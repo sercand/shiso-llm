@@ -1,0 +1,23 @@
+[package]
+name = "shiso-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: ids, shapes/config, dtypes, errors, device buffer ownership, Backend + Model traits, q4e page geometry."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+half = { workspace = true }
+# Only needed to report a failing device free from `DeviceBuffer::drop`, where
+# tracing is the only channel available.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The fake backend used by the buffer-ownership and trait-contract tests.
+parking_lot = { workspace = true }
+
+[lints]
+workspace = true

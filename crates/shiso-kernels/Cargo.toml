@@ -1,0 +1,22 @@
+[package]
+name = "shiso-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Device kernels compiled at build time and embedded as named modules"
+
+[build-dependencies]
+# The kernel manifests. Parsed into a plain table rather than deserialized into
+# structs, so an unknown key can be named in the error instead of being dropped.
+toml = "0.8"
+
+[dev-dependencies]
+# The same version the build script already pulls, so the lock file is unchanged
+# by the test dependency. The integration test reads real and fixture manifests
+# through the same parser the build script uses.
+toml = "0.8"
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

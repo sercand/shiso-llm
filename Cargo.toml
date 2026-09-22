@@ -1,0 +1,212 @@
+[workspace]
+# resolver 3 is the edition-2024 default and is MSRV-aware (stable since 1.84;
+# we pin 1.93). Do not downgrade to "2".
+resolver = "3"
+members = [
+    "crates/shiso-core",
+    "crates/shiso-modelfile",
+    "crates/shiso-metal",
+    "crates/shiso-engine",
+    "crates/shiso-models",
+    "crates/shiso-kvstore",
+    "crates/shiso-ir",
+    "crates/shiso-vision",
+    "crates/shiso-server",
+    "crates/shiso-bench",
+    "crates/shiso-kernels",
+    "crates/shiso-cuda",
+    "crates/shiso-ple",
+    "crates/shiso-parsers",
+    "crates/shiso-kerneltest",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+# No license field: the project license is set later. Every crate is
+# publish = false, which also makes `cargo deny check licenses` skip them.
+
+[workspace.dependencies]
+# --- serialization -------------------------------------------------------
+# preserve_order keeps JSON object keys in insertion order (IndexMap). The chat
+# template renderer must reproduce the transformers `tojson` key order, so this
+# is a correctness feature, not a nicety.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# --- errors --------------------------------------------------------------
+thiserror = "2"          # library errors
+anyhow = "1"             # binary boundaries only (shiso-server main/run)
+
+# --- concurrency + logging ----------------------------------------------
+parking_lot = "0.12"     # no poisoning, .lock() returns the guard directly
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- HTTP stack ----------------------------------------------------------
+clap = { version = "4", features = ["derive", "env"] }
+axum = { version = "0.8", features = ["json"] }
+http-body = "1"
+hyper = { version = "1", features = ["server", "http1", "http2", "client"] }
+hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "http1", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
+tokio = { version = "1", features = ["full", "parking_lot"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# --- tokenizer + chat templates -----------------------------------------
+minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "preserve_order"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+
+# --- model files ---------------------------------------------------------
+# GGUF is hand-rolled (shiso-modelfile); memmap2 backs the read-only model mapping.
+# bytemuck gives zero-copy #[repr(C)] views over quant blocks and fixed headers.
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+safetensors = "0.8"
+half = { version = "2", features = ["bytemuck"] }
+sha1 = "0.10"
+# A Splash package's manifest.json declares a SHA-256 per artifact, and the
+# ~20 GB of weights are checked against it before a byte is mapped: a partial
+# download that is not caught here becomes a model that loads, runs, and
+# answers from bytes that are half another file.
+sha2 = "0.10"
+hex = "0.4"
+
+# --- vision --------------------------------------------------------------
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+base64 = "0.22"
+
+# --- dev -----------------------------------------------------------------
+tempfile = "3"
+
+# --- CUDA phase only -----------------------------------------------------
+# Declared now so later manifests need only `{ workspace = true }`. No Task 1
+# crate references them, so cargo never resolves or downloads them. cudarc is
+# driver+nvrtc only - no runtime, no cuBLAS crate. io-uring sits behind a linux
+# target table in shiso-ple.
+cudarc = { version = "0.19", default-features = false, features = [
+    "std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-version-from-build-system",
+] }
+io-uring = "0.7"
+
+# --- Apple Metal ---------------------------------------------------------
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = [
+    "MTLDevice",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLFunctionConstantValues",
+    # `MTLFunctionConstantValues::setConstantValue:type:atIndex:` and the
+    # `MTLDataType` constants are gated on this feature.
+    "MTLDataType",
+    "MTLLibrary",
+    "MTLBlitCommandEncoder",
+    "MTLEvent",
+    "block2",
+] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSError"] }
+# Page size for the page-aligned no-copy weight wrap (`_SC_PAGESIZE`).
+libc = "0.2"
+
+# --- workspace crates ----------------------------------------------------
+shiso-core = { path = "crates/shiso-core" }
+shiso-modelfile = { path = "crates/shiso-modelfile" }
+shiso-metal = { path = "crates/shiso-metal" }
+shiso-engine = { path = "crates/shiso-engine" }
+shiso-models = { path = "crates/shiso-models" }
+shiso-kvstore = { path = "crates/shiso-kvstore" }
+shiso-ir = { path = "crates/shiso-ir" }
+shiso-vision = { path = "crates/shiso-vision" }
+shiso-server = { path = "crates/shiso-server" }
+shiso-bench = { path = "crates/shiso-bench" }
+shiso-kernels = { path = "crates/shiso-kernels" }
+shiso-cuda = { path = "crates/shiso-cuda" }
+shiso-ple = { path = "crates/shiso-ple" }
+shiso-parsers = { path = "crates/shiso-parsers" }
+shiso-kerneltest = { path = "crates/shiso-kerneltest" }
+[workspace.lints.rust]
+# Safety. Four crates relax this with a crate-level
+# #![allow(unsafe_code, reason = "...")]: shiso-modelfile (mmap), shiso-metal (objc2),
+# shiso-cuda (driver FFI), shiso-ple (io-uring). Everywhere else it stands.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+# API hygiene. missing_docs was `warn` through the build-out so a half-finished
+# crate did not block a commit; Task 20 raised it to "deny", because shipping
+# with an undocumented public item is a different matter.
+missing_docs = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.rustdoc]
+# A doc link that names a moved or deleted item is worse than no link: it reads
+# as a citation and resolves to nothing. Two of them survived the model
+# decoupling, found by the public-surface snapshot rather than by any gate, so
+# the gate now exists and `cargo doc` runs in scripts/check.sh.
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Safety + discipline.
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+allow_attributes = "deny"                # use #[expect(...)] so stale ones fail
+allow_attributes_without_reason = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"                    # tracing, not println
+print_stderr = "deny"
+mem_forget = "deny"
+exit = "deny"
+unwrap_used = "warn"
+expect_used = "allow"                    # expect() with a message is fine
+indexing_slicing = "allow"
+chunks_exact_to_as_chunks = "allow"
+manual_checked_ops = "allow"
+manual_midpoint = "allow"
+duration_suboptimal_units = "allow"
+
+# Deliberately NOT allowed, so they keep firing:
+#   too_many_arguments - a 12-argument launch becomes a named Desc struct.
+#   type_complexity    - forces closure bundles into named traits.
+#   ptr_arg            - &Vec<T> in a signature is always a mistake here.
+#   if_same_then_else  - hides copy-paste in kernel dispatch tables.
+
+# An inference engine that never sets these reads as slow for reasons that have
+# nothing to do with the kernels.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Keep frame pointers + line tables: the profiler is how the perf gates get
+# diagnosed, and this costs no runtime.
+debug = "line-tables-only"
+panic = "unwind"   # the HTTP stack's catch-panic layer requires unwinding
+
+[profile.bench]
+inherits = "release"
+
+# Dequant oracles and golden-vector replays are unusably slow in a debug build of
+# their dependencies; the workspace crates stay at opt-level 0 so `cargo test`
+# still recompiles fast.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test.package."*"]
+opt-level = 2

@@ -1,0 +1,122 @@
+[package]
+name = "shiso-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: Metal backend (objc2) - device, pipeline cache, runtime MSL compile."
+# `tests/oracle.rs` is a shared module rather than a test target, so the two real
+# targets are listed instead of being discovered.
+autotests = false
+
+[dependencies]
+shiso-core = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+memmap2 = { workspace = true }
+# The dense cases and the CPU oracles they are graded against live here rather
+# than in this crate's tests, so the CUDA twins run the same cases. The
+# dependency only ever runs this way: `shiso-kerneltest` names no backend.
+shiso-kerneltest = { workspace = true }
+# The q4_K GPU fixtures are built from the loader's own block layout, and the
+# kernel argument structs are marshalled through `bytemuck` rather than
+# hand-packed bytes, so both layouts come from a struct definition.
+shiso-modelfile = { workspace = true }
+bytemuck = { workspace = true }
+# The attention fixtures fill an `f16` cache, and the encoder is the same one the
+# loader uses, so the fixture never hand-rolls a float conversion.
+half = { workspace = true }
+
+[[test]]
+name = "contract"
+path = "tests/contract.rs"
+
+[[test]]
+name = "metal_kernels"
+path = "tests/metal_kernels.rs"
+
+[[test]]
+name = "q35_gdn"
+path = "tests/q35_gdn.rs"
+
+[[test]]
+name = "q35_attn"
+path = "tests/q35_attn.rs"
+
+[[test]]
+name = "q35_norm_rope"
+path = "tests/q35_norm_rope.rs"
+
+[[test]]
+name = "q35_gemv"
+path = "tests/q35_gemv.rs"
+
+[[test]]
+name = "dense_q4_0"
+path = "tests/dense_q4_0.rs"
+
+[[test]]
+name = "dense_misc"
+path = "tests/dense_misc.rs"
+
+[[test]]
+name = "dense_attn"
+path = "tests/dense_attn.rs"
+
+[[test]]
+name = "dense_ple"
+path = "tests/dense_ple.rs"
+
+[[test]]
+name = "dense_vision"
+path = "tests/dense_vision.rs"
+
+[[test]]
+name = "dense_affine"
+path = "tests/dense_affine.rs"
+
+[[test]]
+name = "q35_compile"
+path = "tests/q35_compile.rs"
+
+# Host-only: pure text scanning over the embedded kernel sources, so it runs on
+# every platform with no device and no compile of the library at all.
+[[test]]
+name = "metal_source_pragmas"
+path = "tests/metal_source_pragmas.rs"
+
+# Host-only: it replays the chunk kernel's index arithmetic rather than running
+# it, which is how the two widths no machine here can launch are covered at all.
+[[test]]
+name = "q35_gdn_chunk_fold"
+path = "tests/q35_gdn_chunk_fold.rs"
+
+[[test]]
+name = "vision_kernels"
+path = "tests/vision_kernels.rs"
+
+[[test]]
+name = "q35moe_moe"
+path = "tests/q35moe_moe.rs"
+
+
+# Cargo features are target-independent, and an optional dependency may not carry
+# a `target` key, so the Objective-C stack is kept out of a Linux build by the
+# target table instead of by the feature.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-metal = { workspace = true }
+objc2-foundation = { workspace = true }
+# Page size, for the page-aligned no-copy import path.
+libc = { workspace = true }
+
+[features]
+default = ["metal"]
+# The backend is built when this is on *and* the target has the Objective-C
+# runtime; `src/lib.rs` states the predicate. A marker feature, not a dep link.
+metal = []
+
+[lints]
+workspace = true

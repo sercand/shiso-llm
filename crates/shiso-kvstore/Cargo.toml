@@ -1,0 +1,29 @@
+[package]
+name = "shiso-kvstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: the KV cache - radix span tree, paged KV, GDN checkpoints, Marconi eviction, disk spill."
+
+[dependencies]
+# `shiso-core` is here for exactly one type: `TokenId`, the workspace-wide token
+# newtype (rule 10). Nothing model-shaped is taken from it - geometry arrives as
+# `CacheGeometry` and page bytes move through `Backing`, so each architecture
+# derives its own numbers and this crate hardcodes none.
+shiso-core = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+# Spill file names are sha1-hex of the rendered byte prefix they cache.
+sha1 = { workspace = true }
+hex = { workspace = true }
+# The 48-byte spill header and the payload header are `#[repr(C)]` records read
+# through bytemuck casts rather than offset constants (rule 14).
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

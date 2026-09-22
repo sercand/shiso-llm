@@ -1,0 +1,22 @@
+# shiso-local-logit-vectors-v1
+# label capture-skeleton
+# captured_from none
+# The capture request the committed golden was filled from. Kept beside it so a
+# recapture asks for exactly the same five frontiers rather than approximately
+# them, and so a reviewer can see what was asked for without reading 320 recorded
+# logits to infer it.
+#
+# Every frontier is the whole of its prompt, so each recorded top-1 is a real
+# continuation that a person can read and judge rather than the model's guess at
+# the middle of a sentence.
+#
+# The two long cases are the point of the file. The three short ones fit inside a
+# single prefill call; a three-thousand-token frontier is what crosses the
+# chunk boundary and reaches the wide attention and recurrent paths, which is
+# where a port's launch geometry goes wrong.
+# case <id> <mode> <ctx> <frontier> <prompt-file> <top-count>
+case short_italian_fact text 1024 15 ../prompts/short_italian_fact.txt 64
+case short_reasoning_plain text 1024 18 ../prompts/short_reasoning_plain.txt 64
+case short_code_completion text 1024 23 ../prompts/short_code_completion.txt 64
+case long_memory_archive text 4096 3493 ../prompts/long_memory_archive.txt 64
+case long_code_audit text 4096 3957 ../prompts/long_code_audit.txt 64

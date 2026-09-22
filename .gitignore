@@ -1,0 +1,6 @@
+/target
+crates/shiso-bench/records/
+docs/superpowers/
+docs/handoff/
+__pycache__
+scripts/local

@@ -1,0 +1,72 @@
+# The qwen3vl vision tower's device kernels: seven entry points in three
+# translation units, split along the tower's own seams — the normalization and
+# its pointwise epilogues, the learned position embedding, and the attention
+# pair (the fused projection split with its two-dimensional rotation, and the
+# bidirectional softmax that consumes its planes).
+#
+# The split is a file split only. Every kernel body in these units is a
+# byte-for-byte copy of the single upstream header they came from; the only edit
+# is `extern "C"` linkage on the six entries, which were `static` in a header
+# that was included into one translation unit and now have to be reachable from
+# a module registry.
+#
+# What is deliberately NOT here is the host encode driver that sits below the
+# kernels upstream. It is host C, this tree holds device code only, and the
+# equivalent host sequencing for this tower already exists in Rust.
+
+#
+# `vit.cu` is the other set in this directory and is not that. It is the
+# parametric decomposition the shared encoder, Gemma 4's tower and the engine's
+# splice actually dispatch, under the module name `vision`; nothing in it is
+# copied and `KERNEL_NAMES.md` records why none of the six entries whose names
+# appear to match across the two sets is a matching contract. It is ONE
+# translation unit because a module name is the key of a separately compiled
+# image and a stem maps to exactly one key.
+
+[build]
+sources = [
+    "vit.cu",
+    "vit_norm.cu",
+    "vit_embed.cu",
+    "vit_attn.cu",
+]
+
+# `--use_fast_math` is DROPPED here, and it is in the tree default this list
+# replaces (lists are replaced, never merged). The reason is arithmetic, not
+# taste. `kernel_vit_qkv_rope` builds a frequency ladder spanning four decades
+# of base and the Metal twin uses the accurate `pow`/`sin`/`cos` rather than the
+# fast forms; under `--use_fast_math` nvcc rewrites every `powf`/`sinf`/`cosf`
+# call to the reduced-precision intrinsic and there is no per-call spelling that
+# opts back out. `vit_gelu_tanh` has the same obligation for the opposite
+# reason: the Metal twin asks for `precise::tanh` because the cubic inside it
+# drives the argument past the fast form's overflow point and hands back NaN
+# from a row this tower produces routinely.
+#
+# Everything else this drops - flush-to-zero, the approximate divide and the
+# approximate square root - is a relaxation these kernels never asked for. The
+# qwen3vl units in this directory lose it too; they are dispatched by nothing,
+# and its absence can only move their arithmetic toward the reference they were
+# extracted from.
+base_flags = ["-O3", "-g", "-lineinfo"]
+
+# Both directories: `vision.cuh` reaches the qwen4exp header for the block
+# reduction its layer normalization calls, which is how the source reached it
+# too — upstream the two headers are included into one translation unit, in that
+# order. The dependency belongs to the source, not to the split.
+includes = ["cuda/q4e", "cuda/vision"]
+
+# The floor is inherited rather than chosen. Nothing in these six kernels needs
+# more than shuffles, dynamic shared memory and the transcendental library, so
+# on their own they would build at the tree default. `vision.cuh` includes
+# `q4e.cuh`, which reaches the shared device header whose matrix-fragment
+# helpers carry `__CUDA_ARCH__ >= 800` guards, and that directory pins its floor
+# there for a reason of its own. Building this one lower would mean compiling
+# those guards' fallback path in a unit that never calls them — buying nothing
+# and differing from the only architecture the tower will ever be measured at.
+arch = ["compute_80"]
+
+[modules]
+vit = "vision"
+vit_norm = "vision_norm"
+vit_embed = "vision_embed"
+vit_attn = "vision_attn"

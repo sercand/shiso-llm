@@ -1,0 +1,1016 @@
+{
+ "note": "Recorded from the local checkpoint's vision shard. Regenerate only from a real checkpoint: if this file is derived from the loader it stops being a gate on it.",
+ "shard": "optiq/optiq_vision.safetensors",
+ "prefix": "vision_tower",
+ "header_format": "mlx",
+ "n_tensors": 297,
+ "dtype": "BF16",
+ "axis_order": "slowest_first",
+ "dims": {
+  "depth": 24,
+  "hidden": 1024,
+  "heads": 16,
+  "intermediate": 4096,
+  "out_hidden": 2560,
+  "position_embeddings": 2304,
+  "patch_size": 16,
+  "temporal_patch_size": 2,
+  "spatial_merge_size": 2
+ },
+ "tensors": {
+  "vision_tower.blocks.0.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.0.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.0.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.0.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.0.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.0.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.0.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.0.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.0.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.0.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.0.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.0.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.1.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.1.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.1.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.1.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.1.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.1.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.1.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.1.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.1.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.1.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.1.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.1.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.10.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.10.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.10.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.10.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.10.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.10.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.10.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.10.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.10.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.10.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.10.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.10.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.11.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.11.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.11.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.11.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.11.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.11.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.11.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.11.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.11.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.11.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.11.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.11.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.12.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.12.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.12.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.12.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.12.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.12.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.12.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.12.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.12.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.12.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.12.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.12.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.13.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.13.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.13.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.13.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.13.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.13.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.13.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.13.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.13.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.13.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.13.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.13.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.14.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.14.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.14.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.14.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.14.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.14.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.14.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.14.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.14.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.14.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.14.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.14.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.15.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.15.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.15.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.15.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.15.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.15.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.15.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.15.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.15.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.15.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.15.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.15.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.16.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.16.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.16.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.16.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.16.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.16.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.16.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.16.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.16.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.16.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.16.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.16.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.17.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.17.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.17.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.17.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.17.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.17.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.17.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.17.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.17.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.17.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.17.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.17.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.18.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.18.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.18.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.18.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.18.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.18.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.18.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.18.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.18.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.18.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.18.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.18.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.19.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.19.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.19.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.19.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.19.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.19.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.19.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.19.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.19.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.19.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.19.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.19.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.2.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.2.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.2.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.2.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.2.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.2.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.2.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.2.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.2.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.2.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.2.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.2.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.20.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.20.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.20.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.20.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.20.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.20.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.20.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.20.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.20.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.20.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.20.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.20.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.21.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.21.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.21.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.21.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.21.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.21.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.21.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.21.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.21.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.21.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.21.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.21.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.22.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.22.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.22.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.22.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.22.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.22.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.22.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.22.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.22.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.22.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.22.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.22.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.23.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.23.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.23.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.23.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.23.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.23.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.23.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.23.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.23.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.23.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.23.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.23.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.3.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.3.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.3.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.3.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.3.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.3.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.3.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.3.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.3.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.3.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.3.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.3.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.4.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.4.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.4.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.4.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.4.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.4.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.4.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.4.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.4.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.4.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.4.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.4.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.5.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.5.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.5.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.5.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.5.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.5.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.5.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.5.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.5.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.5.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.5.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.5.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.6.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.6.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.6.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.6.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.6.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.6.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.6.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.6.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.6.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.6.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.6.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.6.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.7.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.7.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.7.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.7.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.7.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.7.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.7.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.7.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.7.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.7.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.7.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.7.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.8.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.8.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.8.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.8.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.8.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.8.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.8.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.8.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.8.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.8.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.8.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.8.norm2.weight": [
+   1024
+  ],
+  "vision_tower.blocks.9.attn.proj.bias": [
+   1024
+  ],
+  "vision_tower.blocks.9.attn.proj.weight": [
+   1024,
+   1024
+  ],
+  "vision_tower.blocks.9.attn.qkv.bias": [
+   3072
+  ],
+  "vision_tower.blocks.9.attn.qkv.weight": [
+   3072,
+   1024
+  ],
+  "vision_tower.blocks.9.mlp.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.blocks.9.mlp.linear_fc1.weight": [
+   4096,
+   1024
+  ],
+  "vision_tower.blocks.9.mlp.linear_fc2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.9.mlp.linear_fc2.weight": [
+   1024,
+   4096
+  ],
+  "vision_tower.blocks.9.norm1.bias": [
+   1024
+  ],
+  "vision_tower.blocks.9.norm1.weight": [
+   1024
+  ],
+  "vision_tower.blocks.9.norm2.bias": [
+   1024
+  ],
+  "vision_tower.blocks.9.norm2.weight": [
+   1024
+  ],
+  "vision_tower.merger.linear_fc1.bias": [
+   4096
+  ],
+  "vision_tower.merger.linear_fc1.weight": [
+   4096,
+   4096
+  ],
+  "vision_tower.merger.linear_fc2.bias": [
+   2560
+  ],
+  "vision_tower.merger.linear_fc2.weight": [
+   2560,
+   4096
+  ],
+  "vision_tower.merger.norm.bias": [
+   1024
+  ],
+  "vision_tower.merger.norm.weight": [
+   1024
+  ],
+  "vision_tower.patch_embed.proj.bias": [
+   1024
+  ],
+  "vision_tower.patch_embed.proj.weight": [
+   1024,
+   2,
+   16,
+   16,
+   3
+  ],
+  "vision_tower.pos_embed.weight": [
+   2304,
+   1024
+  ]
+ }
+}

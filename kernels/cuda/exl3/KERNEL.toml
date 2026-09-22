@@ -1,0 +1,19 @@
+# Trellis-quantised GEMM and MoE kernels. One translation unit; every other
+# file in this directory is a header it includes.
+#
+# The stem is the module name, so `[modules]` is empty. The copies are still
+# byte-for-byte kernel text; only the filename and the host-side prefix it
+# carried from the upstream project changed, and VENDOR.md records where the
+# bytes came from.
+
+[build]
+sources = ["exl3.cu"]
+
+# These kernels are fp16 tensor-core code — `mma.m16n8k16`, `cp.async`,
+# cooperative groups — and carry no Turing fallback at all, so the tree-wide
+# `compute_75` default would compile to stubs or not at all. `compute_80` is the
+# oldest target whose instruction set they actually use, and emitting PTX rather
+# than a fixed binary keeps a single build loadable on every later device.
+arch = ["compute_80"]
+
+[modules]

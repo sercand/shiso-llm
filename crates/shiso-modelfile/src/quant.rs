@@ -1,0 +1,307 @@
+//! Quantized block geometry.
+//!
+//! Every format a tensor can be stored in gets one `#[repr(C)]` struct whose
+//! fields appear in the same order and width as the format defines them, and
+//! every one of those structs carries a compile-time size assert. The point of
+//! the assert is narrow and important: a field transcribed in the wrong order,
+//! or a padding rule misunderstood, becomes a build failure instead of a wrong
+//! tensor read during inference. Byte-offset constants and hand-rolled
+//! little-endian readers cannot fail that way, which is why they are not used
+//! here.
+//!
+//! Nothing in this module dequantizes anything. Decoding is kernel-side work;
+//! this module answers "how wide is one block, and how many bytes does this
+//! tensor occupy".
+
+use std::mem::size_of;
+
+use shiso_core::DType;
+
+use crate::reader::TensorShape;
+
+/// Elements per block for the `K`-quant and `i`-quant families.
+pub const QK_K: usize = 256;
+/// Elements per block for the microscaling 4-bit format.
+pub const QK_MXFP4: usize = 32;
+/// Elements per block for the legacy 32-element formats.
+pub const QK_LEGACY: usize = 32;
+
+/// Implemented by every [`QuantBlock`] struct, so a borrowed payload can be
+/// reinterpreted as a slice of blocks with no unsafe code at the call site.
+///
+/// `Pod` already guarantees no padding, `Copy`, and any-bit-pattern validity;
+/// `DTYPE` and `ELEMS` tie the struct to the format id and element count it
+/// describes, which is what lets [`crate::reader::TensorView::blocks`] check
+/// the tensor's declared type before casting.
+pub trait QuantBlock: bytemuck::Pod {
+    /// The format this struct lays out.
+    const DTYPE: DType;
+    /// Elements covered by one block.
+    const ELEMS: usize;
+}
+
+/// 8-bit block: one fp16 scale and 32 signed weights.
+///
+/// This format has no historical C struct to transcribe; its geometry is the
+/// type table's `q8_0` row, 32 elements in 34 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockQ8_0 {
+    /// fp16 scale, kept as bits so the struct stays plain-old-data.
+    pub d: u16,
+    /// The 32 signed weights.
+    pub qs: [i8; 32],
+}
+const _: () = assert!(size_of::<BlockQ8_0>() == 34);
+impl QuantBlock for BlockQ8_0 {
+    const DTYPE: DType = DType::Q8_0;
+    const ELEMS: usize = QK_LEGACY;
+}
+
+/// 2-bit `K`-quant: per-subblock scales and minima plus packed weights.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockQ2K {
+    /// One scale nibble pair per 16-element subblock.
+    pub scales: [u8; QK_K / 16],
+    /// Packed 2-bit weights, four per byte.
+    pub qs: [u8; QK_K / 4],
+    /// fp16 block scale, high bits.
+    pub d: u16,
+    /// fp16 block minimum, high bits.
+    pub dmin: u16,
+}
+const _: () = assert!(size_of::<BlockQ2K>() == 84);
+impl QuantBlock for BlockQ2K {
+    const DTYPE: DType = DType::Q2_K;
+    const ELEMS: usize = QK_K;
+}
+
+/// 4-bit `K`-quant: super-block scale and minimum, 12 scale bytes, packed
+/// 4-bit weights.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockQ4K {
+    /// fp16 super-block scale.
+    pub d: u16,
+    /// fp16 super-block minimum.
+    pub dmin: u16,
+    /// Six 6-bit scale/min pairs packed into 12 bytes.
+    pub scales: [u8; 12],
+    /// Packed 4-bit weights, two per byte.
+    pub qs: [u8; QK_K / 2],
+}
+const _: () = assert!(size_of::<BlockQ4K>() == 144);
+impl QuantBlock for BlockQ4K {
+    const DTYPE: DType = DType::Q4_K;
+    const ELEMS: usize = QK_K;
+}
+
+/// 5-bit `K`-quant: like [`BlockQ4K`] plus the fifth bit plane.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockQ5K {
+    /// fp16 super-block scale.
+    pub d: u16,
+    /// fp16 super-block minimum.
+    pub dmin: u16,
+    /// Six 6-bit scale/min pairs packed into 12 bytes.
+    pub scales: [u8; 12],
+    /// High bit plane, one bit per weight.
+    pub qh: [u8; QK_K / 8],
+    /// Low four bits of each weight.
+    pub qs: [u8; QK_K / 2],
+}
+const _: () = assert!(size_of::<BlockQ5K>() == 176);
+impl QuantBlock for BlockQ5K {
+    const DTYPE: DType = DType::Q5_K;
+    const ELEMS: usize = QK_K;
+}
+
+/// 6-bit `K`-quant: two weight planes, 16 signed scales, one fp16 scale.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockQ6K {
+    /// Low four bits of each weight.
+    pub ql: [u8; QK_K / 2],
+    /// High two bits of each weight, four per byte.
+    pub qh: [u8; QK_K / 4],
+    /// One signed scale per 16-element subblock.
+    pub scales: [i8; QK_K / 16],
+    /// fp16 block scale.
+    pub d: u16,
+}
+const _: () = assert!(size_of::<BlockQ6K>() == 210);
+impl QuantBlock for BlockQ6K {
+    const DTYPE: DType = DType::Q6_K;
+    const ELEMS: usize = QK_K;
+}
+
+/// 8-bit `K`-quant: a block-wide `f32` scale, 256 signed weights, and the
+/// per-subblock sums a dot product accumulates.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockQ8K {
+    /// Block scale as `f32`, unlike the fp16 scales of the other `K` formats.
+    pub d: f32,
+    /// The 256 signed weights.
+    pub qs: [i8; QK_K],
+    /// Precomputed sum of each 16-element subblock.
+    pub bsums: [i16; QK_K / 16],
+}
+const _: () = assert!(size_of::<BlockQ8K>() == 292);
+impl QuantBlock for BlockQ8K {
+    const DTYPE: DType = DType::Q8_K;
+    const ELEMS: usize = QK_K;
+}
+
+/// 2-bit `i`-quant, extra-small: an fp16 scale and 32 grid indices.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIq2Xxs {
+    /// fp16 scale.
+    pub d: u16,
+    /// Eight 8-bit indices per `u16`, decoding through
+    /// [`crate::quant_tables::IQ2XXS_GRID`] and
+    /// [`crate::quant_tables::KSIGNS_IQ2XS`].
+    pub qs: [u16; QK_K / 8],
+}
+const _: () = assert!(size_of::<BlockIq2Xxs>() == 66);
+impl QuantBlock for BlockIq2Xxs {
+    const DTYPE: DType = DType::IQ2_XXS;
+    const ELEMS: usize = QK_K;
+}
+
+/// Microscaling 4-bit: one shared exponent plus 16 packed nibbles.
+///
+/// Note the size, 17 bytes: the shared exponent is a single byte, not the fp16
+/// pair the other 32-element formats lead with.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockMxfp4 {
+    /// Shared exponent, `e8m0` encoding.
+    pub e: u8,
+    /// Two 4-bit weights per byte.
+    pub qs: [u8; QK_MXFP4 / 2],
+}
+const _: () = assert!(size_of::<BlockMxfp4>() == 17);
+impl QuantBlock for BlockMxfp4 {
+    const DTYPE: DType = DType::MXFP4;
+    const ELEMS: usize = QK_MXFP4;
+}
+
+/// Legacy 5-bit block: scale, minimum, high-bit plane, low nibbles.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockQ5_1 {
+    /// fp16 scale.
+    pub d: u16,
+    /// fp16 minimum.
+    pub m: u16,
+    /// Fifth bit of each weight.
+    pub qh: [u8; 4],
+    /// Low four bits of each weight.
+    pub qs: [u8; QK_LEGACY / 2],
+}
+const _: () = assert!(size_of::<BlockQ5_1>() == 24);
+impl QuantBlock for BlockQ5_1 {
+    const DTYPE: DType = DType::Q5_1;
+    const ELEMS: usize = QK_LEGACY;
+}
+
+/// 4-bit non-linear block: an fp16 scale and indices into a fixed 16-entry
+/// table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIq4Nl {
+    /// fp16 scale.
+    pub d: u16,
+    /// 4-bit indices into [`crate::quant_tables::IQ4NL_VALUES`].
+    pub qs: [u8; QK_LEGACY / 2],
+}
+const _: () = assert!(size_of::<BlockIq4Nl>() == 18);
+impl QuantBlock for BlockIq4Nl {
+    const DTYPE: DType = DType::IQ4_NL;
+    const ELEMS: usize = QK_LEGACY;
+}
+
+/// Geometry of the trellis and n-gram codecs.
+///
+/// These formats are not `#[repr(C)]` blocks: a trellis block is a 16x16 tile
+/// of `K`-bit weights, so its width depends on `K` and its decoding is a
+/// Hadamard-domain walk. There is therefore no struct to mirror, and the
+/// geometry lives here as constants plus the two derived sizes the reader
+/// needs.
+pub mod exl3 {
+    use shiso_core::DType;
+
+    use crate::reader::TensorShape;
+
+    /// Weights in one trellis tile.
+    pub const TILE_ELEMS: usize = 256;
+    /// Weights in one n-gram row.
+    pub const NGRAM6_ELEMS: usize = 160;
+    /// Bytes in one n-gram row: an fp16 scale word plus a 160x6-bit ring.
+    pub const NGRAM6_BYTES: usize = 122;
+
+    /// Bits per weight for a trellis format, `None` for every other format.
+    #[must_use]
+    pub const fn k_bits(dtype: DType) -> Option<u32> {
+        match dtype {
+            DType::Exl3K4 => Some(4),
+            DType::Exl3K5 => Some(5),
+            DType::Exl3K6 => Some(6),
+            _ => None,
+        }
+    }
+
+    /// Bytes in one tile: 16 rows of `K` bits times 16 columns.
+    ///
+    /// The bit width is a small number by construction - the only producer is
+    /// [`k_bits`] - so an unrepresentable width yields zero rather than a
+    /// wrapped size.
+    #[must_use]
+    pub fn tile_bytes(k_bits: u32) -> usize {
+        (TILE_ELEMS / 8) * usize::from(u8::try_from(k_bits).unwrap_or(0))
+    }
+
+    /// Bytes of the two fp16 scale vectors appended after a tensor's tiles.
+    ///
+    /// A tensor shaped `[k, n]` - or `[k, n, experts]` - carries, per expert,
+    /// an input vector of `k` fp16 words and an output vector of `n` fp16
+    /// words. They live inside the tensor's own payload so a tensor stays one
+    /// contiguous `(offset, bytes)` span, which is what lets the weight cache
+    /// and the device-side buffer slices treat it as a single range.
+    ///
+    /// The arithmetic saturates rather than wrapping: a shape large enough to
+    /// overflow this product is rejected by the caller's bounds check, and a
+    /// saturated value is what makes that rejection happen.
+    #[must_use]
+    pub fn scale_bytes(shape: &TensorShape) -> u64 {
+        let experts = shape.dim(2).unwrap_or(1);
+        let n = shape.dim(1).unwrap_or(1);
+        let k = shape.dim(0).unwrap_or(0);
+        experts
+            .saturating_mul(2)
+            .saturating_mul(k.saturating_add(n))
+    }
+}
+
+/// Total payload bytes of `shape` in format `dtype`: whole blocks rounded up,
+/// plus the scale-vector tail the trellis formats append.
+///
+/// `None` means the product overflowed `u64`, which the reader turns into a
+/// typed error rather than a truncated tensor.
+#[must_use]
+pub fn block_bytes_for(dtype: DType, shape: &TensorShape) -> Option<u64> {
+    let elements = shape.elements().ok()?;
+    let elems_per_block = u64::from(dtype.block_elems().get());
+    let bytes_per_block = u64::from(dtype.block_bytes().get());
+    let blocks = elements.saturating_add(elems_per_block - 1) / elems_per_block;
+    let tiles = blocks.checked_mul(bytes_per_block)?;
+    if exl3::k_bits(dtype).is_some() {
+        tiles.checked_add(exl3::scale_bytes(shape))
+    } else {
+        Some(tiles)
+    }
+}

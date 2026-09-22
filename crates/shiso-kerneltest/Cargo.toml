@@ -1,0 +1,22 @@
+[package]
+name = "shiso-kerneltest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: backend-neutral CPU oracles and device cases for the dense kernel set."
+
+[lints]
+workspace = true
+
+[dependencies]
+shiso-core = { workspace = true }
+# The per-layer fixtures are built from the loader's own q6_K block layout, and
+# the kernel argument structs are marshalled through `bytemuck` rather than
+# hand-packed bytes, so both layouts come from a struct definition.
+shiso-modelfile = { workspace = true }
+bytemuck = { workspace = true }
+# The attention fixtures fill an `f16` cache and the affine ones a `bf16` one,
+# with the same encoder the loader uses, so no fixture hand-rolls a float
+# conversion.
+half = { workspace = true }

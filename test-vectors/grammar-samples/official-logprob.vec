@@ -1,0 +1,17 @@
+# shiso-official-logprob-vectors-v1
+# label parser-conformance-only
+# captured_from none
+# PARSER CONFORMANCE ONLY. Synthetic numbers, no model, never replayed.
+# Tokens here are hex-encoded UTF-8 bytes rather than ids, because the kind of
+# source this grammar exists for - a hosted endpoint that returns text and
+# log-probabilities - has no token ids to give. 416461 is "Ada".
+# case <id> <ctx> <steps> <prompt-file>
+# step <index> <selected-hex> <top-count>
+# top <token-hex> <logprob>
+case sample_bytes 16384 2 ../prompts/short_italian_fact.txt
+step 0 416461 2
+top 416461 0
+top 416461626f -1.25
+step 1 204c6f76 1
+top 204c6f76 0
+end

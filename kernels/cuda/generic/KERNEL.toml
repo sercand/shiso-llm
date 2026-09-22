@@ -1,0 +1,33 @@
+# The kernels a checkpoint that is not qwen35 dispatches through the generic
+# module name: the q4_0 linear path, which is how every Gemma 4 layer is read,
+# plus the two fused norms and the residual add every family closes a block
+# with.
+#
+# ONE translation unit, because on this backend a module is the key of a
+# separately compiled image rather than a label: the engine dispatches the
+# extended matvec, the plain matvec and the norms under `launch::GENERIC`, so
+# they have to land in an image of that name.
+#
+# The prefill GEMM, the q6_K gather and the q6_K extended matvec are NOT here,
+# even though this directory owns the templates all three are instantiations of
+# (`mul_mm.cuh`, `get_rows_q6_K.cuh`, `mul_mv_ext.cuh`). The engine asks for
+# them under `launch::Q35`, so they live in `cuda/qwen35`, which includes this
+# directory for exactly those three headers.
+#
+# Nothing here is a byte copy, so no unit carries a provenance header and the
+# fidelity gate reports it as generated.
+
+[build]
+sources = ["generic.cu"]
+
+# The headers reach only their own directory.
+includes = ["cuda/generic"]
+
+# The floor the rest of the tree's CUDA families are pinned at. Nothing in this
+# unit needs more than warp shuffles and fp16 conversion, so it would build
+# lower; matching the others means one architecture to reason about when a
+# number disagrees, and the GB10 these are measured on is well past it.
+arch = ["compute_80"]
+
+[modules]
+generic = "generic"

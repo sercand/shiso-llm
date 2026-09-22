@@ -1,0 +1,9 @@
+{
+  "_header": "Regression lock for the Gemma 4 vision path.",
+  "_case": "gemma4_image_e2e_golden in crates/shiso-server/tests/media_e2e.rs",
+  "_captured_from": "gemma-4-E4B_q4_0-it.gguf + gemma-4-E4B-it-mmproj.gguf, Metal, greedy (temperature 0), 48-token budget, thinking off",
+  "_fixture": "the same 224x224 PNG of four colour quadrants the Qwen case generates, plus the prompt 'Describe this image in one short sentence.'",
+  "_what_this_does_not_prove": "that the picture reached the model. That is the paired request in the same test: a second image of identical dimensions and different pixels must produce a different answer, which it cannot on a build that drops the pixels.",
+  "prompt_tokens": 275,
+  "answer": "This is a simple image divided into four colored quadrants: red, green, blue, and yellow."
+}

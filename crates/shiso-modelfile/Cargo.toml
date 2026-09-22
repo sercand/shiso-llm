@@ -1,0 +1,35 @@
+[package]
+name = "shiso-modelfile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: model-file loader - GGUF reader, quant block layouts, safetensors/OptiQ, tensor binding."
+
+[dependencies]
+shiso-core = { workspace = true }
+thiserror = { workspace = true }
+# The sharded-checkpoint header and config are JSON. serde_json is read
+# directly rather than through the `safetensors` crate, which loads tensors
+# eagerly and does not expose the raw payload offsets a streaming loader needs.
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+# A dev-only cycle, and a deliberate one. The role binding moved to the crate that
+# knows this checkpoint family, but the fixtures that exercise it - a synthetic
+# file with a wrong dimension, a missing role, a quantized norm vector - are the
+# same fixtures this crate's own reader cases use. Duplicating that writer into a
+# second crate is how the two copies start to disagree about what a valid file
+# looks like, which is the one thing a fixture must not do.
+shiso-models = { workspace = true }
+shiso-engine = { workspace = true }
+# The synthetic-GGUF fixtures in tests/ are written to a temporary directory.
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

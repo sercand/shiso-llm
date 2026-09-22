@@ -1,0 +1,70 @@
+# The qwen4exp device kernels: 65 entry points split into ten translation
+# units along the architecture's own family seams (hyper-connections, MoE,
+# gated DeltaNet, PLE, mat-vec/matmul, sparse attention dense and split,
+# indexer, the row gather every pass opens with, and the two kernels that
+# belong to no family).
+#
+# The split is a file split only. Every kernel body in these units is a
+# byte-for-byte copy of the upstream source it came from; the only edits are
+# `extern "C"` linkage on the 55 non-template entries and explicit
+# instantiation directives for the 10 template ones. `qsa` and `qsa_sparse`
+# are one family in two units, cut at the dense/split-key seam the source
+# itself draws, because that is also the seam between the kernels a Metal
+# oracle can run today and the ones it cannot. `embed` is the one unit whose
+# kernels come from a different upstream file than the other nine: the row
+# gather is format-generic and is shared with every other model there, which
+# is why it lives outside the family header.
+
+[build]
+sources = [
+    "hc.cu",
+    "moe.cu",
+    "gdn.cu",
+    "ple.cu",
+    "matvec.cu",
+    "qsa.cu",
+    "qsa_sparse.cu",
+    "idx.cu",
+    "misc.cu",
+    "embed.cu",
+]
+
+# Every unit includes `q4e.cuh` by bare name, and that header reaches its own
+# `shiso_dev_inc/` and the generated page mirror relative to itself, so the
+# directory is the only include path any of them needs.
+includes = ["cuda/q4e"]
+
+# `defines`, `std`, `base_flags` and `outputs` take the tree defaults. `arch`
+# does not, and the reason is the sharpest failure mode in this directory.
+#
+# Four entries - `q4e_idx_score_tc_kernel`, `q4e_qsa_attention_tc_kernel` and the
+# two matrix-fragment helpers they call - are guarded on `__CUDA_ARCH__ >= 800`
+# and fall back to WRITING ZEROS below it. The host picks between the
+# tensor-core entry and its scalar twin by asking about a shared-memory
+# attribute, not about the architecture. So a module built at the tree default
+# and loaded on a device that has tensor cores takes the tensor-core path
+# straight into the stub: attention scores that are silently zero, on hardware
+# that was perfectly capable of computing them, with nothing in any log.
+#
+# Pinning the floor at `compute_80` is what makes that unrepresentable. The cost
+# is that this module refuses to load on an older device - which is a loud
+# failure at startup, naming the architecture, instead of a quiet wrong answer
+# forty tokens into a generation. That trade is the whole point.
+#
+# Upstream avoids the choice by shipping a fat binary with a second architecture
+# baked in; one PTX output has no equivalent. If this family ever has to run
+# below sm_80, the fix is for the host selection to read the architecture its
+# module was built for - not to lower this floor.
+arch = ["compute_80"]
+
+[modules]
+hc = "q4e_hc"
+moe = "q4e_moe"
+gdn = "q4e_gdn"
+ple = "q4e_ple"
+matvec = "q4e_matvec"
+qsa = "q4e_qsa"
+qsa_sparse = "q4e_qsa_sparse"
+idx = "q4e_idx"
+misc = "q4e_misc"
+embed = "q4e_embed"

@@ -1,0 +1,46 @@
+# The `dense` module: Gemma 4's parametric attention set and its helpers.
+#
+# ONE translation unit, because on this backend a module name is the key of a
+# separately compiled image rather than a label, and the engine dispatches the
+# whole set under `launch::DENSE = "dense"`. Every entry the engine names has to
+# live in an image called `dense`, so `dense.cu` includes the focused `.cuh`
+# pieces and is the whole of the module.
+#
+# Nothing in this directory is a byte copy of anything, so no file here carries
+# a provenance header and `scripts/q4e_ptx_oracle.sh --mode=fidelity` reports it
+# as generated. The arithmetic is the Metal twins' in
+# `crates/shiso-metal/metal/dense`, which is what produced the committed
+# goldens, and the argument blocks are the ones
+# `crates/shiso-engine/src/launch.rs` packs.
+
+[build]
+sources = ["dense.cu"]
+
+# The headers reach only their own directory.
+includes = ["cuda/dense"]
+
+# `--use_fast_math` is DROPPED here, and it is in the tree default this list
+# replaces (lists are replaced, never merged). The reason is arithmetic, not
+# taste. `dense_rope_pairs` builds a frequency ladder spanning six decades of
+# base, and the Metal twin uses the accurate `pow`/`sin`/`cos` rather than the
+# `fast::` ones for exactly that; under `--use_fast_math` nvcc rewrites every
+# `powf`/`sinf`/`cosf` call to the reduced-precision intrinsic and there is no
+# per-call spelling that opts back out. `dense_gelu_tanh` has the same
+# obligation for the opposite reason: the Metal twin asks for `precise::tanh`
+# because the cubic inside it drives the argument past the fast form's overflow
+# point and hands back NaN from a gate this model produces routinely.
+#
+# Everything else this drops - flush-to-zero, the approximate divide and the
+# approximate square root - is a relaxation these kernels never asked for and
+# whose absence can only move an answer toward the reference the goldens were
+# taken against.
+base_flags = ["-O3", "-g", "-lineinfo"]
+
+# The floor the rest of the tree's CUDA families are pinned at. Nothing here
+# needs more than warp shuffles and fp16 conversion, so it would build lower;
+# matching the others means one architecture to reason about when a number
+# disagrees.
+arch = ["compute_80"]
+
+[modules]
+dense = "dense"

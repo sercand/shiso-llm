@@ -1,0 +1,60 @@
+[package]
+name = "shiso-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: CUDA driver-API backend - module registry, argv launches, cuBLAS tier, graph capture."
+
+[dependencies]
+shiso-core = { workspace = true }
+shiso-kernels = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+# The driver bindings are a Linux dependency, not an optional one. A Cargo
+# feature is target-independent, so an optional dep would still be *resolvable*
+# on this developer's Mac and would tempt a `--all-features` build into a link
+# failure that says nothing useful. A target table removes the crate from the
+# macOS graph entirely: `cargo tree` on macOS shows no binding crate at all, and
+# `src/sys` supplies the same function surface from its stub arm instead.
+#
+# `cublas`/`cublaslt` are added here rather than in the workspace table because
+# this is the only crate that calls them, and the generated bindings are what
+# keeps the handle, enum and struct layouts out of hand-written FFI.
+[target.'cfg(target_os = "linux")'.dependencies]
+cudarc = { workspace = true, features = ["cublas", "cublaslt"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The device runbook rounds its own operands, because the multiply it checks
+# takes half-precision inputs and the expected value has to be computed the
+# same way the device will.
+half = { workspace = true }
+# The dense cases and their CPU oracles, shared with the Metal backend. The
+# dependency only ever runs this way: `shiso-kerneltest` names no backend, so
+# the same case grades this device and the other one.
+shiso-kerneltest = { workspace = true }
+# Dev-only, and only for the one case that loads a real checkpoint onto this
+# device. `shiso-models` names no backend either - the load takes an
+# `Arc<dyn Backend>` - so the dependency runs from the test to the family and
+# never the other way. The families' own device cases cannot do this: that
+# crate dev-depends on the Metal backend, whose `device()` answers `None` here,
+# so a load case written there would skip on this box and print nothing.
+shiso-models = { workspace = true }
+# The one case that runs a real prompt needs the checkpoint's own vocabulary.
+# Greedy text from arbitrary token ids proves nothing; text from a real prompt
+# is the first thing that can be read and disbelieved.
+tokenizers = { workspace = true }
+# The reference logits this port is graded against are a small JSON document.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The one case that puts a picture through the stack encodes it with the
+# family's own tower and draws the picture itself, so the answer depends on
+# pixels this file chose rather than on a fixture nobody can read.
+shiso-vision = { workspace = true }
+image = { workspace = true }
+shiso-engine = { workspace = true }

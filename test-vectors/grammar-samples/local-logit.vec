@@ -1,0 +1,16 @@
+# shiso-local-logit-vectors-v1
+# label parser-conformance-only
+# captured_from none
+# PARSER CONFORMANCE ONLY. Synthetic numbers, no model, never replayed.
+# This file exists so the reader has something to read. Its logits are
+# hand-written and describe nothing; a run that tried to replay it would be
+# comparing a checkpoint against five made-up numbers.
+# case <id> <mode> <ctx> <frontier> <prompt-file> <top-count>
+# top <rank> <token-id> <logit>
+case sample_text text 64 32 ../prompts/short_italian_fact.txt 3
+top 0 4371 46.916035
+top 1 3195 24.1749
+top 2 523 21.606873
+case sample_rendered rendered 128 64 ../prompts/short_code_completion.txt 2
+top 0 11751 12.5
+top 1 13 -3.25

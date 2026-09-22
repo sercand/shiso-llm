@@ -1,0 +1,64 @@
+# The `qwen35` module: the Qwen 3.5 dense hybrid's own kernel set, plus the
+# entries the engine asks for under that name on behalf of other families.
+#
+# ONE translation unit, because on this backend a module name is the key of a
+# separately compiled image rather than a label, and
+# `crates/shiso-kernels/build_plan.rs` refuses two directories claiming one
+# module name. Everything the engine dispatches under `launch::Q35 = "qwen35"`
+# has to land in an image called `qwen35`, so `qwen35.cu` is the whole of it.
+#
+# This directory exists because the unit used to live in `cuda/generic`, which
+# it only ever did because the two shared a q4_0 dequantizer and an
+# argument-block header. That stopped being the reason the moment this family's
+# own kernels arrived: the file now carries the rotary pair, the gated
+# attention and the delta rule as well as the four entries a Gemma 4 pass asks
+# for, and a Gemma pass has no business reaching into a directory named for
+# another family's generic set.
+#
+# `includes` still reaches `cuda/generic`, because the prefill GEMM, the
+# extended matvec and the q6_K gather are that directory's templates
+# (`mul_mm.cuh`, `mul_mv_ext.cuh`, `get_rows_q6_K.cuh`) instantiated here.
+#
+# Nothing here is a byte copy, so no file carries a provenance header and
+# `scripts/q4e_ptx_oracle.sh --mode=fidelity` reports it as generated. The
+# arithmetic is the Metal twins' in `crates/shiso-metal/metal/qwen35`, which is
+# what produced the committed goldens, and the laws those twins were themselves
+# ported from are the extracted, fidelity-gated units in `cuda/q4e`.
+
+[build]
+sources = ["qwen35.cu"]
+
+# Its own directory, plus the generic one whose three templates it instantiates.
+includes = ["cuda/generic", "cuda/qwen35"]
+
+# `--use_fast_math` is DROPPED here, and it is in the tree default this list
+# replaces (lists are replaced, never merged). Same reason as
+# `kernels/cuda/dense/KERNEL.toml`, and measured on this GB10 rather than
+# argued: `q35_rope_neox` builds a frequency ladder over `rope_base` and the
+# angle grows with the position, and under `--use_fast_math` nvcc rewrites
+# every `powf`/`sinf`/`cosf` call to the reduced-precision intrinsic with no
+# per-call spelling that opts back out. A standalone probe at n_rot 64 and
+# base 1e6, worst |delta| against the f64 sine and cosine of the same angle:
+#
+#     position        3      512     4096    32768
+#     fast math   2.5e-7   5.0e-5   4.1e-4   3.0e-3
+#     without     4.7e-8   6.4e-6   5.6e-5   3.4e-4
+#
+# An order of magnitude, everywhere past the first few tokens. The oracle in
+# `crates/shiso-kerneltest/src/qwen35/norm_rope.rs` reaches position 3 and
+# passes EITHER WAY, which is precisely why this is a manifest decision and not
+# something a case could have caught.
+#
+# Everything else this drops - flush-to-zero, the approximate divide and the
+# approximate square root - is a relaxation these kernels never asked for and
+# whose absence can only move an answer toward the Metal twins the goldens were
+# taken against.
+base_flags = ["-O3", "-g", "-lineinfo"]
+
+# The floor the rest of the tree's CUDA families are pinned at, and the value
+# this unit was compiled at before the move. Matching the others means one
+# architecture to reason about when a number disagrees.
+arch = ["compute_80"]
+
+[modules]
+qwen35 = "qwen35"

@@ -1,0 +1,10 @@
+{
+  "_header": "Regression lock for the Gemma 4 vision path (MLX container).",
+  "_case": "gemma4_image_e2e_golden in crates/shiso-server/tests/media_e2e.rs, with SHISO_TEST_GEMMA4_WEIGHTS=mlx",
+  "_captured_from": "gemma-4-E4B-it-qat-4bit-mlx, Metal, greedy (temperature 0), 48-token budget, thinking off",
+  "_fixture": "the same 224x224 PNG of four colour quadrants the Qwen case generates, plus the prompt 'Describe this image in one short sentence.'",
+  "_why_a_second_lock": "The mlx export is a different quantization of the same model - its 768-to-2560 projector is four-bit where the mmproj's is brain-float - so it answers this prompt differently and vision-gemma4-image.json cannot grade it. A shared lock would fail on the checkpoint rather than on the build.",
+  "_what_this_does_not_prove": "that the picture reached the model. That is the paired request in the same test: a second image of identical dimensions and different pixels must produce a different answer, which it cannot on a build that drops the pixels.",
+  "prompt_tokens": 275,
+  "answer": "This image is a four-quadrant color block pattern featuring red, green, blue, and yellow."
+}

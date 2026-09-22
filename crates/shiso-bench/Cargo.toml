@@ -1,0 +1,67 @@
+[package]
+name = "shiso-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: perf gates and golden-vector parity - tok/s baselines, fixture grammars, replay."
+
+[dependencies]
+# The `Model` contract, the ids and the shape profile the runner loads against.
+shiso-core = { workspace = true }
+# The sampler the decode loop draws with, and its options.
+shiso-engine = { workspace = true }
+# The model under measurement. The runner names one family because a recorded
+# number describes one checkpoint; a second family is a second binary beside this
+# one, not a match arm inside it.
+shiso-models = { workspace = true }
+# The other family this runner can load. Which of the two a checkpoint is comes
+# from its own config document, the same way the server decides it, so a fixture
+# that names a sparse checkpoint replays without a second binary.
+# The device the numbers describe. A baseline that does not say which backend
+# produced it is not a baseline, so the runner names it in the record it writes.
+shiso-metal = { workspace = true }
+# The other device a parity run can be pointed at. A plain dependency rather
+# than a target-gated one: this crate builds against the backend's stub arm
+# everywhere, which is what lets the code path that opens an NVIDIA device be
+# compiled and type-checked on a machine that has none. Opening one there fails
+# with a typed error instead of failing to link.
+shiso-cuda = { workspace = true }
+# The vocabulary a fixture's prompt file is encoded with. A fixture records
+# which one it used, so a replay that reached for a different file is a typed
+# error rather than a parity failure with a misleading cause.
+tokenizers = { workspace = true }
+# The parity runner has flags; the perf runners do not.
+clap = { workspace = true }
+# Library errors: a fixture that will not parse must say which file and which
+# line, and a caller that wants to react to "no device" must be able to match
+# on it rather than read a string.
+thiserror = { workspace = true }
+# Record and baseline schemas are derived rather than hand-assembled: a gate
+# that parsed its own inputs by hand would be a second place the schema lives.
+serde = { workspace = true }
+# The recorded baseline is JSON because it is read by hand as often as by a gate.
+serde_json = { workspace = true }
+# A binary edge: a failure here ends a run rather than travelling anywhere, so it
+# carries context instead of a variant.
+anyhow = { workspace = true }
+tracing = { workspace = true }
+# The runner reports its phases to stderr; the JSON record is the machine half.
+tracing-subscriber = { workspace = true }
+shiso-vision = { workspace = true }
+
+[lints]
+workspace = true
+
+# Only `tests/contracts.rs` needs these, and only to name types: the contract
+# file asserts that one `TokenId`, one device view and one cache API cross every
+# seam in the workspace, so it has to be able to write down the types on both
+# ends of each seam. Nothing in `src/` depends on them, which is why they sit
+# here rather than above.
+[dev-dependencies]
+# The neutral request/response layer, which counts tokens and never names one.
+shiso-ir = { workspace = true }
+# The cache the checkpoint tier keys on token paths.
+shiso-kvstore = { workspace = true }
+# The vocabulary: the single place in the workspace where text becomes TokenId.
+shiso-server = { workspace = true }

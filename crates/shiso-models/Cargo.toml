@@ -1,0 +1,62 @@
+[package]
+name = "shiso-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: every checkpoint family this build serves - each family's config, tensor roles and model type, one module per family."
+
+[dependencies]
+# The shared vocabulary: the `Model` contract, device memory, ids, errors. It
+# names no checkpoint family, which is why this crate exists.
+shiso-core = { workspace = true }
+# The machinery: the hybrid and sparse stacks, their scratch, the paged cache
+# adapter and the sampler. This crate supplies each family's identity - which
+# document describes the checkpoint, what its tensors are called, which token
+# ends a turn - and the engine runs it.
+shiso-engine = { workspace = true }
+# The checkpoint readers. The role bindings live HERE rather than there: role
+# names are a fact about one family, and a reader that knew them could not open
+# a checkpoint from another.
+shiso-modelfile = { workspace = true }
+# The streaming reader for a per-token embedding table read off the disk at
+# decode time. The families that have one supply the table's own numbers and
+# open the reader over the tensor that holds them.
+shiso-ple = { workspace = true }
+# The tower contract and the host-side preprocess. A family's vision tower is
+# written against both: it encodes the patch rows `shiso-vision` builds and it
+# answers `VisionTower`, which is the only shape the server has for it.
+shiso-vision = { workspace = true }
+# Every kernel argument block is a `#[repr(C)]` struct passed by value, and
+# `bytes_of` is what makes the bytes the struct's own layout rather than a
+# hand-packed array. The families' block launches are here, so this is too.
+bytemuck = { workspace = true }
+half = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The Splash package's per-artifact SHA-256. The digest check is this crate's
+# because the manifest that declares it is this family's container, and the
+# alternative to checking it here is a loader that hands a truncated file to a
+# device and gets a model that answers confidently from half of another one.
+sha2 = { workspace = true }
+# The Splash readers refuse by naming the artifact - a path, a declared length,
+# a computed digest - and an enum with a `#[error]` per variant is how that
+# sentence stays next to the case that produces it.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The device the model tests run on, and the vocabulary the golden prompt is
+# encoded with. Dev-only: this crate names no device API.
+shiso-metal = { workspace = true }
+tokenizers = { workspace = true }
+tempfile = { workspace = true }
+# The fake devices the lifecycle tests drive record their launches behind a lock.
+parking_lot = { workspace = true }
+# The checkpoint test forges a stored payload to prove that a file describing
+# another stack is unlinked rather than refused forever. Only a test reaches the
+# store directly: the models speak to it through the engine's checkpoint tier.
+shiso-kvstore = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+# Quantised matrix-multiply tier used for prefill: block-quantised MMQ, the
+# expert-indexed and vector-dot variants, on-the-fly quantisation and the weight
+# repack. Seven translation units; the rest of the directory is headers.
+#
+# The header-heavy templates here instantiate for a long list of quantisation
+# formats, which is why the work is split across seven units rather than one —
+# a single unit takes long enough to compile that it dominates a clean build.
+#
+# Stems are the module names, so the `[modules]` table below is empty: a file is
+# named for what it holds, and the registry key falls out of that. It was not
+# always so - these sources arrived carrying an upstream project's prefix, and
+# the table existed to map it away. The prefix is gone from the files
+# themselves now, which is the same job done one layer earlier. Provenance for
+# these units is recorded in VENDOR.md, where it belongs.
+
+[build]
+sources = [
+    "ggml_stubs.cu",
+    "mmq.cu",
+    "mmq_d2r.cu",
+    "quantize.cu",
+    "mmid.cu",
+    "mmvq.cu",
+    "repack.cu",
+]
+
+# The sources include each other by bare filename, so the directory itself has
+# to be on the include path.
+includes = ["cuda/mmq"]
+
+# `arch` and `defines` take the tree defaults: these units do carry Turing
+# fallbacks, so `compute_75` PTX is a real portable target for them rather than
+# a stub, and the host side reads the architecture list back to decide which
+# tensor-core tier to enable.
+
+[modules]

@@ -1,0 +1,45 @@
+[package]
+name = "shiso-vision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: host vision pipeline - image/video preprocess, both-tower weight loaders, encoder driver."
+
+[dependencies]
+# The kernel argument blocks are `#[repr(C)]` structs marshalled through
+# `bytemuck`, so their layout comes from the struct definition rather than from
+# a hand-packed byte array that could drift from the kernel's own.
+bytemuck = { workspace = true }
+# Host-side math only: the patch buffer is `f32` end to end, so this crate needs
+# no device API and no HTTP stack. `thiserror` because a rejected decode is a
+# typed outcome the server turns into a 400, not a string.
+image = { workspace = true }
+shiso-core = { workspace = true }
+# The standalone tower container, and the tensor descriptors both towers are
+# checked against. This crate reads a model file but never a quantized block:
+# a vision weight goes to the device whole or is refused by name.
+shiso-modelfile = { workspace = true }
+# The tower shard's header is a JSON table, and the checkpoint config carries
+# the shard's path in a key the config parser does not model.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# The subprocess decoder is shared between a reader thread and a watchdog
+# thread, and neither wants a poisoned lock: a decoder that panicked is already
+# being killed.
+parking_lot = { workspace = true }
+# One debug line per applied orientation tag: it changes what the model sees and
+# is invisible in the output, so it has to be visible somewhere.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The contract test builds a synthetic tower container on disk, because the
+# loader opens a real file and there is no in-memory door into it.
+tempfile = { workspace = true }
+# The encoder's device cases run the real kernels: this crate issues launches
+# through `shiso_core::Backend` and names no backend at all, so the dependency
+# is a test-only one in the direction nothing else in the workspace takes.
+shiso-metal = { workspace = true }
+
+[lints]
+workspace = true

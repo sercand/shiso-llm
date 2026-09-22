@@ -1,0 +1,60 @@
+[package]
+name = "shiso-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: the shiso binary - clap CLI, axum router, OpenAI/Anthropic adapters, scheduler."
+
+[dependencies]
+shiso-core = { workspace = true }
+shiso-engine = { workspace = true }
+shiso-ir = { workspace = true }
+shiso-kvstore = { workspace = true }
+shiso-models = { workspace = true }
+shiso-vision = { workspace = true }
+shiso-parsers = { workspace = true }
+# Declared optional so the `metal` feature below has a dep: target to enable.
+shiso-metal = { workspace = true, optional = true }
+shiso-cuda = { workspace = true, optional = true }
+
+anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+minijinja = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+http-body = { workspace = true }
+image = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+# Backend choice lives here, not on shiso-core. Empty default because Cargo
+# features are target-independent: macOS builds pass --features metal and Linux
+# builds pass --features cuda. Enabling both is a build error rather than a
+# silent precedence rule - see `open_backend`.
+default = []
+metal = ["dep:shiso-metal"]
+cuda = ["dep:shiso-cuda"]
+
+[[bin]]
+name = "shiso"
+path = "src/main.rs"
+
+[lints]
+workspace = true

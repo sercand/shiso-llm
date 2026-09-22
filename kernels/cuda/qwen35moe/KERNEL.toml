@@ -1,0 +1,62 @@
+# The `qwen35moe` module: the FP8 and NVFP4 codecs this family's weights are
+# stored in, and the routed feed-forward that reads them.
+#
+# ONE translation unit, for the reason every other directory here states: a
+# module name is the key of a separately compiled image, and the build refuses
+# two directories claiming one name.
+#
+# A directory of its own rather than entries added to `cuda/qwen35`. The two
+# families share their recurrent and attention kernels and dispatch them
+# through the same module, which is why `crates/shiso-models/src/qwen35moe/`
+# names `Qwen35Kernels` rather than owning a copy; what it cannot get there is
+# a codec the dense container has never carried, and that is what is here.
+
+[build]
+sources = ["qwen35moe.cu"]
+
+# Its own directory and `cuda/generic`.
+#
+# It was its own directory alone, and the comment here said "nothing here
+# instantiates another family's template: both codecs are this checkpoint's and
+# neither exists anywhere else in the tree". That was true of the `modelopt`
+# export's FP8 and NVFP4 and is not true of the GGUF export of the same
+# architecture, whose routed experts are `Q4_K` and `Q5_K` - codecs that DO
+# exist elsewhere in the tree, in `cuda/generic`, behind a template dispatch the
+# plain matvec and the prefill GEMM already read them through.
+#
+# `experts_kblock.cuh` instantiates that dispatch. Respelling the super-block
+# element order here instead would be a second place for it to be wrong, and the
+# two spellings would disagree only on weights nobody looked at.
+includes = ["cuda/qwen35moe", "cuda/generic"]
+
+# `--use_fast_math` is DROPPED, and it is in the tree default this list
+# replaces (lists are replaced, never merged). Not for the reason
+# `cuda/qwen35` and `cuda/dense` drop it - there is no transcendental in this
+# unit at all - but for one this unit has and they do not: every entry here is
+# graded against a host decoder that is itself graded bit-for-bit against
+# torch, and the whole value of that chain is that both ends implement the same
+# law. A relaxed reciprocal or a flushed subnormal would make the device's
+# answer its compiler's business rather than this file's, and there is nothing
+# on the other side of that trade: the decode is a table lookup, a comparison
+# and two multiplies, none of which fast math makes faster.
+#
+# Flush-to-zero in particular would be a live defect rather than a rounding
+# one. This checkpoint's NVFP4 scale arrays reach `0x01`, which is e4m3's
+# subnormal floor, and `shiso_e4m3` computes it as `(mantissa / 8) * 2^-6` -
+# an intermediate of 0.125 times 2^-6, both normal in f32, so FTZ does not
+# reach it today. It would reach a future decode written the obvious other way,
+# and the flag costs nothing to leave off.
+base_flags = ["-O3", "-g", "-lineinfo"]
+
+# The floor the rest of the tree's CUDA families are pinned at. Nothing here
+# needs more than warp shuffles today; matching the others means one
+# architecture to reason about when a number disagrees. **This is also what
+# keeps `<cuda_fp8.h>` out of `q35moe_common.cuh`**: the hardware e4m3
+# conversion is an sm_89 instruction, so at this arch the header would hand
+# back a software emulation whose rounding is its own business rather than
+# ours. The decode is written out instead, from the host law it is graded
+# against.
+arch = ["compute_80"]
+
+[modules]
+qwen35moe = "qwen35moe"

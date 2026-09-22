@@ -1,0 +1,560 @@
+//! The attention block, dense and selected-block alike.
+//!
+//! One slot in four holds one of these. It projects a query row that carries its
+//! own per-head output gate in the same tensor, normalizes and rotates the
+//! query, projects and stores a key and a value, keeps the indexer current, runs
+//! attention, applies the gate and projects back to the residual width.
+//!
+//! # Six attention kernels, one preference order
+//!
+//! The dense entry has a preference order with three shape preconditions ahead
+//! of an always-correct fallback, and the sparse entry has its own. Every one of
+//! those preconditions is a *shape* question - a row count, a head width, a
+//! shared-memory grant - so all of them are answered here, by name, and the
+//! kernel that runs is the first whose preconditions hold. A path taken for the
+//! wrong reason is a wrong answer rather than a slow one, because they do not
+//! read the same keys: the sparse ones read only the blocks the indexer
+//! selected.
+//!
+//! One entry sits above the order rather than inside it. Every kernel in it but
+//! the batched one stages several queries under a single page table, and the
+//! rows of a decode batch belong to different sequences; so a batched pass
+//! takes the batched entry whatever the grants say, and that entry is the dense
+//! one, because this kernel set ships no batched selected-block attention.
+
+use shiso_core::error::CoreResult;
+
+use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
+use crate::sparse::indexer::{self, Scorer};
+use crate::sparse::inputs::MROPE_PREFIX_BYTES;
+use crate::sparse::kernels::{self, Entry, MOD_QSA, MOD_QSA_SPARSE};
+use crate::sparse::matmul::{self, Bound, Device};
+use crate::sparse::moe::RowOrigin;
+use crate::sparse::paged::Plane;
+use crate::sparse::plan::Plan;
+use crate::sparse::scratch::Buf;
+use crate::sparse::shape::SparseShape;
+use crate::sparse::weights::AttnDesc;
+
+/// What an attention block needs that its geometry does not say.
+///
+/// Deliberately NOT `#[non_exhaustive]`: the stack builds one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttnSlot {
+    /// The layer, which names the weights.
+    pub layer: LayerRef,
+    /// The slot's rank among attention slots, which names the cache planes.
+    pub rank: u32,
+    /// Cache **rows** the pool holds - pages times [`shiso_core::page::PAGE_TOKENS`],
+    /// not pages.
+    ///
+    /// The store kernel refuses a row past this, which is what keeps a page id
+    /// the host got wrong from writing over another sequence. Handing it the
+    /// page count instead is the same refusal with the bound a factor of
+    /// `PAGE_TOKENS` too low: every write lands silently nowhere from the first
+    /// session whose page id reaches `pool_pages / PAGE_TOKENS`, its attention
+    /// reads a plane of zeros, and the answer is fluent and unrelated. Nothing
+    /// fails, which is why the unit is in the name and in this note.
+    pub pool_slots: u32,
+    /// Positions this run's context reaches.
+    ///
+    /// The selection's score buffer is strided by it: see
+    /// [`crate::sparse::shape::IndexerShape::score_blocks`].
+    pub ctx: u32,
+}
+
+/// Which attention kernel a call takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AttnPath {
+    /// The always-correct kernel: one block per (head, token), every visible
+    /// key read. Nothing about it is conditional, which is why it is what every
+    /// other path falls back to.
+    Dense,
+    /// The tiled kernel, which stages key tiles in shared memory. Faster over a
+    /// chunk, and only reachable at a row count and head width its tiles cover.
+    Tiled,
+    /// The tensor-core kernel over the whole causal range, one block per
+    /// (row, key head), the result written directly.
+    TensorCore,
+    /// The split-key kernel, which cuts the context into fixed slices and folds
+    /// them. A decode path: its slice count is fixed so that a captured graph
+    /// sees the same geometry at every context length.
+    Split,
+    /// The gathered kernel, which reads only the blocks the indexer selected.
+    Gathered,
+    /// The batched kernel: the always-correct one with one page table and one
+    /// position per row.
+    ///
+    /// It sits above the whole ladder rather than inside it, because every
+    /// other entry here stages several queries under one page table and a
+    /// batch's rows do not share one. It is also the only batched attention
+    /// entry this kernel set ships, which is why a batched pass is a dense
+    /// pass.
+    Batched,
+    /// The tensor-core kernel over the selected blocks.
+    GatheredTensorCore,
+}
+
+/// What the caller knows about this call that the shape does not say.
+///
+/// Deliberately NOT `#[non_exhaustive]`: a caller builds one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AttnContext {
+    /// Whether the indexer's selection is live for this pass.
+    ///
+    /// It is not a property of the block: it is a property of how much context
+    /// the session has accumulated, and it is the same answer for every layer of
+    /// one pass, which is why the caller supplies it rather than each block
+    /// asking.
+    pub selected: bool,
+    /// Whether the device granted the tensor-core attention kernel its shared
+    /// memory, which is more than three quarters of the per-block maximum.
+    pub tensor_core: bool,
+    /// Whether the device granted the tiled kernel its shared memory.
+    pub tiled: bool,
+    /// Whether the rows are one sequence's consecutive positions or one row per
+    /// sequence.
+    ///
+    /// Here rather than beside the row count for the same reason `selected` is:
+    /// it is a property of the pass rather than of the block, it is the same
+    /// answer for every layer, and it decides which of two kernels the store
+    /// and the attention are.
+    pub origin: RowOrigin,
+}
+
+/// Query heads that share one key head.
+fn groups(shape: &SparseShape) -> u32 {
+    if shape.gqa.kv_heads == 0 {
+        return 0;
+    }
+    shape.gqa.q_heads / shape.gqa.kv_heads
+}
+
+/// Whether the selected-block kernels can run on this geometry at all.
+///
+/// Three preconditions, and the middle one is why a stack whose query heads do
+/// not divide evenly among its key heads has no sparse path: the selection is
+/// per key head, and a group that straddled two of them would read another
+/// head's keys.
+#[must_use]
+pub fn selected_eligible(shape: &SparseShape) -> bool {
+    shape.gqa.head_dim == kernels::ATTN_SPLIT_HD
+        && shape.gqa.kv_heads != 0
+        && shape.gqa.q_heads.is_multiple_of(shape.gqa.kv_heads)
+        && groups(shape) <= kernels::ATTN_QG
+}
+
+/// Which kernel this call takes.
+///
+/// The order is the preference order. The selected-block entry comes first when
+/// a selection exists *and* the geometry supports it; below it is the dense
+/// ladder, which is itself three conditional paths above an unconditional one.
+#[must_use]
+pub fn path(shape: &SparseShape, ctx: AttnContext, n_tok: u32) -> AttnPath {
+    let head_dim = shape.gqa.head_dim;
+    // Above every precondition below it: rows from different sequences read
+    // different page tables, and no other entry in this set takes more than
+    // one.
+    if ctx.origin == RowOrigin::Unrelated {
+        return AttnPath::Batched;
+    }
+    if ctx.selected && selected_eligible(shape) {
+        return if ctx.tensor_core {
+            AttnPath::GatheredTensorCore
+        } else {
+            AttnPath::Gathered
+        };
+    }
+    if ctx.tensor_core
+        && n_tok >= kernels::ATTN_QT
+        && head_dim == kernels::TC_HD
+        && shape.gqa.kv_heads != 0
+        && shape.gqa.q_heads.is_multiple_of(shape.gqa.kv_heads)
+        && groups(shape) <= kernels::ATTN_QG
+    {
+        return AttnPath::TensorCore;
+    }
+    if ctx.tiled && kernels::qsa_tiled_eligible(n_tok, head_dim) {
+        return AttnPath::Tiled;
+    }
+    // The split path is bounded from above by the tiled path's floor rather
+    // than merely preferred below it: its partial slab is allocated once, for
+    // the widest batch it can take, so that a captured graph never sees the
+    // address move.
+    if head_dim == kernels::ATTN_SPLIT_HD
+        && shape.gqa.kv_heads != 0
+        && shape.gqa.q_heads.is_multiple_of(shape.gqa.kv_heads)
+        && n_tok < kernels::ATTN_QT
+    {
+        return AttnPath::Split;
+    }
+    AttnPath::Dense
+}
+
+/// The attention launches alone, without the projections around them.
+///
+/// Split out because the choice between the six is the part a test asks about
+/// and the projections around it are the same either way.
+#[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one statement per kernel argument is the point: these bodies are \
+              transcriptions of parameter lists, and a split that broke a list \
+              across two functions would hide the order being transcribed"
+)]
+pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32) -> Plan {
+    let mut plan = Plan::new();
+    let keys = Operand::CachePlane {
+        rank: slot.rank,
+        plane: Plane::Key,
+    };
+    let values = Operand::CachePlane {
+        rank: slot.rank,
+        plane: Plane::Value,
+    };
+    let out = Operand::Scratch(Buf::AttnOut);
+    let part = Operand::Scratch(Buf::AttnPartial);
+    let query = Operand::Scratch(Buf::AttnQuery);
+    let positions = Operand::Scratch(Buf::Positions);
+    // `out, part, n_splits`
+    let fold = |plan: &mut Plan, splits: u32| {
+        plan.launch(
+            Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_combine_kernel"),
+            kernels::qsa_attention_combine(shape.gqa.q_heads, n_tok),
+            Args::of(&[out, part, Operand::U32(splits)]),
+        );
+    };
+    // `out, k_cache, v_cache, q, head_dim, n_head, n_head_kv, pos, pages, n_tok`
+    let dense = Args::of(&[
+        out,
+        keys,
+        values,
+        query,
+        Operand::U32(shape.gqa.head_dim),
+        Operand::U32(shape.gqa.q_heads),
+        Operand::U32(shape.gqa.kv_heads),
+        positions,
+        Operand::Pages,
+        Operand::U32(n_tok),
+    ]);
+    match path(shape, ctx, n_tok) {
+        // `out, k_cache, v_cache, q, head_dim, n_head, n_head_kv, pos,
+        //  pages_arr, n_tok` - the scalar list with the page table replaced by
+        // the per-row array, which is the whole of the difference.
+        AttnPath::Batched => plan.launch(
+            Entry::plain(MOD_QSA, "q4e_qsa_attention_batch_kernel"),
+            kernels::qsa_attention_batch(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
+            Args::of(&[
+                out,
+                keys,
+                values,
+                query,
+                Operand::U32(shape.gqa.head_dim),
+                Operand::U32(shape.gqa.q_heads),
+                Operand::U32(shape.gqa.kv_heads),
+                positions,
+                Operand::PageTables,
+                Operand::U32(n_tok),
+            ]),
+        ),
+        AttnPath::Dense => plan.launch(
+            Entry::plain(MOD_QSA, "q4e_qsa_attention_kernel"),
+            kernels::qsa_attention(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
+            dense,
+        ),
+        AttnPath::Tiled => plan.launch(
+            Entry::plain(MOD_QSA, "q4e_qsa_attention_tiled_kernel"),
+            kernels::qsa_attention_tiled(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
+            dense,
+        ),
+        // One slice, so the kernel writes the destination itself and there is
+        // nothing to fold. The dense entry reads the whole causal range, which
+        // is what the absent selection list says.
+        AttnPath::TensorCore => plan.launch(
+            Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_tc_kernel"),
+            kernels::qsa_attention_tc(shape.gqa.kv_heads, n_tok, 1),
+            tc_args(shape, slot, 1, false),
+        ),
+        AttnPath::Split => {
+            plan.launch(
+                Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_split_kernel"),
+                kernels::qsa_attention_split(shape.gqa.q_heads, shape.gqa.kv_heads, n_tok),
+                // `out, part, k_cache, v_cache, q, n_head, n_head_kv, pos,
+                //  pages, n_tok, n_splits`
+                Args::of(&[
+                    out,
+                    part,
+                    keys,
+                    values,
+                    query,
+                    Operand::U32(shape.gqa.q_heads),
+                    Operand::U32(shape.gqa.kv_heads),
+                    positions,
+                    Operand::Pages,
+                    Operand::U32(n_tok),
+                    Operand::U32(kernels::ATTN_SPLITS),
+                ]),
+            );
+            fold(&mut plan, kernels::ATTN_SPLITS);
+        }
+        AttnPath::Gathered => {
+            plan.launch(
+                Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_gather_kernel"),
+                kernels::qsa_attention_gather(shape.gqa.kv_heads, n_tok),
+                // `part, k_cache, v_cache, q, tokens, n_sel, pages, width,
+                //  n_head, n_head_kv, n_splits` - it writes only the slabs, so
+                // the fold below is what writes the destination.
+                Args::of(&[
+                    part,
+                    keys,
+                    values,
+                    query,
+                    Operand::Scratch(Buf::IdxTokens),
+                    Operand::Scratch(Buf::IdxTokenCount),
+                    Operand::Pages,
+                    Operand::U32(kernels::IDX_WIDTH),
+                    Operand::U32(shape.gqa.q_heads),
+                    Operand::U32(shape.gqa.kv_heads),
+                    Operand::U32(kernels::ATTN_GSPLITS),
+                ]),
+            );
+            fold(&mut plan, kernels::ATTN_GSPLITS);
+        }
+        AttnPath::GatheredTensorCore => {
+            let splits = kernels::tc_splits_sparse(shape.gqa.kv_heads, n_tok);
+            plan.launch(
+                Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_tc_kernel"),
+                kernels::qsa_attention_tc(shape.gqa.kv_heads, n_tok, splits),
+                tc_args(shape, slot, splits, true),
+            );
+            // A single slice wrote the destination itself; folding anyway would
+            // double every value.
+            if splits > 1 {
+                fold(&mut plan, splits);
+            }
+        }
+    }
+    plan
+}
+
+/// The tensor-core entry's argument list.
+///
+/// `out, part, k_cache, v_cache, q, tokens, n_sel, pos, pages, width, n_head,
+/// n_head_kv, n_splits`. On the dense entry the selection list is absent and
+/// the kernel reads the whole causal range instead, which is what the two null
+/// pointers say.
+///
+/// # The first two arguments are exclusive
+///
+/// The kernel decides what to write by asking whether `part` is null: with a
+/// partial buffer it stores an unnormalized slab for the combine, and without
+/// one it normalizes and writes the destination itself. So exactly one of the
+/// two is a real buffer, and which one is what the split count means. Handing
+/// it both is not an over-specification - it is the slab branch, at a split
+/// count whose caller then does not fold, so the destination keeps whatever it
+/// held and the block contributes the previous chunk's attention.
+fn tc_args(shape: &SparseShape, slot: AttnSlot, splits: u32, selected: bool) -> Args {
+    let (tokens, counts) = if selected {
+        (
+            Operand::Scratch(Buf::IdxTokens),
+            Operand::Scratch(Buf::IdxTokenCount),
+        )
+    } else {
+        (Operand::Null, Operand::Null)
+    };
+    let (out, part) = if splits == 1 {
+        (Operand::Scratch(Buf::AttnOut), Operand::Null)
+    } else {
+        (Operand::Null, Operand::Scratch(Buf::AttnPartial))
+    };
+    Args::of(&[
+        out,
+        part,
+        Operand::CachePlane {
+            rank: slot.rank,
+            plane: Plane::Key,
+        },
+        Operand::CachePlane {
+            rank: slot.rank,
+            plane: Plane::Value,
+        },
+        Operand::Scratch(Buf::AttnQuery),
+        tokens,
+        counts,
+        Operand::Scratch(Buf::Positions),
+        Operand::Pages,
+        Operand::U32(kernels::IDX_WIDTH),
+        Operand::U32(shape.gqa.q_heads),
+        Operand::U32(shape.gqa.kv_heads),
+        Operand::U32(splits),
+    ])
+}
+
+/// One attention block, in launch order.
+///
+/// # Errors
+///
+/// Whatever [`matmul::project`] reports for a weight this build cannot project.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one statement per kernel argument is the point: these bodies are \
+              transcriptions of parameter lists, and a split that broke a list \
+              across two functions would hide the order being transcribed"
+)]
+pub fn block(
+    shape: &SparseShape,
+    desc: &AttnDesc,
+    slot: AttnSlot,
+    ctx: AttnContext,
+    n_tok: u32,
+    device: Device,
+) -> CoreResult<Plan> {
+    let at = |role: Role| WeightRef::layer(slot.layer, role);
+    let mut plan = Plan::new();
+    matmul::project(
+        &mut plan,
+        desc.q,
+        Bound::new(
+            at(Role::AttnQuery),
+            Operand::Scratch(Buf::Mixed),
+            Operand::Scratch(Buf::AttnQueryFull),
+        ),
+        n_tok,
+        device,
+    )?;
+    plan.launch(
+        Entry::plain(MOD_QSA, "q4e_qsa_q_norm_rope_kernel"),
+        kernels::qsa_q_norm_rope(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
+        // `q_out, gate_out, qkv, w, head_dim, n_head, n_rot, rope_base, mrope,
+        //  sec_t, sec_h, sec_w, eps` - the query projection carries the per-head
+        // output gate in its own rows, and this is what splits the two apart.
+        Args::of(&[
+            Operand::Scratch(Buf::AttnQuery),
+            Operand::Scratch(Buf::AttnGate),
+            Operand::Scratch(Buf::AttnQueryFull),
+            Operand::Weight(at(Role::AttnQueryNorm)),
+            Operand::U32(shape.gqa.head_dim),
+            Operand::U32(shape.gqa.q_heads),
+            Operand::U32(shape.gqa.n_rot),
+            Operand::f32(shape.rope_theta),
+            Operand::ScratchFrom(Buf::Mrope, MROPE_PREFIX_BYTES),
+            Operand::U32(shape.mrope.time),
+            Operand::U32(shape.mrope.height),
+            Operand::U32(shape.mrope.width),
+            Operand::f32(shape.rms_eps),
+        ]),
+    );
+    matmul::project(
+        &mut plan,
+        desc.k,
+        Bound::new(
+            at(Role::AttnKey),
+            Operand::Scratch(Buf::Mixed),
+            Operand::Scratch(Buf::AttnKey),
+        ),
+        n_tok,
+        device,
+    )?;
+    matmul::project(
+        &mut plan,
+        desc.v,
+        Bound::new(
+            at(Role::AttnValue),
+            Operand::Scratch(Buf::Mixed),
+            Operand::Scratch(Buf::AttnValue),
+        ),
+        n_tok,
+        device,
+    )?;
+    // The batched store is the scalar one with `pages` replaced by the per-row
+    // array; every other parameter, and the grid, is the same.
+    let batched = ctx.origin == RowOrigin::Unrelated;
+    let (store_entry, store_launch, store_pages) = if batched {
+        (
+            "q4e_qsa_store_kv_batch_kernel",
+            kernels::qsa_store_kv_batch(shape.gqa.kv_heads, n_tok, shape.gqa.head_dim),
+            Operand::PageTables,
+        )
+    } else {
+        (
+            "q4e_qsa_store_kv_kernel",
+            kernels::qsa_store_kv(shape.gqa.kv_heads, n_tok, shape.gqa.head_dim),
+            Operand::Pages,
+        )
+    };
+    plan.launch(
+        Entry::plain(MOD_QSA, store_entry),
+        store_launch,
+        // `k_cache, v_cache, k, v, kw, head_dim, n_head_kv, n_rot, rope_base,
+        //  pos, mrope, sec_t, sec_h, sec_w, pages, pool_slots, eps`
+        Args::of(&[
+            Operand::CachePlane {
+                rank: slot.rank,
+                plane: Plane::Key,
+            },
+            Operand::CachePlane {
+                rank: slot.rank,
+                plane: Plane::Value,
+            },
+            Operand::Scratch(Buf::AttnKey),
+            Operand::Scratch(Buf::AttnValue),
+            Operand::Weight(at(Role::AttnKeyNorm)),
+            Operand::U32(shape.gqa.head_dim),
+            Operand::U32(shape.gqa.kv_heads),
+            Operand::U32(shape.gqa.n_rot),
+            Operand::f32(shape.rope_theta),
+            Operand::Scratch(Buf::Positions),
+            Operand::ScratchFrom(Buf::Mrope, MROPE_PREFIX_BYTES),
+            Operand::U32(shape.mrope.time),
+            Operand::U32(shape.mrope.height),
+            Operand::U32(shape.mrope.width),
+            store_pages,
+            Operand::U32(slot.pool_slots),
+            Operand::f32(shape.rms_eps),
+        ]),
+    );
+    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx);
+    plan.append(indexer::store(
+        shape,
+        &desc.indexer,
+        indexed,
+        ctx.origin,
+        n_tok,
+        device,
+    )?);
+    if ctx.selected {
+        let scorer = Scorer::choose(shape.indexer.heads, ctx.tensor_core);
+        plan.append(indexer::select(
+            shape,
+            &desc.indexer,
+            indexed,
+            scorer,
+            n_tok,
+            device,
+        )?);
+    }
+    plan.append(attend(shape, slot, ctx, n_tok));
+    plan.launch(
+        Entry::plain(MOD_QSA, "q4e_qsa_gate_kernel"),
+        kernels::elementwise(u64::from(n_tok) * u64::from(shape.q_dim())),
+        // `x, gate, n` - in place over attention's own output.
+        Args::of(&[
+            Operand::Scratch(Buf::AttnOut),
+            Operand::Scratch(Buf::AttnGate),
+            Operand::U64(u64::from(n_tok) * u64::from(shape.q_dim())),
+        ]),
+    );
+    matmul::project(
+        &mut plan,
+        desc.output,
+        Bound::new(
+            at(Role::AttnOutput),
+            Operand::Scratch(Buf::AttnOut),
+            Operand::Scratch(Buf::BlockOut),
+        ),
+        n_tok,
+        device,
+    )?;
+    Ok(plan)
+}

@@ -1,0 +1,8 @@
+# Pinned so arithmetic-order-sensitive kernels and the clippy gate behave the
+# same on every machine. Run every cargo command from this directory so the pin
+# applies. rustfmt + clippy ship with the channel, so the local gate never
+# depends on a separately-installed component.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

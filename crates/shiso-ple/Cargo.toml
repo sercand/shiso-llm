@@ -1,0 +1,41 @@
+[package]
+name = "shiso-ple"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: streaming n-gram row table - dual row codec, CLOCK row cache, io_uring and thread-pool readers."
+
+[dependencies]
+# Ids, the shared error vocabulary, and the dtype that says which row codec a
+# checkpoint shipped. Nothing else: this crate touches no device.
+shiso-core = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+# The ring is a Linux dependency, not an optional one. A Cargo feature is
+# target-independent, so an optional dep would still resolve on a developer's
+# Mac and would tempt `--all-features` into a build that cannot work. A target
+# table removes the crate from the macOS graph entirely, and `src/ring` supplies
+# the same function surface from its stub arm instead.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+# A dev-dependency cycle, deliberately: `shiso-models` depends on this crate,
+# and `tests/uring_reads_the_shipped_sidecar.rs` depends back on it for the
+# per-layer sidecar's header constants. Cargo allows a cycle through
+# dev-dependencies, and the alternative is worse - a header check whose expected
+# magic, version, row stride and slot count are written out a second time here
+# passes on the wrong file the moment the writer moves and this copy does not.
+shiso-models = { workspace = true }
+# The fixtures are real files: the reader opens a descriptor and there is no
+# in-memory door into it.
+tempfile = { workspace = true }
+# The committed codec vectors are JSON, generated once by the oracle script.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

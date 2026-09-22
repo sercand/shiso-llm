@@ -1,0 +1,24 @@
+[package]
+name = "shiso-ir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: neutral request/stream IR (the narrow waist between wire formats and the engine)."
+
+[dependencies]
+# `serde_json` for the two places a caller's JSON travels through untouched - a
+# tool's schema and a tool call's arguments - built with `preserve_order` so the
+# caller's key order survives to the chat template. `futures` for the boxed event
+# stream, and `thiserror` for the one failure this crate can report.
+#
+# Deliberately no `serde` derive: these types are not wire shapes. Each API
+# surface owns its own wire structs and parses them into these, which is what
+# stops one format's envelope - a discriminator field, a nested wrapper object -
+# from becoming everyone's problem.
+serde_json = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

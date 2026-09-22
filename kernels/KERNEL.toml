@@ -1,0 +1,56 @@
+# Kernel lane defaults.
+#
+# This file is the schema. Every key the build script understands appears here
+# with its default value, and a key that appears nowhere in this file is a hard
+# build error wherever it is written. That is deliberate: a per-directory
+# manifest is edited rarely and read by three separate consumers, so a silently
+# ignored typo ("extra_nvc_flags") would surface as a missing compiler flag in a
+# PTX file nobody reads, months later. Failing the build on an unknown key costs
+# one rebuild and buys that class of bug away entirely.
+#
+# Per-directory manifests live at `kernels/<dir>/KERNEL.toml` and are merged
+# over this one key by key: a key the directory sets wins outright (lists are
+# replaced, never concatenated — concatenation makes it impossible for a
+# directory to *drop* an inherited flag), and every key it leaves out keeps the
+# value below.
+
+[build]
+# Every translation unit in this tree is compiled as C++17. The device code uses
+# fold expressions and structured bindings, and the host compilers that nvcc
+# drives do not all default high enough.
+std = "c++17"
+
+# The optimisation and debug-info flags applied to every unit. `-g -lineinfo`
+# costs nothing at runtime and is the difference between a profiler naming a
+# kernel line and naming an address; `--use_fast_math` is load-bearing rather
+# than cosmetic, because the reference numerics these kernels are checked
+# against were captured with it on.
+base_flags = ["-O3", "-g", "-lineinfo", "--use_fast_math"]
+
+# Appended last, after everything this file composes, so a directory can always
+# have the final word on a flag it needs to override rather than augment.
+extra_nvcc_flags = []
+
+# Preprocessor defines as "NAME=VALUE" (or bare "NAME"), turned into -D.
+defines = []
+
+# Include directories, relative to `kernels/`, turned into -I.
+includes = []
+
+# Device architectures to emit for. `compute_*` asks for PTX the driver JITs on
+# any newer device, which is what makes a single build portable; `sm_*` asks for
+# a fixed binary. The first entry is the one the module registry resolves for a
+# plain `ptx("name")` lookup, so order matters. `SHISO_CUDA_ARCH` (a comma list)
+# replaces this list wholesale for every directory.
+arch = ["compute_75"]
+
+# "ptx" emits portable PTX text. "cubin" additionally emits a SASS object per
+# `sm_*` architecture; it is accepted by the schema and not yet implemented by
+# the compile lane, so a manifest that asks for it fails the build loudly rather
+# than quietly producing PTX and calling it a cubin.
+outputs = ["ptx"]
+
+# File stem to module name. The module name is the registry key, so a stem may
+# not map to two names and two stems may not map to one. A stem that appears in
+# no `[modules]` table is its own module name.
+[modules]

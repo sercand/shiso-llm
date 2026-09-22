@@ -1,0 +1,49 @@
+[package]
+name = "shiso-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "shiso: backend-agnostic orchestration - qwen35 forward, sampling, sessions, KV integration."
+
+[dependencies]
+# The ids, the `Backend`/`Model` contracts and the geometry profile. Nothing here
+# names a device API: the KV pool is `Backend` buffers and the byte mover over
+# them is `kv::PoolBacking`, which is why no backend crate appears below even
+# though the engine drives one.
+shiso-core = { workspace = true }
+# Weight import is `GgufFile::mapping()` plus a byte range per tensor, so the
+# engine reads a model file but never a quant block: a tensor goes to the device
+# whole or not at all.
+shiso-modelfile = { workspace = true }
+# The one KV cache: pages, refcounts, eviction, checkpoints, disk tier. This
+# crate derives the geometry, moves page bytes, and holds a frontier per session.
+shiso-kvstore = { workspace = true }
+# The streaming n-gram table. Pure host Rust - a descriptor, a row cache and a
+# reader - so it names no device API and the engine's independence from one is
+# unaffected. It is here rather than in a model crate because the gather handle
+# the sparse pass hands out is what the reads fill in.
+shiso-ple = { workspace = true }
+# Every kernel argument block is a `#[repr(C)]` struct passed by value, and `bytes_of`
+# is what makes the bytes the struct's own layout rather than a hand-packed array.
+bytemuck = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The device the model tests run on. A dev-dependency only: the engine itself
+# names no device API, which is what lets the same forward pass compile for a
+# second backend.
+shiso-metal = { workspace = true }
+# The golden decode is over real text, so the prompt is encoded with the model's
+# own vocabulary rather than hand-picked ids.
+tokenizers = { workspace = true }
+serde_json = { workspace = true }
+# The lifecycle test builds a synthetic checkpoint on disk, because `load` opens a
+# real file and there is no in-memory door into it.
+tempfile = { workspace = true }
+# The fake device the lifecycle test runs on is shared behind an `Arc` and counts
+# what it was asked to do, so its tables are locks.
+parking_lot = { workspace = true }
+
+[lints]
+workspace = true
