@@ -3,6 +3,7 @@ name = "shiso-engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "shiso: backend-agnostic orchestration - qwen35 forward, sampling, sessions, KV integration."
 

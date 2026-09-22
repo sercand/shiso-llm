@@ -3,6 +3,7 @@ name = "shiso-modelfile"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "shiso: model-file loader - GGUF reader, quant block layouts, safetensors/OptiQ, tensor binding."
 

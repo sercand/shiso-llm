@@ -18,9 +18,9 @@
 //!   cargo test -p shiso-cuda --test qwen35_spec -- --ignored --nocapture
 //! ```
 //!
-//! # Why the dense checkpoint and not Ornith
+//! # Why the dense checkpoint and not Qwen3.6-35B-A3B
 //!
-//! Ornith emits one token and then the same CJK token for ever, so a head
+//! The NVFP4 Qwen3.6-35B-A3B checkpoint emits one token and then the same CJK token for ever, so a head
 //! drafting for it would accept nearly every guess and report an acceptance
 //! rate that means nothing. The dense model's output is healthy, so its
 //! acceptance rate is a measurement rather than an artefact - and the identity

@@ -252,7 +252,7 @@ fn the_mixture_of_experts_family_refuses_a_depth_per_container() {
 
     // The safetensors export: a DIRECTORY, whose own head is BF16 and
     // unrunnable here, so a depth is refused whatever else is passed.
-    let dir = root.path().join("Ornith-1.5-35B-A3B-NVFP4");
+    let dir = root.path().join("Qwen3.6-35B-A3B-NVFP4");
     std::fs::create_dir(&dir).expect("the container directory");
     let error = load_model(&backend, &dir, &config, &args(&dir, 3, None))
         .expect_err("the directory container binds no head this build can run");
@@ -289,7 +289,7 @@ fn the_mixture_of_experts_family_refuses_a_depth_per_container() {
 fn the_mixture_of_experts_family_without_a_depth_gets_no_speculative_refusal() {
     let config = HfConfig::from_json_str(RECORDED_QWEN35MOE_CONFIG).expect("the recorded config");
     let backend: Arc<dyn Backend> = common::FakeBackend::new();
-    let missing = Path::new("/nonexistent/Ornith-1.5-35B-A3B-NVFP4");
+    let missing = Path::new("/nonexistent/Qwen3.6-35B-A3B-NVFP4");
 
     let error = load_model(&backend, missing, &config, &args(missing, 0, None))
         .expect_err("the checkpoint directory is not on disk");

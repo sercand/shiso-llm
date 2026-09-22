@@ -1,6 +1,6 @@
 //! The Qwen 3.5 mixture-of-experts checkpoint, served over a real socket.
 //!
-//! **Every Ornith mixture-of-experts number in this repository before this file
+//! **Every Qwen3.6-35B-A3B mixture-of-experts number in this repository before this file
 //! was measured in process**, through `crates/shiso-bench` or the two `shiso-cuda`
 //! cases that drive the model type directly. The model loaded, decoded and took
 //! a picture; no server could be pointed at it, because `FamilyDefaults`

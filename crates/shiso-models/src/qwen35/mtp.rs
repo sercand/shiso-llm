@@ -623,7 +623,7 @@ fn read_failure(source: shiso_modelfile::GgufError) -> CoreError {
 /// BF16 where every norm the engine's kernels read is `f32`.
 ///
 /// So `fc` is cast to `f16` at load and the norms to `f32`. The `f16` choice is
-/// deliberate and it is the same ruling Ornith's head takes: a draft head is
+/// deliberate and it is the same ruling Qwen3.6-35B-A3B's head takes: a draft head is
 /// graded by its **acceptance rate** and not by its logits, so the half-ulp a
 /// BF16-to-F16 round trip costs on a weight is paid in a guess the target
 /// occasionally rejects, never in an answer. Cost if that is wrong: a

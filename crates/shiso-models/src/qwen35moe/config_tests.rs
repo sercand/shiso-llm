@@ -1,6 +1,6 @@
 //! The config reader, over the real documents.
 //!
-//! The two fixtures are `ornith-ai/Ornith-1.5-35B-A3B-NVFP4`'s own
+//! The two fixtures are `Qwen3.6-35B-A3B-NVFP4`'s own
 //! `config.json` and `hf_quant_config.json`, copied verbatim into
 //! `test-vectors/`. They are checked in rather than read out of the 23.4 GB
 //! snapshot for one reason: a case that skips when a checkpoint is absent and a

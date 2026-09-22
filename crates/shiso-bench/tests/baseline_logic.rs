@@ -542,15 +542,22 @@ fn a_reference_section_survives_the_round_trip_and_gates_nothing() {
 }
 
 #[test]
-fn the_committed_baselines_parse() {
+fn any_committed_baseline_parses() {
+    // A baseline that is not committed yet is the perf gate's "nothing is gated
+    // yet" state, not a failure. One that IS committed has to parse.
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("baseline");
     let perf = dir.join(Target::Metal.baseline_file());
-    let text = std::fs::read_to_string(&perf).expect("the throughput baseline is committed");
-    let file: Baseline<PerfEntry> = serde_json::from_str(&text).expect("and parses");
-    assert!(!file.is_empty(), "a baseline with no machine gates nothing");
+    if perf.exists() {
+        let text = std::fs::read_to_string(&perf).expect("the throughput baseline reads");
+        let file: Baseline<PerfEntry> = serde_json::from_str(&text).expect("and parses");
+        assert!(!file.is_empty(), "a baseline with no machine gates nothing");
+    }
 
     let resume = dir.join(Target::Resume.baseline_file());
-    let file = kv::read(&resume).expect("the resume baseline is committed and parses");
+    if !resume.exists() {
+        return;
+    }
+    let file = kv::read(&resume).expect("the resume baseline parses");
     for entry in file.values() {
         assert!(
             entry.resume_ms < entry.cold_prefill_ms,

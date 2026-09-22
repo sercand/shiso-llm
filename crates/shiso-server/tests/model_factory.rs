@@ -192,10 +192,15 @@ fn qwen35moe_fixture_yields_its_own_defaults() {
         "the mixture-of-experts document resolved to another family's defaults; \
          the most likely cause is the dense reader no longer declining it"
     );
-    assert_ne!(
-        defaults,
-        shiso_server::model_factory::FamilyDefaults::QWEN35,
-        "the document took the dense arm, which asserts 32 layers and hidden 2560"
+    // Asked of the dense reader directly rather than by comparing defaults: the
+    // two families now resolve to equal `FamilyDefaults`, so an inequality
+    // between them no longer says which arm took the document.
+    assert!(
+        matches!(
+            shiso_models::qwen35::Qwen35Config::from_hf(&config),
+            Err(shiso_core::CoreError::UnknownArch { .. })
+        ),
+        "the dense reader claimed the document, which asserts 32 layers and hidden 2560"
     );
 }
 
@@ -230,14 +235,14 @@ fn a_moe_checkpoint_directory_that_is_not_there_is_a_load_failure() {
     let config =
         HfConfig::from_json_str(RECORDED_QWEN35MOE_CONFIG).expect("the recorded config parses");
     let backend: Arc<dyn Backend> = common::FakeBackend::new();
-    let missing = Path::new("/nonexistent/Ornith-1.5-35B-A3B-NVFP4");
+    let missing = Path::new("/nonexistent/Qwen3.6-35B-A3B-NVFP4");
     let error = load_model(&backend, missing, &config, &args(missing))
         .expect_err("a checkpoint directory that is not on disk does not load");
     let FactoryError::Load(inner) = &error else {
         panic!("expected a load failure, got {error:?}");
     };
     assert!(
-        inner.to_string().contains("Ornith-1.5-35B-A3B-NVFP4"),
+        inner.to_string().contains("Qwen3.6-35B-A3B-NVFP4"),
         "the refusal names the directory it looked for, got {inner}"
     );
 }

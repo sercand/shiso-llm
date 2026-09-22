@@ -59,7 +59,7 @@
  * Four and not one, which is what this took until 2026-09-21. An `e4m3`
  * weight is one byte, so a thread reading one weight per turn made a warp
  * fetch 32 bytes per load instruction - a quarter of what one can move - and
- * this entry, the largest single kernel in an Ornith decode step at 34.6% of
+ * this entry, the largest single kernel in a Qwen3.6-35B-A3B decode step at 34.6% of
  * it, ran at 127.5 GB/s of this device's measured 239 GB/s peak. One
  * four-byte word per thread per turn takes the same shapes to 186-212 GB/s.
  * Measured in `docs/handoff/cuda-decode-perf.md`.

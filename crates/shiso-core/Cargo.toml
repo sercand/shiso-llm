@@ -3,6 +3,7 @@ name = "shiso-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "shiso: ids, shapes/config, dtypes, errors, device buffer ownership, Backend + Model traits, q4e page geometry."
 

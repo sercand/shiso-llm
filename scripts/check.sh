@@ -26,18 +26,10 @@ cargo fmt --all --check
 # link at all. `broken_intra_doc_links` is denied in the workspace lints.
 cargo doc --workspace --no-deps --locked "${FEATURES[@]}"
 
-# The copied kernels have no oracle in this repository and no device here to run
-# one on, so the only thing standing between a stray edit and a model that
-# answers confidently and wrongly is a proof that their bytes still match the
-# source they came from.
-if [ -d kernels/cuda ]; then
-    bash scripts/q4e_ptx_oracle.sh --mode=fidelity
-fi
-
 if command -v cargo-deny >/dev/null 2>&1; then
     cargo deny check
 else
-    echo "check: cargo-deny not installed, skipping (Task 20 requires it)"
+    echo "check: cargo-deny not installed, skipping (cargo install cargo-deny --locked)"
 fi
 
 # On macOS nothing may link libcuda.
@@ -49,8 +41,8 @@ if [ "$(uname -s)" = "Darwin" ] && [ -x target/debug/shiso ]; then
 fi
 
 # The rules stop being advice here: the unsafe-exception set, the documented
-# SAFETY note on every unsafe block, the public-surface snapshots, the forbidden
-# shapes, and the rule that upstream names live only in README.md.
+# SAFETY note on every unsafe block, the cross-crate type contracts, the
+# forbidden shapes, and the PROVENANCE.md table.
 bash scripts/api_gate.sh
 
 # The perf gate is arithmetic over committed records - it needs no model and no

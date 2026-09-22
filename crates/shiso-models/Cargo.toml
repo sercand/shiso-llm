@@ -3,6 +3,7 @@ name = "shiso-models"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "shiso: every checkpoint family this build serves - each family's config, tensor roles and model type, one module per family."
 

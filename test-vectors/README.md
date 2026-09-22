@@ -45,7 +45,7 @@ directories does not invalidate it.
 | `vision/vision-gemma4-mlx-image.json` | **Regression lock.** The same lock for the mlx container, which quantizes the tower's projector to four bits and so answers differently. Owned by the same case under `SHISO_TEST_GEMMA4_WEIGHTS=mlx`. |
 | `loader/qwen35-config.json`, `loader/qwen35-optiq-layout.json`, `loader/qwen35-q4km-manifest.tsv` | Loader fixtures, owned elsewhere. |
 | `loader/gemma4-config.json` | Loader fixture. The Gemma 4 E4B `config.json`, verbatim from the local sidecar directory; owned by `crates/shiso-models/tests/gemma4_config.rs`. |
-| `loader/qwen35moe-config.json`, `loader/qwen35moe-quant-config.json` | Loader fixtures. The `config.json` and `hf_quant_config.json` of `ornith-ai/Ornith-1.5-35B-A3B-NVFP4`, verbatim from the local snapshot; owned by `crates/shiso-models/src/qwen35moe/`. Checked in rather than read from the 23.4 GB checkpoint so the config cases run on a machine that does not carry it - a skipped case and a passing one look identical in the output. |
+| `loader/qwen35moe-config.json`, `loader/qwen35moe-quant-config.json` | Loader fixtures. The `config.json` and `hf_quant_config.json` of `Qwen3.6-35B-A3B-NVFP4`, verbatim from the local snapshot; owned by `crates/shiso-models/src/qwen35moe/`. Checked in rather than read from the 23.4 GB checkpoint so the config cases run on a machine that does not carry it - a skipped case and a passing one look identical in the output. |
 | `loader/ple-codec-vectors.json` | Loader fixture for the PLE codec; owned by `crates/shiso-ple/tests/ple_codec.rs`. |
 | `grammar-samples/*.vec` | **Parser conformance only.** Synthetic numbers, no model behind them, never replayed. |
 | `prompts/*.txt` | The prompt corpus. Plain user text, model-agnostic. |

@@ -24,8 +24,9 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
-# No license field: the project license is set later. Every crate is
-# publish = false, which also makes `cargo deny check licenses` skip them.
+license = "MIT"
+# Every crate is publish = false. `cargo deny check licenses` skips them through
+# `[licenses.private]` in deny.toml, not through the publish flag.
 
 [workspace.dependencies]
 # --- serialization -------------------------------------------------------

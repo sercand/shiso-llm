@@ -3,6 +3,7 @@ name = "shiso-metal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "shiso: Metal backend (objc2) - device, pipeline cache, runtime MSL compile."
 # `tests/oracle.rs` is a shared module rather than a test target, so the two real

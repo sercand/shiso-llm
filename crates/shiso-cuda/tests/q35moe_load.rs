@@ -249,10 +249,9 @@ fn a_real_prompt_runs_every_stage_of_the_pass() {
     // something that is not " Paris" has a defect somewhere between the
     // vocabulary gather and the output projection - and every one of the
     // twelve this repository has found produced finite, plausible logits.
-    // Chat-templated, because this checkpoint is an RL post-trained agentic
-    // model rather than a base one: `Ornith-1.5-35B-A3B`, whose card is about
-    // coding and agentic benchmarks. A raw completion from one of those is not
-    // the thing to judge a port by - and the raw completion this stack gives
+    // Chat-templated, because this checkpoint is a post-trained chat model
+    // rather than a base one: `Qwen3.6-35B-A3B`. A raw completion from one of
+    // those is not the thing to judge a port by - and the raw completion this stack gives
     // has been checked against an independent reference anyway, which is what
     // the plan's account records.
     let prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one \
@@ -316,8 +315,8 @@ fn a_real_prompt_runs_every_stage_of_the_pass() {
     // `transformers` 5.16.1's own `qwen3_5_moe` forward produces the same
     // argmax and logits within 0.08, and the two residuals agree at every one
     // of the forty slots. Run over the real prompt's ids the reference
-    // predicts the same first token this does. `ornith-ai/Ornith-1.5-35B-A3B`
-    // is an RL post-trained agentic model and this is a third-party NVFP4
+    // predicts the same first token this does. `Qwen3.6-35B-A3B`
+    // is a post-trained chat model and this is a third-party NVFP4
     // quantization of it; whether that quantization is a good model is a
     // question about the quantization.
     //

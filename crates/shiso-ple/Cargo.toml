@@ -3,6 +3,7 @@ name = "shiso-ple"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "shiso: streaming n-gram row table - dual row codec, CLOCK row cache, io_uring and thread-pool readers."
 

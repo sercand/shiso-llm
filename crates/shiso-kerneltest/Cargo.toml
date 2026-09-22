@@ -3,6 +3,7 @@ name = "shiso-kerneltest"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "shiso: backend-neutral CPU oracles and device cases for the dense kernel set."
 

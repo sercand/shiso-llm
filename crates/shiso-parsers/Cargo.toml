@@ -3,6 +3,7 @@ name = "shiso-parsers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "shiso: reasoning and tool-call tag parsers with stream hold-back."
 

@@ -3,6 +3,7 @@ name = "shiso-cuda"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "shiso: CUDA driver-API backend - module registry, argv launches, cuBLAS tier, graph capture."
 

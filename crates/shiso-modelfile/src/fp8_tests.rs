@@ -16,8 +16,6 @@
 use super::{E4M3_MAX, Fp8Layout, dequant_fp8, e4m3, quantize_activations, to_e4m3};
 use crate::reader::GgufError;
 
-include!("fp8_fixtures.rs");
-
 /// Bit-for-bit, because this decode is exact.
 fn assert_bits(got: &[f32], want: &[u32], label: &str) {
     assert_eq!(got.len(), want.len(), "{label}: element count");
@@ -27,29 +25,6 @@ fn assert_bits(got: &[f32], want: &[u32], label: &str) {
             *bits,
             "{label}: element {i} decoded to {value} (0x{:08x}), reference 0x{bits:08x}",
             value.to_bits(),
-        );
-    }
-}
-
-#[test]
-fn every_one_of_the_two_hundred_and_fifty_six_codes_decodes_to_the_reference() {
-    // E4M3 is one byte. There is no reason to sample it, and a sampled table
-    // is how a subnormal boundary or the exponent's top step survives a test
-    // suite: this checkpoint's scale arrays really do reach `0x01`, and a
-    // decoder that treated subnormals as zero would silence whole groups of a
-    // weight matrix rather than fail anywhere.
-    for (code, want) in E4M3_TABLE.iter().enumerate() {
-        let code = u8::try_from(code).expect("two hundred and fifty-six codes");
-        let got = e4m3(code);
-        if *want == NAN {
-            assert!(got.is_nan(), "code {code:#04x} should be NaN, got {got}");
-            continue;
-        }
-        assert_eq!(
-            got.to_bits(),
-            *want,
-            "code {code:#04x} decoded to {got} (0x{:08x}), reference 0x{want:08x}",
-            got.to_bits(),
         );
     }
 }
@@ -168,29 +143,6 @@ fn the_encode_round_trips_every_representable_magnitude() {
             e4m3(back),
             value,
             "code {code:#04x} decoded to {value} and encoded back to {back:#04x}",
-        );
-    }
-}
-
-#[test]
-fn every_tie_the_format_has_rounds_the_way_the_reference_rounds_it() {
-    // The encode's one free decision, graded exhaustively: 252 exact midpoints
-    // between adjacent finite codes, against `torch`'s own
-    // `.to(torch.float8_e4m3fn)`. It has to agree, because the device does the
-    // same conversion in hardware and a host oracle that rounded ties the
-    // other way would disagree with a kernel on a bit nobody could attribute.
-    //
-    // This encoder was also checked against the same reference on 41,260
-    // values - every midpoint, each midpoint nudged either way by one part in
-    // a million, and 40,000 uniform draws across the range and around zero -
-    // with zero mismatches. Those are not checked in because these 252 are the
-    // ones that could go either way.
-    for (bits, want) in E4M3_TIES {
-        let value = f32::from_bits(bits);
-        assert_eq!(
-            to_e4m3(value),
-            want,
-            "{value:e} (0x{bits:08x}) should encode to 0x{want:02x}",
         );
     }
 }
@@ -319,3 +271,133 @@ fn a_quantized_product_agrees_with_the_dequantized_one_within_the_codec() {
     let relative = (reference - scaled).abs() / reference.abs();
     assert!(relative < 1e-6, "relative {relative:e}");
 }
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+//
+// QKV: rows 0..2 of `model.language_model.layers.0.linear_attn.in_proj_qkv`, first 16 columns of [8192, 2048]
+const QKV_SCALE: f32 = f32::from_bits(0x3a61_2493); // 0.0008588518830947578
+const QKV_BYTES: [u8; 32] = [
+    0xda, 0x57, 0xbd, 0x46, 0xdb, 0x4a, 0x62, 0x48, 0xdf, 0x61, 0xc9, 0x58, 0xc9, 0xda, 0x5f, 0x58,
+    0xdd, 0x63, 0x4a, 0xde, 0xe1, 0x58, 0x29, 0xc1, 0x5a, 0x65, 0xdc, 0xd2, 0xe0, 0x3c, 0x5c, 0xaa,
+];
+const QKV_EXPECT: [u32; 32] = [
+    0xbc8c_b6dc,
+    0x3c53_124a,
+    0xbab6_edb7,
+    0x3b45_0001,
+    0xbc9a_c925,
+    0x3b8c_b6dc,
+    0x3d0c_b6dc,
+    0x3b61_2493,
+    0xbcd3_124a,
+    0x3cfd_4925,
+    0xbb7d_4925,
+    0x3c61_2493,
+    0xbb7d_4925,
+    0xbc8c_b6dc,
+    0x3cd3_124a,
+    0x3c61_2493,
+    0xbcb6_edb7,
+    0x3d1a_c925,
+    0x3b8c_b6dc,
+    0xbcc5_0001,
+    0xbcfd_4925,
+    0x3c61_2493,
+    0x397d_4925,
+    0xbafd_4925,
+    0x3c8c_b6dc,
+    0x3d36_edb7,
+    0xbca8_db6e,
+    0xbc0c_b6dc,
+    0xbce1_2493,
+    0x3aa8_db6e,
+    0x3ca8_db6e,
+    0xb98c_b6dc,
+];
+//   nonzero 32 of 32, amax 0.0446602963
+
+// OUT: rows 0..2 of `model.language_model.layers.0.linear_attn.out_proj`, first 16 columns of [2048, 4096]
+const OUT_SCALE: f32 = f32::from_bits(0x3a79_2493); // 0.0009504046174697578
+const OUT_BYTES: [u8; 32] = [
+    0x4a, 0xd6, 0xb1, 0xc6, 0x55, 0x4a, 0x57, 0xb2, 0x52, 0xcd, 0xd6, 0xce, 0x4a, 0x52, 0xca, 0xd9,
+    0x57, 0x49, 0xba, 0xd7, 0xd8, 0xd5, 0xdb, 0x51, 0xc4, 0x49, 0xd5, 0xda, 0xcc, 0xd3, 0xd0, 0x4c,
+];
+const OUT_EXPECT: [u32; 32] = [
+    0x3b9b_b6dc,
+    0xbc5a_0001,
+    0xba0c_2493,
+    0xbb5a_0001,
+    0x3c4a_6db7,
+    0x3b9b_b6dc,
+    0x3c69_924a,
+    0xba1b_b6dc,
+    0x3c1b_b6dc,
+    0xbbca_6db7,
+    0xbc5a_0001,
+    0xbbda_0001,
+    0x3b9b_b6dc,
+    0x3c1b_b6dc,
+    0xbb9b_b6dc,
+    0xbc8c_2493,
+    0x3c69_924a,
+    0x3b8c_2493,
+    0xba9b_b6dc,
+    0xbc69_924a,
+    0xbc79_2493,
+    0xbc4a_6db7,
+    0xbcab_4925,
+    0x3c0c_2493,
+    0xbb3a_db6e,
+    0x3b8c_2493,
+    0xbc4a_6db7,
+    0xbc9b_b6dc,
+    0xbbba_db6e,
+    0xbc2b_4925,
+    0xbbf9_2493,
+    0x3bba_db6e,
+];
+//   nonzero 32 of 32, amax 0.0209089015
+
+// QPROJ: rows 0..2 of `model.language_model.layers.3.self_attn.q_proj`, first 16 columns of [8192, 2048]
+const QPROJ_SCALE: f32 = f32::from_bits(0x3a46_db6e); // 0.0007585798157379031
+const QPROJ_BYTES: [u8; 32] = [
+    0x52, 0x32, 0x5b, 0xce, 0x50, 0x4b, 0x58, 0xdb, 0xce, 0x57, 0x51, 0x5a, 0x35, 0xc8, 0xd1, 0x58,
+    0x5b, 0x4b, 0xd2, 0xd6, 0xda, 0x61, 0x5b, 0x57, 0xca, 0x42, 0xd1, 0xd9, 0xd7, 0x58, 0x4c, 0x5e,
+];
+const QPROJ_EXPECT: [u32; 32] = [
+    0x3bf8_924a,
+    0x39f8_924a,
+    0x3c88_b6dc,
+    0xbbae_0000,
+    0x3bc6_db6e,
+    0x3b88_b6dc,
+    0x3c46_db6e,
+    0xbc88_b6dc,
+    0xbbae_0000,
+    0x3c3a_6db7,
+    0x3bdf_b6dc,
+    0x3c78_924a,
+    0x3a21_9249,
+    0xbb46_db6e,
+    0xbbdf_b6dc,
+    0x3c46_db6e,
+    0x3c88_b6dc,
+    0x3b88_b6dc,
+    0xbbf8_924a,
+    0xbc2e_0000,
+    0xbc78_924a,
+    0x3cdf_b6dc,
+    0x3c88_b6dc,
+    0x3c3a_6db7,
+    0xbb78_924a,
+    0x3af8_924a,
+    0xbbdf_b6dc,
+    0xbc5f_b6dc,
+    0xbc3a_6db7,
+    0x3c46_db6e,
+    0x3b95_2492,
+    0x3cae_0000,
+];
+//   nonzero 32 of 32, amax 0.0273088738

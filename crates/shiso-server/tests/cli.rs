@@ -44,7 +44,7 @@ fn serve_help() -> String {
 fn a_bare_serve_takes_the_documented_defaults() {
     let args = parse(&["--model", "m.gguf"]).expect("a model is the only required flag");
     assert_eq!(args.bind, "127.0.0.1");
-    assert_eq!(args.port, 8000);
+    assert_eq!(args.port, 8090);
     assert_eq!(args.ctx, 4096);
     assert_eq!(args.kvstore_budget_mb, 4096);
     assert_eq!(args.spec_k, 0);

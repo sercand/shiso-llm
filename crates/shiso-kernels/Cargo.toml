@@ -3,6 +3,7 @@ name = "shiso-kernels"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "Device kernels compiled at build time and embedded as named modules"
 

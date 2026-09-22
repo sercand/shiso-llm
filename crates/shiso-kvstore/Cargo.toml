@@ -3,6 +3,7 @@ name = "shiso-kvstore"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "shiso: the KV cache - radix span tree, paged KV, GDN checkpoints, Marconi eviction, disk spill."
 

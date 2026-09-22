@@ -32,9 +32,9 @@
 //!
 //! These weights were split from `Qwen/Qwen3.6-35B-A3B`, so they predict the
 //! hidden states of that model. `unsloth`'s `UD-Q4_K_XL` is a quantization of
-//! the same base and pairs with them. A FINETUNE of that base does not:
-//! `Ornith-1.5-35B-A3B` is one, and its hidden states are its own, so this head
-//! over that body would draft fluently and be rejected. Nothing here can check
+//! the same base and pairs with them. A FINETUNE of that base does not: its
+//! hidden states are its own, so this head over a fine-tune's body would draft
+//! fluently and be rejected. Nothing here can check
 //! that - the files do not say what they were trained against - so it is stated
 //! rather than enforced, and the acceptance rate is what reveals a mispairing.
 

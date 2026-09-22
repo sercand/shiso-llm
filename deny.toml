@@ -33,9 +33,9 @@ allow = [
 confidence-threshold = 0.8
 exceptions = []
 
-# The project's own crates carry no license field yet, and none of them is
-# published. This is the switch that acts on that, rather than the `publish`
-# flag doing it implicitly - which it does not.
+# The project's own crates are MIT and none of them is published. This is the
+# switch that skips them, rather than the `publish` flag doing it implicitly -
+# which it does not.
 [licenses.private]
 ignore = true
 

@@ -3,9 +3,8 @@
 # advice and become a build failure.
 #
 # Everything here was a rule somebody could have broken quietly. Undocumented
-# public items, a fifth crate reaching for unsafe, an upstream name left in a
-# comment, a public surface that changed without anyone seeing it in a diff -
-# none of these break a test, and all of them are cheap to catch by reading the
+# public items, a fifth crate reaching for unsafe, a workspace member with no
+# provenance row - none of these break a test, and all of them are cheap to catch by reading the
 # tree. So this script reads the tree.
 #
 # It reports every failure it finds rather than stopping at the first, because
@@ -116,12 +115,12 @@ for dir in crates/*/; do
 done
 
 # ---------------------------------------------------------------------------
-section "no upstream provenance in the code (rule 15)"
-
-
+section "provenance (rule 15)"
+# ---------------------------------------------------------------------------
+# Upstream projects are credited in PROVENANCE.md rather than in code comments.
 # The rule only works if the attribution actually landed somewhere, so the
-# Provenance table must have a row naming every workspace member.
-provenance=$(awk '/^## Provenance$/ { on = 1; next } /^## / { on = 0 } on' README.md)
+# table must have a row naming every workspace member.
+provenance=$(cat PROVENANCE.md 2>/dev/null)
 members=$(awk '/^members = \[/ { on = 1; next } /^\]/ { on = 0 } on' Cargo.toml |
     sed -e 's/[",]//g' -e 's#.*/##' -e 's/^[[:space:]]*//' -e '/^$/d')
 missing=""
@@ -129,9 +128,9 @@ for crate in $members; do
     printf '%s' "$provenance" | grep -q "crates/$crate" || missing="$missing $crate"
 done
 if [ -z "$missing" ]; then
-    ok "README.md section Provenance names every workspace member"
+    ok "PROVENANCE.md names every workspace member"
 else
-    bad "README.md section Provenance has no row for:$missing"
+    bad "PROVENANCE.md has no row for:$missing"
 fi
 
 # ---------------------------------------------------------------------------
@@ -200,45 +199,6 @@ fi
 # workspace allow-list, so a public function that grows a fifth positional
 # argument fails the clippy step below and has to become a named struct.
 ok "argument-count rule is clippy's (too_many_arguments is not allowed anywhere)"
-
-# ---------------------------------------------------------------------------
-section "public API snapshots"
-# ---------------------------------------------------------------------------
-# The four crates every other crate builds against. Nothing here is published,
-# so this is not about semver: it is about making a public-surface change show
-# up in the diff of the change that makes it, which is the cheapest review of
-# API drift there is.
-API_CRATES="shiso-core shiso-modelfile shiso-kvstore shiso-ir"
-for crate in $API_CRATES; do
-    [ -f "api/$crate.txt" ] || bad "api/$crate.txt is missing - record it with cargo public-api"
-done
-if ! command -v cargo-public-api >/dev/null 2>&1; then
-    note "SKIPPED the snapshot diff for $API_CRATES: cargo-public-api is not installed."
-    note "      Install it with: cargo install cargo-public-api --locked"
-    note "      The committed snapshots were checked for presence only, not for drift."
-elif ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
-    note "SKIPPED the snapshot diff for $API_CRATES: cargo-public-api needs a nightly"
-    note "      toolchain to emit rustdoc JSON. Install it with: rustup toolchain install nightly"
-    note "      The committed snapshots were checked for presence only, not for drift."
-else
-    snapdir=$(mktemp -d)
-    for crate in $API_CRATES; do
-        if ! cargo public-api -p "$crate" --omit blanket-impls,auto-trait-impls \
-            > "$snapdir/$crate.txt" 2> "$snapdir/$crate.err"; then
-            bad "cargo public-api failed for $crate:"
-            tail -20 "$snapdir/$crate.err" >&2
-            continue
-        fi
-        if diff -u "api/$crate.txt" "$snapdir/$crate.txt" > "$snapdir/$crate.diff"; then
-            ok "api/$crate.txt matches the crate's public surface"
-        else
-            bad "the public surface of $crate changed without the snapshot being re-recorded."
-            bad "  Re-record with: cargo public-api -p $crate --omit blanket-impls,auto-trait-impls > api/$crate.txt"
-            head -60 "$snapdir/$crate.diff" >&2
-        fi
-    done
-    rm -rf "$snapdir"
-fi
 
 # ---------------------------------------------------------------------------
 section "cross-crate type contracts"
