@@ -373,9 +373,13 @@ fn half(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Proj
     })
 }
 
-/// The brain-float tier, which has no split and no single-row instantiation.
+/// The brain-float tier, which has no split.
+///
+/// One row is instantiated because a draft head can carry brain-float dense
+/// projections, and a draft pass is one row; a chunk wider than the
+/// instantiated width is split into passes by [`project`].
 fn brain(in_dim: u32, out_dim: u32, rows: u32) -> CoreResult<Projection> {
-    if !(2..=MAX_ROWS).contains(&rows) {
+    if !(1..=MAX_ROWS).contains(&rows) {
         return Err(CoreError::Unsupported {
             what: "a brain-float projection at a row count this kernel set was not built for",
             backend: "engine",
@@ -510,7 +514,14 @@ pub fn project(
     rows: u32,
     device: Device,
 ) -> CoreResult<()> {
-    if weight.dtype == DType::F16 && half_in_passes(weight.in_dim, weight.out_dim, rows, device) {
+    let passes = match weight.dtype {
+        DType::F16 => half_in_passes(weight.in_dim, weight.out_dim, rows, device),
+        // The brain-float tier has no BLAS path, so passes are its only way
+        // through a chunk - a draft head's catch-up over the prompt is one.
+        DType::BF16 => rows > MAX_ROWS,
+        _ => false,
+    };
+    if passes {
         let mut done = 0;
         while done < rows {
             let take = (rows - done).min(MAX_ROWS);
@@ -1087,15 +1098,37 @@ mod tests {
     }
 
     #[test]
-    fn a_brain_float_projection_has_no_single_row_instantiation() {
-        let err = brain(2_560, 128, 1).expect_err("one row is not in the built set");
+    fn a_brain_float_projection_runs_one_row_and_splits_a_chunk_into_passes() {
+        for want in [1, 4, MAX_ROWS] {
+            let plan = brain(2_560, 128, want).expect("the built set covers it");
+            let Projection::BrainRows { entry, rows, .. } = plan else {
+                panic!("{plan:?}");
+            };
+            assert_eq!(rows, want);
+            assert_eq!(entry.name(), "q4e_matmul_bf16_rows_kernel");
+        }
+        let err = brain(2_560, 128, MAX_ROWS + 1).expect_err("one launch is at most the width");
         assert!(matches!(err, CoreError::Unsupported { .. }), "{err:?}");
-        let plan = brain(2_560, 128, 4).expect("four rows is");
-        let Projection::BrainRows { entry, rows, .. } = plan else {
-            panic!("{plan:?}");
-        };
-        assert_eq!(rows, 4);
-        assert_eq!(entry.name(), "q4e_matmul_bf16_rows_kernel");
+        // A draft head's catch-up chunk: two full passes and a narrower tail.
+        let mut out = Plan::new();
+        let weight = WeightRef::layer(
+            crate::sparse::bind::LayerRef::target(0),
+            crate::sparse::bind::Role::AttnQuery,
+        );
+        let bound = Bound::new(
+            weight,
+            Operand::Scratch(Buf::Residual),
+            Operand::Scratch(Buf::Embed),
+        );
+        project(
+            &mut out,
+            WeightDesc::new(DType::BF16, 2_560, 12_288),
+            bound,
+            2 * MAX_ROWS + 3,
+            GPU,
+        )
+        .expect("a brain-float chunk runs in passes");
+        assert_eq!(out.len(), 3);
     }
 
     #[test]

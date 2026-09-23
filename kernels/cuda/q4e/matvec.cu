@@ -100,7 +100,7 @@ __global__ void q4e_matmul_q8_0_rows_warp_kernel(
     }
 }
 
-/* BF16 matmul for 2..16 activation rows: a warp per output row, lane-strided
+/* BF16 matmul for 1..16 activation rows: a warp per output row, lane-strided
  * bf16x2 weight loads dotted with every row's f32 activation.  The indexer
  * projections (2560 -> 128 and 2560 -> 512) are BF16 and run on every
  * forward; at a few rows the cuBLAS GemmEx path (with its f32 -> bf16
@@ -374,6 +374,8 @@ template __global__ void q4e_matmul_q8_0_rows_warp_kernel<15>(
 template __global__ void q4e_matmul_q8_0_rows_warp_kernel<16>(
         float *, const unsigned char *, const int8_t *, const float *,
         uint64_t, uint32_t);
+template __global__ void q4e_matmul_bf16_rows_kernel<1>(
+        float *, const __nv_bfloat16 *, const float *, uint32_t, uint32_t);
 template __global__ void q4e_matmul_bf16_rows_kernel<2>(
         float *, const __nv_bfloat16 *, const float *, uint32_t, uint32_t);
 template __global__ void q4e_matmul_bf16_rows_kernel<3>(
