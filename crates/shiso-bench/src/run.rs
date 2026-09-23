@@ -212,7 +212,7 @@ pub fn run_case(
     base_dir: &Path,
     case: &LocalCase,
 ) -> ReplayResult<TopSlice> {
-    let produced = run_case_row(harness, vocabulary, base_dir, case)?;
+    let produced = run_case_row(harness, vocabulary, base_dir, case, REPLAY_CHUNK)?;
     Ok(top_k(
         &produced.row,
         usize::try_from(case.top_count).unwrap_or(0),
@@ -236,6 +236,9 @@ pub struct CaseRow {
 /// distribution is where an exact KL finds a quantized build's lost mass, and
 /// a top-k slice has already thrown it away.
 ///
+/// `chunk` is the prefill width; [`REPLAY_CHUNK`] everywhere except a run that
+/// asks for the width a server prefills at, to see its chunk boundaries.
+///
 /// # Errors
 ///
 /// Whatever [`case_tokens`] or the forward pass reports.
@@ -244,9 +247,10 @@ pub fn run_case_row(
     vocabulary: &Vocabulary,
     base_dir: &Path,
     case: &LocalCase,
+    chunk: usize,
 ) -> ReplayResult<CaseRow> {
     let (tokens, prompt_tokens) = encode_case(vocabulary, base_dir, case, None)?;
-    let row = harness.frontier_row(&tokens, REPLAY_CHUNK)?;
+    let row = harness.frontier_row(&tokens, chunk)?;
     Ok(CaseRow {
         row,
         consumed: tokens.len(),
