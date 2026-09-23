@@ -585,6 +585,13 @@ impl SessionPages {
         Ok(TableChange::Republished)
     }
 
+    /// Pages this session still has to claim to hold `positions` tokens.
+    #[must_use]
+    pub fn shortfall(&self, positions: u32) -> u32 {
+        let held = u32::try_from(self.frontier.pages()).unwrap_or(u32::MAX);
+        pages_for(positions).saturating_sub(held)
+    }
+
     /// Claims pages up to `positions` and republishes the table if that moved.
     ///
     /// Claiming is the only way to make a cache row writable: a page the

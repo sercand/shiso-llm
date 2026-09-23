@@ -525,6 +525,7 @@ impl SparseStack {
                 cap: capacity,
             });
         }
+        self.make_room(session, positions)?;
         let live = self
             .sessions
             .get_mut(&session)

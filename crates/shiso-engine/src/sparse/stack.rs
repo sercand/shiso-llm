@@ -1003,8 +1003,54 @@ impl SparseStack {
                 cap: capacity,
             });
         }
+        self.make_room(session, next)?;
+        let live = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
         let change = live.pages.ensure(next)?;
         Ok(change == crate::sparse::paged::TableChange::Republished)
+    }
+
+    /// Evicts idle spans until the pool can give `session` the pages it still
+    /// needs to hold `positions` tokens.
+    ///
+    /// The cache keeps every finished conversation's pages as a reusable
+    /// prefix until something needs them, so a pool that has served a few long
+    /// requests is full of idle spans - and without this every new request
+    /// after that failed for want of a page rather than reclaiming one. Spans
+    /// a live session stands on are never victims. A pool that still cannot
+    /// supply the pages is reported by the claim that follows.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`], and the typed failure of a torn-down
+    /// stack.
+    pub(crate) fn make_room(&mut self, session: SessionId, positions: u32) -> CoreResult<()> {
+        let want = self.session(session)?.pages.shortfall(positions);
+        if want == 0 {
+            return Ok(());
+        }
+        let now = self.now();
+        let cache = &self.resident()?.cache;
+        let stats = cache.stats();
+        if stats.pool_pages.saturating_sub(stats.pages_used) >= want {
+            return Ok(());
+        }
+        let report = cache.evict_to(want, now);
+        if report.pages_freed > 0 {
+            tracing::debug!(
+                want,
+                positions,
+                pages_used = stats.pages_used,
+                pool_pages = stats.pool_pages,
+                pages_freed = report.pages_freed,
+                spans = report.nodes_dropped,
+                checkpoints = report.ckpts_dropped,
+                "evicted idle spans for a claim"
+            );
+        }
+        Ok(())
     }
 
     /// Records that a session advanced by `tokens`, and registers the span it
