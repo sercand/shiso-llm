@@ -4,8 +4,15 @@
 //! cargo run -p shiso-bench --release --bin parity -- \
 //!   --model "$SHISO_TEST_MODEL" --backend metal \
 //!   --vectors test-vectors/goldens/qwen35-local-golden.vec [--case ID]... [--strict] \
-//!   [--capture OUT.vec --label STR] [--json OUT.json]
+//!   [--capture OUT.vec --label STR] [--json OUT.json] [--dump-rows DIR]
 //! ```
+//!
+//! # Rows for an exact KL
+//!
+//! `--dump-rows DIR` also writes each case's whole logits row, as
+//! `DIR/<case-id>.f16.npy` plus `DIR/index.json`, in the layout the independent
+//! reference writes (see [`shiso_bench::rows`]). It works beside a capture or a
+//! replay, and like a capture it refuses to replace anything already there.
 //!
 //! # Replay refuses more than it compares
 //!
@@ -29,8 +36,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use shiso_bench::compare::{Budget, FLOOR, STRICT, Verdict, compare};
+use shiso_bench::compare::{TopSlice, top_k};
 use shiso_bench::replay::{Device, Harness, Vocabulary};
-use shiso_bench::run::{REPLAY_CHUNK, case_tokens, prompts_digest, run_case};
+use shiso_bench::rows::{IndexEntry, RowDump};
+use shiso_bench::run::{REPLAY_CHUNK, case_tokens, prompts_digest, run_case_row};
 use shiso_bench::vecfile::{self, Body, LocalCase, VecFile};
 
 /// Replay or capture a golden-vector fixture against a local checkpoint.
@@ -87,6 +96,14 @@ struct Args {
     /// locks in whatever was wrong on the day.
     #[arg(long, default_value_t = 0)]
     preview: usize,
+
+    /// Also write each case's full logits row here: `<case-id>.f16.npy` plus
+    /// `index.json`.
+    ///
+    /// The directory is created if needed; a row or index already in it is a
+    /// refusal, checked before the checkpoint loads.
+    #[arg(long)]
+    dump_rows: Option<PathBuf>,
 }
 
 /// What every captured fixture says about itself, in the file, in these words.
@@ -160,6 +177,18 @@ fn main() -> Result<()> {
         provenance.check(&fixture)?;
     }
 
+    // Opened before the checkpoint so a used directory costs a second, not a
+    // load and a prefill.
+    let mut dump = match &args.dump_rows {
+        Some(dir) => {
+            let dump = RowDump::create(dir)
+                .with_context(|| format!("opening {} for rows", dir.display()))?;
+            dump.check_free(cases.iter().map(|c| c.id.as_str()))?;
+            Some(dump)
+        }
+        None => None,
+    };
+
     let config = args.config.clone().unwrap_or_else(default_config);
     let mut harness = Harness::open(device, &args.model, &config, ctx)
         .with_context(|| format!("opening {} for {}", args.model.display(), device.as_str()))?;
@@ -177,14 +206,33 @@ fn main() -> Result<()> {
             &vocabulary,
             &base_dir,
             &cases,
-            &args,
-            &provenance,
-            &out,
+            &CaptureDesc {
+                args: &args,
+                provenance: &provenance,
+                out: &out,
+            },
+            dump.as_mut(),
         )
     } else {
-        replay(&mut harness, &vocabulary, &base_dir, &cases, args.strict)
+        replay(
+            &mut harness,
+            &vocabulary,
+            &base_dir,
+            &cases,
+            args.strict,
+            dump.as_mut(),
+        )
     };
     harness.close().context("releasing the device")?;
+    // The rows written so far are indexed even when a later case failed, so a
+    // long run that died at its last case still leaves its rows readable.
+    if let Some(dump) = dump {
+        let index = dump.finish().context("writing the row index")?;
+        report(&format!(
+            "shiso-parity: wrote rows, indexed in {}",
+            index.display()
+        ));
+    }
     let verdicts = outcome?;
 
     if let Some(path) = &args.json {
@@ -263,6 +311,35 @@ impl Provenance {
     }
 }
 
+/// Runs one case, writes its row when a dump is open, and returns its slice.
+fn produce(
+    harness: &mut Harness,
+    vocabulary: &Vocabulary,
+    base_dir: &Path,
+    case: &LocalCase,
+    dump: Option<&mut RowDump>,
+) -> Result<TopSlice> {
+    let produced = run_case_row(harness, vocabulary, base_dir, case)?;
+    if let Some(dump) = dump {
+        // The index names the row's 0-based position, one less than the
+        // count of tokens the case feeds; see `shiso_bench::rows`.
+        let frontier = produced
+            .consumed
+            .checked_sub(1)
+            .context("a case with frontier 0 reads no row")?;
+        let entry = IndexEntry {
+            prompt_file: case.prompt.to_string_lossy().into_owned(),
+            frontier: u32::try_from(frontier)?,
+            prompt_tokens: u32::try_from(produced.prompt_tokens)?,
+        };
+        dump.write(&case.id, &produced.row, entry)?;
+    }
+    Ok(top_k(
+        &produced.row,
+        usize::try_from(case.top_count).unwrap_or(0),
+    ))
+}
+
 /// Grades every case and returns the verdicts.
 fn replay(
     harness: &mut Harness,
@@ -270,6 +347,7 @@ fn replay(
     base_dir: &Path,
     cases: &[&LocalCase],
     strict: bool,
+    mut dump: Option<&mut RowDump>,
 ) -> Result<Vec<Verdict>> {
     let budget: &Budget = if strict { &STRICT } else { &FLOOR };
     let mut verdicts = Vec::with_capacity(cases.len());
@@ -281,7 +359,7 @@ fn replay(
                 case.id
             );
         }
-        let produced = run_case(harness, vocabulary, base_dir, case)?;
+        let produced = produce(harness, vocabulary, base_dir, case, dump.as_deref_mut())?;
         let verdict = compare(&case.id, &case.tops, &produced, budget);
         report(&verdict.report_line());
         for failure in &verdict.failures {
@@ -292,16 +370,32 @@ fn replay(
     Ok(verdicts)
 }
 
+/// What a capture records beside the rows it runs: where the fixture goes and
+/// what its header says.
+#[derive(Debug, Clone, Copy)]
+struct CaptureDesc<'a> {
+    /// The command line, for the label, backend, model and preview.
+    args: &'a Args,
+    /// The digests the fixture records.
+    provenance: &'a Provenance,
+    /// Where the completed fixture is written.
+    out: &'a Path,
+}
+
 /// Fills a skeleton and writes the completed fixture.
 fn capture(
     harness: &mut Harness,
     vocabulary: &Vocabulary,
     base_dir: &Path,
     cases: &[&LocalCase],
-    args: &Args,
-    provenance: &Provenance,
-    out: &Path,
+    desc: &CaptureDesc<'_>,
+    mut dump: Option<&mut RowDump>,
 ) -> Result<Vec<Verdict>> {
+    let CaptureDesc {
+        args,
+        provenance,
+        out,
+    } = *desc;
     if out.exists() {
         bail!(
             "{} already exists. A recorded answer is only worth what the person who read it put \
@@ -316,7 +410,7 @@ fn capture(
 
     let mut filled = Vec::with_capacity(cases.len());
     for case in cases {
-        let produced = run_case(harness, vocabulary, base_dir, case)?;
+        let produced = produce(harness, vocabulary, base_dir, case, dump.as_deref_mut())?;
         let preview = vocabulary.decode(&[shiso_core::ids::TokenId::new(
             produced.first().map_or(0, |e| e.token),
         )])?;

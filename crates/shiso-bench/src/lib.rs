@@ -57,5 +57,6 @@ pub mod measure;
 pub mod ple;
 pub mod prefill;
 pub mod replay;
+pub mod rows;
 pub mod run;
 pub mod vecfile;
