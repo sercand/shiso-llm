@@ -332,11 +332,18 @@ fn open_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend
 
 /// How the server writes `tojson` in every chat template it renders.
 ///
+/// Spaced, for every family: each template this server renders was written for
+/// the Python engine, whose `tojson` separates with `", "` and `": "` and leaves
+/// `<`, `>`, `&` and `'` alone. The template engine's built-in escapes those four
+/// as `\u003c`-style sequences and packs the separators, so a tool schema that
+/// said `<content> & metadata` reached the model in a spelling it was never
+/// trained on - and so did every non-string argument replayed from history.
+///
 /// One constant, read by the boot path and by the parity tests, so the tests
 /// render exactly what production sends: a test that picked its own style would
 /// pass while the server rendered something else.
 pub const SERVER_TOOL_JSON_STYLE: tokenizer::jinja_helpers::ToolJsonStyle =
-    tokenizer::jinja_helpers::ToolJsonStyle::Compact;
+    tokenizer::jinja_helpers::ToolJsonStyle::Spaced;
 
 /// Builds the prompt renderer, reporting rather than failing when the checkpoint
 /// ships no chat template.

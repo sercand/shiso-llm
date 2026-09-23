@@ -27,7 +27,14 @@ use minijinja::{Environment, Value};
 /// How `{{ x | tojson }}` writes JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ToolJsonStyle {
-    /// No spaces: `{"a":1}`.
+    /// No spaces: `{"a":1}`, from the template engine's built-in, which also
+    /// escapes `<`, `>`, `&` and `'` for HTML.
+    ///
+    /// The server no longer renders with it (see
+    /// [`crate::SERVER_TOOL_JSON_STYLE`]): the templates it serves were written
+    /// for the Python engine, whose output is spaced and unescaped, and a schema
+    /// rendered this way is one the model was not trained on. It stays for the
+    /// tests that pin the context this crate builds independently of the style.
     #[default]
     Compact,
     /// Reference spacing: `{"a": 1}`.
