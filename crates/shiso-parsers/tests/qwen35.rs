@@ -245,3 +245,74 @@ fn a_whole_turn_splits_into_a_trace_and_an_answer() {
         ]
     );
 }
+
+fn email_strings() -> std::sync::Arc<shiso_parsers::StringParams> {
+    let schema = serde_json::json!({"type": "object", "properties": {
+        "path": {"type": "string"}, "new_text": {"type": "string"},
+        "count": {"type": "integer"}, "note": {"type": ["string", "null"]}
+    }});
+    std::sync::Arc::new(shiso_parsers::StringParams::from_schemas([(
+        "edit_file",
+        &schema,
+    )]))
+}
+
+fn edit_call(body: &str) -> serde_json::Value {
+    let mut p = shiso_parsers::parser_for_prompt_with(
+        ReasoningScheme::Qwen3,
+        ToolCallScheme::Qwen35,
+        CLOSED_PROMPT,
+        email_strings(),
+    );
+    let mut segs = p.push(body);
+    segs.extend(p.finish());
+    match segs.as_slice() {
+        [Segment::ToolCall { name, arguments }] if name == "edit_file" => {
+            serde_json::from_str(arguments).expect("JSON arguments")
+        }
+        other => panic!("expected one edit_file call, got {other:?}"),
+    }
+}
+
+/// With the request's schema in hand, a `string` parameter is a string whatever
+/// its text looks like, and a declared integer is still read as one.
+#[test]
+fn a_string_parameter_that_looks_like_a_number_stays_a_string() {
+    let v = edit_call(
+        "<tool_call>\n<function=edit_file>\n<parameter=path>\n123\n</parameter>\n<parameter=count>\n2\n</parameter>\n</function>\n</tool_call>",
+    );
+    assert_eq!(v["path"], serde_json::json!("123"));
+    assert_eq!(v["count"], serde_json::json!(2));
+}
+
+/// File content that happens to be valid JSON is still the file content, and a
+/// nullable string is a string.
+#[test]
+fn a_json_looking_string_argument_stays_a_string() {
+    let v = edit_call(
+        "<tool_call>\n<function=edit_file>\n<parameter=new_text>\n{\"a\": 1}\n</parameter>\n<parameter=note>\ntrue\n</parameter>\n</function>\n</tool_call>",
+    );
+    assert_eq!(v["new_text"], serde_json::json!("{\"a\": 1}"));
+    assert_eq!(v["note"], serde_json::json!("true"));
+}
+
+/// Without a schema the reader still guesses from the text, as before.
+#[test]
+fn without_a_schema_a_value_is_read_as_the_json_it_parses_as() {
+    let mut p = parser_for_prompt(
+        ReasoningScheme::Qwen3,
+        ToolCallScheme::Qwen35,
+        CLOSED_PROMPT,
+    );
+    let mut segs = p.push(
+        "<tool_call>\n<function=f>\n<parameter=n>\n123\n</parameter>\n</function>\n</tool_call>",
+    );
+    segs.extend(p.finish());
+    let [Segment::ToolCall { arguments, .. }] = segs.as_slice() else {
+        panic!("{segs:?}")
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(arguments).expect("JSON")["n"],
+        serde_json::json!(123)
+    );
+}

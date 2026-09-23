@@ -233,7 +233,13 @@ async fn queue(
     let generate = GenerateRequest::new(Arc::from(tokens), sampling, seed, max_tokens)
         .with_text(text)
         .with_stop(Arc::from(request.stop.clone()))
-        .with_media(Arc::from(media));
+        .with_media(Arc::from(media))
+        .with_string_params(Arc::new(shiso_parsers::StringParams::from_schemas(
+            request
+                .tools
+                .iter()
+                .map(|tool| (tool.name.as_str(), &tool.input_schema)),
+        )));
     let events = state.engine.generate(generate).await?;
     Ok(Started {
         events,

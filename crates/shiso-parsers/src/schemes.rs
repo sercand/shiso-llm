@@ -4,8 +4,11 @@
 //! using different tag conventions. This module configures and constructs
 //! [`StreamParser`] implementations matching each scheme.
 
+use std::sync::Arc;
+
 use crate::segment::Segment;
-use crate::tags::{TagParser, ToolBody};
+use crate::string_params::StringParams;
+use crate::tags::{TagParser, TagParserDesc, ToolBody};
 
 /// Which reasoning tags a stream carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +107,7 @@ pub fn resumes_thinking(reasoning: ReasoningScheme, prompt: &str) -> bool {
 /// reasoning opener itself and leave the model nothing to emit but the trace.
 #[must_use]
 pub fn parser(reasoning: ReasoningScheme, tools: ToolCallScheme) -> Box<dyn StreamParser> {
-    build(reasoning, tools, false)
+    build(reasoning, tools, false, Arc::default())
 }
 
 /// Builds the parser for a scheme pair, for a turn that continues `prompt`.
@@ -118,14 +121,37 @@ pub fn parser_for_prompt(
     tools: ToolCallScheme,
     prompt: &str,
 ) -> Box<dyn StreamParser> {
-    build(reasoning, tools, resumes_thinking(reasoning, prompt))
+    build(
+        reasoning,
+        tools,
+        resumes_thinking(reasoning, prompt),
+        Arc::default(),
+    )
 }
 
-/// The half both entries share.
+/// [`parser_for_prompt`], with the request's declared string parameters, so a
+/// call body is decoded with the types the caller declared rather than guessed.
+#[must_use]
+pub fn parser_for_prompt_with(
+    reasoning: ReasoningScheme,
+    tools: ToolCallScheme,
+    prompt: &str,
+    strings: Arc<StringParams>,
+) -> Box<dyn StreamParser> {
+    build(
+        reasoning,
+        tools,
+        resumes_thinking(reasoning, prompt),
+        strings,
+    )
+}
+
+/// The half every entry shares.
 fn build(
     reasoning: ReasoningScheme,
     tools: ToolCallScheme,
     in_thinking: bool,
+    strings: Arc<StringParams>,
 ) -> Box<dyn StreamParser> {
     if reasoning == ReasoningScheme::None && tools == ToolCallScheme::None {
         return Box::new(PassthroughParser);
@@ -140,14 +166,15 @@ fn build(
         ToolCallScheme::Qwen35 => ("<tool_call>", "</tool_call>", ToolBody::QwenXml),
     };
 
-    Box::new(TagParser::new(
+    Box::new(TagParser::new(TagParserDesc {
         think_open,
         think_close,
         tool_open,
         tool_close,
         tool_body,
         in_thinking,
-    ))
+        strings,
+    }))
 }
 
 /// Builds a parser configured for Gemma 4 reasoning and tool calls.

@@ -27,12 +27,14 @@
 pub mod gemma_dict;
 pub mod schemes;
 pub mod segment;
+pub mod string_params;
 pub mod tags;
 
 pub use gemma_dict::{GemmaDictError, gemma_dict_to_json};
 pub use schemes::{
     PassthroughParser, ReasoningScheme, StreamParser, ToolCallScheme, gemma4, parser,
-    parser_for_prompt, passthrough, qwen3, qwen35, resumes_thinking,
+    parser_for_prompt, parser_for_prompt_with, passthrough, qwen3, qwen35, resumes_thinking,
 };
 pub use segment::Segment;
+pub use string_params::StringParams;
 pub use tags::TagParser;

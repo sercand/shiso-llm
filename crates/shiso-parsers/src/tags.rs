@@ -14,9 +14,12 @@
 //! incoming text either completes the tag (triggering a state transition) or
 //! proves that the suffix was regular prose all along.
 
+use std::sync::Arc;
+
 use crate::gemma_dict::gemma_dict_to_json;
 use crate::schemes::StreamParser;
 use crate::segment::Segment;
+use crate::string_params::StringParams;
 
 /// Format of the payload between tool call opening and closing tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +42,25 @@ enum State {
     ToolCall(String),
 }
 
+/// Everything a [`TagParser`] is built from.
+#[derive(Debug)]
+pub(crate) struct TagParserDesc {
+    /// The reasoning opener, empty for a scheme with none.
+    pub(crate) think_open: &'static str,
+    /// The reasoning closer, empty for a scheme with none.
+    pub(crate) think_close: &'static str,
+    /// The tool-call opener, empty for a scheme with none.
+    pub(crate) tool_open: &'static str,
+    /// The tool-call closer, empty for a scheme with none.
+    pub(crate) tool_close: &'static str,
+    /// How the text between the tool tags is read.
+    pub(crate) tool_body: ToolBody,
+    /// Whether the turn starts inside the reasoning trace.
+    pub(crate) in_thinking: bool,
+    /// The request's string-typed tool parameters.
+    pub(crate) strings: Arc<StringParams>,
+}
+
 /// A streaming tag parser that extracts reasoning and tool-call blocks.
 #[derive(Debug)]
 pub struct TagParser {
@@ -49,6 +71,7 @@ pub struct TagParser {
     tool_body: ToolBody,
     state: State,
     buffer: String,
+    strings: Arc<StringParams>,
 }
 
 impl TagParser {
@@ -60,26 +83,20 @@ impl TagParser {
     /// closer. A parser that started in prose would hand the whole trace to the
     /// client as text and leak the closing tag behind it.
     #[must_use]
-    pub(crate) fn new(
-        think_open: &'static str,
-        think_close: &'static str,
-        tool_open: &'static str,
-        tool_close: &'static str,
-        tool_body: ToolBody,
-        in_thinking: bool,
-    ) -> Self {
+    pub(crate) fn new(desc: TagParserDesc) -> Self {
         Self {
-            think_open,
-            think_close,
-            tool_open,
-            tool_close,
-            tool_body,
-            state: if in_thinking {
+            think_open: desc.think_open,
+            think_close: desc.think_close,
+            tool_open: desc.tool_open,
+            tool_close: desc.tool_close,
+            tool_body: desc.tool_body,
+            state: if desc.in_thinking {
                 State::Thinking
             } else {
                 State::Text
             },
             buffer: String::new(),
+            strings: desc.strings,
         }
     }
 
@@ -142,7 +159,11 @@ impl TagParser {
     /// null - and the text itself when it parses as none of those or as a JSON
     /// string, since a bare `Paris` is not JSON and a quoted `"Paris"` was
     /// quoted by the model rather than by the template.
-    fn decode_qwen_xml_call(body: &str) -> Option<Segment> {
+    ///
+    /// The guess is made only where the request did not answer the question: a
+    /// parameter its schema declares as a string is the text, whatever the text
+    /// looks like.
+    fn decode_qwen_xml_call(body: &str, strings: &StringParams) -> Option<Segment> {
         const FUNCTION_OPEN: &str = "<function=";
         const PARAMETER_OPEN: &str = "<parameter=";
         const PARAMETER_CLOSE: &str = "</parameter>";
@@ -181,7 +202,12 @@ impl TagParser {
                 // still what it meant to pass.
                 None => (value_region, value_region.len()),
             };
-            arguments.insert(key, qwen_xml_value(raw));
+            let value = if strings.is_string(name, &key) {
+                serde_json::Value::String(strip_one_newline(raw).to_owned())
+            } else {
+                qwen_xml_value(raw)
+            };
+            arguments.insert(key, value);
             rest = &value_region[consumed..];
         }
 
@@ -195,7 +221,7 @@ impl TagParser {
         let parsed = match self.tool_body {
             ToolBody::GemmaCall => Self::decode_gemma_call(body),
             ToolBody::Json => Self::decode_json_call(body),
-            ToolBody::QwenXml => Self::decode_qwen_xml_call(body),
+            ToolBody::QwenXml => Self::decode_qwen_xml_call(body, &self.strings),
             ToolBody::None => None,
         };
         parsed.unwrap_or_else(|| {
@@ -373,21 +399,26 @@ impl StreamParser for TagParser {
     }
 }
 
-/// One `<parameter=…>` body, as the value it stands for.
+/// One `<parameter=…>` body with the template's framing newlines removed.
 ///
 /// Exactly one newline is stripped from each end, because exactly one is what
 /// the template put there: a value's own leading or trailing blank line is part
 /// of the value, and trimming freely would eat it. Interior newlines are never
 /// touched - a multi-line parameter is the case the XML grammar exists for.
-fn qwen_xml_value(raw: &str) -> serde_json::Value {
+fn strip_one_newline(raw: &str) -> &str {
     let text = raw
         .strip_prefix("\r\n")
         .or_else(|| raw.strip_prefix('\n'))
         .unwrap_or(raw);
-    let text = text
-        .strip_suffix("\r\n")
+    text.strip_suffix("\r\n")
         .or_else(|| text.strip_suffix('\n'))
-        .unwrap_or(text);
+        .unwrap_or(text)
+}
+
+/// One `<parameter=…>` body, as the value it stands for, when the request did
+/// not declare its type: the JSON it parses as, or the text.
+fn qwen_xml_value(raw: &str) -> serde_json::Value {
+    let text = strip_one_newline(raw);
     match serde_json::from_str::<serde_json::Value>(text) {
         Ok(serde_json::Value::String(_)) | Err(_) => serde_json::Value::String(text.to_string()),
         Ok(value) => value,

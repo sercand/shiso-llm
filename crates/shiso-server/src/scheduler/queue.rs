@@ -128,6 +128,13 @@ pub struct GenerateRequest {
     /// request crosses a thread boundary; cloning it to cross would double the
     /// largest allocation in the request path.
     pub media: Arc<[VisionItem]>,
+    /// Which declared tool parameters are strings, so the tool-call reader keeps
+    /// them as strings. Empty for a request with no tools.
+    ///
+    /// The XML call body carries no types; without this the reader guesses
+    /// from the text, and a `path` of `123` or file content that parses as JSON
+    /// reaches the tool as something it never declared.
+    pub string_params: Arc<shiso_parsers::StringParams>,
 }
 
 impl GenerateRequest {
@@ -147,6 +154,7 @@ impl GenerateRequest {
             max_tokens,
             stop: Arc::from(Vec::new()),
             media: Arc::from(Vec::new()),
+            string_params: Arc::default(),
         }
     }
 
@@ -168,6 +176,14 @@ impl GenerateRequest {
     #[must_use]
     pub fn with_media(mut self, media: Arc<[VisionItem]>) -> Self {
         self.media = media;
+        self
+    }
+
+    /// The same generation, with the request's string-typed tool parameters
+    /// attached.
+    #[must_use]
+    pub fn with_string_params(mut self, strings: Arc<shiso_parsers::StringParams>) -> Self {
+        self.string_params = strings;
         self
     }
 }

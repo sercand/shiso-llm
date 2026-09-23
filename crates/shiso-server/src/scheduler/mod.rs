@@ -497,6 +497,7 @@ impl Coordinator {
         // Cloned off the request before it is moved into the slot; it is an
         // `Arc<str>`, so the clone is a refcount and not the prompt.
         let prompt_text = Arc::clone(&request.prompt_text);
+        let string_params = Arc::clone(&request.string_params);
         let mut slot = SeqSlot::new(
             request,
             SlotSetup {
@@ -511,8 +512,15 @@ impl Coordinator {
             // The rendered prompt and not just the schemes: a template can
             // spend the reasoning opener itself - Qwen 3.5's closes the
             // generation prompt with `<think>\n` - and then the turn begins
-            // inside the trace with no opener left for the model to emit.
-            shiso_parsers::parser_for_prompt(self.parsers.0, self.parsers.1, &prompt_text),
+            // inside the trace with no opener left for the model to emit. The
+            // declared string parameters ride along so a call's values are
+            // read with the types the caller declared.
+            shiso_parsers::parser_for_prompt_with(
+                self.parsers.0,
+                self.parsers.1,
+                &prompt_text,
+                string_params,
+            ),
         );
         self.try_resume(&mut slot);
         if let Some(refused) = self.slots.admit(slot) {
