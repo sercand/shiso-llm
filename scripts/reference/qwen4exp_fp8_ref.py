@@ -1037,7 +1037,11 @@ def cmd_capture(args) -> None:
                 sys.exit(f"case {c.id}: not a prefix of {longest.id}")
         positions = sorted({c.frontier - 1 for c in group})
         log(f"pass: {prompt} ({mode}), {len(ids)} tokens, positions {positions}")
+        tied0 = sum(ca.tied_rows for ca in ref.attention)
+        over0 = sum(ca.over_budget_rows for ca in ref.attention)
         r = ref.forward(ids, positions, dump_layers=layer_dir is not None)
+        log(f"pass: indexer rows over budget {sum(ca.over_budget_rows for ca in ref.attention) - over0}, "
+            f"with a tie straddling the top-k cut {sum(ca.tied_rows for ca in ref.attention) - tied0}")
         tot_read = sum(t[2] for t in r["timings"])
         log(
             f"pass: {r['seconds']:.1f}s (expert reads {tot_read:.1f}s wall in workers), "
