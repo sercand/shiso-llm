@@ -103,6 +103,14 @@ pub struct ServeArgs {
     /// than inventing a prompt format the model has never seen.
     #[arg(long, env = "SHISO_CHAT_TEMPLATE")]
     pub chat_template: Option<PathBuf>,
+    /// Sampling defaults. Defaults to `generation_config.json` beside the config.
+    ///
+    /// Its `temperature`, `top_k`, `top_p` and `min_p` are what a caller who
+    /// names no sampling knob gets, and each knob a caller names overrides its
+    /// own. A missing file means neutral sampling; a file that does not parse
+    /// stops the server at boot.
+    #[arg(long, env = "SHISO_GENERATION_CONFIG")]
+    pub generation_config: Option<PathBuf>,
     /// Address to listen on.
     #[arg(long, env = "SHISO_BIND", default_value = DEFAULT_BIND)]
     pub bind: String,
@@ -502,6 +510,18 @@ impl ServeArgs {
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join("chat_template.jinja")
+        })
+    }
+
+    /// Where the sampling defaults are read from.
+    #[must_use]
+    pub fn generation_config_path(&self) -> PathBuf {
+        self.generation_config.clone().unwrap_or_else(|| {
+            let config = self.config_path();
+            config
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("generation_config.json")
         })
     }
 

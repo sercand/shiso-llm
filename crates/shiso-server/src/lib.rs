@@ -101,6 +101,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             config_path.display()
         )
     })?;
+    // Before the weights move: a card that exists and does not parse is an
+    // operator mistake, and finding it after a minutes-long load is the most
+    // expensive place to find it.
+    let sampling_preset = load_sampling_preset(&args)?;
     let load_started = std::time::Instant::now();
     let model_factory::Loaded {
         mut model,
@@ -164,6 +168,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     );
 
     let mut state = AppState::new(engine, model_id, args.ctx);
+    if let Some(preset) = sampling_preset {
+        state = state.with_sampling_preset(preset);
+    }
     if let Some(tier) = tier {
         state = state.with_checkpoint_tier(tier);
     }
@@ -393,6 +400,42 @@ fn build_renderer(
             );
             Some(renderer)
         }
+    }
+}
+
+/// The sampling preset from the checkpoint's generation config.
+///
+/// `Ok(None)` when there is no file to read, which keeps neutral sampling and
+/// says so in the log: plenty of checkpoints ship none. A file that is there
+/// and does not parse is an error, because serving on with neutral sampling
+/// would silently be a different model from the one the operator pointed at.
+fn load_sampling_preset(args: &ServeArgs) -> anyhow::Result<Option<shiso_core::SamplingParams>> {
+    let path = args.generation_config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let preset = api::pipeline::preset_from_generation_config(&text)
+                .with_context(|| format!("parsing the generation config at {}", path.display()))?;
+            tracing::info!(
+                path = %path.display(),
+                temperature = preset.temperature,
+                top_k = preset.top_k.map(std::num::NonZeroU32::get),
+                top_p = preset.top_p,
+                min_p = preset.min_p,
+                "sampling preset from the generation config"
+            );
+            Ok(Some(preset))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                path = %path.display(),
+                "no generation config; a caller who names no sampling knob gets neutral sampling"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(anyhow!(error).context(format!(
+            "reading the generation config at {}",
+            path.display()
+        ))),
     }
 }
 

@@ -83,31 +83,88 @@ impl PromptField {
     }
 }
 
-/// The settings a caller who named nothing gets.
+/// The fallback preset, for a checkpoint that ships no generation config.
 ///
 /// Neutral rather than opinionated: every stage is a no-op and the temperature
 /// is one, so an unset knob is the model's own distribution and not this
-/// server's taste. A configurable preset is a scheduler-era knob, and it belongs
-/// with the rest of the admission policy rather than in a constant here.
+/// server's taste. A checkpoint that does ship one gets
+/// [`preset_from_generation_config`] instead, which is what the published model
+/// is served with.
 #[must_use]
 pub const fn preset() -> SamplingParams {
     SamplingParams::neutral()
+}
+
+/// The sampling a checkpoint's `generation_config.json` asks for.
+///
+/// This is what the published model is served with when a caller names nothing,
+/// so it is the preset rather than [`SamplingParams::neutral`]: a neutral preset
+/// samples temperature one over the whole vocabulary, and the tail it keeps is
+/// where malformed tool tags come from. Keys the file does not name keep the
+/// neutral value. `do_sample: false` is greedy.
+///
+/// # Errors
+///
+/// The parse error, for a file that is not a JSON object of the expected types.
+pub fn preset_from_generation_config(text: &str) -> Result<SamplingParams, serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    struct Card {
+        #[serde(default)]
+        do_sample: Option<bool>,
+        #[serde(default)]
+        temperature: Option<f32>,
+        #[serde(default)]
+        top_k: Option<u32>,
+        #[serde(default)]
+        top_p: Option<f32>,
+        #[serde(default)]
+        min_p: Option<f32>,
+    }
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    // A struct also deserializes from a JSON array, field by field; a card that
+    // is a list is not a card, whatever its members happen to be.
+    if !value.is_object() {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "a generation config is a JSON object",
+        ));
+    }
+    let card: Card = serde_json::from_value(value)?;
+    let mut preset = SamplingParams::neutral();
+    if let Some(temperature) = card.temperature {
+        preset.temperature = temperature;
+    }
+    if let Some(top_k) = card.top_k {
+        // Zero is "no top-k stage" here as on the wire.
+        preset.top_k = std::num::NonZeroU32::new(top_k);
+    }
+    if let Some(top_p) = card.top_p {
+        preset.top_p = top_p;
+    }
+    if let Some(min_p) = card.min_p {
+        preset.min_p = min_p;
+    }
+    if card.do_sample == Some(false) {
+        preset.temperature = 0.0;
+    }
+    Ok(preset)
 }
 
 /// Resolves what the caller asked for against the preset.
 ///
 /// Returns the settings the sampler runs and the stream it draws from. The two
 /// are returned together because a seed without the settings it was drawn for
-/// cannot reproduce anything.
+/// cannot reproduce anything. Each knob the caller named overrides the preset's
+/// one by one, and the rest of the preset stands: a caller who sends only a
+/// temperature still gets the checkpoint's top-k.
 #[must_use]
-pub fn resolve_sampling(request: &Request) -> (SamplingParams, Seed) {
+pub fn resolve_sampling(request: &Request, preset: SamplingParams) -> (SamplingParams, Seed) {
     let asked = request.sampling;
     // Built by mutation rather than as a literal: the engine's settings type is
     // `#[non_exhaustive]`, so a struct expression for it is not available from
     // this crate. Every field the caller left silent therefore keeps the preset
     // value it starts with, which is the behaviour a literal would have had to
     // spell out anyway.
-    let mut resolved = preset();
+    let mut resolved = preset;
     if let Some(temperature) = asked.temperature {
         resolved.temperature = temperature;
     }
@@ -229,7 +286,7 @@ async fn queue(
         request.max_tokens.min(budget)
     };
 
-    let (sampling, seed) = resolve_sampling(request);
+    let (sampling, seed) = resolve_sampling(request, state.sampling_preset);
     let generate = GenerateRequest::new(Arc::from(tokens), sampling, seed, max_tokens)
         .with_text(text)
         .with_stop(Arc::from(request.stop.clone()))
@@ -262,7 +319,7 @@ fn remaining_budget(ctx: u32, prompt_tokens: u64) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptField, remaining_budget, resolve_sampling};
+    use super::{PromptField, preset, remaining_budget, resolve_sampling};
     use shiso_ir::{Message, Request, Sampling};
 
     fn request() -> Request {
@@ -271,7 +328,7 @@ mod tests {
 
     #[test]
     fn a_caller_who_named_nothing_gets_the_neutral_preset() {
-        let (sampling, _seed) = resolve_sampling(&request());
+        let (sampling, _seed) = resolve_sampling(&request(), preset());
         assert!((sampling.temperature - 1.0).abs() < f32::EPSILON);
         assert_eq!(sampling.top_k, None);
         assert!((sampling.top_p - 1.0).abs() < f32::EPSILON);
@@ -286,7 +343,7 @@ mod tests {
             temperature: Some(0.0),
             ..Sampling::default()
         };
-        let (sampling, _seed) = resolve_sampling(&request);
+        let (sampling, _seed) = resolve_sampling(&request, preset());
         assert!(sampling.is_greedy());
     }
 
@@ -299,7 +356,7 @@ mod tests {
             top_k: Some(0),
             ..Sampling::default()
         };
-        let (sampling, _seed) = resolve_sampling(&request);
+        let (sampling, _seed) = resolve_sampling(&request, preset());
         assert_eq!(sampling.top_k, None);
     }
 
@@ -307,16 +364,54 @@ mod tests {
     fn a_named_seed_is_the_seed_and_a_silent_one_is_not_zero() {
         let mut request = request();
         request.seed = Some(4242);
-        let (_sampling, seed) = resolve_sampling(&request);
+        let (_sampling, seed) = resolve_sampling(&request, preset());
         assert_eq!(seed.get(), 4242);
 
-        let (_sampling, fresh) = resolve_sampling(&self::request());
-        let (_sampling, again) = resolve_sampling(&self::request());
+        let (_sampling, fresh) = resolve_sampling(&self::request(), preset());
+        let (_sampling, again) = resolve_sampling(&self::request(), preset());
         assert_ne!(
             fresh.get(),
             again.get(),
             "a silent seed is fresh entropy, not a constant"
         );
+    }
+
+    /// The checkpoint card the sparse family ships, verbatim in its sampling
+    /// keys.
+    const CARD: &str = r#"{"do_sample": true, "temperature": 1.0, "top_k": 20, "top_p": 0.95, "eos_token_id": [248046, 248044]}"#;
+
+    #[test]
+    fn the_checkpoint_card_becomes_the_preset() {
+        let preset = super::preset_from_generation_config(CARD).expect("parses");
+        assert!((preset.temperature - 1.0).abs() < f32::EPSILON);
+        assert_eq!(preset.top_k.map(std::num::NonZeroU32::get), Some(20));
+        assert!((preset.top_p - 0.95).abs() < 1e-6);
+    }
+
+    /// Each knob the caller names overrides the preset one by one; the rest of
+    /// the preset stands, so naming a temperature does not reopen the tail.
+    #[test]
+    fn a_request_naming_only_temperature_keeps_the_preset_top_k() {
+        let preset = super::preset_from_generation_config(CARD).expect("parses");
+        let mut request = request();
+        request.sampling.temperature = Some(0.7);
+        let (sampling, _seed) = resolve_sampling(&request, preset);
+        assert!((sampling.temperature - 0.7).abs() < f32::EPSILON);
+        assert_eq!(sampling.top_k.map(std::num::NonZeroU32::get), Some(20));
+    }
+
+    #[test]
+    fn do_sample_false_makes_the_preset_greedy() {
+        let preset =
+            super::preset_from_generation_config(r#"{"do_sample": false, "temperature": 0.6}"#)
+                .expect("parses");
+        assert!(preset.is_greedy());
+    }
+
+    #[test]
+    fn a_card_that_is_not_a_json_object_is_refused() {
+        assert!(super::preset_from_generation_config("[1, 2]").is_err());
+        assert!(super::preset_from_generation_config(r#"{"top_k": "twenty"}"#).is_err());
     }
 
     #[test]

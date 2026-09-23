@@ -78,6 +78,9 @@ pub struct AppState {
     pub response_store: Arc<ResponseStore>,
     /// When the process started serving, for the uptime metric.
     pub started_at: Instant,
+    /// The sampling a caller who names nothing gets: the checkpoint's
+    /// generation config, or neutral when it ships none.
+    pub sampling_preset: shiso_core::SamplingParams,
 }
 
 impl AppState {
@@ -96,7 +99,15 @@ impl AppState {
             renderer: None,
             response_store: ResponseStore::from_env(),
             started_at: Instant::now(),
+            sampling_preset: shiso_core::SamplingParams::neutral(),
         }
+    }
+
+    /// The same state with a sampling preset other than neutral.
+    #[must_use]
+    pub const fn with_sampling_preset(mut self, preset: shiso_core::SamplingParams) -> Self {
+        self.sampling_preset = preset;
+        self
     }
 
     /// The same state with the disk tier attached.

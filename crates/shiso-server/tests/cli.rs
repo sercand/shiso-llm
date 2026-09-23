@@ -187,6 +187,28 @@ fn the_config_and_vocabulary_default_beside_the_files_they_describe() {
     );
 }
 
+/// The sampling defaults sit beside the config, as the checkpoint ships them,
+/// unless the operator names another file.
+#[test]
+fn the_generation_config_defaults_beside_the_config() {
+    let args = parse(&["--model", "/models/weights/m.gguf"]).expect("it parses");
+    assert_eq!(
+        args.generation_config_path(),
+        PathBuf::from("/models/weights/generation_config.json")
+    );
+    let args = parse(&[
+        "--model",
+        "/models/weights/m.gguf",
+        "--generation-config",
+        "/elsewhere/card.json",
+    ])
+    .expect("it parses");
+    assert_eq!(
+        args.generation_config_path(),
+        PathBuf::from("/elsewhere/card.json")
+    );
+}
+
 /// A checkpoint directory carries its own config, so "beside the checkpoint"
 /// means inside it. Getting this wrong points the default one level too high,
 /// where the sibling export's config is as likely to be found as nothing at
@@ -294,6 +316,7 @@ fn every_documented_flag_declares_its_prefixed_environment_fallback() {
         "SHISO_SPEC_K",
         "SHISO_VISION",
         "SHISO_VIDEO_ALLOW_FFMPEG",
+        "SHISO_GENERATION_CONFIG",
     ] {
         assert!(
             help.contains(variable),
@@ -320,6 +343,7 @@ fn the_help_lists_every_flag_an_operator_is_told_about() {
         "--auth-tokens",
         "--vision",
         "--video-allow-ffmpeg",
+        "--generation-config",
     ] {
         assert!(help.contains(flag), "{flag} is missing from the help");
     }
