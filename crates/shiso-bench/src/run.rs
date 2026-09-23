@@ -70,6 +70,17 @@ pub fn case_tokens_with_leading(
     case: &LocalCase,
     leading: Option<TokenId>,
 ) -> ReplayResult<Vec<TokenId>> {
+    encode_case(vocabulary, base_dir, case, leading).map(|(tokens, _)| tokens)
+}
+
+/// The body of [`case_tokens_with_leading`], which also returns how many tokens
+/// the whole prompt encoded to before the frontier cut it.
+fn encode_case(
+    vocabulary: &Vocabulary,
+    base_dir: &Path,
+    case: &LocalCase,
+    leading: Option<TokenId>,
+) -> ReplayResult<(Vec<TokenId>, usize)> {
     let path = prompt_path(base_dir, case);
     let text = std::fs::read_to_string(&path).map_err(|source| ReplayError::Io {
         path: path.clone(),
@@ -88,8 +99,9 @@ pub fn case_tokens_with_leading(
             frontier: case.frontier,
         });
     }
+    let total = tokens.len();
     tokens.truncate(frontier);
-    Ok(tokens)
+    Ok((tokens, total))
 }
 
 /// Where a case's prompt file lives.
@@ -200,7 +212,44 @@ pub fn run_case(
     base_dir: &Path,
     case: &LocalCase,
 ) -> ReplayResult<TopSlice> {
-    let tokens = case_tokens(vocabulary, base_dir, case)?;
+    let produced = run_case_row(harness, vocabulary, base_dir, case)?;
+    Ok(top_k(
+        &produced.row,
+        usize::try_from(case.top_count).unwrap_or(0),
+    ))
+}
+
+/// The whole logits row one case produced, and where in its prompt it sits.
+#[derive(Debug, Clone)]
+pub struct CaseRow {
+    /// The raw logits after the case's frontier, one per vocabulary entry.
+    pub row: Vec<f32>,
+    /// Tokens fed before the row was read: the case's frontier.
+    pub consumed: usize,
+    /// Tokens the whole prompt file encodes to, before the frontier cut it.
+    pub prompt_tokens: usize,
+}
+
+/// Runs one case and returns its full row rather than a slice of it.
+///
+/// What [`run_case`] slices, and what a row dump writes whole: the tail of the
+/// distribution is where an exact KL finds a quantized build's lost mass, and
+/// a top-k slice has already thrown it away.
+///
+/// # Errors
+///
+/// Whatever [`case_tokens`] or the forward pass reports.
+pub fn run_case_row(
+    harness: &mut Harness,
+    vocabulary: &Vocabulary,
+    base_dir: &Path,
+    case: &LocalCase,
+) -> ReplayResult<CaseRow> {
+    let (tokens, prompt_tokens) = encode_case(vocabulary, base_dir, case, None)?;
     let row = harness.frontier_row(&tokens, REPLAY_CHUNK)?;
-    Ok(top_k(&row, usize::try_from(case.top_count).unwrap_or(0)))
+    Ok(CaseRow {
+        row,
+        consumed: tokens.len(),
+        prompt_tokens,
+    })
 }

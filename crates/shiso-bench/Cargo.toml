@@ -49,6 +49,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 # The runner reports its phases to stderr; the JSON record is the machine half.
 tracing-subscriber = { workspace = true }
+# The row dump writes half-precision logits, the shared layout the independent
+# reference writes too; `from_f32` is the round-to-nearest-even conversion.
+half = { workspace = true }
 shiso-vision = { workspace = true }
 
 [lints]
