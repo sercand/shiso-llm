@@ -140,6 +140,7 @@ fn qwen35_fixture_yields_qwen35_defaults() {
             reasoning: shiso_parsers::ReasoningScheme::Qwen3,
             tools: shiso_parsers::ToolCallScheme::Qwen35,
             thinking_default: true,
+            effort: shiso_server::tokenizer::render_prompt::EffortSpelling::STANDARD,
             speculates: true,
         }
     );
@@ -177,6 +178,7 @@ fn qwen35moe_fixture_yields_its_own_defaults() {
             reasoning: shiso_parsers::ReasoningScheme::Qwen3,
             tools: shiso_parsers::ToolCallScheme::Qwen35,
             thinking_default: true,
+            effort: shiso_server::tokenizer::render_prompt::EffortSpelling::STANDARD,
             // TRUE since this family gained a head this build can run: the
             // separately published `Qwen3.6-35B-A3B-MTP-4bit`, MLX affine 4-bit
             // group 64. It was false while the only head was the `modelopt`
@@ -295,6 +297,7 @@ fn gemma4_fixture_yields_gemma4_defaults() {
             reasoning: shiso_parsers::ReasoningScheme::Gemma4,
             tools: shiso_parsers::ToolCallScheme::Gemma4,
             thinking_default: false,
+            effort: shiso_server::tokenizer::render_prompt::EffortSpelling::STANDARD,
             speculates: false,
         }
     );

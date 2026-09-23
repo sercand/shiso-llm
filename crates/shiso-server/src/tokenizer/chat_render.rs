@@ -26,15 +26,6 @@ use serde_json::Value as Json;
 
 use crate::tokenizer::jinja_helpers::{TEMPLATE_NAME, TemplateError, ToolJsonStyle};
 
-/// The effort tier passed when the caller named none and thinking is on.
-///
-/// The neutral rung, not the highest one. Templates that steer on effort
-/// frequently default to their most expensive tier when the variable is
-/// undefined, which means an effort-silent client would silently buy the most
-/// expensive directive. Passing an explicit neutral value makes that
-/// unreachable.
-pub const NEUTRAL_EFFORT: &str = "medium";
-
 /// The effort tier passed when thinking is off.
 pub const NO_EFFORT: &str = "none";
 
@@ -103,9 +94,15 @@ impl ChatTemplate {
                 .and_then(Json::as_str)
                 == Some("assistant");
 
+        // Undefined, never a server-chosen word, when the caller named none: the
+        // template's own default is what the reference renderer applies and what
+        // the model was served with. A server-chosen middle rung made every
+        // effort-silent request a different request from the official one. The
+        // one word the server still supplies is `none` when thinking is off,
+        // which templates read as "no directive".
         let effort: Value = match flags.reasoning_effort {
             Some(named) => named.into(),
-            None if flags.enable_thinking => NEUTRAL_EFFORT.into(),
+            None if flags.enable_thinking => Value::UNDEFINED,
             None => NO_EFFORT.into(),
         };
         let preserve = flags
@@ -176,11 +173,16 @@ mod tests {
         );
     }
 
-    /// An effort-silent caller with thinking on gets the neutral tier, never
-    /// the template's own default.
+    /// An effort-silent caller with thinking on leaves the variable undefined, so
+    /// the template applies its own default - which is what the reference
+    /// renderer does, and what the model was served with.
     #[test]
-    fn thinking_without_a_named_effort_renders_the_neutral_tier() {
-        let template = ChatTemplate::new(TEMPLATE, ToolJsonStyle::Compact).expect("it compiles");
+    fn thinking_without_a_named_effort_leaves_the_template_default() {
+        let template = ChatTemplate::new(
+            "{% if enable_thinking %}[think:{{ reasoning_effort | default('its-own') }}]{% endif %}",
+            ToolJsonStyle::Compact,
+        )
+        .expect("it compiles");
         let out = template
             .render(
                 &turns(),
@@ -191,7 +193,7 @@ mod tests {
                 },
             )
             .expect("it renders");
-        assert!(out.ends_with("[think:medium]"), "{out}");
+        assert_eq!(out, "[think:its-own]");
     }
 
     #[test]

@@ -233,6 +233,18 @@ pub enum WireThinking {
     },
     /// Thinking is off.
     Disabled,
+    /// Thinking is on and the model decides how much; `output_config.effort`
+    /// steers it.
+    Adaptive,
+}
+
+/// The `output_config` object. Unknown keys inside it are ignored, like unknown
+/// keys on the body.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WireOutputConfig {
+    /// How hard the model should think: `low`, `medium`, `high`, `xhigh` or `max`.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// The Messages request body.
@@ -281,6 +293,9 @@ pub struct MessagesBody {
     /// What the caller said about thinking.
     #[serde(default)]
     pub thinking: Option<WireThinking>,
+    /// Output settings; only the effort is read.
+    #[serde(default)]
+    pub output_config: Option<WireOutputConfig>,
 }
 
 impl MessagesBody {

@@ -26,13 +26,13 @@
 
 use serde_json::{Value, json};
 use shiso_ir::{
-    Block, MediaSource, Message, Request, Role, Sampling, Thinking, ThinkingDirective, ToolChoice,
-    ToolDefinition, ToolResult, ToolUse,
+    Block, Effort, MediaSource, Message, Request, Role, Sampling, Thinking, ThinkingDirective,
+    ToolChoice, ToolDefinition, ToolResult, ToolUse,
 };
 
 use crate::anthropic::messages_wire::{
-    Content, MessagesBody, Source, SystemPrompt, ToolOutput, WireBlock, WireMessage, WireRole,
-    WireThinking, WireToolChoice,
+    Content, MessagesBody, Source, SystemPrompt, ToolOutput, WireBlock, WireMessage,
+    WireOutputConfig, WireRole, WireThinking, WireToolChoice,
 };
 use crate::error::AppError;
 
@@ -46,7 +46,8 @@ use crate::error::AppError;
 /// # Errors
 ///
 /// [`AppError::BadRequest`] for a content block this server cannot render, a
-/// media source it cannot reach, or instructions that are not text.
+/// media source it cannot reach, instructions that are not text, or an
+/// `output_config.effort` word this server does not know.
 pub fn to_ir(body: &MessagesBody, model_id: &str) -> Result<Request, AppError> {
     let mut request = Request::new(model_id, Vec::new());
     request.system = system_blocks(body.system.as_ref())?;
@@ -88,7 +89,7 @@ pub fn to_ir(body: &MessagesBody, model_id: &str) -> Result<Request, AppError> {
     request.max_tokens = body.max_tokens;
     request.stop.clone_from(&body.stop_sequences);
     request.stream = body.is_streaming();
-    request.thinking = thinking(body.thinking.as_ref());
+    request.thinking = thinking(body.thinking.as_ref(), body.output_config.as_ref())?;
     Ok(request)
 }
 
@@ -290,17 +291,37 @@ fn tool_choice(choice: &WireToolChoice) -> ToolChoice {
 
 /// What the caller said about thinking.
 ///
-/// Silence stays silence: this format's `thinking` object is the only place a
-/// caller can say anything about it, so an absent object is the one state the
-/// server's own default is allowed to fill in later.
-fn thinking(directive: Option<&WireThinking>) -> ThinkingDirective {
-    match directive {
-        None => ThinkingDirective::Unspecified,
-        Some(WireThinking::Disabled) => ThinkingDirective::Off,
-        Some(WireThinking::Enabled { budget_tokens }) => ThinkingDirective::On {
+/// `thinking.type` says whether; `output_config.effort` says how hard. Silence on
+/// both stays silence, so the server's default applies later. `disabled` wins
+/// over any effort, because off is the more specific statement. Adaptive with no
+/// effort is thinking on with no rung named, so the template's own default
+/// applies. A budget is accepted and not enforced (a decision, not an omission).
+fn thinking(
+    directive: Option<&WireThinking>,
+    output: Option<&WireOutputConfig>,
+) -> Result<ThinkingDirective, AppError> {
+    let effort = match output.and_then(|config| config.effort.as_deref()) {
+        None => None,
+        Some(word) => Some(Effort::parse(word).ok_or_else(|| {
+            AppError::bad_request(
+                format!(
+                    "output_config.effort {word:?} is not one of \"low\", \"medium\", \
+                     \"high\", \"xhigh\" or \"max\""
+                ),
+                Some("output_config.effort"),
+                "invalid_request",
+            )
+        })?),
+    };
+    Ok(match (directive, effort) {
+        (Some(WireThinking::Disabled), _) => ThinkingDirective::Off,
+        (_, Some(level)) => level,
+        (Some(WireThinking::Enabled { budget_tokens }), None) => ThinkingDirective::On {
             budget: *budget_tokens,
         },
-    }
+        (Some(WireThinking::Adaptive), None) => ThinkingDirective::On { budget: None },
+        (None, None) => ThinkingDirective::Unspecified,
+    })
 }
 
 #[cfg(test)]
@@ -308,7 +329,7 @@ mod tests {
     use super::to_ir;
     use crate::anthropic::messages_wire::MessagesBody;
     use serde_json::json;
-    use shiso_ir::{Block, Role, ThinkingDirective, ToolChoice};
+    use shiso_ir::{Block, Effort, Role, ThinkingDirective, ToolChoice};
 
     fn body(json: serde_json::Value) -> MessagesBody {
         serde_json::from_value(json).expect("the body parses")
@@ -572,6 +593,55 @@ mod tests {
             request(&json!("hi")).thinking,
             ThinkingDirective::Unspecified,
             "silence is its own state until policy fills it in"
+        );
+    }
+
+    fn base() -> serde_json::Value {
+        json!({"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    #[test]
+    fn adaptive_with_an_effort_is_that_effort() {
+        let mut body = base();
+        body["thinking"] = json!({"type": "adaptive"});
+        body["output_config"] = json!({"effort": "low"});
+        let request = to_ir(&serde_json::from_value(body).expect("parses"), "m").expect("converts");
+        assert_eq!(request.thinking, ThinkingDirective::Effort(Effort::Low));
+    }
+
+    /// Adaptive with no effort is thinking on, and the template's own default
+    /// effort applies - not the middle rung, and not a refusal.
+    #[test]
+    fn adaptive_without_an_effort_is_thinking_on_with_the_template_default() {
+        let mut body = base();
+        body["thinking"] = json!({"type": "adaptive"});
+        let request = to_ir(&serde_json::from_value(body).expect("parses"), "m").expect("converts");
+        assert_eq!(request.thinking, ThinkingDirective::On { budget: None });
+    }
+
+    #[test]
+    fn an_effort_beside_enabled_is_honoured_and_disabled_wins_over_it() {
+        let mut body = base();
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": 1024});
+        body["output_config"] = json!({"effort": "max"});
+        let request =
+            to_ir(&serde_json::from_value(body.clone()).expect("parses"), "m").expect("converts");
+        assert_eq!(request.thinking, ThinkingDirective::Effort(Effort::XHigh));
+        body["thinking"] = json!({"type": "disabled"});
+        let request = to_ir(&serde_json::from_value(body).expect("parses"), "m").expect("converts");
+        assert_eq!(request.thinking, ThinkingDirective::Off);
+    }
+
+    #[test]
+    fn an_unknown_effort_word_is_refused() {
+        let mut body = base();
+        body["thinking"] = json!({"type": "adaptive"});
+        body["output_config"] = json!({"effort": "enormous"});
+        let error =
+            to_ir(&serde_json::from_value(body).expect("parses"), "m").expect_err("refused");
+        assert!(
+            error.to_string().contains("output_config.effort"),
+            "{error}"
         );
     }
 

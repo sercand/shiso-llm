@@ -52,7 +52,7 @@ use shiso_models::qwen35moe::{Qwen35MoeConfig, Qwen35MoeModel};
 use shiso_vision::{MediaPlacement, VisionError, VisionTower};
 
 use crate::cli::ServeArgs;
-use crate::tokenizer::render_prompt::PromptRenderer;
+use crate::tokenizer::render_prompt::{EffortSpelling, PromptRenderer};
 use shiso_parsers::{ReasoningScheme, ToolCallScheme};
 
 /// Why a checkpoint could not be turned into a model.
@@ -97,6 +97,11 @@ pub struct FamilyDefaults {
     pub tools: ToolCallScheme,
     /// Whether thinking is enabled by default.
     pub thinking_default: bool,
+    /// How this family's template spells each effort rung.
+    ///
+    /// Templates raise on a word outside their list, so a family that borrowed
+    /// another's spelling turned a valid request into a refusal.
+    pub effort: EffortSpelling,
     /// Whether this family's arm honours `--spec-k` at all.
     ///
     /// **This field exists to close a hole that a relaxation opened.** The
@@ -137,6 +142,7 @@ impl FamilyDefaults {
         reasoning: ReasoningScheme::Qwen3,
         tools: ToolCallScheme::Qwen3,
         thinking_default: true,
+        effort: EffortSpelling::STANDARD,
         speculates: true,
     };
 
@@ -154,6 +160,8 @@ impl FamilyDefaults {
         reasoning: ReasoningScheme::Qwen3,
         tools: ToolCallScheme::Qwen35,
         thinking_default: true,
+        // Its template accepts only low, medium and xhigh and raises on high.
+        effort: EffortSpelling::XHIGH_TOP,
         // The sparse family drafts with a head named by `--draft-model`; its
         // arm refuses by name when the depth is asked for without one.
         speculates: true,
@@ -169,6 +177,7 @@ impl FamilyDefaults {
         reasoning: ReasoningScheme::Qwen3,
         tools: ToolCallScheme::Qwen35,
         thinking_default: true,
+        effort: EffortSpelling::STANDARD,
         // The dense family drafts with the head its sidecar names under
         // `mtp_file`; `draft_manifest` resolves it and refuses by name.
         speculates: true,
@@ -184,6 +193,7 @@ impl FamilyDefaults {
         reasoning: ReasoningScheme::Qwen3,
         tools: ToolCallScheme::Qwen35,
         thinking_default: true,
+        effort: EffortSpelling::STANDARD,
         // **True since this family gained a head it can run.** It was false,
         // and the reason was sound at the time: the `modelopt` export's own MTP
         // head is BF16 and this build has no BF16 matvec, so there was no head
@@ -209,6 +219,7 @@ impl FamilyDefaults {
         reasoning: ReasoningScheme::Gemma4,
         tools: ToolCallScheme::Gemma4,
         thinking_default: false,
+        effort: EffortSpelling::STANDARD,
         // This family ships no draft head and its arm binds none. Flip this
         // the day it does, and the refusal below stops firing for it - which
         // is why the answer lives on the constant rather than in a list of
@@ -266,7 +277,9 @@ impl FamilyDefaults {
     /// while production rendered with a different default.
     #[must_use]
     pub fn configure(self, renderer: PromptRenderer) -> PromptRenderer {
-        renderer.with_thinking_default(self.thinking_default)
+        renderer
+            .with_thinking_default(self.thinking_default)
+            .with_effort_spelling(self.effort)
     }
 }
 

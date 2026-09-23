@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use shiso_core::{PadTokens, TokenId, VisionConfig};
-use shiso_ir::{Request, ThinkingDirective};
+use shiso_ir::{Effort, Request, ThinkingDirective};
 use shiso_vision::{FfmpegPolicy, ImageLimits, MediaPlacement, PreprocessSpec, VisionItem};
 
 use crate::error::AppError;
@@ -57,6 +57,60 @@ impl Rendered {
     }
 }
 
+/// How one family's chat template spells each effort rung.
+///
+/// Templates validate the word against a fixed list and raise on any other, so
+/// the spelling is part of a family's contract with its template rather than a
+/// label. Every rung has a word: a table with a hole would turn a valid request
+/// into a template exception.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffortSpelling {
+    /// The word for [`Effort::Minimal`].
+    pub minimal: &'static str,
+    /// The word for [`Effort::Low`].
+    pub low: &'static str,
+    /// The word for [`Effort::Medium`].
+    pub medium: &'static str,
+    /// The word for [`Effort::High`].
+    pub high: &'static str,
+    /// The word for [`Effort::XHigh`].
+    pub xhigh: &'static str,
+}
+
+impl EffortSpelling {
+    /// The words most templates accept: every rung by its own name, with the
+    /// rung below low folded into low.
+    pub const STANDARD: Self = Self {
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+    };
+
+    /// For templates that accept only low, medium and xhigh: the top two rungs
+    /// share xhigh.
+    pub const XHIGH_TOP: Self = Self {
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "xhigh",
+        xhigh: "xhigh",
+    };
+
+    /// The word this family's template accepts for `effort`.
+    #[must_use]
+    pub const fn spell(self, effort: Effort) -> &'static str {
+        match effort {
+            Effort::Minimal => self.minimal,
+            Effort::Low => self.low,
+            Effort::Medium => self.medium,
+            Effort::High => self.high,
+            Effort::XHigh => self.xhigh,
+        }
+    }
+}
+
 /// Everything needed to turn a conversation into a prompt.
 #[derive(Debug)]
 pub struct PromptRenderer {
@@ -73,6 +127,7 @@ pub struct PromptRenderer {
     ffmpeg: Option<FfmpegPolicy>,
     video_fps: f64,
     thinking_default: bool,
+    effort: EffortSpelling,
 }
 
 impl PromptRenderer {
@@ -103,6 +158,7 @@ impl PromptRenderer {
             ffmpeg: None,
             video_fps: shiso_vision::DEFAULT_FPS,
             thinking_default: true,
+            effort: EffortSpelling::STANDARD,
         })
     }
 
@@ -204,6 +260,14 @@ impl PromptRenderer {
         self
     }
 
+    /// The same renderer, spelling effort rungs the way this family's template
+    /// accepts them.
+    #[must_use]
+    pub const fn with_effort_spelling(mut self, effort: EffortSpelling) -> Self {
+        self.effort = effort;
+        self
+    }
+
     /// The vocabulary this renderer encodes with.
     #[must_use]
     pub fn vocabulary(&self) -> &Arc<Vocabulary> {
@@ -298,18 +362,22 @@ impl PromptRenderer {
 
     /// What the template is told about thinking.
     ///
-    /// A budget does not appear here: a template has no way to express one, and
-    /// the number only means something to the sampler that enforces it. It rides
-    /// on the request and is honoured by the scheduler.
+    /// A named rung is spelled the way this family's template accepts it; no
+    /// rung leaves the template's own default in charge.
+    ///
+    /// A budget does not appear here and is not enforced anywhere: it is
+    /// accepted and ignored, by decision. Clients steer with effort, and a hard
+    /// token cap cuts reasoning off mid-thought, which is worse for the answer
+    /// than the thinking it saves.
     fn flags(&self, request: &Request) -> RenderFlags<'static> {
         let (enable_thinking, effort) = match request.thinking {
             ThinkingDirective::Unspecified => (self.thinking_default, None),
             ThinkingDirective::Off => (false, None),
-            ThinkingDirective::Effort(level) => (true, Some(level.as_str())),
+            ThinkingDirective::Effort(level) => (true, Some(self.effort.spell(level))),
             // An explicit budget, and anything added after this was written, is
-            // thinking on with no rung named: a budget is a number only the
-            // sampler can enforce, and a directive this build does not recognise
-            // is still the caller saying something rather than nothing.
+            // thinking on with no rung named: a budget is not enforced, and a
+            // directive this build does not recognise is still the caller saying
+            // something rather than nothing.
             _ => (true, None),
         };
         RenderFlags {
@@ -397,6 +465,17 @@ mod tests {
     /// stays off, but the operator's limits - a fact about the deployment,
     /// not about the failed geometry - are applied exactly as they would be
     /// on the arm that attached a tower.
+    /// The sparse family's template accepts only low, medium and xhigh, so the
+    /// top two rungs both spell xhigh; the standard spelling keeps high.
+    #[test]
+    fn a_family_spelling_maps_every_rung_to_a_word_its_template_accepts() {
+        use super::EffortSpelling;
+        use shiso_ir::Effort;
+        assert_eq!(EffortSpelling::XHIGH_TOP.spell(Effort::High), "xhigh");
+        assert_eq!(EffortSpelling::XHIGH_TOP.spell(Effort::Minimal), "low");
+        assert_eq!(EffortSpelling::STANDARD.spell(Effort::High), "high");
+    }
+
     #[test]
     fn a_degraded_vision_attachment_keeps_the_limits_and_stays_without_a_tower() {
         let limits = ImageLimits::default()
