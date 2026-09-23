@@ -269,6 +269,11 @@ pub struct ChatTemplateKwargs {
     /// How many tokens the thinking block may use.
     #[serde(default)]
     pub thinking_budget: Option<u32>,
+    /// Whether historical thinking blocks survive a re-render. The same knob as
+    /// the body's own `preserve_thinking`, spelled where clients that pass
+    /// template variables through put it.
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
 }
 
 /// A stop field: one sequence, or several.

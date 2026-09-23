@@ -100,7 +100,14 @@ pub fn to_ir(body: &ChatBody, model_id: &str) -> Result<Request, AppError> {
     request.stream = body.stream.unwrap_or(false);
     request.response_format = response_format(body.response_format.as_ref());
     request.thinking = thinking(body)?;
-    request.preserve_thinking = body.preserve_thinking;
+    // Either spelling reaches the template; clients that pass template
+    // variables through send the knob, and ignoring it rendered every
+    // historical trace the caller asked to have stripped. The body's own field
+    // wins when both are sent, since it is the one this surface documents.
+    request.preserve_thinking = body.preserve_thinking.or_else(|| {
+        body.chat_template_kwargs
+            .and_then(|kwargs| kwargs.preserve_thinking)
+    });
     request.logit_bias = logit_bias(body.logit_bias.as_ref())?;
     request.top_logprobs = body
         .logprobs
@@ -523,6 +530,23 @@ mod tests {
             "chat_template_kwargs": {"enable_thinking": false}
         }));
         assert_eq!(request.thinking, ThinkingDirective::Off);
+    }
+
+    /// `preserve_thinking` inside the template knobs reaches the template the
+    /// same as the top-level field; the top-level one wins when both are sent.
+    #[test]
+    fn preserve_thinking_is_read_from_the_template_knobs_too() {
+        let request = ir(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"preserve_thinking": false}
+        }));
+        assert_eq!(request.preserve_thinking, Some(false));
+        let request = ir(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "preserve_thinking": true,
+            "chat_template_kwargs": {"preserve_thinking": false}
+        }));
+        assert_eq!(request.preserve_thinking, Some(true));
     }
 
     #[test]

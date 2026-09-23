@@ -20,8 +20,7 @@ use shiso_server::tokenizer::Vocabulary;
 use shiso_server::tokenizer::render_prompt::PromptRenderer;
 
 fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test-vectors/references/chat/qwen4exp")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/references/chat/qwen4exp")
 }
 
 #[expect(clippy::print_stdout, reason = "the skip report is a test's output")]
@@ -36,9 +35,8 @@ fn renderer(sidecar: &Path) -> PromptRenderer {
         Vocabulary::from_file(&sidecar.join("tokenizer.json"))
             .expect("the sidecar vocabulary loads"),
     );
-    let renderer =
-        PromptRenderer::new(&template, shiso_server::SERVER_TOOL_JSON_STYLE, vocabulary)
-            .expect("the template compiles");
+    let renderer = PromptRenderer::new(&template, shiso_server::SERVER_TOOL_JSON_STYLE, vocabulary)
+        .expect("the template compiles");
     FamilyDefaults::QWEN4EXP.configure(renderer)
 }
 
@@ -88,10 +86,9 @@ fn every_fixture_renders_like_the_reference() {
             .and_then(|n| n.to_str())
             .unwrap_or_default();
         let stem = name.trim_end_matches(".request.json");
-        let case: Value = serde_json::from_str(
-            &std::fs::read_to_string(&path).expect("the fixture is readable"),
-        )
-        .expect("the fixture is JSON");
+        let case: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the fixture is readable"))
+                .expect("the fixture is JSON");
         let expected_stem = case["expected_from"].as_str().unwrap_or(stem);
         let want_text = std::fs::read_to_string(fixtures().join(format!("{expected_stem}.txt")))
             .expect("the expected render exists; run render_chat_fixtures.py");

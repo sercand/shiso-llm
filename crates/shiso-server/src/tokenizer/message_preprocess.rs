@@ -448,8 +448,7 @@ mod tests {
                 )),
             ],
         );
-        let prepared =
-            preprocess(&[], &[turn], &MediaPolicy::default()).expect("text cannot fail");
+        let prepared = preprocess(&[], &[turn], &MediaPolicy::default()).expect("text cannot fail");
         let rendered = &prepared.messages[0];
         assert_eq!(
             rendered["content"],
