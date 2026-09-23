@@ -1,0 +1,250 @@
+{
+  "surface": "openai",
+  "body": {
+    "model": "qwen3.8-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Read email.html and fix the greeting."
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "I should read it first.",
+        "tool_calls": [
+          {
+            "id": "call_a",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": "{\"path\": \"email.html\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_a",
+        "content": "<html><body>Hi</body></html>"
+      },
+      {
+        "role": "assistant",
+        "content": "Fixing the greeting.",
+        "reasoning_content": "Read it again and fix it.",
+        "tool_calls": [
+          {
+            "id": "call_b",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": "{\"path\": \"email.html\"}"
+            }
+          },
+          {
+            "id": "call_c",
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "arguments": "{\"path\": \"email.html\", \"old_text\": \"Hi\", \"new_text\": \"Hello\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_b",
+        "content": "<html><body>Hi</body></html>"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_c",
+        "content": "ok"
+      },
+      {
+        "role": "user",
+        "content": "done?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a workspace file. Returns <content> & metadata; 'path' is relative.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "e.g. email.html"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit_file",
+          "description": "Replace text in a file, or write it with clear=true.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "old_text": {
+                "type": "string"
+              },
+              "new_text": {
+                "type": "string"
+              },
+              "clear": {
+                "type": "boolean"
+              },
+              "count": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "new_text"
+            ]
+          }
+        }
+      }
+    ],
+    "reasoning_effort": "xhigh"
+  },
+  "hf": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Read email.html and fix the greeting."
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "I should read it first.",
+        "tool_calls": [
+          {
+            "id": "call_a",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": {
+                "path": "email.html"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_a",
+        "content": "<html><body>Hi</body></html>"
+      },
+      {
+        "role": "assistant",
+        "content": "Fixing the greeting.",
+        "reasoning_content": "Read it again and fix it.",
+        "tool_calls": [
+          {
+            "id": "call_b",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": {
+                "path": "email.html"
+              }
+            }
+          },
+          {
+            "id": "call_c",
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "arguments": {
+                "path": "email.html",
+                "old_text": "Hi",
+                "new_text": "Hello"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_b",
+        "content": "<html><body>Hi</body></html>"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_c",
+        "content": "ok"
+      },
+      {
+        "role": "user",
+        "content": "done?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a workspace file. Returns <content> & metadata; 'path' is relative.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "e.g. email.html"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit_file",
+          "description": "Replace text in a file, or write it with clear=true.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "old_text": {
+                "type": "string"
+              },
+              "new_text": {
+                "type": "string"
+              },
+              "clear": {
+                "type": "boolean"
+              },
+              "count": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "new_text"
+            ]
+          }
+        }
+      }
+    ],
+    "kwargs": {
+      "reasoning_effort": "xhigh"
+    }
+  }
+}

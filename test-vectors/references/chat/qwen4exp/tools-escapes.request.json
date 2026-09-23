@@ -1,0 +1,125 @@
+{
+  "surface": "openai",
+  "body": {
+    "model": "qwen3.8-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Open email.html"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a workspace file. Returns <content> & metadata; 'path' is relative.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "e.g. email.html"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit_file",
+          "description": "Replace text in a file, or write it with clear=true.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "old_text": {
+                "type": "string"
+              },
+              "new_text": {
+                "type": "string"
+              },
+              "clear": {
+                "type": "boolean"
+              },
+              "count": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "new_text"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "hf": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Open email.html"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a workspace file. Returns <content> & metadata; 'path' is relative.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "e.g. email.html"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit_file",
+          "description": "Replace text in a file, or write it with clear=true.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "old_text": {
+                "type": "string"
+              },
+              "new_text": {
+                "type": "string"
+              },
+              "clear": {
+                "type": "boolean"
+              },
+              "count": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "new_text"
+            ]
+          }
+        }
+      }
+    ],
+    "kwargs": {}
+  }
+}

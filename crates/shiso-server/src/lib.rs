@@ -175,7 +175,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             placement,
             vision_spec.as_ref(),
         ) {
-            let renderer = renderer.with_thinking_default(defaults.thinking_default);
+            let renderer = defaults.configure(renderer);
             state = state.with_renderer(Arc::new(renderer));
         }
         state = state.with_vocabulary(vocabulary);
@@ -330,6 +330,14 @@ fn open_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend
     ))
 }
 
+/// How the server writes `tojson` in every chat template it renders.
+///
+/// One constant, read by the boot path and by the parity tests, so the tests
+/// render exactly what production sends: a test that picked its own style would
+/// pass while the server rendered something else.
+pub const SERVER_TOOL_JSON_STYLE: tokenizer::jinja_helpers::ToolJsonStyle =
+    tokenizer::jinja_helpers::ToolJsonStyle::Compact;
+
 /// Builds the prompt renderer, reporting rather than failing when the checkpoint
 /// ships no chat template.
 ///
@@ -347,7 +355,7 @@ fn build_renderer(
     let template = load_chat_template(args)?;
     let renderer = match tokenizer::render_prompt::PromptRenderer::new(
         &template,
-        tokenizer::jinja_helpers::ToolJsonStyle::Compact,
+        SERVER_TOOL_JSON_STYLE,
         vocabulary,
     ) {
         Ok(renderer) => renderer,

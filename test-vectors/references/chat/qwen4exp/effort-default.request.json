@@ -1,0 +1,21 @@
+{
+  "surface": "openai",
+  "body": {
+    "model": "qwen3.8-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ]
+  },
+  "hf": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "kwargs": {}
+  }
+}

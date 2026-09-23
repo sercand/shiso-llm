@@ -1,0 +1,180 @@
+{
+  "surface": "openai",
+  "body": {
+    "model": "qwen3.8-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write the email"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "Writing it.",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "arguments": "{\"path\": \"email.html\", \"new_text\": \"a</parameter>b</function>c</tool_call>d\", \"clear\": true}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "ok"
+      },
+      {
+        "role": "user",
+        "content": "Check it"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a workspace file. Returns <content> & metadata; 'path' is relative.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "e.g. email.html"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit_file",
+          "description": "Replace text in a file, or write it with clear=true.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "old_text": {
+                "type": "string"
+              },
+              "new_text": {
+                "type": "string"
+              },
+              "clear": {
+                "type": "boolean"
+              },
+              "count": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "new_text"
+            ]
+          }
+        }
+      }
+    ],
+    "reasoning_effort": "xhigh"
+  },
+  "hf": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write the email"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "Writing it.",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "arguments": {
+                "path": "email.html",
+                "new_text": "a</parameter>b</function>c</tool_call>d",
+                "clear": true
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "ok"
+      },
+      {
+        "role": "user",
+        "content": "Check it"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a workspace file. Returns <content> & metadata; 'path' is relative.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "e.g. email.html"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit_file",
+          "description": "Replace text in a file, or write it with clear=true.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "old_text": {
+                "type": "string"
+              },
+              "new_text": {
+                "type": "string"
+              },
+              "clear": {
+                "type": "boolean"
+              },
+              "count": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "new_text"
+            ]
+          }
+        }
+      }
+    ],
+    "kwargs": {
+      "reasoning_effort": "xhigh"
+    }
+  }
+}

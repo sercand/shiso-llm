@@ -52,6 +52,7 @@ use shiso_models::qwen35moe::{Qwen35MoeConfig, Qwen35MoeModel};
 use shiso_vision::{MediaPlacement, VisionError, VisionTower};
 
 use crate::cli::ServeArgs;
+use crate::tokenizer::render_prompt::PromptRenderer;
 use shiso_parsers::{ReasoningScheme, ToolCallScheme};
 
 /// Why a checkpoint could not be turned into a model.
@@ -129,6 +130,20 @@ pub struct FamilyDefaults {
 impl FamilyDefaults {
     /// Family defaults for Qwen 3 models.
     pub const QWEN3: Self = Self {
+        reasoning: ReasoningScheme::Qwen3,
+        tools: ToolCallScheme::Qwen3,
+        thinking_default: true,
+        // The sparse family drafts with a head named by `--draft-model`; its
+        // arm refuses by name when the depth is asked for without one.
+        speculates: true,
+    };
+
+    /// Family defaults for the sparse hybrid checkpoint.
+    ///
+    /// A constant of its own rather than `QWEN3`: this family's template writes
+    /// tool calls as the Qwen 3.5 XML body and accepts its own effort words, and a
+    /// family that borrows another's constant inherits every fact that differs.
+    pub const QWEN4EXP: Self = Self {
         reasoning: ReasoningScheme::Qwen3,
         tools: ToolCallScheme::Qwen3,
         thinking_default: true,
@@ -225,7 +240,7 @@ impl FamilyDefaults {
             return Ok(Self::QWEN35MOE);
         }
         if Qwen4ExpConfig::describes(config) {
-            return Ok(Self::QWEN3);
+            return Ok(Self::QWEN4EXP);
         }
         if Gemma4Config::describes(config) {
             return Ok(Self::GEMMA4);
@@ -233,6 +248,18 @@ impl FamilyDefaults {
         Err(FactoryError::UnknownArchitecture {
             model_type: config.model_type().to_owned(),
         })
+    }
+}
+
+impl FamilyDefaults {
+    /// Applies this family's rendering facts to a renderer.
+    ///
+    /// The one place the boot path and the parity tests share, so a fact added
+    /// here reaches both - a test that configured its own renderer would pass
+    /// while production rendered with a different default.
+    #[must_use]
+    pub fn configure(self, renderer: PromptRenderer) -> PromptRenderer {
+        renderer.with_thinking_default(self.thinking_default)
     }
 }
 

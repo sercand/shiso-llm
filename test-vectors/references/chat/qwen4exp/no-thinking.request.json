@@ -1,0 +1,44 @@
+{
+  "surface": "openai",
+  "body": {
+    "model": "qwen3.8-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "2+2?"
+      },
+      {
+        "role": "assistant",
+        "content": "4",
+        "reasoning_content": "add"
+      },
+      {
+        "role": "user",
+        "content": "times 3?"
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "hf": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "2+2?"
+      },
+      {
+        "role": "assistant",
+        "content": "4",
+        "reasoning_content": "add"
+      },
+      {
+        "role": "user",
+        "content": "times 3?"
+      }
+    ],
+    "kwargs": {
+      "enable_thinking": false
+    }
+  }
+}

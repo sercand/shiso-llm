@@ -1,0 +1,17 @@
+{
+  "surface": "anthropic",
+  "body": {
+    "model": "qwen3.8-flash",
+    "max_tokens": 64,
+    "thinking": {
+      "type": "adaptive"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ]
+  },
+  "expected_from": "effort-default"
+}

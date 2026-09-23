@@ -1,0 +1,15 @@
+<|im_start|>user
+2+2?<|im_end|>
+<|im_start|>assistant
+<think>
+add
+</think>
+
+4<|im_end|>
+<|im_start|>user
+times 3?<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
