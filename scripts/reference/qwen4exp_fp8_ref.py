@@ -84,6 +84,7 @@ MIN_MEM_AVAILABLE = 60 * 2**30
 MIN_FREE_DISK = 40 * 2**30
 ROW_BYTES = VOCAB * 2 + 128  # one .npy row: fp16 payload plus its v1 header
 LOCAL_LOGIT_HEADER = "# shiso-local-logit-vectors-v1"
+RAW_DTYPES = {"F8_E4M3": torch.float8_e4m3fn, "BF16": torch.bfloat16}
 
 
 def log(msg: str) -> None:
@@ -240,11 +241,12 @@ def dequant_block(w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
 class ExpertStore:
     """Reads one expert's e4m3 tensors from the mapped shards and dequantizes them."""
 
-    def __init__(self, ckpt: Path, weight_map: dict[str, str], device: torch.device):
-        from safetensors import safe_open  # noqa: F401  (imported for the workers)
-
+    def __init__(self, ckpt: Path, raw: "RawTensors", device: torch.device):
         self.ckpt = ckpt
-        self.weight_map = weight_map
+        self.raw = raw
+        self.weight_map = raw.weight_map
+        self._fds: dict[str, int] = {}
+        self._fd_lock = threading.Lock()
         self.device = device
         self._local = threading.local()
         self.pool = ThreadPoolExecutor(max_workers=6)
@@ -264,17 +266,53 @@ class ExpertStore:
             cache[fname] = safe_open(str(self.ckpt / fname), framework="pt", device="cpu")
         return cache[fname]
 
-    def read_cpu(self, layer: int, expert: int) -> dict[str, torch.Tensor]:
-        t0 = time.perf_counter()
-        out = {}
+    @staticmethod
+    def names(layer: int, expert: int):
         for proj in ("gate_proj", "up_proj", "down_proj"):
             for suffix in ("weight", "weight_scale_inv"):
-                name = f"model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}.{suffix}"
-                t = self._handle(self.weight_map[name]).get_tensor(name)
-                out[f"{proj}.{suffix}"] = t
-                self.bytes_read += t.numel() * t.element_size()
+                yield (f"{proj}.{suffix}",
+                       f"model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}.{suffix}")
+
+    def _fd(self, fname: str) -> int:
+        with self._fd_lock:
+            if fname not in self._fds:
+                self._fds[fname] = os.open(self.ckpt / fname, os.O_RDONLY)
+            return self._fds[fname]
+
+    def read_cpu(self, layer: int, expert: int) -> dict[str, torch.Tensor]:
+        """One expert's six tensors, read with pread into owned host memory.
+
+        Not through the library's mapped tensors: those fault the file in one
+        page at a time on first touch, which measured ~150 MB/s here (34 ms per
+        expert), while a whole-tensor pread from a worker thread runs at NVMe
+        speed and releases the interpreter lock while it waits.
+        """
+        t0 = time.perf_counter()
+        out = {}
+        for key, name in self.names(layer, expert):
+            fname = self.weight_map[name]
+            base, hdr = self.raw.header(fname)
+            info = hdr[name]
+            start, end = info["data_offsets"]
+            fd = self._fd(fname)
+            buf = bytearray(end - start)
+            view = memoryview(buf)
+            got = 0
+            while got < len(buf):
+                n = os.preadv(fd, [view[got:]], base + start + got)
+                if n <= 0:
+                    raise IOError(f"short read of {name} in {fname}")
+                got += n
+            t = torch.frombuffer(buf, dtype=torch.uint8).view(RAW_DTYPES[info["dtype"]])
+            out[key] = t.reshape(info["shape"])
+            self.bytes_read += len(buf)
         self.read_seconds += time.perf_counter() - t0
         return out
+
+    def read_cpu_safetensors(self, layer: int, expert: int) -> dict[str, torch.Tensor]:
+        """The same tensors through the library's own reader, for the self-check."""
+        return {key: self._handle(self.weight_map[name]).get_tensor(name).clone()
+                for key, name in self.names(layer, expert)}
 
     def to_device(self, cpu: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         dev = {k: v.to(self.device) for k, v in cpu.items()}
@@ -435,7 +473,7 @@ class Reference:
         model = model.to(torch.bfloat16)
         model.eval()
 
-        self.store = ExpertStore(ckpt, self.raw.weight_map, self.device)
+        self.store = ExpertStore(ckpt, self.raw, self.device)
         self.experts = []
         for i, layer in enumerate(model.model.layers):
             ex = StreamedExperts(self.store, i, tc.num_experts, layer.mlp.experts.act_fn)
@@ -817,9 +855,15 @@ def cmd_selfcheck(args) -> None:
     # 2. Block dequant of one expert matrix on the device against NumPy from raw bytes.
     guard()
     raw = RawTensors(Path(args.checkpoint))
-    store = ExpertStore(Path(args.checkpoint), raw.weight_map, torch.device("cuda"))
+    store = ExpertStore(Path(args.checkpoint), raw, torch.device("cuda"))
     layer, expert = args.layer, args.expert
     cpu = store.read_cpu(layer, expert)
+    lib = store.read_cpu_safetensors(layer, expert)
+    for key in cpu:
+        same = cpu[key].dtype == lib[key].dtype and torch.equal(
+            cpu[key].view(torch.uint8), lib[key].view(torch.uint8))
+        log(f"pread vs library reader, {key}: {'identical' if same else 'DIFFERENT'}")
+        ok &= same
     for proj in ("gate_proj", "up_proj", "down_proj"):
         name = f"model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}"
         wmm, wdt, wshape = raw.memmap(name + ".weight")
