@@ -275,6 +275,32 @@ pub fn norm_of(
     plan
 }
 
+/// The stream norm of a mix, into the precision the chunk's mixes run at.
+fn stream_norm(
+    shape: &SparseShape,
+    weight: WeightRef,
+    src: Operand,
+    dst: Operand,
+    n_tok: u32,
+    elem: Elem,
+) -> Plan {
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::template(MOD_HC, "q4e_hc_norm_kernel", TemplateArgs::Elem(elem)),
+        kernels::hc_norm(shape.streams, n_tok),
+        // `out, res, w, n_embd, n_hc, eps`
+        Args::of(&[
+            dst,
+            src,
+            Operand::Weight(weight),
+            Operand::U32(shape.hidden),
+            Operand::U32(shape.streams),
+            Operand::f32(shape.rms_eps),
+        ]),
+    );
+    plan
+}
+
 /// One stream mix.
 ///
 /// The order is the whole of it: normalize (when the chain broke), contract to
@@ -290,6 +316,11 @@ pub fn norm_of(
 ///
 /// Whatever [`matmul::project`] reports for a weight this build cannot
 /// project.
+///
+/// `elem` is the precision the normed residual and the expansion are held in,
+/// which [`matmul::half_streams`] decides once for a whole pass: every combine
+/// in the pass writes the normed residual the next mix reads, so the two have
+/// to agree.
 pub fn mix(
     shape: &SparseShape,
     desc: &MixDesc,
@@ -297,28 +328,30 @@ pub fn mix(
     input: MixInput,
     n_tok: u32,
     device: Device,
+    elem: Elem,
 ) -> CoreResult<Plan> {
     let mut plan = Plan::new();
     if input == MixInput::Raw {
-        plan.append(norm(
+        plan.append(stream_norm(
             shape,
             roles.at(roles.norm),
             Operand::Scratch(Buf::Residual),
             Operand::Scratch(Buf::Normed),
             n_tok,
+            elem,
         ));
     }
-    matmul::project(
-        &mut plan,
-        desc.down,
-        Bound::new(
-            roles.at(roles.down),
-            Operand::Scratch(Buf::Normed),
-            Operand::Scratch(Buf::LowRank),
-        ),
-        n_tok,
-        device,
-    )?;
+    let down = Bound::new(
+        roles.at(roles.down),
+        Operand::Scratch(Buf::Normed),
+        Operand::Scratch(Buf::LowRank),
+    );
+    match elem {
+        Elem::F16 => {
+            matmul::project_on_blas(&mut plan, desc.down, down, n_tok, device, (elem, Elem::F32))?;
+        }
+        Elem::F32 => matmul::project(&mut plan, desc.down, down, n_tok, device)?,
+    }
     plan.launch(
         Entry::plain(MOD_HC, "q4e_scale_silu_kernel"),
         kernels::elementwise(u64::from(n_tok) * u64::from(shape.stream_rank)),
@@ -329,45 +362,66 @@ pub fn mix(
             Operand::U64(u64::from(n_tok) * u64::from(shape.stream_rank)),
         ]),
     );
-    matmul::project(
-        &mut plan,
-        desc.up,
-        Bound::new(
-            roles.at(roles.up),
-            Operand::Scratch(Buf::LowRank),
-            Operand::Scratch(Buf::Expanded),
-        ),
-        n_tok,
-        device,
-    )?;
-    plan.launch(
-        Entry::template(
-            MOD_HC,
-            "q4e_hc_collapse_kernel",
-            TemplateArgs::Elem(Elem::F32),
-        ),
-        kernels::hc_collapse(n_tok),
-        // `out, xn, up, n_embd, n_hc`
-        Args::of(&[
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::Normed),
-            Operand::Scratch(Buf::Expanded),
-            Operand::U32(shape.hidden),
-            Operand::U32(shape.streams),
-        ]),
+    let up = Bound::new(
+        roles.at(roles.up),
+        Operand::Scratch(Buf::LowRank),
+        Operand::Scratch(Buf::Expanded),
     );
-    if let (Some(inject), Some(role)) = (desc.inject, roles.inject) {
-        matmul::project(
-            &mut plan,
-            inject,
-            Bound::new(
-                roles.at(role),
+    match elem {
+        Elem::F16 => {
+            matmul::project_on_blas(&mut plan, desc.up, up, n_tok, device, (Elem::F32, elem))?;
+        }
+        Elem::F32 => matmul::project(&mut plan, desc.up, up, n_tok, device)?,
+    }
+    match elem {
+        Elem::F32 => plan.launch(
+            Entry::template(MOD_HC, "q4e_hc_collapse_kernel", TemplateArgs::Elem(elem)),
+            kernels::hc_collapse(n_tok),
+            // `out, xn, up, n_embd, n_hc`
+            Args::of(&[
+                Operand::Scratch(Buf::Mixed),
                 Operand::Scratch(Buf::Normed),
-                Operand::Scratch(Buf::Inject),
-            ),
-            n_tok,
-            device,
-        )?;
+                Operand::Scratch(Buf::Expanded),
+                Operand::U32(shape.hidden),
+                Operand::U32(shape.streams),
+            ]),
+        ),
+        // The half-precision copy of the block input is written here, where
+        // the block input is produced, for every projection that reads it on
+        // the half-precision tier: see [`Device::half_block_input`].
+        Elem::F16 => plan.launch(
+            Entry::plain(MOD_HC, "q4e_hc_collapse_f16_dual_kernel"),
+            kernels::hc_collapse(n_tok),
+            // `out, out_h, xn, up, n_embd, n_hc`
+            Args::of(&[
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(Buf::MixedHalf),
+                Operand::Scratch(Buf::Normed),
+                Operand::Scratch(Buf::Expanded),
+                Operand::U32(shape.hidden),
+                Operand::U32(shape.streams),
+            ]),
+        ),
+    }
+    if let (Some(inject), Some(role)) = (desc.inject, roles.inject) {
+        let bound = Bound::new(
+            roles.at(role),
+            Operand::Scratch(Buf::Normed),
+            Operand::Scratch(Buf::Inject),
+        );
+        match elem {
+            Elem::F16 => {
+                matmul::project_on_blas(
+                    &mut plan,
+                    inject,
+                    bound,
+                    n_tok,
+                    device,
+                    (elem, Elem::F32),
+                )?;
+            }
+            Elem::F32 => matmul::project(&mut plan, inject, bound, n_tok, device)?,
+        }
     }
     Ok(plan)
 }
@@ -388,7 +442,10 @@ pub fn mix(
 /// [`CoreError::Unsupported`] when the stream width is wider than the fused
 /// kernel's fixed block can cover, which its launcher refuses outright rather
 /// than leaving a tail of the residual unwritten.
-pub fn combine(shape: &SparseShape, next: NextNorm, n_tok: u32) -> CoreResult<Plan> {
+///
+/// `elem` is the precision the normed residual is written in, which is the one
+/// the next mix reads it at; see [`mix`].
+pub fn combine(shape: &SparseShape, next: NextNorm, n_tok: u32, elem: Elem) -> CoreResult<Plan> {
     if !kernels::hc_combine_fits(shape.hidden) {
         return Err(CoreError::Unsupported {
             what: "a residual stream wider than the fused combine's block can cover",
@@ -400,7 +457,7 @@ pub fn combine(shape: &SparseShape, next: NextNorm, n_tok: u32) -> CoreResult<Pl
         Entry::template(
             MOD_HC,
             "q4e_hc_combine_norm_kernel",
-            TemplateArgs::Elem(Elem::F32),
+            TemplateArgs::Elem(elem),
         ),
         kernels::hc_combine(shape.streams, n_tok),
         // `res, xn, block_out, inject, w, n_embd, n_hc, eps`
@@ -434,6 +491,7 @@ pub fn collapse(
     roles: MixRoles,
     n_tok: u32,
     device: Device,
+    elem: Elem,
 ) -> CoreResult<Plan> {
     if desc.inject.is_some() {
         return Err(CoreError::InvalidValue {
@@ -441,7 +499,7 @@ pub fn collapse(
             value: "the collapsing mix has no residual to inject into".to_owned(),
         });
     }
-    mix(shape, desc, roles, MixInput::Raw, n_tok, device)
+    mix(shape, desc, roles, MixInput::Raw, n_tok, device, elem)
 }
 
 /// The reciprocal of the stream count, which the activation scales by.

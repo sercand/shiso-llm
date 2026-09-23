@@ -83,7 +83,7 @@ pub use ckpt_layout::CkptIdentity;
 // a refused save. A model crate that speaks only to the checkpoint tier should not
 // have to depend on the store to name the three of them.
 pub use draft::{DraftHead, DraftParts};
-pub use options::EngineOptions;
+pub use options::{EngineOptions, KvFit, PoolCost};
 pub use sampling::{argmax, rng_f32, rng_next, sample_logits};
 pub use sampling_probs::{build_probabilities, sample_probabilities};
 /// What the cache holds, re-exported so a model crate can forward it without

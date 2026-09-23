@@ -225,6 +225,40 @@ impl SparseStack {
         Ok(())
     }
 
+    /// One segmented pass: every session's run of tokens at its own frontier,
+    /// one pass over the weights, logits for every row. Nothing is advanced:
+    /// this is a batch's verify, and how many of each run's rows a session
+    /// keeps is decided from the picks afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`SparseStack::plan_segments`], the gathers, the inputs and the
+    /// pass report.
+    pub(crate) fn run_segments(&mut self, runs: &[(SessionId, &[TokenId])]) -> CoreResult<()> {
+        let mut republished = false;
+        for (session, tokens) in runs {
+            let n = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+            republished |= self.reserve(*session, n)?;
+        }
+        if republished && let Some(graphs) = self.backend.as_graph() {
+            graphs.invalidate_all();
+        }
+        let sessions = runs.iter().map(|(session, _)| *session).collect::<Vec<_>>();
+        let lens = runs
+            .iter()
+            .map(|(_, tokens)| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
+            .collect::<Vec<_>>();
+        let mut pass = self.plan_segments(&sessions, &lens)?;
+        let gathered = self.issue_gathers(&mut pass, runs)?;
+        self.write_segment_inputs(runs)?;
+        // The recurrence and its convolution run every session's run in one
+        // launch, through the per-row arrays: one pointer per run here.
+        self.pack_row_pointers(&sessions)?;
+        self.land_gathers(gathered)?;
+        self.execute_rows(&sessions, &pass)?;
+        Ok(())
+    }
+
     /// Writes every per-row pointer array this pass's batched launches read.
     ///
     /// # Errors
@@ -232,7 +266,7 @@ impl SparseStack {
     /// [`CoreError::UnknownSession`], [`CoreError::Unsupported`] on a device
     /// that cannot hand out the addresses of its own allocations, and whatever
     /// the transfer reports.
-    fn pack_row_pointers(&self, sessions: &[SessionId]) -> CoreResult<()> {
+    pub(crate) fn pack_row_pointers(&self, sessions: &[SessionId]) -> CoreResult<()> {
         let resident = self.resident()?;
         let rows = sessions
             .iter()

@@ -34,7 +34,7 @@ use shiso_core::Extent3;
 
 use super::{
     CuBlas, CuBlasLt, CuContext, CuDevice, CuFunction, CuGraph, CuGraphExec, CuModule, CuStream,
-    DevicePtr, GemmCall, GemmStride, MathType, Op, SysError, SysResult,
+    DevicePtr, GemmCall, GemmStride, MathType, Op, PinnedPtr, SysError, SysResult,
 };
 
 /// Turns a driver status into a result, naming the failing entry point.
@@ -214,6 +214,28 @@ pub(crate) fn multiprocessor_count(device: CuDevice) -> SysResult<u32> {
     })
 }
 
+/// Whether the device shares its memory with the host.
+///
+/// Read for one purpose: on such a device the driver's free figure leaves out
+/// the host's reclaimable page cache, which the kernel hands back on demand,
+/// so sizing a cache from it alone undercounts what is really available.
+///
+/// # Errors
+///
+/// [`SysError::Driver`] when the attribute cannot be read.
+pub(crate) fn integrated(device: CuDevice) -> SysResult<bool> {
+    let mut flag: c_int = 0;
+    // SAFETY: `flag` is a live local of the type the driver writes.
+    check("cuDeviceGetAttribute", unsafe {
+        cu::cuDeviceGetAttribute(
+            &raw mut flag,
+            cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED,
+            device.raw(),
+        )
+    })?;
+    Ok(flag != 0)
+}
+
 /// Opens a stream.
 ///
 /// # Errors
@@ -278,6 +300,22 @@ pub(crate) fn mem_alloc(bytes: u64) -> SysResult<DevicePtr> {
     Ok(DevicePtr::from_raw(ptr))
 }
 
+/// The current context's free and total device memory, in bytes.
+///
+/// # Errors
+///
+/// [`SysError::Driver`] when the driver refuses the query, which it does with
+/// no current context.
+pub(crate) fn mem_get_info() -> SysResult<(u64, u64)> {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    // SAFETY: both are live locals of the type the driver writes.
+    check("cuMemGetInfo", unsafe {
+        cu::cuMemGetInfo_v2(&raw mut free, &raw mut total)
+    })?;
+    Ok((free as u64, total as u64))
+}
+
 /// Releases device memory.
 ///
 /// # Safety
@@ -320,6 +358,88 @@ pub(crate) unsafe fn memcpy_htod(dst: DevicePtr, src: &[u8], stream: CuStream) -
     check("cuStreamSynchronize", unsafe {
         cu::cuStreamSynchronize(stream)
     })
+}
+
+/// Reserves page-locked host memory.
+///
+/// # Errors
+///
+/// [`SysError::Driver`] when the driver cannot lock `bytes` of host memory.
+pub(crate) fn mem_host_alloc(bytes: u64) -> SysResult<PinnedPtr> {
+    let size = as_size("cuMemAllocHost", bytes)?;
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `ptr` is a live local of the type the driver writes.
+    check("cuMemAllocHost", unsafe {
+        cu::cuMemAllocHost_v2(&raw mut ptr, size)
+    })?;
+    Ok(PinnedPtr::from_raw(ptr as usize))
+}
+
+/// Releases page-locked host memory.
+///
+/// # Safety
+///
+/// `ptr` must be the exact address [`mem_host_alloc`] returned, must not
+/// already have been freed, and no queued copy may still be reading it.
+///
+/// # Errors
+///
+/// [`SysError::Driver`] when the driver refuses the free.
+pub(crate) unsafe fn mem_host_free(ptr: PinnedPtr) -> SysResult<()> {
+    // SAFETY: the caller guarantees the address is a live allocation of its own
+    // that nothing is still reading.
+    check("cuMemFreeHost", unsafe {
+        cu::cuMemFreeHost(ptr.raw() as *mut c_void)
+    })
+}
+
+/// Queues a copy of `len` bytes of page-locked host memory into device memory.
+///
+/// No wait, unlike [`memcpy_htod`]: the source is memory the caller owns and
+/// keeps alive until it has synchronised `stream`, which is the whole reason
+/// pinned memory is used for it.
+///
+/// # Safety
+///
+/// `dst .. dst + len` must lie inside one live allocation, `src .. src + len`
+/// inside one live pinned allocation, and neither may be freed or written until
+/// `stream` has been synchronised.
+///
+/// # Errors
+///
+/// [`SysError::Driver`] when the copy cannot be queued.
+pub(crate) unsafe fn memcpy_htod_pinned(
+    dst: DevicePtr,
+    src: PinnedPtr,
+    len: usize,
+    stream: CuStream,
+) -> SysResult<()> {
+    // SAFETY: the caller guarantees both ranges and their lifetimes.
+    check("cuMemcpyHtoDAsync", unsafe {
+        cu::cuMemcpyHtoDAsync_v2(
+            dst.raw(),
+            src.raw() as *const c_void,
+            len,
+            stream.raw() as cu::CUstream,
+        )
+    })
+}
+
+/// Asks the kernel to start reading `bytes` in, if they are a file mapping.
+///
+/// Advice, not a request that can fail: a range that is not a mapping, or a
+/// kernel that ignores the hint, costs the copy that follows its readahead and
+/// nothing else, so the status is not reported.
+pub(crate) fn advise_willneed(bytes: &[u8]) {
+    const PAGE: usize = 4096;
+    let start = bytes.as_ptr() as usize;
+    let aligned = start & !(PAGE - 1);
+    let len = bytes.len().saturating_add(start - aligned);
+    // SAFETY: `MADV_WILLNEED` neither reads nor writes the range and never
+    // changes its contents; the range starts at the page holding `bytes` and
+    // covers only pages that hold part of it, all of which are mapped for as
+    // long as the borrow lives.
+    let _ = unsafe { libc::madvise(aligned as *mut c_void, len, libc::MADV_WILLNEED) };
 }
 
 /// Writes `len` zero bytes at `dst`, on the stream.
@@ -880,8 +1000,16 @@ const fn blas_dtype(dtype: MathType) -> blas::cudaDataType {
 /// operand type here instead is not a refusal - it is a successful call that
 /// writes halves into a float buffer, so a chunk wide enough to reach this tier
 /// comes back as noise and a narrow one, which never reaches it, does not.
-const fn blas_out_dtype(_dtype: MathType) -> blas::cudaDataType {
-    blas::cudaDataType::CUDA_R_32F
+///
+/// The one exception is a call that asked for a half-precision destination
+/// outright, which the engine makes only where the buffer it writes is read as
+/// halves.
+const fn blas_out_dtype(out_half: bool) -> blas::cudaDataType {
+    if out_half {
+        blas::cudaDataType::CUDA_R_16F
+    } else {
+        blas::cudaDataType::CUDA_R_32F
+    }
 }
 
 /// The accumulator this call asks for.
@@ -931,7 +1059,7 @@ pub(crate) unsafe fn blas_gemm(handle: CuBlas, call: &GemmCall) -> SysResult<()>
             call.ldb,
             (&raw const beta).cast::<c_void>(),
             call.c.raw() as *mut c_void,
-            blas_out_dtype(call.dtype),
+            blas_out_dtype(call.out_half),
             call.ldc,
             blas_compute(call.dtype, call.tf32),
             blas::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
@@ -977,7 +1105,7 @@ pub(crate) unsafe fn blas_gemm_strided(
             stride.b,
             (&raw const beta).cast::<c_void>(),
             call.c.raw() as *mut c_void,
-            blas_out_dtype(call.dtype),
+            blas_out_dtype(call.out_half),
             call.ldc,
             stride.c,
             stride.count,
@@ -1175,8 +1303,13 @@ fn lt_setup(call: &GemmCall) -> SysResult<(LtDesc, LtLayout, LtLayout, LtLayout)
     };
     let a = lt_layout(call.dtype, a_rows, a_cols, call.lda)?;
     let b = lt_layout(call.dtype, b_rows, b_cols, call.ldb)?;
-    // Single precision, whatever the operands are: see `blas_out_dtype`.
-    let c = lt_layout(MathType::F32, call.m, call.n, call.ldc)?;
+    // Single precision unless the call asked for halves: see `blas_out_dtype`.
+    let out = if call.out_half {
+        MathType::F16
+    } else {
+        MathType::F32
+    };
+    let c = lt_layout(out, call.m, call.n, call.ldc)?;
     Ok((desc, a, b, c))
 }
 

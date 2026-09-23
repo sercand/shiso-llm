@@ -336,6 +336,12 @@ pub enum Operand {
     RecurrentConvs(u32),
     /// The device array of one recurrent slot's state matrix per row.
     RecurrentStates(u32),
+    /// The device array of one recurrent slot's convolution rollback records
+    /// per row, which a segmented verify's single convolution launch writes.
+    RecurrentConvCkpts(u32),
+    /// The device array of one recurrent slot's state rollback records per
+    /// row, which a segmented verify's single recurrence launch writes.
+    RecurrentStateCkpts(u32),
     /// The device array of one n-gram convolution window per row.
     NgramWindows,
     /// One attention slot's whole allocation for one cache plane.
@@ -363,6 +369,14 @@ pub enum Operand {
     RecurrentConvCkpt(u32),
     /// One recurrent slot's per-position state matrices, laid out the same way.
     RecurrentStateCkpt(u32),
+    /// One segment's n-gram convolution window, by segment.
+    ///
+    /// What a scalar launch binds inside a segmented pass - several sessions'
+    /// runs of consecutive rows, each launched for its own session - in the
+    /// way [`Operand::PagesOf`] names one row's page table.
+    NgramWindowOf(u32),
+    /// One segment's per-position n-gram windows.
+    NgramWindowCkptOf(u32),
     /// The n-gram block's dilated convolution window.
     NgramWindow,
     /// The n-gram block's per-position windows, which a speculative rollback
@@ -468,12 +482,16 @@ impl Operand {
                 | Self::PageTables
                 | Self::RecurrentConvs(_)
                 | Self::RecurrentStates(_)
+                | Self::RecurrentConvCkpts(_)
+                | Self::RecurrentStateCkpts(_)
                 | Self::NgramWindows
                 | Self::CachePlane { .. }
                 | Self::RecurrentConv(_)
                 | Self::RecurrentState(_)
                 | Self::RecurrentConvCkpt(_)
                 | Self::RecurrentStateCkpt(_)
+                | Self::NgramWindowOf(_)
+                | Self::NgramWindowCkptOf(_)
                 | Self::NgramWindow
                 | Self::NgramWindowCkpt
                 | Self::NgramRows
@@ -800,6 +818,12 @@ impl<'a> Binder<'a> {
     /// not hold - the staged n-gram rows of a stack with no n-gram block, the
     /// cooperative scratch of a device that reserved none - and
     /// [`CoreError::OutOfBounds`] for a recurrent slot or layer past the end.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per operand: this match is the vocabulary's only \
+                  resolver, and a split would give an operand two places it \
+                  might be answered"
+    )]
     pub fn arg(&self, op: Operand) -> CoreResult<KernelArg<'a>> {
         Ok(match op {
             Operand::Scratch(buf) => KernelArg::Buffer(self.scratch.view(buf)?),
@@ -816,6 +840,12 @@ impl<'a> Binder<'a> {
             Operand::RecurrentStates(slot) => {
                 KernelArg::Buffer(self.array(PtrArray::RecurrentState(slot))?)
             }
+            Operand::RecurrentConvCkpts(slot) => {
+                KernelArg::Buffer(self.array(PtrArray::RecurrentConvCkpt(slot))?)
+            }
+            Operand::RecurrentStateCkpts(slot) => {
+                KernelArg::Buffer(self.array(PtrArray::RecurrentStateCkpt(slot))?)
+            }
             Operand::NgramWindows => KernelArg::Buffer(self.array(PtrArray::NgramWindows)?),
             Operand::CachePlane { rank, plane } => {
                 KernelArg::Buffer(self.cache.plane(rank, plane)?)
@@ -827,6 +857,22 @@ impl<'a> Binder<'a> {
             }
             Operand::RecurrentStateCkpt(slot) => {
                 KernelArg::Buffer(self.only()?.recurrent_rollback(slot)?.1)
+            }
+            Operand::NgramWindowOf(row) => KernelArg::Buffer(self.row(row)?.ngram_window().ok_or(
+                CoreError::Unsupported {
+                    what: "the n-gram convolution window of a session whose stack has no n-gram \
+                           block",
+                    backend: "engine",
+                },
+            )?),
+            Operand::NgramWindowCkptOf(row) => {
+                KernelArg::Buffer(self.row(row)?.ngram_window_rollback().ok_or(
+                    CoreError::Unsupported {
+                        what: "the per-position n-gram windows of a session that was not opened \
+                               for speculation",
+                        backend: "engine",
+                    },
+                )?)
             }
             Operand::NgramWindowCkpt => {
                 KernelArg::Buffer(self.only()?.ngram_window_rollback().ok_or(

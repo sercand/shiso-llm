@@ -97,6 +97,31 @@ __global__ void q4e_hc_collapse_kernel(
     }
 }
 
+/* The same collapse over half-precision streams, also writing the block input
+ * as halves: every projection of a prefill chunk that reads the block input
+ * reads it on the half-precision tier, and this is the one place it is
+ * produced, so rounding it here replaces one rounding pass per projection. */
+extern "C" __global__ void q4e_hc_collapse_f16_dual_kernel(
+        float *out, __half *out_h, const __half *xn, const __half *up,
+        uint32_t n_embd, uint32_t n_hc) {
+    const uint32_t t = blockIdx.x;
+    const float inv = 1.0f / (float)n_hc;
+    const __half *xn_t = xn + (uint64_t)t * n_hc * n_embd;
+    const __half *up_t = up + (uint64_t)t * n_hc * n_embd;
+    float *out_t = out + (uint64_t)t * n_embd;
+    __half *out_h_t = out_h + (uint64_t)t * n_embd;
+    for (uint32_t e = threadIdx.x; e < n_embd; e += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t h = 0; h < n_hc; h++) {
+            const uint32_t o = h * n_embd + e;
+            const float g = 1.0f / (1.0f + __expf(-__half2float(up_t[o])));
+            acc += __half2float(xn_t[o]) * g;
+        }
+        out_t[e] = acc * inv;
+        out_h_t[e] = __float2half_rn(acc * inv);
+    }
+}
+
 /* The residual update that closes a block, fused with the group-RMSNorm that
  * opens the next one.
  *

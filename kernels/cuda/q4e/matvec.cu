@@ -214,6 +214,14 @@ extern "C" __global__ void q4e_f32_to_f16_kernel(__half *out, const float *in, u
     if (i < n) out[i] = __float2half_rn(in[i]);
 }
 
+/* The widening a half-precision weight takes before a single-precision
+ * multiply.  Exact: every half is a float, so the product the multiply forms
+ * is the one the per-row kernel forms, and only the summation order differs. */
+extern "C" __global__ void q4e_f16_to_f32_kernel(float *out, const __half *in, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(in[i]);
+}
+
 /* Draft-head slice (see q4e_head_slice in ds4.c).  The selected 128-row
  * blocks of an EXL3 vocabulary head are gathered into a payload with the
  * layout of a (k, n_sel) tensor -- tiles, then suh[k], then svh[n_sel] -- so

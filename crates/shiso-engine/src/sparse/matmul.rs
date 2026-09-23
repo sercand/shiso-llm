@@ -91,6 +91,46 @@ pub const MAX_ROWS: u32 = 16;
 /// than on the tensor.
 pub const NARROW_OUTPUT: u32 = 1_024;
 
+/// Contraction width from which a narrow half-precision chunk goes to the BLAS
+/// tier anyway.
+///
+/// The per-row kernels re-read the whole weight for every sixteen rows, which
+/// for the stream mixes - the full multi-stream residual (10,240 wide) into the
+/// low-rank width or the stream count - is a 6.5 MB weight read 128 times per
+/// 2048-row chunk, ninety-seven times a layer stack. Measured on a GB10 that
+/// was 2.5 s of a 7.5k-token prefill's 10.6 s. Those mixes round their
+/// activation to half precision on the BLAS tier, as the reference does; the
+/// projections [`NARROW_OUTPUT`] exists for - the router above all - contract
+/// over the residual width and stay on the exact path.
+pub const WIDE_CONTRACTION: u32 = 8_192;
+
+/// Whether a half-precision chunk of `rows` must not have its activation
+/// rounded, which keeps it off [`Projection::HalfBlas`].
+#[must_use]
+pub const fn half_exact(in_dim: u32, out_dim: u32, rows: u32) -> bool {
+    rows > MAX_ROWS && out_dim <= NARROW_OUTPUT && in_dim < WIDE_CONTRACTION
+}
+
+/// Whether the strict single-precision multiply is available for a chunk.
+///
+/// It widens the weight into the per-stream staging, which cannot grow while
+/// a stream is capturing; a capture never carries a prefill chunk, so the
+/// per-row passes are what a captured chunk falls back to.
+const fn exact_blas(device: Device) -> bool {
+    device.blas && !device.capturing
+}
+
+/// Whether a half-precision chunk of `rows` runs as sixteen-row passes of the
+/// per-row kernel rather than one BLAS call.
+///
+/// Measured on a GB10 before the strict tier existed, those passes - the
+/// router, the recurrent gates and the shared router, sixteen rows at a time
+/// with a combine behind each - were 1.2 s of a 7.5k-token prefill's 6.8 s.
+#[must_use]
+pub const fn half_in_passes(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> bool {
+    half_exact(in_dim, out_dim, rows) && !exact_blas(device)
+}
+
 /// Elements one block-quantized weight block holds.
 const QUANT_BLOCK: u32 = 32;
 
@@ -144,6 +184,16 @@ pub enum Projection {
         /// Rows the call covers.
         rows: u32,
     },
+    /// A half-precision weight widened to single precision once and multiplied
+    /// in strict single precision, one call for the chunk.
+    ///
+    /// The narrow projections take this rather than [`Projection::HalfBlas`]:
+    /// the activation is never rounded, so the router reads the logits the
+    /// per-row kernel would have produced up to the order of the sums.
+    HalfExact {
+        /// Rows the call covers.
+        rows: u32,
+    },
     /// A brain-float weight through the warp-per-row kernel.
     BrainRows {
         /// The projection itself.
@@ -185,6 +235,11 @@ pub struct Device {
     pub capturing: bool,
     /// Blocks that can be resident at once, which bounds a cooperative grid.
     pub max_co_resident: u32,
+    /// Whether this pass's stream mixes leave the block input in half precision
+    /// as well, in [`Buf::MixedHalf`]. A fact about the pass rather than the
+    /// device, carried here because every planner that projects the block input
+    /// already takes this struct.
+    pub half_block_input: bool,
 }
 
 /// Plans one projection.
@@ -270,7 +325,10 @@ fn half(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Proj
             got: u64::from(in_dim),
         });
     }
-    if rows > MAX_ROWS && out_dim > NARROW_OUTPUT {
+    if half_exact(in_dim, out_dim, rows) && exact_blas(device) {
+        return Ok(Projection::HalfExact { rows });
+    }
+    if rows > MAX_ROWS && !half_exact(in_dim, out_dim, rows) {
         if !device.blas {
             return Err(CoreError::Unsupported {
                 what: "a wide half-precision chunk on a device with no BLAS tier",
@@ -452,7 +510,7 @@ pub fn project(
     rows: u32,
     device: Device,
 ) -> CoreResult<()> {
-    if weight.dtype == DType::F16 && rows > MAX_ROWS && weight.out_dim <= NARROW_OUTPUT {
+    if weight.dtype == DType::F16 && half_in_passes(weight.in_dim, weight.out_dim, rows, device) {
         let mut done = 0;
         while done < rows {
             let take = (rows - done).min(MAX_ROWS);
@@ -470,6 +528,92 @@ pub fn project(
         return Ok(());
     }
     project_one(out, weight, bound, rows, device)
+}
+
+/// Plans one half-precision projection on the BLAS tier whose input may
+/// already be half precision and whose output may be.
+///
+/// The stream mixes of a prefill chunk take this: the normed residual is
+/// written as halves by the norm that produces it, so the rounding pass the
+/// tier otherwise opens with - a whole read and write of the widest activation
+/// in the model, ninety-seven times a chunk - has nothing left to do, and the
+/// expansion's halves are what the collapse reads.
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when the weight would not be planned onto
+/// [`Projection::HalfBlas`] at this row count, which the caller's choice of
+/// precision is supposed to have ruled out.
+pub fn project_on_blas(
+    out: &mut Plan,
+    weight: WeightDesc,
+    bound: Bound,
+    rows: u32,
+    device: Device,
+    io: (Elem, Elem),
+) -> CoreResult<()> {
+    if !matches!(
+        plan(weight.dtype, weight.in_dim, weight.out_dim, rows, device)?,
+        Projection::HalfBlas { .. }
+    ) {
+        return Err(CoreError::Unsupported {
+            what: "a half-precision stream mix whose weight is not on the BLAS tier",
+            backend: "engine",
+        });
+    }
+    let (input, output) = io;
+    let b = match input {
+        Elem::F16 => bound.src,
+        Elem::F32 => {
+            convert_activation(out, bound.src, weight.in_dim, rows);
+            Operand::Scratch(Buf::HalfActivation)
+        }
+    };
+    out.push(Step::Blas {
+        op_a: GemmOp::Transposed,
+        op_b: GemmOp::AsStored,
+        m: weight.out_dim,
+        n: rows,
+        k: weight.in_dim,
+        lda: weight.in_dim,
+        ldb: weight.in_dim,
+        ldc: weight.out_dim,
+        a: Operand::Weight(bound.weight),
+        b,
+        c: bound.dst,
+        dtype: match output {
+            Elem::F16 => GemmDType::F16ToF16,
+            Elem::F32 => GemmDType::F16,
+        },
+    });
+    Ok(())
+}
+
+/// Whether a chunk's stream mixes can keep their normed residual and their
+/// expansion in half precision: every weight of every mix is half precision
+/// and lands on the BLAS tier at this row count, where the activation is
+/// rounded to halves anyway.
+#[must_use]
+pub fn half_streams<'a>(
+    mixes: impl IntoIterator<Item = &'a crate::sparse::weights::MixDesc>,
+    rows: u32,
+    device: Device,
+) -> bool {
+    let on_blas = |weight: &WeightDesc| {
+        weight.dtype == DType::F16
+            && matches!(
+                plan(weight.dtype, weight.in_dim, weight.out_dim, rows, device),
+                Ok(Projection::HalfBlas { .. })
+            )
+    };
+    let mut any = false;
+    for mix in mixes {
+        any = true;
+        if !on_blas(&mix.down) || !on_blas(&mix.up) || !mix.inject.as_ref().is_none_or(on_blas) {
+            return false;
+        }
+    }
+    any
 }
 
 /// Plans one pass of one projection.
@@ -578,7 +722,7 @@ fn project_one(
         // that reads a single-precision right operand against a
         // half-precision left one.
         Projection::HalfBlas { rows } => {
-            convert_activation(out, bound.src, weight.in_dim, rows);
+            let b = half_input(out, bound.src, weight.in_dim, rows, device);
             out.push(Step::Blas {
                 op_a: GemmOp::Transposed,
                 op_b: GemmOp::AsStored,
@@ -589,9 +733,40 @@ fn project_one(
                 ldb: weight.in_dim,
                 ldc: weight.out_dim,
                 a: w,
-                b: Operand::Scratch(Buf::HalfActivation),
+                b,
                 c: bound.dst,
                 dtype: GemmDType::F16,
+            });
+        }
+        // The widening writes the weight into the staging region, output-major
+        // as stored, and the multiply reads it transposed exactly as the
+        // half-precision tier reads the weight in place.
+        Projection::HalfExact { rows } => {
+            let elements = u64::from(weight.in_dim) * u64::from(weight.out_dim);
+            out.push(Step::Expand {
+                entry: Entry::plain(MOD_MATVEC, "q4e_f16_to_f32_kernel"),
+                k: weight.in_dim,
+                n: weight.out_dim,
+                // The element width being widened; this step decodes no trellis.
+                bits: 16,
+                launch: kernels::elementwise(elements),
+                staging: Staging::of(elements * 4),
+                // `out, in, n`
+                args: Args::of(&[Operand::CoopStaging(0), w, Operand::U64(elements)]),
+            });
+            out.push(Step::Blas {
+                op_a: GemmOp::Transposed,
+                op_b: GemmOp::AsStored,
+                m: weight.out_dim,
+                n: rows,
+                k: weight.in_dim,
+                lda: weight.in_dim,
+                ldb: weight.in_dim,
+                ldc: weight.out_dim,
+                a: Operand::CoopStaging(0),
+                b: bound.src,
+                c: bound.dst,
+                dtype: GemmDType::F32Strict,
             });
         }
         Projection::Trellis {
@@ -651,7 +826,7 @@ fn project_one(
                     Operand::I32(0),
                 ]),
             });
-            convert_activation(out, bound.src, weight.in_dim, rows);
+            let b = half_input(out, bound.src, weight.in_dim, rows, device);
             out.push(Step::Blas {
                 op_a: GemmOp::AsStored,
                 op_b: GemmOp::AsStored,
@@ -662,7 +837,7 @@ fn project_one(
                 ldb: weight.in_dim,
                 ldc: weight.out_dim,
                 a: Operand::CoopStaging(0),
-                b: Operand::Scratch(Buf::HalfActivation),
+                b,
                 c: bound.dst,
                 dtype: GemmDType::F16,
             });
@@ -695,6 +870,22 @@ pub(super) fn trellis_entry(template: &'static str, bits: u32, shape: GemmShape)
 /// multiply then reads, and a pass that skipped it would hand the tier whatever
 /// the previous chunk left in that buffer.
 fn convert_activation(out: &mut Plan, src: Operand, in_dim: u32, rows: u32) {
+    convert_into(out, src, in_dim, rows);
+}
+
+/// The half-precision operand a BLAS-tier projection of `src` reads: the copy
+/// the stream mix already wrote when `src` is the whole block input and the
+/// pass has one, and otherwise a rounding pass into the shared half buffer.
+fn half_input(out: &mut Plan, src: Operand, in_dim: u32, rows: u32, device: Device) -> Operand {
+    if device.half_block_input && src == Operand::Scratch(Buf::Mixed) {
+        return Operand::Scratch(Buf::MixedHalf);
+    }
+    convert_into(out, src, in_dim, rows);
+    Operand::Scratch(Buf::HalfActivation)
+}
+
+/// The rounding launch itself.
+fn convert_into(out: &mut Plan, src: Operand, in_dim: u32, rows: u32) {
     let elements = u64::from(rows) * u64::from(in_dim);
     out.launch(
         Entry::plain(MOD_MATVEC, "q4e_f32_to_f16_kernel"),
@@ -800,6 +991,7 @@ mod tests {
         blas: true,
         capturing: false,
         max_co_resident: 48,
+        half_block_input: false,
     };
 
     #[test]
@@ -840,14 +1032,36 @@ mod tests {
     }
 
     #[test]
-    fn a_half_precision_chunk_wider_than_the_instantiated_set_runs_in_passes_of_it() {
-        // A narrow output stays on the per-row kernel however wide the chunk
-        // is, because the BLAS tier's rounding is what flips a routing tie.
+    fn a_narrow_half_precision_chunk_is_multiplied_exactly_or_in_passes() {
+        // A narrow output is never rounded onto the half-precision tier,
+        // because that rounding is what flips a routing tie: it takes the
+        // strict single-precision multiply where there is one, and passes of
+        // the per-row kernel where there is not - or where a capture forbids
+        // widening the weight into the staging.
         let plan = half(2_560, 512, 512, GPU).expect("the router is half precision");
-        let Projection::HalfRows { rows, .. } = plan else {
-            panic!("a narrow output never reaches the BLAS tier: {plan:?}");
-        };
-        assert_eq!(rows, MAX_ROWS, "one pass is the instantiated width");
+        assert_eq!(plan, Projection::HalfExact { rows: 512 });
+        for device in [
+            Device { blas: false, ..GPU },
+            Device {
+                capturing: true,
+                ..GPU
+            },
+        ] {
+            let plan = half(2_560, 512, 512, device).expect("the router has a per-row tier");
+            let Projection::HalfRows { rows, .. } = plan else {
+                panic!("without the strict multiply a narrow output runs in passes: {plan:?}");
+            };
+            assert_eq!(rows, MAX_ROWS, "one pass is the instantiated width");
+        }
+    }
+
+    #[test]
+    fn a_stream_mix_contraction_goes_to_the_half_precision_tier_however_narrow() {
+        // The whole multi-stream residual into the low-rank width: re-read for
+        // every sixteen rows it was most of a prefill, and its activation is
+        // rounded to halves anyway, as the reference does.
+        let plan = half(10_240, 320, 512, GPU).expect("a stream mix has a tier");
+        assert_eq!(plan, Projection::HalfBlas { rows: 512 });
     }
 
     #[test]

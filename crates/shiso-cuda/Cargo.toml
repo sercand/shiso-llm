@@ -26,6 +26,8 @@ tracing = { workspace = true }
 # keeps the handle, enum and struct layouts out of hand-written FFI.
 [target.'cfg(target_os = "linux")'.dependencies]
 cudarc = { workspace = true, features = ["cublas", "cublaslt"] }
+# `madvise`, for the readahead a weight import asks for before it copies.
+libc = { workspace = true }
 
 [lints]
 workspace = true

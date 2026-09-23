@@ -233,6 +233,37 @@ pub trait Backend: Send + Sync + fmt::Debug {
         Ok(raw)
     }
 
+    /// Whether [`Backend::import_raw`] copies the host bytes, so nothing reads
+    /// them once it returns.
+    ///
+    /// A loader uses this to hand a file's pages back to the kernel after each
+    /// import: on a device that copies, keeping them cached costs the device's
+    /// own allocations a reclaim, and on one that wraps the mapping in place
+    /// dropping them would make the device read the file from disk. The
+    /// default copies.
+    fn imports_copy(&self) -> bool {
+        true
+    }
+
+    /// Says the load is over: no more [`Backend::import_raw`] calls are coming.
+    ///
+    /// A backend that keeps host resources to make a burst of imports fast -
+    /// page-locked staging, say - releases them here. Another import after this
+    /// is still correct; it only pays to set that up again. The default has
+    /// nothing to release.
+    fn finish_imports(&self) {}
+
+    /// The device's memory as its driver reports it now, or `None` when this
+    /// backend cannot say.
+    ///
+    /// What sizing a cache to a fraction of the device reads, after the
+    /// weights are resident. `None` is not zero: a caller that asked to fit a
+    /// fraction refuses to start on a device that cannot answer, rather than
+    /// guessing a size. The default cannot answer.
+    fn memory_info(&self) -> Option<MemoryInfo> {
+        None
+    }
+
     /// Resolves an entry point whose real name is only known once its module is
     /// loaded, returning `None` when this device has no such kernel.
     ///
@@ -429,6 +460,18 @@ pub trait Backend: Send + Sync + fmt::Debug {
     }
 }
 
+/// Device memory at one moment, in bytes.
+///
+/// `free` is what the driver would still grant, which on a device that shares
+/// memory with its host counts everything else the machine holds too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryInfo {
+    /// Bytes the driver would still grant.
+    pub free: u64,
+    /// Bytes the device has.
+    pub total: u64,
+}
+
 /// Bytes one device pointer occupies in a packed array.
 ///
 /// Every device this workspace targets addresses memory with sixty-four bits,
@@ -604,8 +647,17 @@ impl<'a> GraphCapture<'a> {
 pub enum GemmDType {
     /// Both operands and the accumulator are single precision.
     F32,
+    /// Single precision that is never rounded on its way into the multiplier,
+    /// whatever reduced-precision mode the backend was opened with.
+    ///
+    /// For the projections whose answer a rounding can flip - a router choosing
+    /// experts from logits a hair apart is the one this exists for.
+    F32Strict,
     /// Half-precision operands accumulated in single precision.
     F16,
+    /// Half-precision operands accumulated in single precision and written
+    /// back as halves, for a destination whose every reader takes halves.
+    F16ToF16,
     /// Brain-float operands accumulated in single precision.
     BF16,
 }

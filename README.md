@@ -106,6 +106,9 @@ environment variable. The ones you are most likely to want:
 | Flag | What it does |
 |---|---|
 | `--ctx` | Tokens one session may hold, prompt included (default 4096) |
+| `--max-num-seqs` | Sequences resident at once (default 4) |
+| `--kv-cache-tokens` | Tokens the shared KV cache holds across all sessions (default 131072) |
+| `--gpu-memory-utilization` | Size the KV cache to fill this share of device memory instead, in (0, 1] |
 | `--bind`, `--port` | Listen address (default `127.0.0.1:8090`) |
 | `--model-name` | The name clients use in the `model` field |
 | `--auth-tokens` | Comma-separated bearer tokens required on inference routes |

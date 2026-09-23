@@ -427,6 +427,24 @@ pub trait Speculating: Model {
     /// [`CoreError::UnknownSession`], [`CoreError::Unsupported`] when the
     /// session was not opened for speculation, and whatever the device reports.
     fn speculate(&mut self, session: SessionId, first: TokenId) -> CoreResult<Speculated>;
+
+    /// One speculative step for several sessions, `steps[i]` being session
+    /// `i`'s committed token, with what [`Speculating::speculate`] would have
+    /// returned for each, in order.
+    ///
+    /// The default is exactly that: one step after another. A family whose
+    /// verify can carry several sessions in one pass over its weights answers
+    /// it in one, and has to leave every session where its own step would.
+    ///
+    /// # Errors
+    ///
+    /// As [`Speculating::speculate`] for any session.
+    fn speculate_batch(&mut self, steps: &[(SessionId, TokenId)]) -> CoreResult<Vec<Speculated>> {
+        steps
+            .iter()
+            .map(|(session, first)| self.speculate(*session, *first))
+            .collect()
+    }
 }
 
 #[cfg(test)]

@@ -259,7 +259,7 @@ impl Qwen35MoeModel {
                 backend,
                 parts,
                 stack.geometry(),
-                opts.kv_pool_pages,
+                stack.pool_pages(),
                 MAX_PREFILL_CHUNK,
             )?;
             stack.bind_draft(resident)?;

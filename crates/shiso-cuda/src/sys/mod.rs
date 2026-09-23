@@ -296,6 +296,16 @@ opaque_handle!(
     usize
 );
 
+opaque_handle!(
+    /// Page-locked host memory the driver allocated.
+    ///
+    /// The device reads it by DMA without the driver first copying it into a
+    /// bounce buffer of its own, which is what makes an asynchronous copy out
+    /// of it both possible and fast.
+    PinnedPtr,
+    usize
+);
+
 /// An address in device memory.
 ///
 /// Distinct from a host pointer on purpose: the two are the same width and are
@@ -404,6 +414,9 @@ pub(crate) struct GemmCall {
     /// Whether reduced-precision accumulation of single-precision operands is
     /// allowed for this call.
     pub(crate) tf32: bool,
+    /// Whether the product is written back in half precision rather than
+    /// single. Accumulation is single precision either way.
+    pub(crate) out_half: bool,
 }
 
 /// The extra arguments a strided-batched multiply needs.
@@ -507,6 +520,7 @@ mod tests {
             beta: 0.0,
             dtype: MathType::Bf16,
             tf32: true,
+            out_half: false,
         };
         assert_eq!((call.op_a, call.op_b), (Op::N, Op::T));
         assert_eq!((call.m, call.n, call.k), (1, 2, 3));
@@ -601,6 +615,7 @@ mod tests {
                 beta: 0.0,
                 dtype: MathType::F32,
                 tf32: false,
+                out_half: false,
             }
         }
 

@@ -36,8 +36,8 @@ use shiso_core::{Backend, Extent3};
 
 use crate::sparse::exl3::{self as exl3, GemmShape};
 use crate::sparse::kernels::{
-    self, Elem, Entry, EntryTable, Instantiation, MOD_EMBED, MOD_EXL3, MOD_GDN, MOD_HC, MOD_IDX,
-    MOD_MATVEC, MOD_MISC, MOD_MOE, MOD_PLE, MOD_QSA, MOD_QSA_SPARSE, TemplateArgs,
+    self, Elem, Entry, EntryTable, Instantiation, MOD_EMBED, MOD_EXL3, MOD_GDN, MOD_GDN_TC, MOD_HC,
+    MOD_IDX, MOD_MATVEC, MOD_MISC, MOD_MOE, MOD_PLE, MOD_QSA, MOD_QSA_SPARSE, TemplateArgs,
 };
 
 /// Every module the sparse stack launches out of.
@@ -49,6 +49,7 @@ const MODULES: &[&str] = &[
     MOD_HC,
     MOD_MOE,
     MOD_GDN,
+    MOD_GDN_TC,
     MOD_PLE,
     MOD_MATVEC,
     MOD_QSA,
@@ -119,10 +120,16 @@ enum Arg {
 
 /// Splits a mangled entry point into the template it instantiates and the
 /// arguments it carries, or `None` for anything this subset does not cover.
+///
+/// A mangled name with no argument list decodes to its name and no arguments:
+/// a C++-linkage entry point that is not a template still cannot be named by a
+/// constant, and [`classify`] decides which of those this build launches.
 fn decode(symbol: &str) -> Option<(&str, Vec<Arg>)> {
     let rest = symbol.strip_prefix("_Z")?;
     let (name, rest) = length_prefixed(rest)?;
-    let mut rest = rest.strip_prefix('I')?;
+    let Some(mut rest) = rest.strip_prefix('I') else {
+        return Some((name, Vec::new()));
+    };
     let mut args = Vec::new();
     loop {
         if let Some(tail) = rest.strip_prefix('E') {
@@ -284,6 +291,33 @@ fn classify(module: &'static str, template: &str, args: &[Arg]) -> Option<Instan
             kernels::EXL3_RECONSTRUCT,
             TemplateArgs::TrellisBits(int(args, 0)?),
         ),
+        kernels::EXL3_MOE_WS_PREP if args.is_empty() => {
+            of(kernels::EXL3_MOE_WS_PREP, TemplateArgs::Untemplated)
+        }
+        // `<bits, cb, STAGES>`: the codebook and the stage count are fixed by
+        // the one instantiation per width the kernel file builds, so the width
+        // is the key.
+        kernels::EXL3_MOE_WS_GATEUP => of(
+            kernels::EXL3_MOE_WS_GATEUP,
+            TemplateArgs::TrellisBits(int(args, 0)?),
+        ),
+        kernels::EXL3_MOE_WS_DOWN => of(
+            kernels::EXL3_MOE_WS_DOWN,
+            TemplateArgs::TrellisBits(int(args, 0)?),
+        ),
+        kernels::EXL3_MOE_WS_DOWN_H => of(
+            kernels::EXL3_MOE_WS_DOWN_H,
+            TemplateArgs::TrellisBits(int(args, 0)?),
+        ),
+        kernels::EXL3_MOE_WS_COMBINE if args.is_empty() => {
+            of(kernels::EXL3_MOE_WS_COMBINE, TemplateArgs::Untemplated)
+        }
+        kernels::EXL3_MOE_WS_INVERT if args.is_empty() => {
+            of(kernels::EXL3_MOE_WS_INVERT, TemplateArgs::Untemplated)
+        }
+        kernels::EXL3_MOE_WS_PREP_TOK if args.is_empty() => {
+            of(kernels::EXL3_MOE_WS_PREP_TOK, TemplateArgs::Untemplated)
+        }
         _ => None,
     }
 }
@@ -408,6 +442,15 @@ mod tests {
         let inst = classify(MOD_EXL3, name, &args).expect("it classifies");
         // Tiles 32x256 are shape three; nothing in the symbol says "three".
         assert_eq!(inst.args, TemplateArgs::Trellis { bits: 5, shape: 3 });
+    }
+
+    #[test]
+    fn an_untemplated_mangled_entry_is_captured_by_name() {
+        let (name, args) =
+            decode("_Z16exl3_moe_ws_prepPKfP6__halfS2_PKS1_S4_PKiS6_iiii").expect("it decodes");
+        assert_eq!(name, "exl3_moe_ws_prep");
+        let inst = classify(MOD_EXL3, name, &args).expect("it classifies");
+        assert_eq!(inst.args, TemplateArgs::Untemplated);
     }
 
     #[test]

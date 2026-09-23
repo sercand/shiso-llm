@@ -55,7 +55,7 @@ use crate::sparse::bind::{LayerRef, Operand, Role, WeightRef};
 use crate::sparse::gather;
 use crate::sparse::hyper::{self, ChainLink, MixRoles, NextNorm};
 use crate::sparse::island::{self, Island, IslandContext, IslandKey, LayerChain};
-use crate::sparse::kernels::F32_BYTES;
+use crate::sparse::kernels::{Elem, F32_BYTES};
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::media;
 use crate::sparse::moe::{self, RowOrigin};
@@ -178,7 +178,50 @@ impl SparseStack {
         self.plan_rows(&live, rows, rows, origin, None)
     }
 
+    /// Plans one segmented pass: each session's run of consecutive positions,
+    /// in session order, all of them in one pass over the weights.
+    ///
+    /// `lens[i]` is how many rows session `i` runs. Every row produces logits,
+    /// because a segmented pass is a batch's speculative verify and what comes
+    /// back is every row's greedy pick.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`], [`CoreError::ShapeMismatch`] for runs
+    /// that do not pair with the sessions or a pass wider than the logits
+    /// block, [`CoreError::InvalidValue`] when one session runs twice, and
+    /// whatever the block families report.
+    pub fn plan_segments(&self, sessions: &[SessionId], lens: &[u32]) -> CoreResult<Pass> {
+        if sessions.len() != lens.len() {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented pass runs",
+                expected: sessions.len() as u64,
+                got: lens.len() as u64,
+            });
+        }
+        let runs = moe::Segments::new(lens)?;
+        let rows = runs.rows();
+        if rows > crate::sparse::stack::MAX_LOGIT_ROWS {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented pass rows",
+                expected: u64::from(crate::sparse::stack::MAX_LOGIT_ROWS),
+                got: u64::from(rows),
+            });
+        }
+        crate::sparse::stack::distinct(sessions)?;
+        let live = sessions
+            .iter()
+            .map(|id| self.session(*id))
+            .collect::<CoreResult<Vec<_>>>()?;
+        self.plan_rows(&live, rows, rows, RowOrigin::Segmented(runs), None)
+    }
+
     /// The pass itself.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the pass is planned in the order it runs - gathers, islands, \
+                  logits - and each stage reads what the one before it chose"
+    )]
     fn plan_rows(
         &self,
         rows: &[&SparseSession],
@@ -195,27 +238,50 @@ impl SparseStack {
             expected: 1,
             got: 0,
         })?;
-        let batched = origin == RowOrigin::Unrelated;
+        let batched = origin != RowOrigin::Sequential;
         // One sequence's frontier decides whether its selection is live. A batch
-        // has one frontier per row and one attention kernel for all of them, and
-        // that kernel is the dense entry: this set ships no batched
-        // selected-block attention, so a batched pass is planned dense and says
-        // so here rather than in the attention ladder.
+        // has one frontier per row, and each row answers for itself: its
+        // attention is planned as a single-row step of its own sequence, over
+        // its own selection when its own context is past the budget.
         let selected = !batched
             && self
                 .shape
                 .indexer
                 .sparse_at(first.written().saturating_add(n_tok));
+        // A segmented pass's run `r` is session `r`'s, and covers `len(r)` rows
+        // past its frontier; a batch's row `r` covers one.
+        let run_rows = |row: u32| match origin {
+            RowOrigin::Segmented(runs) => runs.len(row),
+            RowOrigin::Sequential | RowOrigin::Unrelated => 1,
+        };
+        let batch_selected = if batched {
+            rows.iter()
+                .enumerate()
+                .filter(|(row, live)| {
+                    let row = u32::try_from(*row).unwrap_or(u32::MAX);
+                    self.shape
+                        .indexer
+                        .sparse_at(live.written().saturating_add(run_rows(row)))
+                })
+                .fold(0u8, |bits, (row, _)| bits | (1u8 << (row % 8)))
+        } else {
+            0
+        };
         let ctx = AttnContext {
             selected,
             tensor_core: self.opts.tensor_core,
             tiled: self.opts.tiled_attention,
             origin,
+            batch_selected,
         };
         let capturable = !batched && self.opts.graphs.capturable(n_tok);
         let device = Device {
             capturing: capturable,
             ..self.device
+        };
+        let device = Device {
+            half_block_input: self.stream_elem(n_tok, device) == Elem::F16,
+            ..device
         };
         let context = if batched {
             IslandContext::Batch
@@ -275,9 +341,17 @@ impl SparseStack {
             }
         }
 
-        self.plan_logits(&mut plan, n_tok, logit_rows, batched, device)?;
+        // A segmented pass is a verify, and a verify's output is every row's
+        // greedy pick rather than the rows themselves.
+        self.plan_logits(
+            &mut plan,
+            n_tok,
+            logit_rows,
+            origin == RowOrigin::Unrelated,
+            device,
+        )?;
 
-        let gather = self.plan_gathers(rows, n_tok, batched)?;
+        let gather = self.plan_gathers(rows, n_tok, origin)?;
         // The per-stream scratch every cooperative launch in the pass reads is
         // reserved once, in front of the first island, at the widest carve-up
         // any of them makes. It cannot be reserved where it is needed: growing
@@ -323,6 +397,7 @@ impl SparseStack {
                 MixRoles::output(),
                 n_tok,
                 device,
+                self.stream_elem(n_tok, device),
             )?);
             // The rows that get sampled are the chunk's *last* ones, so the
             // widest matmul in the model starts where they do rather than at
@@ -379,12 +454,25 @@ impl SparseStack {
         &self,
         rows: &[&SparseSession],
         n_tok: u32,
-        batched: bool,
+        origin: RowOrigin,
     ) -> CoreResult<Vec<PleGather>> {
         let Some(ple) = self.shape.ple else {
             return Ok(Vec::new());
         };
-        if !batched {
+        if let RowOrigin::Segmented(runs) = origin {
+            // One gather per run, over that run's own positions: the rows land
+            // in run order, which is the pass's row order.
+            return rows
+                .iter()
+                .enumerate()
+                .map(|(run, live)| {
+                    let len = runs.len(u32::try_from(run).unwrap_or(u32::MAX));
+                    let written = live.written();
+                    PleGather::start(ple, written.saturating_add(len), written, len)
+                })
+                .collect();
+        }
+        if origin == RowOrigin::Sequential {
             let live = rows.first().ok_or(CoreError::ShapeMismatch {
                 field: "pass rows",
                 expected: 1,
@@ -404,6 +492,33 @@ impl SparseStack {
                 PleGather::start(ple, written.saturating_add(1), written, 1)
             })
             .collect()
+    }
+
+    /// The precision every stream mix of a pass of `n_tok` rows holds its
+    /// normed residual and its expansion in.
+    ///
+    /// One answer for the whole pass, the draft head's mixes included, because
+    /// every combine writes the normed residual the next mix reads and the two
+    /// have to agree on its element type.
+    pub(crate) fn stream_elem(&self, n_tok: u32, device: Device) -> Elem {
+        let target = self
+            .desc
+            .layers
+            .iter()
+            .flat_map(|layer| [&layer.attn_mix, &layer.ffn_mix]);
+        let head = self
+            .desc
+            .draft
+            .iter()
+            .flat_map(|head| [&head.layer.attn_mix, &head.layer.ffn_mix, &head.output_mix]);
+        let mixes = target
+            .chain(std::iter::once(&self.desc.output_mix))
+            .chain(head);
+        if matmul::half_streams(mixes, n_tok, device) {
+            Elem::F16
+        } else {
+            Elem::F32
+        }
     }
 
     /// One island's body.
@@ -426,6 +541,7 @@ impl SparseStack {
         device: Device,
     ) -> CoreResult<Plan> {
         let mut plan = Plan::new();
+        let elem = self.stream_elem(n_tok, device);
         let next = match half {
             // The token mixer's combine always feeds this layer's own
             // feed-forward mix, which is the one place in a pass where nothing
@@ -473,6 +589,7 @@ impl SparseStack {
                     chain.mixer_input,
                     n_tok,
                     device,
+                    elem,
                 )?);
                 match layer.block {
                     BlockDesc::Recurrent(desc) => plan.append(recurrent::block(
@@ -512,6 +629,7 @@ impl SparseStack {
                     chain.experts_input,
                     n_tok,
                     device,
+                    elem,
                 )?);
                 plan.append(moe::block(
                     &self.shape,
@@ -522,7 +640,7 @@ impl SparseStack {
                 )?);
             }
         }
-        plan.append(hyper::combine(&self.shape, next, n_tok)?);
+        plan.append(hyper::combine(&self.shape, next, n_tok, elem)?);
         Ok(plan)
     }
 }

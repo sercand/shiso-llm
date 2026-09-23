@@ -25,7 +25,7 @@ use shiso_engine::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
 use shiso_engine::sparse::gather;
 use shiso_engine::sparse::hyper::{self, MixInput, MixRoles, NextNorm};
 use shiso_engine::sparse::indexer::{self, Scorer};
-use shiso_engine::sparse::kernels;
+use shiso_engine::sparse::kernels::{self, Elem};
 use shiso_engine::sparse::matmul::{self, Bound, Device};
 use shiso_engine::sparse::moe::{self, RowOrigin};
 use shiso_engine::sparse::mtp::SpecDepth;
@@ -90,6 +90,7 @@ const GPU: Device = Device {
     blas: true,
     capturing: false,
     max_co_resident: 48,
+    half_block_input: false,
 };
 
 fn half(in_dim: u32, out_dim: u32) -> WeightDesc {
@@ -190,37 +191,49 @@ fn every_path() -> Plan {
         1,
     ));
     for rows in [1_u32, 4, 16, 512] {
-        for input in [MixInput::Raw, MixInput::AlreadyNormed] {
+        // The half-precision streams are a prefill chunk's, so they are only
+        // planned where a chunk is wider than the per-row kernels.
+        let elems: &[Elem] = if rows > 16 {
+            &[Elem::F32, Elem::F16]
+        } else {
+            &[Elem::F32]
+        };
+        for &elem in elems {
+            for input in [MixInput::Raw, MixInput::AlreadyNormed] {
+                plan.append(
+                    hyper::mix(
+                        &shape,
+                        &mix_desc(&shape, true),
+                        MixRoles::token_mixer(LayerRef::target(0)),
+                        input,
+                        rows,
+                        GPU,
+                        elem,
+                    )
+                    .expect("a half-precision mix has a tier"),
+                );
+            }
+            for next in [
+                NextNorm::Broken,
+                NextNorm::Chained(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm)),
+            ] {
+                plan.append(
+                    hyper::combine(&shape, next, rows, elem)
+                        .expect("the residual fits the fused combine"),
+                );
+            }
             plan.append(
-                hyper::mix(
+                hyper::collapse(
                     &shape,
-                    &mix_desc(&shape, true),
-                    MixRoles::token_mixer(LayerRef::target(0)),
-                    input,
+                    &mix_desc(&shape, false),
+                    MixRoles::output(),
                     rows,
                     GPU,
+                    elem,
                 )
-                .expect("a half-precision mix has a tier"),
+                .expect("the collapsing mix has a tier"),
             );
         }
-        for next in [
-            NextNorm::Broken,
-            NextNorm::Chained(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm)),
-        ] {
-            plan.append(
-                hyper::combine(&shape, next, rows).expect("the residual fits the fused combine"),
-            );
-        }
-        plan.append(
-            hyper::collapse(
-                &shape,
-                &mix_desc(&shape, false),
-                MixRoles::output(),
-                rows,
-                GPU,
-            )
-            .expect("the collapsing mix has a tier"),
-        );
         // Both recurrences: the sequential one at every row count, the chunked
         // one only where the policy allows it.
         // Both recurrences, and both draft depths: the per-position checkpoint
@@ -275,6 +288,7 @@ fn every_path() -> Plan {
                 tensor_core: true,
                 tiled: true,
                 origin: RowOrigin::Sequential,
+                batch_selected: 0,
             },
         ] {
             plan.append(
@@ -298,8 +312,20 @@ fn every_path() -> Plan {
         }
         plan.append(
             moe::block(&shape, &expert_desc(&shape), LayerRef::target(0), rows, GPU)
-                .expect("a trellis expert stack has a fused stage"),
+                .expect("a trellis expert stack has a routed stage"),
         );
+        // Three rows, a verify pass's width: the one row count that still
+        // takes the fused cooperative stage.
+        // The fused cooperative stage is no longer on the routed block's own
+        // ladder - every pass of a few rows takes the grouped launches, every
+        // wider one the weight-stationary ones - but it is still a planner, and
+        // its bindings are still checked.
+        if rows == 4 {
+            plan.append(
+                moe::fused_experts(&shape, LayerRef::target(0), 4, 3, GPU)
+                    .expect("a trellis expert stack has a fused stage"),
+            );
+        }
         // The staged down projection, which the fused stage does not reach.
         let mut staged = expert_desc(&shape);
         staged.down = WeightDesc::new(DType::Q8_0, shape.moe.intermediate, shape.hidden);
@@ -390,6 +416,7 @@ fn every_path() -> Plan {
                 tensor_core: true,
                 tiled: true,
                 origin: RowOrigin::Unrelated,
+                batch_selected: 0b01,
             },
         ] {
             plan.append(
@@ -485,6 +512,7 @@ fn exl3_sources() -> String {
         "exl3/exl3_gemm_kernel.cuh",
         "exl3/exl3_moe_common.cuh",
         "exl3/exl3_moe_kernel.cuh",
+        "exl3/exl3_moe_ws.cuh",
         "exl3/exl3_reconstruct.cuh",
         "exl3/KERNEL.toml",
     ]
@@ -506,7 +534,9 @@ fn every_entry_the_pass_can_dispatch_is_in_the_kernel_set_s_own_table() {
         };
         let name = entry.name();
         assert!(
-            table.contains(&format!("`{name}`")) || exl3.contains(&format!("void {name}")),
+            table.contains(&format!("`{name}`"))
+                || exl3.contains(&format!("void {name}"))
+                || exl3.contains(&format!("\n{name}(")),
             "{name} is dispatched by the pass but is declared by no vendored unit"
         );
         checked.insert(name);
@@ -600,6 +630,7 @@ fn a_single_slice_tensor_core_attention_writes_its_own_destination() {
         tensor_core: true,
         tiled: true,
         origin: RowOrigin::Sequential,
+        batch_selected: 0,
     };
     // Two key heads over sixteen rows is past the slice threshold, so one slice
     // covers it and there is nothing to fold.
@@ -657,9 +688,10 @@ fn the_geometry_of_every_kernel_is_the_expression_its_launcher_computes() {
     assert_eq!(tiled.grid.y, 512_u32.div_ceil(kernels::ATTN_QT));
     assert_eq!(tiled.smem, 50_176);
 
-    let split = kernels::qsa_attention_split(shape.gqa.q_heads, shape.gqa.kv_heads, 1);
-    // Twelve query heads a key head over one token, in groups of sixteen.
-    assert_eq!(split.grid.x, 12_u32.div_ceil(kernels::ATTN_QG));
+    let split = kernels::qsa_attention_split(shape.gqa.kv_heads, 4);
+    // One block per row, each holding all twelve query heads of its key head,
+    // so a row's key range is its own.
+    assert_eq!(split.grid.x, 4);
     assert_eq!(split.grid.y, kernels::ATTN_SPLITS);
     assert_eq!(split.grid.z, 2);
 
@@ -768,6 +800,7 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "hc.cu",
         "moe.cu",
         "gdn.cu",
+        "gdn_tc.cu",
         "ple.cu",
         "matvec.cu",
         "qsa.cu",
@@ -797,6 +830,23 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         let source = exl3_sources();
         let pointers = parse_macro_params(&source, macro_name)
             .unwrap_or_else(|| panic!("{macro_name} is declared in the trellis family's sources"));
+        out.insert(name.to_owned(), Signature { pointers });
+    }
+    // The weight-stationary routed block is plain kernels in one header of the
+    // trellis family's own, named without the `_kernel` suffix the scan above
+    // keys on, so each is looked up by the name the pass dispatches.
+    let ws = read_kernel_file("exl3/exl3_moe_ws.cuh");
+    for name in [
+        kernels::EXL3_MOE_WS_PREP,
+        kernels::EXL3_MOE_WS_INVERT,
+        kernels::EXL3_MOE_WS_PREP_TOK,
+        kernels::EXL3_MOE_WS_GATEUP,
+        kernels::EXL3_MOE_WS_DOWN,
+        kernels::EXL3_MOE_WS_DOWN_H,
+        kernels::EXL3_MOE_WS_COMBINE,
+    ] {
+        let pointers = parse_line_definition(&ws, name)
+            .unwrap_or_else(|| panic!("{name} is defined in the weight-stationary header"));
         out.insert(name.to_owned(), Signature { pointers });
     }
     let reconstruct = read_kernel_file("exl3/exl3_reconstruct.cuh");
@@ -829,6 +879,29 @@ fn parse_macro_params(text: &str, macro_name: &str) -> Option<Vec<bool>> {
             .map(|param| param.contains('*'))
             .collect(),
     )
+}
+
+/// The parameter list of a kernel whose name opens its own line and whose
+/// definition follows the list.
+fn parse_line_definition(text: &str, name: &str) -> Option<Vec<bool>> {
+    let mut at = 0usize;
+    while let Some(found) = text[at..].find(&format!("\n{name}(")) {
+        let open = at + found + name.len() + 2;
+        at = open;
+        let rest = &text[open..];
+        let close = rest.find(')')?;
+        if !rest[close + 1..].trim_start().starts_with('{') {
+            continue;
+        }
+        return Some(
+            rest[..close]
+                .split(',')
+                .filter(|param| !param.trim().is_empty())
+                .map(|param| param.contains('*'))
+                .collect(),
+        );
+    }
+    None
 }
 
 /// The same, for a declaration whose opening parenthesis is on its own line.
@@ -957,17 +1030,18 @@ fn every_launch_binds_exactly_the_parameters_its_kernel_declares() {
     }
 }
 
-/// The six kernels that carry per-sequence state through one batched launch,
+/// The five kernels that carry per-sequence state through one batched launch,
 /// and which parameter of each is the per-row array.
 ///
 /// The index is the position in the *kernel's own* declaration, and the test
 /// below reads that declaration rather than trusting this list for anything but
-/// the position it points at.
-const BATCHED: [&str; 6] = [
+/// the position it points at. The batched attention entry is not among them any
+/// more: a batch attends one row at a time through the single-row kernels, over
+/// each row's own page table, so a row computes what it would alone.
+const BATCHED: [&str; 5] = [
     "q4e_gdn_conv_batch_kernel",
     "q4e_gdn_recurrent_batch_kernel",
     "q4e_qsa_store_kv_batch_kernel",
-    "q4e_qsa_attention_batch_kernel",
     "q4e_idx_store_k_batch_kernel",
     "q4e_ple_conv_batch_kernel",
 ];
@@ -990,7 +1064,6 @@ fn every_batched_entry_binds_a_per_row_array_where_its_declaration_takes_one() {
             Operand::RecurrentStates(0),
         ),
         ("q4e_qsa_store_kv_batch_kernel", 14, Operand::PageTables),
-        ("q4e_qsa_attention_batch_kernel", 8, Operand::PageTables),
         ("q4e_idx_store_k_batch_kernel", 3, Operand::PageTables),
         ("q4e_ple_conv_batch_kernel", 1, Operand::NgramWindows),
     ];
@@ -1166,6 +1239,7 @@ fn the_combine_binds_the_next_block_s_norm_and_a_null_where_the_chain_breaks() {
         &shape,
         NextNorm::Chained(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm)),
         1,
+        Elem::F32,
     )
     .expect("the residual fits the fused combine");
     let operands = chained.steps()[0]
@@ -1175,7 +1249,7 @@ fn the_combine_binds_the_next_block_s_norm_and_a_null_where_the_chain_breaks() {
         operands[4],
         Operand::Weight(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm))
     );
-    let broken = hyper::combine(&shape, NextNorm::Broken, 1).expect("the residual fits");
+    let broken = hyper::combine(&shape, NextNorm::Broken, 1, Elem::F32).expect("the residual fits");
     let operands = broken.steps()[0]
         .operands()
         .expect("the list fits a launch");
@@ -1236,7 +1310,7 @@ fn the_routed_experts_carve_three_staging_buffers_that_do_not_overlap() {
     use shiso_engine::sparse::plan::Step;
 
     let shape = shape();
-    let plan = moe::block(&shape, &expert_desc(&shape), LayerRef::target(0), 512, GPU)
+    let plan = moe::fused_experts(&shape, LayerRef::target(0), 4, 3, GPU)
         .expect("a trellis expert stack has a fused stage");
     let fused = plan
         .steps()

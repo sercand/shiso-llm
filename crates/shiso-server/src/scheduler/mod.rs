@@ -88,6 +88,10 @@ pub use queue::{EngineGone, EngineHandle, EngineRequest, GenerateRequest, QUEUE_
 pub use stats::SchedulerStats;
 pub use stop::{StopStep, StopWatcher};
 
+/// Sequences one decode step carries, which is the widest batch the engines'
+/// logits block and per-row pointer arrays are built for.
+const DECODE_GROUP_ROWS: usize = shiso_engine::MAX_DECODE_BATCH as usize;
+
 /// Events buffered for a client that is not reading fast enough.
 const EVENT_QUEUE: usize = 64;
 
@@ -656,8 +660,11 @@ impl Coordinator {
             // visible to the caller instead of to a fan.
             self.unstick();
         }
-        if !plan.decode.is_empty() {
-            self.decode_step(&plan.decode);
+        // In groups no wider than the engine's decode batch: `--max-num-seqs`
+        // may admit more sequences than one pass carries, and a batch wider
+        // than its logits block is refused outright.
+        for group in plan.decode.chunks(DECODE_GROUP_ROWS) {
+            self.decode_step(group);
         }
         if let Some(step) = plan.prefill {
             self.prefill_step(step);
@@ -685,7 +692,84 @@ impl Coordinator {
             self.speculative_step(*only);
             return;
         }
+        // Several sequences, all greedy, on a build with a draft head: one
+        // speculative step for all of them, which a family that can verify
+        // several sequences in one pass does in one pass over its weights.
+        if rows.len() > 1 && rows.iter().all(|at| self.speculative(*at)) {
+            self.speculative_batch_step(rows);
+            return;
+        }
         self.batched_decode_step(rows);
+    }
+
+    /// One speculative step over several sequences.
+    fn speculative_batch_step(&mut self, rows: &[usize]) {
+        let batch: Vec<(usize, DecodeStep)> = rows
+            .iter()
+            .filter_map(|at| {
+                self.slots
+                    .slots()
+                    .get(*at)
+                    .and_then(SeqSlot::decode_step)
+                    .map(|step| (*at, step))
+            })
+            .collect();
+        if batch.is_empty() {
+            return;
+        }
+        let steps: Vec<(SessionId, TokenId)> = batch
+            .iter()
+            .map(|(_, step)| (step.session, step.token))
+            .collect();
+        let started = Instant::now();
+        let results = {
+            let Some(spec) = self.model.as_model_mut().spec_mut() else {
+                return;
+            };
+            match spec.speculate_batch(&steps) {
+                Ok(results) => results,
+                Err(error) => {
+                    tracing::error!(%error, rows = batch.len(), "a batched speculative decode step failed");
+                    for (at, _) in &batch {
+                        self.fail_slot(*at, &error, "a batched speculative decode step failed");
+                    }
+                    return;
+                }
+            }
+        };
+        tracing::debug!(
+            rows = batch.len(),
+            produced = results
+                .iter()
+                .map(|step| step.produced.len())
+                .sum::<usize>(),
+            accepted = results.iter().map(|step| step.accepted).sum::<u32>(),
+            ms = started.elapsed().as_secs_f64() * 1e3,
+            "a batched speculative step"
+        );
+        let now = self.cfg.clock.now();
+        for ((at, _), step) in batch.iter().zip(results) {
+            self.stats.speculated(step.accepted, step.drafted);
+            self.stats.decoded(step.produced.len());
+            let Self {
+                slots,
+                vocabulary,
+                stats,
+                stop,
+                ..
+            } = self;
+            let Some(slot) = slots.get_mut(*at) else {
+                continue;
+            };
+            let mut events = Vec::new();
+            for token in step.produced {
+                if slot.is_done() {
+                    break;
+                }
+                events.extend(slot.accept(token, vocabulary.as_deref(), *stop, now));
+            }
+            send_all(stats, slot, events);
+        }
     }
 
     /// Whether this row's next step can be speculative.

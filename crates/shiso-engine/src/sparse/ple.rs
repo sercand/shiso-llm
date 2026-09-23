@@ -628,7 +628,40 @@ pub fn block(
         Operand::Scratch(Buf::PleConv),
         n_tok,
     ));
-    if ctx.origin == RowOrigin::Unrelated {
+    if let RowOrigin::Segmented(runs) = ctx.origin {
+        // One scalar walk per run, over that run's rows and from its own
+        // session's window, recording that session's rollback windows.
+        let width = u64::from(shape.stream_dim()) * 4;
+        for run in 0..runs.count() {
+            let first = u64::from(runs.start(run)) * width;
+            let ckpt = if spec.is_speculative() {
+                (
+                    Operand::NgramWindowCkptOf(run),
+                    Operand::U32(spec.rollback_slots()),
+                )
+            } else {
+                (Operand::Null, Operand::U32(0))
+            };
+            plan.launch(
+                Entry::plain(MOD_PLE, "q4e_ple_conv_kernel"),
+                kernels::ple_conv(shape.stream_dim()),
+                // `out, state, x, w, channels, kernel, dilation, n_tok, ckpt,
+                //  ckpt_cap`
+                Args::of(&[
+                    Operand::ScratchFrom(Buf::PleConv, first),
+                    Operand::NgramWindowOf(run),
+                    Operand::ScratchFrom(Buf::PleConv, first),
+                    Operand::Weight(at(Role::NgramConv1d)),
+                    Operand::U32(shape.stream_dim()),
+                    Operand::U32(ple.conv),
+                    Operand::U32(ple.ngram),
+                    Operand::U32(runs.len(run)),
+                    ckpt.0,
+                    ckpt.1,
+                ]),
+            );
+        }
+    } else if ctx.origin == RowOrigin::Unrelated {
         plan.launch(
             Entry::plain(MOD_PLE, "q4e_ple_conv_batch_kernel"),
             kernels::ple_conv_batch(shape.stream_dim(), n_tok),

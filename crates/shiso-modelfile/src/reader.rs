@@ -402,6 +402,8 @@ impl<'a> TensorView<'a> {
 pub(crate) struct Mapping {
     path: PathBuf,
     map: Mmap,
+    /// Kept open so the page cache can be advised about the mapping's pages.
+    file: File,
 }
 
 impl Mapping {
@@ -433,8 +435,58 @@ impl Mapping {
         Ok(Self {
             path: path.to_path_buf(),
             map,
+            file,
         })
     }
+
+    /// Unmaps `range` from this process and drops its pages from the page
+    /// cache, where the kernel will.
+    ///
+    /// Both halves are needed: the cache keeps a page any process still maps,
+    /// so advising the file alone leaves every page this process faulted in.
+    /// Advice only - the bytes stay readable, and a later read faults them back
+    /// in from the file - so a failure is not reported.
+    #[cfg(target_os = "linux")]
+    fn release(&self, range: Range<usize>) {
+        use std::os::fd::AsRawFd;
+        const PAGE: usize = 4096;
+        let Some(bytes) = self.map.get(range.clone()) else {
+            return;
+        };
+        let start = bytes.as_ptr() as usize;
+        let aligned = start.next_multiple_of(PAGE);
+        let end = (start + bytes.len()) & !(PAGE - 1);
+        if end > aligned {
+            // SAFETY: the range lies inside this read-only shared file mapping,
+            // on whole pages that hold nothing but bytes of `range`.
+            // `MADV_DONTNEED` on such a mapping only drops the page-table
+            // entries: the next access faults the same file bytes back in, so
+            // every slice handed out from the mapping stays valid and unchanged.
+            let _ = unsafe {
+                libc::madvise(
+                    aligned as *mut libc::c_void,
+                    end - aligned,
+                    libc::MADV_DONTNEED,
+                )
+            };
+        }
+        let offset = libc::off_t::try_from(range.start).unwrap_or(libc::off_t::MAX);
+        let len = libc::off_t::try_from(bytes.len()).unwrap_or(0);
+        // SAFETY: advice on a file descriptor this mapping owns; it reads and
+        // writes no memory of this process.
+        let _ = unsafe {
+            libc::posix_fadvise(
+                self.file.as_raw_fd(),
+                offset,
+                len,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+    }
+
+    /// Nothing to release on a target without the advice calls.
+    #[cfg(not(target_os = "linux"))]
+    fn release(&self, _range: Range<usize>) {}
 
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.map
@@ -456,7 +508,7 @@ impl fmt::Debug for Mapping {
         f.debug_struct("Mapping")
             .field("path", &self.path)
             .field("len", &self.map.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -625,6 +677,17 @@ impl GgufFile {
     pub fn mapping(&self) -> Arc<dyn HostBytes> {
         let shared: Arc<Mapping> = Arc::clone(&self.mapping);
         shared
+    }
+
+    /// Hands the pages of `range` back to the kernel once their bytes have been
+    /// copied somewhere else.
+    ///
+    /// A loader whose device copies every weight calls this after each import:
+    /// the file is larger than the host memory left beside the copies, so pages
+    /// kept cached are pages the device's next allocation has to reclaim. The
+    /// bytes stay readable - a later access reads them from the file again.
+    pub fn release_cached(&self, range: Range<usize>) {
+        self.mapping.release(range);
     }
 
     /// Byte range `desc` occupies within [`GgufFile::mapping`].

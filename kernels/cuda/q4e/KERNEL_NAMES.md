@@ -36,6 +36,7 @@ back to the kernel it belongs to.
 | `q4e_hc` | `hc.cu` | 3 | 6 |
 | `q4e_moe` | `moe.cu` | 8 | 4 |
 | `q4e_gdn` | `gdn.cu` | 8 | 0 |
+| `q4e_gdn_tc` | `gdn_tc.cu` | 4 | 0 |
 | `q4e_ple` | `ple.cu` | 5 | 0 |
 | `q4e_matvec` | `matvec.cu` | 6 | 95 |
 | `q4e_qsa` | `qsa.cu` | 7 | 0 |
@@ -43,7 +44,7 @@ back to the kernel it belongs to.
 | `q4e_idx` | `idx.cu` | 8 | 0 |
 | `q4e_misc` | `misc.cu` | 2 | 0 |
 | `q4e_embed` | `embed.cu` | 4 | 0 |
-| **total** | 10 units | **55** | **105** |
+| **total** | 11 units | **59** | **105** |
 
 ## Plain entries, by module
 
@@ -52,6 +53,7 @@ back to the kernel it belongs to.
 - `q4e_hc_init_kernel`
 - `q4e_hc_init_add_kernel`
 - `q4e_scale_silu_kernel`
+- `q4e_hc_collapse_f16_dual_kernel`
 
 ### `q4e_moe`
 
@@ -74,6 +76,15 @@ back to the kernel it belongs to.
 - `q4e_gdn_out_gate_kernel`
 - `q4e_gdn_conv_batch_kernel`
 - `q4e_gdn_recurrent_batch_kernel`
+- `q4e_gdn_conv_seg_kernel`
+- `q4e_gdn_recurrent_seg_kernel`
+
+### `q4e_gdn_tc`
+
+- `q4e_gdn_tc_prep_kernel`
+- `q4e_gdn_tc_scan_kernel`
+- `q4e_gdn_conv_par_kernel`
+- `q4e_gdn_conv_tail_kernel`
 
 ### `q4e_ple`
 
@@ -87,6 +98,7 @@ back to the kernel it belongs to.
 
 - `q4e_matvec_q8_0_narrow_kernel`
 - `q4e_f32_to_f16_kernel`
+- `q4e_f16_to_f32_kernel`
 - `q4e_exl3_slice_tiles_kernel`
 - `q4e_exl3_slice_svh_kernel`
 - `q4e_matvec_f32_kernel`
@@ -316,6 +328,7 @@ not thereby broken at the shipped shape.
 | `q4e_scale_silu_kernel` | `ceil(n / 256)` | `256` | `0` |
 | `q4e_hc_norm_kernel` ⊤ | `n_tok * n_hc` | `256` | `0` |
 | `q4e_hc_collapse_kernel` ⊤ | `n_tok` | `256` | `0` |
+| `q4e_hc_collapse_f16_dual_kernel` | `n_tok` | `256` | `0` |
 | `q4e_hc_combine_norm_kernel` ⊤ | `(n_tok, n_tok >= 256 ? 1 : n_hc, 1)` | `256` | `0` |
 
 `q4e_hc_combine_norm_kernel`'s `y` is the launcher's own switch: one block per
@@ -360,12 +373,31 @@ rounds: one float per expert.
 | `q4e_gdn_out_gate_kernel` | `n_tok * n_head` | `128` | `0` |
 | `q4e_gdn_conv_batch_kernel` | `(ceil(channels / 256), n_row, 1)` | `256` | `0` |
 | `q4e_gdn_recurrent_batch_kernel` | `(n_head_v, n_row, 1)` | `head_dim * Q4E_GDN_SPLIT` | `head_dim * (head_dim + 1) * 4` — **opt-in** |
+| `q4e_gdn_conv_seg_kernel` | `(ceil(channels / 256), n_run, 1)` | `256` | `0` |
+| `q4e_gdn_recurrent_seg_kernel` | `(n_head_v, n_run, 1)` | `head_dim * Q4E_GDN_SPLIT` | `head_dim * (head_dim + 1) * 4` — **opt-in** |
 
-Both recurrent kernels' launchers reject any `head_dim` but 128 - their state
+The two `_seg` kernels are a segmented verify's: one launch for every
+sequence's run, `blockIdx.y` the run, with the run lengths packed one byte per
+run into a by-value `uint64_t`. Their per-run bodies are the scalar kernels'
+own device functions.
+
+The recurrent kernels' launchers reject any `head_dim` but 128 - their state
 tiles are sized for the shipped head - so the shared-memory formula is
 66,048 B in practice, and the `+ 1` is a float of row padding that keeps the
 state's shared reads off a single bank. The chunk kernel evaluates to 99,072 B.
 Both figures match the four sizes this file already recorded.
+
+### `q4e_gdn_tc`
+
+| Kernel | Grid | Block | Dynamic shared memory |
+|---|---|---|---|
+| `q4e_gdn_tc_prep_kernel` | `(n_head_v, ceil(n_tok / 64), 1)` | `512` | `2*C*136*2 + C*68*4 + 3*C*4`, `C = 64` — 53,504 B, **opt-in** |
+| `q4e_gdn_tc_scan_kernel` | `n_head_v` | `512` | `D*136*2 + 2*C*136*2 + 2*C*4`, `D = 128` — 70,144 B, **opt-in** |
+| `q4e_gdn_conv_par_kernel` | `(ceil(channels / 256), ceil(n_tok / 64), 1)` | `256` | `0` |
+| `q4e_gdn_conv_tail_kernel` | `ceil(channels / 256)` | `256` | `0` |
+
+Both are shiso's own (see the unit's header); they replace
+`q4e_gdn_chunk_kernel` on the prefill path and read its inputs unchanged.
 
 The chunk kernel is a prefill-only path: its launcher takes it only when the row
 count clears a threshold and the device can actually grant the shared memory,
@@ -392,6 +424,7 @@ block width.
 |---|---|---|---|
 | `q4e_matvec_q8_0_narrow_kernel` | `out_dim` | `blocks <= 128 ? 128 : 256` | `0` |
 | `q4e_f32_to_f16_kernel` | `ceil(n / 256)` | `256` | `0` |
+| `q4e_f16_to_f32_kernel` | `ceil(n / 256)` | `256` | `0` |
 | `q4e_exl3_slice_tiles_kernel` | `ceil(n_pieces / 256)` | `256` | `0` |
 | `q4e_exl3_slice_svh_kernel` | `ceil(n_sel / 256)` | `256` | `0` |
 | `q4e_matvec_f32_kernel` | `(out_dim, n_split, 1)` | `256` | `0` |
@@ -452,7 +485,7 @@ back to; the three kernels above it in the dense launcher's preference order
 
 | Kernel | Grid | Block | Dynamic shared memory |
 |---|---|---|---|
-| `q4e_qsa_attention_split_kernel` | `(ceil(G * n_tok / Q4E_ATTN_QG), Q4E_ATTN_SPLITS, n_head_kv)`, `G = n_head / n_head_kv` | `256` | `Q4E_ATTN_SPLIT_HD*Q4E_ATTN_KT*2*2 + Q4E_ATTN_QG*Q4E_ATTN_SPLIT_HD*2 + Q4E_ATTN_TILE_WARPS*Q4E_ATTN_KT*4` — **opt-in (unconditional)** |
+| `q4e_qsa_attention_split_kernel` | `(n_tok, Q4E_ATTN_SPLITS, n_head_kv)` - one block per row (D2), `G = n_head / n_head_kv <= Q4E_ATTN_QG` | `256` | `Q4E_ATTN_SPLIT_HD*Q4E_ATTN_KT*2*2 + Q4E_ATTN_QG*Q4E_ATTN_SPLIT_HD*2 + Q4E_ATTN_TILE_WARPS*Q4E_ATTN_KT*4` — **opt-in (unconditional)** |
 | `q4e_qsa_attention_gather_kernel` | `(Q4E_ATTN_GSPLITS, n_head_kv, n_tok)` | `256` | same formula as the split kernel — **opt-in (unconditional)** |
 | `q4e_qsa_attention_tc_kernel` | `(splits, n_head_kv, n_tok)` | `256` | `Q4E_TC_SMEM` — **opt-in** |
 | `q4e_qsa_attention_combine_kernel` | `n_head * n_tok` | `Q4E_ATTN_SPLIT_HD` | `0` |

@@ -57,13 +57,24 @@ use crate::sparse::stack::{Pass, SparseStack};
 use crate::sparse::weights::{LayerDesc, MixDesc, WeightDesc};
 use shiso_core::model::Speculated;
 
-/// Rows the widest draft pass runs.
+/// Rows the widest draft pass of a decode step runs.
 ///
 /// A chain step drafts one row. The pass that catches the head up after a
 /// verify runs the accepted prefix plus the row the target just committed,
-/// which is at most one more than the deepest draft. Nothing asks for more, and
-/// the buffers this module carves are sized by it rather than by a chunk.
+/// which is at most one more than the deepest draft. The pass that fills the
+/// head's cache while a prompt is read is wider - a whole chunk - which is why
+/// the buffers this module carves are sized by the chunk and not by this.
 pub const ROWS: u32 = MAX_DRAFT + 1;
+
+/// Whose rows a draft pass carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DraftRows {
+    /// One session's consecutive positions; the pick is the last row's.
+    Sequential,
+    /// One row per session, each at its own position; every row is picked.
+    /// The bits say which rows' own heads have outgrown the indexer budget.
+    Batch(u8),
+}
 
 /// The widths one draft pass plans from.
 ///
@@ -112,6 +123,7 @@ impl SparseStack {
         n_tok: u32,
         pick: bool,
         device: Device,
+        rows: DraftRows,
     ) -> CoreResult<Plan> {
         let head = self.desc.draft.as_ref().ok_or(CoreError::Unsupported {
             what: "a draft pass on a stack that carries no draft head",
@@ -189,11 +201,16 @@ impl SparseStack {
         // is the one a single-row decode takes: a draft never carries unrelated
         // rows, and its attention runs dense until its own cache holds more
         // complete blocks than the indexer budget.
+        let (origin, batch_selected) = match rows {
+            DraftRows::Sequential => (RowOrigin::Sequential, 0),
+            DraftRows::Batch(bits) => (RowOrigin::Unrelated, bits),
+        };
         let ctx = AttnContext {
-            selected: shape.indexer.sparse_at(frontier),
+            selected: origin == RowOrigin::Sequential && shape.indexer.sparse_at(frontier),
             tensor_core: self.opts.tensor_core,
             tiled: self.opts.tiled_attention,
-            origin: RowOrigin::Sequential,
+            origin,
+            batch_selected,
         };
         let chain = island::draft_chain();
         for half in Island::ORDER {
@@ -204,7 +221,7 @@ impl SparseStack {
                 half,
                 chain,
                 ctx,
-                RowOrigin::Sequential,
+                origin,
                 n_tok,
                 device,
             )?);
@@ -228,12 +245,20 @@ impl SparseStack {
             MixRoles::draft_output(),
             n_tok,
             device,
+            self.stream_elem(n_tok, device),
         )?);
-        // The rows the head collapsed are `n_tok` of them; the pick is the last
-        // one, for the reason a chunk's logits are its last rows.
-        let last = u64::from(n_tok.saturating_sub(1))
-            .saturating_mul(u64::from(shape.hidden))
-            .saturating_mul(crate::sparse::kernels::F32_BYTES);
+        // The rows the head collapsed are `n_tok` of them; one sequence's pick is
+        // the last one, for the reason a chunk's logits are its last rows, and a
+        // batch's is every row.
+        let (last, picked) = match rows {
+            DraftRows::Sequential => (
+                u64::from(n_tok.saturating_sub(1))
+                    .saturating_mul(u64::from(shape.hidden))
+                    .saturating_mul(crate::sparse::kernels::F32_BYTES),
+                1,
+            ),
+            DraftRows::Batch(_) => (0, n_tok),
+        };
         // Through the narrowed head when there is one. A row it cannot reach is
         // a guess the target rejects, which costs a verify row that was paid
         // for either way - so this is a speed-for-acceptance trade and not a
@@ -250,7 +275,7 @@ impl SparseStack {
                 Operand::ScratchFrom(Buf::Mixed, last),
                 Operand::Scratch(Buf::Logits),
             ),
-            1,
+            picked,
             device,
         )?;
         // A draft is greedy and the caller wants the token, not the row: four
@@ -260,13 +285,13 @@ impl SparseStack {
                 crate::sparse::kernels::MOD_MISC,
                 "q4e_argmax_rows_kernel",
             ),
-            crate::sparse::kernels::argmax_rows(1),
+            crate::sparse::kernels::argmax_rows(picked),
             // `out, logits, n_vocab, n_rows`
             crate::sparse::bind::Args::of(&[
                 Operand::Scratch(Buf::Argmax),
                 Operand::Scratch(Buf::Logits),
                 Operand::U32(head.vocabulary.map_or(shape.vocab, |narrow| narrow.out_dim)),
-                Operand::U32(1),
+                Operand::U32(picked),
             ]),
         );
         // The head's cooperative launches read the same per-stream scratch the
@@ -294,7 +319,7 @@ impl SparseStack {
     /// # Errors
     ///
     /// [`shiso_core::error::CoreError::ShapeMismatch`] for an empty pass or one
-    /// wider than [`ROWS`], [`shiso_core::error::CoreError::UnknownSession`],
+    /// wider than a prefill chunk, [`shiso_core::error::CoreError::UnknownSession`],
     /// [`shiso_core::error::CoreError::ContextOverflow`] when a drafted
     /// position reaches past the context, and whatever the planner, the device
     /// and the transfers report.
@@ -333,7 +358,14 @@ impl SparseStack {
         }
         self.write_draft_inputs(session, tokens, positions)?;
 
-        let plan = self.plan_draft(hidden, reach, n_tok, pick, self.device())?;
+        let plan = self.plan_draft(
+            hidden,
+            reach,
+            n_tok,
+            pick,
+            self.device(),
+            DraftRows::Sequential,
+        )?;
         let pass = Pass {
             // The draft head runs over rows the target already read, so it
             // splices nothing: the embeddings it starts from are the target's
@@ -358,6 +390,124 @@ impl SparseStack {
 }
 
 impl SparseStack {
+    /// One draft pass over one row per session: `tokens[i]` at `positions[i]`
+    /// of session `i`, the head reading `hidden`'s row `i`, and the head's pick
+    /// for every row back.
+    ///
+    /// The batch form of [`SparseStack::draft`] with `pick` set: each row is
+    /// the arithmetic a one-row draft of its session would do, over its own
+    /// cache, so the guesses are the ones each session would have drafted
+    /// alone - in one pass over the head's weights instead of one per session.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::draft`], for any row.
+    pub(crate) fn draft_batch(
+        &mut self,
+        sessions: &[SessionId],
+        tokens: &[TokenId],
+        positions: &[u32],
+        hidden: Operand,
+    ) -> CoreResult<Vec<TokenId>> {
+        let n = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
+        if n == 0 || n > crate::sparse::stack::MAX_DECODE_BATCH || tokens.len() != sessions.len() {
+            return Err(CoreError::ShapeMismatch {
+                field: "batched draft rows",
+                expected: u64::from(crate::sparse::stack::MAX_DECODE_BATCH),
+                got: u64::from(n),
+            });
+        }
+        let mut republished = false;
+        let mut bits = 0u8;
+        let mut reach = 0u32;
+        for (row, (session, at)) in sessions.iter().zip(positions).enumerate() {
+            let past = at.saturating_add(1);
+            republished |= self.reserve_to(*session, past)?;
+            if self.shape.indexer.sparse_at(past) {
+                bits |= 1u8 << (row % 8);
+            }
+            reach = reach.max(past);
+        }
+        if republished && let Some(graphs) = self.backend.as_graph() {
+            graphs.invalidate_all();
+        }
+        let rows = tokens
+            .iter()
+            .zip(positions)
+            .map(|(token, at)| crate::sparse::inputs::DecodeRow {
+                token: *token,
+                position: *at,
+            })
+            .collect::<Vec<_>>();
+        self.write_placed_inputs(&rows)?;
+        let plan = self.plan_draft(
+            hidden,
+            reach,
+            n,
+            true,
+            self.device(),
+            DraftRows::Batch(bits),
+        )?;
+        let pass = Pass {
+            media_rows: None,
+            plan,
+            islands: Vec::new(),
+            capturable: false,
+            selected: false,
+            rows: n,
+            origin: RowOrigin::Unrelated,
+            gather: Vec::new(),
+        };
+        self.pack_row_pointers(sessions)?;
+        self.execute_rows(sessions, &pass)?;
+        self.read_draft_picks(n)
+    }
+
+    /// The head's chains for several sessions at once, one batched draft pass
+    /// a step: the first step opens from each session's staged row, gathered
+    /// side by side, and every step after it from the head's own rows.
+    fn chain_batch(
+        &mut self,
+        sessions: &[SessionId],
+        firsts: &[TokenId],
+        frontiers: &[u32],
+        budget: u32,
+    ) -> CoreResult<Vec<Vec<TokenId>>> {
+        let width = u64::from(self.shape.stream_dim()) * crate::sparse::kernels::F32_BYTES;
+        for (row, session) in sessions.iter().enumerate() {
+            let stage = self
+                .scratch_view(Buf::DraftStage)?
+                .slice(row as u64 * width, width)?;
+            let pending =
+                self.session(*session)?
+                    .pending_draft()
+                    .ok_or(CoreError::Unsupported {
+                        what: "a batched draft for a session that has staged no row",
+                        backend: "engine",
+                    })?;
+            self.backend.copy_d2d(stage, pending)?;
+        }
+        let mut drafts = vec![Vec::with_capacity(budget as usize); sessions.len()];
+        let mut tokens = firsts.to_vec();
+        let mut positions = frontiers
+            .iter()
+            .map(|at| at.saturating_sub(1))
+            .collect::<Vec<_>>();
+        let mut hidden = Operand::Scratch(Buf::DraftStage);
+        for _ in 0..budget {
+            let picks = self.draft_batch(sessions, &tokens, &positions, hidden)?;
+            for ((draft, token), pick) in drafts.iter_mut().zip(tokens.iter_mut()).zip(picks) {
+                draft.push(pick);
+                *token = pick;
+            }
+            for at in &mut positions {
+                *at = at.saturating_add(1);
+            }
+            hidden = Operand::Scratch(Buf::Residual);
+        }
+        Ok(drafts)
+    }
+
     /// Claims page-table entries up to `positions`, and says whether the table
     /// moved.
     ///
@@ -411,10 +561,33 @@ impl SparseStack {
 
     /// Reads back the one token the head picked.
     fn read_draft_pick(&self) -> CoreResult<TokenId> {
-        let view = self.scratch_view(Buf::Argmax)?.slice(0, 4)?;
-        let mut bytes = [0u8; 4];
+        self.read_draft_picks(1)?
+            .first()
+            .copied()
+            .ok_or(CoreError::ShapeMismatch {
+                field: "draft picks",
+                expected: 1,
+                got: 0,
+            })
+    }
+
+    /// Reads back the tokens the head picked for the first `rows` rows.
+    fn read_draft_picks(&self, rows: u32) -> CoreResult<Vec<TokenId>> {
+        let view = self
+            .scratch_view(Buf::Argmax)?
+            .slice(0, u64::from(rows) * 4)?;
+        let mut bytes = vec![0u8; usize::try_from(rows).unwrap_or(0) * 4];
         self.backend.copy_d2h(view, &mut bytes)?;
-        let pick = i32::from_le_bytes(bytes);
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| self.draft_token(i32::from_le_bytes(*word)))
+            .collect()
+    }
+
+    /// The token one row of the draft head's argmax names.
+    fn draft_token(&self, pick: i32) -> CoreResult<TokenId> {
         // Through the narrowed head's id table when there is one: the argmax
         // that comes back is a row of the *slice*, and returning it unmapped
         // would propose whatever token sits at that index of the whole
@@ -496,7 +669,12 @@ impl SparseStack {
         }
         self.advance(session, &outcome.committed, false, Some(outcome.logits_row))?;
         self.stage_draft_row(session, outcome.logits_row)?;
-        self.reflush(session, frontier, &outcome.committed)?;
+        self.reflush(
+            session,
+            frontier,
+            &outcome.committed,
+            Operand::Scratch(Buf::Residual),
+        )?;
         // What the caller has not seen: the guesses that were kept, and then the
         // target's own pick at the row the step settled on. `first` is left out
         // because it was already the caller's - handing it back would emit it
@@ -537,6 +715,7 @@ impl SparseStack {
         session: SessionId,
         frontier: u32,
         committed: &[TokenId],
+        hidden: Operand,
     ) -> CoreResult<()> {
         // Row `i` of the verify pass is position `frontier + i`, and the head
         // at that position reads the token after it - which is `committed[i +
@@ -552,14 +731,149 @@ impl SparseStack {
         let positions: Vec<u32> = (0..tokens.len())
             .map(|i| frontier.saturating_add(u32::try_from(i).unwrap_or(0)))
             .collect();
-        self.draft(
-            session,
-            tokens,
-            &positions,
-            Operand::Scratch(Buf::Residual),
-            false,
-        )?;
+        self.draft(session, tokens, &positions, hidden, false)?;
         Ok(())
+    }
+
+    /// One speculative step for several sequences at once: each drafts its own
+    /// guesses, and one segmented pass verifies every sequence's committed
+    /// token and guesses together, reading the weights once for all of them.
+    ///
+    /// `steps[i]` is session `i`'s committed token, as [`SparseStack::speculate`]
+    /// takes it, and what comes back is what `speculate` would have returned
+    /// for each, in the same order. Each run of the verify is the arithmetic
+    /// that session's own verify pass would do - its state, its cache, its
+    /// selection - so a sequence decodes to the same text whether it is
+    /// verified alone or beside others.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::speculate`], for any of the sessions, and
+    /// [`CoreError::InvalidValue`] when one session appears twice.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the step's phases run in one order over one set of borrowed \
+                  plans and picks, and reading them as one sequence is what \
+                  shows that every session settles before any reflushes"
+    )]
+    pub fn speculate_batch(
+        &mut self,
+        steps: &[(SessionId, TokenId)],
+        eos: TokenId,
+    ) -> CoreResult<Vec<Speculated>> {
+        let started = std::time::Instant::now();
+        let mut plans = Vec::with_capacity(steps.len());
+        for &(session, first) in steps {
+            let live = self.session(session)?;
+            let (depth, frontier) = (live.spec_depth(), live.written());
+            let budget = mtp::draft_budget(depth, frontier, self.opts.engine.ctx, MAX_DRAFT + 1);
+            plans.push((session, first, frontier, budget));
+        }
+        // One batched draft pass a step when every session drafts as deep - the
+        // usual case, since the depth is the server's and only the end of a
+        // context shortens it - and each session's own chain otherwise.
+        let uniform = plans.windows(2).all(|pair| pair[0].3 == pair[1].3);
+        let chains = if uniform && plans.len() > 1 {
+            let sessions = plans.iter().map(|plan| plan.0).collect::<Vec<_>>();
+            let firsts = plans.iter().map(|plan| plan.1).collect::<Vec<_>>();
+            let frontiers = plans.iter().map(|plan| plan.2).collect::<Vec<_>>();
+            self.chain_batch(&sessions, &firsts, &frontiers, plans[0].3)?
+        } else {
+            let mut chains = Vec::with_capacity(plans.len());
+            for &(session, first, frontier, budget) in &plans {
+                chains.push(self.chain(session, first, frontier, budget)?);
+            }
+            chains
+        };
+        let mut runs: Vec<(SessionId, u32, Vec<TokenId>)> = Vec::with_capacity(steps.len());
+        for (&(session, first, frontier, _), drafts) in plans.iter().zip(chains) {
+            let mut rows = Vec::with_capacity(drafts.len().saturating_add(1));
+            rows.push(first);
+            rows.extend_from_slice(&drafts);
+            runs.push((session, frontier, rows));
+        }
+        let borrowed = runs
+            .iter()
+            .map(|(session, _, rows)| (*session, rows.as_slice()))
+            .collect::<Vec<_>>();
+        let drafted_at = started.elapsed();
+        self.run_segments(&borrowed)?;
+        let total = runs.iter().map(|(_, _, rows)| rows.len()).sum::<usize>();
+        let picks = self.read_picks(u32::try_from(total).unwrap_or(u32::MAX))?;
+        let verified_at = started.elapsed();
+        // Every catch-up pass below overwrites the residual, and each reads its
+        // own session's verify rows: they are held first.
+        let width = u64::from(self.shape.stream_dim()) * crate::sparse::kernels::F32_BYTES;
+        {
+            let hold = self
+                .scratch_view(Buf::ResidualHold)?
+                .slice(0, total as u64 * width)?;
+            let residual = self
+                .scratch_view(Buf::Residual)?
+                .slice(0, total as u64 * width)?;
+            self.backend.copy_d2d(hold, residual)?;
+        }
+
+        let mut settled = Vec::with_capacity(runs.len());
+        let mut start = 0usize;
+        for (session, frontier, rows) in &runs {
+            let drafts = rows.get(1..).unwrap_or(&[]);
+            let first = rows.first().copied().ok_or(CoreError::ShapeMismatch {
+                field: "verify run rows",
+                expected: 1,
+                got: 0,
+            })?;
+            let own = picks.get(start..start + rows.len()).unwrap_or(&[]);
+            let outcome = StepOutcome::settle(
+                first,
+                drafts,
+                own.get(..drafts.len()).unwrap_or(&[]),
+                eos,
+                (!drafts.is_empty()).then_some(DraftSource::Head),
+            )?;
+            if let Some(rewind) = outcome.rollback {
+                self.spec_rollback(*session, rewind)?;
+            }
+            let row = u32::try_from(start).unwrap_or(u32::MAX) + outcome.logits_row;
+            self.advance(*session, &outcome.committed, false, Some(row))?;
+            self.stage_draft_row(*session, row)?;
+            settled.push((
+                *session,
+                *frontier,
+                start,
+                outcome,
+                own.to_vec(),
+                drafts.len(),
+            ));
+            start += rows.len();
+        }
+
+        let mut out = Vec::with_capacity(settled.len());
+        for (session, frontier, start, outcome, own, drafted) in settled {
+            let hidden = Operand::ScratchFrom(Buf::ResidualHold, start as u64 * width);
+            self.reflush(session, frontier, &outcome.committed, hidden)?;
+            let accepted = usize::try_from(outcome.logits_row).unwrap_or(0);
+            let mut produced = outcome.committed.get(1..).unwrap_or(&[]).to_vec();
+            produced.push(*own.get(accepted).ok_or(CoreError::ShapeMismatch {
+                field: "verify rows",
+                expected: u64::from(outcome.logits_row).saturating_add(1),
+                got: own.len() as u64,
+            })?);
+            out.push(Speculated {
+                produced,
+                accepted: outcome.logits_row,
+                drafted: u32::try_from(drafted).unwrap_or(u32::MAX),
+            });
+        }
+        tracing::debug!(
+            sessions = steps.len(),
+            rows = total,
+            draft_ms = drafted_at.as_secs_f64() * 1e3,
+            verify_ms = verified_at.saturating_sub(drafted_at).as_secs_f64() * 1e3,
+            settle_ms = started.elapsed().saturating_sub(verified_at).as_secs_f64() * 1e3,
+            "a batched speculative step's phases"
+        );
+        Ok(out)
     }
 
     /// Whether a draft head is resident, which is what makes a step speculative.

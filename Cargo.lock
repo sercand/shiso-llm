@@ -1573,6 +1573,7 @@ dependencies = [
  "cudarc",
  "half",
  "image",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",
@@ -1669,6 +1670,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "half",
+ "libc",
  "memmap2",
  "serde",
  "serde_json",

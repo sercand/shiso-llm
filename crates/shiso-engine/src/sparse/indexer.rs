@@ -125,6 +125,33 @@ pub fn store(
     // The raw store has a batched sibling: it is a plain move, one block per
     // row, and the only thing a row needs of its own is the page table it
     // translates its position through.
+    if let RowOrigin::Segmented(runs) = origin {
+        // One scalar store per run, over its rows and through its own table,
+        // then its own pooled pass: a run is its own sequence's chunk.
+        for run in 0..runs.count() {
+            let first = u64::from(runs.start(run));
+            plan.launch(
+                Entry::plain(MOD_IDX, "q4e_idx_store_k_kernel"),
+                kernels::idx_store_k(runs.len(run)),
+                // `cache, k, pos, pages, n_tok`
+                Args::of(&[
+                    Operand::CachePlane {
+                        rank,
+                        plane: Plane::IndexerKey,
+                    },
+                    Operand::ScratchFrom(
+                        Buf::IdxKey,
+                        first * u64::from(shape.indexer.head_dim) * 4,
+                    ),
+                    Operand::ScratchFrom(Buf::Positions, first * I32_BYTES),
+                    Operand::PagesOf(run),
+                    Operand::U32(runs.len(run)),
+                ]),
+            );
+        }
+        plan.append(pool(shape, layer, rank, origin, n_tok));
+        return Ok(plan);
+    }
     let (store_entry, store_launch, store_pages) = if batched {
         (
             "q4e_idx_store_k_batch_kernel",
@@ -173,12 +200,31 @@ pub fn store(
 fn pool(shape: &SparseShape, layer: LayerRef, rank: u32, origin: RowOrigin, n_tok: u32) -> Plan {
     let mut plan = Plan::new();
     let batched = origin == RowOrigin::Unrelated;
-    let rows = if batched { n_tok } else { 1 };
+    let segments = match origin {
+        RowOrigin::Segmented(runs) => Some(runs),
+        RowOrigin::Sequential | RowOrigin::Unrelated => None,
+    };
+    let rows = match segments {
+        Some(runs) => runs.count(),
+        None if batched => n_tok,
+        None => 1,
+    };
     for row in 0..rows {
         // A chunk's launch covers every row and reads the table whole, from the
         // prefix the writer put in front of the chunk's first position. A
-        // batched row's covers one position and reads its own group.
-        let (pos, pages, table, covered) = if batched {
+        // batched row's covers one position and reads its own group, and a
+        // segmented run's covers its own rows from its own group.
+        let (pos, pages, table, covered) = if let Some(runs) = segments {
+            (
+                Operand::ScratchFrom(Buf::Positions, u64::from(runs.start(row)) * I32_BYTES),
+                Operand::PagesOf(row),
+                Operand::ScratchFrom(
+                    Buf::Mrope,
+                    crate::sparse::inputs::segment_lookback_offset(&runs, row),
+                ),
+                runs.len(row),
+            )
+        } else if batched {
             (
                 Operand::ScratchFrom(Buf::Positions, u64::from(row) * I32_BYTES),
                 Operand::PagesOf(row),
@@ -238,12 +284,6 @@ fn pool(shape: &SparseShape, layer: LayerRef, rank: u32, origin: RowOrigin, n_to
 /// # Errors
 ///
 /// Whatever [`matmul::project`] reports for the query projection.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one statement per kernel argument is the point: these bodies are \
-              transcriptions of parameter lists, and a split that broke a list \
-              across two functions would hide the order being transcribed"
-)]
 pub fn select(
     shape: &SparseShape,
     desc: &IndexerDesc,
@@ -252,7 +292,64 @@ pub fn select(
     n_tok: u32,
     device: Device,
 ) -> CoreResult<Plan> {
-    let IndexerSlot { layer, rank, ctx } = slot;
+    let mut plan = select_queries(shape, desc, slot, n_tok, device)?;
+    plan.append(select_rows(
+        shape,
+        slot,
+        scorer,
+        RowSpan {
+            base: 0,
+            n: n_tok,
+            pages: Operand::Pages,
+        },
+    ));
+    Ok(plan)
+}
+
+/// The rows a selection covers: `n` rows of the pass from row `base`, all of
+/// them one sequence's, read through `pages`.
+///
+/// A chunk's selection is its rows from the first, through the pass's one
+/// table. A batch's is one row at a time, through that row's own: its rows
+/// are unrelated sequences, and a selection bounds its scores by the position
+/// of the last row it covers.
+#[derive(Debug, Clone, Copy)]
+pub struct RowSpan {
+    /// The first row.
+    pub base: u32,
+    /// Rows covered.
+    pub n: u32,
+    /// The page table they read.
+    pub pages: Operand,
+}
+
+impl RowSpan {
+    /// Row `row` of a batch, alone, through its own page table.
+    #[must_use]
+    pub const fn one(row: u32) -> Self {
+        Self {
+            base: row,
+            n: 1,
+            pages: Operand::PagesOf(row),
+        }
+    }
+}
+
+/// The query half of the selection: every row's indexer query, projected,
+/// normed and rotated. Per-row arithmetic, so a batch runs it once over all
+/// its rows.
+///
+/// # Errors
+///
+/// Whatever [`matmul::project`] reports for the query projection.
+pub fn select_queries(
+    shape: &SparseShape,
+    desc: &IndexerDesc,
+    slot: IndexerSlot,
+    n_tok: u32,
+    device: Device,
+) -> CoreResult<Plan> {
+    let IndexerSlot { layer, .. } = slot;
     let mut plan = Plan::new();
     matmul::project(
         &mut plan,
@@ -283,6 +380,21 @@ pub fn select(
             Operand::f32(shape.rms_eps),
         ]),
     );
+    Ok(plan)
+}
+
+/// The scoring half of the selection over the rows `span` names: score the
+/// pooled blocks, keep the best, expand them into positions, each row's lists
+/// landing at that row of the pass.
+#[must_use]
+pub fn select_rows(shape: &SparseShape, slot: IndexerSlot, scorer: Scorer, span: RowSpan) -> Plan {
+    let IndexerSlot { rank, ctx, .. } = slot;
+    let RowSpan {
+        base,
+        n: n_tok,
+        pages,
+    } = span;
+    let mut plan = Plan::new();
     // Two different block counts, and swapping them is silent: `ranked` is how
     // many blocks the scorer ranks, and how wide one row of the score buffer
     // is; `keep` is how many of them survive the top-k. Below the budget every
@@ -297,12 +409,24 @@ pub fn select(
         // Every pass reads its own query rows and its own positions; the score
         // bound is the position of the pass's last row, which is one slot of
         // the position row rather than a buffer of its own.
+        let first = base + done;
         let qn = Operand::ScratchFrom(
             Buf::IdxQueryNorm,
-            u64::from(done) * u64::from(shape.indexer.heads) * u64::from(kernels::IDX_DIM) * 2,
+            u64::from(first) * u64::from(shape.indexer.heads) * u64::from(kernels::IDX_DIM) * 2,
         );
-        let pos = Operand::ScratchFrom(Buf::Positions, u64::from(done) * 4);
-        let last = Operand::ScratchFrom(Buf::Positions, u64::from(done + rows - 1) * 4);
+        let pos = Operand::ScratchFrom(Buf::Positions, u64::from(first) * 4);
+        let last = Operand::ScratchFrom(Buf::Positions, u64::from(first + rows - 1) * 4);
+        // The selection each pass produces is its own rows' and is read by the
+        // attention after every pass has run, so it lands at the pass's own row
+        // offset. The scores are consumed by the very next launch and can share
+        // one slab. Written at offset zero, every pass after the first
+        // overwrote rows 0..512 and the rest of a 2048-row chunk attended over
+        // whatever token lists an earlier request had left there.
+        let row = |width: u64| u64::from(first) * width * 4;
+        let selected = Operand::ScratchFrom(Buf::IdxSelected, row(u64::from(keep)));
+        let count = Operand::ScratchFrom(Buf::IdxCount, row(1));
+        let tokens = Operand::ScratchFrom(Buf::IdxTokens, row(u64::from(kernels::IDX_WIDTH)));
+        let token_count = Operand::ScratchFrom(Buf::IdxTokenCount, row(1));
         match scorer {
             // `score, qn, pooled, pos, pages, n_head, n_tok, n_blocks_stride, pos_last`
             Scorer::Scalar => plan.launch(
@@ -316,7 +440,7 @@ pub fn select(
                         plane: Plane::IndexerPooled,
                     },
                     pos,
-                    Operand::Pages,
+                    pages,
                     Operand::U32(shape.indexer.heads),
                     Operand::U32(rows),
                     Operand::U32(ranked),
@@ -336,7 +460,7 @@ pub fn select(
                         plane: Plane::IndexerPooled,
                     },
                     pos,
-                    Operand::Pages,
+                    pages,
                     Operand::U32(rows),
                     Operand::U32(ranked),
                     last,
@@ -348,8 +472,8 @@ pub fn select(
             kernels::idx_topk(rows),
             // `sel, cnt, score, n_blocks_stride, pos_last, k`
             Args::of(&[
-                Operand::Scratch(Buf::IdxSelected),
-                Operand::Scratch(Buf::IdxCount),
+                selected,
+                count,
                 Operand::Scratch(Buf::IdxScore),
                 Operand::U32(ranked),
                 last,
@@ -361,10 +485,10 @@ pub fn select(
             kernels::idx_expand(rows),
             // `tokens, n_sel, sel, cnt, pos, k, width`
             Args::of(&[
-                Operand::Scratch(Buf::IdxTokens),
-                Operand::Scratch(Buf::IdxTokenCount),
-                Operand::Scratch(Buf::IdxSelected),
-                Operand::Scratch(Buf::IdxCount),
+                tokens,
+                token_count,
+                selected,
+                count,
                 pos,
                 Operand::U32(keep),
                 Operand::U32(kernels::IDX_WIDTH),
@@ -372,7 +496,7 @@ pub fn select(
         );
         done = done.saturating_add(rows);
     }
-    Ok(plan)
+    plan
 }
 
 #[cfg(test)]

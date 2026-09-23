@@ -29,7 +29,7 @@ use crate::sparse::indexer::{self, Scorer};
 use crate::sparse::inputs::MROPE_PREFIX_BYTES;
 use crate::sparse::kernels::{self, Entry, MOD_QSA, MOD_QSA_SPARSE};
 use crate::sparse::matmul::{self, Bound, Device};
-use crate::sparse::moe::RowOrigin;
+use crate::sparse::moe::{RowOrigin, Segments};
 use crate::sparse::paged::Plane;
 use crate::sparse::plan::Plan;
 use crate::sparse::scratch::Buf;
@@ -121,6 +121,15 @@ pub struct AttnContext {
     /// answer for every layer, and it decides which of two kernels the store
     /// and the attention are.
     pub origin: RowOrigin,
+    /// For a batch of unrelated rows, which rows' own contexts have outgrown
+    /// the indexer budget: bit `r` is row `r`.
+    ///
+    /// A batch's rows are separate sequences, so whether a row attends to a
+    /// selection is that row's question, answered from its own frontier - and a
+    /// row that is past the budget must read the same selection a single-row
+    /// step of that sequence would, or batching it would change its text.
+    /// Ignored for one sequence's rows, whose answer is `selected`.
+    pub batch_selected: u8,
 }
 
 /// Query heads that share one key head.
@@ -197,13 +206,19 @@ pub fn path(shape: &SparseShape, ctx: AttnContext, n_tok: u32) -> AttnPath {
 /// Split out because the choice between the six is the part a test asks about
 /// and the projections around it are the same either way.
 #[must_use]
+pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32) -> Plan {
+    attend_at(shape, slot, ctx, n_tok, RowAt::WHOLE)
+}
+
+/// [`attend`] over the rows `at` names.
 #[expect(
     clippy::too_many_lines,
     reason = "one statement per kernel argument is the point: these bodies are \
               transcriptions of parameter lists, and a split that broke a list \
               across two functions would hide the order being transcribed"
 )]
-pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32) -> Plan {
+fn attend_at(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32, at: RowAt) -> Plan {
+    let q_width = u64::from(shape.gqa.q_heads) * u64::from(shape.gqa.head_dim);
     let mut plan = Plan::new();
     let keys = Operand::CachePlane {
         rank: slot.rank,
@@ -213,10 +228,13 @@ pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32)
         rank: slot.rank,
         plane: Plane::Value,
     };
-    let out = Operand::Scratch(Buf::AttnOut);
+    let out = at.of(Buf::AttnOut, q_width);
     let part = Operand::Scratch(Buf::AttnPartial);
-    let query = Operand::Scratch(Buf::AttnQuery);
-    let positions = Operand::Scratch(Buf::Positions);
+    let query = at.of(Buf::AttnQuery, q_width);
+    let positions = at.of(Buf::Positions, 1);
+    let pages = at.pages;
+    let tokens = at.of(Buf::IdxTokens, u64::from(kernels::IDX_WIDTH));
+    let token_count = at.of(Buf::IdxTokenCount, 1);
     // `out, part, n_splits`
     let fold = |plan: &mut Plan, splits: u32| {
         plan.launch(
@@ -235,7 +253,7 @@ pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32)
         Operand::U32(shape.gqa.q_heads),
         Operand::U32(shape.gqa.kv_heads),
         positions,
-        Operand::Pages,
+        pages,
         Operand::U32(n_tok),
     ]);
     match path(shape, ctx, n_tok) {
@@ -274,12 +292,12 @@ pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32)
         AttnPath::TensorCore => plan.launch(
             Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_tc_kernel"),
             kernels::qsa_attention_tc(shape.gqa.kv_heads, n_tok, 1),
-            tc_args(shape, slot, 1, false),
+            tc_args(shape, slot, 1, false, at),
         ),
         AttnPath::Split => {
             plan.launch(
                 Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_split_kernel"),
-                kernels::qsa_attention_split(shape.gqa.q_heads, shape.gqa.kv_heads, n_tok),
+                kernels::qsa_attention_split(shape.gqa.kv_heads, n_tok),
                 // `out, part, k_cache, v_cache, q, n_head, n_head_kv, pos,
                 //  pages, n_tok, n_splits`
                 Args::of(&[
@@ -291,7 +309,7 @@ pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32)
                     Operand::U32(shape.gqa.q_heads),
                     Operand::U32(shape.gqa.kv_heads),
                     positions,
-                    Operand::Pages,
+                    pages,
                     Operand::U32(n_tok),
                     Operand::U32(kernels::ATTN_SPLITS),
                 ]),
@@ -310,9 +328,9 @@ pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32)
                     keys,
                     values,
                     query,
-                    Operand::Scratch(Buf::IdxTokens),
-                    Operand::Scratch(Buf::IdxTokenCount),
-                    Operand::Pages,
+                    tokens,
+                    token_count,
+                    pages,
                     Operand::U32(kernels::IDX_WIDTH),
                     Operand::U32(shape.gqa.q_heads),
                     Operand::U32(shape.gqa.kv_heads),
@@ -326,7 +344,7 @@ pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32)
             plan.launch(
                 Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_tc_kernel"),
                 kernels::qsa_attention_tc(shape.gqa.kv_heads, n_tok, splits),
-                tc_args(shape, slot, splits, true),
+                tc_args(shape, slot, splits, true, at),
             );
             // A single slice wrote the destination itself; folding anyway would
             // double every value.
@@ -336,6 +354,188 @@ pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32)
         }
     }
     plan
+}
+
+/// The rest of an attention block for a segmented pass, from the key and value
+/// store on: every launch that addresses a sequence's cache runs once per run,
+/// as the launch that sequence's own verify pass would make over those rows.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one statement per kernel argument is the point: these bodies are \
+              transcriptions of parameter lists, and a split that broke a list \
+              across two functions would hide the order being transcribed"
+)]
+fn segmented(
+    shape: &SparseShape,
+    desc: &AttnDesc,
+    slot: AttnSlot,
+    ctx: AttnContext,
+    runs: Segments,
+    device: Device,
+    mut plan: Plan,
+) -> CoreResult<Plan> {
+    let at = |role: Role| WeightRef::layer(slot.layer, role);
+    let n_tok = runs.rows();
+    let kv_width = u64::from(shape.kv_dim()) * 4;
+    for run in 0..runs.count() {
+        let first = u64::from(runs.start(run));
+        let rows = runs.len(run);
+        plan.launch(
+            Entry::plain(MOD_QSA, "q4e_qsa_store_kv_kernel"),
+            kernels::qsa_store_kv(shape.gqa.kv_heads, rows, shape.gqa.head_dim),
+            // `k_cache, v_cache, k, v, kw, head_dim, n_head_kv, n_rot,
+            //  rope_base, pos, mrope, sec_t, sec_h, sec_w, pages, pool_slots,
+            //  eps`
+            Args::of(&[
+                Operand::CachePlane {
+                    rank: slot.rank,
+                    plane: Plane::Key,
+                },
+                Operand::CachePlane {
+                    rank: slot.rank,
+                    plane: Plane::Value,
+                },
+                Operand::ScratchFrom(Buf::AttnKey, first * kv_width),
+                Operand::ScratchFrom(Buf::AttnValue, first * kv_width),
+                Operand::Weight(at(Role::AttnKeyNorm)),
+                Operand::U32(shape.gqa.head_dim),
+                Operand::U32(shape.gqa.kv_heads),
+                Operand::U32(shape.gqa.n_rot),
+                Operand::f32(shape.rope_theta),
+                Operand::ScratchFrom(Buf::Positions, first * 4),
+                Operand::ScratchFrom(
+                    Buf::Mrope,
+                    MROPE_PREFIX_BYTES + first * crate::sparse::inputs::MROPE_ROW_BYTES,
+                ),
+                Operand::U32(shape.mrope.time),
+                Operand::U32(shape.mrope.height),
+                Operand::U32(shape.mrope.width),
+                Operand::PagesOf(run),
+                Operand::U32(slot.pool_slots),
+                Operand::f32(shape.rms_eps),
+            ]),
+        );
+    }
+    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx);
+    plan.append(indexer::store(
+        shape,
+        &desc.indexer,
+        indexed,
+        ctx.origin,
+        n_tok,
+        device,
+    )?);
+    let scorer = Scorer::choose(shape.indexer.heads, ctx.tensor_core);
+    if ctx.batch_selected != 0 {
+        plan.append(indexer::select_queries(
+            shape,
+            &desc.indexer,
+            indexed,
+            n_tok,
+            device,
+        )?);
+    }
+    for run in 0..runs.count() {
+        let first = runs.start(run);
+        let rows = runs.len(run);
+        let selected = (ctx.batch_selected >> run) & 1 == 1;
+        let span = indexer::RowSpan {
+            base: first,
+            n: rows,
+            pages: Operand::PagesOf(run),
+        };
+        if selected {
+            plan.append(indexer::select_rows(shape, indexed, scorer, span));
+        }
+        let one = AttnContext {
+            selected,
+            origin: RowOrigin::Sequential,
+            ..ctx
+        };
+        plan.append(attend_at(
+            shape,
+            slot,
+            one,
+            rows,
+            RowAt {
+                row: first,
+                pages: Operand::PagesOf(run),
+            },
+        ));
+    }
+    plan.launch(
+        Entry::plain(MOD_QSA, "q4e_qsa_gate_kernel"),
+        kernels::elementwise(u64::from(n_tok) * u64::from(shape.q_dim())),
+        // `x, gate, n` - in place over attention's own output.
+        Args::of(&[
+            Operand::Scratch(Buf::AttnOut),
+            Operand::Scratch(Buf::AttnGate),
+            Operand::U64(u64::from(n_tok) * u64::from(shape.q_dim())),
+        ]),
+    );
+    matmul::project(
+        &mut plan,
+        desc.output,
+        Bound::new(
+            at(Role::AttnOutput),
+            Operand::Scratch(Buf::AttnOut),
+            Operand::Scratch(Buf::BlockOut),
+        ),
+        n_tok,
+        device,
+    )?;
+    Ok(plan)
+}
+
+/// Where one row of a batch lives in the pass's buffers.
+///
+/// A batch's row `r` is its own sequence: its query, output, position and
+/// selection rows are row `r` of the pass's, and its page table is its own.
+#[derive(Debug, Clone, Copy)]
+struct RowAt {
+    row: u32,
+    pages: Operand,
+}
+
+impl RowAt {
+    /// The whole pass, one sequence's rows from the first.
+    const WHOLE: Self = Self {
+        row: 0,
+        pages: Operand::Pages,
+    };
+
+    /// Byte offset of this row in a buffer whose rows are `width` elements of
+    /// four bytes.
+    fn offset(self, width: u64) -> u64 {
+        u64::from(self.row) * width * 4
+    }
+
+    /// `buf` from this row on.
+    fn of(self, buf: Buf, width: u64) -> Operand {
+        if self.row == 0 {
+            Operand::Scratch(buf)
+        } else {
+            Operand::ScratchFrom(buf, self.offset(width))
+        }
+    }
+}
+
+/// One batch row's attention, launched exactly as a single-row step of its
+/// sequence launches it: the split kernel over the whole cache, or - for a row
+/// whose context has outgrown the budget - the selected-block kernel over the
+/// selection the indexer just made for that row alone.
+fn attend_one(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, row: u32) -> Plan {
+    let at = RowAt {
+        row,
+        pages: Operand::PagesOf(row),
+    };
+    let selected = (ctx.batch_selected >> row) & 1 == 1;
+    let one = AttnContext {
+        selected,
+        origin: RowOrigin::Sequential,
+        ..ctx
+    };
+    attend_at(shape, slot, one, 1, at)
 }
 
 /// The tensor-core entry's argument list.
@@ -354,17 +554,18 @@ pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32)
 /// it both is not an over-specification - it is the slab branch, at a split
 /// count whose caller then does not fold, so the destination keeps whatever it
 /// held and the block contributes the previous chunk's attention.
-fn tc_args(shape: &SparseShape, slot: AttnSlot, splits: u32, selected: bool) -> Args {
+fn tc_args(shape: &SparseShape, slot: AttnSlot, splits: u32, selected: bool, at: RowAt) -> Args {
+    let q_width = u64::from(shape.gqa.q_heads) * u64::from(shape.gqa.head_dim);
     let (tokens, counts) = if selected {
         (
-            Operand::Scratch(Buf::IdxTokens),
-            Operand::Scratch(Buf::IdxTokenCount),
+            at.of(Buf::IdxTokens, u64::from(kernels::IDX_WIDTH)),
+            at.of(Buf::IdxTokenCount, 1),
         )
     } else {
         (Operand::Null, Operand::Null)
     };
     let (out, part) = if splits == 1 {
-        (Operand::Scratch(Buf::AttnOut), Operand::Null)
+        (at.of(Buf::AttnOut, q_width), Operand::Null)
     } else {
         (Operand::Null, Operand::Scratch(Buf::AttnPartial))
     };
@@ -379,11 +580,11 @@ fn tc_args(shape: &SparseShape, slot: AttnSlot, splits: u32, selected: bool) -> 
             rank: slot.rank,
             plane: Plane::Value,
         },
-        Operand::Scratch(Buf::AttnQuery),
+        at.of(Buf::AttnQuery, q_width),
         tokens,
         counts,
-        Operand::Scratch(Buf::Positions),
-        Operand::Pages,
+        at.of(Buf::Positions, 1),
+        at.pages,
         Operand::U32(kernels::IDX_WIDTH),
         Operand::U32(shape.gqa.q_heads),
         Operand::U32(shape.gqa.kv_heads),
@@ -470,6 +671,9 @@ pub fn block(
     // The batched store is the scalar one with `pages` replaced by the per-row
     // array; every other parameter, and the grid, is the same.
     let batched = ctx.origin == RowOrigin::Unrelated;
+    if let RowOrigin::Segmented(runs) = ctx.origin {
+        return segmented(shape, desc, slot, ctx, runs, device, plan);
+    }
     let (store_entry, store_launch, store_pages) = if batched {
         (
             "q4e_qsa_store_kv_batch_kernel",
@@ -523,18 +727,44 @@ pub fn block(
         n_tok,
         device,
     )?);
-    if ctx.selected {
-        let scorer = Scorer::choose(shape.indexer.heads, ctx.tensor_core);
-        plan.append(indexer::select(
-            shape,
-            &desc.indexer,
-            indexed,
-            scorer,
-            n_tok,
-            device,
-        )?);
+    let scorer = Scorer::choose(shape.indexer.heads, ctx.tensor_core);
+    if batched {
+        // Each row of a batch is attended exactly as a single-row step of its
+        // own sequence would attend it: its own selection when its own context
+        // is past the budget, the split kernel over its own cache otherwise.
+        if ctx.batch_selected != 0 {
+            plan.append(indexer::select_queries(
+                shape,
+                &desc.indexer,
+                indexed,
+                n_tok,
+                device,
+            )?);
+        }
+        for row in 0..n_tok {
+            if (ctx.batch_selected >> row) & 1 == 1 {
+                plan.append(indexer::select_rows(
+                    shape,
+                    indexed,
+                    scorer,
+                    indexer::RowSpan::one(row),
+                ));
+            }
+            plan.append(attend_one(shape, slot, ctx, row));
+        }
+    } else {
+        if ctx.selected {
+            plan.append(indexer::select(
+                shape,
+                &desc.indexer,
+                indexed,
+                scorer,
+                n_tok,
+                device,
+            )?);
+        }
+        plan.append(attend(shape, slot, ctx, n_tok));
     }
-    plan.append(attend(shape, slot, ctx, n_tok));
     plan.launch(
         Entry::plain(MOD_QSA, "q4e_qsa_gate_kernel"),
         kernels::elementwise(u64::from(n_tok) * u64::from(shape.q_dim())),

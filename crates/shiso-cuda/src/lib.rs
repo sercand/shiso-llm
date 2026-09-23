@@ -63,14 +63,16 @@ mod ptxmod;
 mod sys;
 #[cfg(test)]
 mod testing;
+mod upload;
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use shiso_core::{
     Backend, BlasBackend, CoopLaunch, CoreResult, DeviceView, Extent3, GemmDesc, GraphBackend,
-    GraphCapture, GraphKey, KernelRef, LaunchArgs, PointerPack, RawBuffer,
+    GraphCapture, GraphKey, HostBytes, KernelRef, LaunchArgs, PointerPack, RawBuffer,
 };
 
 use crate::blas::Blas;
@@ -171,6 +173,10 @@ pub struct CudaBackend {
     state: Mutex<State>,
     modules: ModuleRegistry,
     blas: Blas,
+    /// The page-locked slots weight imports go through, while a load is on.
+    staging: Mutex<Option<upload::Staging>>,
+    /// Where the current load's import time went.
+    imports: Mutex<upload::ImportTally>,
     /// Declared last so it drops last: every other member holds handles that
     /// are only valid inside this context.
     device: DeviceCtx,
@@ -220,6 +226,8 @@ impl CudaBackend {
             state: Mutex::new(State::default()),
             modules,
             blas,
+            staging: Mutex::new(None),
+            imports: Mutex::new(upload::ImportTally::default()),
             device,
         }))
     }
@@ -350,6 +358,25 @@ impl Backend for CudaBackend {
 
     fn free_raw(&self, raw: RawBuffer) -> CoreResult<()> {
         device::free(self, raw)
+    }
+
+    fn import_raw(&self, host: &dyn HostBytes, range: Range<usize>) -> CoreResult<RawBuffer> {
+        device::import(self, host.as_ref(), range)
+    }
+
+    fn finish_imports(&self) {
+        *self.staging.lock() = None;
+        std::mem::take(&mut *self.imports.lock()).report();
+    }
+
+    fn memory_info(&self) -> Option<shiso_core::MemoryInfo> {
+        match device::memory_info(self) {
+            Ok(info) => Some(info),
+            Err(error) => {
+                tracing::warn!(%error, "the device memory query failed");
+                None
+            }
+        }
     }
 
     fn copy_h2d(&self, dst: DeviceView<'_>, src: &[u8]) -> CoreResult<()> {

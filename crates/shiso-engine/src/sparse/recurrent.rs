@@ -19,7 +19,7 @@
 use shiso_core::error::CoreResult;
 
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
-use crate::sparse::kernels::{self, Entry, MOD_GDN};
+use crate::sparse::kernels::{self, Entry, MOD_GDN, MOD_GDN_TC};
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::mtp::SpecDepth;
@@ -168,7 +168,28 @@ pub fn block(
         n_tok,
         device,
     )?;
-    if policy.is_batched() {
+    if let RowOrigin::Segmented(runs) = policy.origin {
+        // Each run is its own sequence's consecutive positions: the scalar
+        // convolution's body over that run's rows, from that session's window,
+        // with that session's rollback records - one launch for every run.
+        let (ckpt, cap) = rollback_args(spec, Operand::RecurrentConvCkpts(slot));
+        plan.launch(
+            Entry::plain(MOD_GDN, "q4e_gdn_conv_seg_kernel"),
+            kernels::gdn_conv_batch(shape.gdn_in_dim(), runs.count()),
+            // `out, states, x, w, channels, kernel, run_lens, ckpts, ckpt_cap`
+            Args::of(&[
+                Operand::Scratch(Buf::GdnConv),
+                Operand::RecurrentConvs(slot),
+                Operand::Scratch(Buf::GdnQkv),
+                Operand::Weight(at(Role::RecurrentConv1d)),
+                Operand::U32(shape.gdn_in_dim()),
+                Operand::U32(shape.gdn.conv_kernel),
+                Operand::U64(runs.packed_lens()),
+                ckpt,
+                cap,
+            ]),
+        );
+    } else if policy.is_batched() {
         plan.launch(
             Entry::plain(MOD_GDN, "q4e_gdn_conv_batch_kernel"),
             kernels::gdn_conv_batch(shape.gdn_in_dim(), n_tok),
@@ -183,6 +204,38 @@ pub fn block(
                 Operand::Weight(at(Role::RecurrentConv1d)),
                 Operand::U32(shape.gdn_in_dim()),
                 Operand::U32(shape.gdn.conv_kernel),
+            ]),
+        );
+    } else if policy.takes_chunk(n_tok) {
+        // A prefill chunk convolves in parallel over tokens and then rewrites
+        // the carried window; like the recurrence it records no per-position
+        // state, which is what the chunked path already guarantees it is never
+        // asked for. Measured on a GB10 at an 8192-row chunk: the sequential
+        // walk was 3.9 ms a layer on 40 blocks.
+        plan.launch(
+            Entry::plain(MOD_GDN_TC, "q4e_gdn_conv_par_kernel"),
+            kernels::gdn_conv_par(shape.gdn_in_dim(), n_tok),
+            // `out, state, x, w, channels, kernel, n_tok`
+            Args::of(&[
+                Operand::Scratch(Buf::GdnConv),
+                Operand::RecurrentConv(slot),
+                Operand::Scratch(Buf::GdnQkv),
+                Operand::Weight(at(Role::RecurrentConv1d)),
+                Operand::U32(shape.gdn_in_dim()),
+                Operand::U32(shape.gdn.conv_kernel),
+                Operand::U32(n_tok),
+            ]),
+        );
+        plan.launch(
+            Entry::plain(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
+            kernels::gdn_conv(shape.gdn_in_dim()),
+            // `state, x, channels, kernel, n_tok`
+            Args::of(&[
+                Operand::RecurrentConv(slot),
+                Operand::Scratch(Buf::GdnQkv),
+                Operand::U32(shape.gdn_in_dim()),
+                Operand::U32(shape.gdn.conv_kernel),
+                Operand::U32(n_tok),
             ]),
         );
     } else {
@@ -257,7 +310,35 @@ pub fn block(
             Operand::U32(n_tok),
         ]),
     );
-    if policy.is_batched() {
+    if let RowOrigin::Segmented(runs) = policy.origin {
+        // The same, for the recurrence: one sequential walk per run, every run
+        // in one launch. Launched once per run instead, the walks were 32
+        // blocks each on a 48-SM device and 10 ms of a four-sequence verify
+        // step on a GB10.
+        let (ckpt, cap) = rollback_args(spec, Operand::RecurrentStateCkpts(slot));
+        plan.launch(
+            Entry::plain(MOD_GDN, "q4e_gdn_recurrent_seg_kernel"),
+            kernels::gdn_recurrent_batch(shape.gdn.head_dim, shape.gdn.v_heads, runs.count()),
+            // `attn_out, states, qkv, decay, beta, head_dim, n_head_k,
+            //  n_head_v, k_offset, v_offset, stride, run_lens, ckpts, ckpt_cap`
+            Args::of(&[
+                Operand::Scratch(Buf::GdnAttn),
+                Operand::RecurrentStates(slot),
+                Operand::Scratch(Buf::GdnConv),
+                Operand::Scratch(Buf::GdnDecay),
+                Operand::Scratch(Buf::GdnBeta),
+                Operand::U32(shape.gdn.head_dim),
+                Operand::U32(shape.gdn.qk_heads),
+                Operand::U32(shape.gdn.v_heads),
+                Operand::U32(shape.gdn_qk_dim()),
+                Operand::U32(2 * shape.gdn_qk_dim()),
+                Operand::U32(shape.gdn_in_dim()),
+                Operand::U64(runs.packed_lens()),
+                ckpt,
+                cap,
+            ]),
+        );
+    } else if policy.is_batched() {
         plan.launch(
             Entry::plain(MOD_GDN, "q4e_gdn_recurrent_batch_kernel"),
             kernels::gdn_recurrent_batch(shape.gdn.head_dim, shape.gdn.v_heads, n_tok),
@@ -280,15 +361,23 @@ pub fn block(
             ]),
         );
     } else if policy.takes_chunk(n_tok) {
+        // The chunked recurrence, on tensor cores: the half of each run's work
+        // that does not depend on the state at its start for every run at once,
+        // then the carry, one block per head. Measured on a GB10 at an
+        // 8192-row chunk against the CUDA-core chunked kernel it replaces:
+        // 21.3 -> 6.4 ms a layer, outputs within 5e-4 relative L2. Neither
+        // writes per-position state, which is why neither carries a
+        // checkpoint slab.
         plan.launch(
-            Entry::plain(MOD_GDN, "q4e_gdn_chunk_kernel"),
-            kernels::gdn_chunk(shape.gdn.head_dim, shape.gdn.v_heads),
-            // `attn_out, state, qkv, decay, beta, n_head_k, n_head_v,
-            //  k_offset, v_offset, stride, n_tok` - the chunked kernel writes no
-            // per-position state, which is why it carries no checkpoint slab.
+            Entry::plain(MOD_GDN_TC, "q4e_gdn_tc_prep_kernel"),
+            kernels::gdn_tc_prep(shape.gdn.v_heads, n_tok),
+            // `u, w, p, g, qkv, decay, beta, n_head_k, n_head_v, k_offset,
+            //  v_offset, stride, n_tok`
             Args::of(&[
-                Operand::Scratch(Buf::GdnAttn),
-                Operand::RecurrentState(slot),
+                Operand::Scratch(Buf::GdnTcU),
+                Operand::Scratch(Buf::GdnTcW),
+                Operand::Scratch(Buf::GdnTcP),
+                Operand::Scratch(Buf::GdnTcG),
                 Operand::Scratch(Buf::GdnConv),
                 Operand::Scratch(Buf::GdnDecay),
                 Operand::Scratch(Buf::GdnBeta),
@@ -296,6 +385,26 @@ pub fn block(
                 Operand::U32(shape.gdn.v_heads),
                 Operand::U32(shape.gdn_qk_dim()),
                 Operand::U32(2 * shape.gdn_qk_dim()),
+                Operand::U32(shape.gdn_in_dim()),
+                Operand::U32(n_tok),
+            ]),
+        );
+        plan.launch(
+            Entry::plain(MOD_GDN_TC, "q4e_gdn_tc_scan_kernel"),
+            kernels::gdn_tc_scan(shape.gdn.v_heads),
+            // `attn_out, state, qkv, u, w, p, g, n_head_k, n_head_v,
+            //  k_offset, stride, n_tok`
+            Args::of(&[
+                Operand::Scratch(Buf::GdnAttn),
+                Operand::RecurrentState(slot),
+                Operand::Scratch(Buf::GdnConv),
+                Operand::Scratch(Buf::GdnTcU),
+                Operand::Scratch(Buf::GdnTcW),
+                Operand::Scratch(Buf::GdnTcP),
+                Operand::Scratch(Buf::GdnTcG),
+                Operand::U32(shape.gdn.qk_heads),
+                Operand::U32(shape.gdn.v_heads),
+                Operand::U32(shape.gdn_qk_dim()),
                 Operand::U32(shape.gdn_in_dim()),
                 Operand::U32(n_tok),
             ]),

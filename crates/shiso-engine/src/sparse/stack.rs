@@ -60,11 +60,21 @@ use crate::sparse::weights::{ModelDesc, SparseWeights};
 /// Every activation buffer is allocated at this width, so it is the one number
 /// that decides the scratch bill. A prompt longer than this is split rather
 /// than refused.
-pub const MAX_PREFILL_CHUNK: u32 = 512;
+///
+/// 2048 rather than 512 because the routed experts are read once per pass: at
+/// 512 rows each expert's weights were streamed and decoded four times for a
+/// 2048-token scheduler chunk, and prefill ran at 550-610 tok/s on a GB10
+/// against 1040-1090 for the reference at 2048. The scratch this costs is
+/// about 2 GB, on a device where the weights are 62.
+pub const MAX_PREFILL_CHUNK: u32 = 8192;
 
 /// Sessions one decode step may carry, which is also the height of the logits
 /// block and the width every per-row pointer array is packed at.
 pub const MAX_DECODE_BATCH: u32 = 8;
+
+/// Rows of logits one pass may produce: a segmented verify's every row, which
+/// is a decode batch's sequences times one verify each.
+pub const MAX_LOGIT_ROWS: u32 = 32;
 
 /// Everything a sparse stack needs that is not geometry and not a weight.
 ///
@@ -490,6 +500,31 @@ impl std::fmt::Debug for SparseStack {
     }
 }
 
+/// Device bytes one session allocates when it opens.
+///
+/// Every recurrent slot's window and state, one rollback record of each per
+/// drafted row, the n-gram window and its records, and the staged draft row -
+/// what [`SparseStack::open_session`] allocates, counted the same way.
+fn session_bytes(shape: &SparseShape, spec: SpecDepth) -> u64 {
+    let records = u64::from(spec.rollback_slots());
+    let copies = if spec.is_speculative() {
+        records.saturating_add(1)
+    } else {
+        1
+    };
+    let recurrent = u64::from(shape.count(LayerKind::Gdn))
+        .saturating_mul(conv_state_bytes(shape).saturating_add(state_bytes(shape)));
+    let pending = if spec.is_speculative() {
+        u64::from(shape.stream_dim()).saturating_mul(F32_BYTES)
+    } else {
+        0
+    };
+    recurrent
+        .saturating_add(ple_window_bytes(shape))
+        .saturating_mul(copies)
+        .saturating_add(pending)
+}
+
 impl SparseStack {
     /// Builds a stack over weights that are already on the device.
     ///
@@ -526,20 +561,11 @@ impl SparseStack {
             indexer: true,
             draft: weights.draft.is_some(),
         };
-        let kv = PagedKv::open(backend, &shape, planes, opts.engine.kv_pool_pages)?;
-        let cache = KvCache::open(
-            &crate::sparse::paged::cache_geometry(&shape, planes, opts.spec),
-            Box::new(kv.clone()),
-            opts.engine.kv_pool_pages,
-            opts.engine.kv_ckpt_slots,
-            None,
-        )
-        .map_err(cache_failure)?;
         let scratch = Scratch::new(
             backend,
             &shape,
             MAX_PREFILL_CHUNK,
-            MAX_DECODE_BATCH,
+            MAX_LOGIT_ROWS,
             opts.engine.ctx,
         )?;
         let ngram = match (shape.ple, ngram) {
@@ -561,10 +587,33 @@ impl SparseStack {
                 });
             }
         };
+        // The pool last, so that a pool sized to the device is sized from what
+        // the weights, the scratch and the n-gram tier left of it.
+        let mut opts = opts;
+        let geometry = crate::sparse::paged::cache_geometry(&shape, planes, opts.spec);
+        opts.engine.fit_pool(
+            backend.as_ref(),
+            crate::options::PoolCost {
+                page_bytes: geometry.page_bytes,
+                session_bytes: session_bytes(&shape, opts.spec),
+                fixed_bytes: u64::from(opts.engine.kv_ckpt_slots)
+                    .saturating_mul(geometry.ckpt_bytes),
+            },
+        )?;
+        let kv = PagedKv::open(backend, &shape, planes, opts.engine.kv_pool_pages)?;
+        let cache = KvCache::open(
+            &geometry,
+            Box::new(kv.clone()),
+            opts.engine.kv_pool_pages,
+            opts.engine.kv_ckpt_slots,
+            None,
+        )
+        .map_err(cache_failure)?;
         let device = Device {
             blas: backend.as_blas().is_some(),
             capturing: false,
             max_co_resident: opts.co_resident_blocks,
+            half_block_input: false,
         };
         let desc = weights.desc(ngram.as_ref().map(|tier| tier.table().row()));
         tracing::info!(
@@ -573,6 +622,7 @@ impl SparseStack {
             experts = shape.moe.experts,
             streams = shape.streams,
             ctx = opts.engine.ctx,
+            pool_pages = opts.engine.kv_pool_pages,
             "sparse stack resident"
         );
         Ok(Self {
@@ -1112,6 +1162,15 @@ impl SparseStack {
             });
         }
         let rows = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
+        if let RowOrigin::Segmented(runs) = pass.origin
+            && runs.count() != rows
+        {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented pass sessions",
+                expected: u64::from(runs.count()),
+                got: u64::from(rows),
+            });
+        }
         if pass.origin == RowOrigin::Unrelated && pass.rows != rows {
             return Err(CoreError::ShapeMismatch {
                 field: "decode batch rows",

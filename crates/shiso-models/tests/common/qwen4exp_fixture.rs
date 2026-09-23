@@ -562,9 +562,9 @@ pub(crate) fn tiny_ngram() -> shiso_models::qwen4exp::NgramHash {
     }
 }
 /// Tokens one session may hold.
-pub(crate) const CTX: u32 = 1_024;
+pub(crate) const CTX: u32 = 9_216;
 /// Pages the pool holds.
-pub(crate) const POOL_PAGES: u32 = 8;
+pub(crate) const POOL_PAGES: u32 = 40;
 /// Blocks the fake device claims it can hold resident.
 pub(crate) const CO_RESIDENT: u32 = 48;
 
@@ -636,13 +636,18 @@ const fn trellis_bits(template: &'static str, bits: u32) -> Instantiation {
     Instantiation::new(kernels::MOD_EXL3, template, TemplateArgs::TrellisBits(bits))
 }
 
+/// One trellis-module entry with C++ linkage and no template arguments.
+const fn untemplated(name: &'static str) -> Instantiation {
+    Instantiation::new(kernels::MOD_EXL3, name, TemplateArgs::Untemplated)
+}
+
 /// The entry names a build would have captured off its compiled modules.
 ///
 /// Stand-ins, not guesses at a real mangling: nothing here launches anything,
 /// and what the table is for is that a dispatch resolves at all. A build with
 /// the toolchain fills this in from the module's own symbol list, which is the
 /// only place those names can honestly come from.
-static CAPTURED: [(Instantiation, &str); 50] = [
+static CAPTURED: [(Instantiation, &str); 59] = [
     (
         Instantiation::new(
             kernels::MOD_HC,
@@ -801,6 +806,43 @@ static CAPTURED: [(Instantiation, &str); 50] = [
     (
         trellis_bits(kernels::EXL3_RECONSTRUCT, 6),
         "captured_exl3_reconstruct_k6",
+    ),
+    // The weight-stationary routed block a prefill chunk takes.
+    (
+        trellis_bits(kernels::EXL3_MOE_WS_GATEUP, 4),
+        "captured_ws_gateup_k4",
+    ),
+    (
+        trellis_bits(kernels::EXL3_MOE_WS_GATEUP, 5),
+        "captured_ws_gateup_k5",
+    ),
+    (
+        trellis_bits(kernels::EXL3_MOE_WS_GATEUP, 6),
+        "captured_ws_gateup_k6",
+    ),
+    (
+        trellis_bits(kernels::EXL3_MOE_WS_DOWN_H, 4),
+        "captured_ws_down_h_k4",
+    ),
+    (
+        trellis_bits(kernels::EXL3_MOE_WS_DOWN_H, 5),
+        "captured_ws_down_h_k5",
+    ),
+    (
+        trellis_bits(kernels::EXL3_MOE_WS_DOWN_H, 6),
+        "captured_ws_down_h_k6",
+    ),
+    (
+        untemplated(kernels::EXL3_MOE_WS_INVERT),
+        "captured_ws_invert",
+    ),
+    (
+        untemplated(kernels::EXL3_MOE_WS_PREP_TOK),
+        "captured_ws_prep_tok",
+    ),
+    (
+        untemplated(kernels::EXL3_MOE_WS_COMBINE),
+        "captured_ws_combine",
     ),
 ];
 

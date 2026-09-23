@@ -83,6 +83,10 @@ pub enum Buf {
     Normed,
     /// One mixed vector per token: what a block actually reads.
     Mixed,
+    /// The same block input in half precision, which the stream mixes of a
+    /// prefill chunk write beside it for the projections that read it on the
+    /// half-precision tier.
+    MixedHalf,
     /// The low-rank vector inside a stream mix.
     LowRank,
     /// The expansion back to the full stream width.
@@ -105,6 +109,15 @@ pub enum Buf {
     GdnBetaProj,
     /// The recurrence's output.
     GdnAttn,
+    /// The tensor-core recurrence's `u` per (run, head), in half precision.
+    GdnTcU,
+    /// Its `w` per (run, head), in half precision.
+    GdnTcW,
+    /// Its masked, scaled query-key products per (run, head), in half
+    /// precision.
+    GdnTcP,
+    /// Its cumulative log decays per (run, head).
+    GdnTcG,
     /// That output after the head norm and gate.
     GdnGated,
     /// The recurrent block's output-gate projection.
@@ -157,6 +170,13 @@ pub enum Buf {
     DraftNormed,
     /// The draft head's projection of that hidden state, per stream.
     DraftHidden,
+    /// A segmented verify's residual rows, held for the draft head's catch-up
+    /// passes: each of those overwrites the residual, and every session's
+    /// catch-up reads its own verify rows.
+    ResidualHold,
+    /// A batch of sessions' staged draft rows, side by side, which a batched
+    /// draft pass opens from.
+    DraftStage,
     /// The routed gate projection, one row per column.
     MoeGate,
     /// The routed up projection, one row per column.
@@ -165,6 +185,18 @@ pub enum Buf {
     MoeMid,
     /// The down projection's output, one row per column.
     MoeDown,
+    /// The weight-stationary routed block's gate input: every routed column's
+    /// row, scaled and transformed, in half precision and expert order.
+    MoeWsGate,
+    /// The same rows for the up projection, which has its own input scales.
+    MoeWsUp,
+    /// The half-precision down input the gate and up launch leaves behind.
+    MoeWsAct,
+    /// Each routed column's row in expert order: the sort's inverse.
+    MoeWsPos,
+    /// Each routed column's input row, replicated once per slot, for the
+    /// grouped launch of a pass of a few rows.
+    MoeRep,
     /// The shared expert's gate projection.
     SharedGate,
     /// The shared expert's up projection.
@@ -225,7 +257,7 @@ pub enum Buf {
 
 impl Buf {
     /// Every buffer, in allocation order.
-    pub const ALL: [Self; 65] = [
+    pub const ALL: [Self; 77] = [
         Self::Ids,
         Self::Positions,
         Self::Mrope,
@@ -234,6 +266,7 @@ impl Buf {
         Self::Residual,
         Self::Normed,
         Self::Mixed,
+        Self::MixedHalf,
         Self::LowRank,
         Self::Expanded,
         Self::Inject,
@@ -245,6 +278,10 @@ impl Buf {
         Self::GdnAlphaProj,
         Self::GdnBetaProj,
         Self::GdnAttn,
+        Self::GdnTcU,
+        Self::GdnTcW,
+        Self::GdnTcP,
+        Self::GdnTcG,
         Self::GdnGated,
         Self::GdnGate,
         Self::AttnQueryFull,
@@ -271,10 +308,17 @@ impl Buf {
         Self::MoeSorted,
         Self::DraftNormed,
         Self::DraftHidden,
+        Self::ResidualHold,
+        Self::DraftStage,
         Self::MoeGate,
         Self::MoeUp,
         Self::MoeMid,
         Self::MoeDown,
+        Self::MoeWsGate,
+        Self::MoeWsUp,
+        Self::MoeWsAct,
+        Self::MoeWsPos,
+        Self::MoeRep,
         Self::SharedGate,
         Self::SharedUp,
         Self::SharedMid,
@@ -304,6 +348,7 @@ impl Buf {
     pub fn bytes(self, shape: &SparseShape, rows: u32, logit_rows: u32, ctx: u32) -> u64 {
         let rows = u64::from(rows);
         let per_token = |width: u32| rows * u64::from(width) * F32_BYTES;
+        let run_rows = rows.next_multiple_of(u64::from(crate::sparse::kernels::GDN_TC_RUN));
         let columns = shape.moe.slot_rows(u32::try_from(rows).unwrap_or(u32::MAX));
         match self {
             Self::Ids | Self::Positions | Self::SpliceMap => rows * I32_BYTES,
@@ -321,6 +366,16 @@ impl Buf {
                 per_token(shape.gdn.v_heads)
             }
             Self::GdnAttn | Self::GdnGated | Self::GdnGate => per_token(shape.gdn_v_dim()),
+            // Whole runs: the last one is padded to the run width, and the
+            // prep writes every row of it.
+            Self::GdnTcU | Self::GdnTcW => run_rows * u64::from(shape.gdn_v_dim()) * F16_BYTES,
+            Self::GdnTcP => {
+                run_rows
+                    * u64::from(shape.gdn.v_heads)
+                    * u64::from(crate::sparse::kernels::GDN_TC_RUN)
+                    * F16_BYTES
+            }
+            Self::GdnTcG => run_rows * u64::from(shape.gdn.v_heads) * F32_BYTES,
             Self::AttnQueryFull => per_token(shape.q_dim()) * 2,
             Self::AttnQuery | Self::AttnGate | Self::AttnOut => per_token(shape.q_dim()),
             Self::AttnKey | Self::AttnValue => per_token(shape.kv_dim()),
@@ -349,13 +404,18 @@ impl Buf {
             Self::IdxSelected => rows * u64::from(shape.indexer.budget_blocks()) * I32_BYTES,
             Self::IdxCount | Self::IdxTokenCount => rows * I32_BYTES,
             Self::IdxTokens => rows * u64::from(IDX_WIDTH) * I32_BYTES,
-            // Sized by the widest draft pass rather than by the chunk: a draft
-            // is at most one verify's worth of rows, and sizing these two by
-            // `rows` would carve a prefill chunk's worth of the widest buffer
-            // in the model for a launch that never runs more than nine.
-            Self::DraftNormed | Self::DraftHidden => {
-                u64::from(crate::sparse::draft::ROWS) * u64::from(shape.stream_dim()) * F32_BYTES
+            // Sized by the chunk, not by the widest draft chain: the pass that
+            // fills the head's cache as a prompt is read runs the head over
+            // every row of the chunk. Sized at nine rows, a prompt longer than
+            // that failed its first chunk's projection and - worse - had its
+            // normalization write past the end of this buffer first.
+            Self::DraftNormed | Self::DraftHidden => per_token(shape.stream_dim()),
+            Self::DraftStage => {
+                u64::from(crate::sparse::stack::MAX_DECODE_BATCH)
+                    * u64::from(shape.stream_dim())
+                    * F32_BYTES
             }
+            Self::ResidualHold => u64::from(logit_rows) * u64::from(shape.stream_dim()) * F32_BYTES,
             Self::MoeRouter => per_token(shape.moe.experts),
             Self::MoeIds => rows * u64::from(shape.moe.used) * I32_BYTES,
             Self::MoeWeights => rows * u64::from(shape.moe.used) * F32_BYTES,
@@ -370,6 +430,25 @@ impl Buf {
                 columns * u64::from(shape.moe.intermediate) * F32_BYTES
             }
             Self::MoeDown => columns * u64::from(shape.hidden) * F32_BYTES,
+            Self::MoeWsGate | Self::MoeWsUp => columns * u64::from(shape.hidden) * F16_BYTES,
+            Self::MoeWsAct => columns * u64::from(shape.moe.intermediate) * F16_BYTES,
+            Self::MoeWsPos => columns * I32_BYTES,
+            // Only the grouped launch writes it, and only below its row bounds.
+            Self::MoeRep => {
+                let grouped = [
+                    crate::sparse::bind::WeightSet::Target,
+                    crate::sparse::bind::WeightSet::Draft,
+                ]
+                .into_iter()
+                .map(crate::sparse::moe::grouped_max)
+                .max()
+                .unwrap_or(0);
+                shape
+                    .moe
+                    .slot_rows(u32::try_from(rows.min(u64::from(grouped))).unwrap_or(0))
+                    * u64::from(shape.hidden)
+                    * F32_BYTES
+            }
             Self::SharedGate | Self::SharedUp | Self::SharedMid => {
                 per_token(shape.moe.intermediate)
             }
@@ -399,6 +478,7 @@ impl Buf {
             // whole. Sizing this for a narrower one is an out-of-bounds write
             // by the rounding pass, not a failed launch.
             Self::HalfActivation => rows * u64::from(shape.stream_dim()) * F16_BYTES,
+            Self::MixedHalf => rows * u64::from(shape.hidden) * F16_BYTES,
             Self::ProjectionPartial => u64::from(PROJECTION_PARTIAL_FLOATS) * F32_BYTES,
         }
     }

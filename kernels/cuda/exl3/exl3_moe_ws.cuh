@@ -111,6 +111,43 @@ exl3_moe_ws_prep(const float *__restrict__ x, half *__restrict__ a_g, half *__re
     ((half4 *)(a_u + (size_t)row * k + c * 128))[lane] = ou;
 }
 
+// ---- prep, by token (shiso) ----------------------------------------------------
+// The same rows as exl3_moe_ws_prep, produced the other way round: one warp per
+// (token, 128-column chunk) reads the token's input once and writes it to every
+// expert row it was routed to, through the sort's inverse.  The per-row form
+// reads each token's input once per expert - ten times - which at an
+// 8192-row chunk is 839 MB of the 1.7 GB the launch moved.
+__global__ void __launch_bounds__(WS_THREADS)
+exl3_moe_ws_invert(int32_t *__restrict__ pos, const int32_t *__restrict__ slot_sorted, int n_rows) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < n_rows) pos[slot_sorted[r]] = r;
+}
+
+__global__ void __launch_bounds__(WS_THREADS)
+exl3_moe_ws_prep_tok(const float *__restrict__ x, half *__restrict__ a_g, half *__restrict__ a_u,
+                     const half *__restrict__ suh_g, const half *__restrict__ suh_u,
+                     const int32_t *__restrict__ ids, const int32_t *__restrict__ pos,
+                     int n_tok, int n_used, int k) {
+    const int lane = threadIdx.x & 31;
+    const int chunks = k / 128;
+    const int task = blockIdx.x * (WS_THREADS / 32) + (threadIdx.x >> 5);
+    if (task >= n_tok * chunks) return;
+    const int t = task / chunks, c = task - t * chunks;
+    const float4 xv = ((const float4 *)(x + (size_t)t * k + c * 128))[lane];
+    for (int s = 0; s < n_used; s++) {
+        const int slot = t * n_used + s;
+        const int e = ids[slot];
+        const int row = pos[slot];
+        float4 g = xv, u = xv;
+        ws_scale4(g, suh_g + (size_t)e * k + c * 128, lane);
+        ws_scale4(u, suh_u + (size_t)e * k + c * 128, lane);
+        ws_had4(g, lane);
+        ws_had4(u, lane);
+        ((half4 *)(a_g + (size_t)row * k + c * 128))[lane] = half4(__floats2half2_rn(g.x, g.y), __floats2half2_rn(g.z, g.w));
+        ((half4 *)(a_u + (size_t)row * k + c * 128))[lane] = half4(__floats2half2_rn(u.x, u.y), __floats2half2_rn(u.z, u.w));
+    }
+}
+
 // ---- GEMM core -----------------------------------------------------------------
 // C_i[m][n0 + j] = sum_k A_i[m][k] B_i[k][n0 + j] for i in {0, 1} (TWO) or {0}.
 // Warp w owns columns [n0 + 16w, n0 + 16w + 16): two n8 fragments per k16
@@ -302,10 +339,17 @@ exl3_moe_ws_gateup(const half *__restrict__ a_g, const half *__restrict__ a_u,
 
 // ---- down ------------------------------------------------------------------------
 // grid.x = n_expert * (hidden / 128).  slot_out[slot][hidden] for the
-// assignment slot_sorted[row] gets its unweighted expert output.
-template <int bits, int cb, int STAGES>
-__global__ void __launch_bounds__(WS_THREADS)
-exl3_moe_ws_down(const half *__restrict__ act, float *__restrict__ slot_out,
+// assignment slot_sorted[row] gets its unweighted expert output, as floats
+// (exl3_moe_ws_down) or as halves (exl3_moe_ws_down_h).  The half form is
+// shiso's: at an 8192-row chunk the slot outputs are 839 MB a layer, written
+// here and read back whole by the combine, and halving them halves both.
+__device__ __forceinline__ void ws_store_out(float *dst, const float4 &o) { *(float4 *)dst = o; }
+__device__ __forceinline__ void ws_store_out(half *dst, const float4 &o) {
+    *(half4 *)dst = half4(__floats2half2_rn(o.x, o.y), __floats2half2_rn(o.z, o.w));
+}
+
+template <int bits, int cb, int STAGES, typename OUT>
+__device__ __forceinline__ void ws_down_body(const half *__restrict__ act, OUT *__restrict__ slot_out,
                  const uint16_t *__restrict__ down_trellis, const half *__restrict__ down_svh,
                  const int32_t *__restrict__ bounds, const int32_t *__restrict__ slot_sorted,
                  int hidden, int inter) {
@@ -339,8 +383,55 @@ exl3_moe_ws_down(const half *__restrict__ act, float *__restrict__ slot_out,
                 ws_had4(o, lane);
                 ws_scale4(o, svh_d, lane);
                 const int slot = slot_sorted[r0 + row];
-                ((float4 *)(slot_out + (size_t)slot * hidden + n0))[lane] = o;
+                ws_store_out(slot_out + (size_t)slot * hidden + n0 + lane * 4, o);
             }
         }
     }
+}
+
+template <int bits, int cb, int STAGES>
+__global__ void __launch_bounds__(WS_THREADS)
+exl3_moe_ws_down(const half *__restrict__ act, float *__restrict__ slot_out,
+                 const uint16_t *__restrict__ down_trellis, const half *__restrict__ down_svh,
+                 const int32_t *__restrict__ bounds, const int32_t *__restrict__ slot_sorted,
+                 int hidden, int inter) {
+    ws_down_body<bits, cb, STAGES>(act, slot_out, down_trellis, down_svh, bounds, slot_sorted, hidden, inter);
+}
+
+template <int bits, int cb, int STAGES>
+__global__ void __launch_bounds__(WS_THREADS)
+exl3_moe_ws_down_h(const half *__restrict__ act, half *__restrict__ slot_out,
+                   const uint16_t *__restrict__ down_trellis, const half *__restrict__ down_svh,
+                   const int32_t *__restrict__ bounds, const int32_t *__restrict__ slot_sorted,
+                   int hidden, int inter) {
+    ws_down_body<bits, cb, STAGES>(act, slot_out, down_trellis, down_svh, bounds, slot_sorted, hidden, inter);
+}
+
+// ---- combine -----------------------------------------------------------------
+// out[t] = sum_s weights[t][s] * slot_out[t][s] + sigmoid(logit[t]) * shared[t],
+// over half slot outputs, in slot order, so a chunk's result does not depend
+// on which expert finished first.  The shared expert's gated add rides along:
+// it was a second pass over the same rows.  Grid (ceil(n_embd / 4 / 256),
+// n_tok), 256 threads, four columns a thread.
+__global__ void __launch_bounds__(256)
+exl3_moe_ws_combine(float *__restrict__ out, const half *__restrict__ slot_out,
+                    const float *__restrict__ weights, const float *__restrict__ shared,
+                    const float *__restrict__ logit, int n_embd, int n_used) {
+    const int t = blockIdx.y;
+    const int e = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (e >= n_embd) return;
+    const float g = 1.0f / (1.0f + __expf(-logit[t]));
+    const float4 sh = *(const float4 *)(shared + (size_t)t * n_embd + e);
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int s = 0; s < n_used; s++) {
+        const size_t col = (size_t)t * n_used + s;
+        const float w = weights[col];
+        const half4 d = *(const half4 *)(slot_out + col * n_embd + e);
+        acc.x += __low2float(d.x) * w;
+        acc.y += __high2float(d.x) * w;
+        acc.z += __low2float(d.y) * w;
+        acc.w += __high2float(d.y) * w;
+    }
+    acc.x += sh.x * g; acc.y += sh.y * g; acc.z += sh.z * g; acc.w += sh.w * g;
+    *(float4 *)(out + (size_t)t * n_embd + e) = acc;
 }

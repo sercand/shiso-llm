@@ -125,6 +125,24 @@ pub const fn batch_lookback_offset(rows: u32, row: u32) -> u64 {
     (ahead as u64).saturating_mul(MROPE_ROW_BYTES)
 }
 
+/// Byte offset of run `run`'s lookback group inside the rotary table of a
+/// segmented pass.
+///
+/// The batched layout, with a run in place of a row: region one is every row
+/// of the pass one row apart, and region two is one group per run - that run's
+/// lookback and then its own rows - which is what the run's pooled-key pass is
+/// bound at, because it indexes the table from the run's first position.
+#[must_use]
+pub fn segment_lookback_offset(runs: &crate::sparse::moe::Segments, run: u32) -> u64 {
+    let before: u32 = (0..run)
+        .map(|earlier| MROPE_BACK.saturating_add(runs.len(earlier)))
+        .sum();
+    let ahead = MROPE_BACK
+        .saturating_add(runs.rows())
+        .saturating_add(before);
+    u64::from(ahead).saturating_mul(MROPE_ROW_BYTES)
+}
+
 /// Rows the rotary table of a batched pass of `rows` rows occupies.
 #[must_use]
 pub const fn batch_mrope_rows(rows: u32) -> u32 {
@@ -522,6 +540,59 @@ impl InputRows {
         Ok(())
     }
 
+    /// The three rows for a segmented pass: each run's tokens at its own
+    /// session's consecutive positions from `first`, in run order.
+    ///
+    /// The rotary table is the batch's two regions with a run in place of a
+    /// row: every row of the pass one row apart, then one group per run - its
+    /// lookback and its own rows - for that run's pooled-key pass. See
+    /// [`segment_lookback_offset`].
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] for no runs or an empty one, and
+    /// [`CoreError::InvalidValue`] for a token outside the vocabulary.
+    pub fn fill_segments(&mut self, runs: &[(&[TokenId], u32)], vocab: u32) -> CoreResult<()> {
+        if runs.is_empty() || runs.iter().any(|(tokens, _)| tokens.is_empty()) {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented pass runs",
+                expected: 1,
+                got: 0,
+            });
+        }
+        self.ids.clear();
+        self.positions.clear();
+        for (tokens, first) in runs {
+            for (i, token) in tokens.iter().enumerate() {
+                self.ids.push(vocabulary_row(*token, vocab)?);
+                let at = first.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+                self.positions.push(position(at));
+            }
+        }
+        self.mrope.clear();
+        let lead = runs.first().map_or(0, |(_, first)| *first);
+        for back in (1..=MROPE_BACK).rev() {
+            push_row(&mut self.mrope, position(lead.saturating_sub(back)));
+        }
+        for (tokens, first) in runs {
+            for i in 0..tokens.len() {
+                let at = first.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+                push_row(&mut self.mrope, position(at));
+            }
+        }
+        for (tokens, first) in runs {
+            for back in (1..=MROPE_BACK).rev() {
+                push_row(&mut self.mrope, position(first.saturating_sub(back)));
+            }
+            for i in 0..tokens.len() {
+                let at = first.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+                push_row(&mut self.mrope, position(at));
+            }
+        }
+        self.splice.clear();
+        Ok(())
+    }
+
     /// The vocabulary row each token of the chunk gathers, in chunk order.
     #[must_use]
     pub fn ids(&self) -> &[i32] {
@@ -772,6 +843,97 @@ impl SparseStack {
         let rows = &mut staging.inputs;
         rows.fill_batch(&batch, vocab)?;
 
+        let scratch = &resident.scratch;
+        let device = backend.as_ref();
+        upload(device, &mut rows.bytes, scratch.view(Buf::Ids)?, &rows.ids)?;
+        upload(
+            device,
+            &mut rows.bytes,
+            scratch.view(Buf::Positions)?,
+            &rows.positions,
+        )?;
+        upload(
+            device,
+            &mut rows.bytes,
+            scratch.view(Buf::Mrope)?,
+            &rows.mrope,
+        )
+    }
+
+    /// Writes a batch's three input rows from rows the caller placed: one token
+    /// per session at a position of the caller's, as a batched draft pass
+    /// needs - its positions run ahead of each session's frontier.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`InputRows::fill_batch`] and the transfers report.
+    pub fn write_placed_inputs(&mut self, rows: &[DecodeRow]) -> CoreResult<()> {
+        let vocab = self.shape.vocab;
+        let Self {
+            backend,
+            resident,
+            staging,
+            ..
+        } = self;
+        let resident = resident.as_ref().ok_or(CoreError::Unsupported {
+            what: "a model whose device state teardown already released",
+            backend: "engine",
+        })?;
+        let inputs = &mut staging.inputs;
+        inputs.fill_batch(rows, vocab)?;
+        let scratch = &resident.scratch;
+        let device = backend.as_ref();
+        upload(
+            device,
+            &mut inputs.bytes,
+            scratch.view(Buf::Ids)?,
+            &inputs.ids,
+        )?;
+        upload(
+            device,
+            &mut inputs.bytes,
+            scratch.view(Buf::Positions)?,
+            &inputs.positions,
+        )?;
+        upload(
+            device,
+            &mut inputs.bytes,
+            scratch.view(Buf::Mrope)?,
+            &inputs.mrope,
+        )
+    }
+
+    /// Writes a segmented pass's three input rows: each run's tokens at its own
+    /// session's frontier and the positions after it.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`], whatever [`InputRows::fill_segments`]
+    /// reports, and whatever the transfers report.
+    pub fn write_segment_inputs(&mut self, runs: &[(SessionId, &[TokenId])]) -> CoreResult<()> {
+        let vocab = self.shape.vocab;
+        let Self {
+            backend,
+            resident,
+            sessions,
+            staging,
+            ..
+        } = self;
+        let resident = resident.as_ref().ok_or(CoreError::Unsupported {
+            what: "a model whose device state teardown already released",
+            backend: "engine",
+        })?;
+        let placed = runs
+            .iter()
+            .map(|(session, tokens)| {
+                let live = sessions
+                    .get(session)
+                    .ok_or(CoreError::UnknownSession(*session))?;
+                Ok((*tokens, live.written()))
+            })
+            .collect::<CoreResult<Vec<_>>>()?;
+        let rows = &mut staging.inputs;
+        rows.fill_segments(&placed, vocab)?;
         let scratch = &resident.scratch;
         let device = backend.as_ref();
         upload(device, &mut rows.bytes, scratch.view(Buf::Ids)?, &rows.ids)?;

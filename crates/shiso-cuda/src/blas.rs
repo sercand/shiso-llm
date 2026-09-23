@@ -193,8 +193,8 @@ impl<'a> CudaGemm<'a> {
 /// would make every bound check below wrong by a factor.
 fn element_bytes(dtype: GemmDType) -> CoreResult<u64> {
     match dtype {
-        GemmDType::F32 => Ok(4),
-        GemmDType::F16 | GemmDType::BF16 => Ok(2),
+        GemmDType::F32 | GemmDType::F32Strict => Ok(4),
+        GemmDType::F16 | GemmDType::F16ToF16 | GemmDType::BF16 => Ok(2),
         _ => Err(unsupported_dtype()),
     }
 }
@@ -207,8 +207,8 @@ fn element_bytes(dtype: GemmDType) -> CoreResult<u64> {
 /// path for.
 fn math_type(dtype: GemmDType) -> CoreResult<MathType> {
     match dtype {
-        GemmDType::F32 => Ok(MathType::F32),
-        GemmDType::F16 => Ok(MathType::F16),
+        GemmDType::F32 | GemmDType::F32Strict => Ok(MathType::F32),
+        GemmDType::F16 | GemmDType::F16ToF16 => Ok(MathType::F16),
         GemmDType::BF16 => Ok(MathType::Bf16),
         _ => Err(unsupported_dtype()),
     }
@@ -359,7 +359,8 @@ fn resolve(
         alpha: gemm.alpha,
         beta: gemm.beta,
         dtype: math_type(gemm.dtype)?,
-        tf32,
+        tf32: tf32 && gemm.dtype != GemmDType::F32Strict,
+        out_half: gemm.dtype == GemmDType::F16ToF16,
     };
     let stride = gemm
         .batch

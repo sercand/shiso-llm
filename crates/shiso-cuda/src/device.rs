@@ -69,16 +69,16 @@ fn bind_ordinal(bound: &mut Option<u32>, ordinal: u32) -> CoreResult<()> {
 
 /// A stream that closes itself.
 #[derive(Debug)]
-struct OwnedStream(CuStream);
+pub(crate) struct OwnedStream(CuStream);
 
 impl OwnedStream {
     /// Opens a stream.
-    fn open() -> SysResult<Self> {
+    pub(crate) fn open() -> SysResult<Self> {
         nvidia::stream_create().map(Self)
     }
 
     /// The handle, for a call that is about to use it.
-    const fn get(&self) -> CuStream {
+    pub(crate) const fn get(&self) -> CuStream {
         self.0
     }
 }
@@ -131,6 +131,9 @@ pub(crate) struct DeviceCtx {
     capture: OwnedStream,
     ctx: OwnedContext,
     multiprocessors: u32,
+    /// Whether the device shares its memory with the host; see
+    /// [`memory_info`].
+    integrated: bool,
 }
 
 impl DeviceCtx {
@@ -151,14 +154,16 @@ impl DeviceCtx {
         // outlives this call.
         unsafe { nvidia::ctx_set_current(ctx.ctx) }?;
         let multiprocessors = nvidia::multiprocessor_count(device)?;
+        let integrated = nvidia::integrated(device)?;
         let work = OwnedStream::open()?;
         let capture = OwnedStream::open()?;
-        tracing::debug!(ordinal, multiprocessors, "opened CUDA device");
+        tracing::debug!(ordinal, multiprocessors, integrated, "opened CUDA device");
         Ok(Self {
             work,
             capture,
             ctx,
             multiprocessors,
+            integrated,
         })
     }
 
@@ -294,6 +299,40 @@ impl BufferTable {
     }
 }
 
+/// The device's free and total memory, from its own context.
+///
+/// # Errors
+///
+/// [`CoreError::Backend`] when the context cannot be made current or the
+/// driver refuses the query.
+pub(crate) fn memory_info(backend: &CudaBackend) -> CoreResult<shiso_core::MemoryInfo> {
+    backend.device.bind()?;
+    let (free, total) = nvidia::mem_get_info()?;
+    // On a device that shares memory with the host, the driver counts the
+    // page cache as taken; measured on a GB10 right after a load, it reported
+    // 113 of 122 GiB in use while 33 GiB of that was file cache the kernel
+    // reclaims on demand. The kernel's own estimate of what an allocation can
+    // still get is the better answer there, and the larger of the two is kept
+    // so a host that cannot say never makes the figure worse.
+    let free = if backend.device.integrated {
+        free.max(host_available().unwrap_or(0).min(total))
+    } else {
+        free
+    };
+    Ok(shiso_core::MemoryInfo { free, total })
+}
+
+/// The kernel's estimate of memory available to a new allocation without
+/// swapping (`MemAvailable`), in bytes; `None` where it cannot be read.
+fn host_available() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo
+        .lines()
+        .find(|line| line.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
 /// Reserves device memory and records it in the table.
 ///
 /// # Errors
@@ -397,6 +436,75 @@ pub(crate) fn copy_h2d(backend: &CudaBackend, dst: DeviceView<'_>, src: &[u8]) -
     // held, so nothing can free the allocation under the copy.
     unsafe { nvidia::memcpy_htod(ptr, src, backend.device.work_stream()) }?;
     Ok(())
+}
+
+/// Allocates device memory and fills it with `host[range]`.
+///
+/// Large ranges go through [`crate::upload::Staging`]; see that module for why
+/// the plain copy is not good enough for a checkpoint. The staging is opened on
+/// the first large import and kept until
+/// [`shiso_core::Backend::finish_imports`].
+///
+/// # Errors
+///
+/// [`CoreError::OutOfBounds`] when `range` runs past `host`, and whatever the
+/// allocation or the copy reports. A failed copy frees the allocation.
+pub(crate) fn import(
+    backend: &CudaBackend,
+    host: &[u8],
+    range: std::ops::Range<usize>,
+) -> CoreResult<RawBuffer> {
+    let src = host.get(range.clone()).ok_or(CoreError::OutOfBounds {
+        offset: range.start as u64,
+        len: range.end.saturating_sub(range.start) as u64,
+        buffer_bytes: host.len() as u64,
+    })?;
+    let len = src.len() as u64;
+    let started = std::time::Instant::now();
+    let raw = alloc(backend, len)?;
+    let allocated = started.elapsed().as_secs_f64();
+    let view = DeviceView::from_raw(raw, 0, len);
+    let staged = src.len() >= crate::upload::STAGED_MIN;
+    let copied = if staged {
+        staged_copy(backend, view, src)
+    } else {
+        copy_h2d(backend, view, src)
+    };
+    {
+        let mut tally = backend.imports.lock();
+        tally.alloc_seconds += allocated;
+        let seconds = started.elapsed().as_secs_f64() - allocated;
+        let bucket = if staged {
+            &mut tally.staged
+        } else {
+            &mut tally.plain
+        };
+        crate::upload::ImportTally::add(bucket, src.len(), seconds);
+    }
+    if let Err(error) = copied {
+        if let Err(free_error) = free(backend, raw) {
+            tracing::error!(error = %free_error, "freeing a failed import");
+        }
+        return Err(error);
+    }
+    Ok(raw)
+}
+
+/// Copies `src` into a freshly allocated range through the staging slots.
+fn staged_copy(backend: &CudaBackend, dst: DeviceView<'_>, src: &[u8]) -> CoreResult<()> {
+    backend.device.bind()?;
+    // Resolved and released before the staging lock is taken: the address
+    // cannot move, and the allocation belongs to the import that made it until
+    // it returns, so nothing can free it under the copy.
+    let ptr = backend.state.lock().buffers.resolve(dst)?;
+    let mut staging = backend.staging.lock();
+    if staging.is_none() {
+        *staging = Some(crate::upload::Staging::open()?);
+    }
+    staging
+        .as_mut()
+        .expect("the staging was opened just above")
+        .upload(ptr, src)
 }
 
 /// Writes zeros over a device range.

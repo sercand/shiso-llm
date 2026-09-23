@@ -56,6 +56,10 @@ pub enum PtrArray {
     RecurrentConv(u32),
     /// One recurrent slot's state matrix per row.
     RecurrentState(u32),
+    /// One recurrent slot's convolution rollback records per row.
+    RecurrentConvCkpt(u32),
+    /// One recurrent slot's state rollback records per row.
+    RecurrentStateCkpt(u32),
 }
 
 /// Where each array sits inside the pack.
@@ -76,6 +80,11 @@ pub struct Layout {
     /// Whether the stack folds in an n-gram block, and therefore whether the
     /// window array exists at all.
     pub ngram: bool,
+    /// Whether the rows carry speculative rollback records, and therefore
+    /// whether the two record arrays per recurrent slot exist. They come after
+    /// every other array, so a pack without them lays the rest out exactly as
+    /// one with them does.
+    pub rollback: bool,
 }
 
 impl Layout {
@@ -84,13 +93,15 @@ impl Layout {
     /// The *sizing* half, and the only one that can answer before a session
     /// exists: [`Buf::RowPointers`] is allocated when the stack is built.
     /// Addressing goes through [`Layout::of_rows`], which asks the sessions
-    /// themselves.
+    /// themselves. The geometry cannot say whether a session will be opened
+    /// for speculation, so this sizes for the record arrays as well.
     #[must_use]
     pub fn of(shape: &SparseShape, rows: u32) -> Self {
         Self {
             rows,
             slots: shape.count(LayerKind::Gdn),
             ngram: shape.ple.is_some(),
+            rollback: true,
         }
     }
 
@@ -117,14 +128,18 @@ impl Layout {
                 u32::try_from(row.recurrent_slots()).unwrap_or(u32::MAX)
             }),
             ngram: first.is_some_and(|row| row.ngram_window().is_some()),
+            // Every row or none: a record array with a hole in it would be a
+            // launch writing one row's records through a pointer nobody packed.
+            rollback: !rows.is_empty() && rows.iter().all(|row| row.recurrent_rollback(0).is_ok()),
         }
     }
 
     /// Arrays the pack holds.
     #[must_use]
     pub const fn arrays(&self) -> u32 {
+        let per_slot = if self.rollback { 4 } else { 2 };
         1u32.saturating_add(self.ngram as u32)
-            .saturating_add(self.slots.saturating_mul(2))
+            .saturating_add(self.slots.saturating_mul(per_slot))
     }
 
     /// Bytes the whole pack occupies.
@@ -144,6 +159,7 @@ impl Layout {
     #[must_use]
     pub const fn ordinal(&self, array: PtrArray) -> Option<u32> {
         let after_pages = 1u32.saturating_add(self.ngram as u32);
+        let after_state = after_pages.saturating_add(self.slots.saturating_mul(2));
         match array {
             PtrArray::Pages => Some(0),
             PtrArray::NgramWindows => {
@@ -164,6 +180,24 @@ impl Layout {
                 if slot < self.slots {
                     Some(
                         after_pages
+                            .saturating_add(slot.saturating_mul(2))
+                            .saturating_add(1),
+                    )
+                } else {
+                    None
+                }
+            }
+            PtrArray::RecurrentConvCkpt(slot) => {
+                if self.rollback && slot < self.slots {
+                    Some(after_state.saturating_add(slot.saturating_mul(2)))
+                } else {
+                    None
+                }
+            }
+            PtrArray::RecurrentStateCkpt(slot) => {
+                if self.rollback && slot < self.slots {
+                    Some(
+                        after_state
                             .saturating_add(slot.saturating_mul(2))
                             .saturating_add(1),
                     )
@@ -277,6 +311,16 @@ pub fn pack(
             views.push(row.recurrent(slot)?.1);
         }
     }
+    if layout.rollback {
+        for slot in 0..layout.slots {
+            for row in rows {
+                views.push(row.recurrent_rollback(slot)?.0);
+            }
+            for row in rows {
+                views.push(row.recurrent_rollback(slot)?.1);
+            }
+        }
+    }
 
     let dst = scratch.view(Buf::RowPointers)?.slice(0, layout.bytes())?;
     pointers.pack_pointers(dst, &views)
@@ -290,6 +334,7 @@ mod tests {
         rows: 4,
         slots: 3,
         ngram: true,
+        rollback: true,
     };
 
     #[test]
@@ -314,6 +359,16 @@ mod tests {
                 LAYOUT
                     .span(PtrArray::RecurrentState(slot))
                     .expect("the slot exists"),
+            );
+            spans.push(
+                LAYOUT
+                    .span(PtrArray::RecurrentConvCkpt(slot))
+                    .expect("the slot has records"),
+            );
+            spans.push(
+                LAYOUT
+                    .span(PtrArray::RecurrentStateCkpt(slot))
+                    .expect("the slot has records"),
             );
         }
         assert_eq!(spans.len(), LAYOUT.arrays() as usize);
@@ -348,6 +403,24 @@ mod tests {
         assert_eq!(LAYOUT.ordinal(PtrArray::RecurrentConv(3)), None);
         assert_eq!(LAYOUT.ordinal(PtrArray::RecurrentState(3)), None);
         assert!(LAYOUT.ordinal(PtrArray::RecurrentState(2)).is_some());
+    }
+
+    #[test]
+    fn a_pack_without_records_keeps_every_other_array_where_it_was() {
+        // The record arrays come last, so whether a batch's sessions were
+        // opened for speculation moves nothing a plain batched launch reads.
+        let plain = Layout {
+            rollback: false,
+            ..LAYOUT
+        };
+        assert_eq!(plain.ordinal(PtrArray::RecurrentStateCkpt(0)), None);
+        assert_eq!(plain.arrays(), LAYOUT.arrays() - 2 * LAYOUT.slots);
+        for slot in 0..LAYOUT.slots {
+            assert_eq!(
+                plain.span(PtrArray::RecurrentState(slot)),
+                LAYOUT.span(PtrArray::RecurrentState(slot))
+            );
+        }
     }
 
     #[test]

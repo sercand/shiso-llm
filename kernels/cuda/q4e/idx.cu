@@ -1,7 +1,13 @@
 /*
  *
- * Deltas against the source, and nothing else: D1 (extern "C" linkage on the non-template kernels).
- * No line of kernel arithmetic was edited, reordered or
+ * Deltas against the source, and nothing else: D1 (extern "C" linkage on the non-template kernels);
+ * D2 (shiso): q4e_idx_topk_kernel's compaction writes the selected blocks in
+ * index order through a block-wide scan, and admits threshold ties lowest
+ * index first, where the source appended them by atomic arrival.  The set was
+ * the same up to exact ties; the order was not, and the attention sums the
+ * selected tokens in that order - so the same prompt decoded to different
+ * text from one run to the next once its context passed the budget.
+ * No other line of kernel arithmetic was edited, reordered or
  * reformatted; a change to any of it is a defect, not a cleanup.
  */
 
@@ -283,9 +289,8 @@ extern "C" __global__ void __launch_bounds__(256) q4e_idx_score_tc_kernel(
 
 /* Top-k blocks per row by radix select on the float bit pattern (4 passes of
  * 8 bits), then compaction.  -inf (invisible) blocks are never selected;
- * ties at the threshold are broken by index order of arrival, which only
- * changes which equally scored block enters.  Output: sel[t][0..cnt) block
- * indices, unordered, cnt <= k. */
+ * ties at the threshold enter lowest index first.  Output: sel[t][0..cnt)
+ * block indices in ascending order, cnt <= k (D2). */
 extern "C" __global__ void __launch_bounds__(1024) q4e_idx_topk_kernel(
         int32_t *sel, int32_t *cnt, const float *score, uint32_t n_blocks_stride,
         const int32_t *pos_last, uint32_t k) {
@@ -295,7 +300,6 @@ extern "C" __global__ void __launch_bounds__(1024) q4e_idx_topk_kernel(
     __shared__ uint32_t hist[256];
     __shared__ uint32_t s_prefix, s_remaining, s_take;
     __shared__ int32_t s_out;
-    __shared__ uint32_t s_gt;
     const uint32_t tid = threadIdx.x;
 
     /* Monotonic key: larger float -> larger key. */
@@ -342,26 +346,56 @@ extern "C" __global__ void __launch_bounds__(1024) q4e_idx_topk_kernel(
         __syncthreads();
     }
     /* prefix is now the full threshold key T (when a bin was found in every
-     * pass); everything > T is in, and `remaining` of the == T ties. */
+     * pass); everything > T is in, and `remaining` of the == T ties.
+     *
+     * Compaction in index order (D2): a tile of blockDim candidates at a time,
+     * each thread's rank among the tile's taken blocks and tied blocks from a
+     * block-wide scan, so the output order and the ties admitted depend on
+     * the scores alone. */
     const bool take_all = (s_take == 0xFFFFFFFFu);
-    if (tid == 0u) { s_out = 0; s_gt = remaining; }
-    __syncthreads();
+    __shared__ uint32_t s_warp_take[32], s_warp_eq[32];
+    uint32_t base_out = 0u, base_eq = 0u;
     int32_t *out = sel + (uint64_t)t * k;
-    for (uint32_t i = tid; i < n_blocks; i += blockDim.x) {
-        const uint32_t u = key_of(row[i]);
-        if (u == neg_inf_key) continue;
-        bool take = take_all || u > prefix;
-        if (!take && u == prefix) {
-            /* One of the tied slots, if any are left. */
-            const uint32_t slot = atomicSub(&s_gt, 1u);
-            take = (slot != 0u && slot <= k);
-            if (!take) atomicAdd(&s_gt, 1u);
+    const uint32_t lane = tid & 31u, warp = tid >> 5u, n_warp = (blockDim.x + 31u) >> 5u;
+    for (uint32_t i0 = 0; i0 < n_blocks; i0 += blockDim.x) {
+        const uint32_t i = i0 + tid;
+        bool gt = false, eq = false;
+        if (i < n_blocks) {
+            const uint32_t u = key_of(row[i]);
+            if (u != neg_inf_key) {
+                gt = take_all || u > prefix;
+                eq = !gt && u == prefix;
+            }
         }
-        if (take) {
-            const int32_t o = atomicAdd(&s_out, 1);
-            if ((uint32_t)o < k) out[o] = (int32_t)i;
+        const uint32_t beq = __ballot_sync(0xffffffffu, eq);
+        const uint32_t below = (1u << lane) - 1u;
+        if (lane == 0u) s_warp_eq[warp] = __popc(beq);
+        __syncthreads();
+        uint32_t off_eq = 0u, tot_eq = 0u;
+        for (uint32_t w = 0; w < n_warp; w++) {
+            if (w < warp) off_eq += s_warp_eq[w];
+            tot_eq += s_warp_eq[w];
         }
+        const uint32_t eq_rank = base_eq + off_eq + __popc(beq & below);
+        const bool tie_in = eq && eq_rank < remaining;
+        const uint32_t take_b = __ballot_sync(0xffffffffu, gt || tie_in);
+        __syncthreads();
+        if (lane == 0u) s_warp_take[warp] = __popc(take_b);
+        __syncthreads();
+        uint32_t off_take = 0u, tot_take = 0u;
+        for (uint32_t w = 0; w < n_warp; w++) {
+            if (w < warp) off_take += s_warp_take[w];
+            tot_take += s_warp_take[w];
+        }
+        if (gt || tie_in) {
+            const uint32_t o = base_out + off_take + __popc(take_b & below);
+            if (o < k) out[o] = (int32_t)i;
+        }
+        base_out += tot_take;
+        base_eq += tot_eq;
+        __syncthreads();
     }
+    if (tid == 0u) s_out = (int32_t)base_out;
     __syncthreads();
     if (tid == 0u) cnt[t] = s_out < (int32_t)k ? s_out : (int32_t)k;
 }

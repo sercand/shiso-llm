@@ -56,6 +56,68 @@ fn a_bare_serve_takes_the_documented_defaults() {
 }
 
 #[test]
+fn the_kv_cache_is_sized_by_tokens_or_by_a_share_of_the_device_never_both() {
+    let args = parse(&["--model", "m.gguf"]).expect("it parses");
+    assert_eq!(args.max_num_seqs, 4);
+    assert_eq!(args.kv_pool_pages().expect("nothing to refuse"), None);
+    assert!(args.kv_fit().expect("nothing to refuse").is_none());
+
+    // Tokens round up to whole pages.
+    let args = parse(&["--model", "m.gguf", "--kv-cache-tokens", "65537"]).expect("it parses");
+    args.validate().expect("a pool wider than one context");
+    assert_eq!(args.kv_pool_pages().expect("a valid pool"), Some(257));
+
+    let args = parse(&[
+        "--model",
+        "m.gguf",
+        "--gpu-memory-utilization",
+        "0.9",
+        "--max-num-seqs",
+        "8",
+    ])
+    .expect("it parses");
+    args.validate().expect("a valid share");
+    let fit = args.kv_fit().expect("a valid share").expect("asked for");
+    assert_eq!(fit.sessions(), 8);
+    assert!((fit.fraction() - 0.9).abs() < 1e-12);
+
+    assert!(
+        parse(&[
+            "--model",
+            "m.gguf",
+            "--kv-cache-tokens",
+            "65536",
+            "--gpu-memory-utilization",
+            "0.9",
+        ])
+        .is_err(),
+        "a pool and a share are two answers to one question"
+    );
+}
+
+#[test]
+fn a_kv_cache_that_cannot_hold_one_context_or_a_share_outside_zero_to_one_is_refused() {
+    let small = parse(&[
+        "--model",
+        "m.gguf",
+        "--ctx",
+        "8192",
+        "--kv-cache-tokens",
+        "4096",
+    ])
+    .expect("it parses");
+    assert!(small.validate().is_err());
+    // `=` because a leading minus would otherwise read as a flag.
+    for share in ["0", "1.5", "-0.2"] {
+        let flag = format!("--gpu-memory-utilization={share}");
+        let args = parse(&["--model", "m.gguf", &flag]).expect("it parses");
+        assert!(args.validate().is_err(), "{share}");
+    }
+    let none = parse(&["--model", "m.gguf", "--max-num-seqs", "0"]).expect("it parses");
+    assert!(none.validate().is_err());
+}
+
+#[test]
 fn the_model_id_is_the_checkpoint_file_stem() {
     let args = parse(&["--model", "/models/Qwen3.5-4B-Q4_K_M.gguf"]).expect("it parses");
     assert_eq!(args.model_id(), "Qwen3.5-4B-Q4_K_M");
@@ -223,6 +285,9 @@ fn every_documented_flag_declares_its_prefixed_environment_fallback() {
         "SHISO_BIND",
         "SHISO_PORT",
         "SHISO_CTX",
+        "SHISO_MAX_NUM_SEQS",
+        "SHISO_KV_CACHE_TOKENS",
+        "SHISO_GPU_MEMORY_UTILIZATION",
         "SHISO_KVSTORE_DIR",
         "SHISO_KVSTORE_BUDGET_MB",
         "SHISO_AUTH_TOKENS",

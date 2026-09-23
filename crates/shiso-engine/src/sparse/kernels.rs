@@ -54,6 +54,8 @@ pub const MOD_HC: &str = "q4e_hc";
 pub const MOD_MOE: &str = "q4e_moe";
 /// The gated recurrent block.
 pub const MOD_GDN: &str = "q4e_gdn";
+/// The gated recurrence of a prefill chunk, on tensor cores.
+pub const MOD_GDN_TC: &str = "q4e_gdn_tc";
 /// The n-gram embedding block.
 pub const MOD_PLE: &str = "q4e_ple";
 /// Dense projections at every stored element type.
@@ -192,6 +194,49 @@ pub const EXL3_MGEMM: &str = "exl3_mgemm_kernel";
 pub const EXL3_MOE: &str = "exl3_moe_kernel";
 /// The one-off expansion of a trellis weight into half precision.
 pub const EXL3_RECONSTRUCT: &str = "reconstruct_had_kernel";
+/// The weight-stationary routed block's first launch: every routed column's
+/// input, scaled and Hadamard-transformed for gate and up, in expert order.
+///
+/// Not a template, but its name is C++-mangled all the same, so it is read off
+/// the module exactly as the instantiations are.
+pub const EXL3_MOE_WS_PREP: &str = "exl3_moe_ws_prep";
+/// The inverse of the expert sort, which the by-token prep writes through.
+pub const EXL3_MOE_WS_INVERT: &str = "exl3_moe_ws_invert";
+/// The weight-stationary block's input rows, produced one token at a time.
+pub const EXL3_MOE_WS_PREP_TOK: &str = "exl3_moe_ws_prep_tok";
+/// The weight-stationary routed block's gate and up projections, with the
+/// activation and the down projection's input transform as their epilogue.
+pub const EXL3_MOE_WS_GATEUP: &str = "exl3_moe_ws_gateup";
+/// The weight-stationary routed block's down projection.
+pub const EXL3_MOE_WS_DOWN: &str = "exl3_moe_ws_down";
+/// The same down projection writing its slot outputs as halves.
+pub const EXL3_MOE_WS_DOWN_H: &str = "exl3_moe_ws_down_h";
+/// The weighted sum of the half slot outputs, with the gated shared expert
+/// added in the same pass.
+pub const EXL3_MOE_WS_COMBINE: &str = "exl3_moe_ws_combine";
+/// Threads one block of every weight-stationary launch carries (`WS_THREADS`).
+pub const EXL3_MOE_WS_THREADS: u32 = 256;
+/// Output columns one weight-stationary block owns.
+pub const EXL3_MOE_WS_TILE_N: u32 = 128;
+/// Pipeline stages the weight-stationary instances were built with.
+const EXL3_MOE_WS_STAGES: u32 = 3;
+
+/// Dynamic shared memory one weight-stationary block needs.
+///
+/// `WsSmem<bits, two, STAGES>::total`, restated: per stage, a 64 x 64
+/// half-precision activation tile and four by eight 16 x 16 trellis tiles, for
+/// one matrix or for the gate and up pair; and never less than the two
+/// 32 x 128 single-precision tiles the epilogue stages its output through.
+#[must_use]
+pub const fn exl3_moe_ws_smem(bits: u32, two: bool) -> u32 {
+    let tile_words = 256 * bits / 16;
+    let a_stage = 64 * 64;
+    let b_stage = (64 / 16) * 8 * tile_words;
+    let matrices = if two { 2 } else { 1 };
+    let bytes = EXL3_MOE_WS_STAGES * matrices * (a_stage * 2 + b_stage * 2);
+    let epilogue = 2 * 32 * 128 * 4;
+    if bytes > epilogue { bytes } else { epilogue }
+}
 
 /// Bytes of one single-precision element.
 pub const F32_BYTES: u64 = 4;
@@ -255,6 +300,9 @@ pub enum TemplateArgs {
     /// A trellis width alone: the fused routed block, whose output tile is
     /// fixed, and the expansion.
     TrellisBits(u32),
+    /// No arguments at all: an entry point with C++ linkage that is not a
+    /// template, whose mangled name has to be read off the module like one.
+    Untemplated,
     /// A stored element type id and the block count one weight row holds.
     StoredTypeBlocks {
         /// The stored element type id the weights carry.
@@ -690,6 +738,49 @@ pub const fn gdn_chunk(head_dim: u32, v_heads: u32) -> Launch {
     )
 }
 
+/// Tokens one run of the tensor-core recurrence covers (`Q4E_GT_C`).
+pub const GDN_TC_RUN: u32 = 64;
+
+/// Runs of the tensor-core recurrence a chunk of `n_tok` rows is cut into.
+#[must_use]
+pub const fn gdn_tc_runs(n_tok: u32) -> u32 {
+    n_tok.div_ceil(GDN_TC_RUN)
+}
+
+/// The run-independent half of the tensor-core recurrence: one block per
+/// (value head, run), heads fastest.
+#[must_use]
+pub const fn gdn_tc_prep(v_heads: u32, n_tok: u32) -> Launch {
+    let c = GDN_TC_RUN;
+    Launch::new(
+        Extent3::new(v_heads, gdn_tc_runs(n_tok), 1),
+        512,
+        2 * c * 136 * 2 + c * 68 * 4 + 3 * c * 4,
+    )
+}
+
+/// The convolution of a prefill chunk, parallel over 64-token tiles.
+#[must_use]
+pub const fn gdn_conv_par(channels: u32, n_tok: u32) -> Launch {
+    Launch::new(
+        Extent3::new(channels.div_ceil(BLOCK_LINEAR), n_tok.div_ceil(64), 1),
+        BLOCK_LINEAR,
+        0,
+    )
+}
+
+/// The carry of the tensor-core recurrence: one block per value head.
+#[must_use]
+pub const fn gdn_tc_scan(v_heads: u32) -> Launch {
+    let c = GDN_TC_RUN;
+    let d = GDN_STATE_HEAD_DIM;
+    Launch::new(
+        Extent3::linear(v_heads),
+        512,
+        d * 136 * 2 + 2 * c * 136 * 2 + 2 * c * 4,
+    )
+}
+
 /// The output gate, one block per (token, head).
 #[must_use]
 pub const fn gdn_out_gate(heads: u32, n_tok: u32) -> Launch {
@@ -918,14 +1009,11 @@ pub const fn qsa_sparse_smem() -> u32 {
 /// The split attention over every visible key, one block per (query group,
 /// split, key head).
 #[must_use]
-pub fn qsa_attention_split(q_heads: u32, kv_heads: u32, n_tok: u32) -> Launch {
-    let groups = q_heads.checked_div(kv_heads).unwrap_or(0);
+pub fn qsa_attention_split(kv_heads: u32, n_tok: u32) -> Launch {
+    // One block per row, whatever the group width: a row's key range and its
+    // split are its own, so it sums exactly as it would alone.
     Launch::new(
-        Extent3::new(
-            blocks_for(u64::from(groups) * u64::from(n_tok), u64::from(ATTN_QG)),
-            ATTN_SPLITS,
-            kv_heads,
-        ),
+        Extent3::new(n_tok, ATTN_SPLITS, kv_heads),
         BLOCK_LINEAR,
         qsa_sparse_smem(),
     )

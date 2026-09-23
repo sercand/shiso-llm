@@ -1,7 +1,13 @@
 /*
  *
- * Deltas against the source, and nothing else: D1 (extern "C" linkage on the non-template kernels).
- * No line of kernel arithmetic was edited, reordered or
+ * Deltas against the source, and nothing else: D1 (extern "C" linkage on the non-template kernels);
+ * D2 (shiso): q4e_qsa_attention_split_kernel gives each row its own block -
+ * its G query heads - and cuts that row's own key range, where the source
+ * packed Q4E_ATTN_QG (head, row) pairs a block and cut the key range of the
+ * pass's last row.  A row's sums then do not depend on the rows beside it, so
+ * a verify pass or a decode batch computes each row exactly as a single-row
+ * step does.
+ * No other line of kernel arithmetic was edited, reordered or
  * reformatted; a change to any of it is a defect, not a cleanup.
  *
  * The leading define block (2907-2909) is the one place a span is
@@ -59,9 +65,11 @@ q4e_qsa_attention_split_kernel(
     const uint32_t split = blockIdx.y;
     const uint32_t G = n_head / n_head_kv;              /* query heads per kv head */
     const uint32_t NQ = G * n_tok;
-    const uint32_t q0 = blockIdx.x * Q4E_ATTN_QG;
-    if (q0 >= NQ) return;
-    const uint32_t n_q = (NQ - q0 < Q4E_ATTN_QG) ? (NQ - q0) : Q4E_ATTN_QG;
+    /* D2: block x is row x, all G of its query heads (G <= QG, which the
+     * launcher checks). */
+    const uint32_t q0 = blockIdx.x * G;
+    if (q0 >= NQ || G > Q4E_ATTN_QG) return;
+    const uint32_t n_q = G;
     const float scale = rsqrtf((float)HD);
 
     /* Everything staged is f16: a 16-byte shared load then carries 8 dims,
@@ -74,8 +82,8 @@ q4e_qsa_attention_split_kernel(
     uint4 *s_q8 = s_v8 + (size_t)KT * C8;                  /* [QG][C8] */
     float *s_w  = (float *)(s_q8 + (size_t)Q4E_ATTN_QG * C8); /* [warps][KT] */
 
-    /* This block's key range. */
-    const uint32_t last = (uint32_t)pos[n_tok - 1u];
+    /* This block's key range: its own row's (D2). */
+    const uint32_t last = (uint32_t)pos[blockIdx.x];
     const uint32_t n_tiles = (last + KT) / KT;
     const uint32_t tiles_per_split = (n_tiles + n_splits - 1u) / n_splits;
     const uint32_t k_begin = split * tiles_per_split * KT;

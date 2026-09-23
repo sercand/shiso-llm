@@ -101,6 +101,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             config_path.display()
         )
     })?;
+    let load_started = std::time::Instant::now();
     let model_factory::Loaded {
         mut model,
         open_tower,
@@ -108,6 +109,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         defaults,
     } = model_factory::load_model(&backend, &args.model, &config, &args)
         .with_context(|| format!("loading the checkpoint at {}", args.model.display()))?;
+    tracing::info!(
+        seconds = load_started.elapsed().as_secs_f64(),
+        "the checkpoint is loaded"
+    );
     // Before anything stands on a session: the tier is a property of the cache
     // the sessions draw their pages from, so it is chosen while there are none.
     let tier = open_checkpoint_tier(model.as_mut(), &args);
@@ -126,12 +131,19 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // open is the authority on how its own pictures are preprocessed, and a
     // server without one falls back to what the checkpoint's config declares.
     let vision_spec = vision.as_ref().map(|tower| tower.preprocess().clone());
+    // Every weight this process will read is resident now, the tower's too, so
+    // whatever the backend kept to make those imports fast can go.
+    backend.finish_imports();
 
     let model_id = args.model_id();
     // The one place the scheduler's environment is read. Once, at boot: a knob
     // that could change between two ticks of the same request would be a policy
     // nobody configured.
-    let scheduler = scheduler::SchedulerConfig::from_env();
+    let mut scheduler = scheduler::SchedulerConfig::from_env();
+    // A flag rather than one of the scheduler's own variables: the same count
+    // is what a `--gpu-memory-utilization` pool set sessions aside for, and the
+    // two must not be able to disagree.
+    scheduler.max_num_seqs = args.max_num_seqs;
     let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);
     let tool_call_scheme = args.tool_call_parser.tools(defaults.tools);
     tracing::info!(

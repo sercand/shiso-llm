@@ -20,6 +20,11 @@ memmap2 = { workspace = true }
 bytemuck = { workspace = true }
 half = { workspace = true }
 
+# `madvise` and `posix_fadvise`, which a loader uses to hand a copied tensor's
+# pages back to the kernel. Linux-only: the other target wraps the mapping.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 # A dev-only cycle, and a deliberate one. The role binding moved to the crate that
 # knows this checkpoint family, but the fixtures that exercise it - a synthetic

@@ -483,6 +483,10 @@ impl Backend for MetalBackend {
     /// back. The wrap is clamped to the mapping, so no byte outside `host` is
     /// ever addressable, and the `Arc` that [`shiso_core::import_host`] keeps
     /// inside the returned `DeviceBuffer` is what keeps the pages mapped.
+    fn imports_copy(&self) -> bool {
+        false
+    }
+
     fn import_raw(&self, host: &dyn HostBytes, range: Range<usize>) -> CoreResult<RawBuffer> {
         let all: &[u8] = host.as_ref();
         if range.end > all.len() {

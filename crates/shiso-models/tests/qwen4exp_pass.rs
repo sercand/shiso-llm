@@ -300,52 +300,47 @@ fn the_indexer_stores_its_keys_on_every_pass_and_selects_on_only_some() {
 }
 
 #[test]
-fn the_routed_feed_forward_sorts_its_columns_before_it_runs_them() {
+fn a_prefill_chunk_s_routed_experts_run_weight_stationary_and_combine_with_the_shared_one() {
     let (_dir, _fake, mut model) = loaded();
     let session = model.open_session().expect("a session opens");
+    // Forty tokens: wider than any decode step, verify pass or decode batch.
     let pass = model
-        .plan_chunk(session, &tokens(0, 4), 1)
-        .expect("a four-token chunk plans");
-    // One router, one sort and one shared expert per layer.
-    assert_eq!(pass.plan.count("q4e_moe_route_kernel"), N_LAYERS as usize);
-    assert_eq!(
-        pass.plan.count("q4e_moe_sort_scan_kernel"),
-        N_LAYERS as usize
-    );
-    assert_eq!(pass.plan.count("q4e_shared_add_kernel"), N_LAYERS as usize);
-    // The feed-forward island runs them in that order.
+        .plan_chunk(session, &tokens(0, 40), 1)
+        .expect("a forty-token chunk plans");
+    assert_eq!(pass.plan.count("trellis experts"), 0);
+    assert_eq!(pass.plan.count("q4e_shared_add_kernel"), 0);
+    assert_eq!(pass.plan.count("q4e_moe_combine_kernel"), 0);
     let names = island_names(&pass, 1);
-    let route = names
-        .iter()
-        .position(|n| *n == "q4e_moe_route_kernel")
-        .expect("the router runs");
-    let scatter = names
-        .iter()
-        .position(|n| *n == "q4e_moe_sort_scatter_kernel")
-        .expect("the sort runs");
-    let experts = names
-        .iter()
-        .position(|n| *n == "trellis experts")
-        .expect("the experts run");
-    let shared = names
-        .iter()
-        .position(|n| *n == "q4e_shared_add_kernel")
-        .expect("the shared expert runs");
-    assert!(route < scatter, "the sort reads what the router chose");
-    assert!(scatter < experts, "the experts read the sorted columns");
+    let at = |name: &str| {
+        names
+            .iter()
+            .position(|n| *n == name)
+            .unwrap_or_else(|| panic!("{name} runs"))
+    };
+    let order = [
+        at("q4e_moe_route_kernel"),
+        at("q4e_moe_sort_scatter_kernel"),
+        at("exl3_moe_ws_invert"),
+        at("exl3_moe_ws_prep_tok"),
+        at("exl3_moe_ws_gateup"),
+        at("exl3_moe_ws_down_h"),
+        at("q4e_swiglu_kernel"),
+        at("exl3_moe_ws_combine"),
+    ];
     assert!(
-        experts < shared,
-        "the shared expert adds onto the routed output"
+        order.windows(2).all(|pair| pair[0] < pair[1]),
+        "route, sort, the sort's inverse, the rows, gate and up, down, the shared \
+         expert, and the combine that adds both, in that order: {order:?}"
     );
 }
 
 #[test]
-fn the_fused_expert_stage_has_its_staging_reserved_outside_every_island() {
+fn the_grouped_expert_stage_has_its_staging_reserved_outside_every_island() {
     let (_dir, _fake, mut model) = loaded();
     let session = model.open_session().expect("a session opens");
     let pass = model
-        .plan_chunk(session, &tokens(0, 4), 1)
-        .expect("a four-token chunk plans");
+        .plan_chunk(session, &tokens(0, 3), 1)
+        .expect("a three-token chunk plans");
     // The reservation is one step, and it is the pass's first: it cannot be
     // made while a stream is capturing, and every layer's fused expert stage
     // sits inside an island that may be. An undersized staging is silent
@@ -368,7 +363,7 @@ fn the_fused_expert_stage_has_its_staging_reserved_outside_every_island() {
         .expect("the staging is reserved");
     let experts = names
         .iter()
-        .position(|n| *n == "trellis experts")
+        .position(|n| *n == "trellis pair")
         .expect("the experts run");
     assert!(reserve < experts);
 }
@@ -388,13 +383,18 @@ fn the_recurrent_slots_take_the_sequential_kernel_at_every_row_count_a_session_r
             6,
             "{rows} rows"
         );
-        assert_eq!(pass.plan.count("q4e_gdn_chunk_kernel"), 0, "{rows} rows");
+        assert_eq!(pass.plan.count("q4e_gdn_tc_prep_kernel"), 0, "{rows} rows");
     }
-    // A wide prefill chunk does reach it.
+    // A wide prefill chunk does reach the chunked form, on tensor cores, and
+    // its convolution runs parallel over tokens.
     let wide = model
         .plan_chunk(session, &tokens(0, 128), 1)
         .expect("a wide chunk plans");
-    assert_eq!(wide.plan.count("q4e_gdn_chunk_kernel"), 6);
+    assert_eq!(wide.plan.count("q4e_gdn_tc_prep_kernel"), 6);
+    assert_eq!(wide.plan.count("q4e_gdn_tc_scan_kernel"), 6);
+    assert_eq!(wide.plan.count("q4e_gdn_conv_par_kernel"), 6);
+    assert_eq!(wide.plan.count("q4e_gdn_conv_kernel"), 0);
+    assert_eq!(wide.plan.count("q4e_gdn_chunk_kernel"), 0);
     assert_eq!(wide.plan.count("q4e_gdn_recurrent_kernel"), 0);
 }
 
@@ -418,11 +418,10 @@ fn a_pass_carries_the_n_gram_gather_it_will_need() {
 }
 
 /// The six kernels that carry per-sequence state through one batched launch.
-const BATCHED: [&str; 6] = [
+const BATCHED: [&str; 5] = [
     "q4e_gdn_conv_batch_kernel",
     "q4e_gdn_recurrent_batch_kernel",
     "q4e_qsa_store_kv_batch_kernel",
-    "q4e_qsa_attention_batch_kernel",
     "q4e_idx_store_k_batch_kernel",
     "q4e_ple_conv_batch_kernel",
 ];
@@ -521,7 +520,6 @@ fn a_batched_pass_binds_a_per_row_array_where_a_chunk_binds_one_sessions_buffer(
         ),
         ("q4e_ple_conv_batch_kernel", 1, Operand::NgramWindows),
         ("q4e_qsa_store_kv_batch_kernel", 14, Operand::PageTables),
-        ("q4e_qsa_attention_batch_kernel", 8, Operand::PageTables),
         ("q4e_idx_store_k_batch_kernel", 3, Operand::PageTables),
     ] {
         let step = pass
@@ -545,6 +543,20 @@ fn a_batched_pass_binds_a_per_row_array_where_a_chunk_binds_one_sessions_buffer(
         .collect::<Vec<_>>();
     assert_eq!(pooled[0], Operand::PagesOf(0));
     assert_eq!(pooled[1], Operand::PagesOf(1));
+
+    // The attention is the single-row kernel, once per row, over that row's
+    // own page table: a row of a batch attends exactly as a single-row step
+    // of its sequence does.
+    let attended = pass
+        .plan
+        .steps()
+        .iter()
+        .filter(|step| step.name() == "q4e_qsa_attention_split_kernel")
+        .map(|step| step.operands().expect("the list fits a launch")[8])
+        .collect::<Vec<_>>();
+    assert_eq!(attended.len(), 2 * fixture::ATTN_SLOTS);
+    assert_eq!(attended[0], Operand::PagesOf(0));
+    assert_eq!(attended[1], Operand::PagesOf(1));
 }
 
 #[test]
@@ -645,45 +657,34 @@ fn the_vocabulary_projection_reads_the_chunks_last_rows_and_not_its_first() {
     );
 }
 
-/// A decode step's routed block is two grouped launches, not the fused one.
+/// Every target pass takes the weight-stationary launches, whatever its width.
 ///
-/// The fused kernel's grid is the device's, not the token's: on a forty-eight
-/// block device it is six groups of eight, so ten routed experts go round
-/// twice. The grouped form gives every slot its own group and streams all ten
-/// at once - and because a slot names its matrix directly, it needs none of the
-/// expert-sorted column map either.
+/// A single decode step, a verify pass's width and a prefill chunk all route
+/// through the same kernels, because a row's arithmetic there does not depend
+/// on how many rows share the pass - which is what keeps a plain step, a
+/// verify and a decode batch answering alike. The grouped launches reduce in
+/// another order, so a target pass that took them at one width and not at
+/// another would drift between plain and speculative decoding.
 #[test]
-fn one_rows_routed_experts_run_grouped_and_skip_the_sort_the_fused_launch_needs() {
+fn every_target_pass_width_routes_its_experts_weight_stationary() {
     let (_dir, _fake, mut model) = loaded();
     let session = model.open_session().expect("a session opens");
-
-    let one = model
-        .plan_chunk(session, &tokens(0, 1), 1)
-        .expect("a one-token chunk plans");
-    assert_eq!(one.plan.count("q4e_moe_route_kernel"), N_LAYERS as usize);
-    assert_eq!(one.plan.count("trellis experts"), 0);
-    assert_eq!(one.plan.count("trellis fan-out"), N_LAYERS as usize);
-    for entry in [
-        "q4e_moe_sort_count_kernel",
-        "q4e_moe_sort_scan_kernel",
-        "q4e_moe_sort_scatter_kernel",
-    ] {
+    for rows in [1, 4, 40] {
+        let pass = model
+            .plan_chunk(session, &tokens(0, rows), 1)
+            .expect("the chunk plans");
+        assert_eq!(pass.plan.count("q4e_moe_route_kernel"), N_LAYERS as usize);
         assert_eq!(
-            one.plan.count(entry),
-            0,
-            "{entry} is dispatched for a row whose experts name themselves"
+            pass.plan.count("exl3_moe_ws_gateup"),
+            N_LAYERS as usize,
+            "{rows} rows"
+        );
+        assert_eq!(pass.plan.count("trellis fan-out"), 0, "{rows} rows");
+        assert_eq!(pass.plan.count("trellis experts"), 0, "{rows} rows");
+        assert_eq!(
+            pass.plan.count("q4e_moe_sort_scan_kernel"),
+            N_LAYERS as usize,
+            "{rows} rows"
         );
     }
-
-    // Anything wider goes back to the fused launch, which reads each expert's
-    // weights once per chunk rather than once per column.
-    let four = model
-        .plan_chunk(session, &tokens(0, 4), 1)
-        .expect("a four-token chunk plans");
-    assert_eq!(four.plan.count("trellis experts"), N_LAYERS as usize);
-    assert_eq!(four.plan.count("trellis fan-out"), 0);
-    assert_eq!(
-        four.plan.count("q4e_moe_sort_scan_kernel"),
-        N_LAYERS as usize
-    );
 }

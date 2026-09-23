@@ -19,7 +19,7 @@ use shiso_core::Extent3;
 
 use super::{
     CuBlas, CuBlasLt, CuContext, CuDevice, CuFunction, CuGraph, CuGraphExec, CuModule, CuStream,
-    DevicePtr, GemmCall, GemmStride, SysError, SysResult,
+    DevicePtr, GemmCall, GemmStride, PinnedPtr, SysError, SysResult,
 };
 
 /// Initialises the driver.
@@ -85,6 +85,15 @@ pub(crate) fn multiprocessor_count(_device: CuDevice) -> SysResult<u32> {
     Err(SysError::no_driver("cuDeviceGetAttribute"))
 }
 
+/// Whether the device shares its memory with the host.
+///
+/// # Errors
+///
+/// Always, on this target.
+pub(crate) fn integrated(_device: CuDevice) -> SysResult<bool> {
+    Err(SysError::no_driver("cuDeviceGetAttribute"))
+}
+
 /// Opens a stream.
 ///
 /// # Errors
@@ -129,6 +138,15 @@ pub(crate) fn mem_alloc(_bytes: u64) -> SysResult<DevicePtr> {
     Err(SysError::no_driver("cuMemAlloc"))
 }
 
+/// The current context's free and total device memory, in bytes.
+///
+/// # Errors
+///
+/// Always, on this target.
+pub(crate) fn mem_get_info() -> SysResult<(u64, u64)> {
+    Err(SysError::no_driver("cuMemGetInfo"))
+}
+
 /// Releases device memory.
 ///
 /// # Safety
@@ -153,6 +171,51 @@ pub(crate) unsafe fn mem_free(_ptr: DevicePtr) -> SysResult<()> {
 ///
 /// Always, on this target.
 pub(crate) unsafe fn memcpy_htod(_dst: DevicePtr, _src: &[u8], _stream: CuStream) -> SysResult<()> {
+    Err(SysError::no_driver("cuMemcpyHtoDAsync"))
+}
+
+/// Asks the kernel to start reading `bytes` in. A no-op on this target.
+pub(crate) const fn advise_willneed(_bytes: &[u8]) {}
+
+/// Reserves page-locked host memory.
+///
+/// # Errors
+///
+/// Always, on this target.
+pub(crate) fn mem_host_alloc(_bytes: u64) -> SysResult<PinnedPtr> {
+    Err(SysError::no_driver("cuMemAllocHost"))
+}
+
+/// Releases page-locked host memory.
+///
+/// # Safety
+///
+/// `ptr` must be the exact address [`mem_host_alloc`] returned, must not
+/// already have been freed, and no queued copy may still be reading it.
+///
+/// # Errors
+///
+/// Always, on this target.
+pub(crate) unsafe fn mem_host_free(_ptr: PinnedPtr) -> SysResult<()> {
+    Err(SysError::no_driver("cuMemFreeHost"))
+}
+
+/// Queues a copy of page-locked host memory into device memory.
+///
+/// # Safety
+///
+/// Both ranges must lie inside live allocations, and neither may be freed or
+/// written until `stream` has been synchronised.
+///
+/// # Errors
+///
+/// Always, on this target.
+pub(crate) unsafe fn memcpy_htod_pinned(
+    _dst: DevicePtr,
+    _src: PinnedPtr,
+    _len: usize,
+    _stream: CuStream,
+) -> SysResult<()> {
     Err(SysError::no_driver("cuMemcpyHtoDAsync"))
 }
 

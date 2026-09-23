@@ -138,6 +138,9 @@ fn layout(rows: u32) -> Layout {
         rows,
         slots: u32::try_from(RECURRENT_SLOTS).expect("the slot count fits"),
         ngram: true,
+        // The record arrays come after every array read here, so whether the
+        // fixture's sessions carry them moves none of these spans.
+        rollback: false,
     }
 }
 
@@ -460,7 +463,10 @@ fn the_layout_the_pack_is_sized_at_and_the_one_it_is_written_at_agree() {
     // sessions rather than a shape, so their half asks the sessions. They agree
     // by construction - a session allocates one state pair per recurrent slot
     // the geometry names, and an n-gram window exactly when the geometry folds
-    // one in - and this is the test that keeps "by construction" true.
+    // one in - and this is the test that keeps "by construction" true. The
+    // one field they may differ in is the rollback records: the geometry
+    // cannot know whether a session will be opened for speculation, so it
+    // sizes for them, and these sessions were not.
     let (_dir, _backend, mut model) = loaded();
     let sessions = open_rows(&mut model, 4);
     let stack = model.stack();
@@ -470,7 +476,15 @@ fn the_layout_the_pack_is_sized_at_and_the_one_it_is_written_at_agree() {
         .collect::<Vec<_>>();
     let from_rows = Layout::of_rows(&live);
     let from_shape = Layout::of(&fixture::tiny_shape(), from_rows.rows);
-    assert_eq!(from_rows, from_shape);
+    assert!(from_shape.rollback && !from_rows.rollback);
+    assert_eq!(
+        from_rows,
+        Layout {
+            rollback: false,
+            ..from_shape
+        }
+    );
+    assert!(from_shape.bytes() >= from_rows.bytes());
     assert_eq!(from_rows.rows, 4);
     assert_eq!(
         from_rows.slots,

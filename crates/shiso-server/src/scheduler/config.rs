@@ -25,12 +25,15 @@ pub const DEFAULT_MAX_QUEUED: usize = 256;
 /// Prompt tokens one prefill quantum covers while decodes are also running.
 pub const DEFAULT_MIXED_QUANTUM: usize = 128;
 /// Prompt tokens one prefill chunk covers when nothing else is running.
-pub const DEFAULT_SOLO_CHUNK: usize = 2048;
+///
+/// As wide as the widest pass a stack takes, because a stack splits a wider
+/// chunk itself and a narrower one only costs passes: the sparse family reads
+/// every routed expert's weights once per pass, and measured on a GB10 its
+/// prefill ran 1580 tok/s at 8192-token chunks against 1000 at 2048.
+pub const DEFAULT_SOLO_CHUNK: usize = 8192;
 /// How long a caller may block inside the queue before being refused.
 pub const DEFAULT_QUEUE_ADMISSION_MS: u64 = 250;
 
-/// The environment knob for the resident bound.
-const MAX_NUM_SEQS_ENV: &str = "SHISO_MAX_NUM_SEQS";
 /// The environment knob for the waiting bound.
 const MAX_QUEUED_ENV: &str = "SHISO_MAX_QUEUED";
 /// The environment knob for the shared prefill quantum.
@@ -284,7 +287,9 @@ impl SchedulerConfig {
         let default = Self::new();
         let timeout_ms = env_u64(REQUEST_TIMEOUT_ENV, 0);
         Self {
-            max_num_seqs: env_count(MAX_NUM_SEQS_ENV, default.max_num_seqs),
+            // `--max-num-seqs` (and its `SHISO_MAX_NUM_SEQS`) is a flag, set
+            // over this by the binary: the KV pool is sized from the same count.
+            max_num_seqs: default.max_num_seqs,
             max_queued: env_count(MAX_QUEUED_ENV, default.max_queued),
             mixed_quantum: env_count(MIXED_QUANTUM_ENV, default.mixed_quantum),
             solo_chunk: env_count(SOLO_CHUNK_ENV, default.solo_chunk),

@@ -293,6 +293,38 @@ fn upload_decode_rows(
     )
 }
 
+/// What one pool page and one session of this stack cost on the device.
+///
+/// A family that drafts binds its head after the stack is built, with a pool
+/// of the same page count, so a speculative stack counts one more attention
+/// layer's key and value runs per page for it: the head is one layer.
+fn pool_cost(
+    shape: &HybridShape,
+    layout: &kv::KvLayout,
+    cache: &shiso_kvstore::CacheGeometry,
+    opts: EngineOptions,
+) -> crate::options::PoolCost {
+    let head = if opts.spec.is_speculative() {
+        layout
+            .run_bytes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(kv::RUNS_PER_LAYER)
+    } else {
+        0
+    };
+    let records = u64::from(opts.spec.rollback_slots());
+    let recurrent = u64::from(shape.count(LayerKind::Gdn))
+        .saturating_mul(kv::conv_state_bytes(shape).saturating_add(kv::state_bytes(shape)));
+    crate::options::PoolCost {
+        page_bytes: layout.page_bytes().saturating_add(head),
+        session_bytes: recurrent.saturating_mul(records.saturating_add(1)),
+        fixed_bytes: u64::from(opts.kv_ckpt_slots).saturating_mul(cache.ckpt_bytes),
+    }
+}
+
 impl HybridStack {
     /// Builds a stack over weights that are already on the device.
     ///
@@ -376,21 +408,26 @@ impl HybridStack {
         let geometry = Geometry::new(&shape, embed)?;
         validate_ple(&geometry, ple.as_ref())?;
         let recurrent_slots = usize::try_from(shape.count(LayerKind::Gdn)).unwrap_or(0);
-        let kv = DeviceKv::open(
-            backend,
-            &kv::KvLayout::from_shape(&shape),
-            opts.kv_pool_pages,
+        let scratch = Scratch::new(backend, &geometry, MAX_PREFILL_CHUNK, MAX_DECODE_BATCH)?;
+        let rows = RowPages::new(backend, opts.ctx, MAX_DECODE_BATCH)?;
+        // The pool after the scratch, so that a pool sized to the device is
+        // sized from what the weights and the scratch left of it.
+        let mut opts = opts;
+        let layout = kv::KvLayout::from_shape(&shape);
+        let cache_geometry = kv::geometry(&shape);
+        opts.fit_pool(
+            backend.as_ref(),
+            pool_cost(&shape, &layout, &cache_geometry, opts),
         )?;
+        let kv = DeviceKv::open(backend, &layout, opts.kv_pool_pages)?;
         let cache = KvCache::open(
-            &kv::geometry(&shape),
+            &cache_geometry,
             Box::new(kv.clone()),
             opts.kv_pool_pages,
             opts.kv_ckpt_slots,
             None,
         )
         .map_err(cache_failure)?;
-        let scratch = Scratch::new(backend, &geometry, MAX_PREFILL_CHUNK, MAX_DECODE_BATCH)?;
-        let rows = RowPages::new(backend, opts.ctx, MAX_DECODE_BATCH)?;
         tracing::info!(
             layers = shape.n_layers(),
             recurrent = recurrent_slots,
@@ -1306,6 +1343,16 @@ impl HybridStack {
     #[must_use]
     pub const fn context_capacity(&self) -> u32 {
         self.opts.ctx
+    }
+
+    /// Pages the KV pool was allocated with.
+    ///
+    /// The count a draft head bound to this stack sizes its own pool by. It is
+    /// the resolved one, which differs from the options the stack was built
+    /// with when those asked for a share of the device.
+    #[must_use]
+    pub const fn pool_pages(&self) -> u32 {
+        self.opts.kv_pool_pages
     }
 
     /// What the cache currently holds: pages, checkpoint slots, and the disk tier

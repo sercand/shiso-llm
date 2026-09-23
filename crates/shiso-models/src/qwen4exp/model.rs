@@ -578,15 +578,29 @@ fn weight(
     let out_dim = extent(dims.get(1).copied().unwrap_or(1))?;
     let slots = extent(dims.get(2).copied().unwrap_or(1))?;
     let range = range_of(file, view)?;
-    Weight::import(
+    let weight = Weight::import(
         backend,
         view.dtype,
         in_dim,
         out_dim,
         slots,
         file.mapping(),
-        range,
-    )
+        range.clone(),
+    )?;
+    release(backend, file, range);
+    Ok(weight)
+}
+
+/// Hands an imported tensor's file pages back to the kernel, where the device
+/// copied them.
+///
+/// The checkpoint is 105 GB and its weights 62; kept cached beside the device's
+/// copies, the file's pages are what the next allocation has to reclaim, which
+/// measured on a GB10 as 17 s of a 48 s load spent inside the allocator.
+fn release(backend: &Arc<dyn Backend>, file: &GgufFile, range: std::ops::Range<usize>) {
+    if backend.imports_copy() {
+        file.release_cached(range);
+    }
 }
 
 /// Imports one weight vector, which every format stores as plain `f32`.
@@ -602,7 +616,9 @@ fn vector(
         });
     }
     let range = range_of(file, view)?;
-    import_host(backend, file.mapping(), range)
+    let buffer = import_host(backend, file.mapping(), range.clone())?;
+    release(backend, file, range);
+    Ok(buffer)
 }
 
 /// The file range one bound tensor occupies.
@@ -708,6 +724,14 @@ impl Speculating for Qwen4ExpModel {
     fn speculate(&mut self, session: SessionId, first: TokenId) -> CoreResult<Speculated> {
         let eos = self.info.stop_tokens.primary();
         self.stack.speculate(session, first, eos)
+    }
+
+    fn speculate_batch(&mut self, steps: &[(SessionId, TokenId)]) -> CoreResult<Vec<Speculated>> {
+        let eos = self.info.stop_tokens.primary();
+        match steps {
+            [(session, first)] => Ok(vec![self.stack.speculate(*session, *first, eos)?]),
+            _ => self.stack.speculate_batch(steps, eos),
+        }
     }
 }
 

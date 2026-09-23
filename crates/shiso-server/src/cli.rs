@@ -34,6 +34,13 @@ pub const DEFAULT_KVSTORE_BUDGET_MB: u64 = 4096;
 pub const DEFAULT_VISION_MAX_PIXELS: usize = 1280 * 1280;
 /// The default row-cache budget for a per-layer embedding table, in mebibytes.
 pub const DEFAULT_PLE_CACHE_MB: u64 = 512;
+/// Bytes a `--gpu-memory-utilization` pool leaves for what is allocated after
+/// the model is built and is not otherwise counted: the math libraries'
+/// workspaces, captured decode graphs, allocator granularity.
+///
+/// A margin, not a measurement: an undercount here is a failed allocation
+/// under load, and 2 GiB is a small price against a pool of tens.
+pub const KV_FIT_HEADROOM_BYTES: u64 = 2 << 30;
 
 /// `shiso`, the inference server.
 #[derive(Debug, clap::Parser)]
@@ -105,6 +112,34 @@ pub struct ServeArgs {
     /// Tokens one session may hold, prompt included.
     #[arg(short = 'c', long, env = "SHISO_CTX", default_value_t = DEFAULT_CTX)]
     pub ctx: u32,
+    /// Sequences that may be resident at once.
+    ///
+    /// Also the sessions whose state a `--gpu-memory-utilization` pool sets
+    /// aside before it takes the rest. More than one decode pass carries are
+    /// decoded in several passes a step.
+    #[arg(long, env = "SHISO_MAX_NUM_SEQS", default_value_t = crate::scheduler::DEFAULT_MAX_NUM_SEQS)]
+    pub max_num_seqs: usize,
+    /// Tokens the KV cache holds, shared by every session.
+    ///
+    /// The pool is allocated whole at load, so this is device memory spent up
+    /// front: `--ctx` caps one session, and this caps all of them together.
+    /// Unset, and without `--gpu-memory-utilization`, the pool holds 131072.
+    #[arg(
+        long,
+        env = "SHISO_KV_CACHE_TOKENS",
+        conflicts_with = "gpu_memory_utilization"
+    )]
+    pub kv_cache_tokens: Option<u64>,
+    /// Share of the device's memory this process may fill, in (0, 1]; the KV
+    /// cache gets whatever of it the weights, the scratch and the sessions'
+    /// state leave.
+    ///
+    /// Counted against the device's total and against everything already on
+    /// it, other processes included - which on a device that shares memory with
+    /// its host is the rest of the machine. A share that leaves less than one
+    /// `--ctx` context refuses to start, with the numbers.
+    #[arg(long, env = "SHISO_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: Option<f64>,
     /// Directory for the cache's disk tier. Unset means nothing is persisted.
     #[arg(long, env = "SHISO_KVSTORE_DIR")]
     pub kvstore_dir: Option<PathBuf>,
@@ -253,6 +288,28 @@ pub enum ConfigError {
         /// The path as it was given.
         path: String,
     },
+    /// A share that is not in `(0, 1]`.
+    #[error("--{flag} {value} is not a share in (0, 1]")]
+    NotAShare {
+        /// The flag, spelled as it is typed.
+        flag: &'static str,
+        /// The value as it was given.
+        value: f64,
+    },
+    /// A KV pool that cannot hold one full context.
+    #[error("--kv-cache-tokens {tokens} cannot serve --ctx {ctx}: it must be at least --ctx")]
+    PoolBelowContext {
+        /// The pool as it was given.
+        tokens: u64,
+        /// The context one session may reach.
+        ctx: u32,
+    },
+    /// A KV pool of more pages than a pool can count.
+    #[error("--kv-cache-tokens {tokens} is more than a pool can count")]
+    PoolTooLarge {
+        /// The pool as it was given.
+        tokens: u64,
+    },
     /// One of the two settings speculation needs was given without the other.
     #[error("--{given} without --{missing}: speculation needs a draft head and a depth")]
     HalfSpeculative {
@@ -293,6 +350,20 @@ impl ServeArgs {
                 flag: "vision-max-pixels",
             });
         }
+        if self.max_num_seqs == 0 {
+            return Err(ConfigError::Zero {
+                flag: "max-num-seqs",
+            });
+        }
+        self.kv_pool_pages()?;
+        if let Some(value) = self.gpu_memory_utilization
+            && !(value > 0.0 && value <= 1.0)
+        {
+            return Err(ConfigError::NotAShare {
+                flag: "gpu-memory-utilization",
+                value,
+            });
+        }
         // A path with no last component cannot name a model, and a server whose
         // model list is empty answers every request with "no such model". The
         // explicit name is the escape hatch: an operator who supplied one has
@@ -323,6 +394,63 @@ impl ServeArgs {
             });
         }
         Ok(())
+    }
+
+    /// The pool `--kv-cache-tokens` asks for, in pages; `None` when it was not
+    /// given.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::PoolBelowContext`] for a pool that cannot hold one
+    /// `--ctx` context - it would evict the span a session is standing on -
+    /// and [`ConfigError::PoolTooLarge`] for more pages than a pool counts.
+    pub fn kv_pool_pages(&self) -> Result<Option<u32>, ConfigError> {
+        let Some(tokens) = self.kv_cache_tokens else {
+            return Ok(None);
+        };
+        if tokens < u64::from(self.ctx) {
+            return Err(ConfigError::PoolBelowContext {
+                tokens,
+                ctx: self.ctx,
+            });
+        }
+        let pages = tokens.div_ceil(u64::from(shiso_core::page::PAGE_TOKENS));
+        u32::try_from(pages)
+            .map(Some)
+            .map_err(|_| ConfigError::PoolTooLarge { tokens })
+    }
+
+    /// The share of the device `--gpu-memory-utilization` sizes the pool to,
+    /// with the sessions and the late allocations it sets aside; `None` when it
+    /// was not given.
+    ///
+    /// The reserve is the vision tower, when `--vision` names a file - it is
+    /// loaded after the model, so the stack cannot see it - and
+    /// [`KV_FIT_HEADROOM_BYTES`]. A tower that lives inside a checkpoint
+    /// directory is not counted beyond the headroom.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`shiso_engine::KvFit::new`] reports for a share outside
+    /// `(0, 1]` or no sessions, which [`ServeArgs::validate`] has already
+    /// refused by flag name.
+    pub fn kv_fit(&self) -> shiso_core::CoreResult<Option<shiso_engine::KvFit>> {
+        let Some(fraction) = self.gpu_memory_utilization else {
+            return Ok(None);
+        };
+        let tower = self
+            .vision
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .filter(std::fs::Metadata::is_file)
+            .map_or(0, |meta| meta.len());
+        let sessions = u32::try_from(self.max_num_seqs).unwrap_or(u32::MAX);
+        shiso_engine::KvFit::new(
+            fraction,
+            sessions,
+            tower.saturating_add(KV_FIT_HEADROOM_BYTES),
+        )
+        .map(Some)
     }
 
     /// The name this checkpoint answers to on the wire.

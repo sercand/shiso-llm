@@ -41,7 +41,7 @@
 use shiso_core::DType;
 use shiso_core::error::{CoreError, CoreResult};
 
-use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
+use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef, WeightSet};
 use crate::sparse::exl3::{self, Fanout};
 use crate::sparse::kernels::{self, Entry, MOD_EXL3, MOD_MOE, TemplateArgs};
 use crate::sparse::matmul::{self, Bound, Device};
@@ -84,6 +84,98 @@ pub enum RowOrigin {
     /// One row per sequence, from sequences that have nothing to do with each
     /// other.
     Unrelated,
+    /// Several sequences' runs of consecutive positions, one run each, in the
+    /// order of the pass's sessions: a speculative verify for a batch of
+    /// sequences, which reads the weights once for all of them.
+    ///
+    /// Every launch that carries a sequence's state runs once per run, as the
+    /// scalar kernel over that run's rows and that sequence's state - which is
+    /// what makes each run's rows the arithmetic its own verify pass would do.
+    Segmented(Segments),
+}
+
+/// The runs of a segmented pass: how many consecutive rows each session has,
+/// in pass order.
+///
+/// A fixed array rather than a vector so the origin stays `Copy`: at most one
+/// run per decode-batch row, each at most a verify's width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Segments {
+    lens: [u8; crate::sparse::stack::MAX_DECODE_BATCH as usize],
+    count: u8,
+}
+
+impl Segments {
+    /// The runs, in pass order.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] for no runs, more runs than a decode batch
+    /// holds, an empty run, or one wider than a byte counts.
+    pub fn new(lens: &[u32]) -> CoreResult<Self> {
+        let mut out = Self::default();
+        if lens.is_empty() || lens.len() > out.lens.len() {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented pass runs",
+                expected: out.lens.len() as u64,
+                got: lens.len() as u64,
+            });
+        }
+        for (slot, len) in out.lens.iter_mut().zip(lens) {
+            *slot =
+                u8::try_from(*len)
+                    .ok()
+                    .filter(|len| *len > 0)
+                    .ok_or(CoreError::ShapeMismatch {
+                        field: "segmented pass run rows",
+                        expected: u64::from(u8::MAX),
+                        got: u64::from(*len),
+                    })?;
+        }
+        out.count = u8::try_from(lens.len()).unwrap_or(u8::MAX);
+        Ok(out)
+    }
+
+    /// Runs in the pass.
+    #[must_use]
+    pub const fn count(&self) -> u32 {
+        self.count as u32
+    }
+
+    /// Rows run `run` covers.
+    #[must_use]
+    pub fn len(&self, run: u32) -> u32 {
+        self.lens.get(run as usize).map_or(0, |len| u32::from(*len))
+    }
+
+    /// The pass row run `run` starts at.
+    #[must_use]
+    pub fn start(&self, run: u32) -> u32 {
+        (0..run).map(|earlier| self.len(earlier)).sum()
+    }
+
+    /// Rows in the whole pass.
+    #[must_use]
+    pub fn rows(&self) -> u32 {
+        self.start(self.count())
+    }
+
+    /// The run lengths as the segmented kernels take them: one byte per run,
+    /// run 0 in the low byte.
+    ///
+    /// By value, because a pass is at most eight runs of at most a byte's rows
+    /// each - which [`Segments::new`] enforces - so the table fits one kernel
+    /// argument and needs no buffer the host fills before every pass.
+    #[must_use]
+    pub fn packed_lens(&self) -> u64 {
+        self.lens
+            .iter()
+            .take(self.count as usize)
+            .enumerate()
+            .fold(0, |packed, (run, len)| {
+                packed | (u64::from(*len) << (8 * run))
+            })
+    }
 }
 
 impl RowOrigin {
@@ -92,7 +184,7 @@ impl RowOrigin {
     pub const fn groups(self, n_tok: u32) -> bool {
         match self {
             Self::Sequential => n_tok >= GROUP_MIN_ROWS,
-            Self::Unrelated => n_tok >= GROUP_MIN_UNRELATED_ROWS,
+            Self::Unrelated | Self::Segmented(_) => n_tok >= GROUP_MIN_UNRELATED_ROWS,
         }
     }
 }
@@ -311,6 +403,172 @@ pub fn fused_experts(
     Ok(plan)
 }
 
+/// Rows up to which a target layer's routed block takes the grouped launches.
+///
+/// None do. Every target pass - a decode step, a verify pass, a decode batch
+/// and a prefill chunk - takes the weight-stationary launches, whose per-row
+/// arithmetic does not depend on how many rows share the pass: an m16 MMA row
+/// accumulates over K in the same order whatever the other fifteen hold. So a
+/// token decodes to the same logits alone, speculatively, or beside other
+/// sequences. The grouped launches reduce in another order, and a plain step
+/// through them drifts from a verify pass through these within a few hundred
+/// tokens of greedy text (measured). What that costs is the plain single-row
+/// step: 25.4 tok/s here against 29.2 grouped, on a GB10.
+pub const GROUPED_MAX_ROWS: u32 = 0;
+
+/// Rows up to which the draft head's routed block takes the grouped launches.
+///
+/// A draft's logits are a guess the target verifies, so no answer depends on
+/// its bits and it keeps the faster single-row launches.
+pub const DRAFT_GROUPED_MAX_ROWS: u32 = 1;
+
+/// Rows up to which a weight set's routed block takes the grouped launches.
+#[must_use]
+pub const fn grouped_max(set: WeightSet) -> u32 {
+    match set {
+        WeightSet::Target => GROUPED_MAX_ROWS,
+        WeightSet::Draft => DRAFT_GROUPED_MAX_ROWS,
+    }
+}
+
+/// Rows from which the routed block takes the weight-stationary launches.
+///
+/// The same line the reference draws. Below it a chunk is a verify pass of two
+/// or three rows, where the cooperative launch is already bound by the
+/// weights it streams.
+pub const WS_MIN_ROWS: u32 = 4;
+
+/// The experts' own stage for a prefill chunk: three ordinary launches.
+///
+/// The fused cooperative launch streams every expert's weights once per 16 of
+/// that expert's rows and pays a grid barrier between its phases. Here a block
+/// owns one (expert, 128-column tile), decodes each weight tile once and
+/// multiplies it against all of that expert's rows in 64-row passes. Measured
+/// on this checkpoint at a 2048-row chunk on a GB10: 28 ms a layer fused
+/// against 9.4 ms here; the chunk's result is the same up to the order of the
+/// multiply-adds (relative L2 5e-5).
+///
+/// The launches are `prep` (each routed column's row, scaled and
+/// Hadamard-transformed for gate and up, in expert order), `gateup` (both
+/// projections, the activation, and the down projection's input transform as
+/// the epilogue) and `down`, which stores each assignment's unweighted output
+/// at its own slot - the layout [`combine`] sums in a fixed order, exactly as
+/// it does for the fused launch.
+///
+/// # Errors
+///
+/// Whatever [`exl3::check_shape`] reports, and [`CoreError::ShapeMismatch`]
+/// for widths the 128-column tiles and the 64-wide stages do not divide.
+pub fn ws_experts(shape: &SparseShape, layer: LayerRef, bits: u32, n_tok: u32) -> CoreResult<Plan> {
+    let hidden = shape.hidden;
+    let inter = shape.moe.intermediate;
+    exl3::check_shape(hidden, inter, bits)?;
+    let tile = kernels::EXL3_MOE_WS_TILE_N;
+    if !hidden.is_multiple_of(tile) || !inter.is_multiple_of(tile) {
+        return Err(CoreError::ShapeMismatch {
+            field: "weight-stationary expert tile",
+            expected: u64::from(tile),
+            got: u64::from(if hidden.is_multiple_of(tile) {
+                inter
+            } else {
+                hidden
+            }),
+        });
+    }
+    let at = |role: Role, span| Operand::Weight(WeightRef::layer(layer, role).spanning(span));
+    let width = |value: u32| Operand::I32(i32::try_from(value).unwrap_or(i32::MAX));
+    let threads = kernels::EXL3_MOE_WS_THREADS;
+    let rows = n_tok.saturating_mul(shape.moe.used);
+    let experts = shape.moe.experts;
+    let bits_key = TemplateArgs::TrellisBits(bits);
+    let mut plan = Plan::new();
+    // The sort's inverse, then one warp per (token, 128 columns of the input),
+    // which reads each token once and writes every expert row it routed to.
+    plan.launch(
+        Entry::template(
+            MOD_EXL3,
+            kernels::EXL3_MOE_WS_INVERT,
+            TemplateArgs::Untemplated,
+        ),
+        kernels::Launch::linear(
+            kernels::blocks_for(u64::from(rows), u64::from(threads)),
+            threads,
+        ),
+        // `pos, slot_sorted, n_rows`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeWsPos),
+            Operand::Scratch(Buf::MoeSorted),
+            width(rows),
+        ]),
+    );
+    let warps = u64::from(n_tok) * u64::from(hidden / tile);
+    plan.launch(
+        Entry::template(
+            MOD_EXL3,
+            kernels::EXL3_MOE_WS_PREP_TOK,
+            TemplateArgs::Untemplated,
+        ),
+        kernels::Launch::linear(kernels::blocks_for(warps, u64::from(threads / 32)), threads),
+        // `x, a_g, a_u, suh_g, suh_u, ids, pos, n_tok, n_used, k`
+        Args::of(&[
+            Operand::Scratch(Buf::Mixed),
+            Operand::Scratch(Buf::MoeWsGate),
+            Operand::Scratch(Buf::MoeWsUp),
+            at(Role::ExpertGate, WeightPart::InputScales),
+            at(Role::ExpertUp, WeightPart::InputScales),
+            Operand::Scratch(Buf::MoeIds),
+            Operand::Scratch(Buf::MoeWsPos),
+            width(n_tok),
+            width(shape.moe.used),
+            width(hidden),
+        ]),
+    );
+    plan.launch(
+        Entry::template(MOD_EXL3, kernels::EXL3_MOE_WS_GATEUP, bits_key),
+        kernels::Launch::new(
+            shiso_core::Extent3::linear(experts.saturating_mul(inter / tile)),
+            threads,
+            kernels::exl3_moe_ws_smem(bits, true),
+        ),
+        // `a_g, a_u, act, gate_trellis, gate_svh, up_trellis, up_svh,
+        //  down_suh, bounds, hidden, inter`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeWsGate),
+            Operand::Scratch(Buf::MoeWsUp),
+            Operand::Scratch(Buf::MoeWsAct),
+            at(Role::ExpertGate, WeightPart::Tiles),
+            at(Role::ExpertGate, WeightPart::OutputScales),
+            at(Role::ExpertUp, WeightPart::Tiles),
+            at(Role::ExpertUp, WeightPart::OutputScales),
+            at(Role::ExpertDown, WeightPart::InputScales),
+            Operand::Scratch(Buf::MoeBounds),
+            width(hidden),
+            width(inter),
+        ]),
+    );
+    plan.launch(
+        Entry::template(MOD_EXL3, kernels::EXL3_MOE_WS_DOWN_H, bits_key),
+        kernels::Launch::new(
+            shiso_core::Extent3::linear(experts.saturating_mul(hidden / tile)),
+            threads,
+            kernels::exl3_moe_ws_smem(bits, false),
+        ),
+        // `act, slot_out, down_trellis, down_svh, bounds, slot_sorted, hidden,
+        //  inter`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeWsAct),
+            Operand::Scratch(Buf::MoeDown),
+            at(Role::ExpertDown, WeightPart::Tiles),
+            at(Role::ExpertDown, WeightPart::OutputScales),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeSorted),
+            width(hidden),
+            width(inter),
+        ]),
+    );
+    Ok(plan)
+}
+
 /// Rows from which the routed block takes the fused launch.
 ///
 /// Below it - which is a decode step and nothing else - the block runs as two
@@ -351,15 +609,23 @@ pub const FUSED_MIN_ROWS: u32 = 2;
 /// [`CoreError::Unsupported`] when no built tiling shape divides the expert
 /// weights, and whatever [`exl3::check_shape`] reports for a weight the codec
 /// cannot tile at all.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one statement per kernel argument is the point: these bodies are \
+              transcriptions of parameter lists, and a split that broke a list \
+              across two functions would hide the order being transcribed"
+)]
 pub fn grouped_experts(
     shape: &SparseShape,
     layer: LayerRef,
     bits: u32,
+    n_tok: u32,
     device: Device,
 ) -> CoreResult<Plan> {
     let hidden = shape.hidden;
     let inter = shape.moe.intermediate;
     let used = shape.moe.used;
+    let columns = used.saturating_mul(n_tok);
     exl3::check_shape(hidden, inter, bits)?;
     exl3::check_shape(inter, hidden, bits)?;
     let at = |role: Role, span| Operand::Weight(WeightRef::layer(layer, role).spanning(span));
@@ -370,16 +636,44 @@ pub fn grouped_experts(
     };
     let mut plan = Plan::new();
 
+    // A single row's slots all read that row. Several rows' slots each read
+    // their own token's row, replicated once per slot, because that is the one
+    // input layout the launch takes besides a shared one - and a replica is the
+    // same bytes, so a row's slot computes exactly what it would alone.
+    let input = if n_tok == 1 {
+        Operand::Scratch(Buf::Mixed)
+    } else {
+        let n = u64::from(columns) * u64::from(hidden);
+        plan.launch(
+            Entry::plain(MOD_MOE, "q4e_moe_rows_per_slot_kernel"),
+            kernels::elementwise(n),
+            // `out, x, in_dim, n_used, n`
+            Args::of(&[
+                Operand::Scratch(Buf::MoeRep),
+                Operand::Scratch(Buf::Mixed),
+                Operand::U32(hidden),
+                Operand::U32(used),
+                Operand::U64(n),
+            ]),
+        );
+        Operand::Scratch(Buf::MoeRep)
+    };
+
     // Gate and up share their input and their slot list, so they are one launch
     // over twice the slots: slot `j` past the split is the second tensor's slot
     // `j - split`, reading the same expert id and writing the other output.
-    let slots = used.saturating_mul(2);
+    //
+    // The tiling and the blocks per slot are the ones a single row's launch
+    // gets, whatever the row count, and the extra slots run in rounds: see
+    // [`exl3::mgemm_grid_rounds`].
+    let basis = used.saturating_mul(2);
+    let slots = columns.saturating_mul(2);
     let pair = Fanout::Grouped {
-        slots,
+        slots: basis,
         input_per_slot: false,
     };
     let tiling = exl3::select_shape(hidden, inter, bits, pair).ok_or_else(unsupported)?;
-    let grid = exl3::mgemm_grid(hidden, inter, tiling, slots, device.max_co_resident);
+    let grid = exl3::mgemm_grid_rounds(hidden, inter, tiling, slots, basis, device.max_co_resident);
     plan.push(Step::Trellis {
         op: TrellisOp::Pair,
         entry: matmul::trellis_entry(kernels::EXL3_MGEMM, bits, tiling),
@@ -397,7 +691,7 @@ pub fn grouped_experts(
         //  A_had, svh_base, B_indices, bszm_in, bszm_out, B_base2, suh_base2,
         //  svh_base2, C2, split`
         args: Args::of(&[
-            Operand::Scratch(Buf::Mixed),
+            input,
             at(Role::ExpertGate, WeightPart::Tiles),
             Operand::U64(exl3::expert_tile_stride(hidden, inter, bits)),
             Operand::Scratch(Buf::MoeGate),
@@ -409,13 +703,18 @@ pub fn grouped_experts(
             Operand::CoopStaging(0),
             at(Role::ExpertGate, WeightPart::OutputScales),
             Operand::Scratch(Buf::MoeIds),
-            Operand::I32(1),
+            // One input shared by every slot, or one per slot.
+            Operand::I32(if n_tok == 1 {
+                1
+            } else {
+                i32::try_from(columns).unwrap_or(i32::MAX)
+            }),
             width(slots),
             at(Role::ExpertUp, WeightPart::Tiles),
             at(Role::ExpertUp, WeightPart::InputScales),
             at(Role::ExpertUp, WeightPart::OutputScales),
             Operand::Scratch(Buf::MoeUp),
-            width(used),
+            width(columns),
         ]),
     });
 
@@ -424,7 +723,7 @@ pub fn grouped_experts(
         Operand::Scratch(Buf::MoeGate),
         Operand::Scratch(Buf::MoeUp),
         Operand::Scratch(Buf::MoeMid),
-        1,
+        n_tok,
     ));
 
     // The down projection is one tensor, and its slots do *not* share an input:
@@ -434,7 +733,8 @@ pub fn grouped_experts(
         input_per_slot: true,
     };
     let tiling = exl3::select_shape(inter, hidden, bits, down).ok_or_else(unsupported)?;
-    let grid = exl3::mgemm_grid(inter, hidden, tiling, used, device.max_co_resident);
+    let grid =
+        exl3::mgemm_grid_rounds(inter, hidden, tiling, columns, used, device.max_co_resident);
     plan.push(Step::Trellis {
         op: TrellisOp::Fanout,
         entry: matmul::trellis_entry(kernels::EXL3_MGEMM, bits, tiling),
@@ -444,7 +744,7 @@ pub fn grouped_experts(
         groups: grid.concurrency,
         block_dim: tiling.block_dim(),
         smem: kernels::EXL3_SMEM_MAX,
-        staging: exl3::Staging::hadamard(used, 1, inter),
+        staging: exl3::Staging::hadamard(columns, 1, inter),
         // The same argument block with no second tensor: the null base is what
         // makes the split unreachable, and the split is still the slot count so
         // that a read of it cannot address past the list.
@@ -461,13 +761,13 @@ pub fn grouped_experts(
             Operand::CoopStaging(0),
             at(Role::ExpertDown, WeightPart::OutputScales),
             Operand::Scratch(Buf::MoeIds),
-            width(used),
-            width(used),
+            width(columns),
+            width(columns),
             Operand::Null,
             Operand::Null,
             Operand::Null,
             Operand::Null,
-            width(used),
+            width(columns),
         ]),
     });
     Ok(plan)
@@ -575,6 +875,41 @@ pub fn down(
     Ok(plan)
 }
 
+/// The weighted sum of the weight-stationary block's half slot outputs, with
+/// the shared expert's gated contribution added in the same pass.
+///
+/// The shared expert's projections have to have run first: this reads their
+/// output and their gate logit, where [`shared`] adds them onto a combine that
+/// already happened.
+#[must_use]
+pub fn ws_combine(shape: &SparseShape, n_tok: u32) -> Plan {
+    let mut plan = Plan::new();
+    let columns = u64::from(shape.hidden / 4);
+    plan.launch(
+        Entry::template(
+            MOD_EXL3,
+            kernels::EXL3_MOE_WS_COMBINE,
+            TemplateArgs::Untemplated,
+        ),
+        kernels::Launch::new(
+            shiso_core::Extent3::new(kernels::blocks_for(columns, 256), n_tok, 1),
+            256,
+            0,
+        ),
+        // `out, slot_out, weights, shared, logit, n_embd, n_used`
+        Args::of(&[
+            Operand::Scratch(Buf::BlockOut),
+            Operand::Scratch(Buf::MoeDown),
+            Operand::Scratch(Buf::MoeWeights),
+            Operand::Scratch(Buf::SharedOut),
+            Operand::Scratch(Buf::SharedLogit),
+            Operand::I32(i32::try_from(shape.hidden).unwrap_or(i32::MAX)),
+            Operand::I32(i32::try_from(shape.moe.used).unwrap_or(i32::MAX)),
+        ]),
+    );
+    plan
+}
+
 /// The recombination of every column into one contribution per token.
 #[must_use]
 pub fn combine(shape: &SparseShape, n_tok: u32) -> Plan {
@@ -594,15 +929,13 @@ pub fn combine(shape: &SparseShape, n_tok: u32) -> Plan {
     plan
 }
 
-/// The shared expert: dense over every token, with a scalar gate of its own.
-///
-/// It runs after the routed contribution is already in place and adds onto it,
-/// which is why its last launch is an add rather than a write.
+/// The shared expert's projections: dense over every token, with a scalar gate
+/// of its own, into its output and its gate logit.
 ///
 /// # Errors
 ///
 /// Whatever [`matmul::project_pair`] and [`matmul::project`] report.
-pub fn shared(
+pub fn shared_projections(
     shape: &SparseShape,
     desc: &ExpertDesc,
     layer: LayerRef,
@@ -662,6 +995,22 @@ pub fn shared(
         n_tok,
         device,
     )?;
+    Ok(plan)
+}
+
+/// The shared expert, added onto the routed contribution already in place.
+///
+/// # Errors
+///
+/// Whatever [`shared_projections`] reports.
+pub fn shared(
+    shape: &SparseShape,
+    desc: &ExpertDesc,
+    layer: LayerRef,
+    n_tok: u32,
+    device: Device,
+) -> CoreResult<Plan> {
+    let mut plan = shared_projections(shape, desc, layer, n_tok, device)?;
     plan.launch(
         Entry::plain(MOD_MOE, "q4e_shared_add_kernel"),
         kernels::moe_combine(shape.hidden, n_tok),
@@ -697,11 +1046,17 @@ pub fn block(
         });
     };
     let mut plan = route(shape, desc, layer, n_tok, device)?;
-    if n_tok < FUSED_MIN_ROWS {
-        plan.append(grouped_experts(shape, layer, bits, device)?);
+    if n_tok <= grouped_max(layer.set) {
+        plan.append(grouped_experts(shape, layer, bits, n_tok, device)?);
     } else {
+        // The weight-stationary path writes its slot outputs as halves, and
+        // its combine adds the shared expert in the same pass, so the shared
+        // expert's projections run first.
         plan.append(sort(shape, n_tok));
-        plan.append(fused_experts(shape, layer, bits, n_tok, device)?);
+        plan.append(ws_experts(shape, layer, bits, n_tok)?);
+        plan.append(shared_projections(shape, desc, layer, n_tok, device)?);
+        plan.append(ws_combine(shape, n_tok));
+        return Ok(plan);
     }
     plan.append(combine(shape, n_tok));
     plan.append(shared(shape, desc, layer, n_tok, device)?);
@@ -711,6 +1066,14 @@ pub fn block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_draft_heads_single_row_takes_the_grouped_launches() {
+        // A target row must reduce in one order at every pass width; a draft's
+        // guess is verified, so its one row keeps the faster launches.
+        assert_eq!(grouped_max(WeightSet::Target), 0);
+        assert_eq!(grouped_max(WeightSet::Draft), 1);
+    }
 
     #[test]
     fn a_routed_column_is_one_token_and_one_expert_slot() {

@@ -20,6 +20,7 @@ sources = [
     "hc.cu",
     "moe.cu",
     "gdn.cu",
+    "gdn_tc.cu",
     "ple.cu",
     "matvec.cu",
     "qsa.cu",
@@ -61,6 +62,7 @@ arch = ["compute_80"]
 hc = "q4e_hc"
 moe = "q4e_moe"
 gdn = "q4e_gdn"
+gdn_tc = "q4e_gdn_tc"
 ple = "q4e_ple"
 matvec = "q4e_matvec"
 qsa = "q4e_qsa"

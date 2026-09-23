@@ -298,7 +298,7 @@ pub fn load_model(
     config: &HfConfig,
     args: &ServeArgs,
 ) -> Result<Loaded, FactoryError> {
-    let opts = engine_options(args);
+    let opts = engine_options(args)?;
     // Resolved once, from the same table every other caller reads, rather than
     // written out again per arm. Two copies of "what this family emits" drift,
     // and the copy that drifts is the one no running server reads: an arm that
@@ -350,7 +350,7 @@ pub fn load_model(
                 backend,
                 path,
                 &family,
-                dense_options(args),
+                dense_options(args)?,
                 head.as_ref(),
             )
             .map_err(FactoryError::Load)?;
@@ -521,7 +521,7 @@ fn load_qwen35moe(
         }
         let family = Qwen35MoeConfig::from_dir(path).map_err(FactoryError::Load)?;
         Box::new(
-            Qwen35MoeModel::load(backend, path, &family, dense_options(args))
+            Qwen35MoeModel::load(backend, path, &family, dense_options(args)?)
                 .map_err(FactoryError::Load)?,
         )
     } else {
@@ -548,7 +548,7 @@ fn load_qwen35moe(
             Qwen35MoeModel::load_gguf_with_draft(
                 backend,
                 path,
-                dense_options(args),
+                dense_options(args)?,
                 args.draft_model.as_deref(),
             )
             .map_err(FactoryError::Load)?,
@@ -574,17 +574,40 @@ fn load_qwen35moe(
 /// speculation, because it is what sizes the per-row rollback records on every
 /// session: a family with no draft head that took this field would allocate a
 /// state matrix per drafted row per recurrent slot for records nothing writes.
-fn engine_options(args: &ServeArgs) -> EngineOptions {
+///
+/// The pool is `--kv-cache-tokens` when given, and a share of the device the
+/// stack resolves once it is resident when `--gpu-memory-utilization` is; the
+/// two are exclusive on the command line.
+///
+/// # Errors
+///
+/// [`FactoryError::Load`] carrying [`CoreError::InvalidValue`] for a pool or a
+/// share [`ServeArgs::validate`] would have refused.
+fn engine_options(args: &ServeArgs) -> Result<EngineOptions, FactoryError> {
     let mut opts = EngineOptions::default();
     opts.ctx = args.ctx;
-    opts
+    let pages = args.kv_pool_pages().map_err(|error| {
+        FactoryError::Load(CoreError::InvalidValue {
+            key: "kv_cache_tokens",
+            value: error.to_string(),
+        })
+    })?;
+    if let Some(pages) = pages {
+        opts.kv_pool_pages = pages;
+    }
+    opts.kv_fit = args.kv_fit().map_err(FactoryError::Load)?;
+    Ok(opts)
 }
 
 /// The dense family's settings: the shared ones, plus the depth it drafts at.
-fn dense_options(args: &ServeArgs) -> EngineOptions {
-    let mut opts = engine_options(args);
+///
+/// # Errors
+///
+/// As [`engine_options`].
+fn dense_options(args: &ServeArgs) -> Result<EngineOptions, FactoryError> {
+    let mut opts = engine_options(args)?;
     opts.spec = SpecDepth::new(args.spec_k);
-    opts
+    Ok(opts)
 }
 
 /// The draft head the command line asks the dense arm for, if any.

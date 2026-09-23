@@ -483,3 +483,12 @@ extern "C" int shs_exl3_moe_ws(const float *x, float *slot_out, uint32_t n_tok, 
     default: return 0;
     }
 }
+
+/* The half-output down projection has no host launcher here - the engine
+ * launches it by name - so its instances are made explicitly. */
+template __global__ void exl3_moe_ws_down_h<4, 2, SHS_WS_STAGES>(
+        const half *, half *, const uint16_t *, const half *, const int32_t *, const int32_t *, int, int);
+template __global__ void exl3_moe_ws_down_h<5, 2, SHS_WS_STAGES>(
+        const half *, half *, const uint16_t *, const half *, const int32_t *, const int32_t *, int, int);
+template __global__ void exl3_moe_ws_down_h<6, 2, SHS_WS_STAGES>(
+        const half *, half *, const uint16_t *, const half *, const int32_t *, const int32_t *, int, int);

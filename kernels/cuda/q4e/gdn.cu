@@ -22,7 +22,7 @@
  * min(ckpt_cap, n_tok - 1), laid out like `state` at ckpt[t].  Speculative
  * verify runs several tokens in one call and, when the target rejects a
  * suffix, restores the checkpoint of the last accepted one. */
-extern "C" __global__ void q4e_gdn_conv_kernel(
+static __device__ __forceinline__ void q4e_gdn_conv_run(
         float *out, float *state, const float *x, const float *w,
         uint32_t channels, uint32_t kernel, uint32_t n_tok,
         float *ckpt, uint32_t ckpt_cap) {
@@ -50,6 +50,42 @@ extern "C" __global__ void q4e_gdn_conv_kernel(
     }
 
     for (uint32_t i = 0; i < hist; i++) state[(uint64_t)i * channels + c] = win[i];
+}
+
+extern "C" __global__ void q4e_gdn_conv_kernel(
+        float *out, float *state, const float *x, const float *w,
+        uint32_t channels, uint32_t kernel, uint32_t n_tok,
+        float *ckpt, uint32_t ckpt_cap) {
+    q4e_gdn_conv_run(out, state, x, w, channels, kernel, n_tok, ckpt, ckpt_cap);
+}
+
+/* Where run blockIdx.y of a segmented pass starts, and how many rows it has.
+ * `run_lens` packs one byte per run, run 0 in the low byte: a segmented pass
+ * is at most one run per decode-batch row (eight), each at most a verify's
+ * width, which is what lets the whole table travel as one by-value argument
+ * rather than a buffer the host would have to fill before every pass. */
+static __device__ __forceinline__ uint32_t q4e_seg_start(uint64_t run_lens, uint32_t run) {
+    uint32_t start = 0;
+    for (uint32_t r = 0; r < run; r++) start += (uint32_t)((run_lens >> (8u * r)) & 0xffu);
+    return start;
+}
+static __device__ __forceinline__ uint32_t q4e_seg_len(uint64_t run_lens, uint32_t run) {
+    return (uint32_t)((run_lens >> (8u * run)) & 0xffu);
+}
+
+/* The convolution for a segmented pass: every run in one launch, blockIdx.y
+ * the run, each through its own session's window and rollback records.  The
+ * per-run arithmetic is q4e_gdn_conv_kernel's own body, so a run convolves to
+ * exactly what its own launch would have produced. */
+extern "C" __global__ void q4e_gdn_conv_seg_kernel(
+        float *out, float * const *states, const float *x, const float *w,
+        uint32_t channels, uint32_t kernel, uint64_t run_lens,
+        float * const *ckpts, uint32_t ckpt_cap) {
+    const uint32_t run = blockIdx.y;
+    const uint32_t first = q4e_seg_start(run_lens, run);
+    const uint64_t at = (uint64_t)first * channels;
+    q4e_gdn_conv_run(out + at, states[run], x + at, w, channels, kernel,
+                     q4e_seg_len(run_lens, run), ckpts ? ckpts[run] : NULL, ckpt_cap);
 }
 
 /* L2-normalize each 128-wide q and k head in place.  This is an L2 norm, not
@@ -100,7 +136,7 @@ extern "C" __global__ void q4e_gdn_gates_kernel(
  *              out[j]   = <S[:,j], q> / sqrt(head_dim)
  */
 #define Q4E_GDN_SPLIT 4u   /* lanes per state column */
-extern "C" __global__ void __launch_bounds__(512) q4e_gdn_recurrent_kernel(
+static __device__ __forceinline__ void q4e_gdn_recurrent_run(
         float *attn_out, float *state,
         const float *qkv, const float *decay, const float *beta,
         uint32_t head_dim, uint32_t n_head_k, uint32_t n_head_v,
@@ -182,8 +218,18 @@ extern "C" __global__ void __launch_bounds__(512) q4e_gdn_recurrent_kernel(
         }
         __syncthreads();
         if (ckpt && t < ckpt_cap && t + 1u < n_tok) {
+            /* Any thread may copy any element: the barrier above has every
+             * row's update for this token in shared memory, and the next
+             * token's updates wait behind the barriers at its start.  So the
+             * copy walks the tile in its global order, each warp storing 128
+             * consecutive floats.  The column-per-lane walk it replaced stored
+             * 32-byte fragments, and a four-token verify run spent most of its
+             * 84 us in them. */
             float *ck = ckpt + ((uint64_t)t * n_head_v + h) * head_dim * head_dim;
-            for (uint32_t r = sub; r < head_dim; r += Q4E_GDN_SPLIT) ck[r * head_dim + j] = s_state[r * row_stride + j];
+            for (uint32_t idx = threadIdx.x; idx < head_dim * head_dim; idx += blockDim.x) {
+                const uint32_t r = idx / head_dim, c = idx % head_dim;
+                ck[idx] = s_state[r * row_stride + c];
+            }
         }
     }
 
@@ -191,6 +237,37 @@ extern "C" __global__ void __launch_bounds__(512) q4e_gdn_recurrent_kernel(
         const uint32_t r = idx / head_dim, c = idx % head_dim;
         m[idx] = s_state[r * row_stride + c];
     }
+}
+
+
+extern "C" __global__ void __launch_bounds__(512) q4e_gdn_recurrent_kernel(
+        float *attn_out, float *state,
+        const float *qkv, const float *decay, const float *beta,
+        uint32_t head_dim, uint32_t n_head_k, uint32_t n_head_v,
+        uint32_t k_offset, uint32_t v_offset, uint32_t stride, uint32_t n_tok,
+        float *ckpt, uint32_t ckpt_cap) {
+    q4e_gdn_recurrent_run(attn_out, state, qkv, decay, beta, head_dim, n_head_k, n_head_v,
+                          k_offset, v_offset, stride, n_tok, ckpt, ckpt_cap);
+}
+
+/* The recurrence for a segmented pass: grid (n_head_v, runs), each run its own
+ * session's state and rollback records and its own rows of the pass.  A
+ * batched verify launched the kernel above once per run, and each of those
+ * launches is 32 blocks on a 48-SM device waiting on a dependent walk: 84 us a
+ * run, 10 ms of a four-sequence verify step on a GB10.  The body is the same
+ * function, so a run's state and outputs are bit-for-bit its own launch's. */
+extern "C" __global__ void __launch_bounds__(512) q4e_gdn_recurrent_seg_kernel(
+        float *attn_out, float * const *states,
+        const float *qkv, const float *decay, const float *beta,
+        uint32_t head_dim, uint32_t n_head_k, uint32_t n_head_v,
+        uint32_t k_offset, uint32_t v_offset, uint32_t stride, uint64_t run_lens,
+        float * const *ckpts, uint32_t ckpt_cap) {
+    const uint32_t run = blockIdx.y;
+    const uint64_t first = q4e_seg_start(run_lens, run);
+    q4e_gdn_recurrent_run(attn_out + first * n_head_v * head_dim, states[run],
+                          qkv + first * stride, decay + first * n_head_v, beta + first * n_head_v,
+                          head_dim, n_head_k, n_head_v, k_offset, v_offset, stride,
+                          q4e_seg_len(run_lens, run), ckpts ? ckpts[run] : NULL, ckpt_cap);
 }
 
 /* Chunked-parallel gated delta rule, for prefill.

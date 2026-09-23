@@ -321,6 +321,31 @@ pub fn mgemm_grid(k: u32, n: u32, shape: GemmShape, slots: u32, max_blocks: u32)
     }
 }
 
+/// The grid for a grouped launch over `slots` weights whose blocks per slot are
+/// the ones a launch over `basis` slots would give.
+///
+/// A slot's result depends on how many blocks share its tiles - they split its
+/// contraction - so a grid sized by the slot count makes a row's answer depend
+/// on how many other rows the pass carries. Pinning the group width to one
+/// row's launch and running the extra slots in rounds makes every row of a
+/// verify pass or a decode batch the arithmetic a single-row step does.
+#[must_use]
+pub fn mgemm_grid_rounds(
+    k: u32,
+    n: u32,
+    shape: GemmShape,
+    slots: u32,
+    basis: u32,
+    max_blocks: u32,
+) -> GroupedGrid {
+    let one = mgemm_grid(k, n, shape, basis, max_blocks);
+    let fit = (max_blocks / one.per_group.max(1)).max(1);
+    GroupedGrid {
+        per_group: one.per_group,
+        concurrency: slots.min(fit).clamp(1, MAX_BARRIERS),
+    }
+}
+
 /// The grid a fused routed launch runs: groups of blocks, one expert at a time
 /// each, every block of the grid co-resident for the group barriers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

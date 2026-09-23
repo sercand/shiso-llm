@@ -35,7 +35,7 @@ pub mod page;
 pub use backend::{
     Backend, BlasBackend, CoopLaunch, DEVICE_POINTER_BYTES, Extent3, FnConst, FnConstValue,
     GemmDType, GemmDesc, GemmOp, GraphBackend, GraphCapture, GraphKey, KernelArg, KernelRef,
-    LaunchArgs, PointerPack,
+    LaunchArgs, MemoryInfo, PointerPack,
 };
 pub use buffer::{DeviceBuffer, DeviceView, HostBytes, RawBuffer, alloc, import_host};
 pub use config::{HfConfig, HiddenAct, VisionConfig};

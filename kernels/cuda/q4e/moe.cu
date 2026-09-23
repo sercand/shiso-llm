@@ -210,19 +210,39 @@ extern "C" __global__ void q4e_moe_sort_count_kernel(
 
 extern "C" __global__ void q4e_moe_sort_scan_kernel(
         int32_t *bounds, int32_t *active, const int32_t *counts, uint32_t n_expert) {
-    /* One block, serial over the experts: 512 entries once per layer is far
-     * below the point where a parallel scan would pay for itself.  Also lists
-     * the experts with at least one column; the count goes in active[n_expert]. */
-    if (threadIdx.x != 0u) return;
-    int32_t total = 0;
-    int32_t n_active = 0;
-    for (uint32_t e = 0; e < n_expert; e++) {
-        bounds[e] = total;
-        total += counts[e];
-        if (counts[e] > 0) active[n_active++] = (int32_t)e;
+    /* One warp; lane l owns a contiguous run of the experts, so a lane's
+     * exclusive prefix over its neighbours' totals is where its run starts,
+     * for the bounds and for the active list alike.  Both come out exactly as
+     * a serial walk writes them: ascending expert order.  The serial walk this
+     * replaced cost 28 us a layer, one dependent global load per expert,
+     * which was 5% of a decode step. */
+    const uint32_t lane = threadIdx.x;
+    if (lane >= 32u) return;
+    const uint32_t per = (n_expert + 31u) / 32u;
+    const uint32_t lo = min(lane * per, n_expert), hi = min(lo + per, n_expert);
+    int32_t rows = 0, live = 0;
+    for (uint32_t e = lo; e < hi; e++) {
+        const int32_t c = counts[e];
+        rows += c;
+        live += c > 0;
     }
-    bounds[n_expert] = total;
-    active[n_expert] = n_active;
+    int32_t rows_at = rows, live_at = live;
+    for (int d = 1; d < 32; d <<= 1) {
+        const int32_t r = __shfl_up_sync(0xffffffffu, rows_at, d);
+        const int32_t a = __shfl_up_sync(0xffffffffu, live_at, d);
+        if ((int)lane >= d) { rows_at += r; live_at += a; }
+    }
+    int32_t total = rows_at - rows, n_active = live_at - live;
+    for (uint32_t e = lo; e < hi; e++) {
+        const int32_t c = counts[e];
+        bounds[e] = total;
+        total += c;
+        if (c > 0) active[n_active++] = (int32_t)e;
+    }
+    if (lane == 31u) {
+        bounds[n_expert] = total;
+        active[n_expert] = n_active;
+    }
 }
 
 extern "C" __global__ void q4e_moe_sort_scatter_kernel(
