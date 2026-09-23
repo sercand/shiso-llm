@@ -429,6 +429,16 @@ impl Backing for DeviceKv {
     }
 }
 
+/// What a claim may evict to make room: the cache its pages come from, and
+/// the time that cache prices its spans at.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Room<'a> {
+    /// The cache whose idle spans may be dropped.
+    pub(crate) cache: &'a shiso_kvstore::KvCache,
+    /// Seconds on the stack's clock.
+    pub(crate) now: f64,
+}
+
 /// One session's view of the cache: where its token positions live, and the
 /// device copy of that table the kernels read.
 ///
@@ -512,15 +522,49 @@ impl SessionKv {
     /// whether a launch that already captured the old contents must be redone.
     /// Claiming is the engine's only way to make a cache row writable: a page the
     /// frontier has not claimed may be handed to another session at any moment.
-    pub(crate) fn ensure_positions(&mut self, positions: u32) -> CoreResult<bool> {
-        let grew = self
+    ///
+    /// When the pool is short, idle spans are evicted from `room` first - the
+    /// cache keeps every finished conversation's pages as a reusable prefix
+    /// until something needs them, so a pool that has served a few requests is
+    /// full of them. A pool that still cannot supply the pages is a refusal.
+    /// It used to be read as "nothing changed", and the pass then wrote its rows
+    /// through table slots that named no page of this session's.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] when the pool cannot supply the pages even
+    /// after eviction, and whatever the table upload reports.
+    pub(crate) fn ensure_positions(&mut self, positions: u32, room: Room<'_>) -> CoreResult<bool> {
+        let before = self.frontier.pages();
+        let held = u32::try_from(before).unwrap_or(u32::MAX);
+        let want = shiso_core::page::pages_for(positions).saturating_sub(held);
+        if want > 0 {
+            let report = room.cache.evict_to(want, room.now);
+            if report.pages_freed > 0 {
+                tracing::debug!(
+                    want,
+                    positions,
+                    pages_freed = report.pages_freed,
+                    spans = report.nodes_dropped,
+                    checkpoints = report.ckpts_dropped,
+                    "evicted idle spans for a claim"
+                );
+            }
+        }
+        let covered = self
             .frontier
             .grow_to(positions)
             .map_err(|e| CoreError::InvalidValue {
                 key: "kv pool",
                 value: format!("cannot claim pages for {positions} tokens: {e}"),
             })?;
-        if grew || self.uploaded != self.frontier.pages() {
+        if !covered {
+            return Err(CoreError::InvalidValue {
+                key: "kv pool",
+                value: format!("the pool has no free page for position {positions}"),
+            });
+        }
+        if self.frontier.pages() != before || self.uploaded != self.frontier.pages() {
             self.upload_table()?;
             return Ok(true);
         }

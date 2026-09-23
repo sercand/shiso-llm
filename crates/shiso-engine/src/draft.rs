@@ -382,10 +382,17 @@ impl HybridStack {
         // and read them back - fluently, at the right shape, from the wrong
         // conversation. Claimed here, once, for every position the chain can
         // reach.
+        // The cache by a second handle, so a claim can evict from it while the
+        // session it claims for is borrowed.
+        let cache = Arc::clone(&self.resident()?.cache);
+        let room = crate::kv::Room {
+            cache: &cache,
+            now: self.now(),
+        };
         self.sessions
             .get_mut(&session)
             .ok_or(CoreError::UnknownSession(session))?
-            .reserve_to(frontier.saturating_add(budget))?;
+            .reserve_to(frontier.saturating_add(budget), room)?;
         let clock = std::time::Instant::now();
         let drafts = self.chain(session, first, frontier, budget)?;
         let chained = clock.elapsed();

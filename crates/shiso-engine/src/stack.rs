@@ -525,6 +525,7 @@ impl HybridStack {
             cap: self.opts.ctx,
         })?;
         let capacity = self.opts.ctx;
+        let now = self.now();
         let Self {
             backend,
             geometry,
@@ -555,7 +556,11 @@ impl HybridStack {
         };
         let rows = open_ple(resident, geometry, &ple_tokens)?;
         let start = live.written();
-        live.advance(tokens, capacity)?;
+        let room = kv::Room {
+            cache: &resident.cache,
+            now,
+        };
+        live.advance(tokens, capacity, room)?;
         upload_row(
             backend.as_ref(),
             &mut staging.ids,
@@ -784,6 +789,7 @@ impl HybridStack {
         // Before `self` is taken apart: the slot this step's launches belong
         // to, allocated on first sight of a shape and reused forever after.
         let slot = self.decode_slot(n_tok, steps);
+        let now = self.now();
         let Self {
             backend,
             geometry,
@@ -808,7 +814,11 @@ impl HybridStack {
                 .get_mut(&step.session)
                 .ok_or(CoreError::UnknownSession(step.session))?;
             positions.push(live.written());
-            live.advance(std::slice::from_ref(&step.token), capacity)?;
+            let room = kv::Room {
+                cache: &resident.cache,
+                now,
+            };
+            live.advance(std::slice::from_ref(&step.token), capacity, room)?;
         }
         upload_decode_rows(
             backend.as_ref(),

@@ -31,7 +31,7 @@ use shiso_core::ids::{SessionId, TokenId};
 use shiso_kvstore::Frontier;
 
 use crate::blocks::StateTrail;
-use crate::kv::{SessionKv, conv_state_bytes, state_bytes};
+use crate::kv::{Room, SessionKv, conv_state_bytes, state_bytes};
 use crate::layers::ResidualIndex;
 use crate::mtp::{Rollback, SpecDepth};
 
@@ -322,8 +322,8 @@ impl Session {
     /// # Errors
     ///
     /// Whatever [`SessionKv::ensure_positions`] reports.
-    pub(crate) fn reserve_to(&mut self, positions: u32) -> CoreResult<()> {
-        self.kv.ensure_positions(positions).map(|_moved| ())
+    pub(crate) fn reserve_to(&mut self, positions: u32, room: Room<'_>) -> CoreResult<()> {
+        self.kv.ensure_positions(positions, room).map(|_moved| ())
     }
 
     /// The `ordinal`-th recurrent slot's trail, when this session keeps one.
@@ -422,7 +422,12 @@ impl Session {
     ///
     /// [`CoreError::ContextOverflow`] when the step reaches past `capacity`, and
     /// whatever [`SessionKv::ensure_positions`] reports.
-    pub(crate) fn advance(&mut self, tokens: &[TokenId], capacity: u32) -> CoreResult<()> {
+    pub(crate) fn advance(
+        &mut self,
+        tokens: &[TokenId],
+        capacity: u32,
+        room: Room<'_>,
+    ) -> CoreResult<()> {
         let n_tok = u32::try_from(tokens.len()).map_err(|_| CoreError::ContextOverflow {
             session: self.id,
             cap: capacity,
@@ -440,7 +445,7 @@ impl Session {
                 cap: capacity,
             });
         }
-        self.kv.ensure_positions(next)?;
+        self.kv.ensure_positions(next, room)?;
         self.written = next;
         Ok(())
     }
