@@ -195,9 +195,10 @@ fn flush(
     let mut turn = serde_json::Map::new();
     turn.insert("role".to_owned(), Value::String(role.as_str().to_owned()));
     turn.insert("content".to_owned(), Value::Array(content));
-    // The calls also ride beside the content, because that is where a template
-    // looks for them. They stay inside the content list too, so the block order
-    // a template that reads the list sees is still the order the model produced.
+    // The calls ride beside the content and only there, because that is where
+    // a template looks for them. A copy inside the content list is a part type
+    // the shipped templates do not accept: they raise on it, and every replayed
+    // assistant turn that had called a tool became a refused request.
     let calls: Vec<Value> = blocks
         .iter()
         .filter_map(|block| match block {
@@ -237,15 +238,12 @@ fn render_blocks(
             Block::Text(text) | Block::Refusal(text) => {
                 parts.push(json!({"type": "text", "text": text}));
             }
-            Block::Thinking(thinking) => {
-                parts.push(json!({"type": "thinking", "thinking": thinking.text}));
-            }
-            Block::ToolUse(use_) => parts.push(json!({
-                "type": "tool_use",
-                "id": use_.id,
-                "name": use_.name,
-                "input": use_.input,
-            })),
+            // A trace and a call are not content: `flush` puts them where every
+            // template looks for them, `reasoning_content` and `tool_calls`. The
+            // templates checkpoints ship accept only text and media parts in
+            // `content` and raise on anything else, so a copy here turned every
+            // replayed assistant turn into a refused request.
+            Block::Thinking(_) | Block::ToolUse(_) => {}
             // A nested tool result is only reachable inside another tool
             // result's content, which no wire format produces; rendering it as
             // its text keeps the function total without inventing a shape.
@@ -425,4 +423,39 @@ pub struct PadMismatch {
     pub markers: usize,
     /// Items the preprocessor decoded.
     pub items: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MediaPolicy, preprocess};
+    use shiso_ir::{Block, Message, Role, Thinking, ToolUse};
+
+    /// A replayed assistant turn reaches the template with its trace in
+    /// `reasoning_content`, its calls in `tool_calls`, and neither in `content`:
+    /// the templates checkpoints ship accept only text and media parts there and
+    /// raise on anything else.
+    #[test]
+    fn an_assistant_turn_keeps_traces_and_calls_out_of_its_content() {
+        let turn = Message::new(
+            Role::Assistant,
+            vec![
+                Block::Thinking(Thinking::new("weighing it")),
+                Block::Text("done".to_owned()),
+                Block::ToolUse(ToolUse::new(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({"path": "a"}),
+                )),
+            ],
+        );
+        let prepared =
+            preprocess(&[], &[turn], &MediaPolicy::default()).expect("text cannot fail");
+        let rendered = &prepared.messages[0];
+        assert_eq!(
+            rendered["content"],
+            serde_json::json!([{"type": "text", "text": "done"}])
+        );
+        assert_eq!(rendered["reasoning_content"], "weighing it");
+        assert_eq!(rendered["tool_calls"][0]["function"]["name"], "read_file");
+    }
 }
