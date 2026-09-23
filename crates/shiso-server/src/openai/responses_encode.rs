@@ -114,7 +114,7 @@ pub fn encode_output(message: &Message, response_id: &str) -> Vec<Value> {
                 "call_id": call.id,
                 "name": call.name,
                 // Back to text, because that is what this format carries.
-                "arguments": call.input.to_string(),
+                "arguments": super::arguments_text(&call.input),
                 "status": "completed",
             }),
             // Media and tool results are things a caller sends, not things a

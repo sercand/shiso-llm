@@ -392,6 +392,15 @@ impl SeqSlot {
         events.into_iter().next()
     }
 
+    /// The id of this sequence's `n`th tool call.
+    ///
+    /// Scoped by the sequence id, which is unique per request in this process:
+    /// a counter alone restarts every turn, and clients match a tool result to
+    /// its call by id, so the second turn's `call_0` answered the first turn's.
+    pub(crate) fn call_id(&self, n: u32) -> String {
+        format!("call_{}_{n}", self.id)
+    }
+
     fn emit_segments(&mut self, segments: Vec<Segment>) -> Vec<StreamEvent> {
         let mut events = Vec::new();
         let mut token_ids = std::mem::take(&mut self.trailing);
@@ -450,7 +459,7 @@ impl SeqSlot {
                     }
                 }
                 Segment::ToolCall { name, arguments } => {
-                    let call_id = format!("call_{}", self.calls_emitted);
+                    let call_id = self.call_id(self.calls_emitted);
                     self.calls_emitted = self.calls_emitted.saturating_add(1);
                     events.extend(
                         self.blocks
@@ -708,6 +717,15 @@ mod tests {
         budget: u32,
         parser: Box<dyn shiso_parsers::StreamParser>,
     ) -> SeqSlot {
+        slot_with_id("s", prompt, budget, parser)
+    }
+
+    fn slot_with_id(
+        id: &str,
+        prompt: &[u32],
+        budget: u32,
+        parser: Box<dyn shiso_parsers::StreamParser>,
+    ) -> SeqSlot {
         let request = GenerateRequest::new(
             Arc::from(prompt.iter().copied().map(TokenId::new).collect::<Vec<_>>()),
             SamplingParams::neutral(),
@@ -719,7 +737,7 @@ mod tests {
         SeqSlot::new(
             request,
             SlotSetup {
-                id: "s".to_owned(),
+                id: id.to_owned(),
                 session: SessionId::next(&mut ids).expect("a session id"),
                 sink,
                 started_at: Instant::now(),
@@ -943,6 +961,16 @@ mod tests {
         }
     }
 
+    /// Two turns of one conversation never hand out the same call id: clients key
+    /// tool results by id, and a second `call_0` answers the first turn's call.
+    #[test]
+    fn call_ids_carry_the_sequence_id() {
+        let a = slot_with_id("a", &[1], 8, shiso_parsers::passthrough());
+        let b = slot_with_id("b", &[1], 8, shiso_parsers::passthrough());
+        assert_ne!(a.call_id(0), b.call_id(0));
+        assert!(a.call_id(0).starts_with("call_"));
+    }
+
     #[test]
     fn a_tool_call_ends_the_turn_as_tool_use() {
         use shiso_ir::{BlockDelta, BlockStart, StreamEvent};
@@ -964,7 +992,7 @@ mod tests {
             StreamEvent::BlockStart {
                 index: 0,
                 block: BlockStart::ToolUse {
-                    id: "call_0".to_string(),
+                    id: slot.call_id(0),
                     name: "f".to_string(),
                 },
             }

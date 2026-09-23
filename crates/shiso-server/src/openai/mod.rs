@@ -58,9 +58,34 @@ pub fn new_response_id() -> String {
     crate::response_store::StoredKind::Response.mint()
 }
 
+/// A call's arguments as the text this format carries.
+///
+/// The neutral shape keeps arguments parsed so that exactly one parse exists,
+/// and keeps them as a string value when they were not JSON. That string is
+/// already the text: serialising it again would hand the client a JSON string
+/// of its own arguments, and a replay would send that back doubly quoted.
+#[must_use]
+pub(crate) fn arguments_text(input: &serde_json::Value) -> String {
+    match input {
+        serde_json::Value::String(raw) => raw.clone(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{new_chunk_id, new_completion_id, new_response_id};
+    use super::{arguments_text, new_chunk_id, new_completion_id, new_response_id};
+
+    /// Arguments that arrived as text the server could not parse go back out
+    /// as that same text, not as a JSON string of it.
+    #[test]
+    fn unparsed_arguments_are_not_encoded_twice() {
+        assert_eq!(
+            arguments_text(&serde_json::json!("not json {")),
+            "not json {"
+        );
+        assert_eq!(arguments_text(&serde_json::json!({"a": 1})), "{\"a\":1}");
+    }
 
     /// The prefix is how a client tells which surface minted an identifier, and
     /// how the store refuses to answer one surface's question with the other's

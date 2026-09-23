@@ -125,7 +125,7 @@ pub fn encode_message(message: &Message) -> Value {
                     // Back to text, because that is what this format carries and
                     // what every client parses. The neutral shape keeps it
                     // parsed so that exactly one parse exists.
-                    "arguments": call.input.to_string(),
+                    "arguments": super::arguments_text(&call.input),
                 },
             })
         })
