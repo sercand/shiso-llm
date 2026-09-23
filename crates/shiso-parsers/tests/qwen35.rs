@@ -245,3 +245,52 @@ fn a_whole_turn_splits_into_a_trace_and_an_answer() {
         ]
     );
 }
+
+fn greedy_after(text: &str) -> bool {
+    let mut p = parser_for_prompt(
+        ReasoningScheme::Qwen3,
+        ToolCallScheme::Qwen35,
+        CLOSED_PROMPT,
+    );
+    let _ = p.push(text);
+    p.wants_greedy()
+}
+
+#[test]
+fn prose_and_values_sample_normally() {
+    assert!(!greedy_after("Hello, "));
+    assert!(!greedy_after("a < b"));
+    assert!(!greedy_after(
+        "<tool_call>\n<function=f>\n<parameter=x>\n<html><bo"
+    ));
+}
+
+#[test]
+fn tool_call_structure_is_greedy() {
+    assert!(greedy_after("<tool_"));
+    assert!(greedy_after("<tool_call>\n<func"));
+    assert!(greedy_after(
+        "<tool_call>\n<function=f>\n<parameter=x>\nv\n</parameter>\n"
+    ));
+    assert!(greedy_after(
+        "<tool_call>\n<function=f>\n<parameter=x>\nvalue\n</par"
+    ));
+}
+
+#[test]
+fn a_near_miss_close_returns_to_normal_sampling() {
+    assert!(!greedy_after(
+        "<tool_call>\n<function=f>\n<parameter=x>\n</paragraph> more"
+    ));
+}
+
+#[test]
+fn thinking_is_never_greedy() {
+    let mut p = parser_for_prompt(
+        ReasoningScheme::Qwen3,
+        ToolCallScheme::Qwen35,
+        THINKING_PROMPT,
+    );
+    let _ = p.push("maybe <tool_");
+    assert!(!p.wants_greedy());
+}

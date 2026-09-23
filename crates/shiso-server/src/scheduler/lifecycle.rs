@@ -343,10 +343,19 @@ impl SeqSlot {
         self.cold
     }
 
-    /// Its sampling settings and PRNG stream, for the one sampler that draws
-    /// for it.
-    pub(crate) fn draw(&mut self) -> (&SamplingParams, &mut Seed) {
-        (&self.sampling, &mut self.seed)
+    /// Its sampling settings for the next token and its PRNG stream, for the
+    /// one sampler that draws for it.
+    ///
+    /// Greedy wherever the output parser says a sampled token could only break
+    /// the format - inside tool-call tags - and the request's own settings
+    /// everywhere else. Greedy requests are unchanged, since every step already
+    /// is.
+    pub(crate) fn draw(&mut self) -> (SamplingParams, &mut Seed) {
+        let mut params = self.sampling;
+        if self.parser.wants_greedy() {
+            params.temperature = 0.0;
+        }
+        (params, &mut self.seed)
     }
 
     /// The half-open range of the prompt this quantum covers.
@@ -1086,5 +1095,36 @@ mod tests {
         }
 
         assert_eq!(reported_ids, accepted_ids);
+    }
+
+    /// Inside tool-call structure the draw is greedy whatever the request asked;
+    /// outside it the request's own temperature stands.
+    #[test]
+    fn the_draw_is_greedy_exactly_where_the_parser_asks() {
+        let mut slot = slot_with(
+            &[1],
+            8,
+            shiso_parsers::parser(
+                shiso_parsers::ReasoningScheme::None,
+                shiso_parsers::ToolCallScheme::Qwen35,
+            ),
+        );
+        let asked = SamplingParams {
+            top_k: std::num::NonZeroU32::new(20),
+            ..SamplingParams::neutral()
+        };
+        slot.sampling = asked;
+        assert!(!asked.is_greedy(), "the case needs a sampling request");
+        assert_eq!(slot.draw().0, asked);
+        let _ = slot.parser.push("<tool_call>\n<func");
+        assert_eq!(
+            slot.draw().0,
+            SamplingParams {
+                temperature: 0.0,
+                ..asked
+            }
+        );
+        // The request's own settings are untouched: the override is per draw.
+        assert_eq!(slot.sampling, asked);
     }
 }
