@@ -220,7 +220,7 @@ impl Qwen4ExpModel {
                 vocab: config.shape().vocab,
                 hidden: config.shape().hidden,
                 n_layers: config.shape().n_layers(),
-                stop_tokens: StopTokens::one(config.eos_token()),
+                stop_tokens: StopTokens::new(&config.stop_tokens())?,
             },
             stack,
             expert_gate,

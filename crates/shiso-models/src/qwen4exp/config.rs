@@ -110,6 +110,30 @@ pub const PLE_CONV: u32 = 4;
 pub const PLE_EOS_TOKEN: u32 = 248_044;
 /// Rotary frequency base.
 pub const ROPE_THETA: f32 = 1.0e7;
+
+/// `<|endoftext|>`, the base model's end of text.
+///
+/// The same id as [`PLE_EOS_TOKEN`] and a different role: that one is what the
+/// n-gram hash reads before a sequence starts, this one is a token the model
+/// can emit, and the checkpoint's generation config lists it as a stop beside
+/// the turn marker.
+const END_OF_TEXT: u32 = 248_044;
+
+/// The ids that end a turn, given the container's EOS: the EOS first, then
+/// end-of-text when it is a different id.
+///
+/// The EOS stays first because speculation drafts against the primary stop
+/// alone, and that is the turn marker the template writes.
+#[must_use]
+pub(crate) fn turn_enders(eos: TokenId) -> Vec<TokenId> {
+    let end_of_text = TokenId::new(END_OF_TEXT);
+    if eos == end_of_text {
+        vec![eos]
+    } else {
+        vec![eos, end_of_text]
+    }
+}
+
 /// Epsilon every normalization adds.
 pub const RMS_EPS: f32 = 1.0e-6;
 /// Positions the rotary table was trained over.
@@ -309,6 +333,12 @@ impl Qwen4ExpConfig {
     #[must_use]
     pub const fn eos_token(&self) -> TokenId {
         self.eos_token
+    }
+
+    /// The ids that end a turn, most specific first.
+    #[must_use]
+    pub fn stop_tokens(&self) -> Vec<TokenId> {
+        turn_enders(self.eos_token)
     }
 
     /// The attention interval the layer schedule follows.
@@ -596,6 +626,22 @@ fn layer_schedule(meta: &GgufMetadata) -> CoreResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The turn marker first, then the base model's end of text, which the
+    /// checkpoint's generation config also lists as a stop. A model that emits
+    /// `<|endoftext|>` and is not stopped keeps writing past its own end.
+    #[test]
+    fn a_turn_ends_on_the_turn_marker_or_on_end_of_text() {
+        assert_eq!(
+            turn_enders(TokenId::new(248_046)),
+            vec![TokenId::new(248_046), TokenId::new(248_044)]
+        );
+        // A container whose EOS already is end-of-text names it once.
+        assert_eq!(
+            turn_enders(TokenId::new(248_044)),
+            vec![TokenId::new(248_044)]
+        );
+    }
 
     #[test]
     fn the_last_slot_is_always_an_attention_slot() {
