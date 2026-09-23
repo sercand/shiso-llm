@@ -128,13 +128,15 @@ pub struct FamilyDefaults {
 }
 
 impl FamilyDefaults {
-    /// Family defaults for Qwen 3 models.
+    /// Family defaults for Qwen 3 models: Qwen 3's reasoning tags and its JSON
+    /// tool-call body.
+    ///
+    /// No family [`FamilyDefaults::for_config`] recognises selects this today;
+    /// the sparse family did until it gained [`FamilyDefaults::QWEN4EXP`].
     pub const QWEN3: Self = Self {
         reasoning: ReasoningScheme::Qwen3,
         tools: ToolCallScheme::Qwen3,
         thinking_default: true,
-        // The sparse family drafts with a head named by `--draft-model`; its
-        // arm refuses by name when the depth is asked for without one.
         speculates: true,
     };
 
@@ -143,9 +145,14 @@ impl FamilyDefaults {
     /// A constant of its own rather than `QWEN3`: this family's template writes
     /// tool calls as the Qwen 3.5 XML body and accepts its own effort words, and a
     /// family that borrows another's constant inherits every fact that differs.
+    ///
+    /// The tool scheme is the one that fact decided. The template writes a call
+    /// as `<function=NAME>` wrapping one `<parameter=KEY>` block per argument;
+    /// while this family borrowed Qwen 3's JSON reader, every such call failed to
+    /// decode and went back to the client as prose, with nothing failing.
     pub const QWEN4EXP: Self = Self {
         reasoning: ReasoningScheme::Qwen3,
-        tools: ToolCallScheme::Qwen3,
+        tools: ToolCallScheme::Qwen35,
         thinking_default: true,
         // The sparse family drafts with a head named by `--draft-model`; its
         // arm refuses by name when the depth is asked for without one.

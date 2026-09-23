@@ -299,3 +299,40 @@ fn gemma4_fixture_yields_gemma4_defaults() {
         }
     );
 }
+
+/// Every family's output schemes, pinned in one table.
+///
+/// The sparse family once borrowed the Qwen 3 constant and with it a JSON tool
+/// reader, while its template writes the XML body: every call came back to the
+/// client as prose, and nothing failed. A family whose defaults change has to
+/// change this table in the same commit.
+#[test]
+fn every_family_declares_the_schemes_its_template_writes() {
+    use shiso_parsers::{ReasoningScheme as R, ToolCallScheme as T};
+    use shiso_server::model_factory::FamilyDefaults as F;
+    let table = [
+        ("qwen35", F::QWEN35, R::Qwen3, T::Qwen35),
+        ("qwen35moe", F::QWEN35MOE, R::Qwen3, T::Qwen35),
+        ("qwen4exp", F::QWEN4EXP, R::Qwen3, T::Qwen35),
+        ("gemma4", F::GEMMA4, R::Gemma4, T::Gemma4),
+    ];
+    for (family, defaults, reasoning, tools) in table {
+        assert_eq!(defaults.reasoning, reasoning, "{family} reasoning scheme");
+        assert_eq!(defaults.tools, tools, "{family} tool scheme");
+    }
+}
+
+/// The sparse family's document selects its own constant, not Qwen 3's.
+#[test]
+fn the_sparse_family_selects_its_own_defaults() {
+    let config = HfConfig::from_json_str(
+        r#"{"model_type": "qwen4_exp", "architectures": ["Qwen4ExpForConditionalGeneration"]}"#,
+    )
+    .expect("a minimal config parses");
+    let defaults = shiso_server::model_factory::FamilyDefaults::for_config(&config)
+        .expect("the sparse family has defaults");
+    assert_eq!(
+        defaults,
+        shiso_server::model_factory::FamilyDefaults::QWEN4EXP
+    );
+}
