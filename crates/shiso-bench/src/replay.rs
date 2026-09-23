@@ -31,6 +31,7 @@ use shiso_core::model::{DecodeStep, Model, ModelInfo};
 use shiso_engine::sparse::capture;
 use shiso_engine::sparse::mtp::SpecDepth;
 use shiso_engine::sparse::stack::SparseOptions;
+use shiso_engine::sparse::tap::ResidualTap;
 use shiso_engine::{EngineOptions, argmax};
 use shiso_models::gemma4::{Gemma4Config, Gemma4Model, PleOptions};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
@@ -121,6 +122,12 @@ pub enum ReplayError {
         /// Tokens the case declares.
         frontier: u32,
     },
+    /// A per-layer dump was asked of a checkpoint whose stack has no tap.
+    ///
+    /// Only the sparse stack has one. The dense families' diagnostic is
+    /// `SHISO_LAYER_DUMP`, which prints statistics rather than rows.
+    #[error("a per-layer residual dump needs a checkpoint of the sparse family")]
+    NoLayerTap,
     /// The engine refused something.
     #[error(transparent)]
     Engine(#[from] shiso_core::CoreError),
@@ -139,7 +146,7 @@ pub type ReplayResult<T> = Result<T, ReplayError>;
 #[derive(Debug)]
 pub struct Harness {
     backend: Arc<dyn Backend>,
-    model: Box<dyn Model>,
+    model: Loaded,
     info: ModelInfo,
     row: Vec<u8>,
 }
@@ -173,8 +180,8 @@ impl Harness {
         let config = HfConfig::from_json_str(&text)?;
         let mut opts = EngineOptions::new();
         opts.ctx = ctx;
-        let model = load_model(&backend, model_path, &config, opts)?;
-        let info = *model.info();
+        let mut model = load_loaded(&backend, model_path, &config, opts, None)?;
+        let info = *model.get().info();
         let row = vec![0u8; usize::try_from(info.logits_row_bytes()).unwrap_or(0)];
         Ok(Self {
             backend,
@@ -196,9 +203,9 @@ impl Harness {
     ///
     /// [`ReplayError::Engine`] when the session or the forward pass fails.
     pub fn frontier_row(&mut self, tokens: &[TokenId], chunk: usize) -> ReplayResult<Vec<f32>> {
-        let session = self.model.open_session()?;
+        let session = self.model.get().open_session()?;
         let result = self.frontier_row_in(session, tokens, chunk);
-        let closed = self.model.close_session(session);
+        let closed = self.model.get().close_session(session);
         let row = result?;
         closed?;
         Ok(row)
@@ -216,9 +223,9 @@ impl Harness {
         let split = tokens.len().saturating_sub(1);
         let (head, tail) = tokens.split_at(split.min(tokens.len()));
         for piece in head.chunks(chunk) {
-            self.model.prefill_chunk(session, piece)?;
+            self.model.get().prefill_chunk(session, piece)?;
         }
-        let last = self.model.prefill_last(session, tail)?;
+        let last = self.model.get().prefill_last(session, tail)?;
         self.backend.copy_d2h(last.row(0)?, &mut self.row)?;
         Ok(decode_row(&self.row))
     }
@@ -234,9 +241,9 @@ impl Harness {
         chunk: usize,
         steps: usize,
     ) -> ReplayResult<Vec<TokenId>> {
-        let session = self.model.open_session()?;
+        let session = self.model.get().open_session()?;
         let result = self.greedy_after_in(session, tokens, chunk, steps);
-        let closed = self.model.close_session(session);
+        let closed = self.model.get().close_session(session);
         let produced = result?;
         closed?;
         Ok(produced)
@@ -254,16 +261,19 @@ impl Harness {
         let split = tokens.len().saturating_sub(1);
         let (head, tail) = tokens.split_at(split.min(tokens.len()));
         for piece in head.chunks(chunk) {
-            self.model.prefill_chunk(session, piece)?;
+            self.model.get().prefill_chunk(session, piece)?;
         }
-        let last = self.model.prefill_last(session, tail)?;
+        let last = self.model.get().prefill_last(session, tail)?;
         self.backend.copy_d2h(last.row(0)?, &mut self.row)?;
 
         let mut produced = Vec::with_capacity(steps);
         let mut token = argmax(&decode_row(&self.row));
         for _ in 0..steps {
             produced.push(token);
-            let out = self.model.decode_batch(&[DecodeStep { session, token }])?;
+            let out = self
+                .model
+                .get()
+                .decode_batch(&[DecodeStep { session, token }])?;
             self.backend.copy_d2h(out.row(0)?, &mut self.row)?;
             token = argmax(&decode_row(&self.row));
         }
@@ -277,8 +287,36 @@ impl Harness {
     ///
     /// [`ReplayError::Engine`] when a device resource could not be released.
     pub fn close(mut self) -> ReplayResult<()> {
-        self.model.teardown()?;
+        self.model.get().teardown()?;
         Ok(())
+    }
+
+    /// Layers of the loaded stack, when it is the sparse family's: the one
+    /// stack a per-layer dump can be taken of.
+    #[must_use]
+    pub fn sparse_layers(&self) -> Option<u32> {
+        match &self.model {
+            Loaded::Sparse(model) => Some(model.stack().shape().n_layers()),
+            Loaded::Other(_) => None,
+        }
+    }
+
+    /// The logits row after `tokens`, and the residual tap over the pass that
+    /// produced it: one residual row per layer boundary at the frontier.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplayError::NoLayerTap`] when the checkpoint is not of the sparse
+    /// family, and whatever [`crate::layers::frontier_layers`] reports.
+    pub fn frontier_layers(
+        &mut self,
+        tokens: &[TokenId],
+        chunk: usize,
+    ) -> ReplayResult<(Vec<f32>, ResidualTap)> {
+        let Loaded::Sparse(model) = &mut self.model else {
+            return Err(ReplayError::NoLayerTap);
+        };
+        crate::layers::frontier_layers(self.backend.as_ref(), model, tokens, chunk)
     }
 }
 
@@ -288,16 +326,6 @@ impl Harness {
 /// reason: `UnknownArch` is the one failure that means "not mine", and every
 /// other failure from a reader means the family matched and the document is
 /// wrong.
-pub(crate) fn load_model(
-    backend: &Arc<dyn Backend>,
-    path: &Path,
-    config: &HfConfig,
-    opts: EngineOptions,
-) -> ReplayResult<Box<dyn Model>> {
-    load_model_with(backend, path, config, opts, None)
-}
-
-/// The same dispatcher, with the per-layer table's holding chosen by the caller.
 ///
 /// `ple` is `None` for every family but Gemma 4, which is the only one that has
 /// a per-layer table, and `None` for that one means the holding an unconfigured
@@ -313,8 +341,49 @@ pub(crate) fn load_model_with(
     opts: EngineOptions,
     ple: Option<PleOptions>,
 ) -> ReplayResult<Box<dyn Model>> {
+    Ok(match load_loaded(backend, path, config, opts, ple)? {
+        Loaded::Sparse(model) => model,
+        Loaded::Other(model) => model,
+    })
+}
+
+/// A loaded checkpoint, keeping the sparse family's concrete type.
+///
+/// The residual tap is armed on the sparse stack itself, which the `Model`
+/// contract does not expose; keeping the type here is what lets the harness
+/// reach it without widening that contract for a diagnostic.
+#[derive(Debug)]
+enum Loaded {
+    /// The sparse family.
+    Sparse(Box<Qwen4ExpModel>),
+    /// Every other family.
+    Other(Box<dyn Model>),
+}
+
+impl Loaded {
+    /// The model, whichever family it is.
+    fn get(&mut self) -> &mut dyn Model {
+        match self {
+            Self::Sparse(model) => model.as_mut(),
+            Self::Other(model) => model.as_mut(),
+        }
+    }
+}
+
+/// The body of [`load_model_with`].
+fn load_loaded(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    opts: EngineOptions,
+    ple: Option<PleOptions>,
+) -> ReplayResult<Loaded> {
     match Qwen35Config::from_hf(config) {
-        Ok(family) => return Ok(Box::new(Qwen35Model::load(backend, path, &family, opts)?)),
+        Ok(family) => {
+            return Ok(Loaded::Other(Box::new(Qwen35Model::load(
+                backend, path, &family, opts,
+            )?)));
+        }
         Err(shiso_core::CoreError::UnknownArch { .. }) => {}
         Err(other) => return Err(other.into()),
     }
@@ -332,7 +401,9 @@ pub(crate) fn load_model_with(
                 co_resident_blocks: capture::co_resident_blocks(backend.as_ref(), entries),
                 ..SparseOptions::default()
             };
-            return Ok(Box::new(Qwen4ExpModel::load(backend, path, &family, opts)?));
+            return Ok(Loaded::Sparse(Box::new(Qwen4ExpModel::load(
+                backend, path, &family, opts,
+            )?)));
         }
         Err(shiso_core::CoreError::UnknownArch { .. }) => {}
         Err(other) => return Err(other.into()),
@@ -341,13 +412,13 @@ pub(crate) fn load_model_with(
     // unasked-for per-layer table is held the way an unconfigured server holds
     // it.
     match Gemma4Config::from_hf(config, path) {
-        Ok(family) => Ok(Box::new(Gemma4Model::load(
+        Ok(family) => Ok(Loaded::Other(Box::new(Gemma4Model::load(
             backend,
             path,
             &family,
             opts,
             ple.unwrap_or_default(),
-        )?)),
+        )?))),
         Err(other) => Err(other.into()),
     }
 }

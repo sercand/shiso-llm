@@ -4,7 +4,8 @@
 //! cargo run -p shiso-bench --release --bin parity -- \
 //!   --model "$SHISO_TEST_MODEL" --backend metal \
 //!   --vectors test-vectors/goldens/qwen35-local-golden.vec [--case ID]... [--strict] \
-//!   [--capture OUT.vec --label STR] [--json OUT.json] [--dump-rows DIR]
+//!   [--capture OUT.vec --label STR] [--json OUT.json] [--dump-rows DIR] \
+//!   [--dump-layers DIR]
 //! ```
 //!
 //! # Rows for an exact KL
@@ -13,6 +14,18 @@
 //! `DIR/<case-id>.f16.npy` plus `DIR/index.json`, in the layout the independent
 //! reference writes (see [`shiso_bench::rows`]). It works beside a capture or a
 //! replay, and like a capture it refuses to replace anything already there.
+//!
+//! # Residual rows for a layer bisection
+//!
+//! `--dump-layers DIR` writes, for each case's frontier position, the residual
+//! streams after the embedding broadcast and after both halves of every layer,
+//! as `DIR/<case-id>/{embed,L{nn}.mixer,L{nn}}.f32.npy` plus `DIR/index.json`
+//! (see [`shiso_bench::layers`]). Only the sparse family's stack has the tap it
+//! reads. The case's final pass runs with device graphs withheld, so every
+//! island is encoded directly and the tap can read between them; the launches
+//! are the ones a replay would issue, so the row graded beside the dump is the
+//! row an untapped run produces. Like the row dump it refuses to replace
+//! anything already there.
 //!
 //! # Replay refuses more than it compares
 //!
@@ -37,9 +50,10 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use shiso_bench::compare::{Budget, FLOOR, STRICT, Verdict, compare};
 use shiso_bench::compare::{TopSlice, top_k};
+use shiso_bench::layers::LayerDump;
 use shiso_bench::replay::{Device, Harness, Vocabulary};
 use shiso_bench::rows::{IndexEntry, RowDump};
-use shiso_bench::run::{REPLAY_CHUNK, case_tokens, prompts_digest, run_case_row};
+use shiso_bench::run::{REPLAY_CHUNK, case_tokens, prompts_digest, run_case_layers, run_case_row};
 use shiso_bench::vecfile::{self, Body, LocalCase, VecFile};
 
 /// Replay or capture a golden-vector fixture against a local checkpoint.
@@ -104,6 +118,16 @@ struct Args {
     /// refusal, checked before the checkpoint loads.
     #[arg(long)]
     dump_rows: Option<PathBuf>,
+
+    /// Also write each case's residual streams at every layer boundary here:
+    /// `<case-id>/embed.f32.npy`, `<case-id>/L{nn}.mixer.f32.npy` and
+    /// `<case-id>/L{nn}.f32.npy`, plus `index.json`.
+    ///
+    /// Sparse-family checkpoints only. The directory is created if needed; an
+    /// index or a case directory already in it is a refusal, checked before
+    /// the checkpoint loads.
+    #[arg(long)]
+    dump_layers: Option<PathBuf>,
 }
 
 /// What every captured fixture says about itself, in the file, in these words.
@@ -179,15 +203,7 @@ fn main() -> Result<()> {
 
     // Opened before the checkpoint so a used directory costs a second, not a
     // load and a prefill.
-    let mut dump = match &args.dump_rows {
-        Some(dir) => {
-            let dump = RowDump::create(dir)
-                .with_context(|| format!("opening {} for rows", dir.display()))?;
-            dump.check_free(cases.iter().map(|c| c.id.as_str()))?;
-            Some(dump)
-        }
-        None => None,
-    };
+    let mut dumps = Dumps::open(&args, &cases)?;
 
     let config = args.config.clone().unwrap_or_else(default_config);
     let mut harness = Harness::open(device, &args.model, &config, ctx)
@@ -199,6 +215,17 @@ fn main() -> Result<()> {
         provenance.vocabulary,
         provenance.prompts,
     ));
+    match (&dumps.layers, harness.sparse_layers()) {
+        (Some(_), None) => {
+            harness.close().context("releasing the device")?;
+            bail!(
+                "--dump-layers reads the sparse stack's residual tap, and {} is not a \
+                 sparse-family checkpoint",
+                args.model.display()
+            );
+        }
+        (_, n) => dumps.n_layers = n.unwrap_or(0),
+    }
 
     let outcome = if let Some(out) = args.capture.clone() {
         capture(
@@ -211,7 +238,7 @@ fn main() -> Result<()> {
                 provenance: &provenance,
                 out: &out,
             },
-            dump.as_mut(),
+            &mut dumps,
         )
     } else {
         replay(
@@ -220,19 +247,11 @@ fn main() -> Result<()> {
             &base_dir,
             &cases,
             args.strict,
-            dump.as_mut(),
+            &mut dumps,
         )
     };
     harness.close().context("releasing the device")?;
-    // The rows written so far are indexed even when a later case failed, so a
-    // long run that died at its last case still leaves its rows readable.
-    if let Some(dump) = dump {
-        let index = dump.finish().context("writing the row index")?;
-        report(&format!(
-            "shiso-parity: wrote rows, indexed in {}",
-            index.display()
-        ));
-    }
+    dumps.finish()?;
     let verdicts = outcome?;
 
     if let Some(path) = &args.json {
@@ -311,28 +330,103 @@ impl Provenance {
     }
 }
 
-/// Runs one case, writes its row when a dump is open, and returns its slice.
+/// The dumps a run writes beside its verdicts, whichever are open.
+#[derive(Debug)]
+struct Dumps {
+    /// Full logits rows.
+    rows: Option<RowDump>,
+    /// Residual rows at every layer boundary.
+    layers: Option<LayerDump>,
+    /// Layers of the loaded stack, which the layer dump checks each tap
+    /// against; zero until a sparse stack is loaded.
+    n_layers: u32,
+}
+
+impl Dumps {
+    /// Opens the directories the command line names, refusing any that
+    /// already hold one of these cases.
+    fn open(args: &Args, cases: &[&LocalCase]) -> Result<Self> {
+        let ids = || cases.iter().map(|c| c.id.as_str());
+        let rows = match &args.dump_rows {
+            Some(dir) => {
+                let dump = RowDump::create(dir)
+                    .with_context(|| format!("opening {} for rows", dir.display()))?;
+                dump.check_free(ids())?;
+                Some(dump)
+            }
+            None => None,
+        };
+        let layers = match &args.dump_layers {
+            Some(dir) => {
+                let dump = LayerDump::create(dir)
+                    .with_context(|| format!("opening {} for layers", dir.display()))?;
+                dump.check_free(ids())?;
+                Some(dump)
+            }
+            None => None,
+        };
+        Ok(Self {
+            rows,
+            layers,
+            n_layers: 0,
+        })
+    }
+
+    /// Writes each open dump's index.
+    ///
+    /// Called whether or not every case ran, so a long run that died at its
+    /// last case still leaves what it wrote readable.
+    fn finish(self) -> Result<()> {
+        if let Some(dump) = self.rows {
+            let index = dump.finish().context("writing the row index")?;
+            report(&format!(
+                "shiso-parity: wrote rows, indexed in {}",
+                index.display()
+            ));
+        }
+        if let Some(dump) = self.layers {
+            let index = dump.finish().context("writing the layer index")?;
+            report(&format!(
+                "shiso-parity: wrote layers, indexed in {}",
+                index.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Runs one case, writes its rows when a dump is open, and returns its slice.
 fn produce(
     harness: &mut Harness,
     vocabulary: &Vocabulary,
     base_dir: &Path,
     case: &LocalCase,
-    dump: Option<&mut RowDump>,
+    dumps: &mut Dumps,
 ) -> Result<TopSlice> {
-    let produced = run_case_row(harness, vocabulary, base_dir, case)?;
-    if let Some(dump) = dump {
-        // The index names the row's 0-based position, one less than the
-        // count of tokens the case feeds; see `shiso_bench::rows`.
+    let (produced, tap) = if dumps.layers.is_some() {
+        let (row, tap) = run_case_layers(harness, vocabulary, base_dir, case)?;
+        (row, Some(tap))
+    } else {
+        (run_case_row(harness, vocabulary, base_dir, case)?, None)
+    };
+    // The index names the row's 0-based position, one less than the count of
+    // tokens the case feeds; see `shiso_bench::rows`.
+    let entry = || -> Result<IndexEntry> {
         let frontier = produced
             .consumed
             .checked_sub(1)
             .context("a case with frontier 0 reads no row")?;
-        let entry = IndexEntry {
+        Ok(IndexEntry {
             prompt_file: case.prompt.to_string_lossy().into_owned(),
             frontier: u32::try_from(frontier)?,
             prompt_tokens: u32::try_from(produced.prompt_tokens)?,
-        };
-        dump.write(&case.id, &produced.row, entry)?;
+        })
+    };
+    if let Some(dump) = dumps.rows.as_mut() {
+        dump.write(&case.id, &produced.row, entry()?)?;
+    }
+    if let (Some(layers), Some(tap)) = (dumps.layers.as_mut(), tap) {
+        layers.write(&case.id, &tap, dumps.n_layers, entry()?)?;
     }
     Ok(top_k(
         &produced.row,
@@ -347,7 +441,7 @@ fn replay(
     base_dir: &Path,
     cases: &[&LocalCase],
     strict: bool,
-    mut dump: Option<&mut RowDump>,
+    dumps: &mut Dumps,
 ) -> Result<Vec<Verdict>> {
     let budget: &Budget = if strict { &STRICT } else { &FLOOR };
     let mut verdicts = Vec::with_capacity(cases.len());
@@ -359,7 +453,7 @@ fn replay(
                 case.id
             );
         }
-        let produced = produce(harness, vocabulary, base_dir, case, dump.as_deref_mut())?;
+        let produced = produce(harness, vocabulary, base_dir, case, dumps)?;
         let verdict = compare(&case.id, &case.tops, &produced, budget);
         report(&verdict.report_line());
         for failure in &verdict.failures {
@@ -389,7 +483,7 @@ fn capture(
     base_dir: &Path,
     cases: &[&LocalCase],
     desc: &CaptureDesc<'_>,
-    mut dump: Option<&mut RowDump>,
+    dumps: &mut Dumps,
 ) -> Result<Vec<Verdict>> {
     let CaptureDesc {
         args,
@@ -410,7 +504,7 @@ fn capture(
 
     let mut filled = Vec::with_capacity(cases.len());
     for case in cases {
-        let produced = produce(harness, vocabulary, base_dir, case, dump.as_deref_mut())?;
+        let produced = produce(harness, vocabulary, base_dir, case, dumps)?;
         let preview = vocabulary.decode(&[shiso_core::ids::TokenId::new(
             produced.first().map_or(0, |e| e.token),
         )])?;

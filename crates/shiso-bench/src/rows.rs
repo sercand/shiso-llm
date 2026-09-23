@@ -146,10 +146,52 @@ pub fn encode_f16_npy(case: &str, row: &[f32]) -> Result<Vec<u8>, RowError> {
         });
     }
 
-    let mut dict = format!(
-        "{{'descr': '<f2', 'fortran_order': False, 'shape': ({},), }}",
-        row.len()
-    );
+    let mut out = npy_header("<f2", &[row.len()], halves.len() * 2)?;
+    for h in &halves {
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Encodes `values` as a `.npy` v1 file of dtype `<f4` and the given shape,
+/// outermost first, in C order.
+///
+/// Written as they are, non-finite values included: an `f32` dump is what a
+/// row is looked at as when it is the finding, so refusing a NaN here would
+/// hide the thing being looked for.
+///
+/// # Errors
+///
+/// [`RowError::BadHeader`] when the shape does not hold exactly `values.len()`
+/// elements.
+pub fn encode_f32_npy(shape: &[usize], values: &[f32]) -> Result<Vec<u8>, RowError> {
+    let count = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d));
+    if count != Some(values.len()) {
+        return Err(RowError::BadHeader {
+            detail: format!("shape {shape:?} does not hold {} values", values.len()),
+        });
+    }
+    let mut out = npy_header("<f4", shape, values.len() * 4)?;
+    for v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// The magic, version and padded header dict of a `.npy` v1 file, with room
+/// reserved for `payload` bytes after it.
+fn npy_header(descr: &str, shape: &[usize], payload: usize) -> Result<Vec<u8>, RowError> {
+    // A one-element tuple needs its trailing comma, which is how Python tells
+    // it from a parenthesized number; numpy writes it the same way.
+    let dims = match shape {
+        [one] => format!("{one},"),
+        _ => shape
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    let mut dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({dims}), }}");
     // Magic (6) + version (2) + header length (2), then the dict padded with
     // spaces and closed by a newline so the data lands on the alignment.
     let unpadded = NPY_MAGIC.len() + 2 + 2 + dict.len() + 1;
@@ -160,20 +202,17 @@ pub fn encode_f16_npy(case: &str, row: &[f32]) -> Result<Vec<u8>, RowError> {
         detail: format!("a {}-byte header does not fit version 1.0", dict.len()),
     })?;
 
-    let mut out = Vec::with_capacity(NPY_MAGIC.len() + 4 + dict.len() + halves.len() * 2);
+    let mut out = Vec::with_capacity(NPY_MAGIC.len() + 4 + dict.len() + payload);
     out.extend_from_slice(NPY_MAGIC);
     out.extend_from_slice(&[1, 0]);
     out.extend_from_slice(&header_len.to_le_bytes());
     out.extend_from_slice(dict.as_bytes());
-    for h in &halves {
-        out.extend_from_slice(&h.to_le_bytes());
-    }
     Ok(out)
 }
 
-/// Parses the header of a one-dimensional `.npy` v1 file.
+/// Parses the header of a `.npy` v1 file.
 ///
-/// Only as general as what [`encode_f16_npy`] and a numpy `np.save` of a 1-D
+/// Only as general as what [`encode_f16_npy`], [`encode_f32_npy`] and a numpy `np.save` of a C-order
 /// array write; it exists so a test can read back what this module wrote
 /// without a second implementation in another language.
 ///
@@ -287,14 +326,7 @@ impl RowDump {
     ///
     /// [`RowError::BadId`] when `id` would not be a plain file name.
     pub fn row_path(&self, id: &str) -> Result<PathBuf, RowError> {
-        let plain = !id.is_empty()
-            && id != "."
-            && id != ".."
-            && !id.contains(['/', '\\', '\0'])
-            && !id.starts_with('.');
-        if !plain {
-            return Err(RowError::BadId { id: id.to_owned() });
-        }
+        check_id(id)?;
         Ok(self.dir.join(format!("{id}.f16.npy")))
     }
 
@@ -345,8 +377,26 @@ impl RowDump {
     }
 }
 
+/// Refuses a case id that would not be a plain file name.
+///
+/// # Errors
+///
+/// [`RowError::BadId`].
+pub(crate) fn check_id(id: &str) -> Result<(), RowError> {
+    let plain = !id.is_empty()
+        && id != "."
+        && id != ".."
+        && !id.contains(['/', '\\', '\0'])
+        && !id.starts_with('.');
+    if plain {
+        Ok(())
+    } else {
+        Err(RowError::BadId { id: id.to_owned() })
+    }
+}
+
 /// Writes `bytes` to a file that must not exist yet.
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), RowError> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), RowError> {
     let io = |source| RowError::Io {
         path: path.to_path_buf(),
         source,

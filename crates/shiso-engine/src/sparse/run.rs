@@ -458,7 +458,24 @@ impl SparseStack {
         phase.mark("inputs");
         self.land_gathers(gathered)?;
         phase.mark("land");
-        self.execute_rows_media(&[session], &pass, block.map(|prefill| prefill.rows()))?;
+        // The tap is taken out for the pass and put back after it, on the
+        // failure path too, so an armed tap outlives a pass that failed and
+        // the caller still disarms it. Unarmed, this is the plain call.
+        match self.tap.take() {
+            None => {
+                self.execute_rows_media(&[session], &pass, block.map(|prefill| prefill.rows()))?;
+            }
+            Some(mut tap) => {
+                let ran = self.execute_rows_tapped(
+                    &[session],
+                    &pass,
+                    block.map(|prefill| prefill.rows()),
+                    Some(&mut tap),
+                );
+                self.tap = Some(tap);
+                ran?;
+            }
+        }
         phase.mark("execute");
         phase.report(pass.plan.len());
         Ok(())

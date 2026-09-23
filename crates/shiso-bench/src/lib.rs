@@ -53,6 +53,7 @@ pub mod chunking;
 pub mod compare;
 pub mod decode;
 pub mod kv;
+pub mod layers;
 pub mod measure;
 pub mod ple;
 pub mod prefill;

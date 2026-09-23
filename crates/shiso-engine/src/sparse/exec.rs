@@ -28,10 +28,12 @@ use shiso_core::backend::{Backend, CoopLaunch, GemmDesc, GraphBackend, KernelArg
 use shiso_core::error::{CoreError, CoreResult};
 
 use crate::sparse::bind::{Binder, Operand};
-use crate::sparse::island::{self, IslandRun};
+use crate::sparse::island::{self, Island, IslandRun};
 use crate::sparse::kernels::EntryTable;
 use crate::sparse::plan::{Step, TrellisOp};
+use crate::sparse::scratch::Buf;
 use crate::sparse::stack::{IslandSpan, Pass};
+use crate::sparse::tap::{ResidualTap, TapPoint};
 
 /// What happened when a pass ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -530,17 +532,81 @@ impl<'a> Exec<'a> {
         pass: &Pass,
         graphs: Option<&dyn GraphBackend>,
     ) -> CoreResult<PassReport> {
+        self.run_pass_tapped(pass, graphs, None)
+    }
+
+    /// Issues a whole pass, copying one residual row into `tap` after the
+    /// prologue and after every island when a tap is given.
+    ///
+    /// A tapped pass is run with `graphs` withheld, so nothing is replayed and
+    /// nothing is captured: see [`crate::sparse::tap`]. Without a tap this is
+    /// [`Exec::run_pass`] exactly.
+    ///
+    /// # Errors
+    ///
+    /// As [`Exec::run_pass`], plus whatever the barrier and the copy report:
+    /// unlike the step dump a tap was asked for, so a row it cannot read is a
+    /// failure rather than a line missing from a log.
+    pub fn run_pass_tapped(
+        &self,
+        pass: &Pass,
+        graphs: Option<&dyn GraphBackend>,
+        mut tap: Option<&mut ResidualTap>,
+    ) -> CoreResult<PassReport> {
         let steps = pass.plan.steps();
-        let graphs = graphs.filter(|_| pass.capturable);
+        let graphs = graphs.filter(|_| pass.capturable && tap.is_none());
+        if let Some(tap) = tap.as_deref_mut() {
+            tap.restart();
+        }
         let mut report = PassReport::default();
         let mut at = 0usize;
-        for span in &pass.islands {
+        for (index, span) in pass.islands.iter().enumerate() {
             report = merge(report, self.run_steps(prefix(steps, at, span.start)?)?);
+            // The prologue is everything in front of the first island. It ends
+            // with the broadcast; the reservation placed there writes no
+            // activation.
+            if index == 0
+                && let Some(tap) = tap.as_deref_mut()
+            {
+                self.copy_residual(tap, TapPoint::Embed, pass.rows)?;
+            }
             report = merge(report, self.run_island(steps, *span, graphs)?);
+            if let Some(tap) = tap.as_deref_mut() {
+                let point = match span.key.island {
+                    Island::Mixer => TapPoint::Mixer(span.key.layer),
+                    Island::Experts => TapPoint::Layer(span.key.layer),
+                };
+                self.copy_residual(tap, point, pass.rows)?;
+            }
             at = span.start.saturating_add(span.len);
         }
         report = merge(report, self.run_steps(tail(steps, at))?);
         Ok(report)
+    }
+
+    /// Copies the last of `rows` residual rows into `tap` under `point`.
+    ///
+    /// The barrier comes first: without it the copy races the launches still
+    /// writing the row and reports the previous island's numbers.
+    fn copy_residual(&self, tap: &mut ResidualTap, point: TapPoint, rows: u32) -> CoreResult<()> {
+        let width = tap.row_len() as u64 * size_of::<f32>() as u64;
+        let last = rows.checked_sub(1).ok_or(CoreError::ShapeMismatch {
+            field: "tapped pass rows",
+            expected: 1,
+            got: 0,
+        })?;
+        self.backend.sync()?;
+        let view = self.binder.buffer(Operand::Scratch(Buf::Residual))?;
+        let row = view.slice(u64::from(last).saturating_mul(width), width)?;
+        let mut bytes = vec![0u8; usize::try_from(width).unwrap_or(usize::MAX)];
+        self.backend.copy_d2h(row, &mut bytes)?;
+        let values = bytes
+            .as_chunks::<{ size_of::<f32>() }>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect();
+        tap.push(point, values)
     }
 
     /// Runs one island, replaying its captured graph when there is one.

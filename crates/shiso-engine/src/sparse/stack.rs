@@ -473,6 +473,9 @@ pub struct SparseStack {
     clock: std::time::Instant,
     /// The disk tier, once a caller has opened a directory over it.
     pub(crate) ckpt: Option<crate::ckpt::Checkpoint>,
+    /// The residual tap, while a caller has one armed; see
+    /// [`crate::sparse::tap`].
+    pub(crate) tap: Option<crate::sparse::tap::ResidualTap>,
 }
 
 impl std::fmt::Debug for SparseStack {
@@ -493,6 +496,7 @@ impl std::fmt::Debug for SparseStack {
             .field("order", &self.order)
             .field("counter", &self.counter)
             .field("checkpointing", &self.ckpt.is_some())
+            .field("tapped", &self.tap.is_some())
             .field("staging", &self.staging)
             .field("clock", &self.clock)
             .field("layers", &self.desc.layers.len())
@@ -645,7 +649,32 @@ impl SparseStack {
             staging: Staging::default(),
             clock: std::time::Instant::now(),
             ckpt: None,
+            tap: None,
         })
+    }
+
+    /// Arms the residual tap: every single-session chunk pass from here on
+    /// copies its last row's residual after the prologue and after every
+    /// island, and runs without device graphs. See [`crate::sparse::tap`].
+    ///
+    /// Arming again discards whatever the previous tap held.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`crate::sparse::tap::ResidualTap::new`] refuses.
+    pub fn arm_residual_tap(&mut self) -> CoreResult<()> {
+        self.tap = Some(crate::sparse::tap::ResidualTap::new(
+            self.shape.streams,
+            self.shape.hidden,
+        )?);
+        Ok(())
+    }
+
+    /// Disarms the residual tap and returns what the last tapped pass copied.
+    ///
+    /// `None` means no tap was armed.
+    pub fn take_residual_tap(&mut self) -> Option<crate::sparse::tap::ResidualTap> {
+        self.tap.take()
     }
 
     /// The geometry this stack runs.
@@ -1154,6 +1183,22 @@ impl SparseStack {
         pass: &Pass,
         media: Option<DeviceView<'a>>,
     ) -> CoreResult<crate::sparse::exec::PassReport> {
+        self.execute_rows_tapped(sessions, pass, media, None)
+    }
+
+    /// The same pass, copying residual rows into `tap` when one is given.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::execute_rows_media`], plus whatever
+    /// [`crate::sparse::exec::Exec::run_pass_tapped`] reports for the copy.
+    pub(crate) fn execute_rows_tapped<'a>(
+        &'a self,
+        sessions: &[SessionId],
+        pass: &Pass,
+        media: Option<DeviceView<'a>>,
+        tap: Option<&mut crate::sparse::tap::ResidualTap>,
+    ) -> CoreResult<crate::sparse::exec::PassReport> {
         if pass.media_rows.is_some() != media.is_some() {
             return Err(CoreError::Unsupported {
                 what: "a pass whose splice and whose encoder block disagree about whether \
@@ -1205,7 +1250,7 @@ impl SparseStack {
             None => binder,
         };
         crate::sparse::exec::Exec::new(self.backend.as_ref(), self.opts.entries, binder)
-            .run_pass(pass, self.backend.as_graph())
+            .run_pass_tapped(pass, self.backend.as_graph(), tap)
     }
 
     /// The executor one session's launches are issued through.

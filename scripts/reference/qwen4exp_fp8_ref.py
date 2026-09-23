@@ -552,6 +552,46 @@ class Reference:
                 if not torch.equal(got.cpu(), ref.to(torch.long)):
                     raise ValueError(f"n-gram {what}: checkpoint and library disagree")
 
+    def _layer_dump_hooks(self, positions: list[int], layer_rows: dict) -> list:
+        """Hooks that copy the residual streams at `positions` at every layer boundary.
+
+        The names and the points are those of the engine's residual tap
+        (`scripts/reference/LAYER_DUMP.md`, `crates/shiso-bench/src/layers.rs`):
+
+        - `embed`: the input of layer 0, the embedding repeated across the streams;
+        - `L{nn}.mixer`: the input of layer nn's feed-forward hyper-connection, which
+          is the residual after the token mixer's combine (and after the n-gram add,
+          on the layer that carries it, as in the engine);
+        - `L{nn}`: layer nn's output.
+
+        Each value is `[hc_count, hidden]` f32, stream-major, which is how the
+        library's flat `hc_count * hidden` residual unflattens.
+        """
+        tc = self.config
+        layers = list(self.model.model.layers[: tc.num_hidden_layers])
+        width = max(2, len(str(max(1, len(layers) - 1))))
+        streams = tc.hc_count
+
+        def grab(name: str, x: torch.Tensor) -> None:
+            for p in positions:
+                layer_rows[p][name] = x[0, p].float().reshape(streams, -1).cpu().numpy()
+
+        def first(args, kwargs, key):
+            return args[0] if args else kwargs[key]
+
+        hooks = [layers[0].register_forward_pre_hook(
+            lambda mod, args, kwargs: grab("embed", first(args, kwargs, "hidden_states")),
+            with_kwargs=True)]
+        for i, layer in enumerate(layers):
+            tag = f"L{i:0{width}d}"
+            hooks.append(layer.mlp_hyper_connection.register_forward_pre_hook(
+                lambda mod, args, kwargs, tag=tag: grab(
+                    f"{tag}.mixer", first(args, kwargs, "hyper_input")),
+                with_kwargs=True))
+            hooks.append(layer.register_forward_hook(
+                lambda mod, args, out, tag=tag: grab(tag, out)))
+        return hooks
+
     @torch.no_grad()
     def forward(self, ids: list[int], positions: list[int], dump_layers: bool = False,
                 per_layer_timing: bool = True) -> dict:
@@ -559,7 +599,7 @@ class Reference:
         model = self.model
         timings: list[tuple[int, float, float, int]] = []
         hooks = []
-        layer_rows: dict[int, list[np.ndarray]] = {p: [] for p in positions} if dump_layers else {}
+        layer_rows: dict[int, dict[str, np.ndarray]] = {p: {} for p in positions} if dump_layers else {}
         state = {}
 
         if per_layer_timing:
@@ -577,16 +617,13 @@ class Reference:
                     self.store.read_seconds - state["read"],
                     torch.cuda.max_memory_allocated(),
                 ))
-                if dump_layers:
-                    for p in positions:
-                        layer_rows[p].append(out[0, p].float().cpu().numpy())
 
             for i, layer in enumerate(model.model.layers):
                 layer._ref_idx = i
                 hooks.append(layer.register_forward_pre_hook(pre, with_kwargs=True))
                 hooks.append(layer.register_forward_hook(post, with_kwargs=True))
         if dump_layers:
-            emb_rows = {}
+            hooks += self._layer_dump_hooks(positions, layer_rows)
 
         input_ids = torch.tensor([ids], dtype=torch.long, device=self.device)
         t0 = time.perf_counter()
@@ -722,12 +759,20 @@ def cmd_capture(args) -> None:
             if (rows_dir / f"{c.id}.f16.npy").exists() or c.id in index:
                 sys.exit(f"row for case {c.id} already exists in {rows_dir}")
     layer_dir = Path(args.layer_dump_dir).expanduser().resolve() if args.layer_dump_dir else None
+    if layer_dir:
+        # The engine's layout (LAYER_DUMP.md): refused up front, before the load.
+        if (layer_dir / "index.json").exists():
+            sys.exit(f"{layer_dir / 'index.json'} already exists; a layer dump is replaced only deliberately")
+        for c in cases:
+            if (layer_dir / c.id).exists():
+                sys.exit(f"layers for case {c.id} already exist in {layer_dir}")
     dump = len(cases) * TOP_COUNT * 40 + 8192
     if rows_dir:
         dump += len(cases) * ROW_BYTES + 4096 * len(cases)
     if layer_dir:
+        # embed, then a mixer and a layer file per layer, each [4, 2560] f32.
         n_layers = 48
-        dump += len(cases) * (n_layers * 4 * HIDDEN * 4 + 128 + 4096)
+        dump += len(cases) * ((1 + 2 * n_layers) * (4 * HIDDEN * 4 + 128) + 4096)
     guard(dump, args.max_dump_bytes)
 
     ref = Reference(Path(args.checkpoint))
@@ -820,15 +865,33 @@ def cmd_capture(args) -> None:
         index_path.write_text(json.dumps(index, indent=1, sort_keys=True) + "\n")
         log(f"wrote {len(cases)} rows and {index_path}")
     if layer_dir:
+        # <dir>/<case>/{embed,L{nn}.mixer,L{nn}}.f32.npy, each [4, 2560] <f4, plus
+        # index.json in the row dump's schema (frontier is the 0-based position).
         layer_dir.mkdir(parents=True, exist_ok=True)
+        layer_index = {}
         for c in cases:
-            arr = np.stack(layer_rows[c.id]).astype("<f4")
-            np.save(layer_dir / f"{c.id}.layers.npy", arr, allow_pickle=False)
-            for i, v in enumerate(arr):
-                rms = float(np.sqrt(np.mean(v.astype(np.float64) ** 2)))
-                log(f"{c.id} layer {i}: n={v.size} rms={rms:.6e} absmax={float(np.abs(v).max()):.6e} "
-                    f"zeros={int((v == 0).sum())} non_finite={int((~np.isfinite(v)).sum())} "
-                    f"first={[float(x) for x in v[:4]]}")
+            case_dir = layer_dir / c.id
+            case_dir.mkdir()
+            for name, v in layer_rows[c.id].items():
+                arr = np.ascontiguousarray(v, dtype="<f4")
+                with open(case_dir / f"{name}.f32.npy", "xb") as f:
+                    np.save(f, arr, allow_pickle=False)
+                rms = float(np.sqrt(np.mean(arr.astype(np.float64) ** 2)))
+                log(f"{c.id} {name}: shape={list(arr.shape)} rms={rms:.6e} "
+                    f"absmax={float(np.abs(arr).max()):.6e} "
+                    f"non_finite={int((~np.isfinite(arr)).sum())}")
+            layer_index[c.id] = {
+                "prompt_file": prompt_key(base / c.prompt),
+                "frontier": c.frontier - 1,
+                "prompt_tokens": full_len[c.id],
+                "vec_frontier": c.frontier,
+                "mode": c.mode,
+                "tokens_digest": tokens_digest(tokens[c.id]),
+                "files": len(layer_rows[c.id]),
+            }
+        with open(layer_dir / "index.json", "x") as f:
+            f.write(json.dumps(layer_index, indent=1, sort_keys=True) + "\n")
+        log(f"wrote layers for {len(cases)} cases under {layer_dir}")
     summary = {"passes": passes, "experts_loaded": ref.store.loaded,
                "expert_bytes_read": ref.store.bytes_read, "load_seconds": ref.load_seconds}
     log("summary " + json.dumps(summary))
@@ -932,7 +995,10 @@ def main() -> None:
     c.add_argument("--out", required=True)
     c.add_argument("--label", required=True)
     c.add_argument("--rows-dir")
-    c.add_argument("--layer-dump-dir")
+    c.add_argument("--layer-dump-dir",
+                   help="also write each case's residual streams at every layer boundary here, "
+                        "in the engine's layout: <case>/{embed,L{nn}.mixer,L{nn}}.f32.npy "
+                        "(see scripts/reference/LAYER_DUMP.md)")
     c.add_argument("--max-dump-bytes", type=int, default=64 * 2**20)
     g = sub.add_parser("greedy")
     g.add_argument("--tokens", type=int, default=24)
