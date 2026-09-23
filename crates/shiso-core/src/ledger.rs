@@ -351,7 +351,12 @@ impl LedgerReport {
         i64::try_from(grown - tagged).ok()
     }
 
-    /// Emits one `info` line per consumer, one per mark, and the totals.
+    /// Emits one `info` line per consumer, one per mark, and the totals, in
+    /// whole mebibytes.
+    ///
+    /// The exact figures - bytes, the peak, where the bytes live and how many
+    /// live allocations make them up - go to a `debug` line beside each, for
+    /// when a count or a leak is the question rather than the size.
     pub fn log(&self) {
         for mark in &self.marks {
             log_mark("memory mark", mark);
@@ -359,21 +364,25 @@ impl LedgerReport {
         for entry in &self.entries {
             tracing::info!(
                 component = entry.tag.name(),
+                mib = whole_mib(entry.bytes),
+                limit_mib = entry.limit.map(whole_mib),
+                "memory"
+            );
+            tracing::debug!(
+                component = entry.tag.name(),
                 residence = entry.tag.residence().name(),
                 bytes = entry.bytes,
-                mib = mib(entry.bytes),
-                peak_mib = mib(entry.peak),
+                peak_bytes = entry.peak,
                 allocations = entry.count,
-                limit_mib = entry.limit.map(mib),
-                "memory"
+                limit_bytes = entry.limit,
+                "memory detail"
             );
         }
         tracing::info!(
-            device_mib = mib(self.total(Residence::Device)),
-            host_mib = mib(self.total(Residence::Host)),
-            disk_mib = mib(self.total(Residence::Disk)),
-            unaccounted_mib = self.unaccounted().map(signed_mib),
-            unified = self.unified,
+            device_mib = whole_mib(self.total(Residence::Device)),
+            host_mib = whole_mib(self.total(Residence::Host)),
+            disk_mib = whole_mib(self.total(Residence::Disk)),
+            unaccounted_mib = self.unaccounted().map(|bytes| bytes >> 20),
             "memory total"
         );
         if let Some(now) = &self.now {
@@ -422,9 +431,9 @@ impl fmt::Display for LedgerReport {
 fn log_mark(message: &'static str, mark: &Mark) {
     tracing::info!(
         label = mark.label,
-        device_total_mib = mark.device.map(|info| mib(info.total)),
-        device_free_mib = mark.device.map(|info| mib(info.free)),
-        host_available_mib = mark.host_available.map(mib),
+        device_total_mib = mark.device.map(|info| whole_mib(info.total)),
+        device_free_mib = mark.device.map(|info| whole_mib(info.free)),
+        host_available_mib = mark.host_available.map(whole_mib),
         "{message}"
     );
 }
@@ -433,7 +442,12 @@ const fn in_use(info: MemoryInfo) -> u64 {
     info.total.saturating_sub(info.free)
 }
 
-/// Mebibytes, for a log line.
+/// Whole mebibytes, rounded to nearest, for a log line.
+const fn whole_mib(bytes: u64) -> u64 {
+    bytes.saturating_add(1 << 19) >> 20
+}
+
+/// Mebibytes, for a table.
 #[expect(
     clippy::cast_precision_loss,
     reason = "a log line in mebibytes; a mantissa's worth of bytes is not the point"
