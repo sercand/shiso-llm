@@ -44,6 +44,14 @@ pub trait StreamParser: Send + std::fmt::Debug {
     /// tool block is closed (thinking as `ThinkingEnd`, a tool call as `Text` of
     /// its raw bytes, since a half call is not a call).
     fn finish(&mut self) -> Vec<Segment>;
+
+    /// Whether the next token should be picked greedily because a sampled one
+    /// could only break the format here: inside a tool call's tags, or at a
+    /// possible closing tag. Prose, reasoning and argument values sample as the
+    /// request asked. Parsers with no such structure never ask.
+    fn wants_greedy(&self) -> bool {
+        false
+    }
 }
 
 /// A pass-through parser that emits all text as [`Segment::Text`] without inspecting tags.

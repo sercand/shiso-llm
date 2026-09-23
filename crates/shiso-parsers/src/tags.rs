@@ -408,6 +408,29 @@ impl StreamParser for TagParser {
         segments
     }
 
+    /// Greedy only for the Qwen XML body, whose tags are the ones a sampled
+    /// token has been seen to corrupt: a held-back `<tool_call>` prefix of two
+    /// or more bytes (a lone `<` is too common in prose and code), anywhere in a
+    /// call between tags, and inside a value only while its tail can still
+    /// become `</parameter>`. Reasoning never is.
+    fn wants_greedy(&self) -> bool {
+        if self.tool_body != ToolBody::QwenXml {
+            return false;
+        }
+        match &self.state {
+            State::Thinking => false,
+            State::Text => longest_matching_prefix_suffix(&self.buffer, self.tool_open) >= 2,
+            State::ToolCall(body) => {
+                let mut seen = body.clone();
+                seen.push_str(&self.buffer);
+                match open_value(&seen) {
+                    None => true,
+                    Some(value) => longest_matching_prefix_suffix(value, PARAMETER_CLOSE_TAG) >= 2,
+                }
+            }
+        }
+    }
+
     fn finish(&mut self) -> Vec<Segment> {
         let mut segments = Vec::new();
         match std::mem::replace(&mut self.state, State::Text) {
@@ -460,6 +483,24 @@ fn qwen_xml_value(raw: &str) -> serde_json::Value {
     match serde_json::from_str::<serde_json::Value>(text) {
         Ok(serde_json::Value::String(_)) | Err(_) => serde_json::Value::String(text.to_string()),
         Ok(value) => value,
+    }
+}
+
+/// The text of the parameter value still open at the end of `call`, or `None`
+/// when the call is between tags. A value is open once its `<parameter=KEY>`
+/// has seen `>` and no structural `</parameter>` has closed it.
+///
+/// The last `<parameter=` is taken as the current one, so a value that itself
+/// contains `<parameter=` reads as a new parameter. The format has no escape for
+/// that; the cost is some greedy steps inside such a value.
+fn open_value(call: &str) -> Option<&str> {
+    const OPEN: &str = "<parameter=";
+    let start = call.rfind(OPEN)?;
+    let name_end = call[start + OPEN.len()..].find('>')?;
+    let value = &call[start + OPEN.len() + name_end + 1..];
+    match structural_parameter_close_strict(value) {
+        Some(_) => None,
+        None => Some(value),
     }
 }
 

@@ -890,7 +890,7 @@ impl Coordinator {
                     continue;
                 };
                 let (params, seed) = slot.draw();
-                sampled.push((entry.slot, sample(row, scores, params, seed)));
+                sampled.push((entry.slot, sample(row, scores, &params, seed)));
             }
             sampled
         };
@@ -1294,7 +1294,7 @@ fn start_decoding(
 ) {
     let token = {
         let (params, seed) = slot.draw();
-        sample(row, scores, params, seed)
+        sample(row, scores, &params, seed)
     };
     let events = slot.accept(token, vocabulary, stop, now);
     send_all(stats, slot, events);
