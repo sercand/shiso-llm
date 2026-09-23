@@ -29,3 +29,4 @@ the name "ds4" for the host project.
 | `crates/shiso-kerneltest` | Splash Metal runtime kernels | some CPU oracles restate that arithmetic |
 | `crates/shiso-server` | - | original; wire formats follow the OpenAI and Anthropic APIs |
 | `crates/shiso-bench` | llama.cpp, `mlx-lm`, `transformers` | independent reference fixtures are captured from these |
+| `scripts/reference/` | atlas-ir repository (same owner); Hugging Face `transformers`, Apache-2.0 | reference tooling. `repro_readback.py` is copied from atlas-ir with embedded credentials removed and `--top-k` added. `render_chat_fixtures.py` calls the reference chat-template implementation from `transformers` at run time; nothing is vendored |
