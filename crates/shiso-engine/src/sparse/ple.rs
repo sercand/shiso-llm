@@ -159,6 +159,17 @@ impl NgramTable {
         self.row
     }
 
+    /// Host bytes the reader's row cache holds, counted the way the cache
+    /// sizes itself: each slot's row plus its bookkeeping.
+    #[must_use]
+    pub fn cache_bytes(&self) -> u64 {
+        /// A slot's identifier, CLOCK bit, pending bit and two index entries.
+        const SLOT_OVERHEAD: u64 = 8 + 1 + 2 * 4;
+        self.stream
+            .cache_rows()
+            .saturating_mul(u64::from(self.stream.row_bytes()).saturating_add(SLOT_OVERHEAD))
+    }
+
     /// The reader the rows come off disk through.
     #[must_use]
     pub const fn stream(&self) -> &Arc<PleStream> {
@@ -211,8 +222,9 @@ impl NgramTier {
         table: NgramTable,
     ) -> CoreResult<Self> {
         let stride = fits(ple, &table)?;
-        let rows = shiso_core::buffer::alloc(
+        let rows = shiso_core::buffer::alloc_tagged(
             backend,
+            shiso_core::ledger::MemTag::NgramStaging,
             u64::from(crate::sparse::stack::MAX_PREFILL_CHUNK)
                 .saturating_mul(u64::from(ple.heads()))
                 .saturating_mul(u64::from(stride)),

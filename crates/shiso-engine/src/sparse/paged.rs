@@ -33,8 +33,9 @@
 use std::sync::Arc;
 
 use shiso_core::backend::Backend;
-use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc};
+use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc_tagged};
 use shiso_core::error::{CoreError, CoreResult};
+use shiso_core::ledger::MemTag;
 use shiso_core::page::{PAGE_TOKENS, pages_for};
 use shiso_kvstore::{Backing, CacheGeometry, Frontier, KvError, PageId};
 
@@ -292,6 +293,17 @@ pub struct PagedKv {
 }
 
 impl PagedKv {
+    /// Device bytes one page occupies across every run, which is what the
+    /// pool was allocated at.
+    #[must_use]
+    pub fn page_bytes(&self) -> u64 {
+        self.pool
+            .runs
+            .iter()
+            .map(|run| run.stride)
+            .fold(0, u64::saturating_add)
+    }
+
     /// Allocates the pool: [`PLANES`] allocations per attention layer, in layer
     /// order, each deep enough for `pool_pages` pages.
     ///
@@ -317,8 +329,15 @@ impl PagedKv {
             .count(LayerKind::Attn)
             .saturating_add(u32::from(planes.draft));
         let mut runs = Vec::with_capacity(PLANES.len().saturating_mul(attn as usize));
-        for _layer in 0..attn {
+        for layer in 0..attn {
+            // The draft head's rank is the last one, past every target slot.
+            let draft = planes.draft && layer + 1 == attn;
             for plane in PLANES {
+                let tag = match (draft, plane) {
+                    (true, _) => MemTag::KvDraft,
+                    (false, Plane::Key | Plane::Value) => MemTag::KvAttention,
+                    (false, Plane::IndexerKey | Plane::IndexerPooled) => MemTag::KvIndexer,
+                };
                 let stride = plane.page_bytes(shape);
                 let bytes = u64::from(pool_pages).checked_mul(stride).ok_or_else(|| {
                     CoreError::InvalidValue {
@@ -329,7 +348,7 @@ impl PagedKv {
                     }
                 })?;
                 runs.push(Run {
-                    buffer: alloc(backend, bytes)?,
+                    buffer: alloc_tagged(backend, tag, bytes)?,
                     stride,
                 });
             }
@@ -516,7 +535,7 @@ impl SessionPages {
                 key: "ctx",
                 value: format!("{slots} page slots do not fit a device table"),
             })?;
-        let table = alloc(backend, bytes)?;
+        let table = alloc_tagged(backend, MemTag::PageTables, bytes)?;
         // Every slot past the claim has to read as page zero; see the type's
         // own notes for what happens when it does not.
         backend.fill_zero(table.view())?;

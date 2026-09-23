@@ -69,6 +69,7 @@ use shiso_core::backend::Backend;
 use shiso_core::buffer::{DeviceBuffer, import_host};
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
+use shiso_core::ledger::{self, MemTag};
 use shiso_core::media::{MediaModel, VisionPrefill};
 use shiso_core::model::{
     DecodeStep, Logits, Model, ModelInfo, Speculated, Speculating, StopTokens,
@@ -188,13 +189,17 @@ impl Qwen4ExpModel {
     ) -> CoreResult<Self> {
         let file = GgufFile::open_shared(path).map_err(open_failure)?;
         let binding = bind_qwen4exp(&file, config)?;
-        let ngram = open_ngram(backend, &file, path, &binding, config, opts)?;
+        let ngram = {
+            let _tag = ledger::scope(MemTag::WeightsEmbedding);
+            open_ngram(backend, &file, path, &binding, config, opts)?
+        };
         let expert_gate = binding
             .layers
             .first()
             .map_or(binding.token_embd.dtype, |layer| layer.experts.gate.dtype);
         let mut weights = import(backend, &file, &binding)?;
         if let Some(sidecar) = draft {
+            let _tag = ledger::scope(MemTag::DraftWeights);
             // Its own mapping, dropped with the target's: the head's tensors
             // take handles on it exactly as the target's do on the checkpoint.
             let head = GgufFile::open_shared(sidecar).map_err(open_failure)?;
@@ -419,6 +424,7 @@ fn import(
             BlockRoles::Recurrent(roles) => {
                 let rank = gdn_rank;
                 gdn_rank += 1;
+                let _tag = ledger::scope(MemTag::WeightsRecurrent);
                 (
                     SparseBlock::Recurrent(import_recurrent(backend, file, roles)?),
                     rank,
@@ -427,30 +433,51 @@ fn import(
             BlockRoles::Attn(roles) => {
                 let rank = attn_rank;
                 attn_rank += 1;
+                let _tag = ledger::scope(MemTag::WeightsAttention);
                 (SparseBlock::Attn(import_attn(backend, file, roles)?), rank)
             }
         };
-        layers.push(SparseLayer {
-            attn_mix: import_mix(backend, file, &layer.attn_mix)?,
-            ffn_mix: import_mix(backend, file, &layer.ffn_mix)?,
-            block,
-            experts: import_experts(backend, file, &layer.experts)?,
-            ngram: layer
+        let mix = ledger::scope(MemTag::WeightsStreamMix);
+        let attn_mix = import_mix(backend, file, &layer.attn_mix)?;
+        let ffn_mix = import_mix(backend, file, &layer.ffn_mix)?;
+        drop(mix);
+        let experts = {
+            let _tag = ledger::scope(MemTag::WeightsExperts);
+            import_experts(backend, file, &layer.experts)?
+        };
+        let ngram = {
+            let _tag = ledger::scope(MemTag::WeightsEmbedding);
+            layer
                 .ngram
                 .as_ref()
                 .map(|roles| import_ngram(backend, file, roles))
-                .transpose()?,
+                .transpose()?
+        };
+        layers.push(SparseLayer {
+            attn_mix,
+            ffn_mix,
+            block,
+            experts,
+            ngram,
             ordinal,
         });
     }
+    let token_embd = {
+        let _tag = ledger::scope(MemTag::WeightsEmbedding);
+        weight(backend, file, &binding.token_embd)?
+    };
+    let _tag = ledger::scope(MemTag::WeightsHead);
+    let lm_head = binding
+        .output
+        .as_ref()
+        .map(|view| weight(backend, file, view))
+        .transpose()?;
+    // The mix that folds the streams back into one row is part of the head.
+    let output_mix = import_mix(backend, file, &binding.output_mix)?;
     Ok(SparseWeights {
-        token_embd: weight(backend, file, &binding.token_embd)?,
-        lm_head: binding
-            .output
-            .as_ref()
-            .map(|view| weight(backend, file, view))
-            .transpose()?,
-        output_mix: import_mix(backend, file, &binding.output_mix)?,
+        token_embd,
+        lm_head,
+        output_mix,
         layers,
         draft: None,
     })

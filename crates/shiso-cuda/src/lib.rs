@@ -177,6 +177,8 @@ pub struct CudaBackend {
     staging: Mutex<Option<upload::Staging>>,
     /// Where the current load's import time went.
     imports: Mutex<upload::ImportTally>,
+    /// Where this backend's memory went; see [`shiso_core::ledger`].
+    ledger: Arc<shiso_core::MemLedger>,
     /// Declared last so it drops last: every other member holds handles that
     /// are only valid inside this context.
     device: DeviceCtx,
@@ -228,6 +230,7 @@ impl CudaBackend {
             blas,
             staging: Mutex::new(None),
             imports: Mutex::new(upload::ImportTally::default()),
+            ledger: Arc::new(shiso_core::MemLedger::new(device.integrated)),
             device,
         }))
     }
@@ -365,8 +368,15 @@ impl Backend for CudaBackend {
     }
 
     fn finish_imports(&self) {
-        *self.staging.lock() = None;
+        if self.staging.lock().take().is_some() {
+            self.ledger
+                .release(shiso_core::MemTag::UploadStaging, upload::STAGING_BYTES);
+        }
         std::mem::take(&mut *self.imports.lock()).report();
+    }
+
+    fn ledger(&self) -> Option<&Arc<shiso_core::MemLedger>> {
+        Some(&self.ledger)
     }
 
     fn memory_info(&self) -> Option<shiso_core::MemoryInfo> {
@@ -503,7 +513,14 @@ impl CoopLaunch for CudaBackend {
                 // The old slab goes only once the new one exists, so a failed
                 // growth leaves the caller with what it had rather than with
                 // nothing.
-                _ => state.scratch.replace((raw, bytes)).map(|(old, _)| old),
+                _ => {
+                    let old = state.scratch.replace((raw, bytes));
+                    self.ledger.record(shiso_core::MemTag::CoopScratch, bytes);
+                    if let Some((_, held)) = old {
+                        self.ledger.release(shiso_core::MemTag::CoopScratch, held);
+                    }
+                    old.map(|(old, _)| old)
+                }
             }
         };
         if let Some(spare) = spare {

@@ -53,6 +53,7 @@ pub mod island;
 pub mod kernels;
 pub mod matmul;
 pub mod media;
+mod memory;
 pub mod moe;
 pub mod mtp;
 pub mod paged;

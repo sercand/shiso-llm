@@ -40,6 +40,9 @@ const SLOT_BYTES: usize = 64 << 20;
 /// Slots in flight. Four keeps the device busy while one fills, measured.
 const SLOTS: usize = 4;
 
+/// Page-locked host bytes the staging holds while it is open.
+pub(crate) const STAGING_BYTES: u64 = (SLOTS * SLOT_BYTES) as u64;
+
 /// Threads that fill one slot.
 ///
 /// The copy is page-fault bound, not bandwidth bound, so it scales with

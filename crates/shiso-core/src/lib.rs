@@ -28,6 +28,7 @@ pub mod config;
 pub mod dtype;
 pub mod error;
 pub mod ids;
+pub mod ledger;
 pub mod media;
 pub mod model;
 pub mod page;
@@ -37,11 +38,14 @@ pub use backend::{
     GemmDType, GemmDesc, GemmOp, GraphBackend, GraphCapture, GraphKey, KernelArg, KernelRef,
     LaunchArgs, MemoryInfo, PointerPack,
 };
-pub use buffer::{DeviceBuffer, DeviceView, HostBytes, RawBuffer, alloc, import_host};
+pub use buffer::{
+    DeviceBuffer, DeviceView, HostBytes, RawBuffer, alloc, alloc_tagged, import_host,
+};
 pub use config::{HfConfig, HiddenAct, VisionConfig};
 pub use dtype::DType;
 pub use error::{Chain, CoreError, CoreResult, chain_of};
 pub use ids::{LayerIdx, Seed, SessionId, TokenId, TokenOutOfRange};
+pub use ledger::{LedgerReport, MemLedger, MemTag, Residence};
 pub use media::{MediaModel, PadTokens, VisionGrid, VisionPrefill};
 pub use model::{
     DecodeStep, Logits, Model, ModelInfo, SamplingParams, Speculated, Speculating, StopTokens,

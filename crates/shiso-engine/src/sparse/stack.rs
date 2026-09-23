@@ -32,9 +32,11 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use shiso_core::backend::Backend;
-use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc};
+use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc_tagged};
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{LayerIdx, SessionId, TokenId};
+use shiso_core::ledger::MemTag;
+use shiso_core::page::PAGE_TOKENS;
 use shiso_kvstore::{Frontier, KvCache};
 
 use crate::options::EngineOptions;
@@ -504,6 +506,27 @@ impl std::fmt::Debug for SparseStack {
     }
 }
 
+/// The line a resident stack announces itself with: its geometry, and what
+/// its cache costs per token, per session and per checkpoint - the figures a
+/// capacity question starts from.
+fn log_resident(shape: &SparseShape, opts: &SparseOptions, kv: &PagedKv, ckpt_bytes: u64) {
+    tracing::info!(
+        layers = shape.n_layers(),
+        recurrent = shape.count(LayerKind::Gdn),
+        experts = shape.moe.experts,
+        streams = shape.streams,
+        ctx = opts.engine.ctx,
+        pool_pages = opts.engine.kv_pool_pages,
+        pool_tokens = u64::from(opts.engine.kv_pool_pages) * u64::from(PAGE_TOKENS),
+        page_bytes = kv.page_bytes(),
+        kv_bytes_per_token = kv.page_bytes() / u64::from(PAGE_TOKENS),
+        session_bytes = session_bytes(shape, opts.spec),
+        ckpt_bytes,
+        ckpt_slots = opts.engine.kv_ckpt_slots,
+        "sparse stack resident"
+    );
+}
+
 /// Device bytes one session allocates when it opens.
 ///
 /// Every recurrent slot's window and state, one rollback record of each per
@@ -558,6 +581,10 @@ impl SparseStack {
     ) -> CoreResult<Self> {
         shape.validate()?;
         check_layers(&shape, &weights)?;
+        // Everything resident so far is weights: the ledger's second mark.
+        if let Some(ledger) = backend.ledger() {
+            ledger.mark("after_weights", backend.memory_info());
+        }
         let recurrent_slots = usize::try_from(shape.count(LayerKind::Gdn)).unwrap_or(0);
         // One extra rank of planes when the checkpoint brought a draft head,
         // because the head runs the same indexer over its own rows.
@@ -573,7 +600,10 @@ impl SparseStack {
             opts.engine.ctx,
         )?;
         let ngram = match (shape.ple, ngram) {
-            (Some(ple), Some(table)) => Some(ple::NgramTier::open(backend, ple, table)?),
+            (Some(ple), Some(table)) => {
+                crate::sparse::memory::watch_ngram(backend, &table, opts.ngram_cache_bytes);
+                Some(ple::NgramTier::open(backend, ple, table)?)
+            }
             (None, None) => None,
             (Some(_), None) => {
                 return Err(CoreError::Unsupported {
@@ -613,6 +643,8 @@ impl SparseStack {
             None,
         )
         .map_err(cache_failure)?;
+        let cache = Arc::new(cache);
+        crate::sparse::memory::watch_cache(backend, &cache, kv.page_bytes(), geometry.ckpt_bytes);
         let device = Device {
             blas: backend.as_blas().is_some(),
             capturing: false,
@@ -620,15 +652,7 @@ impl SparseStack {
             half_block_input: false,
         };
         let desc = weights.desc(ngram.as_ref().map(|tier| tier.table().row()));
-        tracing::info!(
-            layers = shape.n_layers(),
-            recurrent = recurrent_slots,
-            experts = shape.moe.experts,
-            streams = shape.streams,
-            ctx = opts.engine.ctx,
-            pool_pages = opts.engine.kv_pool_pages,
-            "sparse stack resident"
-        );
+        log_resident(&shape, &opts, &kv, geometry.ckpt_bytes);
         Ok(Self {
             backend: Arc::clone(backend),
             shape,
@@ -639,7 +663,7 @@ impl SparseStack {
             resident: Some(Resident {
                 weights,
                 kv,
-                cache: Arc::new(cache),
+                cache,
                 scratch,
                 ngram,
             }),
@@ -768,8 +792,16 @@ impl SparseStack {
                 let state_bytes = state_bytes(&self.shape);
                 let rollback = if self.opts.spec.is_speculative() {
                     Some(RecurrentRollback {
-                        conv: alloc(&self.backend, records.saturating_mul(conv_bytes))?,
-                        state: alloc(&self.backend, records.saturating_mul(state_bytes))?,
+                        conv: alloc_tagged(
+                            &self.backend,
+                            MemTag::RecurrentRollback,
+                            records.saturating_mul(conv_bytes),
+                        )?,
+                        state: alloc_tagged(
+                            &self.backend,
+                            MemTag::RecurrentRollback,
+                            records.saturating_mul(state_bytes),
+                        )?,
                     })
                 } else {
                     None
@@ -780,8 +812,8 @@ impl SparseStack {
                 // before it is written on a session's first chunk, so without
                 // this the fold carries a stranger's state and still answers.
                 // The dense family clears its stack for the same reason.
-                let conv = alloc(&self.backend, conv_bytes)?;
-                let state = alloc(&self.backend, state_bytes)?;
+                let conv = alloc_tagged(&self.backend, MemTag::RecurrentState, conv_bytes)?;
+                let state = alloc_tagged(&self.backend, MemTag::RecurrentState, state_bytes)?;
                 clear_range(&self.backend, &conv)?;
                 clear_range(&self.backend, &state)?;
                 if let Some(slabs) = rollback.as_ref() {
@@ -799,7 +831,7 @@ impl SparseStack {
         let ngram_window = self
             .shape
             .ple
-            .map(|_| alloc(&self.backend, window_bytes))
+            .map(|_| alloc_tagged(&self.backend, MemTag::SessionOther, window_bytes))
             .transpose()?;
         if let Some(window) = ngram_window.as_ref() {
             clear_range(&self.backend, window)?;
@@ -813,7 +845,13 @@ impl SparseStack {
             let ngram_ckpt = self
                 .shape
                 .ple
-                .map(|_| alloc(&self.backend, records.saturating_mul(window_bytes)))
+                .map(|_| {
+                    alloc_tagged(
+                        &self.backend,
+                        MemTag::RecurrentRollback,
+                        records.saturating_mul(window_bytes),
+                    )
+                })
                 .transpose()?;
             if let Some(slab) = ngram_ckpt.as_ref() {
                 clear_range(&self.backend, slab)?;
@@ -821,8 +859,9 @@ impl SparseStack {
             Some(SpecState {
                 depth: self.opts.spec,
                 ngram_ckpt,
-                pending: alloc(
+                pending: alloc_tagged(
                     &self.backend,
+                    MemTag::SessionOther,
                     u64::from(self.shape.stream_dim()).saturating_mul(F32_BYTES),
                 )?,
                 pending_valid: false,

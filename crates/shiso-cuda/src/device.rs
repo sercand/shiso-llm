@@ -28,6 +28,8 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 
+use shiso_core::MemTag;
+
 use parking_lot::Mutex;
 use shiso_core::{CoreError, CoreResult, DeviceView, RawBuffer};
 
@@ -133,7 +135,7 @@ pub(crate) struct DeviceCtx {
     multiprocessors: u32,
     /// Whether the device shares its memory with the host; see
     /// [`memory_info`].
-    integrated: bool,
+    pub(crate) integrated: bool,
 }
 
 impl DeviceCtx {
@@ -500,6 +502,9 @@ fn staged_copy(backend: &CudaBackend, dst: DeviceView<'_>, src: &[u8]) -> CoreRe
     let mut staging = backend.staging.lock();
     if staging.is_none() {
         *staging = Some(crate::upload::Staging::open()?);
+        backend
+            .ledger
+            .record(MemTag::UploadStaging, crate::upload::STAGING_BYTES);
     }
     staging
         .as_mut()

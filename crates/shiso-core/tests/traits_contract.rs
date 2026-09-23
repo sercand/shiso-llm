@@ -23,6 +23,7 @@ use shiso_core::{
     GraphCapture, GraphKey, HostBytes, KernelArg, KernelRef, LaunchArgs, Logits, Model, ModelInfo,
     RawBuffer, SessionId, StopTokens, TokenId, alloc, import_host,
 };
+use shiso_core::{MemLedger, MemTag, alloc_tagged, ledger};
 
 /// The same device as the trait object every engine holds.
 fn dyn_backend<B: Backend + 'static>(backend: Arc<B>) -> Arc<dyn Backend> {
@@ -50,6 +51,7 @@ struct FakeBackend {
     syncs: AtomicU64,
     h2d_bytes: AtomicU64,
     d2h_bytes: AtomicU64,
+    ledger: Arc<MemLedger>,
 }
 
 impl FakeBackend {
@@ -138,6 +140,10 @@ impl FakeBackend {
 impl Backend for FakeBackend {
     fn backend_name(&self) -> &'static str {
         "fake"
+    }
+
+    fn ledger(&self) -> Option<&Arc<MemLedger>> {
+        Some(&self.ledger)
     }
 
     fn alloc_raw(&self, bytes: u64) -> CoreResult<RawBuffer> {
@@ -633,6 +639,35 @@ fn dropping_a_buffer_frees_it_exactly_once() {
     assert_eq!(backend.frees(), 1);
     assert!(!backend.live(id), "the id is gone from the device table");
     assert_eq!(backend.double_frees(), 0);
+}
+
+#[test]
+fn a_buffer_counts_itself_in_the_ledger_under_its_tag_until_it_drops() {
+    let backend = FakeBackend::new();
+    let device = dyn_backend(Arc::clone(&backend));
+    let pool = alloc_tagged(&device, MemTag::KvAttention, 4096).expect("alloc");
+    let weights = {
+        let _tag = ledger::scope(MemTag::WeightsExperts);
+        let host: Arc<dyn HostBytes> = Arc::new(vec![0u8; 256]);
+        import_host(&device, host, 0..256).expect("import")
+    };
+    let loose = alloc(&device, 16).expect("alloc");
+    assert_eq!(weights.tag(), MemTag::WeightsExperts);
+    assert_eq!(
+        loose.tag(),
+        MemTag::Untagged,
+        "the scope ended with its guard"
+    );
+    let book = &backend.ledger;
+    assert_eq!(book.live(MemTag::KvAttention), 4096);
+    assert_eq!(book.live(MemTag::WeightsExperts), 256);
+    assert_eq!(book.live(MemTag::Untagged), 16);
+    drop(pool);
+    assert_eq!(book.live(MemTag::KvAttention), 0);
+    assert_eq!(book.peak(MemTag::KvAttention), 4096);
+    drop((weights, loose));
+    assert_eq!(book.live(MemTag::WeightsExperts), 0);
+    assert_eq!(book.live(MemTag::Untagged), 0);
 }
 
 #[test]

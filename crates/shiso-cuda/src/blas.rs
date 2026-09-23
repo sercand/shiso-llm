@@ -537,6 +537,10 @@ fn lt_gemm(backend: &CudaBackend, gemm: &CudaGemm<'_>, tf32: bool) -> CoreResult
             workspace_bytes = LT_WORKSPACE_BYTES,
             "opened the heuristic matrix-multiply tier",
         );
+        // Held until the backend drops, so it is recorded and never released.
+        backend
+            .ledger
+            .record(shiso_core::MemTag::BlasWorkspace, LT_WORKSPACE_BYTES);
         *tier = Some(LtTier {
             handle,
             workspace,
@@ -615,7 +619,18 @@ pub(crate) fn staging(backend: &CudaBackend, bytes: u64) -> CoreResult<Option<De
             Some((_, held)) if held >= bytes => Some(raw),
             // The old slab goes only once the new one exists, so a failed
             // growth leaves the caller with what it had rather than nothing.
-            _ => state.blas_staging.replace((raw, bytes)).map(|(old, _)| old),
+            _ => {
+                let old = state.blas_staging.replace((raw, bytes));
+                backend
+                    .ledger
+                    .record(shiso_core::MemTag::MatrixStaging, bytes);
+                if let Some((_, held)) = old {
+                    backend
+                        .ledger
+                        .release(shiso_core::MemTag::MatrixStaging, held);
+                }
+                old.map(|(old, _)| old)
+            }
         }
     };
     if let Some(spare) = spare {

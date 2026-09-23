@@ -94,6 +94,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     args.validate()?;
 
     let backend = open_backend(&args)?;
+    // The first mark: whatever is in use now belongs to the driver and the
+    // rest of the machine, and the ledger's unaccounted figure is measured
+    // from here.
+    mark_memory(backend.as_ref(), "before_load");
     let config_path = args.config_path();
     let config = shiso_core::HfConfig::from_file(&config_path).with_context(|| {
         format!(
@@ -105,18 +109,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // operator mistake, and finding it after a minutes-long load is the most
     // expensive place to find it.
     let sampling_preset = load_sampling_preset(&args)?;
-    let load_started = std::time::Instant::now();
     let model_factory::Loaded {
         mut model,
         open_tower,
         placement,
         defaults,
-    } = model_factory::load_model(&backend, &args.model, &config, &args)
-        .with_context(|| format!("loading the checkpoint at {}", args.model.display()))?;
-    tracing::info!(
-        seconds = load_started.elapsed().as_secs_f64(),
-        "the checkpoint is loaded"
-    );
+    } = load_checkpoint(&backend, &config, &args)?;
     // Before anything stands on a session: the tier is a property of the cache
     // the sessions draw their pages from, so it is chosen while there are none.
     let tier = open_checkpoint_tier(model.as_mut(), &args);
@@ -138,6 +136,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Every weight this process will read is resident now, the tower's too, so
     // whatever the backend kept to make those imports fast can go.
     backend.finish_imports();
+    let memory = report_memory(&backend);
 
     let model_id = args.model_id();
     // The one place the scheduler's environment is read. Once, at boot: a knob
@@ -177,6 +176,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     );
 
     let mut state = AppState::new(engine, model_id, args.ctx);
+    if let Some(memory) = memory {
+        state = state.with_memory(memory);
+    }
     if let Some(preset) = sampling_preset {
         state = state.with_sampling_preset(preset);
     }
@@ -221,6 +223,44 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .map_err(|error| anyhow!(error).context(format!("serving on {}:{}", args.bind, args.port)))
 }
 
+/// Loads the checkpoint, timing it.
+///
+/// Under a ledger scope: a family's loader labels its weights by class, and
+/// whatever it leaves unlabelled is still a weight.
+fn load_checkpoint(
+    backend: &Arc<dyn shiso_core::Backend>,
+    config: &shiso_core::HfConfig,
+    args: &ServeArgs,
+) -> anyhow::Result<model_factory::Loaded> {
+    let _tag = shiso_core::ledger::scope(shiso_core::MemTag::WeightsOther);
+    let started = std::time::Instant::now();
+    let loaded = model_factory::load_model(backend, &args.model, config, args)
+        .with_context(|| format!("loading the checkpoint at {}", args.model.display()))?;
+    tracing::info!(
+        seconds = started.elapsed().as_secs_f64(),
+        "the checkpoint is loaded"
+    );
+    Ok(loaded)
+}
+
+/// Records what the device says now in the backend's memory ledger.
+fn mark_memory(backend: &dyn shiso_core::Backend, label: &'static str) {
+    if let Some(ledger) = backend.ledger() {
+        ledger.mark(label, backend.memory_info());
+    }
+}
+
+/// Marks the end of the load and logs the memory ledger, one line per
+/// consumer, returning the handle `/metrics` reads it through.
+fn report_memory(backend: &Arc<dyn shiso_core::Backend>) -> Option<state::MemorySource> {
+    mark_memory(backend.as_ref(), "ready");
+    let memory = state::MemorySource::new(Arc::clone(backend))?;
+    if let Some(report) = memory.report() {
+        report.log();
+    }
+    Some(memory)
+}
+
 /// Opens the vision tower, when the operator named one.
 ///
 /// `Ok(None)` is a text-only server: no `--vision`, so no file is read and no
@@ -237,6 +277,7 @@ fn open_vision_tower(
     let Some(path) = args.vision.as_ref() else {
         return Ok(None);
     };
+    let _tag = shiso_core::ledger::scope(shiso_core::MemTag::VisionWeights);
     // Which container the tower lives in, and how its dimensions read back out,
     // is the family's answer and not this function's: the opener came out of
     // the same arm of the factory that built the model.

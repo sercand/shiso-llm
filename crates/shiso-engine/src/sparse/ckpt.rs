@@ -174,6 +174,12 @@ impl SparseStack {
         )
         .map_err(cache_failure)?;
         resident.cache = Arc::new(cache);
+        crate::sparse::memory::watch_cache(
+            &self.backend,
+            &resident.cache,
+            resident.kv.page_bytes(),
+            geometry.ckpt_bytes,
+        );
         self.ckpt = Some(Checkpoint {
             options: config.options,
             identity,

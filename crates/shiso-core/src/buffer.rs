@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::backend::Backend;
 use crate::error::{CoreError, CoreResult};
+use crate::ledger::{self, MemTag};
 
 /// Opaque, backend-local allocation handle.
 ///
@@ -128,6 +129,9 @@ pub struct DeviceBuffer {
     /// `Some` for [`import_host`] buffers: keeps the host mapping alive for
     /// exactly as long as the device can see it.
     host: Option<Arc<dyn HostBytes>>,
+    /// What the owner's ledger counts these bytes under, until the drop that
+    /// takes them back out.
+    tag: MemTag,
 }
 
 impl DeviceView<'_> {
@@ -155,11 +159,15 @@ impl DeviceView<'_> {
 }
 
 impl DeviceBuffer {
-    pub(crate) fn new(raw: RawBuffer, owner: Arc<dyn Backend>) -> Self {
+    pub(crate) fn new(raw: RawBuffer, owner: Arc<dyn Backend>, tag: MemTag) -> Self {
+        if let Some(ledger) = owner.ledger() {
+            ledger.record(tag, raw.bytes());
+        }
         Self {
             raw,
             owner,
             host: None,
+            tag,
         }
     }
 
@@ -167,12 +175,23 @@ impl DeviceBuffer {
         raw: RawBuffer,
         owner: Arc<dyn Backend>,
         host: Arc<dyn HostBytes>,
+        tag: MemTag,
     ) -> Self {
+        if let Some(ledger) = owner.ledger() {
+            ledger.record(tag, raw.bytes());
+        }
         Self {
             raw,
             owner,
             host: Some(host),
+            tag,
         }
+    }
+
+    /// What the owner's ledger counts this allocation under.
+    #[must_use]
+    pub const fn tag(&self) -> MemTag {
+        self.tag
     }
 
     /// The backend this allocation belongs to.
@@ -241,6 +260,9 @@ impl Drop for DeviceBuffer {
     /// level instead of being swallowed: leaking device memory is visible in
     /// the trace even when it cannot be handled.
     fn drop(&mut self) {
+        if let Some(ledger) = self.owner.ledger() {
+            ledger.release(self.tag, self.raw.bytes());
+        }
         if let Err(err) = self.owner.free_raw(self.raw) {
             tracing::error!(
                 id = %self.raw.id(),
@@ -252,10 +274,11 @@ impl Drop for DeviceBuffer {
     }
 }
 
-/// Allocates device memory through `backend`.
+/// Allocates device memory through `backend`, counted under whatever
+/// [`ledger::scope`] this thread is in.
 ///
-/// This is the only way to create a `DeviceBuffer` outside a backend, and the
-/// returned value releases itself.
+/// This and [`alloc_tagged`] are the only ways to create a `DeviceBuffer`
+/// outside a backend, and the returned value releases itself.
 ///
 /// # Errors
 ///
@@ -263,6 +286,19 @@ impl Drop for DeviceBuffer {
 /// [`CoreError::OutOfBounds`] when the byte count would overflow the
 /// allocation size.
 pub fn alloc(backend: &Arc<dyn Backend>, bytes: u64) -> CoreResult<DeviceBuffer> {
+    alloc_tagged(backend, ledger::current(), bytes)
+}
+
+/// Allocates device memory through `backend`, counted under `tag`.
+///
+/// # Errors
+///
+/// What [`alloc`] reports.
+pub fn alloc_tagged(
+    backend: &Arc<dyn Backend>,
+    tag: MemTag,
+    bytes: u64,
+) -> CoreResult<DeviceBuffer> {
     let raw = backend.alloc_raw(bytes)?;
     if raw.bytes() < bytes {
         return Err(CoreError::Backend {
@@ -274,7 +310,7 @@ pub fn alloc(backend: &Arc<dyn Backend>, bytes: u64) -> CoreResult<DeviceBuffer>
             }),
         });
     }
-    Ok(DeviceBuffer::new(raw, Arc::clone(backend)))
+    Ok(DeviceBuffer::new(raw, Arc::clone(backend), tag))
 }
 
 /// Wraps `host[range]` as device memory without copying where the backend can,
@@ -283,6 +319,9 @@ pub fn alloc(backend: &Arc<dyn Backend>, bytes: u64) -> CoreResult<DeviceBuffer>
 /// Safe in both cases: the `Arc` keeps the host bytes alive for exactly as long
 /// as the `DeviceBuffer` that names them, so a file mapping cannot be unmapped
 /// while the device still reads it.
+///
+/// Counted under whatever [`ledger::scope`] this thread is in, which is how a
+/// loader labels its weights by class.
 ///
 /// # Errors
 ///
@@ -305,7 +344,12 @@ pub fn import_host(
         });
     }
     let raw = backend.import_raw(host.as_ref(), range)?;
-    Ok(DeviceBuffer::wrapped_host(raw, Arc::clone(backend), host))
+    Ok(DeviceBuffer::wrapped_host(
+        raw,
+        Arc::clone(backend),
+        host,
+        ledger::current(),
+    ))
 }
 
 /// A backend that granted less memory than it claimed.

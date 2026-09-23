@@ -100,10 +100,137 @@ pub fn render_metrics(state: &AppState) -> String {
         "Bytes the disk tier holds",
         bytes,
     );
+    if let Some(report) = state
+        .memory
+        .as_ref()
+        .and_then(crate::state::MemorySource::report)
+    {
+        render_memory(&mut out, &report);
+    }
     // Writing into a String cannot fail; the result is discarded rather than
     // unwrapped so that a formatting change can never introduce a panic here.
     let _ = state.sched.render(&mut out);
     out
+}
+
+/// The memory ledger's gauges: one series per consumer, labelled by component
+/// and residence, and the device's own figures beside them.
+pub fn render_memory(out: &mut String, report: &shiso_core::LedgerReport) {
+    use std::fmt::Write as _;
+    type Read = fn(&shiso_core::ledger::Entry) -> Option<u64>;
+    let series: [(&str, &str, Read); 3] = [
+        (
+            "shiso_memory_bytes",
+            "Bytes a memory consumer holds now",
+            |entry| Some(entry.bytes),
+        ),
+        (
+            "shiso_memory_peak_bytes",
+            "The most a memory consumer has held at once",
+            |entry| Some(entry.peak),
+        ),
+        (
+            "shiso_memory_limit_bytes",
+            "The ceiling a memory consumer may grow to",
+            |entry| entry.limit,
+        ),
+    ];
+    // Writing into a String cannot fail; see `push_gauge`.
+    for (name, help, read) in &series {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} gauge");
+        for entry in &report.entries {
+            if let Some(value) = read(entry) {
+                let _ = writeln!(
+                    out,
+                    "{name}{{component=\"{}\",residence=\"{}\"}} {value}",
+                    entry.tag.name(),
+                    entry.tag.residence().name()
+                );
+            }
+        }
+    }
+    if let Some(device) = report.now.and_then(|now| now.device) {
+        push_gauge(
+            out,
+            "shiso_memory_device_total_bytes",
+            "Device memory the driver reports",
+            device.total,
+        );
+        push_gauge(
+            out,
+            "shiso_memory_device_free_bytes",
+            "Device memory the backend counts as free",
+            device.free,
+        );
+    }
+    if let Some(available) = report.now.and_then(|now| now.host_available) {
+        push_gauge(
+            out,
+            "shiso_memory_host_available_bytes",
+            "The host kernel's MemAvailable",
+            available,
+        );
+    }
+    if let Some(unaccounted) = report.unaccounted() {
+        let name = "shiso_memory_unaccounted_bytes";
+        let _ = writeln!(
+            out,
+            "# HELP {name} Device memory in use since boot that no tag covers"
+        );
+        let _ = writeln!(out, "# TYPE {name} gauge");
+        let _ = writeln!(out, "{name} {unaccounted}");
+    }
+}
+
+/// `GET /debug/memory`: the memory ledger as JSON, or 404 when the backend
+/// keeps none.
+pub async fn memory_report(State(state): State<Arc<AppState>>) -> Response {
+    match state
+        .memory
+        .as_ref()
+        .and_then(crate::state::MemorySource::report)
+    {
+        Some(report) => Json(memory_body(&report)).into_response(),
+        None => AppError::NotFound {
+            path: "/debug/memory".to_owned(),
+        }
+        .on(ApiSurface::for_path("/debug/memory"))
+        .into_response(),
+    }
+}
+
+/// The JSON body of `/debug/memory`.
+#[must_use]
+pub fn memory_body(report: &shiso_core::LedgerReport) -> Value {
+    let mark = |mark: &shiso_core::ledger::Mark| {
+        json!({
+            "label": mark.label,
+            "device_total_bytes": mark.device.map(|info| info.total),
+            "device_free_bytes": mark.device.map(|info| info.free),
+            "host_available_bytes": mark.host_available,
+        })
+    };
+    json!({
+        "unified": report.unified,
+        "components": report.entries.iter().map(|entry| json!({
+            "component": entry.tag.name(),
+            "residence": entry.tag.residence().name(),
+            "bytes": entry.bytes,
+            "peak_bytes": entry.peak,
+            "allocations": entry.count,
+            "limit_bytes": entry.limit,
+        })).collect::<Vec<_>>(),
+        "totals": {
+            "device_bytes": report.total(shiso_core::Residence::Device),
+            "host_bytes": report.total(shiso_core::Residence::Host),
+            "disk_bytes": report.total(shiso_core::Residence::Disk),
+            "unaccounted_bytes": report.unaccounted(),
+        },
+        "marks": report.marks.iter().map(mark).collect::<Vec<_>>(),
+        "now": report.now.as_ref().map(mark),
+        "table": report.to_string(),
+    })
 }
 
 /// Appends one gauge with its help and type lines.

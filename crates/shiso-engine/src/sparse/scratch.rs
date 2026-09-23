@@ -28,8 +28,9 @@
 use std::sync::Arc;
 
 use shiso_core::backend::{Backend, DEVICE_POINTER_BYTES};
-use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc};
+use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc_tagged};
 use shiso_core::error::{CoreError, CoreResult};
+use shiso_core::ledger::MemTag;
 use shiso_core::page::MROPE_BACK;
 
 use crate::sparse::inputs::MROPE_AXES;
@@ -483,6 +484,45 @@ impl Buf {
         }
     }
 
+    /// What the memory ledger counts this buffer under: the indexer's and
+    /// the experts' workspaces apart from the rest, because the indexer's
+    /// score row is the one buffer that grows with the context.
+    #[must_use]
+    pub const fn tag(self) -> MemTag {
+        match self {
+            Self::IdxKey
+            | Self::IdxQuery
+            | Self::IdxQueryNorm
+            | Self::IdxScore
+            | Self::IdxSelected
+            | Self::IdxCount
+            | Self::IdxTokenCount
+            | Self::IdxTokens => MemTag::IndexerScratch,
+            Self::MoeRouter
+            | Self::MoeIds
+            | Self::MoeWeights
+            | Self::MoeCounts
+            | Self::MoeBounds
+            | Self::MoeActive
+            | Self::MoeSorted
+            | Self::MoeGate
+            | Self::MoeUp
+            | Self::MoeMid
+            | Self::MoeDown
+            | Self::MoeWsGate
+            | Self::MoeWsUp
+            | Self::MoeWsAct
+            | Self::MoeWsPos
+            | Self::MoeRep
+            | Self::SharedGate
+            | Self::SharedUp
+            | Self::SharedMid
+            | Self::SharedOut
+            | Self::SharedLogit => MemTag::MoeScratch,
+            _ => MemTag::Activations,
+        }
+    }
+
     /// Whether this buffer is only reached by a stack that folds in an n-gram
     /// block.
     #[must_use]
@@ -565,7 +605,7 @@ impl Scratch {
                 } else {
                     buf.bytes(shape, rows, logit_rows, ctx)
                 };
-                alloc(backend, bytes)
+                alloc_tagged(backend, buf.tag(), bytes)
             })
             .collect::<CoreResult<Vec<_>>>()?;
         Ok(Self {

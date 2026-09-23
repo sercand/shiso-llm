@@ -41,6 +41,33 @@ pub struct CheckpointTier {
     pub min_tokens: u32,
 }
 
+/// Where `/metrics` and `/debug/memory` read the memory ledger from.
+///
+/// The backend rather than the model: the ledger is a set of atomics the
+/// backend owns and a device query, neither of which touches anything the
+/// engine thread is writing. Its probes take the cache's own lock for the
+/// length of one statistics read, which is what `/cache` would cost too.
+#[derive(Debug, Clone)]
+pub struct MemorySource {
+    backend: Arc<dyn shiso_core::Backend>,
+}
+
+impl MemorySource {
+    /// A source over `backend`'s ledger; `None` when it keeps none.
+    #[must_use]
+    pub fn new(backend: Arc<dyn shiso_core::Backend>) -> Option<Self> {
+        backend.ledger()?;
+        Some(Self { backend })
+    }
+
+    /// Everything the ledger knows now, with the device's figure now.
+    #[must_use]
+    pub fn report(&self) -> Option<shiso_core::LedgerReport> {
+        let ledger = self.backend.ledger()?;
+        Some(ledger.report(self.backend.memory_info()))
+    }
+}
+
 /// Everything the handlers share.
 #[derive(Debug)]
 pub struct AppState {
@@ -81,6 +108,8 @@ pub struct AppState {
     /// The sampling a caller who names nothing gets: the checkpoint's
     /// generation config, or neutral when it ships none.
     pub sampling_preset: shiso_core::SamplingParams,
+    /// The memory ledger, when the backend keeps one.
+    pub memory: Option<MemorySource>,
 }
 
 impl AppState {
@@ -100,7 +129,15 @@ impl AppState {
             response_store: ResponseStore::from_env(),
             started_at: Instant::now(),
             sampling_preset: shiso_core::SamplingParams::neutral(),
+            memory: None,
         }
+    }
+
+    /// The same state with the memory ledger attached.
+    #[must_use]
+    pub fn with_memory(mut self, memory: MemorySource) -> Self {
+        self.memory = Some(memory);
+        self
     }
 
     /// The same state with a sampling preset other than neutral.

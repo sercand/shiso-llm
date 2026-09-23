@@ -264,6 +264,17 @@ pub trait Backend: Send + Sync + fmt::Debug {
         None
     }
 
+    /// The ledger this backend's allocations are counted in, or `None` when
+    /// it keeps none.
+    ///
+    /// Every [`crate::buffer::DeviceBuffer`] made through this backend adds
+    /// its bytes here under its tag and takes them back out when it drops;
+    /// the backend adds its own slabs itself. `None`, the default, is a
+    /// backend nothing measures - a test double - and costs nothing.
+    fn ledger(&self) -> Option<&std::sync::Arc<crate::ledger::MemLedger>> {
+        None
+    }
+
     /// Resolves an entry point whose real name is only known once its module is
     /// loaded, returning `None` when this device has no such kernel.
     ///

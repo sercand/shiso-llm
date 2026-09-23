@@ -63,6 +63,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let routes = Router::new()
         .route("/health", get(misc_handlers::health))
         .route("/metrics", get(misc_handlers::metrics))
+        .route("/debug/memory", get(misc_handlers::memory_report))
         .route("/v1/models", get(misc_handlers::list_models))
         .route("/cache", get(misc_handlers::cache_report))
         .route(
