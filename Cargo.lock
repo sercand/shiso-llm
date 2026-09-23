@@ -1546,6 +1546,7 @@ dependencies = [
  "shiso-ir",
  "shiso-kvstore",
  "shiso-metal",
+ "shiso-modelfile",
  "shiso-models",
  "shiso-server",
  "shiso-vision",

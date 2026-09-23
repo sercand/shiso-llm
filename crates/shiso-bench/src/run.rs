@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use shiso_core::ids::TokenId;
+use shiso_engine::sparse::tap::ResidualTap;
 
 use crate::compare::{TopSlice, top_k};
 use crate::replay::{Harness, ReplayError, ReplayResult, Vocabulary};
@@ -252,4 +253,31 @@ pub fn run_case_row(
         consumed: tokens.len(),
         prompt_tokens,
     })
+}
+
+/// Runs one case with the residual tap armed on its final pass, and returns
+/// its full row beside the tap.
+///
+/// The row is the one [`run_case_row`] would return: the tapped pass issues
+/// the same launches, only without replaying them from a graph.
+///
+/// # Errors
+///
+/// Whatever [`case_tokens`] or [`Harness::frontier_layers`] reports.
+pub fn run_case_layers(
+    harness: &mut Harness,
+    vocabulary: &Vocabulary,
+    base_dir: &Path,
+    case: &LocalCase,
+) -> ReplayResult<(CaseRow, ResidualTap)> {
+    let (tokens, prompt_tokens) = encode_case(vocabulary, base_dir, case, None)?;
+    let (row, tap) = harness.frontier_layers(&tokens, REPLAY_CHUNK)?;
+    Ok((
+        CaseRow {
+            row,
+            consumed: tokens.len(),
+            prompt_tokens,
+        },
+        tap,
+    ))
 }

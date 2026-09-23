@@ -107,4 +107,15 @@ Per case, at the case's frontier position (the same 0-based position as
 On the shiso side, this needs a new diagnostic. A knob naming a position and a
 directory would make the executor copy one token's `Buf::Residual` row
 (`10240 * 4` bytes at offset `row * 40960`) after each `q4e_hc_init_kernel`,
-Mixer combine and Experts combine, with graphs off. That is not built yet.
+Mixer combine and Experts combine, with graphs off.
+
+**Built since:** `parity --dump-layers DIR` writes exactly this layout for each
+case's frontier (`crates/shiso-bench/src/layers.rs`, the tap in
+`crates/shiso-engine/src/sparse/tap.rs`). The tap is armed for the case's final
+single-token pass only; that pass runs with the graph tier withheld (nothing
+replayed, nothing captured) and copies the pass's last row after the prologue
+and after every island. The plan is not re-made, so its launches are the ones a
+replay would issue. `qwen4exp_fp8_ref.py capture --layer-dump-dir DIR` writes
+the same layout from hooks (layer 0's input, each layer's
+`mlp_hyper_connection` input, each layer's output), and
+`scripts/reference/bisect_layers.py REF_DIR CAND_DIR` compares the two.
