@@ -1,16 +1,21 @@
 # Reference tooling
 
 Scripts that produce or consume *independent* evidence about this engine: renders
-and logits from the reference implementation, and behavioural probes run against
-several servers. None of it is run by `scripts/check.sh`.
+and logits from an independent implementation of a model family (see
+`test-vectors/README.md` for why only those belong in `test-vectors/references/`),
+and behavioural probes run against several servers. They are Python, run with the
+reference venv (`SHISO_REF_PYTHON`, default `~/work/exllamav3/.venv/bin/python`)
+unless noted, and are not run by `scripts/check.sh`. What each depends on upstream is
+in `PROVENANCE.md`.
 
-- `repro_readback.py`: an agent loop with `read_file`/`edit_file` over an email
-  workspace. It flags runs where the model claims text it just wrote came back
-  different. Stdlib only. Endpoint and key come from `LLM_BASE_URL`/`LLM_API_KEY`
-  or flags; nothing is embedded.
-- `render_chat_fixtures.py`: renders `test-vectors/references/chat/qwen4exp/*.request.json`
-  with the reference chat template. Needs `SHISO_REF_PYTHON` (default
-  `~/work/exllamav3/.venv/bin/python`).
+| Script | What it does |
+|---|---|
+| `qwen4exp_fp8_ref.py` | The qwen4exp FP8 reference: runs the independent implementation's own modules over the FP8 checkpoint (W8A16, layer-streamed experts, teacher-forced, no cache) and writes a replayable `.vec` plus full fp16 logit rows at chosen frontiers. `selfcheck` grades its e4m3 decode against `shiso-modelfile`'s for all 256 codes and its block dequant against NumPy; `capture` fills a skeleton `.vec`; `greedy` prints a short cached continuation. Refuses to start while a `shiso`/`ds4`/vLLM server runs, below 60 GiB `MemAvailable`, below 40 GiB free disk, or when a dump would exceed `--max-dump-bytes`. |
+| `compare_rows.py` | Grades a candidate row set against a reference row set (the `--dump-rows` / `index.json` format): top-1, top-5/20 overlap, exact KL, max \|Δlogit\| over the reference top-20, and KL by frontier. `--self-test` checks itself on synthetic rows. |
+| `render_chat_fixtures.py` | Renders `test-vectors/references/chat/qwen4exp/*.request.json` with the reference chat template, for `crates/shiso-server/tests/chat_parity_qwen4exp.rs`. |
+| `repro_readback.py` | An agent loop with `read_file`/`edit_file` over an email workspace; it flags runs where the model claims text it just wrote came back different. Stdlib only. Endpoint and key come from `LLM_BASE_URL`/`LLM_API_KEY` or flags; nothing is embedded. |
+| `LAYER_DUMP.md` | What shiso can and cannot dump per layer for the sparse family, and the per-position layout a reference should write. |
 
-GB10 rules: one model server at a time; check `free -g` and `df -h /` first; stop
-servers with `pkill -x shiso`.
+GB10 rules: any run that loads a model holds the GPU lock
+(`~/work/qwen-3.8-flash/gpu_lock.sh <command>`); one model at a time; check `free -g`
+and `df -h /` first; stop servers with `pkill -x shiso`.
