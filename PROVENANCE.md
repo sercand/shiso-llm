@@ -29,3 +29,4 @@ the name "ds4" for the host project.
 | `crates/shiso-kerneltest` | Splash Metal runtime kernels | some CPU oracles restate that arithmetic |
 | `crates/shiso-server` | - | original; wire formats follow the OpenAI and Anthropic APIs |
 | `crates/shiso-bench` | llama.cpp, `mlx-lm`, `transformers` | independent reference fixtures are captured from these |
+| `scripts/reference/qwen4exp_fp8_ref.py` | Hugging Face `transformers` 5.16.1 (`modeling_qwen4_exp`), Apache-2.0; `torch`, `safetensors`, `tokenizers` | original; imports and runs the `transformers` modules as the independent reference and replaces only its expert and n-gram weight storage |

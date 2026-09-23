@@ -1,0 +1,19 @@
+# shiso-local-logit-vectors-v1
+# WHAT THIS FILE IS: the capture request for q4e-fp8-short.vec, read by scripts/reference/qwen4exp_fp8_ref.py capture. No recorded entries.
+# THE TRACE FRONTIERS straddle the indexer boundary: a query at 0-based position p sees p+1 tokens, and it selects fewer than all of them once (p+1)//4 complete blocks exceed 2048/4 = 512, that is from frontier 2052 on. 2048, 2049 and 2051 are the last dense frontiers.
+case short_italian_fact text 1024 15 ../prompts/short_italian_fact.txt 128
+case short_italian_mid text 1024 10 ../prompts/short_italian_fact.txt 128
+case short_code_completion text 1024 23 ../prompts/short_code_completion.txt 128
+case short_capital_fact text 1024 19 ../prompts/qwen4exp/short_capital_fact.txt 128
+case short_trick_arithmetic text 1024 29 ../prompts/qwen4exp/short_trick_arithmetic.txt 128
+case short_code_fibonacci text 1024 24 ../prompts/qwen4exp/short_code_fibonacci.txt 128
+case short_translate_french text 1024 21 ../prompts/qwen4exp/short_translate_french.txt 128
+case trace_2k5_f0512 text 4096 512 ../prompts/qwen4exp/trace_2k5_apache_license.txt 128
+case trace_2k5_f1024 text 4096 1024 ../prompts/qwen4exp/trace_2k5_apache_license.txt 128
+case trace_2k5_f2048 text 4096 2048 ../prompts/qwen4exp/trace_2k5_apache_license.txt 128
+case trace_2k5_f2049 text 4096 2049 ../prompts/qwen4exp/trace_2k5_apache_license.txt 128
+case trace_2k5_f2051 text 4096 2051 ../prompts/qwen4exp/trace_2k5_apache_license.txt 128
+case trace_2k5_f2052 text 4096 2052 ../prompts/qwen4exp/trace_2k5_apache_license.txt 128
+case trace_2k5_f2053 text 4096 2053 ../prompts/qwen4exp/trace_2k5_apache_license.txt 128
+case trace_2k5_f2100 text 4096 2100 ../prompts/qwen4exp/trace_2k5_apache_license.txt 128
+case trace_2k5_f2376 text 4096 2376 ../prompts/qwen4exp/trace_2k5_apache_license.txt 128
