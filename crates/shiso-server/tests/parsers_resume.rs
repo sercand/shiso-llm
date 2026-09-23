@@ -130,10 +130,12 @@ async fn a_prefilled_opener_puts_the_trace_in_a_thinking_block() {
 
     assert_eq!(body["content"][0]["type"], "thinking", "{body}");
     // The word-level fake vocabulary joins its tokens with a space, so the
-    // space either side of the tag is the decoder's and not the parser's.
+    // space either side of the tag is the decoder's and not the parser's. The
+    // one after it starts the answer's prose, and leading whitespace there is
+    // framing a chat turn does not carry.
     assert_eq!(body["content"][0]["thinking"], "w10 ");
     assert_eq!(body["content"][1]["type"], "text", "{body}");
-    assert_eq!(body["content"][1]["text"], " w11");
+    assert_eq!(body["content"][1]["text"], "w11");
     assert!(
         !body.to_string().contains("</think>"),
         "the closing tag is structure, not text: {body}"

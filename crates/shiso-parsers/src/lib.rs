@@ -25,6 +25,7 @@
 #![deny(unsafe_code)]
 
 pub mod gemma_dict;
+mod prose;
 pub mod schemes;
 pub mod segment;
 pub mod string_params;

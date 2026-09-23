@@ -431,6 +431,10 @@ impl StreamParser for TagParser {
         }
     }
 
+    fn in_reasoning(&self) -> bool {
+        self.state == State::Thinking
+    }
+
     fn finish(&mut self) -> Vec<Segment> {
         let mut segments = Vec::new();
         match std::mem::replace(&mut self.state, State::Text) {

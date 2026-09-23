@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::prose::TrimmedProse;
 use crate::segment::Segment;
 use crate::string_params::StringParams;
 use crate::tags::{TagParser, TagParserDesc, ToolBody};
@@ -50,6 +51,14 @@ pub trait StreamParser: Send + std::fmt::Debug {
     /// possible closing tag. Prose, reasoning and argument values sample as the
     /// request asked. Parsers with no such structure never ask.
     fn wants_greedy(&self) -> bool {
+        false
+    }
+
+    /// Whether the text pushed so far leaves the stream inside a reasoning
+    /// trace, a half-seen closer included. The caller counts reasoning tokens
+    /// with it: a token pushed while this was true, or that made it true, was
+    /// spent on the trace. Parsers with no reasoning tags never are.
+    fn in_reasoning(&self) -> bool {
         false
     }
 }
@@ -110,19 +119,22 @@ pub fn resumes_thinking(reasoning: ReasoningScheme, prompt: &str) -> bool {
 
 /// Builds the parser for a scheme pair. `(None, None)` is a pass-through that emits `Text` only.
 ///
-/// The turn is taken to start in prose. A caller that has the rendered prompt
-/// should use [`parser_for_prompt`] instead, because a template can spend the
-/// reasoning opener itself and leave the model nothing to emit but the trace.
+/// The turn is taken to start in prose, and its prose is passed on verbatim. A
+/// caller that has the rendered prompt should use [`parser_for_prompt`] instead,
+/// because a template can spend the reasoning opener itself and leave the model
+/// nothing to emit but the trace.
 #[must_use]
 pub fn parser(reasoning: ReasoningScheme, tools: ToolCallScheme) -> Box<dyn StreamParser> {
-    build(reasoning, tools, false, Arc::default())
+    build(reasoning, tools, false, Arc::default(), false)
 }
 
 /// Builds the parser for a scheme pair, for a turn that continues `prompt`.
 ///
 /// An empty `prompt` is a turn with no rendered text behind it - the raw
 /// completions surface, which was never run through a template - and starts in
-/// prose, which is what [`parser`] does.
+/// prose with its text verbatim, which is what [`parser`] does. A rendered chat
+/// turn has its prose trimmed where the template's structure frames it: the
+/// newlines around a trace or a call are not content.
 #[must_use]
 pub fn parser_for_prompt(
     reasoning: ReasoningScheme,
@@ -134,6 +146,7 @@ pub fn parser_for_prompt(
         tools,
         resumes_thinking(reasoning, prompt),
         Arc::default(),
+        !prompt.is_empty(),
     )
 }
 
@@ -151,15 +164,18 @@ pub fn parser_for_prompt_with(
         tools,
         resumes_thinking(reasoning, prompt),
         strings,
+        !prompt.is_empty(),
     )
 }
 
-/// The half every entry shares.
+/// The half every entry shares. `trim_prose` is whether the turn is a rendered
+/// chat turn, whose prose is trimmed at the edges its structure gives it.
 fn build(
     reasoning: ReasoningScheme,
     tools: ToolCallScheme,
     in_thinking: bool,
     strings: Arc<StringParams>,
+    trim_prose: bool,
 ) -> Box<dyn StreamParser> {
     if reasoning == ReasoningScheme::None && tools == ToolCallScheme::None {
         return Box::new(PassthroughParser);
@@ -174,7 +190,7 @@ fn build(
         ToolCallScheme::Qwen35 => ("<tool_call>", "</tool_call>", ToolBody::QwenXml),
     };
 
-    Box::new(TagParser::new(TagParserDesc {
+    let tags = TagParser::new(TagParserDesc {
         think_open,
         think_close,
         tool_open,
@@ -182,7 +198,12 @@ fn build(
         tool_body,
         in_thinking,
         strings,
-    }))
+    });
+    if trim_prose {
+        Box::new(TrimmedProse::new(tags))
+    } else {
+        Box::new(tags)
+    }
 }
 
 /// Builds a parser configured for Gemma 4 reasoning and tool calls.

@@ -190,6 +190,8 @@ pub(crate) struct SeqSlot {
     pub(crate) blocks: BlockCursor,
     /// How many tool calls have been emitted in this turn.
     pub(crate) calls_emitted: u32,
+    /// Generated tokens spent on the reasoning trace (see [`SeqSlot::accept`]).
+    reasoning: u64,
     /// Where it is.
     phase: Phase,
     /// Why it stopped, once it has.
@@ -241,6 +243,7 @@ impl SeqSlot {
             parser,
             blocks: BlockCursor::default(),
             calls_emitted: 0,
+            reasoning: 0,
             id: setup.id,
             session: setup.session,
             prompt: request.prompt_tokens,
@@ -545,11 +548,21 @@ impl SeqSlot {
         };
 
         self.trailing.push(token.get());
+        // A token is reasoning when the stream was inside the trace as it
+        // arrived - the closer's own token included - or when it opened the
+        // trace. Read off the parser rather than off the text, because the
+        // parser is what decides which text is the trace. A token whose text a
+        // stop-sequence hold-back is still keeping is counted by the state the
+        // parser was last left in, which is off by at most that hold-back.
+        let reasoning_before = self.parser.in_reasoning();
         let segments = if vocabulary.is_none() {
             vec![Segment::Text(String::new())]
         } else {
             self.parser.push(&text)
         };
+        if reasoning_before || self.parser.in_reasoning() {
+            self.reasoning = self.reasoning.saturating_add(1);
+        }
 
         let events = self.emit_segments(segments);
 
@@ -666,6 +679,7 @@ impl SeqSlot {
             prompt_tokens: u64::try_from(self.prompt.len()).unwrap_or(u64::MAX),
             completion_tokens: completion,
             cached_prompt_tokens: self.cached,
+            reasoning_tokens: self.reasoning,
             time_to_first_token_ms: ttft.map_or(0.0, |at| at * 1000.0),
             tokens_per_second,
             ..Usage::default()
@@ -1154,5 +1168,132 @@ mod tests {
         );
         // The request's own settings are untouched: the override is per draw.
         assert_eq!(slot.sampling, asked);
+    }
+
+    /// A qwen4exp turn of the shape the matrix recorded - a trace, a sentence,
+    /// two calls - run through the slot, the one fold, and every encoder.
+    ///
+    /// The framing newlines the template puts around the calls are not content
+    /// on any surface, and the trace's tokens are counted as reasoning: the
+    /// three up to and including the closer, and none after it.
+    #[test]
+    fn a_thinking_turn_with_calls_encodes_trimmed_prose_and_counts_its_trace() {
+        use shiso_ir::{ResponseBuilder, StreamEvent};
+        const CALL_A: &str = "<tool_call>\n<function=read_file>\n<parameter=path>\na\n</parameter>\n</function>\n</tool_call>";
+        const CALL_B: &str = "<tool_call>\n<function=read_file>\n<parameter=path>\nb\n</parameter>\n</function>\n</tool_call>";
+        let vocab = test_vocab(&[
+            (10, "plan one "),
+            (11, "plan two\n"),
+            (12, "</think>"),
+            (13, "\n\n"),
+            (14, "I'll read both."),
+            (15, CALL_A),
+            (16, "\n"),
+            (17, CALL_B),
+            (63, "<|im_end|>"),
+        ]);
+        let parser = shiso_parsers::parser_for_prompt(
+            shiso_parsers::ReasoningScheme::Qwen3,
+            shiso_parsers::ToolCallScheme::Qwen35,
+            "<|im_start|>user\nread a and b<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        );
+        let mut slot = slot_with(&[1], 32, parser);
+        let now = Instant::now();
+        let mut events = vec![StreamEvent::Start {
+            id: "turn".to_owned(),
+            model: "m".to_owned(),
+            created: 0,
+        }];
+        for id in [10, 11, 12, 13, 14, 13, 15, 16, 17, 63] {
+            events.extend(slot.accept(TokenId::new(id), Some(&vocab), stop(), now));
+        }
+        events.extend(slot.terminal_events(now));
+        let mut builder = ResponseBuilder::new();
+        for event in events {
+            builder.accept(event).expect("the slot's events fold");
+        }
+        let response = builder.finish().expect("the turn is complete");
+        assert_eq!(response.stop, StopReason::ToolUse);
+        assert_eq!(response.usage.reasoning_tokens, 3);
+
+        let chat = crate::openai::chat_encode::encode_response(
+            &response,
+            &crate::openai::chat_encode::EncodeOptions::default(),
+        );
+        let message = &chat["choices"][0]["message"];
+        assert_eq!(message["content"], "I'll read both.");
+        assert_eq!(message["reasoning_content"], "plan one plan two\n");
+        assert_eq!(message["tool_calls"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            chat["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+
+        let responses = crate::openai::responses_encode::encode_response(
+            &response,
+            &crate::openai::responses_encode::ResponseOptions::default(),
+        );
+        assert_eq!(
+            responses["usage"]["output_tokens_details"]["reasoning_tokens"],
+            3
+        );
+
+        let anthropic = crate::anthropic::messages_encode::encode_response(
+            &response,
+            &crate::anthropic::messages_encode::EncodeOptions::default(),
+        );
+        let texts: Vec<&str> = anthropic["content"]
+            .as_array()
+            .expect("content is a list")
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect();
+        assert_eq!(texts, vec!["I'll read both."]);
+    }
+
+    /// A turn that is only calls has no prose at all, so its content is `null`
+    /// rather than the newlines between the calls.
+    #[test]
+    fn a_turn_of_only_calls_has_null_content() {
+        use shiso_ir::{ResponseBuilder, StreamEvent};
+        const CALL: &str = "<tool_call>\n<function=now>\n</function>\n</tool_call>";
+        let vocab = test_vocab(&[
+            (10, "plan\n"),
+            (12, "</think>"),
+            (13, "\n\n"),
+            (15, CALL),
+            (16, "\n"),
+            (63, "<|im_end|>"),
+        ]);
+        let parser = shiso_parsers::parser_for_prompt(
+            shiso_parsers::ReasoningScheme::Qwen3,
+            shiso_parsers::ToolCallScheme::Qwen35,
+            "<|im_start|>assistant\n<think>\n",
+        );
+        let mut slot = slot_with(&[1], 32, parser);
+        let now = Instant::now();
+        let mut events = vec![StreamEvent::Start {
+            id: "turn".to_owned(),
+            model: "m".to_owned(),
+            created: 0,
+        }];
+        for id in [10, 12, 13, 15, 16, 15, 16, 15, 63] {
+            events.extend(slot.accept(TokenId::new(id), Some(&vocab), stop(), now));
+        }
+        events.extend(slot.terminal_events(now));
+        let mut builder = ResponseBuilder::new();
+        for event in events {
+            builder.accept(event).expect("the slot's events fold");
+        }
+        let response = builder.finish().expect("the turn is complete");
+        let chat = crate::openai::chat_encode::encode_response(
+            &response,
+            &crate::openai::chat_encode::EncodeOptions::default(),
+        );
+        let message = &chat["choices"][0]["message"];
+        assert_eq!(message["content"], serde_json::Value::Null);
+        assert_eq!(message["tool_calls"].as_array().map(Vec::len), Some(3));
+        assert_eq!(response.usage.reasoning_tokens, 2);
     }
 }

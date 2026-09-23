@@ -44,7 +44,7 @@ fn a_prefilled_opener_puts_the_trace_in_its_own_segment() {
         vec![
             Segment::Thinking("weighing it up".to_string()),
             Segment::ThinkingEnd,
-            Segment::Text("\n\nHello!".to_string()),
+            Segment::Text("Hello!".to_string()),
         ]
     );
 }
@@ -241,7 +241,7 @@ fn a_whole_turn_splits_into_a_trace_and_an_answer() {
         vec![
             Segment::Thinking("The user says hello.\n".to_string()),
             Segment::ThinkingEnd,
-            Segment::Text("\n\nHello! How can I help you today?".to_string()),
+            Segment::Text("Hello! How can I help you today?".to_string()),
         ]
     );
 }
@@ -439,4 +439,138 @@ fn thinking_is_never_greedy() {
     );
     let _ = p.push("maybe <tool_");
     assert!(!p.wants_greedy());
+}
+
+/// A call as the template writes one, which is what the model reproduces.
+fn read_call(path: &str) -> String {
+    format!(
+        "<tool_call>\n<function=read_file>\n<parameter=path>\n{path}\n</parameter>\n</function>\n</tool_call>"
+    )
+}
+
+/// Pushes `chunks` into a parser for a thinking turn and returns its segments.
+fn thinking_turn(chunks: &[&str]) -> Vec<Segment> {
+    let mut p = parser_for_prompt(
+        ReasoningScheme::Qwen3,
+        ToolCallScheme::Qwen35,
+        THINKING_PROMPT,
+    );
+    let mut segs = Vec::new();
+    for chunk in chunks {
+        segs.extend(p.push(chunk));
+    }
+    segs.extend(p.finish());
+    segs
+}
+
+/// The prose of a turn, the way a client reads it: every text segment joined.
+fn prose(segs: &[Segment]) -> String {
+    segs.iter()
+        .filter_map(|seg| match seg {
+            Segment::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn calls(segs: &[Segment]) -> Vec<String> {
+    segs.iter()
+        .filter_map(|seg| match seg {
+            Segment::ToolCall { arguments, .. } => Some(arguments.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A turn that is only calls has no content. The template writes
+/// `</think>\n\n` before the first call and `\n` between calls, and those
+/// newlines are framing: the matrix got `"\n\n\n\n\n"` back as the content of a
+/// four-call turn, where the official path answers with nothing.
+#[test]
+fn the_framing_around_calls_is_not_content() {
+    let turn = format!(
+        "plan it\n</think>\n\n{}\n{}\n{}\n{}",
+        read_call("email.html"),
+        read_call("text.txt"),
+        read_call("meta.json"),
+        read_call("data.json"),
+    );
+    let segs = thinking_turn(&[&turn]);
+    assert!(
+        !segs.iter().any(|seg| matches!(seg, Segment::Text(_))),
+        "a turn of calls produced text: {segs:?}"
+    );
+    assert_eq!(calls(&segs).len(), 4);
+}
+
+/// Prose before the calls is content, without the newlines that frame it on
+/// either side and without the ones between the calls after it.
+#[test]
+fn prose_before_calls_loses_only_its_framing() {
+    let turn = format!(
+        "plan it\n</think>\n\nI'll write all four files now.\n\n{}\n{}",
+        read_call("email.html"),
+        read_call("text.txt"),
+    );
+    let segs = thinking_turn(&[&turn]);
+    assert_eq!(prose(&segs), "I'll write all four files now.");
+    assert_eq!(calls(&segs).len(), 2);
+}
+
+/// A final answer is trimmed at both ends and keeps every blank line inside it.
+#[test]
+fn an_answer_keeps_its_interior_whitespace() {
+    let segs = thinking_turn(&["done\n</think>\n\nLine one.\n\n  Line two.\n"]);
+    assert_eq!(prose(&segs), "Line one.\n\n  Line two.");
+}
+
+/// Token-sized chunks give the same prose and calls as one push: whitespace at
+/// the end of a chunk is held until the next one shows whether it was interior.
+#[test]
+fn trimming_does_not_depend_on_how_the_text_was_chunked() {
+    let turn = format!(
+        "plan\n</think>\n\nFirst line.\n\nSecond line.\n\n{}\n{}\n",
+        read_call("a"),
+        read_call("b"),
+    );
+    let whole = thinking_turn(&[&turn]);
+    let pieces: Vec<String> = turn.chars().map(String::from).collect();
+    let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    let chunked = thinking_turn(&refs);
+    assert_eq!(prose(&whole), "First line.\n\nSecond line.");
+    assert_eq!(prose(&chunked), prose(&whole));
+    assert_eq!(calls(&chunked), calls(&whole));
+}
+
+/// A raw completion has no template behind it, so its text is the caller's
+/// verbatim: the leading space of ` Paris` is the answer, not framing.
+#[test]
+fn a_raw_completion_keeps_its_whitespace() {
+    let mut p = parser_for_prompt(ReasoningScheme::Qwen3, ToolCallScheme::Qwen35, "");
+    let mut segs = p.push(" Paris.\n");
+    segs.extend(p.finish());
+    assert_eq!(segs, vec![Segment::Text(" Paris.\n".to_string())]);
+}
+
+/// The parser says when the stream is inside the trace, which is what the
+/// reasoning-token count is taken from.
+#[test]
+fn the_parser_reports_when_it_is_inside_the_trace() {
+    let mut p = parser_for_prompt(
+        ReasoningScheme::Qwen3,
+        ToolCallScheme::Qwen35,
+        THINKING_PROMPT,
+    );
+    assert!(p.in_reasoning(), "the prompt opened the trace");
+    let _ = p.push("thinking</thi");
+    assert!(p.in_reasoning(), "a half closer is still inside");
+    let _ = p.push("nk>\n\nanswer");
+    assert!(!p.in_reasoning());
+
+    let closed = parser_for_prompt(
+        ReasoningScheme::Qwen3,
+        ToolCallScheme::Qwen35,
+        CLOSED_PROMPT,
+    );
+    assert!(!closed.in_reasoning());
 }
