@@ -15,7 +15,7 @@ use shiso_engine::sparse::island::Island;
 #[path = "common/qwen4exp_fixture.rs"]
 mod fixture;
 
-use fixture::{N_LAYERS, PLE_LAYER, loaded, tokens};
+use fixture::{N_LAYERS, PLE_LAYER, loaded, loaded_with, speculative_options, tokens};
 
 /// Opens `rows` sessions and claims one cache row for each.
 ///
@@ -687,4 +687,147 @@ fn every_target_pass_width_routes_its_experts_weight_stationary() {
             "{rows} rows"
         );
     }
+}
+
+/// The first frontier at which a single-row step of a session attends over a
+/// selection rather than its whole context.
+///
+/// Found by walking a session one position at a time rather than computed from
+/// the fixture's budget, so the cases below state the rule - each row as its
+/// own decode step would - and not the arithmetic that implements it.
+fn first_selected_frontier(model: &mut shiso_models::qwen4exp::Qwen4ExpModel) -> u32 {
+    let session = model.open_session().expect("a session opens");
+    for frontier in 0..1_000 {
+        if model
+            .plan_chunk(session, &tokens(0, 1), 1)
+            .expect("plans")
+            .selected
+        {
+            model.close_session(session).expect("the session closes");
+            return frontier;
+        }
+        model
+            .stack_mut()
+            .advance(session, &tokens(0, 1), false, None)
+            .expect("the path grows");
+    }
+    panic!("no frontier within reach selects");
+}
+
+/// The row counts `name`'s launches cover, read off their grids.
+///
+/// `axis` names the grid dimension that is the row count, which is x for the
+/// split kernel and the top-k and z for the tensor-core attention.
+fn rows_of(pass: &shiso_engine::sparse::stack::Pass, name: &str, axis: char) -> Vec<u32> {
+    pass.plan
+        .steps()
+        .iter()
+        .filter_map(|step| match step {
+            shiso_engine::sparse::plan::Step::Kernel { entry, launch, .. }
+                if entry.name() == name =>
+            {
+                Some(if axis == 'x' {
+                    launch.grid.x
+                } else {
+                    launch.grid.z
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A verify pass that starts two rows short of the budget attends those two
+/// rows over the whole context, as the decode steps that would otherwise have
+/// produced them do, and only the rows past the budget over a selection.
+///
+/// Deciding the selection once for the whole pass, from its last row, sent the
+/// early rows through the selected-block kernel instead. Below the budget that
+/// selection is every visible key, so the answer was the same attention summed
+/// by a different kernel - close, not equal - and the key and value rows those
+/// positions wrote in every later layer differed from a plain decode's. A
+/// speculative greedy run then left a plain one's text wherever a later pick
+/// was a near tie.
+#[test]
+fn a_pass_that_crosses_the_indexer_budget_attends_each_row_as_its_own_step_would() {
+    let (_dir, _fake, mut model) = loaded();
+    let budget = first_selected_frontier(&mut model);
+    let session = model.open_session().expect("a session opens");
+    model
+        .stack_mut()
+        .advance(session, &tokens(0, budget - 2), false, None)
+        .expect("the path grows");
+    let pass = model.plan_chunk(session, &tokens(0, 4), 4).expect("plans");
+    assert!(pass.selected, "the pass's last row is past the budget");
+    assert_eq!(
+        rows_of(&pass, "q4e_qsa_attention_split_kernel", 'x'),
+        vec![2; fixture::ATTN_SLOTS],
+        "the two rows below the budget attend densely, in every attention slot"
+    );
+    assert_eq!(
+        rows_of(&pass, "q4e_qsa_attention_tc_kernel", 'z'),
+        vec![2; fixture::ATTN_SLOTS],
+        "the two rows past it attend over their selections"
+    );
+    assert_eq!(
+        rows_of(&pass, "q4e_idx_topk_kernel", 'x'),
+        vec![2; fixture::ATTN_SLOTS],
+        "and only those two rows are selected for"
+    );
+    assert!(
+        !pass.capturable,
+        "a crossing pass is planned once per sequence and never replayed"
+    );
+}
+
+/// A pass whose rows are all on one side of the budget is one launch, as
+/// before: the split is for the pass that straddles it and for nothing else.
+#[test]
+fn a_pass_wholly_past_the_budget_attends_in_one_launch() {
+    let (_dir, _fake, mut model) = loaded();
+    let budget = first_selected_frontier(&mut model);
+    let session = model.open_session().expect("a session opens");
+    model
+        .stack_mut()
+        .advance(session, &tokens(0, budget), false, None)
+        .expect("the path grows");
+    let pass = model.plan_chunk(session, &tokens(0, 4), 4).expect("plans");
+    assert!(pass.selected);
+    assert!(rows_of(&pass, "q4e_qsa_attention_split_kernel", 'x').is_empty());
+    assert_eq!(
+        rows_of(&pass, "q4e_qsa_attention_tc_kernel", 'z'),
+        vec![4; fixture::ATTN_SLOTS]
+    );
+}
+
+/// The same rule for a batch's verify: each run is split where its own rows
+/// cross its own budget, and a run wholly past it is not.
+#[test]
+fn each_run_of_a_segmented_verify_crosses_the_budget_where_its_own_rows_do() {
+    let (_dir, _fake, mut model) = loaded_with(speculative_options(3));
+    let budget = first_selected_frontier(&mut model);
+    let crossing = model.open_session().expect("a session opens");
+    model
+        .stack_mut()
+        .advance(crossing, &tokens(0, budget - 1), false, None)
+        .expect("the path grows");
+    let beyond = model.open_session().expect("a session opens");
+    model
+        .stack_mut()
+        .advance(beyond, &tokens(7, budget + 9), false, None)
+        .expect("the path grows");
+    let pass = model
+        .stack()
+        .plan_segments(&[crossing, beyond], &[4, 4])
+        .expect("plans");
+    assert_eq!(
+        rows_of(&pass, "q4e_qsa_attention_split_kernel", 'x'),
+        vec![1; fixture::ATTN_SLOTS],
+        "the crossing run's one row below the budget attends densely"
+    );
+    assert_eq!(
+        rows_of(&pass, "q4e_qsa_attention_tc_kernel", 'z'),
+        [3, 4].repeat(fixture::ATTN_SLOTS),
+        "the rest of the crossing run, and the whole of the other, attend over selections"
+    );
 }

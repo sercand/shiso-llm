@@ -267,14 +267,47 @@ impl SparseStack {
         } else {
             0
         };
+        // Rows at the front of a run whose own single-row step would still
+        // attend densely: the row at `written + i` is past the budget exactly
+        // when a step from that frontier is.
+        let within = |written: u32, rows: u32| {
+            (0..rows)
+                .take_while(|&i| {
+                    !self
+                        .shape
+                        .indexer
+                        .sparse_at(written.saturating_add(i).saturating_add(1))
+                })
+                .count()
+        };
+        let dense_rows = if batched {
+            0
+        } else {
+            u32::try_from(within(first.written(), n_tok)).unwrap_or(n_tok)
+        };
+        let mut run_dense_rows = [0u8; MAX_DECODE_BATCH as usize];
+        if let RowOrigin::Segmented(runs) = origin {
+            for ((run, live), slot) in rows.iter().enumerate().zip(&mut run_dense_rows) {
+                let run = u32::try_from(run).unwrap_or(u32::MAX);
+                *slot = u8::try_from(within(live.written(), runs.len(run))).unwrap_or(u8::MAX);
+            }
+        }
         let ctx = AttnContext {
             selected,
             tensor_core: self.opts.tensor_core,
             tiled: self.opts.tiled_attention,
             origin,
             batch_selected,
+            dense_rows,
+            run_dense_rows,
         };
-        let capturable = !batched && self.opts.graphs.capturable(n_tok);
+        // A pass that crosses the budget is planned with its attention split
+        // at the crossing, and the island key does not say where that is: a
+        // capture of it replayed a step later would split rows that are all
+        // past the budget by then. It happens once per sequence, so it is
+        // simply never captured.
+        let crosses = selected && dense_rows > 0;
+        let capturable = !batched && !crosses && self.opts.graphs.capturable(n_tok);
         let device = Device {
             capturing: capturable,
             ..self.device

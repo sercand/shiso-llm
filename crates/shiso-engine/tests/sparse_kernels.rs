@@ -289,6 +289,7 @@ fn every_path() -> Plan {
                 tiled: true,
                 origin: RowOrigin::Sequential,
                 batch_selected: 0,
+                ..AttnContext::default()
             },
         ] {
             plan.append(
@@ -417,6 +418,7 @@ fn every_path() -> Plan {
                 tiled: true,
                 origin: RowOrigin::Unrelated,
                 batch_selected: 0b01,
+                ..AttnContext::default()
             },
         ] {
             plan.append(
@@ -631,6 +633,7 @@ fn a_single_slice_tensor_core_attention_writes_its_own_destination() {
         tiled: true,
         origin: RowOrigin::Sequential,
         batch_selected: 0,
+        ..AttnContext::default()
     };
     // Two key heads over sixteen rows is past the slice threshold, so one slice
     // covers it and there is nothing to fold.

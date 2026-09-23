@@ -211,6 +211,7 @@ impl SparseStack {
             tiled: self.opts.tiled_attention,
             origin,
             batch_selected,
+            ..AttnContext::default()
         };
         let chain = island::draft_chain();
         for half in Island::ORDER {

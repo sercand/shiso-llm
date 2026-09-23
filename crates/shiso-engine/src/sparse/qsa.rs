@@ -101,7 +101,9 @@ pub enum AttnPath {
 /// Deliberately NOT `#[non_exhaustive]`: a caller builds one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AttnContext {
-    /// Whether the indexer's selection is live for this pass.
+    /// Whether the indexer's selection is live for this pass's last row; the
+    /// rows in front of it that are not yet past the budget are counted by
+    /// [`AttnContext::dense_rows`].
     ///
     /// It is not a property of the block: it is a property of how much context
     /// the session has accumulated, and it is the same answer for every layer of
@@ -130,6 +132,23 @@ pub struct AttnContext {
     /// step of that sequence would, or batching it would change its text.
     /// Ignored for one sequence's rows, whose answer is `selected`.
     pub batch_selected: u8,
+    /// For one sequence's rows when `selected` is set: how many rows at the
+    /// front of the pass still sit within the budget, counted from each row's
+    /// own position.
+    ///
+    /// `selected` is the pass's last row's answer, and a pass that crosses the
+    /// budget has rows on both sides of it. Those in front are attended densely
+    /// and only the rest over a selection, because that is what each row's own
+    /// single-row step does - and a verify pass is only a verify if every row
+    /// is computed as that step would compute it. Below the budget a selection
+    /// is every visible key, so sending those rows through the selected-block
+    /// kernel instead is the same attention summed by a different kernel:
+    /// close, not equal, and a speculative greedy run then leaves a plain one's
+    /// text at the next near tie. Zero, the default, is a pass wholly past it.
+    pub dense_rows: u32,
+    /// The same count for each run of a segmented pass, where run `r`'s entry
+    /// is read when its bit of `batch_selected` is set.
+    pub run_dense_rows: [u8; crate::sparse::stack::MAX_DECODE_BATCH as usize],
 }
 
 /// Query heads that share one key head.
@@ -439,24 +458,37 @@ fn segmented(
         let first = runs.start(run);
         let rows = runs.len(run);
         let selected = (ctx.batch_selected >> run) & 1 == 1;
-        let span = indexer::RowSpan {
-            base: first,
-            n: rows,
-            pages: Operand::PagesOf(run),
+        let dense = if selected {
+            ctx.run_dense_rows
+                .get(run as usize)
+                .map_or(0, |&rows| u32::from(rows))
+                .min(rows)
+        } else {
+            rows
         };
-        if selected {
-            plan.append(indexer::select_rows(shape, indexed, scorer, span));
+        if dense < rows {
+            plan.append(indexer::select_rows(
+                shape,
+                indexed,
+                scorer,
+                indexer::RowSpan {
+                    base: first + dense,
+                    n: rows - dense,
+                    pages: Operand::PagesOf(run),
+                },
+            ));
         }
         let one = AttnContext {
             selected,
             origin: RowOrigin::Sequential,
             ..ctx
         };
-        plan.append(attend_at(
+        plan.append(attend_across(
             shape,
             slot,
             one,
             rows,
+            dense,
             RowAt {
                 row: first,
                 pages: Operand::PagesOf(run),
@@ -518,6 +550,39 @@ impl RowAt {
             Operand::ScratchFrom(buf, self.offset(width))
         }
     }
+}
+
+/// One sequence's `rows` rows from `at`, the first `dense` of them attended
+/// over the whole context and the rest over their selections.
+///
+/// Two launches only for the one pass per sequence that crosses the indexer
+/// budget; on either side of it `dense` is zero or `rows` and this is the one
+/// launch it always was. See [`AttnContext::dense_rows`] for why the rows in
+/// front cannot simply ride along with the selected ones.
+fn attend_across(
+    shape: &SparseShape,
+    slot: AttnSlot,
+    ctx: AttnContext,
+    rows: u32,
+    dense: u32,
+    at: RowAt,
+) -> Plan {
+    let mut plan = Plan::new();
+    if dense > 0 {
+        let within = AttnContext {
+            selected: false,
+            ..ctx
+        };
+        plan.append(attend_at(shape, slot, within, dense, at));
+    }
+    if dense < rows {
+        let past = RowAt {
+            row: at.row + dense,
+            pages: at.pages,
+        };
+        plan.append(attend_at(shape, slot, ctx, rows - dense, past));
+    }
+    plan
 }
 
 /// One batch row's attention, launched exactly as a single-row step of its
@@ -753,17 +818,31 @@ pub fn block(
             plan.append(attend_one(shape, slot, ctx, row));
         }
     } else {
-        if ctx.selected {
-            plan.append(indexer::select(
+        let dense = if ctx.selected {
+            ctx.dense_rows.min(n_tok)
+        } else {
+            n_tok
+        };
+        if dense < n_tok {
+            plan.append(indexer::select_queries(
                 shape,
                 &desc.indexer,
                 indexed,
-                scorer,
                 n_tok,
                 device,
             )?);
+            plan.append(indexer::select_rows(
+                shape,
+                indexed,
+                scorer,
+                indexer::RowSpan {
+                    base: dense,
+                    n: n_tok - dense,
+                    pages: Operand::Pages,
+                },
+            ));
         }
-        plan.append(attend(shape, slot, ctx, n_tok));
+        plan.append(attend_across(shape, slot, ctx, n_tok, dense, RowAt::WHOLE));
     }
     plan.launch(
         Entry::plain(MOD_QSA, "q4e_qsa_gate_kernel"),

@@ -1582,6 +1582,7 @@ dependencies = [
  "shiso-engine",
  "shiso-kernels",
  "shiso-kerneltest",
+ "shiso-modelfile",
  "shiso-models",
  "shiso-vision",
  "thiserror",

@@ -61,3 +61,6 @@ serde_json = { workspace = true }
 shiso-vision = { workspace = true }
 image = { workspace = true }
 shiso-engine = { workspace = true }
+# The sparse family's case reads its geometry off the container's own
+# metadata, so it needs no sidecar directory beside the checkpoint.
+shiso-modelfile = { workspace = true }
