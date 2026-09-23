@@ -220,12 +220,13 @@ impl NgramTier {
         backend: &Arc<dyn shiso_core::backend::Backend>,
         ple: PleShape,
         table: NgramTable,
+        rows: u32,
     ) -> CoreResult<Self> {
         let stride = fits(ple, &table)?;
         let rows = shiso_core::buffer::alloc_tagged(
             backend,
             shiso_core::ledger::MemTag::NgramStaging,
-            u64::from(crate::sparse::stack::MAX_PREFILL_CHUNK)
+            u64::from(rows)
                 .saturating_mul(u64::from(ple.heads()))
                 .saturating_mul(u64::from(stride)),
         )?;

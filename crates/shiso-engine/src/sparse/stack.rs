@@ -44,6 +44,7 @@ use crate::sessions::clear_range;
 use crate::shape::LayerKind;
 use crate::sparse::island::{GraphPolicy, IslandKey};
 use crate::sparse::kernels::F32_BYTES;
+use crate::sparse::kernels::IDX_QUERY_BLOCK;
 use crate::sparse::matmul::Device;
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::mtp::{Rollback, SpecDepth};
@@ -127,6 +128,15 @@ pub struct SparseOptions {
     pub ngram_cache_bytes: u64,
     /// Which reader that table is opened through, and how deep it runs.
     pub ngram_reader: shiso_ple::PleConfig,
+    /// Rows the widest pass may carry, which is what every activation buffer
+    /// is allocated at: a multiple of [`IDX_QUERY_BLOCK`] from one block up
+    /// to [`MAX_PREFILL_CHUNK`].
+    ///
+    /// The scratch is linear in this - about 1.3 MiB a row on the published
+    /// geometry, 10 GiB at 8192 - so it is the knob that trades prefill speed
+    /// (every routed expert is read once per pass) for key/value pool. A
+    /// prompt longer than this is split rather than refused.
+    pub prefill_rows: u32,
 }
 
 impl SparseOptions {
@@ -151,6 +161,7 @@ impl SparseOptions {
             entries: crate::sparse::kernels::EntryTable::new(&[]),
             ngram_cache_bytes: NGRAM_CACHE_BYTES,
             ngram_reader: shiso_ple::PleConfig::DEFAULT,
+            prefill_rows: MAX_PREFILL_CHUNK,
         }
     }
 }
@@ -162,6 +173,20 @@ impl SparseOptions {
 /// revisits are the ones its recent grams name, and that set is small and hot
 /// while the table it is drawn from is tens of gibibytes.
 pub const NGRAM_CACHE_BYTES: u64 = 512 << 20;
+
+impl SparseOptions {
+    /// The [`SparseOptions::prefill_rows`] a scheduler whose widest prefill
+    /// chunk is `widest` tokens needs: rounded up to a whole query block, and
+    /// capped at [`MAX_PREFILL_CHUNK`], past which the stack splits a chunk
+    /// itself.
+    #[must_use]
+    pub fn prefill_rows_for(widest: usize) -> u32 {
+        let widest = u32::try_from(widest).unwrap_or(u32::MAX);
+        widest
+            .clamp(IDX_QUERY_BLOCK, MAX_PREFILL_CHUNK)
+            .next_multiple_of(IDX_QUERY_BLOCK)
+    }
+}
 
 impl Default for SparseOptions {
     fn default() -> Self {
@@ -527,6 +552,26 @@ fn log_resident(shape: &SparseShape, opts: &SparseOptions, kv: &PagedKv, ckpt_by
     );
 }
 
+/// Refuses a pass width the stack cannot be built at.
+///
+/// The floor is one query block, which is also what keeps every decode and
+/// verify pass (at most [`MAX_LOGIT_ROWS`] rows) inside the scratch; the
+/// ceiling is the width the kernels' own tables were sized for.
+fn check_prefill_rows(rows: u32) -> CoreResult<()> {
+    if !(IDX_QUERY_BLOCK..=MAX_PREFILL_CHUNK).contains(&rows)
+        || !rows.is_multiple_of(IDX_QUERY_BLOCK)
+    {
+        return Err(CoreError::InvalidValue {
+            key: "prefill_rows",
+            value: format!(
+                "{rows} is not a multiple of {IDX_QUERY_BLOCK} between {IDX_QUERY_BLOCK} and \
+                 {MAX_PREFILL_CHUNK}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Device bytes one session allocates when it opens.
 ///
 /// Every recurrent slot's window and state, one rollback record of each per
@@ -581,6 +626,7 @@ impl SparseStack {
     ) -> CoreResult<Self> {
         shape.validate()?;
         check_layers(&shape, &weights)?;
+        check_prefill_rows(opts.prefill_rows)?;
         // Everything resident so far is weights: the ledger's second mark.
         if let Some(ledger) = backend.ledger() {
             ledger.mark("after_weights", backend.memory_info());
@@ -595,14 +641,19 @@ impl SparseStack {
         let scratch = Scratch::new(
             backend,
             &shape,
-            MAX_PREFILL_CHUNK,
+            opts.prefill_rows,
             MAX_LOGIT_ROWS,
             opts.engine.ctx,
         )?;
         let ngram = match (shape.ple, ngram) {
             (Some(ple), Some(table)) => {
                 crate::sparse::memory::watch_ngram(backend, &table, opts.ngram_cache_bytes);
-                Some(ple::NgramTier::open(backend, ple, table)?)
+                Some(ple::NgramTier::open(
+                    backend,
+                    ple,
+                    table,
+                    opts.prefill_rows,
+                )?)
             }
             (None, None) => None,
             (Some(_), None) => {
@@ -711,6 +762,13 @@ impl SparseStack {
     #[must_use]
     pub const fn context_capacity(&self) -> u32 {
         self.opts.engine.ctx
+    }
+
+    /// Rows the widest pass this stack runs may carry; a longer prompt is
+    /// split into chunks of at most this many.
+    #[must_use]
+    pub const fn prefill_rows(&self) -> u32 {
+        self.opts.prefill_rows
     }
 
     /// Recurrent slots, which is how many states a session allocates.
@@ -1455,5 +1513,30 @@ fn cache_failure(source: shiso_kvstore::KvError) -> CoreError {
         backend: "engine",
         op: "kv cache",
         source: Box::new(source),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pass_width_is_a_whole_number_of_query_blocks_up_to_the_ceiling() {
+        for rows in [IDX_QUERY_BLOCK, 2048, 4096, MAX_PREFILL_CHUNK] {
+            assert!(check_prefill_rows(rows).is_ok(), "{rows}");
+        }
+        assert_eq!(SparseOptions::prefill_rows_for(1), IDX_QUERY_BLOCK);
+        assert_eq!(SparseOptions::prefill_rows_for(3000), 3072);
+        assert_eq!(SparseOptions::prefill_rows_for(2048), 2048);
+        assert_eq!(SparseOptions::prefill_rows_for(1 << 20), MAX_PREFILL_CHUNK);
+        for rows in [
+            0,
+            32,
+            IDX_QUERY_BLOCK + 1,
+            3000,
+            MAX_PREFILL_CHUNK + IDX_QUERY_BLOCK,
+        ] {
+            assert!(check_prefill_rows(rows).is_err(), "{rows}");
+        }
     }
 }

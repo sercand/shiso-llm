@@ -64,9 +64,7 @@ use crate::sparse::ple::{self, NgramContext, PleGather};
 use crate::sparse::qsa::{self, AttnContext, AttnSlot};
 use crate::sparse::recurrent::{self, Recurrence};
 use crate::sparse::scratch::Buf;
-use crate::sparse::stack::{
-    IslandSpan, MAX_DECODE_BATCH, MAX_PREFILL_CHUNK, Pass, SparseSession, SparseStack,
-};
+use crate::sparse::stack::{IslandSpan, MAX_DECODE_BATCH, Pass, SparseSession, SparseStack};
 use crate::sparse::weights::BlockDesc;
 
 impl SparseStack {
@@ -111,10 +109,10 @@ impl SparseStack {
     ) -> CoreResult<Pass> {
         let live = self.session(session)?;
         let n_tok = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-        if n_tok == 0 || n_tok > MAX_PREFILL_CHUNK {
+        if n_tok == 0 || n_tok > self.opts.prefill_rows {
             return Err(CoreError::ShapeMismatch {
                 field: "chunk rows",
-                expected: u64::from(MAX_PREFILL_CHUNK),
+                expected: u64::from(self.opts.prefill_rows),
                 got: u64::from(n_tok),
             });
         }

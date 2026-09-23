@@ -65,6 +65,12 @@ pub struct EngineOptions {
     ///
     /// `None`, the default, is the page count as given.
     pub kv_fit: Option<KvFit>,
+    /// Refuse a pool given as a page count that the device cannot hold once
+    /// everything else is resident. Ignored when [`EngineOptions::kv_fit`]
+    /// sizes the pool, which fits by construction.
+    ///
+    /// `None`, the default, trusts the count.
+    pub kv_check: Option<KvCheck>,
 }
 
 impl EngineOptions {
@@ -81,24 +87,38 @@ impl EngineOptions {
             kv_ckpt_slots: 16,
             spec: SpecDepth::NONE,
             kv_fit: None,
+            kv_check: None,
         }
     }
 
-    /// Resolves [`EngineOptions::kv_fit`] into `kv_pool_pages`, when set.
+    /// Resolves [`EngineOptions::kv_fit`] into `kv_pool_pages`, when set, and
+    /// otherwise holds `kv_pool_pages` to [`EngineOptions::kv_check`].
     ///
     /// Called by a stack once everything it allocates up front, other than
-    /// the pool, is resident - so the driver's free figure already has its
-    /// weights and scratch taken out of it.
+    /// the pool, is resident. The free figure is the backend's, lowered by its
+    /// memory ledger to what is left once every tagged allocation is actually
+    /// resident ([`shiso_core::MemLedger::committed`]): on a device that
+    /// commits on first touch, the driver alone still counts untouched scratch
+    /// as free.
     ///
     /// # Errors
     ///
-    /// [`CoreError::Unsupported`] on a device that cannot report its memory,
-    /// and whatever [`KvFit::pool_pages`] reports.
+    /// [`CoreError::Unsupported`] on a device that cannot report its memory
+    /// when a fit was asked for, and whatever [`KvFit::pool_pages`] and
+    /// [`KvCheck::check`] report.
     pub fn fit_pool(&mut self, backend: &dyn Backend, cost: PoolCost) -> CoreResult<()> {
+        let committed = || {
+            backend
+                .memory_info()
+                .map(|now| backend.ledger().map_or(now, |ledger| ledger.committed(now)))
+        };
         let Some(fit) = self.kv_fit else {
+            if let (Some(check), Some(info)) = (self.kv_check, committed()) {
+                check.check(info, cost, self.kv_pool_pages)?;
+            }
             return Ok(());
         };
-        let info = backend.memory_info().ok_or(CoreError::Unsupported {
+        let info = committed().ok_or(CoreError::Unsupported {
             what: "sizing the cache to a share of device memory on a device that cannot report \
                    its memory",
             backend: "engine",
@@ -145,6 +165,93 @@ pub struct PoolCost {
     /// checkpoint slots' blobs, which on a device that shares memory with its
     /// host come out of the same memory as the pool.
     pub fixed_bytes: u64,
+}
+
+/// A limit on a pool given as a page count: it, `sessions` sessions' own
+/// state, the checkpoint slots and `reserve_bytes` must all fit in what the
+/// device has free once the stack is resident.
+///
+/// The reason this is a refusal and not a warning is the device it was
+/// written for: on one that commits memory on first touch, a pool that does
+/// not fit still allocates, and the failure comes hours later when sessions
+/// fill it - as the whole machine running out of memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvCheck {
+    sessions: u32,
+    reserve_bytes: u64,
+}
+
+impl KvCheck {
+    /// The sessions that will be resident at once, and the bytes that will be
+    /// allocated after the stack is built.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for zero sessions.
+    pub fn new(sessions: u32, reserve_bytes: u64) -> CoreResult<Self> {
+        if sessions == 0 {
+            return Err(CoreError::InvalidValue {
+                key: "max_num_seqs",
+                value: "0 sessions".to_owned(),
+            });
+        }
+        Ok(Self {
+            sessions,
+            reserve_bytes,
+        })
+    }
+
+    /// Refuses `pool_pages` when they do not fit on a device reporting `info`.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] naming the numbers and the largest pool
+    /// that would fit.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "gibibytes in an error message; a mantissa's worth of bytes is not the point"
+    )]
+    pub fn check(&self, info: MemoryInfo, cost: PoolCost, pool_pages: u32) -> CoreResult<()> {
+        let sessions = u64::from(self.sessions).saturating_mul(cost.session_bytes);
+        let left = info
+            .free
+            .saturating_sub(sessions)
+            .saturating_sub(cost.fixed_bytes)
+            .saturating_sub(self.reserve_bytes);
+        let pool = u64::from(pool_pages).saturating_mul(cost.page_bytes);
+        let fits = left / cost.page_bytes.max(1);
+        tracing::info!(
+            free_gib = gib(info.free),
+            pool_gib = gib(pool),
+            sessions = self.sessions,
+            sessions_gib = gib(sessions),
+            fixed_gib = gib(cost.fixed_bytes),
+            reserve_gib = gib(self.reserve_bytes),
+            margin_gib = (left as f64 - pool as f64) / f64::from(1u32 << 30),
+            "the KV pool against committed memory"
+        );
+        if pool > left {
+            return Err(CoreError::InvalidValue {
+                key: "kv_cache_tokens",
+                value: format!(
+                    "{} tokens ({:.2} GiB) do not fit: {:.2} GiB is free once everything \
+                     allocated so far is resident, less {:.2} GiB for {} sessions, {:.2} GiB \
+                     of checkpoint slots and {:.2} GiB reserved leaves {:.2} GiB, room for \
+                     {} tokens; lower --kv-cache-tokens, --max-num-seqs or the prefill width",
+                    u64::from(pool_pages) * u64::from(PAGE_TOKENS),
+                    gib(pool),
+                    gib(info.free),
+                    gib(sessions),
+                    self.sessions,
+                    gib(cost.fixed_bytes),
+                    gib(self.reserve_bytes),
+                    gib(left),
+                    fits.saturating_mul(u64::from(PAGE_TOKENS)),
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A KV pool sized to a share of the device's memory.
@@ -303,6 +410,22 @@ mod tests {
             .pool_pages(info, COST, 4096)
             .expect_err("half the device is already in use");
         assert!(format!("{error}").contains("GiB"), "{error}");
+    }
+
+    #[test]
+    fn a_counted_pool_is_held_to_what_is_free_after_sessions_and_reserve() {
+        let check = KvCheck::new(4, GIB).expect("sessions");
+        let info = MemoryInfo {
+            free: 40 * GIB,
+            total: 100 * GIB,
+        };
+        // 40 - 1 (sessions) - 1 (reserve) = 38 GiB: 2432 pages of 16 MiB.
+        assert!(check.check(info, COST, 2432).is_ok());
+        let error = check
+            .check(info, COST, 2433)
+            .expect_err("one page too many");
+        assert!(format!("{error}").contains("room for"), "{error}");
+        assert!(KvCheck::new(0, 0).is_err());
     }
 
     #[test]

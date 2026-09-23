@@ -595,6 +595,36 @@ impl MemLedger {
             .push(mark);
     }
 
+    /// `now` with its free figure lowered to what is left once every tagged
+    /// byte is actually resident.
+    ///
+    /// A device that commits memory on first touch - the GB10 does - reports
+    /// an allocation nobody has written yet as free, so a pool sized from its
+    /// free figure is sized against scratch and pages that are only *going*
+    /// to be resident, and runs the machine out of memory when they are. The
+    /// fix is the ledger's own count: what was in use at the first mark, plus
+    /// everything tagged since, is in use whether or not it was touched. The
+    /// larger of that and the driver's figure is kept, so untagged
+    /// allocations still count. Without a first mark `now` is returned as is.
+    #[must_use]
+    pub fn committed(&self, now: MemoryInfo) -> MemoryInfo {
+        let marks = self.marks.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(base) = marks.first().and_then(|mark| mark.device) else {
+            return now;
+        };
+        drop(marks);
+        let mut tagged = self.counted(Residence::Device);
+        if self.unified {
+            tagged = tagged.saturating_add(self.counted(Residence::Host));
+        }
+        let committed = in_use(base).saturating_add(tagged);
+        let in_use_now = in_use(now).max(committed).min(now.total);
+        MemoryInfo {
+            free: now.total - in_use_now,
+            total: now.total,
+        }
+    }
+
     /// Everything the ledger knows, with `device` as the figure now.
     #[must_use]
     pub fn report(&self, device: Option<MemoryInfo>) -> LedgerReport {
@@ -791,6 +821,32 @@ mod tests {
             ..report
         };
         assert_eq!(discrete.unaccounted(), Some(10 * 1024 * 1024));
+    }
+
+    #[test]
+    fn committed_memory_counts_tagged_bytes_the_driver_has_not_seen_yet() {
+        let total = 100 * MIB;
+        let ledger = MemLedger::new(true);
+        let before = MemoryInfo {
+            free: 90 * MIB,
+            total,
+        };
+        // No mark yet: nothing to measure from.
+        assert_eq!(ledger.committed(before), before);
+        ledger.mark("before_load", Some(before));
+        ledger.record(MemTag::Activations, 30 * MIB);
+        // The driver saw only 5 MiB of the 30 get touched.
+        let lazy = ledger.committed(MemoryInfo {
+            free: 85 * MIB,
+            total,
+        });
+        assert_eq!(lazy.free, 60 * MIB);
+        // Untagged growth beyond the tags still counts.
+        let busy = ledger.committed(MemoryInfo {
+            free: 40 * MIB,
+            total,
+        });
+        assert_eq!(busy.free, 40 * MIB);
     }
 
     #[test]

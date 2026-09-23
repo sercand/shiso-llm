@@ -77,7 +77,7 @@ use shiso_core::page::MROPE_BACK;
 
 use crate::sparse::kernels::I32_BYTES;
 use crate::sparse::scratch::Buf;
-use crate::sparse::stack::{MAX_PREFILL_CHUNK, SparseStack};
+use crate::sparse::stack::SparseStack;
 use crate::vision::{Streams, Walk};
 
 /// Position axes one rotary table row carries: time, height and width, in that
@@ -681,10 +681,10 @@ impl SparseStack {
     /// for, and [`CoreError::Backend`] when a transfer fails.
     pub fn write_inputs(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<()> {
         let n_tok = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-        if n_tok == 0 || n_tok > MAX_PREFILL_CHUNK {
+        if n_tok == 0 || n_tok > self.opts.prefill_rows {
             return Err(CoreError::ShapeMismatch {
                 field: "chunk rows",
-                expected: u64::from(MAX_PREFILL_CHUNK),
+                expected: u64::from(self.opts.prefill_rows),
                 got: u64::from(n_tok),
             });
         }
@@ -744,10 +744,10 @@ impl SparseStack {
         run: &mut crate::sparse::media::MediaRun<'_>,
     ) -> CoreResult<()> {
         let n_tok = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-        if n_tok == 0 || n_tok > MAX_PREFILL_CHUNK {
+        if n_tok == 0 || n_tok > self.opts.prefill_rows {
             return Err(CoreError::ShapeMismatch {
                 field: "chunk rows",
-                expected: u64::from(MAX_PREFILL_CHUNK),
+                expected: u64::from(self.opts.prefill_rows),
                 got: u64::from(n_tok),
             });
         }

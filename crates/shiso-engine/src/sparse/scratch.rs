@@ -35,7 +35,8 @@ use shiso_core::page::MROPE_BACK;
 
 use crate::sparse::inputs::MROPE_AXES;
 use crate::sparse::kernels::{
-    ATTN_GSPLITS, ATTN_QT, ATTN_SPLITS, F16_BYTES, F32_BYTES, I32_BYTES, IDX_DIM, IDX_WIDTH,
+    ATTN_GSPLITS, ATTN_QT, ATTN_SPLITS, F16_BYTES, F32_BYTES, I32_BYTES, IDX_DIM, IDX_QUERY_BLOCK,
+    IDX_WIDTH,
 };
 use crate::sparse::shape::SparseShape;
 
@@ -397,11 +398,7 @@ impl Buf {
             Self::IdxQueryNorm => {
                 rows * u64::from(shape.indexer.heads) * u64::from(IDX_DIM) * F16_BYTES
             }
-            // The context in blocks, not the budget: the scorer ranks every
-            // block the context can hold and the top-k keeps `budget_blocks` of
-            // them, so a row sized by the budget is a row that never ranks
-            // anything past it. See `IndexerShape::score_blocks`.
-            Self::IdxScore => rows * u64::from(shape.indexer.score_blocks(ctx)) * F32_BYTES,
+            Self::IdxScore => score_bytes(shape, rows, ctx),
             Self::IdxSelected => rows * u64::from(shape.indexer.budget_blocks()) * I32_BYTES,
             Self::IdxCount | Self::IdxTokenCount => rows * I32_BYTES,
             Self::IdxTokens => rows * u64::from(IDX_WIDTH) * I32_BYTES,
@@ -537,6 +534,23 @@ impl Buf {
                 | Self::PleConv
         )
     }
+}
+
+/// Bytes of the indexer's score slab for a chunk of `rows` rows.
+///
+/// The context in blocks, not the budget: the scorer ranks every block the
+/// context can hold and the top-k keeps `budget_blocks` of them, so a row sized
+/// by the budget is a row that never ranks anything past it. See
+/// `IndexerShape::score_blocks`.
+///
+/// And one query block of rows, not the chunk: the selection scores at most
+/// [`IDX_QUERY_BLOCK`] rows per launch and the top-k right after it consumes
+/// them, so every launch writes this slab from offset zero
+/// (`indexer::select_rows`). Sized by the chunk it was sixteen times too large
+/// at 8192 rows - 8 KiB per token of `--ctx`, 4 GiB at 512K - for rows nothing
+/// ever wrote.
+fn score_bytes(shape: &SparseShape, rows: u64, ctx: u32) -> u64 {
+    rows.min(u64::from(IDX_QUERY_BLOCK)) * u64::from(shape.indexer.score_blocks(ctx)) * F32_BYTES
 }
 
 /// Bytes every buffer a chunk needs, without allocating any of them.
@@ -820,6 +834,16 @@ mod tests {
         assert_eq!(
             Buf::IdxScore.bytes(&shape, 512, 8, CTX),
             512 * u64::from(blocks) * F32_BYTES
+        );
+        // A chunk wider than one query block still gets one block's slab:
+        // the scorer walks the chunk a block at a time over the same rows.
+        assert_eq!(
+            Buf::IdxScore.bytes(&shape, 8192, 8, CTX),
+            u64::from(IDX_QUERY_BLOCK) * u64::from(blocks) * F32_BYTES
+        );
+        assert_eq!(
+            Buf::IdxScore.bytes(&shape, 7, 8, CTX),
+            7 * u64::from(blocks) * F32_BYTES
         );
         // The kept list is the budget's, and stays that way.
         assert_eq!(

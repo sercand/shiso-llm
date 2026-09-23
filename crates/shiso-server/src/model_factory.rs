@@ -643,6 +643,7 @@ fn engine_options(args: &ServeArgs) -> Result<EngineOptions, FactoryError> {
         opts.kv_pool_pages = pages;
     }
     opts.kv_fit = args.kv_fit().map_err(FactoryError::Load)?;
+    opts.kv_check = args.kv_check().map_err(FactoryError::Load)?;
     Ok(opts)
 }
 
@@ -751,11 +752,20 @@ fn sparse_options(
         co_resident_blocks,
         "device facts the sparse stack was built with",
     );
+    // The scratch is allocated at the widest pass the scheduler will ask
+    // for, which is what lets the prefill flags trade speed for pool. The
+    // widths were validated at boot, so the fallback is never taken.
+    let widest = args
+        .prefill_widths()
+        .map_or(shiso_engine::sparse::MAX_PREFILL_CHUNK as usize, |widths| {
+            widths.solo_chunk.max(widths.mixed_quantum)
+        });
     SparseOptions {
         engine,
         spec: SpecDepth::new(args.spec_k),
         entries,
         co_resident_blocks,
+        prefill_rows: SparseOptions::prefill_rows_for(widest),
         ..SparseOptions::default()
     }
 }

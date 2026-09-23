@@ -49,7 +49,7 @@ use crate::sparse::kernels::F32_BYTES;
 use crate::sparse::media::MediaRun;
 use crate::sparse::ple::{PleGather, PleRows};
 use crate::sparse::scratch::Buf;
-use crate::sparse::stack::{MAX_DECODE_BATCH, MAX_PREFILL_CHUNK, Pass, SparseStack};
+use crate::sparse::stack::{MAX_DECODE_BATCH, Pass, SparseStack};
 
 impl SparseStack {
     /// Advances a session by a prompt chunk that produces no logits.
@@ -316,7 +316,7 @@ impl SparseStack {
         // disagree; there is one of this one.
         let positions = crate::shape::MediaPositions::Mrope3D;
         let mut run = media.map(|prefill| MediaRun::new(prefill, start, positions));
-        let width = usize::try_from(MAX_PREFILL_CHUNK).unwrap_or(usize::MAX);
+        let width = usize::try_from(self.opts.prefill_rows).unwrap_or(usize::MAX);
         let mut rest = tokens;
         while !rest.is_empty() {
             // A chunk may not end inside a placeholder run: the walk hands out

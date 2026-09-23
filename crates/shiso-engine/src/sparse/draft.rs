@@ -337,10 +337,10 @@ impl SparseStack {
         pick: bool,
     ) -> CoreResult<Option<TokenId>> {
         let n_tok = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-        if n_tok == 0 || n_tok > crate::sparse::stack::MAX_PREFILL_CHUNK {
+        if n_tok == 0 || n_tok > self.opts.prefill_rows {
             return Err(CoreError::ShapeMismatch {
                 field: "draft rows",
-                expected: u64::from(crate::sparse::stack::MAX_PREFILL_CHUNK),
+                expected: u64::from(self.opts.prefill_rows),
                 got: u64::from(n_tok),
             });
         }

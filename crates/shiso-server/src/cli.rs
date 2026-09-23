@@ -546,19 +546,37 @@ impl ServeArgs {
         let Some(fraction) = self.gpu_memory_utilization else {
             return Ok(None);
         };
+        let sessions = u32::try_from(self.max_num_seqs).unwrap_or(u32::MAX);
+        shiso_engine::KvFit::new(fraction, sessions, self.late_reserve_bytes()).map(Some)
+    }
+
+    /// The limit a pool given as a token count - `--kv-cache-tokens`, or the
+    /// default - is held to: the same sessions and reserve a
+    /// `--gpu-memory-utilization` pool sets aside. `None` when a share sizes
+    /// the pool instead.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`shiso_engine::KvCheck::new`] reports for no sessions, which
+    /// [`ServeArgs::validate`] has already refused by flag name.
+    pub fn kv_check(&self) -> shiso_core::CoreResult<Option<shiso_engine::KvCheck>> {
+        if self.gpu_memory_utilization.is_some() {
+            return Ok(None);
+        }
+        let sessions = u32::try_from(self.max_num_seqs).unwrap_or(u32::MAX);
+        shiso_engine::KvCheck::new(sessions, self.late_reserve_bytes()).map(Some)
+    }
+
+    /// Bytes allocated after the stack is built that it cannot see: the vision
+    /// tower, when `--vision` names a file, and [`KV_FIT_HEADROOM_BYTES`].
+    fn late_reserve_bytes(&self) -> u64 {
         let tower = self
             .vision
             .as_deref()
             .and_then(|path| std::fs::metadata(path).ok())
             .filter(std::fs::Metadata::is_file)
             .map_or(0, |meta| meta.len());
-        let sessions = u32::try_from(self.max_num_seqs).unwrap_or(u32::MAX);
-        shiso_engine::KvFit::new(
-            fraction,
-            sessions,
-            tower.saturating_add(KV_FIT_HEADROOM_BYTES),
-        )
-        .map(Some)
+        tower.saturating_add(KV_FIT_HEADROOM_BYTES)
     }
 
     /// The name this checkpoint answers to on the wire.
