@@ -97,7 +97,7 @@ Per case, at the case's frontier position (the same 0-based position as
 - If the reference keeps the streams in a different order (for example
   `[stream][token][hidden]` for the whole sequence), slice out the one token
   and write `[stream, hidden]`. If the order differs, record it under a `layout` key in
-  `index.json` if it differs.
+  `index.json`.
 - The grading metric is `||shiso - ref||_2 / ||ref||_2` per file. The first
   layer where it jumps names the component: GDN or attention/indexer (mixer
   file), MoE (layer file), the hyper-connection mix and combine (both), or
