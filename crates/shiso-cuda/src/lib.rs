@@ -567,6 +567,15 @@ impl Drop for CudaBackend {
         {
             tracing::error!(error = %err, "matrix staging slab free failed");
         }
+        // The cooperative launches' scratch slab is the same kind of thing: the
+        // backend grows it on request and no caller ever hands it back. It was
+        // the one "live allocation" every sparse-stack run logged at exit.
+        let scratch = self.state.lock().scratch.take();
+        if let Some((raw, _)) = scratch
+            && let Err(err) = device::free(self, raw)
+        {
+            tracing::error!(error = %err, "cooperative scratch slab free failed");
+        }
         device::release_all(&mut self.state.lock().buffers);
     }
 }

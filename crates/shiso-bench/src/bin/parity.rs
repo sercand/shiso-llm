@@ -139,6 +139,15 @@ struct Args {
     /// fixture, so a capture made at another width says so in its label.
     #[arg(long, default_value_t = REPLAY_CHUNK, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     chunk: usize,
+
+    /// Key/value pool depth in pages, instead of the engine's default.
+    ///
+    /// Every case's prefix stays cached after its session closes and a replay
+    /// never evicts, so the pool decides how far into the page-id range a run
+    /// reaches - and a run whose cases add up to more than it is refused at the
+    /// case that overflows it.
+    #[arg(long)]
+    kv_pool_pages: Option<u32>,
 }
 
 /// What every captured fixture says about itself, in the file, in these words.
@@ -206,7 +215,7 @@ fn main() -> Result<()> {
     let vocabulary = Vocabulary::load(&args.tokenizer.join("tokenizer.json"))?;
     let provenance = Provenance {
         vocabulary: vocabulary.digest()?,
-        prompts: prompts_digest(&base_dir, &cases)?,
+        prompts: prompts_digest(&base_dir, &digested(&args, all_cases, &cases))?,
     };
     if args.capture.is_none() {
         provenance.check(&fixture)?;
@@ -217,8 +226,9 @@ fn main() -> Result<()> {
     let mut dumps = Dumps::open(&args, &cases)?;
 
     let config = args.config.clone().unwrap_or_else(default_config);
-    let mut harness = Harness::open(device, &args.model, &config, ctx)
-        .with_context(|| format!("opening {} for {}", args.model.display(), device.as_str()))?;
+    let mut harness =
+        Harness::open_with_pool(device, &args.model, &config, ctx, args.kv_pool_pages)
+            .with_context(|| format!("opening {} for {}", args.model.display(), device.as_str()))?;
     report(&format!(
         "shiso-parity: {} cases, backend {}, ctx {ctx}, prefill chunk {}, vocabulary {}, prompts {}",
         cases.len(),
@@ -298,6 +308,24 @@ fn select<'a>(all: &'a [LocalCase], wanted: &[String]) -> Result<Vec<&'a LocalCa
         chosen.push(case);
     }
     Ok(chosen)
+}
+
+/// The cases the prompt digest is taken over.
+///
+/// A replay digests every case the fixture declares, because that is what the
+/// capture recorded the digest over: digesting only the `--case` selection
+/// would refuse every replay of a subset. A capture digests what it writes,
+/// which is the selection.
+fn digested<'a>(
+    args: &Args,
+    all: &'a [LocalCase],
+    selected: &[&'a LocalCase],
+) -> Vec<&'a LocalCase> {
+    if args.capture.is_some() {
+        selected.to_vec()
+    } else {
+        all.iter().collect()
+    }
 }
 
 /// The two inputs that decide which tokens a case means.

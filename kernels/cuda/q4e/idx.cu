@@ -228,13 +228,19 @@ extern "C" __global__ void __launch_bounds__(256) q4e_idx_score_tc_kernel(
         if (qi < n_q) v = ((const uint4 *)(qn + ((uint64_t)(t0 + qi) * NH + h) * Q4E_IDX_DIM))[c];
         *(uint4 *)(s_q + q4e_idx_tc_off(h * 16u + qi, c)) = v;
     }
-    /* K rows: the tile's pooled keys are contiguous inside one page (the tile
-     * is half a page); rows past n_b are zero. */
-    const uint32_t brow = q4e_kv_row(pages, b0 * Q4E_IDX_R) / Q4E_IDX_R;
+    /* K rows: each block's pooled row is translated through the page table on
+     * its own.  The tile spans BT * R = 512 positions, two KV pages, and a
+     * session's pages are only physically adjacent in a pool nobody has
+     * recycled yet: one lookup for the whole tile read the second half from
+     * the page after the first, and past the plane when the first was the
+     * pool's last page.  Rows past n_b are zero. */
     for (uint32_t i = tid; i < BT * 16u; i += 256u) {
         const uint32_t bi = i >> 4u, c = i & 15u;
         uint4 v = make_uint4(0u, 0u, 0u, 0u);
-        if (bi < n_b) v = ((const uint4 *)(pooled + (uint64_t)(brow + bi) * Q4E_IDX_DIM))[c];
+        if (bi < n_b) {
+            const uint32_t brow = q4e_kv_row(pages, (b0 + bi) * Q4E_IDX_R) / Q4E_IDX_R;
+            v = ((const uint4 *)(pooled + (uint64_t)brow * Q4E_IDX_DIM))[c];
+        }
         *(uint4 *)(s_k + q4e_idx_tc_off(bi, c)) = v;
     }
     __syncthreads();

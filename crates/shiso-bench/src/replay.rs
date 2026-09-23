@@ -169,6 +169,26 @@ impl Harness {
         config_path: &Path,
         ctx: u32,
     ) -> ReplayResult<Self> {
+        Self::open_with_pool(device, model_path, config_path, ctx, None)
+    }
+
+    /// [`Harness::open`] with the key/value pool held at `pool_pages` pages
+    /// rather than the engine's default.
+    ///
+    /// A small pool is how a replay reaches the cache's eviction path in a
+    /// handful of short cases rather than after a pool's worth of long ones;
+    /// `None` is the default pool.
+    ///
+    /// # Errors
+    ///
+    /// As [`Harness::open`].
+    pub fn open_with_pool(
+        device: Device,
+        model_path: &Path,
+        config_path: &Path,
+        ctx: u32,
+        pool_pages: Option<u32>,
+    ) -> ReplayResult<Self> {
         let backend = open_backend(device)?;
         // Read here rather than handing the path to the parser: the parser's own
         // error would name the failure but not the file, and a run pointed at
@@ -180,6 +200,9 @@ impl Harness {
         let config = HfConfig::from_json_str(&text)?;
         let mut opts = EngineOptions::new();
         opts.ctx = ctx;
+        if let Some(pages) = pool_pages {
+            opts.kv_pool_pages = pages;
+        }
         let mut model = load_loaded(&backend, model_path, &config, opts, None)?;
         let info = *model.get().info();
         let row = vec![0u8; usize::try_from(info.logits_row_bytes()).unwrap_or(0)];
