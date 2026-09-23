@@ -1,0 +1,35 @@
+# shiso-local-logit-vectors-v1
+# WHAT THIS FILE IS: the capture request for q4e-fp8-long.vec, read by scripts/reference/qwen4exp_fp8_ref.py capture. No recorded entries.
+# THE TRACES are public-domain Project Gutenberg texts (ebook number in each file name), headers and illustration captions stripped, cut at a paragraph, with a question at the end whose answer is in the first paragraphs. The last frontier of each trace is the whole prompt, so its row is the answer's first token.
+# THE FRONTIERS sit at strides and on both sides of shiso's prefill chunk width: frontier F puts the row at 0-based position F-1, so 8192 is the last row of the first 8192-token chunk and 8193 the first row of the second (likewise 16384/16385 and 24576/24577). 2052 is the first frontier past the indexer budget (see q4e-fp8-short.skeleton.vec).
+case trace_8k5_f01024 text 16384 1024 ../prompts/qwen4exp/trace_8k5_gutenberg1661_sherlock_holmes.txt 128
+case trace_8k5_f02052 text 16384 2052 ../prompts/qwen4exp/trace_8k5_gutenberg1661_sherlock_holmes.txt 128
+case trace_8k5_f04096 text 16384 4096 ../prompts/qwen4exp/trace_8k5_gutenberg1661_sherlock_holmes.txt 128
+case trace_8k5_f06144 text 16384 6144 ../prompts/qwen4exp/trace_8k5_gutenberg1661_sherlock_holmes.txt 128
+case trace_8k5_f08191 text 16384 8191 ../prompts/qwen4exp/trace_8k5_gutenberg1661_sherlock_holmes.txt 128
+case trace_8k5_f08192 text 16384 8192 ../prompts/qwen4exp/trace_8k5_gutenberg1661_sherlock_holmes.txt 128
+case trace_8k5_f08193 text 16384 8193 ../prompts/qwen4exp/trace_8k5_gutenberg1661_sherlock_holmes.txt 128
+case trace_8k5_f08194 text 16384 8194 ../prompts/qwen4exp/trace_8k5_gutenberg1661_sherlock_holmes.txt 128
+case trace_8k5_f08300 text 16384 8300 ../prompts/qwen4exp/trace_8k5_gutenberg1661_sherlock_holmes.txt 128
+case trace_8k5_f08422 text 16384 8422 ../prompts/qwen4exp/trace_8k5_gutenberg1661_sherlock_holmes.txt 128
+case trace_16k_f02052 text 32768 2052 ../prompts/qwen4exp/trace_16k_gutenberg1342_pride_and_prejudice.txt 128
+case trace_16k_f04096 text 32768 4096 ../prompts/qwen4exp/trace_16k_gutenberg1342_pride_and_prejudice.txt 128
+case trace_16k_f08192 text 32768 8192 ../prompts/qwen4exp/trace_16k_gutenberg1342_pride_and_prejudice.txt 128
+case trace_16k_f08193 text 32768 8193 ../prompts/qwen4exp/trace_16k_gutenberg1342_pride_and_prejudice.txt 128
+case trace_16k_f12288 text 32768 12288 ../prompts/qwen4exp/trace_16k_gutenberg1342_pride_and_prejudice.txt 128
+case trace_16k_f16384 text 32768 16384 ../prompts/qwen4exp/trace_16k_gutenberg1342_pride_and_prejudice.txt 128
+case trace_16k_f16385 text 32768 16385 ../prompts/qwen4exp/trace_16k_gutenberg1342_pride_and_prejudice.txt 128
+case trace_16k_f16490 text 32768 16490 ../prompts/qwen4exp/trace_16k_gutenberg1342_pride_and_prejudice.txt 128
+case trace_32k_f02052 text 32768 2052 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f04096 text 32768 4096 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f08192 text 32768 8192 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f08193 text 32768 8193 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f12288 text 32768 12288 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f16384 text 32768 16384 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f16385 text 32768 16385 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f20480 text 32768 20480 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f24576 text 32768 24576 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f24577 text 32768 24577 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f28672 text 32768 28672 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f32000 text 32768 32000 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
+case trace_32k_f32512 text 32768 32512 ../prompts/qwen4exp/trace_32k_gutenberg35_time_machine.txt 128
