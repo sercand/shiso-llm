@@ -96,6 +96,25 @@ fn the_kv_cache_is_sized_by_tokens_or_by_a_share_of_the_device_never_both() {
 }
 
 #[test]
+fn the_checkpoint_count_defaults_to_the_engine_s_and_zero_is_a_count_not_a_default() {
+    let args = parse(&["--model", "m.gguf"]).expect("it parses");
+    assert_eq!(
+        args.kv_checkpoints,
+        shiso_engine::EngineOptions::new().kv_ckpt_slots,
+        "the flag's default and the engine's are one number"
+    );
+    let args = parse(&["--model", "m.gguf", "--kv-checkpoints", "40"]).expect("it parses");
+    args.validate().expect("any count is a valid count");
+    assert_eq!(args.kv_checkpoints, 40);
+    // Zero turns prefix reuse off; it is not refused the way a zero budget
+    // is, because nothing downstream substitutes a default for it.
+    let args = parse(&["--model", "m.gguf", "--kv-checkpoints", "0"]).expect("it parses");
+    args.validate().expect("zero holds none");
+    assert_eq!(args.kv_checkpoints, 0);
+    assert!(parse(&["--model", "m.gguf", "--kv-checkpoints=-1"]).is_err());
+}
+
+#[test]
 fn a_kv_cache_that_cannot_hold_one_context_or_a_share_outside_zero_to_one_is_refused() {
     let small = parse(&[
         "--model",
@@ -310,6 +329,7 @@ fn every_documented_flag_declares_its_prefixed_environment_fallback() {
         "SHISO_MAX_NUM_SEQS",
         "SHISO_KV_CACHE_TOKENS",
         "SHISO_GPU_MEMORY_UTILIZATION",
+        "SHISO_KV_CHECKPOINTS",
         "SHISO_KVSTORE_DIR",
         "SHISO_KVSTORE_BUDGET_MB",
         "SHISO_AUTH_TOKENS",

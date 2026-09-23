@@ -642,6 +642,13 @@ fn engine_options(args: &ServeArgs) -> Result<EngineOptions, FactoryError> {
     if let Some(pages) = pages {
         opts.kv_pool_pages = pages;
     }
+    opts.kv_ckpt_slots = args.kv_checkpoints;
+    // A resume always lands on a checkpoint, so without one no request reuses
+    // a prefix. Legitimate - an operator measuring cold prefill asks for it -
+    // but not something to find out from the throughput.
+    if opts.kv_ckpt_slots == 0 {
+        tracing::warn!("--kv-checkpoints 0: no prefix is reused, every request prefills from zero");
+    }
     opts.kv_fit = args.kv_fit().map_err(FactoryError::Load)?;
     opts.kv_check = args.kv_check().map_err(FactoryError::Load)?;
     Ok(opts)

@@ -181,6 +181,22 @@ pub struct ServeArgs {
     /// `--ctx` context refuses to start, with the numbers.
     #[arg(long, env = "SHISO_GPU_MEMORY_UTILIZATION")]
     pub gpu_memory_utilization: Option<f64>,
+    /// Recurrent-state checkpoints the prefix cache may hold, shared by every
+    /// session. Zero holds none.
+    ///
+    /// A checkpoint is what lets a request resume partway through a prompt it
+    /// shares with an earlier one instead of prefilling it again; a model with
+    /// no recurrent layers keeps only a logits row in each. Slots fill lazily,
+    /// but the pool is sized as if all of them were full, because on a device
+    /// that shares memory with its host they come out of the same memory: every
+    /// slot here is a slot's worth of bytes the KV cache does not get, and a
+    /// count that leaves no room for one `--ctx` context refuses to start.
+    #[arg(
+        long,
+        env = "SHISO_KV_CHECKPOINTS",
+        default_value_t = shiso_engine::EngineOptions::new().kv_ckpt_slots
+    )]
+    pub kv_checkpoints: u32,
     /// Directory for the cache's disk tier. Unset means nothing is persisted.
     #[arg(long, env = "SHISO_KVSTORE_DIR")]
     pub kvstore_dir: Option<PathBuf>,

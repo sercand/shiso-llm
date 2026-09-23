@@ -237,7 +237,8 @@ impl KvCheck {
                     "{} tokens ({:.2} GiB) do not fit: {:.2} GiB is free once everything \
                      allocated so far is resident, less {:.2} GiB for {} sessions, {:.2} GiB \
                      of checkpoint slots and {:.2} GiB reserved leaves {:.2} GiB, room for \
-                     {} tokens; lower --kv-cache-tokens, --max-num-seqs or the prefill width",
+                     {} tokens; lower --kv-cache-tokens, --max-num-seqs, --kv-checkpoints or the \
+                     prefill width",
                     u64::from(pool_pages) * u64::from(PAGE_TOKENS),
                     gib(pool),
                     gib(info.free),
@@ -351,7 +352,8 @@ impl KvFit {
                     "{} of {:.2} GiB leaves {:.2} GiB for the KV cache once {:.2} GiB in \
                      use, {:.2} GiB for {} sessions, {:.2} GiB of checkpoint slots and \
                      {:.2} GiB reserved are taken out: {pages} pages, and one {ctx}-token \
-                     context needs {needed}",
+                     context needs {needed}; raise the share or lower --max-num-seqs or \
+                     --kv-checkpoints",
                     self.fraction,
                     gib(info.total),
                     gib(left),
@@ -426,6 +428,32 @@ mod tests {
             .expect_err("one page too many");
         assert!(format!("{error}").contains("room for"), "{error}");
         assert!(KvCheck::new(0, 0).is_err());
+    }
+
+    #[test]
+    fn checkpoint_slots_come_out_of_the_pool_that_fits_and_the_refusal_names_them() {
+        // The counted pool above, with 2 GiB of checkpoint slots on top: 36
+        // GiB are left, so the 2432 pages that fitted before are now too many.
+        let check = KvCheck::new(4, GIB).expect("sessions");
+        let info = MemoryInfo {
+            free: 40 * GIB,
+            total: 100 * GIB,
+        };
+        let cost = PoolCost {
+            fixed_bytes: 2 * GIB,
+            ..COST
+        };
+        assert!(check.check(info, cost, 2304).is_ok());
+        let error = check
+            .check(info, cost, 2305)
+            .expect_err("the slots took two gibibytes of it");
+        assert!(format!("{error}").contains("--kv-checkpoints"), "{error}");
+
+        let fit = KvFit::new(0.9, 4, GIB).expect("a valid share");
+        let pages = fit
+            .pool_pages(info, cost, 4096)
+            .expect("room for a context");
+        assert_eq!(u64::from(pages), (26 * GIB) / COST.page_bytes);
     }
 
     #[test]
