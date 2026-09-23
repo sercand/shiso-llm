@@ -42,7 +42,9 @@ Run with the reference venv, under the GPU lock, e.g.
         --rows-dir ~/work/qwen-3.8-flash/reference-rows/fp8 --label "..."
 
 Subcommands: `selfcheck` (the B3 codec checks), `capture` (the fixture),
-`greedy` (a short cached greedy continuation, read by a person).
+`greedy` (a short cached greedy continuation, read by a person), `probe` (time
+the first few layers at long lengths), `check-attention` (the query-blocked
+attention against the library's own, bit for bit; see `ChunkedAttention`).
 """
 
 from __future__ import annotations
@@ -430,6 +432,275 @@ class Fp8ShardedEmbedding(nn.Module):
 
 
 # --------------------------------------------------------------------------
+# Long-context attention: the library's arithmetic, without a [T, T] anything
+# --------------------------------------------------------------------------
+
+
+class CausalSentinel:
+    """Stands in for the full-attention mask the library would build.
+
+    The library's model builds one `[1, 1, T, T]` bool causal mask per pass,
+    and each full-attention layer's indexer builds a second one of the same
+    size (plus a `[T, T+1]` scatter target) before the two are combined and
+    handed to sdpa. At 32k tokens each of those is a GiB, and sdpa's bool-to-
+    bias conversion doubles it. `ChunkedAttention` rebuilds the same mask one
+    block of queries at a time, so the model is handed this marker instead,
+    which also proves no library code consumed the mask on the way.
+    """
+
+    def __init__(self, length: int):
+        self.length = length
+
+
+class ChunkedAttention:
+    """The library's full-attention forward and QSA indexer, one query block at a time.
+
+    Every tensor that feeds the arithmetic is computed by the library's own
+    modules in the library's own order. What changes is only the iteration:
+
+    - The indexer's per-query loop re-pools every complete key block for every
+      query. With a plain causal mask (one sequence, no padding, no cache) the
+      visible tokens of query i are exactly 0..i, so its blocks are the first
+      (i+1)//r blocks of the same fixed partition, and the pooled, normed and
+      rotated block keys are one tensor shared by all queries. It is computed
+      once, with the same ops the loop ran (index_select, fp32 mean, bf16
+      cast, k_layernorm, rope at each block's first token).
+    - The scores of a block of queries are one matmul instead of one per query,
+      then the same transpose, relu, sum over heads and 1/sqrt(d). Only the
+      queries with more visible blocks than the budget are scored at all (the
+      rest keep every block, as the library's topk(min(budget, n)) does), and
+      their top-k is still one 1-D call per query on the same slice the library
+      passes, because tied scores break by slice shape (see selection_block).
+    - The mask (causal AND selected) exists for one query block at a time, and
+      sdpa runs over that block of queries against all keys.
+
+    `check_attention` holds this to the library's original, bit for bit, on
+    real hidden states; see `cmd_check_attention`.
+
+    sdpa is pinned to the memory-efficient kernel. That kernel takes an
+    arbitrary mask and never forms the score matrix; the math kernel would form
+    24 x T x T fp32 scores (96 GiB at 32k), and the flash kernel takes no mask
+    at all. If the efficient kernel cannot run these inputs torch raises rather
+    than silently falling back, which is the point.
+    """
+
+    # Only the CPU unit test of the selection logic overrides this (CPU has no
+    # efficient kernel); every capture runs with it.
+    SDPA_BACKEND = "EFFICIENT_ATTENTION"
+
+    def __init__(self, mq, attn: nn.Module, query_block: int, check: bool = False):
+        self.mq = mq
+        self.attn = attn
+        self.query_block = query_block
+        self.check = check
+        self.check_log: list[dict] = []
+        self.library_forward = attn.forward
+        self.tied_rows = 0
+        self.over_budget_rows = 0
+
+    def install(self) -> None:
+        self.attn.forward = self.forward
+
+    # -- the indexer, vectorized over queries ------------------------------
+
+    def indexer_inputs(self, hidden_states, position_embeddings):
+        """q, raw keys and the rotated block keys, exactly as the library's loop forms them."""
+        mq = self.mq
+        idx = self.attn.indexer
+        batch_size, seq_length, _ = hidden_states.shape
+        hidden_shape = (batch_size, seq_length, -1, idx.index_head_dim)
+        full_cos, full_sin = position_embeddings
+        current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
+        qk = idx.index_qk_proj(hidden_states)
+        q, token_k = torch.split(
+            qk,
+            [idx.index_n_heads * idx.index_head_dim, idx.index_kv_heads * idx.index_head_dim],
+            dim=-1,
+        )
+        q, raw_keys = q.reshape(*hidden_shape), token_k.reshape(*hidden_shape).squeeze(2)
+        q = idx.q_layernorm(q)
+        q = mq.apply_rotary_pos_emb(q, cos=current_cos, sin=current_sin, unsqueeze_dim=2)
+
+        r = idx.compress_ratio
+        nb = seq_length // r
+        if nb == 0:
+            return q, None, nb
+        block_token_indices = torch.arange(nb * r, device=hidden_states.device).view(nb, r)
+        key_groups = raw_keys[0].index_select(0, block_token_indices.flatten())
+        key_groups = key_groups.view(*block_token_indices.shape, idx.index_head_dim)
+        pooled_keys = key_groups.float().mean(dim=1).to(raw_keys.dtype)
+        pooled_keys = idx.k_layernorm(pooled_keys)
+        group_starts = block_token_indices[:, 0]
+        block_key_states = mq.apply_rotary_pos_emb(
+            pooled_keys.unsqueeze(1),
+            cos=full_cos[0].index_select(0, group_starts),
+            sin=full_sin[0].index_select(0, group_starts),
+        ).squeeze(1)
+        return q, block_key_states, nb
+
+    def selection_block(self, q, block_key_states, nb: int, s: int, e: int, kv_length: int):
+        """The indexer's selection for queries s..e-1 as a [e-s, kv_length] bool mask.
+
+        Row i-s is True exactly at the tokens the library's loop puts in
+        `selected_token_indices[0, i]`: the chosen complete blocks plus the tail
+        of incomplete-block tokens. It is not yet ANDed with causality (the
+        library does that when it combines the two masks), though every
+        selected token is visible anyway.
+        """
+        idx = self.attn.indexer
+        r = idx.compress_ratio
+        dev = q.device
+        qpos = torch.arange(s, e, device=dev)
+        nb_i = (qpos + 1) // r  # complete blocks query i can see
+        sel_blocks = None
+        if nb > 0:
+            blk = torch.arange(nb, device=dev)
+            visible_blocks = blk[None, :] < nb_i[:, None]
+            # A query with no more visible blocks than the budget keeps them all
+            # (the library's topk(min(block_topk, n)) is then a permutation).
+            sel_blocks = visible_blocks.clone()
+            over = nb_i > idx.block_topk
+            if bool(over.any()):
+                rows = torch.nonzero(over).flatten()
+                qq = q[0, s:e].index_select(0, rows).float()  # [n, H, D]
+                scores = torch.matmul(qq, block_key_states.float().transpose(-1, -2)).transpose(-1, -2)
+                scores = torch.relu(scores).sum(dim=-1) / math.sqrt(idx.index_head_dim)  # [n, nb]
+                # The top-k runs per query on that query's own contiguous 1-D
+                # vector of visible-block scores, exactly the call the library
+                # makes. Relu sums tie exactly (at 0.0 above all), and which
+                # tied block survives the cut is the top-k kernel's choice,
+                # which torch makes differently for a padded [n, nb] batch
+                # (measured: the sets differ on tied rows). So only the scores
+                # are batched; the selection is not.
+                chosen = torch.zeros((rows.numel(), nb), dtype=torch.bool, device=dev)
+                nb_rows = nb_i.index_select(0, rows).tolist()
+                for j, n in enumerate(nb_rows):
+                    top = scores[j, :n].topk(idx.block_topk, dim=0).indices
+                    chosen[j].index_fill_(0, top, True)
+                sel_blocks[rows] = chosen
+                # How many rows had a tie straddling the cut: there the
+                # selection is the kernel's arbitrary pick among equals, and a
+                # second implementation may legitimately pick others.
+                padded = scores.masked_fill(~visible_blocks.index_select(0, rows), float("-inf"))
+                kk = padded.topk(idx.block_topk + 1, dim=-1).values
+                self.tied_rows += int((kk[:, -2] == kk[:, -1]).sum())
+                self.over_budget_rows += rows.numel()
+        tok = torch.arange(kv_length, device=dev)
+        mask = torch.zeros((e - s, kv_length), dtype=torch.bool, device=dev)
+        if sel_blocks is not None:
+            mask[:, : nb * r] = sel_blocks.repeat_interleave(r, dim=1)
+        tail = (tok[None, :] >= (nb_i * r)[:, None]) & (tok[None, :] <= qpos[:, None])
+        return mask | tail
+
+    # -- the attention forward ---------------------------------------------
+
+    def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None,
+                **kwargs):
+        mq = self.mq
+        attn = self.attn
+        if past_key_values is not None:
+            # A cached decode (the `greedy` subcommand) is short; it keeps the
+            # library's own path, mask and all.
+            if isinstance(attention_mask, CausalSentinel):
+                raise RuntimeError("a cached pass needs the library's own mask")
+            return self.library_forward(hidden_states, position_embeddings, attention_mask,
+                                        past_key_values, **kwargs)
+        if hidden_states.shape[0] != 1:
+            raise RuntimeError("the chunked attention runs one sequence at a time")
+        seq_length = hidden_states.shape[1]
+        if not isinstance(attention_mask, CausalSentinel) or attention_mask.length != seq_length:
+            raise RuntimeError("the chunked attention expects the causal sentinel for this pass")
+
+        full_position_embeddings = position_embeddings
+        q_idx, block_key_states, nb = self.indexer_inputs(hidden_states, position_embeddings)
+
+        # From here to the sdpa call: the library's forward, line for line.
+        position_embeddings = tuple(x[:, -seq_length:, :] for x in position_embeddings)
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+        query_states, gate = torch.chunk(
+            attn.q_proj(hidden_states).view(*input_shape, -1, attn.head_dim * 2), 2, dim=-1
+        )
+        gate = gate.reshape(*input_shape, -1)
+        query_states = attn.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = attn.k_norm(attn.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = mq.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # The library's sdpa wrapper repeats the kv heads itself whenever a mask
+        # is passed (enable_gqa would force the math kernel); do the same.
+        key_states = mq.repeat_kv(key_states, attn.num_key_value_groups)
+        value_states = mq.repeat_kv(value_states, attn.num_key_value_groups)
+
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        kv_length = key_states.shape[2]
+        tok = torch.arange(kv_length, device=hidden_states.device)
+        outs = []
+        for s in range(0, seq_length, self.query_block):
+            e = min(seq_length, s + self.query_block)
+            causal = tok[None, :] <= torch.arange(s, e, device=tok.device)[:, None]
+            mask = (causal & self.selection_block(q_idx, block_key_states, nb, s, e, kv_length))
+            with sdpa_kernel([getattr(SDPBackend, self.SDPA_BACKEND)]):
+                o = F.scaled_dot_product_attention(
+                    query_states[:, :, s:e],
+                    key_states,
+                    value_states,
+                    attn_mask=mask[None, None],
+                    dropout_p=0.0,
+                    scale=attn.scaling,
+                    is_causal=False,
+                )
+            outs.append(o.transpose(1, 2))
+        attn_output = torch.cat(outs, dim=1).contiguous()
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output * torch.sigmoid(gate)
+        attn_output = attn.o_proj(attn_output)
+
+        if self.check:
+            self.compare_with_library(hidden_states, full_position_embeddings, q_idx, block_key_states,
+                                      nb, attn_output, **kwargs)
+        return attn_output, None
+
+    # -- the equality check against the library's own path -----------------
+
+    def compare_with_library(self, hidden_states, position_embeddings, q_idx, block_key_states, nb,
+                             attn_output, **kwargs):
+        """Runs the library's indexer and attention on the same input and records exact equality."""
+        seq_length = hidden_states.shape[1]
+        dev = hidden_states.device
+        causal = torch.ones((seq_length, seq_length), dtype=torch.bool, device=dev).tril()[None, None]
+        lib_sel = self.attn.indexer(hidden_states, position_embeddings, causal, None)  # [1,1,T,T]
+        ours = torch.cat([
+            self.selection_block(q_idx, block_key_states, nb, s, min(seq_length, s + self.query_block),
+                                 seq_length)
+            for s in range(0, seq_length, self.query_block)
+        ])[None, None]
+        # The library's own forward: builds its combined mask and calls its sdpa
+        # wrapper (whatever kernel torch picks for it, as in the committed runs).
+        lib_out, _ = self.library_forward(hidden_states, position_embeddings, attention_mask=causal,
+                                          past_key_values=None, **kwargs)
+        sel_equal = bool(torch.equal(lib_sel, ours))
+        out_equal = bool(torch.equal(lib_out, attn_output))
+        entry = {
+            "layer": self.attn.layer_idx,
+            "tokens": seq_length,
+            "selection_equal": sel_equal,
+            "selection_mismatches": int((lib_sel != ours).sum()),
+            "output_equal": out_equal,
+            "output_max_abs_diff": float((lib_out.float() - attn_output.float()).abs().max()),
+            "rows_over_budget": max(0, seq_length - (self.attn.indexer.block_topk + 1)
+                                    * self.attn.indexer.compress_ratio + 1),
+        }
+        self.check_log.append(entry)
+        log(f"check layer {entry['layer']:2d} T={seq_length}: selection "
+            f"{'EQUAL' if sel_equal else 'DIFFERENT'} ({entry['selection_mismatches']} cells), "
+            f"output {'EQUAL' if out_equal else 'DIFFERENT'} (max |d| {entry['output_max_abs_diff']:.3e})")
+        del lib_sel, ours, lib_out, causal
+
+
+# --------------------------------------------------------------------------
 # Model assembly
 # --------------------------------------------------------------------------
 
@@ -451,7 +722,8 @@ def hf_modules():
 
 
 class Reference:
-    def __init__(self, ckpt: Path, device: str = "cuda"):
+    def __init__(self, ckpt: Path, device: str = "cuda", query_block: int = 1024,
+                 check_attention: bool = False):
         transformers, mq, Qwen4ExpConfig = hf_modules()
         self.mq = mq
         self.versions = f"transformers {transformers.__version__}, torch {torch.__version__}"
@@ -487,6 +759,20 @@ class Reference:
                 )
         model.to_empty(device=self.device)
         self.model = model
+        if query_block < 1:
+            raise ValueError(f"query block {query_block} must be positive")
+        self.attention = []
+        # Every softmax-attention layer (the library calls their type
+        # "qwen_sparse_attention"; the recurrent ones have no self_attn).
+        for layer in model.model.layers:
+            if hasattr(layer, "self_attn"):
+                ca = ChunkedAttention(mq, layer.self_attn, query_block, check=check_attention)
+                ca.install()
+                self.attention.append(ca)
+        n_softmax = sum(t != "linear_attention" for t in tc.layer_types)
+        if len(self.attention) != n_softmax:
+            raise RuntimeError(f"installed the chunked attention on {len(self.attention)} layers, "
+                               f"the config has {n_softmax} softmax-attention layers")
         self._load_dense()
         self._restore_derived()
         self.load_seconds = time.perf_counter() - t0
@@ -628,7 +914,11 @@ class Reference:
         input_ids = torch.tensor([ids], dtype=torch.long, device=self.device)
         t0 = time.perf_counter()
         try:
-            out = model.model(input_ids=input_ids, use_cache=False)
+            # The dict skips the library's [T, T] causal mask; the chunked
+            # attention rebuilds it per query block. None is what the library's
+            # recurrent-mask helper returns for one unpadded sequence.
+            masks = {"full_attention": CausalSentinel(len(ids)), "linear_attention": None}
+            out = model.model(input_ids=input_ids, attention_mask=masks, use_cache=False)
         finally:
             for h in hooks:
                 h.remove()
@@ -775,7 +1065,7 @@ def cmd_capture(args) -> None:
         dump += len(cases) * ((1 + 2 * n_layers) * (4 * HIDDEN * 4 + 128) + 4096)
     guard(dump, args.max_dump_bytes)
 
-    ref = Reference(Path(args.checkpoint))
+    ref = Reference(Path(args.checkpoint), query_block=args.query_block)
     # One pass per distinct token prefix: cases on the same prompt and mode
     # share the pass that reaches their furthest frontier.
     groups: dict[tuple[str, str], list[Case]] = {}
@@ -792,7 +1082,11 @@ def cmd_capture(args) -> None:
                 sys.exit(f"case {c.id}: not a prefix of {longest.id}")
         positions = sorted({c.frontier - 1 for c in group})
         log(f"pass: {prompt} ({mode}), {len(ids)} tokens, positions {positions}")
+        tied0 = sum(ca.tied_rows for ca in ref.attention)
+        over0 = sum(ca.over_budget_rows for ca in ref.attention)
         r = ref.forward(ids, positions, dump_layers=layer_dir is not None)
+        log(f"pass: indexer rows over budget {sum(ca.over_budget_rows for ca in ref.attention) - over0}, "
+            f"with a tie straddling the top-k cut {sum(ca.tied_rows for ca in ref.attention) - tied0}")
         tot_read = sum(t[2] for t in r["timings"])
         log(
             f"pass: {r['seconds']:.1f}s (expert reads {tot_read:.1f}s wall in workers), "
@@ -898,6 +1192,106 @@ def cmd_capture(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# The chunked attention against the library's own path
+# --------------------------------------------------------------------------
+
+
+def topk_tie_check(device: torch.device) -> bool:
+    """Batched top-k over -inf-padded rows picks the same set as the library's 1-D calls.
+
+    The indexer's scores are relu sums, so exact ties (most often at 0.0) are
+    real, and which tied block survives the cut is the top-k kernel's choice.
+    The library calls it once per query on a 1-D vector of that query's
+    visible blocks; the chunked path calls it on a padded [queries, blocks]
+    tensor. Kernel selection in torch depends on slice size and slice count,
+    so this is checked on the shapes a 32k pass produces, with heavy ties.
+    """
+    k = 512
+    ok = True
+    gen = torch.Generator(device="cpu").manual_seed(0)
+    for nb_max in (513, 600, 2048, 4096, 8192):
+        rows = 64
+        nb_i = torch.linspace(k + 1, nb_max, rows).round().long()
+        # Scores on a coarse grid, a third of them exactly zero: many ties.
+        vals = torch.randint(0, 8, (rows, nb_max), generator=gen).float() * 0.25
+        vals[torch.rand((rows, nb_max), generator=gen) < 0.33] = 0.0
+        vals = vals.to(device)
+        padded = vals.clone()
+        for r in range(rows):
+            padded[r, int(nb_i[r]):] = float("-inf")
+        batched = padded.topk(k, dim=-1).indices
+        bad = 0
+        for r in range(rows):
+            one = vals[r, : int(nb_i[r])].topk(min(k, int(nb_i[r])), dim=0).indices
+            a = torch.zeros(nb_max, dtype=torch.bool, device=device)
+            b = torch.zeros(nb_max, dtype=torch.bool, device=device)
+            a[one] = True
+            b[batched[r]] = True
+            bad += int(not torch.equal(a, b))
+        log(f"topk ties, blocks up to {nb_max}: {rows - bad}/{rows} rows select the same set")
+        ok &= bad == 0
+    return ok
+
+
+def cmd_check_attention(args) -> None:
+    """Holds the chunked attention to the library's original, bit for bit, on real inputs.
+
+    Every full-attention layer of each pass runs both paths on the same hidden
+    states and compares the indexer's selection mask and the attention output
+    with torch.equal. The pass itself continues with the chunked output.
+    """
+    from tokenizers import Tokenizer
+
+    guard()
+    tokenizer = Tokenizer.from_file(str(Path(args.tokenizer).expanduser() / "tokenizer.json"))
+    ids_all = list(tokenizer.encode(Path(args.prompt_file).read_text(),
+                                    add_special_tokens=False).ids)
+    lengths = [int(x) for x in args.lengths.split(",")]
+    if max(lengths) > len(ids_all):
+        sys.exit(f"{args.prompt_file} encodes to {len(ids_all)} tokens, fewer than {max(lengths)}")
+    ok = topk_tie_check(torch.device("cuda"))
+    ref = Reference(Path(args.checkpoint), query_block=args.query_block, check_attention=True)
+    for n in lengths:
+        r = ref.forward(ids_all[:n], [n - 1], per_layer_timing=False)
+        log(f"pass T={n}: {r['seconds']:.1f}s, peak {r['peak_bytes'] / 2**30:.2f} GiB")
+    entries = [e for ca in ref.attention for e in ca.check_log]
+    bad = [e for e in entries if not (e["selection_equal"] and e["output_equal"])]
+    log(f"check-attention: {len(entries) - len(bad)}/{len(entries)} layer passes equal "
+        f"(lengths {lengths}, query block {args.query_block})")
+    if bad or not ok:
+        sys.exit("check-attention FAILED")
+    log("check-attention ok")
+
+
+def cmd_probe(args) -> None:
+    """Times the first few decoder layers at long lengths, to size a full pass before running one."""
+    from tokenizers import Tokenizer
+
+    guard()
+    tokenizer = Tokenizer.from_file(str(Path(args.tokenizer).expanduser() / "tokenizer.json"))
+    ids_all = list(tokenizer.encode(Path(args.prompt_file).read_text(),
+                                    add_special_tokens=False).ids)
+    lengths = [int(x) for x in args.lengths.split(",")]
+    if max(lengths) > len(ids_all):
+        sys.exit(f"{args.prompt_file} encodes to {len(ids_all)} tokens, fewer than {max(lengths)}")
+    ref = Reference(Path(args.checkpoint), query_block=args.query_block)
+    cfg = ref.model.model.config
+    full = cfg.num_hidden_layers
+    cfg.num_hidden_layers = args.layers  # the library's loop runs layers[:num_hidden_layers]
+    try:
+        for n in lengths:
+            r = ref.forward(ids_all[:n], [n - 1])
+            log(f"probe T={n}: {args.layers} layers in {r['seconds']:.1f}s, "
+                f"peak {r['peak_bytes'] / 2**30:.2f} GiB")
+            for idx, dt, rd, pk in r["timings"]:
+                kind = ref.model.model.layers[idx].layer_type
+                log(f"  layer {idx:2d} {kind:17s}: {dt:7.1f} s  peak {pk / 2**30:6.2f} GiB  "
+                    f"experts {ref.experts[idx].hit_log[-1]}  expert reads {rd:.1f} s")
+    finally:
+        cfg.num_hidden_layers = full
+
+
+# --------------------------------------------------------------------------
 # B3 self-checks
 # --------------------------------------------------------------------------
 
@@ -1000,11 +1394,25 @@ def main() -> None:
                         "in the engine's layout: <case>/{embed,L{nn}.mixer,L{nn}}.f32.npy "
                         "(see scripts/reference/LAYER_DUMP.md)")
     c.add_argument("--max-dump-bytes", type=int, default=64 * 2**20)
+    c.add_argument("--query-block", type=int, default=1024,
+                   help="queries per attention block; the result does not depend on it")
+    pr = sub.add_parser("probe")
+    pr.add_argument("--prompt-file", required=True)
+    pr.add_argument("--lengths", default="8192,16384,32768")
+    pr.add_argument("--layers", type=int, default=4,
+                    help="run only the first N decoder layers (the timing probe)")
+    pr.add_argument("--query-block", type=int, default=1024)
+    k = sub.add_parser("check-attention")
+    k.add_argument("--prompt-file", required=True)
+    k.add_argument("--lengths", default="7,1000,2052,2376",
+                   help="comma-separated prefix lengths, one pass each")
+    k.add_argument("--query-block", type=int, default=1024)
     g = sub.add_parser("greedy")
     g.add_argument("--tokens", type=int, default=24)
     g.add_argument("prompt_file", nargs="+")
     args = p.parse_args()
-    {"selfcheck": cmd_selfcheck, "capture": cmd_capture, "greedy": cmd_greedy}[args.cmd](args)
+    {"selfcheck": cmd_selfcheck, "capture": cmd_capture, "greedy": cmd_greedy,
+     "check-attention": cmd_check_attention, "probe": cmd_probe}[args.cmd](args)
 
 
 if __name__ == "__main__":

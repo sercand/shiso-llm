@@ -128,6 +128,17 @@ struct Args {
     /// the checkpoint loads.
     #[arg(long)]
     dump_layers: Option<PathBuf>,
+
+    /// Prefill width in tokens: everything before a case's last token is fed
+    /// in pieces this wide, then the last token alone.
+    ///
+    /// The default is the replay width every recorded fixture was graded at.
+    /// A wider one puts the prefill's chunk boundaries where a server's are
+    /// (8192 for the sparse family), so a frontier on either side of one tells
+    /// whether crossing it moves the row. It changes what is measured, not the
+    /// fixture, so a capture made at another width says so in its label.
+    #[arg(long, default_value_t = REPLAY_CHUNK, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    chunk: usize,
 }
 
 /// What every captured fixture says about itself, in the file, in these words.
@@ -209,9 +220,10 @@ fn main() -> Result<()> {
     let mut harness = Harness::open(device, &args.model, &config, ctx)
         .with_context(|| format!("opening {} for {}", args.model.display(), device.as_str()))?;
     report(&format!(
-        "shiso-parity: {} cases, backend {}, ctx {ctx}, vocabulary {}, prompts {}",
+        "shiso-parity: {} cases, backend {}, ctx {ctx}, prefill chunk {}, vocabulary {}, prompts {}",
         cases.len(),
         device.as_str(),
+        args.chunk,
         provenance.vocabulary,
         provenance.prompts,
     ));
@@ -247,6 +259,7 @@ fn main() -> Result<()> {
             &base_dir,
             &cases,
             args.strict,
+            args.chunk,
             &mut dumps,
         )
     };
@@ -401,13 +414,17 @@ fn produce(
     vocabulary: &Vocabulary,
     base_dir: &Path,
     case: &LocalCase,
+    chunk: usize,
     dumps: &mut Dumps,
 ) -> Result<TopSlice> {
     let (produced, tap) = if dumps.layers.is_some() {
-        let (row, tap) = run_case_layers(harness, vocabulary, base_dir, case)?;
+        let (row, tap) = run_case_layers(harness, vocabulary, base_dir, case, chunk)?;
         (row, Some(tap))
     } else {
-        (run_case_row(harness, vocabulary, base_dir, case)?, None)
+        (
+            run_case_row(harness, vocabulary, base_dir, case, chunk)?,
+            None,
+        )
     };
     // The index names the row's 0-based position, one less than the count of
     // tokens the case feeds; see `shiso_bench::rows`.
@@ -441,6 +458,7 @@ fn replay(
     base_dir: &Path,
     cases: &[&LocalCase],
     strict: bool,
+    chunk: usize,
     dumps: &mut Dumps,
 ) -> Result<Vec<Verdict>> {
     let budget: &Budget = if strict { &STRICT } else { &FLOOR };
@@ -453,7 +471,7 @@ fn replay(
                 case.id
             );
         }
-        let produced = produce(harness, vocabulary, base_dir, case, dumps)?;
+        let produced = produce(harness, vocabulary, base_dir, case, chunk, dumps)?;
         let verdict = compare(&case.id, &case.tops, &produced, budget);
         report(&verdict.report_line());
         for failure in &verdict.failures {
@@ -504,7 +522,7 @@ fn capture(
 
     let mut filled = Vec::with_capacity(cases.len());
     for case in cases {
-        let produced = produce(harness, vocabulary, base_dir, case, dumps)?;
+        let produced = produce(harness, vocabulary, base_dir, case, args.chunk, dumps)?;
         let preview = vocabulary.decode(&[shiso_core::ids::TokenId::new(
             produced.first().map_or(0, |e| e.token),
         )])?;
@@ -516,7 +534,7 @@ fn capture(
         ));
         if args.preview > 0 {
             let tokens = case_tokens(vocabulary, base_dir, case)?;
-            let continued = harness.greedy_after(&tokens, REPLAY_CHUNK, args.preview)?;
+            let continued = harness.greedy_after(&tokens, args.chunk, args.preview)?;
             let text = vocabulary.decode(&continued)?;
             report(&format!("shiso-parity:   continuation {text:?}"));
         }
