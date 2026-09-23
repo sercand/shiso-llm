@@ -1,4 +1,4 @@
-//! The dense, generic, qwen35, qwen35moe and vision kernel sets' device cases,
+//! The dense, generic, qwen35, qwen35moe, qwen4exp and vision kernel sets' device cases,
 //! written against no backend in particular.
 //!
 //! Every case here is a fixture, a launch through [`shiso_core::Backend`] and a
@@ -27,6 +27,7 @@ pub mod harness;
 pub mod oracle;
 pub mod qwen35;
 pub mod qwen35moe;
+pub mod qwen4exp;
 pub mod vision;
 
 pub use crate::harness::{Gpu, drain, f32_bytes, f32_values, run};
