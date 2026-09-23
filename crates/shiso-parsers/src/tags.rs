@@ -166,7 +166,6 @@ impl TagParser {
     fn decode_qwen_xml_call(body: &str, strings: &StringParams) -> Option<Segment> {
         const FUNCTION_OPEN: &str = "<function=";
         const PARAMETER_OPEN: &str = "<parameter=";
-        const PARAMETER_CLOSE: &str = "</parameter>";
 
         let after_open = body.find(FUNCTION_OPEN)? + FUNCTION_OPEN.len();
         let rest = &body[after_open..];
@@ -184,8 +183,10 @@ impl TagParser {
         let mut rest = &rest[name_end + 1..];
         // A `</function>` is where the parameters stop; a body that never wrote
         // one is still a call whose parameters are all here, because the caller
-        // only reaches this after the closing tool tag was matched.
-        if let Some(end) = rest.find("</function>") {
+        // only reaches this after the closing tool tag was matched. The *last*
+        // one, because a value may contain the tag - HTML, code, or text about
+        // this very format - and the first would cut that value short.
+        if let Some(end) = rest.rfind("</function>") {
             rest = &rest[..end];
         }
         while let Some(start) = rest.find(PARAMETER_OPEN) {
@@ -195,8 +196,11 @@ impl TagParser {
             };
             let key = after[..key_end].trim().to_string();
             let value_region = &after[key_end + 1..];
-            let (raw, consumed) = match value_region.find(PARAMETER_CLOSE) {
-                Some(close) => (&value_region[..close], close + PARAMETER_CLOSE.len()),
+            // The close that ends this value is the first *structural* one, not
+            // the first occurrence: a value that contains `</parameter>` is
+            // still one value.
+            let (raw, consumed) = match structural_parameter_close(value_region) {
+                Some(close) => (&value_region[..close], close + PARAMETER_CLOSE_TAG.len()),
                 // An unterminated parameter runs to the end of the call: the
                 // model wrote a value and lost the closing tag, and the value is
                 // still what it meant to pass.
@@ -319,17 +323,51 @@ impl TagParser {
         }
     }
 
+    /// Where the call's own closing tag starts in the buffer, once it has
+    /// arrived.
+    ///
+    /// For the Qwen XML body that is the first occurrence the call's structure
+    /// has reached ([`structural_tool_close`]); an occurrence inside a value is
+    /// left in the buffer, and the hold-back below moves it into the body,
+    /// because it holds only a trailing *proper* prefix of the tag. Other
+    /// bodies keep the first occurrence: their payloads have their own quoting.
+    fn tool_close_at(&self) -> Option<usize> {
+        if self.tool_body != ToolBody::QwenXml {
+            return self.buffer.find(self.tool_close);
+        }
+        let State::ToolCall(body) = &self.state else {
+            return None;
+        };
+        let mut from = 0;
+        while let Some(rel) = self.buffer[from..].find(self.tool_close) {
+            let at = from + rel;
+            // Body and buffer together: a tag the check reads can straddle the
+            // two, since the hold-back only keeps prefixes of the tool closer.
+            let mut before = body.clone();
+            before.push_str(&self.buffer[..at]);
+            // A body with no `<function=` has no value to protect, so its first
+            // closer ends it: a malformed call is handed back as text at once
+            // rather than swallowing the rest of the turn until it ends.
+            if !before.contains("<function=") || structural_tool_close(&before) {
+                return Some(at);
+            }
+            from = at + self.tool_close.len();
+        }
+        None
+    }
+
     fn step_tool_call(&mut self, segments: &mut Vec<Segment>) -> bool {
         if self.tool_close.is_empty() {
             self.state = State::Text;
             return false;
         }
 
+        let close_at = self.tool_close_at();
         let State::ToolCall(body) = &mut self.state else {
             return false;
         };
 
-        if let Some(start) = self.buffer.find(self.tool_close) {
+        if let Some(start) = close_at {
             body.push_str(&self.buffer[..start]);
             self.buffer = self.buffer[start + self.tool_close.len()..].to_string();
             let completed_body = std::mem::take(body);
@@ -446,4 +484,46 @@ fn hold_back_len(s: &str, tags: &[&str]) -> usize {
         }
     }
     max_hold
+}
+
+const PARAMETER_CLOSE_TAG: &str = "</parameter>";
+
+/// The offset of the first `</parameter>` in `region` that is structural:
+/// followed, after whitespace, by another parameter, the end of the function, or
+/// nothing yet. `None` when every close in `region` is followed by other text,
+/// so the value is still open. The greedy-sampling query (Task 12) uses this
+/// directly.
+fn structural_parameter_close_strict(region: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(found) = region[from..].find(PARAMETER_CLOSE_TAG) {
+        let at = from + found;
+        let after = region[at + PARAMETER_CLOSE_TAG.len()..].trim_start();
+        if after.is_empty() || after.starts_with("<parameter=") || after.starts_with("</function>")
+        {
+            return Some(at);
+        }
+        from = at + PARAMETER_CLOSE_TAG.len();
+    }
+    None
+}
+
+/// The offset of the `</parameter>` that closes the value starting `region`:
+/// the first structural one. With no structural close at all, the last
+/// `</parameter>` is taken, which is the most text a truncated call can still
+/// mean.
+fn structural_parameter_close(region: &str) -> Option<usize> {
+    structural_parameter_close_strict(region).or_else(|| region.rfind(PARAMETER_CLOSE_TAG))
+}
+
+/// Whether a `</tool_call>` found right after `before` is the call's own close:
+/// the call's structure has ended there. Anything else is a value that happens to
+/// contain the tag.
+///
+/// `</parameter>` counts as well as `</function>`, so a model that drops the
+/// function close still ends its call. A value that itself ends in a valid
+/// closing sequence cannot be told apart from a real close; the format has no
+/// escape, and the round-trip tests list that case as one it cannot carry.
+pub(crate) fn structural_tool_close(before: &str) -> bool {
+    let trimmed = before.trim_end();
+    trimmed.ends_with("</function>") || trimmed.ends_with("</parameter>")
 }

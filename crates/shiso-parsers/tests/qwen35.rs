@@ -316,3 +316,78 @@ fn without_a_schema_a_value_is_read_as_the_json_it_parses_as() {
         serde_json::json!(123)
     );
 }
+
+fn one_call(chunks: &[&str]) -> (String, serde_json::Value) {
+    let mut p = parser_for_prompt(
+        ReasoningScheme::Qwen3,
+        ToolCallScheme::Qwen35,
+        CLOSED_PROMPT,
+    );
+    let mut segs = Vec::new();
+    for chunk in chunks {
+        segs.extend(p.push(chunk));
+    }
+    segs.extend(p.finish());
+    match segs.as_slice() {
+        [Segment::ToolCall { name, arguments }] => {
+            (name.clone(), serde_json::from_str(arguments).expect("JSON"))
+        }
+        other => panic!("expected one call, got {other:?}"),
+    }
+}
+
+/// HTML or code that contains the format's own closing tags is a value, not
+/// the end of one: a close counts only where the call's structure ends.
+#[test]
+fn close_tags_inside_a_value_are_part_of_the_value() {
+    let (name, args) = one_call(&[
+        "<tool_call>\n<function=edit_file>\n<parameter=new_text>\na</parameter>b</function>c</tool_call>d\n</parameter>\n</function>\n</tool_call>",
+    ]);
+    assert_eq!(name, "edit_file");
+    assert_eq!(
+        args["new_text"],
+        serde_json::json!("a</parameter>b</function>c</tool_call>d")
+    );
+}
+
+#[test]
+fn a_close_split_across_pushes_decodes_the_same() {
+    let whole =
+        "<tool_call>\n<function=f>\n<parameter=x>\nv\n</parameter>\n</function>\n</tool_call>";
+    let split = [
+        "<tool_call>\n<function=f>\n<parameter=x>\nv\n</para",
+        "meter>\n</function>\n</tool_",
+        "call>",
+    ];
+    assert_eq!(one_call(&[whole]), one_call(&split));
+}
+
+/// A body with no function in it closes at its first closer, so a malformed
+/// call comes back as text while the turn is still streaming instead of
+/// swallowing everything after it.
+#[test]
+fn a_body_with_no_function_closes_at_once() {
+    let mut p = parser_for_prompt(
+        ReasoningScheme::Qwen3,
+        ToolCallScheme::Qwen35,
+        CLOSED_PROMPT,
+    );
+    let raw = "<tool_call>\n{\"name\": \"f\"}\n</tool_call>";
+    let segs = p.push(&format!("{raw}after"));
+    assert_eq!(
+        segs,
+        vec![
+            Segment::Text(raw.to_string()),
+            Segment::Text("after".to_string())
+        ]
+    );
+}
+
+/// A model that drops `</function>` still closed its call with the last
+/// parameter's close.
+#[test]
+fn a_call_that_drops_its_function_close_still_decodes() {
+    let (_, args) =
+        one_call(&["<tool_call>\n<function=f>\n<parameter=x>\nv\n</parameter>\n</tool_call>"]);
+    assert_eq!(args["x"], serde_json::json!("v"));
+}
