@@ -127,6 +127,39 @@ pub struct ServeArgs {
     /// decoded in several passes a step.
     #[arg(long, env = "SHISO_MAX_NUM_SEQS", default_value_t = crate::scheduler::DEFAULT_MAX_NUM_SEQS)]
     pub max_num_seqs: usize,
+    /// Prompt tokens one prefill chunk covers when nothing else is decoding.
+    ///
+    /// Wide, because with nobody to starve the only thing a narrow chunk buys is
+    /// more passes, and the sparse family reads every routed expert once per
+    /// pass. A stack splits a chunk wider than its own widest pass itself.
+    #[arg(
+        long,
+        env = "SHISO_SOLO_PREFILL_CHUNK",
+        default_value_t = crate::scheduler::DEFAULT_SOLO_CHUNK,
+        conflicts_with = "max_num_batched_tokens"
+    )]
+    pub solo_prefill_chunk: usize,
+    /// Prompt tokens one prefill quantum adds to a step while other sequences
+    /// are decoding.
+    ///
+    /// The trade: a wider quantum brings a waiting prompt's first token sooner,
+    /// and makes every decoding sequence's step that much longer.
+    #[arg(
+        long,
+        env = "SHISO_MIXED_PREFILL_QUANTUM",
+        default_value_t = crate::scheduler::DEFAULT_MIXED_QUANTUM,
+        conflicts_with = "max_num_batched_tokens"
+    )]
+    pub mixed_prefill_quantum: usize,
+    /// Tokens one scheduler step may carry, prompt and decode rows together.
+    ///
+    /// Sets both prefill widths at once: the whole budget when nothing is
+    /// decoding, and what the decode rows leave of it when something is. The
+    /// decode rows are counted at their worst, `--max-num-seqs` times
+    /// `1 + --spec-k`, so a budget that fits them never lets a mixed step grow
+    /// past it. Refused beside either width, since the two would disagree.
+    #[arg(long, env = "SHISO_MAX_NUM_BATCHED_TOKENS")]
+    pub max_num_batched_tokens: Option<usize>,
     /// Tokens the KV cache holds, shared by every session.
     ///
     /// The pool is allocated whole at load, so this is device memory spent up
@@ -277,6 +310,15 @@ pub struct ServeArgs {
 
 /// A setting that parses but cannot be served.
 ///
+/// The scheduler's two prefill widths, resolved from the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillWidths {
+    /// Prompt tokens one chunk covers when nothing else is decoding.
+    pub solo_chunk: usize,
+    /// Prompt tokens one quantum adds to a step while others decode.
+    pub mixed_quantum: usize,
+}
+
 /// Separate from clap's own parse failures because these are cross-field or
 /// range checks that clap has no vocabulary for, and separate from
 /// [`anyhow`](https://docs.rs/anyhow) because this is library code: the binary
@@ -317,6 +359,17 @@ pub enum ConfigError {
     PoolTooLarge {
         /// The pool as it was given.
         tokens: u64,
+    },
+    /// A step budget the decode rows alone fill, leaving no prefill.
+    #[error(
+        "--max-num-batched-tokens {budget} leaves no room for a prefill: \
+         {decode_rows} decode rows (--max-num-seqs x (1 + --spec-k)) can fill it"
+    )]
+    BudgetBelowDecodes {
+        /// The budget as it was given.
+        budget: usize,
+        /// The worst-case decode rows of one step.
+        decode_rows: usize,
     },
     /// One of the two settings speculation needs was given without the other.
     #[error("--{given} without --{missing}: speculation needs a draft head and a depth")]
@@ -364,6 +417,7 @@ impl ServeArgs {
             });
         }
         self.kv_pool_pages()?;
+        self.prefill_widths()?;
         if let Some(value) = self.gpu_memory_utilization
             && !(value > 0.0 && value <= 1.0)
         {
@@ -402,6 +456,52 @@ impl ServeArgs {
             });
         }
         Ok(())
+    }
+
+    /// How wide the scheduler's prefill chunks are, from the two width flags or
+    /// from `--max-num-batched-tokens`.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Zero`] for a width or budget of zero, which would never
+    /// finish a prompt, and [`ConfigError::BudgetBelowDecodes`] for a budget
+    /// the worst-case decode rows fill on their own.
+    pub fn prefill_widths(&self) -> Result<PrefillWidths, ConfigError> {
+        let Some(budget) = self.max_num_batched_tokens else {
+            if self.solo_prefill_chunk == 0 {
+                return Err(ConfigError::Zero {
+                    flag: "solo-prefill-chunk",
+                });
+            }
+            if self.mixed_prefill_quantum == 0 {
+                return Err(ConfigError::Zero {
+                    flag: "mixed-prefill-quantum",
+                });
+            }
+            return Ok(PrefillWidths {
+                solo_chunk: self.solo_prefill_chunk,
+                mixed_quantum: self.mixed_prefill_quantum,
+            });
+        };
+        if budget == 0 {
+            return Err(ConfigError::Zero {
+                flag: "max-num-batched-tokens",
+            });
+        }
+        let rows_per_seq = usize::try_from(self.spec_k)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let decode_rows = self.max_num_seqs.saturating_mul(rows_per_seq);
+        if budget <= decode_rows {
+            return Err(ConfigError::BudgetBelowDecodes {
+                budget,
+                decode_rows,
+            });
+        }
+        Ok(PrefillWidths {
+            solo_chunk: budget,
+            mixed_quantum: budget - decode_rows,
+        })
     }
 
     /// The pool `--kv-cache-tokens` asks for, in pages; `None` when it was not

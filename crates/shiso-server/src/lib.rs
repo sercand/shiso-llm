@@ -148,6 +148,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // is what a `--gpu-memory-utilization` pool set sessions aside for, and the
     // two must not be able to disagree.
     scheduler.max_num_seqs = args.max_num_seqs;
+    // Validated at boot, so the widths are known to be servable here.
+    let widths = args.prefill_widths()?;
+    scheduler.solo_chunk = widths.solo_chunk;
+    scheduler.mixed_quantum = widths.mixed_quantum;
+    tracing::info!(
+        solo_chunk = widths.solo_chunk,
+        mixed_quantum = widths.mixed_quantum,
+        "prefill widths"
+    );
     let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);
     let tool_call_scheme = args.tool_call_parser.tools(defaults.tools);
     tracing::info!(

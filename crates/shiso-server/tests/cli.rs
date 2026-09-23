@@ -317,6 +317,9 @@ fn every_documented_flag_declares_its_prefixed_environment_fallback() {
         "SHISO_VISION",
         "SHISO_VIDEO_ALLOW_FFMPEG",
         "SHISO_GENERATION_CONFIG",
+        "SHISO_SOLO_PREFILL_CHUNK",
+        "SHISO_MIXED_PREFILL_QUANTUM",
+        "SHISO_MAX_NUM_BATCHED_TOKENS",
     ] {
         assert!(
             help.contains(variable),
@@ -374,4 +377,111 @@ fn the_help_text_never_prints_a_configured_bearer_token() {
         !text.contains("sk-supersecret"),
         "a configured token leaked into the help text: {text}"
     );
+}
+
+/// The two prefill widths default to the scheduler's own constants.
+#[test]
+fn the_prefill_widths_default_to_the_scheduler_constants() {
+    let args = parse(&["--model", "m.gguf"]).expect("it parses");
+    let widths = args.prefill_widths().expect("the defaults are servable");
+    assert_eq!(
+        widths.solo_chunk,
+        shiso_server::scheduler::DEFAULT_SOLO_CHUNK
+    );
+    assert_eq!(
+        widths.mixed_quantum,
+        shiso_server::scheduler::DEFAULT_MIXED_QUANTUM
+    );
+}
+
+/// Each width can be set on its own.
+#[test]
+fn each_prefill_width_is_its_own_flag() {
+    let args = parse(&[
+        "--model",
+        "m.gguf",
+        "--solo-prefill-chunk",
+        "4096",
+        "--mixed-prefill-quantum",
+        "1024",
+    ])
+    .expect("it parses");
+    let widths = args.prefill_widths().expect("both are positive");
+    assert_eq!((widths.solo_chunk, widths.mixed_quantum), (4096, 1024));
+}
+
+/// A per-step budget sets both widths: the whole budget when nothing decodes,
+/// and what the decode rows leave of it when something does.
+///
+/// The decode rows are counted at their worst: every resident sequence
+/// verifying a full draft is `max-num-seqs * (1 + spec-k)` rows in one step.
+#[test]
+fn a_step_budget_leaves_the_prefill_what_the_decode_rows_do_not_take() {
+    let args = parse(&[
+        "--model",
+        "m.gguf",
+        "--max-num-batched-tokens",
+        "2048",
+        "--max-num-seqs",
+        "4",
+        "--spec-k",
+        "3",
+    ])
+    .expect("it parses");
+    let widths = args.prefill_widths().expect("the budget leaves room");
+    assert_eq!(widths.solo_chunk, 2048);
+    assert_eq!(widths.mixed_quantum, 2048 - 16);
+}
+
+/// A budget and an explicit width say two different things about the same
+/// step, so the parse refuses rather than picking one.
+#[test]
+fn a_step_budget_and_an_explicit_width_are_refused_together() {
+    for width in ["--mixed-prefill-quantum", "--solo-prefill-chunk"] {
+        let parsed = parse(&[
+            "--model",
+            "m.gguf",
+            "--max-num-batched-tokens",
+            "4096",
+            width,
+            "512",
+        ]);
+        assert!(parsed.is_err(), "{width} beside a budget must be refused");
+    }
+}
+
+/// A budget the decode rows alone fill leaves no prefill at all, which would
+/// starve every waiting prompt; it is refused at boot instead.
+#[test]
+fn a_step_budget_that_the_decode_rows_fill_is_refused() {
+    let args = parse(&[
+        "--model",
+        "m.gguf",
+        "--max-num-batched-tokens",
+        "16",
+        "--max-num-seqs",
+        "4",
+        "--spec-k",
+        "3",
+    ])
+    .expect("it parses");
+    let error = args.validate().expect_err("no room is left for a prefill");
+    assert!(
+        error.to_string().contains("max-num-batched-tokens"),
+        "{error}"
+    );
+}
+
+/// Zero widths are refused, never quietly raised to one.
+#[test]
+fn a_zero_prefill_width_is_refused() {
+    for flag in [
+        "--solo-prefill-chunk",
+        "--mixed-prefill-quantum",
+        "--max-num-batched-tokens",
+    ] {
+        let args = parse(&["--model", "m.gguf", flag, "0"]).expect("it parses");
+        let error = args.validate().expect_err("zero is not a width");
+        assert!(error.to_string().contains(&flag[2..]), "{flag}: {error}");
+    }
 }

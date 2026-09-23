@@ -36,10 +36,6 @@ pub const DEFAULT_QUEUE_ADMISSION_MS: u64 = 250;
 
 /// The environment knob for the waiting bound.
 const MAX_QUEUED_ENV: &str = "SHISO_MAX_QUEUED";
-/// The environment knob for the shared prefill quantum.
-const MIXED_QUANTUM_ENV: &str = "SHISO_MIXED_PREFILL_QUANTUM";
-/// The environment knob for the solo prefill chunk.
-const SOLO_CHUNK_ENV: &str = "SHISO_SOLO_PREFILL_CHUNK";
 /// The environment knob for the per-request deadline, in milliseconds.
 const REQUEST_TIMEOUT_ENV: &str = "SHISO_REQUEST_TIMEOUT_MS";
 /// The environment knob for the admission wait, in milliseconds.
@@ -291,8 +287,11 @@ impl SchedulerConfig {
             // over this by the binary: the KV pool is sized from the same count.
             max_num_seqs: default.max_num_seqs,
             max_queued: env_count(MAX_QUEUED_ENV, default.max_queued),
-            mixed_quantum: env_count(MIXED_QUANTUM_ENV, default.mixed_quantum),
-            solo_chunk: env_count(SOLO_CHUNK_ENV, default.solo_chunk),
+            // `--mixed-prefill-quantum` and `--solo-prefill-chunk` (or
+            // `--max-num-batched-tokens`) are flags, set over these by the
+            // binary, which refuses a zero rather than raising it to one.
+            mixed_quantum: default.mixed_quantum,
+            solo_chunk: default.solo_chunk,
             // Zero is how the knob spells "no deadline", which is a different
             // thing from a deadline of zero milliseconds and has to stay
             // distinguishable from it.
