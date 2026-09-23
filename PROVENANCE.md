@@ -30,3 +30,4 @@ the name "ds4" for the host project.
 | `crates/shiso-server` | - | original; wire formats follow the OpenAI and Anthropic APIs |
 | `crates/shiso-bench` | llama.cpp, `mlx-lm`, `transformers` | independent reference fixtures are captured from these |
 | `scripts/reference/` | atlas-ir repository (same owner); Hugging Face `transformers`, Apache-2.0 | reference tooling. `repro_readback.py` is copied from atlas-ir with embedded credentials removed and `--top-k` added. `render_chat_fixtures.py` calls the reference chat-template implementation from `transformers` at run time; nothing is vendored |
+| `scripts/reference/qwen4exp_fp8_ref.py` | Hugging Face `transformers` 5.16.1 (`modeling_qwen4_exp`), Apache-2.0; `torch`, `safetensors`, `tokenizers` | original; imports and runs the `transformers` modules as the independent reference and replaces only its expert and n-gram weight storage |
