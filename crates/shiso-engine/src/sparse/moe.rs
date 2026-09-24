@@ -569,6 +569,216 @@ pub fn ws_experts(shape: &SparseShape, layer: LayerRef, bits: u32, n_tok: u32) -
     Ok(plan)
 }
 
+/// Rows up to which the routed block takes the decode-shaped launches.
+///
+/// They are the weight-stationary GEMMs cut into one n16 column group a warp
+/// over the *active* experts, with the Hadamard epilogues in launches of their
+/// own, and a pass through them is bit-identical to one through
+/// [`ws_experts`] - so this line is drawn on speed alone. The weight-stationary
+/// grid is sized by the expert count and holds 64-row staging: one token's
+/// fifty busy blocks of 2,560 ran two waves on forty-eight SMs, at 55% of the
+/// bandwidth the layer's weights cost (measured on a GB10, 185 us a layer).
+/// Past a real chunk the 64-row passes win, as each expert has rows enough to
+/// fill them.
+pub const WSD_MAX_ROWS: u32 = 32;
+
+/// The experts' own stage for a decode step, a verify pass or a decode batch:
+/// the same prep as [`ws_experts`], then the decode-shaped gate and up, their
+/// epilogue, and the down projection. [`wsd_combine`] finishes it.
+///
+/// # Errors
+///
+/// As [`ws_experts`].
+pub fn wsd_experts(
+    shape: &SparseShape,
+    layer: LayerRef,
+    bits: u32,
+    n_tok: u32,
+) -> CoreResult<Plan> {
+    let hidden = shape.hidden;
+    let inter = shape.moe.intermediate;
+    exl3::check_shape(hidden, inter, bits)?;
+    let tile = kernels::EXL3_MOE_WS_TILE_N;
+    let group = 16 * kernels::EXL3_MOE_WSD_WARPS;
+    if !hidden.is_multiple_of(tile) || !inter.is_multiple_of(tile) || !tile.is_multiple_of(group) {
+        return Err(CoreError::ShapeMismatch {
+            field: "decode-shaped expert tile",
+            expected: u64::from(tile),
+            got: u64::from(if hidden.is_multiple_of(tile) {
+                inter
+            } else {
+                hidden
+            }),
+        });
+    }
+    let at = |role: Role, span| Operand::Weight(WeightRef::layer(layer, role).spanning(span));
+    let width = |value: u32| Operand::I32(i32::try_from(value).unwrap_or(i32::MAX));
+    let threads = kernels::EXL3_MOE_WS_THREADS;
+    let rows = n_tok.saturating_mul(shape.moe.used);
+    let experts = shape.moe.experts;
+    // No more experts can be busy than there are routed columns.
+    let busy = rows.min(experts);
+    if shape.moe.used > kernels::EXL3_MOE_WSD_MAX_USED {
+        return Err(CoreError::ShapeMismatch {
+            field: "decode-shaped combine slots",
+            expected: u64::from(kernels::EXL3_MOE_WSD_MAX_USED),
+            got: u64::from(shape.moe.used),
+        });
+    }
+    let bits_key = TemplateArgs::TrellisBits(bits);
+    let block = kernels::EXL3_MOE_WSD_WARPS * 32;
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::template(
+            MOD_EXL3,
+            kernels::EXL3_MOE_WS_INVERT,
+            TemplateArgs::Untemplated,
+        ),
+        kernels::Launch::linear(
+            kernels::blocks_for(u64::from(rows), u64::from(threads)),
+            threads,
+        ),
+        // `pos, slot_sorted, n_rows`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeWsPos),
+            Operand::Scratch(Buf::MoeSorted),
+            width(rows),
+        ]),
+    );
+    let warps = u64::from(rows) * u64::from(hidden / tile);
+    plan.launch(
+        Entry::template(
+            MOD_EXL3,
+            kernels::EXL3_MOE_WSD_PREP,
+            TemplateArgs::Untemplated,
+        ),
+        kernels::Launch::linear(kernels::blocks_for(warps, u64::from(threads / 32)), threads),
+        // `x, a_g, a_u, suh_g, suh_u, ids, pos, n_tok, n_used, k`
+        Args::of(&[
+            Operand::Scratch(Buf::Mixed),
+            Operand::Scratch(Buf::MoeWsGate),
+            Operand::Scratch(Buf::MoeWsUp),
+            at(Role::ExpertGate, WeightPart::InputScales),
+            at(Role::ExpertUp, WeightPart::InputScales),
+            Operand::Scratch(Buf::MoeIds),
+            Operand::Scratch(Buf::MoeWsPos),
+            width(n_tok),
+            width(shape.moe.used),
+            width(hidden),
+        ]),
+    );
+    plan.launch(
+        Entry::template(MOD_EXL3, kernels::EXL3_MOE_WSD_GATEUP, bits_key),
+        kernels::Launch::new(
+            shiso_core::Extent3::linear(busy.saturating_mul(inter / group)),
+            block,
+            kernels::exl3_moe_wsd_smem(bits, true),
+        ),
+        // `a_g, a_u, raw_g, raw_u, gate_trellis, up_trellis, bounds, active,
+        //  n_expert, hidden, inter`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeWsGate),
+            Operand::Scratch(Buf::MoeWsUp),
+            Operand::Scratch(Buf::MoeGate),
+            Operand::Scratch(Buf::MoeUp),
+            at(Role::ExpertGate, WeightPart::Tiles),
+            at(Role::ExpertUp, WeightPart::Tiles),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            width(experts),
+            width(hidden),
+            width(inter),
+        ]),
+    );
+    let act_warps = u64::from(rows) * u64::from(inter / tile);
+    plan.launch(
+        Entry::template(
+            MOD_EXL3,
+            kernels::EXL3_MOE_WSD_ACT,
+            TemplateArgs::Untemplated,
+        ),
+        kernels::Launch::linear(
+            kernels::blocks_for(act_warps, u64::from(threads / 32)),
+            threads,
+        ),
+        // `raw_g, raw_u, act, gate_svh, up_svh, down_suh, ids, slot_sorted,
+        //  bounds, n_expert, n_rows, inter`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeGate),
+            Operand::Scratch(Buf::MoeUp),
+            Operand::Scratch(Buf::MoeWsAct),
+            at(Role::ExpertGate, WeightPart::OutputScales),
+            at(Role::ExpertUp, WeightPart::OutputScales),
+            at(Role::ExpertDown, WeightPart::InputScales),
+            Operand::Scratch(Buf::MoeIds),
+            Operand::Scratch(Buf::MoeSorted),
+            Operand::Scratch(Buf::MoeBounds),
+            width(experts),
+            width(rows),
+            width(inter),
+        ]),
+    );
+    plan.launch(
+        Entry::template(MOD_EXL3, kernels::EXL3_MOE_WSD_DOWN, bits_key),
+        kernels::Launch::new(
+            shiso_core::Extent3::linear(busy.saturating_mul(hidden / group)),
+            block,
+            kernels::exl3_moe_wsd_smem(bits, false),
+        ),
+        // `act, raw_d, down_trellis, bounds, active, n_expert, hidden, inter`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeWsAct),
+            Operand::Scratch(Buf::MoeDown),
+            at(Role::ExpertDown, WeightPart::Tiles),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            width(experts),
+            width(hidden),
+            width(inter),
+        ]),
+    );
+    Ok(plan)
+}
+
+/// The down epilogue and the weighted sum of [`wsd_experts`]' raw rows, with
+/// the gated shared expert added in the same pass, as [`ws_combine`] adds it.
+#[must_use]
+pub fn wsd_combine(shape: &SparseShape, layer: LayerRef, n_tok: u32) -> Plan {
+    let mut plan = Plan::new();
+    let chunks = shape.hidden / kernels::EXL3_MOE_WS_TILE_N;
+    plan.launch(
+        Entry::template(
+            MOD_EXL3,
+            kernels::EXL3_MOE_WSD_COMBINE,
+            TemplateArgs::Untemplated,
+        ),
+        // One warp per slot: the geometry refuses a count past the kernel's
+        // static staging rather than leaving slots out of the sum.
+        kernels::Launch::new(
+            shiso_core::Extent3::new(chunks, n_tok, 1),
+            32 * shape.moe.used,
+            0,
+        ),
+        // `out, raw_d, down_svh, ids, pos, weights, shared, logit, n_embd,
+        //  n_used`
+        Args::of(&[
+            Operand::Scratch(Buf::BlockOut),
+            Operand::Scratch(Buf::MoeDown),
+            Operand::Weight(
+                WeightRef::layer(layer, Role::ExpertDown).spanning(WeightPart::OutputScales),
+            ),
+            Operand::Scratch(Buf::MoeIds),
+            Operand::Scratch(Buf::MoeWsPos),
+            Operand::Scratch(Buf::MoeWeights),
+            Operand::Scratch(Buf::SharedOut),
+            Operand::Scratch(Buf::SharedLogit),
+            Operand::I32(i32::try_from(shape.hidden).unwrap_or(i32::MAX)),
+            Operand::I32(i32::try_from(shape.moe.used).unwrap_or(i32::MAX)),
+        ]),
+    );
+    plan
+}
+
 /// Rows from which the routed block takes the fused launch.
 ///
 /// Below it - which is a decode step and nothing else - the block runs as two
@@ -1053,6 +1263,12 @@ pub fn block(
         // its combine adds the shared expert in the same pass, so the shared
         // expert's projections run first.
         plan.append(sort(shape, n_tok));
+        if n_tok <= WSD_MAX_ROWS {
+            plan.append(wsd_experts(shape, layer, bits, n_tok)?);
+            plan.append(shared_projections(shape, desc, layer, n_tok, device)?);
+            plan.append(wsd_combine(shape, layer, n_tok));
+            return Ok(plan);
+        }
         plan.append(ws_experts(shape, layer, bits, n_tok)?);
         plan.append(shared_projections(shape, desc, layer, n_tok, device)?);
         plan.append(ws_combine(shape, n_tok));

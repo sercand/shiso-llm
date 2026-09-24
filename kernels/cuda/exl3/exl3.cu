@@ -16,6 +16,7 @@ namespace cg = cooperative_groups;
 #include "exl3_reconstruct.cuh"
 #include "exl3_moe_kernel.cuh"
 #include "exl3_moe_ws.cuh"
+#include "exl3_dgemv.cuh"
 
 /* Only the mul1 codebook (cb 2) and fp32 outputs are instantiated: the
  * qwen4exp checkpoint is mul1 throughout, K = 4 for routed experts and the
@@ -492,3 +493,32 @@ template __global__ void exl3_moe_ws_down_h<5, 2, SHS_WS_STAGES>(
         const half *, half *, const uint16_t *, const half *, const int32_t *, const int32_t *, int, int);
 template __global__ void exl3_moe_ws_down_h<6, 2, SHS_WS_STAGES>(
         const half *, half *, const uint16_t *, const half *, const int32_t *, const int32_t *, int, int);
+
+/* The decode-shaped routed block (exl3_moe_ws.cuh), launched by name as well.
+ * Four stages of four warps: 32-40 KB of staging, under the default dynamic
+ * limit, so no opt-in is needed and three blocks share an SM. */
+#define SHS_WSD_STAGES 4
+#define SHS_WSD_WARPS 4
+#define SHS_WSD_INSTANCES(B)                                                                               \
+    template __global__ void exl3_moe_wsd_gateup<B, 2, SHS_WSD_STAGES, SHS_WSD_WARPS>(                     \
+            const half *, const half *, float *, float *, const uint16_t *, const uint16_t *,              \
+            const int32_t *, const int32_t *, int, int, int);                                             \
+    template __global__ void exl3_moe_wsd_down<B, 2, SHS_WSD_STAGES, SHS_WSD_WARPS>(                       \
+            const half *, float *, const uint16_t *, const int32_t *, const int32_t *, int, int, int);
+SHS_WSD_INSTANCES(4)
+SHS_WSD_INSTANCES(5)
+SHS_WSD_INSTANCES(6)
+
+/* The decode-shaped dense projection (exl3_dgemv.cuh), launched by name.
+ * 20-28 KB of staging at four stages of four warps. */
+#define SHS_DG_STAGES 4
+#define SHS_DG_WARPS 4
+#define SHS_DG_INSTANCES(B, MT)                                                                        \
+    template __global__ void exl3_dgemv<B, 2, SHS_DG_STAGES, SHS_DG_WARPS, MT>(                        \
+            const half *, const uint16_t *, float *, float *, int *, const half *, int, int, int, int);
+SHS_DG_INSTANCES(4, 1)
+SHS_DG_INSTANCES(4, 2)
+SHS_DG_INSTANCES(5, 1)
+SHS_DG_INSTANCES(5, 2)
+SHS_DG_INSTANCES(6, 1)
+SHS_DG_INSTANCES(6, 2)

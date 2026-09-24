@@ -214,6 +214,64 @@ pub const EXL3_MOE_WS_DOWN_H: &str = "exl3_moe_ws_down_h";
 /// The weighted sum of the half slot outputs, with the gated shared expert
 /// added in the same pass.
 pub const EXL3_MOE_WS_COMBINE: &str = "exl3_moe_ws_combine";
+/// The decode-shaped routed block's gate and up projections: raw sums only,
+/// over the active experts in 16-row passes.
+pub const EXL3_MOE_WSD_GATEUP: &str = "exl3_moe_wsd_gateup";
+/// The decode-shaped block's input rows, one warp per (token, slot, chunk).
+pub const EXL3_MOE_WSD_PREP: &str = "exl3_moe_wsd_prep";
+/// Slots the decode-shaped combine stages, one warp each (`WSD_MAX_USED`).
+pub const EXL3_MOE_WSD_MAX_USED: u32 = 16;
+/// The gate and up epilogue the weight-stationary launch runs in place, as a
+/// launch of its own over the decode-shaped block's raw sums.
+pub const EXL3_MOE_WSD_ACT: &str = "exl3_moe_wsd_act";
+/// The decode-shaped routed block's down projection: raw sums only.
+pub const EXL3_MOE_WSD_DOWN: &str = "exl3_moe_wsd_down";
+/// The down epilogue and the weighted combine in one launch, over the
+/// decode-shaped block's raw sums.
+pub const EXL3_MOE_WSD_COMBINE: &str = "exl3_moe_wsd_combine";
+/// Warps one decode-shaped block carries, one n16 column group each
+/// (`SHS_WSD_WARPS`).
+pub const EXL3_MOE_WSD_WARPS: u32 = 4;
+/// Pipeline stages the decode-shaped instances were built with.
+const EXL3_MOE_WSD_STAGES: u32 = 4;
+
+/// Dynamic shared memory one decode-shaped block needs.
+///
+/// `WsdSmem<bits, two, STAGES, WARPS>::total`, restated: per stage a 16 x 64
+/// half-precision activation tile and four by `WARPS` trellis tiles, for one
+/// matrix or for the gate and up pair.
+#[must_use]
+pub const fn exl3_moe_wsd_smem(bits: u32, two: bool) -> u32 {
+    let tile_words = 256 * bits / 16;
+    let a_stage = 16 * 64;
+    let b_stage = (64 / 16) * EXL3_MOE_WSD_WARPS * tile_words;
+    let matrices = if two { 2 } else { 1 };
+    EXL3_MOE_WSD_STAGES * matrices * (a_stage * 2 + b_stage * 2)
+}
+/// The decode-shaped dense projection's input transform.
+pub const EXL3_DGEMV_HAD: &str = "exl3_dgemv_had";
+/// The decode-shaped dense projection itself.
+pub const EXL3_DGEMV: &str = "exl3_dgemv";
+/// Warps one decode-shaped dense block carries (`SHS_DG_WARPS`).
+pub const EXL3_DGEMV_WARPS: u32 = 4;
+/// Pipeline stages the decode-shaped dense instances were built with.
+const EXL3_DGEMV_STAGES: u32 = 4;
+/// K one pipeline stage of the decode-shaped dense projection covers
+/// (`DG_KT`), which a slice of the contraction has to be a multiple of.
+pub const EXL3_DGEMV_KT: u32 = 64;
+
+/// Dynamic shared memory one decode-shaped dense block needs.
+///
+/// `DgSmem<bits, STAGES, WARPS, MT>::total`, restated: per stage `tiles`
+/// 16 x 64 half-precision activation tiles and four by `WARPS` trellis tiles.
+#[must_use]
+pub const fn exl3_dgemv_smem(bits: u32, tiles: u32) -> u32 {
+    let tile_words = 256 * bits / 16;
+    let a_stage = tiles * 16 * EXL3_DGEMV_KT;
+    let b_stage = (EXL3_DGEMV_KT / 16) * EXL3_DGEMV_WARPS * tile_words;
+    EXL3_DGEMV_STAGES * (a_stage * 2 + b_stage * 2)
+}
+
 /// Threads one block of every weight-stationary launch carries (`WS_THREADS`).
 pub const EXL3_MOE_WS_THREADS: u32 = 256;
 /// Output columns one weight-stationary block owns.
@@ -300,6 +358,14 @@ pub enum TemplateArgs {
     /// A trellis width alone: the fused routed block, whose output tile is
     /// fixed, and the expansion.
     TrellisBits(u32),
+    /// A trellis width and the m16 tiles one pass holds, for the
+    /// decode-shaped dense projection.
+    TrellisTiles {
+        /// Trellis width the instance decodes.
+        bits: u32,
+        /// Sixteen-row tiles one pass of the instance multiplies at once.
+        tiles: u32,
+    },
     /// No arguments at all: an entry point with C++ linkage that is not a
     /// template, whose mangled name has to be read off the module like one.
     Untemplated,

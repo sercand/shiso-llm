@@ -499,6 +499,37 @@ impl Staging {
         }
     }
 
+    /// The staging a decode-shaped dense projection carves: the transformed
+    /// activation, then at [`Staging::decode_partials`] the slices' partial
+    /// sums, floored as the transformed slab is so a wider pass is never a
+    /// growth.
+    #[must_use]
+    pub fn decode(rows: u32, k: u32, n: u32, ksplit: u32) -> Self {
+        let partials = u64::from(ksplit)
+            .saturating_mul(u64::from(rows))
+            .saturating_mul(u64::from(n))
+            .saturating_mul(4);
+        Self {
+            bytes: Self::decode_partials(rows, k)
+                .saturating_add(partials)
+                .max(HADAMARD_FLOOR_HALVES * HALF_BYTES),
+        }
+    }
+
+    /// Where a decode-shaped dense projection's partial sums start inside its
+    /// staging: past the transformed activation, at the staging alignment.
+    ///
+    /// The activation is stored in MMA fragment order, whole sixteen-row
+    /// tiles of it with the rows past the pass zeroed, and in that order one
+    /// row's halves are spread through the whole tile. Sized by the rows alone,
+    /// the partial sums overlapped the padding - that is, every row's data -
+    /// and the slices' stores raced the other blocks' reads of the activation.
+    #[must_use]
+    pub fn decode_partials(rows: u32, k: u32) -> u64 {
+        (u64::from(rows.next_multiple_of(16)) * u64::from(k) * HALF_BYTES)
+            .next_multiple_of(STAGING_ALIGN)
+    }
+
     /// The slab an expanded trellis weight is written into.
     #[must_use]
     pub fn expanded(k: u32, n: u32) -> Self {

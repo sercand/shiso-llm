@@ -309,6 +309,36 @@ fn classify(module: &'static str, template: &str, args: &[Arg]) -> Option<Instan
             kernels::EXL3_MOE_WS_DOWN_H,
             TemplateArgs::TrellisBits(int(args, 0)?),
         ),
+        // `<bits, cb, STAGES, WARPS, MT>`: the tile count is the only other
+        // argument that varies between instances.
+        kernels::EXL3_DGEMV => of(
+            kernels::EXL3_DGEMV,
+            TemplateArgs::TrellisTiles {
+                bits: int(args, 0)?,
+                tiles: int(args, 4)?,
+            },
+        ),
+        kernels::EXL3_DGEMV_HAD if args.is_empty() => {
+            of(kernels::EXL3_DGEMV_HAD, TemplateArgs::Untemplated)
+        }
+        // `<bits, cb, STAGES, WARPS>`, one instantiation per width.
+        kernels::EXL3_MOE_WSD_GATEUP => of(
+            kernels::EXL3_MOE_WSD_GATEUP,
+            TemplateArgs::TrellisBits(int(args, 0)?),
+        ),
+        kernels::EXL3_MOE_WSD_DOWN => of(
+            kernels::EXL3_MOE_WSD_DOWN,
+            TemplateArgs::TrellisBits(int(args, 0)?),
+        ),
+        kernels::EXL3_MOE_WSD_PREP if args.is_empty() => {
+            of(kernels::EXL3_MOE_WSD_PREP, TemplateArgs::Untemplated)
+        }
+        kernels::EXL3_MOE_WSD_ACT if args.is_empty() => {
+            of(kernels::EXL3_MOE_WSD_ACT, TemplateArgs::Untemplated)
+        }
+        kernels::EXL3_MOE_WSD_COMBINE if args.is_empty() => {
+            of(kernels::EXL3_MOE_WSD_COMBINE, TemplateArgs::Untemplated)
+        }
         kernels::EXL3_MOE_WS_COMBINE if args.is_empty() => {
             of(kernels::EXL3_MOE_WS_COMBINE, TemplateArgs::Untemplated)
         }

@@ -435,3 +435,284 @@ exl3_moe_ws_combine(float *__restrict__ out, const half *__restrict__ slot_out,
     acc.x += sh.x * g; acc.y += sh.y * g; acc.z += sh.z * g; acc.w += sh.w * g;
     *(float4 *)(out + (size_t)t * n_embd + e) = acc;
 }
+
+// ---- decode shape (shiso) -------------------------------------------------------
+// The weight-stationary launches above size their grid by the expert count, so a
+// decode step of one token runs 2,560 gate/up blocks of which fifty have rows,
+// and those fifty land on forty-eight SMs: two waves, the second two blocks
+// wide, at one block an SM because the 64-row staging takes 72 KB.  Measured
+// on a GB10: 115 us gate/up and 70 us down a layer, 55% of the bandwidth the
+// 24.6 MB they stream costs.
+//
+// These are the same GEMMs cut finer.  A block is WARPS warps, one n16 column
+// group each, for one *active* expert (the sort's active list), over 16-row
+// passes; the 128-column Hadamard epilogues move out into their own launches,
+// which read the raw single-precision sums back.  Every column's sum is the
+// same sequence of m16n8k16 MMAs over the same decoded fragments and the same
+// fp16 A rows, in the same k order, as exl3_moe_ws_gateup / _down's, and the
+// epilogues are the same operations on the same values -- so a pass through
+// these is bit-identical to one through the weight-stationary launches, and
+// the choice between them is a matter of speed alone.
+#ifndef WSD_KT
+#define WSD_KT 64
+#endif
+#define WSD_A_COLS (WSD_KT / 8)
+
+template <int bits, bool TWO, int STAGES, int WARPS>
+struct WsdSmem {
+    static constexpr int tile_words = 256 * bits / 16;
+    static constexpr int a_stage = 16 * WSD_KT;                       // halfs, per matrix
+    static constexpr int b_stage = (WSD_KT / 16) * WARPS * tile_words;  // uint16, per matrix
+    static constexpr int n_mat = TWO ? 2 : 1;
+    static constexpr int stage_bytes = n_mat * (a_stage * 2 + b_stage * 2);
+    static constexpr int total = STAGES * stage_bytes;
+};
+
+// One 16-row pass: warp w's two n8 fragments of columns [n0 + 16w, n0 + 16w + 16).
+template <int bits, int cb, bool TWO, int STAGES, int WARPS>
+__device__ __forceinline__ void wsd_gemm_pass(
+        const half *__restrict__ A0, const half *__restrict__ A1, int m_rows,
+        const uint16_t *__restrict__ B0, const uint16_t *__restrict__ B1,
+        int k, int n, int n0, FragC *c0, FragC *c1, uint8_t *smem) {
+    typedef WsdSmem<bits, TWO, STAGES, WARPS> S;
+    constexpr int TW = S::tile_words;
+    constexpr int THREADS = WARPS * 32;
+    half *sh_a0 = (half *)smem;
+    half *sh_a1 = sh_a0 + STAGES * S::a_stage;
+    uint16_t *sh_b0 = (uint16_t *)(sh_a1 + (TWO ? STAGES * S::a_stage : 0));
+    uint16_t *sh_b1 = sh_b0 + STAGES * S::b_stage;
+
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int blocks_n = n / 16;
+    const int n_stages = k / WSD_KT;
+#pragma unroll
+    for (int f = 0; f < 2; f++) { c0[f] = {}; if (TWO) c1[f] = {}; }
+
+    auto load_a = [&](const half *A, half *sh, int k0) {
+        for (int idx = t; idx < 16 * WSD_A_COLS; idx += THREADS) {
+            const int m = idx / WSD_A_COLS, kc = idx % WSD_A_COLS;
+            int4 *dst = (int4 *)sh + m * WSD_A_COLS + (kc ^ (m & 7));
+            if (m < m_rows) cp_async(dst, (const int4 *)(A + (size_t)m * k + k0) + kc);
+            else *dst = make_int4(0, 0, 0, 0);
+        }
+    };
+    auto load_b = [&](const uint16_t *B, uint16_t *sh, int k0) {
+        constexpr int per_tile = TW * 2 / 16;
+        constexpr int pieces = (WSD_KT / 16) * WARPS * per_tile;
+        for (int p = t; p < pieces; p += THREADS) {
+            const int tile = p / per_tile, piece = p - tile * per_tile;
+            const int kb = tile / WARPS, nbi = tile % WARPS;
+            const size_t src = ((size_t)(k0 / 16 + kb) * blocks_n + n0 / 16 + nbi) * TW;
+            cp_async((int4 *)sh + p, (const int4 *)(B + src) + piece);
+        }
+    };
+    auto load_stage = [&](int s, int buf) {
+        const int k0 = s * WSD_KT;
+        load_a(A0, sh_a0 + buf * S::a_stage, k0);
+        load_b(B0, sh_b0 + buf * S::b_stage, k0);
+        if (TWO) {
+            load_a(A1, sh_a1 + buf * S::a_stage, k0);
+            load_b(B1, sh_b1 + buf * S::b_stage, k0);
+        }
+        cp_async_fence();
+    };
+    auto compute_stage = [&](int buf) {
+        const half *a0 = sh_a0 + buf * S::a_stage, *a1 = sh_a1 + buf * S::a_stage;
+        const uint16_t *b0 = sh_b0 + buf * S::b_stage, *b1 = sh_b1 + buf * S::b_stage;
+        const int r = (lane & 7) + 8 * ((lane >> 3) & 1);
+#pragma unroll
+        for (int kb = 0; kb < WSD_KT / 16; kb++) {
+            FragB fb0[2], fb1[2];
+            dq_dispatch<bits, cb>((const uint32_t *)(b0 + (kb * WARPS + warp) * TW), lane << 3, fb0[0], fb0[1]);
+            if (TWO) dq_dispatch<bits, cb>((const uint32_t *)(b1 + (kb * WARPS + warp) * TW), lane << 3, fb1[0], fb1[1]);
+            const int c = kb * 2 + (lane >> 4);
+            const int off = r * WSD_A_COLS + (c ^ (r & 7));
+            FragA fa;
+            ldsm4(fa, (const int4 *)a0 + off);
+            ptx_mma_m16n8k16(fa, fb0[0], c0[0]);
+            ptx_mma_m16n8k16(fa, fb0[1], c0[1]);
+            if (TWO) {
+                ldsm4(fa, (const int4 *)a1 + off);
+                ptx_mma_m16n8k16(fa, fb1[0], c1[0]);
+                ptx_mma_m16n8k16(fa, fb1[1], c1[1]);
+            }
+        }
+    };
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; s++) {
+        if (s < n_stages) load_stage(s, s); else cp_async_fence();
+    }
+    for (int s = 0; s < n_stages; s++) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        const int nxt = s + STAGES - 1;
+        if (nxt < n_stages) load_stage(nxt, nxt % STAGES); else cp_async_fence();
+        compute_stage(s % STAGES);
+    }
+    cp_async_wait<0>();
+    __syncthreads();
+}
+
+// A warp's fragments of rows [0, m) into dst[row][ld], its 16 columns at col0.
+__device__ __forceinline__ void wsd_store_raw(float *dst, int ld, int m, int col0, const FragC *c, int lane) {
+    const int r0 = lane >> 2, col = col0 + (lane & 3) * 2;
+#pragma unroll
+    for (int f = 0; f < 2; f++) {
+        if (r0 < m) *(float2 *)(dst + (size_t)r0 * ld + col + f * 8) = make_float2(c[f].elems[0], c[f].elems[1]);
+        if (r0 + 8 < m) *(float2 *)(dst + (size_t)(r0 + 8) * ld + col + f * 8) = make_float2(c[f].elems[2], c[f].elems[3]);
+    }
+}
+
+// exl3_moe_ws_prep_tok with the slot loop spread over warps: one warp per
+// (token, slot, 128-column chunk).  At one token the by-token form is twenty
+// warps walking ten slots each, 12 us of a decode step's layer; each slot's
+// row is the same arithmetic either way.
+__global__ void __launch_bounds__(WS_THREADS)
+exl3_moe_wsd_prep(const float *__restrict__ x, half *__restrict__ a_g, half *__restrict__ a_u,
+                  const half *__restrict__ suh_g, const half *__restrict__ suh_u,
+                  const int32_t *__restrict__ ids, const int32_t *__restrict__ pos,
+                  int n_tok, int n_used, int k) {
+    const int lane = threadIdx.x & 31;
+    const int chunks = k / 128;
+    const int task = blockIdx.x * (WS_THREADS / 32) + (threadIdx.x >> 5);
+    if (task >= n_tok * n_used * chunks) return;
+    const int slot = task / chunks, c = task - slot * chunks;
+    const int t = slot / n_used;
+    const float4 xv = ((const float4 *)(x + (size_t)t * k + c * 128))[lane];
+    const int e = ids[slot];
+    const int row = pos[slot];
+    float4 g = xv, u = xv;
+    ws_scale4(g, suh_g + (size_t)e * k + c * 128, lane);
+    ws_scale4(u, suh_u + (size_t)e * k + c * 128, lane);
+    ws_had4(g, lane);
+    ws_had4(u, lane);
+    ((half4 *)(a_g + (size_t)row * k + c * 128))[lane] = half4(__floats2half2_rn(g.x, g.y), __floats2half2_rn(g.z, g.w));
+    ((half4 *)(a_u + (size_t)row * k + c * 128))[lane] = half4(__floats2half2_rn(u.x, u.y), __floats2half2_rn(u.z, u.w));
+}
+
+// grid.x = min(n_rows, n_expert) * (inter / (16 * WARPS)): block b is active
+// expert b / tiles_n.  raw_g / raw_u[row][inter] get the sorted rows' sums.
+template <int bits, int cb, int STAGES, int WARPS>
+__global__ void __launch_bounds__(WARPS * 32)
+exl3_moe_wsd_gateup(const half *__restrict__ a_g, const half *__restrict__ a_u,
+                    float *__restrict__ raw_g, float *__restrict__ raw_u,
+                    const uint16_t *__restrict__ gate_trellis, const uint16_t *__restrict__ up_trellis,
+                    const int32_t *__restrict__ bounds, const int32_t *__restrict__ active,
+                    int n_expert, int hidden, int inter) {
+    extern __shared__ __align__(16) uint8_t ws_smem[];
+    const int tiles_n = inter / (16 * WARPS);
+    const int j = blockIdx.x / tiles_n;
+    if (j >= active[n_expert]) return;
+    const int e = active[j], n0 = (blockIdx.x - j * tiles_n) * 16 * WARPS;
+    const int r0 = bounds[e], m = bounds[e + 1] - r0;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const size_t tstride = (size_t)hidden * inter * bits / 16;
+    const uint16_t *Bg = gate_trellis + (size_t)e * tstride;
+    const uint16_t *Bu = up_trellis + (size_t)e * tstride;
+    for (int p0 = 0; p0 < m; p0 += 16) {
+        const int rows = min(16, m - p0);
+        FragC cg[2], cu[2];
+        wsd_gemm_pass<bits, cb, true, STAGES, WARPS>(a_g + (size_t)(r0 + p0) * hidden, a_u + (size_t)(r0 + p0) * hidden,
+                                                     rows, Bg, Bu, hidden, inter, n0, cg, cu, ws_smem);
+        wsd_store_raw(raw_g + (size_t)(r0 + p0) * inter, inter, rows, n0 + warp * 16, cg, lane);
+        wsd_store_raw(raw_u + (size_t)(r0 + p0) * inter, inter, rows, n0 + warp * 16, cu, lane);
+    }
+}
+
+// The gate/up epilogue of exl3_moe_ws_gateup, over the raw sums: one warp per
+// (sorted row, 128 columns).
+__global__ void __launch_bounds__(256)
+exl3_moe_wsd_act(const float *__restrict__ raw_g, const float *__restrict__ raw_u, half *__restrict__ act,
+                 const half *__restrict__ gate_svh, const half *__restrict__ up_svh,
+                 const half *__restrict__ down_suh, const int32_t *__restrict__ ids,
+                 const int32_t *__restrict__ slot_sorted, const int32_t *__restrict__ bounds,
+                 int n_expert, int n_rows, int inter) {
+    const int lane = threadIdx.x & 31;
+    const int chunks = inter / 128;
+    const int task = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (task >= n_rows * chunks) return;
+    const int row = task / chunks, c = task - row * chunks;
+    if (row >= bounds[n_expert]) return;
+    const int e = ids[slot_sorted[row]];
+    const int n0 = c * 128;
+    float4 g = ((const float4 *)(raw_g + (size_t)row * inter + n0))[lane];
+    float4 u = ((const float4 *)(raw_u + (size_t)row * inter + n0))[lane];
+    ws_had4(g, lane); ws_had4(u, lane);
+    ws_scale4(g, gate_svh + (size_t)e * inter + n0, lane); ws_scale4(u, up_svh + (size_t)e * inter + n0, lane);
+    g.x = g.x / (1.0f + __expf(-g.x)) * u.x;
+    g.y = g.y / (1.0f + __expf(-g.y)) * u.y;
+    g.z = g.z / (1.0f + __expf(-g.z)) * u.z;
+    g.w = g.w / (1.0f + __expf(-g.w)) * u.w;
+    ws_scale4(g, down_suh + (size_t)e * inter + n0, lane);
+    ws_had4(g, lane);
+    half4 o(__floats2half2_rn(g.x, g.y), __floats2half2_rn(g.z, g.w));
+    ((half4 *)(act + (size_t)row * inter + n0))[lane] = o;
+}
+
+// grid.x = min(n_rows, n_expert) * (hidden / (16 * WARPS)); raw_d[row][hidden].
+template <int bits, int cb, int STAGES, int WARPS>
+__global__ void __launch_bounds__(WARPS * 32)
+exl3_moe_wsd_down(const half *__restrict__ act, float *__restrict__ raw_d,
+                  const uint16_t *__restrict__ down_trellis,
+                  const int32_t *__restrict__ bounds, const int32_t *__restrict__ active,
+                  int n_expert, int hidden, int inter) {
+    extern __shared__ __align__(16) uint8_t ws_smem[];
+    const int tiles_n = hidden / (16 * WARPS);
+    const int j = blockIdx.x / tiles_n;
+    if (j >= active[n_expert]) return;
+    const int e = active[j], n0 = (blockIdx.x - j * tiles_n) * 16 * WARPS;
+    const int r0 = bounds[e], m = bounds[e + 1] - r0;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const size_t tstride = (size_t)hidden * inter * bits / 16;
+    const uint16_t *Bd = down_trellis + (size_t)e * tstride;
+    for (int p0 = 0; p0 < m; p0 += 16) {
+        const int rows = min(16, m - p0);
+        FragC cd[2], unused[2];
+        wsd_gemm_pass<bits, cb, false, STAGES, WARPS>(act + (size_t)(r0 + p0) * inter, NULL, rows, Bd, NULL,
+                                                      inter, hidden, n0, cd, unused, ws_smem);
+        wsd_store_raw(raw_d + (size_t)(r0 + p0) * hidden, hidden, rows, n0 + warp * 16, cd, lane);
+    }
+}
+
+// exl3_moe_ws_down_h's epilogue and exl3_moe_ws_combine in one.  A block is
+// one (token, 128 columns); warp s transforms slot s's row -- the Hadamard,
+// svh, and the rounding to the half the weight-stationary down stores -- into
+// shared memory, and warp 0 then sums the slots in slot order with the
+// combine's own expression, lane l on columns 4l..4l+3 as there.  n_used is
+// at most WSD_MAX_USED.  Grid (hidden / 128, n_tok), 32 * n_used threads.
+#define WSD_MAX_USED 16
+__global__ void __launch_bounds__(32 * WSD_MAX_USED)
+exl3_moe_wsd_combine(float *__restrict__ out, const float *__restrict__ raw_d,
+                     const half *__restrict__ down_svh, const int32_t *__restrict__ ids,
+                     const int32_t *__restrict__ pos, const float *__restrict__ weights,
+                     const float *__restrict__ shared, const float *__restrict__ logit,
+                     int n_embd, int n_used) {
+    __shared__ half4 sh_d[WSD_MAX_USED][32];
+    const int lane = threadIdx.x & 31, s = threadIdx.x >> 5;
+    const int t = blockIdx.y;
+    const int n0 = blockIdx.x * 128;
+    if (s < n_used) {
+        const size_t col = (size_t)t * n_used + s;
+        const int e = ids[col];
+        float4 o = ((const float4 *)(raw_d + (size_t)pos[col] * n_embd + n0))[lane];
+        ws_had4(o, lane);
+        ws_scale4(o, down_svh + (size_t)e * n_embd + n0, lane);
+        sh_d[s][lane] = half4(__floats2half2_rn(o.x, o.y), __floats2half2_rn(o.z, o.w));
+    }
+    __syncthreads();
+    if (s != 0) return;
+    const int e0 = n0 + lane * 4;
+    const float g = 1.0f / (1.0f + __expf(-logit[t]));
+    const float4 sh = *(const float4 *)(shared + (size_t)t * n_embd + e0);
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int j = 0; j < n_used; j++) {
+        const float w = weights[(size_t)t * n_used + j];
+        const half4 d = sh_d[j][lane];
+        acc.x += __low2float(d.x) * w;
+        acc.y += __high2float(d.x) * w;
+        acc.z += __low2float(d.y) * w;
+        acc.w += __high2float(d.y) * w;
+    }
+    acc.x += sh.x * g; acc.y += sh.y * g; acc.z += sh.z * g; acc.w += sh.w * g;
+    *(float4 *)(out + (size_t)t * n_embd + e0) = acc;
+}

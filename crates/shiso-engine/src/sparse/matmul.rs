@@ -212,6 +212,17 @@ pub enum Projection {
         /// Blocks the cooperative launch starts, all of them resident.
         blocks: u32,
     },
+    /// A trellis-codec weight through the decode-shaped projection: an input
+    /// transform, then one n16 column group a warp over `ksplit` slices of
+    /// the contraction.
+    TrellisDecode {
+        /// Trellis width.
+        bits: u32,
+        /// Slices the contraction is cut into.
+        ksplit: u32,
+        /// Sixteen-row tiles one pass multiplies at once.
+        tiles: u32,
+    },
     /// A trellis-codec weight expanded once and multiplied by the BLAS tier.
     TrellisExpanded {
         /// Trellis width.
@@ -435,6 +446,13 @@ fn trellis(
     if exl3::reconstruct(gate, in_dim, out_dim) {
         return Ok(Projection::TrellisExpanded { bits, rows });
     }
+    if let Some(ksplit) = decode_split(in_dim, out_dim, rows, device.max_co_resident) {
+        return Ok(Projection::TrellisDecode {
+            bits,
+            ksplit,
+            tiles: if rows > 16 { 2 } else { 1 },
+        });
+    }
     let shape = exl3::select_shape(in_dim, out_dim, bits, Fanout::Single).ok_or(
         CoreError::Unsupported {
             what: "a trellis weight no built tiling shape divides",
@@ -446,6 +464,65 @@ fn trellis(
         bits,
         blocks: exl3::gemm_blocks(in_dim, out_dim, shape, device.max_co_resident),
     })
+}
+
+/// Rows up to which a dense trellis projection takes the decode-shaped launch.
+///
+/// A decode step, a verify pass and a decode batch all fit, so all three run
+/// one arithmetic per row. Past it a pass is a prefill chunk, which the
+/// cooperative kernel and then the expansion serve.
+pub const TRELLIS_DECODE_MAX_ROWS: u32 = 32;
+
+/// Width at or below which one side of a dense trellis weight has to be for
+/// the decode-shaped launch to take it.
+///
+/// The cooperative kernel runs one block an SM, so a weight narrow on either
+/// side leaves most of each block idle behind its lock chain: the attention
+/// key and value projections (2560 -> 512) ran at 60 GB/s there, the shared
+/// expert's (640 -> 2560) at 90, the indexer's under 50. On the wide
+/// projections - the recurrent input and output, the attention query - the
+/// cooperative kernel's decode loop is the faster of the two by a fifth on a
+/// GB10, where a six-bit trellis is bound by its decode rather than by the
+/// bytes (it slows in proportion when the SM clock is pinned lower), so those
+/// stay where they are. Measured in a standalone harness at one to sixteen
+/// rows.
+pub const TRELLIS_DECODE_NARROW: u32 = 1_024;
+
+/// Warps the decode-shaped projection wants in flight, which is what the
+/// contraction is sliced to reach: about eight an SM on a 48-SM device, where
+/// fewer left a narrow output's weight streaming at a third of the bandwidth.
+const TRELLIS_DECODE_WARPS: u32 = 384;
+
+/// The contraction slices a dense trellis projection takes on the
+/// decode-shaped launch, or `None` when this shape and row count do not take
+/// it.
+///
+/// The fewest slices that reach [`TRELLIS_DECODE_WARPS`] and make the block
+/// count a multiple of `sms`, the device's one-block-an-SM residency: the
+/// blocks are all resident at once, so an SM holding one more than its
+/// neighbours is the launch's tail (measured: a 160-block grid on 48 SMs ran
+/// the recurrent input projection 17% slower than the cooperative kernel's 48
+/// balanced blocks). A function of the shape and the device alone, so every
+/// row count below the bound sums a row the same way.
+#[must_use]
+pub fn decode_split(in_dim: u32, out_dim: u32, rows: u32, sms: u32) -> Option<u32> {
+    let group = 16 * kernels::EXL3_DGEMV_WARPS;
+    if rows > TRELLIS_DECODE_MAX_ROWS
+        || (out_dim > TRELLIS_DECODE_NARROW && in_dim > TRELLIS_DECODE_NARROW)
+        || !out_dim.is_multiple_of(128)
+        || !in_dim.is_multiple_of(128)
+        || !128_u32.is_multiple_of(group)
+    {
+        return None;
+    }
+    let groups = out_dim / 16;
+    let blocks = out_dim / group;
+    let stages = in_dim / kernels::EXL3_DGEMV_KT;
+    let want = TRELLIS_DECODE_WARPS.div_ceil(groups).clamp(1, stages);
+    let sms = sms.max(1);
+    (want..=stages)
+        .find(|split| (blocks * split).is_multiple_of(sms))
+        .or(Some(want))
 }
 
 /// Whether a pair of weights of identical shape and type can share one grouped
@@ -810,6 +887,68 @@ fn project_one(
                 Operand::Weight(part(bound.weight, WeightPart::OutputScales)),
             ]),
         }),
+        // The input transform into the staging, then the slices, whose last
+        // block per output tile folds the partial sums behind the transform.
+        Projection::TrellisDecode {
+            bits,
+            ksplit,
+            tiles,
+        } => {
+            let staging = Staging::decode(rows, weight.in_dim, weight.out_dim, ksplit);
+            let partials = Staging::decode_partials(rows, weight.in_dim);
+            let warps = u64::from(rows) * u64::from(weight.in_dim / 128);
+            out.push(Step::Expand {
+                entry: Entry::template(
+                    MOD_EXL3,
+                    kernels::EXL3_DGEMV_HAD,
+                    TemplateArgs::Untemplated,
+                ),
+                k: weight.in_dim,
+                n: weight.out_dim,
+                bits,
+                launch: Launch::linear(blocks_for(warps, 8), 256),
+                staging,
+                // `A, A_had, suh, size_m, size_k`
+                args: Args::of(&[
+                    bound.src,
+                    Operand::CoopStaging(0),
+                    Operand::Weight(part(bound.weight, WeightPart::InputScales)),
+                    Operand::I32(i32::try_from(rows).unwrap_or(i32::MAX)),
+                    Operand::I32(i32::try_from(weight.in_dim).unwrap_or(i32::MAX)),
+                ]),
+            });
+            let group = 16 * kernels::EXL3_DGEMV_WARPS;
+            out.push(Step::Expand {
+                entry: Entry::template(
+                    MOD_EXL3,
+                    kernels::EXL3_DGEMV,
+                    TemplateArgs::TrellisTiles { bits, tiles },
+                ),
+                k: weight.in_dim,
+                n: weight.out_dim,
+                bits,
+                launch: Launch::new(
+                    shiso_core::Extent3::new(weight.out_dim / group, ksplit, 1),
+                    kernels::EXL3_DGEMV_WARPS * 32,
+                    kernels::exl3_dgemv_smem(bits, tiles),
+                ),
+                staging,
+                // `A_had, B, C, part, tickets, svh, size_m, size_k, size_n,
+                //  ksplit`
+                args: Args::of(&[
+                    Operand::CoopStaging(0),
+                    Operand::Weight(part(bound.weight, WeightPart::Tiles)),
+                    bound.dst,
+                    Operand::CoopStaging(partials),
+                    Operand::CoopLocks,
+                    Operand::Weight(part(bound.weight, WeightPart::OutputScales)),
+                    Operand::I32(i32::try_from(rows).unwrap_or(i32::MAX)),
+                    Operand::I32(i32::try_from(weight.in_dim).unwrap_or(i32::MAX)),
+                    Operand::I32(i32::try_from(weight.out_dim).unwrap_or(i32::MAX)),
+                    Operand::I32(i32::try_from(ksplit).unwrap_or(i32::MAX)),
+                ]),
+            });
+        }
         // The expansion writes the whole weight into the staging region, the
         // conversion rounds the activation, and the multiply reads both as
         // stored: an expanded weight comes out output-major, which is the
