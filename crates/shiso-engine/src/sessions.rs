@@ -251,6 +251,13 @@ pub(crate) struct Session {
     /// The engine hands tokens over a chunk at a time, which makes the session the
     /// only place that path can live.
     history: Vec<TokenId>,
+    /// Whether any chunk this session read spliced media rows in. Such a path
+    /// is never checkpointed: a placeholder run is one id repeated, so its
+    /// tokens cannot tell two pictures apart.
+    media: bool,
+    /// The position a resume stood this session on, zero for one prefilled
+    /// from nothing: what files a prompt's end as cold or as a continuation.
+    resumed_at: u32,
 }
 
 impl Session {
@@ -280,6 +287,8 @@ impl Session {
             last: None,
             history: Vec::new(),
             spec,
+            media: false,
+            resumed_at: 0,
         })
     }
 
@@ -550,6 +559,28 @@ pub(crate) fn clear_range(backend: &Arc<dyn Backend>, buffer: &DeviceBuffer) -> 
 }
 
 impl Session {
+    /// Whether this session read media, which keeps it off disk.
+    #[must_use]
+    pub(crate) const fn carries_media(&self) -> bool {
+        self.media
+    }
+
+    /// Records that a chunk spliced media rows in.
+    pub(crate) fn mark_media(&mut self) {
+        self.media = true;
+    }
+
+    /// The position a resume stood this session on.
+    #[must_use]
+    pub(crate) const fn resumed_at(&self) -> u32 {
+        self.resumed_at
+    }
+
+    /// Records where a resume stood this session.
+    pub(crate) fn set_resumed_at(&mut self, position: u32) {
+        self.resumed_at = position;
+    }
+
     /// The path and the frontier together, as a commit needs them.
     ///
     /// The cache walks the token sequence from position zero while it extends the

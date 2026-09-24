@@ -44,6 +44,8 @@
 //! That costs one device-to-host transfer per admission and buys a store that has
 //! never seen a device pointer.
 
+use std::sync::Arc;
+
 use crate::error::KvError;
 use crate::geom::CacheGeometry;
 use crate::ids::to_u32;
@@ -53,9 +55,14 @@ use crate::ids::{NodeId, SlotId};
 #[derive(Debug)]
 struct Slot {
     /// The state blob, or `None` when the slot is free or has been evicted.
-    state: Option<Vec<u8>>,
+    ///
+    /// Shared rather than owned, because the disk tier's writer holds the same
+    /// blob until its entry lands: queueing a write costs a reference count,
+    /// and a slot refreshed meanwhile gets a new allocation instead of changing
+    /// the bytes under the writer.
+    state: Option<Arc<[u8]>>,
     /// The prompt-final logits row, kept only when it was still fresh.
-    logits: Option<Vec<u8>>,
+    logits: Option<Arc<[u8]>>,
     /// The node this state was taken at, which is what makes a slot findable again.
     node: Option<NodeId>,
     /// Taken on speculation rather than because a rule asked.
@@ -136,11 +143,9 @@ impl CkptStore {
             .is_some_and(|s| s.state.is_some())
     }
 
-    /// Whether a slot holds speculative state.
-    ///
-    /// Test-only: the store reads the flag itself when it picks a victim, and a caller
-    /// has nothing to do with the answer -- it either allowed eviction or did not.
-    #[cfg(test)]
+    /// Whether a slot holds speculative state: a chunk end the engine happened to
+    /// stop at rather than a boundary a rule earned. The disk tier stores only
+    /// earned ones.
     pub(crate) fn is_speculative(&self, slot: SlotId) -> bool {
         self.slots.get(slot.index()).is_some_and(|s| s.speculative)
     }
@@ -162,13 +167,19 @@ impl CkptStore {
         self.slots.get(slot.index()).map_or(0.0, |s| s.hit)
     }
 
-    /// Bytes in the slot's logits row, or `None` when it has none.
+    /// The slot's state blob, shared.
     #[must_use]
-    pub(crate) fn logits_len(&self, slot: SlotId) -> Option<usize> {
+    pub(crate) fn state_arc(&self, slot: SlotId) -> Option<Arc<[u8]>> {
+        self.slots.get(slot.index()).and_then(|s| s.state.clone())
+    }
+
+    /// The slot's logits row, shared.
+    #[must_use]
+    pub(crate) fn logits_arc(&self, slot: SlotId) -> Option<Arc<[u8]>> {
         self.slots
             .get(slot.index())
-            .and_then(|s| s.logits.as_ref())
-            .map(Vec::len)
+            .filter(|s| s.state.is_some())
+            .and_then(|s| s.logits.clone())
     }
 
     /// Every slot that holds state, in table order.
@@ -329,8 +340,8 @@ impl CkptStore {
             });
         }
         let entry = &mut self.slots[slot.index()];
-        entry.state = Some(state.to_vec());
-        entry.logits = logits.map(<[u8]>::to_vec);
+        entry.state = Some(Arc::from(state));
+        entry.logits = logits.map(Arc::from);
         entry.node = Some(node);
         entry.hit = now;
         Ok(CkptRef {

@@ -16,7 +16,7 @@ use shiso_core::error::CoreResult;
 use shiso_core::ids::{SessionId, TokenId};
 use shiso_engine::CacheStats;
 use shiso_engine::ckpt::{Checkpointed, CkptConfig, ResumeInfo, SaveOutcome};
-use shiso_engine::{CkptIdentity, Reason};
+use shiso_engine::{CkptIdentity, PumpReport, Reason};
 
 use crate::qwen35::model::Qwen35Model;
 
@@ -59,6 +59,10 @@ impl Checkpointed for Qwen35Model {
         self.stack().cache_stats()
     }
 
+    fn kv_cache(&self) -> Option<std::sync::Arc<shiso_engine::KvCache>> {
+        self.stack().cache()
+    }
+
     fn kv_enable(&mut self, config: &CkptConfig) -> CoreResult<()> {
         let identity = self.ckpt_identity();
         self.stack_mut().ckpt_enable(config, identity)
@@ -73,27 +77,31 @@ impl Checkpointed for Qwen35Model {
     fn kv_resume(
         &mut self,
         session: SessionId,
-        prompt_text: &[u8],
+        prompt: &[TokenId],
     ) -> CoreResult<Option<ResumeInfo<'_>>> {
-        self.stack_mut().ckpt_resume(session, prompt_text)
+        self.stack_mut().ckpt_resume(session, prompt)
     }
 
-    fn kv_save(
-        &mut self,
-        session: SessionId,
-        tokens: &[TokenId],
-        prompt_text: &[u8],
-        reason: Reason,
-    ) -> CoreResult<SaveOutcome> {
-        self.stack_mut()
-            .ckpt_save(session, tokens, prompt_text, reason)
+    fn kv_save(&mut self, session: SessionId, reason: Reason) -> CoreResult<SaveOutcome> {
+        self.stack_mut().ckpt_save(session, reason)
     }
 
-    fn kv_shutdown_sweep(
-        &mut self,
-        text_of: &mut dyn FnMut(SessionId) -> Option<(Vec<TokenId>, Vec<u8>)>,
-    ) -> usize {
-        self.stack_mut().ckpt_shutdown_sweep(text_of)
+    fn kv_pump(&mut self, max_bytes: u64) -> CoreResult<PumpReport> {
+        self.stack().ckpt_pump(max_bytes)
+    }
+
+    fn kv_drain(&mut self, timeout: std::time::Duration) -> bool {
+        self.stack().ckpt_drain(timeout)
+    }
+
+    fn kv_observe_prefill(&mut self, tokens: u32, seconds: f64) {
+        if let Some(cache) = self.stack().cache() {
+            cache.observe_prefill(tokens, seconds);
+        }
+    }
+
+    fn kv_shutdown_sweep(&mut self) -> usize {
+        self.stack_mut().ckpt_shutdown_sweep()
     }
 }
 

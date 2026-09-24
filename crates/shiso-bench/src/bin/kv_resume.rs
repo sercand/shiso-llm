@@ -25,7 +25,7 @@ use anyhow::{Context, Result, bail};
 use shiso_core::backend::Backend;
 use shiso_core::ids::TokenId;
 use shiso_core::model::{DecodeStep, Model};
-use shiso_engine::{Checkpointed, CkptConfig, EngineOptions, Reason, SaveOutcome, argmax};
+use shiso_engine::{Checkpointed, CkptConfig, EngineOptions, Reason, argmax};
 use shiso_metal::{MetalBackend, metal_available};
 use shiso_models::qwen35::{Qwen35Config, Qwen35Model};
 
@@ -109,25 +109,24 @@ fn run(
         .context("opening the checkpoint directory")?;
 
     let prompt = prompt(config);
-    // The key is the bytes a later request will have in hand. This crate has no
-    // renderer, so the ids stand in for the rendered text - which is exactly the
-    // contract: the engine hashes what it is handed and never derives it.
-    let key = key_of(&prompt);
 
     let cold = Instant::now();
-    let (session, first) = stand_on(&mut model, backend, &prompt, None)?;
+    let (session, first) = stand_on(&mut model, backend, &prompt, false)?;
     let cold_prefill_ms = cold.elapsed().as_secs_f64() * 1000.0;
 
     // Stored here rather than after the continuation: a save names the position
     // the session is standing on, and a session that has decoded past its prompt
-    // is somewhere else. The tier says so by name rather than writing a file that
-    // describes a frontier nothing reached.
-    match model
-        .kv_save(session, &prompt, &key, Reason::Cold)
-        .context("storing the prefix")?
-    {
-        SaveOutcome::Written(id) => tracing::info!(?id, "prefix stored"),
-        other => bail!("the prefix was not stored: {other:?}"),
+    // is somewhere else. The prompt's own commit already queued it; the save
+    // finds it queued, and the drain lands it.
+    let outcome = model
+        .kv_save(session, Reason::Cold)
+        .context("storing the prefix")?;
+    let Some(id) = outcome.stored() else {
+        bail!("the prefix was not stored: {outcome:?}");
+    };
+    tracing::info!(?id, "prefix stored");
+    if !model.kv_drain(std::time::Duration::from_secs(60)) {
+        bail!("the stored prefix did not reach disk in a minute");
     }
     let cold_tail = continue_from(&mut model, backend, session, first)?;
     model
@@ -135,7 +134,7 @@ fn run(
         .context("closing the session")?;
 
     let warm = Instant::now();
-    let (session, first) = stand_on(&mut model, backend, &prompt, Some(&key))?;
+    let (session, first) = stand_on(&mut model, backend, &prompt, true)?;
     let resume_ms = warm.elapsed().as_secs_f64() * 1000.0;
     let warm_tail = continue_from(&mut model, backend, session, first)?;
     let reused = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
@@ -156,31 +155,34 @@ fn run(
 /// Opens a session and stands it at the end of the prompt, returning the first
 /// token the model would produce next.
 ///
-/// With `key`, the prompt is looked for on disk and the session is installed on
-/// what was found; without one, the whole prompt is prefilled. The session is
-/// left exactly at its frontier, which is the only position a save may name.
+/// With `resume`, the prompt is looked up in the cache - the tree, or the disk
+/// behind it - and the session is installed on what was found; without it, the
+/// whole prompt is prefilled. The session is left exactly at its frontier.
 fn stand_on(
     model: &mut Qwen35Model,
     backend: &Arc<dyn Backend>,
     prompt: &[TokenId],
-    key: Option<&[u8]>,
+    resume: bool,
 ) -> Result<(shiso_core::ids::SessionId, TokenId)> {
     let vocab = usize::try_from(model.info().vocab).unwrap_or(0);
     let mut row = vec![0u8; vocab * 4];
     let mut scratch = vec![0f32; vocab];
 
     let session = model.open_session().context("opening a session")?;
-    let token = if let Some(key) = key {
+    let token = if resume {
         let resumed = model
-            .kv_resume(session, key)
+            .kv_resume(session, prompt)
             .context("looking for a stored prefix")?;
         let Some(info) = resumed else {
             bail!("the stored prefix did not match on the second run");
         };
-        // The file carries the row the next token is drawn from, so a resume
+        let Some(logits) = info.frontier_logits else {
+            bail!("a resume of the whole prompt came back without its row");
+        };
+        // The entry carries the row the next token is drawn from, so a resume
         // re-runs no decode step. Reading it here is what proves that.
         backend
-            .copy_d2h(info.frontier_logits.row(0)?, &mut row)
+            .copy_d2h(logits.row(0)?, &mut row)
             .context("reading the restored frontier row")?;
         greedy(&row, &mut scratch)
     } else {
@@ -236,15 +238,6 @@ fn prompt(config: &Qwen35Config) -> Vec<TokenId> {
     (0..PROMPT_TOKENS)
         .map(|i| TokenId::new(i.saturating_mul(2_654_435_761) % vocab))
         .collect()
-}
-
-/// The bytes the tier keys this prefix by.
-fn key_of(prompt: &[TokenId]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(prompt.len() * 4);
-    for token in prompt {
-        key.extend(token.get().to_le_bytes());
-    }
-    key
 }
 
 /// The checkpoint the run measures.

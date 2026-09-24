@@ -48,6 +48,7 @@
     reason = "the ring arm registers bounce buffers with the kernel and pushes submission entries, which is FFI; every block carries its own SAFETY note"
 )]
 
+pub mod bulk;
 pub mod codec;
 
 mod cache;

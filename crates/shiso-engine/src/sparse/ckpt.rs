@@ -41,14 +41,16 @@
 //! word carrying it could only ever disagree.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::model::Logits;
-use shiso_kvstore::{CacheStats, CommitOpts, KvCache, PathLayout, Reason, SpillConfig};
-use shiso_kvstore::{SpillOutcome, SpillRefusal};
+use shiso_kvstore::{
+    CacheStats, CommitOpts, KvCache, PathLayout, PersistRefusal, PumpReport, Reason,
+};
 
-use crate::ckpt::{Checkpoint, CkptConfig, ResumeInfo, SaveOutcome, scan_prefixes};
+use crate::ckpt::{Checkpoint, CkptConfig, ResumeInfo, SaveOutcome, source_of};
 use crate::ckpt_layout::CkptIdentity;
 use crate::shape::LayerKind;
 use crate::sparse::kernels::F32_BYTES;
@@ -112,6 +114,28 @@ fn elements(bytes: u64) -> u32 {
     u32::try_from(bytes / F32_BYTES).unwrap_or(u32::MAX)
 }
 
+/// What kind of boundary a committed span ends at, which decides whether it
+/// is worth a checkpoint and what the disk tier files it under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Boundary {
+    /// A decode step or a chunk end the stack happened to stop at.
+    Step,
+    /// The end of a prompt: where the same prompt, or the next turn of its
+    /// conversation, resumes from.
+    PromptEnd,
+    /// A message boundary or the point a prompt branched off a path the cache
+    /// held: shared by many sessions, so worth a checkpoint of its own.
+    Shared,
+}
+
+impl Boundary {
+    /// Whether a rule earned this boundary, rather than the stack stopping
+    /// there by chance.
+    const fn earned(self) -> bool {
+        !matches!(self, Self::Step)
+    }
+}
+
 impl SparseStack {
     /// Whether a checkpoint directory has been opened.
     #[must_use]
@@ -127,13 +151,20 @@ impl SparseStack {
             .map(|resident| resident.cache.stats())
     }
 
+    /// The cache underneath this stack.
+    #[must_use]
+    pub fn cache(&self) -> Option<Arc<KvCache>> {
+        self.resident
+            .as_ref()
+            .map(|resident| Arc::clone(&resident.cache))
+    }
+
     /// Opens the checkpoint tier over `config.dir`, tagged with `identity`.
     ///
     /// The tier is part of the cache rather than a layer above it, so turning it
-    /// on rebuilds the cache with a spill directory and the byte description a
-    /// stored payload needs. That is why it is refused while sessions are open:
-    /// a session holds page references into the pool the old cache owns, and the
-    /// new one has its own.
+    /// on rebuilds the cache with a disk directory and the layout its keys name.
+    /// That is why it is refused while sessions are open: a session holds page
+    /// references into the pool the old cache owns, and the new one has its own.
     ///
     /// `identity` is not a caller's choice. It comes from the crate that loaded
     /// the checkpoint, which is the only party that knows which family wrote the
@@ -142,8 +173,8 @@ impl SparseStack {
     /// # Errors
     ///
     /// [`CoreError::Unsupported`] when a session is open or the stack has been
-    /// torn down, and [`CoreError::Backend`] when the directory cannot be
-    /// opened.
+    /// torn down, [`CoreError::InvalidValue`] for a zero budget, and
+    /// [`CoreError::Backend`] when the directory cannot be opened.
     pub fn ckpt_enable(&mut self, config: &CkptConfig, identity: CkptIdentity) -> CoreResult<()> {
         if !self.sessions.is_empty() {
             return Err(CoreError::Unsupported {
@@ -154,7 +185,7 @@ impl SparseStack {
         let layout = path_layout(&self.shape, self.opts.engine.ctx, self.opts.spec, identity);
         // The planes the pool was allocated with, which include a draft head's
         // own four when one is resident: a geometry that left them out handed
-        // the spill a page buffer one draft layer short of the page, and every
+        // the store a page buffer one draft layer short of the page, and every
         // store from a build with a head failed on its first page.
         let planes = PagePlanes {
             indexer: true,
@@ -162,12 +193,17 @@ impl SparseStack {
         };
         let geometry =
             paged::cache_geometry(&self.shape, planes, self.opts.spec).with_layout(layout);
-        let mut spill = SpillConfig::new(config.dir.clone(), config.options.budget_mb);
-        spill.reject_different_quant = config.options.reject_different_quant;
         let (pool_pages, ckpt_slots) = (
             self.opts.engine.kv_pool_pages,
             self.opts.engine.kv_ckpt_slots,
         );
+        let disk = config.options.disk(
+            config.dir.clone(),
+            geometry.page_bytes_total(pool_pages),
+            self.backend.numerics_id(),
+        )?;
+        let budget_bytes = disk.budget_bytes;
+        let numerics = disk.numerics.clone();
         let resident = self.resident.as_mut().ok_or(CoreError::Unsupported {
             what: "a stack whose device state teardown already released",
             backend: "engine",
@@ -177,7 +213,7 @@ impl SparseStack {
             Box::new(resident.kv.clone()),
             pool_pages,
             ckpt_slots,
-            Some(spill),
+            Some(disk),
         )
         .map_err(cache_failure)?;
         resident.cache = Arc::new(cache);
@@ -189,40 +225,38 @@ impl SparseStack {
         );
         self.ckpt = Some(Checkpoint {
             options: config.options,
-            identity,
         });
         tracing::info!(
             dir = %config.dir.display(),
             min_tokens = config.options.min_tokens,
-            budget_mb = config.options.budget_mb,
+            budget_bytes,
             model_id = identity.model_id,
             quant_bits = identity.quant_bits,
+            %numerics,
             "sparse checkpoint tier open"
         );
         Ok(())
     }
 
     /// Registers the span a session just wrote, and admits a checkpoint when the
-    /// cache says the position is worth one.
+    /// span ends at a boundary worth one.
     ///
     /// The snapshot is asked for before it is taken, for the reason the dense
     /// stack gives: a blob is a multi-megabyte read back off the device, so
     /// paying it on every committed span would cost more than the prefill it
-    /// saves. So a snapshot is only considered at a boundary worth one on its own
-    /// terms - the end of a prompt, or a stride multiple - which are the
-    /// positions a later request can actually resume from.
+    /// saves. So a snapshot is only taken at a boundary worth one on its own
+    /// terms - a prompt's end, a message boundary, a branch point, or a stride
+    /// multiple - which are the positions a later request can resume from.
     ///
-    /// `earned` says the span ends a prompt, which is the boundary a later
-    /// request would resume from. It is the caller's to answer and not this
-    /// function's to infer, because the two callers look identical from here:
-    /// a prompt's last chunk and a decode step both write one logits row, so a
-    /// checkpoint earned by *having* a row is a checkpoint earned by every
-    /// token - and that is the whole recurrent stack read back to the host per
-    /// token, which is most of a decode step.
+    /// `boundary` is the caller's to answer and not this function's to infer,
+    /// because a prompt's last chunk and a decode step look identical from here:
+    /// both write one logits row, so a checkpoint earned by *having* a row is a
+    /// checkpoint earned by every token - the whole recurrent stack read back to
+    /// the host per token, which is most of a decode step.
     ///
     /// `frontier_row` names which row of the logits block this session's last
     /// position produced. A checkpoint admitted without one cannot be resumed
-    /// from without re-running a step.
+    /// from at the very end of a prompt without re-running a step.
     ///
     /// # Errors
     ///
@@ -232,7 +266,7 @@ impl SparseStack {
     pub(crate) fn commit(
         &mut self,
         session: SessionId,
-        earned: bool,
+        boundary: Boundary,
         frontier_row: Option<u32>,
     ) -> CoreResult<()> {
         let now = self.now();
@@ -253,26 +287,23 @@ impl SparseStack {
             .get_mut(&session)
             .ok_or(CoreError::UnknownSession(session))?;
         let q = live.written();
-        // A prompt's final chunk is a boundary on its own terms - it is where a
-        // later request carrying the same prompt would want to resume - so it is
-        // *earned*, and an earned checkpoint survives an eviction pass that
-        // takes the speculative ones back. Every other boundary this stack takes
-        // is a chunk end it happened to stop at.
+        let earned = boundary.earned();
         let periodic = q > 0 && q.is_multiple_of(MAX_PREFILL_CHUNK);
         // A speculating session's blob carries its staged draft row, and a
         // resume marks that row usable because the blob carried it. So a session
         // that has not staged one is not checkpointed at all rather than
         // checkpointed with zeros that a later run would draft from.
         let staged = live.spec_depth().is_speculative() == live.pending_draft().is_some();
-        // A prompt's end is admitted without asking the cache where this path
-        // branches from the tree. The cache answers with the earliest stop, and
-        // every rendered prompt shares at least its template's opening with one
-        // before it, so the branch lay behind every prompt's end but the first
-        // one a process read - and a stack that stops chunks only at their
-        // width then admitted no prompt end but an exact repeat's. A stride
-        // position still has to be the cache's own stop.
+        // A prompt's end and a shared boundary are admitted without asking the
+        // cache where this path branches: the cache answers with the earliest
+        // stop, and every rendered prompt shares at least its template's opening
+        // with one before it, so the branch lay behind every prompt's end but the
+        // first one a process read. A stride position still has to be the
+        // cache's own stop. A session that read media is never checkpointed: its
+        // placeholder runs cannot tell two pictures apart.
         let admit = (earned || periodic)
             && staged
+            && !live.media
             && (earned
                 || resident.cache.next_admission(
                     live.pages.frontier(),
@@ -291,11 +322,21 @@ impl SparseStack {
                 backend.copy_d2h(view, &mut staging.logits)?;
             }
         }
+        let reason = match boundary {
+            Boundary::Shared => Reason::AgentSystem,
+            _ if live.resumed_at == 0 => Reason::Cold,
+            _ => Reason::Continued,
+        };
         let mut opts = CommitOpts::span(&[]);
         if admit {
             opts = opts.checkpoint(staging.ckpt.as_slice(), earned);
             if frontier_row.is_some() {
                 opts = opts.logits_row(staging.logits.as_slice());
+            }
+            if earned {
+                // Written behind: this queues the checkpoint and pins the pages
+                // the disk does not have yet, and the pump copies them later.
+                opts = opts.persist(reason);
             }
         }
         // Split borrows rather than a copy of the path: this runs once per
@@ -309,93 +350,92 @@ impl SparseStack {
             .map_err(cache_failure)
     }
 
-    /// Stores the session's prefix at its frontier. See
-    /// [`crate::ckpt::Checkpointed::kv_save`].
+    /// Stores the checkpoint at the session's frontier, taking one first when
+    /// the frontier has none. See [`crate::ckpt::Checkpointed::kv_save`].
+    ///
+    /// The end of a turn is the case that takes one: the frontier moved one
+    /// decoded token at a time and none of those steps took a snapshot. The
+    /// last sampled token has not been run, so the checkpoint is at the last
+    /// position the session *wrote* - the next turn's prompt supplies that token
+    /// again - and a speculating session is only snapshotted when its staged
+    /// draft row belongs to that position.
     ///
     /// # Errors
     ///
-    /// [`CoreError::UnknownSession`], and [`CoreError::Backend`] when the store
-    /// fails for a reason that is not a refusal.
-    pub fn ckpt_save(
-        &mut self,
-        session: SessionId,
-        tokens: &[TokenId],
-        prompt_text: &[u8],
-        reason: Reason,
-    ) -> CoreResult<SaveOutcome> {
-        let Some(ckpt) = self.ckpt else {
+    /// [`CoreError::UnknownSession`], and whatever the device or the cache report.
+    pub fn ckpt_save(&mut self, session: SessionId, reason: Reason) -> CoreResult<SaveOutcome> {
+        let Some(Checkpoint { options }) = self.ckpt else {
             return Ok(SaveOutcome::Disabled);
         };
-        let live = self
-            .sessions
-            .get(&session)
+        let now = self.now();
+        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec);
+        let Self {
+            backend,
+            resident,
+            sessions,
+            staging,
+            ..
+        } = self;
+        let resident = resident.as_ref().ok_or(CoreError::Unsupported {
+            what: "a stack whose device state teardown already released",
+            backend: "engine",
+        })?;
+        let live = sessions
+            .get_mut(&session)
             .ok_or(CoreError::UnknownSession(session))?;
-        let written = live.written();
-        let offered = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-        // The frontier gate, and it compares the path rather than only its
-        // length: a caller holding the right number of the wrong tokens would
-        // otherwise file one conversation's state under another's key.
-        if offered != written || tokens != live.history() {
-            return Ok(SaveOutcome::NotAtFrontier {
-                tokens: offered,
-                written,
-            });
+        if live.media {
+            return Ok(SaveOutcome::CarriesMedia);
         }
-        if offered < ckpt.options.min_tokens {
-            return Ok(SaveOutcome::BelowMinTokens {
-                tokens: offered,
-                min: ckpt.options.min_tokens,
-            });
+        let q = live.written();
+        // The floor is checked before the snapshot: below it the store would
+        // refuse the entry, and the snapshot is the expensive half.
+        let min = options.min_tokens;
+        if q < min {
+            return Ok(SaveOutcome::Refused(PersistRefusal::BelowMinTokens {
+                tokens: q,
+                min,
+            }));
         }
-        if prompt_text.is_empty() {
-            return Ok(SaveOutcome::EmptyText);
+        let standing = resident
+            .cache
+            .frontier_ckpt(live.pages.frontier())
+            .is_some_and(|ckpt| ckpt.pos == q);
+        if !standing {
+            if live.spec_depth().is_speculative() && !live.staged_row_current() {
+                return Ok(SaveOutcome::NoDraftRow);
+            }
+            snapshot(backend.as_ref(), live, blob_bytes, &mut staging.ckpt)?;
+            let (frontier, history) = live.commit_parts();
+            resident
+                .cache
+                .commit(
+                    frontier,
+                    history,
+                    q,
+                    CommitOpts::span(&[]).checkpoint(staging.ckpt.as_slice(), true),
+                    now,
+                )
+                .map_err(cache_failure)?;
         }
-        let node = live.pages.frontier().node();
-        let cache = &self.resident()?.cache;
-        let outcome = cache
-            .spill(node, prompt_text, reason)
+        let outcome = resident
+            .cache
+            .persist(live.pages.frontier(), reason)
             .map_err(cache_failure)?;
-        match outcome {
-            SpillOutcome::Written { id, bytes } => {
-                tracing::debug!(entry = %id, bytes, tokens = offered, ?reason, "checkpoint written");
-                Ok(SaveOutcome::Written(id))
-            }
-            SpillOutcome::AlreadyStored { id } => Ok(SaveOutcome::AlreadyStored(id)),
-            SpillOutcome::Refused {
-                reason: SpillRefusal::StaleLogits,
-            } => Ok(SaveOutcome::NoFrontierLogits),
-            SpillOutcome::Refused { reason } => Ok(SaveOutcome::StoreRefused(reason)),
-            // The store's answer set is open, and an answer this build cannot
-            // name is not a refusal it may quietly report as one.
-            other => {
-                tracing::error!(
-                    ?other,
-                    "the store answered in terms this build has no name for"
-                );
-                Err(CoreError::Unsupported {
-                    what: "a spill outcome this build cannot report",
-                    backend: "engine",
-                })
-            }
-        }
+        let outcome = SaveOutcome::from_persist(outcome);
+        tracing::debug!(%session, tokens = q, ?reason, ?outcome, "a session's frontier was offered to disk");
+        Ok(outcome)
     }
 
     /// Stores every open session. See
     /// [`crate::ckpt::Checkpointed::kv_shutdown_sweep`].
-    pub fn ckpt_shutdown_sweep(
-        &mut self,
-        text_of: &mut dyn FnMut(SessionId) -> Option<(Vec<TokenId>, Vec<u8>)>,
-    ) -> usize {
+    pub fn ckpt_shutdown_sweep(&mut self) -> usize {
         if self.ckpt.is_none() {
             return 0;
         }
-        let mut written = 0;
+        let mut stored = 0;
         for session in self.order.clone() {
-            let Some((tokens, text)) = text_of(session) else {
-                continue;
-            };
-            match self.ckpt_save(session, &tokens, &text, Reason::Shutdown) {
-                Ok(outcome) if outcome.stored().is_some() => written += 1,
+            match self.ckpt_save(session, Reason::Shutdown) {
+                Ok(outcome) if outcome.stored().is_some() => stored += 1,
                 Ok(outcome) => {
                     tracing::debug!(%session, ?outcome, "session not stored on the way down");
                 }
@@ -407,11 +447,49 @@ impl SparseStack {
                 }
             }
         }
-        tracing::info!(written, "sparse shutdown sweep complete");
-        written
+        tracing::info!(stored, "sparse shutdown sweep complete");
+        stored
     }
 
-    /// Stands `session` on the longest stored prefix of `prompt_text`. See
+    /// Records the message boundaries of the prompt `session` is about to read.
+    /// See [`crate::ckpt::Checkpointed::kv_set_hints`].
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`].
+    pub fn ckpt_set_hints(&mut self, session: SessionId, hints: &[u32]) -> CoreResult<()> {
+        let live = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        live.hints.clear();
+        live.hints.extend_from_slice(hints);
+        live.hints.sort_unstable();
+        live.hints.dedup();
+        Ok(())
+    }
+
+    /// Copies up to `max_bytes` of queued checkpoint pages off the device.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the device reports for a copy.
+    pub fn ckpt_pump(&self, max_bytes: u64) -> CoreResult<PumpReport> {
+        match self.resident.as_ref() {
+            Some(resident) => resident.cache.pump(max_bytes).map_err(cache_failure),
+            None => Ok(PumpReport::default()),
+        }
+    }
+
+    /// Copies everything queued and waits up to `timeout` for it to land.
+    #[must_use]
+    pub fn ckpt_drain(&self, timeout: Duration) -> bool {
+        self.resident
+            .as_ref()
+            .is_none_or(|resident| resident.cache.drain(timeout))
+    }
+
+    /// Stands `session` on the deepest usable checkpoint of `prompt`. See
     /// [`crate::ckpt::Checkpointed::kv_resume`].
     ///
     /// `Ok(None)` is a cold start and not a refusal: no directory is open, or
@@ -425,11 +503,11 @@ impl SparseStack {
     pub fn ckpt_resume(
         &mut self,
         session: SessionId,
-        prompt_text: &[u8],
+        prompt: &[TokenId],
     ) -> CoreResult<Option<ResumeInfo<'_>>> {
-        let Some(ckpt) = self.ckpt else {
+        if self.ckpt.is_none() {
             return Ok(None);
-        };
+        }
         if !self.sessions.contains_key(&session) {
             return Err(CoreError::UnknownSession(session));
         }
@@ -437,55 +515,31 @@ impl SparseStack {
         let capacity = self.opts.engine.ctx;
         let vocab = self.shape.vocab;
         let cache = Arc::clone(&self.resident()?.cache);
-
-        let scan = scan_prefixes(&cache.spill_entries(), prompt_text, ckpt.gate(capacity));
-        for id in scan.foreign() {
-            match cache.forget_spill(id) {
-                Ok(_) => tracing::info!(entry = %id, "discarded an entry written by another model"),
-                Err(error) => {
-                    tracing::warn!(entry = %id, %error, "could not discard a foreign entry");
-                }
-            }
-        }
-        let Some(best) = scan.best() else {
+        let Some(resume) = cache.resume(prompt, now).map_err(cache_failure)? else {
             return Ok(None);
         };
-        let Some(restored) = cache.restore(best.id(), now).map_err(cache_failure)? else {
+        let Some(reference) = resume.ckpt else {
             return Ok(None);
         };
-        let Some(reference) = restored.ckpt else {
-            // The pages came back but no slot could hold the state. A transient
-            // shortage rather than a bad file, so the entry stays and the request
-            // prefills.
-            tracing::debug!(entry = %best.id(), "no checkpoint slot for a restored prefix");
-            return Ok(None);
-        };
-        let Some(row) = restored.logits else {
-            // A payload with no frontier row cannot be resumed from without
-            // re-running a step, which is the one thing this tier promises not to
-            // do. Nothing this build writes is like that, so the file is one it
-            // can never use.
-            tracing::warn!(entry = %best.id(), "a stored prefix carries no frontier row; discarding");
-            let _discarded = cache.forget_spill(best.id());
-            return Ok(None);
-        };
+        let reused = resume.ckpt_pos.min(capacity);
+        let whole = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
         let want_row = u64::from(vocab).saturating_mul(F32_BYTES);
-        if u64::try_from(row.len()).unwrap_or(u64::MAX) != want_row {
-            return Err(CoreError::ShapeMismatch {
-                field: "restored logits row",
-                expected: want_row,
-                got: u64::try_from(row.len()).unwrap_or(u64::MAX),
-            });
-        }
-
+        let row = if reused == whole {
+            let mut row = vec![0u8; usize::try_from(want_row).unwrap_or(usize::MAX)];
+            cache
+                .ckpt_logits_into(reference, &mut row)
+                .map_err(cache_failure)?;
+            Some(row)
+        } else {
+            None
+        };
         let mut blob =
             vec![0u8; usize::try_from(cache.geometry().ckpt_bytes).unwrap_or(usize::MAX)];
         cache
             .ckpt_state_into(reference, &mut blob)
             .map_err(cache_failure)?;
-        let tokens = restored.tokens;
-        let reused = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-
+        let tokens = prompt[..usize::try_from(reused).unwrap_or(prompt.len())].to_vec();
+        let source = source_of(resume.source);
         {
             // Split borrows: the frontier and the per-session state belong to the
             // session, and the bytes move through the backend.
@@ -495,39 +549,42 @@ impl SparseStack {
             let live = sessions
                 .get_mut(&session)
                 .ok_or(CoreError::UnknownSession(session))?;
-            live.pages.adopt(restored.frontier)?;
+            live.pages.adopt(resume.frontier)?;
             live.history.clear();
             live.history.extend_from_slice(&tokens);
-            live.written = reused.min(capacity);
+            live.written = reused;
+            live.resumed_at = reused;
             restore_state(backend.as_ref(), live, &blob)?;
+            if let Some(spec) = live.spec.as_mut() {
+                spec.staged_for = reused;
+            }
         }
         // The frontier row goes exactly where a freshly computed one would be, so
         // a caller cannot tell a resumed row from a prefilled one.
-        {
-            let logits = self
-                .resident()?
-                .scratch
-                .view(Buf::Logits)?
-                .slice(0, want_row)?;
-            self.backend.copy_h2d(logits, &row)?;
-        }
+        let logits = match row {
+            Some(row) => {
+                let view = self
+                    .resident()?
+                    .scratch
+                    .view(Buf::Logits)?
+                    .slice(0, want_row)?;
+                self.backend.copy_h2d(view, &row)?;
+                let view = self
+                    .resident()?
+                    .scratch
+                    .view(Buf::Logits)?
+                    .slice(0, want_row)?;
+                Some(Logits::new(view, 1, vocab)?)
+            }
+            None => None,
+        };
         tracing::info!(
-            entry = %best.id(),
             tokens = reused,
-            text_bytes = best.text_bytes(),
+            ?source,
+            whole,
             "resumed a stored sparse prefix"
         );
-        let logits = self
-            .resident()?
-            .scratch
-            .view(Buf::Logits)?
-            .slice(0, want_row)?;
-        Ok(Some(ResumeInfo::new(
-            reused,
-            best.text_bytes(),
-            tokens,
-            Logits::new(logits, 1, vocab)?,
-        )))
+        Ok(Some(ResumeInfo::new(reused, tokens, logits, source)))
     }
 }
 

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "shiso: the KV cache - radix span tree, paged KV, GDN checkpoints, Marconi eviction, disk spill."
+description = "shiso: the KV cache - radix span tree, paged KV, GDN checkpoints, Marconi eviction, disk tier."
 
 [dependencies]
 # `shiso-core` is here for exactly one type: `TokenId`, the workspace-wide token
@@ -16,12 +16,11 @@ shiso-core = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
-# Spill file names are sha1-hex of the rendered byte prefix they cache.
+# Disk-tier file names are sha1 digests of the token prefix and build they hold.
 sha1 = { workspace = true }
-hex = { workspace = true }
-# The 48-byte spill header and the payload header are `#[repr(C)]` records read
-# through bytemuck casts rather than offset constants (rule 14).
-bytemuck = { workspace = true }
+# A restore reads a few hundred page files with several reads in flight, through
+# the ring reader this crate already owns (and its blocking fallback off Linux).
+shiso-ple = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -41,8 +41,9 @@ use shiso_core::{
     Backend, CoreError, CoreResult, DecodeStep, DeviceBuffer, DeviceView, KernelRef, LaunchArgs,
     Logits, Model, ModelInfo, RawBuffer, SessionId, StopTokens, TokenId, alloc,
 };
+use shiso_engine::PersistRefusal;
 use shiso_engine::Reason;
-use shiso_engine::ckpt::{Checkpointed, CkptConfig, ResumeInfo, SaveOutcome};
+use shiso_engine::ckpt::{Checkpointed, CkptConfig, ResumeInfo, ResumeSource, SaveOutcome};
 use shiso_server::scheduler::{
     EngineFailure, EngineHandle, SchedulerConfig, spawn_engine, spawn_engine_configured,
     spawn_engine_with_checkpoints,
@@ -57,7 +58,7 @@ const VOCAB: u32 = 64;
 /// Not exported: a scripted model runs out of script and ends its turn by
 /// itself, so no test has to name this, and one that did would be asserting on
 /// the fake rather than on the server.
-const EOS: u32 = 63;
+pub(crate) const EOS: u32 = 63;
 
 /// Tokens one fake session may hold.
 pub(crate) const CAPACITY: u32 = 256;
@@ -203,7 +204,7 @@ pub(crate) enum Call {
 /// One offer to the checkpoint tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SaveNote {
-    /// How long the offered path was.
+    /// Positions the session had run when it was offered.
     pub(crate) tokens: usize,
     /// Why the coordinator said it was storing it.
     pub(crate) reason: Reason,
@@ -224,10 +225,12 @@ pub(crate) struct Audit {
     pub(crate) live: Mutex<Vec<SessionId>>,
     /// Every call, in order.
     pub(crate) calls: Mutex<Vec<Call>>,
-    /// Prefixes the coordinator offered to the checkpoint tier.
+    /// Frontiers the coordinator offered to the checkpoint tier.
     pub(crate) saves: Mutex<Vec<SaveNote>>,
-    /// Prefix scans the coordinator asked for.
-    pub(crate) resumes: Mutex<Vec<String>>,
+    /// Resumes the coordinator asked for, by prompt length.
+    pub(crate) resumes: Mutex<Vec<usize>>,
+    /// Message boundaries the coordinator handed over, per session, in order.
+    pub(crate) hints: Mutex<Vec<Vec<u32>>>,
     /// Shutdown sweeps.
     pub(crate) sweeps: AtomicU64,
 }
@@ -479,17 +482,17 @@ impl Model for FakeModel {
 
 /// The same model with a checkpoint tier that records what it was asked.
 ///
-/// Its resume always answers "cold", and not because that is uninteresting: a
-/// hit would have to hand back a [`ResumeInfo`], which is `#[non_exhaustive]`
-/// and has no constructor, so no crate outside the engine can build one. What
-/// this fake can still pin is every other half of the contract - that the scan
-/// is asked once per distinct prompt rather than once per sequence, that a cold
-/// prefix is offered at the prompt's own frontier, that a finished turn is
-/// offered again, and that the sweep runs on the way down.
+/// It resumes whatever `hit` says it should - nothing by default - and counts
+/// the positions each session has run, which is what a save stores: the
+/// session's own history, never a path the caller hands over.
 #[derive(Debug)]
 pub(crate) struct FakeCheckpointed {
     inner: FakeModel,
     enabled: bool,
+    /// Positions each open session has run.
+    written: HashMap<SessionId, usize>,
+    /// How many prompt tokens a resume reports reusing, when it reports a hit.
+    hit: Option<u32>,
 }
 
 impl FakeCheckpointed {
@@ -500,6 +503,8 @@ impl FakeCheckpointed {
             Self {
                 inner,
                 enabled: true,
+                written: HashMap::new(),
+                hit: None,
             },
             audit,
         )
@@ -510,6 +515,13 @@ impl FakeCheckpointed {
         self.inner = self.inner.with_gate(gate);
         self
     }
+
+    /// The same model, reporting a resume of `tokens` prompt tokens to every
+    /// prompt at least that long.
+    pub(crate) const fn with_hit(mut self, tokens: u32) -> Self {
+        self.hit = Some(tokens);
+        self
+    }
 }
 
 impl Model for FakeCheckpointed {
@@ -518,22 +530,31 @@ impl Model for FakeCheckpointed {
     }
 
     fn open_session(&mut self) -> CoreResult<SessionId> {
-        self.inner.open_session()
+        let session = self.inner.open_session()?;
+        self.written.insert(session, 0);
+        Ok(session)
     }
 
     fn close_session(&mut self, session: SessionId) -> CoreResult<()> {
+        self.written.remove(&session);
         self.inner.close_session(session)
     }
 
     fn prefill_chunk(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<()> {
-        self.inner.prefill_chunk(session, tokens)
+        self.inner.prefill_chunk(session, tokens)?;
+        *self.written.entry(session).or_insert(0) += tokens.len();
+        Ok(())
     }
 
     fn prefill_last(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<Logits<'_>> {
+        *self.written.entry(session).or_insert(0) += tokens.len();
         self.inner.prefill_last(session, tokens)
     }
 
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
+        for step in steps {
+            *self.written.entry(step.session).or_insert(0) += 1;
+        }
         self.inner.decode_batch(steps)
     }
 
@@ -554,41 +575,54 @@ impl Checkpointed for FakeCheckpointed {
 
     fn kv_resume(
         &mut self,
-        _session: SessionId,
-        prompt_text: &[u8],
+        session: SessionId,
+        prompt: &[TokenId],
     ) -> CoreResult<Option<ResumeInfo<'_>>> {
-        self.inner
-            .audit
-            .resumes
-            .lock()
-            .push(String::from_utf8_lossy(prompt_text).into_owned());
-        Ok(None)
+        self.inner.audit.resumes.lock().push(prompt.len());
+        let Some(hit) = self
+            .hit
+            .filter(|hit| usize::try_from(*hit).is_ok_and(|n| n <= prompt.len()))
+        else {
+            return Ok(None);
+        };
+        let reused = usize::try_from(hit).unwrap_or(prompt.len());
+        self.written.insert(session, reused);
+        // A resume of the whole prompt stands on the row its next token is
+        // drawn from; the fake writes one, as the real tier restores one.
+        let logits = if reused == prompt.len() {
+            self.inner.write_row(session, 0)?;
+            Some(self.inner.block(1)?)
+        } else {
+            None
+        };
+        Ok(Some(ResumeInfo::new(
+            hit,
+            prompt[..reused].to_vec(),
+            logits,
+            ResumeSource::Memory,
+        )))
     }
 
-    fn kv_save(
-        &mut self,
-        session: SessionId,
-        tokens: &[TokenId],
-        _prompt_text: &[u8],
-        reason: Reason,
-    ) -> CoreResult<SaveOutcome> {
+    fn kv_save(&mut self, session: SessionId, reason: Reason) -> CoreResult<SaveOutcome> {
         if !self.inner.open.contains(&session) {
             return Err(CoreError::UnknownSession(session));
         }
         self.inner.audit.saves.lock().push(SaveNote {
-            tokens: tokens.len(),
+            tokens: self.written.get(&session).copied().unwrap_or(0),
             reason,
         });
-        // Refused rather than written, because a fake that claimed to have
-        // written a file would let a test assert on a store this harness does
+        // Refused rather than stored, because a fake that claimed to have
+        // stored a file would let a test assert on a store this harness does
         // not have. What is being pinned is the offer and its reason.
-        Ok(SaveOutcome::EmptyText)
+        Ok(SaveOutcome::Refused(PersistRefusal::NoCheckpoint))
     }
 
-    fn kv_shutdown_sweep(
-        &mut self,
-        _text_of: &mut dyn FnMut(SessionId) -> Option<(Vec<TokenId>, Vec<u8>)>,
-    ) -> usize {
+    fn kv_set_hints(&mut self, _session: SessionId, hints: &[u32]) -> CoreResult<()> {
+        self.inner.audit.hints.lock().push(hints.to_vec());
+        Ok(())
+    }
+
+    fn kv_shutdown_sweep(&mut self) -> usize {
         self.inner.audit.sweeps.fetch_add(1, Ordering::Relaxed);
         0
     }
@@ -652,10 +686,29 @@ pub(crate) fn checkpointed_engine(
     std::thread::JoinHandle<Result<(), EngineFailure>>,
     Arc<Audit>,
 ) {
+    checkpointed_engine_hitting(script, cfg, gate, None)
+}
+
+/// As [`checkpointed_engine`], with the tier reporting a resume of `hit`
+/// prompt tokens to every prompt at least that long.
+pub(crate) fn checkpointed_engine_hitting(
+    script: Vec<u32>,
+    cfg: SchedulerConfig,
+    gate: Option<Arc<Gate>>,
+    hit: Option<u32>,
+) -> (
+    EngineHandle,
+    std::thread::JoinHandle<Result<(), EngineFailure>>,
+    Arc<Audit>,
+) {
     let backend: Arc<dyn Backend> = FakeBackend::new();
     let (model, audit) = FakeCheckpointed::new(&backend, script);
     let model = match gate {
         Some(gate) => model.with_gate(gate),
+        None => model,
+    };
+    let model = match hit {
+        Some(tokens) => model.with_hit(tokens),
         None => model,
     };
     let (engine, join) = spawn_engine_with_checkpoints(

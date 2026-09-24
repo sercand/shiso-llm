@@ -14,8 +14,9 @@ no Python runtime.
   state alongside the paged KV cache, so a shared prefix is served from cache
   instead of being prefilled again.
 - **Prefix caching that survives restarts.** A radix-tree KV cache with
-  cost-aware eviction, plus an optional disk tier (`--kvstore-dir`). A prompt
-  seen by an earlier process skips prefill.
+  cost-aware eviction, plus an optional disk tier (`--kvstore-dir`) that stores
+  content-addressed pages and checkpoints behind the request path. A prompt or
+  a conversation seen by an earlier process skips prefill.
 - **Efficient serving.** Continuous batching, chunked prefill that never stalls
   a stream already decoding, decode-graph replay, and speculative decoding
   with MTP draft heads.
@@ -113,6 +114,8 @@ environment variable. The ones you are most likely to want:
 | `--model-name` | The name clients use in the `model` field |
 | `--auth-tokens` | Comma-separated bearer tokens required on inference routes |
 | `--kvstore-dir` | Persist the prefix cache to disk |
+| `--kvstore-budget-mb` | Disk budget for that tier (default: twice the KV cache's bytes) |
+| `--kvstore-min-tokens` | Shortest prefix the disk tier stores or reads (default 512) |
 | `--spec-k` | Speculative decoding depth (0 = off) |
 | `--vision` | Vision tower weights; enables image input |
 | `--vision-allow-remote-images` | Allow fetching images from `http(s)` URLs |

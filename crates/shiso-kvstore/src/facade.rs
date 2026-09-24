@@ -9,7 +9,7 @@
 //! | [`KvCache::lookup`] | give me a frontier I can generate from | no, it only claims pages |
 //! | [`KvCache::commit`] | the frontier I just prefilled is worth keeping | yes, by adding |
 //! | [`KvCache::evict_to`] | make room for `n` more pages | yes, by dropping leaves |
-//! | [`KvCache::spill`] / [`KvCache::restore`] | put a prefix on disk, take it back | yes, on restore |
+//! | [`KvCache::persist`] / [`KvCache::resume`] | put a checkpoint on disk, stand on the deepest one there or in the tree | yes, on a disk resume |
 //!
 //! # Two locks, and where this module takes them
 //!
@@ -31,6 +31,7 @@
 //! clock, because they outlive the process.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use shiso_core::TokenId;
 
@@ -39,11 +40,13 @@ use crate::ckpt::{Admission, CkptRef, CkptStore};
 use crate::error::KvError;
 use crate::evict::ckpt_utility;
 use crate::geom::CacheGeometry;
-use crate::ids::{NodeId, SlotId, SpillId, to_u32};
+use crate::ids::{NodeId, SlotId, to_u32};
 use crate::page_table::PageTable;
-use crate::path::{DecodedPath, PathHeader, PathMismatch, PathSections, decode_path, encode_path};
 use crate::pool::{InnerGuard, PagePool};
-use crate::spill::{Incoming, Reason, SpillConfig, SpillStore, SpillWrite};
+use crate::store::{
+    DiskConfig, DiskStats, DiskStore, EntryKey, Hit, PersistOutcome, PersistRefusal, PersistSpec,
+    Prefetcher, PumpReport, Reason,
+};
 use crate::tree::SpanTree;
 
 /// Where a resume would come from, which changes what the engine has to do.
@@ -60,6 +63,8 @@ pub enum ReuseSource {
     Checkpoint,
     /// A checkpoint the tree remembered from some other conversation.
     Tree,
+    /// A checkpoint read back from the disk tier.
+    Disk,
 }
 
 /// What a prompt would reuse, without taking anything.
@@ -77,7 +82,7 @@ pub struct Lookup {
     pub matched: u32,
     /// The checkpoint a resume would load, if there is one worth loading.
     pub ckpt: Option<CkptRef>,
-    /// The node that checkpoint belongs to, which is what [`KvCache::spill`] takes.
+    /// The node that checkpoint belongs to.
     pub ckpt_node: Option<NodeId>,
     /// The position the checkpoint's state is valid at.
     pub ckpt_pos: u32,
@@ -93,7 +98,9 @@ impl Lookup {
         match self.source {
             ReuseSource::Live => self.matched,
             ReuseSource::Cold => 0,
-            ReuseSource::Checkpoint | ReuseSource::Tree => self.ckpt_pos.min(self.matched),
+            ReuseSource::Checkpoint | ReuseSource::Tree | ReuseSource::Disk => {
+                self.ckpt_pos.min(self.matched)
+            }
         }
     }
 }
@@ -195,6 +202,10 @@ pub struct CommitOpts<'a> {
     pub state: Option<&'a [u8]>,
     /// The vocab-sized logits row, committed only at a refresh boundary.
     pub logits: Option<&'a [u8]>,
+    /// Queue the checkpoint for the disk tier once it is admitted, filed under
+    /// this reason. Ignored for a speculative (chunk-end) checkpoint and on a
+    /// cache with no disk tier.
+    pub persist: Option<Reason>,
 }
 
 impl<'a> CommitOpts<'a> {
@@ -211,6 +222,7 @@ impl<'a> CommitOpts<'a> {
             hints,
             state: None,
             logits: None,
+            persist: None,
         }
     }
 
@@ -236,6 +248,18 @@ impl<'a> CommitOpts<'a> {
     pub const fn logits_row(mut self, logits: &'a [u8]) -> Self {
         self.logits = Some(logits);
         self.with_logits = true;
+        self
+    }
+
+    /// The same commit, asking for the admitted checkpoint to be written to
+    /// the disk tier under `reason`.
+    ///
+    /// The write is behind: this queues it, and the pump and the writer thread
+    /// do the copying and the file work later. A commit is never slower for it
+    /// than by a reference count and a page pin per page not yet on disk.
+    #[must_use]
+    pub const fn persist(mut self, reason: Reason) -> Self {
+        self.persist = Some(reason);
         self
     }
 }
@@ -270,88 +294,14 @@ pub struct CacheStats {
     pub page_evictions: u64,
     /// Checkpoints evicted, whether for room or for pages.
     pub ckpt_evictions: u64,
-    /// The disk tier's own numbers, when a spill directory was opened.
-    pub spill: Option<crate::spill::SpillStats>,
-}
-
-/// Why a spill did not happen, or what it produced.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum SpillOutcome {
-    /// The prefix was written; the id is the sha1 of the bytes it caches.
-    Written {
-        /// The key the payload is stored under.
-        id: SpillId,
-        /// Bytes written, header included.
-        bytes: u64,
-    },
-    /// The same prefix was already on disk, so nothing was written.
-    AlreadyStored {
-        /// The existing entry.
-        id: SpillId,
-    },
-    /// Nothing was written, and why.
-    Refused {
-        /// The reason, in the engine's words.
-        reason: SpillRefusal,
-    },
-}
-
-/// Why `spill` declined. Split out because the engine's answer differs by case: a
-/// cold prefix is a decision to revisit later, while a missing logits row is a caller
-/// bug it should not retry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SpillRefusal {
-    /// The node has no checkpoint, so a resume from it would have to prefill the whole
-    /// prefix anyway.
-    NoCheckpoint,
-    /// The checkpoint's logits row is missing, so a resume at the end of the prefix
-    /// would not be sample-identical.
-    StaleLogits,
-    /// The node's span is not on the tree any more.
-    NodeGone,
-    /// The cache was opened without a spill directory, or without the byte
-    /// description a payload needs.
-    NotConfigured,
-    /// The payload would not fit the directory budget even after evicting.
-    OverBudget {
-        /// Bytes the write needs.
-        required: u64,
-        /// Bytes the directory may hold.
-        budget: u64,
-    },
-    /// The checkpoint blob and the byte description disagree about how large a state
-    /// section is, so the payload would not read back. A configuration error, and the
-    /// one refusal the engine cannot fix at runtime.
-    LayoutMismatch {
-        /// Bytes the description says the state section is.
-        want: u64,
-        /// Bytes the checkpoint blob is.
-        got: u64,
-    },
-}
-
-/// A prefix read back from the disk tier, ready to generate from.
-///
-/// The state and the page bytes are already where a frontier keeps them -- in a
-/// checkpoint slot and in pool pages -- so the caller generates from
-/// [`Restored::frontier`] and never handles the bytes. That is the whole point of
-/// returning a frontier rather than a bag of buffers: a caller that had to adopt the
-/// pages itself could forget to, and the payload's pages would never come back.
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct Restored {
-    /// The prefix's pages and the span it ends at.
-    pub frontier: Frontier,
-    /// The token prefix the payload covers.
-    pub tokens: Vec<TokenId>,
-    /// The logits row that came with the state, so a re-send of the same prompt can
-    /// answer without recomputing one.
-    pub logits: Option<Vec<u8>>,
-    /// The checkpoint the state was installed in, so the caller can read the blob back
-    /// with [`KvCache::ckpt_state_into`] if it wants it in its own buffer.
-    pub ckpt: Option<CkptRef>,
+    /// Resumes served from a checkpoint the tree held.
+    pub resumes_tree: u64,
+    /// Resumes served from the disk tier.
+    pub resumes_disk: u64,
+    /// The prefill rate the resume cost model assumes, seconds per token.
+    pub prefill_s_per_token: f64,
+    /// The disk tier's own numbers, when one was opened.
+    pub disk: Option<DiskStats>,
 }
 
 /// The KV cache.
@@ -365,15 +315,15 @@ pub struct KvCache {
     /// Shared with every page table this cache hands out. Held here too so a stats
     /// read does not need the cache lock to ask how full the pool is.
     pool: Arc<PagePool>,
-    /// Crate-visible so the modules that are the cache's other halves -- the disk
-    /// index in [`crate::entries`] -- can take the same lock in the same order
-    /// rather than reaching the tree through a second one.
-    pub(crate) inner: parking_lot::Mutex<Inner>,
+    /// The disk tier's request-thread door, kept outside the cache lock so a
+    /// prefetch never waits on a step.
+    prefetcher: Option<Prefetcher>,
+    inner: parking_lot::Mutex<Inner>,
 }
 
 /// Everything the cache lock covers.
 #[derive(Debug)]
-pub(crate) struct Inner {
+struct Inner {
     geometry: CacheGeometry,
     /// The same `Arc` the tree and every page table handed out holds.
     pool: Arc<PagePool>,
@@ -383,8 +333,20 @@ pub(crate) struct Inner {
     /// copy-on-write must not interleave with the span changes that decided which page
     /// to copy.
     backing: Box<dyn Backing>,
-    pub(crate) spill: Option<SpillStore>,
+    disk: Option<DiskStore>,
+    /// Prefill seconds per token, as measured by the engine when it says so and
+    /// as the geometry estimated before that: what a resume from disk is priced
+    /// against.
+    prefill_s_per_token: f64,
+    resumes_tree: u64,
+    resumes_disk: u64,
 }
+
+/// How much of a new prefill-rate sample the running estimate takes.
+const PREFILL_EWMA_WEIGHT: f64 = 0.3;
+
+/// How long a drain waits for the writer to free staging before copying more.
+const DRAIN_WAIT: Duration = Duration::from_millis(5);
 
 impl KvCache {
     /// Builds a cache with `pool_pages` pages of key/value storage and room for
@@ -396,29 +358,38 @@ impl KvCache {
     /// sequence claims one, and a slot's blob appears when it is first filled -- so an
     /// over-generous pool costs a `Vec` of counters, not the bytes.
     ///
-    /// `spill` opens the disk tier. Without it the cache is purely in-memory and
-    /// [`Self::spill`] answers [`SpillRefusal::NotConfigured`].
+    /// `disk` opens the disk tier, which needs the geometry's layout: every key
+    /// it writes names the build that computed the bytes. Without it the cache
+    /// is purely in-memory and [`Self::persist`] answers
+    /// [`PersistRefusal::NotConfigured`].
     ///
     /// # Errors
     ///
-    /// [`KvError::BadGeometry`] if the geometry cannot be built from, and
-    /// [`KvError::Io`] if the spill directory cannot be created. A directory full of
-    /// files this build cannot read is not an error: those are simply not entries.
+    /// [`KvError::BadGeometry`] if the geometry cannot be built from, or a disk
+    /// tier is asked for without a layout, and [`KvError::Io`] if the disk
+    /// directory cannot be created.
     pub fn open(
         geometry: &CacheGeometry,
         backing: Box<dyn Backing>,
         pool_pages: u32,
         ckpt_slots: u32,
-        spill: Option<SpillConfig>,
+        disk: Option<DiskConfig>,
     ) -> Result<Self, KvError> {
         geometry.validate()?;
         let pool = Arc::new(PagePool::new(pool_pages));
         let tree = SpanTree::new(*geometry, Arc::clone(&pool));
         let ckpt = CkptStore::new(*geometry, ckpt_slots);
-        let spill = match spill {
-            Some(config) => Some(SpillStore::open(&config)?),
+        let disk = match disk {
+            Some(config) => {
+                let layout = geometry.layout.ok_or(KvError::bad_geometry(
+                    "layout",
+                    "is required by a disk tier, whose keys name the build",
+                ))?;
+                Some(DiskStore::open(&config, geometry, &layout)?)
+            }
             None => None,
         };
+        let prefetcher = disk.as_ref().map(DiskStore::prefetcher);
         Ok(Self {
             inner: parking_lot::Mutex::new(Inner {
                 geometry: *geometry,
@@ -426,10 +397,14 @@ impl KvCache {
                 tree,
                 ckpt,
                 backing,
-                spill,
+                disk,
+                prefill_s_per_token: geometry.prefill_s_per_token,
+                resumes_tree: 0,
+                resumes_disk: 0,
             }),
             geometry: *geometry,
             pool,
+            prefetcher,
         })
     }
 
@@ -522,58 +497,7 @@ impl KvCache {
     ) -> Result<Option<Resume>, KvError> {
         let _held = InnerGuard::new();
         let mut inner = self.inner.lock();
-        let plan = inner.plan_with(standing, tokens, clamp, now);
-        let (Some(ckpt), Some(target)) = (plan.ckpt, plan.ckpt_node) else {
-            return Ok(None);
-        };
-        let cpos = ckpt.pos;
-
-        // Pin the path being moved onto *before* anything that can evict. The copy
-        // below may need a page, and a page shortage runs the victim scan; if the
-        // target were still an unpinned childless leaf at that moment, the scan could
-        // drop the very node and checkpoint being restored. Pinning afterwards is the
-        // bug, not the ordering.
-        let live = inner.tree.live_guard(target);
-        let pages = match inner.tree.page_array_from_path(target, cpos) {
-            Ok(pages) => pages,
-            Err(error) => {
-                drop(live);
-                return Err(error);
-            }
-        };
-        let mut table = PageTable::adopt(Arc::clone(&self.pool), self.geometry, pages);
-
-        // The page holding `cpos - 1` is shared and immutable, and the next prefill is
-        // about to rewrite its tail, so this sequence takes a private copy of that one
-        // page. A checkpoint on a page boundary -- every chunk boundary is one -- needs
-        // no copy at all, which is why resuming at a chunk boundary is free.
-        if !self.geometry.is_page_start(cpos) && !table.is_empty() {
-            let last = table.len() - 1;
-            let src = table.as_slice()[last];
-            if self.pool.n_free() == 0 {
-                inner.free_pages(1, now);
-            }
-            let Some(dst) = self.pool.take() else {
-                drop(live);
-                return Err(KvError::PoolEmpty);
-            };
-            if let Err(error) = inner.backing.copy_page(dst, src) {
-                self.pool.unref(dst);
-                drop(live);
-                return Err(error);
-            }
-            table.replace(last, dst);
-        }
-
-        inner.tree.touch(target, now);
-        inner.ckpt.touch(ckpt.slot, now);
-        Ok(Some(Resume {
-            frontier: Frontier { live, table },
-            ckpt: Some(ckpt),
-            ckpt_pos: cpos,
-            matched: plan.matched,
-            source: plan.source,
-        }))
+        inner.lookup_with(standing, tokens, clamp, now)
     }
 
     /// Hand the tree the span the caller has just produced, and the checkpoint at its
@@ -713,16 +637,92 @@ impl KvCache {
             ckpt_capacity: inner.ckpt.capacity(),
             page_evictions: inner.tree.page_evictions(),
             ckpt_evictions: inner.ckpt.evictions(),
-            spill: inner.spill.as_ref().map(SpillStore::stats),
+            resumes_tree: inner.resumes_tree,
+            resumes_disk: inner.resumes_disk,
+            prefill_s_per_token: inner.prefill_s_per_token,
+            disk: inner.disk.as_ref().map(DiskStore::stats),
         }
     }
 
-    /// Every entry the disk tier holds, newest first by the store's own order.
+    /// The disk tier's numbers alone, when one is open.
     #[must_use]
-    pub fn spill_stats(&self) -> Option<crate::spill::SpillStats> {
+    pub fn disk_stats(&self) -> Option<DiskStats> {
         let _held = InnerGuard::new();
         let inner = self.inner.lock();
-        inner.spill.as_ref().map(SpillStore::stats)
+        inner.disk.as_ref().map(DiskStore::stats)
+    }
+
+    /// The request-thread door to the disk tier: warms the page cache for a
+    /// request that is still queued. `None` without a disk tier.
+    #[must_use]
+    pub fn prefetcher(&self) -> Option<Prefetcher> {
+        self.prefetcher.clone()
+    }
+}
+
+impl Inner {
+    /// The resume half of `lookup_with`, with the lock held. `Ok(None)` is
+    /// the public method's: nothing in the tree to resume from.
+    fn lookup_with(
+        &mut self,
+        standing: Option<&Frontier>,
+        tokens: &[TokenId],
+        clamp: Option<u32>,
+        now: f64,
+    ) -> Result<Option<Resume>, KvError> {
+        let plan = self.plan_with(standing, tokens, clamp, now);
+        let (Some(ckpt), Some(target)) = (plan.ckpt, plan.ckpt_node) else {
+            return Ok(None);
+        };
+        let cpos = ckpt.pos;
+
+        // Pin the path being moved onto *before* anything that can evict. The copy
+        // below may need a page, and a page shortage runs the victim scan; if the
+        // target were still an unpinned childless leaf at that moment, the scan could
+        // drop the very node and checkpoint being restored. Pinning afterwards is the
+        // bug, not the ordering.
+        let live = self.tree.live_guard(target);
+        let pages = match self.tree.page_array_from_path(target, cpos) {
+            Ok(pages) => pages,
+            Err(error) => {
+                drop(live);
+                return Err(error);
+            }
+        };
+        let geometry = self.geometry;
+        let mut table = PageTable::adopt(Arc::clone(&self.pool), geometry, pages);
+
+        // The page holding `cpos - 1` is shared and immutable, and the next prefill is
+        // about to rewrite its tail, so this sequence takes a private copy of that one
+        // page. A checkpoint on a page boundary -- every chunk boundary is one -- needs
+        // no copy at all, which is why resuming at a chunk boundary is free.
+        if !geometry.is_page_start(cpos) && !table.is_empty() {
+            let last = table.len() - 1;
+            let src = table.as_slice()[last];
+            if self.pool.n_free() == 0 {
+                self.free_pages(1, now);
+            }
+            let Some(dst) = self.pool.take() else {
+                drop(live);
+                return Err(KvError::PoolEmpty);
+            };
+            if let Err(error) = self.backing.copy_page(dst, src) {
+                self.pool.unref(dst);
+                drop(live);
+                return Err(error);
+            }
+            table.replace(last, dst);
+        }
+
+        self.tree.touch(target, now);
+        self.ckpt.touch(ckpt.slot, now);
+        Ok(Some(Resume {
+            frontier: Frontier { live, table },
+            ckpt: Some(ckpt),
+            ckpt_pos: cpos,
+            matched: plan.matched,
+            source: plan.source,
+        }))
     }
 }
 
@@ -855,7 +855,7 @@ impl Inner {
             .collect()
     }
 
-    /// The tokens from the root to `node`'s end, which is what a spill keys a path by.
+    /// The tokens from the root to `node`'s end, which is what the disk tier keys a path by.
     fn path_tokens(&self, node: NodeId) -> Vec<TokenId> {
         let mut out = Vec::new();
         for step in self.tree.path_to(node) {
@@ -943,7 +943,7 @@ impl Inner {
     /// caller still holds its own pages and its next plan will read the sequence as cold
     /// -- the same outcome as a cache that never held it, at the cost of one recomputation.
     ///
-    /// `entry` labels the log lines with the spilled entry the span came from, when it
+    /// `entry` labels the log lines with the stored entry the span came from, when it
     /// came from one; a commit's span has no entry to name.
     fn adopt_span(
         &mut self,
@@ -952,7 +952,7 @@ impl Inner {
         tokens: &[TokenId],
         q: u32,
         now: f64,
-        entry: Option<SpillId>,
+        entry: Option<EntryKey>,
     ) -> Option<NodeId> {
         // The span starts where `parent` ends, which is where a caller's frontier
         // stands: taking the position from the tree rather than from the caller is what
@@ -1008,7 +1008,11 @@ impl Inner {
         now: f64,
     ) -> Result<(), KvError> {
         let q = q.min(to_u32(tokens.len()));
-        if q == 0 || q <= self.tree.node(fr.node()).end {
+        // A position the frontier already stands on is still worth a call when
+        // it brings a checkpoint: that is how a finished turn is checkpointed at
+        // the last position its steps committed one token at a time.
+        let end = self.tree.node(fr.node()).end;
+        if q == 0 || q < end || (q == end && opts.state.is_none()) {
             return Ok(());
         }
         let want_blob = usize::try_from(self.geometry.ckpt_bytes).unwrap_or(usize::MAX);
@@ -1069,6 +1073,21 @@ impl Inner {
         match self.ckpt.fill(slot, cur, q, state, logits, now) {
             Ok(_) => {
                 self.tree.attach_ckpt(cur, slot);
+                if let Some(reason) = opts.persist
+                    && !opts.chunk_only
+                {
+                    match self.persist_node(cur, reason) {
+                        Ok(outcome) => tracing::debug!(
+                            ?outcome,
+                            q,
+                            ?reason,
+                            "checkpoint offered to the disk tier"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(%error, q, "a checkpoint could not be offered to the disk tier");
+                        }
+                    }
+                }
                 Ok(())
             }
             Err(error) => {
@@ -1109,6 +1128,7 @@ impl Inner {
             let Some(victim) = victim else {
                 break;
             };
+            self.before_drop(victim);
             if let Some(slot) = self.tree.ckpt_at(victim) {
                 self.ckpt.evict(slot);
                 self.tree.detach_ckpt(victim);
@@ -1123,6 +1143,18 @@ impl Inner {
                     tracing::debug!(node = ?victim, %error, "victim refused the drop");
                     break;
                 }
+            }
+        }
+        // Pages a queued write still pins are held by nothing else once their
+        // spans are gone, and no victim scan can reach them: copy them now,
+        // whatever the staging budget says, rather than fail the claim.
+        if self.pool.n_free() < want {
+            let Inner { disk, backing, .. } = self;
+            if let Some(disk) = disk.as_mut()
+                && !disk.jobs.is_empty()
+                && let Err(error) = disk.pump(backing.as_ref(), u64::MAX, None, true)
+            {
+                tracing::warn!(%error, "queued checkpoints could not be copied to free their pages");
             }
         }
         if report.nodes_dropped > 0 {
@@ -1154,275 +1186,438 @@ impl KvCache {
         }
     }
 
-    /// Write the path below `node` to the disk tier, keyed by `text`.
+    /// Queues the checkpoint the frontier stands on for the disk tier.
     ///
-    /// `text` is the rendered prefix the entry is *named* by -- the bytes a later
-    /// request will have in hand when it looks for this one -- and it is not the
-    /// token list, because the token run a media span produces is the same id repeated
-    /// and cannot distinguish two different pictures. The caller is the only party that
-    /// knows what a request rendered to, so the key is passed in rather than derived.
-    ///
-    /// A node without a checkpoint is refused rather than written: a prefix whose
-    /// recurrent state is missing has to be re-prefilled anyway, so its pages are worth
-    /// less than the disk space they would take. A checkpoint whose logits row is gone is
-    /// refused for a different reason -- resuming at the very end of a prefix needs that
-    /// row to sample identically -- and the engine treats that one as a bug in itself
-    /// rather than as a cold prefix.
-    ///
-    /// `reason` is what the budget pass prices the entry at: an entry written because the
-    /// process is shutting down, or because the engine expects to come back to it,
-    /// outlives one written because a leaf was merely cold.
+    /// The frontier's own span has to carry a live checkpoint at its end - the
+    /// one a prompt's last chunk or a finished turn admitted - and the path from
+    /// the root to it is what the entry is keyed by. Nothing is written here:
+    /// the pages still to copy are pinned, and [`Self::pump`] and the writer
+    /// thread do the rest.
     ///
     /// # Errors
     ///
-    /// [`KvError::Io`] if the directory rejects the write, and whatever the byte mover
-    /// reports while reading the path's pages. A refusal is `Ok`, not an error.
-    pub fn spill(
-        &self,
-        node: NodeId,
-        text: &[u8],
-        reason: Reason,
-    ) -> Result<SpillOutcome, KvError> {
+    /// [`KvError::PathGap`] when the tree's half of the path has a hole in it.
+    /// Every refusal is an `Ok` outcome.
+    pub fn persist(&self, fr: &Frontier, reason: Reason) -> Result<PersistOutcome, KvError> {
         let _held = InnerGuard::new();
         let mut inner = self.inner.lock();
-        inner.spill(node, text, reason)
+        inner.persist_node(fr.node(), reason)
     }
 
-    /// Read a spilled path back and hand over a frontier that stands at its end.
+    /// The live checkpoint at the end of the frontier's span, when there is one.
+    #[must_use]
+    pub fn frontier_ckpt(&self, fr: &Frontier) -> Option<CkptRef> {
+        let _held = InnerGuard::new();
+        let inner = self.inner.lock();
+        let node = fr.node();
+        let slot = inner.tree.ckpt_at(node)?;
+        inner.ckpt.reference(slot, inner.tree.node(node).end)
+    }
+
+    /// Copies up to `max_bytes` of queued pages off the device for the writer,
+    /// and hands over every entry whose pages are all copied.
     ///
-    /// `Ok(None)` means the entry is gone, was never there, or describes a build this
-    /// one can never be. A file that this build can never read is deleted on the way
-    /// past -- it is worthless wherever it sits -- while a file that is only wrong
-    /// *as configured* is kept, because the same binary started with the other toggle
-    /// value can read it and the key does not mention the toggles.
+    /// The host calls this between steps. It stops early wherever the staging
+    /// budget is full, so one call never holds more than that budget of copies,
+    /// and a cache with nothing queued answers at once.
     ///
     /// # Errors
     ///
-    /// [`KvError::ShaMismatch`] if the file's contents do not hash to its name,
-    /// [`KvError::PoolEmpty`] if the pages the payload needs cannot be claimed even after
-    /// eviction, [`KvError::PathGap`] if the tree's half of the path has a hole in it, and
-    /// whatever the byte mover reports.
-    pub fn restore(&self, id: SpillId, now: f64) -> Result<Option<Restored>, KvError> {
+    /// Whatever the byte mover reports for a copy; the job it was for is
+    /// dropped and the rest stay queued.
+    pub fn pump(&self, max_bytes: u64) -> Result<PumpReport, KvError> {
         let _held = InnerGuard::new();
         let mut inner = self.inner.lock();
-        inner.restore(id, now)
+        let Inner { disk, backing, .. } = &mut *inner;
+        match disk.as_mut() {
+            Some(disk) if !disk.jobs.is_empty() => {
+                let started = Instant::now();
+                let report = disk.pump(backing.as_ref(), max_bytes, None, false)?;
+                if report.pages > 0 || report.entries > 0 {
+                    tracing::debug!(
+                        pages = report.pages,
+                        entries = report.entries,
+                        queued = report.queued,
+                        pump_us = started.elapsed().as_micros(),
+                        "copied queued checkpoint pages for the writer"
+                    );
+                }
+                Ok(report)
+            }
+            _ => Ok(PumpReport::default()),
+        }
+    }
+
+    /// Copies every queued page and waits up to `timeout` for the writer to land
+    /// everything. Returns whether it caught up; when it did not, the writes
+    /// still queued are abandoned so that dropping the cache returns promptly.
+    ///
+    /// For a shutdown. The copies still respect the staging budget - the writer
+    /// frees it as pages land, and a short wait lets it - so draining a full
+    /// queue does not hold every queued page in host memory at once.
+    pub fn drain(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let _held = InnerGuard::new();
+        let mut inner = self.inner.lock();
+        let Inner { disk, backing, .. } = &mut *inner;
+        let Some(disk) = disk.as_mut() else {
+            return true;
+        };
+        while !disk.jobs.is_empty() && Instant::now() < deadline {
+            match disk.pump(backing.as_ref(), u64::MAX, None, false) {
+                Ok(report) if report.pages == 0 && report.entries == 0 => {
+                    std::thread::sleep(DRAIN_WAIT);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "a queued checkpoint could not be copied on the way down");
+                }
+            }
+        }
+        let dropped = disk.jobs.len();
+        while !disk.jobs.is_empty() {
+            disk.drop_job(0);
+        }
+        let caught_up =
+            dropped == 0 && disk.flush(deadline.saturating_duration_since(Instant::now()));
+        if !caught_up {
+            tracing::warn!(
+                timeout_s = timeout.as_secs_f64(),
+                dropped,
+                "the disk writer did not finish in time; abandoning the writes still queued"
+            );
+            disk.abandon_queued();
+        }
+        caught_up
+    }
+
+    /// Records a measured prefill: `tokens` computed in `seconds`. The resume
+    /// cost model prices a disk read against this rate.
+    pub fn observe_prefill(&self, tokens: u32, seconds: f64) {
+        if tokens == 0 || seconds.is_nan() || seconds <= 0.0 {
+            return;
+        }
+        let sample = seconds / f64::from(tokens);
+        let _held = InnerGuard::new();
+        let mut inner = self.inner.lock();
+        inner.prefill_s_per_token =
+            inner.prefill_s_per_token * (1.0 - PREFILL_EWMA_WEIGHT) + sample * PREFILL_EWMA_WEIGHT;
+    }
+
+    /// Stands a fresh sequence on the deepest checkpoint its prompt can use,
+    /// from the tree or from the disk tier.
+    ///
+    /// The tree is asked first and is free: its pages are resident. The disk is
+    /// asked for a checkpoint *deeper* than the tree's, and read only when the
+    /// cost model says reading it beats prefilling the difference: bytes at the
+    /// measured read rate against tokens at the measured prefill rate. A disk
+    /// restore that fails partway - a missing or corrupt file - discards the
+    /// entry and falls back to the tree's answer.
+    ///
+    /// A checkpoint at the very end of `tokens` is only used when it carries its
+    /// logits row, because resuming there means answering the next token from
+    /// that row. `Ok(None)` means nothing usable was found: the caller prefills
+    /// from zero, exactly as with an empty cache.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::PoolEmpty`] when the pages a resume needs cannot be claimed
+    /// even after eviction, [`KvError::PathGap`] for a hole in the tree's half of
+    /// a path, and whatever the byte mover reports.
+    pub fn resume(&self, tokens: &[TokenId], now: f64) -> Result<Option<Resume>, KvError> {
+        let _held = InnerGuard::new();
+        let mut inner = self.inner.lock();
+        inner.resume(tokens, now)
+    }
+
+    /// Where `tokens` stops matching the tree: the branch point a prompt leaves
+    /// the paths the cache already holds at.
+    ///
+    /// A checkpoint there is what a third prompt sharing the same opening
+    /// resumes from, which is why a host stops a chunk at it. Walked from the
+    /// root, so it is right whatever the caller's own frontier holds.
+    #[must_use]
+    pub fn branch_point(&self, tokens: &[TokenId]) -> u32 {
+        let _held = InnerGuard::new();
+        let inner = self.inner.lock();
+        inner.tree.walk_down(tokens).matched
     }
 }
 
 impl Inner {
-    /// The spill half, with the lock held.
-    fn spill(
-        &mut self,
-        node: NodeId,
-        text: &[u8],
-        reason: Reason,
-    ) -> Result<SpillOutcome, KvError> {
-        let refused = |reason: SpillRefusal| Ok(SpillOutcome::Refused { reason });
-        if self.tree.node(node).dropped || node == self.tree.root() {
-            return refused(SpillRefusal::NodeGone);
+    /// The persist half, with the lock held.
+    fn persist_node(&mut self, node: NodeId, reason: Reason) -> Result<PersistOutcome, KvError> {
+        let refused = |why| Ok(PersistOutcome::Refused(why));
+        if self.disk.is_none() {
+            return refused(PersistRefusal::NotConfigured);
         }
-        let geometry = self.geometry;
-        let Some(layout) = geometry.layout else {
-            return refused(SpillRefusal::NotConfigured);
+        if node == self.tree.root() || self.tree.node(node).dropped {
+            return refused(PersistRefusal::NodeGone);
+        }
+        let Some(slot) = self
+            .tree
+            .ckpt_at(node)
+            .filter(|slot| self.ckpt.is_live(*slot))
+        else {
+            return refused(PersistRefusal::NoCheckpoint);
         };
-        if self.spill.is_none() {
-            return refused(SpillRefusal::NotConfigured);
-        }
-        let Some(slot) = self.tree.ckpt_at(node) else {
-            return refused(SpillRefusal::NoCheckpoint);
-        };
-        if !self.ckpt.is_live(slot) {
-            return refused(SpillRefusal::NoCheckpoint);
-        }
-        if !self.ckpt.has_logits(slot) {
-            return refused(SpillRefusal::StaleLogits);
-        }
-
         let pos = self.tree.node(node).end;
-        let tokens = self.path_tokens(node);
-        let pages = self.tree.page_array_from_path(node, pos)?;
-        let header = PathHeader::from_layout(
-            &layout,
-            &geometry,
-            to_u32(tokens.len()),
-            to_u32(pages.len()),
-        );
-        let reference = self
-            .ckpt
-            .reference(slot, pos)
-            .ok_or(KvError::StaleCheckpoint { slot })?;
-
-        let mut state = vec![0u8; usize::try_from(geometry.ckpt_bytes).unwrap_or(usize::MAX)];
-        self.ckpt.state_into(reference, &mut state)?;
-        let described = header.state_bytes();
-        let carried = u64::try_from(state.len()).unwrap_or(u64::MAX);
-        if described != carried {
-            // The payload's sections are sized from the layout's element counts and the
-            // blob is sized from the geometry. If those disagree the file would read back
-            // with its sections shifted, which is worse than not writing it.
-            return refused(SpillRefusal::LayoutMismatch {
-                want: described,
-                got: carried,
-            });
+        let min = self.disk.as_ref().map_or(0, DiskStore::min_tokens);
+        if pos < min {
+            return refused(PersistRefusal::BelowMinTokens { tokens: pos, min });
         }
-        let logits_len = self.ckpt.logits_len(slot).unwrap_or(0);
-        let mut logits = vec![0u8; logits_len];
-        self.ckpt.logits_into(reference, &mut logits)?;
-
-        let page_bytes = usize::try_from(geometry.page_bytes).unwrap_or(usize::MAX);
-        let mut page_section = Vec::with_capacity(pages.len().saturating_mul(page_bytes));
-        let mut buffer = vec![0u8; page_bytes];
-        for page in &pages {
-            self.backing.page_to_host(*page, &mut buffer)?;
-            page_section.extend_from_slice(&buffer);
-        }
-
-        let payload = encode_path(
-            &header,
-            &PathSections {
-                tokens: &tokens,
-                logits: &logits,
-                state: &state,
-                pages: &page_section,
-            },
-        );
-        let incoming = Incoming {
-            text,
-            tokens: to_u32(tokens.len()),
-            quant_bits: layout.quant_bits,
-            model_id: layout.model_id,
-            ctx_size: layout.ctx_size,
-            reason,
-            ext_flags: 0,
-            payload: &payload,
+        let Some(state) = self.ckpt.state_arc(slot) else {
+            return refused(PersistRefusal::NoCheckpoint);
         };
-        let store = self.spill.as_mut().ok_or(KvError::BadHeader {
-            reason: "the spill directory vanished mid-write",
-        })?;
-        match store.write(&incoming) {
-            Ok(SpillWrite::Written { id, bytes }) => Ok(SpillOutcome::Written { id, bytes }),
-            Ok(SpillWrite::AlreadyStored { id }) => Ok(SpillOutcome::AlreadyStored { id }),
-            Err(KvError::OverBudget { required, budget }) => {
-                refused(SpillRefusal::OverBudget { required, budget })
+        let tokens = self.path_tokens(node);
+        let page_ids = self.tree.page_array_from_path(node, pos)?;
+        let spec = PersistSpec {
+            tokens: &tokens,
+            page_ids: &page_ids,
+            state,
+            logits: self.ckpt.logits_arc(slot),
+            reason,
+        };
+        let pool = Arc::clone(&self.pool);
+        let Some(disk) = self.disk.as_mut() else {
+            return refused(PersistRefusal::NotConfigured);
+        };
+        Ok(disk.persist(&spec, &pool))
+    }
+
+    /// Makes sure nothing is lost when `victim`'s pages leave the pool.
+    ///
+    /// An earned checkpoint at the victim's end that is not on disk yet is
+    /// queued first - spill on evict, the safety net under the writes a turn
+    /// already queued - and every queued job pinning one of the victim's pages
+    /// is copied now, whatever the staging budget says, because a pin left in
+    /// place would keep the page the eviction is trying to free.
+    fn before_drop(&mut self, victim: NodeId) {
+        let Some(disk) = self.disk.as_ref() else {
+            return;
+        };
+        if let Some(slot) = self.tree.ckpt_at(victim)
+            && self.ckpt.is_live(slot)
+            && !self.ckpt.is_speculative(slot)
+            && self.tree.node(victim).end >= disk.min_tokens()
+        {
+            let tokens = self.path_tokens(victim);
+            let stored = disk
+                .entry_key_of(&tokens)
+                .is_none_or(|key| disk.knows(&key));
+            if !stored {
+                match self.persist_node(victim, Reason::Evict) {
+                    Ok(outcome) => {
+                        tracing::debug!(?outcome, "an evicted checkpoint was queued for disk");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "an evicted checkpoint could not be queued");
+                    }
+                }
             }
-            Err(error) => Err(error),
+        }
+        let pages = self.tree.node(victim).pages.clone();
+        let Inner { disk, backing, .. } = self;
+        let Some(disk) = disk.as_mut() else {
+            return;
+        };
+        while let Some(at) = disk
+            .jobs
+            .iter()
+            .position(|job| pages.iter().any(|page| job.pins(*page)))
+        {
+            if let Err(error) = disk.pump(backing.as_ref(), u64::MAX, Some(at), true) {
+                tracing::warn!(%error, "a queued checkpoint could not be copied before its pages went");
+            }
         }
     }
 
-    /// The restore half, with the lock held.
-    ///
-    /// A path that cannot be installed still costs nothing but the recomputation: the
-    /// caller gets `None` and prefills, exactly as it would have with an empty cache.
-    fn restore(&mut self, id: SpillId, now: f64) -> Result<Option<Restored>, KvError> {
-        let geometry = self.geometry;
-        let Some(layout) = geometry.layout else {
-            return Ok(None);
+    /// The resume half, with the lock held. `Ok(None)` is the public method's:
+    /// nothing usable in the tree or on disk, a cold start.
+    fn resume(&mut self, tokens: &[TokenId], now: f64) -> Result<Option<Resume>, KvError> {
+        let plan = self.plan_with(None, tokens, None, now);
+        let tree_pos = if plan.ckpt.is_some() {
+            plan.reusable()
+        } else {
+            0
         };
-        let Some(store) = self.spill.as_mut() else {
-            return Ok(None);
-        };
-        let Some(entry) = store.read(id)? else {
-            return Ok(None);
-        };
-        let expect = PathHeader::from_layout(&layout, &geometry, 0, 0);
-        let Some(decoded) = Self::read_spilled(store, id, &entry.payload, &expect) else {
-            return Ok(None);
-        };
-        let _ = store.touch(id);
+        let hit = self
+            .disk
+            .as_ref()
+            .and_then(|disk| disk.lookup(tokens, tree_pos.saturating_add(1)));
+        if let Some(hit) = hit {
+            let prefill_s = f64::from(hit.pos - tree_pos) * self.prefill_s_per_token;
+            let restore_s = self.restore_estimate(&hit, plan.matched);
+            if restore_s < prefill_s {
+                match self.restore_disk(tokens, &hit, prefill_s, now) {
+                    Ok(Some(resume)) => {
+                        self.resumes_disk += 1;
+                        return Ok(Some(resume));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, entry = %hit.key, "a disk resume failed; trying the tree");
+                        if let Some(disk) = self.disk.as_ref() {
+                            disk.restore_failed();
+                        }
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    entry = %hit.key,
+                    tokens = hit.pos,
+                    restore_s,
+                    prefill_s,
+                    "a stored checkpoint costs more to read than to prefill"
+                );
+                if let Some(disk) = self.disk.as_ref() {
+                    disk.restore_declined();
+                }
+            }
+        }
+        let resumed = self.lookup_with(None, tokens, None, now)?;
+        if resumed.is_some() {
+            self.resumes_tree += 1;
+        }
+        Ok(resumed)
+    }
 
-        let logits = (!decoded.logits.is_empty()).then_some(decoded.logits);
-        let (frontier, target) = self.install_restored(id, &decoded.tokens, &decoded.pages, now)?;
-        let ckpt = self.checkpoint_restored(
-            id,
+    /// Seconds a disk restore of `hit` is expected to take: the bytes not
+    /// already resident, at the measured read rate.
+    fn restore_estimate(&self, hit: &Hit, matched: u32) -> f64 {
+        let Some(disk) = self.disk.as_ref() else {
+            return f64::INFINITY;
+        };
+        let pages = hit.pages.len().max(1);
+        let resident = usize::try_from(self.geometry.page_of(matched.min(hit.pos)))
+            .unwrap_or(0)
+            .min(pages);
+        let fraction = f64::from(to_u32(pages - resident)) / f64::from(to_u32(pages));
+        let bytes = crate::ids::to_u32_wide(hit.bytes);
+        f64::from(bytes) * fraction / disk.read_bps().max(1.0)
+    }
+
+    /// Reads a stored path back and stands a frontier on it: the tree's own
+    /// pages below the position the tree still agrees with, pages read off disk
+    /// above it, and the stored state in a fresh checkpoint slot.
+    ///
+    /// `Ok(None)` when the entry turned out unusable partway - it is discarded -
+    /// or no slot could hold its state; the caller falls back to the tree.
+    fn restore_disk(
+        &mut self,
+        tokens: &[TokenId],
+        hit: &Hit,
+        prefill_s: f64,
+        now: f64,
+    ) -> Result<Option<Resume>, KvError> {
+        let started = Instant::now();
+        let geometry = self.geometry;
+        let want_state = usize::try_from(geometry.ckpt_bytes).unwrap_or(usize::MAX);
+        let Some(disk) = self.disk.as_ref() else {
+            return Ok(None);
+        };
+        let pos = hit.pos;
+        let path = &tokens[..usize::try_from(pos)
+            .unwrap_or(tokens.len())
+            .min(tokens.len())];
+        let walk = self.tree.walk_down(path);
+        let matched = walk.matched.min(pos);
+        let own_from = usize::try_from(geometry.page_of(matched)).unwrap_or(usize::MAX);
+        let Some((stream, body)) = disk.start_restore(hit, path, own_from) else {
+            return Ok(None);
+        };
+        let mut target = self.tree.frontier_at(&walk)?;
+        // Pinned before anything is claimed: the claims below can evict, and an
+        // unpinned target is a leaf the victim scan would drop from under the
+        // restore about to stand on it.
+        let mut live = self.tree.live_guard(target);
+        let table = self.restore_table(target, own_from, pos, now)?;
+        let Some(disk) = self.disk.as_ref() else {
+            return Ok(None);
+        };
+        let read = match upload_pages(
+            &stream,
+            self.backing.as_mut(),
+            &table,
+            own_from,
+            hit.pages.len(),
+        )? {
+            Ok(read) => read,
+            Err(failure) => {
+                tracing::warn!(entry = %hit.key, page = failure.index, why = ?failure.why, "a stored page is unusable");
+                disk.forget(hit.key, failure.why);
+                disk.restore_failed();
+                return Ok(None);
+            }
+        };
+        drop(stream);
+        disk.count_read(read);
+        let pages_done = started.elapsed();
+        let Some(entry) = disk.finish_body(hit, body, want_state) else {
+            return Ok(None);
+        };
+
+        // The span above the match joins the tree, so the next request walking
+        // this prefix matches it instead of reading the files again.
+        if matched < pos
+            && let Some(node) = self.adopt_span(target, &table, path, pos, now, Some(hit.key))
+        {
+            target = node;
+            live = self.tree.live_guard(target);
+        }
+        self.tree.touch(target, now);
+        let Some(ckpt) = self.checkpoint_restored(
+            hit.key,
             target,
-            to_u32(decoded.tokens.len()),
-            &decoded.state,
-            logits.as_deref(),
+            pos,
+            &entry.state,
+            entry.logits.as_deref(),
             now,
+        ) else {
+            return Ok(None);
+        };
+        let took = started.elapsed();
+        if let Some(disk) = self.disk.as_mut() {
+            disk.restored(hit.key, hit.bytes, took, prefill_s);
+        }
+        tracing::info!(
+            entry = %hit.key,
+            tokens = pos,
+            tree_tokens = matched,
+            read_bytes = read,
+            restore_ms = took.as_millis(),
+            pages_ms = pages_done.as_millis(),
+            prefill_estimate_s = prefill_s,
+            "resumed a checkpoint from disk"
         );
-        Ok(Some(Restored {
-            frontier,
-            tokens: decoded.tokens,
-            logits,
-            ckpt,
+        Ok(Some(Resume {
+            frontier: Frontier { live, table },
+            ckpt: Some(ckpt),
+            ckpt_pos: pos,
+            matched: pos,
+            source: ReuseSource::Disk,
         }))
     }
 
-    /// Decode a payload and decide what happens to the file it came from.
-    ///
-    /// `None` means the caller gets a cold answer and nothing is restored. Which of those
-    /// refusals also *deletes* is decided by the mismatch kind rather than by this
-    /// function's convenience -- see [`PathMismatch`].
-    fn read_spilled(
-        store: &SpillStore,
-        id: SpillId,
-        payload: &[u8],
-        expect: &PathHeader,
-    ) -> Option<DecodedPath> {
-        match decode_path(payload, expect) {
-            Ok(decoded) => Some(decoded),
-            Err(PathMismatch::Foreign { field, found, want }) => {
-                tracing::warn!(
-                    entry = %id, field, found, want,
-                    "spilled path describes a build this one can never be; discarding",
-                );
-                discard(store, id);
-                None
-            }
-            Err(PathMismatch::Incompatible { field, found, want }) => {
-                // Kept: the same build started with the other toggle value can read this,
-                // and the key is the rendered text rather than the toggles, so deleting it
-                // would wipe a shared directory every time an operator flips a flag.
-                tracing::info!(
-                    entry = %id, field, found, want,
-                    "spilled path is not usable as configured; keeping it",
-                );
-                None
-            }
-            Err(PathMismatch::Truncated { needed, have }) => {
-                tracing::warn!(entry = %id, needed, have, "spilled path is short; discarding");
-                discard(store, id);
-                None
-            }
-        }
-    }
-
-    /// Rebuild a frontier for a spilled path: the tree's own pages below the position the
-    /// tree still agrees with, and fresh pages read from the payload above it.
-    ///
-    /// The node comes back too, because that is where the restored state is a checkpoint
-    /// *at*, and rediscovering it would mean walking the tree a second time.
+    /// The page table a disk restore fills: the tree's own pages below page
+    /// `own_from`, and freshly claimed ones up to `pos` for the reads to land in.
     ///
     /// # Errors
     ///
-    /// [`KvError::PathGap`] if the matched path has a page nobody owns, [`KvError::PoolEmpty`]
-    /// if the pages above the match cannot be claimed even after an eviction pass, and
-    /// whatever the byte mover reports while reading the payload in.
-    fn install_restored(
+    /// [`KvError::PathGap`] for a hole in the tree's half, and
+    /// [`KvError::PoolEmpty`] when the pages cannot be claimed even after an
+    /// eviction pass.
+    fn restore_table(
         &mut self,
-        id: SpillId,
-        tokens: &[TokenId],
-        pages: &[Vec<u8>],
+        target: NodeId,
+        own_from: usize,
+        pos: u32,
         now: f64,
-    ) -> Result<(Frontier, NodeId), KvError> {
+    ) -> Result<PageTable, KvError> {
         let geometry = self.geometry;
-        let pos = to_u32(tokens.len());
-        let walk = self.tree.walk_down(tokens);
-        let matched = walk.matched.min(pos);
-        let mut target = self.tree.frontier_at(&walk)?;
-        // Pin before claiming anything: the page claims below can evict, and an
-        // unpinned target is a childless leaf the victim scan would happily drop out from
-        // under the restore that is about to stand on it.
-        let mut live = self.tree.live_guard(target);
-
-        // Everything below the page the match lands inside is already owned by the tree
-        // and adopted rather than re-read. That one page is the exception: the tree's copy
-        // is only valid up to the match, so the payload's copy -- which has the whole
-        // page -- is what gets used, and it is read in rather than copied from a page the
-        // tree is still holding.
-        let own_from = usize::try_from(geometry.page_of(matched)).unwrap_or(usize::MAX);
-        let prefix_len = geometry.first_position(to_u32(own_from));
-        let prefix = self.tree.page_array_from_path(target, prefix_len)?;
+        let prefix = self
+            .tree
+            .page_array_from_path(target, geometry.first_position(to_u32(own_from)))?;
         let mut table = PageTable::adopt(Arc::clone(&self.pool), geometry, prefix);
         if !table.grow_to(pos)? {
             self.free_pages(geometry.pages_for(pos), now);
@@ -1430,43 +1625,25 @@ impl Inner {
                 return Err(KvError::PoolEmpty);
             }
         }
-        let fresh = table.as_slice()[own_from..].to_vec();
-        for (page, bytes) in fresh.iter().zip(pages.iter().skip(own_from)) {
-            self.backing.page_from_host(*page, bytes)?;
-        }
-
-        // The span above the match joins the tree, so the next request that walks this
-        // prefix matches it instead of re-reading the file.
-        if matched < pos
-            && let Some(node) = self.adopt_span(target, &table, tokens, pos, now, Some(id))
-        {
-            target = node;
-            live = self.tree.live_guard(target);
-        }
-        self.tree.touch(target, now);
-        Ok((Frontier { live, table }, target))
+        Ok(table)
     }
 
-    /// Give the restored state a checkpoint on the node the path ends at.
+    /// Gives restored state a checkpoint on the node the path ends at.
     ///
-    /// That is what makes a second restore of the same prefix unnecessary and what lets
-    /// the eviction scan price the prefix against the rest of the cache. A slot that
-    /// cannot be claimed, or a state blob whose length disagrees with this cache, costs
-    /// the restored path its checkpoint and nothing else: the caller still gets the pages
-    /// and the frontier, and can decode from position zero.
+    /// That is what makes a second restore of the same prefix unnecessary and
+    /// what lets the eviction scan price the prefix against the rest of the
+    /// cache. A slot that cannot be claimed, or a blob whose length disagrees
+    /// with this cache, costs the restore its checkpoint - and a checkpoint is
+    /// the whole of a hybrid resume, so the caller falls back.
     fn checkpoint_restored(
         &mut self,
-        id: SpillId,
+        key: EntryKey,
         target: NodeId,
         pos: u32,
         state: &[u8],
         logits: Option<&[u8]>,
         now: f64,
     ) -> Option<CkptRef> {
-        // An empty blob is a missing one only where a blob was expected. A cache whose
-        // geometry says the model has no recurrent state is carrying a checkpoint that
-        // is the frontier logits row alone, and dropping it would cost the restored
-        // path the prefill it was written to save.
         if self.geometry.ckpt_bytes > 0 && state.is_empty() {
             return None;
         }
@@ -1479,7 +1656,7 @@ impl Inner {
                 Some(reference)
             }
             Err(error) => {
-                tracing::warn!(entry = %id, %error, "restored state is not the size this cache uses");
+                tracing::warn!(entry = %key, %error, "restored state is not the size this cache uses");
                 self.ckpt.evict(slot);
                 None
             }
@@ -1487,16 +1664,34 @@ impl Inner {
     }
 }
 
-/// Delete an entry that this build can never read. that this build can never read.
+/// Uploads pages `from..to` of a restored path as the reader delivers them.
 ///
-/// Failure is ignored on purpose: the entry will be refused again on the next read, and
-/// a directory the process cannot write to is not a reason to fail the request that
-/// merely asked what was in it.
-fn discard(store: &SpillStore, id: SpillId) {
-    let path = store.path_of(id);
-    if let Err(error) = std::fs::remove_file(&path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(path = %path.display(), %error, "could not discard an unreadable path");
+/// The outer `Result` is the byte mover's; the inner one is the entry's: a
+/// page that did not arrive, arrived out of order, or failed its checks makes
+/// the whole entry unusable, and the caller discards it.
+fn upload_pages(
+    stream: &crate::store::PageStream,
+    backing: &mut dyn Backing,
+    table: &PageTable,
+    from: usize,
+    to: usize,
+) -> Result<Result<u64, crate::store::PageFailure>, KvError> {
+    let mut read = 0u64;
+    for expected in from..to {
+        match stream.next() {
+            Some(Ok(page)) if page.index == expected => {
+                backing.page_from_host(table.as_slice()[expected], page.payload())?;
+                read += u64::try_from(page.buf.len()).unwrap_or(u64::MAX);
+                stream.give_back(page.buf);
+            }
+            Some(Err(failure)) => return Ok(Err(failure)),
+            Some(Ok(_)) | None => {
+                return Ok(Err(crate::store::PageFailure {
+                    index: expected,
+                    why: crate::store::Unusable::Missing,
+                }));
+            }
+        }
     }
+    Ok(Ok(read))
 }

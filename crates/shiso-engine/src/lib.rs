@@ -74,14 +74,10 @@ pub mod tune;
 pub mod vision;
 
 pub use ckpt::{
-    CKPT_BUDGET_MB_DEFAULT, CKPT_MIN_TOKENS_DEFAULT, Checkpointed, CkptConfig, CkptOptions,
-    ResumeInfo, SaveOutcome,
+    CKPT_BUDGET_POOL_MULTIPLE, CKPT_MIN_TOKENS_DEFAULT, Checkpointed, CkptConfig, CkptOptions,
+    ResumeInfo, ResumeSource, SaveOutcome,
 };
 pub use ckpt_layout::CkptIdentity;
-// The store's own vocabulary, re-exported: a `Reason` is what an entry is priced by,
-// a `SpillId` is what it is filed under, and a `SpillRefusal` is the store's half of
-// a refused save. A model crate that speaks only to the checkpoint tier should not
-// have to depend on the store to name the three of them.
 pub use draft::{DraftHead, DraftParts};
 pub use options::{EngineOptions, KvCheck, KvFit, PoolCost};
 pub use sampling::{argmax, rng_f32, rng_next, sample_logits};
@@ -90,5 +86,9 @@ pub use sampling_probs::{build_probabilities, sample_probabilities};
 /// taking a dependency on the cache crate: the type is part of this crate's own
 /// contract the moment `Checkpointed` reports it.
 pub use shiso_kvstore::CacheStats;
-pub use shiso_kvstore::{Reason, SpillId, SpillRefusal};
+// The store's own vocabulary, re-exported: a `Reason` is what an entry is filed
+// under, an `EntryKey` is its name, a `PersistRefusal` is the store's half of a
+// refused save and a `PumpReport` is what a pump did. A model crate that speaks only
+// to the checkpoint tier should not have to depend on the store to name them.
+pub use shiso_kvstore::{EntryKey, KvCache, PersistRefusal, PumpReport, Reason};
 pub use stack::{HybridStack, MAX_DECODE_BATCH, MAX_PREFILL_CHUNK};

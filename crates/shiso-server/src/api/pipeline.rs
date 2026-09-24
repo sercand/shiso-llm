@@ -286,6 +286,18 @@ async fn queue(
         request.max_tokens.min(budget)
     };
 
+    // A request that will wait for a seat warms the page cache for the stored
+    // prefix it will resume from, so its restore reads memory rather than the
+    // drive. Only then: one admitted at once resumes straight away, usually from
+    // the tree, and reading its files would be traffic for nothing.
+    let seats = u64::try_from(state.engine.max_num_seqs()).unwrap_or(u64::MAX);
+    if media.is_empty()
+        && state.sched.active() >= seats
+        && let Some(prefetcher) = state.kv.as_ref().and_then(|kv| kv.prefetcher())
+    {
+        let started = prefetcher.prefetch(&tokens);
+        tracing::trace!(started, "prefetch for a queued request");
+    }
     let (sampling, seed) = resolve_sampling(request, state.sampling_preset);
     let generate = GenerateRequest::new(Arc::from(tokens), sampling, seed, max_tokens)
         .with_text(text)

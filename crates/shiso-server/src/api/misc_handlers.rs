@@ -64,10 +64,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
 /// built on it looks healthy for the wrong reason.
 #[must_use]
 pub fn render_metrics(state: &AppState) -> String {
-    let spill = state.kv.as_ref().and_then(|kv| kv.stats().spill);
-    let enabled = u8::from(spill.is_some());
-    let entries = spill.as_ref().map_or(0, |stats| u64::from(stats.entries));
-    let bytes = spill.as_ref().map_or(0, |stats| stats.total_bytes);
+    let disk = state.kv.as_ref().and_then(|kv| kv.disk_stats());
+    let enabled = u8::from(disk.is_some());
+    let entries = disk.as_ref().map_or(0, |stats| u64::from(stats.entries));
+    let bytes = disk.as_ref().map_or(0, |stats| stats.durable_bytes);
     let mut out = String::new();
     push_gauge(&mut out, "shiso_up", "1 when the process is serving", 1);
     push_gauge(
@@ -100,6 +100,9 @@ pub fn render_metrics(state: &AppState) -> String {
         "Bytes the disk tier holds",
         bytes,
     );
+    if let Some(disk) = disk.as_ref() {
+        render_disk(&mut out, disk);
+    }
     if let Some(report) = state
         .memory
         .as_ref()
@@ -243,6 +246,125 @@ fn push_gauge(out: &mut String, name: &str, help: &str, value: u64) {
     let _ = writeln!(out, "{name} {value}");
 }
 
+/// Appends one counter series.
+fn push_total(out: &mut String, name: &str, help: &str, value: u64) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} counter");
+    let _ = writeln!(out, "{name} {value}");
+}
+
+/// The disk tier's traffic, queue and restore figures.
+fn render_disk(out: &mut String, disk: &shiso_kvstore::DiskStats) {
+    let gauges: [(&str, &str, u64); 5] = [
+        (
+            "shiso_kvstore_budget_bytes",
+            "Bytes the disk tier may hold",
+            disk.budget_bytes,
+        ),
+        (
+            "shiso_kvstore_reserved_bytes",
+            "Bytes promised to disk writes still queued",
+            disk.reserved_bytes,
+        ),
+        (
+            "shiso_kvstore_pages",
+            "Page files the disk tier holds",
+            u64::from(disk.pages),
+        ),
+        (
+            "shiso_kvstore_queued_jobs",
+            "Checkpoints waiting for their pages to be copied off the device",
+            u64::from(disk.queued_jobs),
+        ),
+        (
+            "shiso_kvstore_staged_bytes",
+            "Host bytes copied off the device and not yet written",
+            disk.staged_bytes,
+        ),
+    ];
+    for (name, help, value) in gauges {
+        push_gauge(out, name, help, value);
+    }
+    let totals: [(&str, &str, u64); 7] = [
+        (
+            "shiso_kvstore_written_bytes_total",
+            "Bytes the disk tier has written",
+            disk.bytes_written,
+        ),
+        (
+            "shiso_kvstore_read_bytes_total",
+            "Bytes restores have read back",
+            disk.bytes_read,
+        ),
+        (
+            "shiso_kvstore_write_failures_total",
+            "Disk-tier writes that failed",
+            disk.write_failures,
+        ),
+        (
+            "shiso_kvstore_jobs_dropped_total",
+            "Checkpoints dropped because the write queue was full",
+            disk.jobs_dropped,
+        ),
+        (
+            "shiso_kvstore_evictions_total",
+            "Entries the disk budget released",
+            disk.entries_evicted,
+        ),
+        (
+            "shiso_kvstore_restores_total",
+            "Sessions stood up from the disk tier",
+            disk.restores,
+        ),
+        (
+            "shiso_kvstore_restore_failures_total",
+            "Restores that found a file unusable",
+            disk.restore_failures,
+        ),
+    ];
+    for (name, help, value) in totals {
+        push_total(out, name, help, value);
+    }
+    render_disk_history(out, disk);
+}
+
+/// The disk tier's per-reason write counts and restore seconds.
+fn render_disk_history(out: &mut String, disk: &shiso_kvstore::DiskStats) {
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        out,
+        "# HELP shiso_kvstore_entries_written_total Entry files written, by reason"
+    );
+    let _ = writeln!(out, "# TYPE shiso_kvstore_entries_written_total counter");
+    for (reason, count) in shiso_kvstore::Reason::ALL
+        .iter()
+        .zip(disk.entries_by_reason.iter())
+    {
+        let _ = writeln!(
+            out,
+            "shiso_kvstore_entries_written_total{{reason=\"{}\"}} {count}",
+            reason.label()
+        );
+    }
+    for (name, help, value) in [
+        (
+            "shiso_kvstore_restore_seconds_total",
+            "Seconds spent restoring from disk",
+            disk.restore_seconds,
+        ),
+        (
+            "shiso_kvstore_restore_prefill_seconds_total",
+            "Seconds of prefill restores replaced, estimated",
+            disk.restore_prefill_seconds,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(out, "{name} {value:.6}");
+    }
+}
+
 /// `GET /v1/models`.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
     Json(model_listing(&state))
@@ -291,38 +413,52 @@ pub async fn cache_report(State(state): State<Arc<AppState>>) -> Json<CacheRepor
 /// rather than letting an unmeasurable tier look like an empty one.
 #[must_use]
 pub fn cache_body(state: &AppState) -> CacheReport {
-    let measured = state.kv.as_ref().and_then(|kv| kv.stats().spill);
-    let disk = match (measured, state.ckpt.as_ref()) {
-        (Some(spill), tier) => DiskReport {
+    let cache_stats = state.kv.as_ref().map(|kv| kv.stats());
+    let min_tokens = state.ckpt.as_ref().map_or(0, |tier| tier.min_tokens);
+    let disk = match (
+        cache_stats.as_ref().and_then(|cache| cache.disk.clone()),
+        state.ckpt.as_ref(),
+    ) {
+        (Some(disk), _) => DiskReport {
             enabled: true,
-            dir: Some(spill.dir.display().to_string()),
-            budget_bytes: spill.budget_bytes,
-            min_tokens: tier.map_or(0, |tier| tier.min_tokens),
+            dir: Some(disk.dir.display().to_string()),
+            budget_bytes: disk.budget_bytes,
+            min_tokens,
             measured: true,
-            total_bytes: spill.total_bytes,
-            entries: spill.entries,
-            evictions: spill.evictions,
+            total_bytes: disk.durable_bytes,
+            reserved_bytes: disk.reserved_bytes,
+            entries: disk.entries,
+            pending_entries: disk.pending_entries,
+            pages: disk.pages,
+            queued_jobs: disk.queued_jobs,
+            staged_bytes: disk.staged_bytes,
+            evictions: disk.entries_evicted,
+            bytes_written: disk.bytes_written,
+            bytes_read: disk.bytes_read,
+            entries_written: shiso_kvstore::Reason::ALL
+                .iter()
+                .zip(disk.entries_by_reason.iter())
+                .filter(|(_, count)| **count > 0)
+                .map(|(reason, count)| (reason.label(), *count))
+                .collect(),
+            write_failures: disk.write_failures,
+            jobs_dropped: disk.jobs_dropped,
+            restores: disk.restores,
+            restore_failures: disk.restore_failures,
+            restores_declined: disk.restores_declined,
+            restore_seconds: disk.restore_seconds,
+            restore_prefill_seconds: disk.restore_prefill_seconds,
+            read_bps: disk.read_bps,
+            prefetches: disk.prefetches,
         },
         (None, Some(tier)) => DiskReport {
             enabled: true,
             dir: Some(tier.dir.display().to_string()),
             budget_bytes: tier.budget_bytes,
-            min_tokens: tier.min_tokens,
-            measured: false,
-            total_bytes: 0,
-            entries: 0,
-            evictions: 0,
+            min_tokens,
+            ..DiskReport::default()
         },
-        (None, None) => DiskReport {
-            enabled: false,
-            dir: None,
-            budget_bytes: 0,
-            min_tokens: 0,
-            measured: false,
-            total_bytes: 0,
-            entries: 0,
-            evictions: 0,
-        },
+        (None, None) => DiskReport::default(),
     };
     let sched = &state.sched;
     CacheReport {
@@ -334,6 +470,11 @@ pub fn cache_body(state: &AppState) -> CacheReport {
             tokens_reused: sched.reused_tokens(),
             tokens_prefilled: sched.prefill_tokens(),
             writes: sched.checkpoint_writes(),
+            resumes_memory: cache_stats.as_ref().map_or(0, |cache| cache.resumes_tree),
+            resumes_disk: cache_stats.as_ref().map_or(0, |cache| cache.resumes_disk),
+            prefill_s_per_token: cache_stats
+                .as_ref()
+                .map_or(0.0, |cache| cache.prefill_s_per_token),
             resident: sched.active(),
             capacity: u64::try_from(state.engine.max_num_seqs()).unwrap_or(u64::MAX),
         },

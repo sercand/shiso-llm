@@ -100,13 +100,11 @@ pub struct GenerateRequest {
     /// `Arc<[T]>` rather than `Arc<Vec<T>>`: one indirection instead of two,
     /// and the length is part of the pointer rather than behind it.
     pub prompt_tokens: Arc<[TokenId]>,
-    /// The rendered prompt as text, which is what the checkpoint tier keys on.
+    /// The rendered prompt as text, which the stream parser reads to tell
+    /// whether the template already opened a reasoning block.
     ///
-    /// Empty when the surface had no rendered text to offer, and that is a
-    /// cold start rather than an error: an entry keyed by nothing could never be
-    /// named by a later request. Deriving it here by decoding the ids would
-    /// produce a string that is *nearly* the prompt, and a cache keyed on nearly
-    /// the prompt occasionally answers with somebody else's conversation.
+    /// Empty when the surface had no rendered text to offer. The checkpoint
+    /// tier does not read it: it keys by `prompt_tokens`.
     pub prompt_text: Arc<str>,
     /// Resolved sampling settings. The request's own preferences were turned
     /// into these at the edge, because only the edge knows the server's preset.

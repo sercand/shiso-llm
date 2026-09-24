@@ -1,5 +1,9 @@
 //! Storing a session's prefix and standing a fresh one back up on it.
 //!
+//! Every store here is written behind: a commit queues the checkpoint, and the
+//! cases drain the queue before they reopen the directory, which is what a
+//! server does on its way down.
+//!
 //! The tier's policy - the floor, the prefix scan, the refusal vocabulary - is
 //! the engine's and is tested there. What is tested here is the part that is
 //! this family's own: that a blob carries everything a sparse resume cannot
@@ -25,9 +29,11 @@
 #[path = "common/qwen4exp_fixture.rs"]
 mod fixture;
 
+use std::time::Duration;
+
 use shiso_core::Model as _;
 use shiso_core::ids::{SessionId, TokenId};
-use shiso_engine::ckpt::{Checkpointed as _, CkptConfig, CkptOptions, SaveOutcome};
+use shiso_engine::ckpt::{Checkpointed as _, CkptConfig, CkptOptions, ResumeSource, SaveOutcome};
 use shiso_engine::sparse::mtp::SpecDepth;
 use shiso_engine::sparse::stack::SparseOptions;
 use shiso_models::qwen4exp::{QWEN4EXP_MODEL_ID, Qwen4ExpModel};
@@ -44,12 +50,22 @@ const PROMPT: u32 = 64;
 fn config(dir: &std::path::Path) -> CkptConfig {
     let mut options = CkptOptions::new();
     options.min_tokens = 8;
+    options.budget_mb = Some(256);
+    options.staging_mb = 16;
     CkptConfig::new(dir.to_path_buf()).with_options(options)
 }
 
 /// Tokens `0..n`, which is a path no other case writes.
 fn path_of(n: u32) -> Vec<TokenId> {
     (0..n).map(TokenId::new).collect()
+}
+
+/// Every queued write lands.
+fn drain(model: &mut Qwen4ExpModel) {
+    assert!(
+        model.kv_drain(Duration::from_secs(10)),
+        "the writer caught up"
+    );
 }
 
 /// Fills every recurrent slot, the n-gram window and - when the session has one -
@@ -96,13 +112,12 @@ fn state_is(model: &Qwen4ExpModel, session: SessionId, want: u8) -> bool {
     })
 }
 
-/// A loaded model with the tier open over `dir`, plus one prefilled session
-/// whose state has been painted with `value`.
+/// A loaded model with the tier open over `dir`, plus one session that ended a
+/// prompt of [`PROMPT`] tokens with its state painted `value`, drained to disk.
 fn stored(
     dir: &tempfile::TempDir,
     opts: SparseOptions,
     value: u8,
-    text: &[u8],
 ) -> (tempfile::TempDir, Qwen4ExpModel, SessionId) {
     let (weights, _backend, mut model) = fixture::loaded_with(opts);
     model
@@ -122,28 +137,27 @@ fn stored(
     }
     paint(&model, session, value);
     // `true` is what says this chunk ended a prompt, and `Some(0)` names the
-    // row a resume from here would sample: a commit without that row cannot be
-    // resumed from without re-running a step, and a commit that claims to end a
-    // prompt without ending one is a snapshot per decoded token.
+    // row a resume from here would sample. The commit queues the checkpoint for
+    // disk on its own; a save afterwards finds it already queued.
     model
         .stack_mut()
         .advance(session, &tokens, true, Some(0))
         .expect("the span is registered");
     let outcome = model
-        .kv_save(session, &tokens, text, shiso_engine::Reason::Cold)
+        .kv_save(session, shiso_engine::Reason::Cold)
         .expect("the store accepted the save");
     assert!(
-        outcome.stored().is_some(),
-        "the prefix was not stored: {outcome:?}"
+        matches!(outcome, SaveOutcome::AlreadyStored(_)),
+        "the prompt's end was queued by its own commit: {outcome:?}"
     );
+    drain(&mut model);
     (weights, model, session)
 }
 
 #[test]
 fn a_stored_prefix_stands_a_fresh_session_up_on_the_bytes_it_was_saved_with() {
     let dir = tempfile::TempDir::new().expect("a cache directory");
-    let text = b"the prompt these bytes belong to";
-    let (_weights, model, _session) = stored(&dir, fixture::options(), 0xA7, text);
+    let (_weights, model, _session) = stored(&dir, fixture::options(), 0xA7);
     drop(model);
 
     let (_weights, _backend, mut fresh) = fixture::loaded_with(fixture::options());
@@ -157,15 +171,15 @@ fn a_stored_prefix_stands_a_fresh_session_up_on_the_bytes_it_was_saved_with() {
 
     let reused = {
         let info = fresh
-            .kv_resume(session, text)
+            .kv_resume(session, &path_of(PROMPT))
             .expect("the resume did not fail")
             .expect("the stored prefix was found");
         assert_eq!(info.tokens, path_of(PROMPT), "the token path came back");
         assert_eq!(info.tokens_reused, PROMPT);
-        assert_eq!(
-            info.text_bytes,
-            u64::try_from(text.len()).expect("a short prompt"),
-            "the entry covers the whole prompt it was keyed by"
+        assert_eq!(info.source, ResumeSource::Disk);
+        assert!(
+            info.frontier_logits.is_some(),
+            "a resume covering the whole prompt hands back the row to sample from"
         );
         info.tokens_reused
     };
@@ -183,9 +197,8 @@ fn a_resume_restores_the_staged_draft_row_and_not_only_the_recurrent_stack() {
     // would answer, and would answer differently on exactly that step - which is
     // the one a stored prefix exists to make cheap.
     let dir = tempfile::TempDir::new().expect("a cache directory");
-    let text = b"a prompt a speculating build stored";
     let opts = fixture::speculative_options(4);
-    let (_weights, model, _session) = stored(&dir, opts, 0x5E, text);
+    let (_weights, model, _session) = stored(&dir, opts, 0x5E);
     drop(model);
 
     let (_weights, _backend, mut fresh) = fixture::loaded_with(opts);
@@ -203,13 +216,16 @@ fn a_resume_restores_the_staged_draft_row_and_not_only_the_recurrent_stack() {
         "a fresh session has staged nothing"
     );
     fresh
-        .kv_resume(session, text)
+        .kv_resume(session, &path_of(PROMPT))
         .expect("the resume did not fail")
         .expect("the stored prefix was found");
     let stack = fresh.stack();
-    let row = stack
-        .session(session)
-        .expect("open")
+    let live = stack.session(session).expect("open");
+    assert!(
+        live.staged_row_current(),
+        "the restored row drafts from the resumed frontier"
+    );
+    let row = live
         .pending_draft()
         .expect("the resumed session can draft on its first step");
     let mut bytes = vec![0_u8; usize::try_from(row.len()).expect("a fixture range fits")];
@@ -225,8 +241,7 @@ fn a_prompt_that_shares_an_opening_with_an_earlier_one_is_still_stored() {
     // Every rendered prompt shares at least its template's opening with the
     // prompts before it, so the cache's branch point lies behind its end. The
     // end of a prompt is admitted anyway: it is what the same prompt, or the
-    // next turn of its conversation, resumes from. Gated on the branch point, a
-    // process stored the first prompt it read and then only exact repeats.
+    // next turn of its conversation, resumes from.
     let dir = tempfile::TempDir::new().expect("a cache directory");
     let (_weights, _backend, mut model) = fixture::loaded_with(fixture::options());
     model
@@ -243,27 +258,28 @@ fn a_prompt_that_shares_an_opening_with_an_earlier_one_is_still_stored() {
         .prefill_last(second, &tokens)
         .expect("the second prompt prefills");
     let outcome = model
-        .kv_save(
-            second,
-            &tokens,
-            b"a prompt that opens like the first",
-            shiso_engine::Reason::Cold,
-        )
+        .kv_save(second, shiso_engine::Reason::Cold)
         .expect("the store answered");
     assert!(
         outcome.stored().is_some(),
         "the second prompt was not stored: {outcome:?}"
     );
+    drain(&mut model);
+    let stats = model
+        .kv_cache_stats()
+        .and_then(|stats| stats.disk)
+        .expect("a disk tier is open");
+    // Both prompt ends, and the point the second prompt branched off the first.
+    assert_eq!(stats.entries, 3, "{stats:?}");
 }
 
 #[test]
 fn a_build_that_speculates_will_not_read_a_file_written_by_one_that_does_not() {
     // The two blobs are different lengths, because the draft row is in one and
-    // not the other. Reading either as the other would shift every section after
-    // the first, and every shifted section still decodes to finite numbers.
+    // not the other, and the layout word that says so is part of every key: the
+    // speculating build never even finds the other build's entry.
     let dir = tempfile::TempDir::new().expect("a cache directory");
-    let text = b"a prompt a plain build stored";
-    let (_weights, model, _session) = stored(&dir, fixture::options(), 0x22, text);
+    let (_weights, model, _session) = stored(&dir, fixture::options(), 0x22);
     drop(model);
 
     let (_weights, _backend, mut speculating) =
@@ -274,7 +290,7 @@ fn a_build_that_speculates_will_not_read_a_file_written_by_one_that_does_not() {
     let session = speculating.open_session().expect("a session opens");
     assert!(
         speculating
-            .kv_resume(session, text)
+            .kv_resume(session, &path_of(PROMPT))
             .expect("a refusal to read is a cold start, not a failure")
             .is_none(),
         "a file whose state section is a different length was read anyway"
@@ -282,32 +298,126 @@ fn a_build_that_speculates_will_not_read_a_file_written_by_one_that_does_not() {
 }
 
 #[test]
-fn a_session_that_is_not_standing_on_the_tokens_it_offers_is_not_stored_under_their_key() {
+fn a_finished_turn_is_stored_at_the_last_position_it_wrote() {
+    // The next turn's prompt is this one plus the answer plus a new message, so
+    // the checkpoint worth having is at the end of the answer - not the end of
+    // the prompt, and not one past it: the last sampled token was never run.
+    let dir = tempfile::TempDir::new().expect("a cache directory");
+    let answered = {
+        let (_weights, _backend, mut model) = fixture::loaded_with(fixture::options());
+        model
+            .kv_enable(&config(dir.path()))
+            .expect("the tier opens");
+        let session = model.open_session().expect("a session opens");
+        model
+            .prefill_last(session, &path_of(PROMPT))
+            .expect("the prompt prefills");
+        let mut path = path_of(PROMPT);
+        for step in 0..5u32 {
+            let token = TokenId::new(500 + step);
+            model
+                .stack_mut()
+                .reserve(session, 1)
+                .expect("the pool has room for a row");
+            model
+                .stack_mut()
+                .advance(session, &[token], false, Some(0))
+                .expect("the step is registered");
+            path.push(token);
+        }
+        paint(&model, session, 0x3C);
+        let outcome = model
+            .kv_save(session, shiso_engine::Reason::Continued)
+            .expect("the store answered");
+        assert!(
+            matches!(outcome, SaveOutcome::Queued(_)),
+            "the turn's end was queued: {outcome:?}"
+        );
+        drain(&mut model);
+        path
+    };
+
+    let (_weights, _backend, mut fresh) = fixture::loaded_with(fixture::options());
+    fresh
+        .kv_enable(&config(dir.path()))
+        .expect("the tier opens");
+    let session = fresh.open_session().expect("a session opens");
+    let mut next_turn = answered.clone();
+    next_turn.extend((900..910).map(TokenId::new));
+    let info = fresh
+        .kv_resume(session, &next_turn)
+        .expect("not an error")
+        .expect("the turn's end was found");
+    assert_eq!(
+        info.tokens_reused,
+        u32::try_from(answered.len()).expect("short"),
+        "the resume reaches the end of the answer"
+    );
+    assert!(
+        info.frontier_logits.is_none(),
+        "a resume short of the prompt's end prefills the rest and needs no row"
+    );
+    assert!(state_is(&fresh, session, 0x3C));
+}
+
+#[test]
+fn a_message_boundary_earns_a_checkpoint_a_shorter_prompt_resumes_from() {
+    // A system prompt shared by every session of an agent ends at a message
+    // boundary. The first prompt through it leaves a checkpoint there, so the
+    // second - which shares nothing past it - still skips it.
     let dir = tempfile::TempDir::new().expect("a cache directory");
     let (_weights, _backend, mut model) = fixture::loaded_with(fixture::options());
     model
         .kv_enable(&config(dir.path()))
         .expect("the tier opens");
-    let session = model.open_session().expect("a session opens");
+    let first = model.open_session().expect("a session opens");
     model
-        .stack_mut()
-        .reserve(session, PROMPT)
-        .expect("the pool has room");
+        .kv_set_hints(first, &[24])
+        .expect("the session is open");
     model
-        .stack_mut()
-        .advance(session, &path_of(PROMPT), true, Some(0))
-        .expect("the span is registered");
+        .prefill_last(first, &path_of(PROMPT))
+        .expect("the prompt prefills");
+    let second = model.open_session().expect("a second session opens");
+    let mut other = path_of(24);
+    other.extend((700..740).map(TokenId::new));
+    let info = model
+        .kv_resume(second, &other)
+        .expect("not an error")
+        .expect("the boundary's checkpoint was found");
+    assert_eq!(info.tokens_reused, 24);
+    assert_eq!(info.source, ResumeSource::Memory);
+}
 
-    // The right number of the wrong tokens. Without the path comparison this
-    // files one conversation's state under another conversation's key.
-    let wrong = (100..100 + PROMPT).map(TokenId::new).collect::<Vec<_>>();
-    let outcome = model
-        .kv_save(session, &wrong, b"some text", shiso_engine::Reason::Cold)
-        .expect("the store was asked");
-    assert!(
-        matches!(outcome, SaveOutcome::NotAtFrontier { .. }),
-        "expected a frontier refusal, got {outcome:?}"
-    );
+#[test]
+fn the_point_a_prompt_branches_off_a_cached_path_earns_a_checkpoint() {
+    // Same opening, different question: the second prompt stops a chunk where
+    // it leaves the first one's path, and a third that shares that opening
+    // resumes there.
+    let dir = tempfile::TempDir::new().expect("a cache directory");
+    let (_weights, _backend, mut model) = fixture::loaded_with(fixture::options());
+    model
+        .kv_enable(&config(dir.path()))
+        .expect("the tier opens");
+    let first = model.open_session().expect("a session opens");
+    model
+        .prefill_last(first, &path_of(PROMPT))
+        .expect("the first prompt prefills");
+    let with_question = |question: u32| {
+        let mut tokens = path_of(40);
+        // The fixture's vocabulary is 64 ids wide.
+        tokens.extend((0..20).map(|i| TokenId::new((question + i) % 64)));
+        tokens
+    };
+    let second = model.open_session().expect("a second session opens");
+    model
+        .prefill_last(second, &with_question(50))
+        .expect("the second prompt prefills");
+    let third = model.open_session().expect("a third session opens");
+    let info = model
+        .kv_resume(third, &with_question(10))
+        .expect("not an error")
+        .expect("the branch point's checkpoint was found");
+    assert_eq!(info.tokens_reused, 40);
 }
 
 #[test]
@@ -317,19 +427,14 @@ fn nothing_is_stored_until_a_directory_is_opened() {
     let session = model.open_session().expect("a session opens");
     assert_eq!(
         model
-            .kv_save(
-                session,
-                &path_of(PROMPT),
-                b"text",
-                shiso_engine::Reason::Cold
-            )
+            .kv_save(session, shiso_engine::Reason::Cold)
             .expect("asking is not an error"),
         SaveOutcome::Disabled,
         "a process that was never told where to put a cache must not invent a place"
     );
     assert!(
         model
-            .kv_resume(session, b"text")
+            .kv_resume(session, &path_of(PROMPT))
             .expect("asking is not an error")
             .is_none()
     );
@@ -352,38 +457,31 @@ fn the_tier_is_chosen_before_anything_stands_on_a_session() {
 }
 
 #[test]
-fn a_shutdown_sweep_stores_every_session_it_is_given_text_for() {
+fn a_shutdown_sweep_stores_every_open_session() {
     let dir = tempfile::TempDir::new().expect("a cache directory");
     let (_weights, _backend, mut model) = fixture::loaded_with(fixture::options());
     model
         .kv_enable(&config(dir.path()))
         .expect("the tier opens");
-    let mut sessions = Vec::new();
-    for _ in 0..2u32 {
+    for first in [0u32, 1000] {
         let session = model.open_session().expect("a session opens");
+        let tokens: Vec<TokenId> = (first..first + PROMPT).map(TokenId::new).collect();
         model
             .stack_mut()
             .reserve(session, PROMPT)
             .expect("the pool has room");
         model
             .stack_mut()
-            .advance(session, &path_of(PROMPT), true, Some(0))
+            .advance(session, &tokens, true, Some(0))
             .expect("the span is registered");
-        sessions.push(session);
     }
-    // One session's text is withheld, which is how a scheduler says it has none:
-    // that session is skipped and the other is still stored.
-    let first = *sessions.first().expect("two sessions");
-    let written = model.kv_shutdown_sweep(&mut |id| {
-        (id == first).then(|| (path_of(PROMPT), b"the first session's text".to_vec()))
-    });
-    assert_eq!(written, 1);
+    assert_eq!(model.kv_shutdown_sweep(), 2);
 }
 
 #[test]
 fn this_family_tags_its_files_with_its_own_identity() {
-    // The tag is what keeps a shared cache directory unambiguous, and the
-    // quantization is read off the weights rather than stated by a caller.
+    // The tag is part of every key, and the quantization is read off the
+    // weights rather than stated by a caller.
     let (_weights, _backend, model) = fixture::loaded_with(fixture::options());
     let identity = model.ckpt_identity();
     assert_eq!(identity.model_id, QWEN4EXP_MODEL_ID);

@@ -10,12 +10,6 @@
 //! `Option<NodeId>`, never a magic maximum.
 
 use std::fmt;
-use std::str::FromStr;
-
-use sha1::Digest as _;
-use sha1::Sha1;
-
-use crate::error::KvError;
 
 /// Generates the three index newtypes. They differ only in which table they
 /// index, which is exactly the distinction Rust can enforce and an integer
@@ -97,92 +91,4 @@ pub(crate) fn to_u32(value: usize) -> u32 {
 #[must_use]
 pub(crate) fn to_u32_wide(value: u64) -> u32 {
     to_u32(usize::try_from(value).unwrap_or(usize::MAX))
-}
-
-/// The name of a spilled checkpoint: the sha1 of the rendered byte prefix it
-/// caches.
-///
-/// The digest is kept as bytes, not as a `String`, because the 40 hex characters
-/// are a file name and nothing else: comparing, hashing and storing 20 bytes is
-/// cheaper, and a `SpillId` can never be a name that sha1 could not have
-/// produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SpillId([u8; 20]);
-
-impl SpillId {
-    /// The digest of a byte prefix, which is how the disk tier keys its index.
-    #[must_use]
-    pub fn of(text: &[u8]) -> Self {
-        let mut digest = Sha1::new();
-        digest.update(text);
-        Self(digest.finalize().into())
-    }
-
-    /// The raw digest bytes, for callers that key their own index by them.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 20] {
-        &self.0
-    }
-
-    /// The 40 lowercase hex characters this id is named by on disk.
-    #[must_use]
-    pub fn to_hex(self) -> String {
-        hex::encode(self.0)
-    }
-}
-
-impl From<[u8; 20]> for SpillId {
-    fn from(raw: [u8; 20]) -> Self {
-        Self(raw)
-    }
-}
-
-impl fmt::Display for SpillId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl FromStr for SpillId {
-    type Err = KvError;
-
-    /// Parses the 40 hex characters of a spill name. Anything else — wrong
-    /// length, a stray newline in a name read back from a directory listing —
-    /// is refused rather than folded into a valid-looking id.
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let digits = text.as_bytes();
-        if digits.len() != 40 {
-            return Err(KvError::BadSpillId {
-                found: text.to_string(),
-            });
-        }
-        let mut raw = [0u8; 20];
-        for (index, byte_slot) in raw.iter_mut().enumerate() {
-            let Some(high) = hex_value(digits[index * 2]) else {
-                return Err(KvError::BadSpillId {
-                    found: text.to_string(),
-                });
-            };
-            let Some(low) = hex_value(digits[index * 2 + 1]) else {
-                return Err(KvError::BadSpillId {
-                    found: text.to_string(),
-                });
-            };
-            *byte_slot = high << 4 | low;
-        }
-        Ok(Self(raw))
-    }
-}
-
-/// The value of one ASCII hex digit, either case.
-fn hex_value(digit: u8) -> Option<u8> {
-    match digit {
-        b'0'..=b'9' => Some(digit - b'0'),
-        b'a'..=b'f' => Some(digit - b'a' + 10),
-        b'A'..=b'F' => Some(digit - b'A' + 10),
-        _ => None,
-    }
 }

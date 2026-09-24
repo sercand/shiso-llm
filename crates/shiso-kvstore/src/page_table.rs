@@ -54,7 +54,7 @@ impl PageTable {
     /// A table covering `pages`, taking one holder on each.
     ///
     /// Used by `lookup` for a path the tree already owns and by `restore` for a
-    /// path rebuilt from spilled bytes: in both cases the pages exist and somebody
+    /// path rebuilt from stored bytes: in both cases the pages exist and somebody
     /// else holds them too, so this adopts rather than claims.
     pub(crate) fn adopt(pool: Arc<PagePool>, geometry: CacheGeometry, pages: Vec<PageId>) -> Self {
         for page in &pages {

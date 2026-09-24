@@ -196,6 +196,19 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// Short stable name used in error messages and traces.
     fn backend_name(&self) -> &'static str;
 
+    /// What names the arithmetic this device runs: two values that differ mean
+    /// the same launches may compute different bits.
+    ///
+    /// Stored state is only reusable by a build that computes what the writer
+    /// computed - a key/value row or a recurrent state from other kernels
+    /// resumes into a state this build would not produce, and answers
+    /// differently from a cold run - so a disk cache folds this into every key.
+    /// The default is the backend's name, which is right for a backend whose
+    /// kernels are compiled from sources that ship with the binary.
+    fn numerics_id(&self) -> String {
+        self.backend_name().to_owned()
+    }
+
     /// Allocates `bytes` of device memory.
     #[doc(hidden)]
     ///

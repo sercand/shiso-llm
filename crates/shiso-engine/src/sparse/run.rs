@@ -45,6 +45,7 @@ use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::model::{DecodeStep, Logits};
 
+use crate::sparse::ckpt::Boundary;
 use crate::sparse::kernels::F32_BYTES;
 use crate::sparse::media::MediaRun;
 use crate::sparse::ple::{PleGather, PleRows};
@@ -178,6 +179,23 @@ impl SparseStack {
                 // A decode step writes a logits row and ends no prompt: the
                 // row is what the sampler reads, not a boundary to resume from.
                 self.run_chunk(step.session, &[step.token], 1, false, None)?;
+            }
+        }
+        // A session that may speculate keeps its staged row current through
+        // plain steps too: the residual of the position just committed, which
+        // row `i` of the pass still holds. Left stale, the row would name a
+        // position the session has moved past, and the end of the turn could
+        // not be checkpointed - the checkpoint carries the row.
+        if self.has_draft_head() {
+            for (row, step) in steps.iter().enumerate() {
+                let speculates = self
+                    .sessions
+                    .get(&step.session)
+                    .is_some_and(|live| live.spec_depth().is_speculative());
+                if speculates {
+                    let row = u32::try_from(row).unwrap_or(u32::MAX);
+                    self.stage_draft_row(step.session, row)?;
+                }
             }
         }
         self.logits(rows)
@@ -327,6 +345,13 @@ impl SparseStack {
             });
         }
         let start = self.session(session)?.written();
+        if media.is_some() {
+            // Marked before anything runs, so a chunk that fails halfway still
+            // leaves the session off disk.
+            if let Some(live) = self.sessions.get_mut(&session) {
+                live.media = true;
+            }
+        }
         // This family states one position rule and every request it serves is
         // walked by it: a placeholder token's three axes are a grid coordinate.
         // The dense families read theirs off the config because two of them
@@ -340,10 +365,22 @@ impl SparseStack {
             // an item's encoder rows and its grid positions together, and a cut
             // through one would split an item's rows across two passes whose
             // maps were built from two different walks of the same item.
-            let take = match run.as_ref() {
+            let mut take = match run.as_ref() {
                 Some(run) => run.walk.split_point(rest, width),
                 None => rest.len().min(width),
             };
+            // A chunk also stops at a boundary a later request is likely to
+            // resume from - a message end, or where this prompt branches off a
+            // path the cache holds - so the commit there can take a checkpoint.
+            // One extra split and one snapshot per new boundary.
+            let mut shared = false;
+            if run.is_none()
+                && let Some(stop) = self.shared_stop(session, rest)?
+                && stop <= take
+            {
+                take = stop;
+                shared = true;
+            }
             let (head, tail) = rest.split_at(take);
             let logit_rows = u32::from(tail.is_empty() && with_logits);
             // The draft head's own cache is filled as the prompt is read, and
@@ -353,7 +390,13 @@ impl SparseStack {
             if let Some(first) = head.first() {
                 self.warm_draft_boundary(session, *first, start)?;
             }
-            let earned = logit_rows > 0;
+            let boundary = if logit_rows > 0 {
+                Boundary::PromptEnd
+            } else if shared {
+                Boundary::Shared
+            } else {
+                Boundary::Step
+            };
             self.run_rows_media(session, head, logit_rows, run.as_mut())?;
             // Staged after the pass and before the commit: the commit is where
             // a prompt's final chunk earns its checkpoint, and a speculating
@@ -365,7 +408,15 @@ impl SparseStack {
                 let last = u32::try_from(head.len().saturating_sub(1)).unwrap_or(0);
                 self.stage_draft_row(session, last)?;
             }
-            self.advance(session, head, earned, logit_rows.checked_sub(1))?;
+            self.advance_at(session, head, boundary, logit_rows.checked_sub(1))?;
+            // The row staged before the advance is the residual of the chunk's
+            // last position, so it drafts from the frontier the advance just
+            // reached.
+            if let Some(live) = self.sessions.get_mut(&session)
+                && let Some(spec) = live.spec.as_mut()
+            {
+                spec.staged_for = live.written;
+            }
             self.warm_draft(session, head, start)?;
             // The rows the next piece needs are known the moment this one is
             // enqueued, and this one is about to spend its time on the device,
@@ -397,6 +448,42 @@ impl SparseStack {
             }
         }
         Ok(())
+    }
+
+    /// Tokens of `rest` to run before the next shared boundary, when one falls
+    /// inside it: a message-boundary hint, or the point where this path stops
+    /// matching the tree.
+    ///
+    /// A boundary closer than the tier's floor to the last checkpoint on this
+    /// path is skipped - a checkpoint is worth the prefill between it and the
+    /// one below it, and a few hundred tokens of that is not worth a snapshot -
+    /// and so is everything on a stack with no disk tier, which has nowhere to
+    /// resume a later request from. `None` is not a refusal: the chunk simply
+    /// runs to its own width.
+    fn shared_stop(&self, session: SessionId, rest: &[TokenId]) -> CoreResult<Option<usize>> {
+        let Some(ckpt) = self.ckpt else {
+            return Ok(None);
+        };
+        let live = self.session(session)?;
+        let pos = live.written();
+        let len = pos.saturating_add(u32::try_from(rest.len()).unwrap_or(u32::MAX));
+        let mut path = Vec::with_capacity(live.history().len() + rest.len());
+        path.extend_from_slice(live.history());
+        path.extend_from_slice(rest);
+        let branch = self.resident()?.cache.branch_point(&path);
+        // Every candidate is judged on its own: a branch point a few tokens into
+        // a shared template opening is too close to be worth a snapshot, and it
+        // must not hide the message boundary a thousand tokens later.
+        let floor = ckpt.options.min_tokens.max(1);
+        let lowest = pos.max(live.resumed_at).saturating_add(floor).max(floor);
+        let stop = live
+            .hints
+            .iter()
+            .copied()
+            .chain(std::iter::once(branch))
+            .filter(|stop| *stop > pos && *stop < len && *stop >= lowest)
+            .min();
+        Ok(stop.and_then(|stop| usize::try_from(stop - pos).ok()))
     }
 
     /// One pass over one chunk, in the order this module's notes give.

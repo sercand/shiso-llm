@@ -165,13 +165,30 @@ impl shiso_kvstore::Backing for NullBacking {
 #[tokio::test]
 async fn the_cache_report_describes_a_disk_tier_that_is_on() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let geometry = shiso_kvstore::CacheGeometry::new(16, 4096, 4096, 0.001, 600.0);
+    let geometry = shiso_kvstore::CacheGeometry::new(16, 4096, 4096, 0.001, 600.0).with_layout(
+        shiso_kvstore::PathLayout {
+            model_id: 9,
+            quant_bits: 4,
+            ctx_size: CTX,
+            kv_width: 16,
+            n_layers: 2,
+            n_attn_layers: 2,
+            n_gdn_layers: 0,
+            vocab: 16,
+            gdn_conv_elements: 0,
+            gdn_state_elements: 0,
+            ple_window_elements: 0,
+            hc_width: 0,
+            indexer: false,
+            draft_head: false,
+        },
+    );
     let cache = shiso_kvstore::KvCache::open(
         &geometry,
         Box::new(NullBacking),
         4,
         2,
-        Some(shiso_kvstore::SpillConfig::new(dir.path(), 8)),
+        Some(shiso_kvstore::DiskConfig::new(dir.path(), 8 << 20)),
     )
     .expect("the cache opens over an empty directory");
 

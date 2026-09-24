@@ -18,9 +18,9 @@
 //! without corrupting every other path through it; it takes a private copy of that
 //! one page instead. That is the whole copy-on-write cost of a resume.
 //!
-//! [`Backing::page_to_host`] is called by `spill`, once per page of the path being
-//! written, and [`Backing::page_from_host`] by `restore`, once per page it has to
-//! re-create. Both are the engine's chance to do one large transfer rather than
+//! [`Backing::page_to_host`] is called by the disk tier's pump, once per page a
+//! queued checkpoint still needs on disk, and [`Backing::page_from_host`] by a disk
+//! resume, once per page it has to re-create. Both are the engine's chance to do one large transfer rather than
 //! many small ones, which is why the buffer is a whole page.
 //!
 //! # What an implementation owes the cache
@@ -64,7 +64,7 @@ pub trait Backing: Send + std::fmt::Debug {
     ///
     /// `buf.len()` is the geometry's `page_bytes`; a shorter buffer is a caller bug
     /// and is reported as [`KvError::BufferLen`] rather than partially filled. Used
-    /// by the spill writer, one page at a time.
+    /// by the disk tier's pump, one page at a time.
     ///
     /// # Errors
     ///
@@ -73,7 +73,7 @@ pub trait Backing: Send + std::fmt::Debug {
 
     /// Writes a whole page's bytes from a caller-owned buffer.
     ///
-    /// The counterpart of [`Self::page_to_host`], used when a spilled path is
+    /// The counterpart of [`Self::page_to_host`], used when a stored path is
     /// adopted: the pages above the match are freshly claimed, and this is what puts
     /// their rows back. A page is written whole for the same reason it is copied
     /// whole -- the cache does not know where one row ends.

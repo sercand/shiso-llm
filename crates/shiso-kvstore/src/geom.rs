@@ -49,8 +49,7 @@ pub struct CacheGeometry {
     /// blob and is not counted here, because the store keeps the two apart -- one is
     /// restored into the recurrent stack, the other is a sampler's answer. An engine
     /// that folds the row into its own blob should say so in `PathLayout` by leaving
-    /// `vocab` at zero; otherwise `spill` refuses the mismatch rather than writing a
-    /// payload whose sections do not add up.
+    /// `vocab` at zero; the disk tier stores the two as separate sections of an entry.
     pub ckpt_bytes: u64,
     /// Measured prefill seconds per token: the numerator of both utility
     /// formulas. A property of the machine, not of a model.
@@ -59,7 +58,7 @@ pub struct CacheGeometry {
     pub decay_s: f64,
     /// What a serialized path looks like, when this cache is allowed to write one.
     ///
-    /// `None` means the disk tier is not configured: the cache still spills nothing
+    /// `None` means the disk tier cannot be opened: the cache stores nothing
     /// and refuses to say a path is restorable, because it has no way to describe the
     /// bytes it would be describing. See [`Self::with_layout`].
     pub layout: Option<PathLayout>,
@@ -94,11 +93,11 @@ impl CacheGeometry {
         }
     }
 
-    /// Adds the byte description a spilled path needs.
+    /// Adds the byte description a stored path's identity is built from.
     ///
     /// A builder rather than a seventh constructor argument because the two numbers
     /// the cache prices bytes with are needed by every cache and the fourteen the
-    /// spill header carries are needed by exactly one feature.
+    /// disk tier's identity folds in are needed by exactly one feature.
     #[must_use]
     pub const fn with_layout(mut self, layout: PathLayout) -> Self {
         self.layout = Some(layout);
@@ -235,7 +234,7 @@ pub(crate) fn mib(bytes: u64) -> f64 {
 /// an unbuildable literal would hide that a caller left one of the words unset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathLayout {
-    /// Which build's geometry a spilled path assumes. A reader that does not
+    /// Which build's geometry a stored path assumes. A reader that does not
     /// recognize the value refuses the file rather than guessing.
     pub model_id: u8,
     /// Quantization width the page bytes were written with. Two widths are not

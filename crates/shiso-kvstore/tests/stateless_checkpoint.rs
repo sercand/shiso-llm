@@ -9,8 +9,10 @@
 
 mod common;
 
+use std::time::Duration;
+
 use shiso_kvstore::{
-    CacheGeometry, CommitOpts, KvCache, PathLayout, Reason, SpillConfig, SpillOutcome,
+    CacheGeometry, CommitOpts, DiskConfig, KvCache, PathLayout, PersistOutcome, Reason, ReuseSource,
 };
 
 use common::{FakeBacking, PAGE_BYTES, PAGE_TOKENS, Pages, seq};
@@ -59,10 +61,10 @@ fn cache_over(
     geometry: &CacheGeometry,
     pool_pages: u32,
     ckpt_slots: u32,
-    spill: Option<SpillConfig>,
+    disk: Option<DiskConfig>,
 ) -> (KvCache, Pages) {
     let (backing, pages) = FakeBacking::new();
-    let cache = KvCache::open(geometry, Box::new(backing), pool_pages, ckpt_slots, spill)
+    let cache = KvCache::open(geometry, Box::new(backing), pool_pages, ckpt_slots, disk)
         .expect("a stateless geometry is one a cache can be built from");
     (cache, pages)
 }
@@ -119,67 +121,80 @@ fn a_stack_with_no_recurrent_state_commits_and_resumes_a_logits_only_checkpoint(
     assert_eq!(row, ROW, "the row comes back exactly as it was handed over");
 }
 
+/// A disk tier small enough for a fixture and with the floor lowered to the
+/// fixture's prompt.
+fn disk(dir: &std::path::Path) -> DiskConfig {
+    let mut config = DiskConfig::new(dir, 64 << 20);
+    config.min_tokens = 8;
+    config.staging_bytes = 1 << 20;
+    config
+}
+
 #[test]
-fn a_logits_only_checkpoint_survives_a_spill_and_a_restore() {
-    let dir = tempfile::TempDir::new().expect("a temporary spill directory");
+fn a_logits_only_checkpoint_survives_the_disk_tier() {
+    let dir = tempfile::TempDir::new().expect("a temporary disk directory");
     let geometry = geometry().with_layout(layout());
-    let (cache, pages) = cache_over(&geometry, 8, 2, Some(SpillConfig::new(dir.path(), 64)));
     let prompt = seq(22_000, POSITIONS);
-    let mut writer = cache.cold_frontier();
-    assert!(
-        writer
-            .grow_to(POSITIONS)
-            .expect("a pool of eight pages covers two"),
-        "the pool covered every position of the prompt"
-    );
-    // The spill reads whole pages out of the backing, so the backing has to hold
-    // what a forward pass would have written into them.
-    let page_bytes = usize::try_from(PAGE_BYTES).expect("a fixture page fits a usize");
-    for (rank, page) in writer.table().as_slice().iter().enumerate() {
-        let fill = u8::try_from(rank % 251).expect("a remainder fits a byte");
-        pages.seed(*page, &vec![fill; page_bytes]);
+    {
+        let (cache, pages) = cache_over(&geometry, 8, 2, Some(disk(dir.path())));
+        let mut writer = cache.cold_frontier();
+        assert!(
+            writer
+                .grow_to(POSITIONS)
+                .expect("a pool of eight pages covers two"),
+            "the pool covered every position of the prompt"
+        );
+        // The pump reads whole pages out of the backing, so the backing has to
+        // hold what a forward pass would have written into them.
+        let page_bytes = usize::try_from(PAGE_BYTES).expect("a fixture page fits a usize");
+        for (rank, page) in writer.table().as_slice().iter().enumerate() {
+            let fill = u8::try_from(rank % 251).expect("a remainder fits a byte");
+            pages.seed(*page, &vec![fill; page_bytes]);
+        }
+        cache
+            .commit(
+                &mut writer,
+                &prompt,
+                POSITIONS,
+                CommitOpts::span(&[])
+                    .checkpoint(&[], true)
+                    .logits_row(&ROW)
+                    .persist(Reason::Cold),
+                1.0,
+            )
+            .expect("a checkpoint whose state is nothing is still a checkpoint");
+        assert!(matches!(
+            cache.persist(&writer, Reason::Cold),
+            Ok(PersistOutcome::AlreadyStored { .. })
+        ));
+        assert!(cache.drain(Duration::from_secs(10)), "the writer caught up");
     }
-    cache
-        .commit(
-            &mut writer,
-            &prompt,
-            POSITIONS,
-            CommitOpts::span(&[]).checkpoint(&[], true).logits_row(&ROW),
-            1.0,
-        )
-        .expect("a checkpoint whose state is nothing is still a checkpoint");
 
-    let node = writer.node();
-    let id = match cache.spill(
-        node,
-        b"a prompt from a stack with no recurrent state",
-        Reason::Cold,
-    ) {
-        Ok(SpillOutcome::Written { id, .. }) => id,
-        other => panic!("the path did not spill: {other:?}"),
-    };
-
-    // Everything the cache still holds goes back, so the restore rebuilds the path
-    // out of the file rather than out of the tree it is still standing on.
-    drop(writer);
-    let _freed = cache.evict_to(8, 3.0);
-
-    let restored = cache
-        .restore(id, 4.0)
+    // A fresh process: nothing in the tree, everything on disk.
+    let (cache, pages) = cache_over(&geometry, 8, 2, Some(disk(dir.path())));
+    let resume = cache
+        .resume(&prompt, 4.0)
         .expect("a restore of a well-formed entry is not an error")
         .expect("the entry is in the directory");
-    assert_eq!(restored.tokens, prompt, "the path comes back whole");
-    assert_eq!(
-        restored.logits.as_deref(),
-        Some(ROW.as_slice()),
-        "the frontier row is the only thing the payload's state carried"
-    );
-    let reference = restored
+    assert_eq!(resume.source, ReuseSource::Disk);
+    assert_eq!(resume.ckpt_pos, POSITIONS);
+    let reference = resume
         .ckpt
         .expect("a restored stateless checkpoint is re-admitted rather than dropped");
     cache
         .ckpt_state_into(reference, &mut [])
         .expect("a blob of zero bytes copies into a buffer of zero bytes");
+    let mut row = [0u8; 16];
+    cache
+        .ckpt_logits_into(reference, &mut row)
+        .expect("the row came back with the entry");
+    assert_eq!(row, ROW);
+    let first = resume.frontier.table().as_slice()[1];
+    assert_eq!(
+        pages.bytes_of(first).expect("the page was uploaded"),
+        vec![1u8; usize::try_from(PAGE_BYTES).expect("fits")],
+        "the second page came back holding the bytes it was written with"
+    );
 }
 
 #[test]
