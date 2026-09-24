@@ -527,6 +527,14 @@ pub fn decode_split(in_dim: u32, out_dim: u32, rows: u32, sms: u32) -> Option<u3
         .or(Some(want))
 }
 
+/// Whether one weight of a pair takes the decode-shaped launch at `rows`,
+/// which is what splits the pair into two ordinary launches.
+#[must_use]
+pub fn pair_decoded(weight: &WeightDesc, rows: u32, device: Device) -> bool {
+    trellis_bits(weight.dtype).is_some()
+        && decode_split(weight.in_dim, weight.out_dim, rows, device.max_co_resident).is_some()
+}
+
 /// Whether a pair of weights of identical shape and type can share one grouped
 /// launch.
 ///
@@ -1067,6 +1075,17 @@ pub fn project_pair(
     rows: u32,
     device: Device,
 ) -> CoreResult<()> {
+    // Narrow enough for the decode-shaped launch, the pair is two of those, at
+    // every row count that launch covers, so that a row is summed one way
+    // below the bound whatever else shares its pass. Serially the two cost a
+    // little more than the grouped launch (23 against 22 us for the shared
+    // expert); the routed block runs them as a branch beside its own launches,
+    // where the grouped launch could not go: it is cooperative, and its grid
+    // has to be resident alone.
+    if pair_decoded(&gate, rows, device) && pair_decoded(&up, rows, device) {
+        project(out, gate, gate_bound, rows, device)?;
+        return project(out, up, up_bound, rows, device);
+    }
     // Past the threshold the pair splits: each weight is expanded once and
     // multiplied, which is cheaper than streaming both trellises once per
     // sixteen rows, and there is no grouped form of the expanded path. Below

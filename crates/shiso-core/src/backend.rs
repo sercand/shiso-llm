@@ -446,6 +446,43 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// its queue.
     fn sync(&self) -> CoreResult<()>;
 
+    /// Opens a branch: launches from here to [`Backend::resume`] wait for
+    /// everything issued before this call, and may run beside whatever is
+    /// issued after the resume, until [`Backend::join`].
+    ///
+    /// For work that does not depend on the launches it overlaps and writes
+    /// nothing they read - a small latency-bound projection beside a
+    /// bandwidth-bound one. A backend with one queue runs the branch in order,
+    /// which is what the default does.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::Backend`] when a branch is already open or the
+    /// device refuses the ordering.
+    fn fork(&self) -> CoreResult<()> {
+        Ok(())
+    }
+
+    /// Ends the open branch's launches; what follows runs beside it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::Backend`] when no branch is open or the device
+    /// refuses the ordering.
+    fn resume(&self) -> CoreResult<()> {
+        Ok(())
+    }
+
+    /// Makes what follows wait for the branch that last resumed.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::Backend`] when a branch is still open or the device
+    /// refuses the ordering.
+    fn join(&self) -> CoreResult<()> {
+        Ok(())
+    }
+
     /// Graph capture support, absent by default.
     ///
     /// Capabilities are accessors rather than error variants, so a backend that

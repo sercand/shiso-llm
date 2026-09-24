@@ -413,6 +413,18 @@ impl Backend for CudaBackend {
         device::sync(self)
     }
 
+    fn fork(&self) -> CoreResult<()> {
+        graph::fork(self)
+    }
+
+    fn resume(&self) -> CoreResult<()> {
+        graph::resume(self)
+    }
+
+    fn join(&self) -> CoreResult<()> {
+        graph::join(self)
+    }
+
     fn as_graph(&self) -> Option<&dyn GraphBackend> {
         self.options.decode_graphs.then_some(self)
     }

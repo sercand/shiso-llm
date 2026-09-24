@@ -162,6 +162,8 @@ pub enum Step {
         /// The buffer to zero.
         buffer: Operand,
     },
+    /// A point in a branch of concurrent work; see [`Branch`].
+    Branch(Branch),
     /// A trellis weight expanded once into half precision, before the BLAS
     /// multiply that follows it.
     ///
@@ -185,6 +187,24 @@ pub enum Step {
         /// What it is handed, in kernel declaration order.
         args: Args,
     },
+}
+
+/// The three points that bracket work run beside the main stream.
+///
+/// `Fork`, the branch's launches, `Resume`, the main stream's launches, `Join`:
+/// the branch waits for everything before the fork, the main stream runs on
+/// beside it from the resume, and nothing after the join starts before the
+/// branch is done. The branch must neither read what the main stream's
+/// launches write nor write what they read, and it must not use the
+/// per-stream cooperative scratch while they do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Branch {
+    /// Opens the branch.
+    Fork,
+    /// Ends the branch's launches.
+    Resume,
+    /// Waits for the branch.
+    Join,
 }
 
 impl Step {
@@ -214,7 +234,9 @@ impl Step {
             Self::Kernel { args, .. } | Self::Trellis { args, .. } | Self::Expand { args, .. } => {
                 args.operands()
             }
-            Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } => Ok(&[]),
+            Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } | Self::Branch(_) => {
+                Ok(&[])
+            }
         }
     }
 
@@ -230,7 +252,9 @@ impl Step {
             Self::Kernel { args, .. } | Self::Trellis { args, .. } | Self::Expand { args, .. } => {
                 *args
             }
-            Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } => Args::new(),
+            Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } | Self::Branch(_) => {
+                Args::new()
+            }
         }
     }
 
@@ -239,9 +263,11 @@ impl Step {
     pub const fn staging(&self) -> Staging {
         match self {
             Self::Trellis { staging, .. } | Self::Expand { staging, .. } => *staging,
-            Self::Kernel { .. } | Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } => {
-                Staging::none()
-            }
+            Self::Kernel { .. }
+            | Self::Blas { .. }
+            | Self::Reserve { .. }
+            | Self::Clear { .. }
+            | Self::Branch(_) => Staging::none(),
         }
     }
 
@@ -253,7 +279,7 @@ impl Step {
             Self::Kernel { entry, .. }
             | Self::Trellis { entry, .. }
             | Self::Expand { entry, .. } => Some(*entry),
-            Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } => None,
+            Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } | Self::Branch(_) => None,
         }
     }
 
@@ -268,6 +294,9 @@ impl Step {
             Self::Expand { .. } => "trellis expand",
             Self::Reserve { .. } => "stream scratch",
             Self::Clear { .. } => "zero a buffer",
+            Self::Branch(Branch::Fork) => "fork",
+            Self::Branch(Branch::Resume) => "resume",
+            Self::Branch(Branch::Join) => "join",
         }
     }
 }
@@ -393,7 +422,9 @@ impl Plan {
                     u64::from(*blocks).saturating_mul(u64::from(*groups)),
                     u64::from(*block_dim),
                 ),
-                Step::Blas { .. } | Step::Reserve { .. } | Step::Clear { .. } => continue,
+                Step::Blas { .. } | Step::Reserve { .. } | Step::Clear { .. } | Step::Branch(_) => {
+                    continue;
+                }
             };
             if grid == 0 || block == 0 {
                 return Err(CoreError::ShapeMismatch {

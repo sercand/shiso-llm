@@ -79,6 +79,158 @@ extern "C" __global__ void q4e_moe_route_kernel(
     }
 }
 
+/* q4e_moe_route_kernel, q4e_moe_sort_*_kernel and the sort's inverse in one
+ * block, for a pass of at most Q4E_ROUTE_SORT_TOKENS tokens (shiso).
+ *
+ * At a decode step the router's selection and the counting sort were seven
+ * launches of a block or less each - 17 us a layer of dependent latency in
+ * front of the routed GEMMs.  Here warp w routes token w with the logits in
+ * its registers, and the block then sorts every routed column in shared
+ * memory.  Same results, bit for bit:
+ *   - the max and the argmax rounds are order-independent (the argmax is a
+ *     total order: value, then the lower id);
+ *   - the softmax sum is q4e_block_sum's exact order, the 256-thread block
+ *     emulated: virtual thread vt = lane + 32 v sums e = vt, vt + 256, ...,
+ *     each virtual warp reduces with warp_sum_f32, then the eight warp sums;
+ *   - the chosen weights are the same serial loop;
+ *   - bounds and the active list are the scan's ascending walk, and a column's
+ *     place inside its expert is its rank among that expert's columns, which
+ *     the atomic scatter left to chance (nothing reads that order).
+ * n_expert is at most Q4E_ROUTE_SORT_EXPERTS and a multiple of 32. */
+#define Q4E_ROUTE_SORT_TOKENS 32u
+#define Q4E_ROUTE_SORT_EXPERTS 512u
+#define Q4E_ROUTE_SORT_ROWS (Q4E_ROUTE_SORT_TOKENS * 16u)
+#define Q4E_ROUTE_BLOCK 256u  /* the block q4e_moe_route_kernel runs at */
+
+extern "C" __global__ void __launch_bounds__(32u * Q4E_ROUTE_SORT_TOKENS)
+q4e_moe_route_sort_small_kernel(
+        int32_t *ids, float *weights, const float *logits,
+        int32_t *bounds, int32_t *active, int32_t *sorted, int32_t *pos,
+        uint32_t n_tok, uint32_t n_expert, uint32_t n_used) {
+    __shared__ int32_t s_ids[Q4E_ROUTE_SORT_ROWS];
+    __shared__ int32_t s_bounds[Q4E_ROUTE_SORT_EXPERTS + 1u];
+    __shared__ int32_t s_counts[Q4E_ROUTE_SORT_EXPERTS];
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    constexpr uint32_t PER = Q4E_ROUTE_SORT_EXPERTS / 32u;
+
+    for (uint32_t e = threadIdx.x; e < n_expert; e += blockDim.x) s_counts[e] = 0;
+
+    if (warp < n_tok) {
+        const float *row = logits + (uint64_t)warp * n_expert;
+        float v[PER];
+        float m = -INFINITY;
+#pragma unroll
+        for (uint32_t j = 0; j < PER; j++) {
+            const uint32_t e = lane + 32u * j;
+            v[j] = e < n_expert ? row[e] : -INFINITY;
+            if (e < n_expert) m = fmaxf(m, v[j]);
+        }
+        m = warp_max_f32(m);
+        const float s_max = __shfl_sync(0xffffffffu, m, 0);
+        /* q4e_block_sum over a 256-thread block: warp sums, then their sum. */
+        float warp_total = 0.0f;
+        for (uint32_t vw = 0; vw < Q4E_ROUTE_BLOCK / 32u; vw++) {
+            const uint32_t vt = lane + 32u * vw;
+            float sum = 0.0f;
+            for (uint32_t e = vt; e < n_expert; e += Q4E_ROUTE_BLOCK) {
+                sum += __expf(v[e / 32u] - s_max);
+            }
+            sum = warp_sum_f32(sum);
+            const float s_w = __shfl_sync(0xffffffffu, sum, 0);
+            if (lane == vw) warp_total = s_w;
+        }
+        warp_total = warp_sum_f32(warp_total);
+        const float inv_sum = 1.0f / __shfl_sync(0xffffffffu, warp_total, 0);
+
+        float chosen_w[16];
+        int32_t chosen_i[16];
+        for (uint32_t s = 0; s < n_used; s++) {
+            float best = -INFINITY;
+            int32_t best_i = -1;
+#pragma unroll
+            for (uint32_t j = 0; j < PER; j++) {
+                const uint32_t e = lane + 32u * j;
+                if (e < n_expert && v[j] > best) { best = v[j]; best_i = (int32_t)e; }
+            }
+            for (uint32_t d = 16u; d > 0u; d >>= 1) {
+                const float ov = __shfl_down_sync(0xffffffffu, best, d);
+                const int32_t oi = __shfl_down_sync(0xffffffffu, best_i, d);
+                if (ov > best || (ov == best && oi >= 0 && (best_i < 0 || oi < best_i))) { best = ov; best_i = oi; }
+            }
+            const float top = __shfl_sync(0xffffffffu, best, 0);
+            const int32_t top_i = __shfl_sync(0xffffffffu, best_i, 0);
+            chosen_w[s] = top;
+            chosen_i[s] = top_i;
+            if (top_i >= 0 && (uint32_t)top_i % 32u == lane) {
+#pragma unroll
+                for (uint32_t j = 0; j < PER; j++)
+                    if ((uint32_t)top_i / 32u == j) v[j] = -INFINITY;
+            }
+        }
+        if (lane == 0u) {
+            float wsum = 0.0f;
+            for (uint32_t s = 0; s < n_used; s++) {
+                chosen_w[s] = __expf(chosen_w[s] - s_max) * inv_sum;
+                wsum += chosen_w[s];
+            }
+            wsum = fmaxf(wsum, 1e-20f);
+            for (uint32_t s = 0; s < n_used; s++) {
+                ids[(uint64_t)warp * n_used + s] = chosen_i[s];
+                weights[(uint64_t)warp * n_used + s] = chosen_w[s] / wsum;
+                s_ids[warp * n_used + s] = chosen_i[s];
+            }
+        }
+    }
+    __syncthreads();
+
+    const uint32_t n_rows = n_tok * n_used;
+    for (uint32_t i = threadIdx.x; i < n_rows; i += blockDim.x) {
+        const int32_t e = s_ids[i];
+        if (e >= 0 && (uint32_t)e < n_expert) atomicAdd(&s_counts[e], 1);
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        /* q4e_moe_sort_scan_kernel's walk: lane l owns a contiguous run. */
+        const uint32_t per = (n_expert + 31u) / 32u;
+        const uint32_t lo = min(lane * per, n_expert), hi = min(lo + per, n_expert);
+        int32_t rows = 0, live = 0;
+        for (uint32_t e = lo; e < hi; e++) {
+            const int32_t c = s_counts[e];
+            rows += c;
+            live += c > 0;
+        }
+        int32_t rows_at = rows, live_at = live;
+        for (int d = 1; d < 32; d <<= 1) {
+            const int32_t r = __shfl_up_sync(0xffffffffu, rows_at, d);
+            const int32_t a = __shfl_up_sync(0xffffffffu, live_at, d);
+            if ((int)lane >= d) { rows_at += r; live_at += a; }
+        }
+        int32_t total = rows_at - rows, n_active = live_at - live;
+        for (uint32_t e = lo; e < hi; e++) {
+            const int32_t c = s_counts[e];
+            s_bounds[e] = total;
+            bounds[e] = total;
+            total += c;
+            if (c > 0) active[n_active++] = (int32_t)e;
+        }
+        if (lane == 31u) {
+            s_bounds[n_expert] = total;
+            bounds[n_expert] = total;
+            active[n_expert] = n_active;
+        }
+    }
+    __syncthreads();
+    for (uint32_t i = threadIdx.x; i < n_rows; i += blockDim.x) {
+        const int32_t e = s_ids[i];
+        if (e < 0 || (uint32_t)e >= n_expert) continue;
+        int32_t rank = 0;
+        for (uint32_t j = 0; j < i; j++) rank += s_ids[j] == e;
+        const int32_t at = s_bounds[e] + rank;
+        sorted[at] = (int32_t)i;
+        pos[i] = at;
+    }
+}
+
 /* out = silu(gate) * up over the routed intermediate. */
 extern "C" __global__ void q4e_swiglu_kernel(float *out, const float *gate, const float *up, uint64_t n) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;

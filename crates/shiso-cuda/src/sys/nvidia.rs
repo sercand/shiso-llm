@@ -33,8 +33,8 @@ use parking_lot::Mutex;
 use shiso_core::Extent3;
 
 use super::{
-    CuBlas, CuBlasLt, CuContext, CuDevice, CuFunction, CuGraph, CuGraphExec, CuModule, CuStream,
-    DevicePtr, GemmCall, GemmStride, MathType, Op, PinnedPtr, SysError, SysResult,
+    CuBlas, CuBlasLt, CuContext, CuDevice, CuEvent, CuFunction, CuGraph, CuGraphExec, CuModule,
+    CuStream, DevicePtr, GemmCall, GemmStride, MathType, Op, PinnedPtr, SysError, SysResult,
 };
 
 /// Turns a driver status into a result, naming the failing entry point.
@@ -282,6 +282,74 @@ pub(crate) unsafe fn stream_synchronize(stream: CuStream) -> SysResult<()> {
     // SAFETY: the caller guarantees the handle is live.
     check("cuStreamSynchronize", unsafe {
         cu::cuStreamSynchronize(stream.raw() as cu::CUstream)
+    })
+}
+
+/// Opens an event that records ordering only, not time.
+///
+/// # Errors
+///
+/// [`SysError::Driver`] when the device refuses an event.
+pub(crate) fn event_create() -> SysResult<CuEvent> {
+    let mut event: cu::CUevent = std::ptr::null_mut();
+    // SAFETY: `event` is a live local of the type the driver writes.
+    check("cuEventCreate", unsafe {
+        cu::cuEventCreate(
+            &raw mut event,
+            cu::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
+        )
+    })?;
+    Ok(CuEvent::from_raw(event as usize))
+}
+
+/// Closes an event.
+///
+/// # Safety
+///
+/// `event` must be live and must not be destroyed twice.
+///
+/// # Errors
+///
+/// [`SysError::Driver`] when the driver refuses the destroy.
+pub(crate) unsafe fn event_destroy(event: CuEvent) -> SysResult<()> {
+    // SAFETY: the caller guarantees the handle is live and unreleased.
+    check("cuEventDestroy", unsafe {
+        cu::cuEventDestroy_v2(event.raw() as cu::CUevent)
+    })
+}
+
+/// Marks the point `stream` has reached. Inside a capture this is a node the
+/// graph orders later nodes against rather than a host-visible time.
+///
+/// # Safety
+///
+/// `event` and `stream` must be live.
+///
+/// # Errors
+///
+/// [`SysError::Driver`] when the driver refuses the record.
+pub(crate) unsafe fn event_record(event: CuEvent, stream: CuStream) -> SysResult<()> {
+    // SAFETY: the caller guarantees both handles are live.
+    check("cuEventRecord", unsafe {
+        cu::cuEventRecord(event.raw() as cu::CUevent, stream.raw() as cu::CUstream)
+    })
+}
+
+/// Makes everything queued on `stream` from now on wait for `event`. Waiting
+/// on an event recorded in a capturing stream is what pulls `stream` into
+/// that capture as a parallel branch.
+///
+/// # Safety
+///
+/// `stream` and `event` must be live.
+///
+/// # Errors
+///
+/// [`SysError::Driver`] when the driver refuses the wait.
+pub(crate) unsafe fn stream_wait_event(stream: CuStream, event: CuEvent) -> SysResult<()> {
+    // SAFETY: the caller guarantees both handles are live.
+    check("cuStreamWaitEvent", unsafe {
+        cu::cuStreamWaitEvent(stream.raw() as cu::CUstream, event.raw() as cu::CUevent, 0)
     })
 }
 

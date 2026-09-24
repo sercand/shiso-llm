@@ -45,7 +45,7 @@ use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef, WeightSet};
 use crate::sparse::exl3::{self, Fanout};
 use crate::sparse::kernels::{self, Entry, MOD_EXL3, MOD_MOE, TemplateArgs};
 use crate::sparse::matmul::{self, Bound, Device};
-use crate::sparse::plan::{Plan, Step, TrellisOp};
+use crate::sparse::plan::{Branch, Plan, Step, TrellisOp};
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
 use crate::sparse::weights::{ExpertDesc, WeightPart};
@@ -204,18 +204,7 @@ pub fn route(
     n_tok: u32,
     device: Device,
 ) -> CoreResult<Plan> {
-    let mut plan = Plan::new();
-    matmul::project(
-        &mut plan,
-        desc.router,
-        Bound::new(
-            WeightRef::layer(layer, Role::Router),
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::MoeRouter),
-        ),
-        n_tok,
-        device,
-    )?;
+    let mut plan = router_logits(desc, layer, n_tok, device)?;
     plan.launch(
         Entry::plain(MOD_MOE, "q4e_moe_route_kernel"),
         kernels::moe_route(shape.moe.experts, n_tok),
@@ -229,6 +218,78 @@ pub fn route(
         ]),
     );
     Ok(plan)
+}
+
+/// The router's projection alone, into [`Buf::MoeRouter`].
+///
+/// # Errors
+///
+/// Whatever [`matmul::project`] reports.
+pub fn router_logits(
+    desc: &ExpertDesc,
+    layer: LayerRef,
+    n_tok: u32,
+    device: Device,
+) -> CoreResult<Plan> {
+    let mut plan = Plan::new();
+    matmul::project(
+        &mut plan,
+        desc.router,
+        Bound::new(
+            WeightRef::layer(layer, Role::Router),
+            Operand::Scratch(Buf::Mixed),
+            Operand::Scratch(Buf::MoeRouter),
+        ),
+        n_tok,
+        device,
+    )?;
+    Ok(plan)
+}
+
+/// Tokens up to which the routed selection, the sort and its inverse run as
+/// one launch (`Q4E_ROUTE_SORT_TOKENS`).
+pub const ROUTE_SORT_MAX_TOKENS: u32 = 32;
+/// Experts the one-launch selection holds in registers
+/// (`Q4E_ROUTE_SORT_EXPERTS`).
+const ROUTE_SORT_MAX_EXPERTS: u32 = 512;
+
+/// Whether a pass takes [`route_sort`].
+#[must_use]
+pub const fn route_sorts(shape: &SparseShape, n_tok: u32) -> bool {
+    n_tok <= ROUTE_SORT_MAX_TOKENS
+        && shape.moe.experts <= ROUTE_SORT_MAX_EXPERTS
+        && shape.moe.experts.is_multiple_of(32)
+        && shape.moe.used <= 16
+}
+
+/// The routed selection, the sort by expert and the sort's inverse, as one
+/// block: the same ids, weights, bounds and active list as `route`'s selection
+/// followed by [`sort`], and the inverse the decode-shaped prep reads.
+///
+/// At a decode step those were seven launches of a block or less each, 17 us a
+/// layer of dependent latency in front of the routed projections.
+#[must_use]
+pub fn route_sort(shape: &SparseShape, n_tok: u32) -> Plan {
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::plain(MOD_MOE, "q4e_moe_route_sort_small_kernel"),
+        kernels::Launch::linear(1, 32 * ROUTE_SORT_MAX_TOKENS),
+        // `ids, weights, logits, bounds, active, sorted, pos, n_tok,
+        //  n_expert, n_used`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeIds),
+            Operand::Scratch(Buf::MoeWeights),
+            Operand::Scratch(Buf::MoeRouter),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            Operand::Scratch(Buf::MoeSorted),
+            Operand::Scratch(Buf::MoeWsPos),
+            Operand::U32(n_tok),
+            Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+        ]),
+    );
+    plan
 }
 
 /// The sort that groups the routed columns by expert.
@@ -584,7 +645,8 @@ pub const WSD_MAX_ROWS: u32 = 32;
 
 /// The experts' own stage for a decode step, a verify pass or a decode batch:
 /// the same prep as [`ws_experts`], then the decode-shaped gate and up, their
-/// epilogue, and the down projection. [`wsd_combine`] finishes it.
+/// epilogue, and the down projection. [`wsd_combine`] finishes it. The sort's
+/// inverse is [`route_sort`]'s, which every pass this takes runs first.
 ///
 /// # Errors
 ///
@@ -628,23 +690,6 @@ pub fn wsd_experts(
     let bits_key = TemplateArgs::TrellisBits(bits);
     let block = kernels::EXL3_MOE_WSD_WARPS * 32;
     let mut plan = Plan::new();
-    plan.launch(
-        Entry::template(
-            MOD_EXL3,
-            kernels::EXL3_MOE_WS_INVERT,
-            TemplateArgs::Untemplated,
-        ),
-        kernels::Launch::linear(
-            kernels::blocks_for(u64::from(rows), u64::from(threads)),
-            threads,
-        ),
-        // `pos, slot_sorted, n_rows`
-        Args::of(&[
-            Operand::Scratch(Buf::MoeWsPos),
-            Operand::Scratch(Buf::MoeSorted),
-            width(rows),
-        ]),
-    );
     let warps = u64::from(rows) * u64::from(hidden / tile);
     plan.launch(
         Entry::template(
@@ -1152,6 +1197,24 @@ pub fn shared_projections(
     n_tok: u32,
     device: Device,
 ) -> CoreResult<Plan> {
+    let mut plan = shared_expert(shape, desc, layer, n_tok, device)?;
+    plan.append(shared_logit(desc, layer, n_tok, device)?);
+    Ok(plan)
+}
+
+/// The shared expert's three projections and its activation, into
+/// [`Buf::SharedOut`]: everything of [`shared_projections`] but the gate logit.
+///
+/// # Errors
+///
+/// Whatever [`matmul::project_pair`] and [`matmul::project`] report.
+pub fn shared_expert(
+    shape: &SparseShape,
+    desc: &ExpertDesc,
+    layer: LayerRef,
+    n_tok: u32,
+    device: Device,
+) -> CoreResult<Plan> {
     let at = |role: Role| WeightRef::layer(layer, role);
     let n = u64::from(n_tok) * u64::from(shape.moe.intermediate);
     let mut plan = Plan::new();
@@ -1194,6 +1257,22 @@ pub fn shared_projections(
         n_tok,
         device,
     )?;
+    Ok(plan)
+}
+
+/// The shared expert's gate logit, into [`Buf::SharedLogit`].
+///
+/// # Errors
+///
+/// Whatever [`matmul::project`] reports.
+pub fn shared_logit(
+    desc: &ExpertDesc,
+    layer: LayerRef,
+    n_tok: u32,
+    device: Device,
+) -> CoreResult<Plan> {
+    let at = |role: Role| WeightRef::layer(layer, role);
+    let mut plan = Plan::new();
     matmul::project(
         &mut plan,
         desc.shared_router,
@@ -1255,27 +1334,71 @@ pub fn block(
             backend: "engine",
         });
     };
-    let mut plan = route(shape, desc, layer, n_tok, device)?;
-    if n_tok <= grouped_max(layer.set) {
-        plan.append(grouped_experts(shape, layer, bits, n_tok, device)?);
-    } else {
-        // The weight-stationary path writes its slot outputs as halves, and
-        // its combine adds the shared expert in the same pass, so the shared
-        // expert's projections run first.
-        plan.append(sort(shape, n_tok));
-        if n_tok <= WSD_MAX_ROWS {
-            plan.append(wsd_experts(shape, layer, bits, n_tok)?);
-            plan.append(shared_projections(shape, desc, layer, n_tok, device)?);
-            plan.append(wsd_combine(shape, layer, n_tok));
-            return Ok(plan);
+    // The shared expert reads only the block input and writes only its own
+    // buffers, and on the decode-shaped launches its projections are latency
+    // bound - 35 us a layer at a third of the bandwidth - so it runs as a
+    // branch beside the router and the routed launches. Only when those carve
+    // none of the per-stream scratch the branch's launches use: a router over
+    // more than sixteen rows widens its weight into it outside a capture, and
+    // the two corrupted each other. The gate logit is a half-precision
+    // projection, whose split sums share a buffer with the router's, so it
+    // stays on the main stream.
+    let wsd = n_tok <= WSD_MAX_ROWS && route_sorts(shape, n_tok);
+    if n_tok > grouped_max(layer.set)
+        && matmul::pair_decoded(&desc.shared_gate, n_tok, device)
+        && matmul::pair_decoded(&desc.shared_down, n_tok, device)
+        && let Some(main) = {
+            let main = if wsd {
+                let mut main = router_logits(desc, layer, n_tok, device)?;
+                main.append(route_sort(shape, n_tok));
+                main.append(wsd_experts(shape, layer, bits, n_tok)?);
+                main
+            } else {
+                let mut main = route(shape, desc, layer, n_tok, device)?;
+                main.append(sort(shape, n_tok));
+                main.append(ws_experts(shape, layer, bits, n_tok)?);
+                main
+            };
+            (main.staging().bytes == 0).then_some(main)
         }
-        plan.append(ws_experts(shape, layer, bits, n_tok)?);
-        plan.append(shared_projections(shape, desc, layer, n_tok, device)?);
-        plan.append(ws_combine(shape, n_tok));
+    {
+        let mut plan = Plan::new();
+        plan.push(Step::Branch(Branch::Fork));
+        plan.append(shared_expert(shape, desc, layer, n_tok, device)?);
+        plan.push(Step::Branch(Branch::Resume));
+        plan.append(main);
+        plan.push(Step::Branch(Branch::Join));
+        plan.append(shared_logit(desc, layer, n_tok, device)?);
+        plan.append(if wsd {
+            wsd_combine(shape, layer, n_tok)
+        } else {
+            ws_combine(shape, n_tok)
+        });
         return Ok(plan);
     }
-    plan.append(combine(shape, n_tok));
-    plan.append(shared(shape, desc, layer, n_tok, device)?);
+    if n_tok <= grouped_max(layer.set) {
+        let mut plan = route(shape, desc, layer, n_tok, device)?;
+        plan.append(grouped_experts(shape, layer, bits, n_tok, device)?);
+        plan.append(combine(shape, n_tok));
+        plan.append(shared(shape, desc, layer, n_tok, device)?);
+        return Ok(plan);
+    }
+    // The weight-stationary path writes its slot outputs as halves, and its
+    // combine adds the shared expert in the same pass, so the shared expert's
+    // projections run first.
+    if wsd {
+        let mut plan = router_logits(desc, layer, n_tok, device)?;
+        plan.append(route_sort(shape, n_tok));
+        plan.append(wsd_experts(shape, layer, bits, n_tok)?);
+        plan.append(shared_projections(shape, desc, layer, n_tok, device)?);
+        plan.append(wsd_combine(shape, layer, n_tok));
+        return Ok(plan);
+    }
+    let mut plan = route(shape, desc, layer, n_tok, device)?;
+    plan.append(sort(shape, n_tok));
+    plan.append(ws_experts(shape, layer, bits, n_tok)?);
+    plan.append(shared_projections(shape, desc, layer, n_tok, device)?);
+    plan.append(ws_combine(shape, n_tok));
     Ok(plan)
 }
 

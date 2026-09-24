@@ -35,7 +35,7 @@ use shiso_core::{CoreError, CoreResult, DeviceView, RawBuffer};
 
 use crate::CudaBackend;
 use crate::sys::nvidia;
-use crate::sys::{CuContext, CuDevice, CuStream, DevicePtr, SysResult, host_error};
+use crate::sys::{CuContext, CuDevice, CuEvent, CuStream, DevicePtr, SysResult, host_error};
 
 /// The ordinal this process bound to, once anything has bound one.
 ///
@@ -97,6 +97,34 @@ impl Drop for OwnedStream {
     }
 }
 
+/// One event, closed on drop.
+#[derive(Debug)]
+pub(crate) struct OwnedEvent(CuEvent);
+
+impl OwnedEvent {
+    /// Opens an event.
+    pub(crate) fn open() -> SysResult<Self> {
+        nvidia::event_create().map(Self)
+    }
+
+    /// The handle, for a call that is about to use it.
+    pub(crate) const fn get(&self) -> CuEvent {
+        self.0
+    }
+}
+
+impl Drop for OwnedEvent {
+    fn drop(&mut self) {
+        // SAFETY: this is the only owner of the handle and it has not been
+        // destroyed, because destruction happens here and only here.
+        if let Err(err) = unsafe { nvidia::event_destroy(self.0) }
+            && !err.is_teardown_noop()
+        {
+            tracing::error!(error = %err, "event destroy failed");
+        }
+    }
+}
+
 /// One retain of a device's primary context, released on drop.
 #[derive(Debug)]
 struct OwnedContext {
@@ -131,6 +159,12 @@ pub(crate) struct DeviceCtx {
     /// use-after-free, and field order is what enforces that.
     work: OwnedStream,
     capture: OwnedStream,
+    /// The branch streams a fork runs on, one beside each of the two above.
+    side_work: OwnedStream,
+    side_capture: OwnedStream,
+    /// Where the main stream was at the fork, and the branch at its end.
+    fork_event: OwnedEvent,
+    join_event: OwnedEvent,
     ctx: OwnedContext,
     multiprocessors: u32,
     /// Whether the device shares its memory with the host; see
@@ -159,10 +193,18 @@ impl DeviceCtx {
         let integrated = nvidia::integrated(device)?;
         let work = OwnedStream::open()?;
         let capture = OwnedStream::open()?;
+        let side_work = OwnedStream::open()?;
+        let side_capture = OwnedStream::open()?;
+        let fork_event = OwnedEvent::open()?;
+        let join_event = OwnedEvent::open()?;
         tracing::debug!(ordinal, multiprocessors, integrated, "opened CUDA device");
         Ok(Self {
             work,
             capture,
+            side_work,
+            side_capture,
+            fork_event,
+            join_event,
             ctx,
             multiprocessors,
             integrated,
@@ -196,6 +238,26 @@ impl DeviceCtx {
     /// The stream a graph capture runs on.
     pub(crate) const fn capture_stream(&self) -> CuStream {
         self.capture.get()
+    }
+
+    /// The branch stream beside the work stream.
+    pub(crate) const fn side_work_stream(&self) -> CuStream {
+        self.side_work.get()
+    }
+
+    /// The branch stream beside the capture stream.
+    pub(crate) const fn side_capture_stream(&self) -> CuStream {
+        self.side_capture.get()
+    }
+
+    /// The event a fork records on the main stream.
+    pub(crate) const fn fork_event(&self) -> CuEvent {
+        self.fork_event.get()
+    }
+
+    /// The event the end of a branch records on its stream.
+    pub(crate) const fn join_event(&self) -> CuEvent {
+        self.join_event.get()
     }
 
     /// Multiprocessors on this device, for sizing a cooperative grid.

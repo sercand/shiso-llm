@@ -61,6 +61,8 @@ pub(crate) struct GraphCache {
     dead: HashSet<GraphKey>,
     /// Whether the "no free graph slots" warning has already been emitted.
     warned_full: bool,
+    /// Whether launches go to the branch stream a fork opened.
+    branch: bool,
 }
 
 impl GraphCache {
@@ -75,11 +77,33 @@ impl GraphCache {
     /// ordinary work goes to the work stream, and while a capture is running it
     /// goes to the capture stream instead. Nothing else in the launch path
     /// knows that graphs exist.
+    ///
+    /// Between a fork and the resume that ends its branch, work goes to the
+    /// branch stream beside whichever of the two is current.
     pub(crate) const fn stream(&self, device: &DeviceCtx) -> CuStream {
+        match (self.capturing.is_some(), self.branch) {
+            (true, false) => device.capture_stream(),
+            (true, true) => device.side_capture_stream(),
+            (false, false) => device.work_stream(),
+            (false, true) => device.side_work_stream(),
+        }
+    }
+
+    /// The main stream, whatever branch is open.
+    const fn main_stream(&self, device: &DeviceCtx) -> CuStream {
         if self.capturing.is_some() {
             device.capture_stream()
         } else {
             device.work_stream()
+        }
+    }
+
+    /// The branch stream beside the main one.
+    const fn side_stream(&self, device: &DeviceCtx) -> CuStream {
+        if self.capturing.is_some() {
+            device.side_capture_stream()
+        } else {
+            device.side_work_stream()
         }
     }
 
@@ -593,4 +617,68 @@ mod tests {
         let cache = cache();
         assert_eq!(cache.get(GraphKey::new(42)), None);
     }
+}
+
+/// Opens a branch: the branch stream waits for everything queued on the main
+/// stream so far, and launches go to it until [`resume`].
+///
+/// # Errors
+///
+/// [`shiso_core::CoreError::Backend`] when a branch is already open, and when
+/// the driver refuses the record or the wait.
+pub(crate) fn fork(backend: &CudaBackend) -> CoreResult<()> {
+    backend.device.bind()?;
+    let mut state = backend.state.lock();
+    if state.graphs.branch {
+        return Err(host_error("fork", "a fork inside an open branch"));
+    }
+    let main = state.graphs.main_stream(&backend.device);
+    let side = state.graphs.side_stream(&backend.device);
+    let event = backend.device.fork_event();
+    // SAFETY: both streams and the event are owned by `backend.device` and
+    // live for as long as it does.
+    unsafe { nvidia::event_record(event, main) }?;
+    // SAFETY: as above.
+    unsafe { nvidia::stream_wait_event(side, event) }?;
+    state.graphs.branch = true;
+    Ok(())
+}
+
+/// Ends a branch's launches: the branch stream marks where it got to, and
+/// launches go back to the main stream, which runs on beside it until
+/// [`join`].
+///
+/// # Errors
+///
+/// [`shiso_core::CoreError::Backend`] when no branch is open, and when the
+/// driver refuses the record.
+pub(crate) fn resume(backend: &CudaBackend) -> CoreResult<()> {
+    backend.device.bind()?;
+    let mut state = backend.state.lock();
+    if !state.graphs.branch {
+        return Err(host_error("resume", "a resume with no branch open"));
+    }
+    let side = state.graphs.side_stream(&backend.device);
+    // SAFETY: the stream and the event are owned by `backend.device`.
+    unsafe { nvidia::event_record(backend.device.join_event(), side) }?;
+    state.graphs.branch = false;
+    Ok(())
+}
+
+/// Makes the main stream wait for the branch that last resumed.
+///
+/// # Errors
+///
+/// [`shiso_core::CoreError::Backend`] when a branch is still open, and when
+/// the driver refuses the wait.
+pub(crate) fn join(backend: &CudaBackend) -> CoreResult<()> {
+    backend.device.bind()?;
+    let state = backend.state.lock();
+    if state.graphs.branch {
+        return Err(host_error("join", "a join inside an open branch"));
+    }
+    let main = state.graphs.main_stream(&backend.device);
+    // SAFETY: the stream and the event are owned by `backend.device`.
+    unsafe { nvidia::stream_wait_event(main, backend.device.join_event()) }?;
+    Ok(())
 }

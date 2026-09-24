@@ -18,8 +18,8 @@ use std::ffi::{CStr, c_void};
 use shiso_core::Extent3;
 
 use super::{
-    CuBlas, CuBlasLt, CuContext, CuDevice, CuFunction, CuGraph, CuGraphExec, CuModule, CuStream,
-    DevicePtr, GemmCall, GemmStride, PinnedPtr, SysError, SysResult,
+    CuBlas, CuBlasLt, CuContext, CuDevice, CuEvent, CuFunction, CuGraph, CuGraphExec, CuModule,
+    CuStream, DevicePtr, GemmCall, GemmStride, PinnedPtr, SysError, SysResult,
 };
 
 /// Initialises the driver.
@@ -127,6 +127,54 @@ pub(crate) unsafe fn stream_destroy(_stream: CuStream) -> SysResult<()> {
 /// Always, on this target.
 pub(crate) unsafe fn stream_synchronize(_stream: CuStream) -> SysResult<()> {
     Err(SysError::no_driver("cuStreamSynchronize"))
+}
+
+/// Opens an event that records ordering only.
+///
+/// # Errors
+///
+/// Always, on this target.
+pub(crate) fn event_create() -> SysResult<CuEvent> {
+    Err(SysError::no_driver("cuEventCreate"))
+}
+
+/// Closes an event.
+///
+/// # Safety
+///
+/// `event` must be live and must not be destroyed twice.
+///
+/// # Errors
+///
+/// Always, on this target.
+pub(crate) unsafe fn event_destroy(_event: CuEvent) -> SysResult<()> {
+    Err(SysError::no_driver("cuEventDestroy"))
+}
+
+/// Marks the point a stream has reached.
+///
+/// # Safety
+///
+/// `event` and `stream` must be live.
+///
+/// # Errors
+///
+/// Always, on this target.
+pub(crate) unsafe fn event_record(_event: CuEvent, _stream: CuStream) -> SysResult<()> {
+    Err(SysError::no_driver("cuEventRecord"))
+}
+
+/// Makes a stream wait for an event.
+///
+/// # Safety
+///
+/// `stream` and `event` must be live.
+///
+/// # Errors
+///
+/// Always, on this target.
+pub(crate) unsafe fn stream_wait_event(_stream: CuStream, _event: CuEvent) -> SysResult<()> {
+    Err(SysError::no_driver("cuStreamWaitEvent"))
 }
 
 /// Reserves device memory.

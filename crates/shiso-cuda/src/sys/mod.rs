@@ -266,6 +266,11 @@ opaque_handle!(
     usize
 );
 opaque_handle!(
+    /// An event: a marker in one stream that another can wait on.
+    CuEvent,
+    usize
+);
+opaque_handle!(
     /// A loaded kernel module.
     CuModule,
     usize

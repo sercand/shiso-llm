@@ -30,7 +30,7 @@ use shiso_core::error::{CoreError, CoreResult};
 use crate::sparse::bind::{Binder, Operand};
 use crate::sparse::island::{self, Island, IslandRun};
 use crate::sparse::kernels::EntryTable;
-use crate::sparse::plan::{Step, TrellisOp};
+use crate::sparse::plan::{Branch, Step, TrellisOp};
 use crate::sparse::scratch::Buf;
 use crate::sparse::stack::{IslandSpan, Pass};
 use crate::sparse::tap::{ResidualTap, TapPoint};
@@ -125,6 +125,7 @@ fn step_geometry(step: &Step) -> String {
         ),
         Step::Reserve { bytes } => format!("{bytes} bytes"),
         Step::Clear { .. } => "zeros".to_owned(),
+        Step::Branch(branch) => format!("{branch:?}"),
         Step::Blas { m, n, k, .. } => format!("m {m} n {n} k {k}"),
     }
 }
@@ -146,7 +147,8 @@ fn destination(step: &Step) -> usize {
         | Step::Expand { .. }
         | Step::Blas { .. }
         | Step::Reserve { .. }
-        | Step::Clear { .. } => 0,
+        | Step::Clear { .. }
+        | Step::Branch(_) => 0,
     }
 }
 
@@ -158,6 +160,7 @@ fn step_name(step: &Step) -> &'static str {
         }
         Step::Reserve { .. } => "reserve scratch",
         Step::Clear { .. } => "zero a buffer",
+        Step::Branch(_) => "branch",
         Step::Blas { .. } => "matrix multiply",
     }
 }
@@ -238,6 +241,9 @@ impl<'a> Exec<'a> {
             // Zeroing is a step, not a side effect of allocation: see
             // `Step::Clear`.
             Step::Clear { buffer } => self.backend.fill_zero(self.binder.buffer(*buffer)?),
+            Step::Branch(Branch::Fork) => self.backend.fork(),
+            Step::Branch(Branch::Resume) => self.backend.resume(),
+            Step::Branch(Branch::Join) => self.backend.join(),
             // The whole grid of a trellis launch has to be resident at once,
             // because its blocks hand partial sums down the lock chain at the
             // head of the per-stream scratch. That is a different launch call,
@@ -510,6 +516,7 @@ impl<'a> Exec<'a> {
                 }
                 Step::Blas { .. } => report.multiplies = report.multiplies.saturating_add(1),
                 Step::Clear { .. } => report.cleared = report.cleared.saturating_add(1),
+                Step::Branch(_) => {}
             }
         }
         Ok(report)
