@@ -468,10 +468,12 @@ fn trellis(
 
 /// Rows up to which a dense trellis projection takes the decode-shaped launch.
 ///
-/// A decode step, a verify pass and a decode batch all fit, so all three run
-/// one arithmetic per row. Past it a pass is a prefill chunk, which the
-/// cooperative kernel and then the expansion serve.
-pub const TRELLIS_DECODE_MAX_ROWS: u32 = 32;
+/// The same bound the cooperative kernel holds below the expansion, and it has
+/// to be: every pass up to it sums a row the same way, so a short prompt
+/// prefilled alone and one prefilled in a pass beside other sessions' prompts
+/// get the same bits. Drawn at 32 instead, a prompt's text depended on what it
+/// was batched with (measured: two identical requests in one batch diverged).
+pub const TRELLIS_DECODE_MAX_ROWS: u32 = kernels::EXL3_RECONSTRUCT_ROWS;
 
 /// Width at or below which one side of a dense trellis weight has to be for
 /// the decode-shaped launch to take it.
