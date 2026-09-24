@@ -612,6 +612,70 @@ impl SparseStack {
     }
 }
 
+/// The prompt lookup beside the head.
+impl SparseStack {
+    /// The drafts a step verifies: the prompt lookup's proposal when it is
+    /// longer than the head's chain and starts with the head's first guess
+    /// ([`mtp::lookup_beats_head`]), the head's chain otherwise.
+    ///
+    /// A guess either way - the verify pass decides what is kept - so the
+    /// lookup changes how many tokens a step can commit and never which.
+    fn lookup_or_head(
+        &self,
+        session: SessionId,
+        first: TokenId,
+        head: Vec<TokenId>,
+        budget: u32,
+        eos: TokenId,
+    ) -> CoreResult<(Vec<TokenId>, Option<DraftSource>)> {
+        let fallback = |head: Vec<TokenId>| {
+            let source = (!head.is_empty()).then_some(DraftSource::Head);
+            (head, source)
+        };
+        let reach = self.opts.lookup_drafts.min(budget);
+        if reach == 0 {
+            return Ok(fallback(head));
+        }
+        let live = self.session(session)?;
+        let Some(spec) = live.spec.as_ref() else {
+            return Ok(fallback(head));
+        };
+        let policy = mtp::NgramPolicy::new(reach, mtp::NGRAM_MIN_MATCH, eos);
+        let proposal = mtp::propose(
+            live.history(),
+            first,
+            spec.generated_from,
+            &spec.lookup_fails,
+            policy,
+        );
+        let head_drafts = u32::try_from(head.len()).unwrap_or(u32::MAX);
+        match proposal {
+            Some(proposal)
+                if mtp::lookup_beats_head(&proposal, head_drafts, head.first().copied()) =>
+            {
+                tracing::trace!(%session, len = proposal.len(), "prompt lookup drafts the step");
+                let id = proposal.id();
+                Ok((proposal.tokens().to_vec(), Some(DraftSource::Lookup(id))))
+            }
+            _ => Ok(fallback(head)),
+        }
+    }
+
+    /// Writes a rejected lookup proposal into the session's failure ring.
+    fn remember_lookup(&mut self, session: SessionId, outcome: &StepOutcome) -> CoreResult<()> {
+        if let Some(id) = outcome.failed_lookup() {
+            let live = self
+                .sessions
+                .get_mut(&session)
+                .ok_or(CoreError::UnknownSession(session))?;
+            if let Some(spec) = live.spec.as_mut() {
+                spec.lookup_fails.remember(id);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The tokens a speculative step drafted and what the target made of them.
 impl SparseStack {
     /// One speculative decode step: draft, verify, settle.
@@ -644,7 +708,8 @@ impl SparseStack {
         let live = self.session(session)?;
         let (depth, frontier) = (live.spec_depth(), live.written());
         let budget = mtp::draft_budget(depth, frontier, self.opts.engine.ctx, MAX_DRAFT + 1);
-        let drafts = self.chain(session, first, frontier, budget)?;
+        let head = self.chain(session, first, frontier, budget.min(self.opts.head_depth()))?;
+        let (drafts, source) = self.lookup_or_head(session, first, head, budget, eos)?;
 
         // The verify pass: the committed token and every guess behind it, at
         // consecutive positions from the frontier. Its row `i` is the target's
@@ -661,8 +726,9 @@ impl SparseStack {
             &drafts,
             picks.get(..drafts.len()).unwrap_or(&[]),
             eos,
-            (!drafts.is_empty()).then_some(DraftSource::Head),
+            source,
         )?;
+        self.remember_lookup(session, &outcome)?;
         // The rewind before the commit, and both before the row is staged: the
         // staged row is the residual of the last *committed* position, and the
         // rewind is what makes the recurrent state agree with it.
@@ -769,7 +835,13 @@ impl SparseStack {
             let live = self.session(session)?;
             let (depth, frontier) = (live.spec_depth(), live.written());
             let budget = mtp::draft_budget(depth, frontier, self.opts.engine.ctx, MAX_DRAFT + 1);
-            plans.push((session, first, frontier, budget));
+            plans.push((
+                session,
+                first,
+                frontier,
+                budget.min(self.opts.head_depth()),
+                budget,
+            ));
         }
         // One batched draft pass a step when every session drafts as deep - the
         // usual case, since the depth is the server's and only the end of a
@@ -782,17 +854,22 @@ impl SparseStack {
             self.chain_batch(&sessions, &firsts, &frontiers, plans[0].3)?
         } else {
             let mut chains = Vec::with_capacity(plans.len());
-            for &(session, first, frontier, budget) in &plans {
-                chains.push(self.chain(session, first, frontier, budget)?);
+            for &(session, first, frontier, head, _) in &plans {
+                chains.push(self.chain(session, first, frontier, head)?);
             }
             chains
         };
+        // Each session's own prompt lookup, beside its own chain: the runs of a
+        // segmented verify need not be one length.
         let mut runs: Vec<(SessionId, u32, Vec<TokenId>)> = Vec::with_capacity(steps.len());
-        for (&(session, first, frontier, _), drafts) in plans.iter().zip(chains) {
+        let mut sources = Vec::with_capacity(steps.len());
+        for (&(session, first, frontier, _, budget), head) in plans.iter().zip(chains) {
+            let (drafts, source) = self.lookup_or_head(session, first, head, budget, eos)?;
             let mut rows = Vec::with_capacity(drafts.len().saturating_add(1));
             rows.push(first);
             rows.extend_from_slice(&drafts);
             runs.push((session, frontier, rows));
+            sources.push(source);
         }
         let borrowed = runs
             .iter()
@@ -818,7 +895,7 @@ impl SparseStack {
 
         let mut settled = Vec::with_capacity(runs.len());
         let mut start = 0usize;
-        for (session, frontier, rows) in &runs {
+        for ((session, frontier, rows), source) in runs.iter().zip(sources) {
             let drafts = rows.get(1..).unwrap_or(&[]);
             let first = rows.first().copied().ok_or(CoreError::ShapeMismatch {
                 field: "verify run rows",
@@ -831,8 +908,9 @@ impl SparseStack {
                 drafts,
                 own.get(..drafts.len()).unwrap_or(&[]),
                 eos,
-                (!drafts.is_empty()).then_some(DraftSource::Head),
+                source,
             )?;
+            self.remember_lookup(*session, &outcome)?;
             if let Some(rewind) = outcome.rollback {
                 self.spec_rollback(*session, rewind)?;
             }

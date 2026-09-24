@@ -767,9 +767,18 @@ fn sparse_options(
         .map_or(shiso_engine::sparse::MAX_PREFILL_CHUNK as usize, |widths| {
             widths.solo_chunk.max(widths.mixed_quantum)
         });
+    // The lookup proposes past the head's chain, so the depth the records are
+    // sized for is the deeper of the two; the head still chains its own.
+    let depth = SpecDepth::new(args.spec_k.max(args.spec_lookup));
     SparseOptions {
         engine,
-        spec: SpecDepth::new(args.spec_k),
+        spec: depth,
+        head_drafts: args.spec_k,
+        lookup_drafts: if args.spec_k > 0 { args.spec_lookup } else { 0 },
+        graphs: shiso_engine::sparse::island::GraphPolicy {
+            spec_depth: depth.get(),
+            capture_verify: args.capture_verify,
+        },
         entries,
         co_resident_blocks,
         prefill_rows: SparseOptions::prefill_rows_for(widest),

@@ -138,6 +138,16 @@ pub struct SparseOptions {
     /// (every routed expert is read once per pass) for key/value pool. A
     /// prompt longer than this is split rather than refused.
     pub prefill_rows: u32,
+    /// Drafts the head chains a step, at most [`SparseOptions::spec`].
+    ///
+    /// The depth sizes the records a verify can roll back, and a prompt lookup
+    /// proposes past what the head chains: its first token agreeing with the
+    /// head's is the evidence the echo is real, and the rest of the depth is
+    /// the echo's (see [`SparseOptions::lookup_drafts`]).
+    pub head_drafts: u32,
+    /// Tokens the prompt lookup may propose a step, zero for none; at most
+    /// [`SparseOptions::spec`]. See [`crate::sparse::mtp::propose`].
+    pub lookup_drafts: u32,
 }
 
 impl SparseOptions {
@@ -163,6 +173,20 @@ impl SparseOptions {
             ngram_cache_bytes: NGRAM_CACHE_BYTES,
             ngram_reader: shiso_ple::PleConfig::DEFAULT,
             prefill_rows: MAX_PREFILL_CHUNK,
+            head_drafts: u32::MAX,
+            lookup_drafts: 0,
+        }
+    }
+
+    /// Drafts the head chains a step: [`SparseOptions::head_drafts`] within
+    /// the depth.
+    #[must_use]
+    pub const fn head_depth(&self) -> u32 {
+        let depth = self.spec.get();
+        if self.head_drafts < depth {
+            self.head_drafts
+        } else {
+            depth
         }
     }
 }
@@ -237,6 +261,12 @@ pub(crate) struct SpecState {
     /// Whether [`SpecState::pending`] holds a row, and therefore whether the
     /// draft head can run at all on the next step.
     pub(crate) pending_valid: bool,
+    /// Where this turn's own tokens begin in the history: the frontier the
+    /// last prompt left. The prompt lookup keys only on tokens past it.
+    pub(crate) generated_from: u32,
+    /// The lookup proposals this session saw rejected, which it does not
+    /// propose again from the same place.
+    pub(crate) lookup_fails: crate::sparse::mtp::FailRing,
 }
 
 /// One live session.
@@ -924,6 +954,8 @@ impl SparseStack {
                     u64::from(self.shape.stream_dim()).saturating_mul(F32_BYTES),
                 )?,
                 pending_valid: false,
+                generated_from: 0,
+                lookup_fails: crate::sparse::mtp::FailRing::new(),
             })
         } else {
             None

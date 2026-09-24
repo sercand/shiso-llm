@@ -231,6 +231,25 @@ pub struct ServeArgs {
     /// architecture's arm rather than to a union-of-all-models options struct.
     #[arg(long, env = "SHISO_SPEC_K", default_value_t = 0)]
     pub spec_k: u32,
+    /// Prompt-lookup drafts: tokens a step may propose by finding the text
+    /// being written earlier in the context. Zero is off.
+    ///
+    /// Taken in place of the draft head's chain only when it is longer and its
+    /// first token is the head's own first guess, which is the evidence that
+    /// the text is an echo; a rejected proposal is not made again from the
+    /// same place. The verify pass is `1 + max(--spec-k, this)` rows at the
+    /// widest, which is what the per-session rollback records are sized for.
+    /// Read by the sparse family's arm, and only beside `--spec-k`.
+    #[arg(long, env = "SHISO_SPEC_LOOKUP", default_value_t = 0)]
+    pub spec_lookup: u32,
+    /// Capture the speculative verify passes as device graphs, one per row
+    /// count and session, as the single-row step already is.
+    ///
+    /// Off, a verify pass is encoded launch by launch every step: thousands of
+    /// launches whose host cost shows as gaps between them. On, the first pass
+    /// at each width pays a capture. Read by the sparse family's arm.
+    #[arg(long, env = "SHISO_CAPTURE_VERIFY", default_value_t = false)]
+    pub capture_verify: bool,
     /// The draft head: a sidecar weights file beside the checkpoint.
     ///
     /// Absent means one token a step. Present, and with `--spec-k` above zero,
@@ -504,7 +523,7 @@ impl ServeArgs {
                 flag: "max-num-batched-tokens",
             });
         }
-        let rows_per_seq = usize::try_from(self.spec_k)
+        let rows_per_seq = usize::try_from(self.spec_k.max(self.spec_lookup))
             .unwrap_or(usize::MAX)
             .saturating_add(1);
         let decode_rows = self.max_num_seqs.saturating_mul(rows_per_seq);

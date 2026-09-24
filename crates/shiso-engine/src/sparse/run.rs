@@ -66,7 +66,22 @@ impl SparseStack {
     /// empty chunk, and whatever the planner, the streaming tier, the device or
     /// the cache report.
     pub fn prefill_chunk(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<()> {
-        self.advance_over(session, tokens, false, None)
+        self.advance_over(session, tokens, false, None)?;
+        self.mark_prompt_end(session)
+    }
+
+    /// Records the session's frontier as where its next generated tokens
+    /// begin, which is what the prompt lookup keys past.
+    fn mark_prompt_end(&mut self, session: SessionId) -> CoreResult<()> {
+        let live = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        let written = live.written;
+        if let Some(spec) = live.spec.as_mut() {
+            spec.generated_from = written;
+        }
+        Ok(())
     }
 
     /// Advances a session by its final prompt chunk and returns the row its
@@ -83,6 +98,7 @@ impl SparseStack {
         tokens: &[TokenId],
     ) -> CoreResult<Logits<'_>> {
         self.advance_over(session, tokens, true, None)?;
+        self.mark_prompt_end(session)?;
         self.logits(1)
     }
 
@@ -116,6 +132,7 @@ impl SparseStack {
         // launches back by handing over no items.
         let media = (!media.is_empty()).then_some(media);
         self.advance_over(session, tokens, true, media)?;
+        self.mark_prompt_end(session)?;
         self.logits(1)
     }
 
