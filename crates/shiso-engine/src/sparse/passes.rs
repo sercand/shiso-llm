@@ -706,7 +706,7 @@ impl SparseStack {
     /// slot and a capture of its own, never a replay of this one. Starting
     /// over drops every captured graph first, so a slot handed out again cannot
     /// name a graph of the pass it used to mean.
-    fn batch_slot(&self, rows: &[&SparseSession], plan: &Plan) -> CoreResult<u32> {
+    pub(crate) fn batch_slot(&self, rows: &[&SparseSession], plan: &Plan) -> CoreResult<u32> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for row in rows {

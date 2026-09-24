@@ -367,19 +367,42 @@ impl SparseStack {
             self.device(),
             DraftRows::Sequential,
         )?;
+        // A chain step is the same shape every time and worth capturing, and
+        // its key cannot alias a target island's: it is filed under the slot
+        // the registry gives this exact pass - its session and every launch
+        // and operand, the head's own weights among them - behind a layer
+        // index no target layer has. Only when the verify passes are captured
+        // too, and only the one-row chain step.
+        let capture = n_tok == 1 && pick && self.opts.graphs.capture_verify;
+        let islands = if capture {
+            let slot = self.batch_slot(&[self.session(session)?], &plan)?;
+            let start = plan
+                .steps()
+                .iter()
+                .take_while(|step| matches!(step, crate::sparse::plan::Step::Reserve { .. }))
+                .count();
+            vec![crate::sparse::stack::IslandSpan {
+                key: island::IslandKey {
+                    layer: LayerIdx::new(DRAFT_ISLAND_LAYER),
+                    island: Island::Mixer,
+                    rows: 1,
+                    selected: false,
+                    context: island::IslandContext::Batched(slot),
+                },
+                start,
+                len: plan.len().saturating_sub(start),
+            }]
+        } else {
+            Vec::new()
+        };
         let pass = Pass {
             // The draft head runs over rows the target already read, so it
             // splices nothing: the embeddings it starts from are the target's
             // own, picture rows included.
             media_rows: None,
             plan,
-            // Not captured. A chain step is the same shape every time and is
-            // worth capturing, but an island whose replay bound the *target's*
-            // weights would be a draft that predicted from the target's first
-            // layer - so the capture keys have to learn about the weight set
-            // before this may.
-            islands: Vec::new(),
-            capturable: false,
+            islands,
+            capturable: capture,
             selected: false,
             rows: n_tok,
             origin: RowOrigin::Sequential,
@@ -611,6 +634,10 @@ impl SparseStack {
         })
     }
 }
+
+/// The layer index a captured draft chain step is filed under: past every
+/// target layer a key can name, so the two can never share a slot.
+const DRAFT_ISLAND_LAYER: u32 = 0xffff;
 
 /// The prompt lookup beside the head.
 impl SparseStack {
