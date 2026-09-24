@@ -1056,18 +1056,29 @@ impl Coordinator {
         }
     }
 
-    /// Files a cold prefix, when the policy says it is worth one.
+    /// Files a prompt's prefix, when the policy says it is worth one.
+    ///
+    /// A cold prompt is filed as one. So is a resumed prompt that this process
+    /// prefilled past the stored prefix it resumed from - the next turn of a
+    /// conversation, which the following turn resumes from in turn - filed as a
+    /// continuation; leaving it out left every later turn resuming from the
+    /// first one's prompt and prefilling the rest of the conversation again. A
+    /// prompt the resume covered whole is already on disk under its own text.
     fn store_cold(&mut self, at: usize) {
         let Some(slot) = self.slots.slots().get(at) else {
             return;
         };
-        if !slot.was_cold()
-            || !slot.checkpointable()
-            || !self.cfg.store.stores_cold(slot.frontier_len())
-        {
+        if !slot.checkpointable() || !self.cfg.store.stores_cold(slot.frontier_len()) {
             return;
         }
-        self.store_frontier(at, Reason::Cold);
+        let reason = if slot.was_cold() {
+            Reason::Cold
+        } else if slot.cached_tokens() < u64::from(slot.frontier_len()) {
+            Reason::Continued
+        } else {
+            return;
+        };
+        self.store_frontier(at, reason);
     }
 
     /// Files a growing conversation's prefix on the configured interval.
