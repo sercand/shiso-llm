@@ -183,6 +183,29 @@ fn every_path() -> Plan {
             .expect("every stored format here has a gather"),
         );
     }
+    // The packed half-precision tier at every rung of its ladder: the
+    // per-row kernel, its passes, and both expansions a prefill chunk takes -
+    // the narrow router's to floats for the strict multiply, the stream mix's
+    // to halves for the half-precision one.
+    for (in_dim, out_dim, rows) in [
+        (shape.hidden, shape.moe.experts, 1_u32),
+        (shape.hidden, shape.moe.experts, 32),
+        (shape.hidden, shape.moe.experts, 512),
+        (shape.stream_dim(), shape.stream_rank, 512),
+    ] {
+        matmul::project(
+            &mut plan,
+            WeightDesc::new(DType::F16Pack12, in_dim, out_dim),
+            Bound::new(
+                WeightRef::layer(LayerRef::target(0), Role::Router),
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(Buf::MoeRouter),
+            ),
+            rows,
+            GPU,
+        )
+        .expect("a packed half-precision weight has a tier at every row count");
+    }
     plan.append(hyper::init(&shape, 1));
     plan.append(hyper::init_add(
         &shape,

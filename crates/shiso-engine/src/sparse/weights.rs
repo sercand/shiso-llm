@@ -213,6 +213,51 @@ impl Weight {
         }
     }
 
+    /// Imports a half-precision matrix repacked to [`DType::F16Pack12`], or
+    /// `None` when its contraction is not one the packing covers - the caller
+    /// then imports the halves as they are.
+    ///
+    /// `halves` is the tensor's stored bytes, row-major over `out_dim` rows of
+    /// `in_dim`; see [`crate::sparse::pack12`] for what the packing is and why
+    /// it is lossless.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Backend`] when the upload fails.
+    pub fn packed_half(
+        backend: &Arc<dyn Backend>,
+        in_dim: u32,
+        out_dim: u32,
+        halves: &[u8],
+    ) -> CoreResult<Option<Self>> {
+        let bits = halves
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect::<Vec<_>>();
+        let Some(bytes) = crate::sparse::pack12::pack(&bits, in_dim, out_dim) else {
+            return Ok(None);
+        };
+        // Copied rather than imported: an import keeps its host bytes alive
+        // beside the device's copy, and on a device that shares its memory
+        // with the host these are a gibibyte nobody reads again. The ledger
+        // tag is the caller's scope, as an import's is.
+        let buffer = shiso_core::buffer::alloc_tagged(
+            backend,
+            shiso_core::ledger::current(),
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        )?;
+        backend.copy_h2d(buffer.view(), &bytes)?;
+        Ok(Some(Self {
+            dtype: DType::F16Pack12,
+            in_dim,
+            out_dim,
+            slots: 1,
+            buffer,
+        }))
+    }
+
     /// Wraps a buffer this crate produced as a weight of the given shape.
     ///
     /// The import above is for bytes a container holds; this is for bytes a

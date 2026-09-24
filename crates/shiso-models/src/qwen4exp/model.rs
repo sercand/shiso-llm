@@ -197,7 +197,7 @@ impl Qwen4ExpModel {
             .layers
             .first()
             .map_or(binding.token_embd.dtype, |layer| layer.experts.gate.dtype);
-        let mut weights = import(backend, &file, &binding)?;
+        let mut weights = import(backend, &file, &binding, opts.pack_halves)?;
         if let Some(sidecar) = draft {
             let _tag = ledger::scope(MemTag::DraftWeights);
             // Its own mapping, dropped with the target's: the head's tensors
@@ -205,7 +205,13 @@ impl Qwen4ExpModel {
             let head = GgufFile::open_shared(sidecar).map_err(open_failure)?;
             let bound = bind_draft(&head, config)?;
             let rank = config.shape().count(shiso_engine::shape::LayerKind::Attn);
-            weights.draft = Some(import_draft(backend, &head, &bound, rank)?);
+            weights.draft = Some(import_draft(
+                backend,
+                &head,
+                &bound,
+                rank,
+                opts.pack_halves,
+            )?);
             drop(bound);
             drop(head);
             if let Some(list) = counts {
@@ -385,6 +391,7 @@ fn import_draft(
     file: &GgufFile,
     binding: &DraftBinding<'_>,
     rank: u32,
+    pack: bool,
 ) -> CoreResult<DraftHead> {
     let BlockRoles::Attn(roles) = &binding.layer.block else {
         return Err(CoreError::Unsupported {
@@ -398,14 +405,14 @@ fn import_draft(
         fc_embed: weight(backend, file, &binding.fc_embed)?,
         fc_hidden: weight(backend, file, &binding.fc_hidden)?,
         layer: SparseLayer {
-            attn_mix: import_mix(backend, file, &binding.layer.attn_mix)?,
-            ffn_mix: import_mix(backend, file, &binding.layer.ffn_mix)?,
+            attn_mix: import_mix(backend, file, &binding.layer.attn_mix, pack)?,
+            ffn_mix: import_mix(backend, file, &binding.layer.ffn_mix, pack)?,
             block: SparseBlock::Attn(import_attn(backend, file, roles)?),
-            experts: import_experts(backend, file, &binding.layer.experts)?,
+            experts: import_experts(backend, file, &binding.layer.experts, pack)?,
             ngram: None,
             ordinal: rank,
         },
-        output_mix: import_mix(backend, file, &binding.output_mix)?,
+        output_mix: import_mix(backend, file, &binding.output_mix, pack)?,
         head: None,
     })
 }
@@ -415,6 +422,7 @@ fn import(
     backend: &Arc<dyn Backend>,
     file: &GgufFile,
     binding: &ModelBinding<'_>,
+    pack: bool,
 ) -> CoreResult<SparseWeights> {
     let mut gdn_rank = 0;
     let mut attn_rank = 0;
@@ -426,7 +434,7 @@ fn import(
                 gdn_rank += 1;
                 let _tag = ledger::scope(MemTag::WeightsRecurrent);
                 (
-                    SparseBlock::Recurrent(import_recurrent(backend, file, roles)?),
+                    SparseBlock::Recurrent(import_recurrent(backend, file, roles, pack)?),
                     rank,
                 )
             }
@@ -438,19 +446,19 @@ fn import(
             }
         };
         let mix = ledger::scope(MemTag::WeightsStreamMix);
-        let attn_mix = import_mix(backend, file, &layer.attn_mix)?;
-        let ffn_mix = import_mix(backend, file, &layer.ffn_mix)?;
+        let attn_mix = import_mix(backend, file, &layer.attn_mix, pack)?;
+        let ffn_mix = import_mix(backend, file, &layer.ffn_mix, pack)?;
         drop(mix);
         let experts = {
             let _tag = ledger::scope(MemTag::WeightsExperts);
-            import_experts(backend, file, &layer.experts)?
+            import_experts(backend, file, &layer.experts, pack)?
         };
         let ngram = {
             let _tag = ledger::scope(MemTag::WeightsEmbedding);
             layer
                 .ngram
                 .as_ref()
-                .map(|roles| import_ngram(backend, file, roles))
+                .map(|roles| import_ngram(backend, file, roles, pack))
                 .transpose()?
         };
         layers.push(SparseLayer {
@@ -473,7 +481,7 @@ fn import(
         .map(|view| weight(backend, file, view))
         .transpose()?;
     // The mix that folds the streams back into one row is part of the head.
-    let output_mix = import_mix(backend, file, &binding.output_mix)?;
+    let output_mix = import_mix(backend, file, &binding.output_mix, pack)?;
     Ok(SparseWeights {
         token_embd,
         lm_head,
@@ -488,15 +496,16 @@ fn import_mix(
     backend: &Arc<dyn Backend>,
     file: &GgufFile,
     roles: &MixRoles<'_>,
+    pack: bool,
 ) -> CoreResult<StreamMix> {
     Ok(StreamMix {
         norm: vector(backend, file, &roles.norm)?,
-        down: weight(backend, file, &roles.down)?,
-        up: weight(backend, file, &roles.up)?,
+        down: projection(backend, file, &roles.down, pack)?,
+        up: projection(backend, file, &roles.up, pack)?,
         inject: roles
             .inject
             .as_ref()
-            .map(|view| weight(backend, file, view))
+            .map(|view| projection(backend, file, view, pack))
             .transpose()?,
     })
 }
@@ -506,13 +515,14 @@ fn import_experts(
     backend: &Arc<dyn Backend>,
     file: &GgufFile,
     roles: &ExpertRoles<'_>,
+    pack: bool,
 ) -> CoreResult<ExpertBank> {
     Ok(ExpertBank {
-        router: weight(backend, file, &roles.router)?,
+        router: projection(backend, file, &roles.router, pack)?,
         gate: weight(backend, file, &roles.gate)?,
         up: weight(backend, file, &roles.up)?,
         down: weight(backend, file, &roles.down)?,
-        shared_router: weight(backend, file, &roles.shared_router)?,
+        shared_router: projection(backend, file, &roles.shared_router, pack)?,
         shared_gate: weight(backend, file, &roles.shared_gate)?,
         shared_up: weight(backend, file, &roles.shared_up)?,
         shared_down: weight(backend, file, &roles.shared_down)?,
@@ -546,12 +556,13 @@ fn import_recurrent(
     backend: &Arc<dyn Backend>,
     file: &GgufFile,
     roles: &RecurrentRoles<'_>,
+    pack: bool,
 ) -> CoreResult<Recurrent> {
     Ok(Recurrent {
         qkv: weight(backend, file, &roles.qkv)?,
         gate: weight(backend, file, &roles.gate)?,
-        alpha: weight(backend, file, &roles.alpha)?,
-        beta: weight(backend, file, &roles.beta)?,
+        alpha: projection(backend, file, &roles.alpha, pack)?,
+        beta: projection(backend, file, &roles.beta, pack)?,
         out: weight(backend, file, &roles.out)?,
         conv1d: vector(backend, file, &roles.conv1d)?,
         a: vector(backend, file, &roles.a)?,
@@ -565,10 +576,11 @@ fn import_ngram(
     backend: &Arc<dyn Backend>,
     file: &GgufFile,
     roles: &NgramRoles<'_>,
+    pack: bool,
 ) -> CoreResult<NgramBlock> {
     Ok(NgramBlock {
-        key: weight(backend, file, &roles.key)?,
-        value: weight(backend, file, &roles.value)?,
+        key: projection(backend, file, &roles.key, pack)?,
+        value: projection(backend, file, &roles.value, pack)?,
         norm_key: vector(backend, file, &roles.norm_key)?,
         norm_query: vector(backend, file, &roles.norm_query)?,
         norm_conv: vector(backend, file, &roles.norm_conv)?,
@@ -616,6 +628,39 @@ fn weight(
     )?;
     release(backend, file, range);
     Ok(weight)
+}
+
+/// Imports one projection matrix, repacking a half-precision one to twelve
+/// bits a weight when `pack` asks for it (see
+/// [`shiso_engine::sparse::pack12`]): lossless, and a quarter fewer bytes for
+/// every decode step to stream. A matrix the packing does not cover is
+/// imported as it is stored.
+fn projection(
+    backend: &Arc<dyn Backend>,
+    file: &GgufFile,
+    view: &TensorView<'_>,
+    pack: bool,
+) -> CoreResult<Weight> {
+    let dims = view.shape.dims();
+    if pack && view.dtype == DType::F16 && dims.len() == 2 {
+        let in_dim = extent(dims.first().copied().unwrap_or(0))?;
+        let out_dim = extent(dims.get(1).copied().unwrap_or(1))?;
+        let range = range_of(file, view)?;
+        let mapping = file.mapping();
+        let stored =
+            AsRef::<[u8]>::as_ref(&*mapping)
+                .get(range.clone())
+                .ok_or(CoreError::OutOfBounds {
+                    offset: range.start as u64,
+                    len: (range.end - range.start) as u64,
+                    buffer_bytes: 0,
+                })?;
+        if let Some(packed) = Weight::packed_half(backend, in_dim, out_dim, stored)? {
+            release(backend, file, range);
+            return Ok(packed);
+        }
+    }
+    weight(backend, file, view)
 }
 
 /// Hands an imported tensor's file pages back to the kernel, where the device

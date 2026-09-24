@@ -56,6 +56,7 @@ pub mod media;
 mod memory;
 pub mod moe;
 pub mod mtp;
+pub mod pack12;
 pub mod paged;
 pub mod passes;
 pub mod plan;

@@ -206,6 +206,18 @@ pub enum Projection {
         /// Rows the call covers.
         rows: u32,
     },
+    /// A packed half-precision weight ([`DType::F16Pack12`]) expanded once
+    /// into the per-stream staging - to the halves it was, or to the floats
+    /// they are - and multiplied by the BLAS tier exactly as
+    /// [`Projection::HalfBlas`] or [`Projection::HalfExact`] multiplies the
+    /// stored halves.
+    PackedExpanded {
+        /// What the expansion writes: halves for the half-precision tier,
+        /// floats for the strict one.
+        wide: Elem,
+        /// Rows the call covers.
+        rows: u32,
+    },
     /// A brain-float weight through the warp-per-row kernel.
     BrainRows {
         /// The projection itself.
@@ -290,6 +302,7 @@ pub fn plan(
     match dtype {
         DType::F32 => Ok(float(in_dim, out_dim)),
         DType::F16 => half(in_dim, out_dim, rows, device),
+        DType::F16Pack12 => packed_half(in_dim, out_dim, rows, device),
         DType::BF16 => brain(in_dim, out_dim, rows),
         DType::Exl3K4 | DType::Exl3K5 | DType::Exl3K6 => {
             trellis(dtype, in_dim, out_dim, rows, device)
@@ -394,6 +407,76 @@ fn half(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Proj
         }),
         rows: pass,
     })
+}
+
+/// The packed half-precision tier: [`half`]'s ladder over the twelve-bit
+/// repack, the per-row kernel reading the packed planes and the two BLAS tiers
+/// reading the weight expanded back to what the checkpoint stored.
+fn packed_half(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Projection> {
+    if !in_dim.is_multiple_of(crate::sparse::pack12::PACK12_COLUMN_QUANTUM) {
+        return Err(CoreError::ShapeMismatch {
+            field: "packed half-precision contraction width",
+            expected: u64::from(crate::sparse::pack12::PACK12_COLUMN_QUANTUM),
+            got: u64::from(in_dim),
+        });
+    }
+    Ok(match half(in_dim, out_dim, rows, device)? {
+        Projection::HalfExact { rows } => Projection::PackedExpanded {
+            wide: Elem::F32,
+            rows,
+        },
+        Projection::HalfBlas { rows } => Projection::PackedExpanded {
+            wide: Elem::F16,
+            rows,
+        },
+        Projection::HalfRows {
+            launch,
+            chunk,
+            combine,
+            rows,
+            ..
+        } => Projection::HalfRows {
+            entry: Entry::template(
+                MOD_MATVEC,
+                "q4e_matmul_p12_rows_kernel",
+                TemplateArgs::Rows(rows),
+            ),
+            launch,
+            chunk,
+            combine,
+            rows,
+        },
+        other => other,
+    })
+}
+
+/// The expansion of a packed half-precision weight into the staging.
+fn expand_packed(out: &mut Plan, weight: WeightDesc, w: Operand, wide: Elem) {
+    let elements = u64::from(weight.in_dim) * u64::from(weight.out_dim);
+    let width = match wide {
+        Elem::F16 => 2,
+        Elem::F32 => 4,
+    };
+    out.push(Step::Expand {
+        entry: Entry::template(
+            MOD_MATVEC,
+            "q4e_p12_expand_kernel",
+            TemplateArgs::Elem(wide),
+        ),
+        k: weight.in_dim,
+        n: weight.out_dim,
+        // The element width being restored; this step decodes no trellis.
+        bits: 16,
+        launch: Launch::linear(weight.out_dim, 256),
+        staging: Staging::of(elements * width),
+        // `dst, w, in_dim, out_dim`
+        args: Args::of(&[
+            Operand::CoopStaging(0),
+            w,
+            Operand::U32(weight.in_dim),
+            Operand::U32(weight.out_dim),
+        ]),
+    });
 }
 
 /// The brain-float tier, which has no split.
@@ -614,14 +697,16 @@ pub fn project(
     device: Device,
 ) -> CoreResult<()> {
     let passes = match weight.dtype {
-        DType::F16 => half_in_passes(weight.in_dim, weight.out_dim, rows, device),
+        DType::F16 | DType::F16Pack12 => {
+            half_in_passes(weight.in_dim, weight.out_dim, rows, device)
+        }
         // The brain-float tier has no BLAS path, so passes are its only way
         // through a chunk - a draft head's catch-up over the prompt is one.
         DType::BF16 => rows > MAX_ROWS,
         _ => false,
     };
     if passes {
-        let width = if weight.dtype == DType::F16 {
+        let width = if matches!(weight.dtype, DType::F16 | DType::F16Pack12) {
             HALF_MAX_ROWS
         } else {
             MAX_ROWS
@@ -667,15 +752,21 @@ pub fn project_on_blas(
     device: Device,
     io: (Elem, Elem),
 ) -> CoreResult<()> {
-    if !matches!(
-        plan(weight.dtype, weight.in_dim, weight.out_dim, rows, device)?,
-        Projection::HalfBlas { .. }
-    ) {
-        return Err(CoreError::Unsupported {
-            what: "a half-precision stream mix whose weight is not on the BLAS tier",
-            backend: "engine",
-        });
-    }
+    let a = match plan(weight.dtype, weight.in_dim, weight.out_dim, rows, device)? {
+        Projection::HalfBlas { .. } => Operand::Weight(bound.weight),
+        Projection::PackedExpanded {
+            wide: Elem::F16, ..
+        } => {
+            expand_packed(out, weight, Operand::Weight(bound.weight), Elem::F16);
+            Operand::CoopStaging(0)
+        }
+        _ => {
+            return Err(CoreError::Unsupported {
+                what: "a half-precision stream mix whose weight is not on the BLAS tier",
+                backend: "engine",
+            });
+        }
+    };
     let (input, output) = io;
     let b = match input {
         Elem::F16 => bound.src,
@@ -693,7 +784,7 @@ pub fn project_on_blas(
         lda: weight.in_dim,
         ldb: weight.in_dim,
         ldc: weight.out_dim,
-        a: Operand::Weight(bound.weight),
+        a,
         b,
         c: bound.dst,
         dtype: match output {
@@ -715,10 +806,14 @@ pub fn half_streams<'a>(
     device: Device,
 ) -> bool {
     let on_blas = |weight: &WeightDesc| {
-        weight.dtype == DType::F16
+        matches!(weight.dtype, DType::F16 | DType::F16Pack12)
             && matches!(
                 plan(weight.dtype, weight.in_dim, weight.out_dim, rows, device),
-                Ok(Projection::HalfBlas { .. })
+                Ok(Projection::HalfBlas { .. }
+                    | Projection::PackedExpanded {
+                        wide: Elem::F16,
+                        ..
+                    })
             )
     };
     let mut any = false;
@@ -883,6 +978,44 @@ fn project_one(
                 c: bound.dst,
                 dtype: GemmDType::F32Strict,
             });
+        }
+        // The expansion, then the multiply the stored halves would have taken,
+        // reading the staging where it would have read the weight.
+        Projection::PackedExpanded { wide, rows } => {
+            expand_packed(out, weight, w, wide);
+            match wide {
+                Elem::F16 => {
+                    let b = half_input(out, bound.src, weight.in_dim, rows, device);
+                    out.push(Step::Blas {
+                        op_a: GemmOp::Transposed,
+                        op_b: GemmOp::AsStored,
+                        m: weight.out_dim,
+                        n: rows,
+                        k: weight.in_dim,
+                        lda: weight.in_dim,
+                        ldb: weight.in_dim,
+                        ldc: weight.out_dim,
+                        a: Operand::CoopStaging(0),
+                        b,
+                        c: bound.dst,
+                        dtype: GemmDType::F16,
+                    });
+                }
+                Elem::F32 => out.push(Step::Blas {
+                    op_a: GemmOp::Transposed,
+                    op_b: GemmOp::AsStored,
+                    m: weight.out_dim,
+                    n: rows,
+                    k: weight.in_dim,
+                    lda: weight.in_dim,
+                    ldb: weight.in_dim,
+                    ldc: weight.out_dim,
+                    a: Operand::CoopStaging(0),
+                    b: bound.src,
+                    c: bound.dst,
+                    dtype: GemmDType::F32Strict,
+                }),
+            }
         }
         Projection::Trellis {
             shape,

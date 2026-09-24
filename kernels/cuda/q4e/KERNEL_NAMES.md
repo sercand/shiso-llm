@@ -11,7 +11,7 @@ Two kinds of entry live in these units, and they are fetched differently.
 answers to, verbatim. There are 57 of them.
 
 **Template kernels** do not. They are instantiated explicitly at the bottom of
-their translation unit - 121 instantiations across 10 templates - and each one
+their translation unit - 155 instantiations across 12 templates - and each one
 gets a C++-mangled name that depends on the compiler's mangling of its argument
 list. Those names are NOT written out below, and guessing them would be the
 worst kind of plausible: a mangled name that is subtly wrong fails at lookup
@@ -259,6 +259,40 @@ identify the kernel a captured name belongs to.
 | `q4e_matmul_f16_rows_kernel` | `30, float, float` |
 | `q4e_matmul_f16_rows_kernel` | `31, float, float` |
 | `q4e_matmul_f16_rows_kernel` | `32, float, float` |
+| `q4e_matmul_p12_rows_kernel` | `1` |
+| `q4e_matmul_p12_rows_kernel` | `2` |
+| `q4e_matmul_p12_rows_kernel` | `3` |
+| `q4e_matmul_p12_rows_kernel` | `4` |
+| `q4e_matmul_p12_rows_kernel` | `5` |
+| `q4e_matmul_p12_rows_kernel` | `6` |
+| `q4e_matmul_p12_rows_kernel` | `7` |
+| `q4e_matmul_p12_rows_kernel` | `8` |
+| `q4e_matmul_p12_rows_kernel` | `9` |
+| `q4e_matmul_p12_rows_kernel` | `10` |
+| `q4e_matmul_p12_rows_kernel` | `11` |
+| `q4e_matmul_p12_rows_kernel` | `12` |
+| `q4e_matmul_p12_rows_kernel` | `13` |
+| `q4e_matmul_p12_rows_kernel` | `14` |
+| `q4e_matmul_p12_rows_kernel` | `15` |
+| `q4e_matmul_p12_rows_kernel` | `16` |
+| `q4e_matmul_p12_rows_kernel` | `17` |
+| `q4e_matmul_p12_rows_kernel` | `18` |
+| `q4e_matmul_p12_rows_kernel` | `19` |
+| `q4e_matmul_p12_rows_kernel` | `20` |
+| `q4e_matmul_p12_rows_kernel` | `21` |
+| `q4e_matmul_p12_rows_kernel` | `22` |
+| `q4e_matmul_p12_rows_kernel` | `23` |
+| `q4e_matmul_p12_rows_kernel` | `24` |
+| `q4e_matmul_p12_rows_kernel` | `25` |
+| `q4e_matmul_p12_rows_kernel` | `26` |
+| `q4e_matmul_p12_rows_kernel` | `27` |
+| `q4e_matmul_p12_rows_kernel` | `28` |
+| `q4e_matmul_p12_rows_kernel` | `29` |
+| `q4e_matmul_p12_rows_kernel` | `30` |
+| `q4e_matmul_p12_rows_kernel` | `31` |
+| `q4e_matmul_p12_rows_kernel` | `32` |
+| `q4e_p12_expand_kernel` | `__half` |
+| `q4e_p12_expand_kernel` | `float` |
 | `q4e_matmul_f16_rows_kernel` | `1, __half, float` |
 | `q4e_matmul_f16_rows_kernel` | `2, __half, float` |
 | `q4e_matmul_f16_rows_kernel` | `3, __half, float` |

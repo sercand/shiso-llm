@@ -258,6 +258,15 @@ pub struct ServeArgs {
     /// step waiting on the host. Read by the sparse family's arm.
     #[arg(long, env = "SHISO_CAPTURE_BATCH", default_value_t = false)]
     pub capture_batch: bool,
+    /// Keep half-precision projections as the checkpoint stores them rather
+    /// than repacking them to twelve bits a weight at load.
+    ///
+    /// The repack is lossless - every weight decodes to its stored half - and
+    /// a decode step streams a quarter fewer of those bytes; this is the way
+    /// back to the stored form for a comparison. Read by the sparse family's
+    /// arm.
+    #[arg(long, env = "SHISO_NO_PACK_HALVES", default_value_t = false)]
+    pub no_pack_halves: bool,
     /// The draft head: a sidecar weights file beside the checkpoint.
     ///
     /// Absent means one token a step. Present, and with `--spec-k` above zero,

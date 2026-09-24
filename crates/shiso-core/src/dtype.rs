@@ -82,6 +82,19 @@ pub enum DType {
     ///
     /// [`block_bytes`]: DType::block_bytes
     Nvfp4Gs16 = 203,
+    /// Half precision whose values are brain-float values, repacked by the
+    /// engine at load into twelve bits a weight: a byte of sign and the seven
+    /// mantissa bits a brain float has, and a four-bit exponent code against a
+    /// per-row base, with the few values that fit neither - the subnormals and
+    /// those far below their row's largest - kept exactly in a per-row list
+    /// beside the planes. Lossless: every weight decodes to its stored half.
+    ///
+    /// Never read from a file. [`block_bytes`] is **3** over two elements -
+    /// the two planes - and, as for [`DType::Nvfp4Gs16`], the rest of the
+    /// payload is not in the block.
+    ///
+    /// [`block_bytes`]: DType::block_bytes
+    F16Pack12 = 204,
 }
 
 impl DType {
@@ -151,6 +164,7 @@ impl DType {
             Self::MlxAffine8Gs64 => "mlx_affine_8_gs64",
             Self::Fp8E4M3 => "fp8_e4m3",
             Self::Nvfp4Gs16 => "nvfp4_gs16",
+            Self::F16Pack12 => "f16_pack12",
         }
     }
 }
@@ -163,6 +177,7 @@ impl DType {
         let elems = match self {
             Self::F32 | Self::F16 | Self::BF16 | Self::I32 | Self::Fp8E4M3 => 1,
             Self::Nvfp4Gs16 => 16,
+            Self::F16Pack12 => 2,
             Self::Q4_0 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::IQ4_NL | Self::MXFP4 => 32,
             Self::MlxAffine4Gs64 | Self::MlxAffine8Gs64 => 64,
             Self::Exl3Ngram6 => 160,
@@ -211,6 +226,8 @@ impl DType {
             // that covers it: both live in arrays of their own. See the
             // variant's own note for why this is the useful convention.
             Self::Nvfp4Gs16 => 8,
+            // The two planes of two weights; see the variant.
+            Self::F16Pack12 => 3,
         };
         expect_nonzero(bytes)
     }

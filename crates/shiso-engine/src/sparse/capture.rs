@@ -265,6 +265,11 @@ fn classify(module: &'static str, template: &str, args: &[Arg]) -> Option<Instan
             "q4e_matmul_q8_0_rows_warp_kernel",
             TemplateArgs::Rows(int(args, 0)?),
         ),
+        "q4e_matmul_p12_rows_kernel" => of(
+            "q4e_matmul_p12_rows_kernel",
+            TemplateArgs::Rows(int(args, 0)?),
+        ),
+        "q4e_p12_expand_kernel" => of("q4e_p12_expand_kernel", TemplateArgs::Elem(kind(args, 0)?)),
         "q4e_matmul_f16_rows_kernel" => of(
             "q4e_matmul_f16_rows_kernel",
             TemplateArgs::RowsIo {

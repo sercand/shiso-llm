@@ -774,6 +774,7 @@ fn sparse_options(
         engine,
         spec: depth,
         head_drafts: args.spec_k,
+        pack_halves: !args.no_pack_halves,
         lookup_drafts: if args.spec_k > 0 { args.spec_lookup } else { 0 },
         graphs: shiso_engine::sparse::island::GraphPolicy {
             spec_depth: depth.get(),

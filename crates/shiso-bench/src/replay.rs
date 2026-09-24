@@ -422,6 +422,9 @@ fn load_loaded(
                 spec: SpecDepth::NONE,
                 entries,
                 co_resident_blocks: capture::co_resident_blocks(backend.as_ref(), entries),
+                // The server's default, so a replay grades the weights a
+                // server streams.
+                pack_halves: true,
                 ..SparseOptions::default()
             };
             return Ok(Loaded::Sparse(Box::new(Qwen4ExpModel::load(

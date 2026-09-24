@@ -1,6 +1,7 @@
 /*
  * Deltas against the source, and nothing else: D1 (extern "C" linkage on the non-template kernels), D2 (explicit template instantiations),
  * D3 (external linkage on the template kernels: an explicit instantiation of a `static` template is emitted as a non-`.visible` entry the driver cannot resolve).
+ * D4 (shiso): q4e_matmul_p12_rows_kernel and q4e_p12_expand_kernel, for the engine's twelve-bit repack of half-precision weights.
  * No line of kernel arithmetic was edited, reordered or
  * reformatted; a change to any of it is a defect, not a cleanup.
  */
@@ -196,6 +197,127 @@ __global__ void q4e_matmul_f16_rows_kernel(
         const float v = warp_sum_f32(acc[t]);
         if (lane == 0u) q4e_store(dst + (uint64_t)t * out_dim + row, v);
     }
+}
+
+/* Half precision packed to twelve bits a weight (shiso; DType::F16Pack12).
+ *
+ * The checkpoint's half-precision tensors hold brain-float values: seven
+ * mantissa bits, and exponents that within one row span sixteen values at
+ * most.  So a weight is a byte of sign and mantissa and a four-bit exponent
+ * code against a per-row base, and the ~0.1% that fit neither (subnormals,
+ * exponents far below the row's largest, a set low mantissa bit) are kept
+ * exactly in a per-row list, with code zero - value zero - in the planes.
+ * Every weight decodes to its stored half; a quarter of the bytes are gone.
+ *
+ * One buffer, 16-byte aligned regions:
+ *   mant  [out][in]    u8   sign << 7 | mantissa >> 3
+ *   expo  [out][in/2]  u8   code of column 2j in the low nibble, 2j+1 high
+ *   base  [out]        i8   the exponent a code of 1 stands for, minus one
+ *   ptr   [out + 1]    u32  row r's exceptions are [ptr[r], ptr[r + 1])
+ *   col   [n]          u32  column of each exception
+ *   val   [n]          u16  its half bits */
+__device__ __forceinline__ static uint64_t q4e_p12_align(uint64_t at) { return (at + 15u) & ~(uint64_t)15u; }
+struct Q4eP12 {
+    const uint8_t *mant, *expo;
+    const int8_t *base;
+    const uint32_t *ptr, *col;
+    const uint16_t *val;
+};
+__device__ __forceinline__ static Q4eP12 q4e_p12_view(const uint8_t *w, uint32_t in_dim, uint32_t out_dim) {
+    Q4eP12 v;
+    const uint64_t cells = (uint64_t)out_dim * in_dim;
+    v.mant = w;
+    v.expo = w + cells;
+    const uint64_t at_base = cells + cells / 2u;
+    v.base = (const int8_t *)(w + at_base);
+    const uint64_t at_ptr = q4e_p12_align(at_base + out_dim);
+    v.ptr = (const uint32_t *)(w + at_ptr);
+    const uint64_t at_col = q4e_p12_align(at_ptr + 4ull * (out_dim + 1u));
+    v.col = (const uint32_t *)(w + at_col);
+    v.val = (const uint16_t *)(w + at_col + 4ull * v.ptr[out_dim]);
+    return v;
+}
+__device__ __forceinline__ static float q4e_p12_decode(uint32_t byte, uint32_t code, int base) {
+    const uint32_t h = code ? (((byte & 0x80u) << 8) | ((uint32_t)(base + (int)code) << 10) | ((byte & 0x7fu) << 3)) : 0u;
+    return __half2float(__ushort_as_half((unsigned short)h));
+}
+
+/* The per-row projection over packed weights: q4e_matmul_f16_rows_kernel's
+ * launch and argument list, sixteen weights a lane a step, the row's
+ * exceptions added after the planes. */
+template <int NT>
+__global__ void q4e_matmul_p12_rows_kernel(
+        float *out, const uint8_t *w, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t chunk) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
+    if (row >= out_dim) return;
+    const Q4eP12 v = q4e_p12_view(w, in_dim, out_dim);
+    const uint32_t i0 = blockIdx.y * chunk;
+    const uint32_t i1 = min(i0 + chunk, in_dim);
+    const uint8_t *mr = v.mant + (uint64_t)row * in_dim;
+    const uint8_t *er = v.expo + (uint64_t)row * (in_dim / 2u);
+    const int base = v.base[row];
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; t++) acc[t] = 0.0f;
+    for (uint32_t i = i0 + lane * 16u; i < i1; i += 512u) {
+        const uint4 m = *(const uint4 *)(mr + i);
+        const uint2 e = *(const uint2 *)(er + i / 2u);
+        const uint32_t mw[4] = {m.x, m.y, m.z, m.w};
+        const uint32_t ew[2] = {e.x, e.y};
+        float wv[16];
+#pragma unroll
+        for (int j = 0; j < 16; j++)
+            wv[j] = q4e_p12_decode((mw[j >> 2] >> ((j & 3) * 8)) & 0xffu, (ew[j >> 3] >> ((j & 7) * 4)) & 0xfu, base);
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+            const float4 *xp = (const float4 *)(x + (uint64_t)t * in_dim + i);
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const float4 xv = xp[q];
+                acc[t] = fmaf(wv[4 * q], xv.x, acc[t]);
+                acc[t] = fmaf(wv[4 * q + 1], xv.y, acc[t]);
+                acc[t] = fmaf(wv[4 * q + 2], xv.z, acc[t]);
+                acc[t] = fmaf(wv[4 * q + 3], xv.w, acc[t]);
+            }
+        }
+    }
+    for (uint32_t k = v.ptr[row] + lane; k < v.ptr[row + 1u]; k += 32u) {
+        const uint32_t c = v.col[k];
+        if (c < i0 || c >= i1) continue;
+        const float wk = __half2float(__ushort_as_half(v.val[k]));
+#pragma unroll
+        for (int t = 0; t < NT; t++) acc[t] = fmaf(wk, x[(uint64_t)t * in_dim + c], acc[t]);
+    }
+    float *dst = out + (uint64_t)blockIdx.y * NT * out_dim;
+#pragma unroll
+    for (int t = 0; t < NT; t++) {
+        const float s = warp_sum_f32(acc[t]);
+        if (lane == 0u) dst[(uint64_t)t * out_dim + row] = s;
+    }
+}
+
+/* The packed weight expanded back to its stored halves (or to the floats they
+ * are), for the multiply tier a prefill chunk takes: exactly the tensor the
+ * checkpoint held.  One block a row. */
+__device__ __forceinline__ static void q4e_p12_put(__half *dst, uint16_t bits) { *dst = __ushort_as_half(bits); }
+__device__ __forceinline__ static void q4e_p12_put(float *dst, uint16_t bits) { *dst = __half2float(__ushort_as_half(bits)); }
+template <typename OUT>
+__global__ void q4e_p12_expand_kernel(OUT *dst, const uint8_t *w, uint32_t in_dim, uint32_t out_dim) {
+    const uint32_t row = blockIdx.x;
+    if (row >= out_dim) return;
+    const Q4eP12 v = q4e_p12_view(w, in_dim, out_dim);
+    const int base = v.base[row];
+    OUT *dr = dst + (uint64_t)row * in_dim;
+    for (uint32_t c = threadIdx.x; c < in_dim; c += blockDim.x) {
+        const uint32_t byte = v.mant[(uint64_t)row * in_dim + c];
+        const uint32_t code = (v.expo[(uint64_t)row * (in_dim / 2u) + c / 2u] >> ((c & 1u) * 4u)) & 0xfu;
+        const uint32_t h = code ? (((byte & 0x80u) << 8) | ((uint32_t)(base + (int)code) << 10) | ((byte & 0x7fu) << 3)) : 0u;
+        q4e_p12_put(dr + c, (uint16_t)h);
+    }
+    __syncthreads();
+    for (uint32_t k = v.ptr[row] + threadIdx.x; k < v.ptr[row + 1u]; k += blockDim.x) q4e_p12_put(dr + v.col[k], v.val[k]);
 }
 
 /* The K-split partials are fp32 whatever the output type. */
@@ -471,6 +593,73 @@ template __global__ void q4e_matmul_f16_rows_kernel<31, float, float>(
         float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
 template __global__ void q4e_matmul_f16_rows_kernel<32, float, float>(
         float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+/* The packed half-precision projection (shiso), at every row count the half-precision one has, and its expansions. */
+template __global__ void q4e_matmul_p12_rows_kernel<1>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<2>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<3>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<4>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<5>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<6>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<7>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<8>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<9>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<10>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<11>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<12>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<13>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<14>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<15>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<16>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<17>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<18>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<19>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<20>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<21>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<22>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<23>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<24>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<25>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<26>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<27>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<28>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<29>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<30>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<31>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_p12_rows_kernel<32>(
+        float *, const uint8_t *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_p12_expand_kernel<__half>(__half *, const uint8_t *, uint32_t, uint32_t);
+template __global__ void q4e_p12_expand_kernel<float>(float *, const uint8_t *, uint32_t, uint32_t);
 template __global__ void q4e_matmul_f16_rows_kernel<1, __half, float>(
         float *, const __half *, const __half *, uint32_t, uint32_t, uint32_t);
 template __global__ void q4e_matmul_f16_rows_kernel<2, __half, float>(

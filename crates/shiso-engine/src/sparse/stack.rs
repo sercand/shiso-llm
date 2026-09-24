@@ -148,6 +148,12 @@ pub struct SparseOptions {
     /// Tokens the prompt lookup may propose a step, zero for none; at most
     /// [`SparseOptions::spec`]. See [`crate::sparse::mtp::propose`].
     pub lookup_drafts: u32,
+    /// Whether the loader repacks half-precision projections to
+    /// [`shiso_core::DType::F16Pack12`] (see [`crate::sparse::pack12`]).
+    ///
+    /// Off by default because only the device kernel set reads the packed form;
+    /// a server on a device that has it turns it on.
+    pub pack_halves: bool,
 }
 
 impl SparseOptions {
@@ -176,6 +182,7 @@ impl SparseOptions {
             prefill_rows: MAX_PREFILL_CHUNK,
             head_drafts: u32::MAX,
             lookup_drafts: 0,
+            pack_halves: false,
         }
     }
 
