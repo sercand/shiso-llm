@@ -631,6 +631,38 @@ fn log_resident(shape: &SparseShape, opts: &SparseOptions, kv: &PagedKv, ckpt_by
     );
 }
 
+/// Opens the streamed n-gram tier, or refuses a geometry and a table that
+/// disagree about whether there is one.
+///
+/// `Ok(None)` is a geometry with no n-gram slot, given no table for one, which
+/// is not a refusal: there is simply nothing to stream. Split out of
+/// [`SparseStack::new`], which is otherwise a straight sequence of allocations.
+fn open_ngram(
+    backend: &Arc<dyn Backend>,
+    shape: &SparseShape,
+    ngram: Option<ple::NgramTable>,
+    opts: &SparseOptions,
+) -> CoreResult<Option<ple::NgramTier>> {
+    match (shape.ple, ngram) {
+        (Some(ple), Some(table)) => {
+            crate::sparse::memory::watch_ngram(backend, &table, opts.ngram_cache_bytes);
+            ple::NgramTier::open(backend, ple, table, opts.prefill_rows).map(Some)
+        }
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(CoreError::Unsupported {
+            what: "a geometry that folds in an n-gram block with no streamed table to \
+                   gather its rows from, which would decode that layer's contribution \
+                   to the residual out of unwritten memory",
+            backend: "engine",
+        }),
+        (None, Some(_)) => Err(CoreError::Unsupported {
+            what: "a streamed n-gram table for a geometry with no n-gram slot, which is \
+                   a reader no launch in the pass would ever ask",
+            backend: "engine",
+        }),
+    }
+}
+
 /// Refuses a pass width the stack cannot be built at.
 ///
 /// The floor is one query block, which is also what keeps every decode and
@@ -724,33 +756,7 @@ impl SparseStack {
             MAX_LOGIT_ROWS,
             opts.engine.ctx,
         )?;
-        let ngram = match (shape.ple, ngram) {
-            (Some(ple), Some(table)) => {
-                crate::sparse::memory::watch_ngram(backend, &table, opts.ngram_cache_bytes);
-                Some(ple::NgramTier::open(
-                    backend,
-                    ple,
-                    table,
-                    opts.prefill_rows,
-                )?)
-            }
-            (None, None) => None,
-            (Some(_), None) => {
-                return Err(CoreError::Unsupported {
-                    what: "a geometry that folds in an n-gram block with no streamed table to \
-                           gather its rows from, which would decode that layer's contribution \
-                           to the residual out of unwritten memory",
-                    backend: "engine",
-                });
-            }
-            (None, Some(_)) => {
-                return Err(CoreError::Unsupported {
-                    what: "a streamed n-gram table for a geometry with no n-gram slot, which is \
-                           a reader no launch in the pass would ever ask",
-                    backend: "engine",
-                });
-            }
-        };
+        let ngram = open_ngram(backend, &shape, ngram, &opts)?;
         // The pool last, so that a pool sized to the device is sized from what
         // the weights, the scratch and the n-gram tier left of it.
         let mut opts = opts;
