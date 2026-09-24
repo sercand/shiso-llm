@@ -2,6 +2,7 @@
  *
  * Deltas against the source, and nothing else: D1 (extern "C" linkage on the non-template kernels), D2 (explicit template instantiations),
  * D3 (external linkage on the template kernels: an explicit instantiation of a `static` template is emitted as a non-`.visible` entry the driver cannot resolve).
+ * D4 (shiso): q4e_hc_combine_norm_kernel issues its loads before its arithmetic; the expressions and their order are unchanged.
  * No line of kernel arithmetic was edited, reordered or
  * reformatted; a change to any of it is a defect, not a cleanup.
  */
@@ -171,16 +172,29 @@ __global__ void q4e_hc_combine_norm_kernel(
     }
 
     for (uint32_t h = h0; h < n_hc; h += hstep) {
+        /* Every load of this stream is issued before any of the arithmetic
+         * (shiso): the residual row, the norm weight and the injection logit
+         * are independent of each other, and issued in turn behind the
+         * dependent chain they were a decode step's layer paid four DRAM
+         * round trips here, 10 us, twice a layer.  The expressions and their
+         * order are unchanged. */
+        float *dst = res + ((uint64_t)t * n_hc + h) * n_embd;
+        const float *wh = w ? w + (uint64_t)h * n_embd : nullptr;
+        float vv[Q4E_HC_FUSE_MAX], wv[Q4E_HC_FUSE_MAX];
+#pragma unroll
+        for (uint32_t n = 0; n < Q4E_HC_FUSE_MAX; n++) {
+            const uint32_t i = threadIdx.x + n * blockDim.x;
+            vv[n] = (i < n_embd) ? dst[i] : 0.0f;
+            wv[n] = (wh && i < n_embd) ? wh[i] : 0.0f;
+        }
         const float wgt =
             2.0f / (1.0f + __expf(-inject[(uint64_t)t * n_hc + h] / (float)n_hc));
-        float *dst = res + ((uint64_t)t * n_hc + h) * n_embd;
-        float vv[Q4E_HC_FUSE_MAX];
         float sum = 0.0f;
 #pragma unroll
         for (uint32_t n = 0; n < Q4E_HC_FUSE_MAX; n++) {
             const uint32_t i = threadIdx.x + n * blockDim.x;
             if (i < n_embd) {
-                float v = dst[i];
+                float v = vv[n];
                 v += sv[n] * wgt;
                 dst[i] = v;
                 vv[n] = v;
@@ -190,12 +204,11 @@ __global__ void q4e_hc_combine_norm_kernel(
         if (!w) continue;
         sum = q4e_block_sum(sum);
         const float scale = rsqrtf(sum / (float)n_embd + eps);
-        const float *wh = w + (uint64_t)h * n_embd;
         XN *out = xn + ((uint64_t)t * n_hc + h) * n_embd;
 #pragma unroll
         for (uint32_t n = 0; n < Q4E_HC_FUSE_MAX; n++) {
             const uint32_t i = threadIdx.x + n * blockDim.x;
-            if (i < n_embd) q4e_store(out + i, vv[n] * scale * wh[i]);
+            if (i < n_embd) q4e_store(out + i, vv[n] * scale * wv[n]);
         }
     }
 }

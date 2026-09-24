@@ -2,6 +2,7 @@
  *
  * Deltas against the source, and nothing else: D1 (extern "C" linkage on the non-template kernels), D2 (explicit template instantiations),
  * D3 (external linkage on the template kernels: an explicit instantiation of a `static` template is emitted as a non-`.visible` entry the driver cannot resolve).
+ * D4 (shiso): q4e_moe_route_sort_small_kernel, a new kernel that computes what q4e_moe_route_kernel and the sort kernels do, bit for bit.
  * No line of kernel arithmetic was edited, reordered or
  * reformatted; a change to any of it is a defect, not a cleanup.
  */
@@ -128,12 +129,17 @@ q4e_moe_route_sort_small_kernel(
         m = warp_max_f32(m);
         const float s_max = __shfl_sync(0xffffffffu, m, 0);
         /* q4e_block_sum over a 256-thread block: warp sums, then their sum. */
+        /* Every index below is a compile-time one, so v stays in registers:
+         * virtual thread vt = lane + 32 vw sums e = vt + 256 k, which is
+         * register j = vw + 8 k. */
         float warp_total = 0.0f;
+#pragma unroll
         for (uint32_t vw = 0; vw < Q4E_ROUTE_BLOCK / 32u; vw++) {
-            const uint32_t vt = lane + 32u * vw;
             float sum = 0.0f;
-            for (uint32_t e = vt; e < n_expert; e += Q4E_ROUTE_BLOCK) {
-                sum += __expf(v[e / 32u] - s_max);
+#pragma unroll
+            for (uint32_t k = 0; k < PER / (Q4E_ROUTE_BLOCK / 32u); k++) {
+                const uint32_t j = vw + (Q4E_ROUTE_BLOCK / 32u) * k;
+                if (lane + 32u * j < n_expert) sum += __expf(v[j] - s_max);
             }
             sum = warp_sum_f32(sum);
             const float s_w = __shfl_sync(0xffffffffu, sum, 0);
@@ -144,7 +150,9 @@ q4e_moe_route_sort_small_kernel(
 
         float chosen_w[16];
         int32_t chosen_i[16];
-        for (uint32_t s = 0; s < n_used; s++) {
+#pragma unroll
+        for (uint32_t s = 0; s < 16u; s++) {
+            if (s >= n_used) break;
             float best = -INFINITY;
             int32_t best_i = -1;
 #pragma unroll
@@ -169,12 +177,16 @@ q4e_moe_route_sort_small_kernel(
         }
         if (lane == 0u) {
             float wsum = 0.0f;
-            for (uint32_t s = 0; s < n_used; s++) {
+#pragma unroll
+            for (uint32_t s = 0; s < 16u; s++) {
+                if (s >= n_used) break;
                 chosen_w[s] = __expf(chosen_w[s] - s_max) * inv_sum;
                 wsum += chosen_w[s];
             }
             wsum = fmaxf(wsum, 1e-20f);
-            for (uint32_t s = 0; s < n_used; s++) {
+#pragma unroll
+            for (uint32_t s = 0; s < 16u; s++) {
+                if (s >= n_used) break;
                 ids[(uint64_t)warp * n_used + s] = chosen_i[s];
                 weights[(uint64_t)warp * n_used + s] = chosen_w[s] / wsum;
                 s_ids[warp * n_used + s] = chosen_i[s];
