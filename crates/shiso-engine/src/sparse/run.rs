@@ -171,7 +171,28 @@ impl SparseStack {
                 return Err(CoreError::UnknownSession(step.session));
             }
         }
-        if rows > 1 {
+        if rows > 1 && self.backend.as_pointers().is_none() {
+            // The batched kernels read one pointer per row out of a device
+            // array, and a device that cannot hand out its allocations'
+            // addresses cannot fill one. Each row is then its own one-row
+            // pass - the arithmetic its sequence would get decoding alone -
+            // and its logits row is moved into place once the next pass has
+            // no further use for row zero.
+            let vocab_row = u64::from(self.shape.vocab) * 4;
+            let mut staged = vec![0u8; usize::try_from(vocab_row).unwrap_or(usize::MAX)];
+            let mut rows_out = Vec::with_capacity(steps.len());
+            for step in steps {
+                self.run_chunk(step.session, &[step.token], 1, false, None)?;
+                let row = self.logits(1)?.row(0)?;
+                self.backend.copy_d2h(row, &mut staged)?;
+                rows_out.push(staged.clone());
+            }
+            let block = self.logits(rows)?;
+            for (at, bytes) in rows_out.iter().enumerate() {
+                let row = block.row(u32::try_from(at).unwrap_or(u32::MAX))?;
+                self.backend.copy_h2d(row, bytes)?;
+            }
+        } else if rows > 1 {
             self.run_batch(steps)?;
         } else {
             for step in steps {

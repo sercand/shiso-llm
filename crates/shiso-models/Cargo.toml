@@ -58,6 +58,9 @@ parking_lot = { workspace = true }
 # another stack is unlinked rather than refused forever. Only a test reaches the
 # store directly: the models speak to it through the engine's checkpoint tier.
 shiso-kvstore = { workspace = true }
+# The Metal run of the MLX checkpoint reports its per-step diagnostics through
+# the engine's own tracing, which a test has to install a subscriber to see.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

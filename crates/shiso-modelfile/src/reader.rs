@@ -403,6 +403,13 @@ pub(crate) struct Mapping {
     path: PathBuf,
     map: Mmap,
     /// Kept open so the page cache can be advised about the mapping's pages.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only the Linux page-cache advice reads the descriptor"
+        )
+    )]
     file: File,
 }
 
@@ -486,6 +493,10 @@ impl Mapping {
 
     /// Nothing to release on a target without the advice calls.
     #[cfg(not(target_os = "linux"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Linux twin advises through the descriptor, and both share one signature"
+    )]
     fn release(&self, _range: Range<usize>) {}
 
     pub(crate) fn bytes(&self) -> &[u8] {

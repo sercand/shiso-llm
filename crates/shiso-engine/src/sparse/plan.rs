@@ -164,6 +164,20 @@ pub enum Step {
     },
     /// A point in a branch of concurrent work; see [`Branch`].
     Branch(Branch),
+    /// Brings the routed experts of one layer into the expert stream's slots,
+    /// between the sort that chose them and the stages that read them.
+    ///
+    /// A host step: it drains the device and reads the layer's routed ids
+    /// back. On a stack whose banks are resident it does nothing, which is why
+    /// the affine expert plan carries it unconditionally - see
+    /// [`crate::sparse::stream`].
+    Fetch {
+        /// The layer whose map is updated, by index.
+        layer: u32,
+        /// Routed ids the layer's router wrote: the pass's rows times the
+        /// experts each row is routed to.
+        ids: u32,
+    },
     /// An ordinary launch that carves the per-stream staging the cooperative
     /// launches use - the decode-shaped trellis projection, whose transformed
     /// activation and partial sums live there.
@@ -248,9 +262,11 @@ impl Step {
             | Self::Trellis { args, .. }
             | Self::Expand { args, .. }
             | Self::Staged { args, .. } => args.operands(),
-            Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } | Self::Branch(_) => {
-                Ok(&[])
-            }
+            Self::Blas { .. }
+            | Self::Reserve { .. }
+            | Self::Clear { .. }
+            | Self::Branch(_)
+            | Self::Fetch { .. } => Ok(&[]),
         }
     }
 
@@ -267,9 +283,11 @@ impl Step {
             | Self::Trellis { args, .. }
             | Self::Expand { args, .. }
             | Self::Staged { args, .. } => *args,
-            Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } | Self::Branch(_) => {
-                Args::new()
-            }
+            Self::Blas { .. }
+            | Self::Reserve { .. }
+            | Self::Clear { .. }
+            | Self::Branch(_)
+            | Self::Fetch { .. } => Args::new(),
         }
     }
 
@@ -284,7 +302,8 @@ impl Step {
             | Self::Blas { .. }
             | Self::Reserve { .. }
             | Self::Clear { .. }
-            | Self::Branch(_) => Staging::none(),
+            | Self::Branch(_)
+            | Self::Fetch { .. } => Staging::none(),
         }
     }
 
@@ -297,7 +316,11 @@ impl Step {
             | Self::Trellis { entry, .. }
             | Self::Expand { entry, .. }
             | Self::Staged { entry, .. } => Some(*entry),
-            Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } | Self::Branch(_) => None,
+            Self::Blas { .. }
+            | Self::Reserve { .. }
+            | Self::Clear { .. }
+            | Self::Branch(_)
+            | Self::Fetch { .. } => None,
         }
     }
 
@@ -315,6 +338,7 @@ impl Step {
             Self::Branch(Branch::Fork) => "fork",
             Self::Branch(Branch::Resume) => "resume",
             Self::Branch(Branch::Join) => "join",
+            Self::Fetch { .. } => "fetch routed experts",
         }
     }
 }
@@ -440,7 +464,11 @@ impl Plan {
                     u64::from(*blocks).saturating_mul(u64::from(*groups)),
                     u64::from(*block_dim),
                 ),
-                Step::Blas { .. } | Step::Reserve { .. } | Step::Clear { .. } | Step::Branch(_) => {
+                Step::Blas { .. }
+                | Step::Reserve { .. }
+                | Step::Clear { .. }
+                | Step::Branch(_)
+                | Step::Fetch { .. } => {
                     continue;
                 }
             };

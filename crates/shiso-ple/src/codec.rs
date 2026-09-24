@@ -76,6 +76,10 @@ pub const fn row_bytes(params: &PleParams) -> u32 {
     match params.row_type() {
         PleRowType::TrellisK6 => 2 + params.head_dim() * TRELLIS_BITS / 8,
         PleRowType::BlockNl4 => params.head_dim() / BLOCK_ELEMS * BLOCK_BYTES,
+        // Codes at four bits, then one scale and one bias per group, both
+        // brain floats.
+        PleRowType::MlxAffine4 => params.head_dim() / 2 + params.head_dim() / BLOCK_ELEMS * 4,
+        PleRowType::Fp8E4M3 { .. } => params.head_dim(),
     }
 }
 
@@ -195,8 +199,48 @@ pub fn dequant_row(params: &PleParams, src: &[u8], head: u32, dst: &mut [f32]) -
     match params.row_type() {
         PleRowType::TrellisK6 => decode_trellis(params, src, head, dst),
         PleRowType::BlockNl4 => decode_block(src, width, dst),
+        PleRowType::MlxAffine4 => decode_affine(src, width, dst),
+        PleRowType::Fp8E4M3 { scale_bits } => {
+            let scale = f32::from_bits(scale_bits);
+            for (out, &byte) in dst.iter_mut().zip(src).take(width) {
+                *out = e4m3(byte) * scale;
+            }
+        }
     }
     Ok(())
+}
+
+/// One FP8 E4M3 byte: one sign, four exponent bits biased by seven, three
+/// mantissa bits, no infinities and the all-ones pattern not a number.
+#[must_use]
+pub fn e4m3(byte: u8) -> f32 {
+    let e = i32::from((byte >> 3) & 0xF);
+    let bits = byte & 7;
+    let m = f32::from(bits);
+    let v = if e == 0 {
+        m * 2f32.powi(-9)
+    } else if e == 15 && bits == 7 {
+        f32::NAN
+    } else {
+        (1.0 + m / 8.0) * 2f32.powi(e - 7)
+    };
+    if byte & 0x80 == 0 { v } else { -v }
+}
+
+/// The affine codec: `code * scale + bias` per weight, one scale and bias per
+/// thirty-two weights, codes low nibble first.
+fn decode_affine(src: &[u8], width: usize, dst: &mut [f32]) {
+    let groups = width / BLOCK_ELEMS as usize;
+    let params = &src[width / 2..];
+    let bf16 = |at: usize| {
+        f32::from_bits(u32::from(u16::from_le_bytes([params[2 * at], params[2 * at + 1]])) << 16)
+    };
+    for (i, out) in dst.iter_mut().enumerate().take(width) {
+        let byte = src[i / 2];
+        let q = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+        let g = i / BLOCK_ELEMS as usize;
+        *out = f32::from(q) * bf16(g) + bf16(groups + g);
+    }
 }
 
 /// The block codec: a half-precision scale per thirty-two weights, then the

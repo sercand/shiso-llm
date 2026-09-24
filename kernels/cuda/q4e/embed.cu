@@ -42,7 +42,7 @@ extern "C" __global__ void embed_tokens_hc_kernel(
     out[gid] = __half2float(w[(uint64_t)tok * n_embd + d]);
 }
 
-extern "C" __global__ void glm_embed_tokens_q8_0_kernel(
+extern "C" __global__ void embed_tokens_q8_0_kernel(
         float *out,
         const int32_t *tokens,
         const unsigned char *w,
@@ -60,7 +60,7 @@ extern "C" __global__ void glm_embed_tokens_q8_0_kernel(
     out[gid] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
 }
 
-extern "C" __global__ void glm53_embedding_bf16_kernel(
+extern "C" __global__ void embed_tokens_bf16_kernel(
         float *out,
         const uint16_t *weights,
         const int32_t *tokens,

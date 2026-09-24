@@ -420,6 +420,13 @@ pub fn load_model(
         return load_qwen35moe(backend, path, args, defaults);
     }
 
+    // The sparse family's MLX container is a DIRECTORY of safetensors shards,
+    // and its geometry is in the document rather than in a container's
+    // metadata, so it takes an arm of its own ahead of the single-file one.
+    if Qwen4ExpConfig::describes(config) && path.is_dir() {
+        return load_qwen4exp_mlx(backend, path, config, args, opts, defaults);
+    }
+
     // The sparse family's reader takes the checkpoint as well as the document,
     // because this family carries no geometry in a config document: the reader
     // recognises the family by name and then reads every dimension out of the
@@ -743,10 +750,11 @@ pub fn draft_manifest(args: &ServeArgs) -> Result<Option<MtpManifest>, CoreError
 /// Order matters: the ceiling is read off the trellis entry points, so it can
 /// only be asked once their names are known.
 ///
-/// `tiled_attention` and `tensor_core` stay at their defaults. They are not
-/// device facts this host can ask for through the backend contract - the
-/// shared-memory opt-in happens inside the launch - and the kernels they gate
-/// are built against a floor (`compute_80`) whose budget already admits them.
+/// `tiled_attention`, `tensor_core` and the chunked recurrence are on exactly
+/// when the device has kernels for them (see [`capture::optional_paths`]): a
+/// backend whose kernel set leaves one out - the Metal port has neither the
+/// matrix-unit nor the large-shared-memory layouts - gets the always-correct
+/// fallback rather than a launch of an entry that does not exist.
 fn sparse_options(
     args: &ServeArgs,
     engine: EngineOptions,
@@ -754,6 +762,7 @@ fn sparse_options(
 ) -> SparseOptions {
     let entries = capture::capture(backend.as_ref());
     let co_resident_blocks = capture::co_resident_blocks(backend.as_ref(), entries);
+    let paths = capture::optional_paths(backend.as_ref());
     tracing::info!(
         entries = entries.len(),
         co_resident_blocks,
@@ -784,8 +793,87 @@ fn sparse_options(
         entries,
         co_resident_blocks,
         prefill_rows: SparseOptions::prefill_rows_for(widest),
+        tensor_core: paths.tensor_core,
+        tiled_attention: paths.tiled_attention,
+        chunk: shiso_engine::sparse::recurrent::ChunkPolicy {
+            available: paths.chunked_recurrence,
+            ..shiso_engine::sparse::recurrent::ChunkPolicy::new()
+        },
         ..SparseOptions::default()
     }
+}
+
+/// The sparse family's MLX directory: the geometry from its `config.json`, the
+/// routed banks resident or streamed as `--expert-residency` says.
+fn load_qwen4exp_mlx(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    args: &ServeArgs,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    use shiso_models::qwen4exp::mlx::ExpertResidency;
+    if args.spec_k > 0 {
+        return Err(FactoryError::Load(CoreError::Unsupported {
+            what: "speculation on the MLX container, which carries no draft head",
+            backend: "qwen4exp",
+        }));
+    }
+    let residency = match args.expert_residency {
+        crate::cli::ExpertResidencyChoice::Auto if args.expert_slots == 0 => None,
+        crate::cli::ExpertResidencyChoice::Resident => Some(ExpertResidency::Resident),
+        crate::cli::ExpertResidencyChoice::Auto | crate::cli::ExpertResidencyChoice::Stream => {
+            let slots = if args.expert_slots == 0 {
+                shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS
+            } else {
+                args.expert_slots
+            };
+            Some(ExpertResidency::Streamed { slots })
+        }
+    };
+    let reserve = args.expert_reserve_gb.saturating_mul(1 << 30);
+    if shiso_models::qwen4exp::mlx::MlxCheckpoint::is_reference_export(path) {
+        // The reference export streams its FP8 experts whatever the device;
+        // `resident` asks for a pool that holds every one of them.
+        let slots = match args.expert_residency {
+            crate::cli::ExpertResidencyChoice::Resident => {
+                Some(shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS)
+            }
+            _ if args.expert_slots > 0 => Some(args.expert_slots),
+            _ => None,
+        };
+        let model = Qwen4ExpModel::load_reference(
+            backend,
+            path,
+            config,
+            sparse_options(args, opts, backend),
+            slots,
+            reserve,
+        )
+        .map_err(FactoryError::Load)?;
+        return Ok(Loaded {
+            model: Box::new(model),
+            open_tower: open_qwen35_tower,
+            placement: Qwen35Tower::PLACEMENT,
+            defaults,
+        });
+    }
+    let model = Qwen4ExpModel::load_mlx(
+        backend,
+        path,
+        config,
+        sparse_options(args, opts, backend),
+        residency,
+        reserve,
+    )
+    .map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_qwen35_tower,
+        placement: Qwen35Tower::PLACEMENT,
+        defaults,
+    })
 }
 
 /// Whether this build recognises a config document at all.

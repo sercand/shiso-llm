@@ -596,6 +596,11 @@ fn describe_one(
             want: Box::from("a format this container stores"),
             got: Box::from("packed u32 words, which are the MLX container's"),
         }),
+        StDType::I64 => Err(GgufError::LayoutMismatch {
+            tensor: base.into(),
+            want: Box::from("a format this container stores"),
+            got: Box::from("64-bit integers, which no weight of this container is"),
+        }),
     }
 }
 

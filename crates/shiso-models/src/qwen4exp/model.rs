@@ -90,6 +90,7 @@ use crate::qwen4exp::binding::{
     NGRAM_TABLE, NgramRoles, RecurrentRoles, bind_draft, bind_qwen4exp,
 };
 use crate::qwen4exp::config::Qwen4ExpConfig;
+use crate::qwen4exp::mlx;
 
 /// The formats a bound projection may be stored as.
 ///
@@ -238,6 +239,132 @@ impl Qwen4ExpModel {
         })
     }
 
+    /// Opens an MLX checkpoint directory and puts it on the device.
+    ///
+    /// `residency` chooses where the routed banks live; `None` decides from
+    /// the device: the banks are imported in place when they fit in the
+    /// device's working set beside everything else with `reserve` bytes to
+    /// spare for the cache and activations, and are streamed from disk into as
+    /// many expert slots as do fit otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`mlx::MlxCheckpoint::open`], [`Qwen4ExpConfig::from_mlx`],
+    /// the imports and [`SparseStack::new`] report, and
+    /// [`CoreError::Unsupported`] when not even a streamed bank fits.
+    pub fn load_mlx(
+        backend: &Arc<dyn Backend>,
+        dir: &Path,
+        hf: &shiso_core::config::HfConfig,
+        opts: SparseOptions,
+        residency: Option<mlx::ExpertResidency>,
+        reserve: u64,
+    ) -> CoreResult<Self> {
+        let ck = mlx::MlxCheckpoint::open(dir)?;
+        let config = Qwen4ExpConfig::from_mlx(hf, &ck)?;
+        let ngram = {
+            let _tag = ledger::scope(MemTag::WeightsEmbedding);
+            mlx::open_ngram(&ck, &config, &opts)?
+        };
+        let residency = match residency {
+            Some(chosen) => chosen,
+            None => choose_residency(backend.as_ref(), &ck, reserve)?,
+        };
+        tracing::info!(?residency, "routed expert banks");
+        let weights = mlx::import(backend, &ck, &config, residency)?;
+        let expert_gate = DType::MlxAffine4Gs64;
+        let mut stack =
+            SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
+        if let mlx::ExpertResidency::Streamed { slots } = residency {
+            let stream = mlx::open_stream(backend, &ck, slots, opts.prefill_rows)?;
+            stack.attach_expert_stream(stream)?;
+        }
+        Ok(Self {
+            info: ModelInfo {
+                context_capacity: stack.context_capacity(),
+                vocab: config.shape().vocab,
+                hidden: config.shape().hidden,
+                n_layers: config.shape().n_layers(),
+                stop_tokens: StopTokens::new(&config.stop_tokens())?,
+            },
+            stack,
+            expert_gate,
+        })
+    }
+
+    /// Opens the reference export's directory - brain-float dense weights,
+    /// FP8 experts and n-gram table - and puts it on the device.
+    ///
+    /// The routed experts always go through the expert stream. `slots` fixes
+    /// the pool; `None` sizes it to the device - every expert, preloaded, when
+    /// they all fit beside the dense weights with `reserve` to spare, and as
+    /// many as fit otherwise.
+    ///
+    /// # Errors
+    ///
+    /// As [`Qwen4ExpModel::load_mlx`].
+    pub fn load_reference(
+        backend: &Arc<dyn Backend>,
+        dir: &Path,
+        hf: &shiso_core::config::HfConfig,
+        opts: SparseOptions,
+        slots: Option<u32>,
+        reserve: u64,
+    ) -> CoreResult<Self> {
+        use crate::qwen4exp::config::{EXPERTS, N_LAYERS};
+        let ck = crate::qwen4exp::fp8::open(dir)?;
+        let config = Qwen4ExpConfig::from_reference(hf, &ck)?;
+        let ngram = {
+            let _tag = ledger::scope(MemTag::WeightsEmbedding);
+            crate::qwen4exp::fp8::open_ngram(backend, &ck, &config, &opts)?
+        };
+        let all = EXPERTS * N_LAYERS;
+        let slots = if let Some(slots) = slots {
+            slots
+        } else {
+            {
+                let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
+                let rest = ck
+                    .resident_bytes()
+                    .saturating_sub(crate::qwen4exp::fp8::expert_bytes());
+                // The dense weights are counted twice. They are wrapped file
+                // pages, read whole every step, and the system evicts wrapped
+                // pages first when the working set is full: sized to the last
+                // byte, the pool pushed them out and every step read them back
+                // from disk (measured on a 64 GB machine: 0.3 tok/s, against
+                // 2.9 with this margin).
+                let room = total.saturating_sub(rest.saturating_mul(2).saturating_add(reserve));
+                let fit =
+                    u32::try_from(room / crate::qwen4exp::fp8::slot_bytes()).unwrap_or(u32::MAX);
+                if fit < EXPERTS {
+                    return Err(CoreError::Unsupported {
+                        what: "a device whose working set cannot hold one layer's routed experts \
+                               beside the dense weights",
+                        backend: "qwen4exp",
+                    });
+                }
+                fit.min(all)
+            }
+        };
+        tracing::info!(slots, all, "routed expert pool of the FP8 export");
+        let weights = crate::qwen4exp::fp8::import(backend, &ck, &config)?;
+        let mut stack =
+            SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
+        let stream = crate::qwen4exp::fp8::open_stream(backend, &ck, slots, opts.prefill_rows)?;
+        stack.attach_expert_stream(stream)?;
+        Ok(Self {
+            info: ModelInfo {
+                context_capacity: stack.context_capacity(),
+                vocab: config.shape().vocab,
+                hidden: config.shape().hidden,
+                n_layers: config.shape().n_layers(),
+                stop_tokens: StopTokens::new(&config.stop_tokens())?,
+            },
+            stack,
+            expert_gate: DType::Fp8E4M3Block128,
+        })
+    }
+
     /// Storage format of the layer-zero routed expert gate.
     #[must_use]
     pub const fn expert_gate_dtype(&self) -> DType {
@@ -273,6 +400,48 @@ impl Qwen4ExpModel {
     ) -> CoreResult<Pass> {
         self.stack.plan_chunk(session, tokens, logit_rows)
     }
+}
+
+/// Where an MLX checkpoint's routed banks go on this device.
+///
+/// Resident when every language-model weight, the banks included, fits in the
+/// device's working set with `reserve` bytes left; otherwise streamed, into as
+/// many slots as fit once the rest of the weights and the reserve are
+/// accounted for. The n-gram table is never counted: it is streamed either
+/// way.
+fn choose_residency(
+    backend: &dyn Backend,
+    ck: &mlx::MlxCheckpoint,
+    reserve: u64,
+) -> CoreResult<mlx::ExpertResidency> {
+    let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
+    let banks = mlx::expert_bytes();
+    let rest = ck.resident_bytes().saturating_sub(banks);
+    let fixed = rest.saturating_add(reserve);
+    if fixed.saturating_add(banks) <= total {
+        return Ok(mlx::ExpertResidency::Resident);
+    }
+    let room = total.saturating_sub(fixed);
+    let slots = u32::try_from(room / mlx::slot_bytes()).unwrap_or(u32::MAX);
+    let all = crate::qwen4exp::config::EXPERTS * crate::qwen4exp::config::N_LAYERS;
+    if slots < crate::qwen4exp::config::EXPERTS {
+        return Err(CoreError::Unsupported {
+            what: "a device whose working set cannot hold one layer's routed experts beside \
+                   the rest of the weights",
+            backend: "qwen4exp",
+        });
+    }
+    tracing::info!(
+        total_gib = total >> 30,
+        other_weights_gib = rest >> 30,
+        reserve_gib = reserve >> 30,
+        banks_gib = banks >> 30,
+        slots,
+        "the routed banks do not fit; streaming them from disk"
+    );
+    Ok(mlx::ExpertResidency::Streamed {
+        slots: slots.min(all),
+    })
 }
 
 /// Opens the streamed n-gram table this checkpoint gathers its rows from.
@@ -327,7 +496,7 @@ fn open_ngram(
         (PleRowType::TrellisK6, Some(view)) => Some(view),
         // A bias beside a codec that takes no such pointer is a tensor nothing
         // would read, and the tier below refuses it rather than carrying it.
-        (PleRowType::BlockNl4, _) => None,
+        (PleRowType::BlockNl4 | PleRowType::MlxAffine4 | PleRowType::Fp8E4M3 { .. }, _) => None,
     };
     let params =
         config
@@ -488,6 +657,7 @@ fn import(
         output_mix,
         layers,
         draft: None,
+        expert_map: None,
     })
 }
 

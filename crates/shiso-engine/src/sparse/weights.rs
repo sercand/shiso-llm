@@ -53,6 +53,26 @@ pub enum WeightPart {
     InputScales,
     /// The output scale vector, one half-precision word per output row.
     OutputScales,
+    /// An affine weight's per-group scales, one brain float per group per row.
+    ///
+    /// The codes are the affine weight's [`WeightPart::Whole`]: the kernels
+    /// that read an affine matrix take codes, scales and biases as three
+    /// arrays, which is how the checkpoint stores them.
+    AffineScales,
+    /// An affine weight's per-group biases, laid out as its scales are.
+    AffineBiases,
+    /// A block-scaled FP8 weight's scales: one brain float per 128 x 128
+    /// block, row-major over the blocks. The codes are its
+    /// [`WeightPart::Whole`].
+    BlockScales,
+}
+
+/// The two arrays an affine weight carries beside its codes.
+struct AffineParams {
+    /// Per-group scales.
+    scales: DeviceBuffer,
+    /// Per-group biases.
+    biases: DeviceBuffer,
 }
 
 /// One projection weight, resident on the device.
@@ -88,6 +108,43 @@ pub struct Weight {
     /// a launch computes with is still one expert's.
     pub slots: u32,
     buffer: DeviceBuffer,
+    /// The scales and biases of an affine weight, whose `buffer` is its codes.
+    affine: Option<Box<AffineParams>>,
+    /// The block scales of a block-scaled FP8 weight, whose `buffer` is its
+    /// codes.
+    block_scales: Option<DeviceBuffer>,
+    /// Whether the payload is on the device at all.
+    ///
+    /// A routed expert bank that is streamed from disk is described here - its
+    /// format and widths are what every plan is built from - and holds no
+    /// bytes: its experts live in the stream's slot pool, and a launch reaches
+    /// them through the binder rather than through this weight.
+    resident: bool,
+}
+
+/// Bytes of one affine matrix's codes, scales and biases, or `None` for a
+/// format that is not affine or a width that is not a whole number of groups.
+#[must_use]
+pub fn affine_bytes(dtype: DType, in_dim: u32, out_dim: u32) -> Option<(u64, u64)> {
+    let bits = u64::from(dtype.affine_bits()?);
+    let group = 64u64;
+    let (in_dim, out_dim) = (u64::from(in_dim), u64::from(out_dim));
+    if in_dim == 0 || !in_dim.is_multiple_of(group) {
+        return None;
+    }
+    let codes = out_dim.checked_mul(in_dim)?.checked_mul(bits)? / 8;
+    let params = out_dim.checked_mul(in_dim / group)?.checked_mul(2)?;
+    Some((codes, params))
+}
+
+/// Bytes of one block-scaled FP8 matrix's codes and block scales.
+#[must_use]
+pub fn fp8_block_bytes(in_dim: u32, out_dim: u32) -> (u64, u64) {
+    let (in_dim, out_dim) = (u64::from(in_dim), u64::from(out_dim));
+    (
+        in_dim * out_dim,
+        in_dim.div_ceil(128) * out_dim.div_ceil(128) * 2,
+    )
 }
 
 impl Weight {
@@ -159,7 +216,128 @@ impl Weight {
             out_dim,
             slots,
             buffer,
+            affine: None,
+            block_scales: None,
+            resident: true,
         })
+    }
+
+    /// Assembles an affine weight from its three device arrays.
+    ///
+    /// Each array is checked against the widths rather than trusted: they come
+    /// from three tensors of a container, and one of the wrong length is a
+    /// kernel striding past the end of another.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] when the format is not affine, the
+    /// contraction is not a whole number of groups, or an array's length is not
+    /// the one the widths and slot count imply.
+    pub fn affine(
+        dtype: DType,
+        in_dim: u32,
+        out_dim: u32,
+        slots: u32,
+        [codes, scales, biases]: [DeviceBuffer; 3],
+    ) -> CoreResult<Self> {
+        let (one_codes, one_params) =
+            affine_bytes(dtype, in_dim, out_dim).ok_or(CoreError::ShapeMismatch {
+                field: "affine contraction width",
+                expected: 64,
+                got: u64::from(in_dim),
+            })?;
+        let slots64 = u64::from(slots.max(1));
+        for (field, want, got) in [
+            ("affine codes bytes", one_codes * slots64, codes.len()),
+            ("affine scales bytes", one_params * slots64, scales.len()),
+            ("affine biases bytes", one_params * slots64, biases.len()),
+        ] {
+            if want != got {
+                return Err(CoreError::ShapeMismatch {
+                    field,
+                    expected: want,
+                    got,
+                });
+            }
+        }
+        Ok(Self {
+            dtype,
+            in_dim,
+            out_dim,
+            slots: slots.max(1),
+            buffer: codes,
+            affine: Some(Box::new(AffineParams { scales, biases })),
+            block_scales: None,
+            resident: true,
+        })
+    }
+
+    /// Assembles a block-scaled FP8 weight from its codes and its block
+    /// scales.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] when either array's length is not the one
+    /// the widths and slot count imply.
+    pub fn block_scaled(
+        in_dim: u32,
+        out_dim: u32,
+        slots: u32,
+        [codes, scales]: [DeviceBuffer; 2],
+    ) -> CoreResult<Self> {
+        let slots64 = u64::from(slots.max(1));
+        let (one_codes, one_scales) = fp8_block_bytes(in_dim, out_dim);
+        for (field, want, got) in [
+            ("fp8 codes bytes", one_codes * slots64, codes.len()),
+            ("fp8 block scales bytes", one_scales * slots64, scales.len()),
+        ] {
+            if want != got {
+                return Err(CoreError::ShapeMismatch {
+                    field,
+                    expected: want,
+                    got,
+                });
+            }
+        }
+        Ok(Self {
+            dtype: DType::Fp8E4M3Block128,
+            in_dim,
+            out_dim,
+            slots: slots.max(1),
+            buffer: codes,
+            affine: None,
+            block_scales: Some(scales),
+            resident: true,
+        })
+    }
+
+    /// Describes a weight whose bytes are not on the device: a streamed expert
+    /// bank. `placeholder` is any small allocation; nothing reads it, and every
+    /// part of the weight is refused.
+    #[must_use]
+    pub const fn streamed(
+        dtype: DType,
+        in_dim: u32,
+        out_dim: u32,
+        slots: u32,
+        placeholder: DeviceBuffer,
+    ) -> Self {
+        Self {
+            dtype,
+            in_dim,
+            out_dim,
+            slots,
+            buffer: placeholder,
+            affine: None,
+            block_scales: None,
+            resident: false,
+        }
+    }
+
+    /// Whether the payload is on the device; `false` for a streamed bank.
+    #[must_use]
+    pub const fn is_resident(&self) -> bool {
+        self.resident
     }
 
     /// The whole weight, as a kernel argument.
@@ -183,15 +361,48 @@ impl Weight {
     /// [`CoreError::OutOfBounds`] when the computed span runs past the resident
     /// copy, which means the layout and the import disagree.
     pub fn part(&self, part: WeightPart) -> CoreResult<DeviceView<'_>> {
+        if !self.resident {
+            return Err(CoreError::Unsupported {
+                what: "a part of a streamed expert bank, whose experts live in the stream's slots",
+                backend: "engine",
+            });
+        }
+        if let Some(scales) = &self.block_scales {
+            return match part {
+                WeightPart::Whole => Ok(self.buffer.view()),
+                WeightPart::BlockScales => Ok(scales.view()),
+                _ => Err(CoreError::Unsupported {
+                    what: "a part a block-scaled FP8 weight does not have",
+                    backend: "engine",
+                }),
+            };
+        }
+        if let Some(params) = &self.affine {
+            return match part {
+                WeightPart::Whole => Ok(self.buffer.view()),
+                WeightPart::AffineScales => Ok(params.scales.view()),
+                WeightPart::AffineBiases => Ok(params.biases.view()),
+                WeightPart::Tiles
+                | WeightPart::InputScales
+                | WeightPart::OutputScales
+                | WeightPart::BlockScales => Err(CoreError::Unsupported {
+                    what: "a part an affine weight does not have",
+                    backend: "engine",
+                }),
+            };
+        }
         let Some(bits) = quant::exl3::k_bits(self.dtype) else {
             return match part {
                 WeightPart::Whole => Ok(self.buffer.view()),
-                WeightPart::Tiles | WeightPart::InputScales | WeightPart::OutputScales => {
-                    Err(CoreError::Unsupported {
-                        what: "a trellis payload part of a weight stored in another format",
-                        backend: "engine",
-                    })
-                }
+                WeightPart::Tiles
+                | WeightPart::InputScales
+                | WeightPart::OutputScales
+                | WeightPart::AffineScales
+                | WeightPart::AffineBiases
+                | WeightPart::BlockScales => Err(CoreError::Unsupported {
+                    what: "a payload part of a weight whose format has no such part",
+                    backend: "engine",
+                }),
             };
         };
         // Each of the three regions holds every slot's copy back to back, so a
@@ -210,6 +421,12 @@ impl Weight {
             WeightPart::Tiles => self.buffer.slice(0, tiles),
             WeightPart::InputScales => self.buffer.slice(tiles, input),
             WeightPart::OutputScales => self.buffer.slice(tiles.saturating_add(input), output),
+            WeightPart::AffineScales | WeightPart::AffineBiases | WeightPart::BlockScales => {
+                Err(CoreError::Unsupported {
+                    what: "an affine or block-scale part of a trellis weight",
+                    backend: "engine",
+                })
+            }
         }
     }
 
@@ -255,6 +472,9 @@ impl Weight {
             out_dim,
             slots: 1,
             buffer,
+            affine: None,
+            block_scales: None,
+            resident: true,
         }))
     }
 
@@ -273,13 +493,25 @@ impl Weight {
             out_dim,
             slots: 1,
             buffer,
+            affine: None,
+            block_scales: None,
+            resident: true,
         }
     }
 
-    /// Bytes the resident copy occupies.
+    /// Bytes the resident copy occupies, every array of it; zero for a
+    /// streamed bank.
     #[must_use]
     pub fn len(&self) -> u64 {
+        if !self.resident {
+            return 0;
+        }
         self.buffer.len()
+            + self
+                .affine
+                .as_ref()
+                .map_or(0, |p| p.scales.len() + p.biases.len())
+            + self.block_scales.as_ref().map_or(0, DeviceBuffer::len)
     }
 
     /// Whether the weight is empty, which no bound tensor ever is.
@@ -302,7 +534,11 @@ impl fmt::Debug for Weight {
             .field("in_dim", &self.in_dim)
             .field("out_dim", &self.out_dim)
             .field("slots", &self.slots)
-            .field("bytes", &self.buffer.len())
+            .field("bytes", &self.len())
+            .field("buffer", &self.buffer.len())
+            .field("affine", &self.affine.is_some())
+            .field("block_scales", &self.block_scales.is_some())
+            .field("resident", &self.resident)
             .finish()
     }
 }
@@ -346,6 +582,7 @@ impl WeightDesc {
                     | (DType::F16, DType::F16)
                     | (DType::BF16, DType::BF16)
                     | (DType::F32, DType::F32)
+                    | (DType::MlxAffine4Gs64, DType::MlxAffine4Gs64)
             )
     }
 }
@@ -795,6 +1032,14 @@ pub struct SparseWeights {
     pub layers: Vec<SparseLayer>,
     /// The draft head, on a build that speculates.
     pub draft: Option<DraftHead>,
+    /// The identity expert-to-slot map the affine expert stages read when the
+    /// routed banks are resident: `map[e] = e`, one `u32` per expert.
+    ///
+    /// Those stages always index a bank through a map, because a streamed bank
+    /// keeps its experts wherever the stream put them; a resident bank is the
+    /// case where every expert sits at its own index. Absent for a checkpoint
+    /// whose banks are not affine.
+    pub expert_map: Option<DeviceBuffer>,
 }
 
 impl SparseWeights {

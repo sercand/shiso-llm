@@ -1034,6 +1034,173 @@ pub fn grouped_experts(
     Ok(plan)
 }
 
+/// Output rows one affine expert threadgroup covers (`Q4E_AFFINE_ROWS`).
+const AFFINE_EXPERT_ROWS: u32 = 8;
+
+/// The expert stages over an affine or a block-scaled FP8 bank: gate and up in
+/// one launch over the sorted columns, the activation, and the down
+/// projection, every stage reaching an expert's matrices through the layer's
+/// expert-to-slot map.
+///
+/// The grid's second axis is one threadgroup per active expert, bounded by
+/// the expert count and by the column count, whichever is smaller; the tail
+/// of it returns once the active list runs out.
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when the three banks are not all affine at the
+/// widths the expert shape names.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one statement per kernel argument is the point: these bodies are \
+              transcriptions of parameter lists, two formats' worth"
+)]
+pub fn affine_experts(
+    shape: &SparseShape,
+    desc: &ExpertDesc,
+    layer: LayerRef,
+    n_tok: u32,
+) -> CoreResult<Plan> {
+    let hidden = shape.hidden;
+    let inter = shape.moe.intermediate;
+    let widths = [
+        (desc.gate, hidden, inter),
+        (desc.up, hidden, inter),
+        (desc.down, inter, hidden),
+    ];
+    let fp8 = desc.gate.dtype == DType::Fp8E4M3Block128;
+    if widths.iter().any(|(w, i, o)| {
+        !(w.dtype.is_affine() || fp8)
+            || w.dtype != desc.gate.dtype
+            || w.in_dim != *i
+            || w.out_dim != *o
+    }) {
+        return Err(CoreError::Unsupported {
+            what: "a routed expert stage whose three banks disagree on format or width",
+            backend: "engine",
+        });
+    }
+    let columns = u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX);
+    let groups = columns.min(shape.moe.experts);
+    let at = |role: Role, span| Operand::Weight(WeightRef::layer(layer, role).spanning(span));
+    let map = Operand::ExpertMap(layer.index);
+    let launch = |out_dim: u32| {
+        kernels::Launch::new(
+            shiso_core::Extent3::new(out_dim.div_ceil(AFFINE_EXPERT_ROWS), groups, 1),
+            32 * AFFINE_EXPERT_ROWS,
+            0,
+        )
+    };
+    let mut plan = Plan::new();
+    let tail = |in_dim: u32, out_dim: u32| {
+        [
+            Operand::Scratch(Buf::MoeSorted),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            map,
+            Operand::U32(in_dim),
+            Operand::U32(out_dim),
+            Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+        ]
+    };
+    if fp8 {
+        // `out_gate, out_up, gate_w, gate_s, up_w, up_s, x, sorted, bounds,
+        //  active, map, in_dim, out_dim, n_expert, n_used`
+        let mut ops = vec![
+            Operand::Scratch(Buf::MoeGate),
+            Operand::Scratch(Buf::MoeUp),
+            at(Role::ExpertGate, WeightPart::Whole),
+            at(Role::ExpertGate, WeightPart::BlockScales),
+            at(Role::ExpertUp, WeightPart::Whole),
+            at(Role::ExpertUp, WeightPart::BlockScales),
+            Operand::Scratch(Buf::Mixed),
+        ];
+        ops.extend(tail(hidden, inter));
+        plan.launch(
+            Entry::plain(MOD_MOE, "q4e_fp8_experts_gate_up_kernel"),
+            launch(inter),
+            Args::of(&ops),
+        );
+        plan.append(activate(
+            shape,
+            Operand::Scratch(Buf::MoeGate),
+            Operand::Scratch(Buf::MoeUp),
+            Operand::Scratch(Buf::MoeMid),
+            n_tok,
+        ));
+        // `out, down_w, down_s, mid, sorted, bounds, active, map, in_dim,
+        //  out_dim, n_expert, n_used`
+        let mut ops = vec![
+            Operand::Scratch(Buf::MoeDown),
+            at(Role::ExpertDown, WeightPart::Whole),
+            at(Role::ExpertDown, WeightPart::BlockScales),
+            Operand::Scratch(Buf::MoeMid),
+        ];
+        ops.extend(tail(inter, hidden));
+        plan.launch(
+            Entry::plain(MOD_MOE, "q4e_fp8_experts_down_kernel"),
+            launch(hidden),
+            Args::of(&ops),
+        );
+        return Ok(plan);
+    }
+    plan.launch(
+        Entry::plain(MOD_MOE, "q4e_affine_experts_gate_up_kernel"),
+        launch(inter),
+        // `out_gate, out_up, gate_w, gate_s, gate_b, up_w, up_s, up_b, x,
+        //  sorted, bounds, active, map, in_dim, out_dim, n_expert, n_used`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeGate),
+            Operand::Scratch(Buf::MoeUp),
+            at(Role::ExpertGate, WeightPart::Whole),
+            at(Role::ExpertGate, WeightPart::AffineScales),
+            at(Role::ExpertGate, WeightPart::AffineBiases),
+            at(Role::ExpertUp, WeightPart::Whole),
+            at(Role::ExpertUp, WeightPart::AffineScales),
+            at(Role::ExpertUp, WeightPart::AffineBiases),
+            Operand::Scratch(Buf::Mixed),
+            Operand::Scratch(Buf::MoeSorted),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            map,
+            Operand::U32(hidden),
+            Operand::U32(inter),
+            Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+        ]),
+    );
+    plan.append(activate(
+        shape,
+        Operand::Scratch(Buf::MoeGate),
+        Operand::Scratch(Buf::MoeUp),
+        Operand::Scratch(Buf::MoeMid),
+        n_tok,
+    ));
+    plan.launch(
+        Entry::plain(MOD_MOE, "q4e_affine_experts_down_kernel"),
+        launch(hidden),
+        // `out, down_w, down_s, down_b, mid, sorted, bounds, active, map,
+        //  in_dim, out_dim, n_expert, n_used`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeDown),
+            at(Role::ExpertDown, WeightPart::Whole),
+            at(Role::ExpertDown, WeightPart::AffineScales),
+            at(Role::ExpertDown, WeightPart::AffineBiases),
+            Operand::Scratch(Buf::MoeMid),
+            Operand::Scratch(Buf::MoeSorted),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            map,
+            Operand::U32(inter),
+            Operand::U32(hidden),
+            Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+        ]),
+    );
+    Ok(plan)
+}
+
 /// The activation between the up projection and the down one.
 ///
 /// `out, gate, up, n`. The three buffers are the caller's because this kernel
@@ -1334,6 +1501,21 @@ pub fn block(
     n_tok: u32,
     device: Device,
 ) -> CoreResult<Plan> {
+    if desc.gate.dtype.is_affine() || desc.gate.dtype == DType::Fp8E4M3Block128 {
+        let mut plan = route(shape, desc, layer, n_tok, device)?;
+        plan.append(sort(shape, n_tok));
+        // The target's banks may be streamed; a draft head's never are.
+        if layer.set == WeightSet::Target {
+            plan.push(Step::Fetch {
+                layer: layer.index,
+                ids: u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX),
+            });
+        }
+        plan.append(affine_experts(shape, desc, layer, n_tok)?);
+        plan.append(combine(shape, n_tok));
+        plan.append(shared(shape, desc, layer, n_tok, device)?);
+        return Ok(plan);
+    }
     let Some(bits) = matmul::trellis_bits(desc.gate.dtype) else {
         return Err(CoreError::Unsupported {
             what: "a staged expert gate and up projection, whose kernel is not in this kernel set",

@@ -307,6 +307,31 @@ pub struct ServeArgs {
     #[arg(long, env = "SHISO_PLE_RESIDENT", default_value_t = false)]
     pub ple_resident: bool,
 
+    /// Where a sparse checkpoint's routed expert banks live: imported beside
+    /// the other weights, or streamed from disk into a pool of expert slots.
+    ///
+    /// Read only by the sparse family's MLX directory. `auto` imports them
+    /// when every weight fits in the device's working set with
+    /// `--expert-reserve-gb` to spare, and streams them otherwise; the other
+    /// two insist, and `resident` on a device that cannot hold them fails at
+    /// the first allocation that does not fit.
+    #[arg(long, env = "SHISO_EXPERT_RESIDENCY", value_enum, default_value_t = ExpertResidencyChoice::Auto)]
+    pub expert_residency: ExpertResidencyChoice,
+    /// Gibibytes of the device's working set the automatic residency choice
+    /// leaves for the cache, the activations and the n-gram rows.
+    ///
+    /// Larger is a smaller expert pool and a larger cache; the pool is sized
+    /// from what is left.
+    #[arg(long, env = "SHISO_EXPERT_RESERVE_GB", default_value_t = 6)]
+    pub expert_reserve_gb: u64,
+    /// Expert slots when the banks are streamed; zero sizes the pool from the
+    /// working set.
+    ///
+    /// One slot holds one expert of one layer, 2.6 MiB for the published
+    /// checkpoint.
+    #[arg(long, env = "SHISO_EXPERT_SLOTS", default_value_t = 0)]
+    pub expert_slots: u32,
+
     /// The vision tower: a sidecar weights file, or a directory holding one.
     ///
     /// Absent means text only, and the encoder is never loaded.
@@ -766,6 +791,17 @@ impl ServeArgs {
             .filter(|token| !token.is_empty())
             .collect()
     }
+}
+
+/// Where the routed expert banks live, as the operator asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExpertResidencyChoice {
+    /// Resident when they fit, streamed when they do not.
+    Auto,
+    /// Imported beside the other weights.
+    Resident,
+    /// Streamed from disk into a pool of expert slots.
+    Stream,
 }
 
 /// The parser choice specified via CLI flags.

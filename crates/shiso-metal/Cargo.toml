@@ -102,6 +102,42 @@ path = "tests/vision_kernels.rs"
 name = "q35moe_moe"
 path = "tests/q35moe_moe.rs"
 
+[[test]]
+name = "q4e_hc"
+path = "tests/q4e_hc.rs"
+
+[[test]]
+name = "q4e_gdn"
+path = "tests/q4e_gdn.rs"
+
+[[test]]
+name = "q4e_ple"
+path = "tests/q4e_ple.rs"
+
+[[test]]
+name = "q4e_matvec"
+path = "tests/q4e_matvec.rs"
+
+[[test]]
+name = "q4e_qsa"
+path = "tests/q4e_qsa.rs"
+
+[[test]]
+name = "q4e_idx"
+path = "tests/q4e_idx.rs"
+
+[[test]]
+name = "q4e_misc"
+path = "tests/q4e_misc.rs"
+
+[[test]]
+name = "q4e_affine"
+path = "tests/q4e_affine.rs"
+
+[[test]]
+name = "q4e_fp8"
+path = "tests/q4e_fp8.rs"
+
 
 # Cargo features are target-independent, and an optional dependency may not carry
 # a `target` key, so the Objective-C stack is kept out of a Linux build by the

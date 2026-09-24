@@ -20,6 +20,8 @@
 mod binding;
 mod ckpt;
 mod config;
+pub mod fp8;
+pub mod mlx;
 mod model;
 
 pub use binding::{

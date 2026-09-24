@@ -73,6 +73,9 @@ pub enum StDType {
     /// The modelopt export uses it twice over, for two unrelated things: an
     /// FP8 target's weights, and an NVFP4 target's per-group scales.
     F8E4M3,
+    /// Signed 64-bit integers: the sparse family's n-gram hash tables (its
+    /// multipliers, head offsets and head sizes) are stored this way.
+    I64,
 }
 
 impl StDType {
@@ -86,6 +89,7 @@ impl StDType {
             "U32" => Some(Self::U32),
             "U8" => Some(Self::U8),
             "F8_E4M3" => Some(Self::F8E4M3),
+            "I64" => Some(Self::I64),
             _ => None,
         }
     }
@@ -97,12 +101,13 @@ impl StDType {
             Self::U8 | Self::F8E4M3 => 1,
             Self::Bf16 | Self::F16 => 2,
             Self::F32 | Self::U32 => 4,
+            Self::I64 => 8,
         }
     }
 }
 
 /// Every spelling [`StDType::parse`] accepts, for the error a refusal carries.
-const SPELLINGS: &str = "one of BF16, F16, F32, U32, U8, F8_E4M3";
+const SPELLINGS: &str = "one of BF16, F16, F32, U32, U8, F8_E4M3, I64";
 
 /// One tensor as the shard header describes it, before translation.
 #[derive(Debug, Deserialize)]
@@ -252,6 +257,19 @@ impl Shard {
     ///
     /// [`GgufError::OutOfBounds`] when the span is not inside the mapping.
     pub fn payload(&self, start: u64, end: u64) -> GgufResult<&[u8]> {
+        Ok(&self.map[self.payload_range(start, end)?])
+    }
+
+    /// The span of the whole mapping a payload span occupies.
+    ///
+    /// What a device import wants: the shard itself is the host memory
+    /// ([`Shard`] is `AsRef<[u8]>` over its whole mapping), and this is the
+    /// window into it one tensor's payload is.
+    ///
+    /// # Errors
+    ///
+    /// [`GgufError::OutOfBounds`] when the span is not inside the mapping.
+    pub fn payload_range(&self, start: u64, end: u64) -> GgufResult<std::ops::Range<usize>> {
         let range = usize::try_from(self.payload_base.saturating_add(start))
             .ok()
             .zip(usize::try_from(self.payload_base.saturating_add(end)).ok())
@@ -259,7 +277,14 @@ impl Shard {
         let (from, to) = range.ok_or_else(|| GgufError::OutOfBounds {
             tensor: Box::from(self.path.to_string_lossy().as_ref()),
         })?;
-        Ok(&self.map[from..to])
+        Ok(from..to)
+    }
+
+    /// Byte offset of the payload base inside the file, which is where a
+    /// positional reader of this shard adds a tensor's own offsets to.
+    #[must_use]
+    pub const fn payload_base(&self) -> u64 {
+        self.payload_base
     }
 
     /// Path this shard was mapped from.
@@ -278,6 +303,38 @@ impl Shard {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+}
+
+/// Opens `path` for positional reads that bypass the page cache where the
+/// platform allows it.
+///
+/// For a reader that streams parts of a checkpoint into memory of its own -
+/// routed experts into a slot pool - a cached read is a second copy of every
+/// byte, in the page cache, on a machine whose memory is already the pool's.
+/// On a target with no such switch the file is opened normally.
+///
+/// # Errors
+///
+/// [`io::Error`] when the file cannot be opened.
+pub fn open_uncached(path: &Path) -> io::Result<File> {
+    let file = File::open(path)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `F_NOCACHE` takes an integer argument and only changes how
+        // the kernel caches this descriptor's reads; the descriptor is live
+        // for the call. A refusal is advice ignored, not a failure.
+        let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    }
+    Ok(file)
+}
+
+/// The whole mapping, which is what makes a shard shareable host memory a
+/// device can wrap without copying.
+impl AsRef<[u8]> for Shard {
+    fn as_ref(&self) -> &[u8] {
+        &self.map
     }
 }
 

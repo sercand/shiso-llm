@@ -492,6 +492,8 @@ pub(crate) struct Resident {
     /// its layer out of whatever the allocator left behind and a table with no
     /// slot is a reader nothing ever asks.
     pub(crate) ngram: Option<ple::NgramTier>,
+    /// The routed expert stream, on a stack whose banks are not resident.
+    pub(crate) stream: Option<crate::sparse::stream::ExpertStream>,
 }
 
 /// The host buffers this stack moves bytes through, reused between calls.
@@ -764,6 +766,7 @@ impl SparseStack {
                 cache,
                 scratch,
                 ngram,
+                stream: None,
             }),
             sessions: HashMap::new(),
             order: Vec::new(),
@@ -774,6 +777,36 @@ impl SparseStack {
             tap: None,
             batch_slots: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Hands the stack the stream its routed banks are read through.
+    ///
+    /// The banks the weights hold for those roles are then descriptions only:
+    /// every expert stage binds the stream's slot pools and per-layer maps, and
+    /// every layer's fetch step brings the routed experts in first.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] after teardown.
+    pub fn attach_expert_stream(
+        &mut self,
+        stream: crate::sparse::stream::ExpertStream,
+    ) -> CoreResult<()> {
+        let resident = self.resident.as_mut().ok_or(CoreError::Unsupported {
+            what: "an expert stream on a stack that has been torn down",
+            backend: "engine",
+        })?;
+        resident.stream = Some(stream);
+        Ok(())
+    }
+
+    /// The routed expert stream's running totals, on a stack that streams.
+    #[must_use]
+    pub fn expert_stream_stats(&self) -> Option<crate::sparse::stream::StreamStats> {
+        self.resident
+            .as_ref()
+            .and_then(|resident| resident.stream.as_ref())
+            .map(crate::sparse::stream::ExpertStream::stats)
     }
 
     /// Arms the residual tap: every single-session chunk pass from here on
@@ -1352,6 +1385,10 @@ impl SparseStack {
             Some(rows) => binder.with_media(rows),
             None => binder,
         };
+        let binder = match resident.stream.as_ref() {
+            Some(stream) => binder.with_stream(stream),
+            None => binder,
+        };
         Ok(match self.backend.as_coop() {
             Some(coop) => binder.with_coop(coop),
             None => binder,
@@ -1526,7 +1563,9 @@ impl SparseStack {
                 cache,
                 scratch,
                 ngram,
+                stream,
             } = resident;
+            drop(stream);
             drop(ngram);
             drop(scratch);
             drop(cache);

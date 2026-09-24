@@ -13,4 +13,13 @@
 //! Every case asserts by panicking, because that is the whole of what a case
 //! does.
 
+pub mod affine;
+pub mod fp8;
+pub mod gdn;
+pub mod hc;
+pub mod idx;
 pub mod indexer;
+pub mod matvec;
+pub mod misc;
+pub mod ple;
+pub mod qsa;

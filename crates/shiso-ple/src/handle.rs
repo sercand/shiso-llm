@@ -56,6 +56,20 @@ pub enum PleRowType {
     /// A six-bit tail-biting trellis over the whole row, one half-precision row
     /// scale, and a per-head bias added after decoding.
     TrellisK6,
+    /// MLX affine four-bit codes in groups of thirty-two, one brain-float scale
+    /// and one brain-float bias per group.
+    ///
+    /// The container stores the three as separate arrays, so a row as this
+    /// crate hands it out is their three slices concatenated: `head_dim / 2`
+    /// bytes of codes, then the scales, then the biases.
+    MlxAffine4,
+    /// One FP8 E4M3 byte a weight under one scale for the whole table, the
+    /// scale's single-precision bit pattern carried here because it is a fact
+    /// of the rows' format and not of any one row.
+    Fp8E4M3 {
+        /// The table scale, as `f32::to_bits`.
+        scale_bits: u32,
+    },
 }
 
 /// The table metadata a checkpoint supplies, before it has been checked.
@@ -463,6 +477,45 @@ pub(crate) struct RowRead {
     pub(crate) len: usize,
 }
 
+/// One array of a sharded table: a file, where the array starts in it, and how
+/// many bytes of a row it holds.
+#[derive(Debug, Clone)]
+pub struct PleSegment {
+    /// The file the array lives in.
+    pub file: Arc<File>,
+    /// Byte offset of the array's first row.
+    pub offset: u64,
+    /// Bytes one row occupies in this array.
+    pub row_bytes: u32,
+}
+
+/// A table stored as shards of equal row count, each shard as several arrays
+/// whose row slices, concatenated in order, are one row.
+///
+/// The layout a container that splits one embedding into many tensors has:
+/// row `r` is row `r % rows_per_shard` of shard `r / rows_per_shard`, and each
+/// shard's arrays can sit anywhere in any file.
+#[derive(Debug, Clone)]
+pub struct PleShards {
+    /// Rows every shard holds; the last may hold fewer of them as real rows,
+    /// which the table's own row count bounds.
+    pub rows_per_shard: u64,
+    /// One entry per shard, each the same number of segments in the same
+    /// order.
+    pub shards: Vec<Vec<PleSegment>>,
+}
+
+impl PleShards {
+    /// Bytes one assembled row occupies, or `None` when the shards disagree.
+    fn row_bytes(&self) -> Option<u32> {
+        let first: u32 = self.shards.first()?.iter().map(|seg| seg.row_bytes).sum();
+        self.shards
+            .iter()
+            .all(|shard| shard.iter().map(|seg| seg.row_bytes).sum::<u32>() == first)
+            .then_some(first)
+    }
+}
+
 /// The descriptor, and the arithmetic that turns a row into a read.
 #[derive(Debug)]
 pub(crate) struct RowReader {
@@ -471,6 +524,8 @@ pub(crate) struct RowReader {
     row_bytes: usize,
     direct: bool,
     align: usize,
+    /// The sharded layout, which replaces `file` and `file_offset` when set.
+    shards: Option<PleShards>,
 }
 
 impl RowReader {
@@ -492,7 +547,38 @@ impl RowReader {
             row_bytes: row_bytes as usize,
             direct,
             align,
+            shards: None,
         }
+    }
+
+    /// A reader over a sharded table. Reads are buffered: each is a few dozen
+    /// bytes, and the three reads of one row land in three different places.
+    fn sharded(shards: PleShards, row_bytes: u32) -> PleResult<Self> {
+        let file = shards
+            .shards
+            .first()
+            .and_then(|shard| shard.first())
+            .map(|seg| seg.file.try_clone())
+            .transpose()
+            .map_err(PleError::Io)?
+            .ok_or_else(|| PleError::InvalidParams {
+                what: "sharded table",
+                value: "no shards".to_owned(),
+            })?;
+        Ok(Self {
+            file,
+            file_offset: 0,
+            row_bytes: row_bytes as usize,
+            direct: false,
+            align: 1,
+            shards: Some(shards),
+        })
+    }
+
+    /// Whether this reader assembles rows from several arrays, which only the
+    /// thread pool can serve.
+    pub(crate) const fn is_sharded(&self) -> bool {
+        self.shards.is_some()
     }
 
     /// Bytes one row occupies.
@@ -575,6 +661,28 @@ impl RowReader {
         bounce: &mut Vec<u8>,
     ) -> PleResult<Tally> {
         let started = Instant::now();
+        if let Some(layout) = &self.shards {
+            let shard = usize::try_from(row / layout.rows_per_shard.max(1)).unwrap_or(usize::MAX);
+            let local = row % layout.rows_per_shard.max(1);
+            let segments = layout
+                .shards
+                .get(shard)
+                .ok_or(PleError::RowOutOfRange { row, n_rows: 0 })?;
+            let mut at = 0usize;
+            let mut reads = 0u64;
+            for seg in segments {
+                let len = seg.row_bytes as usize;
+                let start = seg.offset + local * u64::from(seg.row_bytes);
+                read_at(&seg.file, &mut dst[at..at + len], start, row, 0, len)?;
+                at += len;
+                reads += 1;
+            }
+            return Ok(Tally {
+                reads,
+                bytes: at as u64,
+                elapsed: started.elapsed(),
+            });
+        }
         let geom = self.geometry(row);
         let mut done = 0usize;
         if self.is_direct() {
@@ -843,11 +951,67 @@ impl PleStream {
         )
     }
 
+    /// Opens a hashed table stored as shards of several arrays each.
+    ///
+    /// The same hash, cache and pool as [`PleStream::open`]; only the reader
+    /// differs, assembling each row from its shard's arrays. The ring reader is
+    /// never used: one row is several reads into several places, which the
+    /// ring's one-read-per-row accounting does not describe.
+    ///
+    /// # Errors
+    ///
+    /// [`PleError::InvalidParams`] when the shards' row width is not the one
+    /// the row format implies, or the shards cannot hold `n_rows`; whatever
+    /// [`PleStream::open`] refuses otherwise.
+    pub fn open_sharded(
+        shards: PleShards,
+        n_rows: u64,
+        params: PleParams,
+        cache_bytes: u64,
+        cfg: &PleConfig,
+    ) -> PleResult<Self> {
+        let row_bytes = params.row_bytes();
+        if shards.row_bytes() != Some(row_bytes) {
+            return Err(PleError::InvalidParams {
+                what: "sharded row width",
+                value: format!("{:?} rather than {row_bytes}", shards.row_bytes()),
+            });
+        }
+        let capacity = shards
+            .rows_per_shard
+            .saturating_mul(shards.shards.len() as u64);
+        if capacity < n_rows {
+            return Err(PleError::InvalidParams {
+                what: "sharded row count",
+                value: format!("{capacity} rows of shards for a {n_rows}-row table"),
+            });
+        }
+        let reader = RowReader::sharded(shards, row_bytes)?;
+        let cfg = PleConfig {
+            io: PleIo::Pool,
+            ..*cfg
+        };
+        Self::open_reader(reader, n_rows, Some(params), row_bytes, cache_bytes, &cfg)
+    }
+
     /// The body both constructors share: the reader, the cache and the readers'
     /// backends, over a row width whichever of them decided it.
     fn open_rows(
         shard: File,
         file_offset: u64,
+        n_rows: u64,
+        params: Option<PleParams>,
+        row_bytes: u32,
+        cache_bytes: u64,
+        cfg: &PleConfig,
+    ) -> PleResult<Self> {
+        let reader = RowReader::new(shard, file_offset, row_bytes);
+        Self::open_reader(reader, n_rows, params, row_bytes, cache_bytes, cfg)
+    }
+
+    /// The reader-independent half of every constructor.
+    fn open_reader(
+        reader: RowReader,
         n_rows: u64,
         params: Option<PleParams>,
         row_bytes: u32,
@@ -867,9 +1031,12 @@ impl PleStream {
             });
         }
 
-        let reader = RowReader::new(shard, file_offset, row_bytes);
         let cache = RowCache::new(row_bytes, n_rows, cache_bytes);
-        let want = resolve_io(cfg.io)?;
+        let want = if reader.is_sharded() {
+            PleIo::Pool
+        } else {
+            resolve_io(cfg.io)?
+        };
 
         let mut ring = None;
         if want != PleIo::Pool {

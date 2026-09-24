@@ -111,6 +111,11 @@ objc2-metal = { version = "0.3", features = [
     "MTLLibrary",
     "MTLBlitCommandEncoder",
     "MTLEvent",
+    # Pipeline reflection: which kernels declare a dynamic threadgroup-memory
+    # binding (`MTLArgument` for the binding types, `MTLAllocation` gates the
+    # reflecting constructor).
+    "MTLArgument",
+    "MTLAllocation",
     "block2",
 ] }
 objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSError"] }

@@ -413,6 +413,41 @@ pub trait Backend: Send + Sync + fmt::Debug {
         Ok(())
     }
 
+    /// Fills several device ranges from the host in one call: `fill` is handed
+    /// one writable slice per view, in order, and whatever it writes is what the
+    /// ranges hold afterwards.
+    ///
+    /// For a writer that produces its bytes in place - a positional read off a
+    /// disk - a device whose memory the host can address hands out the ranges
+    /// themselves, and nothing is staged or copied; the default stages each
+    /// range in a host buffer and copies it across once `fill` returns. Either
+    /// way the device has finished with the ranges before `fill` runs, and
+    /// nothing launched afterwards sees them half written.
+    ///
+    /// The views must not overlap: the slices are handed out at once, and two
+    /// of them over the same bytes would be two mutable borrows of one place.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::InvalidValue`] for overlapping views, whatever
+    /// `fill` reports, and whatever the copies report.
+    fn write_host(
+        &self,
+        dsts: &[DeviceView<'_>],
+        fill: &mut dyn FnMut(&mut [&mut [u8]]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let mut staged: Vec<Vec<u8>> = dsts
+            .iter()
+            .map(|view| vec![0u8; usize::try_from(view.len()).unwrap_or(usize::MAX)])
+            .collect();
+        let mut slices: Vec<&mut [u8]> = staged.iter_mut().map(Vec::as_mut_slice).collect();
+        fill(&mut slices)?;
+        for (view, bytes) in dsts.iter().zip(&staged) {
+            self.copy_h2d(*view, bytes)?;
+        }
+        Ok(())
+    }
+
     /// Device-to-device copy. Requires `dst.len() == src.len()`.
     ///
     /// # Errors

@@ -9,7 +9,10 @@ use std::fmt;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
-use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLFunctionConstantValues, MTLLibrary};
+use objc2_metal::{
+    MTLBinding, MTLBindingType, MTLComputePipelineState, MTLDevice, MTLFunctionConstantValues,
+    MTLLibrary, MTLPipelineOption,
+};
 use shiso_core::{CoreError, CoreResult, FnConst, KernelRef};
 
 use crate::device::MetalError;
@@ -39,7 +42,24 @@ impl PipelineKey {
 }
 
 /// A resolved pipeline handle.
-pub(crate) type PipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+pub(crate) type PipelineHandle = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+/// A resolved pipeline and the one reflection fact a dispatch needs.
+#[derive(Clone)]
+pub(crate) struct PipelineState {
+    /// The pipeline itself.
+    pub(crate) pipeline: PipelineHandle,
+    /// Whether the kernel declares a `[[threadgroup(n)]]` parameter, which is
+    /// the only way a launch's dynamic threadgroup length reaches it.
+    ///
+    /// A launch's `smem_bytes` is the CUDA launcher's dynamic shared-memory
+    /// request, and the engine computes it from the CUDA kernel's layout. A
+    /// Metal port that restructured its staging to fit this device's smaller
+    /// threadgroup memory declares its arrays statically instead and has no
+    /// such parameter - so for it the request describes nothing and is not
+    /// applied, rather than refused for exceeding a limit it does not use.
+    pub(crate) dynamic_threadgroup: bool,
+}
 
 /// Cache of resolved pipelines, keyed by entry point and specialization.
 ///
@@ -106,18 +126,38 @@ impl PipelineCache {
                 .newFunctionWithName_constantValues_error(&name, constants)
                 .map_err(|err| backend_error("newFunctionWithName", &err))?,
         };
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|err| backend_error("newComputePipelineState", &err))?;
+        let mut reflection = None;
+        // SAFETY: `function` came out of this device's own library, so its
+        // argument and return types are the ones the pipeline is built from,
+        // and the reflection slot is a live local the call fills in.
+        let pipeline = unsafe {
+            device.newComputePipelineStateWithFunction_options_reflection_error(
+                &function,
+                MTLPipelineOption::BindingInfo,
+                Some(&mut reflection),
+            )
+        }
+        .map_err(|err| backend_error("newComputePipelineState", &err))?;
+        let dynamic_threadgroup = reflection.is_some_and(|reflection| {
+            reflection
+                .bindings()
+                .iter()
+                .any(|binding| binding.r#type() == MTLBindingType::ThreadgroupMemory)
+        });
         tracing::debug!(
             entry = kernel.entry,
             consts = kernel.consts.len(),
             max_threads = pipeline.maxTotalThreadsPerThreadgroup(),
+            dynamic_threadgroup,
             "resolved Metal pipeline",
         );
+        let state = PipelineState {
+            pipeline,
+            dynamic_threadgroup,
+        };
         self.entries
-            .insert(PipelineKey::from_kernel(kernel), pipeline.clone());
-        Ok(pipeline)
+            .insert(PipelineKey::from_kernel(kernel), state.clone());
+        Ok(state)
     }
 }
 

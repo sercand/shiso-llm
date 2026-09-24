@@ -702,11 +702,13 @@ fn widen(bytes: &[u8], dtype: StDType, tensor: &str) -> GgufResult<Vec<f32>> {
         // affine row, which has no meaning without the scales and biases
         // beside it; `U8` and `F8_E4M3` belong to the modelopt container and
         // reach this one only through a header that claimed to be MLX's.
-        StDType::U32 | StDType::U8 | StDType::F8E4M3 => Err(GgufError::LayoutMismatch {
-            tensor: tensor.into(),
-            want: Box::from("a float array"),
-            got: Box::from("packed bytes with no scales"),
-        }),
+        StDType::U32 | StDType::U8 | StDType::F8E4M3 | StDType::I64 => {
+            Err(GgufError::LayoutMismatch {
+                tensor: tensor.into(),
+                want: Box::from("a float array"),
+                got: Box::from("packed bytes with no scales"),
+            })
+        }
     }
 }
 

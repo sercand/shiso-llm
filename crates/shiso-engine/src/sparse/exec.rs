@@ -126,6 +126,7 @@ fn step_geometry(step: &Step) -> String {
             staging.bytes,
         ),
         Step::Reserve { bytes } => format!("{bytes} bytes"),
+        Step::Fetch { layer, ids } => format!("layer {layer} ids {ids}"),
         Step::Clear { .. } => "zeros".to_owned(),
         Step::Branch(branch) => format!("{branch:?}"),
         Step::Blas { m, n, k, .. } => format!("m {m} n {n} k {k}"),
@@ -151,7 +152,8 @@ fn destination(step: &Step) -> usize {
         | Step::Blas { .. }
         | Step::Reserve { .. }
         | Step::Clear { .. }
-        | Step::Branch(_) => 0,
+        | Step::Branch(_)
+        | Step::Fetch { .. } => 0,
     }
 }
 
@@ -166,6 +168,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::Clear { .. } => "zero a buffer",
         Step::Branch(_) => "branch",
         Step::Blas { .. } => "matrix multiply",
+        Step::Fetch { .. } => "fetch routed experts",
     }
 }
 
@@ -254,6 +257,7 @@ impl<'a> Exec<'a> {
             Step::Branch(Branch::Fork) => self.backend.fork(),
             Step::Branch(Branch::Resume) => self.backend.resume(),
             Step::Branch(Branch::Join) => self.backend.join(),
+            Step::Fetch { layer, ids } => self.binder.fetch_experts(self.backend, *layer, *ids),
             // The whole grid of a trellis launch has to be resident at once,
             // because its blocks hand partial sums down the lock chain at the
             // head of the per-stream scratch. That is a different launch call,
@@ -529,7 +533,7 @@ impl<'a> Exec<'a> {
                 }
                 Step::Blas { .. } => report.multiplies = report.multiplies.saturating_add(1),
                 Step::Clear { .. } => report.cleared = report.cleared.saturating_add(1),
-                Step::Branch(_) => {}
+                Step::Branch(_) | Step::Fetch { .. } => {}
             }
         }
         Ok(report)

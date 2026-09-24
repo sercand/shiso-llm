@@ -29,6 +29,9 @@ shiso-ple = { workspace = true }
 # is what makes the bytes the struct's own layout rather than a hand-packed array.
 bytemuck = { workspace = true }
 tracing = { workspace = true }
+# The routed expert stream's slot table is shared by the binder that issues a
+# fetch and nothing else, behind a lock that cannot be poisoned.
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 # The device the model tests run on. A dev-dependency only: the engine itself

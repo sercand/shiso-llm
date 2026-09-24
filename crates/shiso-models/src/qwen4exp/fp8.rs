@@ -1,0 +1,650 @@
+//! The reference export of this family: brain-float dense weights, routed
+//! experts in FP8 E4M3 with one scale per 128 x 128 block, and an FP8 n-gram
+//! table under one scale - a directory of safetensors shards as the model's
+//! own library writes it.
+//!
+//! The dense weights are imported as the brain floats they are, with the same
+//! moves the other containers need made on the way (see [`super::mlx`]): the
+//! recurrent block's value heads into the tiled order, the decay base as
+//! `-exp(A_log)`, the indexer's fused projection as two row ranges. This export
+//! is the unconverted one, so the norms the reference applies as `1 + w` are
+//! stored as `w`, and the one is added here.
+//!
+//! The routed experts are 112 GB, one tensor per expert and projection. They
+//! are always read through an [`ExpertStream`]: into a pool that holds every
+//! expert on a device that fits them, filled once at load, and into a pool of
+//! as many slots as fit otherwise.
+
+use std::fs::File;
+use std::path::Path;
+use std::sync::Arc;
+
+use shiso_core::DType;
+use shiso_core::backend::Backend;
+use shiso_core::buffer::{DeviceBuffer, import_host};
+use shiso_core::config::HfConfig;
+use shiso_core::error::{CoreError, CoreResult};
+use shiso_core::ledger::{self, MemTag};
+use shiso_engine::sparse::ple::NgramTable;
+use shiso_engine::sparse::stack::SparseOptions;
+use shiso_engine::sparse::stream::{ExpertSource, ExpertStream};
+use shiso_engine::sparse::weights::{
+    ExpertBank, Indexer, NgramBlock, Recurrent, SparseAttn, SparseBlock, SparseLayer,
+    SparseWeights, StreamMix, Weight, WeightPart, fp8_block_bytes,
+};
+use shiso_modelfile::st_header::Shard;
+use shiso_ple::{PleRowType, PleSegment, PleShards, PleStream};
+
+use crate::qwen4exp::config::{
+    self as cfg, EXPERT_INTERMEDIATE, EXPERTS, EXPERTS_USED, GDN_HEAD_DIM, GDN_QK_HEADS,
+    GDN_V_HEADS, HEAD_DIM, HIDDEN, INDEXER_HEAD_DIM, INDEXER_HEADS, KV_HEADS, N_LAYERS,
+    PLE_HEAD_DIM, PLE_LAYER, Q_HEADS, Qwen4ExpConfig, STREAM_RANK, STREAMS, VOCAB, is_attention,
+};
+use crate::qwen4exp::mlx::{
+    MlxCheckpoint, config_from, f32_bytes, permute_blocks, permute_columns, upload, value_heads,
+};
+
+/// Prefix of every language-model tensor of this export.
+const LM: &str = "model.language_model";
+/// Shards the n-gram table is split into.
+const NGRAM_SHARDS: usize = 128;
+
+impl Qwen4ExpConfig {
+    /// Reads the geometry of the reference export's directory; see
+    /// [`Qwen4ExpConfig::from_mlx`], whose checks this shares.
+    ///
+    /// # Errors
+    ///
+    /// As [`Qwen4ExpConfig::from_mlx`].
+    pub fn from_reference(config: &HfConfig, ck: &MlxCheckpoint) -> CoreResult<Self> {
+        config_from(
+            config,
+            ck,
+            &format!("{LM}.layers.{PLE_LAYER}.ple.ple_embedding"),
+        )
+    }
+}
+
+/// How one brain-float matrix is moved on its way to the device.
+#[derive(Debug, Clone, Copy)]
+enum Move<'p> {
+    /// As stored, wrapped in place.
+    InPlace,
+    /// Output rows in blocks of `rows`, the first `lead` blocks kept.
+    Rows {
+        rows: usize,
+        lead: usize,
+        perm: &'p [usize],
+    },
+    /// Contraction columns in blocks of `cols`.
+    Cols { cols: usize, perm: &'p [usize] },
+}
+
+/// `1 + w`: the centred norms, which this export stores uncentred.
+fn plus_one(w: f32) -> f32 {
+    1.0 + w
+}
+
+/// The loader's state over one open directory.
+struct Loader<'c> {
+    ck: &'c MlxCheckpoint,
+    backend: &'c Arc<dyn Backend>,
+}
+
+impl Loader<'_> {
+    /// A brain-float matrix `[out, in]`, optionally a row range of a larger
+    /// one, optionally moved.
+    fn dense(
+        &self,
+        name: &str,
+        stored_rows: u32,
+        in_dim: u32,
+        rows: std::ops::Range<u32>,
+        how: Move<'_>,
+    ) -> CoreResult<Weight> {
+        let shape = [u64::from(stored_rows), u64::from(in_dim)];
+        let row_bytes = in_dim as usize * 2;
+        let (slot, span) = self.ck.span(name, "BF16", &shape)?;
+        let start = span.start + rows.start as usize * row_bytes;
+        let end = span.start + rows.end as usize * row_bytes;
+        let host: Arc<Shard> = self.ck.shard(slot);
+        let buffer = match how {
+            Move::InPlace => import_host(self.backend, host, start..end)?,
+            Move::Rows {
+                rows: r,
+                lead,
+                perm,
+            } => {
+                let src = &AsRef::<[u8]>::as_ref(&*host)[start..end];
+                upload(self.backend, permute_blocks(src, r * row_bytes, lead, perm))?
+            }
+            Move::Cols { cols, perm } => {
+                let src = &AsRef::<[u8]>::as_ref(&*host)[start..end];
+                upload(
+                    self.backend,
+                    permute_columns(src, row_bytes, cols * 2, perm),
+                )?
+            }
+        };
+        Ok(Weight::over(
+            DType::BF16,
+            in_dim,
+            rows.end - rows.start,
+            buffer,
+        ))
+    }
+
+    /// A whole brain-float matrix, as stored.
+    fn matrix(&self, name: &str, in_dim: u32, out_dim: u32) -> CoreResult<Weight> {
+        self.dense(name, out_dim, in_dim, 0..out_dim, Move::InPlace)
+    }
+
+    /// A single-precision vector from a brain-float tensor, through `op`,
+    /// its blocks of `block` values reordered past the first `lead` when
+    /// `perm` is given.
+    fn vector(
+        &self,
+        name: &str,
+        shape: &[u64],
+        op: impl Fn(f32) -> f32,
+        perm: Option<(usize, usize, &[usize])>,
+    ) -> CoreResult<DeviceBuffer> {
+        let values: Vec<f32> = self.ck.floats(name, shape)?.into_iter().map(op).collect();
+        let bytes = f32_bytes(&values);
+        let bytes = match perm {
+            Some((block, lead, perm)) => permute_blocks(&bytes, block * 4, lead, perm),
+            None => bytes,
+        };
+        upload(self.backend, bytes)
+    }
+
+    fn mix(&self, base: &str, inject: bool) -> CoreResult<StreamMix> {
+        let wide = HIDDEN * STREAMS;
+        Ok(StreamMix {
+            norm: self.vector(
+                &format!("{base}.hc_norm.weight"),
+                &[u64::from(wide)],
+                plus_one,
+                None,
+            )?,
+            down: self.matrix(
+                &format!("{base}.input_mix_weight_down.weight"),
+                wide,
+                STREAM_RANK,
+            )?,
+            up: self.matrix(
+                &format!("{base}.input_mix_weight_up.weight"),
+                STREAM_RANK,
+                wide,
+            )?,
+            inject: inject
+                .then(|| self.matrix(&format!("{base}.block_inject_weight.weight"), wide, STREAMS))
+                .transpose()?,
+        })
+    }
+
+    fn attn(&self, base: &str) -> CoreResult<SparseAttn> {
+        let a = format!("{base}.self_attn");
+        let kv_rows = KV_HEADS * HEAD_DIM;
+        let idx_q = INDEXER_HEADS * INDEXER_HEAD_DIM;
+        let idx_rows = idx_q + INDEXER_HEAD_DIM;
+        let idx = format!("{a}.indexer.index_qk_proj.weight");
+        let norm = |name: &str, width: u32| {
+            self.vector(
+                &format!("{a}.{name}.weight"),
+                &[u64::from(width)],
+                plus_one,
+                None,
+            )
+        };
+        Ok(SparseAttn {
+            q: self.matrix(
+                &format!("{a}.q_proj.weight"),
+                HIDDEN,
+                Q_HEADS * HEAD_DIM * 2,
+            )?,
+            k: self.matrix(&format!("{a}.k_proj.weight"), HIDDEN, kv_rows)?,
+            v: self.matrix(&format!("{a}.v_proj.weight"), HIDDEN, kv_rows)?,
+            output: self.matrix(&format!("{a}.o_proj.weight"), Q_HEADS * HEAD_DIM, HIDDEN)?,
+            q_norm: norm("q_norm", HEAD_DIM)?,
+            k_norm: norm("k_norm", HEAD_DIM)?,
+            indexer: Indexer {
+                q: self.dense(&idx, idx_rows, HIDDEN, 0..idx_q, Move::InPlace)?,
+                k: self.dense(&idx, idx_rows, HIDDEN, idx_q..idx_rows, Move::InPlace)?,
+                q_norm: norm("indexer.q_layernorm", INDEXER_HEAD_DIM)?,
+                k_norm: norm("indexer.k_layernorm", INDEXER_HEAD_DIM)?,
+            },
+        })
+    }
+
+    fn recurrent(&self, base: &str) -> CoreResult<Recurrent> {
+        let la = format!("{base}.linear_attn");
+        let heads = value_heads();
+        let hd = GDN_HEAD_DIM as usize;
+        let qk_blocks = 2 * GDN_QK_HEADS as usize;
+        let v_rows = GDN_V_HEADS * GDN_HEAD_DIM;
+        let qkv_rows = 2 * GDN_QK_HEADS * GDN_HEAD_DIM + v_rows;
+        let n_v = u64::from(GDN_V_HEADS);
+        Ok(Recurrent {
+            qkv: self.dense(
+                &format!("{la}.in_proj_qkv.weight"),
+                qkv_rows,
+                HIDDEN,
+                0..qkv_rows,
+                Move::Rows {
+                    rows: hd,
+                    lead: qk_blocks,
+                    perm: &heads,
+                },
+            )?,
+            gate: self.dense(
+                &format!("{la}.in_proj_z.weight"),
+                v_rows,
+                HIDDEN,
+                0..v_rows,
+                Move::Rows {
+                    rows: hd,
+                    lead: 0,
+                    perm: &heads,
+                },
+            )?,
+            alpha: self.dense(
+                &format!("{la}.in_proj_a.weight"),
+                GDN_V_HEADS,
+                HIDDEN,
+                0..GDN_V_HEADS,
+                Move::Rows {
+                    rows: 1,
+                    lead: 0,
+                    perm: &heads,
+                },
+            )?,
+            beta: self.dense(
+                &format!("{la}.in_proj_b.weight"),
+                GDN_V_HEADS,
+                HIDDEN,
+                0..GDN_V_HEADS,
+                Move::Rows {
+                    rows: 1,
+                    lead: 0,
+                    perm: &heads,
+                },
+            )?,
+            out: self.dense(
+                &format!("{la}.out_proj.weight"),
+                HIDDEN,
+                v_rows,
+                0..HIDDEN,
+                Move::Cols {
+                    cols: hd,
+                    perm: &heads,
+                },
+            )?,
+            // `[channels, 1, kernel]`: a channel's taps are contiguous, which
+            // is the flat order the kernels read.
+            conv1d: self.vector(
+                &format!("{la}.conv1d.weight"),
+                &[u64::from(qkv_rows), 1, u64::from(cfg::GDN_CONV)],
+                std::convert::identity,
+                Some((hd * cfg::GDN_CONV as usize, qk_blocks, &heads)),
+            )?,
+            a: self.vector(
+                &format!("{la}.A_log"),
+                &[n_v],
+                |a| -a.exp(),
+                Some((1, 0, &heads)),
+            )?,
+            dt_bias: self.vector(
+                &format!("{la}.dt_bias"),
+                &[n_v],
+                std::convert::identity,
+                Some((1, 0, &heads)),
+            )?,
+            norm: self.vector(
+                &format!("{la}.norm.weight"),
+                &[u64::from(GDN_HEAD_DIM)],
+                std::convert::identity,
+                None,
+            )?,
+        })
+    }
+
+    fn experts(&self, base: &str) -> CoreResult<ExpertBank> {
+        let m = format!("{base}.mlp");
+        let streamed = |in_dim: u32, out_dim: u32| -> CoreResult<Weight> {
+            Ok(Weight::streamed(
+                DType::Fp8E4M3Block128,
+                in_dim,
+                out_dim,
+                EXPERTS,
+                shiso_core::buffer::alloc(self.backend, 16)?,
+            ))
+        };
+        Ok(ExpertBank {
+            router: self.matrix(&format!("{m}.gate.weight"), HIDDEN, EXPERTS)?,
+            gate: streamed(HIDDEN, EXPERT_INTERMEDIATE)?,
+            up: streamed(HIDDEN, EXPERT_INTERMEDIATE)?,
+            down: streamed(EXPERT_INTERMEDIATE, HIDDEN)?,
+            shared_router: self.matrix(&format!("{m}.shared_expert_gate.weight"), HIDDEN, 1)?,
+            shared_gate: self.matrix(
+                &format!("{m}.shared_expert.gate_proj.weight"),
+                HIDDEN,
+                EXPERT_INTERMEDIATE,
+            )?,
+            shared_up: self.matrix(
+                &format!("{m}.shared_expert.up_proj.weight"),
+                HIDDEN,
+                EXPERT_INTERMEDIATE,
+            )?,
+            shared_down: self.matrix(
+                &format!("{m}.shared_expert.down_proj.weight"),
+                EXPERT_INTERMEDIATE,
+                HIDDEN,
+            )?,
+        })
+    }
+
+    fn ngram(&self, base: &str) -> CoreResult<NgramBlock> {
+        let p = format!("{base}.ple");
+        let wide = HIDDEN * STREAMS;
+        let norm = |name: &str| {
+            self.vector(
+                &format!("{p}.{name}.weight"),
+                &[u64::from(wide)],
+                plus_one,
+                None,
+            )
+        };
+        Ok(NgramBlock {
+            key: self.matrix(&format!("{p}.key_proj.weight"), HIDDEN, wide)?,
+            value: self.matrix(&format!("{p}.value_proj.weight"), HIDDEN, HIDDEN)?,
+            norm_key: norm("norm_key")?,
+            norm_query: norm("norm_query")?,
+            norm_conv: norm("norm_conv")?,
+            conv1d: self.vector(
+                &format!("{p}.conv1d.weight"),
+                &[u64::from(wide), 1, u64::from(cfg::PLE_CONV)],
+                std::convert::identity,
+                None,
+            )?,
+        })
+    }
+}
+
+/// Imports every dense weight of the export; the routed banks are described
+/// and left to the stream.
+///
+/// # Errors
+///
+/// [`CoreError::ConfigMissing`] naming the first tensor the directory does not
+/// carry, [`CoreError::InvalidValue`] for one of another layout, and whatever
+/// the device reports.
+pub fn import(
+    backend: &Arc<dyn Backend>,
+    ck: &MlxCheckpoint,
+    config: &Qwen4ExpConfig,
+) -> CoreResult<SparseWeights> {
+    let loader = Loader { ck, backend };
+    let interval = config.full_attention_interval();
+    let mut layers = Vec::with_capacity(N_LAYERS as usize);
+    let (mut gdn_rank, mut attn_rank) = (0u32, 0u32);
+    for il in 0..config.shape().n_layers() {
+        let base = format!("{LM}.layers.{il}");
+        let (block, ordinal) = if is_attention(il, interval) {
+            let _tag = ledger::scope(MemTag::WeightsAttention);
+            attn_rank += 1;
+            (SparseBlock::Attn(loader.attn(&base)?), attn_rank - 1)
+        } else {
+            let _tag = ledger::scope(MemTag::WeightsRecurrent);
+            gdn_rank += 1;
+            (
+                SparseBlock::Recurrent(loader.recurrent(&base)?),
+                gdn_rank - 1,
+            )
+        };
+        let mix = ledger::scope(MemTag::WeightsStreamMix);
+        let attn_mix = loader.mix(&format!("{base}.attn_hyper_connection"), true)?;
+        let ffn_mix = loader.mix(&format!("{base}.mlp_hyper_connection"), true)?;
+        drop(mix);
+        let experts = {
+            let _tag = ledger::scope(MemTag::WeightsExperts);
+            loader.experts(&base)?
+        };
+        let ngram = (il == PLE_LAYER)
+            .then(|| {
+                let _tag = ledger::scope(MemTag::WeightsEmbedding);
+                loader.ngram(&base)
+            })
+            .transpose()?;
+        layers.push(SparseLayer {
+            attn_mix,
+            ffn_mix,
+            block,
+            experts,
+            ngram,
+            ordinal,
+        });
+    }
+    let token_embd = {
+        let _tag = ledger::scope(MemTag::WeightsEmbedding);
+        loader.matrix(&format!("{LM}.embed_tokens.weight"), HIDDEN, VOCAB)?
+    };
+    let _tag = ledger::scope(MemTag::WeightsHead);
+    let lm_head = loader.matrix("lm_head.weight", HIDDEN, VOCAB)?;
+    let output_mix = loader.mix(&format!("{LM}.hyper_connection_mixer"), false)?;
+    let identity: Vec<u8> = (0..EXPERTS).flat_map(u32::to_le_bytes).collect();
+    Ok(SparseWeights {
+        token_embd,
+        lm_head: Some(lm_head),
+        output_mix,
+        layers,
+        draft: None,
+        expert_map: Some(upload(backend, identity)?),
+    })
+}
+
+/// The three projections of one expert, each as codes then block scales.
+const PROJECTIONS: [(&str, u32, u32); 3] = [
+    ("gate_proj", HIDDEN, EXPERT_INTERMEDIATE),
+    ("up_proj", HIDDEN, EXPERT_INTERMEDIATE),
+    ("down_proj", EXPERT_INTERMEDIATE, HIDDEN),
+];
+
+/// Bytes one expert occupies across its six arrays.
+#[must_use]
+pub fn slot_bytes() -> u64 {
+    PROJECTIONS
+        .iter()
+        .map(|(_, i, o)| {
+            let (codes, scales) = fp8_block_bytes(*i, *o);
+            codes + scales
+        })
+        .sum()
+}
+
+/// Bytes of the routed banks, every layer.
+#[must_use]
+pub fn expert_bytes() -> u64 {
+    slot_bytes() * u64::from(EXPERTS) * u64::from(N_LAYERS)
+}
+
+/// The routed banks of the export, one tensor per expert and array.
+#[derive(Debug)]
+pub struct Fp8Experts {
+    /// `(file, offset)` per layer, expert and array, flattened in that order.
+    arrays: Vec<(Arc<File>, u64)>,
+    layout: Vec<u64>,
+}
+
+impl Fp8Experts {
+    /// Locates every expert's six arrays, reading through handles that bypass
+    /// the page cache.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ConfigMissing`] naming a missing tensor, and
+    /// [`CoreError::InvalidValue`] for one of another layout.
+    pub fn new(ck: &MlxCheckpoint) -> CoreResult<Self> {
+        let uncached = ck
+            .shard_paths()
+            .iter()
+            .map(|path| {
+                shiso_modelfile::st_header::open_uncached(path)
+                    .map(Arc::new)
+                    .map_err(CoreError::Io)
+            })
+            .collect::<CoreResult<Vec<_>>>()?;
+        let mut layout = Vec::with_capacity(6);
+        for (_, in_dim, out_dim) in PROJECTIONS {
+            let (codes, scales) = fp8_block_bytes(in_dim, out_dim);
+            layout.push(codes);
+            layout.push(scales);
+        }
+        let mut arrays = Vec::with_capacity((N_LAYERS * EXPERTS) as usize * 6);
+        for il in 0..N_LAYERS {
+            for e in 0..EXPERTS {
+                let base = format!("{LM}.layers.{il}.mlp.experts.{e}");
+                for (proj, in_dim, out_dim) in PROJECTIONS {
+                    let codes = format!("{base}.{proj}.weight");
+                    let scales = format!("{base}.{proj}.weight_scale_inv");
+                    ck.span(&codes, "F8_E4M3", &[u64::from(out_dim), u64::from(in_dim)])?;
+                    ck.span(
+                        &scales,
+                        "BF16",
+                        &[
+                            u64::from(out_dim.div_ceil(128)),
+                            u64::from(in_dim.div_ceil(128)),
+                        ],
+                    )?;
+                    for name in [codes, scales] {
+                        let (slot, offset) = ck.shard_offset(&name)?;
+                        arrays.push((Arc::clone(&uncached[slot]), offset));
+                    }
+                }
+            }
+        }
+        Ok(Self { arrays, layout })
+    }
+}
+
+impl ExpertSource for Fp8Experts {
+    fn parts(&self) -> &'static [WeightPart] {
+        &[WeightPart::Whole, WeightPart::BlockScales]
+    }
+
+    fn layout(&self) -> Vec<u64> {
+        self.layout.clone()
+    }
+
+    fn read(&self, layer: u32, expert: u32, array: usize, dst: &mut [u8]) -> CoreResult<()> {
+        use std::os::unix::fs::FileExt;
+        let at = (layer as usize * EXPERTS as usize + expert as usize) * 6 + array;
+        let (file, offset) = self.arrays.get(at).ok_or(CoreError::OutOfBounds {
+            offset: at as u64,
+            len: 1,
+            buffer_bytes: self.arrays.len() as u64,
+        })?;
+        file.read_exact_at(dst, *offset).map_err(CoreError::Io)
+    }
+}
+
+/// Opens the stream over the export's routed banks; a pool that holds every
+/// expert is filled at once rather than on first use.
+///
+/// # Errors
+///
+/// Whatever [`Fp8Experts::new`], [`ExpertStream::open`] and the fill report.
+pub fn open_stream(
+    backend: &Arc<dyn Backend>,
+    ck: &MlxCheckpoint,
+    slots: u32,
+    widest_pass: u32,
+) -> CoreResult<ExpertStream> {
+    let source = Arc::new(Fp8Experts::new(ck)?);
+    let min_slots = widest_pass.saturating_mul(EXPERTS_USED).min(EXPERTS);
+    let stream = ExpertStream::open(backend, source, N_LAYERS, EXPERTS, slots, min_slots)?;
+    if slots >= EXPERTS * N_LAYERS {
+        stream.preload(backend.as_ref())?;
+    }
+    Ok(stream)
+}
+
+/// Opens the FP8 n-gram table: 128 shards of one array each, one scale for
+/// the whole table, which goes to the device as the decode's one float.
+///
+/// # Errors
+///
+/// [`CoreError::ConfigMissing`] for a missing shard or scale, and whatever the
+/// reader refuses.
+pub fn open_ngram(
+    backend: &Arc<dyn Backend>,
+    ck: &MlxCheckpoint,
+    config: &Qwen4ExpConfig,
+    opts: &SparseOptions,
+) -> CoreResult<NgramTable> {
+    let ple = config.shape().ple.ok_or(CoreError::ShapeMismatch {
+        field: "n-gram slot",
+        expected: 1,
+        got: 0,
+    })?;
+    let base = format!("{LM}.layers.{PLE_LAYER}.ple.ple_embedding.ngram_embedding");
+    let scale = ck
+        .floats(&format!("{base}.weight_scale"), &[1])?
+        .first()
+        .copied()
+        .ok_or_else(|| CoreError::ConfigMissing {
+            key: format!("{base}.weight_scale"),
+        })?;
+    let row_type = PleRowType::Fp8E4M3 {
+        scale_bits: scale.to_bits(),
+    };
+    let params = config.ngram().params(ple, row_type, None)?;
+    let mut shards = Vec::with_capacity(NGRAM_SHARDS);
+    let mut rows_per_shard = 0u64;
+    for s in 0..NGRAM_SHARDS {
+        let name = format!("{base}.shard_{s}.weight");
+        let (_, raw) = ck.raw(&name)?;
+        let rows = raw.shape.first().copied().unwrap_or(0);
+        if raw.dtype != "F8_E4M3" || raw.shape.get(1).copied() != Some(u64::from(PLE_HEAD_DIM)) {
+            return Err(CoreError::InvalidValue {
+                key: "n-gram shard layout",
+                value: format!("{name} is {} {:?}", raw.dtype, raw.shape),
+            });
+        }
+        if rows_per_shard == 0 {
+            rows_per_shard = rows;
+        } else if rows != rows_per_shard {
+            return Err(CoreError::InvalidValue {
+                key: "n-gram shard rows",
+                value: format!("{name} holds {rows} rows, not {rows_per_shard}"),
+            });
+        }
+        let (file, offset) = ck.file_offset(&name)?;
+        shards.push(vec![PleSegment {
+            file,
+            offset,
+            row_bytes: PLE_HEAD_DIM,
+        }]);
+    }
+    let stream = PleStream::open_sharded(
+        PleShards {
+            rows_per_shard,
+            shards,
+        },
+        rows_per_shard * NGRAM_SHARDS as u64,
+        params,
+        opts.ngram_cache_bytes,
+        &opts.ngram_reader,
+    )?;
+    let scale_buffer = upload(backend, scale.to_le_bytes().to_vec())?;
+    NgramTable::new(DType::Fp8E4M3, Arc::new(stream), Some(scale_buffer))
+}
+
+/// Opens the reference export's directory as a checkpoint.
+///
+/// # Errors
+///
+/// As [`MlxCheckpoint::open_reference`].
+pub fn open(dir: &Path) -> CoreResult<MlxCheckpoint> {
+    MlxCheckpoint::open_reference(dir)
+}

@@ -505,7 +505,14 @@ impl Backend for MetalBackend {
         let want = (slack + len + page - 1) & !(page - 1);
         let inside = aligned + want <= base + all.len();
         let fits = self.device.maxBufferLength();
-        if inside && want <= fits {
+        // The wrap keeps the range's own address, and the kernels read it as
+        // words and as 16-byte vectors: a payload that does not start on such
+        // a boundary - a container whose header length is not a multiple of
+        // sixteen puts every tensor on an odd address - reads back correctly
+        // through the host and as garbage through the device. Copying is what
+        // puts it on a boundary.
+        let vector_aligned = start.is_multiple_of(IMPORT_ALIGN);
+        if inside && want <= fits && vector_aligned {
             let pointer = ptr::NonNull::new(aligned as *mut c_void).ok_or_else(|| {
                 MetalError::backend("import_raw", "the mapping is at a null address")
             })?;
@@ -554,6 +561,48 @@ impl Backend for MetalBackend {
             ptr::copy_nonoverlapping(src.as_ptr(), target, src.len());
         }
         Ok(())
+    }
+
+    /// Hands out the ranges themselves: the buffers are host-visible shared
+    /// memory, so a writer fills them where the device reads them.
+    fn write_host(
+        &self,
+        dsts: &[DeviceView<'_>],
+        fill: &mut dyn FnMut(&mut [&mut [u8]]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let mut state = self.inner.lock();
+        Self::flush(&mut state, "write_host")?;
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(dsts.len());
+        for view in dsts {
+            let entry = state.view(*view)?;
+            let offset = usize::try_from(view.offset()).unwrap_or(usize::MAX);
+            let start = Self::contents(entry) as usize + offset;
+            spans.push((start, usize::try_from(view.len()).unwrap_or(usize::MAX)));
+        }
+        let mut sorted = spans.clone();
+        sorted.sort_unstable();
+        if sorted
+            .windows(2)
+            .any(|pair| pair[0].0.saturating_add(pair[0].1) > pair[1].0)
+        {
+            return Err(CoreError::InvalidValue {
+                key: "write_host views",
+                value: "two of the ranges overlap".to_owned(),
+            });
+        }
+        let mut slices: Vec<&mut [u8]> = spans
+            .iter()
+            .map(|&(start, len)| {
+                // SAFETY: each span lies inside a live buffer the table
+                // retains (checked by `view`), the spans were just shown to be
+                // pairwise disjoint, the lock held for this whole call keeps
+                // every buffer alive and keeps any other call from encoding
+                // work against them, and the flush above means the device has
+                // finished with them.
+                unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) }
+            })
+            .collect();
+        fill(&mut slices)
     }
 
     fn copy_d2h(&self, src: DeviceView<'_>, dst: &mut [u8]) -> CoreResult<()> {
@@ -611,6 +660,42 @@ impl Backend for MetalBackend {
         crate::run::dispatch(self, kernel, args)
     }
 
+    /// The working set the device recommends, and what this process has not
+    /// yet allocated of it.
+    ///
+    /// Not the machine's memory: the GPU shares it with everything else, and
+    /// the recommended working set is the most the driver will keep resident
+    /// for one process without paging. A no-copy wrap of a file mapping is
+    /// counted once its pages are used, which is what makes this the budget a
+    /// loader deciding between resident and streamed weights has to fit.
+    fn memory_info(&self) -> Option<shiso_core::backend::MemoryInfo> {
+        let total = self.device.recommendedMaxWorkingSetSize();
+        let used = u64::try_from(self.device.currentAllocatedSize()).unwrap_or(u64::MAX);
+        Some(shiso_core::backend::MemoryInfo {
+            free: total.saturating_sub(used),
+            total,
+        })
+    }
+
+    /// Every template instantiation the library declares, whatever `module`.
+    ///
+    /// Metal compiles one flat library, so there is no per-module symbol table
+    /// to read. A template instantiation in these sources carries a
+    /// `[[host_name]]` spelled the way the CUDA toolchain mangles the same
+    /// instantiation, which is what the engine's decoder reads back into a
+    /// (template, arguments) key; every other entry has a plain name and is
+    /// left out. Handing the same list to every module is harmless: a key
+    /// carries its module, and a template filed under a module that does not
+    /// launch it is a row nothing looks up.
+    fn module_entries(&self, _module: &'static str) -> Vec<String> {
+        self.library
+            .functionNames()
+            .iter()
+            .map(|name| name.to_string())
+            .filter(|name| name.starts_with("_Z"))
+            .collect()
+    }
+
     fn max_block_threads(&self, kernel: KernelRef) -> Option<u32> {
         let mut state = self.inner.lock();
         // A kernel that will not build has no limit to report. The resolve
@@ -627,7 +712,7 @@ impl Backend for MetalBackend {
                 return None;
             }
         };
-        u32::try_from(pipeline.maxTotalThreadsPerThreadgroup()).ok()
+        u32::try_from(pipeline.pipeline.maxTotalThreadsPerThreadgroup()).ok()
     }
 
     fn sync(&self) -> CoreResult<()> {
@@ -697,6 +782,10 @@ impl MetalBackend {
         Ok(raw)
     }
 }
+
+/// The alignment a wrapped range's own start needs for the device to read it:
+/// the widest load any kernel issues, a 16-byte vector.
+const IMPORT_ALIGN: usize = 16;
 
 /// Bytes in one host page, which is the alignment a no-copy wrap needs.
 fn page_size() -> usize {

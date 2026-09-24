@@ -68,6 +68,7 @@ pub mod run;
 pub mod scratch;
 pub mod shape;
 pub mod stack;
+pub mod stream;
 pub mod tap;
 pub mod weights;
 
@@ -86,6 +87,7 @@ pub use shape::{IndexerShape, MoeShape, MropeSections, PleShape, SparseShape};
 pub use stack::{
     MAX_DECODE_BATCH, MAX_PREFILL_CHUNK, Pass, SparseOptions, SparseSession, SparseStack,
 };
+pub use stream::{EXPERT_MATRICES, ExpertSource, ExpertStream, StreamStats};
 pub use tap::{ResidualTap, TapPoint, TapRecord};
 pub use weights::{
     ExpertBank, Indexer, NgramBlock, Recurrent, SparseAttn, SparseBlock, SparseLayer,

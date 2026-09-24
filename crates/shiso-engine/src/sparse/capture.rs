@@ -373,6 +373,48 @@ fn trellis(args: &[Arg]) -> Option<TemplateArgs> {
     })
 }
 
+/// Which of the stack's optional kernel paths this device can launch at all.
+///
+/// Each path has an always-correct fallback the planner takes without it: the
+/// dense attention and the scalar scorer for the tensor-core pair, the dense
+/// attention for the tiled one, the sequential recurrence for the chunked
+/// one. A backend whose kernel set leaves a path out - one whose device lacks
+/// the matrix units, or the shared memory those layouts were written for -
+/// answers here by not resolving its entry points, which is what
+/// [`Backend::max_block_threads`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OptionalPaths {
+    /// The tensor-core attention and indexer scorer.
+    pub tensor_core: bool,
+    /// The tiled attention.
+    pub tiled_attention: bool,
+    /// The chunked recurrence and its parallel convolution.
+    pub chunked_recurrence: bool,
+}
+
+/// Asks the device which optional paths it has kernels for.
+#[must_use]
+pub fn optional_paths(backend: &dyn Backend) -> OptionalPaths {
+    use shiso_core::backend::KernelRef;
+    let has = |module: &'static str, entry: &'static str| {
+        backend
+            .max_block_threads(KernelRef::new(module, entry))
+            .is_some()
+    };
+    let paths = OptionalPaths {
+        tensor_core: has(MOD_QSA_SPARSE, "q4e_qsa_attention_tc_kernel")
+            && has(MOD_IDX, "q4e_idx_score_tc_kernel"),
+        tiled_attention: has(MOD_QSA, "q4e_qsa_attention_tiled_kernel"),
+        chunked_recurrence: has(MOD_GDN_TC, "q4e_gdn_tc_prep_kernel")
+            && has(MOD_GDN_TC, "q4e_gdn_tc_scan_kernel")
+            && has(MOD_GDN_TC, "q4e_gdn_conv_par_kernel")
+            && has(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
+    };
+    tracing::info!(?paths, "optional sparse kernel paths this device has");
+    paths
+}
+
 /// Blocks of the trellis kernels this device can hold resident at once.
 ///
 /// The number that bounds every cooperative grid, and the one device fact the

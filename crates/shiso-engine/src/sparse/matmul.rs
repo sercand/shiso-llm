@@ -254,6 +254,47 @@ pub enum Projection {
         /// Rows the call covers.
         rows: u32,
     },
+    /// An MLX affine weight, read in place: one simdgroup an output row, one
+    /// activation row a launch at decode and [`AFFINE_TOKENS`] a threadgroup
+    /// over a chunk.
+    Affine {
+        /// The projection itself.
+        entry: Entry,
+        /// Its launch.
+        launch: Launch,
+    },
+}
+
+/// Output rows one affine projection threadgroup covers
+/// (`Q4E_AFFINE_ROWS`).
+pub const AFFINE_ROWS: u32 = 8;
+/// Activation rows one multi-row affine threadgroup carries
+/// (`Q4E_AFFINE_TOKENS`).
+pub const AFFINE_TOKENS: u32 = 8;
+
+/// The affine tier: the one-row kernel for a single activation row and the
+/// multi-row one for a chunk, over the same grid of output rows.
+fn affine(in_dim: u32, out_dim: u32, rows: u32) -> CoreResult<Projection> {
+    if crate::sparse::weights::affine_bytes(DType::MlxAffine4Gs64, in_dim, out_dim).is_none() {
+        return Err(CoreError::ShapeMismatch {
+            field: "affine contraction width",
+            expected: 64,
+            got: u64::from(in_dim),
+        });
+    }
+    let (entry, tokens) = if rows == 1 {
+        ("q4e_affine_mv_kernel", 1)
+    } else {
+        ("q4e_affine_mm_kernel", AFFINE_TOKENS)
+    };
+    Ok(Projection::Affine {
+        entry: Entry::plain(MOD_MATVEC, entry),
+        launch: Launch::new(
+            shiso_core::Extent3::new(out_dim.div_ceil(AFFINE_ROWS), rows.div_ceil(tokens), 1),
+            32 * AFFINE_ROWS,
+            0,
+        ),
+    })
 }
 
 /// The device facts the ladder closes over.
@@ -307,6 +348,7 @@ pub fn plan(
         DType::Exl3K4 | DType::Exl3K5 | DType::Exl3K6 => {
             trellis(dtype, in_dim, out_dim, rows, device)
         }
+        DType::MlxAffine4Gs64 => affine(in_dim, out_dim, rows),
         // Every block-quantized tier reaches its kernel through an activation
         // quantizer, and drops through to a dense path, that belong to the
         // general kernel set rather than to this one.
@@ -1017,6 +1059,21 @@ fn project_one(
                 }),
             }
         }
+        // `out, w, scales, biases, x, in_dim, out_dim, rows`
+        Projection::Affine { entry, launch } => out.launch(
+            entry,
+            launch,
+            Args::of(&[
+                bound.dst,
+                w,
+                Operand::Weight(part(bound.weight, WeightPart::AffineScales)),
+                Operand::Weight(part(bound.weight, WeightPart::AffineBiases)),
+                bound.src,
+                Operand::U32(weight.in_dim),
+                Operand::U32(weight.out_dim),
+                Operand::U32(rows),
+            ]),
+        ),
         Projection::Trellis {
             shape,
             bits,

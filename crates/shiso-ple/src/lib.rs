@@ -59,7 +59,8 @@ mod ring;
 use thiserror::Error;
 
 pub use crate::handle::{
-    PleBackend, PleConfig, PleIo, PleParams, PleParamsDesc, PleRowType, PleStats, PleStream,
+    PleBackend, PleConfig, PleIo, PleParams, PleParamsDesc, PleRowType, PleSegment, PleShards,
+    PleStats, PleStream,
 };
 
 /// Everything this crate can refuse to do.

@@ -149,8 +149,8 @@ never allowed to make.
 
 - `embed_token_hc_kernel`
 - `embed_tokens_hc_kernel`
-- `glm_embed_tokens_q8_0_kernel`
-- `glm53_embedding_bf16_kernel`
+- `embed_tokens_q8_0_kernel`
+- `embed_tokens_bf16_kernel`
 
 ## Template instantiations, by module
 
@@ -601,8 +601,8 @@ shipped 4. Their tile widths differ (`Q4E_IDX_TC_BT` vs `Q4E_IDX_BT`), so the
 |---|---|---|---|
 | `embed_token_hc_kernel` | `ceil(n_embd * n_hc / 256)` | `256` | `0` |
 | `embed_tokens_hc_kernel` | `ceil(n_tok * n_hc * n_embd / 256)` | `256` | `0` |
-| `glm_embed_tokens_q8_0_kernel` | `ceil(n_tok * n_embd / 256)` | `256` | `0` |
-| `glm53_embedding_bf16_kernel` | `ceil(n_tok * n_embd / 256)` | `256` | `0` |
+| `embed_tokens_q8_0_kernel` | `ceil(n_tok * n_embd / 256)` | `256` | `0` |
+| `embed_tokens_bf16_kernel` | `ceil(n_tok * n_embd / 256)` | `256` | `0` |
 
 All four are flat elementwise launches over the destination, and `n_hc` is the
 fan-out the half-precision pair writes: at `n_hc = 1` it gathers one row per

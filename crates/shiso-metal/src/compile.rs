@@ -208,6 +208,32 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "qwen35moe/moe_misc.metal",
         include_str!("../metal/qwen35moe/moe_misc.metal"),
     ),
+    // --- qwen4exp (q4e) kernel set; appended, nothing above this line
+    // changed. The header comes first for the same reason every other set's
+    // does. The router, the sort, the activation, the combine and the shared
+    // add are already above, in the qwen35moe set, under the entry names the
+    // sparse stack launches.
+    ("q4e_common.h", include_str!("../metal/q4e/q4e_common.h")),
+    ("q4e/hc.metal", include_str!("../metal/q4e/hc.metal")),
+    ("q4e/gdn.metal", include_str!("../metal/q4e/gdn.metal")),
+    ("q4e/ple.metal", include_str!("../metal/q4e/ple.metal")),
+    (
+        "q4e/matvec.metal",
+        include_str!("../metal/q4e/matvec.metal"),
+    ),
+    ("q4e/qsa.metal", include_str!("../metal/q4e/qsa.metal")),
+    (
+        "q4e/qsa_sparse.metal",
+        include_str!("../metal/q4e/qsa_sparse.metal"),
+    ),
+    ("q4e/idx.metal", include_str!("../metal/q4e/idx.metal")),
+    ("q4e/misc.metal", include_str!("../metal/q4e/misc.metal")),
+    ("q4e/embed.metal", include_str!("../metal/q4e/embed.metal")),
+    (
+        "q4e/affine.metal",
+        include_str!("../metal/q4e/affine.metal"),
+    ),
+    ("q4e/fp8.metal", include_str!("../metal/q4e/fp8.metal")),
 ];
 
 /// Concatenates every source into the one translation unit the device compiles.

@@ -68,10 +68,12 @@ fn st_dtype(name: &str, dtype: StDType) -> Result<DType, VisionError> {
         StDType::Bf16 => Ok(DType::BF16),
         StDType::F16 => Ok(DType::F16),
         StDType::F32 => Ok(DType::F32),
-        StDType::U8 | StDType::U32 | StDType::F8E4M3 => Err(VisionError::TensorDType {
-            name: name.to_owned(),
-            dtype: DType::I32,
-        }),
+        StDType::U8 | StDType::U32 | StDType::F8E4M3 | StDType::I64 => {
+            Err(VisionError::TensorDType {
+                name: name.to_owned(),
+                dtype: DType::I32,
+            })
+        }
     }
 }
 

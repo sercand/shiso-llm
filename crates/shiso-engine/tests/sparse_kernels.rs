@@ -1058,8 +1058,8 @@ fn every_launch_binds_exactly_the_parameters_its_kernel_declares() {
     );
     for entry in [
         "embed_tokens_hc_kernel",
-        "glm53_embedding_bf16_kernel",
-        "glm_embed_tokens_q8_0_kernel",
+        "embed_tokens_bf16_kernel",
+        "embed_tokens_q8_0_kernel",
         kernels::EXL3_GEMM,
         kernels::EXL3_MGEMM,
         kernels::EXL3_MOE,

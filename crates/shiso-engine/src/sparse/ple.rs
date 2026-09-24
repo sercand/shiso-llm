@@ -88,8 +88,17 @@ pub fn row_bytes(row: DType, head_dim: u32) -> Option<u32> {
     if row == DType::Exl3Ngram6 {
         return Some(2 + head_dim.checked_mul(6)? / 8);
     }
+    // One FP8 byte a weight; the scale is the table's, not the row's.
+    if row == DType::Fp8E4M3 {
+        return Some(head_dim);
+    }
     if !head_dim.is_multiple_of(NGRAM_BLOCK_ELEMS) {
         return None;
+    }
+    // The affine rows: codes, then one brain-float scale and one bias per
+    // group, gathered from three arrays into one row by the reader.
+    if row == DType::MlxAffine4Gs32 {
+        return Some(head_dim / 2 + head_dim / NGRAM_BLOCK_ELEMS * 4);
     }
     Some(head_dim / NGRAM_BLOCK_ELEMS * NGRAM_BLOCK_BYTES)
 }
@@ -129,13 +138,36 @@ impl NgramTable {
     /// codec disagree, and [`CoreError::ConfigMissing`] when the trellis codec
     /// is missing its bias.
     pub fn new(row: DType, stream: Arc<PleStream>, bias: Option<DeviceBuffer>) -> CoreResult<Self> {
+        let stored = hashed(&stream)?.row_type();
+        let fp8 = row == DType::Fp8E4M3;
+        if fp8 {
+            if !matches!(stored, PleRowType::Fp8E4M3 { .. }) {
+                return Err(CoreError::ShapeMismatch {
+                    field: "n-gram row codec",
+                    expected: 1,
+                    got: 0,
+                });
+            }
+            // The table scale travels in the bias slot: one float the decode
+            // kernel reads, uploaded by the loader from the row format's own.
+            if bias.is_none() {
+                return Err(CoreError::ConfigMissing {
+                    key: "the FP8 n-gram table's scale on the device".to_owned(),
+                });
+            }
+            return Ok(Self { row, stream, bias });
+        }
         let trellis = row == DType::Exl3Ngram6;
-        let stored = hashed(&stream)?.row_type() == PleRowType::TrellisK6;
-        if trellis != stored {
+        let want = match row {
+            DType::Exl3Ngram6 => PleRowType::TrellisK6,
+            DType::MlxAffine4Gs32 => PleRowType::MlxAffine4,
+            _ => PleRowType::BlockNl4,
+        };
+        if want != stored {
             return Err(CoreError::ShapeMismatch {
                 field: "n-gram row codec",
                 expected: u64::from(trellis),
-                got: u64::from(stored),
+                got: u64::from(stored == PleRowType::TrellisK6),
             });
         }
         if trellis && bias.is_none() {
@@ -499,6 +531,8 @@ pub const fn decode_entry(row: DType, head_dim: u32) -> Option<Entry> {
                 None
             }
         }
+        DType::MlxAffine4Gs32 => Some(Entry::plain(MOD_PLE, "q4e_ple_dequant_affine_kernel")),
+        DType::Fp8E4M3 => Some(Entry::plain(MOD_PLE, "q4e_ple_dequant_fp8_kernel")),
         _ => Some(Entry::plain(MOD_PLE, "q4e_ple_dequant_kernel")),
     }
 }
@@ -567,7 +601,19 @@ pub fn block(
     // seventh n-gram role. Its block is the row width, because the code's ring
     // wraps at that width and one thread decodes one weight.
     let trellis = decode.name() == "q4e_ple_dequant_exl3_kernel";
-    let args = if trellis {
+    let fp8 = desc.row == DType::Fp8E4M3;
+    let args = if fp8 {
+        // `out, rows, head_dim, n_heads, row_bytes, n_rows, scale`
+        Args::of(&[
+            Operand::Scratch(Buf::PleEmbed),
+            Operand::NgramRows,
+            Operand::U32(ple.head_dim),
+            Operand::U32(heads),
+            Operand::U32(stride),
+            Operand::U32(rows),
+            Operand::NgramBias,
+        ])
+    } else if trellis {
         // `out, rows, bias, head_dim, n_heads, row_bytes, n_rows`
         Args::of(&[
             Operand::Scratch(Buf::PleEmbed),
@@ -589,7 +635,9 @@ pub fn block(
             Operand::U32(rows),
         ])
     };
-    let launch = if trellis {
+    // The affine decode takes the block-quantized decode's argument list and
+    // the trellis decode's grid: one thread a weight, one block a row.
+    let launch = if trellis || fp8 || desc.row == DType::MlxAffine4Gs32 {
         kernels::ple_dequant_trellis(heads, n_tok, ple.head_dim)
     } else {
         kernels::ple_dequant(heads, n_tok)

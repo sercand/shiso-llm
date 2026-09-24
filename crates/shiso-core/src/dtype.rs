@@ -59,6 +59,21 @@ pub enum DType {
     MlxAffine4Gs64 = 200,
     /// MLX 8-bit affine block quant, group size 64: 64 bytes weights + 2 bytes scale + 2 bytes bias.
     MlxAffine8Gs64 = 201,
+    /// MLX 4-bit affine block quant, group size 32: 16 bytes weights + 2 bytes
+    /// scale + 2 bytes bias.
+    ///
+    /// The row format of a streamed n-gram table and nothing else: no
+    /// projection tier reads it, which is why [`DType::is_affine`] - the
+    /// question the projection ladder asks - answers no for it.
+    MlxAffine4Gs32 = 210,
+    /// FP8 E4M3 weights with one brain-float scale per 128 x 128 block of the
+    /// matrix, in an array beside the codes (a checkpoint's
+    /// `weight_scale_inv`).
+    ///
+    /// One byte a weight, like [`DType::Fp8E4M3`]; what differs is where the
+    /// scale lives, which is why this is a type of its own: a kernel that took
+    /// one for the other would scale every block by the first block's scale.
+    Fp8E4M3Block128 = 211,
     /// FP8 E4M3 weights under one `f32` per tensor.
     ///
     /// The scale is NOT in the block - there is no block, one byte is one
@@ -162,6 +177,8 @@ impl DType {
             Self::Exl3Ngram6 => "exl3_ngram6",
             Self::MlxAffine4Gs64 => "mlx_affine_4_gs64",
             Self::MlxAffine8Gs64 => "mlx_affine_8_gs64",
+            Self::MlxAffine4Gs32 => "mlx_affine_4_gs32",
+            Self::Fp8E4M3Block128 => "fp8_e4m3_block128",
             Self::Fp8E4M3 => "fp8_e4m3",
             Self::Nvfp4Gs16 => "nvfp4_gs16",
             Self::F16Pack12 => "f16_pack12",
@@ -175,10 +192,21 @@ impl DType {
     #[must_use]
     pub const fn block_elems(self) -> NonZeroU32 {
         let elems = match self {
-            Self::F32 | Self::F16 | Self::BF16 | Self::I32 | Self::Fp8E4M3 => 1,
+            Self::F32
+            | Self::F16
+            | Self::BF16
+            | Self::I32
+            | Self::Fp8E4M3
+            | Self::Fp8E4M3Block128 => 1,
             Self::Nvfp4Gs16 => 16,
             Self::F16Pack12 => 2,
-            Self::Q4_0 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::IQ4_NL | Self::MXFP4 => 32,
+            Self::Q4_0
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::IQ4_NL
+            | Self::MXFP4
+            | Self::MlxAffine4Gs32 => 32,
             Self::MlxAffine4Gs64 | Self::MlxAffine8Gs64 => 64,
             Self::Exl3Ngram6 => 160,
             Self::Q2_K
@@ -202,7 +230,7 @@ impl DType {
     #[must_use]
     pub const fn block_bytes(self) -> NonZeroU32 {
         let bytes = match self {
-            Self::Fp8E4M3 => 1,
+            Self::Fp8E4M3 | Self::Fp8E4M3Block128 => 1,
             Self::F16 | Self::BF16 => 2,
             Self::F32 | Self::I32 => 4,
             Self::Q4_0 | Self::IQ4_NL => 18,
@@ -222,6 +250,7 @@ impl DType {
             Self::Exl3Ngram6 => 122,
             Self::MlxAffine4Gs64 => 36,
             Self::MlxAffine8Gs64 => 68,
+            Self::MlxAffine4Gs32 => 20,
             // The packed weights of one group, without the `e4m3` scale byte
             // that covers it: both live in arrays of their own. See the
             // variant's own note for why this is the useful convention.

@@ -40,7 +40,15 @@ pub(crate) fn dispatch(
     launch: &LaunchArgs<'_>,
 ) -> CoreResult<()> {
     let mut state = backend.lock();
-    let pipeline = backend.resolve(&mut state, kernel)?;
+    let resolved = backend.resolve(&mut state, kernel)?;
+    let pipeline = resolved.pipeline;
+    // A kernel with no dynamic threadgroup binding sized its staging itself;
+    // the CUDA-derived request is not its to honour. See `PipelineState`.
+    let smem = if resolved.dynamic_threadgroup {
+        launch.smem_bytes
+    } else {
+        0
+    };
     let threads = u64::from(launch.block.x)
         .saturating_mul(u64::from(launch.block.y))
         .saturating_mul(u64::from(launch.block.z));
@@ -54,7 +62,7 @@ pub(crate) fn dispatch(
             ),
         ));
     }
-    let smem_bytes = u64::from(launch.smem_bytes);
+    let smem_bytes = u64::from(smem);
     let smem_limit = backend.max_threadgroup_memory();
     if smem_bytes > smem_limit {
         return Err(MetalError::backend(
@@ -113,7 +121,7 @@ pub(crate) fn dispatch(
         }
     }
 
-    if launch.smem_bytes > 0 {
+    if smem > 0 {
         // SAFETY: threadgroup memory lives in its own binding space, so index
         // zero cannot collide with the parameter bindings above. The length
         // was checked above against `max_threadgroup_memory`, which is the
@@ -121,10 +129,8 @@ pub(crate) fn dispatch(
         // creation -- an over-limit length passed to this call is undefined
         // behaviour, not a reported error, so the bound above is load-bearing.
         unsafe {
-            encoder.setThreadgroupMemoryLength_atIndex(
-                usize::try_from(launch.smem_bytes).unwrap_or(usize::MAX),
-                0,
-            );
+            encoder
+                .setThreadgroupMemoryLength_atIndex(usize::try_from(smem).unwrap_or(usize::MAX), 0);
         }
     }
 

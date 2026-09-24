@@ -436,6 +436,10 @@ pub enum Operand {
     /// staging buffers - so two operands of one launch naming the same offset
     /// is a plan a reader can see is wrong.
     CoopStaging(u64),
+    /// The expert-to-slot map the affine expert stages of one layer read, by
+    /// layer index: the identity while the banks are resident, and the stream's
+    /// own map for that layer while they are streamed.
+    ExpertMap(u32),
     /// A pointer parameter the launcher passes as null.
     Null,
     /// An unsigned 32-bit scalar.
@@ -500,6 +504,7 @@ impl Operand {
                 | Self::SpliceArgs
                 | Self::CoopLocks
                 | Self::CoopStaging(_)
+                | Self::ExpertMap(_)
                 | Self::Null
         )
     }
@@ -607,6 +612,7 @@ pub struct Binder<'a> {
     media: Option<DeviceView<'a>>,
     splice: Option<&'a crate::launch::SpliceArgs>,
     coop: Option<&'a dyn CoopLaunch>,
+    stream: Option<&'a crate::sparse::stream::ExpertStream>,
 }
 
 impl<'a> Binder<'a> {
@@ -630,6 +636,7 @@ impl<'a> Binder<'a> {
             media: None,
             splice: None,
             coop: None,
+            stream: None,
         }
     }
 
@@ -670,6 +677,7 @@ impl<'a> Binder<'a> {
             media: None,
             splice: None,
             coop: None,
+            stream: None,
         })
     }
 
@@ -794,6 +802,33 @@ impl<'a> Binder<'a> {
     pub const fn with_coop(mut self, coop: &'a dyn CoopLaunch) -> Self {
         self.coop = Some(coop);
         self
+    }
+
+    /// The same binder, resolving the routed banks and the expert maps
+    /// through a stream rather than through resident weights.
+    #[must_use]
+    pub const fn with_stream(mut self, stream: &'a crate::sparse::stream::ExpertStream) -> Self {
+        self.stream = Some(stream);
+        self
+    }
+
+    /// Issues a [`crate::sparse::plan::Step::Fetch`]: brings one layer's routed
+    /// experts into the stream's slots, or does nothing on a stack whose banks
+    /// are resident.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`crate::sparse::stream::ExpertStream::fetch`] reports.
+    pub fn fetch_experts(
+        &self,
+        backend: &dyn shiso_core::backend::Backend,
+        layer: u32,
+        ids: u32,
+    ) -> CoreResult<()> {
+        let Some(stream) = self.stream else {
+            return Ok(());
+        };
+        stream.fetch(backend, layer, self.scratch.view(Buf::MoeIds)?, ids)
     }
 
     /// Resolves one argument list into what a launch takes.
@@ -925,6 +960,24 @@ impl<'a> Binder<'a> {
                     },
                 )?)
             }
+            Operand::ExpertMap(layer) if self.stream.is_some() => KernelArg::Buffer(
+                self.stream
+                    .ok_or(CoreError::Unsupported {
+                        what: "an expert map on a stack with no stream",
+                        backend: "engine",
+                    })?
+                    .map(layer)?,
+            ),
+            Operand::ExpertMap(_) => KernelArg::Buffer(
+                self.weights
+                    .expert_map
+                    .as_ref()
+                    .ok_or(CoreError::Unsupported {
+                        what: "the expert-to-slot map of a model whose expert banks are not affine",
+                        backend: "engine",
+                    })?
+                    .view(),
+            ),
             Operand::CoopLocks => KernelArg::Buffer(self.coop_at(0)?),
             Operand::CoopStaging(offset) => {
                 KernelArg::Buffer(self.coop_at(crate::sparse::exl3::STAGING_BASE + offset)?)
@@ -1050,6 +1103,14 @@ impl<'a> Binder<'a> {
                 Role::OutputMixUp => head()?.output_mix.up.part(part),
                 _ => Self::layer_weight(&head()?.layer, reference, part),
             };
+        }
+        if let Some(stream) = self.stream
+            && matches!(
+                reference.role,
+                Role::ExpertGate | Role::ExpertUp | Role::ExpertDown
+            )
+        {
+            return stream.bank(reference.role, part);
         }
         let index = usize::try_from(reference.layer.index).unwrap_or(usize::MAX);
         let layer = self

@@ -24,6 +24,7 @@ use crate::sparse::bind::{Args, Operand};
 use crate::sparse::kernels::{self, Entry, MOD_EMBED};
 use crate::sparse::plan::Plan;
 use crate::sparse::shape::SparseShape;
+use crate::sparse::weights::WeightPart;
 
 /// The three operands a gather moves between.
 ///
@@ -86,7 +87,7 @@ pub fn rows(shape: &SparseShape, dtype: DType, bound: Bound, n_tok: u32) -> Core
         // before the ids here, which is the whole reason these lists are
         // written out one kernel at a time.
         DType::BF16 => plan.launch(
-            Entry::plain(MOD_EMBED, "glm53_embedding_bf16_kernel"),
+            Entry::plain(MOD_EMBED, "embed_tokens_bf16_kernel"),
             launch,
             Args::of(&[
                 bound.dst,
@@ -99,7 +100,7 @@ pub fn rows(shape: &SparseShape, dtype: DType, bound: Bound, n_tok: u32) -> Core
         ),
         // `out, tokens, w, n_tokens, n_embd`
         DType::Q8_0 => plan.launch(
-            Entry::plain(MOD_EMBED, "glm_embed_tokens_q8_0_kernel"),
+            Entry::plain(MOD_EMBED, "embed_tokens_q8_0_kernel"),
             launch,
             Args::of(&[
                 bound.dst,
@@ -109,6 +110,32 @@ pub fn rows(shape: &SparseShape, dtype: DType, bound: Bound, n_tok: u32) -> Core
                 Operand::U32(shape.hidden),
             ]),
         ),
+        // `out, tokens, w, scales, biases, n_vocab, n_tokens, n_embd, n_hc` -
+        // the half-precision entry's list with the table's two parameter
+        // arrays after its codes.
+        DType::MlxAffine4Gs64 => {
+            let Operand::Weight(table) = bound.table else {
+                return Err(CoreError::Unsupported {
+                    what: "an affine vocabulary table that is not a bound weight",
+                    backend: "engine",
+                });
+            };
+            plan.launch(
+                Entry::plain(MOD_EMBED, "q4e_affine_embed_hc_kernel"),
+                launch,
+                Args::of(&[
+                    bound.dst,
+                    bound.ids,
+                    bound.table,
+                    Operand::Weight(table.spanning(WeightPart::AffineScales)),
+                    Operand::Weight(table.spanning(WeightPart::AffineBiases)),
+                    Operand::U32(shape.vocab),
+                    Operand::U32(n_tok),
+                    Operand::U32(shape.hidden),
+                    Operand::U32(COPIES_PER_TOKEN),
+                ]),
+            );
+        }
         _ => {
             return Err(CoreError::Unsupported {
                 what: "a vocabulary table stored in a format no row gather in this kernel set \
@@ -158,8 +185,8 @@ mod tests {
         let shape = shape();
         for (dtype, entry) in [
             (DType::F16, "embed_tokens_hc_kernel"),
-            (DType::BF16, "glm53_embedding_bf16_kernel"),
-            (DType::Q8_0, "glm_embed_tokens_q8_0_kernel"),
+            (DType::BF16, "embed_tokens_bf16_kernel"),
+            (DType::Q8_0, "embed_tokens_q8_0_kernel"),
         ] {
             let plan = rows(&shape, dtype, bound(), 8).expect("a stored format with a gather");
             assert_eq!(plan.names(), vec![entry], "{dtype:?}");

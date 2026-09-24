@@ -211,6 +211,59 @@ impl std::error::Error for HostFailure {}
 
 macro_rules! opaque_handle {
     ($(#[$meta:meta])* $name:ident, $repr:ty) => {
+        opaque_handle!(@with
+            [cfg_attr(
+                all(not(target_os = "linux"), not(test)),
+                expect(
+                    dead_code,
+                    reason = "the stub arm never receives a handle from a driver, but the constructor has to exist for both arms to share one type"
+                )
+            )]
+            [cfg_attr(
+                all(not(target_os = "linux"), not(test)),
+                expect(
+                    dead_code,
+                    reason = "the stub arm never passes a handle to a driver, but the accessor has to exist for both arms to share one type"
+                )
+            )]
+            $(#[$meta])* $name, $repr);
+    };
+    // A handle no test on the stub target touches either, so both accessors
+    // are dead there with or without the test harness.
+    (stub_dead; $(#[$meta:meta])* $name:ident, $repr:ty) => {
+        opaque_handle!(@with
+            [cfg_attr(
+                not(target_os = "linux"),
+                expect(
+                    dead_code,
+                    reason = "the stub arm never receives a handle from a driver, but the constructor has to exist for both arms to share one type"
+                )
+            )]
+            [cfg_attr(
+                not(target_os = "linux"),
+                expect(
+                    dead_code,
+                    reason = "the stub arm never passes a handle to a driver, but the accessor has to exist for both arms to share one type"
+                )
+            )]
+            $(#[$meta])* $name, $repr);
+    };
+    // A handle the host side reads on every target - page-locked memory is
+    // written through its address - so its accessor is live on the stub arm
+    // too, and only its constructor is dead there.
+    (host_read; $(#[$meta:meta])* $name:ident, $repr:ty) => {
+        opaque_handle!(@with
+            [cfg_attr(
+                not(target_os = "linux"),
+                expect(
+                    dead_code,
+                    reason = "the stub arm never receives a handle from a driver, but the constructor has to exist for both arms to share one type"
+                )
+            )]
+            []
+            $(#[$meta])* $name, $repr);
+    };
+    (@with [$($from:meta)?] [$($raw:meta)?] $(#[$meta:meta])* $name:ident, $repr:ty) => {
         $(#[$meta])*
         ///
         /// An opaque driver token. The field is private and the only way to
@@ -224,25 +277,13 @@ macro_rules! opaque_handle {
             ///
             /// Only the target arm of this module calls this, immediately after
             /// the call that produced the value.
-            #[cfg_attr(
-                all(not(target_os = "linux"), not(test)),
-                expect(
-                    dead_code,
-                    reason = "the stub arm never receives a handle from a driver, but the constructor has to exist for both arms to share one type"
-                )
-            )]
+            $(#[$from])?
             pub(crate) const fn from_raw(raw: $repr) -> Self {
                 Self(raw)
             }
 
             /// The token, on its way back into a driver call.
-            #[cfg_attr(
-                all(not(target_os = "linux"), not(test)),
-                expect(
-                    dead_code,
-                    reason = "the stub arm never passes a handle to a driver, but the accessor has to exist for both arms to share one type"
-                )
-            )]
+            $(#[$raw])?
             pub(crate) const fn raw(self) -> $repr {
                 self.0
             }
@@ -266,6 +307,7 @@ opaque_handle!(
     usize
 );
 opaque_handle!(
+    stub_dead;
     /// An event: a marker in one stream that another can wait on.
     CuEvent,
     usize
@@ -302,6 +344,7 @@ opaque_handle!(
 );
 
 opaque_handle!(
+    host_read;
     /// Page-locked host memory the driver allocated.
     ///
     /// The device reads it by DMA without the driver first copying it into a
@@ -421,6 +464,13 @@ pub(crate) struct GemmCall {
     pub(crate) tf32: bool,
     /// Whether the product is written back in half precision rather than
     /// single. Accumulation is single precision either way.
+    #[cfg_attr(
+        all(not(target_os = "linux"), test),
+        expect(
+            dead_code,
+            reason = "only the driver arm and the non-test stub read it"
+        )
+    )]
     pub(crate) out_half: bool,
 }
 
