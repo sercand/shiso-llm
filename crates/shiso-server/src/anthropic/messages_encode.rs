@@ -63,13 +63,18 @@ pub fn stop_sequence(stop: &StopReason) -> Value {
 
 /// The accounting block.
 ///
+/// This format splits the prompt rather than nesting the cached part inside
+/// it: `input_tokens` is only what was prefilled, and the whole prompt is the
+/// sum of it and the two cache counters. Reporting the whole prompt there as
+/// well would bill a full cache hit twice - once as input and once as a read.
+///
 /// `cache_creation_input_tokens` is present and zero: this server writes no
 /// cache entries a caller is billed for, and a client that sums the two cache
 /// counters expects both keys to exist.
 #[must_use]
 pub fn encode_usage(usage: &Usage) -> Value {
     json!({
-        "input_tokens": usage.prompt_tokens,
+        "input_tokens": usage.prompt_tokens.saturating_sub(usage.cached_prompt_tokens),
         "output_tokens": usage.completion_tokens,
         "cache_read_input_tokens": usage.cached_prompt_tokens,
         "cache_creation_input_tokens": 0,
@@ -177,7 +182,10 @@ mod tests {
         assert_eq!(body["content"][0]["text"], "Paris");
         assert_eq!(body["stop_reason"], "end_turn");
         assert_eq!(body["stop_sequence"], json!(null));
-        assert_eq!(body["usage"]["input_tokens"], 7);
+        assert_eq!(
+            body["usage"]["input_tokens"], 5,
+            "the cached part of the prompt is not input as well"
+        );
         assert_eq!(body["usage"]["output_tokens"], 3);
         assert_eq!(body["usage"]["cache_read_input_tokens"], 2);
         assert_eq!(body["usage"]["cache_creation_input_tokens"], 0);

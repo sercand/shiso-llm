@@ -31,12 +31,15 @@
 //!
 //! # What `message_start` cannot say
 //!
-//! This format's opening frame carries the prompt's token count, and at the
-//! moment it is sent nothing has counted the prompt yet - the accounting
-//! arrives with the terminal event. It is therefore sent as zero and filled in
-//! by `message_delta`, whose usage is the whole turn's. A client that reads
-//! only the opening frame under-reports; a client that reads the closing one,
-//! as every client of this format does, is exact.
+//! This format's opening frame carries the prompt's token count, split into
+//! what was prefilled and what was read from a cache. The pipeline counted the
+//! rendered prompt before the stream opened, so the total is known; the split
+//! is not, because whether a stored prefix covers the prompt is decided once
+//! the scheduler admits the turn. The opening frame therefore reports the whole
+//! prompt as input, and `message_delta`, whose usage is the whole turn's,
+//! carries the split. A client that reads only the opening frame over-reports
+//! a cache hit; a client that reads the closing one, as every client of this
+//! format does, is exact.
 
 use std::collections::BTreeSet;
 
@@ -361,6 +364,28 @@ mod tests {
         assert_eq!(bodies[5]["delta"]["stop_sequence"], Value::Null);
         assert_eq!(bodies[5]["usage"]["input_tokens"], 11);
         assert_eq!(bodies[5]["usage"]["output_tokens"], 2);
+    }
+
+    /// A prompt a stored prefix covered whole was read, not prefilled: the
+    /// closing frame reports it as a cache read and none of it as input.
+    #[test]
+    fn a_whole_cache_hit_closes_with_no_input_and_the_prompt_as_a_read() {
+        let mut turn = text_turn();
+        turn.pop();
+        turn.push(StreamEvent::Stop {
+            stop: StopReason::EndTurn,
+            usage: Usage {
+                prompt_tokens: 11,
+                completion_tokens: 2,
+                cached_prompt_tokens: 11,
+                ..Usage::default()
+            },
+            token_ids: Vec::new(),
+        });
+        let bodies = data(&drain(encoder(), turn));
+        let usage = &bodies[5]["usage"];
+        assert_eq!(usage["input_tokens"], 0, "{usage}");
+        assert_eq!(usage["cache_read_input_tokens"], 11, "{usage}");
     }
 
     /// The `event:` line and the `type` in the data have to agree, because a
