@@ -288,7 +288,7 @@ impl Device {
     /// Whether this pass's rows are held to every other pass width.
     #[must_use]
     pub const fn row_invariant(self) -> bool {
-        matches!(self.role, PassRole::Prompt)
+        matches!(self.role, PassRole::Prompt { .. })
     }
 
     /// The reduction every multiply of this pass asks the BLAS tier for.
@@ -325,11 +325,28 @@ pub enum PassRole {
     /// that where the prompt was cut - the prefill width, a quantum shared with
     /// decoding sequences, a resume point - moves no bit of any row. See
     /// [`Device::role`].
-    Prompt,
+    Prompt {
+        /// The row of this pass before which the session's recurrent state is
+        /// also written to the stack's snapshot buffer, when the pass carries
+        /// one: the last grid point of a prompt that ends between two, which is
+        /// where a longer prompt resumes. Tiers never read it.
+        snapshot: Option<u32>,
+    },
     /// A decode step or a speculative verify: rows a single-row step must be
     /// able to reproduce, planned on the tiers their row count reaches.
     #[default]
     Step,
+}
+
+impl PassRole {
+    /// The snapshot row a prompt pass carries, if any.
+    #[must_use]
+    pub const fn snapshot(self) -> Option<u32> {
+        match self {
+            Self::Prompt { snapshot } => snapshot,
+            Self::Step => None,
+        }
+    }
 }
 
 /// Plans one projection.

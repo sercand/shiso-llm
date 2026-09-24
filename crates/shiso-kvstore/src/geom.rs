@@ -62,6 +62,17 @@ pub struct CacheGeometry {
     /// and refuses to say a path is restorable, because it has no way to describe the
     /// bytes it would be describing. See [`Self::with_layout`].
     pub layout: Option<PathLayout>,
+    /// The position grid a prompt-final checkpoint has to sit on before a
+    /// longer prompt may continue from it. One places no condition.
+    ///
+    /// An engine whose prompt passes are computed the same way wherever the
+    /// prompt was cut - so long as every cut lands on this grid - sees a
+    /// prompt-final checkpoint off the grid as exact for the prompt that wrote
+    /// it and for nothing longer: a continuation from it cuts where a cold run
+    /// of the longer prompt never would. Such a checkpoint still answers its own
+    /// prompt, from the logits row it carries; a longer prompt resumes from a
+    /// checkpoint on the grid beneath it instead. See [`Self::continuable`].
+    pub resume_grid: u32,
 }
 
 impl CacheGeometry {
@@ -90,7 +101,24 @@ impl CacheGeometry {
             prefill_s_per_token,
             decay_s,
             layout: None,
+            resume_grid: 1,
         }
+    }
+
+    /// Holds prompt-final checkpoints to `grid` for continuation: see
+    /// [`Self::resume_grid`].
+    #[must_use]
+    pub const fn with_resume_grid(mut self, grid: u32) -> Self {
+        self.resume_grid = grid;
+        self
+    }
+
+    /// Whether a checkpoint at `pos` may stand a prompt longer than `pos` on
+    /// it. Only a prompt-final one - the one carrying a logits row - can be
+    /// refused, and only off the grid.
+    #[must_use]
+    pub const fn continuable(&self, pos: u32, has_logits: bool) -> bool {
+        !has_logits || self.resume_grid <= 1 || pos.is_multiple_of(self.resume_grid)
     }
 
     /// Adds the byte description a stored path's identity is built from.

@@ -189,7 +189,7 @@ pub fn selected_eligible(shape: &SparseShape) -> bool {
 #[must_use]
 pub fn path(shape: &SparseShape, ctx: AttnContext, n_tok: u32) -> AttnPath {
     let head_dim = shape.gqa.head_dim;
-    let n_tok = if ctx.role == PassRole::Prompt {
+    let n_tok = if matches!(ctx.role, PassRole::Prompt { .. }) {
         u32::MAX
     } else {
         n_tok
@@ -374,7 +374,7 @@ fn attend_at(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32, 
         AttnPath::GatheredTensorCore => {
             let splits = kernels::tc_splits_sparse(
                 shape.gqa.kv_heads,
-                if ctx.role == PassRole::Prompt {
+                if matches!(ctx.role, PassRole::Prompt { .. }) {
                     u32::MAX
                 } else {
                     n_tok

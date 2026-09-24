@@ -103,7 +103,13 @@ impl SparseStack {
         tokens: &[TokenId],
         logit_rows: u32,
     ) -> CoreResult<Pass> {
-        self.plan_chunk_media(session, tokens, logit_rows, None, PassRole::Prompt)
+        self.plan_chunk_media(
+            session,
+            tokens,
+            logit_rows,
+            None,
+            PassRole::Prompt { snapshot: None },
+        )
     }
 
     /// The same pass, with the splice that a chunk carrying a picture needs.

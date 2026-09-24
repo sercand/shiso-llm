@@ -426,7 +426,35 @@ impl SparseStack {
             } else {
                 Boundary::Step
             };
-            self.run_rows_media(session, head, logit_rows, run.as_mut(), PassRole::Prompt)?;
+            let snapshot = if logit_rows > 0 && run.is_none() {
+                self.snapshot_row(session, start, head.len())?
+            } else {
+                None
+            };
+            self.run_rows_media(
+                session,
+                head,
+                logit_rows,
+                run.as_mut(),
+                PassRole::Prompt { snapshot },
+            )?;
+            // A prompt that ends between two grid points is checkpointed at the
+            // last one instead of at its end: a longer prompt continues from
+            // there exactly as a cold prefill of it would, where a checkpoint at
+            // the end would have it cut a run in two. The end itself is then an
+            // ordinary span, and a repeat of this prompt re-reads the few
+            // positions past the grid point.
+            let boundary = match snapshot {
+                Some(row) => {
+                    let lead = usize::try_from(row).unwrap_or(head.len()).min(head.len());
+                    if self.commit_snapshot(session, &head[..lead])? {
+                        Boundary::Step
+                    } else {
+                        boundary
+                    }
+                }
+                None => boundary,
+            };
             // Staged after the pass and before the commit: the commit is where
             // a prompt's final chunk earns its checkpoint, and a speculating
             // session's checkpoint carries this row - staged any later, the
@@ -519,6 +547,32 @@ impl SparseStack {
             .filter(|stop| *stop > pos && *stop < len && *stop >= lowest)
             .min();
         Ok(stop.and_then(|stop| usize::try_from(stop - pos).ok()))
+    }
+
+    /// The row of a prompt's final pass at which its state is snapshotted, when
+    /// it gets one: the pass starts on the grid, ends off it, and reaches a grid
+    /// point in between - and a tier is open to keep the snapshot, and the
+    /// chunked recurrence, the only one that writes one, is what the pass runs.
+    /// `None` is not a refusal: the prompt's end is checkpointed as it is.
+    fn snapshot_row(&self, session: SessionId, start: u32, rows: usize) -> CoreResult<Option<u32>> {
+        let has_buffer = self
+            .resident
+            .as_ref()
+            .is_some_and(|resident| resident.snapshot.is_some());
+        if self.ckpt.is_none() || !has_buffer || self.session(session)?.media {
+            return Ok(None);
+        }
+        let chunk = self.opts.chunk;
+        if chunk.min_rows == 0 || !chunk.available {
+            return Ok(None);
+        }
+        let end = start.saturating_add(u32::try_from(rows).unwrap_or(u32::MAX));
+        let grid = GDN_CHUNK;
+        let below = end - end % grid;
+        Ok(
+            (start.is_multiple_of(grid) && !end.is_multiple_of(grid) && below > start)
+                .then(|| below - start),
+        )
     }
 
     /// One pass over one chunk, in the order this module's notes give.

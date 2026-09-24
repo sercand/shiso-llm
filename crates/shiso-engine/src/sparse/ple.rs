@@ -43,7 +43,7 @@ pub use crate::ple_rows::PleRows;
 use crate::ple_rows::{fetch_rows, issue_rows};
 use crate::sparse::bind::{Args, LayerRef, NgramViews, Operand, Role, WeightRef};
 use crate::sparse::hyper;
-use crate::sparse::kernels::{self, Entry, MOD_MISC, MOD_PLE};
+use crate::sparse::kernels::{self, Entry, MOD_GDN_TC, MOD_MISC, MOD_PLE};
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::mtp::SpecDepth;
@@ -703,6 +703,24 @@ pub fn block(
             ]),
         );
     } else {
+        // The window as it will stand before the snapshot row, taken first: the
+        // convolution runs in place and its inputs are gone once it has. The
+        // window is the last `history` inputs, which is the recurrent blocks'
+        // tail copy with a kernel one wider than the history.
+        if let Some(row) = device.role.snapshot() {
+            plan.launch(
+                Entry::plain(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
+                kernels::gdn_conv(shape.stream_dim()),
+                // `state, x, channels, kernel, n_tok`
+                Args::of(&[
+                    Operand::Snapshot(crate::sparse::paged::snapshot_window_offset(shape)),
+                    Operand::Scratch(Buf::PleConv),
+                    Operand::U32(shape.stream_dim()),
+                    Operand::U32(ple.history() + 1),
+                    Operand::U32(row),
+                ]),
+            );
+        }
         plan.launch(
             Entry::plain(MOD_PLE, "q4e_ple_conv_kernel"),
             kernels::ple_conv(shape.stream_dim()),

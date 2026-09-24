@@ -64,3 +64,6 @@ shiso-engine = { workspace = true }
 # The sparse family's case reads its geometry off the container's own
 # metadata, so it needs no sidecar directory beside the checkpoint.
 shiso-modelfile = { workspace = true }
+# The resume case stores a checkpoint and reads it back, in a directory of its
+# own that is gone when the case is.
+tempfile = { workspace = true }

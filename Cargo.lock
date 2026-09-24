@@ -1580,6 +1580,7 @@ dependencies = [
  "shiso-modelfile",
  "shiso-models",
  "shiso-vision",
+ "tempfile",
  "thiserror",
  "tokenizers",
  "tracing",

@@ -217,6 +217,14 @@ impl SparseStack {
         )
         .map_err(cache_failure)?;
         resident.cache = Arc::new(cache);
+        // Sized as one blob and tagged as the recurrent state it holds a copy
+        // of. The pool was sized before any tier opened, so this comes out of
+        // what the pool left, never out of the pool.
+        resident.snapshot = Some(shiso_core::buffer::alloc_tagged(
+            &self.backend,
+            shiso_core::ledger::MemTag::RecurrentState,
+            geometry.ckpt_bytes,
+        )?);
         crate::sparse::memory::watch_cache(
             &self.backend,
             &resident.cache,
@@ -348,6 +356,80 @@ impl SparseStack {
             .cache
             .commit(frontier, history, q, opts, now)
             .map_err(cache_failure)
+    }
+
+    /// Commits the span a prompt's final pass wrote up to its snapshot row -
+    /// `lead` is those rows' tokens - with the state the pass left in the
+    /// snapshot buffer as its checkpoint, filed and persisted as the prompt's
+    /// end would have been. `false` when there was nothing to commit it with.
+    ///
+    /// A speculating session's blob carries the draft row of the position
+    /// before the snapshot, which the pass's residual still holds.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`], and whatever the device or the cache
+    /// report.
+    pub(crate) fn commit_snapshot(
+        &mut self,
+        session: SessionId,
+        lead: &[TokenId],
+    ) -> CoreResult<bool> {
+        let Some(row) = u64::try_from(lead.len()).ok().filter(|row| *row > 0) else {
+            return Ok(false);
+        };
+        let now = self.now();
+        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec);
+        let draft_at = paged::snapshot_draft_offset(&self.shape);
+        let width = paged::draft_row_bytes(&self.shape);
+        let Self {
+            backend,
+            resident,
+            sessions,
+            staging,
+            ..
+        } = self;
+        let resident = resident.as_ref().ok_or(CoreError::Unsupported {
+            what: "a stack whose device state teardown already released",
+            backend: "engine",
+        })?;
+        let Some(snapshot) = resident.snapshot.as_ref() else {
+            return Ok(false);
+        };
+        let live = sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        if live.spec_depth().is_speculative() {
+            let residual = resident
+                .scratch
+                .view(Buf::Residual)?
+                .slice((row - 1).saturating_mul(width), width)?;
+            backend.copy_d2d(snapshot.view().slice(draft_at, width)?, residual)?;
+        }
+        staging
+            .ckpt
+            .resize(usize::try_from(blob_bytes).unwrap_or(usize::MAX), 0);
+        backend.copy_d2h(snapshot.view().slice(0, blob_bytes)?, &mut staging.ckpt)?;
+        let q = live
+            .written()
+            .saturating_add(u32::try_from(row).unwrap_or(u32::MAX));
+        let mut path = Vec::with_capacity(live.history.len().saturating_add(lead.len()));
+        path.extend_from_slice(&live.history);
+        path.extend_from_slice(lead);
+        let reason = if live.resumed_at == 0 {
+            Reason::Cold
+        } else {
+            Reason::Continued
+        };
+        let opts = CommitOpts::span(&[])
+            .checkpoint(staging.ckpt.as_slice(), true)
+            .persist(reason);
+        let (frontier, _) = live.commit_parts();
+        resident
+            .cache
+            .commit(frontier, &path, q, opts, now)
+            .map_err(cache_failure)?;
+        Ok(true)
     }
 
     /// Stores the checkpoint at the session's frontier, taking one first when

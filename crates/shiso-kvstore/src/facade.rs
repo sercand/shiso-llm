@@ -771,6 +771,13 @@ impl Inner {
             if cand_end == end && !self.ckpt.has_logits(slot) {
                 continue;
             }
+            if cand_end < end
+                && !self
+                    .geometry
+                    .continuable(cand_end, self.ckpt.has_logits(slot))
+            {
+                continue;
+            }
             if let Some(ckpt) = self.ckpt.reference(slot, cand_end) {
                 found = Some((cand, ckpt));
             }

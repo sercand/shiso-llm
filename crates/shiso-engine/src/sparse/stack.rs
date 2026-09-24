@@ -517,6 +517,11 @@ pub(crate) struct Resident {
     /// its layer out of whatever the allocator left behind and a table with no
     /// slot is a reader nothing ever asks.
     pub(crate) ngram: Option<ple::NgramTier>,
+    /// One checkpoint blob's worth of device memory, laid out as one, which a
+    /// prompt's final pass writes the session's state into as it stood at the
+    /// last grid point before the prompt's end. Allocated when a checkpoint
+    /// tier opens, after the pool was sized, so it is never the pool's.
+    pub(crate) snapshot: Option<DeviceBuffer>,
 }
 
 /// The host buffers this stack moves bytes through, reused between calls.
@@ -790,6 +795,7 @@ impl SparseStack {
                 cache,
                 scratch,
                 ngram,
+                snapshot: None,
             }),
             sessions: HashMap::new(),
             order: Vec::new(),
@@ -1405,6 +1411,10 @@ impl SparseStack {
             Some(rows) => binder.with_media(rows),
             None => binder,
         };
+        let binder = match resident.snapshot.as_ref() {
+            Some(snapshot) => binder.with_snapshot(snapshot.view()),
+            None => binder,
+        };
         Ok(match self.backend.as_coop() {
             Some(coop) => binder.with_coop(coop),
             None => binder,
@@ -1579,7 +1589,9 @@ impl SparseStack {
                 cache,
                 scratch,
                 ngram,
+                snapshot,
             } = resident;
+            drop(snapshot);
             drop(ngram);
             drop(scratch);
             drop(cache);

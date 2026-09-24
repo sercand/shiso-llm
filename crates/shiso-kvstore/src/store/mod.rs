@@ -216,6 +216,9 @@ pub(crate) struct Shared {
     identity: Identity,
     page_tokens: u32,
     min_tokens: u32,
+    /// The geometry the cache was opened with, which says whether an entry a
+    /// prompt ran past may be continued from.
+    geometry: CacheGeometry,
     /// Set while a prefetch thread is running; one at a time is plenty.
     prefetching: AtomicBool,
 }
@@ -421,6 +424,7 @@ impl DiskStore {
             identity,
             page_tokens: geometry.page_tokens,
             min_tokens: config.min_tokens,
+            geometry: *geometry,
             prefetching: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
@@ -493,10 +497,12 @@ impl DiskStore {
             return None;
         }
         let keys = PathKeys::new(self.identity, tokens, self.page_tokens);
-        self.shared
-            .index
-            .lock()
-            .lookup(&keys, len, floor.max(self.shared.min_tokens))
+        self.shared.index.lock().lookup(
+            &keys,
+            len,
+            floor.max(self.shared.min_tokens),
+            |pos, logits| self.shared.geometry.continuable(pos, logits),
+        )
     }
 
     /// Bytes an entry file for this spec will occupy.
@@ -1041,7 +1047,9 @@ impl Prefetcher {
         let keys = PathKeys::new(self.shared.identity, tokens, self.shared.page_tokens);
         let paths: Vec<PathBuf> = {
             let index = self.shared.index.lock();
-            let Some(hit) = index.lookup(&keys, len, self.shared.min_tokens) else {
+            let Some(hit) = index.lookup(&keys, len, self.shared.min_tokens, |pos, logits| {
+                self.shared.geometry.continuable(pos, logits)
+            }) else {
                 return false;
             };
             std::iter::once(index.entry_path(&hit.key))

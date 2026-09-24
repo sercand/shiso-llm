@@ -188,9 +188,17 @@ impl Index {
     /// `len` and at or above `floor`.
     ///
     /// An entry exactly at `len` is only usable with its logits row, because a
-    /// resume there answers the next token from that row.
+    /// resume there answers the next token from that row; one short of `len` is
+    /// usable only if `continuable` says a longer prompt may stand on it (see
+    /// [`crate::CacheGeometry::continuable`]).
     #[must_use]
-    pub(crate) fn lookup(&self, keys: &PathKeys<'_>, len: u32, floor: u32) -> Option<Hit> {
+    pub(crate) fn lookup(
+        &self,
+        keys: &PathKeys<'_>,
+        len: u32,
+        floor: u32,
+        continuable: impl Fn(u32, bool) -> bool,
+    ) -> Option<Hit> {
         if floor.max(1) > len {
             return None;
         }
@@ -201,7 +209,11 @@ impl Index {
             let Some(entry) = self.entries.get(&key) else {
                 continue;
             };
-            if !entry.durable || entry.foreign || (pos == len && !entry.has_logits) {
+            if !entry.durable
+                || entry.foreign
+                || (pos == len && !entry.has_logits)
+                || (pos < len && !continuable(pos, entry.has_logits))
+            {
                 continue;
             }
             let page_bytes: u64 = entry
@@ -773,9 +785,13 @@ mod tests {
             "the first two pages were written once"
         );
         assert_eq!(index.durable_bytes, 4 * PAGE_FILE + 2 * ENTRY_FILE);
-        let hit = index.lookup(&keys, 16, 0).expect("the deeper one");
+        let hit = index
+            .lookup(&keys, 16, 0, |_, _| true)
+            .expect("the deeper one");
         assert_eq!(hit.pos, 16);
-        let hit = index.lookup(&keys, 12, 0).expect("the lower one");
+        let hit = index
+            .lookup(&keys, 12, 0, |_, _| true)
+            .expect("the lower one");
         assert_eq!(hit.pos, 8);
     }
 
@@ -791,7 +807,11 @@ mod tests {
         // Its own entry file and its two unshared pages.
         assert_eq!(gone.len(), 3);
         assert_eq!(index.pages.len(), 2);
-        assert!(index.lookup(&keys, 16, 0).is_some_and(|hit| hit.pos == 8));
+        assert!(
+            index
+                .lookup(&keys, 16, 0, |_, _| true)
+                .is_some_and(|hit| hit.pos == 8)
+        );
     }
 
     #[test]
@@ -810,15 +830,41 @@ mod tests {
         }
         index.entry_written(&offer.key, ENTRY_FILE);
         assert!(
-            index.lookup(&keys, 8, 0).is_none(),
+            index.lookup(&keys, 8, 0, |_, _| true).is_none(),
             "no row at the very end"
         );
         let longer = path(0, 12);
         let longer_keys = PathKeys::new(Identity::from_bytes([1; 20]), &longer, 4);
         assert_eq!(
-            index.lookup(&longer_keys, 12, 0).map(|hit| hit.pos),
+            index
+                .lookup(&longer_keys, 12, 0, |_, _| true)
+                .map(|hit| hit.pos),
             Some(8)
         );
+    }
+
+    #[test]
+    fn a_prompt_final_entry_off_the_grid_answers_its_own_prompt_and_nothing_longer() {
+        // An entry with a logits row at 6, on a path whose grid is 4: it is the
+        // end of the prompt that wrote it, and a longer prompt that stood on it
+        // would cut where a cold prefill never does. The lower entry at 4 is on
+        // the grid and is what the longer prompt gets.
+        let dir = tempfile::tempdir().expect("dir");
+        let mut index = Index::empty(dir.path(), 10_000, pricing());
+        let tokens = path(0, 12);
+        let keys = PathKeys::new(Identity::from_bytes([1; 20]), &tokens, 4);
+        land(&mut index, &keys, 4);
+        land(&mut index, &keys, 6);
+        let geometry = crate::CacheGeometry::new(4, 1, 1, 0.001, 600.0).with_resume_grid(4);
+        let continuable = |pos, logits| geometry.continuable(pos, logits);
+        let exact = index
+            .lookup(&keys, 6, 0, continuable)
+            .expect("its own prompt");
+        assert_eq!(exact.pos, 6);
+        let longer = index
+            .lookup(&keys, 12, 0, continuable)
+            .expect("the grid entry");
+        assert_eq!(longer.pos, 4);
     }
 
     #[test]

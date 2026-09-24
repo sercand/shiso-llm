@@ -555,3 +555,52 @@ fn a_span_that_ends_no_prompt_is_not_snapshotted() {
         "a decode step read the session's state back off the device"
     );
 }
+
+#[test]
+fn a_prompt_that_ends_off_the_grid_is_checkpointed_on_the_grid_beneath_its_end() {
+    // A prompt of two grid runs and a bit more: its final pass stops between
+    // two grid points, so its checkpoint is taken at the last one it passed,
+    // inside the pass. A longer prompt continues from there as a cold prefill
+    // of it would; the same prompt again re-reads the few positions past it.
+    let dir = tempfile::TempDir::new().expect("a cache directory");
+    let (_weights, _backend, mut model) = fixture::loaded_with(fixture::options());
+    model
+        .kv_enable(&config(dir.path()))
+        .expect("the tier opens");
+    let prompt = cycle_of(2 * BOUNDARY + 36);
+    let first = model.open_session().expect("a session opens");
+    model
+        .prefill_last(first, &prompt)
+        .expect("the prompt prefills");
+
+    let longer = {
+        let mut tokens = prompt.clone();
+        tokens.extend(cycle_of(20));
+        tokens
+    };
+    let second = model.open_session().expect("a second session opens");
+    let info = model
+        .kv_resume(second, &longer)
+        .expect("not an error")
+        .expect("the grid checkpoint was found");
+    assert_eq!(
+        info.tokens_reused,
+        2 * BOUNDARY,
+        "a longer prompt resumes on the grid"
+    );
+
+    let third = model.open_session().expect("a third session opens");
+    let info = model
+        .kv_resume(third, &prompt)
+        .expect("not an error")
+        .expect("the grid checkpoint was found");
+    assert_eq!(
+        info.tokens_reused,
+        2 * BOUNDARY,
+        "a repeat resumes on the grid too"
+    );
+    assert!(
+        info.frontier_logits.is_none(),
+        "short of the prompt's end, the rest is prefilled and no row is handed back"
+    );
+}

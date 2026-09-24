@@ -242,3 +242,52 @@ fn the_stateless_checkpoint_worth_least_is_the_one_a_full_store_gives_up() {
         "and the admission that displaced it got its slot"
     );
 }
+
+#[test]
+fn a_prompt_final_checkpoint_off_the_resume_grid_answers_only_its_own_prompt() {
+    // Two checkpoints on one path: one on the grid at 512, and the end of a
+    // prompt at 600, with its logits row. The prompt that ended at 600 gets
+    // 600 back and needs no prefill; a longer prompt would cut a run there
+    // that a cold prefill of it never cuts, so it gets 512.
+    let geometry = geometry().with_resume_grid(64);
+    let (cache, _pages) = cache_over(&geometry, 8, 4, None);
+    let longer = seq(22_000, 700);
+    let mut writer = cache.cold_frontier();
+    assert!(
+        writer.grow_to(600).expect("the pool covers three pages"),
+        "the pool covered every position of the prompt"
+    );
+    cache
+        .commit(
+            &mut writer,
+            &longer,
+            POSITIONS,
+            CommitOpts::span(&[]).checkpoint(&[], true),
+            1.0,
+        )
+        .expect("the grid checkpoint commits");
+    cache
+        .commit(
+            &mut writer,
+            &longer,
+            600,
+            CommitOpts::span(&[]).checkpoint(&[], true).logits_row(&ROW),
+            2.0,
+        )
+        .expect("the prompt-final checkpoint commits");
+
+    let own = cache
+        .lookup(&longer[..600], 3.0)
+        .expect("not an error")
+        .expect("the prompt that wrote it");
+    assert_eq!(own.ckpt_pos, 600, "its own prompt resumes at its end");
+    drop(own);
+    let continued = cache
+        .lookup(&longer, 4.0)
+        .expect("not an error")
+        .expect("the grid checkpoint beneath it");
+    assert_eq!(
+        continued.ckpt_pos, POSITIONS,
+        "a longer prompt resumes on the grid"
+    );
+}

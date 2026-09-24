@@ -37,6 +37,7 @@ use shiso_core::ids::TokenId;
 use shiso_core::model::Model;
 use shiso_cuda::{CudaBackend, CudaOptions};
 use shiso_engine::EngineOptions;
+use shiso_engine::ckpt::{Checkpointed as _, CkptConfig, CkptOptions};
 use shiso_engine::sparse::capture;
 use shiso_engine::sparse::stack::SparseOptions;
 use shiso_modelfile::GgufFile;
@@ -129,8 +130,21 @@ fn prefill(
     cut: &[usize],
 ) -> Left {
     let session = model.open_session().expect("a session opens");
+    prefill_from(backend, model, session, tokens, 0, cut)
+}
+
+/// [`prefill`] for a session already standing on `tokens[..from]`, which then
+/// closes.
+fn prefill_from(
+    backend: &Arc<dyn Backend>,
+    model: &mut Qwen4ExpModel,
+    session: shiso_core::ids::SessionId,
+    tokens: &[TokenId],
+    from: usize,
+    cut: &[usize],
+) -> Left {
     let (body, last) = tokens.split_at(tokens.len() - 1);
-    let mut rest = body;
+    let mut rest = &body[from..];
     for piece in 0.. {
         if rest.is_empty() {
             break;
@@ -196,5 +210,58 @@ fn a_prompt_cut_anywhere_on_the_grid_leaves_the_bits_one_pass_leaves() {
             "cut {cut:?}: the next row's logits moved"
         );
     }
+    model.teardown().expect("the model tears down");
+}
+
+#[test]
+#[ignore = "needs a CUDA device and a checkpoint of this family"]
+fn a_longer_prompt_continued_from_a_stored_prompt_leaves_the_bits_a_cold_one_leaves() {
+    // The first prompt ends thirty positions past a grid point, so its final
+    // pass files its checkpoint at that grid point, from inside the pass. A
+    // longer prompt that resumes there and prefills the rest must end up where
+    // a cold prefill of the whole longer prompt does, bit for bit.
+    let Some(path) = file_from("SHISO_TEST_MODEL_QWEN4EXP") else {
+        skip("no checkpoint named by SHISO_TEST_MODEL_QWEN4EXP");
+        return;
+    };
+    let backend: Arc<dyn Backend> =
+        CudaBackend::new(0, CudaOptions::default()).expect("a CUDA device");
+    let mut model = load(&backend, &path);
+    let dir = tempfile::TempDir::new().expect("a cache directory");
+    let mut options = CkptOptions::new();
+    options.min_tokens = 64;
+    model
+        .kv_enable(&CkptConfig::new(dir.path().to_path_buf()).with_options(options))
+        .expect("the tier opens");
+
+    let longer = prompt(PROMPT + 150);
+    let first = model.open_session().expect("a session opens");
+    model
+        .prefill_last(first, &longer[..PROMPT as usize])
+        .expect("the first prompt prefills");
+    model.close_session(first).expect("the session closes");
+
+    let resumed = model.open_session().expect("a session opens");
+    let info = model
+        .kv_resume(resumed, &longer)
+        .expect("not an error")
+        .expect("the first prompt's checkpoint was found");
+    let grid = PROMPT - PROMPT % 64;
+    assert_eq!(
+        info.tokens_reused, grid,
+        "the checkpoint sits on the grid beneath the end"
+    );
+    let from = usize::try_from(grid).expect("a host index");
+    let warm = prefill_from(&backend, &mut model, resumed, &longer, from, WHOLE);
+    // After the resume, which would otherwise find the checkpoint this cold
+    // run files at the longer prompt's own end.
+    let cold = prefill(&backend, &mut model, &longer, WHOLE);
+
+    let moved: Vec<usize> = (0..cold.slots.len())
+        .filter(|&slot| cold.slots[slot] != warm.slots[slot])
+        .collect();
+    assert!(moved.is_empty(), "recurrent slots {moved:?} moved");
+    assert!(cold.window == warm.window, "the n-gram window moved");
+    assert!(cold.logits == warm.logits, "the next row's logits moved");
     model.teardown().expect("the model tears down");
 }
