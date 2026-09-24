@@ -936,6 +936,50 @@ pub fn matmul_f16_rows(out_dim: u32, n_split: u32) -> Launch {
     )
 }
 
+/// Output rows one warp of the packed half-precision projection owns at
+/// `rows` activation rows: `Q4E_P12_WARP_ROWS` in the kernel, restated.
+///
+/// Past a few activation rows a warp that owned one output row re-read every
+/// activation row for it and ran at a quarter of the bandwidth; owning two or
+/// four shares each activation load between them.
+#[must_use]
+pub const fn p12_warp_rows(rows: u32) -> u32 {
+    if rows <= 4 {
+        1
+    } else if rows <= 16 {
+        2
+    } else {
+        4
+    }
+}
+
+/// The packed half-precision multi-row projection, which splits the
+/// contraction.
+///
+/// A warp that owns one output row runs in blocks of four warps: on the
+/// narrow-contraction mixes a whole row is one step of the loop, and the
+/// smaller block keeps more of them resident (measured on a GB10, 28 us to 25
+/// on a 320 x 10240 mix). A warp that owns several needs every register the
+/// eight-warp block leaves it.
+#[must_use]
+pub fn matmul_p12_rows(out_dim: u32, n_split: u32, rows: u32) -> Launch {
+    let per_warp = p12_warp_rows(rows);
+    let threads = if per_warp == 1 {
+        BLOCK_NARROW
+    } else {
+        BLOCK_LINEAR
+    };
+    Launch::new(
+        Extent3::new(
+            blocks_for(u64::from(out_dim), u64::from(threads / WARP * per_warp)),
+            n_split,
+            1,
+        ),
+        threads,
+        0,
+    )
+}
+
 /// The single-precision projection, which splits the contraction.
 #[must_use]
 pub const fn matvec_f32(out_dim: u32, n_split: u32) -> Launch {

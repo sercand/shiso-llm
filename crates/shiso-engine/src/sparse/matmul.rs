@@ -441,7 +441,7 @@ fn packed_half(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResu
                 "q4e_matmul_p12_rows_kernel",
                 TemplateArgs::Rows(rows),
             ),
-            launch,
+            launch: kernels::matmul_p12_rows(out_dim, launch.grid.y, rows),
             chunk,
             combine,
             rows,

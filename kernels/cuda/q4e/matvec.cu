@@ -243,59 +243,89 @@ __device__ __forceinline__ static float q4e_p12_decode(uint32_t byte, uint32_t c
 }
 
 /* The per-row projection over packed weights: q4e_matmul_f16_rows_kernel's
- * launch and argument list, sixteen weights a lane a step, the row's
- * exceptions added after the planes. */
+ * argument list, sixteen weights a lane a step, the row's exceptions added
+ * after the planes.  A warp owns Q4E_P12_WARP_ROWS(NT) consecutive output
+ * rows and decodes all of them before walking the activations once: past a
+ * few activation rows the per-row form re-read every activation row once per
+ * output row and ran at a quarter of the bandwidth (a 20-row verify pass over
+ * a 10240 x 320 mix, 95 us against 40).  Each accumulator still adds the same
+ * products in the same order whichever warp shape runs it, so an output row
+ * does not depend on how many rows share its warp or its pass.  The engine
+ * restates the rule to size the grid (kernels::p12_warp_rows). */
+#define Q4E_P12_WARP_ROWS(NT) ((NT) <= 4 ? 1 : (NT) <= 16 ? 2 : 4)
 template <int NT>
 __global__ void q4e_matmul_p12_rows_kernel(
         float *out, const uint8_t *w, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t chunk) {
+    constexpr int R = Q4E_P12_WARP_ROWS(NT);
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
-    if (row >= out_dim) return;
+    const uint32_t row0 = (blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u)) * (uint32_t)R;
+    if (row0 >= out_dim) return;
     const Q4eP12 v = q4e_p12_view(w, in_dim, out_dim);
     const uint32_t i0 = blockIdx.y * chunk;
     const uint32_t i1 = min(i0 + chunk, in_dim);
-    const uint8_t *mr = v.mant + (uint64_t)row * in_dim;
-    const uint8_t *er = v.expo + (uint64_t)row * (in_dim / 2u);
-    const int base = v.base[row];
-    float acc[NT];
+    /* A row past the output reads row0's planes and is never stored. */
+    int base[R];
+    bool live[R];
 #pragma unroll
-    for (int t = 0; t < NT; t++) acc[t] = 0.0f;
+    for (int r = 0; r < R; r++) {
+        live[r] = row0 + (uint32_t)r < out_dim;
+        base[r] = live[r] ? v.base[row0 + (uint32_t)r] : 0;
+    }
+    float acc[R][NT];
+#pragma unroll
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int t = 0; t < NT; t++) acc[r][t] = 0.0f;
     for (uint32_t i = i0 + lane * 16u; i < i1; i += 512u) {
-        const uint4 m = *(const uint4 *)(mr + i);
-        const uint2 e = *(const uint2 *)(er + i / 2u);
-        const uint32_t mw[4] = {m.x, m.y, m.z, m.w};
-        const uint32_t ew[2] = {e.x, e.y};
-        float wv[16];
+        float wv[R][16];
 #pragma unroll
-        for (int j = 0; j < 16; j++)
-            wv[j] = q4e_p12_decode((mw[j >> 2] >> ((j & 3) * 8)) & 0xffu, (ew[j >> 3] >> ((j & 7) * 4)) & 0xfu, base);
+        for (int r = 0; r < R; r++) {
+            const uint32_t row = live[r] ? row0 + (uint32_t)r : row0;
+            const uint4 m = *(const uint4 *)(v.mant + (uint64_t)row * in_dim + i);
+            const uint2 e = *(const uint2 *)(v.expo + (uint64_t)row * (in_dim / 2u) + i / 2u);
+            const uint32_t mw[4] = {m.x, m.y, m.z, m.w};
+            const uint32_t ew[2] = {e.x, e.y};
+#pragma unroll
+            for (int j = 0; j < 16; j++)
+                wv[r][j] = q4e_p12_decode((mw[j >> 2] >> ((j & 3) * 8)) & 0xffu, (ew[j >> 3] >> ((j & 7) * 4)) & 0xfu, base[r]);
+        }
 #pragma unroll
         for (int t = 0; t < NT; t++) {
             const float4 *xp = (const float4 *)(x + (uint64_t)t * in_dim + i);
 #pragma unroll
             for (int q = 0; q < 4; q++) {
                 const float4 xv = xp[q];
-                acc[t] = fmaf(wv[4 * q], xv.x, acc[t]);
-                acc[t] = fmaf(wv[4 * q + 1], xv.y, acc[t]);
-                acc[t] = fmaf(wv[4 * q + 2], xv.z, acc[t]);
-                acc[t] = fmaf(wv[4 * q + 3], xv.w, acc[t]);
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    acc[r][t] = fmaf(wv[r][4 * q], xv.x, acc[r][t]);
+                    acc[r][t] = fmaf(wv[r][4 * q + 1], xv.y, acc[r][t]);
+                    acc[r][t] = fmaf(wv[r][4 * q + 2], xv.z, acc[r][t]);
+                    acc[r][t] = fmaf(wv[r][4 * q + 3], xv.w, acc[r][t]);
+                }
             }
         }
     }
-    for (uint32_t k = v.ptr[row] + lane; k < v.ptr[row + 1u]; k += 32u) {
-        const uint32_t c = v.col[k];
-        if (c < i0 || c >= i1) continue;
-        const float wk = __half2float(__ushort_as_half(v.val[k]));
 #pragma unroll
-        for (int t = 0; t < NT; t++) acc[t] = fmaf(wk, x[(uint64_t)t * in_dim + c], acc[t]);
+    for (int r = 0; r < R; r++) {
+        if (!live[r]) continue;
+        const uint32_t row = row0 + (uint32_t)r;
+        for (uint32_t k = v.ptr[row] + lane; k < v.ptr[row + 1u]; k += 32u) {
+            const uint32_t c = v.col[k];
+            if (c < i0 || c >= i1) continue;
+            const float wk = __half2float(__ushort_as_half(v.val[k]));
+#pragma unroll
+            for (int t = 0; t < NT; t++) acc[r][t] = fmaf(wk, x[(uint64_t)t * in_dim + c], acc[r][t]);
+        }
     }
     float *dst = out + (uint64_t)blockIdx.y * NT * out_dim;
 #pragma unroll
-    for (int t = 0; t < NT; t++) {
-        const float s = warp_sum_f32(acc[t]);
-        if (lane == 0u) dst[(uint64_t)t * out_dim + row] = s;
-    }
+    for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+            const float s = warp_sum_f32(acc[r][t]);
+            if (lane == 0u && live[r]) dst[(uint64_t)t * out_dim + row0 + (uint32_t)r] = s;
+        }
 }
 
 /* The packed weight expanded back to its stored halves (or to the floats they
