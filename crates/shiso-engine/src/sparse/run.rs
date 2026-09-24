@@ -353,13 +353,19 @@ impl SparseStack {
             if let Some(first) = head.first() {
                 self.warm_draft_boundary(session, *first, start)?;
             }
-            self.run_chunk(session, head, logit_rows, logit_rows > 0, run.as_mut())?;
-            // Staged before the warm-up reads the residual, because the warm-up
-            // is what overwrites it.
+            let earned = logit_rows > 0;
+            self.run_rows_media(session, head, logit_rows, run.as_mut())?;
+            // Staged after the pass and before the commit: the commit is where
+            // a prompt's final chunk earns its checkpoint, and a speculating
+            // session's checkpoint carries this row - staged any later, the
+            // first chunk had none to carry and was never checkpointed, and a
+            // later chunk carried the chunk before it's. And before the warm-up
+            // reads the residual, because the warm-up is what overwrites it.
             if self.has_draft_head() {
                 let last = u32::try_from(head.len().saturating_sub(1)).unwrap_or(0);
                 self.stage_draft_row(session, last)?;
             }
+            self.advance(session, head, earned, logit_rows.checked_sub(1))?;
             self.warm_draft(session, head, start)?;
             // The rows the next piece needs are known the moment this one is
             // enqueued, and this one is about to spend its time on the device,
