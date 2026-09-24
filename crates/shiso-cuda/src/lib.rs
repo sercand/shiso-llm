@@ -324,6 +324,12 @@ impl Backend for CudaBackend {
         sys::BACKEND
     }
 
+    fn numerics_id(&self) -> String {
+        // The embedded kernel set is what decides the bits a launch computes;
+        // two binaries with the same fingerprint embed the same modules.
+        format!("{}/{}", sys::BACKEND, shiso_kernels::KERNEL_SET_HASH)
+    }
+
     fn resolve_entry(&self, module: &'static str, logical: &str) -> Option<KernelRef> {
         ModuleRegistry::resolve(module, logical)
     }

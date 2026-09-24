@@ -27,7 +27,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
-use shiso_core::{CoreError, CoreResult, DeviceView, GemmDType, GemmDesc, GemmOp};
+use shiso_core::{CoreError, CoreResult, DeviceView, GemmDType, GemmDesc, GemmOp, GemmReduction};
 
 use crate::CudaBackend;
 use crate::device::BufferTable;
@@ -83,6 +83,16 @@ pub enum BlasTier {
     /// The heuristic entry point, which chooses an algorithm per problem shape
     /// and uses a workspace. Opt-in per call.
     Lt,
+    /// The heuristic entry point with the algorithm pinned per shape *without*
+    /// the column count, and the contraction never split: a column sums the
+    /// same way at every column count. What a
+    /// [`GemmReduction::ColumnInvariant`] multiply takes.
+    ///
+    /// The ordinary entry point picks a split of the contraction from the
+    /// column count for every narrow output this family projects (measured on a
+    /// GB10: a 48- or 640-row product differed at 1 to 4096 columns against the
+    /// same columns of an 8192-column call), so it cannot promise this.
+    Pinned,
 }
 
 /// One operand: where it lives and how far apart its columns are.
@@ -179,7 +189,10 @@ impl<'a> CudaGemm<'a> {
             beta: desc.beta,
             dtype: desc.dtype,
             batch: None,
-            tier: BlasTier::Classic,
+            tier: match desc.reduction {
+                GemmReduction::Fastest => BlasTier::Classic,
+                GemmReduction::ColumnInvariant => BlasTier::Pinned,
+            },
         }
     }
 }
@@ -497,7 +510,7 @@ pub(crate) fn gemm(backend: &CudaBackend, gemm: &CudaGemm<'_>) -> CoreResult<()>
     backend.device.bind()?;
     let tf32 = backend.blas.tf32();
 
-    if gemm.tier == BlasTier::Lt {
+    if matches!(gemm.tier, BlasTier::Lt | BlasTier::Pinned) {
         if gemm.batch.is_some() {
             return Err(CoreError::Unsupported {
                 what: "a strided batch on the heuristic matrix-multiply tier",
@@ -554,6 +567,14 @@ fn lt_gemm(backend: &CudaBackend, gemm: &CudaGemm<'_>, tf32: bool) -> CoreResult
     let state = backend.state.lock();
     let (call, _) = resolve(&state.buffers, gemm, tf32)?;
     let stream = state.graphs.stream(&backend.device);
+    if gemm.tier == BlasTier::Pinned {
+        // SAFETY: `validate` proved every operand covers the shape it declares
+        // and `resolve` proved every range lies inside a live allocation; the
+        // state lock is held, so nothing can free one under the call. The
+        // pinned call uses no workspace.
+        unsafe { nvidia::blas_lt_matmul_pinned(opened.handle, &call, stream) }?;
+        return Ok(());
+    }
     // SAFETY: `validate` proved every operand covers the shape it declares and
     // `resolve` proved every range lies inside a live allocation; the state lock
     // is held, so nothing can free one under the call. The workspace is owned by

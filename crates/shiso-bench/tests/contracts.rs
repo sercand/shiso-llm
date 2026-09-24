@@ -42,9 +42,9 @@ use shiso_core::error::CoreResult;
 use shiso_core::ids::{Seed, SessionId, TokenId};
 use shiso_core::model::{DecodeStep, Logits, SamplingParams};
 use shiso_core::{Backend, DeviceView, Model};
-use shiso_engine::{Checkpointed, Reason, ResumeInfo, SaveOutcome};
+use shiso_engine::{Checkpointed, Reason, ResumeInfo, ResumeSource, SaveOutcome};
 use shiso_ir::Usage;
-use shiso_kvstore::{CommitOpts, Frontier, KvCache, KvError, Lookup, Resume};
+use shiso_kvstore::{CommitOpts, Frontier, KvCache, KvError, Lookup, PersistOutcome, Resume};
 use shiso_server::tokenizer::{TokenizerError, Vocabulary};
 
 // ---------------------------------------------------------------------------
@@ -95,38 +95,39 @@ fn decode_step_fields(step: DecodeStep) -> (SessionId, TokenId) {
 const _: fn(DecodeStep) -> (SessionId, TokenId) = decode_step_fields;
 
 /// A resume borrows from the model it stood up, which is why the returned
-/// lifetime is the receiver's.
+/// lifetime is the receiver's. It is keyed by the prompt's token path.
 type KvResume = for<'c> fn(
     &'c mut (dyn Checkpointed + 'static),
     SessionId,
-    &[u8],
+    &[TokenId],
 ) -> CoreResult<Option<ResumeInfo<'c>>>;
 const _: KvResume = <dyn Checkpointed>::kv_resume;
 
-/// A save is keyed by the token path the session stands on, in the same type.
-type KvSave = fn(
-    &mut (dyn Checkpointed + 'static),
-    SessionId,
-    &[TokenId],
-    &[u8],
-    Reason,
-) -> CoreResult<SaveOutcome>;
+/// A save names only the session and why: the path is the session's own
+/// history, so there is no caller-supplied one to disagree with its state.
+type KvSave = fn(&mut (dyn Checkpointed + 'static), SessionId, Reason) -> CoreResult<SaveOutcome>;
 const _: KvSave = <dyn Checkpointed>::kv_save;
 
-/// The shutdown sweep asks its caller for each session's text and token path,
-/// because the engine has no tokenizer of its own.
-type KvSweep = fn(
-    &mut (dyn Checkpointed + 'static),
-    &mut dyn FnMut(SessionId) -> Option<(Vec<TokenId>, Vec<u8>)>,
-) -> usize;
+/// The shutdown sweep stores every open session from its own history.
+type KvSweep = fn(&mut (dyn Checkpointed + 'static)) -> usize;
 const _: KvSweep = <dyn Checkpointed>::kv_shutdown_sweep;
 
-/// What a resume hands back: an owned path in the same token type, plus the two
-/// counts a caller needs to know how much prefill it does not owe.
-fn resume_info_fields(info: ResumeInfo<'_>) -> (u32, u64, Vec<TokenId>) {
-    (info.tokens_reused, info.text_bytes, info.tokens)
+/// What a resume hands back: the reach, the owned path in the same token type,
+/// and where it came from.
+fn resume_info_fields(info: ResumeInfo<'_>) -> (u32, Vec<TokenId>, ResumeSource) {
+    (info.tokens_reused, info.tokens, info.source)
 }
-const _: fn(ResumeInfo<'_>) -> (u32, u64, Vec<TokenId>) = resume_info_fields;
+const _: fn(ResumeInfo<'_>) -> (u32, Vec<TokenId>, ResumeSource) = resume_info_fields;
+
+/// The cache's own resume: the tree, then the disk behind it, keyed by the
+/// same tokens a plan is.
+type CacheResume = fn(&KvCache, &[TokenId], f64) -> Result<Option<Resume>, KvError>;
+const _: CacheResume = KvCache::resume;
+
+/// Queueing a frontier's checkpoint for disk names the frontier and a reason,
+/// and answers in the store's own outcome.
+type CachePersist = fn(&KvCache, &Frontier, Reason) -> Result<PersistOutcome, KvError>;
+const _: CachePersist = KvCache::persist;
 
 /// What the cache would reuse for a prompt, without taking anything.
 type Plan = fn(&KvCache, &[TokenId], f64) -> Lookup;

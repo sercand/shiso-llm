@@ -31,6 +31,16 @@ pub const DEFAULT_MIXED_QUANTUM: usize = 128;
 /// every routed expert's weights once per pass, and measured on a GB10 its
 /// prefill ran 1580 tok/s at 8192-token chunks against 1000 at 2048.
 pub const DEFAULT_SOLO_CHUNK: usize = 8192;
+/// The grid a prefill chunk that does not finish its prompt ends on.
+///
+/// The recurrent blocks walk a prompt in runs of this many positions counted
+/// from position zero, and a pass boundary inside a run cuts it into two runs
+/// whose sums are not the one run's: the prompt would answer by where the
+/// scheduler happened to cut it. Every stack's prompt passes are otherwise
+/// computed row for row as any other cut would compute them, so a chunk end on
+/// this grid is the whole of what keeps the widths, the quantum shared with
+/// decoding sequences, and a resume point out of the answer.
+pub const PREFILL_GRID: usize = 64;
 /// How long a caller may block inside the queue before being refused.
 pub const DEFAULT_QUEUE_ADMISSION_MS: u64 = 250;
 
@@ -44,13 +54,23 @@ const QUEUE_ADMISSION_ENV: &str = "SHISO_QUEUE_ADMISSION_MS";
 const CKPT_ALIGN_ENV: &str = "SHISO_CKPT_BOUNDARY_ALIGN";
 /// The environment knob for how far alignment may wait.
 const CKPT_TRIM_ENV: &str = "SHISO_CKPT_BOUNDARY_TRIM";
-/// The environment knob for the cold ceiling.
-const CKPT_COLD_MAX_ENV: &str = "SHISO_CKPT_COLD_MAX_TOKENS";
 /// The environment knob for the continued interval.
 const CKPT_CONTINUED_ENV: &str = "SHISO_CKPT_CONTINUED_INTERVAL";
 
-/// How long a prefix has to be before it is worth another checkpoint file.
-pub const DEFAULT_CONTINUED_INTERVAL: u32 = 1024;
+/// Tokens a session has to add mid-answer before its frontier is offered again.
+/// Zero: only the end of a turn, which every turn offers anyway.
+pub const DEFAULT_CONTINUED_INTERVAL: u32 = 0;
+/// Bytes of queued checkpoint pages one tick may copy off the device.
+///
+/// Eight pages of the sparse family's cache: a few milliseconds of copies
+/// between decode steps, which is the whole of what the write-behind costs the
+/// streams that are decoding.
+pub const DEFAULT_PUMP_BYTES: u64 = 64 * 1024 * 1024;
+/// How long a shutdown waits for queued checkpoint writes to land.
+///
+/// Under the 90 seconds the service unit allows a stop, with room left for the
+/// teardown after it.
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// The alignment a stored prefix is preferred to land on.
 pub const DEFAULT_BOUNDARY_ALIGN: u32 = 256;
 /// How far past its trigger a store may wait for that alignment.
@@ -126,27 +146,28 @@ pub struct StorePolicy {
     /// a turn that ends before the next boundary. With one, a turn that will not
     /// reach the boundary in time is stored unaligned rather than not at all.
     pub boundary_trim: u32,
-    /// The longest cold prefix worth a file. Zero is no ceiling.
-    ///
-    /// A very long cold prompt is the case where a file costs the most to write
-    /// and is least likely to be asked for again, because the longer a prompt is
-    /// the less likely two callers send the same one.
-    pub cold_max_tokens: u32,
     /// Tokens a session has to have added since its last stored frontier before
     /// another one is offered. Zero stores only at the end of the turn.
     pub continued_interval: u32,
+    /// Bytes of queued checkpoint pages one tick copies off the device for the
+    /// disk tier's writer.
+    pub pump_bytes: u64,
+    /// How long a shutdown waits for queued checkpoint writes.
+    pub drain_timeout: Duration,
 }
 
 impl StorePolicy {
-    /// The defaults: 256-token alignment, 64 tokens of patience for it, no cold
-    /// ceiling, and a refresh every 1024 generated tokens.
+    /// The defaults: 256-token alignment, 64 tokens of patience for it, the end
+    /// of each turn only, a 64 MiB pump per tick and a minute
+    /// to drain on the way down.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             boundary_align: DEFAULT_BOUNDARY_ALIGN,
             boundary_trim: DEFAULT_BOUNDARY_TRIM,
-            cold_max_tokens: 0,
             continued_interval: DEFAULT_CONTINUED_INTERVAL,
+            pump_bytes: DEFAULT_PUMP_BYTES,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         }
     }
 
@@ -157,18 +178,15 @@ impl StorePolicy {
         Self {
             boundary_align: clamp_u32(env_u64(CKPT_ALIGN_ENV, default.boundary_align.into())),
             boundary_trim: clamp_u32(env_u64(CKPT_TRIM_ENV, default.boundary_trim.into())),
-            cold_max_tokens: clamp_u32(env_u64(CKPT_COLD_MAX_ENV, default.cold_max_tokens.into())),
             continued_interval: clamp_u32(env_u64(
                 CKPT_CONTINUED_ENV,
                 default.continued_interval.into(),
             )),
+            // `--kvstore-pump-mb` and `--kvstore-drain-secs` are flags, set
+            // over these by the binary.
+            pump_bytes: default.pump_bytes,
+            drain_timeout: default.drain_timeout,
         }
-    }
-
-    /// Whether a cold prefill of `prompt_tokens` is worth storing.
-    #[must_use]
-    pub const fn stores_cold(&self, prompt_tokens: u32) -> bool {
-        self.cold_max_tokens == 0 || prompt_tokens <= self.cold_max_tokens
     }
 
     /// Whether a frontier of `frontier` is worth storing given that `stored` was
@@ -328,22 +346,6 @@ impl Default for SchedulerConfig {
 mod tests {
     use super::{SchedulerConfig, StorePolicy};
 
-    #[test]
-    fn a_cold_ceiling_of_zero_stores_every_prompt_and_a_real_one_bounds_it() {
-        let policy = StorePolicy {
-            cold_max_tokens: 0,
-            ..StorePolicy::new()
-        };
-        assert!(policy.stores_cold(1_000_000));
-
-        let bounded = StorePolicy {
-            cold_max_tokens: 4096,
-            ..StorePolicy::new()
-        };
-        assert!(bounded.stores_cold(4096));
-        assert!(!bounded.stores_cold(4097));
-    }
-
     /// The interval is what keeps a long turn from writing a file per token,
     /// and the end of a turn is what keeps a short one from writing none.
     #[test]
@@ -351,8 +353,8 @@ mod tests {
         let policy = StorePolicy {
             boundary_align: 0,
             boundary_trim: 0,
-            cold_max_tokens: 0,
             continued_interval: 100,
+            ..StorePolicy::new()
         };
         assert!(!policy.stores_continued(1099, 1000, false));
         assert!(policy.stores_continued(1100, 1000, false));
@@ -373,8 +375,8 @@ mod tests {
         let policy = StorePolicy {
             boundary_align: 64,
             boundary_trim: 16,
-            cold_max_tokens: 0,
             continued_interval: 100,
+            ..StorePolicy::new()
         };
         // Triggered at 1100, which is not a multiple of 64, so it waits.
         assert!(!policy.stores_continued(1100, 1000, false));

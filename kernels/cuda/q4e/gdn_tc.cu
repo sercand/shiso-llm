@@ -299,11 +299,18 @@ extern "C" __global__ void __launch_bounds__(512) q4e_gdn_tc_prep_kernel(
  * Grid (value heads), 512 threads.  The head's state [D keys][D values] is
  * held in the sixteen warps' accumulators - four 16 x 16 tiles each - for the
  * whole chunk, and copied to shared memory as halves once per run for the two
- * products that read it. */
+ * products that read it.
+ *
+ * `snap`, when not null, receives the state as it stands before run
+ * `snap_run`, laid out exactly as `state` is: the checkpoint a later prompt
+ * resumes from when this chunk ends between two runs, taken on the run grid
+ * where a cold prefill of that longer prompt would pass through the same bits.
+ * No run's arithmetic reads it. */
 extern "C" __global__ void __launch_bounds__(512) q4e_gdn_tc_scan_kernel(
         float *attn_out, float *state,
         const float *qkv, const __half *u_in, const __half *w_in, const __half *p_in, const float *g_in,
-        uint32_t n_head_k, uint32_t n_head_v, uint32_t k_offset, uint32_t stride, uint32_t n_tok) {
+        uint32_t n_head_k, uint32_t n_head_v, uint32_t k_offset, uint32_t stride, uint32_t n_tok,
+        float *snap, uint32_t snap_run) {
     extern __shared__ __align__(32) unsigned char q4e_gt_scan_smem[];
     __half *s_S = (__half *)q4e_gt_scan_smem;                        /* [D][LH] the state, as halves */
     __half *s_X = s_S + Q4E_GT_D * Q4E_GT_LH;                        /* [C][LH] scaled q, then scaled k */
@@ -341,6 +348,14 @@ extern "C" __global__ void __launch_bounds__(512) q4e_gdn_tc_scan_kernel(
         const __half *p_run = p_in + slot * Q4E_GT_C * Q4E_GT_C;
         const __half *u_run = u_in + slot * Q4E_GT_C * Q4E_GT_D;
 
+        if (snap && run == snap_run) {
+            float *snap_h = snap + (uint64_t)h * Q4E_GT_D * Q4E_GT_D;
+#pragma unroll
+            for (uint32_t q = 0; q < 4u; q++) {
+                wmma::store_matrix_sync(snap_h + (sc0 + q) * 16u * Q4E_GT_D + sr * 16u, s_acc[q], Q4E_GT_D,
+                                        wmma::mem_col_major);
+            }
+        }
 #pragma unroll
         for (uint32_t q = 0; q < 4u; q++) {
             q4e_gt_store_h(s_S + sr * 16u * Q4E_GT_LH + (sc0 + q) * 16u, s_acc[q], Q4E_GT_LH);

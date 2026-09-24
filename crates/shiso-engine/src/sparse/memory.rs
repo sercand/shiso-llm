@@ -48,13 +48,22 @@ pub(crate) fn watch_cache(
             limit: Some(u64::from(stats.ckpt_capacity).saturating_mul(ckpt_bytes)),
         }),
     );
-    if cache.stats().spill.is_some() {
+    if cache.stats().disk.is_some() {
         ledger.probe(
             MemTag::DiskTier,
+            stats_probe(weak.clone(), |stats| {
+                stats.disk.map_or_else(Usage::default, |disk| Usage {
+                    bytes: disk.durable_bytes,
+                    limit: Some(disk.budget_bytes),
+                })
+            }),
+        );
+        ledger.probe(
+            MemTag::DiskStaging,
             stats_probe(weak, |stats| {
-                stats.spill.map_or_else(Usage::default, |spill| Usage {
-                    bytes: spill.total_bytes,
-                    limit: Some(spill.budget_bytes),
+                stats.disk.map_or_else(Usage::default, |disk| Usage {
+                    bytes: disk.staged_bytes,
+                    limit: None,
                 })
             }),
         );

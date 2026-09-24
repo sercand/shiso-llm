@@ -379,6 +379,10 @@ pub enum Operand {
     NgramWindowCkptOf(u32),
     /// The n-gram block's dilated convolution window.
     NgramWindow,
+    /// The stack's snapshot buffer from this byte offset: a checkpoint blob's
+    /// layout on the device, which a prompt pass that ends between two grid
+    /// points writes the session's state into as it stood at the last one.
+    Snapshot(u64),
     /// The n-gram block's per-position windows, which a speculative rollback
     /// copies back from.
     NgramWindowCkpt,
@@ -497,6 +501,7 @@ impl Operand {
                 | Self::NgramWindowOf(_)
                 | Self::NgramWindowCkptOf(_)
                 | Self::NgramWindow
+                | Self::Snapshot(_)
                 | Self::NgramWindowCkpt
                 | Self::NgramRows
                 | Self::NgramBias
@@ -613,6 +618,7 @@ pub struct Binder<'a> {
     splice: Option<&'a crate::launch::SpliceArgs>,
     coop: Option<&'a dyn CoopLaunch>,
     stream: Option<&'a crate::sparse::stream::ExpertStream>,
+    snapshot: Option<DeviceView<'a>>,
 }
 
 impl<'a> Binder<'a> {
@@ -637,6 +643,7 @@ impl<'a> Binder<'a> {
             splice: None,
             coop: None,
             stream: None,
+            snapshot: None,
         }
     }
 
@@ -678,6 +685,7 @@ impl<'a> Binder<'a> {
             splice: None,
             coop: None,
             stream: None,
+            snapshot: None,
         })
     }
 
@@ -788,6 +796,14 @@ impl<'a> Binder<'a> {
     #[must_use]
     pub(crate) const fn with_splice(mut self, args: &'a crate::launch::SpliceArgs) -> Self {
         self.splice = Some(args);
+        self
+    }
+
+    /// Names the stack's snapshot buffer, which exists once a checkpoint tier
+    /// is open.
+    #[must_use]
+    pub const fn with_snapshot(mut self, snapshot: DeviceView<'a>) -> Self {
+        self.snapshot = Some(snapshot);
         self
     }
 
@@ -924,6 +940,13 @@ impl<'a> Binder<'a> {
                            block",
                     backend: "engine",
                 })?)
+            }
+            Operand::Snapshot(offset) => {
+                let snapshot = self.snapshot.ok_or(CoreError::Unsupported {
+                    what: "the snapshot buffer of a stack with no checkpoint tier open",
+                    backend: "engine",
+                })?;
+                KernelArg::Buffer(snapshot.slice(offset, snapshot.len().saturating_sub(offset))?)
             }
             Operand::DraftRow => {
                 KernelArg::Buffer(self.only()?.pending_draft().ok_or(CoreError::Unsupported {

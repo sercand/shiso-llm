@@ -23,6 +23,7 @@ use crate::sparse::kernels::{self, Entry, MOD_GDN, MOD_GDN_TC};
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::mtp::SpecDepth;
+use crate::sparse::paged;
 use crate::sparse::plan::Plan;
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
@@ -206,7 +207,7 @@ pub fn block(
                 Operand::U32(shape.gdn.conv_kernel),
             ]),
         );
-    } else if policy.takes_chunk(n_tok) {
+    } else if policy.takes_chunk(device.tier_rows(n_tok)) {
         // A prefill chunk convolves in parallel over tokens and then rewrites
         // the carried window; like the recurrence it records no per-position
         // state, which is what the chunked path already guarantees it is never
@@ -238,6 +239,23 @@ pub fn block(
                 Operand::U32(n_tok),
             ]),
         );
+        // The window as it stood before the snapshot row: the same tail, cut
+        // there, into this slot's place in the snapshot buffer. The row is a
+        // grid point past the pass's first run, so it never reaches back into
+        // the carried window.
+        if let Some(row) = device.role.snapshot() {
+            plan.launch(
+                Entry::plain(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
+                kernels::gdn_conv(shape.gdn_in_dim()),
+                Args::of(&[
+                    Operand::Snapshot(paged::snapshot_conv_offset(shape, slot)),
+                    Operand::Scratch(Buf::GdnQkv),
+                    Operand::U32(shape.gdn_in_dim()),
+                    Operand::U32(shape.gdn.conv_kernel),
+                    Operand::U32(row),
+                ]),
+            );
+        }
     } else {
         plan.launch(
             Entry::plain(MOD_GDN, "q4e_gdn_conv_kernel"),
@@ -360,7 +378,7 @@ pub fn block(
                 Operand::U32(shape.gdn_in_dim()),
             ]),
         );
-    } else if policy.takes_chunk(n_tok) {
+    } else if policy.takes_chunk(device.tier_rows(n_tok)) {
         // The chunked recurrence, on tensor cores: the half of each run's work
         // that does not depend on the state at its start for every run at once,
         // then the carry, one block per head. Measured on a GB10 at an
@@ -389,11 +407,20 @@ pub fn block(
                 Operand::U32(n_tok),
             ]),
         );
+        // The state before the snapshot row's run goes to this slot's place in
+        // the snapshot buffer; a null slab and a run past the last is none.
+        let (snap, snap_run) = match device.role.snapshot() {
+            Some(row) => (
+                Operand::Snapshot(paged::snapshot_state_offset(shape, slot)),
+                row / kernels::GDN_CHUNK,
+            ),
+            None => (Operand::Null, u32::MAX),
+        };
         plan.launch(
             Entry::plain(MOD_GDN_TC, "q4e_gdn_tc_scan_kernel"),
             kernels::gdn_tc_scan(shape.gdn.v_heads),
             // `attn_out, state, qkv, u, w, p, g, n_head_k, n_head_v,
-            //  k_offset, stride, n_tok`
+            //  k_offset, stride, n_tok, snap, snap_run`
             Args::of(&[
                 Operand::Scratch(Buf::GdnAttn),
                 Operand::RecurrentState(slot),
@@ -407,6 +434,8 @@ pub fn block(
                 Operand::U32(shape.gdn_qk_dim()),
                 Operand::U32(shape.gdn_in_dim()),
                 Operand::U32(n_tok),
+                snap,
+                Operand::U32(snap_run),
             ]),
         );
     } else {

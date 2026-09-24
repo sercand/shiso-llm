@@ -149,11 +149,13 @@ pub enum MemTag {
     UploadStaging,
     /// The on-disk checkpoint tier.
     DiskTier,
+    /// Host copies of checkpoint pages on their way to the disk tier's writer.
+    DiskStaging,
 }
 
 impl MemTag {
     /// Every tag, in report order.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::WeightsExperts,
         Self::WeightsAttention,
         Self::WeightsRecurrent,
@@ -182,6 +184,7 @@ impl MemTag {
         Self::CheckpointSlots,
         Self::UploadStaging,
         Self::DiskTier,
+        Self::DiskStaging,
         Self::Untagged,
     ];
 
@@ -218,6 +221,7 @@ impl MemTag {
             Self::CheckpointSlots => "ckpt.slots",
             Self::UploadStaging => "load.staging",
             Self::DiskTier => "disk.tier",
+            Self::DiskStaging => "disk.staging",
         }
     }
 
@@ -225,7 +229,10 @@ impl MemTag {
     #[must_use]
     pub const fn residence(self) -> Residence {
         match self {
-            Self::NgramRowCache | Self::CheckpointSlots | Self::UploadStaging => Residence::Host,
+            Self::NgramRowCache
+            | Self::CheckpointSlots
+            | Self::UploadStaging
+            | Self::DiskStaging => Residence::Host,
             Self::DiskTier => Residence::Disk,
             Self::KvInUse => Residence::Included,
             _ => Residence::Device,

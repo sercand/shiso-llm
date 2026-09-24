@@ -1,5 +1,5 @@
 //! The KV cache: a radix tree of token spans over refcounted paged KV, plus the
-//! recurrent-state checkpoint store, utility eviction and the disk spill tier.
+//! recurrent-state checkpoint store, utility eviction and the disk tier.
 //!
 //! Three things are true at once here, and most of the design rules fall out of
 //! keeping them separate.
@@ -18,7 +18,7 @@
 //!
 //! # Start at [`KvCache`]
 //!
-//! The five verbs are `plan`, `lookup`, `commit`, `evict_to` and `spill`/`restore`;
+//! The verbs are `plan`, `lookup`, `commit`, `evict_to` and `persist`/`resume`;
 //! [`pool`] explains the two-lock design they all depend on and [`facade`] the order in
 //! which they take those locks.
 //!
@@ -41,16 +41,14 @@
 pub mod backing;
 
 mod ckpt;
-mod entries;
 mod error;
 mod evict;
 mod facade;
 mod geom;
 mod ids;
 mod page_table;
-mod path;
 mod pool;
-mod spill;
+mod store;
 mod tree;
 
 pub use backing::Backing;
@@ -58,16 +56,12 @@ pub use ckpt::CkptRef;
 pub use error::KvError;
 pub use evict::next_admission_pos;
 pub use facade::{
-    CacheStats, CommitOpts, EvictReport, Frontier, KvCache, Lookup, Restored, Resume, ReuseSource,
-    SpillOutcome, SpillRefusal,
+    CacheStats, CommitOpts, EvictReport, Frontier, KvCache, Lookup, Resume, ReuseSource,
 };
 pub use geom::{CacheGeometry, PathLayout};
-pub use ids::{NodeId, PageId, SlotId, SpillId};
+pub use ids::{NodeId, PageId, SlotId};
 pub use page_table::PageTable;
-pub use path::{
-    DecodedPath, PathHeader, PathMismatch, PathSections, PathWords, decode_path, encode_path,
-};
-pub use spill::{
-    Incoming, Reason, SpillConfig, SpillEntry, SpillHeader, SpillStats, SpillStore, SpillWrite,
-    StoredEntry,
+pub use store::{
+    DEFAULT_MAX_JOBS, DEFAULT_MIN_TOKENS, DEFAULT_STAGING_MB, DiskConfig, DiskStats, EntryKey,
+    PersistOutcome, PersistRefusal, Prefetcher, PumpReport, Reason,
 };

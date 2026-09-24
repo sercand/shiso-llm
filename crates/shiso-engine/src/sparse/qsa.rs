@@ -28,7 +28,7 @@ use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
 use crate::sparse::indexer::{self, Scorer};
 use crate::sparse::inputs::MROPE_PREFIX_BYTES;
 use crate::sparse::kernels::{self, Entry, MOD_QSA, MOD_QSA_SPARSE};
-use crate::sparse::matmul::{self, Bound, Device};
+use crate::sparse::matmul::{self, Bound, Device, PassRole};
 use crate::sparse::moe::{RowOrigin, Segments};
 use crate::sparse::paged::Plane;
 use crate::sparse::plan::Plan;
@@ -149,6 +149,14 @@ pub struct AttnContext {
     /// The same count for each run of a segmented pass, where run `r`'s entry
     /// is read when its bit of `batch_selected` is set.
     pub run_dense_rows: [u8; crate::sparse::stack::MAX_DECODE_BATCH as usize],
+    /// Which reference pass the rows must reproduce. A
+    /// [`PassRole::Prompt`] pass's rows are attended exactly as they would be
+    /// in a pass of any other width. The kernel is then chosen as for the
+    /// widest pass - the tensor-core entries, whose blocks are one row each, at
+    /// one slice - rather than from this pass's row count, so the fourteen
+    /// rows at the end of a prompt are summed as they would have been in the
+    /// middle of one. See [`crate::sparse::matmul::Device::role`].
+    pub role: PassRole,
 }
 
 /// Query heads that share one key head.
@@ -181,6 +189,11 @@ pub fn selected_eligible(shape: &SparseShape) -> bool {
 #[must_use]
 pub fn path(shape: &SparseShape, ctx: AttnContext, n_tok: u32) -> AttnPath {
     let head_dim = shape.gqa.head_dim;
+    let n_tok = if matches!(ctx.role, PassRole::Prompt { .. }) {
+        u32::MAX
+    } else {
+        n_tok
+    };
     // Above every precondition below it: rows from different sequences read
     // different page tables, and no other entry in this set takes more than
     // one.
@@ -359,7 +372,14 @@ fn attend_at(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32, 
             fold(&mut plan, kernels::ATTN_GSPLITS);
         }
         AttnPath::GatheredTensorCore => {
-            let splits = kernels::tc_splits_sparse(shape.gqa.kv_heads, n_tok);
+            let splits = kernels::tc_splits_sparse(
+                shape.gqa.kv_heads,
+                if matches!(ctx.role, PassRole::Prompt { .. }) {
+                    u32::MAX
+                } else {
+                    n_tok
+                },
+            );
             plan.launch(
                 Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_tc_kernel"),
                 kernels::qsa_attention_tc(shape.gqa.kv_heads, n_tok, splits),

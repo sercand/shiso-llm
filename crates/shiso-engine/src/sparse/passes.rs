@@ -56,6 +56,7 @@ use crate::sparse::gather;
 use crate::sparse::hyper::{self, ChainLink, MixRoles, NextNorm};
 use crate::sparse::island::{self, Island, IslandContext, IslandKey, LayerChain};
 use crate::sparse::kernels::{Elem, F32_BYTES};
+pub use crate::sparse::matmul::PassRole;
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::media;
 use crate::sparse::moe::{self, RowOrigin};
@@ -87,7 +88,28 @@ impl SparseStack {
         tokens: &[TokenId],
         logit_rows: u32,
     ) -> CoreResult<Pass> {
-        self.plan_chunk_media(session, tokens, logit_rows, None)
+        self.plan_chunk_media(session, tokens, logit_rows, None, PassRole::Step)
+    }
+
+    /// Plans one prompt chunk: [`SparseStack::plan_chunk`] with every row
+    /// computed as a pass of any other width would compute it.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::plan_chunk`].
+    pub fn plan_prompt(
+        &self,
+        session: SessionId,
+        tokens: &[TokenId],
+        logit_rows: u32,
+    ) -> CoreResult<Pass> {
+        self.plan_chunk_media(
+            session,
+            tokens,
+            logit_rows,
+            None,
+            PassRole::Prompt { snapshot: None },
+        )
     }
 
     /// The same pass, with the splice that a chunk carrying a picture needs.
@@ -106,6 +128,7 @@ impl SparseStack {
         tokens: &[TokenId],
         logit_rows: u32,
         media_rows: Option<u32>,
+        role: PassRole,
     ) -> CoreResult<Pass> {
         let live = self.session(session)?;
         let n_tok = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
@@ -133,6 +156,7 @@ impl SparseStack {
             logit_rows,
             RowOrigin::Sequential,
             media_rows,
+            role,
         )
     }
 
@@ -173,7 +197,7 @@ impl SparseStack {
         // A decode batch reads one token per session and embeds no picture: a
         // request's media is spliced during its prefill and is in the cache by
         // the time any of its rows decode.
-        self.plan_rows(&live, rows, rows, origin, None)
+        self.plan_rows(&live, rows, rows, origin, None, PassRole::Step)
     }
 
     /// Plans one segmented pass: each session's run of consecutive positions,
@@ -211,7 +235,14 @@ impl SparseStack {
             .iter()
             .map(|id| self.session(*id))
             .collect::<CoreResult<Vec<_>>>()?;
-        self.plan_rows(&live, rows, rows, RowOrigin::Segmented(runs), None)
+        self.plan_rows(
+            &live,
+            rows,
+            rows,
+            RowOrigin::Segmented(runs),
+            None,
+            PassRole::Step,
+        )
     }
 
     /// The pass itself.
@@ -227,6 +258,7 @@ impl SparseStack {
         logit_rows: u32,
         origin: RowOrigin,
         media_rows: Option<u32>,
+        role: PassRole,
     ) -> CoreResult<Pass> {
         // A torn-down stack has no scratch to plan against, and the plan would
         // describe launches over buffers that no longer exist.
@@ -237,6 +269,9 @@ impl SparseStack {
             got: 0,
         })?;
         let batched = origin != RowOrigin::Sequential;
+        // Only one sequence's prompt rows are promised to every pass width: a
+        // batch's rows are steps by construction.
+        let role = if batched { PassRole::Step } else { role };
         // One sequence's frontier decides whether its selection is live. A batch
         // has one frontier per row, and each row answers for itself: its
         // attention is planned as a single-row step of its own sequence, over
@@ -298,6 +333,7 @@ impl SparseStack {
             batch_selected,
             dense_rows,
             run_dense_rows,
+            role,
         };
         // A pass that crosses the budget is planned with its attention split
         // at the crossing, and the island key does not say where that is: a
@@ -305,7 +341,11 @@ impl SparseStack {
         // past the budget by then. It happens once per sequence, so it is
         // simply never captured.
         let crosses = selected && dense_rows > 0;
+        // A prompt chunk is never captured either: a capture may not grow the
+        // scratch, so a captured pass falls back to the per-row tiers, and the
+        // widest-pass tiers are the whole of what makes its rows invariant.
         let capturable = !crosses
+            && role == PassRole::Step
             && if batched {
                 self.opts.graphs.capture_batch
             } else {
@@ -313,6 +353,7 @@ impl SparseStack {
             };
         let device = Device {
             capturing: capturable,
+            role,
             ..self.device
         };
         let device = Device {
@@ -459,7 +500,15 @@ impl SparseStack {
                     Operand::Scratch(Buf::Logits),
                 ),
                 logit_rows,
-                device,
+                // The vocabulary projection runs on the logit rows alone, and a
+                // prompt always asks for exactly one: its width never moves
+                // with where the prompt was cut, so it keeps the tier a single
+                // row is fastest on rather than expanding the widest weight in
+                // the model for one row.
+                Device {
+                    role: PassRole::Step,
+                    ..device
+                },
             )?;
             // More than one logit row means a speculative verify or a decode
             // batch, and what comes back from a verify is the greedy pick of

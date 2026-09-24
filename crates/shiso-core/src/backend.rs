@@ -196,6 +196,19 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// Short stable name used in error messages and traces.
     fn backend_name(&self) -> &'static str;
 
+    /// What names the arithmetic this device runs: two values that differ mean
+    /// the same launches may compute different bits.
+    ///
+    /// Stored state is only reusable by a build that computes what the writer
+    /// computed - a key/value row or a recurrent state from other kernels
+    /// resumes into a state this build would not produce, and answers
+    /// differently from a cold run - so a disk cache folds this into every key.
+    /// The default is the backend's name, which is right for a backend whose
+    /// kernels are compiled from sources that ship with the binary.
+    fn numerics_id(&self) -> String {
+        self.backend_name().to_owned()
+    }
+
     /// Allocates `bytes` of device memory.
     #[doc(hidden)]
     ///
@@ -762,6 +775,28 @@ pub enum GemmOp {
     Transposed,
 }
 
+/// Whether a multiply's columns may be reduced differently at different
+/// column counts.
+///
+/// A projection's columns are a pass's rows, and a vendor library chooses its
+/// algorithm - its tile, and whether it splits the contraction - from the whole
+/// problem shape, column count included. The same column then sums in a
+/// different order when it is multiplied beside more or fewer others, which is
+/// harmless for a decode step and wrong for a prompt: the prompt's answer would
+/// depend on where its chunks happened to be cut.
+///
+/// Not `#[non_exhaustive]`: a caller builds one for every multiply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GemmReduction {
+    /// Whatever the device finds fastest for this exact shape.
+    #[default]
+    Fastest,
+    /// One reduction per column, the same at every column count: one algorithm
+    /// per shape with the column count left out, and no split of the
+    /// contraction. A device that cannot promise it refuses the multiply.
+    ColumnInvariant,
+}
+
 /// One matrix multiply, as a single argument block.
 ///
 /// Row strides travel with their matrix, so transposing `lda` and `ldb` at a
@@ -809,6 +844,8 @@ pub struct GemmDesc<'a> {
     pub beta: f32,
     /// Element type of the operands.
     pub dtype: GemmDType,
+    /// Whether a column's sums may depend on how many columns the call has.
+    pub reduction: GemmReduction,
 }
 
 /// A BLAS-capable device.

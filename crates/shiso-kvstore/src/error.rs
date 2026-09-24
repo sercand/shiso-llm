@@ -17,7 +17,7 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum KvError {
-    /// A spill file could not be read, written or renamed.
+    /// A disk-tier file could not be read, written or renamed.
     #[error("io error for {path}: {source}")]
     Io {
         /// The file the operation was on.
@@ -51,22 +51,15 @@ pub enum KvError {
         reason: &'static str,
     },
 
-    /// A spill file's header is not one this build understands.
-    #[error("bad spill header: {reason}")]
+    /// A disk-tier file's header is not one this build understands.
+    #[error("bad disk-tier header: {reason}")]
     BadHeader {
         /// Which field was wrong.
         reason: &'static str,
     },
 
-    /// A spill file's contents do not hash to the name it is stored under.
-    #[error("spill {id} does not match its name")]
-    ShaMismatch {
-        /// The id the file was read from.
-        id: crate::ids::SpillId,
-    },
-
-    /// A spill would put the directory over its byte budget.
-    #[error("spill needs {required} bytes, budget is {budget}")]
+    /// A write would put the disk tier over its byte budget.
+    #[error("a disk-tier write needs {required} bytes, budget is {budget}")]
     OverBudget {
         /// Bytes the write would need.
         required: u64,
@@ -88,13 +81,6 @@ pub enum KvError {
         want: usize,
         /// Bytes the caller passed.
         got: usize,
-    },
-
-    /// A spill id is not 40 hex digits.
-    #[error("not a spill id: {found}")]
-    BadSpillId {
-        /// The text that failed to parse.
-        found: String,
     },
 
     /// A `CacheGeometry` the cache cannot be built from.

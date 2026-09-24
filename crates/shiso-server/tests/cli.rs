@@ -46,7 +46,9 @@ fn a_bare_serve_takes_the_documented_defaults() {
     assert_eq!(args.bind, "127.0.0.1");
     assert_eq!(args.port, 8090);
     assert_eq!(args.ctx, 4096);
-    assert_eq!(args.kvstore_budget_mb, 4096);
+    assert_eq!(args.kvstore_budget_mb, None, "unset is twice the pool");
+    assert_eq!(args.kvstore_min_tokens, 512);
+    assert_eq!(args.kvstore_pump_mb, 64);
     assert_eq!(args.spec_k, 0);
     assert!(args.kvstore_dir.is_none());
     assert!(args.auth_tokens.is_empty());

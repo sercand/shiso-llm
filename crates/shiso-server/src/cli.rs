@@ -28,8 +28,15 @@ pub const DEFAULT_BIND: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 8090;
 /// The default context, in tokens.
 pub const DEFAULT_CTX: u32 = 4096;
-/// The default disk-tier budget, in mebibytes.
-pub const DEFAULT_KVSTORE_BUDGET_MB: u64 = 4096;
+/// The default floor below which the disk tier stores and reads nothing.
+pub const DEFAULT_KVSTORE_MIN_TOKENS: u32 = shiso_engine::CKPT_MIN_TOKENS_DEFAULT;
+/// The default host staging the disk tier's writes may hold, in mebibytes.
+pub const DEFAULT_KVSTORE_STAGING_MB: u64 = 1024;
+/// The default checkpoint pages one scheduler tick copies for the disk tier, in
+/// mebibytes.
+pub const DEFAULT_KVSTORE_PUMP_MB: u64 = 64;
+/// The default time a shutdown waits for queued disk writes, in seconds.
+pub const DEFAULT_KVSTORE_DRAIN_SECS: u64 = 60;
 /// The default pixel ceiling one image may occupy after resizing.
 pub const DEFAULT_VISION_MAX_PIXELS: usize = 1280 * 1280;
 /// The default row-cache budget for a per-layer embedding table, in mebibytes.
@@ -200,9 +207,29 @@ pub struct ServeArgs {
     /// Directory for the cache's disk tier. Unset means nothing is persisted.
     #[arg(long, env = "SHISO_KVSTORE_DIR")]
     pub kvstore_dir: Option<PathBuf>,
-    /// Budget for the disk tier, in mebibytes.
-    #[arg(long, env = "SHISO_KVSTORE_BUDGET_MB", default_value_t = DEFAULT_KVSTORE_BUDGET_MB)]
-    pub kvstore_budget_mb: u64,
+    /// Budget for the disk tier, in mebibytes. Unset is twice the key/value
+    /// pool's bytes: enough for every resident session and as many again that
+    /// memory gave up.
+    #[arg(long, env = "SHISO_KVSTORE_BUDGET_MB")]
+    pub kvstore_budget_mb: Option<u64>,
+    /// Checkpoints shorter than this many tokens are neither stored on disk nor
+    /// looked up there: below it a file costs more to write and read than the
+    /// prefill it saves.
+    #[arg(long, env = "SHISO_KVSTORE_MIN_TOKENS", default_value_t = DEFAULT_KVSTORE_MIN_TOKENS)]
+    pub kvstore_min_tokens: u32,
+    /// Host memory the disk tier's write-behind may hold in copied pages, in
+    /// mebibytes.
+    #[arg(long, env = "SHISO_KVSTORE_STAGING_MB", default_value_t = DEFAULT_KVSTORE_STAGING_MB)]
+    pub kvstore_staging_mb: u64,
+    /// Checkpoint pages one scheduler tick copies off the device for the disk
+    /// writer, in mebibytes: what the write-behind costs a decoding stream per
+    /// step.
+    #[arg(long, env = "SHISO_KVSTORE_PUMP_MB", default_value_t = DEFAULT_KVSTORE_PUMP_MB)]
+    pub kvstore_pump_mb: u64,
+    /// How long a shutdown waits for queued disk writes before abandoning them,
+    /// in seconds. Keep it under the service manager's stop timeout.
+    #[arg(long, env = "SHISO_KVSTORE_DRAIN_SECS", default_value_t = DEFAULT_KVSTORE_DRAIN_SECS)]
+    pub kvstore_drain_secs: u64,
     /// Bearer tokens that may call the inference routes, comma separated.
     ///
     /// `hide_env_values` is set: a token must never appear in `--help`, in a
@@ -448,6 +475,19 @@ pub enum ConfigError {
         /// The worst-case decode rows of one step.
         decode_rows: usize,
     },
+    /// A prefill width that is not a whole number of the recurrence's runs.
+    #[error(
+        "--{flag} {value} is not a multiple of {grid}: a prompt chunk must end on \
+         the recurrent blocks' run grid, or where a prompt is cut changes its answer"
+    )]
+    OffGrid {
+        /// The flag, spelled as it is typed.
+        flag: &'static str,
+        /// The width as it was given.
+        value: usize,
+        /// The grid it must be a multiple of.
+        grid: usize,
+    },
     /// One of the two settings speculation needs was given without the other.
     #[error("--{given} without --{missing}: speculation needs a draft head and a depth")]
     HalfSpeculative {
@@ -478,10 +518,20 @@ impl ServeArgs {
         if self.port == 0 {
             return Err(ConfigError::Zero { flag: "port" });
         }
-        if self.kvstore_budget_mb == 0 {
+        if self.kvstore_budget_mb == Some(0) {
             return Err(ConfigError::Zero {
                 flag: "kvstore-budget-mb",
             });
+        }
+        for (value, flag) in [
+            (u64::from(self.kvstore_min_tokens), "kvstore-min-tokens"),
+            (self.kvstore_staging_mb, "kvstore-staging-mb"),
+            (self.kvstore_pump_mb, "kvstore-pump-mb"),
+            (self.kvstore_drain_secs, "kvstore-drain-secs"),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Zero { flag });
+            }
         }
         if self.vision_max_pixels == 0 {
             return Err(ConfigError::Zero {
@@ -554,6 +604,22 @@ impl ServeArgs {
                 return Err(ConfigError::Zero {
                     flag: "mixed-prefill-quantum",
                 });
+            }
+            // A budget's widths are what is left of it, and the scheduler rounds
+            // those down to the grid itself; widths typed as widths are refused
+            // instead, because a width that silently shrank is not the one
+            // configured.
+            for (flag, value) in [
+                ("solo-prefill-chunk", self.solo_prefill_chunk),
+                ("mixed-prefill-quantum", self.mixed_prefill_quantum),
+            ] {
+                if !value.is_multiple_of(crate::scheduler::PREFILL_GRID) {
+                    return Err(ConfigError::OffGrid {
+                        flag,
+                        value,
+                        grid: crate::scheduler::PREFILL_GRID,
+                    });
+                }
             }
             return Ok(PrefillWidths {
                 solo_chunk: self.solo_prefill_chunk,

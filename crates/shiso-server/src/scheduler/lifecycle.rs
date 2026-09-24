@@ -148,6 +148,10 @@ impl TextCursor {
     }
 }
 
+/// Fewest prefilled tokens a prompt needs before its wall time says anything
+/// about the prefill rate.
+const MIN_TIMED_PREFILL: u32 = 512;
+
 /// One resident sequence.
 #[derive(Debug)]
 pub(crate) struct SeqSlot {
@@ -157,8 +161,6 @@ pub(crate) struct SeqSlot {
     pub(crate) session: SessionId,
     /// The rendered prompt.
     pub(crate) prompt: Arc<[TokenId]>,
-    /// The rendered prompt as text, which is the checkpoint tier's key.
-    pub(crate) prompt_text: Arc<str>,
     /// Where its events go.
     pub(crate) sink: mpsc::Sender<StreamEvent>,
     /// Prompt tokens read so far, resume included.
@@ -204,6 +206,13 @@ pub(crate) struct SeqSlot {
     pub(crate) deadline: Option<Instant>,
     /// The frontier length this sequence last put on disk.
     pub(crate) stored_len: u32,
+    /// Prompt tokens this process prefilled, and the wall time the calls took.
+    prefill_timed: (u32, Duration),
+    /// The coordinator's decode-step count when the first prompt chunk ran, and
+    /// whether it moved before the last: a prefill with decode steps between its
+    /// chunks did not have the device to itself.
+    prefill_decodes: Option<u64>,
+    prefill_mixed: bool,
     /// The encoder rows its prompt's placeholders stand for.
     ///
     /// Owned by the sequence rather than by the tick that encoded them: the
@@ -247,7 +256,6 @@ impl SeqSlot {
             id: setup.id,
             session: setup.session,
             prompt: request.prompt_tokens,
-            prompt_text: request.prompt_text,
             sink: setup.sink,
             cursor: 0,
             cached: 0,
@@ -266,6 +274,9 @@ impl SeqSlot {
             first_token_at: None,
             deadline: setup.deadline,
             stored_len: 0,
+            prefill_timed: (0, Duration::ZERO),
+            prefill_decodes: None,
+            prefill_mixed: false,
         }
     }
 
@@ -278,6 +289,7 @@ impl SeqSlot {
             } else {
                 0
             },
+            prompt_at: self.cursor,
             indivisible_prompt: self.media.is_some(),
         }
     }
@@ -301,7 +313,34 @@ impl SeqSlot {
     /// picture's activations for another picture's request - fluently, and with
     /// nothing in the response to show for it.
     pub(crate) fn checkpointable(&self) -> bool {
-        !self.prompt_text.is_empty() && self.media.is_none()
+        self.media.is_none()
+    }
+
+    /// Records one prefill call: `tokens` covered in `elapsed`, with the
+    /// coordinator having run `decode_steps` decode steps so far.
+    pub(crate) fn time_prefill(&mut self, tokens: usize, elapsed: Duration, decode_steps: u64) {
+        match self.prefill_decodes {
+            None => self.prefill_decodes = Some(decode_steps),
+            Some(at) if at != decode_steps => self.prefill_mixed = true,
+            Some(_) => {}
+        }
+        let tokens = u32::try_from(tokens).unwrap_or(u32::MAX);
+        self.prefill_timed = (
+            self.prefill_timed.0.saturating_add(tokens),
+            self.prefill_timed.1 + elapsed,
+        );
+    }
+
+    /// The prompt's prefilled tokens and their wall time, when no decode step
+    /// ran between its first chunk and `decode_steps` and there were enough of
+    /// them to measure: a few dozen tokens cost a pass's fixed overhead, not a
+    /// per-token rate.
+    pub(crate) fn solo_prefill(&self, decode_steps: u64) -> Option<(u32, Duration)> {
+        let (tokens, elapsed) = self.prefill_timed;
+        (!self.prefill_mixed
+            && self.prefill_decodes == Some(decode_steps)
+            && tokens >= MIN_TIMED_PREFILL)
+            .then_some((tokens, elapsed))
     }
 
     /// Its decode step, when it is standing on a token.
@@ -329,11 +368,19 @@ impl SeqSlot {
     }
 
     /// The whole path its session stands on: prompt then generated.
+    #[cfg(test)]
     pub(crate) fn frontier_path(&self) -> Vec<TokenId> {
         let mut path = Vec::with_capacity(self.prompt.len() + self.out.len());
         path.extend_from_slice(&self.prompt);
         path.extend_from_slice(&self.out);
         path
+    }
+
+    /// Positions its session has run: the frontier less a sampled token still
+    /// waiting for the decode step that feeds it in.
+    pub(crate) fn written_len(&self) -> u32 {
+        self.frontier_len()
+            .saturating_sub(u32::from(self.next_input.is_some()))
     }
 
     /// Positions its session has written.
@@ -342,6 +389,7 @@ impl SeqSlot {
     }
 
     /// Whether the whole prompt was prefilled by this process.
+    #[cfg(test)]
     pub(crate) const fn was_cold(&self) -> bool {
         self.cold
     }
@@ -879,8 +927,8 @@ mod tests {
         assert_eq!(slot.usage(Instant::now()).cached_prompt_tokens, 3);
     }
 
-    /// The frontier is the prompt plus what has been generated, which is the
-    /// path the checkpoint tier will refuse to store under any other length.
+    /// The frontier is the prompt plus what has been generated, and the session
+    /// has run all of it but the last sampled token.
     #[test]
     fn the_frontier_is_the_prompt_and_everything_generated_after_it() {
         let mut slot = slot(&[1, 2], 8);
@@ -891,6 +939,7 @@ mod tests {
             slot.frontier_path(),
             vec![TokenId::new(1), TokenId::new(2), TokenId::new(10)]
         );
+        assert_eq!(slot.written_len(), 2, "the sampled token has not been run");
     }
 
     /// A sequence that is still reading prompt must never appear in a decode

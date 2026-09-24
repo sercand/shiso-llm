@@ -1,47 +1,33 @@
-//! What a stored checkpoint is made of, and which build may read it back.
+//! Which build may read a stored checkpoint back.
 //!
-//! [`crate::ckpt`] decides *when* an entry is written and which one is worth loading.
-//! This module answers the other question - what the bytes are - and it is separate
-//! because the two change for different reasons: a policy changes when a scheduler
-//! learns something, and a layout changes only when the file format does.
+//! [`crate::ckpt`] decides *when* an entry is written. This module answers the
+//! other question - which bytes a build may resume from - and it is separate
+//! because the two change for different reasons: a policy changes when a
+//! scheduler learns something, and a layout changes only when a shape does.
 //!
-//! # The byte table
+//! # The layout words are part of every key
 //!
-//! A stored entry is an envelope, a text prefix, and a payload. The engine owns none
-//! of the envelope and all of the payload's *shape*; the bytes are moved by
-//! [`shiso_kvstore`], which never interprets them. All fields are little-endian.
+//! Every count a reader would otherwise have to assume is stated: the layer
+//! counts, the vocabulary, the width of a key/value row, and the element counts
+//! the recurrent state is sized from. The store folds these words, the page
+//! geometry and the device's kernel-set fingerprint into one identity digest, and
+//! that digest into the name of every page and every checkpoint. A build whose
+//! words differ therefore never even finds another build's files - which is the
+//! failure that matters here, because loading another architecture's rows
+//! produces fluent, confident nonsense rather than an error.
 //!
-//! | offset | bytes | what |
-//! |---|---|---|
-//! | `0` | `48` | the entry envelope: magic, quantization, reason, model tag, token count, hit count, context size, timestamps, payload length |
-//! | `48` | `4` | length of the text prefix the file name hashes |
-//! | `52` | `text_bytes` | that text prefix, verbatim |
-//! | then | `76` | the payload header: nineteen `u32` geometry words |
-//! | then | `4 * tokens` | the path's token ids, one `u32` each, position zero first |
-//! | then | `4 * vocab` | the frontier logits row, `f32` |
-//! | then | `4 * n_gdn * (conv_elems + state_elems)` | the recurrent stack |
-//! | then | `pages * page_bytes` | the key/value pages, one contiguous run each |
-//!
-//! The recurrent section is the session's own stack, slot by slot in ordinal order,
-//! each slot's convolution window followed by its state matrix. That is the order
-//! [`crate::stack`] snapshots in, and a resume copies it straight back: no element is
-//! read, reordered or converted anywhere along the way, so a restored session is a
-//! byte image of the one that was saved.
-//!
-//! # Why the geometry words are in the file
-//!
-//! Every count a reader would otherwise have to assume is written down: the layer
-//! counts, the vocabulary, the width of a key/value row, and the element counts the
-//! recurrent section is sized from. A file whose words disagree with the running
-//! build is refused by name rather than read into the wrong shapes - which is the
-//! failure that matters here, because loading another architecture's rows produces
-//! fluent, confident nonsense rather than an error.
+//! The recurrent state itself is the session's own stack, slot by slot in
+//! ordinal order, each slot's convolution window followed by its state matrix.
+//! That is the order [`crate::stack`] snapshots in, and a resume copies it
+//! straight back: no element is read, reordered or converted anywhere along the
+//! way, so a restored session is a byte image of the one that was saved.
 //!
 //! # What identity the engine cannot supply
 //!
-//! Two of the guard fields are not derivable from a geometry: which checkpoint family
-//! wrote the file, and how its weights were quantized. Both are facts about a model,
-//! so they arrive as [`CkptIdentity`] from the crate that knows which model this is.
+//! Two of the words are not derivable from a geometry: which checkpoint family
+//! wrote the file, and how its weights were quantized. Both are facts about a
+//! model, so they arrive as [`CkptIdentity`] from the crate that knows which
+//! model this is.
 
 use shiso_kvstore::PathLayout;
 
@@ -181,7 +167,6 @@ pub(crate) fn state_elements(shape: &HybridShape) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use shiso_kvstore::{PathHeader, PathLayout};
 
     use super::{conv_elements, kv_row_bytes, state_elements};
     use crate::kv;
@@ -265,29 +250,9 @@ mod tests {
             "the blob is the recurrent stack alone, and there is none"
         );
 
-        // The payload header is sized from the same element counts, so a family
-        // with no recurrent block writes a file whose state section is empty --
-        // which is what the store has to be willing to round-trip.
-        let geometry = kv::geometry(&shape);
-        let layout = PathLayout {
-            model_id: 9,
-            quant_bits: 4,
-            ctx_size: 4096,
-            kv_width: kv_row_bytes(&shape),
-            n_layers: shape.n_layers(),
-            n_attn_layers: shape.count(LayerKind::Attn),
-            n_gdn_layers: shape.count(LayerKind::Gdn),
-            vocab: shape.vocab,
-            gdn_conv_elements: conv_elements(&shape),
-            gdn_state_elements: state_elements(&shape),
-            ple_window_elements: 0,
-            hc_width: 0,
-            indexer: false,
-            draft_head: false,
-        };
-        assert_eq!(
-            PathHeader::from_layout(&layout, &geometry, 512, 2).state_bytes(),
-            0
+        assert!(
+            kv_row_bytes(&shape) > 0,
+            "the attention rows are still described"
         );
     }
 }

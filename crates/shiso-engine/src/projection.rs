@@ -49,7 +49,7 @@ use shiso_core::backend::{Backend, FnConst, KernelArg, KernelRef};
 
 use shiso_core::{
     CoreError, CoreResult, DType, DeviceBuffer, DeviceView, Extent3, GemmDType, GemmDesc, GemmOp,
-    HostBytes, alloc, import_host,
+    GemmReduction, HostBytes, alloc, import_host,
 };
 
 use crate::launch::{
@@ -1025,6 +1025,7 @@ fn blas_projection(
             alpha: 1.0,
             beta: 0.0,
             dtype: GemmDType::F32,
+            reduction: GemmReduction::Fastest,
         })?;
     }
     Ok(true)

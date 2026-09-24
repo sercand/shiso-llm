@@ -641,3 +641,21 @@ pub(crate) unsafe fn blas_lt_matmul(
 ) -> SysResult<()> {
     Err(SysError::no_driver("cublasLtMatmul"))
 }
+
+/// Queues one matrix multiply through the heuristic path with the algorithm
+/// pinned per shape, whatever the column count.
+///
+/// # Safety
+///
+/// As [`blas_gemm`].
+///
+/// # Errors
+///
+/// Always, on this target.
+pub(crate) unsafe fn blas_lt_matmul_pinned(
+    _handle: CuBlasLt,
+    _call: &GemmCall,
+    _stream: CuStream,
+) -> SysResult<()> {
+    Err(SysError::no_driver("cublasLtMatmul"))
+}

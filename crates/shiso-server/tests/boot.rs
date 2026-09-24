@@ -424,7 +424,10 @@ fn checkpointed_server(args: &ServeArgs, dir: &Path) -> CheckpointedServer {
             .with_renderer(Arc::new(renderer))
             .with_checkpoint_tier(shiso_server::state::CheckpointTier {
                 dir: dir.to_path_buf(),
-                budget_bytes: args.kvstore_budget_mb.saturating_mul(1024 * 1024),
+                budget_bytes: args
+                    .kvstore_budget_mb
+                    .unwrap_or(0)
+                    .saturating_mul(1024 * 1024),
                 min_tokens: options.min_tokens,
             }),
     );

@@ -36,7 +36,7 @@
 //! state the type can hold. There is no counter to keep in step with a list, and
 //! therefore no way for the two to disagree.
 
-use crate::scheduler::config::SchedulerConfig;
+use crate::scheduler::config::{PREFILL_GRID, SchedulerConfig};
 use crate::scheduler::lifecycle::SeqSlot;
 
 /// What the planner needs to know about one resident sequence.
@@ -50,6 +50,9 @@ pub(crate) struct SlotFacts {
     pub(crate) ready_to_decode: bool,
     /// Prompt tokens it has still not read. Zero once prefill is done.
     pub(crate) prompt_remaining: usize,
+    /// The position of the next prompt token it reads, which is where its next
+    /// quantum starts: past a resumed prefix, not necessarily on the grid.
+    pub(crate) prompt_at: usize,
     /// Whether its prompt has to be read in a single quantum.
     ///
     /// True for a sequence carrying media. The contract a model's media path
@@ -120,7 +123,7 @@ pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
             let tokens = if fact.indivisible_prompt {
                 fact.prompt_remaining
             } else {
-                fact.prompt_remaining.min(quantum.max(1))
+                on_grid(fact.prompt_at, fact.prompt_remaining, quantum)
             };
             PrefillStep {
                 slot: at,
@@ -130,6 +133,28 @@ pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
         });
 
     TickPlan { decode, prefill }
+}
+
+/// Tokens one quantum reads from `at` with `remaining` to go: at most
+/// `quantum`, ending on [`PREFILL_GRID`] unless it ends the prompt.
+///
+/// Rounded down to the grid, so a quantum never grows past its width - except
+/// when the grid point below lies behind `at`, which only a quantum narrower
+/// than the grid or a start off it reaches: then it runs to the grid point
+/// above, which is at most one grid step, rather than cut a run.
+fn on_grid(at: usize, remaining: usize, quantum: usize) -> usize {
+    let want = remaining.min(quantum.max(1));
+    if want == remaining {
+        return want;
+    }
+    let end = at.saturating_add(want);
+    let down = end - end % PREFILL_GRID;
+    let take = if down > at {
+        down - at
+    } else {
+        (at / PREFILL_GRID + 1) * PREFILL_GRID - at
+    };
+    take.min(remaining)
 }
 
 /// The resident sequences, bounded.
@@ -230,13 +255,13 @@ impl SlotTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrefillStep, SlotFacts, plan};
-    use crate::scheduler::config::SchedulerConfig;
+    use super::{PrefillStep, SlotFacts, on_grid, plan};
+    use crate::scheduler::config::{PREFILL_GRID, SchedulerConfig};
 
     fn cfg() -> SchedulerConfig {
         SchedulerConfig {
-            mixed_quantum: 8,
-            solo_chunk: 64,
+            mixed_quantum: 128,
+            solo_chunk: 512,
             ..SchedulerConfig::new()
         }
     }
@@ -245,6 +270,7 @@ mod tests {
         SlotFacts {
             ready_to_decode: true,
             prompt_remaining: 0,
+            prompt_at: 0,
             indivisible_prompt: false,
         }
     }
@@ -253,6 +279,7 @@ mod tests {
         SlotFacts {
             ready_to_decode: false,
             prompt_remaining: remaining,
+            prompt_at: 0,
             indivisible_prompt: false,
         }
     }
@@ -309,7 +336,7 @@ mod tests {
             plan.prefill,
             Some(PrefillStep {
                 slot: 1,
-                tokens: 8,
+                tokens: 128,
                 last: false
             }),
             "a shared tick reads at most one mixed quantum"
@@ -326,7 +353,7 @@ mod tests {
             plan.prefill,
             Some(PrefillStep {
                 slot: 0,
-                tokens: 64,
+                tokens: 512,
                 last: false
             })
         );
@@ -365,8 +392,38 @@ mod tests {
             indivisible_prompt: false,
             ready_to_decode: false,
             prompt_remaining: 0,
+            prompt_at: 0,
         }];
         assert!(plan(&facts, &cfg()).is_idle());
         assert!(plan(&[], &cfg()).is_idle());
+    }
+
+    /// A prompt that resumed off the grid reaches it with its first quantum and
+    /// stays on it: every later cut lands where a cold prefill of the same
+    /// prompt could have cut too.
+    #[test]
+    fn a_quantum_after_an_off_grid_resume_ends_on_the_grid() {
+        let facts = [SlotFacts {
+            prompt_at: 1_000,
+            ..prefilling(5_000)
+        }];
+        let step = plan(&facts, &cfg()).prefill.expect("a prefill");
+        assert_eq!((1_000 + step.tokens) % PREFILL_GRID, 0);
+        assert!(step.tokens <= 512, "rounded down, never past the width");
+    }
+
+    /// A width off the grid is rounded down to it, and one narrower than the
+    /// grid runs to the next grid point instead of cutting a run.
+    #[test]
+    fn a_quantum_is_rounded_to_the_grid_and_never_below_one_step() {
+        assert_eq!(on_grid(0, 10_000, 1_000), 960);
+        assert_eq!(on_grid(0, 10_000, 8), PREFILL_GRID);
+        assert_eq!(on_grid(60, 10_000, 8), 4);
+        assert_eq!(
+            on_grid(60, 3, 8),
+            3,
+            "the end of the prompt is never rounded"
+        );
+        assert_eq!(on_grid(64, 100, 512), 100);
     }
 }

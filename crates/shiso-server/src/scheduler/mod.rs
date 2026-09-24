@@ -55,7 +55,6 @@ pub mod queue;
 mod stats;
 pub mod stop;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -81,8 +80,9 @@ use lifecycle::{Ending, SeqSlot, SlotSetup};
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use config::{
     DEFAULT_BOUNDARY_ALIGN, DEFAULT_BOUNDARY_TRIM, DEFAULT_CONTINUED_INTERVAL,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MAX_QUEUED, DEFAULT_MIXED_QUANTUM, DEFAULT_QUEUE_ADMISSION_MS,
-    DEFAULT_SOLO_CHUNK, SchedulerConfig, StorePolicy,
+    DEFAULT_DRAIN_TIMEOUT, DEFAULT_MAX_NUM_SEQS, DEFAULT_MAX_QUEUED, DEFAULT_MIXED_QUANTUM,
+    DEFAULT_PUMP_BYTES, DEFAULT_QUEUE_ADMISSION_MS, DEFAULT_SOLO_CHUNK, PREFILL_GRID,
+    SchedulerConfig, StorePolicy,
 };
 pub use queue::{EngineGone, EngineHandle, EngineRequest, GenerateRequest, QUEUE_CAPACITY};
 pub use stats::SchedulerStats;
@@ -94,6 +94,14 @@ const DECODE_GROUP_ROWS: usize = shiso_engine::MAX_DECODE_BATCH as usize;
 
 /// Events buffered for a client that is not reading fast enough.
 const EVENT_QUEUE: usize = 64;
+
+/// How much more of the queued checkpoint pages one pump call may copy when no
+/// sequence is resident: nothing is waiting on the device.
+const IDLE_PUMP_FACTOR: u64 = 8;
+
+/// How long an idle pump waits for the writer to free staging before it
+/// polls the request queue and tries again.
+const IDLE_PUMP_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// The loop could not finish cleanly.
 ///
@@ -193,15 +201,9 @@ struct Coordinator {
     /// The same row as floats, reused for the same reason.
     scores: Vec<f32>,
     next_id: u64,
-    /// Prompts a checkpoint scan has already refused, this tick.
-    ///
-    /// The scan re-hashes every candidate prefix, which is work proportional to
-    /// what is on disk rather than to the request. Two identical prompts
-    /// admitted in one tick would pay for it twice to be told the same thing, so
-    /// the refusal is remembered for the length of the tick - and only the
-    /// refusal, because a scan that *found* something has to run again to
-    /// install that prefix into the second session.
-    resume_misses: HashSet<Arc<str>>,
+    /// Decode steps run so far: a prompt whose prefill saw none of them ran on
+    /// the device alone, and its wall time is a fair measure of prefill speed.
+    decode_steps: u64,
     /// Whether the queue has closed and the loop is draining.
     closing: bool,
 }
@@ -348,7 +350,7 @@ fn start(
         row: vec![0u8; vocab.saturating_mul(4)],
         scores: vec![0f32; vocab],
         next_id: 1,
-        resume_misses: HashSet::new(),
+        decode_steps: 0,
         closing: false,
     };
     let join = std::thread::Builder::new()
@@ -375,6 +377,13 @@ impl Coordinator {
             if self.slots.is_empty() {
                 if self.closing {
                     break;
+                }
+                // Checkpoint pages still queued for disk are copied while
+                // nothing else wants the device, a staging budget at a time,
+                // polling the queue between rounds so a request that arrives
+                // meanwhile is not kept waiting.
+                if self.pump_idle(&mut rx) {
+                    continue;
                 }
                 // Nothing to run and nothing waiting: block until something
                 // arrives. An idle server burns no CPU, which a poll would not
@@ -403,7 +412,6 @@ impl Coordinator {
 
     /// Admits as many waiting requests as there are free slots.
     fn admit_waiting(&mut self, rx: &mut mpsc::Receiver<EngineRequest>) {
-        self.resume_misses.clear();
         while self.slots.has_room() && !self.closing {
             match rx.try_recv() {
                 Ok(request) => self.admit(request),
@@ -584,9 +592,10 @@ impl Coordinator {
         asked.min(self.ctx.saturating_sub(prompt))
     }
 
-    /// Stands a fresh sequence on a stored prefix, when there is one.
+    /// Stands a fresh sequence on a stored prefix, when there is one, and tells
+    /// the model where its prompt's message boundaries are.
     fn try_resume(&mut self, slot: &mut SeqSlot) {
-        if !slot.checkpointable() || self.resume_misses.contains(&slot.prompt_text) {
+        if !slot.checkpointable() {
             return;
         }
         let Self {
@@ -595,7 +604,6 @@ impl Coordinator {
             row,
             scores,
             stats,
-            resume_misses,
             vocabulary,
             cfg,
             stop,
@@ -604,17 +612,17 @@ impl Coordinator {
         let Some(ckpt) = model.ckpt_mut() else {
             return;
         };
+        let hints = message_hints(&slot.prompt, *stop);
+        if let Err(error) = ckpt.kv_set_hints(slot.session, &hints) {
+            tracing::debug!(error = %error.chain(), "the prompt's message boundaries were not recorded");
+        }
         let whole_prompt = slot.prompt.len();
-        let outcome = ckpt.kv_resume(slot.session, slot.prompt_text.as_bytes());
-        let reused = match outcome {
+        let reused = match ckpt.kv_resume(slot.session, &slot.prompt) {
             Err(error) => {
                 tracing::warn!(error = %error.chain(), "a checkpoint resume failed; the prompt will be prefilled");
                 return;
             }
-            Ok(None) => {
-                resume_misses.insert(Arc::clone(&slot.prompt_text));
-                return;
-            }
+            Ok(None) => return,
             Ok(Some(info)) => {
                 let reused = info.tokens_reused;
                 if usize::try_from(reused).unwrap_or(usize::MAX) >= whole_prompt {
@@ -623,23 +631,33 @@ impl Coordinator {
                     // its next sample reads and no step is re-run to recover it.
                     let read = info
                         .frontier_logits
-                        .row(0)
+                        .as_ref()
+                        .ok_or(CoreError::Unsupported {
+                            what: "a resume of a whole prompt without its logits row",
+                            backend: "scheduler",
+                        })
+                        .and_then(|logits| logits.row(0))
                         .and_then(|view| backend.copy_d2h(view, row));
                     if let Err(error) = read {
+                        // The session already stands on the prefix, so a
+                        // prefill from here would run the prompt twice; the
+                        // sequence fails instead of answering from that.
                         tracing::warn!(error = %error.chain(), "a resumed frontier row did not read back");
+                        slot.fail(error.to_string());
                         return;
                     }
                 }
+                tracing::debug!(
+                    slot = slot.id,
+                    tokens_reused = reused,
+                    source = ?info.source,
+                    "a stored prefix was resumed"
+                );
                 reused
             }
         };
         slot.resumed(reused);
         stats.resumed(u64::from(reused));
-        tracing::debug!(
-            slot = slot.id,
-            tokens_reused = reused,
-            "a stored prefix was resumed"
-        );
         if slot.prompt_done() {
             start_decoding(
                 row,
@@ -650,6 +668,48 @@ impl Coordinator {
                 stats,
                 slot,
             );
+        }
+    }
+
+    /// Copies queued checkpoint pages off the device while no sequence is
+    /// resident. Returns `true` when a request arrived meanwhile and was
+    /// admitted, so the loop runs it instead of blocking.
+    fn pump_idle(&mut self, rx: &mut mpsc::Receiver<EngineRequest>) -> bool {
+        let budget = self.cfg.store.pump_bytes.saturating_mul(IDLE_PUMP_FACTOR);
+        loop {
+            let Some(ckpt) = self.model.ckpt_mut() else {
+                return false;
+            };
+            let queued = match ckpt.kv_pump(budget) {
+                Ok(report) => {
+                    if report.pages > 0 || report.entries > 0 {
+                        tracing::trace!(?report, "idle pump");
+                    }
+                    report.queued
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error.chain(), "a queued checkpoint could not be copied");
+                    0
+                }
+            };
+            if queued == 0 {
+                return false;
+            }
+            match rx.try_recv() {
+                Ok(request) => {
+                    self.admit(request);
+                    return true;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.closing = true;
+                    return true;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // Staging is full until the writer lands what it has; a
+                    // short wait lets it, and the queue is polled again after.
+                    std::thread::sleep(IDLE_PUMP_WAIT);
+                }
+            }
         }
     }
 
@@ -679,6 +739,19 @@ impl Coordinator {
         }
         self.store_continued();
         self.retire();
+        self.pump();
+    }
+
+    /// Copies a bounded slice of queued checkpoint pages off the device, between
+    /// steps: the write-behind's one foot on the scheduler thread.
+    fn pump(&mut self) {
+        let budget = self.cfg.store.pump_bytes;
+        let Some(ckpt) = self.model.ckpt_mut() else {
+            return;
+        };
+        if let Err(error) = ckpt.kv_pump(budget) {
+            tracing::warn!(error = %error.chain(), "a queued checkpoint could not be copied");
+        }
     }
 
     /// One decode step, speculative when this build and this sequence allow it.
@@ -694,6 +767,7 @@ impl Coordinator {
     /// Anything else takes the batched path below, which is the same work a
     /// build with no head does.
     fn decode_step(&mut self, rows: &[usize]) {
+        self.decode_steps = self.decode_steps.wrapping_add(1);
         if let [only] = rows
             && self.speculative(*only)
         {
@@ -949,16 +1023,20 @@ impl Coordinator {
                 self.fail_slot(step.slot, &error, "a media prompt was split");
                 return;
             }
+            let started = Instant::now();
             if let Err(error) = self.model.as_model_mut().prefill_chunk(session, chunk) {
                 self.fail_slot(step.slot, &error, "a prompt chunk could not be read");
                 return;
             }
+            let decode_steps = self.decode_steps;
             if let Some(slot) = self.slots.get_mut(step.slot) {
                 slot.advance_prefill(covered);
+                slot.time_prefill(covered, started.elapsed(), decode_steps);
             }
             self.stats.prefilled(covered as u64);
             return;
         }
+        let started = Instant::now();
 
         {
             let Self {
@@ -1003,15 +1081,7 @@ impl Coordinator {
                 return;
             }
         }
-        if let Some(slot) = self.slots.get_mut(step.slot) {
-            slot.advance_prefill(covered);
-        }
-        self.stats.prefilled(covered as u64);
-        // The frontier is exactly the prompt at this instant, which is the one
-        // moment a cold prefix can be filed under the prompt's own key. One
-        // decode step later the frontier has moved and the key would name a path
-        // no other request will ever send.
-        self.store_cold(step.slot);
+        self.finish_prompt(step.slot, covered, started);
 
         let Self {
             slots,
@@ -1056,21 +1126,34 @@ impl Coordinator {
         }
     }
 
-    /// Files a cold prefix, when the policy says it is worth one.
-    fn store_cold(&mut self, at: usize) {
-        let Some(slot) = self.slots.slots().get(at) else {
-            return;
-        };
-        if !slot.was_cold()
-            || !slot.checkpointable()
-            || !self.cfg.store.stores_cold(slot.frontier_len())
+    /// Accounts a prompt's last chunk: the cursor, the counters, and the prefill
+    /// rate the disk tier prices a resume against.
+    ///
+    /// A prompt whose chunks ran with no decode step between them timed the
+    /// device alone, and the last chunk's row read waited for all of it: a fair
+    /// sample of what a prefill costs. The prompt's end itself was queued for
+    /// disk by the model's own commit.
+    fn finish_prompt(&mut self, at: usize, covered: usize, started: Instant) {
+        let decode_steps = self.decode_steps;
+        let timed = self.slots.get_mut(at).and_then(|slot| {
+            slot.advance_prefill(covered);
+            slot.time_prefill(covered, started.elapsed(), decode_steps);
+            slot.solo_prefill(decode_steps)
+        });
+        self.stats.prefilled(covered as u64);
+        if let Some((tokens, elapsed)) = timed
+            && let Some(ckpt) = self.model.ckpt_mut()
         {
-            return;
+            ckpt.kv_observe_prefill(tokens, elapsed.as_secs_f64());
         }
-        self.store_frontier(at, Reason::Cold);
     }
 
-    /// Files a growing conversation's prefix on the configured interval.
+    /// Files a growing conversation's frontier on the configured interval.
+    ///
+    /// Off by default: the end of every turn is filed anyway, and a checkpoint
+    /// mid-answer is a snapshot of the whole recurrent stack for a position the
+    /// turn's end supersedes. What the interval buys is a crash mid-answer that
+    /// resumes part-way through it.
     fn store_continued(&mut self) {
         if self.cfg.store.continued_interval == 0 || self.model.ckpt_mut().is_none() {
             return;
@@ -1084,58 +1167,48 @@ impl Coordinator {
             .filter(|(_at, slot)| {
                 !slot.is_done()
                     && slot.checkpointable()
-                    && policy.stores_continued(slot.frontier_len(), slot.stored_len, false)
+                    && policy.stores_continued(slot.written_len(), slot.stored_len, false)
             })
             .map(|(at, _slot)| at)
             .collect();
         for at in due {
-            self.store_frontier(at, Reason::Continued);
-        }
-    }
-
-    /// Files whatever one sequence is standing on right now.
-    fn store_frontier(&mut self, at: usize, reason: Reason) -> bool {
-        let Some(slot) = self.slots.slots().get(at) else {
-            return false;
-        };
-        let session = slot.session;
-        let text = Arc::clone(&slot.prompt_text);
-        let path = slot.frontier_path();
-        let frontier = slot.frontier_len();
-        if self.save(session, &path, &text, reason) {
-            if let Some(slot) = self.slots.get_mut(at) {
-                slot.stored_len = frontier;
+            let Some(slot) = self.slots.slots().get(at) else {
+                continue;
+            };
+            let (session, written) = (slot.session, slot.written_len());
+            if self.save(session, Reason::Continued)
+                && let Some(slot) = self.slots.get_mut(at)
+            {
+                slot.stored_len = written;
             }
-            return true;
         }
-        false
     }
 
-    /// Offers one prefix to the checkpoint tier.
+    /// Offers the checkpoint at a session's frontier to the disk tier.
     ///
-    /// The engine's own gates decide whether a file appears: a prefix below the
-    /// floor, one the store already holds, one the session is not standing on.
-    /// None of those are re-implemented here, because a scheduler that decided
-    /// them too would be a second answer that can disagree with the first.
-    fn save(&mut self, session: SessionId, path: &[TokenId], text: &str, reason: Reason) -> bool {
+    /// The model's own gates decide whether anything is queued: the floor, an
+    /// entry already stored, a session that read media. None of those are
+    /// re-implemented here, because a scheduler that decided them too would be
+    /// a second answer that can disagree with the first.
+    fn save(&mut self, session: SessionId, reason: Reason) -> bool {
         let Self { model, stats, .. } = self;
         let Some(ckpt) = model.ckpt_mut() else {
             return false;
         };
-        match ckpt.kv_save(session, path, text.as_bytes(), reason) {
+        match ckpt.kv_save(session, reason) {
             Ok(outcome) => {
                 if outcome.stored().is_some() {
                     stats.checkpoint_written();
-                    tracing::debug!(?reason, tokens = path.len(), "a prefix was stored");
+                    tracing::debug!(?reason, ?outcome, "a frontier was offered to disk");
                     return true;
                 }
-                tracing::debug!(?outcome, ?reason, "a prefix was not stored");
+                tracing::debug!(?outcome, ?reason, "a frontier was not stored");
                 false
             }
             Err(error) => {
                 // A store that fails costs the next request a prefill and
                 // nothing else, so it is reported and the turn continues.
-                tracing::warn!(error = %error.chain(), ?reason, "a prefix could not be stored");
+                tracing::warn!(error = %error.chain(), ?reason, "a frontier could not be stored");
                 false
             }
         }
@@ -1193,7 +1266,7 @@ impl Coordinator {
         if !self
             .cfg
             .store
-            .stores_continued(slot.frontier_len(), slot.stored_len, true)
+            .stores_continued(slot.written_len(), slot.stored_len, true)
         {
             return;
         }
@@ -1204,10 +1277,7 @@ impl Coordinator {
         } else {
             Reason::Evict
         };
-        let path = slot.frontier_path();
-        let session = slot.session;
-        let text = Arc::clone(&slot.prompt_text);
-        if self.save(session, &path, &text, reason) && reason == Reason::Shutdown {
+        if self.save(slot.session, reason) && reason == Reason::Shutdown {
             self.stats.swept(1);
         }
     }
@@ -1247,34 +1317,66 @@ impl Coordinator {
         // Unconditional, because "there is nothing left to sweep" is the
         // engine's answer to give and not this loop's to assume: a session this
         // table does not know about is exactly the kind the sweep exists for.
-        self.sweep(&live);
+        self.sweep();
         for slot in &live {
             self.release(slot.session);
         }
     }
 
-    /// Stores every session that is still open on the way down.
+    /// Stores every session that is still open on the way down, then waits for
+    /// every queued write to land.
     ///
-    /// Ordinarily writes nothing, because the retirement path has already
-    /// stored each sequence as it ended. It is the safety net for the sessions
-    /// that path never reached - a coordinator that stopped with sequences still
-    /// resident - and is the one place a shutdown can still turn work already
-    /// paid for into a prefill somebody else will not pay.
-    fn sweep(&mut self, live: &[SeqSlot]) {
+    /// The sweep ordinarily stores nothing new, because the retirement path has
+    /// already offered each sequence as it ended. It is the safety net for the
+    /// sessions that path never reached. The drain is bounded: the unit that
+    /// runs this server gives the process a fixed time to stop, and a write
+    /// still queued when the bound passes is abandoned rather than killed
+    /// halfway.
+    fn sweep(&mut self) {
+        let timeout = self.cfg.store.drain_timeout;
         let Self { model, stats, .. } = self;
         let Some(ckpt) = model.ckpt_mut() else {
             return;
         };
-        let mut text_of = |session: SessionId| -> Option<(Vec<TokenId>, Vec<u8>)> {
-            let slot = live.iter().find(|slot| slot.session == session)?;
-            if !slot.checkpointable() {
-                return None;
-            }
-            Some((slot.frontier_path(), slot.prompt_text.as_bytes().to_vec()))
-        };
-        let written = ckpt.kv_shutdown_sweep(&mut text_of);
+        let written = ckpt.kv_shutdown_sweep();
         stats.swept(written as u64);
+        let started = Instant::now();
+        let landed = ckpt.kv_drain(timeout);
+        tracing::info!(
+            landed,
+            drain_ms = started.elapsed().as_millis(),
+            "the checkpoint queue was drained on the way down"
+        );
     }
+}
+
+/// Message boundaries of a prompt worth a checkpoint of their own: the end of
+/// its first message and the start of its last.
+///
+/// A boundary is the position just past an end-of-turn token. The first one is
+/// where a system prompt ends - shared by every session of an agent, and worth
+/// a checkpoint on first sight. The start of the final message is what a
+/// regenerated or edited last message branches from. The boundary just before
+/// the generation prompt is left out: the prompt's own end is a handful of
+/// tokens later and is checkpointed anyway, so a stop there would buy a chunk
+/// split and a snapshot and no reuse. Every boundary in between is either one
+/// of these for an earlier request or covered by the turn-end checkpoints a
+/// conversation already leaves.
+fn message_hints(prompt: &[TokenId], stop: StopTokens) -> Vec<u32> {
+    let len = prompt.len();
+    let mut boundaries: Vec<u32> = prompt
+        .iter()
+        .enumerate()
+        .filter(|(at, token)| stop.contains(**token) && at + 1 < len)
+        .map(|(at, _)| u32::try_from(at + 1).unwrap_or(u32::MAX))
+        .collect();
+    boundaries.pop();
+    let first = boundaries.first().copied();
+    let last = boundaries
+        .last()
+        .copied()
+        .filter(|last| Some(*last) != first);
+    first.into_iter().chain(last).collect()
 }
 
 /// Hands a sequence the first token of its turn and sends what that produced.

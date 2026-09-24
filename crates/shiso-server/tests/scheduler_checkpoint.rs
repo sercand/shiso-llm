@@ -1,19 +1,11 @@
 //! When the coordinator asks the checkpoint tier something, and what it offers.
 //!
-//! The engine decides whether a file appears - a prefix below its floor, one it
-//! already holds, one the session is not standing on. What the scheduler decides
-//! is *which moments* are offered at all, and that is what these tests pin: a
-//! scan per distinct prompt rather than per sequence, a cold prefix offered at
-//! the prompt's own frontier, the finished turn offered again, and a sweep on
-//! the way down.
-//!
-//! # What cannot be tested here
-//!
-//! A checkpoint *hit*. A fake tier would have to return a `ResumeInfo`, which is
-//! `#[non_exhaustive]` and has no constructor, so no crate outside the engine
-//! can build one. The miss path, the save path and the sweep are all reachable;
-//! the resume-skips-prefill case needs either a constructor on that type or a
-//! real store, and is owed.
+//! The model decides whether anything is stored - a prefix below its floor, one
+//! it already holds, a session that read media - and it files a prompt's end on
+//! its own, from the commit that ends the prompt. What the scheduler decides is
+//! *which other moments* are offered: the finished turn, a turn cut short, and a
+//! sweep on the way down; and what it hands the model beforehand: the prompt's
+//! tokens to resume from and its message boundaries.
 
 mod common;
 
@@ -33,7 +25,7 @@ fn argmax() -> SamplingParams {
     }
 }
 
-/// A request whose rendered text is `text`, which is what a store keys on.
+/// A request whose rendered text is `text`.
 fn request(text: &str, prompt: usize, max_tokens: u32) -> GenerateRequest {
     GenerateRequest::new(
         Arc::from(vec![TokenId::new(1); prompt]),
@@ -44,16 +36,16 @@ fn request(text: &str, prompt: usize, max_tokens: u32) -> GenerateRequest {
     .with_text(Arc::from(text))
 }
 
-/// A policy that offers a prefix twice per turn - once cold, once at the end -
-/// and never in between, so a test can count offers rather than race them.
+/// A policy that offers a frontier at the end of a turn and never in between,
+/// so a test can count offers rather than race them.
 fn ends_only(max_num_seqs: usize) -> SchedulerConfig {
     SchedulerConfig {
         max_num_seqs,
         store: StorePolicy {
             boundary_align: 0,
             boundary_trim: 0,
-            cold_max_tokens: 0,
             continued_interval: 0,
+            ..StorePolicy::new()
         },
         ..SchedulerConfig::new()
     }
@@ -64,14 +56,14 @@ async fn drain(mut stream: shiso_ir::EventStream) {
     while stream.next().await.is_some() {}
 }
 
-/// The two moments a turn is worth storing, and the paths they carry.
+/// A finished turn is offered once, at the last position its session ran.
 ///
-/// The cold one is the only instant the frontier is the prompt and nothing
-/// else, which is the one key another request could ever name. The second is
-/// the finished conversation, which is what a follow-up turn would continue
-/// from.
+/// The prompt's end is not offered here: the model files it itself, from the
+/// commit that ends the prompt. The turn's end is the prompt plus every
+/// generated token a decode step ran; the end-of-turn id that stopped it was
+/// sampled and never run, and the next turn's prompt supplies it again.
 #[tokio::test]
-async fn a_turn_offers_its_prompt_cold_and_its_whole_frontier_at_the_end() {
+async fn a_finished_turn_offers_the_last_position_its_session_ran() {
     let (engine, join, audit) = common::checkpointed_engine(vec![10, 11, 12], ends_only(2), None);
     drain(
         engine
@@ -87,17 +79,83 @@ async fn a_turn_offers_its_prompt_cold_and_its_whole_frontier_at_the_end() {
         .expect("the loop exits cleanly");
 
     let saves = audit.saves.lock().clone();
-    assert_eq!(saves.len(), 2, "two offers, not one per token: {saves:?}");
-    assert_eq!(saves[0].reason, Reason::Cold);
+    assert_eq!(saves.len(), 1, "one offer, not one per token: {saves:?}");
+    assert_eq!(saves[0].reason, Reason::Continued);
     assert_eq!(
-        saves[0].tokens, 6,
-        "the cold offer is the prompt itself, at the one instant that is the frontier"
+        saves[0].tokens, 9,
+        "the prompt plus the three generated ids, each run by the step after it"
     );
-    assert_eq!(saves[1].reason, Reason::Continued);
+}
+
+/// A prompt the tier covers whole starts decoding from the row the resume
+/// hands back, and no prompt token goes through a forward pass.
+#[tokio::test]
+async fn a_prompt_the_tier_covers_whole_is_not_prefilled() {
+    let (engine, join, audit) =
+        common::checkpointed_engine_hitting(vec![10, 11], ends_only(2), None, Some(6));
+    drain(
+        engine
+            .generate(request("a covered prompt", 6, 4))
+            .await
+            .expect("the engine accepts the request"),
+    )
+    .await;
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
+    assert_eq!(audit.resumes.lock().clone(), vec![6]);
+    assert!(
+        audit.prefill_chunks().is_empty(),
+        "a covered prompt read nothing: {:?}",
+        audit.prefill_chunks()
+    );
+}
+
+/// A prompt the tier covers in part prefills exactly the rest.
+#[tokio::test]
+async fn a_prompt_the_tier_covers_in_part_prefills_only_the_rest() {
+    let (engine, join, audit) =
+        common::checkpointed_engine_hitting(vec![10, 11], ends_only(2), None, Some(4));
+    drain(
+        engine
+            .generate(request("a longer prompt", 10, 4))
+            .await
+            .expect("the engine accepts the request"),
+    )
+    .await;
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
     assert_eq!(
-        saves[1].tokens, 9,
-        "the second offer is the prompt plus the three ids the turn generated"
+        audit.prefill_chunks(),
+        vec![6],
+        "the six tokens past the resume"
     );
+}
+
+/// The model is told where the prompt's message boundaries are before it reads
+/// the prompt: just past the first end-of-turn token, and the start of the final
+/// message. The boundary just before the generation prompt is not handed over:
+/// the prompt's own end, a few tokens later, is checkpointed anyway.
+#[tokio::test]
+async fn the_first_and_last_message_boundaries_are_handed_over() {
+    let (engine, join, audit) = common::checkpointed_engine(vec![10, 11], ends_only(2), None);
+    let eos = TokenId::new(common::EOS);
+    let one = TokenId::new(1);
+    let prompt = vec![one, one, eos, one, eos, one, eos, one, one, eos, one];
+    let req = GenerateRequest::new(Arc::from(prompt), argmax(), Seed::new(7), 4);
+    drain(engine.generate(req).await.expect("accepted")).await;
+    // One message and a generation prompt: nothing worth a stop.
+    let single = vec![one, one, one, eos, one];
+    let req = GenerateRequest::new(Arc::from(single), argmax(), Seed::new(7), 4);
+    drain(engine.generate(req).await.expect("accepted")).await;
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
+    assert_eq!(audit.hints.lock().clone(), vec![vec![3, 7], vec![]]);
 }
 
 /// A turn whose client hung up is state being discarded rather than a
@@ -142,66 +200,11 @@ async fn an_abandoned_turn_is_stored_as_state_leaving_memory() {
     );
 }
 
-/// The prefix scan re-hashes whatever is on disk, so two sequences that arrived
-/// together with the same prompt must not pay for it twice to be told the same
-/// thing.
+/// A prompt with no rendered text is still looked up and still filed: the tier
+/// keys by tokens, and a legacy completion's tokens are as good a key as a chat
+/// prompt's.
 #[tokio::test]
-async fn two_sequences_admitted_together_share_one_prefix_scan() {
-    let (engine, join, audit) = common::checkpointed_engine(vec![10; 400], ends_only(3), None);
-
-    // The first takes a seat and the coordinator settles into its loop. Its own
-    // prompt text is different, so it cannot be the one being memoised.
-    let first = engine
-        .generate(request("the first prompt", 2, 300))
-        .await
-        .expect("the engine accepts the first request");
-
-    // These two arrive together, with the same rendered text.
-    let queued: Vec<_> = (0..2)
-        .map(|_| {
-            let engine = engine.clone();
-            tokio::spawn(async move { engine.generate(request("a shared prompt", 2, 4)).await })
-        })
-        .collect();
-    let mut streams = vec![first];
-    for task in queued {
-        streams.push(
-            task.await
-                .expect("a queued request is not cancelled")
-                .expect("the engine accepts it"),
-        );
-    }
-    for stream in streams.drain(1..) {
-        drain(stream).await;
-    }
-
-    drop(streams);
-    drop(engine);
-    join.join()
-        .expect("the engine thread does not panic")
-        .expect("the loop exits cleanly");
-
-    let scans = audit.resumes.lock().clone();
-    let shared = scans
-        .iter()
-        .filter(|text| *text == "a shared prompt")
-        .count();
-    assert!(
-        (1..=2).contains(&shared),
-        "at most one scan per sequence, and one when they arrive together: {scans:?}"
-    );
-    assert!(
-        scans.iter().any(|text| text == "the first prompt"),
-        "a distinct prompt is always scanned: {scans:?}"
-    );
-}
-
-/// A prompt with no rendered text can never be named by a later request, so
-/// there is nothing to look up and nothing to file. Asking anyway would cost
-/// every legacy-completions request a scan of the whole store for a key that
-/// cannot exist.
-#[tokio::test]
-async fn a_prompt_with_no_rendered_text_is_neither_scanned_nor_stored() {
+async fn a_prompt_with_no_rendered_text_is_still_resumed_and_stored() {
     let (engine, join, audit) = common::checkpointed_engine(vec![10, 11], ends_only(2), None);
     let textless = GenerateRequest::new(
         Arc::from(vec![TokenId::new(1); 4]),
@@ -222,8 +225,8 @@ async fn a_prompt_with_no_rendered_text_is_neither_scanned_nor_stored() {
         .expect("the engine thread does not panic")
         .expect("the loop exits cleanly");
 
-    assert!(audit.resumes.lock().is_empty(), "nothing was looked up");
-    assert!(audit.saves.lock().is_empty(), "nothing was filed");
+    assert_eq!(audit.resumes.lock().clone(), vec![4], "it was looked up");
+    assert_eq!(audit.saves.lock().len(), 1, "its turn's end was offered");
 }
 
 /// The sweep is the safety net for sessions the retirement path never reached.
@@ -249,10 +252,6 @@ async fn the_shutdown_sweep_runs_exactly_once_on_the_way_down() {
         "the sweep runs once, whether or not it finds anything"
     );
     let saves = audit.saves.lock().clone();
-    assert!(
-        saves.iter().any(|note| note.reason == Reason::Cold),
-        "the cold offer still happened: {saves:?}"
-    );
     assert!(
         saves
             .iter()

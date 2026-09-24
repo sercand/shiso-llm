@@ -1208,6 +1208,7 @@ pub(crate) fn blas_lt_create() -> SysResult<CuBlasLt> {
 /// [`SysError::Math`] when the library refuses the destroy.
 pub(crate) unsafe fn blas_lt_destroy(handle: CuBlasLt) -> SysResult<()> {
     algo_cache().lock().clear();
+    pin_cache().lock().clear();
     // SAFETY: the caller guarantees the handle is live and unreleased.
     check_lt("cublasLtDestroy", unsafe {
         lt::cublasLtDestroy(handle.raw() as lt::cublasLtHandle_t)
@@ -1478,6 +1479,185 @@ pub(crate) unsafe fn blas_lt_matmul(
             &raw const algo,
             workspace.raw() as *mut c_void,
             workspace_size,
+            stream.raw() as lt::cudaStream_t,
+        )
+    })
+}
+
+/// The column count a pinned algorithm is chosen at.
+///
+/// Any fixed number keeps the promise - what matters is that the choice never
+/// sees the caller's own column count - and this one is a whole prefill chunk,
+/// the shape the pinned tier spends nearly all of its time on.
+const PIN_REFERENCE_COLUMNS: i32 = 4_096;
+
+/// What makes two pinned multiplies the same question: [`AlgoKey`] without the
+/// column count or a workspace, and with the output precision, which the
+/// ordinary key reads off the element type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PinKey {
+    op_a: Op,
+    op_b: Op,
+    m: i32,
+    k: i32,
+    lda: i32,
+    ldb: i32,
+    ldc: i32,
+    dtype: u32,
+    tf32: bool,
+    out_half: bool,
+}
+
+/// The process-wide pinned-algorithm table. Unbounded, because it holds one
+/// entry per projection shape and a model has a few dozen.
+type PinCache = Mutex<HashMap<PinKey, lt::cublasLtMatmulAlgo_t>>;
+
+/// The table, created on first use.
+fn pin_cache() -> &'static PinCache {
+    static CACHE: std::sync::OnceLock<PinCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Sets one attribute of an algorithm's configuration.
+fn algo_set(
+    algo: &mut lt::cublasLtMatmulAlgo_t,
+    attr: lt::cublasLtMatmulAlgoConfigAttributes_t,
+    value: u32,
+) -> SysResult<()> {
+    // SAFETY: `algo` is a live, initialised algorithm the caller owns, and
+    // `value` a live local of exactly the width declared, copied by the call.
+    check_lt("cublasLtMatmulAlgoConfigSetAttribute", unsafe {
+        lt::cublasLtMatmulAlgoConfigSetAttribute(
+            &raw mut *algo,
+            attr,
+            (&raw const value).cast::<c_void>(),
+            size_of::<u32>(),
+        )
+    })
+}
+
+/// The algorithm every multiply of `call`'s shape takes, whatever its column
+/// count: the library's choice at [`PIN_REFERENCE_COLUMNS`] columns with no
+/// workspace, then held to one slice of the contraction.
+///
+/// # Safety
+///
+/// `handle` must be live.
+unsafe fn pinned_algo(
+    handle: lt::cublasLtHandle_t,
+    call: &GemmCall,
+) -> SysResult<lt::cublasLtMatmulAlgo_t> {
+    let key = PinKey {
+        op_a: call.op_a,
+        op_b: call.op_b,
+        m: call.m,
+        k: call.k,
+        lda: call.lda,
+        ldb: call.ldb,
+        ldc: call.ldc,
+        dtype: lt_dtype(call.dtype) as u32,
+        tf32: call.tf32,
+        out_half: call.out_half,
+    };
+    if let Some(algo) = pin_cache().lock().get(&key).copied() {
+        return Ok(algo);
+    }
+    // The reference problem is described, never run, so a transposed right
+    // operand's leading dimension only has to be wide enough to describe it.
+    let reference = GemmCall {
+        n: PIN_REFERENCE_COLUMNS,
+        ldb: match call.op_b {
+            Op::N => call.ldb,
+            Op::T => call.ldb.max(PIN_REFERENCE_COLUMNS),
+        },
+        ..*call
+    };
+    let (desc, a, b, c) = lt_setup(&reference)?;
+    // No workspace: a split contraction reduces through one, and an algorithm
+    // that cannot run without it is not one this tier may take.
+    // SAFETY: every handle is live for the call.
+    let mut algo = unsafe { lt_heuristic(handle, &desc, &a, &b, &c, 0) }?;
+    algo_set(
+        &mut algo,
+        lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+        1,
+    )?;
+    algo_set(
+        &mut algo,
+        lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+        lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_NONE as u32,
+    )?;
+    pin_cache().lock().insert(key, algo);
+    Ok(algo)
+}
+
+/// Queues one matrix multiply through the heuristic path with its algorithm
+/// pinned per shape, so a column sums the same way at every column count.
+///
+/// # Safety
+///
+/// As [`blas_gemm`].
+///
+/// # Errors
+///
+/// [`SysError::Math`] when the library refuses any step - including when the
+/// pinned algorithm cannot run at this column count, which is a refusal rather
+/// than a quiet change of algorithm - and [`SysError::Host`] when it offers
+/// none for the reference shape.
+pub(crate) unsafe fn blas_lt_matmul_pinned(
+    handle: CuBlasLt,
+    call: &GemmCall,
+    stream: CuStream,
+) -> SysResult<()> {
+    let lt_handle = handle.raw() as lt::cublasLtHandle_t;
+    // SAFETY: the caller guarantees the handle is live.
+    let algo = unsafe { pinned_algo(lt_handle, call) }?;
+    let (desc, a, b, c) = lt_setup(call)?;
+    let mut fit = std::mem::MaybeUninit::<lt::cublasLtMatmulHeuristicResult_t>::zeroed();
+    // SAFETY: every handle is live; `algo` and `fit` are live locals of the
+    // types the library reads and writes.
+    check_lt("cublasLtMatmulAlgoCheck", unsafe {
+        lt::cublasLtMatmulAlgoCheck(
+            lt_handle,
+            desc.0,
+            a.0,
+            b.0,
+            c.0,
+            c.0,
+            &raw const algo,
+            fit.as_mut_ptr(),
+        )
+    })?;
+    // SAFETY: the check succeeded, so the library filled the result.
+    let fit = unsafe { fit.assume_init() };
+    if fit.workspaceSize != 0 {
+        return Err(SysError::Host {
+            op: "cublasLtMatmulAlgoCheck",
+            what: "the pinned algorithm asks for a workspace at this column count",
+        });
+    }
+    let alpha = call.alpha;
+    let beta = call.beta;
+    // SAFETY: the caller guarantees every device range; `alpha`, `beta` and
+    // `algo` are live locals the library reads during the call, and the
+    // descriptors live until this function returns.
+    check_lt("cublasLtMatmul", unsafe {
+        lt::cublasLtMatmul(
+            lt_handle,
+            desc.0,
+            (&raw const alpha).cast::<c_void>(),
+            call.a.raw() as *const c_void,
+            a.0,
+            call.b.raw() as *const c_void,
+            b.0,
+            (&raw const beta).cast::<c_void>(),
+            call.c.raw() as *const c_void,
+            c.0,
+            call.c.raw() as *mut c_void,
+            c.0,
+            &raw const algo,
+            std::ptr::null_mut(),
+            0,
             stream.raw() as lt::cudaStream_t,
         )
     })

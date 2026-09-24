@@ -212,6 +212,33 @@ pub fn ckpt_bytes(shape: &SparseShape, spec: SpecDepth) -> u64 {
         .saturating_add(draft)
 }
 
+/// Where one recurrent slot's convolution window starts in a checkpoint blob,
+/// and so in the stack's snapshot buffer, which is laid out as one: every slot
+/// in ordinal order, each window followed by its state matrix, then the n-gram
+/// window, then the draft row. The order is `ckpt::snapshot`'s.
+#[must_use]
+pub fn snapshot_conv_offset(shape: &SparseShape, slot: u32) -> u64 {
+    u64::from(slot).saturating_mul(conv_state_bytes(shape).saturating_add(state_bytes(shape)))
+}
+
+/// Where one recurrent slot's state matrix starts in a checkpoint blob.
+#[must_use]
+pub fn snapshot_state_offset(shape: &SparseShape, slot: u32) -> u64 {
+    snapshot_conv_offset(shape, slot).saturating_add(conv_state_bytes(shape))
+}
+
+/// Where the n-gram window starts in a checkpoint blob: past every slot.
+#[must_use]
+pub fn snapshot_window_offset(shape: &SparseShape) -> u64 {
+    snapshot_conv_offset(shape, shape.count(LayerKind::Gdn))
+}
+
+/// Where the draft row starts in a speculating stack's checkpoint blob.
+#[must_use]
+pub fn snapshot_draft_offset(shape: &SparseShape) -> u64 {
+    snapshot_window_offset(shape).saturating_add(ple_window_bytes(shape))
+}
+
 /// Bytes of the residual row a speculative step leaves staged for the draft
 /// head.
 ///
@@ -269,6 +296,9 @@ pub fn ple_window_bytes(shape: &SparseShape) -> u64 {
 /// The cache geometry this shape implies.
 #[must_use]
 pub fn cache_geometry(shape: &SparseShape, planes: PagePlanes, spec: SpecDepth) -> CacheGeometry {
+    // A prompt pass is summed the same way wherever it is cut, provided every
+    // cut is on the recurrence's run grid; a prompt-final checkpoint off it
+    // answers its own prompt and nothing longer.
     CacheGeometry::new(
         PAGE_TOKENS,
         page_bytes(shape, planes),
@@ -276,6 +306,7 @@ pub fn cache_geometry(shape: &SparseShape, planes: PagePlanes, spec: SpecDepth) 
         ESTIMATED_PREFILL_S_PER_TOKEN,
         UTILITY_DECAY_S,
     )
+    .with_resume_grid(crate::sparse::kernels::GDN_CHUNK)
 }
 
 /// One allocation behind the pool, and the bytes one page occupies inside it.

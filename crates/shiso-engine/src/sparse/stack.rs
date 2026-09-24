@@ -42,6 +42,7 @@ use shiso_kvstore::{Frontier, KvCache};
 use crate::options::EngineOptions;
 use crate::sessions::clear_range;
 use crate::shape::LayerKind;
+use crate::sparse::ckpt::Boundary;
 use crate::sparse::island::{GraphPolicy, IslandKey};
 use crate::sparse::kernels::IDX_QUERY_BLOCK;
 use crate::sparse::kernels::{self, F32_BYTES};
@@ -275,6 +276,10 @@ pub(crate) struct SpecState {
     /// The lookup proposals this session saw rejected, which it does not
     /// propose again from the same place.
     pub(crate) lookup_fails: crate::sparse::mtp::FailRing,
+    /// The frontier the staged row drafts from: the session's `written` once
+    /// the position the row came from was committed. A row staged for another
+    /// frontier is stale, and a checkpoint must not carry it.
+    pub(crate) staged_for: u32,
 }
 
 /// One live session.
@@ -290,6 +295,16 @@ pub struct SparseSession {
     pub(crate) spec: Option<SpecState>,
     pub(crate) written: u32,
     pub(crate) history: Vec<TokenId>,
+    /// Message boundaries of the prompt being read, as absolute positions: a
+    /// chunk stops at each so a checkpoint can be taken there.
+    pub(crate) hints: Vec<u32>,
+    /// Whether any chunk spliced media rows in. Such a path is never
+    /// checkpointed: a placeholder run is one id repeated, so its tokens cannot
+    /// tell two pictures apart.
+    pub(crate) media: bool,
+    /// The position a resume stood this session on, zero for one prefilled
+    /// from nothing.
+    pub(crate) resumed_at: u32,
 }
 
 impl SparseSession {
@@ -397,6 +412,16 @@ impl SparseSession {
         spec.pending_valid.then(|| spec.pending.view())
     }
 
+    /// Whether the staged draft row belongs to the frontier this session stands
+    /// on now. A plain decode step advances the frontier without restaging, so
+    /// the row can be one position or many behind.
+    #[must_use]
+    pub fn staged_row_current(&self) -> bool {
+        self.spec
+            .as_ref()
+            .is_some_and(|spec| spec.pending_valid && spec.staged_for == self.written)
+    }
+
     /// How many recurrent slots this session carries state for.
     #[must_use]
     pub fn recurrent_slots(&self) -> usize {
@@ -494,6 +519,11 @@ pub(crate) struct Resident {
     pub(crate) ngram: Option<ple::NgramTier>,
     /// The routed expert stream, on a stack whose banks are not resident.
     pub(crate) stream: Option<crate::sparse::stream::ExpertStream>,
+    /// One checkpoint blob's worth of device memory, laid out as one, which a
+    /// prompt's final pass writes the session's state into as it stood at the
+    /// last grid point before the prompt's end. Allocated when a checkpoint
+    /// tier opens, after the pool was sized, so it is never the pool's.
+    pub(crate) snapshot: Option<DeviceBuffer>,
 }
 
 /// The host buffers this stack moves bytes through, reused between calls.
@@ -750,6 +780,7 @@ impl SparseStack {
             capturing: false,
             max_co_resident: opts.co_resident_blocks,
             half_block_input: false,
+            role: crate::sparse::matmul::PassRole::Step,
         };
         let desc = weights.desc(ngram.as_ref().map(|tier| tier.table().row()));
         log_resident(&shape, &opts, &kv, geometry.ckpt_bytes);
@@ -767,6 +798,7 @@ impl SparseStack {
                 scratch,
                 ngram,
                 stream: None,
+                snapshot: None,
             }),
             sessions: HashMap::new(),
             order: Vec::new(),
@@ -1006,6 +1038,7 @@ impl SparseStack {
                 pending_valid: false,
                 generated_from: 0,
                 lookup_fails: crate::sparse::mtp::FailRing::new(),
+                staged_for: 0,
             })
         } else {
             None
@@ -1019,6 +1052,9 @@ impl SparseStack {
             spec,
             written: 0,
             history: Vec::new(),
+            hints: Vec::new(),
+            media: false,
+            resumed_at: 0,
         };
         self.sessions.insert(id, session);
         self.order.push(id);
@@ -1168,6 +1204,28 @@ impl SparseStack {
         earned: bool,
         frontier_row: Option<u32>,
     ) -> CoreResult<()> {
+        let boundary = if earned {
+            Boundary::PromptEnd
+        } else {
+            Boundary::Step
+        };
+        self.advance_at(session, tokens, boundary, frontier_row)
+    }
+
+    /// [`SparseStack::advance`], with the boundary named rather than folded into
+    /// a flag: a message boundary or a branch point inside a prompt earns a
+    /// checkpoint without ending the prompt.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::advance`].
+    pub(crate) fn advance_at(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        boundary: Boundary,
+        frontier_row: Option<u32>,
+    ) -> CoreResult<()> {
         let n_tok = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
         {
             let live = self
@@ -1177,7 +1235,7 @@ impl SparseStack {
             live.history.extend_from_slice(tokens);
             live.written = live.written.saturating_add(n_tok);
         }
-        self.commit(session, earned, frontier_row)
+        self.commit(session, boundary, frontier_row)
     }
 
     /// Puts a session back where it stood before the drafts the target rejected.
@@ -1290,6 +1348,7 @@ impl SparseStack {
         })?;
         backend.copy_d2d(spec.pending.view(), residual)?;
         spec.pending_valid = true;
+        spec.staged_for = live.written;
         Ok(())
     }
 
@@ -1387,6 +1446,10 @@ impl SparseStack {
         };
         let binder = match resident.stream.as_ref() {
             Some(stream) => binder.with_stream(stream),
+            None => binder,
+        };
+        let binder = match resident.snapshot.as_ref() {
+            Some(snapshot) => binder.with_snapshot(snapshot.view()),
             None => binder,
         };
         Ok(match self.backend.as_coop() {
@@ -1564,8 +1627,10 @@ impl SparseStack {
                 scratch,
                 ngram,
                 stream,
+                snapshot,
             } = resident;
             drop(stream);
+            drop(snapshot);
             drop(ngram);
             drop(scratch);
             drop(cache);

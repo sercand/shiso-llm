@@ -40,7 +40,7 @@ use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::model::{DecodeStep, Logits};
 use shiso_core::{DType, DeviceView, GraphKey};
-use shiso_kvstore::{CacheStats, CommitOpts, KvCache};
+use shiso_kvstore::{CacheStats, CommitOpts, KvCache, Reason};
 
 use crate::blocks::{BlockKernels, Trail};
 use crate::kv::{self, DeviceKv};
@@ -988,11 +988,14 @@ impl HybridStack {
         // a caller that builds the same request shape every time gets the old
         // launches back by handing over no items.
         let media = media.filter(|prefill| !prefill.is_empty());
-        let start = self
+        let live = self
             .sessions
-            .get(&session)
-            .ok_or(CoreError::UnknownSession(session))?
-            .written();
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        if media.is_some() {
+            live.mark_media();
+        }
+        let start = live.written();
         let positions = self.shape.media_positions;
         let mut run = media.map(|prefill| MediaRun {
             prefill: *prefill,
@@ -1100,17 +1103,23 @@ impl HybridStack {
         // step.
         //
         // So a snapshot is only considered at a boundary that is worth one on
-        // its own terms: the end of a prompt, or a stride multiple. Those are
-        // the positions a later request can actually resume from, which is the
-        // only reason the blob is written at all.
+        // its own terms: the end of a prompt, or a stride multiple. A prompt's
+        // end is admitted outright - the cache's earliest stop is the branch
+        // point, which every rendered prompt passes on its template's opening,
+        // so gating the end on it stored nothing but first prompts and exact
+        // repeats - and a stride position still has to be the cache's own stop.
+        // A session that read media is never checkpointed: its placeholder
+        // runs cannot tell two pictures apart.
         let periodic = q > 0 && q.is_multiple_of(MAX_PREFILL_CHUNK);
         let admit = (earned || periodic)
-            && resident.cache.next_admission(
-                live.kv().frontier(),
-                live.history(),
-                &[],
-                MAX_PREFILL_CHUNK,
-            ) == Some(q);
+            && !live.carries_media()
+            && (earned
+                || resident.cache.next_admission(
+                    live.kv().frontier(),
+                    live.history(),
+                    &[],
+                    MAX_PREFILL_CHUNK,
+                ) == Some(q));
         if admit {
             snapshot(backend.as_ref(), live, &mut staging.ckpt)?;
             if let Some(row) = logits_row {
@@ -1123,12 +1132,23 @@ impl HybridStack {
                 backend.copy_d2h(row, &mut staging.logits)?;
             }
         }
+        // A prompt's end goes to the disk tier as soon as it is admitted: cold
+        // when this process prefilled the whole prompt, a continuation when it
+        // extended a resumed one.
+        let reason = if live.resumed_at() == 0 {
+            Reason::Cold
+        } else {
+            Reason::Continued
+        };
         let (history, kv) = live.commit_parts();
         let mut opts = CommitOpts::span(&[]);
         if admit {
             opts = opts.checkpoint(staging.ckpt.as_slice(), earned);
             if logits_row.is_some() {
                 opts = opts.logits_row(staging.logits.as_slice());
+            }
+            if earned {
+                opts = opts.persist(reason);
             }
         }
         resident
@@ -1292,7 +1312,11 @@ fn logits_row_bytes(resident: &Resident) -> u64 {
 /// The layout is the ordinal order the layers name, each slot's convolution window
 /// followed by its state matrix. It is the layout a resume reads back, and the two
 /// agree because this is the only function that writes it.
-fn snapshot(backend: &dyn Backend, session: &mut Session, blob: &mut Vec<u8>) -> CoreResult<()> {
+pub(crate) fn snapshot(
+    backend: &dyn Backend,
+    session: &mut Session,
+    blob: &mut Vec<u8>,
+) -> CoreResult<()> {
     blob.clear();
     for ordinal in 0..session.recurrent_slots() {
         let ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);

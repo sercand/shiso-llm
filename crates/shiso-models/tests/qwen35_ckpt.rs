@@ -22,11 +22,11 @@
 //! and a buffer in one has a counterpart in the other.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
-use shiso_core::{Model, TokenId};
+use shiso_core::Model;
 use shiso_engine::ckpt::Checkpointed;
-use shiso_engine::{CkptConfig, CkptOptions, EngineOptions, Reason, SaveOutcome};
-use shiso_kvstore::{Incoming, PathWords, SpillConfig, SpillStore};
+use shiso_engine::{CkptConfig, CkptOptions, EngineOptions, PersistRefusal, Reason, SaveOutcome};
 
 #[path = "common/qwen35_fixture.rs"]
 mod fixture;
@@ -36,11 +36,7 @@ use fixture::{
     RECURRENT_SLOTS, loaded, loaded_with, tokens,
 };
 
-/// The rendered text a stored entry is keyed by. Only the engine's caller knows what
-/// a request rendered to, so it arrives as bytes and nothing here tokenizes it.
-const PROMPT: &[u8] = b"<|im_start|>user\nThe capital of France is<|im_end|>\n";
-
-/// Tokens the fixture prompt stands for. Eight, which clears the floor below.
+/// Tokens the fixture prompt holds. Eight, which clears the floor below.
 const PROMPT_TOKENS: u32 = 8;
 
 /// Bytes of one page inside one key/value allocation, which is the range a restore
@@ -50,9 +46,23 @@ fn kv_run_bytes() -> usize {
         .expect("the fixture page fits this host")
 }
 
-/// Bytes of the rendered prompt, as an entry's header counts them.
-fn prompt_bytes() -> u64 {
-    u64::try_from(PROMPT.len()).expect("the fixture prompt is short")
+/// Entry files the store holds.
+fn entries(store: &std::path::Path) -> usize {
+    let Ok(fans) = store.join("ckpt").read_dir() else {
+        return 0;
+    };
+    fans.flatten()
+        .filter_map(|fan| fan.path().read_dir().ok())
+        .map(Iterator::count)
+        .sum()
+}
+
+/// Every queued write lands.
+fn drain(model: &mut shiso_models::qwen35::Qwen35Model) {
+    assert!(
+        model.kv_drain(Duration::from_secs(10)),
+        "the writer caught up"
+    );
 }
 
 /// A tier that stores anything four tokens or longer.
@@ -63,7 +73,8 @@ fn prompt_bytes() -> u64 {
 fn ckpt_options() -> CkptOptions {
     let mut opts = CkptOptions::new();
     opts.min_tokens = 4;
-    opts.budget_mb = 64;
+    opts.budget_mb = Some(64);
+    opts.staging_mb = 16;
     opts
 }
 
@@ -120,7 +131,8 @@ fn saver(
     (dir, fake, model, session, recurrent)
 }
 
-/// Prefills the fixture prompt and stores the session at its frontier.
+/// Prefills the fixture prompt - whose last chunk queues its own checkpoint -
+/// asks for the frontier to be stored, and drains the queue.
 fn store_prefix(
     model: &mut shiso_models::qwen35::Qwen35Model,
     session: shiso_core::SessionId,
@@ -129,9 +141,11 @@ fn store_prefix(
     model
         .prefill_last(session, &path)
         .expect("the prompt prefills");
-    model
-        .kv_save(session, &path, PROMPT, Reason::Cold)
-        .expect("the store answers")
+    let outcome = model
+        .kv_save(session, Reason::Cold)
+        .expect("the store answers");
+    drain(model);
+    outcome
 }
 
 #[test]
@@ -141,8 +155,8 @@ fn a_resumed_session_is_a_byte_image_of_the_one_that_was_saved() {
     let (_dir, saved_device, mut saved, session, recurrent) = saver(store.path());
     let outcome = store_prefix(&mut saved, session);
     assert!(
-        matches!(outcome, SaveOutcome::Written(_)),
-        "the prefix is written: {outcome:?}"
+        matches!(outcome, SaveOutcome::AlreadyStored(_)),
+        "the prompt's end was queued by its own commit: {outcome:?}"
     );
 
     // A second model over its own device, which has never run anything.
@@ -160,7 +174,7 @@ fn a_resumed_session_is_a_byte_image_of_the_one_that_was_saved() {
     let owned = device.allocated_since(mark);
 
     let info = model
-        .kv_resume(fresh, PROMPT)
+        .kv_resume(fresh, &tokens(1, PROMPT_TOKENS))
         .expect("the resume answers")
         .expect("the stored prefix is found");
     assert_eq!(
@@ -168,17 +182,15 @@ fn a_resumed_session_is_a_byte_image_of_the_one_that_was_saved() {
         "the whole stored path is reused"
     );
     assert_eq!(
-        info.text_bytes,
-        prompt_bytes(),
-        "the entry covers the whole rendered prompt"
-    );
-    assert_eq!(
         info.tokens,
         tokens(1, PROMPT_TOKENS),
         "the token path comes back as it was stored"
     );
-    assert_eq!(info.frontier_logits.rows(), 1);
-    let row_buffer = info.frontier_logits.view().id().get();
+    let row = info
+        .frontier_logits
+        .expect("a resume of the whole prompt carries its row");
+    assert_eq!(row.rows(), 1);
+    let row_buffer = row.view().id().get();
 
     // The recurrent stack: the Decision that the payload carries it, as a test. If
     // anyone drops the conv windows or the state matrices from the payload, this is
@@ -221,7 +233,7 @@ fn a_resumed_session_is_a_byte_image_of_the_one_that_was_saved() {
 }
 
 #[test]
-fn a_request_whose_text_is_not_the_stored_one_is_a_cold_start() {
+fn a_prompt_the_stored_path_does_not_begin_is_a_cold_start() {
     let store = tempfile::TempDir::new().expect("a temporary directory");
     let (_dir, _device, mut saved, session, _recurrent) = saver(store.path());
     assert!(store_prefix(&mut saved, session).stored().is_some());
@@ -232,22 +244,18 @@ fn a_request_whose_text_is_not_the_stored_one_is_a_cold_start() {
         .expect("the same directory opens");
     let fresh = model.open_session().expect("a session opens");
 
-    // A prompt the stored entry is not a prefix of. The key is the hash of the text,
-    // so a different rendering simply names a file that is not there.
+    // A prompt the stored path is not a prefix of: its keys name other files.
     assert!(
         model
-            .kv_resume(
-                fresh,
-                b"<|im_start|>user\nSomething else entirely<|im_end|>\n"
-            )
+            .kv_resume(fresh, &tokens(40, PROMPT_TOKENS))
             .expect("the resume answers")
             .is_none(),
-        "a text the stored entry does not begin is a cold start"
+        "a prompt the stored entry does not begin is a cold start"
     );
-    // A text shorter than the stored prefix cannot have it as a prefix either.
+    // A prompt shorter than the stored path cannot resume from its end either.
     assert!(
         model
-            .kv_resume(fresh, &PROMPT[..8])
+            .kv_resume(fresh, &tokens(1, 5))
             .expect("the resume answers")
             .is_none()
     );
@@ -258,28 +266,21 @@ fn a_longer_stored_prefix_beats_a_shorter_one() {
     let store = tempfile::TempDir::new().expect("a temporary directory");
     // Two entries over the same conversation: a short one and the whole prompt.
     let (_dir, _device, mut saved, session, _recurrent) = saver(store.path());
-    let short_text = &PROMPT[..20];
     let short_path = tokens(1, 4);
     saved
         .prefill_chunk(session, &short_path)
         .expect("the first half prefills");
-    // A chunk that is not the last one leaves no frontier row, so the short entry is
-    // stored from its own session standing at its own frontier.
+    // Stored at the frontier, whether the chunk's own commit already queued
+    // it or the save has to take the checkpoint itself.
     let head = saved
-        .kv_save(session, &short_path, short_text, Reason::Cold)
+        .kv_save(session, Reason::Cold)
         .expect("the store answers");
-    let tail_path = tokens(5, 4);
+    assert!(head.stored().is_some(), "{head:?}");
     saved
-        .prefill_last(session, &tail_path)
+        .prefill_last(session, &tokens(5, 4))
         .expect("the rest prefills");
-    let whole: Vec<TokenId> = tokens(1, PROMPT_TOKENS);
-    let full = saved
-        .kv_save(session, &whole, PROMPT, Reason::Cold)
-        .expect("the store answers");
-    assert!(
-        full.stored().is_some(),
-        "the whole prompt is stored: {full:?}"
-    );
+    drain(&mut saved);
+    assert_eq!(entries(store.path()), 2);
 
     let (_dir_b, _device_b, mut model) = loaded();
     model
@@ -287,21 +288,12 @@ fn a_longer_stored_prefix_beats_a_shorter_one() {
         .expect("the same directory opens");
     let fresh = model.open_session().expect("a session opens");
     let info = model
-        .kv_resume(fresh, PROMPT)
+        .kv_resume(fresh, &tokens(1, PROMPT_TOKENS))
         .expect("the resume answers")
         .expect("a stored prefix is found");
     assert_eq!(
         info.tokens_reused, PROMPT_TOKENS,
-        "the entry covering the most text is the one read, not the first one found"
-    );
-    // The short store is only interesting if it happened at all; a mid-prefill chunk
-    // carries no frontier row, so it is refused for that and not silently skipped.
-    assert!(
-        matches!(
-            head,
-            SaveOutcome::NoFrontierLogits | SaveOutcome::Written(_)
-        ),
-        "{head:?}"
+        "the deepest entry on the path is the one read"
     );
 }
 
@@ -315,79 +307,34 @@ fn every_refusal_says_which_one_it_is() {
     let path = tokens(1, PROMPT_TOKENS);
     cold.prefill_last(session, &path).expect("the prompt runs");
     assert_eq!(
-        cold.kv_save(session, &path, PROMPT, Reason::Cold)
+        cold.kv_save(session, Reason::Cold)
             .expect("a disabled tier still answers"),
         SaveOutcome::Disabled,
         "a stack nobody gave a directory to says so rather than failing"
     );
     assert!(!cold.kv_checkpoint_enabled());
     assert!(
-        cold.kv_resume(session, PROMPT)
+        cold.kv_resume(session, &path)
             .expect("a disabled tier still answers")
             .is_none()
     );
 
-    let (_dir, _device, mut model, session, _recurrent) = saver(store.path());
-    assert!(model.kv_checkpoint_enabled());
-    model
-        .prefill_last(session, &path)
-        .expect("the prompt prefills");
-
-    // Not at the frontier: the right number of the wrong tokens, and the wrong number.
-    let wrong = tokens(40, PROMPT_TOKENS);
-    assert_eq!(
-        model
-            .kv_save(session, &wrong, PROMPT, Reason::Cold)
-            .expect("the store answers"),
-        SaveOutcome::NotAtFrontier {
-            tokens: PROMPT_TOKENS,
-            written: PROMPT_TOKENS
-        },
-        "a path the session is not standing on is refused even at the right length"
-    );
-    assert_eq!(
-        model
-            .kv_save(session, &path[..3], PROMPT, Reason::Cold)
-            .expect("the store answers"),
-        SaveOutcome::NotAtFrontier {
-            tokens: 3,
-            written: PROMPT_TOKENS
-        }
-    );
-
-    // Empty text: nothing could ever name the entry.
-    assert_eq!(
-        model
-            .kv_save(session, &path, b"", Reason::Cold)
-            .expect("the store answers"),
-        SaveOutcome::EmptyText
-    );
-
     // Below the floor, which is the one intrinsic gate this tier owns.
-    let (_dir, _device, mut strict, strict_session, _r) = saver(store.path());
-    let mut high = ckpt_options();
-    high.min_tokens = 4096;
-    strict
-        .kv_enable(&CkptConfig::new(store.path()).with_options(high))
-        .expect_err("the tier cannot be reopened under a running session");
+    let (_dir, _device, mut model, session, _recurrent) = saver(store.path());
     let short = tokens(1, 2);
-    strict
-        .prefill_last(strict_session, &short)
+    model
+        .prefill_last(session, &short)
         .expect("two tokens prefill");
     assert_eq!(
-        strict
-            .kv_save(strict_session, &short, PROMPT, Reason::Cold)
+        model
+            .kv_save(session, Reason::Cold)
             .expect("the store answers"),
-        SaveOutcome::BelowMinTokens { tokens: 2, min: 4 }
+        SaveOutcome::Refused(PersistRefusal::BelowMinTokens { tokens: 2, min: 4 })
     );
-
-    assert!(
-        store
-            .path()
-            .read_dir()
-            .expect("the directory exists")
-            .count()
-            == 0,
+    drain(&mut model);
+    assert_eq!(
+        entries(store.path()),
+        0,
         "not one refusal left a file behind"
     );
 }
@@ -398,9 +345,9 @@ fn a_path_prefilled_under_a_larger_context_is_not_read_into_a_smaller_one() {
     let (_dir, _device, mut saved, session, _recurrent) = saver(store.path());
     assert!(store_prefix(&mut saved, session).stored().is_some());
 
-    // The same build, started with half the context. The stored path fits, but the
-    // entry was written for a cache this one is not, so it is refused - and kept,
-    // because the build it was written for can still read it.
+    // The same build, started with half the context. The context is a layout
+    // word, so the entry is named for a build this one is not: it is never
+    // found, and it is kept, because the build it was written for can read it.
     let (_dir_b, _device_b, mut small) = loaded_with(options_at(CTX / 2));
     small
         .kv_enable(&CkptConfig::new(store.path()).with_options(ckpt_options()))
@@ -408,56 +355,30 @@ fn a_path_prefilled_under_a_larger_context_is_not_read_into_a_smaller_one() {
     let fresh = small.open_session().expect("a session opens");
     assert!(
         small
-            .kv_resume(fresh, PROMPT)
+            .kv_resume(fresh, &tokens(1, PROMPT_TOKENS))
             .expect("the resume answers")
             .is_none(),
         "an entry written under a larger context is not read into a smaller one"
     );
-    assert_eq!(
-        store
-            .path()
-            .read_dir()
-            .expect("the directory exists")
-            .count(),
-        1,
-        "a disagreement with this configuration keeps the file"
-    );
+    assert_eq!(entries(store.path()), 1, "the other build's file is kept");
 }
 
 #[test]
-fn a_payload_describing_a_stack_this_build_does_not_have_is_unlinked() {
+fn a_corrupt_entry_is_a_cold_start_and_is_unlinked() {
     let store = tempfile::TempDir::new().expect("a temporary directory");
     let (_dir, _device, mut saved, session, _recurrent) = saver(store.path());
-    let id = store_prefix(&mut saved, session)
-        .stored()
-        .expect("the prefix is stored");
+    assert!(store_prefix(&mut saved, session).stored().is_some());
+    drop(saved);
 
-    // Rewrite the stored payload so its header claims a recurrent stack of a
-    // different depth. Nothing about the envelope changes, so the scan still matches
-    // it by name and the refusal has to come from the payload's own geometry.
-    {
-        let mut disk = SpillStore::open(&SpillConfig::new(store.path(), 64))
-            .expect("the directory opens directly");
-        let entry = disk
-            .read(id)
-            .expect("the entry reads")
-            .expect("the entry is there");
-        let mut payload = entry.payload.clone();
-        let mut words: PathWords = bytemuck::pod_read_unaligned(&payload[..size_of::<PathWords>()]);
-        words.n_gdn_layers += 1;
-        payload[..size_of::<PathWords>()].copy_from_slice(bytemuck::bytes_of(&words));
-        assert!(disk.forget(id).expect("the original is removed"));
-        disk.write(&Incoming {
-            text: &entry.text,
-            tokens: entry.header.tokens,
-            quant_bits: entry.header.quant_bits,
-            model_id: entry.header.model_id,
-            ctx_size: entry.header.ctx_size,
-            reason: Reason::Cold,
-            ext_flags: 0,
-            payload: &payload,
-        })
-        .expect("the forged entry is written");
+    // Flip one byte of the state section: the checksum no longer adds up.
+    for fan in store.path().join("ckpt").read_dir().expect("the directory") {
+        for file in fan.expect("a fan").path().read_dir().expect("files") {
+            let path = file.expect("a file").path();
+            let mut bytes = std::fs::read(&path).expect("readable");
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0x5A;
+            std::fs::write(&path, bytes).expect("writable");
+        }
     }
 
     let (_dir_b, _device_b, mut model) = loaded();
@@ -467,24 +388,21 @@ fn a_payload_describing_a_stack_this_build_does_not_have_is_unlinked() {
     let fresh = model.open_session().expect("a session opens");
     assert!(
         model
-            .kv_resume(fresh, PROMPT)
+            .kv_resume(fresh, &tokens(1, PROMPT_TOKENS))
             .expect("the resume answers")
             .is_none(),
-        "a payload shaped for another stack is a cold start"
+        "a corrupt entry is a cold start"
     );
+    drain(&mut model);
     assert_eq!(
-        store
-            .path()
-            .read_dir()
-            .expect("the directory exists")
-            .count(),
+        entries(store.path()),
         0,
         "a file this build can never read is unlinked rather than left to be refused again"
     );
 }
 
 #[test]
-fn the_shutdown_sweep_stores_every_session_it_is_given_text_for() {
+fn the_shutdown_sweep_stores_every_open_session() {
     let store = tempfile::TempDir::new().expect("a temporary directory");
     let (_dir, _device, mut model, first, _recurrent) = saver(store.path());
     let path = tokens(1, PROMPT_TOKENS);
@@ -497,33 +415,10 @@ fn the_shutdown_sweep_stores_every_session_it_is_given_text_for() {
     let third = model.open_session().expect("a third session opens");
     model.prefill_last(third, &path).expect("the prompt runs");
 
-    let mut text_of = |session| {
-        if session == first {
-            Some((path.clone(), PROMPT.to_vec()))
-        } else if session == second {
-            Some((
-                other.clone(),
-                b"<|im_start|>user\nsomething else<|im_end|>\n".to_vec(),
-            ))
-        } else {
-            // A session the caller has no rendered text for is skipped, not failed:
-            // the engine has no tokenizer and cannot invent one.
-            None
-        }
-    };
-    assert_eq!(
-        model.kv_shutdown_sweep(&mut text_of),
-        2,
-        "the two sessions with text are stored and the third is skipped"
-    );
-    assert_eq!(
-        store
-            .path()
-            .read_dir()
-            .expect("the directory exists")
-            .count(),
-        2
-    );
+    // The third stands on the first one's path: already stored, and counted.
+    assert_eq!(model.kv_shutdown_sweep(), 3);
+    drain(&mut model);
+    assert_eq!(entries(store.path()), 2);
 }
 
 #[test]
@@ -532,9 +427,8 @@ fn a_sweep_without_a_directory_writes_nothing() {
     let session = model.open_session().expect("a session opens");
     let path = tokens(1, PROMPT_TOKENS);
     model.prefill_last(session, &path).expect("the prompt runs");
-    let mut text_of = |_| Some((path.clone(), PROMPT.to_vec()));
     assert_eq!(
-        model.kv_shutdown_sweep(&mut text_of),
+        model.kv_shutdown_sweep(),
         0,
         "a stack with no checkpoint directory has nowhere to sweep to"
     );

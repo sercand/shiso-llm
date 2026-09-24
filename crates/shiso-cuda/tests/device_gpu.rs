@@ -20,7 +20,7 @@
 
 #![cfg(target_os = "linux")]
 
-use shiso_core::{Backend, GemmDType, GemmDesc, GemmOp};
+use shiso_core::{Backend, GemmDType, GemmDesc, GemmOp, GemmReduction};
 use shiso_cuda::{CudaBackend, CudaOptions};
 
 /// Opens a backend, or skips when the host has bindings but no device.
@@ -355,6 +355,7 @@ fn a_half_precision_multiply_writes_single_precision_into_the_destination() {
         alpha: 1.0,
         beta: 0.0,
         dtype: GemmDType::F16,
+        reduction: GemmReduction::Fastest,
     })
     .expect("the multiply runs");
     handle.sync().expect("the stream drains");

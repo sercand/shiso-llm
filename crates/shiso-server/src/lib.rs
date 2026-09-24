@@ -118,6 +118,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Before anything stands on a session: the tier is a property of the cache
     // the sessions draw their pages from, so it is chosen while there are none.
     let tier = open_checkpoint_tier(model.as_mut(), &args);
+    // Shared with the request threads: `/cache` reads it and a queued request prefetches.
+    let cache = tier.as_ref().and_then(|_| model.kv_cache());
 
     // A vocabulary is how generated ids become text. Its absence is a warning
     // rather than a failure: the ids still reach the caller, and a checkpoint
@@ -147,6 +149,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // is what a `--gpu-memory-utilization` pool set sessions aside for, and the
     // two must not be able to disagree.
     scheduler.max_num_seqs = args.max_num_seqs;
+    scheduler.store.pump_bytes = args.kvstore_pump_mb.saturating_mul(1024 * 1024);
+    scheduler.store.drain_timeout = std::time::Duration::from_secs(args.kvstore_drain_secs);
     // Validated at boot, so the widths are known to be servable here.
     let widths = args.prefill_widths()?;
     scheduler.solo_chunk = widths.solo_chunk;
@@ -185,6 +189,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if let Some(tier) = tier {
         state = state.with_checkpoint_tier(tier);
     }
+    state.kv = cache;
     if let Some(vocabulary) = vocabulary {
         if let Some(renderer) = build_renderer(
             &args,
@@ -318,18 +323,25 @@ fn open_checkpoint_tier(
     let dir = args.kvstore_dir.as_ref()?;
     let mut options = shiso_engine::ckpt::CkptOptions::new();
     options.budget_mb = args.kvstore_budget_mb;
+    options.min_tokens = args.kvstore_min_tokens;
+    options.staging_mb = args.kvstore_staging_mb;
     let config = shiso_engine::ckpt::CkptConfig::new(dir.clone()).with_options(options);
     match model.kv_enable(&config) {
         Ok(()) => {
+            let budget_bytes = model
+                .kv_cache()
+                .and_then(|cache| cache.disk_stats())
+                .map_or(0, |stats| stats.budget_bytes);
             tracing::info!(
                 dir = %dir.display(),
-                budget_mb = args.kvstore_budget_mb,
+                budget_bytes,
                 min_tokens = options.min_tokens,
+                staging_mb = options.staging_mb,
                 "the checkpoint tier is open"
             );
             Some(state::CheckpointTier {
                 dir: dir.clone(),
-                budget_bytes: args.kvstore_budget_mb.saturating_mul(1024 * 1024),
+                budget_bytes,
                 min_tokens: options.min_tokens,
             })
         }
