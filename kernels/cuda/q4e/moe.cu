@@ -111,6 +111,8 @@ q4e_moe_route_sort_small_kernel(
     __shared__ int32_t s_ids[Q4E_ROUTE_SORT_ROWS];
     __shared__ int32_t s_bounds[Q4E_ROUTE_SORT_EXPERTS + 1u];
     __shared__ int32_t s_counts[Q4E_ROUTE_SORT_EXPERTS];
+    __shared__ float s_cw[Q4E_ROUTE_SORT_TOKENS][16];
+    __shared__ int32_t s_ci[Q4E_ROUTE_SORT_TOKENS][16];
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
     constexpr uint32_t PER = Q4E_ROUTE_SORT_EXPERTS / 32u;
 
@@ -148,8 +150,10 @@ q4e_moe_route_sort_small_kernel(
         warp_total = warp_sum_f32(warp_total);
         const float inv_sum = 1.0f / __shfl_sync(0xffffffffu, warp_total, 0);
 
-        float chosen_w[16];
-        int32_t chosen_i[16];
+        /* In shared memory rather than registers: at 1024 threads a thread
+         * has 64 registers, and the logits already take sixteen of them. */
+        float *chosen_w = s_cw[warp];
+        int32_t *chosen_i = s_ci[warp];
 #pragma unroll
         for (uint32_t s = 0; s < 16u; s++) {
             if (s >= n_used) break;
@@ -167,8 +171,10 @@ q4e_moe_route_sort_small_kernel(
             }
             const float top = __shfl_sync(0xffffffffu, best, 0);
             const int32_t top_i = __shfl_sync(0xffffffffu, best_i, 0);
-            chosen_w[s] = top;
-            chosen_i[s] = top_i;
+            if (lane == 0u) {
+                chosen_w[s] = top;
+                chosen_i[s] = top_i;
+            }
             if (top_i >= 0 && (uint32_t)top_i % 32u == lane) {
 #pragma unroll
                 for (uint32_t j = 0; j < PER; j++)
