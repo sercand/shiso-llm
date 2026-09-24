@@ -554,7 +554,7 @@ impl SparseStack {
             staging.path.clear();
             staging.path.extend_from_slice(live.history());
             staging.path.extend_from_slice(tokens);
-            issued.push(gather.issue(tier.table().stream(), &staging.path)?);
+            issued.push(gather.fetch(tier.table().stream(), &staging.path)?);
         }
         Ok(issued)
     }

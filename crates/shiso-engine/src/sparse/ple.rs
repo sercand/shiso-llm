@@ -40,7 +40,7 @@ use shiso_core::ids::TokenId;
 use shiso_ple::{PleParams, PleRowType, PleStream, codec};
 
 pub use crate::ple_rows::PleRows;
-use crate::ple_rows::issue_rows;
+use crate::ple_rows::{fetch_rows, issue_rows};
 use crate::sparse::bind::{Args, LayerRef, NgramViews, Operand, Role, WeightRef};
 use crate::sparse::hyper;
 use crate::sparse::kernels::{self, Entry, MOD_MISC, MOD_PLE};
@@ -455,6 +455,16 @@ impl PleGather {
     pub fn issue(self, table: &Arc<PleStream>, tokens: &[TokenId]) -> CoreResult<PleRows> {
         let ids = self.row_ids(table, tokens)?;
         issue_rows(table, ids)
+    }
+
+    /// The same rows read on the caller's thread; see [`fetch_rows`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`PleGather::row_ids`] reports.
+    pub fn fetch(self, table: &PleStream, tokens: &[TokenId]) -> CoreResult<PleRows> {
+        let ids = self.row_ids(table, tokens)?;
+        Ok(fetch_rows(table, &ids))
     }
 }
 
