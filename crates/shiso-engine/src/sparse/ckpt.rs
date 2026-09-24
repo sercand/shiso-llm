@@ -152,9 +152,16 @@ impl SparseStack {
             });
         }
         let layout = path_layout(&self.shape, self.opts.engine.ctx, self.opts.spec, identity);
+        // The planes the pool was allocated with, which include a draft head's
+        // own four when one is resident: a geometry that left them out handed
+        // the spill a page buffer one draft layer short of the page, and every
+        // store from a build with a head failed on its first page.
+        let planes = PagePlanes {
+            indexer: true,
+            draft: self.has_draft_head(),
+        };
         let geometry =
-            paged::cache_geometry(&self.shape, PagePlanes::indexer_only(), self.opts.spec)
-                .with_layout(layout);
+            paged::cache_geometry(&self.shape, planes, self.opts.spec).with_layout(layout);
         let mut spill = SpillConfig::new(config.dir.clone(), config.options.budget_mb);
         spill.reject_different_quant = config.options.reject_different_quant;
         let (pool_pages, ckpt_slots) = (
@@ -257,14 +264,22 @@ impl SparseStack {
         // that has not staged one is not checkpointed at all rather than
         // checkpointed with zeros that a later run would draft from.
         let staged = live.spec_depth().is_speculative() == live.pending_draft().is_some();
+        // A prompt's end is admitted without asking the cache where this path
+        // branches from the tree. The cache answers with the earliest stop, and
+        // every rendered prompt shares at least its template's opening with one
+        // before it, so the branch lay behind every prompt's end but the first
+        // one a process read - and a stack that stops chunks only at their
+        // width then admitted no prompt end but an exact repeat's. A stride
+        // position still has to be the cache's own stop.
         let admit = (earned || periodic)
             && staged
-            && resident.cache.next_admission(
-                live.pages.frontier(),
-                &live.history,
-                &[],
-                MAX_PREFILL_CHUNK,
-            ) == Some(q);
+            && (earned
+                || resident.cache.next_admission(
+                    live.pages.frontier(),
+                    &live.history,
+                    &[],
+                    MAX_PREFILL_CHUNK,
+                ) == Some(q));
         if admit {
             snapshot(backend.as_ref(), live, blob_bytes, &mut staging.ckpt)?;
             if let Some(row) = frontier_row {

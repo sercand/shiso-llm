@@ -221,6 +221,42 @@ fn a_resume_restores_the_staged_draft_row_and_not_only_the_recurrent_stack() {
 }
 
 #[test]
+fn a_prompt_that_shares_an_opening_with_an_earlier_one_is_still_stored() {
+    // Every rendered prompt shares at least its template's opening with the
+    // prompts before it, so the cache's branch point lies behind its end. The
+    // end of a prompt is admitted anyway: it is what the same prompt, or the
+    // next turn of its conversation, resumes from. Gated on the branch point, a
+    // process stored the first prompt it read and then only exact repeats.
+    let dir = tempfile::TempDir::new().expect("a cache directory");
+    let (_weights, _backend, mut model) = fixture::loaded_with(fixture::options());
+    model
+        .kv_enable(&config(dir.path()))
+        .expect("the tier opens over a fresh directory");
+    let first = model.open_session().expect("a session opens");
+    model
+        .prefill_last(first, &path_of(PROMPT))
+        .expect("the first prompt prefills");
+    let second = model.open_session().expect("a second session opens");
+    let mut tokens = path_of(PROMPT / 2);
+    tokens.extend((0..PROMPT / 2).map(|i| TokenId::new(PROMPT - 1 - i)));
+    model
+        .prefill_last(second, &tokens)
+        .expect("the second prompt prefills");
+    let outcome = model
+        .kv_save(
+            second,
+            &tokens,
+            b"a prompt that opens like the first",
+            shiso_engine::Reason::Cold,
+        )
+        .expect("the store answered");
+    assert!(
+        outcome.stored().is_some(),
+        "the second prompt was not stored: {outcome:?}"
+    );
+}
+
+#[test]
 fn a_build_that_speculates_will_not_read_a_file_written_by_one_that_does_not() {
     // The two blobs are different lengths, because the draft row is in one and
     // not the other. Reading either as the other would shift every section after
