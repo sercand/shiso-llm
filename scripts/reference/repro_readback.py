@@ -581,8 +581,12 @@ def run_once(args, index: int) -> RunResult:
                 encoding="utf-8",
             )
 
-        # Echo the assistant turn back without provider-specific reasoning keys.
+        # Echo the reasoning trace back too: this family's template replays it
+        # inside <think>, so dropping it makes the next prompt diverge from the
+        # generated tokens and the server can reuse only the previous prompt.
         assistant_msg = {"role": "assistant", "content": content}
+        if reasoning:
+            assistant_msg["reasoning_content"] = reasoning
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
