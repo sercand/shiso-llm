@@ -220,6 +220,10 @@ pub(crate) struct SeqSlot {
     /// on a tick this sequence may not be alone on. `None` is a text-only
     /// request and takes the launches it took before any of this existed.
     media: Option<EncodedMedia>,
+    /// Whether it runs only when no standard sequence has work.
+    flex: bool,
+    /// When the planner last started leaving it out, while it still is.
+    paused_since: Option<Instant>,
 }
 
 /// Everything a slot needs that is not derived from the request.
@@ -248,6 +252,8 @@ impl SeqSlot {
         parser: Box<dyn shiso_parsers::StreamParser>,
     ) -> Self {
         Self {
+            flex: request.is_flex(),
+            paused_since: None,
             media,
             parser,
             blocks: BlockCursor::default(),
@@ -291,6 +297,33 @@ impl SeqSlot {
             },
             prompt_at: self.cursor,
             indivisible_prompt: self.media.is_some(),
+            flex: self.flex,
+        }
+    }
+
+    /// Whether this is a flex sequence.
+    pub(crate) const fn is_flex(&self) -> bool {
+        self.flex
+    }
+
+    /// Records whether this tick left this sequence out for standard work, and
+    /// logs the moment that changes: how long a flex sequence waited is the one
+    /// number an operator needs to tell "paused" from "stuck".
+    pub(crate) fn mark_paused(&mut self, paused: bool, now: Instant) {
+        match (paused, self.paused_since) {
+            (true, None) => {
+                tracing::debug!(slot = self.id, "a flex sequence paused for standard work");
+                self.paused_since = Some(now);
+            }
+            (false, Some(since)) => {
+                tracing::debug!(
+                    slot = self.id,
+                    paused_ms = now.saturating_duration_since(since).as_millis(),
+                    "a flex sequence resumed"
+                );
+                self.paused_since = None;
+            }
+            _ => {}
         }
     }
 

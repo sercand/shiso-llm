@@ -15,11 +15,12 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse as _, Response};
 use axum::{Json, body::Bytes};
 
 use crate::api::pipeline::{self, PromptField};
-use crate::api::{blocking, sse};
+use crate::api::{blocking, service_tier, sse};
 use crate::error::AppError;
 use crate::openai::responses_encode::{ResponseOptions, encode_response};
 use crate::openai::responses_sse::ResponsesEventEncoder;
@@ -29,22 +30,27 @@ use crate::response_store::{StoredEntry, StoredKind};
 use crate::state::AppState;
 
 /// `POST /v1/responses`.
-pub async fn responses_endpoint(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    match answer(&state, &body).await {
+pub async fn responses_endpoint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match answer(&state, &headers, &body).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
 }
 
 /// The handler, with its failures still typed.
-async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
-    let parsed: ResponsesBody = serde_json::from_slice(body).map_err(|error| {
+async fn answer(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<Response, AppError> {
+    let mut parsed: ResponsesBody = serde_json::from_slice(body).map_err(|error| {
         AppError::bad_request(
             format!("the request body is not a response request: {error}"),
             None,
             "invalid_request",
         )
     })?;
+    parsed.service_tier = service_tier::resolve(parsed.service_tier, headers)?;
     parsed.validate()?;
 
     let prior = resolve_prior(state, parsed.previous_response_id.as_deref())?;

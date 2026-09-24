@@ -76,6 +76,12 @@ pub struct Request {
     pub timeout_secs: Option<f32>,
     /// Report the sampled token ids alongside the text.
     pub return_token_ids: bool,
+    /// Which class of service the caller asked for.
+    ///
+    /// Here rather than left on the wire body because the scheduler reads it:
+    /// it decides whether this request's rows run at all while other work is
+    /// resident, which is as much a part of generating it as its budget.
+    pub service_class: ServiceClass,
 }
 
 impl Request {
@@ -107,6 +113,7 @@ impl Request {
             seed: None,
             timeout_secs: None,
             return_token_ids: false,
+            service_class: ServiceClass::Standard,
         }
     }
 
@@ -167,6 +174,24 @@ pub enum ResponseFormat {
         /// Whether the decoder must refuse anything the schema does not allow.
         strict: bool,
     },
+}
+
+/// How the scheduler treats a request while other work is resident.
+///
+/// Two classes and no numeric priority. What a flex caller buys is the whole
+/// rule - its rows run only when no standard request has work - and a priority
+/// number would invite a ladder of classes whose interleaving nobody asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ServiceClass {
+    /// Served as it arrives, sharing the device with every other standard
+    /// request.
+    #[default]
+    Standard,
+    /// Served only when no standard request has work: admitted when the
+    /// standard traffic has drained, and paused, with its state kept, whenever
+    /// a standard request arrives. It waits rather than being refused.
+    Flex,
 }
 
 /// What the caller said about thinking.

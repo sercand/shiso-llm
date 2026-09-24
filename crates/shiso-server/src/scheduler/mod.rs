@@ -38,6 +38,22 @@
 //! bound - and therefore the point at which a caller is told the server is
 //! overloaded - could be enforced twice or not at all.
 //!
+//! # Flex requests wait for standard work to drain
+//!
+//! A flex request is served only while no standard request has work. One that
+//! arrives while standard work is resident is *held*: it gets its stream at
+//! once, so a streaming caller sees its headers and the keepalives that follow,
+//! but no session, until the standard work has drained. Held requests are
+//! admitted oldest first, and a standard request that comes off the queue
+//! behind one is admitted straight past it. One that is already resident is
+//! paused by the planner (see `batching.rs`) rather than evicted, and resumes
+//! where it stood.
+//!
+//! Flex sequences never take the last slot while there is more than one: a
+//! standard request arriving at a table full of flex answers would otherwise
+//! wait for one of them to finish, which is the one thing a standard caller
+//! was promised it would not do.
+//!
 //! # Who closes a session
 //!
 //! This thread, and nothing else. A session is opened at admission and closed
@@ -55,6 +71,7 @@ pub mod queue;
 mod stats;
 pub mod stop;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -168,6 +185,17 @@ struct BatchRow {
     step: DecodeStep,
 }
 
+/// A flex request that has its stream and is waiting for a session.
+///
+/// The reply has already been answered, so what is held is the request and the
+/// end of the stream its events will go down. A sink the caller has dropped is
+/// a request nobody is waiting for any more, and it is let go without ever
+/// opening a session.
+struct HeldFlex {
+    request: GenerateRequest,
+    sink: mpsc::Sender<StreamEvent>,
+}
+
 /// Everything the engine thread owns.
 struct Coordinator {
     backend: Arc<dyn Backend>,
@@ -206,6 +234,13 @@ struct Coordinator {
     decode_steps: u64,
     /// Whether the queue has closed and the loop is draining.
     closing: bool,
+    /// Flex requests waiting for standard work to drain, oldest first.
+    ///
+    /// Unbounded, by decision: a flex caller asked to wait rather than to be
+    /// refused, and each entry is a prompt behind an `Arc` and a channel. The
+    /// bound on how much can be *queued* is still the channel's; this is only
+    /// what has come off it.
+    held_flex: VecDeque<HeldFlex>,
 }
 
 /// Starts the engine thread over a loaded model.
@@ -352,6 +387,7 @@ fn start(
         next_id: 1,
         decode_steps: 0,
         closing: false,
+        held_flex: VecDeque::new(),
     };
     let join = std::thread::Builder::new()
         .name("shiso-engine".to_owned())
@@ -374,6 +410,12 @@ impl Coordinator {
 
         loop {
             self.admit_waiting(&mut rx);
+            // After the queue, so a standard request that was queued behind a
+            // held flex one is resident before the flex one is considered. An
+            // empty table always takes a held request, so a table still empty
+            // here has nothing held either and the blocking read below cannot
+            // strand one.
+            self.admit_held_flex();
             if self.slots.is_empty() {
                 if self.closing {
                     break;
@@ -395,7 +437,7 @@ impl Coordinator {
                 }
                 continue;
             }
-            self.stats.set_pending(rx.len());
+            self.stats.set_pending(rx.len() + self.held_flex.len());
             self.stats.set_active(self.slots.len());
             self.tick();
         }
@@ -424,9 +466,68 @@ impl Coordinator {
         }
     }
 
-    /// Gives one request a stream, a session and a slot.
+    /// Gives one request a stream, and then a session and a slot - or, for a
+    /// flex request that cannot run yet, a place in the held queue.
     fn admit(&mut self, request: EngineRequest) {
         let EngineRequest::Generate { request, reply } = request;
+        let Some(sink) = Self::reply_stream(&request, reply) else {
+            return;
+        };
+        if request.is_flex() && !(self.held_flex.is_empty() && self.flex_fits()) {
+            tracing::debug!(
+                held = self.held_flex.len() + 1,
+                "a flex request is held until standard work drains"
+            );
+            self.held_flex.push_back(HeldFlex { request, sink });
+            return;
+        }
+        self.open(request, sink);
+    }
+
+    /// Whether a flex request could take a slot now: there is room, no
+    /// standard sequence is resident, and flex sequences would still leave one
+    /// slot free.
+    fn flex_fits(&self) -> bool {
+        let resident = self.slots.slots();
+        let standard = resident
+            .iter()
+            .any(|slot| !slot.is_flex() && !slot.is_done());
+        let flex = resident.iter().filter(|slot| slot.is_flex()).count();
+        let cap = self.cfg.max_num_seqs.saturating_sub(1).max(1);
+        self.slots.has_room() && !standard && flex < cap
+    }
+
+    /// Admits held flex requests, oldest first, for as long as one fits.
+    ///
+    /// A held request whose caller has gone is dropped first, wherever it is in
+    /// the queue, so it neither opens a session nor holds up the ones behind it.
+    fn admit_held_flex(&mut self) {
+        self.held_flex.retain(|held| {
+            let waiting = !held.sink.is_closed();
+            if !waiting {
+                tracing::debug!("a held flex request was abandoned before it started");
+            }
+            waiting
+        });
+        while !self.held_flex.is_empty() && self.flex_fits() {
+            let Some(held) = self.held_flex.pop_front() else {
+                break;
+            };
+            tracing::debug!(
+                still_held = self.held_flex.len(),
+                "a held flex request is admitted"
+            );
+            self.open(held.request, held.sink);
+        }
+    }
+
+    /// Answers a request's reply with its stream, and returns the end its
+    /// events go down - or `None` when there is nothing to serve: an empty
+    /// prompt, which is told so on its stream, or a caller already gone.
+    fn reply_stream(
+        request: &GenerateRequest,
+        reply: tokio::sync::oneshot::Sender<Result<EventStream, crate::error::AppError>>,
+    ) -> Option<mpsc::Sender<StreamEvent>> {
         let (sink, events) = mpsc::channel(EVENT_QUEUE);
         let stream: EventStream = Box::pin(ReceiverStream::new(events));
 
@@ -443,15 +544,20 @@ impl Coordinator {
                     },
                 );
             }
-            return;
+            return None;
         }
         if reply.send(Ok(stream)).is_err() {
             // The caller gave up between queueing and admission. Nothing has
             // been generated and no session has been opened, so there is
             // nothing to unwind.
             tracing::debug!("a queued request was abandoned before it started");
-            return;
+            return None;
         }
+        Some(sink)
+    }
+
+    /// Gives a request whose stream is answered a session and a slot.
+    fn open(&mut self, request: GenerateRequest, sink: mpsc::Sender<StreamEvent>) {
         // The tower runs before a session is opened, because everything it can
         // refuse is cheaper to refuse with nothing standing on it. A request
         // whose pictures cannot be encoded is FAILED rather than served from its
@@ -718,6 +824,11 @@ impl Coordinator {
         let now = self.cfg.clock.now();
         cancel::enforce_deadlines(&self.stats, self.slots.slots_mut(), now);
         let plan = batching::plan(&self.slots.facts(), &self.cfg);
+        for (at, slot) in self.slots.slots_mut().iter_mut().enumerate() {
+            if slot.is_flex() {
+                slot.mark_paused(plan.paused.contains(&at), now);
+            }
+        }
         if plan.is_idle() {
             // Something is resident and none of it is decoding or reading
             // prompt. By construction that cannot happen - a sequence leaves
@@ -1299,6 +1410,17 @@ impl Coordinator {
     /// The tail: terminal events for anything still live, the sweep, then the
     /// sessions.
     fn shutdown(&mut self) {
+        // Nothing is held by the time the loop ends - an empty table takes the
+        // next held request - so this is the safety net, not the path: a held
+        // caller is told why its stream ended rather than seeing it close.
+        for held in self.held_flex.drain(..) {
+            send_event(
+                &held.sink,
+                StreamEvent::Failed {
+                    message: "the server shut down before this flex request ran".to_owned(),
+                },
+            );
+        }
         let mut live = self.slots.drain();
         if !live.is_empty() {
             tracing::info!(

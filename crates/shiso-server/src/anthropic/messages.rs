@@ -24,11 +24,19 @@
 //! credential header this format uses, `x-api-key`, *is* read - by the auth
 //! gate, beside the bearer header, because a client with a key configured would
 //! otherwise be refused before this handler ran.
+//!
+//! # The service class is read from the header only
+//!
+//! This format's body has a `service_tier` of its own, and it means something
+//! else - whether a request may fall back to a different capacity pool - so it
+//! is left unread. `X-Service-Tier: flex` asks for the flex class here as on
+//! every other surface.
 
 use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse as _, Response};
 
 use crate::anthropic::messages_encode::{EncodeOptions, encode_response};
@@ -36,13 +44,17 @@ use crate::anthropic::messages_sse::MessagesEventEncoder;
 use crate::anthropic::messages_to_ir::to_ir;
 use crate::anthropic::messages_wire::MessagesBody;
 use crate::api::pipeline::{self, PromptField};
-use crate::api::{blocking, sse};
+use crate::api::{blocking, service_tier, sse};
 use crate::error::{ApiSurface, AppError};
 use crate::state::AppState;
 
 /// `POST /v1/messages`.
-pub async fn messages(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    match answer(&state, &body).await {
+pub async fn messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match answer(&state, &headers, &body).await {
         Ok(response) => response,
         // Every failure on this route is rendered in this format's error shape,
         // whichever layer raised it: a client of this family parses one body
@@ -53,7 +65,7 @@ pub async fn messages(State(state): State<Arc<AppState>>, body: Bytes) -> Respon
 }
 
 /// The handler, with its failures still typed.
-async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
+async fn answer(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<Response, AppError> {
     let parsed: MessagesBody = serde_json::from_slice(body).map_err(|error| {
         AppError::bad_request(
             format!("the request body is not a message request: {error}"),
@@ -69,7 +81,10 @@ async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
         model: state.model_id.clone(),
     };
 
-    let request = to_ir(&parsed, &state.model_id)?;
+    let mut request = to_ir(&parsed, &state.model_id)?;
+    if let Some(tier) = service_tier::header_tier(headers)? {
+        request.service_class = tier.class();
+    }
     let started = pipeline::start(state, &request, PromptField::Messages).await?;
     if streaming {
         return Ok(sse::encode(

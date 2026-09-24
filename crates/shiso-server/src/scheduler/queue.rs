@@ -32,12 +32,17 @@
 //! [`super::SchedulerConfig::queue_admission`] and what comes back after it is
 //! a refusal that says the server is overloaded - a status a client library
 //! already knows how to back off from.
+//!
+//! A flex request is the exception. What its caller bought is capacity nobody
+//! else is using, at whatever latency that costs, so it waits for room in the
+//! queue for as long as it takes and is never told the server is overloaded.
+//! Its caller still cancels by going away, which drops the wait.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use shiso_core::{SamplingParams, Seed, TokenId};
-use shiso_ir::EventStream;
+use shiso_ir::{EventStream, ServiceClass};
 use shiso_vision::VisionItem;
 use tokio::sync::{mpsc, oneshot};
 
@@ -133,6 +138,9 @@ pub struct GenerateRequest {
     /// from the text, and a `path` of `123` or file content that parses as JSON
     /// reaches the tool as something it never declared.
     pub string_params: Arc<shiso_parsers::StringParams>,
+    /// Whether this generation runs beside standard work or only in its
+    /// absence. See [`ServiceClass::Flex`] for what the scheduler does with it.
+    pub service_class: ServiceClass,
 }
 
 impl GenerateRequest {
@@ -153,6 +161,7 @@ impl GenerateRequest {
             stop: Arc::from(Vec::new()),
             media: Arc::from(Vec::new()),
             string_params: Arc::default(),
+            service_class: ServiceClass::Standard,
         }
     }
 
@@ -183,6 +192,19 @@ impl GenerateRequest {
     pub fn with_string_params(mut self, strings: Arc<shiso_parsers::StringParams>) -> Self {
         self.string_params = strings;
         self
+    }
+
+    /// The same generation, served in `class`.
+    #[must_use]
+    pub const fn with_service_class(mut self, class: ServiceClass) -> Self {
+        self.service_class = class;
+        self
+    }
+
+    /// Whether this generation is served only when no standard one has work.
+    #[must_use]
+    pub const fn is_flex(&self) -> bool {
+        matches!(self.service_class, ServiceClass::Flex)
     }
 }
 
@@ -262,15 +284,22 @@ impl EngineHandle {
     ///
     /// [`AppError::Overloaded`] when the queue stayed full for the whole
     /// admission window - the server has more work than it can hold, and a
-    /// client that backs off and retries will be served. [`AppError::Internal`]
+    /// client that backs off and retries will be served. Never for a flex
+    /// request, which waits for room instead. [`AppError::Internal`]
     /// when the engine thread is gone - a closed channel or a dropped reply -
     /// because a request that cannot reach the model at all is a server failure
     /// and not something a retry will fix.
     pub async fn generate(&self, request: GenerateRequest) -> Result<EventStream, AppError> {
         self.stats.request_queued();
         let (reply, answer) = oneshot::channel();
+        let flex = request.is_flex();
         let send = self.tx.send(EngineRequest::Generate { request, reply });
-        match tokio::time::timeout(self.admission, send).await {
+        let delivered = if flex {
+            Ok(send.await)
+        } else {
+            tokio::time::timeout(self.admission, send).await
+        };
+        match delivered {
             Ok(Ok(())) => {}
             // The channel closed under us. Nothing was generated, and nothing
             // will be: the thread that would have answered is gone.

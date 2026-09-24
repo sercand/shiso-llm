@@ -21,13 +21,17 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse as _, Response};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use shiso_core::TokenId;
-use shiso_ir::{BlockDelta, Request, Sampling, StopReason, StreamEvent, ThinkingDirective, Usage};
+use shiso_ir::{
+    BlockDelta, Request, Sampling, ServiceClass, StopReason, StreamEvent, ThinkingDirective, Usage,
+};
 
 use crate::api::pipeline::{self, PromptField};
+use crate::api::service_tier::{self, ServiceTier};
 use crate::api::sse::{Frame, FrameEncoder};
 use crate::api::{blocking, sse};
 use crate::error::AppError;
@@ -98,6 +102,10 @@ pub struct CompletionBody {
     /// Report the sampled ids beside the text.
     #[serde(default)]
     pub return_token_ids: Option<bool>,
+    /// The service class asked for. Read and never echoed: the legacy
+    /// completion object has no field to echo it in.
+    #[serde(default)]
+    pub service_tier: Option<ServiceTier>,
 }
 
 impl CompletionBody {
@@ -238,22 +246,27 @@ fn from_ids(
 }
 
 /// `POST /v1/completions`.
-pub async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    match answer(&state, &body).await {
+pub async fn completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match answer(&state, &headers, &body).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
 }
 
 /// The handler, with its failures still typed.
-async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
-    let parsed: CompletionBody = serde_json::from_slice(body).map_err(|error| {
+async fn answer(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<Response, AppError> {
+    let mut parsed: CompletionBody = serde_json::from_slice(body).map_err(|error| {
         AppError::bad_request(
             format!("the request body is not a completion: {error}"),
             None,
             "invalid_request",
         )
     })?;
+    parsed.service_tier = service_tier::resolve(parsed.service_tier, headers)?;
     parsed.validate()?;
 
     let renderer = state.renderer.as_ref().ok_or(AppError::NotReady {
@@ -321,6 +334,9 @@ fn to_ir(body: &CompletionBody, model_id: &str) -> Request {
     request.thinking = ThinkingDirective::Off;
     request.seed = body.seed;
     request.return_token_ids = body.return_token_ids.unwrap_or(false);
+    request.service_class = body
+        .service_tier
+        .map_or(ServiceClass::Standard, ServiceTier::class);
     request
 }
 
@@ -489,6 +505,17 @@ mod tests {
 
     fn body(json: Value) -> CompletionBody {
         serde_json::from_value(json).expect("the body parses")
+    }
+
+    #[test]
+    fn a_flex_tier_asks_the_scheduler_for_the_flex_class() {
+        let flex = super::to_ir(
+            &body(serde_json::json!({"prompt": "w1", "service_tier": "flex"})),
+            "a-model",
+        );
+        assert_eq!(flex.service_class, shiso_ir::ServiceClass::Flex);
+        let silent = super::to_ir(&body(serde_json::json!({"prompt": "w1"})), "a-model");
+        assert_eq!(silent.service_class, shiso_ir::ServiceClass::Standard);
     }
 
     fn options() -> Options {

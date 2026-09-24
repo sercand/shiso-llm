@@ -303,6 +303,7 @@ async fn queue(
         .with_text(text)
         .with_stop(Arc::from(request.stop.clone()))
         .with_media(Arc::from(media))
+        .with_service_class(request.service_class)
         .with_string_params(Arc::new(shiso_parsers::StringParams::from_schemas(
             request
                 .tools

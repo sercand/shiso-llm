@@ -24,17 +24,14 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse as _, Response};
 
 use crate::api::pipeline::{self, PromptField};
-use crate::api::{blocking, sse};
+use crate::api::{blocking, service_tier, sse};
 use crate::error::AppError;
 use crate::openai::chat_encode::{EncodeOptions, encode_response};
 use crate::openai::chat_sse::ChatChunkEncoder;
 use crate::openai::chat_to_ir::to_ir;
-use crate::openai::chat_wire::{ChatBody, ServiceTier};
+use crate::openai::chat_wire::ChatBody;
 use crate::response_store::{StoredEntry, StoredKind};
 use crate::state::AppState;
-
-/// The header a caller may name a service class in.
-const SERVICE_TIER_HEADER: &str = "x-service-tier";
 
 /// `POST /v1/chat/completions`.
 pub async fn chat_completions(
@@ -57,12 +54,7 @@ async fn answer(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<R
             "invalid_request",
         )
     })?;
-    // The header is a fallback for the body field, not an override: a caller
-    // that named a class in the body meant that one, and a gateway that adds a
-    // header must not silently change it.
-    if parsed.service_tier.is_none() {
-        parsed.service_tier = header_tier(headers)?;
-    }
+    parsed.service_tier = service_tier::resolve(parsed.service_tier, headers)?;
     parsed.validate()?;
 
     let streaming = parsed.stream.unwrap_or(false);
@@ -142,59 +134,4 @@ fn store_hook(
             body,
         });
     })
-}
-
-/// The service class a header named, when it named one this server knows.
-///
-/// `Ok(None)` means the header was absent, which is not a refusal: the request
-/// simply did not ask for a tier and takes the server's default.
-fn header_tier(headers: &HeaderMap) -> Result<Option<ServiceTier>, AppError> {
-    let Some(raw) = headers.get(SERVICE_TIER_HEADER) else {
-        return Ok(None);
-    };
-    let value = raw.to_str().map_err(|_not_text| {
-        AppError::bad_request(
-            "the X-Service-Tier header is not text",
-            Some("service_tier"),
-            "invalid_request",
-        )
-    })?;
-    ServiceTier::parse(value).map(Some).ok_or_else(|| {
-        AppError::bad_request(
-            format!(
-                "the X-Service-Tier header must be \"auto\", \"default\" or \
-                 \"flex\", not {value:?}"
-            ),
-            Some("service_tier"),
-            "invalid_request",
-        )
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::header_tier;
-    use crate::openai::chat_wire::ServiceTier;
-    use axum::http::HeaderMap;
-
-    fn headers(value: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-service-tier", value.parse().expect("a header value"));
-        headers
-    }
-
-    #[test]
-    fn a_header_names_a_service_class_case_insensitively() {
-        assert_eq!(
-            header_tier(&headers("Flex")).expect("a known class"),
-            Some(ServiceTier::Flex)
-        );
-        assert_eq!(header_tier(&HeaderMap::new()).expect("no header"), None);
-    }
-
-    #[test]
-    fn a_header_naming_a_class_this_server_does_not_have_is_refused() {
-        let error = header_tier(&headers("premium")).expect_err("an unknown class");
-        assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
-    }
 }

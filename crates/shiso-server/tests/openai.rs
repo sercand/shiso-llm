@@ -901,3 +901,79 @@ async fn a_streamed_response_can_be_continued_by_name() {
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["previous_response_id"], json!(id));
 }
+
+// --- service tier ---------------------------------------------------------
+
+/// The same POST with an `X-Service-Tier` header.
+fn post_tier(path: &str, body: &Value, tier: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("x-service-tier", tier)
+        .body(Body::from(body.to_string()))
+        .expect("a POST request builds")
+}
+
+/// Every `OpenAI` surface reads the header, and a flex request on an otherwise
+/// idle server is simply served.
+#[tokio::test]
+async fn every_openai_surface_serves_a_flex_request_named_by_the_header() {
+    let state = state(vec![10, 11]);
+    let (status, body) = call(
+        &state,
+        post_tier(
+            "/v1/responses",
+            &greedy(json!({"input": "w1 w2", "max_output_tokens": 4})),
+            "flex",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["service_tier"], "flex",
+        "the header is echoed as the tier the body did not name"
+    );
+
+    let (status, body) = call(
+        &state,
+        post_tier(
+            "/v1/completions",
+            &greedy(json!({"prompt": "w1 w2"})),
+            "flex",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call(
+        &state,
+        post_tier(
+            "/v1/chat/completions",
+            &greedy(json!({"messages": [{"role": "user", "content": "w1"}]})),
+            "flex",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["service_tier"], "flex");
+}
+
+/// A tier this server does not have is refused on every surface, before
+/// anything is queued.
+#[tokio::test]
+async fn an_unknown_tier_in_the_header_is_refused_on_every_openai_surface() {
+    let state = state(vec![10]);
+    for (path, body) in [
+        ("/v1/responses", json!({"input": "w1"})),
+        ("/v1/completions", json!({"prompt": "w1"})),
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "w1"}]}),
+        ),
+    ] {
+        let (status, answer) = call(&state, post_tier(path, &body, "premium")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {answer}");
+        assert_eq!(answer["error"]["param"], "service_tier", "{path}: {answer}");
+    }
+}

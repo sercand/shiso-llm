@@ -29,10 +29,11 @@
 
 use serde_json::Value;
 use shiso_ir::{
-    Block, Effort, MediaSource, Message, Request, Role, Sampling, ThinkingDirective, ToolChoice,
-    ToolDefinition, ToolResult, ToolUse,
+    Block, Effort, MediaSource, Message, Request, Role, Sampling, ServiceClass, ThinkingDirective,
+    ToolChoice, ToolDefinition, ToolResult, ToolUse,
 };
 
+use crate::api::service_tier::ServiceTier;
 use crate::error::AppError;
 use crate::openai::chat_wire::{
     ChatBody, Content, MediaRef, Part, WireMessage, WireRole, WireToolChoice,
@@ -115,6 +116,9 @@ pub fn to_ir(body: &ChatBody, model_id: &str) -> Result<Request, AppError> {
         .then(|| body.top_logprobs.unwrap_or(0));
     request.seed = body.seed;
     request.return_token_ids = body.return_token_ids.unwrap_or(false);
+    request.service_class = body
+        .service_tier
+        .map_or(ServiceClass::Standard, ServiceTier::class);
     Ok(request)
 }
 
@@ -353,6 +357,17 @@ mod tests {
     fn ir(json: serde_json::Value) -> shiso_ir::Request {
         let body: ChatBody = serde_json::from_value(json).expect("the body parses");
         to_ir(&body, "a-model").expect("the body converts")
+    }
+
+    #[test]
+    fn a_flex_tier_asks_the_scheduler_for_the_flex_class() {
+        let messages = serde_json::json!([{"role": "user", "content": "hi"}]);
+        let flex = ir(serde_json::json!({"messages": messages, "service_tier": "flex"}));
+        assert_eq!(flex.service_class, shiso_ir::ServiceClass::Flex);
+        let named = ir(serde_json::json!({"messages": messages, "service_tier": "default"}));
+        assert_eq!(named.service_class, shiso_ir::ServiceClass::Standard);
+        let silent = ir(serde_json::json!({"messages": messages}));
+        assert_eq!(silent.service_class, shiso_ir::ServiceClass::Standard);
     }
 
     #[test]

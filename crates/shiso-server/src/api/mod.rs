@@ -10,4 +10,5 @@ pub mod blocking;
 pub mod inference_types;
 pub mod misc_handlers;
 pub mod pipeline;
+pub mod service_tier;
 pub mod sse;

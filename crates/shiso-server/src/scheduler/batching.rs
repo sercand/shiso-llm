@@ -29,6 +29,16 @@
 //! in tokens and is paid by whatever else is decoding at the time; the
 //! alternative is a wrong answer nobody can see.
 //!
+//! # Flex sequences run only in standard traffic's absence
+//!
+//! A flex sequence is left out of a tick - no decode row, no prompt quantum -
+//! whenever a standard sequence has work, and planned like any other when none
+//! does. Leaving it out is the whole of pausing it: its session and its cache
+//! stay resident, nothing is thrown away, and the first tick after the standard
+//! work drains picks it up where it stood. The pause lands between two calls
+//! because a tick is the only place a call is chosen, so a flex prompt that was
+//! mid-read finishes the quantum it was in and no more.
+//!
 //! # Why over-admission is impossible rather than checked
 //!
 //! The slot table owns its sequences in a `Vec` with a maximum it will not push
@@ -64,6 +74,16 @@ pub(crate) struct SlotFacts {
     /// the planner would otherwise choose is not available rather than merely
     /// discouraged.
     pub(crate) indivisible_prompt: bool,
+    /// Whether this is a flex sequence, which runs only when no standard one
+    /// has work.
+    pub(crate) flex: bool,
+}
+
+impl SlotFacts {
+    /// Whether this sequence wants anything from the device this tick.
+    const fn has_work(&self) -> bool {
+        self.ready_to_decode || self.prompt_remaining > 0
+    }
 }
 
 /// One sequence's share of a tick's prefill.
@@ -85,10 +105,16 @@ pub(crate) struct TickPlan {
     pub(crate) decode: Vec<usize>,
     /// The one sequence that reads prompt this tick, if any.
     pub(crate) prefill: Option<PrefillStep>,
+    /// The flex sequences that had work and were left out for standard work,
+    /// in slot order.
+    pub(crate) paused: Vec<usize>,
 }
 
 impl TickPlan {
     /// Whether this tick would do nothing at all.
+    ///
+    /// Never true while something is paused: a flex sequence is only paused
+    /// for a standard one with work, and that one is in the plan.
     pub(crate) const fn is_idle(&self) -> bool {
         self.decode.is_empty() && self.prefill.is_none()
     }
@@ -100,10 +126,20 @@ impl TickPlan {
 /// load-bearing claim and it should be assertable against a list of numbers
 /// rather than against a running engine.
 pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
+    let standard_busy = facts.iter().any(|fact| !fact.flex && fact.has_work());
+    let runs = |fact: &SlotFacts| !(standard_busy && fact.flex);
+    let paused: Vec<usize> = facts
+        .iter()
+        .enumerate()
+        .filter_map(|(at, fact)| (!runs(fact) && fact.has_work()).then_some(at))
+        .collect();
+    // The decode set is chosen after the flex rows are left out, so the prefill
+    // width below is chosen from it too: a paused row decodes nothing, and a
+    // standard prompt read beside it has nobody to starve.
     let decode: Vec<usize> = facts
         .iter()
         .enumerate()
-        .filter_map(|(at, fact)| fact.ready_to_decode.then_some(at))
+        .filter_map(|(at, fact)| (fact.ready_to_decode && runs(fact)).then_some(at))
         .collect();
 
     // The first sequence with prompt left, in admission order. Round-robin
@@ -113,7 +149,7 @@ pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
     let prefill = facts
         .iter()
         .enumerate()
-        .find(|(_at, fact)| fact.prompt_remaining > 0)
+        .find(|(_at, fact)| fact.prompt_remaining > 0 && runs(fact))
         .map(|(at, fact)| {
             let quantum = if decode.is_empty() {
                 cfg.solo_chunk
@@ -132,7 +168,11 @@ pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
             }
         });
 
-    TickPlan { decode, prefill }
+    TickPlan {
+        decode,
+        prefill,
+        paused,
+    }
 }
 
 /// Tokens one quantum reads from `at` with `remaining` to go: at most
@@ -272,6 +312,7 @@ mod tests {
             prompt_remaining: 0,
             prompt_at: 0,
             indivisible_prompt: false,
+            flex: false,
         }
     }
 
@@ -281,7 +322,77 @@ mod tests {
             prompt_remaining: remaining,
             prompt_at: 0,
             indivisible_prompt: false,
+            flex: false,
         }
+    }
+
+    fn flex(fact: SlotFacts) -> SlotFacts {
+        SlotFacts { flex: true, ..fact }
+    }
+
+    fn finished() -> SlotFacts {
+        SlotFacts {
+            ready_to_decode: false,
+            prompt_remaining: 0,
+            ..decoding()
+        }
+    }
+
+    /// The flex rule: while a standard sequence has work, a flex one gets
+    /// neither a decode row nor a prompt quantum, and says it was paused.
+    #[test]
+    fn a_flex_sequence_is_left_out_while_a_standard_one_decodes() {
+        let facts = [flex(decoding()), decoding(), flex(prefilling(1000))];
+        let plan = plan(&facts, &cfg());
+        assert_eq!(plan.decode, vec![1]);
+        assert_eq!(plan.prefill, None, "the flex prompt is not read either");
+        assert_eq!(plan.paused, vec![0, 2]);
+    }
+
+    #[test]
+    fn a_flex_sequence_is_left_out_while_a_standard_prompt_is_read() {
+        let facts = [flex(decoding()), prefilling(1000)];
+        let plan = plan(&facts, &cfg());
+        assert!(plan.decode.is_empty());
+        assert_eq!(
+            plan.prefill,
+            Some(PrefillStep {
+                slot: 1,
+                tokens: 512,
+                last: false
+            }),
+            "a paused row decodes nothing, so the standard prompt has nobody to \
+             starve and takes the solo width"
+        );
+        assert_eq!(plan.paused, vec![0]);
+    }
+
+    /// With no standard work - none resident, or only ones that have stopped -
+    /// flex sequences are planned exactly like standard ones.
+    #[test]
+    fn flex_sequences_run_when_no_standard_one_has_work() {
+        let facts = [flex(decoding()), finished(), flex(prefilling(1000))];
+        let plan = plan(&facts, &cfg());
+        assert_eq!(plan.decode, vec![0]);
+        assert_eq!(
+            plan.prefill,
+            Some(PrefillStep {
+                slot: 2,
+                tokens: 128,
+                last: false
+            })
+        );
+        assert!(plan.paused.is_empty());
+    }
+
+    /// A tick with something paused is never idle, which is what keeps the
+    /// idle path from ending a paused sequence as stuck.
+    #[test]
+    fn a_plan_that_pauses_something_is_not_idle() {
+        let facts = [flex(decoding()), decoding()];
+        let plan = plan(&facts, &cfg());
+        assert!(!plan.paused.is_empty());
+        assert!(!plan.is_idle());
     }
 
     /// A prompt carrying media is read whole, whatever the quantum would have
@@ -393,6 +504,7 @@ mod tests {
             ready_to_decode: false,
             prompt_remaining: 0,
             prompt_at: 0,
+            flex: false,
         }];
         assert!(plan(&facts, &cfg()).is_idle());
         assert!(plan(&[], &cfg()).is_idle());

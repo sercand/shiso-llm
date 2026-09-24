@@ -297,53 +297,7 @@ impl StopField {
     }
 }
 
-/// The service class a caller asked to be served in.
-///
-/// Parsed rather than echoed as an opaque value, because a mistyped tier is a
-/// caller that thinks it bought something it did not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceTier {
-    /// Whatever the server would do anyway.
-    Auto,
-    /// The ordinary class, named explicitly.
-    Default,
-    /// The class that trades latency for capacity.
-    Flex,
-}
-
-impl ServiceTier {
-    /// Parses the wire vocabulary, case insensitively.
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "auto" => Some(Self::Auto),
-            "default" => Some(Self::Default),
-            "flex" => Some(Self::Flex),
-            _ => None,
-        }
-    }
-
-    /// The spelling a response echoes.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Default => "default",
-            Self::Flex => "flex",
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ServiceTier {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        Self::parse(&raw).ok_or_else(|| {
-            serde::de::Error::custom(format!(
-                "service_tier must be one of \"auto\", \"default\" or \"flex\", not {raw:?}"
-            ))
-        })
-    }
-}
+pub use crate::api::service_tier::ServiceTier;
 
 /// The chat-completions request body.
 ///

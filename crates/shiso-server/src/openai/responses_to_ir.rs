@@ -18,10 +18,11 @@
 
 use serde_json::Value;
 use shiso_ir::{
-    Block, Effort, MediaSource, Message, Request, Role, Sampling, ThinkingDirective, ToolChoice,
-    ToolDefinition, ToolResult, ToolUse,
+    Block, Effort, MediaSource, Message, Request, Role, Sampling, ServiceClass, ThinkingDirective,
+    ToolChoice, ToolDefinition, ToolResult, ToolUse,
 };
 
+use crate::api::service_tier::ServiceTier;
 use crate::error::AppError;
 use crate::openai::chat_wire::StopField;
 use crate::openai::responses_wire::{
@@ -73,6 +74,9 @@ pub fn to_ir(
     request.thinking = thinking(body.reasoning.as_ref())?;
     request.response_format = response_format(body.text.as_ref());
     request.seed = body.seed;
+    request.service_class = body
+        .service_tier
+        .map_or(ServiceClass::Standard, ServiceTier::class);
     Ok(request)
 }
 
@@ -329,6 +333,14 @@ mod tests {
     fn ir(json: serde_json::Value) -> Request {
         let body: ResponsesBody = serde_json::from_value(json).expect("the body parses");
         to_ir(&body, "a-model", Vec::new()).expect("the body converts")
+    }
+
+    #[test]
+    fn a_flex_tier_asks_the_scheduler_for_the_flex_class() {
+        let flex = ir(serde_json::json!({"input": "hello", "service_tier": "flex"}));
+        assert_eq!(flex.service_class, shiso_ir::ServiceClass::Flex);
+        let silent = ir(serde_json::json!({"input": "hello"}));
+        assert_eq!(silent.service_class, shiso_ir::ServiceClass::Standard);
     }
 
     #[test]

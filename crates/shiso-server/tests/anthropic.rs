@@ -496,3 +496,39 @@ async fn the_opening_frame_reports_the_prompt_that_was_actually_rendered() {
         "streaming and blocking agree about the prompt: {body}"
     );
 }
+
+/// The same POST with an `X-Service-Tier` header.
+fn post_tier(body: &Value, tier: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("x-service-tier", tier)
+        .body(Body::from(body.to_string()))
+        .expect("a POST request builds")
+}
+
+/// This surface takes the flex class from the header, and its own body field
+/// of the same name - which means something else here - does not stand in
+/// the way.
+#[tokio::test]
+async fn a_flex_request_is_named_by_the_header_and_served() {
+    let state = state(vec![10, 11]);
+    let (status, body) = call(
+        &state,
+        post_tier(
+            &wire_body(&json!({"service_tier": "standard_only"})),
+            "flex",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["type"], "message");
+}
+
+#[tokio::test]
+async fn an_unknown_tier_in_the_header_is_refused() {
+    let state = state(vec![10]);
+    let (status, body) = call(&state, post_tier(&wire_body(&json!({})), "premium")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
