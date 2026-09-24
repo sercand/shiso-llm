@@ -228,7 +228,7 @@ pub(crate) fn mib(bytes: u64) -> f64 {
 /// writes them into a header and compares them on the way back.
 ///
 /// The field set is the on-disk word set, so it is deliberately *not*
-/// `#[non_exhaustive]`, for the same reason [`crate::PathHeader`] is not: a field
+/// `#[non_exhaustive]`, for the same reason the stored header is not: a field
 /// cannot be added here without a version bump that every reader in the directory
 /// would fail, and the engine is the only party that can state one - a constructor or
 /// an unbuildable literal would hide that a caller left one of the words unset.

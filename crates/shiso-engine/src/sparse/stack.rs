@@ -773,6 +773,7 @@ impl SparseStack {
             capturing: false,
             max_co_resident: opts.co_resident_blocks,
             half_block_input: false,
+            role: crate::sparse::matmul::PassRole::Step,
         };
         let desc = weights.desc(ngram.as_ref().map(|tier| tier.table().row()));
         log_resident(&shape, &opts, &kv, geometry.ckpt_bytes);

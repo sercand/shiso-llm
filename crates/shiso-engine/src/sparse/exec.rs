@@ -296,6 +296,7 @@ impl<'a> Exec<'a> {
                 b,
                 c,
                 dtype,
+                reduction,
             } => self
                 .backend
                 .as_blas()
@@ -321,6 +322,7 @@ impl<'a> Exec<'a> {
                     alpha: 1.0,
                     beta: 0.0,
                     dtype: *dtype,
+                    reduction: *reduction,
                 }),
         }
     }

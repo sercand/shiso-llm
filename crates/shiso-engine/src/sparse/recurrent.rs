@@ -206,7 +206,7 @@ pub fn block(
                 Operand::U32(shape.gdn.conv_kernel),
             ]),
         );
-    } else if policy.takes_chunk(n_tok) {
+    } else if policy.takes_chunk(device.tier_rows(n_tok)) {
         // A prefill chunk convolves in parallel over tokens and then rewrites
         // the carried window; like the recurrence it records no per-position
         // state, which is what the chunked path already guarantees it is never
@@ -360,7 +360,7 @@ pub fn block(
                 Operand::U32(shape.gdn_in_dim()),
             ]),
         );
-    } else if policy.takes_chunk(n_tok) {
+    } else if policy.takes_chunk(device.tier_rows(n_tok)) {
         // The chunked recurrence, on tensor cores: the half of each run's work
         // that does not depend on the state at its start for every run at once,
         // then the carry, one block per head. Measured on a GB10 at an

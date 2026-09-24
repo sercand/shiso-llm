@@ -289,6 +289,7 @@ impl SeqSlot {
             } else {
                 0
             },
+            prompt_at: self.cursor,
             indivisible_prompt: self.media.is_some(),
         }
     }

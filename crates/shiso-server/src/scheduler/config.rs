@@ -31,6 +31,16 @@ pub const DEFAULT_MIXED_QUANTUM: usize = 128;
 /// every routed expert's weights once per pass, and measured on a GB10 its
 /// prefill ran 1580 tok/s at 8192-token chunks against 1000 at 2048.
 pub const DEFAULT_SOLO_CHUNK: usize = 8192;
+/// The grid a prefill chunk that does not finish its prompt ends on.
+///
+/// The recurrent blocks walk a prompt in runs of this many positions counted
+/// from position zero, and a pass boundary inside a run cuts it into two runs
+/// whose sums are not the one run's: the prompt would answer by where the
+/// scheduler happened to cut it. Every stack's prompt passes are otherwise
+/// computed row for row as any other cut would compute them, so a chunk end on
+/// this grid is the whole of what keeps the widths, the quantum shared with
+/// decoding sequences, and a resume point out of the answer.
+pub const PREFILL_GRID: usize = 64;
 /// How long a caller may block inside the queue before being refused.
 pub const DEFAULT_QUEUE_ADMISSION_MS: u64 = 250;
 

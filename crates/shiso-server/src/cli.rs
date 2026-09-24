@@ -450,6 +450,19 @@ pub enum ConfigError {
         /// The worst-case decode rows of one step.
         decode_rows: usize,
     },
+    /// A prefill width that is not a whole number of the recurrence's runs.
+    #[error(
+        "--{flag} {value} is not a multiple of {grid}: a prompt chunk must end on \
+         the recurrent blocks' run grid, or where a prompt is cut changes its answer"
+    )]
+    OffGrid {
+        /// The flag, spelled as it is typed.
+        flag: &'static str,
+        /// The width as it was given.
+        value: usize,
+        /// The grid it must be a multiple of.
+        grid: usize,
+    },
     /// One of the two settings speculation needs was given without the other.
     #[error("--{given} without --{missing}: speculation needs a draft head and a depth")]
     HalfSpeculative {
@@ -566,6 +579,22 @@ impl ServeArgs {
                 return Err(ConfigError::Zero {
                     flag: "mixed-prefill-quantum",
                 });
+            }
+            // A budget's widths are what is left of it, and the scheduler rounds
+            // those down to the grid itself; widths typed as widths are refused
+            // instead, because a width that silently shrank is not the one
+            // configured.
+            for (flag, value) in [
+                ("solo-prefill-chunk", self.solo_prefill_chunk),
+                ("mixed-prefill-quantum", self.mixed_prefill_quantum),
+            ] {
+                if !value.is_multiple_of(crate::scheduler::PREFILL_GRID) {
+                    return Err(ConfigError::OffGrid {
+                        flag,
+                        value,
+                        grid: crate::scheduler::PREFILL_GRID,
+                    });
+                }
             }
             return Ok(PrefillWidths {
                 solo_chunk: self.solo_prefill_chunk,

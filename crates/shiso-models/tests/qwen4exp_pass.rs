@@ -835,3 +835,81 @@ fn each_run_of_a_segmented_verify_crosses_the_budget_where_its_own_rows_do() {
         "the rest of the crossing run, and the whole of the other, attend over selections"
     );
 }
+
+/// What decides one step's arithmetic, and nothing that only sizes its grid:
+/// which kernel, instantiated how, or which multiply at which element type,
+/// reduction and weight shape.
+fn route(step: &shiso_engine::sparse::plan::Step) -> String {
+    use shiso_engine::sparse::plan::Step;
+    match step {
+        Step::Kernel { entry, .. } | Step::Staged { entry, .. } => format!("{entry:?}"),
+        Step::Trellis {
+            op, entry, shape, ..
+        } => format!("{op:?} {entry:?} {shape:?}"),
+        Step::Expand { entry, k, n, .. } => format!("expand {entry:?} {k}x{n}"),
+        Step::Blas {
+            dtype,
+            reduction,
+            m,
+            k,
+            ..
+        } => format!("blas {dtype:?} {reduction:?} {m}x{k}"),
+        other => other.name().to_owned(),
+    }
+}
+
+/// Every step's route, in plan order.
+fn routes(pass: &shiso_engine::sparse::stack::Pass) -> Vec<String> {
+    pass.plan.steps().iter().map(route).collect()
+}
+
+#[test]
+fn a_prompt_chunk_takes_the_same_route_at_every_width() {
+    // Where a prompt is cut is not the answer's business: a chunk of one row at
+    // the end of a prompt must be summed as the same row is in the middle of a
+    // wide one, so every width plans the same kernels and the same multiplies -
+    // the column-invariant ones - and differs only in the grids that cover it.
+    let (_dir, _fake, mut model) = loaded();
+    let session = model.open_session().expect("a session opens");
+    // Past the fixture's indexer budget first, so every row of every width
+    // attends over a selection: below it, a wide chunk's later rows would
+    // select while a narrow one's did not, which is a difference in what each
+    // row reads rather than in how it is summed.
+    model
+        .prefill_chunk(session, &tokens(0, 128))
+        .expect("the opening prefills");
+    let widest = model
+        .stack()
+        .plan_prompt(session, &tokens(128, 512), 1)
+        .expect("a wide prompt chunk plans");
+    for step in widest.plan.steps() {
+        if let shiso_engine::sparse::plan::Step::Blas { reduction, .. } = step {
+            assert_eq!(
+                *reduction,
+                shiso_core::GemmReduction::ColumnInvariant,
+                "a prompt chunk asked for a multiply whose columns may move"
+            );
+        }
+    }
+    assert!(!widest.capturable, "a prompt chunk is never captured");
+    for width in [1, 5, 17, 33, 64, 145, 320] {
+        let narrow = model
+            .stack()
+            .plan_prompt(session, &tokens(128, width), 1)
+            .expect("a narrow prompt chunk plans");
+        assert_eq!(
+            routes(&narrow),
+            routes(&widest),
+            "a {width}-row prompt chunk takes another route than a 512-row one"
+        );
+    }
+    // The contrast that makes the claim mean something: planned as steps, the
+    // same widths do take different routes.
+    let step_narrow = model
+        .plan_chunk(session, &tokens(128, 1), 1)
+        .expect("a one-row step plans");
+    let step_wide = model
+        .plan_chunk(session, &tokens(128, 512), 1)
+        .expect("a wide step plans");
+    assert_ne!(routes(&step_narrow), routes(&step_wide));
+}

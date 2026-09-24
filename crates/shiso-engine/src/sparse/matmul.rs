@@ -26,7 +26,7 @@
 //! kernel.
 
 use shiso_core::DType;
-use shiso_core::backend::{GemmDType, GemmOp};
+use shiso_core::backend::{GemmDType, GemmOp, GemmReduction};
 use shiso_core::error::{CoreError, CoreResult};
 
 use crate::sparse::bind::{Args, Operand, WeightRef};
@@ -140,7 +140,7 @@ const fn exact_blas(device: Device) -> bool {
 /// with a combine behind each - were 1.2 s of a 7.5k-token prefill's 6.8 s.
 #[must_use]
 pub const fn half_in_passes(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> bool {
-    half_exact(in_dim, out_dim, rows) && !exact_blas(device)
+    half_exact(in_dim, out_dim, device.tier_rows(rows)) && !exact_blas(device)
 }
 
 /// Elements one block-quantized weight block holds.
@@ -275,6 +275,61 @@ pub struct Device {
     /// device, carried here because every planner that projects the block input
     /// already takes this struct.
     pub half_block_input: bool,
+    /// Which reference pass this one's rows must reproduce. On a
+    /// [`PassRole::Prompt`] pass every row comes out bit for bit as it would in
+    /// a pass of any other width: every tier decision that reads a row count
+    /// reads the widest one instead, and every multiply is asked for
+    /// [`GemmReduction::ColumnInvariant`]. A fact about the pass, carried here
+    /// for the reason `half_block_input` is.
+    pub role: PassRole,
+}
+
+impl Device {
+    /// Whether this pass's rows are held to every other pass width.
+    #[must_use]
+    pub const fn row_invariant(self) -> bool {
+        matches!(self.role, PassRole::Prompt)
+    }
+
+    /// The reduction every multiply of this pass asks the BLAS tier for.
+    #[must_use]
+    pub const fn reduction(self) -> GemmReduction {
+        if self.row_invariant() {
+            GemmReduction::ColumnInvariant
+        } else {
+            GemmReduction::Fastest
+        }
+    }
+
+    /// The row count a tier decision reads for a pass of `rows`: the rows
+    /// themselves, or on a row-invariant pass the widest a pass can be, so
+    /// that every width takes the tier a full chunk takes.
+    #[must_use]
+    pub const fn tier_rows(self, rows: u32) -> u32 {
+        if self.row_invariant() { u32::MAX } else { rows }
+    }
+}
+
+/// What one session's pass of consecutive positions is for.
+///
+/// The two are planned differently for one reason: a prompt's rows must come
+/// out exactly as they would in a pass of any other width, and a step's rows
+/// must come out exactly as a single decode step would compute them. Both are
+/// the same promise - the text must not depend on how the work was cut - made
+/// to two different reference passes, and no plan can keep both at once: the
+/// kernels a one-row step is fast on are the ones whose sums move with the row
+/// count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PassRole {
+    /// A chunk of a prompt. Every tier is chosen as for the widest chunk, so
+    /// that where the prompt was cut - the prefill width, a quantum shared with
+    /// decoding sequences, a resume point - moves no bit of any row. See
+    /// [`Device::role`].
+    Prompt,
+    /// A decode step or a speculative verify: rows a single-row step must be
+    /// able to reproduce, planned on the tiers their row count reaches.
+    #[default]
+    Step,
 }
 
 /// Plans one projection.
@@ -361,10 +416,11 @@ fn half(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Proj
             got: u64::from(in_dim),
         });
     }
-    if half_exact(in_dim, out_dim, rows) && exact_blas(device) {
+    let tier = device.tier_rows(rows);
+    if half_exact(in_dim, out_dim, tier) && exact_blas(device) {
         return Ok(Projection::HalfExact { rows });
     }
-    if rows > HALF_MAX_ROWS && !half_exact(in_dim, out_dim, rows) {
+    if tier > HALF_MAX_ROWS && !half_exact(in_dim, out_dim, tier) {
         if !device.blas {
             return Err(CoreError::Unsupported {
                 what: "a wide half-precision chunk on a device with no BLAS tier",
@@ -534,14 +590,19 @@ fn trellis(
     })?;
     exl3::check_shape(in_dim, out_dim, bits)?;
     let gate = exl3::ReconstructGate {
-        rows,
+        rows: device.tier_rows(rows),
         blas: device.blas,
         capturing: device.capturing,
     };
     if exl3::reconstruct(gate, in_dim, out_dim) {
         return Ok(Projection::TrellisExpanded { bits, rows });
     }
-    if let Some(ksplit) = decode_split(in_dim, out_dim, rows, device.max_co_resident) {
+    if let Some(ksplit) = decode_split(
+        in_dim,
+        out_dim,
+        device.tier_rows(rows),
+        device.max_co_resident,
+    ) {
         return Ok(Projection::TrellisDecode {
             bits,
             ksplit,
@@ -627,7 +688,13 @@ pub fn decode_split(in_dim: u32, out_dim: u32, rows: u32, sms: u32) -> Option<u3
 #[must_use]
 pub fn pair_decoded(weight: &WeightDesc, rows: u32, device: Device) -> bool {
     trellis_bits(weight.dtype).is_some()
-        && decode_split(weight.in_dim, weight.out_dim, rows, device.max_co_resident).is_some()
+        && decode_split(
+            weight.in_dim,
+            weight.out_dim,
+            device.tier_rows(rows),
+            device.max_co_resident,
+        )
+        .is_some()
 }
 
 /// Whether a pair of weights of identical shape and type can share one grouped
@@ -791,6 +858,7 @@ pub fn project_on_blas(
             Elem::F16 => GemmDType::F16ToF16,
             Elem::F32 => GemmDType::F16,
         },
+        reduction: device.reduction(),
     });
     Ok(())
 }
@@ -946,6 +1014,7 @@ fn project_one(
                 b,
                 c: bound.dst,
                 dtype: GemmDType::F16,
+                reduction: device.reduction(),
             });
         }
         // The widening writes the weight into the staging region, output-major
@@ -977,6 +1046,7 @@ fn project_one(
                 b: bound.src,
                 c: bound.dst,
                 dtype: GemmDType::F32Strict,
+                reduction: device.reduction(),
             });
         }
         // The expansion, then the multiply the stored halves would have taken,
@@ -999,6 +1069,7 @@ fn project_one(
                         b,
                         c: bound.dst,
                         dtype: GemmDType::F16,
+                        reduction: device.reduction(),
                     });
                 }
                 Elem::F32 => out.push(Step::Blas {
@@ -1014,6 +1085,7 @@ fn project_one(
                     b: bound.src,
                     c: bound.dst,
                     dtype: GemmDType::F32Strict,
+                    reduction: device.reduction(),
                 }),
             }
         }
@@ -1144,6 +1216,7 @@ fn project_one(
                 b,
                 c: bound.dst,
                 dtype: GemmDType::F16,
+                reduction: device.reduction(),
             });
         }
     }
@@ -1236,7 +1309,7 @@ pub fn project_pair(
     // it, one grouped launch runs both over half a device each instead of two
     // cooperative launches in sequence.
     if gate.matches(&up)
-        && rows <= kernels::EXL3_RECONSTRUCT_ROWS
+        && device.tier_rows(rows) <= kernels::EXL3_RECONSTRUCT_ROWS
         && let Some(bits) = trellis_bits(gate.dtype)
     {
         exl3::check_shape(gate.in_dim, gate.out_dim, bits)?;
@@ -1307,6 +1380,7 @@ mod tests {
         capturing: false,
         max_co_resident: 48,
         half_block_input: false,
+        role: PassRole::Step,
     };
 
     #[test]

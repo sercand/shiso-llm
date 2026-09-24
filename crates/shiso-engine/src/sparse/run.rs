@@ -46,8 +46,9 @@ use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::model::{DecodeStep, Logits};
 
 use crate::sparse::ckpt::Boundary;
-use crate::sparse::kernels::F32_BYTES;
+use crate::sparse::kernels::{F32_BYTES, GDN_CHUNK};
 use crate::sparse::media::MediaRun;
+use crate::sparse::passes::PassRole;
 use crate::sparse::ple::{PleGather, PleRows};
 use crate::sparse::scratch::Buf;
 use crate::sparse::stack::{MAX_DECODE_BATCH, Pass, SparseStack};
@@ -101,6 +102,33 @@ impl SparseStack {
         self.advance_over(session, tokens, true, None)?;
         self.mark_prompt_end(session)?;
         self.logits(1)
+    }
+
+    /// Advances a session by `tokens` in one pass planned as a speculative
+    /// verify plans its rows, and returns every row's logits.
+    ///
+    /// A verify's rows are held to the single decode step, not to a prompt
+    /// chunk: they take the tiers their own row count reaches, which is what
+    /// makes a verify's pick at every row the pick a plain step would make. This
+    /// is that pass without the draft that normally supplies its rows, so a
+    /// caller can put it beside the decode steps it stands in for; unlike a
+    /// verify, it commits every row.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::prefill_chunk`], and [`CoreError::ShapeMismatch`] for
+    /// more rows than the logits block holds.
+    pub fn step_rows(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<Logits<'_>> {
+        let rows = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+        if rows == 0 || rows > crate::sparse::stack::MAX_LOGIT_ROWS {
+            return Err(CoreError::ShapeMismatch {
+                field: "step rows",
+                expected: u64::from(crate::sparse::stack::MAX_LOGIT_ROWS),
+                got: u64::from(rows),
+            });
+        }
+        self.run_chunk(session, tokens, rows, false, None)?;
+        self.logits(rows)
     }
 
     /// Advances a session by the WHOLE of a media-carrying prompt, splicing the
@@ -365,9 +393,10 @@ impl SparseStack {
             // an item's encoder rows and its grid positions together, and a cut
             // through one would split an item's rows across two passes whose
             // maps were built from two different walks of the same item.
+            let at = self.session(session)?.written();
             let mut take = match run.as_ref() {
                 Some(run) => run.walk.split_point(rest, width),
-                None => rest.len().min(width),
+                None => on_grid(at, rest.len().min(width), rest.len()),
             };
             // A chunk also stops at a boundary a later request is likely to
             // resume from - a message end, or where this prompt branches off a
@@ -397,7 +426,7 @@ impl SparseStack {
             } else {
                 Boundary::Step
             };
-            self.run_rows_media(session, head, logit_rows, run.as_mut())?;
+            self.run_rows_media(session, head, logit_rows, run.as_mut(), PassRole::Prompt)?;
             // Staged after the pass and before the commit: the commit is where
             // a prompt's final chunk earns its checkpoint, and a speculating
             // session's checkpoint carries this row - staged any later, the
@@ -476,11 +505,17 @@ impl SparseStack {
         // must not hide the message boundary a thousand tokens later.
         let floor = ckpt.options.min_tokens.max(1);
         let lowest = pos.max(live.resumed_at).saturating_add(floor).max(floor);
+        // Each is moved back onto the recurrence's grid first: a stop between
+        // two grid points would cut a run, and every later pass of this prompt -
+        // and of every prompt resumed from the checkpoint taken here - would sum
+        // differently from a cold prefill of the same tokens. The resume re-reads
+        // the few positions between the grid point and the boundary instead.
         let stop = live
             .hints
             .iter()
             .copied()
             .chain(std::iter::once(branch))
+            .map(|stop| stop - stop % GDN_CHUNK)
             .filter(|stop| *stop > pos && *stop < len && *stop >= lowest)
             .min();
         Ok(stop.and_then(|stop| usize::try_from(stop - pos).ok()))
@@ -498,7 +533,7 @@ impl SparseStack {
         earned: bool,
         media: Option<&mut MediaRun<'_>>,
     ) -> CoreResult<()> {
-        self.run_rows_media(session, tokens, logit_rows, media)?;
+        self.run_rows_media(session, tokens, logit_rows, media, PassRole::Step)?;
         // `logit_rows - 1` is the row this chunk's last position produced, and
         // `None` for a chunk that produced none: a checkpoint admitted without
         // that row cannot be resumed from without re-running a step.
@@ -519,11 +554,12 @@ impl SparseStack {
         tokens: &[TokenId],
         logit_rows: u32,
     ) -> CoreResult<()> {
-        self.run_rows_media(session, tokens, logit_rows, None)
+        self.run_rows_media(session, tokens, logit_rows, None, PassRole::Step)
     }
 
     /// The same pass, splicing a request's encoder rows over its placeholder
-    /// tokens when the chunk carries any.
+    /// tokens when the chunk carries any. `role` says which reference pass its
+    /// rows must reproduce: see [`PassRole`].
     ///
     /// # Errors
     ///
@@ -535,6 +571,7 @@ impl SparseStack {
         tokens: &[TokenId],
         logit_rows: u32,
         media: Option<&mut MediaRun<'_>>,
+        role: PassRole,
     ) -> CoreResult<()> {
         let n_tok = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
         if self.reserve(session, n_tok)?
@@ -557,6 +594,7 @@ impl SparseStack {
             tokens,
             logit_rows,
             block.map(|prefill| prefill.row_count()),
+            role,
         )?;
         phase.mark("plan");
         let gathered = self.issue_gathers(&mut pass, &[(session, tokens)])?;
@@ -745,4 +783,28 @@ impl Phases {
             tracing::info!(steps, marks = ?self.marks, "decode phases, microseconds");
         }
     }
+}
+
+/// Tokens of a piece that starts at position `start`, wants `want` and has
+/// `rest` to go: ending on the recurrence's run grid unless it ends the call.
+///
+/// The recurrent blocks' chunked walk counts its runs from the pass's first
+/// row, so a pass that started between two grid points would cut every run of
+/// its prompt in two - summed differently from a cold prefill of the same
+/// tokens, which starts on the grid. Rounded down, so a piece never grows past
+/// the pass width; a start off the grid - a resume that stood on a turn's end -
+/// takes the short piece up to the next grid point and is on the grid after it.
+fn on_grid(start: u32, want: usize, rest: usize) -> usize {
+    if want >= rest {
+        return rest;
+    }
+    let grid = u64::from(GDN_CHUNK);
+    let end = u64::from(start).saturating_add(want as u64);
+    let down = end - end % grid;
+    let take = if down > u64::from(start) {
+        down - u64::from(start)
+    } else {
+        (u64::from(start) / grid + 1) * grid - u64::from(start)
+    };
+    usize::try_from(take).unwrap_or(want).min(rest)
 }

@@ -60,6 +60,17 @@ fn path_of(n: u32) -> Vec<TokenId> {
     (0..n).map(TokenId::new).collect()
 }
 
+/// A shared boundary the cases put a checkpoint at: one run of the
+/// recurrence's grid in, because a boundary between two grid points is moved
+/// back onto the grid before a chunk stops at it.
+const BOUNDARY: u32 = 64;
+
+/// `n` tokens cycling through the fixture's 64-id vocabulary, so a prompt can
+/// run past a [`BOUNDARY`] without leaving it.
+fn cycle_of(n: u32) -> Vec<TokenId> {
+    (0..n).map(|i| TokenId::new(i % 64)).collect()
+}
+
 /// Every queued write lands.
 fn drain(model: &mut Qwen4ExpModel) {
     assert!(
@@ -249,11 +260,11 @@ fn a_prompt_that_shares_an_opening_with_an_earlier_one_is_still_stored() {
         .expect("the tier opens over a fresh directory");
     let first = model.open_session().expect("a session opens");
     model
-        .prefill_last(first, &path_of(PROMPT))
+        .prefill_last(first, &cycle_of(2 * BOUNDARY))
         .expect("the first prompt prefills");
     let second = model.open_session().expect("a second session opens");
-    let mut tokens = path_of(PROMPT / 2);
-    tokens.extend((0..PROMPT / 2).map(|i| TokenId::new(PROMPT - 1 - i)));
+    let mut tokens = cycle_of(BOUNDARY);
+    tokens.extend((0..BOUNDARY).map(|i| TokenId::new(63 - i % 64)));
     model
         .prefill_last(second, &tokens)
         .expect("the second prompt prefills");
@@ -372,19 +383,19 @@ fn a_message_boundary_earns_a_checkpoint_a_shorter_prompt_resumes_from() {
         .expect("the tier opens");
     let first = model.open_session().expect("a session opens");
     model
-        .kv_set_hints(first, &[24])
+        .kv_set_hints(first, &[BOUNDARY])
         .expect("the session is open");
     model
-        .prefill_last(first, &path_of(PROMPT))
+        .prefill_last(first, &cycle_of(2 * BOUNDARY))
         .expect("the prompt prefills");
     let second = model.open_session().expect("a second session opens");
-    let mut other = path_of(24);
+    let mut other = cycle_of(BOUNDARY);
     other.extend((700..740).map(TokenId::new));
     let info = model
         .kv_resume(second, &other)
         .expect("not an error")
         .expect("the boundary's checkpoint was found");
-    assert_eq!(info.tokens_reused, 24);
+    assert_eq!(info.tokens_reused, BOUNDARY);
     assert_eq!(info.source, ResumeSource::Memory);
 }
 
@@ -400,10 +411,10 @@ fn the_point_a_prompt_branches_off_a_cached_path_earns_a_checkpoint() {
         .expect("the tier opens");
     let first = model.open_session().expect("a session opens");
     model
-        .prefill_last(first, &path_of(PROMPT))
+        .prefill_last(first, &cycle_of(2 * BOUNDARY))
         .expect("the first prompt prefills");
     let with_question = |question: u32| {
-        let mut tokens = path_of(40);
+        let mut tokens = cycle_of(BOUNDARY);
         // The fixture's vocabulary is 64 ids wide.
         tokens.extend((0..20).map(|i| TokenId::new((question + i) % 64)));
         tokens
@@ -417,7 +428,7 @@ fn the_point_a_prompt_branches_off_a_cached_path_earns_a_checkpoint() {
         .kv_resume(third, &with_question(10))
         .expect("not an error")
         .expect("the branch point's checkpoint was found");
-    assert_eq!(info.tokens_reused, 40);
+    assert_eq!(info.tokens_reused, BOUNDARY);
 }
 
 #[test]

@@ -740,6 +740,28 @@ pub enum GemmOp {
     Transposed,
 }
 
+/// Whether a multiply's columns may be reduced differently at different
+/// column counts.
+///
+/// A projection's columns are a pass's rows, and a vendor library chooses its
+/// algorithm - its tile, and whether it splits the contraction - from the whole
+/// problem shape, column count included. The same column then sums in a
+/// different order when it is multiplied beside more or fewer others, which is
+/// harmless for a decode step and wrong for a prompt: the prompt's answer would
+/// depend on where its chunks happened to be cut.
+///
+/// Not `#[non_exhaustive]`: a caller builds one for every multiply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GemmReduction {
+    /// Whatever the device finds fastest for this exact shape.
+    #[default]
+    Fastest,
+    /// One reduction per column, the same at every column count: one algorithm
+    /// per shape with the column count left out, and no split of the
+    /// contraction. A device that cannot promise it refuses the multiply.
+    ColumnInvariant,
+}
+
 /// One matrix multiply, as a single argument block.
 ///
 /// Row strides travel with their matrix, so transposing `lda` and `ldb` at a
@@ -787,6 +809,8 @@ pub struct GemmDesc<'a> {
     pub beta: f32,
     /// Element type of the operands.
     pub dtype: GemmDType,
+    /// Whether a column's sums may depend on how many columns the call has.
+    pub reduction: GemmReduction,
 }
 
 /// A BLAS-capable device.

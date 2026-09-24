@@ -35,12 +35,14 @@ fn request(prompt: usize, max_tokens: u32) -> GenerateRequest {
     )
 }
 
-/// Quanta small enough that a hundred-token prompt takes several of them.
+/// Quanta small enough that a three-hundred-token prompt takes several of
+/// them, and each a whole number of the prefill grid, which a quantum that
+/// does not end its prompt always ends on.
 fn cfg(max_num_seqs: usize) -> SchedulerConfig {
     SchedulerConfig {
         max_num_seqs,
-        mixed_quantum: 8,
-        solo_chunk: 64,
+        mixed_quantum: 64,
+        solo_chunk: 128,
         ..SchedulerConfig::new()
     }
 }
@@ -62,7 +64,7 @@ async fn a_lone_prompt_is_read_at_the_solo_width() {
     let (engine, join, audit) = common::scheduled_engine(vec![10, 11], cfg(2), None);
     drain(
         engine
-            .generate(request(100, 4))
+            .generate(request(300, 4))
             .await
             .expect("the engine accepts the request"),
     )
@@ -70,8 +72,8 @@ async fn a_lone_prompt_is_read_at_the_solo_width() {
 
     assert_eq!(
         audit.prefill_chunks(),
-        vec![64, 36],
-        "a hundred-token prompt is one solo chunk and its remainder"
+        vec![128, 128, 44],
+        "a three-hundred-token prompt is two solo chunks and their remainder"
     );
 
     drop(engine);
@@ -95,7 +97,7 @@ async fn a_prompt_read_beside_a_decoding_turn_is_read_in_quanta() {
         .expect("the engine accepts the streaming request");
     let arriving = tokio::spawn({
         let engine = engine.clone();
-        async move { engine.generate(request(100, 4)).await }
+        async move { engine.generate(request(300, 4)).await }
     });
     common::wait_for_live(&audit, &gate, 2).await;
     let arriving = arriving
@@ -121,10 +123,10 @@ async fn a_prompt_read_beside_a_decoding_turn_is_read_in_quanta() {
         .collect();
     assert!(
         quanta.len() > 2,
-        "a hundred-token prompt beside a decoder takes several quanta: {quanta:?}"
+        "a three-hundred-token prompt beside a decoder takes several quanta: {quanta:?}"
     );
     assert!(
-        quanta.iter().all(|tokens| *tokens <= 8),
+        quanta.iter().all(|tokens| *tokens <= 64),
         "no quantum is wider than the shared cap: {quanta:?}"
     );
 
@@ -154,7 +156,7 @@ async fn no_two_prompt_quanta_run_between_a_sequences_decode_steps() {
     let queued: Vec<_> = (0..2)
         .map(|_| {
             let engine = engine.clone();
-            tokio::spawn(async move { engine.generate(request(100, 4)).await })
+            tokio::spawn(async move { engine.generate(request(300, 4)).await })
         })
         .collect();
     common::wait_for_live(&audit, &gate, 3).await;

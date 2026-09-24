@@ -18,7 +18,7 @@
 //! paths move bytes. Four variants say which of those a step is, so a reader of
 //! a plan cannot mistake a cooperative grid for an ordinary one.
 
-use shiso_core::backend::{GemmDType, GemmOp};
+use shiso_core::backend::{GemmDType, GemmOp, GemmReduction};
 use shiso_core::error::{CoreError, CoreResult};
 
 use crate::sparse::bind::{Args, Operand};
@@ -137,6 +137,8 @@ pub enum Step {
         c: Operand,
         /// Element type of the operands.
         dtype: GemmDType,
+        /// Whether a row may be summed differently at another row count.
+        reduction: GemmReduction,
     },
     /// A reservation of per-stream scratch, which some launches need and which
     /// cannot be made while a stream is capturing.

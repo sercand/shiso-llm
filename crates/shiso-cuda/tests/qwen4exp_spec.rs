@@ -191,12 +191,15 @@ fn a_verify_width_chunk_across_the_indexer_budget_matches_decode_to_the_bit() {
         0,
     );
     assert_eq!(greedy(&first), ids[0], "the two prompts agree");
+    // Through the verify's own planning: a prompt chunk of the same rows is
+    // held to every other prompt cut instead, not to the decode step.
     let chunk = row_of(
         &backend,
         &model
-            .prefill_last(session, &ids[..WIDTH as usize])
+            .stack_mut()
+            .step_rows(session, &ids[..WIDTH as usize])
             .expect("the crossing chunk runs"),
-        0,
+        WIDTH - 1,
     );
     model.close_session(session).expect("the session closes");
     let want = &rows[WIDTH as usize - 1];

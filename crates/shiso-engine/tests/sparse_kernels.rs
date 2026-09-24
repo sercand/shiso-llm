@@ -26,7 +26,7 @@ use shiso_engine::sparse::gather;
 use shiso_engine::sparse::hyper::{self, MixInput, MixRoles, NextNorm};
 use shiso_engine::sparse::indexer::{self, Scorer};
 use shiso_engine::sparse::kernels::{self, Elem};
-use shiso_engine::sparse::matmul::{self, Bound, Device};
+use shiso_engine::sparse::matmul::{self, Bound, Device, PassRole};
 use shiso_engine::sparse::moe::{self, RowOrigin};
 use shiso_engine::sparse::mtp::SpecDepth;
 use shiso_engine::sparse::plan::Plan;
@@ -91,6 +91,7 @@ const GPU: Device = Device {
     capturing: false,
     max_co_resident: 48,
     half_block_input: false,
+    role: PassRole::Step,
 };
 
 fn half(in_dim: u32, out_dim: u32) -> WeightDesc {

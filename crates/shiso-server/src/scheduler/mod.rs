@@ -81,8 +81,8 @@ pub use clock::{Clock, FakeClock, SystemClock};
 pub use config::{
     DEFAULT_BOUNDARY_ALIGN, DEFAULT_BOUNDARY_TRIM, DEFAULT_CONTINUED_INTERVAL,
     DEFAULT_DRAIN_TIMEOUT, DEFAULT_MAX_NUM_SEQS, DEFAULT_MAX_QUEUED, DEFAULT_MIXED_QUANTUM,
-    DEFAULT_PUMP_BYTES, DEFAULT_QUEUE_ADMISSION_MS, DEFAULT_SOLO_CHUNK, SchedulerConfig,
-    StorePolicy,
+    DEFAULT_PUMP_BYTES, DEFAULT_QUEUE_ADMISSION_MS, DEFAULT_SOLO_CHUNK, PREFILL_GRID,
+    SchedulerConfig, StorePolicy,
 };
 pub use queue::{EngineGone, EngineHandle, EngineRequest, GenerateRequest, QUEUE_CAPACITY};
 pub use stats::SchedulerStats;
