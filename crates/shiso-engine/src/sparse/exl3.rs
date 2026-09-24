@@ -235,7 +235,12 @@ pub fn select_shape(k: u32, n: u32, bits: u32, fanout: Fanout) -> Option<GemmSha
             2
         }
     } else if mod_256 && n_eff <= 4_096 {
-        if k_eff > 8_192 && bits >= 3 { 3 } else { 2 }
+        // shiso: a long contraction into a narrow output takes the 256-wide
+        // tile on a GB10 from 4096 up, not 8192: the recurrent and attention
+        // output projections (6144 -> 2560, six bits) ran 65 us on the 128-wide
+        // tile and 56 on this one, measured standalone at one row.
+        let from = if fanout.is_grouped() { 8_192 } else { 4_096 };
+        if k_eff > from && bits >= 3 { 3 } else { 2 }
     } else if mod_512 && n_eff > 16_384 {
         4
     } else if mod_256 {
