@@ -25,7 +25,8 @@ behind.
 | `exl3_kernel_map.cuh` | `quant/exl3_kernel_map.cuh` | **modified**: argument lists; host declarations dropped |
 | `exl3_moe_common.cuh` | `quant/exl3_moe_common.cuh` | **modified**: ds4 argument list (see below) |
 | `exl3_moe_kernel.cuh` | `quant/exl3_moe_kernel.cuh` | **modified**, see below |
-| `exl3_moe_ws.cuh` | none | **shiso's own**: the weight-stationary routed prefill (prep, gate+up, down with a float or a half slot output, and the half-slot combine that also adds the gated shared expert), built on exllamav3's decoder, Hadamard helpers and PTX wrappers |
+| `exl3_moe_ws.cuh` | none | **shiso's own**: the weight-stationary routed prefill (prep, gate+up, down with a float or a half slot output, and the half-slot combine that also adds the gated shared expert), and its decode-shaped twin (`exl3_moe_wsd_*`: the same MMA sequence per column over the active experts in 16-row passes, the Hadamard epilogues as launches of their own), built on exllamav3's decoder, Hadamard helpers and PTX wrappers |
+| `exl3_dgemv.cuh` | none | **shiso's own**: the decode-shaped dense projection (input transform into MMA fragment order, split-K slices, a last-block fold in slice order), built on exllamav3's decoder, Hadamard helpers and PTX wrappers |
 | `exl3_reconstruct.cuh` | `quant/reconstruct.cu` | `reconstruct_had_kernel` only; C++17 `register` dropped |
 | `exl3_devctx.cuh` | `quant/exl3_devctx.cuh` | lock-buffer layout constants only |
 | `ptx.cuh` | `ptx.cuh` | verbatim (mma.m16n8k16, cp.async, barriers) |

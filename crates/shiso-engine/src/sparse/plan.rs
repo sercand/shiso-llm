@@ -164,6 +164,19 @@ pub enum Step {
     },
     /// A point in a branch of concurrent work; see [`Branch`].
     Branch(Branch),
+    /// An ordinary launch that carves the per-stream staging the cooperative
+    /// launches use - the decode-shaped trellis projection, whose transformed
+    /// activation and partial sums live there.
+    Staged {
+        /// The entry point.
+        entry: Entry,
+        /// Its grid and block.
+        launch: Launch,
+        /// What it carves out of the per-stream scratch.
+        staging: Staging,
+        /// What it is handed, in kernel declaration order.
+        args: Args,
+    },
     /// A trellis weight expanded once into half precision, before the BLAS
     /// multiply that follows it.
     ///
@@ -231,9 +244,10 @@ impl Step {
     /// than a launch can carry.
     pub fn operands(&self) -> CoreResult<&[Operand]> {
         match self {
-            Self::Kernel { args, .. } | Self::Trellis { args, .. } | Self::Expand { args, .. } => {
-                args.operands()
-            }
+            Self::Kernel { args, .. }
+            | Self::Trellis { args, .. }
+            | Self::Expand { args, .. }
+            | Self::Staged { args, .. } => args.operands(),
             Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } | Self::Branch(_) => {
                 Ok(&[])
             }
@@ -249,9 +263,10 @@ impl Step {
     #[must_use]
     pub const fn args(&self) -> Args {
         match self {
-            Self::Kernel { args, .. } | Self::Trellis { args, .. } | Self::Expand { args, .. } => {
-                *args
-            }
+            Self::Kernel { args, .. }
+            | Self::Trellis { args, .. }
+            | Self::Expand { args, .. }
+            | Self::Staged { args, .. } => *args,
             Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } | Self::Branch(_) => {
                 Args::new()
             }
@@ -262,7 +277,9 @@ impl Step {
     #[must_use]
     pub const fn staging(&self) -> Staging {
         match self {
-            Self::Trellis { staging, .. } | Self::Expand { staging, .. } => *staging,
+            Self::Trellis { staging, .. }
+            | Self::Expand { staging, .. }
+            | Self::Staged { staging, .. } => *staging,
             Self::Kernel { .. }
             | Self::Blas { .. }
             | Self::Reserve { .. }
@@ -278,7 +295,8 @@ impl Step {
         match self {
             Self::Kernel { entry, .. }
             | Self::Trellis { entry, .. }
-            | Self::Expand { entry, .. } => Some(*entry),
+            | Self::Expand { entry, .. }
+            | Self::Staged { entry, .. } => Some(*entry),
             Self::Blas { .. } | Self::Reserve { .. } | Self::Clear { .. } | Self::Branch(_) => None,
         }
     }
@@ -288,7 +306,7 @@ impl Step {
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
-            Self::Kernel { entry, .. } => entry.name(),
+            Self::Kernel { entry, .. } | Self::Staged { entry, .. } => entry.name(),
             Self::Trellis { op, .. } => op.name(),
             Self::Blas { .. } => "blas gemm",
             Self::Expand { .. } => "trellis expand",
@@ -410,9 +428,9 @@ impl Plan {
     pub fn validate(&self) -> CoreResult<()> {
         for step in &self.steps {
             let (grid, block) = match step {
-                Step::Kernel { launch, .. } | Step::Expand { launch, .. } => {
-                    (launch.grid.volume(), launch.block.volume())
-                }
+                Step::Kernel { launch, .. }
+                | Step::Expand { launch, .. }
+                | Step::Staged { launch, .. } => (launch.grid.volume(), launch.block.volume()),
                 Step::Trellis {
                     blocks,
                     groups,

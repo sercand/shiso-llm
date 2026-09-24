@@ -1,6 +1,9 @@
 /*
  *
  * Deltas against the source, and nothing else: D1 (extern "C" linkage on the non-template kernels).
+ * D2 (shiso): the sequential recurrence records the start-of-pass state and its rows' inputs instead of a
+ * state per row, and q4e_gdn_replay_kernel rebuilds a kept row's state from them; the recurrence's
+ * arithmetic is unchanged.
  * No line of kernel arithmetic was edited, reordered or
  * reformatted; a change to any of it is a defect, not a cleanup.
  */
@@ -136,8 +139,19 @@ extern "C" __global__ void q4e_gdn_gates_kernel(
  *              out[j]   = <S[:,j], q> / sqrt(head_dim)
  */
 #define Q4E_GDN_SPLIT 4u   /* lanes per state column */
+/* The rollback slab of one session's recurrent slot (shiso): the state at the
+ * start of the pass, then the recurrence's own inputs for each recorded row -
+ * the pass's qkv row, then every row's decay, then every row's beta - laid out
+ * with the pass's own strides, so a replay reads them exactly as the pass did.
+ * The per-row state snapshots this replaced were a full state matrix a row:
+ * 3 MB a layer and a draft, which at depth three was 60% of a verify's
+ * recurrence time and at four sessions 10 ms of the step. */
+static __device__ __forceinline__ float *q4e_gdn_rec_rows(float *ckpt, uint32_t head_dim, uint32_t n_head_v) {
+    return ckpt + (uint64_t)n_head_v * head_dim * head_dim;
+}
+
 static __device__ __forceinline__ void q4e_gdn_recurrent_run(
-        float *attn_out, float *state,
+        float *attn_out, const float *state_in, float *state_out,
         const float *qkv, const float *decay, const float *beta,
         uint32_t head_dim, uint32_t n_head_k, uint32_t n_head_v,
         uint32_t k_offset, uint32_t v_offset, uint32_t stride, uint32_t n_tok,
@@ -157,11 +171,38 @@ static __device__ __forceinline__ void q4e_gdn_recurrent_run(
     const uint32_t seg = head_dim / Q4E_GDN_SPLIT;          /* 32 */
     const float scale = rsqrtf((float)head_dim);
     const uint32_t row_stride = head_dim + 1u;
+    /* A replay (attn_out == NULL) advances the state and produces nothing. */
+    const bool outputs = attn_out != NULL;
 
-    float *m = state + (uint64_t)h * head_dim * head_dim;
+    const float *m_in = state_in + (uint64_t)h * head_dim * head_dim;
+    float *m = state_out + (uint64_t)h * head_dim * head_dim;
+    /* The rollback record: this head's state as the pass found it, stored as
+     * it is read, and the inputs of each row a rollback could keep. */
+    const uint32_t recorded = (ckpt && n_tok > 1u) ? min(ckpt_cap, n_tok) : 0u;
+    float *s0 = recorded ? ckpt + (uint64_t)h * head_dim * head_dim : NULL;
     for (uint32_t idx = threadIdx.x; idx < head_dim * head_dim; idx += blockDim.x) {
         const uint32_t r = idx / head_dim, c = idx % head_dim;
-        s_state[r * row_stride + c] = m[idx];
+        const float v = m_in[idx];
+        s_state[r * row_stride + c] = v;
+        if (s0) s0[idx] = v;
+    }
+    if (recorded) {
+        float *rows = q4e_gdn_rec_rows(ckpt, head_dim, n_head_v);
+        float *rdec = rows + (uint64_t)ckpt_cap * stride;
+        float *rbeta = rdec + (uint64_t)ckpt_cap * n_head_v;
+        for (uint32_t t = 0; t < recorded; t++) {
+            const float *base = qkv + (uint64_t)t * stride;
+            float *dst = rows + (uint64_t)t * stride;
+            for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+                dst[v_offset + (uint64_t)h * head_dim + i] = base[v_offset + (uint64_t)h * head_dim + i];
+                if (h < n_head_k)
+                    dst[k_offset + (uint64_t)h * head_dim + i] = base[k_offset + (uint64_t)h * head_dim + i];
+            }
+            if (threadIdx.x == 0u) {
+                rdec[(uint64_t)t * n_head_v + h] = decay[(uint64_t)t * n_head_v + h];
+                rbeta[(uint64_t)t * n_head_v + h] = beta[(uint64_t)t * n_head_v + h];
+            }
+        }
     }
     __syncthreads();
 
@@ -177,13 +218,17 @@ static __device__ __forceinline__ void q4e_gdn_recurrent_run(
         float kq_part = 0.0f;
         if (sub == 0u && j < head_dim) {
             const float kv = k_d[j];
-            const float qv = q_d[j];
             s_k[j] = kv;
-            s_q[j] = qv;
-            kq_part = kv * qv;
+            if (outputs) {
+                const float qv = q_d[j];
+                s_q[j] = qv;
+                kq_part = kv * qv;
+            }
         }
-        kq_part = q4e_block_sum(kq_part);
-        if (threadIdx.x == 0u) s_kq = kq_part;
+        if (outputs) {
+            kq_part = q4e_block_sum(kq_part);
+            if (threadIdx.x == 0u) s_kq = kq_part;
+        }
         __syncthreads();
 
         const uint64_t gi = (uint64_t)t * n_head_v + h;
@@ -200,7 +245,7 @@ static __device__ __forceinline__ void q4e_gdn_recurrent_run(
             const uint32_t i = i0 + ((n + 8u * sub) & (seg - 1u));
             const float mv = row[i];
             sk = fmaf(mv, s_k[i], sk);
-            sq = fmaf(mv, s_q[i], sq);
+            if (outputs) sq = fmaf(mv, s_q[i], sq);
         }
         sk += __shfl_xor_sync(0xffffffffu, sk, 1);
         sk += __shfl_xor_sync(0xffffffffu, sk, 2);
@@ -208,7 +253,7 @@ static __device__ __forceinline__ void q4e_gdn_recurrent_run(
         sq += __shfl_xor_sync(0xffffffffu, sq, 2);
         const float delta = (v_d[j] - dec * sk) * bt;
 
-        if (sub == 0u) {
+        if (outputs && sub == 0u) {
             attn_out[((uint64_t)t * n_head_v + h) * head_dim + j] =
                 (dec * sq + delta * s_kq) * scale;
         }
@@ -217,20 +262,6 @@ static __device__ __forceinline__ void q4e_gdn_recurrent_run(
             row[i] = fmaf(row[i], dec, delta * s_k[i]);
         }
         __syncthreads();
-        if (ckpt && t < ckpt_cap && t + 1u < n_tok) {
-            /* Any thread may copy any element: the barrier above has every
-             * row's update for this token in shared memory, and the next
-             * token's updates wait behind the barriers at its start.  So the
-             * copy walks the tile in its global order, each warp storing 128
-             * consecutive floats.  The column-per-lane walk it replaced stored
-             * 32-byte fragments, and a four-token verify run spent most of its
-             * 84 us in them. */
-            float *ck = ckpt + ((uint64_t)t * n_head_v + h) * head_dim * head_dim;
-            for (uint32_t idx = threadIdx.x; idx < head_dim * head_dim; idx += blockDim.x) {
-                const uint32_t r = idx / head_dim, c = idx % head_dim;
-                ck[idx] = s_state[r * row_stride + c];
-            }
-        }
     }
 
     for (uint32_t idx = threadIdx.x; idx < head_dim * head_dim; idx += blockDim.x) {
@@ -246,7 +277,7 @@ extern "C" __global__ void __launch_bounds__(512) q4e_gdn_recurrent_kernel(
         uint32_t head_dim, uint32_t n_head_k, uint32_t n_head_v,
         uint32_t k_offset, uint32_t v_offset, uint32_t stride, uint32_t n_tok,
         float *ckpt, uint32_t ckpt_cap) {
-    q4e_gdn_recurrent_run(attn_out, state, qkv, decay, beta, head_dim, n_head_k, n_head_v,
+    q4e_gdn_recurrent_run(attn_out, state, state, qkv, decay, beta, head_dim, n_head_k, n_head_v,
                           k_offset, v_offset, stride, n_tok, ckpt, ckpt_cap);
 }
 
@@ -264,10 +295,27 @@ extern "C" __global__ void __launch_bounds__(512) q4e_gdn_recurrent_seg_kernel(
         float * const *ckpts, uint32_t ckpt_cap) {
     const uint32_t run = blockIdx.y;
     const uint64_t first = q4e_seg_start(run_lens, run);
-    q4e_gdn_recurrent_run(attn_out + first * n_head_v * head_dim, states[run],
+    q4e_gdn_recurrent_run(attn_out + first * n_head_v * head_dim, states[run], states[run],
                           qkv + first * stride, decay + first * n_head_v, beta + first * n_head_v,
                           head_dim, n_head_k, n_head_v, k_offset, v_offset, stride,
                           q4e_seg_len(run_lens, run), ckpts ? ckpts[run] : NULL, ckpt_cap);
+}
+
+/* A rollback (shiso): the state after the first n_keep rows of the last
+ * verify pass, recomputed from the slab's start-of-pass state and recorded
+ * inputs by the same function the pass ran, so bit for bit the state the pass
+ * had after those rows.  Grid n_head_v, 512 threads, the recurrence's shared
+ * memory. */
+extern "C" __global__ void __launch_bounds__(512) q4e_gdn_replay_kernel(
+        float *state, float *ckpt,
+        uint32_t head_dim, uint32_t n_head_k, uint32_t n_head_v,
+        uint32_t k_offset, uint32_t v_offset, uint32_t stride, uint32_t n_keep,
+        uint32_t ckpt_cap) {
+    const float *rows = q4e_gdn_rec_rows(ckpt, head_dim, n_head_v);
+    const float *rdec = rows + (uint64_t)ckpt_cap * stride;
+    const float *rbeta = rdec + (uint64_t)ckpt_cap * n_head_v;
+    q4e_gdn_recurrent_run(NULL, ckpt, state, rows, rdec, rbeta, head_dim, n_head_k, n_head_v,
+                          k_offset, v_offset, stride, n_keep, NULL, 0u);
 }
 
 /* Chunked-parallel gated delta rule, for prefill.

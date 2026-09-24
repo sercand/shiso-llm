@@ -46,7 +46,7 @@ use crate::sparse::shape::SparseShape;
 /// until the block count approaches a thousand while each split keeps a full
 /// pass, and the partial set it writes is the instantiated row count times the
 /// output width. This is the bound that set stays inside.
-pub const PROJECTION_PARTIAL_FLOATS: u32 = 2_048 * 16;
+pub const PROJECTION_PARTIAL_FLOATS: u32 = 2_048 * 32;
 
 /// Floats one sparse attention partial slab occupies.
 ///

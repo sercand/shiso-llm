@@ -438,6 +438,39 @@ template __global__ void q4e_matmul_f16_rows_kernel<15, float, float>(
         float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
 template __global__ void q4e_matmul_f16_rows_kernel<16, float, float>(
         float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+/* 17 to 32 rows (shiso): a batched verify pass stays on the per-row kernel. */
+template __global__ void q4e_matmul_f16_rows_kernel<17, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<18, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<19, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<20, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<21, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<22, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<23, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<24, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<25, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<26, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<27, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<28, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<29, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<30, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<31, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
+template __global__ void q4e_matmul_f16_rows_kernel<32, float, float>(
+        float *, const __half *, const float *, uint32_t, uint32_t, uint32_t);
 template __global__ void q4e_matmul_f16_rows_kernel<1, __half, float>(
         float *, const __half *, const __half *, uint32_t, uint32_t, uint32_t);
 template __global__ void q4e_matmul_f16_rows_kernel<2, __half, float>(

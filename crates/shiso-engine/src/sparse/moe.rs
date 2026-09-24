@@ -651,6 +651,12 @@ pub const WSD_MAX_ROWS: u32 = 32;
 /// # Errors
 ///
 /// As [`ws_experts`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "one statement per kernel argument is the point: these bodies are \
+              transcriptions of parameter lists, and a split that broke a list \
+              across two functions would hide the order being transcribed"
+)]
 pub fn wsd_experts(
     shape: &SparseShape,
     layer: LayerRef,

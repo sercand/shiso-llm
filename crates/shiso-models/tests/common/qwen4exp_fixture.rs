@@ -647,7 +647,7 @@ const fn untemplated(name: &'static str) -> Instantiation {
 /// and what the table is for is that a dispatch resolves at all. A build with
 /// the toolchain fills this in from the module's own symbol list, which is the
 /// only place those names can honestly come from.
-static CAPTURED: [(Instantiation, &str); 59] = [
+static CAPTURED: [(Instantiation, &str); 91] = [
     (
         Instantiation::new(
             kernels::MOD_HC,
@@ -696,6 +696,22 @@ static CAPTURED: [(Instantiation, &str); 59] = [
     (f16_rows(14), "captured_f16_rows_14"),
     (f16_rows(15), "captured_f16_rows_15"),
     (f16_rows(16), "captured_f16_rows_16"),
+    (f16_rows(17), "captured_f16_rows_17"),
+    (f16_rows(18), "captured_f16_rows_18"),
+    (f16_rows(19), "captured_f16_rows_19"),
+    (f16_rows(20), "captured_f16_rows_20"),
+    (f16_rows(21), "captured_f16_rows_21"),
+    (f16_rows(22), "captured_f16_rows_22"),
+    (f16_rows(23), "captured_f16_rows_23"),
+    (f16_rows(24), "captured_f16_rows_24"),
+    (f16_rows(25), "captured_f16_rows_25"),
+    (f16_rows(26), "captured_f16_rows_26"),
+    (f16_rows(27), "captured_f16_rows_27"),
+    (f16_rows(28), "captured_f16_rows_28"),
+    (f16_rows(29), "captured_f16_rows_29"),
+    (f16_rows(30), "captured_f16_rows_30"),
+    (f16_rows(31), "captured_f16_rows_31"),
+    (f16_rows(32), "captured_f16_rows_32"),
     (
         trellis(kernels::EXL3_GEMM, 4, 1),
         "captured_exl3_gemm_k4_s1",
@@ -844,6 +860,86 @@ static CAPTURED: [(Instantiation, &str); 59] = [
         untemplated(kernels::EXL3_MOE_WS_COMBINE),
         "captured_ws_combine",
     ),
+    // The decode-shaped routed block and dense projection.
+    (
+        trellis_bits(kernels::EXL3_MOE_WSD_GATEUP, 4),
+        "captured_wsd_gateup_k4",
+    ),
+    (
+        trellis_bits(kernels::EXL3_MOE_WSD_DOWN, 4),
+        "captured_wsd_down_k4",
+    ),
+    (
+        Instantiation::new(
+            kernels::MOD_EXL3,
+            kernels::EXL3_DGEMV,
+            TemplateArgs::TrellisTiles { bits: 4, tiles: 1 },
+        ),
+        "captured_dgemv_k4_t1",
+    ),
+    (
+        Instantiation::new(
+            kernels::MOD_EXL3,
+            kernels::EXL3_DGEMV,
+            TemplateArgs::TrellisTiles { bits: 4, tiles: 2 },
+        ),
+        "captured_dgemv_k4_t2",
+    ),
+    (
+        trellis_bits(kernels::EXL3_MOE_WSD_GATEUP, 5),
+        "captured_wsd_gateup_k5",
+    ),
+    (
+        trellis_bits(kernels::EXL3_MOE_WSD_DOWN, 5),
+        "captured_wsd_down_k5",
+    ),
+    (
+        Instantiation::new(
+            kernels::MOD_EXL3,
+            kernels::EXL3_DGEMV,
+            TemplateArgs::TrellisTiles { bits: 5, tiles: 1 },
+        ),
+        "captured_dgemv_k5_t1",
+    ),
+    (
+        Instantiation::new(
+            kernels::MOD_EXL3,
+            kernels::EXL3_DGEMV,
+            TemplateArgs::TrellisTiles { bits: 5, tiles: 2 },
+        ),
+        "captured_dgemv_k5_t2",
+    ),
+    (
+        trellis_bits(kernels::EXL3_MOE_WSD_GATEUP, 6),
+        "captured_wsd_gateup_k6",
+    ),
+    (
+        trellis_bits(kernels::EXL3_MOE_WSD_DOWN, 6),
+        "captured_wsd_down_k6",
+    ),
+    (
+        Instantiation::new(
+            kernels::MOD_EXL3,
+            kernels::EXL3_DGEMV,
+            TemplateArgs::TrellisTiles { bits: 6, tiles: 1 },
+        ),
+        "captured_dgemv_k6_t1",
+    ),
+    (
+        Instantiation::new(
+            kernels::MOD_EXL3,
+            kernels::EXL3_DGEMV,
+            TemplateArgs::TrellisTiles { bits: 6, tiles: 2 },
+        ),
+        "captured_dgemv_k6_t2",
+    ),
+    (untemplated(kernels::EXL3_MOE_WSD_PREP), "captured_wsd_prep"),
+    (untemplated(kernels::EXL3_MOE_WSD_ACT), "captured_wsd_act"),
+    (
+        untemplated(kernels::EXL3_MOE_WSD_COMBINE),
+        "captured_wsd_combine",
+    ),
+    (untemplated(kernels::EXL3_DGEMV_HAD), "captured_dgemv_had"),
 ];
 
 /// The options every test loads with.

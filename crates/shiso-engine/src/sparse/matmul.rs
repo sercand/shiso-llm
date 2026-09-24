@@ -79,6 +79,18 @@ impl Bound {
 /// BLAS tier, depending on how wide the output is.
 pub const MAX_ROWS: u32 = 16;
 
+/// The widest row count the half-precision per-row projection was
+/// instantiated for, which every pass up to it takes.
+///
+/// Wider than [`MAX_ROWS`] because a batched verify is wider than sixteen rows
+/// (four sessions at draft depth four are twenty), and past the per-row kernel
+/// the stream mixes round their activation to halves on the BLAS tier and the
+/// narrow projections take the strict multiply: either way a batched row's
+/// arithmetic was not its own verify pass's, and identical requests in one batch
+/// answered differently (measured at depth four). Every pass up to this width
+/// now sums a row the one way.
+pub const HALF_MAX_ROWS: u32 = 32;
+
 /// Output width at or below which a chunk stays on the per-row kernels however
 /// many rows it has.
 ///
@@ -108,7 +120,7 @@ pub const WIDE_CONTRACTION: u32 = 8_192;
 /// rounded, which keeps it off [`Projection::HalfBlas`].
 #[must_use]
 pub const fn half_exact(in_dim: u32, out_dim: u32, rows: u32) -> bool {
-    rows > MAX_ROWS && out_dim <= NARROW_OUTPUT && in_dim < WIDE_CONTRACTION
+    rows > HALF_MAX_ROWS && out_dim <= NARROW_OUTPUT && in_dim < WIDE_CONTRACTION
 }
 
 /// Whether the strict single-precision multiply is available for a chunk.
@@ -339,7 +351,7 @@ fn half(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Proj
     if half_exact(in_dim, out_dim, rows) && exact_blas(device) {
         return Ok(Projection::HalfExact { rows });
     }
-    if rows > MAX_ROWS && !half_exact(in_dim, out_dim, rows) {
+    if rows > HALF_MAX_ROWS && !half_exact(in_dim, out_dim, rows) {
         if !device.blas {
             return Err(CoreError::Unsupported {
                 what: "a wide half-precision chunk on a device with no BLAS tier",
@@ -350,7 +362,7 @@ fn half(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Proj
     }
     // A chunk past the instantiated width runs in passes of that width; the
     // plan describes one pass, because every pass is the same launch.
-    let pass = rows.min(MAX_ROWS);
+    let pass = rows.min(HALF_MAX_ROWS);
     let splits = kernels::f16_split(in_dim, out_dim);
     let chunk = half_chunk(in_dim, splits);
     // The instantiation is the same either way: a split projection writes
@@ -609,9 +621,14 @@ pub fn project(
         _ => false,
     };
     if passes {
+        let width = if weight.dtype == DType::F16 {
+            HALF_MAX_ROWS
+        } else {
+            MAX_ROWS
+        };
         let mut done = 0;
         while done < rows {
-            let take = (rows - done).min(MAX_ROWS);
+            let take = (rows - done).min(width);
             let src_bytes = u64::from(done) * u64::from(weight.in_dim) * 4;
             let dst_bytes = u64::from(done) * u64::from(weight.out_dim) * 4;
             project_one(
@@ -907,15 +924,12 @@ fn project_one(
             let staging = Staging::decode(rows, weight.in_dim, weight.out_dim, ksplit);
             let partials = Staging::decode_partials(rows, weight.in_dim);
             let warps = u64::from(rows) * u64::from(weight.in_dim / 128);
-            out.push(Step::Expand {
+            out.push(Step::Staged {
                 entry: Entry::template(
                     MOD_EXL3,
                     kernels::EXL3_DGEMV_HAD,
                     TemplateArgs::Untemplated,
                 ),
-                k: weight.in_dim,
-                n: weight.out_dim,
-                bits,
                 launch: Launch::linear(blocks_for(warps, 8), 256),
                 staging,
                 // `A, A_had, suh, size_m, size_k`
@@ -928,15 +942,12 @@ fn project_one(
                 ]),
             });
             let group = 16 * kernels::EXL3_DGEMV_WARPS;
-            out.push(Step::Expand {
+            out.push(Step::Staged {
                 entry: Entry::template(
                     MOD_EXL3,
                     kernels::EXL3_DGEMV,
                     TemplateArgs::TrellisTiles { bits, tiles },
                 ),
-                k: weight.in_dim,
-                n: weight.out_dim,
-                bits,
                 launch: Launch::new(
                     shiso_core::Extent3::new(weight.out_dim / group, ksplit, 1),
                     kernels::EXL3_DGEMV_WARPS * 32,
@@ -1222,7 +1233,7 @@ mod tests {
             let Projection::HalfRows { rows, .. } = plan else {
                 panic!("without the strict multiply a narrow output runs in passes: {plan:?}");
             };
-            assert_eq!(rows, MAX_ROWS, "one pass is the instantiated width");
+            assert_eq!(rows, HALF_MAX_ROWS, "one pass is the instantiated width");
         }
     }
 

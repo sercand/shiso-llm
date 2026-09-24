@@ -20,7 +20,9 @@
 //! The records these cases restore from are written by the sequential recurrent
 //! kernel and the n-gram convolution, neither of which has ever executed. What
 //! is asserted is that the plan hands those kernels the slab and the record
-//! count, and that the copy back reads the record the accept rule named.
+//! count, that the copies back read the record the accept rule named, and that
+//! the state matrix - which is not copied back but replayed from the state the
+//! pass started at - is replayed over exactly the rows the rule kept.
 
 #[path = "common/qwen4exp_fixture.rs"]
 mod fixture;
@@ -76,7 +78,16 @@ fn seed(model: &Qwen4ExpModel, session: SessionId, depth: SpecDepth) {
             .recurrent_rollback(ordinal)
             .expect("a speculative session carries records");
         seed_records(model, conv_ckpt, conv.len(), depth);
-        seed_records(model, state_ckpt, state.len(), depth);
+        // The state slab is the start-of-pass state and the rows' inputs, which
+        // only a replay reads; its size is what is checked here.
+        assert_eq!(
+            state_ckpt.len(),
+            shiso_engine::sparse::paged::state_rollback_bytes(
+                model.stack().shape(),
+                depth.rollback_slots()
+            ),
+            "the state slab is one state and one input record per drafted row"
+        );
     }
     let window = live
         .ngram_window()
@@ -111,19 +122,50 @@ fn seed_records(
     }
 }
 
-/// Asserts that every piece of per-position state holds `want` end to end.
-fn assert_state_is(model: &Qwen4ExpModel, session: SessionId, want: u8) {
+/// Asserts that every copied piece of per-position state holds `want` end to
+/// end, and that every state matrix was replayed over `want - 0x10 + 1` rows
+/// from its own slab.
+fn assert_state_is(
+    model: &Qwen4ExpModel,
+    fake: &fixture::FakeBackend,
+    session: SessionId,
+    want: u8,
+) {
     let stack = model.stack();
     let live = stack.session(session).expect("the session is open");
+    let replays: Vec<_> = fake
+        .launches()
+        .into_iter()
+        .filter(|launch| launch.entry == "q4e_gdn_replay_kernel")
+        .collect();
+    assert_eq!(
+        replays.len(),
+        live.recurrent_slots(),
+        "one replay per recurrent slot"
+    );
+    let keep = u32::from(want - 0x10) + 1;
     for ordinal in 0..u32::try_from(live.recurrent_slots()).expect("a few slots") {
         let (conv, state) = live.recurrent(ordinal).expect("the slot exists");
         assert!(
             read(model, conv).iter().all(|byte| *byte == want),
             "slot {ordinal}'s convolution window is not record {want:#x}"
         );
-        assert!(
-            read(model, state).iter().all(|byte| *byte == want),
-            "slot {ordinal}'s state matrix is not record {want:#x}"
+        let (_, slab) = live.recurrent_rollback(ordinal).expect("records");
+        let replay = &replays[usize::try_from(ordinal).expect("a few slots")];
+        assert_eq!(
+            replay.args[0],
+            fixture::Arg::Buffer(state.id().get(), state.offset(), state.len()),
+            "slot {ordinal} replays into its own state"
+        );
+        assert_eq!(
+            replay.args[1],
+            fixture::Arg::Buffer(slab.id().get(), slab.offset(), slab.len()),
+            "slot {ordinal} replays from its own slab"
+        );
+        assert_eq!(
+            replay.args[8],
+            fixture::Arg::U32(keep),
+            "slot {ordinal} replays the kept rows"
         );
     }
     let window = live
@@ -135,18 +177,23 @@ fn assert_state_is(model: &Qwen4ExpModel, session: SessionId, want: u8) {
     );
 }
 
-/// A loaded speculative model with one open session.
-fn speculative() -> (tempfile::TempDir, Qwen4ExpModel, SessionId) {
-    let (dir, _backend, mut model) = fixture::loaded_with(fixture::speculative_options(DRAFTS));
+/// A loaded speculative model with one open session, and the device under it.
+fn speculative() -> (
+    tempfile::TempDir,
+    std::sync::Arc<fixture::FakeBackend>,
+    Qwen4ExpModel,
+    SessionId,
+) {
+    let (dir, backend, mut model) = fixture::loaded_with(fixture::speculative_options(DRAFTS));
     let session = model.open_session().expect("a session opens");
-    (dir, model, session)
+    (dir, backend, model, session)
 }
 
 #[test]
 fn a_draft_the_target_rejected_outright_leaves_the_session_on_the_token_it_committed() {
     // Nothing accepted, so the session has to stand where the one committed
     // token left it - record zero - and on no position the drafts reached.
-    let (_dir, model, session) = speculative();
+    let (_dir, fake, model, session) = speculative();
     let depth = SpecDepth::new(DRAFTS);
     seed(&model, session, depth);
     let before_written = model
@@ -161,7 +208,7 @@ fn a_draft_the_target_rejected_outright_leaves_the_session_on_the_token_it_commi
         .spec_rollback(session, rollback)
         .expect("a speculative session can roll back");
 
-    assert_state_is(&model, session, 0x10);
+    assert_state_is(&model, &fake, session, 0x10);
     assert_eq!(
         model
             .stack()
@@ -176,7 +223,7 @@ fn a_draft_the_target_rejected_outright_leaves_the_session_on_the_token_it_commi
 
 #[test]
 fn a_partly_accepted_draft_restores_the_record_of_the_last_row_the_target_agreed_with() {
-    let (_dir, model, session) = speculative();
+    let (_dir, fake, model, session) = speculative();
     seed(&model, session, SpecDepth::new(DRAFTS));
     let rollback = Rollback::new(3, DRAFTS).expect("one of four was rejected");
     model
@@ -185,7 +232,7 @@ fn a_partly_accepted_draft_restores_the_record_of_the_last_row_the_target_agreed
         .expect("a speculative session can roll back");
     // Record three, not record four: the slab holds one record per drafted row,
     // indexed by the row it was written after.
-    assert_state_is(&model, session, 0x13);
+    assert_state_is(&model, &fake, session, 0x13);
 }
 
 #[test]
@@ -193,7 +240,7 @@ fn every_piece_of_per_position_state_is_restored_and_not_only_the_recurrent_slot
     // The n-gram block's dilated window advances per position exactly as a
     // recurrent slot does. Restoring the slots and leaving it behind would put
     // the stack on two different positions at once, and would still answer.
-    let (_dir, model, session) = speculative();
+    let (_dir, _fake, model, session) = speculative();
     seed(&model, session, SpecDepth::new(DRAFTS));
     model
         .stack()

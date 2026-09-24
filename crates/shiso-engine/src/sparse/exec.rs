@@ -92,16 +92,18 @@ fn step_dump_all() -> bool {
 /// The grid, block and staging a step asks for, for a diagnostic.
 fn step_geometry(step: &Step) -> String {
     match step {
-        Step::Kernel { launch, .. } | Step::Expand { launch, .. } => format!(
-            "grid {}x{}x{} block {}x{}x{} smem {}",
-            launch.grid.x,
-            launch.grid.y,
-            launch.grid.z,
-            launch.block.x,
-            launch.block.y,
-            launch.block.z,
-            launch.smem,
-        ),
+        Step::Kernel { launch, .. } | Step::Expand { launch, .. } | Step::Staged { launch, .. } => {
+            format!(
+                "grid {}x{}x{} block {}x{}x{} smem {}",
+                launch.grid.x,
+                launch.grid.y,
+                launch.grid.z,
+                launch.block.x,
+                launch.block.y,
+                launch.block.z,
+                launch.smem,
+            )
+        }
         Step::Trellis {
             op,
             blocks,
@@ -145,6 +147,7 @@ fn destination(step: &Step) -> usize {
         },
         Step::Kernel { .. }
         | Step::Expand { .. }
+        | Step::Staged { .. }
         | Step::Blas { .. }
         | Step::Reserve { .. }
         | Step::Clear { .. }
@@ -155,9 +158,10 @@ fn destination(step: &Step) -> usize {
 /// What a step is called in a diagnostic.
 fn step_name(step: &Step) -> &'static str {
     match step {
-        Step::Kernel { entry, .. } | Step::Expand { entry, .. } | Step::Trellis { entry, .. } => {
-            entry.name()
-        }
+        Step::Kernel { entry, .. }
+        | Step::Expand { entry, .. }
+        | Step::Trellis { entry, .. }
+        | Step::Staged { entry, .. } => entry.name(),
         Step::Reserve { .. } => "reserve scratch",
         Step::Clear { .. } => "zero a buffer",
         Step::Branch(_) => "branch",
@@ -214,6 +218,12 @@ impl<'a> Exec<'a> {
                 args,
             }
             | Step::Expand {
+                entry,
+                launch,
+                args,
+                ..
+            }
+            | Step::Staged {
                 entry,
                 launch,
                 args,
@@ -508,7 +518,10 @@ impl<'a> Exec<'a> {
                 self.dump_destination(at, step);
             }
             match step {
-                Step::Kernel { .. } | Step::Trellis { .. } | Step::Expand { .. } => {
+                Step::Kernel { .. }
+                | Step::Trellis { .. }
+                | Step::Expand { .. }
+                | Step::Staged { .. } => {
                     report.launches = report.launches.saturating_add(1);
                 }
                 Step::Reserve { .. } => {
@@ -653,7 +666,10 @@ impl<'a> Exec<'a> {
                     .filter(|step| {
                         matches!(
                             step,
-                            Step::Kernel { .. } | Step::Trellis { .. } | Step::Expand { .. }
+                            Step::Kernel { .. }
+                                | Step::Trellis { .. }
+                                | Step::Expand { .. }
+                                | Step::Staged { .. }
                         )
                     })
                     .count();

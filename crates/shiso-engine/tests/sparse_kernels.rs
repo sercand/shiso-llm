@@ -315,6 +315,14 @@ fn every_path() -> Plan {
             moe::block(&shape, &expert_desc(&shape), LayerRef::target(0), rows, GPU)
                 .expect("a trellis expert stack has a routed stage"),
         );
+        if rows == 1 {
+            // The draft head's single row takes the grouped launches, which is
+            // the one routed stage the cooperative fan-out still serves.
+            plan.append(
+                moe::block(&shape, &expert_desc(&shape), LayerRef::draft(), rows, GPU)
+                    .expect("a trellis expert stack has a draft routed stage"),
+            );
+        }
         // Three rows, a verify pass's width: the one row count that still
         // takes the fused cooperative stage.
         // The fused cooperative stage is no longer on the routed block's own
@@ -515,6 +523,7 @@ fn exl3_sources() -> String {
         "exl3/exl3_moe_common.cuh",
         "exl3/exl3_moe_kernel.cuh",
         "exl3/exl3_moe_ws.cuh",
+        "exl3/exl3_dgemv.cuh",
         "exl3/exl3_reconstruct.cuh",
         "exl3/KERNEL.toml",
     ]
@@ -847,9 +856,21 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         kernels::EXL3_MOE_WS_DOWN,
         kernels::EXL3_MOE_WS_DOWN_H,
         kernels::EXL3_MOE_WS_COMBINE,
+        kernels::EXL3_MOE_WSD_PREP,
+        kernels::EXL3_MOE_WSD_GATEUP,
+        kernels::EXL3_MOE_WSD_ACT,
+        kernels::EXL3_MOE_WSD_DOWN,
+        kernels::EXL3_MOE_WSD_COMBINE,
     ] {
         let pointers = parse_line_definition(&ws, name)
             .unwrap_or_else(|| panic!("{name} is defined in the weight-stationary header"));
+        out.insert(name.to_owned(), Signature { pointers });
+    }
+    // The decode-shaped dense projection, in a header of its own.
+    let dgemv = read_kernel_file("exl3/exl3_dgemv.cuh");
+    for name in [kernels::EXL3_DGEMV_HAD, kernels::EXL3_DGEMV] {
+        let pointers = parse_line_definition(&dgemv, name)
+            .unwrap_or_else(|| panic!("{name} is defined in the decode-shaped header"));
         out.insert(name.to_owned(), Signature { pointers });
     }
     let reconstruct = read_kernel_file("exl3/exl3_reconstruct.cuh");
@@ -1362,12 +1383,12 @@ fn a_trellis_pair_stays_one_launch_up_to_the_expand_threshold_and_splits_past_it
 
     let shape = shape();
     let inter = shape.moe.intermediate;
-    let pair = |rows| {
+    let pair_of = |out: u32, rows| {
         let mut plan = Plan::new();
         matmul::project_pair(
             &mut plan,
-            trellis(shape.hidden, inter),
-            trellis(shape.hidden, inter),
+            trellis(shape.hidden, out),
+            trellis(shape.hidden, out),
             Bound::new(
                 WeightRef::layer(LayerRef::target(0), Role::SharedGate),
                 Operand::Scratch(Buf::Mixed),
@@ -1384,17 +1405,25 @@ fn a_trellis_pair_stays_one_launch_up_to_the_expand_threshold_and_splits_past_it
         .expect("a matched trellis pair has a tier");
         plan
     };
-    // One grouped launch, which runs both weights over half a device each
-    // rather than one after the other.
-    let grouped = pair(kernels::EXL3_RECONSTRUCT_ROWS);
-    assert_eq!(grouped.count("trellis pair"), 1);
-    assert_eq!(grouped.count("trellis expand"), 0);
+    let pair = |rows| pair_of(inter, rows);
+    // Narrow enough for the decode-shaped projection, the pair is two of
+    // those at every row count that projection covers.
+    let decoded = pair(kernels::EXL3_RECONSTRUCT_ROWS);
+    assert_eq!(decoded.count("trellis pair"), 0);
+    assert_eq!(decoded.count(kernels::EXL3_DGEMV), 2);
+    assert_eq!(decoded.count("trellis expand"), 0);
     // One row past it each weight is expanded once and multiplied: there is no
     // grouped form of the expanded path, so the pair stops being one launch.
     let split = pair(kernels::EXL3_RECONSTRUCT_ROWS + 1);
     assert_eq!(split.count("trellis pair"), 0);
     assert_eq!(split.count("trellis expand"), 2);
     assert_eq!(split.count("blas gemm"), 2);
+    // A pair wide on both sides is one grouped launch up to the threshold,
+    // which runs both weights over half a device each rather than one after
+    // the other.
+    let grouped = pair_of(2_048, kernels::EXL3_RECONSTRUCT_ROWS);
+    assert_eq!(grouped.count("trellis pair"), 1);
+    assert_eq!(grouped.count("trellis expand"), 0);
     // And the grouped launch's two output slots are different buffers: one
     // launch writing one destination twice is a gate that is its own up.
     let step = grouped

@@ -445,6 +445,70 @@ fn rebind_work_stream(backend: &CudaBackend) {
     }
 }
 
+/// Opens a branch: the branch stream waits for everything queued on the main
+/// stream so far, and launches go to it until [`resume`].
+///
+/// # Errors
+///
+/// [`shiso_core::CoreError::Backend`] when a branch is already open, and when
+/// the driver refuses the record or the wait.
+pub(crate) fn fork(backend: &CudaBackend) -> CoreResult<()> {
+    backend.device.bind()?;
+    let mut state = backend.state.lock();
+    if state.graphs.branch {
+        return Err(host_error("fork", "a fork inside an open branch"));
+    }
+    let main = state.graphs.main_stream(&backend.device);
+    let side = state.graphs.side_stream(&backend.device);
+    let event = backend.device.fork_event();
+    // SAFETY: both streams and the event are owned by `backend.device` and
+    // live for as long as it does.
+    unsafe { nvidia::event_record(event, main) }?;
+    // SAFETY: as above.
+    unsafe { nvidia::stream_wait_event(side, event) }?;
+    state.graphs.branch = true;
+    Ok(())
+}
+
+/// Ends a branch's launches: the branch stream marks where it got to, and
+/// launches go back to the main stream, which runs on beside it until
+/// [`join`].
+///
+/// # Errors
+///
+/// [`shiso_core::CoreError::Backend`] when no branch is open, and when the
+/// driver refuses the record.
+pub(crate) fn resume(backend: &CudaBackend) -> CoreResult<()> {
+    backend.device.bind()?;
+    let mut state = backend.state.lock();
+    if !state.graphs.branch {
+        return Err(host_error("resume", "a resume with no branch open"));
+    }
+    let side = state.graphs.side_stream(&backend.device);
+    // SAFETY: the stream and the event are owned by `backend.device`.
+    unsafe { nvidia::event_record(backend.device.join_event(), side) }?;
+    state.graphs.branch = false;
+    Ok(())
+}
+
+/// Makes the main stream wait for the branch that last resumed.
+///
+/// # Errors
+///
+/// [`shiso_core::CoreError::Backend`] when a branch is still open, and when
+/// the driver refuses the wait.
+pub(crate) fn join(backend: &CudaBackend) -> CoreResult<()> {
+    backend.device.bind()?;
+    let state = backend.state.lock();
+    if state.graphs.branch {
+        return Err(host_error("join", "a join inside an open branch"));
+    }
+    let main = state.graphs.main_stream(&backend.device);
+    // SAFETY: the stream and the event are owned by `backend.device`.
+    unsafe { nvidia::stream_wait_event(main, backend.device.join_event()) }?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use shiso_core::{CoreError, GraphKey};
@@ -617,68 +681,4 @@ mod tests {
         let cache = cache();
         assert_eq!(cache.get(GraphKey::new(42)), None);
     }
-}
-
-/// Opens a branch: the branch stream waits for everything queued on the main
-/// stream so far, and launches go to it until [`resume`].
-///
-/// # Errors
-///
-/// [`shiso_core::CoreError::Backend`] when a branch is already open, and when
-/// the driver refuses the record or the wait.
-pub(crate) fn fork(backend: &CudaBackend) -> CoreResult<()> {
-    backend.device.bind()?;
-    let mut state = backend.state.lock();
-    if state.graphs.branch {
-        return Err(host_error("fork", "a fork inside an open branch"));
-    }
-    let main = state.graphs.main_stream(&backend.device);
-    let side = state.graphs.side_stream(&backend.device);
-    let event = backend.device.fork_event();
-    // SAFETY: both streams and the event are owned by `backend.device` and
-    // live for as long as it does.
-    unsafe { nvidia::event_record(event, main) }?;
-    // SAFETY: as above.
-    unsafe { nvidia::stream_wait_event(side, event) }?;
-    state.graphs.branch = true;
-    Ok(())
-}
-
-/// Ends a branch's launches: the branch stream marks where it got to, and
-/// launches go back to the main stream, which runs on beside it until
-/// [`join`].
-///
-/// # Errors
-///
-/// [`shiso_core::CoreError::Backend`] when no branch is open, and when the
-/// driver refuses the record.
-pub(crate) fn resume(backend: &CudaBackend) -> CoreResult<()> {
-    backend.device.bind()?;
-    let mut state = backend.state.lock();
-    if !state.graphs.branch {
-        return Err(host_error("resume", "a resume with no branch open"));
-    }
-    let side = state.graphs.side_stream(&backend.device);
-    // SAFETY: the stream and the event are owned by `backend.device`.
-    unsafe { nvidia::event_record(backend.device.join_event(), side) }?;
-    state.graphs.branch = false;
-    Ok(())
-}
-
-/// Makes the main stream wait for the branch that last resumed.
-///
-/// # Errors
-///
-/// [`shiso_core::CoreError::Backend`] when a branch is still open, and when
-/// the driver refuses the wait.
-pub(crate) fn join(backend: &CudaBackend) -> CoreResult<()> {
-    backend.device.bind()?;
-    let state = backend.state.lock();
-    if state.graphs.branch {
-        return Err(host_error("join", "a join inside an open branch"));
-    }
-    let main = state.graphs.main_stream(&backend.device);
-    // SAFETY: the stream and the event are owned by `backend.device`.
-    unsafe { nvidia::stream_wait_event(main, backend.device.join_event()) }?;
-    Ok(())
 }

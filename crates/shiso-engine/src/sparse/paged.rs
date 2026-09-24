@@ -240,6 +240,22 @@ pub fn state_bytes(shape: &SparseShape) -> u64 {
         .saturating_mul(F32_BYTES)
 }
 
+/// Bytes of one recurrent slot's rollback slab at `records` recorded rows.
+///
+/// The state matrix as a verify pass found it, then each recorded row's own
+/// recurrence inputs - its projected row, its decay and its beta - from which
+/// a rollback replays the kept rows (`q4e_gdn_replay_kernel`). A state matrix
+/// a row instead was 3 MB a layer and a draft for the pass to write.
+#[must_use]
+pub fn state_rollback_bytes(shape: &SparseShape, records: u32) -> u64 {
+    let row = u64::from(shape.gdn_in_dim()).saturating_add(2 * u64::from(shape.gdn.v_heads));
+    state_bytes(shape).saturating_add(
+        u64::from(records)
+            .saturating_mul(row)
+            .saturating_mul(F32_BYTES),
+    )
+}
+
 /// Bytes of the n-gram block's dilated convolution window.
 #[must_use]
 pub fn ple_window_bytes(shape: &SparseShape) -> u64 {

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use shiso_core::backend::Backend;
+use shiso_core::backend::{Backend, KernelArg, LaunchArgs};
 use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc_tagged};
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{LayerIdx, SessionId, TokenId};
@@ -43,13 +43,14 @@ use crate::options::EngineOptions;
 use crate::sessions::clear_range;
 use crate::shape::LayerKind;
 use crate::sparse::island::{GraphPolicy, IslandKey};
-use crate::sparse::kernels::F32_BYTES;
 use crate::sparse::kernels::IDX_QUERY_BLOCK;
+use crate::sparse::kernels::{self, F32_BYTES};
 use crate::sparse::matmul::Device;
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::mtp::{Rollback, SpecDepth};
 use crate::sparse::paged::{
     PagePlanes, PagedKv, SessionPages, conv_state_bytes, ple_window_bytes, state_bytes,
+    state_rollback_bytes,
 };
 use crate::sparse::plan::Plan;
 use crate::sparse::ple::{self, PleGather};
@@ -118,7 +119,7 @@ pub struct SparseOptions {
     /// Empty on a host that never compiled the kernels, which makes every
     /// template dispatch a typed refusal naming the missing build artifact
     /// rather than a guessed name.
-    pub entries: crate::sparse::kernels::EntryTable,
+    pub entries: kernels::EntryTable,
     /// Bytes the streamed n-gram reader may hold rows in.
     ///
     /// A per-stream fact rather than a process one: the table is read a
@@ -158,7 +159,7 @@ impl SparseOptions {
             co_resident_blocks: 0,
             tiled_attention: true,
             tensor_core: true,
-            entries: crate::sparse::kernels::EntryTable::new(&[]),
+            entries: kernels::EntryTable::new(&[]),
             ngram_cache_bytes: NGRAM_CACHE_BYTES,
             ngram_reader: shiso_ple::PleConfig::DEFAULT,
             prefill_rows: MAX_PREFILL_CHUNK,
@@ -579,22 +580,22 @@ fn check_prefill_rows(rows: u32) -> CoreResult<()> {
 /// what [`SparseStack::open_session`] allocates, counted the same way.
 fn session_bytes(shape: &SparseShape, spec: SpecDepth) -> u64 {
     let records = u64::from(spec.rollback_slots());
-    let copies = if spec.is_speculative() {
-        records.saturating_add(1)
-    } else {
-        1
-    };
-    let recurrent = u64::from(shape.count(LayerKind::Gdn))
-        .saturating_mul(conv_state_bytes(shape).saturating_add(state_bytes(shape)));
-    let pending = if spec.is_speculative() {
-        u64::from(shape.stream_dim()).saturating_mul(F32_BYTES)
-    } else {
-        0
-    };
-    recurrent
-        .saturating_add(ple_window_bytes(shape))
-        .saturating_mul(copies)
-        .saturating_add(pending)
+    let slots = u64::from(shape.count(LayerKind::Gdn));
+    let live = slots
+        .saturating_mul(conv_state_bytes(shape).saturating_add(state_bytes(shape)))
+        .saturating_add(ple_window_bytes(shape));
+    if !spec.is_speculative() {
+        return live;
+    }
+    let rollback = slots
+        .saturating_mul(
+            records
+                .saturating_mul(conv_state_bytes(shape))
+                .saturating_add(state_rollback_bytes(shape, spec.rollback_slots())),
+        )
+        .saturating_add(records.saturating_mul(ple_window_bytes(shape)));
+    let pending = u64::from(shape.stream_dim()).saturating_mul(F32_BYTES);
+    live.saturating_add(rollback).saturating_add(pending)
 }
 
 impl SparseStack {
@@ -858,7 +859,7 @@ impl SparseStack {
                         state: alloc_tagged(
                             &self.backend,
                             MemTag::RecurrentRollback,
-                            records.saturating_mul(state_bytes),
+                            state_rollback_bytes(&self.shape, self.opts.spec.rollback_slots()),
                         )?,
                     })
                 } else {
@@ -1118,7 +1119,15 @@ impl SparseStack {
     pub fn spec_rollback(&self, session: SessionId, rollback: Rollback) -> CoreResult<()> {
         let live = self.session(session)?;
         let conv_bytes = conv_state_bytes(&self.shape);
-        let state_bytes = state_bytes(&self.shape);
+        // The state matrix is not copied back but rebuilt: the slab holds the
+        // state the pass started from and its rows' inputs, and the replay runs
+        // the kept rows through the pass's own recurrence (see
+        // `state_rollback_bytes`).
+        let replay = self.opts.entries.resolve(kernels::Entry::plain(
+            kernels::MOD_GDN,
+            "q4e_gdn_replay_kernel",
+        ))?;
+        let launch = kernels::gdn_recurrent(self.shape.gdn.head_dim, self.shape.gdn.v_heads);
         for ordinal in 0..u32::try_from(live.states.len()).unwrap_or(u32::MAX) {
             let (conv, state) = live.recurrent(ordinal)?;
             let (conv_ckpt, state_ckpt) = live.recurrent_rollback(ordinal)?;
@@ -1126,9 +1135,28 @@ impl SparseStack {
                 conv,
                 conv_ckpt.slice(rollback.offset(conv_bytes), conv_bytes)?,
             )?;
-            self.backend.copy_d2d(
-                state,
-                state_ckpt.slice(rollback.offset(state_bytes), state_bytes)?,
+            // `state, ckpt, head_dim, n_head_k, n_head_v, k_offset, v_offset,
+            //  stride, n_keep, ckpt_cap`
+            let args = [
+                KernelArg::Buffer(state),
+                KernelArg::Buffer(state_ckpt),
+                KernelArg::U32(self.shape.gdn.head_dim),
+                KernelArg::U32(self.shape.gdn.qk_heads),
+                KernelArg::U32(self.shape.gdn.v_heads),
+                KernelArg::U32(self.shape.gdn_qk_dim()),
+                KernelArg::U32(2 * self.shape.gdn_qk_dim()),
+                KernelArg::U32(self.shape.gdn_in_dim()),
+                KernelArg::U32(rollback.slot().saturating_add(1)),
+                KernelArg::U32(self.opts.spec.rollback_slots()),
+            ];
+            self.backend.run(
+                replay,
+                &LaunchArgs {
+                    grid: launch.grid,
+                    block: launch.block,
+                    smem_bytes: launch.smem,
+                    args: &args,
+                },
             )?;
         }
         if let (Some(window), Some(records)) = (live.ngram_window(), live.ngram_window_rollback()) {

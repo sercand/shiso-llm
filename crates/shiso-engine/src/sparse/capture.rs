@@ -232,6 +232,11 @@ fn kind(args: &[Arg], at: usize) -> Option<Elem> {
 /// The template name is matched against the constants rather than kept from the
 /// symbol, so the `'static` name in the key is this crate's own and a symbol
 /// carrying some other template is skipped rather than interned.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per template the kernel set instantiates: the table is \
+              the point, and splitting it would hide which name maps to which key"
+)]
 fn classify(module: &'static str, template: &str, args: &[Arg]) -> Option<Instantiation> {
     let of =
         |name: &'static str, template_args| Some(Instantiation::new(module, name, template_args));

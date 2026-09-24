@@ -8,10 +8,10 @@ registry key; a kernel inside it is fetched by the exact name recorded here.
 Two kinds of entry live in these units, and they are fetched differently.
 
 **Plain kernels** carry C linkage, so the name below is the name the driver
-answers to, verbatim. There are 55 of them.
+answers to, verbatim. There are 57 of them.
 
 **Template kernels** do not. They are instantiated explicitly at the bottom of
-their translation unit - 105 instantiations across 10 templates - and each one
+their translation unit - 121 instantiations across 10 templates - and each one
 gets a C++-mangled name that depends on the compiler's mangling of its argument
 list. Those names are NOT written out below, and guessing them would be the
 worst kind of plausible: a mangled name that is subtly wrong fails at lookup
@@ -58,6 +58,7 @@ back to the kernel it belongs to.
 ### `q4e_moe`
 
 - `q4e_moe_route_kernel`
+- `q4e_moe_route_sort_small_kernel`
 - `q4e_swiglu_kernel`
 - `q4e_moe_combine_kernel`
 - `q4e_shared_add_kernel`
@@ -78,6 +79,7 @@ back to the kernel it belongs to.
 - `q4e_gdn_recurrent_batch_kernel`
 - `q4e_gdn_conv_seg_kernel`
 - `q4e_gdn_recurrent_seg_kernel`
+- `q4e_gdn_replay_kernel`
 
 ### `q4e_gdn_tc`
 
@@ -241,6 +243,22 @@ identify the kernel a captured name belongs to.
 | `q4e_matmul_f16_rows_kernel` | `14, float, float` |
 | `q4e_matmul_f16_rows_kernel` | `15, float, float` |
 | `q4e_matmul_f16_rows_kernel` | `16, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `17, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `18, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `19, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `20, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `21, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `22, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `23, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `24, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `25, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `26, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `27, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `28, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `29, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `30, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `31, float, float` |
+| `q4e_matmul_f16_rows_kernel` | `32, float, float` |
 | `q4e_matmul_f16_rows_kernel` | `1, __half, float` |
 | `q4e_matmul_f16_rows_kernel` | `2, __half, float` |
 | `q4e_matmul_f16_rows_kernel` | `3, __half, float` |
@@ -341,6 +359,7 @@ refuses the call outright when `n_embd > 256 * Q4E_HC_FUSE_MAX`.
 | Kernel | Grid | Block | Dynamic shared memory |
 |---|---|---|---|
 | `q4e_moe_route_kernel` | `n_tok` | `256` | `n_expert * 4` |
+| `q4e_moe_route_sort_small_kernel` | `1` | `1024` | `0` |
 | `q4e_swiglu_kernel` | `ceil(n / 256)` | `256` | `0` |
 | `q4e_moe_combine_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
 | `q4e_shared_add_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
@@ -375,6 +394,7 @@ rounds: one float per expert.
 | `q4e_gdn_recurrent_batch_kernel` | `(n_head_v, n_row, 1)` | `head_dim * Q4E_GDN_SPLIT` | `head_dim * (head_dim + 1) * 4` — **opt-in** |
 | `q4e_gdn_conv_seg_kernel` | `(ceil(channels / 256), n_run, 1)` | `256` | `0` |
 | `q4e_gdn_recurrent_seg_kernel` | `(n_head_v, n_run, 1)` | `head_dim * Q4E_GDN_SPLIT` | `head_dim * (head_dim + 1) * 4` — **opt-in** |
+| `q4e_gdn_replay_kernel` | `n_head_v` | `head_dim * Q4E_GDN_SPLIT` | `head_dim * (head_dim + 1) * 4` — **opt-in** |
 
 The two `_seg` kernels are a segmented verify's: one launch for every
 sequence's run, `blockIdx.y` the run, with the run lengths packed one byte per

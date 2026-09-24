@@ -361,11 +361,15 @@ fn the_grouped_expert_stage_has_its_staging_reserved_outside_every_island() {
         .iter()
         .position(|n| *n == "stream scratch")
         .expect("the staging is reserved");
-    let experts = names
+    // The first launch that carves the staging, whichever tier it is: the
+    // shared expert's decode-shaped projections at this width.
+    let carves = pass
+        .plan
+        .steps()
         .iter()
-        .position(|n| *n == "trellis pair")
-        .expect("the experts run");
-    assert!(reserve < experts);
+        .position(|step| step.staging().bytes > 0 && step.name() != "stream scratch")
+        .expect("a launch in the pass carves the staging");
+    assert!(reserve < carves);
 }
 
 #[test]
