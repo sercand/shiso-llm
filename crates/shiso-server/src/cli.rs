@@ -250,6 +250,14 @@ pub struct ServeArgs {
     /// at each width pays a capture. Read by the sparse family's arm.
     #[arg(long, env = "SHISO_CAPTURE_VERIFY", default_value_t = false)]
     pub capture_verify: bool,
+    /// Capture passes over several sessions as device graphs, one per distinct
+    /// pass: its sessions in row order and every launch's arguments.
+    ///
+    /// Off, a decode batch or a batched verify is encoded launch by launch
+    /// every step, and at four sessions the device idled 6 ms of each 58 ms
+    /// step waiting on the host. Read by the sparse family's arm.
+    #[arg(long, env = "SHISO_CAPTURE_BATCH", default_value_t = false)]
+    pub capture_batch: bool,
     /// The draft head: a sidecar weights file beside the checkpoint.
     ///
     /// Absent means one token a step. Present, and with `--spec-k` above zero,

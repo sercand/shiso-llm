@@ -305,7 +305,12 @@ impl SparseStack {
         // past the budget by then. It happens once per sequence, so it is
         // simply never captured.
         let crosses = selected && dense_rows > 0;
-        let capturable = !batched && !crosses && self.opts.graphs.capturable(n_tok);
+        let capturable = !crosses
+            && if batched {
+                self.opts.graphs.capture_batch
+            } else {
+                self.opts.graphs.capturable(n_tok)
+            };
         let device = Device {
             capturing: capturable,
             ..self.device
@@ -391,8 +396,14 @@ impl SparseStack {
         // capture is refused by the device. Reserving the maximum up front is
         // what makes the offsets the launches were planned with the offsets
         // they are issued with.
-        let (plan, islands) = with_reservation(plan, islands);
+        let (plan, mut islands) = with_reservation(plan, islands);
         plan.validate()?;
+        if batched && capturable {
+            let slot = self.batch_slot(rows, &plan)?;
+            for span in &mut islands {
+                span.key.context = IslandContext::Batched(slot);
+            }
+        }
         Ok(Pass {
             media_rows,
             plan,
@@ -682,6 +693,50 @@ impl SparseStack {
 /// is a narrowing - and it is a *checked* one in the key, which refuses rather
 /// than masking. The alternative, hashing, would alias two live sessions onto
 /// one slot with no way to notice.
+/// Distinct batched passes the registry holds before it starts over.
+const BATCH_SLOTS: usize = 1 << 12;
+
+impl SparseStack {
+    /// The context slot a capturable batched pass is filed under.
+    ///
+    /// Keyed by everything a replay depends on: the sessions in row order,
+    /// whose addresses the launches bind, and every step of the plan, whose
+    /// launches and operands the capture bakes in. A pass that differs in any
+    /// of them - another selection mode, another run length - is a different
+    /// slot and a capture of its own, never a replay of this one. Starting
+    /// over drops every captured graph first, so a slot handed out again cannot
+    /// name a graph of the pass it used to mean.
+    fn batch_slot(&self, rows: &[&SparseSession], plan: &Plan) -> CoreResult<u32> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for row in rows {
+            row.id().hash(&mut hasher);
+        }
+        plan.steps().hash(&mut hasher);
+        let print = hasher.finish();
+        let mut slots = self
+            .batch_slots
+            .lock()
+            .map_err(|_| CoreError::Unsupported {
+                what: "the batch registry after a panic while it was held",
+                backend: "engine",
+            })?;
+        if let Some(slot) = slots.get(&print) {
+            return Ok(*slot);
+        }
+        if slots.len() >= BATCH_SLOTS {
+            if let Some(graphs) = self.backend.as_graph() {
+                graphs.invalidate_all();
+            }
+            slots.clear();
+        }
+        let slot = island::BATCH_CONTEXT_BASE
+            .saturating_add(u32::try_from(slots.len()).unwrap_or(u32::MAX));
+        slots.insert(print, slot);
+        Ok(slot)
+    }
+}
+
 fn context_id(session: SessionId) -> u32 {
     u32::try_from(session.get().get()).unwrap_or(u32::MAX)
 }

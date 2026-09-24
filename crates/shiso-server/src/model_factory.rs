@@ -778,6 +778,7 @@ fn sparse_options(
         graphs: shiso_engine::sparse::island::GraphPolicy {
             spec_depth: depth.get(),
             capture_verify: args.capture_verify,
+            capture_batch: args.capture_batch,
         },
         entries,
         co_resident_blocks,

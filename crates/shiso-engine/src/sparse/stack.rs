@@ -165,6 +165,7 @@ impl SparseOptions {
             graphs: GraphPolicy {
                 spec_depth: 0,
                 capture_verify: false,
+                capture_batch: false,
             },
             co_resident_blocks: 0,
             tiled_attention: true,
@@ -534,6 +535,10 @@ pub struct SparseStack {
     /// The residual tap, while a caller has one armed; see
     /// [`crate::sparse::tap`].
     pub(crate) tap: Option<crate::sparse::tap::ResidualTap>,
+    /// The batch registry: a fingerprint of each distinct batched pass seen
+    /// since the graphs were last dropped, and the context slot it is filed
+    /// under. See [`crate::sparse::island::IslandContext::Batched`].
+    pub(crate) batch_slots: std::sync::Mutex<HashMap<u64, u32>>,
 }
 
 impl std::fmt::Debug for SparseStack {
@@ -555,6 +560,10 @@ impl std::fmt::Debug for SparseStack {
             .field("counter", &self.counter)
             .field("checkpointing", &self.ckpt.is_some())
             .field("tapped", &self.tap.is_some())
+            .field(
+                "batch_slots",
+                &self.batch_slots.lock().map_or(0, |slots| slots.len()),
+            )
             .field("staging", &self.staging)
             .field("clock", &self.clock)
             .field("layers", &self.desc.layers.len())
@@ -756,6 +765,7 @@ impl SparseStack {
             clock: std::time::Instant::now(),
             ckpt: None,
             tap: None,
+            batch_slots: std::sync::Mutex::new(HashMap::new()),
         })
     }
 

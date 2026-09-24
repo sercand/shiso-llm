@@ -407,7 +407,7 @@ impl Instantiation {
 }
 
 /// An entry point the stack can launch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Entry {
     /// A C-linkage entry point, which the driver answers to by this name.
     Plain(KernelRef),
@@ -519,7 +519,7 @@ impl EntryTable {
 /// Held together rather than returned as a tuple because two of them are
 /// three-dimensional extents that read identically at a call site and would be
 /// swappable without a compile error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Launch {
     /// Blocks.
     pub grid: Extent3,

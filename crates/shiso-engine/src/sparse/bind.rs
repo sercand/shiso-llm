@@ -510,7 +510,7 @@ impl Operand {
 /// A fixed array rather than a vector, because a plan is `Copy` and a heap
 /// allocation per launch in a pass that issues thousands of them is a cost
 /// nothing here needs to pay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Args {
     ops: [Operand; MAX_ARGS],
     len: usize,

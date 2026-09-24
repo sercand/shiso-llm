@@ -101,7 +101,16 @@ pub enum IslandContext {
     Session(u32),
     /// A pass over more than one session, which is never captured.
     Batch,
+    /// A pass over more than one session that may be captured, filed under
+    /// the slot the stack's batch registry gave the exact pass it is: the
+    /// ordered sessions and every step's launch and operands, so a replay can
+    /// only ever be of the pass that was captured. At or above
+    /// [`BATCH_CONTEXT_BASE`], so it never names a session's slot.
+    Batched(u32),
 }
+
+/// Where batched contexts start, above every session handle a key can carry.
+pub const BATCH_CONTEXT_BASE: u32 = 1 << 23;
 
 /// What tells two captured islands apart.
 ///
@@ -158,8 +167,9 @@ impl IslandKey {
     ///
     /// [`CoreError::InvalidValue`] naming the field that does not fit.
     pub fn pack(&self) -> CoreResult<Option<GraphKey>> {
-        let IslandContext::Session(context) = self.context else {
-            return Ok(None);
+        let context = match self.context {
+            IslandContext::Session(context) | IslandContext::Batched(context) => context,
+            IslandContext::Batch => return Ok(None),
         };
         let fields = [
             ("layer", u64::from(self.layer.get()), LAYER_BITS),
@@ -264,6 +274,9 @@ pub struct GraphPolicy {
     /// produced, so each depth is a capture of its own and the set only pays
     /// once it has run long enough to trust.
     pub capture_verify: bool,
+    /// Whether passes over several sessions are captured, one graph per
+    /// distinct pass (see [`IslandContext::Batched`]).
+    pub capture_batch: bool,
 }
 
 impl GraphPolicy {
@@ -574,12 +587,14 @@ mod tests {
         let opt_out = GraphPolicy {
             spec_depth: 4,
             capture_verify: false,
+            capture_batch: false,
         };
         assert!(opt_out.capturable(1));
         assert!(!opt_out.capturable(5));
         let opt_in = GraphPolicy {
             spec_depth: 4,
             capture_verify: true,
+            capture_batch: false,
         };
         assert!(opt_in.capturable(5));
         assert!(!opt_in.capturable(6), "one row past the draft depth");

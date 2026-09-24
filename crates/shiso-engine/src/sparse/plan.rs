@@ -29,7 +29,7 @@ use crate::sparse::kernels::{Entry, Launch};
 ///
 /// Named rather than inferred from the grid, because the three have different
 /// argument shapes on the device side and only their block counts look alike.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TrellisOp {
     /// One weight, one output.
@@ -56,7 +56,7 @@ impl TrellisOp {
 }
 
 /// One unit of work in a pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Step {
     /// An ordinary kernel launch.
@@ -210,7 +210,7 @@ pub enum Step {
 /// branch is done. The branch must neither read what the main stream's
 /// launches write nor write what they read, and it must not use the
 /// per-stream cooperative scratch while they do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Branch {
     /// Opens the branch.
     Fork,

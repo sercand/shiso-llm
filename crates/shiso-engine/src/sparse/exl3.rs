@@ -464,7 +464,7 @@ const HALF_BYTES: u64 = 2;
 /// an expanded weight, by the launch immediately after), and no launch expects
 /// to find what a previous one left there. The locks do, which is why they and
 /// only they are pinned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub struct Staging {
     /// Bytes of staging this launch carves, past the lock prefix.
