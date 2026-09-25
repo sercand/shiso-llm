@@ -36,6 +36,7 @@ use crate::tokenizer::Vocabulary;
 use crate::tokenizer::chat_render::{ChatTemplate, RenderFlags};
 use crate::tokenizer::jinja_helpers::ToolJsonStyle;
 use crate::tokenizer::message_preprocess::{MediaPolicy, expand_vision_pads, preprocess};
+use crate::tokenizer::turn_replay::TurnReplay;
 
 /// A rendered prompt, in all three of the forms something downstream needs.
 #[derive(Debug, Clone)]
@@ -128,6 +129,8 @@ pub struct PromptRenderer {
     video_fps: f64,
     thinking_default: bool,
     effort: EffortSpelling,
+    /// Finished turns whose ids a prompt extending them reuses, when kept.
+    replay: Option<Arc<TurnReplay>>,
 }
 
 impl PromptRenderer {
@@ -159,6 +162,7 @@ impl PromptRenderer {
             video_fps: shiso_vision::DEFAULT_FPS,
             thinking_default: true,
             effort: EffortSpelling::STANDARD,
+            replay: None,
         })
     }
 
@@ -268,6 +272,14 @@ impl PromptRenderer {
         self
     }
 
+    /// The same renderer, reusing the ids of finished turns in `replay` for the
+    /// span of a prompt that extends one. `None` encodes every prompt cold.
+    #[must_use]
+    pub fn with_turn_replay(mut self, replay: Option<Arc<TurnReplay>>) -> Self {
+        self.replay = replay;
+        self
+    }
+
     /// The vocabulary this renderer encodes with.
     #[must_use]
     pub fn vocabulary(&self) -> &Arc<Vocabulary> {
@@ -313,8 +325,7 @@ impl PromptRenderer {
         // starts with exactly one, which is what the model was trained on and
         // what upstream llama.cpp produces for the same conversation.
         let tokens = self
-            .vocabulary
-            .encode_prompt(&text)
+            .encode_with_replay(&text, prepared.media.is_empty())
             .map_err(|error| AppError::internal("encoding the rendered prompt", error))?;
         let tokens = expand_vision_pads(tokens, &prepared.pad_counts, self.pads, self.wrap)
             .map_err(|error| AppError::internal("expanding the media pad markers", error))?;
@@ -324,6 +335,37 @@ impl PromptRenderer {
             text,
             media: prepared.media,
         })
+    }
+
+    /// Encodes `text`, taking the ids of the longest finished turn it extends
+    /// for that span and encoding only the rest.
+    ///
+    /// The rest is encoded without an opening token: the replayed ids came out
+    /// of this function once already and carry it. A prompt with media is
+    /// always encoded cold, because its pad markers are one id for any picture.
+    fn encode_with_replay(
+        &self,
+        text: &str,
+        text_only: bool,
+    ) -> Result<Vec<TokenId>, super::TokenizerError> {
+        let replayed = self
+            .replay
+            .as_ref()
+            .filter(|_| text_only)
+            .and_then(|replay| replay.longest_prefix(text));
+        let Some(replayed) = replayed else {
+            return self.vocabulary.encode_prompt(text);
+        };
+        let rest = text.get(replayed.text_len..).unwrap_or_default();
+        let mut tokens = Vec::with_capacity(replayed.tokens.len() + rest.len() / 3);
+        tokens.extend_from_slice(&replayed.tokens);
+        tokens.extend(self.vocabulary.encode(rest, false)?);
+        tracing::debug!(
+            replayed = replayed.tokens.len(),
+            total = tokens.len(),
+            "a prompt extends a finished turn; its ids are reused"
+        );
+        Ok(tokens)
     }
 
     /// The tool list in the shape a chat template writes into the prompt.
@@ -474,6 +516,31 @@ mod tests {
         assert_eq!(EffortSpelling::XHIGH_TOP.spell(Effort::High), "xhigh");
         assert_eq!(EffortSpelling::XHIGH_TOP.spell(Effort::Minimal), "low");
         assert_eq!(EffortSpelling::STANDARD.spell(Effort::High), "high");
+    }
+
+    /// A prompt extending a finished turn carries that turn's ids even where
+    /// encoding its text would split differently, and encodes only the rest;
+    /// a prompt with media never does.
+    #[test]
+    fn a_prompt_extending_a_finished_turn_reuses_its_ids() {
+        use crate::tokenizer::turn_replay::TurnReplay;
+        use shiso_core::TokenId;
+        let replay = Arc::new(TurnReplay::new(64));
+        // Not what encoding "word word" gives, which is [1, 1]: the model's own
+        // split, which is the one the cache holds.
+        replay.record("word word".to_owned(), [7, 8].map(TokenId::new).into());
+        let renderer = PromptRenderer::new(TEMPLATE, ToolJsonStyle::Compact, stub_vocabulary())
+            .expect("the stub template compiles")
+            .with_turn_replay(Some(replay));
+        let raw = |tokens: Vec<TokenId>| tokens.iter().map(|id| id.get()).collect::<Vec<_>>();
+        let spliced = renderer
+            .encode_with_replay("word word word", true)
+            .expect("encodes");
+        assert_eq!(raw(spliced), [7, 8, 1]);
+        let with_media = renderer
+            .encode_with_replay("word word word", false)
+            .expect("encodes");
+        assert_eq!(raw(with_media), [1, 1, 1]);
     }
 
     #[test]

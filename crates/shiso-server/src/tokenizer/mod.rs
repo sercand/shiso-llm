@@ -24,6 +24,7 @@ pub mod chat_render;
 pub mod jinja_helpers;
 pub mod message_preprocess;
 pub mod render_prompt;
+pub mod turn_replay;
 
 use std::path::Path;
 

@@ -141,25 +141,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let memory = report_memory(&backend);
 
     let model_id = args.model_id();
-    // The one place the scheduler's environment is read. Once, at boot: a knob
-    // that could change between two ticks of the same request would be a policy
-    // nobody configured.
-    let mut scheduler = scheduler::SchedulerConfig::from_env();
-    // A flag rather than one of the scheduler's own variables: the same count
-    // is what a `--gpu-memory-utilization` pool set sessions aside for, and the
-    // two must not be able to disagree.
-    scheduler.max_num_seqs = args.max_num_seqs;
-    scheduler.store.pump_bytes = args.kvstore_pump_mb.saturating_mul(1024 * 1024);
-    scheduler.store.drain_timeout = std::time::Duration::from_secs(args.kvstore_drain_secs);
-    // Validated at boot, so the widths are known to be servable here.
-    let widths = args.prefill_widths()?;
-    scheduler.solo_chunk = widths.solo_chunk;
-    scheduler.mixed_quantum = widths.mixed_quantum;
-    tracing::info!(
-        solo_chunk = widths.solo_chunk,
-        mixed_quantum = widths.mixed_quantum,
-        "prefill widths"
-    );
+    let scheduler = scheduler_config(&args)?;
+    // The renderer reads the store the scheduler writes.
+    let turn_replay = scheduler.turn_replay.clone();
     let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);
     let tool_call_scheme = args.tool_call_parser.tools(defaults.tools);
     tracing::info!(
@@ -197,6 +181,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             Arc::clone(&vocabulary),
             placement,
             vision_spec.as_ref(),
+            turn_replay,
         ) {
             let renderer = defaults.configure(renderer);
             state = state.with_renderer(Arc::new(renderer));
@@ -226,6 +211,38 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
     result
         .map_err(|error| anyhow!(error).context(format!("serving on {}:{}", args.bind, args.port)))
+}
+
+/// The scheduler's configuration: its environment, then the flags that
+/// override it.
+fn scheduler_config(args: &ServeArgs) -> anyhow::Result<scheduler::SchedulerConfig> {
+    // The one place the scheduler's environment is read. Once, at boot: a knob
+    // that could change between two ticks of the same request would be a policy
+    // nobody configured.
+    let mut scheduler = scheduler::SchedulerConfig::from_env();
+    // A flag rather than one of the scheduler's own variables: the same count
+    // is what a `--gpu-memory-utilization` pool set sessions aside for, and the
+    // two must not be able to disagree.
+    scheduler.max_num_seqs = args.max_num_seqs;
+    scheduler.store.pump_bytes = args.kvstore_pump_mb.saturating_mul(1024 * 1024);
+    scheduler.store.drain_timeout = std::time::Duration::from_secs(args.kvstore_drain_secs);
+    // Validated at boot, so the widths are known to be servable here.
+    let widths = args.prefill_widths()?;
+    scheduler.solo_chunk = widths.solo_chunk;
+    scheduler.mixed_quantum = widths.mixed_quantum;
+    tracing::info!(
+        solo_chunk = widths.solo_chunk,
+        mixed_quantum = widths.mixed_quantum,
+        "prefill widths"
+    );
+    // Written by the scheduler as turns retire, read by the renderer. Zero is
+    // the operator turning it off, not a store that keeps nothing.
+    scheduler.turn_replay = (args.turn_replay_tokens > 0).then(|| {
+        Arc::new(tokenizer::turn_replay::TurnReplay::new(
+            args.turn_replay_tokens,
+        ))
+    });
+    Ok(scheduler)
 }
 
 /// Loads the checkpoint, timing it.
@@ -427,6 +444,7 @@ fn build_renderer(
     vocabulary: Arc<tokenizer::Vocabulary>,
     placement: shiso_vision::MediaPlacement,
     spec: Option<&shiso_vision::PreprocessSpec>,
+    replay: Option<Arc<tokenizer::turn_replay::TurnReplay>>,
 ) -> Option<tokenizer::render_prompt::PromptRenderer> {
     let template = load_chat_template(args)?;
     let renderer = match tokenizer::render_prompt::PromptRenderer::new(
@@ -442,7 +460,8 @@ fn build_renderer(
     };
     let renderer = renderer
         .with_remote_media(args.vision_allow_remote_images)
-        .with_video(args.ffmpeg_policy(), args.video_fps);
+        .with_video(args.ffmpeg_policy(), args.video_fps)
+        .with_turn_replay(replay);
     // The tower geometry is what turns one media marker into the right number of
     // pad tokens, so a renderer without it must refuse media rather than send a
     // prompt whose pad run disagrees with the embedding rows. An open tower is

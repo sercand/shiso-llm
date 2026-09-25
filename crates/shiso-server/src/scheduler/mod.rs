@@ -1346,6 +1346,7 @@ impl Coordinator {
                 _ => {}
             }
             self.store_on_retire(&slot, ending.as_ref());
+            self.remember_turn(&slot);
             tracing::debug!(
                 slot = slot.id,
                 emitted = slot.generated().len(),
@@ -1356,6 +1357,18 @@ impl Coordinator {
             self.release(slot.session);
         }
         self.stats.set_active(self.slots.len());
+    }
+
+    /// Keeps a finished turn's ids for the renderer, so the next prompt in its
+    /// conversation carries the ids this turn ran rather than a re-encoding of
+    /// their text that can split differently.
+    fn remember_turn(&self, slot: &SeqSlot) {
+        let (Some(replay), Some(vocabulary)) = (&self.cfg.turn_replay, &self.vocabulary) else {
+            return;
+        };
+        if let Some((text, tokens)) = slot.finished_turn(vocabulary) {
+            replay.record(text, tokens);
+        }
     }
 
     /// Stores a retiring sequence's prefix, when the policy says to.

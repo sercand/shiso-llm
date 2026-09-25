@@ -161,6 +161,8 @@ pub(crate) struct SeqSlot {
     pub(crate) session: SessionId,
     /// The rendered prompt.
     pub(crate) prompt: Arc<[TokenId]>,
+    /// The rendered prompt as text, empty when the surface had none.
+    prompt_text: Arc<str>,
     /// Where its events go.
     pub(crate) sink: mpsc::Sender<StreamEvent>,
     /// Prompt tokens read so far, resume included.
@@ -173,6 +175,8 @@ pub(crate) struct SeqSlot {
     next_input: Option<TokenId>,
     /// The ids generated, in order.
     out: Vec<TokenId>,
+    /// The end-of-turn marker the turn stopped on, which `out` leaves out.
+    end_marker: Option<TokenId>,
     /// How many tokens this turn may still generate.
     budget: u32,
     /// Sampling settings and the stream they draw from.
@@ -262,12 +266,14 @@ impl SeqSlot {
             id: setup.id,
             session: setup.session,
             prompt: request.prompt_tokens,
+            prompt_text: request.prompt_text,
             sink: setup.sink,
             cursor: 0,
             cached: 0,
             cold: true,
             next_input: None,
             out: Vec::new(),
+            end_marker: None,
             budget: setup.budget,
             sampling: request.sampling,
             seed: request.seed,
@@ -398,6 +404,39 @@ impl SeqSlot {
     /// stands on.
     pub(crate) fn generated(&self) -> &[TokenId] {
         &self.out
+    }
+
+    /// The turn as the next request in its conversation would carry it: the
+    /// rendered prompt text and ids, then the generation and the marker it
+    /// ended on.
+    ///
+    /// `None` for a turn that did not end on its marker - a stop sequence
+    /// leaves ids past the text the caller received, and a cut budget can end
+    /// mid-character - for one with media, whose pad ids are the same for any
+    /// picture, and for one whose surface rendered no text.
+    pub(crate) fn finished_turn(
+        &self,
+        vocabulary: &Vocabulary,
+    ) -> Option<(String, Arc<[TokenId]>)> {
+        let marker = self.end_marker?;
+        if self.media.is_some()
+            || self.prompt_text.is_empty()
+            || !matches!(
+                self.ending,
+                Some(Ending::Stopped(StopReason::EndTurn | StopReason::ToolUse))
+            )
+        {
+            return None;
+        }
+        let mut generated = Vec::with_capacity(self.out.len() + 1);
+        generated.extend_from_slice(&self.out);
+        generated.push(marker);
+        let decoded = vocabulary.decode(&generated).ok()?;
+        let mut text = String::with_capacity(self.prompt_text.len() + decoded.len());
+        text.push_str(&self.prompt_text);
+        text.push_str(&decoded);
+        let tokens = self.prompt.iter().chain(&generated).copied().collect();
+        Some((text, tokens))
     }
 
     /// The whole path its session stands on: prompt then generated.
@@ -617,6 +656,7 @@ impl SeqSlot {
             // A marker produces no text, and its id still has to add up: it
             // rides the terminal event rather than a delta.
             self.trailing.push(token.get());
+            self.end_marker = Some(token);
             self.stop(StopReason::EndTurn);
             return Vec::new();
         }
@@ -887,6 +927,47 @@ mod tests {
         .to_string();
         let inner = tokenizers::Tokenizer::from_str(&doc).expect("the test vocabulary loads");
         Arc::new(Vocabulary::from_tokenizer(inner))
+    }
+
+    fn slot_with_text(prompt: &[u32], text: &str, budget: u32) -> SeqSlot {
+        let mut slot = slot(prompt, budget);
+        slot.prompt_text = Arc::from(text);
+        slot
+    }
+
+    /// A turn that ended on its marker is kept as the next prompt would render
+    /// it: the prompt text, the generation, then the marker's own text, beside
+    /// exactly the ids the model ran.
+    #[test]
+    fn a_turn_ended_on_its_marker_is_kept_with_the_ids_it_ran() {
+        let vocab = test_vocab(&[(10, "a"), (11, "b"), (63, "<e>")]);
+        let mut slot = slot_with_text(&[1, 2], "<p>", 16);
+        let now = Instant::now();
+        for id in [10, 11, 63] {
+            slot.accept(TokenId::new(id), Some(&vocab), stop(), now);
+        }
+        let (text, tokens) = slot.finished_turn(&vocab).expect("a marker-ended turn");
+        assert_eq!(text, "<p>ab<e>");
+        let raw: Vec<u32> = tokens.iter().map(|id| id.get()).collect();
+        assert_eq!(raw, [1, 2, 10, 11, 63]);
+    }
+
+    /// A cut budget, or a surface that rendered no text, leaves nothing a next
+    /// prompt's text could be matched against.
+    #[test]
+    fn a_turn_without_its_marker_or_its_text_is_not_kept() {
+        let vocab = test_vocab(&[(10, "a"), (11, "b"), (63, "<e>")]);
+        let now = Instant::now();
+        let mut cut = slot_with_text(&[1], "<p>", 2);
+        cut.accept(TokenId::new(10), Some(&vocab), stop(), now);
+        cut.accept(TokenId::new(11), Some(&vocab), stop(), now);
+        assert_eq!(cut.ending, Some(Ending::Stopped(StopReason::MaxTokens)));
+        assert!(cut.finished_turn(&vocab).is_none());
+
+        let mut untitled = slot(&[1], 16);
+        untitled.accept(TokenId::new(10), Some(&vocab), stop(), now);
+        untitled.accept(TokenId::new(63), Some(&vocab), stop(), now);
+        assert!(untitled.finished_turn(&vocab).is_none());
     }
 
     /// The budget counts generated tokens, and the turn stops on the one that

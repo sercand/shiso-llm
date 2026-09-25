@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::scheduler::clock::{Clock, SystemClock};
+use crate::tokenizer::turn_replay::TurnReplay;
 
 /// Sequences that may be resident at once.
 pub const DEFAULT_MAX_NUM_SEQS: usize = 4;
@@ -273,6 +274,9 @@ pub struct SchedulerConfig {
     pub store: StorePolicy,
     /// Where elapsed time is read from.
     pub clock: Arc<dyn Clock>,
+    /// Where finished turns are kept for the renderer to reuse their ids.
+    /// `None` keeps nothing.
+    pub turn_replay: Option<Arc<TurnReplay>>,
 }
 
 impl SchedulerConfig {
@@ -288,6 +292,7 @@ impl SchedulerConfig {
             queue_admission: Duration::from_millis(DEFAULT_QUEUE_ADMISSION_MS),
             store: StorePolicy::new(),
             clock: Arc::new(SystemClock),
+            turn_replay: None,
         }
     }
 
@@ -320,6 +325,8 @@ impl SchedulerConfig {
             )),
             store: StorePolicy::from_env(),
             clock: default.clock,
+            // Shared with the renderer, so the binary builds it and sets it.
+            turn_replay: None,
         }
     }
 

@@ -37,6 +37,9 @@ pub const DEFAULT_KVSTORE_STAGING_MB: u64 = 1024;
 pub const DEFAULT_KVSTORE_PUMP_MB: u64 = 64;
 /// The default time a shutdown waits for queued disk writes, in seconds.
 pub const DEFAULT_KVSTORE_DRAIN_SECS: u64 = 60;
+/// The default ids the turn replay keeps across finished turns: about 32 MiB
+/// of ids and text, room for sixteen conversations at a 262 144-token context.
+pub const DEFAULT_TURN_REPLAY_TOKENS: usize = 4 * 1024 * 1024;
 /// The default pixel ceiling one image may occupy after resizing.
 pub const DEFAULT_VISION_MAX_PIXELS: usize = 1280 * 1280;
 /// The default row-cache budget for a per-layer embedding table, in mebibytes.
@@ -230,6 +233,12 @@ pub struct ServeArgs {
     /// in seconds. Keep it under the service manager's stop timeout.
     #[arg(long, env = "SHISO_KVSTORE_DRAIN_SECS", default_value_t = DEFAULT_KVSTORE_DRAIN_SECS)]
     pub kvstore_drain_secs: u64,
+    /// Ids the server keeps from finished turns, so the next prompt in a
+    /// conversation carries the ids the model generated rather than a
+    /// re-encoding of their text that can split differently and miss the
+    /// prefix cache. Zero keeps none.
+    #[arg(long, env = "SHISO_TURN_REPLAY_TOKENS", default_value_t = DEFAULT_TURN_REPLAY_TOKENS)]
+    pub turn_replay_tokens: usize,
     /// Bearer tokens that may call the inference routes, comma separated.
     ///
     /// `hide_env_values` is set: a token must never appear in `--help`, in a
