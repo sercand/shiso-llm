@@ -45,6 +45,27 @@ fn the_multi_row_projection_matches_the_host() {
 
 #[test]
 #[ignore = "requires a Metal device"]
+fn the_prompt_projection_matches_the_host_at_every_width() {
+    let Some(gpu) = open() else { return };
+    cases::the_prompt_projection_matches_the_host_at_every_width(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_prompt_expert_stages_match_the_host_at_every_width() {
+    let Some(gpu) = open() else { return };
+    cases::the_prompt_expert_stages_match_the_host_at_every_width(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_prompt_brain_float_projection_matches_the_host_at_every_width() {
+    let Some(gpu) = open() else { return };
+    cases::the_prompt_brain_float_projection_matches_the_host_at_every_width(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
 fn the_affine_gather_matches_the_host() {
     let Some(gpu) = open() else { return };
     cases::the_affine_gather_matches_the_host(&gpu);

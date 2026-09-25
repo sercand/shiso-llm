@@ -425,6 +425,7 @@ const HOST_KERNELS: &[KernelRef] = &[
     KernelRef::new("generic", "kernel_dsv4_rope_tail_f32"),
     KernelRef::new("generic", "kernel_dsv4_rope_tail_f32_inplace_pair"),
     KernelRef::new("generic", "kernel_dsv4_rope_tail_f32_inplace_pair_affine"),
+    KernelRef::new("generic", "kernel_fill_zero_u8"),
     KernelRef::new("generic", "kernel_get_rows_f16"),
     KernelRef::new("generic", "kernel_get_rows_f16_f32"),
     KernelRef::new("generic", "kernel_get_rows_f32"),

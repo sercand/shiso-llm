@@ -266,6 +266,7 @@ impl Qwen4ExpModel {
             let _tag = ledger::scope(MemTag::WeightsEmbedding);
             mlx::open_ngram(&ck, &config, &opts)?
         };
+        let sized = residency.is_none();
         let residency = match residency {
             Some(chosen) => chosen,
             None => choose_residency(backend.as_ref(), &ck, reserve)?,
@@ -273,9 +274,15 @@ impl Qwen4ExpModel {
         tracing::info!(?residency, "routed expert banks");
         let weights = mlx::import(backend, &ck, &config, residency)?;
         let expert_gate = DType::MlxAffine4Gs64;
+        let free = device_free(backend.as_ref());
         let mut stack =
             SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
         if let mlx::ExpertResidency::Streamed { slots } = residency {
+            let slots = if sized {
+                beside_stack(backend.as_ref(), free, slots, mlx::slot_bytes())
+            } else {
+                slots
+            };
             let stream = mlx::open_stream(backend, &ck, slots, opts.prefill_rows)?;
             stack.attach_expert_stream(stream)?;
         }
@@ -319,6 +326,7 @@ impl Qwen4ExpModel {
             crate::qwen4exp::fp8::open_ngram(backend, &ck, &config, &opts)?
         };
         let all = EXPERTS * N_LAYERS;
+        let sized = slots.is_none();
         let slots = if let Some(slots) = slots {
             slots
         } else {
@@ -348,8 +356,21 @@ impl Qwen4ExpModel {
         };
         tracing::info!(slots, all, "routed expert pool of the FP8 export");
         let weights = crate::qwen4exp::fp8::import(backend, &ck, &config)?;
+        let free = device_free(backend.as_ref());
         let mut stack =
             SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
+        // A pool that holds every expert keeps them all; only one sized to the
+        // device gives back what the stack took.
+        let slots = if sized && slots < all {
+            beside_stack(
+                backend.as_ref(),
+                free,
+                slots,
+                crate::qwen4exp::fp8::slot_bytes(),
+            )
+        } else {
+            slots
+        };
         let stream = crate::qwen4exp::fp8::open_stream(backend, &ck, slots, opts.prefill_rows)?;
         stack.attach_expert_stream(stream)?;
         Ok(Self {
@@ -409,6 +430,42 @@ impl Qwen4ExpModel {
 /// many slots as fit once the rest of the weights and the reserve are
 /// accounted for. The n-gram table is never counted: it is streamed either
 /// way.
+/// What the device reports free, or `None` where it reports nothing.
+fn device_free(backend: &dyn Backend) -> Option<u64> {
+    backend.memory_info().map(|info| info.free)
+}
+
+/// A pool sized to the device, less what the stack took after it was sized.
+///
+/// The pool's size has to be known before the weights are imported - it
+/// decides whether the banks are imported at all - so the scratch and cache
+/// the stack then allocates for its widest pass come out of the working set
+/// the pool was sized to fill. At a server's prefill chunk that is several
+/// gigabytes, and with it left in, the pool and the stack together overran
+/// the working set of a 64 GB machine: every step waited on the system's
+/// swap, 0.46 tok/s against 5 to 6 with the stack's bytes given back. `free`
+/// is what the device reported free before the stack was built; the floor is
+/// one layer's experts, below which the stream refuses to open anyway.
+fn beside_stack(backend: &dyn Backend, free: Option<u64>, slots: u32, slot_bytes: u64) -> u32 {
+    let (Some(before), Some(after)) = (free, device_free(backend)) else {
+        return slots;
+    };
+    let taken = before.saturating_sub(after);
+    let give_back = u32::try_from(taken.div_ceil(slot_bytes.max(1))).unwrap_or(u32::MAX);
+    let fitted = slots
+        .saturating_sub(give_back)
+        .max(crate::qwen4exp::config::EXPERTS.min(slots));
+    if fitted < slots {
+        tracing::info!(
+            stack_gib = taken >> 30,
+            slots = fitted,
+            was = slots,
+            "the expert pool gives back what the stack's scratch and cache took"
+        );
+    }
+    fitted
+}
+
 fn choose_residency(
     backend: &dyn Backend,
     ck: &mlx::MlxCheckpoint,

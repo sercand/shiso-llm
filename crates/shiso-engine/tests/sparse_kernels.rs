@@ -92,6 +92,7 @@ const GPU: Device = Device {
     max_co_resident: 48,
     half_block_input: false,
     role: PassRole::Step,
+    prompt_matmul: matmul::PromptMatmul::Rows,
 };
 
 fn half(in_dim: u32, out_dim: u32) -> WeightDesc {

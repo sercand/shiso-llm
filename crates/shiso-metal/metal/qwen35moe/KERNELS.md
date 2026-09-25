@@ -63,6 +63,7 @@ dispatched directly. `columns` is `n_tok * n_used`; `BLOCK` is 256 there.
 | `q4e_moe_sort_count_kernel` | `counts, ids, n_rows:u32, n_expert:u32` | `max(ceil(columns/256), 1)` | 256 | 0 |
 | `q4e_moe_sort_scan_kernel` | `bounds, active, counts, n_expert:u32` | 1 | 32 | 0 |
 | `q4e_moe_sort_scatter_kernel` | `sorted, cursor, bounds, ids, n_rows:u32, n_expert:u32` | `max(ceil(columns/256), 1)` | 256 | 0 |
+| `q4e_moe_route_sort_small_kernel` (the sparse stack's decode-sized route and sort, `n_tok <= 32`; not dispatched by `moe.rs`) | `ids, weights, logits, bounds, active, sorted, pos, n_tok:u32, n_expert:u32, n_used:u32` | 1 | 1024 | 0 |
 | `q4e_swiglu_kernel` | `out, gate, up, n:u64` | `max(ceil(n/256), 1)` | 256 | 0 |
 | `q4e_moe_combine_kernel` | `out, down, weights, n_embd:u32, n_used:u32` | `(max(ceil(n_embd/256), 1), n_tok)` | 256 | 0 |
 | `q4e_shared_add_kernel` | `out, shared, logit, n_embd:u32` | `(max(ceil(n_embd/256), 1), n_tok)` | 256 | 0 |

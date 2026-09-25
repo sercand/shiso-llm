@@ -53,6 +53,12 @@ impl FileRead {
 pub struct BulkReader {
     #[cfg(target_os = "linux")]
     ring: Option<arm::BulkRing>,
+    /// Reads in flight, which only the ring reads: the blocking path takes one
+    /// file at a time.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only the ring arm batches by depth")
+    )]
     depth: u32,
 }
 

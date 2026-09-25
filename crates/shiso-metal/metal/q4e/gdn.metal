@@ -255,13 +255,21 @@ static inline void q4e_gdn_recurrent_run(
     device float *s0 = io.ckpt + ulong(h) * head_dim * head_dim;
 
     const uint i0 = sub * seg;
+    // The walk's rotation is a multiple of four, so four consecutive `n` are
+    // four consecutive `i`: the state moves as 16-byte vectors, in the same
+    // walk order - a scalar load here left the recurrence at a fifth of the
+    // device's bandwidth.
     float reg[Q4E_GDN_SEG];
-    for (uint n = 0; n < Q4E_GDN_SEG; n++) {
+    for (uint n = 0; n < Q4E_GDN_SEG; n += 4u) {
         const uint i = i0 + ((n + 8u * sub) & (seg - 1u));
-        const float v = owner ? m_in[ulong(j) * head_dim + i] : 0.0f;
-        reg[n] = v;
+        const float4 v = owner ? *(device const float4 *)(m_in + ulong(j) * head_dim + i)
+                               : float4(0.0f);
+        reg[n] = v.x;
+        reg[n + 1u] = v.y;
+        reg[n + 2u] = v.z;
+        reg[n + 3u] = v.w;
         if (recorded && owner) {
-            s0[ulong(j) * head_dim + i] = v;
+            *(device float4 *)(s0 + ulong(j) * head_dim + i) = v;
         }
     }
     if (recorded) {
@@ -339,9 +347,10 @@ static inline void q4e_gdn_recurrent_run(
     }
 
     if (owner) {
-        for (uint n = 0; n < Q4E_GDN_SEG; n++) {
+        for (uint n = 0; n < Q4E_GDN_SEG; n += 4u) {
             const uint i = i0 + ((n + 8u * sub) & (seg - 1u));
-            m[ulong(j) * head_dim + i] = reg[n];
+            *(device float4 *)(m + ulong(j) * head_dim + i) =
+                float4(reg[n], reg[n + 1u], reg[n + 2u], reg[n + 3u]);
         }
     }
 }

@@ -31,6 +31,10 @@ bytemuck = { workspace = true }
 half = { workspace = true }
 
 [[test]]
+name = "q4e_route"
+path = "tests/q4e_route.rs"
+
+[[test]]
 name = "contract"
 path = "tests/contract.rs"
 

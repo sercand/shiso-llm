@@ -218,6 +218,14 @@ pub enum Projection {
         /// Rows the call covers.
         rows: u32,
     },
+    /// A brain-float weight on the matrix units, a prompt chunk in one
+    /// launch.
+    BrainGemm {
+        /// The projection itself.
+        entry: Entry,
+        /// Its launch.
+        launch: Launch,
+    },
     /// A brain-float weight through the warp-per-row kernel.
     BrainRows {
         /// The projection itself.
@@ -254,7 +262,7 @@ pub enum Projection {
         /// Rows the call covers.
         rows: u32,
     },
-    /// An MLX affine weight, read in place: one simdgroup an output row, one
+    /// An MLX affine weight, read in place: one simdgroup four output rows, one
     /// activation row a launch at decode and [`AFFINE_TOKENS`] a threadgroup
     /// over a chunk.
     Affine {
@@ -268,18 +276,65 @@ pub enum Projection {
 /// Output rows one affine projection threadgroup covers
 /// (`Q4E_AFFINE_ROWS`).
 pub const AFFINE_ROWS: u32 = 8;
+/// Threads one affine projection threadgroup runs: two simdgroups of four
+/// output rows each (`Q4E_AFFINE_SG_ROWS`).
+pub const AFFINE_THREADS: u32 = 64;
 /// Activation rows one multi-row affine threadgroup carries
 /// (`Q4E_AFFINE_TOKENS`).
 pub const AFFINE_TOKENS: u32 = 8;
 
+/// Output rows and activation rows one tile of the prompt projection covers
+/// (`Q4E_GEMM_BM`, `Q4E_GEMM_BN`).
+pub const AFFINE_GEMM_TILE: u32 = 32;
+/// Threads the prompt projection runs a tile with: four simdgroups.
+pub const AFFINE_GEMM_THREADS: u32 = 128;
+
+/// Slices an affine projection's contraction is split into, one pair of
+/// simdgroups each: a narrow output over a wide contraction is too few
+/// threadgroups to keep the device's memory busy, and a wide output already
+/// is. A fact about the shape alone, so the one-row and multi-row kernels sum
+/// a row the same way.
+#[must_use]
+pub const fn affine_splits(in_dim: u32, out_dim: u32) -> u32 {
+    let sweeps = in_dim / 512;
+    if out_dim.div_ceil(AFFINE_ROWS) >= 768 {
+        1
+    } else if sweeps >= 16 {
+        4
+    } else if sweeps >= 4 {
+        2
+    } else {
+        1
+    }
+}
+
 /// The affine tier: the one-row kernel for a single activation row and the
 /// multi-row one for a chunk, over the same grid of output rows.
-fn affine(in_dim: u32, out_dim: u32, rows: u32) -> CoreResult<Projection> {
+///
+/// A prompt pass takes the matrix-unit kernel at every width instead: its
+/// rows only have to agree with each other across chunk widths, which that
+/// kernel keeps, and a chunk is where the one-row kernels' sweep order costs
+/// the most.
+fn affine(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Projection> {
     if crate::sparse::weights::affine_bytes(DType::MlxAffine4Gs64, in_dim, out_dim).is_none() {
         return Err(CoreError::ShapeMismatch {
             field: "affine contraction width",
             expected: 64,
             got: u64::from(in_dim),
+        });
+    }
+    if device.row_invariant() {
+        return Ok(Projection::Affine {
+            entry: Entry::plain(MOD_MATVEC, "q4e_affine_gemm_kernel"),
+            launch: Launch::new(
+                shiso_core::Extent3::new(
+                    out_dim.div_ceil(AFFINE_GEMM_TILE),
+                    rows.div_ceil(AFFINE_GEMM_TILE),
+                    1,
+                ),
+                AFFINE_GEMM_THREADS,
+                0,
+            ),
         });
     }
     let (entry, tokens) = if rows == 1 {
@@ -291,7 +346,7 @@ fn affine(in_dim: u32, out_dim: u32, rows: u32) -> CoreResult<Projection> {
         entry: Entry::plain(MOD_MATVEC, entry),
         launch: Launch::new(
             shiso_core::Extent3::new(out_dim.div_ceil(AFFINE_ROWS), rows.div_ceil(tokens), 1),
-            32 * AFFINE_ROWS,
+            AFFINE_THREADS * affine_splits(in_dim, out_dim),
             0,
         ),
     })
@@ -323,6 +378,11 @@ pub struct Device {
     /// [`GemmReduction::ColumnInvariant`]. A fact about the pass, carried here
     /// for the reason `half_block_input` is.
     pub role: PassRole,
+    /// Which kernel a prompt pass's brain-float projections take: the
+    /// matrix-unit one (`q4e_bf16_gemm_kernel`) at every width where the
+    /// device has it. A probed device fact: a kernel set without it keeps the
+    /// warp-per-row kernel.
+    pub prompt_matmul: PromptMatmul,
 }
 
 impl Device {
@@ -349,6 +409,16 @@ impl Device {
     pub const fn tier_rows(self, rows: u32) -> u32 {
         if self.row_invariant() { u32::MAX } else { rows }
     }
+}
+
+/// The kernel a prompt pass's brain-float projections take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PromptMatmul {
+    /// The warp-per-row kernel, sixteen rows a launch: every kernel set has it.
+    #[default]
+    Rows,
+    /// The matrix-unit kernel, a whole chunk a launch.
+    Matrix,
 }
 
 /// What one session's pass of consecutive positions is for.
@@ -416,11 +486,11 @@ pub fn plan(
         DType::F32 => Ok(float(in_dim, out_dim)),
         DType::F16 => half(in_dim, out_dim, rows, device),
         DType::F16Pack12 => packed_half(in_dim, out_dim, rows, device),
-        DType::BF16 => brain(in_dim, out_dim, rows),
+        DType::BF16 => brain(in_dim, out_dim, rows, device),
         DType::Exl3K4 | DType::Exl3K5 | DType::Exl3K6 => {
             trellis(dtype, in_dim, out_dim, rows, device)
         }
-        DType::MlxAffine4Gs64 => affine(in_dim, out_dim, rows),
+        DType::MlxAffine4Gs64 => affine(in_dim, out_dim, rows, device),
         // Every block-quantized tier reaches its kernel through an activation
         // quantizer, and drops through to a dense path, that belong to the
         // general kernel set rather than to this one.
@@ -599,7 +669,24 @@ fn expand_packed(out: &mut Plan, weight: WeightDesc, w: Operand, wide: Elem) {
 /// One row is instantiated because a draft head can carry brain-float dense
 /// projections, and a draft pass is one row; a chunk wider than the
 /// instantiated width is split into passes by [`project`].
-fn brain(in_dim: u32, out_dim: u32, rows: u32) -> CoreResult<Projection> {
+///
+/// A prompt pass on a device with the matrix-unit kernel takes it at every
+/// width instead, as the affine tier does, for the same reason.
+fn brain(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Projection> {
+    if brain_gemm(in_dim, device) {
+        return Ok(Projection::BrainGemm {
+            entry: Entry::plain(MOD_MATVEC, "q4e_bf16_gemm_kernel"),
+            launch: Launch::new(
+                shiso_core::Extent3::new(
+                    out_dim.div_ceil(AFFINE_GEMM_TILE),
+                    rows.div_ceil(AFFINE_GEMM_TILE),
+                    1,
+                ),
+                AFFINE_GEMM_THREADS,
+                0,
+            ),
+        });
+    }
     if !(1..=MAX_ROWS).contains(&rows) {
         return Err(CoreError::Unsupported {
             what: "a brain-float projection at a row count this kernel set was not built for",
@@ -622,6 +709,15 @@ fn brain(in_dim: u32, out_dim: u32, rows: u32) -> CoreResult<Projection> {
         launch: kernels::matmul_rows_warp(out_dim),
         rows,
     })
+}
+
+/// Whether a brain-float projection of contraction `in_dim` takes the
+/// matrix-unit kernel on this pass: a prompt pass, on a device that has it,
+/// over a contraction its 32-wide slices divide.
+const fn brain_gemm(in_dim: u32, device: Device) -> bool {
+    matches!(device.prompt_matmul, PromptMatmul::Matrix)
+        && device.row_invariant()
+        && in_dim.is_multiple_of(32)
 }
 
 /// Trellis width of one of the three codec element types.
@@ -828,7 +924,7 @@ pub fn project(
         }
         // The brain-float tier has no BLAS path, so passes are its only way
         // through a chunk - a draft head's catch-up over the prompt is one.
-        DType::BF16 => rows > MAX_ROWS,
+        DType::BF16 => rows > MAX_ROWS && !brain_gemm(weight.in_dim, device),
         _ => false,
     };
     if passes {
@@ -1040,6 +1136,19 @@ fn project_one(
                 );
             }
         }
+        // `out, w, x, in_dim, out_dim, rows`.
+        Projection::BrainGemm { entry, launch } => out.launch(
+            entry,
+            launch,
+            Args::of(&[
+                bound.dst,
+                w,
+                bound.src,
+                Operand::U32(weight.in_dim),
+                Operand::U32(weight.out_dim),
+                Operand::U32(rows),
+            ]),
+        ),
         // `out, w, x, in_dim, out_dim`.
         Projection::BrainRows { entry, launch, .. } => out.launch(
             entry,
@@ -1455,6 +1564,7 @@ mod tests {
         max_co_resident: 48,
         half_block_input: false,
         role: PassRole::Step,
+        prompt_matmul: PromptMatmul::Rows,
     };
 
     #[test]
@@ -1550,16 +1660,48 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_pass_takes_the_brain_float_matrix_kernel_at_every_width() {
+        let prompt = Device {
+            prompt_matmul: PromptMatmul::Matrix,
+            role: PassRole::Prompt { snapshot: None },
+            ..GPU
+        };
+        for rows in [1, 5, 512, 4096] {
+            let plan = brain(2_560, 512, rows, prompt).expect("the device has it");
+            let Projection::BrainGemm { entry, launch } = plan else {
+                panic!("{plan:?}");
+            };
+            assert_eq!(entry.name(), "q4e_bf16_gemm_kernel");
+            assert_eq!(launch.grid.y, rows.div_ceil(AFFINE_GEMM_TILE));
+        }
+        // Without the kernel, or on a step, the row kernel as before.
+        for device in [
+            Device {
+                prompt_matmul: PromptMatmul::Rows,
+                ..prompt
+            },
+            Device {
+                prompt_matmul: PromptMatmul::Matrix,
+                ..GPU
+            },
+        ] {
+            let plan = brain(2_560, 512, 4, device).expect("the built set covers it");
+            assert!(matches!(plan, Projection::BrainRows { .. }), "{plan:?}");
+        }
+    }
+
+    #[test]
     fn a_brain_float_projection_runs_one_row_and_splits_a_chunk_into_passes() {
         for want in [1, 4, MAX_ROWS] {
-            let plan = brain(2_560, 128, want).expect("the built set covers it");
+            let plan = brain(2_560, 128, want, GPU).expect("the built set covers it");
             let Projection::BrainRows { entry, rows, .. } = plan else {
                 panic!("{plan:?}");
             };
             assert_eq!(rows, want);
             assert_eq!(entry.name(), "q4e_matmul_bf16_rows_kernel");
         }
-        let err = brain(2_560, 128, MAX_ROWS + 1).expect_err("one launch is at most the width");
+        let err =
+            brain(2_560, 128, MAX_ROWS + 1, GPU).expect_err("one launch is at most the width");
         assert!(matches!(err, CoreError::Unsupported { .. }), "{err:?}");
         // A draft head's catch-up chunk: two full passes and a narrower tail.
         let mut out = Plan::new();

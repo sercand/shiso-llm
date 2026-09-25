@@ -115,6 +115,9 @@ pub struct SparseOptions {
     pub tiled_attention: bool,
     /// Whether it granted the tensor-core kernels theirs.
     pub tensor_core: bool,
+    /// Which kernel its prompt passes' brain-float projections take; see
+    /// [`crate::sparse::matmul::Device::prompt_matmul`].
+    pub prompt_matmul: crate::sparse::matmul::PromptMatmul,
     /// The entry names this build captured for the template kernels.
     ///
     /// Empty on a host that never compiled the kernels, which makes every
@@ -177,6 +180,7 @@ impl SparseOptions {
             co_resident_blocks: 0,
             tiled_attention: true,
             tensor_core: true,
+            prompt_matmul: crate::sparse::matmul::PromptMatmul::Rows,
             entries: kernels::EntryTable::new(&[]),
             ngram_cache_bytes: NGRAM_CACHE_BYTES,
             ngram_reader: shiso_ple::PleConfig::DEFAULT,
@@ -787,6 +791,7 @@ impl SparseStack {
             max_co_resident: opts.co_resident_blocks,
             half_block_input: false,
             role: crate::sparse::matmul::PassRole::Step,
+            prompt_matmul: opts.prompt_matmul,
         };
         let desc = weights.desc(ngram.as_ref().map(|tier| tier.table().row()));
         log_resident(&shape, &opts, &kv, geometry.ckpt_bytes);

@@ -32,6 +32,19 @@ kernel void kernel_touch_u8_stride(
     dst[dst_offset + (ulong)gid] = src[off];
 }
 
+// Zeroes `bytes` bytes, sixteen per thread. The backend's `fill_zero`: a
+// dispatch keeps the clear inside the open compute encoder, where a blit fill
+// would close it and open another around every clear.
+kernel void kernel_fill_zero_u8(
+        device uchar          *dst        [[buffer(0)]],
+        constant ulong        &bytes      [[buffer(1)]],
+        uint gid [[thread_position_in_grid]]) {
+    ulong at = (ulong)gid * 16;
+    for (ulong i = at; i < MIN(at + 16, bytes); ++i) {
+        dst[i] = 0;
+    }
+}
+
 enum shs_sort_order {
     SHS_SORT_ORDER_ASC,
     SHS_SORT_ORDER_DESC,

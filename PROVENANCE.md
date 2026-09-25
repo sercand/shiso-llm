@@ -24,6 +24,7 @@ the name "ds4" for the host project.
 | `crates/shiso-vision` | Hugging Face `transformers`, mlx-vlm | preprocessing matches the reference processors |
 | `crates/shiso-ple` | - | original to this repository |
 | `crates/shiso-metal` | llama.cpp Metal kernels; Splash Metal runtime kernels | several MSL kernels ported from those sources |
+| `crates/shiso-metal/metal/q4e/affine.metal` | [MLX](https://github.com/ml-explore/mlx) Metal quantized kernels (`qmv_fast`, `qmm_t`), MIT | written for this repository; the one-row projections' pre-scaled four-bit dot and the prompt projections' staged-tile matrix multiply follow the technique of those kernels |
 | `crates/shiso-cuda` | - | original to this repository |
 | `crates/shiso-kernels` | ds4, llama.cpp, exllamav3 | build and embed the kernel trees above |
 | `crates/shiso-kerneltest` | Splash Metal runtime kernels | some CPU oracles restate that arithmetic |

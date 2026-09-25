@@ -391,6 +391,8 @@ pub struct OptionalPaths {
     pub tiled_attention: bool,
     /// The chunked recurrence and its parallel convolution.
     pub chunked_recurrence: bool,
+    /// The kernel a prompt pass's brain-float projections can take.
+    pub prompt_matmul: crate::sparse::matmul::PromptMatmul,
 }
 
 /// Asks the device which optional paths it has kernels for.
@@ -410,6 +412,11 @@ pub fn optional_paths(backend: &dyn Backend) -> OptionalPaths {
             && has(MOD_GDN_TC, "q4e_gdn_tc_scan_kernel")
             && has(MOD_GDN_TC, "q4e_gdn_conv_par_kernel")
             && has(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
+        prompt_matmul: if has(MOD_MATVEC, "q4e_bf16_gemm_kernel") {
+            crate::sparse::matmul::PromptMatmul::Matrix
+        } else {
+            crate::sparse::matmul::PromptMatmul::Rows
+        },
     };
     tracing::info!(?paths, "optional sparse kernel paths this device has");
     paths

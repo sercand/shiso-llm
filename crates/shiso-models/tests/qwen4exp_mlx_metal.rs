@@ -9,6 +9,14 @@
 //! ```
 //!
 //! A skipped case says so on stdout; it passes as well, so read the output.
+//!
+//! The first case doubles as the stack's speed check on this machine, and a
+//! few variables shape it: `SHISO_TEST_DECODE_TOKENS` (15) tokens decoded
+//! after the prompt, `SHISO_TEST_PROMPT_REPEAT` repeats of a sentence in
+//! front of it to time a long prefill, `SHISO_TEST_PREFILL_ROWS` (512) the
+//! widest prefill pass, and `SHISO_TEST_RESERVE_GB` (6) the memory left
+//! beside the expert pool - a wider margin keeps the machine out of swap,
+//! which is what makes two runs comparable.
 #![cfg(target_os = "macos")]
 #![expect(
     clippy::cast_possible_truncation,
@@ -72,7 +80,11 @@ fn metal_options(backend: &Arc<dyn Backend>) -> SparseOptions {
     opts.tiled_attention = false;
     opts.chunk.available = false;
     opts.entries = capture::capture(backend.as_ref());
-    opts.prefill_rows = 512;
+    opts.prompt_matmul = capture::optional_paths(backend.as_ref()).prompt_matmul;
+    opts.prefill_rows = std::env::var("SHISO_TEST_PREFILL_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
     opts.engine.ctx = 4096;
     opts.engine.kv_pool_pages = 32;
     opts
@@ -127,7 +139,15 @@ fn the_checkpoint_answers_a_short_prompt_on_metal() {
 
     let tokenizer =
         tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("the tokenizer loads");
-    let prompt = "The capital of France is";
+    let long = std::env::var("SHISO_TEST_PROMPT_REPEAT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| {
+            "The history of Paris spans more than two thousand years, from a Celtic settlement on the Seine to a Roman town, a medieval capital and a modern metropolis. "
+                .repeat(n)
+                + "The capital of France is"
+        });
+    let prompt = long.as_deref().unwrap_or("The capital of France is");
     let ids: Vec<TokenId> = tokenizer
         .encode(prompt, false)
         .expect("the prompt encodes")
@@ -135,10 +155,12 @@ fn the_checkpoint_answers_a_short_prompt_on_metal() {
         .iter()
         .map(|&id| TokenId::new(id))
         .collect();
-    say(&format!(
-        "prompt ids {:?}",
-        ids.iter().map(|t| t.get()).collect::<Vec<_>>()
-    ));
+    if ids.len() < 64 {
+        say(&format!(
+            "prompt ids {:?}",
+            ids.iter().map(|t| t.get()).collect::<Vec<_>>()
+        ));
+    }
 
     let session = model.open_session().expect("a session opens");
     let started = std::time::Instant::now();
@@ -146,7 +168,15 @@ fn the_checkpoint_answers_a_short_prompt_on_metal() {
         .prefill_last(session, &ids)
         .expect("the prompt prefills");
     let row = read_row(&backend, logits.row(0).expect("one logits row"));
-    say(&format!("prefill {:.2}s", started.elapsed().as_secs_f64()));
+    say(&format!(
+        "prefill {} tokens {:.2}s ({:.1} tok/s)",
+        ids.len(),
+        started.elapsed().as_secs_f64(),
+        ids.len() as f64 / started.elapsed().as_secs_f64()
+    ));
+    if let Some(stats) = model.stack().expert_stream_stats() {
+        say(&format!("after prefill: {stats:?}"));
+    }
     let finite = row.iter().all(|v| v.is_finite());
     let mut top: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
     top.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -159,7 +189,11 @@ fn the_checkpoint_answers_a_short_prompt_on_metal() {
     let mut next = TokenId::new(argmax(&row) as u32);
     let mut out = vec![next.get()];
     let started = std::time::Instant::now();
-    for _ in 0..15 {
+    let decode_n: usize = std::env::var("SHISO_TEST_DECODE_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
+    for _ in 0..decode_n {
         let step = [shiso_core::model::DecodeStep {
             session,
             token: next,
@@ -171,8 +205,8 @@ fn the_checkpoint_answers_a_short_prompt_on_metal() {
     }
     let secs = started.elapsed().as_secs_f64();
     say(&format!(
-        "decoded 15 in {secs:.2}s ({:.2} tok/s): {:?}",
-        15.0 / secs,
+        "decoded {decode_n} in {secs:.2}s ({:.2} tok/s): {:?}",
+        decode_n as f64 / secs,
         tokenizer.decode(&out, false).unwrap_or_default()
     ));
     if let Some(stats) = model.stack().expert_stream_stats() {
@@ -181,24 +215,28 @@ fn the_checkpoint_answers_a_short_prompt_on_metal() {
     // The same prompt and continuation again, teacher-forced: every expert
     // it routes to is already in a slot, so this is the decode rate the
     // device and the host overhead allow, with no disk in it.
-    model.close_session(session).expect("the session closes");
-    let session = model.open_session().expect("a second session opens");
-    model
-        .prefill_last(session, &ids)
-        .expect("the prompt prefills again");
-    let started = std::time::Instant::now();
-    for &token in &out[..out.len() - 1] {
-        let step = [shiso_core::model::DecodeStep {
-            session,
-            token: TokenId::new(token),
-        }];
-        model.decode_batch(&step).expect("a decode step runs");
+    // Three times over: one replay on this device swings with its clocks.
+    let mut session = session;
+    for _ in 0..3 {
+        model.close_session(session).expect("the session closes");
+        session = model.open_session().expect("a second session opens");
+        model
+            .prefill_last(session, &ids)
+            .expect("the prompt prefills again");
+        let started = std::time::Instant::now();
+        for &token in &out[..out.len() - 1] {
+            let step = [shiso_core::model::DecodeStep {
+                session,
+                token: TokenId::new(token),
+            }];
+            model.decode_batch(&step).expect("a decode step runs");
+        }
+        let secs = started.elapsed().as_secs_f64();
+        say(&format!(
+            "warm replay: {:.2} tok/s",
+            (out.len() - 1) as f64 / secs
+        ));
     }
-    let secs = started.elapsed().as_secs_f64();
-    say(&format!(
-        "warm replay: {:.2} tok/s",
-        (out.len() - 1) as f64 / secs
-    ));
     if let Some(stats) = model.stack().expert_stream_stats() {
         say(&format!("expert stream after replay: {stats:?}"));
     }

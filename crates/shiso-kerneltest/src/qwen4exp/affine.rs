@@ -161,18 +161,21 @@ fn projection(gpu: &Gpu, out_dim: usize, in_dim: usize, rows: usize, seed: u32) 
         KernelArg::U32(out_dim as u32),
         KernelArg::U32(rows as u32),
     ];
-    let grid = Extent3::new(out_dim.div_ceil(8) as u32, rows.div_ceil(tokens) as u32, 1);
-    run(
-        gpu,
-        KernelRef::new(MODULE, entry),
-        &LaunchArgs::new(grid, Extent3::linear(256), &args),
-    );
-    drain(gpu);
-    let got = gpu.read_f32(&out);
     let want: Vec<f32> = (0..rows)
         .flat_map(|r| bank.project(0, &x[r * in_dim..(r + 1) * in_dim]))
         .collect();
-    assert_close(entry, &got, &want, 2e-4);
+    let grid = Extent3::new(out_dim.div_ceil(8) as u32, rows.div_ceil(tokens) as u32, 1);
+    // Every contraction split the host may choose sums the same product.
+    for splits in [1u32, 2, 4] {
+        run(
+            gpu,
+            KernelRef::new(MODULE, entry),
+            &LaunchArgs::new(grid, Extent3::linear(64 * splits), &args),
+        );
+        drain(gpu);
+        let got = gpu.read_f32(&out);
+        assert_close(entry, &got, &want, 2e-4);
+    }
 }
 
 /// A decode step's projections at the checkpoint's shapes, including the
@@ -190,6 +193,134 @@ pub fn the_one_row_projection_matches_the_host(gpu: &Gpu) {
 pub fn the_multi_row_projection_matches_the_host(gpu: &Gpu) {
     projection(gpu, 320, 10240, 5, 5);
     projection(gpu, 640, 2560, 19, 6);
+    projection(gpu, 10240, 320, 11, 7);
+    projection(gpu, 2560, 640, 9, 8);
+}
+
+/// One prompt projection on the matrix units, at `rows` activation rows.
+fn gemm(
+    gpu: &Gpu,
+    bank: &AffineBank,
+    x: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    rows: usize,
+) -> Vec<f32> {
+    let (w, s, b) = bank.upload(gpu);
+    let xs = gpu.upload(&f32_bytes(&x[..rows * in_dim]));
+    let out = gpu.upload(&vec![0u8; rows * out_dim * 4]);
+    let args = [
+        KernelArg::Buffer(out.view()),
+        KernelArg::Buffer(w.view()),
+        KernelArg::Buffer(s.view()),
+        KernelArg::Buffer(b.view()),
+        KernelArg::Buffer(xs.view()),
+        KernelArg::U32(in_dim as u32),
+        KernelArg::U32(out_dim as u32),
+        KernelArg::U32(rows as u32),
+    ];
+    let grid = Extent3::new(out_dim.div_ceil(32) as u32, rows.div_ceil(32) as u32, 1);
+    run(
+        gpu,
+        KernelRef::new(MODULE, "q4e_affine_gemm_kernel"),
+        &LaunchArgs::new(grid, Extent3::linear(128), &args),
+    );
+    drain(gpu);
+    gpu.read_f32(&out)
+}
+
+/// The prompt projection matches the host, and a row comes out bit for bit
+/// the same whichever rows share its pass - the promise a prompt pass makes.
+pub fn the_prompt_projection_matches_the_host_at_every_width(gpu: &Gpu) {
+    for (out_dim, in_dim, rows, seed) in [
+        (640usize, 2560usize, 45usize, 11u32),
+        (70, 320, 33, 12),
+        (320, 10240, 7, 13),
+    ] {
+        let bank = AffineBank::new(1, out_dim, in_dim, 64, seed);
+        let x = signal(rows * in_dim, seed ^ 0x55);
+        let got = gemm(gpu, &bank, &x, out_dim, in_dim, rows);
+        let want: Vec<f32> = (0..rows)
+            .flat_map(|r| bank.project(0, &x[r * in_dim..(r + 1) * in_dim]))
+            .collect();
+        assert_close("q4e_affine_gemm_kernel", &got, &want, 2e-4);
+        for narrow in [1usize, 5] {
+            let fewer = gemm(gpu, &bank, &x, out_dim, in_dim, narrow);
+            assert!(
+                fewer == got[..narrow * out_dim],
+                "{out_dim}x{in_dim}: the first {narrow} rows moved when the pass narrowed"
+            );
+        }
+    }
+}
+
+/// One brain-float prompt projection on the matrix units at `rows` rows.
+fn bf16_gemm(
+    gpu: &Gpu,
+    w: &[u16],
+    x: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    rows: usize,
+) -> Vec<f32> {
+    let wb = gpu.upload(&w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+    let xs = gpu.upload(&f32_bytes(&x[..rows * in_dim]));
+    let out = gpu.upload(&vec![0u8; rows * out_dim * 4]);
+    let args = [
+        KernelArg::Buffer(out.view()),
+        KernelArg::Buffer(wb.view()),
+        KernelArg::Buffer(xs.view()),
+        KernelArg::U32(in_dim as u32),
+        KernelArg::U32(out_dim as u32),
+        KernelArg::U32(rows as u32),
+    ];
+    let grid = Extent3::new(out_dim.div_ceil(32) as u32, rows.div_ceil(32) as u32, 1);
+    run(
+        gpu,
+        KernelRef::new(MODULE, "q4e_bf16_gemm_kernel"),
+        &LaunchArgs::new(grid, Extent3::linear(128), &args),
+    );
+    drain(gpu);
+    gpu.read_f32(&out)
+}
+
+/// The brain-float prompt projection matches the host at the checkpoint's
+/// shapes - the router, the recurrent gates, the stream mixes' injections -
+/// and a row comes out the same whichever rows share its pass.
+pub fn the_prompt_brain_float_projection_matches_the_host_at_every_width(gpu: &Gpu) {
+    for (out_dim, in_dim, rows, seed) in [
+        (512usize, 2560usize, 40usize, 21u32),
+        (4, 10240, 37, 22),
+        (48, 2560, 3, 23),
+    ] {
+        let w: Vec<u16> = signal(out_dim * in_dim, seed)
+            .iter()
+            .map(|v| bf16_bits(*v * 0.05))
+            .collect();
+        let x = signal(rows * in_dim, seed ^ 0x33);
+        let got = bf16_gemm(gpu, &w, &x, out_dim, in_dim, rows);
+        let want: Vec<f32> = (0..rows)
+            .flat_map(|r| {
+                let xr = &x[r * in_dim..(r + 1) * in_dim];
+                let w = &w;
+                (0..out_dim).map(move |o| {
+                    let mut acc = 0f64;
+                    for k in 0..in_dim {
+                        acc += f64::from(bf16_value(w[o * in_dim + k])) * f64::from(xr[k]);
+                    }
+                    acc as f32
+                })
+            })
+            .collect();
+        assert_close("q4e_bf16_gemm_kernel", &got, &want, 2e-4);
+        for narrow in [1usize, 2] {
+            let fewer = bf16_gemm(gpu, &w, &x, out_dim, in_dim, narrow);
+            assert!(
+                fewer == got[..narrow * out_dim],
+                "{out_dim}x{in_dim}: the first {narrow} rows moved when the pass narrowed"
+            );
+        }
+    }
 }
 
 /// The vocabulary gather dequantizes each token's row and fans it out.
@@ -253,21 +384,42 @@ fn i32_bytes(values: &[i32]) -> Vec<u8> {
 /// through a slot map that is not the identity: the case a streamed bank
 /// takes, where expert `e` sits wherever the stream put it.
 pub fn the_expert_stages_follow_the_slot_map(gpu: &Gpu) {
-    let (hidden, inter, n_expert, n_used, slots) = (2560usize, 640usize, 16usize, 3usize, 6usize);
-    let gate = AffineBank::new(slots, inter, hidden, 64, 21);
-    let up = AffineBank::new(slots, inter, hidden, 64, 22);
-    let down = AffineBank::new(slots, hidden, inter, 64, 23);
+    // The checkpoint's intermediate width takes the down projection's row
+    // split; a width that is not a multiple of 128 takes the sweep layout.
+    expert_stages(gpu, 640);
+    expert_stages(gpu, 576);
+}
+
+/// One expert-stage case at intermediate width `inter`.
+fn expert_stages(gpu: &Gpu, inter: usize) {
     // Two tokens, three slots each: columns 0..6.
     let ids: Vec<i32> = vec![4, 9, 1, 9, 13, 4];
-    let n_tok = ids.len() / n_used;
     // Expert -> slot; only the routed experts have one.
-    let mut map = vec![u32::MAX; n_expert];
+    let mut map = vec![u32::MAX; 16];
     for (slot, e) in [1usize, 4, 9, 13].iter().enumerate() {
         map[*e] = [5u32, 0, 3, 2][slot];
     }
+    expert_case(gpu, inter, &ids, 16, &map, false);
+}
+
+/// The routed stages over `ids` - three slots a token - checked against the
+/// host, on the prompt kernels when `gemm`; returns gate, up and down.
+fn expert_case(
+    gpu: &Gpu,
+    inter: usize,
+    ids: &[i32],
+    n_expert: usize,
+    map: &[u32],
+    gemm: bool,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (hidden, n_used, slots) = (2560usize, 3usize, 6usize);
+    let gate = AffineBank::new(slots, inter, hidden, 64, 21);
+    let up = AffineBank::new(slots, inter, hidden, 64, 22);
+    let down = AffineBank::new(slots, hidden, inter, 64, 23);
+    let n_tok = ids.len() / n_used;
     // The sort's outputs, computed on the host.
     let mut bounds = vec![0i32; n_expert + 1];
-    for &e in &ids {
+    for &e in ids {
         bounds[e as usize + 1] += 1;
     }
     for e in 0..n_expert {
@@ -287,6 +439,26 @@ pub fn the_expert_stages_follow_the_slot_map(gpu: &Gpu) {
     active.push(n_active);
 
     let x = signal(n_tok * hidden, 31);
+    let (gate_up_entry, down_entry, block, per) = if gemm {
+        (
+            "q4e_affine_experts_gemm_gate_up_kernel",
+            "q4e_affine_experts_gemm_down_kernel",
+            128,
+            (64, 64),
+        )
+    } else {
+        let rows = if inter.is_multiple_of(128) && inter <= 1024 {
+            16
+        } else {
+            8
+        };
+        (
+            "q4e_affine_experts_gate_up_kernel",
+            "q4e_affine_experts_down_kernel",
+            64,
+            (8, rows),
+        )
+    };
     let (gw, gs, gb) = gate.upload(gpu);
     let (uw, us, ub) = up.upload(gpu);
     let (dw, ds, db) = down.upload(gpu);
@@ -317,11 +489,16 @@ pub fn the_expert_stages_follow_the_slot_map(gpu: &Gpu) {
         KernelArg::U32(n_expert as u32),
         KernelArg::U32(n_used as u32),
     ];
-    let grid = Extent3::new(inter.div_ceil(8) as u32, cols.min(n_expert) as u32, 1);
+    let tiles = if gemm {
+        2 * inter.div_ceil(per.0)
+    } else {
+        inter.div_ceil(per.0)
+    };
+    let grid = Extent3::new(tiles as u32, cols.min(n_expert) as u32, 1);
     run(
         gpu,
-        KernelRef::new("q4e_moe", "q4e_affine_experts_gate_up_kernel"),
-        &LaunchArgs::new(grid, Extent3::linear(256), &args),
+        KernelRef::new("q4e_moe", gate_up_entry),
+        &LaunchArgs::new(grid, Extent3::linear(block), &args),
     );
     drain(gpu);
     let got_gate = gpu.read_f32(&og);
@@ -355,11 +532,11 @@ pub fn the_expert_stages_follow_the_slot_map(gpu: &Gpu) {
         KernelArg::U32(n_expert as u32),
         KernelArg::U32(n_used as u32),
     ];
-    let grid = Extent3::new(hidden.div_ceil(8) as u32, cols.min(n_expert) as u32, 1);
+    let grid = Extent3::new(hidden.div_ceil(per.1) as u32, cols.min(n_expert) as u32, 1);
     run(
         gpu,
-        KernelRef::new("q4e_moe", "q4e_affine_experts_down_kernel"),
-        &LaunchArgs::new(grid, Extent3::linear(256), &args),
+        KernelRef::new("q4e_moe", down_entry),
+        &LaunchArgs::new(grid, Extent3::linear(block), &args),
     );
     drain(gpu);
     let got_down = gpu.read_f32(&od);
@@ -373,6 +550,32 @@ pub fn the_expert_stages_follow_the_slot_map(gpu: &Gpu) {
             2e-4,
         );
     }
+    (got_gate, got_up, got_down)
+}
+
+/// The prompt kernels of both routed stages match the host, loop over an
+/// expert whose columns fill more than one tile, and give each column the same
+/// bits whichever columns share its pass.
+pub fn the_prompt_expert_stages_match_the_host_at_every_width(gpu: &Gpu) {
+    let n_expert = 8usize;
+    // Forty tokens, three distinct experts each, expert 2 in every one: forty
+    // columns for expert 2, two tiles.
+    let others = [0i32, 1, 3, 4, 5, 6, 7];
+    let ids: Vec<i32> = (0..40usize)
+        .flat_map(|t| {
+            let a = others[t % 7];
+            let b = others[(t * 3 + 1) % 7];
+            let b = if b == a { others[(t % 7 + 1) % 7] } else { b };
+            [2, a, b]
+        })
+        .collect();
+    let map: Vec<u32> = (0..n_expert as u32).map(|e| (e * 5 + 1) % 6).collect();
+    let (g, u, d) = expert_case(gpu, 640, &ids, n_expert, &map, true);
+    let narrow = &ids[..5 * 3];
+    let (g5, u5, d5) = expert_case(gpu, 640, narrow, n_expert, &map, true);
+    assert!(g5 == g[..g5.len()], "gate moved when the pass narrowed");
+    assert!(u5 == u[..u5.len()], "up moved when the pass narrowed");
+    assert!(d5 == d[..d5.len()], "down moved when the pass narrowed");
 }
 
 /// The n-gram rows decode from the concatenated affine row format into the

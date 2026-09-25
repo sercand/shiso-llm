@@ -23,3 +23,4 @@ pub mod matvec;
 pub mod misc;
 pub mod ple;
 pub mod qsa;
+pub mod route;

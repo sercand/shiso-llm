@@ -795,6 +795,7 @@ fn sparse_options(
         prefill_rows: SparseOptions::prefill_rows_for(widest),
         tensor_core: paths.tensor_core,
         tiled_attention: paths.tiled_attention,
+        prompt_matmul: paths.prompt_matmul,
         chunk: shiso_engine::sparse::recurrent::ChunkPolicy {
             available: paths.chunked_recurrence,
             ..shiso_engine::sparse::recurrent::ChunkPolicy::new()
