@@ -152,7 +152,8 @@ environment variable. The ones you are most likely to want:
 | `--vision-allow-remote-images` | Allow fetching images from `http(s)` URLs |
 | `--video-allow-ffmpeg` | Allow video input by spawning ffmpeg |
 | `--audio-allow-ffmpeg` | Allow audio containers other than WAV by spawning ffmpeg |
-| `--audio-max-seconds` | Longest audio clip a request may carry (default 1800) |
+| `--audio-max-seconds` | Longest audio clip a request may carry (default 7200) |
+| `--audio-max-upload-mb` | Largest transcription upload, in MiB (default 512); other routes keep the 32 MiB body limit |
 | `--asr-model`, `--asr-id` | Speech recognizer for `/v1/audio/transcriptions`, and the id it answers to |
 | `--diarization-model` | Speaker diarizer, for `response_format=diarized_json` |
 | `--asr-lookahead` | Encoder lookahead frames, one the checkpoint was trained for (default 13) |

@@ -177,6 +177,14 @@ pub enum AppError {
         /// The stable machine-readable code.
         code: &'static str,
     },
+    /// The request body is larger than the route accepts.
+    #[error("the request body is larger than the {limit} bytes {what} accepts")]
+    TooLarge {
+        /// Which route's limit was reached, named as an operator would tune it.
+        what: &'static str,
+        /// The limit, in bytes.
+        limit: usize,
+    },
     /// The server has more work in flight than it can hold.
     ///
     /// A variant of its own rather than an internal failure, because the two
@@ -250,6 +258,7 @@ impl AppError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::NotFound { .. } | Self::UnknownModel { .. } => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
+            Self::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::BadRequest { .. } | Self::ContextOverflow { .. } => StatusCode::BAD_REQUEST,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -280,6 +289,7 @@ impl AppError {
             Self::NotFound { .. } => "unknown_endpoint",
             Self::UnknownModel { .. } => "model_not_found",
             Self::MethodNotAllowed { .. } => "method_not_allowed",
+            Self::TooLarge { .. } => "request_too_large",
             Self::BadRequest { code, .. } => code,
             Self::Internal { .. } => "internal_error",
         }
@@ -314,7 +324,7 @@ impl AppError {
 #[must_use]
 pub const fn type_for_status(status: StatusCode) -> &'static str {
     match status {
-        StatusCode::BAD_REQUEST => "invalid_request_error",
+        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE => "invalid_request_error",
         StatusCode::UNAUTHORIZED => "authentication_error",
         StatusCode::NOT_FOUND => "not_found_error",
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_exceeded",
@@ -375,6 +385,7 @@ fn body_for(error: &AppError, surface: ApiSurface) -> Value {
 const fn anthropic_type_for_status(status: StatusCode) -> &'static str {
     match status {
         StatusCode::BAD_REQUEST => "invalid_request_error",
+        StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
         StatusCode::UNAUTHORIZED => "authentication_error",
         StatusCode::NOT_FOUND => "not_found_error",
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",

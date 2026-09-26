@@ -26,6 +26,12 @@ use tokio::sync::mpsc;
 
 use crate::error::AppError;
 
+/// The largest transcription upload, when nothing else is configured:
+/// 512 MiB, a little over an hour of 44.1 kHz stereo WAV and several hours of
+/// compressed audio. The whole body is held while it is decoded, so this is
+/// also the memory one request may pin.
+pub const DEFAULT_MAX_UPLOAD_BYTES: usize = 512 * 1024 * 1024;
+
 /// One transcription to run.
 #[derive(Debug)]
 pub struct TranscriptionJob {
@@ -98,6 +104,8 @@ pub struct AudioServiceDesc {
     /// The subprocess decoder for containers other than WAV, or `None` when
     /// only WAV is accepted.
     pub ffmpeg: Option<FfmpegPolicy>,
+    /// The largest request body the transcription routes read.
+    pub max_upload_bytes: usize,
 }
 
 /// A queued job and where its events go.
@@ -116,6 +124,7 @@ pub struct AudioService {
     diarizer: bool,
     limits: DecodeLimits,
     ffmpeg: Option<Arc<FfmpegPolicy>>,
+    max_upload_bytes: usize,
 }
 
 impl AudioService {
@@ -133,6 +142,7 @@ impl AudioService {
             diarizer: desc.diarizer.is_some(),
             limits: desc.limits,
             ffmpeg: desc.ffmpeg.clone().map(Arc::new),
+            max_upload_bytes: desc.max_upload_bytes,
         };
         // The diarizer thread ends when the worker, its only sender, does.
         let diarizer = match &desc.diarizer {
@@ -162,6 +172,12 @@ impl AudioService {
     #[must_use]
     pub fn languages(&self) -> &[String] {
         &self.languages
+    }
+
+    /// The largest request body the transcription routes read.
+    #[must_use]
+    pub const fn max_upload_bytes(&self) -> usize {
+        self.max_upload_bytes
     }
 
     /// Whether a diarizer is loaded.

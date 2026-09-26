@@ -197,6 +197,7 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
         queue: args.audio_max_streams.saturating_mul(4),
         limits: args.audio_limits(),
         ffmpeg: args.audio_ffmpeg_policy(),
+        max_upload_bytes: args.audio_max_upload_bytes(),
     })
     .context("starting the audio worker")?;
     Ok(Some(service))

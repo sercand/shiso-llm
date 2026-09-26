@@ -183,6 +183,15 @@ impl Diarizer for Halves {
 }
 
 fn service(max_streams: usize, queue: usize, log: &Log) -> AudioService {
+    service_with_upload(max_streams, queue, log, super::DEFAULT_MAX_UPLOAD_BYTES)
+}
+
+fn service_with_upload(
+    max_streams: usize,
+    queue: usize,
+    log: &Log,
+    max_upload_bytes: usize,
+) -> AudioService {
     let vocab = Arc::new(
         PieceVocab::from_pieces(vec![
             "<blank>".into(),
@@ -207,6 +216,7 @@ fn service(max_streams: usize, queue: usize, log: &Log) -> AudioService {
         queue,
         limits: crate::tokenizer::message_preprocess::DEFAULT_AUDIO_LIMITS,
         ffmpeg: None,
+        max_upload_bytes,
     })
     .expect("the thread starts");
     service
@@ -432,4 +442,74 @@ async fn a_long_diarization_holds_no_other_job() {
     let last_diar = log.iter().rposition(|l| l == "diar").expect("diarized");
     let first_b = log.iter().position(|l| l == "b").expect("b ran");
     assert!(first_b < last_diar, "b waited for the diarizer: {log:?}");
+}
+
+/// A transcription form carrying `file_bytes` bytes that are not audio.
+fn upload(file_bytes: usize) -> axum::http::Request<axum::body::Body> {
+    let boundary = "shisoboundary";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nscripted\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend(std::iter::repeat_n(7u8, file_bytes));
+    body.extend(format!("\r\n--{boundary}--\r\n").into_bytes());
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/audio/transcriptions")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(axum::body::Body::from(body))
+        .expect("builds")
+}
+
+async fn status_and_code(
+    service: AudioService,
+    request: axum::http::Request<axum::body::Body>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower::ServiceExt as _;
+    let state = Arc::new(crate::state::AppState::without_language_model().with_audio(service));
+    let response = crate::router::build_router(state)
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body reads");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn an_upload_past_the_json_body_limit_is_read_as_audio() {
+    let log = Log::default();
+    // 40 MiB: past the 32 MiB every other route takes, inside the audio limit.
+    let (status, body) = status_and_code(
+        service_with_upload(1, 1, &log, 64 * 1024 * 1024),
+        upload(40 * 1024 * 1024),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["code"], "invalid_audio",
+        "it was read: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_upload_past_the_audio_limit_is_refused_as_too_large() {
+    let log = Log::default();
+    let (status, body) = status_and_code(
+        service_with_upload(1, 1, &log, 1024 * 1024),
+        upload(2 * 1024 * 1024),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "request_too_large", "{body}");
 }

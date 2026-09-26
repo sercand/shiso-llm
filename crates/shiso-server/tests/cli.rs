@@ -516,7 +516,8 @@ fn an_audio_only_server_needs_no_language_model() {
     assert_eq!(args.asr_id().as_deref(), Some("nemotron-asr"));
     assert_eq!(args.asr_lookahead, 13);
     assert_eq!(args.audio_max_streams, 4);
-    assert_eq!(args.audio_max_seconds.get(), 1800);
+    assert_eq!(args.audio_max_seconds.get(), 7200);
+    assert_eq!(args.audio_max_upload_bytes(), 512 * 1024 * 1024);
 }
 
 #[test]

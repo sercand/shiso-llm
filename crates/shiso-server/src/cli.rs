@@ -409,8 +409,12 @@ pub struct ServeArgs {
     ///
     /// Checked on the decoded length, before any mel frame is computed. A
     /// tower's own limit still applies beneath it.
-    #[arg(long, env = "SHISO_AUDIO_MAX_SECONDS", default_value = "1800")]
+    #[arg(long, env = "SHISO_AUDIO_MAX_SECONDS", default_value = "7200")]
     pub audio_max_seconds: NonZeroU32,
+    /// The largest transcription upload, in MiB. Only the transcription
+    /// routes take it; every other route keeps the JSON body limit.
+    #[arg(long, env = "SHISO_AUDIO_MAX_UPLOAD_MB", default_value = "512")]
+    pub audio_max_upload_mb: NonZeroU32,
     /// Allow decoding audio containers other than WAV by spawning the decoder
     /// `--video-ffmpeg-path` names.
     #[arg(long, env = "SHISO_AUDIO_ALLOW_FFMPEG", default_value_t = false)]
@@ -915,6 +919,14 @@ impl ServeArgs {
             policy = policy.with_timeout_secs(seconds);
         }
         Some(policy)
+    }
+
+    /// The transcription routes' body limit, in bytes.
+    #[must_use]
+    pub fn audio_max_upload_bytes(&self) -> usize {
+        usize::try_from(self.audio_max_upload_mb.get())
+            .unwrap_or(usize::MAX)
+            .saturating_mul(1024 * 1024)
     }
 
     /// The audio decode limits these flags describe.
