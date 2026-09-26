@@ -10,17 +10,68 @@
 //! Multilingual models in automatic-language mode emit a language tag piece
 //! such as `<en-US>` after the text. The tag is not text: [`Detokenizer`]
 //! strips it and reports it as the language.
+//!
+//! A second family of models tokenizes with GPT-2 byte-level BPE instead:
+//! there is no `▁`, and a piece is a run of symbols from a 256-character byte
+//! alphabet rather than text itself. [`PieceVocab::from_byte_level`] builds
+//! this mode, and [`Detokenizer::push`] maps each piece's symbols back to raw
+//! bytes and buffers them until they complete a UTF-8 character - a
+//! multi-byte character can end up split across two token ids, and must never
+//! be reported as text (or as U+FFFD) until it is whole.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use crate::error::AudioError;
 
 const BOUNDARY: char = '\u{2581}';
 
+/// Whether a byte is one of GPT-2's 188 "printable" bytes, which the
+/// byte-to-unicode bijection maps to themselves (their own code point).
+/// Every other byte maps to U+0100 onward, in ascending byte order.
+fn is_gpt2_printable_byte(b: u8) -> bool {
+    matches!(b, 33..=126 | 161..=172 | 174..=255)
+}
+
+/// The inverse of GPT-2's byte-level bijection: symbol character → raw byte.
+///
+/// Built once and shared, because every byte-level push looks a handful of
+/// characters up in it.
+static BYTE_LEVEL_TABLE: LazyLock<HashMap<char, u8>> = LazyLock::new(|| {
+    let mut table = HashMap::with_capacity(256);
+    for b in 0u8..=255 {
+        if is_gpt2_printable_byte(b) {
+            let ch = char::from_u32(u32::from(b)).expect("every printable byte is a scalar value");
+            table.insert(ch, b);
+        }
+    }
+    let mut next = 0u32;
+    for b in 0u8..=255 {
+        if !is_gpt2_printable_byte(b) {
+            let ch = char::from_u32(256 + next).expect("U+0100.. is always a scalar value");
+            table.insert(ch, b);
+            next += 1;
+        }
+    }
+    table
+});
+
+/// How a vocabulary's pieces turn into text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mode {
+    /// `SentencePiece`: `▁` marks a word boundary; pieces are already text.
+    Piece,
+    /// GPT-2 byte-level BPE: pieces are symbols in the byte alphabet, decoded
+    /// through [`BYTE_LEVEL_TABLE`], except the ids in this set, whose piece
+    /// is used as literal text (added tokens such as `<asr_text>`).
+    ByteLevel { literal: HashSet<u32> },
+}
+
 /// A dense id → piece table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PieceVocab {
     pieces: Vec<String>,
+    mode: Mode,
 }
 
 fn vocab_err(reason: impl Into<String>) -> AudioError {
@@ -99,7 +150,10 @@ impl PieceVocab {
         if pieces.is_empty() {
             return Err(vocab_err("no pieces"));
         }
-        Ok(Self { pieces })
+        Ok(Self {
+            pieces,
+            mode: Mode::Piece,
+        })
     }
 
     /// Reads `model.vocab` and `added_tokens` from a `tokenizer.json`.
@@ -179,6 +233,74 @@ impl PieceVocab {
         Self::from_pieces(pieces)
     }
 
+    /// A GPT-2 byte-level BPE vocabulary.
+    ///
+    /// `tokens` are the ids `0..tokens.len()`, in order: the byte-alphabet
+    /// symbols from `vocab.json` sorted by id, or from GGUF's
+    /// `tokenizer.ggml.tokens` when `tokenizer.ggml.model = gpt2`. `specials`
+    /// are the added tokens that follow (ids `tokens.len()` and up, from
+    /// `tokenizer_config.json`'s `added_tokens_decoder`); their text is used
+    /// literally by [`Detokenizer::push`] rather than decoded through the
+    /// byte table, so `<asr_text>` survives even though it was never part of
+    /// the byte alphabet. A special whose own id sits inside `0..tokens.len()`
+    /// is allowed too, replacing that slot.
+    ///
+    /// # Errors
+    ///
+    /// [`AudioError::Vocab`] for an empty token list, a gap between the ids
+    /// `specials` covers and the ids `tokens` covers, or a non-special piece
+    /// holding a character the byte table does not map to a byte.
+    pub fn from_byte_level(
+        tokens: Vec<String>,
+        specials: &[(u32, String)],
+    ) -> Result<Self, AudioError> {
+        if tokens.is_empty() {
+            return Err(vocab_err("no tokens"));
+        }
+        for token in &tokens {
+            if let Some(bad) = token.chars().find(|c| !BYTE_LEVEL_TABLE.contains_key(c)) {
+                return Err(vocab_err(format!(
+                    "byte-level piece {token:?} has a character {bad:?} the byte table does not map"
+                )));
+            }
+        }
+        let mut by_id: Vec<Option<String>> = tokens.into_iter().map(Some).collect();
+        let mut literal = HashSet::with_capacity(specials.len());
+        for (id, text) in specials {
+            let idx = usize::try_from(*id).map_err(|_| vocab_err("an id past usize"))?;
+            if by_id.len() <= idx {
+                by_id.resize(idx + 1, None);
+            }
+            by_id[idx] = Some(text.clone());
+            literal.insert(*id);
+        }
+        let pieces = by_id
+            .into_iter()
+            .enumerate()
+            .map(|(id, p)| p.ok_or_else(|| vocab_err(format!("id {id} has no piece"))))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            pieces,
+            mode: Mode::ByteLevel { literal },
+        })
+    }
+
+    /// Whether this vocabulary decodes through the GPT-2 byte table instead
+    /// of `SentencePiece`'s `▁` word marker.
+    #[must_use]
+    pub fn is_byte_level(&self) -> bool {
+        matches!(self.mode, Mode::ByteLevel { .. })
+    }
+
+    /// Whether `id`'s piece is literal text in byte-level mode (an added
+    /// token). Always `false` outside byte-level mode.
+    fn is_literal(&self, id: u32) -> bool {
+        match &self.mode {
+            Mode::ByteLevel { literal } => literal.contains(&id),
+            Mode::Piece => false,
+        }
+    }
+
     /// Pieces in the table.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -212,6 +334,9 @@ pub struct Detokenizer {
     vocab: Arc<PieceVocab>,
     text: String,
     language: Option<String>,
+    /// Byte-level mode only: raw bytes decoded from pushed symbols that do
+    /// not yet form a complete UTF-8 prefix. Empty in `SentencePiece` mode.
+    pending: Vec<u8>,
 }
 
 impl Detokenizer {
@@ -222,6 +347,7 @@ impl Detokenizer {
             vocab,
             text: String::new(),
             language: None,
+            pending: Vec::new(),
         }
     }
 
@@ -231,7 +357,10 @@ impl Detokenizer {
             self.language = Some(lang.to_owned());
             return None;
         }
-        let piece = self.vocab.piece(id)?;
+        let piece = self.vocab.piece(id)?.to_owned();
+        if self.vocab.is_byte_level() {
+            return self.push_byte_level(id, &piece);
+        }
         let mut delta = piece.replace(BOUNDARY, " ");
         // No leading space at the start, and none stacked on a space already
         // written: a stripped tag sits between two word boundaries, and the
@@ -244,6 +373,72 @@ impl Detokenizer {
         }
         self.text.push_str(&delta);
         Some(delta)
+    }
+
+    /// The byte-level branch of [`Self::push`]: an added token's piece is
+    /// appended as literal text; anything else is bytes through the GPT-2
+    /// table, buffered until they complete a character.
+    fn push_byte_level(&mut self, id: u32, piece: &str) -> Option<String> {
+        if self.vocab.is_literal(id) {
+            let mut delta = self.take_valid_prefix();
+            delta.push_str(piece);
+            return self.commit(delta);
+        }
+        self.pending.reserve(piece.chars().count());
+        for ch in piece.chars() {
+            // `PieceVocab::from_byte_level` refused any non-literal piece
+            // holding a character the table does not map, so every piece
+            // reaching here maps every char to a byte.
+            let byte = *BYTE_LEVEL_TABLE
+                .get(&ch)
+                .expect("from_byte_level validated every byte-level piece");
+            self.pending.push(byte);
+        }
+        let delta = self.take_valid_prefix();
+        self.commit(delta)
+    }
+
+    /// Drains the longest valid UTF-8 prefix of `pending` into a `String`,
+    /// leaving an incomplete trailing sequence (if any) buffered.
+    fn take_valid_prefix(&mut self) -> String {
+        match std::str::from_utf8(&self.pending) {
+            Ok(s) => {
+                let out = s.to_owned();
+                self.pending.clear();
+                out
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                let out = String::from_utf8(self.pending[..valid_up_to].to_vec())
+                    .expect("valid_up_to bounds a valid UTF-8 prefix");
+                self.pending.drain(..valid_up_to);
+                out
+            }
+        }
+    }
+
+    /// Appends `delta` to the transcript, or returns `None` for an empty one
+    /// (nothing new to report, the same convention as the `SentencePiece` path).
+    fn commit(&mut self, delta: String) -> Option<String> {
+        if delta.is_empty() {
+            return None;
+        }
+        self.text.push_str(&delta);
+        Some(delta)
+    }
+
+    /// Ends a byte-level stream: an incomplete character still in the pending
+    /// buffer is reported as U+FFFD instead of being silently dropped. Call at
+    /// most once, after the last [`Self::push`].
+    ///
+    /// `SentencePiece` mode has no pending buffer, so this is always `None`
+    /// there.
+    pub fn flush(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        self.pending.clear();
+        self.commit("\u{FFFD}".to_owned())
     }
 
     /// The transcript so far.
