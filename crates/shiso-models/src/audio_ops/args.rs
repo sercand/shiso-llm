@@ -97,8 +97,9 @@ pub(crate) struct Conv2dArgs {
     pub(crate) relu: u32,
     pub(crate) in_valid: u32,
     pub(crate) out_valid: u32,
+    pub(crate) batch: u32,
 }
-const _: () = assert!(size_of::<Conv2dArgs>() == 52);
+const _: () = assert!(size_of::<Conv2dArgs>() == 56);
 
 /// `audio_args_dwconv1d`.
 #[repr(C)]

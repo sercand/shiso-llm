@@ -58,6 +58,8 @@ device_cases!(
     gemv_matches_for_every_weight_type,
     tall_gemm_matches_for_every_weight_type,
     conv2d_matches_causal_symmetric_full_and_depthwise,
+    conv2d_keeps_batched_planes_apart,
+    im2col_lays_out_the_patches_of_every_plane,
     dwconv1d_sums_taps_over_pre_padded_rows,
     unfold_stacks_neighbouring_rows_with_zero_edges,
     transpose_swaps_the_inner_two_axes,

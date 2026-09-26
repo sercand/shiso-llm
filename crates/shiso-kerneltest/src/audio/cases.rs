@@ -59,6 +59,7 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_keep_f32",
     "kernel_audio_bias_rows_f32",
     "kernel_audio_argmax_rows_f32",
+    "kernel_audio_im2col_s2_f32",
 ];
 
 const LINEAR_BLOCK: u32 = 256;
@@ -743,8 +744,9 @@ struct Conv2dArgs {
     relu: u32,
     in_valid: u32,
     out_valid: u32,
+    batch: u32,
 }
-const _: () = assert!(size_of::<Conv2dArgs>() == 52);
+const _: () = assert!(size_of::<Conv2dArgs>() == 56);
 
 struct ConvCase {
     t_in: usize,
@@ -760,9 +762,19 @@ struct ConvCase {
     relu: bool,
     in_valid: usize,
     out_valid: usize,
+    /// Independent planes, stacked.
+    batch: usize,
 }
 
 fn conv_oracle(c: &ConvCase, x: &[f32], w: &[f32], b: &[f32]) -> Vec<f32> {
+    // Each plane is its own image: its first rows are padding, never the
+    // previous plane's last.
+    x.chunks(c.t_in * c.f_in * c.c_in)
+        .flat_map(|x| conv_plane(c, x, w, b))
+        .collect()
+}
+
+fn conv_plane(c: &ConvCase, x: &[f32], w: &[f32], b: &[f32]) -> Vec<f32> {
     let per = if c.depthwise { 1 } else { c.c_in };
     let mut out = vec![0.0f32; c.t_out * c.f_out * c.c_out];
     for t in 0..c.t_out {
@@ -802,7 +814,7 @@ fn conv_oracle(c: &ConvCase, x: &[f32], w: &[f32], b: &[f32]) -> Vec<f32> {
 
 fn conv_run(gpu: &Gpu, c: &ConvCase) {
     let per = if c.depthwise { 1 } else { c.c_in };
-    let x = oracle::signal(c.t_in * c.f_in * c.c_in, 41);
+    let x = oracle::signal(c.batch * c.t_in * c.f_in * c.c_in, 41);
     let w = oracle::signal(c.c_out * per * 9, 42);
     let b = oracle::signal(c.c_out, 43);
     let (xb, wb, bb) = (
@@ -810,7 +822,7 @@ fn conv_run(gpu: &Gpu, c: &ConvCase) {
         gpu.upload(&f32_bytes(&w)),
         gpu.upload(&f32_bytes(&b)),
     );
-    let total = c.t_out * c.f_out * c.c_out;
+    let total = c.batch * c.t_out * c.f_out * c.c_out;
     let out = gpu.upload(&f32_bytes(&vec![f32::NAN; total]));
     let args = Conv2dArgs {
         t_in: c.t_in as u32,
@@ -826,6 +838,7 @@ fn conv_run(gpu: &Gpu, c: &ConvCase) {
         relu: u32::from(c.relu),
         in_valid: c.in_valid as u32,
         out_valid: c.out_valid as u32,
+        batch: c.batch as u32,
     };
     launch(
         gpu,
@@ -871,6 +884,7 @@ pub fn conv2d_matches_causal_symmetric_full_and_depthwise(gpu: &Gpu) {
             relu: true,
             in_valid: 21,
             out_valid: 9,
+            batch: 1,
         },
     );
     // Depthwise over an odd freq width with an input valid-row cut.
@@ -890,6 +904,7 @@ pub fn conv2d_matches_causal_symmetric_full_and_depthwise(gpu: &Gpu) {
             relu: false,
             in_valid: 8,
             out_valid: 6,
+            batch: 1,
         },
     );
     // Symmetric pad 1, no bias, full 8 -> 4 channels (the second shape of a two-stage stack).
@@ -909,8 +924,163 @@ pub fn conv2d_matches_causal_symmetric_full_and_depthwise(gpu: &Gpu) {
             relu: false,
             in_valid: 13,
             out_valid: 7,
+            batch: 1,
         },
     );
+}
+
+/// A stack of planes convolves each on its own: a plane's first output row
+/// reads zero padding, not the previous plane's last rows, and the valid-row
+/// cuts apply within every plane.
+pub fn conv2d_keeps_batched_planes_apart(gpu: &Gpu) {
+    // Symmetric pad 1, full 1 -> 6 channels over five planes of an odd height.
+    conv_run(
+        gpu,
+        &ConvCase {
+            t_in: 9,
+            f_in: 20,
+            c_in: 1,
+            c_out: 6,
+            t_out: 5,
+            f_out: 10,
+            pad_t: 1,
+            pad_f: 1,
+            depthwise: false,
+            bias: true,
+            relu: false,
+            in_valid: 9,
+            out_valid: 5,
+            batch: 5,
+        },
+    );
+    // Full 6 -> 5 channels over three planes with both cuts inside each.
+    conv_run(
+        gpu,
+        &ConvCase {
+            t_in: 10,
+            f_in: 11,
+            c_in: 6,
+            c_out: 5,
+            t_out: 5,
+            f_out: 6,
+            pad_t: 1,
+            pad_f: 1,
+            depthwise: false,
+            bias: true,
+            relu: true,
+            in_valid: 7,
+            out_valid: 4,
+            batch: 3,
+        },
+    );
+}
+
+/// The stride-2 conv2d's patches: every plane, tap and channel lands where
+/// the GEMM reads it, zero at the pads, past the input cut and on output rows
+/// past the output cut; and patches times the kernel is the direct conv.
+///
+/// # Panics
+///
+/// When a patch value differs, or the product differs from the direct conv.
+pub fn im2col_lays_out_the_patches_of_every_plane(gpu: &Gpu) {
+    let c = ConvCase {
+        t_in: 11,
+        f_in: 13,
+        c_in: 5,
+        c_out: 7,
+        t_out: 6,
+        f_out: 7,
+        pad_t: 1,
+        pad_f: 1,
+        depthwise: false,
+        bias: true,
+        relu: false,
+        in_valid: 9,
+        out_valid: 5,
+        batch: 3,
+    };
+    let x = oracle::signal(c.batch * c.t_in * c.f_in * c.c_in, 61);
+    let taps = 9 * c.c_in;
+    let total = c.batch * c.t_out * c.f_out * taps;
+    let mut want = vec![0.0f32; total];
+    for b in 0..c.batch {
+        for t in 0..c.out_valid {
+            for f in 0..c.f_out {
+                for kt in 0..3 {
+                    for kf in 0..3 {
+                        let (ti, fi) = (
+                            (2 * t + kt) as isize - c.pad_t as isize,
+                            (2 * f + kf) as isize - c.pad_f as isize,
+                        );
+                        if ti < 0 || fi < 0 || ti as usize >= c.in_valid || fi as usize >= c.f_in {
+                            continue;
+                        }
+                        for ci in 0..c.c_in {
+                            want[((b * c.t_out + t) * c.f_out + f) * taps
+                                + (kt * 3 + kf) * c.c_in
+                                + ci] = x
+                                [((b * c.t_in + ti as usize) * c.f_in + fi as usize) * c.c_in + ci];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let xb = gpu.upload(&f32_bytes(&x));
+    let out = gpu.upload(&f32_bytes(&vec![f32::NAN; total]));
+    let args = Conv2dArgs {
+        t_in: c.t_in as u32,
+        f_in: c.f_in as u32,
+        c_in: c.c_in as u32,
+        t_out: c.t_out as u32,
+        f_out: c.f_out as u32,
+        c_out: c.c_out as u32,
+        pad_t: c.pad_t as u32,
+        pad_f: c.pad_f as u32,
+        depthwise: 0,
+        has_bias: 0,
+        relu: 0,
+        in_valid: c.in_valid as u32,
+        out_valid: c.out_valid as u32,
+        batch: c.batch as u32,
+    };
+    launch(
+        gpu,
+        "kernel_audio_im2col_s2_f32",
+        Extent3::linear(blocks(total, LINEAR_BLOCK)),
+        Extent3::linear(LINEAR_BLOCK),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(xb.view()),
+        ],
+    );
+    drain(gpu);
+    let got = gpu.read_f32(&out);
+    // A copy: exact.
+    assert_eq!(got, want, "im2col");
+    // The patches against the kernel, reordered to `[c_out][tap][c_in]`, are
+    // the direct conv on every valid row (without the bias, which the conv
+    // writes on rows the patches leave zero).
+    let w = oracle::signal(c.c_out * c.c_in * 9, 62);
+    let direct = conv_oracle(&ConvCase { bias: false, ..c }, &x, &w, &[]);
+    for (row, patch) in got.chunks(taps).enumerate() {
+        for co in 0..c.c_out {
+            let mut acc = 0.0f64;
+            for tap in 0..9 {
+                for ci in 0..c.c_in {
+                    acc += f64::from(w[(co * c.c_in + ci) * 9 + tap])
+                        * f64::from(patch[tap * c.c_in + ci]);
+                }
+            }
+            let d = direct[row * c.c_out + co];
+            assert!(
+                (acc as f32 - d).abs() <= 1e-5 * d.abs().max(1.0),
+                "row {row} channel {co}: {acc} against {d}"
+            );
+        }
+    }
 }
 
 /// `audio_args_dwconv1d`.

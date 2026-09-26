@@ -415,6 +415,7 @@ impl Encoder<'_> {
                     depthwise: false,
                     in_valid: t_in,
                     out_valid: t_out,
+                    batch: 1,
                 },
                 relu: false,
             })?;

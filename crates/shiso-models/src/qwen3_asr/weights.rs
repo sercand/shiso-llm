@@ -7,7 +7,9 @@
 //! and load the same way. Everything small - norms, conv kernels, biases - is
 //! widened to f32 on the host, and the MLX export's channels-last conv
 //! kernels are permuted to the reference layout on the way (notes §6.2), so
-//! every export looks the same to the encoder.
+//! every export looks the same to the encoder. The conv kernels are then
+//! reordered once more into the rows of a GEMM over the conv's patches
+//! ([`Conv`]).
 //!
 //! The output head is the embedding (notes §4, tied embeddings): the MLX
 //! export and one GGUF have no separate head, and the others store a
@@ -20,7 +22,7 @@ use super::config::{Flavour, Located, Qwen3AsrConfig, Stores, TOKENS_PER_CHUNK};
 use super::names::{Names, Stem};
 use crate::audio_ops::load::{LinearSource, conv_weight, f32_param, linear, upload_f32};
 use crate::audio_ops::store::TensorStore;
-use crate::audio_ops::{Linear, Ops};
+use crate::audio_ops::{GemmType, Linear, LinearWeight, Ops};
 
 /// A layer norm's parameters.
 #[derive(Debug)]
@@ -31,13 +33,17 @@ pub struct Norm {
     pub bias: DeviceBuffer,
 }
 
-/// One conv of the stem, 3x3, stride 2, padding 1.
+/// One conv of the stem, 3x3, stride 2, padding 1, as a linear over its
+/// patches: an f32 `[out][3 time][3 frequency][in]` weight on the audio GEMM,
+/// with the bias.
+///
+/// The reference's kernel is `[out][in][frequency][time]`, because its conv
+/// runs over `[mels][frames]` images (notes §2.2); the audio kernels take
+/// channels-last `[t][f][c]` images, time first.
 #[derive(Debug)]
 pub struct Conv {
-    /// `[out][in][3][3]` f32.
-    pub weight: DeviceBuffer,
-    /// `[out]` f32.
-    pub bias: DeviceBuffer,
+    /// `in_dim` is `9 * channels in`.
+    pub linear: Linear,
 }
 
 /// One pre-norm transformer layer of the tower.
@@ -152,6 +158,23 @@ pub(crate) fn sinusoids(rows: usize, width: usize) -> Vec<f32> {
     out
 }
 
+/// A reference `[out][in][3 frequency][3 time]` kernel as the patch GEMM's
+/// `[out][3 time][3 frequency][in]` rows (see [`Conv`]).
+fn patch_rows(values: &[f32], out: usize, inp: usize) -> Vec<f32> {
+    let mut rows = vec![0.0f32; values.len()];
+    for o in 0..out {
+        for i in 0..inp {
+            for kf in 0..3 {
+                for kt in 0..3 {
+                    rows[(o * 9 + kt * 3 + kf) * inp + i] =
+                        values[((o * inp + i) * 3 + kf) * 3 + kt];
+                }
+            }
+        }
+    }
+    rows
+}
+
 struct Loader<'a> {
     ops: &'a Ops,
     store: &'a TensorStore,
@@ -194,8 +217,15 @@ impl Loader<'_> {
             channels_last,
         )?;
         Ok(Conv {
-            weight: upload_f32(self.ops, &values)?,
-            bias: self.param(&self.names.bias(role), out)?,
+            linear: Linear {
+                weight: LinearWeight::Gemm {
+                    dtype: GemmType::F32,
+                    buffer: upload_f32(self.ops, &patch_rows(&values, out, inp))?,
+                    in_dim: 9 * inp,
+                    out_dim: out,
+                },
+                bias: Some(self.param(&self.names.bias(role), out)?),
+            },
         })
     }
 }

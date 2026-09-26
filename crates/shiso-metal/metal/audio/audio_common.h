@@ -49,6 +49,7 @@ typedef struct {
     uint pad_t; uint pad_f;
     uint depthwise; uint has_bias; uint relu;
     uint in_valid; uint out_valid;
+    uint batch;
 } audio_args_conv2d;
 typedef struct { uint rows; uint channels; uint taps; } audio_args_dwconv1d;
 typedef struct { uint rows; uint channels; uint taps; uint pad; } audio_args_unfold;

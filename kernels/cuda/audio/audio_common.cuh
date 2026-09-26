@@ -48,6 +48,7 @@ struct audio_args_conv2d {
     uint pad_t; uint pad_f;
     uint depthwise; uint has_bias; uint relu;
     uint in_valid; uint out_valid;
+    uint batch;
 };
 struct audio_args_dwconv1d { uint rows; uint channels; uint taps; };
 struct audio_args_unfold { uint rows; uint channels; uint taps; uint pad; };

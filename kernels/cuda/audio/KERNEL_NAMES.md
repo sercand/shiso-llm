@@ -2,12 +2,12 @@
 
 The lookup table a loader resolves a kernel through. The module is loaded by
 its registry key, `audio`; every entry carries C linkage, so each name below is
-the name the driver answers to, verbatim. The same twenty-two names are the
+the name the driver answers to, verbatim. The same names are the
 Metal twin's (`crates/shiso-metal/metal/audio`) and the host's literals in
 `crates/shiso-models/src/audio_ops`; `shiso_kerneltest::audio::cases::ENTRIES`
 holds them, and `crates/shiso-cuda/tests/audio_kernels.rs` resolves every one.
 
-## Module `audio` — 33 entries
+## Module `audio` — 34 entries
 
 ```
 kernel_audio_unary_f32
@@ -31,6 +31,7 @@ kernel_audio_gemv_f16w
 kernel_audio_gemv_q8_0w
 kernel_audio_split_sum_f32
 kernel_audio_conv2d_s2_f32
+kernel_audio_im2col_s2_f32
 kernel_audio_dwconv1d_f32
 kernel_audio_unfold_f32
 kernel_audio_transpose_f32

@@ -196,7 +196,8 @@ pub struct NormDesc<'a> {
     pub eps: f32,
 }
 
-/// The shape of a stride-2 3x3 conv2d over channels-last `[t][f][c]`.
+/// The shape of a stride-2 3x3 conv2d over channels-last `[t][f][c]`, applied
+/// to each of `batch` stacked planes on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conv2dGeometry {
     /// Input time rows.
@@ -221,14 +222,18 @@ pub struct Conv2dGeometry {
     pub in_valid: usize,
     /// Output rows at or past this are written as zero.
     pub out_valid: usize,
+    /// Independent planes, stacked: each is convolved as its own image, so
+    /// its first rows read the padding and never the previous plane's last.
+    /// The valid-row cuts apply within every plane.
+    pub batch: usize,
 }
 
 /// One stride-2 3x3 conv2d.
 #[derive(Debug, Clone, Copy)]
 pub struct Conv2dDesc<'a> {
-    /// Destination, `[t_out][f_out][c_out]`.
+    /// Destination, `[batch][t_out][f_out][c_out]`.
     pub out: DeviceView<'a>,
-    /// Source, `[t_in][f_in][c_in]`.
+    /// Source, `[batch][t_in][f_in][c_in]`.
     pub input: DeviceView<'a>,
     /// `[c_out][c_in or 1][3][3]`.
     pub weight: DeviceView<'a>,
@@ -238,6 +243,21 @@ pub struct Conv2dDesc<'a> {
     pub geometry: Conv2dGeometry,
     /// Apply `max(0, .)` to the result.
     pub relu: bool,
+}
+
+/// The patches of a full stride-2 3x3 conv2d, `[batch][t_out][f_out][9 *
+/// c_in]` with tap `kt * 3 + kf` major and the channel minor, so a GEMM
+/// against the kernel laid out `[c_out][3][3][c_in]` is the conv. Output rows
+/// past `out_valid` are zero patches, so the GEMM writes its bias there
+/// rather than the zeros the direct conv does.
+#[derive(Debug, Clone, Copy)]
+pub struct Im2colDesc<'a> {
+    /// Destination, `[batch][t_out][f_out][9 * c_in]`.
+    pub out: DeviceView<'a>,
+    /// Source, `[batch][t_in][f_in][c_in]`.
+    pub input: DeviceView<'a>,
+    /// Shape; `c_out` is unread, and a depthwise conv is refused.
+    pub geometry: Conv2dGeometry,
 }
 
 /// A depthwise conv1d over rows the caller already left-padded.
@@ -899,7 +919,7 @@ impl Ops {
     /// [`CoreError::ShapeMismatch`] for a short view, or the launch's error.
     pub fn conv2d_s2(&self, d: &Conv2dDesc<'_>) -> CoreResult<()> {
         let g = &d.geometry;
-        let total = g.t_out * g.f_out * g.c_out;
+        let total = g.batch * g.t_out * g.f_out * g.c_out;
         let per = if g.depthwise { 1 } else { g.c_in };
         limit(
             !g.depthwise || g.c_in == g.c_out,
@@ -907,7 +927,7 @@ impl Ops {
             g.c_in,
         )?;
         need(d.out, total, "conv2d.out")?;
-        need(d.input, g.t_in * g.f_in * g.c_in, "conv2d.input")?;
+        need(d.input, g.batch * g.t_in * g.f_in * g.c_in, "conv2d.input")?;
         need(d.weight, g.c_out * per * 9, "conv2d.weight")?;
         if let Some(b) = d.bias {
             need(b, g.c_out, "conv2d.bias")?;
@@ -926,6 +946,7 @@ impl Ops {
             relu: u32::from(d.relu),
             in_valid: dim(g.in_valid, "conv2d.in_valid")?,
             out_valid: dim(g.out_valid, "conv2d.out_valid")?,
+            batch: dim(g.batch, "conv2d.batch")?,
         };
         self.launch(
             "kernel_audio_conv2d_s2_f32",
@@ -938,6 +959,55 @@ impl Ops {
                 KernelArg::Buffer(d.input),
                 KernelArg::Buffer(d.weight),
                 KernelArg::Buffer(d.bias.unwrap_or(d.weight)),
+            ],
+        )
+    }
+
+    /// The patches of a stride-2 3x3 conv2d, for the conv as a GEMM.
+    ///
+    /// The direct conv takes each output's whole receptive field in one
+    /// thread, which is fine for one or a few input channels; with hundreds
+    /// it reads each weight once per output position and runs at a small
+    /// fraction of the device. The patches cost one copy and let the tiled
+    /// GEMM do the arithmetic.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a depthwise geometry or a patch matrix
+    /// past `u32` elements, [`CoreError::ShapeMismatch`] for a short view, or
+    /// the launch's error.
+    pub fn im2col_s2(&self, d: &Im2colDesc<'_>) -> CoreResult<()> {
+        let g = &d.geometry;
+        limit(!g.depthwise, "im2col.depthwise", 1)?;
+        let total = g.batch * g.t_out * g.f_out * 9 * g.c_in;
+        dim(total, "im2col.total")?;
+        need(d.out, total, "im2col.out")?;
+        need(d.input, g.batch * g.t_in * g.f_in * g.c_in, "im2col.input")?;
+        let args = Conv2dArgs {
+            t_in: dim(g.t_in, "conv2d.t_in")?,
+            f_in: dim(g.f_in, "conv2d.f_in")?,
+            c_in: dim(g.c_in, "conv2d.c_in")?,
+            t_out: dim(g.t_out, "conv2d.t_out")?,
+            f_out: dim(g.f_out, "conv2d.f_out")?,
+            c_out: dim(g.c_out, "conv2d.c_out")?,
+            pad_t: dim(g.pad_t, "conv2d.pad_t")?,
+            pad_f: dim(g.pad_f, "conv2d.pad_f")?,
+            depthwise: 0,
+            has_bias: 0,
+            relu: 0,
+            in_valid: dim(g.in_valid, "conv2d.in_valid")?,
+            out_valid: dim(g.out_valid, "conv2d.out_valid")?,
+            batch: dim(g.batch, "conv2d.batch")?,
+        };
+        self.launch(
+            "kernel_audio_im2col_s2_f32",
+            linear_grid(total)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.input),
             ],
         )
     }

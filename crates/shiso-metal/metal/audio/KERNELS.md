@@ -16,7 +16,8 @@ listed.
 | `kernel_audio_gemm64_{f32w,bf16w,f16w,q8_0w}` | as `kernel_audio_gemm_*` | as `kernel_audio_gemm_*` | `(ceil(n/64), ceil(m/64), splits)` × 256, 20480 |
 | `kernel_audio_gemv_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm` (one split) | y `[m][n]`, x `[m][k]`, w `[n][k]`, bias `[n]` | `(ceil(n/16), ceil(m/8))` × 128, 0 |
 | `kernel_audio_split_sum_f32` | `audio_args_gemm` | y `[m][n]`, parts `[splits][m][n]`, bias `[n]` | `ceil(m·n/256)` × 256, 0 |
-| `kernel_audio_conv2d_s2_f32` | `audio_args_conv2d{t_in, f_in, c_in, t_out, f_out, c_out, pad_t, pad_f, depthwise, has_bias, relu, in_valid, out_valid}` | out `[t_out][f_out][c_out]`, in `[t_in][f_in][c_in]`, w `[c_out][c_in/g][3][3]`, bias `[c_out]` | `ceil(t_out·f_out·c_out/256)` × 256, 0 |
+| `kernel_audio_conv2d_s2_f32` | `audio_args_conv2d{t_in, f_in, c_in, t_out, f_out, c_out, pad_t, pad_f, depthwise, has_bias, relu, in_valid, out_valid, batch}` | out `[batch][t_out][f_out][c_out]`, in `[batch][t_in][f_in][c_in]`, w `[c_out][c_in/g][3][3]`, bias `[c_out]` | `ceil(batch·t_out·f_out·c_out/256)` × 256, 0 |
+| `kernel_audio_im2col_s2_f32` | `audio_args_conv2d` (as above; `c_out`, `depthwise`, `has_bias`, `relu` unread) | out `[batch][t_out][f_out][9·c_in]` (tap `kt·3+kf` major, channel minor), in `[batch][t_in][f_in][c_in]` | `ceil(batch·t_out·f_out·9·c_in/256)` × 256, 0 |
 | `kernel_audio_dwconv1d_f32` | `audio_args_dwconv1d{rows, channels, taps}` | out `[rows][C]`, in `[rows+taps−1][C]`, w `[C][taps]` | `ceil(rows·C/256)` × 256, 0 |
 | `kernel_audio_unfold_f32` | `audio_args_unfold{rows, channels, taps, pad}` | out `[rows][taps·C]`, in `[rows][C]` | `ceil(rows·taps·C/256)` × 256, 0 |
 | `kernel_audio_transpose_f32` | `audio_args_transpose{batch, rows, cols}` | out `[b][cols][rows]`, in `[b][rows][cols]` | `ceil(b·rows·cols/256)` × 256, 0 |
