@@ -2,7 +2,7 @@
 
 use super::{
     Filterbank, Framing, LogScale, MelFrontend, MelScale, MelSpec, Preemphasis, Spectrum, Window,
-    apply_whisper_clamp,
+    apply_max_floor,
 };
 use crate::num::{f32_of, f64_of};
 
@@ -73,7 +73,7 @@ pub(crate) fn centred_reflect() -> MelSpec {
             f_min: 0.0,
             f_max: 8_000.0,
         },
-        log_scale: LogScale::WhisperClamp,
+        log_scale: LogScale::Log10MaxFloor,
     }
 }
 
@@ -189,7 +189,7 @@ fn the_reflect_frontend_drops_the_last_frame() {
 }
 
 #[test]
-fn the_whisper_clamp_floors_at_the_max_minus_eight() {
+fn the_log10_max_floor_floors_at_the_max_minus_eight() {
     let mels = 4;
     let valid = 3;
     let mut data: Vec<f32> = vec![
@@ -198,7 +198,7 @@ fn the_whisper_clamp_floors_at_the_max_minus_eight() {
         -6.0, -6.0, -6.0, -6.0, //
         0.0, 0.0, 0.0, 0.0, // past `valid`: left alone
     ];
-    apply_whisper_clamp(&mut data, mels, valid);
+    apply_max_floor(&mut data, mels, valid);
     let floored = f32_of((50.0 - 8.0 + 4.0) / 4.0);
     let peak = f32_of((50.0 + 4.0) / 4.0);
     let want = [

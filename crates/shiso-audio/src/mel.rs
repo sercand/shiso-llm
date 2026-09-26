@@ -9,7 +9,7 @@
 //! | preemphasis | over the whole signal | none | none |
 //! | spectrum | power | power | magnitude |
 //! | filterbank | Slaney scale, area-normalised | Slaney scale, area-normalised | HTK scale, unnormalised |
-//! | log scale | natural, per frame | [`LogScale::WhisperClamp`], over the whole clip | natural, per frame |
+//! | log scale | natural, per frame | [`LogScale::Log10MaxFloor`], over the whole clip | natural, per frame |
 //!
 //! So nothing here has a default. A family states each field from its own
 //! checkpoint, and a mismatch is a wrong transcript, not an error. That is why
@@ -110,7 +110,7 @@ pub enum LogScale {
     /// [`MelFrontend::compute`] after all frames exist, not per frame; the
     /// incremental `MelStream` frontend has no "after all frames exist" and
     /// refuses this variant with [`AudioError::BadSpec`].
-    WhisperClamp,
+    Log10MaxFloor,
 }
 
 /// Every constant of one log-mel frontend.
@@ -300,12 +300,13 @@ fn reflect_pad(out: &mut [f64], samples: &[f32], left: usize) {
     }
 }
 
-/// Whisper's floor-and-rescale, applied once over the whole computed frames:
-/// `v = max(stage-one value, chunk_max - 8)`, then `(v + 4) / 4`. `data`
-/// holds a stage-one `log10(max(x, 1e-10))` value in every row up to
-/// `valid`, written by [`MelFrontend::frame_row_with`]; rows at or past
-/// `valid` are the caller's zeroed tail and are left alone.
-fn apply_whisper_clamp(data: &mut [f32], mels: usize, valid: usize) {
+/// The floor-and-rescale [`LogScale::Log10MaxFloor`] finishes with, applied
+/// once over the whole computed frames: `v = max(stage-one value,
+/// chunk_max - 8)`, then `(v + 4) / 4`. `data` holds a stage-one
+/// `log10(max(x, 1e-10))` value in every row up to `valid`, written by
+/// [`MelFrontend::frame_row_with`]; rows at or past `valid` are the caller's
+/// zeroed tail and are left alone.
+fn apply_max_floor(data: &mut [f32], mels: usize, valid: usize) {
     let head = &mut data[..valid * mels];
     let Some(chunk_max) = head.iter().copied().reduce(f32::max) else {
         return;
@@ -592,7 +593,7 @@ impl MelFrontend {
                 LogScale::Natural { guard } => f32_of((e + f64::from(guard)).ln()),
                 // Stage one only; the floor and rescale need every frame's
                 // value first, so `MelFrontend::compute` finishes the job.
-                LogScale::WhisperClamp => f32_of(e.max(1e-10).log10()),
+                LogScale::Log10MaxFloor => f32_of(e.max(1e-10).log10()),
             };
         }
     }
@@ -625,8 +626,8 @@ impl MelFrontend {
                 });
             }
         });
-        if matches!(self.spec.log_scale, LogScale::WhisperClamp) {
-            apply_whisper_clamp(&mut data, mels, valid);
+        if matches!(self.spec.log_scale, LogScale::Log10MaxFloor) {
+            apply_max_floor(&mut data, mels, valid);
         }
         MelFrames::from_parts(data, mels, total, valid)
     }

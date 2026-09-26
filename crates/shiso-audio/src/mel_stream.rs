@@ -36,7 +36,7 @@ impl MelStream {
                 reason: "only centred framing streams".into(),
             });
         }
-        if matches!(frontend.spec().log_scale, LogScale::WhisperClamp) {
+        if matches!(frontend.spec().log_scale, LogScale::Log10MaxFloor) {
             return Err(AudioError::BadSpec {
                 reason: "this log scale needs every frame's value before it can floor and \
                          rescale any of them, so it cannot stream"

@@ -47,11 +47,11 @@ fn refuses_left_padded_framing() {
 
 #[test]
 fn refuses_the_whole_clip_log_scale() {
-    // Centred framing streams fine on its own; it is the whisper-clamp log
+    // Centred framing streams fine on its own; it is the log10-max-floor log
     // scale, which needs every frame's value before it can floor any of
     // them, that a stream cannot offer.
     let mut spec = centred();
-    spec.log_scale = LogScale::WhisperClamp;
+    spec.log_scale = LogScale::Log10MaxFloor;
     let fe = Arc::new(MelFrontend::new(spec).expect("valid"));
     assert!(MelStream::new(fe).is_err());
 }
