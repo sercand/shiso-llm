@@ -367,3 +367,65 @@ fn run_decoder_returns_raw_output_for_arbitrary_output_args() {
     .expect("the tone decodes");
     assert_eq!(out.len(), 64_000);
 }
+
+/// An m4a whose index trails its media, as the decoder itself and most phone
+/// recorders write one, still decodes over the pipe.
+#[test]
+fn an_audio_file_with_a_trailing_index_decodes_over_the_pipe() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    if !have_decoder() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "shiso-vision-m4a-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    let out = dir.join("tone.m4a");
+    let made = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=60",
+        ])
+        .args(["-c:a", "aac", "-b:a", "64k"])
+        .arg(&out)
+        .status()
+        .expect("the decoder runs");
+    assert!(made.success(), "the tone encodes");
+    let bytes = std::fs::read(&out).expect("the tone reads");
+    let _ = std::fs::remove_dir_all(&dir);
+    let moov = bytes
+        .windows(4)
+        .position(|w| w == b"moov")
+        .expect("an index");
+    let mdat = bytes.windows(4).position(|w| w == b"mdat").expect("media");
+    assert!(moov > mdat, "the fixture's index trails its media");
+    let raw = super::run_decoder(
+        &enabled(),
+        &[
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+        ],
+        &bytes,
+    )
+    .expect("it decodes");
+    // A minute at 16 kHz, give or take the encoder's priming. Sixty seconds
+    // because a clip small enough to fit the decoder's probe buffer demuxes
+    // from a pipe anyway, and would not show the trailing index at all.
+    let samples = raw.len() / 4;
+    assert!((958_000..=962_000).contains(&samples), "{samples} samples");
+}

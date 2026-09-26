@@ -26,6 +26,8 @@
 //!   command string, so no input can become a flag or a second command.
 //! - **No temp file.** The container goes in over stdin, so there is no path to
 //!   traverse, collide on, or leave behind.
+//!   A pipe cannot be seeked, so an MP4 whose index trails its media is
+//!   reordered in memory first (`mp4::faststart`), as a fast-start remux would.
 //! - **The decoder cannot reach for a terminal**, and stdin is the pipe.
 //! - **Frame count** is capped by the decoder's own flag, so a long clip cannot
 //!   decode forever.
@@ -281,6 +283,10 @@ pub fn run_decoder(
     bytes: &[u8],
 ) -> Result<Vec<u8>, VisionError> {
     tracing::debug!(binary = ?policy.binary(), "spawning the subprocess decoder");
+    let bytes = crate::mp4::faststart(bytes);
+    if matches!(bytes, std::borrow::Cow::Owned(_)) {
+        tracing::debug!("moved a trailing MP4 index ahead of its media");
+    }
     let mut args: Vec<&str> = vec![
         "-v", "error",
         // Without this the decoder can block on a prompt whenever it thinks
