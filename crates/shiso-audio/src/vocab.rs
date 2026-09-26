@@ -11,7 +11,7 @@
 //! such as `<en-US>` after the text. The tag is not text: [`Detokenizer`]
 //! strips it and reports it as the language.
 //!
-//! A second family of models tokenizes with GPT-2 byte-level BPE instead:
+//! A second family of models tokenizes with byte-level BPE instead:
 //! there is no `▁`, and a piece is a run of symbols from a 256-character byte
 //! alphabet rather than text itself. [`PieceVocab::from_byte_level`] builds
 //! this mode, and [`Detokenizer::push`] maps each piece's symbols back to raw
@@ -26,28 +26,28 @@ use crate::error::AudioError;
 
 const BOUNDARY: char = '\u{2581}';
 
-/// Whether a byte is one of GPT-2's 188 "printable" bytes, which the
-/// byte-to-unicode bijection maps to themselves (their own code point).
-/// Every other byte maps to U+0100 onward, in ascending byte order.
-fn is_gpt2_printable_byte(b: u8) -> bool {
+/// Whether a byte is one of the 188 "printable" bytes that the byte-to-unicode
+/// bijection maps to themselves (their own code point). Every other byte maps
+/// to U+0100 onward, in ascending byte order.
+fn maps_to_itself(b: u8) -> bool {
     matches!(b, 33..=126 | 161..=172 | 174..=255)
 }
 
-/// The inverse of GPT-2's byte-level bijection: symbol character → raw byte.
+/// The inverse of the byte-level bijection: symbol character → raw byte.
 ///
 /// Built once and shared, because every byte-level push looks a handful of
 /// characters up in it.
 static BYTE_LEVEL_TABLE: LazyLock<HashMap<char, u8>> = LazyLock::new(|| {
     let mut table = HashMap::with_capacity(256);
     for b in 0u8..=255 {
-        if is_gpt2_printable_byte(b) {
+        if maps_to_itself(b) {
             let ch = char::from_u32(u32::from(b)).expect("every printable byte is a scalar value");
             table.insert(ch, b);
         }
     }
     let mut next = 0u32;
     for b in 0u8..=255 {
-        if !is_gpt2_printable_byte(b) {
+        if !maps_to_itself(b) {
             let ch = char::from_u32(256 + next).expect("U+0100.. is always a scalar value");
             table.insert(ch, b);
             next += 1;
@@ -61,7 +61,7 @@ static BYTE_LEVEL_TABLE: LazyLock<HashMap<char, u8>> = LazyLock::new(|| {
 enum Mode {
     /// `SentencePiece`: `▁` marks a word boundary; pieces are already text.
     Piece,
-    /// GPT-2 byte-level BPE: pieces are symbols in the byte alphabet, decoded
+    /// Byte-level BPE: pieces are symbols in the byte alphabet, decoded
     /// through [`BYTE_LEVEL_TABLE`], except the ids in this set, whose piece
     /// is used as literal text (added tokens such as `<asr_text>`).
     ByteLevel { literal: HashSet<u32> },
@@ -233,7 +233,7 @@ impl PieceVocab {
         Self::from_pieces(pieces)
     }
 
-    /// A GPT-2 byte-level BPE vocabulary.
+    /// A byte-level BPE vocabulary.
     ///
     /// `tokens` are the ids `0..tokens.len()`, in order: the byte-alphabet
     /// symbols from `vocab.json` sorted by id, or from GGUF's
@@ -285,7 +285,7 @@ impl PieceVocab {
         })
     }
 
-    /// Whether this vocabulary decodes through the GPT-2 byte table instead
+    /// Whether this vocabulary decodes through the byte-level table instead
     /// of `SentencePiece`'s `▁` word marker.
     #[must_use]
     pub fn is_byte_level(&self) -> bool {
@@ -376,8 +376,8 @@ impl Detokenizer {
     }
 
     /// The byte-level branch of [`Self::push`]: an added token's piece is
-    /// appended as literal text; anything else is bytes through the GPT-2
-    /// table, buffered until they complete a character.
+    /// appended as literal text; anything else is bytes through the
+    /// byte-level table, buffered until they complete a character.
     fn push_byte_level(&mut self, id: u32, piece: &str) -> Option<String> {
         if self.vocab.is_literal(id) {
             let mut delta = self.take_valid_prefix();
@@ -398,21 +398,46 @@ impl Detokenizer {
         self.commit(delta)
     }
 
-    /// Drains the longest valid UTF-8 prefix of `pending` into a `String`,
-    /// leaving an incomplete trailing sequence (if any) buffered.
+    /// Drains everything decidable out of `pending`: every valid character,
+    /// with each irrecoverable byte run along the way replaced by one
+    /// U+FFFD, leaving only a trailing sequence that is still incomplete (but
+    /// could yet complete) buffered for the next push.
+    ///
+    /// `str::from_utf8`'s error tells apart the two ways a byte can fail:
+    /// `error_len() == None` means the tail is a prefix of some valid
+    /// sequence that just hasn't arrived yet, so it stays in `pending`.
+    /// `error_len() == Some(n)` means those `n` bytes can never become valid
+    /// no matter what follows, so they must be reported now - if they were
+    /// left in `pending` instead, `valid_up_to` would be `0` on every later
+    /// call (nothing after an unrecoverable byte is "valid from the start"),
+    /// silently swallowing every subsequent push, including plain ASCII,
+    /// until `flush` finally discarded the whole backlog as a single U+FFFD.
     fn take_valid_prefix(&mut self) -> String {
-        match std::str::from_utf8(&self.pending) {
-            Ok(s) => {
-                let out = s.to_owned();
-                self.pending.clear();
-                out
-            }
-            Err(e) => {
-                let valid_up_to = e.valid_up_to();
-                let out = String::from_utf8(self.pending[..valid_up_to].to_vec())
-                    .expect("valid_up_to bounds a valid UTF-8 prefix");
-                self.pending.drain(..valid_up_to);
-                out
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.pending.clear();
+                    return out;
+                }
+                Err(e) => {
+                    let valid_up_to = e.valid_up_to();
+                    out.push_str(
+                        std::str::from_utf8(&self.pending[..valid_up_to])
+                            .expect("valid_up_to bounds a valid UTF-8 prefix"),
+                    );
+                    if let Some(bad_len) = e.error_len() {
+                        out.push('\u{FFFD}');
+                        self.pending.drain(..valid_up_to + bad_len);
+                        // The rest of the buffer may hold more text, or
+                        // another irrecoverable run: keep going rather than
+                        // returning early.
+                    } else {
+                        self.pending.drain(..valid_up_to);
+                        return out;
+                    }
+                }
             }
         }
     }

@@ -116,8 +116,8 @@ fn a_tag_between_sentences_leaves_one_space() {
 
 #[test]
 fn byte_level_symbols_decode_to_their_bytes() {
-    // "Ġhello" is the GPT-2 byte-level spelling of " hello" (0x20 maps to
-    // U+0120), and "Ċ" is a lone newline (0x0A maps to U+010A).
+    // "Ġhello" is the byte-level spelling of " hello" (0x20 maps to U+0120),
+    // and "Ċ" is a lone newline (0x0A maps to U+010A).
     let tokens = ["Ġhello".to_owned(), "Ċ".to_owned()];
     let v = Arc::new(PieceVocab::from_byte_level(tokens.to_vec(), &[]).expect("valid symbols"));
     assert!(v.is_byte_level());
@@ -129,8 +129,8 @@ fn byte_level_symbols_decode_to_their_bytes() {
 
 #[test]
 fn a_character_split_across_tokens_is_emitted_once_whole() {
-    // "ğ" is the two UTF-8 bytes 0xC4 0x9F; the GPT-2 byte alphabet spells
-    // them as one symbol character each ("Ä", "Ł"). "中" is the three bytes
+    // "ğ" is the two UTF-8 bytes 0xC4 0x9F; the byte alphabet spells them as
+    // one symbol character each ("Ä", "Ł"). "中" is the three bytes
     // 0xE4 0xB8 0xAD; split 1+2 the symbols are "ä" and "¸Ń" (one token
     // spelling two bytes). Neither character is completed until its last
     // byte-level token arrives.
@@ -150,6 +150,26 @@ fn a_character_split_across_tokens_is_emitted_once_whole() {
     assert_eq!(d.push(3), Some("中".to_owned()));
     assert_eq!(d.text(), "ğ中");
     assert!(!d.text().contains('\u{FFFD}'));
+}
+
+#[test]
+fn an_irrecoverable_byte_is_reported_immediately_not_held() {
+    // Byte 0xFF (255) is one of the "printable" bytes, so the byte table
+    // spells it as the single character U+00FF ('ÿ') - but 0xFF can never
+    // start a valid UTF-8 sequence, so it is not merely incomplete the way a
+    // multi-byte character's leading bytes are: nothing that could ever
+    // follow makes it valid. It must be reported as U+FFFD on the very push
+    // that produced it, not held waiting for a completion that can never
+    // come (which would otherwise swallow every push after it, including
+    // plain ASCII, until `flush` discarded the whole backlog as one U+FFFD).
+    let tokens = ["ÿ".to_owned(), "Ġok".to_owned()];
+    let v = Arc::new(PieceVocab::from_byte_level(tokens.to_vec(), &[]).expect("valid symbols"));
+    let mut d = Detokenizer::new(v);
+    assert_eq!(d.push(0), Some("\u{FFFD}".to_owned()));
+    assert_eq!(d.push(1), Some(" ok".to_owned()));
+    assert_eq!(d.text(), "\u{FFFD} ok");
+    // Nothing was left buffered by the bad byte.
+    assert_eq!(d.flush(), None);
 }
 
 #[test]
