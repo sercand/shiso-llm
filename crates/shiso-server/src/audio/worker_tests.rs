@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use shiso_audio::transcript::SpeakerActivity;
 use shiso_audio::{
-    AudioError, DiarizationPass, Diarizer, Filterbank, Framing, Language, MelFrames, MelScale,
-    MelSpec, Pcm, PieceVocab, Preemphasis, RecognizerStream, Spectrum, SpeechRecognizer,
+    AudioError, DiarizationPass, Diarizer, Filterbank, Framing, Language, LogScale, MelFrames,
+    MelScale, MelSpec, Pcm, PieceVocab, Preemphasis, RecognizerStream, Spectrum, SpeechRecognizer,
     StreamOptions, TokenEvent, Window,
 };
 use shiso_core::TokenId;
@@ -33,7 +33,7 @@ fn spec() -> MelSpec {
             f_min: 0.0,
             f_max: 8_000.0,
         },
-        log_guard: 1e-6,
+        log_scale: LogScale::Natural { guard: 1e-6 },
     }
 }
 

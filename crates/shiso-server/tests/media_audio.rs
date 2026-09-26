@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use shiso_audio::{
-    AudioClip, AudioError, AudioTower, DecodeLimits, Filterbank, Framing, MelScale, MelSpec,
-    Preemphasis, Spectrum, Window,
+    AudioClip, AudioError, AudioTower, DecodeLimits, Filterbank, Framing, LogScale, MelScale,
+    MelSpec, Preemphasis, Spectrum, Window,
 };
 use shiso_core::{Backend, HfConfig};
 use shiso_ir::{Block, MediaSource, Message, Role};
@@ -69,7 +69,7 @@ fn stand() -> Stand {
                 f_min: 0.0,
                 f_max: 8_000.0,
             },
-            log_guard: 1e-3,
+            log_scale: LogScale::Natural { guard: 1e-3 },
         },
     }
 }

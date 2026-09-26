@@ -28,7 +28,8 @@ pub use decode::{DecodeLimits, decode_audio, sniff_container};
 pub use diarizer::{DiarizationPass, Diarizer};
 pub use error::AudioError;
 pub use mel::{
-    Filterbank, Framing, MelFrames, MelFrontend, MelScale, MelSpec, Preemphasis, Spectrum, Window,
+    Filterbank, Framing, LogScale, MelFrames, MelFrontend, MelScale, MelSpec, Preemphasis,
+    Spectrum, Window,
 };
 pub use mel_stream::MelStream;
 pub use pcm::{MODEL_RATE, Pcm};

@@ -16,8 +16,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use shiso_audio::{
-    AudioError, DiarizationPass, Diarizer, Filterbank, Framing, MelFrames, MelScale, MelSpec,
-    Preemphasis, Spectrum, Window, transcript::SpeakerActivity,
+    AudioError, DiarizationPass, Diarizer, Filterbank, Framing, LogScale, MelFrames, MelScale,
+    MelSpec, Preemphasis, Spectrum, Window, transcript::SpeakerActivity,
 };
 use shiso_core::Backend;
 
@@ -113,7 +113,9 @@ pub fn open(
         preemphasis: Preemphasis::Signal(0.97),
         spectrum: Spectrum::Power,
         filterbank,
-        log_guard: 2f32.powi(-24),
+        log_scale: LogScale::Natural {
+            guard: 2f32.powi(-24),
+        },
     };
     Ok(Some(NemotronDiarizer {
         model: Arc::new(Model {

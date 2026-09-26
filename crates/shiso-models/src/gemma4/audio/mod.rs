@@ -23,8 +23,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use shiso_audio::{
-    AudioClip, AudioError, AudioTower, Filterbank, Framing, MelScale, MelSpec, Preemphasis,
-    Spectrum, Window,
+    AudioClip, AudioError, AudioTower, Filterbank, Framing, LogScale, MelScale, MelSpec,
+    Preemphasis, Spectrum, Window,
 };
 use shiso_core::{Backend, DeviceBuffer, VisionGrid};
 use shiso_vision::EncodedRows;
@@ -120,7 +120,7 @@ impl Gemma4AudioTower {
                 f_min: 0.0,
                 f_max: 8_000.0,
             },
-            log_guard: 1e-3,
+            log_scale: LogScale::Natural { guard: 1e-3 },
         };
         let bytes = std::fs::metadata(path).map_or(0, |m| if m.is_file() { m.len() } else { 0 });
         Ok(Self {

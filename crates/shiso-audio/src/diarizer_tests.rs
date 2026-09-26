@@ -4,7 +4,7 @@
 use super::{DiarizationPass, Diarizer};
 use crate::error::AudioError;
 use crate::mel::{
-    Filterbank, Framing, MelFrames, MelScale, MelSpec, Preemphasis, Spectrum, Window,
+    Filterbank, Framing, LogScale, MelFrames, MelScale, MelSpec, Preemphasis, Spectrum, Window,
 };
 use crate::transcript::SpeakerActivity;
 
@@ -67,7 +67,9 @@ fn spec() -> MelSpec {
             f_min: 0.0,
             f_max: 8_000.0,
         },
-        log_guard: 2f32.powi(-24),
+        log_scale: LogScale::Natural {
+            guard: 2f32.powi(-24),
+        },
     }
 }
 

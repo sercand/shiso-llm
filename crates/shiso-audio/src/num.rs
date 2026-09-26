@@ -42,3 +42,23 @@ pub(crate) fn usize_floor(x: f64) -> usize {
 pub(crate) fn u32_ceil(x: f64) -> u32 {
     x.ceil().clamp(0.0, f64::from(u32::MAX)) as u32
 }
+
+/// `n` as `i64`; exact for every sample count this crate handles.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "sample counts stay far below 2^62"
+)]
+pub(crate) fn i64_of(n: usize) -> i64 {
+    n as i64
+}
+
+/// A value already known to lie in `0..n` for some sample count `n`, narrowed
+/// back to `usize`.
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "callers only pass a value a reflect index just proved is in 0..n"
+)]
+pub(crate) fn usize_of(n: i64) -> usize {
+    n as usize
+}

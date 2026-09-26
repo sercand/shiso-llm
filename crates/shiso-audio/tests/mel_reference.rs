@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use shiso_audio::{
-    Filterbank, Framing, MelFrontend, MelScale, MelSpec, Preemphasis, Spectrum, Window,
+    Filterbank, Framing, LogScale, MelFrontend, MelScale, MelSpec, Preemphasis, Spectrum, Window,
 };
 
 // The budgets are about twice what was measured on 2026-09-25 (M1 Max,
@@ -53,7 +53,9 @@ fn spec(style: &str) -> MelSpec {
                 f_min: 0.0,
                 f_max: 8_000.0,
             },
-            log_guard: 2f32.powi(-24),
+            log_scale: LogScale::Natural {
+                guard: 2f32.powi(-24),
+            },
         },
         "left-padded" => MelSpec {
             sample_rate: 16_000,
@@ -73,7 +75,7 @@ fn spec(style: &str) -> MelSpec {
                 f_min: 0.0,
                 f_max: 8_000.0,
             },
-            log_guard: 1e-3,
+            log_scale: LogScale::Natural { guard: 1e-3 },
         },
         other => panic!("unknown style {other}"),
     }
