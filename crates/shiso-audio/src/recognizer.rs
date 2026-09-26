@@ -35,8 +35,14 @@ pub struct StreamOptions {
     /// Language conditioning.
     pub language: Language,
     /// Encoder frames of future context each frame may see; one of
-    /// [`SpeechRecognizer::lookaheads`].
+    /// [`SpeechRecognizer::lookaheads`], or ignored by a recognizer that
+    /// lists none.
     pub lookahead: usize,
+    /// Mel frames at which a chunk must end, strictly increasing, from the
+    /// start of the stream: the diarizer's speaker turns, say, as
+    /// [`crate::chunks::turn_cuts`] plans them. `None` leaves the plan to the
+    /// recognizer. A recognizer that does not chunk ignores it.
+    pub cuts: Option<Vec<u32>>,
 }
 
 /// One emitted token and the encoder frame it was emitted at.
@@ -62,8 +68,16 @@ pub trait SpeechRecognizer: Send + Sync + fmt::Debug {
     /// Locale tags its language conditioning accepts.
     fn languages(&self) -> Vec<String>;
 
-    /// Lookaheads its encoder was trained for.
+    /// Lookaheads its encoder was trained for. Empty means the recognizer has
+    /// no lookahead: its streams ignore [`StreamOptions::lookahead`].
     fn lookaheads(&self) -> &[usize];
+
+    /// Whether its streams transcribe in chunks and honour
+    /// [`StreamOptions::cuts`]. When true, a diarized job is worth holding
+    /// until its speaker turns are known, so that each chunk is one turn.
+    fn chunks_at_cuts(&self) -> bool {
+        false
+    }
 
     /// Whether `id` is never text: blank, padding, unknown.
     fn is_special(&self, id: u32) -> bool;

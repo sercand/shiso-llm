@@ -105,6 +105,7 @@ fn every_export_transcribes_through_the_public_path() {
                 .open_stream(&StreamOptions {
                     language: Language::Auto,
                     lookahead: 13,
+                    cuts: None,
                 })
                 .expect("a stream opens");
             let mut mel = MelStream::new(Arc::clone(&frontend)).expect("streams");
@@ -172,6 +173,7 @@ fn the_first_chunk_leaves_as_soon_as_its_mel_rows_arrive() {
             .open_stream(&StreamOptions {
                 language: Language::Auto,
                 lookahead,
+                cuts: None,
             })
             .expect("opens");
         stream.push(&mel).expect("pushes");

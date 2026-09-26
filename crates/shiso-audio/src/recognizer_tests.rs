@@ -15,13 +15,16 @@ fn options_carry_the_language_and_lookahead() {
     let auto = StreamOptions {
         language: Language::Auto,
         lookahead: 13,
+        cuts: None,
     };
     assert_eq!(auto.language, Language::Auto);
     let tagged = StreamOptions {
         language: Language::Tag("en-US".into()),
         lookahead: 3,
+        cuts: Some(vec![480, 3_200]),
     };
     assert_eq!(tagged.language, Language::Tag("en-US".into()));
+    assert_eq!(tagged.cuts.as_deref(), Some(&[480, 3_200][..]));
     assert_eq!(
         TokenEvent {
             token: shiso_core::TokenId::new(7),

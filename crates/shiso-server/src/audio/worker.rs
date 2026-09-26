@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
+use shiso_audio::chunks;
 use shiso_audio::transcript::{self, SpeakerActivity, TimedPiece};
 use shiso_audio::{
-    AudioError, Detokenizer, MelFrames, MelFrontend, RecognizerStream, SpeechRecognizer,
+    AudioError, Detokenizer, Language, MelFrames, MelFrontend, RecognizerStream, SpeechRecognizer,
     StreamOptions, TokenEvent,
 };
 use tokio::sync::mpsc;
@@ -33,7 +34,7 @@ pub(super) const MIN_ROWS_PER_TURN: usize = 160;
 /// One admitted job.
 struct Active {
     events: mpsc::UnboundedSender<TranscriptEvent>,
-    stream: Box<dyn RecognizerStream>,
+    stream: Stream,
     mel: MelFrames,
     next_row: usize,
     detok: Detokenizer,
@@ -46,6 +47,15 @@ struct Active {
     duration: f64,
     /// Whether the stream has been told the input is over.
     flushed: bool,
+}
+
+/// A job's recognizer stream, or what opening it waits for.
+enum Stream {
+    Open(Box<dyn RecognizerStream>),
+    /// A chunking recognizer on a diarized job: its stream opens with the
+    /// speaker turns as cuts, so it waits for the activity with the
+    /// language it will be opened in.
+    AwaitingTurns(Language),
 }
 
 /// What a turn left the job as.
@@ -196,10 +206,18 @@ fn start(
             });
         }
     };
-    let stream = recognizer.open_stream(&StreamOptions {
-        language,
-        lookahead: desc.lookahead,
-    })?;
+    // A recognizer that chunks is better off cutting at the speaker turns
+    // than at silence, so its stream waits for them; one that does not chunk
+    // runs beside its diarizer as before.
+    let stream = if diarizing.is_some() && recognizer.chunks_at_cuts() {
+        Stream::AwaitingTurns(language)
+    } else {
+        Stream::Open(recognizer.open_stream(&StreamOptions {
+            language,
+            lookahead: desc.lookahead,
+            cuts: None,
+        })?)
+    };
     Ok(Active {
         events,
         stream,
@@ -226,17 +244,33 @@ fn advance(desc: &AudioServiceDesc, job: &mut Active, rows_per_turn: usize) -> T
     if let Some(turn) = collect_speakers(desc, job, None) {
         return turn;
     }
+    if let Stream::AwaitingTurns(_) = job.stream {
+        // Waiting on the diarizer here, rather than spinning, is the same
+        // bounded wait a recognised job takes for its speakers.
+        if job.activity.is_none()
+            && let Some(turn) = collect_speakers(desc, job, Some(SPEAKER_WAIT))
+        {
+            return turn;
+        }
+        if let Some(turn) = open_at_turns(desc, job) {
+            return turn;
+        }
+    }
     if !job.flushed {
+        let Stream::Open(stream) = &mut job.stream else {
+            // Still waiting for the speaker turns.
+            return Turn::More;
+        };
         let total = job.mel.valid();
         let n = job.mel.n_mels();
         let result = if job.next_row < total {
             let end = (job.next_row + rows_per_turn).min(total);
             let rows = job.mel.as_slice()[job.next_row * n..end * n].to_vec();
             job.next_row = end;
-            MelFrames::from_rows(rows, n).and_then(|chunk| job.stream.push(&chunk))
+            MelFrames::from_rows(rows, n).and_then(|chunk| stream.push(&chunk))
         } else {
             job.flushed = true;
-            job.stream.finish()
+            stream.finish()
         };
         match result {
             Err(error) => {
@@ -261,6 +295,55 @@ fn advance(desc: &AudioServiceDesc, job: &mut Active, rows_per_turn: usize) -> T
     }
     let _gone = job.events.send(TranscriptEvent::Done(finish(desc, job)));
     Turn::Finished
+}
+
+/// Opens a waiting stream once the job's speaker activity is known, cut at
+/// its turns; `Some` when opening failed and that ends the job.
+fn open_at_turns(desc: &AudioServiceDesc, job: &mut Active) -> Option<Turn> {
+    let (Stream::AwaitingTurns(language), Some(activity)) = (&job.stream, &job.activity) else {
+        return None;
+    };
+    let spec = desc.recognizer.mel_spec();
+    let opened = u32::try_from(spec.hop_length)
+        .map_err(|_| AudioError::BadSpec {
+            reason: format!("a hop of {} samples is not a mel frame", spec.hop_length),
+        })
+        .and_then(|hop| {
+            let mel_frame_secs = f64::from(hop) / f64::from(spec.sample_rate);
+            chunks::turn_cuts(activity, &job.mel, mel_frame_secs)
+                .into_iter()
+                .map(|cut| {
+                    u32::try_from(cut).map_err(|_| AudioError::BadSpec {
+                        reason: format!(
+                            "a cut at mel frame {cut} does not fit a stream's frame index"
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<u32>, AudioError>>()
+        })
+        .and_then(|cuts| {
+            desc.recognizer.open_stream(&StreamOptions {
+                language: language.clone(),
+                lookahead: desc.lookahead,
+                cuts: Some(cuts),
+            })
+        });
+    match opened {
+        Ok(stream) => {
+            job.stream = Stream::Open(stream);
+            None
+        }
+        Err(error) => {
+            // The same split as at admission: a refusal of the request is the
+            // caller's, a device error this server's.
+            let caller = !matches!(error, AudioError::Device(_) | AudioError::Io { .. });
+            let _gone = job.events.send(TranscriptEvent::Failed(JobFailure {
+                message: error.to_string(),
+                caller,
+            }));
+            Some(Turn::Finished)
+        }
+    }
 }
 
 /// Takes the job's speaker activity if its pass has answered, waiting up to

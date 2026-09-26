@@ -4,11 +4,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use shiso_audio::chunks;
 use shiso_audio::transcript::SpeakerActivity;
 use shiso_audio::{
     AudioError, DiarizationPass, Diarizer, Filterbank, Framing, Language, LogScale, MelFrames,
-    MelScale, MelSpec, Pcm, PieceVocab, Preemphasis, RecognizerStream, Spectrum, SpeechRecognizer,
-    StreamOptions, TokenEvent, Window,
+    MelFrontend, MelScale, MelSpec, Pcm, PieceVocab, Preemphasis, RecognizerStream, Spectrum,
+    SpeechRecognizer, StreamOptions, TokenEvent, Window,
 };
 use shiso_core::TokenId;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -40,13 +41,19 @@ fn spec() -> MelSpec {
 /// Which job each push belonged to, in the order the worker made them.
 type Log = Arc<Mutex<Vec<String>>>;
 
+/// The options each stream was opened with, in order.
+type Opened = Arc<Mutex<Vec<StreamOptions>>>;
+
 /// Emits `▁a` or `▁b` for every 40 mel rows it is fed, alternating, and one
-/// more on flush; refuses a stream conditioned on `fail`.
+/// more on flush; refuses a stream conditioned on `fail`. With `chunks`, it
+/// says it honours cuts, as a chunking recognizer does.
 #[derive(Debug)]
 struct Scripted {
     spec: MelSpec,
     vocab: Arc<PieceVocab>,
     log: Log,
+    chunks: bool,
+    opened: Opened,
 }
 
 struct ScriptedStream {
@@ -114,10 +121,17 @@ impl SpeechRecognizer for Scripted {
     fn is_special(&self, id: u32) -> bool {
         id == 0
     }
+    fn chunks_at_cuts(&self) -> bool {
+        self.chunks
+    }
     fn open_stream(
         &self,
         options: &StreamOptions,
     ) -> Result<Box<dyn RecognizerStream>, AudioError> {
+        self.opened
+            .lock()
+            .expect("unpoisoned")
+            .push(options.clone());
         let label = match &options.language {
             Language::Auto => "auto".to_owned(),
             Language::Tag(tag) => tag.clone(),
@@ -192,6 +206,35 @@ fn service_with_upload(
     log: &Log,
     max_upload_bytes: usize,
 ) -> AudioService {
+    service_with(&ServiceShape {
+        max_streams,
+        queue,
+        log,
+        max_upload_bytes,
+        chunks: false,
+        opened: &Opened::default(),
+    })
+}
+
+/// What a test service is built with.
+struct ServiceShape<'a> {
+    max_streams: usize,
+    queue: usize,
+    log: &'a Log,
+    max_upload_bytes: usize,
+    chunks: bool,
+    opened: &'a Opened,
+}
+
+fn service_with(shape: &ServiceShape<'_>) -> AudioService {
+    let ServiceShape {
+        max_streams,
+        queue,
+        log,
+        max_upload_bytes,
+        chunks,
+        opened,
+    } = *shape;
     let vocab = Arc::new(
         PieceVocab::from_pieces(vec![
             "<blank>".into(),
@@ -205,6 +248,8 @@ fn service_with_upload(
             spec: spec(),
             vocab,
             log: Arc::clone(log),
+            chunks,
+            opened: Arc::clone(opened),
         }),
         diarizer: Some(Arc::new(Halves {
             spec: spec(),
@@ -427,6 +472,76 @@ async fn a_diarized_job_is_recognised_while_it_is_diarized() {
         first_a < last_diar,
         "recognition waited for the diarizer: {log:?}"
     );
+}
+
+#[tokio::test]
+async fn a_chunking_recognizer_opens_its_stream_with_the_diarizer_cuts() {
+    let log = Log::default();
+    let opened = Opened::default();
+    let svc = service_with(&ServiceShape {
+        max_streams: 1,
+        queue: 4,
+        log: &log,
+        max_upload_bytes: super::DEFAULT_MAX_UPLOAD_BYTES,
+        chunks: true,
+        opened: &opened,
+    });
+    let clip = job(6, "a", true);
+    // What the worker sees: the recognizer's mel, and the scripted
+    // diarizer's activity over the diarizer's own (here identical) mel.
+    let mel = MelFrontend::new(spec())
+        .expect("spec")
+        .compute(clip.pcm.samples());
+    let frames = mel.valid();
+    let probs = (0..frames)
+        .flat_map(|f| {
+            if f < frames / 2 {
+                [0.9, 0.0]
+            } else {
+                [0.0, 0.9]
+            }
+        })
+        .collect();
+    let activity = SpeakerActivity::new(0.01, 2, probs).expect("geometry");
+    let expected: Vec<u32> = chunks::turn_cuts(&activity, &mel, 0.01)
+        .into_iter()
+        .map(|c| u32::try_from(c).expect("small"))
+        .collect();
+    assert_eq!(expected.len(), 1, "one turn change: {expected:?}");
+    let events = drain(svc.submit(clip).expect("queued")).await;
+    let Some(TranscriptEvent::Done(transcript)) = events.last() else {
+        panic!("{events:?}");
+    };
+    assert!(transcript.diarized);
+    let opened = opened.lock().expect("unpoisoned").clone();
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert_eq!(opened[0].cuts, Some(expected));
+    let log = log.lock().expect("unpoisoned").clone();
+    let last_diar = log.iter().rposition(|l| l == "diar").expect("diarized");
+    let first_a = log.iter().position(|l| l == "a").expect("a ran");
+    assert!(
+        last_diar < first_a,
+        "rows were pushed before the cuts were known: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_chunking_recognizer_is_opened_without_cuts() {
+    let log = Log::default();
+    let opened = Opened::default();
+    let svc = service_with(&ServiceShape {
+        max_streams: 1,
+        queue: 4,
+        log: &log,
+        max_upload_bytes: super::DEFAULT_MAX_UPLOAD_BYTES,
+        chunks: false,
+        opened: &opened,
+    });
+    let events = drain(svc.submit(job(2, "a", true)).expect("queued")).await;
+    assert!(matches!(events.last(), Some(TranscriptEvent::Done(_))));
+    let opened = opened.lock().expect("unpoisoned").clone();
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert_eq!(opened[0].cuts, None);
 }
 
 #[tokio::test]

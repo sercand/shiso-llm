@@ -9,6 +9,7 @@
 //! their detokenization, and transcript assembly.
 #![forbid(unsafe_code)]
 
+pub mod chunks;
 mod decode;
 mod diarizer;
 mod error;
