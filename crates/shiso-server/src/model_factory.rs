@@ -38,13 +38,16 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use shiso_audio::{AudioError, AudioTower};
 use shiso_core::{Backend, CoreError, HfConfig};
 use shiso_engine::EngineOptions;
 use shiso_engine::ckpt::Checkpointed;
 use shiso_engine::sparse::capture;
 use shiso_engine::sparse::mtp::SpecDepth;
 use shiso_engine::sparse::stack::SparseOptions;
-use shiso_models::gemma4::{Gemma4Config, Gemma4Model, Gemma4Tower, PleOptions};
+use shiso_models::gemma4::{
+    Gemma4AudioTower, Gemma4Config, Gemma4Model, Gemma4Tower, PleOptions, holds_audio_tower,
+};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::mtp::{self, AffineQuant, MtpManifest};
 use shiso_models::qwen35::{Qwen35Config, Qwen35Model, Qwen35Tower};
@@ -87,6 +90,26 @@ pub enum FactoryError {
 /// Whatever the family's loader refuses the source for, and
 /// [`VisionError::Unsupported`] for a family this build serves no tower for.
 pub type TowerOpener = fn(&Arc<dyn Backend>, &Path) -> Result<Box<dyn VisionTower>, VisionError>;
+
+/// How a family's audio tower is opened from the container `--vision` names.
+///
+/// The same shape as [`TowerOpener`], and the same path: a family that hears
+/// ships its audio tower in the container that carries its vision tower.
+///
+/// # Errors
+///
+/// Whatever the family's loader refuses the container for.
+pub type AudioTowerOpener = fn(&Arc<dyn Backend>, &Path) -> Result<AudioTowerFound, AudioError>;
+
+/// What a family's audio opener found in the tower container.
+#[derive(Debug)]
+pub enum AudioTowerFound {
+    /// The tower, loaded.
+    Tower(Arc<dyn AudioTower>),
+    /// No audio tower to open - an export without one, or a family that does
+    /// not hear - which turns audio input off rather than failing boot.
+    Absent,
+}
 
 /// What a family says about its own output, for the server to default to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +319,8 @@ pub struct Loaded {
     pub model: Box<dyn Checkpointed>,
     /// How this family's tower is opened, when the operator names one.
     pub open_tower: TowerOpener,
+    /// How this family's audio tower is opened from the same container.
+    pub open_audio: AudioTowerOpener,
     /// Where this family's template puts media.
     pub placement: MediaPlacement,
     /// What this family defaults to for output parsing and thinking.
@@ -317,6 +342,32 @@ fn open_qwen35_tower(
     path: &Path,
 ) -> Result<Box<dyn VisionTower>, VisionError> {
     Ok(Box::new(Qwen35Tower::open(backend, path)?))
+}
+
+/// The opener of a family that does not hear: audio input stays off.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "every family's opener has the one signature the boot path calls"
+)]
+fn no_audio_tower(
+    _backend: &Arc<dyn Backend>,
+    _path: &Path,
+) -> Result<AudioTowerFound, AudioError> {
+    Ok(AudioTowerFound::Absent)
+}
+
+/// The Gemma 4 family's audio opener: absent when the container was exported
+/// without the tower.
+fn open_gemma4_audio(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+) -> Result<AudioTowerFound, AudioError> {
+    if !holds_audio_tower(path)? {
+        return Ok(AudioTowerFound::Absent);
+    }
+    Ok(AudioTowerFound::Tower(Arc::new(Gemma4AudioTower::open(
+        backend, path,
+    )?)))
 }
 
 /// The Gemma 4 family's opener.
@@ -404,6 +455,7 @@ pub fn load_model(
             return Ok(Loaded {
                 model: Box::new(model),
                 open_tower: open_qwen35_tower,
+                open_audio: no_audio_tower,
                 placement: Qwen35Tower::PLACEMENT,
                 defaults,
             });
@@ -467,6 +519,7 @@ pub fn load_model(
             return Ok(Loaded {
                 model: Box::new(model),
                 open_tower: open_qwen35_tower,
+                open_audio: no_audio_tower,
                 placement: Qwen35Tower::PLACEMENT,
                 defaults,
             });
@@ -495,6 +548,7 @@ pub fn load_model(
             return Ok(Loaded {
                 model: Box::new(model),
                 open_tower: open_gemma4_tower,
+                open_audio: open_gemma4_audio,
                 placement: MediaPlacement::GEMMA4,
                 defaults,
             });
@@ -617,6 +671,7 @@ fn load_qwen35moe(
     Ok(Loaded {
         model,
         open_tower: open_qwen35_tower,
+        open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
     })
@@ -856,6 +911,7 @@ fn load_qwen4exp_mlx(
         return Ok(Loaded {
             model: Box::new(model),
             open_tower: open_qwen35_tower,
+            open_audio: no_audio_tower,
             placement: Qwen35Tower::PLACEMENT,
             defaults,
         });
@@ -872,6 +928,7 @@ fn load_qwen4exp_mlx(
     Ok(Loaded {
         model: Box::new(model),
         open_tower: open_qwen35_tower,
+        open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
     })

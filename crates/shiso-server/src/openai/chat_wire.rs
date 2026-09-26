@@ -98,11 +98,30 @@ pub enum Part {
         /// Where the bytes are.
         video_url: MediaRef,
     },
+    /// A sound clip, inline.
+    InputAudio {
+        /// The clip.
+        input_audio: InputAudio,
+    },
     /// Output a safety decision withheld.
     Refusal {
         /// What is shown instead.
         refusal: String,
     },
+}
+
+/// An inline sound clip.
+///
+/// `format` is the client's word for the container and is read by nobody: the
+/// decoder sniffs the bytes, so a clip labelled `mp3` that is really WAV still
+/// decodes, and one that is neither is refused for what it is.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InputAudio {
+    /// The clip's bytes, base64, with or without a `data:` prefix.
+    pub data: String,
+    /// The container the client says it is.
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 /// A turn's content: one string, or parts.

@@ -97,23 +97,40 @@ impl VisionGrid {
     }
 }
 
-/// The two placeholder token ids a rendered prompt can carry.
+/// The placeholder token ids a rendered prompt can carry: image, video, audio.
 ///
-/// Both are optional because a vocabulary may declare one and not the other, and
-/// a model with neither has no media path at all. They are one type rather than
-/// two arguments so that no call site can pass them in the wrong order or match
-/// only the first.
+/// All are optional because a vocabulary may declare some and not others, and
+/// a model with none has no media path at all. They are one type rather than
+/// separate arguments so that no call site can pass them in the wrong order or
+/// match only some of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PadTokens {
     image: Option<TokenId>,
     video: Option<TokenId>,
+    audio: Option<TokenId>,
 }
 
 impl PadTokens {
     /// The pair as a vocabulary reports it.
     #[must_use]
     pub const fn new(image: Option<TokenId>, video: Option<TokenId>) -> Self {
-        Self { image, video }
+        Self {
+            image,
+            video,
+            audio: None,
+        }
+    }
+
+    /// The same set with the audio placeholder, for a family that hears.
+    #[must_use]
+    pub const fn with_audio(self, audio: Option<TokenId>) -> Self {
+        Self { audio, ..self }
+    }
+
+    /// The audio placeholder.
+    #[must_use]
+    pub const fn audio(&self) -> Option<TokenId> {
+        self.audio
     }
 
     /// The still-image placeholder.
@@ -132,10 +149,10 @@ impl PadTokens {
     /// media at all.
     #[must_use]
     pub const fn any(&self) -> bool {
-        self.image.is_some() || self.video.is_some()
+        self.image.is_some() || self.video.is_some() || self.audio.is_some()
     }
 
-    /// Whether `token` is a placeholder. Both are matched, always.
+    /// Whether `token` is a placeholder. Every one is matched, always.
     ///
     /// Matching only the still-image id walks a clip's run one text token at a
     /// time: every position after it shifts, no encoder row is spliced over any
@@ -143,7 +160,7 @@ impl PadTokens {
     /// was left holding.
     #[must_use]
     pub fn matches(&self, token: TokenId) -> bool {
-        Some(token) == self.image || Some(token) == self.video
+        Some(token) == self.image || Some(token) == self.video || Some(token) == self.audio
     }
 }
 

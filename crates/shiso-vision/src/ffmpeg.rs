@@ -225,11 +225,9 @@ pub fn probe(policy: Option<&FfmpegPolicy>) -> Availability {
 ///
 /// # Errors
 ///
-/// [`VisionError::DecoderSpawn`] when the binary cannot be started, which is a
-/// deployment problem and reads as one; [`VisionError::DecoderTimeout`] and
-/// [`VisionError::DecoderOutputCap`] when a cap is hit;
-/// [`VisionError::DecoderFailed`] carrying the decoder's own last complaint;
-/// and [`VisionError::NoFrames`] for a container with no video stream.
+/// Every error [`run_decoder`] returns, plus [`VisionError::FramePng`] for a
+/// frame that does not decode and [`VisionError::NoFrames`] for a container
+/// with no video stream.
 pub fn decode_frames(
     bytes: &[u8],
     target_fps: f64,
@@ -242,17 +240,9 @@ pub fn decode_frames(
     };
     let filter = format!("fps={fps}");
     let frame_cap = policy.max_frames().to_string();
-
-    tracing::debug!(binary = ?policy.binary(), fps, "spawning the subprocess frame decoder");
-    let mut child = Command::new(policy.binary())
-        .args([
-            "-v",
-            "error",
-            // Without this the decoder can block on a prompt whenever it thinks
-            // stdin is interactive.
-            "-nostdin",
-            "-i",
-            "pipe:0",
+    let out = run_decoder(
+        policy,
+        &[
             "-vf",
             &filter,
             "-frames:v",
@@ -261,8 +251,46 @@ pub fn decode_frames(
             "image2pipe",
             "-vcodec",
             "png",
-            "pipe:1",
-        ])
+        ],
+        bytes,
+    )?;
+    let frames = split_png_stream(&out)?;
+    if frames.is_empty() {
+        return Err(VisionError::NoFrames);
+    }
+    Ok(frames)
+}
+
+/// Runs the decoder over `bytes` with `output_args` and returns its raw output.
+///
+/// The command line is `-v error -nostdin -i pipe:0 <output_args…> pipe:1`:
+/// the container goes in over stdin and whatever the output arguments ask for
+/// comes back over stdout, under every cap the policy sets. The caller owns
+/// the meaning of the bytes - frames, samples, anything the decoder can write
+/// to a pipe.
+///
+/// # Errors
+///
+/// [`VisionError::DecoderSpawn`] when the binary cannot be started, which is a
+/// deployment problem and reads as one; [`VisionError::DecoderTimeout`] and
+/// [`VisionError::DecoderOutputCap`] when a cap is hit; and
+/// [`VisionError::DecoderFailed`] carrying the decoder's own last complaint.
+pub fn run_decoder(
+    policy: &FfmpegPolicy,
+    output_args: &[&str],
+    bytes: &[u8],
+) -> Result<Vec<u8>, VisionError> {
+    tracing::debug!(binary = ?policy.binary(), "spawning the subprocess decoder");
+    let mut args: Vec<&str> = vec![
+        "-v", "error",
+        // Without this the decoder can block on a prompt whenever it thinks
+        // stdin is interactive.
+        "-nostdin", "-i", "pipe:0",
+    ];
+    args.extend_from_slice(output_args);
+    args.push("pipe:1");
+    let mut child = Command::new(policy.binary())
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -326,7 +354,7 @@ pub fn decode_frames(
     let timed_out = watchdog.join().unwrap_or(false);
 
     read_result.map_err(|source| VisionError::Io {
-        what: "reading decoded frames",
+        what: "reading decoded output",
         source,
     })?;
     if timed_out {
@@ -347,11 +375,7 @@ pub fn decode_frames(
         return Err(VisionError::DecoderFailed { detail });
     }
 
-    let frames = split_png_stream(&out)?;
-    if frames.is_empty() {
-        return Err(VisionError::NoFrames);
-    }
-    Ok(frames)
+    Ok(out)
 }
 
 /// Starts the watchdog that kills a decoder which overruns its budget.
@@ -375,7 +399,10 @@ fn spawn_watchdog(
             }
             if Instant::now() >= deadline {
                 let _ = guard.kill();
-                tracing::warn!(timeout_secs, "killed the frame decoder at its deadline");
+                tracing::warn!(
+                    timeout_secs,
+                    "killed the subprocess decoder at its deadline"
+                );
                 return true;
             }
         }

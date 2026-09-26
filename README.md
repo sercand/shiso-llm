@@ -38,6 +38,15 @@ no Python runtime.
 
 Vision towers are supported for Qwen 3.5, Qwen 3.6 MoE and Gemma 4.
 
+Speech models (for the audio endpoints): the Nemotron 3.5 streaming ASR
+(HF, MLX and GGUF exports) and Nemotron-3-Diarization (HF, MLX, and bf16 and
+q8_0 GGUF exports).
+
+Gemma 4 also takes audio input: `input_audio` parts on Chat Completions and
+Responses, up to 30 seconds a clip. The audio tower loads from the same
+`--vision` path, either the MLX export directory or the mmproj GGUF. WAV is
+decoded natively; other containers need `--audio-allow-ffmpeg`.
+
 ## Supported hardware
 
 - **Apple Silicon** Macs (Metal)
@@ -99,6 +108,28 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
+### Transcribe audio
+
+`--model` is optional when a speech recognizer is given; the server then
+serves transcription alone.
+
+```sh
+./target/release/shiso serve \
+    --asr-model ~/models/nemotron-3.5-asr-streaming-0.6b/mlx --asr-id nemotron-asr \
+    --diarization-model ~/models/Nemotron-3-Diarization/mlx
+
+curl http://127.0.0.1:8090/v1/audio/transcriptions \
+    -F model=nemotron-asr -F file=@speech.wav
+curl http://127.0.0.1:8090/v1/audio/transcriptions \
+    -F model=nemotron-asr -F response_format=diarized_json -F file=@meeting.wav
+```
+
+`response_format` is one of `json`, `text`, `verbose_json` (with
+`timestamp_granularities[]` of `segment` and/or `word`), `srt`, `vtt` and
+`diarized_json`; `stream=true` streams `transcript.text.delta` events (or, for
+`diarized_json`, `transcript.text.segment` events) ending in
+`transcript.text.done`.
+
 ## Configuration
 
 Run `shiso serve --help` for every option. Each flag also reads a `SHISO_*`
@@ -120,6 +151,12 @@ environment variable. The ones you are most likely to want:
 | `--vision` | Vision tower weights; enables image input |
 | `--vision-allow-remote-images` | Allow fetching images from `http(s)` URLs |
 | `--video-allow-ffmpeg` | Allow video input by spawning ffmpeg |
+| `--audio-allow-ffmpeg` | Allow audio containers other than WAV by spawning ffmpeg |
+| `--audio-max-seconds` | Longest audio clip a request may carry (default 1800) |
+| `--asr-model`, `--asr-id` | Speech recognizer for `/v1/audio/transcriptions`, and the id it answers to |
+| `--diarization-model` | Speaker diarizer, for `response_format=diarized_json` |
+| `--asr-lookahead` | Encoder lookahead frames, one the checkpoint was trained for (default 13) |
+| `--audio-max-streams` | Transcriptions advanced at once; the rest queue (default 4) |
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
 
@@ -131,6 +168,7 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 | `POST /v1/completions` | OpenAI Completions |
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/audio/transcriptions` | OpenAI Audio Transcriptions (also at `/audio/transcriptions`) |
 | `GET /v1/models` | OpenAI Models |
 | `GET /health`, `GET /metrics`, `GET /cache` | health, metrics, cache report |
 

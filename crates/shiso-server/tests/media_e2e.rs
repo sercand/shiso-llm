@@ -298,6 +298,39 @@ fn flashing_field() -> Vec<RgbaImage> {
 
 // --- the running server ---------------------------------------------------
 
+/// Sends the server's log to the test's output.
+///
+/// A 500 says only "internal server error" on the wire; the cause is in the
+/// log, and a failing device case with no log is a case nobody can read.
+/// Another test in the binary may have installed one already.
+fn install_log() {
+    let _installed = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
+/// The renderer with the audio tower attached, as the binary's boot does.
+fn with_audio(
+    renderer: shiso_server::tokenizer::render_prompt::PromptRenderer,
+    audio: Option<Arc<dyn shiso_audio::AudioTower>>,
+    placement: shiso_vision::MediaPlacement,
+    args: &ServeArgs,
+) -> shiso_server::tokenizer::render_prompt::PromptRenderer {
+    match audio {
+        Some(tower) => renderer.with_audio_tower(
+            tower,
+            placement,
+            args.audio_limits(),
+            args.audio_ffmpeg_policy(),
+        ),
+        None => renderer,
+    }
+}
+
 /// A booted stack, and the two things that must be torn down, in order.
 struct Stack {
     addr: SocketAddr,
@@ -320,16 +353,23 @@ impl Stack {
     /// The same boot from an already-parsed command line, so a second family
     /// comes through the identical door rather than beside it.
     async fn boot_args(args: ServeArgs) -> Self {
+        install_log();
         args.validate().expect("the command line is servable");
         let backend: Arc<dyn Backend> = shiso_metal::MetalBackend::new().expect("a Metal device");
         let parsed = shiso_core::HfConfig::from_file(&args.config_path()).expect("the config");
         let shiso_server::model_factory::Loaded {
             model: mut loaded,
             open_tower,
+            open_audio,
             placement,
             defaults,
-        } = shiso_server::model_factory::load_model(&backend, &args.model, &parsed, &args)
-            .expect("the checkpoint loads");
+        } = shiso_server::model_factory::load_model(
+            &backend,
+            args.model.as_deref().expect("this test passes --model"),
+            &parsed,
+            &args,
+        )
+        .expect("the checkpoint loads");
 
         let vision = args.vision.as_ref().expect("this test passes --vision");
         // Through the family's own opener, which is the door the binary uses:
@@ -349,6 +389,12 @@ impl Stack {
             tower.placement().image_marker,
             tower.device_bytes()
         ));
+
+        // The binary's own opener, width and media-path checks included: a copy
+        // here would pass while the shipped one drifted.
+        let audio = shiso_server::open_audio_tower(&backend, &args, loaded.as_mut(), open_audio)
+            .expect("the audio tower opens or is absent");
+        note(&format!("audio tower resident: {}", audio.is_some()));
 
         let vocabulary = Arc::new(
             shiso_server::tokenizer::Vocabulary::from_file(&args.tokenizer_path())
@@ -386,12 +432,16 @@ impl Stack {
         // the model's preamble rather than its description. The multimodal path
         // is identical either way.
         .with_thinking_default(false);
+        let renderer = with_audio(renderer, audio.clone(), placement, &args);
 
         let model_id = args.model_id();
         let (engine, join) = spawn_engine_with_checkpoints(
             Arc::clone(&backend),
             loaded,
-            Some(tower),
+            shiso_server::media::MediaTowers {
+                vision: Some(tower),
+                audio,
+            },
             Some(Arc::clone(&vocabulary)),
             &model_id,
             args.ctx,
@@ -471,6 +521,8 @@ async fn post_chat(addr: SocketAddr, body: &Value) -> (StatusCode, String) {
 struct Answer {
     text: String,
     prompt_tokens: u64,
+    /// The prompt's audio soft tokens, as the usage block reports them.
+    audio_tokens: u64,
 }
 
 /// One greedy turn over a media part and a question.
@@ -491,6 +543,9 @@ async fn ask(addr: SocketAddr, part: Value, question: &str) -> Answer {
     Answer {
         text: answer,
         prompt_tokens: value["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+        audio_tokens: value["usage"]["prompt_tokens_details"]["audio_tokens"]
+            .as_u64()
+            .unwrap_or(0),
     }
 }
 
@@ -552,6 +607,9 @@ async fn text_only(addr: SocketAddr) -> Answer {
     Answer {
         text: answer,
         prompt_tokens: value["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+        audio_tokens: value["usage"]["prompt_tokens_details"]["audio_tokens"]
+            .as_u64()
+            .unwrap_or(0),
     }
 }
 
@@ -787,6 +845,99 @@ async fn gemma4_image_e2e_golden() {
     .await;
     stack.shutdown().await;
     finished.expect("the golden image case finished inside its deadline");
+}
+
+/// The spoken clip, read from the committed audio fixtures.
+fn speech_en_wav() -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-vectors/references/audio/clips/speech-en.wav");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// A spoken clip reaches the model: asked where the speaker went, it names the
+/// city the speech names. The clip is thirty seconds of a public address that
+/// says "Chicago" once; no word of the prompt does.
+async fn gemma4_audio_case(addr: SocketAddr) {
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD.encode(speech_en_wav());
+    let part = json!({"type": "input_audio", "input_audio": {"data": data, "format": "wav"}});
+    let answer = ask(
+        addr,
+        part,
+        "What city did the speaker travel to? Answer with one word.",
+    )
+    .await;
+    note(&format!(
+        "gemma4/audio/speech-en: prompt {} tokens, answer {:?}",
+        answer.prompt_tokens, answer.text
+    ));
+    // 750 soft tokens for thirty seconds, plus the bracket and the words.
+    assert!(
+        answer.prompt_tokens > 750,
+        "the clip's pad run is missing from the prompt: {} tokens",
+        answer.prompt_tokens
+    );
+    assert_eq!(
+        answer.audio_tokens, 750,
+        "thirty seconds is 750 audio soft tokens in the usage block"
+    );
+    assert!(
+        answer.text.contains("Chicago"),
+        "the answer does not name the city the speech names: {:?}",
+        answer.text
+    );
+    note("ok: the speech reached the model");
+
+    // A picture before the clip in the same turn: two items of two kinds,
+    // encoded by two towers and gathered into one block. Rows spliced in the
+    // wrong order would put the picture's rows in the clip's run.
+    let picture = json!({"type": "image_url", "image_url": {"url": png_uri(&quadrants())}});
+    let clip = json!({"type": "input_audio", "input_audio": {"data": data, "format": "wav"}});
+    let body = json!({
+        "messages": [{"role": "user", "content": [
+            picture,
+            clip,
+            {"type": "text", "text": "Ignore the picture. What city did the speaker travel to? Answer with one word."},
+        ]}],
+        "max_completion_tokens": MAX_TOKENS,
+        "temperature": 0.0
+    });
+    let (status, text) = post_chat(addr, &body).await;
+    assert_eq!(status, StatusCode::OK, "the request was refused: {text}");
+    let value: Value = serde_json::from_str(&text).expect("the answer is JSON");
+    let mixed = value["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default();
+    note(&format!(
+        "gemma4/audio/image+speech-en: prompt {} tokens, answer {mixed:?}",
+        value["usage"]["prompt_tokens"]
+    ));
+    assert_eq!(value["usage"]["prompt_tokens_details"]["audio_tokens"], 750);
+    assert!(
+        value["usage"]["prompt_tokens"].as_u64().unwrap_or(0) > answer.prompt_tokens,
+        "the picture's run is missing from the prompt"
+    );
+    assert!(
+        mixed.contains("Chicago"),
+        "with a picture before it, the clip's rows did not land in the clip's run: {mixed:?}"
+    );
+    note("ok: a picture and a clip in one turn, each in its own run");
+}
+
+/// A request carrying speech is answered from what was said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the local Gemma 4 container, mmproj and a Metal device"]
+async fn gemma4_audio_e2e_names_the_city() {
+    let Some(stack) = booted_gemma4().await else {
+        return;
+    };
+    let addr = stack.addr;
+    let finished = tokio::time::timeout(Duration::from_secs(1200), async {
+        gemma4_audio_case(addr).await;
+    })
+    .await;
+    stack.shutdown().await;
+    finished.expect("the audio case finished inside its deadline");
 }
 
 /// The booted Gemma 4 stack, or `None` having printed why this machine cannot

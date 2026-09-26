@@ -1,0 +1,69 @@
+{
+  "weather-es": {
+    "url": "https://huggingface.co/datasets/hf-internal-testing/dummy-audio-samples/resolve/main/bcn_weather.mp3",
+    "source_sha256": "47f2f8c2382b7b78fa7e8427a0fc7d33e8f997a0a9a9bc93c803eba218813130",
+    "wav_sha256": "db01a348175d8a157a9f9be395ebacd6bfb84ea77e3eee40fc3d09114e7033eb",
+    "seconds": 30
+  },
+  "speech-en": {
+    "url": "https://huggingface.co/datasets/hf-internal-testing/dummy-audio-samples/resolve/main/obama.mp3",
+    "source_sha256": "e00596034c91110540ca2c37a79e0b8fdddd4d11a494ee069d213b6fe6e6d7b9",
+    "wav_sha256": "322287e3de36ebac2f1c4502efb49d021c06e5ae5ca63db90b72e7d43b675719",
+    "seconds": 30
+  },
+  "speech-en-odd": {
+    "derived_from": "speech-en",
+    "samples": 176641,
+    "wav_sha256": "245fb5aec01c8dbf03692ec5b09c5a744c237b344602a4a77247a971ccf3c031"
+  },
+  "two-speakers": {
+    "spliced_from": [
+      [
+        "speech-en",
+        0,
+        10
+      ],
+      [
+        "weather-es",
+        0,
+        10
+      ],
+      [
+        "speech-en",
+        10,
+        20
+      ],
+      [
+        "weather-es",
+        10,
+        20
+      ],
+      [
+        "speech-en",
+        20,
+        30
+      ]
+    ],
+    "wav_sha256": "21d1c52349d3926d7bbec56fb32ca015a12e27ec6c19202b8ce6c3d40fc75baf"
+  },
+  "long-dialogue": {
+    "spliced_from": [
+      [
+        "speech-en",
+        0,
+        30
+      ],
+      [
+        "weather-es",
+        0,
+        11
+      ],
+      [
+        "speech-en",
+        0,
+        30
+      ]
+    ],
+    "wav_sha256": "b3766a68c17e21e4a9046b9fbb0e813d638a3eb821d4d2582221f2333b4024b0"
+  }
+}

@@ -86,9 +86,12 @@ use shiso_ir::{EventStream, StopReason, StreamEvent};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::media::{MediaItem, MediaTowers};
 use crate::tokenizer::Vocabulary;
 use crate::vision::{EncodedMedia, VisionTower};
+use shiso_audio::AudioTower;
 use shiso_parsers::{ReasoningScheme, ToolCallScheme};
+use shiso_vision::EncodedRows;
 
 use batching::{PrefillStep, SlotTable};
 use cancel::{Delivery, send_all, send_event};
@@ -207,6 +210,10 @@ struct Coordinator {
     /// server: no tower was named, none was loaded, and a request that carries
     /// a picture is refused rather than answered from its words alone.
     vision: Option<VisionTower>,
+    /// The audio tower, when the tower container carries one. Shared with the
+    /// renderer, which reads its frontend and token rule; only this thread
+    /// runs it.
+    audio: Option<Arc<dyn AudioTower>>,
     vocabulary: Option<Arc<Vocabulary>>,
     /// The placeholder ids a prompt's media runs are written in, resolved once
     /// at boot from the tower's placement and this checkpoint's vocabulary.
@@ -292,7 +299,7 @@ pub fn spawn_engine_configured(
     start(
         backend,
         EngineModel::Plain(model),
-        None,
+        MediaTowers::default(),
         vocabulary,
         model_id,
         ctx,
@@ -320,12 +327,12 @@ pub fn spawn_engine_configured(
 /// As [`spawn_engine`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "the scheduler takes the device, the model, the vision tower, the vocabulary, the identity, the context size, the runtime config and the stream parsers"
+    reason = "the scheduler takes the device, the model, the media towers, the vocabulary, the identity, the context size, the runtime config and the stream parsers"
 )]
 pub fn spawn_engine_with_checkpoints(
     backend: Arc<dyn Backend>,
     model: Box<dyn Checkpointed>,
-    vision: Option<VisionTower>,
+    towers: MediaTowers,
     vocabulary: Option<Arc<Vocabulary>>,
     model_id: &str,
     ctx: u32,
@@ -335,7 +342,7 @@ pub fn spawn_engine_with_checkpoints(
     start(
         backend,
         EngineModel::Checkpointed(model),
-        vision,
+        towers,
         vocabulary,
         model_id,
         ctx,
@@ -347,12 +354,12 @@ pub fn spawn_engine_with_checkpoints(
 /// Builds the queue, the counters and the thread.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the scheduler takes the device, the model, the vision tower, the vocabulary, the identity, the context size, the runtime config and the stream parsers"
+    reason = "the scheduler takes the device, the model, the media towers, the vocabulary, the identity, the context size, the runtime config and the stream parsers"
 )]
 fn start(
     backend: Arc<dyn Backend>,
     mut model: EngineModel,
-    vision: Option<VisionTower>,
+    towers: MediaTowers,
     vocabulary: Option<Arc<Vocabulary>>,
     model_id: &str,
     ctx: u32,
@@ -365,6 +372,7 @@ fn start(
     let info = *model.as_model_mut().info();
     let vocab = usize::try_from(info.vocab).unwrap_or(usize::MAX);
     let max_num_seqs = cfg.max_num_seqs;
+    let MediaTowers { vision, audio } = towers;
     let pads = match (vision.as_ref(), vocabulary.as_ref()) {
         (Some(tower), Some(vocabulary)) => vocabulary.media_ids(&tower.placement()),
         _ => PadTokens::default(),
@@ -373,6 +381,7 @@ fn start(
         backend,
         model,
         vision,
+        audio,
         vocabulary,
         pads,
         model_id,
@@ -650,7 +659,13 @@ impl Coordinator {
         }
     }
 
-    /// Runs the tower over a request's media, or explains why it cannot.
+    /// Runs each item's tower over a request's media, or explains why it
+    /// cannot.
+    ///
+    /// Items are encoded one at a time in prompt order and gathered into one
+    /// block, because the splice consumes rows in the order the pad runs
+    /// appear and a picture and a clip interleave there. Both towers loop per
+    /// item inside anyway, so nothing is lost by not batching a kind.
     ///
     /// `Ok(None)` is a text-only request: nothing was attached, so nothing was
     /// encoded, and the sequence takes the launches it took before any of this
@@ -667,17 +682,52 @@ impl Coordinator {
                     .to_owned(),
             );
         }
-        let Some(tower) = self.vision.as_ref() else {
-            return Err(
-                "this server was started without a vision tower, so the attached media \
-                 cannot be looked at; start it with --vision naming the tower"
-                    .to_owned(),
-            );
-        };
         let started = Instant::now();
-        let encoded = tower
-            .encode(&self.backend, &request.media)
-            .map_err(|error| error.to_string())?;
+        let mut parts = Vec::with_capacity(request.media.len());
+        let mut grids = Vec::with_capacity(request.media.len());
+        let mut audio_pads = 0u32;
+        for item in request.media.iter() {
+            let encoded = match item {
+                MediaItem::Vision(item) => {
+                    let Some(tower) = self.vision.as_ref() else {
+                        return Err(
+                            "this server was started without a vision tower, so the attached \
+                             media cannot be looked at; start it with --vision naming the tower"
+                                .to_owned(),
+                        );
+                    };
+                    tower
+                        .encode_rows(&self.backend, std::slice::from_ref(item))
+                        .map_err(|error| error.to_string())?
+                }
+                MediaItem::Audio(clip) => {
+                    let Some(tower) = self.audio.as_ref() else {
+                        return Err(
+                            "this server has no audio tower, so the attached audio cannot be \
+                             heard; start it with --vision naming a container that carries one"
+                                .to_owned(),
+                        );
+                    };
+                    audio_pads =
+                        audio_pads.saturating_add(u32::try_from(clip.tokens()).unwrap_or(u32::MAX));
+                    tower
+                        .encode(&self.backend, std::slice::from_ref(clip))
+                        .map_err(|error| error.to_string())?
+                }
+            };
+            parts.push(encoded.rows);
+            grids.extend(encoded.grids);
+        }
+        let hidden = self.model.as_model_mut().info().hidden;
+        let row_bytes = u64::from(hidden).saturating_mul(4);
+        let encoded = if parts.len() == 1 {
+            let rows = parts.pop().ok_or_else(|| "no encoded rows".to_owned())?;
+            EncodedRows { rows, grids }
+        } else {
+            EncodedRows::gather(&self.backend, &parts, grids, row_bytes)
+                .map_err(|error| error.to_string())?
+        };
+        let encoded = EncodedMedia::from_rows(encoded).with_audio_pads(audio_pads);
         tracing::debug!(
             items = request.media.len(),
             rows = encoded.pad_total(),

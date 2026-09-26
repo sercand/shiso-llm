@@ -328,3 +328,42 @@ fn a_stream_of_two_images_splits_into_two_frames() {
     assert_eq!(frames[0].as_rgb8().get(..3), Some(&[1u8, 2, 3][..]));
     assert_eq!(frames[1].as_rgb8().get(..3), Some(&[4u8, 5, 6][..]));
 }
+
+#[test]
+fn run_decoder_returns_raw_output_for_arbitrary_output_args() {
+    if !have_decoder() {
+        return;
+    }
+    // A generated one-second sine through the audio arguments the audio crate
+    // will use. Raw f32 mono at 16 kHz is exactly 64000 bytes per second.
+    let wav = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+        ])
+        .args(["-ar", "16000", "-ac", "1", "-f", "wav", "pipe:1"])
+        .output()
+        .expect("the decoder generates a tone")
+        .stdout;
+    let out = super::run_decoder(
+        &enabled(),
+        &[
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+        ],
+        &wav,
+    )
+    .expect("the tone decodes");
+    assert_eq!(out.len(), 64_000);
+}

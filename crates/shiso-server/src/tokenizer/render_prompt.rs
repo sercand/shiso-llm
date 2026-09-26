@@ -29,13 +29,19 @@ use std::sync::Arc;
 
 use shiso_core::{PadTokens, TokenId, VisionConfig};
 use shiso_ir::{Effort, Request, ThinkingDirective};
-use shiso_vision::{FfmpegPolicy, ImageLimits, MediaPlacement, PreprocessSpec, VisionItem};
+use shiso_vision::{FfmpegPolicy, ImageLimits, MediaPlacement, PreprocessSpec};
+
+use shiso_audio::{AudioTower, DecodeLimits};
+
+use crate::media::MediaItem;
 
 use crate::error::AppError;
 use crate::tokenizer::Vocabulary;
 use crate::tokenizer::chat_render::{ChatTemplate, RenderFlags};
 use crate::tokenizer::jinja_helpers::ToolJsonStyle;
-use crate::tokenizer::message_preprocess::{MediaPolicy, expand_vision_pads, preprocess};
+use crate::tokenizer::message_preprocess::{
+    DEFAULT_AUDIO_LIMITS, MediaPolicy, MediaWraps, expand_media_pads, preprocess,
+};
 use crate::tokenizer::turn_replay::TurnReplay;
 
 /// A rendered prompt, in all three of the forms something downstream needs.
@@ -47,7 +53,7 @@ pub struct Rendered {
     /// The prompt text, byte for byte as the template produced it.
     pub text: String,
     /// The decoded media, in the order the prompt refers to it.
-    pub media: Vec<VisionItem>,
+    pub media: Vec<MediaItem>,
 }
 
 impl Rendered {
@@ -123,6 +129,8 @@ pub struct PromptRenderer {
     pads: PadTokens,
     /// The bracket ids, for a family that brackets an image's run.
     wrap: Option<(TokenId, TokenId)>,
+    /// The bracket around an audio clip's run.
+    audio_wrap: Option<(TokenId, TokenId)>,
     limits: ImageLimits,
     allow_remote: bool,
     ffmpeg: Option<FfmpegPolicy>,
@@ -131,6 +139,10 @@ pub struct PromptRenderer {
     effort: EffortSpelling,
     /// Finished turns whose ids a prompt extending them reuses, when kept.
     replay: Option<Arc<TurnReplay>>,
+    /// The audio tower whose frontend and token rule size a clip's pad run.
+    audio: Option<Arc<dyn AudioTower>>,
+    audio_limits: DecodeLimits,
+    audio_ffmpeg: Option<FfmpegPolicy>,
 }
 
 impl PromptRenderer {
@@ -156,6 +168,7 @@ impl PromptRenderer {
             vision: None,
             pads: PadTokens::default(),
             wrap: None,
+            audio_wrap: None,
             limits: ImageLimits::default(),
             allow_remote: false,
             ffmpeg: None,
@@ -163,6 +176,9 @@ impl PromptRenderer {
             thinking_default: true,
             effort: EffortSpelling::STANDARD,
             replay: None,
+            audio: None,
+            audio_limits: DEFAULT_AUDIO_LIMITS,
+            audio_ffmpeg: None,
         })
     }
 
@@ -225,6 +241,7 @@ impl PromptRenderer {
             );
         }
         self.wrap = self.vocabulary.wrap_ids(&placement);
+        self.audio_wrap = self.vocabulary.audio_wrap_ids(&placement);
         if self.wrap.is_none() && placement.wrap_image.is_some() {
             tracing::warn!(
                 "this family brackets an image's pad run but this vocabulary declares no \
@@ -233,6 +250,35 @@ impl PromptRenderer {
         }
         self.vision = Some(spec.clone());
         self.limits = limits;
+        self
+    }
+
+    /// The same renderer with an audio tower attached.
+    ///
+    /// The placement is resolved again here, as [`Self::with_tower`] does,
+    /// because the audio marker and its bracket are ids in the same
+    /// vocabulary and a clip rendered with no pad id resolved is a pad run the
+    /// expansion cannot find.
+    #[must_use]
+    pub fn with_audio_tower(
+        mut self,
+        tower: Arc<dyn AudioTower>,
+        placement: MediaPlacement,
+        limits: DecodeLimits,
+        ffmpeg: Option<FfmpegPolicy>,
+    ) -> Self {
+        self.pads = self.vocabulary.media_ids(&placement);
+        self.audio_wrap = self.vocabulary.audio_wrap_ids(&placement);
+        if self.pads.audio().is_none() {
+            tracing::warn!(
+                marker = placement.audio_marker,
+                "this checkpoint's vocabulary declares no audio marker; a prompt carrying \
+                 a clip will have nowhere to put its rows"
+            );
+        }
+        self.audio = Some(tower);
+        self.audio_limits = limits;
+        self.audio_ffmpeg = ffmpeg;
         self
     }
 
@@ -303,6 +349,9 @@ impl PromptRenderer {
             allow_remote: self.allow_remote,
             ffmpeg: self.ffmpeg.as_ref(),
             video_fps: self.video_fps,
+            audio: self.audio.as_deref(),
+            audio_limits: self.audio_limits,
+            audio_ffmpeg: self.audio_ffmpeg.as_ref(),
         };
         let prepared = preprocess(&request.system, &request.messages, &policy)
             .map_err(|error| AppError::bad_request(error.to_string(), None, "invalid_media"))?;
@@ -327,8 +376,26 @@ impl PromptRenderer {
         let tokens = self
             .encode_with_replay(&text, prepared.media.is_empty())
             .map_err(|error| AppError::internal("encoding the rendered prompt", error))?;
-        let tokens = expand_vision_pads(tokens, &prepared.pad_counts, self.pads, self.wrap)
-            .map_err(|error| AppError::internal("expanding the media pad markers", error))?;
+        let wraps = MediaWraps {
+            image: self.wrap,
+            audio: self.audio_wrap,
+        };
+        let tokens =
+            expand_media_pads(tokens, &prepared.pad_counts, self.pads, wraps).map_err(|error| {
+                // The template writes one marker per item, so a count that
+                // disagrees came from the caller: marker text written into a
+                // message, or media in a turn the template does not render.
+                AppError::bad_request(
+                    format!(
+                        "the prompt holds {} media marker(s) for {} attached item(s); a message \
+                         must not contain a media marker as text, and media is accepted only \
+                         where this model's template renders it",
+                        error.markers, error.items
+                    ),
+                    Some("messages"),
+                    "invalid_media",
+                )
+            })?;
 
         Ok(Rendered {
             tokens,

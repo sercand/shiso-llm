@@ -507,3 +507,51 @@ fn a_zero_prefill_width_is_refused() {
         assert!(error.to_string().contains(&flag[2..]), "{flag}: {error}");
     }
 }
+
+#[test]
+fn an_audio_only_server_needs_no_language_model() {
+    let args = parse(&["--asr-model", "/models/nemotron-asr"]).expect("the ASR alone parses");
+    assert!(args.model.is_none());
+    args.validate().expect("an ASR alone is servable");
+    assert_eq!(args.asr_id().as_deref(), Some("nemotron-asr"));
+    assert_eq!(args.asr_lookahead, 13);
+    assert_eq!(args.audio_max_streams, 4);
+    assert_eq!(args.audio_max_seconds.get(), 1800);
+}
+
+#[test]
+fn a_server_with_neither_model_is_refused() {
+    let error = parse(&[])
+        .expect("parses")
+        .validate()
+        .expect_err("nothing to serve");
+    let text = error.to_string();
+    assert!(
+        text.contains("--model") && text.contains("--asr-model"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_diarizer_without_a_recognizer_is_refused() {
+    let error = parse(&["--model", "m.gguf", "--diarization-model", "/models/diar"])
+        .expect("parses")
+        .validate()
+        .expect_err("a diarizer has nothing to attribute");
+    assert!(error.to_string().contains("--asr-model"), "{error}");
+}
+
+#[test]
+fn zero_audio_streams_is_refused() {
+    let error = parse(&["--asr-model", "/a", "--audio-max-streams", "0"])
+        .expect("parses")
+        .validate()
+        .expect_err("zero streams serves nothing");
+    assert!(error.to_string().contains("audio-max-streams"), "{error}");
+}
+
+#[test]
+fn the_asr_id_can_be_named() {
+    let args = parse(&["--asr-model", "/models/asr/mlx", "--asr-id", "nemotron"]).expect("parses");
+    assert_eq!(args.asr_id().as_deref(), Some("nemotron"));
+}

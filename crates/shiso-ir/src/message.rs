@@ -125,6 +125,7 @@ impl Message {
         self.content.iter().filter_map(|block| match block {
             Block::Image(source) => Some((MediaKind::Image, source)),
             Block::Video(source) => Some((MediaKind::Video, source)),
+            Block::Audio(source) => Some((MediaKind::Audio, source)),
             _ => None,
         })
     }
@@ -160,6 +161,9 @@ pub enum Block {
     /// A video. Distinct from an image because the marker and the pad-token count
     /// differ, not because the bytes arrive differently.
     Video(MediaSource),
+    /// A sound clip. The bytes are a container the decoder sniffs; the model
+    /// hears them through its own audio tower.
+    Audio(MediaSource),
     /// Output withheld by a safety decision, with the text shown instead.
     Refusal(String),
 }
@@ -249,6 +253,8 @@ pub enum MediaKind {
     Image,
     /// A video.
     Video,
+    /// A sound clip.
+    Audio,
 }
 
 /// Where a media item's bytes come from.

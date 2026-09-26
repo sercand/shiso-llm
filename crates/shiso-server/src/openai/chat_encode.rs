@@ -70,12 +70,13 @@ pub fn encode_usage(usage: &Usage) -> Value {
         "total_tokens": usage.prompt_tokens.saturating_add(usage.completion_tokens),
         "prompt_tokens_details": {
             "cached_tokens": usage.cached_prompt_tokens,
-            // This server serves no audio, and the field is present rather than
-            // absent because a client that sums the details expects it to be.
-            "audio_tokens": 0,
+            "audio_tokens": usage.audio_prompt_tokens,
         },
         "completion_tokens_details": {
             "reasoning_tokens": usage.reasoning_tokens,
+            // Nothing this server generates is audio, and the field is present
+            // rather than absent because a client that sums the details
+            // expects it to be.
             "audio_tokens": 0,
             "accepted_prediction_tokens": usage.accepted_prediction_tokens,
             "rejected_prediction_tokens": 0,
@@ -248,6 +249,18 @@ mod tests {
             body.get("token_ids").is_none(),
             "the ids ride only when they were asked for"
         );
+    }
+
+    #[test]
+    fn the_audio_share_of_the_prompt_is_its_pad_run() {
+        let usage = encode_usage(&Usage {
+            prompt_tokens: 774,
+            audio_prompt_tokens: 750,
+            ..Usage::default()
+        });
+        assert_eq!(usage["prompt_tokens_details"]["audio_tokens"], 750);
+        // Nothing this server generates is audio.
+        assert_eq!(usage["completion_tokens_details"]["audio_tokens"], 0);
     }
 
     /// One request, one turn: the list exists because the format demands one,

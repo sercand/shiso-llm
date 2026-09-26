@@ -11,6 +11,9 @@ description = "shiso: every checkpoint family this build serves - each family's 
 # The shared vocabulary: the `Model` contract, device memory, ids, errors. It
 # names no checkpoint family, which is why this crate exists.
 shiso-core = { workspace = true }
+# The audio families implement the host audio crate's contracts and report its
+# typed errors.
+shiso-audio = { workspace = true }
 # The machinery: the hybrid and sparse stacks, their scratch, the paged cache
 # adapter and the sampler. This crate supplies each family's identity - which
 # document describes the checkpoint, what its tensors are called, which token
@@ -61,6 +64,11 @@ shiso-kvstore = { workspace = true }
 # The Metal run of the MLX checkpoint reports its per-step diagnostics through
 # the engine's own tracing, which a test has to install a subscriber to see.
 tracing-subscriber = { workspace = true }
+
+# The CUDA twin of the device the model tests run on, on the machines that
+# have one.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+shiso-cuda = { workspace = true }
 
 [lints]
 workspace = true

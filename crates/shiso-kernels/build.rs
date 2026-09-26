@@ -93,6 +93,12 @@ fn load_plan(kernels_root: &Path) -> LanePlan {
     for manifest in &plan.manifests {
         println!("cargo:rerun-if-changed={}", manifest.display());
     }
+    // The root too, which cargo scans recursively: the directories below are
+    // the ones this run found, and a kernel directory added later is a new
+    // module no watch on an existing directory would notice - the build then
+    // keeps embedding a registry that lacks it and every launch into it fails
+    // at run time with "this build embeds no kernel module".
+    println!("cargo:rerun-if-changed={}", plan.root.display());
     // Watching each directory rather than each source catches a changed header
     // too, and every file in these directories is either a unit or a header one
     // of them includes.

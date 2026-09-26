@@ -842,11 +842,15 @@ pub(crate) unsafe fn launch_cooperative(
 
 /// Puts `stream` into capture mode.
 ///
-/// The mode is the strict one: any work submitted to another stream while this
-/// capture is running fails the capture instead of being silently left out of
-/// the graph. This backend has exactly one capture stream and no cross-stream
-/// work, so the strict mode costs nothing and turns a whole class of "the graph
-/// replayed but did less than the eager pass" bug into an immediate error.
+/// The mode is thread-local: on the capturing thread any potentially unsafe
+/// call - an allocation, work submitted outside the capture - fails instead of
+/// being silently left out of the graph, which turns a whole class of "the
+/// graph replayed but did less than the eager pass" bug into an immediate
+/// error. It is not the global mode, which forbids those calls on *every*
+/// thread of the process: another thread driving its own backend instance
+/// (the speech models beside the language model) has nothing to do with this
+/// capture, and under the global mode each of its allocations failed while
+/// one ran.
 ///
 /// # Safety
 ///
@@ -861,7 +865,7 @@ pub(crate) unsafe fn stream_begin_capture(stream: CuStream) -> SysResult<()> {
     check("cuStreamBeginCapture", unsafe {
         cu::cuStreamBeginCapture_v2(
             stream.raw() as cu::CUstream,
-            cu::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+            cu::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
         )
     })
 }

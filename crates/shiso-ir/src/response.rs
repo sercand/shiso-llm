@@ -120,6 +120,8 @@ pub struct Usage {
     pub completion_tokens: u64,
     /// Prompt tokens answered from the cache rather than computed.
     pub cached_prompt_tokens: u64,
+    /// Prompt tokens that are audio soft tokens: the pad runs of the clips.
+    pub audio_prompt_tokens: u64,
     /// Generated tokens that were part of a thinking block.
     pub reasoning_tokens: u64,
     /// Speculated tokens the verify step accepted. Zero when speculation is off.

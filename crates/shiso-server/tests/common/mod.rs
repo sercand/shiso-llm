@@ -714,7 +714,7 @@ pub(crate) fn checkpointed_engine_hitting(
     let (engine, join) = spawn_engine_with_checkpoints(
         backend,
         Box::new(model),
-        None,
+        shiso_server::media::MediaTowers::default(),
         None,
         "fake-model",
         CAPACITY,
@@ -748,7 +748,7 @@ pub(crate) fn parsed_engine(
     spawn_engine_with_checkpoints(
         backend,
         Box::new(model),
-        None,
+        shiso_server::media::MediaTowers::default(),
         vocabulary,
         "fake-model",
         CAPACITY,

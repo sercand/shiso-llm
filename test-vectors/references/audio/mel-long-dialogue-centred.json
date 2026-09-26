@@ -1,0 +1,11 @@
+{
+  "clip": "long-dialogue",
+  "style": "centred",
+  "frames_total": 7100,
+  "frames_valid": 7100,
+  "n_mels": 128,
+  "transformers": "5.18.0.dev0",
+  "torch": "2.11.0",
+  "extractor": "NemotronAsrStreamingFeatureExtractor",
+  "source_dir": "/Users/sercand/models/Nemotron-3-Diarization/nvidia"
+}

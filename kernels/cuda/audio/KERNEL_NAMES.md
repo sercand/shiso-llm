@@ -1,0 +1,46 @@
+# audio entry-point names
+
+The lookup table a loader resolves a kernel through. The module is loaded by
+its registry key, `audio`; every entry carries C linkage, so each name below is
+the name the driver answers to, verbatim. The same twenty-two names are the
+Metal twin's (`crates/shiso-metal/metal/audio`) and the host's literals in
+`crates/shiso-models/src/audio_ops`; `shiso_kerneltest::audio::cases::ENTRIES`
+holds them, and `crates/shiso-cuda/tests/audio_kernels.rs` resolves every one.
+
+## Module `audio` — 33 entries
+
+```
+kernel_audio_unary_f32
+kernel_audio_axpy_f32
+kernel_audio_glu_f32
+kernel_audio_bias_rows_f32
+kernel_audio_argmax_rows_f32
+kernel_audio_layer_norm_f32
+kernel_audio_rms_norm_f32
+kernel_audio_gemm_f32w
+kernel_audio_gemm_bf16w
+kernel_audio_gemm_f16w
+kernel_audio_gemm_q8_0w
+kernel_audio_gemm64_f32w
+kernel_audio_gemm64_bf16w
+kernel_audio_gemm64_f16w
+kernel_audio_gemm64_q8_0w
+kernel_audio_gemv_f32w
+kernel_audio_gemv_bf16w
+kernel_audio_gemv_f16w
+kernel_audio_gemv_q8_0w
+kernel_audio_split_sum_f32
+kernel_audio_conv2d_s2_f32
+kernel_audio_dwconv1d_f32
+kernel_audio_unfold_f32
+kernel_audio_transpose_f32
+kernel_audio_window_attn_f32
+kernel_audio_rel_scores_f32
+kernel_audio_rope_half_f32
+kernel_audio_lstm_cell_f32
+kernel_audio_greedy_window_f32
+kernel_audio_greedy_step_u32
+kernel_audio_embed_row_f32
+kernel_audio_lstm_cell_gated_f32
+kernel_audio_keep_f32
+```

@@ -1,0 +1,78 @@
+{
+  "clip": "two-speakers",
+  "mel_frames": 4104,
+  "encoder_frames": 513,
+  "step0_frames": 380,
+  "steps": 2,
+  "speakers": 8,
+  "speakers_active": [
+    0,
+    1
+  ],
+  "segments_at_0_5": [
+    [
+      0,
+      81,
+      551
+    ],
+    [
+      0,
+      602,
+      809
+    ],
+    [
+      0,
+      900,
+      1000
+    ],
+    [
+      1,
+      1093,
+      1702
+    ],
+    [
+      1,
+      1790,
+      1959
+    ],
+    [
+      0,
+      2008,
+      2092
+    ],
+    [
+      0,
+      2177,
+      2477
+    ],
+    [
+      0,
+      2544,
+      2804
+    ],
+    [
+      0,
+      2856,
+      3000
+    ],
+    [
+      0,
+      3153,
+      3395
+    ],
+    [
+      0,
+      3441,
+      3723
+    ],
+    [
+      0,
+      3801,
+      4104
+    ]
+  ],
+  "mode": "offline",
+  "transformers": "5.18.0.dev0",
+  "torch": "2.11.0",
+  "source_dir": "/Users/sercand/models/Nemotron-3-Diarization/nvidia"
+}

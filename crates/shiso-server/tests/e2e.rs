@@ -132,8 +132,13 @@ impl Stack {
         args.validate().expect("the command line is servable");
         let backend: Arc<dyn Backend> = shiso_metal::MetalBackend::new().expect("a Metal device");
         let parsed = shiso_core::HfConfig::from_file(&args.config_path()).expect("the config");
-        let loaded = shiso_server::model_factory::load_model(&backend, &args.model, &parsed, &args)
-            .expect("the checkpoint loads");
+        let loaded = shiso_server::model_factory::load_model(
+            &backend,
+            args.model.as_deref().expect("this test passes --model"),
+            &parsed,
+            &args,
+        )
+        .expect("the checkpoint loads");
         let model = loaded.model;
         let defaults = loaded.defaults;
         let vocabulary = Arc::new(
@@ -154,7 +159,7 @@ impl Stack {
         let (engine, join) = spawn_engine_with_checkpoints(
             backend,
             model,
-            None,
+            shiso_server::media::MediaTowers::default(),
             Some(Arc::clone(&vocabulary)),
             &model_id,
             args.ctx,

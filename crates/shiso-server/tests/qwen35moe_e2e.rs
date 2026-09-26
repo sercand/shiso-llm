@@ -177,10 +177,16 @@ impl Stack {
         let shiso_server::model_factory::Loaded {
             model: mut loaded,
             open_tower,
+            open_audio: _,
             placement,
             defaults,
-        } = shiso_server::model_factory::load_model(backend, &args.model, &parsed, &args)
-            .expect("the checkpoint loads");
+        } = shiso_server::model_factory::load_model(
+            backend,
+            args.model.as_deref().expect("this test passes --model"),
+            &parsed,
+            &args,
+        )
+        .expect("the checkpoint loads");
         assert!(
             !defaults.speculates,
             "this family binds no draft head; `speculates` must stay false or --spec-k \
@@ -235,7 +241,10 @@ impl Stack {
         let (engine, join) = spawn_engine_with_checkpoints(
             Arc::clone(backend),
             loaded,
-            tower,
+            shiso_server::media::MediaTowers {
+                vision: tower,
+                audio: None,
+            },
             Some(Arc::clone(&vocabulary)),
             &model_id,
             args.ctx,

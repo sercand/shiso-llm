@@ -161,3 +161,7 @@ metal = []
 
 [lints]
 workspace = true
+
+[[test]]
+name = "audio_kernels"
+path = "tests/audio_kernels.rs"

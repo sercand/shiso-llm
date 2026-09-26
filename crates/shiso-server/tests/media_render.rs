@@ -16,7 +16,7 @@ use shiso_ir::{Block, MediaSource, Message, Request, Role};
 use shiso_server::tokenizer::Vocabulary;
 use shiso_server::tokenizer::jinja_helpers::ToolJsonStyle;
 use shiso_server::tokenizer::message_preprocess::{
-    MediaPolicy, PreprocessError, expand_vision_pads, preprocess,
+    MediaPolicy, MediaWraps, PreprocessError, expand_media_pads, expand_vision_pads, preprocess,
 };
 use shiso_server::tokenizer::render_prompt::PromptRenderer;
 use shiso_vision::{ImageLimits, MediaPlacement, PatchGeometry, PreprocessSpec};
@@ -300,6 +300,41 @@ fn image_and_video_markers_both_expand() {
     assert_eq!(ids, vec![9, 9, 1, 10, 10, 10]);
 }
 
+/// An image and two audio clips expand in prompt order, each bracketed by its
+/// own pair, and the audio pad is matched although it is neither the image nor
+/// the video marker.
+#[test]
+fn image_and_audio_markers_expand_in_order_with_their_own_brackets() {
+    let (image, audio) = (TokenId::new(9), TokenId::new(11));
+    let wraps = MediaWraps {
+        image: Some((TokenId::new(20), TokenId::new(21))),
+        audio: Some((TokenId::new(30), TokenId::new(31))),
+    };
+    let pads = PadTokens::new(Some(image), None).with_audio(Some(audio));
+    assert!(pads.matches(audio));
+    let expanded = expand_media_pads(
+        vec![image, TokenId::new(1), audio, audio],
+        &[2, 3, 1],
+        pads,
+        wraps,
+    )
+    .expect("the counts match");
+    let ids: Vec<u32> = expanded.iter().map(|token| token.get()).collect();
+    assert_eq!(ids, vec![20, 9, 9, 21, 1, 30, 11, 11, 11, 31, 30, 11, 31]);
+}
+
+/// Gemma 4's placement declares the audio marker and its bracket; Qwen's
+/// declares neither.
+#[test]
+fn the_family_placements_declare_audio_where_the_family_hears() {
+    assert_eq!(MediaPlacement::GEMMA4.audio_marker, Some("<|audio|>"));
+    assert_eq!(
+        MediaPlacement::GEMMA4.wrap_audio,
+        Some(("<|audio>", "<audio|>"))
+    );
+    assert_eq!(MediaPlacement::QWEN35.audio_marker, None);
+}
+
 // --- the bracketed placement -----------------------------------------------
 
 /// The bracket ids the fake vocabulary below gives Gemma's two wrap markers.
@@ -450,4 +485,38 @@ fn the_bracket_is_written_around_the_image_run_only() {
     .expect("the counts match");
     let ids: Vec<u32> = expanded.iter().map(|token| token.get()).collect();
     assert_eq!(ids, vec![OPEN, MARKER, MARKER, CLOSE, 1, 9, 9]);
+}
+
+/// A caller who writes a media marker as text has made a request error, not a
+/// server one: the vocabulary turns the marker text into the pad id, and the
+/// run then has no item. That is answered as a 400 saying so.
+#[test]
+fn marker_text_in_a_message_is_a_request_error() {
+    let renderer = PromptRenderer::new(
+        WRAPPING_TEMPLATE,
+        ToolJsonStyle::Compact,
+        wrapping_vocabulary(),
+    )
+    .expect("the tiny template compiles")
+    .with_tower(
+        &one_token_spec(),
+        MediaPlacement::GEMMA4,
+        ImageLimits::default(),
+    );
+    let request = Request::new(
+        "test",
+        vec![Message::user(format!(
+            "word {} word",
+            MediaPlacement::GEMMA4.image_marker
+        ))],
+    );
+    let error = renderer
+        .render(&request)
+        .expect_err("a marker with no item cannot be expanded");
+    assert_eq!(
+        error.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "got {error:?}"
+    );
+    assert!(error.to_string().contains("marker"), "{error}");
 }

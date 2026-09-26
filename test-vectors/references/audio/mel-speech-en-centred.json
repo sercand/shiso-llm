@@ -1,0 +1,11 @@
+{
+  "clip": "speech-en",
+  "style": "centred",
+  "frames_total": 3001,
+  "frames_valid": 3000,
+  "n_mels": 128,
+  "transformers": "5.18.0.dev0",
+  "torch": "2.11.0",
+  "extractor": "NemotronAsrStreamingFeatureExtractor",
+  "source_dir": "/Users/sercand/models/nemotron-3.5-asr-streaming-0.6b/nvidia"
+}

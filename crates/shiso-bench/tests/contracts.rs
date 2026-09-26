@@ -190,6 +190,63 @@ fn usage_counts(usage: &Usage) -> (u64, u64, u64, u64) {
 }
 const _: fn(&Usage) -> (u64, u64, u64, u64) = usage_counts;
 
+// ---------------------------------------------------------------------------
+// Speech.
+//
+// The recognizer, the diarizer and the audio tower are held as trait objects
+// by the server's audio worker and engine thread, and each family opens its
+// own; losing object safety, or a second token type on the recognizer's
+// seam, would surface here rather than in the worker.
+
+const _: Option<&dyn shiso_audio::SpeechRecognizer> = None;
+const _: Option<&dyn shiso_audio::RecognizerStream> = None;
+const _: Option<&dyn shiso_audio::Diarizer> = None;
+const _: Option<&dyn shiso_audio::DiarizationPass> = None;
+const _: Option<&dyn shiso_audio::AudioTower> = None;
+
+/// A recognized token is the one `TokenId`, at an encoder frame.
+fn token_event_fields(event: shiso_audio::TokenEvent) -> (TokenId, u32) {
+    (event.token, event.frame)
+}
+const _: fn(shiso_audio::TokenEvent) -> (TokenId, u32) = token_event_fields;
+
+/// A stream is fed mel frames and answers timed tokens.
+type RecognizerPush = fn(
+    &mut (dyn shiso_audio::RecognizerStream + 'static),
+    &shiso_audio::MelFrames,
+) -> Result<Vec<shiso_audio::TokenEvent>, shiso_audio::AudioError>;
+const _: RecognizerPush = <dyn shiso_audio::RecognizerStream>::push;
+
+/// A diarizer answers one whole clip with one activity block.
+type Diarize = fn(
+    &(dyn shiso_audio::Diarizer + 'static),
+    &shiso_audio::MelFrames,
+) -> Result<shiso_audio::transcript::SpeakerActivity, shiso_audio::AudioError>;
+const _: Diarize = <dyn shiso_audio::Diarizer>::diarize;
+
+/// An audio tower's rows are the vision towers' block type, so the engine
+/// splices both through one path.
+type AudioEncode = fn(
+    &(dyn shiso_audio::AudioTower + 'static),
+    &std::sync::Arc<dyn Backend>,
+    &[shiso_audio::AudioClip],
+) -> Result<shiso_vision::EncodedRows, shiso_audio::AudioError>;
+const _: AudioEncode = <dyn shiso_audio::AudioTower>::encode;
+
+/// The openers the server calls, one per role, each trying every family.
+type OpenRecognizer =
+    fn(
+        &std::path::Path,
+        &std::sync::Arc<dyn Backend>,
+    ) -> Result<std::sync::Arc<dyn shiso_audio::SpeechRecognizer>, shiso_audio::AudioError>;
+const _: OpenRecognizer = shiso_models::audio_registry::open_speech_recognizer;
+type OpenDiarizer =
+    fn(
+        &std::path::Path,
+        &std::sync::Arc<dyn Backend>,
+    ) -> Result<std::sync::Arc<dyn shiso_audio::Diarizer>, shiso_audio::AudioError>;
+const _: OpenDiarizer = shiso_models::audio_registry::open_diarizer;
+
 /// The contracts above are checked by the compiler, so this file building at
 /// all is the result. The test exists so a target that stopped being built
 /// shows up as a missing test rather than as silence.

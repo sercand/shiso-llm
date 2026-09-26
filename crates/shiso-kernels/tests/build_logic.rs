@@ -165,6 +165,7 @@ fn the_real_manifest_tree_parses() {
     assert_eq!(
         sorted,
         [
+            "audio",
             "dense",
             "exl3",
             "generic",

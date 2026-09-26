@@ -1205,15 +1205,6 @@ const EXT_Q6_K: [Option<&str>; 5] = [
     Some("kernel_mul_mv_ext_q6_K_f32_r1_5"),
 ];
 
-/// The `f16` instantiations of the same family.
-const EXT_F16: [Option<&str>; 5] = [
-    None,
-    Some("kernel_mul_mv_ext_f16_f32_r1_2"),
-    Some("kernel_mul_mv_ext_f16_f32_r1_3"),
-    Some("kernel_mul_mv_ext_f16_f32_r1_4"),
-    Some("kernel_mul_mv_ext_f16_f32_r1_5"),
-];
-
 /// One plain-matvec launch: the entry point plus the geometry it was compiled
 /// for.
 ///
@@ -1372,7 +1363,10 @@ pub const fn ext_name(dtype: DType, r1ptg: u32) -> Option<&'static str> {
         DType::Q8_0 => EXT_Q8_0,
         DType::Q5_K => EXT_Q5_K,
         DType::Q6_K => EXT_Q6_K,
-        DType::F16 => EXT_F16,
+        // `f16` has no extended instantiation on either backend, and a row here
+        // named four kernels no library holds: every chunk of two to five tokens
+        // over an `f16` weight failed in the driver. It takes the plain matvec
+        // at every width below the GEMM, as the by-name backend always has.
         _ => return None,
     };
     if r1ptg == 0 || r1ptg > 5 {

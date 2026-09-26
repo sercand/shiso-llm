@@ -262,6 +262,20 @@ impl Index {
                 .page_file_bytes
                 .saturating_mul(u64::try_from(new_pages).unwrap_or(u64::MAX)),
         );
+        // Built before the budget pass because it is context for the pricing:
+        // the entry being offered subsumes a shallower one on its path, and
+        // without it that one would be priced as though nothing covered it.
+        let incoming = EntryMeta {
+            pos: offer.pos,
+            pages: offer.pages.to_vec(),
+            has_logits: offer.has_logits,
+            bytes: offer.entry_bytes,
+            created_at: offer.now,
+            last_used: 0,
+            hits: 0,
+            durable: false,
+            foreign: false,
+        };
         let mut accepted = Accepted::default();
         let refusal = NotAccepted::OverBudget {
             required,
@@ -272,7 +286,7 @@ impl Index {
                 if self.durable_bytes + self.reserved_bytes + required <= self.budget {
                     break true;
                 }
-                let Some(victim) = self.victim(offer.now) else {
+                let Some(victim) = self.victim(offer.now, Some(&incoming)) else {
                     break false;
                 };
                 accepted.deletions.extend(self.release(&victim));
@@ -305,20 +319,7 @@ impl Index {
             self.reserved_bytes += offer.page_file_bytes;
         }
         self.reserved_bytes += offer.entry_bytes;
-        self.entries.insert(
-            offer.key,
-            EntryMeta {
-                pos: offer.pos,
-                pages: offer.pages.to_vec(),
-                has_logits: offer.has_logits,
-                bytes: offer.entry_bytes,
-                created_at: offer.now,
-                last_used: 0,
-                hits: 0,
-                durable: false,
-                foreign: false,
-            },
-        );
+        self.entries.insert(offer.key, incoming);
         Ok(accepted)
     }
 
@@ -476,15 +477,17 @@ impl Index {
 
     /// The entry the budget pass releases first: another build's before any of
     /// this one's, then the lowest utility, the key breaking a tie so the pass
-    /// is deterministic.
-    fn victim(&self, now: u64) -> Option<EntryKey> {
-        // Every entry of this build, pending ones included, is context for the
-        // pricing: a deeper entry still on its way to disk already subsumes a
-        // shallower one on the same path.
+    /// is deterministic. `incoming` is an entry being accepted that is not in
+    /// the index yet; it is priced as context but is never the victim.
+    fn victim(&self, now: u64, incoming: Option<&EntryMeta>) -> Option<EntryKey> {
+        // Every entry of this build, pending ones and the incoming one
+        // included, is context for the pricing: a deeper entry still on its way
+        // to disk already subsumes a shallower one on the same path.
         let context: Vec<&EntryMeta> = self
             .entries
             .values()
             .filter(|entry| !entry.foreign)
+            .chain(incoming)
             .collect();
         let mut best: Option<(EntryKey, f64)> = None;
         for (key, entry) in self.entries.iter().filter(|(_, entry)| entry.durable) {
@@ -693,7 +696,7 @@ impl Index {
     pub(crate) fn fit_budget(&mut self, now: u64) -> Vec<PathBuf> {
         let mut deletions = Vec::new();
         while self.durable_bytes + self.reserved_bytes > self.budget {
-            let Some(victim) = self.victim(now) else {
+            let Some(victim) = self.victim(now, None) else {
                 break;
             };
             deletions.extend(self.release(&victim));
@@ -761,8 +764,15 @@ mod tests {
 
     /// Accepts and lands one entry and its pages, as the writer would.
     fn land(index: &mut Index, keys: &PathKeys<'_>, pos: u32) {
+        land_at(index, keys, pos, 1000);
+    }
+
+    /// [`land`], offered at `now`.
+    fn land_at(index: &mut Index, keys: &PathKeys<'_>, pos: u32, now: u64) {
         let pages = keys.pages_to(pos);
-        index.accept(&offer_for(keys, pos, &pages)).expect("fits");
+        let mut offer = offer_for(keys, pos, &pages);
+        offer.now = now;
+        index.accept(&offer).expect("fits");
         for page in &pages {
             if index.claim_page(page) {
                 assert!(index.page_written(page, PAGE_FILE).is_none());
@@ -892,6 +902,32 @@ mod tests {
             "the read one stayed"
         );
         assert!(!index.knows(&kb.entry_at(8).expect("inside")));
+    }
+
+    #[test]
+    fn the_entry_an_offer_subsumes_goes_before_an_older_lone_one() {
+        // The offer at 16 is what subsumes the entry at 8 on its path, and it
+        // is not in the index until the budget pass has made room for it. The
+        // lone entry is a second older, which alone would make it the victim.
+        let dir = tempfile::tempdir().expect("dir");
+        let entry = 2 * PAGE_FILE + ENTRY_FILE;
+        let mut index = Index::empty(dir.path(), 3 * entry - 10, pricing());
+        let lone = path(100, 8);
+        let turn = path(0, 16);
+        let k_lone = PathKeys::new(Identity::from_bytes([1; 20]), &lone, 4);
+        let k_turn = PathKeys::new(Identity::from_bytes([1; 20]), &turn, 4);
+        land_at(&mut index, &k_lone, 8, 1000);
+        land_at(&mut index, &k_turn, 8, 1001);
+        let pages = k_turn.pages_to(16);
+        let mut offer = offer_for(&k_turn, 16, &pages);
+        offer.now = 1002;
+        let accepted = index.accept(&offer).expect("room was made");
+        assert_eq!(accepted.evicted, 1);
+        assert!(
+            index.knows(&k_lone.entry_at(8).expect("inside")),
+            "the lone entry stayed"
+        );
+        assert!(!index.knows(&k_turn.entry_at(8).expect("inside")));
     }
 
     #[test]

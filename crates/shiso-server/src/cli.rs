@@ -15,7 +15,7 @@
 //! onto the types the media layer takes, and [`ServeArgs::ffmpeg_policy`] is the
 //! only place that mapping happens.
 
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use shiso_parsers::{ReasoningScheme, ToolCallScheme};
@@ -79,9 +79,11 @@ pub enum Command {
     reason = "each one is a separate on-off policy an operator sets on the command line, and a state machine over four independent switches would be sixteen states nobody asked for"
 )]
 pub struct ServeArgs {
-    /// Checkpoint to serve. Either a checkpoint file or a checkpoint directory.
+    /// Language model checkpoint to serve. Either a checkpoint file or a
+    /// checkpoint directory. Optional when `--asr-model` is given: a server
+    /// can serve transcription alone.
     #[arg(short = 'm', long, env = "SHISO_MODEL")]
-    pub model: PathBuf,
+    pub model: Option<PathBuf>,
     /// The name this checkpoint answers to on the wire. Defaults to the last
     /// component of `--model`, with any extension removed.
     ///
@@ -403,6 +405,36 @@ pub struct ServeArgs {
     /// Wall-clock budget for one decode, in seconds.
     #[arg(long, env = "SHISO_VIDEO_DECODE_TIMEOUT_S", default_value_t = 20)]
     pub video_decode_timeout_s: u64,
+    /// The longest audio clip one request may carry, in seconds.
+    ///
+    /// Checked on the decoded length, before any mel frame is computed. A
+    /// tower's own limit still applies beneath it.
+    #[arg(long, env = "SHISO_AUDIO_MAX_SECONDS", default_value = "1800")]
+    pub audio_max_seconds: NonZeroU32,
+    /// Allow decoding audio containers other than WAV by spawning the decoder
+    /// `--video-ffmpeg-path` names.
+    #[arg(long, env = "SHISO_AUDIO_ALLOW_FFMPEG", default_value_t = false)]
+    pub audio_allow_ffmpeg: bool,
+    /// Speech recognizer checkpoint: an export directory or a GGUF file.
+    /// Serves `/v1/audio/transcriptions`.
+    #[arg(long, env = "SHISO_ASR_MODEL")]
+    pub asr_model: Option<PathBuf>,
+    /// The name the recognizer answers to in a transcription's `model` field.
+    /// Defaults to the last component of `--asr-model`, extension removed.
+    #[arg(long, env = "SHISO_ASR_ID")]
+    pub asr_id: Option<String>,
+    /// Speaker diarizer checkpoint, for `response_format=diarized_json`.
+    /// Needs `--asr-model`.
+    #[arg(long, env = "SHISO_DIARIZATION_MODEL")]
+    pub diarization_model: Option<PathBuf>,
+    /// Encoder frames of future context the recognizer uses: one of the
+    /// lookaheads the checkpoint was trained for, checked when it loads. More
+    /// is more accurate and later to emit.
+    #[arg(long, env = "SHISO_ASR_LOOKAHEAD", default_value_t = 13)]
+    pub asr_lookahead: usize,
+    /// Transcriptions advanced at once; the rest wait in the queue.
+    #[arg(long, env = "SHISO_AUDIO_MAX_STREAMS", default_value_t = 4)]
+    pub audio_max_streams: usize,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -451,6 +483,12 @@ pub enum ConfigError {
         /// The path as it was given.
         path: String,
     },
+    /// Neither a language model nor a recognizer was named.
+    #[error("nothing to serve: give --model, --asr-model, or both")]
+    NothingToServe,
+    /// A diarizer was named with no recognizer to attribute speech from.
+    #[error("--diarization-model needs --asr-model: a diarizer labels a transcript")]
+    DiarizerWithoutRecognizer,
     /// A share that is not in `(0, 1]`.
     #[error("--{flag} {value} is not a share in (0, 1]")]
     NotAShare {
@@ -566,9 +604,21 @@ impl ServeArgs {
         // model list is empty answers every request with "no such model". The
         // explicit name is the escape hatch: an operator who supplied one has
         // already answered the question this check asks.
-        if self.model_name.is_none() && self.model.file_stem().is_none() {
-            return Err(ConfigError::NamelessModel {
-                path: self.model.display().to_string(),
+        match (&self.model, &self.asr_model) {
+            (None, None) => return Err(ConfigError::NothingToServe),
+            (Some(model), _) if self.model_name.is_none() && model.file_stem().is_none() => {
+                return Err(ConfigError::NamelessModel {
+                    path: model.display().to_string(),
+                });
+            }
+            _ => {}
+        }
+        if self.diarization_model.is_some() && self.asr_model.is_none() {
+            return Err(ConfigError::DiarizerWithoutRecognizer);
+        }
+        if self.audio_max_streams == 0 {
+            return Err(ConfigError::Zero {
+                flag: "audio-max-streams",
             });
         }
         // A head with no depth is refused here: it is a gigabyte of weights
@@ -743,10 +793,23 @@ impl ServeArgs {
         if let Some(name) = &self.model_name {
             return name.clone();
         }
-        self.model.file_stem().map_or_else(
+        self.model.as_deref().and_then(Path::file_stem).map_or_else(
             || "model".to_owned(),
             |stem| stem.to_string_lossy().into_owned(),
         )
+    }
+
+    /// The name the recognizer answers to, when one is configured.
+    #[must_use]
+    pub fn asr_id(&self) -> Option<String> {
+        if let Some(name) = &self.asr_id {
+            return Some(name.clone());
+        }
+        let path = self.asr_model.as_deref()?;
+        Some(path.file_stem().map_or_else(
+            || "asr".to_owned(),
+            |stem| stem.to_string_lossy().into_owned(),
+        ))
     }
 
     /// Where the architecture config is read from.
@@ -762,10 +825,11 @@ impl ServeArgs {
     #[must_use]
     pub fn config_path(&self) -> PathBuf {
         self.config.clone().unwrap_or_else(|| {
-            let beside = if self.model.is_dir() {
-                self.model.as_path()
+            let model = self.model.as_deref().unwrap_or_else(|| Path::new("."));
+            let beside = if model.is_dir() {
+                model
             } else {
-                self.model.parent().unwrap_or_else(|| Path::new("."))
+                model.parent().unwrap_or_else(|| Path::new("."))
             };
             beside.join("config.json")
         })
@@ -847,6 +911,29 @@ impl ServeArgs {
         if let Some(frames) = NonZeroUsize::new(self.video_max_frames) {
             policy = policy.with_max_frames(frames);
         }
+        if let Some(seconds) = NonZeroU64::new(self.video_decode_timeout_s) {
+            policy = policy.with_timeout_secs(seconds);
+        }
+        Some(policy)
+    }
+
+    /// The audio decode limits these flags describe.
+    #[must_use]
+    pub const fn audio_limits(&self) -> shiso_audio::DecodeLimits {
+        shiso_audio::DecodeLimits::new(self.audio_max_seconds)
+    }
+
+    /// The subprocess policy for audio containers other than WAV, or `None`
+    /// when only WAV is accepted.
+    ///
+    /// The binary and the timeout are the video decoder's: one ffmpeg per
+    /// server, switched on per kind of media.
+    #[must_use]
+    pub fn audio_ffmpeg_policy(&self) -> Option<FfmpegPolicy> {
+        if !self.audio_allow_ffmpeg {
+            return None;
+        }
+        let mut policy = FfmpegPolicy::new(self.video_ffmpeg_path.clone());
         if let Some(seconds) = NonZeroU64::new(self.video_decode_timeout_s) {
             policy = policy.with_timeout_secs(seconds);
         }

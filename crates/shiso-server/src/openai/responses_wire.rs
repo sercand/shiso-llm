@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::AppError;
-use crate::openai::chat_wire::{MediaRef, ServiceTier, StopField, StreamOptions};
+use crate::openai::chat_wire::{InputAudio, MediaRef, ServiceTier, StopField, StreamOptions};
 
 /// Who sent one input turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -59,6 +59,11 @@ pub enum ContentPart {
     InputVideo {
         /// Where the bytes are.
         video_url: MediaRef,
+    },
+    /// A sound clip, inline.
+    InputAudio {
+        /// The clip.
+        input_audio: InputAudio,
     },
     /// Output a safety decision withheld.
     Refusal {

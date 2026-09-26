@@ -43,10 +43,10 @@ use std::time::Duration;
 
 use shiso_core::{SamplingParams, Seed, TokenId};
 use shiso_ir::{EventStream, ServiceClass};
-use shiso_vision::VisionItem;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::AppError;
+use crate::media::MediaItem;
 use crate::scheduler::stats::SchedulerStats;
 
 /// Requests the queue holds when nothing said otherwise.
@@ -130,7 +130,7 @@ pub struct GenerateRequest {
     /// Carried as `Arc<[_]>` because the payload is megabytes of `f32` and the
     /// request crosses a thread boundary; cloning it to cross would double the
     /// largest allocation in the request path.
-    pub media: Arc<[VisionItem]>,
+    pub media: Arc<[MediaItem]>,
     /// Which declared tool parameters are strings, so the tool-call reader keeps
     /// them as strings. Empty for a request with no tools.
     ///
@@ -181,7 +181,7 @@ impl GenerateRequest {
 
     /// The same generation, with media attached.
     #[must_use]
-    pub fn with_media(mut self, media: Arc<[VisionItem]>) -> Self {
+    pub fn with_media(mut self, media: Arc<[MediaItem]>) -> Self {
         self.media = media;
         self
     }

@@ -11,6 +11,7 @@ members = [
     "crates/shiso-kvstore",
     "crates/shiso-ir",
     "crates/shiso-vision",
+    "crates/shiso-audio",
     "crates/shiso-server",
     "crates/shiso-bench",
     "crates/shiso-kernels",
@@ -29,6 +30,8 @@ license = "MIT"
 # `[licenses.private]` in deny.toml, not through the publish flag.
 
 [workspace.dependencies]
+# The real-input FFT of the log-mel frontends: planned once per frontend, f64.
+realfft = "3"
 # --- serialization -------------------------------------------------------
 # preserve_order keeps JSON object keys in insertion order (IndexMap). The chat
 # template renderer must reproduce the transformers `tojson` key order, so this
@@ -47,7 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # --- HTTP stack ----------------------------------------------------------
 clap = { version = "4", features = ["derive", "env"] }
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "multipart"] }
 http-body = "1"
 hyper = { version = "1", features = ["server", "http1", "http2", "client"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "http1", "tokio"] }
@@ -131,6 +134,7 @@ shiso-models = { path = "crates/shiso-models" }
 shiso-kvstore = { path = "crates/shiso-kvstore" }
 shiso-ir = { path = "crates/shiso-ir" }
 shiso-vision = { path = "crates/shiso-vision" }
+shiso-audio = { path = "crates/shiso-audio" }
 shiso-server = { path = "crates/shiso-server" }
 shiso-bench = { path = "crates/shiso-bench" }
 shiso-kernels = { path = "crates/shiso-kernels" }

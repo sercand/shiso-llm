@@ -69,7 +69,10 @@ pub fn incomplete_details(stop: &StopReason) -> Value {
 pub fn encode_usage(usage: &Usage) -> Value {
     json!({
         "input_tokens": usage.prompt_tokens,
-        "input_tokens_details": {"cached_tokens": usage.cached_prompt_tokens},
+        "input_tokens_details": {
+            "cached_tokens": usage.cached_prompt_tokens,
+            "audio_tokens": usage.audio_prompt_tokens,
+        },
         "output_tokens": usage.completion_tokens,
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens},
         "total_tokens": usage.prompt_tokens.saturating_add(usage.completion_tokens),
@@ -345,6 +348,18 @@ mod tests {
         assert_eq!(usage["output_tokens"], 6);
         assert_eq!(usage["total_tokens"], 11);
         assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 2);
+    }
+
+    #[test]
+    fn the_audio_share_of_the_prompt_is_reported_beside_the_cached_share() {
+        let usage = encode_usage(&Usage {
+            prompt_tokens: 774,
+            audio_prompt_tokens: 750,
+            cached_prompt_tokens: 3,
+            ..Usage::default()
+        });
+        assert_eq!(usage["input_tokens_details"]["audio_tokens"], 750);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 3);
     }
 
     #[test]

@@ -228,6 +228,9 @@ pub async fn start(
     request: &Request,
     field: PromptField,
 ) -> Result<Started, AppError> {
+    // A server with no language model has no renderer either, and "no model is
+    // loaded" is the answer that says what to change.
+    state.engine()?;
     let renderer = state.renderer.as_ref().ok_or(AppError::NotReady {
         what: "a prompt renderer",
     })?;
@@ -252,7 +255,7 @@ pub async fn start_with_prompt(
     state: &AppState,
     request: &Request,
     tokens: Vec<TokenId>,
-    media: Vec<shiso_vision::VisionItem>,
+    media: Vec<crate::media::MediaItem>,
     field: PromptField,
 ) -> Result<Started, AppError> {
     // No rendered text, so nothing keys the checkpoint tier and this prompt is
@@ -267,7 +270,7 @@ async fn queue(
     state: &AppState,
     request: &Request,
     tokens: Vec<TokenId>,
-    media: Vec<shiso_vision::VisionItem>,
+    media: Vec<crate::media::MediaItem>,
     text: Arc<str>,
     field: PromptField,
 ) -> Result<Started, AppError> {
@@ -290,7 +293,8 @@ async fn queue(
     // prefix it will resume from, so its restore reads memory rather than the
     // drive. Only then: one admitted at once resumes straight away, usually from
     // the tree, and reading its files would be traffic for nothing.
-    let seats = u64::try_from(state.engine.max_num_seqs()).unwrap_or(u64::MAX);
+    let engine = state.engine()?;
+    let seats = u64::try_from(engine.max_num_seqs()).unwrap_or(u64::MAX);
     if media.is_empty()
         && state.sched.active() >= seats
         && let Some(prefetcher) = state.kv.as_ref().and_then(|kv| kv.prefetcher())
@@ -310,7 +314,7 @@ async fn queue(
                 .iter()
                 .map(|tool| (tool.name.as_str(), &tool.input_schema)),
         )));
-    let events = state.engine.generate(generate).await?;
+    let events = engine.generate(generate).await?;
     Ok(Started {
         events,
         prompt_tokens,

@@ -185,6 +185,9 @@ fn content_blocks(content: &InputContent) -> Vec<Block> {
                 ContentPart::InputVideo { video_url } => {
                     Block::Video(MediaSource::classify(video_url.url()))
                 }
+                ContentPart::InputAudio { input_audio } => {
+                    Block::Audio(MediaSource::Inline(input_audio.data.clone()))
+                }
                 ContentPart::Refusal { refusal } => Block::Refusal(refusal.clone()),
             })
             .collect(),
@@ -489,6 +492,17 @@ mod tests {
         assert!(matches!(
             request.messages[0].content[1],
             Block::Image(shiso_ir::MediaSource::Inline(_))
+        ));
+    }
+
+    #[test]
+    fn an_audio_part_carries_its_base64_inline() {
+        let request = ir(serde_json::json!({"input": [{"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}
+        ]}]}));
+        assert!(matches!(
+            request.messages[0].content[0],
+            Block::Audio(shiso_ir::MediaSource::Inline(_))
         ));
     }
 

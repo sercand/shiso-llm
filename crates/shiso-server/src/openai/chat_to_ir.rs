@@ -223,6 +223,9 @@ fn part_block(part: &Part) -> Block {
         Part::Text { text } => Block::Text(text.clone()),
         Part::ImageUrl { image_url } => Block::Image(media(image_url)),
         Part::VideoUrl { video_url } => Block::Video(media(video_url)),
+        Part::InputAudio { input_audio } => {
+            Block::Audio(MediaSource::Inline(input_audio.data.clone()))
+        }
         Part::Refusal { refusal } => Block::Refusal(refusal.clone()),
     }
 }
@@ -494,6 +497,28 @@ mod tests {
             blocks[1],
             Block::Video(shiso_ir::MediaSource::Remote(_))
         ));
+    }
+
+    #[test]
+    fn an_audio_part_carries_its_base64_inline_whatever_its_format_says() {
+        let request = ir(
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what was said?"},
+                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "mp3"}}
+            ]}]}),
+        );
+        assert!(matches!(
+            request.messages[0].content[1],
+            Block::Audio(shiso_ir::MediaSource::Inline(ref data)) if data == "UklGRg=="
+        ));
+    }
+
+    #[test]
+    fn an_audio_part_without_data_is_refused() {
+        let body = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"format": "wav"}}
+        ]}]});
+        assert!(serde_json::from_value::<ChatBody>(body).is_err());
     }
 
     #[test]

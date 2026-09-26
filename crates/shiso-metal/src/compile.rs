@@ -234,6 +234,35 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         include_str!("../metal/q4e/affine.metal"),
     ),
     ("q4e/fp8.metal", include_str!("../metal/q4e/fp8.metal")),
+    // --- audio encoder kernel set; appended, nothing above this line changed.
+    (
+        "audio_common.h",
+        include_str!("../metal/audio/audio_common.h"),
+    ),
+    (
+        "audio/audio_elementwise.metal",
+        include_str!("../metal/audio/audio_elementwise.metal"),
+    ),
+    (
+        "audio/audio_norm.metal",
+        include_str!("../metal/audio/audio_norm.metal"),
+    ),
+    (
+        "audio/audio_gemm.metal",
+        include_str!("../metal/audio/audio_gemm.metal"),
+    ),
+    (
+        "audio/audio_conv.metal",
+        include_str!("../metal/audio/audio_conv.metal"),
+    ),
+    (
+        "audio/audio_attn.metal",
+        include_str!("../metal/audio/audio_attn.metal"),
+    ),
+    (
+        "audio/audio_lstm.metal",
+        include_str!("../metal/audio/audio_lstm.metal"),
+    ),
 ];
 
 /// Concatenates every source into the one translation unit the device compiles.

@@ -1,0 +1,22 @@
+# The audio encoders' kernel set: the CUDA twin of
+# `crates/shiso-metal/metal/audio`, one entry per Metal entry, under the same
+# names, argument blocks and buffer orders (the launch contract is
+# `crates/shiso-metal/metal/audio/KERNELS.md`). One translation unit, because
+# every entry is dispatched under the one module name `audio`.
+#
+# `--use_fast_math` is dropped, as for the vision set: the layer norm takes its
+# sums about a pivot that fast-math reassociation would undo, and the error
+# function, sigmoid, tanh and the rotary frequency ladder are graded against
+# accurate references at f32 tolerances the fast intrinsics miss.
+
+[build]
+sources = ["audio.cu"]
+
+base_flags = ["-O3", "-g", "-lineinfo"]
+
+includes = ["cuda/audio"]
+
+arch = ["compute_80"]
+
+[modules]
+audio = "audio"

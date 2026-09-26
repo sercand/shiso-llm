@@ -241,10 +241,14 @@ fn media_arrives_tagged_and_in_the_order_the_caller_wrote_it() {
             Block::Video(MediaSource::Inline("v".into())),
             Block::Text("and".into()),
             Block::Image(MediaSource::Inline("i".into())),
+            Block::Audio(MediaSource::Inline("a".into())),
         ],
     );
     let kinds: Vec<MediaKind> = turn.media().map(|(kind, _)| kind).collect();
-    assert_eq!(kinds, vec![MediaKind::Video, MediaKind::Image]);
+    assert_eq!(
+        kinds,
+        vec![MediaKind::Video, MediaKind::Image, MediaKind::Audio]
+    );
 }
 
 #[test]

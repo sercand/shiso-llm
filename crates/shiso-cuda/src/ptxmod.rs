@@ -445,13 +445,14 @@ mod tests {
     /// ever being asked.
     #[test]
     fn an_unknown_module_is_reported_with_the_kernel_set_and_never_reaches_the_driver() {
-        let registry = ModuleRegistry::load_all().expect("an empty module set loads");
-        assert_eq!(registry.len(), shiso_kernels::ptx_modules().len());
-        if registry.len() > 0 {
-            // This build embeds real modules, so loading them needed a driver
-            // and the assertion above already covered what this test can check.
+        if !shiso_kernels::ptx_modules().is_empty() {
+            // This build embeds real modules, and loading them needs an
+            // initialised driver this host-only test does not set up; the
+            // device tests load them.
             return;
         }
+        let registry = ModuleRegistry::load_all().expect("an empty module set loads");
+        assert_eq!(registry.len(), 0);
         let kernel = KernelRef::new("not_a_module", "not_an_entry");
         match registry.function(kernel) {
             Err(CoreError::Backend {

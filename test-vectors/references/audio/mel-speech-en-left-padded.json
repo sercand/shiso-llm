@@ -1,0 +1,11 @@
+{
+  "clip": "speech-en",
+  "style": "left-padded",
+  "frames_total": 2999,
+  "frames_valid": 2999,
+  "n_mels": 128,
+  "transformers": "5.18.0.dev0",
+  "torch": "2.11.0",
+  "extractor": "Gemma4AudioFeatureExtractor",
+  "source_dir": "/Users/sercand/models/gemma/gemma-4-E4B-it-qat-4bit-mlx"
+}

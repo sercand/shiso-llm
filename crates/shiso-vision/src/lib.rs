@@ -71,7 +71,7 @@ mod testing;
 pub use config::{ImageLimits, PatchGeometry, PreprocessSpec, Resample, ResizeRule};
 pub use container::{VisionSource, open_checkpoint, open_gguf};
 pub use error::{Container, ShardFault, VisionError};
-pub use ffmpeg::{Availability, FfmpegPolicy, decode_frames, probe};
+pub use ffmpeg::{Availability, FfmpegPolicy, decode_frames, probe, run_decoder};
 pub use image::preprocess_image;
 pub use item::VisionItem;
 pub use shard::VisionShard;

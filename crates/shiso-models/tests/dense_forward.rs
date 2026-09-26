@@ -71,10 +71,10 @@ const PROMPT: u32 = 5;
 /// `projection::GEMM_MIN_TOKENS` is one past the widest decode batch - the
 /// tiled GEMM measured at 17 GB/s against the extended matvec's 120 on this
 /// device, so a decode batch must not take it - which leaves a five-row chunk
-/// on the extended family at five rows per threadgroup. That reads the weight
-/// once, exactly as the GEMM would; only a chunk wider than a decode batch
-/// reaches `kernel_mul_mm_f16_f32`.
-const PROJ: &str = "kernel_mul_mv_ext_f16_f32_r1_5";
+/// on a matvec. `f16` has no extended instantiation on either backend, so it
+/// is the plain one; only a chunk wider than a decode batch reaches
+/// `kernel_mul_mm_f16_f32`.
+const PROJ: &str = "kernel_mul_mv_f16_f32_4";
 /// The placeholder token a media prompt is rendered with.
 const IMG: TokenId = TokenId::new(60);
 /// Layer slots, which is also how many `q6_K` blocks one per-layer row carries.

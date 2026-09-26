@@ -76,8 +76,13 @@ async fn a_real_checkpoint_boots_under_the_engine_thread_and_answers_health() {
     args.validate().expect("the command line is servable");
     let backend: Arc<dyn Backend> = shiso_metal::MetalBackend::new().expect("a Metal device");
     let parsed = shiso_core::HfConfig::from_file(&args.config_path()).expect("the config parses");
-    let loaded = shiso_server::model_factory::load_model(&backend, &args.model, &parsed, &args)
-        .expect("the checkpoint loads");
+    let loaded = shiso_server::model_factory::load_model(
+        &backend,
+        args.model.as_deref().expect("this test passes --model"),
+        &parsed,
+        &args,
+    )
+    .expect("the checkpoint loads");
 
     let model_id = args.model_id();
     let (engine, join) = spawn_engine(backend, loaded.model, None, &model_id, args.ctx);
@@ -127,9 +132,14 @@ async fn every_surface_answers_over_a_real_checkpoint() {
     let args = args(&model, &config);
     let backend: Arc<dyn Backend> = shiso_metal::MetalBackend::new().expect("a Metal device");
     let parsed = shiso_core::HfConfig::from_file(&args.config_path()).expect("the config parses");
-    let loaded = shiso_server::model_factory::load_model(&backend, &args.model, &parsed, &args)
-        .expect("the checkpoint loads")
-        .model;
+    let loaded = shiso_server::model_factory::load_model(
+        &backend,
+        args.model.as_deref().expect("this test passes --model"),
+        &parsed,
+        &args,
+    )
+    .expect("the checkpoint loads")
+    .model;
 
     let vocabulary = Arc::new(
         shiso_server::tokenizer::Vocabulary::from_file(&args.tokenizer_path())
@@ -378,9 +388,14 @@ struct CheckpointedServer {
 fn checkpointed_server(args: &ServeArgs, dir: &Path) -> CheckpointedServer {
     let backend: Arc<dyn Backend> = shiso_metal::MetalBackend::new().expect("a Metal device");
     let parsed = shiso_core::HfConfig::from_file(&args.config_path()).expect("the config parses");
-    let mut loaded = shiso_server::model_factory::load_model(&backend, &args.model, &parsed, args)
-        .expect("the checkpoint loads")
-        .model;
+    let mut loaded = shiso_server::model_factory::load_model(
+        &backend,
+        args.model.as_deref().expect("this test passes --model"),
+        &parsed,
+        args,
+    )
+    .expect("the checkpoint loads")
+    .model;
 
     // Before any session exists: the tier is a property of the cache the
     // sessions draw their pages from.
@@ -407,7 +422,7 @@ fn checkpointed_server(args: &ServeArgs, dir: &Path) -> CheckpointedServer {
     let (engine, join) = shiso_server::scheduler::spawn_engine_with_checkpoints(
         backend,
         loaded,
-        None,
+        shiso_server::media::MediaTowers::default(),
         Some(Arc::clone(&vocabulary)),
         &model_id,
         args.ctx,

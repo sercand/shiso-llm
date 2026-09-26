@@ -52,6 +52,10 @@ pub struct MediaPlacement {
     /// Tokens written before and after the repeated run, when the family wants
     /// them.
     pub wrap_image: Option<(&'static str, &'static str)>,
+    /// The marker the template writes once per audio clip, when the family hears.
+    pub audio_marker: Option<&'static str>,
+    /// Tokens written before and after an audio clip's run.
+    pub wrap_audio: Option<(&'static str, &'static str)>,
 }
 
 impl MediaPlacement {
@@ -66,9 +70,12 @@ impl MediaPlacement {
         image_marker: "<|image_pad|>",
         video_marker: Some("<|video_pad|>"),
         wrap_image: None,
+        audio_marker: None,
+        wrap_audio: None,
     };
 
-    /// Gemma 4's placement: one marker per image, bracketed, and no clip.
+    /// Gemma 4's placement: one marker per image and per audio clip, each
+    /// bracketed, and no video clip.
     ///
     /// The bracket is not decoration. This family's template writes
     /// `<|image>` … `<image|>` around the soft-token run, both tokens are in
@@ -78,6 +85,8 @@ impl MediaPlacement {
         image_marker: "<|image|>",
         video_marker: None,
         wrap_image: Some(("<|image>", "<image|>")),
+        audio_marker: Some("<|audio|>"),
+        wrap_audio: Some(("<|audio>", "<audio|>")),
     };
 }
 

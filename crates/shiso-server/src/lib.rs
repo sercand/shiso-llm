@@ -24,10 +24,12 @@
 
 pub mod anthropic;
 pub mod api;
+pub mod audio;
 pub mod auth;
 pub mod cli;
 pub mod error;
 pub mod ids;
+pub mod media;
 pub mod model_factory;
 pub mod openai;
 pub mod response_store;
@@ -93,7 +95,123 @@ fn install_tracing() {
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     args.validate()?;
 
-    let backend = open_backend(&args)?;
+    // The language model is optional: a server started with only a recognizer
+    // serves transcription and answers every generation route with the typed
+    // "no model is loaded" error.
+    // The speech models load first: a KV pool sized to a share of free device
+    // memory must see their weights already resident, or it takes the memory
+    // they then load into.
+    let audio = boot_audio(&args)?;
+    let (mut state, engine_thread) = match args.model.as_deref() {
+        Some(model) => {
+            let (state, join) = boot_language_model(&args, model)?;
+            (state, Some(join))
+        }
+        None => (AppState::without_language_model(), None),
+    };
+    if let Some(audio) = audio {
+        state = state.with_audio(audio);
+    }
+    if let Some(auth) = auth::AuthConfig::new(args.auth_tokens()) {
+        tracing::info!(tokens = auth.token_count(), "bearer authentication is on");
+        state = state.with_auth(auth);
+    } else {
+        tracing::warn!("no bearer tokens configured; every inference route is open");
+    }
+
+    shutdown::install();
+    let state = Arc::new(state);
+    let result = router::serve(state, &args.bind, args.port).await;
+
+    // The engine thread is joined after serving stops so that teardown finishes
+    // before the process exits. Dropping the handle is what closes the queue,
+    // and the queue closing is what ends the loop.
+    match engine_thread.map(std::thread::JoinHandle::join) {
+        None | Some(Ok(Ok(()))) => {}
+        Some(Ok(Err(error))) => {
+            tracing::error!(error = %shiso_core::chain_of(&error), "the engine did not shut down cleanly");
+        }
+        Some(Err(_panicked)) => tracing::error!("the engine thread panicked"),
+    }
+    result
+        .map_err(|error| anyhow!(error).context(format!("serving on {}:{}", args.bind, args.port)))
+}
+
+/// Opens the speech models and starts the audio worker, when `--asr-model`
+/// was given.
+///
+/// On backend instances of their own, one for the recognizer and one for the
+/// diarizer: a device that records the language model's launches for replay
+/// must not find the recognizer's launches in the recording. The worker thread runs until every handle to the service is
+/// dropped, which is when the server stops.
+///
+/// # Errors
+///
+/// A recognizer or diarizer that will not load, a lookahead the recognizer
+/// was not trained for, or a device that will not open.
+// `Ok(None)` is a server without transcription: no `--asr-model` was given.
+pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService>> {
+    let Some(asr) = args.asr_model.as_deref() else {
+        return Ok(None);
+    };
+    let backend = open_audio_backend(args)?;
+    let started = std::time::Instant::now();
+    let recognizer = shiso_models::audio_registry::open_speech_recognizer(asr, &backend)
+        .with_context(|| format!("opening the speech recognizer at {}", asr.display()))?;
+    if !recognizer.lookaheads().contains(&args.asr_lookahead) {
+        return Err(anyhow!(
+            "--asr-lookahead {} is not one this recognizer was trained for; it takes {:?}",
+            args.asr_lookahead,
+            recognizer.lookaheads()
+        ));
+    }
+    // The diarizer runs on its own thread beside the recognizer, so it gets
+    // its own command stream too: on a shared one, every decode round trip
+    // of the recognizer would wait behind the diarizer's queued encoder work.
+    let diarizer = match args.diarization_model.as_deref() {
+        Some(path) => {
+            let own = open_audio_backend(args)?;
+            let diarizer = shiso_models::audio_registry::open_diarizer(path, &own)
+                .with_context(|| format!("opening the diarizer at {}", path.display()))?;
+            own.finish_imports();
+            Some(diarizer)
+        }
+        None => None,
+    };
+    backend.finish_imports();
+    let asr_id = args.asr_id().unwrap_or_else(|| "asr".to_owned());
+    tracing::info!(
+        asr = %asr.display(),
+        id = %asr_id,
+        lookahead = args.asr_lookahead,
+        diarizer = diarizer.is_some(),
+        seconds = started.elapsed().as_secs_f64(),
+        "the speech models are resident"
+    );
+    let (service, _worker) = audio::AudioService::start(audio::AudioServiceDesc {
+        recognizer,
+        diarizer,
+        asr_id,
+        lookahead: args.asr_lookahead,
+        max_streams: args.audio_max_streams,
+        queue: args.audio_max_streams.saturating_mul(4),
+        limits: args.audio_limits(),
+        ffmpeg: args.audio_ffmpeg_policy(),
+    })
+    .context("starting the audio worker")?;
+    Ok(Some(service))
+}
+
+/// The engine thread's handle, joined at shutdown.
+type EngineThread = std::thread::JoinHandle<Result<(), scheduler::EngineFailure>>;
+
+/// Loads the language model at `model` and starts its engine thread: the
+/// state every generation route reads, before authentication is attached.
+fn boot_language_model(
+    args: &ServeArgs,
+    model_path: &std::path::Path,
+) -> anyhow::Result<(AppState, EngineThread)> {
+    let backend = open_backend(args)?;
     // The first mark: whatever is in use now belongs to the driver and the
     // rest of the machine, and the ledger's unaccounted figure is measured
     // from here.
@@ -108,16 +226,17 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Before the weights move: a card that exists and does not parse is an
     // operator mistake, and finding it after a minutes-long load is the most
     // expensive place to find it.
-    let sampling_preset = load_sampling_preset(&args)?;
+    let sampling_preset = load_sampling_preset(args)?;
     let model_factory::Loaded {
         mut model,
         open_tower,
+        open_audio,
         placement,
         defaults,
-    } = load_checkpoint(&backend, &config, &args)?;
+    } = load_checkpoint(&backend, &config, args, model_path)?;
     // Before anything stands on a session: the tier is a property of the cache
     // the sessions draw their pages from, so it is chosen while there are none.
-    let tier = open_checkpoint_tier(model.as_mut(), &args);
+    let tier = open_checkpoint_tier(model.as_mut(), args);
     // Shared with the request threads: `/cache` reads it and a queued request prefetches.
     let cache = tier.as_ref().and_then(|_| model.kv_cache());
 
@@ -125,23 +244,25 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // rather than a failure: the ids still reach the caller, and a checkpoint
     // whose vocabulary lives somewhere this flag was not pointed at is an
     // operator mistake that should be reported, not a reason to refuse to run.
-    let vocabulary = load_vocabulary(&args);
+    let vocabulary = load_vocabulary(args);
 
     // Before the listener binds, and only when the operator named one. A tower
     // that will not load, or that does not pair with this checkpoint, ends the
     // process here rather than failing the first request that carries a picture.
-    let vision = open_vision_tower(&backend, &args, model.as_mut(), open_tower)?;
+    let vision = open_vision_tower(&backend, args, model.as_mut(), open_tower)?;
     // Taken before the tower is handed to the engine thread: a tower that is
     // open is the authority on how its own pictures are preprocessed, and a
     // server without one falls back to what the checkpoint's config declares.
     let vision_spec = vision.as_ref().map(|tower| tower.preprocess().clone());
+    // The same container, asked for the other tower it may carry.
+    let audio = open_audio_tower(&backend, args, model.as_mut(), open_audio)?;
     // Every weight this process will read is resident now, the tower's too, so
     // whatever the backend kept to make those imports fast can go.
     backend.finish_imports();
     let memory = report_memory(&backend);
 
     let model_id = args.model_id();
-    let scheduler = scheduler_config(&args)?;
+    let scheduler = scheduler_config(args)?;
     // The renderer reads the store the scheduler writes.
     let turn_replay = scheduler.turn_replay.clone();
     let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);
@@ -155,7 +276,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let (engine, join) = scheduler::spawn_engine_with_checkpoints(
         Arc::clone(&backend),
         model,
-        vision,
+        media::MediaTowers {
+            vision,
+            audio: audio.clone(),
+        },
         vocabulary.clone(),
         &model_id,
         args.ctx,
@@ -176,11 +300,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     state.kv = cache;
     if let Some(vocabulary) = vocabulary {
         if let Some(renderer) = build_renderer(
-            &args,
+            args,
             &config,
             Arc::clone(&vocabulary),
             placement,
             vision_spec.as_ref(),
+            audio,
             turn_replay,
         ) {
             let renderer = defaults.configure(renderer);
@@ -188,29 +313,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
         state = state.with_vocabulary(vocabulary);
     }
-    if let Some(auth) = auth::AuthConfig::new(args.auth_tokens()) {
-        tracing::info!(tokens = auth.token_count(), "bearer authentication is on");
-        state = state.with_auth(auth);
-    } else {
-        tracing::warn!("no bearer tokens configured; every inference route is open");
-    }
-
-    shutdown::install();
-    let state = Arc::new(state);
-    let result = router::serve(state, &args.bind, args.port).await;
-
-    // The engine thread is joined after serving stops so that teardown finishes
-    // before the process exits. Dropping the handle is what closes the queue,
-    // and the queue closing is what ends the loop.
-    match join.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::error!(error = %shiso_core::chain_of(&error), "the engine did not shut down cleanly");
-        }
-        Err(_panicked) => tracing::error!("the engine thread panicked"),
-    }
-    result
-        .map_err(|error| anyhow!(error).context(format!("serving on {}:{}", args.bind, args.port)))
+    Ok((state, join))
 }
 
 /// The scheduler's configuration: its environment, then the flags that
@@ -253,11 +356,12 @@ fn load_checkpoint(
     backend: &Arc<dyn shiso_core::Backend>,
     config: &shiso_core::HfConfig,
     args: &ServeArgs,
+    model: &std::path::Path,
 ) -> anyhow::Result<model_factory::Loaded> {
     let _tag = shiso_core::ledger::scope(shiso_core::MemTag::WeightsOther);
     let started = std::time::Instant::now();
-    let loaded = model_factory::load_model(backend, &args.model, config, args)
-        .with_context(|| format!("loading the checkpoint at {}", args.model.display()))?;
+    let loaded = model_factory::load_model(backend, model, config, args)
+        .with_context(|| format!("loading the checkpoint at {}", model.display()))?;
     tracing::info!(
         seconds = started.elapsed().as_secs_f64(),
         "the checkpoint is loaded"
@@ -327,6 +431,58 @@ fn open_vision_tower(
     Ok(Some(tower))
 }
 
+/// Opens the audio tower from the `--vision` container, when it carries one.
+///
+/// # Errors
+///
+/// A container that claims a tower and will not load it, or a tower that does
+/// not pair with this checkpoint: both end boot here, before a request carrying
+/// a clip is answered from its words alone.
+// `Ok(None)` is audio input off: no `--vision`, a family that does not hear,
+// or a container exported without the tower. Each is logged.
+pub fn open_audio_tower(
+    backend: &Arc<dyn shiso_core::Backend>,
+    args: &ServeArgs,
+    model: &mut dyn shiso_engine::ckpt::Checkpointed,
+    open: model_factory::AudioTowerOpener,
+) -> anyhow::Result<Option<Arc<dyn shiso_audio::AudioTower>>> {
+    let Some(path) = args.vision.as_ref() else {
+        return Ok(None);
+    };
+    let _tag = shiso_core::ledger::scope(shiso_core::MemTag::VisionWeights);
+    let model_factory::AudioTowerFound::Tower(tower) = open(backend, path)
+        .with_context(|| format!("opening the audio tower in {}", path.display()))?
+    else {
+        tracing::info!(
+            path = %path.display(),
+            "the tower container carries no audio tower; audio input is off"
+        );
+        return Ok(None);
+    };
+    let hidden = shiso_core::Model::info(model).hidden;
+    let width = u32::try_from(tower.out_hidden()).unwrap_or(u32::MAX);
+    if width != hidden {
+        return Err(anyhow!(
+            "the audio tower projects to {width}-wide rows but this checkpoint's residual \
+             stream is {hidden} wide; they are not a pair"
+        ));
+    }
+    if shiso_core::Model::media_mut(model).is_none() {
+        return Err(anyhow!(
+            "the tower container carries an audio tower but this checkpoint has no media \
+             path to splice its rows into"
+        ));
+    }
+    tracing::info!(
+        path = %path.display(),
+        out_hidden = width,
+        max_seconds = tower.max_seconds(),
+        device_bytes = tower.device_bytes(),
+        "the audio tower is resident"
+    );
+    Ok(Some(tower))
+}
+
 /// Turns the checkpoint tier on, when the operator named a directory for it.
 ///
 /// Reports rather than fails: a directory that cannot be opened costs every
@@ -390,6 +546,29 @@ fn open_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend
     Ok(backend)
 }
 
+/// Opens the backend instance the speech models run on: the same device, a
+/// command stream of its own, and no launch recording.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn open_audio_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+    open_backend(args)
+}
+
+/// Opens the backend instance the speech models run on. Decode graphs stay
+/// off here: the speech models' launches are never replayed.
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+fn open_audio_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+    let options = shiso_cuda::CudaOptions::default().with_decode_graphs(false);
+    let backend = shiso_cuda::CudaBackend::new(0, options)
+        .context("opening the CUDA device for the speech models")?;
+    Ok(backend)
+}
+
+/// As [`open_backend`]: this build has no device for the speech models.
+#[cfg(not(any(feature = "metal", feature = "cuda")))]
+fn open_audio_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+    open_backend(args)
+}
+
 /// Opens the NVIDIA device.
 ///
 /// Ordinal zero and the default options: which device to run on is a placement
@@ -444,6 +623,7 @@ fn build_renderer(
     vocabulary: Arc<tokenizer::Vocabulary>,
     placement: shiso_vision::MediaPlacement,
     spec: Option<&shiso_vision::PreprocessSpec>,
+    audio: Option<Arc<dyn shiso_audio::AudioTower>>,
     replay: Option<Arc<tokenizer::turn_replay::TurnReplay>>,
 ) -> Option<tokenizer::render_prompt::PromptRenderer> {
     let template = load_chat_template(args)?;
@@ -462,6 +642,18 @@ fn build_renderer(
         .with_remote_media(args.vision_allow_remote_images)
         .with_video(args.ffmpeg_policy(), args.video_fps)
         .with_turn_replay(replay);
+    // The clip's frontend and token rule are the tower's, so a renderer that
+    // sizes a clip's pad run needs the tower itself; without one an audio part
+    // is refused.
+    let renderer = match audio {
+        Some(tower) => renderer.with_audio_tower(
+            tower,
+            placement,
+            args.audio_limits(),
+            args.audio_ffmpeg_policy(),
+        ),
+        None => renderer,
+    };
     // The tower geometry is what turns one media marker into the right number of
     // pad tokens, so a renderer without it must refuse media rather than send a
     // prompt whose pad run disagrees with the embedding rows. An open tower is

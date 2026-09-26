@@ -16,6 +16,7 @@
 //! theirs together: they are the facts that are true of this checkpoint family
 //! and of nothing else.
 
+mod audio;
 mod binding;
 pub mod binding_mlx;
 mod ckpt;
@@ -24,6 +25,7 @@ mod model;
 pub mod ple_repack;
 mod vision;
 
+pub use audio::{Gemma4AudioTower, holds_audio_tower};
 pub use binding::{
     Gemma4AttnRoles, Gemma4DescBinding, Gemma4FfnRoles, Gemma4LayerRoles, Gemma4PleRoles,
     Gemma4Roles, VECTOR_TYPES, WEIGHT_TYPES, bind_gemma4_desc,

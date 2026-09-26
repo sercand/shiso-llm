@@ -34,8 +34,11 @@
 //! it is.
 
 use serde_json::{Value, json};
+use shiso_audio::{AudioError, AudioTower, DecodeLimits};
 use shiso_ir::{Block, MediaSource, Message, Role};
 use shiso_vision::{FfmpegPolicy, ImageLimits, PreprocessSpec, VisionError, VisionItem};
+
+use crate::media::MediaItem;
 
 /// What the media flags allow, and what the checkpoint's tower needs.
 ///
@@ -57,7 +60,21 @@ pub struct MediaPolicy<'a> {
     pub ffmpeg: Option<&'a FfmpegPolicy>,
     /// The rate a clip is sampled at.
     pub video_fps: f64,
+    /// This checkpoint's audio tower. `None` means an audio part is a request
+    /// error rather than a decode.
+    pub audio: Option<&'a dyn AudioTower>,
+    /// Decode limits for one audio clip.
+    pub audio_limits: DecodeLimits,
+    /// The subprocess decoder for audio containers other than WAV, or `None`
+    /// when only WAV is accepted. Separate from the video policy because the
+    /// two are switched on by separate flags, and a refusal names its own.
+    pub audio_ffmpeg: Option<&'a FfmpegPolicy>,
 }
+
+/// The audio decode cap when nothing else was configured: the longest clip the
+/// one shipped audio tower accepts.
+pub const DEFAULT_AUDIO_LIMITS: DecodeLimits =
+    DecodeLimits::new(std::num::NonZeroU32::MIN.saturating_add(29));
 
 impl Default for MediaPolicy<'_> {
     fn default() -> Self {
@@ -67,6 +84,9 @@ impl Default for MediaPolicy<'_> {
             allow_remote: false,
             ffmpeg: None,
             video_fps: shiso_vision::DEFAULT_FPS,
+            audio: None,
+            audio_limits: DEFAULT_AUDIO_LIMITS,
+            audio_ffmpeg: None,
         }
     }
 }
@@ -116,6 +136,13 @@ pub enum PreprocessError {
     /// The media layer refused the payload.
     #[error(transparent)]
     Media(#[from] VisionError),
+    /// The request carries audio and this checkpoint has no audio tower.
+    #[error("this model has no audio tower, so it cannot be sent audio")]
+    NoAudioTower,
+    /// The audio layer refused the payload: a container this build cannot
+    /// decode, a clip past the limit, or one too short to make a token.
+    #[error(transparent)]
+    Audio(#[from] AudioError),
 }
 
 /// A conversation, ready for a template and for the engine.
@@ -124,7 +151,7 @@ pub struct Prepared {
     /// The turns, in the shape a template reads.
     pub messages: Vec<Value>,
     /// The media, in the order the prompt refers to it.
-    pub media: Vec<VisionItem>,
+    pub media: Vec<MediaItem>,
     /// How many pad tokens each item occupies, index for index with `media`.
     pub pad_counts: Vec<usize>,
 }
@@ -271,6 +298,16 @@ fn render_blocks(
                 push_item(item, policy, out);
                 parts.push(json!({"type": "video"}));
             }
+            Block::Audio(source) => {
+                let tower = policy.audio.ok_or(PreprocessError::NoAudioTower)?;
+                let bytes = payload(source, policy, "audio")?;
+                let pcm =
+                    shiso_audio::decode_audio(&bytes, &policy.audio_limits, policy.audio_ffmpeg)?;
+                let clip = shiso_audio::clip_for(tower, &pcm)?;
+                out.pad_counts.push(clip.tokens());
+                out.media.push(MediaItem::Audio(clip));
+                parts.push(json!({"type": "audio"}));
+            }
             // The block list is open: a modality added to the IR after this was
             // written has no rendering here, and dropping it silently would send
             // the model a turn that is missing content the caller sent. Saying
@@ -290,6 +327,7 @@ fn push_item(item: VisionItem, policy: &MediaPolicy<'_>, out: &mut Prepared) {
     let merge = policy
         .vision
         .map_or(1, |spec| spec.geometry.spatial_merge_size());
+    let item = MediaItem::Vision(item);
     out.pad_counts.push(item.pad_count(merge));
     out.media.push(item);
 }
@@ -343,32 +381,17 @@ fn decode_inline(value: &str) -> Result<Vec<u8>, PreprocessError> {
         .map_err(|_bad| PreprocessError::NotBase64)
 }
 
-/// Expands each pad marker into the run of pads its item needs.
-///
-/// A chat template writes exactly one pad marker per media item, because that
-/// is how many the item is in the conversation. The encoder produces one
-/// embedding row per merged patch, and the prompt has to have one position for
-/// each of those rows, or every embedding after the first item lands on the
-/// wrong token. This is the fan-out.
-///
-/// A count list that does not match the markers found is left alone rather than
-/// half-expanded: a mismatch means the template and the preprocessor disagree
-/// about the conversation, and guessing which is right produces a prompt that
-/// is silently about the wrong picture.
-///
-/// # The bracket, and why it is ordinary tokens
-///
-/// A family whose template brackets the run - Gemma writes `<|image>` before it
-/// and `<image|>` after - passes `wrap`, and each marker becomes
-/// `open + marker * count + close`. The two bracket tokens are ORDINARY tokens
-/// to everything downstream: the engine's media walk finds a picture by looking
-/// for a run of the placeholder id, the splice map counts only that run, and a
-/// bracket token that shared the placeholder's id would lengthen every item's
-/// run by two and put every embedding after the first on the wrong token.
-///
-/// The bracket goes around the image marker only. The families that bracket
-/// have no clip marker at all, and a bracket invented for one would be a prompt
-/// shape no checkpoint was trained on.
+/// The brackets a family writes around each kind of media run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MediaWraps {
+    /// Around an image's run.
+    pub image: Option<(shiso_core::TokenId, shiso_core::TokenId)>,
+    /// Around an audio clip's run.
+    pub audio: Option<(shiso_core::TokenId, shiso_core::TokenId)>,
+}
+
+/// Repeats each media marker to its item's pad count, bracketing image runs
+/// only; the audio-free spelling of [`expand_media_pads`].
 ///
 /// # Errors
 ///
@@ -378,6 +401,33 @@ pub fn expand_vision_pads(
     pad_counts: &[usize],
     pads: shiso_core::PadTokens,
     wrap: Option<(shiso_core::TokenId, shiso_core::TokenId)>,
+) -> Result<Vec<shiso_core::TokenId>, PadMismatch> {
+    expand_media_pads(
+        tokens,
+        pad_counts,
+        pads,
+        MediaWraps {
+            image: wrap,
+            audio: None,
+        },
+    )
+}
+
+/// Repeats each media marker `pad_counts[i]` times, in prompt order, with the
+/// bracket its kind carries.
+///
+/// A marker is bracketed by its own kind's pair only: a clip has no bracket in
+/// families that have no clip marker at all, and a bracket invented for one
+/// would be a prompt shape no checkpoint was trained on.
+///
+/// # Errors
+///
+/// [`PadMismatch`] when the marker count and the item count disagree.
+pub fn expand_media_pads(
+    tokens: Vec<shiso_core::TokenId>,
+    pad_counts: &[usize],
+    pads: shiso_core::PadTokens,
+    wraps: MediaWraps,
 ) -> Result<Vec<shiso_core::TokenId>, PadMismatch> {
     let markers = tokens.iter().filter(|token| pads.matches(**token)).count();
     if markers != pad_counts.len() {
@@ -398,7 +448,13 @@ pub fn expand_vision_pads(
     for token in tokens {
         if pads.matches(token) {
             let count = pad_counts.get(item).copied().unwrap_or(1).max(1);
-            let bracket = wrap.filter(|_| Some(token) == pads.image());
+            let bracket = if Some(token) == pads.image() {
+                wraps.image
+            } else if Some(token) == pads.audio() {
+                wraps.audio
+            } else {
+                None
+            };
             if let Some((open, _close)) = bracket {
                 out.push(open);
             }

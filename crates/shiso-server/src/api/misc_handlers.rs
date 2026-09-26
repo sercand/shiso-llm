@@ -42,7 +42,12 @@ pub fn readiness(model_id: Option<&str>) -> (StatusCode, Value) {
 
 /// `GET /health`.
 pub async fn health(State(state): State<Arc<AppState>>) -> Response {
-    let (status, body) = readiness(Some(state.model_id.as_str()));
+    // A server without a language model reports the recognizer it serves.
+    let model = match (&state.engine, &state.audio) {
+        (None, Some(audio)) => audio.asr_id(),
+        _ => state.model_id.as_str(),
+    };
+    let (status, body) = readiness(Some(model));
     (status, Json(body)).into_response()
 }
 
@@ -381,9 +386,9 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())
         .saturating_sub(state.uptime_seconds());
-    ModelListResponse {
-        object: "list",
-        data: vec![ModelInfo {
+    let mut data = Vec::new();
+    if state.engine.is_some() {
+        data.push(ModelInfo {
             id: state.model_id.clone(),
             object: "model",
             created,
@@ -396,7 +401,29 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
                 is_moderated: false,
             },
             supported_parameters: SUPPORTED_PARAMETERS.to_vec(),
-        }],
+        });
+    }
+    // The recognizer answers to its own id, which is what a transcription's
+    // `model` field must name.
+    if let Some(audio) = &state.audio {
+        data.push(ModelInfo {
+            id: audio.asr_id().to_owned(),
+            object: "model",
+            created,
+            owned_by: "shiso",
+            name: audio.asr_id().to_owned(),
+            context_length: 0,
+            top_provider: TopProvider {
+                context_length: 0,
+                max_completion_tokens: 0,
+                is_moderated: false,
+            },
+            supported_parameters: Vec::new(),
+        });
+    }
+    ModelListResponse {
+        object: "list",
+        data,
     }
 }
 
@@ -476,7 +503,9 @@ pub fn cache_body(state: &AppState) -> CacheReport {
                 .as_ref()
                 .map_or(0.0, |cache| cache.prefill_s_per_token),
             resident: sched.active(),
-            capacity: u64::try_from(state.engine.max_num_seqs()).unwrap_or(u64::MAX),
+            capacity: state.engine.as_ref().map_or(0, |engine| {
+                u64::try_from(engine.max_num_seqs()).unwrap_or(u64::MAX)
+            }),
         },
     }
 }

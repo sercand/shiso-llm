@@ -14,7 +14,11 @@
 //! growing row of them.
 #![forbid(unsafe_code)]
 
+pub mod audio_ops;
+pub mod audio_registry;
 pub mod gemma4;
+pub mod nemotron_asr;
+pub mod nemotron_diar;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen4exp;

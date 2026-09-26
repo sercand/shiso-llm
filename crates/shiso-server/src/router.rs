@@ -83,6 +83,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(crate::openai::responses::get_stored_response),
         )
         .route("/v1/messages", post(crate::anthropic::messages::messages))
+        .route(
+            "/v1/audio/transcriptions",
+            post(crate::openai::transcription::transcriptions),
+        )
+        .route(
+            "/audio/transcriptions",
+            post(crate::openai::transcription::transcriptions),
+        )
         .method_not_allowed_fallback(misc_handlers::method_not_allowed)
         .fallback(misc_handlers::not_found)
         .layer(DefaultBodyLimit::max(max_body_bytes()))

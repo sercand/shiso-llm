@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::auth::AuthConfig;
+use crate::error::AppError;
 use crate::response_store::ResponseStore;
 use crate::scheduler::{EngineHandle, SchedulerStats};
 use crate::tokenizer::Vocabulary;
@@ -71,8 +72,11 @@ impl MemorySource {
 /// Everything the handlers share.
 #[derive(Debug)]
 pub struct AppState {
-    /// The queue into the engine thread. Handlers never touch the model itself.
-    pub engine: EngineHandle,
+    /// The queue into the engine thread, when a language model is loaded.
+    /// Handlers never touch the model itself; they reach this through
+    /// [`AppState::engine`], which answers the typed "no model" error for a
+    /// server that serves transcription alone.
+    pub engine: Option<EngineHandle>,
     /// The name this checkpoint answers to on the wire.
     pub model_id: String,
     /// Tokens one session may hold, as the server was configured.
@@ -110,6 +114,8 @@ pub struct AppState {
     pub sampling_preset: shiso_core::SamplingParams,
     /// The memory ledger, when the backend keeps one.
     pub memory: Option<MemorySource>,
+    /// The transcription service, when a recognizer is loaded.
+    pub audio: Option<crate::audio::AudioService>,
 }
 
 impl AppState {
@@ -118,7 +124,7 @@ impl AppState {
     pub fn new(engine: EngineHandle, model_id: String, ctx: u32) -> Self {
         Self {
             sched: Arc::clone(engine.stats()),
-            engine,
+            engine: Some(engine),
             model_id,
             ctx,
             kv: None,
@@ -130,7 +136,46 @@ impl AppState {
             started_at: Instant::now(),
             sampling_preset: shiso_core::SamplingParams::neutral(),
             memory: None,
+            audio: None,
         }
+    }
+
+    /// The state for a server with no language model: every generation route
+    /// answers [`AppError::NoModel`], and everything else serves.
+    #[must_use]
+    pub fn without_language_model() -> Self {
+        Self {
+            sched: Arc::new(SchedulerStats::new()),
+            engine: None,
+            model_id: String::new(),
+            ctx: 0,
+            kv: None,
+            ckpt: None,
+            auth: None,
+            vocabulary: None,
+            renderer: None,
+            response_store: ResponseStore::from_env(),
+            started_at: Instant::now(),
+            sampling_preset: shiso_core::SamplingParams::neutral(),
+            memory: None,
+            audio: None,
+        }
+    }
+
+    /// The same state with the transcription service attached.
+    #[must_use]
+    pub fn with_audio(mut self, audio: crate::audio::AudioService) -> Self {
+        self.audio = Some(audio);
+        self
+    }
+
+    /// The engine queue.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::NoModel`] when no language model is loaded.
+    pub fn engine(&self) -> Result<&EngineHandle, AppError> {
+        self.engine.as_ref().ok_or(AppError::NoModel)
     }
 
     /// The same state with the memory ledger attached.

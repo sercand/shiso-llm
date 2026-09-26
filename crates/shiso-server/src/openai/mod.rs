@@ -28,6 +28,9 @@ pub mod responses_encode;
 pub mod responses_sse;
 pub mod responses_to_ir;
 pub mod responses_wire;
+pub mod transcription;
+pub mod transcription_encode;
+pub mod transcription_wire;
 
 /// The fingerprint every chat body carries.
 ///

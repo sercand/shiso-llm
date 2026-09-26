@@ -1,0 +1,11 @@
+{
+  "clip": "two-speakers",
+  "style": "centred",
+  "frames_total": 4104,
+  "frames_valid": 4104,
+  "n_mels": 128,
+  "transformers": "5.18.0.dev0",
+  "torch": "2.11.0",
+  "extractor": "NemotronAsrStreamingFeatureExtractor",
+  "source_dir": "/Users/sercand/models/Nemotron-3-Diarization/nvidia"
+}

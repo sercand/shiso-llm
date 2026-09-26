@@ -1,0 +1,32 @@
+[package]
+name = "shiso-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "shiso: host audio pipeline - decode, resample, log-mel frontends, vocabularies, transcript assembly."
+
+[dependencies]
+# The subprocess decoder and its policy are shared with video input: one set of
+# caps and one watchdog for every container the server hands to ffmpeg. The
+# encoded-rows type an audio tower returns is the vision tower's, for the same
+# splice.
+shiso-vision = { workspace = true }
+# A recognizer stream runs on a device: the contract names the backend it was
+# opened on, and a device failure inside it is one of its typed errors.
+shiso-core = { workspace = true }
+# `tokenizer.json` is a JSON document; the vocabulary reader walks it untyped
+# because only `model.vocab` and `added_tokens` matter here.
+serde_json = { workspace = true }
+# The frames' real-input FFT: a planned transform and reused scratch, rather
+# than a hand-written complex transform of a real frame.
+realfft = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

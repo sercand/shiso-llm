@@ -446,3 +446,66 @@ fn a_packed_pointer_array_holds_the_address_of_each_range_and_nothing_else() {
         .pack_pointers(narrow.view(), &srcs)
         .expect_err("one slot does not hold four pointers");
 }
+
+#[test]
+#[ignore = "needs a CUDA device"]
+fn a_capture_on_one_thread_does_not_refuse_another_threads_allocations() {
+    let Some(backend) = open() else {
+        return;
+    };
+    // The server's shape: the language model captures on its engine thread
+    // while the speech models run on a backend instance of their own on
+    // another thread. A capture mode that forbade every thread's allocations
+    // failed every transcription that overlapped a capture; and the capture
+    // itself has to survive the other thread's work, or decode would quietly
+    // fall back to eager launches.
+    let other = shiso_cuda::CudaBackend::new(0, shiso_cuda::CudaOptions::default())
+        .expect("a second instance on the same device");
+    let handle: std::sync::Arc<dyn Backend> = backend.clone();
+    let graphs = backend.as_graph().expect("graphs are on");
+    let src = shiso_core::alloc(&handle, 512).expect("allocation");
+    let dst = shiso_core::alloc(&handle, 512).expect("allocation");
+    let pattern: Vec<u8> = (0..512_u32)
+        .map(|i| u8::try_from(i % 89).expect("a value below 89 is a byte"))
+        .collect();
+    backend.copy_h2d(src.view(), &pattern).expect("fill");
+    let key = shiso_core::GraphKey::new(4);
+    {
+        let capture = graphs.capture(key).expect("capture");
+        backend
+            .copy_d2d(dst.view(), src.view())
+            .expect("a device-to-device copy is capturable");
+        // The instance is handed back rather than dropped on the thread:
+        // tearing a second instance down while another's capture runs does
+        // invalidate that capture (measured on the GB10), and the server's
+        // audio instance lives for the process, so teardown is not the shape
+        // being checked. Allocation, copies, syncs and frees are.
+        let (result, other) = std::thread::spawn(move || {
+            let handle: std::sync::Arc<dyn Backend> = other;
+            let result = (|| {
+                let buffer = shiso_core::alloc(&handle, 4096)?;
+                handle.copy_h2d(buffer.view(), &[7_u8; 4096])?;
+                handle.sync()?;
+                drop(buffer);
+                Ok::<(), shiso_core::CoreError>(())
+            })();
+            (result, handle)
+        })
+        .join()
+        .expect("the thread does not panic");
+        result.expect("another thread's allocation, copy and free succeed during the capture");
+        capture
+            .finish()
+            .expect("the capture survives the other thread's work");
+        drop(other);
+    }
+    backend.copy_h2d(dst.view(), &[0_u8; 512]).expect("clear");
+    assert!(
+        graphs.replay(key).expect("replay"),
+        "the graph was installed"
+    );
+    backend.sync().expect("drain");
+    let mut read = vec![0_u8; 512];
+    backend.copy_d2h(dst.view(), &mut read).expect("read back");
+    assert_eq!(read, pattern, "the replay does what the capture recorded");
+}

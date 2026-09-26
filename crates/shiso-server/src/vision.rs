@@ -40,7 +40,7 @@
 use std::sync::Arc;
 
 use shiso_core::{Backend, DeviceBuffer, VisionGrid};
-use shiso_vision::{MediaPlacement, PreprocessSpec, VisionError, VisionItem};
+use shiso_vision::{EncodedRows, MediaPlacement, PreprocessSpec, VisionError, VisionItem};
 
 /// Why a request's media could not be turned into embedding rows.
 #[derive(Debug, thiserror::Error)]
@@ -81,9 +81,34 @@ pub enum TowerError {
 pub struct EncodedMedia {
     rows: DeviceBuffer,
     grids: Vec<VisionGrid>,
+    /// How many of the rows are audio soft tokens, for the usage block.
+    audio_pads: u32,
 }
 
 impl EncodedMedia {
+    /// Takes ownership of a gathered block.
+    #[must_use]
+    pub fn from_rows(encoded: EncodedRows) -> Self {
+        Self {
+            rows: encoded.rows,
+            grids: encoded.grids,
+            audio_pads: 0,
+        }
+    }
+
+    /// The same block, recording that `pads` of its rows are audio.
+    #[must_use]
+    pub const fn with_audio_pads(mut self, pads: u32) -> Self {
+        self.audio_pads = pads;
+        self
+    }
+
+    /// Rows that are audio soft tokens.
+    #[must_use]
+    pub const fn audio_pads(&self) -> u32 {
+        self.audio_pads
+    }
+
     /// The whole block, `[sum of placeholder counts, hidden]` single precision.
     #[must_use]
     pub fn rows(&self) -> &DeviceBuffer {
@@ -177,6 +202,22 @@ impl VisionTower {
         self.inner.device_bytes()
     }
 
+    /// Runs the tower over `items` and returns its block as the tower built it.
+    ///
+    /// # Errors
+    ///
+    /// [`TowerError::Encode`] when the tower refuses an item or the device
+    /// fails under it.
+    pub fn encode_rows(
+        &self,
+        backend: &Arc<dyn Backend>,
+        items: &[VisionItem],
+    ) -> Result<EncodedRows, TowerError> {
+        self.inner
+            .encode(backend, items)
+            .map_err(TowerError::Encode)
+    }
+
     /// Runs the tower over every item of one request and gathers the result.
     ///
     /// # Errors
@@ -192,9 +233,6 @@ impl VisionTower {
             .inner
             .encode(backend, items)
             .map_err(TowerError::Encode)?;
-        Ok(EncodedMedia {
-            rows: encoded.rows,
-            grids: encoded.grids,
-        })
+        Ok(EncodedMedia::from_rows(encoded))
     }
 }

@@ -800,6 +800,10 @@ impl SeqSlot {
             prompt_tokens: u64::try_from(self.prompt.len()).unwrap_or(u64::MAX),
             completion_tokens: completion,
             cached_prompt_tokens: self.cached,
+            audio_prompt_tokens: self
+                .media
+                .as_ref()
+                .map_or(0, |media| u64::from(media.audio_pads())),
             reasoning_tokens: self.reasoning,
             time_to_first_token_ms: ttft.map_or(0.0, |at| at * 1000.0),
             tokens_per_second,

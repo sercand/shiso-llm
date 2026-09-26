@@ -21,6 +21,7 @@
 //! `#[test]` wrappers and nothing else: open a device, or say on stderr why the
 //! cases did not run.
 
+pub mod audio;
 pub mod dense;
 pub mod generic;
 pub mod harness;

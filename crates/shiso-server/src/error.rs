@@ -114,6 +114,12 @@ pub enum AppError {
     /// The server is running with no model loaded.
     #[error("no model is loaded")]
     NoModel,
+    /// A request named a model this server does not serve.
+    #[error("the model {model:?} is not served here")]
+    UnknownModel {
+        /// The name the request gave.
+        model: String,
+    },
     /// The auth gate refused the request.
     #[error("unauthorized: {}", .0.message())]
     Unauthorized(AuthReject),
@@ -242,7 +248,7 @@ impl AppError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-            Self::NotFound { .. } => StatusCode::NOT_FOUND,
+            Self::NotFound { .. } | Self::UnknownModel { .. } => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::BadRequest { .. } | Self::ContextOverflow { .. } => StatusCode::BAD_REQUEST,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -272,6 +278,7 @@ impl AppError {
             Self::ContextOverflow { .. } => "context_length_exceeded",
             Self::Unauthorized(reject) => reject.code(),
             Self::NotFound { .. } => "unknown_endpoint",
+            Self::UnknownModel { .. } => "model_not_found",
             Self::MethodNotAllowed { .. } => "method_not_allowed",
             Self::BadRequest { code, .. } => code,
             Self::Internal { .. } => "internal_error",

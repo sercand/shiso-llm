@@ -227,6 +227,7 @@ impl Vocabulary {
             self.marker_id(placement.image_marker),
             placement.video_marker.and_then(|m| self.marker_id(m)),
         )
+        .with_audio(placement.audio_marker.and_then(|m| self.marker_id(m)))
     }
 
     /// The bracket ids this family writes around an image's run, when it writes
@@ -238,6 +239,13 @@ impl Vocabulary {
     #[must_use]
     pub fn wrap_ids(&self, placement: &MediaPlacement) -> Option<(TokenId, TokenId)> {
         let (open, close) = placement.wrap_image?;
+        Some((self.marker_id(open)?, self.marker_id(close)?))
+    }
+
+    /// The bracket ids around an audio clip's run, all or nothing as for images.
+    #[must_use]
+    pub fn audio_wrap_ids(&self, placement: &MediaPlacement) -> Option<(TokenId, TokenId)> {
+        let (open, close) = placement.wrap_audio?;
         Some((self.marker_id(open)?, self.marker_id(close)?))
     }
 }

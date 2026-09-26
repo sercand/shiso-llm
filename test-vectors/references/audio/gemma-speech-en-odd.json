@@ -1,0 +1,13 @@
+{
+  "clip": "speech-en-odd",
+  "samples": 176641,
+  "mel_frames": 1104,
+  "mel_valid": 1104,
+  "tokens": 276,
+  "tower_width": 1536,
+  "embedded_width": 2560,
+  "attention": "sdpa",
+  "transformers": "5.18.0.dev0",
+  "torch": "2.11.0",
+  "source_dir": "/Users/sercand/models/gemma/gemma-4-E4B-it-qat-4bit-mlx"
+}
