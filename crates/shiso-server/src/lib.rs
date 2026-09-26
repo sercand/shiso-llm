@@ -156,8 +156,12 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
     };
     let backend = open_audio_backend(args)?;
     let started = std::time::Instant::now();
-    let recognizer = shiso_models::audio_registry::open_speech_recognizer(asr, &backend)
-        .with_context(|| format!("opening the speech recognizer at {}", asr.display()))?;
+    let recognizer = shiso_models::audio_registry::open_speech_recognizer(
+        asr,
+        args.asr_mmproj.as_deref(),
+        &backend,
+    )
+    .with_context(|| format!("opening the speech recognizer at {}", asr.display()))?;
     if recognizer.lookaheads().is_empty() {
         // A recognizer without lookahead has nothing to check the flag
         // against; its streams ignore it.

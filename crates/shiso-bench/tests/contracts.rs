@@ -237,6 +237,7 @@ const _: AudioEncode = <dyn shiso_audio::AudioTower>::encode;
 type OpenRecognizer =
     fn(
         &std::path::Path,
+        Option<&std::path::Path>,
         &std::sync::Arc<dyn Backend>,
     ) -> Result<std::sync::Arc<dyn shiso_audio::SpeechRecognizer>, shiso_audio::AudioError>;
 const _: OpenRecognizer = shiso_models::audio_registry::open_speech_recognizer;

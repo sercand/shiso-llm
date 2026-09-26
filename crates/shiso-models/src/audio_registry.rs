@@ -12,14 +12,22 @@ use shiso_core::Backend;
 
 /// Opens the speech recognizer at `path` on `backend`.
 ///
+/// `mmproj` is `--asr-mmproj`: the audio-tower file for a family whose GGUF
+/// export splits it from the text model. A family that ships in one file
+/// ignores it.
+///
 /// # Errors
 ///
 /// The claiming family's load error, or [`AudioError::Checkpoint`] saying no
 /// family recognises the path.
 pub fn open_speech_recognizer(
     path: &Path,
+    mmproj: Option<&Path>,
     backend: &Arc<dyn Backend>,
 ) -> Result<Arc<dyn SpeechRecognizer>, AudioError> {
+    // Nemotron ships every export as one file or directory; it has no tower
+    // file to take.
+    let _ = mmproj;
     if let Some(model) = crate::nemotron_asr::open(path, backend)? {
         return Ok(Arc::new(model));
     }

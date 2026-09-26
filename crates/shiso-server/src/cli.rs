@@ -423,6 +423,12 @@ pub struct ServeArgs {
     /// Serves `/v1/audio/transcriptions`.
     #[arg(long, env = "SHISO_ASR_MODEL")]
     pub asr_model: Option<PathBuf>,
+    /// The audio-tower GGUF (an `mmproj-*.gguf`) for a recognizer whose GGUF
+    /// export keeps its tower apart from the text model. Without it the one
+    /// mmproj beside `--asr-model` with the same quantisation suffix is taken,
+    /// and none or several is refused. Needs `--asr-model`.
+    #[arg(long, env = "SHISO_ASR_MMPROJ")]
+    pub asr_mmproj: Option<PathBuf>,
     /// The name the recognizer answers to in a transcription's `model` field.
     /// Defaults to the last component of `--asr-model`, extension removed.
     #[arg(long, env = "SHISO_ASR_ID")]
@@ -493,6 +499,9 @@ pub enum ConfigError {
     /// A diarizer was named with no recognizer to attribute speech from.
     #[error("--diarization-model needs --asr-model: a diarizer labels a transcript")]
     DiarizerWithoutRecognizer,
+    /// An audio tower was named with no recognizer to load it into.
+    #[error("--asr-mmproj needs --asr-model: it is the tower of the recognizer's text model")]
+    MmprojWithoutRecognizer,
     /// A share that is not in `(0, 1]`.
     #[error("--{flag} {value} is not a share in (0, 1]")]
     NotAShare {
@@ -619,6 +628,9 @@ impl ServeArgs {
         }
         if self.diarization_model.is_some() && self.asr_model.is_none() {
             return Err(ConfigError::DiarizerWithoutRecognizer);
+        }
+        if self.asr_mmproj.is_some() && self.asr_model.is_none() {
+            return Err(ConfigError::MmprojWithoutRecognizer);
         }
         if self.audio_max_streams == 0 {
             return Err(ConfigError::Zero {

@@ -543,6 +543,36 @@ fn a_diarizer_without_a_recognizer_is_refused() {
 }
 
 #[test]
+fn an_mmproj_without_a_recognizer_is_refused() {
+    let error = parse(&[
+        "--model",
+        "m.gguf",
+        "--asr-mmproj",
+        "/models/mmproj-Q8_0.gguf",
+    ])
+    .expect("parses")
+    .validate()
+    .expect_err("a tower has no text model to join");
+    assert!(error.to_string().contains("--asr-model"), "{error}");
+}
+
+#[test]
+fn the_asr_mmproj_is_passed_through() {
+    let args = parse(&[
+        "--asr-model",
+        "/models/asr/Model-Q8_0.gguf",
+        "--asr-mmproj",
+        "/models/asr/mmproj-Model-Q8_0.gguf",
+    ])
+    .expect("parses");
+    args.validate().expect("valid");
+    assert_eq!(
+        args.asr_mmproj.as_deref(),
+        Some(std::path::Path::new("/models/asr/mmproj-Model-Q8_0.gguf"))
+    );
+}
+
+#[test]
 fn zero_audio_streams_is_refused() {
     let error = parse(&["--asr-model", "/a", "--audio-max-streams", "0"])
         .expect("parses")
