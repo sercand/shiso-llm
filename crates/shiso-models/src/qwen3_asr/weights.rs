@@ -6,12 +6,13 @@
 //! `conv_out` is f16 in one GGUF pair and `Q8_0` in the other; both are dense
 //! and load the same way. Everything small - norms, conv kernels, biases - is
 //! widened to f32 on the host, and the MLX export's channels-last conv
-//! kernels are permuted to the reference layout on the way (notes §6.2), so
+//! kernels (`[out][f][t][in]`) are permuted to the reference layout on the
+//! way, so
 //! every export looks the same to the encoder. The conv kernels are then
 //! reordered once more into the rows of a GEMM over the conv's patches
 //! ([`Conv`]).
 //!
-//! The output head is the embedding (notes §4, tied embeddings): the MLX
+//! The output head is the embedding (the config ties them): the MLX
 //! export and one GGUF have no separate head, and the others store a
 //! bit-identical copy, so it is loaded once.
 
@@ -38,7 +39,7 @@ pub struct Norm {
 /// with the bias.
 ///
 /// The reference's kernel is `[out][in][frequency][time]`, because its conv
-/// runs over `[mels][frames]` images (notes §2.2); the audio kernels take
+/// runs over `[mels][frames]` images; the audio kernels take
 /// channels-last `[t][f][c]` images, time first.
 #[derive(Debug)]
 pub struct Conv {
@@ -75,8 +76,7 @@ pub struct TowerWeights {
     /// The flattened stem into the tower's width, `C * F -> d_model`, no bias.
     pub conv_out: Linear,
     /// The sinusoid rows added after `conv_out`, `[13][d_model]` f32: only
-    /// the first 13 are ever read, because positions restart in every chunk
-    /// (notes §2.3).
+    /// the first 13 are ever read, because positions restart in every chunk.
     pub positions: DeviceBuffer,
     /// The transformer layers.
     pub layers: Vec<TowerLayer>,
@@ -137,7 +137,8 @@ pub struct QwenAsrWeights {
 
 /// The tower's position rows: `rows` of `width`, the first half of each
 /// `sin(p * w_i)` and the second half `cos(p * w_i)` (not interleaved), with
-/// `w_i = exp(-i * ln(10000) / (width/2 - 1))` (notes §2.3).
+/// `w_i = exp(-i * ln(10000) / (width/2 - 1))`, as the reference encoder
+/// builds its table.
 pub(crate) fn sinusoids(rows: usize, width: usize) -> Vec<f32> {
     let half = width / 2;
     let step = 10_000f64.ln() / crate::audio_ops::f64_of(half.saturating_sub(1).max(1));
@@ -277,7 +278,7 @@ fn load_tower(
 ) -> Result<TowerWeights, AudioError> {
     let a = &config.audio;
     let (c, d) = (a.conv_channels, a.d_model);
-    // Three stride-2, pad-1, 3-tap convs over the mel axis (notes §2.2).
+    // Three stride-2, pad-1, 3-tap convs over the mel axis.
     let halve = |x: usize| x.saturating_sub(1) / 2 + 1;
     let freq = halve(halve(halve(a.mels)));
     let convs = [

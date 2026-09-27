@@ -1,5 +1,5 @@
 //! The prompt against the reference processor's own ids, and the output
-//! parser and repetition collapse against the reference's rules (notes §3).
+//! parser and repetition collapse against the reference's rules.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -62,7 +62,7 @@ fn the_prompt_ids_match_the_reference() {
 
 #[test]
 fn the_prompt_is_fifteen_ids_around_the_audio() {
-    // Notes §3: 15 ids plus one placeholder per audio row, the placeholders
+    // The reference processor's prompt: 15 ids plus one placeholder per audio row, the placeholders
     // one unbroken run.
     let p = ids(390, None).expect("builds");
     assert_eq!(p.len(), 405);

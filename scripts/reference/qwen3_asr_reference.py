@@ -9,8 +9,8 @@ fixture: one already present is kept, and deleting it deliberately is how it
 is recaptured.
 
 Qwen3-ASR and R2T2 share the same architecture (`Qwen3ASRForConditionalGeneration`)
-and, per the model notes, an audio tower that is bit-identical between the two
-checkpoints. So the mel and windowed-encoder fixtures are captured once from
+and an audio tower that is bit-identical between the two checkpoints (the
+fine-tune retrained only the decoder; assert_towers_equal checks it). So the mel and windowed-encoder fixtures are captured once from
 the Qwen3-ASR run and copied byte-for-byte to the R2T2 names, after asserting
 the two checkpoints' audio tower weights actually match. Prompt ids and
 generated tokens differ per model (different text decoder, and R2T2 carries
@@ -36,8 +36,8 @@ ROOT = Path(__file__).resolve().parents[2] / "test-vectors" / "references" / "au
 
 CLIPS = ["speech-en", "speech-en-odd", "weather-es", "two-speakers"]
 
-# The forced language per clip (NOTES §3: canonicalised to first-letter-upper,
-# rest-lower, and must be one of the checkpoint's 30 supported languages).
+# The forced language per clip (the processor canonicalises it to
+# first-letter-upper, rest-lower, and must be one of the checkpoint's 30 supported languages).
 FORCED_LANGUAGE = {
     "speech-en": "English",
     "speech-en-odd": "English",
@@ -45,12 +45,13 @@ FORCED_LANGUAGE = {
     "weather-es": "Spanish",
 }
 
-AUDIO_PAD_ID = 151676  # `<|audio_pad|>` (NOTES §3)
+AUDIO_PAD_ID = 151676  # `<|audio_pad|>` in tokenizer_config.json
 
-# NOTES §8.B: the windowed-encoder, auto-language golden for speech-en. This is
-# the recommended golden (matches vLLM/FA2), not the HF sdpa/eager default,
-# which silently runs full-clip attention over the encoder (NOTES §2.4/§7.1).
-SPEECH_EN_AUTO_IDS_NOTES = [
+# The windowed-encoder, auto-language golden for speech-en, from an earlier
+# reference run. It is the windowed one (matches vLLM/FA2), not the HF
+# sdpa/eager default, which silently runs full-clip attention over the encoder
+# (see the patch below).
+SPEECH_EN_AUTO_IDS_GOLDEN = [
     11528, 6364, 151704, 1986, 2003, 11, 358, 30696, 311, 10557, 311, 6359, 847, 1590, 71543, 2621, 311,
     279, 6995, 13, 22713, 304, 279, 13815, 315, 46508, 1573, 752, 11, 432, 572, 458, 6638, 311, 1977, 9702,
     498, 13, 13139, 582, 3003, 3884, 7912, 311, 7912, 476, 18521, 7230, 518, 678, 11, 847, 20959, 448, 498,
@@ -59,12 +60,12 @@ SPEECH_EN_AUTO_IDS_NOTES = [
     13, 151645,
 ]
 
-# NOTES §2.4/§7.1: in transformers 4.57.6 the encoder layer is called as
+# In transformers 4.57.6 the encoder layer is called as
 # `encoder_layer(hidden_states, cu_seqlens)` with no attention_mask, and the
 # sdpa/eager attention paths silently ignore cu_seqlens, giving full-clip
 # attention instead of vLLM/FA2's 104-token windows. Patch the layer so every
 # run in this script (both the standalone encoder fixture and generation)
-# takes the windowed path the notes call the recommended golden.
+# takes the windowed path, the golden this script checks.
 _ORIG_LAYER_FORWARD = M.Qwen3ASRAudioEncoderLayer.forward
 
 
@@ -126,7 +127,7 @@ def clone_state_dict(module: torch.nn.Module) -> dict:
 
 
 def assert_towers_equal(a: dict, b: dict):
-    """Fail loudly unless R2T2's audio tower is bit-identical to Qwen3-ASR's (NOTES §0/§8's cross-model claim)."""
+    """Fail loudly unless R2T2's audio tower is bit-identical to Qwen3-ASR's (the fine-tune's claim to share it)."""
     if a.keys() != b.keys():
         sys.exit(f"audio tower tensor names differ: {sorted(set(a) ^ set(b))}")
     for k in a:
@@ -179,7 +180,7 @@ def run_clip(wrapper: Qwen3ASRModel, model_key: str, clip: str, source_dir: str,
         if mel_path.exists() and mel_meta_path.exists() and enc_path.exists():
             print(f"kept {mel_path.name}, {mel_meta_path.name}, {enc_path.name}: delete them to recapture")
         else:
-            # NOTES §6: the encoder is run per clip on input_features[:, :feature_len]
+            # The encoder is run per clip on input_features[:, :feature_len]
             # (`input_feature[:, :feature_len]` in the thinker's own get_audio_features).
             mel = inputs_auto["input_features"][0][:, :feature_len]
             with torch.no_grad():
@@ -267,14 +268,14 @@ def copy_mel_encoder(clip: str):
 def check_speech_en_golden():
     path = ROOT / "qwen3asr-speech-en-tokens.json"
     got = json.loads(path.read_text())["auto"]["generated_ids"]
-    if got != SPEECH_EN_AUTO_IDS_NOTES:
+    if got != SPEECH_EN_AUTO_IDS_GOLDEN:
         sys.exit(
-            "NEEDS_CONTEXT: qwen3asr speech-en auto tokens do not match NOTES §8. "
-            f"got {len(got)} ids, expected {len(SPEECH_EN_AUTO_IDS_NOTES)}.\n"
+            "NEEDS_CONTEXT: qwen3asr speech-en auto tokens do not match the golden. "
+            f"got {len(got)} ids, expected {len(SPEECH_EN_AUTO_IDS_GOLDEN)}.\n"
             f"got:      {got}\n"
-            f"expected: {SPEECH_EN_AUTO_IDS_NOTES}"
+            f"expected: {SPEECH_EN_AUTO_IDS_GOLDEN}"
         )
-    print(f"speech-en auto tokens match NOTES §8 ({len(got)} ids)")
+    print(f"speech-en auto tokens match the golden ({len(got)} ids)")
 
 
 def main():

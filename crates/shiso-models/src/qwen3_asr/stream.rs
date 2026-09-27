@@ -2,8 +2,7 @@
 //!
 //! The model has no streaming encoder and no timestamps of its own, so a clip
 //! is cut into chunks and each chunk is one prompt and one greedy decode with
-//! no context from the one before, as the reference transcribes long audio
-//! (notes §5).
+//! no context from the one before, as the reference transcribes long audio.
 //!
 //! - **Where a chunk ends.** At the cuts the caller gave
 //!   ([`StreamOptions::cuts`](shiso_audio::StreamOptions), a diarized job's
@@ -49,7 +48,7 @@ use crate::audio_ops::Workspace;
 /// Seconds per mel frame, the unit of every token's frame.
 pub(crate) const MEL_FRAME_SECS: f64 = 0.01;
 /// The shortest chunk the tower is given, in mel frames: 0.5 s, the
-/// reference's `MIN_ASR_INPUT_SECONDS` (notes §5).
+/// shortest input the reference transcribes without padding it.
 const MIN_CHUNK_FRAMES: usize = 50;
 /// The first-stage value of a frame of digital silence, `log10(1e-10)`: what
 /// the frontend gives the zeros the reference pads a short chunk with.

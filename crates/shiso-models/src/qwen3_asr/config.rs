@@ -1,15 +1,15 @@
 //! What checkpoint this is, and the numbers it runs with.
 //!
-//! One architecture ships in three containers (model notes §6): an HF
+//! One architecture ships in three containers: an HF
 //! directory (bf16, one or two safetensors shards), an MLX directory (the
 //! decoder's linears 8-bit affine, the tower bf16), and a GGUF pair - a text
 //! file holding the decoder and an mmproj holding the audio tower. The HF and
 //! MLX configs state the geometry of both halves; the GGUF pair states it in
 //! two key sets (`qwen3vl.*` in the text file, `clip.audio.*` in the mmproj),
 //! and the mmproj omits the window sizes, the frontend and the token ids
-//! (§6.4). Those are constants here, each citing the notes section it comes
-//! from, and an HF config that states a different value is refused rather
-//! than half-honoured.
+//! Those are constants here, each saying where its value comes from, and an
+//! HF config that states a different value is refused rather than
+//! half-honoured.
 //!
 //! The text GGUF does not say which mmproj belongs to it. `--asr-mmproj`
 //! names it; without the flag the one `mmproj-*.gguf` beside the text file
@@ -30,48 +30,51 @@ use shiso_modelfile::{GgufFile, GgufMetadata};
 use super::names::{Names, Stem};
 use crate::audio_ops::store::TensorStore;
 
-/// Mel frames per conv-stem chunk, `n_window * 2` (notes §2.1).
+/// Mel frames per conv-stem chunk, `n_window * 2`: the tower cuts its input
+/// into 1 s chunks before the conv stem.
 pub const CHUNK_FRAMES: usize = 100;
 /// Tower tokens one full chunk yields: three stride-2 convs over 100 frames
-/// (notes §2.2). This is also the number of position-table rows ever used,
-/// because the positions restart in every chunk (§2.3).
+/// (`100 -> 50 -> 25 -> 13`). This is also the number of position-table rows
+/// ever used, because the positions restart in every chunk.
 pub const TOKENS_PER_CHUNK: usize = 13;
 /// Tokens per bidirectional attention window in the tower,
-/// `13 * (n_window_infer / (n_window * 2))` (notes §2.4).
+/// `13 * (n_window_infer / (n_window * 2))`: eight whole chunks, 8 s of audio.
 pub const WINDOW_TOKENS: usize = 104;
-/// `n_window` the constants above are derived from (notes §2).
+/// `n_window` the constants above are derived from, as the HF config states it.
 const N_WINDOW: u64 = 50;
-/// `n_window_infer` the constants above are derived from (notes §2).
+/// `n_window_infer` the constants above are derived from, as the HF config
+/// states it.
 const N_WINDOW_INFER: u64 = 800;
-/// Mel bins the frontend computes (notes §1).
+/// Mel bins the frontend computes.
 pub const MEL_BINS: usize = 128;
 /// The tower's layer-norm epsilon: the framework default, which the HF config
-/// does not state and the mmproj states as this (notes §2).
+/// does not state and the mmproj states as this.
 const AUDIO_NORM_EPS: f32 = 1e-5;
 
-/// `<|endoftext|>`, the pad and a stop token (notes §3).
+/// `<|endoftext|>`, the pad and a stop token (the tokenizer config's ids,
+/// as every id below).
 pub const ENDOFTEXT: u32 = 151_643;
-/// `<|im_start|>` (notes §3).
+/// `<|im_start|>`.
 pub const IM_START: u32 = 151_644;
-/// `<|im_end|>`, the end of a turn and a stop token (notes §3).
+/// `<|im_end|>`, the end of a turn and a stop token.
 pub const IM_END: u32 = 151_645;
-/// `<|audio_start|>` (notes §3).
+/// `<|audio_start|>`.
 pub const AUDIO_START: u32 = 151_669;
-/// `<|audio_end|>` (notes §3).
+/// `<|audio_end|>`.
 pub const AUDIO_END: u32 = 151_670;
-/// `<|audio_pad|>`: each is replaced by one tower row (notes §2.7, §3).
+/// `<|audio_pad|>`: each is replaced by one tower row, in order.
 pub const AUDIO_PAD: u32 = 151_676;
 /// `<asr_text>`, an added token that is not special, so it survives decoding
-/// and the transcript is split on it as text (notes §3).
+/// and the transcript is split on it as text.
 pub const ASR_TEXT: u32 = 151_704;
-/// Decoding stops on either (notes §3, Generation).
+/// Decoding stops on either: the generation config's end ids.
 pub const STOP_TOKENS: [u32; 2] = [IM_END, ENDOFTEXT];
 /// The first id past the byte-level alphabet: everything from here up is an
-/// added token whose text is used literally (notes §3).
+/// added token whose text is used literally.
 const FIRST_SPECIAL: u32 = ENDOFTEXT;
 
 /// The languages the model can be told to transcribe as: an ISO 639 code and
-/// the name the model writes after `language ` (notes §3; the config's
+/// the name the model writes after `language ` (the config's
 /// `support_languages`, in its order). Filipino has no two-letter code of its
 /// own, so it takes the three-letter one, as Cantonese does.
 const LANGUAGES: [(&str, &str); 30] = [
@@ -140,7 +143,7 @@ pub fn language_code(name: &str) -> Option<&'static str> {
 /// and the blanks - or an id past the checkpoint's own table (the GGUF
 /// vocabulary pads to 151936). Never text. The added tokens that are not
 /// special (`<asr_text>`, `<think>`, the tool and FIM markers, `<non_speech>`)
-/// are text the model may write, and are not in this set (notes §3; the
+/// are text the model may write, and are not in this set (the
 /// `special` flags of `tokenizer_config.json`'s `added_tokens_decoder`,
 /// identical in every export of both checkpoints).
 #[must_use]
@@ -148,9 +151,9 @@ pub fn is_special(id: u32) -> bool {
     matches!(id, 151_643..=151_656 | 151_669..=151_674 | 151_676..=151_703) || id > ASR_TEXT
 }
 
-/// The log-mel frontend (notes §1): a periodic Hann window of 400 over a
-/// 400-point FFT every 160 samples, reflect-padded centre framing, the power
-/// spectrum through 128 Slaney mels from 0 to 8 kHz, and the whole-clip
+/// The log-mel frontend, as the reference feature extractor computes it: a
+/// periodic Hann window of 400 over a 400-point FFT every 160 samples,
+/// reflect-padded centre framing, the power spectrum through 128 Slaney mels from 0 to 8 kHz, and the whole-clip
 /// `log10` floor and rescale.
 #[must_use]
 pub fn mel_spec() -> MelSpec {
@@ -789,8 +792,7 @@ impl Qwen3AsrConfig {
         let layers = a("clip.audio.block_count")?;
         let ffn = a("clip.audio.feed_forward_length")?;
         let norm_eps = gguf_f32(am, "clip.audio.attention.layer_norm_epsilon", &tower_path)?;
-        // The mmproj states no stem width; the first conv's rows are it
-        // (notes §6.4).
+        // The mmproj states no stem width; the first conv's rows are it.
         let conv = Names::new(Flavour::Gguf).weight(Stem::Conv(1));
         let conv_channels = stores
             .tower()

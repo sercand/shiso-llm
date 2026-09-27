@@ -1,6 +1,6 @@
 //! The dense decoder on the device: the prompt with the tower's rows in place
 //! of its audio placeholders, one prefill, then greedy decoding until an end
-//! id or the token cap (notes §3, §4).
+//! id or the token cap.
 //!
 //! The prefill is one pass of GEMMs over every prompt row. Decoding then
 //! follows the transducer's pattern: each step - the embedding row of the
@@ -43,8 +43,8 @@ use crate::audio_ops::{
     decode_attention_partials, step_silu, step3,
 };
 
-/// Tokens one transcription may emit: the reference's vLLM path's
-/// `max_new_tokens` (notes §3, Generation). A chunk is at most 35 s, which
+/// Tokens one transcription may emit: the `max_new_tokens` the reference
+/// serving path generates with. A chunk is at most 35 s, which
 /// speech fills with a few hundred tokens; the cap only bounds a degenerate
 /// repetition, which the parser then collapses.
 pub const MAX_NEW_TOKENS: usize = 4096;
@@ -469,8 +469,8 @@ impl<'a> Decoder<'a> {
     }
 
     /// The prompt's rows into `s.x`: each text id's embedding row, and the
-    /// tower's rows over the placeholder run, in order and unscaled (notes
-    /// §2.7).
+    /// tower's rows over the placeholder run, in order and unscaled, as the
+    /// reference merges them.
     fn embed_prompt(
         &self,
         s: &Scratch<'_>,
@@ -549,8 +549,8 @@ impl<'a> Decoder<'a> {
         })?)
     }
 
-    /// One prefill layer over the `n` prompt rows of `s.x`, in place (notes
-    /// §4): every projection on the audio set's tiled GEMM (an 8-bit affine
+    /// One prefill layer over the `n` prompt rows of `s.x`, in place: every
+    /// projection on the audio set's tiled GEMM (an 8-bit affine
     /// weight too), attention causal from position 0.
     fn layer(
         &self,

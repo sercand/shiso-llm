@@ -1,10 +1,11 @@
 //! Where each role's tensor sits, per container flavour.
 //!
-//! Three containers spell the same tensors three ways (model notes §6.1-§6.4):
+//! Three containers spell the same tensors three ways:
 //! the HF export under a `thinker.` prefix, the MLX export without it, and the
 //! GGUF pair in its own short names, the tower in the mmproj and the decoder in
 //! the text file. The table lives here, once, so the loader asks for a role and
-//! never for a string. The GGUF q/k weights are not permuted (§6), so no role
+//! never for a string. The GGUF q/k weights keep the checkpoint's row order
+//! (the converter does not permute them for this architecture), so no role
 //! needs a reordering.
 
 use super::config::Flavour;
@@ -98,7 +99,8 @@ impl Names {
     }
 }
 
-/// The safetensors spelling, `thinker.` prefix excluded (notes §6.1, §6.2).
+/// The safetensors spelling of the HF and MLX exports, `thinker.` prefix
+/// excluded.
 fn safetensors(role: Stem) -> String {
     let tower = |n: usize, rest: &str| format!("audio_tower.layers.{n}.{rest}");
     let text = |n: usize, rest: &str| format!("model.layers.{n}.{rest}");
@@ -132,8 +134,8 @@ fn safetensors(role: Stem) -> String {
     }
 }
 
-/// The GGUF spelling: `a.*` and `mm.a.*` in the mmproj (notes §6.4), the
-/// rest in the text file (§6.3).
+/// The GGUF spelling: `a.*` and `mm.a.*` in the mmproj, the rest in the
+/// text file.
 fn gguf(role: Stem) -> String {
     match role {
         Stem::Conv(i) => format!("a.conv2d.{i}"),

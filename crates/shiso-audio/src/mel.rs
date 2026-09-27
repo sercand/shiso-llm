@@ -35,9 +35,9 @@ pub enum Framing {
     /// `t·hop`; the window sits centred in the frame. `1 + L/hop` frames, of
     /// which `L/hop` are valid.
     Centred,
-    /// `n_fft/2` samples on each side, mirrored by reflection (numpy's
-    /// `mode="reflect"`: the edge sample is never repeated) instead of
-    /// zeroed; otherwise identical to [`Self::Centred`], including its frame
+    /// `n_fft/2` samples on each side, mirrored by reflection about the edge
+    /// sample (`[c, b, a, b, c]` around `a`: the edge sample is never
+    /// repeated) instead of zeroed; otherwise identical to [`Self::Centred`], including its frame
     /// counts. Forbids pre-emphasis, which no frontend here combines with it.
     CentredReflect,
     /// The signal is rounded up to `pad_to_multiple` samples with zeros, then
@@ -271,8 +271,8 @@ fn bad(reason: impl Into<String>) -> AudioError {
 }
 
 /// Mirrors a virtual sample position `s` (any integer, inside `0..n` or not)
-/// into `0..n`, matching numpy's `mode="reflect"`: the edge sample at `0` or
-/// `n - 1` is never repeated, so a period is `2*(n - 1)`. `n` must be at
+/// into `0..n` by reflection about the edge samples: the edge sample at `0`
+/// or `n - 1` is never repeated, so a period is `2*(n - 1)`. `n` must be at
 /// least 2.
 fn reflect_index(s: i64, n: i64) -> i64 {
     let period = 2 * (n - 1);

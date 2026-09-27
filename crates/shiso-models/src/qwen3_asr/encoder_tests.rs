@@ -140,7 +140,7 @@ const CLIPS: [&str; 4] = ["speech-en", "speech-en-odd", "weather-es", "two-speak
 
 #[test]
 fn audio_tokens_follow_the_reference_lengths() {
-    // Notes §2.2: verified against the reference encoder's output lengths.
+    // The lengths the reference encoder's output had for these frame counts.
     for (frames, tokens) in [
         (3000, 390),
         (1234, 161),
@@ -209,7 +209,7 @@ fn a_tail_chunk_is_padded() {
     let tower = Tower::new(&ops, &weights.tower, &config.audio);
     // 1104 frames: eleven whole chunks and a tail of four, which yields one
     // token. Its conv stem must run over the tail zero-filled to 100 frames
-    // (notes §2.1); an unpadded tail moves that token.
+    // as the reference fills it; an unpadded tail moves that token.
     let clip = "speech-en-odd";
     let (got, tokens, _) = run(&ops, &tower, clip);
     assert_eq!(tokens, n_audio(clip));

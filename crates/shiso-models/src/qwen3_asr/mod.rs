@@ -6,9 +6,9 @@
 //! Two checkpoints share the architecture - the base model and a fine-tune
 //! with a retrained decoder - and every container they ship in (HF, MLX, a
 //! GGUF text file with its mmproj) reads through one name table and one
-//! config reader ([`config`]). The facts behind every constant are in the
-//! model notes (`docs/superpowers/specs/2026-09-26-qwen3-asr-model-notes.md`),
-//! cited by section where each is used.
+//! config reader ([`config`]). Each constant says where its value comes
+//! from: the checkpoint's own configs, or the reference implementation's
+//! processor, encoder and parser, measured against it.
 //!
 //! The model has no streaming encoder: a clip is transcribed in chunks of at
 //! most 35 s (the `stream` module), each one prompt and one greedy decode, and a
@@ -77,8 +77,8 @@ pub fn open(
     let weights = QwenAsrWeights::load(&ops, &located, &config, &stores)?;
     let vocab = Arc::new(read_vocab(&located, &stores)?);
     // The worker frames the whole clip once; the floor-and-rescale belongs to
-    // each chunk's own rows (notes §5: the reference extracts every chunk's
-    // features on their own), so the frames it computes stop at the log and
+    // each chunk's own rows (the reference extracts every chunk's features on
+    // their own), so the frames it computes stop at the log and
     // the stream finishes each chunk.
     let mut mel = config::mel_spec();
     mel.log_scale = LogScale::Log10;

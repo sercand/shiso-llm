@@ -1,18 +1,19 @@
 //! The audio tower: mel frames in, one `output_dim` row per audio token out,
-//! the rows a prompt's audio placeholders are replaced by (notes §2).
+//! the rows a prompt's audio placeholders are replaced by.
 //!
 //! The clip is cut into 1-second chunks of [`CHUNK_FRAMES`] mel frames, and
 //! each chunk goes through the conv stem on its own - no receptive field
 //! crosses a chunk boundary. The tail chunk is zero-filled to a whole chunk
 //! first and only its valid output tokens are kept: the stem's second and
 //! third convs read `gelu(bias + ...)` in the filled region, not zeros, and
-//! skipping the fill moves the tail's tokens by up to 1.19 (notes §2.1). Only
+//! skipping the fill moves the tail's tokens by up to 1.19 against the
+//! reference encoder's. Only
 //! a clip shorter than one chunk runs unfilled, as the reference does.
 //!
 //! Every chunk's tokens then share one `[tokens][d_model]` matrix through the
-//! transformer. Positions restart at 0 in every chunk (§2.3), and attention is
-//! bidirectional inside blocks of [`WINDOW_TOKENS`] and blind across them
-//! (§2.4) - the attention's chunk rule with no past chunks - so the whole clip
+//! transformer. Positions restart at 0 in every chunk, and attention is
+//! bidirectional inside blocks of [`WINDOW_TOKENS`] and blind across them -
+//! the attention's chunk rule with no past chunks - so the whole clip
 //! is one launch per operation rather than one per chunk or per window.
 //!
 //! Everything is f32; weights read in whatever width their export stored.
@@ -44,7 +45,8 @@ const fn stem_tokens(frames: usize) -> usize {
 }
 
 /// Audio tokens the tower makes of `frames` mel frames: 13 per whole chunk
-/// and the stem's output length of the tail (notes §2.2). This sizes the
+/// and the stem's output length of the tail, as the reference encoder counts
+/// them. This sizes the
 /// prompt's placeholder run before the tower runs.
 #[must_use]
 pub const fn audio_tokens(frames: usize) -> usize {
@@ -270,7 +272,8 @@ impl<'a> Tower<'a> {
             self.config.d_model,
         );
         let per_chunk = stem.extents[0].0;
-        // The chunks as planes; past the clip's end, zeros (notes §2.1).
+        // The chunks as planes; past the clip's end, zeros, as the reference
+        // fills its tail chunk.
         let count = stem.chunks * per_chunk * mels;
         let mut planes = vec![0u8; count * 4];
         let end = (frame0 + stem.chunks * per_chunk).min(mel.len() / mels);
@@ -291,7 +294,7 @@ impl<'a> Tower<'a> {
             c_in = channels;
         }
         // `[chunk][t][f][c]` to `[chunk][t][c][f]`: the reference flattens a
-        // token's stem output channel-major (notes §2.2).
+        // token's stem output channel-major before the stem's linear.
         let (tokens, freq) = (stem.tokens(), stem.freq());
         let token_rows = stem.chunks * tokens;
         let flat = ws.get(slot::FLAT);
@@ -406,7 +409,8 @@ impl<'a> Tower<'a> {
         Ok(linear.forward(self.ops, x.view(), y.view(), n)?)
     }
 
-    /// One pre-norm layer, in place on `s.x` (notes §2.5).
+    /// One pre-norm layer, in place on `s.x`: layer-normed attention and a
+    /// layer-normed GELU MLP, each added back to the residual.
     fn layer(&self, layer: &TowerLayer, s: &Scratch<'_>, n: usize) -> Result<(), AudioError> {
         let d = self.config.d_model;
         self.norm(&layer.attn_norm, s.x, s.h, n)?;
@@ -447,7 +451,7 @@ impl<'a> Tower<'a> {
         self.residual(s.x, s.h, n * d)
     }
 
-    /// `proj2(gelu(proj1(ln_post(x))))` (notes §2.6).
+    /// `proj2(gelu(proj1(ln_post(x))))`, the tower's output head.
     fn head(&self, s: &Scratch<'_>, n: usize) -> Result<Encoded, AudioError> {
         let w = self.weights;
         self.norm(&w.ln_post, s.x, s.h, n)?;

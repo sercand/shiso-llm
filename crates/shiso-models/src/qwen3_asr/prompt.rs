@@ -1,4 +1,4 @@
-//! The prompt the decoder reads, and what its output means (notes §3).
+//! The prompt the decoder reads, and what its output means.
 //!
 //! The prompt is the chat template with an empty system turn and one audio
 //! item, its single placeholder expanded to one `<|audio_pad|>` per tower row;
@@ -34,7 +34,7 @@ const LANGUAGE: u32 = 11528;
 const ASR_TEXT_TAG: &str = "<asr_text>";
 /// What a meta line starts with.
 const LANGUAGE_PREFIX: &str = "language ";
-/// The collapse threshold the reference parses with (notes §3).
+/// The collapse threshold the reference parses with.
 pub const REPEAT_THRESHOLD: usize = 20;
 /// The longest pattern the collapse looks for.
 const MAX_PATTERN: usize = 20;
@@ -118,7 +118,7 @@ pub fn forced_suffix(name: &str) -> Option<Vec<u32>> {
 }
 
 /// The prompt for `n_audio` tower rows, captured from the reference
-/// processor with an empty context (notes §3):
+/// processor with an empty context:
 ///
 /// ```text
 /// <|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>
@@ -180,7 +180,7 @@ fn normalise(name: &str) -> String {
 }
 
 /// The decoded output, stripped, collapsed and split at the first
-/// `<asr_text>` as the reference's `parse_asr_output` does (notes §3):
+/// `<asr_text>` as the reference's output parser does:
 ///
 /// - a forced language: the whole output is the text;
 /// - no tag: the whole output is the text, with no language;
@@ -227,9 +227,8 @@ pub fn parse(raw: &str, forced: Option<&str>) -> Parsed {
     Parsed { language, text }
 }
 
-/// Degenerate repetition collapsed as the reference's
-/// `detect_and_fix_repetitions` does (`inference/utils.py`, notes §3), over
-/// characters: first a run of one character longer than `threshold` becomes
+/// Degenerate repetition collapsed as the reference's repetition fix does,
+/// over characters: first a run of one character longer than `threshold` becomes
 /// that character; then, scanning from the left, the first pattern of 1 to 20
 /// characters repeated at least `threshold` times becomes one copy, and the
 /// rest of the string after the repeats is collapsed the same way.
