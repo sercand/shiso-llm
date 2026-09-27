@@ -244,6 +244,8 @@ enum Pattern {
     /// Speaker 0 for the first third, nobody for the second, speaker 1 for
     /// the last.
     Gapped,
+    /// No answer: the pass fails.
+    Fails,
 }
 
 impl Pattern {
@@ -251,12 +253,12 @@ impl Pattern {
     fn at(self, f: usize, n: usize) -> [f32; 2] {
         let first = match self {
             Self::Halves => f < n / 2,
-            Self::Silent => false,
+            Self::Silent | Self::Fails => false,
             Self::Gapped => f < n / 3,
         };
         let second = match self {
             Self::Halves => f >= n / 2,
-            Self::Silent => false,
+            Self::Silent | Self::Fails => false,
             Self::Gapped => f >= 2 * n / 3,
         };
         [
@@ -297,6 +299,11 @@ impl DiarizationPass for HalvesPass {
         if self.left > 0 {
             self.left -= 1;
             return Ok(None);
+        }
+        if self.pattern == Pattern::Fails {
+            return Err(AudioError::BadSpec {
+                reason: "scripted diarizer failure".into(),
+            });
         }
         Ok(Some(self.pattern.activity(self.frames)))
     }
@@ -1055,6 +1062,52 @@ async fn a_plain_job_is_cut_at_the_diarizer_turns_without_naming_speakers() {
         "{events:?}"
     );
     assert_eq!(offline.lock().expect("unpoisoned").clone(), vec![want]);
+}
+
+#[tokio::test]
+async fn a_plain_offline_job_whose_diarizer_fails_is_cut_by_the_silence_rule() {
+    let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
+    let svc = service_with(&ServiceShape::offline(
+        &log,
+        &opened,
+        &offline,
+        Some(Pattern::Fails),
+    ));
+    let clip = job(70, "a", false);
+    let want = chunks::plan_offline(&mel_of(&clip), None, 0.01, &OfflineRule::for_10ms_mel(true))
+        .expect("plans");
+    assert!(want.len() >= 2, "{want:?}");
+    let events = drain(svc.submit(clip).expect("queued")).await;
+    let Some(TranscriptEvent::Done(done)) = events.last() else {
+        panic!("the transcript completes without the diarizer: {events:?}");
+    };
+    assert!(!done.diarized);
+    assert!(!done.text.is_empty(), "{done:?}");
+    assert_eq!(offline.lock().expect("unpoisoned").clone(), vec![want]);
+}
+
+#[tokio::test]
+async fn a_diarized_offline_job_whose_diarizer_fails_fails() {
+    let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
+    let svc = service_with(&ServiceShape::offline(
+        &log,
+        &opened,
+        &offline,
+        Some(Pattern::Fails),
+    ));
+    let events = drain(svc.submit(job(70, "a", true)).expect("queued")).await;
+    let Some(TranscriptEvent::Failed(failure)) = events.last() else {
+        panic!("the speakers it asked for cannot be named: {events:?}");
+    };
+    assert!(!failure.caller, "{failure:?}");
+    assert!(
+        failure.message.contains("scripted diarizer failure"),
+        "{failure:?}"
+    );
+    assert!(
+        offline.lock().expect("unpoisoned").is_empty(),
+        "no offline job opens"
+    );
 }
 
 #[tokio::test]

@@ -564,6 +564,17 @@ fn collect_speakers(
         // Closed unanswered: the pass panicked.
         Err(false) => internal_failure(),
     };
+    job.diarizing = None;
+    if !job.diarize {
+        // Only an offline job's cuts wanted this pass: the caller asked for
+        // no speakers, so the clip is planned by the silence rule instead
+        // and the transcript still completes.
+        tracing::warn!(
+            error = %failure.message,
+            "the diarizer failed on a job that asked for no speakers;              cutting it by the silence rule"
+        );
+        return None;
+    }
     let _gone = job.events.send(TranscriptEvent::Failed(failure));
     Some(Turn::Finished)
 }
