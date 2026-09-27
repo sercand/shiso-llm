@@ -6,6 +6,11 @@
 // every reduction below is spelled out so its summation order is fixed.
 
 #define AUDIO_LINEAR_BLOCK 256u
+// Full unrolling of a fixed-count loop over simdgroup fragments. Without it
+// the compiler may keep a fragment array in memory and index it: a 4x4 block
+// of accumulators per simdgroup measured six times slower that way, and the
+// GEMM's own 4x2 block 7% slower on M1 Max.
+#define AUDIO_UNROLL _Pragma("clang loop unroll(full)")
 #define AUDIO_BLOCK_SUM_SLOTS 33u
 #define AUDIO_GEMM_TILE 32u
 #define AUDIO_GEMM_TILE_M 32u

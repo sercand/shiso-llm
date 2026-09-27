@@ -78,8 +78,8 @@ kernel void kernel_audio_gemm(
     device float *out = y + (uint64_t) tgpig.z * args.m * args.n;
 
     simdgroup_float8x8 acc[4][2];
-    for (uint i = 0; i < 4u; ++i) {
-        for (uint j = 0; j < 2u; ++j) {
+    AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
+        AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
             acc[i][j] = simdgroup_float8x8(0.0f);
         }
     }
@@ -123,18 +123,18 @@ kernel void kernel_audio_gemm(
             *((threadgroup float4 *) (sb + rr * BK + kk)) = v;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < BK; kk += 8u) {
+        AUDIO_UNROLL for (uint kk = 0; kk < BK; kk += 8u) {
             simdgroup_float8x8 a[4];
             simdgroup_float8x8 b[2];
-            for (uint i = 0; i < 4u; ++i) {
+            AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
                 simdgroup_load(a[i], sa + (8u * i) * BK + kk, BK);
             }
-            for (uint j = 0; j < 2u; ++j) {
+            AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
                 // Transposed load: b[j](r, c) = W[c0 + 8j + c][k0 + kk + r].
                 simdgroup_load(b[j], sb + (c0 + 8u * j) * BK + kk, BK, ulong2(0, 0), true);
             }
-            for (uint i = 0; i < 4u; ++i) {
-                for (uint j = 0; j < 2u; ++j) {
+            AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
+                AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
                     simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
                 }
             }
@@ -143,8 +143,8 @@ kernel void kernel_audio_gemm(
     }
     // The staged tiles are done with; the 32x64 result fits in their place.
     threadgroup float *sc = smem;
-    for (uint i = 0; i < 4u; ++i) {
-        for (uint j = 0; j < 2u; ++j) {
+    AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
+        AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
             simdgroup_store(acc[i][j], sc + (8u * i) * BN + c0 + 8u * j, BN);
         }
     }
@@ -205,8 +205,8 @@ kernel void kernel_audio_gemm64(
     device float *out = y + (uint64_t) tgpig.z * args.m * args.n;
 
     simdgroup_float8x8 acc[4][2];
-    for (uint i = 0; i < 4u; ++i) {
-        for (uint j = 0; j < 2u; ++j) {
+    AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
+        AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
             acc[i][j] = simdgroup_float8x8(0.0f);
         }
     }
@@ -250,18 +250,18 @@ kernel void kernel_audio_gemm64(
             *((threadgroup float4 *) (sb + rr * LD + kk)) = v;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < BK; kk += 8u) {
+        AUDIO_UNROLL for (uint kk = 0; kk < BK; kk += 8u) {
             simdgroup_float8x8 a[4];
             simdgroup_float8x8 b[2];
-            for (uint i = 0; i < 4u; ++i) {
+            AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
                 simdgroup_load(a[i], sa + (r0 + 8u * i) * LD + kk, LD);
             }
-            for (uint j = 0; j < 2u; ++j) {
+            AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
                 // Transposed load: b[j](r, c) = W[c0 + 8j + c][k0 + kk + r].
                 simdgroup_load(b[j], sb + (c0 + 8u * j) * LD + kk, LD, ulong2(0, 0), true);
             }
-            for (uint i = 0; i < 4u; ++i) {
-                for (uint j = 0; j < 2u; ++j) {
+            AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
+                AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
                     simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
                 }
             }
@@ -273,8 +273,8 @@ kernel void kernel_audio_gemm64(
     threadgroup float *slot = smem + (BM + BN) * LD + sg * 64u;
     // A partial tile carries no bias: the split-sum pass adds it once.
     const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u && args.splits <= 1u;
-    for (uint i = 0; i < 4u; ++i) {
-        for (uint j = 0; j < 2u; ++j) {
+    AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
+        AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
             simdgroup_store(acc[i][j], slot, 8u);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             for (uint e = lane; e < 64u; e += 32u) {
@@ -649,3 +649,4 @@ template [[host_name("kernel_audio_matvec_silu_f32w")]]  kernel audio_matvec_sil
 template [[host_name("kernel_audio_matvec_silu_bf16w")]] kernel audio_matvec_silu_t kernel_audio_matvec_silu<audio_run8_bf16>;
 template [[host_name("kernel_audio_matvec_silu_f16w")]]  kernel audio_matvec_silu_t kernel_audio_matvec_silu<audio_run8_f16>;
 template [[host_name("kernel_audio_matvec_silu_q8_0w")]] kernel audio_matvec_silu_t kernel_audio_matvec_silu<audio_run8_q8_0>;
+
