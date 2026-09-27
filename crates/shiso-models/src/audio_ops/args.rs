@@ -213,3 +213,51 @@ pub(crate) struct KeepArgs {
     pub(crate) count: u32,
 }
 const _: () = assert!(size_of::<KeepArgs>() == 4);
+
+/// `audio_args_cache_attn`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct CacheAttnArgs {
+    pub(crate) n_q: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) pos0: u32,
+    pub(crate) cap: u32,
+    pub(crate) scale: f32,
+    pub(crate) splits: u32,
+}
+const _: () = assert!(size_of::<CacheAttnArgs>() == 32);
+
+/// `audio_args_kv_append`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct KvAppendArgs {
+    pub(crate) rows: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) cap: u32,
+}
+const _: () = assert!(size_of::<KvAppendArgs>() == 16);
+
+/// `audio_args_decode_step`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct DecodeStepArgs {
+    pub(crate) eos0: u32,
+    pub(crate) eos1: u32,
+    pub(crate) max_tokens: u32,
+    pub(crate) advance: u32,
+    pub(crate) slot: u32,
+}
+const _: () = assert!(size_of::<DecodeStepArgs>() == 20);
+
+/// `audio_args_embed_token`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct EmbedTokenArgs {
+    pub(crate) width: u32,
+    pub(crate) vocab: u32,
+    pub(crate) group: u32,
+}
+const _: () = assert!(size_of::<EmbedTokenArgs>() == 12);

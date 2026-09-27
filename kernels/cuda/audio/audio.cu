@@ -9,7 +9,9 @@
  * index over 256-thread blocks, the norms one block per row, the GEMM a 32x64
  * output tile per 128-thread block with 12288 bytes of dynamic shared memory
  * (the 64-row GEMM 64x64 per 256 threads with 20480),
- * and the window attention one warp per (head, query).
+ * the window and causal attention one warp per (head, block of eight
+ * queries), and decode attention a warp per (kv head, split) with four to a
+ * block, closed by a 256-thread merge per head.
  */
 
 #include "audio_common.cuh"
@@ -807,4 +809,409 @@ extern "C" __global__ void kernel_audio_keep_f32(
         return;
     }
     dst[i] = src[i];
+}
+
+/* ---- a causal decoder over a device KV cache ----------------------------- */
+
+/* The half-split rotation at the decoder state's position: row `row` turns by
+ * (state[POS] + pos0 + row) * theta^(-2m/hd). */
+extern "C" __global__ void kernel_audio_rope_half_state_f32(
+        const struct audio_args_rope args, float *x, const uint *state) {
+    const uint half_dim = args.head_dim / 2u;
+    const uint i = blockIdx.x * AUDIO_LINEAR_BLOCK + threadIdx.x;
+    if (i >= args.rows * args.heads * half_dim) {
+        return;
+    }
+    const uint m = i % half_dim;
+    const uint rh = i / half_dim;
+    const uint row = rh / args.heads;
+    float *p = x + (uint64_t) rh * args.head_dim;
+    const float inv_freq = powf(args.theta, -2.0f * (float) m / (float) args.head_dim);
+    const float ang = (float) (state[AUDIO_DECODE_POS] + args.pos0 + row) * inv_freq;
+    float s;
+    float c;
+    sincosf(ang, &s, &c);
+    const float a = p[m];
+    const float b = p[m + half_dim];
+    p[m] = a * c - b * s;
+    p[m + half_dim] = b * c + a * s;
+}
+
+/* rows new k and v rows, [rows][kv_heads * hd], into one layer's cache planes
+ * [kv_heads][cap][hd] from the state's position on; a row at or past cap is
+ * dropped, and the position is left to the step kernel. */
+extern "C" __global__ void kernel_audio_kv_append_f32(
+        const struct audio_args_kv_append args, float *k_cache, float *v_cache, const float *k,
+        const float *v, const uint *state) {
+    const uint i = blockIdx.x * AUDIO_LINEAR_BLOCK + threadIdx.x;
+    const uint hd = args.head_dim;
+    if (i >= args.rows * args.kv_heads * hd) {
+        return;
+    }
+    const uint e = i % hd;
+    const uint rh = i / hd;
+    const uint h = rh % args.kv_heads;
+    const uint r = rh / args.kv_heads;
+    const uint pos = state[AUDIO_DECODE_POS] + r;
+    if (pos >= args.cap) {
+        return;
+    }
+    const uint64_t dst = ((uint64_t) h * args.cap + pos) * hd + e;
+    k_cache[dst] = k[i];
+    v_cache[dst] = v[i];
+}
+
+/* Causal grouped-query attention of a block of AUDIO_ATTN_QB queries of one
+ * head over a layer's cache planes, one warp per block, as the Metal twin:
+ * query i at pos0 + i sees rows 0..=pos0 + i of kv head h / (heads /
+ * kv_heads), and no row past the block's last query is read. */
+extern "C" __global__ void kernel_audio_causal_attn_f32(
+        const struct audio_args_cache_attn args, float *out, const float *q,
+        const float *k_cache, const float *v_cache) {
+    extern __shared__ float qa[];
+    const uint QB = AUDIO_ATTN_QB;
+    const uint h = blockIdx.x;
+    const uint i0 = blockIdx.y * QB;
+    const uint lane = threadIdx.x;
+    if (h >= args.heads || i0 >= args.n_q) {
+        return;
+    }
+    const uint hd = args.head_dim;
+    const uint w = args.heads * hd;
+    const uint hoff = h * hd;
+    const uint kvh = h / (args.heads / args.kv_heads);
+    const float *kp = k_cache + (uint64_t) kvh * args.cap * hd;
+    const float *vp = v_cache + (uint64_t) kvh * args.cap * hd;
+    const uint nq = min(QB, args.n_q - i0);
+    for (uint e = lane; e < QB * hd; e += 32u) {
+        const uint r = e / hd;
+        const uint d = e - r * hd;
+        qa[e] = r < nq ? q[(uint64_t) (i0 + r) * w + hoff + d] : 0.0f;
+    }
+    __syncwarp();
+
+    const uint qfirst = args.pos0 + i0;
+    const uint hi = min(qfirst + nq, args.cap);
+
+    float m[AUDIO_ATTN_QB];
+    float l[AUDIO_ATTN_QB];
+    float acc[AUDIO_ATTN_QB][AUDIO_ATTN_SLOTS];
+    for (uint r = 0; r < QB; ++r) {
+        m[r] = -INFINITY;
+        l[r] = 0.0f;
+        for (uint s = 0; s < AUDIO_ATTN_SLOTS; ++s) {
+            acc[r][s] = 0.0f;
+        }
+    }
+    for (uint base = 0; base < hi; base += 32u) {
+        const uint ka = base + lane;
+        const bool key_in = ka < hi;
+        float sc[AUDIO_ATTN_QB];
+        for (uint r = 0; r < QB; ++r) {
+            sc[r] = 0.0f;
+        }
+        if (key_in) {
+            const float *krow = kp + (uint64_t) ka * hd;
+            for (uint d = 0; d < hd; ++d) {
+                const float kd = krow[d];
+                for (uint r = 0; r < QB; ++r) {
+                    sc[r] += qa[r * hd + d] * kd;
+                }
+            }
+        }
+        for (uint r = 0; r < QB; ++r) {
+            const bool visible = key_in && r < nq && ka <= qfirst + r;
+            sc[r] = visible ? args.scale * sc[r] : -INFINITY;
+        }
+        float p[AUDIO_ATTN_QB];
+        for (uint r = 0; r < QB; ++r) {
+            const float block_max = audio_warp_max_all(sc[r]);
+            const float m_new = fmaxf(m[r], block_max);
+            const float corr = m_new == -INFINITY ? 1.0f : expf(m[r] - m_new);
+            p[r] = sc[r] == -INFINITY ? 0.0f : expf(sc[r] - m_new);
+            l[r] = l[r] * corr + audio_warp_sum_all(p[r]);
+            for (uint s = 0; s < AUDIO_ATTN_SLOTS; ++s) {
+                acc[r][s] *= corr;
+            }
+            m[r] = m_new;
+        }
+        const uint keys_here = min(32u, hi - base);
+        for (uint jj = 0; jj < keys_here; ++jj) {
+            const float *vrow = vp + (uint64_t) (base + jj) * hd;
+            float vv[AUDIO_ATTN_SLOTS];
+            for (uint s = 0; s < AUDIO_ATTN_SLOTS; ++s) {
+                const uint e = lane + 32u * s;
+                vv[s] = e < hd ? vrow[e] : 0.0f;
+            }
+            for (uint r = 0; r < QB; ++r) {
+                const float pj = __shfl_sync(0xffffffffu, p[r], jj);
+                for (uint s = 0; s < AUDIO_ATTN_SLOTS; ++s) {
+                    acc[r][s] += pj * vv[s];
+                }
+            }
+        }
+    }
+    for (uint r = 0; r < nq; ++r) {
+        const float inv = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
+        for (uint s = 0; s < AUDIO_ATTN_SLOTS; ++s) {
+            const uint e = lane + 32u * s;
+            if (e < hd) {
+                out[(uint64_t) (i0 + r) * w + hoff + e] = acc[r][s] * inv;
+            }
+        }
+    }
+}
+
+/* The one query of a decode step, per head, over cache rows 0..=state[POS] of
+ * its kv head, split over the rows, as the Metal twin: one warp per (kv head,
+ * split, tile of AUDIO_DECODE_GT query heads), four splits to a 128-thread
+ * block, grid (kv_heads, ceil(splits / 4), ceil(group / GT)). Lanes own four
+ * consecutive dims; rows go AUDIO_DECODE_KB at a time. Each (head, split)
+ * leaves its unnormalised accumulator at partials[(h * splits + split) * hd]
+ * and its (max, sum) pair at heads * splits * hd + 2 (h * splits + split).
+ * The exponentials are the accurate ones; the Metal twin takes the fast ones
+ * for speed, within 3 ulp of 1 on every weight. */
+extern "C" __global__ void kernel_audio_decode_attn_f32(
+        const struct audio_args_cache_attn args, float *partials, const float *q,
+        const float *k_cache, const float *v_cache, const uint *state) {
+    const uint KB = AUDIO_DECODE_KB;
+    const uint GT = AUDIO_DECODE_GT;
+    const uint lane = threadIdx.x & 31u;
+    const uint sg = threadIdx.x >> 5u;
+    const uint kvh = blockIdx.x;
+    const uint split = blockIdx.y * AUDIO_DECODE_SPLITS_PER_TG + sg;
+    const uint group = args.heads / args.kv_heads;
+    const uint g0 = blockIdx.z * GT;
+    if (kvh >= args.kv_heads || split >= args.splits || g0 >= group) {
+        return;
+    }
+    const uint ng = min(GT, group - g0);
+    const uint h0 = kvh * group + g0;
+    const uint hd = args.head_dim;
+    const uint n4 = hd / 4u;
+    const bool owns = lane < n4;
+    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4 *kp = (const float4 *) (k_cache + (uint64_t) kvh * args.cap * hd);
+    const float4 *vp = (const float4 *) (v_cache + (uint64_t) kvh * args.cap * hd);
+    float4 qv[AUDIO_DECODE_GT];
+    float m[AUDIO_DECODE_GT];
+    float l[AUDIO_DECODE_GT];
+    float4 acc[AUDIO_DECODE_GT];
+    for (uint g = 0; g < GT; ++g) {
+        qv[g] = (g < ng && owns) ? ((const float4 *) (q + (uint64_t) (h0 + g) * hd))[lane] : zero;
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+        acc[g] = zero;
+    }
+    const uint len = min(state[AUDIO_DECODE_POS] + 1u, args.cap);
+    const uint per = ((len + args.splits - 1u) / args.splits + KB - 1u) / KB * KB;
+    const uint start = split * per;
+    const uint end = min(start + per, len);
+    for (uint base = start; base < end; base += KB) {
+        const uint n = min(KB, end - base);
+        float4 kv[AUDIO_DECODE_KB];
+        float4 vv[AUDIO_DECODE_KB];
+        for (uint b = 0; b < KB; ++b) {
+            const bool in = b < n && owns;
+            kv[b] = in ? kp[(uint64_t) (base + b) * n4 + lane] : zero;
+            vv[b] = in ? vp[(uint64_t) (base + b) * n4 + lane] : zero;
+        }
+        for (uint g = 0; g < GT; ++g) {
+            float p[AUDIO_DECODE_KB];
+            float mb = -INFINITY;
+            for (uint b = 0; b < KB; ++b) {
+                const float dx = qv[g].x * kv[b].x;
+                const float dy = qv[g].y * kv[b].y;
+                const float dz = qv[g].z * kv[b].z;
+                const float dw = qv[g].w * kv[b].w;
+                const float s = args.scale * audio_warp_sum_all((dx + dy) + (dz + dw));
+                p[b] = b < n ? s : -INFINITY;
+                mb = fmaxf(mb, p[b]);
+            }
+            const float m_new = fmaxf(m[g], mb);
+            const float corr = m[g] == -INFINITY ? 0.0f : expf(m[g] - m_new);
+            float sum = 0.0f;
+            float4 a = make_float4(acc[g].x * corr, acc[g].y * corr, acc[g].z * corr, acc[g].w * corr);
+            for (uint b = 0; b < KB; ++b) {
+                const float pb = b < n ? expf(p[b] - m_new) : 0.0f;
+                sum += pb;
+                a.x += pb * vv[b].x;
+                a.y += pb * vv[b].y;
+                a.z += pb * vv[b].z;
+                a.w += pb * vv[b].w;
+            }
+            l[g] = l[g] * corr + sum;
+            acc[g] = a;
+            m[g] = m_new;
+        }
+    }
+    const uint64_t ml0 = (uint64_t) args.heads * args.splits * hd;
+    for (uint g = 0; g < ng; ++g) {
+        const uint64_t slot = (uint64_t) (h0 + g) * args.splits + split;
+        if (owns) {
+            ((float4 *) (partials + slot * hd))[lane] = acc[g];
+        }
+        if (lane == 0u) {
+            partials[ml0 + 2u * slot] = m[g];
+            partials[ml0 + 2u * slot + 1u] = l[g];
+        }
+    }
+}
+
+/* Closes decode attention, one block of AUDIO_DECODE_MERGE_THREADS per head,
+ * as the Metal twin: the splits' weights formed once into shared memory and
+ * summed by the block reduction, warp g summing the accumulators of splits
+ * g, g + 8, ... in order, and the eight partial sums added in warp order. */
+extern "C" __global__ void kernel_audio_decode_attn_merge_f32(
+        const struct audio_args_cache_attn args, float *out, const float *partials) {
+    __shared__ float wts[AUDIO_DECODE_MAX_SPLITS];
+    __shared__ float scratch[AUDIO_BLOCK_SUM_SLOTS];
+    __shared__ float4 part[AUDIO_DECODE_MERGE_SG][32];
+    const uint NT = AUDIO_DECODE_MERGE_THREADS;
+    const uint tid = threadIdx.x;
+    const uint lane = tid & 31u;
+    const uint sg = tid >> 5u;
+    const uint h = blockIdx.x;
+    if (h >= args.heads) {
+        return;
+    }
+    const uint hd = args.head_dim;
+    const uint n4 = hd / 4u;
+    const bool owns = lane < n4;
+    const uint splits = min(args.splits, AUDIO_DECODE_MAX_SPLITS);
+    const float *ml = partials + (uint64_t) args.heads * args.splits * hd
+            + 2u * (uint64_t) h * args.splits;
+    const float4 *accs = (const float4 *) (partials + (uint64_t) h * args.splits * hd);
+    float mx = -INFINITY;
+    for (uint s = tid; s < splits; s += NT) {
+        mx = fmaxf(mx, ml[2u * s]);
+    }
+    mx = audio_warp_max_all(mx);
+    if (lane == 0u) {
+        scratch[sg] = mx;
+    }
+    __syncthreads();
+    mx = -INFINITY;
+    for (uint g = 0; g < AUDIO_DECODE_MERGE_SG; ++g) {
+        mx = fmaxf(mx, scratch[g]);
+    }
+    __syncthreads();
+    float t = 0.0f;
+    for (uint s = tid; s < splits; s += NT) {
+        const float ms = ml[2u * s];
+        const float ws = ms == -INFINITY ? 0.0f : expf(ms - mx);
+        wts[s] = ws;
+        t += ml[2u * s + 1u] * ws;
+    }
+    const float total = audio_block_sum(t, scratch, tid, NT);
+    float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (owns) {
+        for (uint s = sg; s < splits; s += AUDIO_DECODE_MERGE_SG) {
+            const float4 v = accs[(uint64_t) s * n4 + lane];
+            const float w = wts[s];
+            a.x += v.x * w;
+            a.y += v.y * w;
+            a.z += v.z * w;
+            a.w += v.w * w;
+        }
+    }
+    part[sg][lane] = a;
+    __syncthreads();
+    if (sg == 0u && owns) {
+        float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (uint g = 0; g < AUDIO_DECODE_MERGE_SG; ++g) {
+            sum.x += part[g][lane].x;
+            sum.y += part[g][lane].y;
+            sum.z += part[g][lane].z;
+            sum.w += part[g][lane].w;
+        }
+        const float inv = total > 0.0f ? 1.0f / total : 0.0f;
+        ((float4 *) (out + (uint64_t) h * hd))[lane] =
+                make_float4(sum.x * inv, sum.y * inv, sum.z * inv, sum.w * inv);
+    }
+}
+
+/* One decision of a causal decoder, on one thread, as the Metal twin: the
+ * position moves by `advance`, an end id stops without emitting, any other id
+ * is emitted to out[slot] and stops at the max_tokens-th, and a done state
+ * writes NONE, lowers the emit flag and changes nothing else. */
+extern "C" __global__ void kernel_audio_decode_step_u32(
+        const struct audio_args_decode_step args, uint *state, uint *out, const uint *ids) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) {
+        return;
+    }
+    out[args.slot] = AUDIO_DECODE_NONE;
+    state[AUDIO_DECODE_EMIT] = 0u;
+    if (state[AUDIO_DECODE_DONE] != 0u) {
+        return;
+    }
+    const uint count = state[AUDIO_DECODE_COUNT];
+    if (count >= args.max_tokens) {
+        state[AUDIO_DECODE_DONE] = 1u;
+        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_CAP;
+        return;
+    }
+    state[AUDIO_DECODE_POS] += args.advance;
+    const uint k = ids[0];
+    if (k == args.eos0 || k == args.eos1) {
+        state[AUDIO_DECODE_DONE] = 1u;
+        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_EOS;
+        return;
+    }
+    out[args.slot] = k;
+    state[AUDIO_DECODE_TOKEN] = k;
+    state[AUDIO_DECODE_EMIT] = 1u;
+    state[AUDIO_DECODE_COUNT] = count + 1u;
+    if (count + 1u >= args.max_tokens) {
+        state[AUDIO_DECODE_DONE] = 1u;
+        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_CAP;
+    }
+}
+
+/* out = table[token] dequantised, the state's last token's row of a
+ * [vocab][width] table read through the GEMM's weight readers; zeros past the
+ * table. */
+template <typename W>
+static __device__ __forceinline__ void audio_embed_token(
+        const struct audio_args_embed_token args, float *out, const void *table,
+        const uint *state) {
+    const uint u = blockIdx.x * AUDIO_LINEAR_BLOCK + threadIdx.x;
+    if (u >= args.width) {
+        return;
+    }
+    const uint k = state[AUDIO_DECODE_TOKEN];
+    out[u] = k < args.vocab ? W::load(table, (uint64_t) k * args.width + u) : 0.0f;
+}
+
+#define AUDIO_EMBED_ENTRY(SUFFIX, W) \
+    extern "C" __global__ void kernel_audio_embed_token_##SUFFIX( \
+            const struct audio_args_embed_token args, float *out, const void *table, \
+            const uint *state) { \
+        audio_embed_token<W>(args, out, table, state); \
+    }
+
+AUDIO_EMBED_ENTRY(f32w, audio_w_f32)
+AUDIO_EMBED_ENTRY(bf16w, audio_w_bf16)
+AUDIO_EMBED_ENTRY(f16w, audio_w_f16)
+AUDIO_EMBED_ENTRY(q8_0w, audio_w_q8_0)
+
+/* The row above from an 8-bit affine table: per group of a row a bf16 scale
+ * and bias, the bytes packed four to a little-endian u32, each value one fused
+ * q * scale + bias. */
+extern "C" __global__ void kernel_audio_embed_token_affine8w(
+        const struct audio_args_embed_token args, float *out, const uint *words,
+        const unsigned short *scales, const unsigned short *biases, const uint *state) {
+    const uint u = blockIdx.x * AUDIO_LINEAR_BLOCK + threadIdx.x;
+    if (u >= args.width) {
+        return;
+    }
+    const uint k = state[AUDIO_DECODE_TOKEN];
+    if (k >= args.vocab) {
+        out[u] = 0.0f;
+        return;
+    }
+    const uint64_t i = (uint64_t) k * args.width + u;
+    const uint64_t g = (uint64_t) k * (args.width / args.group) + u / args.group;
+    const float qv = (float) ((words[i >> 2u] >> (8u * (uint) (i & 3u))) & 0xffu);
+    out[u] = fmaf(qv, audio_bf16(scales + g), audio_bf16(biases + g));
 }

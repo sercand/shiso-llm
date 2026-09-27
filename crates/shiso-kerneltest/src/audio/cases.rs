@@ -60,6 +60,17 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_bias_rows_f32",
     "kernel_audio_argmax_rows_f32",
     "kernel_audio_im2col_s2_f32",
+    "kernel_audio_causal_attn_f32",
+    "kernel_audio_decode_attn_f32",
+    "kernel_audio_decode_attn_merge_f32",
+    "kernel_audio_kv_append_f32",
+    "kernel_audio_rope_half_state_f32",
+    "kernel_audio_decode_step_u32",
+    "kernel_audio_embed_token_f32w",
+    "kernel_audio_embed_token_bf16w",
+    "kernel_audio_embed_token_f16w",
+    "kernel_audio_embed_token_q8_0w",
+    "kernel_audio_embed_token_affine8w",
 ];
 
 const LINEAR_BLOCK: u32 = 256;
@@ -2148,4 +2159,630 @@ pub fn keep_copies_only_on_emit(gpu: &Gpu) {
         let want = if emit == 1 { &src } else { &dst0 };
         close(&gpu.read_f32(&db), want, 0.0, &format!("keep, emit {emit}"));
     }
+}
+
+// ---- a causal decoder over a device KV cache -------------------------------
+
+/// `audio_args_cache_attn`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct CacheAttnArgs {
+    n_q: u32,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    pos0: u32,
+    cap: u32,
+    scale: f32,
+    splits: u32,
+}
+const _: () = assert!(size_of::<CacheAttnArgs>() == 32);
+
+/// `audio_args_kv_append`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct KvAppendArgs {
+    rows: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    cap: u32,
+}
+const _: () = assert!(size_of::<KvAppendArgs>() == 16);
+
+/// `audio_args_decode_step`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct DecodeStepArgs {
+    eos0: u32,
+    eos1: u32,
+    max_tokens: u32,
+    advance: u32,
+    slot: u32,
+}
+const _: () = assert!(size_of::<DecodeStepArgs>() == 20);
+
+/// `audio_args_embed_token`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct EmbedTokenArgs {
+    width: u32,
+    vocab: u32,
+    group: u32,
+}
+const _: () = assert!(size_of::<EmbedTokenArgs>() == 12);
+
+/// Splits one decode-attention threadgroup runs, query heads one simdgroup
+/// takes per kv head, and the merge's threads per head.
+const DECODE_SPLITS_PER_TG: u32 = 4;
+const DECODE_GROUP_TILE: u32 = 2;
+const DECODE_MERGE_THREADS: u32 = 256;
+/// The decoder state's words: cache rows filled, tokens emitted, done, last
+/// token, emitted, stop reason.
+const DEC_POS: usize = 0;
+const DEC_COUNT: usize = 1;
+const DEC_DONE: usize = 2;
+const DEC_TOKEN: usize = 3;
+const DEC_EMIT: usize = 4;
+const DEC_STOP: usize = 5;
+const DEC_STOP_EOS: u32 = 1;
+const DEC_STOP_CAP: u32 = 2;
+
+fn decode_state(gpu: &Gpu, pos: u32, token: u32) -> DeviceBuffer {
+    gpu.upload(&u32_bytes(&[pos, 0, 0, token, 0, 0, 0, 0]))
+}
+
+/// One layer's cache plane, `[kv_heads][cap][hd]`: rows below `valid` hold
+/// the signal, rows at or past it NaN, so a kernel that reads a row it may
+/// not see answers NaN.
+fn cache_plane(kv_heads: usize, cap: usize, hd: usize, valid: usize, seed: u32) -> Vec<f32> {
+    let mut plane = oracle::signal(kv_heads * cap * hd, seed);
+    for h in 0..kv_heads {
+        for r in valid..cap {
+            plane[(h * cap + r) * hd..(h * cap + r + 1) * hd].fill(f32::NAN);
+        }
+    }
+    plane
+}
+
+/// Causal GQA attention over a cache plane, in f64: query `i` of head `h`
+/// sits at `pos0 + i` and sees cache rows `0..=pos0 + i` of kv head
+/// `h / (heads / kv_heads)`.
+struct CacheAttnOracle<'a> {
+    q: &'a [f32],
+    k: &'a [f32],
+    v: &'a [f32],
+    n_q: usize,
+    heads: usize,
+    kv_heads: usize,
+    hd: usize,
+    pos0: usize,
+    cap: usize,
+    scale: f32,
+}
+
+fn cache_attn_oracle(o: &CacheAttnOracle<'_>) -> Vec<f32> {
+    let w = o.heads * o.hd;
+    let group = o.heads / o.kv_heads;
+    let mut out = vec![0.0f32; o.n_q * w];
+    for i in 0..o.n_q {
+        for h in 0..o.heads {
+            let kvh = h / group;
+            let seen = o.pos0 + i + 1;
+            let scores: Vec<f64> = (0..seen)
+                .map(|j| {
+                    let dot: f64 = (0..o.hd)
+                        .map(|e| {
+                            f64::from(o.q[i * w + h * o.hd + e])
+                                * f64::from(o.k[(kvh * o.cap + j) * o.hd + e])
+                        })
+                        .sum();
+                    f64::from(o.scale) * dot
+                })
+                .collect();
+            let mx = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let z: f64 = scores.iter().map(|s| (s - mx).exp()).sum();
+            for e in 0..o.hd {
+                let acc: f64 = scores
+                    .iter()
+                    .enumerate()
+                    .map(|(j, s)| (s - mx).exp() / z * f64::from(o.v[(kvh * o.cap + j) * o.hd + e]))
+                    .sum();
+                out[i * w + h * o.hd + e] = acc as f32;
+            }
+        }
+    }
+    out
+}
+
+/// Prefill attention is causal and grouped: each query sees the cache up to
+/// its own absolute position, and a query head reads its group's kv head,
+/// from a cache offset of zero and of 37 rows. Rows past the last query's
+/// position are NaN, so a row read that should not be is caught.
+///
+/// # Panics
+///
+/// When an output differs from the oracle by more than 2e-5.
+pub fn causal_attention_matches_for_gqa_and_a_cache_offset(gpu: &Gpu) {
+    let (heads, kv_heads, hd, n_q, cap) = (4usize, 2usize, 128usize, 13usize, 64usize);
+    let scale = 1.0 / (hd as f32).sqrt();
+    for pos0 in [0usize, 37] {
+        let valid = pos0 + n_q;
+        let q = oracle::signal(n_q * heads * hd, 171 + pos0 as u32);
+        let k = cache_plane(kv_heads, cap, hd, valid, 172);
+        let v = cache_plane(kv_heads, cap, hd, valid, 173);
+        let (qb, kb, vb) = (
+            gpu.upload(&f32_bytes(&q)),
+            gpu.upload(&f32_bytes(&k)),
+            gpu.upload(&f32_bytes(&v)),
+        );
+        let out = gpu.upload(&f32_bytes(&vec![f32::NAN; n_q * heads * hd]));
+        let args = CacheAttnArgs {
+            n_q: n_q as u32,
+            heads: heads as u32,
+            kv_heads: kv_heads as u32,
+            head_dim: hd as u32,
+            pos0: pos0 as u32,
+            cap: cap as u32,
+            scale,
+            splits: 0,
+        };
+        launch(
+            gpu,
+            "kernel_audio_causal_attn_f32",
+            Extent3::new(heads as u32, blocks(n_q, ATTN_QUERY_BLOCK), 1),
+            Extent3::linear(32),
+            ATTN_QUERY_BLOCK * hd as u32 * 4,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(qb.view()),
+                KernelArg::Buffer(kb.view()),
+                KernelArg::Buffer(vb.view()),
+            ],
+        );
+        drain(gpu);
+        let want = cache_attn_oracle(&CacheAttnOracle {
+            q: &q,
+            k: &k,
+            v: &v,
+            n_q,
+            heads,
+            kv_heads,
+            hd,
+            pos0,
+            cap,
+            scale,
+        });
+        close(
+            &gpu.read_f32(&out),
+            &want,
+            2e-5,
+            &format!("causal attention, pos0 {pos0}"),
+        );
+    }
+}
+
+/// Decode attention takes its length from the state: the one query of each
+/// head at position `pos` sees rows `0..=pos`, for a length of one row, a
+/// length shorter than the splits, and several blocks per split with a
+/// ragged tail, split one way, five ways and 32 ways, for query groups of
+/// one, two and four heads; the merge closes the splits into the same
+/// answer. The rows past the length are NaN.
+///
+/// # Panics
+///
+/// When an output differs from the oracle by more than 2e-5.
+pub fn decode_attention_reads_its_length_from_the_state(gpu: &Gpu) {
+    // Groups of two (one tile), four (two tiles) and one (a tile's edge).
+    for (heads, kv_heads, hd) in [(16usize, 8usize, 128usize), (8, 2, 128), (3, 3, 64)] {
+        decode_attention_case(gpu, heads, kv_heads, hd);
+    }
+}
+
+fn decode_attention_case(gpu: &Gpu, heads: usize, kv_heads: usize, hd: usize) {
+    let cap = 1100usize;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let q = oracle::signal(heads * hd, 181);
+    let qb = gpu.upload(&f32_bytes(&q));
+    for pos in [0usize, 3, 1037] {
+        let k = cache_plane(kv_heads, cap, hd, pos + 1, 182);
+        let v = cache_plane(kv_heads, cap, hd, pos + 1, 183);
+        let (kb, vb) = (gpu.upload(&f32_bytes(&k)), gpu.upload(&f32_bytes(&v)));
+        let state = decode_state(gpu, pos as u32, 0);
+        let want = cache_attn_oracle(&CacheAttnOracle {
+            q: &q,
+            k: &k,
+            v: &v,
+            n_q: 1,
+            heads,
+            kv_heads,
+            hd,
+            pos0: pos,
+            cap,
+            scale,
+        });
+        for splits in [1usize, 5, 32] {
+            let partials = gpu.upload(&f32_bytes(&vec![f32::NAN; heads * splits * (hd + 2)]));
+            let out = gpu.upload(&f32_bytes(&vec![f32::NAN; heads * hd]));
+            let args = CacheAttnArgs {
+                n_q: 1,
+                heads: heads as u32,
+                kv_heads: kv_heads as u32,
+                head_dim: hd as u32,
+                pos0: 0,
+                cap: cap as u32,
+                scale,
+                splits: splits as u32,
+            };
+            launch(
+                gpu,
+                "kernel_audio_decode_attn_f32",
+                Extent3::new(
+                    kv_heads as u32,
+                    blocks(splits, DECODE_SPLITS_PER_TG),
+                    blocks(heads / kv_heads, DECODE_GROUP_TILE),
+                ),
+                Extent3::linear(32 * DECODE_SPLITS_PER_TG),
+                0,
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(partials.view()),
+                    KernelArg::Buffer(qb.view()),
+                    KernelArg::Buffer(kb.view()),
+                    KernelArg::Buffer(vb.view()),
+                    KernelArg::Buffer(state.view()),
+                ],
+            );
+            launch(
+                gpu,
+                "kernel_audio_decode_attn_merge_f32",
+                Extent3::linear(heads as u32),
+                Extent3::linear(DECODE_MERGE_THREADS),
+                0,
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(partials.view()),
+                ],
+            );
+            drain(gpu);
+            close(
+                &gpu.read_f32(&out),
+                &want,
+                2e-5,
+                &format!(
+                    "decode attention, {heads}/{kv_heads} heads of {hd}, pos {pos}, {splits} splits"
+                ),
+            );
+        }
+    }
+}
+
+/// The append writes its rows at the state's position, head by head into
+/// the `[kv_heads][cap][hd]` planes, leaves every other row alone, and
+/// drops a row that would land at or past the capacity.
+///
+/// # Panics
+///
+/// When a row is written where it should not be, or not where it should.
+pub fn kv_append_writes_at_the_state_position(gpu: &Gpu) {
+    let (kv_heads, hd, cap, rows) = (2usize, 128usize, 20usize, 3usize);
+    for pos in [5usize, 18] {
+        let (k0, v0) = (
+            oracle::signal(kv_heads * cap * hd, 191),
+            oracle::signal(kv_heads * cap * hd, 192),
+        );
+        let (kn, vn) = (
+            oracle::signal(rows * kv_heads * hd, 193),
+            oracle::signal(rows * kv_heads * hd, 194),
+        );
+        let (kc, vc) = (gpu.upload(&f32_bytes(&k0)), gpu.upload(&f32_bytes(&v0)));
+        let (kb, vb) = (gpu.upload(&f32_bytes(&kn)), gpu.upload(&f32_bytes(&vn)));
+        let state = decode_state(gpu, pos as u32, 0);
+        let args = KvAppendArgs {
+            rows: rows as u32,
+            kv_heads: kv_heads as u32,
+            head_dim: hd as u32,
+            cap: cap as u32,
+        };
+        launch(
+            gpu,
+            "kernel_audio_kv_append_f32",
+            Extent3::linear(blocks(rows * kv_heads * hd, LINEAR_BLOCK)),
+            Extent3::linear(LINEAR_BLOCK),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(kc.view()),
+                KernelArg::Buffer(vc.view()),
+                KernelArg::Buffer(kb.view()),
+                KernelArg::Buffer(vb.view()),
+                KernelArg::Buffer(state.view()),
+            ],
+        );
+        drain(gpu);
+        let place = |plane: &[f32], new: &[f32]| {
+            let mut want = plane.to_vec();
+            for r in 0..rows {
+                if pos + r >= cap {
+                    continue;
+                }
+                for h in 0..kv_heads {
+                    let dst = (h * cap + pos + r) * hd;
+                    let src = (r * kv_heads + h) * hd;
+                    want[dst..dst + hd].copy_from_slice(&new[src..src + hd]);
+                }
+            }
+            want
+        };
+        close(
+            &gpu.read_f32(&kc),
+            &place(&k0, &kn),
+            0.0,
+            &format!("kv append k, pos {pos}"),
+        );
+        close(
+            &gpu.read_f32(&vc),
+            &place(&v0, &vn),
+            0.0,
+            &format!("kv append v, pos {pos}"),
+        );
+        assert_eq!(
+            read_u32(gpu, &state)[DEC_POS],
+            pos as u32,
+            "the append leaves the position to the step"
+        );
+    }
+}
+
+/// Queues a batch of decode steps over scripted argmax ids with no read
+/// between them, as the decoder does, and returns the slots and the state.
+fn decode_batch(
+    gpu: &Gpu,
+    state: &DeviceBuffer,
+    ids: &[u32],
+    max_tokens: u32,
+    first_advance: u32,
+) -> (Vec<u32>, Vec<u32>) {
+    let out = gpu.upload(&u32_bytes(&vec![7777; ids.len()]));
+    let id_bufs: Vec<DeviceBuffer> = ids
+        .iter()
+        .map(|&id| gpu.upload(&u32_bytes(&[id])))
+        .collect();
+    for (slot, idb) in id_bufs.iter().enumerate() {
+        let args = DecodeStepArgs {
+            eos0: 151_643,
+            eos1: 151_645,
+            max_tokens,
+            advance: if slot == 0 { first_advance } else { 1 },
+            slot: slot as u32,
+        };
+        launch(
+            gpu,
+            "kernel_audio_decode_step_u32",
+            Extent3::linear(1),
+            Extent3::linear(1),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(state.view()),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(idb.view()),
+            ],
+        );
+    }
+    drain(gpu);
+    (read_u32(gpu, &out), read_u32(gpu, state))
+}
+
+/// The step appends each argmax to its slot and advances the position, stops
+/// on either end id without emitting it, stops after the token cap with the
+/// last token kept, and once stopped every later step in the batch writes
+/// the no-token mark and changes nothing.
+///
+/// # Panics
+///
+/// When a slot or a state word differs from the rules.
+pub fn decode_step_stops_on_eos_and_goes_quiet(gpu: &Gpu) {
+    let none = u32::MAX;
+    // The first step takes the prefill's argmax: nothing was appended for it,
+    // so the position stays where the host left it.
+    let state = decode_state(gpu, 10, 0);
+    let (out, s) = decode_batch(gpu, &state, &[5, 6, 151_645, 7, 8], 100, 0);
+    assert_eq!(out, vec![5, 6, none, none, none]);
+    assert_eq!(s[DEC_POS], 12, "steps 1 and 2 each fed one row");
+    assert_eq!(s[DEC_COUNT], 2);
+    assert_eq!(s[DEC_DONE], 1);
+    assert_eq!(s[DEC_TOKEN], 6, "the end id is not the last token");
+    assert_eq!(s[DEC_EMIT], 0);
+    assert_eq!(s[DEC_STOP], DEC_STOP_EOS);
+    // The other end id, with every step fed.
+    let state = decode_state(gpu, 3, 42);
+    let (out, s) = decode_batch(gpu, &state, &[9, 151_643, 1], 100, 1);
+    assert_eq!(out, vec![9, none, none]);
+    assert_eq!(s[DEC_POS], 5);
+    assert_eq!((s[DEC_COUNT], s[DEC_TOKEN]), (1, 9));
+    assert_eq!(s[DEC_STOP], DEC_STOP_EOS);
+    // The cap keeps its last token and then goes quiet.
+    let state = decode_state(gpu, 0, 42);
+    let (out, s) = decode_batch(gpu, &state, &[1, 2, 3, 4, 5], 3, 1);
+    assert_eq!(out, vec![1, 2, 3, none, none]);
+    assert_eq!((s[DEC_POS], s[DEC_COUNT], s[DEC_TOKEN]), (3, 3, 3));
+    assert_eq!(
+        (s[DEC_DONE], s[DEC_STOP], s[DEC_EMIT]),
+        (1, DEC_STOP_CAP, 0)
+    );
+    // A batch still running leaves done low and the emit flag up.
+    let state = decode_state(gpu, 0, 42);
+    let (out, s) = decode_batch(gpu, &state, &[11, 12], 100, 1);
+    assert_eq!(out, vec![11, 12]);
+    assert_eq!((s[DEC_POS], s[DEC_COUNT], s[DEC_TOKEN]), (2, 2, 12));
+    assert_eq!((s[DEC_DONE], s[DEC_STOP], s[DEC_EMIT]), (0, 0, 1));
+    // A later batch on the same state carries on from it.
+    let (out, s) = decode_batch(gpu, &state, &[13, 151_645], 100, 1);
+    assert_eq!(out, vec![13, none]);
+    assert_eq!((s[DEC_POS], s[DEC_COUNT], s[DEC_TOKEN]), (4, 3, 13));
+}
+
+/// MLX 8-bit affine rows: per group of `group` elements a bf16 scale and bias,
+/// the bytes packed four to a little-endian u32. Returns the words', scales'
+/// and biases' bytes.
+fn affine8_fixture(rows: usize, width: usize, group: usize, seed: u32) -> [Vec<u8>; 3] {
+    let raw = oracle::signal(rows * width, seed);
+    let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
+    let (mut words, mut scales, mut biases) = (Vec::new(), Vec::new(), Vec::new());
+    for g in raw.chunks(group) {
+        let lo = g.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = g.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let s = f32::from_bits(u32::from(bf16((hi - lo) / 255.0)) << 16);
+        let b = f32::from_bits(u32::from(bf16(lo)) << 16);
+        scales.extend_from_slice(&bf16(s).to_le_bytes());
+        biases.extend_from_slice(&bf16(b).to_le_bytes());
+        for v in g {
+            words.push(((v - b) / s).round().clamp(0.0, 255.0) as u8);
+        }
+    }
+    [words, scales, biases]
+}
+
+/// Element `i` of an affine fixture as the kernel dequantises it: one fused
+/// multiply-add of the byte, the group's scale and its bias.
+fn affine8_value(fx: &[Vec<u8>; 3], group: usize, i: usize) -> f32 {
+    let g = i / group;
+    let bf16 =
+        |b: &[u8]| f32::from_bits(u32::from(u16::from_le_bytes([b[2 * g], b[2 * g + 1]])) << 16);
+    f32::from(fx[0][i]).mul_add(bf16(&fx[1]), bf16(&fx[2]))
+}
+
+/// The embedding row of the state's last token, for every storage the text
+/// embedding comes in, dequantised exactly; zeros for a token past the table.
+///
+/// # Panics
+///
+/// When a value differs from the table's.
+pub fn embed_token_takes_the_state_token_row(gpu: &Gpu) {
+    let (vocab, width, group) = (9usize, 320usize, 64usize);
+    let dense: Vec<(&str, &'static str)> = vec![
+        ("f32w", "kernel_audio_embed_token_f32w"),
+        ("bf16w", "kernel_audio_embed_token_bf16w"),
+        ("f16w", "kernel_audio_embed_token_f16w"),
+        ("q8_0w", "kernel_audio_embed_token_q8_0w"),
+    ];
+    let args = EmbedTokenArgs {
+        width: width as u32,
+        vocab: vocab as u32,
+        group: group as u32,
+    };
+    let grid = Extent3::linear(blocks(width, LINEAR_BLOCK));
+    let row_of = |values: &[f32], token: u32| -> Vec<f32> {
+        let k = token as usize;
+        if k < vocab {
+            values[k * width..(k + 1) * width].to_vec()
+        } else {
+            vec![0.0; width]
+        }
+    };
+    for (kind, entry) in dense {
+        let (bytes, values) = weight_fixture(kind, vocab * width, 201);
+        let tb = gpu.upload(&bytes);
+        for token in [0u32, 7, 9] {
+            let state = decode_state(gpu, 0, token);
+            let out = gpu.upload(&f32_bytes(&vec![f32::NAN; width]));
+            launch(
+                gpu,
+                entry,
+                grid,
+                Extent3::linear(LINEAR_BLOCK),
+                0,
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(tb.view()),
+                    KernelArg::Buffer(state.view()),
+                ],
+            );
+            drain(gpu);
+            close(
+                &gpu.read_f32(&out),
+                &row_of(&values, token),
+                0.0,
+                &format!("embed token {kind} {token}"),
+            );
+        }
+    }
+    let fx = affine8_fixture(vocab, width, group, 202);
+    let values: Vec<f32> = (0..vocab * width)
+        .map(|i| affine8_value(&fx, group, i))
+        .collect();
+    let (wb, sb, bb) = (gpu.upload(&fx[0]), gpu.upload(&fx[1]), gpu.upload(&fx[2]));
+    for token in [0u32, 7, 9] {
+        let state = decode_state(gpu, 0, token);
+        let out = gpu.upload(&f32_bytes(&vec![f32::NAN; width]));
+        launch(
+            gpu,
+            "kernel_audio_embed_token_affine8w",
+            grid,
+            Extent3::linear(LINEAR_BLOCK),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(wb.view()),
+                KernelArg::Buffer(sb.view()),
+                KernelArg::Buffer(bb.view()),
+                KernelArg::Buffer(state.view()),
+            ],
+        );
+        drain(gpu);
+        close(
+            &gpu.read_f32(&out),
+            &row_of(&values, token),
+            0.0,
+            &format!("embed token affine8w {token}"),
+        );
+    }
+}
+
+/// The state-driven rotary embedding is the plain one at the state's position
+/// plus the offset, bit for bit.
+///
+/// # Panics
+///
+/// When a value differs from the plain rotation's.
+pub fn rope_half_state_takes_its_position_from_the_state(gpu: &Gpu) {
+    let (rows, heads, hd, theta) = (2usize, 16usize, 128usize, 1.0e6f32);
+    let (pos, offset) = (4093u32, 1u32);
+    let x = oracle::signal(rows * heads * hd, 211);
+    let pairs = rows * heads * hd / 2;
+    let rotate = |entry: &'static str, pos0: u32, state: Option<&DeviceBuffer>| {
+        let buf = gpu.upload(&f32_bytes(&x));
+        let args = RopeArgs {
+            rows: rows as u32,
+            heads: heads as u32,
+            head_dim: hd as u32,
+            pos0,
+            theta,
+        };
+        let mut bind = vec![
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(buf.view()),
+        ];
+        if let Some(s) = state {
+            bind.push(KernelArg::Buffer(s.view()));
+        }
+        launch(
+            gpu,
+            entry,
+            Extent3::linear(blocks(pairs, LINEAR_BLOCK)),
+            Extent3::linear(LINEAR_BLOCK),
+            0,
+            &bind,
+        );
+        drain(gpu);
+        gpu.read_f32(&buf)
+    };
+    let state = decode_state(gpu, pos, 0);
+    let got = rotate("kernel_audio_rope_half_state_f32", offset, Some(&state));
+    let want = rotate("kernel_audio_rope_half_f32", pos + offset, None);
+    close(&got, &want, 0.0, "rope at the state's position");
 }

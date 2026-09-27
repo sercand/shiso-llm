@@ -12,6 +12,8 @@
 //! launch.
 
 mod args;
+#[cfg(test)]
+mod decode_tests;
 mod linear;
 pub mod load;
 pub mod store;
@@ -27,9 +29,10 @@ use shiso_core::{
 pub use linear::{GemmType, Linear, LinearWeight};
 
 use args::{
-    ArgmaxArgs, AxpyArgs, BiasRowsArgs, Conv2dArgs, DwConv1dArgs, EmbedRowArgs, GemmArgs, GluArgs,
-    GreedyStepArgs, GreedyWindowArgs, KeepArgs, LstmArgs, NormArgs, RopeArgs, TransposeArgs,
-    UnaryArgs, UnfoldArgs, WindowAttnArgs,
+    ArgmaxArgs, AxpyArgs, BiasRowsArgs, CacheAttnArgs, Conv2dArgs, DecodeStepArgs, DwConv1dArgs,
+    EmbedRowArgs, EmbedTokenArgs, GemmArgs, GluArgs, GreedyStepArgs, GreedyWindowArgs, KeepArgs,
+    KvAppendArgs, LstmArgs, NormArgs, RopeArgs, TransposeArgs, UnaryArgs, UnfoldArgs,
+    WindowAttnArgs,
 };
 
 /// The kernel module every launch here names.
@@ -38,6 +41,43 @@ pub const MODULE: &str = "audio";
 /// `u32` words of greedy search's device state: frame, symbols on it, done,
 /// last token, emitted, and padding.
 pub const GREEDY_STATE_WORDS: usize = 8;
+/// `u32` words of a causal decoder's device state; the words are the
+/// `DECODE_*` indices below, and the rest is padding.
+pub const DECODE_STATE_WORDS: usize = 8;
+/// Decoder state word: cache rows filled, which is the position of the token
+/// the next pass feeds. Only the step kernel moves it.
+pub const DECODE_POS: usize = 0;
+/// Decoder state word: tokens emitted.
+pub const DECODE_COUNT: usize = 1;
+/// Decoder state word: nonzero once the decoder has stopped.
+pub const DECODE_DONE: usize = 2;
+/// Decoder state word: the last token emitted, the one the next pass feeds.
+pub const DECODE_TOKEN: usize = 3;
+/// Decoder state word: whether the last step emitted.
+pub const DECODE_EMIT: usize = 4;
+/// Decoder state word: why the decoder stopped, [`DECODE_STOP_EOS`] or
+/// [`DECODE_STOP_CAP`]; 0 while it runs.
+pub const DECODE_STOP: usize = 5;
+/// [`DECODE_STOP`]'s value after an end id.
+pub const DECODE_STOP_EOS: u32 = 1;
+/// [`DECODE_STOP`]'s value after the token cap.
+pub const DECODE_STOP_CAP: u32 = 2;
+/// What the step kernel writes to a slot whose step emitted nothing.
+pub const DECODE_NO_TOKEN: u32 = u32::MAX;
+/// Splits of decode attention: with eight kv heads, 256 simdgroups over the
+/// cached rows. On an M1 Max (24-core GPU), 16 query heads over 8 kv heads
+/// of 128: 16 splits took 1.6x as long over 4096 rows, and 64 or more
+/// gained under 10% there (none with the fast exponential the kernel now
+/// takes) while the merge's share grew at short lengths.
+pub const DECODE_ATTN_SPLITS: usize = 32;
+
+/// Floats of scratch decode attention needs for `heads` query heads of
+/// `head_dim` cut into `splits`: an accumulator and a (max, sum) pair per
+/// (head, split).
+#[must_use]
+pub const fn decode_attention_partials(heads: usize, head_dim: usize, splits: usize) -> usize {
+    heads * splits * (head_dim + 2)
+}
 /// Threads per group of the elementwise, norm and layout kernels.
 const LINEAR_BLOCK: u32 = 256;
 /// Threadgroup bytes of a norm's block reduction.
@@ -85,6 +125,15 @@ const GEMM64_BLOCK: u32 = 256;
 const GEMM64_SMEM: u32 = 20_480;
 /// Largest head dimension the attention holds in a lane's registers.
 const MAX_HEAD_DIM: usize = 128;
+/// Query heads of a kv head's group one decode-attention simdgroup scores
+/// against each cached row it reads; a larger group takes more simdgroups.
+const DECODE_GROUP_TILE: usize = 2;
+/// Splits one decode-attention threadgroup runs, a simdgroup each.
+const DECODE_SPLITS_PER_TG: usize = 4;
+/// Most splits decode attention's merge is written for.
+const DECODE_MAX_SPLITS: usize = 256;
+/// Threads of the decode-attention merge, per head.
+const DECODE_MERGE_THREADS: u32 = 256;
 /// Largest depthwise conv1d the kernels are written for.
 const MAX_TAPS: usize = 16;
 
@@ -476,6 +525,162 @@ pub struct KeepDesc<'a> {
     pub count: usize,
 }
 
+/// One layer's key and value cache planes, each `[kv_heads][cap][head_dim]`
+/// f32: the layout the cache kernels read, so a layer is two views.
+#[derive(Debug, Clone, Copy)]
+pub struct CachePlanes<'a> {
+    /// Keys.
+    pub k: DeviceView<'a>,
+    /// Values.
+    pub v: DeviceView<'a>,
+    /// Key and value heads.
+    pub kv_heads: usize,
+    /// Rows each head's plane holds.
+    pub cap: usize,
+    /// Width of one head.
+    pub head_dim: usize,
+}
+
+/// Causal grouped-query attention of many queries over a cache: query `i`
+/// sits at `pos0 + i` and sees cache rows `0..=pos0 + i`.
+#[derive(Debug, Clone, Copy)]
+pub struct CausalAttnDesc<'a> {
+    /// Destination, `[n_q][heads * head_dim]`.
+    pub out: DeviceView<'a>,
+    /// Queries, as the destination.
+    pub q: DeviceView<'a>,
+    /// The layer's cache, already holding rows `0..pos0 + n_q`.
+    pub cache: CachePlanes<'a>,
+    /// Query rows.
+    pub n_q: usize,
+    /// Query heads, a multiple of the cache's kv heads.
+    pub heads: usize,
+    /// Absolute position of query row 0.
+    pub pos0: usize,
+    /// Scale on the logit.
+    pub scale: f32,
+}
+
+/// The one query of a decode step over a cache, at the decoder state's
+/// position.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeAttnDesc<'a> {
+    /// Destination, `[heads * head_dim]`.
+    pub out: DeviceView<'a>,
+    /// Scratch for the splits' partial results, at least
+    /// [`decode_attention_partials`] floats; the caller keeps one for the
+    /// whole decode rather than allocating per step.
+    pub partials: DeviceView<'a>,
+    /// Runs the cached rows are cut into, each on its own simdgroup per kv
+    /// head. The length is only known on the device, so this is fixed per
+    /// launch; [`DECODE_ATTN_SPLITS`] is the measured default.
+    pub splits: usize,
+    /// The query, as the destination.
+    pub q: DeviceView<'a>,
+    /// The layer's cache, holding rows `0..=state[DECODE_POS]`.
+    pub cache: CachePlanes<'a>,
+    /// Query heads, a multiple of the cache's kv heads.
+    pub heads: usize,
+    /// The decoder state, whose position sets the rows seen.
+    pub state: DeviceView<'a>,
+    /// Scale on the logit.
+    pub scale: f32,
+}
+
+/// New key and value rows into a layer's cache at the decoder state's
+/// position.
+#[derive(Debug, Clone, Copy)]
+pub struct KvAppendDesc<'a> {
+    /// The layer's cache.
+    pub cache: CachePlanes<'a>,
+    /// Keys, `[rows][kv_heads * head_dim]`.
+    pub k: DeviceView<'a>,
+    /// Values, as the keys.
+    pub v: DeviceView<'a>,
+    /// The decoder state; its position is the first row written.
+    pub state: DeviceView<'a>,
+    /// Rows.
+    pub rows: usize,
+}
+
+/// Half-split rotary embedding at the decoder state's position, in place.
+#[derive(Debug, Clone, Copy)]
+pub struct RopeStateDesc<'a> {
+    /// `[rows][heads * head_dim]`.
+    pub x: DeviceView<'a>,
+    /// Rows.
+    pub rows: usize,
+    /// Heads.
+    pub heads: usize,
+    /// Width of one head, even.
+    pub head_dim: usize,
+    /// Added to the state's position for row 0.
+    pub offset: usize,
+    /// Frequency base.
+    pub theta: f32,
+    /// The decoder state.
+    pub state: DeviceView<'a>,
+}
+
+/// One decision of a causal decoder.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeStepDesc<'a> {
+    /// The decoder state, read and advanced.
+    pub state: DeviceView<'a>,
+    /// One `u32` per step of a batch.
+    pub out: DeviceView<'a>,
+    /// The head's argmax, one `u32`.
+    pub ids: DeviceView<'a>,
+    /// The ids that end the text; either stops the decoder and is not
+    /// emitted.
+    pub eos: [u32; 2],
+    /// Tokens the decoder may emit in all; the last is kept.
+    pub max_tokens: usize,
+    /// Cache rows the pass before this step appended: 0 for the step over the
+    /// prefill's argmax, 1 after a decode pass.
+    pub advance: usize,
+    /// This step's slot in `out`.
+    pub slot: usize,
+}
+
+/// A `[vocab][width]` embedding table as it is stored.
+#[derive(Debug, Clone, Copy)]
+pub enum EmbedTable<'a> {
+    /// A dense or `Q8_0` table, read as the audio GEMM reads that weight type.
+    Dense {
+        /// Storage.
+        dtype: GemmType,
+        /// The rows.
+        rows: DeviceView<'a>,
+    },
+    /// An 8-bit affine table: per `group` elements a bf16 scale and bias.
+    Affine8 {
+        /// The bytes, four to a little-endian `u32`, `[vocab][width]`.
+        words: DeviceView<'a>,
+        /// bf16, `[vocab][width / group]`.
+        scales: DeviceView<'a>,
+        /// bf16, as the scales.
+        biases: DeviceView<'a>,
+        /// Elements per group.
+        group: usize,
+    },
+}
+
+/// The f32 embedding row of the decoder state's last token.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbedTokenDesc<'a> {
+    /// `[width]`.
+    pub out: DeviceView<'a>,
+    /// The table.
+    pub table: EmbedTable<'a>,
+    /// The decoder state.
+    pub state: DeviceView<'a>,
+    /// Row width.
+    pub width: usize,
+    /// Rows in the table.
+    pub vocab: usize,
+}
+
 /// `n` as `f64`; exact for every count a model here holds.
 #[expect(
     clippy::cast_precision_loss,
@@ -514,6 +719,49 @@ fn limit(ok: bool, key: &'static str, value: usize) -> CoreResult<()> {
         Err(CoreError::InvalidValue {
             key,
             value: value.to_string(),
+        })
+    }
+}
+
+/// Refuses a view shorter than `bytes`.
+fn need_bytes(view: DeviceView<'_>, bytes: usize, field: &'static str) -> CoreResult<()> {
+    let want = u64::try_from(bytes).unwrap_or(u64::MAX);
+    if view.len() < want {
+        return Err(CoreError::ShapeMismatch {
+            field,
+            expected: want,
+            got: view.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses cache planes shorter than their geometry, or a geometry no cache
+/// kernel is written for.
+fn need_cache(c: &CachePlanes<'_>, heads: usize, what: &'static str) -> CoreResult<()> {
+    limit(
+        (1..=MAX_HEAD_DIM).contains(&c.head_dim),
+        "cache.head_dim",
+        c.head_dim,
+    )?;
+    limit(
+        c.kv_heads > 0 && heads.is_multiple_of(c.kv_heads),
+        what,
+        heads,
+    )?;
+    let plane = c.kv_heads * c.cap * c.head_dim;
+    need(c.k, plane, "cache.k")?;
+    need(c.v, plane, "cache.v")
+}
+
+/// Refuses a view a four-wide read cannot start at.
+fn aligned16(view: DeviceView<'_>, field: &'static str) -> CoreResult<()> {
+    if view.offset().is_multiple_of(16) {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidValue {
+            key: field,
+            value: format!("offset {} is not 16-byte aligned", view.offset()),
         })
     }
 }
@@ -1386,5 +1634,323 @@ impl Ops {
                 KernelArg::Buffer(d.state),
             ],
         )
+    }
+
+    /// Causal grouped-query attention of `n_q` queries over a layer's cache,
+    /// which must already hold every row they see.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a head wider than 128, query heads
+    /// that are not a multiple of the kv heads, or queries past the cache;
+    /// [`CoreError::ShapeMismatch`] for a short view; or the launch's error.
+    pub fn causal_attention(&self, d: &CausalAttnDesc<'_>) -> CoreResult<()> {
+        need_cache(&d.cache, d.heads, "causal_attention.heads")?;
+        limit(
+            d.pos0 + d.n_q <= d.cache.cap,
+            "causal_attention.pos0",
+            d.pos0 + d.n_q,
+        )?;
+        let hd = d.cache.head_dim;
+        let width = d.heads * hd;
+        need(d.out, d.n_q * width, "causal_attention.out")?;
+        need(d.q, d.n_q * width, "causal_attention.q")?;
+        let args = CacheAttnArgs {
+            n_q: dim(d.n_q, "causal_attention.n_q")?,
+            heads: dim(d.heads, "causal_attention.heads")?,
+            kv_heads: dim(d.cache.kv_heads, "causal_attention.kv_heads")?,
+            head_dim: dim(hd, "causal_attention.head_dim")?,
+            pos0: dim(d.pos0, "causal_attention.pos0")?,
+            cap: dim(d.cache.cap, "causal_attention.cap")?,
+            scale: d.scale,
+            splits: 0,
+        };
+        self.launch(
+            "kernel_audio_causal_attn_f32",
+            Extent3::new(
+                dim(d.heads.max(1), "causal_attention.heads")?,
+                dim(
+                    d.n_q.div_ceil(ATTN_QUERY_BLOCK).max(1),
+                    "causal_attention.n_q",
+                )?,
+                1,
+            ),
+            32,
+            dim(attention_smem(hd), "causal_attention.smem")?,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.q),
+                KernelArg::Buffer(d.cache.k),
+                KernelArg::Buffer(d.cache.v),
+            ],
+        )
+    }
+
+    /// The one query of a decode step over cache rows
+    /// `0..=state[DECODE_POS]`, the length read on the device so a batch of
+    /// steps needs no host value: the rows are cut into `splits` runs scored
+    /// side by side, then merged in split order.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a head that is not a multiple of four
+    /// up to 128, query heads that are not a multiple of the kv heads, splits
+    /// outside `1..=256`, or a view not 16-byte aligned;
+    /// [`CoreError::ShapeMismatch`] for a short view; or the launch's error.
+    pub fn decode_attention(&self, d: &DecodeAttnDesc<'_>) -> CoreResult<()> {
+        need_cache(&d.cache, d.heads, "decode_attention.heads")?;
+        let hd = d.cache.head_dim;
+        limit(hd.is_multiple_of(4), "decode_attention.head_dim", hd)?;
+        limit(
+            (1..=DECODE_MAX_SPLITS).contains(&d.splits),
+            "decode_attention.splits",
+            d.splits,
+        )?;
+        let width = d.heads * hd;
+        need(d.out, width, "decode_attention.out")?;
+        need(d.q, width, "decode_attention.q")?;
+        need(
+            d.partials,
+            decode_attention_partials(d.heads, hd, d.splits),
+            "decode_attention.partials",
+        )?;
+        need(d.state, DECODE_STATE_WORDS, "decode_attention.state")?;
+        for (view, field) in [
+            (d.out, "decode_attention.out"),
+            (d.partials, "decode_attention.partials"),
+            (d.q, "decode_attention.q"),
+            (d.cache.k, "decode_attention.cache.k"),
+            (d.cache.v, "decode_attention.cache.v"),
+        ] {
+            aligned16(view, field)?;
+        }
+        let args = CacheAttnArgs {
+            n_q: 1,
+            heads: dim(d.heads, "decode_attention.heads")?,
+            kv_heads: dim(d.cache.kv_heads, "decode_attention.kv_heads")?,
+            head_dim: dim(hd, "decode_attention.head_dim")?,
+            pos0: 0,
+            cap: dim(d.cache.cap, "decode_attention.cap")?,
+            scale: d.scale,
+            splits: dim(d.splits, "decode_attention.splits")?,
+        };
+        self.launch(
+            "kernel_audio_decode_attn_f32",
+            Extent3::new(
+                args.kv_heads,
+                dim(
+                    d.splits.div_ceil(DECODE_SPLITS_PER_TG),
+                    "decode_attention.splits",
+                )?,
+                dim(
+                    (d.heads / d.cache.kv_heads).div_ceil(DECODE_GROUP_TILE),
+                    "decode_attention.group",
+                )?,
+            ),
+            dim(32 * DECODE_SPLITS_PER_TG, "decode_attention.block")?,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.partials),
+                KernelArg::Buffer(d.q),
+                KernelArg::Buffer(d.cache.k),
+                KernelArg::Buffer(d.cache.v),
+                KernelArg::Buffer(d.state),
+            ],
+        )?;
+        self.launch(
+            "kernel_audio_decode_attn_merge_f32",
+            Extent3::linear(args.heads),
+            DECODE_MERGE_THREADS,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.partials),
+            ],
+        )
+    }
+
+    /// `rows` new key and value rows into a layer's cache from the decoder
+    /// state's position on. The position is not moved: every layer of a pass
+    /// appends at the same one, and the step kernel moves it after. A row
+    /// that would land at or past the capacity is dropped on the device, so
+    /// the caller grows the cache before it queues rows that reach it.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] for a short view, or the launch's error.
+    pub fn kv_append(&self, d: &KvAppendDesc<'_>) -> CoreResult<()> {
+        need_cache(&d.cache, d.cache.kv_heads, "kv_append.kv_heads")?;
+        let count = d.rows * d.cache.kv_heads * d.cache.head_dim;
+        need(d.k, count, "kv_append.k")?;
+        need(d.v, count, "kv_append.v")?;
+        need(d.state, DECODE_STATE_WORDS, "kv_append.state")?;
+        let args = KvAppendArgs {
+            rows: dim(d.rows, "kv_append.rows")?,
+            kv_heads: dim(d.cache.kv_heads, "kv_append.kv_heads")?,
+            head_dim: dim(d.cache.head_dim, "kv_append.head_dim")?,
+            cap: dim(d.cache.cap, "kv_append.cap")?,
+        };
+        self.launch(
+            "kernel_audio_kv_append_f32",
+            linear_grid(count)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.cache.k),
+                KernelArg::Buffer(d.cache.v),
+                KernelArg::Buffer(d.k),
+                KernelArg::Buffer(d.v),
+                KernelArg::Buffer(d.state),
+            ],
+        )
+    }
+
+    /// Half-split rotary embedding at the decoder state's position plus
+    /// `offset`, read on the device.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for an odd head,
+    /// [`CoreError::ShapeMismatch`] for a short view, or the launch's error.
+    pub fn rope_half_at_state(&self, d: &RopeStateDesc<'_>) -> CoreResult<()> {
+        limit(
+            d.head_dim.is_multiple_of(2),
+            "rope_half_at_state.head_dim",
+            d.head_dim,
+        )?;
+        let total = d.rows * d.heads * d.head_dim;
+        need(d.x, total, "rope_half_at_state.x")?;
+        need(d.state, DECODE_STATE_WORDS, "rope_half_at_state.state")?;
+        let args = RopeArgs {
+            rows: dim(d.rows, "rope_half_at_state.rows")?,
+            heads: dim(d.heads, "rope_half_at_state.heads")?,
+            head_dim: dim(d.head_dim, "rope_half_at_state.head_dim")?,
+            pos0: dim(d.offset, "rope_half_at_state.offset")?,
+            theta: d.theta,
+        };
+        self.launch(
+            "kernel_audio_rope_half_state_f32",
+            linear_grid(total / 2)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.x),
+                KernelArg::Buffer(d.state),
+            ],
+        )
+    }
+
+    /// One decision of a causal decoder over the head's argmax, on the
+    /// device: the position moves by `advance`, an end id stops the decoder
+    /// unemitted, any other id is emitted to `out[slot]` and becomes the last
+    /// token, and the `max_tokens`-th stops it. A step on a stopped decoder
+    /// writes [`DECODE_NO_TOKEN`], lowers the emit flag and changes nothing
+    /// else, so a batch can run past the stop.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a zero token cap or an advance past
+    /// one row, [`CoreError::ShapeMismatch`] for a short view, or the
+    /// launch's error.
+    pub fn decode_step(&self, d: &DecodeStepDesc<'_>) -> CoreResult<()> {
+        limit(d.max_tokens > 0, "decode_step.max_tokens", d.max_tokens)?;
+        limit(d.advance <= 1, "decode_step.advance", d.advance)?;
+        need(d.state, DECODE_STATE_WORDS, "decode_step.state")?;
+        need(d.out, d.slot + 1, "decode_step.out")?;
+        need(d.ids, 1, "decode_step.ids")?;
+        let args = DecodeStepArgs {
+            eos0: d.eos[0],
+            eos1: d.eos[1],
+            max_tokens: dim(d.max_tokens, "decode_step.max_tokens")?,
+            advance: dim(d.advance, "decode_step.advance")?,
+            slot: dim(d.slot, "decode_step.slot")?,
+        };
+        self.launch(
+            "kernel_audio_decode_step_u32",
+            Extent3::new(1, 1, 1),
+            1,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.state),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.ids),
+            ],
+        )
+    }
+
+    /// The f32 embedding row of the decoder state's last token, dequantised
+    /// from the table's own storage; zeros for a token past the table.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a width that is not whole blocks or
+    /// groups of the table's storage, [`CoreError::ShapeMismatch`] for a
+    /// short view, or the launch's error.
+    pub fn embed_token(&self, d: &EmbedTokenDesc<'_>) -> CoreResult<()> {
+        need(d.out, d.width, "embed_token.out")?;
+        need(d.state, DECODE_STATE_WORDS, "embed_token.state")?;
+        let mut args = EmbedTokenArgs {
+            width: dim(d.width, "embed_token.width")?,
+            vocab: dim(d.vocab, "embed_token.vocab")?,
+            group: 0,
+        };
+        match d.table {
+            EmbedTable::Dense { dtype, rows } => {
+                let row = dtype.row_bytes(d.width).ok_or(CoreError::InvalidValue {
+                    key: "embed_token.width",
+                    value: d.width.to_string(),
+                })?;
+                need_bytes(rows, d.vocab * row, "embed_token.table")?;
+                self.launch(
+                    dtype.embed_entry(),
+                    linear_grid(d.width)?,
+                    LINEAR_BLOCK,
+                    0,
+                    &[
+                        KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                        KernelArg::Buffer(d.out),
+                        KernelArg::Buffer(rows),
+                        KernelArg::Buffer(d.state),
+                    ],
+                )
+            }
+            EmbedTable::Affine8 {
+                words,
+                scales,
+                biases,
+                group,
+            } => {
+                limit(
+                    group > 0 && d.width.is_multiple_of(group) && d.width.is_multiple_of(4),
+                    "embed_token.group",
+                    group,
+                )?;
+                need_bytes(words, d.vocab * d.width, "embed_token.words")?;
+                let groups = d.vocab * (d.width / group);
+                need_bytes(scales, groups * 2, "embed_token.scales")?;
+                need_bytes(biases, groups * 2, "embed_token.biases")?;
+                args.group = dim(group, "embed_token.group")?;
+                self.launch(
+                    "kernel_audio_embed_token_affine8w",
+                    linear_grid(d.width)?,
+                    LINEAR_BLOCK,
+                    0,
+                    &[
+                        KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                        KernelArg::Buffer(d.out),
+                        KernelArg::Buffer(words),
+                        KernelArg::Buffer(scales),
+                        KernelArg::Buffer(biases),
+                        KernelArg::Buffer(d.state),
+                    ],
+                )
+            }
+        }
     }
 }

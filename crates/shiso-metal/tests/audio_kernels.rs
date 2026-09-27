@@ -76,6 +76,12 @@ device_cases!(
     embed_row_takes_the_last_tokens_row,
     gated_lstm_cell_keeps_the_state_only_on_emit,
     keep_copies_only_on_emit,
+    causal_attention_matches_for_gqa_and_a_cache_offset,
+    decode_attention_reads_its_length_from_the_state,
+    kv_append_writes_at_the_state_position,
+    decode_step_stops_on_eos_and_goes_quiet,
+    embed_token_takes_the_state_token_row,
+    rope_half_state_takes_its_position_from_the_state,
 );
 
 #[test]

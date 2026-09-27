@@ -1,4 +1,6 @@
-// The recurrent cell of a transducer's prediction network.
+// Transducer and decoder steps: the recurrent cell of a transducer's
+// prediction network and its greedy search, and the step and embedding row of
+// a causal decoder, all resident on the device.
 
 /// Gates in (i, f, g, o) order, biases already folded in by the projections:
 /// c' = sig(f) c + sig(i) tanh(g);  h' = sig(o) tanh(c').  `c` is updated in place.
@@ -165,4 +167,110 @@ kernel void kernel_audio_keep_f32(
         return;
     }
     dst[i] = src[i];
+}
+
+// A causal decoder's greedy loop, resident on the device: a step is the
+// embedding row of the state's last token, the layers (the rotation at the
+// state's position, the cache append there, decode attention through it), the
+// head, the row argmax, then `kernel_audio_decode_step_u32` deciding. A batch
+// of steps queues with no read between them; once a step stops the decoder,
+// every later step in the batch writes nothing and leaves the state alone, so
+// its passes only recompute the row the stop left.
+
+/// One decision of a causal decoder, on one thread. The pass just run fed
+/// `advance` rows into the cache (0 for the prefill's own argmax, 1 in
+/// decode), so the position moves by that much. Then the argmax `ids[0]` is:
+/// an end id - done, stop EOS, nothing emitted; otherwise emitted to
+/// `out[slot]` and made the last token, and done with stop CAP when it is the
+/// `max_tokens`-th. A step on a done state writes `NONE`, lowers the emit
+/// flag and changes nothing else; a step on a state that has already emitted
+/// `max_tokens` does the same and marks it done.
+kernel void kernel_audio_decode_step_u32(
+        constant audio_args_decode_step & args [[buffer(0)]],
+        device uint *state                     [[buffer(1)]],
+        device uint *out                       [[buffer(2)]],
+        device const uint *ids                 [[buffer(3)]],
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0u) {
+        return;
+    }
+    out[args.slot] = AUDIO_DECODE_NONE;
+    state[AUDIO_DECODE_EMIT] = 0u;
+    if (state[AUDIO_DECODE_DONE] != 0u) {
+        return;
+    }
+    const uint count = state[AUDIO_DECODE_COUNT];
+    if (count >= args.max_tokens) {
+        state[AUDIO_DECODE_DONE] = 1u;
+        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_CAP;
+        return;
+    }
+    state[AUDIO_DECODE_POS] += args.advance;
+    const uint k = ids[0];
+    if (k == args.eos0 || k == args.eos1) {
+        state[AUDIO_DECODE_DONE] = 1u;
+        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_EOS;
+        return;
+    }
+    out[args.slot] = k;
+    state[AUDIO_DECODE_TOKEN] = k;
+    state[AUDIO_DECODE_EMIT] = 1u;
+    state[AUDIO_DECODE_COUNT] = count + 1u;
+    if (count + 1u >= args.max_tokens) {
+        state[AUDIO_DECODE_DONE] = 1u;
+        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_CAP;
+    }
+}
+
+/// `out = table[token]` dequantised to f32, the decoder state's last token's
+/// row of a `[vocab][width]` table in `W`'s storage (the GEMM's weight
+/// readers, so a Q8_0 row is `width / 32` blocks); zeros for a token past the
+/// table.
+template <typename W>
+kernel void kernel_audio_embed_token(
+        constant audio_args_embed_token & args [[buffer(0)]],
+        device float *out                      [[buffer(1)]],
+        device const void *table               [[buffer(2)]],
+        device const uint *state               [[buffer(3)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint u = tgpig.x * AUDIO_LINEAR_BLOCK + tpitg.x;
+    if (u >= args.width) {
+        return;
+    }
+    const uint k = state[AUDIO_DECODE_TOKEN];
+    out[u] = k < args.vocab ? W::load(table, (uint64_t) k * args.width + u) : 0.0f;
+}
+
+typedef decltype(kernel_audio_embed_token<audio_w_f32>) audio_embed_token_t;
+template [[host_name("kernel_audio_embed_token_f32w")]]  kernel audio_embed_token_t kernel_audio_embed_token<audio_w_f32>;
+template [[host_name("kernel_audio_embed_token_bf16w")]] kernel audio_embed_token_t kernel_audio_embed_token<audio_w_bf16>;
+template [[host_name("kernel_audio_embed_token_f16w")]]  kernel audio_embed_token_t kernel_audio_embed_token<audio_w_f16>;
+template [[host_name("kernel_audio_embed_token_q8_0w")]] kernel audio_embed_token_t kernel_audio_embed_token<audio_w_q8_0>;
+
+/// The row above from an 8-bit affine table: per `group` elements of a row a
+/// bf16 scale and bias, the bytes packed four to a little-endian u32, and
+/// each value one fused `q * scale + bias`.
+kernel void kernel_audio_embed_token_affine8w(
+        constant audio_args_embed_token & args [[buffer(0)]],
+        device float *out                      [[buffer(1)]],
+        device const uint *words               [[buffer(2)]],
+        device const ushort *scales            [[buffer(3)]],
+        device const ushort *biases            [[buffer(4)]],
+        device const uint *state               [[buffer(5)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint u = tgpig.x * AUDIO_LINEAR_BLOCK + tpitg.x;
+    if (u >= args.width) {
+        return;
+    }
+    const uint k = state[AUDIO_DECODE_TOKEN];
+    if (k >= args.vocab) {
+        out[u] = 0.0f;
+        return;
+    }
+    const uint64_t i = (uint64_t) k * args.width + u;
+    const uint64_t g = (uint64_t) k * (args.width / args.group) + u / args.group;
+    const float qv = (float) ((words[i >> 2u] >> (8u * (uint) (i & 3u))) & 0xffu);
+    out[u] = fma(qv, audio_bf16(scales + g), audio_bf16(biases + g));
 }

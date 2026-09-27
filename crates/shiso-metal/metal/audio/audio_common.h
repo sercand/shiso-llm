@@ -23,6 +23,19 @@
 #define AUDIO_REL_ROWS 4u
 // Threads one row argmax spreads a row over.
 #define AUDIO_ARGMAX_BLOCK 256u
+// Cached rows one decode-attention simdgroup reads per block, and the query
+// heads of a kv head's group it scores against each row it reads. Both are
+// small on purpose: at 8 rows and 4 heads the block's registers spill and the
+// kernel ran 1.7x slower over 4096 rows on an M1 Max.
+#define AUDIO_DECODE_KB 4u
+#define AUDIO_DECODE_GT 2u
+// Splits one decode-attention threadgroup runs, a simdgroup each; the most
+// splits a launch may cut the rows into; the merge's threads per head and the
+// simdgroups they make.
+#define AUDIO_DECODE_SPLITS_PER_TG 4u
+#define AUDIO_DECODE_MAX_SPLITS 256u
+#define AUDIO_DECODE_MERGE_THREADS 256u
+#define AUDIO_DECODE_MERGE_SG 8u
 
 #define AUDIO_OP_RELU 0u
 #define AUDIO_OP_SILU 1u
@@ -68,6 +81,13 @@ typedef struct { uint rows; uint cols; uint avail; } audio_args_greedy_window;
 typedef struct { uint rows; uint avail; uint blank; uint max_symbols; uint slot; } audio_args_greedy_step;
 typedef struct { uint width; uint vocab; } audio_args_embed_row;
 typedef struct { uint count; } audio_args_keep;
+typedef struct {
+    uint n_q; uint heads; uint kv_heads; uint head_dim;
+    uint pos0; uint cap; float scale; uint splits;
+} audio_args_cache_attn;
+typedef struct { uint rows; uint kv_heads; uint head_dim; uint cap; } audio_args_kv_append;
+typedef struct { uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; } audio_args_decode_step;
+typedef struct { uint width; uint vocab; uint group; } audio_args_embed_token;
 
 // Greedy search's state on the device, one u32 each: the frame (relative to
 // the first pending row), the symbols emitted on it, whether the search has
@@ -79,6 +99,20 @@ typedef struct { uint count; } audio_args_keep;
 #define AUDIO_GREEDY_TOKEN 3u
 #define AUDIO_GREEDY_EMIT 4u
 #define AUDIO_GREEDY_NONE 0xffffffffu
+
+// A causal decoder's state on the device, one u32 each: the cache rows
+// filled (the position of the token the next pass feeds), the tokens
+// emitted, done, the last token emitted (the one the next pass feeds),
+// whether the last step emitted, and why the decoder stopped.
+#define AUDIO_DECODE_POS 0u
+#define AUDIO_DECODE_COUNT 1u
+#define AUDIO_DECODE_DONE 2u
+#define AUDIO_DECODE_TOKEN 3u
+#define AUDIO_DECODE_EMIT 4u
+#define AUDIO_DECODE_STOP 5u
+#define AUDIO_DECODE_NONE 0xffffffffu
+#define AUDIO_DECODE_STOP_EOS 1u
+#define AUDIO_DECODE_STOP_CAP 2u
 
 /// One brain-float, widened exactly (the 16 bits become the high half).
 static inline float audio_bf16(device const ushort *p) {

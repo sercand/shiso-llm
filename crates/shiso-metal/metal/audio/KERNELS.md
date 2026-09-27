@@ -30,6 +30,14 @@ listed.
 | `kernel_audio_greedy_step_u32` | `audio_args_greedy_step{rows, avail, blank, max_symbols, slot}` | state u32 `[8]` (in/out), out u32 `[slots][2]`, ids u32 `[rows]` | 1 × 1, 0 |
 | `kernel_audio_embed_row_f32` | `audio_args_embed_row{width, vocab}` | out `[width]`, table `[vocab][width]`, state u32 `[8]` | `ceil(width/256)` × 256, 0 |
 | `kernel_audio_keep_f32` | `audio_args_keep{count}` | dst `[count]`, src `[count]`, state u32 `[8]` | `ceil(count/256)` × 256, 0 |
+| `kernel_audio_rope_half_state_f32` | `audio_args_rope{rows, heads, head_dim, pos0, theta}` (`pos0` an offset on the state's position) | x (in place) `[rows][H·hd]`, decoder state u32 `[8]` | `ceil(rows·H·hd/2/256)` × 256, 0 |
+| `kernel_audio_kv_append_f32` | `audio_args_kv_append{rows, kv_heads, head_dim, cap}` | k cache (in/out) `[Hkv][cap][hd]`, v cache (in/out), k `[rows][Hkv·hd]`, v, decoder state u32 `[8]` | `ceil(rows·Hkv·hd/256)` × 256, 0 |
+| `kernel_audio_causal_attn_f32` | `audio_args_cache_attn{n_q, heads, kv_heads, head_dim, pos0, cap, scale, splits}` (`splits` unread) | out `[n_q][H·hd]`, q `[n_q][H·hd]`, k cache `[Hkv][cap][hd]`, v cache | `(heads, ceil(n_q/8))` × 32, 8·hd·4 |
+| `kernel_audio_decode_attn_f32` | `audio_args_cache_attn` (`n_q`, `pos0` unread) | partials `[H·splits·(hd+2)]` (accumulators `[H][splits][hd]`, then (max, sum) pairs `[H][splits][2]`), q `[H·hd]`, k cache `[Hkv][cap][hd]`, v cache, decoder state u32 `[8]` | `(Hkv, ceil(splits/4), ceil((H/Hkv)/2))` × 128, 0 |
+| `kernel_audio_decode_attn_merge_f32` | `audio_args_cache_attn` (as above) | out `[H·hd]`, partials (from the entry above) | `heads` × 256, 0 (static) |
+| `kernel_audio_decode_step_u32` | `audio_args_decode_step{eos0, eos1, max_tokens, advance, slot}` | decoder state u32 `[8]` (in/out), out u32 `[slots]`, ids u32 `[1]` | 1 × 1, 0 |
+| `kernel_audio_embed_token_{f32w,bf16w,f16w,q8_0w}` | `audio_args_embed_token{width, vocab, group}` (`group` unread) | out `[width]`, table `[vocab][width]` (q8_0w: `vocab·width/32` 34-byte blocks), decoder state u32 `[8]` | `ceil(width/256)` × 256, 0 |
+| `kernel_audio_embed_token_affine8w` | `audio_args_embed_token{width, vocab, group}` | out `[width]`, words u32 `[vocab][width/4]`, scales bf16 `[vocab][width/group]`, biases bf16 (as scales), decoder state u32 `[8]` | `ceil(width/256)` × 256, 0 |
 
 Unary op codes: `0` relu, `1` silu, `2` sigmoid, `3` exact GELU (erf), `4` tanh, `5` clamp to `[a, b]`, `6` scale by
 `a`. Norm flags: bit 0 has-weight (RMS only; the layer norm always reads one), bit 1 has-bias (layer norm). GEMM
@@ -65,3 +73,30 @@ Greedy search's state is eight u32 words: the frame (relative to the first pendi
 done (the frame reached `avail`), the last token, whether the last step emitted it, and three unused. The step kernel
 writes `(token, frame)` to its slot, or `(0xffffffff, 0)` when it emitted nothing; the gated cell, the embedding row
 and keep read the emit flag and the token it left.
+
+A causal decoder's state is eight u32 words: `0` the cache rows filled (the position of the token the next pass
+feeds), `1` the tokens emitted, `2` done, `3` the last token emitted (the one the next pass feeds, and the row the
+embedding entries fetch), `4` whether the last step emitted, `5` why it stopped (`0` running, `1` an end id, `2` the
+token cap), and two unused. The rotation, the append and decode attention read word 0 and never write it; only the
+step kernel moves it, by its `advance` (0 for the step over the prefill's own argmax, 1 after a decode pass), so every
+layer of a pass appends at the same row. Decode attention sees rows `0..=word 0` (clamped to `cap`); the append drops a
+row at or past `cap`, so the host grows the cache before it queues a batch that would reach it. The step writes the
+token to `out[slot]`, or `0xffffffff` for a step that emitted nothing: an end id (which is never emitted), a done
+state, or a state that already has `max_tokens`. Once done, a later step in the batch changes no word but the emit
+flag, which it lowers.
+
+Causal attention visibility: query `i` sits at `pos0 + i` and sees cache rows `0..=pos0 + i` of kv head
+`h / (heads / kv_heads)`, with the logit `scale · q·k`; rows past `pos0 + n_q − 1` are never read.
+
+Decode attention runs as two launches. The first cuts the `len` rows present into `splits` runs of
+`ceil(len/splits)` rounded up to four (`len` is only known on the device, so `splits` is fixed per launch, at most
+256); one simdgroup per (kv head, split, pair of the group's query heads), four to a threadgroup, scores its run and
+leaves an unnormalised accumulator and its (max, sum). The merge then closes each head in split order, so the result
+does not depend on scheduling. It wants `head_dim` a multiple of four and every view 16-byte aligned (lanes read four
+dims at a time, so a cached row is one 512-byte read). Measured on an M1 Max (24-core GPU), 16 query heads over 8 kv
+heads of 128 with 32 splits: about 20 µs over 600 rows and 67 µs over 4096 (both launches). Its inner loop uses the
+fast `exp`, unlike the window attention: the precise one doubled that time, and on arguments at most zero the fast
+one's `3 + 2|x|` ulp keeps every softmax weight within 3 ulp of 1. The CUDA twin uses the accurate `expf`.
+
+A per-head RMS norm (a decoder's q and k norms over each head's 128 dims) is `kernel_audio_rms_norm_f32` with
+`rows = n·H` and `dim = hd`: each row is normalised on its own against a weight of length `dim`.

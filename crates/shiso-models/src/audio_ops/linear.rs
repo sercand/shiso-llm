@@ -62,9 +62,19 @@ impl GemmType {
         }
     }
 
+    /// The embedding-row fetch for a table in this storage.
+    pub(crate) fn embed_entry(self) -> &'static str {
+        match self {
+            Self::F32 => "kernel_audio_embed_token_f32w",
+            Self::Bf16 => "kernel_audio_embed_token_bf16w",
+            Self::F16 => "kernel_audio_embed_token_f16w",
+            Self::Q8_0 => "kernel_audio_embed_token_q8_0w",
+        }
+    }
+
     /// Bytes of one `in_dim`-wide row, or `None` when `in_dim` is not a whole
     /// number of blocks.
-    fn row_bytes(self, in_dim: usize) -> Option<usize> {
+    pub(crate) fn row_bytes(self, in_dim: usize) -> Option<usize> {
         match self {
             Self::F32 => Some(in_dim * 4),
             Self::Bf16 | Self::F16 => Some(in_dim * 2),

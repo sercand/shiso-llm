@@ -20,6 +20,12 @@
 #define AUDIO_ATTN_QB 8u
 #define AUDIO_REL_ROWS 4u
 #define AUDIO_ARGMAX_BLOCK 256u
+#define AUDIO_DECODE_KB 4u
+#define AUDIO_DECODE_GT 2u
+#define AUDIO_DECODE_SPLITS_PER_TG 4u
+#define AUDIO_DECODE_MAX_SPLITS 256u
+#define AUDIO_DECODE_MERGE_THREADS 256u
+#define AUDIO_DECODE_MERGE_SG 8u
 
 #define AUDIO_OP_RELU 0u
 #define AUDIO_OP_SILU 1u
@@ -67,6 +73,13 @@ struct audio_args_greedy_window { uint rows; uint cols; uint avail; };
 struct audio_args_greedy_step { uint rows; uint avail; uint blank; uint max_symbols; uint slot; };
 struct audio_args_embed_row { uint width; uint vocab; };
 struct audio_args_keep { uint count; };
+struct audio_args_cache_attn {
+    uint n_q; uint heads; uint kv_heads; uint head_dim;
+    uint pos0; uint cap; float scale; uint splits;
+};
+struct audio_args_kv_append { uint rows; uint kv_heads; uint head_dim; uint cap; };
+struct audio_args_decode_step { uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; };
+struct audio_args_embed_token { uint width; uint vocab; uint group; };
 
 /* Greedy search's state on the device, as the Metal twin's. */
 #define AUDIO_GREEDY_T 0u
@@ -75,6 +88,17 @@ struct audio_args_keep { uint count; };
 #define AUDIO_GREEDY_TOKEN 3u
 #define AUDIO_GREEDY_EMIT 4u
 #define AUDIO_GREEDY_NONE 0xffffffffu
+
+/* A causal decoder's state on the device, as the Metal twin's. */
+#define AUDIO_DECODE_POS 0u
+#define AUDIO_DECODE_COUNT 1u
+#define AUDIO_DECODE_DONE 2u
+#define AUDIO_DECODE_TOKEN 3u
+#define AUDIO_DECODE_EMIT 4u
+#define AUDIO_DECODE_STOP 5u
+#define AUDIO_DECODE_NONE 0xffffffffu
+#define AUDIO_DECODE_STOP_EOS 1u
+#define AUDIO_DECODE_STOP_CAP 2u
 
 /* One brain-float, widened exactly (the 16 bits become the high half). */
 static __device__ __forceinline__ float audio_bf16(const unsigned short *p) {
