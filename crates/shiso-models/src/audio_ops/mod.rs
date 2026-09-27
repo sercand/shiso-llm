@@ -148,7 +148,7 @@ const GEMV_TG_COLS: usize = 16;
 const GEMV_TG_ROWS: usize = 8;
 /// Input rows one threadgroup of the multi-row matrix-vector-by-runs kernels
 /// takes: a decoder batch's rows share each weight run it reads.
-const MATVEC_ROWS: usize = 8;
+const MATVEC_ROWS: usize = 4;
 
 /// The matrix-vector-by-runs entry and grid for `rows` rows of `cols`
 /// columns: one row on the one-row kernel, more on the multi-row one, which
@@ -1318,7 +1318,7 @@ impl Ops {
     /// about twice the rate [`Self::gemm`]'s matrix-vector kernel does. The
     /// summation order is not that kernel's, so a model takes one or the
     /// other for a given product, never a mix. More than one row takes the
-    /// multi-row kernel, which reads each weight run once for up to eight
+    /// multi-row kernel, which reads each weight run once for up to four
     /// rows and gives each row the one-row kernel's value, so a decoder's
     /// batch of rows costs about one row's weight traffic.
     ///

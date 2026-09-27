@@ -758,8 +758,8 @@ static __device__ __forceinline__ void audio_matvec_rows_tile(
     }
 }
 
-/* audio_matvec over rows [8 y, 8 y + 8) of the input in one block: grid
- * (ceil(n / 4), ceil(m / 8)). */
+/* audio_matvec over rows [4 y, 4 y + 4) of the input in one block: grid
+ * (ceil(n / 4), ceil(m / 4)). */
 template <typename R>
 static __device__ __forceinline__ void audio_matvec_rows(
         const struct audio_args_gemm args, float *y, const float *x, const R w,
@@ -780,7 +780,7 @@ static __device__ __forceinline__ void audio_matvec_rows(
     }
 }
 
-/* audio_matvec_silu over rows [8 y, 8 y + 8) of the input in one block. */
+/* audio_matvec_silu over rows [4 y, 4 y + 4) of the input in one block. */
 template <typename R>
 static __device__ __forceinline__ void audio_matvec_silu_rows(
         const struct audio_args_gemm args, float *y, const float *x, const R wg,

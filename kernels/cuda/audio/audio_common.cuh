@@ -23,7 +23,7 @@
 #define AUDIO_MATVEC_SG 2u
 /* Input rows one block of the multi-row matrix-vector kernels takes: a
  * decoder batch's rows share each weight run the block reads. */
-#define AUDIO_MATVEC_ROWS 8u
+#define AUDIO_MATVEC_ROWS 4u
 /* Values one thread of the fused residual-add RMS norm loads at once. */
 #define AUDIO_ADD_RMS_RUN 8u
 #define AUDIO_ATTN_SLOTS 4u

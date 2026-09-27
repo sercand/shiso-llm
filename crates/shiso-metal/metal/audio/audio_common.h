@@ -26,8 +26,12 @@
 #define AUDIO_MATVEC_COLS 4u
 #define AUDIO_MATVEC_SG 2u
 // Input rows one threadgroup of the multi-row matrix-vector kernels takes:
-// a decoder batch's rows share each weight run the threadgroup reads.
-#define AUDIO_MATVEC_ROWS 8u
+// a decoder batch's rows share each weight run the threadgroup reads. Four,
+// not eight: a lane's accumulators for eight rows cost the kernel so many
+// threadgroups a core that three rows took 15.6 ms of a Q8_0 decoder pass's
+// projections and head against 11.1 at four (eight rows: 23.4 against 23.8
+// in two blocks of four), M1 Max.
+#define AUDIO_MATVEC_ROWS 4u
 // Values one thread of the fused residual-add RMS norm loads at once.
 #define AUDIO_ADD_RMS_RUN 8u
 // Head dims up to 32 lanes x 4 values; the attention keeps a lane's slice of

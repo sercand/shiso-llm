@@ -10,7 +10,7 @@ use super::{GemmArgs, MATVEC_BLOCK, MATVEC_COLS, blocks, launch, weight_fixture}
 use crate::{Gpu, drain, f32_bytes, oracle};
 
 /// Input rows one multi-row threadgroup takes.
-const MATVEC_ROWS: u32 = 8;
+const MATVEC_ROWS: u32 = 4;
 
 /// One weight as the kernels bind it: the main buffer and, for an affine
 /// weight, its scales and biases.

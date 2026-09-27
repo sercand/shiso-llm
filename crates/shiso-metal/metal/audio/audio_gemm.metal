@@ -983,8 +983,8 @@ static inline void audio_matvec_rows_tile(const R w, uint n, uint k, uint n0,
     }
 }
 
-/// `kernel_audio_matvec`'s product over rows `[8 y, 8 y + 8)` of the input
-/// in one threadgroup: grid `(ceil(n / 4), ceil(m / 8))`.
+/// `kernel_audio_matvec`'s product over rows `[4 y, 4 y + 4)` of the input
+/// in one threadgroup: grid `(ceil(n / 4), ceil(m / 4))`.
 template <typename R>
 static inline void audio_matvec_rows_body(constant audio_args_gemm & args, device float *y,
                                           device const float *x, const R w,
@@ -1035,7 +1035,7 @@ kernel void kernel_audio_matvec_rows_affine8w(
                            tgpig, lane, sg);
 }
 
-/// `kernel_audio_matvec_silu`'s gated pair over rows `[8 y, 8 y + 8)` of the
+/// `kernel_audio_matvec_silu`'s gated pair over rows `[4 y, 4 y + 4)` of the
 /// input in one threadgroup, each product the multi-row tile's, the product
 /// formed as the one-row kernel forms it.
 template <typename R>
