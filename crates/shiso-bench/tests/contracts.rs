@@ -242,6 +242,50 @@ const _: TurnCuts = shiso_audio::chunks::turn_cuts;
 type SilenceCuts = fn(&shiso_audio::MelFrames, usize, usize, usize) -> Vec<usize>;
 const _: SilenceCuts = shiso_audio::chunks::silence_cuts;
 
+/// A clip recognised offline is planned whole into spans, which a batching
+/// recognizer transcribes a batch at a time; one that does not batch says 0.
+type PlanOffline = fn(
+    &shiso_audio::MelFrames,
+    Option<&shiso_audio::transcript::SpeakerActivity>,
+    f64,
+    &shiso_audio::chunks::OfflineRule,
+) -> Result<Vec<shiso_audio::chunks::Span>, shiso_audio::AudioError>;
+const _: PlanOffline = shiso_audio::chunks::plan_offline;
+const _: fn(bool) -> shiso_audio::chunks::OfflineRule =
+    shiso_audio::chunks::OfflineRule::for_10ms_mel;
+const _: fn(usize, usize, bool) -> shiso_audio::chunks::Span =
+    |start, end, transcribe| shiso_audio::chunks::Span {
+        start,
+        end,
+        transcribe,
+    };
+type BatchesOffline = fn(&(dyn shiso_audio::SpeechRecognizer + 'static)) -> usize;
+const _: BatchesOffline = <dyn shiso_audio::SpeechRecognizer>::batches_offline;
+type OpenOffline = fn(
+    &(dyn shiso_audio::SpeechRecognizer + 'static),
+    &shiso_audio::StreamOptions,
+    Vec<shiso_audio::chunks::Span>,
+) -> Result<Box<dyn shiso_audio::OfflineJob>, shiso_audio::AudioError>;
+const _: OpenOffline = <dyn shiso_audio::SpeechRecognizer>::open_offline;
+type OfflineStep = fn(
+    &mut (dyn shiso_audio::OfflineJob + 'static),
+    &shiso_audio::MelFrames,
+) -> Result<Option<shiso_audio::OfflineBatch>, shiso_audio::AudioError>;
+const _: OfflineStep = <dyn shiso_audio::OfflineJob>::step;
+const _: fn(Vec<shiso_audio::SpanResult>) -> shiso_audio::OfflineBatch =
+    |spans| shiso_audio::OfflineBatch { spans };
+const _: fn(
+    shiso_audio::chunks::Span,
+    Vec<shiso_audio::TokenEvent>,
+    u32,
+    Option<String>,
+) -> shiso_audio::SpanResult = |span, tokens, chunk_end, language| shiso_audio::SpanResult {
+    span,
+    tokens,
+    chunk_end,
+    language,
+};
+
 /// A diarizer answers one whole clip with one activity block.
 type Diarize = fn(
     &(dyn shiso_audio::Diarizer + 'static),

@@ -7,6 +7,12 @@
 //! recognition is a stream fed everything at once and finished, so there is one
 //! path to get right rather than two.
 //!
+//! The one exception is a recognizer that can decode several chunks at once
+//! ([`SpeechRecognizer::batches_offline`]): a whole clip planned up front
+//! ([`crate::chunks::plan_offline`]) lets it transcribe a batch of spans per
+//! weight read instead of one. That path is an [`OfflineJob`], and a
+//! recognizer that does not batch never sees it.
+//!
 //! Nothing here assumes a transducer, a CTC head or an attention decoder: a
 //! stream turns mel frames into timed token ids, and how it does so is the
 //! family's business.
@@ -16,6 +22,7 @@ use std::sync::Arc;
 
 use shiso_core::TokenId;
 
+use crate::chunks::Span;
 use crate::error::AudioError;
 use crate::mel::{MelFrames, MelSpec};
 use crate::vocab::PieceVocab;
@@ -91,6 +98,72 @@ pub trait SpeechRecognizer: Send + Sync + fmt::Debug {
     /// device error while allocating the stream's state.
     fn open_stream(&self, options: &StreamOptions)
     -> Result<Box<dyn RecognizerStream>, AudioError>;
+
+    /// How many spans one [`OfflineJob::step`] transcribes at most. Zero, the
+    /// default, means the recognizer has no batched offline path: a caller
+    /// streams instead and never calls [`Self::open_offline`].
+    fn batches_offline(&self) -> usize {
+        0
+    }
+
+    /// Starts transcribing a whole clip already planned into `spans`
+    /// ([`crate::chunks::plan_offline`]), which tile its mel frames exactly.
+    /// [`StreamOptions::cuts`] is ignored: the spans are the cuts. Only
+    /// called when [`Self::batches_offline`] is above zero.
+    ///
+    /// # Errors
+    ///
+    /// By default, [`AudioError::BadSpec`]: the recognizer has no offline
+    /// path. Otherwise, as [`Self::open_stream`].
+    fn open_offline(
+        &self,
+        _options: &StreamOptions,
+        _spans: Vec<Span>,
+    ) -> Result<Box<dyn OfflineJob>, AudioError> {
+        Err(AudioError::BadSpec {
+            reason: "this recognizer has no offline path; stream the clip instead".into(),
+        })
+    }
+}
+
+/// One transcribed span of an offline job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanResult {
+    /// The span, as planned.
+    pub span: Span,
+    /// Its tokens, in order. Their frames are the recognizer's frames
+    /// ([`SpeechRecognizer::frame_secs`]) counted from the start of the
+    /// clip, not of the span: for a recognizer whose frame is a mel frame,
+    /// absolute mel frames.
+    pub tokens: Vec<TokenEvent>,
+    /// Where the span ends, in the same frames: what
+    /// [`RecognizerStream::chunk_ends`] would have reported for it.
+    pub chunk_end: u32,
+    /// The language the recognizer found in its own output for this span,
+    /// as [`RecognizerStream::language`].
+    pub language: Option<String>,
+}
+
+/// What one [`OfflineJob::step`] transcribed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineBatch {
+    /// The spans transcribed, in plan order, each once. Skipped spans
+    /// (`transcribe: false`) never appear.
+    pub spans: Vec<SpanResult>,
+}
+
+/// A whole clip being transcribed a batch of spans at a time.
+pub trait OfflineJob: Send {
+    /// Transcribes the next batch of up to
+    /// [`SpeechRecognizer::batches_offline`] transcribed spans of `mel`, the
+    /// whole clip's frames, the same on every call.
+    ///
+    /// # Errors
+    ///
+    /// A device error, or [`AudioError::BadSpec`] for frames of the wrong
+    /// width or fewer than the plan covers.
+    // None: every transcribed span has been returned; the job is done.
+    fn step(&mut self, mel: &MelFrames) -> Result<Option<OfflineBatch>, AudioError>;
 }
 
 /// One utterance in progress.

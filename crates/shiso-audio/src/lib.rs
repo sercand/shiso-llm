@@ -34,6 +34,9 @@ pub use mel::{
 };
 pub use mel_stream::MelStream;
 pub use pcm::{MODEL_RATE, Pcm};
-pub use recognizer::{Language, RecognizerStream, SpeechRecognizer, StreamOptions, TokenEvent};
+pub use recognizer::{
+    Language, OfflineBatch, OfflineJob, RecognizerStream, SpanResult, SpeechRecognizer,
+    StreamOptions, TokenEvent,
+};
 pub use tower::{AudioClip, AudioTower, clip_for};
 pub use vocab::{Detokenizer, PieceVocab};

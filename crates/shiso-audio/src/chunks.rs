@@ -8,10 +8,16 @@
 //! a chunk; only a turn longer than a chunk falls back to the silence rule
 //! inside it.
 //!
+//! A clip recognised offline is planned whole, before recognition starts
+//! ([`plan_offline`]): the same cuts, plus long silences the diarizer hears
+//! no one in, which are skipped rather than transcribed, so their encode
+//! and decode cost is never paid.
+//!
 //! Everything here is host arithmetic over frames the caller already has. It
 //! is deterministic: the same frames always give the same cuts, ties going to
 //! the earliest candidate, so a transcript does not change between runs.
 
+use crate::error::AudioError;
 use crate::mel::MelFrames;
 use crate::num::{f64_of, usize_floor};
 use crate::transcript::SpeakerActivity;
@@ -53,7 +59,7 @@ pub fn silence_cuts(
     let mut out = Vec::new();
     cuts_between(
         &energy,
-        Span {
+        Stretch {
             lo: 0,
             hi: mel.valid(),
         },
@@ -131,11 +137,278 @@ pub fn turn_cuts(activity: &SpeakerActivity, mel: &MelFrames, mel_frame_secs: f6
     let mut out = Vec::new();
     let mut lo = 0;
     for hi in changes.into_iter().chain(std::iter::once(valid)) {
-        cuts_between(&energy, Span { lo, hi }, &rule, &mut out);
+        cuts_between(&energy, Stretch { lo, hi }, &rule, &mut out);
         if hi < valid {
             out.push(hi);
         }
         lo = hi;
+    }
+    out
+}
+
+/// A stretch of mel frames in an offline plan, `start..end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    /// First mel frame.
+    pub start: usize,
+    /// One past the last mel frame.
+    pub end: usize,
+    /// Whether the recognizer transcribes it; `false` is a long silence the
+    /// plan skips.
+    pub transcribe: bool,
+}
+
+/// How [`plan_offline`] cuts a whole clip. Frame counts are mel frames,
+/// times are seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OfflineRule {
+    /// The longest transcribed span. The silence rule looks for a cut within
+    /// `search_frames` either side of the mark `max_frames - search_frames`,
+    /// so no span it leaves runs past this.
+    pub max_frames: usize,
+    /// How far either side of each mark the quiet window is looked for.
+    pub search_frames: usize,
+    /// The window whose mean energy is compared.
+    pub window_frames: usize,
+    /// The shortest silence worth skipping.
+    pub skip_silence_secs: f64,
+    /// A diarizer frame where no speaker reaches this activity is silent.
+    /// It sits below [`DOMINANT_ABOVE`] on purpose: speech too faint to own
+    /// a turn is still speech, and is not skipped.
+    pub speech_floor: f32,
+    /// Silence kept transcribed on each side of a skipped span that borders
+    /// speech, so that a word the diarizer ends a little early is not cut.
+    pub pad_secs: f64,
+    /// Whether long silences are skipped at all.
+    pub skip_silence: bool,
+}
+
+impl OfflineRule {
+    /// The rule for 10 ms mel frames: spans of at most 35 s cut at the
+    /// quietest 100 ms within ±5 s of each 30 s mark (the streaming chunks'
+    /// own rule), and silences of 3 s or more under activity 0.3 skipped
+    /// with 0.2 s of margin, when `skip_silence` says so.
+    #[must_use]
+    pub const fn for_10ms_mel(skip_silence: bool) -> Self {
+        Self {
+            max_frames: 3_500,
+            search_frames: 500,
+            window_frames: 10,
+            skip_silence_secs: 3.0,
+            speech_floor: 0.3,
+            pad_secs: 0.2,
+            skip_silence,
+        }
+    }
+
+    /// Refuses a rule whose fields cannot make a plan.
+    fn check(&self, mel_frame_secs: f64) -> Result<(), AudioError> {
+        let bad = |reason: String| Err(AudioError::BadSpec { reason });
+        if !(mel_frame_secs.is_finite() && mel_frame_secs > 0.0) {
+            return bad(format!(
+                "a mel frame lasts a positive time, not {mel_frame_secs}"
+            ));
+        }
+        if self.max_frames <= self.search_frames {
+            return bad(format!(
+                "an offline span of at most {} frames leaves no mark to search {} frames around",
+                self.max_frames, self.search_frames
+            ));
+        }
+        if self.window_frames == 0 {
+            return bad("a window of zero frames measures nothing".into());
+        }
+        if !(self.skip_silence_secs.is_finite() && self.skip_silence_secs > 0.0) {
+            return bad(format!(
+                "a skipped silence lasts a positive time, not {}",
+                self.skip_silence_secs
+            ));
+        }
+        if !(self.pad_secs.is_finite() && self.pad_secs >= 0.0) {
+            return bad(format!(
+                "a silence margin is a time of zero or more, not {}",
+                self.pad_secs
+            ));
+        }
+        if !(self.speech_floor > 0.0 && self.speech_floor <= 1.0) {
+            return bad(format!(
+                "a speech floor is an activity in (0, 1], not {}",
+                self.speech_floor
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Cuts a whole clip into spans before any of it is recognised, in mel
+/// frames of `mel_frame_secs` each.
+///
+/// - **Without activity** the cuts are [`silence_cuts`] at the mark
+///   `max_frames - search_frames` (30 s under
+///   [`OfflineRule::for_10ms_mel`]: the streaming path's own chunks), and
+///   every span is transcribed.
+/// - **With activity** the cuts are [`turn_cuts`]. When
+///   `rule.skip_silence`, every run of diarizer frames at least
+///   `skip_silence_secs` long in which no speaker reaches `speech_floor`
+///   is skipped, less `pad_secs` on each side that borders speech; a side
+///   at the clip's start or end has no speech to keep a margin for. The
+///   skipped span replaces whatever turn spans it covers: a turn cut inside
+///   it (the midpoint of a pause between two speakers, say) goes, and a
+///   turn span it overlaps is split at its edge. Mel frames past the end
+///   of the activity are transcribed, since nothing says they are silent,
+///   except for less than one diarizer frame's worth, which belongs to the
+///   last frame.
+/// - **Always**, a transcribed span longer than `max_frames` is split by
+///   the silence rule inside it, and the spans cover `0..mel.valid()`
+///   exactly, in order, none of them empty. A transcribed span may be
+///   shorter than a recognizer's shortest input; padding it is the
+///   recognizer's business, and dropping it would lose its words.
+///
+/// # Errors
+///
+/// [`AudioError::BadSpec`] for a rule that cannot make a plan (see
+/// [`OfflineRule`]) or a non-positive `mel_frame_secs`, and for a plan
+/// that does not tile the clip, which would be a bug here.
+pub fn plan_offline(
+    mel: &MelFrames,
+    activity: Option<&SpeakerActivity>,
+    mel_frame_secs: f64,
+    rule: &OfflineRule,
+) -> Result<Vec<Span>, AudioError> {
+    rule.check(mel_frame_secs)?;
+    let valid = mel.valid();
+    if valid == 0 {
+        return Ok(Vec::new());
+    }
+    let marks = SilenceRule {
+        max: rule.max_frames - rule.search_frames,
+        search: rule.search_frames,
+        window: rule.window_frames,
+    };
+    let cuts = match activity {
+        Some(a) => turn_cuts(a, mel, mel_frame_secs),
+        None => silence_cuts(mel, marks.max, marks.search, marks.window),
+    };
+    let skipped = match activity {
+        Some(a) if rule.skip_silence => skipped_silences(a, valid, mel_frame_secs, rule),
+        _ => Vec::new(),
+    };
+    // Every edge either list makes; each piece between two is skipped when
+    // a skipped stretch holds it, and neighbouring skipped pieces merge.
+    let mut edges = cuts;
+    edges.extend(skipped.iter().flat_map(|s| [s.lo, s.hi]));
+    edges.extend([0, valid]);
+    edges.sort_unstable();
+    edges.dedup();
+    let mut pieces: Vec<Span> = Vec::with_capacity(edges.len());
+    for w in edges.windows(2) {
+        let (start, end) = (w[0], w[1]);
+        let transcribe = !skipped.iter().any(|s| s.lo <= start && end <= s.hi);
+        match pieces.last_mut() {
+            Some(last) if !last.transcribe && !transcribe => last.end = end,
+            _ => pieces.push(Span {
+                start,
+                end,
+                transcribe,
+            }),
+        }
+    }
+    let energy = frame_energy(mel);
+    let mut out = Vec::with_capacity(pieces.len());
+    let mut inner = Vec::new();
+    for piece in pieces {
+        if !piece.transcribe || piece.end - piece.start <= rule.max_frames {
+            out.push(piece);
+            continue;
+        }
+        inner.clear();
+        let whole = Stretch {
+            lo: piece.start,
+            hi: piece.end,
+        };
+        cuts_between(&energy, whole, &marks, &mut inner);
+        let mut start = piece.start;
+        for end in inner.iter().copied().chain(std::iter::once(piece.end)) {
+            out.push(Span {
+                start,
+                end,
+                transcribe: true,
+            });
+            start = end;
+        }
+    }
+    check_tiling(&out, valid)?;
+    Ok(out)
+}
+
+/// Refuses spans that do not cover `0..valid` exactly, in order, none empty.
+fn check_tiling(spans: &[Span], valid: usize) -> Result<(), AudioError> {
+    let mut at = 0;
+    for s in spans {
+        if s.start != at || s.end <= s.start {
+            return Err(AudioError::BadSpec {
+                reason: format!(
+                    "an offline plan must tile the clip: span {}..{} where one from {at} was due",
+                    s.start, s.end
+                ),
+            });
+        }
+        at = s.end;
+    }
+    if at == valid {
+        Ok(())
+    } else {
+        Err(AudioError::BadSpec {
+            reason: format!("an offline plan must tile the clip: it ends at {at}, not {valid}"),
+        })
+    }
+}
+
+/// The mel stretches a long silence in `activity` lets the plan skip,
+/// increasing and disjoint, margins already taken off.
+fn skipped_silences(
+    activity: &SpeakerActivity,
+    valid: usize,
+    mel_frame_secs: f64,
+    rule: &OfflineRule,
+) -> Vec<Stretch> {
+    let fs = activity.frame_secs();
+    let frames = activity.frames();
+    let pad = frames_in(rule.pad_secs, mel_frame_secs);
+    // Mel frames per diarizer frame, at least one.
+    let per_frame = frames_in(fs, mel_frame_secs).max(1);
+    let to_mel = |t: usize| usize_floor((f64_of(t) * fs / mel_frame_secs).round()).min(valid);
+    let silent =
+        |t: usize| (0..activity.speakers()).all(|s| activity.prob(t, s) < rule.speech_floor);
+    let mut out = Vec::new();
+    let mut t = 0;
+    while t < frames {
+        if !silent(t) {
+            t += 1;
+            continue;
+        }
+        let first = t;
+        while t < frames && silent(t) {
+            t += 1;
+        }
+        // Measured in the diarizer's own frames: 3 s over 0.08 s is 37.5, so
+        // 37 frames fall short and 38 are enough, with no rounding between.
+        if f64_of(t - first) * fs + 1e-9 < rule.skip_silence_secs {
+            continue;
+        }
+        let mut hi = to_mel(t);
+        if t == frames && hi + per_frame > valid {
+            hi = valid;
+        }
+        let lo = if first == 0 { 0 } else { to_mel(first) + pad };
+        let hi = if hi == valid {
+            valid
+        } else {
+            hi.saturating_sub(pad)
+        };
+        if lo < hi {
+            out.push(Stretch { lo, hi });
+        }
     }
     out
 }
@@ -149,7 +422,7 @@ struct SilenceRule {
 
 /// A half-open range of mel frames, `lo..hi`.
 #[derive(Clone, Copy)]
-struct Span {
+struct Stretch {
     lo: usize,
     hi: usize,
 }
@@ -182,7 +455,7 @@ fn frame_energy(mel: &MelFrames) -> Vec<f64> {
 }
 
 /// Appends the silence rule's cuts strictly inside `span` to `out`.
-fn cuts_between(energy: &[f64], span: Span, rule: &SilenceRule, out: &mut Vec<usize>) {
+fn cuts_between(energy: &[f64], span: Stretch, rule: &SilenceRule, out: &mut Vec<usize>) {
     assert!(rule.max > 0, "a chunk of zero frames is not a plan");
     assert!(rule.window > 0, "a window of zero frames measures nothing");
     let window = rule.window;
