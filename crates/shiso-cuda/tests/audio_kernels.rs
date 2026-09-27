@@ -62,6 +62,7 @@ device_cases!(
     matvec_matches_for_every_weight_type,
     matvec3_is_three_matvecs,
     matvec_silu_is_the_products_and_silu_mul,
+    matvec_rows_are_each_row_alone,
     add_rms_norm_is_the_axpy_and_rms_norm_it_replaces,
     qk_norm_rope_append_is_the_chain_it_replaces,
     argmax_wide_matches_the_row_argmax,

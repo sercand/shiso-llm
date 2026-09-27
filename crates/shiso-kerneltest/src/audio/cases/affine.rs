@@ -19,14 +19,14 @@ const GROUP: usize = 64;
 
 /// An `[n][k]` affine weight on the device, and its values as the kernels
 /// form them (`q * scale + bias`, fused, in f32).
-struct Affine {
-    q: DeviceBuffer,
-    scales: DeviceBuffer,
-    biases: DeviceBuffer,
+pub(super) struct Affine {
+    pub(super) q: DeviceBuffer,
+    pub(super) scales: DeviceBuffer,
+    pub(super) biases: DeviceBuffer,
     values: Vec<f32>,
 }
 
-fn affine(gpu: &Gpu, n: usize, k: usize, seed: u32) -> Affine {
+pub(super) fn affine(gpu: &Gpu, n: usize, k: usize, seed: u32) -> Affine {
     let bytes: Vec<u8> = oracle::signal(n * k, seed)
         .iter()
         .map(|v| ((v + 1.0) * 127.5).clamp(0.0, 255.0) as u8)

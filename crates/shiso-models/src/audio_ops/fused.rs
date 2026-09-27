@@ -330,17 +330,8 @@ impl Ops {
             bind.push(g);
             bind.push(u);
         }
-        self.launch(
-            gate.matvec_silu_entry(),
-            Extent3::new(
-                dim(cols.div_ceil(MATVEC_COLS).max(1), "matvec_silu.grid")?,
-                dim(rows.max(1), "matvec_silu.grid")?,
-                1,
-            ),
-            MATVEC_BLOCK,
-            0,
-            &bind,
-        )?;
+        let (entry, grid) = super::matvec_launch(&gate, rows, cols, true)?;
+        self.launch(entry, grid, MATVEC_BLOCK, 0, &bind)?;
         Ok(true)
     }
 }

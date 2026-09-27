@@ -13,9 +13,10 @@
 //! - the prefill's GEMMs take the stacked rows in runs whose rows are summed
 //!   as they would be alone ([`gemm_rows_sum_alone`]): the prompts longer
 //!   than the 32-row tile side by side, a shorter one on its own;
-//! - a decode step's projections take the batch's rows on the one-row
-//!   kernels, which sum each row alone, and its head argmaxes each row with
-//!   the single path's wide argmax;
+//! - a decode step's projections take the batch's rows on the multi-row
+//!   matrix-vector kernels, which read each weight run once for up to eight
+//!   rows and sum each row as the one-row kernels do, and its head argmaxes
+//!   each row with the single path's wide argmax;
 //! - the decode attention keeps the single path's 32 splits: fewer measured
 //!   faster at eight sequences, but a split is a partial sum, and its count
 //!   changes the float.
@@ -38,9 +39,13 @@
 //! next batch of steps runs only the live ones, their states copied into a
 //! fresh block and their planes left where they are (only the table changes).
 //! Compacting costs a few small copies and saves each finished row's share
-//! of every launch; keeping finished rows measured slower on M1 Max (see
-//! the task report's measurements, reproduced by
-//! `batched_step_and_prefill_times`).
+//! of every launch: eight mixed chunks decoded in 4.0 s compacting against
+//! 4.7 s keeping every row (M1 Max, HF bf16, `batched_step_and_prefill_times`).
+//!
+//! A pass over eight sequences measured 37 ms against 12 ms for one (the
+//! single path's pass): 4.7 ms a sequence. The prefill is compute-bound and
+//! stacking gains nothing on it; it is one pass for the batch's rows so the
+//! decode can start for all of them at once.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};

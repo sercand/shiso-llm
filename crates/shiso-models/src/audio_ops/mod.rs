@@ -143,6 +143,37 @@ const GEMM_SPLIT_BELOW: usize = 64;
 const GEMV_TG_COLS: usize = 16;
 /// Rows one matrix-vector threadgroup produces.
 const GEMV_TG_ROWS: usize = 8;
+/// Input rows one threadgroup of the multi-row matrix-vector-by-runs kernels
+/// takes: a decoder batch's rows share each weight run it reads.
+const MATVEC_ROWS: usize = 8;
+
+/// The matrix-vector-by-runs entry and grid for `rows` rows of `cols`
+/// columns: one row on the one-row kernel, more on the multi-row one, which
+/// reads each weight run once for up to [`MATVEC_ROWS`] rows and sums each
+/// row exactly as the one-row kernel does - so a row's value never depends on
+/// how many rows share its launch.
+fn matvec_launch(
+    weight: &WeightView<'_>,
+    rows: usize,
+    cols: usize,
+    silu: bool,
+) -> CoreResult<(&'static str, Extent3)> {
+    let (entry, row_groups) = match (rows > 1, silu) {
+        (false, false) => (weight.matvec_entry(), 1),
+        (false, true) => (weight.matvec_silu_entry(), 1),
+        (true, false) => (weight.matvec_rows_entry(), rows.div_ceil(MATVEC_ROWS)),
+        (true, true) => (weight.matvec_silu_rows_entry(), rows.div_ceil(MATVEC_ROWS)),
+    };
+    Ok((
+        entry,
+        Extent3::new(
+            dim(cols.div_ceil(MATVEC_COLS).max(1), "matvec.grid")?,
+            dim(row_groups, "matvec.grid")?,
+            1,
+        ),
+    ))
+}
+
 /// Output columns one matrix-vector-by-runs threadgroup produces.
 const MATVEC_COLS: usize = 4;
 /// Threads of one matrix-vector-by-runs threadgroup: two simdgroups sharing
@@ -1276,8 +1307,10 @@ impl Ops {
     /// runs of eight consecutive weights, which streams a row-major weight at
     /// about twice the rate [`Self::gemm`]'s matrix-vector kernel does. The
     /// summation order is not that kernel's, so a model takes one or the
-    /// other for a given product, never a mix; every row re-reads the weights,
-    /// so this is for one row, or a handful.
+    /// other for a given product, never a mix. More than one row takes the
+    /// multi-row kernel, which reads each weight run once for up to eight
+    /// rows and gives each row the one-row kernel's value, so a decoder's
+    /// batch of rows costs about one row's weight traffic.
     ///
     /// Returns `false`, launching nothing, when `k` is not a whole number of
     /// runs or a view is not 16-byte aligned, so the caller takes
@@ -1307,11 +1340,7 @@ impl Ops {
             k_chunk: dim(depth, "matvec.k")?,
             splits: 1,
         };
-        let grid = Extent3::new(
-            dim(cols.div_ceil(MATVEC_COLS).max(1), "matvec.grid")?,
-            dim(rows.max(1), "matvec.grid")?,
-            1,
-        );
+        let (entry, grid) = matvec_launch(&weight, rows, cols, false)?;
         let mut bind = vec![
             KernelArg::Bytes(bytemuck::bytes_of(&args)),
             KernelArg::Buffer(out),
@@ -1320,7 +1349,7 @@ impl Ops {
             KernelArg::Buffer(bias.unwrap_or(input)),
         ];
         bind.extend(weight.aux());
-        self.launch(weight.matvec_entry(), grid, MATVEC_BLOCK, 0, &bind)?;
+        self.launch(entry, grid, MATVEC_BLOCK, 0, &bind)?;
         Ok(true)
     }
 

@@ -55,6 +55,26 @@ impl GemmType {
         }
     }
 
+    /// The matrix-vector-by-runs kernel over blocks of rows.
+    pub(crate) fn matvec_rows_entry(self) -> &'static str {
+        match self {
+            Self::F32 => "kernel_audio_matvec_rows_f32w",
+            Self::Bf16 => "kernel_audio_matvec_rows_bf16w",
+            Self::F16 => "kernel_audio_matvec_rows_f16w",
+            Self::Q8_0 => "kernel_audio_matvec_rows_q8_0w",
+        }
+    }
+
+    /// The gated two-product kernel over blocks of rows.
+    pub(crate) fn matvec_silu_rows_entry(self) -> &'static str {
+        match self {
+            Self::F32 => "kernel_audio_matvec_silu_rows_f32w",
+            Self::Bf16 => "kernel_audio_matvec_silu_rows_bf16w",
+            Self::F16 => "kernel_audio_matvec_silu_rows_f16w",
+            Self::Q8_0 => "kernel_audio_matvec_silu_rows_q8_0w",
+        }
+    }
+
     /// The three-product matrix-vector-by-runs kernel for this weight type.
     pub(crate) fn matvec3_entry(self) -> &'static str {
         match self {

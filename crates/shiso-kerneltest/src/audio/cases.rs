@@ -26,6 +26,7 @@ use crate::{Gpu, drain, f32_bytes, run};
 mod affine;
 mod batched;
 mod fused;
+mod rows;
 pub use affine::{
     affine8_fused_products_are_the_chain, affine8_products_match_the_dequantised_weight,
 };
@@ -40,6 +41,7 @@ pub use fused::{
     matvec_silu_is_the_products_and_silu_mul, matvec3_is_three_matvecs,
     qk_norm_rope_append_is_the_chain_it_replaces,
 };
+pub use rows::matvec_rows_are_each_row_alone;
 
 /// Every entry the set exports, in contract-table order. Each kernel group
 /// appends its entries here; the pipeline check resolves exactly this list.
@@ -121,6 +123,16 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_embed_token_batch_f16w",
     "kernel_audio_embed_token_batch_q8_0w",
     "kernel_audio_embed_token_batch_affine8w",
+    "kernel_audio_matvec_rows_f32w",
+    "kernel_audio_matvec_rows_bf16w",
+    "kernel_audio_matvec_rows_f16w",
+    "kernel_audio_matvec_rows_q8_0w",
+    "kernel_audio_matvec_rows_affine8w",
+    "kernel_audio_matvec_silu_rows_f32w",
+    "kernel_audio_matvec_silu_rows_bf16w",
+    "kernel_audio_matvec_silu_rows_f16w",
+    "kernel_audio_matvec_silu_rows_q8_0w",
+    "kernel_audio_matvec_silu_rows_affine8w",
 ];
 
 const LINEAR_BLOCK: u32 = 256;

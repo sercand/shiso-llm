@@ -697,6 +697,135 @@ extern "C" __global__ void kernel_audio_matvec_silu_affine8w(
                                        audio_r_affine8{qu, su, bu});
 }
 
+/* The one-row tile over a block of up to AUDIO_MATVEC_ROWS rows of x (nrows
+ * of them, k apart) at once: each weight run is read once for every row, and
+ * each row's column sum is formed exactly as audio_matvec_tile forms it on
+ * that row alone. Lane c < 4 of warp 0 gets row r's column c in total[r]. */
+template <typename R>
+static __device__ __forceinline__ void audio_matvec_rows_tile(
+        const R w, uint n, uint k, uint n0, const float *x, uint nrows, float *part,
+        float *total) {
+    const uint NR = AUDIO_MATVEC_COLS;
+    const uint NSG = AUDIO_MATVEC_SG;
+    const uint RB = AUDIO_MATVEC_ROWS;
+    const uint lane = threadIdx.x & 31u;
+    const uint warp = threadIdx.x >> 5u;
+    const uint runs = k >> 3u;
+    float acc[AUDIO_MATVEC_ROWS][AUDIO_MATVEC_COLS];
+    for (uint r = 0; r < RB; ++r) {
+        for (uint c = 0; c < NR; ++c) {
+            acc[r][c] = 0.0f;
+        }
+    }
+    for (uint j = warp * 32u + lane; j < runs; j += NSG * 32u) {
+        for (uint r = 0; r < RB; ++r) {
+            if (r < nrows) {
+                const float *xr = x + (uint64_t) r * k;
+                for (uint c = 0; c < NR; ++c) {
+                    const uint64_t col = min(n0 + c, n - 1u);
+                    acc[r][c] += w.run8(col, k, j, xr);
+                }
+            }
+        }
+    }
+    for (uint r = 0; r < RB; ++r) {
+        for (uint c = 0; c < NR; ++c) {
+            acc[r][c] = audio_warp_sum(acc[r][c]);
+        }
+    }
+    if (lane == 0u) {
+        for (uint r = 0; r < RB; ++r) {
+            for (uint c = 0; c < NR; ++c) {
+                part[(r * NR + c) * NSG + warp] = acc[r][c];
+            }
+        }
+    }
+    __syncthreads();
+    for (uint r = 0; r < RB; ++r) {
+        float t = 0.0f;
+        if (warp == 0u && lane < NR) {
+            for (uint s = 0; s < NSG; ++s) {
+                t += part[(r * NR + lane) * NSG + s];
+            }
+        }
+        total[r] = t;
+    }
+}
+
+/* audio_matvec over rows [8 y, 8 y + 8) of the input in one block: grid
+ * (ceil(n / 4), ceil(m / 8)). */
+template <typename R>
+static __device__ __forceinline__ void audio_matvec_rows(
+        const struct audio_args_gemm args, float *y, const float *x, const R w,
+        const float *bias) {
+    __shared__ float part[AUDIO_MATVEC_ROWS * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    const uint n0 = blockIdx.x * AUDIO_MATVEC_COLS;
+    const uint row0 = blockIdx.y * AUDIO_MATVEC_ROWS;
+    const uint nrows = min(AUDIO_MATVEC_ROWS, args.m - row0);
+    float total[AUDIO_MATVEC_ROWS];
+    audio_matvec_rows_tile<R>(w, args.n, args.k, n0, x + (uint64_t) row0 * args.k, nrows, part,
+                              total);
+    if (threadIdx.x < AUDIO_MATVEC_COLS && n0 + threadIdx.x < args.n) {
+        const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u;
+        for (uint r = 0; r < nrows; ++r) {
+            y[(uint64_t) (row0 + r) * args.n + n0 + threadIdx.x] =
+                    total[r] + (has_bias ? bias[n0 + threadIdx.x] : 0.0f);
+        }
+    }
+}
+
+/* audio_matvec_silu over rows [8 y, 8 y + 8) of the input in one block. */
+template <typename R>
+static __device__ __forceinline__ void audio_matvec_silu_rows(
+        const struct audio_args_gemm args, float *y, const float *x, const R wg,
+        const R wu) {
+    __shared__ float part_g[AUDIO_MATVEC_ROWS * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    __shared__ float part_u[AUDIO_MATVEC_ROWS * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    const uint n0 = blockIdx.x * AUDIO_MATVEC_COLS;
+    const uint row0 = blockIdx.y * AUDIO_MATVEC_ROWS;
+    const uint nrows = min(AUDIO_MATVEC_ROWS, args.m - row0);
+    const float *xr = x + (uint64_t) row0 * args.k;
+    float g[AUDIO_MATVEC_ROWS];
+    float u[AUDIO_MATVEC_ROWS];
+    audio_matvec_rows_tile<R>(wg, args.n, args.k, n0, xr, nrows, part_g, g);
+    audio_matvec_rows_tile<R>(wu, args.n, args.k, n0, xr, nrows, part_u, u);
+    if (threadIdx.x < AUDIO_MATVEC_COLS && n0 + threadIdx.x < args.n) {
+        for (uint r = 0; r < nrows; ++r) {
+            const float gr = g[r] + 0.0f;
+            const float ur = u[r] + 0.0f;
+            y[(uint64_t) (row0 + r) * args.n + n0 + threadIdx.x] = gr * audio_sigmoid(gr) * ur;
+        }
+    }
+}
+
+#define AUDIO_MATVEC_ROWS_ENTRY(SUFFIX, W) \
+    extern "C" __global__ void kernel_audio_matvec_rows_##SUFFIX( \
+            const struct audio_args_gemm args, float *y, const float *x, const void *w, const float *bias) { \
+        audio_matvec_rows<audio_r_dense<W>>(args, y, x, audio_r_dense<W>{w}, bias); \
+    } \
+    extern "C" __global__ void kernel_audio_matvec_silu_rows_##SUFFIX( \
+            const struct audio_args_gemm args, float *y, const float *x, const void *wg, const void *wu) { \
+        audio_matvec_silu_rows<audio_r_dense<W>>(args, y, x, audio_r_dense<W>{wg}, audio_r_dense<W>{wu}); \
+    }
+
+AUDIO_MATVEC_ROWS_ENTRY(f32w, audio_w_f32)
+AUDIO_MATVEC_ROWS_ENTRY(bf16w, audio_w_bf16)
+AUDIO_MATVEC_ROWS_ENTRY(f16w, audio_w_f16)
+AUDIO_MATVEC_ROWS_ENTRY(q8_0w, audio_w_q8_0)
+
+extern "C" __global__ void kernel_audio_matvec_rows_affine8w(
+        const struct audio_args_gemm args, float *y, const float *x, const uint *q,
+        const float *bias, const unsigned short *scales, const unsigned short *biases) {
+    audio_matvec_rows<audio_r_affine8>(args, y, x, audio_r_affine8{q, scales, biases}, bias);
+}
+extern "C" __global__ void kernel_audio_matvec_silu_rows_affine8w(
+        const struct audio_args_gemm args, float *y, const float *x, const uint *qg,
+        const uint *qu, const unsigned short *sg, const unsigned short *su,
+        const unsigned short *bg, const unsigned short *bu) {
+    audio_matvec_silu_rows<audio_r_affine8>(args, y, x, audio_r_affine8{qg, sg, bg},
+                                            audio_r_affine8{qu, su, bu});
+}
+
 /* y[i] = sum_z parts[z][i] (+ b[i % n]): closes a split-k GEMM, summing the
  * planes in order so the result does not depend on scheduling. */
 extern "C" __global__ void kernel_audio_split_sum_f32(

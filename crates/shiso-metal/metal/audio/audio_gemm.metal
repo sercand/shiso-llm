@@ -503,8 +503,29 @@ template [[host_name("kernel_audio_gemv_q8_0w")]] kernel audio_gemv_t kernel_aud
 // differs from the matrix-vector kernel's, which is why both exist: a lane
 // sums its runs in k order, `simd_sum` closes each simdgroup, and the two
 // simdgroups' sums are added in simdgroup order.
+// One run's eight weights as the multi-row kernels hold them, read once and
+// dotted with each row of a block: the weights as floats and, for a block
+// format, the run's scale (and an affine group's bias). `apply8(load8(..))`
+// is each type's `dot8`, term for term.
+struct audio_run8_vals {
+    float4 w0;
+    float4 w1;
+    float d;
+    float b;
+};
+static inline float audio_apply8_plain(const thread audio_run8_vals & v, float4 x0, float4 x1) {
+    return dot(v.w0, x0) + dot(v.w1, x1);
+}
+
 struct audio_run8_f32 {
     static uint64_t row_bytes(uint k) { return (uint64_t) k * 4u; }
+    static audio_run8_vals load8(device const uchar *row, uint j) {
+        device const float4 *p = (device const float4 *) (row + (uint64_t) j * 32u);
+        return audio_run8_vals{p[0], p[1], 0.0f, 0.0f};
+    }
+    static float apply8(const thread audio_run8_vals & v, float4 x0, float4 x1) {
+        return audio_apply8_plain(v, x0, x1);
+    }
     static float dot8(device const uchar *row, uint j, float4 x0, float4 x1) {
         device const float4 *p = (device const float4 *) (row + (uint64_t) j * 32u);
         return dot(p[0], x0) + dot(p[1], x1);
@@ -512,6 +533,17 @@ struct audio_run8_f32 {
 };
 struct audio_run8_bf16 {
     static uint64_t row_bytes(uint k) { return (uint64_t) k * 2u; }
+    static audio_run8_vals load8(device const uchar *row, uint j) {
+        const uint4 b = *((device const uint4 *) (row + (uint64_t) j * 16u));
+        const float4 w0 = float4(as_type<float>(b.x << 16), as_type<float>(b.x & 0xffff0000u),
+                                 as_type<float>(b.y << 16), as_type<float>(b.y & 0xffff0000u));
+        const float4 w1 = float4(as_type<float>(b.z << 16), as_type<float>(b.z & 0xffff0000u),
+                                 as_type<float>(b.w << 16), as_type<float>(b.w & 0xffff0000u));
+        return audio_run8_vals{w0, w1, 0.0f, 0.0f};
+    }
+    static float apply8(const thread audio_run8_vals & v, float4 x0, float4 x1) {
+        return audio_apply8_plain(v, x0, x1);
+    }
     static float dot8(device const uchar *row, uint j, float4 x0, float4 x1) {
         const uint4 b = *((device const uint4 *) (row + (uint64_t) j * 16u));
         const float4 w0 = float4(as_type<float>(b.x << 16), as_type<float>(b.x & 0xffff0000u),
@@ -523,6 +555,13 @@ struct audio_run8_bf16 {
 };
 struct audio_run8_f16 {
     static uint64_t row_bytes(uint k) { return (uint64_t) k * 2u; }
+    static audio_run8_vals load8(device const uchar *row, uint j) {
+        device const half4 *p = (device const half4 *) (row + (uint64_t) j * 16u);
+        return audio_run8_vals{float4(p[0]), float4(p[1]), 0.0f, 0.0f};
+    }
+    static float apply8(const thread audio_run8_vals & v, float4 x0, float4 x1) {
+        return audio_apply8_plain(v, x0, x1);
+    }
     static float dot8(device const uchar *row, uint j, float4 x0, float4 x1) {
         device const half4 *p = (device const half4 *) (row + (uint64_t) j * 16u);
         return dot(float4(p[0]), x0) + dot(float4(p[1]), x1);
@@ -532,6 +571,17 @@ struct audio_run8_f16 {
 // the eight quants are read as four halfwords; the run's dot is scaled once.
 struct audio_run8_q8_0 {
     static uint64_t row_bytes(uint k) { return (uint64_t) (k >> 5u) * 34u; }
+    static audio_run8_vals load8(device const uchar *row, uint j) {
+        device const uchar *block = row + (uint64_t) (j >> 2u) * 34u;
+        const float d = (float) *((device const half *) block);
+        device const ushort *qs = (device const ushort *) (block + 2u + (j & 3u) * 8u);
+        const float4 q0 = float4(as_type<char4>((uint) qs[0] | ((uint) qs[1] << 16u)));
+        const float4 q1 = float4(as_type<char4>((uint) qs[2] | ((uint) qs[3] << 16u)));
+        return audio_run8_vals{q0, q1, d, 0.0f};
+    }
+    static float apply8(const thread audio_run8_vals & v, float4 x0, float4 x1) {
+        return (dot(v.w0, x0) + dot(v.w1, x1)) * v.d;
+    }
     static float dot8(device const uchar *row, uint j, float4 x0, float4 x1) {
         device const uchar *block = row + (uint64_t) (j >> 2u) * 34u;
         const float d = (float) *((device const half *) block);
@@ -552,6 +602,10 @@ struct audio_runs {
     typedef device const uchar *row_t;
     row_t row(uint c) const { return (device const uchar *) w + (uint64_t) c * W::row_bytes(k); }
     float dot8(row_t r, uint j, float4 x0, float4 x1) const { return W::dot8(r, j, x0, x1); }
+    audio_run8_vals load8(row_t r, uint j) const { return W::load8(r, j); }
+    float apply8(const thread audio_run8_vals & v, float4 x0, float4 x1) const {
+        return W::apply8(v, x0, x1);
+    }
 };
 // MLX 8-bit affine, groups of 64: a run is two words of one group, and its
 // dot is `scale * (q . x) + bias * sum(x)`. A row is only the column's first
@@ -574,6 +628,16 @@ struct audio_runs_affine8 {
         const float bi = audio_bf16(biases + g);
         const float4 one = float4(1.0f);
         return sc * (dot(q0, x0) + dot(q1, x1)) + bi * (dot(x0, one) + dot(x1, one));
+    }
+    audio_run8_vals load8(row_t g0, uint j) const {
+        const uint g = g0 + (j >> 3u);
+        const uint2 w = *((device const uint2 *) (q + (uint64_t) g * 16u + 2u * (j & 7u)));
+        return audio_run8_vals{float4(as_type<uchar4>(w.x)), float4(as_type<uchar4>(w.y)),
+                               audio_bf16(scales + g), audio_bf16(biases + g)};
+    }
+    float apply8(const thread audio_run8_vals & v, float4 x0, float4 x1) const {
+        const float4 one = float4(1.0f);
+        return v.d * (dot(v.w0, x0) + dot(v.w1, x1)) + v.b * (dot(x0, one) + dot(x1, one));
     }
 };
 
@@ -846,6 +910,184 @@ kernel void kernel_audio_matvec_silu_affine8w(
                            audio_runs_affine8{qu, su, bu, args.k}, part, tgpig, lane, sg);
 }
 
+/// The one-row tile over a block of up to `AUDIO_MATVEC_ROWS` rows of `x`
+/// (`nrows` of them, `k` apart) at once: every weight run is read and
+/// converted once (`load8`) and dotted with each row (`apply8`), and each row's column sum is formed exactly as
+/// `audio_matvec_tile` forms it on that row alone - the same runs per lane in
+/// the same order, the same simdgroup sum, the two halves added in order -
+/// so a batch of decoder rows costs one pass over the weights and keeps
+/// every row's value. Lane `c < 4` of simdgroup 0 gets row `r`'s column `c`
+/// in `total[r]`.
+template <typename R>
+static inline void audio_matvec_rows_tile(const R w, uint n, uint k, uint n0,
+                                          device const float *x, uint nrows,
+                                          threadgroup float *part, ushort lane, ushort sg,
+                                          thread float *total) {
+    const uint NR = AUDIO_MATVEC_COLS;
+    const uint NSG = AUDIO_MATVEC_SG;
+    const uint RB = AUDIO_MATVEC_ROWS;
+    const uint runs = k >> 3u;
+    typename R::row_t wr[AUDIO_MATVEC_COLS];
+    for (uint c = 0; c < NR; ++c) {
+        wr[c] = w.row(min(n0 + c, n - 1u));
+    }
+    float acc[AUDIO_MATVEC_ROWS][AUDIO_MATVEC_COLS];
+    for (uint r = 0; r < RB; ++r) {
+        for (uint c = 0; c < NR; ++c) {
+            acc[r][c] = 0.0f;
+        }
+    }
+    for (uint j = sg * 32u + lane; j < runs; j += NSG * 32u) {
+        audio_run8_vals v[AUDIO_MATVEC_COLS];
+        for (uint c = 0; c < NR; ++c) {
+            v[c] = w.load8(wr[c], j);
+        }
+        for (uint r = 0; r < RB; ++r) {
+            if (r < nrows) {
+                device const float4 *xp = (device const float4 *) (x + (uint64_t) r * k + j * 8u);
+                const float4 x0 = xp[0];
+                const float4 x1 = xp[1];
+                for (uint c = 0; c < NR; ++c) {
+                    acc[r][c] += w.apply8(v[c], x0, x1);
+                }
+            }
+        }
+    }
+    for (uint r = 0; r < RB; ++r) {
+        for (uint c = 0; c < NR; ++c) {
+            acc[r][c] = simd_sum(acc[r][c]);
+        }
+    }
+    if (lane == 0u) {
+        for (uint r = 0; r < RB; ++r) {
+            for (uint c = 0; c < NR; ++c) {
+                part[(r * NR + c) * NSG + sg] = acc[r][c];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = 0; r < RB; ++r) {
+        float t = 0.0f;
+        if (sg == 0u && lane < NR) {
+            for (uint s = 0; s < NSG; ++s) {
+                t += part[(r * NR + lane) * NSG + s];
+            }
+        }
+        total[r] = t;
+    }
+}
+
+/// `kernel_audio_matvec`'s product over rows `[8 y, 8 y + 8)` of the input
+/// in one threadgroup: grid `(ceil(n / 4), ceil(m / 8))`.
+template <typename R>
+static inline void audio_matvec_rows_body(constant audio_args_gemm & args, device float *y,
+                                          device const float *x, const R w,
+                                          device const float *bias, threadgroup float *part,
+                                          uint3 tgpig, ushort lane, ushort sg) {
+    const uint n0 = tgpig.x * AUDIO_MATVEC_COLS;
+    const uint row0 = tgpig.y * AUDIO_MATVEC_ROWS;
+    const uint nrows = min(AUDIO_MATVEC_ROWS, args.m - row0);
+    float total[AUDIO_MATVEC_ROWS];
+    audio_matvec_rows_tile(w, args.n, args.k, n0, x + (uint64_t) row0 * args.k, nrows, part,
+                           lane, sg, total);
+    if (sg == 0u && lane < AUDIO_MATVEC_COLS && n0 + lane < args.n) {
+        const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u;
+        for (uint r = 0; r < nrows; ++r) {
+            y[(uint64_t) (row0 + r) * args.n + n0 + lane] =
+                    total[r] + (has_bias ? bias[n0 + lane] : 0.0f);
+        }
+    }
+}
+
+template <typename W>
+kernel void kernel_audio_matvec_rows(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const void *w            [[buffer(3)]],
+        device const float *bias        [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[AUDIO_MATVEC_ROWS * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    audio_matvec_rows_body(args, y, x, audio_runs<W>{w, args.k}, bias, part, tgpig, lane, sg);
+}
+
+kernel void kernel_audio_matvec_rows_affine8w(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const uint *q            [[buffer(3)]],
+        device const float *bias        [[buffer(4)]],
+        device const ushort *scales     [[buffer(5)]],
+        device const ushort *biases     [[buffer(6)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[AUDIO_MATVEC_ROWS * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    audio_matvec_rows_body(args, y, x, audio_runs_affine8{q, scales, biases, args.k}, bias, part,
+                           tgpig, lane, sg);
+}
+
+/// `kernel_audio_matvec_silu`'s gated pair over rows `[8 y, 8 y + 8)` of the
+/// input in one threadgroup, each product the multi-row tile's, the product
+/// formed as the one-row kernel forms it.
+template <typename R>
+static inline void audio_matvec_silu_rows_body(constant audio_args_gemm & args, device float *y,
+                                               device const float *x, const R wg, const R wu,
+                                               threadgroup float *part, uint3 tgpig,
+                                               ushort lane, ushort sg) {
+    const uint n0 = tgpig.x * AUDIO_MATVEC_COLS;
+    const uint row0 = tgpig.y * AUDIO_MATVEC_ROWS;
+    const uint nrows = min(AUDIO_MATVEC_ROWS, args.m - row0);
+    device const float *xr = x + (uint64_t) row0 * args.k;
+    const uint span = AUDIO_MATVEC_ROWS * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG;
+    float g[AUDIO_MATVEC_ROWS];
+    float u[AUDIO_MATVEC_ROWS];
+    audio_matvec_rows_tile(wg, args.n, args.k, n0, xr, nrows, part, lane, sg, g);
+    audio_matvec_rows_tile(wu, args.n, args.k, n0, xr, nrows, part + span, lane, sg, u);
+    if (sg == 0u && lane < AUDIO_MATVEC_COLS && n0 + lane < args.n) {
+        for (uint r = 0; r < nrows; ++r) {
+            const float gr = g[r] + 0.0f;
+            const float ur = u[r] + 0.0f;
+            y[(uint64_t) (row0 + r) * args.n + n0 + lane] = gr * audio_sigmoid(gr) * ur;
+        }
+    }
+}
+
+template <typename W>
+kernel void kernel_audio_matvec_silu_rows(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const void *wg           [[buffer(3)]],
+        device const void *wu           [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[2u * AUDIO_MATVEC_ROWS * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    audio_matvec_silu_rows_body(args, y, x, audio_runs<W>{wg, args.k}, audio_runs<W>{wu, args.k},
+                                part, tgpig, lane, sg);
+}
+
+kernel void kernel_audio_matvec_silu_rows_affine8w(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const uint *qg           [[buffer(3)]],
+        device const uint *qu           [[buffer(4)]],
+        device const ushort *sg_        [[buffer(5)]],
+        device const ushort *su         [[buffer(6)]],
+        device const ushort *bg         [[buffer(7)]],
+        device const ushort *bu         [[buffer(8)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[2u * AUDIO_MATVEC_ROWS * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    audio_matvec_silu_rows_body(args, y, x, audio_runs_affine8{qg, sg_, bg, args.k},
+                                audio_runs_affine8{qu, su, bu, args.k}, part, tgpig, lane, sg);
+}
+
 typedef decltype(kernel_audio_matvec<audio_run8_f32>) audio_matvec_t;
 template [[host_name("kernel_audio_matvec_f32w")]]  kernel audio_matvec_t kernel_audio_matvec<audio_run8_f32>;
 template [[host_name("kernel_audio_matvec_bf16w")]] kernel audio_matvec_t kernel_audio_matvec<audio_run8_bf16>;
@@ -863,3 +1105,15 @@ template [[host_name("kernel_audio_matvec_silu_f32w")]]  kernel audio_matvec_sil
 template [[host_name("kernel_audio_matvec_silu_bf16w")]] kernel audio_matvec_silu_t kernel_audio_matvec_silu<audio_run8_bf16>;
 template [[host_name("kernel_audio_matvec_silu_f16w")]]  kernel audio_matvec_silu_t kernel_audio_matvec_silu<audio_run8_f16>;
 template [[host_name("kernel_audio_matvec_silu_q8_0w")]] kernel audio_matvec_silu_t kernel_audio_matvec_silu<audio_run8_q8_0>;
+
+typedef decltype(kernel_audio_matvec_rows<audio_run8_f32>) audio_matvec_rows_t;
+template [[host_name("kernel_audio_matvec_rows_f32w")]]  kernel audio_matvec_rows_t kernel_audio_matvec_rows<audio_run8_f32>;
+template [[host_name("kernel_audio_matvec_rows_bf16w")]] kernel audio_matvec_rows_t kernel_audio_matvec_rows<audio_run8_bf16>;
+template [[host_name("kernel_audio_matvec_rows_f16w")]]  kernel audio_matvec_rows_t kernel_audio_matvec_rows<audio_run8_f16>;
+template [[host_name("kernel_audio_matvec_rows_q8_0w")]] kernel audio_matvec_rows_t kernel_audio_matvec_rows<audio_run8_q8_0>;
+
+typedef decltype(kernel_audio_matvec_silu_rows<audio_run8_f32>) audio_matvec_silu_rows_t;
+template [[host_name("kernel_audio_matvec_silu_rows_f32w")]]  kernel audio_matvec_silu_rows_t kernel_audio_matvec_silu_rows<audio_run8_f32>;
+template [[host_name("kernel_audio_matvec_silu_rows_bf16w")]] kernel audio_matvec_silu_rows_t kernel_audio_matvec_silu_rows<audio_run8_bf16>;
+template [[host_name("kernel_audio_matvec_silu_rows_f16w")]]  kernel audio_matvec_silu_rows_t kernel_audio_matvec_silu_rows<audio_run8_f16>;
+template [[host_name("kernel_audio_matvec_silu_rows_q8_0w")]] kernel audio_matvec_silu_rows_t kernel_audio_matvec_silu_rows<audio_run8_q8_0>;

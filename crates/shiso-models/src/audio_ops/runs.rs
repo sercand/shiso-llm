@@ -81,6 +81,22 @@ impl<'a> WeightView<'a> {
         }
     }
 
+    /// The one-product kernel over blocks of rows.
+    pub(crate) fn matvec_rows_entry(&self) -> &'static str {
+        match self {
+            Self::Dense(t, _) => t.matvec_rows_entry(),
+            Self::Affine8(_) => "kernel_audio_matvec_rows_affine8w",
+        }
+    }
+
+    /// The gated two-product kernel over blocks of rows.
+    pub(crate) fn matvec_silu_rows_entry(&self) -> &'static str {
+        match self {
+            Self::Dense(t, _) => t.matvec_silu_rows_entry(),
+            Self::Affine8(_) => "kernel_audio_matvec_silu_rows_affine8w",
+        }
+    }
+
     /// The three-product kernel.
     pub(crate) fn matvec3_entry(&self) -> &'static str {
         match self {

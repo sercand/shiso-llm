@@ -23,6 +23,9 @@
 // that share each column's k range.
 #define AUDIO_MATVEC_COLS 4u
 #define AUDIO_MATVEC_SG 2u
+// Input rows one threadgroup of the multi-row matrix-vector kernels takes:
+// a decoder batch's rows share each weight run the threadgroup reads.
+#define AUDIO_MATVEC_ROWS 8u
 // Values one thread of the fused residual-add RMS norm loads at once.
 #define AUDIO_ADD_RMS_RUN 8u
 // Head dims up to 32 lanes x 4 values; the attention keeps a lane's slice of
