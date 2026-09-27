@@ -73,6 +73,86 @@ extern "C" __global__ void kernel_vit_add_bias_bf16(
     x[i] += vit_bf16(bias + (i % args.period));
 }
 
+/* Writes `x` at `i` of an operand split into brain-float pairs: the nearest
+ * value at `out[i]`, the remainder `count` elements further on. The layout
+ * `kernel_vit_to_bf16` writes and a BLAS projection reads. */
+static __device__ __forceinline__ void vit_store_split(__nv_bfloat16 *out, uint64_t count,
+                                                       uint64_t i, float x) {
+    const __nv_bfloat16 hi = __float2bfloat16_rn(x);
+    out[i] = hi;
+    out[count + i] = __float2bfloat16_rn(x - __bfloat162float(hi));
+}
+
+/* `kernel_vit_layer_norm` writing its rows as the next projection's split
+ * operand instead of as single-precision rows: the normalized row is only ever
+ * read by that projection, so writing it once as f32 and then again as the
+ * pair was a whole pass over the hidden stream for nothing. The arithmetic is
+ * the unfused kernel's, value for value. */
+extern "C" __global__ void kernel_vit_layer_norm_split(
+        const struct vit_args_layer_norm args,
+        __nv_bfloat16 *__restrict__ out,
+        const float *__restrict__ in,
+        const unsigned short *__restrict__ weight,
+        const unsigned short *__restrict__ bias) {
+    const unsigned r = blockIdx.x;
+    if (r >= args.rows) {
+        return;
+    }
+    float *scratch = (float *) vit_smem;
+    const unsigned tid = threadIdx.x;
+    const unsigned nthreads = blockDim.x;
+    const float *src = in + (uint64_t) r * args.dim;
+    const uint64_t count = (uint64_t) args.rows * args.dim;
+
+    float sum = 0.0f;
+    for (unsigned i = tid; i < args.dim; i += nthreads) {
+        sum += src[i];
+    }
+    const float mean = vit_block_sum(sum, scratch, tid, nthreads) / (float) args.dim;
+    float var = 0.0f;
+    for (unsigned i = tid; i < args.dim; i += nthreads) {
+        const float d = src[i] - mean;
+        var += d * d;
+    }
+    const float rstd = rsqrtf(
+            vit_block_sum(var, scratch, tid, nthreads) / (float) args.dim + args.eps);
+    for (unsigned i = tid; i < args.dim; i += nthreads) {
+        const float y = (src[i] - mean) * rstd * vit_bf16(weight + i) + vit_bf16(bias + i);
+        vit_store_split(out, count, (uint64_t) r * args.dim + i, y);
+    }
+}
+
+/* The first feed-forward layer's epilogue and the second's operand in one
+ * pass: `gelu_tanh(x[i] + bias[i % period])`, written as a split operand. The
+ * activated row is read by nothing but the second layer, so it is never
+ * stored as single precision. */
+extern "C" __global__ void kernel_vit_bias_gelu_split(
+        const struct vit_args_add args,
+        __nv_bfloat16 *__restrict__ out,
+        const float *__restrict__ x,
+        const unsigned short *__restrict__ bias) {
+    const unsigned i = blockIdx.x * VIT_LINEAR_BLOCK + threadIdx.x;
+    if (i >= args.count) {
+        return;
+    }
+    vit_store_split(out, args.count, i, vit_gelu_tanh(x[i] + vit_bf16(bias + (i % args.period))));
+}
+
+/* A projection's bias and the block's residual in one pass:
+ * `x[i] = (x[i] + bias[i % period]) + residual[i]`, in the order the two
+ * unfused kernels added them. */
+extern "C" __global__ void kernel_vit_add_bias_residual(
+        const struct vit_args_add args,
+        float *__restrict__ x,
+        const unsigned short *__restrict__ bias,
+        const float *__restrict__ residual) {
+    const unsigned i = blockIdx.x * VIT_LINEAR_BLOCK + threadIdx.x;
+    if (i >= args.count) {
+        return;
+    }
+    x[i] = (x[i] + vit_bf16(bias + (i % args.period))) + residual[i];
+}
+
 /* Two floats as one register of two brain-floats, the first in the low half:
  * the order a fragment register holds consecutive columns in. */
 static __device__ __forceinline__ uint32_t vit_pack_bf16(float lo, float hi) {
@@ -122,6 +202,16 @@ static __device__ __forceinline__ void vit_mma_bf16x3(float d[4], const uint32_t
     vit_mma_bf16(d, al, bh0, bh1);
     vit_mma_bf16(d, ah, bl0, bl1);
     vit_mma_bf16(d, ah, bh0, bh1);
+}
+
+/* `2^x` from the special-function unit. Its error, two units in the last place,
+ * is some thousand times below what the brain-float pairs keep, and the
+ * accurate `exp2f` sequence was a fifth of this kernel's instructions. A
+ * large negative argument flushes to zero, which is the weight it stands for. */
+static __device__ __forceinline__ float vit_ex2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
 }
 
 /* A query row's value at head column `d`, or zero past the row's end or the
@@ -195,22 +285,153 @@ extern "C" __global__ void kernel_vit_split_kv(
     }
 }
 
+/* `kernel_vit_qkv_rope_split`'s arguments: the rotation's, plus the padded
+ * group length of the split planes it writes. */
+struct vit_args_qkv_rope_split {
+    uint32_t rows;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t grid_w;
+    uint32_t plane;
+    uint32_t plane_pad;
+    float rope_base;
+};
+static_assert(sizeof(struct vit_args_qkv_rope_split) == 28, "vit_args_qkv_rope_split is 28 bytes");
+
+/* The fused projection's bias, the two-dimensional rotation and the key/value
+ * split in one pass over the fused row: `q` comes out rotated in single
+ * precision, the keys rotated and the values as-is, both straight into the
+ * split planes `kernel_vit_attention_mma` stages from.
+ *
+ * The arithmetic is `kernel_vit_add_bias_bf16`, then `kernel_vit_qkv_rope`,
+ * then `kernel_vit_split_kv`, value for value; what is gone is two
+ * single-precision planes written and read back once per layer. Only real
+ * key rows are written, so the planes' padding rows must be zero before the
+ * first layer - the host clears them once per encode - and the padding
+ * columns past the head's width are written as zeros here.
+ *
+ * One block per (head, row), as the rotation. */
+extern "C" __global__ void kernel_vit_qkv_rope_split(
+        const struct vit_args_qkv_rope_split args,
+        float *__restrict__ q,
+        __nv_bfloat16 *__restrict__ kp,
+        __nv_bfloat16 *__restrict__ vp,
+        const float *__restrict__ qkv,
+        const unsigned short *__restrict__ bias) {
+    const unsigned n = blockIdx.y;
+    const unsigned h = blockIdx.x;
+    if (n >= args.rows) {
+        return;
+    }
+    const unsigned tid = threadIdx.x;
+    const unsigned nthreads = blockDim.x;
+    const unsigned hd = args.head_dim;
+    const unsigned dim = args.heads * hd;
+    const unsigned half_hd = hd / 2u;
+    const unsigned per_axis = half_hd / 2u;
+
+    const unsigned local = n % args.plane;
+    const float row = (float) (local / args.grid_w);
+    const float col = (float) (local % args.grid_w);
+    const unsigned padded = (args.rows / args.plane) * args.plane_pad;
+    const unsigned prow = (n / args.plane) * args.plane_pad + local;
+    const uint64_t kplane = (uint64_t) args.heads * padded * VIT_FA_HD;
+
+    const float *src = qkv + (uint64_t) n * 3u * dim;
+    const unsigned off = h * hd;
+    float *qd = q + (uint64_t) n * dim + off;
+    __nv_bfloat16 *kd = kp + ((uint64_t) h * padded + prow) * VIT_FA_HD;
+    __nv_bfloat16 *vd = vp + (uint64_t) h * VIT_FA_HD * padded + prow;
+
+    for (unsigned i = tid; i < VIT_FA_HD; i += nthreads) {
+        const float x = (i < hd) ? src[2u * dim + off + i] + vit_bf16(bias + 2u * dim + off + i)
+                                 : 0.0f;
+        const __nv_bfloat16 hi = __float2bfloat16_rn(x);
+        vd[(uint64_t) i * padded] = hi;
+        vd[kplane + (uint64_t) i * padded] = __float2bfloat16_rn(x - __bfloat162float(hi));
+        if (i >= hd) {
+            kd[i] = __float2bfloat16_rn(0.0f);
+            kd[kplane + i] = __float2bfloat16_rn(0.0f);
+        }
+    }
+    for (unsigned i = tid; i < half_hd; i += nthreads) {
+        const unsigned freq = (i < per_axis) ? i : (i - per_axis);
+        const float pos = (i < per_axis) ? row : col;
+        const float inv = powf(args.rope_base, -2.0f * (float) freq / (float) half_hd);
+        const float theta = pos * inv;
+        const float s = sinf(theta);
+        const float c = cosf(theta);
+        const float q0 = src[off + i] + vit_bf16(bias + off + i);
+        const float q1 = src[off + i + half_hd] + vit_bf16(bias + off + i + half_hd);
+        qd[i] = q0 * c - q1 * s;
+        qd[i + half_hd] = q1 * c + q0 * s;
+        const float k0 = src[dim + off + i] + vit_bf16(bias + dim + off + i);
+        const float k1 = src[dim + off + i + half_hd] + vit_bf16(bias + dim + off + i + half_hd);
+        vit_store_split(kd, kplane, i, k0 * c - k1 * s);
+        vit_store_split(kd, kplane, i + half_hd, k1 * c + k0 * s);
+    }
+}
+
+/* One staged key/value tile: each as its nearest brain-floats and as what
+ * they left over, the values transposed. The attention holds two, one being
+ * filled while the other is read. */
+struct vit_fa_tile {
+    __nv_bfloat16 ks[2][VIT_FA_BK][VIT_FA_HD + VIT_FA_PAD];
+    __nv_bfloat16 vt[2][VIT_FA_HD][VIT_FA_BK + VIT_FA_PAD];
+};
+/* The attention's dynamic shared memory, which the host passes at launch. */
+#define VIT_FA_SMEM (2u * (unsigned) sizeof(struct vit_fa_tile))
+
+/* Sixteen bytes from global to shared memory without passing through a
+ * register, completing asynchronously. */
+static __device__ __forceinline__ void vit_cp_async16(void *dst, const void *src) {
+    const unsigned at = (unsigned) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(at), "l"(src));
+}
+
+/* Issues the copies that fill `dst` with the key tile starting `tk` keys into
+ * the group, and closes them as one group. */
+static __device__ __forceinline__ void vit_fa_stage(struct vit_fa_tile *dst,
+                                                    const __nv_bfloat16 *kh_src,
+                                                    const __nv_bfloat16 *vh_src, uint64_t kplane,
+                                                    unsigned padded, unsigned tk) {
+    constexpr unsigned KV = VIT_FA_HD / 8u;
+    constexpr unsigned VV = VIT_FA_BK / 8u;
+    for (unsigned i = threadIdx.x; i < 2u * VIT_FA_BK * KV; i += blockDim.x) {
+        const unsigned half = i / (VIT_FA_BK * KV);
+        const unsigned r = (i / KV) % VIT_FA_BK;
+        const unsigned c = i % KV;
+        vit_cp_async16(&dst->ks[half][r][c * 8u],
+                       kh_src + half * kplane + (uint64_t) (tk + r) * VIT_FA_HD + c * 8u);
+    }
+    for (unsigned i = threadIdx.x; i < 2u * VIT_FA_HD * VV; i += blockDim.x) {
+        const unsigned half = i / (VIT_FA_HD * VV);
+        const unsigned d = (i / VV) % VIT_FA_HD;
+        const unsigned c = i % VV;
+        vit_cp_async16(&dst->vt[half][d][c * 8u],
+                       vh_src + half * kplane + (uint64_t) d * padded + tk + c * 8u);
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
 /* Bidirectional attention over one temporal group, on matrix fragments.
  *
  * The same contract as `kernel_vit_attention` - the same argument block, the
  * same planes it reads through `kernel_vit_split_kv`, the same output -
  * launched differently: one block of eight warps per (head, 128 queries of
- * one group), grid `(heads, groups * ceil(plane / 128))`, no dynamic shared
- * memory. Each warp owns sixteen query rows. Keys and values are staged a
- * 64-key tile at a time in shared memory, the values transposed, so each tile
- * is read once per 128 queries rather than every query reading every key from
- * global memory. Eight warps rather than four measured 390 -> 358 ms for a
- * 896-pixel picture on the GB10.
+ * one group), grid `(heads, groups * ceil(plane / 128))`, VIT_FA_SMEM bytes
+ * of dynamic shared memory. Each warp owns sixteen query rows. Keys and
+ * values are staged a 64-key tile at a time, the values transposed, so each
+ * tile is read once per 128 queries rather than every query reading every key
+ * from global memory; two tiles are held, and the next one's asynchronous
+ * copies run while this one is multiplied. Measured on the GB10 for a
+ * 896-pixel picture's whole tower: eight warps rather than four, 390 -> 358
+ * ms; the second tile, 294 -> 239 ms.
  *
  * The softmax is the online form: a running maximum and denominator per query
  * row, the accumulator rescaled whenever the maximum moves. Scores are taken
  * in base two, the scale folded into the queries with a factor of log2(e), so
- * the exponentials are `exp2f`.
+ * the exponentials are `vit_ex2`.
  *
  * Every operand - queries, keys, probabilities, values - is carried as a pair
  * of brain-floats, the nearest value and its remainder, and multiplied as
@@ -223,9 +444,9 @@ extern "C" __global__ void __launch_bounds__(256) kernel_vit_attention_mma(
         const float *__restrict__ q,
         const __nv_bfloat16 *__restrict__ kp,
         const __nv_bfloat16 *__restrict__ vp) {
-    /* Each tile twice, as its nearest brain-floats and as what they left over. */
-    __shared__ __align__(16) __nv_bfloat16 ks[2][VIT_FA_BK][VIT_FA_HD + VIT_FA_PAD];
-    __shared__ __align__(16) __nv_bfloat16 vt[2][VIT_FA_HD][VIT_FA_BK + VIT_FA_PAD];
+    /* Two tiles, VIT_FA_SMEM bytes of dynamic shared memory: the next key
+     * tile's copies are in flight while this one's fragments are multiplied. */
+    struct vit_fa_tile *staged = reinterpret_cast<struct vit_fa_tile *>(vit_smem);
 
     const unsigned hd = args.head_dim;
     if (hd > VIT_FA_HD) {
@@ -286,32 +507,21 @@ extern "C" __global__ void __launch_bounds__(256) kernel_vit_attention_mma(
      * the end, rather than every tile. */
     float l0 = 0.0f, l1 = 0.0f;
 
-    for (unsigned k0 = base; k0 < end; k0 += VIT_FA_BK) {
-        __syncthreads();
-        /* Stage the tile from the split planes, sixteen bytes at a time: keys
-         * as 64 rows of VIT_FA_HD, values as VIT_FA_HD rows of 64. Both halves
-         * of each. Past the group's end the planes hold zeros, and the mask
-         * below gives those keys no weight. */
-        const unsigned tk = k0 - base;
-        constexpr unsigned KV = VIT_FA_HD / 8u;
-        constexpr unsigned VV = VIT_FA_BK / 8u;
-        for (unsigned i = tid; i < 2u * VIT_FA_BK * KV; i += blockDim.x) {
-            const unsigned half = i / (VIT_FA_BK * KV);
-            const unsigned r = (i / KV) % VIT_FA_BK;
-            const unsigned c = i % KV;
-            const uint4 *src = reinterpret_cast<const uint4 *>(
-                    kh_src + half * kplane + (uint64_t) (tk + r) * VIT_FA_HD) + c;
-            *reinterpret_cast<uint4 *>(&ks[half][r][c * 8u]) = *src;
-        }
-        for (unsigned i = tid; i < 2u * VIT_FA_HD * VV; i += blockDim.x) {
-            const unsigned half = i / (VIT_FA_HD * VV);
-            const unsigned d = (i / VV) % VIT_FA_HD;
-            const unsigned c = i % VV;
-            const uint4 *src = reinterpret_cast<const uint4 *>(
-                    vh_src + half * kplane + (uint64_t) d * padded + tk) + c;
-            *reinterpret_cast<uint4 *>(&vt[half][d][c * 8u]) = *src;
+    /* Past the group's end the planes hold zeros, and the mask below gives
+     * those keys no weight. */
+    const unsigned ntiles = args.plane_pad / VIT_FA_BK;
+    vit_fa_stage(&staged[0], kh_src, vh_src, kplane, padded, 0u);
+    for (unsigned it = 0u; it < ntiles; it++) {
+        const unsigned k0 = base + it * VIT_FA_BK;
+        if (it + 1u < ntiles) {
+            vit_fa_stage(&staged[(it + 1u) & 1u], kh_src, vh_src, kplane, padded,
+                         (it + 1u) * VIT_FA_BK);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::);
         }
         __syncthreads();
+        const struct vit_fa_tile &tile = staged[it & 1u];
 
         /* Scores for this warp's sixteen rows against the tile's 64 keys. */
         float s[VIT_FA_BK / 8u][4];
@@ -320,8 +530,8 @@ extern "C" __global__ void __launch_bounds__(256) kernel_vit_attention_mma(
             s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
 #pragma unroll
             for (unsigned st = 0u; st < VIT_FA_HD / 16u; st++) {
-                const __nv_bfloat16 *kh = &ks[0][n * 8u + g][st * 16u + 2u * t];
-                const __nv_bfloat16 *kl = &ks[1][n * 8u + g][st * 16u + 2u * t];
+                const __nv_bfloat16 *kh = &tile.ks[0][n * 8u + g][st * 16u + 2u * t];
+                const __nv_bfloat16 *kl = &tile.ks[1][n * 8u + g][st * 16u + 2u * t];
                 vit_mma_bf16x3(s[n], qa[st], ql[st],
                                *reinterpret_cast<const uint32_t *>(kh),
                                *reinterpret_cast<const uint32_t *>(kh + 8),
@@ -352,8 +562,8 @@ extern "C" __global__ void __launch_bounds__(256) kernel_vit_attention_mma(
         t1 = fmaxf(t1, __shfl_xor_sync(0xffffffffu, t1, 2));
         /* A row that has seen only masked keys keeps a maximum of minus
          * infinity; its rescale is taken as one so nothing becomes NaN. */
-        const float a0 = (t0 == -INFINITY) ? 1.0f : exp2f(m0 - t0);
-        const float a1 = (t1 == -INFINITY) ? 1.0f : exp2f(m1 - t1);
+        const float a0 = (t0 == -INFINITY) ? 1.0f : vit_ex2(m0 - t0);
+        const float a1 = (t1 == -INFINITY) ? 1.0f : vit_ex2(m1 - t1);
         m0 = t0;
         m1 = t1;
         l0 *= a0;
@@ -367,10 +577,10 @@ extern "C" __global__ void __launch_bounds__(256) kernel_vit_attention_mma(
         }
 #pragma unroll
         for (unsigned n = 0u; n < VIT_FA_BK / 8u; n++) {
-            s[n][0] = (m0 == -INFINITY) ? 0.0f : exp2f(s[n][0] - m0);
-            s[n][1] = (m0 == -INFINITY) ? 0.0f : exp2f(s[n][1] - m0);
-            s[n][2] = (m1 == -INFINITY) ? 0.0f : exp2f(s[n][2] - m1);
-            s[n][3] = (m1 == -INFINITY) ? 0.0f : exp2f(s[n][3] - m1);
+            s[n][0] = (m0 == -INFINITY) ? 0.0f : vit_ex2(s[n][0] - m0);
+            s[n][1] = (m0 == -INFINITY) ? 0.0f : vit_ex2(s[n][1] - m0);
+            s[n][2] = (m1 == -INFINITY) ? 0.0f : vit_ex2(s[n][2] - m1);
+            s[n][3] = (m1 == -INFINITY) ? 0.0f : vit_ex2(s[n][3] - m1);
             l0 += s[n][0] + s[n][1];
             l1 += s[n][2] + s[n][3];
         }
@@ -387,8 +597,8 @@ extern "C" __global__ void __launch_bounds__(256) kernel_vit_attention_mma(
             vit_split_bf16(s[2u * st + 1u][2], s[2u * st + 1u][3], &pa[3], &pl[3]);
 #pragma unroll
             for (unsigned j = 0u; j < VIT_FA_HD / 8u; j++) {
-                const __nv_bfloat16 *vh = &vt[0][j * 8u + g][st * 16u + 2u * t];
-                const __nv_bfloat16 *vl = &vt[1][j * 8u + g][st * 16u + 2u * t];
+                const __nv_bfloat16 *vh = &tile.vt[0][j * 8u + g][st * 16u + 2u * t];
+                const __nv_bfloat16 *vl = &tile.vt[1][j * 8u + g][st * 16u + 2u * t];
                 vit_mma_bf16x3(o[j], pa, pl,
                                *reinterpret_cast<const uint32_t *>(vh),
                                *reinterpret_cast<const uint32_t *>(vh + 8),
@@ -396,6 +606,8 @@ extern "C" __global__ void __launch_bounds__(256) kernel_vit_attention_mma(
                                *reinterpret_cast<const uint32_t *>(vl + 8));
             }
         }
+        /* The next iteration refills the buffer just read. */
+        __syncthreads();
     }
 
     l0 += __shfl_xor_sync(0xffffffffu, l0, 1);

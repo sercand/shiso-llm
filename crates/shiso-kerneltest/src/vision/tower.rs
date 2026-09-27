@@ -1151,7 +1151,8 @@ fn run_attention_mma(
             1,
         ),
         Extent3::linear(256),
-        0,
+        // `VIT_FA_SMEM`: two staged tiles.
+        2 * 2 * 2 * (64 * (80 + 8) + 80 * (64 + 8)),
         &[
             KernelArg::Bytes(bytemuck::bytes_of(&args)),
             KernelArg::Buffer(out.view()),
