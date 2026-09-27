@@ -91,6 +91,12 @@ device_cases!(
     decode_step_stops_on_eos_and_goes_quiet,
     embed_token_takes_the_state_token_row,
     rope_half_state_takes_its_position_from_the_state,
+    segmented_causal_attention_matches_each_sequence_alone,
+    segmented_qk_norm_rope_append_is_each_sequence_alone,
+    batched_qk_norm_rope_append_is_each_row_alone,
+    batched_decode_attention_reads_each_length,
+    batched_step_stops_each_sequence_alone,
+    batched_embed_token_takes_each_state_token_row,
 );
 
 #[test]

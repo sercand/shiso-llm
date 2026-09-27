@@ -92,6 +92,15 @@ struct audio_args_qk_rope {
 struct audio_args_argmax_split { uint cols; uint span; uint parts; };
 struct audio_args_decode_step { uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; };
 struct audio_args_embed_token { uint width; uint vocab; uint group; };
+struct audio_args_batch_attn {
+    uint seqs; uint heads; uint kv_heads; uint head_dim; float scale; uint splits;
+};
+struct audio_args_qk_rope_seq {
+    uint rows; uint seqs; uint heads; uint kv_heads; uint head_dim; float eps; float theta;
+};
+struct audio_args_decode_step_batch {
+    uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; uint seqs;
+};
 
 /* Greedy search's state on the device, as the Metal twin's. */
 #define AUDIO_GREEDY_T 0u
@@ -111,6 +120,18 @@ struct audio_args_embed_token { uint width; uint vocab; uint group; };
 #define AUDIO_DECODE_NONE 0xffffffffu
 #define AUDIO_DECODE_STOP_EOS 1u
 #define AUDIO_DECODE_STOP_CAP 2u
+#define AUDIO_DECODE_STATE_WORDS 8u
+
+/* A batch's per-sequence table, eight words a sequence, as the Metal twin's:
+ * the first cache row of its plane in the shared buffers, the plane's
+ * capacity, and for a segmented prefill its first stacked row, its rows and
+ * that first row's position. */
+#define AUDIO_SEQ_WORDS 8u
+#define AUDIO_SEQ_PLANE 0u
+#define AUDIO_SEQ_CAP 1u
+#define AUDIO_SEQ_ROW0 2u
+#define AUDIO_SEQ_ROWS 3u
+#define AUDIO_SEQ_POS0 4u
 
 /* One brain-float, widened exactly (the 16 bits become the high half). */
 static __device__ __forceinline__ float audio_bf16(const unsigned short *p) {

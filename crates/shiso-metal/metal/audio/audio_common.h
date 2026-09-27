@@ -105,6 +105,15 @@ typedef struct {
 typedef struct { uint cols; uint span; uint parts; } audio_args_argmax_split;
 typedef struct { uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; } audio_args_decode_step;
 typedef struct { uint width; uint vocab; uint group; } audio_args_embed_token;
+typedef struct {
+    uint seqs; uint heads; uint kv_heads; uint head_dim; float scale; uint splits;
+} audio_args_batch_attn;
+typedef struct {
+    uint rows; uint seqs; uint heads; uint kv_heads; uint head_dim; float eps; float theta;
+} audio_args_qk_rope_seq;
+typedef struct {
+    uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; uint seqs;
+} audio_args_decode_step_batch;
 
 // Greedy search's state on the device, one u32 each: the frame (relative to
 // the first pending row), the symbols emitted on it, whether the search has
@@ -130,6 +139,22 @@ typedef struct { uint width; uint vocab; uint group; } audio_args_embed_token;
 #define AUDIO_DECODE_NONE 0xffffffffu
 #define AUDIO_DECODE_STOP_EOS 1u
 #define AUDIO_DECODE_STOP_CAP 2u
+// Words of one decoder state; a batch keeps its sequences' states back to
+// back, sequence s's at s * AUDIO_DECODE_STATE_WORDS.
+#define AUDIO_DECODE_STATE_WORDS 8u
+
+// A batch of causal-decoder sequences, eight u32 words per sequence: the
+// first cache row of its `[kv_heads][cap][hd]` plane in the batch's shared
+// key and value buffers (row r of kv head h is at `(plane + h * cap + r) *
+// hd`), the plane's capacity, and for a segmented prefill its first stacked
+// row, its row count and the position of that first row. The decode entries
+// read only the plane and the capacity.
+#define AUDIO_SEQ_WORDS 8u
+#define AUDIO_SEQ_PLANE 0u
+#define AUDIO_SEQ_CAP 1u
+#define AUDIO_SEQ_ROW0 2u
+#define AUDIO_SEQ_ROWS 3u
+#define AUDIO_SEQ_POS0 4u
 
 /// One brain-float, widened exactly (the 16 bits become the high half).
 static inline float audio_bf16(device const ushort *p) {

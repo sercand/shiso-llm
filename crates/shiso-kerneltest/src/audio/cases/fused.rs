@@ -27,14 +27,14 @@ const _: () = assert!(size_of::<Matvec3Args>() == 16);
 /// `audio_args_qk_rope`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct QkRopeArgs {
-    rows: u32,
-    heads: u32,
-    kv_heads: u32,
-    head_dim: u32,
-    cap: u32,
-    eps: f32,
-    theta: f32,
+pub(super) struct QkRopeArgs {
+    pub(super) rows: u32,
+    pub(super) heads: u32,
+    pub(super) kv_heads: u32,
+    pub(super) head_dim: u32,
+    pub(super) cap: u32,
+    pub(super) eps: f32,
+    pub(super) theta: f32,
 }
 const _: () = assert!(size_of::<QkRopeArgs>() == 28);
 

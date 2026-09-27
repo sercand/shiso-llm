@@ -12,6 +12,9 @@
 //! launch.
 
 mod args;
+mod batch;
+#[cfg(test)]
+mod batch_tests;
 #[cfg(test)]
 mod decode_tests;
 mod fused;
@@ -29,6 +32,10 @@ use shiso_core::{
     Backend, CoreError, CoreResult, DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef,
 };
 
+pub use batch::{
+    BatchPlanes, CausalAttnSegDesc, DecodeAttnBatchDesc, DecodeStepBatchDesc, EmbedTokenBatchDesc,
+    QkRopeAppendBatchDesc, QkRopeAppendSegDesc, SEQ_WORDS, SeqSpan, SeqTable,
+};
 pub use fused::{AddRmsNormDesc, ArgmaxWideDesc, QkRopeAppendDesc, argmax_wide_parts};
 pub use linear::{GemmType, Linear, LinearWeight, step_silu, step3};
 use runs::WeightView;
@@ -36,8 +43,8 @@ pub use workspace::Workspace;
 
 use args::{
     ArgmaxArgs, AxpyArgs, BiasRowsArgs, CacheAttnArgs, Conv2dArgs, DecodeStepArgs, DwConv1dArgs,
-    EmbedRowArgs, EmbedTokenArgs, GemmArgs, GluArgs, GreedyStepArgs, GreedyWindowArgs, KeepArgs,
-    KvAppendArgs, LstmArgs, NormArgs, RopeArgs, SiluMulArgs, TransposeArgs, UnaryArgs, UnfoldArgs,
+    EmbedRowArgs, GemmArgs, GluArgs, GreedyStepArgs, GreedyWindowArgs, KeepArgs, KvAppendArgs,
+    LstmArgs, NormArgs, RopeArgs, SiluMulArgs, TransposeArgs, UnaryArgs, UnfoldArgs,
     WindowAttnArgs,
 };
 
@@ -2041,62 +2048,6 @@ impl Ops {
     pub fn embed_token(&self, d: &EmbedTokenDesc<'_>) -> CoreResult<()> {
         need(d.out, d.width, "embed_token.out")?;
         need(d.state, DECODE_STATE_WORDS, "embed_token.state")?;
-        let mut args = EmbedTokenArgs {
-            width: dim(d.width, "embed_token.width")?,
-            vocab: dim(d.vocab, "embed_token.vocab")?,
-            group: 0,
-        };
-        match d.table {
-            EmbedTable::Dense { dtype, rows } => {
-                let row = dtype.row_bytes(d.width).ok_or(CoreError::InvalidValue {
-                    key: "embed_token.width",
-                    value: d.width.to_string(),
-                })?;
-                need_bytes(rows, d.vocab * row, "embed_token.table")?;
-                self.launch(
-                    dtype.embed_entry(),
-                    linear_grid(d.width)?,
-                    LINEAR_BLOCK,
-                    0,
-                    &[
-                        KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                        KernelArg::Buffer(d.out),
-                        KernelArg::Buffer(rows),
-                        KernelArg::Buffer(d.state),
-                    ],
-                )
-            }
-            EmbedTable::Affine8 {
-                words,
-                scales,
-                biases,
-                group,
-            } => {
-                limit(
-                    group > 0 && d.width.is_multiple_of(group) && d.width.is_multiple_of(4),
-                    "embed_token.group",
-                    group,
-                )?;
-                need_bytes(words, d.vocab * d.width, "embed_token.words")?;
-                let groups = d.vocab * (d.width / group);
-                need_bytes(scales, groups * 2, "embed_token.scales")?;
-                need_bytes(biases, groups * 2, "embed_token.biases")?;
-                args.group = dim(group, "embed_token.group")?;
-                self.launch(
-                    "kernel_audio_embed_token_affine8w",
-                    linear_grid(d.width)?,
-                    LINEAR_BLOCK,
-                    0,
-                    &[
-                        KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                        KernelArg::Buffer(d.out),
-                        KernelArg::Buffer(words),
-                        KernelArg::Buffer(scales),
-                        KernelArg::Buffer(biases),
-                        KernelArg::Buffer(d.state),
-                    ],
-                )
-            }
-        }
+        self.embed_rows(d.out, d.table, d.state, (d.width, d.vocab, 1), false)
     }
 }

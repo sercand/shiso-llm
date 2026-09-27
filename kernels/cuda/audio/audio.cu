@@ -1198,46 +1198,37 @@ extern "C" __global__ void kernel_audio_rope_half_state_f32(
     p[m + half_dim] = b * c + a * s;
 }
 
-/* A decoder step's query and key norms, their rotation and the cache append
- * in one launch, as the Metal twin: block (h, r), 256 threads; h < heads
- * normalises and rotates query head h in place, the next kv_heads normalise
- * and rotate key head h - heads into the cache with value head h - heads. */
-extern "C" __global__ void kernel_audio_qk_norm_rope_append_f32(
-        const struct audio_args_qk_rope args, float *q, const float *k, const float *v,
-        const float *q_norm, const float *k_norm, float *k_cache, float *v_cache,
-        const uint *state) {
-    __shared__ float scratch[AUDIO_BLOCK_SUM_SLOTS];
-    __shared__ float normed[AUDIO_ATTN_SLOTS * 32u];
-    const uint h = blockIdx.x;
-    const uint row = blockIdx.y;
-    const uint hd = args.head_dim;
+/* One block's head of the fused norm, rotation and append over one row, as
+ * the Metal twin's helper: q, k and v are the row's, k_plane and v_plane its
+ * sequence's planes of cap rows, pos the row's position; with append false
+ * the key head writes nothing. Every fused entry runs this body. */
+static __device__ __forceinline__ void audio_qk_rope_append_head(
+        uint heads, uint hd, float eps, float theta, float *q, const float *k,
+        const float *v, const float *q_norm, const float *k_norm, float *k_plane,
+        float *v_plane, uint cap, uint pos, bool append, uint h, uint t, uint nt,
+        float *scratch, float *normed) {
     const uint half_dim = hd / 2u;
-    const uint nt = blockDim.x;
-    const uint t = threadIdx.x;
-    const bool is_q = h < args.heads;
-    const uint kh = h - args.heads;
-    const float *src = is_q ? q + ((uint64_t) row * args.heads + h) * hd
-                            : k + ((uint64_t) row * args.kv_heads + kh) * hd;
+    const bool is_q = h < heads;
+    const uint kh = h - heads;
+    const float *src = is_q ? q + (uint64_t) h * hd : k + (uint64_t) kh * hd;
     const float *weight = is_q ? q_norm : k_norm;
     float sq = 0.0f;
     for (uint i = t; i < hd; i += nt) {
         sq += src[i] * src[i];
     }
-    const float rms = rsqrtf(audio_block_sum(sq, scratch, t, nt) / (float) hd + args.eps);
+    const float rms = rsqrtf(audio_block_sum(sq, scratch, t, nt) / (float) hd + eps);
     for (uint i = t; i < hd; i += nt) {
         const float y = src[i] * rms;
         normed[i] = y * weight[i];
     }
     __syncthreads();
-    const uint pos = state[AUDIO_DECODE_POS] + row;
-    if (!is_q && pos >= args.cap) {
+    if (!is_q && (!append || pos >= cap)) {
         return;
     }
-    float *dst = is_q ? q + ((uint64_t) row * args.heads + h) * hd
-                      : k_cache + ((uint64_t) kh * args.cap + pos) * hd;
+    float *dst = is_q ? q + (uint64_t) h * hd : k_plane + ((uint64_t) kh * cap + pos) * hd;
     for (uint m = t; m < half_dim; m += nt) {
-        const float inv_freq = powf(args.theta, -2.0f * (float) m / (float) hd);
-        const float ang = (float) (state[AUDIO_DECODE_POS] + 0u + row) * inv_freq;
+        const float inv_freq = powf(theta, -2.0f * (float) m / (float) hd);
+        const float ang = (float) pos * inv_freq;
         float s;
         float c;
         sincosf(ang, &s, &c);
@@ -1249,11 +1240,88 @@ extern "C" __global__ void kernel_audio_qk_norm_rope_append_f32(
     if (is_q) {
         return;
     }
-    const float *vs = v + ((uint64_t) row * args.kv_heads + kh) * hd;
-    float *vd = v_cache + ((uint64_t) kh * args.cap + pos) * hd;
+    const float *vs = v + (uint64_t) kh * hd;
+    float *vd = v_plane + ((uint64_t) kh * cap + pos) * hd;
     for (uint e = t; e < hd; e += nt) {
         vd[e] = vs[e];
     }
+}
+
+/* A decoder step's query and key norms, their rotation and the cache append
+ * in one launch, as the Metal twin: block (h, r), 256 threads; h < heads
+ * normalises and rotates query head h in place, the next kv_heads normalise
+ * and rotate key head h - heads into the cache with value head h - heads. */
+extern "C" __global__ void kernel_audio_qk_norm_rope_append_f32(
+        const struct audio_args_qk_rope args, float *q, const float *k, const float *v,
+        const float *q_norm, const float *k_norm, float *k_cache, float *v_cache,
+        const uint *state) {
+    __shared__ float scratch[AUDIO_BLOCK_SUM_SLOTS];
+    __shared__ float normed[AUDIO_ATTN_SLOTS * 32u];
+    const uint row = blockIdx.y;
+    const uint hd = args.head_dim;
+    audio_qk_rope_append_head(args.heads, hd, args.eps, args.theta,
+            q + (uint64_t) row * args.heads * hd, k + (uint64_t) row * args.kv_heads * hd,
+            v + (uint64_t) row * args.kv_heads * hd, q_norm, k_norm, k_cache, v_cache,
+            args.cap, state[AUDIO_DECODE_POS] + row, true, blockIdx.x, threadIdx.x,
+            blockDim.x, scratch, normed);
+}
+
+/* The fused norm, rotation and append over a segmented prefill's stacked
+ * rows, as the Metal twin: block (h, r) finds the sequence owning stacked row
+ * r and works at pos0 + (r - row0) into its planes; an unowned row is left. */
+extern "C" __global__ void kernel_audio_qk_norm_rope_append_seg_f32(
+        const struct audio_args_qk_rope_seq args, float *q, const float *k, const float *v,
+        const float *q_norm, const float *k_norm, float *k_cache, float *v_cache,
+        const uint *table) {
+    __shared__ float scratch[AUDIO_BLOCK_SUM_SLOTS];
+    __shared__ float normed[AUDIO_ATTN_SLOTS * 32u];
+    const uint row = blockIdx.y;
+    if (row >= args.rows) {
+        return;
+    }
+    uint s = 0u;
+    while (s < args.seqs) {
+        const uint *e = table + (uint64_t) s * AUDIO_SEQ_WORDS;
+        if (row >= e[AUDIO_SEQ_ROW0] && row - e[AUDIO_SEQ_ROW0] < e[AUDIO_SEQ_ROWS]) {
+            break;
+        }
+        ++s;
+    }
+    if (s >= args.seqs) {
+        return;
+    }
+    const uint *e = table + (uint64_t) s * AUDIO_SEQ_WORDS;
+    const uint hd = args.head_dim;
+    const uint64_t plane = (uint64_t) e[AUDIO_SEQ_PLANE] * hd;
+    audio_qk_rope_append_head(args.heads, hd, args.eps, args.theta,
+            q + (uint64_t) row * args.heads * hd, k + (uint64_t) row * args.kv_heads * hd,
+            v + (uint64_t) row * args.kv_heads * hd, q_norm, k_norm, k_cache + plane,
+            v_cache + plane, e[AUDIO_SEQ_CAP], e[AUDIO_SEQ_POS0] + (row - e[AUDIO_SEQ_ROW0]),
+            true, blockIdx.x, threadIdx.x, blockDim.x, scratch, normed);
+}
+
+/* The fused norm, rotation and append of one decode step over a batch, as
+ * the Metal twin: row s is sequence s's, at its own state's position, into its
+ * own planes; a finished sequence appends nothing. */
+extern "C" __global__ void kernel_audio_qk_norm_rope_append_batch_f32(
+        const struct audio_args_qk_rope_seq args, float *q, const float *k, const float *v,
+        const float *q_norm, const float *k_norm, float *k_cache, float *v_cache,
+        const uint *states, const uint *table) {
+    __shared__ float scratch[AUDIO_BLOCK_SUM_SLOTS];
+    __shared__ float normed[AUDIO_ATTN_SLOTS * 32u];
+    const uint s = blockIdx.y;
+    if (s >= args.seqs) {
+        return;
+    }
+    const uint *st = states + (uint64_t) s * AUDIO_DECODE_STATE_WORDS;
+    const uint *e = table + (uint64_t) s * AUDIO_SEQ_WORDS;
+    const uint hd = args.head_dim;
+    const uint64_t plane = (uint64_t) e[AUDIO_SEQ_PLANE] * hd;
+    audio_qk_rope_append_head(args.heads, hd, args.eps, args.theta,
+            q + (uint64_t) s * args.heads * hd, k + (uint64_t) s * args.kv_heads * hd,
+            v + (uint64_t) s * args.kv_heads * hd, q_norm, k_norm, k_cache + plane,
+            v_cache + plane, e[AUDIO_SEQ_CAP], st[AUDIO_DECODE_POS],
+            st[AUDIO_DECODE_DONE] == 0u, blockIdx.x, threadIdx.x, blockDim.x, scratch, normed);
 }
 
 /* rows new k and v rows, [rows][kv_heads * hd], into one layer's cache planes
@@ -1280,28 +1348,16 @@ extern "C" __global__ void kernel_audio_kv_append_f32(
     v_cache[dst] = v[i];
 }
 
-/* Causal grouped-query attention of a block of AUDIO_ATTN_QB queries of one
- * head over a layer's cache planes, one warp per block, as the Metal twin:
- * query i at pos0 + i sees rows 0..=pos0 + i of kv head h / (heads /
- * kv_heads), and no row past the block's last query is read. */
-extern "C" __global__ void kernel_audio_causal_attn_f32(
-        const struct audio_args_cache_attn args, float *out, const float *q,
-        const float *k_cache, const float *v_cache) {
-    extern __shared__ float qa[];
+/* One warp's block of causal attention over one sequence, as the Metal
+ * twin's helper: q and out at the sequence's row 0, kp and vp its kv head's
+ * rows of a plane of cap; the single and segmented entries run this body. */
+static __device__ __forceinline__ void audio_causal_attn_block(
+        float *out, const float *q, const float *kp, const float *vp, float *qa, uint n_q,
+        uint heads, uint hd, uint h, uint i0, uint pos0, uint cap, float scale, uint lane) {
     const uint QB = AUDIO_ATTN_QB;
-    const uint h = blockIdx.x;
-    const uint i0 = blockIdx.y * QB;
-    const uint lane = threadIdx.x;
-    if (h >= args.heads || i0 >= args.n_q) {
-        return;
-    }
-    const uint hd = args.head_dim;
-    const uint w = args.heads * hd;
+    const uint w = heads * hd;
     const uint hoff = h * hd;
-    const uint kvh = h / (args.heads / args.kv_heads);
-    const float *kp = k_cache + (uint64_t) kvh * args.cap * hd;
-    const float *vp = v_cache + (uint64_t) kvh * args.cap * hd;
-    const uint nq = min(QB, args.n_q - i0);
+    const uint nq = min(QB, n_q - i0);
     for (uint e = lane; e < QB * hd; e += 32u) {
         const uint r = e / hd;
         const uint d = e - r * hd;
@@ -1309,8 +1365,8 @@ extern "C" __global__ void kernel_audio_causal_attn_f32(
     }
     __syncwarp();
 
-    const uint qfirst = args.pos0 + i0;
-    const uint hi = min(qfirst + nq, args.cap);
+    const uint qfirst = pos0 + i0;
+    const uint hi = min(qfirst + nq, cap);
 
     float m[AUDIO_ATTN_QB];
     float l[AUDIO_ATTN_QB];
@@ -1340,7 +1396,7 @@ extern "C" __global__ void kernel_audio_causal_attn_f32(
         }
         for (uint r = 0; r < QB; ++r) {
             const bool visible = key_in && r < nq && ka <= qfirst + r;
-            sc[r] = visible ? args.scale * sc[r] : -INFINITY;
+            sc[r] = visible ? scale * sc[r] : -INFINITY;
         }
         float p[AUDIO_ATTN_QB];
         for (uint r = 0; r < QB; ++r) {
@@ -1381,37 +1437,66 @@ extern "C" __global__ void kernel_audio_causal_attn_f32(
     }
 }
 
-/* The one query of a decode step, per head, over cache rows 0..=state[POS] of
- * its kv head, split over the rows, as the Metal twin: one warp per (kv head,
- * split, tile of AUDIO_DECODE_GT query heads), four splits to a 128-thread
- * block, grid (kv_heads, ceil(splits / 4), ceil(group / GT)). Lanes own four
- * consecutive dims; rows go AUDIO_DECODE_KB at a time. Each (head, split)
- * leaves its unnormalised accumulator at partials[(h * splits + split) * hd]
- * and its (max, sum) pair at heads * splits * hd + 2 (h * splits + split).
- * The exponentials are the accurate ones; the Metal twin takes the fast ones
- * for speed, within 3 ulp of 1 on every weight. */
-extern "C" __global__ void kernel_audio_decode_attn_f32(
-        const struct audio_args_cache_attn args, float *partials, const float *q,
-        const float *k_cache, const float *v_cache, const uint *state) {
-    const uint KB = AUDIO_DECODE_KB;
-    const uint GT = AUDIO_DECODE_GT;
-    const uint lane = threadIdx.x & 31u;
-    const uint sg = threadIdx.x >> 5u;
-    const uint kvh = blockIdx.x;
-    const uint split = blockIdx.y * AUDIO_DECODE_SPLITS_PER_TG + sg;
-    const uint group = args.heads / args.kv_heads;
-    const uint g0 = blockIdx.z * GT;
-    if (kvh >= args.kv_heads || split >= args.splits || g0 >= group) {
+/* Causal grouped-query attention of a block of AUDIO_ATTN_QB queries of one
+ * head over a layer's cache planes, one warp per block, as the Metal twin:
+ * query i at pos0 + i sees rows 0..=pos0 + i of kv head h / (heads /
+ * kv_heads), and no row past the block's last query is read. */
+extern "C" __global__ void kernel_audio_causal_attn_f32(
+        const struct audio_args_cache_attn args, float *out, const float *q,
+        const float *k_cache, const float *v_cache) {
+    extern __shared__ float qa[];
+    const uint h = blockIdx.x;
+    const uint i0 = blockIdx.y * AUDIO_ATTN_QB;
+    if (h >= args.heads || i0 >= args.n_q) {
         return;
     }
-    const uint ng = min(GT, group - g0);
-    const uint h0 = kvh * group + g0;
     const uint hd = args.head_dim;
+    const uint kvh = h / (args.heads / args.kv_heads);
+    audio_causal_attn_block(out, q, k_cache + (uint64_t) kvh * args.cap * hd,
+            v_cache + (uint64_t) kvh * args.cap * hd, qa, args.n_q, args.heads, hd, h, i0,
+            args.pos0, args.cap, args.scale, threadIdx.x);
+}
+
+/* Causal attention over a segmented prefill, as the Metal twin: block (h,
+ * query block, s) attends sequence s's stacked rows over its own plane of the
+ * shared buffers; a block past its sequence's rows returns. */
+extern "C" __global__ void kernel_audio_causal_attn_seg_f32(
+        const struct audio_args_batch_attn args, float *out, const float *q,
+        const float *k_cache, const float *v_cache, const uint *table) {
+    extern __shared__ float qa[];
+    const uint h = blockIdx.x;
+    const uint i0 = blockIdx.y * AUDIO_ATTN_QB;
+    const uint s = blockIdx.z;
+    if (h >= args.heads || s >= args.seqs) {
+        return;
+    }
+    const uint *e = table + (uint64_t) s * AUDIO_SEQ_WORDS;
+    const uint rows = e[AUDIO_SEQ_ROWS];
+    if (i0 >= rows) {
+        return;
+    }
+    const uint hd = args.head_dim;
+    const uint cap = e[AUDIO_SEQ_CAP];
+    const uint kvh = h / (args.heads / args.kv_heads);
+    const uint64_t plane = ((uint64_t) e[AUDIO_SEQ_PLANE] + (uint64_t) kvh * cap) * hd;
+    const uint64_t row0 = (uint64_t) e[AUDIO_SEQ_ROW0] * args.heads * hd;
+    audio_causal_attn_block(out + row0, q + row0, k_cache + plane, v_cache + plane, qa, rows,
+            args.heads, hd, h, i0, e[AUDIO_SEQ_POS0], cap, args.scale, threadIdx.x);
+}
+
+/* One warp's split of decode attention over one sequence, as the Metal
+ * twin's helper: query heads h0 .. h0 + ng of the sequence's row q over rows
+ * 0..len of kp and vp, left as partials under heads slot0 .. with the
+ * (max, sum) pairs from ml0. The single and batched entries run this body. */
+static __device__ __forceinline__ void audio_decode_attn_split(
+        float *partials, const float *q, const float4 *kp, const float4 *vp, uint len,
+        uint split, uint splits, uint h0, uint slot0, uint ng, uint hd, float scale,
+        uint64_t ml0, uint lane) {
+    const uint KB = AUDIO_DECODE_KB;
+    const uint GT = AUDIO_DECODE_GT;
     const uint n4 = hd / 4u;
     const bool owns = lane < n4;
     const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const float4 *kp = (const float4 *) (k_cache + (uint64_t) kvh * args.cap * hd);
-    const float4 *vp = (const float4 *) (v_cache + (uint64_t) kvh * args.cap * hd);
     float4 qv[AUDIO_DECODE_GT];
     float m[AUDIO_DECODE_GT];
     float l[AUDIO_DECODE_GT];
@@ -1422,8 +1507,7 @@ extern "C" __global__ void kernel_audio_decode_attn_f32(
         l[g] = 0.0f;
         acc[g] = zero;
     }
-    const uint len = min(state[AUDIO_DECODE_POS] + 1u, args.cap);
-    const uint per = ((len + args.splits - 1u) / args.splits + KB - 1u) / KB * KB;
+    const uint per = ((len + splits - 1u) / splits + KB - 1u) / KB * KB;
     const uint start = split * per;
     const uint end = min(start + per, len);
     for (uint base = start; base < end; base += KB) {
@@ -1443,7 +1527,7 @@ extern "C" __global__ void kernel_audio_decode_attn_f32(
                 const float dy = qv[g].y * kv[b].y;
                 const float dz = qv[g].z * kv[b].z;
                 const float dw = qv[g].w * kv[b].w;
-                const float s = args.scale * audio_warp_sum_all((dx + dy) + (dz + dw));
+                const float s = scale * audio_warp_sum_all((dx + dy) + (dz + dw));
                 p[b] = b < n ? s : -INFINITY;
                 mb = fmaxf(mb, p[b]);
             }
@@ -1464,9 +1548,8 @@ extern "C" __global__ void kernel_audio_decode_attn_f32(
             m[g] = m_new;
         }
     }
-    const uint64_t ml0 = (uint64_t) args.heads * args.splits * hd;
     for (uint g = 0; g < ng; ++g) {
-        const uint64_t slot = (uint64_t) (h0 + g) * args.splits + split;
+        const uint64_t slot = (uint64_t) (slot0 + g) * splits + split;
         if (owns) {
             ((float4 *) (partials + slot * hd))[lane] = acc[g];
         }
@@ -1475,6 +1558,70 @@ extern "C" __global__ void kernel_audio_decode_attn_f32(
             partials[ml0 + 2u * slot + 1u] = l[g];
         }
     }
+}
+
+/* The one query of a decode step, per head, over cache rows 0..=state[POS] of
+ * its kv head, split over the rows, as the Metal twin: one warp per (kv head,
+ * split, tile of AUDIO_DECODE_GT query heads), four splits to a 128-thread
+ * block, grid (kv_heads, ceil(splits / 4), ceil(group / GT)). Lanes own four
+ * consecutive dims; rows go AUDIO_DECODE_KB at a time. Each (head, split)
+ * leaves its unnormalised accumulator at partials[(h * splits + split) * hd]
+ * and its (max, sum) pair at heads * splits * hd + 2 (h * splits + split).
+ * The exponentials are the accurate ones; the Metal twin takes the fast ones
+ * for speed, within 3 ulp of 1 on every weight. */
+extern "C" __global__ void kernel_audio_decode_attn_f32(
+        const struct audio_args_cache_attn args, float *partials, const float *q,
+        const float *k_cache, const float *v_cache, const uint *state) {
+    const uint GT = AUDIO_DECODE_GT;
+    const uint lane = threadIdx.x & 31u;
+    const uint sg = threadIdx.x >> 5u;
+    const uint kvh = blockIdx.x;
+    const uint split = blockIdx.y * AUDIO_DECODE_SPLITS_PER_TG + sg;
+    const uint group = args.heads / args.kv_heads;
+    const uint g0 = blockIdx.z * GT;
+    if (kvh >= args.kv_heads || split >= args.splits || g0 >= group) {
+        return;
+    }
+    const uint h0 = kvh * group + g0;
+    const uint hd = args.head_dim;
+    const uint64_t plane = (uint64_t) kvh * args.cap * hd;
+    audio_decode_attn_split(partials, q, (const float4 *) (k_cache + plane),
+            (const float4 *) (v_cache + plane), min(state[AUDIO_DECODE_POS] + 1u, args.cap),
+            split, args.splits, h0, h0, min(GT, group - g0), hd, args.scale,
+            (uint64_t) args.heads * args.splits * hd, lane);
+}
+
+/* Decode attention's first launch over a batch, as the Metal twin: sequence
+ * s's query row over its own plane and its own length (none when finished),
+ * grid (kv_heads, ceil(splits / 4), ceil(group / GT) * seqs) sequence-major in
+ * z, the partials laid out for seqs * heads heads so the single merge closes
+ * the batch. */
+extern "C" __global__ void kernel_audio_decode_attn_batch_f32(
+        const struct audio_args_batch_attn args, float *partials, const float *q,
+        const float *k_cache, const float *v_cache, const uint *states, const uint *table) {
+    const uint GT = AUDIO_DECODE_GT;
+    const uint lane = threadIdx.x & 31u;
+    const uint sg = threadIdx.x >> 5u;
+    const uint kvh = blockIdx.x;
+    const uint split = blockIdx.y * AUDIO_DECODE_SPLITS_PER_TG + sg;
+    const uint group = args.heads / args.kv_heads;
+    const uint tiles = (group + GT - 1u) / GT;
+    const uint s = blockIdx.z / tiles;
+    const uint g0 = (blockIdx.z - s * tiles) * GT;
+    if (s >= args.seqs || kvh >= args.kv_heads || split >= args.splits || g0 >= group) {
+        return;
+    }
+    const uint *st = states + (uint64_t) s * AUDIO_DECODE_STATE_WORDS;
+    const uint *e = table + (uint64_t) s * AUDIO_SEQ_WORDS;
+    const uint cap = e[AUDIO_SEQ_CAP];
+    const uint len = st[AUDIO_DECODE_DONE] != 0u ? 0u : min(st[AUDIO_DECODE_POS] + 1u, cap);
+    const uint h0 = kvh * group + g0;
+    const uint hd = args.head_dim;
+    const uint64_t plane = ((uint64_t) e[AUDIO_SEQ_PLANE] + (uint64_t) kvh * cap) * hd;
+    audio_decode_attn_split(partials, q + (uint64_t) s * args.heads * hd,
+            (const float4 *) (k_cache + plane), (const float4 *) (v_cache + plane), len, split,
+            args.splits, h0, s * args.heads + h0, min(GT, group - g0), hd, args.scale,
+            (uint64_t) args.seqs * args.heads * args.splits * hd, lane);
 }
 
 /* Closes decode attention, one block of AUDIO_DECODE_MERGE_THREADS per head,
@@ -1554,37 +1701,57 @@ extern "C" __global__ void kernel_audio_decode_attn_merge_f32(
  * position moves by `advance`, an end id stops without emitting, any other id
  * is emitted to out[slot] and stops at the max_tokens-th, and a done state
  * writes NONE, lowers the emit flag and changes nothing else. */
-extern "C" __global__ void kernel_audio_decode_step_u32(
-        const struct audio_args_decode_step args, uint *state, uint *out, const uint *ids) {
-    if (blockIdx.x != 0u || threadIdx.x != 0u) {
-        return;
-    }
-    out[args.slot] = AUDIO_DECODE_NONE;
+static __device__ __forceinline__ void audio_decode_step_one(
+        uint eos0, uint eos1, uint max_tokens, uint advance, uint *state, uint *slot, uint k) {
+    *slot = AUDIO_DECODE_NONE;
     state[AUDIO_DECODE_EMIT] = 0u;
     if (state[AUDIO_DECODE_DONE] != 0u) {
         return;
     }
     const uint count = state[AUDIO_DECODE_COUNT];
-    if (count >= args.max_tokens) {
+    if (count >= max_tokens) {
         state[AUDIO_DECODE_DONE] = 1u;
         state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_CAP;
         return;
     }
-    state[AUDIO_DECODE_POS] += args.advance;
-    const uint k = ids[0];
-    if (k == args.eos0 || k == args.eos1) {
+    state[AUDIO_DECODE_POS] += advance;
+    if (k == eos0 || k == eos1) {
         state[AUDIO_DECODE_DONE] = 1u;
         state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_EOS;
         return;
     }
-    out[args.slot] = k;
+    *slot = k;
     state[AUDIO_DECODE_TOKEN] = k;
     state[AUDIO_DECODE_EMIT] = 1u;
     state[AUDIO_DECODE_COUNT] = count + 1u;
-    if (count + 1u >= args.max_tokens) {
+    if (count + 1u >= max_tokens) {
         state[AUDIO_DECODE_DONE] = 1u;
         state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_CAP;
     }
+}
+
+extern "C" __global__ void kernel_audio_decode_step_u32(
+        const struct audio_args_decode_step args, uint *state, uint *out, const uint *ids) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) {
+        return;
+    }
+    audio_decode_step_one(args.eos0, args.eos1, args.max_tokens, args.advance, state,
+            out + args.slot, ids[0]);
+}
+
+/* The step over a batch, one thread per sequence, as the Metal twin:
+ * sequence s decides on ids[s] over state block s and writes out[slot * seqs
+ * + s]. */
+extern "C" __global__ void kernel_audio_decode_step_batch_u32(
+        const struct audio_args_decode_step_batch args, uint *states, uint *out,
+        const uint *ids) {
+    const uint s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= args.seqs) {
+        return;
+    }
+    audio_decode_step_one(args.eos0, args.eos1, args.max_tokens, args.advance,
+            states + (uint64_t) s * AUDIO_DECODE_STATE_WORDS,
+            out + (uint64_t) args.slot * args.seqs + s, ids[s]);
 }
 
 /* out = table[token] dequantised, the state's last token's row of a
@@ -1614,6 +1781,33 @@ AUDIO_EMBED_ENTRY(bf16w, audio_w_bf16)
 AUDIO_EMBED_ENTRY(f16w, audio_w_f16)
 AUDIO_EMBED_ENTRY(q8_0w, audio_w_q8_0)
 
+/* The row above for each sequence of a batch, as the Metal twin: row s is
+ * state block s's last token's, grid (ceil(width / 256), seqs). */
+template <typename W>
+static __device__ __forceinline__ void audio_embed_token_batch(
+        const struct audio_args_embed_token args, float *out, const void *table,
+        const uint *states) {
+    const uint u = blockIdx.x * AUDIO_LINEAR_BLOCK + threadIdx.x;
+    if (u >= args.width) {
+        return;
+    }
+    const uint k = states[(uint64_t) blockIdx.y * AUDIO_DECODE_STATE_WORDS + AUDIO_DECODE_TOKEN];
+    out[(uint64_t) blockIdx.y * args.width + u] =
+            k < args.vocab ? W::load(table, (uint64_t) k * args.width + u) : 0.0f;
+}
+
+#define AUDIO_EMBED_BATCH_ENTRY(SUFFIX, W) \
+    extern "C" __global__ void kernel_audio_embed_token_batch_##SUFFIX( \
+            const struct audio_args_embed_token args, float *out, const void *table, \
+            const uint *states) { \
+        audio_embed_token_batch<W>(args, out, table, states); \
+    }
+
+AUDIO_EMBED_BATCH_ENTRY(f32w, audio_w_f32)
+AUDIO_EMBED_BATCH_ENTRY(bf16w, audio_w_bf16)
+AUDIO_EMBED_BATCH_ENTRY(f16w, audio_w_f16)
+AUDIO_EMBED_BATCH_ENTRY(q8_0w, audio_w_q8_0)
+
 /* The row above from an 8-bit affine table: per group of a row a bf16 scale
  * and bias, the bytes packed four to a little-endian u32, each value one fused
  * q * scale + bias. */
@@ -1633,4 +1827,24 @@ extern "C" __global__ void kernel_audio_embed_token_affine8w(
     const uint64_t g = (uint64_t) k * (args.width / args.group) + u / args.group;
     const float qv = (float) ((words[i >> 2u] >> (8u * (uint) (i & 3u))) & 0xffu);
     out[u] = fmaf(qv, audio_bf16(scales + g), audio_bf16(biases + g));
+}
+
+/* The affine row above for each sequence of a batch, as the Metal twin. */
+extern "C" __global__ void kernel_audio_embed_token_batch_affine8w(
+        const struct audio_args_embed_token args, float *out, const uint *words,
+        const unsigned short *scales, const unsigned short *biases, const uint *states) {
+    const uint u = blockIdx.x * AUDIO_LINEAR_BLOCK + threadIdx.x;
+    if (u >= args.width) {
+        return;
+    }
+    float *row = out + (uint64_t) blockIdx.y * args.width;
+    const uint k = states[(uint64_t) blockIdx.y * AUDIO_DECODE_STATE_WORDS + AUDIO_DECODE_TOKEN];
+    if (k >= args.vocab) {
+        row[u] = 0.0f;
+        return;
+    }
+    const uint64_t i = (uint64_t) k * args.width + u;
+    const uint64_t g = (uint64_t) k * (args.width / args.group) + u / args.group;
+    const float qv = (float) ((words[i >> 2u] >> (8u * (uint) (i & 3u))) & 0xffu);
+    row[u] = fmaf(qv, audio_bf16(scales + g), audio_bf16(biases + g));
 }

@@ -50,6 +50,13 @@ listed.
 | `kernel_audio_decode_step_u32` | `audio_args_decode_step{eos0, eos1, max_tokens, advance, slot}` | decoder state u32 `[8]` (in/out), out u32 `[slots]`, ids u32 `[1]` | 1 × 1, 0 |
 | `kernel_audio_embed_token_{f32w,bf16w,f16w,q8_0w}` | `audio_args_embed_token{width, vocab, group}` (`group` unread) | out `[width]`, table `[vocab][width]` (q8_0w: `vocab·width/32` 34-byte blocks), decoder state u32 `[8]` | `ceil(width/256)` × 256, 0 |
 | `kernel_audio_embed_token_affine8w` | `audio_args_embed_token{width, vocab, group}` | out `[width]`, words u32 `[vocab][width/4]`, scales bf16 `[vocab][width/group]`, biases bf16 (as scales), decoder state u32 `[8]` | `ceil(width/256)` × 256, 0 |
+| `kernel_audio_causal_attn_seg_f32` | `audio_args_batch_attn{seqs, heads, kv_heads, head_dim, scale, splits}` (`splits` unread) | out `[rows][H·hd]`, q `[rows][H·hd]` (stacked), k cache (shared), v cache (shared), sequence table u32 `[seqs][8]` | `(heads, ceil(max seq rows/8), seqs)` × 32, 8·hd·4 |
+| `kernel_audio_qk_norm_rope_append_seg_f32` | `audio_args_qk_rope_seq{rows, seqs, heads, kv_heads, head_dim, eps, theta}` | q (in/out) `[rows][H·hd]` (stacked), k `[rows][Hkv·hd]`, v, q_norm `[hd]`, k_norm `[hd]`, k cache (shared, in/out), v cache (shared, in/out), sequence table u32 `[seqs][8]` | `(heads + kv_heads, rows)` × 256, 0 (static) |
+| `kernel_audio_qk_norm_rope_append_batch_f32` | `audio_args_qk_rope_seq` (`rows` unread) | q (in/out) `[seqs][H·hd]`, k `[seqs][Hkv·hd]`, v, q_norm, k_norm, k cache (shared, in/out), v cache (shared, in/out), decoder states u32 `[seqs][8]`, sequence table u32 `[seqs][8]` | `(heads + kv_heads, seqs)` × 256, 0 (static) |
+| `kernel_audio_decode_attn_batch_f32` | `audio_args_batch_attn` | partials `[seqs·H·splits·(hd+2)]` (the single entry's layout for `seqs·H` heads), q `[seqs][H·hd]`, k cache (shared), v cache (shared), decoder states u32 `[seqs][8]`, sequence table u32 `[seqs][8]` | `(Hkv, ceil(splits/4), ceil((H/Hkv)/2)·seqs)` × 128, 0; then `kernel_audio_decode_attn_merge_f32` with `heads = seqs·H` into out `[seqs][H·hd]` |
+| `kernel_audio_decode_step_batch_u32` | `audio_args_decode_step_batch{eos0, eos1, max_tokens, advance, slot, seqs}` | decoder states u32 `[seqs][8]` (in/out), out u32 `[slots][seqs]`, ids u32 `[seqs]` | `ceil(seqs/32)` × 32, 0 |
+| `kernel_audio_embed_token_batch_{f32w,bf16w,f16w,q8_0w}` | `audio_args_embed_token` (`group` unread) | out `[seqs][width]`, table (as `kernel_audio_embed_token_*`), decoder states u32 `[seqs][8]` | `(ceil(width/256), seqs)` × 256, 0 |
+| `kernel_audio_embed_token_batch_affine8w` | `audio_args_embed_token` | out `[seqs][width]`, words, scales, biases (as `kernel_audio_embed_token_affine8w`), decoder states u32 `[seqs][8]` | `(ceil(width/256), seqs)` × 256, 0 |
 
 Unary op codes: `0` relu, `1` silu, `2` sigmoid, `3` exact GELU (erf), `4` tanh, `5` clamp to `[a, b]`, `6` scale by
 `a`. Norm flags: bit 0 has-weight (RMS only; the layer norm always reads one), bit 1 has-bias (layer norm). GEMM
@@ -134,3 +141,17 @@ one's `3 + 2|x|` ulp keeps every softmax weight within 3 ulp of 1. The CUDA twin
 
 A per-head RMS norm (a decoder's q and k norms over each head's 128 dims) is `kernel_audio_rms_norm_f32` with
 `rows = n·H` and `dim = hd`: each row is normalised on its own against a weight of length `dim`.
+
+A batch of causal-decoder sequences runs through the `_seg` (prefill) and `_batch` (decode) entries. Every
+sequence has its own decoder state, the eight words above, and the batch keeps them back to back (`[seqs][8]`). The
+sequences' caches share one key and one value buffer per layer: a sequence table of eight u32 words per sequence
+gives `0` the first cache row of the sequence's `[kv_heads][cap][hd]` plane (row `r` of kv head `h` is at
+`(plane + h·cap + r)·hd`), `1` its `cap`, and for a segmented prefill `2` its first stacked row, `3` its row count
+and `4` the position of that first row; `5`–`7` are unused. The decode entries read only words 0 and 1, so each
+sequence's plane can sit anywhere in the buffers with its own capacity, and a launch binds three buffers for the
+cache whatever the batch size (Metal allows 31 bindings a kernel). Each batched entry runs the same body as the
+single-sequence entry it batches, over that sequence's plane, rows and state, and forms every value exactly as that
+entry does on the sequence alone; a stacked row no sequence owns is neither read nor written. A finished sequence
+(state word 2 set) appends nothing and its decode attention sees no rows, so its row merges to zeros; its rows may
+keep flowing through the batch's products. The batched step writes sequence `s`'s token of step `slot` to
+`out[slot·seqs + s]`.

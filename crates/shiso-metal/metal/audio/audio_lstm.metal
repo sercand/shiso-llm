@@ -185,6 +185,39 @@ kernel void kernel_audio_keep_f32(
 /// `max_tokens`-th. A step on a done state writes `NONE`, lowers the emit
 /// flag and changes nothing else; a step on a state that has already emitted
 /// `max_tokens` does the same and marks it done.
+/// The decision above for one sequence: `state` its state words, `slot` its
+/// output slot and `k` its argmax. The single and batched step entries both
+/// run this body.
+static inline void audio_decode_step_one(
+        uint eos0, uint eos1, uint max_tokens, uint advance,
+        device uint *state, device uint *slot, uint k) {
+    *slot = AUDIO_DECODE_NONE;
+    state[AUDIO_DECODE_EMIT] = 0u;
+    if (state[AUDIO_DECODE_DONE] != 0u) {
+        return;
+    }
+    const uint count = state[AUDIO_DECODE_COUNT];
+    if (count >= max_tokens) {
+        state[AUDIO_DECODE_DONE] = 1u;
+        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_CAP;
+        return;
+    }
+    state[AUDIO_DECODE_POS] += advance;
+    if (k == eos0 || k == eos1) {
+        state[AUDIO_DECODE_DONE] = 1u;
+        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_EOS;
+        return;
+    }
+    *slot = k;
+    state[AUDIO_DECODE_TOKEN] = k;
+    state[AUDIO_DECODE_EMIT] = 1u;
+    state[AUDIO_DECODE_COUNT] = count + 1u;
+    if (count + 1u >= max_tokens) {
+        state[AUDIO_DECODE_DONE] = 1u;
+        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_CAP;
+    }
+}
+
 kernel void kernel_audio_decode_step_u32(
         constant audio_args_decode_step & args [[buffer(0)]],
         device uint *state                     [[buffer(1)]],
@@ -194,32 +227,27 @@ kernel void kernel_audio_decode_step_u32(
     if (tid != 0u) {
         return;
     }
-    out[args.slot] = AUDIO_DECODE_NONE;
-    state[AUDIO_DECODE_EMIT] = 0u;
-    if (state[AUDIO_DECODE_DONE] != 0u) {
+    audio_decode_step_one(args.eos0, args.eos1, args.max_tokens, args.advance,
+            state, out + args.slot, ids[0]);
+}
+
+/// The step over a batch, one thread per sequence: sequence `s` decides on
+/// `ids[s]` (the batch's row argmax) over state block `s`, exactly as the
+/// single step, and writes its slot to `out[slot * seqs + s]`, so a batch of
+/// steps leaves `[steps][seqs]`. A finished sequence goes quiet as a
+/// finished single state does.
+kernel void kernel_audio_decode_step_batch_u32(
+        constant audio_args_decode_step_batch & args [[buffer(0)]],
+        device uint *states                          [[buffer(1)]],
+        device uint *out                             [[buffer(2)]],
+        device const uint *ids                       [[buffer(3)]],
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= args.seqs) {
         return;
     }
-    const uint count = state[AUDIO_DECODE_COUNT];
-    if (count >= args.max_tokens) {
-        state[AUDIO_DECODE_DONE] = 1u;
-        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_CAP;
-        return;
-    }
-    state[AUDIO_DECODE_POS] += args.advance;
-    const uint k = ids[0];
-    if (k == args.eos0 || k == args.eos1) {
-        state[AUDIO_DECODE_DONE] = 1u;
-        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_EOS;
-        return;
-    }
-    out[args.slot] = k;
-    state[AUDIO_DECODE_TOKEN] = k;
-    state[AUDIO_DECODE_EMIT] = 1u;
-    state[AUDIO_DECODE_COUNT] = count + 1u;
-    if (count + 1u >= args.max_tokens) {
-        state[AUDIO_DECODE_DONE] = 1u;
-        state[AUDIO_DECODE_STOP] = AUDIO_DECODE_STOP_CAP;
-    }
+    audio_decode_step_one(args.eos0, args.eos1, args.max_tokens, args.advance,
+            states + (uint64_t) tid * AUDIO_DECODE_STATE_WORDS,
+            out + (uint64_t) args.slot * args.seqs + tid, ids[tid]);
 }
 
 /// `out = table[token]` dequantised to f32, the decoder state's last token's
@@ -248,6 +276,31 @@ template [[host_name("kernel_audio_embed_token_bf16w")]] kernel audio_embed_toke
 template [[host_name("kernel_audio_embed_token_f16w")]]  kernel audio_embed_token_t kernel_audio_embed_token<audio_w_f16>;
 template [[host_name("kernel_audio_embed_token_q8_0w")]] kernel audio_embed_token_t kernel_audio_embed_token<audio_w_q8_0>;
 
+/// The row above for each sequence of a batch: row `s` of `[seqs][width]`
+/// is the last token of state block `s`. Grid `(ceil(width / 256), seqs)`.
+template <typename W>
+kernel void kernel_audio_embed_token_batch(
+        constant audio_args_embed_token & args [[buffer(0)]],
+        device float *out                      [[buffer(1)]],
+        device const void *table               [[buffer(2)]],
+        device const uint *states              [[buffer(3)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint u = tgpig.x * AUDIO_LINEAR_BLOCK + tpitg.x;
+    if (u >= args.width) {
+        return;
+    }
+    const uint k = states[(uint64_t) tgpig.y * AUDIO_DECODE_STATE_WORDS + AUDIO_DECODE_TOKEN];
+    out[(uint64_t) tgpig.y * args.width + u] =
+            k < args.vocab ? W::load(table, (uint64_t) k * args.width + u) : 0.0f;
+}
+
+typedef decltype(kernel_audio_embed_token_batch<audio_w_f32>) audio_embed_token_batch_t;
+template [[host_name("kernel_audio_embed_token_batch_f32w")]]  kernel audio_embed_token_batch_t kernel_audio_embed_token_batch<audio_w_f32>;
+template [[host_name("kernel_audio_embed_token_batch_bf16w")]] kernel audio_embed_token_batch_t kernel_audio_embed_token_batch<audio_w_bf16>;
+template [[host_name("kernel_audio_embed_token_batch_f16w")]]  kernel audio_embed_token_batch_t kernel_audio_embed_token_batch<audio_w_f16>;
+template [[host_name("kernel_audio_embed_token_batch_q8_0w")]] kernel audio_embed_token_batch_t kernel_audio_embed_token_batch<audio_w_q8_0>;
+
 /// The row above from an 8-bit affine table: per `group` elements of a row a
 /// bf16 scale and bias, the bytes packed four to a little-endian u32, and
 /// each value one fused `q * scale + bias`.
@@ -273,4 +326,31 @@ kernel void kernel_audio_embed_token_affine8w(
     const uint64_t g = (uint64_t) k * (args.width / args.group) + u / args.group;
     const float qv = (float) ((words[i >> 2u] >> (8u * (uint) (i & 3u))) & 0xffu);
     out[u] = fma(qv, audio_bf16(scales + g), audio_bf16(biases + g));
+}
+
+/// The affine row above for each sequence of a batch, as the dense batch
+/// entries lay it out.
+kernel void kernel_audio_embed_token_batch_affine8w(
+        constant audio_args_embed_token & args [[buffer(0)]],
+        device float *out                      [[buffer(1)]],
+        device const uint *words               [[buffer(2)]],
+        device const ushort *scales            [[buffer(3)]],
+        device const ushort *biases            [[buffer(4)]],
+        device const uint *states              [[buffer(5)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint u = tgpig.x * AUDIO_LINEAR_BLOCK + tpitg.x;
+    if (u >= args.width) {
+        return;
+    }
+    device float *row = out + (uint64_t) tgpig.y * args.width;
+    const uint k = states[(uint64_t) tgpig.y * AUDIO_DECODE_STATE_WORDS + AUDIO_DECODE_TOKEN];
+    if (k >= args.vocab) {
+        row[u] = 0.0f;
+        return;
+    }
+    const uint64_t i = (uint64_t) k * args.width + u;
+    const uint64_t g = (uint64_t) k * (args.width / args.group) + u / args.group;
+    const float qv = (float) ((words[i >> 2u] >> (8u * (uint) (i & 3u))) & 0xffu);
+    row[u] = fma(qv, audio_bf16(scales + g), audio_bf16(biases + g));
 }

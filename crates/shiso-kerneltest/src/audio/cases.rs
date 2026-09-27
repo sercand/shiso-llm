@@ -24,9 +24,16 @@ use crate::oracle;
 use crate::{Gpu, drain, f32_bytes, run};
 
 mod affine;
+mod batched;
 mod fused;
 pub use affine::{
     affine8_fused_products_are_the_chain, affine8_products_match_the_dequantised_weight,
+};
+pub use batched::{
+    batched_decode_attention_reads_each_length, batched_embed_token_takes_each_state_token_row,
+    batched_qk_norm_rope_append_is_each_row_alone, batched_step_stops_each_sequence_alone,
+    segmented_causal_attention_matches_each_sequence_alone,
+    segmented_qk_norm_rope_append_is_each_sequence_alone,
 };
 pub use fused::{
     add_rms_norm_is_the_axpy_and_rms_norm_it_replaces, argmax_wide_matches_the_row_argmax,
@@ -104,6 +111,16 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_matvec_affine8w",
     "kernel_audio_matvec3_affine8w",
     "kernel_audio_matvec_silu_affine8w",
+    "kernel_audio_causal_attn_seg_f32",
+    "kernel_audio_qk_norm_rope_append_seg_f32",
+    "kernel_audio_qk_norm_rope_append_batch_f32",
+    "kernel_audio_decode_attn_batch_f32",
+    "kernel_audio_decode_step_batch_u32",
+    "kernel_audio_embed_token_batch_f32w",
+    "kernel_audio_embed_token_batch_bf16w",
+    "kernel_audio_embed_token_batch_f16w",
+    "kernel_audio_embed_token_batch_q8_0w",
+    "kernel_audio_embed_token_batch_affine8w",
 ];
 
 const LINEAR_BLOCK: u32 = 256;

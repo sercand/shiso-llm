@@ -304,3 +304,43 @@ pub(crate) struct ArgmaxSplitArgs {
     pub(crate) parts: u32,
 }
 const _: () = assert!(size_of::<ArgmaxSplitArgs>() == 12);
+
+/// `audio_args_batch_attn`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct BatchAttnArgs {
+    pub(crate) seqs: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) scale: f32,
+    pub(crate) splits: u32,
+}
+const _: () = assert!(size_of::<BatchAttnArgs>() == 24);
+
+/// `audio_args_qk_rope_seq`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct QkRopeSeqArgs {
+    pub(crate) rows: u32,
+    pub(crate) seqs: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) eps: f32,
+    pub(crate) theta: f32,
+}
+const _: () = assert!(size_of::<QkRopeSeqArgs>() == 28);
+
+/// `audio_args_decode_step_batch`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct DecodeStepBatchArgs {
+    pub(crate) eos0: u32,
+    pub(crate) eos1: u32,
+    pub(crate) max_tokens: u32,
+    pub(crate) advance: u32,
+    pub(crate) slot: u32,
+    pub(crate) seqs: u32,
+}
+const _: () = assert!(size_of::<DecodeStepBatchArgs>() == 24);

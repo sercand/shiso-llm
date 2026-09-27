@@ -104,6 +104,17 @@ impl GemmType {
         }
     }
 
+    /// The batched embedding-row fetch for a table in this storage: one row
+    /// per sequence's state.
+    pub(crate) fn embed_batch_entry(self) -> &'static str {
+        match self {
+            Self::F32 => "kernel_audio_embed_token_batch_f32w",
+            Self::Bf16 => "kernel_audio_embed_token_batch_bf16w",
+            Self::F16 => "kernel_audio_embed_token_batch_f16w",
+            Self::Q8_0 => "kernel_audio_embed_token_batch_q8_0w",
+        }
+    }
+
     /// Bytes of one `in_dim`-wide row, or `None` when `in_dim` is not a whole
     /// number of blocks.
     pub(crate) fn row_bytes(self, in_dim: usize) -> Option<usize> {
