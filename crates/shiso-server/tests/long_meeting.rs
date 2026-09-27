@@ -139,7 +139,11 @@ async fn post(state: &Arc<AppState>, body: Vec<u8>) -> (StatusCode, String) {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("the body reads");
-    (status, String::from_utf8(bytes.to_vec()).expect("text"))
+    // `Result::expect` would Debug-format a `FromUtf8Error`, which carries the
+    // invalid bytes - here, the model's transcript of the private meeting.
+    // `{error}` uses `Display`, which carries no bytes.
+    let text = String::from_utf8(bytes.to_vec()).unwrap_or_else(|error| panic!("text: {error}"));
+    (status, text)
 }
 
 /// A recognizer and the shared MLX diarizer, booted as the binary boots them,
