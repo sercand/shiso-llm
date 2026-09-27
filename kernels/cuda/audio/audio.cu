@@ -330,9 +330,48 @@ struct audio_w_q8_0 {
 /* BM rows by 64 columns per block of 4 * BM threads, each thread one row by
  * 16 columns: the 32-row tile on 128 threads, and the 64-row tile the host
  * picks for more than 32 rows on 256. */
-template <typename W, uint BM>
+/* The weight a GEMM stages, as one object: a dense type's rows, or an 8-bit
+ * affine weight's bytes (four to a little-endian u32) with a bf16 scale and
+ * bias per 64 of a row, each value the fused q * scale + bias. */
+template <typename W>
+struct audio_r_dense {
+    const void *w;
+    __device__ __forceinline__ float load(uint64_t i) const { return W::load(w, i); }
+    __device__ __forceinline__ float run8(uint64_t col, uint k, uint j, const float *xr) const;
+};
+struct audio_r_affine8 {
+    const uint *q;
+    const unsigned short *scales;
+    const unsigned short *biases;
+    __device__ __forceinline__ float load(uint64_t i) const {
+        const float qv = (float) ((q[i >> 2u] >> (8u * (uint) (i & 3u))) & 0xffu);
+        return fmaf(qv, audio_bf16(scales + (i >> 6u)), audio_bf16(biases + (i >> 6u)));
+    }
+    /* A run's dot as the Metal twin forms it: scale * (q . x) + bias * sum(x),
+     * each four-wide half summed on its own. */
+    __device__ __forceinline__ float run8(uint64_t col, uint k, uint j, const float *xr) const {
+        const uint64_t g = col * (k >> 6u) + (j >> 3u);
+        const uint *w = q + g * 16u + 2u * (j & 7u);
+        const float *xp = xr + (uint64_t) j * 8u;
+        const float sc = audio_bf16(scales + g);
+        const float bi = audio_bf16(biases + g);
+        float q0 = 0.0f;
+        float q1 = 0.0f;
+        float x0 = 0.0f;
+        float x1 = 0.0f;
+        for (uint e = 0; e < 4u; ++e) {
+            q0 += (float) ((w[0] >> (8u * e)) & 0xffu) * xp[e];
+            q1 += (float) ((w[1] >> (8u * e)) & 0xffu) * xp[4u + e];
+            x0 += xp[e];
+            x1 += xp[4u + e];
+        }
+        return sc * (q0 + q1) + bi * (x0 + x1);
+    }
+};
+
+template <typename R, uint BM>
 static __device__ __forceinline__ void audio_gemm(
-        const struct audio_args_gemm args, float *y, const float *x, const void *w,
+        const struct audio_args_gemm args, float *y, const float *x, const R w,
         const float *bias) {
     extern __shared__ float smem[];
     const uint NT = 4u * BM;
@@ -365,7 +404,7 @@ static __device__ __forceinline__ void audio_gemm(
             const uint kk = e - rr * BK;
             const uint gk = k0 + kk;
             const uint gn = n0 + rr;
-            sb[e] = (gn < args.n && gk < k_end) ? W::load(w, (uint64_t) gn * args.k + gk) : 0.0f;
+            sb[e] = (gn < args.n && gk < k_end) ? w.load((uint64_t) gn * args.k + gk) : 0.0f;
         }
         __syncthreads();
         for (uint kk = 0; kk < BK; ++kk) {
@@ -440,11 +479,11 @@ static __device__ __forceinline__ void audio_gemv(
 #define AUDIO_GEMM_ENTRIES(SUFFIX, W) \
     extern "C" __global__ void kernel_audio_gemm_##SUFFIX( \
             const struct audio_args_gemm args, float *y, const float *x, const void *w, const float *bias) { \
-        audio_gemm<W, AUDIO_GEMM_TILE_M>(args, y, x, w, bias); \
+        audio_gemm<audio_r_dense<W>, AUDIO_GEMM_TILE_M>(args, y, x, audio_r_dense<W>{w}, bias); \
     } \
     extern "C" __global__ void kernel_audio_gemm64_##SUFFIX( \
             const struct audio_args_gemm args, float *y, const float *x, const void *w, const float *bias) { \
-        audio_gemm<W, AUDIO_GEMM64_TILE_M>(args, y, x, w, bias); \
+        audio_gemm<audio_r_dense<W>, AUDIO_GEMM64_TILE_M>(args, y, x, audio_r_dense<W>{w}, bias); \
     } \
     extern "C" __global__ void kernel_audio_gemv_##SUFFIX( \
             const struct audio_args_gemm args, float *y, const float *x, const void *w, const float *bias) { \
@@ -455,6 +494,19 @@ AUDIO_GEMM_ENTRIES(f32w, audio_w_f32)
 AUDIO_GEMM_ENTRIES(bf16w, audio_w_bf16)
 AUDIO_GEMM_ENTRIES(f16w, audio_w_f16)
 AUDIO_GEMM_ENTRIES(q8_0w, audio_w_q8_0)
+
+/* The tiled GEMMs over an 8-bit affine weight: the bytes where a dense
+ * weight goes, then its scales and biases. */
+extern "C" __global__ void kernel_audio_gemm_affine8w(
+        const struct audio_args_gemm args, float *y, const float *x, const uint *q,
+        const float *bias, const unsigned short *scales, const unsigned short *biases) {
+    audio_gemm<audio_r_affine8, AUDIO_GEMM_TILE_M>(args, y, x, audio_r_affine8{q, scales, biases}, bias);
+}
+extern "C" __global__ void kernel_audio_gemm64_affine8w(
+        const struct audio_args_gemm args, float *y, const float *x, const uint *q,
+        const float *bias, const unsigned short *scales, const unsigned short *biases) {
+    audio_gemm<audio_r_affine8, AUDIO_GEMM64_TILE_M>(args, y, x, audio_r_affine8{q, scales, biases}, bias);
+}
 
 /* y = x * W^T (+ b) one row at a time, the Metal twin's order: each lane dots
  * runs of eight consecutive weights (a Q8_0 quarter block, scaled once),
@@ -492,11 +544,17 @@ __device__ __forceinline__ float audio_run8<audio_w_q8_0>(const void *w, uint64_
     return (lo + hi) * d;
 }
 
+template <typename W>
+__device__ __forceinline__ float audio_r_dense<W>::run8(uint64_t col, uint k, uint j,
+                                                        const float *xr) const {
+    return audio_run8<W>(w, col * k, j, xr);
+}
+
 /* One tile: columns [n0, n0 + 4) of w against the row xr; lane c of warp 0
  * returns column c's total, every other thread 0. */
-template <typename W>
+template <typename R>
 static __device__ __forceinline__ float audio_matvec_tile(
-        const void *w, uint n, uint k, uint n0, const float *xr, float *part) {
+        const R w, uint n, uint k, uint n0, const float *xr, float *part) {
     const uint NR = AUDIO_MATVEC_COLS;
     const uint NSG = AUDIO_MATVEC_SG;
     const uint lane = threadIdx.x & 31u;
@@ -509,7 +567,7 @@ static __device__ __forceinline__ float audio_matvec_tile(
     for (uint j = warp * 32u + lane; j < runs; j += NSG * 32u) {
         for (uint c = 0; c < NR; ++c) {
             const uint64_t col = min(n0 + c, n - 1u);
-            acc[c] += audio_run8<W>(w, col * k, j, xr);
+            acc[c] += w.run8(col, k, j, xr);
         }
     }
     for (uint c = 0; c < NR; ++c) {
@@ -530,15 +588,15 @@ static __device__ __forceinline__ float audio_matvec_tile(
     return total;
 }
 
-template <typename W>
+template <typename R>
 static __device__ __forceinline__ void audio_matvec(
-        const struct audio_args_gemm args, float *y, const float *x, const void *w,
+        const struct audio_args_gemm args, float *y, const float *x, const R w,
         const float *bias) {
     __shared__ float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
     const uint n0 = blockIdx.x * AUDIO_MATVEC_COLS;
     const uint row = blockIdx.y;
     const uint lane = threadIdx.x & 31u;
-    const float total = audio_matvec_tile<W>(w, args.n, args.k, n0, x + (uint64_t) row * args.k, part);
+    const float total = audio_matvec_tile<R>(w, args.n, args.k, n0, x + (uint64_t) row * args.k, part);
     if (threadIdx.x < AUDIO_MATVEC_COLS && n0 + lane < args.n) {
         const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u;
         y[(uint64_t) row * args.n + n0 + lane] = total + (has_bias ? bias[n0 + lane] : 0.0f);
@@ -547,16 +605,16 @@ static __device__ __forceinline__ void audio_matvec(
 
 /* Three products of one row in one launch: blocks [0, t0) take w0's columns,
  * [t0, t0 + t1) w1's, the rest w2's. No bias. */
-template <typename W>
+template <typename R>
 static __device__ __forceinline__ void audio_matvec3(
         const struct audio_args_matvec3 args, float *y0, float *y1, float *y2, const float *x,
-        const void *w0, const void *w1, const void *w2) {
+        const R w0, const R w1, const R w2) {
     __shared__ float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
     const uint t0 = (args.n0 + AUDIO_MATVEC_COLS - 1u) / AUDIO_MATVEC_COLS;
     const uint t1 = (args.n1 + AUDIO_MATVEC_COLS - 1u) / AUDIO_MATVEC_COLS;
     uint t = blockIdx.x;
     float *y = y0;
-    const void *w = w0;
+    R w = w0;
     uint n = args.n0;
     if (t >= t0 + t1) {
         t -= t0 + t1;
@@ -570,7 +628,7 @@ static __device__ __forceinline__ void audio_matvec3(
         n = args.n1;
     }
     const uint n0 = t * AUDIO_MATVEC_COLS;
-    const float total = audio_matvec_tile<W>(w, n, args.k, n0, x, part);
+    const float total = audio_matvec_tile<R>(w, n, args.k, n0, x, part);
     if (threadIdx.x < AUDIO_MATVEC_COLS && n0 + threadIdx.x < n) {
         y[n0 + threadIdx.x] = total + 0.0f;
     }
@@ -578,17 +636,17 @@ static __device__ __forceinline__ void audio_matvec3(
 
 /* y[c] = g * sigmoid(g) * u over the gate and value products of each row, as
  * the SiLU-product kernel forms it. No bias. */
-template <typename W>
+template <typename R>
 static __device__ __forceinline__ void audio_matvec_silu(
-        const struct audio_args_gemm args, float *y, const float *x, const void *wg,
-        const void *wu) {
+        const struct audio_args_gemm args, float *y, const float *x, const R wg,
+        const R wu) {
     __shared__ float part_g[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
     __shared__ float part_u[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
     const uint n0 = blockIdx.x * AUDIO_MATVEC_COLS;
     const uint row = blockIdx.y;
     const float *xr = x + (uint64_t) row * args.k;
-    const float g = audio_matvec_tile<W>(wg, args.n, args.k, n0, xr, part_g) + 0.0f;
-    const float u = audio_matvec_tile<W>(wu, args.n, args.k, n0, xr, part_u) + 0.0f;
+    const float g = audio_matvec_tile<R>(wg, args.n, args.k, n0, xr, part_g) + 0.0f;
+    const float u = audio_matvec_tile<R>(wu, args.n, args.k, n0, xr, part_u) + 0.0f;
     if (threadIdx.x < AUDIO_MATVEC_COLS && n0 + threadIdx.x < args.n) {
         y[(uint64_t) row * args.n + n0 + threadIdx.x] = g * audio_sigmoid(g) * u;
     }
@@ -597,22 +655,47 @@ static __device__ __forceinline__ void audio_matvec_silu(
 #define AUDIO_MATVEC_ENTRY(SUFFIX, W) \
     extern "C" __global__ void kernel_audio_matvec_##SUFFIX( \
             const struct audio_args_gemm args, float *y, const float *x, const void *w, const float *bias) { \
-        audio_matvec<W>(args, y, x, w, bias); \
+        audio_matvec<audio_r_dense<W>>(args, y, x, audio_r_dense<W>{w}, bias); \
     } \
     extern "C" __global__ void kernel_audio_matvec3_##SUFFIX( \
             const struct audio_args_matvec3 args, float *y0, float *y1, float *y2, const float *x, \
             const void *w0, const void *w1, const void *w2) { \
-        audio_matvec3<W>(args, y0, y1, y2, x, w0, w1, w2); \
+        audio_matvec3<audio_r_dense<W>>(args, y0, y1, y2, x, audio_r_dense<W>{w0}, \
+                                        audio_r_dense<W>{w1}, audio_r_dense<W>{w2}); \
     } \
     extern "C" __global__ void kernel_audio_matvec_silu_##SUFFIX( \
             const struct audio_args_gemm args, float *y, const float *x, const void *wg, const void *wu) { \
-        audio_matvec_silu<W>(args, y, x, wg, wu); \
+        audio_matvec_silu<audio_r_dense<W>>(args, y, x, audio_r_dense<W>{wg}, audio_r_dense<W>{wu}); \
     }
 
 AUDIO_MATVEC_ENTRY(f32w, audio_w_f32)
 AUDIO_MATVEC_ENTRY(bf16w, audio_w_bf16)
 AUDIO_MATVEC_ENTRY(f16w, audio_w_f16)
 AUDIO_MATVEC_ENTRY(q8_0w, audio_w_q8_0)
+
+/* The matrix-vector-by-runs kernels over 8-bit affine weights: each weight's
+ * bytes, then the scales, then the biases, in the order the Metal twin lists
+ * them. */
+extern "C" __global__ void kernel_audio_matvec_affine8w(
+        const struct audio_args_gemm args, float *y, const float *x, const uint *q,
+        const float *bias, const unsigned short *scales, const unsigned short *biases) {
+    audio_matvec<audio_r_affine8>(args, y, x, audio_r_affine8{q, scales, biases}, bias);
+}
+extern "C" __global__ void kernel_audio_matvec3_affine8w(
+        const struct audio_args_matvec3 args, float *y0, float *y1, float *y2, const float *x,
+        const uint *q0, const uint *q1, const uint *q2, const unsigned short *s0,
+        const unsigned short *s1, const unsigned short *s2, const unsigned short *b0,
+        const unsigned short *b1, const unsigned short *b2) {
+    audio_matvec3<audio_r_affine8>(args, y0, y1, y2, x, audio_r_affine8{q0, s0, b0},
+                                   audio_r_affine8{q1, s1, b1}, audio_r_affine8{q2, s2, b2});
+}
+extern "C" __global__ void kernel_audio_matvec_silu_affine8w(
+        const struct audio_args_gemm args, float *y, const float *x, const uint *qg,
+        const uint *qu, const unsigned short *sg, const unsigned short *su,
+        const unsigned short *bg, const unsigned short *bu) {
+    audio_matvec_silu<audio_r_affine8>(args, y, x, audio_r_affine8{qg, sg, bg},
+                                       audio_r_affine8{qu, su, bu});
+}
 
 /* y[i] = sum_z parts[z][i] (+ b[i % n]): closes a split-k GEMM, summing the
  * planes in order so the result does not depend on scheduling. */

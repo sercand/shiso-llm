@@ -23,7 +23,11 @@ use shiso_core::{DeviceBuffer, Extent3, KernelArg, KernelRef, LaunchArgs};
 use crate::oracle;
 use crate::{Gpu, drain, f32_bytes, run};
 
+mod affine;
 mod fused;
+pub use affine::{
+    affine8_fused_products_are_the_chain, affine8_products_match_the_dequantised_weight,
+};
 pub use fused::{
     add_rms_norm_is_the_axpy_and_rms_norm_it_replaces, argmax_wide_matches_the_row_argmax,
     matvec_silu_is_the_products_and_silu_mul, matvec3_is_three_matvecs,
@@ -95,6 +99,11 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_qk_norm_rope_append_f32",
     "kernel_audio_argmax_split_f32",
     "kernel_audio_argmax_merge_f32",
+    "kernel_audio_gemm_affine8w",
+    "kernel_audio_gemm64_affine8w",
+    "kernel_audio_matvec_affine8w",
+    "kernel_audio_matvec3_affine8w",
+    "kernel_audio_matvec_silu_affine8w",
 ];
 
 const LINEAR_BLOCK: u32 = 256;

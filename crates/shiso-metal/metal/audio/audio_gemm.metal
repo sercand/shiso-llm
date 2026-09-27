@@ -50,17 +50,46 @@ struct audio_w_q8_0 {
     }
 };
 
+// The weight a tiled GEMM stages, as one object: a dense type's rows, or an
+// 8-bit affine weight's bytes with its per-group scales and biases.
 template <typename W>
-kernel void kernel_audio_gemm(
-        constant audio_args_gemm & args [[buffer(0)]],
-        device float *y                 [[buffer(1)]],
-        device const float *x           [[buffer(2)]],
-        device const void *w            [[buffer(3)]],
-        device const float *bias        [[buffer(4)]],
-        threadgroup float *smem         [[threadgroup(0)]],
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        ushort tid [[thread_index_in_threadgroup]],
-        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+struct audio_dense {
+    device const void *w;
+    float load(uint64_t i) const { return W::load(w, i); }
+    float4 load4(uint64_t i) const { return W::load4(w, i); }
+};
+// MLX 8-bit affine, groups of 64: the bytes four to a little-endian u32 along
+// each row, and per group a bf16 scale and bias; element i of the flattened
+// [n][k] matrix (k a multiple of 64, so no group crosses a row) is the fused
+// `q * scale + bias` of group i / 64, as the embedding-row fetch forms it.
+struct audio_affine8 {
+    device const uint *q;
+    device const ushort *scales;
+    device const ushort *biases;
+    float load(uint64_t i) const {
+        const float qv = (float) ((q[i >> 2u] >> (8u * (uint) (i & 3u))) & 0xffu);
+        return fma(qv, audio_bf16(scales + (i >> 6u)), audio_bf16(biases + (i >> 6u)));
+    }
+    float4 load4(uint64_t i) const {
+        const uint word = q[i >> 2u];
+        const float s = audio_bf16(scales + (i >> 6u));
+        const float b = audio_bf16(biases + (i >> 6u));
+        return float4(fma((float) (word & 0xffu), s, b), fma((float) ((word >> 8u) & 0xffu), s, b),
+                      fma((float) ((word >> 16u) & 0xffu), s, b), fma((float) (word >> 24u), s, b));
+    }
+};
+
+template <typename R>
+static inline void audio_gemm_tile(
+        constant audio_args_gemm & args,
+        device float *y,
+        device const float *x,
+        const R w,
+        device const float *bias,
+        threadgroup float *smem,
+        uint3 tgpig,
+        ushort tid,
+        ushort sg) {
     const uint BM = AUDIO_GEMM_TILE_M;
     const uint BN = AUDIO_GEMM_TILE_N;
     const uint BK = AUDIO_GEMM_TILE_K;
@@ -113,10 +142,10 @@ kernel void kernel_audio_gemm(
             if (gn < args.n) {
                 const uint64_t base = (uint64_t) gn * args.k;
                 if (vec && gk + 3u < k_end) {
-                    v = W::load4(w, base + gk);
+                    v = w.load4(base + gk);
                 } else {
                     for (uint q = 0; q < 4u; ++q) {
-                        v[q] = gk + q < k_end ? W::load(w, base + gk + q) : 0.0f;
+                        v[q] = gk + q < k_end ? w.load(base + gk + q) : 0.0f;
                     }
                 }
             }
@@ -169,18 +198,18 @@ kernel void kernel_audio_gemm(
 // rows or fewer, which is why both exist. Staged rows are padded by four
 // floats, and each simdgroup writes its fragments through its own 8x8 slot,
 // so the tile needs 20 KiB rather than room for the whole result.
-template <typename W>
-kernel void kernel_audio_gemm64(
-        constant audio_args_gemm & args [[buffer(0)]],
-        device float *y                 [[buffer(1)]],
-        device const float *x           [[buffer(2)]],
-        device const void *w            [[buffer(3)]],
-        device const float *bias        [[buffer(4)]],
-        threadgroup float *smem         [[threadgroup(0)]],
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        ushort tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+template <typename R>
+static inline void audio_gemm64_tile(
+        constant audio_args_gemm & args,
+        device float *y,
+        device const float *x,
+        const R w,
+        device const float *bias,
+        threadgroup float *smem,
+        uint3 tgpig,
+        ushort tid,
+        ushort lane,
+        ushort sg) {
     const uint BM = AUDIO_GEMM64_TILE_M;
     const uint BN = AUDIO_GEMM_TILE_N;
     const uint BK = AUDIO_GEMM_TILE_K;
@@ -240,10 +269,10 @@ kernel void kernel_audio_gemm64(
             if (gn < args.n) {
                 const uint64_t base = (uint64_t) gn * args.k;
                 if (vec && gk + 3u < k_end) {
-                    v = W::load4(w, base + gk);
+                    v = w.load4(base + gk);
                 } else {
                     for (uint q = 0; q < 4u; ++q) {
-                        v[q] = gk + q < k_end ? W::load(w, base + gk + q) : 0.0f;
+                        v[q] = gk + q < k_end ? w.load(base + gk + q) : 0.0f;
                     }
                 }
             }
@@ -309,6 +338,68 @@ kernel void kernel_audio_split_sum_f32(
     }
     const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u;
     y[i] = total + (has_bias ? bias[i % args.n] : 0.0f);
+}
+
+template <typename W>
+kernel void kernel_audio_gemm(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const void *w            [[buffer(3)]],
+        device const float *bias        [[buffer(4)]],
+        threadgroup float *smem         [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    audio_gemm_tile(args, y, x, audio_dense<W>{w}, bias, smem, tgpig, tid, sg);
+}
+
+template <typename W>
+kernel void kernel_audio_gemm64(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const void *w            [[buffer(3)]],
+        device const float *bias        [[buffer(4)]],
+        threadgroup float *smem         [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    audio_gemm64_tile(args, y, x, audio_dense<W>{w}, bias, smem, tgpig, tid, lane, sg);
+}
+
+/// The tiled GEMMs over an 8-bit affine weight: the bytes where a dense
+/// weight goes, then its scales and biases.
+kernel void kernel_audio_gemm_affine8w(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const uint *q            [[buffer(3)]],
+        device const float *bias        [[buffer(4)]],
+        device const ushort *scales     [[buffer(5)]],
+        device const ushort *biases     [[buffer(6)]],
+        threadgroup float *smem         [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    audio_gemm_tile(args, y, x, audio_affine8{q, scales, biases}, bias, smem, tgpig, tid, sg);
+}
+
+kernel void kernel_audio_gemm64_affine8w(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const uint *q            [[buffer(3)]],
+        device const float *bias        [[buffer(4)]],
+        device const ushort *scales     [[buffer(5)]],
+        device const ushort *biases     [[buffer(6)]],
+        threadgroup float *smem         [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    audio_gemm64_tile(args, y, x, audio_affine8{q, scales, biases}, bias, smem, tgpig, tid, lane, sg);
 }
 
 typedef decltype(kernel_audio_gemm<audio_w_f32>) audio_gemm_t;
@@ -451,23 +542,57 @@ struct audio_run8_q8_0 {
     }
 };
 
+// A matrix-vector-by-runs weight as one object: `row(c)` is column c's
+// reader, whose `dot8(j, x0, x1)` dots run j. A dense type's row is a byte
+// pointer.
+template <typename W>
+struct audio_runs {
+    device const void *w;
+    uint k;
+    typedef device const uchar *row_t;
+    row_t row(uint c) const { return (device const uchar *) w + (uint64_t) c * W::row_bytes(k); }
+    float dot8(row_t r, uint j, float4 x0, float4 x1) const { return W::dot8(r, j, x0, x1); }
+};
+// MLX 8-bit affine, groups of 64: a run is two words of one group, and its
+// dot is `scale * (q . x) + bias * sum(x)`. A row is only the column's first
+// group: its words are 16 groups' worth of u32 further on, and keeping one
+// index a row rather than three pointers keeps the gated pair's eight rows
+// in registers (three pointers a row measured 2x slower there).
+struct audio_runs_affine8 {
+    device const uint *q;
+    device const ushort *scales;
+    device const ushort *biases;
+    uint k;
+    typedef uint row_t;
+    row_t row(uint c) const { return c * (k >> 6u); }
+    float dot8(row_t g0, uint j, float4 x0, float4 x1) const {
+        const uint g = g0 + (j >> 3u);
+        const uint2 w = *((device const uint2 *) (q + (uint64_t) g * 16u + 2u * (j & 7u)));
+        const float4 q0 = float4(as_type<uchar4>(w.x));
+        const float4 q1 = float4(as_type<uchar4>(w.y));
+        const float sc = audio_bf16(scales + g);
+        const float bi = audio_bf16(biases + g);
+        const float4 one = float4(1.0f);
+        return sc * (dot(q0, x0) + dot(q1, x1)) + bi * (dot(x0, one) + dot(x1, one));
+    }
+};
+
 /// One matrix-vector-by-runs tile: columns `[n0, n0 + 4)` of `w` against
 /// the row `xr`. The sum of each column lands in `part` (the two simdgroups'
 /// halves, `[col][sg]`), and after the barrier lane `c` of simdgroup 0 adds
 /// them into the column's total, which is what it returns; every other thread
 /// returns 0. A column past the edge reads the last one and is never written,
 /// so the loop needs no branch.
-template <typename W>
-static inline float audio_matvec_tile(device const void *w, uint n, uint k, uint n0,
+template <typename R>
+static inline float audio_matvec_tile(const R w, uint n, uint k, uint n0,
                                       device const float *xr, threadgroup float *part,
                                       ushort lane, ushort sg) {
     const uint NR = AUDIO_MATVEC_COLS;
     const uint NSG = AUDIO_MATVEC_SG;
     const uint runs = k >> 3u;
-    const uint64_t rb = W::row_bytes(k);
-    device const uchar *wr[AUDIO_MATVEC_COLS];
+    typename R::row_t wr[AUDIO_MATVEC_COLS];
     for (uint c = 0; c < NR; ++c) {
-        wr[c] = (device const uchar *) w + (uint64_t) min(n0 + c, n - 1u) * rb;
+        wr[c] = w.row(min(n0 + c, n - 1u));
     }
     float acc[AUDIO_MATVEC_COLS];
     for (uint c = 0; c < NR; ++c) {
@@ -478,7 +603,7 @@ static inline float audio_matvec_tile(device const void *w, uint n, uint k, uint
         const float4 x0 = xp[0];
         const float4 x1 = xp[1];
         for (uint c = 0; c < NR; ++c) {
-            acc[c] += W::dot8(wr[c], j, x0, x1);
+            acc[c] += w.dot8(wr[c], j, x0, x1);
         }
     }
     for (uint c = 0; c < NR; ++c) {
@@ -499,6 +624,20 @@ static inline float audio_matvec_tile(device const void *w, uint n, uint k, uint
     return total;
 }
 
+template <typename R>
+static inline void audio_matvec_body(constant audio_args_gemm & args, device float *y,
+                                     device const float *x, const R w, device const float *bias,
+                                     threadgroup float *part, uint3 tgpig, ushort lane, ushort sg) {
+    const uint n0 = tgpig.x * AUDIO_MATVEC_COLS;
+    const uint row = tgpig.y;
+    const float total = audio_matvec_tile(w, args.n, args.k, n0, x + (uint64_t) row * args.k,
+                                          part, lane, sg);
+    if (sg == 0u && lane < AUDIO_MATVEC_COLS && n0 + lane < args.n) {
+        const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u;
+        y[(uint64_t) row * args.n + n0 + lane] = total + (has_bias ? bias[n0 + lane] : 0.0f);
+    }
+}
+
 template <typename W>
 kernel void kernel_audio_matvec(
         constant audio_args_gemm & args [[buffer(0)]],
@@ -510,14 +649,25 @@ kernel void kernel_audio_matvec(
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg  [[simdgroup_index_in_threadgroup]]) {
     threadgroup float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
-    const uint n0 = tgpig.x * AUDIO_MATVEC_COLS;
-    const uint row = tgpig.y;
-    const float total = audio_matvec_tile<W>(w, args.n, args.k, n0, x + (uint64_t) row * args.k,
-                                             part, lane, sg);
-    if (sg == 0u && lane < AUDIO_MATVEC_COLS && n0 + lane < args.n) {
-        const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u;
-        y[(uint64_t) row * args.n + n0 + lane] = total + (has_bias ? bias[n0 + lane] : 0.0f);
-    }
+    audio_matvec_body(args, y, x, audio_runs<W>{w, args.k}, bias, part, tgpig, lane, sg);
+}
+
+/// The one-product kernel over an 8-bit affine weight: the bytes where a
+/// dense weight goes, then its scales and biases.
+kernel void kernel_audio_matvec_affine8w(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const uint *q            [[buffer(3)]],
+        device const float *bias        [[buffer(4)]],
+        device const ushort *scales     [[buffer(5)]],
+        device const ushort *biases     [[buffer(6)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    audio_matvec_body(args, y, x, audio_runs_affine8{q, scales, biases, args.k}, bias, part, tgpig,
+                      lane, sg);
 }
 
 /// Three matrix-vector-by-runs products of one row in one launch - a
@@ -525,6 +675,36 @@ kernel void kernel_audio_matvec(
 /// `[0, t0)` take `w0`'s columns, `[t0, t0 + t1)` `w1`'s and the rest `w2`'s,
 /// `t_i = ceil(n_i / 4)`, each column summed exactly as the one-product
 /// kernel sums it. No bias.
+template <typename R>
+static inline void audio_matvec3_body(constant audio_args_matvec3 & args, device float *y0,
+                                      device float *y1, device float *y2, device const float *x,
+                                      const R w0, const R w1, const R w2,
+                                      threadgroup float *part, uint3 tgpig, ushort lane,
+                                      ushort sg) {
+    const uint t0 = (args.n0 + AUDIO_MATVEC_COLS - 1u) / AUDIO_MATVEC_COLS;
+    const uint t1 = (args.n1 + AUDIO_MATVEC_COLS - 1u) / AUDIO_MATVEC_COLS;
+    uint t = tgpig.x;
+    device float *y = y0;
+    R w = w0;
+    uint n = args.n0;
+    if (t >= t0 + t1) {
+        t -= t0 + t1;
+        y = y2;
+        w = w2;
+        n = args.n2;
+    } else if (t >= t0) {
+        t -= t0;
+        y = y1;
+        w = w1;
+        n = args.n1;
+    }
+    const uint n0 = t * AUDIO_MATVEC_COLS;
+    const float total = audio_matvec_tile(w, n, args.k, n0, x, part, lane, sg);
+    if (sg == 0u && lane < AUDIO_MATVEC_COLS && n0 + lane < n) {
+        y[n0 + lane] = total + 0.0f;
+    }
+}
+
 template <typename W>
 kernel void kernel_audio_matvec3(
         constant audio_args_matvec3 & args [[buffer(0)]],
@@ -539,28 +719,34 @@ kernel void kernel_audio_matvec3(
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg  [[simdgroup_index_in_threadgroup]]) {
     threadgroup float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
-    const uint t0 = (args.n0 + AUDIO_MATVEC_COLS - 1u) / AUDIO_MATVEC_COLS;
-    const uint t1 = (args.n1 + AUDIO_MATVEC_COLS - 1u) / AUDIO_MATVEC_COLS;
-    uint t = tgpig.x;
-    device float *y = y0;
-    device const void *w = w0;
-    uint n = args.n0;
-    if (t >= t0 + t1) {
-        t -= t0 + t1;
-        y = y2;
-        w = w2;
-        n = args.n2;
-    } else if (t >= t0) {
-        t -= t0;
-        y = y1;
-        w = w1;
-        n = args.n1;
-    }
-    const uint n0 = t * AUDIO_MATVEC_COLS;
-    const float total = audio_matvec_tile<W>(w, n, args.k, n0, x, part, lane, sg);
-    if (sg == 0u && lane < AUDIO_MATVEC_COLS && n0 + lane < n) {
-        y[n0 + lane] = total + 0.0f;
-    }
+    audio_matvec3_body(args, y0, y1, y2, x, audio_runs<W>{w0, args.k}, audio_runs<W>{w1, args.k},
+                       audio_runs<W>{w2, args.k}, part, tgpig, lane, sg);
+}
+
+/// The three-product kernel over 8-bit affine weights: each weight's bytes,
+/// then each one's scales, then each one's biases.
+kernel void kernel_audio_matvec3_affine8w(
+        constant audio_args_matvec3 & args [[buffer(0)]],
+        device float *y0                   [[buffer(1)]],
+        device float *y1                   [[buffer(2)]],
+        device float *y2                   [[buffer(3)]],
+        device const float *x              [[buffer(4)]],
+        device const uint *q0              [[buffer(5)]],
+        device const uint *q1              [[buffer(6)]],
+        device const uint *q2              [[buffer(7)]],
+        device const ushort *s0            [[buffer(8)]],
+        device const ushort *s1            [[buffer(9)]],
+        device const ushort *s2            [[buffer(10)]],
+        device const ushort *b0            [[buffer(11)]],
+        device const ushort *b1            [[buffer(12)]],
+        device const ushort *b2            [[buffer(13)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    audio_matvec3_body(args, y0, y1, y2, x, audio_runs_affine8{q0, s0, b0, args.k},
+                       audio_runs_affine8{q1, s1, b1, args.k},
+                       audio_runs_affine8{q2, s2, b2, args.k}, part, tgpig, lane, sg);
 }
 
 /// A SiLU-gated MLP's two projections of one row and their product in one
@@ -568,30 +754,23 @@ kernel void kernel_audio_matvec3(
 /// `u = x . wu[c]`, each column summed exactly as the one-product kernel
 /// sums it (the two share a loop, so both weights stream at once) and the
 /// product formed as the SiLU-product kernel forms it. No bias.
-template <typename W>
-kernel void kernel_audio_matvec_silu(
-        constant audio_args_gemm & args [[buffer(0)]],
-        device float *y                 [[buffer(1)]],
-        device const float *x           [[buffer(2)]],
-        device const void *wg           [[buffer(3)]],
-        device const void *wu           [[buffer(4)]],
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+template <typename R>
+static inline void audio_matvec_silu_body(constant audio_args_gemm & args, device float *y,
+                                          device const float *x, const R wg, const R wu,
+                                          threadgroup float *part, uint3 tgpig, ushort lane,
+                                          ushort sg) {
     const uint NR = AUDIO_MATVEC_COLS;
     const uint NSG = AUDIO_MATVEC_SG;
-    threadgroup float part[2u * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
     const uint n0 = tgpig.x * NR;
     const uint row = tgpig.y;
     device const float *xr = x + (uint64_t) row * args.k;
     const uint runs = args.k >> 3u;
-    const uint64_t rb = W::row_bytes(args.k);
-    device const uchar *gr[AUDIO_MATVEC_COLS];
-    device const uchar *ur[AUDIO_MATVEC_COLS];
+    typename R::row_t gr[AUDIO_MATVEC_COLS];
+    typename R::row_t ur[AUDIO_MATVEC_COLS];
     for (uint c = 0; c < NR; ++c) {
-        const uint64_t at = (uint64_t) min(n0 + c, args.n - 1u) * rb;
-        gr[c] = (device const uchar *) wg + at;
-        ur[c] = (device const uchar *) wu + at;
+        const uint col = min(n0 + c, args.n - 1u);
+        gr[c] = wg.row(col);
+        ur[c] = wu.row(col);
     }
     float ag[AUDIO_MATVEC_COLS];
     float au[AUDIO_MATVEC_COLS];
@@ -604,8 +783,8 @@ kernel void kernel_audio_matvec_silu(
         const float4 x0 = xp[0];
         const float4 x1 = xp[1];
         for (uint c = 0; c < NR; ++c) {
-            ag[c] += W::dot8(gr[c], j, x0, x1);
-            au[c] += W::dot8(ur[c], j, x0, x1);
+            ag[c] += wg.dot8(gr[c], j, x0, x1);
+            au[c] += wu.dot8(ur[c], j, x0, x1);
         }
     }
     for (uint c = 0; c < NR; ++c) {
@@ -632,6 +811,41 @@ kernel void kernel_audio_matvec_silu(
     }
 }
 
+template <typename W>
+kernel void kernel_audio_matvec_silu(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const void *wg           [[buffer(3)]],
+        device const void *wu           [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[2u * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    audio_matvec_silu_body(args, y, x, audio_runs<W>{wg, args.k}, audio_runs<W>{wu, args.k},
+                           part, tgpig, lane, sg);
+}
+
+/// The gated pair over 8-bit affine weights: both weights' bytes, then their
+/// scales, then their biases.
+kernel void kernel_audio_matvec_silu_affine8w(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const uint *qg           [[buffer(3)]],
+        device const uint *qu           [[buffer(4)]],
+        device const ushort *sg_        [[buffer(5)]],
+        device const ushort *su         [[buffer(6)]],
+        device const ushort *bg         [[buffer(7)]],
+        device const ushort *bu         [[buffer(8)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[2u * AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    audio_matvec_silu_body(args, y, x, audio_runs_affine8{qg, sg_, bg, args.k},
+                           audio_runs_affine8{qu, su, bu, args.k}, part, tgpig, lane, sg);
+}
+
 typedef decltype(kernel_audio_matvec<audio_run8_f32>) audio_matvec_t;
 template [[host_name("kernel_audio_matvec_f32w")]]  kernel audio_matvec_t kernel_audio_matvec<audio_run8_f32>;
 template [[host_name("kernel_audio_matvec_bf16w")]] kernel audio_matvec_t kernel_audio_matvec<audio_run8_bf16>;
@@ -649,4 +863,3 @@ template [[host_name("kernel_audio_matvec_silu_f32w")]]  kernel audio_matvec_sil
 template [[host_name("kernel_audio_matvec_silu_bf16w")]] kernel audio_matvec_silu_t kernel_audio_matvec_silu<audio_run8_bf16>;
 template [[host_name("kernel_audio_matvec_silu_f16w")]]  kernel audio_matvec_silu_t kernel_audio_matvec_silu<audio_run8_f16>;
 template [[host_name("kernel_audio_matvec_silu_q8_0w")]] kernel audio_matvec_silu_t kernel_audio_matvec_silu<audio_run8_q8_0>;
-

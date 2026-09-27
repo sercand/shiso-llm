@@ -7,9 +7,10 @@
 use shiso_core::{CoreResult, DeviceView, Extent3, KernelArg};
 
 use super::args::{ArgmaxSplitArgs, GemmArgs, Matvec3Args, NormArgs, QkRopeArgs};
+use super::runs::WeightView;
 use super::{
-    CachePlanes, DECODE_STATE_WORDS, GemmType, LINEAR_BLOCK, MATVEC_BLOCK, MATVEC_COLS, MATVEC_RUN,
-    NORM_SMEM, Ops, dim, limit, need, need_cache,
+    CachePlanes, DECODE_STATE_WORDS, LINEAR_BLOCK, MATVEC_BLOCK, MATVEC_COLS, NORM_SMEM, Ops, dim,
+    limit, need, need_cache,
 };
 
 /// Columns one threadgroup of the split argmax scans.
@@ -92,14 +93,8 @@ pub const fn argmax_wide_parts(cols: usize) -> usize {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MatvecPart<'a> {
     pub(crate) out: DeviceView<'a>,
-    pub(crate) weight: DeviceView<'a>,
+    pub(crate) weight: WeightView<'a>,
     pub(crate) cols: usize,
-}
-
-/// Whether the matrix-vector-by-runs kernels take a product of depth `k`
-/// with these views.
-fn runs_fit(k: usize, views: &[DeviceView<'_>]) -> bool {
-    k.is_multiple_of(MATVEC_RUN) && views.iter().all(|v| v.offset().is_multiple_of(16))
 }
 
 impl Ops {
@@ -246,23 +241,23 @@ impl Ops {
 
     /// Three matrix-vector-by-runs products of one row of `input` (depth
     /// `k`) in one launch, each column summed as [`Ops::matvec`] sums it; no
-    /// bias. Returns `false`, launching nothing, where [`Ops::matvec`] would.
+    /// bias. Returns `false`, launching nothing, where [`Ops::matvec`] would
+    /// or the three weights do not share a kernel.
     pub(crate) fn matvec3(
         &self,
-        dtype: GemmType,
-        parts: [MatvecPart<'_>; 3],
+        parts: &[MatvecPart<'_>; 3],
         input: DeviceView<'_>,
         k: usize,
     ) -> CoreResult<bool> {
-        if !runs_fit(
-            k,
-            &[input, parts[0].weight, parts[1].weight, parts[2].weight],
-        ) {
+        let w = parts.map(|p| p.weight);
+        if !input.offset().is_multiple_of(16)
+            || !w.iter().all(|x| x.runs_fit(k) && x.same_kind(&w[0]))
+        {
             return Ok(false);
         }
         need(input, k, "matvec3.x")?;
         let mut groups = 0;
-        for p in &parts {
+        for p in parts {
             need(p.out, p.cols, "matvec3.y")?;
             groups += p.cols.div_ceil(MATVEC_COLS);
         }
@@ -272,21 +267,25 @@ impl Ops {
             n2: dim(parts[2].cols, "matvec3.n2")?,
             k: dim(k, "matvec3.k")?,
         };
+        let mut bind = vec![
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(parts[0].out),
+            KernelArg::Buffer(parts[1].out),
+            KernelArg::Buffer(parts[2].out),
+            KernelArg::Buffer(input),
+        ];
+        bind.extend(w.iter().map(|x| KernelArg::Buffer(x.main())));
+        // An affine weight's scales, then its biases, each for all three.
+        let aux: Vec<Vec<KernelArg<'_>>> = w.iter().map(WeightView::aux).collect();
+        for i in 0..aux[0].len() {
+            bind.extend(aux.iter().map(|a| a[i]));
+        }
         self.launch(
-            dtype.matvec3_entry(),
+            w[0].matvec3_entry(),
             Extent3::linear(dim(groups.max(1), "matvec3.grid")?),
             MATVEC_BLOCK,
             0,
-            &[
-                KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                KernelArg::Buffer(parts[0].out),
-                KernelArg::Buffer(parts[1].out),
-                KernelArg::Buffer(parts[2].out),
-                KernelArg::Buffer(input),
-                KernelArg::Buffer(parts[0].weight),
-                KernelArg::Buffer(parts[1].weight),
-                KernelArg::Buffer(parts[2].weight),
-            ],
+            &bind,
         )?;
         Ok(true)
     }
@@ -294,16 +293,19 @@ impl Ops {
     /// `out = silu(x * Wg^T) * (x * Wu^T)` over `rows` rows in one launch,
     /// each product summed as [`Ops::matvec`] sums it and the product formed
     /// as [`Ops::silu_mul`] forms it. Returns `false`, launching nothing,
-    /// where [`Ops::matvec`] would.
+    /// where [`Ops::matvec`] would or the two weights do not share a kernel.
     pub(crate) fn matvec_silu(
         &self,
-        dtype: GemmType,
         out: DeviceView<'_>,
         input: DeviceView<'_>,
-        [gate, up]: [DeviceView<'_>; 2],
+        [gate, up]: [WeightView<'_>; 2],
         (rows, cols, depth): (usize, usize, usize),
     ) -> CoreResult<bool> {
-        if !runs_fit(depth, &[input, gate, up]) {
+        if !input.offset().is_multiple_of(16)
+            || !gate.runs_fit(depth)
+            || !up.runs_fit(depth)
+            || !gate.same_kind(&up)
+        {
             return Ok(false);
         }
         need(out, rows * cols, "matvec_silu.y")?;
@@ -316,8 +318,20 @@ impl Ops {
             k_chunk: dim(depth, "matvec_silu.k")?,
             splits: 1,
         };
+        let mut bind = vec![
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out),
+            KernelArg::Buffer(input),
+            KernelArg::Buffer(gate.main()),
+            KernelArg::Buffer(up.main()),
+        ];
+        let (ga, ua) = (gate.aux(), up.aux());
+        for (g, u) in ga.into_iter().zip(ua) {
+            bind.push(g);
+            bind.push(u);
+        }
         self.launch(
-            dtype.matvec_silu_entry(),
+            gate.matvec_silu_entry(),
             Extent3::new(
                 dim(cols.div_ceil(MATVEC_COLS).max(1), "matvec_silu.grid")?,
                 dim(rows.max(1), "matvec_silu.grid")?,
@@ -325,13 +339,7 @@ impl Ops {
             ),
             MATVEC_BLOCK,
             0,
-            &[
-                KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                KernelArg::Buffer(out),
-                KernelArg::Buffer(input),
-                KernelArg::Buffer(gate),
-                KernelArg::Buffer(up),
-            ],
+            &bind,
         )?;
         Ok(true)
     }

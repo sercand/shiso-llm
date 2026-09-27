@@ -16,11 +16,11 @@ use crate::{Gpu, drain, f32_bytes, oracle};
 /// `audio_args_matvec3`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct Matvec3Args {
-    n0: u32,
-    n1: u32,
-    n2: u32,
-    k: u32,
+pub(super) struct Matvec3Args {
+    pub(super) n0: u32,
+    pub(super) n1: u32,
+    pub(super) n2: u32,
+    pub(super) k: u32,
 }
 const _: () = assert!(size_of::<Matvec3Args>() == 16);
 
@@ -53,7 +53,7 @@ const ARGMAX_SPAN: u32 = 2048;
 
 /// Equal value for value; the fused launch forms each one as the chain does,
 /// so no tolerance. A zero's sign is the one thing either may pick.
-fn same(got: &[f32], want: &[f32], what: &str) {
+pub(super) fn same(got: &[f32], want: &[f32], what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
         let zero = |v: f32| v.to_bits().trailing_zeros() >= 31;

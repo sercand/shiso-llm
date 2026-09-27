@@ -524,7 +524,8 @@ impl<'a> Decoder<'a> {
     }
 
     /// One prefill layer over the `n` prompt rows of `s.x`, in place (notes
-    /// §4): every projection on the GEMM, attention causal from position 0.
+    /// §4): every projection on the audio set's tiled GEMM (an 8-bit affine
+    /// weight too), attention causal from position 0.
     fn layer(
         &self,
         layer: &TextLayer,
@@ -535,9 +536,9 @@ impl<'a> Decoder<'a> {
         let (ops, c) = (self.ops, self.config);
         let hd = c.head_dim;
         self.rms(s.h.view(), s.x.view(), &layer.attn_norm, n, c.hidden)?;
-        layer.q.forward(ops, s.h.view(), s.q.view(), n)?;
-        layer.k.forward(ops, s.h.view(), s.k.view(), n)?;
-        layer.v.forward(ops, s.h.view(), s.v.view(), n)?;
+        layer.q.forward_own(ops, s.h.view(), s.q.view(), n)?;
+        layer.k.forward_own(ops, s.h.view(), s.k.view(), n)?;
+        layer.v.forward_own(ops, s.h.view(), s.v.view(), n)?;
         // The q and k norms are over each head's dims, before the rotation.
         self.rms(s.q.view(), s.q.view(), &layer.q_norm, n * c.heads, hd)?;
         self.rms(s.k.view(), s.k.view(), &layer.k_norm, n * c.kv_heads, hd)?;
@@ -567,18 +568,18 @@ impl<'a> Decoder<'a> {
             pos0: 0,
             scale: attention_scale(hd),
         })?;
-        layer.o.forward(ops, s.att.view(), s.h.view(), n)?;
+        layer.o.forward_own(ops, s.att.view(), s.h.view(), n)?;
         self.residual(s.x, s.h, n * c.hidden)?;
         self.rms(s.h.view(), s.x.view(), &layer.ffn_norm, n, c.hidden)?;
-        layer.gate.forward(ops, s.h.view(), s.gate.view(), n)?;
-        layer.up.forward(ops, s.h.view(), s.up.view(), n)?;
+        layer.gate.forward_own(ops, s.h.view(), s.gate.view(), n)?;
+        layer.up.forward_own(ops, s.h.view(), s.up.view(), n)?;
         ops.silu_mul(&SiluMulDesc {
             out: s.gate.view(),
             gate: s.gate.view(),
             up: s.up.view(),
             count: n * c.ffn,
         })?;
-        layer.down.forward(ops, s.gate.view(), s.h.view(), n)?;
+        layer.down.forward_own(ops, s.gate.view(), s.h.view(), n)?;
         self.residual(s.x, s.h, n * c.hidden)
     }
 

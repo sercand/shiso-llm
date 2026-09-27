@@ -22,6 +22,10 @@ listed.
 | `kernel_audio_matvec_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm` (one split; `k % 8 == 0`) | y `[m][n]`, x `[m][k]` (16-byte aligned), w `[n][k]` (16-byte aligned; q8_0w as the GEMM's), bias `[n]` | `(ceil(n/4), m)` × 64, 0 (static) |
 | `kernel_audio_matvec3_{f32w,bf16w,f16w,q8_0w}` | `audio_args_matvec3{n0, n1, n2, k}` (`k % 8 == 0`) | y0 `[n0]`, y1 `[n1]`, y2 `[n2]`, x `[k]`, w0 `[n0][k]`, w1 `[n1][k]`, w2 `[n2][k]` (x and w 16-byte aligned) | `ceil(n0/4) + ceil(n1/4) + ceil(n2/4)` × 64, 0 (static) |
 | `kernel_audio_matvec_silu_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm` (`flags`, `k_chunk`, `splits` unread) | y `[m][n]`, x `[m][k]`, w_gate `[n][k]`, w_up `[n][k]` | `(ceil(n/4), m)` × 64, 0 (static) |
+| `kernel_audio_gemm_affine8w`, `kernel_audio_gemm64_affine8w` | `audio_args_gemm` (`k % 64 == 0`) | as `kernel_audio_gemm_*` with w the bytes u32 `[n][k/4]`, then scales bf16 `[n][k/64]`, biases bf16 (as scales) | as `kernel_audio_gemm_*` / `kernel_audio_gemm64_*` |
+| `kernel_audio_matvec_affine8w` | `audio_args_gemm` (one split; `k % 64 == 0`) | as `kernel_audio_matvec_*` with w the bytes (8-byte aligned), then scales, biases | as `kernel_audio_matvec_*` |
+| `kernel_audio_matvec3_affine8w` | `audio_args_matvec3` (`k % 64 == 0`) | y0, y1, y2, x, the three weights' bytes, their three scales, their three biases | as `kernel_audio_matvec3_*` |
+| `kernel_audio_matvec_silu_affine8w` | `audio_args_gemm` | y, x, gate bytes, up bytes, gate scales, up scales, gate biases, up biases | as `kernel_audio_matvec_silu_*` |
 | `kernel_audio_split_sum_f32` | `audio_args_gemm` | y `[m][n]`, parts `[splits][m][n]`, bias `[n]` | `ceil(m·n/256)` × 256, 0 |
 | `kernel_audio_conv2d_s2_f32` | `audio_args_conv2d{t_in, f_in, c_in, t_out, f_out, c_out, pad_t, pad_f, depthwise, has_bias, relu, in_valid, out_valid, batch}` | out `[batch][t_out][f_out][c_out]`, in `[batch][t_in][f_in][c_in]`, w `[c_out][c_in/g][3][3]`, bias `[c_out]` | `ceil(batch·t_out·f_out·c_out/256)` × 256, 0 |
 | `kernel_audio_im2col_s2_f32` | `audio_args_conv2d` (as above; `c_out`, `depthwise`, `has_bias`, `relu` unread) | out `[batch][t_out][f_out][9·c_in]` (tap `kt·3+kf` major, channel minor), in `[batch][t_in][f_in][c_in]` | `ceil(batch·t_out·f_out·9·c_in/256)` × 256, 0 |
@@ -67,6 +71,11 @@ The matrix-vector-by-runs kernel is the one-row product of a decoder step: each 
 consecutive weights (for q8_0w a quarter block, the run's integer dot scaled once), sums its runs in k order, a
 simdgroup sum closes each of the two simdgroups, and their sums are added in simdgroup order. That order is not the
 matrix-vector kernel's, so a model takes one or the other for a product. Every row re-reads the weights.
+
+An `affine8w` weight is MLX 8-bit affine with groups of 64: the bytes four to a little-endian u32 along each row and
+a bf16 scale and bias per group. The tiled GEMMs stage each weight as the fused `q * scale + bias` in f32; the
+matrix-vector-by-runs entries dot a run of eight as `scale * (q . x) + bias * sum(x)`, so the two orders differ and a
+model takes one or the other for a product.
 
 The decoder step's fused entries each do the work of a chain of the plain entries in one launch and form every
 value exactly as that chain does, so a decoder may take either: `add_rms_norm` is the axpy at alpha 1 then the RMS

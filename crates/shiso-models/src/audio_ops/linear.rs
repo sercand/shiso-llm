@@ -8,10 +8,11 @@
 //! GEMM, dequantising in f32, keeps 1e-5. An encoder therefore never has to ask
 //! what a weight is stored as.
 
-use shiso_core::{CoreError, CoreResult, DeviceBuffer, DeviceView};
-use shiso_engine::projection::{Weight, projection};
+use shiso_core::{CoreError, CoreResult, DType, DeviceBuffer, DeviceView};
+use shiso_engine::projection::{Weight, WeightAux, projection};
 
 use super::fused::MatvecPart;
+use super::runs::{AFFINE_GROUP, Affine8, WeightView};
 use super::{BiasRowsDesc, Ops, SiluMulDesc};
 
 /// Rows per projected call. The engine's library GEMM route only engages on
@@ -222,11 +223,58 @@ impl Linear {
 }
 
 impl Linear {
+    /// The weight as the audio set's own kernels read it: the audio GEMM's
+    /// rows (checked against the shape), or an 8-bit affine weight with its
+    /// scales and biases; `None` for any other projected weight.
+    fn own(&self) -> CoreResult<Option<WeightView<'_>>> {
+        let (k, n) = (self.in_dim(), self.out_dim());
+        match &self.weight {
+            LinearWeight::Gemm { dtype, buffer, .. } => {
+                let row = dtype.row_bytes(k).ok_or(CoreError::InvalidValue {
+                    key: "linear.in_dim",
+                    value: k.to_string(),
+                })?;
+                let want = u64::try_from(n * row).unwrap_or(u64::MAX);
+                if buffer.len() < want {
+                    return Err(CoreError::ShapeMismatch {
+                        field: "linear.weight",
+                        expected: want,
+                        got: buffer.len(),
+                    });
+                }
+                Ok(Some(WeightView::Dense(*dtype, buffer.view())))
+            }
+            LinearWeight::Projected(w) => match (w.dtype, w.aux().and_then(WeightAux::affine)) {
+                (DType::MlxAffine8Gs64, Some(aux)) if k.is_multiple_of(AFFINE_GROUP) => {
+                    let (words, groups) = (n * k, n * k / AFFINE_GROUP);
+                    let q = w.view();
+                    if q.len() < bytes(words / 4)
+                        || aux.scales.len() < u64::try_from(groups * 2).unwrap_or(u64::MAX)
+                        || aux.biases.len() < u64::try_from(groups * 2).unwrap_or(u64::MAX)
+                    {
+                        return Err(CoreError::ShapeMismatch {
+                            field: "linear.affine",
+                            expected: bytes(words / 4),
+                            got: q.len(),
+                        });
+                    }
+                    Ok(Some(WeightView::Affine8(Affine8 {
+                        q,
+                        scales: aux.scales.view(),
+                        biases: aux.biases.view(),
+                    })))
+                }
+                _ => Ok(None),
+            },
+        }
+    }
+
     /// [`Self::forward`] for a decoder step's row or few: the audio GEMM's
-    /// weights go to the matrix-vector-by-runs kernel, whose summation order
-    /// differs from the matrix-vector kernel [`Self::forward`] takes at a few
-    /// rows, so a model uses one or the other for each product. Other weights,
-    /// and shapes that kernel does not take, go through [`Self::forward`].
+    /// weights and 8-bit affine ones go to the matrix-vector-by-runs kernel,
+    /// whose summation order differs from the matrix-vector kernel
+    /// [`Self::forward`] takes at a few rows, so a model uses one or the
+    /// other for each product. Other weights, and shapes that kernel does not
+    /// take, go through [`Self::forward`].
     ///
     /// # Errors
     ///
@@ -238,50 +286,53 @@ impl Linear {
         y: DeviceView<'_>,
         rows: usize,
     ) -> CoreResult<()> {
-        if let LinearWeight::Gemm { dtype, buffer, .. } = &self.weight {
-            let (k, n) = (self.in_dim(), self.out_dim());
-            let row = dtype.row_bytes(k).ok_or(CoreError::InvalidValue {
-                key: "linear.in_dim",
-                value: k.to_string(),
-            })?;
-            let want = u64::try_from(n * row).unwrap_or(u64::MAX);
-            if buffer.len() < want {
-                return Err(CoreError::ShapeMismatch {
-                    field: "linear.weight",
-                    expected: want,
-                    got: buffer.len(),
-                });
-            }
+        if let Some(w) = self.own()? {
             let bias = self.bias.as_ref().map(DeviceBuffer::view);
-            if ops.matvec(*dtype, y, x, buffer.view(), bias, (rows, n, k))? {
+            if ops.matvec(w, y, x, bias, (rows, self.out_dim(), self.in_dim()))? {
                 return Ok(());
             }
         }
         self.forward(ops, x, y, rows)
     }
+
+    /// [`Self::forward`], but an 8-bit affine weight goes to the audio set's
+    /// own tiled GEMM - a prefill's rows at the rate the dense weights get,
+    /// where the engine's affine projection runs at a fifth of it - and
+    /// forms each weight as `q * scale + bias` in f32. Every other weight is
+    /// exactly [`Self::forward`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward`].
+    pub fn forward_own(
+        &self,
+        ops: &Ops,
+        x: DeviceView<'_>,
+        y: DeviceView<'_>,
+        rows: usize,
+    ) -> CoreResult<()> {
+        if let (LinearWeight::Projected(_), Some(w)) = (&self.weight, self.own()?) {
+            let bias = self.bias.as_ref().map(DeviceBuffer::view);
+            return ops.gemm_of(w, y, x, bias, (rows, self.out_dim(), self.in_dim()));
+        }
+        self.forward(ops, x, y, rows)
+    }
 }
 
-/// A weight the matrix-vector-by-runs kernels read, with its type, rows,
-/// depth and columns, or `None` for a weight they do not.
-fn runs_weight(linear: &Linear) -> Option<(GemmType, &DeviceBuffer, usize, usize)> {
-    match &linear.weight {
-        LinearWeight::Gemm {
-            dtype,
-            buffer,
-            in_dim,
-            out_dim,
-        } if linear.bias.is_none() => {
-            let want = u64::try_from(out_dim * dtype.row_bytes(*in_dim)?).ok()?;
-            (buffer.len() >= want).then_some((*dtype, buffer, *in_dim, *out_dim))
-        }
-        _ => None,
+/// A bias-free weight the matrix-vector-by-runs kernels read, with its depth
+/// and columns, or `None`.
+fn runs_weight(linear: &Linear) -> Option<(WeightView<'_>, usize, usize)> {
+    if linear.bias.is_some() {
+        return None;
     }
+    let w = linear.own().ok()??;
+    Some((w, linear.in_dim(), linear.out_dim()))
 }
 
 /// A decoder step's three projections of one row of `x` - query, key and
 /// value - as [`Linear::step`] forms each, in one launch when all three are
-/// bias-free audio GEMM weights of one type and depth, else one after
-/// another.
+/// bias-free weights of one kind and depth that the one-row kernels read,
+/// else one after another.
 ///
 /// # Errors
 ///
@@ -294,17 +345,15 @@ pub fn step3(
 ) -> CoreResult<()> {
     let found = linears.map(runs_weight);
     if let [Some(a), Some(b), Some(c)] = found
-        && a.0 == b.0
-        && b.0 == c.0
-        && a.2 == b.2
-        && b.2 == c.2
+        && a.1 == b.1
+        && b.1 == c.1
     {
-        let parts = [(a, ys[0]), (b, ys[1]), (c, ys[2])].map(|((_, w, _, n), out)| MatvecPart {
+        let parts = [(a, ys[0]), (b, ys[1]), (c, ys[2])].map(|((w, _, n), out)| MatvecPart {
             out,
-            weight: w.view(),
+            weight: w,
             cols: n,
         });
-        if ops.matvec3(a.0, parts, x, a.2)? {
+        if ops.matvec3(&parts, x, a.1)? {
             return Ok(());
         }
     }
@@ -316,9 +365,9 @@ pub fn step3(
 
 /// A SiLU-gated MLP's projections of `rows` rows of `x` and their product,
 /// `out = silu(x * gate^T) * (x * up^T)`, as [`Linear::step`] and
-/// [`Ops::silu_mul`] form them: in one launch when both are bias-free audio
-/// GEMM weights of one type and shape, else as those three launches with
-/// `spare` holding the value projection.
+/// [`Ops::silu_mul`] form them: in one launch when both are bias-free
+/// weights of one kind and shape that the one-row kernels read, else as
+/// those three launches with `spare` holding the value projection.
 ///
 /// # Errors
 ///
@@ -332,9 +381,8 @@ pub fn step_silu(
     rows: usize,
 ) -> CoreResult<()> {
     if let (Some(g), Some(u)) = (runs_weight(gate), runs_weight(up))
-        && g.0 == u.0
-        && (g.2, g.3) == (u.2, u.3)
-        && ops.matvec_silu(g.0, out, x, [g.1.view(), u.1.view()], (rows, g.3, g.2))?
+        && (g.1, g.2) == (u.1, u.2)
+        && ops.matvec_silu(out, x, [g.0, u.0], (rows, g.2, g.1))?
     {
         return Ok(());
     }

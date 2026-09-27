@@ -7,7 +7,7 @@ Metal twin's (`crates/shiso-metal/metal/audio`) and the host's literals in
 `crates/shiso-models/src/audio_ops`; `shiso_kerneltest::audio::cases::ENTRIES`
 holds them, and `crates/shiso-cuda/tests/audio_kernels.rs` resolves every one.
 
-## Module `audio` — 62 entries
+## Module `audio` — 67 entries
 
 ```
 kernel_audio_unary_f32
@@ -72,4 +72,9 @@ kernel_audio_add_rms_norm_f32
 kernel_audio_qk_norm_rope_append_f32
 kernel_audio_argmax_split_f32
 kernel_audio_argmax_merge_f32
+kernel_audio_gemm_affine8w
+kernel_audio_gemm64_affine8w
+kernel_audio_matvec_affine8w
+kernel_audio_matvec3_affine8w
+kernel_audio_matvec_silu_affine8w
 ```

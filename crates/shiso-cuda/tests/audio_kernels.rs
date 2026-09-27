@@ -65,6 +65,8 @@ device_cases!(
     add_rms_norm_is_the_axpy_and_rms_norm_it_replaces,
     qk_norm_rope_append_is_the_chain_it_replaces,
     argmax_wide_matches_the_row_argmax,
+    affine8_products_match_the_dequantised_weight,
+    affine8_fused_products_are_the_chain,
     tall_gemm_matches_for_every_weight_type,
     conv2d_matches_causal_symmetric_full_and_depthwise,
     conv2d_keeps_batched_planes_apart,

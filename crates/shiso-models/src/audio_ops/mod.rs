@@ -17,6 +17,7 @@ mod decode_tests;
 mod fused;
 mod linear;
 pub mod load;
+mod runs;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -30,6 +31,7 @@ use shiso_core::{
 
 pub use fused::{AddRmsNormDesc, ArgmaxWideDesc, QkRopeAppendDesc, argmax_wide_parts};
 pub use linear::{GemmType, Linear, LinearWeight, step_silu, step3};
+use runs::WeightView;
 pub use workspace::Workspace;
 
 use args::{
@@ -128,8 +130,6 @@ const MATVEC_COLS: usize = 4;
 /// Threads of one matrix-vector-by-runs threadgroup: two simdgroups sharing
 /// each column's k range.
 const MATVEC_BLOCK: u32 = 64;
-/// Consecutive weights one lane of the matrix-vector-by-runs kernel dots.
-const MATVEC_RUN: usize = 8;
 /// Threads of one GEMM tile, and of one matrix-vector threadgroup: four
 /// simdgroups.
 const GEMM_BLOCK: u32 = 128;
@@ -804,6 +804,27 @@ fn linear_grid(count: usize) -> CoreResult<Extent3> {
     )?))
 }
 
+/// A GEMM's bindings: the arguments, the destination, the input, the weight,
+/// the bias (the input when there is none), then an affine weight's scales
+/// and biases.
+fn gemm_bind<'a>(
+    args: &'a GemmArgs,
+    target: DeviceView<'a>,
+    input: DeviceView<'a>,
+    weight: &WeightView<'a>,
+    bias: Option<DeviceView<'a>>,
+) -> Vec<KernelArg<'a>> {
+    let mut b = vec![
+        KernelArg::Bytes(bytemuck::bytes_of(args)),
+        KernelArg::Buffer(target),
+        KernelArg::Buffer(input),
+        KernelArg::Buffer(weight.main()),
+        KernelArg::Buffer(bias.unwrap_or(input)),
+    ];
+    b.extend(weight.aux());
+    b
+}
+
 /// Launches the audio kernel set on one backend.
 #[derive(Debug, Clone)]
 pub struct Ops {
@@ -1119,17 +1140,30 @@ impl Ops {
         bias: Option<DeviceView<'_>>,
         shape: (usize, usize, usize),
     ) -> CoreResult<()> {
+        self.gemm_of(WeightView::Dense(dtype, weight), out, input, bias, shape)
+    }
+
+    /// [`Self::gemm`] over any weight the audio set reads. An affine weight
+    /// has no matrix-vector kernel of the old order, so a few rows of one
+    /// take the 32-row tile.
+    pub(crate) fn gemm_of(
+        &self,
+        weight: WeightView<'_>,
+        out: DeviceView<'_>,
+        input: DeviceView<'_>,
+        bias: Option<DeviceView<'_>>,
+        shape: (usize, usize, usize),
+    ) -> CoreResult<()> {
         // A few rows go to the matrix-vector kernel, which spreads the
         // columns over enough threadgroups to stream the weights at the
         // memory's rate; more rows go to the tiled GEMM.
-        let skinny = shape.0 <= GEMV_MAX_ROWS;
+        let skinny = shape.0 <= GEMV_MAX_ROWS && matches!(weight, WeightView::Dense(..));
         let tall = shape.0 > GEMM_TILE_M;
-        let entry = if skinny {
-            dtype.gemv_entry()
-        } else if tall {
-            dtype.entry64()
-        } else {
-            dtype.entry()
+        let (entry32, entry64) = weight.tiled_entries();
+        let entry = match weight {
+            WeightView::Dense(dtype, _) if skinny => dtype.gemv_entry(),
+            _ if tall => entry64,
+            _ => entry32,
         };
         let (tile_m, block, smem) = if tall {
             (GEMM64_TILE_M, GEMM64_BLOCK, GEMM64_SMEM)
@@ -1177,13 +1211,7 @@ impl Ops {
                 grid,
                 GEMM_BLOCK,
                 0,
-                &[
-                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                    KernelArg::Buffer(out),
-                    KernelArg::Buffer(input),
-                    KernelArg::Buffer(weight),
-                    KernelArg::Buffer(bias.unwrap_or(input)),
-                ],
+                &gemm_bind(&args, out, input, &weight, bias),
             );
         }
         let grid = Extent3::new(
@@ -1207,13 +1235,7 @@ impl Ops {
             grid,
             block,
             smem,
-            &[
-                KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                KernelArg::Buffer(target),
-                KernelArg::Buffer(input),
-                KernelArg::Buffer(weight),
-                KernelArg::Buffer(bias.unwrap_or(input)),
-            ],
+            &gemm_bind(&args, target, input, &weight, bias),
         )?;
         let Some(parts) = parts else {
             return Ok(());
@@ -1244,18 +1266,14 @@ impl Ops {
     /// [`Self::gemm`] instead.
     pub(crate) fn matvec(
         &self,
-        dtype: GemmType,
+        weight: WeightView<'_>,
         out: DeviceView<'_>,
         input: DeviceView<'_>,
-        weight: DeviceView<'_>,
         bias: Option<DeviceView<'_>>,
         shape: (usize, usize, usize),
     ) -> CoreResult<bool> {
         let (rows, cols, depth) = shape;
-        if !depth.is_multiple_of(MATVEC_RUN)
-            || !input.offset().is_multiple_of(16)
-            || !weight.offset().is_multiple_of(16)
-        {
+        if !weight.runs_fit(depth) || !input.offset().is_multiple_of(16) {
             return Ok(false);
         }
         need(out, rows * cols, "matvec.y")?;
@@ -1276,19 +1294,15 @@ impl Ops {
             dim(rows.max(1), "matvec.grid")?,
             1,
         );
-        self.launch(
-            dtype.matvec_entry(),
-            grid,
-            MATVEC_BLOCK,
-            0,
-            &[
-                KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                KernelArg::Buffer(out),
-                KernelArg::Buffer(input),
-                KernelArg::Buffer(weight),
-                KernelArg::Buffer(bias.unwrap_or(input)),
-            ],
-        )?;
+        let mut bind = vec![
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out),
+            KernelArg::Buffer(input),
+            KernelArg::Buffer(weight.main()),
+            KernelArg::Buffer(bias.unwrap_or(input)),
+        ];
+        bind.extend(weight.aux());
+        self.launch(weight.matvec_entry(), grid, MATVEC_BLOCK, 0, &bind)?;
         Ok(true)
     }
 
