@@ -16,6 +16,16 @@
 //! the attention's chunk rule with no past chunks - so the whole clip
 //! is one launch per operation rather than one per chunk or per window.
 //!
+//! Several clips can share one pass ([`Tower::encode_many`]): each clip's
+//! stem runs as it would alone, and its tokens join one stacked matrix
+//! through every layer's GEMMs and row-wise work, only the attention running
+//! clip by clip. A clip of ten seconds is some 130 tokens, too few rows for a
+//! GEMM to fill the device (a 1024-column projection is then 48
+//! threadgroups), and a batch of them is a thousand. A clip's rows are summed
+//! as they are alone only if it has more tokens than the 32-row GEMM tile,
+//! or is not shorter than a chunk, so a clip of 32 tokens or fewer (under
+//! some 2.5 s) still runs on its own.
+//!
 //! Everything is f32; weights read in whatever width their export stored.
 
 use shiso_audio::{AudioError, MelFrames};
@@ -25,7 +35,7 @@ use super::config::{AudioConfig, CHUNK_FRAMES, TOKENS_PER_CHUNK, WINDOW_TOKENS};
 use super::weights::{Conv, Norm, TowerLayer, TowerWeights};
 use crate::audio_ops::{
     AttnWindow, AxpyDesc, BiasRowsDesc, Conv2dGeometry, Im2colDesc, Linear, NormDesc, Ops,
-    TransposeDesc, UnaryDesc, UnaryOp, WindowAttnDesc, Workspace,
+    TransposeDesc, UnaryDesc, UnaryOp, WindowAttnDesc, Workspace, gemm_rows_sum_alone,
 };
 
 /// Chunks one pass of the conv stem takes. The second conv's patches are
@@ -67,7 +77,7 @@ fn bytes(floats: usize) -> u64 {
 }
 
 /// Rows `[row, row + count)` of a buffer of `width`-float rows.
-fn rows(
+fn rows_of(
     buf: &DeviceBuffer,
     row: usize,
     count: usize,
@@ -122,6 +132,33 @@ struct Scratch<'w> {
     v: &'w DeviceBuffer,
     att: &'w DeviceBuffer,
     up: &'w DeviceBuffer,
+}
+
+impl<'w> Scratch<'w> {
+    /// The layers' slots of `ws`.
+    fn of(ws: &'w Workspace) -> Self {
+        Self {
+            x: ws.get(slot::X),
+            h: ws.get(slot::H),
+            q: ws.get(slot::Q),
+            k: ws.get(slot::K),
+            v: ws.get(slot::V),
+            att: ws.get(slot::ATT),
+            up: ws.get(slot::UP),
+        }
+    }
+}
+
+/// One clip's shape through the tower.
+#[derive(Debug, Clone, Copy)]
+struct Clip {
+    /// Its tokens: [`audio_tokens`] of its frames.
+    tokens: usize,
+    /// Frames a stem chunk takes: a whole chunk, or the clip if shorter.
+    per_chunk: usize,
+    chunks: usize,
+    /// Rows the stem makes of one chunk.
+    stem_rows: usize,
 }
 
 /// The workspace slots of one encode: the layers' scratch, then one pass of
@@ -179,6 +216,124 @@ impl<'a> Tower<'a> {
     ///
     /// As [`Self::encode`].
     pub fn encode_with(&self, mel: &MelFrames, ws: &mut Workspace) -> Result<Encoded, AudioError> {
+        let clip = self.shape(mel)?;
+        ws.reserve(
+            self.ops,
+            &self.sizes(
+                &Stem::new(
+                    STEM_GROUP.min(clip.chunks),
+                    clip.per_chunk,
+                    self.config.mels,
+                ),
+                clip.chunks * clip.stem_rows,
+                clip.tokens,
+            ),
+        )?;
+        let ws = &*ws;
+        let s = Scratch::of(ws);
+        self.stems(mel, &clip, ws, 0)?;
+        // Only the tail chunk has rows past the clip's tokens, and it is last,
+        // so the valid tokens are the matrix's first `tokens` rows.
+        let one = [(0, clip.tokens)];
+        for layer in &self.weights.layers {
+            self.layer(layer, &s, clip.tokens, &one)?;
+        }
+        self.head(&s, clip.tokens)
+    }
+
+    /// Each of `mels` through the tower, as [`Self::encode_with`] gives it
+    /// alone, bit for bit: the clips of more tokens than the 32-row tile and
+    /// at least a chunk long share one pass (see the module docs), the rest
+    /// run one by one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::encode`], for any of the clips.
+    pub fn encode_many(
+        &self,
+        mels: &[&MelFrames],
+        ws: &mut Workspace,
+    ) -> Result<Vec<Encoded>, AudioError> {
+        let mut shapes = Vec::with_capacity(mels.len());
+        for mel in mels {
+            shapes.push(self.shape(mel)?);
+        }
+        let shared: Vec<usize> = (0..mels.len())
+            .filter(|&i| {
+                let clip = &shapes[i];
+                clip.per_chunk == CHUNK_FRAMES && gemm_rows_sum_alone(clip.tokens)
+            })
+            .collect();
+        let mut out: Vec<Option<Encoded>> = (0..mels.len()).map(|_| None).collect();
+        if shared.len() > 1 {
+            for (i, encoded) in shared
+                .iter()
+                .zip(self.encode_stacked(mels, &shapes, &shared, ws)?)
+            {
+                out[*i] = Some(encoded);
+            }
+        }
+        for (i, mel) in mels.iter().enumerate() {
+            if out[i].is_none() {
+                out[i] = Some(self.encode_with(mel, ws)?);
+            }
+        }
+        Ok(out.into_iter().flatten().collect())
+    }
+
+    /// The clips `which` of `mels` in one pass: each clip's stem as alone,
+    /// its tokens at its own offset of one matrix, each layer's GEMMs over
+    /// every clip's rows at once and its attention clip by clip.
+    fn encode_stacked(
+        &self,
+        mels: &[&MelFrames],
+        shapes: &[Clip],
+        which: &[usize],
+        ws: &mut Workspace,
+    ) -> Result<Vec<Encoded>, AudioError> {
+        let mut spans = Vec::with_capacity(which.len());
+        let (mut total, mut rows, mut widest) = (0, 0, 0);
+        for &i in which {
+            let clip = &shapes[i];
+            spans.push((total, clip.tokens));
+            // A clip's stem writes whole chunks; its tail chunk's rows past
+            // its tokens are overwritten by the next clip's.
+            rows = rows.max(total + clip.chunks * clip.stem_rows);
+            widest = widest.max(clip.chunks);
+            total += clip.tokens;
+        }
+        ws.reserve(
+            self.ops,
+            &self.sizes(
+                &Stem::new(STEM_GROUP.min(widest), CHUNK_FRAMES, self.config.mels),
+                rows,
+                total,
+            ),
+        )?;
+        let ws = &*ws;
+        let s = Scratch::of(ws);
+        for (&i, &(row0, _)) in which.iter().zip(&spans) {
+            self.stems(mels[i], &shapes[i], ws, row0)?;
+        }
+        for layer in &self.weights.layers {
+            self.layer(layer, &s, total, &spans)?;
+        }
+        let all = self.head(&s, total)?;
+        let width = self.config.output_dim;
+        spans
+            .iter()
+            .map(|&(row0, tokens)| {
+                let buffer = self.ops.scratch_uninit(tokens * width)?;
+                self.ops
+                    .backend()
+                    .copy_d2d(buffer.view(), rows_of(&all.buffer, row0, tokens, width)?)?;
+                Ok(Encoded { buffer, tokens })
+            })
+            .collect()
+    }
+
+    /// `mel`'s shape through the tower, or why it cannot go through.
+    fn shape(&self, mel: &MelFrames) -> Result<Clip, AudioError> {
         let mels = self.config.mels;
         if mel.n_mels() != mels {
             return Err(AudioError::BadSpec {
@@ -191,43 +346,41 @@ impl<'a> Tower<'a> {
                 reason: "a clip of no mel frames".into(),
             });
         }
-        let tokens = audio_tokens(frames);
         // A clip shorter than a chunk is one unfilled chunk of its own length.
         let per_chunk = frames.min(CHUNK_FRAMES);
-        let chunks = frames.div_ceil(per_chunk);
-        let stem_rows = stem_tokens(per_chunk);
-        ws.reserve(
-            self.ops,
-            &self.sizes(
-                &Stem::new(STEM_GROUP.min(chunks), per_chunk, mels),
-                chunks * stem_rows,
-                tokens,
-            ),
-        )?;
-        let ws = &*ws;
-        let s = Scratch {
-            x: ws.get(slot::X),
-            h: ws.get(slot::H),
-            q: ws.get(slot::Q),
-            k: ws.get(slot::K),
-            v: ws.get(slot::V),
-            att: ws.get(slot::ATT),
-            up: ws.get(slot::UP),
-        };
-        let valid = &mel.as_slice()[..frames * mels];
+        Ok(Clip {
+            tokens: audio_tokens(frames),
+            per_chunk,
+            chunks: frames.div_ceil(per_chunk),
+            stem_rows: stem_tokens(per_chunk),
+        })
+    }
+
+    /// `clip`'s stem, `STEM_GROUP` chunks a pass, its rows from row `row0` of
+    /// the hidden matrix.
+    fn stems(
+        &self,
+        mel: &MelFrames,
+        clip: &Clip,
+        ws: &Workspace,
+        row0: usize,
+    ) -> Result<(), AudioError> {
+        let mels = self.config.mels;
+        let valid = &mel.as_slice()[..mel.valid() * mels];
         let mut first = 0;
-        while first < chunks {
-            let group = STEM_GROUP.min(chunks - first);
-            let stem = Stem::new(group, per_chunk, mels);
-            self.stem(&stem, valid, first * per_chunk, ws, first * stem_rows)?;
+        while first < clip.chunks {
+            let group = STEM_GROUP.min(clip.chunks - first);
+            let stem = Stem::new(group, clip.per_chunk, mels);
+            self.stem(
+                &stem,
+                valid,
+                first * clip.per_chunk,
+                ws,
+                row0 + first * clip.stem_rows,
+            )?;
             first += group;
         }
-        // Only the tail chunk has rows past the clip's tokens, and it is last,
-        // so the valid tokens are the matrix's first `tokens` rows.
-        for layer in &self.weights.layers {
-            self.layer(layer, &s, tokens)?;
-        }
-        self.head(&s, tokens)
+        Ok(())
     }
 
     /// Floats of every workspace slot, for a stem pass of `stem`'s shape, a
@@ -305,14 +458,14 @@ impl<'a> Tower<'a> {
             rows: freq,
             cols: channels,
         })?;
-        let out = rows(ws.get(slot::X), row0, token_rows, width)?;
+        let out = rows_of(ws.get(slot::X), row0, token_rows, width)?;
         self.weights
             .conv_out
             .forward(self.ops, flat.view(), out, token_rows)?;
         // Positions restart in every chunk: one `[tokens][width]` table per chunk.
         Ok(self.ops.bias_rows(&BiasRowsDesc {
             y: out,
-            bias: rows(&self.weights.positions, 0, tokens, width)?,
+            bias: rows_of(&self.weights.positions, 0, tokens, width)?,
             rows: stem.chunks,
             cols: tokens * width,
         })?)
@@ -409,39 +562,50 @@ impl<'a> Tower<'a> {
         Ok(linear.forward(self.ops, x.view(), y.view(), n)?)
     }
 
-    /// One pre-norm layer, in place on `s.x`: layer-normed attention and a
-    /// layer-normed GELU MLP, each added back to the residual.
-    fn layer(&self, layer: &TowerLayer, s: &Scratch<'_>, n: usize) -> Result<(), AudioError> {
+    /// One pre-norm layer, in place on the `n` rows of `s.x`: layer-normed
+    /// attention and a layer-normed GELU MLP, each added back to the
+    /// residual. Each `(row0, tokens)` of `clips` is one clip's rows, which
+    /// attend only among themselves.
+    fn layer(
+        &self,
+        layer: &TowerLayer,
+        s: &Scratch<'_>,
+        n: usize,
+        clips: &[(usize, usize)],
+    ) -> Result<(), AudioError> {
         let d = self.config.d_model;
         self.norm(&layer.attn_norm, s.x, s.h, n)?;
         self.linear(&layer.q, s.h, s.q, n)?;
         self.linear(&layer.k, s.h, s.k, n)?;
         self.linear(&layer.v, s.h, s.v, n)?;
-        self.ops.window_attention(&WindowAttnDesc {
-            out: s.att.view(),
-            q: s.q.view(),
-            k: s.k.view(),
-            v: s.v.view(),
-            n_q: n,
-            n_k: n,
-            heads: self.config.heads,
-            head_dim: self.config.head_dim,
-            // A query sees the keys of its own block of `WINDOW_TOKENS` and
-            // nothing before or after it; the last block is the remainder.
-            window: AttnWindow {
-                q_abs0: 0,
-                k_abs0: 0,
-                k_end: n,
-                chunk: WINDOW_TOKENS,
-                left_chunks: 0,
-            },
-            bias_uv: None,
-            q_dim_scale: None,
-            rel: None,
-            scale: attention_scale(self.config.head_dim),
-            ac_scale: 1.0,
-            softcap: None,
-        })?;
+        for &(row0, tokens) in clips {
+            self.ops.window_attention(&WindowAttnDesc {
+                out: rows_of(s.att, row0, tokens, d)?,
+                q: rows_of(s.q, row0, tokens, d)?,
+                k: rows_of(s.k, row0, tokens, d)?,
+                v: rows_of(s.v, row0, tokens, d)?,
+                n_q: tokens,
+                n_k: tokens,
+                heads: self.config.heads,
+                head_dim: self.config.head_dim,
+                // A query sees the keys of its own block of `WINDOW_TOKENS`
+                // and nothing before or after it; the last block is the
+                // remainder.
+                window: AttnWindow {
+                    q_abs0: 0,
+                    k_abs0: 0,
+                    k_end: tokens,
+                    chunk: WINDOW_TOKENS,
+                    left_chunks: 0,
+                },
+                bias_uv: None,
+                q_dim_scale: None,
+                rel: None,
+                scale: attention_scale(self.config.head_dim),
+                ac_scale: 1.0,
+                softcap: None,
+            })?;
+        }
         self.linear(&layer.o, s.att, s.h, n)?;
         self.residual(s.x, s.h, n * d)?;
         self.norm(&layer.ffn_norm, s.x, s.h, n)?;

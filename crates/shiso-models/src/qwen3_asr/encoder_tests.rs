@@ -224,3 +224,65 @@ fn a_tail_chunk_is_padded() {
     assert!(tail <= allowed, "tail token {tail}");
     assert!(all <= allowed, "every token {all}");
 }
+
+/// `mel`'s frames `[from, to)`.
+fn frames_of(mel: &MelFrames, from: usize, to: usize) -> MelFrames {
+    MelFrames::from_rows(mel.as_slice()[from * 128..to * 128].to_vec(), 128).expect("rows")
+}
+
+#[test]
+#[ignore = "requires a GPU device and SHISO_TEST_MODEL_QWEN3ASR"]
+fn clips_sharing_a_pass_are_each_encoded_as_alone() {
+    let Some(ops) = ops() else {
+        return;
+    };
+    let mut ran = 0;
+    for export in exports()
+        .into_iter()
+        .filter(|e| ["qwen hf", "qwen gguf q8_0", "qwen mlx"].contains(&e.name))
+    {
+        let Some((config, weights)) = load(&ops, &export) else {
+            continue;
+        };
+        let tower = Tower::new(&ops, &weights.tower, &config.audio);
+        let long = mel("two-speakers");
+        // The four clips, and pieces that must still run alone: 1.8 s is 23
+        // tokens (the 32-row tile's own sums), 0.7 s is one short chunk; and
+        // a 25-chunk piece whose last stem pass has one chunk.
+        let mels: Vec<MelFrames> = CLIPS
+            .iter()
+            .map(|c| mel(c))
+            .chain([
+                frames_of(&long, 0, 180),
+                frames_of(&long, 200, 270),
+                frames_of(&long, 300, 2_750),
+            ])
+            .collect();
+        let refs: Vec<&MelFrames> = mels.iter().collect();
+        let mut ws = crate::audio_ops::Workspace::new();
+        let many = tower.encode_many(&refs, &mut ws).expect("encodes");
+        assert_eq!(many.len(), mels.len());
+        for (i, (mel, got)) in mels.iter().zip(&many).enumerate() {
+            let alone = tower.encode(mel).expect("encodes");
+            assert_eq!(got.tokens, alone.tokens, "{} clip {i}", export.name);
+            let n = got.tokens * OUT;
+            let (a, b) = (
+                download_f32(&ops, got.buffer.view(), n).expect("reads"),
+                download_f32(&ops, alone.buffer.view(), n).expect("reads"),
+            );
+            let same = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());
+            assert!(
+                same,
+                "{} clip {i}: a shared pass moved a value",
+                export.name
+            );
+        }
+        say(&format!(
+            "{}: {} clips, each as alone",
+            export.name,
+            mels.len()
+        ));
+        ran += 1;
+    }
+    assert!(ran > 0, "no export ran");
+}

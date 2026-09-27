@@ -151,8 +151,8 @@ impl QwenOffline {
         })
     }
 
-    /// The ids of the spans `picked` of `mel`: each encoded through the tower
-    /// on its own, then all of them through the decoder together, in the
+    /// The ids of the spans `picked` of `mel`: through the tower together,
+    /// each as it would be alone, then through the decoder together, in the
     /// model's pooled batch memory - so a job holds no device memory between
     /// its steps, and the stream memories stay for the streams.
     fn transcribe(&self, mel: &MelFrames, picked: &[usize]) -> Result<Vec<Vec<u32>>, AudioError> {
@@ -168,10 +168,8 @@ impl QwenOffline {
         m.with_batch_memory(|memory| {
             let tower = Tower::new(&m.ops, &m.weights.tower, &m.config.audio);
             let started = std::time::Instant::now();
-            let mut encoded = Vec::with_capacity(chunks.len());
-            for chunk in &chunks {
-                encoded.push(tower.encode_with(chunk, &mut memory.tower)?);
-            }
+            let mels: Vec<&MelFrames> = chunks.iter().collect();
+            let encoded = tower.encode_many(&mels, &mut memory.tower)?;
             // The encodes' tail would otherwise be timed as the prefill's.
             m.ops.backend().sync()?;
             tracing::debug!(
