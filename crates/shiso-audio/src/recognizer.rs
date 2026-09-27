@@ -144,11 +144,13 @@ pub struct SpanResult {
     pub language: Option<String>,
 }
 
-/// What one [`OfflineJob::step`] transcribed.
+/// The spans one [`OfflineJob::step`] hands back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfflineBatch {
-    /// The spans transcribed, in plan order, each once. Skipped spans
-    /// (`transcribe: false`) never appear.
+    /// Spans whose text is final, continuing the plan order from the last
+    /// step's, each once over the job. Skipped spans (`transcribe: false`)
+    /// never appear. A step may transcribe spans it does not hand back yet
+    /// (a job may batch them out of order) and hand back none.
     pub spans: Vec<SpanResult>,
 }
 
@@ -156,7 +158,8 @@ pub struct OfflineBatch {
 pub trait OfflineJob: Send {
     /// Transcribes the next batch of up to
     /// [`SpeechRecognizer::batches_offline`] transcribed spans of `mel`, the
-    /// whole clip's frames, the same on every call.
+    /// whole clip's frames, the same on every call, and hands back the spans
+    /// that are then final, in plan order.
     ///
     /// # Errors
     ///
