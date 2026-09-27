@@ -38,6 +38,39 @@ fn matches_the_direct_dft() {
 
 #[test]
 fn refuses_other_sizes() {
-    assert!(Fft::new(400).is_err());
     assert!(Fft::new(1).is_err());
+    assert!(Fft::new(0).is_err());
+}
+
+#[test]
+fn a_non_power_of_two_size_matches_the_direct_transform() {
+    let n = 400;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let frame: Vec<f64> = (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            f64_of(usize::try_from(state % 2001).expect("small")) / 1000.0 - 1.0
+        })
+        .collect();
+    let fft = Fft::new(n).expect("non-power-of-two sizes are planned too");
+    assert_eq!(fft.len(), n);
+    let mut work = fft.work();
+    work.frame.copy_from_slice(&frame);
+    fft.spectrum(&mut work);
+    let (re, im): (Vec<f64>, Vec<f64>) = work.bins.iter().map(|c| (c.re, c.im)).unzip();
+    assert_eq!(re.len(), n / 2 + 1);
+    for k in 0..=n / 2 {
+        let (mut dr, mut di) = (0.0, 0.0);
+        for (t, x) in frame.iter().enumerate() {
+            let w = -2.0 * std::f64::consts::PI * f64_of(k * t) / f64_of(n);
+            dr += x * w.cos();
+            di += x * w.sin();
+        }
+        assert!(
+            (re[k] - dr).abs() < 1e-9 && (im[k] - di).abs() < 1e-9,
+            "bin {k}"
+        );
+    }
 }

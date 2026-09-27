@@ -1,6 +1,6 @@
 //! This family's weights, read out of a GGUF container.
 //!
-//! The sibling of [`super::model`]'s `import_weights`, which reads the same
+//! The sibling of `super::model`'s `import_weights`, which reads the same
 //! roles out of a `modelopt` safetensors export. Both end at one
 //! [`shiso_engine::layers::Weights`] and the stack cannot tell them apart.
 //!

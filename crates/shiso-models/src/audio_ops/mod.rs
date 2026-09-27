@@ -12,11 +12,19 @@
 //! launch.
 
 mod args;
+mod batch;
+#[cfg(test)]
+mod batch_tests;
+#[cfg(test)]
+mod decode_tests;
+mod fused;
 mod linear;
 pub mod load;
+mod runs;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod testing;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -24,12 +32,20 @@ use shiso_core::{
     Backend, CoreError, CoreResult, DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef,
 };
 
-pub use linear::{GemmType, Linear, LinearWeight};
+pub use batch::{
+    BatchPlanes, CausalAttnSegDesc, DecodeAttnBatchDesc, DecodeStepBatchDesc, EmbedTokenBatchDesc,
+    QkRopeAppendBatchDesc, QkRopeAppendSegDesc, SEQ_WORDS, SeqSpan, SeqTable,
+};
+pub use fused::{AddRmsNormDesc, ArgmaxWideDesc, QkRopeAppendDesc, argmax_wide_parts};
+pub use linear::{GemmType, Linear, LinearWeight, step_silu, step3};
+use runs::WeightView;
+pub use workspace::Workspace;
 
 use args::{
-    ArgmaxArgs, AxpyArgs, BiasRowsArgs, Conv2dArgs, DwConv1dArgs, EmbedRowArgs, GemmArgs, GluArgs,
-    GreedyStepArgs, GreedyWindowArgs, KeepArgs, LstmArgs, NormArgs, RopeArgs, TransposeArgs,
-    UnaryArgs, UnfoldArgs, WindowAttnArgs,
+    ArgmaxArgs, AxpyArgs, BiasRowsArgs, CacheAttnArgs, Conv2dArgs, DecodeStepArgs, DwConv1dArgs,
+    EmbedRowArgs, GemmArgs, GluArgs, GreedyStepArgs, GreedyWindowArgs, KeepArgs, KvAppendArgs,
+    LstmArgs, NormArgs, RopeArgs, SiluMulArgs, TransposeArgs, UnaryArgs, UnfoldArgs,
+    WindowAttnArgs,
 };
 
 /// The kernel module every launch here names.
@@ -38,6 +54,49 @@ pub const MODULE: &str = "audio";
 /// `u32` words of greedy search's device state: frame, symbols on it, done,
 /// last token, emitted, and padding.
 pub const GREEDY_STATE_WORDS: usize = 8;
+/// `u32` words of a causal decoder's device state; the words are the
+/// `DECODE_*` indices below, and the rest is padding.
+pub const DECODE_STATE_WORDS: usize = 8;
+/// Decoder state word: cache rows filled, which is the position of the token
+/// the next pass feeds. On the device only the step kernel moves it.
+///
+/// A prefill hands over by a host write: its rows are appended from a state
+/// at position 0, and the host then writes `n`, the prefill's row count, into
+/// this word with `copy_h2d` before it queues the step over the prefill's
+/// argmax (which advances by 0). No kernel adds a prefill's length, so a
+/// state whose position was not written starts decoding over row 0.
+pub const DECODE_POS: usize = 0;
+/// Decoder state word: tokens emitted.
+pub const DECODE_COUNT: usize = 1;
+/// Decoder state word: nonzero once the decoder has stopped.
+pub const DECODE_DONE: usize = 2;
+/// Decoder state word: the last token emitted, the one the next pass feeds.
+pub const DECODE_TOKEN: usize = 3;
+/// Decoder state word: whether the last step emitted.
+pub const DECODE_EMIT: usize = 4;
+/// Decoder state word: why the decoder stopped, [`DECODE_STOP_EOS`] or
+/// [`DECODE_STOP_CAP`]; 0 while it runs.
+pub const DECODE_STOP: usize = 5;
+/// [`DECODE_STOP`]'s value after an end id.
+pub const DECODE_STOP_EOS: u32 = 1;
+/// [`DECODE_STOP`]'s value after the token cap.
+pub const DECODE_STOP_CAP: u32 = 2;
+/// What the step kernel writes to a slot whose step emitted nothing.
+pub const DECODE_NO_TOKEN: u32 = u32::MAX;
+/// Splits of decode attention: with eight kv heads, 256 simdgroups over the
+/// cached rows. On an M1 Max (24-core GPU), 16 query heads over 8 kv heads
+/// of 128: 16 splits took 1.6x as long over 4096 rows, and 64 or more
+/// gained under 10% there (none with the fast exponential the kernel now
+/// takes) while the merge's share grew at short lengths.
+pub const DECODE_ATTN_SPLITS: usize = 32;
+
+/// Floats of scratch decode attention needs for `heads` query heads of
+/// `head_dim` cut into `splits`: an accumulator and a (max, sum) pair per
+/// (head, split).
+#[must_use]
+pub const fn decode_attention_partials(heads: usize, head_dim: usize, splits: usize) -> usize {
+    heads * splits * (head_dim + 2)
+}
 /// Threads per group of the elementwise, norm and layout kernels.
 const LINEAR_BLOCK: u32 = 256;
 /// Threadgroup bytes of a norm's block reduction.
@@ -49,10 +108,25 @@ const GEMM_TILE_N: usize = 64;
 /// Output rows one GEMM threadgroup produces.
 const GEMM_TILE_M: usize = 32;
 /// Output rows one threadgroup of the 64-row GEMM produces; it takes every
-/// product of more than [`GEMM_TILE_M`] rows.
+/// product of more than [`GEMM_TILE_M`] rows whose depth is a whole number of
+/// its k slices.
 const GEMM64_TILE_M: usize = 64;
+/// k one 64-row GEMM slice stages.
+const GEMM64_TILE_K: usize = 16;
 /// Queries one attention simdgroup takes at once.
 const ATTN_QUERY_BLOCK: usize = 8;
+
+/// Whether a product of `rows` rows on the audio GEMM sums each row as it
+/// would among any other rows: past [`GEMM_TILE_M`] rows every weight
+/// takes the 64-row tile or the unsplit 32-row tile, neither of which
+/// splits k, so a row's sum depends on nothing but that row. Fewer rows
+/// pick the matrix-vector kernel or a k split by the count, so rows
+/// stacked with others would be summed apart from how they are summed
+/// alone.
+#[must_use]
+pub(crate) const fn gemm_rows_sum_alone(rows: usize) -> bool {
+    rows > GEMM_TILE_M
+}
 
 /// Distance rows one relative-score simdgroup takes at once.
 const REL_ROWS: usize = 4;
@@ -73,18 +147,64 @@ const GEMM_SPLIT_BELOW: usize = 64;
 const GEMV_TG_COLS: usize = 16;
 /// Rows one matrix-vector threadgroup produces.
 const GEMV_TG_ROWS: usize = 8;
+/// Input rows one threadgroup of the multi-row matrix-vector-by-runs kernels
+/// takes: a decoder batch's rows share each weight run it reads.
+const MATVEC_ROWS: usize = 4;
+
+/// The matrix-vector-by-runs entry and grid for `rows` rows of `cols`
+/// columns: one row on the one-row kernel, more on the multi-row one, which
+/// reads each weight run once for up to [`MATVEC_ROWS`] rows and sums each
+/// row exactly as the one-row kernel does - so a row's value never depends on
+/// how many rows share its launch.
+fn matvec_launch(
+    weight: &WeightView<'_>,
+    rows: usize,
+    cols: usize,
+    silu: bool,
+) -> CoreResult<(&'static str, Extent3)> {
+    let (entry, row_groups) = match (rows > 1, silu) {
+        (false, false) => (weight.matvec_entry(), 1),
+        (false, true) => (weight.matvec_silu_entry(), 1),
+        (true, false) => (weight.matvec_rows_entry(), rows.div_ceil(MATVEC_ROWS)),
+        (true, true) => (weight.matvec_silu_rows_entry(), rows.div_ceil(MATVEC_ROWS)),
+    };
+    Ok((
+        entry,
+        Extent3::new(
+            dim(cols.div_ceil(MATVEC_COLS).max(1), "matvec.grid")?,
+            dim(row_groups, "matvec.grid")?,
+            1,
+        ),
+    ))
+}
+
+/// Output columns one matrix-vector-by-runs threadgroup produces.
+const MATVEC_COLS: usize = 4;
+/// Threads of one matrix-vector-by-runs threadgroup: two simdgroups sharing
+/// each column's k range.
+const MATVEC_BLOCK: u32 = 64;
 /// Threads of one GEMM tile, and of one matrix-vector threadgroup: four
 /// simdgroups.
 const GEMM_BLOCK: u32 = 128;
 /// Threadgroup bytes of one GEMM tile: two staged operands and the output.
 const GEMM_SMEM: u32 = 12_288;
-/// Threads of one 64-row GEMM tile: eight simdgroups.
-const GEMM64_BLOCK: u32 = 256;
-/// Threadgroup bytes of one 64-row GEMM tile: two padded staged operands and
-/// an 8x8 slot per simdgroup.
-const GEMM64_SMEM: u32 = 20_480;
+/// Threads of one 64-row GEMM tile: four simdgroups.
+const GEMM64_BLOCK: u32 = 128;
+/// Threadgroup bytes of one 64-row GEMM tile: 16 k of the activations and of
+/// the weights, each staged row padded by four floats (the Metal layout; the
+/// CUDA twin stages the same slices unpadded, in 8 KiB).
+const GEMM64_SMEM: u32 = 9_472;
 /// Largest head dimension the attention holds in a lane's registers.
 const MAX_HEAD_DIM: usize = 128;
+/// Query heads of a kv head's group one decode-attention simdgroup scores
+/// against each cached row it reads; a larger group takes more simdgroups.
+const DECODE_GROUP_TILE: usize = 2;
+/// Splits one decode-attention threadgroup runs, a simdgroup each.
+const DECODE_SPLITS_PER_TG: usize = 4;
+/// Most splits decode attention's merge is written for.
+const DECODE_MAX_SPLITS: usize = 256;
+/// Threads of the decode-attention merge, per head.
+const DECODE_MERGE_THREADS: u32 = 256;
 /// Largest depthwise conv1d the kernels are written for.
 const MAX_TAPS: usize = 16;
 
@@ -177,6 +297,20 @@ pub struct GluDesc<'a> {
     pub channels: usize,
 }
 
+/// `out[i] = silu(gate[i]) * up[i]` over `count` values; `out` may be
+/// `gate`.
+#[derive(Debug, Clone, Copy)]
+pub struct SiluMulDesc<'a> {
+    /// Destination.
+    pub out: DeviceView<'a>,
+    /// The gate projection's output.
+    pub gate: DeviceView<'a>,
+    /// The value projection's output.
+    pub up: DeviceView<'a>,
+    /// Values.
+    pub count: usize,
+}
+
 /// A row normalization; `out` may be `input`.
 #[derive(Debug, Clone, Copy)]
 pub struct NormDesc<'a> {
@@ -196,7 +330,8 @@ pub struct NormDesc<'a> {
     pub eps: f32,
 }
 
-/// The shape of a stride-2 3x3 conv2d over channels-last `[t][f][c]`.
+/// The shape of a stride-2 3x3 conv2d over channels-last `[t][f][c]`, applied
+/// to each of `batch` stacked planes on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conv2dGeometry {
     /// Input time rows.
@@ -221,14 +356,18 @@ pub struct Conv2dGeometry {
     pub in_valid: usize,
     /// Output rows at or past this are written as zero.
     pub out_valid: usize,
+    /// Independent planes, stacked: each is convolved as its own image, so
+    /// its first rows read the padding and never the previous plane's last.
+    /// The valid-row cuts apply within every plane.
+    pub batch: usize,
 }
 
 /// One stride-2 3x3 conv2d.
 #[derive(Debug, Clone, Copy)]
 pub struct Conv2dDesc<'a> {
-    /// Destination, `[t_out][f_out][c_out]`.
+    /// Destination, `[batch][t_out][f_out][c_out]`.
     pub out: DeviceView<'a>,
-    /// Source, `[t_in][f_in][c_in]`.
+    /// Source, `[batch][t_in][f_in][c_in]`.
     pub input: DeviceView<'a>,
     /// `[c_out][c_in or 1][3][3]`.
     pub weight: DeviceView<'a>,
@@ -238,6 +377,21 @@ pub struct Conv2dDesc<'a> {
     pub geometry: Conv2dGeometry,
     /// Apply `max(0, .)` to the result.
     pub relu: bool,
+}
+
+/// The patches of a full stride-2 3x3 conv2d, `[batch][t_out][f_out][9 *
+/// c_in]` with tap `kt * 3 + kf` major and the channel minor, so a GEMM
+/// against the kernel laid out `[c_out][3][3][c_in]` is the conv. Output rows
+/// past `out_valid` are zero patches, so the GEMM writes its bias there
+/// rather than the zeros the direct conv does.
+#[derive(Debug, Clone, Copy)]
+pub struct Im2colDesc<'a> {
+    /// Destination, `[batch][t_out][f_out][9 * c_in]`.
+    pub out: DeviceView<'a>,
+    /// Source, `[batch][t_in][f_in][c_in]`.
+    pub input: DeviceView<'a>,
+    /// Shape; `c_out` is unread, and a depthwise conv is refused.
+    pub geometry: Conv2dGeometry,
 }
 
 /// A depthwise conv1d over rows the caller already left-padded.
@@ -456,6 +610,162 @@ pub struct KeepDesc<'a> {
     pub count: usize,
 }
 
+/// One layer's key and value cache planes, each `[kv_heads][cap][head_dim]`
+/// f32: the layout the cache kernels read, so a layer is two views.
+#[derive(Debug, Clone, Copy)]
+pub struct CachePlanes<'a> {
+    /// Keys.
+    pub k: DeviceView<'a>,
+    /// Values.
+    pub v: DeviceView<'a>,
+    /// Key and value heads.
+    pub kv_heads: usize,
+    /// Rows each head's plane holds.
+    pub cap: usize,
+    /// Width of one head.
+    pub head_dim: usize,
+}
+
+/// Causal grouped-query attention of many queries over a cache: query `i`
+/// sits at `pos0 + i` and sees cache rows `0..=pos0 + i`.
+#[derive(Debug, Clone, Copy)]
+pub struct CausalAttnDesc<'a> {
+    /// Destination, `[n_q][heads * head_dim]`.
+    pub out: DeviceView<'a>,
+    /// Queries, as the destination.
+    pub q: DeviceView<'a>,
+    /// The layer's cache, already holding rows `0..pos0 + n_q`.
+    pub cache: CachePlanes<'a>,
+    /// Query rows.
+    pub n_q: usize,
+    /// Query heads, a multiple of the cache's kv heads.
+    pub heads: usize,
+    /// Absolute position of query row 0.
+    pub pos0: usize,
+    /// Scale on the logit.
+    pub scale: f32,
+}
+
+/// The one query of a decode step over a cache, at the decoder state's
+/// position.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeAttnDesc<'a> {
+    /// Destination, `[heads * head_dim]`.
+    pub out: DeviceView<'a>,
+    /// Scratch for the splits' partial results, at least
+    /// [`decode_attention_partials`] floats; the caller keeps one for the
+    /// whole decode rather than allocating per step.
+    pub partials: DeviceView<'a>,
+    /// Runs the cached rows are cut into, each on its own simdgroup per kv
+    /// head. The length is only known on the device, so this is fixed per
+    /// launch; [`DECODE_ATTN_SPLITS`] is the measured default.
+    pub splits: usize,
+    /// The query, as the destination.
+    pub q: DeviceView<'a>,
+    /// The layer's cache, holding rows `0..=state[DECODE_POS]`.
+    pub cache: CachePlanes<'a>,
+    /// Query heads, a multiple of the cache's kv heads.
+    pub heads: usize,
+    /// The decoder state, whose position sets the rows seen.
+    pub state: DeviceView<'a>,
+    /// Scale on the logit.
+    pub scale: f32,
+}
+
+/// New key and value rows into a layer's cache at the decoder state's
+/// position.
+#[derive(Debug, Clone, Copy)]
+pub struct KvAppendDesc<'a> {
+    /// The layer's cache.
+    pub cache: CachePlanes<'a>,
+    /// Keys, `[rows][kv_heads * head_dim]`.
+    pub k: DeviceView<'a>,
+    /// Values, as the keys.
+    pub v: DeviceView<'a>,
+    /// The decoder state; its position is the first row written.
+    pub state: DeviceView<'a>,
+    /// Rows.
+    pub rows: usize,
+}
+
+/// Half-split rotary embedding at the decoder state's position, in place.
+#[derive(Debug, Clone, Copy)]
+pub struct RopeStateDesc<'a> {
+    /// `[rows][heads * head_dim]`.
+    pub x: DeviceView<'a>,
+    /// Rows.
+    pub rows: usize,
+    /// Heads.
+    pub heads: usize,
+    /// Width of one head, even.
+    pub head_dim: usize,
+    /// Added to the state's position for row 0.
+    pub offset: usize,
+    /// Frequency base.
+    pub theta: f32,
+    /// The decoder state.
+    pub state: DeviceView<'a>,
+}
+
+/// One decision of a causal decoder.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeStepDesc<'a> {
+    /// The decoder state, read and advanced.
+    pub state: DeviceView<'a>,
+    /// One `u32` per step of a batch.
+    pub out: DeviceView<'a>,
+    /// The head's argmax, one `u32`.
+    pub ids: DeviceView<'a>,
+    /// The ids that end the text; either stops the decoder and is not
+    /// emitted.
+    pub eos: [u32; 2],
+    /// Tokens the decoder may emit in all; the last is kept.
+    pub max_tokens: usize,
+    /// Cache rows the pass before this step appended: 0 for the step over the
+    /// prefill's argmax, 1 after a decode pass.
+    pub advance: usize,
+    /// This step's slot in `out`.
+    pub slot: usize,
+}
+
+/// A `[vocab][width]` embedding table as it is stored.
+#[derive(Debug, Clone, Copy)]
+pub enum EmbedTable<'a> {
+    /// A dense or `Q8_0` table, read as the audio GEMM reads that weight type.
+    Dense {
+        /// Storage.
+        dtype: GemmType,
+        /// The rows.
+        rows: DeviceView<'a>,
+    },
+    /// An 8-bit affine table: per `group` elements a bf16 scale and bias.
+    Affine8 {
+        /// The bytes, four to a little-endian `u32`, `[vocab][width]`.
+        words: DeviceView<'a>,
+        /// bf16, `[vocab][width / group]`.
+        scales: DeviceView<'a>,
+        /// bf16, as the scales.
+        biases: DeviceView<'a>,
+        /// Elements per group.
+        group: usize,
+    },
+}
+
+/// The f32 embedding row of the decoder state's last token.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbedTokenDesc<'a> {
+    /// `[width]`.
+    pub out: DeviceView<'a>,
+    /// The table.
+    pub table: EmbedTable<'a>,
+    /// The decoder state.
+    pub state: DeviceView<'a>,
+    /// Row width.
+    pub width: usize,
+    /// Rows in the table.
+    pub vocab: usize,
+}
+
 /// `n` as `f64`; exact for every count a model here holds.
 #[expect(
     clippy::cast_precision_loss,
@@ -498,11 +808,75 @@ fn limit(ok: bool, key: &'static str, value: usize) -> CoreResult<()> {
     }
 }
 
+/// Refuses a view shorter than `bytes`.
+fn need_bytes(view: DeviceView<'_>, bytes: usize, field: &'static str) -> CoreResult<()> {
+    let want = u64::try_from(bytes).unwrap_or(u64::MAX);
+    if view.len() < want {
+        return Err(CoreError::ShapeMismatch {
+            field,
+            expected: want,
+            got: view.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses cache planes shorter than their geometry, or a geometry no cache
+/// kernel is written for.
+fn need_cache(c: &CachePlanes<'_>, heads: usize, what: &'static str) -> CoreResult<()> {
+    limit(
+        (1..=MAX_HEAD_DIM).contains(&c.head_dim),
+        "cache.head_dim",
+        c.head_dim,
+    )?;
+    limit(
+        c.kv_heads > 0 && heads.is_multiple_of(c.kv_heads),
+        what,
+        heads,
+    )?;
+    let plane = c.kv_heads * c.cap * c.head_dim;
+    need(c.k, plane, "cache.k")?;
+    need(c.v, plane, "cache.v")
+}
+
+/// Refuses a view a four-wide read cannot start at.
+fn aligned16(view: DeviceView<'_>, field: &'static str) -> CoreResult<()> {
+    if view.offset().is_multiple_of(16) {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidValue {
+            key: field,
+            value: format!("offset {} is not 16-byte aligned", view.offset()),
+        })
+    }
+}
+
 fn linear_grid(count: usize) -> CoreResult<Extent3> {
     Ok(Extent3::linear(dim(
         count.div_ceil(LINEAR_BLOCK as usize).max(1),
         "grid",
     )?))
+}
+
+/// A GEMM's bindings: the arguments, the destination, the input, the weight,
+/// the bias (the input when there is none), then an affine weight's scales
+/// and biases.
+fn gemm_bind<'a>(
+    args: &'a GemmArgs,
+    target: DeviceView<'a>,
+    input: DeviceView<'a>,
+    weight: &WeightView<'a>,
+    bias: Option<DeviceView<'a>>,
+) -> Vec<KernelArg<'a>> {
+    let mut b = vec![
+        KernelArg::Bytes(bytemuck::bytes_of(args)),
+        KernelArg::Buffer(target),
+        KernelArg::Buffer(input),
+        KernelArg::Buffer(weight.main()),
+        KernelArg::Buffer(bias.unwrap_or(input)),
+    ];
+    b.extend(weight.aux());
+    b
 }
 
 /// Launches the audio kernel set on one backend.
@@ -536,6 +910,21 @@ impl Ops {
         let buffer = shiso_core::alloc(&self.backend, bytes)?;
         self.backend.fill_zero(buffer.view())?;
         Ok(buffer)
+    }
+
+    /// A buffer of `floats` f32 values whose contents are undefined, for
+    /// one every element of which a kernel writes before any is read:
+    /// [`Self::scratch`]'s fill costs a pass over the memory, and on a fresh
+    /// buffer that pass is also its first touch.
+    ///
+    /// # Errors
+    ///
+    /// Allocation failures from the backend.
+    pub fn scratch_uninit(&self, floats: usize) -> CoreResult<DeviceBuffer> {
+        let bytes = u64::try_from(floats.max(1))
+            .unwrap_or(u64::MAX)
+            .saturating_mul(4);
+        shiso_core::alloc(&self.backend, bytes)
     }
 
     fn launch(
@@ -696,6 +1085,32 @@ impl Ops {
         )
     }
 
+    /// A SiLU-gated MLP's product of its gate and value projections.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] for a short view, or the launch's error.
+    pub fn silu_mul(&self, d: &SiluMulDesc<'_>) -> CoreResult<()> {
+        need(d.out, d.count, "silu_mul.out")?;
+        need(d.gate, d.count, "silu_mul.gate")?;
+        need(d.up, d.count, "silu_mul.up")?;
+        let args = SiluMulArgs {
+            count: dim(d.count, "silu_mul.count")?,
+        };
+        self.launch(
+            "kernel_audio_silu_mul_f32",
+            linear_grid(d.count)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.gate),
+                KernelArg::Buffer(d.up),
+            ],
+        )
+    }
+
     fn norm(&self, d: &NormDesc<'_>, entry: &'static str, layer: bool) -> CoreResult<()> {
         // A zero-width row has nothing to normalise and no first value for the
         // layer norm's pivot; the kernel would read past an empty view.
@@ -779,19 +1194,38 @@ impl Ops {
         bias: Option<DeviceView<'_>>,
         shape: (usize, usize, usize),
     ) -> CoreResult<()> {
+        self.gemm_of(WeightView::Dense(dtype, weight), out, input, bias, shape)
+    }
+
+    /// [`Self::gemm`] over any weight the audio set reads. An affine weight
+    /// has no matrix-vector kernel of the old order, so a few rows of one
+    /// take the 32-row tile.
+    pub(crate) fn gemm_of(
+        &self,
+        weight: WeightView<'_>,
+        out: DeviceView<'_>,
+        input: DeviceView<'_>,
+        bias: Option<DeviceView<'_>>,
+        shape: (usize, usize, usize),
+    ) -> CoreResult<()> {
         // A few rows go to the matrix-vector kernel, which spreads the
         // columns over enough threadgroups to stream the weights at the
         // memory's rate; more rows go to the tiled GEMM.
-        let skinny = shape.0 <= GEMV_MAX_ROWS;
+        let skinny = shape.0 <= GEMV_MAX_ROWS && matches!(weight, WeightView::Dense(..));
         let tall = shape.0 > GEMM_TILE_M;
-        let entry = if skinny {
-            dtype.gemv_entry()
-        } else if tall {
-            dtype.entry64()
-        } else {
-            dtype.entry()
+        // The 64-row tile takes whole slices of an aligned k and never
+        // splits; any other tall product takes the 32-row tile, also
+        // unsplit, whose every element is summed exactly as the 64-row
+        // tile's would be.
+        let wide =
+            tall && shape.2.is_multiple_of(GEMM64_TILE_K) && input.offset().is_multiple_of(16);
+        let (entry32, entry64) = weight.tiled_entries();
+        let entry = match weight {
+            WeightView::Dense(dtype, _) if skinny => dtype.gemv_entry(),
+            _ if wide => entry64,
+            _ => entry32,
         };
-        let (tile_m, block, smem) = if tall {
+        let (tile_m, block, smem) = if wide {
             (GEMM64_TILE_M, GEMM64_BLOCK, GEMM64_SMEM)
         } else {
             (GEMM_TILE_M, GEMM_BLOCK, GEMM_SMEM)
@@ -837,13 +1271,7 @@ impl Ops {
                 grid,
                 GEMM_BLOCK,
                 0,
-                &[
-                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                    KernelArg::Buffer(out),
-                    KernelArg::Buffer(input),
-                    KernelArg::Buffer(weight),
-                    KernelArg::Buffer(bias.unwrap_or(input)),
-                ],
+                &gemm_bind(&args, out, input, &weight, bias),
             );
         }
         let grid = Extent3::new(
@@ -867,13 +1295,7 @@ impl Ops {
             grid,
             block,
             smem,
-            &[
-                KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                KernelArg::Buffer(target),
-                KernelArg::Buffer(input),
-                KernelArg::Buffer(weight),
-                KernelArg::Buffer(bias.unwrap_or(input)),
-            ],
+            &gemm_bind(&args, target, input, &weight, bias),
         )?;
         let Some(parts) = parts else {
             return Ok(());
@@ -892,6 +1314,56 @@ impl Ops {
         )
     }
 
+    /// `y = x * W^T (+ b)` for a decoder step's few rows: each lane dots
+    /// runs of eight consecutive weights, which streams a row-major weight at
+    /// about twice the rate [`Self::gemm`]'s matrix-vector kernel does. The
+    /// summation order is not that kernel's, so a model takes one or the
+    /// other for a given product, never a mix. More than one row takes the
+    /// multi-row kernel, which reads each weight run once for up to four
+    /// rows and gives each row the one-row kernel's value, so a decoder's
+    /// batch of rows costs about one row's weight traffic.
+    ///
+    /// Returns `false`, launching nothing, when `k` is not a whole number of
+    /// runs or a view is not 16-byte aligned, so the caller takes
+    /// [`Self::gemm`] instead.
+    pub(crate) fn matvec(
+        &self,
+        weight: WeightView<'_>,
+        out: DeviceView<'_>,
+        input: DeviceView<'_>,
+        bias: Option<DeviceView<'_>>,
+        shape: (usize, usize, usize),
+    ) -> CoreResult<bool> {
+        let (rows, cols, depth) = shape;
+        if !weight.runs_fit(depth) || !input.offset().is_multiple_of(16) {
+            return Ok(false);
+        }
+        need(out, rows * cols, "matvec.y")?;
+        need(input, rows * depth, "matvec.x")?;
+        if let Some(b) = bias {
+            need(b, cols, "matvec.bias")?;
+        }
+        let args = GemmArgs {
+            m: dim(rows, "matvec.m")?,
+            n: dim(cols, "matvec.n")?,
+            k: dim(depth, "matvec.k")?,
+            flags: u32::from(bias.is_some()),
+            k_chunk: dim(depth, "matvec.k")?,
+            splits: 1,
+        };
+        let (entry, grid) = matvec_launch(&weight, rows, cols, false)?;
+        let mut bind = vec![
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out),
+            KernelArg::Buffer(input),
+            KernelArg::Buffer(weight.main()),
+            KernelArg::Buffer(bias.unwrap_or(input)),
+        ];
+        bind.extend(weight.aux());
+        self.launch(entry, grid, MATVEC_BLOCK, 0, &bind)?;
+        Ok(true)
+    }
+
     /// One stride-2 3x3 conv2d.
     ///
     /// # Errors
@@ -899,7 +1371,7 @@ impl Ops {
     /// [`CoreError::ShapeMismatch`] for a short view, or the launch's error.
     pub fn conv2d_s2(&self, d: &Conv2dDesc<'_>) -> CoreResult<()> {
         let g = &d.geometry;
-        let total = g.t_out * g.f_out * g.c_out;
+        let total = g.batch * g.t_out * g.f_out * g.c_out;
         let per = if g.depthwise { 1 } else { g.c_in };
         limit(
             !g.depthwise || g.c_in == g.c_out,
@@ -907,7 +1379,7 @@ impl Ops {
             g.c_in,
         )?;
         need(d.out, total, "conv2d.out")?;
-        need(d.input, g.t_in * g.f_in * g.c_in, "conv2d.input")?;
+        need(d.input, g.batch * g.t_in * g.f_in * g.c_in, "conv2d.input")?;
         need(d.weight, g.c_out * per * 9, "conv2d.weight")?;
         if let Some(b) = d.bias {
             need(b, g.c_out, "conv2d.bias")?;
@@ -926,6 +1398,7 @@ impl Ops {
             relu: u32::from(d.relu),
             in_valid: dim(g.in_valid, "conv2d.in_valid")?,
             out_valid: dim(g.out_valid, "conv2d.out_valid")?,
+            batch: dim(g.batch, "conv2d.batch")?,
         };
         self.launch(
             "kernel_audio_conv2d_s2_f32",
@@ -938,6 +1411,55 @@ impl Ops {
                 KernelArg::Buffer(d.input),
                 KernelArg::Buffer(d.weight),
                 KernelArg::Buffer(d.bias.unwrap_or(d.weight)),
+            ],
+        )
+    }
+
+    /// The patches of a stride-2 3x3 conv2d, for the conv as a GEMM.
+    ///
+    /// The direct conv takes each output's whole receptive field in one
+    /// thread, which is fine for one or a few input channels; with hundreds
+    /// it reads each weight once per output position and runs at a small
+    /// fraction of the device. The patches cost one copy and let the tiled
+    /// GEMM do the arithmetic.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a depthwise geometry or a patch matrix
+    /// past `u32` elements, [`CoreError::ShapeMismatch`] for a short view, or
+    /// the launch's error.
+    pub fn im2col_s2(&self, d: &Im2colDesc<'_>) -> CoreResult<()> {
+        let g = &d.geometry;
+        limit(!g.depthwise, "im2col.depthwise", 1)?;
+        let total = g.batch * g.t_out * g.f_out * 9 * g.c_in;
+        dim(total, "im2col.total")?;
+        need(d.out, total, "im2col.out")?;
+        need(d.input, g.batch * g.t_in * g.f_in * g.c_in, "im2col.input")?;
+        let args = Conv2dArgs {
+            t_in: dim(g.t_in, "conv2d.t_in")?,
+            f_in: dim(g.f_in, "conv2d.f_in")?,
+            c_in: dim(g.c_in, "conv2d.c_in")?,
+            t_out: dim(g.t_out, "conv2d.t_out")?,
+            f_out: dim(g.f_out, "conv2d.f_out")?,
+            c_out: dim(g.c_out, "conv2d.c_out")?,
+            pad_t: dim(g.pad_t, "conv2d.pad_t")?,
+            pad_f: dim(g.pad_f, "conv2d.pad_f")?,
+            depthwise: 0,
+            has_bias: 0,
+            relu: 0,
+            in_valid: dim(g.in_valid, "conv2d.in_valid")?,
+            out_valid: dim(g.out_valid, "conv2d.out_valid")?,
+            batch: dim(g.batch, "conv2d.batch")?,
+        };
+        self.launch(
+            "kernel_audio_im2col_s2_f32",
+            linear_grid(total)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.input),
             ],
         )
     }
@@ -1316,5 +1838,267 @@ impl Ops {
                 KernelArg::Buffer(d.state),
             ],
         )
+    }
+
+    /// Causal grouped-query attention of `n_q` queries over a layer's cache,
+    /// which must already hold every row they see.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a head wider than 128, query heads
+    /// that are not a multiple of the kv heads, or queries past the cache;
+    /// [`CoreError::ShapeMismatch`] for a short view; or the launch's error.
+    pub fn causal_attention(&self, d: &CausalAttnDesc<'_>) -> CoreResult<()> {
+        need_cache(&d.cache, d.heads, "causal_attention.heads")?;
+        limit(
+            d.pos0 + d.n_q <= d.cache.cap,
+            "causal_attention.pos0",
+            d.pos0 + d.n_q,
+        )?;
+        let hd = d.cache.head_dim;
+        let width = d.heads * hd;
+        need(d.out, d.n_q * width, "causal_attention.out")?;
+        need(d.q, d.n_q * width, "causal_attention.q")?;
+        let args = CacheAttnArgs {
+            n_q: dim(d.n_q, "causal_attention.n_q")?,
+            heads: dim(d.heads, "causal_attention.heads")?,
+            kv_heads: dim(d.cache.kv_heads, "causal_attention.kv_heads")?,
+            head_dim: dim(hd, "causal_attention.head_dim")?,
+            pos0: dim(d.pos0, "causal_attention.pos0")?,
+            cap: dim(d.cache.cap, "causal_attention.cap")?,
+            scale: d.scale,
+            splits: 0,
+        };
+        self.launch(
+            "kernel_audio_causal_attn_f32",
+            Extent3::new(
+                dim(d.heads.max(1), "causal_attention.heads")?,
+                dim(
+                    d.n_q.div_ceil(ATTN_QUERY_BLOCK).max(1),
+                    "causal_attention.n_q",
+                )?,
+                1,
+            ),
+            32,
+            dim(attention_smem(hd), "causal_attention.smem")?,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.q),
+                KernelArg::Buffer(d.cache.k),
+                KernelArg::Buffer(d.cache.v),
+            ],
+        )
+    }
+
+    /// The one query of a decode step over cache rows
+    /// `0..=state[DECODE_POS]`, the length read on the device so a batch of
+    /// steps needs no host value: the rows are cut into `splits` runs scored
+    /// side by side, then merged in split order.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a head that is not a multiple of four
+    /// up to 128, query heads that are not a multiple of the kv heads, splits
+    /// outside `1..=256`, or a view not 16-byte aligned;
+    /// [`CoreError::ShapeMismatch`] for a short view; or the launch's error.
+    pub fn decode_attention(&self, d: &DecodeAttnDesc<'_>) -> CoreResult<()> {
+        need_cache(&d.cache, d.heads, "decode_attention.heads")?;
+        let hd = d.cache.head_dim;
+        limit(hd.is_multiple_of(4), "decode_attention.head_dim", hd)?;
+        limit(
+            (1..=DECODE_MAX_SPLITS).contains(&d.splits),
+            "decode_attention.splits",
+            d.splits,
+        )?;
+        let width = d.heads * hd;
+        need(d.out, width, "decode_attention.out")?;
+        need(d.q, width, "decode_attention.q")?;
+        need(
+            d.partials,
+            decode_attention_partials(d.heads, hd, d.splits),
+            "decode_attention.partials",
+        )?;
+        need(d.state, DECODE_STATE_WORDS, "decode_attention.state")?;
+        for (view, field) in [
+            (d.out, "decode_attention.out"),
+            (d.partials, "decode_attention.partials"),
+            (d.q, "decode_attention.q"),
+            (d.cache.k, "decode_attention.cache.k"),
+            (d.cache.v, "decode_attention.cache.v"),
+        ] {
+            aligned16(view, field)?;
+        }
+        let args = CacheAttnArgs {
+            n_q: 1,
+            heads: dim(d.heads, "decode_attention.heads")?,
+            kv_heads: dim(d.cache.kv_heads, "decode_attention.kv_heads")?,
+            head_dim: dim(hd, "decode_attention.head_dim")?,
+            pos0: 0,
+            cap: dim(d.cache.cap, "decode_attention.cap")?,
+            scale: d.scale,
+            splits: dim(d.splits, "decode_attention.splits")?,
+        };
+        self.launch(
+            "kernel_audio_decode_attn_f32",
+            Extent3::new(
+                args.kv_heads,
+                dim(
+                    d.splits.div_ceil(DECODE_SPLITS_PER_TG),
+                    "decode_attention.splits",
+                )?,
+                dim(
+                    (d.heads / d.cache.kv_heads).div_ceil(DECODE_GROUP_TILE),
+                    "decode_attention.group",
+                )?,
+            ),
+            dim(32 * DECODE_SPLITS_PER_TG, "decode_attention.block")?,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.partials),
+                KernelArg::Buffer(d.q),
+                KernelArg::Buffer(d.cache.k),
+                KernelArg::Buffer(d.cache.v),
+                KernelArg::Buffer(d.state),
+            ],
+        )?;
+        self.launch(
+            "kernel_audio_decode_attn_merge_f32",
+            Extent3::linear(args.heads),
+            DECODE_MERGE_THREADS,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.partials),
+            ],
+        )
+    }
+
+    /// `rows` new key and value rows into a layer's cache from the decoder
+    /// state's position on. The position is not moved: every layer of a pass
+    /// appends at the same one, and the step kernel moves it after. A row
+    /// that would land at or past the capacity is dropped on the device, so
+    /// the caller grows the cache before it queues rows that reach it.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] for a short view, or the launch's error.
+    pub fn kv_append(&self, d: &KvAppendDesc<'_>) -> CoreResult<()> {
+        need_cache(&d.cache, d.cache.kv_heads, "kv_append.kv_heads")?;
+        let count = d.rows * d.cache.kv_heads * d.cache.head_dim;
+        need(d.k, count, "kv_append.k")?;
+        need(d.v, count, "kv_append.v")?;
+        need(d.state, DECODE_STATE_WORDS, "kv_append.state")?;
+        let args = KvAppendArgs {
+            rows: dim(d.rows, "kv_append.rows")?,
+            kv_heads: dim(d.cache.kv_heads, "kv_append.kv_heads")?,
+            head_dim: dim(d.cache.head_dim, "kv_append.head_dim")?,
+            cap: dim(d.cache.cap, "kv_append.cap")?,
+        };
+        self.launch(
+            "kernel_audio_kv_append_f32",
+            linear_grid(count)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.cache.k),
+                KernelArg::Buffer(d.cache.v),
+                KernelArg::Buffer(d.k),
+                KernelArg::Buffer(d.v),
+                KernelArg::Buffer(d.state),
+            ],
+        )
+    }
+
+    /// Half-split rotary embedding at the decoder state's position plus
+    /// `offset`, read on the device.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for an odd head,
+    /// [`CoreError::ShapeMismatch`] for a short view, or the launch's error.
+    pub fn rope_half_at_state(&self, d: &RopeStateDesc<'_>) -> CoreResult<()> {
+        limit(
+            d.head_dim.is_multiple_of(2),
+            "rope_half_at_state.head_dim",
+            d.head_dim,
+        )?;
+        let total = d.rows * d.heads * d.head_dim;
+        need(d.x, total, "rope_half_at_state.x")?;
+        need(d.state, DECODE_STATE_WORDS, "rope_half_at_state.state")?;
+        let args = RopeArgs {
+            rows: dim(d.rows, "rope_half_at_state.rows")?,
+            heads: dim(d.heads, "rope_half_at_state.heads")?,
+            head_dim: dim(d.head_dim, "rope_half_at_state.head_dim")?,
+            pos0: dim(d.offset, "rope_half_at_state.offset")?,
+            theta: d.theta,
+        };
+        self.launch(
+            "kernel_audio_rope_half_state_f32",
+            linear_grid(total / 2)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.x),
+                KernelArg::Buffer(d.state),
+            ],
+        )
+    }
+
+    /// One decision of a causal decoder over the head's argmax, on the
+    /// device: the position moves by `advance`, an end id stops the decoder
+    /// unemitted, any other id is emitted to `out[slot]` and becomes the last
+    /// token, and the `max_tokens`-th stops it. A step on a stopped decoder
+    /// writes [`DECODE_NO_TOKEN`], lowers the emit flag and changes nothing
+    /// else, so a batch can run past the stop.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a zero token cap or an advance past
+    /// one row, [`CoreError::ShapeMismatch`] for a short view, or the
+    /// launch's error.
+    pub fn decode_step(&self, d: &DecodeStepDesc<'_>) -> CoreResult<()> {
+        limit(d.max_tokens > 0, "decode_step.max_tokens", d.max_tokens)?;
+        limit(d.advance <= 1, "decode_step.advance", d.advance)?;
+        need(d.state, DECODE_STATE_WORDS, "decode_step.state")?;
+        need(d.out, d.slot + 1, "decode_step.out")?;
+        need(d.ids, 1, "decode_step.ids")?;
+        let args = DecodeStepArgs {
+            eos0: d.eos[0],
+            eos1: d.eos[1],
+            max_tokens: dim(d.max_tokens, "decode_step.max_tokens")?,
+            advance: dim(d.advance, "decode_step.advance")?,
+            slot: dim(d.slot, "decode_step.slot")?,
+        };
+        self.launch(
+            "kernel_audio_decode_step_u32",
+            Extent3::new(1, 1, 1),
+            1,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.state),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.ids),
+            ],
+        )
+    }
+
+    /// The f32 embedding row of the decoder state's last token, dequantised
+    /// from the table's own storage; zeros for a token past the table.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a width that is not whole blocks or
+    /// groups of the table's storage, [`CoreError::ShapeMismatch`] for a
+    /// short view, or the launch's error.
+    pub fn embed_token(&self, d: &EmbedTokenDesc<'_>) -> CoreResult<()> {
+        need(d.out, d.width, "embed_token.out")?;
+        need(d.state, DECODE_STATE_WORDS, "embed_token.state")?;
+        self.embed_rows(d.out, d.table, d.state, (d.width, d.vocab, 1), false)
     }
 }

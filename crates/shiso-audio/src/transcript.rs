@@ -132,25 +132,66 @@ impl SpeakerActivity {
     }
 }
 
-/// Groups pieces into words.
-#[must_use]
-pub fn words(pieces: &[TimedPiece], frame_secs: f64) -> Vec<Word> {
-    // (text, first frame, last frame)
+/// Pieces grouped into words: `(text, first frame, last frame)`, empty
+/// words dropped. A piece starts a word after a space, or in another chunk
+/// of `chunk_ends` than the word before it.
+fn spans(pieces: &[TimedPiece], chunk_ends: &[u32]) -> Vec<(String, u32, u32)> {
+    let chunk_of = |frame: u32| chunk_ends.partition_point(|&end| end <= frame);
     let mut out: Vec<(String, u32, u32)> = Vec::new();
     for p in pieces {
-        if out.is_empty() || p.text.starts_with(' ') {
+        let new_chunk = out
+            .last()
+            .is_some_and(|last| chunk_of(last.1) != chunk_of(p.frame));
+        if out.is_empty() || p.text.starts_with(' ') || new_chunk {
             out.push((p.text.trim().to_owned(), p.frame, p.frame));
         } else if let Some(last) = out.last_mut() {
             last.0.push_str(p.text.trim_end());
             last.2 = p.frame;
         }
     }
-    out.into_iter()
-        .filter(|(text, _, _)| !text.is_empty())
-        .map(|(text, first, last)| Word {
-            text,
-            start: f64::from(first) * frame_secs,
-            end: f64::from(last + 1) * frame_secs,
+    out.retain(|(text, _, _)| !text.is_empty());
+    out
+}
+
+/// Groups pieces into words, each ending one frame after its last piece.
+#[must_use]
+pub fn words(pieces: &[TimedPiece], frame_secs: f64) -> Vec<Word> {
+    words_in_chunks(pieces, frame_secs, &[])
+}
+
+/// Groups the pieces of a recognizer that transcribes in chunks ending at
+/// `chunk_ends` (frames, increasing; see
+/// [`crate::RecognizerStream::chunk_ends`]) into words.
+///
+/// Such a recognizer places each piece somewhere inside its chunk and knows
+/// nothing of where a word stops, so a word ends where the next word of its
+/// chunk starts, and a chunk's last word at the chunk's end: a one-word turn
+/// then spans its turn rather than one frame, and a segment cut at a turn
+/// ends at the cut. No word spans two chunks: text written without spaces
+/// that runs across a join is two words, each timed (and given a speaker)
+/// by its own chunk. A word past every chunk end, and every word when
+/// `chunk_ends` is empty, ends one frame after its last piece, as [`words`]
+/// has it.
+#[must_use]
+pub fn words_in_chunks(pieces: &[TimedPiece], frame_secs: f64, chunk_ends: &[u32]) -> Vec<Word> {
+    let spans = spans(pieces, chunk_ends);
+    let chunk_of = |frame: u32| chunk_ends.partition_point(|&end| end <= frame);
+    (0..spans.len())
+        .map(|i| {
+            let (text, first, last) = &spans[i];
+            let chunk = chunk_of(*first);
+            let end = match chunk_ends.get(chunk) {
+                None => last + 1,
+                Some(&chunk_end) => match spans.get(i + 1) {
+                    Some((_, next, _)) if chunk_of(*next) == chunk => *next,
+                    _ => chunk_end,
+                },
+            };
+            Word {
+                text: text.clone(),
+                start: f64::from(*first) * frame_secs,
+                end: f64::from(end) * frame_secs,
+            }
         })
         .collect()
 }
@@ -265,6 +306,56 @@ pub fn assign_speakers(words: &[Word], activity: &SpeakerActivity) -> Vec<usize>
         previous = who;
     }
     out
+}
+
+/// The speaker of each word of a transcript recognised in chunks cut at
+/// `cuts` (seconds, increasing): the speaker who is dominant, as
+/// [`crate::chunks::turn_cuts`] reckons it, over most of the chunk the word's
+/// middle falls in. A chunking recognizer's word times are interpolated
+/// inside their chunk, so a word near a turn's edge can sit in the silence
+/// the cut was put in, where [`assign_speakers`] would give it the previous
+/// voice; the chunk is the turn, so its words are that turn's. A chunk where
+/// nobody is dominant keeps [`assign_speakers`]' answer for its words.
+#[must_use]
+pub fn assign_speakers_by_chunk(
+    words: &[Word],
+    activity: &SpeakerActivity,
+    cuts: &[f64],
+) -> Vec<usize> {
+    let fs = activity.frame_secs();
+    let chunk_of = |secs: f64| cuts.partition_point(|&cut| cut <= secs);
+    let mut held = vec![vec![0usize; activity.speakers()]; cuts.len() + 1];
+    for t in 0..activity.frames() {
+        let mut who = None;
+        let mut loudest = crate::chunks::DOMINANT_ABOVE;
+        for s in 0..activity.speakers() {
+            let p = activity.prob(t, s);
+            if p > loudest {
+                loudest = p;
+                who = Some(s);
+            }
+        }
+        if let Some(s) = who {
+            held[chunk_of((f64_of(t) + 0.5) * fs)][s] += 1;
+        }
+    }
+    // The most frames, the lower index on a tie.
+    let owners: Vec<Option<usize>> = held
+        .iter()
+        .map(|count| {
+            let (who, frames) =
+                count.iter().enumerate().fold(
+                    (0, 0),
+                    |best, (s, &n)| if n > best.1 { (s, n) } else { best },
+                );
+            (frames > 0).then_some(who)
+        })
+        .collect();
+    assign_speakers(words, activity)
+        .into_iter()
+        .zip(words)
+        .map(|(own, w)| owners[chunk_of(f64::midpoint(w.start, w.end))].unwrap_or(own))
+        .collect()
 }
 
 /// Segments of consecutive same-speaker words.

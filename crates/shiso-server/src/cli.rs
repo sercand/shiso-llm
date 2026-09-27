@@ -421,8 +421,12 @@ pub struct ServeArgs {
     ///
     /// Checked on the decoded length, before any mel frame is computed. A
     /// tower's own limit still applies beneath it.
-    #[arg(long, env = "SHISO_AUDIO_MAX_SECONDS", default_value = "1800")]
+    #[arg(long, env = "SHISO_AUDIO_MAX_SECONDS", default_value = "7200")]
     pub audio_max_seconds: NonZeroU32,
+    /// The largest transcription upload, in MiB. Only the transcription
+    /// routes take it; every other route keeps the JSON body limit.
+    #[arg(long, env = "SHISO_AUDIO_MAX_UPLOAD_MB", default_value = "512")]
+    pub audio_max_upload_mb: NonZeroU32,
     /// Allow decoding audio containers other than WAV by spawning the decoder
     /// `--video-ffmpeg-path` names.
     #[arg(long, env = "SHISO_AUDIO_ALLOW_FFMPEG", default_value_t = false)]
@@ -431,6 +435,12 @@ pub struct ServeArgs {
     /// Serves `/v1/audio/transcriptions`.
     #[arg(long, env = "SHISO_ASR_MODEL")]
     pub asr_model: Option<PathBuf>,
+    /// The audio-tower GGUF (an `mmproj-*.gguf`) for a recognizer whose GGUF
+    /// export keeps its tower apart from the text model. Without it the one
+    /// mmproj beside `--asr-model` with the same quantisation suffix is taken,
+    /// and none or several is refused. Needs `--asr-model`.
+    #[arg(long, env = "SHISO_ASR_MMPROJ")]
+    pub asr_mmproj: Option<PathBuf>,
     /// The name the recognizer answers to in a transcription's `model` field.
     /// Defaults to the last component of `--asr-model`, extension removed.
     #[arg(long, env = "SHISO_ASR_ID")]
@@ -447,6 +457,35 @@ pub struct ServeArgs {
     /// Transcriptions advanced at once; the rest wait in the queue.
     #[arg(long, env = "SHISO_AUDIO_MAX_STREAMS", default_value_t = 4)]
     pub audio_max_streams: usize,
+    /// Chunks an offline transcription decodes at once, on a recognizer that
+    /// batches: one weight read per step serves this many. Streaming
+    /// requests decode one at a time whatever it is.
+    #[arg(long, env = "SHISO_ASR_BATCH", default_value_t = 8)]
+    pub asr_batch: usize,
+    /// Whether an offline transcription with a diarizer loaded leaves out
+    /// silences of 3 s or more where no speaker is active. Skipped audio
+    /// yields no text: speech the diarizer misses there is lost.
+    /// `--asr-skip-silence=false` transcribes them.
+    #[arg(
+        long,
+        env = "SHISO_ASR_SKIP_SILENCE",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        action = clap::ArgAction::Set
+    )]
+    pub asr_skip_silence: bool,
+    /// The shortest clip, in seconds, that a non-streaming transcription
+    /// plans whole and decodes in batches, on a recognizer that batches;
+    /// shorter clips keep the chunk-by-chunk path. 0 sends every
+    /// non-streaming transcription offline.
+    #[arg(
+        long,
+        env = "SHISO_ASR_OFFLINE_MIN_SECS",
+        default_value_t = crate::audio::DEFAULT_OFFLINE_MIN_SECS
+    )]
+    pub asr_offline_min_secs: u32,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -501,6 +540,9 @@ pub enum ConfigError {
     /// A diarizer was named with no recognizer to attribute speech from.
     #[error("--diarization-model needs --asr-model: a diarizer labels a transcript")]
     DiarizerWithoutRecognizer,
+    /// An audio tower was named with no recognizer to load it into.
+    #[error("--asr-mmproj needs --asr-model: it is the tower of the recognizer's text model")]
+    MmprojWithoutRecognizer,
     /// A share that is not in `(0, 1]`.
     #[error("--{flag} {value} is not a share in (0, 1]")]
     NotAShare {
@@ -629,10 +671,16 @@ impl ServeArgs {
         if self.diarization_model.is_some() && self.asr_model.is_none() {
             return Err(ConfigError::DiarizerWithoutRecognizer);
         }
+        if self.asr_mmproj.is_some() && self.asr_model.is_none() {
+            return Err(ConfigError::MmprojWithoutRecognizer);
+        }
         if self.audio_max_streams == 0 {
             return Err(ConfigError::Zero {
                 flag: "audio-max-streams",
             });
+        }
+        if self.asr_batch == 0 {
+            return Err(ConfigError::Zero { flag: "asr-batch" });
         }
         // A head with no depth is refused here: it is a gigabyte of weights
         // made resident that nothing will ever ask a question, and no arm can
@@ -933,6 +981,14 @@ impl ServeArgs {
             policy = policy.with_timeout_secs(seconds);
         }
         Some(policy)
+    }
+
+    /// The transcription routes' body limit, in bytes.
+    #[must_use]
+    pub fn audio_max_upload_bytes(&self) -> usize {
+        usize::try_from(self.audio_max_upload_mb.get())
+            .unwrap_or(usize::MAX)
+            .saturating_mul(1024 * 1024)
     }
 
     /// The audio decode limits these flags describe.

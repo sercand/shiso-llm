@@ -157,9 +157,23 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
     };
     let backend = open_audio_backend(args)?;
     let started = std::time::Instant::now();
-    let recognizer = shiso_models::audio_registry::open_speech_recognizer(asr, &backend)
-        .with_context(|| format!("opening the speech recognizer at {}", asr.display()))?;
-    if !recognizer.lookaheads().contains(&args.asr_lookahead) {
+    let recognizer = shiso_models::audio_registry::open_speech_recognizer(
+        asr,
+        &shiso_models::audio_registry::RecognizerDesc {
+            mmproj: args.asr_mmproj.as_deref(),
+            offline_batch: args.asr_batch,
+        },
+        &backend,
+    )
+    .with_context(|| format!("opening the speech recognizer at {}", asr.display()))?;
+    if recognizer.lookaheads().is_empty() {
+        // A recognizer without lookahead has nothing to check the flag
+        // against; its streams ignore it.
+        tracing::info!(
+            lookahead = args.asr_lookahead,
+            "this recognizer has no lookahead; --asr-lookahead is ignored"
+        );
+    } else if !recognizer.lookaheads().contains(&args.asr_lookahead) {
         return Err(anyhow!(
             "--asr-lookahead {} is not one this recognizer was trained for; it takes {:?}",
             args.asr_lookahead,
@@ -186,6 +200,9 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
         id = %asr_id,
         lookahead = args.asr_lookahead,
         diarizer = diarizer.is_some(),
+        offline_batch = recognizer.batches_offline(),
+        offline_min_secs = args.asr_offline_min_secs,
+        skip_silence = args.asr_skip_silence,
         seconds = started.elapsed().as_secs_f64(),
         "the speech models are resident"
     );
@@ -198,6 +215,9 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
         queue: args.audio_max_streams.saturating_mul(4),
         limits: args.audio_limits(),
         ffmpeg: args.audio_ffmpeg_policy(),
+        max_upload_bytes: args.audio_max_upload_bytes(),
+        offline_min_secs: args.asr_offline_min_secs,
+        skip_silence: args.asr_skip_silence,
     })
     .context("starting the audio worker")?;
     Ok(Some(service))

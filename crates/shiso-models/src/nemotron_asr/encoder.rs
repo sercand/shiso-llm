@@ -236,6 +236,7 @@ impl<'a> Encoder<'a> {
                 depthwise: index > 0,
                 in_valid: t_in,
                 out_valid: t_out,
+                batch: 1,
             };
             let (weight, bias) = match index {
                 0 => (&self.weights.conv0, &self.weights.conv0_bias),

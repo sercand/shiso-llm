@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use crate::error::AudioError;
-use crate::mel::{Framing, MelFrames, MelFrontend, Preemphasis};
+use crate::mel::{Framing, LogScale, MelFrames, MelFrontend, Preemphasis};
 
 /// An incremental centred log-mel frontend.
 #[derive(Debug)]
@@ -34,6 +34,13 @@ impl MelStream {
         if frontend.spec().framing != Framing::Centred {
             return Err(AudioError::BadSpec {
                 reason: "only centred framing streams".into(),
+            });
+        }
+        if matches!(frontend.spec().log_scale, LogScale::Log10MaxFloor) {
+            return Err(AudioError::BadSpec {
+                reason: "this log scale needs every frame's value before it can floor and \
+                         rescale any of them, so it cannot stream"
+                    .into(),
             });
         }
         let left = frontend.spec().n_fft / 2;

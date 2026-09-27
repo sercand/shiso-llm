@@ -168,3 +168,127 @@ fn vtt_cue_text_is_escaped() {
     );
     assert!(srt(&segs).contains("\nAT&T said a < b > c\n"));
 }
+
+fn word(text: &str, start: f64, end: f64) -> Word {
+    Word {
+        text: text.to_owned(),
+        start,
+        end,
+    }
+}
+
+#[test]
+fn a_chunked_transcript_changes_speaker_only_at_a_chunk_cut() {
+    // Speaker 0 until 0.9 s, silence to 1.1 s, speaker 1 after; the chunks
+    // are cut at 1.0 s, the middle of the silence.
+    let probs = (0..20)
+        .flat_map(|t| match t {
+            0..9 => [0.9, 0.0],
+            9..11 => [0.1, 0.1],
+            _ => [0.0, 0.9],
+        })
+        .collect();
+    let activity = SpeakerActivity::new(0.1, 2, probs).expect("valid");
+    // The second chunk's first word starts at its first frame, inside the
+    // silence: by itself it would inherit the previous speaker.
+    let words = [
+        word("one", 0.0, 0.4),
+        word("two", 0.5, 0.95),
+        word("three", 1.0, 1.08),
+        word("four", 1.5, 1.9),
+    ];
+    assert_eq!(assign_speakers(&words, &activity), [0, 0, 0, 1]);
+    assert_eq!(
+        assign_speakers_by_chunk(&words, &activity, &[1.0]),
+        [0, 0, 1, 1]
+    );
+}
+
+#[test]
+fn a_chunk_nobody_holds_keeps_each_words_own_speaker() {
+    // Speaker 1 speaks, then a chunk of silence, then speaker 0.
+    let probs = (0..30)
+        .flat_map(|t| match t {
+            0..10 => [0.0, 0.9],
+            10..20 => [0.1, 0.1],
+            _ => [0.9, 0.0],
+        })
+        .collect();
+    let activity = SpeakerActivity::new(0.1, 2, probs).expect("valid");
+    let words = [
+        word("a", 0.2, 0.4),
+        word("b", 1.2, 1.4),
+        word("c", 2.2, 2.4),
+    ];
+    assert_eq!(
+        assign_speakers_by_chunk(&words, &activity, &[1.0, 2.0]),
+        assign_speakers(&words, &activity)
+    );
+    assert_eq!(
+        assign_speakers_by_chunk(&words, &activity, &[1.0, 2.0]),
+        [1, 1, 0]
+    );
+}
+
+#[test]
+fn a_chunked_words_end_at_the_next_word_or_its_chunks_end() {
+    // Two chunks, frames [0, 100) and [100, 250), at 0.01 s a frame: each
+    // piece has only the frame it starts at.
+    let pieces = [
+        tp("Hel", 0),
+        tp("lo", 20),
+        tp(" there.", 60),
+        tp(" Next", 100),
+        tp(" one", 180),
+    ];
+    let w = words_in_chunks(&pieces, 0.01, &[100, 250]);
+    let times: Vec<(&str, f64, f64)> = w
+        .iter()
+        .map(|w| (w.text.as_str(), w.start, w.end))
+        .collect();
+    let want = [
+        ("Hello", 0.0, 0.6),
+        ("there.", 0.6, 1.0),
+        ("Next", 1.0, 1.8),
+        ("one", 1.8, 2.5),
+    ];
+    assert_eq!(times.len(), want.len(), "{times:?}");
+    for (got, want) in times.iter().zip(want) {
+        assert_eq!(got.0, want.0);
+        assert!(
+            (got.1 - want.1).abs() < 1e-9 && (got.2 - want.2).abs() < 1e-9,
+            "{got:?} against {want:?}"
+        );
+    }
+    // A one-word chunk lasts the whole chunk, not one frame.
+    let lone = words_in_chunks(&[tp("Yes.", 300)], 0.01, &[300, 420]);
+    assert!((lone[0].end - 4.2).abs() < 1e-9, "{lone:?}");
+    // Without chunk ends a word ends one frame after its last piece, as
+    // `words` has it.
+    assert_eq!(words_in_chunks(&pieces, 0.08, &[]), words(&pieces, 0.08));
+}
+
+#[test]
+fn a_chunk_boundary_ends_a_word_written_without_spaces() {
+    // Text in a script written without spaces runs across the join of two
+    // chunks: each chunk's part is its own word, timed by its own chunk.
+    let pieces = [tp("你好", 0), tp("。", 40), tp("我们", 100), tp("走", 150)];
+    let w = words_in_chunks(&pieces, 0.01, &[100, 200]);
+    let got: Vec<(&str, f64, f64)> = w
+        .iter()
+        .map(|w| (w.text.as_str(), w.start, w.end))
+        .collect();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(got[0].0, "你好。");
+    assert!(
+        (got[0].1 - 0.0).abs() < 1e-9 && (got[0].2 - 1.0).abs() < 1e-9,
+        "{got:?}"
+    );
+    assert_eq!(got[1].0, "我们走");
+    assert!(
+        (got[1].1 - 1.0).abs() < 1e-9 && (got[1].2 - 2.0).abs() < 1e-9,
+        "{got:?}"
+    );
+    // Without chunk ends the run is one word, as before.
+    assert_eq!(words(&pieces, 0.01).len(), 1);
+}

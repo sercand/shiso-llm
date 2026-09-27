@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use clap::Parser as _;
-use shiso_server::cli::{Cli, Command, ServeArgs};
+use shiso_server::cli::{Cli, Command, ConfigError, ServeArgs};
 
 /// Parses a `shiso serve` command line.
 fn parse(args: &[&str]) -> Result<ServeArgs, clap::Error> {
@@ -342,6 +342,9 @@ fn every_documented_flag_declares_its_prefixed_environment_fallback() {
         "SHISO_SOLO_PREFILL_CHUNK",
         "SHISO_MIXED_PREFILL_QUANTUM",
         "SHISO_MAX_NUM_BATCHED_TOKENS",
+        "SHISO_ASR_BATCH",
+        "SHISO_ASR_SKIP_SILENCE",
+        "SHISO_ASR_OFFLINE_MIN_SECS",
     ] {
         assert!(
             help.contains(variable),
@@ -516,7 +519,8 @@ fn an_audio_only_server_needs_no_language_model() {
     assert_eq!(args.asr_id().as_deref(), Some("nemotron-asr"));
     assert_eq!(args.asr_lookahead, 13);
     assert_eq!(args.audio_max_streams, 4);
-    assert_eq!(args.audio_max_seconds.get(), 1800);
+    assert_eq!(args.audio_max_seconds.get(), 7200);
+    assert_eq!(args.audio_max_upload_bytes(), 512 * 1024 * 1024);
 }
 
 #[test]
@@ -542,12 +546,85 @@ fn a_diarizer_without_a_recognizer_is_refused() {
 }
 
 #[test]
+fn an_mmproj_without_a_recognizer_is_refused() {
+    let error = parse(&[
+        "--model",
+        "m.gguf",
+        "--asr-mmproj",
+        "/models/mmproj-Q8_0.gguf",
+    ])
+    .expect("parses")
+    .validate()
+    .expect_err("a tower has no text model to join");
+    assert!(error.to_string().contains("--asr-model"), "{error}");
+}
+
+#[test]
+fn the_asr_mmproj_is_passed_through() {
+    let args = parse(&[
+        "--asr-model",
+        "/models/asr/Model-Q8_0.gguf",
+        "--asr-mmproj",
+        "/models/asr/mmproj-Model-Q8_0.gguf",
+    ])
+    .expect("parses");
+    args.validate().expect("valid");
+    assert_eq!(
+        args.asr_mmproj.as_deref(),
+        Some(std::path::Path::new("/models/asr/mmproj-Model-Q8_0.gguf"))
+    );
+}
+
+#[test]
 fn zero_audio_streams_is_refused() {
     let error = parse(&["--asr-model", "/a", "--audio-max-streams", "0"])
         .expect("parses")
         .validate()
         .expect_err("zero streams serves nothing");
     assert!(error.to_string().contains("audio-max-streams"), "{error}");
+}
+
+#[test]
+fn the_offline_flags_default_to_a_batch_of_8_skipping_silence_past_5_minutes() {
+    let args = parse(&["--asr-model", "/a"]).expect("parses");
+    args.validate().expect("valid");
+    assert_eq!(args.asr_batch, 8);
+    assert!(args.asr_skip_silence);
+    assert_eq!(args.asr_offline_min_secs, 300);
+}
+
+#[test]
+fn the_offline_flags_can_be_set_and_silence_kept() {
+    let args = parse(&[
+        "--asr-model",
+        "/a",
+        "--asr-batch",
+        "3",
+        "--asr-skip-silence=false",
+        "--asr-offline-min-secs",
+        "0",
+    ])
+    .expect("parses");
+    args.validate().expect("valid");
+    assert_eq!(args.asr_batch, 3);
+    assert!(!args.asr_skip_silence);
+    assert_eq!(args.asr_offline_min_secs, 0);
+    // The bare flag turns it on.
+    let args = parse(&["--asr-model", "/a", "--asr-skip-silence"]).expect("parses");
+    assert!(args.asr_skip_silence);
+}
+
+#[test]
+fn a_zero_asr_batch_is_refused_naming_the_flag() {
+    let error = parse(&["--asr-model", "/a", "--asr-batch", "0"])
+        .expect("parses")
+        .validate()
+        .expect_err("a batch of nothing transcribes nothing");
+    assert!(
+        matches!(error, ConfigError::Zero { flag: "asr-batch" }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("--asr-batch"), "{error}");
 }
 
 #[test]

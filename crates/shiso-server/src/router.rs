@@ -60,6 +60,12 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 /// body limit closest to the handlers. A body limit outside the auth gate would
 /// read a 32 MiB body from an unauthenticated client before refusing it.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    // An audio upload is a file, not a JSON body, so the transcription routes
+    // take their own, larger limit; the route's layer is the inner one and wins.
+    let upload_limit = state.audio.as_ref().map_or(
+        DEFAULT_MAX_BODY_BYTES,
+        crate::audio::AudioService::max_upload_bytes,
+    );
     let routes = Router::new()
         .route("/health", get(misc_handlers::health))
         .route("/metrics", get(misc_handlers::metrics))
@@ -85,11 +91,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/messages", post(crate::anthropic::messages::messages))
         .route(
             "/v1/audio/transcriptions",
-            post(crate::openai::transcription::transcriptions),
+            post(crate::openai::transcription::transcriptions)
+                .layer(DefaultBodyLimit::max(upload_limit)),
         )
         .route(
             "/audio/transcriptions",
-            post(crate::openai::transcription::transcriptions),
+            post(crate::openai::transcription::transcriptions)
+                .layer(DefaultBodyLimit::max(upload_limit)),
         )
         .method_not_allowed_fallback(misc_handlers::method_not_allowed)
         .fallback(misc_handlers::not_found)

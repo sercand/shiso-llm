@@ -54,6 +54,14 @@ pub(crate) struct GluArgs {
 }
 const _: () = assert!(size_of::<GluArgs>() == 8);
 
+/// `audio_args_silu_mul`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct SiluMulArgs {
+    pub(crate) count: u32,
+}
+const _: () = assert!(size_of::<SiluMulArgs>() == 4);
+
 /// `audio_args_norm`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -97,8 +105,9 @@ pub(crate) struct Conv2dArgs {
     pub(crate) relu: u32,
     pub(crate) in_valid: u32,
     pub(crate) out_valid: u32,
+    pub(crate) batch: u32,
 }
-const _: () = assert!(size_of::<Conv2dArgs>() == 52);
+const _: () = assert!(size_of::<Conv2dArgs>() == 56);
 
 /// `audio_args_dwconv1d`.
 #[repr(C)]
@@ -212,3 +221,126 @@ pub(crate) struct KeepArgs {
     pub(crate) count: u32,
 }
 const _: () = assert!(size_of::<KeepArgs>() == 4);
+
+/// `audio_args_cache_attn`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct CacheAttnArgs {
+    pub(crate) n_q: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) pos0: u32,
+    pub(crate) cap: u32,
+    pub(crate) scale: f32,
+    pub(crate) splits: u32,
+}
+const _: () = assert!(size_of::<CacheAttnArgs>() == 32);
+
+/// `audio_args_kv_append`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct KvAppendArgs {
+    pub(crate) rows: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) cap: u32,
+}
+const _: () = assert!(size_of::<KvAppendArgs>() == 16);
+
+/// `audio_args_decode_step`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct DecodeStepArgs {
+    pub(crate) eos0: u32,
+    pub(crate) eos1: u32,
+    pub(crate) max_tokens: u32,
+    pub(crate) advance: u32,
+    pub(crate) slot: u32,
+}
+const _: () = assert!(size_of::<DecodeStepArgs>() == 20);
+
+/// `audio_args_embed_token`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct EmbedTokenArgs {
+    pub(crate) width: u32,
+    pub(crate) vocab: u32,
+    pub(crate) group: u32,
+}
+const _: () = assert!(size_of::<EmbedTokenArgs>() == 12);
+
+/// `audio_args_matvec3`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct Matvec3Args {
+    pub(crate) n0: u32,
+    pub(crate) n1: u32,
+    pub(crate) n2: u32,
+    pub(crate) k: u32,
+}
+const _: () = assert!(size_of::<Matvec3Args>() == 16);
+
+/// `audio_args_qk_rope`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct QkRopeArgs {
+    pub(crate) rows: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) cap: u32,
+    pub(crate) eps: f32,
+    pub(crate) theta: f32,
+}
+const _: () = assert!(size_of::<QkRopeArgs>() == 28);
+
+/// `audio_args_argmax_split`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct ArgmaxSplitArgs {
+    pub(crate) cols: u32,
+    pub(crate) span: u32,
+    pub(crate) parts: u32,
+}
+const _: () = assert!(size_of::<ArgmaxSplitArgs>() == 12);
+
+/// `audio_args_batch_attn`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct BatchAttnArgs {
+    pub(crate) seqs: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) scale: f32,
+    pub(crate) splits: u32,
+}
+const _: () = assert!(size_of::<BatchAttnArgs>() == 24);
+
+/// `audio_args_qk_rope_seq`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct QkRopeSeqArgs {
+    pub(crate) rows: u32,
+    pub(crate) seqs: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) eps: f32,
+    pub(crate) theta: f32,
+}
+const _: () = assert!(size_of::<QkRopeSeqArgs>() == 28);
+
+/// `audio_args_decode_step_batch`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct DecodeStepBatchArgs {
+    pub(crate) eos0: u32,
+    pub(crate) eos1: u32,
+    pub(crate) max_tokens: u32,
+    pub(crate) advance: u32,
+    pub(crate) slot: u32,
+    pub(crate) seqs: u32,
+}
+const _: () = assert!(size_of::<DecodeStepBatchArgs>() == 24);

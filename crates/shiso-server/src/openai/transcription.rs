@@ -56,8 +56,16 @@ fn decode_error(error: AudioError) -> AppError {
     }
 }
 
-async fn read_fields(mut multipart: Multipart) -> Result<Vec<Field>, AppError> {
+async fn read_fields(mut multipart: Multipart, limit: usize) -> Result<Vec<Field>, AppError> {
+    // The body limit surfaces here, as a read error, so it is told apart from
+    // a malformed form: one is fixed by a smaller file, the other by a client.
     let bad = |error: axum::extract::multipart::MultipartError| {
+        if error.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+            return AppError::TooLarge {
+                what: "a transcription upload (--audio-max-upload-mb)",
+                limit,
+            };
+        }
         AppError::bad_request(
             format!("the body is not a readable multipart form: {error}"),
             None,
@@ -77,7 +85,8 @@ async fn answer(state: &AppState, multipart: Multipart) -> Result<Response, AppE
     let audio = state.audio.as_ref().ok_or(AppError::NotReady {
         what: "a speech recognizer (start the server with --asr-model)",
     })?;
-    let form = TranscriptionForm::from_fields(read_fields(multipart).await?)?;
+    let form =
+        TranscriptionForm::from_fields(read_fields(multipart, audio.max_upload_bytes()).await?)?;
     form.validate(&ServedAudio {
         asr_id: audio.asr_id(),
         has_diarizer: audio.has_diarizer(),
@@ -91,6 +100,7 @@ async fn answer(state: &AppState, multipart: Multipart) -> Result<Response, AppE
         pcm,
         language: form.language.clone().map_or(Language::Auto, Language::Tag),
         diarize,
+        streaming: form.stream,
     })?;
     if form.stream {
         let first = events.recv().await.ok_or_else(worker_gone)?;

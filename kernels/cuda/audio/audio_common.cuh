@@ -14,12 +14,28 @@
 #define AUDIO_GEMM_TILE_N 64u
 #define AUDIO_GEMM_TILE_K 32u
 #define AUDIO_GEMM64_TILE_M 64u
+#define AUDIO_GEMM64_TILE_K 16u
 #define AUDIO_GEMV_ROWS 8u
 #define AUDIO_GEMV_COLS 4u
+/* Columns one matrix-vector-by-runs block produces, and the warps that share
+ * each column's k range. */
+#define AUDIO_MATVEC_COLS 4u
+#define AUDIO_MATVEC_SG 2u
+/* Input rows one block of the multi-row matrix-vector kernels takes: a
+ * decoder batch's rows share each weight run the block reads. */
+#define AUDIO_MATVEC_ROWS 4u
+/* Values one thread of the fused residual-add RMS norm loads at once. */
+#define AUDIO_ADD_RMS_RUN 8u
 #define AUDIO_ATTN_SLOTS 4u
 #define AUDIO_ATTN_QB 8u
 #define AUDIO_REL_ROWS 4u
 #define AUDIO_ARGMAX_BLOCK 256u
+#define AUDIO_DECODE_KB 4u
+#define AUDIO_DECODE_GT 2u
+#define AUDIO_DECODE_SPLITS_PER_TG 4u
+#define AUDIO_DECODE_MAX_SPLITS 256u
+#define AUDIO_DECODE_MERGE_THREADS 256u
+#define AUDIO_DECODE_MERGE_SG 8u
 
 #define AUDIO_OP_RELU 0u
 #define AUDIO_OP_SILU 1u
@@ -40,14 +56,17 @@ struct audio_args_axpy { uint count; float alpha; };
 struct audio_args_bias_rows { uint rows; uint cols; };
 struct audio_args_argmax { uint rows; uint cols; };
 struct audio_args_glu { uint rows; uint channels; };
+struct audio_args_silu_mul { uint count; };
 struct audio_args_norm { uint rows; uint dim; float eps; uint flags; };
 struct audio_args_gemm { uint m; uint n; uint k; uint flags; uint k_chunk; uint splits; };
+struct audio_args_matvec3 { uint n0; uint n1; uint n2; uint k; };
 struct audio_args_conv2d {
     uint t_in; uint f_in; uint c_in;
     uint t_out; uint f_out; uint c_out;
     uint pad_t; uint pad_f;
     uint depthwise; uint has_bias; uint relu;
     uint in_valid; uint out_valid;
+    uint batch;
 };
 struct audio_args_dwconv1d { uint rows; uint channels; uint taps; };
 struct audio_args_unfold { uint rows; uint channels; uint taps; uint pad; };
@@ -66,6 +85,26 @@ struct audio_args_greedy_window { uint rows; uint cols; uint avail; };
 struct audio_args_greedy_step { uint rows; uint avail; uint blank; uint max_symbols; uint slot; };
 struct audio_args_embed_row { uint width; uint vocab; };
 struct audio_args_keep { uint count; };
+struct audio_args_cache_attn {
+    uint n_q; uint heads; uint kv_heads; uint head_dim;
+    uint pos0; uint cap; float scale; uint splits;
+};
+struct audio_args_kv_append { uint rows; uint kv_heads; uint head_dim; uint cap; };
+struct audio_args_qk_rope {
+    uint rows; uint heads; uint kv_heads; uint head_dim; uint cap; float eps; float theta;
+};
+struct audio_args_argmax_split { uint cols; uint span; uint parts; };
+struct audio_args_decode_step { uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; };
+struct audio_args_embed_token { uint width; uint vocab; uint group; };
+struct audio_args_batch_attn {
+    uint seqs; uint heads; uint kv_heads; uint head_dim; float scale; uint splits;
+};
+struct audio_args_qk_rope_seq {
+    uint rows; uint seqs; uint heads; uint kv_heads; uint head_dim; float eps; float theta;
+};
+struct audio_args_decode_step_batch {
+    uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; uint seqs;
+};
 
 /* Greedy search's state on the device, as the Metal twin's. */
 #define AUDIO_GREEDY_T 0u
@@ -74,6 +113,29 @@ struct audio_args_keep { uint count; };
 #define AUDIO_GREEDY_TOKEN 3u
 #define AUDIO_GREEDY_EMIT 4u
 #define AUDIO_GREEDY_NONE 0xffffffffu
+
+/* A causal decoder's state on the device, as the Metal twin's. */
+#define AUDIO_DECODE_POS 0u
+#define AUDIO_DECODE_COUNT 1u
+#define AUDIO_DECODE_DONE 2u
+#define AUDIO_DECODE_TOKEN 3u
+#define AUDIO_DECODE_EMIT 4u
+#define AUDIO_DECODE_STOP 5u
+#define AUDIO_DECODE_NONE 0xffffffffu
+#define AUDIO_DECODE_STOP_EOS 1u
+#define AUDIO_DECODE_STOP_CAP 2u
+#define AUDIO_DECODE_STATE_WORDS 8u
+
+/* A batch's per-sequence table, eight words a sequence, as the Metal twin's:
+ * the first cache row of its plane in the shared buffers, the plane's
+ * capacity, and for a segmented prefill its first stacked row, its rows and
+ * that first row's position. */
+#define AUDIO_SEQ_WORDS 8u
+#define AUDIO_SEQ_PLANE 0u
+#define AUDIO_SEQ_CAP 1u
+#define AUDIO_SEQ_ROW0 2u
+#define AUDIO_SEQ_ROWS 3u
+#define AUDIO_SEQ_POS0 4u
 
 /* One brain-float, widened exactly (the 16 bits become the high half). */
 static __device__ __forceinline__ float audio_bf16(const unsigned short *p) {

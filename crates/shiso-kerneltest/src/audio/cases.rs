@@ -23,6 +23,26 @@ use shiso_core::{DeviceBuffer, Extent3, KernelArg, KernelRef, LaunchArgs};
 use crate::oracle;
 use crate::{Gpu, drain, f32_bytes, run};
 
+mod affine;
+mod batched;
+mod fused;
+mod rows;
+pub use affine::{
+    affine8_fused_products_are_the_chain, affine8_products_match_the_dequantised_weight,
+};
+pub use batched::{
+    batched_decode_attention_reads_each_length, batched_embed_token_takes_each_state_token_row,
+    batched_qk_norm_rope_append_is_each_row_alone, batched_step_stops_each_sequence_alone,
+    segmented_causal_attention_matches_each_sequence_alone,
+    segmented_qk_norm_rope_append_is_each_sequence_alone,
+};
+pub use fused::{
+    add_rms_norm_is_the_axpy_and_rms_norm_it_replaces, argmax_wide_matches_the_row_argmax,
+    matvec_silu_is_the_products_and_silu_mul, matvec3_is_three_matvecs,
+    qk_norm_rope_append_is_the_chain_it_replaces,
+};
+pub use rows::matvec_rows_are_each_row_alone;
+
 /// Every entry the set exports, in contract-table order. Each kernel group
 /// appends its entries here; the pipeline check resolves exactly this list.
 pub const ENTRIES: &[&str] = &[
@@ -59,6 +79,60 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_keep_f32",
     "kernel_audio_bias_rows_f32",
     "kernel_audio_argmax_rows_f32",
+    "kernel_audio_im2col_s2_f32",
+    "kernel_audio_causal_attn_f32",
+    "kernel_audio_decode_attn_f32",
+    "kernel_audio_decode_attn_merge_f32",
+    "kernel_audio_kv_append_f32",
+    "kernel_audio_rope_half_state_f32",
+    "kernel_audio_decode_step_u32",
+    "kernel_audio_embed_token_f32w",
+    "kernel_audio_embed_token_bf16w",
+    "kernel_audio_embed_token_f16w",
+    "kernel_audio_embed_token_q8_0w",
+    "kernel_audio_embed_token_affine8w",
+    "kernel_audio_silu_mul_f32",
+    "kernel_audio_matvec_f32w",
+    "kernel_audio_matvec_bf16w",
+    "kernel_audio_matvec_f16w",
+    "kernel_audio_matvec_q8_0w",
+    "kernel_audio_matvec3_f32w",
+    "kernel_audio_matvec3_bf16w",
+    "kernel_audio_matvec3_f16w",
+    "kernel_audio_matvec3_q8_0w",
+    "kernel_audio_matvec_silu_f32w",
+    "kernel_audio_matvec_silu_bf16w",
+    "kernel_audio_matvec_silu_f16w",
+    "kernel_audio_matvec_silu_q8_0w",
+    "kernel_audio_add_rms_norm_f32",
+    "kernel_audio_qk_norm_rope_append_f32",
+    "kernel_audio_argmax_split_f32",
+    "kernel_audio_argmax_merge_f32",
+    "kernel_audio_gemm_affine8w",
+    "kernel_audio_gemm64_affine8w",
+    "kernel_audio_matvec_affine8w",
+    "kernel_audio_matvec3_affine8w",
+    "kernel_audio_matvec_silu_affine8w",
+    "kernel_audio_causal_attn_seg_f32",
+    "kernel_audio_qk_norm_rope_append_seg_f32",
+    "kernel_audio_qk_norm_rope_append_batch_f32",
+    "kernel_audio_decode_attn_batch_f32",
+    "kernel_audio_decode_step_batch_u32",
+    "kernel_audio_embed_token_batch_f32w",
+    "kernel_audio_embed_token_batch_bf16w",
+    "kernel_audio_embed_token_batch_f16w",
+    "kernel_audio_embed_token_batch_q8_0w",
+    "kernel_audio_embed_token_batch_affine8w",
+    "kernel_audio_matvec_rows_f32w",
+    "kernel_audio_matvec_rows_bf16w",
+    "kernel_audio_matvec_rows_f16w",
+    "kernel_audio_matvec_rows_q8_0w",
+    "kernel_audio_matvec_rows_affine8w",
+    "kernel_audio_matvec_silu_rows_f32w",
+    "kernel_audio_matvec_silu_rows_bf16w",
+    "kernel_audio_matvec_silu_rows_f16w",
+    "kernel_audio_matvec_silu_rows_q8_0w",
+    "kernel_audio_matvec_silu_rows_affine8w",
 ];
 
 const LINEAR_BLOCK: u32 = 256;
@@ -68,6 +142,9 @@ const GEMM_TILE_N: u32 = 64;
 /// Output columns and rows one matrix-vector threadgroup produces.
 const GEMV_TG_COLS: u32 = 16;
 const GEMV_TG_ROWS: u32 = 8;
+/// Output columns and threads of one matrix-vector-by-runs threadgroup.
+const MATVEC_COLS: u32 = 4;
+const MATVEC_BLOCK: u32 = 64;
 /// Queries one attention simdgroup takes at once.
 const ATTN_QUERY_BLOCK: u32 = 8;
 /// Distance rows one relative-score simdgroup takes at once.
@@ -76,8 +153,8 @@ const GEMM_BLOCK: u32 = 128;
 const GEMM_SMEM: u32 = 12_288;
 /// Rows, threads and threadgroup bytes of the 64-row GEMM.
 const GEMM64_TILE_M: u32 = 64;
-const GEMM64_BLOCK: u32 = 256;
-const GEMM64_SMEM: u32 = 20_480;
+const GEMM64_BLOCK: u32 = 128;
+const GEMM64_SMEM: u32 = 9_472;
 const NORM_SMEM: u32 = 132;
 
 fn launch(
@@ -148,6 +225,14 @@ struct GluArgs {
     channels: u32,
 }
 const _: () = assert!(size_of::<GluArgs>() == 8);
+
+/// `audio_args_silu_mul`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct SiluMulArgs {
+    count: u32,
+}
+const _: () = assert!(size_of::<SiluMulArgs>() == 4);
 
 fn unary_oracle(op: u32, x: f32, a: f32, b: f32) -> f32 {
     match op {
@@ -291,6 +376,40 @@ pub fn glu_gates_the_first_half_with_the_second(gpu: &Gpu) {
         }
     }
     close(&gpu.read_f32(&out), &want, 2e-6, "glu");
+}
+
+/// The gated MLP's product takes `silu` of the gate, not of the value,
+/// over a count that is not a whole number of blocks, and runs in place on
+/// the gate.
+pub fn silu_mul_gates_the_up_rows(gpu: &Gpu) {
+    let count = 1000usize;
+    let gate: Vec<f32> = oracle::signal(count, 11).iter().map(|v| v * 8.0).collect();
+    let up = oracle::signal(count, 12);
+    let g = gpu.upload(&f32_bytes(&gate));
+    let u = gpu.upload(&f32_bytes(&up));
+    let args = SiluMulArgs {
+        count: count as u32,
+    };
+    launch(
+        gpu,
+        "kernel_audio_silu_mul_f32",
+        Extent3::linear(blocks(count, LINEAR_BLOCK)),
+        Extent3::linear(LINEAR_BLOCK),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(g.view()),
+            KernelArg::Buffer(g.view()),
+            KernelArg::Buffer(u.view()),
+        ],
+    );
+    drain(gpu);
+    let want: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(&x, &y)| x / (1.0 + (-x).exp()) * y)
+        .collect();
+    close(&gpu.read_f32(&g), &want, 2e-6, "silu_mul");
 }
 
 /// `audio_args_norm`.
@@ -533,8 +652,10 @@ enum GemmMode {
     Split(usize),
     /// The matrix-vector kernel.
     Gemv,
-    /// The 64-row tiled GEMM over `splits` slices of k (1: all of it).
-    Tall(usize),
+    /// The 64-row tiled GEMM over all of k.
+    Tall,
+    /// The matrix-vector-by-runs kernel, one threadgroup row per input row.
+    Matvec,
 }
 
 fn gemm_entry(kind: &str, mode: GemmMode) -> &'static str {
@@ -543,10 +664,14 @@ fn gemm_entry(kind: &str, mode: GemmMode) -> &'static str {
         (GemmMode::Gemv, "f32w") => "kernel_audio_gemv_f32w",
         (GemmMode::Gemv, "bf16w") => "kernel_audio_gemv_bf16w",
         (GemmMode::Gemv, _) => "kernel_audio_gemv_f16w",
-        (GemmMode::Tall(_), "q8_0w") => "kernel_audio_gemm64_q8_0w",
-        (GemmMode::Tall(_), "f32w") => "kernel_audio_gemm64_f32w",
-        (GemmMode::Tall(_), "bf16w") => "kernel_audio_gemm64_bf16w",
-        (GemmMode::Tall(_), _) => "kernel_audio_gemm64_f16w",
+        (GemmMode::Matvec, "q8_0w") => "kernel_audio_matvec_q8_0w",
+        (GemmMode::Matvec, "f32w") => "kernel_audio_matvec_f32w",
+        (GemmMode::Matvec, "bf16w") => "kernel_audio_matvec_bf16w",
+        (GemmMode::Matvec, _) => "kernel_audio_matvec_f16w",
+        (GemmMode::Tall, "q8_0w") => "kernel_audio_gemm64_q8_0w",
+        (GemmMode::Tall, "f32w") => "kernel_audio_gemm64_f32w",
+        (GemmMode::Tall, "bf16w") => "kernel_audio_gemm64_bf16w",
+        (GemmMode::Tall, _) => "kernel_audio_gemm64_f16w",
         (_, "q8_0w") => "kernel_audio_gemm_q8_0w",
         (_, "f32w") => "kernel_audio_gemm_f32w",
         (_, "bf16w") => "kernel_audio_gemm_bf16w",
@@ -560,7 +685,7 @@ fn gemm_case(
     (m, n, k): (usize, usize, usize),
     with_bias: bool,
     mode: GemmMode,
-) {
+) -> Vec<f32> {
     let x = oracle::signal(m * k, 31);
     let (wbytes, wvals) = weight_fixture(kind, n * k, 32);
     let bias = oracle::signal(n, 33);
@@ -572,8 +697,8 @@ fn gemm_case(
     // One guard row past the end: the kernel must not write it.
     let y = gpu.upload(&f32_bytes(&vec![f32::NAN; m * n + n]));
     let splits = match mode {
-        GemmMode::Split(s) | GemmMode::Tall(s) => s,
-        GemmMode::Tiled | GemmMode::Gemv => 1,
+        GemmMode::Split(s) => s,
+        GemmMode::Tiled | GemmMode::Tall | GemmMode::Gemv | GemmMode::Matvec => 1,
     };
     let k_tiles = k.div_ceil(GEMM_TILE as usize);
     let k_chunk = k_tiles.div_ceil(splits) * GEMM_TILE as usize;
@@ -588,57 +713,61 @@ fn gemm_case(
     };
     let entry = gemm_entry(kind, mode);
     let parts = gpu.upload(&f32_bytes(&vec![f32::NAN; splits * m * n]));
-    match mode {
-        GemmMode::Gemv => launch(
-            gpu,
-            entry,
+    let target = if splits > 1 { &parts } else { &y };
+    let (grid, block, smem) = match mode {
+        GemmMode::Gemv => (
             Extent3::new(blocks(n, GEMV_TG_COLS), blocks(m, GEMV_TG_ROWS), 1),
-            Extent3::linear(GEMM_BLOCK),
+            GEMM_BLOCK,
+            0,
+        ),
+        GemmMode::Matvec => (
+            Extent3::new(blocks(n, MATVEC_COLS), m as u32, 1),
+            MATVEC_BLOCK,
+            0,
+        ),
+        GemmMode::Tall => (
+            Extent3::new(
+                blocks(n, GEMM_TILE_N),
+                blocks(m, GEMM64_TILE_M),
+                splits as u32,
+            ),
+            GEMM64_BLOCK,
+            GEMM64_SMEM,
+        ),
+        GemmMode::Tiled | GemmMode::Split(_) => (
+            Extent3::new(blocks(n, GEMM_TILE_N), blocks(m, GEMM_TILE), splits as u32),
+            GEMM_BLOCK,
+            GEMM_SMEM,
+        ),
+    };
+    launch(
+        gpu,
+        entry,
+        grid,
+        Extent3::linear(block),
+        smem,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(target.view()),
+            KernelArg::Buffer(xb.view()),
+            KernelArg::Buffer(wb.view()),
+            KernelArg::Buffer(bb.view()),
+        ],
+    );
+    if splits > 1 {
+        launch(
+            gpu,
+            "kernel_audio_split_sum_f32",
+            Extent3::linear(blocks(m * n, LINEAR_BLOCK)),
+            Extent3::linear(LINEAR_BLOCK),
             0,
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(y.view()),
-                KernelArg::Buffer(xb.view()),
-                KernelArg::Buffer(wb.view()),
+                KernelArg::Buffer(parts.view()),
                 KernelArg::Buffer(bb.view()),
             ],
-        ),
-        GemmMode::Tiled | GemmMode::Split(_) | GemmMode::Tall(_) => {
-            let target = if splits > 1 { &parts } else { &y };
-            let (tile_m, block, smem) = match mode {
-                GemmMode::Tall(_) => (GEMM64_TILE_M, GEMM64_BLOCK, GEMM64_SMEM),
-                _ => (GEMM_TILE, GEMM_BLOCK, GEMM_SMEM),
-            };
-            launch(
-                gpu,
-                entry,
-                Extent3::new(blocks(n, GEMM_TILE_N), blocks(m, tile_m), splits as u32),
-                Extent3::linear(block),
-                smem,
-                &[
-                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                    KernelArg::Buffer(target.view()),
-                    KernelArg::Buffer(xb.view()),
-                    KernelArg::Buffer(wb.view()),
-                    KernelArg::Buffer(bb.view()),
-                ],
-            );
-            if splits > 1 {
-                launch(
-                    gpu,
-                    "kernel_audio_split_sum_f32",
-                    Extent3::linear(blocks(m * n, LINEAR_BLOCK)),
-                    Extent3::linear(LINEAR_BLOCK),
-                    0,
-                    &[
-                        KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                        KernelArg::Buffer(y.view()),
-                        KernelArg::Buffer(parts.view()),
-                        KernelArg::Buffer(bb.view()),
-                    ],
-                );
-            }
-        }
+        );
     }
     drain(gpu);
     let got = gpu.read_f32(&y);
@@ -653,6 +782,7 @@ fn gemm_case(
         got[m * n..].iter().all(|v| v.is_nan()),
         "gemm {kind} {mode:?}: wrote past the output"
     );
+    got[..m * n].to_vec()
 }
 
 /// The tiled GEMM for every weight type over square, ragged, single-row and
@@ -691,20 +821,37 @@ pub fn split_k_gemm_matches_the_whole_product(gpu: &Gpu) {
 }
 
 /// The 64-row GEMM for every weight type: a whole tile, rows that end
-/// mid-tile, several row tiles, ragged columns and k, and split k.
+/// mid-tile, several row tiles and ragged columns. It takes whole 16-k
+/// slices and one split (the host sends any other product to the 32-row
+/// tile), so every k here is a multiple of 16, one of them not of 32.
 pub fn tall_gemm_matches_for_every_weight_type(gpu: &Gpu) {
     for kind in ["f32w", "bf16w", "f16w"] {
-        for &(m, n, k, bias, splits) in &[
-            (64usize, 64usize, 64usize, true, 1usize),
-            (33, 5, 33, false, 1),
-            (200, 130, 1024, true, 1),
-            (130, 70, 1000, true, 4),
+        for &(m, n, k, bias) in &[
+            (64usize, 64usize, 64usize, true),
+            (33, 5, 48, false),
+            (200, 130, 1024, true),
+            (130, 70, 1008, true),
         ] {
-            gemm_case(gpu, kind, (m, n, k), bias, GemmMode::Tall(splits));
+            tall_as_tiled(gpu, kind, (m, n, k), bias);
         }
     }
-    for &(m, n, k, splits) in &[(200usize, 130usize, 1024usize, 1usize), (37, 96, 1024, 5)] {
-        gemm_case(gpu, "q8_0w", (m, n, k), true, GemmMode::Tall(splits));
+    // Q8_0 rows are whole blocks, so its k stay multiples of 32.
+    for &(m, n, k) in &[(200usize, 130usize, 1024usize), (37, 96, 992)] {
+        tall_as_tiled(gpu, "q8_0w", (m, n, k), true);
+    }
+}
+
+/// The 64-row tile's product, which must also be the unsplit 32-row tile's
+/// bit for bit: the host sends a tall product the 64-row tile does not take to
+/// the 32-row one, and a row's value may not depend on which.
+fn tall_as_tiled(gpu: &Gpu, kind: &'static str, shape: (usize, usize, usize), bias: bool) {
+    let tall = gemm_case(gpu, kind, shape, bias, GemmMode::Tall);
+    let tiled = gemm_case(gpu, kind, shape, bias, GemmMode::Tiled);
+    for (i, (a, b)) in tall.iter().zip(&tiled).enumerate() {
+        assert!(
+            a.to_bits() == b.to_bits(),
+            "gemm {kind} {shape:?}[{i}]: the 64-row tile gave {a}, the 32-row one {b}"
+        );
     }
 }
 
@@ -726,6 +873,30 @@ pub fn gemv_matches_for_every_weight_type(gpu: &Gpu) {
     }
 }
 
+/// The matrix-vector-by-runs kernel for every weight type: one row and a
+/// few, column counts that end mid-threadgroup, a k shorter than one
+/// simdgroup's sweep and one of several sweeps, with and without the bias,
+/// writing nothing past `m x n`.
+pub fn matvec_matches_for_every_weight_type(gpu: &Gpu) {
+    for kind in ["f32w", "bf16w", "f16w"] {
+        for &(m, n, k, bias) in &[
+            (1usize, 1301usize, 1152usize, true),
+            (3, 37, 64, false),
+            (1, 6, 8, true),
+            (2, 9, 2056, true),
+        ] {
+            gemm_case(gpu, kind, (m, n, k), bias, GemmMode::Matvec);
+        }
+    }
+    for &(m, n, k, bias) in &[
+        (1usize, 1301usize, 1152usize, true),
+        (3, 37, 64, false),
+        (1, 5, 2080, true),
+    ] {
+        gemm_case(gpu, "q8_0w", (m, n, k), bias, GemmMode::Matvec);
+    }
+}
+
 /// `audio_args_conv2d`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -743,8 +914,9 @@ struct Conv2dArgs {
     relu: u32,
     in_valid: u32,
     out_valid: u32,
+    batch: u32,
 }
-const _: () = assert!(size_of::<Conv2dArgs>() == 52);
+const _: () = assert!(size_of::<Conv2dArgs>() == 56);
 
 struct ConvCase {
     t_in: usize,
@@ -760,9 +932,19 @@ struct ConvCase {
     relu: bool,
     in_valid: usize,
     out_valid: usize,
+    /// Independent planes, stacked.
+    batch: usize,
 }
 
 fn conv_oracle(c: &ConvCase, x: &[f32], w: &[f32], b: &[f32]) -> Vec<f32> {
+    // Each plane is its own image: its first rows are padding, never the
+    // previous plane's last.
+    x.chunks(c.t_in * c.f_in * c.c_in)
+        .flat_map(|x| conv_plane(c, x, w, b))
+        .collect()
+}
+
+fn conv_plane(c: &ConvCase, x: &[f32], w: &[f32], b: &[f32]) -> Vec<f32> {
     let per = if c.depthwise { 1 } else { c.c_in };
     let mut out = vec![0.0f32; c.t_out * c.f_out * c.c_out];
     for t in 0..c.t_out {
@@ -802,7 +984,7 @@ fn conv_oracle(c: &ConvCase, x: &[f32], w: &[f32], b: &[f32]) -> Vec<f32> {
 
 fn conv_run(gpu: &Gpu, c: &ConvCase) {
     let per = if c.depthwise { 1 } else { c.c_in };
-    let x = oracle::signal(c.t_in * c.f_in * c.c_in, 41);
+    let x = oracle::signal(c.batch * c.t_in * c.f_in * c.c_in, 41);
     let w = oracle::signal(c.c_out * per * 9, 42);
     let b = oracle::signal(c.c_out, 43);
     let (xb, wb, bb) = (
@@ -810,7 +992,7 @@ fn conv_run(gpu: &Gpu, c: &ConvCase) {
         gpu.upload(&f32_bytes(&w)),
         gpu.upload(&f32_bytes(&b)),
     );
-    let total = c.t_out * c.f_out * c.c_out;
+    let total = c.batch * c.t_out * c.f_out * c.c_out;
     let out = gpu.upload(&f32_bytes(&vec![f32::NAN; total]));
     let args = Conv2dArgs {
         t_in: c.t_in as u32,
@@ -826,6 +1008,7 @@ fn conv_run(gpu: &Gpu, c: &ConvCase) {
         relu: u32::from(c.relu),
         in_valid: c.in_valid as u32,
         out_valid: c.out_valid as u32,
+        batch: c.batch as u32,
     };
     launch(
         gpu,
@@ -871,6 +1054,7 @@ pub fn conv2d_matches_causal_symmetric_full_and_depthwise(gpu: &Gpu) {
             relu: true,
             in_valid: 21,
             out_valid: 9,
+            batch: 1,
         },
     );
     // Depthwise over an odd freq width with an input valid-row cut.
@@ -890,6 +1074,7 @@ pub fn conv2d_matches_causal_symmetric_full_and_depthwise(gpu: &Gpu) {
             relu: false,
             in_valid: 8,
             out_valid: 6,
+            batch: 1,
         },
     );
     // Symmetric pad 1, no bias, full 8 -> 4 channels (the second shape of a two-stage stack).
@@ -909,8 +1094,163 @@ pub fn conv2d_matches_causal_symmetric_full_and_depthwise(gpu: &Gpu) {
             relu: false,
             in_valid: 13,
             out_valid: 7,
+            batch: 1,
         },
     );
+}
+
+/// A stack of planes convolves each on its own: a plane's first output row
+/// reads zero padding, not the previous plane's last rows, and the valid-row
+/// cuts apply within every plane.
+pub fn conv2d_keeps_batched_planes_apart(gpu: &Gpu) {
+    // Symmetric pad 1, full 1 -> 6 channels over five planes of an odd height.
+    conv_run(
+        gpu,
+        &ConvCase {
+            t_in: 9,
+            f_in: 20,
+            c_in: 1,
+            c_out: 6,
+            t_out: 5,
+            f_out: 10,
+            pad_t: 1,
+            pad_f: 1,
+            depthwise: false,
+            bias: true,
+            relu: false,
+            in_valid: 9,
+            out_valid: 5,
+            batch: 5,
+        },
+    );
+    // Full 6 -> 5 channels over three planes with both cuts inside each.
+    conv_run(
+        gpu,
+        &ConvCase {
+            t_in: 10,
+            f_in: 11,
+            c_in: 6,
+            c_out: 5,
+            t_out: 5,
+            f_out: 6,
+            pad_t: 1,
+            pad_f: 1,
+            depthwise: false,
+            bias: true,
+            relu: true,
+            in_valid: 7,
+            out_valid: 4,
+            batch: 3,
+        },
+    );
+}
+
+/// The stride-2 conv2d's patches: every plane, tap and channel lands where
+/// the GEMM reads it, zero at the pads, past the input cut and on output rows
+/// past the output cut; and patches times the kernel is the direct conv.
+///
+/// # Panics
+///
+/// When a patch value differs, or the product differs from the direct conv.
+pub fn im2col_lays_out_the_patches_of_every_plane(gpu: &Gpu) {
+    let c = ConvCase {
+        t_in: 11,
+        f_in: 13,
+        c_in: 5,
+        c_out: 7,
+        t_out: 6,
+        f_out: 7,
+        pad_t: 1,
+        pad_f: 1,
+        depthwise: false,
+        bias: true,
+        relu: false,
+        in_valid: 9,
+        out_valid: 5,
+        batch: 3,
+    };
+    let x = oracle::signal(c.batch * c.t_in * c.f_in * c.c_in, 61);
+    let taps = 9 * c.c_in;
+    let total = c.batch * c.t_out * c.f_out * taps;
+    let mut want = vec![0.0f32; total];
+    for b in 0..c.batch {
+        for t in 0..c.out_valid {
+            for f in 0..c.f_out {
+                for kt in 0..3 {
+                    for kf in 0..3 {
+                        let (ti, fi) = (
+                            (2 * t + kt) as isize - c.pad_t as isize,
+                            (2 * f + kf) as isize - c.pad_f as isize,
+                        );
+                        if ti < 0 || fi < 0 || ti as usize >= c.in_valid || fi as usize >= c.f_in {
+                            continue;
+                        }
+                        for ci in 0..c.c_in {
+                            want[((b * c.t_out + t) * c.f_out + f) * taps
+                                + (kt * 3 + kf) * c.c_in
+                                + ci] = x
+                                [((b * c.t_in + ti as usize) * c.f_in + fi as usize) * c.c_in + ci];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let xb = gpu.upload(&f32_bytes(&x));
+    let out = gpu.upload(&f32_bytes(&vec![f32::NAN; total]));
+    let args = Conv2dArgs {
+        t_in: c.t_in as u32,
+        f_in: c.f_in as u32,
+        c_in: c.c_in as u32,
+        t_out: c.t_out as u32,
+        f_out: c.f_out as u32,
+        c_out: c.c_out as u32,
+        pad_t: c.pad_t as u32,
+        pad_f: c.pad_f as u32,
+        depthwise: 0,
+        has_bias: 0,
+        relu: 0,
+        in_valid: c.in_valid as u32,
+        out_valid: c.out_valid as u32,
+        batch: c.batch as u32,
+    };
+    launch(
+        gpu,
+        "kernel_audio_im2col_s2_f32",
+        Extent3::linear(blocks(total, LINEAR_BLOCK)),
+        Extent3::linear(LINEAR_BLOCK),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(xb.view()),
+        ],
+    );
+    drain(gpu);
+    let got = gpu.read_f32(&out);
+    // A copy: exact.
+    assert_eq!(got, want, "im2col");
+    // The patches against the kernel, reordered to `[c_out][tap][c_in]`, are
+    // the direct conv on every valid row (without the bias, which the conv
+    // writes on rows the patches leave zero).
+    let w = oracle::signal(c.c_out * c.c_in * 9, 62);
+    let direct = conv_oracle(&ConvCase { bias: false, ..c }, &x, &w, &[]);
+    for (row, patch) in got.chunks(taps).enumerate() {
+        for co in 0..c.c_out {
+            let mut acc = 0.0f64;
+            for tap in 0..9 {
+                for ci in 0..c.c_in {
+                    acc += f64::from(w[(co * c.c_in + ci) * 9 + tap])
+                        * f64::from(patch[tap * c.c_in + ci]);
+                }
+            }
+            let d = direct[row * c.c_out + co];
+            assert!(
+                (acc as f32 - d).abs() <= 1e-5 * d.abs().max(1.0),
+                "row {row} channel {co}: {acc} against {d}"
+            );
+        }
+    }
 }
 
 /// `audio_args_dwconv1d`.
@@ -1978,4 +2318,630 @@ pub fn keep_copies_only_on_emit(gpu: &Gpu) {
         let want = if emit == 1 { &src } else { &dst0 };
         close(&gpu.read_f32(&db), want, 0.0, &format!("keep, emit {emit}"));
     }
+}
+
+// ---- a causal decoder over a device KV cache -------------------------------
+
+/// `audio_args_cache_attn`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct CacheAttnArgs {
+    n_q: u32,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    pos0: u32,
+    cap: u32,
+    scale: f32,
+    splits: u32,
+}
+const _: () = assert!(size_of::<CacheAttnArgs>() == 32);
+
+/// `audio_args_kv_append`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct KvAppendArgs {
+    rows: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    cap: u32,
+}
+const _: () = assert!(size_of::<KvAppendArgs>() == 16);
+
+/// `audio_args_decode_step`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct DecodeStepArgs {
+    eos0: u32,
+    eos1: u32,
+    max_tokens: u32,
+    advance: u32,
+    slot: u32,
+}
+const _: () = assert!(size_of::<DecodeStepArgs>() == 20);
+
+/// `audio_args_embed_token`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct EmbedTokenArgs {
+    width: u32,
+    vocab: u32,
+    group: u32,
+}
+const _: () = assert!(size_of::<EmbedTokenArgs>() == 12);
+
+/// Splits one decode-attention threadgroup runs, query heads one simdgroup
+/// takes per kv head, and the merge's threads per head.
+const DECODE_SPLITS_PER_TG: u32 = 4;
+const DECODE_GROUP_TILE: u32 = 2;
+const DECODE_MERGE_THREADS: u32 = 256;
+/// The decoder state's words: cache rows filled, tokens emitted, done, last
+/// token, emitted, stop reason.
+const DEC_POS: usize = 0;
+const DEC_COUNT: usize = 1;
+const DEC_DONE: usize = 2;
+const DEC_TOKEN: usize = 3;
+const DEC_EMIT: usize = 4;
+const DEC_STOP: usize = 5;
+const DEC_STOP_EOS: u32 = 1;
+const DEC_STOP_CAP: u32 = 2;
+
+fn decode_state(gpu: &Gpu, pos: u32, token: u32) -> DeviceBuffer {
+    gpu.upload(&u32_bytes(&[pos, 0, 0, token, 0, 0, 0, 0]))
+}
+
+/// One layer's cache plane, `[kv_heads][cap][hd]`: rows below `valid` hold
+/// the signal, rows at or past it NaN, so a kernel that reads a row it may
+/// not see answers NaN.
+fn cache_plane(kv_heads: usize, cap: usize, hd: usize, valid: usize, seed: u32) -> Vec<f32> {
+    let mut plane = oracle::signal(kv_heads * cap * hd, seed);
+    for h in 0..kv_heads {
+        for r in valid..cap {
+            plane[(h * cap + r) * hd..(h * cap + r + 1) * hd].fill(f32::NAN);
+        }
+    }
+    plane
+}
+
+/// Causal GQA attention over a cache plane, in f64: query `i` of head `h`
+/// sits at `pos0 + i` and sees cache rows `0..=pos0 + i` of kv head
+/// `h / (heads / kv_heads)`.
+struct CacheAttnOracle<'a> {
+    q: &'a [f32],
+    k: &'a [f32],
+    v: &'a [f32],
+    n_q: usize,
+    heads: usize,
+    kv_heads: usize,
+    hd: usize,
+    pos0: usize,
+    cap: usize,
+    scale: f32,
+}
+
+fn cache_attn_oracle(o: &CacheAttnOracle<'_>) -> Vec<f32> {
+    let w = o.heads * o.hd;
+    let group = o.heads / o.kv_heads;
+    let mut out = vec![0.0f32; o.n_q * w];
+    for i in 0..o.n_q {
+        for h in 0..o.heads {
+            let kvh = h / group;
+            let seen = o.pos0 + i + 1;
+            let scores: Vec<f64> = (0..seen)
+                .map(|j| {
+                    let dot: f64 = (0..o.hd)
+                        .map(|e| {
+                            f64::from(o.q[i * w + h * o.hd + e])
+                                * f64::from(o.k[(kvh * o.cap + j) * o.hd + e])
+                        })
+                        .sum();
+                    f64::from(o.scale) * dot
+                })
+                .collect();
+            let mx = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let z: f64 = scores.iter().map(|s| (s - mx).exp()).sum();
+            for e in 0..o.hd {
+                let acc: f64 = scores
+                    .iter()
+                    .enumerate()
+                    .map(|(j, s)| (s - mx).exp() / z * f64::from(o.v[(kvh * o.cap + j) * o.hd + e]))
+                    .sum();
+                out[i * w + h * o.hd + e] = acc as f32;
+            }
+        }
+    }
+    out
+}
+
+/// Prefill attention is causal and grouped: each query sees the cache up to
+/// its own absolute position, and a query head reads its group's kv head,
+/// from a cache offset of zero and of 37 rows. Rows past the last query's
+/// position are NaN, so a row read that should not be is caught.
+///
+/// # Panics
+///
+/// When an output differs from the oracle by more than 2e-5.
+pub fn causal_attention_matches_for_gqa_and_a_cache_offset(gpu: &Gpu) {
+    let (heads, kv_heads, hd, n_q, cap) = (4usize, 2usize, 128usize, 13usize, 64usize);
+    let scale = 1.0 / (hd as f32).sqrt();
+    for pos0 in [0usize, 37] {
+        let valid = pos0 + n_q;
+        let q = oracle::signal(n_q * heads * hd, 171 + pos0 as u32);
+        let k = cache_plane(kv_heads, cap, hd, valid, 172);
+        let v = cache_plane(kv_heads, cap, hd, valid, 173);
+        let (qb, kb, vb) = (
+            gpu.upload(&f32_bytes(&q)),
+            gpu.upload(&f32_bytes(&k)),
+            gpu.upload(&f32_bytes(&v)),
+        );
+        let out = gpu.upload(&f32_bytes(&vec![f32::NAN; n_q * heads * hd]));
+        let args = CacheAttnArgs {
+            n_q: n_q as u32,
+            heads: heads as u32,
+            kv_heads: kv_heads as u32,
+            head_dim: hd as u32,
+            pos0: pos0 as u32,
+            cap: cap as u32,
+            scale,
+            splits: 0,
+        };
+        launch(
+            gpu,
+            "kernel_audio_causal_attn_f32",
+            Extent3::new(heads as u32, blocks(n_q, ATTN_QUERY_BLOCK), 1),
+            Extent3::linear(32),
+            ATTN_QUERY_BLOCK * hd as u32 * 4,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(qb.view()),
+                KernelArg::Buffer(kb.view()),
+                KernelArg::Buffer(vb.view()),
+            ],
+        );
+        drain(gpu);
+        let want = cache_attn_oracle(&CacheAttnOracle {
+            q: &q,
+            k: &k,
+            v: &v,
+            n_q,
+            heads,
+            kv_heads,
+            hd,
+            pos0,
+            cap,
+            scale,
+        });
+        close(
+            &gpu.read_f32(&out),
+            &want,
+            2e-5,
+            &format!("causal attention, pos0 {pos0}"),
+        );
+    }
+}
+
+/// Decode attention takes its length from the state: the one query of each
+/// head at position `pos` sees rows `0..=pos`, for a length of one row, a
+/// length shorter than the splits, and several blocks per split with a
+/// ragged tail, split one way, five ways and 32 ways, for query groups of
+/// one, two and four heads; the merge closes the splits into the same
+/// answer. The rows past the length are NaN.
+///
+/// # Panics
+///
+/// When an output differs from the oracle by more than 2e-5.
+pub fn decode_attention_reads_its_length_from_the_state(gpu: &Gpu) {
+    // Groups of two (one tile), four (two tiles) and one (a tile's edge).
+    for (heads, kv_heads, hd) in [(16usize, 8usize, 128usize), (8, 2, 128), (3, 3, 64)] {
+        decode_attention_case(gpu, heads, kv_heads, hd);
+    }
+}
+
+fn decode_attention_case(gpu: &Gpu, heads: usize, kv_heads: usize, hd: usize) {
+    let cap = 1100usize;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let q = oracle::signal(heads * hd, 181);
+    let qb = gpu.upload(&f32_bytes(&q));
+    for pos in [0usize, 3, 1037] {
+        let k = cache_plane(kv_heads, cap, hd, pos + 1, 182);
+        let v = cache_plane(kv_heads, cap, hd, pos + 1, 183);
+        let (kb, vb) = (gpu.upload(&f32_bytes(&k)), gpu.upload(&f32_bytes(&v)));
+        let state = decode_state(gpu, pos as u32, 0);
+        let want = cache_attn_oracle(&CacheAttnOracle {
+            q: &q,
+            k: &k,
+            v: &v,
+            n_q: 1,
+            heads,
+            kv_heads,
+            hd,
+            pos0: pos,
+            cap,
+            scale,
+        });
+        for splits in [1usize, 5, 32] {
+            let partials = gpu.upload(&f32_bytes(&vec![f32::NAN; heads * splits * (hd + 2)]));
+            let out = gpu.upload(&f32_bytes(&vec![f32::NAN; heads * hd]));
+            let args = CacheAttnArgs {
+                n_q: 1,
+                heads: heads as u32,
+                kv_heads: kv_heads as u32,
+                head_dim: hd as u32,
+                pos0: 0,
+                cap: cap as u32,
+                scale,
+                splits: splits as u32,
+            };
+            launch(
+                gpu,
+                "kernel_audio_decode_attn_f32",
+                Extent3::new(
+                    kv_heads as u32,
+                    blocks(splits, DECODE_SPLITS_PER_TG),
+                    blocks(heads / kv_heads, DECODE_GROUP_TILE),
+                ),
+                Extent3::linear(32 * DECODE_SPLITS_PER_TG),
+                0,
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(partials.view()),
+                    KernelArg::Buffer(qb.view()),
+                    KernelArg::Buffer(kb.view()),
+                    KernelArg::Buffer(vb.view()),
+                    KernelArg::Buffer(state.view()),
+                ],
+            );
+            launch(
+                gpu,
+                "kernel_audio_decode_attn_merge_f32",
+                Extent3::linear(heads as u32),
+                Extent3::linear(DECODE_MERGE_THREADS),
+                0,
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(partials.view()),
+                ],
+            );
+            drain(gpu);
+            close(
+                &gpu.read_f32(&out),
+                &want,
+                2e-5,
+                &format!(
+                    "decode attention, {heads}/{kv_heads} heads of {hd}, pos {pos}, {splits} splits"
+                ),
+            );
+        }
+    }
+}
+
+/// The append writes its rows at the state's position, head by head into
+/// the `[kv_heads][cap][hd]` planes, leaves every other row alone, and
+/// drops a row that would land at or past the capacity.
+///
+/// # Panics
+///
+/// When a row is written where it should not be, or not where it should.
+pub fn kv_append_writes_at_the_state_position(gpu: &Gpu) {
+    let (kv_heads, hd, cap, rows) = (2usize, 128usize, 20usize, 3usize);
+    for pos in [5usize, 18] {
+        let (k0, v0) = (
+            oracle::signal(kv_heads * cap * hd, 191),
+            oracle::signal(kv_heads * cap * hd, 192),
+        );
+        let (kn, vn) = (
+            oracle::signal(rows * kv_heads * hd, 193),
+            oracle::signal(rows * kv_heads * hd, 194),
+        );
+        let (kc, vc) = (gpu.upload(&f32_bytes(&k0)), gpu.upload(&f32_bytes(&v0)));
+        let (kb, vb) = (gpu.upload(&f32_bytes(&kn)), gpu.upload(&f32_bytes(&vn)));
+        let state = decode_state(gpu, pos as u32, 0);
+        let args = KvAppendArgs {
+            rows: rows as u32,
+            kv_heads: kv_heads as u32,
+            head_dim: hd as u32,
+            cap: cap as u32,
+        };
+        launch(
+            gpu,
+            "kernel_audio_kv_append_f32",
+            Extent3::linear(blocks(rows * kv_heads * hd, LINEAR_BLOCK)),
+            Extent3::linear(LINEAR_BLOCK),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(kc.view()),
+                KernelArg::Buffer(vc.view()),
+                KernelArg::Buffer(kb.view()),
+                KernelArg::Buffer(vb.view()),
+                KernelArg::Buffer(state.view()),
+            ],
+        );
+        drain(gpu);
+        let place = |plane: &[f32], new: &[f32]| {
+            let mut want = plane.to_vec();
+            for r in 0..rows {
+                if pos + r >= cap {
+                    continue;
+                }
+                for h in 0..kv_heads {
+                    let dst = (h * cap + pos + r) * hd;
+                    let src = (r * kv_heads + h) * hd;
+                    want[dst..dst + hd].copy_from_slice(&new[src..src + hd]);
+                }
+            }
+            want
+        };
+        close(
+            &gpu.read_f32(&kc),
+            &place(&k0, &kn),
+            0.0,
+            &format!("kv append k, pos {pos}"),
+        );
+        close(
+            &gpu.read_f32(&vc),
+            &place(&v0, &vn),
+            0.0,
+            &format!("kv append v, pos {pos}"),
+        );
+        assert_eq!(
+            read_u32(gpu, &state)[DEC_POS],
+            pos as u32,
+            "the append leaves the position to the step"
+        );
+    }
+}
+
+/// Queues a batch of decode steps over scripted argmax ids with no read
+/// between them, as the decoder does, and returns the slots and the state.
+fn decode_batch(
+    gpu: &Gpu,
+    state: &DeviceBuffer,
+    ids: &[u32],
+    max_tokens: u32,
+    first_advance: u32,
+) -> (Vec<u32>, Vec<u32>) {
+    let out = gpu.upload(&u32_bytes(&vec![7777; ids.len()]));
+    let id_bufs: Vec<DeviceBuffer> = ids
+        .iter()
+        .map(|&id| gpu.upload(&u32_bytes(&[id])))
+        .collect();
+    for (slot, idb) in id_bufs.iter().enumerate() {
+        let args = DecodeStepArgs {
+            eos0: 151_643,
+            eos1: 151_645,
+            max_tokens,
+            advance: if slot == 0 { first_advance } else { 1 },
+            slot: slot as u32,
+        };
+        launch(
+            gpu,
+            "kernel_audio_decode_step_u32",
+            Extent3::linear(1),
+            Extent3::linear(1),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(state.view()),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(idb.view()),
+            ],
+        );
+    }
+    drain(gpu);
+    (read_u32(gpu, &out), read_u32(gpu, state))
+}
+
+/// The step appends each argmax to its slot and advances the position, stops
+/// on either end id without emitting it, stops after the token cap with the
+/// last token kept, and once stopped every later step in the batch writes
+/// the no-token mark and changes nothing.
+///
+/// # Panics
+///
+/// When a slot or a state word differs from the rules.
+pub fn decode_step_stops_on_eos_and_goes_quiet(gpu: &Gpu) {
+    let none = u32::MAX;
+    // The first step takes the prefill's argmax: nothing was appended for it,
+    // so the position stays where the host left it.
+    let state = decode_state(gpu, 10, 0);
+    let (out, s) = decode_batch(gpu, &state, &[5, 6, 151_645, 7, 8], 100, 0);
+    assert_eq!(out, vec![5, 6, none, none, none]);
+    assert_eq!(s[DEC_POS], 12, "steps 1 and 2 each fed one row");
+    assert_eq!(s[DEC_COUNT], 2);
+    assert_eq!(s[DEC_DONE], 1);
+    assert_eq!(s[DEC_TOKEN], 6, "the end id is not the last token");
+    assert_eq!(s[DEC_EMIT], 0);
+    assert_eq!(s[DEC_STOP], DEC_STOP_EOS);
+    // The other end id, with every step fed.
+    let state = decode_state(gpu, 3, 42);
+    let (out, s) = decode_batch(gpu, &state, &[9, 151_643, 1], 100, 1);
+    assert_eq!(out, vec![9, none, none]);
+    assert_eq!(s[DEC_POS], 5);
+    assert_eq!((s[DEC_COUNT], s[DEC_TOKEN]), (1, 9));
+    assert_eq!(s[DEC_STOP], DEC_STOP_EOS);
+    // The cap keeps its last token and then goes quiet.
+    let state = decode_state(gpu, 0, 42);
+    let (out, s) = decode_batch(gpu, &state, &[1, 2, 3, 4, 5], 3, 1);
+    assert_eq!(out, vec![1, 2, 3, none, none]);
+    assert_eq!((s[DEC_POS], s[DEC_COUNT], s[DEC_TOKEN]), (3, 3, 3));
+    assert_eq!(
+        (s[DEC_DONE], s[DEC_STOP], s[DEC_EMIT]),
+        (1, DEC_STOP_CAP, 0)
+    );
+    // A batch still running leaves done low and the emit flag up.
+    let state = decode_state(gpu, 0, 42);
+    let (out, s) = decode_batch(gpu, &state, &[11, 12], 100, 1);
+    assert_eq!(out, vec![11, 12]);
+    assert_eq!((s[DEC_POS], s[DEC_COUNT], s[DEC_TOKEN]), (2, 2, 12));
+    assert_eq!((s[DEC_DONE], s[DEC_STOP], s[DEC_EMIT]), (0, 0, 1));
+    // A later batch on the same state carries on from it.
+    let (out, s) = decode_batch(gpu, &state, &[13, 151_645], 100, 1);
+    assert_eq!(out, vec![13, none]);
+    assert_eq!((s[DEC_POS], s[DEC_COUNT], s[DEC_TOKEN]), (4, 3, 13));
+}
+
+/// MLX 8-bit affine rows: per group of `group` elements a bf16 scale and bias,
+/// the bytes packed four to a little-endian u32. Returns the words', scales'
+/// and biases' bytes.
+fn affine8_fixture(rows: usize, width: usize, group: usize, seed: u32) -> [Vec<u8>; 3] {
+    let raw = oracle::signal(rows * width, seed);
+    let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
+    let (mut words, mut scales, mut biases) = (Vec::new(), Vec::new(), Vec::new());
+    for g in raw.chunks(group) {
+        let lo = g.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = g.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let s = f32::from_bits(u32::from(bf16((hi - lo) / 255.0)) << 16);
+        let b = f32::from_bits(u32::from(bf16(lo)) << 16);
+        scales.extend_from_slice(&bf16(s).to_le_bytes());
+        biases.extend_from_slice(&bf16(b).to_le_bytes());
+        for v in g {
+            words.push(((v - b) / s).round().clamp(0.0, 255.0) as u8);
+        }
+    }
+    [words, scales, biases]
+}
+
+/// Element `i` of an affine fixture as the kernel dequantises it: one fused
+/// multiply-add of the byte, the group's scale and its bias.
+fn affine8_value(fx: &[Vec<u8>; 3], group: usize, i: usize) -> f32 {
+    let g = i / group;
+    let bf16 =
+        |b: &[u8]| f32::from_bits(u32::from(u16::from_le_bytes([b[2 * g], b[2 * g + 1]])) << 16);
+    f32::from(fx[0][i]).mul_add(bf16(&fx[1]), bf16(&fx[2]))
+}
+
+/// The embedding row of the state's last token, for every storage the text
+/// embedding comes in, dequantised exactly; zeros for a token past the table.
+///
+/// # Panics
+///
+/// When a value differs from the table's.
+pub fn embed_token_takes_the_state_token_row(gpu: &Gpu) {
+    let (vocab, width, group) = (9usize, 320usize, 64usize);
+    let dense: Vec<(&str, &'static str)> = vec![
+        ("f32w", "kernel_audio_embed_token_f32w"),
+        ("bf16w", "kernel_audio_embed_token_bf16w"),
+        ("f16w", "kernel_audio_embed_token_f16w"),
+        ("q8_0w", "kernel_audio_embed_token_q8_0w"),
+    ];
+    let args = EmbedTokenArgs {
+        width: width as u32,
+        vocab: vocab as u32,
+        group: group as u32,
+    };
+    let grid = Extent3::linear(blocks(width, LINEAR_BLOCK));
+    let row_of = |values: &[f32], token: u32| -> Vec<f32> {
+        let k = token as usize;
+        if k < vocab {
+            values[k * width..(k + 1) * width].to_vec()
+        } else {
+            vec![0.0; width]
+        }
+    };
+    for (kind, entry) in dense {
+        let (bytes, values) = weight_fixture(kind, vocab * width, 201);
+        let tb = gpu.upload(&bytes);
+        for token in [0u32, 7, 9] {
+            let state = decode_state(gpu, 0, token);
+            let out = gpu.upload(&f32_bytes(&vec![f32::NAN; width]));
+            launch(
+                gpu,
+                entry,
+                grid,
+                Extent3::linear(LINEAR_BLOCK),
+                0,
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(tb.view()),
+                    KernelArg::Buffer(state.view()),
+                ],
+            );
+            drain(gpu);
+            close(
+                &gpu.read_f32(&out),
+                &row_of(&values, token),
+                0.0,
+                &format!("embed token {kind} {token}"),
+            );
+        }
+    }
+    let fx = affine8_fixture(vocab, width, group, 202);
+    let values: Vec<f32> = (0..vocab * width)
+        .map(|i| affine8_value(&fx, group, i))
+        .collect();
+    let (wb, sb, bb) = (gpu.upload(&fx[0]), gpu.upload(&fx[1]), gpu.upload(&fx[2]));
+    for token in [0u32, 7, 9] {
+        let state = decode_state(gpu, 0, token);
+        let out = gpu.upload(&f32_bytes(&vec![f32::NAN; width]));
+        launch(
+            gpu,
+            "kernel_audio_embed_token_affine8w",
+            grid,
+            Extent3::linear(LINEAR_BLOCK),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(wb.view()),
+                KernelArg::Buffer(sb.view()),
+                KernelArg::Buffer(bb.view()),
+                KernelArg::Buffer(state.view()),
+            ],
+        );
+        drain(gpu);
+        close(
+            &gpu.read_f32(&out),
+            &row_of(&values, token),
+            0.0,
+            &format!("embed token affine8w {token}"),
+        );
+    }
+}
+
+/// The state-driven rotary embedding is the plain one at the state's position
+/// plus the offset, bit for bit.
+///
+/// # Panics
+///
+/// When a value differs from the plain rotation's.
+pub fn rope_half_state_takes_its_position_from_the_state(gpu: &Gpu) {
+    let (rows, heads, hd, theta) = (2usize, 16usize, 128usize, 1.0e6f32);
+    let (pos, offset) = (4093u32, 1u32);
+    let x = oracle::signal(rows * heads * hd, 211);
+    let pairs = rows * heads * hd / 2;
+    let rotate = |entry: &'static str, pos0: u32, state: Option<&DeviceBuffer>| {
+        let buf = gpu.upload(&f32_bytes(&x));
+        let args = RopeArgs {
+            rows: rows as u32,
+            heads: heads as u32,
+            head_dim: hd as u32,
+            pos0,
+            theta,
+        };
+        let mut bind = vec![
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(buf.view()),
+        ];
+        if let Some(s) = state {
+            bind.push(KernelArg::Buffer(s.view()));
+        }
+        launch(
+            gpu,
+            entry,
+            Extent3::linear(blocks(pairs, LINEAR_BLOCK)),
+            Extent3::linear(LINEAR_BLOCK),
+            0,
+            &bind,
+        );
+        drain(gpu);
+        gpu.read_f32(&buf)
+    };
+    let state = decode_state(gpu, pos, 0);
+    let got = rotate("kernel_audio_rope_half_state_f32", offset, Some(&state));
+    let want = rotate("kernel_audio_rope_half_f32", pos + offset, None);
+    close(&got, &want, 0.0, "rope at the state's position");
 }

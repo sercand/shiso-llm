@@ -78,3 +78,65 @@ kernel void kernel_audio_rms_norm_f32(
         dst[i] = has_weight ? y * weight[i] : y;
     }
 }
+
+/// `x += add`, then `out = x * rsqrt(mean(x^2) + eps) (* w)`: a residual add
+/// and the RMS norm after it in one pass, each sum and the reduction formed
+/// exactly as the axpy (at alpha 1) and the RMS norm above form them. `out`
+/// may be `add` (each thread reads and writes only its own elements); it may
+/// not be `x`.
+kernel void kernel_audio_add_rms_norm_f32(
+        constant audio_args_norm & args [[buffer(0)]],
+        device float *out               [[buffer(1)]],
+        device float *x                 [[buffer(2)]],
+        device const float *add         [[buffer(3)]],
+        device const float *weight      [[buffer(4)]],
+        threadgroup float *scratch      [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    const uint r = tgpig.x;
+    if (r >= args.rows) {
+        return;
+    }
+    const uint nt = ntg.x;
+    device float *src = x + (uint64_t) r * args.dim;
+    device const float *a = add + (uint64_t) r * args.dim;
+    device float *dst = out + (uint64_t) r * args.dim;
+    // A thread's values are loaded before any is stored, eight at a time:
+    // the stores may alias the loads as far as the compiler knows, and a
+    // row of 2048 read one dependent round trip at a time took 11 us.
+    const uint R = AUDIO_ADD_RMS_RUN;
+    const bool has_weight = (args.flags & AUDIO_NORM_HAS_WEIGHT) != 0u;
+    float sq = 0.0f;
+    for (uint base = tpitg.x; base < args.dim; base += R * nt) {
+        float v[AUDIO_ADD_RMS_RUN];
+        for (uint j = 0; j < R; ++j) {
+            const uint i = base + j * nt;
+            v[j] = i < args.dim ? src[i] + a[i] : 0.0f;
+        }
+        for (uint j = 0; j < R; ++j) {
+            const uint i = base + j * nt;
+            if (i < args.dim) {
+                src[i] = v[j];
+                sq += v[j] * v[j];
+            }
+        }
+    }
+    const float rms = rsqrt(audio_block_sum(sq, scratch, tpitg.x, nt) / (float) args.dim + args.eps);
+    for (uint base = tpitg.x; base < args.dim; base += R * nt) {
+        float v[AUDIO_ADD_RMS_RUN];
+        float g[AUDIO_ADD_RMS_RUN];
+        for (uint j = 0; j < R; ++j) {
+            const uint i = base + j * nt;
+            v[j] = i < args.dim ? src[i] : 0.0f;
+            g[j] = i < args.dim && has_weight ? weight[i] : 1.0f;
+        }
+        for (uint j = 0; j < R; ++j) {
+            const uint i = base + j * nt;
+            if (i < args.dim) {
+                const float y = v[j] * rms;
+                dst[i] = has_weight ? y * g[j] : y;
+            }
+        }
+    }
+}

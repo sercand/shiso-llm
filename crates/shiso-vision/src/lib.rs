@@ -61,6 +61,7 @@ mod error;
 mod ffmpeg;
 mod image;
 mod item;
+mod mp4;
 pub mod shard;
 mod tower;
 mod video;

@@ -16,8 +16,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use shiso_audio::{
-    AudioError, Filterbank, Framing, MelScale, MelSpec, PieceVocab, Preemphasis, RecognizerStream,
-    Spectrum, SpeechRecognizer, StreamOptions, Window,
+    AudioError, Filterbank, Framing, LogScale, MelScale, MelSpec, PieceVocab, Preemphasis,
+    RecognizerStream, Spectrum, SpeechRecognizer, StreamOptions, Window,
 };
 use shiso_core::Backend;
 
@@ -90,7 +90,9 @@ pub fn open(path: &Path, backend: &Arc<dyn Backend>) -> Result<Option<NemotronAs
         preemphasis: Preemphasis::Signal(0.97),
         spectrum: Spectrum::Power,
         filterbank,
-        log_guard: 2f32.powi(-24),
+        log_scale: LogScale::Natural {
+            guard: 2f32.powi(-24),
+        },
     };
     let special = (0..config.vocab)
         .map(|id| {
