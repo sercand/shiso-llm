@@ -474,3 +474,23 @@ fn the_constants_the_mmproj_lacks_are_stated() {
     assert_eq!(language_name("mk"), Some("Macedonian"));
     assert_eq!(language_name("xx"), None);
 }
+
+#[test]
+fn a_bare_relative_gguf_is_looked_for_beside_it_in_the_working_directory() {
+    // `--asr-model X-Q8_0.gguf`: the file's parent is the empty path, which
+    // is the working directory, not a directory that cannot be listed. The
+    // tests run in the crate's directory, which holds no mmproj, so the
+    // search ends in the refusal that names the flag, not an IO error.
+    let err = super::find_mmproj(Path::new("Absent-Q8_0.gguf")).expect_err("no mmproj here");
+    assert!(
+        matches!(err, shiso_audio::AudioError::Checkpoint { .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("--asr-mmproj"), "{err}");
+    assert_eq!(super::dir_of(Path::new("Absent-Q8_0.gguf")), Path::new("."));
+    assert_eq!(
+        super::dir_of(Path::new("gguf/A-Q8_0.gguf")),
+        Path::new("gguf")
+    );
+    assert_eq!(super::dir_of(Path::new("/A-Q8_0.gguf")), Path::new("/"));
+}

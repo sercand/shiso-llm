@@ -465,10 +465,7 @@ fn located_gguf(text: &Path, mmproj: Option<&Path>) -> Result<Located, AudioErro
     check_mmproj(&tower)?;
     Ok(Located {
         flavour: Flavour::Gguf,
-        dir: text
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
+        dir: dir_of(text).to_path_buf(),
         weights: vec![text.to_path_buf()],
         mmproj: Some(tower),
         affine_group: None,
@@ -483,9 +480,18 @@ fn quant_suffix(p: &Path) -> Option<String> {
     stem.rsplit_once('-').map(|(_, s)| s.to_owned())
 }
 
+/// The directory `path` sits in: its parent, or the working directory for a
+/// bare file name, whose parent is the empty path (and `read_dir("")` fails).
+fn dir_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 /// The one `mmproj-*.gguf` beside `text` with the same quantisation suffix.
 fn find_mmproj(text: &Path) -> Result<PathBuf, AudioError> {
-    let dir = text.parent().unwrap_or_else(|| Path::new("."));
+    let dir = dir_of(text);
     let candidates: Vec<PathBuf> = gguf_files(dir)?
         .into_iter()
         .filter(|p| file_name(p).starts_with("mmproj-"))
