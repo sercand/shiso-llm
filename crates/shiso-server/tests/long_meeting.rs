@@ -9,6 +9,13 @@
 //! is ever printed, asserted into a message, or written anywhere; only
 //! aggregate counts, times and percentages are.
 //!
+//! The checkpoints are read from the same roots as `transcription_e2e.rs`:
+//! `SHISO_TEST_MODEL_QWEN3ASR`, `SHISO_TEST_MODEL_R2T2`,
+//! `SHISO_TEST_MODEL_ASR` (Nemotron) and `SHISO_TEST_MODEL_DIAR`; a
+//! recognizer whose root is unset or lacks its file is skipped on stderr.
+//! `SHISO_TEST_FFMPEG` names the `ffmpeg` that decodes the `m4a`, `ffmpeg` on
+//! `PATH` by default.
+//!
 //! The export is another system's output, not ground truth: it catches
 //! regressions and compares recognizers, so only a floor is asserted (word
 //! error rate under 50%, speaker agreement over 50%) for the Qwen3 family.
@@ -39,17 +46,35 @@ fn say(line: &str) {
 
 const BOUNDARY: &str = "shiso-long-meeting-boundary";
 
-/// The MLX diarizer every recognizer in this test shares.
-const DIARIZER: &str = "/Users/sercand/models/Nemotron-3-Diarization/mlx";
-/// The decoder for the meeting's `m4a` container.
-const FFMPEG: &str = "/opt/homebrew/bin/ffmpeg";
+/// The MLX diarizer every recognizer in this test shares, under
+/// `SHISO_TEST_MODEL_DIAR`; `None` having said why on stderr.
+fn diarizer() -> Option<PathBuf> {
+    let Some(root) = std::env::var_os("SHISO_TEST_MODEL_DIAR") else {
+        say("SKIP: SHISO_TEST_MODEL_DIAR is unset");
+        return None;
+    };
+    let path = Path::new(&root).join("mlx");
+    if !path.exists() {
+        say(&format!("SKIP: the diarizer {} is absent", path.display()));
+        return None;
+    }
+    Some(path)
+}
+
+/// The decoder for the meeting's `m4a` container: `SHISO_TEST_FFMPEG`, or
+/// `ffmpeg` on `PATH`.
+fn ffmpeg() -> String {
+    std::env::var("SHISO_TEST_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned())
+}
 
 /// One recognizer this test runs the meeting through.
 struct Recognizer {
     /// The name it answers to in the transcription's `model` field.
     name: &'static str,
-    /// Its checkpoint: a GGUF file (mmproj auto-picked) or an export
-    /// directory.
+    /// The variable naming its model root.
+    root: &'static str,
+    /// Its checkpoint under that root: a GGUF file (mmproj auto-picked) or an
+    /// export directory.
     model: &'static str,
     /// Whether its word error rate and speaker agreement are asserted, not
     /// only printed. Nemotron is a comparison point, not a target.
@@ -59,23 +84,26 @@ struct Recognizer {
 const RECOGNIZERS: &[Recognizer] = &[
     Recognizer {
         name: "qwen3-asr-q8",
-        model: "/Users/sercand/models/Qwen3-ASR-1.7B/gguf/Qwen3-ASR-1.7B-Q8_0.gguf",
+        root: "SHISO_TEST_MODEL_QWEN3ASR",
+        model: "gguf/Qwen3-ASR-1.7B-Q8_0.gguf",
         assert_floor: true,
     },
     Recognizer {
         name: "qwen3-asr-mlx",
-        model: "/Users/sercand/models/Qwen3-ASR-1.7B/mlx",
+        root: "SHISO_TEST_MODEL_QWEN3ASR",
+        model: "mlx",
         assert_floor: true,
     },
     Recognizer {
         name: "r2t2-q8",
-        model: "/Users/sercand/models/R2T2/gguf/Confucius4-R2T2-Q8_0.gguf",
+        root: "SHISO_TEST_MODEL_R2T2",
+        model: "gguf/Confucius4-R2T2-Q8_0.gguf",
         assert_floor: true,
     },
     Recognizer {
         name: "nemotron-q8",
-        model: "/Users/sercand/models/nemotron-3.5-asr-streaming-0.6b/nvidia/\
-                nemotron-3.5-asr-streaming-0.6b.q8_0.gguf",
+        root: "SHISO_TEST_MODEL_ASR",
+        model: "nvidia/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf",
         assert_floor: false,
     },
 ];
@@ -149,28 +177,42 @@ async fn post(state: &Arc<AppState>, body: Vec<u8>) -> (StatusCode, String) {
 /// A recognizer and the shared MLX diarizer, booted as the binary boots them,
 /// with `--audio-allow-ffmpeg` and a `--audio-max-seconds` wide enough for the
 /// meeting. `None` having said on stderr why the checkpoint was skipped.
-fn boot(recognizer: &Recognizer) -> Option<Arc<AppState>> {
-    if !Path::new(recognizer.model).exists() {
+fn boot(recognizer: &Recognizer, diarizer: &Path) -> Option<Arc<AppState>> {
+    let Some(root) = std::env::var_os(recognizer.root) else {
+        say(&format!(
+            "SKIP {}: {} is unset",
+            recognizer.name, recognizer.root
+        ));
+        return None;
+    };
+    let model = Path::new(&root).join(recognizer.model);
+    if !model.exists() {
         say(&format!(
             "SKIP {}: {} is absent",
-            recognizer.name, recognizer.model
+            recognizer.name,
+            model.display()
         ));
         return None;
     }
+    let (model, diarizer, ffmpeg) = (
+        model.display().to_string(),
+        diarizer.display().to_string(),
+        ffmpeg(),
+    );
     let line = [
         "shiso",
         "serve",
         "--asr-model",
-        recognizer.model,
+        &model,
         "--asr-id",
         recognizer.name,
         "--diarization-model",
-        DIARIZER,
+        &diarizer,
         "--audio-allow-ffmpeg",
         "--audio-max-seconds",
         "3600",
         "--video-ffmpeg-path",
-        FFMPEG,
+        &ffmpeg,
         // The default 20 s watchdog is sized for short video clips, not a
         // 57-minute container; ffmpeg's own decode is well under this, but
         // the margin costs nothing.
@@ -419,10 +461,9 @@ async fn long_meeting_recognizers() {
         say("SKIP: no Metal device");
         return;
     }
-    if !Path::new(DIARIZER).exists() {
-        say(&format!("SKIP: the diarizer {DIARIZER} is absent"));
+    let Some(diarizer) = diarizer() else {
         return;
-    }
+    };
 
     let audio_bytes =
         std::fs::read(&audio_path).unwrap_or_else(|error| panic!("reading the meeting: {error}"));
@@ -434,7 +475,7 @@ async fn long_meeting_recognizers() {
     ));
 
     for recognizer in RECOGNIZERS {
-        let Some(state) = boot(recognizer) else {
+        let Some(state) = boot(recognizer, &diarizer) else {
             continue;
         };
         let started = Instant::now();
