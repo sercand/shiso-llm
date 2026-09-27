@@ -20,6 +20,7 @@ pub mod load;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod testing;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ use shiso_core::{
 
 pub use fused::{AddRmsNormDesc, ArgmaxWideDesc, QkRopeAppendDesc, argmax_wide_parts};
 pub use linear::{GemmType, Linear, LinearWeight, step_silu, step3};
+pub use workspace::Workspace;
 
 use args::{
     ArgmaxArgs, AxpyArgs, BiasRowsArgs, CacheAttnArgs, Conv2dArgs, DecodeStepArgs, DwConv1dArgs,
@@ -833,6 +835,21 @@ impl Ops {
         let buffer = shiso_core::alloc(&self.backend, bytes)?;
         self.backend.fill_zero(buffer.view())?;
         Ok(buffer)
+    }
+
+    /// A buffer of `floats` f32 values whose contents are undefined, for
+    /// one every element of which a kernel writes before any is read:
+    /// [`Self::scratch`]'s fill costs a pass over the memory, and on a fresh
+    /// buffer that pass is also its first touch.
+    ///
+    /// # Errors
+    ///
+    /// Allocation failures from the backend.
+    pub fn scratch_uninit(&self, floats: usize) -> CoreResult<DeviceBuffer> {
+        let bytes = u64::try_from(floats.max(1))
+            .unwrap_or(u64::MAX)
+            .saturating_mul(4);
+        shiso_core::alloc(&self.backend, bytes)
     }
 
     fn launch(

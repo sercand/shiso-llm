@@ -24,7 +24,7 @@ mod stream;
 pub mod weights;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use shiso_audio::{
     AudioError, Language, LogScale, MelSpec, PieceVocab, RecognizerStream, SpeechRecognizer,
@@ -43,6 +43,9 @@ pub(crate) struct Model {
     pub(crate) config: Qwen3AsrConfig,
     pub(crate) weights: QwenAsrWeights,
     pub(crate) vocab: Arc<PieceVocab>,
+    /// Device memory of streams that have closed, for the next to take
+    /// (see `stream::Memory`).
+    pub(crate) spare: Mutex<Vec<stream::Memory>>,
 }
 
 /// A loaded checkpoint of this architecture.
@@ -85,6 +88,7 @@ pub fn open(
             config,
             weights,
             vocab,
+            spare: Mutex::new(Vec::new()),
         }),
         mel,
     }))

@@ -42,6 +42,7 @@ use super::config::{ASR_TEXT, language_code};
 use super::decoder::{Decoder, KvCache, MAX_NEW_TOKENS};
 use super::encoder::Tower;
 use super::prompt;
+use crate::audio_ops::Workspace;
 
 /// Seconds per mel frame, the unit of every token's frame.
 pub(crate) const MEL_FRAME_SECS: f64 = 0.01;
@@ -305,6 +306,18 @@ pub(crate) fn chunk_events(
     }
 }
 
+/// A stream's device memory: the decoder's cache and activations and the
+/// tower's scratch, all written before they are read. A closed stream hands
+/// it back to the model for the next one, because a fresh buffer's first
+/// touch costs some 50 us a megabyte (M1 Max) and a stream's is several
+/// hundred megabytes.
+#[derive(Debug)]
+pub(crate) struct Memory {
+    cache: KvCache,
+    decoder: Workspace,
+    tower: Workspace,
+}
+
 /// A stream of this recognizer.
 #[derive(Debug)]
 pub(crate) struct QwenStream {
@@ -312,7 +325,8 @@ pub(crate) struct QwenStream {
     /// The language the prompt forces, by the model's name for it.
     forced: Option<&'static str>,
     planner: Planner,
-    cache: KvCache,
+    /// Always `Some` until the stream is dropped and gives it back.
+    memory: Option<Memory>,
     /// Mel rows from the planner's start, row-major, first-stage `log10`.
     pending: Vec<f32>,
     /// Whether any chunk has written text.
@@ -328,12 +342,21 @@ impl QwenStream {
         forced: Option<&'static str>,
         cuts: Option<&[u32]>,
     ) -> Result<Self, AudioError> {
-        let cache = KvCache::new(&model.config.text);
+        let spare = model
+            .spare
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        let memory = spare.unwrap_or_else(|| Memory {
+            cache: KvCache::new(&model.config.text),
+            decoder: Workspace::new(),
+            tower: Workspace::new(),
+        });
         Ok(Self {
+            planner: Planner::new(cuts)?,
             model,
             forced,
-            planner: Planner::new(cuts)?,
-            cache,
+            memory: Some(memory),
             pending: Vec::new(),
             wrote_text: false,
             language: None,
@@ -372,9 +395,14 @@ impl QwenStream {
             data.resize(MIN_CHUNK_FRAMES * n, SILENT_LOG10);
         }
         let mel = log10_max_floor(&MelFrames::from_rows(data, n)?);
-        let audio = Tower::new(&m.ops, &m.weights.tower, &m.config.audio).encode(&mel)?;
-        let ids = Decoder::new(&m.ops, &m.weights.text, &m.config.text).transcribe(
-            &mut self.cache,
+        let memory = self.memory.as_mut().ok_or_else(|| AudioError::Checkpoint {
+            what: "a stream without its device memory".into(),
+        })?;
+        let audio = Tower::new(&m.ops, &m.weights.tower, &m.config.audio)
+            .encode_with(&mel, &mut memory.tower)?;
+        let ids = Decoder::new(&m.ops, &m.weights.text, &m.config.text).transcribe_with(
+            &mut memory.cache,
+            &mut memory.decoder,
             &audio,
             self.forced,
         )?;
@@ -392,6 +420,18 @@ impl QwenStream {
             span,
             self.wrote_text,
         ))
+    }
+}
+
+impl Drop for QwenStream {
+    fn drop(&mut self) {
+        if let Some(memory) = self.memory.take() {
+            self.model
+                .spare
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(memory);
+        }
     }
 }
 

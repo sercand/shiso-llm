@@ -22,10 +22,9 @@ use shiso_core::{DeviceBuffer, DeviceView};
 
 use super::config::{AudioConfig, CHUNK_FRAMES, TOKENS_PER_CHUNK, WINDOW_TOKENS};
 use super::weights::{Conv, Norm, TowerLayer, TowerWeights};
-use crate::audio_ops::load::upload_f32;
 use crate::audio_ops::{
     AttnWindow, AxpyDesc, BiasRowsDesc, Conv2dGeometry, Im2colDesc, Linear, NormDesc, Ops,
-    TransposeDesc, UnaryDesc, UnaryOp, WindowAttnDesc,
+    TransposeDesc, UnaryDesc, UnaryOp, WindowAttnDesc, Workspace,
 };
 
 /// Chunks one pass of the conv stem takes. The second conv's patches are
@@ -111,15 +110,35 @@ impl Stem {
     }
 }
 
-/// Scratch shared by every layer, sized for one clip.
-struct Scratch {
-    x: DeviceBuffer,
-    h: DeviceBuffer,
-    q: DeviceBuffer,
-    k: DeviceBuffer,
-    v: DeviceBuffer,
-    att: DeviceBuffer,
-    up: DeviceBuffer,
+/// Scratch shared by every layer, sized for one clip: slots of the
+/// workspace.
+struct Scratch<'w> {
+    x: &'w DeviceBuffer,
+    h: &'w DeviceBuffer,
+    q: &'w DeviceBuffer,
+    k: &'w DeviceBuffer,
+    v: &'w DeviceBuffer,
+    att: &'w DeviceBuffer,
+    up: &'w DeviceBuffer,
+}
+
+/// The workspace slots of one encode: the layers' scratch, then one pass of
+/// the stem's planes, patches and outputs, reused by every group.
+mod slot {
+    pub(super) const X: usize = 0;
+    pub(super) const H: usize = 1;
+    pub(super) const Q: usize = 2;
+    pub(super) const K: usize = 3;
+    pub(super) const V: usize = 4;
+    pub(super) const ATT: usize = 5;
+    pub(super) const UP: usize = 6;
+    pub(super) const PLANES: usize = 7;
+    /// Conv `i`'s patches.
+    pub(super) const PATCHES: usize = 8;
+    /// Conv `i`'s output.
+    pub(super) const CONV: usize = 11;
+    pub(super) const FLAT: usize = 14;
+    pub(super) const COUNT: usize = 15;
 }
 
 /// The tower over one loaded checkpoint.
@@ -148,7 +167,17 @@ impl<'a> Tower<'a> {
     /// [`AudioError::BadSpec`] for mel rows of another width than the
     /// checkpoint's or a clip with no frames; a device error.
     pub fn encode(&self, mel: &MelFrames) -> Result<Encoded, AudioError> {
-        let (mels, d) = (self.config.mels, self.config.d_model);
+        self.encode_with(mel, &mut Workspace::new())
+    }
+
+    /// [`Self::encode`] in `ws`'s buffers, which a model keeps from one clip
+    /// to the next.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, mel: &MelFrames, ws: &mut Workspace) -> Result<Encoded, AudioError> {
+        let mels = self.config.mels;
         if mel.n_mels() != mels {
             return Err(AudioError::BadSpec {
                 reason: format!("mel rows of {} bins for a tower of {mels}", mel.n_mels()),
@@ -165,21 +194,30 @@ impl<'a> Tower<'a> {
         let per_chunk = frames.min(CHUNK_FRAMES);
         let chunks = frames.div_ceil(per_chunk);
         let stem_rows = stem_tokens(per_chunk);
+        ws.reserve(
+            self.ops,
+            &self.sizes(
+                &Stem::new(STEM_GROUP.min(chunks), per_chunk, mels),
+                chunks * stem_rows,
+                tokens,
+            ),
+        )?;
+        let ws = &*ws;
         let s = Scratch {
-            x: self.ops.scratch(chunks * stem_rows * d)?,
-            h: self.ops.scratch(tokens * d)?,
-            q: self.ops.scratch(tokens * d)?,
-            k: self.ops.scratch(tokens * d)?,
-            v: self.ops.scratch(tokens * d)?,
-            att: self.ops.scratch(tokens * d)?,
-            up: self.ops.scratch(tokens * self.config.ffn)?,
+            x: ws.get(slot::X),
+            h: ws.get(slot::H),
+            q: ws.get(slot::Q),
+            k: ws.get(slot::K),
+            v: ws.get(slot::V),
+            att: ws.get(slot::ATT),
+            up: ws.get(slot::UP),
         };
         let valid = &mel.as_slice()[..frames * mels];
         let mut first = 0;
         while first < chunks {
             let group = STEM_GROUP.min(chunks - first);
             let stem = Stem::new(group, per_chunk, mels);
-            self.stem(&stem, valid, first * per_chunk, &s.x, first * stem_rows)?;
+            self.stem(&stem, valid, first * per_chunk, ws, first * stem_rows)?;
             first += group;
         }
         // Only the tail chunk has rows past the clip's tokens, and it is last,
@@ -190,14 +228,40 @@ impl<'a> Tower<'a> {
         self.head(&s, tokens)
     }
 
+    /// Floats of every workspace slot, for a stem pass of `stem`'s shape, a
+    /// hidden matrix of `rows` rows and `tokens` valid tokens.
+    fn sizes(&self, stem: &Stem, rows: usize, tokens: usize) -> [usize; slot::COUNT] {
+        let (mels, channels, d) = (
+            self.config.mels,
+            self.config.conv_channels,
+            self.config.d_model,
+        );
+        let mut sizes = [0; slot::COUNT];
+        sizes[slot::X] = rows * d;
+        for i in [slot::H, slot::Q, slot::K, slot::V, slot::ATT] {
+            sizes[i] = tokens * d;
+        }
+        sizes[slot::UP] = tokens * self.config.ffn;
+        sizes[slot::PLANES] = stem.chunks * stem.extents[0].0 * mels;
+        for i in 0..3 {
+            let (t, f) = stem.extents[i + 1];
+            let c_in = if i == 0 { 1 } else { channels };
+            sizes[slot::PATCHES + i] = stem.chunks * t * f * 9 * c_in;
+            sizes[slot::CONV + i] = stem.chunks * t * f * channels;
+        }
+        sizes[slot::FLAT] = stem.chunks * stem.tokens() * channels * stem.freq();
+        sizes
+    }
+
     /// The conv stem over `stem.chunks` chunks from mel frame `frame0`, whose
-    /// `conv_out` rows, positions added, land at row `row0` of `hidden`.
+    /// `conv_out` rows, positions added, land at row `row0` of the hidden
+    /// matrix.
     fn stem(
         &self,
         stem: &Stem,
         mel: &[f32],
         frame0: usize,
-        hidden: &DeviceBuffer,
+        ws: &Workspace,
         row0: usize,
     ) -> Result<(), AudioError> {
         let (mels, channels, width) = (
@@ -207,20 +271,30 @@ impl<'a> Tower<'a> {
         );
         let per_chunk = stem.extents[0].0;
         // The chunks as planes; past the clip's end, zeros (notes §2.1).
-        let mut planes = vec![0.0f32; stem.chunks * per_chunk * mels];
+        let count = stem.chunks * per_chunk * mels;
+        let mut planes = vec![0u8; count * 4];
         let end = (frame0 + stem.chunks * per_chunk).min(mel.len() / mels);
-        planes[..(end - frame0) * mels].copy_from_slice(&mel[frame0 * mels..end * mels]);
-        let mut current = upload_f32(self.ops, &planes)?;
+        for (to, v) in planes
+            .chunks_exact_mut(4)
+            .zip(&mel[frame0 * mels..end * mels])
+        {
+            to.copy_from_slice(&v.to_le_bytes());
+        }
+        let input = ws.get(slot::PLANES);
+        self.ops
+            .backend()
+            .copy_h2d(input.slice(0, bytes(count))?, &planes)?;
+        let mut current = input;
         let mut c_in = 1;
         for (i, conv) in self.weights.convs.iter().enumerate() {
-            current = self.conv(stem, i, conv, &current, c_in)?;
+            current = self.conv(stem, i, conv, current, c_in, ws)?;
             c_in = channels;
         }
         // `[chunk][t][f][c]` to `[chunk][t][c][f]`: the reference flattens a
         // token's stem output channel-major (notes §2.2).
         let (tokens, freq) = (stem.tokens(), stem.freq());
         let token_rows = stem.chunks * tokens;
-        let flat = self.ops.scratch(token_rows * channels * freq)?;
+        let flat = ws.get(slot::FLAT);
         self.ops.transpose(&TransposeDesc {
             out: flat.view(),
             input: current.view(),
@@ -228,7 +302,7 @@ impl<'a> Tower<'a> {
             rows: freq,
             cols: channels,
         })?;
-        let out = rows(hidden, row0, token_rows, width)?;
+        let out = rows(ws.get(slot::X), row0, token_rows, width)?;
         self.weights
             .conv_out
             .forward(self.ops, flat.view(), out, token_rows)?;
@@ -244,18 +318,19 @@ impl<'a> Tower<'a> {
     /// Conv `i` of the stem and its GELU, over every chunk at once: the
     /// patches, then the GEMM against the kernel, which lands channels-last
     /// `[chunk][t][f][c]` as the next conv reads it.
-    fn conv(
+    fn conv<'w>(
         &self,
         stem: &Stem,
         i: usize,
         conv: &Conv,
         input: &DeviceBuffer,
         c_in: usize,
-    ) -> Result<DeviceBuffer, AudioError> {
+        ws: &'w Workspace,
+    ) -> Result<&'w DeviceBuffer, AudioError> {
         let c_out = self.config.conv_channels;
         let ((t_in, f_in), (t_out, f_out)) = (stem.extents[i], stem.extents[i + 1]);
         let positions = stem.chunks * t_out * f_out;
-        let patches = self.ops.scratch(positions * 9 * c_in)?;
+        let patches = ws.get(slot::PATCHES + i);
         self.ops.im2col_s2(&Im2colDesc {
             out: patches.view(),
             input: input.view(),
@@ -274,9 +349,9 @@ impl<'a> Tower<'a> {
                 batch: stem.chunks,
             },
         })?;
-        let out = self.ops.scratch(positions * c_out)?;
-        self.linear(&conv.linear, &patches, &out, positions)?;
-        self.gelu(&out, positions * c_out)?;
+        let out = ws.get(slot::CONV + i);
+        self.linear(&conv.linear, patches, out, positions)?;
+        self.gelu(out, positions * c_out)?;
         Ok(out)
     }
 
@@ -332,12 +407,12 @@ impl<'a> Tower<'a> {
     }
 
     /// One pre-norm layer, in place on `s.x` (notes §2.5).
-    fn layer(&self, layer: &TowerLayer, s: &Scratch, n: usize) -> Result<(), AudioError> {
+    fn layer(&self, layer: &TowerLayer, s: &Scratch<'_>, n: usize) -> Result<(), AudioError> {
         let d = self.config.d_model;
-        self.norm(&layer.attn_norm, &s.x, &s.h, n)?;
-        self.linear(&layer.q, &s.h, &s.q, n)?;
-        self.linear(&layer.k, &s.h, &s.k, n)?;
-        self.linear(&layer.v, &s.h, &s.v, n)?;
+        self.norm(&layer.attn_norm, s.x, s.h, n)?;
+        self.linear(&layer.q, s.h, s.q, n)?;
+        self.linear(&layer.k, s.h, s.k, n)?;
+        self.linear(&layer.v, s.h, s.v, n)?;
         self.ops.window_attention(&WindowAttnDesc {
             out: s.att.view(),
             q: s.q.view(),
@@ -363,23 +438,23 @@ impl<'a> Tower<'a> {
             ac_scale: 1.0,
             softcap: None,
         })?;
-        self.linear(&layer.o, &s.att, &s.h, n)?;
-        self.residual(&s.x, &s.h, n * d)?;
-        self.norm(&layer.ffn_norm, &s.x, &s.h, n)?;
-        self.linear(&layer.fc1, &s.h, &s.up, n)?;
-        self.gelu(&s.up, n * self.config.ffn)?;
-        self.linear(&layer.fc2, &s.up, &s.h, n)?;
-        self.residual(&s.x, &s.h, n * d)
+        self.linear(&layer.o, s.att, s.h, n)?;
+        self.residual(s.x, s.h, n * d)?;
+        self.norm(&layer.ffn_norm, s.x, s.h, n)?;
+        self.linear(&layer.fc1, s.h, s.up, n)?;
+        self.gelu(s.up, n * self.config.ffn)?;
+        self.linear(&layer.fc2, s.up, s.h, n)?;
+        self.residual(s.x, s.h, n * d)
     }
 
     /// `proj2(gelu(proj1(ln_post(x))))` (notes §2.6).
-    fn head(&self, s: &Scratch, n: usize) -> Result<Encoded, AudioError> {
+    fn head(&self, s: &Scratch<'_>, n: usize) -> Result<Encoded, AudioError> {
         let w = self.weights;
-        self.norm(&w.ln_post, &s.x, &s.h, n)?;
-        self.linear(&w.proj1, &s.h, &s.q, n)?;
-        self.gelu(&s.q, n * self.config.d_model)?;
+        self.norm(&w.ln_post, s.x, s.h, n)?;
+        self.linear(&w.proj1, s.h, s.q, n)?;
+        self.gelu(s.q, n * self.config.d_model)?;
         let out = self.ops.scratch(n * self.config.output_dim)?;
-        self.linear(&w.proj2, &s.q, &out, n)?;
+        self.linear(&w.proj2, s.q, &out, n)?;
         Ok(Encoded {
             buffer: out,
             tokens: n,

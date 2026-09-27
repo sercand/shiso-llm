@@ -39,7 +39,7 @@ use crate::audio_ops::{
     AddRmsNormDesc, ArgmaxWideDesc, AxpyDesc, CachePlanes, CausalAttnDesc, DECODE_ATTN_SPLITS,
     DECODE_COUNT, DECODE_DONE, DECODE_NO_TOKEN, DECODE_POS, DECODE_STATE_WORDS, DECODE_TOKEN,
     DecodeAttnDesc, DecodeStepDesc, EmbedTable, EmbedTokenDesc, KvAppendDesc, Linear, LinearWeight,
-    NormDesc, Ops, QkRopeAppendDesc, RopeDesc, SiluMulDesc, argmax_wide_parts,
+    NormDesc, Ops, QkRopeAppendDesc, RopeDesc, SiluMulDesc, Workspace, argmax_wide_parts,
     decode_attention_partials, step_silu, step3,
 };
 
@@ -231,17 +231,19 @@ pub(crate) struct Timing {
 }
 
 /// Activations of one transcription, sized for its prompt; a decode pass
-/// uses the first row of each.
-struct Scratch {
-    x: DeviceBuffer,
-    h: DeviceBuffer,
-    q: DeviceBuffer,
-    k: DeviceBuffer,
-    v: DeviceBuffer,
-    att: DeviceBuffer,
-    gate: DeviceBuffer,
-    up: DeviceBuffer,
-    logits: DeviceBuffer,
+/// uses the first row of each. The large ones are workspace slots, kept
+/// between transcriptions; every element of those is written before it is
+/// read.
+struct Scratch<'w> {
+    x: &'w DeviceBuffer,
+    h: &'w DeviceBuffer,
+    q: &'w DeviceBuffer,
+    k: &'w DeviceBuffer,
+    v: &'w DeviceBuffer,
+    att: &'w DeviceBuffer,
+    gate: &'w DeviceBuffer,
+    up: &'w DeviceBuffer,
+    logits: &'w DeviceBuffer,
     /// The head's argmax, one `u32`.
     ids: DeviceBuffer,
     /// The wide argmax's candidates.
@@ -299,7 +301,23 @@ impl<'a> Decoder<'a> {
         audio: &Encoded,
         forced: Option<&str>,
     ) -> Result<Vec<u32>, AudioError> {
-        let (tokens, t) = self.timed(cache, audio, forced)?;
+        self.transcribe_with(cache, &mut Workspace::new(), audio, forced)
+    }
+
+    /// [`Self::transcribe`] in `ws`'s buffers, which a model keeps from one
+    /// transcription to the next.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::transcribe`].
+    pub fn transcribe_with(
+        &self,
+        cache: &mut KvCache,
+        ws: &mut Workspace,
+        audio: &Encoded,
+        forced: Option<&str>,
+    ) -> Result<Vec<u32>, AudioError> {
+        let (tokens, t) = self.timed_with(cache, ws, audio, forced)?;
         tracing::debug!(
             prompt = t.prompt,
             prefill_ms = t.prefill.as_secs_f64() * 1e3,
@@ -312,9 +330,21 @@ impl<'a> Decoder<'a> {
     }
 
     /// [`Self::transcribe`], with where the time went.
+    #[cfg(test)]
     pub(crate) fn timed(
         &self,
         cache: &mut KvCache,
+        audio: &Encoded,
+        forced: Option<&str>,
+    ) -> Result<(Vec<u32>, Timing), AudioError> {
+        self.timed_with(cache, &mut Workspace::new(), audio, forced)
+    }
+
+    /// [`Self::transcribe_with`], with where the time went.
+    pub(crate) fn timed_with(
+        &self,
+        cache: &mut KvCache,
+        ws: &mut Workspace,
         audio: &Encoded,
         forced: Option<&str>,
     ) -> Result<(Vec<u32>, Timing), AudioError> {
@@ -337,7 +367,7 @@ impl<'a> Decoder<'a> {
         let ids = prompt::ids(audio.tokens, forced)?;
         let n = ids.len();
         let start = Instant::now();
-        let s = self.scratch(n)?;
+        let s = self.scratch(n, ws)?;
         cache.reserve(self.ops, 0, n + cache.headroom)?;
         self.embed_prompt(&s, &ids, audio)?;
         for (l, layer) in self.weights.layers.iter().enumerate() {
@@ -362,19 +392,22 @@ impl<'a> Decoder<'a> {
         Ok((tokens, timing))
     }
 
-    fn scratch(&self, n: usize) -> Result<Scratch, AudioError> {
+    fn scratch<'w>(&self, n: usize, ws: &'w mut Workspace) -> Result<Scratch<'w>, AudioError> {
         let (c, ops) = (self.config, self.ops);
         let (qw, kw) = (c.heads * c.head_dim, c.kv_heads * c.head_dim);
+        let (d, f) = (n * c.hidden, n * c.ffn);
+        ws.reserve(ops, &[d, d, n * qw, n * kw, n * kw, n * qw, f, f, c.vocab])?;
+        let ws = &*ws;
         Ok(Scratch {
-            x: ops.scratch(n * c.hidden)?,
-            h: ops.scratch(n * c.hidden)?,
-            q: ops.scratch(n * qw)?,
-            k: ops.scratch(n * kw)?,
-            v: ops.scratch(n * kw)?,
-            att: ops.scratch(n * qw)?,
-            gate: ops.scratch(n * c.ffn)?,
-            up: ops.scratch(n * c.ffn)?,
-            logits: ops.scratch(c.vocab)?,
+            x: ws.get(0),
+            h: ws.get(1),
+            q: ws.get(2),
+            k: ws.get(3),
+            v: ws.get(4),
+            att: ws.get(5),
+            gate: ws.get(6),
+            up: ws.get(7),
+            logits: ws.get(8),
             ids: ops.scratch(1)?,
             parts: ops.scratch(argmax_wide_parts(c.vocab))?,
             partials: ops.scratch(decode_attention_partials(
@@ -412,7 +445,12 @@ impl<'a> Decoder<'a> {
     /// The prompt's rows into `s.x`: each text id's embedding row, and the
     /// tower's rows over the placeholder run, in order and unscaled (notes
     /// §2.7).
-    fn embed_prompt(&self, s: &Scratch, ids: &[u32], audio: &Encoded) -> Result<(), AudioError> {
+    fn embed_prompt(
+        &self,
+        s: &Scratch<'_>,
+        ids: &[u32],
+        audio: &Encoded,
+    ) -> Result<(), AudioError> {
         let (ops, c) = (self.ops, self.config);
         let first =
             ids.iter()
@@ -421,7 +459,7 @@ impl<'a> Decoder<'a> {
                     reason: "a prompt with no audio placeholder".into(),
                 })?;
         ops.backend().copy_d2d(
-            rows(&s.x, first, audio.tokens, c.hidden)?,
+            rows(s.x, first, audio.tokens, c.hidden)?,
             rows(&audio.buffer, 0, audio.tokens, c.hidden)?,
         )?;
         // The row fetch reads its id from a decoder state; each text row gets
@@ -442,7 +480,7 @@ impl<'a> Decoder<'a> {
         let table = self.table()?;
         for (j, &(i, _)) in text.iter().enumerate() {
             ops.embed_token(&EmbedTokenDesc {
-                out: rows(&s.x, i, 1, c.hidden)?,
+                out: rows(s.x, i, 1, c.hidden)?,
                 table,
                 state: rows(&states, j, 1, DECODE_STATE_WORDS)?,
                 width: c.hidden,
@@ -491,7 +529,7 @@ impl<'a> Decoder<'a> {
         &self,
         layer: &TextLayer,
         cache: CachePlanes<'_>,
-        s: &Scratch,
+        s: &Scratch<'_>,
         n: usize,
     ) -> Result<(), AudioError> {
         let (ops, c) = (self.ops, self.config);
@@ -530,7 +568,7 @@ impl<'a> Decoder<'a> {
             scale: attention_scale(hd),
         })?;
         layer.o.forward(ops, s.att.view(), s.h.view(), n)?;
-        self.residual(&s.x, &s.h, n * c.hidden)?;
+        self.residual(s.x, s.h, n * c.hidden)?;
         self.rms(s.h.view(), s.x.view(), &layer.ffn_norm, n, c.hidden)?;
         layer.gate.forward(ops, s.h.view(), s.gate.view(), n)?;
         layer.up.forward(ops, s.h.view(), s.up.view(), n)?;
@@ -541,20 +579,20 @@ impl<'a> Decoder<'a> {
             count: n * c.ffn,
         })?;
         layer.down.forward(ops, s.gate.view(), s.h.view(), n)?;
-        self.residual(&s.x, &s.h, n * c.hidden)
+        self.residual(s.x, s.h, n * c.hidden)
     }
 
     /// The final norm of row `row` of `s.x`, the tied head, and its argmax
     /// into `s.ids`; a tie keeps the lowest id, as the reference's argmax
     /// does. After a decode pass the last layer's residual is still in
     /// `s.h`, and is added first.
-    fn head(&self, s: &Scratch, row: usize, pass: Pass) -> Result<(), AudioError> {
+    fn head(&self, s: &Scratch<'_>, row: usize, pass: Pass) -> Result<(), AudioError> {
         let (ops, c) = (self.ops, self.config);
-        let h = rows(&s.h, 0, 1, c.hidden)?;
+        let h = rows(s.h, 0, 1, c.hidden)?;
         match pass {
             Pass::Prefill => self.rms(
                 h,
-                rows(&s.x, row, 1, c.hidden)?,
+                rows(s.x, row, 1, c.hidden)?,
                 &self.weights.norm,
                 1,
                 c.hidden,
@@ -571,12 +609,12 @@ impl<'a> Decoder<'a> {
     }
 
     /// `x += h`, then `h = rms_norm(x) * weight`, over a decode pass's row.
-    fn add_rms(&self, s: &Scratch, weight: &DeviceBuffer) -> Result<(), AudioError> {
+    fn add_rms(&self, s: &Scratch<'_>, weight: &DeviceBuffer) -> Result<(), AudioError> {
         let c = self.config;
-        let h = rows(&s.h, 0, 1, c.hidden)?;
+        let h = rows(s.h, 0, 1, c.hidden)?;
         Ok(self.ops.add_rms_norm(&AddRmsNormDesc {
             out: h,
-            x: rows(&s.x, 0, 1, c.hidden)?,
+            x: rows(s.x, 0, 1, c.hidden)?,
             add: h,
             weight: Some(weight.view()),
             rows: 1,
@@ -594,7 +632,7 @@ impl<'a> Decoder<'a> {
         &self,
         layer: &TextLayer,
         cache: CachePlanes<'_>,
-        s: &Scratch,
+        s: &Scratch<'_>,
         first: bool,
     ) -> Result<(), AudioError> {
         let (ops, c) = (self.ops, self.config);
@@ -646,7 +684,7 @@ impl<'a> Decoder<'a> {
         Ok(())
     }
 
-    fn step(&self, s: &Scratch, advance: usize, slot: usize) -> Result<(), AudioError> {
+    fn step(&self, s: &Scratch<'_>, advance: usize, slot: usize) -> Result<(), AudioError> {
         Ok(self.ops.decode_step(&DecodeStepDesc {
             state: s.state.view(),
             out: s.out.view(),
@@ -660,7 +698,7 @@ impl<'a> Decoder<'a> {
 
     /// One decode pass over the state's last token, ending in the head's
     /// argmax.
-    fn pass(&self, cache: &KvCache, s: &Scratch) -> Result<(), AudioError> {
+    fn pass(&self, cache: &KvCache, s: &Scratch<'_>) -> Result<(), AudioError> {
         let c = self.config;
         self.ops.embed_token(&EmbedTokenDesc {
             out: s.x.view(),
@@ -680,7 +718,7 @@ impl<'a> Decoder<'a> {
     fn decode(
         &self,
         cache: &mut KvCache,
-        s: &Scratch,
+        s: &Scratch<'_>,
         prompt: usize,
     ) -> Result<(Vec<u32>, usize), AudioError> {
         let backend = self.ops.backend();
