@@ -264,24 +264,29 @@ fn a_growing_cache_changes_nothing() {
         return;
     };
     let rows = reference_rows(&ops, "qwen3asr", "speech-en");
-    // Eight rows and no headroom: the cache grows to the prompt before the
-    // prefill, then doubles while the decode runs past it (review focus 4).
-    let mut tight = KvCache::tight(&ops, &m.config.text, 8).expect("allocates");
+    // Room for the prompt and ten decoded rows: the first batch of seven
+    // steps fits, and the second grows the cache with those seven decoded
+    // rows in it, which the copy must carry over.
+    let prompt = crate::qwen3_asr::prompt::ids(rows.tokens, None)
+        .expect("a prompt")
+        .len();
+    let mut tight = KvCache::tight(&ops, &m.config.text, prompt + 10).expect("allocates");
     let (got, timing) = decoder.timed(&mut tight, &rows, None).expect("decodes");
     say(&format!(
-        "tight cache: capacity {} after {} prompt rows and {} tokens",
+        "tight cache: capacity {} after {} prompt rows and {} tokens, grown with {:?} rows filled",
         tight.capacity(),
         timing.prompt,
-        got.len()
+        got.len(),
+        tight.copied()
     ));
-    // Doubling from exactly the prompt: the decode's first batch needs rows
-    // past it.
-    assert_eq!(tight.capacity(), 2 * timing.prompt, "grew by doubling");
-    assert_eq!(
-        tight.grown(),
-        2,
-        "one growth to the prompt, one while decoding"
+    assert_eq!(timing.prompt, prompt);
+    assert!(got.len() > 10, "the decode runs past the first capacity");
+    assert!(
+        tight.copied().iter().any(|&filled| filled > prompt),
+        "a growth while decoding copied decoded rows: {:?}",
+        tight.copied()
     );
+    assert_eq!(tight.copied().first(), Some(&(prompt + 7)));
     let mut roomy = KvCache::new(&m.config.text);
     let (again, _) = decoder.timed(&mut roomy, &rows, None).expect("decodes");
     assert_eq!(got, again, "the same ids either way");
@@ -312,7 +317,7 @@ fn quantised_exports_stay_close() {
     let Some(ops) = ops() else {
         return;
     };
-    let mut measured = 0;
+    let (mut measured, mut compared) = (0, 0);
     for (export, model, budget) in MEASURED {
         let Some(m) = load(&ops, export) else {
             continue;
@@ -333,6 +338,7 @@ fn quantised_exports_stay_close() {
                 let parsed = parse(&text_of(&m.vocab, &got), w.forced.as_deref());
                 let d = word_distance(&parsed.text, &w.text);
                 got_words[c * 2 + k] = d;
+                compared += 1;
                 let same = parsed.language.as_deref().unwrap_or("") == w.language;
                 write!(
                     report,
@@ -359,7 +365,18 @@ fn quantised_exports_stay_close() {
         }
         measured += 1;
     }
-    say(&format!("measured {measured} exports"));
+    say(&format!("measured {measured} exports, {compared} decodes"));
+    // With a checkpoint root set, a run that compared nothing is a broken
+    // setup - absent exports or fixtures - not a pass.
+    if ["SHISO_TEST_MODEL_QWEN3ASR", "SHISO_TEST_MODEL_R2T2"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some())
+    {
+        assert!(
+            compared > 0,
+            "a checkpoint root is set, but no export was compared"
+        );
+    }
 }
 
 #[test]

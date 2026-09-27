@@ -127,8 +127,9 @@ pub struct KvCache {
     head_dim: usize,
     /// Rows past the prompt the first sizing adds.
     headroom: usize,
-    /// Times the planes were reallocated.
-    grown: usize,
+    /// The rows each reallocation copied, in order.
+    #[cfg(test)]
+    copied: Vec<usize>,
 }
 
 impl KvCache {
@@ -143,7 +144,8 @@ impl KvCache {
             kv_heads: config.kv_heads,
             head_dim: config.head_dim,
             headroom: HEADROOM,
-            grown: 0,
+            #[cfg(test)]
+            copied: Vec::new(),
         }
     }
 
@@ -158,7 +160,7 @@ impl KvCache {
         let mut cache = Self::new(config);
         cache.headroom = 0;
         cache.reserve(ops, 0, capacity)?;
-        cache.grown = 0;
+        cache.copied.clear();
         Ok(cache)
     }
 
@@ -177,10 +179,10 @@ impl KvCache {
         self.capacity
     }
 
-    /// Times the planes were reallocated since the cache was made.
+    /// The rows each reallocation since the cache was made copied.
     #[cfg(test)]
-    pub(crate) fn grown(&self) -> usize {
-        self.grown
+    pub(crate) fn copied(&self) -> &[usize] {
+        &self.copied
     }
 
     fn plane_floats(&self, capacity: usize) -> usize {
@@ -225,7 +227,8 @@ impl KvCache {
         }
         self.planes = planes;
         self.capacity = capacity;
-        self.grown += 1;
+        #[cfg(test)]
+        self.copied.push(filled);
         Ok(())
     }
 
