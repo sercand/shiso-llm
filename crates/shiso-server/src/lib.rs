@@ -158,7 +158,10 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
     let started = std::time::Instant::now();
     let recognizer = shiso_models::audio_registry::open_speech_recognizer(
         asr,
-        args.asr_mmproj.as_deref(),
+        &shiso_models::audio_registry::RecognizerDesc {
+            mmproj: args.asr_mmproj.as_deref(),
+            offline_batch: args.asr_batch,
+        },
         &backend,
     )
     .with_context(|| format!("opening the speech recognizer at {}", asr.display()))?;
@@ -196,6 +199,9 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
         id = %asr_id,
         lookahead = args.asr_lookahead,
         diarizer = diarizer.is_some(),
+        offline_batch = recognizer.batches_offline(),
+        offline_min_secs = args.asr_offline_min_secs,
+        skip_silence = args.asr_skip_silence,
         seconds = started.elapsed().as_secs_f64(),
         "the speech models are resident"
     );
@@ -209,6 +215,8 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
         limits: args.audio_limits(),
         ffmpeg: args.audio_ffmpeg_policy(),
         max_upload_bytes: args.audio_max_upload_bytes(),
+        offline_min_secs: args.asr_offline_min_secs,
+        skip_silence: args.asr_skip_silence,
     })
     .context("starting the audio worker")?;
     Ok(Some(service))

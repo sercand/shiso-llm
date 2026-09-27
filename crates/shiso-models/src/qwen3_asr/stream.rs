@@ -66,7 +66,7 @@ fn frames_in(secs: f64) -> usize {
     (secs / MEL_FRAME_SECS).round() as usize
 }
 
-fn frame_word(frame: usize) -> Result<u32, AudioError> {
+pub(crate) fn frame_word(frame: usize) -> Result<u32, AudioError> {
     u32::try_from(frame).map_err(|_| AudioError::BadSpec {
         reason: format!("mel frame {frame} does not fit a stream's frame index"),
     })
@@ -201,6 +201,40 @@ pub(crate) struct ChunkText {
     pub(crate) language: Option<String>,
     /// The text the events spell, the space before it included.
     pub(crate) text: String,
+}
+
+impl ChunkText {
+    /// The last character the chunk wrote, for the next chunk's join; `None`
+    /// when it wrote nothing, so the join looks past it.
+    pub(crate) fn last_char(&self) -> Option<char> {
+        self.text.trim_end().chars().next_back()
+    }
+}
+
+/// A chunk's first-stage rows (`n` bins wide) as the tower is given them:
+/// padded with silent frames to [`MIN_CHUNK_FRAMES`], then floored at their
+/// own maximum and rescaled.
+///
+/// # Errors
+///
+/// [`AudioError::BadSpec`] for rows that are not whole frames.
+pub(crate) fn chunk_mel(mut data: Vec<f32>, n: usize) -> Result<MelFrames, AudioError> {
+    if data.len() < MIN_CHUNK_FRAMES * n {
+        data.resize(MIN_CHUNK_FRAMES * n, SILENT_LOG10);
+    }
+    Ok(log10_max_floor(&MelFrames::from_rows(data, n)?))
+}
+
+/// Says so when a chunk at frames `span` decoded to the token cap: its text
+/// is kept, but it is most likely a repetition the model could not leave.
+pub(crate) fn warn_at_cap(ids: &[u32], span: &Range<u32>) {
+    if ids.len() >= MAX_NEW_TOKENS {
+        tracing::warn!(
+            start = span.start,
+            end = span.end,
+            "a chunk decoded to the token cap; its text is kept"
+        );
+    }
 }
 
 /// Whether `c` is a letter of a script written without spaces between
@@ -396,7 +430,34 @@ fn resume_at(vocab: &Arc<PieceVocab>, ids: &[u32], rest: &str) -> Option<usize> 
 pub(crate) struct Memory {
     cache: KvCache,
     decoder: Workspace,
-    tower: Workspace,
+    pub(crate) tower: Workspace,
+}
+
+impl Memory {
+    /// A memory from `model`'s pool, or a fresh one when the pool is empty.
+    pub(crate) fn take(model: &Model) -> Self {
+        let spare = model
+            .spare
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        spare.unwrap_or_else(|| Self {
+            cache: KvCache::new(&model.config.text),
+            decoder: Workspace::new(),
+            tower: Workspace::new(),
+        })
+    }
+
+    /// Returns this memory to `model`'s pool ([`give_back`]).
+    pub(crate) fn put_back(self, model: &Model) {
+        give_back(
+            &mut model
+                .spare
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            self,
+        );
+    }
 }
 
 /// Memories the model keeps for the next streams: the server's default
@@ -442,16 +503,7 @@ impl QwenStream {
         forced: Option<&'static str>,
         cuts: Option<&[u32]>,
     ) -> Result<Self, AudioError> {
-        let spare = model
-            .spare
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop();
-        let memory = spare.unwrap_or_else(|| Memory {
-            cache: KvCache::new(&model.config.text),
-            decoder: Workspace::new(),
-            tower: Workspace::new(),
-        });
+        let memory = Memory::take(&model);
         Ok(Self {
             planner: Planner::new(cuts)?,
             model,
@@ -475,7 +527,7 @@ impl QwenStream {
         for end in ends {
             let rows = self.pending[(from - start) * n..(end - start) * n].to_vec();
             let chunk = self.chunk(rows, frame_word(from)?..frame_word(end)?)?;
-            if let Some(last) = chunk.text.trim_end().chars().next_back() {
+            if let Some(last) = chunk.last_char() {
                 self.last_char = Some(last);
             }
             if self.language.is_none() {
@@ -490,13 +542,9 @@ impl QwenStream {
     }
 
     /// One chunk of first-stage rows at frames `span`.
-    fn chunk(&mut self, mut data: Vec<f32>, span: Range<u32>) -> Result<ChunkText, AudioError> {
+    fn chunk(&mut self, data: Vec<f32>, span: Range<u32>) -> Result<ChunkText, AudioError> {
         let m = &*self.model;
-        let n = m.config.audio.mels;
-        if data.len() < MIN_CHUNK_FRAMES * n {
-            data.resize(MIN_CHUNK_FRAMES * n, SILENT_LOG10);
-        }
-        let mel = log10_max_floor(&MelFrames::from_rows(data, n)?);
+        let mel = chunk_mel(data, m.config.audio.mels)?;
         let memory = self.memory.as_mut().ok_or_else(|| AudioError::Checkpoint {
             what: "a stream without its device memory".into(),
         })?;
@@ -508,13 +556,7 @@ impl QwenStream {
             &audio,
             self.forced,
         )?;
-        if ids.len() >= MAX_NEW_TOKENS {
-            tracing::warn!(
-                start = span.start,
-                end = span.end,
-                "a chunk decoded to the token cap; its text is kept"
-            );
-        }
+        warn_at_cap(&ids, &span);
         Ok(chunk_events(
             &m.vocab,
             &ids,
@@ -528,14 +570,7 @@ impl QwenStream {
 impl Drop for QwenStream {
     fn drop(&mut self) {
         if let Some(memory) = self.memory.take() {
-            give_back(
-                &mut self
-                    .model
-                    .spare
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                memory,
-            );
+            memory.put_back(&self.model);
         }
     }
 }

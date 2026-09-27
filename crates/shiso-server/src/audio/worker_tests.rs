@@ -1,15 +1,16 @@
 //! The audio worker over a scripted recognizer and diarizer: event order,
-//! fairness between jobs, a caller that leaves, a full queue, and a failure.
+//! fairness between jobs, a caller that leaves, a full queue, a failure, and
+//! the offline path of a recognizer that batches.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use shiso_audio::chunks;
+use shiso_audio::chunks::{self, OfflineRule, Span};
 use shiso_audio::transcript::SpeakerActivity;
 use shiso_audio::{
     AudioError, DiarizationPass, Diarizer, Filterbank, Framing, Language, LogScale, MelFrames,
-    MelFrontend, MelScale, MelSpec, Pcm, PieceVocab, Preemphasis, RecognizerStream, Spectrum,
-    SpeechRecognizer, StreamOptions, TokenEvent, Window,
+    MelFrontend, MelScale, MelSpec, OfflineBatch, OfflineJob, Pcm, PieceVocab, Preemphasis,
+    RecognizerStream, SpanResult, Spectrum, SpeechRecognizer, StreamOptions, TokenEvent, Window,
 };
 use shiso_core::TokenId;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -44,9 +45,13 @@ type Log = Arc<Mutex<Vec<String>>>;
 /// The options each stream was opened with, in order.
 type Opened = Arc<Mutex<Vec<StreamOptions>>>;
 
+/// The plan each offline job was opened with, in order.
+type OpenedOffline = Arc<Mutex<Vec<Vec<Span>>>>;
+
 /// Emits `▁a` or `▁b` for every 40 mel rows it is fed, alternating, and one
 /// more on flush; refuses a stream conditioned on `fail`. With `chunks`, it
-/// says it honours cuts, as a chunking recognizer does.
+/// says it honours cuts, as a chunking recognizer does. With `offline` above
+/// zero it batches that many spans a step ([`ScriptedOffline`]).
 #[derive(Debug)]
 struct Scripted {
     spec: MelSpec,
@@ -54,6 +59,58 @@ struct Scripted {
     log: Log,
     chunks: bool,
     opened: Opened,
+    offline: usize,
+    opened_offline: OpenedOffline,
+}
+
+/// A recognizer frame (0.08 s) at or after mel frame `mel` (0.01 s).
+fn frame_at(mel: usize) -> u32 {
+    u32::try_from(mel.div_ceil(8)).expect("small")
+}
+
+/// Logs `off:<label>` for each step it takes, and writes `▁a` at each
+/// transcribed span's start and `▁b` at its middle, in absolute frames.
+struct ScriptedOffline {
+    label: String,
+    spans: Vec<Span>,
+    next: usize,
+    batch: usize,
+    log: Log,
+}
+
+impl OfflineJob for ScriptedOffline {
+    // None: every transcribed span has been returned.
+    fn step(&mut self, _mel: &MelFrames) -> Result<Option<OfflineBatch>, AudioError> {
+        self.log
+            .lock()
+            .expect("unpoisoned")
+            .push(format!("off:{}", self.label));
+        std::thread::sleep(Duration::from_millis(2));
+        let mut out = Vec::new();
+        while self.next < self.spans.len() && out.len() < self.batch {
+            let span = self.spans[self.next];
+            self.next += 1;
+            if !span.transcribe {
+                continue;
+            }
+            out.push(SpanResult {
+                span,
+                tokens: vec![
+                    TokenEvent {
+                        token: TokenId::new(1),
+                        frame: frame_at(span.start),
+                    },
+                    TokenEvent {
+                        token: TokenId::new(2),
+                        frame: frame_at(span.start.midpoint(span.end)),
+                    },
+                ],
+                chunk_end: frame_at(span.end),
+                language: Some("xx".into()),
+            });
+        }
+        Ok((!out.is_empty()).then_some(OfflineBatch { spans: out }))
+    }
 }
 
 struct ScriptedStream {
@@ -151,21 +208,85 @@ impl SpeechRecognizer for Scripted {
             log: Arc::clone(&self.log),
         }))
     }
+    fn batches_offline(&self) -> usize {
+        self.offline
+    }
+    fn open_offline(
+        &self,
+        options: &StreamOptions,
+        spans: Vec<Span>,
+    ) -> Result<Box<dyn OfflineJob>, AudioError> {
+        self.opened_offline
+            .lock()
+            .expect("unpoisoned")
+            .push(spans.clone());
+        let label = match &options.language {
+            Language::Auto => "auto".to_owned(),
+            Language::Tag(tag) => tag.clone(),
+        };
+        Ok(Box::new(ScriptedOffline {
+            label,
+            spans,
+            next: 0,
+            batch: self.offline,
+            log: Arc::clone(&self.log),
+        }))
+    }
 }
 
-/// Speaker 0 for the first half of the clip, speaker 1 for the rest, after
-/// twenty logged steps of 5 ms each: long enough that recognition running
-/// beside it shows in the log.
+/// Who speaks when in a scripted diarizer's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pattern {
+    /// Speaker 0 for the first half, speaker 1 for the rest.
+    Halves,
+    /// Nobody, anywhere.
+    Silent,
+    /// Speaker 0 for the first third, nobody for the second, speaker 1 for
+    /// the last.
+    Gapped,
+}
+
+impl Pattern {
+    /// The two speakers' activity at frame `f` of `n`.
+    fn at(self, f: usize, n: usize) -> [f32; 2] {
+        let first = match self {
+            Self::Halves => f < n / 2,
+            Self::Silent => false,
+            Self::Gapped => f < n / 3,
+        };
+        let second = match self {
+            Self::Halves => f >= n / 2,
+            Self::Silent => false,
+            Self::Gapped => f >= 2 * n / 3,
+        };
+        [
+            if first { 0.9 } else { 0.0 },
+            if second { 0.9 } else { 0.0 },
+        ]
+    }
+
+    /// The answer over `n` frames.
+    fn activity(self, n: usize) -> SpeakerActivity {
+        let probs = (0..n).flat_map(|f| self.at(f, n)).collect();
+        SpeakerActivity::new(0.01, 2, probs).expect("geometry")
+    }
+}
+
+/// Answers its [`Pattern`] after `steps` logged steps of 5 ms each: long
+/// enough that recognition running beside it shows in the log.
 #[derive(Debug)]
 struct Halves {
     spec: MelSpec,
     log: Log,
+    pattern: Pattern,
+    steps: usize,
 }
 
 struct HalvesPass {
     frames: usize,
     left: usize,
     log: Log,
+    pattern: Pattern,
 }
 
 impl DiarizationPass for HalvesPass {
@@ -177,11 +298,7 @@ impl DiarizationPass for HalvesPass {
             self.left -= 1;
             return Ok(None);
         }
-        let n = self.frames;
-        let probs = (0..n)
-            .flat_map(|f| if f < n / 2 { [0.9, 0.0] } else { [0.0, 0.9] })
-            .collect();
-        SpeakerActivity::new(0.01, 2, probs).map(Some)
+        Ok(Some(self.pattern.activity(self.frames)))
     }
 }
 
@@ -198,8 +315,9 @@ impl Diarizer for Halves {
     fn begin(&self, mel: MelFrames) -> Result<Box<dyn DiarizationPass>, AudioError> {
         Ok(Box::new(HalvesPass {
             frames: mel.valid(),
-            left: 20,
+            left: self.steps,
             log: Arc::clone(&self.log),
+            pattern: self.pattern,
         }))
     }
 }
@@ -219,9 +337,7 @@ fn service_with_upload(
         queue,
         log,
         max_upload_bytes,
-        chunks: false,
-        opened: &Opened::default(),
-        byte_level: false,
+        ..ServiceShape::plain(log)
     })
 }
 
@@ -236,6 +352,62 @@ struct ServiceShape<'a> {
     /// A byte-level vocabulary of the same ids, whose pieces keep their
     /// leading space and whose id 3 is half a character.
     byte_level: bool,
+    /// Spans an offline step takes; 0 is no offline path.
+    offline: usize,
+    opened_offline: &'a OpenedOffline,
+    /// The diarizer's answer, or no diarizer.
+    diarizer: Option<Pattern>,
+    offline_min_secs: u32,
+    skip_silence: bool,
+    /// Steps of 5 ms the diarizer's pass takes.
+    diar_steps: usize,
+}
+
+impl<'a> ServiceShape<'a> {
+    /// One job at a time, a queue of four, the halves diarizer, and no
+    /// offline path.
+    fn plain(log: &'a Log) -> Self {
+        Self {
+            max_streams: 1,
+            queue: 4,
+            log,
+            max_upload_bytes: super::DEFAULT_MAX_UPLOAD_BYTES,
+            chunks: false,
+            opened: leaked_default(),
+            byte_level: false,
+            offline: 0,
+            opened_offline: leaked_default(),
+            diarizer: Some(Pattern::Halves),
+            offline_min_secs: super::DEFAULT_OFFLINE_MIN_SECS,
+            skip_silence: true,
+            diar_steps: 20,
+        }
+    }
+
+    /// A chunking recognizer that batches two spans a step and sends every
+    /// non-streaming job offline, recording what it opens.
+    fn offline(
+        log: &'a Log,
+        opened: &'a Opened,
+        opened_offline: &'a OpenedOffline,
+        diarizer: Option<Pattern>,
+    ) -> Self {
+        Self {
+            max_streams: 2,
+            chunks: true,
+            opened,
+            offline: 2,
+            opened_offline,
+            diarizer,
+            offline_min_secs: 0,
+            ..Self::plain(log)
+        }
+    }
+}
+
+/// A record nobody reads, for a shape that does not look at what it opens.
+fn leaked_default<T: Default>() -> &'static T {
+    Box::leak(Box::default())
 }
 
 fn service_with(shape: &ServiceShape<'_>) -> AudioService {
@@ -247,6 +419,12 @@ fn service_with(shape: &ServiceShape<'_>) -> AudioService {
         chunks,
         opened,
         byte_level,
+        offline,
+        opened_offline,
+        diarizer,
+        offline_min_secs,
+        skip_silence,
+        diar_steps,
     } = *shape;
     let vocab = Arc::new(if byte_level {
         PieceVocab::from_byte_level(
@@ -274,11 +452,17 @@ fn service_with(shape: &ServiceShape<'_>) -> AudioService {
             log: Arc::clone(log),
             chunks,
             opened: Arc::clone(opened),
+            offline,
+            opened_offline: Arc::clone(opened_offline),
         }),
-        diarizer: Some(Arc::new(Halves {
-            spec: spec(),
-            log: Arc::clone(log),
-        })),
+        diarizer: diarizer.map(|pattern| -> Arc<dyn Diarizer> {
+            Arc::new(Halves {
+                spec: spec(),
+                log: Arc::clone(log),
+                pattern,
+                steps: diar_steps,
+            })
+        }),
         asr_id: "scripted".into(),
         lookahead: 0,
         max_streams,
@@ -286,6 +470,8 @@ fn service_with(shape: &ServiceShape<'_>) -> AudioService {
         limits: crate::tokenizer::message_preprocess::DEFAULT_AUDIO_LIMITS,
         ffmpeg: None,
         max_upload_bytes,
+        offline_min_secs,
+        skip_silence,
     })
     .expect("the thread starts");
     service
@@ -299,7 +485,25 @@ fn job(seconds: usize, language: &str, diarize: bool) -> TranscriptionJob {
         pcm: Pcm::new(samples, 16_000).expect("pcm"),
         language: Language::Tag(language.into()),
         diarize,
+        streaming: false,
     }
+}
+
+/// [`job`], read as it streams (`stream=true`).
+fn streamed_job(seconds: usize, language: &str) -> TranscriptionJob {
+    TranscriptionJob {
+        streaming: true,
+        ..job(seconds, language, false)
+    }
+}
+
+/// The recognizer's mel of `clip`, as the worker frames it.
+fn mel_of(clip: &TranscriptionJob) -> MelFrames {
+    let all = MelFrontend::new(spec())
+        .expect("spec")
+        .compute(clip.pcm.samples());
+    let (n, valid) = (all.n_mels(), all.valid());
+    MelFrames::from_rows(all.as_slice()[..valid * n].to_vec(), n).expect("rows")
 }
 
 /// Every event of one job, up to and including its last.
@@ -349,12 +553,8 @@ async fn a_transcript_is_trimmed_and_flushed_at_its_end() {
     let log = Log::default();
     let svc = service_with(&ServiceShape {
         max_streams: 2,
-        queue: 4,
-        log: &log,
-        max_upload_bytes: super::DEFAULT_MAX_UPLOAD_BYTES,
-        chunks: false,
-        opened: &Opened::default(),
         byte_level: true,
+        ..ServiceShape::plain(&log)
     });
     let events = drain(svc.submit(job(1, "tail", false)).expect("queued")).await;
     let Some(TranscriptEvent::Done(transcript)) = events.last() else {
@@ -553,13 +753,9 @@ async fn a_chunking_recognizer_opens_its_stream_with_the_diarizer_cuts() {
     let log = Log::default();
     let opened = Opened::default();
     let svc = service_with(&ServiceShape {
-        max_streams: 1,
-        queue: 4,
-        log: &log,
-        max_upload_bytes: super::DEFAULT_MAX_UPLOAD_BYTES,
         chunks: true,
         opened: &opened,
-        byte_level: false,
+        ..ServiceShape::plain(&log)
     });
     let clip = job(6, "a", true);
     // What the worker sees: the recognizer's mel, and the scripted
@@ -605,13 +801,8 @@ async fn a_non_chunking_recognizer_is_opened_without_cuts() {
     let log = Log::default();
     let opened = Opened::default();
     let svc = service_with(&ServiceShape {
-        max_streams: 1,
-        queue: 4,
-        log: &log,
-        max_upload_bytes: super::DEFAULT_MAX_UPLOAD_BYTES,
-        chunks: false,
         opened: &opened,
-        byte_level: false,
+        ..ServiceShape::plain(&log)
     });
     let events = drain(svc.submit(job(2, "a", true)).expect("queued")).await;
     assert!(matches!(events.last(), Some(TranscriptEvent::Done(_))));
@@ -623,7 +814,13 @@ async fn a_non_chunking_recognizer_is_opened_without_cuts() {
 #[tokio::test]
 async fn a_long_diarization_holds_no_other_job() {
     let log = Log::default();
-    let svc = service(2, 4, &log);
+    // A second of diarizing: admitting the plain job computes its mel first,
+    // which a busy test machine can stretch past a shorter pass.
+    let svc = service_with(&ServiceShape {
+        max_streams: 2,
+        diar_steps: 200,
+        ..ServiceShape::plain(&log)
+    });
     let diarized = svc.submit(job(2, "a", true)).expect("queued");
     let plain = svc.submit(job(40, "b", false)).expect("queued");
     let (diarized, plain) = tokio::join!(drain(diarized), drain(plain));
@@ -703,4 +900,235 @@ async fn an_upload_past_the_audio_limit_is_refused_as_too_large() {
     .await;
     assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     assert_eq!(body["error"]["code"], "request_too_large", "{body}");
+}
+
+/// The offline steps the log shows, in order: `a` for `off:a`.
+fn steps(log: &Log) -> Vec<String> {
+    log.lock()
+        .expect("unpoisoned")
+        .iter()
+        .filter_map(|l| l.strip_prefix("off:").map(str::to_owned))
+        .collect()
+}
+
+fn transcribed(plan: &[Span]) -> usize {
+    plan.iter().filter(|s| s.transcribe).count()
+}
+
+#[tokio::test]
+async fn an_offline_job_steps_one_batch_per_turn() {
+    let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
+    let svc = service_with(&ServiceShape::offline(&log, &opened, &offline, None));
+    // Long enough for several spans each under the silence rule.
+    let a = svc.submit(job(100, "a", false)).expect("queued");
+    let b = svc.submit(job(100, "b", false)).expect("queued");
+    let (a, b) = tokio::join!(drain(a), drain(b));
+    let Some(TranscriptEvent::Done(done)) = a.last() else {
+        panic!("{a:?}");
+    };
+    assert!(matches!(b.last(), Some(TranscriptEvent::Done(_))), "{b:?}");
+    assert!(opened.lock().expect("unpoisoned").is_empty(), "no stream");
+    let plans = offline.lock().expect("unpoisoned").clone();
+    assert_eq!(plans.len(), 2);
+    let spans = transcribed(&plans[0]);
+    assert!(spans >= 3, "{:?}", plans[0]);
+    // Every span wrote its two words, in plan order.
+    assert_eq!(done.words.len(), 2 * spans, "{:?}", done.words);
+    assert_eq!(done.language.as_deref(), Some("xx"));
+    let steps = steps(&log);
+    // Two spans a step, then the step that says the job is done.
+    for label in ["a", "b"] {
+        let taken = steps.iter().filter(|s| *s == label).count();
+        assert_eq!(taken, spans.div_ceil(2) + 1, "{label}: {steps:?}");
+    }
+    // One step a turn: while both run, their steps alternate.
+    let first_b = steps.iter().position(|s| s == "b").expect("b stepped");
+    let last_a = steps.iter().rposition(|s| s == "a").expect("a stepped");
+    assert!(first_b < last_a, "a finished before b stepped: {steps:?}");
+    assert!(
+        steps[first_b..=last_a].windows(2).all(|w| w[0] != w[1]),
+        "a job took two steps in one turn: {steps:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_streaming_job_is_not_held_behind_an_offline_job() {
+    let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
+    let svc = service_with(&ServiceShape::offline(&log, &opened, &offline, None));
+    let batched = svc.submit(job(100, "a", false)).expect("queued");
+    let live = svc.submit(streamed_job(40, "b")).expect("queued");
+    let (batched, live) = tokio::join!(drain(batched), drain(live));
+    assert!(matches!(batched.last(), Some(TranscriptEvent::Done(_))));
+    assert!(matches!(live.last(), Some(TranscriptEvent::Done(_))));
+    // The streaming job streamed; only the other went offline.
+    assert_eq!(opened.lock().expect("unpoisoned").len(), 1);
+    assert_eq!(offline.lock().expect("unpoisoned").len(), 1);
+    let log = log.lock().expect("unpoisoned").clone();
+    let first_b = log.iter().position(|l| l == "b").expect("b ran");
+    let last_a = log.iter().rposition(|l| l == "off:a").expect("a stepped");
+    assert!(
+        first_b < last_a,
+        "the streaming job waited for the offline one: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_all_silent_diarized_job_completes_empty() {
+    let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
+    let svc = service_with(&ServiceShape::offline(
+        &log,
+        &opened,
+        &offline,
+        Some(Pattern::Silent),
+    ));
+    let clip = job(6, "a", true);
+    let frames = mel_of(&clip).valid();
+    let events = drain(svc.submit(clip).expect("queued")).await;
+    let Some(TranscriptEvent::Done(done)) = events.last() else {
+        panic!("{events:?}");
+    };
+    assert_eq!(done.text, "");
+    assert!(
+        done.words.is_empty() && done.segments.is_empty(),
+        "{done:?}"
+    );
+    assert!(done.diarized);
+    assert_eq!(
+        offline.lock().expect("unpoisoned").clone(),
+        vec![vec![Span {
+            start: 0,
+            end: frames,
+            transcribe: false,
+        }]]
+    );
+}
+
+#[tokio::test]
+async fn a_job_without_a_diarizer_uses_the_silence_rule() {
+    let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
+    let svc = service_with(&ServiceShape::offline(&log, &opened, &offline, None));
+    let clip = job(70, "a", false);
+    let want = chunks::plan_offline(&mel_of(&clip), None, 0.01, &OfflineRule::for_10ms_mel(true))
+        .expect("plans");
+    assert!(
+        want.len() >= 2 && want.iter().all(|s| s.transcribe),
+        "{want:?}"
+    );
+    let events = drain(svc.submit(clip).expect("queued")).await;
+    let Some(TranscriptEvent::Done(done)) = events.last() else {
+        panic!("{events:?}");
+    };
+    assert!(!done.diarized);
+    assert_eq!(offline.lock().expect("unpoisoned").clone(), vec![want]);
+}
+
+#[tokio::test]
+async fn a_plain_job_is_cut_at_the_diarizer_turns_without_naming_speakers() {
+    let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
+    let svc = service_with(&ServiceShape::offline(
+        &log,
+        &opened,
+        &offline,
+        Some(Pattern::Halves),
+    ));
+    let clip = job(6, "a", false);
+    let mel = mel_of(&clip);
+    let activity = Pattern::Halves.activity(mel.valid());
+    let want = chunks::plan_offline(
+        &mel,
+        Some(&activity),
+        0.01,
+        &OfflineRule::for_10ms_mel(true),
+    )
+    .expect("plans");
+    assert_eq!(want.len(), 2, "one turn change: {want:?}");
+    let events = drain(svc.submit(clip).expect("queued")).await;
+    let Some(TranscriptEvent::Done(done)) = events.last() else {
+        panic!("{events:?}");
+    };
+    assert!(!done.diarized);
+    assert!(done.segments.iter().all(|s| s.speaker.is_none()));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, TranscriptEvent::Segment(_))),
+        "{events:?}"
+    );
+    assert_eq!(offline.lock().expect("unpoisoned").clone(), vec![want]);
+}
+
+#[tokio::test]
+async fn skipped_spans_produce_no_segments_and_frames_stay_absolute() {
+    let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
+    let svc = service_with(&ServiceShape::offline(
+        &log,
+        &opened,
+        &offline,
+        Some(Pattern::Gapped),
+    ));
+    let clip = job(12, "a", true);
+    let mel = mel_of(&clip);
+    let activity = Pattern::Gapped.activity(mel.valid());
+    let want = chunks::plan_offline(
+        &mel,
+        Some(&activity),
+        0.01,
+        &OfflineRule::for_10ms_mel(true),
+    )
+    .expect("plans");
+    let skipped: Vec<Span> = want.iter().filter(|s| !s.transcribe).copied().collect();
+    assert_eq!(skipped.len(), 1, "the middle third is skipped: {want:?}");
+    let gap = skipped[0];
+    let secs = |frame: usize| f64::from(u32::try_from(frame).expect("small")) * 0.01;
+    let (gap_start, gap_end) = (secs(gap.start), secs(gap.end));
+    let events = drain(svc.submit(clip).expect("queued")).await;
+    let Some(TranscriptEvent::Done(done)) = events.last() else {
+        panic!("{events:?}");
+    };
+    assert_eq!(offline.lock().expect("unpoisoned").clone(), vec![want]);
+    // Two words for each side of the gap, none inside it.
+    assert_eq!(done.words.len(), 4, "{:?}", done.words);
+    assert!(
+        done.words
+            .iter()
+            .all(|w| w.start < gap_start || w.start >= gap_end),
+        "{:?}",
+        done.words
+    );
+    // The words after the gap sit after it, not at the clip's start.
+    assert!(done.words[2].start >= gap_end, "{:?}", done.words);
+    // One recognizer frame (0.08 s) of rounding at the gap's edges.
+    assert!(
+        done.segments
+            .iter()
+            .all(|s| s.end <= gap_start + 0.08 || s.start >= gap_end),
+        "{:?}",
+        done.segments
+    );
+    let speakers: Vec<Option<usize>> = done.segments.iter().map(|s| s.speaker).collect();
+    assert_eq!(speakers.first(), Some(&Some(0)), "{speakers:?}");
+    assert_eq!(speakers.last(), Some(&Some(1)), "{speakers:?}");
+}
+
+#[tokio::test]
+async fn a_clip_under_the_offline_threshold_keeps_the_chunked_stream_path() {
+    for (min_secs, offline_jobs) in [(super::DEFAULT_OFFLINE_MIN_SECS, 0), (0, 1)] {
+        let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
+        let svc = service_with(&ServiceShape {
+            offline_min_secs: min_secs,
+            ..ServiceShape::offline(&log, &opened, &offline, None)
+        });
+        let events = drain(svc.submit(job(240, "a", false)).expect("queued")).await;
+        assert!(matches!(events.last(), Some(TranscriptEvent::Done(_))));
+        assert_eq!(
+            offline.lock().expect("unpoisoned").len(),
+            offline_jobs,
+            "threshold {min_secs}"
+        );
+        assert_eq!(
+            opened.lock().expect("unpoisoned").len(),
+            1 - offline_jobs,
+            "threshold {min_secs}"
+        );
+    }
 }

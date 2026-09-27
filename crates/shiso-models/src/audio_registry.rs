@@ -10,12 +10,21 @@ use std::sync::Arc;
 use shiso_audio::{AudioError, Diarizer, SpeechRecognizer};
 use shiso_core::Backend;
 
-/// Opens the speech recognizer at `path` on `backend`.
-///
-/// `mmproj` is `--asr-mmproj`: the audio-tower file for a family whose GGUF
-/// export splits it from the text model. A family that ships in one file
-/// refuses it rather than ignoring it, since a flag that does nothing hides
-/// a wrong command line.
+/// How [`open_speech_recognizer`] opens a checkpoint, beyond its path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecognizerDesc<'a> {
+    /// `--asr-mmproj`: the audio-tower file for a family whose GGUF export
+    /// splits it from the text model. A family that ships in one file
+    /// refuses it rather than ignoring it, since a flag that does nothing
+    /// hides a wrong command line.
+    pub mmproj: Option<&'a Path>,
+    /// `--asr-batch`: spans an offline job transcribes a step, for a family
+    /// that batches ([`SpeechRecognizer::batches_offline`]); one that does
+    /// not ignores it, since every server passes the default.
+    pub offline_batch: usize,
+}
+
+/// Opens the speech recognizer at `path` on `backend`, as `desc` says.
 ///
 /// # Errors
 ///
@@ -24,9 +33,10 @@ use shiso_core::Backend;
 /// [`AudioError::Checkpoint`] saying no family recognises the path.
 pub fn open_speech_recognizer(
     path: &Path,
-    mmproj: Option<&Path>,
+    desc: &RecognizerDesc<'_>,
     backend: &Arc<dyn Backend>,
 ) -> Result<Arc<dyn SpeechRecognizer>, AudioError> {
+    let mmproj = desc.mmproj;
     // Nemotron ships every export as one file or directory; it has no tower
     // file to take. Recognising the path loads nothing, so the refusal comes
     // before the weights do.
@@ -45,7 +55,7 @@ pub fn open_speech_recognizer(
         }
     }
     if let Some(model) = crate::qwen3_asr::open(path, mmproj, backend)? {
-        return Ok(Arc::new(model));
+        return Ok(Arc::new(model.with_offline_batch(desc.offline_batch)));
     }
     Err(AudioError::Checkpoint {
         what: format!("no speech recognizer family recognises {}", path.display()),
@@ -107,8 +117,15 @@ mod tests {
         .expect("writes");
         std::fs::write(dir.path().join("processor_config.json"), "{}").expect("writes");
         let mmproj = dir.path().join("mmproj-x.gguf");
-        let error = super::open_speech_recognizer(dir.path(), Some(&mmproj), &backend)
-            .expect_err("refused");
+        let error = super::open_speech_recognizer(
+            dir.path(),
+            &super::RecognizerDesc {
+                mmproj: Some(&mmproj),
+                offline_batch: 8,
+            },
+            &backend,
+        )
+        .expect_err("refused");
         assert!(
             matches!(&error, AudioError::Checkpoint { what }
                 if what.contains("--asr-mmproj") && what.contains("mmproj-x.gguf")),

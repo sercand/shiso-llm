@@ -306,10 +306,16 @@ const _: AudioEncode = <dyn shiso_audio::AudioTower>::encode;
 type OpenRecognizer =
     fn(
         &std::path::Path,
-        Option<&std::path::Path>,
+        &shiso_models::audio_registry::RecognizerDesc<'_>,
         &std::sync::Arc<dyn Backend>,
     ) -> Result<std::sync::Arc<dyn shiso_audio::SpeechRecognizer>, shiso_audio::AudioError>;
 const _: OpenRecognizer = shiso_models::audio_registry::open_speech_recognizer;
+/// The recognizer's open-time knobs: the tower file and the offline batch.
+const _: fn(Option<&std::path::Path>, usize) -> shiso_models::audio_registry::RecognizerDesc<'_> =
+    |mmproj, offline_batch| shiso_models::audio_registry::RecognizerDesc {
+        mmproj,
+        offline_batch,
+    };
 type OpenDiarizer =
     fn(
         &std::path::Path,

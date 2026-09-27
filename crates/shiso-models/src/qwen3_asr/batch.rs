@@ -803,10 +803,6 @@ impl Model {
     /// # Errors
     ///
     /// As [`BatchTranscriber::transcribe`].
-    #[expect(
-        dead_code,
-        reason = "the offline job (the next change) is its caller; the pool is pinned by its tests now"
-    )]
     pub(crate) fn transcribe_batch(
         &self,
         chunks: &[ChunkInput<'_>],

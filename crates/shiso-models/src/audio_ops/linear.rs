@@ -300,6 +300,17 @@ impl Linear {
         }
     }
 
+    /// Whether every row of a product over this weight sums exactly as it
+    /// would alone, at any row count: true for the weights the audio set's
+    /// own GEMM and matrix-vector-by-runs kernels read (the audio GEMM's, and
+    /// 8-bit affine ones, at a depth those kernels take); false for any
+    /// other projected weight, whose engine kernels pick their tiling and
+    /// split from the row count.
+    #[must_use]
+    pub fn rows_sum_alone(&self) -> bool {
+        matches!(self.own(), Ok(Some(w)) if w.runs_fit(self.in_dim()))
+    }
+
     /// [`Self::forward`] for a decoder step's row or few: the audio GEMM's
     /// weights and 8-bit affine ones go to the matrix-vector-by-runs kernel,
     /// whose summation order differs from the matrix-vector kernel

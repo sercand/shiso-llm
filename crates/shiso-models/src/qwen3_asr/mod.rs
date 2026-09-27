@@ -15,13 +15,17 @@
 //! token's time is interpolated inside its chunk. Times are therefore
 //! chunk-accurate, not word-accurate. A whole clip known up front can instead
 //! go through the decoder several chunks at a time ([`batch`]), with the same
-//! ids.
+//! ids, as an offline job (the `offline` module). That holds only while every
+//! decoder weight is one the audio set's own kernels read, whose rows sum
+//! alone at any row count; an export with any other weight keeps the single
+//! path ([`Qwen3Asr::with_offline_batch`]).
 
 pub mod batch;
 pub mod config;
 pub mod decoder;
 pub mod encoder;
 mod names;
+mod offline;
 pub mod prompt;
 mod stream;
 pub mod weights;
@@ -29,15 +33,16 @@ pub mod weights;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use shiso_audio::chunks::Span;
 use shiso_audio::{
-    AudioError, Language, LogScale, MelSpec, PieceVocab, RecognizerStream, SpeechRecognizer,
-    StreamOptions,
+    AudioError, Language, LogScale, MelSpec, OfflineJob, PieceVocab, RecognizerStream,
+    SpeechRecognizer, StreamOptions,
 };
 use shiso_core::Backend;
 
 use crate::audio_ops::Ops;
 use config::{Qwen3AsrConfig, language_name, languages, locate, read_vocab};
-use weights::QwenAsrWeights;
+use weights::{QwenAsrWeights, TextWeights};
 
 /// What every stream of one loaded checkpoint shares.
 #[derive(Debug)]
@@ -59,6 +64,57 @@ pub(crate) struct Model {
 pub struct Qwen3Asr {
     model: Arc<Model>,
     mel: MelSpec,
+    /// Spans an offline step transcribes, as configured; 0 is no offline
+    /// path.
+    offline_batch: usize,
+    /// The first decoder weight whose rows do not sum alone, by name: with
+    /// one, a batch could give other ids than the single path, so the model
+    /// has no offline path whatever the batch.
+    outside: Option<String>,
+}
+
+/// The decoder's linears by their role, embedding (the tied head) first.
+fn text_linears(text: &TextWeights) -> Vec<(String, &crate::audio_ops::Linear)> {
+    let mut out = vec![("embed".to_owned(), &text.embed)];
+    for (i, layer) in text.layers.iter().enumerate() {
+        for (role, linear) in [
+            ("q", &layer.q),
+            ("k", &layer.k),
+            ("v", &layer.v),
+            ("o", &layer.o),
+            ("gate", &layer.gate),
+            ("up", &layer.up),
+            ("down", &layer.down),
+        ] {
+            out.push((format!("layers.{i}.{role}"), linear));
+        }
+    }
+    out
+}
+
+/// The name of the first of `linears` (name, whether its rows sum alone)
+/// whose rows do not, or `None` when every one does.
+pub(crate) fn first_outside(linears: impl IntoIterator<Item = (String, bool)>) -> Option<String> {
+    linears
+        .into_iter()
+        .find_map(|(name, alone)| (!alone).then_some(name))
+}
+
+/// The spans an offline step takes: `configured`, or none when a weight
+/// `outside` the audio set would let a batch change the ids.
+pub(crate) fn offline_batch(configured: usize, outside: Option<&str>) -> usize {
+    if outside.is_some() { 0 } else { configured }
+}
+
+/// The language `options` force, by the model's name for it.
+// None: the language is left to the model (`Language::Auto`).
+fn forced_of(options: &StreamOptions) -> Result<Option<&'static str>, AudioError> {
+    match &options.language {
+        Language::Auto => Ok(None),
+        Language::Tag(tag) => language_name(tag)
+            .map(Some)
+            .ok_or_else(|| AudioError::UnknownLanguage { tag: tag.clone() }),
+    }
 }
 
 /// Opens the checkpoint at `path` on `backend`; `mmproj` is `--asr-mmproj`,
@@ -88,7 +144,22 @@ pub fn open(
     // the stream finishes each chunk.
     let mut mel = config::mel_spec();
     mel.log_scale = LogScale::Log10;
+    let outside = first_outside(
+        text_linears(&weights.text)
+            .into_iter()
+            .map(|(name, linear)| (name, linear.rows_sum_alone())),
+    );
+    if let Some(name) = &outside {
+        tracing::info!(
+            weight = %name,
+            "a decoder weight is outside the audio kernels, whose rows sum alone at any \
+             row count; this export has no batched offline path and transcribes one chunk \
+             at a time"
+        );
+    }
     Ok(Some(Qwen3Asr {
+        offline_batch: 0,
+        outside,
         model: Arc::new(Model {
             ops,
             config,
@@ -99,6 +170,18 @@ pub fn open(
         }),
         mel,
     }))
+}
+
+impl Qwen3Asr {
+    /// Transcribes offline jobs `batch` spans a step; 0, the default, is no
+    /// offline path. An export with a decoder weight outside the audio set
+    /// keeps the single path whatever the batch, since a batch of it could
+    /// give other ids.
+    #[must_use]
+    pub fn with_offline_batch(mut self, batch: usize) -> Self {
+        self.offline_batch = batch;
+        self
+    }
 }
 
 impl SpeechRecognizer for Qwen3Asr {
@@ -140,17 +223,39 @@ impl SpeechRecognizer for Qwen3Asr {
         &self,
         options: &StreamOptions,
     ) -> Result<Box<dyn RecognizerStream>, AudioError> {
-        let forced = match &options.language {
-            Language::Auto => None,
-            Language::Tag(tag) => Some(
-                language_name(tag)
-                    .ok_or_else(|| AudioError::UnknownLanguage { tag: tag.clone() })?,
-            ),
-        };
         Ok(Box::new(stream::QwenStream::new(
             Arc::clone(&self.model),
-            forced,
+            forced_of(options)?,
             options.cuts.as_deref(),
+        )?))
+    }
+
+    fn batches_offline(&self) -> usize {
+        offline_batch(self.offline_batch, self.outside.as_deref())
+    }
+
+    fn open_offline(
+        &self,
+        options: &StreamOptions,
+        spans: Vec<Span>,
+    ) -> Result<Box<dyn OfflineJob>, AudioError> {
+        let batch = self.batches_offline();
+        if batch == 0 {
+            return Err(AudioError::BadSpec {
+                reason: match &self.outside {
+                    Some(name) => format!(
+                        "decoder weight {name} is outside the audio kernels; \
+                         stream the clip instead"
+                    ),
+                    None => "no offline batch is configured; stream the clip instead".into(),
+                },
+            });
+        }
+        Ok(Box::new(offline::QwenOffline::new(
+            Arc::clone(&self.model),
+            forced_of(options)?,
+            spans,
+            batch,
         )?))
     }
 }

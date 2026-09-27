@@ -135,6 +135,18 @@ each diarized segment is one turn. They give no word times of their own, so a
 word's time is interpolated inside its chunk: times are chunk-accurate, not
 word-accurate.
 
+A clip of at least 5 minutes (`--asr-offline-min-secs`) sent without
+`stream=true` is planned whole instead and decoded `--asr-batch` chunks at a
+time (default 8), one weight read per step serving the whole batch, with the
+same tokens as one chunk at a time. With a diarizer loaded, that plan follows
+the speaker turns even for plain `json`, and a silence of 3 s or more where
+no speaker is active is not transcribed at all: skipped audio yields no text,
+so speech the diarizer misses there is lost. `--asr-skip-silence=false`
+transcribes it. Streaming requests and shorter clips keep the chunk-by-chunk
+path. An export with a decoder weight outside the audio kernels (an
+engine-dispatched K-quant, for example) has no batched path and always goes
+chunk by chunk, as the load log says.
+
 ```sh
 ./target/release/shiso serve \
     --asr-model ~/models/Qwen3-ASR-1.7B/gguf/Qwen3-ASR-1.7B-Q8_0.gguf --asr-id qwen3 \
@@ -176,6 +188,9 @@ environment variable. The ones you are most likely to want:
 | `--diarization-model` | Speaker diarizer, for `response_format=diarized_json` |
 | `--asr-lookahead` | Encoder lookahead frames, one the checkpoint was trained for (default 13; ignored by a recognizer without lookahead) |
 | `--audio-max-streams` | Transcriptions advanced at once; the rest queue (default 4) |
+| `--asr-batch` | Chunks an offline transcription decodes at once (default 8; 0 is refused) |
+| `--asr-skip-silence` | Leave out silences of 3 s or more that the diarizer finds in an offline transcription; they yield no text (default true; `--asr-skip-silence=false` turns it off) |
+| `--asr-offline-min-secs` | Shortest non-streaming clip transcribed offline, in seconds (default 300; 0 sends every one) |
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
 

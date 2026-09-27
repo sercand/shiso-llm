@@ -445,6 +445,35 @@ pub struct ServeArgs {
     /// Transcriptions advanced at once; the rest wait in the queue.
     #[arg(long, env = "SHISO_AUDIO_MAX_STREAMS", default_value_t = 4)]
     pub audio_max_streams: usize,
+    /// Chunks an offline transcription decodes at once, on a recognizer that
+    /// batches: one weight read per step serves this many. Streaming
+    /// requests decode one at a time whatever it is.
+    #[arg(long, env = "SHISO_ASR_BATCH", default_value_t = 8)]
+    pub asr_batch: usize,
+    /// Whether an offline transcription with a diarizer loaded leaves out
+    /// silences of 3 s or more where no speaker is active. Skipped audio
+    /// yields no text: speech the diarizer misses there is lost.
+    /// `--asr-skip-silence=false` transcribes them.
+    #[arg(
+        long,
+        env = "SHISO_ASR_SKIP_SILENCE",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        action = clap::ArgAction::Set
+    )]
+    pub asr_skip_silence: bool,
+    /// The shortest clip, in seconds, that a non-streaming transcription
+    /// plans whole and decodes in batches, on a recognizer that batches;
+    /// shorter clips keep the chunk-by-chunk path. 0 sends every
+    /// non-streaming transcription offline.
+    #[arg(
+        long,
+        env = "SHISO_ASR_OFFLINE_MIN_SECS",
+        default_value_t = crate::audio::DEFAULT_OFFLINE_MIN_SECS
+    )]
+    pub asr_offline_min_secs: u32,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -636,6 +665,9 @@ impl ServeArgs {
             return Err(ConfigError::Zero {
                 flag: "audio-max-streams",
             });
+        }
+        if self.asr_batch == 0 {
+            return Err(ConfigError::Zero { flag: "asr-batch" });
         }
         // A head with no depth is refused here: it is a gigabyte of weights
         // made resident that nothing will ever ask a question, and no arm can
