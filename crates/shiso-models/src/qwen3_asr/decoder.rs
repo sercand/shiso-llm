@@ -6,7 +6,7 @@
 //! follows the transducer's pattern: each step - the embedding row of the
 //! state's last token, 28 layers on GEMV with attention over the cache, the
 //! tied head, the row argmax and the step kernel - is queued without a read,
-//! up to 32 steps at a time, and the host reads the emitted ids and
+//! up to 8 steps at a time, and the host reads the emitted ids and
 //! the state once per batch. A step after the decoder stopped changes
 //! nothing, so a batch that overshoots the end costs time and nothing else.
 //!
@@ -42,8 +42,13 @@ use crate::audio_ops::{
 /// speech fills with a few hundred tokens; the cap only bounds a degenerate
 /// repetition, which the parser then collapses.
 pub const MAX_NEW_TOKENS: usize = 4096;
-/// Steps queued per read-back, as the transducer's search queues them.
-const BATCH: usize = 32;
+/// Steps queued per read-back. A pass here is some 8 ms and a read-back
+/// some 0.2 ms, the other way round from the transducer's search, so the
+/// batch is small: every step after the end in the last batch is a whole
+/// wasted pass. On long-dialogue (214 tokens over 3 chunks, M1 Max) 32 ran
+/// 253 passes, 16 ran 237, 8 ran 221 and 4 ran 217, and 8 and 4 took the
+/// same time.
+const BATCH: usize = 8;
 /// Cache rows past the prompt a fresh cache is sized for: a transcript of a
 /// full chunk is a few hundred tokens, so most chunks never grow it.
 const HEADROOM: usize = 256;
