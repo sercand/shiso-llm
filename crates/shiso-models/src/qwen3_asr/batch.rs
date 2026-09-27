@@ -6,15 +6,15 @@
 //! row of a batched launch is formed exactly as the single launch forms it:
 //!
 //! - the layers' per-row work is the single decoder's own
-//!   ([`Decoder::prefill_layer`], [`Decoder::step_layer`],
-//!   [`Decoder::logits`]); only the attention between the projections
+//!   (`Decoder::prefill_layer`, `Decoder::step_layer`,
+//!   `Decoder::logits`); only the attention between the projections
 //!   differs, and the batched attention kernels run the single kernels'
 //!   bodies over each sequence's rows and plane;
 //! - the prefill's GEMMs take the stacked rows in runs whose rows are summed
-//!   as they would be alone ([`gemm_rows_sum_alone`]): the prompts longer
+//!   as they would be alone (`gemm_rows_sum_alone`): the prompts longer
 //!   than the 32-row tile side by side, a shorter one on its own;
 //! - a decode step's projections take the batch's rows on the multi-row
-//!   matrix-vector kernels, which read each weight run once for up to eight
+//!   matrix-vector kernels, which read each weight run once for up to four
 //!   rows and sum each row as the one-row kernels do, and its head argmaxes
 //!   each row with the single path's wide argmax;
 //! - the decode attention keeps the single path's 32 splits: fewer measured
@@ -23,7 +23,7 @@
 //!
 //! **The cache.** The sequences' planes share one key and one value buffer
 //! per layer (see [`SeqTable`] for why), laid out back to back, each sized
-//! for its prompt and [`HEADROOM`] rows as a fresh [`KvCache`] is. Before
+//! for its prompt and `HEADROOM` rows as a fresh `KvCache` is. Before
 //! each batch of steps, a sequence whose position could pass its plane
 //! grows it the single path's way - to what it needs or twice its capacity -
 //! from the positions the last read-back gave. Growing re-lays out the whole

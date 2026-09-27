@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 /// Which wire format an error is being rendered for.
 ///
 /// Two variants because two surfaces are served. A third would be a third
-/// variant and a third arm in [`body_for`], which is the whole extent of what
+/// variant and a third arm in `body_for`, which is the whole extent of what
 /// adding a surface costs here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiSurface {

@@ -26,8 +26,8 @@
 //! before the first step, which advances by 0 over the prefill's own argmax.
 //!
 //! A layer's per-row work - the norms, the projections, the residuals, the
-//! gated MLP and the head - is written once here ([`Decoder::prefill_layer`],
-//! [`Decoder::step_layer`], [`Decoder::logits`]) with the attention between
+//! gated MLP and the head - is written once here (`Decoder::prefill_layer`,
+//! `Decoder::step_layer`, `Decoder::logits`) with the attention between
 //! them left to the caller, so the batched decoder (`super::batch`) forms
 //! every row exactly as this one does and differs only in how its sequences
 //! attend.
