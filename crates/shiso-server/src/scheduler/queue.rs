@@ -188,11 +188,16 @@ impl GenerateRequest {
         self
     }
 
-    /// The same generation, with media attached and digested.
+    /// The same generation, with media attached, each item beside its digest.
+    ///
+    /// The digests come from whoever decoded the items, which already hashed
+    /// each one once and remembered it. A count that does not match is kept
+    /// rather than refused, and it is safe: the scheduler then files the
+    /// request under no key, as though it carried no digests at all.
     #[must_use]
-    pub fn with_media(mut self, media: Arc<[MediaItem]>) -> Self {
-        self.media_digests = media.iter().map(MediaItem::digest).collect();
+    pub fn with_media(mut self, media: Arc<[MediaItem]>, digests: Arc<[MediaDigest]>) -> Self {
         self.media = media;
+        self.media_digests = digests;
         self
     }
 

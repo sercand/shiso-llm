@@ -42,6 +42,8 @@ use std::sync::Arc;
 use shiso_core::{Backend, DeviceBuffer, VisionGrid};
 use shiso_vision::{EncodedRows, MediaPlacement, PreprocessSpec, VisionError, VisionItem};
 
+use crate::media_cache::CachedRows;
+
 /// Why a request's media could not be turned into embedding rows.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -79,7 +81,7 @@ pub enum TowerError {
 /// prefill contract borrows both out of here together.
 #[derive(Debug)]
 pub struct EncodedMedia {
-    rows: DeviceBuffer,
+    rows: Block,
     grids: Vec<VisionGrid>,
     /// How many of the rows are audio soft tokens, for the usage block.
     audio_pads: u32,
@@ -90,10 +92,58 @@ impl EncodedMedia {
     #[must_use]
     pub fn from_rows(encoded: EncodedRows) -> Self {
         Self {
-            rows: encoded.rows,
+            rows: Block::Owned(encoded.rows),
             grids: encoded.grids,
             audio_pads: 0,
         }
+    }
+
+    /// One block over items encoded one at a time, some of them read out of
+    /// the media cache.
+    ///
+    /// A single item is used where it lies, shared with the cache, because the
+    /// block is only ever read. Several are copied into one allocation in
+    /// prompt order, because the splice reads the block as one run of rows.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the device reports for the allocation or a copy.
+    pub fn from_parts(
+        backend: &Arc<dyn Backend>,
+        mut parts: Vec<Arc<CachedRows>>,
+    ) -> Result<Self, shiso_core::CoreError> {
+        let grids = parts.iter().map(|part| part.grid()).collect();
+        let audio_pads = parts
+            .iter()
+            .filter(|part| part.is_audio())
+            .map(|part| part.grid().pad_count())
+            .fold(0u32, u32::saturating_add);
+        if parts.len() == 1
+            && let Some(part) = parts.pop()
+        {
+            return Ok(Self {
+                rows: Block::Shared(part),
+                grids,
+                audio_pads,
+            });
+        }
+        let total = parts
+            .iter()
+            .map(|part| part.rows().len())
+            .fold(0u64, u64::saturating_add);
+        let rows = shiso_core::alloc(backend, total.max(1))?;
+        let mut at = 0u64;
+        for part in &parts {
+            let len = part.rows().len();
+            backend.copy_d2d(rows.slice(at, len)?, part.rows().view())?;
+            at = at.saturating_add(len);
+        }
+        backend.sync()?;
+        Ok(Self {
+            rows: Block::Owned(rows),
+            grids,
+            audio_pads,
+        })
     }
 
     /// The same block, recording that `pads` of its rows are audio.
@@ -112,7 +162,10 @@ impl EncodedMedia {
     /// The whole block, `[sum of placeholder counts, hidden]` single precision.
     #[must_use]
     pub fn rows(&self) -> &DeviceBuffer {
-        &self.rows
+        match &self.rows {
+            Block::Owned(rows) => rows,
+            Block::Shared(part) => part.rows(),
+        }
     }
 
     /// The items' post-merge grids, in the order the prompt refers to them.
@@ -129,6 +182,15 @@ impl EncodedMedia {
             .map(VisionGrid::pad_count)
             .fold(0u32, u32::saturating_add)
     }
+}
+
+/// Where an [`EncodedMedia`]'s rows live.
+#[derive(Debug)]
+enum Block {
+    /// A block built for this request alone.
+    Owned(DeviceBuffer),
+    /// One item's rows, shared with the media cache.
+    Shared(Arc<CachedRows>),
 }
 
 /// A loaded vision tower and the facts this server needs about it.

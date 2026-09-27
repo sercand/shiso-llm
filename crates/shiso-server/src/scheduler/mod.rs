@@ -89,11 +89,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::media::{MediaItem, MediaTowers};
+use crate::media_cache::{CachedRows, MediaCache};
 use crate::tokenizer::Vocabulary;
 use crate::vision::{EncodedMedia, VisionTower};
 use shiso_audio::AudioTower;
 use shiso_parsers::{ReasoningScheme, ToolCallScheme};
-use shiso_vision::EncodedRows;
 
 use batching::{PrefillStep, SlotTable};
 use cancel::{Delivery, send_all, send_event};
@@ -216,6 +216,10 @@ struct Coordinator {
     /// renderer, which reads its frontend and token rule; only this thread
     /// runs it.
     audio: Option<Arc<dyn AudioTower>>,
+    /// The towers' output by content digest, shared with the renderer, which
+    /// reads it to skip decoding a picture whose rows are resident. `None`
+    /// encodes every item every time.
+    media_cache: Option<Arc<MediaCache>>,
     vocabulary: Option<Arc<Vocabulary>>,
     /// The placeholder ids a prompt's media runs are written in, resolved once
     /// at boot from the tower's placement and this checkpoint's vocabulary.
@@ -374,7 +378,11 @@ fn start(
     let info = *model.as_model_mut().info();
     let vocab = usize::try_from(info.vocab).unwrap_or(usize::MAX);
     let max_num_seqs = cfg.max_num_seqs;
-    let MediaTowers { vision, audio } = towers;
+    let MediaTowers {
+        vision,
+        audio,
+        cache: media_cache,
+    } = towers;
     let pads = match (vision.as_ref(), vocabulary.as_ref()) {
         (Some(tower), Some(vocabulary)) => vocabulary.media_ids(&tower.placement()),
         _ => PadTokens::default(),
@@ -384,6 +392,7 @@ fn start(
         model,
         vision,
         audio,
+        media_cache,
         vocabulary,
         pads,
         model_id,
@@ -583,6 +592,7 @@ impl Coordinator {
         }
         let key = self.media_key(&request);
         let items = Arc::clone(&request.media);
+        let key_digests = Arc::clone(&request.media_digests);
 
         let session = match self.model.as_model_mut().open_session() {
             Ok(session) => session,
@@ -664,7 +674,8 @@ impl Coordinator {
                     .take_while(|span| usize::try_from(span.end()).unwrap_or(usize::MAX) <= from)
                     .count()
             });
-            match self.encode_media(items.get(covered..).unwrap_or_default()) {
+            let digests = key_digests.get(covered..).unwrap_or_default();
+            match self.encode_media(items.get(covered..).unwrap_or_default(), digests) {
                 Ok(Some(media)) => slot.attach_media(media),
                 Ok(None) => {}
                 Err(message) => {
@@ -770,7 +781,11 @@ impl Coordinator {
     /// encoded, and the sequence takes the launches it took before any of this
     /// existed. The `Err` is the message the caller's stream fails with, written
     /// for whoever sent the request and naming the flag an operator would change.
-    fn encode_media(&mut self, items: &[MediaItem]) -> Result<Option<EncodedMedia>, String> {
+    fn encode_media(
+        &mut self,
+        items: &[MediaItem],
+        digests: &[MediaDigest],
+    ) -> Result<Option<EncodedMedia>, String> {
         if items.is_empty() {
             return Ok(None);
         }
@@ -779,57 +794,82 @@ impl Coordinator {
         }
         let started = Instant::now();
         let mut parts = Vec::with_capacity(items.len());
-        let mut grids = Vec::with_capacity(items.len());
-        let mut audio_pads = 0u32;
-        for item in items {
-            let encoded = match item {
-                MediaItem::Vision(item) => {
-                    let Some(tower) = self.vision.as_ref() else {
-                        return Err(
-                            "this server was started without a vision tower, so the attached \
-                             media cannot be looked at; start it with --vision naming the tower"
-                                .to_owned(),
-                        );
-                    };
-                    tower
-                        .encode_rows(&self.backend, std::slice::from_ref(item))
-                        .map_err(|error| error.to_string())?
-                }
-                MediaItem::Audio(clip) => {
-                    let Some(tower) = self.audio.as_ref() else {
-                        return Err(
-                            "this server has no audio tower, so the attached audio cannot be \
-                             heard; start it with --vision naming a container that carries one"
-                                .to_owned(),
-                        );
-                    };
-                    audio_pads =
-                        audio_pads.saturating_add(u32::try_from(clip.tokens()).unwrap_or(u32::MAX));
-                    tower
-                        .encode(&self.backend, std::slice::from_ref(clip))
-                        .map_err(|error| error.to_string())?
-                }
+        let mut ran = 0usize;
+        for (at, item) in items.iter().enumerate() {
+            // The request thread's lease first, then the cache - another
+            // request may have encoded the same picture since this one was
+            // rendered - and the tower only when neither has it.
+            let digest = digests.get(at).copied();
+            let cached = match item {
+                MediaItem::Encoded(item) => Some(Arc::clone(&item.rows)),
+                _ => digest
+                    .zip(self.media_cache.as_ref())
+                    .and_then(|(digest, cache)| cache.rows(&digest)),
             };
-            parts.push(encoded.rows);
-            grids.extend(encoded.grids);
+            if let Some(rows) = cached {
+                parts.push(rows);
+                continue;
+            }
+            let rows = self.run_tower(item)?;
+            ran += 1;
+            parts.push(match (digest, self.media_cache.as_ref()) {
+                (Some(digest), Some(cache)) => cache.insert(digest, rows),
+                _ => Arc::new(rows),
+            });
         }
-        let hidden = self.model.as_model_mut().info().hidden;
-        let row_bytes = u64::from(hidden).saturating_mul(4);
-        let encoded = if parts.len() == 1 {
-            let rows = parts.pop().ok_or_else(|| "no encoded rows".to_owned())?;
-            EncodedRows { rows, grids }
-        } else {
-            EncodedRows::gather(&self.backend, &parts, grids, row_bytes)
-                .map_err(|error| error.to_string())?
-        };
-        let encoded = EncodedMedia::from_rows(encoded).with_audio_pads(audio_pads);
+        let encoded =
+            EncodedMedia::from_parts(&self.backend, parts).map_err(|error| error.to_string())?;
         tracing::debug!(
             items = items.len(),
+            encoded = ran,
+            reused = items.len() - ran,
             rows = encoded.pad_total(),
             ms = started.elapsed().as_secs_f64() * 1000.0,
             "a request's media was encoded"
         );
         Ok(Some(encoded))
+    }
+
+    /// Runs one decoded item through its tower.
+    fn run_tower(&self, item: &MediaItem) -> Result<CachedRows, String> {
+        let (encoded, audio) = match item {
+            MediaItem::Vision(item) => {
+                let Some(tower) = self.vision.as_ref() else {
+                    return Err(
+                        "this server was started without a vision tower, so the attached \
+                         media cannot be looked at; start it with --vision naming the tower"
+                            .to_owned(),
+                    );
+                };
+                let encoded = tower
+                    .encode_rows(&self.backend, std::slice::from_ref(item))
+                    .map_err(|error| error.to_string())?;
+                (encoded, false)
+            }
+            MediaItem::Audio(clip) => {
+                let Some(tower) = self.audio.as_ref() else {
+                    return Err(
+                        "this server has no audio tower, so the attached audio cannot be \
+                         heard; start it with --vision naming a container that carries one"
+                            .to_owned(),
+                    );
+                };
+                let encoded = tower
+                    .encode(&self.backend, std::slice::from_ref(clip))
+                    .map_err(|error| error.to_string())?;
+                (encoded, true)
+            }
+            MediaItem::Encoded(_) => {
+                return Err("an item that was already encoded reached the tower".to_owned());
+            }
+        };
+        let grid = match encoded.grids.as_slice() {
+            [grid] => *grid,
+            grids => {
+                return Err(format!("one item encoded to {} grids", grids.len()));
+            }
+        };
+        Ok(CachedRows::new(encoded.rows, grid, audio))
     }
 
     /// How many tokens a turn over this prompt may generate.

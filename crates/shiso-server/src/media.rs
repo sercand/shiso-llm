@@ -13,16 +13,31 @@ use shiso_audio::{AudioClip, AudioTower};
 use shiso_core::media::{MediaDigest, VisionGrid};
 use shiso_vision::VisionItem;
 
+use crate::media_cache::{CachedRows, MediaCache};
 use crate::vision::VisionTower;
 
-/// A decoded image, video or audio clip, ready for its tower.
-#[derive(Debug, Clone, PartialEq)]
+/// A decoded image, video or audio clip, ready for its tower - or one whose
+/// tower output is already resident.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum MediaItem {
     /// A still or a clip of frames, for the vision tower.
     Vision(VisionItem),
     /// Mel rows and their token count, for the audio tower.
     Audio(AudioClip),
+    /// An item the request thread recognised, holding the rows its tower
+    /// produced the last time it was seen; nothing was decoded. See
+    /// [`crate::media_cache`] for why it holds the rows and not their digest.
+    Encoded(EncodedItem),
+}
+
+/// An item whose tower output is resident, and the digest it was filed under.
+#[derive(Debug, Clone)]
+pub struct EncodedItem {
+    /// The digest [`MediaItem::digest`] gave the item when it was decoded.
+    pub digest: MediaDigest,
+    /// The rows, shared with the cache that found them.
+    pub rows: Arc<CachedRows>,
 }
 
 impl MediaItem {
@@ -35,6 +50,7 @@ impl MediaItem {
         match self {
             Self::Vision(item) => item.pad_count(spatial_merge),
             Self::Audio(clip) => clip.tokens(),
+            Self::Encoded(item) => usize::try_from(item.rows.grid().pad_count()).unwrap_or(0),
         }
     }
 
@@ -55,6 +71,7 @@ impl MediaItem {
                 VisionGrid::new(narrow(t_len), narrow(gh / merge), narrow(gw / merge))
             }
             Self::Audio(clip) => VisionGrid::new(1, 1, narrow(clip.tokens())),
+            Self::Encoded(item) => item.rows.grid(),
         }
     }
 
@@ -64,10 +81,15 @@ impl MediaItem {
     /// the same file can decode to different rows under a different resize,
     /// and two encodings of one picture decode to the same rows. What a cached
     /// prefix depends on is the rows, so that is what is hashed.
+    ///
+    /// Free for an [`MediaItem::Encoded`] item, which carries the digest it
+    /// was filed under; the decoded kinds hash megabytes, which is why the
+    /// request thread asks once per payload and remembers the answer.
     #[must_use]
     pub fn digest(&self) -> MediaDigest {
         let mut hash = Sha256::new();
         match self {
+            Self::Encoded(item) => return item.digest,
             Self::Vision(item) => {
                 let (t_len, gh, gw) = item.grid();
                 hash.update(b"vision");
@@ -91,8 +113,12 @@ impl MediaItem {
 
     /// Whether the item is for the audio tower.
     #[must_use]
-    pub const fn is_audio(&self) -> bool {
-        matches!(self, Self::Audio(_))
+    pub fn is_audio(&self) -> bool {
+        match self {
+            Self::Audio(_) => true,
+            Self::Vision(_) => false,
+            Self::Encoded(item) => item.rows.is_audio(),
+        }
     }
 }
 
@@ -107,6 +133,9 @@ pub struct MediaTowers {
     pub vision: Option<VisionTower>,
     /// The audio tower, when the `--vision` container carries one.
     pub audio: Option<Arc<dyn AudioTower>>,
+    /// Where the towers' output is kept by content digest, shared with the
+    /// renderer. `None` encodes every item of every request.
+    pub cache: Option<Arc<MediaCache>>,
 }
 
 /// Feeds `values` to `hash` as little-endian bytes, a block at a time so a
