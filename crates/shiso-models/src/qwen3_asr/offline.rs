@@ -19,8 +19,9 @@ use shiso_audio::chunks::Span;
 use shiso_audio::{AudioError, MelFrames, OfflineBatch, OfflineJob, SpanResult};
 
 use super::Model;
+use super::batch::BatchTranscriber;
 use super::encoder::{Encoded, Tower};
-use super::stream::{Memory, chunk_events, chunk_mel, frame_word, warn_at_cap};
+use super::stream::{chunk_events, chunk_mel, frame_word, warn_at_cap};
 
 /// The indices of the next at most `batch` spans to transcribe, from index
 /// `from` of `spans`, and where the next batch starts looking: past the last
@@ -66,9 +67,6 @@ pub(crate) struct QwenOffline {
     batch: usize,
     /// The last character the spans have written.
     last_char: Option<char>,
-    /// Always `Some` until the job is dropped and gives it back; only its
-    /// tower scratch is used, the batch keeping memory of its own.
-    memory: Option<Memory>,
 }
 
 impl QwenOffline {
@@ -85,7 +83,6 @@ impl QwenOffline {
             });
         }
         check_plan(&spans)?;
-        let memory = Memory::take(&model);
         Ok(Self {
             model,
             forced,
@@ -93,28 +90,36 @@ impl QwenOffline {
             next: 0,
             batch,
             last_char: None,
-            memory: Some(memory),
         })
     }
 
-    /// The span's rows through the tower.
-    fn encode(&mut self, mel: &MelFrames, span: Range<usize>) -> Result<Encoded, AudioError> {
+    /// The ids of the spans `picked` of `mel`: each encoded through the tower
+    /// on its own, then all of them through the decoder together, in the
+    /// model's pooled batch memory - so a job holds no device memory between
+    /// its steps, and the stream memories stay for the streams.
+    fn transcribe(&self, mel: &MelFrames, picked: &[usize]) -> Result<Vec<Vec<u32>>, AudioError> {
         let m = &*self.model;
         let n = m.config.audio.mels;
-        let rows = mel.as_slice()[span.start * n..span.end * n].to_vec();
-        let chunk = chunk_mel(rows, n)?;
-        let memory = self.memory.as_mut().ok_or_else(|| AudioError::Checkpoint {
-            what: "an offline job without its device memory".into(),
-        })?;
-        Tower::new(&m.ops, &m.weights.tower, &m.config.audio).encode_with(&chunk, &mut memory.tower)
-    }
-}
-
-impl Drop for QwenOffline {
-    fn drop(&mut self) {
-        if let Some(memory) = self.memory.take() {
-            memory.put_back(&self.model);
-        }
+        let chunks = picked
+            .iter()
+            .map(|&i| {
+                let Range { start, end } = self.spans[i].start..self.spans[i].end;
+                chunk_mel(mel.as_slice()[start * n..end * n].to_vec(), n)
+            })
+            .collect::<Result<Vec<MelFrames>, AudioError>>()?;
+        m.with_batch_memory(|memory| {
+            let tower = Tower::new(&m.ops, &m.weights.tower, &m.config.audio);
+            let mut encoded = Vec::with_capacity(chunks.len());
+            for chunk in &chunks {
+                encoded.push(tower.encode_with(chunk, &mut memory.tower)?);
+            }
+            let refs: Vec<&Encoded> = encoded.iter().collect();
+            BatchTranscriber::new(&m.ops, &m.weights.text, &m.config.text).transcribe_with(
+                memory,
+                &refs,
+                self.forced,
+            )
+        })
     }
 }
 
@@ -137,13 +142,7 @@ impl OfflineJob for QwenOffline {
                 ),
             });
         }
-        let mut encoded = Vec::with_capacity(picked.len());
-        for &i in &picked {
-            let span = self.spans[i];
-            encoded.push(self.encode(mel, span.start..span.end)?);
-        }
-        let chunks: Vec<&Encoded> = encoded.iter().collect();
-        let ids = self.model.transcribe_batch(&chunks, self.forced)?;
+        let ids = self.transcribe(mel, &picked)?;
         let mut out = Vec::with_capacity(picked.len());
         for (&i, ids) in picked.iter().zip(&ids) {
             let span = self.spans[i];

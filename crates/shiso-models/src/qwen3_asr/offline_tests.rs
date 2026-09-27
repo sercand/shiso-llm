@@ -93,6 +93,35 @@ fn an_engine_projected_weight_does_not_sum_its_rows_alone() {
     assert!(!projected.rows_sum_alone());
 }
 
+/// The text `events` spell in `asr`'s vocabulary.
+fn text_of(asr: &crate::qwen3_asr::Qwen3Asr, events: &[TokenEvent]) -> String {
+    let mut detok = shiso_audio::Detokenizer::new(Arc::clone(asr.vocab()));
+    for e in events {
+        detok.push(e.token.get());
+    }
+    detok.flush();
+    detok.text().to_owned()
+}
+
+/// The model's pooled memories: the streams' count, and whether a batch's is
+/// held.
+fn pooled(asr: &crate::qwen3_asr::Qwen3Asr) -> (usize, bool) {
+    use std::sync::PoisonError;
+    let streams = asr
+        .model
+        .spare
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .len();
+    let batch = asr
+        .model
+        .batch_spare
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some();
+    (streams, batch)
+}
+
 #[test]
 #[ignore = "requires a GPU device and SHISO_TEST_MODEL_QWEN3ASR"]
 fn offline_text_equals_streaming_text_on_long_dialogue() {
@@ -139,10 +168,25 @@ fn offline_text_equals_streaming_text_on_long_dialogue() {
         streamed.extend(stream.push(&piece).expect("pushes"));
     }
     streamed.extend(stream.finish().expect("finishes"));
+    let (stream_ends, stream_language) = (
+        stream.chunk_ends().to_vec(),
+        stream.language().map(str::to_owned),
+    );
+    drop(stream);
+    assert_eq!(
+        pooled(&asr),
+        (1, false),
+        "the closed stream's memory is pooled"
+    );
 
     // The offline job over the silence rule's plan: the stream's own cuts.
     let spans = plan_offline(&mel, None, 0.01, &OfflineRule::for_10ms_mel(true)).expect("plans");
     let mut job = asr.open_offline(&options, spans.clone()).expect("opens");
+    assert_eq!(
+        pooled(&asr),
+        (1, false),
+        "an open offline job takes no stream's memory"
+    );
     let mut offline: Vec<TokenEvent> = Vec::new();
     let mut ends = Vec::new();
     let mut languages = Vec::new();
@@ -158,14 +202,14 @@ fn offline_text_equals_streaming_text_on_long_dialogue() {
             languages.push(result.language);
         }
     }
-    let text = |events: &[TokenEvent]| {
-        let mut detok = shiso_audio::Detokenizer::new(Arc::clone(asr.vocab()));
-        for e in events {
-            detok.push(e.token.get());
-        }
-        detok.flush();
-        detok.text().to_owned()
-    };
+    assert_eq!(
+        pooled(&asr),
+        (1, true),
+        "between steps the job holds nothing: its tower and decoder memory is pooled"
+    );
+    drop(job);
+    assert_eq!(pooled(&asr), (1, true));
+    let text = |events: &[TokenEvent]| text_of(&asr, events);
     say(&format!(
         "{} spans in {steps} steps ({:.2} s), {} events; offline {:?}",
         spans.len(),
@@ -175,9 +219,9 @@ fn offline_text_equals_streaming_text_on_long_dialogue() {
     ));
     assert_eq!(text(&offline), text(&streamed));
     assert_eq!(offline, streamed, "the same ids at the same frames");
-    assert_eq!(ends, stream.chunk_ends());
+    assert_eq!(ends, stream_ends);
     assert_eq!(
         languages.iter().flatten().next().map(String::as_str),
-        stream.language()
+        stream_language.as_deref()
     );
 }

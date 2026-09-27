@@ -307,14 +307,17 @@ impl BatchCache {
     }
 }
 
-/// A batch's device memory: the shared caches and the activations, all
-/// written before they are read. A model keeps one for the next batch
-/// ([`give_back`]), because a fresh buffer's first touch costs some 50 us a
-/// megabyte (M1 Max) and a batch's is over a gigabyte.
+/// A batch's device memory: the shared caches, the activations, and the
+/// tower's scratch its chunks are encoded in, all written before they are
+/// read. A model keeps one for the next batch (`give_back`), because a
+/// fresh buffer's first touch costs some 50 us a megabyte (M1 Max) and a
+/// batch's is over a gigabyte.
 #[derive(Debug)]
 pub struct BatchMemory {
     pub(crate) cache: BatchCache,
     ws: Workspace,
+    /// The tower's scratch for the batch's chunks, one after another.
+    pub(crate) tower: Workspace,
 }
 
 impl BatchMemory {
@@ -325,6 +328,7 @@ impl BatchMemory {
         Self {
             cache: BatchCache::new(config),
             ws: Workspace::new(),
+            tower: Workspace::new(),
         }
     }
 
@@ -479,7 +483,7 @@ impl<'a> BatchTranscriber<'a> {
         let ns: Vec<usize> = prompts.iter().map(Vec::len).collect();
         let (b, total) = (ns.len(), ns.iter().sum::<usize>());
         let start = Instant::now();
-        let BatchMemory { cache, ws } = memory;
+        let BatchMemory { cache, ws, .. } = memory;
         let a = self.decoder.acts(total, b, ws)?;
         let s = Scratch {
             ids: ops.scratch(b)?,
@@ -797,25 +801,25 @@ fn gemm_runs(ns: &[usize]) -> Vec<Range<usize>> {
 }
 
 impl Model {
-    /// [`BatchTranscriber::transcribe`] in the model's pooled batch memory,
-    /// returned to the pool afterwards under [`give_back`]'s rule.
+    /// `f` over the model's pooled batch memory (a fresh one when another
+    /// batch holds it), which returns to the pool afterwards under
+    /// [`give_back`]'s rule: an offline job holds no device memory between
+    /// its steps.
     ///
     /// # Errors
     ///
-    /// As [`BatchTranscriber::transcribe`].
-    pub(crate) fn transcribe_batch(
+    /// `f`'s.
+    pub(crate) fn with_batch_memory<T>(
         &self,
-        chunks: &[ChunkInput<'_>],
-        forced: Option<&str>,
-    ) -> Result<Vec<Vec<u32>>, AudioError> {
+        f: impl FnOnce(&mut BatchMemory) -> Result<T, AudioError>,
+    ) -> Result<T, AudioError> {
         let pooled = self
             .batch_spare
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         let mut memory = pooled.unwrap_or_else(|| BatchMemory::new(&self.config.text));
-        let out = BatchTranscriber::new(&self.ops, &self.weights.text, &self.config.text)
-            .transcribe_with(&mut memory, chunks, forced);
+        let out = f(&mut memory);
         give_back(
             &mut self
                 .batch_spare
