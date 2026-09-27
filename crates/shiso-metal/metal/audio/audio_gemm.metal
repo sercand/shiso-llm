@@ -191,13 +191,29 @@ static inline void audio_gemm_tile(
     }
 }
 
-// The same product for many rows: a 64x64 tile per threadgroup of eight
-// simdgroups, so each staged operand feeds twice the multiplies it does in
-// the 32-row kernel. Measured on M1 Max at 200 rows: 1.5x on 1024-column
-// shapes, even on 4096 columns, and slower than the 32-row kernel for 32
-// rows or fewer, which is why both exist. Staged rows are padded by four
-// floats, and each simdgroup writes its fragments through its own 8x8 slot,
-// so the tile needs 20 KiB rather than room for the whole result.
+// The same product for many rows: a 64x64 tile per threadgroup of four
+// simdgroups, each owning a 32x32 quarter as a 4x4 grid of 8x8 accumulators,
+// so each staged operand feeds four times the multiplies it does in the
+// 32-row kernel. k is staged 16 at a time: the activations as `[row][k]`, the
+// weights transposed to `[k][col]` so every fragment load is a plain one, each
+// staged row padded by four floats against bank conflicts - 9.25 KiB, small
+// enough for several threadgroups a core. The next slice's global reads are
+// issued after the current slice's multiplies, which keeps them out of the
+// registers the accumulators need.
+//
+// It takes whole 16-k slices of all of k - `k % 16 == 0`, one split, rows
+// float4-aligned - and the host sends any other product to the 32-row
+// kernel. Carrying a split's offsets or a ragged slice's checks cost it 8 to
+// 14% (M1 Max): measured over a 969-row decoder layer (Q8_0), 22.9 ms
+// against 27.7 for the 8-simdgroup 32x16 layout it replaced, whose 20 KiB of
+// staging held fewer threadgroups; 128-row, 128-column, double-buffered,
+// 8-deep and prefetching variants were all slower. It is slower than the
+// 32-row kernel for 32 rows or fewer, which is why both exist.
+//
+// Every output element is still the multiply-accumulates of its row and
+// column over 8-k steps in k order from zero, as in every tile shape here and
+// in the 32-row kernel without a split, so the layout changes speed and never
+// a value.
 template <typename R>
 static inline void audio_gemm64_tile(
         constant audio_args_gemm & args,
@@ -212,105 +228,95 @@ static inline void audio_gemm64_tile(
         ushort sg) {
     const uint BM = AUDIO_GEMM64_TILE_M;
     const uint BN = AUDIO_GEMM_TILE_N;
-    const uint BK = AUDIO_GEMM_TILE_K;
-    // Staged rows are padded so the eight rows one fragment load touches fall
-    // in different banks.
-    const uint LD = BK + 4u;
-    threadgroup float *sa = smem;           // [BM rows][BK k]
-    threadgroup float *sb = smem + BM * LD; // [BN cols][BK k]
+    const uint BK = AUDIO_GEMM64_TILE_K;
+    const uint NT = AUDIO_GEMM64_THREADS;
+    const uint LDA = BK + 4u;
+    const uint LDB = BN + 4u;
+    threadgroup float *sa = smem;            // [BM rows][BK k]
+    threadgroup float *sb = smem + BM * LDA; // [BK k][BN cols]
     const uint n0 = tgpig.x * BN;
     const uint m0 = tgpig.y * BM;
-    // Eight simdgroups in a 2x4 grid, each owning 32 rows by 16 columns: the
-    // four-by-two fragment block of the 32-row kernel. A four-by-four block
-    // per simdgroup, the textbook shape, measured four times slower here.
-    const uint r0 = (sg >> 2u) * 32u;
-    const uint c0 = (sg & 3u) * 16u;
-    const bool vec = (args.k & 3u) == 0u;
-    // Split k: slice z covers [k_begin, k_end) and writes a partial tile into
-    // its own plane of `y`, which the split-sum pass then adds up. With one
-    // split the slice is all of k and the plane is `y` itself.
-    const uint k_begin = tgpig.z * args.k_chunk;
-    const uint k_end = min(args.k, k_begin + args.k_chunk);
-    device float *out = y + (uint64_t) tgpig.z * args.m * args.n;
-
-    simdgroup_float8x8 acc[4][2];
-    AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
-        AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
-            acc[i][j] = simdgroup_float8x8(0.0f);
-        }
-    }
-    for (uint k0 = k_begin; k0 < k_end; k0 += BK) {
-        // BMxBK activations: float4 slots over 256 threads.
-        for (uint e = tid; e < BM * BK / 4u; e += 256u) {
+    // Four simdgroups in a 2x2 grid, each owning 32 rows by 32 columns.
+    const uint r0 = (sg >> 1u) * 32u;
+    const uint c0 = (sg & 1u) * 32u;
+    // Each thread's two float4 slots of the activations and of the weights:
+    // slot e of a 64x16 operand is row e / 4, k (e % 4) * 4.
+    const uint SLOTS = BM * BK / 4u / NT;
+    float4 ra[SLOTS];
+    float4 rb[SLOTS];
+    // One slice's global reads; rows and columns past the edge read as zero.
+    auto fetch = [&](uint k0) {
+        AUDIO_UNROLL for (uint q = 0; q < SLOTS; ++q) {
+            const uint e = tid + q * NT;
             const uint rr = e / (BK / 4u);
             const uint kk = (e - rr * (BK / 4u)) * 4u;
             const uint gm = m0 + rr;
-            const uint gk = k0 + kk;
-            float4 v = float4(0.0f);
-            if (gm < args.m) {
-                device const float *row = x + (uint64_t) gm * args.k;
-                if (vec && gk + 3u < k_end) {
-                    v = *((device const float4 *) (row + gk));
-                } else {
-                    for (uint q = 0; q < 4u; ++q) {
-                        v[q] = gk + q < k_end ? row[gk + q] : 0.0f;
-                    }
-                }
-            }
-            *((threadgroup float4 *) (sa + rr * LD + kk)) = v;
+            ra[q] = gm < args.m ? *((device const float4 *) (x + (uint64_t) gm * args.k + k0 + kk))
+                                : float4(0.0f);
         }
-        // BNxBK weights.
-        for (uint e = tid; e < BN * BK / 4u; e += 256u) {
+        AUDIO_UNROLL for (uint q = 0; q < SLOTS; ++q) {
+            const uint e = tid + q * NT;
             const uint rr = e / (BK / 4u);
             const uint kk = (e - rr * (BK / 4u)) * 4u;
             const uint gn = n0 + rr;
-            const uint gk = k0 + kk;
-            float4 v = float4(0.0f);
-            if (gn < args.n) {
-                const uint64_t base = (uint64_t) gn * args.k;
-                if (vec && gk + 3u < k_end) {
-                    v = w.load4(base + gk);
-                } else {
-                    for (uint q = 0; q < 4u; ++q) {
-                        v[q] = gk + q < k_end ? w.load(base + gk + q) : 0.0f;
-                    }
-                }
-            }
-            *((threadgroup float4 *) (sb + rr * LD + kk)) = v;
+            rb[q] = gn < args.n ? w.load4((uint64_t) gn * args.k + k0 + kk) : float4(0.0f);
+        }
+    };
+
+    simdgroup_float8x8 acc[4][4];
+    AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
+        AUDIO_UNROLL for (uint j = 0; j < 4u; ++j) {
+            acc[i][j] = simdgroup_float8x8(0.0f);
+        }
+    }
+    fetch(0);
+    for (uint k0 = 0; k0 < args.k; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        AUDIO_UNROLL for (uint q = 0; q < SLOTS; ++q) {
+            const uint e = tid + q * NT;
+            const uint rr = e / (BK / 4u);
+            const uint kk = (e - rr * (BK / 4u)) * 4u;
+            *((threadgroup float4 *) (sa + rr * LDA + kk)) = ra[q];
+            sb[(kk + 0u) * LDB + rr] = rb[q].x;
+            sb[(kk + 1u) * LDB + rr] = rb[q].y;
+            sb[(kk + 2u) * LDB + rr] = rb[q].z;
+            sb[(kk + 3u) * LDB + rr] = rb[q].w;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         AUDIO_UNROLL for (uint kk = 0; kk < BK; kk += 8u) {
             simdgroup_float8x8 a[4];
-            simdgroup_float8x8 b[2];
+            simdgroup_float8x8 b[4];
             AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
-                simdgroup_load(a[i], sa + (r0 + 8u * i) * LD + kk, LD);
+                simdgroup_load(a[i], sa + (r0 + 8u * i) * LDA + kk, LDA);
             }
-            AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
-                // Transposed load: b[j](r, c) = W[c0 + 8j + c][k0 + kk + r].
-                simdgroup_load(b[j], sb + (c0 + 8u * j) * LD + kk, LD, ulong2(0, 0), true);
+            AUDIO_UNROLL for (uint j = 0; j < 4u; ++j) {
+                // b[j](r, c) = W[c0 + 8j + c][k0 + kk + r].
+                simdgroup_load(b[j], sb + kk * LDB + c0 + 8u * j, LDB);
             }
             AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
-                AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
+                AUDIO_UNROLL for (uint j = 0; j < 4u; ++j) {
                     simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
                 }
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k0 + BK < args.k) {
+            fetch(k0 + BK);
+        }
     }
-    // Each simdgroup writes its fragments through its own 8x8 slot past the
-    // staged operands, so the tile needs no room for the whole result.
-    threadgroup float *slot = smem + (BM + BN) * LD + sg * 64u;
-    // A partial tile carries no bias: the split-sum pass adds it once.
-    const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u && args.splits <= 1u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The staged operands are done with; each simdgroup writes its fragments
+    // through its own 8x8 slot at the start of the tile.
+    threadgroup float *slot = smem + sg * 64u;
+    const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u;
     AUDIO_UNROLL for (uint i = 0; i < 4u; ++i) {
-        AUDIO_UNROLL for (uint j = 0; j < 2u; ++j) {
+        AUDIO_UNROLL for (uint j = 0; j < 4u; ++j) {
             simdgroup_store(acc[i][j], slot, 8u);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             for (uint e = lane; e < 64u; e += 32u) {
                 const uint gm = m0 + r0 + 8u * i + (e >> 3u);
                 const uint gn = n0 + c0 + 8u * j + (e & 7u);
                 if (gm < args.m && gn < args.n) {
-                    out[(uint64_t) gm * args.n + gn] = slot[e] + (has_bias ? bias[gn] : 0.0f);
+                    y[(uint64_t) gm * args.n + gn] = slot[e] + (has_bias ? bias[gn] : 0.0f);
                 }
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);

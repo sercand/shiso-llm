@@ -108,8 +108,11 @@ const GEMM_TILE_N: usize = 64;
 /// Output rows one GEMM threadgroup produces.
 const GEMM_TILE_M: usize = 32;
 /// Output rows one threadgroup of the 64-row GEMM produces; it takes every
-/// product of more than [`GEMM_TILE_M`] rows.
+/// product of more than [`GEMM_TILE_M`] rows whose depth is a whole number of
+/// its k slices.
 const GEMM64_TILE_M: usize = 64;
+/// k one 64-row GEMM slice stages.
+const GEMM64_TILE_K: usize = 16;
 /// Queries one attention simdgroup takes at once.
 const ATTN_QUERY_BLOCK: usize = 8;
 
@@ -184,11 +187,12 @@ const MATVEC_BLOCK: u32 = 64;
 const GEMM_BLOCK: u32 = 128;
 /// Threadgroup bytes of one GEMM tile: two staged operands and the output.
 const GEMM_SMEM: u32 = 12_288;
-/// Threads of one 64-row GEMM tile: eight simdgroups.
-const GEMM64_BLOCK: u32 = 256;
-/// Threadgroup bytes of one 64-row GEMM tile: two padded staged operands and
-/// an 8x8 slot per simdgroup.
-const GEMM64_SMEM: u32 = 20_480;
+/// Threads of one 64-row GEMM tile: four simdgroups.
+const GEMM64_BLOCK: u32 = 128;
+/// Threadgroup bytes of one 64-row GEMM tile: 16 k of the activations and of
+/// the weights, each staged row padded by four floats (the Metal layout; the
+/// CUDA twin stages the same slices unpadded, in 8 KiB).
+const GEMM64_SMEM: u32 = 9_472;
 /// Largest head dimension the attention holds in a lane's registers.
 const MAX_HEAD_DIM: usize = 128;
 /// Query heads of a kv head's group one decode-attention simdgroup scores
@@ -1208,13 +1212,19 @@ impl Ops {
         // memory's rate; more rows go to the tiled GEMM.
         let skinny = shape.0 <= GEMV_MAX_ROWS && matches!(weight, WeightView::Dense(..));
         let tall = shape.0 > GEMM_TILE_M;
+        // The 64-row tile takes whole slices of an aligned k and never
+        // splits; any other tall product takes the 32-row tile, also
+        // unsplit, whose every element is summed exactly as the 64-row
+        // tile's would be.
+        let wide =
+            tall && shape.2.is_multiple_of(GEMM64_TILE_K) && input.offset().is_multiple_of(16);
         let (entry32, entry64) = weight.tiled_entries();
         let entry = match weight {
             WeightView::Dense(dtype, _) if skinny => dtype.gemv_entry(),
-            _ if tall => entry64,
+            _ if wide => entry64,
             _ => entry32,
         };
-        let (tile_m, block, smem) = if tall {
+        let (tile_m, block, smem) = if wide {
             (GEMM64_TILE_M, GEMM64_BLOCK, GEMM64_SMEM)
         } else {
             (GEMM_TILE_M, GEMM_BLOCK, GEMM_SMEM)

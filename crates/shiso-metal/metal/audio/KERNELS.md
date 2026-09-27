@@ -17,7 +17,7 @@ listed.
 | `kernel_audio_layer_norm_f32` | `audio_args_norm{rows, dim, eps, flags}` | out, in, weight `[dim]`, bias `[dim]` | rows × 256, 132 |
 | `kernel_audio_rms_norm_f32` | `audio_args_norm{rows, dim, eps, flags}` | out, in, weight `[dim]` | rows × 256, 132 |
 | `kernel_audio_gemm_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm{m, n, k, flags, k_chunk, splits}` | y `[splits][m][n]` (the output itself with one split), x `[m][k]`, w `[n][k]` (q8_0w: `n·k/32` 34-byte blocks, `k % 32 == 0`), bias `[n]` | `(ceil(n/64), ceil(m/32), splits)` × 128, 12288 |
-| `kernel_audio_gemm64_{f32w,bf16w,f16w,q8_0w}` | as `kernel_audio_gemm_*` | as `kernel_audio_gemm_*` | `(ceil(n/64), ceil(m/64), splits)` × 256, 20480 |
+| `kernel_audio_gemm64_{f32w,bf16w,f16w,q8_0w}` | as `kernel_audio_gemm_*`, with `k % 16 == 0`, one split, float4-aligned rows | as `kernel_audio_gemm_*` | `(ceil(n/64), ceil(m/64), 1)` × 128, 9472 |
 | `kernel_audio_gemv_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm` (one split) | y `[m][n]`, x `[m][k]`, w `[n][k]`, bias `[n]` | `(ceil(n/16), ceil(m/8))` × 128, 0 |
 | `kernel_audio_matvec_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm` (one split; `k % 8 == 0`) | y `[m][n]`, x `[m][k]` (16-byte aligned), w `[n][k]` (16-byte aligned; q8_0w as the GEMM's), bias `[n]` | `(ceil(n/4), m)` × 64, 0 (static) |
 | `kernel_audio_matvec3_{f32w,bf16w,f16w,q8_0w}` | `audio_args_matvec3{n0, n1, n2, k}` (`k % 8 == 0`) | y0 `[n0]`, y1 `[n1]`, y2 `[n2]`, x `[k]`, w0 `[n0][k]`, w1 `[n1][k]`, w2 `[n2][k]` (x and w 16-byte aligned) | `ceil(n0/4) + ceil(n1/4) + ceil(n2/4)` × 64, 0 (static) |
@@ -99,7 +99,8 @@ A split GEMM covers `k` in slices of `k_chunk` (a multiple of 32): block `z` mul
 into plane `z` of y without the bias, and the split-sum pass adds the planes in order and the bias once, so the result
 does not depend on scheduling. With `splits == 1` the GEMM writes the output and its bias directly. The host splits
 only when the output tiles alone are fewer than 64, and sends at most four rows to the matrix-vector kernel, which
-gives each simdgroup four columns of up to eight rows.
+gives each simdgroup four columns of up to eight rows. It never splits more than 32 rows: those take the 64-row GEMM
+when `k % 16 == 0` and the 32-row one otherwise, which sum every element alike, so the pick changes no value.
 
 The `q8_0w` GEMM reads GGUF `Q8_0` rows directly (34-byte blocks: an f16 scale, then 32 signed bytes) and
 dequantises in f32; `k` must be a multiple of 32. It exists because the engine's tiled `Q8_0` path stages both

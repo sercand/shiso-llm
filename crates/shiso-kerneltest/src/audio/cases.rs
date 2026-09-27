@@ -153,8 +153,8 @@ const GEMM_BLOCK: u32 = 128;
 const GEMM_SMEM: u32 = 12_288;
 /// Rows, threads and threadgroup bytes of the 64-row GEMM.
 const GEMM64_TILE_M: u32 = 64;
-const GEMM64_BLOCK: u32 = 256;
-const GEMM64_SMEM: u32 = 20_480;
+const GEMM64_BLOCK: u32 = 128;
+const GEMM64_SMEM: u32 = 9_472;
 const NORM_SMEM: u32 = 132;
 
 fn launch(
@@ -652,8 +652,8 @@ enum GemmMode {
     Split(usize),
     /// The matrix-vector kernel.
     Gemv,
-    /// The 64-row tiled GEMM over `splits` slices of k (1: all of it).
-    Tall(usize),
+    /// The 64-row tiled GEMM over all of k.
+    Tall,
     /// The matrix-vector-by-runs kernel, one threadgroup row per input row.
     Matvec,
 }
@@ -668,10 +668,10 @@ fn gemm_entry(kind: &str, mode: GemmMode) -> &'static str {
         (GemmMode::Matvec, "f32w") => "kernel_audio_matvec_f32w",
         (GemmMode::Matvec, "bf16w") => "kernel_audio_matvec_bf16w",
         (GemmMode::Matvec, _) => "kernel_audio_matvec_f16w",
-        (GemmMode::Tall(_), "q8_0w") => "kernel_audio_gemm64_q8_0w",
-        (GemmMode::Tall(_), "f32w") => "kernel_audio_gemm64_f32w",
-        (GemmMode::Tall(_), "bf16w") => "kernel_audio_gemm64_bf16w",
-        (GemmMode::Tall(_), _) => "kernel_audio_gemm64_f16w",
+        (GemmMode::Tall, "q8_0w") => "kernel_audio_gemm64_q8_0w",
+        (GemmMode::Tall, "f32w") => "kernel_audio_gemm64_f32w",
+        (GemmMode::Tall, "bf16w") => "kernel_audio_gemm64_bf16w",
+        (GemmMode::Tall, _) => "kernel_audio_gemm64_f16w",
         (_, "q8_0w") => "kernel_audio_gemm_q8_0w",
         (_, "f32w") => "kernel_audio_gemm_f32w",
         (_, "bf16w") => "kernel_audio_gemm_bf16w",
@@ -685,7 +685,7 @@ fn gemm_case(
     (m, n, k): (usize, usize, usize),
     with_bias: bool,
     mode: GemmMode,
-) {
+) -> Vec<f32> {
     let x = oracle::signal(m * k, 31);
     let (wbytes, wvals) = weight_fixture(kind, n * k, 32);
     let bias = oracle::signal(n, 33);
@@ -697,8 +697,8 @@ fn gemm_case(
     // One guard row past the end: the kernel must not write it.
     let y = gpu.upload(&f32_bytes(&vec![f32::NAN; m * n + n]));
     let splits = match mode {
-        GemmMode::Split(s) | GemmMode::Tall(s) => s,
-        GemmMode::Tiled | GemmMode::Gemv | GemmMode::Matvec => 1,
+        GemmMode::Split(s) => s,
+        GemmMode::Tiled | GemmMode::Tall | GemmMode::Gemv | GemmMode::Matvec => 1,
     };
     let k_tiles = k.div_ceil(GEMM_TILE as usize);
     let k_chunk = k_tiles.div_ceil(splits) * GEMM_TILE as usize;
@@ -725,7 +725,7 @@ fn gemm_case(
             MATVEC_BLOCK,
             0,
         ),
-        GemmMode::Tall(_) => (
+        GemmMode::Tall => (
             Extent3::new(
                 blocks(n, GEMM_TILE_N),
                 blocks(m, GEMM64_TILE_M),
@@ -782,6 +782,7 @@ fn gemm_case(
         got[m * n..].iter().all(|v| v.is_nan()),
         "gemm {kind} {mode:?}: wrote past the output"
     );
+    got[..m * n].to_vec()
 }
 
 /// The tiled GEMM for every weight type over square, ragged, single-row and
@@ -820,20 +821,37 @@ pub fn split_k_gemm_matches_the_whole_product(gpu: &Gpu) {
 }
 
 /// The 64-row GEMM for every weight type: a whole tile, rows that end
-/// mid-tile, several row tiles, ragged columns and k, and split k.
+/// mid-tile, several row tiles and ragged columns. It takes whole 16-k
+/// slices and one split (the host sends any other product to the 32-row
+/// tile), so every k here is a multiple of 16, one of them not of 32.
 pub fn tall_gemm_matches_for_every_weight_type(gpu: &Gpu) {
     for kind in ["f32w", "bf16w", "f16w"] {
-        for &(m, n, k, bias, splits) in &[
-            (64usize, 64usize, 64usize, true, 1usize),
-            (33, 5, 33, false, 1),
-            (200, 130, 1024, true, 1),
-            (130, 70, 1000, true, 4),
+        for &(m, n, k, bias) in &[
+            (64usize, 64usize, 64usize, true),
+            (33, 5, 48, false),
+            (200, 130, 1024, true),
+            (130, 70, 1008, true),
         ] {
-            gemm_case(gpu, kind, (m, n, k), bias, GemmMode::Tall(splits));
+            tall_as_tiled(gpu, kind, (m, n, k), bias);
         }
     }
-    for &(m, n, k, splits) in &[(200usize, 130usize, 1024usize, 1usize), (37, 96, 1024, 5)] {
-        gemm_case(gpu, "q8_0w", (m, n, k), true, GemmMode::Tall(splits));
+    // Q8_0 rows are whole blocks, so its k stay multiples of 32.
+    for &(m, n, k) in &[(200usize, 130usize, 1024usize), (37, 96, 992)] {
+        tall_as_tiled(gpu, "q8_0w", (m, n, k), true);
+    }
+}
+
+/// The 64-row tile's product, which must also be the unsplit 32-row tile's
+/// bit for bit: the host sends a tall product the 64-row tile does not take to
+/// the 32-row one, and a row's value may not depend on which.
+fn tall_as_tiled(gpu: &Gpu, kind: &'static str, shape: (usize, usize, usize), bias: bool) {
+    let tall = gemm_case(gpu, kind, shape, bias, GemmMode::Tall);
+    let tiled = gemm_case(gpu, kind, shape, bias, GemmMode::Tiled);
+    for (i, (a, b)) in tall.iter().zip(&tiled).enumerate() {
+        assert!(
+            a.to_bits() == b.to_bits(),
+            "gemm {kind} {shape:?}[{i}]: the 64-row tile gave {a}, the 32-row one {b}"
+        );
     }
 }
 

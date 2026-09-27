@@ -369,26 +369,32 @@ struct audio_r_affine8 {
     }
 };
 
-template <typename R, uint BM>
+/* The tiled GEMM's twin: BM rows by 64 columns a block of 128 threads, BK of
+ * k staged at a time (32 for the 32-row tile, 16 for the 64-row one, as the
+ * Metal tiles stage them), each thread summing its outputs' products one k
+ * at a time in k order. */
+template <typename R, uint BM, uint BK>
 static __device__ __forceinline__ void audio_gemm(
         const struct audio_args_gemm args, float *y, const float *x, const R w,
         const float *bias) {
     extern __shared__ float smem[];
-    const uint NT = 4u * BM;
+    const uint NT = 128u;
     const uint BN = AUDIO_GEMM_TILE_N;
-    const uint BK = AUDIO_GEMM_TILE_K;
-    float *sa = smem;           /* [BM rows][32 k] */
-    float *sb = smem + BM * BK; /* [64 cols][32 k] */
+    /* Threads a row, and the columns each takes. */
+    const uint TPR = NT / BM;
+    const uint CW = BN / TPR;
+    float *sa = smem;           /* [BM rows][BK k] */
+    float *sb = smem + BM * BK; /* [64 cols][BK k] */
     const uint tid = threadIdx.x;
     const uint n0 = blockIdx.x * BN;
     const uint m0 = blockIdx.y * BM;
     const uint k_begin = blockIdx.z * args.k_chunk;
     const uint k_end = min(args.k, k_begin + args.k_chunk);
     float *out = y + (uint64_t) blockIdx.z * args.m * args.n;
-    const uint row = tid >> 2u;         /* 0..BM-1 */
-    const uint col0 = (tid & 3u) * 16u; /* 0, 16, 32, 48 */
-    float acc[16];
-    for (uint j = 0; j < 16u; ++j) {
+    const uint row = tid / TPR;
+    const uint col0 = (tid % TPR) * CW;
+    float acc[CW];
+    for (uint j = 0; j < CW; ++j) {
         acc[j] = 0.0f;
     }
     for (uint k0 = k_begin; k0 < k_end; k0 += BK) {
@@ -409,7 +415,7 @@ static __device__ __forceinline__ void audio_gemm(
         __syncthreads();
         for (uint kk = 0; kk < BK; ++kk) {
             const float a = sa[row * BK + kk];
-            for (uint j = 0; j < 16u; ++j) {
+            for (uint j = 0; j < CW; ++j) {
                 acc[j] += a * sb[(col0 + j) * BK + kk];
             }
         }
@@ -421,7 +427,7 @@ static __device__ __forceinline__ void audio_gemm(
     if (gm >= args.m) {
         return;
     }
-    for (uint j = 0; j < 16u; ++j) {
+    for (uint j = 0; j < CW; ++j) {
         const uint gn = n0 + col0 + j;
         if (gn < args.n) {
             out[(uint64_t) gm * args.n + gn] = acc[j] + (has_bias ? bias[gn] : 0.0f);
@@ -479,11 +485,11 @@ static __device__ __forceinline__ void audio_gemv(
 #define AUDIO_GEMM_ENTRIES(SUFFIX, W) \
     extern "C" __global__ void kernel_audio_gemm_##SUFFIX( \
             const struct audio_args_gemm args, float *y, const float *x, const void *w, const float *bias) { \
-        audio_gemm<audio_r_dense<W>, AUDIO_GEMM_TILE_M>(args, y, x, audio_r_dense<W>{w}, bias); \
+        audio_gemm<audio_r_dense<W>, AUDIO_GEMM_TILE_M, AUDIO_GEMM_TILE_K>(args, y, x, audio_r_dense<W>{w}, bias); \
     } \
     extern "C" __global__ void kernel_audio_gemm64_##SUFFIX( \
             const struct audio_args_gemm args, float *y, const float *x, const void *w, const float *bias) { \
-        audio_gemm<audio_r_dense<W>, AUDIO_GEMM64_TILE_M>(args, y, x, audio_r_dense<W>{w}, bias); \
+        audio_gemm<audio_r_dense<W>, AUDIO_GEMM64_TILE_M, AUDIO_GEMM64_TILE_K>(args, y, x, audio_r_dense<W>{w}, bias); \
     } \
     extern "C" __global__ void kernel_audio_gemv_##SUFFIX( \
             const struct audio_args_gemm args, float *y, const float *x, const void *w, const float *bias) { \
@@ -500,12 +506,12 @@ AUDIO_GEMM_ENTRIES(q8_0w, audio_w_q8_0)
 extern "C" __global__ void kernel_audio_gemm_affine8w(
         const struct audio_args_gemm args, float *y, const float *x, const uint *q,
         const float *bias, const unsigned short *scales, const unsigned short *biases) {
-    audio_gemm<audio_r_affine8, AUDIO_GEMM_TILE_M>(args, y, x, audio_r_affine8{q, scales, biases}, bias);
+    audio_gemm<audio_r_affine8, AUDIO_GEMM_TILE_M, AUDIO_GEMM_TILE_K>(args, y, x, audio_r_affine8{q, scales, biases}, bias);
 }
 extern "C" __global__ void kernel_audio_gemm64_affine8w(
         const struct audio_args_gemm args, float *y, const float *x, const uint *q,
         const float *bias, const unsigned short *scales, const unsigned short *biases) {
-    audio_gemm<audio_r_affine8, AUDIO_GEMM64_TILE_M>(args, y, x, audio_r_affine8{q, scales, biases}, bias);
+    audio_gemm<audio_r_affine8, AUDIO_GEMM64_TILE_M, AUDIO_GEMM64_TILE_K>(args, y, x, audio_r_affine8{q, scales, biases}, bias);
 }
 
 /* y = x * W^T (+ b) one row at a time, the Metal twin's order: each lane dots
