@@ -121,6 +121,18 @@ pub trait RecognizerStream: Send {
     fn language(&self) -> Option<&str> {
         None
     }
+
+    /// The encoder frames at which the chunks transcribed so far end,
+    /// increasing, for a recognizer that transcribes in chunks and places
+    /// each token only somewhere inside its chunk: every token a chunk emits
+    /// comes back from the same call that adds its end here. The transcript
+    /// ends a chunk's last word at its end
+    /// ([`crate::transcript::words_in_chunks`]). Empty for a recognizer
+    /// whose token frames are its own: its words end one frame after their
+    /// last piece.
+    fn chunk_ends(&self) -> &[u32] {
+        &[]
+    }
 }
 
 #[cfg(test)]

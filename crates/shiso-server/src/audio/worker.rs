@@ -415,7 +415,7 @@ fn deliver(desc: &AudioServiceDesc, job: &mut Active, tokens: &[TokenEvent]) -> 
         }
     }
     if let Some(activity) = &job.activity {
-        let words = transcript::words(&job.pieces, desc.recognizer.frame_secs());
+        let words = words_of(desc, job);
         let speakers = speakers_of(job, &words, activity);
         let segments = transcript::diarized_segments(&words, &speakers);
         // Every segment but the last is final: a later piece can only extend
@@ -441,8 +441,19 @@ fn speakers_of(job: &Active, words: &[transcript::Word], activity: &SpeakerActiv
     }
 }
 
+/// The job's words so far, each ending where its recognizer's timing says:
+/// at the next word or its chunk's end for a chunking stream, one frame
+/// after its last piece otherwise.
+fn words_of(desc: &AudioServiceDesc, job: &Active) -> Vec<transcript::Word> {
+    let chunk_ends = match &job.stream {
+        Stream::Open(stream) => stream.chunk_ends(),
+        Stream::AwaitingTurns(_) => &[],
+    };
+    transcript::words_in_chunks(&job.pieces, desc.recognizer.frame_secs(), chunk_ends)
+}
+
 fn finish(desc: &AudioServiceDesc, job: &Active) -> Transcript {
-    let words = transcript::words(&job.pieces, desc.recognizer.frame_secs());
+    let words = words_of(desc, job);
     let (segments, diarized) = match &job.activity {
         Some(activity) => {
             let speakers = speakers_of(job, &words, activity);

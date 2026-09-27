@@ -334,4 +334,8 @@ fn the_whole_stream_matches_one_shot_transcription() {
         "{frames:?}"
     );
     assert_eq!(frames.first(), Some(&0));
+    // The chunks' ends cover the clip, the last at its last frame.
+    let ends = stream.chunk_ends();
+    assert!(ends.windows(2).all(|w| w[0] < w[1]), "{ends:?}");
+    assert_eq!(ends.last(), Some(&u32::try_from(valid).expect("fits")));
 }

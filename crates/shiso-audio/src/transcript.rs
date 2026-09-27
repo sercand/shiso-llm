@@ -132,10 +132,9 @@ impl SpeakerActivity {
     }
 }
 
-/// Groups pieces into words.
-#[must_use]
-pub fn words(pieces: &[TimedPiece], frame_secs: f64) -> Vec<Word> {
-    // (text, first frame, last frame)
+/// Pieces grouped into words: `(text, first frame, last frame)`, empty
+/// words dropped.
+fn spans(pieces: &[TimedPiece]) -> Vec<(String, u32, u32)> {
     let mut out: Vec<(String, u32, u32)> = Vec::new();
     for p in pieces {
         if out.is_empty() || p.text.starts_with(' ') {
@@ -145,12 +144,47 @@ pub fn words(pieces: &[TimedPiece], frame_secs: f64) -> Vec<Word> {
             last.2 = p.frame;
         }
     }
-    out.into_iter()
-        .filter(|(text, _, _)| !text.is_empty())
-        .map(|(text, first, last)| Word {
-            text,
-            start: f64::from(first) * frame_secs,
-            end: f64::from(last + 1) * frame_secs,
+    out.retain(|(text, _, _)| !text.is_empty());
+    out
+}
+
+/// Groups pieces into words, each ending one frame after its last piece.
+#[must_use]
+pub fn words(pieces: &[TimedPiece], frame_secs: f64) -> Vec<Word> {
+    words_in_chunks(pieces, frame_secs, &[])
+}
+
+/// Groups the pieces of a recognizer that transcribes in chunks ending at
+/// `chunk_ends` (frames, increasing; see
+/// [`crate::RecognizerStream::chunk_ends`]) into words.
+///
+/// Such a recognizer places each piece somewhere inside its chunk and knows
+/// nothing of where a word stops, so a word ends where the next word of its
+/// chunk starts, and a chunk's last word at the chunk's end: a one-word turn
+/// then spans its turn rather than one frame, and a segment cut at a turn
+/// ends at the cut. A word past every chunk end, and every word when
+/// `chunk_ends` is empty, ends one frame after its last piece, as [`words`]
+/// has it.
+#[must_use]
+pub fn words_in_chunks(pieces: &[TimedPiece], frame_secs: f64, chunk_ends: &[u32]) -> Vec<Word> {
+    let spans = spans(pieces);
+    let chunk_of = |frame: u32| chunk_ends.partition_point(|&end| end <= frame);
+    (0..spans.len())
+        .map(|i| {
+            let (text, first, last) = &spans[i];
+            let chunk = chunk_of(*first);
+            let end = match chunk_ends.get(chunk) {
+                None => last + 1,
+                Some(&chunk_end) => match spans.get(i + 1) {
+                    Some((_, next, _)) if chunk_of(*next) == chunk => *next,
+                    _ => chunk_end,
+                },
+            };
+            Word {
+                text: text.clone(),
+                start: f64::from(*first) * frame_secs,
+                end: f64::from(end) * frame_secs,
+            }
         })
         .collect()
 }

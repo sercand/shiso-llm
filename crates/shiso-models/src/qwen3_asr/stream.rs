@@ -26,7 +26,9 @@
 //!   without the `language X<asr_text>` prefix ([`chunk_events`]). Each takes
 //!   the mel frame `a + (b - a) * chars_before / chars` over the chunk's frames
 //!   `[a, b)`: words land in the right chunk, and only approximately at the
-//!   right time inside it.
+//!   right time inside it. The stream reports each chunk's end
+//!   ([`RecognizerStream::chunk_ends`]), so that a word ends where the next
+//!   one starts and a chunk's last word at the chunk's end.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -333,6 +335,8 @@ pub(crate) struct QwenStream {
     wrote_text: bool,
     /// The first language a chunk reported.
     language: Option<String>,
+    /// Where each chunk transcribed so far ends, in mel frames.
+    ends: Vec<u32>,
     finished: bool,
 }
 
@@ -360,6 +364,7 @@ impl QwenStream {
             pending: Vec::new(),
             wrote_text: false,
             language: None,
+            ends: Vec::new(),
             finished: false,
         })
     }
@@ -381,6 +386,7 @@ impl QwenStream {
                 self.language = chunk.language;
             }
             events.extend(chunk.events);
+            self.ends.push(frame_word(end)?);
             from = end;
         }
         self.pending.drain(..(from - start) * n);
@@ -468,6 +474,12 @@ impl RecognizerStream for QwenStream {
 
     fn language(&self) -> Option<&str> {
         self.language.as_deref()
+    }
+
+    /// Every chunk's end: a token's frame is only interpolated inside its
+    /// chunk, so its word ends at the next word or the chunk's end.
+    fn chunk_ends(&self) -> &[u32] {
+        &self.ends
     }
 }
 

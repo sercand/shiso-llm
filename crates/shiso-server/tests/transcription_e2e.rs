@@ -436,9 +436,10 @@ async fn speakers_follow_turns(state: &Arc<AppState>, diar: &Path, name: &str) {
         let Some(at) = at else {
             panic!("{name}: a speaker change at frame {start} is not on a cut {cuts:?}");
         };
+        // The turn's segment runs to its cut, not to its last word's start.
         assert!(
-            secs(a, "end") * 100.0 <= f64::from(at) + 1e-6,
-            "{name}: {a} {b}"
+            (secs(a, "end") * 100.0 - f64::from(at)).abs() < 0.5,
+            "{name}: the segment before the cut at {at} ends elsewhere: {a} {b}"
         );
     }
     let mut turns: Vec<usize> = owners.iter().flatten().copied().collect();

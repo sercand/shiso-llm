@@ -229,3 +229,41 @@ fn a_chunk_nobody_holds_keeps_each_words_own_speaker() {
         [1, 1, 0]
     );
 }
+
+#[test]
+fn a_chunked_words_end_at_the_next_word_or_its_chunks_end() {
+    // Two chunks, frames [0, 100) and [100, 250), at 0.01 s a frame: each
+    // piece has only the frame it starts at.
+    let pieces = [
+        tp("Hel", 0),
+        tp("lo", 20),
+        tp(" there.", 60),
+        tp(" Next", 100),
+        tp(" one", 180),
+    ];
+    let w = words_in_chunks(&pieces, 0.01, &[100, 250]);
+    let times: Vec<(&str, f64, f64)> = w
+        .iter()
+        .map(|w| (w.text.as_str(), w.start, w.end))
+        .collect();
+    let want = [
+        ("Hello", 0.0, 0.6),
+        ("there.", 0.6, 1.0),
+        ("Next", 1.0, 1.8),
+        ("one", 1.8, 2.5),
+    ];
+    assert_eq!(times.len(), want.len(), "{times:?}");
+    for (got, want) in times.iter().zip(want) {
+        assert_eq!(got.0, want.0);
+        assert!(
+            (got.1 - want.1).abs() < 1e-9 && (got.2 - want.2).abs() < 1e-9,
+            "{got:?} against {want:?}"
+        );
+    }
+    // A one-word chunk lasts the whole chunk, not one frame.
+    let lone = words_in_chunks(&[tp("Yes.", 300)], 0.01, &[300, 420]);
+    assert!((lone[0].end - 4.2).abs() < 1e-9, "{lone:?}");
+    // Without chunk ends a word ends one frame after its last piece, as
+    // `words` has it.
+    assert_eq!(words_in_chunks(&pieces, 0.08, &[]), words(&pieces, 0.08));
+}
