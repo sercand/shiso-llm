@@ -2,7 +2,7 @@
 
 use super::{
     Filterbank, Framing, LogScale, MelFrontend, MelScale, MelSpec, Preemphasis, Spectrum, Window,
-    apply_max_floor,
+    apply_max_floor, log10_max_floor,
 };
 use crate::num::{f32_of, f64_of};
 
@@ -215,6 +215,20 @@ fn the_log10_max_floor_floors_at_the_max_minus_eight() {
             i % mels
         );
     }
+}
+
+#[test]
+fn a_log10_clip_finished_by_its_own_floor_equals_the_floored_clip() {
+    let mut samples = tone(440.0, 8_000);
+    samples.extend(tone(1_000.0, 4_000).iter().map(|v| v * 0.01));
+    let floored = MelFrontend::new(centred_reflect())
+        .expect("valid")
+        .compute(&samples);
+    let mut spec = centred_reflect();
+    spec.log_scale = LogScale::Log10;
+    let log10 = MelFrontend::new(spec).expect("valid").compute(&samples);
+    assert_ne!(log10, floored, "the first stage alone is not floored");
+    assert_eq!(log10_max_floor(&log10), floored);
 }
 
 #[expect(clippy::print_stderr, reason = "a skipped case says why on stderr")]

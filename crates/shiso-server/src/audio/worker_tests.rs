@@ -100,6 +100,11 @@ impl RecognizerStream for ScriptedStream {
     fn frames(&self) -> u32 {
         u32::try_from(self.rows / 8).unwrap_or(u32::MAX)
     }
+    fn language(&self) -> Option<&str> {
+        // A stream conditioned on `speaks` reads its language out of the
+        // model's words, as a model that writes `language X` does.
+        (self.label == "speaks").then_some("xx")
+    }
 }
 
 impl SpeechRecognizer for Scripted {
@@ -318,6 +323,19 @@ async fn a_job_streams_its_text_and_ends_in_the_whole_transcript() {
     assert!(!transcript.words.is_empty());
     assert!((transcript.duration - 2.0).abs() < 1e-9);
     assert!(!transcript.diarized);
+}
+
+#[tokio::test]
+async fn a_language_the_stream_reports_reaches_the_transcript() {
+    let log = Log::default();
+    let svc = service(2, 4, &log);
+    for (tag, want) in [("speaks", Some("xx")), ("a", None)] {
+        let events = drain(svc.submit(job(1, tag, false)).expect("queued")).await;
+        let Some(TranscriptEvent::Done(transcript)) = events.last() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(transcript.language.as_deref(), want, "{tag}");
+    }
 }
 
 #[tokio::test]

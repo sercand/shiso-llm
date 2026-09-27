@@ -43,6 +43,9 @@ struct Active {
     /// recognition.
     diarizing: Option<std_mpsc::Receiver<diarize::Reply>>,
     activity: Option<SpeakerActivity>,
+    /// The cuts a chunking stream was opened with, in seconds: its words
+    /// take their chunk's speaker.
+    cut_secs: Option<Vec<f64>>,
     segments_sent: usize,
     duration: f64,
     /// Whether the stream has been told the input is over.
@@ -227,6 +230,7 @@ fn start(
         pieces: Vec::new(),
         diarizing,
         activity: None,
+        cut_secs: None,
         segments_sent: 0,
         duration: pcm.duration_secs(),
         flushed: false,
@@ -304,12 +308,13 @@ fn open_at_turns(desc: &AudioServiceDesc, job: &mut Active) -> Option<Turn> {
         return None;
     };
     let spec = desc.recognizer.mel_spec();
+    let mut mel_frame_secs = 0.0;
     let opened = u32::try_from(spec.hop_length)
         .map_err(|_| AudioError::BadSpec {
             reason: format!("a hop of {} samples is not a mel frame", spec.hop_length),
         })
         .and_then(|hop| {
-            let mel_frame_secs = f64::from(hop) / f64::from(spec.sample_rate);
+            mel_frame_secs = f64::from(hop) / f64::from(spec.sample_rate);
             chunks::turn_cuts(activity, &job.mel, mel_frame_secs)
                 .into_iter()
                 .map(|cut| {
@@ -322,15 +327,22 @@ fn open_at_turns(desc: &AudioServiceDesc, job: &mut Active) -> Option<Turn> {
                 .collect::<Result<Vec<u32>, AudioError>>()
         })
         .and_then(|cuts| {
-            desc.recognizer.open_stream(&StreamOptions {
-                language: language.clone(),
-                lookahead: desc.lookahead,
-                cuts: Some(cuts),
-            })
+            let secs = cuts
+                .iter()
+                .map(|&cut| f64::from(cut) * mel_frame_secs)
+                .collect();
+            desc.recognizer
+                .open_stream(&StreamOptions {
+                    language: language.clone(),
+                    lookahead: desc.lookahead,
+                    cuts: Some(cuts),
+                })
+                .map(|stream| (stream, secs))
         });
     match opened {
-        Ok(stream) => {
+        Ok((stream, secs)) => {
             job.stream = Stream::Open(stream);
+            job.cut_secs = Some(secs);
             None
         }
         Err(error) => {
@@ -404,7 +416,7 @@ fn deliver(desc: &AudioServiceDesc, job: &mut Active, tokens: &[TokenEvent]) -> 
     }
     if let Some(activity) = &job.activity {
         let words = transcript::words(&job.pieces, desc.recognizer.frame_secs());
-        let speakers = transcript::assign_speakers(&words, activity);
+        let speakers = speakers_of(job, &words, activity);
         let segments = transcript::diarized_segments(&words, &speakers);
         // Every segment but the last is final: a later piece can only extend
         // the last word, or start a word after it.
@@ -419,11 +431,21 @@ fn deliver(desc: &AudioServiceDesc, job: &mut Active, tokens: &[TokenEvent]) -> 
     true
 }
 
+/// Each word's speaker: its chunk's, for a stream cut at the speaker turns,
+/// since the recognizer's times inside a chunk are interpolated; otherwise
+/// whoever is most active while it is spoken.
+fn speakers_of(job: &Active, words: &[transcript::Word], activity: &SpeakerActivity) -> Vec<usize> {
+    match &job.cut_secs {
+        Some(cuts) => transcript::assign_speakers_by_chunk(words, activity, cuts),
+        None => transcript::assign_speakers(words, activity),
+    }
+}
+
 fn finish(desc: &AudioServiceDesc, job: &Active) -> Transcript {
     let words = transcript::words(&job.pieces, desc.recognizer.frame_secs());
     let (segments, diarized) = match &job.activity {
         Some(activity) => {
-            let speakers = transcript::assign_speakers(&words, activity);
+            let speakers = speakers_of(job, &words, activity);
             (transcript::diarized_segments(&words, &speakers), true)
         }
         None => (transcript::segments(&words), false),
@@ -431,7 +453,14 @@ fn finish(desc: &AudioServiceDesc, job: &Active) -> Transcript {
     Transcript {
         // A word boundary the last piece opened is not text.
         text: job.detok.text().trim_end().to_owned(),
-        language: job.detok.language().map(str::to_owned),
+        // A stream that read the language out of the model's words knows it
+        // better than the tags do; a stream that never opened knows nothing.
+        language: match &job.stream {
+            Stream::Open(stream) => stream.language(),
+            Stream::AwaitingTurns(_) => None,
+        }
+        .or_else(|| job.detok.language())
+        .map(str::to_owned),
         duration: job.duration,
         words,
         segments,

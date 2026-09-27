@@ -30,7 +30,7 @@ pub use diarizer::{DiarizationPass, Diarizer};
 pub use error::AudioError;
 pub use mel::{
     Filterbank, Framing, LogScale, MelFrames, MelFrontend, MelScale, MelSpec, Preemphasis,
-    Spectrum, Window,
+    Spectrum, Window, log10_max_floor,
 };
 pub use mel_stream::MelStream;
 pub use pcm::{MODEL_RATE, Pcm};

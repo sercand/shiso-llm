@@ -168,3 +168,64 @@ fn vtt_cue_text_is_escaped() {
     );
     assert!(srt(&segs).contains("\nAT&T said a < b > c\n"));
 }
+
+fn word(text: &str, start: f64, end: f64) -> Word {
+    Word {
+        text: text.to_owned(),
+        start,
+        end,
+    }
+}
+
+#[test]
+fn a_chunked_transcript_changes_speaker_only_at_a_chunk_cut() {
+    // Speaker 0 until 0.9 s, silence to 1.1 s, speaker 1 after; the chunks
+    // are cut at 1.0 s, the middle of the silence.
+    let probs = (0..20)
+        .flat_map(|t| match t {
+            0..9 => [0.9, 0.0],
+            9..11 => [0.1, 0.1],
+            _ => [0.0, 0.9],
+        })
+        .collect();
+    let activity = SpeakerActivity::new(0.1, 2, probs).expect("valid");
+    // The second chunk's first word starts at its first frame, inside the
+    // silence: by itself it would inherit the previous speaker.
+    let words = [
+        word("one", 0.0, 0.4),
+        word("two", 0.5, 0.95),
+        word("three", 1.0, 1.08),
+        word("four", 1.5, 1.9),
+    ];
+    assert_eq!(assign_speakers(&words, &activity), [0, 0, 0, 1]);
+    assert_eq!(
+        assign_speakers_by_chunk(&words, &activity, &[1.0]),
+        [0, 0, 1, 1]
+    );
+}
+
+#[test]
+fn a_chunk_nobody_holds_keeps_each_words_own_speaker() {
+    // Speaker 1 speaks, then a chunk of silence, then speaker 0.
+    let probs = (0..30)
+        .flat_map(|t| match t {
+            0..10 => [0.0, 0.9],
+            10..20 => [0.1, 0.1],
+            _ => [0.9, 0.0],
+        })
+        .collect();
+    let activity = SpeakerActivity::new(0.1, 2, probs).expect("valid");
+    let words = [
+        word("a", 0.2, 0.4),
+        word("b", 1.2, 1.4),
+        word("c", 2.2, 2.4),
+    ];
+    assert_eq!(
+        assign_speakers_by_chunk(&words, &activity, &[1.0, 2.0]),
+        assign_speakers(&words, &activity)
+    );
+    assert_eq!(
+        assign_speakers_by_chunk(&words, &activity, &[1.0, 2.0]),
+        [1, 1, 0]
+    );
+}

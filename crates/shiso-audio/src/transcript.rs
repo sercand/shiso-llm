@@ -267,6 +267,56 @@ pub fn assign_speakers(words: &[Word], activity: &SpeakerActivity) -> Vec<usize>
     out
 }
 
+/// The speaker of each word of a transcript recognised in chunks cut at
+/// `cuts` (seconds, increasing): the speaker who is dominant, as
+/// [`crate::chunks::turn_cuts`] reckons it, over most of the chunk the word's
+/// middle falls in. A chunking recognizer's word times are interpolated
+/// inside their chunk, so a word near a turn's edge can sit in the silence
+/// the cut was put in, where [`assign_speakers`] would give it the previous
+/// voice; the chunk is the turn, so its words are that turn's. A chunk where
+/// nobody is dominant keeps [`assign_speakers`]' answer for its words.
+#[must_use]
+pub fn assign_speakers_by_chunk(
+    words: &[Word],
+    activity: &SpeakerActivity,
+    cuts: &[f64],
+) -> Vec<usize> {
+    let fs = activity.frame_secs();
+    let chunk_of = |secs: f64| cuts.partition_point(|&cut| cut <= secs);
+    let mut held = vec![vec![0usize; activity.speakers()]; cuts.len() + 1];
+    for t in 0..activity.frames() {
+        let mut who = None;
+        let mut loudest = crate::chunks::DOMINANT_ABOVE;
+        for s in 0..activity.speakers() {
+            let p = activity.prob(t, s);
+            if p > loudest {
+                loudest = p;
+                who = Some(s);
+            }
+        }
+        if let Some(s) = who {
+            held[chunk_of((f64_of(t) + 0.5) * fs)][s] += 1;
+        }
+    }
+    // The most frames, the lower index on a tie.
+    let owners: Vec<Option<usize>> = held
+        .iter()
+        .map(|count| {
+            let (who, frames) =
+                count.iter().enumerate().fold(
+                    (0, 0),
+                    |best, (s, &n)| if n > best.1 { (s, n) } else { best },
+                );
+            (frames > 0).then_some(who)
+        })
+        .collect();
+    assign_speakers(words, activity)
+        .into_iter()
+        .zip(words)
+        .map(|(own, w)| owners[chunk_of(f64::midpoint(w.start, w.end))].unwrap_or(own))
+        .collect()
+}
+
 /// Segments of consecutive same-speaker words.
 #[must_use]
 pub fn diarized_segments(words: &[Word], speakers: &[usize]) -> Vec<Segment> {

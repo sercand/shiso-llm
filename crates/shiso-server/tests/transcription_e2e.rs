@@ -238,3 +238,234 @@ async fn transcriptions_end_to_end() {
     let (status, wrong) = post(&state, form(&speech, &[("model", "whisper-1")])).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{wrong}");
 }
+
+/// The chunking recognizer's state: the `Q8_0` text GGUF (its mmproj found
+/// beside it) and the MLX diarizer, booted as the binary boots them. Needs
+/// `SHISO_TEST_MODEL_QWEN3ASR` and `SHISO_TEST_MODEL_DIAR`.
+#[cfg(target_os = "macos")]
+fn booted_chunking() -> Option<(Arc<AppState>, PathBuf)> {
+    let (Some(asr), Some(diar)) = (
+        std::env::var_os("SHISO_TEST_MODEL_QWEN3ASR").map(PathBuf::from),
+        std::env::var_os("SHISO_TEST_MODEL_DIAR").map(PathBuf::from),
+    ) else {
+        say("SKIP: SHISO_TEST_MODEL_QWEN3ASR and SHISO_TEST_MODEL_DIAR are needed");
+        return None;
+    };
+    if !shiso_metal::metal_available() {
+        say("SKIP: no Metal device");
+        return None;
+    }
+    let asr = asr.join("gguf/Qwen3-ASR-1.7B-Q8_0.gguf");
+    let diar = diar.join("mlx");
+    for path in [&asr, &diar] {
+        if !path.exists() {
+            say(&format!("SKIP: {} is absent", path.display()));
+            return None;
+        }
+    }
+    let (asr_arg, diar_arg) = (asr.display().to_string(), diar.display().to_string());
+    let line = [
+        "shiso",
+        "serve",
+        "--asr-model",
+        &asr_arg,
+        "--asr-id",
+        "qwen3",
+        "--diarization-model",
+        &diar_arg,
+    ];
+    let cli = <Cli as clap::Parser>::try_parse_from(line).expect("the command line parses");
+    let Command::Serve(args) = cli.command;
+    args.validate().expect("servable");
+    let audio = shiso_server::boot_audio(&args)
+        .expect("the speech models load")
+        .expect("an ASR was named");
+    Some((
+        Arc::new(AppState::without_language_model().with_audio(audio)),
+        diar,
+    ))
+}
+
+/// The cuts the worker plans for `name` - the diarizer's turns over the
+/// recognizer's frames - and, for each chunk they bound, the speaker who
+/// holds most of its diarizer frames.
+#[cfg(target_os = "macos")]
+fn turn_plan(diar: &Path, name: &str) -> (Vec<u32>, Vec<Option<usize>>) {
+    use shiso_audio::{DecodeLimits, LogScale, MelFrontend, chunks, decode_audio};
+
+    let limits = DecodeLimits::new(std::num::NonZeroU32::new(600).expect("non-zero"));
+    let pcm = decode_audio(&clip(name), &limits, None).expect("decodes");
+    let backend: Arc<dyn shiso_core::Backend> =
+        shiso_metal::MetalBackend::new().expect("the Metal library compiles");
+    let diarizer = shiso_models::audio_registry::open_diarizer(diar, &backend).expect("loads");
+    let dmel = MelFrontend::new(diarizer.mel_spec().clone())
+        .expect("a frontend")
+        .compute(pcm.samples());
+    let activity = diarizer.diarize(&dmel).expect("diarizes");
+    let mut spec = shiso_models::qwen3_asr::config::mel_spec();
+    spec.log_scale = LogScale::Log10;
+    let mel = MelFrontend::new(spec)
+        .expect("a frontend")
+        .compute(pcm.samples());
+    let frame = |f: usize| u32::try_from(f).expect("a frame fits");
+    let cuts: Vec<u32> = chunks::turn_cuts(&activity, &mel, 0.01)
+        .into_iter()
+        .map(frame)
+        .collect();
+    let mut bounds = vec![0];
+    bounds.extend(&cuts);
+    bounds.push(frame(mel.valid()));
+    let fs = activity.frame_secs();
+    let owners = bounds
+        .windows(2)
+        .map(|w| {
+            let mut count = vec![0usize; activity.speakers()];
+            for t in 0..activity.frames() {
+                // The diarizer frame's middle, in mel frames.
+                let mel_t = (f64::from(frame(t)) + 0.5) * fs / 0.01;
+                if mel_t < f64::from(w[0]) || mel_t >= f64::from(w[1]) {
+                    continue;
+                }
+                let mut best = (None, chunks::DOMINANT_ABOVE);
+                for s in 0..activity.speakers() {
+                    if activity.prob(t, s) > best.1 {
+                        best = (Some(s), activity.prob(t, s));
+                    }
+                }
+                if let Some(s) = best.0 {
+                    count[s] += 1;
+                }
+            }
+            let (who, n) = count
+                .iter()
+                .enumerate()
+                .max_by_key(|(s, n)| (**n, std::cmp::Reverse(*s)))
+                .expect("a speaker");
+            (*n > 0).then_some(who)
+        })
+        .collect();
+    (cuts, owners)
+}
+
+/// Every response format on one clip answers with text.
+#[cfg(target_os = "macos")]
+async fn every_format(state: &Arc<AppState>, name: &str) {
+    let audio = clip(name);
+    for format in [
+        "json",
+        "text",
+        "verbose_json",
+        "srt",
+        "vtt",
+        "diarized_json",
+    ] {
+        let started = std::time::Instant::now();
+        let (status, body) = post(
+            state,
+            form(&audio, &[("model", "qwen3"), ("response_format", format)]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name} {format}: {body}");
+        let text = match format {
+            "json" | "verbose_json" | "diarized_json" => {
+                let json: Value = serde_json::from_str(&body).expect("json");
+                if format == "verbose_json" {
+                    assert!(json["language"].is_string(), "{name}: {json}");
+                    let words = json["segments"].as_array().expect("segments");
+                    assert!(!words.is_empty(), "{name}: no segments");
+                }
+                json["text"].as_str().expect("text").to_owned()
+            }
+            _ => body.clone(),
+        };
+        say(&format!(
+            "{name} {format} in {:.2} s: {} chars",
+            started.elapsed().as_secs_f64(),
+            text.len()
+        ));
+        assert!(
+            text.chars().any(char::is_alphanumeric),
+            "{name} {format}: {body}"
+        );
+    }
+    let (status, stream) = post(
+        state,
+        form(&audio, &[("model", "qwen3"), ("stream", "true")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stream}");
+    let last = stream
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .map(|d| serde_json::from_str::<Value>(d).expect("a json frame"))
+        .next_back()
+        .expect("frames");
+    assert_eq!(last["type"], "transcript.text.done", "{last}");
+}
+
+/// A diarized transcript of `name` changes speaker only on a turn cut, and
+/// exactly as often as the turns do.
+#[cfg(target_os = "macos")]
+async fn speakers_follow_turns(state: &Arc<AppState>, diar: &Path, name: &str) {
+    let (cuts, owners) = turn_plan(diar, name);
+    let (status, body) = post(
+        state,
+        form(
+            &clip(name),
+            &[("model", "qwen3"), ("response_format", "diarized_json")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let segments = json["segments"].as_array().expect("segments");
+    assert!(!segments.is_empty(), "{name}: no segments");
+    let secs = |v: &Value, key: &str| v[key].as_f64().expect("a time");
+    let mut changes = 0;
+    for pair in segments.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if a["speaker"] == b["speaker"] {
+            continue;
+        }
+        changes += 1;
+        let start = secs(b, "start") * 100.0;
+        let at = cuts
+            .iter()
+            .copied()
+            .find(|&c| (f64::from(c) - start).abs() < 0.5);
+        let Some(at) = at else {
+            panic!("{name}: a speaker change at frame {start} is not on a cut {cuts:?}");
+        };
+        assert!(
+            secs(a, "end") * 100.0 <= f64::from(at) + 1e-6,
+            "{name}: {a} {b}"
+        );
+    }
+    let mut turns: Vec<usize> = owners.iter().flatten().copied().collect();
+    turns.dedup();
+    let speakers: Vec<&str> = segments
+        .iter()
+        .filter_map(|s| s["speaker"].as_str())
+        .collect();
+    say(&format!(
+        "{name}: {} segments, {changes} speaker changes, {} cuts, turns {turns:?}, speakers {speakers:?}",
+        segments.len(),
+        cuts.len()
+    ));
+    assert_eq!(changes, turns.len().saturating_sub(1), "{name}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the local speech checkpoints and a Metal device"]
+async fn chunked_transcriptions_end_to_end() {
+    let Some((state, diar)) = booted_chunking() else {
+        return;
+    };
+    for name in ["speech-en", "long-dialogue"] {
+        every_format(&state, name).await;
+    }
+    for name in ["two-speakers", "long-dialogue"] {
+        speakers_follow_turns(&state, &diar, name).await;
+    }
+}

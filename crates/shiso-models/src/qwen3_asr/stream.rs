@@ -1,0 +1,436 @@
+//! One clip through the tower and the decoder, a chunk at a time.
+//!
+//! The model has no streaming encoder and no timestamps of its own, so a clip
+//! is cut into chunks and each chunk is one prompt and one greedy decode with
+//! no context from the one before, as the reference transcribes long audio
+//! (notes §5).
+//!
+//! - **Where a chunk ends.** At the cuts the caller gave
+//!   ([`StreamOptions::cuts`](shiso_audio::StreamOptions), a diarized job's
+//!   speaker turns), or else by the silence rule of
+//!   [`shiso_audio::chunks::silence_cuts`]: the quietest 100 ms within 5 s of
+//!   each 30 s mark. The rule's first cut past the last one depends only on the
+//!   35.1 s after it, so a chunk is transcribed as soon as those rows are in,
+//!   and the cuts are exactly the rule's over the whole clip, whatever the push
+//!   schedule.
+//! - **The frontend.** The recognizer's frames stop at `log10`; each chunk's
+//!   rows are floored at their own maximum and rescaled here
+//!   ([`shiso_audio::log10_max_floor`]), because the reference extracts every
+//!   chunk's features on their own. A chunk shorter than 0.5 s is padded
+//!   with silent frames first, as the reference pads its waveform with zeros.
+//!   The reference frames each chunk's samples, so its first and last frame
+//!   see the chunk edge where these see the audio past it; the rows between
+//!   are the same.
+//! - **What is emitted.** The chunk's ids are decoded, collapsed and parsed as
+//!   [`prompt::parse`] does; the events are the ids that spell the parsed text,
+//!   without the `language X<asr_text>` prefix ([`chunk_events`]). Each takes
+//!   the mel frame `a + (b - a) * chars_before / chars` over the chunk's frames
+//!   `[a, b)`: words land in the right chunk, and only approximately at the
+//!   right time inside it.
+
+use std::ops::Range;
+use std::sync::Arc;
+
+use shiso_audio::chunks::{CHUNK_SECS, SEARCH_SECS, WINDOW_SECS, silence_cuts};
+use shiso_audio::{
+    AudioError, Detokenizer, MelFrames, PieceVocab, RecognizerStream, TokenEvent, log10_max_floor,
+};
+use shiso_core::TokenId;
+
+use super::Model;
+use super::config::{ASR_TEXT, language_code};
+use super::decoder::{Decoder, KvCache, MAX_NEW_TOKENS};
+use super::encoder::Tower;
+use super::prompt;
+
+/// Seconds per mel frame, the unit of every token's frame.
+pub(crate) const MEL_FRAME_SECS: f64 = 0.01;
+/// The shortest chunk the tower is given, in mel frames: 0.5 s, the
+/// reference's `MIN_ASR_INPUT_SECONDS` (notes §5).
+const MIN_CHUNK_FRAMES: usize = 50;
+/// The first-stage value of a frame of digital silence, `log10(1e-10)`: what
+/// the frontend gives the zeros the reference pads a short chunk with.
+const SILENT_LOG10: f32 = -10.0;
+/// `Ġ`, a lone space: put between two chunks' texts.
+const SPACE: u32 = 220;
+
+/// `secs` in whole mel frames.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the chunking constants are small positive seconds"
+)]
+fn frames_in(secs: f64) -> usize {
+    (secs / MEL_FRAME_SECS).round() as usize
+}
+
+fn frame_word(frame: usize) -> Result<u32, AudioError> {
+    u32::try_from(frame).map_err(|_| AudioError::BadSpec {
+        reason: format!("mel frame {frame} does not fit a stream's frame index"),
+    })
+}
+
+/// Where one stream's chunks end, in mel frames from its start.
+#[derive(Debug)]
+pub(crate) struct Planner {
+    /// The caller's cuts, strictly increasing; `None` for the silence rule.
+    given: Option<Vec<usize>>,
+    /// The first given cut not yet reached.
+    next: usize,
+    /// Where the current chunk starts: the last end handed out.
+    start: usize,
+    /// The silence rule's chunk, search and window lengths.
+    max: usize,
+    search: usize,
+    window: usize,
+}
+
+impl Planner {
+    /// A plan cut at `cuts`, or by the silence rule without them.
+    ///
+    /// # Errors
+    ///
+    /// [`AudioError::BadSpec`] for cuts that are not strictly increasing or
+    /// start at frame 0: a chunk of no frames is not a plan.
+    pub(crate) fn new(cuts: Option<&[u32]>) -> Result<Self, AudioError> {
+        let given = match cuts {
+            None => None,
+            Some(cuts) => {
+                let mut last = 0;
+                let mut out = Vec::with_capacity(cuts.len());
+                for &cut in cuts {
+                    let cut = usize::try_from(cut).unwrap_or(usize::MAX);
+                    if cut <= last {
+                        return Err(AudioError::BadSpec {
+                            reason: format!(
+                                "chunk cuts must be strictly increasing past frame 0; \
+                                 {cut} follows {last}"
+                            ),
+                        });
+                    }
+                    out.push(cut);
+                    last = cut;
+                }
+                Some(out)
+            }
+        };
+        Ok(Self {
+            given,
+            next: 0,
+            start: 0,
+            max: frames_in(CHUNK_SECS),
+            search: frames_in(SEARCH_SECS),
+            window: frames_in(WINDOW_SECS),
+        })
+    }
+
+    /// Where the current chunk starts.
+    pub(crate) fn start(&self) -> usize {
+        self.start
+    }
+
+    /// The ends of the chunks that `rows` - every mel row from
+    /// [`Self::start`] received so far, `n_mels` wide - completes, in order;
+    /// with `finishing`, through the last row. A given cut at or past the end
+    /// of a finished clip is not a chunk.
+    pub(crate) fn ends(&mut self, rows: &[f32], n_mels: usize, finishing: bool) -> Vec<usize> {
+        let have = rows.len() / n_mels.max(1);
+        let received = self.start + have;
+        let mut out = Vec::new();
+        let mut at = self.start;
+        if let Some(given) = &self.given {
+            while let Some(&cut) = given.get(self.next)
+                && cut <= received
+            {
+                self.next += 1;
+                if cut > at {
+                    out.push(cut);
+                    at = cut;
+                }
+            }
+        } else {
+            // The rule's next cut, from `at`, needs the chunk, the search past
+            // its mark and one window: what the whole-clip rule would read.
+            let need = self.max + self.search + self.window;
+            while received - at >= need && !finishing {
+                let lo = at - self.start;
+                let cut = self.first_cut(&rows[lo * n_mels..(lo + need) * n_mels], n_mels);
+                at += cut;
+                out.push(at);
+            }
+            if finishing && received > at {
+                let lo = at - self.start;
+                for cut in self.cuts(&rows[lo * n_mels..], n_mels) {
+                    out.push(at + cut);
+                }
+                at = out.last().copied().unwrap_or(at);
+            }
+        }
+        if finishing && received > at {
+            out.push(received);
+        }
+        if let Some(&last) = out.last() {
+            self.start = last;
+        }
+        out
+    }
+
+    /// The silence rule's cuts over `rows`, from their first.
+    fn cuts(&self, rows: &[f32], n_mels: usize) -> Vec<usize> {
+        MelFrames::from_rows(rows.to_vec(), n_mels)
+            .map(|mel| silence_cuts(&mel, self.max, self.search, self.window))
+            .unwrap_or_default()
+    }
+
+    /// The first of [`Self::cuts`] over rows that run past the first mark's
+    /// search, which the rule always finds.
+    fn first_cut(&self, rows: &[f32], n_mels: usize) -> usize {
+        self.cuts(rows, n_mels).first().copied().unwrap_or(self.max)
+    }
+}
+
+/// What one chunk's decoded ids come to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChunkText {
+    /// The ids that spell the chunk's text, each at its interpolated frame.
+    pub(crate) events: Vec<TokenEvent>,
+    /// The language the chunk was transcribed in, as an ISO code where the
+    /// model's name for it has one.
+    pub(crate) language: Option<String>,
+    /// The text the events spell, the space before it included.
+    pub(crate) text: String,
+}
+
+/// The events of one chunk of frames `span` whose greedy ids are `ids`
+/// (without the end id), decoded through `vocab`; `forced` is the language
+/// the prompt forced, by the model's name for it; `after_text` says an
+/// earlier chunk wrote text.
+///
+/// The ids kept are those after the first `<asr_text>` (the whole output when
+/// the language was forced, or when the model wrote no tag), up to the first
+/// one whose text would take the transcript away from [`prompt::parse`]'s:
+///
+/// - a leading id that is only whitespace is dropped, since the parsed text
+///   is stripped, and so is a trailing one;
+/// - where the repetition collapse changed the text, the ids stop where the
+///   decoded text stops agreeing with the collapsed text: the repeats past
+///   the first copy are dropped, and so is whatever followed them (the
+///   collapse keeps that; it is almost always a truncated repeat at the token
+///   cap).
+///
+/// Ids that decode to nothing until a later id completes a character share
+/// that id's fate and frame. A chunk after one that wrote text starts with a
+/// [`SPACE`] at its first frame unless its own text starts with whitespace:
+/// the reference joins chunk texts with nothing between, which would glue the
+/// last word of one chunk to the first of the next.
+pub(crate) fn chunk_events(
+    vocab: &Arc<PieceVocab>,
+    ids: &[u32],
+    forced: Option<&str>,
+    span: Range<u32>,
+    after_text: bool,
+) -> ChunkText {
+    let mut raw = Detokenizer::new(Arc::clone(vocab));
+    for &id in ids {
+        raw.push(id);
+    }
+    raw.flush();
+    let parsed = prompt::parse(raw.text(), forced);
+    let language = parsed
+        .language
+        .as_deref()
+        .map(|name| language_code(name).map_or_else(|| name.to_lowercase(), str::to_owned));
+    let kept = match (forced, ids.iter().position(|&id| id == ASR_TEXT)) {
+        (None, Some(tag)) => &ids[tag + 1..],
+        _ => ids,
+    };
+    let target = parsed.text.as_str();
+    // (ids, characters of kept text before them)
+    let mut groups: Vec<(Vec<u32>, usize)> = Vec::new();
+    let mut text = String::new();
+    let mut waiting: Vec<u32> = Vec::new();
+    let mut detok = Detokenizer::new(Arc::clone(vocab));
+    let mut accept = |ids: Vec<u32>, delta: &str, text: &mut String| -> bool {
+        if text.is_empty() && delta.trim().is_empty() {
+            return true;
+        }
+        let candidate = format!("{text}{delta}");
+        if !target.starts_with(candidate.trim_start()) {
+            return false;
+        }
+        groups.push((ids, text.chars().count()));
+        *text = candidate;
+        true
+    };
+    let mut agreed = true;
+    for &id in kept {
+        waiting.push(id);
+        let Some(delta) = detok.push(id) else {
+            continue;
+        };
+        if !accept(std::mem::take(&mut waiting), &delta, &mut text) {
+            agreed = false;
+            break;
+        }
+    }
+    if agreed && let Some(delta) = detok.flush() {
+        accept(std::mem::take(&mut waiting), &delta, &mut text);
+    }
+    let chars = u64::try_from(text.chars().count().max(1)).unwrap_or(u64::MAX);
+    let (a, b) = (span.start, span.end.max(span.start));
+    let at = |before: usize| {
+        let before = u64::try_from(before).unwrap_or(u64::MAX);
+        let offset = u64::from(b - a) * before / chars;
+        a + u32::try_from(offset).unwrap_or(0)
+    };
+    let mut events = Vec::with_capacity(kept.len() + 1);
+    if after_text && !text.is_empty() && !text.starts_with(char::is_whitespace) {
+        events.push(TokenEvent {
+            token: TokenId::new(SPACE),
+            frame: a,
+        });
+        text.insert(0, ' ');
+    }
+    for (ids, before) in groups {
+        let frame = at(before);
+        events.extend(ids.into_iter().map(|id| TokenEvent {
+            token: TokenId::new(id),
+            frame,
+        }));
+    }
+    ChunkText {
+        events,
+        language,
+        text,
+    }
+}
+
+/// A stream of this recognizer.
+#[derive(Debug)]
+pub(crate) struct QwenStream {
+    model: Arc<Model>,
+    /// The language the prompt forces, by the model's name for it.
+    forced: Option<&'static str>,
+    planner: Planner,
+    cache: KvCache,
+    /// Mel rows from the planner's start, row-major, first-stage `log10`.
+    pending: Vec<f32>,
+    /// Whether any chunk has written text.
+    wrote_text: bool,
+    /// The first language a chunk reported.
+    language: Option<String>,
+    finished: bool,
+}
+
+impl QwenStream {
+    pub(crate) fn new(
+        model: Arc<Model>,
+        forced: Option<&'static str>,
+        cuts: Option<&[u32]>,
+    ) -> Result<Self, AudioError> {
+        let cache = KvCache::new(&model.config.text);
+        Ok(Self {
+            model,
+            forced,
+            planner: Planner::new(cuts)?,
+            cache,
+            pending: Vec::new(),
+            wrote_text: false,
+            language: None,
+            finished: false,
+        })
+    }
+
+    /// Transcribes every chunk the rows in so far complete.
+    fn run(&mut self, finishing: bool) -> Result<Vec<TokenEvent>, AudioError> {
+        let n = self.model.config.audio.mels;
+        let start = self.planner.start();
+        let ends = self.planner.ends(&self.pending, n, finishing);
+        let mut events = Vec::new();
+        let mut from = start;
+        for end in ends {
+            let rows = self.pending[(from - start) * n..(end - start) * n].to_vec();
+            let chunk = self.chunk(rows, frame_word(from)?..frame_word(end)?)?;
+            if !chunk.text.trim().is_empty() {
+                self.wrote_text = true;
+            }
+            if self.language.is_none() {
+                self.language = chunk.language;
+            }
+            events.extend(chunk.events);
+            from = end;
+        }
+        self.pending.drain(..(from - start) * n);
+        Ok(events)
+    }
+
+    /// One chunk of first-stage rows at frames `span`.
+    fn chunk(&mut self, mut data: Vec<f32>, span: Range<u32>) -> Result<ChunkText, AudioError> {
+        let m = &*self.model;
+        let n = m.config.audio.mels;
+        if data.len() < MIN_CHUNK_FRAMES * n {
+            data.resize(MIN_CHUNK_FRAMES * n, SILENT_LOG10);
+        }
+        let mel = log10_max_floor(&MelFrames::from_rows(data, n)?);
+        let audio = Tower::new(&m.ops, &m.weights.tower, &m.config.audio).encode(&mel)?;
+        let ids = Decoder::new(&m.ops, &m.weights.text, &m.config.text).transcribe(
+            &mut self.cache,
+            &audio,
+            self.forced,
+        )?;
+        if ids.len() >= MAX_NEW_TOKENS {
+            tracing::warn!(
+                start = span.start,
+                end = span.end,
+                "a chunk decoded to the token cap; its text is kept"
+            );
+        }
+        Ok(chunk_events(
+            &m.vocab,
+            &ids,
+            self.forced,
+            span,
+            self.wrote_text,
+        ))
+    }
+}
+
+impl RecognizerStream for QwenStream {
+    fn push(&mut self, mel: &MelFrames) -> Result<Vec<TokenEvent>, AudioError> {
+        if self.finished {
+            return Err(AudioError::Checkpoint {
+                what: "push on a finished stream".into(),
+            });
+        }
+        let n = self.model.config.audio.mels;
+        if mel.valid() > 0 && mel.n_mels() != n {
+            return Err(AudioError::BadSpec {
+                reason: format!("{} mel bins, this model reads {n}", mel.n_mels()),
+            });
+        }
+        self.pending
+            .extend_from_slice(&mel.as_slice()[..mel.valid() * mel.n_mels()]);
+        self.run(false)
+    }
+
+    fn finish(&mut self) -> Result<Vec<TokenEvent>, AudioError> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.finished = true;
+        self.run(true)
+    }
+
+    /// Mel frames transcribed so far.
+    fn frames(&self) -> u32 {
+        u32::try_from(self.planner.start()).unwrap_or(u32::MAX)
+    }
+
+    fn language(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+}
+
+#[cfg(test)]
+#[path = "stream_tests.rs"]
+mod tests;

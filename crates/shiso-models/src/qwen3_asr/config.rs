@@ -125,6 +125,29 @@ pub fn language_name(tag: &str) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
+/// The ISO code of the language the model names `name` (in any case), the
+/// inverse of [`language_name`]; `None` for a name outside the model's list.
+#[must_use]
+pub fn language_code(name: &str) -> Option<&'static str> {
+    LANGUAGES
+        .iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(name))
+        .map(|(code, _)| *code)
+}
+
+/// Whether `id` is an added token the tokenizer marks special - the chat
+/// markers, the end ids, the vision and audio placeholders, the TTS markers
+/// and the blanks - or an id past the checkpoint's own table (the GGUF
+/// vocabulary pads to 151936). Never text. The added tokens that are not
+/// special (`<asr_text>`, `<think>`, the tool and FIM markers, `<non_speech>`)
+/// are text the model may write, and are not in this set (notes §3; the
+/// `special` flags of `tokenizer_config.json`'s `added_tokens_decoder`,
+/// identical in every export of both checkpoints).
+#[must_use]
+pub fn is_special(id: u32) -> bool {
+    matches!(id, 151_643..=151_656 | 151_669..=151_674 | 151_676..=151_703) || id > ASR_TEXT
+}
+
 /// The log-mel frontend (notes §1): a periodic Hann window of 400 over a
 /// 400-point FFT every 160 samples, reflect-padded centre framing, the power
 /// spectrum through 128 Slaney mels from 0 to 8 kHz, and the whole-clip

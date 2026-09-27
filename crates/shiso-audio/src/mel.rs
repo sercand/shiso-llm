@@ -111,6 +111,13 @@ pub enum LogScale {
     /// incremental `MelStream` frontend has no "after all frames exist" and
     /// refuses this variant with [`AudioError::BadSpec`].
     Log10MaxFloor,
+    /// `log10(max(x, 1e-10))` per frame: the first stage of
+    /// [`LogScale::Log10MaxFloor`] alone. A recognizer that transcribes a clip
+    /// in chunks and floors each chunk on its own maximum computes the whole
+    /// clip this way once, then finishes each chunk's rows with
+    /// [`log10_max_floor`]: the floor depends on which rows share it, so it
+    /// cannot be undone once applied over the whole clip.
+    Log10,
 }
 
 /// Every constant of one log-mel frontend.
@@ -316,6 +323,18 @@ fn apply_max_floor(data: &mut [f32], mels: usize, valid: usize) {
         let v = f64::from(*slot).max(floor);
         *slot = f32_of((v + 4.0) / 4.0);
     }
+}
+
+/// Frames computed with [`LogScale::Log10`], finished as
+/// [`LogScale::Log10MaxFloor`] would finish exactly these frames: the floor at
+/// their own maximum less 8, then `(v + 4) / 4`. Computing a clip with
+/// [`LogScale::Log10`] and finishing it here gives the same values as
+/// computing it with [`LogScale::Log10MaxFloor`].
+#[must_use]
+pub fn log10_max_floor(mel: &MelFrames) -> MelFrames {
+    let mut data = mel.as_slice().to_vec();
+    apply_max_floor(&mut data, mel.n_mels(), mel.valid());
+    MelFrames::from_parts(data, mel.n_mels(), mel.total(), mel.valid())
 }
 
 /// The analysis window, placed in an `n_fft`-long vector as the framing asks.
@@ -593,7 +612,7 @@ impl MelFrontend {
                 LogScale::Natural { guard } => f32_of((e + f64::from(guard)).ln()),
                 // Stage one only; the floor and rescale need every frame's
                 // value first, so `MelFrontend::compute` finishes the job.
-                LogScale::Log10MaxFloor => f32_of(e.max(1e-10).log10()),
+                LogScale::Log10MaxFloor | LogScale::Log10 => f32_of(e.max(1e-10).log10()),
             };
         }
     }

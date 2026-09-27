@@ -113,6 +113,14 @@ pub trait RecognizerStream: Send {
 
     /// Encoder frames consumed so far.
     fn frames(&self) -> u32;
+
+    /// The language the stream found in the model's own output, for a model
+    /// that names it in words rather than with a tag piece
+    /// ([`PieceVocab::language_of`]). `None` leaves the transcript's language
+    /// to the tags the detokenizer saw.
+    fn language(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[cfg(test)]
