@@ -20,6 +20,9 @@ const WEEK: u32 = 2003;
 const DOT: u32 = 13;
 const A: u32 = 64;
 const B: u32 = 65;
+/// `哈` and `好`, one byte-level piece each.
+const HA: u32 = 1_000;
+const HAO: u32 = 1_001;
 
 /// A byte-level vocabulary of the checkpoint's size holding the handful of
 /// pieces these tests spell, and the added tokens where the checkpoint has
@@ -36,6 +39,8 @@ fn vocab() -> Arc<PieceVocab> {
         (SPACE, "\u{120}"),
         (A, "a"),
         (B, "b"),
+        (HA, "\u{e5}\u{135}\u{12a}"),
+        (HAO, "\u{e5}\u{a5}\u{bd}"),
     ] {
         tokens[usize::try_from(id).expect("fits")] = piece.to_owned();
     }
@@ -60,7 +65,7 @@ fn at(events: &[TokenEvent]) -> Vec<(u32, u32)> {
 fn frames_interpolate_by_characters_inside_a_chunk() {
     let v = vocab();
     let ids = [LANGUAGE, ENGLISH, ASR_TEXT, THIS, WEEK, DOT];
-    let chunk = chunk_events(&v, &ids, None, 100..200, false);
+    let chunk = chunk_events(&v, &ids, None, 100..200, None);
     // "This week." is 10 characters: "This" starts at 0, " week" at 4 and
     // "." at 9, over frames 100..200. The prefix is not emitted.
     assert_eq!(at(&chunk.events), [(THIS, 100), (WEEK, 140), (DOT, 190)]);
@@ -69,7 +74,7 @@ fn frames_interpolate_by_characters_inside_a_chunk() {
 
     // After a chunk that wrote text, a space opens this one at its first
     // frame; the others keep their frames.
-    let next = chunk_events(&v, &ids, None, 100..200, true);
+    let next = chunk_events(&v, &ids, None, 100..200, Some('.'));
     assert_eq!(
         at(&next.events),
         [(SPACE, 100), (THIS, 100), (WEEK, 140), (DOT, 190)]
@@ -77,7 +82,7 @@ fn frames_interpolate_by_characters_inside_a_chunk() {
     assert_eq!(next.text, " This week.");
 
     // Forced: no prefix to drop, the language is the forced one.
-    let forced = chunk_events(&v, &[THIS, WEEK], Some("English"), 0..90, false);
+    let forced = chunk_events(&v, &[THIS, WEEK], Some("English"), 0..90, None);
     assert_eq!(at(&forced.events), [(THIS, 0), (WEEK, 40)]);
     assert_eq!(forced.language.as_deref(), Some("en"));
 }
@@ -91,11 +96,11 @@ fn a_chunk_emits_only_the_ids_of_its_parsed_text() {
         &[LANGUAGE, ENGLISH, ASR_TEXT, SPACE, THIS, WEEK, SPACE],
         None,
         0..100,
-        false,
+        None,
     );
     assert_eq!(at(&padded.events), [(THIS, 0), (WEEK, 44)]);
     // Silence: the model says so and writes nothing.
-    let silent = chunk_events(&v, &[LANGUAGE, NONE, ASR_TEXT], None, 0..100, true);
+    let silent = chunk_events(&v, &[LANGUAGE, NONE, ASR_TEXT], None, 0..100, Some('.'));
     assert!(silent.events.is_empty(), "{:?}", silent.events);
     assert_eq!(silent.language, None);
     // A degenerate repeat, collapsed by the parse to one copy: the ids stop
@@ -104,7 +109,7 @@ fn a_chunk_emits_only_the_ids_of_its_parsed_text() {
     for _ in 0..30 {
         looping.extend([A, B]);
     }
-    let collapsed = chunk_events(&v, &looping, None, 0..100, false);
+    let collapsed = chunk_events(&v, &looping, None, 0..100, None);
     assert_eq!(collapsed.text, "Thisab");
     assert_eq!(
         collapsed
@@ -115,9 +120,65 @@ fn a_chunk_emits_only_the_ids_of_its_parsed_text() {
         [THIS, A, B]
     );
     // No tag at all: the whole output is text, with no language.
-    let untagged = chunk_events(&v, &[THIS, WEEK], None, 0..100, false);
+    let untagged = chunk_events(&v, &[THIS, WEEK], None, 0..100, None);
     assert_eq!(untagged.text, "This week");
     assert_eq!(untagged.language, None);
+}
+
+fn ids_of(chunk: &super::ChunkText) -> Vec<u32> {
+    chunk.events.iter().map(|e| e.token.get()).collect()
+}
+
+#[test]
+fn the_text_after_a_collapsed_run_is_kept() {
+    let v = vocab();
+    // A run of one character past the threshold collapses to one copy, and
+    // the words after it are the parsed text's too.
+    let mut run = vec![LANGUAGE, ENGLISH, ASR_TEXT, THIS];
+    run.extend([A; 25]);
+    run.extend([WEEK, DOT]);
+    let chunk = chunk_events(&v, &run, None, 0..100, None);
+    assert_eq!(chunk.text, "Thisa week.");
+    assert_eq!(ids_of(&chunk), [THIS, A, WEEK, DOT]);
+    // A repeated pattern, the same.
+    let mut pattern = vec![LANGUAGE, ENGLISH, ASR_TEXT, THIS];
+    for _ in 0..30 {
+        pattern.extend([A, B]);
+    }
+    pattern.push(WEEK);
+    let chunk = chunk_events(&v, &pattern, None, 0..100, None);
+    assert_eq!(chunk.text, "Thisab week");
+    assert_eq!(ids_of(&chunk), [THIS, A, B, WEEK]);
+    // Twenty-one of one Han character, then another.
+    let mut han = vec![HA; 21];
+    han.push(HAO);
+    let chunk = chunk_events(&v, &han, Some("Chinese"), 0..100, None);
+    assert_eq!(chunk.text, "哈好");
+    assert_eq!(ids_of(&chunk), [HA, HAO]);
+}
+
+#[test]
+fn no_space_joins_chunks_in_a_script_written_without_spaces() {
+    let v = vocab();
+    // Latin after Latin: a space.
+    let latin = chunk_events(&v, &[THIS, WEEK], Some("English"), 0..90, Some('.'));
+    assert_eq!(ids_of(&latin), [SPACE, THIS, WEEK]);
+    assert_eq!(latin.text, " This week");
+    // Han after Han, Han after Latin, Latin after Han: none.
+    for after in ['哈', '.'] {
+        let han = chunk_events(&v, &[HAO], Some("Chinese"), 0..90, Some(after));
+        assert_eq!(ids_of(&han), [HAO], "after {after:?}");
+        assert_eq!(han.text, "好");
+    }
+    let after_han = chunk_events(&v, &[THIS], Some("English"), 0..90, Some('好'));
+    assert_eq!(ids_of(&after_han), [THIS]);
+    // Kana and Thai are written without spaces too; Hangul is not.
+    for c in ['か', 'カ', 'ก', '。'] {
+        assert!(super::unspaced(c), "{c}");
+    }
+    for c in ['한', 'a', 'é', 'я', '1'] {
+        assert!(!super::unspaced(c), "{c}");
+    }
 }
 
 #[test]

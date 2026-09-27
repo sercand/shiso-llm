@@ -203,10 +203,30 @@ pub(crate) struct ChunkText {
     pub(crate) text: String,
 }
 
+/// Whether `c` belongs to a script written without spaces between words -
+/// Han, kana, Thai, Lao, Khmer, Myanmar, and the CJK punctuation and
+/// full-width forms - so that no space goes between it and a neighbouring
+/// chunk's text. Hangul is written with spaces and is not one.
+pub(crate) fn unspaced(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0E00}'..='\u{0EFF}' // Thai, Lao
+            | '\u{1000}'..='\u{109F}' // Myanmar
+            | '\u{1780}'..='\u{17FF}' // Khmer
+            | '\u{3000}'..='\u{30FF}' // CJK punctuation, Hiragana, Katakana
+            | '\u{31F0}'..='\u{31FF}' // Katakana phonetic extensions
+            | '\u{3400}'..='\u{4DBF}' // Han extension A
+            | '\u{4E00}'..='\u{9FFF}' // Han
+            | '\u{F900}'..='\u{FAFF}' // Han compatibility
+            | '\u{FF00}'..='\u{FFEF}' // full-width and half-width forms
+            | '\u{20000}'..='\u{3FFFF}' // Han extensions B onward
+    )
+}
+
 /// The events of one chunk of frames `span` whose greedy ids are `ids`
 /// (without the end id), decoded through `vocab`; `forced` is the language
-/// the prompt forced, by the model's name for it; `after_text` says an
-/// earlier chunk wrote text.
+/// the prompt forced, by the model's name for it; `after` is the last
+/// character earlier chunks wrote, if they wrote any.
 ///
 /// The ids kept are those after the first `<asr_text>` (the whole output when
 /// the language was forced, or when the model wrote no tag), up to the first
@@ -214,23 +234,25 @@ pub(crate) struct ChunkText {
 ///
 /// - a leading id that is only whitespace is dropped, since the parsed text
 ///   is stripped, and so is a trailing one;
-/// - where the repetition collapse changed the text, the ids stop where the
-///   decoded text stops agreeing with the collapsed text: the repeats past
-///   the first copy are dropped, and so is whatever followed them (the
-///   collapse keeps that; it is almost always a truncated repeat at the token
-///   cap).
+/// - where the repetition collapse changed the text, the ids that spell the
+///   repeats past the first copy are dropped, and emitting resumes at the
+///   first later id from which the ids spell the rest of the collapsed text
+///   ([`resume_at`]): the collapse keeps what follows a run, so the
+///   transcript does too. Where no later id does (the collapse changed the
+///   rest as well), the ids stop there.
 ///
 /// Ids that decode to nothing until a later id completes a character share
 /// that id's fate and frame. A chunk after one that wrote text starts with a
-/// [`SPACE`] at its first frame unless its own text starts with whitespace:
-/// the reference joins chunk texts with nothing between, which would glue the
-/// last word of one chunk to the first of the next.
+/// [`SPACE`] at its first frame unless its own text starts with whitespace
+/// or either side of the join is [`unspaced`]: the reference joins chunk
+/// texts with nothing between, which would glue the last word of one chunk
+/// to the first of the next, and is right only where words take no spaces.
 pub(crate) fn chunk_events(
     vocab: &Arc<PieceVocab>,
     ids: &[u32],
     forced: Option<&str>,
     span: Range<u32>,
-    after_text: bool,
+    after: Option<char>,
 ) -> ChunkText {
     let mut raw = Detokenizer::new(Arc::clone(vocab));
     for &id in ids {
@@ -250,33 +272,59 @@ pub(crate) fn chunk_events(
     // (ids, characters of kept text before them)
     let mut groups: Vec<(Vec<u32>, usize)> = Vec::new();
     let mut text = String::new();
-    let mut waiting: Vec<u32> = Vec::new();
-    let mut detok = Detokenizer::new(Arc::clone(vocab));
-    let mut accept = |ids: Vec<u32>, delta: &str, text: &mut String| -> bool {
-        if text.is_empty() && delta.trim().is_empty() {
+    // Bytes of `target` the kept text spells.
+    let mut matched = 0;
+    let mut accept = |ids: Vec<u32>, delta: &str, text: &mut String, matched: &mut usize| {
+        // Leading whitespace is not the stripped target's.
+        let spelled = if text.is_empty() {
+            delta.trim_start()
+        } else {
+            delta
+        };
+        if spelled.is_empty() {
             return true;
         }
-        let candidate = format!("{text}{delta}");
-        if !target.starts_with(candidate.trim_start()) {
+        if !target[*matched..].starts_with(spelled) {
             return false;
         }
         groups.push((ids, text.chars().count()));
-        *text = candidate;
+        text.push_str(delta);
+        *matched += spelled.len();
         true
     };
+    let mut waiting: Vec<u32> = Vec::new();
+    let mut detok = Detokenizer::new(Arc::clone(vocab));
     let mut agreed = true;
-    for &id in kept {
+    let mut i = 0;
+    while let Some(&id) = kept.get(i) {
+        i += 1;
         waiting.push(id);
         let Some(delta) = detok.push(id) else {
             continue;
         };
-        if !accept(std::mem::take(&mut waiting), &delta, &mut text) {
+        let from = i - waiting.len();
+        if accept(
+            std::mem::take(&mut waiting),
+            &delta,
+            &mut text,
+            &mut matched,
+        ) {
+            continue;
+        }
+        let Some(skip) = resume_at(vocab, &kept[from..], &target[matched..]) else {
             agreed = false;
             break;
-        }
+        };
+        i = from + skip;
+        detok = Detokenizer::new(Arc::clone(vocab));
     }
     if agreed && let Some(delta) = detok.flush() {
-        accept(std::mem::take(&mut waiting), &delta, &mut text);
+        accept(
+            std::mem::take(&mut waiting),
+            &delta,
+            &mut text,
+            &mut matched,
+        );
     }
     let chars = u64::try_from(text.chars().count().max(1)).unwrap_or(u64::MAX);
     let (a, b) = (span.start, span.end.max(span.start));
@@ -286,7 +334,8 @@ pub(crate) fn chunk_events(
         a + u32::try_from(offset).unwrap_or(0)
     };
     let mut events = Vec::with_capacity(kept.len() + 1);
-    if after_text && !text.is_empty() && !text.starts_with(char::is_whitespace) {
+    let spaced = |c: char| !c.is_whitespace() && !unspaced(c);
+    if after.is_some_and(spaced) && text.chars().next().is_some_and(spaced) {
         events.push(TokenEvent {
             token: TokenId::new(SPACE),
             frame: a,
@@ -305,6 +354,35 @@ pub(crate) fn chunk_events(
         language,
         text,
     }
+}
+
+/// Where emitting resumes after `ids[0]` began text the collapsed target does
+/// not have: the index of the first later id, at a character boundary, from
+/// which `ids` spell exactly `rest` (the target's text not yet spelled),
+/// trailing whitespace aside. `None` when nothing is left to spell or no
+/// suffix spells it.
+///
+/// One decode of `ids` finds every boundary, and a suffix of the wrong
+/// length is refused before its bytes are compared, so a chunk at the token
+/// cap costs one pass over its ids, not one per id.
+fn resume_at(vocab: &Arc<PieceVocab>, ids: &[u32], rest: &str) -> Option<usize> {
+    if rest.is_empty() {
+        return None;
+    }
+    let mut detok = Detokenizer::new(Arc::clone(vocab));
+    // (the id after a whole delta, the text's length before that id)
+    let mut starts = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        if detok.push(id).is_some() {
+            starts.push((i + 1, detok.text().len()));
+        }
+    }
+    detok.flush();
+    let all = detok.text();
+    starts
+        .into_iter()
+        .find(|&(i, at)| i < ids.len() && all[at..].trim_end() == rest)
+        .map(|(i, _)| i)
 }
 
 /// A stream's device memory: the decoder's cache and activations and the
@@ -347,8 +425,8 @@ pub(crate) struct QwenStream {
     memory: Option<Memory>,
     /// Mel rows from the planner's start, row-major, first-stage `log10`.
     pending: Vec<f32>,
-    /// Whether any chunk has written text.
-    wrote_text: bool,
+    /// The last character the chunks have written.
+    last_char: Option<char>,
     /// The first language a chunk reported.
     language: Option<String>,
     /// Where each chunk transcribed so far ends, in mel frames.
@@ -378,7 +456,7 @@ impl QwenStream {
             forced,
             memory: Some(memory),
             pending: Vec::new(),
-            wrote_text: false,
+            last_char: None,
             language: None,
             ends: Vec::new(),
             finished: false,
@@ -395,8 +473,8 @@ impl QwenStream {
         for end in ends {
             let rows = self.pending[(from - start) * n..(end - start) * n].to_vec();
             let chunk = self.chunk(rows, frame_word(from)?..frame_word(end)?)?;
-            if !chunk.text.trim().is_empty() {
-                self.wrote_text = true;
+            if let Some(last) = chunk.text.trim_end().chars().next_back() {
+                self.last_char = Some(last);
             }
             if self.language.is_none() {
                 self.language = chunk.language;
@@ -440,7 +518,7 @@ impl QwenStream {
             &ids,
             self.forced,
             span,
-            self.wrote_text,
+            self.last_char,
         ))
     }
 }
