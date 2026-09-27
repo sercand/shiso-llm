@@ -1853,6 +1853,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "shiso-audio",
  "shiso-core",
  "shiso-cuda",

@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
 use shiso_audio::{AudioClip, AudioTower};
+use shiso_core::media::{MediaDigest, VisionGrid};
 use shiso_vision::VisionItem;
 
 use crate::vision::VisionTower;
@@ -36,6 +38,57 @@ impl MediaItem {
         }
     }
 
+    /// The grid the item's tower lays its rows out in, which is also what
+    /// decides the rotary positions of everything after it.
+    ///
+    /// Stated here, before any tower has run, because a prefix resume has to
+    /// know where every picture it skips sat. It is the same division each
+    /// tower performs on its way out - a still or clip's pre-merge patch grid
+    /// over the merge factor, and a clip of audio as one row of its tokens.
+    #[must_use]
+    pub fn grid(&self, spatial_merge: usize) -> VisionGrid {
+        let narrow = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+        match self {
+            Self::Vision(item) => {
+                let (t_len, gh, gw) = item.grid();
+                let merge = spatial_merge.max(1);
+                VisionGrid::new(narrow(t_len), narrow(gh / merge), narrow(gw / merge))
+            }
+            Self::Audio(clip) => VisionGrid::new(1, 1, narrow(clip.tokens())),
+        }
+    }
+
+    /// A digest of exactly what the item's tower will be handed.
+    ///
+    /// The decoded values and their layout rather than the request's bytes:
+    /// the same file can decode to different rows under a different resize,
+    /// and two encodings of one picture decode to the same rows. What a cached
+    /// prefix depends on is the rows, so that is what is hashed.
+    #[must_use]
+    pub fn digest(&self) -> MediaDigest {
+        let mut hash = Sha256::new();
+        match self {
+            Self::Vision(item) => {
+                let (t_len, gh, gw) = item.grid();
+                hash.update(b"vision");
+                for extent in [t_len, gh, gw, item.row_len()] {
+                    hash.update(u64::try_from(extent).unwrap_or(u64::MAX).to_le_bytes());
+                }
+                hash_floats(&mut hash, item.as_flat());
+            }
+            Self::Audio(clip) => {
+                hash.update(b"audio");
+                hash.update(
+                    u64::try_from(clip.tokens())
+                        .unwrap_or(u64::MAX)
+                        .to_le_bytes(),
+                );
+                hash_floats(&mut hash, clip.mel().as_slice());
+            }
+        }
+        MediaDigest::new(hash.finalize().into())
+    }
+
     /// Whether the item is for the audio tower.
     #[must_use]
     pub const fn is_audio(&self) -> bool {
@@ -54,4 +107,17 @@ pub struct MediaTowers {
     pub vision: Option<VisionTower>,
     /// The audio tower, when the `--vision` container carries one.
     pub audio: Option<Arc<dyn AudioTower>>,
+}
+
+/// Feeds `values` to `hash` as little-endian bytes, a block at a time so a
+/// megabyte payload is not copied whole to be hashed.
+fn hash_floats(hash: &mut Sha256, values: &[f32]) {
+    let mut block = Vec::with_capacity(4096);
+    for chunk in values.chunks(1024) {
+        block.clear();
+        for value in chunk {
+            block.extend_from_slice(&value.to_le_bytes());
+        }
+        hash.update(&block);
+    }
 }

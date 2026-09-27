@@ -48,6 +48,7 @@ use shiso_core::backend::Backend;
 use shiso_core::buffer::DeviceView;
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
+use shiso_core::media::MediaKey;
 use shiso_core::model::{Logits, Model};
 use shiso_kvstore::{
     CacheStats, CommitOpts, DiskConfig, EntryKey, KvCache, PersistOutcome, PersistRefusal,
@@ -200,9 +201,10 @@ pub enum SaveOutcome {
     AlreadyStored(EntryKey),
     /// The stack has no disk tier: nobody called [`Checkpointed::kv_enable`].
     Disabled,
-    /// The session read media: a run of placeholder tokens is the same id
-    /// repeated, so its token path cannot tell two pictures apart and is never
-    /// stored.
+    /// The session read media with no content key, or stands inside one of
+    /// its pictures: a run of placeholder tokens is the same id repeated, so
+    /// such a path cannot tell two pictures apart and is never stored (see
+    /// [`Checkpointed::kv_set_media_key`]).
     CarriesMedia,
     /// A speculating session with no staged draft row: a checkpoint would carry
     /// a row nothing computed.
@@ -345,6 +347,33 @@ pub trait Checkpointed: Model {
     fn kv_set_hints(&mut self, session: SessionId, hints: &[u32]) -> CoreResult<()> {
         let _ = (session, hints);
         Ok(())
+    }
+
+    /// Files `session`'s path under `key`, the content key of the media prompt
+    /// `prompt` it is about to resume or read, so its prefix can be stored and
+    /// resumed like a text prompt's.
+    ///
+    /// Refused by default, and the refusal is the answer a host must honour: a
+    /// model that cannot key its cache files a media prompt under placeholder
+    /// runs that are the same for any picture, so the host keeps such a
+    /// session off the tier altogether.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] from a model that cannot key its cache, and
+    /// whatever the implementation refuses - see
+    /// [`crate::sparse::SparseStack::ckpt_set_media_key`].
+    fn kv_set_media_key(
+        &mut self,
+        session: SessionId,
+        prompt: &[TokenId],
+        key: MediaKey<'_>,
+    ) -> CoreResult<()> {
+        let _ = (session, prompt, key);
+        Err(CoreError::Unsupported {
+            what: "a content-keyed prefix for a media prompt",
+            backend: "checkpoint",
+        })
     }
 
     /// Copies up to `max_bytes` of queued checkpoint pages off the device for

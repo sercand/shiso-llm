@@ -16,8 +16,9 @@
     reason = "the fixtures are small literal grids and the pre-temporal rule is transcribed with the widths it was written in; a conversion at every index would make it a worse transcription of the rule it is here to reproduce"
 )]
 
-use super::{MediaPositions, PadTokens, Streams, VisionGrid, Walk};
+use super::{MediaPositions, PadTokens, Streams, VisionGrid, Walk, rotary_shift_at};
 use shiso_core::ids::TokenId;
+use shiso_core::media::MediaSpan;
 
 const IMG: TokenId = TokenId::new(248_056);
 const VID: TokenId = TokenId::new(248_057);
@@ -565,4 +566,113 @@ fn a_chunk_holding_an_item_whole_is_bounded_per_token_too() {
     let mut out = Streams::default();
     Walk::new(&grids, pads(), 0, MediaPositions::Linear).chunk(&tokens, &mut out);
     assert_eq!(out.bound, (0..6).collect::<Vec<_>>());
+}
+
+// -- resuming past a picture ----------------------------------------------------
+
+/// Text, a 3x4 still, text, a 2x2 still, text: two pictures whose area and
+/// extent differ, so the shift after each is a different number.
+fn two_pictures() -> (Vec<TokenId>, Vec<VisionGrid>, Vec<MediaSpan>) {
+    let mut tokens = vec![TXT; 3];
+    tokens.extend([IMG; 12]);
+    tokens.extend([TXT; 5]);
+    tokens.extend([IMG; 4]);
+    tokens.extend([TXT; 6]);
+    let grids = vec![grid(1, 3, 4), grid(1, 2, 2)];
+    let spans = vec![MediaSpan::new(3, grids[0]), MediaSpan::new(20, grids[1])];
+    (tokens, grids, spans)
+}
+
+/// The shift a resume recomputes is the one a walk over the same prompt
+/// reaches, at every position that is not inside a picture.
+#[test]
+fn the_stated_shift_is_the_walked_one_at_every_position_outside_a_picture() {
+    let (tokens, grids, spans) = two_pictures();
+    for at in 0..=tokens.len() {
+        let mut walk = Walk::new(&grids, pads(), 0, MediaPositions::Mrope3D);
+        walk.chunk(&tokens[..at], &mut Streams::default());
+        let pos = at as u32;
+        match rotary_shift_at(&spans, pos, MediaPositions::Mrope3D) {
+            Some(shift) => assert_eq!(shift, walk.shift(), "at {at}"),
+            None => assert!(spans.iter().any(|span| span.splits(pos)), "at {at}"),
+        }
+    }
+    // 3x4 advances by 4 over 12 tokens, 2x2 by 2 over 4.
+    assert_eq!(
+        rotary_shift_at(&spans, 20, MediaPositions::Mrope3D),
+        Some(8)
+    );
+    assert_eq!(
+        rotary_shift_at(&spans, 26, MediaPositions::Mrope3D),
+        Some(10)
+    );
+}
+
+/// A prefix may not end halfway through an item, and the one-position rule
+/// never parts the two streams at all.
+#[test]
+fn inside_a_picture_there_is_no_shift_and_the_linear_rule_has_none_anywhere() {
+    let (_tokens, _grids, spans) = two_pictures();
+    assert_eq!(rotary_shift_at(&spans, 4, MediaPositions::Mrope3D), None);
+    assert_eq!(rotary_shift_at(&spans, 3, MediaPositions::Mrope3D), Some(0));
+    assert_eq!(
+        rotary_shift_at(&spans, 15, MediaPositions::Mrope3D),
+        Some(8)
+    );
+    assert_eq!(rotary_shift_at(&spans, 26, MediaPositions::Linear), Some(0));
+}
+
+/// The resume invariant: a walk over a whole prompt and a fresh walk started
+/// past its first picture - at the recomputed rotary position, holding only the
+/// items still ahead of it - hand out the same streams for the tail. This is
+/// what lets a stored prefix end after a picture and be continued as though the
+/// prompt had been read cold.
+#[test]
+fn a_walk_restarted_past_a_picture_continues_the_one_that_read_it() {
+    let (tokens, grids, spans) = two_pictures();
+    let whole = run(&tokens, &grids, 0);
+    for at in [15usize, 17, 20, 24, 26] {
+        let pos = at as u32;
+        let shift = rotary_shift_at(&spans, pos, MediaPositions::Mrope3D).expect("outside");
+        let ahead: Vec<VisionGrid> = spans
+            .iter()
+            .filter(|span| span.start() >= pos)
+            .map(MediaSpan::grid)
+            .collect();
+        let mut tail = Streams::default();
+        Walk::new(&ahead, pads(), pos, MediaPositions::Mrope3D)
+            .at_rotary(pos - shift)
+            .chunk(&tokens[at..], &mut tail);
+        assert_eq!(tail.t, whole.t[at..], "t from {at}");
+        assert_eq!(tail.h, whole.h[at..], "h from {at}");
+        assert_eq!(tail.w, whole.w[at..], "w from {at}");
+        assert_eq!(tail.bound, whole.bound[at..], "bound from {at}");
+        // The encoder row map restarts at the first item still ahead, which is
+        // the first row of the block handed to the restarted walk.
+        let first = whole.map[at..].iter().copied().find(|row| *row >= 0);
+        let offset = first.map_or(0, |row| {
+            row - tail.map.iter().copied().find(|r| *r >= 0).unwrap_or(0)
+        });
+        let rebased: Vec<i32> = tail
+            .map
+            .iter()
+            .map(|row| if *row >= 0 { row + offset } else { *row })
+            .collect();
+        assert_eq!(rebased, whole.map[at..], "map from {at}");
+    }
+}
+
+/// Text after a picture, then decoding: the rotary position a decode step
+/// takes is the walk's, and the shift is exactly what separates it from the
+/// sequence position.
+#[test]
+fn the_token_after_a_prompt_rotates_where_the_walk_left_the_stream() {
+    let (tokens, grids, _spans) = two_pictures();
+    let mut walk = Walk::new(&grids, pads(), 0, MediaPositions::Mrope3D);
+    let mut out = Streams::default();
+    walk.chunk(&tokens, &mut out);
+    let last = *out.t.last().expect("a prompt");
+    let next = tokens.len() as u32;
+    assert_eq!(i64::from(walk.rotary()), i64::from(last) + 1);
+    assert_eq!(next - walk.shift(), walk.rotary());
 }

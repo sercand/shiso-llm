@@ -152,6 +152,21 @@ impl TextCursor {
 /// about the prefill rate.
 const MIN_TIMED_PREFILL: u32 = 512;
 
+/// Whether a sequence's path carries media, and if so how the cache may file it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathMedia {
+    /// No media: the path is its own key.
+    Text,
+    /// Media the model files under no content key. Kept off the tier, because
+    /// a placeholder run is the same ids for any picture. A resume can cover
+    /// every picture so that nothing is encoded, and the path still carries
+    /// their runs, which is why this is a fact about the request and not
+    /// about what was encoded.
+    Unkeyed,
+    /// Media the model files under the pictures' content key.
+    Keyed,
+}
+
 /// One resident sequence.
 #[derive(Debug)]
 pub(crate) struct SeqSlot {
@@ -224,6 +239,11 @@ pub(crate) struct SeqSlot {
     /// on a tick this sequence may not be alone on. `None` is a text-only
     /// request and takes the launches it took before any of this existed.
     media: Option<EncodedMedia>,
+    /// Whether its path carries media and how the cache may file it.
+    path_media: PathMedia,
+    /// Audio placeholder tokens in the prompt, counted from the request rather
+    /// than from what was encoded, which a resume can make smaller.
+    audio_pads: u32,
     /// Whether it runs only when no standard sequence has work.
     flex: bool,
     /// When the planner last started leaving it out, while it still is.
@@ -255,10 +275,26 @@ impl SeqSlot {
         media: Option<EncodedMedia>,
         parser: Box<dyn shiso_parsers::StreamParser>,
     ) -> Self {
+        let path_media = if request.media.is_empty() && media.is_none() {
+            PathMedia::Text
+        } else {
+            PathMedia::Unkeyed
+        };
+        let audio_pads = request
+            .media
+            .iter()
+            .filter(|item| item.is_audio())
+            .map(|item| u32::try_from(item.pad_count(1)).unwrap_or(u32::MAX))
+            .fold(0u32, u32::saturating_add);
+        let audio_pads = media
+            .as_ref()
+            .map_or(audio_pads, |media| audio_pads.max(media.audio_pads()));
         Self {
             flex: request.is_flex(),
             paused_since: None,
             media,
+            path_media,
+            audio_pads,
             parser,
             blocks: BlockCursor::default(),
             calls_emitted: 0,
@@ -342,17 +378,33 @@ impl SeqSlot {
         self.media.as_ref()
     }
 
+    /// Hands it the encoder rows for the items its prompt still has to read.
+    pub(crate) fn attach_media(&mut self, media: EncodedMedia) {
+        self.media = Some(media);
+    }
+
+    /// Records that the model files this sequence under a content key.
+    pub(crate) const fn set_keyed(&mut self) {
+        if matches!(self.path_media, PathMedia::Unkeyed) {
+            self.path_media = PathMedia::Keyed;
+        }
+    }
+
+    /// Prompt tokens read so far, a resume included.
+    pub(crate) const fn prompt_cursor(&self) -> usize {
+        self.cursor
+    }
+
     /// Whether this sequence's prefix may be stored or resumed.
     ///
-    /// The checkpoint tier keys on the rendered prompt TEXT, and a prompt that
-    /// carries a picture renders to the same text whichever picture it is: the
-    /// placeholder marker is one token and the pixels are not in the string. So
-    /// a media request must never file a prefix under that key and must never
-    /// stand on one somebody else filed, because both directions serve one
-    /// picture's activations for another picture's request - fluently, and with
-    /// nothing in the response to show for it.
-    pub(crate) fn checkpointable(&self) -> bool {
-        self.media.is_none()
+    /// The tier keys on token ids, and a picture is a run of one placeholder id
+    /// whichever picture it is. So a media request may file or stand on a
+    /// prefix only when the model keys its path by the pictures' content (see
+    /// [`shiso_core::media::MediaKey`]); without that, both directions serve one
+    /// picture's activations for another picture's request - fluently, and
+    /// with nothing in the response to show for it.
+    pub(crate) const fn checkpointable(&self) -> bool {
+        !matches!(self.path_media, PathMedia::Unkeyed)
     }
 
     /// Records one prefill call: `tokens` covered in `elapsed`, with the
@@ -419,7 +471,7 @@ impl SeqSlot {
         vocabulary: &Vocabulary,
     ) -> Option<(String, Arc<[TokenId]>)> {
         let marker = self.end_marker?;
-        if self.media.is_some()
+        if !matches!(self.path_media, PathMedia::Text)
             || self.prompt_text.is_empty()
             || !matches!(
                 self.ending,
@@ -800,10 +852,7 @@ impl SeqSlot {
             prompt_tokens: u64::try_from(self.prompt.len()).unwrap_or(u64::MAX),
             completion_tokens: completion,
             cached_prompt_tokens: self.cached,
-            audio_prompt_tokens: self
-                .media
-                .as_ref()
-                .map_or(0, |media| u64::from(media.audio_pads())),
+            audio_prompt_tokens: u64::from(self.audio_pads),
             reasoning_tokens: self.reasoning,
             time_to_first_token_ms: ttft.map_or(0.0, |at| at * 1000.0),
             tokens_per_second,

@@ -39,7 +39,7 @@ use shiso_core::{DeviceView, Extent3};
 
 use crate::launch::{self, BLOCK_LINEAR, SpliceArgs, VISION};
 
-pub(crate) use mrope::{Streams, Walk};
+pub(crate) use mrope::{Streams, Walk, rotary_shift_at};
 pub use shiso_core::media::{PadTokens, VisionGrid, VisionPrefill};
 
 /// What one chunk of a multimodal prefill adds to the pass.

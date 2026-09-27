@@ -67,6 +67,8 @@ mod cancel;
 pub mod clock;
 mod config;
 mod lifecycle;
+#[cfg(test)]
+mod media_key_tests;
 pub mod queue;
 mod stats;
 pub mod stop;
@@ -77,8 +79,8 @@ use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use shiso_core::{
-    Backend, CoreError, DecodeStep, Model, PadTokens, SamplingParams, Seed, SessionId, StopTokens,
-    TokenId, VisionPrefill,
+    Backend, CoreError, DecodeStep, MediaDigest, MediaKey, MediaSpan, Model, PadTokens,
+    SamplingParams, Seed, SessionId, StopTokens, TokenId, VisionGrid, VisionPrefill,
 };
 use shiso_engine::Reason;
 use shiso_engine::ckpt::Checkpointed;
@@ -567,20 +569,20 @@ impl Coordinator {
 
     /// Gives a request whose stream is answered a session and a slot.
     fn open(&mut self, request: GenerateRequest, sink: mpsc::Sender<StreamEvent>) {
-        // The tower runs before a session is opened, because everything it can
-        // refuse is cheaper to refuse with nothing standing on it. A request
-        // whose pictures cannot be encoded is FAILED rather than served from its
-        // words: the prompt still carries the placeholder run, so serving it
-        // would run the model over a few hundred embedding rows that stand for
-        // nothing and hand back fluent prose about a picture nobody looked at.
-        let media = match self.encode_media(&request) {
-            Ok(media) => media,
-            Err(message) => {
-                tracing::warn!(%message, "a request carrying media could not be served");
-                send_event(&sink, StreamEvent::Failed { message });
-                return;
-            }
-        };
+        // What a server without the right tower would refuse is refused before
+        // a session is opened, because it is cheaper to refuse with nothing
+        // standing on it. A request whose pictures cannot be encoded is FAILED
+        // rather than served from its words: the prompt still carries the
+        // placeholder run, so serving it would run the model over a few hundred
+        // embedding rows that stand for nothing and hand back fluent prose
+        // about a picture nobody looked at.
+        if let Some(message) = self.media_refusal(&request.media) {
+            tracing::warn!(%message, "a request carrying media could not be served");
+            send_event(&sink, StreamEvent::Failed { message });
+            return;
+        }
+        let key = self.media_key(&request);
+        let items = Arc::clone(&request.media);
 
         let session = match self.model.as_model_mut().open_session() {
             Ok(session) => session,
@@ -631,7 +633,7 @@ impl Coordinator {
                 deadline: self.cfg.request_timeout.map(|window| now + window),
                 budget,
             },
-            media,
+            None,
             // The rendered prompt and not just the schemes: a template can
             // spend the reasoning opener itself - Qwen 3.5's closes the
             // generation prompt with `<think>\n` - and then the turn begins
@@ -645,7 +647,32 @@ impl Coordinator {
                 string_params,
             ),
         );
+        if let Some((path, spans)) = &key {
+            self.key_session(&mut slot, path, spans);
+        }
         self.try_resume(&mut slot);
+        // The tower runs after the resume, over only the items the resume did
+        // not cover: a conversation re-sends its pictures every turn, and the
+        // ones a stored prefix already read would be encoded for nothing. A
+        // resume never ends inside a picture, so an item is covered whole or
+        // not at all.
+        if !items.is_empty() && !slot.is_done() && !slot.prompt_done() {
+            let from = slot.prompt_cursor();
+            let covered = key.as_ref().map_or(0, |(_, spans)| {
+                spans
+                    .iter()
+                    .take_while(|span| usize::try_from(span.end()).unwrap_or(usize::MAX) <= from)
+                    .count()
+            });
+            match self.encode_media(items.get(covered..).unwrap_or_default()) {
+                Ok(Some(media)) => slot.attach_media(media),
+                Ok(None) => {}
+                Err(message) => {
+                    tracing::warn!(%message, "a request carrying media could not be served");
+                    slot.fail(message);
+                }
+            }
+        }
         if let Some(refused) = self.slots.admit(slot) {
             // Unreachable while admission only happens with a free slot, and
             // still handled rather than asserted: a sequence whose session was
@@ -656,6 +683,78 @@ impl Coordinator {
                 "a sequence was admitted with no slot for it"
             );
             self.release(refused.session);
+        }
+    }
+
+    /// Why a request's media cannot be looked at on this server, when it
+    /// cannot: the checkpoint has no media path, or a tower it needs is
+    /// missing. The message is written for whoever sent the request and names
+    /// the flag an operator would change.
+    fn media_refusal(&mut self, items: &[MediaItem]) -> Option<String> {
+        if items.is_empty() {
+            return None;
+        }
+        if self.model.as_model_mut().media_mut().is_none() {
+            return Some(
+                "this checkpoint has no media path, so the attached media cannot be \
+                 looked at"
+                    .to_owned(),
+            );
+        }
+        if self.vision.is_none() && items.iter().any(|item| !item.is_audio()) {
+            return Some(
+                "this server was started without a vision tower, so the attached \
+                 media cannot be looked at; start it with --vision naming the tower"
+                    .to_owned(),
+            );
+        }
+        if self.audio.is_none() && items.iter().any(MediaItem::is_audio) {
+            return Some(
+                "this server has no audio tower, so the attached audio cannot be \
+                 heard; start it with --vision naming a container that carries one"
+                    .to_owned(),
+            );
+        }
+        None
+    }
+
+    /// The prefix-cache key of a media request's prompt. See [`media_key`].
+    fn media_key(&self, request: &GenerateRequest) -> Option<(Vec<TokenId>, Vec<MediaSpan>)> {
+        if request.media.is_empty() {
+            return None;
+        }
+        let merge = self
+            .vision
+            .as_ref()
+            .map_or(1, VisionTower::spatial_merge_size);
+        let grids: Vec<VisionGrid> = request.media.iter().map(|item| item.grid(merge)).collect();
+        media_key(
+            &request.prompt_tokens,
+            &grids,
+            &request.media_digests,
+            self.pads,
+        )
+    }
+
+    /// Asks the model to file `slot`'s path under its media key, and marks the
+    /// slot keyed when it agrees. A model that refuses keeps the slot off the
+    /// tier, which is the answer the refusal means.
+    fn key_session(&mut self, slot: &mut SeqSlot, path: &[TokenId], spans: &[MediaSpan]) {
+        let Some(ckpt) = self.model.ckpt_mut() else {
+            return;
+        };
+        let key = match MediaKey::new(path, spans) {
+            Ok(key) => key,
+            Err(error) => {
+                tracing::warn!(%error, "a media prompt's cache key was malformed; it will not be cached");
+                return;
+            }
+        };
+        match ckpt.kv_set_media_key(slot.session, &slot.prompt, key) {
+            Ok(()) => slot.set_keyed(),
+            Err(error) => {
+                tracing::debug!(error = %error.chain(), "the model does not key media prompts; this one will not be cached");
+            }
         }
     }
 
@@ -671,22 +770,18 @@ impl Coordinator {
     /// encoded, and the sequence takes the launches it took before any of this
     /// existed. The `Err` is the message the caller's stream fails with, written
     /// for whoever sent the request and naming the flag an operator would change.
-    fn encode_media(&mut self, request: &GenerateRequest) -> Result<Option<EncodedMedia>, String> {
-        if request.media.is_empty() {
+    fn encode_media(&mut self, items: &[MediaItem]) -> Result<Option<EncodedMedia>, String> {
+        if items.is_empty() {
             return Ok(None);
         }
-        if self.model.as_model_mut().media_mut().is_none() {
-            return Err(
-                "this checkpoint has no media path, so the attached media cannot be \
-                 looked at"
-                    .to_owned(),
-            );
+        if let Some(message) = self.media_refusal(items) {
+            return Err(message);
         }
         let started = Instant::now();
-        let mut parts = Vec::with_capacity(request.media.len());
-        let mut grids = Vec::with_capacity(request.media.len());
+        let mut parts = Vec::with_capacity(items.len());
+        let mut grids = Vec::with_capacity(items.len());
         let mut audio_pads = 0u32;
-        for item in request.media.iter() {
+        for item in items {
             let encoded = match item {
                 MediaItem::Vision(item) => {
                     let Some(tower) = self.vision.as_ref() else {
@@ -729,7 +824,7 @@ impl Coordinator {
         };
         let encoded = EncodedMedia::from_rows(encoded).with_audio_pads(audio_pads);
         tracing::debug!(
-            items = request.media.len(),
+            items = items.len(),
             rows = encoded.pad_total(),
             ms = started.elapsed().as_secs_f64() * 1000.0,
             "a request's media was encoded"
@@ -1533,6 +1628,44 @@ impl Coordinator {
             "the checkpoint queue was drained on the way down"
         );
     }
+}
+
+/// A media prompt's prefix-cache key: its placeholder runs written in the
+/// items' content ids, and where each run sits.
+///
+/// `None` - the request is then kept off the checkpoint tier, as every media
+/// request once was - for a prompt whose runs cannot be matched to its items
+/// one for one: a run of the wrong length, a stray placeholder, or an item with
+/// no digest. Each of those would key some positions under the wrong picture,
+/// and a key that is wrong is worse than none.
+fn media_key(
+    prompt: &[TokenId],
+    grids: &[VisionGrid],
+    digests: &[MediaDigest],
+    pads: PadTokens,
+) -> Option<(Vec<TokenId>, Vec<MediaSpan>)> {
+    if grids.is_empty() || digests.len() != grids.len() {
+        return None;
+    }
+    let mut path = prompt.to_vec();
+    let mut spans = Vec::with_capacity(grids.len());
+    let mut at = 0usize;
+    for (grid, digest) in grids.iter().zip(digests) {
+        let start = (at..prompt.len()).find(|p| pads.matches(prompt[*p]))?;
+        let end = start.checked_add(usize::try_from(grid.pad_count()).ok()?)?;
+        if !prompt.get(start..end)?.iter().all(|t| pads.matches(*t)) {
+            return None;
+        }
+        for (k, slot) in path[start..end].iter_mut().enumerate() {
+            *slot = digest.key_id(u32::try_from(k).ok()?);
+        }
+        spans.push(MediaSpan::new(u32::try_from(start).ok()?, *grid));
+        at = end;
+    }
+    if prompt[at..].iter().any(|t| pads.matches(*t)) {
+        return None;
+    }
+    Some((path, spans))
 }
 
 /// Message boundaries of a prompt worth a checkpoint of their own: the end of

@@ -46,7 +46,10 @@ pub use dtype::DType;
 pub use error::{Chain, CoreError, CoreResult, chain_of};
 pub use ids::{LayerIdx, Seed, SessionId, TokenId, TokenOutOfRange};
 pub use ledger::{LedgerReport, MemLedger, MemTag, Residence};
-pub use media::{MediaModel, PadTokens, VisionGrid, VisionPrefill};
+pub use media::{
+    KEY_ID_FLOOR, MediaDigest, MediaKey, MediaModel, MediaSpan, PadTokens, VisionGrid,
+    VisionPrefill,
+};
 pub use model::{
     DecodeStep, Logits, Model, ModelInfo, SamplingParams, Speculated, Speculating, StopTokens,
 };
