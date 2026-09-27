@@ -577,7 +577,8 @@ fn collect_speakers(
         // and the transcript still completes.
         tracing::warn!(
             error = %failure.message,
-            "the diarizer failed on a job that asked for no speakers;              cutting it by the silence rule"
+            "the diarizer failed on a job that asked for no speakers; \
+             cutting it by the silence rule"
         );
         return None;
     }

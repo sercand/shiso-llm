@@ -980,6 +980,77 @@ async fn a_streaming_job_is_not_held_behind_an_offline_job() {
 }
 
 #[tokio::test]
+async fn a_streaming_job_beats_two_offline_jobs_to_its_first_delta() {
+    let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
+    let svc = service_with(&ServiceShape {
+        // All three admitted at once: two offline jobs and a streaming one
+        // beside them, so none waits in the queue for a slot.
+        max_streams: 3,
+        ..ServiceShape::offline(&log, &opened, &offline, None)
+    });
+    let mut a = svc.submit(job(100, "a", false)).expect("queued");
+    let mut b = svc.submit(job(100, "b", false)).expect("queued");
+    let mut live = svc.submit(streamed_job(40, "c")).expect("queued");
+
+    // Whether each offline job had already sent its last event when the
+    // streaming job's first delta arrived, and each job's own last event -
+    // raced across the three channels rather than drained one at a time, so
+    // the order the worker actually delivered them in is what is checked.
+    let mut a_last = None;
+    let mut b_last = None;
+    let mut live_last = None;
+    let mut delta_beat_both_offline_jobs = None;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            tokio::select! {
+                Some(event) = a.recv(), if a_last.is_none() => {
+                    if matches!(event, TranscriptEvent::Done(_) | TranscriptEvent::Failed(_)) {
+                        a_last = Some(event);
+                    }
+                }
+                Some(event) = b.recv(), if b_last.is_none() => {
+                    if matches!(event, TranscriptEvent::Done(_) | TranscriptEvent::Failed(_)) {
+                        b_last = Some(event);
+                    }
+                }
+                Some(event) = live.recv(), if live_last.is_none() => {
+                    if delta_beat_both_offline_jobs.is_none()
+                        && matches!(event, TranscriptEvent::Delta(_))
+                    {
+                        delta_beat_both_offline_jobs =
+                            Some(a_last.is_none() && b_last.is_none());
+                    }
+                    if matches!(event, TranscriptEvent::Done(_) | TranscriptEvent::Failed(_)) {
+                        live_last = Some(event);
+                    }
+                }
+                else => break,
+            }
+        }
+    })
+    .await
+    .expect("the worker answers");
+
+    assert!(
+        matches!(a_last, Some(TranscriptEvent::Done(_))),
+        "{a_last:?}"
+    );
+    assert!(
+        matches!(b_last, Some(TranscriptEvent::Done(_))),
+        "{b_last:?}"
+    );
+    assert!(
+        matches!(live_last, Some(TranscriptEvent::Done(_))),
+        "{live_last:?}"
+    );
+    assert_eq!(
+        delta_beat_both_offline_jobs,
+        Some(true),
+        "the streaming job's first delta should arrive while both offline jobs are still running"
+    );
+}
+
+#[tokio::test]
 async fn an_all_silent_diarized_job_completes_empty() {
     let (log, opened, offline) = (Log::default(), Opened::default(), OpenedOffline::default());
     let svc = service_with(&ServiceShape::offline(

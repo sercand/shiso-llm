@@ -142,7 +142,10 @@ same tokens as one chunk at a time. With a diarizer loaded, that plan follows
 the speaker turns even for plain `json`, and a silence of 3 s or more where
 no speaker is active is not transcribed at all: skipped audio yields no text,
 so speech the diarizer misses there is lost. `--asr-skip-silence=false`
-transcribes it. Streaming requests and shorter clips keep the chunk-by-chunk
+transcribes it. The plan batches its longest spans first, and a job's results
+arrive in plan order as the batches covering them complete, so a streaming
+job running beside an offline one waits at most one batch — a few seconds —
+each turn. Streaming requests and shorter clips keep the chunk-by-chunk
 path. An export with a decoder weight outside the audio kernels (an
 engine-dispatched K-quant, for example) has no batched path and always goes
 chunk by chunk, as the load log says.

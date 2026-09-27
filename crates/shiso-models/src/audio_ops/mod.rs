@@ -118,10 +118,11 @@ const ATTN_QUERY_BLOCK: usize = 8;
 
 /// Whether a product of `rows` rows on the audio GEMM sums each row as it
 /// would among any other rows: past [`GEMM_TILE_M`] rows every weight
-/// takes the 64-row tile, which never splits k, so a row's sum depends on
-/// nothing but that row. Fewer rows pick the matrix-vector kernel or a k
-/// split by the count, so rows stacked with others would be summed apart
-/// from how they are summed alone.
+/// takes the 64-row tile or the unsplit 32-row tile, neither of which
+/// splits k, so a row's sum depends on nothing but that row. Fewer rows
+/// pick the matrix-vector kernel or a k split by the count, so rows
+/// stacked with others would be summed apart from how they are summed
+/// alone.
 #[must_use]
 pub(crate) const fn gemm_rows_sum_alone(rows: usize) -> bool {
     rows > GEMM_TILE_M
