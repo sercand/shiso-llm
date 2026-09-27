@@ -291,6 +291,85 @@ kernel void kernel_audio_kv_append_f32(
     v_cache[dst] = v[i];
 }
 
+/// A decoder step's per-head query and key norms, their rotation and the
+/// cache append in one launch, each value formed exactly as the RMS norm
+/// (256 threads over a head's dims), the state-positioned rotation and the
+/// append form it. Threadgroup `(h, r)` of row `r`: `h < heads` normalises
+/// query head `h` by `q_norm` and rotates it in place; the next `kv_heads`
+/// normalise key head `h - heads` by `k_norm`, rotate it and write it, with
+/// value head `h - heads` as it is, into the cache at `state[POS] + r`. A row
+/// at or past `cap` is not written, as the append drops it.
+kernel void kernel_audio_qk_norm_rope_append_f32(
+        constant audio_args_qk_rope & args [[buffer(0)]],
+        device float *q                    [[buffer(1)]],
+        device const float *k              [[buffer(2)]],
+        device const float *v              [[buffer(3)]],
+        device const float *q_norm         [[buffer(4)]],
+        device const float *k_norm         [[buffer(5)]],
+        device float *k_cache              [[buffer(6)]],
+        device float *v_cache              [[buffer(7)]],
+        device const uint *state           [[buffer(8)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    threadgroup float scratch[AUDIO_BLOCK_SUM_SLOTS];
+    threadgroup float normed[AUDIO_ATTN_SLOTS * 32u];
+    const uint h = tgpig.x;
+    const uint row = tgpig.y;
+    const uint hd = args.head_dim;
+    const uint half_dim = hd / 2u;
+    const uint nt = ntg.x;
+    const uint t = tpitg.x;
+    const bool is_q = h < args.heads;
+    const uint kh = h - args.heads;
+    device const float *src = is_q ? q + ((uint64_t) row * args.heads + h) * hd
+                                   : k + ((uint64_t) row * args.kv_heads + kh) * hd;
+    device const float *weight = is_q ? q_norm : k_norm;
+    float sq = 0.0f;
+    for (uint i = t; i < hd; i += nt) {
+        sq += src[i] * src[i];
+    }
+    const float rms = rsqrt(audio_block_sum(sq, scratch, t, nt) / (float) hd + args.eps);
+    for (uint i = t; i < hd; i += nt) {
+        const float y = src[i] * rms;
+        normed[i] = y * weight[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint pos = state[AUDIO_DECODE_POS] + row;
+    if (is_q) {
+        device float *p = q + ((uint64_t) row * args.heads + h) * hd;
+        for (uint m = t; m < half_dim; m += nt) {
+            const float inv_freq = precise::pow(args.theta, -2.0f * (float) m / (float) hd);
+            const float ang = (float) (state[AUDIO_DECODE_POS] + 0u + row) * inv_freq;
+            float c;
+            const float s = precise::sincos(ang, c);
+            const float a = normed[m];
+            const float b = normed[m + half_dim];
+            p[m] = a * c - b * s;
+            p[m + half_dim] = b * c + a * s;
+        }
+        return;
+    }
+    if (pos >= args.cap) {
+        return;
+    }
+    const uint64_t at = ((uint64_t) kh * args.cap + pos) * hd;
+    for (uint m = t; m < half_dim; m += nt) {
+        const float inv_freq = precise::pow(args.theta, -2.0f * (float) m / (float) hd);
+        const float ang = (float) (state[AUDIO_DECODE_POS] + 0u + row) * inv_freq;
+        float c;
+        const float s = precise::sincos(ang, c);
+        const float a = normed[m];
+        const float b = normed[m + half_dim];
+        k_cache[at + m] = a * c - b * s;
+        k_cache[at + m + half_dim] = b * c + a * s;
+    }
+    device const float *vs = v + ((uint64_t) row * args.kv_heads + kh) * hd;
+    for (uint e = t; e < hd; e += nt) {
+        v_cache[at + e] = vs[e];
+    }
+}
+
 /// Causal grouped-query attention of a block of AUDIO_ATTN_QB queries of one
 /// head over a layer's cache planes `[kv_heads][cap][hd]`, one simdgroup per
 /// block: the blocking of the window attention above. Query `i` sits at

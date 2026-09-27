@@ -20,6 +20,8 @@
  * each column's k range. */
 #define AUDIO_MATVEC_COLS 4u
 #define AUDIO_MATVEC_SG 2u
+/* Values one thread of the fused residual-add RMS norm loads at once. */
+#define AUDIO_ADD_RMS_RUN 8u
 #define AUDIO_ATTN_SLOTS 4u
 #define AUDIO_ATTN_QB 8u
 #define AUDIO_REL_ROWS 4u
@@ -53,6 +55,7 @@ struct audio_args_glu { uint rows; uint channels; };
 struct audio_args_silu_mul { uint count; };
 struct audio_args_norm { uint rows; uint dim; float eps; uint flags; };
 struct audio_args_gemm { uint m; uint n; uint k; uint flags; uint k_chunk; uint splits; };
+struct audio_args_matvec3 { uint n0; uint n1; uint n2; uint k; };
 struct audio_args_conv2d {
     uint t_in; uint f_in; uint c_in;
     uint t_out; uint f_out; uint c_out;
@@ -83,6 +86,10 @@ struct audio_args_cache_attn {
     uint pos0; uint cap; float scale; uint splits;
 };
 struct audio_args_kv_append { uint rows; uint kv_heads; uint head_dim; uint cap; };
+struct audio_args_qk_rope {
+    uint rows; uint heads; uint kv_heads; uint head_dim; uint cap; float eps; float theta;
+};
+struct audio_args_argmax_split { uint cols; uint span; uint parts; };
 struct audio_args_decode_step { uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; };
 struct audio_args_embed_token { uint width; uint vocab; uint group; };
 

@@ -18,6 +18,8 @@
 // that share each column's k range.
 #define AUDIO_MATVEC_COLS 4u
 #define AUDIO_MATVEC_SG 2u
+// Values one thread of the fused residual-add RMS norm loads at once.
+#define AUDIO_ADD_RMS_RUN 8u
 // Head dims up to 32 lanes x 4 values; the attention keeps a lane's slice of
 // the query, the accumulator and the output in registers.
 #define AUDIO_ATTN_SLOTS 4u
@@ -61,6 +63,7 @@ typedef struct { uint rows; uint channels; } audio_args_glu;
 typedef struct { uint count; } audio_args_silu_mul;
 typedef struct { uint rows; uint dim; float eps; uint flags; } audio_args_norm;
 typedef struct { uint m; uint n; uint k; uint flags; uint k_chunk; uint splits; } audio_args_gemm;
+typedef struct { uint n0; uint n1; uint n2; uint k; } audio_args_matvec3;
 typedef struct {
     uint t_in; uint f_in; uint c_in;
     uint t_out; uint f_out; uint c_out;
@@ -91,6 +94,10 @@ typedef struct {
     uint pos0; uint cap; float scale; uint splits;
 } audio_args_cache_attn;
 typedef struct { uint rows; uint kv_heads; uint head_dim; uint cap; } audio_args_kv_append;
+typedef struct {
+    uint rows; uint heads; uint kv_heads; uint head_dim; uint cap; float eps; float theta;
+} audio_args_qk_rope;
+typedef struct { uint cols; uint span; uint parts; } audio_args_argmax_split;
 typedef struct { uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; } audio_args_decode_step;
 typedef struct { uint width; uint vocab; uint group; } audio_args_embed_token;
 

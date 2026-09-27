@@ -269,3 +269,38 @@ pub(crate) struct EmbedTokenArgs {
     pub(crate) group: u32,
 }
 const _: () = assert!(size_of::<EmbedTokenArgs>() == 12);
+
+/// `audio_args_matvec3`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct Matvec3Args {
+    pub(crate) n0: u32,
+    pub(crate) n1: u32,
+    pub(crate) n2: u32,
+    pub(crate) k: u32,
+}
+const _: () = assert!(size_of::<Matvec3Args>() == 16);
+
+/// `audio_args_qk_rope`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct QkRopeArgs {
+    pub(crate) rows: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) cap: u32,
+    pub(crate) eps: f32,
+    pub(crate) theta: f32,
+}
+const _: () = assert!(size_of::<QkRopeArgs>() == 28);
+
+/// `audio_args_argmax_split`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct ArgmaxSplitArgs {
+    pub(crate) cols: u32,
+    pub(crate) span: u32,
+    pub(crate) parts: u32,
+}
+const _: () = assert!(size_of::<ArgmaxSplitArgs>() == 12);

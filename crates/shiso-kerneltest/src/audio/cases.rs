@@ -23,6 +23,13 @@ use shiso_core::{DeviceBuffer, Extent3, KernelArg, KernelRef, LaunchArgs};
 use crate::oracle;
 use crate::{Gpu, drain, f32_bytes, run};
 
+mod fused;
+pub use fused::{
+    add_rms_norm_is_the_axpy_and_rms_norm_it_replaces, argmax_wide_matches_the_row_argmax,
+    matvec_silu_is_the_products_and_silu_mul, matvec3_is_three_matvecs,
+    qk_norm_rope_append_is_the_chain_it_replaces,
+};
+
 /// Every entry the set exports, in contract-table order. Each kernel group
 /// appends its entries here; the pipeline check resolves exactly this list.
 pub const ENTRIES: &[&str] = &[
@@ -76,6 +83,18 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_matvec_bf16w",
     "kernel_audio_matvec_f16w",
     "kernel_audio_matvec_q8_0w",
+    "kernel_audio_matvec3_f32w",
+    "kernel_audio_matvec3_bf16w",
+    "kernel_audio_matvec3_f16w",
+    "kernel_audio_matvec3_q8_0w",
+    "kernel_audio_matvec_silu_f32w",
+    "kernel_audio_matvec_silu_bf16w",
+    "kernel_audio_matvec_silu_f16w",
+    "kernel_audio_matvec_silu_q8_0w",
+    "kernel_audio_add_rms_norm_f32",
+    "kernel_audio_qk_norm_rope_append_f32",
+    "kernel_audio_argmax_split_f32",
+    "kernel_audio_argmax_merge_f32",
 ];
 
 const LINEAR_BLOCK: u32 = 256;

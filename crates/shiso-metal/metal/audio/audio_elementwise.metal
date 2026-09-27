@@ -141,3 +141,83 @@ kernel void kernel_audio_argmax_rows_f32(
         out[r] = i == 0xffffffffu ? 0u : i;
     }
 }
+
+/// One wide row's argmax in two launches, for a row too long for one
+/// threadgroup to scan quickly (a vocabulary's logits). The first launch:
+/// threadgroup `p` scans columns `[p * span, (p + 1) * span)` as the one-pass
+/// kernel scans a row and writes its (value, index) candidate to
+/// `parts[p]` - the value's bits, then the index, `0xffffffff` for none. The
+/// answer does not depend on how the row is cut: the largest value with the
+/// lowest index among equals, a NaN never winning.
+kernel void kernel_audio_argmax_split_f32(
+        constant audio_args_argmax_split & args [[buffer(0)]],
+        device uint *parts                      [[buffer(1)]],
+        device const float *in                  [[buffer(2)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float best_v[AUDIO_ARGMAX_BLOCK / 32u];
+    threadgroup uint best_i[AUDIO_ARGMAX_BLOCK / 32u];
+    const uint p = tgpig.x;
+    if (p >= args.parts) {
+        return;
+    }
+    const uint lo = p * args.span;
+    const uint hi = min(args.cols, lo + args.span);
+    float v = -INFINITY;
+    uint i = 0xffffffffu;
+    for (uint c = lo + tpitg.x; c < hi; c += AUDIO_ARGMAX_BLOCK) {
+        if (in[c] > v) {
+            v = in[c];
+            i = c;
+        }
+    }
+    for (ushort off = 16; off > 0; off >>= 1) {
+        audio_argmax_pick(v, i, simd_shuffle_xor(v, off), simd_shuffle_xor(i, off));
+    }
+    if (lane == 0) {
+        best_v[sg] = v;
+        best_i[sg] = i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tpitg.x == 0) {
+        for (uint s = 1; s < AUDIO_ARGMAX_BLOCK / 32u; ++s) {
+            audio_argmax_pick(v, i, best_v[s], best_i[s]);
+        }
+        parts[2u * p] = as_type<uint>(v);
+        parts[2u * p + 1u] = i;
+    }
+}
+
+/// The second launch: one threadgroup picks among the `parts` candidates and
+/// writes the index, 0 when no candidate rose above negative infinity.
+kernel void kernel_audio_argmax_merge_f32(
+        constant audio_args_argmax_split & args [[buffer(0)]],
+        device uint *out                        [[buffer(1)]],
+        device const uint *parts                [[buffer(2)]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float best_v[AUDIO_ARGMAX_BLOCK / 32u];
+    threadgroup uint best_i[AUDIO_ARGMAX_BLOCK / 32u];
+    float v = -INFINITY;
+    uint i = 0xffffffffu;
+    for (uint p = tpitg.x; p < args.parts; p += AUDIO_ARGMAX_BLOCK) {
+        audio_argmax_pick(v, i, as_type<float>(parts[2u * p]), parts[2u * p + 1u]);
+    }
+    for (ushort off = 16; off > 0; off >>= 1) {
+        audio_argmax_pick(v, i, simd_shuffle_xor(v, off), simd_shuffle_xor(i, off));
+    }
+    if (lane == 0) {
+        best_v[sg] = v;
+        best_i[sg] = i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tpitg.x == 0) {
+        for (uint s = 1; s < AUDIO_ARGMAX_BLOCK / 32u; ++s) {
+            audio_argmax_pick(v, i, best_v[s], best_i[s]);
+        }
+        out[0] = i == 0xffffffffu ? 0u : i;
+    }
+}

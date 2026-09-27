@@ -4,10 +4,15 @@
 //!
 //! The prefill is one pass of GEMMs over every prompt row. Decoding then
 //! follows the transducer's pattern: each step - the embedding row of the
-//! state's last token, 28 layers on GEMV with attention over the cache, the
-//! tied head, the row argmax and the step kernel - is queued without a read,
-//! up to 8 steps at a time, and the host reads the emitted ids and
-//! the state once per batch. A step after the decoder stopped changes
+//! state's last token, 28 layers on the one-row matrix-vector kernels with
+//! attention over the cache, the tied head, the row argmax and the step
+//! kernel - is queued without a read, up to 8 steps at a time, and the host
+//! reads the emitted ids and the state once per batch. A step's layer is the
+//! fused launches of `audio_ops` (the residual add inside the next norm, the
+//! three projections in one launch, the query and key norms with the
+//! rotation and the append, the gated pair with its product): nine launches
+//! where the plain chain takes nineteen, each value formed as that chain
+//! forms it. A step after the decoder stopped changes
 //! nothing, so a batch that overshoots the end costs time and nothing else.
 //!
 //! Everything stays f32 - the residual stream, every norm, the attention and
@@ -31,10 +36,11 @@ use super::encoder::Encoded;
 use super::prompt;
 use super::weights::{TextLayer, TextWeights};
 use crate::audio_ops::{
-    ArgmaxDesc, AxpyDesc, CachePlanes, CausalAttnDesc, DECODE_ATTN_SPLITS, DECODE_COUNT,
-    DECODE_DONE, DECODE_NO_TOKEN, DECODE_POS, DECODE_STATE_WORDS, DECODE_TOKEN, DecodeAttnDesc,
-    DecodeStepDesc, EmbedTable, EmbedTokenDesc, KvAppendDesc, Linear, LinearWeight, NormDesc, Ops,
-    RopeDesc, RopeStateDesc, SiluMulDesc, decode_attention_partials,
+    AddRmsNormDesc, ArgmaxWideDesc, AxpyDesc, CachePlanes, CausalAttnDesc, DECODE_ATTN_SPLITS,
+    DECODE_COUNT, DECODE_DONE, DECODE_NO_TOKEN, DECODE_POS, DECODE_STATE_WORDS, DECODE_TOKEN,
+    DecodeAttnDesc, DecodeStepDesc, EmbedTable, EmbedTokenDesc, KvAppendDesc, Linear, LinearWeight,
+    NormDesc, Ops, QkRopeAppendDesc, RopeDesc, SiluMulDesc, argmax_wide_parts,
+    decode_attention_partials, step_silu, step3,
 };
 
 /// Tokens one transcription may emit: the reference's vLLM path's
@@ -238,18 +244,20 @@ struct Scratch {
     logits: DeviceBuffer,
     /// The head's argmax, one `u32`.
     ids: DeviceBuffer,
+    /// The wide argmax's candidates.
+    parts: DeviceBuffer,
     partials: DeviceBuffer,
     state: DeviceBuffer,
     /// One `u32` per step of a batch.
     out: DeviceBuffer,
 }
 
-/// How a layer attends and where its rows sit.
+/// Where the head's input row comes from.
 #[derive(Clone, Copy)]
 enum Pass {
-    /// Every prompt row from position 0, causally.
+    /// A prefill row of `s.x`, its layers' residuals all added.
     Prefill,
-    /// One row at the state's position, over the cache.
+    /// A decode pass's row: `s.x` plus the last layer's residual in `s.h`.
     Decode,
 }
 
@@ -333,9 +341,9 @@ impl<'a> Decoder<'a> {
         cache.reserve(self.ops, 0, n + cache.headroom)?;
         self.embed_prompt(&s, &ids, audio)?;
         for (l, layer) in self.weights.layers.iter().enumerate() {
-            self.layer(layer, cache.layer(l), &s, n, Pass::Prefill)?;
+            self.layer(layer, cache.layer(l), &s, n)?;
         }
-        self.head(&s, n - 1)?;
+        self.head(&s, n - 1, Pass::Prefill)?;
         // The handoff: the prefill appended from position 0; the first step
         // decodes from `n`. The write waits for the prefill.
         let mut handoff = [0u32; DECODE_STATE_WORDS];
@@ -368,6 +376,7 @@ impl<'a> Decoder<'a> {
             up: ops.scratch(n * c.ffn)?,
             logits: ops.scratch(c.vocab)?,
             ids: ops.scratch(1)?,
+            parts: ops.scratch(argmax_wide_parts(c.vocab))?,
             partials: ops.scratch(decode_attention_partials(
                 c.heads,
                 c.head_dim,
@@ -476,61 +485,33 @@ impl<'a> Decoder<'a> {
         })?)
     }
 
-    /// A projection of `n` rows: a decode pass's one row on the one-row
-    /// kernels, a prefill's rows on the GEMM.
-    fn project(
-        &self,
-        linear: &Linear,
-        x: DeviceView<'_>,
-        y: DeviceView<'_>,
-        n: usize,
-        pass: Pass,
-    ) -> Result<(), AudioError> {
-        match pass {
-            Pass::Prefill => linear.forward(self.ops, x, y, n)?,
-            Pass::Decode => linear.step(self.ops, x, y, n)?,
-        }
-        Ok(())
-    }
-
-    /// One layer over `n` rows of `s.x`, in place (notes §4).
+    /// One prefill layer over the `n` prompt rows of `s.x`, in place (notes
+    /// §4): every projection on the GEMM, attention causal from position 0.
     fn layer(
         &self,
         layer: &TextLayer,
         cache: CachePlanes<'_>,
         s: &Scratch,
         n: usize,
-        pass: Pass,
     ) -> Result<(), AudioError> {
         let (ops, c) = (self.ops, self.config);
         let hd = c.head_dim;
         self.rms(s.h.view(), s.x.view(), &layer.attn_norm, n, c.hidden)?;
-        self.project(&layer.q, s.h.view(), s.q.view(), n, pass)?;
-        self.project(&layer.k, s.h.view(), s.k.view(), n, pass)?;
-        self.project(&layer.v, s.h.view(), s.v.view(), n, pass)?;
+        layer.q.forward(ops, s.h.view(), s.q.view(), n)?;
+        layer.k.forward(ops, s.h.view(), s.k.view(), n)?;
+        layer.v.forward(ops, s.h.view(), s.v.view(), n)?;
         // The q and k norms are over each head's dims, before the rotation.
         self.rms(s.q.view(), s.q.view(), &layer.q_norm, n * c.heads, hd)?;
         self.rms(s.k.view(), s.k.view(), &layer.k_norm, n * c.kv_heads, hd)?;
         for (x, heads) in [(&s.q, c.heads), (&s.k, c.kv_heads)] {
-            match pass {
-                Pass::Prefill => ops.rope_half(&RopeDesc {
-                    x: x.view(),
-                    rows: n,
-                    heads,
-                    head_dim: hd,
-                    pos0: 0,
-                    theta: c.rope_theta,
-                })?,
-                Pass::Decode => ops.rope_half_at_state(&RopeStateDesc {
-                    x: x.view(),
-                    rows: 1,
-                    heads,
-                    head_dim: hd,
-                    offset: 0,
-                    theta: c.rope_theta,
-                    state: s.state.view(),
-                })?,
-            }
+            ops.rope_half(&RopeDesc {
+                x: x.view(),
+                rows: n,
+                heads,
+                head_dim: hd,
+                pos0: 0,
+                theta: c.rope_theta,
+            })?;
         }
         ops.kv_append(&KvAppendDesc {
             cache,
@@ -539,63 +520,130 @@ impl<'a> Decoder<'a> {
             state: s.state.view(),
             rows: n,
         })?;
-        let scale = attention_scale(hd);
-        match pass {
-            Pass::Prefill => ops.causal_attention(&CausalAttnDesc {
-                out: s.att.view(),
-                q: s.q.view(),
-                cache,
-                n_q: n,
-                heads: c.heads,
-                pos0: 0,
-                scale,
-            })?,
-            Pass::Decode => ops.decode_attention(&DecodeAttnDesc {
-                out: s.att.view(),
-                partials: s.partials.view(),
-                splits: DECODE_ATTN_SPLITS,
-                q: s.q.view(),
-                cache,
-                heads: c.heads,
-                state: s.state.view(),
-                scale,
-            })?,
-        }
-        self.project(&layer.o, s.att.view(), s.h.view(), n, pass)?;
+        ops.causal_attention(&CausalAttnDesc {
+            out: s.att.view(),
+            q: s.q.view(),
+            cache,
+            n_q: n,
+            heads: c.heads,
+            pos0: 0,
+            scale: attention_scale(hd),
+        })?;
+        layer.o.forward(ops, s.att.view(), s.h.view(), n)?;
         self.residual(&s.x, &s.h, n * c.hidden)?;
         self.rms(s.h.view(), s.x.view(), &layer.ffn_norm, n, c.hidden)?;
-        self.project(&layer.gate, s.h.view(), s.gate.view(), n, pass)?;
-        self.project(&layer.up, s.h.view(), s.up.view(), n, pass)?;
+        layer.gate.forward(ops, s.h.view(), s.gate.view(), n)?;
+        layer.up.forward(ops, s.h.view(), s.up.view(), n)?;
         ops.silu_mul(&SiluMulDesc {
             out: s.gate.view(),
             gate: s.gate.view(),
             up: s.up.view(),
             count: n * c.ffn,
         })?;
-        self.project(&layer.down, s.gate.view(), s.h.view(), n, pass)?;
+        layer.down.forward(ops, s.gate.view(), s.h.view(), n)?;
         self.residual(&s.x, &s.h, n * c.hidden)
     }
 
     /// The final norm of row `row` of `s.x`, the tied head, and its argmax
     /// into `s.ids`; a tie keeps the lowest id, as the reference's argmax
-    /// does.
-    fn head(&self, s: &Scratch, row: usize) -> Result<(), AudioError> {
+    /// does. After a decode pass the last layer's residual is still in
+    /// `s.h`, and is added first.
+    fn head(&self, s: &Scratch, row: usize, pass: Pass) -> Result<(), AudioError> {
         let (ops, c) = (self.ops, self.config);
         let h = rows(&s.h, 0, 1, c.hidden)?;
-        self.rms(
-            h,
-            rows(&s.x, row, 1, c.hidden)?,
-            &self.weights.norm,
-            1,
-            c.hidden,
-        )?;
+        match pass {
+            Pass::Prefill => self.rms(
+                h,
+                rows(&s.x, row, 1, c.hidden)?,
+                &self.weights.norm,
+                1,
+                c.hidden,
+            )?,
+            Pass::Decode => self.add_rms(s, &self.weights.norm)?,
+        }
         self.weights.embed.step(ops, h, s.logits.view(), 1)?;
-        Ok(ops.argmax_rows(&ArgmaxDesc {
+        Ok(ops.argmax_wide(&ArgmaxWideDesc {
             out: s.ids.view(),
             input: s.logits.view(),
-            rows: 1,
+            parts: s.parts.view(),
             cols: c.vocab,
         })?)
+    }
+
+    /// `x += h`, then `h = rms_norm(x) * weight`, over a decode pass's row.
+    fn add_rms(&self, s: &Scratch, weight: &DeviceBuffer) -> Result<(), AudioError> {
+        let c = self.config;
+        let h = rows(&s.h, 0, 1, c.hidden)?;
+        Ok(self.ops.add_rms_norm(&AddRmsNormDesc {
+            out: h,
+            x: rows(&s.x, 0, 1, c.hidden)?,
+            add: h,
+            weight: Some(weight.view()),
+            rows: 1,
+            dim: c.hidden,
+            eps: c.rms_eps,
+        })?)
+    }
+
+    /// One layer of a decode pass over `s.x`'s row, in the fused launches.
+    /// The layer's input is `x + h` - the residual the layer before left in
+    /// `s.h` is added by this layer's first norm (the first layer's `h` is
+    /// already normed) - and its own last residual is left in `s.h` the same
+    /// way: the values are the ones [`Self::layer`] forms, in fewer launches.
+    fn layer_step(
+        &self,
+        layer: &TextLayer,
+        cache: CachePlanes<'_>,
+        s: &Scratch,
+        first: bool,
+    ) -> Result<(), AudioError> {
+        let (ops, c) = (self.ops, self.config);
+        if first {
+            self.rms(s.h.view(), s.x.view(), &layer.attn_norm, 1, c.hidden)?;
+        } else {
+            self.add_rms(s, &layer.attn_norm)?;
+        }
+        step3(
+            ops,
+            [&layer.q, &layer.k, &layer.v],
+            s.h.view(),
+            [s.q.view(), s.k.view(), s.v.view()],
+        )?;
+        ops.qk_norm_rope_append(&QkRopeAppendDesc {
+            q: s.q.view(),
+            k: s.k.view(),
+            v: s.v.view(),
+            q_norm: layer.q_norm.view(),
+            k_norm: layer.k_norm.view(),
+            cache,
+            heads: c.heads,
+            rows: 1,
+            eps: c.rms_eps,
+            theta: c.rope_theta,
+            state: s.state.view(),
+        })?;
+        ops.decode_attention(&DecodeAttnDesc {
+            out: s.att.view(),
+            partials: s.partials.view(),
+            splits: DECODE_ATTN_SPLITS,
+            q: s.q.view(),
+            cache,
+            heads: c.heads,
+            state: s.state.view(),
+            scale: attention_scale(c.head_dim),
+        })?;
+        layer.o.step(ops, s.att.view(), s.h.view(), 1)?;
+        self.add_rms(s, &layer.ffn_norm)?;
+        step_silu(
+            ops,
+            [&layer.gate, &layer.up],
+            s.h.view(),
+            s.gate.view(),
+            s.up.view(),
+            1,
+        )?;
+        layer.down.step(ops, s.gate.view(), s.h.view(), 1)?;
+        Ok(())
     }
 
     fn step(&self, s: &Scratch, advance: usize, slot: usize) -> Result<(), AudioError> {
@@ -622,9 +670,9 @@ impl<'a> Decoder<'a> {
             vocab: c.vocab,
         })?;
         for (l, layer) in self.weights.layers.iter().enumerate() {
-            self.layer(layer, cache.layer(l), s, 1, Pass::Decode)?;
+            self.layer_step(layer, cache.layer(l), s, l == 0)?;
         }
-        self.head(s, 0)
+        self.head(s, 0, Pass::Decode)
     }
 
     /// Greedy steps from the prefill's argmax until the state says done;

@@ -11,7 +11,8 @@
 use shiso_core::{CoreError, CoreResult, DeviceBuffer, DeviceView};
 use shiso_engine::projection::{Weight, projection};
 
-use super::{BiasRowsDesc, Ops};
+use super::fused::MatvecPart;
+use super::{BiasRowsDesc, Ops, SiluMulDesc};
 
 /// Rows per projected call. The engine's library GEMM route only engages on
 /// views sized for its prefill chunk, so a longer sequence is cut into slices
@@ -50,6 +51,26 @@ impl GemmType {
             Self::Bf16 => "kernel_audio_matvec_bf16w",
             Self::F16 => "kernel_audio_matvec_f16w",
             Self::Q8_0 => "kernel_audio_matvec_q8_0w",
+        }
+    }
+
+    /// The three-product matrix-vector-by-runs kernel for this weight type.
+    pub(crate) fn matvec3_entry(self) -> &'static str {
+        match self {
+            Self::F32 => "kernel_audio_matvec3_f32w",
+            Self::Bf16 => "kernel_audio_matvec3_bf16w",
+            Self::F16 => "kernel_audio_matvec3_f16w",
+            Self::Q8_0 => "kernel_audio_matvec3_q8_0w",
+        }
+    }
+
+    /// The gated two-product matrix-vector-by-runs kernel for this type.
+    pub(crate) fn matvec_silu_entry(self) -> &'static str {
+        match self {
+            Self::F32 => "kernel_audio_matvec_silu_f32w",
+            Self::Bf16 => "kernel_audio_matvec_silu_bf16w",
+            Self::F16 => "kernel_audio_matvec_silu_f16w",
+            Self::Q8_0 => "kernel_audio_matvec_silu_q8_0w",
         }
     }
 
@@ -238,6 +259,93 @@ impl Linear {
         }
         self.forward(ops, x, y, rows)
     }
+}
+
+/// A weight the matrix-vector-by-runs kernels read, with its type, rows,
+/// depth and columns, or `None` for a weight they do not.
+fn runs_weight(linear: &Linear) -> Option<(GemmType, &DeviceBuffer, usize, usize)> {
+    match &linear.weight {
+        LinearWeight::Gemm {
+            dtype,
+            buffer,
+            in_dim,
+            out_dim,
+        } if linear.bias.is_none() => {
+            let want = u64::try_from(out_dim * dtype.row_bytes(*in_dim)?).ok()?;
+            (buffer.len() >= want).then_some((*dtype, buffer, *in_dim, *out_dim))
+        }
+        _ => None,
+    }
+}
+
+/// A decoder step's three projections of one row of `x` - query, key and
+/// value - as [`Linear::step`] forms each, in one launch when all three are
+/// bias-free audio GEMM weights of one type and depth, else one after
+/// another.
+///
+/// # Errors
+///
+/// As [`Linear::forward`].
+pub fn step3(
+    ops: &Ops,
+    linears: [&Linear; 3],
+    x: DeviceView<'_>,
+    ys: [DeviceView<'_>; 3],
+) -> CoreResult<()> {
+    let found = linears.map(runs_weight);
+    if let [Some(a), Some(b), Some(c)] = found
+        && a.0 == b.0
+        && b.0 == c.0
+        && a.2 == b.2
+        && b.2 == c.2
+    {
+        let parts = [(a, ys[0]), (b, ys[1]), (c, ys[2])].map(|((_, w, _, n), out)| MatvecPart {
+            out,
+            weight: w.view(),
+            cols: n,
+        });
+        if ops.matvec3(a.0, parts, x, a.2)? {
+            return Ok(());
+        }
+    }
+    for (linear, y) in linears.into_iter().zip(ys) {
+        linear.step(ops, x, y, 1)?;
+    }
+    Ok(())
+}
+
+/// A SiLU-gated MLP's projections of `rows` rows of `x` and their product,
+/// `out = silu(x * gate^T) * (x * up^T)`, as [`Linear::step`] and
+/// [`Ops::silu_mul`] form them: in one launch when both are bias-free audio
+/// GEMM weights of one type and shape, else as those three launches with
+/// `spare` holding the value projection.
+///
+/// # Errors
+///
+/// As [`Linear::forward`].
+pub fn step_silu(
+    ops: &Ops,
+    [gate, up]: [&Linear; 2],
+    x: DeviceView<'_>,
+    out: DeviceView<'_>,
+    spare: DeviceView<'_>,
+    rows: usize,
+) -> CoreResult<()> {
+    if let (Some(g), Some(u)) = (runs_weight(gate), runs_weight(up))
+        && g.0 == u.0
+        && (g.2, g.3) == (u.2, u.3)
+        && ops.matvec_silu(g.0, out, x, [g.1.view(), u.1.view()], (rows, g.3, g.2))?
+    {
+        return Ok(());
+    }
+    gate.step(ops, x, out, rows)?;
+    up.step(ops, x, spare, rows)?;
+    ops.silu_mul(&SiluMulDesc {
+        out,
+        gate: out,
+        up: spare,
+        count: rows * gate.out_dim(),
+    })
 }
 
 /// Byte length of `floats` f32 values.

@@ -9,14 +9,19 @@ listed.
 | `kernel_audio_axpy_f32` | `audio_args_axpy{count, alpha}` | y (in/out), x | `ceil(count/256)` × 256, 0 |
 | `kernel_audio_bias_rows_f32` | `audio_args_bias_rows{rows, cols}` | y (in/out) `[rows][cols]`, b `[cols]` | `ceil(rows·cols/256)` × 256, 0 |
 | `kernel_audio_argmax_rows_f32` | `audio_args_argmax{rows, cols}` | out u32 `[rows]`, in `[rows][cols]` | `rows` × 256, 0 |
+| `kernel_audio_argmax_split_f32` | `audio_args_argmax_split{cols, span, parts}` | parts u32 `[parts][2]` (value bits, index), in `[cols]` | `parts` × 256, 0 |
+| `kernel_audio_argmax_merge_f32` | `audio_args_argmax_split` | out u32 `[1]`, parts (from the entry above) | 1 × 256, 0 |
 | `kernel_audio_glu_f32` | `audio_args_glu{rows, channels}` | out `[rows][C]`, in `[rows][2C]` | `ceil(rows·C/256)` × 256, 0 |
 | `kernel_audio_silu_mul_f32` | `audio_args_silu_mul{count}` | out, gate, up (`out` may be `gate`) | `ceil(count/256)` × 256, 0 |
+| `kernel_audio_add_rms_norm_f32` | `audio_args_norm{rows, dim, eps, flags}` | out (may be add, not x), x (in/out) `[rows][dim]`, add, weight `[dim]` | rows × 256, 132 |
 | `kernel_audio_layer_norm_f32` | `audio_args_norm{rows, dim, eps, flags}` | out, in, weight `[dim]`, bias `[dim]` | rows × 256, 132 |
 | `kernel_audio_rms_norm_f32` | `audio_args_norm{rows, dim, eps, flags}` | out, in, weight `[dim]` | rows × 256, 132 |
 | `kernel_audio_gemm_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm{m, n, k, flags, k_chunk, splits}` | y `[splits][m][n]` (the output itself with one split), x `[m][k]`, w `[n][k]` (q8_0w: `n·k/32` 34-byte blocks, `k % 32 == 0`), bias `[n]` | `(ceil(n/64), ceil(m/32), splits)` × 128, 12288 |
 | `kernel_audio_gemm64_{f32w,bf16w,f16w,q8_0w}` | as `kernel_audio_gemm_*` | as `kernel_audio_gemm_*` | `(ceil(n/64), ceil(m/64), splits)` × 256, 20480 |
 | `kernel_audio_gemv_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm` (one split) | y `[m][n]`, x `[m][k]`, w `[n][k]`, bias `[n]` | `(ceil(n/16), ceil(m/8))` × 128, 0 |
 | `kernel_audio_matvec_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm` (one split; `k % 8 == 0`) | y `[m][n]`, x `[m][k]` (16-byte aligned), w `[n][k]` (16-byte aligned; q8_0w as the GEMM's), bias `[n]` | `(ceil(n/4), m)` × 64, 0 (static) |
+| `kernel_audio_matvec3_{f32w,bf16w,f16w,q8_0w}` | `audio_args_matvec3{n0, n1, n2, k}` (`k % 8 == 0`) | y0 `[n0]`, y1 `[n1]`, y2 `[n2]`, x `[k]`, w0 `[n0][k]`, w1 `[n1][k]`, w2 `[n2][k]` (x and w 16-byte aligned) | `ceil(n0/4) + ceil(n1/4) + ceil(n2/4)` × 64, 0 (static) |
+| `kernel_audio_matvec_silu_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm` (`flags`, `k_chunk`, `splits` unread) | y `[m][n]`, x `[m][k]`, w_gate `[n][k]`, w_up `[n][k]` | `(ceil(n/4), m)` × 64, 0 (static) |
 | `kernel_audio_split_sum_f32` | `audio_args_gemm` | y `[m][n]`, parts `[splits][m][n]`, bias `[n]` | `ceil(m·n/256)` × 256, 0 |
 | `kernel_audio_conv2d_s2_f32` | `audio_args_conv2d{t_in, f_in, c_in, t_out, f_out, c_out, pad_t, pad_f, depthwise, has_bias, relu, in_valid, out_valid, batch}` | out `[batch][t_out][f_out][c_out]`, in `[batch][t_in][f_in][c_in]`, w `[c_out][c_in/g][3][3]`, bias `[c_out]` | `ceil(batch·t_out·f_out·c_out/256)` × 256, 0 |
 | `kernel_audio_im2col_s2_f32` | `audio_args_conv2d` (as above; `c_out`, `depthwise`, `has_bias`, `relu` unread) | out `[batch][t_out][f_out][9·c_in]` (tap `kt·3+kf` major, channel minor), in `[batch][t_in][f_in][c_in]` | `ceil(batch·t_out·f_out·9·c_in/256)` × 256, 0 |
@@ -34,6 +39,7 @@ listed.
 | `kernel_audio_keep_f32` | `audio_args_keep{count}` | dst `[count]`, src `[count]`, state u32 `[8]` | `ceil(count/256)` × 256, 0 |
 | `kernel_audio_rope_half_state_f32` | `audio_args_rope{rows, heads, head_dim, pos0, theta}` (`pos0` an offset on the state's position) | x (in place) `[rows][H·hd]`, decoder state u32 `[8]` | `ceil(rows·H·hd/2/256)` × 256, 0 |
 | `kernel_audio_kv_append_f32` | `audio_args_kv_append{rows, kv_heads, head_dim, cap}` | k cache (in/out) `[Hkv][cap][hd]`, v cache (in/out), k `[rows][Hkv·hd]`, v, decoder state u32 `[8]` | `ceil(rows·Hkv·hd/256)` × 256, 0 |
+| `kernel_audio_qk_norm_rope_append_f32` | `audio_args_qk_rope{rows, heads, kv_heads, head_dim, cap, eps, theta}` | q (in/out) `[rows][H·hd]`, k `[rows][Hkv·hd]`, v, q_norm `[hd]`, k_norm `[hd]`, k cache (in/out) `[Hkv][cap][hd]`, v cache (in/out), decoder state u32 `[8]` | `(heads + kv_heads, rows)` × 256, 0 (static) |
 | `kernel_audio_causal_attn_f32` | `audio_args_cache_attn{n_q, heads, kv_heads, head_dim, pos0, cap, scale, splits}` (`splits` unread) | out `[n_q][H·hd]`, q `[n_q][H·hd]`, k cache `[Hkv][cap][hd]`, v cache | `(heads, ceil(n_q/8))` × 32, 8·hd·4 |
 | `kernel_audio_decode_attn_f32` | `audio_args_cache_attn` (`n_q`, `pos0` unread) | partials `[H·splits·(hd+2)]` (accumulators `[H][splits][hd]`, then (max, sum) pairs `[H][splits][2]`), q `[H·hd]`, k cache `[Hkv][cap][hd]`, v cache, decoder state u32 `[8]` | `(Hkv, ceil(splits/4), ceil((H/Hkv)/2))` × 128, 0 |
 | `kernel_audio_decode_attn_merge_f32` | `audio_args_cache_attn` (as above) | out `[H·hd]`, partials (from the entry above) | `heads` × 256, 0 (static) |
@@ -61,6 +67,15 @@ The matrix-vector-by-runs kernel is the one-row product of a decoder step: each 
 consecutive weights (for q8_0w a quarter block, the run's integer dot scaled once), sums its runs in k order, a
 simdgroup sum closes each of the two simdgroups, and their sums are added in simdgroup order. That order is not the
 matrix-vector kernel's, so a model takes one or the other for a product. Every row re-reads the weights.
+
+The decoder step's fused entries each do the work of a chain of the plain entries in one launch and form every
+value exactly as that chain does, so a decoder may take either: `add_rms_norm` is the axpy at alpha 1 then the RMS
+norm (each thread loads its eight-value runs before storing any); `qk_norm_rope_append` is the RMS norm over each
+query and key head (256 threads a head), the rotation at the state's position (offset 0) and the append, with a row
+at or past `cap` not written; `matvec3` is three one-product matvecs (threadgroups `[0, t0)` on the first weight,
+then the second, then the third) and `matvec_silu` two of them and the SiLU product. The split argmax cuts a wide row
+into spans of `span` columns, each threadgroup writing its span's first largest (value, index), and the merge picks
+among them; the answer is the one-pass argmax's whatever the cut.
 
 A split GEMM covers `k` in slices of `k_chunk` (a multiple of 32): block `z` multiplies `[z·k_chunk, (z+1)·k_chunk)`
 into plane `z` of y without the bias, and the split-sum pass adds the planes in order and the bias once, so the result

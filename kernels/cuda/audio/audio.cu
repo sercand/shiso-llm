@@ -124,6 +124,71 @@ extern "C" __global__ void kernel_audio_argmax_rows_f32(
     }
 }
 
+/* One wide row's argmax in two launches, as the Metal twin: block p scans
+ * columns [p * span, (p + 1) * span) and writes its (value bits, index)
+ * candidate to parts[p]; the merge's one block picks among them. */
+extern "C" __global__ void kernel_audio_argmax_split_f32(
+        const struct audio_args_argmax_split args, uint *parts, const float *in) {
+    __shared__ float best_v[AUDIO_ARGMAX_BLOCK / 32u];
+    __shared__ uint best_i[AUDIO_ARGMAX_BLOCK / 32u];
+    const uint p = blockIdx.x;
+    if (p >= args.parts) {
+        return;
+    }
+    const uint lo = p * args.span;
+    const uint hi = min(args.cols, lo + args.span);
+    float v = -INFINITY;
+    uint i = 0xffffffffu;
+    for (uint c = lo + threadIdx.x; c < hi; c += AUDIO_ARGMAX_BLOCK) {
+        if (in[c] > v) {
+            v = in[c];
+            i = c;
+        }
+    }
+    for (uint off = 16u; off > 0u; off >>= 1u) {
+        audio_argmax_pick(v, i, __shfl_xor_sync(0xffffffffu, v, off),
+                          __shfl_xor_sync(0xffffffffu, i, off));
+    }
+    if ((threadIdx.x & 31u) == 0u) {
+        best_v[threadIdx.x >> 5u] = v;
+        best_i[threadIdx.x >> 5u] = i;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        for (uint s = 1; s < AUDIO_ARGMAX_BLOCK / 32u; ++s) {
+            audio_argmax_pick(v, i, best_v[s], best_i[s]);
+        }
+        parts[2u * p] = __float_as_uint(v);
+        parts[2u * p + 1u] = i;
+    }
+}
+
+extern "C" __global__ void kernel_audio_argmax_merge_f32(
+        const struct audio_args_argmax_split args, uint *out, const uint *parts) {
+    __shared__ float best_v[AUDIO_ARGMAX_BLOCK / 32u];
+    __shared__ uint best_i[AUDIO_ARGMAX_BLOCK / 32u];
+    float v = -INFINITY;
+    uint i = 0xffffffffu;
+    for (uint p = threadIdx.x; p < args.parts; p += AUDIO_ARGMAX_BLOCK) {
+        audio_argmax_pick(v, i, __uint_as_float(parts[2u * p]), parts[2u * p + 1u]);
+    }
+    for (uint off = 16u; off > 0u; off >>= 1u) {
+        audio_argmax_pick(v, i, __shfl_xor_sync(0xffffffffu, v, off),
+                          __shfl_xor_sync(0xffffffffu, i, off));
+    }
+    if ((threadIdx.x & 31u) == 0u) {
+        best_v[threadIdx.x >> 5u] = v;
+        best_i[threadIdx.x >> 5u] = i;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        for (uint s = 1; s < AUDIO_ARGMAX_BLOCK / 32u; ++s) {
+            audio_argmax_pick(v, i, best_v[s], best_i[s]);
+        }
+        out[0] = i == 0xffffffffu ? 0u : i;
+    }
+}
+
 /* ---- norms ---------------------------------------------------------------- */
 
 /* Two-pass about the row's first value, as the Metal twin: a row with a large
@@ -179,6 +244,51 @@ extern "C" __global__ void kernel_audio_rms_norm_f32(
     for (uint i = tid; i < args.dim; i += nt) {
         const float y = src[i] * rms;
         dst[i] = has_weight ? y * weight[i] : y;
+    }
+}
+
+/* x += add, then out = rms_norm(x) (* w), as the axpy at alpha 1 and the RMS
+ * norm form them; each thread loads its values before it stores any, as the
+ * Metal twin. out may be add, not x. */
+extern "C" __global__ void kernel_audio_add_rms_norm_f32(
+        const struct audio_args_norm args, float *out, float *x, const float *add,
+        const float *weight) {
+    extern __shared__ float scratch[];
+    const uint r = blockIdx.x;
+    if (r >= args.rows) {
+        return;
+    }
+    const uint nt = blockDim.x;
+    const uint tid = threadIdx.x;
+    const uint R = AUDIO_ADD_RMS_RUN;
+    float *src = x + (uint64_t) r * args.dim;
+    const float *a = add + (uint64_t) r * args.dim;
+    float *dst = out + (uint64_t) r * args.dim;
+    const bool has_weight = (args.flags & AUDIO_NORM_HAS_WEIGHT) != 0u;
+    float sq = 0.0f;
+    for (uint base = tid; base < args.dim; base += R * nt) {
+        float v[AUDIO_ADD_RMS_RUN];
+        for (uint j = 0; j < R; ++j) {
+            const uint i = base + j * nt;
+            v[j] = i < args.dim ? src[i] + a[i] : 0.0f;
+        }
+        for (uint j = 0; j < R; ++j) {
+            const uint i = base + j * nt;
+            if (i < args.dim) {
+                src[i] = v[j];
+                sq += v[j] * v[j];
+            }
+        }
+    }
+    const float rms = rsqrtf(audio_block_sum(sq, scratch, tid, nt) / (float) args.dim + args.eps);
+    for (uint base = tid; base < args.dim; base += R * nt) {
+        for (uint j = 0; j < R; ++j) {
+            const uint i = base + j * nt;
+            if (i < args.dim) {
+                const float y = src[i] * rms;
+                dst[i] = has_weight ? y * weight[i] : y;
+            }
+        }
     }
 }
 
@@ -382,27 +492,24 @@ __device__ __forceinline__ float audio_run8<audio_w_q8_0>(const void *w, uint64_
     return (lo + hi) * d;
 }
 
+/* One tile: columns [n0, n0 + 4) of w against the row xr; lane c of warp 0
+ * returns column c's total, every other thread 0. */
 template <typename W>
-static __device__ __forceinline__ void audio_matvec(
-        const struct audio_args_gemm args, float *y, const float *x, const void *w,
-        const float *bias) {
+static __device__ __forceinline__ float audio_matvec_tile(
+        const void *w, uint n, uint k, uint n0, const float *xr, float *part) {
     const uint NR = AUDIO_MATVEC_COLS;
     const uint NSG = AUDIO_MATVEC_SG;
-    __shared__ float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
     const uint lane = threadIdx.x & 31u;
     const uint warp = threadIdx.x >> 5u;
-    const uint n0 = blockIdx.x * NR;
-    const uint row = blockIdx.y;
-    const uint runs = args.k >> 3u;
-    const float *xr = x + (uint64_t) row * args.k;
+    const uint runs = k >> 3u;
     float acc[AUDIO_MATVEC_COLS];
     for (uint c = 0; c < NR; ++c) {
         acc[c] = 0.0f;
     }
     for (uint j = warp * 32u + lane; j < runs; j += NSG * 32u) {
         for (uint c = 0; c < NR; ++c) {
-            const uint64_t col = min(n0 + c, args.n - 1u);
-            acc[c] += audio_run8<W>(w, col * args.k, j, xr);
+            const uint64_t col = min(n0 + c, n - 1u);
+            acc[c] += audio_run8<W>(w, col * k, j, xr);
         }
     }
     for (uint c = 0; c < NR; ++c) {
@@ -414,13 +521,76 @@ static __device__ __forceinline__ void audio_matvec(
         }
     }
     __syncthreads();
-    if (warp == 0u && lane < NR && n0 + lane < args.n) {
-        float total = 0.0f;
+    float total = 0.0f;
+    if (warp == 0u && lane < NR) {
         for (uint s = 0; s < NSG; ++s) {
             total += part[lane * NSG + s];
         }
+    }
+    return total;
+}
+
+template <typename W>
+static __device__ __forceinline__ void audio_matvec(
+        const struct audio_args_gemm args, float *y, const float *x, const void *w,
+        const float *bias) {
+    __shared__ float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    const uint n0 = blockIdx.x * AUDIO_MATVEC_COLS;
+    const uint row = blockIdx.y;
+    const uint lane = threadIdx.x & 31u;
+    const float total = audio_matvec_tile<W>(w, args.n, args.k, n0, x + (uint64_t) row * args.k, part);
+    if (threadIdx.x < AUDIO_MATVEC_COLS && n0 + lane < args.n) {
         const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u;
         y[(uint64_t) row * args.n + n0 + lane] = total + (has_bias ? bias[n0 + lane] : 0.0f);
+    }
+}
+
+/* Three products of one row in one launch: blocks [0, t0) take w0's columns,
+ * [t0, t0 + t1) w1's, the rest w2's. No bias. */
+template <typename W>
+static __device__ __forceinline__ void audio_matvec3(
+        const struct audio_args_matvec3 args, float *y0, float *y1, float *y2, const float *x,
+        const void *w0, const void *w1, const void *w2) {
+    __shared__ float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    const uint t0 = (args.n0 + AUDIO_MATVEC_COLS - 1u) / AUDIO_MATVEC_COLS;
+    const uint t1 = (args.n1 + AUDIO_MATVEC_COLS - 1u) / AUDIO_MATVEC_COLS;
+    uint t = blockIdx.x;
+    float *y = y0;
+    const void *w = w0;
+    uint n = args.n0;
+    if (t >= t0 + t1) {
+        t -= t0 + t1;
+        y = y2;
+        w = w2;
+        n = args.n2;
+    } else if (t >= t0) {
+        t -= t0;
+        y = y1;
+        w = w1;
+        n = args.n1;
+    }
+    const uint n0 = t * AUDIO_MATVEC_COLS;
+    const float total = audio_matvec_tile<W>(w, n, args.k, n0, x, part);
+    if (threadIdx.x < AUDIO_MATVEC_COLS && n0 + threadIdx.x < n) {
+        y[n0 + threadIdx.x] = total + 0.0f;
+    }
+}
+
+/* y[c] = g * sigmoid(g) * u over the gate and value products of each row, as
+ * the SiLU-product kernel forms it. No bias. */
+template <typename W>
+static __device__ __forceinline__ void audio_matvec_silu(
+        const struct audio_args_gemm args, float *y, const float *x, const void *wg,
+        const void *wu) {
+    __shared__ float part_g[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    __shared__ float part_u[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    const uint n0 = blockIdx.x * AUDIO_MATVEC_COLS;
+    const uint row = blockIdx.y;
+    const float *xr = x + (uint64_t) row * args.k;
+    const float g = audio_matvec_tile<W>(wg, args.n, args.k, n0, xr, part_g) + 0.0f;
+    const float u = audio_matvec_tile<W>(wu, args.n, args.k, n0, xr, part_u) + 0.0f;
+    if (threadIdx.x < AUDIO_MATVEC_COLS && n0 + threadIdx.x < args.n) {
+        y[(uint64_t) row * args.n + n0 + threadIdx.x] = g * audio_sigmoid(g) * u;
     }
 }
 
@@ -428,6 +598,15 @@ static __device__ __forceinline__ void audio_matvec(
     extern "C" __global__ void kernel_audio_matvec_##SUFFIX( \
             const struct audio_args_gemm args, float *y, const float *x, const void *w, const float *bias) { \
         audio_matvec<W>(args, y, x, w, bias); \
+    } \
+    extern "C" __global__ void kernel_audio_matvec3_##SUFFIX( \
+            const struct audio_args_matvec3 args, float *y0, float *y1, float *y2, const float *x, \
+            const void *w0, const void *w1, const void *w2) { \
+        audio_matvec3<W>(args, y0, y1, y2, x, w0, w1, w2); \
+    } \
+    extern "C" __global__ void kernel_audio_matvec_silu_##SUFFIX( \
+            const struct audio_args_gemm args, float *y, const float *x, const void *wg, const void *wu) { \
+        audio_matvec_silu<W>(args, y, x, wg, wu); \
     }
 
 AUDIO_MATVEC_ENTRY(f32w, audio_w_f32)
@@ -934,6 +1113,64 @@ extern "C" __global__ void kernel_audio_rope_half_state_f32(
     const float b = p[m + half_dim];
     p[m] = a * c - b * s;
     p[m + half_dim] = b * c + a * s;
+}
+
+/* A decoder step's query and key norms, their rotation and the cache append
+ * in one launch, as the Metal twin: block (h, r), 256 threads; h < heads
+ * normalises and rotates query head h in place, the next kv_heads normalise
+ * and rotate key head h - heads into the cache with value head h - heads. */
+extern "C" __global__ void kernel_audio_qk_norm_rope_append_f32(
+        const struct audio_args_qk_rope args, float *q, const float *k, const float *v,
+        const float *q_norm, const float *k_norm, float *k_cache, float *v_cache,
+        const uint *state) {
+    __shared__ float scratch[AUDIO_BLOCK_SUM_SLOTS];
+    __shared__ float normed[AUDIO_ATTN_SLOTS * 32u];
+    const uint h = blockIdx.x;
+    const uint row = blockIdx.y;
+    const uint hd = args.head_dim;
+    const uint half_dim = hd / 2u;
+    const uint nt = blockDim.x;
+    const uint t = threadIdx.x;
+    const bool is_q = h < args.heads;
+    const uint kh = h - args.heads;
+    const float *src = is_q ? q + ((uint64_t) row * args.heads + h) * hd
+                            : k + ((uint64_t) row * args.kv_heads + kh) * hd;
+    const float *weight = is_q ? q_norm : k_norm;
+    float sq = 0.0f;
+    for (uint i = t; i < hd; i += nt) {
+        sq += src[i] * src[i];
+    }
+    const float rms = rsqrtf(audio_block_sum(sq, scratch, t, nt) / (float) hd + args.eps);
+    for (uint i = t; i < hd; i += nt) {
+        const float y = src[i] * rms;
+        normed[i] = y * weight[i];
+    }
+    __syncthreads();
+    const uint pos = state[AUDIO_DECODE_POS] + row;
+    if (!is_q && pos >= args.cap) {
+        return;
+    }
+    float *dst = is_q ? q + ((uint64_t) row * args.heads + h) * hd
+                      : k_cache + ((uint64_t) kh * args.cap + pos) * hd;
+    for (uint m = t; m < half_dim; m += nt) {
+        const float inv_freq = powf(args.theta, -2.0f * (float) m / (float) hd);
+        const float ang = (float) (state[AUDIO_DECODE_POS] + 0u + row) * inv_freq;
+        float s;
+        float c;
+        sincosf(ang, &s, &c);
+        const float a = normed[m];
+        const float b = normed[m + half_dim];
+        dst[m] = a * c - b * s;
+        dst[m + half_dim] = b * c + a * s;
+    }
+    if (is_q) {
+        return;
+    }
+    const float *vs = v + ((uint64_t) row * args.kv_heads + kh) * hd;
+    float *vd = v_cache + ((uint64_t) kh * args.cap + pos) * hd;
+    for (uint e = t; e < hd; e += nt) {
+        vd[e] = vs[e];
+    }
 }
 
 /* rows new k and v rows, [rows][kv_heads * hd], into one layer's cache planes

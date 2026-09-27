@@ -14,6 +14,7 @@
 mod args;
 #[cfg(test)]
 mod decode_tests;
+mod fused;
 mod linear;
 pub mod load;
 pub mod store;
@@ -26,7 +27,8 @@ use shiso_core::{
     Backend, CoreError, CoreResult, DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef,
 };
 
-pub use linear::{GemmType, Linear, LinearWeight};
+pub use fused::{AddRmsNormDesc, ArgmaxWideDesc, QkRopeAppendDesc, argmax_wide_parts};
+pub use linear::{GemmType, Linear, LinearWeight, step_silu, step3};
 
 use args::{
     ArgmaxArgs, AxpyArgs, BiasRowsArgs, CacheAttnArgs, Conv2dArgs, DecodeStepArgs, DwConv1dArgs,
