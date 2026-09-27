@@ -29,14 +29,14 @@ use crate::qwen3_asr::prompt::parse;
 use crate::qwen3_asr::weights::QwenAsrWeights;
 
 /// Width of a tower row.
-const OUT: usize = 2048;
+pub(crate) const OUT: usize = 2048;
 
-const CLIPS: [&str; 4] = ["speech-en", "speech-en-odd", "weather-es", "two-speakers"];
+pub(crate) const CLIPS: [&str; 4] = ["speech-en", "speech-en-odd", "weather-es", "two-speakers"];
 
 /// One device case at a time.
-static DEVICE: Mutex<()> = Mutex::new(());
+pub(crate) static DEVICE: Mutex<()> = Mutex::new(());
 
-fn fixtures() -> PathBuf {
+pub(crate) fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/references/audio")
 }
 
@@ -65,11 +65,11 @@ fn u32s(value: &serde_json::Value) -> Vec<u32> {
 }
 
 /// What the reference generated for one clip in one mode.
-struct Want {
+pub(crate) struct Want {
     /// The ids before the end id, which the decoder never emits.
-    ids: Vec<u32>,
+    pub(crate) ids: Vec<u32>,
     /// The forced language, or `None` for the auto prompt.
-    forced: Option<String>,
+    pub(crate) forced: Option<String>,
     /// The parsed language and text.
     language: String,
     text: String,
@@ -77,7 +77,7 @@ struct Want {
 
 /// The reference's two runs of `clip` (auto, then forced), or `None` having
 /// said the fixture is absent.
-fn want(model: &str, clip: &str) -> Option<[Want; 2]> {
+pub(crate) fn want(model: &str, clip: &str) -> Option<[Want; 2]> {
     let path = fixtures().join(format!("{model}-{clip}-tokens.json"));
     if !path.exists() {
         say(&format!("SKIP {}: absent", path.display()));
@@ -103,7 +103,7 @@ fn want(model: &str, clip: &str) -> Option<[Want; 2]> {
 }
 
 /// The reference's tower output for `clip`, on the device.
-fn reference_rows(ops: &Ops, model: &str, clip: &str) -> Encoded {
+pub(crate) fn reference_rows(ops: &Ops, model: &str, clip: &str) -> Encoded {
     let rows = f32s(&fixtures().join(format!("{model}-{clip}-encoder.f32")));
     assert_eq!(rows.len() % OUT, 0, "{model} {clip}: whole rows");
     Encoded {
@@ -112,19 +112,19 @@ fn reference_rows(ops: &Ops, model: &str, clip: &str) -> Encoded {
     }
 }
 
-fn ops() -> Option<Ops> {
+pub(crate) fn ops() -> Option<Ops> {
     crate::audio_ops::testing::device().map(Ops::new)
 }
 
 /// One export on the device, with its vocabulary.
-struct Loaded {
-    config: Qwen3AsrConfig,
-    weights: QwenAsrWeights,
+pub(crate) struct Loaded {
+    pub(crate) config: Qwen3AsrConfig,
+    pub(crate) weights: QwenAsrWeights,
     vocab: Arc<PieceVocab>,
 }
 
 /// The export named `name`, or `None` having said why.
-fn load(ops: &Ops, name: &str) -> Option<Loaded> {
+pub(crate) fn load(ops: &Ops, name: &str) -> Option<Loaded> {
     let Some(export): Option<Export> = exports().into_iter().find(|e| e.name == name) else {
         say(&format!("SKIP {name}: its root variable is unset"));
         return None;
@@ -176,7 +176,7 @@ fn word_distance(a: &str, b: &str) -> usize {
 }
 
 /// Milliseconds per decode pass, read-backs included.
-fn per_pass(t: &Timing) -> f64 {
+pub(crate) fn per_pass(t: &Timing) -> f64 {
     t.decode.as_secs_f64() * 1e3 / crate::audio_ops::f64_of(t.passes.max(1))
 }
 

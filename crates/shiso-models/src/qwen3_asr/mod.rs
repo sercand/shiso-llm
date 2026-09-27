@@ -13,8 +13,11 @@
 //! The model has no streaming encoder: a clip is transcribed in chunks of at
 //! most 35 s (the `stream` module), each one prompt and one greedy decode, and a
 //! token's time is interpolated inside its chunk. Times are therefore
-//! chunk-accurate, not word-accurate.
+//! chunk-accurate, not word-accurate. A whole clip known up front can instead
+//! go through the decoder several chunks at a time ([`batch`]), with the same
+//! ids.
 
+pub mod batch;
 pub mod config;
 pub mod decoder;
 pub mod encoder;
@@ -46,6 +49,9 @@ pub(crate) struct Model {
     /// Device memory of streams that have closed, for the next to take
     /// (see `stream::Memory`), at most `stream::POOL_STREAMS` of them.
     pub(crate) spare: Mutex<Vec<stream::Memory>>,
+    /// Device memory of the last batch, for the next (see
+    /// `batch::give_back`), at most `batch::POOL_BATCHES` of them.
+    pub(crate) batch_spare: Mutex<Option<batch::BatchMemory>>,
 }
 
 /// A loaded checkpoint of this architecture.
@@ -89,6 +95,7 @@ pub fn open(
             weights,
             vocab,
             spare: Mutex::new(Vec::new()),
+            batch_spare: Mutex::new(None),
         }),
         mel,
     }))

@@ -301,7 +301,7 @@ fn batched(ops: &Ops, fx: &Fixture) -> Run {
         plane += KV_HEADS * cap + 3;
         row0 += rows;
     }
-    let table = SeqTable::new(ops, &spans).expect("uploads");
+    let table = SeqTable::new(ops, &spans, KV_HEADS).expect("uploads");
     let (kc, vc) = (
         ops.scratch(plane * HD).expect("allocates"),
         ops.scratch(plane * HD).expect("allocates"),
@@ -485,7 +485,7 @@ fn batched_decode_attention_time_against_single_launches() {
             ..SeqSpan::default()
         })
         .collect();
-    let table = SeqTable::new(&ops, &spans).expect("uploads");
+    let table = SeqTable::new(&ops, &spans, KV_HEADS).expect("uploads");
     let kc = upload_f32(&ops, &signal(b * plane * HD, 21)).expect("uploads");
     let vc = upload_f32(&ops, &signal(b * plane * HD, 22)).expect("uploads");
     let q = upload_f32(&ops, &signal(b * QW, 23)).expect("uploads");

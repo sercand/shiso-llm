@@ -65,21 +65,64 @@ impl SeqSpan {
 /// words the batched kernels read, [`SEQ_WORDS`] a sequence. Build a new
 /// one when a plane moves or grows; queued launches keep the words they were
 /// given.
+///
+/// A table is sound by construction: no two planes share a cache row and no
+/// two sequences share a stacked row, because the kernels write every row a
+/// span names without asking whose else it is - an overlap would be one
+/// sequence's append landing in another's history.
 #[derive(Debug)]
 pub struct SeqTable {
     spans: Vec<SeqSpan>,
+    kv_heads: usize,
     words: DeviceBuffer,
 }
 
+/// Refuses spans whose planes of `kv_heads` heads overlap, or whose stacked
+/// prefill rows do: [`CoreError::InvalidValue`] naming the two sequences.
+fn disjoint(spans: &[SeqSpan], kv_heads: usize) -> CoreResult<()> {
+    limit(kv_heads > 0, "seq_table.kv_heads", kv_heads)?;
+    let overlap = |a: (usize, usize), b: (usize, usize)| a.0 < b.1 && b.0 < a.1;
+    for (i, a) in spans.iter().enumerate() {
+        for (j, b) in spans.iter().enumerate().skip(i + 1) {
+            let planes = (
+                (a.plane, a.plane_end(kv_heads)),
+                (b.plane, b.plane_end(kv_heads)),
+            );
+            if overlap(planes.0, planes.1) {
+                return Err(CoreError::InvalidValue {
+                    key: "seq_table.planes_overlap",
+                    value: format!(
+                        "sequence {i} rows {:?} and sequence {j} rows {:?}",
+                        planes.0, planes.1
+                    ),
+                });
+            }
+            let stacked = ((a.row0, a.row0 + a.rows), (b.row0, b.row0 + b.rows));
+            if a.rows > 0 && b.rows > 0 && overlap(stacked.0, stacked.1) {
+                return Err(CoreError::InvalidValue {
+                    key: "seq_table.stacked_rows_overlap",
+                    value: format!(
+                        "sequence {i} rows {:?} and sequence {j} rows {:?}",
+                        stacked.0, stacked.1
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 impl SeqTable {
-    /// Uploads `spans`.
+    /// Uploads `spans`, each plane `kv_heads` heads of its capacity.
     ///
     /// # Errors
     ///
-    /// [`CoreError::InvalidValue`] for no spans or a value past `u32`; an
-    /// allocation or copy failure.
-    pub fn new(ops: &Ops, spans: &[SeqSpan]) -> CoreResult<Self> {
+    /// [`CoreError::InvalidValue`] for no spans, no kv heads, a value past
+    /// `u32`, two planes that share a cache row, or two sequences that share
+    /// a stacked row; an allocation or copy failure.
+    pub fn new(ops: &Ops, spans: &[SeqSpan], kv_heads: usize) -> CoreResult<Self> {
         limit(!spans.is_empty(), "seq_table.spans", 0)?;
+        disjoint(spans, kv_heads)?;
         let mut raw = Vec::with_capacity(spans.len() * SEQ_WORDS * 4);
         for s in spans {
             let entry = [
@@ -98,6 +141,7 @@ impl SeqTable {
         ops.backend().copy_h2d(words.view(), &raw)?;
         Ok(Self {
             spans: spans.to_vec(),
+            kv_heads,
             words,
         })
     }
@@ -280,9 +324,16 @@ pub struct EmbedTokenBatchDesc<'a> {
     pub seqs: usize,
 }
 
-/// Refuses shared planes shorter than any sequence's plane, or a geometry no
-/// cache kernel is written for.
+/// Refuses shared planes shorter than any sequence's plane, planes of another
+/// head count than the table was checked at, or a geometry no cache kernel
+/// is written for.
 fn need_batch(c: &BatchPlanes<'_>, heads: usize, what: &'static str) -> CoreResult<()> {
+    // The table's planes were checked disjoint at this many heads.
+    limit(
+        c.table.kv_heads == c.kv_heads,
+        "batch_cache.kv_heads",
+        c.kv_heads,
+    )?;
     limit(
         (1..=MAX_HEAD_DIM).contains(&c.head_dim),
         "batch_cache.head_dim",
@@ -736,5 +787,38 @@ impl Ops {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SeqSpan, disjoint};
+
+    fn span(plane: usize, cap: usize, first: usize, count: usize) -> SeqSpan {
+        SeqSpan {
+            plane,
+            cap,
+            row0: first,
+            rows: count,
+            pos0: 0,
+        }
+    }
+
+    #[test]
+    fn a_table_refuses_shared_cache_rows_and_shared_stacked_rows() {
+        // Two heads: plane 0 covers rows [0, 20), plane 1 from 20 does not
+        // touch it, and a gap between planes is fine.
+        disjoint(
+            &[span(0, 10, 0, 5), span(20, 4, 5, 3), span(30, 1, 8, 0)],
+            2,
+        )
+        .expect("disjoint");
+        // Decode tables carry no stacked rows, so row0 may repeat.
+        disjoint(&[span(0, 10, 0, 0), span(20, 10, 0, 0)], 2).expect("no stacked rows");
+        let err = disjoint(&[span(0, 10, 0, 5), span(19, 4, 5, 3)], 2).expect_err("row 19");
+        assert!(err.to_string().contains("planes_overlap"), "{err}");
+        let err = disjoint(&[span(0, 10, 0, 5), span(20, 4, 4, 3)], 2).expect_err("row 4");
+        assert!(err.to_string().contains("stacked_rows_overlap"), "{err}");
+        assert!(disjoint(&[span(0, 1, 0, 1)], 0).is_err(), "no kv heads");
     }
 }
