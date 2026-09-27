@@ -286,6 +286,7 @@ fn advance(desc: &AudioServiceDesc, job: &mut Active, rows_per_turn: usize) -> T
             }
             Ok(tokens) if !deliver(desc, job, &tokens) => return Turn::Dropped,
             Ok(_) if !job.flushed => return Turn::More,
+            Ok(_) if !flush_tail(desc, job) => return Turn::Dropped,
             Ok(_) => {}
         }
     }
@@ -431,6 +432,27 @@ fn deliver(desc: &AudioServiceDesc, job: &mut Active, tokens: &[TokenEvent]) -> 
     true
 }
 
+/// Reports what the detokenizer still holds once the stream is finished -
+/// the bytes of a character its last id left incomplete, as U+FFFD - as a
+/// delta and a piece at the last piece's frame, so the text and the deltas
+/// both end with it; `false` when the caller has gone.
+fn flush_tail(desc: &AudioServiceDesc, job: &mut Active) -> bool {
+    let Some(tail) = job.detok.flush() else {
+        return true;
+    };
+    let frame = job.pieces.last().map_or(0, |p| p.frame);
+    job.pieces.push(TimedPiece {
+        text: tail.clone(),
+        frame,
+    });
+    if job.events.send(TranscriptEvent::Delta(tail)).is_err() {
+        return false;
+    }
+    // The flushed piece can end the last word, so the segments are sent
+    // again with it.
+    deliver(desc, job, &[])
+}
+
 /// Each word's speaker: its chunk's, for a stream cut at the speaker turns,
 /// since the recognizer's times inside a chunk are interpolated; otherwise
 /// whoever is most active while it is spoken.
@@ -462,8 +484,8 @@ fn finish(desc: &AudioServiceDesc, job: &Active) -> Transcript {
         None => (transcript::segments(&words), false),
     };
     Transcript {
-        // A word boundary the last piece opened is not text.
-        text: job.detok.text().trim_end().to_owned(),
+        // A word boundary the first or the last piece opened is not text.
+        text: job.detok.text().trim().to_owned(),
         // A stream that read the language out of the model's words knows it
         // better than the tags do; a stream that never opened knows nothing.
         language: match &job.stream {

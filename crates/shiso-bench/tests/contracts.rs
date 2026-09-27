@@ -217,6 +217,31 @@ type RecognizerPush = fn(
 ) -> Result<Vec<shiso_audio::TokenEvent>, shiso_audio::AudioError>;
 const _: RecognizerPush = <dyn shiso_audio::RecognizerStream>::push;
 
+/// A chunking recognizer is told where its chunks end, in mel frames from the
+/// stream's start, and says whether it honours that.
+fn stream_cuts(options: shiso_audio::StreamOptions) -> Option<Vec<u32>> {
+    options.cuts
+}
+const _: fn(shiso_audio::StreamOptions) -> Option<Vec<u32>> = stream_cuts;
+type ChunksAtCuts = fn(&(dyn shiso_audio::SpeechRecognizer + 'static)) -> bool;
+const _: ChunksAtCuts = <dyn shiso_audio::SpeechRecognizer>::chunks_at_cuts;
+
+/// A stream may name the language it read out of the model's words, and a
+/// chunking stream reports where its chunks ended, which ends its words.
+type StreamLanguage =
+    for<'a> fn(&'a (dyn shiso_audio::RecognizerStream + 'static)) -> Option<&'a str>;
+const _: StreamLanguage = <dyn shiso_audio::RecognizerStream>::language;
+type ChunkEnds = for<'a> fn(&'a (dyn shiso_audio::RecognizerStream + 'static)) -> &'a [u32];
+const _: ChunkEnds = <dyn shiso_audio::RecognizerStream>::chunk_ends;
+
+/// The two chunk plans the worker and the chunking stream share: the
+/// diarizer's turns over the mel frames, and the silence rule.
+type TurnCuts =
+    fn(&shiso_audio::transcript::SpeakerActivity, &shiso_audio::MelFrames, f64) -> Vec<usize>;
+const _: TurnCuts = shiso_audio::chunks::turn_cuts;
+type SilenceCuts = fn(&shiso_audio::MelFrames, usize, usize, usize) -> Vec<usize>;
+const _: SilenceCuts = shiso_audio::chunks::silence_cuts;
+
 /// A diarizer answers one whole clip with one activity block.
 type Diarize = fn(
     &(dyn shiso_audio::Diarizer + 'static),

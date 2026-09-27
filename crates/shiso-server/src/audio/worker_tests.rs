@@ -92,8 +92,11 @@ impl RecognizerStream for ScriptedStream {
     }
     fn finish(&mut self) -> Result<Vec<TokenEvent>, AudioError> {
         self.emitted += 1;
+        // A stream conditioned on `tail` ends on half a character, which
+        // only the detokenizer's flush reports.
+        let last = if self.label == "tail" { 3 } else { 1 };
         Ok(vec![TokenEvent {
-            token: TokenId::new(1),
+            token: TokenId::new(last),
             frame: self.emitted * 5,
         }])
     }
@@ -218,6 +221,7 @@ fn service_with_upload(
         max_upload_bytes,
         chunks: false,
         opened: &Opened::default(),
+        byte_level: false,
     })
 }
 
@@ -229,6 +233,9 @@ struct ServiceShape<'a> {
     max_upload_bytes: usize,
     chunks: bool,
     opened: &'a Opened,
+    /// A byte-level vocabulary of the same ids, whose pieces keep their
+    /// leading space and whose id 3 is half a character.
+    byte_level: bool,
 }
 
 fn service_with(shape: &ServiceShape<'_>) -> AudioService {
@@ -239,15 +246,27 @@ fn service_with(shape: &ServiceShape<'_>) -> AudioService {
         max_upload_bytes,
         chunks,
         opened,
+        byte_level,
     } = *shape;
-    let vocab = Arc::new(
+    let vocab = Arc::new(if byte_level {
+        PieceVocab::from_byte_level(
+            vec![
+                "!".into(),
+                "\u{120}a".into(),
+                "\u{120}b".into(),
+                "\u{e5}".into(),
+            ],
+            &[],
+        )
+        .expect("pieces")
+    } else {
         PieceVocab::from_pieces(vec![
             "<blank>".into(),
             "\u{2581}a".into(),
             "\u{2581}b".into(),
         ])
-        .expect("pieces"),
-    );
+        .expect("pieces")
+    });
     let (service, _join) = AudioService::start(AudioServiceDesc {
         recognizer: Arc::new(Scripted {
             spec: spec(),
@@ -323,6 +342,43 @@ async fn a_job_streams_its_text_and_ends_in_the_whole_transcript() {
     assert!(!transcript.words.is_empty());
     assert!((transcript.duration - 2.0).abs() < 1e-9);
     assert!(!transcript.diarized);
+}
+
+#[tokio::test]
+async fn a_transcript_is_trimmed_and_flushed_at_its_end() {
+    let log = Log::default();
+    let svc = service_with(&ServiceShape {
+        max_streams: 2,
+        queue: 4,
+        log: &log,
+        max_upload_bytes: super::DEFAULT_MAX_UPLOAD_BYTES,
+        chunks: false,
+        opened: &Opened::default(),
+        byte_level: true,
+    });
+    let events = drain(svc.submit(job(1, "tail", false)).expect("queued")).await;
+    let Some(TranscriptEvent::Done(transcript)) = events.last() else {
+        panic!("{events:?}");
+    };
+    let deltas: String = events
+        .iter()
+        .filter_map(|e| match e {
+            TranscriptEvent::Delta(d) => Some(d.as_str()),
+            _ => None,
+        })
+        .collect();
+    // Byte-level pieces keep the space before the first word; the text
+    // does not.
+    assert!(deltas.starts_with(" a"), "{deltas:?}");
+    assert!(transcript.text.starts_with("a b"), "{:?}", transcript.text);
+    // The half character at the end is reported, in the text and as a
+    // delta, rather than dropped.
+    assert!(
+        transcript.text.ends_with('\u{FFFD}'),
+        "{:?}",
+        transcript.text
+    );
+    assert_eq!(deltas.trim(), transcript.text);
 }
 
 #[tokio::test]
@@ -503,6 +559,7 @@ async fn a_chunking_recognizer_opens_its_stream_with_the_diarizer_cuts() {
         max_upload_bytes: super::DEFAULT_MAX_UPLOAD_BYTES,
         chunks: true,
         opened: &opened,
+        byte_level: false,
     });
     let clip = job(6, "a", true);
     // What the worker sees: the recognizer's mel, and the scripted
@@ -554,6 +611,7 @@ async fn a_non_chunking_recognizer_is_opened_without_cuts() {
         max_upload_bytes: super::DEFAULT_MAX_UPLOAD_BYTES,
         chunks: false,
         opened: &opened,
+        byte_level: false,
     });
     let events = drain(svc.submit(job(2, "a", true)).expect("queued")).await;
     assert!(matches!(events.last(), Some(TranscriptEvent::Done(_))));
