@@ -71,6 +71,7 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_embed_token_f16w",
     "kernel_audio_embed_token_q8_0w",
     "kernel_audio_embed_token_affine8w",
+    "kernel_audio_silu_mul_f32",
 ];
 
 const LINEAR_BLOCK: u32 = 256;
@@ -160,6 +161,14 @@ struct GluArgs {
     channels: u32,
 }
 const _: () = assert!(size_of::<GluArgs>() == 8);
+
+/// `audio_args_silu_mul`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct SiluMulArgs {
+    count: u32,
+}
+const _: () = assert!(size_of::<SiluMulArgs>() == 4);
 
 fn unary_oracle(op: u32, x: f32, a: f32, b: f32) -> f32 {
     match op {
@@ -303,6 +312,40 @@ pub fn glu_gates_the_first_half_with_the_second(gpu: &Gpu) {
         }
     }
     close(&gpu.read_f32(&out), &want, 2e-6, "glu");
+}
+
+/// The gated MLP's product takes `silu` of the gate, not of the value,
+/// over a count that is not a whole number of blocks, and runs in place on
+/// the gate.
+pub fn silu_mul_gates_the_up_rows(gpu: &Gpu) {
+    let count = 1000usize;
+    let gate: Vec<f32> = oracle::signal(count, 11).iter().map(|v| v * 8.0).collect();
+    let up = oracle::signal(count, 12);
+    let g = gpu.upload(&f32_bytes(&gate));
+    let u = gpu.upload(&f32_bytes(&up));
+    let args = SiluMulArgs {
+        count: count as u32,
+    };
+    launch(
+        gpu,
+        "kernel_audio_silu_mul_f32",
+        Extent3::linear(blocks(count, LINEAR_BLOCK)),
+        Extent3::linear(LINEAR_BLOCK),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(g.view()),
+            KernelArg::Buffer(g.view()),
+            KernelArg::Buffer(u.view()),
+        ],
+    );
+    drain(gpu);
+    let want: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(&x, &y)| x / (1.0 + (-x).exp()) * y)
+        .collect();
+    close(&gpu.read_f32(&g), &want, 2e-6, "silu_mul");
 }
 
 /// `audio_args_norm`.

@@ -50,6 +50,7 @@ device_cases!(
     unary_runs_in_place,
     axpy_adds_a_scaled_copy,
     glu_gates_the_first_half_with_the_second,
+    silu_mul_gates_the_up_rows,
     layer_norm_matches_with_and_without_bias,
     layer_norm_keeps_precision_on_a_large_mean_small_variance_row,
     rms_norm_matches_with_and_without_weight,

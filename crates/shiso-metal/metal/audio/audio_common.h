@@ -54,6 +54,7 @@ typedef struct { uint count; float alpha; } audio_args_axpy;
 typedef struct { uint rows; uint cols; } audio_args_bias_rows;
 typedef struct { uint rows; uint cols; } audio_args_argmax;
 typedef struct { uint rows; uint channels; } audio_args_glu;
+typedef struct { uint count; } audio_args_silu_mul;
 typedef struct { uint rows; uint dim; float eps; uint flags; } audio_args_norm;
 typedef struct { uint m; uint n; uint k; uint flags; uint k_chunk; uint splits; } audio_args_gemm;
 typedef struct {

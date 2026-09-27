@@ -10,6 +10,7 @@ listed.
 | `kernel_audio_bias_rows_f32` | `audio_args_bias_rows{rows, cols}` | y (in/out) `[rows][cols]`, b `[cols]` | `ceil(rows·cols/256)` × 256, 0 |
 | `kernel_audio_argmax_rows_f32` | `audio_args_argmax{rows, cols}` | out u32 `[rows]`, in `[rows][cols]` | `rows` × 256, 0 |
 | `kernel_audio_glu_f32` | `audio_args_glu{rows, channels}` | out `[rows][C]`, in `[rows][2C]` | `ceil(rows·C/256)` × 256, 0 |
+| `kernel_audio_silu_mul_f32` | `audio_args_silu_mul{count}` | out, gate, up (`out` may be `gate`) | `ceil(count/256)` × 256, 0 |
 | `kernel_audio_layer_norm_f32` | `audio_args_norm{rows, dim, eps, flags}` | out, in, weight `[dim]`, bias `[dim]` | rows × 256, 132 |
 | `kernel_audio_rms_norm_f32` | `audio_args_norm{rows, dim, eps, flags}` | out, in, weight `[dim]` | rows × 256, 132 |
 | `kernel_audio_gemm_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm{m, n, k, flags, k_chunk, splits}` | y `[splits][m][n]` (the output itself with one split), x `[m][k]`, w `[n][k]` (q8_0w: `n·k/32` 34-byte blocks, `k % 32 == 0`), bias `[n]` | `(ceil(n/64), ceil(m/32), splits)` × 128, 12288 |
@@ -79,8 +80,11 @@ feeds), `1` the tokens emitted, `2` done, `3` the last token emitted (the one th
 embedding entries fetch), `4` whether the last step emitted, `5` why it stopped (`0` running, `1` an end id, `2` the
 token cap), and two unused. The rotation, the append and decode attention read word 0 and never write it; only the
 step kernel moves it, by its `advance` (0 for the step over the prefill's own argmax, 1 after a decode pass), so every
-layer of a pass appends at the same row. Decode attention sees rows `0..=word 0` (clamped to `cap`); the append drops a
-row at or past `cap`, so the host grows the cache before it queues a batch that would reach it. The step writes the
+layer of a pass appends at the same row. The prefill hands over by a host write: its rows go in through the append
+from a state whose word 0 is 0, and the host then writes `n`, the prefill's rows, into word 0 of the decode state
+(`copy_h2d`) before it queues the step over the prefill's argmax; no kernel adds a prefill's length. Decode
+attention sees rows `0..=word 0` (clamped to `cap`); the append drops a row at or past `cap`, so the host grows the
+cache before it queues a batch that would reach it. The step writes the
 token to `out[slot]`, or `0xffffffff` for a step that emitted nothing: an end id (which is never emitted), a done
 state, or a state that already has `max_tokens`. Once done, a later step in the batch changes no word but the emit
 flag, which it lowers.

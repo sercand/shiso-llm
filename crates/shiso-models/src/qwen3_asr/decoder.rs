@@ -1,0 +1,668 @@
+//! The dense decoder on the device: the prompt with the tower's rows in place
+//! of its audio placeholders, one prefill, then greedy decoding until an end
+//! id or the token cap (notes §3, §4).
+//!
+//! The prefill is one pass of GEMMs over every prompt row. Decoding then
+//! follows the transducer's pattern: each step - the embedding row of the
+//! state's last token, 28 layers on GEMV with attention over the cache, the
+//! tied head, the row argmax and the step kernel - is queued without a read,
+//! up to 32 steps at a time, and the host reads the emitted ids and
+//! the state once per batch. A step after the decoder stopped changes
+//! nothing, so a batch that overshoots the end costs time and nothing else.
+//!
+//! Everything stays f32 - the residual stream, every norm, the attention and
+//! the cache - whatever width the weights are stored in, because the
+//! reference ran in f32 from the bf16 weights and the ids are held to it
+//! exactly.
+//!
+//! The decoder state's position (`DECODE_POS`) is the one thing the host
+//! writes between prefill and decode: the prefill appends its rows from a
+//! state at position 0, and the host then writes the prefill's row count
+//! before the first step, which advances by 0 over the prefill's own argmax.
+
+use std::time::{Duration, Instant};
+
+use shiso_audio::AudioError;
+use shiso_core::{DType, DeviceBuffer, DeviceView};
+use shiso_engine::projection::WeightAux;
+
+use super::config::{AUDIO_PAD, STOP_TOKENS, TextConfig};
+use super::encoder::Encoded;
+use super::prompt;
+use super::weights::{TextLayer, TextWeights};
+use crate::audio_ops::{
+    ArgmaxDesc, AxpyDesc, CachePlanes, CausalAttnDesc, DECODE_ATTN_SPLITS, DECODE_COUNT,
+    DECODE_DONE, DECODE_NO_TOKEN, DECODE_POS, DECODE_STATE_WORDS, DECODE_TOKEN, DecodeAttnDesc,
+    DecodeStepDesc, EmbedTable, EmbedTokenDesc, KvAppendDesc, Linear, LinearWeight, NormDesc, Ops,
+    RopeDesc, RopeStateDesc, SiluMulDesc, decode_attention_partials,
+};
+
+/// Tokens one transcription may emit: the reference's vLLM path's
+/// `max_new_tokens` (notes §3, Generation). A chunk is at most 35 s, which
+/// speech fills with a few hundred tokens; the cap only bounds a degenerate
+/// repetition, which the parser then collapses.
+pub const MAX_NEW_TOKENS: usize = 4096;
+/// Steps queued per read-back, as the transducer's search queues them.
+const BATCH: usize = 32;
+/// Cache rows past the prompt a fresh cache is sized for: a transcript of a
+/// full chunk is a few hundred tokens, so most chunks never grow it.
+const HEADROOM: usize = 256;
+
+fn bytes(floats: usize) -> u64 {
+    u64::try_from(floats).unwrap_or(u64::MAX).saturating_mul(4)
+}
+
+/// Rows `[row, row + count)` of a buffer of `width`-float rows.
+fn rows(
+    buf: &DeviceBuffer,
+    row: usize,
+    count: usize,
+    width: usize,
+) -> Result<DeviceView<'_>, AudioError> {
+    Ok(buf.slice(bytes(row * width), bytes(count * width))?)
+}
+
+fn words(host: &[u8]) -> Vec<u32> {
+    host.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+fn word(value: usize, what: &str) -> Result<u32, AudioError> {
+    u32::try_from(value).map_err(|_| AudioError::BadSpec {
+        reason: format!("{what} {value} does not fit a u32"),
+    })
+}
+
+fn count_of(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+/// `1 / sqrt(head_dim)`, the scale on every attention logit.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the kernel takes the scale as f32"
+)]
+fn attention_scale(head_dim: usize) -> f32 {
+    (1.0 / crate::audio_ops::f64_of(head_dim).sqrt()) as f32
+}
+
+/// One stream's key and value cache: per layer two f32 planes of
+/// `[kv_heads][capacity][head_dim]`, the layout the cache kernels read.
+///
+/// A transcription starts it empty and appends every prompt row and every
+/// decoded token. The capacity only grows: to the prompt plus a headroom
+/// before the prefill, then by doubling (a copy on the device of the rows
+/// already filled) before any batch of steps that could pass it, because the
+/// append drops a row at or past the capacity rather than failing.
+#[derive(Debug)]
+pub struct KvCache {
+    /// `[k, v]` per layer; empty until the first transcription sizes it.
+    planes: Vec<[DeviceBuffer; 2]>,
+    capacity: usize,
+    layers: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    /// Rows past the prompt the first sizing adds.
+    headroom: usize,
+    /// Times the planes were reallocated.
+    grown: usize,
+}
+
+impl KvCache {
+    /// An empty cache for a decoder of `config`'s geometry; the first
+    /// transcription allocates it.
+    #[must_use]
+    pub fn new(config: &TextConfig) -> Self {
+        Self {
+            planes: Vec::new(),
+            capacity: 0,
+            layers: config.layers,
+            kv_heads: config.kv_heads,
+            head_dim: config.head_dim,
+            headroom: HEADROOM,
+            grown: 0,
+        }
+    }
+
+    /// A cache of `capacity` rows with no headroom, so a transcription grows
+    /// it to exactly its prompt and then again while it decodes.
+    #[cfg(test)]
+    pub(crate) fn tight(
+        ops: &Ops,
+        config: &TextConfig,
+        capacity: usize,
+    ) -> Result<Self, AudioError> {
+        let mut cache = Self::new(config);
+        cache.headroom = 0;
+        cache.reserve(ops, 0, capacity)?;
+        cache.grown = 0;
+        Ok(cache)
+    }
+
+    /// Rows the cache holds without growing.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Times the planes were reallocated since the cache was made.
+    #[cfg(test)]
+    pub(crate) fn grown(&self) -> usize {
+        self.grown
+    }
+
+    fn plane_floats(&self, capacity: usize) -> usize {
+        self.kv_heads * capacity * self.head_dim
+    }
+
+    /// Makes room for `need` rows, keeping the first `filled`: to `need` or
+    /// twice the capacity, whichever is more.
+    fn reserve(&mut self, ops: &Ops, filled: usize, need: usize) -> Result<(), AudioError> {
+        if need <= self.capacity {
+            return Ok(());
+        }
+        let capacity = need.max(2 * self.capacity);
+        let floats = self.plane_floats(capacity);
+        let mut planes = Vec::with_capacity(self.layers);
+        for _ in 0..self.layers {
+            // Rows past the filled ones are never read before they are
+            // written, so the new planes are not cleared.
+            planes.push([
+                shiso_core::alloc(ops.backend(), bytes(floats))?,
+                shiso_core::alloc(ops.backend(), bytes(floats))?,
+            ]);
+        }
+        if filled > 0 {
+            let run = filled * self.head_dim;
+            for (new, old) in planes.iter().zip(&self.planes) {
+                for (to, from) in new.iter().zip(old) {
+                    for h in 0..self.kv_heads {
+                        ops.backend().copy_d2d(
+                            to.slice(bytes(h * capacity * self.head_dim), bytes(run))?,
+                            from.slice(bytes(h * self.capacity * self.head_dim), bytes(run))?,
+                        )?;
+                    }
+                }
+            }
+        }
+        self.planes = planes;
+        self.capacity = capacity;
+        self.grown += 1;
+        Ok(())
+    }
+
+    fn layer(&self, layer: usize) -> CachePlanes<'_> {
+        let [k, v] = &self.planes[layer];
+        CachePlanes {
+            k: k.view(),
+            v: v.view(),
+            kv_heads: self.kv_heads,
+            cap: self.capacity,
+            head_dim: self.head_dim,
+        }
+    }
+}
+
+/// Where one transcription's time went.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Timing {
+    /// Prompt rows.
+    pub(crate) prompt: usize,
+    /// Embedding, prefill and the first argmax, to the host's handoff.
+    pub(crate) prefill: Duration,
+    /// Every batch of steps, read-backs included.
+    pub(crate) decode: Duration,
+    /// Decode passes run, including those after the end in the last batch.
+    pub(crate) passes: usize,
+    /// Tokens emitted.
+    pub(crate) tokens: usize,
+}
+
+/// Activations of one transcription, sized for its prompt; a decode pass
+/// uses the first row of each.
+struct Scratch {
+    x: DeviceBuffer,
+    h: DeviceBuffer,
+    q: DeviceBuffer,
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+    att: DeviceBuffer,
+    gate: DeviceBuffer,
+    up: DeviceBuffer,
+    logits: DeviceBuffer,
+    /// The head's argmax, one `u32`.
+    ids: DeviceBuffer,
+    partials: DeviceBuffer,
+    state: DeviceBuffer,
+    /// One `u32` per step of a batch.
+    out: DeviceBuffer,
+}
+
+/// How a layer attends and where its rows sit.
+#[derive(Clone, Copy)]
+enum Pass {
+    /// Every prompt row from position 0, causally.
+    Prefill,
+    /// One row at the state's position, over the cache.
+    Decode,
+}
+
+/// The decoder over one loaded checkpoint.
+#[derive(Debug)]
+pub struct Decoder<'a> {
+    ops: &'a Ops,
+    weights: &'a TextWeights,
+    config: &'a TextConfig,
+}
+
+impl<'a> Decoder<'a> {
+    /// Binds the decoder to its weights.
+    #[must_use]
+    pub fn new(ops: &'a Ops, weights: &'a TextWeights, config: &'a TextConfig) -> Self {
+        Self {
+            ops,
+            weights,
+            config,
+        }
+    }
+
+    /// The greedy transcript of `audio`'s rows, as ids: the prompt of
+    /// [`prompt::ids`] with the rows in place of its placeholders, decoded
+    /// until an end id (which is not returned) or [`MAX_NEW_TOKENS`]. With
+    /// `forced` the prompt ends in `language {forced}<asr_text>` and the ids
+    /// are the transcript alone; without it they start with the model's own
+    /// `language X<asr_text>`.
+    ///
+    /// # Errors
+    ///
+    /// [`AudioError::BadSpec`] for rows of another width than the decoder's,
+    /// no rows, or a forced language the model does not support;
+    /// [`AudioError::Checkpoint`] for an embedding stored in an encoding no
+    /// row fetch reads; a device error.
+    pub fn transcribe(
+        &self,
+        cache: &mut KvCache,
+        audio: &Encoded,
+        forced: Option<&str>,
+    ) -> Result<Vec<u32>, AudioError> {
+        let (tokens, t) = self.timed(cache, audio, forced)?;
+        tracing::debug!(
+            prompt = t.prompt,
+            prefill_ms = t.prefill.as_secs_f64() * 1e3,
+            decode_ms = t.decode.as_secs_f64() * 1e3,
+            passes = t.passes,
+            tokens = t.tokens,
+            "transcribed a chunk"
+        );
+        Ok(tokens)
+    }
+
+    /// [`Self::transcribe`], with where the time went.
+    pub(crate) fn timed(
+        &self,
+        cache: &mut KvCache,
+        audio: &Encoded,
+        forced: Option<&str>,
+    ) -> Result<(Vec<u32>, Timing), AudioError> {
+        let c = self.config;
+        if audio.tokens == 0 {
+            return Err(AudioError::BadSpec {
+                reason: "no audio rows to transcribe".into(),
+            });
+        }
+        if audio.buffer.len() < bytes(audio.tokens * c.hidden) {
+            return Err(AudioError::BadSpec {
+                reason: format!(
+                    "{} audio rows in {} bytes, not rows of the decoder's {}",
+                    audio.tokens,
+                    audio.buffer.len(),
+                    c.hidden
+                ),
+            });
+        }
+        let ids = prompt::ids(audio.tokens, forced)?;
+        let n = ids.len();
+        let start = Instant::now();
+        let s = self.scratch(n)?;
+        cache.reserve(self.ops, 0, n + cache.headroom)?;
+        self.embed_prompt(&s, &ids, audio)?;
+        for (l, layer) in self.weights.layers.iter().enumerate() {
+            self.layer(layer, cache.layer(l), &s, n, Pass::Prefill)?;
+        }
+        self.head(&s, n - 1)?;
+        // The handoff: the prefill appended from position 0; the first step
+        // decodes from `n`. The write waits for the prefill.
+        let mut handoff = [0u32; DECODE_STATE_WORDS];
+        handoff[DECODE_POS] = word(n, "a prompt of")?;
+        let raw: Vec<u8> = handoff.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.ops.backend().copy_h2d(s.state.view(), &raw)?;
+        let prefill = start.elapsed();
+        let (tokens, passes) = self.decode(cache, &s, n)?;
+        let timing = Timing {
+            prompt: n,
+            prefill,
+            decode: start.elapsed().saturating_sub(prefill),
+            passes,
+            tokens: tokens.len(),
+        };
+        Ok((tokens, timing))
+    }
+
+    fn scratch(&self, n: usize) -> Result<Scratch, AudioError> {
+        let (c, ops) = (self.config, self.ops);
+        let (qw, kw) = (c.heads * c.head_dim, c.kv_heads * c.head_dim);
+        Ok(Scratch {
+            x: ops.scratch(n * c.hidden)?,
+            h: ops.scratch(n * c.hidden)?,
+            q: ops.scratch(n * qw)?,
+            k: ops.scratch(n * kw)?,
+            v: ops.scratch(n * kw)?,
+            att: ops.scratch(n * qw)?,
+            gate: ops.scratch(n * c.ffn)?,
+            up: ops.scratch(n * c.ffn)?,
+            logits: ops.scratch(c.vocab)?,
+            ids: ops.scratch(1)?,
+            partials: ops.scratch(decode_attention_partials(
+                c.heads,
+                c.head_dim,
+                DECODE_ATTN_SPLITS,
+            ))?,
+            state: ops.scratch(DECODE_STATE_WORDS)?,
+            out: ops.scratch(BATCH)?,
+        })
+    }
+
+    /// The embedding as the row fetch reads it.
+    fn table(&self) -> Result<EmbedTable<'_>, AudioError> {
+        let embed: &Linear = &self.weights.embed;
+        match &embed.weight {
+            LinearWeight::Gemm { dtype, buffer, .. } => Ok(EmbedTable::Dense {
+                dtype: *dtype,
+                rows: buffer.view(),
+            }),
+            LinearWeight::Projected(w) => match (w.dtype, w.aux().and_then(WeightAux::affine)) {
+                (DType::MlxAffine8Gs64, Some(aux)) => Ok(EmbedTable::Affine8 {
+                    words: w.view(),
+                    scales: aux.scales.view(),
+                    biases: aux.biases.view(),
+                    group: 64,
+                }),
+                (other, _) => Err(AudioError::Checkpoint {
+                    what: format!("the embedding is stored as {other:?}, which no row fetch reads"),
+                }),
+            },
+        }
+    }
+
+    /// The prompt's rows into `s.x`: each text id's embedding row, and the
+    /// tower's rows over the placeholder run, in order and unscaled (notes
+    /// §2.7).
+    fn embed_prompt(&self, s: &Scratch, ids: &[u32], audio: &Encoded) -> Result<(), AudioError> {
+        let (ops, c) = (self.ops, self.config);
+        let first =
+            ids.iter()
+                .position(|&t| t == AUDIO_PAD)
+                .ok_or_else(|| AudioError::BadSpec {
+                    reason: "a prompt with no audio placeholder".into(),
+                })?;
+        ops.backend().copy_d2d(
+            rows(&s.x, first, audio.tokens, c.hidden)?,
+            rows(&audio.buffer, 0, audio.tokens, c.hidden)?,
+        )?;
+        // The row fetch reads its id from a decoder state; each text row gets
+        // a state of its own, uploaded at once.
+        let text: Vec<(usize, u32)> = ids
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i < first || i >= first + audio.tokens)
+            .map(|(i, &t)| (i, t))
+            .collect();
+        let mut raw = vec![0u8; text.len() * DECODE_STATE_WORDS * 4];
+        for (j, &(_, t)) in text.iter().enumerate() {
+            let at = (j * DECODE_STATE_WORDS + DECODE_TOKEN) * 4;
+            raw[at..at + 4].copy_from_slice(&t.to_le_bytes());
+        }
+        let states = ops.scratch(text.len() * DECODE_STATE_WORDS)?;
+        ops.backend().copy_h2d(states.view(), &raw)?;
+        let table = self.table()?;
+        for (j, &(i, _)) in text.iter().enumerate() {
+            ops.embed_token(&EmbedTokenDesc {
+                out: rows(&s.x, i, 1, c.hidden)?,
+                table,
+                state: rows(&states, j, 1, DECODE_STATE_WORDS)?,
+                width: c.hidden,
+                vocab: c.vocab,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn rms(
+        &self,
+        out: DeviceView<'_>,
+        input: DeviceView<'_>,
+        weight: &DeviceBuffer,
+        rows: usize,
+        dim: usize,
+    ) -> Result<(), AudioError> {
+        Ok(self.ops.rms_norm(&NormDesc {
+            out,
+            input,
+            weight: Some(weight.view()),
+            bias: None,
+            rows,
+            dim,
+            eps: self.config.rms_eps,
+        })?)
+    }
+
+    fn residual(
+        &self,
+        x: &DeviceBuffer,
+        add: &DeviceBuffer,
+        count: usize,
+    ) -> Result<(), AudioError> {
+        Ok(self.ops.axpy(&AxpyDesc {
+            y: x.view(),
+            x: add.view(),
+            alpha: 1.0,
+            count,
+        })?)
+    }
+
+    /// One layer over `n` rows of `s.x`, in place (notes §4).
+    fn layer(
+        &self,
+        layer: &TextLayer,
+        cache: CachePlanes<'_>,
+        s: &Scratch,
+        n: usize,
+        pass: Pass,
+    ) -> Result<(), AudioError> {
+        let (ops, c) = (self.ops, self.config);
+        let hd = c.head_dim;
+        self.rms(s.h.view(), s.x.view(), &layer.attn_norm, n, c.hidden)?;
+        layer.q.forward(ops, s.h.view(), s.q.view(), n)?;
+        layer.k.forward(ops, s.h.view(), s.k.view(), n)?;
+        layer.v.forward(ops, s.h.view(), s.v.view(), n)?;
+        // The q and k norms are over each head's dims, before the rotation.
+        self.rms(s.q.view(), s.q.view(), &layer.q_norm, n * c.heads, hd)?;
+        self.rms(s.k.view(), s.k.view(), &layer.k_norm, n * c.kv_heads, hd)?;
+        for (x, heads) in [(&s.q, c.heads), (&s.k, c.kv_heads)] {
+            match pass {
+                Pass::Prefill => ops.rope_half(&RopeDesc {
+                    x: x.view(),
+                    rows: n,
+                    heads,
+                    head_dim: hd,
+                    pos0: 0,
+                    theta: c.rope_theta,
+                })?,
+                Pass::Decode => ops.rope_half_at_state(&RopeStateDesc {
+                    x: x.view(),
+                    rows: 1,
+                    heads,
+                    head_dim: hd,
+                    offset: 0,
+                    theta: c.rope_theta,
+                    state: s.state.view(),
+                })?,
+            }
+        }
+        ops.kv_append(&KvAppendDesc {
+            cache,
+            k: s.k.view(),
+            v: s.v.view(),
+            state: s.state.view(),
+            rows: n,
+        })?;
+        let scale = attention_scale(hd);
+        match pass {
+            Pass::Prefill => ops.causal_attention(&CausalAttnDesc {
+                out: s.att.view(),
+                q: s.q.view(),
+                cache,
+                n_q: n,
+                heads: c.heads,
+                pos0: 0,
+                scale,
+            })?,
+            Pass::Decode => ops.decode_attention(&DecodeAttnDesc {
+                out: s.att.view(),
+                partials: s.partials.view(),
+                splits: DECODE_ATTN_SPLITS,
+                q: s.q.view(),
+                cache,
+                heads: c.heads,
+                state: s.state.view(),
+                scale,
+            })?,
+        }
+        layer.o.forward(ops, s.att.view(), s.h.view(), n)?;
+        self.residual(&s.x, &s.h, n * c.hidden)?;
+        self.rms(s.h.view(), s.x.view(), &layer.ffn_norm, n, c.hidden)?;
+        layer.gate.forward(ops, s.h.view(), s.gate.view(), n)?;
+        layer.up.forward(ops, s.h.view(), s.up.view(), n)?;
+        ops.silu_mul(&SiluMulDesc {
+            out: s.gate.view(),
+            gate: s.gate.view(),
+            up: s.up.view(),
+            count: n * c.ffn,
+        })?;
+        layer.down.forward(ops, s.gate.view(), s.h.view(), n)?;
+        self.residual(&s.x, &s.h, n * c.hidden)
+    }
+
+    /// The final norm of row `row` of `s.x`, the tied head, and its argmax
+    /// into `s.ids`; a tie keeps the lowest id, as the reference's argmax
+    /// does.
+    fn head(&self, s: &Scratch, row: usize) -> Result<(), AudioError> {
+        let (ops, c) = (self.ops, self.config);
+        let h = rows(&s.h, 0, 1, c.hidden)?;
+        self.rms(
+            h,
+            rows(&s.x, row, 1, c.hidden)?,
+            &self.weights.norm,
+            1,
+            c.hidden,
+        )?;
+        self.weights.embed.forward(ops, h, s.logits.view(), 1)?;
+        Ok(ops.argmax_rows(&ArgmaxDesc {
+            out: s.ids.view(),
+            input: s.logits.view(),
+            rows: 1,
+            cols: c.vocab,
+        })?)
+    }
+
+    fn step(&self, s: &Scratch, advance: usize, slot: usize) -> Result<(), AudioError> {
+        Ok(self.ops.decode_step(&DecodeStepDesc {
+            state: s.state.view(),
+            out: s.out.view(),
+            ids: s.ids.view(),
+            eos: STOP_TOKENS,
+            max_tokens: MAX_NEW_TOKENS,
+            advance,
+            slot,
+        })?)
+    }
+
+    /// One decode pass over the state's last token, ending in the head's
+    /// argmax.
+    fn pass(&self, cache: &KvCache, s: &Scratch) -> Result<(), AudioError> {
+        let c = self.config;
+        self.ops.embed_token(&EmbedTokenDesc {
+            out: s.x.view(),
+            table: self.table()?,
+            state: s.state.view(),
+            width: c.hidden,
+            vocab: c.vocab,
+        })?;
+        for (l, layer) in self.weights.layers.iter().enumerate() {
+            self.layer(layer, cache.layer(l), s, 1, Pass::Decode)?;
+        }
+        self.head(s, 0)
+    }
+
+    /// Greedy steps from the prefill's argmax until the state says done;
+    /// returns the emitted ids and the passes run.
+    fn decode(
+        &self,
+        cache: &mut KvCache,
+        s: &Scratch,
+        prompt: usize,
+    ) -> Result<(Vec<u32>, usize), AudioError> {
+        let backend = self.ops.backend();
+        let mut tokens = Vec::new();
+        let (mut pos, mut emitted, mut passes) = (prompt, 0usize, 0usize);
+        let mut first = true;
+        loop {
+            // The first batch's first step takes the prefill's argmax, with no
+            // pass before it. Past the cap a step emits nothing, so no batch
+            // runs more passes than tokens remain.
+            let room = MAX_NEW_TOKENS.saturating_sub(emitted);
+            let run = if first { BATCH - 1 } else { BATCH }.min(room);
+            // Each pass appends one row at the state's position, which only
+            // the steps move; the append drops rows past the capacity, so the
+            // cache grows before the batch is queued.
+            cache.reserve(self.ops, pos, pos + run)?;
+            let mut slot = 0;
+            if first {
+                self.step(s, 0, 0)?;
+                slot = 1;
+            }
+            for _ in 0..run {
+                self.pass(cache, s)?;
+                self.step(s, 1, slot)?;
+                slot += 1;
+            }
+            passes += run;
+            let mut host = vec![0u8; 4 * slot];
+            backend.copy_d2h(s.out.slice(0, bytes(slot))?, &mut host)?;
+            tokens.extend(words(&host).into_iter().filter(|&t| t != DECODE_NO_TOKEN));
+            let mut host = vec![0u8; 4 * DECODE_STATE_WORDS];
+            backend.copy_d2h(s.state.view(), &mut host)?;
+            let st = words(&host);
+            pos = count_of(st[DECODE_POS]);
+            let now = count_of(st[DECODE_COUNT]);
+            if st[DECODE_DONE] != 0 {
+                break;
+            }
+            if now == emitted && !first {
+                return Err(AudioError::BadSpec {
+                    reason: format!(
+                        "a batch of {run} decode steps emitted nothing and did not stop"
+                    ),
+                });
+            }
+            emitted = now;
+            first = false;
+        }
+        Ok((tokens, passes))
+    }
+}
+
+#[cfg(test)]
+#[path = "decoder_tests.rs"]
+mod tests;

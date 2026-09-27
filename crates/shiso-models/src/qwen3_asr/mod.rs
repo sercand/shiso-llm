@@ -11,6 +11,8 @@
 //! cited by section where each is used.
 
 pub mod config;
+pub mod decoder;
 pub mod encoder;
 mod names;
+pub mod prompt;
 pub mod weights;

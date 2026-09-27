@@ -1,5 +1,5 @@
 // Elementwise arithmetic of the audio encoders: activations, the scaled
-// residual add, and the gated linear unit.
+// residual add, the gated linear unit and a decoder MLP's SiLU gate.
 
 /// `out[i] = f(in[i])` for the contract's op codes; safe in place.
 kernel void kernel_audio_unary_f32(
@@ -57,6 +57,23 @@ kernel void kernel_audio_glu_f32(
     const uint c = i - r * args.channels;
     device const float *row = in + (uint64_t) r * 2u * args.channels;
     out[i] = row[c] * audio_sigmoid(row[args.channels + c]);
+}
+
+/// `out[i] = silu(gate[i]) * up[i]`: a SiLU-gated MLP's product, the gate
+/// and the value from two projections; safe with `out` bound to `gate`.
+kernel void kernel_audio_silu_mul_f32(
+        constant audio_args_silu_mul & args [[buffer(0)]],
+        device float *out                   [[buffer(1)]],
+        device const float *gate            [[buffer(2)]],
+        device const float *up              [[buffer(3)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint i = tgpig.x * AUDIO_LINEAR_BLOCK + tpitg.x;
+    if (i >= args.count) {
+        return;
+    }
+    const float g = gate[i];
+    out[i] = g * audio_sigmoid(g) * up[i];
 }
 
 /// `y[r][c] += b[c]`: a linear's bias after a projection that carries none.

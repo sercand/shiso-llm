@@ -31,7 +31,7 @@ pub use linear::{GemmType, Linear, LinearWeight};
 use args::{
     ArgmaxArgs, AxpyArgs, BiasRowsArgs, CacheAttnArgs, Conv2dArgs, DecodeStepArgs, DwConv1dArgs,
     EmbedRowArgs, EmbedTokenArgs, GemmArgs, GluArgs, GreedyStepArgs, GreedyWindowArgs, KeepArgs,
-    KvAppendArgs, LstmArgs, NormArgs, RopeArgs, TransposeArgs, UnaryArgs, UnfoldArgs,
+    KvAppendArgs, LstmArgs, NormArgs, RopeArgs, SiluMulArgs, TransposeArgs, UnaryArgs, UnfoldArgs,
     WindowAttnArgs,
 };
 
@@ -45,7 +45,13 @@ pub const GREEDY_STATE_WORDS: usize = 8;
 /// `DECODE_*` indices below, and the rest is padding.
 pub const DECODE_STATE_WORDS: usize = 8;
 /// Decoder state word: cache rows filled, which is the position of the token
-/// the next pass feeds. Only the step kernel moves it.
+/// the next pass feeds. On the device only the step kernel moves it.
+///
+/// A prefill hands over by a host write: its rows are appended from a state
+/// at position 0, and the host then writes `n`, the prefill's row count, into
+/// this word with `copy_h2d` before it queues the step over the prefill's
+/// argmax (which advances by 0). No kernel adds a prefill's length, so a
+/// state whose position was not written starts decoding over row 0.
 pub const DECODE_POS: usize = 0;
 /// Decoder state word: tokens emitted.
 pub const DECODE_COUNT: usize = 1;
@@ -224,6 +230,20 @@ pub struct GluDesc<'a> {
     pub rows: usize,
     /// Output channels.
     pub channels: usize,
+}
+
+/// `out[i] = silu(gate[i]) * up[i]` over `count` values; `out` may be
+/// `gate`.
+#[derive(Debug, Clone, Copy)]
+pub struct SiluMulDesc<'a> {
+    /// Destination.
+    pub out: DeviceView<'a>,
+    /// The gate projection's output.
+    pub gate: DeviceView<'a>,
+    /// The value projection's output.
+    pub up: DeviceView<'a>,
+    /// Values.
+    pub count: usize,
 }
 
 /// A row normalization; `out` may be `input`.
@@ -960,6 +980,32 @@ impl Ops {
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(d.out),
                 KernelArg::Buffer(d.input),
+            ],
+        )
+    }
+
+    /// A SiLU-gated MLP's product of its gate and value projections.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] for a short view, or the launch's error.
+    pub fn silu_mul(&self, d: &SiluMulDesc<'_>) -> CoreResult<()> {
+        need(d.out, d.count, "silu_mul.out")?;
+        need(d.gate, d.count, "silu_mul.gate")?;
+        need(d.up, d.count, "silu_mul.up")?;
+        let args = SiluMulArgs {
+            count: dim(d.count, "silu_mul.count")?,
+        };
+        self.launch(
+            "kernel_audio_silu_mul_f32",
+            linear_grid(d.count)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.gate),
+                KernelArg::Buffer(d.up),
             ],
         )
     }

@@ -54,6 +54,14 @@ pub(crate) struct GluArgs {
 }
 const _: () = assert!(size_of::<GluArgs>() == 8);
 
+/// `audio_args_silu_mul`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct SiluMulArgs {
+    pub(crate) count: u32,
+}
+const _: () = assert!(size_of::<SiluMulArgs>() == 4);
+
 /// `audio_args_norm`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]

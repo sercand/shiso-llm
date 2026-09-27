@@ -46,6 +46,7 @@ struct audio_args_axpy { uint count; float alpha; };
 struct audio_args_bias_rows { uint rows; uint cols; };
 struct audio_args_argmax { uint rows; uint cols; };
 struct audio_args_glu { uint rows; uint channels; };
+struct audio_args_silu_mul { uint count; };
 struct audio_args_norm { uint rows; uint dim; float eps; uint flags; };
 struct audio_args_gemm { uint m; uint n; uint k; uint flags; uint k_chunk; uint splits; };
 struct audio_args_conv2d {

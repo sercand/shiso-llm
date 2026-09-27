@@ -60,6 +60,16 @@ extern "C" __global__ void kernel_audio_glu_f32(
     out[i] = row[c] * audio_sigmoid(row[args.channels + c]);
 }
 
+extern "C" __global__ void kernel_audio_silu_mul_f32(
+        const struct audio_args_silu_mul args, float *out, const float *gate, const float *up) {
+    const uint i = blockIdx.x * AUDIO_LINEAR_BLOCK + threadIdx.x;
+    if (i >= args.count) {
+        return;
+    }
+    const float g = gate[i];
+    out[i] = g * audio_sigmoid(g) * up[i];
+}
+
 extern "C" __global__ void kernel_audio_bias_rows_f32(
         const struct audio_args_bias_rows args, float *y, const float *b) {
     const uint i = blockIdx.x * AUDIO_LINEAR_BLOCK + threadIdx.x;
