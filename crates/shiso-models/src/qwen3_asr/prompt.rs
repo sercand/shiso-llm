@@ -84,6 +84,25 @@ pub struct Parsed {
     pub text: String,
 }
 
+/// Ids of the prompt around its placeholder run: nine before it, six after.
+pub(crate) const FRAME_IDS: usize = 15;
+
+/// Ids of the longest [`forced_suffix`].
+pub(crate) const LONGEST_SUFFIX: usize = longest_suffix();
+
+const fn longest_suffix() -> usize {
+    let mut longest = 0;
+    let mut i = 0;
+    while i < NAME_IDS.len() {
+        if NAME_IDS[i].1.len() > longest {
+            longest = NAME_IDS[i].1.len();
+        }
+        i += 1;
+    }
+    // `language` before the name, `<asr_text>` after it.
+    longest + 2
+}
+
 /// The ids of `language {name}<asr_text>` for a language the model supports,
 /// named as the model names it (in any case); `None` for any other.
 #[must_use]
@@ -130,7 +149,7 @@ pub fn ids(n_audio: usize, forced: Option<&str>) -> Result<Vec<u32>, AudioError>
             })?
         }
     };
-    let mut out = Vec::with_capacity(15 + n_audio + suffix.len());
+    let mut out = Vec::with_capacity(FRAME_IDS + n_audio + suffix.len());
     out.extend_from_slice(&[
         IM_START,
         SYSTEM,

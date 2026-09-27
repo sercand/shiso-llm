@@ -58,6 +58,17 @@ const BATCH: usize = 8;
 /// Cache rows past the prompt a fresh cache is sized for: a transcript of a
 /// full chunk is a few hundred tokens, so most chunks never grow it.
 const HEADROOM: usize = 256;
+/// The longest chunk the stream's plan cuts, in mel frames: 35 s, a 30 s
+/// chunk and the 5 s its cut is searched for past the mark.
+const LONGEST_CHUNK_FRAMES: usize = 3_500;
+/// The capacity a fresh cache takes for the longest chunk, in any language:
+/// the prompt and the headroom. A cache past it grew while a chunk decoded
+/// far past any speech - toward the token cap, at some 320 KB a row - and
+/// is not worth keeping once its stream closes.
+pub(crate) const POOLED_CAPACITY: usize = prompt::FRAME_IDS
+    + super::encoder::audio_tokens(LONGEST_CHUNK_FRAMES)
+    + prompt::LONGEST_SUFFIX
+    + HEADROOM;
 
 fn bytes(floats: usize) -> u64 {
     u64::try_from(floats).unwrap_or(u64::MAX).saturating_mul(4)
@@ -151,6 +162,15 @@ impl KvCache {
         Ok(cache)
     }
 
+    /// A cache that says it holds `capacity` rows and holds none, for the
+    /// stream pool's bookkeeping: nothing may transcribe with it.
+    #[cfg(test)]
+    pub(crate) fn claiming(config: &TextConfig, capacity: usize) -> Self {
+        let mut cache = Self::new(config);
+        cache.capacity = capacity;
+        cache
+    }
+
     /// Rows the cache holds without growing.
     #[must_use]
     pub fn capacity(&self) -> usize {
@@ -167,13 +187,19 @@ impl KvCache {
         self.kv_heads * capacity * self.head_dim
     }
 
-    /// Makes room for `need` rows, keeping the first `filled`: to `need` or
-    /// twice the capacity, whichever is more.
+    /// Makes room for `need` rows, keeping the first `filled`: to `need` or,
+    /// while rows are filled, twice the capacity, whichever is more. An
+    /// empty cache (before a prefill) takes exactly `need`, so a stream whose
+    /// chunks grow only by the prompt stays at [`POOLED_CAPACITY`] or under.
     fn reserve(&mut self, ops: &Ops, filled: usize, need: usize) -> Result<(), AudioError> {
         if need <= self.capacity {
             return Ok(());
         }
-        let capacity = need.max(2 * self.capacity);
+        let capacity = if filled == 0 {
+            need
+        } else {
+            need.max(2 * self.capacity)
+        };
         let floats = self.plane_floats(capacity);
         let mut planes = Vec::with_capacity(self.layers);
         for _ in 0..self.layers {

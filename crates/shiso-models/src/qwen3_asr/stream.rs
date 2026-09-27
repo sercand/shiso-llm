@@ -41,7 +41,7 @@ use shiso_core::TokenId;
 
 use super::Model;
 use super::config::{ASR_TEXT, language_code};
-use super::decoder::{Decoder, KvCache, MAX_NEW_TOKENS};
+use super::decoder::{Decoder, KvCache, MAX_NEW_TOKENS, POOLED_CAPACITY};
 use super::encoder::Tower;
 use super::prompt;
 use crate::audio_ops::Workspace;
@@ -310,14 +310,31 @@ pub(crate) fn chunk_events(
 
 /// A stream's device memory: the decoder's cache and activations and the
 /// tower's scratch, all written before they are read. A closed stream hands
-/// it back to the model for the next one, because a fresh buffer's first
-/// touch costs some 50 us a megabyte (M1 Max) and a stream's is several
-/// hundred megabytes.
+/// it back to the model for the next one ([`give_back`]), because a fresh
+/// buffer's first touch costs some 50 us a megabyte (M1 Max) and a stream's
+/// is several hundred megabytes.
 #[derive(Debug)]
 pub(crate) struct Memory {
     cache: KvCache,
     decoder: Workspace,
     tower: Workspace,
+}
+
+/// Memories the model keeps for the next streams: the server's default
+/// `--audio-max-streams`. The model is opened without the server's limit, so
+/// it cannot size the pool to it; a server running more streams than this
+/// allocates the rest afresh, and one running fewer never fills it.
+pub(crate) const POOL_STREAMS: usize = 4;
+
+/// Returns a closed stream's `memory` to `pool`, or drops it: a cache that
+/// grew past [`POOLED_CAPACITY`] held one degenerate chunk's rows - up to
+/// some 1.3 GB at the token cap - and would hold them for the life of the
+/// process; a pool of [`POOL_STREAMS`] already serves every stream the
+/// server runs at once by default.
+pub(crate) fn give_back(pool: &mut Vec<Memory>, memory: Memory) {
+    if memory.cache.capacity() <= POOLED_CAPACITY && pool.len() < POOL_STREAMS {
+        pool.push(memory);
+    }
 }
 
 /// A stream of this recognizer.
@@ -432,11 +449,14 @@ impl QwenStream {
 impl Drop for QwenStream {
     fn drop(&mut self) {
         if let Some(memory) = self.memory.take() {
-            self.model
-                .spare
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(memory);
+            give_back(
+                &mut self
+                    .model
+                    .spare
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                memory,
+            );
         }
     }
 }

@@ -44,7 +44,7 @@ pub(crate) struct Model {
     pub(crate) weights: QwenAsrWeights,
     pub(crate) vocab: Arc<PieceVocab>,
     /// Device memory of streams that have closed, for the next to take
-    /// (see `stream::Memory`).
+    /// (see `stream::Memory`), at most `stream::POOL_STREAMS` of them.
     pub(crate) spare: Mutex<Vec<stream::Memory>>,
 }
 

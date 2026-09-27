@@ -339,3 +339,64 @@ fn the_whole_stream_matches_one_shot_transcription() {
     assert!(ends.windows(2).all(|w| w[0] < w[1]), "{ends:?}");
     assert_eq!(ends.last(), Some(&u32::try_from(valid).expect("fits")));
 }
+
+fn memory(capacity: usize) -> super::Memory {
+    let config = crate::qwen3_asr::config::TextConfig {
+        hidden: 8,
+        layers: 1,
+        heads: 1,
+        kv_heads: 1,
+        head_dim: 8,
+        ffn: 8,
+        vocab: 8,
+        rms_eps: 1e-6,
+        rope_theta: 1e6,
+        max_positions: 1 << 16,
+    };
+    super::Memory {
+        cache: crate::qwen3_asr::decoder::KvCache::claiming(&config, capacity),
+        decoder: crate::audio_ops::Workspace::new(),
+        tower: crate::audio_ops::Workspace::new(),
+    }
+}
+
+#[test]
+fn the_pool_keeps_a_few_ordinary_memories_and_no_grown_one() {
+    use super::{POOL_STREAMS, give_back};
+    use crate::qwen3_asr::decoder::POOLED_CAPACITY;
+
+    let mut pool = Vec::new();
+    // A cache that ran to the token cap is dropped, not kept for the life
+    // of the process.
+    give_back(&mut pool, memory(POOLED_CAPACITY + 1));
+    give_back(&mut pool, memory(8_192));
+    assert!(pool.is_empty());
+    // One sized for any chunk of the plan is kept, up to the stream limit.
+    give_back(&mut pool, memory(POOLED_CAPACITY));
+    assert_eq!(pool.len(), 1);
+    for _ in 0..10 {
+        give_back(&mut pool, memory(300));
+    }
+    assert_eq!(pool.len(), POOL_STREAMS);
+}
+
+#[test]
+fn the_pooled_capacity_is_the_longest_chunks_prompt_and_headroom() {
+    use crate::qwen3_asr::config::languages;
+    use crate::qwen3_asr::decoder::POOLED_CAPACITY;
+    use crate::qwen3_asr::encoder::audio_tokens;
+    use crate::qwen3_asr::prompt;
+    use shiso_audio::chunks::{CHUNK_SECS, SEARCH_SECS};
+
+    let longest = super::frames_in(CHUNK_SECS + SEARCH_SECS);
+    let prompt_rows = languages()
+        .iter()
+        .map(|(_, name)| {
+            prompt::ids(audio_tokens(longest), Some(name))
+                .expect("a supported language")
+                .len()
+        })
+        .max()
+        .expect("languages");
+    assert_eq!(POOLED_CAPACITY, prompt_rows + 256);
+}
