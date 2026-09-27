@@ -267,3 +267,28 @@ fn a_chunked_words_end_at_the_next_word_or_its_chunks_end() {
     // `words` has it.
     assert_eq!(words_in_chunks(&pieces, 0.08, &[]), words(&pieces, 0.08));
 }
+
+#[test]
+fn a_chunk_boundary_ends_a_word_written_without_spaces() {
+    // Text in a script written without spaces runs across the join of two
+    // chunks: each chunk's part is its own word, timed by its own chunk.
+    let pieces = [tp("你好", 0), tp("。", 40), tp("我们", 100), tp("走", 150)];
+    let w = words_in_chunks(&pieces, 0.01, &[100, 200]);
+    let got: Vec<(&str, f64, f64)> = w
+        .iter()
+        .map(|w| (w.text.as_str(), w.start, w.end))
+        .collect();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(got[0].0, "你好。");
+    assert!(
+        (got[0].1 - 0.0).abs() < 1e-9 && (got[0].2 - 1.0).abs() < 1e-9,
+        "{got:?}"
+    );
+    assert_eq!(got[1].0, "我们走");
+    assert!(
+        (got[1].1 - 1.0).abs() < 1e-9 && (got[1].2 - 2.0).abs() < 1e-9,
+        "{got:?}"
+    );
+    // Without chunk ends the run is one word, as before.
+    assert_eq!(words(&pieces, 0.01).len(), 1);
+}

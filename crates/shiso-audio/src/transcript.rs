@@ -133,11 +133,16 @@ impl SpeakerActivity {
 }
 
 /// Pieces grouped into words: `(text, first frame, last frame)`, empty
-/// words dropped.
-fn spans(pieces: &[TimedPiece]) -> Vec<(String, u32, u32)> {
+/// words dropped. A piece starts a word after a space, or in another chunk
+/// of `chunk_ends` than the word before it.
+fn spans(pieces: &[TimedPiece], chunk_ends: &[u32]) -> Vec<(String, u32, u32)> {
+    let chunk_of = |frame: u32| chunk_ends.partition_point(|&end| end <= frame);
     let mut out: Vec<(String, u32, u32)> = Vec::new();
     for p in pieces {
-        if out.is_empty() || p.text.starts_with(' ') {
+        let new_chunk = out
+            .last()
+            .is_some_and(|last| chunk_of(last.1) != chunk_of(p.frame));
+        if out.is_empty() || p.text.starts_with(' ') || new_chunk {
             out.push((p.text.trim().to_owned(), p.frame, p.frame));
         } else if let Some(last) = out.last_mut() {
             last.0.push_str(p.text.trim_end());
@@ -162,12 +167,14 @@ pub fn words(pieces: &[TimedPiece], frame_secs: f64) -> Vec<Word> {
 /// nothing of where a word stops, so a word ends where the next word of its
 /// chunk starts, and a chunk's last word at the chunk's end: a one-word turn
 /// then spans its turn rather than one frame, and a segment cut at a turn
-/// ends at the cut. A word past every chunk end, and every word when
+/// ends at the cut. No word spans two chunks: text written without spaces
+/// that runs across a join is two words, each timed (and given a speaker)
+/// by its own chunk. A word past every chunk end, and every word when
 /// `chunk_ends` is empty, ends one frame after its last piece, as [`words`]
 /// has it.
 #[must_use]
 pub fn words_in_chunks(pieces: &[TimedPiece], frame_secs: f64, chunk_ends: &[u32]) -> Vec<Word> {
-    let spans = spans(pieces);
+    let spans = spans(pieces, chunk_ends);
     let chunk_of = |frame: u32| chunk_ends.partition_point(|&end| end <= frame);
     (0..spans.len())
         .map(|i| {

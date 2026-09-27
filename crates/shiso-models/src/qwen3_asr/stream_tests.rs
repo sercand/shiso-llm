@@ -172,11 +172,15 @@ fn no_space_joins_chunks_in_a_script_written_without_spaces() {
     }
     let after_han = chunk_events(&v, &[THIS], Some("English"), 0..90, Some('好'));
     assert_eq!(ids_of(&after_han), [THIS]);
+    // A CJK full stop is punctuation, not a script: the Latin word after it
+    // is still a word of its own.
+    let after_stop = chunk_events(&v, &[THIS], Some("English"), 0..90, Some('。'));
+    assert_eq!(ids_of(&after_stop), [SPACE, THIS]);
     // Kana and Thai are written without spaces too; Hangul is not.
-    for c in ['か', 'カ', 'ก', '。'] {
+    for c in ['か', 'カ', 'ｶ', 'ก', '好'] {
         assert!(super::unspaced(c), "{c}");
     }
-    for c in ['한', 'a', 'é', 'я', '1'] {
+    for c in ['한', 'a', 'é', 'я', '1', '。', '，'] {
         assert!(!super::unspaced(c), "{c}");
     }
 }

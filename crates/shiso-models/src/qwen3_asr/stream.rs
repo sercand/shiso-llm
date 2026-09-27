@@ -203,22 +203,24 @@ pub(crate) struct ChunkText {
     pub(crate) text: String,
 }
 
-/// Whether `c` belongs to a script written without spaces between words -
-/// Han, kana, Thai, Lao, Khmer, Myanmar, and the CJK punctuation and
-/// full-width forms - so that no space goes between it and a neighbouring
-/// chunk's text. Hangul is written with spaces and is not one.
+/// Whether `c` is a letter of a script written without spaces between
+/// words - Han, kana, Thai, Lao, Khmer, Myanmar - so that no space goes
+/// between it and a neighbouring chunk's text. Hangul is written with spaces
+/// and is not one. Nor is CJK punctuation: a Latin word after a `。` is still
+/// a word of its own, and a Han character on the other side keeps the join
+/// unspaced anyway.
 pub(crate) fn unspaced(c: char) -> bool {
     matches!(
         c,
         '\u{0E00}'..='\u{0EFF}' // Thai, Lao
             | '\u{1000}'..='\u{109F}' // Myanmar
             | '\u{1780}'..='\u{17FF}' // Khmer
-            | '\u{3000}'..='\u{30FF}' // CJK punctuation, Hiragana, Katakana
+            | '\u{3040}'..='\u{30FF}' // Hiragana, Katakana
             | '\u{31F0}'..='\u{31FF}' // Katakana phonetic extensions
             | '\u{3400}'..='\u{4DBF}' // Han extension A
             | '\u{4E00}'..='\u{9FFF}' // Han
             | '\u{F900}'..='\u{FAFF}' // Han compatibility
-            | '\u{FF00}'..='\u{FFEF}' // full-width and half-width forms
+            | '\u{FF66}'..='\u{FF9F}' // half-width Katakana
             | '\u{20000}'..='\u{3FFFF}' // Han extensions B onward
     )
 }
