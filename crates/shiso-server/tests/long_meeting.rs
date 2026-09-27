@@ -20,6 +20,12 @@
 //! regressions and compares recognizers, so only a floor is asserted (word
 //! error rate under 50%, speaker agreement over 50%) for the Qwen3 family.
 //! Nemotron's numbers are printed for comparison only.
+//!
+//! The meeting is far past `--asr-offline-min-secs`, so a non-streaming
+//! request to the Qwen3 family takes the batched offline path. Each of those
+//! recognizers runs twice, with `--asr-skip-silence` on (the default) and
+//! off, so what skipping long silences costs in words and saves in time is
+//! measured on one recording; Nemotron has no offline path and runs once.
 
 #![cfg(target_os = "macos")]
 
@@ -79,6 +85,9 @@ struct Recognizer {
     /// Whether its word error rate and speaker agreement are asserted, not
     /// only printed. Nemotron is a comparison point, not a target.
     assert_floor: bool,
+    /// Whether it transcribes a long clip offline, so it runs with silence
+    /// skipped and kept.
+    offline: bool,
 }
 
 const RECOGNIZERS: &[Recognizer] = &[
@@ -87,24 +96,28 @@ const RECOGNIZERS: &[Recognizer] = &[
         root: "SHISO_TEST_MODEL_QWEN3ASR",
         model: "gguf/Qwen3-ASR-1.7B-Q8_0.gguf",
         assert_floor: true,
+        offline: true,
     },
     Recognizer {
         name: "qwen3-asr-mlx",
         root: "SHISO_TEST_MODEL_QWEN3ASR",
         model: "mlx",
         assert_floor: true,
+        offline: true,
     },
     Recognizer {
         name: "r2t2-q8",
         root: "SHISO_TEST_MODEL_R2T2",
         model: "gguf/Confucius4-R2T2-Q8_0.gguf",
         assert_floor: true,
+        offline: true,
     },
     Recognizer {
         name: "nemotron-q8",
         root: "SHISO_TEST_MODEL_ASR",
         model: "nvidia/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf",
         assert_floor: false,
+        offline: false,
     },
 ];
 
@@ -175,9 +188,10 @@ async fn post(state: &Arc<AppState>, body: Vec<u8>) -> (StatusCode, String) {
 }
 
 /// A recognizer and the shared MLX diarizer, booted as the binary boots them,
-/// with `--audio-allow-ffmpeg` and a `--audio-max-seconds` wide enough for the
-/// meeting. `None` having said on stderr why the checkpoint was skipped.
-fn boot(recognizer: &Recognizer, diarizer: &Path) -> Option<Arc<AppState>> {
+/// with `--audio-allow-ffmpeg`, a `--audio-max-seconds` wide enough for the
+/// meeting, and `extra` flags. `None` having said on stderr why the
+/// checkpoint was skipped.
+fn boot(recognizer: &Recognizer, diarizer: &Path, extra: &[&str]) -> Option<Arc<AppState>> {
     let Some(root) = std::env::var_os(recognizer.root) else {
         say(&format!(
             "SKIP {}: {} is unset",
@@ -199,7 +213,7 @@ fn boot(recognizer: &Recognizer, diarizer: &Path) -> Option<Arc<AppState>> {
         diarizer.display().to_string(),
         ffmpeg(),
     );
-    let line = [
+    let mut line = vec![
         "shiso",
         "serve",
         "--asr-model",
@@ -219,6 +233,7 @@ fn boot(recognizer: &Recognizer, diarizer: &Path) -> Option<Arc<AppState>> {
         "--video-decode-timeout-s",
         "300",
     ];
+    line.extend_from_slice(extra);
     let cli = <Cli as clap::Parser>::try_parse_from(line).expect("the command line parses");
     let Command::Serve(args) = cli.command;
     args.validate().expect("servable");
@@ -475,76 +490,95 @@ async fn long_meeting_recognizers() {
     ));
 
     for recognizer in RECOGNIZERS {
-        let Some(state) = boot(recognizer, &diarizer) else {
-            continue;
-        };
-        let started = Instant::now();
-        let (status, body) = post(
-            &state,
-            form(
-                &audio_bytes,
-                &[
-                    ("model", recognizer.name),
-                    ("response_format", "diarized_json"),
-                    ("language", "tr"),
-                ],
-            ),
-        )
-        .await;
-        let elapsed = started.elapsed().as_secs_f64();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{}: request failed",
-            recognizer.name
-        );
-        let json: Value = serde_json::from_str(&body).expect("json");
-        let duration = json["duration"].as_f64().unwrap_or(0.0);
-        let hyp_words = normalize_words(json["text"].as_str().expect("text"));
-        let edits = edit_distance(&reference.words, &hyp_words);
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a word count fits a meeting's transcript; f64 carries it exactly"
-        )]
-        let wer = edits as f64 / reference.words.len().max(1) as f64;
-        let spans = our_spans(&json);
-        let mut speakers: Vec<&str> = spans.iter().map(|s| s.0.as_str()).collect();
-        speakers.sort_unstable();
-        speakers.dedup();
-        let (matched, pairs) = speaker_agreement(&reference.spans, &spans);
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a half-second sample count fits a meeting's length; f64 carries it exactly"
-        )]
-        let agreement = if pairs == 0 {
-            0.0
+        let runs: &[(&str, &[&str])] = if recognizer.offline {
+            &[
+                ("offline, silence skipped", &["--asr-skip-silence=true"]),
+                ("offline, silence kept", &["--asr-skip-silence=false"]),
+            ]
         } else {
-            matched as f64 / pairs as f64
+            &[("streamed", &[])]
         };
-        say(&format!(
-            "{}: {elapsed:.1} s wall ({:.3}x realtime over {duration:.1} s), \
-             WER {:.1}% ({edits} of {} words), {} speakers found, \
-             agreement {:.1}% over {pairs} half-second samples",
-            recognizer.name,
-            elapsed / duration.max(1.0),
-            wer * 100.0,
-            reference.words.len(),
-            speakers.len(),
-            agreement * 100.0,
-        ));
-        if recognizer.assert_floor {
-            assert!(
-                wer < 0.5,
-                "{}: WER {:.1}% is not under the 50% floor",
-                recognizer.name,
-                wer * 100.0
-            );
-            assert!(
-                agreement > 0.5,
-                "{}: speaker agreement {:.1}% is not over the 50% floor",
-                recognizer.name,
-                agreement * 100.0
-            );
+        for &(run, extra) in runs {
+            let Some(state) = boot(recognizer, &diarizer, extra) else {
+                break;
+            };
+            let (wer, agreement) =
+                measure(recognizer.name, run, &state, &audio_bytes, &reference).await;
+            if recognizer.assert_floor {
+                assert!(
+                    wer < 0.5,
+                    "{} ({run}): WER {:.1}% is not under the 50% floor",
+                    recognizer.name,
+                    wer * 100.0
+                );
+                assert!(
+                    agreement > 0.5,
+                    "{} ({run}): speaker agreement {:.1}% is not over the 50% floor",
+                    recognizer.name,
+                    agreement * 100.0
+                );
+            }
         }
     }
+}
+
+/// One diarized transcription of the meeting through `state`, its aggregates
+/// said on stderr; returns its word error rate and speaker agreement.
+async fn measure(
+    name: &str,
+    run: &str,
+    state: &Arc<AppState>,
+    audio_bytes: &[u8],
+    reference: &Reference,
+) -> (f64, f64) {
+    let started = Instant::now();
+    let (status, body) = post(
+        state,
+        form(
+            audio_bytes,
+            &[
+                ("model", name),
+                ("response_format", "diarized_json"),
+                ("language", "tr"),
+            ],
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed().as_secs_f64();
+    assert_eq!(status, StatusCode::OK, "{name} ({run}): request failed");
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let duration = json["duration"].as_f64().unwrap_or(0.0);
+    let hyp_words = normalize_words(json["text"].as_str().expect("text"));
+    let edits = edit_distance(&reference.words, &hyp_words);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a word count fits a meeting's transcript; f64 carries it exactly"
+    )]
+    let wer = edits as f64 / reference.words.len().max(1) as f64;
+    let spans = our_spans(&json);
+    let mut speakers: Vec<&str> = spans.iter().map(|s| s.0.as_str()).collect();
+    speakers.sort_unstable();
+    speakers.dedup();
+    let (matched, pairs) = speaker_agreement(&reference.spans, &spans);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a half-second sample count fits a meeting's length; f64 carries it exactly"
+    )]
+    let agreement = if pairs == 0 {
+        0.0
+    } else {
+        matched as f64 / pairs as f64
+    };
+    say(&format!(
+        "{name} ({run}): {elapsed:.1} s wall ({:.3}x realtime over {duration:.1} s), \
+         WER {:.1}% ({edits} of {} words; {} words transcribed), {} speakers found, \
+         agreement {:.1}% over {pairs} half-second samples",
+        elapsed / duration.max(1.0),
+        wer * 100.0,
+        reference.words.len(),
+        hyp_words.len(),
+        speakers.len(),
+        agreement * 100.0,
+    ));
+    (wer, agreement)
 }
