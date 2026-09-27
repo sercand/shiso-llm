@@ -236,7 +236,8 @@ pub async fn start(
     })?;
     let prompt = renderer.render(request)?;
     let text: Arc<str> = Arc::from(prompt.text);
-    queue(state, request, prompt.tokens, prompt.media, text, field).await
+    let media = (prompt.media, prompt.digests);
+    queue(state, request, prompt.tokens, media, text, field).await
 }
 
 /// Queues a generation over a prompt that is already tokenized.
@@ -262,7 +263,16 @@ pub async fn start_with_prompt(
     // always a cold start. Decoding the ids back into text to get a key would
     // produce a string that is *nearly* the prompt, and a cache keyed on nearly
     // the prompt occasionally answers with somebody else's conversation.
-    queue(state, request, tokens, media, Arc::from(""), field).await
+    let digests = media.iter().map(crate::media::MediaItem::digest).collect();
+    queue(
+        state,
+        request,
+        tokens,
+        (media, digests),
+        Arc::from(""),
+        field,
+    )
+    .await
 }
 
 /// The half both entries share: the context guard, the budget, the preset.
@@ -270,7 +280,10 @@ async fn queue(
     state: &AppState,
     request: &Request,
     tokens: Vec<TokenId>,
-    media: Vec<crate::media::MediaItem>,
+    (media, digests): (
+        Vec<crate::media::MediaItem>,
+        Vec<shiso_core::media::MediaDigest>,
+    ),
     text: Arc<str>,
     field: PromptField,
 ) -> Result<Started, AppError> {
@@ -306,7 +319,7 @@ async fn queue(
     let generate = GenerateRequest::new(Arc::from(tokens), sampling, seed, max_tokens)
         .with_text(text)
         .with_stop(Arc::from(request.stop.clone()))
-        .with_media(Arc::from(media))
+        .with_media(Arc::from(media), Arc::from(digests))
         .with_service_class(request.service_class)
         .with_string_params(Arc::new(shiso_parsers::StringParams::from_schemas(
             request

@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use shiso_audio::{DecodeLimits, Language, MelFrontend, MelStream, StreamOptions, decode_audio};
 use shiso_core::Backend;
-use shiso_models::audio_registry::open_speech_recognizer;
+use shiso_models::audio_registry::{RecognizerDesc, open_speech_recognizer};
 
 #[expect(
     clippy::print_stdout,
@@ -88,7 +88,8 @@ fn every_export_transcribes_through_the_public_path() {
             say(&format!("SKIP {name}: absent"));
             continue;
         }
-        let recognizer = open_speech_recognizer(&path, &backend).expect("the registry opens it");
+        let recognizer = open_speech_recognizer(&path, &RecognizerDesc::default(), &backend)
+            .expect("the registry opens it");
         let budget = BUDGETS
             .iter()
             .find(|(n, _)| *n == name)
@@ -105,6 +106,7 @@ fn every_export_transcribes_through_the_public_path() {
                 .open_stream(&StreamOptions {
                     language: Language::Auto,
                     lookahead: 13,
+                    cuts: None,
                 })
                 .expect("a stream opens");
             let mut mel = MelStream::new(Arc::clone(&frontend)).expect("streams");
@@ -158,7 +160,9 @@ fn the_first_chunk_leaves_as_soon_as_its_mel_rows_arrive() {
     };
     let metal = shiso_metal::MetalBackend::new().expect("the Metal library compiles");
     let backend: Arc<dyn Backend> = metal;
-    let recognizer = open_speech_recognizer(&root.join("nvidia"), &backend).expect("opens");
+    let recognizer =
+        open_speech_recognizer(&root.join("nvidia"), &RecognizerDesc::default(), &backend)
+            .expect("opens");
     let frontend = MelFrontend::new(recognizer.mel_spec().clone()).expect("valid");
     for lookahead in [13usize, 3] {
         // The first chunk needs 1 + 8R mel rows; it must not wait for more.
@@ -172,6 +176,7 @@ fn the_first_chunk_leaves_as_soon_as_its_mel_rows_arrive() {
             .open_stream(&StreamOptions {
                 language: Language::Auto,
                 lookahead,
+                cuts: None,
             })
             .expect("opens");
         stream.push(&mel).expect("pushes");
@@ -201,7 +206,8 @@ fn a_broken_export_of_this_family_reports_its_own_defect() {
     .expect("writes");
     let metal = shiso_metal::MetalBackend::new().expect("the Metal library compiles");
     let backend: Arc<dyn Backend> = metal;
-    let err = open_speech_recognizer(dir.path(), &backend).expect_err("refused");
+    let err = open_speech_recognizer(dir.path(), &RecognizerDesc::default(), &backend)
+        .expect_err("refused");
     let text = err.to_string();
     assert!(!text.contains("no speech recognizer family"), "{text}");
     assert!(text.contains("prompt"), "{text}");

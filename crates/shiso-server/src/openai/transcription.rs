@@ -100,6 +100,7 @@ async fn answer(state: &AppState, multipart: Multipart) -> Result<Response, AppE
         pcm,
         language: form.language.clone().map_or(Language::Auto, Language::Tag),
         diarize,
+        streaming: form.stream,
     })?;
     if form.stream {
         let first = events.recv().await.ok_or_else(worker_gone)?;

@@ -1,14 +1,15 @@
 //! Log-mel frontends, every constant explicit.
 //!
-//! Two frontends are in use, and they share almost nothing but the idea:
+//! Three frontends are in use, and they share almost nothing but the idea:
 //!
-//! | | centred | left-padded |
-//! |---|---|---|
-//! | framing | `n_fft/2` zeros both sides, `n_fft`-sample frames | `win/2` zeros on the left, `win`-sample frames |
-//! | window | symmetric Hann, centred in `n_fft` | periodic Hann at the frame start |
-//! | preemphasis | over the whole signal | none |
-//! | spectrum | power | magnitude |
-//! | filterbank | Slaney scale, area-normalised | HTK scale, unnormalised |
+//! | | centred | reflect | left-padded |
+//! |---|---|---|---|
+//! | framing | `n_fft/2` zeros both sides, `n_fft`-sample frames | `n_fft/2` mirrored both sides, `n_fft`-sample frames | `win/2` zeros on the left, `win`-sample frames |
+//! | window | symmetric Hann, centred in `n_fft` | periodic Hann, centred in `n_fft` | periodic Hann at the frame start |
+//! | preemphasis | over the whole signal | none | none |
+//! | spectrum | power | power | magnitude |
+//! | filterbank | Slaney scale, area-normalised | Slaney scale, area-normalised | HTK scale, unnormalised |
+//! | log scale | natural, per frame | [`LogScale::Log10MaxFloor`], over the whole clip | natural, per frame |
 //!
 //! So nothing here has a default. A family states each field from its own
 //! checkpoint, and a mismatch is a wrong transcript, not an error. That is why
@@ -16,7 +17,7 @@
 
 use crate::error::AudioError;
 use crate::fft::{Fft, FftWork};
-use crate::num::{f32_of, f64_of};
+use crate::num::{f32_of, f64_of, i64_of, usize_of};
 
 /// The analysis window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,11 @@ pub enum Framing {
     /// `t·hop`; the window sits centred in the frame. `1 + L/hop` frames, of
     /// which `L/hop` are valid.
     Centred,
+    /// `n_fft/2` samples on each side, mirrored by reflection about the edge
+    /// sample (`[c, b, a, b, c]` around `a`: the edge sample is never
+    /// repeated) instead of zeroed; otherwise identical to [`Self::Centred`], including its frame
+    /// counts. Forbids pre-emphasis, which no frontend here combines with it.
+    CentredReflect,
     /// The signal is rounded up to `pad_to_multiple` samples with zeros, then
     /// `win/2` zeros go on the left only. Frame `t` spans `win` samples from
     /// `t·hop`, zero-filled to `n_fft`. It is valid while its last sample lies
@@ -89,6 +95,31 @@ pub enum Filterbank {
     Given(Vec<f32>),
 }
 
+/// How a mel energy becomes the log value the encoder reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LogScale {
+    /// `ln(x + guard)`, computed per frame as each row is filled.
+    Natural {
+        /// Added before the log so a silent bin does not diverge.
+        guard: f32,
+    },
+    /// `log10(max(x, 1e-10))`, then `max(v, chunk_max - 8.0)`, then
+    /// `(v + 4.0) / 4.0`, where `chunk_max` is the maximum over every valid
+    /// row of the whole computed [`MelFrames`]. The floor and rescale need
+    /// every frame's value first, so this is applied once in
+    /// [`MelFrontend::compute`] after all frames exist, not per frame; the
+    /// incremental `MelStream` frontend has no "after all frames exist" and
+    /// refuses this variant with [`AudioError::BadSpec`].
+    Log10MaxFloor,
+    /// `log10(max(x, 1e-10))` per frame: the first stage of
+    /// [`LogScale::Log10MaxFloor`] alone. A recognizer that transcribes a clip
+    /// in chunks and floors each chunk on its own maximum computes the whole
+    /// clip this way once, then finishes each chunk's rows with
+    /// [`log10_max_floor`]: the floor depends on which rows share it, so it
+    /// cannot be undone once applied over the whole clip.
+    Log10,
+}
+
 /// Every constant of one log-mel frontend.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MelSpec {
@@ -112,8 +143,8 @@ pub struct MelSpec {
     pub spectrum: Spectrum,
     /// Filterbank source.
     pub filterbank: Filterbank,
-    /// Added before the natural log.
-    pub log_guard: f32,
+    /// How a mel energy becomes a log value.
+    pub log_scale: LogScale,
 }
 
 /// Mel frames, row-major `[total][n_mels]`; rows at or past `valid` are zero.
@@ -239,11 +270,78 @@ fn bad(reason: impl Into<String>) -> AudioError {
     }
 }
 
+/// Mirrors a virtual sample position `s` (any integer, inside `0..n` or not)
+/// into `0..n` by reflection about the edge samples: the edge sample at `0`
+/// or `n - 1` is never repeated, so a period is `2*(n - 1)`. `n` must be at
+/// least 2.
+fn reflect_index(s: i64, n: i64) -> i64 {
+    let period = 2 * (n - 1);
+    let m = s.rem_euclid(period);
+    if m < n { m } else { period - m }
+}
+
+/// Fills the `left` reflect-padding samples on each side of `out`, which
+/// already holds `samples` verbatim at `out[left..left + samples.len()]`.
+fn reflect_pad(out: &mut [f64], samples: &[f32], left: usize) {
+    let n = samples.len();
+    if n == 0 {
+        return;
+    }
+    let start = left + n;
+    let right = out.len().saturating_sub(start);
+    if n == 1 {
+        // A single sample reflects onto itself from every offset.
+        let value = f64::from(samples[0]);
+        out[..left].fill(value);
+        out[start..start + right].fill(value);
+        return;
+    }
+    let nn = i64_of(n);
+    for (i, slot) in out[..left].iter_mut().enumerate() {
+        let s = i64_of(i) - i64_of(left);
+        *slot = f64::from(samples[usize_of(reflect_index(s, nn))]);
+    }
+    for (j, slot) in out[start..start + right].iter_mut().enumerate() {
+        let s = nn + i64_of(j);
+        *slot = f64::from(samples[usize_of(reflect_index(s, nn))]);
+    }
+}
+
+/// The floor-and-rescale [`LogScale::Log10MaxFloor`] finishes with, applied
+/// once over the whole computed frames: `v = max(stage-one value,
+/// chunk_max - 8)`, then `(v + 4) / 4`. `data` holds a stage-one
+/// `log10(max(x, 1e-10))` value in every row up to `valid`, written by
+/// [`MelFrontend::frame_row_with`]; rows at or past `valid` are the caller's
+/// zeroed tail and are left alone.
+fn apply_max_floor(data: &mut [f32], mels: usize, valid: usize) {
+    let head = &mut data[..valid * mels];
+    let Some(chunk_max) = head.iter().copied().reduce(f32::max) else {
+        return;
+    };
+    let floor = f64::from(chunk_max) - 8.0;
+    for slot in head.iter_mut() {
+        let v = f64::from(*slot).max(floor);
+        *slot = f32_of((v + 4.0) / 4.0);
+    }
+}
+
+/// Frames computed with [`LogScale::Log10`], finished as
+/// [`LogScale::Log10MaxFloor`] would finish exactly these frames: the floor at
+/// their own maximum less 8, then `(v + 4) / 4`. Computing a clip with
+/// [`LogScale::Log10`] and finishing it here gives the same values as
+/// computing it with [`LogScale::Log10MaxFloor`].
+#[must_use]
+pub fn log10_max_floor(mel: &MelFrames) -> MelFrames {
+    let mut data = mel.as_slice().to_vec();
+    apply_max_floor(&mut data, mel.n_mels(), mel.valid());
+    MelFrames::from_parts(data, mel.n_mels(), mel.total(), mel.valid())
+}
+
 /// The analysis window, placed in an `n_fft`-long vector as the framing asks.
 fn window(spec: &MelSpec) -> Vec<f64> {
     let len = spec.win_length;
     let offset = match spec.framing {
-        Framing::Centred => (spec.n_fft - len) / 2,
+        Framing::Centred | Framing::CentredReflect => (spec.n_fft - len) / 2,
         Framing::LeftPadded { .. } => 0,
     };
     let denom = match spec.window {
@@ -329,8 +427,10 @@ impl MelFrontend {
         if spec.hop_length == 0 || spec.n_mels == 0 {
             return Err(bad("hop_length and n_mels must be positive"));
         }
-        if spec.log_guard.is_nan() || spec.log_guard <= 0.0 {
-            return Err(bad("log_guard must be positive"));
+        if let LogScale::Natural { guard } = spec.log_scale
+            && (guard.is_nan() || guard <= 0.0)
+        {
+            return Err(bad("a natural log_scale guard must be positive"));
         }
         if let Framing::LeftPadded { pad_to_multiple } = spec.framing {
             if pad_to_multiple == 0 {
@@ -341,6 +441,11 @@ impl MelFrontend {
                     "left-padded framing with pre-emphasis is not a frontend any model here uses",
                 ));
             }
+        }
+        if spec.framing == Framing::CentredReflect && spec.preemphasis != Preemphasis::None {
+            return Err(bad(
+                "reflect framing with pre-emphasis is not a frontend any model here uses",
+            ));
         }
         let window = window(&spec);
         let bank = filterbank(&spec, bins)?;
@@ -378,7 +483,7 @@ impl MelFrontend {
     pub fn valid_frames(&self, samples: usize) -> usize {
         let hop = self.spec.hop_length;
         match self.spec.framing {
-            Framing::Centred => samples / hop,
+            Framing::Centred | Framing::CentredReflect => samples / hop,
             Framing::LeftPadded { .. } => {
                 // t·hop + win < win/2 + L  <=>  t·hop < L − (win − win/2)
                 let reach = self.spec.win_length - self.spec.win_length / 2;
@@ -395,7 +500,7 @@ impl MelFrontend {
     fn total_frames(&self, samples: usize) -> usize {
         let hop = self.spec.hop_length;
         match self.spec.framing {
-            Framing::Centred => 1 + samples / hop,
+            Framing::Centred | Framing::CentredReflect => 1 + samples / hop,
             Framing::LeftPadded { pad_to_multiple } => {
                 let padded =
                     samples.div_ceil(pad_to_multiple) * pad_to_multiple + self.spec.win_length / 2;
@@ -412,7 +517,9 @@ impl MelFrontend {
     /// The pre-emphasised, padded signal the frames are cut from.
     pub(crate) fn padded(&self, samples: &[f32]) -> Vec<f64> {
         let (left, len) = match self.spec.framing {
-            Framing::Centred => (self.spec.n_fft / 2, samples.len() + self.spec.n_fft),
+            Framing::Centred | Framing::CentredReflect => {
+                (self.spec.n_fft / 2, samples.len() + self.spec.n_fft)
+            }
             Framing::LeftPadded { pad_to_multiple } => {
                 let left = self.spec.win_length / 2;
                 (
@@ -436,6 +543,12 @@ impl MelFrontend {
                 }
             };
             prev = x;
+        }
+        // Reflect framing forbids pre-emphasis (checked in `new`), so `out`
+        // still holds the real samples verbatim; mirror them into the
+        // padding on each side instead of leaving it zero.
+        if self.spec.framing == Framing::CentredReflect {
+            reflect_pad(&mut out, samples, left);
         }
         out
     }
@@ -464,7 +577,7 @@ impl MelFrontend {
     ) {
         let n = self.fft.len();
         let span = match self.spec.framing {
-            Framing::Centred => n,
+            Framing::Centred | Framing::CentredReflect => n,
             Framing::LeftPadded { .. } => self.spec.win_length,
         };
         work.fft.frame.fill(0.0);
@@ -487,7 +600,6 @@ impl MelFrontend {
             };
         }
         let bins = n / 2 + 1;
-        let guard = f64::from(self.spec.log_guard);
         for (m, slot) in out.iter_mut().enumerate() {
             let (first, last) = self.support[m];
             let row = &self.bank[m * bins + first..m * bins + last];
@@ -496,7 +608,12 @@ impl MelFrontend {
                 .zip(&work.power[first..last])
                 .map(|(w, s)| f64::from(*w) * s)
                 .sum();
-            *slot = f32_of((e + guard).ln());
+            *slot = match self.spec.log_scale {
+                LogScale::Natural { guard } => f32_of((e + f64::from(guard)).ln()),
+                // Stage one only; the floor and rescale need every frame's
+                // value first, so `MelFrontend::compute` finishes the job.
+                LogScale::Log10MaxFloor | LogScale::Log10 => f32_of(e.max(1e-10).log10()),
+            };
         }
     }
 
@@ -528,6 +645,9 @@ impl MelFrontend {
                 });
             }
         });
+        if matches!(self.spec.log_scale, LogScale::Log10MaxFloor) {
+            apply_max_floor(&mut data, mels, valid);
+        }
         MelFrames::from_parts(data, mels, total, valid)
     }
 }

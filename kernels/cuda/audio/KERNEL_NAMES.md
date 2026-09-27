@@ -2,12 +2,12 @@
 
 The lookup table a loader resolves a kernel through. The module is loaded by
 its registry key, `audio`; every entry carries C linkage, so each name below is
-the name the driver answers to, verbatim. The same twenty-two names are the
+the name the driver answers to, verbatim. The same names are the
 Metal twin's (`crates/shiso-metal/metal/audio`) and the host's literals in
 `crates/shiso-models/src/audio_ops`; `shiso_kerneltest::audio::cases::ENTRIES`
 holds them, and `crates/shiso-cuda/tests/audio_kernels.rs` resolves every one.
 
-## Module `audio` — 33 entries
+## Module `audio` — 87 entries
 
 ```
 kernel_audio_unary_f32
@@ -31,6 +31,7 @@ kernel_audio_gemv_f16w
 kernel_audio_gemv_q8_0w
 kernel_audio_split_sum_f32
 kernel_audio_conv2d_s2_f32
+kernel_audio_im2col_s2_f32
 kernel_audio_dwconv1d_f32
 kernel_audio_unfold_f32
 kernel_audio_transpose_f32
@@ -43,4 +44,57 @@ kernel_audio_greedy_step_u32
 kernel_audio_embed_row_f32
 kernel_audio_lstm_cell_gated_f32
 kernel_audio_keep_f32
+kernel_audio_rope_half_state_f32
+kernel_audio_kv_append_f32
+kernel_audio_causal_attn_f32
+kernel_audio_decode_attn_f32
+kernel_audio_decode_attn_merge_f32
+kernel_audio_decode_step_u32
+kernel_audio_embed_token_f32w
+kernel_audio_embed_token_bf16w
+kernel_audio_embed_token_f16w
+kernel_audio_embed_token_q8_0w
+kernel_audio_embed_token_affine8w
+kernel_audio_silu_mul_f32
+kernel_audio_matvec_f32w
+kernel_audio_matvec_bf16w
+kernel_audio_matvec_f16w
+kernel_audio_matvec_q8_0w
+kernel_audio_matvec3_f32w
+kernel_audio_matvec3_bf16w
+kernel_audio_matvec3_f16w
+kernel_audio_matvec3_q8_0w
+kernel_audio_matvec_silu_f32w
+kernel_audio_matvec_silu_bf16w
+kernel_audio_matvec_silu_f16w
+kernel_audio_matvec_silu_q8_0w
+kernel_audio_add_rms_norm_f32
+kernel_audio_qk_norm_rope_append_f32
+kernel_audio_argmax_split_f32
+kernel_audio_argmax_merge_f32
+kernel_audio_gemm_affine8w
+kernel_audio_gemm64_affine8w
+kernel_audio_matvec_affine8w
+kernel_audio_matvec3_affine8w
+kernel_audio_matvec_silu_affine8w
+kernel_audio_causal_attn_seg_f32
+kernel_audio_qk_norm_rope_append_seg_f32
+kernel_audio_qk_norm_rope_append_batch_f32
+kernel_audio_decode_attn_batch_f32
+kernel_audio_decode_step_batch_u32
+kernel_audio_embed_token_batch_f32w
+kernel_audio_embed_token_batch_bf16w
+kernel_audio_embed_token_batch_f16w
+kernel_audio_embed_token_batch_q8_0w
+kernel_audio_embed_token_batch_affine8w
+kernel_audio_matvec_rows_f32w
+kernel_audio_matvec_rows_bf16w
+kernel_audio_matvec_rows_f16w
+kernel_audio_matvec_rows_q8_0w
+kernel_audio_matvec_rows_affine8w
+kernel_audio_matvec_silu_rows_f32w
+kernel_audio_matvec_silu_rows_bf16w
+kernel_audio_matvec_silu_rows_f16w
+kernel_audio_matvec_silu_rows_q8_0w
+kernel_audio_matvec_silu_rows_affine8w
 ```

@@ -23,6 +23,7 @@
 use shiso_core::DType;
 use shiso_core::error::CoreResult;
 use shiso_core::ids::{SessionId, TokenId};
+use shiso_core::media::MediaKey;
 use shiso_engine::CacheStats;
 use shiso_engine::ckpt::{Checkpointed, CkptConfig, ResumeInfo, SaveOutcome};
 use shiso_engine::{CkptIdentity, PumpReport, Reason};
@@ -98,6 +99,15 @@ impl Checkpointed for Qwen4ExpModel {
 
     fn kv_set_hints(&mut self, session: SessionId, hints: &[u32]) -> CoreResult<()> {
         self.stack_mut().ckpt_set_hints(session, hints)
+    }
+
+    fn kv_set_media_key(
+        &mut self,
+        session: SessionId,
+        prompt: &[TokenId],
+        key: MediaKey<'_>,
+    ) -> CoreResult<()> {
+        self.stack_mut().ckpt_set_media_key(session, prompt, key)
     }
 
     fn kv_pump(&mut self, max_bytes: u64) -> CoreResult<PumpReport> {

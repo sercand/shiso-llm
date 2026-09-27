@@ -217,6 +217,75 @@ type RecognizerPush = fn(
 ) -> Result<Vec<shiso_audio::TokenEvent>, shiso_audio::AudioError>;
 const _: RecognizerPush = <dyn shiso_audio::RecognizerStream>::push;
 
+/// A chunking recognizer is told where its chunks end, in mel frames from the
+/// stream's start, and says whether it honours that.
+fn stream_cuts(options: shiso_audio::StreamOptions) -> Option<Vec<u32>> {
+    options.cuts
+}
+const _: fn(shiso_audio::StreamOptions) -> Option<Vec<u32>> = stream_cuts;
+type ChunksAtCuts = fn(&(dyn shiso_audio::SpeechRecognizer + 'static)) -> bool;
+const _: ChunksAtCuts = <dyn shiso_audio::SpeechRecognizer>::chunks_at_cuts;
+
+/// A stream may name the language it read out of the model's words, and a
+/// chunking stream reports where its chunks ended, which ends its words.
+type StreamLanguage =
+    for<'a> fn(&'a (dyn shiso_audio::RecognizerStream + 'static)) -> Option<&'a str>;
+const _: StreamLanguage = <dyn shiso_audio::RecognizerStream>::language;
+type ChunkEnds = for<'a> fn(&'a (dyn shiso_audio::RecognizerStream + 'static)) -> &'a [u32];
+const _: ChunkEnds = <dyn shiso_audio::RecognizerStream>::chunk_ends;
+
+/// The two chunk plans the worker and the chunking stream share: the
+/// diarizer's turns over the mel frames, and the silence rule.
+type TurnCuts =
+    fn(&shiso_audio::transcript::SpeakerActivity, &shiso_audio::MelFrames, f64) -> Vec<usize>;
+const _: TurnCuts = shiso_audio::chunks::turn_cuts;
+type SilenceCuts = fn(&shiso_audio::MelFrames, usize, usize, usize) -> Vec<usize>;
+const _: SilenceCuts = shiso_audio::chunks::silence_cuts;
+
+/// A clip recognised offline is planned whole into spans, which a batching
+/// recognizer transcribes a batch at a time; one that does not batch says 0.
+type PlanOffline = fn(
+    &shiso_audio::MelFrames,
+    Option<&shiso_audio::transcript::SpeakerActivity>,
+    f64,
+    &shiso_audio::chunks::OfflineRule,
+) -> Result<Vec<shiso_audio::chunks::Span>, shiso_audio::AudioError>;
+const _: PlanOffline = shiso_audio::chunks::plan_offline;
+const _: fn(bool) -> shiso_audio::chunks::OfflineRule =
+    shiso_audio::chunks::OfflineRule::for_10ms_mel;
+const _: fn(usize, usize, bool) -> shiso_audio::chunks::Span =
+    |start, end, transcribe| shiso_audio::chunks::Span {
+        start,
+        end,
+        transcribe,
+    };
+type BatchesOffline = fn(&(dyn shiso_audio::SpeechRecognizer + 'static)) -> usize;
+const _: BatchesOffline = <dyn shiso_audio::SpeechRecognizer>::batches_offline;
+type OpenOffline = fn(
+    &(dyn shiso_audio::SpeechRecognizer + 'static),
+    &shiso_audio::StreamOptions,
+    Vec<shiso_audio::chunks::Span>,
+) -> Result<Box<dyn shiso_audio::OfflineJob>, shiso_audio::AudioError>;
+const _: OpenOffline = <dyn shiso_audio::SpeechRecognizer>::open_offline;
+type OfflineStep = fn(
+    &mut (dyn shiso_audio::OfflineJob + 'static),
+    &shiso_audio::MelFrames,
+) -> Result<Option<shiso_audio::OfflineBatch>, shiso_audio::AudioError>;
+const _: OfflineStep = <dyn shiso_audio::OfflineJob>::step;
+const _: fn(Vec<shiso_audio::SpanResult>) -> shiso_audio::OfflineBatch =
+    |spans| shiso_audio::OfflineBatch { spans };
+const _: fn(
+    shiso_audio::chunks::Span,
+    Vec<shiso_audio::TokenEvent>,
+    u32,
+    Option<String>,
+) -> shiso_audio::SpanResult = |span, tokens, chunk_end, language| shiso_audio::SpanResult {
+    span,
+    tokens,
+    chunk_end,
+    language,
+};
+
 /// A diarizer answers one whole clip with one activity block.
 type Diarize = fn(
     &(dyn shiso_audio::Diarizer + 'static),
@@ -237,9 +306,16 @@ const _: AudioEncode = <dyn shiso_audio::AudioTower>::encode;
 type OpenRecognizer =
     fn(
         &std::path::Path,
+        &shiso_models::audio_registry::RecognizerDesc<'_>,
         &std::sync::Arc<dyn Backend>,
     ) -> Result<std::sync::Arc<dyn shiso_audio::SpeechRecognizer>, shiso_audio::AudioError>;
 const _: OpenRecognizer = shiso_models::audio_registry::open_speech_recognizer;
+/// The recognizer's open-time knobs: the tower file and the offline batch.
+const _: fn(Option<&std::path::Path>, usize) -> shiso_models::audio_registry::RecognizerDesc<'_> =
+    |mmproj, offline_batch| shiso_models::audio_registry::RecognizerDesc {
+        mmproj,
+        offline_batch,
+    };
 type OpenDiarizer =
     fn(
         &std::path::Path,

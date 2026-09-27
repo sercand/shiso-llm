@@ -41,13 +41,18 @@ pub(crate) struct FftWork {
 impl Fft {
     /// Plans a transform of `n` points.
     ///
+    /// `realfft` plans any size, power of two or not: it factors `n` and
+    /// picks the fastest decomposition it has, falling back to Bluestein's
+    /// algorithm for a prime it cannot factor. One reflect-framed frontend
+    /// here uses `n_fft = 400`, which is `2^4 * 5^2`, plain mixed-radix.
+    ///
     /// # Errors
     ///
-    /// [`AudioError::BadSpec`] unless `n` is a power of two of at least 2.
+    /// [`AudioError::BadSpec`] unless `n >= 2`.
     pub(crate) fn new(n: usize) -> Result<Self, AudioError> {
-        if n < 2 || !n.is_power_of_two() {
+        if n < 2 {
             return Err(AudioError::BadSpec {
-                reason: format!("n_fft {n} is not a power of two >= 2"),
+                reason: format!("n_fft {n} must be at least 2"),
             });
         }
         let plan = RealFftPlanner::<f64>::new().plan_fft_forward(n);

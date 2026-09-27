@@ -12,6 +12,11 @@
 //! listening frees its slot at the job's next event. A diarized job's
 //! speaker pass runs on a third thread, over a third backend instance, while
 //! its words are recognised.
+//!
+//! A long clip nobody reads as it streams goes another way on a recognizer
+//! that batches ([`SpeechRecognizer::batches_offline`]): it is planned whole
+//! into spans - at the diarizer's turns when one is loaded, with long
+//! silences skipped - and transcribed a batch of spans a turn.
 
 mod diarize;
 mod worker;
@@ -32,6 +37,11 @@ use crate::error::AppError;
 /// also the memory one request may pin.
 pub const DEFAULT_MAX_UPLOAD_BYTES: usize = 512 * 1024 * 1024;
 
+/// The shortest clip, in seconds, that goes offline when nothing else is
+/// configured: 5 minutes. A shorter clip keeps the chunk-by-chunk path, whose
+/// first text arrives a chunk in and whose whole run is short anyway.
+pub const DEFAULT_OFFLINE_MIN_SECS: u32 = 300;
+
 /// One transcription to run.
 #[derive(Debug)]
 pub struct TranscriptionJob {
@@ -41,6 +51,10 @@ pub struct TranscriptionJob {
     pub language: Language,
     /// Whether to attribute each word to a speaker.
     pub diarize: bool,
+    /// Whether the caller reads the events as they come (`stream=true`).
+    /// Such a job keeps the chunk-by-chunk path, whose first text arrives a
+    /// chunk in; an offline job's arrives a batch in.
+    pub streaming: bool,
 }
 
 /// What a job reports, in order.
@@ -106,6 +120,11 @@ pub struct AudioServiceDesc {
     pub ffmpeg: Option<FfmpegPolicy>,
     /// The largest request body the transcription routes read.
     pub max_upload_bytes: usize,
+    /// The shortest decoded clip, in seconds, that a non-streaming job
+    /// transcribes offline on a recognizer that batches; 0 sends every one.
+    pub offline_min_secs: u32,
+    /// Whether an offline job skips the long silences its diarizer finds.
+    pub skip_silence: bool,
 }
 
 /// A queued job and where its events go.

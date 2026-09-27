@@ -10,7 +10,7 @@ use std::num::NonZeroU64;
 use super::{ABS_MAX_DIM, DECODE_MAX_SIDE, decode_image, preprocess_image, target_size_for};
 use crate::config::{ImageLimits, PreprocessSpec};
 use crate::error::VisionError;
-use crate::testing::{chain, png, vision_config};
+use crate::testing::{chain, encoded, png, vision_config};
 
 /// The shipped grid unit: a 16-pixel patch under a 2x2 merger.
 const GU: u32 = 32;
@@ -625,4 +625,23 @@ fn the_declared_limit_reaches_the_sizing_step() {
         small_h < big_h,
         "the bound did not shrink {big_h} to {small_h}"
     );
+}
+
+/// WebP and BMP decode in process, like PNG: the same picture in each format
+/// becomes the same item, so nothing downstream can tell which one was sent.
+#[test]
+fn webp_and_bmp_decode_to_the_same_item_as_png() {
+    let rgb = [30, 144, 255];
+    let want = preprocess_image(&png(64, 48, rgb), &qwen(), ImageLimits::default())
+        .expect("a PNG preprocesses");
+    for format in [image::ImageFormat::WebP, image::ImageFormat::Bmp] {
+        let got = preprocess_image(
+            &encoded(64, 48, rgb, format),
+            &qwen(),
+            ImageLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("{format:?} did not preprocess: {error}"));
+        assert_eq!(got.grid(), want.grid(), "{format:?} grid");
+        assert_eq!(got.as_flat(), want.as_flat(), "{format:?} pixels");
+    }
 }

@@ -35,6 +35,8 @@ struct Running {
     pass: Box<dyn DiarizationPass>,
     events: mpsc::UnboundedSender<TranscriptEvent>,
     reply: std_mpsc::Sender<Reply>,
+    /// When the pass began, for the debug line its answer logs.
+    began: std::time::Instant,
 }
 
 /// The thread body: runs until the recognizer's thread drops its sender.
@@ -62,7 +64,12 @@ pub(super) fn run(diarizer: &dyn Diarizer, rx: &std_mpsc::Receiver<Request>) {
             match stepped {
                 Ok(Ok(None)) => i += 1,
                 Ok(Ok(Some(activity))) => {
-                    let _gone = running.swap_remove(i).reply.send(Ok(activity));
+                    let done = running.swap_remove(i);
+                    tracing::debug!(
+                        pass_ms = done.began.elapsed().as_secs_f64() * 1e3,
+                        "a diarization pass answered"
+                    );
+                    let _gone = done.reply.send(Ok(activity));
                 }
                 Ok(Err(error)) => {
                     let _gone = running.swap_remove(i).reply.send(Err(error));
@@ -87,6 +94,7 @@ fn begin(diarizer: &dyn Diarizer, request: Request, running: &mut Vec<Running>) 
             pass,
             events,
             reply,
+            began: std::time::Instant::now(),
         }),
         Ok(Err(error)) => {
             let _gone = reply.send(Err(error));

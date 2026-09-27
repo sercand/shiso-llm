@@ -314,6 +314,19 @@ fn install_log() {
 }
 
 /// The renderer with the audio tower attached, as the binary's boot does.
+/// The towers the engine is spawned with; no encode cache, so every item is
+/// encoded afresh and the two answers compared are the towers' own.
+fn towers(
+    vision: VisionTower,
+    audio: Option<Arc<dyn shiso_audio::AudioTower>>,
+) -> shiso_server::media::MediaTowers {
+    shiso_server::media::MediaTowers {
+        vision: Some(vision),
+        audio,
+        cache: None,
+    }
+}
+
 fn with_audio(
     renderer: shiso_server::tokenizer::render_prompt::PromptRenderer,
     audio: Option<Arc<dyn shiso_audio::AudioTower>>,
@@ -438,10 +451,7 @@ impl Stack {
         let (engine, join) = spawn_engine_with_checkpoints(
             Arc::clone(&backend),
             loaded,
-            shiso_server::media::MediaTowers {
-                vision: Some(tower),
-                audio,
-            },
+            towers(tower, audio),
             Some(Arc::clone(&vocabulary)),
             &model_id,
             args.ctx,

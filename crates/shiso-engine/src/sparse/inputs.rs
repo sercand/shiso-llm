@@ -166,6 +166,21 @@ pub struct DecodeRow {
     /// The absolute position it occupies in its own sequence, which is that
     /// session's own frontier.
     pub position: u32,
+    /// How far the row's rotary position trails `position`: zero for a
+    /// session that has read no picture. See [`rotary`].
+    pub rope_shift: u32,
+}
+
+/// The rotary position of sequence position `pos` in a session whose rotary
+/// stream trails by `shift`.
+///
+/// A picture occupies its grid's area in sequence positions and advances the
+/// rotary stream by only its longest extent, so after one the two numbers part
+/// for good: the cache is addressed by the first and the rotation reads the
+/// second. Saturating because the shift never exceeds the position it was
+/// measured at, and a wrap would rotate a token at a position two billion away.
+const fn rotary(pos: u32, shift: u32) -> u32 {
+    pos.saturating_sub(shift)
 }
 
 /// One token as the vocabulary row the gather indexes with.
@@ -247,6 +262,23 @@ impl InputRows {
     /// of a `vocab`-entry table, and [`CoreError::ShapeMismatch`] for a chunk
     /// with more tokens than a position can count.
     pub fn fill(&mut self, tokens: &[TokenId], pos0: u32, vocab: u32) -> CoreResult<()> {
+        self.fill_shifted(tokens, pos0, 0, vocab)
+    }
+
+    /// [`InputRows::fill`] for a session whose rotary stream trails its
+    /// sequence position by `shift`: the position row is still `pos0` onward,
+    /// and the rotary table is `pos0 - shift` onward.
+    ///
+    /// # Errors
+    ///
+    /// As [`InputRows::fill`].
+    pub fn fill_shifted(
+        &mut self,
+        tokens: &[TokenId],
+        pos0: u32,
+        shift: u32,
+        vocab: u32,
+    ) -> CoreResult<()> {
         let n_tok = u32::try_from(tokens.len()).map_err(|_| CoreError::ShapeMismatch {
             field: "chunk rows",
             expected: u64::from(u32::MAX),
@@ -269,11 +301,12 @@ impl InputRows {
         // `pos0 - pos0 % compress`, which is never below zero - so clamping
         // them at zero fills a region rather than inventing a position.
         self.mrope.clear();
+        let rope0 = rotary(pos0, shift);
         for back in (1..=MROPE_BACK).rev() {
-            push_row(&mut self.mrope, position(pos0.saturating_sub(back)));
+            push_row(&mut self.mrope, position(rope0.saturating_sub(back)));
         }
         for i in 0..n_tok {
-            push_row(&mut self.mrope, position(pos0.saturating_add(i)));
+            push_row(&mut self.mrope, position(rope0.saturating_add(i)));
         }
         // A text chunk splices nothing, and a stale map left from an earlier
         // media chunk of the same stack would name encoder rows for tokens that
@@ -371,6 +404,10 @@ impl InputRows {
         self.positions
             .extend((0..n_tok).map(|i| position(pos0.saturating_add(i))));
 
+        // Read before the walk moves: the head-of-request prefix steps back
+        // from where this chunk's rotary stream starts, not from its sequence
+        // position, which after a picture is a different number.
+        let rope0 = walk.rotary();
         self.streams.clear();
         walk.chunk(tokens, &mut self.streams);
         let walked = self.streams.t.len();
@@ -395,7 +432,7 @@ impl InputRows {
             // its own end marker - so the rows this names are text tokens'.
             None => {
                 for back in (1..=MROPE_BACK).rev() {
-                    push_row(&mut self.mrope, position(pos0.saturating_sub(back)));
+                    push_row(&mut self.mrope, position(rope0.saturating_sub(back)));
                 }
             }
         }
@@ -520,28 +557,33 @@ impl InputRows {
         // - no launch of a batched pass reads it, and filling it is cheaper than
         // leaving a hole a later reader would have to be trusted not to touch.
         self.mrope.clear();
-        let first = rows[0].position;
+        let first = rotary(rows[0].position, rows[0].rope_shift);
         for back in (1..=MROPE_BACK).rev() {
             push_row(&mut self.mrope, position(first.saturating_sub(back)));
         }
         for row in rows {
-            push_row(&mut self.mrope, position(row.position));
+            push_row(
+                &mut self.mrope,
+                position(rotary(row.position, row.rope_shift)),
+            );
         }
         // Region two: one group per row, that row's own lookback and then its
         // own position, which is what the pooled-key pass for that row is bound
         // at.
         for row in rows {
+            let at = rotary(row.position, row.rope_shift);
             for back in (1..=MROPE_BACK).rev() {
-                push_row(&mut self.mrope, position(row.position.saturating_sub(back)));
+                push_row(&mut self.mrope, position(at.saturating_sub(back)));
             }
-            push_row(&mut self.mrope, position(row.position));
+            push_row(&mut self.mrope, position(at));
         }
         self.splice.clear();
         Ok(())
     }
 
     /// The three rows for a segmented pass: each run's tokens at its own
-    /// session's consecutive positions from `first`, in run order.
+    /// session's consecutive positions from `first`, in run order, rotated
+    /// `shift` positions behind them (see [`DecodeRow::rope_shift`]).
     ///
     /// The rotary table is the batch's two regions with a run in place of a
     /// row: every row of the pass one row apart, then one group per run - its
@@ -552,8 +594,8 @@ impl InputRows {
     ///
     /// [`CoreError::ShapeMismatch`] for no runs or an empty one, and
     /// [`CoreError::InvalidValue`] for a token outside the vocabulary.
-    pub fn fill_segments(&mut self, runs: &[(&[TokenId], u32)], vocab: u32) -> CoreResult<()> {
-        if runs.is_empty() || runs.iter().any(|(tokens, _)| tokens.is_empty()) {
+    pub fn fill_segments(&mut self, runs: &[(&[TokenId], u32, u32)], vocab: u32) -> CoreResult<()> {
+        if runs.is_empty() || runs.iter().any(|(tokens, _, _)| tokens.is_empty()) {
             return Err(CoreError::ShapeMismatch {
                 field: "segmented pass runs",
                 expected: 1,
@@ -562,7 +604,7 @@ impl InputRows {
         }
         self.ids.clear();
         self.positions.clear();
-        for (tokens, first) in runs {
+        for (tokens, first, _) in runs {
             for (i, token) in tokens.iter().enumerate() {
                 self.ids.push(vocabulary_row(*token, vocab)?);
                 let at = first.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
@@ -570,22 +612,26 @@ impl InputRows {
             }
         }
         self.mrope.clear();
-        let lead = runs.first().map_or(0, |(_, first)| *first);
+        let lead = runs
+            .first()
+            .map_or(0, |(_, first, shift)| rotary(*first, *shift));
         for back in (1..=MROPE_BACK).rev() {
             push_row(&mut self.mrope, position(lead.saturating_sub(back)));
         }
-        for (tokens, first) in runs {
+        for (tokens, first, shift) in runs {
+            let rope0 = rotary(*first, *shift);
             for i in 0..tokens.len() {
-                let at = first.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+                let at = rope0.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
                 push_row(&mut self.mrope, position(at));
             }
         }
-        for (tokens, first) in runs {
+        for (tokens, first, shift) in runs {
+            let rope0 = rotary(*first, *shift);
             for back in (1..=MROPE_BACK).rev() {
-                push_row(&mut self.mrope, position(first.saturating_sub(back)));
+                push_row(&mut self.mrope, position(rope0.saturating_sub(back)));
             }
             for i in 0..tokens.len() {
-                let at = first.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+                let at = rope0.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
                 push_row(&mut self.mrope, position(at));
             }
         }
@@ -704,7 +750,7 @@ impl SparseStack {
             .get(&session)
             .ok_or(CoreError::UnknownSession(session))?;
         let rows = &mut staging.inputs;
-        rows.fill(tokens, live.written(), vocab)?;
+        rows.fill_shifted(tokens, live.written(), live.rope_shift, vocab)?;
 
         let scratch = &resident.scratch;
         let device = backend.as_ref();
@@ -837,6 +883,7 @@ impl SparseStack {
                 Ok(DecodeRow {
                     token: step.token,
                     position: live.written(),
+                    rope_shift: live.rope_shift,
                 })
             })
             .collect::<CoreResult<Vec<_>>>()?;
@@ -929,7 +976,7 @@ impl SparseStack {
                 let live = sessions
                     .get(session)
                     .ok_or(CoreError::UnknownSession(*session))?;
-                Ok((*tokens, live.written()))
+                Ok((*tokens, live.written(), live.rope_shift))
             })
             .collect::<CoreResult<Vec<_>>>()?;
         let rows = &mut staging.inputs;
@@ -1269,5 +1316,79 @@ mod tests {
             .fill_media(&tokens, 8, 248_320, &mut walk, Some(&[0, 0, 0]))
             .expect_err("a three-value prefix is not four rows");
         assert!(matches!(err, CoreError::ShapeMismatch { .. }), "{err:?}");
+    }
+
+    /// Every rotary row a builder wrote, as the one number all three axes
+    /// share for a text token.
+    fn rotary_rows(rows: &InputRows) -> Vec<i32> {
+        rows.mrope()
+            .chunks(axes())
+            .map(|row| {
+                assert!(
+                    row.iter().all(|axis| *axis == row[0]),
+                    "a text row: {row:?}"
+                );
+                row[0]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_shifted_chunk_rotates_behind_its_positions_and_addresses_the_cache_at_them() {
+        // A session that read a picture: sequence position 40, rotary 30.
+        let mut rows = InputRows::new();
+        rows.fill_shifted(&chunk(), 40, 10, 64)
+            .expect("every id is a row");
+        assert_eq!(
+            rows.positions(),
+            [40, 41, 42, 43],
+            "the cache is addressed linearly"
+        );
+        assert_eq!(
+            rotary_rows(&rows),
+            [26, 27, 28, 29, 30, 31, 32, 33],
+            "the lookback and the chunk both rotate from the shifted start"
+        );
+        let mut unshifted = InputRows::new();
+        unshifted.fill(&chunk(), 40, 64).expect("every id is a row");
+        rows.fill_shifted(&chunk(), 40, 0, 64)
+            .expect("every id is a row");
+        assert_eq!(rows.mrope(), unshifted.mrope(), "no shift is the text rule");
+    }
+
+    #[test]
+    fn each_decode_row_rotates_behind_its_own_position_by_its_own_shift() {
+        let batch = [
+            DecodeRow {
+                token: TokenId::new(3),
+                position: 50,
+                rope_shift: 0,
+            },
+            DecodeRow {
+                token: TokenId::new(9),
+                position: 900,
+                rope_shift: 600,
+            },
+        ];
+        let mut rows = InputRows::new();
+        rows.fill_batch(&batch, 64).expect("every id is a row");
+        assert_eq!(rows.positions(), [50, 900]);
+        let rotary = rotary_rows(&rows);
+        // Region one: the first row's lookback, then one row per batch row.
+        assert_eq!(rotary[..6], [46, 47, 48, 49, 50, 300]);
+        // Region two: each row's own lookback and position, shifted alike.
+        assert_eq!(rotary[6..], [46, 47, 48, 49, 50, 296, 297, 298, 299, 300]);
+    }
+
+    #[test]
+    fn a_segmented_run_rotates_behind_its_session_and_its_neighbour_does_not() {
+        let text = [TokenId::new(1), TokenId::new(2)];
+        let mut rows = InputRows::new();
+        rows.fill_segments(&[(&text, 10, 0), (&text, 100, 40)], 64)
+            .expect("every id is a row");
+        assert_eq!(rows.positions(), [10, 11, 100, 101]);
+        let rotary = rotary_rows(&rows);
+        assert_eq!(rotary[..8], [6, 7, 8, 9, 10, 11, 60, 61]);
+        assert_eq!(rotary[8..], [6, 7, 8, 9, 10, 11, 56, 57, 58, 59, 60, 61]);
     }
 }

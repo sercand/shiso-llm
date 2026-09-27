@@ -124,3 +124,31 @@ fn a_source_row_past_the_block_leaves_the_embedding_alone() {
     let Some(gpu) = open() else { return };
     tower::a_source_row_past_the_block_leaves_the_embedding_alone(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_operand_split_sums_back_to_its_input() {
+    let Some(gpu) = open() else { return };
+    tower::the_operand_split_sums_back_to_its_input(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_brain_float_bias_repeats_with_its_period() {
+    let Some(gpu) = open() else { return };
+    tower::the_brain_float_bias_repeats_with_its_period(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_tensor_core_attention_agrees_with_a_plain_softmax() {
+    let Some(gpu) = open() else { return };
+    tower::the_tensor_core_attention_agrees_with_a_plain_softmax(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_tensor_core_query_never_attends_across_a_group() {
+    let Some(gpu) = open() else { return };
+    tower::a_tensor_core_query_never_attends_across_a_group(&gpu);
+}

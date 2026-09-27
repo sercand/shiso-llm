@@ -461,6 +461,11 @@ impl SparseStack {
             .map(|(token, at)| crate::sparse::inputs::DecodeRow {
                 token: *token,
                 position: *at,
+                // The head attends over its own cache only, which its prompt
+                // warm-up fills at sequence positions, so it rotates at those
+                // too: a shift here and none there would be the prefill-decode
+                // mismatch the target's own shift exists to remove.
+                rope_shift: 0,
             })
             .collect::<Vec<_>>();
         self.write_placed_inputs(&rows)?;

@@ -21,4 +21,5 @@ pub mod nemotron_asr;
 pub mod nemotron_diar;
 pub mod qwen35;
 pub mod qwen35moe;
+pub mod qwen3_asr;
 pub mod qwen4exp;

@@ -8,7 +8,7 @@ use shiso_vision::EncodedRows;
 
 use super::{AudioClip, AudioTower, clip_for};
 use crate::error::AudioError;
-use crate::mel::{Filterbank, Framing, MelScale, MelSpec, Preemphasis, Spectrum, Window};
+use crate::mel::{Filterbank, Framing, LogScale, MelScale, MelSpec, Preemphasis, Spectrum, Window};
 use crate::pcm::{MODEL_RATE, Pcm};
 
 /// A tower with a real frontend and the token rule of two stride-2 stages,
@@ -61,7 +61,7 @@ fn fake(cap: usize) -> Fake {
                 f_min: 0.0,
                 f_max: 8_000.0,
             },
-            log_guard: 1e-3,
+            log_scale: LogScale::Natural { guard: 1e-3 },
         },
         cap,
     }

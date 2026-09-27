@@ -244,6 +244,7 @@ impl Stack {
             shiso_server::media::MediaTowers {
                 vision: tower,
                 audio: None,
+                cache: None,
             },
             Some(Arc::clone(&vocabulary)),
             &model_id,

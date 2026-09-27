@@ -961,3 +961,259 @@ pub fn a_source_row_past_the_block_leaves_the_embedding_alone(gpu: &Gpu) {
         );
     }
 }
+
+// -- the tensor-core path (CUDA only) ----------------------------------------
+//
+// These entries exist only where a backend compiled them; the host finds them
+// in the module's entry list and falls back to the scalar set above when they
+// are absent. The oracle is the same one, and the budget is wider for one
+// reason only: the operands are carried as two brain-floats each, about
+// sixteen bits, where the scalar set keeps twenty-four.
+
+/// Relative budget for the tensor-core attention against the plain softmax.
+///
+/// Calibrated: the widest disagreement the case below shows is between 3e-5
+/// and 4e-5 of the larger of a value and one (measured on the GB10). The bound
+/// is about three times that.
+const MMA_TOL: f32 = 1e-4;
+/// Head width of the tensor-core fixture: the served tower's, which is not a
+/// whole number of sixteen-wide steps and so exercises the zero padding.
+const MMA_HEAD_DIM: usize = 72;
+/// A group longer than one 128-query block and not a multiple of the 64-key
+/// tile, so both the partial query block and the masked key tile run.
+const MMA_PLANE: usize = 200;
+/// Queries one block owns and keys one tile stages.
+const MMA_QUERIES: usize = 128;
+const MMA_KEYS: usize = 64;
+/// `VIT_FA_HD`: the padded head width the split planes are laid out in.
+const MMA_PADDED_DIM: usize = 80;
+
+/// `vit_args_unary`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct CountArgs {
+    count: u32,
+}
+
+/// `vit_args_attention_mma`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct AttentionMmaArgs {
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+    plane: u32,
+    plane_pad: u32,
+    scale: f32,
+}
+
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+/// The operand split writes each value as its nearest brain-float and the
+/// nearest brain-float to what that left over, and the two sum back to the
+/// value to about sixteen bits.
+pub fn the_operand_split_sums_back_to_its_input(gpu: &Gpu) {
+    let count = 1000;
+    let x: Vec<f32> = oracle::signal(count, 81)
+        .iter()
+        .enumerate()
+        .map(|(i, v)| v * [1e-3, 1e-2, 0.1, 1.0, 10.0, 100.0, 1e3][i % 7])
+        .collect();
+    let d_x = gpu.upload(&f32_bytes(&x));
+    let out = gpu.upload(&vec![0u8; count * 4]);
+    launch(
+        gpu,
+        "kernel_vit_to_bf16",
+        Extent3::linear((count as u32).div_ceil(LINEAR_BLOCK)),
+        Extent3::linear(LINEAR_BLOCK),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&CountArgs {
+                count: count as u32,
+            })),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(d_x.view()),
+        ],
+    );
+    drain(gpu);
+    let bytes = gpu.read(&out);
+    let halves: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    for (i, want) in x.iter().enumerate() {
+        let hi = bf16_to_f32(halves[i]);
+        let lo = bf16_to_f32(halves[count + i]);
+        // The big half is the nearest brain-float: within half a unit of the
+        // last of its eight significant bits.
+        assert!(
+            (hi - want).abs() <= want.abs() * 2f32.powi(-8),
+            "value {i}: {hi} is not the nearest brain-float to {want}"
+        );
+        assert!(
+            (hi + lo - want).abs() <= want.abs() * 2f32.powi(-16),
+            "value {i}: {hi} + {lo} does not sum back to {want}"
+        );
+    }
+}
+
+/// The brain-float bias repeats with its period, as the projection's own
+/// epilogue would add it.
+pub fn the_brain_float_bias_repeats_with_its_period(gpu: &Gpu) {
+    let (rows, width) = (5usize, 13usize);
+    let x = oracle::signal(rows * width, 82);
+    // Values that are exact in brain-float, so the oracle needs no rounding.
+    let bias: Vec<u16> = (0..width).map(|i| (0x3f80 + i * 3) as u16).collect();
+    let d_x = gpu.upload(&f32_bytes(&x));
+    let d_bias = gpu.upload(
+        &bias
+            .iter()
+            .flat_map(|b| b.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    launch(
+        gpu,
+        "kernel_vit_add_bias_bf16",
+        Extent3::linear(((rows * width) as u32).div_ceil(LINEAR_BLOCK)),
+        Extent3::linear(LINEAR_BLOCK),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&AddArgs {
+                count: (rows * width) as u32,
+                period: width as u32,
+            })),
+            KernelArg::Buffer(d_x.view()),
+            KernelArg::Buffer(d_bias.view()),
+        ],
+    );
+    drain(gpu);
+    let want: Vec<f32> = x
+        .iter()
+        .enumerate()
+        .map(|(i, v)| v + bf16_to_f32(bias[i % width]))
+        .collect();
+    close(&gpu.read_f32(&d_x), &want, "brain-float bias");
+}
+
+/// Runs the split and the tensor-core attention over `rows` rows in groups of
+/// `plane`, `heads` heads of `MMA_HEAD_DIM`.
+fn run_attention_mma(
+    gpu: &Gpu,
+    (q, k, v): (&[f32], &[f32], &[f32]),
+    rows: usize,
+    heads: usize,
+    plane: usize,
+) -> Vec<f32> {
+    let dim = heads * MMA_HEAD_DIM;
+    let plane_pad = plane.div_ceil(MMA_KEYS) * MMA_KEYS;
+    let groups = rows / plane;
+    let args = AttentionMmaArgs {
+        rows: rows as u32,
+        heads: heads as u32,
+        head_dim: MMA_HEAD_DIM as u32,
+        plane: plane as u32,
+        plane_pad: plane_pad as u32,
+        scale: 1.0 / (MMA_HEAD_DIM as f32).sqrt(),
+    };
+    let split_bytes = 2 * heads * groups * plane_pad * MMA_PADDED_DIM * 2;
+    let keys = gpu.upload(&vec![0u8; split_bytes]);
+    let values = gpu.upload(&vec![0u8; split_bytes]);
+    let (d_q, d_k, d_v) = (
+        gpu.upload(&f32_bytes(q)),
+        gpu.upload(&f32_bytes(k)),
+        gpu.upload(&f32_bytes(v)),
+    );
+    let out = zeros(gpu, rows * dim);
+    launch(
+        gpu,
+        "kernel_vit_split_kv",
+        Extent3::linear((groups * plane_pad) as u32),
+        Extent3::linear(LINEAR_BLOCK),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(keys.view()),
+            KernelArg::Buffer(values.view()),
+            KernelArg::Buffer(d_k.view()),
+            KernelArg::Buffer(d_v.view()),
+        ],
+    );
+    launch(
+        gpu,
+        "kernel_vit_attention_mma",
+        Extent3::new(
+            heads as u32,
+            (groups * plane.div_ceil(MMA_QUERIES)) as u32,
+            1,
+        ),
+        Extent3::linear(256),
+        // `VIT_FA_SMEM`: two staged tiles.
+        2 * 2 * 2 * (64 * (80 + 8) + 80 * (64 + 8)),
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(d_q.view()),
+            KernelArg::Buffer(keys.view()),
+            KernelArg::Buffer(values.view()),
+        ],
+    );
+    drain(gpu);
+    gpu.read_f32(&out)
+}
+
+/// The tensor-core attention agrees with the plain softmax over every patch,
+/// across two temporal groups, a partial query block and a masked key tile.
+pub fn the_tensor_core_attention_agrees_with_a_plain_softmax(gpu: &Gpu) {
+    let heads = 2;
+    let rows = 2 * MMA_PLANE;
+    let dim = heads * MMA_HEAD_DIM;
+    // Scaled up so the softmax is peaked rather than nearly uniform: a flat
+    // distribution would hide an error in the maximum's bookkeeping.
+    let scaled = |seed| -> Vec<f32> {
+        oracle::signal(rows * dim, seed)
+            .iter()
+            .map(|v| v * 4.0)
+            .collect()
+    };
+    let (q, k, v) = (scaled(91), scaled(92), oracle::signal(rows * dim, 93));
+    let got = run_attention_mma(gpu, (&q, &k, &v), rows, heads, MMA_PLANE);
+    let want = attention_oracle(&q, &k, &v, rows, heads, MMA_HEAD_DIM, MMA_PLANE);
+    for (index, (&g, &w)) in got.iter().zip(&want).enumerate() {
+        let bound = MMA_TOL * w.abs().max(1.0);
+        assert!(
+            (g - w).abs() <= bound,
+            "tensor-core attention [{index}]: got {g}, want {w}, bound {bound}"
+        );
+    }
+}
+
+/// The first group's rows come out the same whether or not a second group
+/// follows it: no query reads a key across the boundary, padding included.
+pub fn a_tensor_core_query_never_attends_across_a_group(gpu: &Gpu) {
+    let heads = 2;
+    let dim = heads * MMA_HEAD_DIM;
+    let rows = 2 * MMA_PLANE;
+    let (q, k, v) = (
+        oracle::signal(rows * dim, 94),
+        oracle::signal(rows * dim, 95),
+        oracle::signal(rows * dim, 96),
+    );
+    let both = run_attention_mma(gpu, (&q, &k, &v), rows, heads, MMA_PLANE);
+    let first = MMA_PLANE * dim;
+    let alone = run_attention_mma(
+        gpu,
+        (&q[..first], &k[..first], &v[..first]),
+        MMA_PLANE,
+        heads,
+        MMA_PLANE,
+    );
+    assert_eq!(
+        both[..first],
+        alone[..],
+        "the first group moved when a second joined it"
+    );
+}

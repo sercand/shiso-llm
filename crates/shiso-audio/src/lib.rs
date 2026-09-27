@@ -9,6 +9,7 @@
 //! their detokenization, and transcript assembly.
 #![forbid(unsafe_code)]
 
+pub mod chunks;
 mod decode;
 mod diarizer;
 mod error;
@@ -28,10 +29,14 @@ pub use decode::{DecodeLimits, decode_audio, sniff_container};
 pub use diarizer::{DiarizationPass, Diarizer};
 pub use error::AudioError;
 pub use mel::{
-    Filterbank, Framing, MelFrames, MelFrontend, MelScale, MelSpec, Preemphasis, Spectrum, Window,
+    Filterbank, Framing, LogScale, MelFrames, MelFrontend, MelScale, MelSpec, Preemphasis,
+    Spectrum, Window, log10_max_floor,
 };
 pub use mel_stream::MelStream;
 pub use pcm::{MODEL_RATE, Pcm};
-pub use recognizer::{Language, RecognizerStream, SpeechRecognizer, StreamOptions, TokenEvent};
+pub use recognizer::{
+    Language, OfflineBatch, OfflineJob, RecognizerStream, SpanResult, SpeechRecognizer,
+    StreamOptions, TokenEvent,
+};
 pub use tower::{AudioClip, AudioTower, clip_for};
 pub use vocab::{Detokenizer, PieceVocab};

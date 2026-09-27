@@ -30,6 +30,8 @@ pub const DEFAULT_PORT: u16 = 8090;
 pub const DEFAULT_CTX: u32 = 4096;
 /// The default floor below which the disk tier stores and reads nothing.
 pub const DEFAULT_KVSTORE_MIN_TOKENS: u32 = shiso_engine::CKPT_MIN_TOKENS_DEFAULT;
+/// The default device memory kept for the towers' output, in mebibytes.
+pub const DEFAULT_VISION_CACHE_MB: u64 = 1024;
 /// The default host staging the disk tier's writes may hold, in mebibytes.
 pub const DEFAULT_KVSTORE_STAGING_MB: u64 = 1024;
 /// The default checkpoint pages one scheduler tick copies for the disk tier, in
@@ -324,6 +326,16 @@ pub struct ServeArgs {
     #[arg(long, env = "SHISO_DRAFT_VOCAB")]
     pub draft_vocab: Option<PathBuf>,
 
+    /// Device memory kept for the towers' output, in mebibytes: a picture seen
+    /// before is neither decoded nor encoded again while its rows are here.
+    ///
+    /// A picture's rows are one per placeholder token, a few megabytes each,
+    /// so the default holds a long agent session's screenshots. It is set aside
+    /// before the key/value pool is sized, and only when `--vision` names a
+    /// tower.
+    #[arg(long, env = "SHISO_VISION_CACHE_MB", default_value_t = DEFAULT_VISION_CACHE_MB)]
+    pub vision_cache_mb: u64,
+
     /// Row-cache budget for the per-layer embedding table, in mebibytes.
     ///
     /// Read only by families with a per-layer embedding table; every other
@@ -423,6 +435,12 @@ pub struct ServeArgs {
     /// Serves `/v1/audio/transcriptions`.
     #[arg(long, env = "SHISO_ASR_MODEL")]
     pub asr_model: Option<PathBuf>,
+    /// The audio-tower GGUF (an `mmproj-*.gguf`) for a recognizer whose GGUF
+    /// export keeps its tower apart from the text model. Without it the one
+    /// mmproj beside `--asr-model` with the same quantisation suffix is taken,
+    /// and none or several is refused. Needs `--asr-model`.
+    #[arg(long, env = "SHISO_ASR_MMPROJ")]
+    pub asr_mmproj: Option<PathBuf>,
     /// The name the recognizer answers to in a transcription's `model` field.
     /// Defaults to the last component of `--asr-model`, extension removed.
     #[arg(long, env = "SHISO_ASR_ID")]
@@ -439,6 +457,35 @@ pub struct ServeArgs {
     /// Transcriptions advanced at once; the rest wait in the queue.
     #[arg(long, env = "SHISO_AUDIO_MAX_STREAMS", default_value_t = 4)]
     pub audio_max_streams: usize,
+    /// Chunks an offline transcription decodes at once, on a recognizer that
+    /// batches: one weight read per step serves this many. Streaming
+    /// requests decode one at a time whatever it is.
+    #[arg(long, env = "SHISO_ASR_BATCH", default_value_t = 8)]
+    pub asr_batch: usize,
+    /// Whether an offline transcription with a diarizer loaded leaves out
+    /// silences of 3 s or more where no speaker is active. Skipped audio
+    /// yields no text: speech the diarizer misses there is lost.
+    /// `--asr-skip-silence=false` transcribes them.
+    #[arg(
+        long,
+        env = "SHISO_ASR_SKIP_SILENCE",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        action = clap::ArgAction::Set
+    )]
+    pub asr_skip_silence: bool,
+    /// The shortest clip, in seconds, that a non-streaming transcription
+    /// plans whole and decodes in batches, on a recognizer that batches;
+    /// shorter clips keep the chunk-by-chunk path. 0 sends every
+    /// non-streaming transcription offline.
+    #[arg(
+        long,
+        env = "SHISO_ASR_OFFLINE_MIN_SECS",
+        default_value_t = crate::audio::DEFAULT_OFFLINE_MIN_SECS
+    )]
+    pub asr_offline_min_secs: u32,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -493,6 +540,9 @@ pub enum ConfigError {
     /// A diarizer was named with no recognizer to attribute speech from.
     #[error("--diarization-model needs --asr-model: a diarizer labels a transcript")]
     DiarizerWithoutRecognizer,
+    /// An audio tower was named with no recognizer to load it into.
+    #[error("--asr-mmproj needs --asr-model: it is the tower of the recognizer's text model")]
+    MmprojWithoutRecognizer,
     /// A share that is not in `(0, 1]`.
     #[error("--{flag} {value} is not a share in (0, 1]")]
     NotAShare {
@@ -579,6 +629,7 @@ impl ServeArgs {
             (self.kvstore_staging_mb, "kvstore-staging-mb"),
             (self.kvstore_pump_mb, "kvstore-pump-mb"),
             (self.kvstore_drain_secs, "kvstore-drain-secs"),
+            (self.vision_cache_mb, "vision-cache-mb"),
         ] {
             if value == 0 {
                 return Err(ConfigError::Zero { flag });
@@ -620,10 +671,16 @@ impl ServeArgs {
         if self.diarization_model.is_some() && self.asr_model.is_none() {
             return Err(ConfigError::DiarizerWithoutRecognizer);
         }
+        if self.asr_mmproj.is_some() && self.asr_model.is_none() {
+            return Err(ConfigError::MmprojWithoutRecognizer);
+        }
         if self.audio_max_streams == 0 {
             return Err(ConfigError::Zero {
                 flag: "audio-max-streams",
             });
+        }
+        if self.asr_batch == 0 {
+            return Err(ConfigError::Zero { flag: "asr-batch" });
         }
         // A head with no depth is refused here: it is a gigabyte of weights
         // made resident that nothing will ever ask a question, and no arm can
@@ -738,8 +795,9 @@ impl ServeArgs {
     /// with the sessions and the late allocations it sets aside; `None` when it
     /// was not given.
     ///
-    /// The reserve is the vision tower, when `--vision` names a file - it is
-    /// loaded after the model, so the stack cannot see it - and
+    /// The reserve is the vision tower and `--vision-cache-mb`, when
+    /// `--vision` names a file - both are allocated after the model, so the
+    /// stack cannot see them - and
     /// [`KV_FIT_HEADROOM_BYTES`]. A tower that lives inside a checkpoint
     /// directory is not counted beyond the headroom.
     ///
@@ -774,14 +832,18 @@ impl ServeArgs {
     }
 
     /// Bytes allocated after the stack is built that it cannot see: the vision
-    /// tower, when `--vision` names a file, and [`KV_FIT_HEADROOM_BYTES`].
+    /// tower and the cache of its output, when `--vision` names a file, and
+    /// [`KV_FIT_HEADROOM_BYTES`].
     fn late_reserve_bytes(&self) -> u64 {
         let tower = self
             .vision
             .as_deref()
             .and_then(|path| std::fs::metadata(path).ok())
             .filter(std::fs::Metadata::is_file)
-            .map_or(0, |meta| meta.len());
+            .map_or(0, |meta| {
+                meta.len()
+                    .saturating_add(self.vision_cache_mb.saturating_mul(1 << 20))
+            });
         tower.saturating_add(KV_FIT_HEADROOM_BYTES)
     }
 

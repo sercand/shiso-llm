@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use super::MelStream;
-use crate::mel::MelFrontend;
 use crate::mel::tests::{centred, left_padded};
+use crate::mel::{LogScale, MelFrontend};
 use crate::num::{f32_of, f64_of};
 
 #[test]
@@ -42,6 +42,17 @@ fn awkward_push_schedules_match_offline_bit_for_bit() {
 #[test]
 fn refuses_left_padded_framing() {
     let fe = Arc::new(MelFrontend::new(left_padded()).expect("valid"));
+    assert!(MelStream::new(fe).is_err());
+}
+
+#[test]
+fn refuses_the_whole_clip_log_scale() {
+    // Centred framing streams fine on its own; it is the log10-max-floor log
+    // scale, which needs every frame's value before it can floor any of
+    // them, that a stream cannot offer.
+    let mut spec = centred();
+    spec.log_scale = LogScale::Log10MaxFloor;
+    let fe = Arc::new(MelFrontend::new(spec).expect("valid"));
     assert!(MelStream::new(fe).is_err());
 }
 
