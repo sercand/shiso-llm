@@ -43,7 +43,9 @@
 //! 4.7 s keeping every row (M1 Max, HF bf16, `batched_step_and_prefill_times`).
 //!
 //! A pass over eight sequences measured 37 ms against 12 ms for one (the
-//! single path's pass): 4.7 ms a sequence. The prefill is compute-bound and
+//! single path's pass): 4.7 ms a sequence (HF bf16). With four rows a block
+//! of the multi-row kernels, a `Q8_0` pass over three sequences measured
+//! 13.3 ms and over eight 30.6 ms (M1 Max). The prefill is compute-bound and
 //! stacking gains nothing on it; it is one pass for the batch's rows so the
 //! decode can start for all of them at once.
 

@@ -213,7 +213,13 @@ fn start(
         streaming,
     } = job;
     let recognizer: &Arc<dyn SpeechRecognizer> = &desc.recognizer;
+    let began = std::time::Instant::now();
     let mel = mel_for(recognizer.mel_spec(), pcm.samples())?;
+    tracing::debug!(
+        mel_ms = began.elapsed().as_secs_f64() * 1e3,
+        frames = mel.valid(),
+        "the recognizer's mel is computed"
+    );
     if mel.valid() == 0 {
         return Err(AudioError::Empty);
     }
