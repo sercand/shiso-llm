@@ -703,6 +703,9 @@ fn a_device_failure_names_the_step_it_happened_in() {
         backend: &backend,
         eps: encoder.layer_norm_eps(),
         rope_base: encoder.rope_base(),
+        fast: super::Fast::SCALAR,
+        operand: None,
+        split: None,
     };
     match run.scratch("patch rows", 16) {
         Err(VisionError::Encode { step, .. }) => assert_eq!(step, "patch rows"),

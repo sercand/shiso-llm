@@ -26,9 +26,9 @@
 //!
 //! # Media leaves as items and pad counts, together
 //!
-//! Every media block contributes one [`VisionItem`] and one pad count, in block
-//! order, and the two vectors are built in the same pass. The count is the
-//! item's own [`VisionItem::pad_count`] rather than a number computed here,
+//! Every media block contributes one item and one pad count, in block order,
+//! and the two vectors are built in the same pass. The count is the item's own
+//! [`shiso_vision::VisionItem::pad_count`] rather than a number computed here,
 //! because the pad run in the prompt and the embedding rows the encoder returns
 //! have to be the same number and there is exactly one function that says what
 //! it is.
@@ -36,9 +36,11 @@
 use serde_json::{Value, json};
 use shiso_audio::{AudioError, AudioTower, DecodeLimits};
 use shiso_ir::{Block, MediaSource, Message, Role};
-use shiso_vision::{FfmpegPolicy, ImageLimits, PreprocessSpec, VisionError, VisionItem};
+use shiso_vision::{FfmpegPolicy, ImageLimits, PreprocessSpec, VisionError};
 
-use crate::media::MediaItem;
+use crate::media::{EncodedItem, MediaItem};
+use crate::media_cache::{MediaCache, payload_key};
+use shiso_core::media::MediaDigest;
 
 /// What the media flags allow, and what the checkpoint's tower needs.
 ///
@@ -69,6 +71,9 @@ pub struct MediaPolicy<'a> {
     /// when only WAV is accepted. Separate from the video policy because the
     /// two are switched on by separate flags, and a refusal names its own.
     pub audio_ffmpeg: Option<&'a FfmpegPolicy>,
+    /// Where an item seen before is found without decoding it. `None` decodes
+    /// every item, as every request did before there was one.
+    pub cache: Option<&'a MediaCache>,
 }
 
 /// The audio decode cap when nothing else was configured: the longest clip the
@@ -87,6 +92,7 @@ impl Default for MediaPolicy<'_> {
             audio: None,
             audio_limits: DEFAULT_AUDIO_LIMITS,
             audio_ffmpeg: None,
+            cache: None,
         }
     }
 }
@@ -154,6 +160,9 @@ pub struct Prepared {
     pub media: Vec<MediaItem>,
     /// How many pad tokens each item occupies, index for index with `media`.
     pub pad_counts: Vec<usize>,
+    /// Each item's content digest, index for index with `media`: what the
+    /// prefix cache files its placeholder run under.
+    pub digests: Vec<MediaDigest>,
 }
 
 /// Prepares a conversation.
@@ -279,33 +288,34 @@ fn render_blocks(
                 parts.extend(inner);
             }
             Block::Image(source) => {
-                let bytes = payload(source, policy, "an image")?;
-                let item = shiso_vision::preprocess_image(
-                    &bytes,
-                    tower(policy, "an image")?,
-                    policy.limits,
-                )?;
-                push_item(item, policy, out);
+                let spec = tower(policy, "an image")?;
+                push_media("an image", source, policy, out, |bytes| {
+                    let item = shiso_vision::preprocess_image(bytes, spec, policy.limits)?;
+                    Ok(MediaItem::Vision(item))
+                })?;
                 parts.push(json!({"type": "image"}));
             }
             Block::Video(source) => {
-                let bytes = payload(source, policy, "a video")?;
                 let spec = tower(policy, "a video")?;
-                let clip = shiso_vision::decode_clip(&bytes, policy.video_fps, policy.ffmpeg)?;
-                let frames =
-                    clip.into_sampled(policy.video_fps, spec.geometry.temporal_patch_size());
-                let item = shiso_vision::preprocess_video(&frames, spec, policy.limits)?;
-                push_item(item, policy, out);
+                push_media("a video", source, policy, out, |bytes| {
+                    let clip = shiso_vision::decode_clip(bytes, policy.video_fps, policy.ffmpeg)?;
+                    let frames =
+                        clip.into_sampled(policy.video_fps, spec.geometry.temporal_patch_size());
+                    let item = shiso_vision::preprocess_video(&frames, spec, policy.limits)?;
+                    Ok(MediaItem::Vision(item))
+                })?;
                 parts.push(json!({"type": "video"}));
             }
             Block::Audio(source) => {
                 let tower = policy.audio.ok_or(PreprocessError::NoAudioTower)?;
-                let bytes = payload(source, policy, "audio")?;
-                let pcm =
-                    shiso_audio::decode_audio(&bytes, &policy.audio_limits, policy.audio_ffmpeg)?;
-                let clip = shiso_audio::clip_for(tower, &pcm)?;
-                out.pad_counts.push(clip.tokens());
-                out.media.push(MediaItem::Audio(clip));
+                push_media("audio", source, policy, out, |bytes| {
+                    let pcm = shiso_audio::decode_audio(
+                        bytes,
+                        &policy.audio_limits,
+                        policy.audio_ffmpeg,
+                    )?;
+                    Ok(MediaItem::Audio(shiso_audio::clip_for(tower, &pcm)?))
+                })?;
                 parts.push(json!({"type": "audio"}));
             }
             // The block list is open: a modality added to the IR after this was
@@ -322,14 +332,47 @@ fn render_blocks(
     Ok(parts)
 }
 
-/// Records one decoded item and the pad run it will occupy.
-fn push_item(item: VisionItem, policy: &MediaPolicy<'_>, out: &mut Prepared) {
+/// Records one media item, the pad run it will occupy and its digest,
+/// decoding it only when the cache cannot stand in for it.
+///
+/// A payload the cache recognises, whose rows are still resident, becomes a
+/// [`MediaItem::Encoded`] holding those rows: nothing is base64-decoded,
+/// decoded, resized or hashed. Anything else is decoded by `decode`, digested
+/// once, and the digest remembered against the payload for the next request
+/// that carries it.
+fn push_media(
+    kind: &'static str,
+    source: &MediaSource,
+    policy: &MediaPolicy<'_>,
+    out: &mut Prepared,
+    decode: impl FnOnce(&[u8]) -> Result<MediaItem, PreprocessError>,
+) -> Result<(), PreprocessError> {
     let merge = policy
         .vision
         .map_or(1, |spec| spec.geometry.spatial_merge_size());
-    let item = MediaItem::Vision(item);
+    let key = match (policy.cache, source) {
+        (Some(_), MediaSource::Inline(value)) => Some(payload_key(kind, value)),
+        _ => None,
+    };
+    let known = policy
+        .cache
+        .zip(key.as_ref())
+        .and_then(|(cache, key)| cache.rows_for_payload(key));
+    let (item, digest) = if let Some((digest, rows)) = known {
+        (MediaItem::Encoded(EncodedItem { digest, rows }), digest)
+    } else {
+        let bytes = payload(source, policy, kind)?;
+        let item = decode(&bytes)?;
+        let digest = item.digest();
+        if let (Some(cache), Some(key)) = (policy.cache, key) {
+            cache.remember_payload(key, digest);
+        }
+        (item, digest)
+    };
     out.pad_counts.push(item.pad_count(merge));
+    out.digests.push(digest);
     out.media.push(item);
+    Ok(())
 }
 
 /// The tower's preprocessing spec, or the error a text-only checkpoint owes a

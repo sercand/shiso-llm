@@ -34,6 +34,8 @@ use shiso_vision::{FfmpegPolicy, ImageLimits, MediaPlacement, PreprocessSpec};
 use shiso_audio::{AudioTower, DecodeLimits};
 
 use crate::media::MediaItem;
+use crate::media_cache::MediaCache;
+use shiso_core::media::MediaDigest;
 
 use crate::error::AppError;
 use crate::tokenizer::Vocabulary;
@@ -54,6 +56,8 @@ pub struct Rendered {
     pub text: String,
     /// The decoded media, in the order the prompt refers to it.
     pub media: Vec<MediaItem>,
+    /// Each item's content digest, index for index with `media`.
+    pub digests: Vec<MediaDigest>,
 }
 
 impl Rendered {
@@ -143,6 +147,8 @@ pub struct PromptRenderer {
     audio: Option<Arc<dyn AudioTower>>,
     audio_limits: DecodeLimits,
     audio_ffmpeg: Option<FfmpegPolicy>,
+    /// Where a picture seen before is found without decoding it again.
+    media_cache: Option<Arc<MediaCache>>,
 }
 
 impl PromptRenderer {
@@ -179,7 +185,16 @@ impl PromptRenderer {
             audio: None,
             audio_limits: DEFAULT_AUDIO_LIMITS,
             audio_ffmpeg: None,
+            media_cache: None,
         })
+    }
+
+    /// The same renderer, finding pictures it has seen before in `cache`
+    /// rather than decoding them. The engine thread fills the same cache.
+    #[must_use]
+    pub fn with_media_cache(mut self, cache: Arc<MediaCache>) -> Self {
+        self.media_cache = Some(cache);
+        self
     }
 
     /// The same renderer with the checkpoint's own vision geometry attached.
@@ -352,6 +367,7 @@ impl PromptRenderer {
             audio: self.audio.as_deref(),
             audio_limits: self.audio_limits,
             audio_ffmpeg: self.audio_ffmpeg.as_ref(),
+            cache: self.media_cache.as_deref(),
         };
         let prepared = preprocess(&request.system, &request.messages, &policy)
             .map_err(|error| AppError::bad_request(error.to_string(), None, "invalid_media"))?;
@@ -401,6 +417,7 @@ impl PromptRenderer {
             tokens,
             text,
             media: prepared.media,
+            digests: prepared.digests,
         })
     }
 

@@ -65,7 +65,7 @@
 //! embedding it was left holding.
 
 use shiso_core::ids::TokenId;
-use shiso_core::media::{PadTokens, VisionGrid};
+use shiso_core::media::{MediaSpan, PadTokens, VisionGrid};
 
 use crate::shape::MediaPositions;
 
@@ -86,6 +86,35 @@ const fn advance(grid: VisionGrid) -> u32 {
     } else {
         spatial
     }
+}
+
+/// How far a text token's rotary position trails its sequence position once
+/// the items of `spans` that end at or before `pos` have been walked.
+///
+/// Each item under [`MediaPositions::Mrope3D`] occupies `pad_count` sequence
+/// positions and advances the rotary stream by only [`advance`] of them, so the
+/// gap is the sum of the differences - the same number a [`Walk`] over the
+/// prompt reaches as its `linear - pos`, stated without walking. Under
+/// [`MediaPositions::Linear`] the two never part.
+///
+/// `None` when `pos` falls strictly inside a run: no prefix may end there,
+/// because the next pass would start halfway through one item's grid.
+pub(crate) fn rotary_shift_at(
+    spans: &[MediaSpan],
+    pos: u32,
+    positions: MediaPositions,
+) -> Option<u32> {
+    let mut shift = 0u32;
+    for span in spans {
+        if span.splits(pos) {
+            return None;
+        }
+        if span.end() <= pos && matches!(positions, MediaPositions::Mrope3D) {
+            let grid = span.grid();
+            shift = shift.saturating_add(grid.pad_count().saturating_sub(advance(grid)));
+        }
+    }
+    Some(shift)
 }
 
 /// The five `int32` rows one chunk uploads.
@@ -213,6 +242,27 @@ impl<'a> Walk<'a> {
             linear: start,
             run: None,
         }
+    }
+
+    /// The same walk with its rotary stream starting at `pos` rather than at
+    /// the sequence position.
+    ///
+    /// A session that already read a picture stands where its rotary position
+    /// trails its sequence position, and a walk seeded with one number for both
+    /// would rotate this prompt's text as though that picture had been text.
+    pub(crate) const fn at_rotary(mut self, pos: u32) -> Self {
+        self.pos = pos;
+        self
+    }
+
+    /// The rotary position the next text token takes.
+    pub(crate) const fn rotary(&self) -> u32 {
+        self.pos
+    }
+
+    /// How far the rotary stream now trails the sequence position.
+    pub(crate) const fn shift(&self) -> u32 {
+        self.linear.saturating_sub(self.pos)
     }
 
     /// Encoder rows handed out so far.

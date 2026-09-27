@@ -48,6 +48,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::AppError;
 use crate::media::MediaItem;
 use crate::scheduler::stats::SchedulerStats;
+use shiso_core::media::MediaDigest;
 
 /// Requests the queue holds when nothing said otherwise.
 ///
@@ -131,6 +132,13 @@ pub struct GenerateRequest {
     /// request crosses a thread boundary; cloning it to cross would double the
     /// largest allocation in the request path.
     pub media: Arc<[MediaItem]>,
+    /// One digest per item of `media`, in the same order: what the prefix
+    /// cache files a media prompt's placeholder runs under.
+    ///
+    /// Computed where the request is built rather than on the engine thread,
+    /// because hashing a picture's rows is megabytes of work and that thread
+    /// is every other sequence's decode loop.
+    pub media_digests: Arc<[MediaDigest]>,
     /// Which declared tool parameters are strings, so the tool-call reader keeps
     /// them as strings. Empty for a request with no tools.
     ///
@@ -160,6 +168,7 @@ impl GenerateRequest {
             max_tokens,
             stop: Arc::from(Vec::new()),
             media: Arc::from(Vec::new()),
+            media_digests: Arc::from(Vec::new()),
             string_params: Arc::default(),
             service_class: ServiceClass::Standard,
         }
@@ -179,10 +188,16 @@ impl GenerateRequest {
         self
     }
 
-    /// The same generation, with media attached.
+    /// The same generation, with media attached, each item beside its digest.
+    ///
+    /// The digests come from whoever decoded the items, which already hashed
+    /// each one once and remembered it. A count that does not match is kept
+    /// rather than refused, and it is safe: the scheduler then files the
+    /// request under no key, as though it carried no digests at all.
     #[must_use]
-    pub fn with_media(mut self, media: Arc<[MediaItem]>) -> Self {
+    pub fn with_media(mut self, media: Arc<[MediaItem]>, digests: Arc<[MediaDigest]>) -> Self {
         self.media = media;
+        self.media_digests = digests;
         self
     }
 

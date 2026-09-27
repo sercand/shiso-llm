@@ -28,6 +28,7 @@ futures = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 minijinja = { workspace = true }
+sha2 = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -302,16 +302,77 @@ pub struct SparseSession {
     /// Message boundaries of the prompt being read, as absolute positions: a
     /// chunk stops at each so a checkpoint can be taken there.
     pub(crate) hints: Vec<u32>,
-    /// Whether any chunk spliced media rows in. Such a path is never
-    /// checkpointed: a placeholder run is one id repeated, so its tokens cannot
-    /// tell two pictures apart.
+    /// Whether any chunk spliced media rows in, or a media key was set. Such
+    /// a path is checkpointed only under [`SparseSession::key`]: a placeholder
+    /// run is one id repeated, so its own tokens cannot tell two pictures apart.
     pub(crate) media: bool,
+    /// The content-keyed path the cache files this session under, when the
+    /// host supplied one. See [`shiso_core::media::MediaKey`].
+    pub(crate) key: Option<SessionKey>,
+    /// How far this session's rotary position trails its sequence position.
+    ///
+    /// Zero until a picture has been read. A picture occupies its grid's area
+    /// in sequence positions but advances the rotary stream by only its
+    /// longest extent, and every token after it - the rest of the prompt, each
+    /// decoded token, each verified draft - rotates at `written - rope_shift`.
+    /// Rotating those at `written` instead leaves the first decoded token
+    /// hundreds of positions away from the text it answers.
+    pub(crate) rope_shift: u32,
     /// The position a resume stood this session on, zero for one prefilled
     /// from nothing.
     pub(crate) resumed_at: u32,
 }
 
+/// A media session's cache key, and its history as the cache reads it.
+#[derive(Debug)]
+pub(crate) struct SessionKey {
+    /// The prompt's key path, as long as the prompt.
+    pub(crate) prompt: Vec<TokenId>,
+    /// The prompt's items, in prompt order.
+    pub(crate) spans: Vec<shiso_core::media::MediaSpan>,
+    /// `history` with every position the prompt keyed written in its key id.
+    ///
+    /// Kept rather than derived because a commit reads it once per span and a
+    /// decode step is one span: rebuilding it there would make every token
+    /// cost a pass over the conversation.
+    pub(crate) path: Vec<TokenId>,
+}
+
+impl SessionKey {
+    /// Appends `tokens`, which sit at the positions from `at`, as the cache
+    /// reads them.
+    pub(crate) fn extend_keyed(&self, at: u32, tokens: &[TokenId], out: &mut Vec<TokenId>) {
+        let at = usize::try_from(at).unwrap_or(usize::MAX);
+        out.extend(tokens.iter().enumerate().map(|(i, token)| {
+            self.prompt
+                .get(at.saturating_add(i))
+                .copied()
+                .filter(|id| id.get() >= shiso_core::media::KEY_ID_FLOOR)
+                .unwrap_or(*token)
+        }));
+    }
+}
+
 impl SparseSession {
+    /// The path the cache files this session under: its history, with a media
+    /// prompt's placeholder runs written in their key ids.
+    #[must_use]
+    pub(crate) fn cache_path(&self) -> &[TokenId] {
+        self.key.as_ref().map_or(&self.history, |key| &key.path)
+    }
+
+    /// [`Self::cache_path`] followed by `rest`, the tokens about to be written
+    /// at the positions from [`Self::written`].
+    pub(crate) fn cache_path_with(&self, rest: &[TokenId]) -> Vec<TokenId> {
+        let mut path = Vec::with_capacity(self.history.len().saturating_add(rest.len()));
+        path.extend_from_slice(self.cache_path());
+        match &self.key {
+            Some(key) => key.extend_keyed(self.written, rest, &mut path),
+            None => path.extend_from_slice(rest),
+        }
+        path
+    }
+
     /// Absolute position of the next token this session writes.
     #[must_use]
     pub const fn written(&self) -> u32 {
@@ -374,8 +435,12 @@ impl SparseSession {
     /// other and they are fields of the same session: handed out one accessor at
     /// a time, the caller would have to copy the path, and the path is as long
     /// as the conversation.
-    pub(crate) const fn commit_parts(&mut self) -> (&mut Frontier, &[TokenId]) {
-        (self.pages.frontier_mut(), self.history.as_slice())
+    pub(crate) fn commit_parts(&mut self) -> (&mut Frontier, &[TokenId]) {
+        let path = match &self.key {
+            Some(key) => key.path.as_slice(),
+            None => self.history.as_slice(),
+        };
+        (self.pages.frontier_mut(), path)
     }
 
     /// The n-gram block's window, when this stack has one.
@@ -949,6 +1014,49 @@ impl SparseStack {
         })
     }
 
+    /// A new session's speculation state, cleared, or `None` at plain-decode
+    /// depth. `records` is the rollback slots per drafted row and
+    /// `window_bytes` one n-gram window.
+    fn fresh_spec_state(&self, records: u64, window_bytes: u64) -> CoreResult<Option<SpecState>> {
+        if !self.opts.spec.is_speculative() {
+            return Ok(None);
+        }
+        {
+            // The n-gram block's per-position records are cleared for the
+            // reason its recurrent siblings are, and not clearing them here
+            // while clearing those would be the asymmetry, not the fix: a
+            // rollback reads them, and a device allocator hands back whatever
+            // was last at that address.
+            let ngram_ckpt = self
+                .shape
+                .ple
+                .map(|_| {
+                    alloc_tagged(
+                        &self.backend,
+                        MemTag::RecurrentRollback,
+                        records.saturating_mul(window_bytes),
+                    )
+                })
+                .transpose()?;
+            if let Some(slab) = ngram_ckpt.as_ref() {
+                clear_range(&self.backend, slab)?;
+            }
+            Ok(Some(SpecState {
+                depth: self.opts.spec,
+                ngram_ckpt,
+                pending: alloc_tagged(
+                    &self.backend,
+                    MemTag::SessionOther,
+                    u64::from(self.shape.stream_dim()).saturating_mul(F32_BYTES),
+                )?,
+                pending_valid: false,
+                generated_from: 0,
+                lookup_fails: crate::sparse::mtp::FailRing::new(),
+                staged_for: 0,
+            }))
+        }
+    }
+
     /// Allocates a fresh, empty session.
     ///
     /// # Errors
@@ -1013,47 +1121,12 @@ impl SparseStack {
         let ngram_window = self
             .shape
             .ple
-            .map(|_| alloc_tagged(&self.backend, MemTag::SessionOther, window_bytes))
-            .transpose()?;
-        if let Some(window) = ngram_window.as_ref() {
-            clear_range(&self.backend, window)?;
-        }
-        let spec = if self.opts.spec.is_speculative() {
-            // The n-gram block's per-position records are cleared for the
-            // reason its recurrent siblings are, and not clearing them here
-            // while clearing those would be the asymmetry, not the fix: a
-            // rollback reads them, and a device allocator hands back whatever
-            // was last at that address.
-            let ngram_ckpt = self
-                .shape
-                .ple
-                .map(|_| {
-                    alloc_tagged(
-                        &self.backend,
-                        MemTag::RecurrentRollback,
-                        records.saturating_mul(window_bytes),
-                    )
-                })
-                .transpose()?;
-            if let Some(slab) = ngram_ckpt.as_ref() {
-                clear_range(&self.backend, slab)?;
-            }
-            Some(SpecState {
-                depth: self.opts.spec,
-                ngram_ckpt,
-                pending: alloc_tagged(
-                    &self.backend,
-                    MemTag::SessionOther,
-                    u64::from(self.shape.stream_dim()).saturating_mul(F32_BYTES),
-                )?,
-                pending_valid: false,
-                generated_from: 0,
-                lookup_fails: crate::sparse::mtp::FailRing::new(),
-                staged_for: 0,
+            .map(|_| {
+                let window = alloc_tagged(&self.backend, MemTag::SessionOther, window_bytes)?;
+                clear_range(&self.backend, &window).map(|()| window)
             })
-        } else {
-            None
-        };
+            .transpose()?;
+        let spec = self.fresh_spec_state(records, window_bytes)?;
         let pages = SessionPages::open(&self.backend, frontier, capacity)?;
         let session = SparseSession {
             id,
@@ -1066,6 +1139,8 @@ impl SparseStack {
             hints: Vec::new(),
             media: false,
             resumed_at: 0,
+            key: None,
+            rope_shift: 0,
         };
         self.sessions.insert(id, session);
         self.order.push(id);
@@ -1243,6 +1318,11 @@ impl SparseStack {
                 .sessions
                 .get_mut(&session)
                 .ok_or(CoreError::UnknownSession(session))?;
+            if let Some(key) = live.key.as_mut() {
+                let mut path = std::mem::take(&mut key.path);
+                key.extend_keyed(live.written, tokens, &mut path);
+                key.path = path;
+            }
             live.history.extend_from_slice(tokens);
             live.written = live.written.saturating_add(n_tok);
         }

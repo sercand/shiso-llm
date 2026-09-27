@@ -232,6 +232,64 @@ Three launch constraints are not visible in a signature:
   lane, bounding `head_dim` at 256, and returns without writing above that
   rather than truncating silently.
 
+### `vision` — the CUDA-only tensor-core entries (`vit_fast.cuh`)
+
+```
+kernel_vit_to_bf16
+kernel_vit_add_bias_bf16
+kernel_vit_layer_norm_split
+kernel_vit_bias_gelu_split
+kernel_vit_add_bias_residual
+kernel_vit_split_kv
+kernel_vit_qkv_rope_split
+kernel_vit_attention_mma
+```
+
+These have no Metal twin. The Qwen encoder looks for them in the module's entry
+list (`Backend::module_entries`) and runs the scalar set above when any is
+missing, so a backend that does not compile them needs nothing. The
+projections take `kernel_vit_to_bf16`, two brain-float GEMMs through the
+device's BLAS, then `kernel_vit_add_bias_bf16`. The attention takes
+`kernel_vit_split_kv` and then `kernel_vit_attention_mma`. Inside a block the
+encoder fuses the elementwise passes between projections:
+- `kernel_vit_layer_norm_split` writes the next projection's operand.
+- `kernel_vit_bias_gelu_split` writes the second feed-forward layer's operand.
+- `kernel_vit_add_bias_residual` carries each residual add's bias.
+- `kernel_vit_qkv_rope_split` writes Q and the split K/V planes in one pass.
+
+Each fused kernel repeats the unfused sequence's arithmetic, value for value.
+
+| Entry point | Parameters after the argument block | grid | block | smem |
+|---|---|---|---|---|
+| `kernel_vit_to_bf16` | `out (2 * count bf16: hi, then lo), in` | `ceil(count/256)` | 256 | 0 |
+| `kernel_vit_add_bias_bf16` | `x, bias (bf16)` | `ceil(count/256)` | 256 | 0 |
+| `kernel_vit_layer_norm_split` | `out (2 * rows * dim bf16), in, weight, bias` | `rows` | 256 | 132 |
+| `kernel_vit_bias_gelu_split` | `out (2 * count bf16), x, bias` | `ceil(count/256)` | 256 | 0 |
+| `kernel_vit_add_bias_residual` | `x, bias, residual` | `ceil(count/256)` | 256 | 0 |
+| `kernel_vit_split_kv` | `kp, vp, k, v` | `groups * plane_pad` | 256 | 0 |
+| `kernel_vit_qkv_rope_split` | `q, kp, vp, qkv, bias` | `(heads, rows)` | 128 | 0 |
+| `kernel_vit_attention_mma` | `out, q, kp, vp` | `(heads, groups * ceil(plane/128))` | 256 | 91 136 (`VIT_FA_SMEM`) |
+
+Argument blocks:
+
+- `kernel_vit_to_bf16` takes `vit_args_unary {count}`.
+- `kernel_vit_add_bias_bf16` takes `vit_args_add {count, period}`, with `period` the bias width.
+- `kernel_vit_layer_norm_split` takes `vit_args_layer_norm`.
+- `kernel_vit_bias_gelu_split` and `kernel_vit_add_bias_residual` take `vit_args_add`.
+- `kernel_vit_qkv_rope_split` takes `vit_args_qkv_rope_split {rows, heads, head_dim, grid_w, plane, plane_pad, rope_base}`, 28 bytes.
+- `kernel_vit_split_kv` and `kernel_vit_attention_mma` take `vit_args_attention_mma {rows, heads, head_dim, plane, plane_pad, scale}`, 24 bytes.
+- In both of the last two, `plane_pad` is `plane` rounded up to 64.
+
+Two constraints are not visible in a signature:
+
+- `kernel_vit_attention_mma` holds a head of at most `VIT_FA_HD` = 80 columns and
+  must be launched at exactly 256 threads (eight warps of sixteen queries). The
+  host sends a wider head to `kernel_vit_attention`.
+- `kp` and `vp` are laid out as `kernel_vit_split_kv` writes them - two halves,
+  head-major, each group padded to `plane_pad`, values transposed.
+  `kernel_vit_qkv_rope_split` writes the same layout but only real key rows,
+  so the host clears both planes once per encode.
+
 ### `vision_norm`
 
 - `qwen3vl_layernorm_kernel`

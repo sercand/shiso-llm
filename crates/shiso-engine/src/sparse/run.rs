@@ -393,20 +393,25 @@ impl SparseStack {
                 got: 0,
             });
         }
-        let start = self.session(session)?.written();
+        let (start, rope_shift) = {
+            let live = self.session(session)?;
+            (live.written(), live.rope_shift)
+        };
         if media.is_some() {
             // Marked before anything runs, so a chunk that fails halfway still
-            // leaves the session off disk.
+            // leaves the session off disk unless a content key names it.
             if let Some(live) = self.sessions.get_mut(&session) {
                 live.media = true;
             }
         }
-        // This family states one position rule and every request it serves is
-        // walked by it: a placeholder token's three axes are a grid coordinate.
-        // The dense families read theirs off the config because two of them
-        // disagree; there is one of this one.
-        let positions = crate::shape::MediaPositions::Mrope3D;
-        let mut run = media.map(|prefill| MediaRun::new(prefill, start, positions));
+        let mut run = media.map(|prefill| {
+            MediaRun::new(
+                prefill,
+                start,
+                rope_shift,
+                crate::sparse::media::MEDIA_POSITIONS,
+            )
+        });
         let width = usize::try_from(self.opts.prefill_rows).unwrap_or(usize::MAX);
         let mut rest = tokens;
         while !rest.is_empty() {
@@ -424,9 +429,9 @@ impl SparseStack {
             // path the cache holds - so the commit there can take a checkpoint.
             // One extra split and one snapshot per new boundary.
             let mut shared = false;
-            if run.is_none()
-                && let Some(stop) = self.shared_stop(session, rest)?
+            if let Some(stop) = self.shared_stop(session, rest)?
                 && stop <= take
+                && (run.is_none() || self.stop_clears_media(session, at, stop)?)
             {
                 take = stop;
                 shared = true;
@@ -459,6 +464,7 @@ impl SparseStack {
                 run.as_mut(),
                 PassRole::Prompt { snapshot },
             )?;
+            self.keep_rope_shift(session, run.as_ref());
             // A prompt that ends between two grid points is checkpointed at the
             // last one instead of at its end: a longer prompt continues from
             // there exactly as a cold prefill of it would, where a checkpoint at
@@ -509,23 +515,32 @@ impl SparseStack {
             }
             rest = tail;
         }
-        // The count the items carry is the count the rendered prompt used, and
-        // nothing below re-expands a placeholder run. So the walk having handed
-        // out every encoder row is the statement that the prompt and the tower
-        // described the same request - the one mismatch that otherwise succeeds,
-        // stays fluent and answers about a rearranged picture.
-        if let Some(run) = run.as_ref() {
-            let consumed = u64::from(run.walk.rows_consumed());
-            let available = u64::from(run.prefill.row_count());
-            if consumed != available {
-                return Err(CoreError::ShapeMismatch {
-                    field: "vision placeholder tokens",
-                    expected: available,
-                    got: consumed,
-                });
-            }
+        run.as_ref().map_or(Ok(()), every_row_consumed)
+    }
+
+    /// Records where a media chunk's walk left the rotary stream: whatever
+    /// reads this session next - the rest of the prompt as text, a decode
+    /// step, a verify - rotates from there. Mid-item the number is transient,
+    /// and nothing reads it there: a prompt never ends inside a run.
+    fn keep_rope_shift(&mut self, session: SessionId, run: Option<&MediaRun<'_>>) {
+        if let Some(run) = run
+            && let Some(live) = self.sessions.get_mut(&session)
+        {
+            live.rope_shift = run.walk.shift();
         }
-        Ok(())
+    }
+
+    /// Whether a media prompt's chunk may stop `stop` tokens past `at`: only
+    /// under a content key, which is the only way the checkpoint taken there
+    /// can be stored, and only outside every picture, because the walk hands
+    /// out an item's rows and positions in one pass.
+    fn stop_clears_media(&self, session: SessionId, at: u32, stop: usize) -> CoreResult<bool> {
+        let pos = at.saturating_add(u32::try_from(stop).unwrap_or(u32::MAX));
+        Ok(self
+            .session(session)?
+            .key
+            .as_ref()
+            .is_some_and(|key| !key.spans.iter().any(|span| span.splits(pos))))
     }
 
     /// Tokens of `rest` to run before the next shared boundary, when one falls
@@ -545,9 +560,7 @@ impl SparseStack {
         let live = self.session(session)?;
         let pos = live.written();
         let len = pos.saturating_add(u32::try_from(rest.len()).unwrap_or(u32::MAX));
-        let mut path = Vec::with_capacity(live.history().len() + rest.len());
-        path.extend_from_slice(live.history());
-        path.extend_from_slice(rest);
+        let path = live.cache_path_with(rest);
         let branch = self.resident()?.cache.branch_point(&path);
         // Every candidate is judged on its own: a branch point a few tokens into
         // a shared template opening is too close to be worth a snapshot, and it
@@ -815,6 +828,27 @@ impl SparseStack {
         path.extend_from_slice(live.history());
         path.extend_from_slice(tokens);
         crate::sparse::ple::prefetch(tier.table().stream(), &gather, &path)
+    }
+}
+
+/// Whether a finished media prompt's walk handed out every encoder row.
+///
+/// The count the items carry is the count the rendered prompt used, and nothing
+/// re-expands a placeholder run. So the walk having handed out every row is the
+/// statement that the prompt and the tower described the same request - the one
+/// mismatch that otherwise succeeds, stays fluent and answers about a rearranged
+/// picture.
+fn every_row_consumed(run: &MediaRun<'_>) -> CoreResult<()> {
+    let consumed = u64::from(run.walk.rows_consumed());
+    let available = u64::from(run.prefill.row_count());
+    if consumed == available {
+        Ok(())
+    } else {
+        Err(CoreError::ShapeMismatch {
+            field: "vision placeholder tokens",
+            expected: available,
+            got: consumed,
+        })
     }
 }
 

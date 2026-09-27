@@ -459,8 +459,8 @@ fn a_capture_on_one_thread_does_not_refuse_another_threads_allocations() {
     // failed every transcription that overlapped a capture; and the capture
     // itself has to survive the other thread's work, or decode would quietly
     // fall back to eager launches.
-    let other = shiso_cuda::CudaBackend::new(0, shiso_cuda::CudaOptions::default())
-        .expect("a second instance on the same device");
+    let other =
+        CudaBackend::new(0, CudaOptions::default()).expect("a second instance on the same device");
     let handle: std::sync::Arc<dyn Backend> = backend.clone();
     let graphs = backend.as_graph().expect("graphs are on");
     let src = shiso_core::alloc(&handle, 512).expect("allocation");
