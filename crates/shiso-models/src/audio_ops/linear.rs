@@ -43,6 +43,16 @@ impl GemmType {
         }
     }
 
+    /// The matrix-vector-by-runs kernel for this weight type.
+    pub(crate) fn matvec_entry(self) -> &'static str {
+        match self {
+            Self::F32 => "kernel_audio_matvec_f32w",
+            Self::Bf16 => "kernel_audio_matvec_bf16w",
+            Self::F16 => "kernel_audio_matvec_f16w",
+            Self::Q8_0 => "kernel_audio_matvec_q8_0w",
+        }
+    }
+
     pub(crate) fn entry(self) -> &'static str {
         match self {
             Self::F32 => "kernel_audio_gemm_f32w",
@@ -131,6 +141,9 @@ impl Linear {
 
     /// `y[rows][out] = x[rows][in] * W^T (+ b)`.
     ///
+    /// The audio GEMM's weights take its matrix-vector kernel at a few rows;
+    /// [`Self::step`] is the faster one-row form a decoder step takes.
+    ///
     /// # Errors
     ///
     /// [`CoreError::ShapeMismatch`] for a view or weight shorter than the
@@ -184,6 +197,46 @@ impl Linear {
                 Ok(())
             }
         }
+    }
+}
+
+impl Linear {
+    /// [`Self::forward`] for a decoder step's row or few: the audio GEMM's
+    /// weights go to the matrix-vector-by-runs kernel, whose summation order
+    /// differs from the matrix-vector kernel [`Self::forward`] takes at a few
+    /// rows, so a model uses one or the other for each product. Other weights,
+    /// and shapes that kernel does not take, go through [`Self::forward`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward`].
+    pub fn step(
+        &self,
+        ops: &Ops,
+        x: DeviceView<'_>,
+        y: DeviceView<'_>,
+        rows: usize,
+    ) -> CoreResult<()> {
+        if let LinearWeight::Gemm { dtype, buffer, .. } = &self.weight {
+            let (k, n) = (self.in_dim(), self.out_dim());
+            let row = dtype.row_bytes(k).ok_or(CoreError::InvalidValue {
+                key: "linear.in_dim",
+                value: k.to_string(),
+            })?;
+            let want = u64::try_from(n * row).unwrap_or(u64::MAX);
+            if buffer.len() < want {
+                return Err(CoreError::ShapeMismatch {
+                    field: "linear.weight",
+                    expected: want,
+                    got: buffer.len(),
+                });
+            }
+            let bias = self.bias.as_ref().map(DeviceBuffer::view);
+            if ops.matvec(*dtype, y, x, buffer.view(), bias, (rows, n, k))? {
+                return Ok(());
+            }
+        }
+        self.forward(ops, x, y, rows)
     }
 }
 

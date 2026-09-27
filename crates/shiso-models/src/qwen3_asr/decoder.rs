@@ -471,6 +471,23 @@ impl<'a> Decoder<'a> {
         })?)
     }
 
+    /// A projection of `n` rows: a decode pass's one row on the one-row
+    /// kernels, a prefill's rows on the GEMM.
+    fn project(
+        &self,
+        linear: &Linear,
+        x: DeviceView<'_>,
+        y: DeviceView<'_>,
+        n: usize,
+        pass: Pass,
+    ) -> Result<(), AudioError> {
+        match pass {
+            Pass::Prefill => linear.forward(self.ops, x, y, n)?,
+            Pass::Decode => linear.step(self.ops, x, y, n)?,
+        }
+        Ok(())
+    }
+
     /// One layer over `n` rows of `s.x`, in place (notes §4).
     fn layer(
         &self,
@@ -483,9 +500,9 @@ impl<'a> Decoder<'a> {
         let (ops, c) = (self.ops, self.config);
         let hd = c.head_dim;
         self.rms(s.h.view(), s.x.view(), &layer.attn_norm, n, c.hidden)?;
-        layer.q.forward(ops, s.h.view(), s.q.view(), n)?;
-        layer.k.forward(ops, s.h.view(), s.k.view(), n)?;
-        layer.v.forward(ops, s.h.view(), s.v.view(), n)?;
+        self.project(&layer.q, s.h.view(), s.q.view(), n, pass)?;
+        self.project(&layer.k, s.h.view(), s.k.view(), n, pass)?;
+        self.project(&layer.v, s.h.view(), s.v.view(), n, pass)?;
         // The q and k norms are over each head's dims, before the rotation.
         self.rms(s.q.view(), s.q.view(), &layer.q_norm, n * c.heads, hd)?;
         self.rms(s.k.view(), s.k.view(), &layer.k_norm, n * c.kv_heads, hd)?;
@@ -539,18 +556,18 @@ impl<'a> Decoder<'a> {
                 scale,
             })?,
         }
-        layer.o.forward(ops, s.att.view(), s.h.view(), n)?;
+        self.project(&layer.o, s.att.view(), s.h.view(), n, pass)?;
         self.residual(&s.x, &s.h, n * c.hidden)?;
         self.rms(s.h.view(), s.x.view(), &layer.ffn_norm, n, c.hidden)?;
-        layer.gate.forward(ops, s.h.view(), s.gate.view(), n)?;
-        layer.up.forward(ops, s.h.view(), s.up.view(), n)?;
+        self.project(&layer.gate, s.h.view(), s.gate.view(), n, pass)?;
+        self.project(&layer.up, s.h.view(), s.up.view(), n, pass)?;
         ops.silu_mul(&SiluMulDesc {
             out: s.gate.view(),
             gate: s.gate.view(),
             up: s.up.view(),
             count: n * c.ffn,
         })?;
-        layer.down.forward(ops, s.gate.view(), s.h.view(), n)?;
+        self.project(&layer.down, s.gate.view(), s.h.view(), n, pass)?;
         self.residual(&s.x, &s.h, n * c.hidden)
     }
 
@@ -567,7 +584,7 @@ impl<'a> Decoder<'a> {
             1,
             c.hidden,
         )?;
-        self.weights.embed.forward(ops, h, s.logits.view(), 1)?;
+        self.weights.embed.step(ops, h, s.logits.view(), 1)?;
         Ok(ops.argmax_rows(&ArgmaxDesc {
             out: s.ids.view(),
             input: s.logits.view(),

@@ -16,6 +16,7 @@ listed.
 | `kernel_audio_gemm_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm{m, n, k, flags, k_chunk, splits}` | y `[splits][m][n]` (the output itself with one split), x `[m][k]`, w `[n][k]` (q8_0w: `n·k/32` 34-byte blocks, `k % 32 == 0`), bias `[n]` | `(ceil(n/64), ceil(m/32), splits)` × 128, 12288 |
 | `kernel_audio_gemm64_{f32w,bf16w,f16w,q8_0w}` | as `kernel_audio_gemm_*` | as `kernel_audio_gemm_*` | `(ceil(n/64), ceil(m/64), splits)` × 256, 20480 |
 | `kernel_audio_gemv_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm` (one split) | y `[m][n]`, x `[m][k]`, w `[n][k]`, bias `[n]` | `(ceil(n/16), ceil(m/8))` × 128, 0 |
+| `kernel_audio_matvec_{f32w,bf16w,f16w,q8_0w}` | `audio_args_gemm` (one split; `k % 8 == 0`) | y `[m][n]`, x `[m][k]` (16-byte aligned), w `[n][k]` (16-byte aligned; q8_0w as the GEMM's), bias `[n]` | `(ceil(n/4), m)` × 64, 0 (static) |
 | `kernel_audio_split_sum_f32` | `audio_args_gemm` | y `[m][n]`, parts `[splits][m][n]`, bias `[n]` | `ceil(m·n/256)` × 256, 0 |
 | `kernel_audio_conv2d_s2_f32` | `audio_args_conv2d{t_in, f_in, c_in, t_out, f_out, c_out, pad_t, pad_f, depthwise, has_bias, relu, in_valid, out_valid, batch}` | out `[batch][t_out][f_out][c_out]`, in `[batch][t_in][f_in][c_in]`, w `[c_out][c_in/g][3][3]`, bias `[c_out]` | `ceil(batch·t_out·f_out·c_out/256)` × 256, 0 |
 | `kernel_audio_im2col_s2_f32` | `audio_args_conv2d` (as above; `c_out`, `depthwise`, `has_bias`, `relu` unread) | out `[batch][t_out][f_out][9·c_in]` (tap `kt·3+kf` major, channel minor), in `[batch][t_in][f_in][c_in]` | `ceil(batch·t_out·f_out·9·c_in/256)` × 256, 0 |
@@ -55,6 +56,11 @@ stride, the GEMM assumes 128 threads (four simdgroups) and 12288 bytes of thread
 simdgroups) and none, and the window attention one simdgroup of 32 lanes per (head, block of eight queries) with
 head_dim at most 128. The host takes the matrix-vector kernel for at most 4 rows, the 32-row GEMM up to 32 and the
 64-row GEMM above that.
+
+The matrix-vector-by-runs kernel is the one-row product of a decoder step: each lane dots runs of eight
+consecutive weights (for q8_0w a quarter block, the run's integer dot scaled once), sums its runs in k order, a
+simdgroup sum closes each of the two simdgroups, and their sums are added in simdgroup order. That order is not the
+matrix-vector kernel's, so a model takes one or the other for a product. Every row re-reads the weights.
 
 A split GEMM covers `k` in slices of `k_chunk` (a multiple of 32): block `z` multiplies `[z·k_chunk, (z+1)·k_chunk)`
 into plane `z` of y without the bias, and the split-sum pass adds the planes in order and the bias once, so the result

@@ -400,3 +400,114 @@ template [[host_name("kernel_audio_gemv_f32w")]]  kernel audio_gemv_t kernel_aud
 template [[host_name("kernel_audio_gemv_bf16w")]] kernel audio_gemv_t kernel_audio_gemv<audio_w_bf16>;
 template [[host_name("kernel_audio_gemv_f16w")]]  kernel audio_gemv_t kernel_audio_gemv<audio_w_f16>;
 template [[host_name("kernel_audio_gemv_q8_0w")]] kernel audio_gemv_t kernel_audio_gemv<audio_w_q8_0>;
+
+// y = x * W^T (+ b) for one row at a time, the shape of a decoder step. The
+// matrix-vector kernel above keeps a lane on four consecutive weights of each
+// of four columns, which for Q8_0 is a 4-byte read per column per step and
+// streamed at about 150 GB/s on M1 Max. Here each lane dots a run of eight
+// consecutive weights - a Q8_0 quarter block, or 16 bytes of bf16 - so a
+// simdgroup reads 256 weights of a column per step, and two simdgroups share
+// each column's k range; measured 330-410 GB/s on the same shapes, and the
+// 151936-column head at about 355 GB/s against 175. The summation order
+// differs from the matrix-vector kernel's, which is why both exist: a lane
+// sums its runs in k order, `simd_sum` closes each simdgroup, and the two
+// simdgroups' sums are added in simdgroup order.
+struct audio_run8_f32 {
+    static uint64_t row_bytes(uint k) { return (uint64_t) k * 4u; }
+    static float dot8(device const uchar *row, uint j, float4 x0, float4 x1) {
+        device const float4 *p = (device const float4 *) (row + (uint64_t) j * 32u);
+        return dot(p[0], x0) + dot(p[1], x1);
+    }
+};
+struct audio_run8_bf16 {
+    static uint64_t row_bytes(uint k) { return (uint64_t) k * 2u; }
+    static float dot8(device const uchar *row, uint j, float4 x0, float4 x1) {
+        const uint4 b = *((device const uint4 *) (row + (uint64_t) j * 16u));
+        const float4 w0 = float4(as_type<float>(b.x << 16), as_type<float>(b.x & 0xffff0000u),
+                                 as_type<float>(b.y << 16), as_type<float>(b.y & 0xffff0000u));
+        const float4 w1 = float4(as_type<float>(b.z << 16), as_type<float>(b.z & 0xffff0000u),
+                                 as_type<float>(b.w << 16), as_type<float>(b.w & 0xffff0000u));
+        return dot(w0, x0) + dot(w1, x1);
+    }
+};
+struct audio_run8_f16 {
+    static uint64_t row_bytes(uint k) { return (uint64_t) k * 2u; }
+    static float dot8(device const uchar *row, uint j, float4 x0, float4 x1) {
+        device const half4 *p = (device const half4 *) (row + (uint64_t) j * 16u);
+        return dot(float4(p[0]), x0) + dot(float4(p[1]), x1);
+    }
+};
+// A run is a quarter of a 34-byte block. Blocks are only 2-byte aligned, so
+// the eight quants are read as four halfwords; the run's dot is scaled once.
+struct audio_run8_q8_0 {
+    static uint64_t row_bytes(uint k) { return (uint64_t) (k >> 5u) * 34u; }
+    static float dot8(device const uchar *row, uint j, float4 x0, float4 x1) {
+        device const uchar *block = row + (uint64_t) (j >> 2u) * 34u;
+        const float d = (float) *((device const half *) block);
+        device const ushort *qs = (device const ushort *) (block + 2u + (j & 3u) * 8u);
+        const float4 q0 = float4(as_type<char4>((uint) qs[0] | ((uint) qs[1] << 16u)));
+        const float4 q1 = float4(as_type<char4>((uint) qs[2] | ((uint) qs[3] << 16u)));
+        return (dot(q0, x0) + dot(q1, x1)) * d;
+    }
+};
+
+template <typename W>
+kernel void kernel_audio_matvec(
+        constant audio_args_gemm & args [[buffer(0)]],
+        device float *y                 [[buffer(1)]],
+        device const float *x           [[buffer(2)]],
+        device const void *w            [[buffer(3)]],
+        device const float *bias        [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg  [[simdgroup_index_in_threadgroup]]) {
+    const uint NR = AUDIO_MATVEC_COLS;
+    const uint NSG = AUDIO_MATVEC_SG;
+    threadgroup float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    const uint n0 = tgpig.x * NR;
+    const uint row = tgpig.y;
+    const uint runs = args.k >> 3u;
+    const uint64_t rb = W::row_bytes(args.k);
+    device const float *xr = x + (uint64_t) row * args.k;
+    // A column past the edge reads the last one and is never written, so the
+    // loop needs no branch.
+    device const uchar *wr[AUDIO_MATVEC_COLS];
+    for (uint c = 0; c < NR; ++c) {
+        wr[c] = (device const uchar *) w + (uint64_t) min(n0 + c, args.n - 1u) * rb;
+    }
+    float acc[AUDIO_MATVEC_COLS];
+    for (uint c = 0; c < NR; ++c) {
+        acc[c] = 0.0f;
+    }
+    for (uint j = sg * 32u + lane; j < runs; j += NSG * 32u) {
+        device const float4 *xp = (device const float4 *) (xr + j * 8u);
+        const float4 x0 = xp[0];
+        const float4 x1 = xp[1];
+        for (uint c = 0; c < NR; ++c) {
+            acc[c] += W::dot8(wr[c], j, x0, x1);
+        }
+    }
+    for (uint c = 0; c < NR; ++c) {
+        acc[c] = simd_sum(acc[c]);
+    }
+    if (lane == 0u) {
+        for (uint c = 0; c < NR; ++c) {
+            part[c * NSG + sg] = acc[c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u && lane < NR && n0 + lane < args.n) {
+        float total = 0.0f;
+        for (uint s = 0; s < NSG; ++s) {
+            total += part[lane * NSG + s];
+        }
+        const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u;
+        y[(uint64_t) row * args.n + n0 + lane] = total + (has_bias ? bias[n0 + lane] : 0.0f);
+    }
+}
+
+typedef decltype(kernel_audio_matvec<audio_run8_f32>) audio_matvec_t;
+template [[host_name("kernel_audio_matvec_f32w")]]  kernel audio_matvec_t kernel_audio_matvec<audio_run8_f32>;
+template [[host_name("kernel_audio_matvec_bf16w")]] kernel audio_matvec_t kernel_audio_matvec<audio_run8_bf16>;
+template [[host_name("kernel_audio_matvec_f16w")]]  kernel audio_matvec_t kernel_audio_matvec<audio_run8_f16>;
+template [[host_name("kernel_audio_matvec_q8_0w")]] kernel audio_matvec_t kernel_audio_matvec<audio_run8_q8_0>;

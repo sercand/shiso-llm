@@ -72,6 +72,10 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_embed_token_q8_0w",
     "kernel_audio_embed_token_affine8w",
     "kernel_audio_silu_mul_f32",
+    "kernel_audio_matvec_f32w",
+    "kernel_audio_matvec_bf16w",
+    "kernel_audio_matvec_f16w",
+    "kernel_audio_matvec_q8_0w",
 ];
 
 const LINEAR_BLOCK: u32 = 256;
@@ -81,6 +85,9 @@ const GEMM_TILE_N: u32 = 64;
 /// Output columns and rows one matrix-vector threadgroup produces.
 const GEMV_TG_COLS: u32 = 16;
 const GEMV_TG_ROWS: u32 = 8;
+/// Output columns and threads of one matrix-vector-by-runs threadgroup.
+const MATVEC_COLS: u32 = 4;
+const MATVEC_BLOCK: u32 = 64;
 /// Queries one attention simdgroup takes at once.
 const ATTN_QUERY_BLOCK: u32 = 8;
 /// Distance rows one relative-score simdgroup takes at once.
@@ -590,6 +597,8 @@ enum GemmMode {
     Gemv,
     /// The 64-row tiled GEMM over `splits` slices of k (1: all of it).
     Tall(usize),
+    /// The matrix-vector-by-runs kernel, one threadgroup row per input row.
+    Matvec,
 }
 
 fn gemm_entry(kind: &str, mode: GemmMode) -> &'static str {
@@ -598,6 +607,10 @@ fn gemm_entry(kind: &str, mode: GemmMode) -> &'static str {
         (GemmMode::Gemv, "f32w") => "kernel_audio_gemv_f32w",
         (GemmMode::Gemv, "bf16w") => "kernel_audio_gemv_bf16w",
         (GemmMode::Gemv, _) => "kernel_audio_gemv_f16w",
+        (GemmMode::Matvec, "q8_0w") => "kernel_audio_matvec_q8_0w",
+        (GemmMode::Matvec, "f32w") => "kernel_audio_matvec_f32w",
+        (GemmMode::Matvec, "bf16w") => "kernel_audio_matvec_bf16w",
+        (GemmMode::Matvec, _) => "kernel_audio_matvec_f16w",
         (GemmMode::Tall(_), "q8_0w") => "kernel_audio_gemm64_q8_0w",
         (GemmMode::Tall(_), "f32w") => "kernel_audio_gemm64_f32w",
         (GemmMode::Tall(_), "bf16w") => "kernel_audio_gemm64_bf16w",
@@ -628,7 +641,7 @@ fn gemm_case(
     let y = gpu.upload(&f32_bytes(&vec![f32::NAN; m * n + n]));
     let splits = match mode {
         GemmMode::Split(s) | GemmMode::Tall(s) => s,
-        GemmMode::Tiled | GemmMode::Gemv => 1,
+        GemmMode::Tiled | GemmMode::Gemv | GemmMode::Matvec => 1,
     };
     let k_tiles = k.div_ceil(GEMM_TILE as usize);
     let k_chunk = k_tiles.div_ceil(splits) * GEMM_TILE as usize;
@@ -643,57 +656,61 @@ fn gemm_case(
     };
     let entry = gemm_entry(kind, mode);
     let parts = gpu.upload(&f32_bytes(&vec![f32::NAN; splits * m * n]));
-    match mode {
-        GemmMode::Gemv => launch(
-            gpu,
-            entry,
+    let target = if splits > 1 { &parts } else { &y };
+    let (grid, block, smem) = match mode {
+        GemmMode::Gemv => (
             Extent3::new(blocks(n, GEMV_TG_COLS), blocks(m, GEMV_TG_ROWS), 1),
-            Extent3::linear(GEMM_BLOCK),
+            GEMM_BLOCK,
+            0,
+        ),
+        GemmMode::Matvec => (
+            Extent3::new(blocks(n, MATVEC_COLS), m as u32, 1),
+            MATVEC_BLOCK,
+            0,
+        ),
+        GemmMode::Tall(_) => (
+            Extent3::new(
+                blocks(n, GEMM_TILE_N),
+                blocks(m, GEMM64_TILE_M),
+                splits as u32,
+            ),
+            GEMM64_BLOCK,
+            GEMM64_SMEM,
+        ),
+        GemmMode::Tiled | GemmMode::Split(_) => (
+            Extent3::new(blocks(n, GEMM_TILE_N), blocks(m, GEMM_TILE), splits as u32),
+            GEMM_BLOCK,
+            GEMM_SMEM,
+        ),
+    };
+    launch(
+        gpu,
+        entry,
+        grid,
+        Extent3::linear(block),
+        smem,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(target.view()),
+            KernelArg::Buffer(xb.view()),
+            KernelArg::Buffer(wb.view()),
+            KernelArg::Buffer(bb.view()),
+        ],
+    );
+    if splits > 1 {
+        launch(
+            gpu,
+            "kernel_audio_split_sum_f32",
+            Extent3::linear(blocks(m * n, LINEAR_BLOCK)),
+            Extent3::linear(LINEAR_BLOCK),
             0,
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(y.view()),
-                KernelArg::Buffer(xb.view()),
-                KernelArg::Buffer(wb.view()),
+                KernelArg::Buffer(parts.view()),
                 KernelArg::Buffer(bb.view()),
             ],
-        ),
-        GemmMode::Tiled | GemmMode::Split(_) | GemmMode::Tall(_) => {
-            let target = if splits > 1 { &parts } else { &y };
-            let (tile_m, block, smem) = match mode {
-                GemmMode::Tall(_) => (GEMM64_TILE_M, GEMM64_BLOCK, GEMM64_SMEM),
-                _ => (GEMM_TILE, GEMM_BLOCK, GEMM_SMEM),
-            };
-            launch(
-                gpu,
-                entry,
-                Extent3::new(blocks(n, GEMM_TILE_N), blocks(m, tile_m), splits as u32),
-                Extent3::linear(block),
-                smem,
-                &[
-                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                    KernelArg::Buffer(target.view()),
-                    KernelArg::Buffer(xb.view()),
-                    KernelArg::Buffer(wb.view()),
-                    KernelArg::Buffer(bb.view()),
-                ],
-            );
-            if splits > 1 {
-                launch(
-                    gpu,
-                    "kernel_audio_split_sum_f32",
-                    Extent3::linear(blocks(m * n, LINEAR_BLOCK)),
-                    Extent3::linear(LINEAR_BLOCK),
-                    0,
-                    &[
-                        KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                        KernelArg::Buffer(y.view()),
-                        KernelArg::Buffer(parts.view()),
-                        KernelArg::Buffer(bb.view()),
-                    ],
-                );
-            }
-        }
+        );
     }
     drain(gpu);
     let got = gpu.read_f32(&y);
@@ -778,6 +795,30 @@ pub fn gemv_matches_for_every_weight_type(gpu: &Gpu) {
     }
     for &(m, n, k) in &[(1usize, 1300usize, 1152usize), (4, 37, 64)] {
         gemm_case(gpu, "q8_0w", (m, n, k), true, GemmMode::Gemv);
+    }
+}
+
+/// The matrix-vector-by-runs kernel for every weight type: one row and a
+/// few, column counts that end mid-threadgroup, a k shorter than one
+/// simdgroup's sweep and one of several sweeps, with and without the bias,
+/// writing nothing past `m x n`.
+pub fn matvec_matches_for_every_weight_type(gpu: &Gpu) {
+    for kind in ["f32w", "bf16w", "f16w"] {
+        for &(m, n, k, bias) in &[
+            (1usize, 1301usize, 1152usize, true),
+            (3, 37, 64, false),
+            (1, 6, 8, true),
+            (2, 9, 2056, true),
+        ] {
+            gemm_case(gpu, kind, (m, n, k), bias, GemmMode::Matvec);
+        }
+    }
+    for &(m, n, k, bias) in &[
+        (1usize, 1301usize, 1152usize, true),
+        (3, 37, 64, false),
+        (1, 5, 2080, true),
+    ] {
+        gemm_case(gpu, "q8_0w", (m, n, k), bias, GemmMode::Matvec);
     }
 }
 

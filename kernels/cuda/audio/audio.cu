@@ -346,6 +346,95 @@ AUDIO_GEMM_ENTRIES(bf16w, audio_w_bf16)
 AUDIO_GEMM_ENTRIES(f16w, audio_w_f16)
 AUDIO_GEMM_ENTRIES(q8_0w, audio_w_q8_0)
 
+/* y = x * W^T (+ b) one row at a time, the Metal twin's order: each lane dots
+ * runs of eight consecutive weights (a Q8_0 quarter block, scaled once),
+ * `(w0.x0) + (w1.x1)` over two four-wide halves; a lane sums its runs in k
+ * order, a warp sum closes each warp, and the two warps' sums are added in
+ * warp order. The grid is `ceil(n / 4)` by `m`, 64 threads. */
+template <typename W>
+static __device__ __forceinline__ float audio_run8(const void *w, uint64_t row0, uint j,
+                                                   const float *xr) {
+    const uint64_t at = row0 + (uint64_t) j * 8u;
+    const float *xp = xr + (uint64_t) j * 8u;
+    float lo = 0.0f;
+    float hi = 0.0f;
+    for (uint e = 0; e < 4u; ++e) {
+        lo += W::load(w, at + e) * xp[e];
+        hi += W::load(w, at + 4u + e) * xp[4u + e];
+    }
+    return lo + hi;
+}
+template <>
+__device__ __forceinline__ float audio_run8<audio_w_q8_0>(const void *w, uint64_t row0, uint j,
+                                                          const float *xr) {
+    const uint64_t at = row0 + (uint64_t) j * 8u;
+    const unsigned char *block = (const unsigned char *) w + (at >> 5u) * 34u;
+    const unsigned short bits = (unsigned short) (block[0] | (block[1] << 8));
+    const float d = __half2float(__ushort_as_half(bits));
+    const signed char *qs = (const signed char *) block + 2u + (at & 31u);
+    const float *xp = xr + (uint64_t) j * 8u;
+    float lo = 0.0f;
+    float hi = 0.0f;
+    for (uint e = 0; e < 4u; ++e) {
+        lo += (float) qs[e] * xp[e];
+        hi += (float) qs[4u + e] * xp[4u + e];
+    }
+    return (lo + hi) * d;
+}
+
+template <typename W>
+static __device__ __forceinline__ void audio_matvec(
+        const struct audio_args_gemm args, float *y, const float *x, const void *w,
+        const float *bias) {
+    const uint NR = AUDIO_MATVEC_COLS;
+    const uint NSG = AUDIO_MATVEC_SG;
+    __shared__ float part[AUDIO_MATVEC_COLS * AUDIO_MATVEC_SG];
+    const uint lane = threadIdx.x & 31u;
+    const uint warp = threadIdx.x >> 5u;
+    const uint n0 = blockIdx.x * NR;
+    const uint row = blockIdx.y;
+    const uint runs = args.k >> 3u;
+    const float *xr = x + (uint64_t) row * args.k;
+    float acc[AUDIO_MATVEC_COLS];
+    for (uint c = 0; c < NR; ++c) {
+        acc[c] = 0.0f;
+    }
+    for (uint j = warp * 32u + lane; j < runs; j += NSG * 32u) {
+        for (uint c = 0; c < NR; ++c) {
+            const uint64_t col = min(n0 + c, args.n - 1u);
+            acc[c] += audio_run8<W>(w, col * args.k, j, xr);
+        }
+    }
+    for (uint c = 0; c < NR; ++c) {
+        acc[c] = audio_warp_sum(acc[c]);
+    }
+    if (lane == 0u) {
+        for (uint c = 0; c < NR; ++c) {
+            part[c * NSG + warp] = acc[c];
+        }
+    }
+    __syncthreads();
+    if (warp == 0u && lane < NR && n0 + lane < args.n) {
+        float total = 0.0f;
+        for (uint s = 0; s < NSG; ++s) {
+            total += part[lane * NSG + s];
+        }
+        const bool has_bias = (args.flags & AUDIO_GEMM_HAS_BIAS) != 0u;
+        y[(uint64_t) row * args.n + n0 + lane] = total + (has_bias ? bias[n0 + lane] : 0.0f);
+    }
+}
+
+#define AUDIO_MATVEC_ENTRY(SUFFIX, W) \
+    extern "C" __global__ void kernel_audio_matvec_##SUFFIX( \
+            const struct audio_args_gemm args, float *y, const float *x, const void *w, const float *bias) { \
+        audio_matvec<W>(args, y, x, w, bias); \
+    }
+
+AUDIO_MATVEC_ENTRY(f32w, audio_w_f32)
+AUDIO_MATVEC_ENTRY(bf16w, audio_w_bf16)
+AUDIO_MATVEC_ENTRY(f16w, audio_w_f16)
+AUDIO_MATVEC_ENTRY(q8_0w, audio_w_q8_0)
+
 /* y[i] = sum_z parts[z][i] (+ b[i % n]): closes a split-k GEMM, summing the
  * planes in order so the result does not depend on scheduling. */
 extern "C" __global__ void kernel_audio_split_sum_f32(

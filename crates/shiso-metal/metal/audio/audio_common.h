@@ -14,6 +14,10 @@
 #define AUDIO_GEMM64_TILE_M 64u
 #define AUDIO_GEMV_ROWS 8u
 #define AUDIO_GEMV_COLS 4u
+// Columns one matrix-vector-by-runs threadgroup produces, and the simdgroups
+// that share each column's k range.
+#define AUDIO_MATVEC_COLS 4u
+#define AUDIO_MATVEC_SG 2u
 // Head dims up to 32 lanes x 4 values; the attention keeps a lane's slice of
 // the query, the accumulator and the output in registers.
 #define AUDIO_ATTN_SLOTS 4u

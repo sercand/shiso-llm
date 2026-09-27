@@ -57,6 +57,7 @@ device_cases!(
     gemm_matches_for_every_weight_type_and_ragged_shape,
     split_k_gemm_matches_the_whole_product,
     gemv_matches_for_every_weight_type,
+    matvec_matches_for_every_weight_type,
     tall_gemm_matches_for_every_weight_type,
     conv2d_matches_causal_symmetric_full_and_depthwise,
     conv2d_keeps_batched_planes_apart,

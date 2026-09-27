@@ -119,6 +119,13 @@ const GEMM_SPLIT_BELOW: usize = 64;
 const GEMV_TG_COLS: usize = 16;
 /// Rows one matrix-vector threadgroup produces.
 const GEMV_TG_ROWS: usize = 8;
+/// Output columns one matrix-vector-by-runs threadgroup produces.
+const MATVEC_COLS: usize = 4;
+/// Threads of one matrix-vector-by-runs threadgroup: two simdgroups sharing
+/// each column's k range.
+const MATVEC_BLOCK: u32 = 64;
+/// Consecutive weights one lane of the matrix-vector-by-runs kernel dots.
+const MATVEC_RUN: usize = 8;
 /// Threads of one GEMM tile, and of one matrix-vector threadgroup: four
 /// simdgroups.
 const GEMM_BLOCK: u32 = 128;
@@ -1204,6 +1211,66 @@ impl Ops {
                 KernelArg::Buffer(bias.unwrap_or(input)),
             ],
         )
+    }
+
+    /// `y = x * W^T (+ b)` for a decoder step's few rows: each lane dots
+    /// runs of eight consecutive weights, which streams a row-major weight at
+    /// about twice the rate [`Self::gemm`]'s matrix-vector kernel does. The
+    /// summation order is not that kernel's, so a model takes one or the
+    /// other for a given product, never a mix; every row re-reads the weights,
+    /// so this is for one row, or a handful.
+    ///
+    /// Returns `false`, launching nothing, when `k` is not a whole number of
+    /// runs or a view is not 16-byte aligned, so the caller takes
+    /// [`Self::gemm`] instead.
+    pub(crate) fn matvec(
+        &self,
+        dtype: GemmType,
+        out: DeviceView<'_>,
+        input: DeviceView<'_>,
+        weight: DeviceView<'_>,
+        bias: Option<DeviceView<'_>>,
+        shape: (usize, usize, usize),
+    ) -> CoreResult<bool> {
+        let (rows, cols, depth) = shape;
+        if !depth.is_multiple_of(MATVEC_RUN)
+            || !input.offset().is_multiple_of(16)
+            || !weight.offset().is_multiple_of(16)
+        {
+            return Ok(false);
+        }
+        need(out, rows * cols, "matvec.y")?;
+        need(input, rows * depth, "matvec.x")?;
+        if let Some(b) = bias {
+            need(b, cols, "matvec.bias")?;
+        }
+        let args = GemmArgs {
+            m: dim(rows, "matvec.m")?,
+            n: dim(cols, "matvec.n")?,
+            k: dim(depth, "matvec.k")?,
+            flags: u32::from(bias.is_some()),
+            k_chunk: dim(depth, "matvec.k")?,
+            splits: 1,
+        };
+        let grid = Extent3::new(
+            dim(cols.div_ceil(MATVEC_COLS).max(1), "matvec.grid")?,
+            dim(rows.max(1), "matvec.grid")?,
+            1,
+        );
+        self.launch(
+            dtype.matvec_entry(),
+            grid,
+            MATVEC_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(out),
+                KernelArg::Buffer(input),
+                KernelArg::Buffer(weight),
+                KernelArg::Buffer(bias.unwrap_or(input)),
+            ],
+        )?;
+        Ok(true)
     }
 
     /// One stride-2 3x3 conv2d.

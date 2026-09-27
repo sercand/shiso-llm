@@ -16,6 +16,10 @@
 #define AUDIO_GEMM64_TILE_M 64u
 #define AUDIO_GEMV_ROWS 8u
 #define AUDIO_GEMV_COLS 4u
+/* Columns one matrix-vector-by-runs block produces, and the warps that share
+ * each column's k range. */
+#define AUDIO_MATVEC_COLS 4u
+#define AUDIO_MATVEC_SG 2u
 #define AUDIO_ATTN_SLOTS 4u
 #define AUDIO_ATTN_QB 8u
 #define AUDIO_REL_ROWS 4u
