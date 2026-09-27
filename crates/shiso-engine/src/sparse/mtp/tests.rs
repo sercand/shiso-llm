@@ -439,3 +439,110 @@ fn the_lookup_is_taken_only_when_it_is_longer_and_the_head_agrees_with_its_first
         "a step where the head drafted nothing has no evidence either"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the single-pass scan against the one-pass-per-key-length scan it replaced
+// ---------------------------------------------------------------------------
+
+/// The lookup as it was first written: every key length its own pass over the
+/// history, longest first, newest window first. Slow at a long context and
+/// obviously right, which is what makes it the reference for the scan that
+/// replaced it.
+fn propose_per_length(
+    history: &[TokenId],
+    first: TokenId,
+    generated_from: u32,
+    memory: &FailRing,
+    policy: NgramPolicy,
+) -> Option<Vec<TokenId>> {
+    if !policy.is_on() {
+        return None;
+    }
+    let mut seq = history.to_vec();
+    seq.push(first);
+    let seq_len = u32::try_from(seq.len()).expect("a test history fits in u32");
+    let mut key = NGRAM_MAX_MATCH;
+    while key >= policy.min_match {
+        if key < seq_len && seq_len >= key + generated_from {
+            for end in (key - 1..=seq_len - 2).rev() {
+                let matches = (0..key)
+                    .all(|back| seq[(end - back) as usize] == seq[(seq_len - 1 - back) as usize]);
+                if !matches {
+                    continue;
+                }
+                let mut tokens = Vec::new();
+                let mut marker = false;
+                for &token in &seq[end as usize + 1..] {
+                    if tokens.len() == policy.max_k as usize {
+                        break;
+                    }
+                    if token >= policy.special_floor {
+                        marker = true;
+                        break;
+                    }
+                    tokens.push(token);
+                }
+                if marker || tokens.is_empty() || memory.rejected(ProposalId::new(end, &tokens)) {
+                    continue;
+                }
+                return Some(tokens);
+            }
+        }
+        key -= 1;
+    }
+    None
+}
+
+#[test]
+fn the_single_pass_proposes_exactly_what_a_pass_per_key_length_did() {
+    // A tiny vocabulary so that keys of every length match somewhere, markers
+    // among the text so that some continuations are refused, and failures
+    // remembered so that the newest window is sometimes skipped for an older
+    // one - the three ways the answer can move to a different window.
+    let mut seed = 0x5eed_u64;
+    let mut next = move |bound: u32| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        u32::try_from(seed >> 33).expect("a 31-bit value fits") % bound
+    };
+    let mut compared = 0_u32;
+    let mut proposed = 0_u32;
+    for case in 0..4000_u32 {
+        let vocab = 2 + next(4);
+        let len = next(80);
+        let history = (0..len)
+            .map(|_| {
+                if next(40) == 0 {
+                    SPECIAL
+                } else {
+                    TokenId::new(next(vocab))
+                }
+            })
+            .collect::<Vec<_>>();
+        let first = TokenId::new(next(vocab));
+        let generated_from = next(len + 2);
+        let policy = NgramPolicy::new(1 + next(MAX_DRAFT), 1 + next(NGRAM_MAX_MATCH), SPECIAL);
+        let mut ring = FailRing::new();
+        // Remember whatever the reference proposes a few times over, so later
+        // rounds have to fall back past those windows.
+        for _ in 0..3 {
+            let expected = propose_per_length(&history, first, generated_from, &ring, policy);
+            let got = propose(&history, first, generated_from, &ring, policy);
+            assert_eq!(
+                got.as_ref().map(|proposal| proposal.tokens().to_vec()),
+                expected,
+                "case {case}: history {history:?} first {first:?} from {generated_from} \
+                 policy {policy:?}"
+            );
+            compared += 1;
+            let Some(proposal) = got else { break };
+            proposed += 1;
+            ring.remember(proposal.id());
+        }
+    }
+    assert!(
+        proposed > compared / 4,
+        "the cases have to exercise proposals, not only misses: {proposed} of {compared}"
+    );
+}

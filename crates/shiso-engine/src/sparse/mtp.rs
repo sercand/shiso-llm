@@ -395,50 +395,89 @@ pub fn propose(
             std::cmp::Ordering::Greater => None,
         }
     };
-    if seq_len < policy.min_match.saturating_add(1) {
+    // Key lengths the lookup may try: the longest is the one whose key still lies
+    // inside this generation and leaves a token before it to read from.
+    let longest = NGRAM_MAX_MATCH
+        .min(seq_len.saturating_sub(1))
+        .min(seq_len.saturating_sub(generated_from));
+    if longest < policy.min_match {
         return None;
     }
-    let mut key_len = NGRAM_MAX_MATCH;
-    while key_len >= policy.min_match {
-        let this_key = key_len;
-        key_len = key_len.saturating_sub(1);
-        if this_key.saturating_add(1) > seq_len || seq_len < this_key.saturating_add(generated_from)
-        {
+    // One pass over the history for every key length at once, rather than one
+    // pass per length. A window's continuation depends only on where the window
+    // ends, never on how long its key was, so keeping the newest proposal of
+    // each longer key seen so far is the same answer as trying each length in
+    // turn - and at a long context the history scan is the whole cost of a
+    // step's lookup, on the scheduler thread, ahead of the verify launch.
+    let longest_usize = usize::try_from(longest).ok()?;
+    let min_usize = usize::try_from(policy.min_match).ok()?;
+    // The key's tokens before `first`, which every window's own tokens before
+    // its last are compared against, nearest first.
+    let tail = history.get(history.len().checked_sub(longest_usize - 1)?..)?;
+    let mut fallback = None;
+    // Windows end at `end`, most recent first. The newest one that can still be
+    // followed by a token ends at the last history position, and the oldest
+    // whole window ends at `min_match - 1`.
+    let mut hay = history;
+    while let Some(end) = rfind(hay, first) {
+        hay = &history[..end];
+        if end + 1 < min_usize {
+            break;
+        }
+        let matched = 1 + hay
+            .iter()
+            .rev()
+            .zip(tail.iter().rev())
+            .take_while(|(here, there)| here == there)
+            .count();
+        // Older windows only ever replace the fallback with a longer key.
+        let beaten = fallback.as_ref().is_some_and(|&(best, _)| matched <= best);
+        if matched < min_usize || beaten {
             continue;
         }
-        // Windows ending at `end`, most recent first. The newest one that can
-        // still be followed by a token is at `seq_len - 2`, and the oldest whole
-        // window ends at `this_key - 1`.
-        let mut end = seq_len.saturating_sub(2);
-        loop {
-            if window_matches(&at, end, seq_len, this_key)
-                && let Some(proposal) = read_forward(&at, end, seq_len, memory, policy)
-            {
-                return Some(proposal);
-            }
-            if end.saturating_add(1) <= this_key {
-                break;
-            }
-            end = end.saturating_sub(1);
+        let Some(proposal) = u32::try_from(end)
+            .ok()
+            .and_then(|end| read_forward(&at, end, seq_len, memory, policy))
+        else {
+            continue;
+        };
+        if matched >= longest_usize {
+            return Some(proposal);
         }
+        fallback = Some((matched, proposal));
     }
-    None
+    fallback.map(|(_, proposal)| proposal)
 }
 
-/// Whether the `key_len` tokens ending at `end` are the `key_len` tokens ending
-/// at the sequence's last position.
-fn window_matches(
-    at: &impl Fn(u32) -> Option<TokenId>,
-    end: u32,
-    seq_len: u32,
-    key_len: u32,
-) -> bool {
-    let last = seq_len.saturating_sub(1);
-    (0..key_len).all(|back| {
-        let here = end.checked_sub(back).and_then(at);
-        let there = last.checked_sub(back).and_then(at);
-        here.is_some() && here == there
-    })
+/// The last position of `needle` in `hay`.
+///
+/// Compares a fixed-width block with no early exit before looking inside it,
+/// which the compiler turns into vector compares: nearly every position is a
+/// miss, so the scan is bounded by how fast it can rule a block out.
+#[expect(
+    clippy::needless_bitwise_bool,
+    reason = "the eager `|` is what keeps the block compare branch-free and vectorised"
+)]
+fn rfind(hay: &[TokenId], needle: TokenId) -> Option<usize> {
+    const BLOCK: usize = 32;
+    let whole = hay.len() - hay.len() % BLOCK;
+    if let Some(at) = hay[whole..].iter().rposition(|&token| token == needle) {
+        return Some(whole + at);
+    }
+    hay[..whole]
+        .chunks_exact(BLOCK)
+        .rposition(|block| {
+            block
+                .iter()
+                .fold(false, |hit, &token| hit | (token == needle))
+        })
+        .and_then(|block| {
+            let start = block * BLOCK;
+            hay[start..start + BLOCK]
+                .iter()
+                .rposition(|&token| token == needle)
+                .map(|at| start + at)
+        })
 }
 
 /// Reads the continuation after a matched window, refusing one that runs into
