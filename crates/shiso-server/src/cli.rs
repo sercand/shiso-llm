@@ -30,6 +30,8 @@ pub const DEFAULT_PORT: u16 = 8090;
 pub const DEFAULT_CTX: u32 = 4096;
 /// The default floor below which the disk tier stores and reads nothing.
 pub const DEFAULT_KVSTORE_MIN_TOKENS: u32 = shiso_engine::CKPT_MIN_TOKENS_DEFAULT;
+/// The default device memory kept for the towers' output, in mebibytes.
+pub const DEFAULT_VISION_CACHE_MB: u64 = 1024;
 /// The default host staging the disk tier's writes may hold, in mebibytes.
 pub const DEFAULT_KVSTORE_STAGING_MB: u64 = 1024;
 /// The default checkpoint pages one scheduler tick copies for the disk tier, in
@@ -324,6 +326,16 @@ pub struct ServeArgs {
     #[arg(long, env = "SHISO_DRAFT_VOCAB")]
     pub draft_vocab: Option<PathBuf>,
 
+    /// Device memory kept for the towers' output, in mebibytes: a picture seen
+    /// before is neither decoded nor encoded again while its rows are here.
+    ///
+    /// A picture's rows are one per placeholder token, a few megabytes each,
+    /// so the default holds a long agent session's screenshots. It is set aside
+    /// before the key/value pool is sized, and only when `--vision` names a
+    /// tower.
+    #[arg(long, env = "SHISO_VISION_CACHE_MB", default_value_t = DEFAULT_VISION_CACHE_MB)]
+    pub vision_cache_mb: u64,
+
     /// Row-cache budget for the per-layer embedding table, in mebibytes.
     ///
     /// Read only by families with a per-layer embedding table; every other
@@ -617,6 +629,7 @@ impl ServeArgs {
             (self.kvstore_staging_mb, "kvstore-staging-mb"),
             (self.kvstore_pump_mb, "kvstore-pump-mb"),
             (self.kvstore_drain_secs, "kvstore-drain-secs"),
+            (self.vision_cache_mb, "vision-cache-mb"),
         ] {
             if value == 0 {
                 return Err(ConfigError::Zero { flag });
@@ -782,8 +795,9 @@ impl ServeArgs {
     /// with the sessions and the late allocations it sets aside; `None` when it
     /// was not given.
     ///
-    /// The reserve is the vision tower, when `--vision` names a file - it is
-    /// loaded after the model, so the stack cannot see it - and
+    /// The reserve is the vision tower and `--vision-cache-mb`, when
+    /// `--vision` names a file - both are allocated after the model, so the
+    /// stack cannot see them - and
     /// [`KV_FIT_HEADROOM_BYTES`]. A tower that lives inside a checkpoint
     /// directory is not counted beyond the headroom.
     ///
@@ -818,14 +832,18 @@ impl ServeArgs {
     }
 
     /// Bytes allocated after the stack is built that it cannot see: the vision
-    /// tower, when `--vision` names a file, and [`KV_FIT_HEADROOM_BYTES`].
+    /// tower and the cache of its output, when `--vision` names a file, and
+    /// [`KV_FIT_HEADROOM_BYTES`].
     fn late_reserve_bytes(&self) -> u64 {
         let tower = self
             .vision
             .as_deref()
             .and_then(|path| std::fs::metadata(path).ok())
             .filter(std::fs::Metadata::is_file)
-            .map_or(0, |meta| meta.len());
+            .map_or(0, |meta| {
+                meta.len()
+                    .saturating_add(self.vision_cache_mb.saturating_mul(1 << 20))
+            });
         tower.saturating_add(KV_FIT_HEADROOM_BYTES)
     }
 

@@ -113,6 +113,10 @@ pub fn preprocess_image(
 /// why this reads it before finishing the decode. A format that carries no
 /// orientation reports no transform, so this is a no-op for PNG and for any
 /// untagged JPEG.
+///
+/// PNG, JPEG, GIF, WebP and BMP are decoded here, in process, by pure-Rust
+/// decoders; the format is read from the bytes. None of them goes near a
+/// subprocess - that door is for video and non-WAV audio containers only.
 fn decode_image(bytes: &[u8], limits: ImageLimits) -> Result<RgbImage, VisionError> {
     if bytes.is_empty() {
         return Err(VisionError::EmptyPayload);

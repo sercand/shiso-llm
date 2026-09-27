@@ -79,14 +79,16 @@ const DEFAULT_ROPE_BASE: f32 = 10_000.0;
 
 /// Runs a loaded vision tower over one media item.
 ///
-/// Holds only the two numbers no container states: the normalization's epsilon
-/// and the rotation's base. Everything else comes from the weights it is handed,
-/// so one encoder value runs any tower the loader accepts.
+/// Holds only the two numbers no container states - the normalization's
+/// epsilon and the rotation's base - and whether the device's faster entries
+/// may be used. Everything else comes from the weights it is handed, so one
+/// encoder value runs any tower the loader accepts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct VisionEncoder {
     eps: f32,
     rope_base: f32,
+    scalar_only: bool,
 }
 
 impl Default for VisionEncoder {
@@ -223,7 +225,20 @@ impl VisionEncoder {
         Self {
             eps: DEFAULT_LAYER_NORM_EPS,
             rope_base: DEFAULT_ROPE_BASE,
+            scalar_only: false,
         }
+    }
+
+    /// The same encoder, held to the portable single-precision kernels even
+    /// where the device has tensor-core ones.
+    ///
+    /// The faster path rounds a projection's operand and the attention's
+    /// operands to brain-float; this is the door a parity case uses to measure
+    /// what that rounding moves.
+    #[must_use]
+    pub const fn with_scalar_kernels(mut self) -> Self {
+        self.scalar_only = true;
+        self
     }
 
     /// Overrides the epsilon inside the normalization's square root.
@@ -277,11 +292,7 @@ impl VisionEncoder {
     ) -> Result<DeviceBuffer, VisionError> {
         let dims = weights.dims();
         let plan = Plan::new(dims, item)?;
-        let run = Run {
-            backend,
-            eps: self.eps,
-            rope_base: self.rope_base,
-        };
+        let run = Run::new(backend, *self, &plan)?;
         let positions = Self::resample_positions(backend, weights, plan.grid_h, plan.grid_w)?;
         Self::forward(&run, &plan, weights, item, &positions, &mut NoopSink)
     }
@@ -299,11 +310,7 @@ impl VisionEncoder {
     ) -> Result<VisionStages, VisionError> {
         let dims = weights.dims();
         let plan = Plan::new(dims, item)?;
-        let run = Run {
-            backend,
-            eps: self.eps,
-            rope_base: self.rope_base,
-        };
+        let run = Run::new(backend, *self, &plan)?;
         let positions = Self::resample_positions(backend, weights, plan.grid_h, plan.grid_w)?;
         let mut sink = CollectorSink::new(backend, weights.dims().depth());
         let _out = Self::forward(&run, &plan, weights, item, &positions, &mut sink)?;
@@ -369,6 +376,9 @@ impl VisionEncoder {
         block: &TowerBlock<TowerTensor>,
         buffers: &mut Buffers,
     ) -> Result<(), VisionError> {
+        if run.staged_operand().is_some() {
+            return Self::block_fused(run, plan, block, buffers);
+        }
         let hidden_rows = plan.rows * plan.hidden;
         let rows = plan.rows;
 
@@ -439,6 +449,61 @@ impl VisionEncoder {
             &buffers.state,
             hidden_rows,
             hidden_rows,
+        )?;
+        buffers.advance();
+        Ok(())
+    }
+
+    /// [`Self::block`] with the projections in the device's BLAS and every
+    /// elementwise pass that sits between two of them folded into its
+    /// neighbour: each normalization writes the next projection's operand
+    /// directly, the first feed-forward layer's bias and activation write the
+    /// second's, and each residual add carries the projection's bias.
+    ///
+    /// The arithmetic is the unfused sequence's, value for value; what is gone
+    /// is six passes a block over the hidden stream or the feed-forward rows.
+    fn block_fused(
+        run: &Run<'_>,
+        plan: &Plan,
+        block: &TowerBlock<TowerTensor>,
+        buffers: &mut Buffers,
+    ) -> Result<(), VisionError> {
+        let rows = plan.rows;
+        run.norm_split("norm1", &buffers.state, &block.norm1, rows, plan.hidden)?;
+        let fused = Shape::new(rows, 3 * plan.hidden, plan.hidden);
+        run.multiply("fused projection", &buffers.qkv, &block.qkv, fused)?;
+        if run.fast.rope_split {
+            run.rope_split(plan, &buffers.q, &buffers.qkv, &block.qkv)?;
+            run.attention_staged(plan, &buffers.attn, &buffers.q)?;
+        } else {
+            run.add_bias("fused projection", &buffers.qkv, &block.qkv, fused)?;
+            run.rope(plan, &buffers.q, &buffers.k, &buffers.v, &buffers.qkv)?;
+            run.attention(plan, &buffers.attn, &buffers.q, &buffers.k, &buffers.v)?;
+        }
+        let out = Shape::new(rows, plan.hidden, plan.hidden);
+        run.stage("attention output", &buffers.attn, rows * plan.hidden)?;
+        run.multiply("attention output", &buffers.scratch, &block.proj, out)?;
+        run.bias_residual(
+            "attention residual",
+            &buffers.scratch,
+            &block.proj,
+            &buffers.state,
+            out,
+        )?;
+        buffers.advance();
+
+        run.norm_split("norm2", &buffers.state, &block.norm2, rows, plan.hidden)?;
+        let inner = Shape::new(rows, plan.intermediate, plan.hidden);
+        run.multiply("feed-forward in", &buffers.feed_forward, &block.fc1, inner)?;
+        run.bias_gelu_split("block activation", &buffers.feed_forward, &block.fc1, inner)?;
+        let back = Shape::new(rows, plan.hidden, plan.intermediate);
+        run.multiply("feed-forward out", &buffers.scratch, &block.fc2, back)?;
+        run.bias_residual(
+            "feed-forward residual",
+            &buffers.scratch,
+            &block.fc2,
+            &buffers.state,
+            back,
         )?;
         buffers.advance();
         Ok(())
@@ -612,6 +677,19 @@ fn sample(index: usize, extent: usize, span: f32, side: usize) -> (usize, usize,
     (low_index, high_index, position - low)
 }
 
+/// The tensor-core attention's argument block.
+#[expect(clippy::cast_precision_loss, reason = "head_dim is a small dimension")]
+fn mma_args(plan: &Plan, split: &SplitPlanes) -> AttentionMmaArgs {
+    AttentionMmaArgs {
+        rows: narrow(plan.rows),
+        heads: narrow(plan.heads),
+        head_dim: narrow(plan.head_dim),
+        plane: narrow(plan.plane),
+        plane_pad: narrow(split.plane_pad),
+        scale: 1.0 / (plan.head_dim as f32).sqrt(),
+    }
+}
+
 /// Widens a brain-float tensor off the device into host floats.
 fn read_bf16(backend: &Arc<dyn Backend>, tensor: &TowerTensor) -> Result<Vec<f32>, VisionError> {
     if tensor.dtype() != DType::BF16 {
@@ -727,11 +805,173 @@ impl Shape {
     }
 }
 
-/// One encode's device handle and the two constants no container states.
+/// Which of the device's faster entries an encode may use.
+///
+/// Probed from the module's own entry list rather than from the backend's
+/// name: a build that compiled the tensor-core entries has them, one that did
+/// not (Metal, or a build with no kernels) runs the scalar set, and nothing
+/// above the backend has to know which device it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Fast {
+    /// `kernel_vit_attention_mma`, for a head no wider than it holds.
+    attention: bool,
+    /// The device's BLAS for the projections, with the two kernels that
+    /// round its operand and add its bias.
+    blas: bool,
+    /// `kernel_vit_qkv_rope_split`, which folds the fused projection's bias,
+    /// the rotation and the key/value split into one pass.
+    rope_split: bool,
+}
+
+impl Fast {
+    /// The scalar set everywhere.
+    pub(crate) const SCALAR: Self = Self {
+        attention: false,
+        blas: false,
+        rope_split: false,
+    };
+
+    /// What `backend` offers, for a tower whose head is `head_dim` wide.
+    fn probe(backend: &Arc<dyn Backend>, head_dim: usize) -> Self {
+        let entries = backend.module_entries(MODULE);
+        let has = |name: &str| entries.iter().any(|entry| entry == name);
+        let attention = has(ATTENTION_MMA)
+            && has(SPLIT_KV)
+            && head_dim <= MMA_HEAD_DIM
+            && head_dim.is_multiple_of(2);
+        Self {
+            attention,
+            rope_split: attention && has(ROPE_SPLIT),
+            blas: backend.as_blas().is_some()
+                && [
+                    TO_BF16,
+                    ADD_BIAS_BF16,
+                    NORM_SPLIT,
+                    BIAS_GELU_SPLIT,
+                    BIAS_RESIDUAL,
+                ]
+                .iter()
+                .all(|name| has(name)),
+        }
+    }
+}
+
+/// The tensor-core attention's entry; see `kernels/cuda/vision/vit_fast.cuh`.
+const ATTENTION_MMA: &str = "kernel_vit_attention_mma";
+/// The operand rounding a BLAS projection reads.
+const TO_BF16: &str = "kernel_vit_to_bf16";
+/// A BLAS projection's bias epilogue.
+const ADD_BIAS_BF16: &str = "kernel_vit_add_bias_bf16";
+/// The normalization written as the next projection's split operand.
+const NORM_SPLIT: &str = "kernel_vit_layer_norm_split";
+/// The first feed-forward layer's bias and activation, as the second's operand.
+const BIAS_GELU_SPLIT: &str = "kernel_vit_bias_gelu_split";
+/// A projection's bias and the block's residual in one pass.
+const BIAS_RESIDUAL: &str = "kernel_vit_add_bias_residual";
+/// The fused projection's bias, the rotation and the key/value split.
+const ROPE_SPLIT: &str = "kernel_vit_qkv_rope_split";
+/// Widest head the tensor-core attention holds: `VIT_FA_HD`.
+const MMA_HEAD_DIM: usize = 80;
+/// Queries one tensor-core attention block owns: `VIT_FA_BQ`.
+const MMA_QUERIES: usize = 128;
+/// Keys one tensor-core attention tile stages: `VIT_FA_BK`.
+const MMA_KEYS: usize = 64;
+/// The split into brain-float pairs the tensor-core attention reads.
+const SPLIT_KV: &str = "kernel_vit_split_kv";
+/// Threads of one tensor-core attention block: eight warps.
+const MMA_THREADS: u32 = 256;
+/// Dynamic shared memory of one tensor-core attention block: `VIT_FA_SMEM`,
+/// two staged tiles of brain-float key and value pairs. Past the 48 KiB
+/// default, which the backend raises for the entry on its first launch.
+const MMA_SMEM: u32 = 2 * 2 * 2 * (64 * (80 + 8) + 80 * (64 + 8));
+
+/// One encode's device handle, the two constants no container states, and
+/// which faster path it runs.
 struct Run<'a> {
     backend: &'a Arc<dyn Backend>,
     eps: f32,
     rope_base: f32,
+    fast: Fast,
+    /// A projection's operand as two brain-float planes, the nearest value and
+    /// what it left over, sized for the widest one of this encode; `None`
+    /// unless the projections run in the BLAS.
+    operand: Option<DeviceBuffer>,
+    /// The key and value planes split into brain-float pairs, in the layout
+    /// the tensor-core attention stages them from; `None` unless it runs.
+    split: Option<SplitPlanes>,
+}
+
+/// `kernel_vit_split_kv`'s two outputs.
+struct SplitPlanes {
+    keys: DeviceBuffer,
+    values: DeviceBuffer,
+    /// A temporal group's length rounded up to whole key tiles.
+    plane_pad: usize,
+}
+
+impl<'a> Run<'a> {
+    /// The run for one encode of `plan` on `backend`.
+    fn new(
+        backend: &'a Arc<dyn Backend>,
+        encoder: VisionEncoder,
+        plan: &Plan,
+    ) -> Result<Self, VisionError> {
+        let fast = if encoder.scalar_only {
+            Fast::SCALAR
+        } else {
+            Fast::probe(backend, plan.head_dim)
+        };
+        // The widest operand any projection reads: the patch rows, the
+        // hidden stream, the feed-forward rows, or the merger's folded rows,
+        // which are the hidden stream regrouped.
+        let widest = plan.rows * plan.patch_dim.max(plan.hidden).max(plan.intermediate);
+        let operand = if fast.blas {
+            Some(
+                alloc(backend, u64::try_from(widest).unwrap_or(u64::MAX) * 4).map_err(
+                    |source| VisionError::Encode {
+                        step: "brain-float operand",
+                        source,
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let split = if fast.attention {
+            let plane_pad = plan.plane.div_ceil(MMA_KEYS) * MMA_KEYS;
+            let groups = plan.rows / plan.plane.max(1);
+            // Two halves of every head's padded keys, each MMA_HEAD_DIM wide,
+            // two bytes an element.
+            let bytes = u64::try_from(2 * plan.heads * groups * plane_pad * MMA_HEAD_DIM * 2)
+                .unwrap_or(u64::MAX);
+            // Cleared once: `kernel_vit_qkv_rope_split` writes only real key
+            // rows, and a padding row must hold zeros for the attention's
+            // masked keys to stay finite.
+            let plane = |step| {
+                let buffer =
+                    alloc(backend, bytes).map_err(|source| VisionError::Encode { step, source })?;
+                backend
+                    .fill_zero(buffer.view())
+                    .map_err(|source| VisionError::Encode { step, source })?;
+                Ok::<_, VisionError>(buffer)
+            };
+            Some(SplitPlanes {
+                keys: plane("split key plane")?,
+                values: plane("split value plane")?,
+                plane_pad,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            backend,
+            eps: encoder.eps,
+            rope_base: encoder.rope_base,
+            fast,
+            operand,
+            split,
+        })
+    }
 }
 
 impl Run<'_> {
@@ -800,6 +1040,11 @@ impl Run<'_> {
         layer: &Affine<TowerTensor>,
         shape: Shape,
     ) -> Result<(), VisionError> {
+        if self.staged_operand().is_some() {
+            self.stage(step, input, shape.rows * shape.in_width)?;
+            self.multiply(step, out, layer, shape)?;
+            return self.add_bias(step, out, layer, shape);
+        }
         let weight = bf16_view(&layer.weight)?;
         let bias = bf16_view(&layer.bias)?;
         let args = GemmArgs {
@@ -823,6 +1068,226 @@ impl Run<'_> {
                 KernelArg::Buffer(input.view()),
                 KernelArg::Buffer(weight),
                 KernelArg::Buffer(bias),
+            ],
+        )
+    }
+
+    /// The split-operand staging, when the projections run in the device's
+    /// BLAS; `None` runs them on the scalar GEMM.
+    fn staged_operand(&self) -> Option<&DeviceBuffer> {
+        self.operand
+            .as_ref()
+            .filter(|_| self.fast.blas && self.backend.as_blas().is_some())
+    }
+
+    /// The operand planes as a view of `reads` elements each, hi then lo.
+    fn operand_planes(
+        &self,
+        step: &'static str,
+        reads: usize,
+    ) -> Result<DeviceView<'_>, VisionError> {
+        let operand = self.staged_operand().ok_or(VisionError::Encode {
+            step,
+            source: shiso_core::CoreError::Unsupported {
+                what: "a split operand on a run with no BLAS projections",
+                backend: "vision",
+            },
+        })?;
+        let bytes = u64::try_from(reads).unwrap_or(u64::MAX).saturating_mul(4);
+        operand
+            .slice(0, bytes)
+            .map_err(|source| VisionError::Encode { step, source })
+    }
+
+    /// Splits `input` into the operand planes the next [`Self::multiply`] reads.
+    fn stage(
+        &self,
+        step: &'static str,
+        input: &DeviceBuffer,
+        reads: usize,
+    ) -> Result<(), VisionError> {
+        let planes = self.operand_planes(step, reads)?;
+        self.launch(
+            step,
+            TO_BF16,
+            Extent3::linear(grid_for(reads, LINEAR_BLOCK)),
+            Extent3::linear(LINEAR_BLOCK),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&UnaryArgs {
+                    count: narrow(reads),
+                })),
+                KernelArg::Buffer(planes),
+                KernelArg::Buffer(input.view()),
+            ],
+        )
+    }
+
+    /// `out[m, n] = operand[m, k] . weight[n, k]`, from the staged planes: one
+    /// brain-float multiply per plane, accumulated in single precision.
+    ///
+    /// Two multiplies rather than one because a single rounding of the operand
+    /// moved this tower's output by a percent of its largest value; the weights
+    /// are brain-float as stored, so the pair loses nothing on either side.
+    fn multiply(
+        &self,
+        step: &'static str,
+        out: &DeviceBuffer,
+        layer: &Affine<TowerTensor>,
+        shape: Shape,
+    ) -> Result<(), VisionError> {
+        let fail = |source| VisionError::Encode { step, source };
+        let blas = self.backend.as_blas().ok_or(VisionError::Encode {
+            step,
+            source: shiso_core::CoreError::Unsupported {
+                what: "a BLAS projection on a device with no BLAS",
+                backend: "vision",
+            },
+        })?;
+        let reads = shape.rows * shape.in_width;
+        let planes = self.operand_planes(step, reads)?;
+        let plane = u64::try_from(reads).unwrap_or(u64::MAX) * 2;
+        let weight = bf16_view(&layer.weight)?;
+        let (m, n, k) = (
+            narrow(shape.out_width),
+            narrow(shape.rows),
+            narrow(shape.in_width),
+        );
+        for (half, beta) in [(0u64, 0.0f32), (1, 1.0)] {
+            blas.gemm(&shiso_core::GemmDesc {
+                op_a: shiso_core::GemmOp::Transposed,
+                op_b: shiso_core::GemmOp::AsStored,
+                m,
+                n,
+                k,
+                lda: k,
+                ldb: k,
+                ldc: m,
+                a: weight,
+                b: planes.slice(half * plane, plane).map_err(fail)?,
+                c: out.view(),
+                alpha: 1.0,
+                // The second plane adds onto the first's product.
+                beta,
+                dtype: shiso_core::GemmDType::BF16,
+                reduction: shiso_core::GemmReduction::Fastest,
+            })
+            .map_err(fail)?;
+        }
+        Ok(())
+    }
+
+    /// A BLAS projection's bias, in place.
+    fn add_bias(
+        &self,
+        step: &'static str,
+        out: &DeviceBuffer,
+        layer: &Affine<TowerTensor>,
+        shape: Shape,
+    ) -> Result<(), VisionError> {
+        let writes = shape.rows * shape.out_width;
+        self.launch(
+            step,
+            ADD_BIAS_BF16,
+            Extent3::linear(grid_for(writes, LINEAR_BLOCK)),
+            Extent3::linear(LINEAR_BLOCK),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&AddArgs {
+                    count: narrow(writes),
+                    period: narrow(shape.out_width),
+                })),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(bf16_view(&layer.bias)?),
+            ],
+        )
+    }
+
+    /// [`Self::layer_norm`] written straight into the operand planes of the
+    /// projection that reads it.
+    fn norm_split(
+        &self,
+        step: &'static str,
+        input: &DeviceBuffer,
+        layer: &Affine<TowerTensor>,
+        rows: usize,
+        dim: usize,
+    ) -> Result<(), VisionError> {
+        let planes = self.operand_planes(step, rows * dim)?;
+        let args = LayerNormArgs {
+            rows: narrow(rows),
+            dim: narrow(dim),
+            eps: self.eps,
+        };
+        self.launch(
+            step,
+            NORM_SPLIT,
+            Extent3::linear(narrow(rows)),
+            Extent3::linear(NORM_BLOCK),
+            NORM_SMEM,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(planes),
+                KernelArg::Buffer(input.view()),
+                KernelArg::Buffer(bf16_view(&layer.weight)?),
+                KernelArg::Buffer(bf16_view(&layer.bias)?),
+            ],
+        )
+    }
+
+    /// The first feed-forward layer's bias and activation, written as the
+    /// second layer's operand planes.
+    fn bias_gelu_split(
+        &self,
+        step: &'static str,
+        x: &DeviceBuffer,
+        layer: &Affine<TowerTensor>,
+        shape: Shape,
+    ) -> Result<(), VisionError> {
+        let count = shape.rows * shape.out_width;
+        let planes = self.operand_planes(step, count)?;
+        self.launch(
+            step,
+            BIAS_GELU_SPLIT,
+            Extent3::linear(grid_for(count, LINEAR_BLOCK)),
+            Extent3::linear(LINEAR_BLOCK),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&AddArgs {
+                    count: narrow(count),
+                    period: narrow(shape.out_width),
+                })),
+                KernelArg::Buffer(planes),
+                KernelArg::Buffer(x.view()),
+                KernelArg::Buffer(bf16_view(&layer.bias)?),
+            ],
+        )
+    }
+
+    /// A BLAS projection's bias and the block's residual, in place on `x`.
+    fn bias_residual(
+        &self,
+        step: &'static str,
+        x: &DeviceBuffer,
+        layer: &Affine<TowerTensor>,
+        residual: &DeviceBuffer,
+        shape: Shape,
+    ) -> Result<(), VisionError> {
+        let count = shape.rows * shape.out_width;
+        self.launch(
+            step,
+            BIAS_RESIDUAL,
+            Extent3::linear(grid_for(count, LINEAR_BLOCK)),
+            Extent3::linear(LINEAR_BLOCK),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&AddArgs {
+                    count: narrow(count),
+                    period: narrow(shape.out_width),
+                })),
+                KernelArg::Buffer(x.view()),
+                KernelArg::Buffer(bf16_view(&layer.bias)?),
+                KernelArg::Buffer(residual.view()),
             ],
         )
     }
@@ -964,6 +1429,32 @@ impl Run<'_> {
             // as an argument so a tower that does not (gemma 4) can pass one.
             scale: 1.0 / (plan.head_dim as f32).sqrt(),
         };
+        let planes = [
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(q.view()),
+            KernelArg::Buffer(k.view()),
+            KernelArg::Buffer(v.view()),
+        ];
+        if let Some(split) = self.split.as_ref() {
+            let groups = plan.rows / plan.plane.max(1);
+            let mma = mma_args(plan, split);
+            self.launch(
+                "attention operand split",
+                SPLIT_KV,
+                Extent3::linear(narrow(groups * split.plane_pad)),
+                Extent3::linear(LINEAR_BLOCK),
+                0,
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&mma)),
+                    KernelArg::Buffer(split.keys.view()),
+                    KernelArg::Buffer(split.values.view()),
+                    KernelArg::Buffer(k.view()),
+                    KernelArg::Buffer(v.view()),
+                ],
+            )?;
+            return self.attention_staged(plan, out, q);
+        }
         // The query row, one accumulator per simdgroup, then the per-simdgroup
         // softmax maximum and denominator. Same formula as `KERNELS.md`.
         let warps = ATTN_BLOCK / 32;
@@ -974,12 +1465,81 @@ impl Run<'_> {
             Extent3::new(narrow(plan.heads), narrow(plan.rows), 1),
             Extent3::linear(ATTN_BLOCK),
             smem,
+            &planes,
+        )
+    }
+
+    /// The split planes, or the refusal a run without them owes `step`.
+    fn split_planes(&self, step: &'static str) -> Result<&SplitPlanes, VisionError> {
+        self.split.as_ref().ok_or(VisionError::Encode {
+            step,
+            source: shiso_core::CoreError::Unsupported {
+                what: "a tensor-core attention step on a run with no split planes",
+                backend: "vision",
+            },
+        })
+    }
+
+    /// The tensor-core attention over queries `q` and the split planes as they
+    /// stand, however they were written.
+    fn attention_staged(
+        &self,
+        plan: &Plan,
+        out: &DeviceBuffer,
+        q: &DeviceBuffer,
+    ) -> Result<(), VisionError> {
+        let split = self.split_planes("attention")?;
+        let groups = plan.rows / plan.plane.max(1);
+        let tiles = plan.plane.div_ceil(MMA_QUERIES);
+        let mma = mma_args(plan, split);
+        self.launch(
+            "attention",
+            ATTENTION_MMA,
+            Extent3::new(narrow(plan.heads), narrow(groups * tiles), 1),
+            Extent3::linear(MMA_THREADS),
+            MMA_SMEM,
             &[
-                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Bytes(bytemuck::bytes_of(&mma)),
                 KernelArg::Buffer(out.view()),
                 KernelArg::Buffer(q.view()),
-                KernelArg::Buffer(k.view()),
-                KernelArg::Buffer(v.view()),
+                KernelArg::Buffer(split.keys.view()),
+                KernelArg::Buffer(split.values.view()),
+            ],
+        )
+    }
+
+    /// The fused projection's bias, the rotation, and the key/value planes
+    /// written straight into the split planes; `q` comes out rotated.
+    fn rope_split(
+        &self,
+        plan: &Plan,
+        q: &DeviceBuffer,
+        qkv: &DeviceBuffer,
+        layer: &Affine<TowerTensor>,
+    ) -> Result<(), VisionError> {
+        let split = self.split_planes("rotation")?;
+        let args = RopeSplitArgs {
+            rows: narrow(plan.rows),
+            heads: narrow(plan.heads),
+            head_dim: narrow(plan.head_dim),
+            grid_w: narrow(plan.grid_w),
+            plane: narrow(plan.plane),
+            plane_pad: narrow(split.plane_pad),
+            rope_base: self.rope_base,
+        };
+        self.launch(
+            "rotation",
+            ROPE_SPLIT,
+            Extent3::new(narrow(plan.heads), narrow(plan.rows), 1),
+            Extent3::linear(ATTN_BLOCK),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(q.view()),
+                KernelArg::Buffer(split.keys.view()),
+                KernelArg::Buffer(split.values.view()),
+                KernelArg::Buffer(qkv.view()),
+                KernelArg::Buffer(bf16_view(&layer.bias)?),
             ],
         )
     }
@@ -1106,6 +1666,19 @@ struct RopeArgs {
     rope_base: f32,
 }
 
+/// `vit_args_qkv_rope_split`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct RopeSplitArgs {
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+    grid_w: u32,
+    plane: u32,
+    plane_pad: u32,
+    rope_base: f32,
+}
+
 /// `vit_args_attention`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -1114,6 +1687,18 @@ struct AttentionArgs {
     heads: u32,
     head_dim: u32,
     plane: u32,
+    scale: f32,
+}
+
+/// `vit_args_attention_mma`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct AttentionMmaArgs {
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+    plane: u32,
+    plane_pad: u32,
     scale: f32,
 }
 

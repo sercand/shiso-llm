@@ -27,3 +27,4 @@
 #include "vit_linear.cuh"
 #include "vit_tower.cuh"
 #include "vit_seam.cuh"
+#include "vit_fast.cuh"

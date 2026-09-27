@@ -118,6 +118,12 @@ pub fn splice(n_tok: u32) -> Plan {
     plan
 }
 
+/// The one position rule this family walks every request by: a placeholder
+/// token's three axes are a grid coordinate. The dense families read theirs off
+/// the config because two of them disagree; there is one of this one.
+pub(crate) const MEDIA_POSITIONS: crate::shape::MediaPositions =
+    crate::shape::MediaPositions::Mrope3D;
+
 /// A multimodal prefill part way through its chunks.
 ///
 /// The walk is the part that cannot be rebuilt per chunk: it carries the
@@ -139,16 +145,18 @@ pub(crate) struct MediaRun<'a> {
 }
 
 impl<'a> MediaRun<'a> {
-    /// Starts a run over `prefill`, with the walk's running position at
-    /// `start`.
+    /// Starts a run over `prefill`, with the walk's sequence position at
+    /// `start` and its rotary position `rope_shift` behind it.
     pub(crate) fn new(
         prefill: &VisionPrefill<'a>,
         start: u32,
+        rope_shift: u32,
         positions: crate::shape::MediaPositions,
     ) -> Self {
         Self {
             prefill: *prefill,
-            walk: crate::vision::Walk::new(prefill.grids(), prefill.pads(), start, positions),
+            walk: crate::vision::Walk::new(prefill.grids(), prefill.pads(), start, positions)
+                .at_rotary(start.saturating_sub(rope_shift)),
             prefix: Vec::new(),
         }
     }

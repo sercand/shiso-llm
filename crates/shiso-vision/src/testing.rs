@@ -26,14 +26,22 @@ pub(crate) fn vision_config() -> VisionConfig {
 
 /// A solid-colour image, encoded as PNG.
 pub(crate) fn png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    encoded(width, height, rgb, image::ImageFormat::Png)
+}
+
+/// A solid-colour image in `format`. Lossless formats only, so the decoded
+/// pixels are the colour asked for.
+pub(crate) fn encoded(
+    width: u32,
+    height: u32,
+    rgb: [u8; 3],
+    format: image::ImageFormat,
+) -> Vec<u8> {
     let image = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
     let mut bytes = Vec::new();
     image::DynamicImage::ImageRgb8(image)
-        .write_to(
-            &mut std::io::Cursor::new(&mut bytes),
-            image::ImageFormat::Png,
-        )
-        .expect("encoding a solid-colour PNG");
+        .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+        .expect("encoding a solid-colour image");
     bytes
 }
 

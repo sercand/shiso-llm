@@ -30,6 +30,7 @@ pub mod cli;
 pub mod error;
 pub mod ids;
 pub mod media;
+pub mod media_cache;
 pub mod model_factory;
 pub mod openai;
 pub mod response_store;
@@ -293,12 +294,20 @@ fn boot_language_model(
         thinking_default = defaults.thinking_default,
         "output parsers configured"
     );
+    // One cache, read by the renderer and filled by the engine thread, so a
+    // picture is decoded and encoded once however many turns carry it.
+    let media_cache = (vision.is_some() || audio.is_some()).then(|| {
+        Arc::new(media_cache::MediaCache::new(
+            args.vision_cache_mb.saturating_mul(1 << 20),
+        ))
+    });
     let (engine, join) = scheduler::spawn_engine_with_checkpoints(
         Arc::clone(&backend),
         model,
         media::MediaTowers {
             vision,
             audio: audio.clone(),
+            cache: media_cache.clone(),
         },
         vocabulary.clone(),
         &model_id,
@@ -328,7 +337,10 @@ fn boot_language_model(
             audio,
             turn_replay,
         ) {
-            let renderer = defaults.configure(renderer);
+            let mut renderer = defaults.configure(renderer);
+            if let Some(cache) = media_cache {
+                renderer = renderer.with_media_cache(cache);
+            }
             state = state.with_renderer(Arc::new(renderer));
         }
         state = state.with_vocabulary(vocabulary);

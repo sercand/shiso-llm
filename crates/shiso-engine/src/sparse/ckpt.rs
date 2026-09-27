@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
+use shiso_core::media::{KEY_ID_FLOOR, MediaKey, MediaSpan};
 use shiso_core::model::Logits;
 use shiso_kvstore::{
     CacheStats, CommitOpts, KvCache, PathLayout, PersistRefusal, PumpReport, Reason,
@@ -58,7 +59,7 @@ use crate::sparse::mtp::SpecDepth;
 use crate::sparse::paged::{self, PagePlanes, conv_state_bytes, ple_window_bytes, state_bytes};
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
-use crate::sparse::stack::{MAX_PREFILL_CHUNK, SparseSession, SparseStack};
+use crate::sparse::stack::{MAX_PREFILL_CHUNK, SessionKey, SparseSession, SparseStack};
 
 /// Bytes per stored key/value element: this family's cache is half precision end
 /// to end, exactly as the dense one's is.
@@ -307,15 +308,16 @@ impl SparseStack {
         // stop, and every rendered prompt shares at least its template's opening
         // with one before it, so the branch lay behind every prompt's end but the
         // first one a process read. A stride position still has to be the
-        // cache's own stop. A session that read media is never checkpointed: its
-        // placeholder runs cannot tell two pictures apart.
+        // cache's own stop. A session that read media is checkpointed only
+        // under a content key - its placeholder runs cannot tell two pictures
+        // apart - and never inside a run, where no later pass could continue.
         let admit = (earned || periodic)
             && staged
-            && !live.media
+            && keyed_at(live, q)
             && (earned
                 || resident.cache.next_admission(
                     live.pages.frontier(),
-                    &live.history,
+                    live.cache_path(),
                     &[],
                     MAX_PREFILL_CHUNK,
                 ) == Some(q));
@@ -413,9 +415,10 @@ impl SparseStack {
         let q = live
             .written()
             .saturating_add(u32::try_from(row).unwrap_or(u32::MAX));
-        let mut path = Vec::with_capacity(live.history.len().saturating_add(lead.len()));
-        path.extend_from_slice(&live.history);
-        path.extend_from_slice(lead);
+        if !keyed_at(live, q) {
+            return Ok(false);
+        }
+        let path = live.cache_path_with(lead);
         let reason = if live.resumed_at == 0 {
             Reason::Cold
         } else {
@@ -465,10 +468,10 @@ impl SparseStack {
         let live = sessions
             .get_mut(&session)
             .ok_or(CoreError::UnknownSession(session))?;
-        if live.media {
+        let q = live.written();
+        if !keyed_at(live, q) {
             return Ok(SaveOutcome::CarriesMedia);
         }
-        let q = live.written();
         // The floor is checked before the snapshot: below it the store would
         // refuse the entry, and the snapshot is the expensive half.
         let min = options.min_tokens;
@@ -551,6 +554,63 @@ impl SparseStack {
         Ok(())
     }
 
+    /// Files `session`'s path under a media prompt's content key. See
+    /// [`crate::ckpt::Checkpointed::kv_set_media_key`].
+    ///
+    /// Set before anything is read: the key names the prompt's positions from
+    /// zero, and a session that already wrote some has filed them under its
+    /// bare ids.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`], [`CoreError::Unsupported`] for a session
+    /// that has already written, and [`CoreError::InvalidValue`] for a key that
+    /// is not `prompt` with only its spans rewritten.
+    pub fn ckpt_set_media_key(
+        &mut self,
+        session: SessionId,
+        prompt: &[TokenId],
+        key: MediaKey<'_>,
+    ) -> CoreResult<()> {
+        let live = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        if live.written() != 0 {
+            return Err(CoreError::Unsupported {
+                what: "a media key on a session that has already written",
+                backend: "engine",
+            });
+        }
+        let path = key.path();
+        let differs = path.len() != prompt.len()
+            || path
+                .iter()
+                .zip(prompt)
+                .any(|(keyed, own)| keyed != own && keyed.get() < KEY_ID_FLOOR);
+        if differs {
+            return Err(CoreError::InvalidValue {
+                key: "media cache key",
+                value: format!(
+                    "a {}-token key for a {}-token prompt that differs outside its spans",
+                    path.len(),
+                    prompt.len()
+                ),
+            });
+        }
+        // Marked media now rather than when a chunk splices: a resume can cover
+        // every picture, and the tail it leaves is then read as text - but the
+        // path still carries placeholder runs, and dropping the key must never
+        // leave it checkpointable under them.
+        live.media = true;
+        live.key = Some(SessionKey {
+            prompt: path.to_vec(),
+            spans: key.spans().to_vec(),
+            path: Vec::with_capacity(path.len()),
+        });
+        Ok(())
+    }
+
     /// Copies up to `max_bytes` of queued checkpoint pages off the device.
     ///
     /// # Errors
@@ -569,6 +629,28 @@ impl SparseStack {
         self.resident
             .as_ref()
             .is_none_or(|resident| resident.cache.drain(timeout))
+    }
+
+    /// The path a resume of `prompt` looks up, and the pictures on it.
+    ///
+    /// A keyed session matches under its key and reads under its own ids; the
+    /// two are the same length and differ only inside the spans, which
+    /// [`Self::ckpt_set_media_key`] checked.
+    fn resume_path(
+        &self,
+        session: SessionId,
+        prompt: &[TokenId],
+    ) -> CoreResult<(Vec<TokenId>, Vec<MediaSpan>)> {
+        match &self.session(session)?.key {
+            Some(key) if key.prompt.len() == prompt.len() => {
+                Ok((key.prompt.clone(), key.spans.clone()))
+            }
+            Some(_) => Err(CoreError::InvalidValue {
+                key: "media cache key",
+                value: "a resume of a prompt other than the one the key was set for".into(),
+            }),
+            None => Ok((prompt.to_vec(), Vec::new())),
+        }
     }
 
     /// Stands `session` on the deepest usable checkpoint of `prompt`. See
@@ -597,13 +679,29 @@ impl SparseStack {
         let capacity = self.opts.engine.ctx;
         let vocab = self.shape.vocab;
         let cache = Arc::clone(&self.resident()?.cache);
-        let Some(resume) = cache.resume(prompt, now).map_err(cache_failure)? else {
+        let (lookup, spans) = self.resume_path(session, prompt)?;
+        let Some(resume) = cache.resume(&lookup, now).map_err(cache_failure)? else {
             return Ok(None);
         };
         let Some(reference) = resume.ckpt else {
             return Ok(None);
         };
         let reused = resume.ckpt_pos.min(capacity);
+        // The rotary stream a resumed session continues from is a fact about
+        // the pictures behind it, and the key pins those: the same key path is
+        // the same pictures, so the shift is recomputed here rather than
+        // stored. A checkpoint inside a run is never admitted; one found there
+        // anyway is dropped - which returns its pages - rather than continued
+        // halfway through an item.
+        let Some(rope_shift) =
+            crate::vision::rotary_shift_at(&spans, reused, crate::sparse::media::MEDIA_POSITIONS)
+        else {
+            tracing::warn!(
+                reused,
+                "a stored media prefix ends inside a picture; prefilling instead"
+            );
+            return Ok(None);
+        };
         let whole = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
         let want_row = u64::from(vocab).saturating_mul(F32_BYTES);
         let row = if reused == whole {
@@ -634,6 +732,11 @@ impl SparseStack {
             live.pages.adopt(resume.frontier)?;
             live.history.clear();
             live.history.extend_from_slice(&tokens);
+            if let Some(key) = live.key.as_mut() {
+                key.path.clear();
+                key.path.extend_from_slice(&lookup[..tokens.len()]);
+            }
+            live.rope_shift = rope_shift;
             live.written = reused;
             live.resumed_at = reused;
             restore_state(backend.as_ref(), live, &blob)?;
@@ -667,6 +770,15 @@ impl SparseStack {
             "resumed a stored sparse prefix"
         );
         Ok(Some(ResumeInfo::new(reused, tokens, logits, source)))
+    }
+}
+
+/// Whether `live` may be checkpointed at `q`: a text session anywhere, and a
+/// media session only under a content key and never inside one of its runs.
+fn keyed_at(live: &SparseSession, q: u32) -> bool {
+    match &live.key {
+        None => !live.media,
+        Some(key) => !key.spans.iter().any(|span| span.splits(q)),
     }
 }
 
