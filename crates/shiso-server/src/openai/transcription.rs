@@ -91,6 +91,9 @@ async fn answer(state: &AppState, multipart: Multipart) -> Result<Response, AppE
         asr_id: audio.asr_id(),
         has_diarizer: audio.has_diarizer(),
     })?;
+    // Refused before the audio is decoded: a context the recognizer cannot
+    // carry is the request's fault whatever the audio holds.
+    let context = audio.encode_context(&form.context)?;
     let pcm = audio
         .decode(form.file.clone())
         .await
@@ -99,6 +102,7 @@ async fn answer(state: &AppState, multipart: Multipart) -> Result<Response, AppE
     let mut events = audio.submit(TranscriptionJob {
         pcm,
         language: form.language.clone().map_or(Language::Auto, Language::Tag),
+        context,
         diarize,
         streaming: form.stream,
     })?;

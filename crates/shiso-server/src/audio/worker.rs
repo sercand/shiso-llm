@@ -61,16 +61,23 @@ struct Active {
     flushed: bool,
 }
 
+/// What a stream that waits is opened with once it can be.
+struct Opening {
+    language: Language,
+    context: ContextIds,
+}
+
 /// A job's recognizer stream, or what opening it waits for.
 enum Stream {
     Open(Box<dyn RecognizerStream>),
     /// A chunking recognizer on a diarized job: its stream opens with the
     /// speaker turns as cuts, so it waits for the activity with the
-    /// language it will be opened in.
-    AwaitingTurns(Language),
+    /// language and context it will be opened with.
+    AwaitingTurns(Opening),
     /// An offline job still to be planned: it waits for the activity, when
-    /// a diarizer is loaded, with the language it will be opened in.
-    AwaitingPlan(Language),
+    /// a diarizer is loaded, with the language and context it will be
+    /// opened with.
+    AwaitingPlan(Opening),
     /// An offline job, planned and opened.
     Offline(Offline),
 }
@@ -209,6 +216,7 @@ fn start(
     let TranscriptionJob {
         pcm,
         language,
+        context,
         diarize,
         streaming,
     } = job;
@@ -257,15 +265,15 @@ fn start(
     // than at silence, so its stream waits for them; one that does not chunk
     // runs beside its diarizer as before.
     let stream = if offline {
-        Stream::AwaitingPlan(language)
+        Stream::AwaitingPlan(Opening { language, context })
     } else if diarizing.is_some() && recognizer.chunks_at_cuts() {
-        Stream::AwaitingTurns(language)
+        Stream::AwaitingTurns(Opening { language, context })
     } else {
         Stream::Open(recognizer.open_stream(&StreamOptions {
             language,
             lookahead: desc.lookahead,
             cuts: None,
-            context: ContextIds::default(),
+            context,
         })?)
     };
     Ok(Active {
@@ -383,7 +391,7 @@ fn fail(job: &Active, error: &AudioError, caller: bool) -> Turn {
 /// when it has the activity, by the silence rule otherwise - and opens it;
 /// `Some` when that failed and ends the job.
 fn open_offline(desc: &AudioServiceDesc, job: &mut Active) -> Option<Turn> {
-    let Stream::AwaitingPlan(language) = &job.stream else {
+    let Stream::AwaitingPlan(opening) = &job.stream else {
         return None;
     };
     let planned = mel_frame_secs(desc.recognizer.mel_spec()).and_then(|secs| {
@@ -413,10 +421,10 @@ fn open_offline(desc: &AudioServiceDesc, job: &mut Active) -> Option<Turn> {
     let cut_secs = span_cuts(&spans, secs);
     let opened = desc.recognizer.open_offline(
         &StreamOptions {
-            language: language.clone(),
+            language: opening.language.clone(),
             lookahead: desc.lookahead,
             cuts: None,
-            context: ContextIds::default(),
+            context: opening.context.clone(),
         },
         spans,
     );
@@ -493,7 +501,7 @@ fn step_offline(desc: &AudioServiceDesc, job: &mut Active) -> Turn {
 /// Opens a waiting stream once the job's speaker activity is known, cut at
 /// its turns; `Some` when opening failed and that ends the job.
 fn open_at_turns(desc: &AudioServiceDesc, job: &mut Active) -> Option<Turn> {
-    let (Stream::AwaitingTurns(language), Some(activity)) = (&job.stream, &job.activity) else {
+    let (Stream::AwaitingTurns(opening), Some(activity)) = (&job.stream, &job.activity) else {
         return None;
     };
     let mut frame_secs = 0.0;
@@ -518,10 +526,10 @@ fn open_at_turns(desc: &AudioServiceDesc, job: &mut Active) -> Option<Turn> {
                 .collect();
             desc.recognizer
                 .open_stream(&StreamOptions {
-                    language: language.clone(),
+                    language: opening.language.clone(),
                     lookahead: desc.lookahead,
                     cuts: Some(cuts),
-                    context: ContextIds::default(),
+                    context: opening.context.clone(),
                 })
                 .map(|stream| (stream, secs))
         });

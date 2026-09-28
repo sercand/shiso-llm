@@ -25,11 +25,22 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use shiso_audio::transcript::{Segment, Word};
-use shiso_audio::{AudioError, DecodeLimits, Diarizer, Language, Pcm, SpeechRecognizer};
+use shiso_audio::{
+    AudioError, Context, ContextEncoder, ContextIds, DecodeLimits, Diarizer, Language, Pcm,
+    SpeechRecognizer,
+};
 use shiso_vision::FfmpegPolicy;
 use tokio::sync::mpsc;
 
 use crate::error::AppError;
+
+/// The most raw bytes a context's prompt and keywords may total together,
+/// checked before either is tokenized. The upload cap is hundreds of MB and
+/// this runs on the caller's (async runtime) thread, so a huge `prompt`
+/// would otherwise tokenize synchronously there; the largest ids cap any
+/// recognizer offers is 512, and 512 ids never need more than a few KiB of
+/// source text.
+const MAX_CONTEXT_BYTES: usize = 16 * 1024;
 
 /// The largest transcription upload, when nothing else is configured:
 /// 512 MiB, a little over an hour of 44.1 kHz stereo WAV and several hours of
@@ -49,6 +60,9 @@ pub struct TranscriptionJob {
     pub pcm: Pcm,
     /// Language conditioning.
     pub language: Language,
+    /// The prompt's context, as the recognizer's ids
+    /// ([`AudioService::encode_context`]); empty for none.
+    pub context: ContextIds,
     /// Whether to attribute each word to a speaker.
     pub diarize: bool,
     /// Whether the caller reads the events as they come (`stream=true`).
@@ -125,6 +139,9 @@ pub struct AudioServiceDesc {
     pub offline_min_secs: u32,
     /// Whether an offline job skips the long silences its diarizer finds.
     pub skip_silence: bool,
+    /// The most context ids a request may carry
+    /// (`--asr-max-context-tokens`), at most the recognizer's own cap.
+    pub max_context_ids: usize,
 }
 
 /// A queued job and where its events go.
@@ -144,6 +161,10 @@ pub struct AudioService {
     limits: DecodeLimits,
     ffmpeg: Option<Arc<FfmpegPolicy>>,
     max_upload_bytes: usize,
+    /// The encoder the recognizer hands the server for its context, or
+    /// `None` for a recognizer that takes none.
+    context: Option<Arc<dyn ContextEncoder>>,
+    max_context_ids: usize,
 }
 
 impl AudioService {
@@ -162,6 +183,8 @@ impl AudioService {
             limits: desc.limits,
             ffmpeg: desc.ffmpeg.clone().map(Arc::new),
             max_upload_bytes: desc.max_upload_bytes,
+            context: desc.recognizer.context_encoder(),
+            max_context_ids: desc.max_context_ids,
         };
         // The diarizer thread ends when the worker, its only sender, does.
         let diarizer = match &desc.diarizer {
@@ -203,6 +226,50 @@ impl AudioService {
     #[must_use]
     pub const fn has_diarizer(&self) -> bool {
         self.diarizer
+    }
+
+    /// `context` as the recognizer's ids, checked against this server's
+    /// cap. Runs on the caller's thread: the encoder is plain host data.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::BadRequest`] naming `keywords` for a context sent to a
+    /// recognizer that takes none, one whose raw text is past
+    /// [`MAX_CONTEXT_BYTES`], one longer than `--asr-max-context-tokens`
+    /// once encoded, or one the encoder refuses.
+    pub fn encode_context(&self, context: &Context) -> Result<ContextIds, AppError> {
+        if context.is_empty() {
+            return Ok(ContextIds::default());
+        }
+        let refuse =
+            |message: String| AppError::bad_request(message, Some("keywords"), "invalid_request");
+        let encoder = self.context.as_ref().ok_or_else(|| {
+            refuse(format!(
+                "{} takes no keywords or prompt; send the audio alone",
+                self.asr_id
+            ))
+        })?;
+        // Checked before the encoder ever sees the text: the upload cap is
+        // hundreds of MB and this runs on the async runtime, so a caller's
+        // oversized prompt must not reach a tokenizer pass here.
+        let bytes = context.prompt.as_deref().map_or(0, str::len)
+            + context.keywords.iter().map(String::len).sum::<usize>();
+        if bytes > MAX_CONTEXT_BYTES {
+            return Err(refuse(format!(
+                "the keywords and prompt are {bytes} bytes of text; this server encodes at \
+                 most {MAX_CONTEXT_BYTES}"
+            )));
+        }
+        let ids = encoder.encode(context).map_err(|e| refuse(e.to_string()))?;
+        if ids.len() > self.max_context_ids {
+            return Err(refuse(format!(
+                "the keywords and prompt are {} tokens; this server takes at most {} \
+                 (--asr-max-context-tokens)",
+                ids.len(),
+                self.max_context_ids
+            )));
+        }
+        Ok(ids)
     }
 
     /// Decodes a request's audio to the model rate, off the async runtime: a

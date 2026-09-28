@@ -486,6 +486,12 @@ pub struct ServeArgs {
         default_value_t = crate::audio::DEFAULT_OFFLINE_MIN_SECS
     )]
     pub asr_offline_min_secs: u32,
+    /// The most tokens a transcription's `keywords` and `prompt` may take in
+    /// the recognizer's prompt, once worded and tokenized; a request past it
+    /// is refused. At most the recognizer's own cap (512 for the Qwen3-ASR
+    /// family); every chunk's prefill carries them.
+    #[arg(long, env = "SHISO_ASR_MAX_CONTEXT_TOKENS", default_value_t = 256)]
+    pub asr_max_context_tokens: usize,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -681,6 +687,11 @@ impl ServeArgs {
         }
         if self.asr_batch == 0 {
             return Err(ConfigError::Zero { flag: "asr-batch" });
+        }
+        if self.asr_max_context_tokens == 0 {
+            return Err(ConfigError::Zero {
+                flag: "asr-max-context-tokens",
+            });
         }
         // A head with no depth is refused here: it is a gigabyte of weights
         // made resident that nothing will ever ask a question, and no arm can
