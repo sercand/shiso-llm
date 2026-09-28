@@ -212,6 +212,7 @@ mod tests {
                 started_at: Instant::now(),
                 deadline,
                 budget: 8,
+                keyed: false,
             },
             None,
             shiso_parsers::passthrough(),

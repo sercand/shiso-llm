@@ -326,6 +326,13 @@ impl HybridStack {
         self.draft.is_some() || self.block.is_some()
     }
 
+    /// Whether a block drafter is resident, which is what gives the stack its
+    /// two-phase step.
+    #[must_use]
+    pub fn block_resident(&self) -> bool {
+        self.block.is_some()
+    }
+
     /// How deep this stack may draft.
     #[must_use]
     pub const fn spec_depth(&self) -> SpecDepth {

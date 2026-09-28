@@ -195,3 +195,154 @@ fn speculative_greedy_decoding_is_serial_greedy_decoding() {
         );
     }
 }
+
+/// A logits row's floats.
+fn floats(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect()
+}
+
+/// The model's own sampling defaults: temperature 1, top-k 20, top-p 0.95.
+fn sampled() -> shiso_core::SamplingParams {
+    let mut params = shiso_core::SamplingParams::neutral();
+    params.top_k = std::num::NonZeroU32::new(20);
+    params.top_p = 0.95;
+    params
+}
+
+/// `STEPS` tokens a token at a time, each the keyed draw at its position.
+fn serial_keyed(
+    backend: &Arc<dyn Backend>,
+    model_dir: &Path,
+    prompt: &[TokenId],
+    key: u64,
+) -> Vec<TokenId> {
+    let params = sampled();
+    let pick = |row: &[f32], at: usize| {
+        shiso_engine::keyed_sample(row, &params, key, u32::try_from(at).expect("a position"))
+    };
+    let mut model = load(backend, model_dir, false);
+    let vocab = model.info().vocab as usize;
+    let mut bytes = vec![0u8; vocab * 4];
+    let session = model.open_session().expect("a session");
+    let row = model
+        .prefill_last(session, prompt)
+        .expect("prompt")
+        .row(0)
+        .expect("row");
+    backend.copy_d2h(row, &mut bytes).expect("read");
+    let mut token = pick(&floats(&bytes), prompt.len());
+    let mut out = vec![token];
+    while out.len() < STEPS {
+        let step = model
+            .decode_batch(&[DecodeStep { session, token }])
+            .expect("step");
+        backend
+            .copy_d2h(step.row(0).expect("row"), &mut bytes)
+            .expect("read");
+        token = pick(&floats(&bytes), prompt.len() + out.len());
+        out.push(token);
+    }
+    model.teardown().expect("teardown");
+    out
+}
+
+/// `STEPS` tokens through the two-phase step, each row's token the keyed draw
+/// at its position; and the tokens committed per round.
+fn drafted_keyed(
+    backend: &Arc<dyn Backend>,
+    dirs: (&Path, &Path),
+    prompt: &[TokenId],
+    key: u64,
+) -> (Vec<TokenId>, f64) {
+    let params = sampled();
+    let pick = |row: &[f32], at: usize| {
+        shiso_engine::keyed_sample(row, &params, key, u32::try_from(at).expect("a position"))
+    };
+    let mut model = load(backend, dirs.0, true);
+    model
+        .bind_block_drafter(backend, dirs.1)
+        .expect("the drafter binds");
+    let vocab = model.info().vocab as usize;
+    let mut bytes = vec![0u8; vocab * 4];
+    let session = model.open_session().expect("a session");
+    let row = model
+        .prefill_last(session, prompt)
+        .expect("prompt")
+        .row(0)
+        .expect("row");
+    backend.copy_d2h(row, &mut bytes).expect("read");
+    let mut out = vec![pick(&floats(&bytes), prompt.len())];
+    let (mut rounds, mut kept) = (0u32, 0u32);
+    let hint = shiso_core::model::DraftHint {
+        key,
+        temperature: params.temperature,
+    };
+    while out.len() < STEPS {
+        let first = *out.last().expect("a token");
+        let spec = model.spec_mut().expect("speculative");
+        let block = spec
+            .verify_block(session, first, hint)
+            .expect("verify")
+            .expect("two-phase");
+        let mut accepted = 0u32;
+        for i in 0..=block.drafts.len() {
+            let token = pick(block.row(i), prompt.len() + out.len());
+            out.push(token);
+            if block.drafts.get(i) == Some(&token) {
+                accepted += 1;
+            } else {
+                break;
+            }
+        }
+        rounds += 1;
+        kept += accepted;
+        spec.settle_block(session, block, accepted).expect("settle");
+    }
+    model.teardown().expect("teardown");
+    out.truncate(STEPS);
+    (out, f64::from(kept + rounds) / f64::from(rounds))
+}
+
+/// Sampled decoding under the keyed rule: the continuation decoded through the
+/// two-phase speculative step is the one decoded a token at a time, id for id,
+/// at temperature 1 with a top-k and a nucleus - the model's own defaults.
+#[test]
+#[ignore = "needs the local 27B export, its block drafter and a Metal device"]
+fn speculative_keyed_sampling_is_serial_keyed_sampling() {
+    let Some((model_dir, draft_dir)) = dirs() else {
+        say("SKIP: SHISO_TEST_MODEL_QWEN38_27B or SHISO_TEST_DRAFT_BLOCK names no directory");
+        return;
+    };
+    if !metal_available() {
+        say("SKIP: no Metal device");
+        return;
+    }
+    let reference = reference();
+    let backend: Arc<dyn Backend> = MetalBackend::new().expect("a Metal device");
+    for record in reference["records"].as_array().expect("records") {
+        let name = record["prompt"].as_str().expect("a prompt name");
+        let prompt = ids(&record["prompt_tokens"]);
+        for key in [1234u64, 1235] {
+            let serial = serial_keyed(&backend, &model_dir, &prompt, key);
+            let (drafted, per_round) =
+                drafted_keyed(&backend, (&model_dir, &draft_dir), &prompt, key);
+            say(&format!(
+                "{name} key {key}: {per_round:.2} tokens/round sampled"
+            ));
+            let agree = serial
+                .iter()
+                .zip(&drafted)
+                .take_while(|(a, b)| a == b)
+                .count();
+            assert_eq!(
+                agree, STEPS,
+                "{name} key {key}: sampled speculative decoding parted from serial at {agree}"
+            );
+        }
+    }
+}

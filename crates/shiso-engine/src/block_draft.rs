@@ -53,7 +53,7 @@ use shiso_core::backend::{Backend, KernelArg, KernelRef};
 use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc};
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
-use shiso_core::model::Speculated;
+use shiso_core::model::{DraftHint, Speculated};
 
 use crate::attn::{Attn, AttnCache, AttnGeometry, Pages, Positions};
 use crate::blocks::AttnIo;
@@ -543,10 +543,11 @@ impl BlockDrafter {
         backend: &Arc<dyn Backend>,
         target: (&Weights, &Geometry),
         pages: DeviceView<'_>,
-        first: TokenId,
-        pos: u32,
+        at: (TokenId, u32),
+        hint: DraftHint,
     ) -> CoreResult<Vec<TokenId>> {
         let (weights, geometry) = target;
+        let (first, pos) = at;
         let shape = &self.parts.shape;
         let b = shape.block;
         let hidden = shape.hidden;
@@ -619,7 +620,7 @@ impl BlockDrafter {
         let mut pbytes = vec![0u8; drafted as usize * rank * 4];
         be.copy_d2h(self.projected.view(), &mut pbytes)?;
         let projected = floats(&pbytes);
-        Ok(self.select(first, &logits, &projected, vocab))
+        Ok(self.select(first, (&logits, &projected, vocab), hint, pos + 1))
     }
 
     /// One drafter layer over the block's rows, in place on `stream`.
@@ -746,19 +747,32 @@ impl BlockDrafter {
     }
 
     /// The greedy path through each position's candidates.
+    ///
+    /// For a sampling caller each candidate's score is divided by its
+    /// temperature and carries a share of the Gumbel noise the caller's keyed
+    /// draw will add at the position the candidate would occupy - from `at`
+    /// for the first drafted row - so the path follows the draw the target is
+    /// about to make instead of its most likely token.
     fn select(
         &self,
         first: TokenId,
-        logits: &[f32],
-        projected: &[f32],
-        vocab: usize,
+        rows: (&[f32], &[f32], usize),
+        hint: DraftHint,
+        at: u32,
     ) -> Vec<TokenId> {
+        let (logits, projected, vocab) = rows;
         let shape = &self.parts.shape;
         let rank = shape.selector_rank as usize;
         let k = shape.selector_top_k as usize;
+        let sampled = hint.temperature > 0.0;
         let mut prev = first.get();
         let mut out = Vec::with_capacity(shape.block as usize - 1);
-        for (row, hidden_row) in logits.chunks_exact(vocab).zip(projected.chunks_exact(rank)) {
+        for (i, (row, hidden_row)) in logits
+            .chunks_exact(vocab)
+            .zip(projected.chunks_exact(rank))
+            .enumerate()
+        {
+            let position = at + u32::try_from(i).unwrap_or(u32::MAX);
             let candidates = top_k(row, k);
             let weighted: Vec<f32> = self
                 .parts
@@ -776,7 +790,11 @@ impl BlockDrafter {
                     .zip(&weighted)
                     .map(|(s, p)| s * p)
                     .sum();
-                let score = row[cand as usize] + edge;
+                let mut score = row[cand as usize] + edge;
+                if sampled {
+                    let u = crate::sampling::keyed_uniform(hint.key, position, cand);
+                    score = score / hint.temperature + DRAFT_NOISE * -(-u.ln()).ln();
+                }
                 if score > best.0 {
                     best = (score, cand);
                 }
@@ -787,6 +805,11 @@ impl BlockDrafter {
         out
     }
 }
+
+/// The share of the caller's keyed noise a sampled draft's scores carry: the
+/// weight a best-first search over this drafter's candidates was measured best
+/// at, applied here to a chain.
+const DRAFT_NOISE: f32 = 0.7;
 
 /// The `k` highest entries of `row`, highest first, ties to the lower id.
 fn top_k(row: &[f32], k: usize) -> Vec<u32> {
@@ -1022,6 +1045,7 @@ impl crate::stack::HybridStack {
         session: SessionId,
         first: TokenId,
         frontier: u32,
+        hint: DraftHint,
     ) -> CoreResult<Vec<TokenId>> {
         let Self {
             backend,
@@ -1048,8 +1072,8 @@ impl crate::stack::HybridStack {
             backend,
             (&resident.weights, geometry),
             pages,
-            first,
-            frontier,
+            (first, frontier),
+            hint,
         )
     }
 
@@ -1073,22 +1097,24 @@ impl crate::stack::HybridStack {
         }
     }
 
-    /// One speculative step through the block drafter: draft a block behind
-    /// `first`, verify it in one pass, commit what the target agreed with.
+    /// Drafts a block behind `first` and verifies it, committing nothing: the
+    /// drafts and the target's logits over them.
     ///
-    /// Greedy, as [`crate::stack::HybridStack::speculate`] is: a draft is
-    /// accepted when it equals the target's argmax at its row.
+    /// The round is left pending on the stack until
+    /// [`crate::stack::HybridStack::settle_verified`] says how many drafts the
+    /// caller kept; a second verify before that replaces it.
     ///
     /// # Errors
     ///
-    /// [`CoreError::UnknownSession`], and whatever the draft, the verify pass
-    /// and the rewind report.
-    pub(crate) fn speculate_block(
+    /// [`CoreError::UnknownSession`], and whatever the draft and the verify
+    /// pass report.
+    pub fn draft_and_verify(
         &mut self,
         session: SessionId,
         first: TokenId,
         eos: TokenId,
-    ) -> CoreResult<Speculated> {
+        hint: DraftHint,
+    ) -> CoreResult<shiso_core::model::VerifiedBlock> {
         let live = self
             .sessions
             .get(&session)
@@ -1114,38 +1140,90 @@ impl crate::stack::HybridStack {
             .get_mut(&session)
             .ok_or(CoreError::UnknownSession(session))?
             .reserve_to(frontier.saturating_add(block), room)?;
-        let clock_start = std::time::Instant::now();
-        let clock = std::time::Instant::now();
+        let started = std::time::Instant::now();
         let (mut drafts, source) = match self.copy(session, first, eos, budget)? {
             Some((tokens, id)) => (tokens, crate::mtp::DraftSource::Lookup(id)),
             None if self.drafting_pays(session) => (
-                self.draft_block(session, first, frontier)?,
+                self.draft_block(session, first, frontier, hint)?,
                 crate::mtp::DraftSource::Head,
             ),
             None => (Vec::new(), crate::mtp::DraftSource::Head),
         };
         drafts.truncate(budget as usize);
-        let drafted = clock.elapsed();
-
         let mut rows = Vec::with_capacity(drafts.len() + 1);
         rows.push(first);
         rows.extend_from_slice(&drafts);
         let verify_rows = u32::try_from(rows.len()).unwrap_or(1);
-        let clock = std::time::Instant::now();
         self.run_verify_rows(session, &rows)?;
         self.write_logits_rows(verify_rows)?;
-        let picks = self.read_picks(verify_rows)?;
-        let verified = clock.elapsed();
-        let outcome = crate::mtp::StepOutcome::settle(
-            first,
-            &drafts,
-            picks.get(..drafts.len()).unwrap_or(&[]),
-            eos,
-            (!drafts.is_empty()).then_some(source),
+        let vocab = self.geometry.vocab as usize;
+        let mut bytes = vec![0u8; rows.len() * vocab * 4];
+        self.backend.copy_d2h(
+            self.resident()?
+                .scratch
+                .logits()
+                .view()
+                .slice(0, bytes.len() as u64)?,
+            &mut bytes,
         )?;
-        let accepted = outcome.logits_row;
+        self.pending = Some(crate::stack::PendingBlock {
+            session,
+            first,
+            frontier,
+            drafts: drafts.clone(),
+            source,
+            started,
+        });
+        Ok(shiso_core::model::VerifiedBlock {
+            drafts,
+            logits: floats(&bytes),
+            vocab,
+        })
+    }
+
+    /// Commits `first` and the first `accepted` drafts of the round
+    /// [`crate::stack::HybridStack::draft_and_verify`] left pending for
+    /// `session`, winding the session back past the rest.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] with no round pending for `session`,
+    /// [`CoreError::ShapeMismatch`] for more kept drafts than were drafted, and
+    /// whatever the rewind and the commit report.
+    pub fn settle_verified(&mut self, session: SessionId, accepted: u32) -> CoreResult<()> {
+        let pending =
+            self.pending
+                .take()
+                .filter(|p| p.session == session)
+                .ok_or(CoreError::Unsupported {
+                    what: "a settle with no verified block pending for this session",
+                    backend: "engine",
+                })?;
+        let drafted = u32::try_from(pending.drafts.len()).unwrap_or(u32::MAX);
+        if accepted > drafted {
+            return Err(CoreError::ShapeMismatch {
+                field: "kept drafts",
+                expected: u64::from(drafted),
+                got: u64::from(accepted),
+            });
+        }
+        let taken = accepted as usize;
+        let mut committed = Vec::with_capacity(taken + 1);
+        committed.push(pending.first);
+        committed.extend_from_slice(&pending.drafts[..taken]);
+        let outcome = crate::mtp::StepOutcome {
+            committed,
+            rollback: crate::mtp::Rollback::new(accepted, drafted),
+            logits_row: accepted,
+            source: (drafted > 0).then_some(pending.source),
+        };
         if let Some(drafter) = self.block.as_mut() {
-            drafter.learn(session, &outcome, drafts.len(), clock_start.elapsed());
+            drafter.learn(
+                session,
+                &outcome,
+                pending.drafts.len(),
+                pending.started.elapsed(),
+            );
         }
         if let Some(rewind) = outcome.rollback {
             let live = self
@@ -1153,7 +1231,7 @@ impl crate::stack::HybridStack {
                 .get(&session)
                 .ok_or(CoreError::UnknownSession(session))?;
             live.rewind_states(&self.backend, rewind)?;
-            let keep = frontier.saturating_add(accepted).saturating_add(1);
+            let keep = pending.frontier.saturating_add(accepted).saturating_add(1);
             self.sessions
                 .get_mut(&session)
                 .ok_or(CoreError::UnknownSession(session))?
@@ -1161,29 +1239,46 @@ impl crate::stack::HybridStack {
         }
         self.commit_step(session)?;
         // The kept rows are the drafter's context now: `first` and the drafts
-        // the target agreed with, at the positions the verify pass gave them.
-        self.absorb_kept(session, accepted + 1, frontier)?;
+        // the caller kept, at the positions the verify pass gave them.
+        self.absorb_kept(session, accepted + 1, pending.frontier)?;
         tracing::debug!(
-            draft_ms = drafted.as_secs_f64() * 1e3,
-            verify_ms = verified.as_secs_f64() * 1e3,
-            rows = verify_rows,
+            round_ms = pending.started.elapsed().as_secs_f64() * 1e3,
+            drafted,
             accepted,
             "block speculative step"
         );
-        let mut produced = outcome.committed.get(1..).unwrap_or(&[]).to_vec();
-        produced.push(
-            *picks
-                .get(accepted as usize)
-                .ok_or(CoreError::ShapeMismatch {
-                    field: "verify rows",
-                    expected: u64::from(accepted).saturating_add(1),
-                    got: u64::try_from(picks.len()).unwrap_or(u64::MAX),
-                })?,
-        );
+        Ok(())
+    }
+
+    /// One greedy speculative step through the block drafter: the two phases,
+    /// with each row's token the target's argmax.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::stack::HybridStack::draft_and_verify`] and
+    /// [`crate::stack::HybridStack::settle_verified`].
+    pub(crate) fn speculate_block(
+        &mut self,
+        session: SessionId,
+        first: TokenId,
+        eos: TokenId,
+    ) -> CoreResult<Speculated> {
+        let block = self.draft_and_verify(session, first, eos, DraftHint::greedy())?;
+        let picks: Vec<TokenId> = (0..=block.drafts.len())
+            .map(|i| crate::sampling::argmax(block.row(i)))
+            .collect();
+        let accepted = crate::mtp::accepted_prefix(
+            &block.drafts,
+            picks.get(..block.drafts.len()).unwrap_or(&[]),
+            eos,
+        )?;
+        self.settle_verified(session, accepted)?;
+        let mut produced = block.drafts[..accepted as usize].to_vec();
+        produced.push(picks[accepted as usize]);
         Ok(Speculated {
             produced,
             accepted,
-            drafted: u32::try_from(drafts.len()).unwrap_or(u32::MAX),
+            drafted: u32::try_from(block.drafts.len()).unwrap_or(u32::MAX),
         })
     }
 }

@@ -177,6 +177,8 @@ pub struct HybridStack {
     ///
     /// Exclusive with [`HybridStack::draft`]: a stack drafts one way.
     pub(crate) block: Option<crate::block_draft::BlockDrafter>,
+    /// The block verified and not yet settled, when there is one.
+    pub(crate) pending: Option<PendingBlock>,
     pub(crate) staging: Staging,
     /// The disk tier, once a caller has turned it on.
     ///
@@ -222,6 +224,23 @@ pub struct HybridStack {
     decode_residual: Option<ResidualIndex>,
 }
 
+/// A verified block waiting to be told how much of it the caller kept.
+#[derive(Debug)]
+pub(crate) struct PendingBlock {
+    /// Whose round it is.
+    pub(crate) session: SessionId,
+    /// The token the round committed at its frontier.
+    pub(crate) first: TokenId,
+    /// The session's frontier before the round.
+    pub(crate) frontier: u32,
+    /// The drafts the round verified.
+    pub(crate) drafts: Vec<TokenId>,
+    /// Where they came from.
+    pub(crate) source: crate::mtp::DraftSource,
+    /// When the round began, for its cost.
+    pub(crate) started: Instant,
+}
+
 /// What a captured decode step belongs to.
 ///
 /// See [`HybridStack::graph_slots`] for why the session list is in here.
@@ -247,6 +266,7 @@ impl std::fmt::Debug for HybridStack {
             .field("counter", &self.counter)
             .field("draft", &self.draft.is_some())
             .field("block", &self.block.is_some())
+            .field("pending", &self.pending.as_ref().map(|p| p.session))
             .field("staging", &self.staging)
             .field("ckpt", &self.ckpt)
             .field("clock", &self.clock)
@@ -460,6 +480,7 @@ impl HybridStack {
             counter: NonZeroU64::MIN,
             draft: None,
             block: None,
+            pending: None,
             staging: Staging::default(),
             ckpt: None,
             clock: Instant::now(),

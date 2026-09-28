@@ -591,4 +591,31 @@ impl shiso_core::model::Speculating for Qwen35Model {
         let eos = self.info.stop_tokens.primary();
         self.stack.speculate(session, first, eos)
     }
+
+    // None: the stack drafts with a head rather than a block drafter, whose
+    // greedy step is the only one it has.
+    fn verify_block(
+        &mut self,
+        session: SessionId,
+        first: TokenId,
+        hint: shiso_core::model::DraftHint,
+    ) -> CoreResult<Option<shiso_core::model::VerifiedBlock>> {
+        if !self.stack.block_resident() {
+            return Ok(None);
+        }
+        let eos = self.info.stop_tokens.primary();
+        self.stack
+            .draft_and_verify(session, first, eos, hint)
+            .map(Some)
+    }
+
+    fn settle_block(
+        &mut self,
+        session: SessionId,
+        block: shiso_core::model::VerifiedBlock,
+        accepted: u32,
+    ) -> CoreResult<()> {
+        let _ = block;
+        self.stack.settle_verified(session, accepted)
+    }
 }
