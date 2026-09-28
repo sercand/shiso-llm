@@ -62,7 +62,7 @@ use super::decoder::{
     bytes, count_of, rows, word, words,
 };
 use super::encoder::Encoded;
-use super::prompt;
+use super::prompt::{self, Conditioning};
 use super::weights::TextWeights;
 use crate::audio_ops::{
     ArgmaxWideDesc, BatchPlanes, CausalAttnSegDesc, DECODE_ATTN_SPLITS, DECODE_COUNT, DECODE_DONE,
@@ -423,20 +423,21 @@ impl<'a> BatchTranscriber<'a> {
     }
 
     /// Each chunk's greedy ids, in order: what [`Decoder::transcribe`] gives
-    /// that chunk alone with the same `forced`.
+    /// that chunk alone with the same `cond`.
     ///
     /// # Errors
     ///
     /// [`AudioError::BadSpec`] for no chunks, a chunk the single decoder
     /// refuses, or a forced language the model does not support;
+    /// [`AudioError::BadContext`] for more context ids than a prompt carries;
     /// [`AudioError::Checkpoint`] for an embedding no row fetch reads; a
     /// device error.
     pub fn transcribe(
         &self,
         chunks: &[ChunkInput<'_>],
-        forced: Option<&str>,
+        cond: &Conditioning<'_>,
     ) -> Result<Vec<Vec<u32>>, AudioError> {
-        self.transcribe_with(&mut BatchMemory::new(self.config), chunks, forced)
+        self.transcribe_with(&mut BatchMemory::new(self.config), chunks, cond)
     }
 
     /// [`Self::transcribe`] in `memory`, which a model keeps from one batch
@@ -449,9 +450,9 @@ impl<'a> BatchTranscriber<'a> {
         &self,
         memory: &mut BatchMemory,
         chunks: &[ChunkInput<'_>],
-        forced: Option<&str>,
+        cond: &Conditioning<'_>,
     ) -> Result<Vec<Vec<u32>>, AudioError> {
-        let (ids, t) = self.timed_with(memory, chunks, forced)?;
+        let (ids, t) = self.timed_with(memory, chunks, cond)?;
         tracing::debug!(
             chunks = chunks.len(),
             prompt = t.prompt,
@@ -469,7 +470,7 @@ impl<'a> BatchTranscriber<'a> {
         &self,
         memory: &mut BatchMemory,
         chunks: &[ChunkInput<'_>],
-        forced: Option<&str>,
+        cond: &Conditioning<'_>,
     ) -> Result<(Vec<Vec<u32>>, BatchTiming), AudioError> {
         let (ops, c) = (self.ops, self.config);
         if chunks.is_empty() {
@@ -480,7 +481,7 @@ impl<'a> BatchTranscriber<'a> {
         let mut prompts = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             self.decoder.check_audio(chunk)?;
-            prompts.push(prompt::ids(chunk.tokens, forced)?);
+            prompts.push(prompt::ids(chunk.tokens, cond)?);
         }
         let ns: Vec<usize> = prompts.iter().map(Vec::len).collect();
         let (b, total) = (ns.len(), ns.iter().sum::<usize>());

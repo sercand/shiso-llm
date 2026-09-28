@@ -17,6 +17,15 @@ generated tokens differ per model (different text decoder, and R2T2 carries
 its own tokenizer additions), so those are captured independently for each.
 
     qwen3_asr_reference.py --qwen3 ~/models/Qwen3-ASR-1.7B/qwen --r2t2 ~/models/R2T2/bf16
+
+A separate mode loads no weights: `--context-prompt-only --tokenizer <dir>`
+loads only the reference tokenizer and chat template (`transformers.AutoTokenizer`
+and, when the `qwen_asr` package is importable, its own `_build_text_prompt`,
+which needs a processor but not a loaded model) and writes
+`qwen3asr-context-prompt.json`, the ids of the system turn holding the fixed
+`CONTEXT` string and the whole prompt around its one `<|audio_pad|>`. This is
+what `context_tests.rs` and `prompt_tests.rs` check the encoder and the
+prompt layout against without a checkpoint's weights on hand.
 """
 import argparse
 import json
@@ -46,6 +55,13 @@ FORCED_LANGUAGE = {
 }
 
 AUDIO_PAD_ID = 151676  # `<|audio_pad|>` in tokenizer_config.json
+
+# The context string `--context-prompt-only` renders and tokenizes. Public,
+# fixed, and exercises both non-ASCII text and keywords: it is exactly
+# `wording(Context { prompt: Some("A farewell address."), keywords: ["Chicago",
+# "İstanbul", "Çanakkale", "Ağrı Dağı"] })` under the Rust wording
+# (`qwen3_asr::context::wording`), pinned by a unit test in context_tests.rs.
+CONTEXT = "A farewell address.\nKeywords: Chicago, İstanbul, Çanakkale, Ağrı Dağı"
 
 # The windowed-encoder, auto-language golden for speech-en, from an earlier
 # reference run. It is the windowed one (matches vLLM/FA2), not the HF
@@ -90,6 +106,91 @@ def versions() -> dict:
         "torch": torch.__version__,
         "qwen_asr": pkg_version("qwen-asr"),
     }
+
+
+def _rendered_with_qwen_asr(tokenizer_dir: str) -> str:
+    """`CONTEXT`'s system turn and one audio item, rendered by the reference
+    package's own `_build_text_prompt` over a processor built from
+    `tokenizer_dir` - no model, no weights. Raises whatever loading the
+    processor or building the prompt raises; the caller falls back."""
+    processor = transformers.AutoProcessor.from_pretrained(tokenizer_dir, fix_mistral_regex=True)
+    # `_build_text_prompt` only reads `self.processor`; passing no model
+    # (backend "vllm" skips the transformers-only device/dtype lookup in
+    # `__init__`) keeps this path weight-free.
+    wrapper = Qwen3ASRModel(backend="vllm", model=None, processor=processor)
+    return wrapper._build_text_prompt(context=CONTEXT, force_language=None)
+
+
+def _rendered_with_chat_template_json(tokenizer_dir: str) -> str:
+    """The same rendering read directly from the checkpoint's own
+    `chat_template.json` through `jinja2`, for a directory `qwen_asr`
+    cannot process (no processor registered, or its call raises)."""
+    import jinja2
+
+    doc = json.loads((Path(tokenizer_dir) / "chat_template.json").read_text())
+    template = jinja2.Environment(trim_blocks=True, lstrip_blocks=True).from_string(
+        doc["chat_template"]
+    )
+    messages = [
+        {"role": "system", "content": CONTEXT},
+        {"role": "user", "content": [{"type": "audio", "audio": ""}]},
+    ]
+    return template.render(messages=messages, add_generation_prompt=True)
+
+
+def context_prompt_text(tokenizer_dir: str) -> tuple[str, str]:
+    """The rendered text and which source rendered it: the reference
+    package's `_build_text_prompt` when it can run with no weights, else the
+    checkpoint's own `chat_template.json`."""
+    try:
+        return _rendered_with_qwen_asr(tokenizer_dir), "qwen_asr._build_text_prompt"
+    except Exception as e:  # noqa: BLE001 - any failure falls back, by design
+        print(f"qwen_asr._build_text_prompt failed ({e!r}); falling back to chat_template.json")
+        return _rendered_with_chat_template_json(tokenizer_dir), "chat_template.json"
+
+
+def context_ids_between(text: str, ids: list, offsets: list) -> list:
+    """The ids whose span sits strictly inside the system turn: after
+    `"<|im_start|>system\\n"` and before the first `"<|im_end|>"` that
+    follows it, located in `text` and mapped back to `ids` through the fast
+    tokenizer's offsets rather than by hardcoding token ids, so this does not
+    silently agree with a wrong vocabulary."""
+    prefix = "<|im_start|>system\n"
+    start = text.index(prefix) + len(prefix)
+    end = text.index("<|im_end|>", start)
+    return [i for i, (s, e) in zip(ids, offsets) if s >= start and e <= end]
+
+
+def run_context_prompt_only(tokenizer_dir: str):
+    """Loads only the reference tokenizer and chat template from
+    `tokenizer_dir` (no model weights) and writes
+    `qwen3asr-context-prompt.json`: `CONTEXT`, the ids of its system turn, and
+    the whole rendered prompt around its one `<|audio_pad|>`."""
+    path = ROOT / "qwen3asr-context-prompt.json"
+    if kept(path):
+        return
+    text, source = context_prompt_text(tokenizer_dir)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_dir, fix_mistral_regex=True)
+    encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    ids = encoded["input_ids"]
+    n_audio_pad = ids.count(AUDIO_PAD_ID)
+    if n_audio_pad != 1:
+        sys.exit(
+            f"the rendered context prompt has {n_audio_pad} <|audio_pad|> ids, expected exactly 1: {ids}"
+        )
+    context_ids = context_ids_between(text, ids, encoded["offset_mapping"])
+    write_json(
+        path,
+        {
+            "context": CONTEXT,
+            "context_ids": context_ids,
+            "ids": ids,
+            "n_audio_pad": n_audio_pad,
+            "template_source": source,
+            **versions(),
+        },
+    )
+    print(f"{path.name}: {len(context_ids)} context ids, {len(ids)} prompt ids, from {source}")
 
 
 def refuse_existing(path: Path):
@@ -280,11 +381,31 @@ def check_speech_en_golden():
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--qwen3", required=True, help="Qwen3-ASR HF bf16 directory (…/Qwen3-ASR-1.7B/qwen)")
-    p.add_argument("--r2t2", required=True, help="R2T2 HF bf16 directory (…/R2T2/bf16)")
+    p.add_argument("--qwen3", help="Qwen3-ASR HF bf16 directory (…/Qwen3-ASR-1.7B/qwen)")
+    p.add_argument("--r2t2", help="R2T2 HF bf16 directory (…/R2T2/bf16)")
+    p.add_argument(
+        "--context-prompt-only",
+        action="store_true",
+        help="load only the reference tokenizer and chat template (no weights) and write "
+        "qwen3asr-context-prompt.json; needs --tokenizer",
+    )
+    p.add_argument(
+        "--tokenizer",
+        help="the sidecar directory to load the tokenizer and chat template from "
+        "(…/Qwen3-ASR-1.7B), for --context-prompt-only",
+    )
     args = p.parse_args()
 
     ROOT.mkdir(parents=True, exist_ok=True)
+
+    if args.context_prompt_only:
+        if not args.tokenizer:
+            p.error("--context-prompt-only needs --tokenizer")
+        run_context_prompt_only(args.tokenizer)
+        return
+
+    if not args.qwen3 or not args.r2t2:
+        p.error("--qwen3 and --r2t2 are required unless --context-prompt-only is given")
 
     print(f"loading qwen3asr from {args.qwen3}")
     qwen = load_model(args.qwen3)

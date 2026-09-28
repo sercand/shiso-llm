@@ -19,6 +19,7 @@ use crate::qwen3_asr::decoder::tests::{
 };
 use crate::qwen3_asr::decoder::{Decoder, KvCache, POOLED_CAPACITY};
 use crate::qwen3_asr::encoder::Encoded;
+use crate::qwen3_asr::prompt::Conditioning;
 
 /// Three mixed clips, long first.
 const MIXED: [&str; 3] = ["two-speakers", "weather-es", "speech-en-odd"];
@@ -65,7 +66,7 @@ fn singles(
         .iter()
         .map(|&clip| {
             let ids = decoder
-                .transcribe(&mut cache, &rows[clip], forced)
+                .transcribe(&mut cache, &rows[clip], &Conditioning::forced(forced))
                 .expect("decodes");
             (clip, ids)
         })
@@ -99,7 +100,9 @@ fn check(
     what: &str,
 ) {
     let chunks: Vec<&Encoded> = names.iter().map(|n| &rows[n]).collect();
-    let (got, timing) = batch.timed_with(memory, &chunks, forced).expect("decodes");
+    let (got, timing) = batch
+        .timed_with(memory, &chunks, &Conditioning::forced(forced))
+        .expect("decodes");
     let mode = forced.unwrap_or("auto");
     say(&format!(
         "{what} B={} {mode}: {}",
@@ -132,7 +135,11 @@ fn every_shape(ops: &Ops, export: &str, model: &str) -> usize {
     for forced in [None, Some("English")] {
         let want = singles(ops, &m, &rows, forced);
         // One untimed batch, so the timings leave out pipeline compiles.
-        drop(batch.timed_with(&mut memory, &[&rows["weather-es"]], forced));
+        drop(batch.timed_with(
+            &mut memory,
+            &[&rows["weather-es"]],
+            &Conditioning::forced(forced),
+        ));
         for clip in CLIPS {
             check(&batch, &mut memory, &rows, &[clip], forced, &want, export);
             compared += 1;
@@ -235,14 +242,15 @@ fn a_finished_sequence_writes_nothing_more() {
         // row no append has reached.
         let mut memory = BatchMemory::new(c).with_sentinel().with_headroom(0);
         let got = batch
-            .transcribe_with(&mut memory, &chunks, None)
+            .transcribe_with(&mut memory, &chunks, &Conditioning::forced(None))
             .expect("decodes");
         assert!(memory.cache.grown > 0, "the planes grew while decoding");
         for (s, name) in names.iter().enumerate() {
             assert_eq!(got[s], want[name], "compact {compact}: {name} ids");
-            let prompt = crate::qwen3_asr::prompt::ids(rows[name].tokens, None)
-                .expect("a prompt")
-                .len();
+            let prompt =
+                crate::qwen3_asr::prompt::ids(rows[name].tokens, &Conditioning::forced(None))
+                    .expect("a prompt")
+                    .len();
             let end = memory.cache.ends[s];
             // The last pass that appended ran over the last emitted token,
             // and its argmax was the end id.
@@ -350,8 +358,10 @@ fn batched_step_and_prefill_times() {
     let decoder = Decoder::new(&ops, &m.weights.text, &m.config.text);
     let mut cache = KvCache::new(&m.config.text);
     let clip = &rows["two-speakers"];
-    drop(decoder.timed(&mut cache, clip, None));
-    let (_, single) = decoder.timed(&mut cache, clip, None).expect("decodes");
+    drop(decoder.timed(&mut cache, clip, &Conditioning::forced(None)));
+    let (_, single) = decoder
+        .timed(&mut cache, clip, &Conditioning::forced(None))
+        .expect("decodes");
     say(&format!(
         "single two-speakers: prefill {} rows {:.1} ms, {:.2} ms/pass",
         single.prompt,
@@ -364,9 +374,9 @@ fn batched_step_and_prefill_times() {
         let mut memory = BatchMemory::new(&m.config.text);
         for b in [1usize, 4, 8] {
             let chunks: Vec<&Encoded> = (0..b).map(|_| clip).collect();
-            drop(batch.timed_with(&mut memory, &chunks, None));
+            drop(batch.timed_with(&mut memory, &chunks, &Conditioning::forced(None)));
             let (_, t) = batch
-                .timed_with(&mut memory, &chunks, None)
+                .timed_with(&mut memory, &chunks, &Conditioning::forced(None))
                 .expect("decodes");
             say(&format!(
                 "compact {compact} B={b} same clip: {} ({:.2} ms/pass/sequence)",
@@ -375,15 +385,15 @@ fn batched_step_and_prefill_times() {
             ));
         }
         let chunks: Vec<&Encoded> = EIGHT.iter().map(|n| &rows[n]).collect();
-        drop(batch.timed_with(&mut memory, &chunks, None));
+        drop(batch.timed_with(&mut memory, &chunks, &Conditioning::forced(None)));
         let (_, t) = batch
-            .timed_with(&mut memory, &chunks, None)
+            .timed_with(&mut memory, &chunks, &Conditioning::forced(None))
             .expect("decodes");
         say(&format!("compact {compact} B=8 mixed: {}", line(&t)));
         let mut singles = Duration::ZERO;
         for name in EIGHT {
             let (_, t) = decoder
-                .timed(&mut cache, &rows[name], None)
+                .timed(&mut cache, &rows[name], &Conditioning::forced(None))
                 .expect("decodes");
             singles += t.prefill + t.decode;
         }

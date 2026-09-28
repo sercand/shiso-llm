@@ -25,7 +25,7 @@ use crate::audio_ops::load::upload_f32;
 use crate::qwen3_asr::config::tests::{Export, exports, say};
 use crate::qwen3_asr::config::{IM_END, Qwen3AsrConfig, locate, read_vocab};
 use crate::qwen3_asr::encoder::{Encoded, Tower};
-use crate::qwen3_asr::prompt::parse;
+use crate::qwen3_asr::prompt::{Conditioning, parse};
 use crate::qwen3_asr::weights::QwenAsrWeights;
 
 /// Width of a tower row.
@@ -207,7 +207,11 @@ fn exact(export: &str, model: &str) {
     let decoder = Decoder::new(&ops, &m.weights.text, &m.config.text);
     let mut cache = KvCache::new(&m.config.text);
     // One untimed pass, so the timings leave out pipeline compiles.
-    drop(decoder.transcribe(&mut cache, &reference_rows(&ops, model, "weather-es"), None));
+    drop(decoder.transcribe(
+        &mut cache,
+        &reference_rows(&ops, model, "weather-es"),
+        &Conditioning::forced(None),
+    ));
     let mut compared = 0;
     for clip in CLIPS {
         let Some(wants) = want(model, clip) else {
@@ -216,7 +220,11 @@ fn exact(export: &str, model: &str) {
         let rows = reference_rows(&ops, model, clip);
         for w in &wants {
             let (got, timing) = decoder
-                .timed(&mut cache, &rows, w.forced.as_deref())
+                .timed(
+                    &mut cache,
+                    &rows,
+                    &Conditioning::forced(w.forced.as_deref()),
+                )
                 .expect("decodes");
             let mode = w.forced.as_deref().unwrap_or("auto");
             say(&format!("{export} {clip} {mode}: {}", line(&timing)));
@@ -267,11 +275,13 @@ fn a_growing_cache_changes_nothing() {
     // Room for the prompt and ten decoded rows: the first batch of seven
     // steps fits, and the second grows the cache with those seven decoded
     // rows in it, which the copy must carry over.
-    let prompt = crate::qwen3_asr::prompt::ids(rows.tokens, None)
+    let prompt = crate::qwen3_asr::prompt::ids(rows.tokens, &Conditioning::forced(None))
         .expect("a prompt")
         .len();
     let mut tight = KvCache::tight(&ops, &m.config.text, prompt + 10).expect("allocates");
-    let (got, timing) = decoder.timed(&mut tight, &rows, None).expect("decodes");
+    let (got, timing) = decoder
+        .timed(&mut tight, &rows, &Conditioning::forced(None))
+        .expect("decodes");
     say(&format!(
         "tight cache: capacity {} after {} prompt rows and {} tokens, grown with {:?} rows filled",
         tight.capacity(),
@@ -288,7 +298,9 @@ fn a_growing_cache_changes_nothing() {
     );
     assert_eq!(tight.copied().first(), Some(&(prompt + 7)));
     let mut roomy = KvCache::new(&m.config.text);
-    let (again, _) = decoder.timed(&mut roomy, &rows, None).expect("decodes");
+    let (again, _) = decoder
+        .timed(&mut roomy, &rows, &Conditioning::forced(None))
+        .expect("decodes");
     assert_eq!(got, again, "the same ids either way");
     assert_eq!(got, auto.ids, "and the reference's");
 }
@@ -333,7 +345,11 @@ fn quantised_exports_stay_close() {
             let rows = reference_rows(&ops, model, clip);
             for (k, w) in wants.iter().enumerate() {
                 let (got, timing) = decoder
-                    .timed(&mut cache, &rows, w.forced.as_deref())
+                    .timed(
+                        &mut cache,
+                        &rows,
+                        &Conditioning::forced(w.forced.as_deref()),
+                    )
                     .expect("decodes");
                 let parsed = parse(&text_of(&m.vocab, &got), w.forced.as_deref());
                 let d = word_distance(&parsed.text, &w.text);
@@ -406,7 +422,11 @@ fn hf_end_to_end_from_the_mel() {
     let mut cache = KvCache::new(&m.config.text);
     for w in [&auto, &forced] {
         let (got, _) = decoder
-            .timed(&mut cache, &rows, w.forced.as_deref())
+            .timed(
+                &mut cache,
+                &rows,
+                &Conditioning::forced(w.forced.as_deref()),
+            )
             .expect("decodes");
         let mode = w.forced.as_deref().unwrap_or("auto");
         let first = got.iter().zip(&w.ids).position(|(a, b)| a != b);

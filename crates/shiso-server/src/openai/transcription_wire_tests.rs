@@ -90,7 +90,6 @@ fn what_this_model_cannot_do_is_refused_by_field() {
         fields.push(extra);
         fields
     };
-    refused(with(field("prompt", "earlier context")), "prompt");
     refused(with(field("temperature", "0.2")), "temperature");
     refused(with(field("temperature", "warm")), "temperature");
     refused(with(field("include[]", "logprobs")), "include");
@@ -113,6 +112,43 @@ fn what_this_model_cannot_do_is_refused_by_field() {
         fields.push(field("stream", "true"));
         refused(fields, "stream");
     }
+}
+
+#[test]
+fn keywords_and_a_prompt_become_the_context() {
+    let form = parse(vec![
+        file(),
+        field("model", "nemotron"),
+        field("keywords[]", " premium plan "),
+        field("keywords[]", "AC-42"),
+        field("keywords", "billing"),
+        field("prompt", " A support call. "),
+    ])
+    .expect("accepted");
+    assert_eq!(
+        form.context.keywords,
+        vec!["premium plan", "AC-42", "billing"]
+    );
+    assert_eq!(form.context.prompt.as_deref(), Some("A support call."));
+}
+
+#[test]
+fn an_empty_prompt_is_no_context() {
+    let form = parse(vec![
+        file(),
+        field("model", "nemotron"),
+        field("prompt", "  "),
+    ])
+    .expect("accepted");
+    assert!(form.context.is_empty());
+}
+
+#[test]
+fn an_empty_keyword_is_refused() {
+    refused(
+        vec![file(), field("model", "nemotron"), field("keywords[]", " ")],
+        "keywords",
+    );
 }
 
 #[test]

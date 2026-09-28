@@ -345,6 +345,7 @@ fn every_documented_flag_declares_its_prefixed_environment_fallback() {
         "SHISO_ASR_BATCH",
         "SHISO_ASR_SKIP_SILENCE",
         "SHISO_ASR_OFFLINE_MIN_SECS",
+        "SHISO_ASR_MAX_CONTEXT_TOKENS",
     ] {
         assert!(
             help.contains(variable),
@@ -625,6 +626,27 @@ fn a_zero_asr_batch_is_refused_naming_the_flag() {
         "{error}"
     );
     assert!(error.to_string().contains("--asr-batch"), "{error}");
+}
+
+#[test]
+fn a_zero_asr_max_context_tokens_is_refused_naming_the_flag() {
+    let error = parse(&["--asr-model", "/a", "--asr-max-context-tokens", "0"])
+        .expect("parses")
+        .validate()
+        .expect_err("a cap of zero tokens carries no keywords or prompt");
+    assert!(
+        matches!(
+            error,
+            ConfigError::Zero {
+                flag: "asr-max-context-tokens"
+            }
+        ),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("--asr-max-context-tokens"),
+        "{error}"
+    );
 }
 
 #[test]

@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use shiso_audio::chunks::{OfflineRule, Span, plan_offline};
 use shiso_audio::{
-    DecodeLimits, Language, MelFrames, MelFrontend, SpeechRecognizer, StreamOptions, TokenEvent,
-    decode_audio,
+    ContextIds, DecodeLimits, Language, MelFrames, MelFrontend, SpeechRecognizer, StreamOptions,
+    TokenEvent, decode_audio,
 };
 
-use super::{Schedule, check_plan};
+use super::{Schedule, check_plan, to_redecode};
+use crate::qwen3_asr::stream::tests::{LIST, SPEECH, keywords, vocab};
 use crate::qwen3_asr::{first_outside, offline_batch};
 
 fn span(start: usize, end: usize, transcribe: bool) -> Span {
@@ -56,6 +57,21 @@ fn batches_take_the_longest_spans_first_and_hand_back_in_plan_order() {
     let mut s = Schedule::new(&[span(0, 900, false)], 8);
     assert_eq!(s.next(), Vec::<usize>::new());
     assert_eq!(s.release(), vec![]);
+}
+
+#[test]
+fn only_the_spans_that_echo_the_keywords_are_decoded_again() {
+    let v = vocab();
+    let k = keywords(&["a", "b", "this"]);
+    let batch = [LIST.to_vec(), SPEECH.to_vec(), Vec::new(), LIST.to_vec()];
+    // Positions in the batch, in order.
+    assert_eq!(to_redecode(&v, &batch, None, &k), vec![0, 3]);
+    assert_eq!(
+        to_redecode(&v, &[SPEECH.to_vec()], None, &k),
+        Vec::<usize>::new()
+    );
+    // A context without keywords re-decodes nothing.
+    assert_eq!(to_redecode(&v, &batch, None, &[]), Vec::<usize>::new());
 }
 
 #[test]
@@ -176,6 +192,7 @@ fn offline_text_equals_streaming_text_on_long_dialogue() {
         language: Language::Auto,
         lookahead: 0,
         cuts: None,
+        context: ContextIds::default(),
     };
 
     // The stream, pushed as the server pushes.
@@ -232,8 +249,15 @@ fn offline_text_equals_streaming_text_on_long_dialogue() {
     // One and two spans a step: the longest spans go first, so the spans
     // are transcribed out of plan order and handed back in it.
     for batch in [1, 2] {
-        let mut job = super::QwenOffline::new(Arc::clone(&asr.model), None, spans.clone(), batch)
-            .expect("opens");
+        let mut job = super::QwenOffline::new(
+            Arc::clone(&asr.model),
+            None,
+            Arc::from([]),
+            Arc::from([]),
+            spans.clone(),
+            batch,
+        )
+        .expect("opens");
         let (events, ends, _, steps) = run_job(&mut job, &mel);
         assert_eq!(events, streamed, "{batch} a step");
         assert_eq!(ends, stream_ends, "{batch} a step");

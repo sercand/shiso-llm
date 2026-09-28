@@ -239,6 +239,70 @@ async fn transcriptions_end_to_end() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{wrong}");
 }
 
+/// `keywords[]` steers the Qwen3 recognizer's transcript, and the Nemotron
+/// recognizer refuses a context outright: the same clip, once plain and once
+/// with two words it really contains, then the same keywords against
+/// Nemotron. Nemotron boots the way `booted_nemotron` does: the `Q8_0` GGUF
+/// under `SHISO_TEST_MODEL_ASR/nvidia` and the MLX diarizer under
+/// `SHISO_TEST_MODEL_DIAR/mlx`, the layout the binary is actually run with.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the local speech checkpoints and a Metal device"]
+async fn keywords_end_to_end() {
+    let Some((state, _diar)) = booted_chunking(&[]) else {
+        return;
+    };
+    let speech = clip("speech-en");
+
+    let (status, plain) = post(&state, form(&speech, &[("model", "qwen3")])).await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+
+    let (status, with_keywords) = post(
+        &state,
+        form(
+            &speech,
+            &[
+                ("model", "qwen3"),
+                ("keywords[]", "Chicago"),
+                ("keywords[]", "farewell"),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{with_keywords}");
+    let json: Value = serde_json::from_str(&with_keywords).expect("json");
+    let transcript = json["text"].as_str().expect("text").to_owned();
+    say(&format!("json: {transcript:?}"));
+    let normalized = transcript
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    for word in ["chicago", "farewell"] {
+        assert!(normalized.contains(word), "{normalized:?} misses {word:?}");
+    }
+    drop(state);
+
+    let Some(nemotron) = booted_nemotron() else {
+        return;
+    };
+    let (status, refused) = post(
+        &nemotron,
+        form(
+            &speech,
+            &[
+                ("model", "nemotron-asr"),
+                ("keywords[]", "Chicago"),
+                ("keywords[]", "farewell"),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let refused: Value = serde_json::from_str(&refused).expect("json");
+    assert_eq!(refused["error"]["param"], "keywords", "{refused}");
+}
+
 /// The chunking recognizer's state: the `Q8_0` text GGUF (its mmproj found
 /// beside it) and the MLX diarizer, booted as the binary boots them with
 /// `extra` flags. Needs `SHISO_TEST_MODEL_QWEN3ASR` and
@@ -285,6 +349,55 @@ fn booted_chunking(extra: &[&str]) -> Option<(Arc<AppState>, PathBuf)> {
     Some((
         Arc::new(AppState::without_language_model().with_audio(audio)),
         diar,
+    ))
+}
+
+/// The Nemotron recognizer's state, booted the way the user actually runs
+/// it: the `Q8_0` GGUF checkpoint under `SHISO_TEST_MODEL_ASR/nvidia` and the
+/// MLX diarizer at `SHISO_TEST_MODEL_DIAR/mlx` (there is no `nvidia/` export
+/// of the diarizer on this machine). Needs `SHISO_TEST_MODEL_ASR` and
+/// `SHISO_TEST_MODEL_DIAR`; skips rather than panics when a root is set but
+/// the file it needs is absent.
+#[cfg(target_os = "macos")]
+fn booted_nemotron() -> Option<Arc<AppState>> {
+    let (Some(asr_root), Some(diar_root)) = (
+        std::env::var_os("SHISO_TEST_MODEL_ASR").map(PathBuf::from),
+        std::env::var_os("SHISO_TEST_MODEL_DIAR").map(PathBuf::from),
+    ) else {
+        say("SKIP: SHISO_TEST_MODEL_ASR and SHISO_TEST_MODEL_DIAR are needed");
+        return None;
+    };
+    if !shiso_metal::metal_available() {
+        say("SKIP: no Metal device");
+        return None;
+    }
+    let asr = asr_root.join("nvidia/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf");
+    let diar = diar_root.join("mlx");
+    for path in [&asr, &diar] {
+        if !path.exists() {
+            say(&format!("SKIP: {} is absent", path.display()));
+            return None;
+        }
+    }
+    let (asr_arg, diar_arg) = (asr.display().to_string(), diar.display().to_string());
+    let line = [
+        "shiso",
+        "serve",
+        "--asr-model",
+        &asr_arg,
+        "--asr-id",
+        "nemotron-asr",
+        "--diarization-model",
+        &diar_arg,
+    ];
+    let cli = <Cli as clap::Parser>::try_parse_from(line).expect("the command line parses");
+    let Command::Serve(args) = cli.command;
+    args.validate().expect("servable");
+    let audio = shiso_server::boot_audio(&args)
+        .expect("the speech models load")
+        .expect("an ASR was named");
+    Some(Arc::new(
+        AppState::without_language_model().with_audio(audio),
     ))
 }
 

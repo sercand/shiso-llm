@@ -29,6 +29,8 @@
     reason = "one harness serves every integration test here, and no single test uses all of it"
 )]
 
+pub(crate) mod wer;
+
 use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroU64;

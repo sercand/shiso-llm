@@ -194,6 +194,18 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
         None => None,
     };
     backend.finish_imports();
+    // A cap wider than the recognizer's own is not a policy an operator can
+    // ask for: every chunk's prefill would still be held to the smaller
+    // number, so the flag would silently do nothing past the recognizer's
+    // own ceiling.
+    if let Some(encoder) = recognizer.context_encoder() {
+        anyhow::ensure!(
+            args.asr_max_context_tokens <= encoder.max_ids(),
+            "--asr-max-context-tokens {} is past this recognizer's {}",
+            args.asr_max_context_tokens,
+            encoder.max_ids()
+        );
+    }
     let asr_id = args.asr_id().unwrap_or_else(|| "asr".to_owned());
     tracing::info!(
         asr = %asr.display(),
@@ -218,6 +230,7 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
         max_upload_bytes: args.audio_max_upload_bytes(),
         offline_min_secs: args.asr_offline_min_secs,
         skip_silence: args.asr_skip_silence,
+        max_context_ids: args.asr_max_context_tokens,
     })
     .context("starting the audio worker")?;
     Ok(Some(service))

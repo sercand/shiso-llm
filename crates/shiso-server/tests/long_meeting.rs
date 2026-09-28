@@ -26,16 +26,33 @@
 //! recognizers runs twice, with `--asr-skip-silence` on (the default) and
 //! off, so what skipping long silences costs in words and saves in time is
 //! measured on one recording; Nemotron has no offline path and runs once.
+//!
+//! `SHISO_TEST_KEYWORDS` is optional, widening the check: when it names a
+//! file, one `keywords[]` field a line is added to every recognizer whose
+//! family accepts a context, and its aggregate line says `keywords=on`.
+//! Unset, the run is the plain baseline. A recognizer with no context
+//! encoder (Nemotron) never receives them, since it refuses one outright.
+//!
+//! `SHISO_TEST_DIAG` is optional and separate from the run above: when set,
+//! the ordinary recognizer loop is skipped entirely and this test instead
+//! diagnoses the keyword-driven WER rise the wider check found, on
+//! qwen3-asr-q8 alone, offline with silence kept (the worse of the two
+//! silence settings), once without keywords and once with. Unset, this
+//! test's output is exactly what it was before this diagnostic existed.
 
 #![cfg(target_os = "macos")]
+
+mod common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use common::wer::{edit_distance, edit_ops, normalize_words};
 use serde_json::Value;
 use shiso_server::cli::{Cli, Command};
 use shiso_server::router::build_router;
@@ -73,6 +90,152 @@ fn ffmpeg() -> String {
     std::env::var("SHISO_TEST_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned())
 }
 
+/// One `keywords[]` field a non-empty line of `SHISO_TEST_KEYWORDS`; empty,
+/// so a request built from it sends none, when the variable is unset.
+fn keyword_fields() -> Vec<(String, String)> {
+    let Some(path) = std::env::var_os("SHISO_TEST_KEYWORDS").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| ("keywords[]".to_owned(), line.to_owned()))
+        .collect()
+}
+
+/// Non-overlapping occurrences of `needle` (normalised words) in `hay`. The
+/// same rule `keyword_bias.rs` counts with, duplicated rather than shared:
+/// this file's diagnostic needs it standalone, the way its other helpers are
+/// already duplicated across the two files.
+fn occurrences(hay: &[String], needle: &[String]) -> usize {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let (mut i, mut n) = (0, 0);
+    while i + needle.len() <= hay.len() {
+        if hay[i..i + needle.len()] == *needle {
+            n += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// Words of `hay` covered by non-overlapping occurrences of `needle`; a
+/// keyword matched twice covers twice its own word count. Keywords that
+/// overlap in the text can double-count a word, which is fine for the
+/// diagnostic's "roughly how much of this segment is keywords" reading.
+fn covered_words(hay: &[String], needle: &[String]) -> usize {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let (mut i, mut covered) = (0, 0);
+    while i + needle.len() <= hay.len() {
+        if hay[i..i + needle.len()] == *needle {
+            covered += needle.len();
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    covered
+}
+
+/// Keyword recall and insertions of `ours` against `reference`: the same
+/// per-keyword `min`/`saturating_sub` rule `keyword_bias.rs` scores with.
+fn keyword_score(
+    reference: &[String],
+    ours: &[String],
+    keywords: &[Vec<String>],
+) -> (usize, usize, usize) {
+    let (mut hits, mut total, mut inserted) = (0, 0, 0);
+    for k in keywords {
+        let (r, o) = (occurrences(reference, k), occurrences(ours, k));
+        hits += o.min(r);
+        total += r;
+        inserted += o.saturating_sub(r);
+    }
+    (hits, total, inserted)
+}
+
+/// Whether `words` (one segment, normalised) reads as a keyword echo: three
+/// or more distinct keywords matched anywhere in it, or at least half its
+/// words covered by keyword matches.
+fn is_echo_segment(words: &[String], keywords: &[Vec<String>]) -> bool {
+    if words.is_empty() {
+        return false;
+    }
+    let distinct = keywords
+        .iter()
+        .filter(|k| occurrences(words, k) >= 1)
+        .count();
+    if distinct >= 3 {
+        return true;
+    }
+    let covered: usize = keywords.iter().map(|k| covered_words(words, k)).sum();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a segment's word count fits a f64 exactly"
+    )]
+    let coverage = covered as f64 / words.len() as f64;
+    coverage >= 0.5
+}
+
+/// Offline spans decoded again for echoing the keywords, and the spans
+/// transcribed, summed from the offline job's closing debug event while the
+/// diagnostic runs ([`RedecodeCounter`]).
+static REDECODED: AtomicU64 = AtomicU64::new(0);
+static JOB_SPANS: AtomicU64 = AtomicU64::new(0);
+
+/// Sums the `redecoded` and `spans` fields of the offline job's debug
+/// events into [`REDECODED`] and [`JOB_SPANS`]: the only place the server
+/// says how many spans it decoded again, since the response does not.
+struct RedecodeCounter;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RedecodeCounter {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        /// The two counts one event carries.
+        #[derive(Default)]
+        struct Counts {
+            redecoded: Option<u64>,
+            spans: Option<u64>,
+        }
+        impl tracing::field::Visit for Counts {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                match field.name() {
+                    "redecoded" => self.redecoded = Some(value),
+                    "spans" => self.spans = Some(value),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut counts = Counts::default();
+        event.record(&mut counts);
+        if let (Some(redecoded), Some(spans)) = (counts.redecoded, counts.spans) {
+            REDECODED.fetch_add(redecoded, Ordering::Relaxed);
+            JOB_SPANS.fetch_add(spans, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Installs [`RedecodeCounter`] for the offline job's debug events alone;
+/// whether it could (another subscriber may already be the global one).
+fn count_redecodes() -> bool {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::{Layer as _, filter::Targets};
+    let filter =
+        Targets::new().with_target("shiso_models::qwen3_asr::offline", tracing::Level::DEBUG);
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(RedecodeCounter.with_filter(filter)),
+    )
+    .is_ok()
+}
+
 /// One recognizer this test runs the meeting through.
 struct Recognizer {
     /// The name it answers to in the transcription's `model` field.
@@ -88,6 +251,10 @@ struct Recognizer {
     /// Whether it transcribes a long clip offline, so it runs with silence
     /// skipped and kept.
     offline: bool,
+    /// Whether its family carries a context encoder, so `keywords[]` may be
+    /// sent to it; Nemotron has none and refuses a non-empty context
+    /// outright.
+    supports_context: bool,
 }
 
 const RECOGNIZERS: &[Recognizer] = &[
@@ -97,6 +264,7 @@ const RECOGNIZERS: &[Recognizer] = &[
         model: "gguf/Qwen3-ASR-1.7B-Q8_0.gguf",
         assert_floor: true,
         offline: true,
+        supports_context: true,
     },
     Recognizer {
         name: "qwen3-asr-mlx",
@@ -104,6 +272,7 @@ const RECOGNIZERS: &[Recognizer] = &[
         model: "mlx",
         assert_floor: true,
         offline: true,
+        supports_context: true,
     },
     Recognizer {
         name: "r2t2-q8",
@@ -111,6 +280,7 @@ const RECOGNIZERS: &[Recognizer] = &[
         model: "gguf/Confucius4-R2T2-Q8_0.gguf",
         assert_floor: true,
         offline: true,
+        supports_context: true,
     },
     Recognizer {
         name: "nemotron-q8",
@@ -118,6 +288,7 @@ const RECOGNIZERS: &[Recognizer] = &[
         model: "nvidia/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf",
         assert_floor: false,
         offline: false,
+        supports_context: false,
     },
 ];
 
@@ -243,53 +414,6 @@ fn boot(recognizer: &Recognizer, diarizer: &Path, extra: &[&str]) -> Option<Arc<
     Some(Arc::new(
         AppState::without_language_model().with_audio(audio),
     ))
-}
-
-/// Lowercases `text` with Turkish casing (`I`/`ı`, `İ`/`i` mapped before the
-/// generic lowercasing, which would otherwise fold both onto ASCII `i`), then
-/// strips everything but word characters and whitespace and splits on
-/// whitespace. Mirrors the scoring approach validated against this export
-/// during development.
-fn normalize_words(text: &str) -> Vec<String> {
-    let turkish: String = text
-        .chars()
-        .map(|c| match c {
-            'I' => 'ı',
-            'İ' => 'i',
-            other => other,
-        })
-        .collect();
-    let lowered = turkish.to_lowercase();
-    let stripped: String = lowered
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' || c.is_whitespace() {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect();
-    stripped.split_whitespace().map(str::to_owned).collect()
-}
-
-/// The word-level edit distance between `reference` and `hypothesis`: the
-/// classic single-row dynamic program, insertion, deletion and substitution
-/// all costing one word.
-fn edit_distance(reference: &[String], hypothesis: &[String]) -> usize {
-    let mut d: Vec<usize> = (0..=hypothesis.len()).collect();
-    for a in reference {
-        let mut diag = d[0];
-        d[0] += 1;
-        for (col, b) in (1..=hypothesis.len()).zip(hypothesis) {
-            let up = d[col];
-            let left = d[col - 1];
-            let cost = usize::from(a != b);
-            d[col] = (up + 1).min(left + 1).min(diag + cost);
-            diag = up;
-        }
-    }
-    d[hypothesis.len()]
 }
 
 /// A speaker's labelled span: its label and `[start, end)` in seconds.
@@ -466,6 +590,17 @@ fn our_spans(json: &Value) -> Vec<Span> {
         .collect()
 }
 
+/// Our own diarized segments' raw `text`, in order.
+fn our_segment_texts(json: &Value) -> Vec<String> {
+    json["segments"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s["text"].as_str().map(str::to_owned))
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the private long meeting recording and a Metal device"]
 async fn long_meeting_recognizers() {
@@ -489,6 +624,12 @@ async fn long_meeting_recognizers() {
         reference.spans.len()
     ));
 
+    if std::env::var_os("SHISO_TEST_DIAG").is_some() {
+        diagnose_keyword_wer(&diarizer, &audio_bytes, &reference).await;
+        return;
+    }
+
+    let keywords = keyword_fields();
     for recognizer in RECOGNIZERS {
         let runs: &[(&str, &[&str])] = if recognizer.offline {
             &[
@@ -498,12 +639,24 @@ async fn long_meeting_recognizers() {
         } else {
             &[("streamed", &[])]
         };
+        let context: &[(String, String)] = if recognizer.supports_context {
+            &keywords
+        } else {
+            &[]
+        };
         for &(run, extra) in runs {
             let Some(state) = boot(recognizer, &diarizer, extra) else {
                 break;
             };
-            let (wer, agreement) =
-                measure(recognizer.name, run, &state, &audio_bytes, &reference).await;
+            let (wer, agreement) = measure(
+                recognizer.name,
+                run,
+                &state,
+                &audio_bytes,
+                &reference,
+                context,
+            )
+            .await;
             if recognizer.assert_floor {
                 assert!(
                     wer < 0.5,
@@ -522,28 +675,25 @@ async fn long_meeting_recognizers() {
     }
 }
 
-/// One diarized transcription of the meeting through `state`, its aggregates
-/// said on stderr; returns its word error rate and speaker agreement.
+/// One diarized transcription of the meeting through `state`, `context`
+/// added as `keywords[]` fields when non-empty, its aggregates said on
+/// stderr; returns its word error rate and speaker agreement.
 async fn measure(
     name: &str,
     run: &str,
     state: &Arc<AppState>,
     audio_bytes: &[u8],
     reference: &Reference,
+    context: &[(String, String)],
 ) -> (f64, f64) {
     let started = Instant::now();
-    let (status, body) = post(
-        state,
-        form(
-            audio_bytes,
-            &[
-                ("model", name),
-                ("response_format", "diarized_json"),
-                ("language", "tr"),
-            ],
-        ),
-    )
-    .await;
+    let mut fields: Vec<(&str, &str)> = vec![
+        ("model", name),
+        ("response_format", "diarized_json"),
+        ("language", "tr"),
+    ];
+    fields.extend(context.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let (status, body) = post(state, form(audio_bytes, &fields)).await;
     let elapsed = started.elapsed().as_secs_f64();
     assert_eq!(status, StatusCode::OK, "{name} ({run}): request failed");
     let json: Value = serde_json::from_str(&body).expect("json");
@@ -569,10 +719,15 @@ async fn measure(
     } else {
         matched as f64 / pairs as f64
     };
+    let keyword_tag = if context.is_empty() {
+        ""
+    } else {
+        " keywords=on"
+    };
     say(&format!(
         "{name} ({run}): {elapsed:.1} s wall ({:.3}x realtime over {duration:.1} s), \
          WER {:.1}% ({edits} of {} words; {} words transcribed), {} speakers found, \
-         agreement {:.1}% over {pairs} half-second samples",
+         agreement {:.1}% over {pairs} half-second samples{keyword_tag}",
         elapsed / duration.max(1.0),
         wer * 100.0,
         reference.words.len(),
@@ -581,4 +736,115 @@ async fn measure(
         agreement * 100.0,
     ));
     (wer, agreement)
+}
+
+/// Diagnoses the WER rise `SHISO_TEST_KEYWORDS` causes on the full meeting:
+/// qwen3-asr-q8, offline with silence kept (the worse of the two silence
+/// settings measured by the ordinary run), booted once and sent two
+/// requests - one without keywords, one with. Each transcript's word errors
+/// are split into substitutions, deletions and insertions; its keyword
+/// recall and insertions are scored the way `keyword_bias.rs` scores them,
+/// against the same export `measure` compares to; and its segments are
+/// checked for "keyword echo" (three or more distinct keywords matched, or
+/// at least half the segment's words covered by one) and for an exact
+/// repeat of the previous segment's text. `rule_echo_segments` counts the
+/// segments the recognizer's own rule ([`shiso_audio::is_echo`]) would call
+/// an echo, and `redecoded_spans` how many of the offline job's spans it
+/// decoded again without the context, out of those it transcribed, read from
+/// its debug event. One `diag` line a run, aggregates only. SKIPs on
+/// stderr, needing no state, when `SHISO_TEST_KEYWORDS` is unset - the two
+/// runs would otherwise be identical - or when qwen3-asr-q8 itself is
+/// unavailable (`boot` has already said why).
+async fn diagnose_keyword_wer(diarizer: &Path, audio_bytes: &[u8], reference: &Reference) {
+    let keyword_lines = keyword_fields();
+    if keyword_lines.is_empty() {
+        say("SKIP diag: SHISO_TEST_KEYWORDS is needed for the with/without comparison");
+        return;
+    }
+    let keyword_needles: Vec<Vec<String>> = keyword_lines
+        .iter()
+        .map(|(_, value)| normalize_words(value))
+        .collect();
+    // The production rule's split of each keyword, for `rule_echo_segments`.
+    let rule_needles: Vec<Vec<String>> = keyword_lines
+        .iter()
+        .map(|(_, value)| shiso_audio::keyword_words(value))
+        .collect();
+    let counting = count_redecodes();
+    // By name rather than `RECOGNIZERS[0]`, so a reordering of that list
+    // cannot silently point this diagnostic at the wrong recognizer in a
+    // release build, where a `debug_assert!` would have compiled out.
+    let recognizer = RECOGNIZERS
+        .iter()
+        .find(|r| r.name == "qwen3-asr-q8")
+        .expect("qwen3-asr-q8 is in RECOGNIZERS");
+    let Some(state) = boot(recognizer, diarizer, &["--asr-skip-silence=false"]) else {
+        return;
+    };
+
+    for (run, context) in [
+        ("baseline", [].as_slice()),
+        ("keywords", keyword_lines.as_slice()),
+    ] {
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("model", recognizer.name),
+            ("response_format", "diarized_json"),
+            ("language", "tr"),
+        ];
+        fields.extend(context.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        REDECODED.store(0, Ordering::Relaxed);
+        JOB_SPANS.store(0, Ordering::Relaxed);
+        let (status, body) = post(&state, form(audio_bytes, &fields)).await;
+        assert_eq!(status, StatusCode::OK, "diag {run}: request failed");
+        let redecoded = if counting {
+            format!(
+                "{}/{}",
+                REDECODED.load(Ordering::Relaxed),
+                JOB_SPANS.load(Ordering::Relaxed)
+            )
+        } else {
+            "unobserved".to_owned()
+        };
+        let json: Value = serde_json::from_str(&body).expect("json");
+        let hyp_words = normalize_words(json["text"].as_str().expect("text"));
+        let (subs, dels, ins) = edit_ops(&reference.words, &hyp_words);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a word count fits a meeting's transcript; f64 carries it exactly"
+        )]
+        let wer = (subs + dels + ins) as f64 / reference.words.len().max(1) as f64;
+        let (keyword_hits, keyword_total, keyword_insertions) =
+            keyword_score(&reference.words, &hyp_words, &keyword_needles);
+
+        let (mut echo_segments, mut echo_words) = (0usize, 0usize);
+        let (mut repeat_segments, mut repeat_words) = (0usize, 0usize);
+        let mut rule_echo_segments = 0usize;
+        let mut previous: Option<String> = None;
+        for text in our_segment_texts(&json) {
+            let trimmed = text.trim();
+            let words = normalize_words(trimmed);
+            if is_echo_segment(&words, &keyword_needles) {
+                echo_segments += 1;
+                echo_words += words.len();
+            }
+            if shiso_audio::is_echo(trimmed, &rule_needles) {
+                rule_echo_segments += 1;
+            }
+            if previous.as_deref() == Some(trimmed) {
+                repeat_segments += 1;
+                repeat_words += words.len();
+            }
+            previous = Some(trimmed.to_owned());
+        }
+
+        say(&format!(
+            "diag run={run} wer={:.1}% subs={subs} dels={dels} ins={ins} \
+             keyword_recall={keyword_hits}/{keyword_total} keyword_insertions={keyword_insertions} \
+             words={} echo_segments={echo_segments} echo_words={echo_words} \
+             repeat_segments={repeat_segments} repeat_words={repeat_words} \
+             rule_echo_segments={rule_echo_segments} redecoded_spans={redecoded}",
+            wer * 100.0,
+            hyp_words.len(),
+        ));
+    }
 }

@@ -19,6 +19,12 @@
 //! `Q8_0`) plan-order batches ran 4487 decode passes, 3.1 tokens a pass, and
 //! longest-first ones 2375, 5.9 a pass: 106 s of decoding became 76 s.
 //!
+//! **A span that echoes the keywords.** After a batch decodes with the
+//! context, the spans whose text [`echoes`] the keywords ([`to_redecode`])
+//! are decoded once more together, from the same tower rows, with no
+//! context, and those ids replace theirs: at most one more pass a batch, and
+//! never a third decode of a span.
+//!
 //! Skipped spans (`transcribe: false`, a long silence the plan leaves out)
 //! are never encoded and write nothing, and a join looks past them to the
 //! last text a transcribed span wrote.
@@ -27,12 +33,13 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use shiso_audio::chunks::Span;
-use shiso_audio::{AudioError, MelFrames, OfflineBatch, OfflineJob, SpanResult};
+use shiso_audio::{AudioError, MelFrames, OfflineBatch, OfflineJob, PieceVocab, SpanResult};
 
 use super::Model;
 use super::batch::BatchTranscriber;
 use super::encoder::{Encoded, Tower};
-use super::stream::{chunk_events, chunk_mel, frame_word, warn_at_cap};
+use super::prompt::Conditioning;
+use super::stream::{chunk_events, chunk_mel, echoes, frame_word, warn_at_cap};
 
 /// Which spans a job's steps transcribe, and which of them it can hand back.
 #[derive(Debug)]
@@ -117,11 +124,34 @@ pub(crate) fn check_plan(spans: &[Span]) -> Result<(), AudioError> {
     Ok(())
 }
 
+/// Which of a batch's spans, decoded with the context to `ids` (in batch
+/// order), echo `keywords` and are decoded again without it: their places
+/// in `ids`, in order. `forced` is the language the prompt forced.
+pub(crate) fn to_redecode(
+    vocab: &Arc<PieceVocab>,
+    ids: &[Vec<u32>],
+    forced: Option<&str>,
+    keywords: &[Vec<String>],
+) -> Vec<usize> {
+    ids.iter()
+        .enumerate()
+        .filter(|(_, ids)| echoes(vocab, ids, forced, keywords))
+        .map(|(k, _)| k)
+        .collect()
+}
+
 /// One clip's offline job.
 pub(crate) struct QwenOffline {
     model: Arc<Model>,
     /// The language the prompt forces, by the model's name for it.
     forced: Option<&'static str>,
+    /// The system turn's ids, shared by every span.
+    context: Arc<[u32]>,
+    /// The keywords `context` was made from, as word sequences: a span that
+    /// echoes them is decoded again without it.
+    keywords: Arc<[Vec<String>]>,
+    /// How many spans were decoded again for echoing the keywords.
+    redecoded: usize,
     spans: Vec<Span>,
     schedule: Schedule,
     /// The last character the spans handed back have written.
@@ -133,6 +163,8 @@ impl QwenOffline {
     pub(crate) fn new(
         model: Arc<Model>,
         forced: Option<&'static str>,
+        context: Arc<[u32]>,
+        keywords: Arc<[Vec<String>]>,
         spans: Vec<Span>,
         batch: usize,
     ) -> Result<Self, AudioError> {
@@ -145,6 +177,9 @@ impl QwenOffline {
         Ok(Self {
             model,
             forced,
+            context,
+            keywords,
+            redecoded: 0,
             schedule: Schedule::new(&spans, batch),
             spans,
             last_char: None,
@@ -154,8 +189,14 @@ impl QwenOffline {
     /// The ids of the spans `picked` of `mel`: through the tower together,
     /// each as it would be alone, then through the decoder together, in the
     /// model's pooled batch memory - so a job holds no device memory between
-    /// its steps, and the stream memories stay for the streams.
-    fn transcribe(&self, mel: &MelFrames, picked: &[usize]) -> Result<Vec<Vec<u32>>, AudioError> {
+    /// its steps, and the stream memories stay for the streams. The spans
+    /// that echo the keywords are decoded again without the context; the
+    /// count of them comes back with the ids.
+    fn transcribe(
+        &self,
+        mel: &MelFrames,
+        picked: &[usize],
+    ) -> Result<(Vec<Vec<u32>>, usize), AudioError> {
         let m = &*self.model;
         let n = m.config.audio.mels;
         let chunks = picked
@@ -179,11 +220,25 @@ impl QwenOffline {
                 "encoded a batch"
             );
             let refs: Vec<&Encoded> = encoded.iter().collect();
-            BatchTranscriber::new(&m.ops, &m.weights.text, &m.config.text).transcribe_with(
+            let decoder = BatchTranscriber::new(&m.ops, &m.weights.text, &m.config.text);
+            let mut ids = decoder.transcribe_with(
                 memory,
                 &refs,
-                self.forced,
-            )
+                &Conditioning {
+                    forced: self.forced,
+                    context: &self.context,
+                },
+            )?;
+            let again = to_redecode(&m.vocab, &ids, self.forced, &self.keywords);
+            if !again.is_empty() {
+                let rows: Vec<&Encoded> = again.iter().map(|&k| refs[k]).collect();
+                let plain =
+                    decoder.transcribe_with(memory, &rows, &Conditioning::forced(self.forced))?;
+                for (&k, plain) in again.iter().zip(plain) {
+                    ids[k] = plain;
+                }
+            }
+            Ok((ids, again.len()))
         })
     }
 }
@@ -204,13 +259,21 @@ impl OfflineJob for QwenOffline {
                     ),
                 });
             }
-            let ids = self.transcribe(mel, &picked)?;
+            let (ids, redecoded) = self.transcribe(mel, &picked)?;
+            self.redecoded += redecoded;
             for (&i, ids) in picked.iter().zip(ids) {
                 self.schedule.finish(i, ids);
             }
         }
         let ready = self.schedule.release();
         if picked.is_empty() && ready.is_empty() {
+            if !self.keywords.is_empty() {
+                tracing::debug!(
+                    spans = self.spans.iter().filter(|s| s.transcribe).count(),
+                    redecoded = self.redecoded,
+                    "an offline job's spans decoded again for echoing the keywords"
+                );
+            }
             return Ok(None);
         }
         let mut out = Vec::with_capacity(ready.len());

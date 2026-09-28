@@ -5,12 +5,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use shiso_audio::chunks::{self, OfflineRule, Span};
 use shiso_audio::transcript::SpeakerActivity;
 use shiso_audio::{
-    AudioError, DiarizationPass, Diarizer, Filterbank, Framing, Language, LogScale, MelFrames,
-    MelFrontend, MelScale, MelSpec, OfflineBatch, OfflineJob, Pcm, PieceVocab, Preemphasis,
-    RecognizerStream, SpanResult, Spectrum, SpeechRecognizer, StreamOptions, TokenEvent, Window,
+    AudioError, Context, ContextEncoder, ContextIds, DiarizationPass, Diarizer, Filterbank,
+    Framing, Language, LogScale, MelFrames, MelFrontend, MelScale, MelSpec, OfflineBatch,
+    OfflineJob, Pcm, PieceVocab, Preemphasis, RecognizerStream, SpanResult, Spectrum,
+    SpeechRecognizer, StreamOptions, TokenEvent, Window,
 };
 use shiso_core::TokenId;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -61,6 +63,39 @@ struct Scripted {
     opened: Opened,
     offline: usize,
     opened_offline: OpenedOffline,
+    /// The context encoder this recognizer hands the server, or `None` for a
+    /// recognizer that takes no context.
+    encoder: Option<Arc<dyn ContextEncoder>>,
+}
+
+/// Encodes one id per keyword (`1000 + index`), ignoring the prompt's words;
+/// caps at 4 ids.
+#[derive(Debug)]
+struct ScriptedEncoder;
+
+impl ContextEncoder for ScriptedEncoder {
+    fn encode(&self, context: &Context) -> Result<ContextIds, AudioError> {
+        let ids: Vec<TokenId> = context
+            .keywords
+            .iter()
+            .enumerate()
+            .map(|(i, _)| TokenId::new(1000 + u32::try_from(i).expect("small")))
+            .collect();
+        if ids.len() > self.max_ids() {
+            // Exercises a recognizer whose own cap is tighter than the
+            // server's configured one, the way the real qwen3_asr encoder's
+            // internal cap can be.
+            return Err(AudioError::TooManyContextTokens {
+                tokens: ids.len(),
+                max: self.max_ids(),
+            });
+        }
+        Ok(ContextIds::new(ids))
+    }
+
+    fn max_ids(&self) -> usize {
+        4
+    }
 }
 
 /// A recognizer frame (0.08 s) at or after mel frame `mel` (0.01 s).
@@ -211,11 +246,18 @@ impl SpeechRecognizer for Scripted {
     fn batches_offline(&self) -> usize {
         self.offline
     }
+    fn context_encoder(&self) -> Option<Arc<dyn ContextEncoder>> {
+        self.encoder.clone()
+    }
     fn open_offline(
         &self,
         options: &StreamOptions,
         spans: Vec<Span>,
     ) -> Result<Box<dyn OfflineJob>, AudioError> {
+        self.opened
+            .lock()
+            .expect("unpoisoned")
+            .push(options.clone());
         self.opened_offline
             .lock()
             .expect("unpoisoned")
@@ -349,6 +391,11 @@ fn service_with_upload(
 }
 
 /// What a test service is built with.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each names an independent knob a test flips on its own; a state \
+              machine over them would be harder to read at every call site"
+)]
 struct ServiceShape<'a> {
     max_streams: usize,
     queue: usize,
@@ -368,6 +415,8 @@ struct ServiceShape<'a> {
     skip_silence: bool,
     /// Steps of 5 ms the diarizer's pass takes.
     diar_steps: usize,
+    /// Whether the recognizer hands the server a [`ScriptedEncoder`].
+    encoder: bool,
 }
 
 impl<'a> ServiceShape<'a> {
@@ -388,6 +437,7 @@ impl<'a> ServiceShape<'a> {
             offline_min_secs: super::DEFAULT_OFFLINE_MIN_SECS,
             skip_silence: true,
             diar_steps: 20,
+            encoder: false,
         }
     }
 
@@ -432,6 +482,7 @@ fn service_with(shape: &ServiceShape<'_>) -> AudioService {
         offline_min_secs,
         skip_silence,
         diar_steps,
+        encoder,
     } = *shape;
     let vocab = Arc::new(if byte_level {
         PieceVocab::from_byte_level(
@@ -461,6 +512,7 @@ fn service_with(shape: &ServiceShape<'_>) -> AudioService {
             opened: Arc::clone(opened),
             offline,
             opened_offline: Arc::clone(opened_offline),
+            encoder: encoder.then(|| -> Arc<dyn ContextEncoder> { Arc::new(ScriptedEncoder) }),
         }),
         diarizer: diarizer.map(|pattern| -> Arc<dyn Diarizer> {
             Arc::new(Halves {
@@ -479,21 +531,38 @@ fn service_with(shape: &ServiceShape<'_>) -> AudioService {
         max_upload_bytes,
         offline_min_secs,
         skip_silence,
+        max_context_ids: 3,
     })
     .expect("the thread starts");
     service
 }
 
 fn job(seconds: usize, language: &str, diarize: bool) -> TranscriptionJob {
-    let samples = (0..seconds * 16_000)
-        .map(|i| (f32::from(u16::try_from(i % 97).expect("small")) / 97.0) - 0.5)
-        .collect();
     TranscriptionJob {
-        pcm: Pcm::new(samples, 16_000).expect("pcm"),
+        pcm: pcm_secs_usize(seconds),
         language: Language::Tag(language.into()),
+        context: ContextIds::default(),
         diarize,
         streaming: false,
     }
+}
+
+/// The same synthetic clip [`job`] builds, `seconds` long.
+fn pcm_secs_usize(seconds: usize) -> Pcm {
+    let samples = (0..seconds * 16_000)
+        .map(|i| (f32::from(u16::try_from(i % 97).expect("small")) / 97.0) - 0.5)
+        .collect();
+    Pcm::new(samples, 16_000).expect("pcm")
+}
+
+/// [`pcm_secs_usize`], for a fractional clip length.
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "a test clip's length in seconds is always small and non-negative"
+)]
+fn pcm_secs(seconds: f64) -> Pcm {
+    pcm_secs_usize(seconds.round() as usize)
 }
 
 /// [`job`], read as it streams (`stream=true`).
@@ -864,7 +933,7 @@ fn upload(file_bytes: usize) -> axum::http::Request<axum::body::Body> {
 async fn status_and_code(
     service: AudioService,
     request: axum::http::Request<axum::body::Body>,
-) -> (axum::http::StatusCode, serde_json::Value) {
+) -> (StatusCode, serde_json::Value) {
     use tower::ServiceExt as _;
     let state = Arc::new(crate::state::AppState::without_language_model().with_audio(service));
     let response = crate::router::build_router(state)
@@ -890,7 +959,7 @@ async fn an_upload_past_the_json_body_limit_is_read_as_audio() {
         upload(40 * 1024 * 1024),
     )
     .await;
-    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(
         body["error"]["code"], "invalid_audio",
         "it was read: {body}"
@@ -905,7 +974,7 @@ async fn an_upload_past_the_audio_limit_is_refused_as_too_large() {
         upload(2 * 1024 * 1024),
     )
     .await;
-    assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     assert_eq!(body["error"]["code"], "request_too_large", "{body}");
 }
 
@@ -934,7 +1003,17 @@ async fn an_offline_job_steps_one_batch_per_turn() {
         panic!("{a:?}");
     };
     assert!(matches!(b.last(), Some(TranscriptEvent::Done(_))), "{b:?}");
-    assert!(opened.lock().expect("unpoisoned").is_empty(), "no stream");
+    // `opened` now records both `open_stream` and `open_offline` calls, so
+    // the stream count is what is left once the offline opens are taken out;
+    // here that is zero, since both jobs went offline.
+    let opened_len = opened.lock().expect("unpoisoned").len();
+    let offline_len = offline.lock().expect("unpoisoned").len();
+    assert_eq!(
+        opened_len - offline_len,
+        0,
+        "no RecognizerStream::open_stream call: both jobs went offline \
+         (opened: {opened_len}, offline: {offline_len})"
+    );
     let plans = offline.lock().expect("unpoisoned").clone();
     assert_eq!(plans.len(), 2);
     let spans = transcribed(&plans[0]);
@@ -967,9 +1046,17 @@ async fn a_streaming_job_is_not_held_behind_an_offline_job() {
     let (batched, live) = tokio::join!(drain(batched), drain(live));
     assert!(matches!(batched.last(), Some(TranscriptEvent::Done(_))));
     assert!(matches!(live.last(), Some(TranscriptEvent::Done(_))));
-    // The streaming job streamed; only the other went offline.
-    assert_eq!(opened.lock().expect("unpoisoned").len(), 1);
-    assert_eq!(offline.lock().expect("unpoisoned").len(), 1);
+    // `opened` now records both `open_stream` and `open_offline` calls, so
+    // the stream count is what is left once the offline opens are taken
+    // out: one, for the streaming job; the batched job went offline instead.
+    let opened_len = opened.lock().expect("unpoisoned").len();
+    let offline_len = offline.lock().expect("unpoisoned").len();
+    assert_eq!(
+        opened_len - offline_len,
+        1,
+        "one real stream open: the live job (opened: {opened_len}, offline: {offline_len})"
+    );
+    assert_eq!(offline_len, 1);
     let log = log.lock().expect("unpoisoned").clone();
     let first_b = log.iter().position(|l| l == "b").expect("b ran");
     let last_a = log.iter().rposition(|l| l == "off:a").expect("a stepped");
@@ -1249,10 +1336,188 @@ async fn a_clip_under_the_offline_threshold_keeps_the_chunked_stream_path() {
             offline_jobs,
             "threshold {min_secs}"
         );
+        // `opened` records both `open_stream` and `open_offline` calls, so
+        // the stream count is what is left once the offline opens are taken
+        // out: one below the threshold (a real stream), zero at or above it
+        // (the job went offline instead).
+        let opened_len = opened.lock().expect("unpoisoned").len();
+        let offline_len = offline.lock().expect("unpoisoned").len();
         assert_eq!(
-            opened.lock().expect("unpoisoned").len(),
+            opened_len - offline_len,
             1 - offline_jobs,
-            "threshold {min_secs}"
+            "threshold {min_secs} (opened: {opened_len}, offline: {offline_len})"
         );
     }
+}
+
+#[tokio::test]
+async fn a_context_reaches_every_stream_the_job_opens() {
+    let log = Log::default();
+    let opened = Opened::default();
+    let offline = OpenedOffline::default();
+    let service = service_with(&ServiceShape {
+        encoder: true,
+        ..ServiceShape::offline(&log, &opened, &offline, None)
+    });
+    let context = Context {
+        prompt: None,
+        keywords: vec!["a".into(), "b".into()],
+    };
+    let ids = service.encode_context(&context).expect("encodes");
+    assert_eq!(ids.len(), 2);
+    for streaming in [true, false] {
+        let events = service
+            .submit(TranscriptionJob {
+                pcm: pcm_secs(2.0),
+                language: Language::Auto,
+                context: ids.clone(),
+                diarize: false,
+                streaming,
+            })
+            .expect("queued");
+        drain(events).await;
+    }
+    let seen = opened.lock().expect("unpoisoned");
+    assert_eq!(seen.len(), 2, "one stream and one offline job");
+    assert!(seen.iter().all(|options| options.context == ids));
+}
+
+/// A diarized job on a chunking recognizer waits in `Stream::AwaitingTurns`
+/// until the diarizer's turns are known, then opens through
+/// `worker::open_at_turns` rather than the immediate `open_stream` call in
+/// `worker::start`; its context must survive that wait too.
+#[tokio::test]
+async fn a_context_reaches_a_stream_opened_at_the_diarizer_turns() {
+    let log = Log::default();
+    let opened = Opened::default();
+    // `ServiceShape::plain` already loads a diarizer (`Pattern::Halves`);
+    // `chunks: true` is what sends a diarized job through `AwaitingTurns`
+    // instead of opening its stream immediately.
+    let service = service_with(&ServiceShape {
+        chunks: true,
+        opened: &opened,
+        encoder: true,
+        ..ServiceShape::plain(&log)
+    });
+    let context = Context {
+        prompt: None,
+        keywords: vec!["a".into()],
+    };
+    let ids = service.encode_context(&context).expect("encodes");
+    let events = drain(
+        service
+            .submit(TranscriptionJob {
+                context: ids.clone(),
+                ..job(6, "a", true)
+            })
+            .expect("queued"),
+    )
+    .await;
+    assert!(matches!(events.last(), Some(TranscriptEvent::Done(_))));
+    let seen = opened.lock().expect("unpoisoned").clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].context, ids);
+}
+
+/// Whether `error` is a [`AppError::BadRequest`] naming `param`.
+fn refused_over(error: &AppError, param: &str) -> bool {
+    matches!(error, AppError::BadRequest { param: Some(p), .. } if p == param)
+}
+
+#[test]
+fn a_prompt_only_context_is_refused_by_a_recognizer_that_takes_none() {
+    let log = Log::default();
+    let service = service_with(&ServiceShape::plain(&log));
+    let error = service
+        .encode_context(&Context {
+            prompt: Some("x".into()),
+            keywords: Vec::new(),
+        })
+        .expect_err("refused");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{error}");
+    assert!(refused_over(&error, "prompt"), "{error}");
+}
+
+#[test]
+fn a_keyword_context_is_refused_by_a_recognizer_that_takes_none() {
+    let log = Log::default();
+    let service = service_with(&ServiceShape::plain(&log));
+    let error = service
+        .encode_context(&Context {
+            prompt: None,
+            keywords: vec!["a".into()],
+        })
+        .expect_err("refused");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{error}");
+    assert!(refused_over(&error, "keywords"), "{error}");
+}
+
+#[test]
+fn a_context_past_the_server_cap_is_refused() {
+    let log = Log::default();
+    let service = service_with(&ServiceShape {
+        encoder: true,
+        ..ServiceShape::plain(&log)
+    });
+    let error = service
+        .encode_context(&Context {
+            prompt: None,
+            keywords: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        })
+        .expect_err("refused");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{error}");
+    assert!(refused_over(&error, "keywords"), "{error}");
+    assert!(
+        error.to_string().contains("--asr-max-context-tokens"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_context_past_the_encoders_own_cap_is_refused_in_the_servers_own_terms() {
+    let log = Log::default();
+    let service = service_with(&ServiceShape {
+        encoder: true,
+        ..ServiceShape::plain(&log)
+    });
+    // Five keywords tokenize to five ids: past the ScriptedEncoder's own cap
+    // of 4, so the encoder itself refuses first, before the server's own
+    // (tighter, 3) cap ever gets a count to compare. The refusal must still
+    // name the server's knob and cap, not the encoder's internal 4.
+    let error = service
+        .encode_context(&Context {
+            prompt: None,
+            keywords: vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+        })
+        .expect_err("refused");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{error}");
+    assert!(refused_over(&error, "keywords"), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("--asr-max-context-tokens"), "{message}");
+    assert!(message.contains("at most 3"), "{message}");
+    assert!(!message.contains("at most 4"), "{message}");
+}
+
+#[test]
+fn a_context_past_the_byte_cap_is_refused_before_tokenizing() {
+    let log = Log::default();
+    let service = service_with(&ServiceShape {
+        encoder: true,
+        ..ServiceShape::plain(&log)
+    });
+    // A long prompt and no keywords: the scripted encoder would emit no ids
+    // for it (it only counts keywords), so a refusal here can only come from
+    // the byte check, not the ids-per-request cap.
+    let error = service
+        .encode_context(&Context {
+            prompt: Some("x".repeat(super::MAX_CONTEXT_BYTES + 1)),
+            keywords: Vec::new(),
+        })
+        .expect_err("refused");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{error}");
+    assert!(refused_over(&error, "prompt"), "{error}");
+    assert!(
+        !error.to_string().contains("--asr-max-context-tokens"),
+        "the byte cap is refused before an id count exists: {error}"
+    );
 }

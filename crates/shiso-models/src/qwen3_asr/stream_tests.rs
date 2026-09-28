@@ -5,21 +5,21 @@ use std::sync::Arc;
 
 use shiso_audio::chunks::silence_cuts;
 use shiso_audio::{
-    DecodeLimits, Detokenizer, Language, MelFrames, MelFrontend, PieceVocab, SpeechRecognizer,
-    StreamOptions, TokenEvent, decode_audio,
+    ContextIds, DecodeLimits, Detokenizer, Language, MelFrames, MelFrontend, PieceVocab,
+    SpeechRecognizer, StreamOptions, TokenEvent, decode_audio,
 };
 
-use super::{Planner, SPACE, chunk_events};
+use super::{Planner, SPACE, chunk_events, echoes};
 use crate::qwen3_asr::config::{ASR_TEXT, is_special};
 
-const LANGUAGE: u32 = 11528;
-const ENGLISH: u32 = 6364;
-const NONE: u32 = 2240;
-const THIS: u32 = 1986;
-const WEEK: u32 = 2003;
-const DOT: u32 = 13;
-const A: u32 = 64;
-const B: u32 = 65;
+pub(crate) const LANGUAGE: u32 = 11528;
+pub(crate) const ENGLISH: u32 = 6364;
+pub(crate) const NONE: u32 = 2240;
+pub(crate) const THIS: u32 = 1986;
+pub(crate) const WEEK: u32 = 2003;
+pub(crate) const DOT: u32 = 13;
+pub(crate) const A: u32 = 64;
+pub(crate) const B: u32 = 65;
 /// `哈` and `好`, one byte-level piece each.
 const HA: u32 = 1_000;
 const HAO: u32 = 1_001;
@@ -27,7 +27,7 @@ const HAO: u32 = 1_001;
 /// A byte-level vocabulary of the checkpoint's size holding the handful of
 /// pieces these tests spell, and the added tokens where the checkpoint has
 /// them.
-fn vocab() -> Arc<PieceVocab> {
+pub(crate) fn vocab() -> Arc<PieceVocab> {
     let mut tokens = vec!["!".to_owned(); 151_643];
     for (id, piece) in [
         (LANGUAGE, "language"),
@@ -352,7 +352,7 @@ fn the_whole_stream_matches_one_shot_transcription() {
         .expect("encodes");
     let mut cache = KvCache::new(&m.config.text);
     let ids = Decoder::new(&m.ops, &m.weights.text, &m.config.text)
-        .transcribe(&mut cache, &audio, None)
+        .transcribe(&mut cache, &audio, &prompt::Conditioning::forced(None))
         .expect("decodes");
     let mut raw = Detokenizer::new(Arc::clone(&m.vocab));
     for &id in &ids {
@@ -372,6 +372,7 @@ fn the_whole_stream_matches_one_shot_transcription() {
             language: Language::Auto,
             lookahead: 0,
             cuts: None,
+            context: ContextIds::default(),
         })
         .expect("opens");
     let mut events = Vec::new();
@@ -457,11 +458,50 @@ fn the_pooled_capacity_is_the_longest_chunks_prompt_and_headroom() {
     let prompt_rows = languages()
         .iter()
         .map(|(_, name)| {
-            prompt::ids(audio_tokens(longest), Some(name))
-                .expect("a supported language")
-                .len()
+            prompt::ids(
+                audio_tokens(longest),
+                &prompt::Conditioning::forced(Some(name)),
+            )
+            .expect("a supported language")
+            .len()
         })
         .max()
         .expect("languages");
-    assert_eq!(POOLED_CAPACITY, prompt_rows + 256);
+    assert_eq!(POOLED_CAPACITY, prompt_rows + prompt::MAX_CONTEXT_IDS + 256);
+}
+
+/// `a. b. This`, after the language prefix: three short words.
+pub(crate) const LIST: [u32; 10] = [
+    LANGUAGE, ENGLISH, ASR_TEXT, A, DOT, SPACE, B, DOT, SPACE, THIS,
+];
+/// `This week.`, after the language prefix.
+pub(crate) const SPEECH: [u32; 6] = [LANGUAGE, ENGLISH, ASR_TEXT, THIS, WEEK, DOT];
+
+/// Keyword word sequences, as the context encoder hands them over.
+pub(crate) fn keywords(list: &[&str]) -> Vec<Vec<String>> {
+    list.iter().map(|k| shiso_audio::keyword_words(k)).collect()
+}
+
+#[test]
+fn a_chunk_echoes_by_its_parsed_text_not_its_language_prefix() {
+    let v = vocab();
+    assert!(echoes(&v, &LIST, None, &keywords(&["a", "b", "this"])));
+    assert!(!echoes(&v, &SPEECH, None, &keywords(&["a", "b"])));
+    // The prefix spells `language English`: read raw, with `This` it would
+    // be a run of three keywords.
+    assert!(!echoes(
+        &v,
+        &SPEECH,
+        None,
+        &keywords(&["language", "english", "this"])
+    ));
+    // A forced language has no prefix to strip.
+    assert!(echoes(
+        &v,
+        &[A, DOT, SPACE, B, DOT, SPACE, THIS],
+        Some("English"),
+        &keywords(&["a", "b", "this"])
+    ));
+    // No keywords: a prompt-only context never re-decodes.
+    assert!(!echoes(&v, &LIST, None, &[]));
 }

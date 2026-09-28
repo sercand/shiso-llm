@@ -28,13 +28,19 @@
 //!   right time inside it. The stream reports each chunk's end
 //!   ([`RecognizerStream::chunk_ends`]), so that a word ends where the next
 //!   one starts and a chunk's last word at the chunk's end.
+//! - **A chunk that echoes the keywords.** Given keywords, the model now and
+//!   then writes the list out in place of quiet or unclear speech. A chunk
+//!   whose parsed text [`echoes`] them is decoded once more from the same
+//!   tower rows with no context, and that text is kept; the no-context
+//!   decode is what the chunk would have read without keywords at all.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use shiso_audio::chunks::{CHUNK_SECS, SEARCH_SECS, WINDOW_SECS, silence_cuts};
 use shiso_audio::{
-    AudioError, Detokenizer, MelFrames, PieceVocab, RecognizerStream, TokenEvent, log10_max_floor,
+    AudioError, Detokenizer, MelFrames, PieceVocab, RecognizerStream, TokenEvent, is_echo,
+    log10_max_floor,
 };
 use shiso_core::TokenId;
 
@@ -42,7 +48,7 @@ use super::Model;
 use super::config::{ASR_TEXT, language_code};
 use super::decoder::{Decoder, KvCache, MAX_NEW_TOKENS, POOLED_CAPACITY};
 use super::encoder::Tower;
-use super::prompt;
+use super::prompt::{self, Conditioning};
 use crate::audio_ops::Workspace;
 
 /// Seconds per mel frame, the unit of every token's frame.
@@ -392,6 +398,28 @@ pub(crate) fn chunk_events(
     }
 }
 
+/// Whether a chunk whose greedy ids are `ids` (without the end id) echoes
+/// `keywords` ([`is_echo`]), judged on its text as [`prompt::parse`] reads
+/// it: the `language X<asr_text>` prefix is the model's, not the speech's.
+/// `forced` is as for [`chunk_events`]. No keywords never echo, so a
+/// prompt-only context never costs a second decode.
+pub(crate) fn echoes(
+    vocab: &Arc<PieceVocab>,
+    ids: &[u32],
+    forced: Option<&str>,
+    keywords: &[Vec<String>],
+) -> bool {
+    if keywords.is_empty() {
+        return false;
+    }
+    let mut raw = Detokenizer::new(Arc::clone(vocab));
+    for &id in ids {
+        raw.push(id);
+    }
+    raw.flush();
+    is_echo(&prompt::parse(raw.text(), forced).text, keywords)
+}
+
 /// Where emitting resumes after `ids[0]` began text the collapsed target does
 /// not have: the index of the first later id, at a character boundary, from
 /// which `ids` spell exactly `rest` (the target's text not yet spelled),
@@ -483,6 +511,13 @@ pub(crate) struct QwenStream {
     model: Arc<Model>,
     /// The language the prompt forces, by the model's name for it.
     forced: Option<&'static str>,
+    /// The system turn's ids, shared by every chunk.
+    context: Arc<[u32]>,
+    /// The keywords `context` was made from, as word sequences: a chunk
+    /// that echoes them is decoded again without it.
+    keywords: Arc<[Vec<String>]>,
+    /// How many chunks were decoded again for echoing the keywords.
+    redecoded: usize,
     planner: Planner,
     /// Always `Some` until the stream is dropped and gives it back.
     memory: Option<Memory>,
@@ -501,6 +536,8 @@ impl QwenStream {
     pub(crate) fn new(
         model: Arc<Model>,
         forced: Option<&'static str>,
+        context: Arc<[u32]>,
+        keywords: Arc<[Vec<String>]>,
         cuts: Option<&[u32]>,
     ) -> Result<Self, AudioError> {
         let memory = Memory::take(&model);
@@ -508,6 +545,9 @@ impl QwenStream {
             planner: Planner::new(cuts)?,
             model,
             forced,
+            context,
+            keywords,
+            redecoded: 0,
             memory: Some(memory),
             pending: Vec::new(),
             last_char: None,
@@ -550,12 +590,25 @@ impl QwenStream {
         })?;
         let audio = Tower::new(&m.ops, &m.weights.tower, &m.config.audio)
             .encode_with(&mel, &mut memory.tower)?;
-        let ids = Decoder::new(&m.ops, &m.weights.text, &m.config.text).transcribe_with(
+        let decoder = Decoder::new(&m.ops, &m.weights.text, &m.config.text);
+        let mut ids = decoder.transcribe_with(
             &mut memory.cache,
             &mut memory.decoder,
             &audio,
-            self.forced,
+            &Conditioning {
+                forced: self.forced,
+                context: &self.context,
+            },
         )?;
+        if echoes(&m.vocab, &ids, self.forced, &self.keywords) {
+            ids = decoder.transcribe_with(
+                &mut memory.cache,
+                &mut memory.decoder,
+                &audio,
+                &Conditioning::forced(self.forced),
+            )?;
+            self.redecoded += 1;
+        }
         warn_at_cap(&ids, &span);
         Ok(chunk_events(
             &m.vocab,
@@ -598,7 +651,15 @@ impl RecognizerStream for QwenStream {
             return Ok(Vec::new());
         }
         self.finished = true;
-        self.run(true)
+        let events = self.run(true)?;
+        if !self.keywords.is_empty() {
+            tracing::debug!(
+                chunks = self.ends.len(),
+                redecoded = self.redecoded,
+                "a stream's chunks decoded again for echoing the keywords"
+            );
+        }
+        Ok(events)
     }
 
     /// Mel frames transcribed so far.
@@ -619,4 +680,4 @@ impl RecognizerStream for QwenStream {
 
 #[cfg(test)]
 #[path = "stream_tests.rs"]
-mod tests;
+pub(crate) mod tests;

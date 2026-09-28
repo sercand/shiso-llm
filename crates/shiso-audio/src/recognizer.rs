@@ -23,6 +23,7 @@ use std::sync::Arc;
 use shiso_core::TokenId;
 
 use crate::chunks::Span;
+use crate::context::{ContextEncoder, ContextIds};
 use crate::error::AudioError;
 use crate::mel::{MelFrames, MelSpec};
 use crate::vocab::PieceVocab;
@@ -50,6 +51,11 @@ pub struct StreamOptions {
     /// [`crate::chunks::turn_cuts`] plans them. `None` leaves the plan to the
     /// recognizer. A recognizer that does not chunk ignores it.
     pub cuts: Option<Vec<u32>>,
+    /// The context the prompt carries, as the recognizer's own ids from its
+    /// [`SpeechRecognizer::context_encoder`]; empty for none. A recognizer
+    /// without an encoder only ever sees it empty: the server refuses a
+    /// context before a job opens.
+    pub context: ContextIds,
 }
 
 /// One emitted token and the encoder frame it was emitted at.
@@ -84,6 +90,13 @@ pub trait SpeechRecognizer: Send + Sync + fmt::Debug {
     /// until its speaker turns are known, so that each chunk is one turn.
     fn chunks_at_cuts(&self) -> bool {
         false
+    }
+
+    /// The encoder for the context its prompt can carry. `None`, the
+    /// default, means the recognizer takes no context, and a request that
+    /// sends one is refused.
+    fn context_encoder(&self) -> Option<Arc<dyn ContextEncoder>> {
+        None
     }
 
     /// Whether `id` is never text: blank, padding, unknown.
