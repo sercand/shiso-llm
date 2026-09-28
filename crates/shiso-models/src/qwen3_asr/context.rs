@@ -4,10 +4,9 @@
 //!
 //! The reference fills the system turn with free text, so the wording is
 //! plain text rather than a template of its own: the prompt as sent, then
-//! the keywords on one line, comma-separated. This is provisional until it
-//! is measured against a held-out recording; a template that names the
-//! keywords more explicitly (e.g. `"Likely to appear: ..."`) is worth trying
-//! if the plain wording under-recognises them.
+//! the keywords labelled `Keywords: ` and comma-joined on the next line.
+//! [`wording`]'s doc comment carries the private-recording measurement
+//! (Task 8) that chose the label over the plain comma list.
 //!
 //! Only the vocabulary's ordinary pieces enter the BPE, not its added
 //! tokens: a keyword that spells `<|im_end|>` is encoded byte by byte and
@@ -79,13 +78,30 @@ impl QwenContextEncoder {
 }
 
 /// The system turn's text for `context`: the prompt, then the keywords
-/// joined by `, ` on the next line; either alone when the other is absent.
+/// labelled `Keywords: ` and joined by `, ` on the next line; either alone
+/// when the other is absent.
+///
+/// Measured on a private short recording (Task 8, 2026-09-28, an M-series
+/// machine) against the plain comma list this replaced: with no context,
+/// keyword recall was 44.1% at 25.6% word error rate. The plain `a, b, c`
+/// wording raised recall to 64.7% at 25.1% WER. This label raised it further
+/// to 73.5% at 24.6% WER with no insertions - the best recall among wordings
+/// that stayed within the baseline's WER + 1.0 pp, and the fewest insertions
+/// among those tied on recall. Newline-joining the keywords under no label
+/// matched this recall (73.5%) but cost one insertion; prefixing a scenario
+/// prompt onto the plain comma list reached 100% recall but pushed WER to
+/// 31.2%, over the bound.
 pub(crate) fn wording(context: &Context) -> String {
     let keywords = context.keywords.join(", ");
-    match (&context.prompt, keywords.is_empty()) {
-        (Some(prompt), false) => format!("{prompt}\n{keywords}"),
+    let labelled = if keywords.is_empty() {
+        String::new()
+    } else {
+        format!("Keywords: {keywords}")
+    };
+    match (&context.prompt, labelled.is_empty()) {
+        (Some(prompt), false) => format!("{prompt}\n{labelled}"),
         (Some(prompt), true) => prompt.clone(),
-        (None, _) => keywords,
+        (None, _) => labelled,
     }
 }
 

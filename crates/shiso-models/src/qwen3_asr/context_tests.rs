@@ -43,21 +43,21 @@ fn byte_alphabet() -> Vec<String> {
 }
 
 #[test]
-fn keywords_alone_are_worded_as_one_line() {
+fn keywords_alone_are_worded_as_one_labelled_line() {
     let context = Context {
         prompt: None,
-        keywords: vec!["Unity".into(), "SQLite".into()],
+        keywords: vec!["Marigold".into(), "Lighthouse".into()],
     };
-    assert_eq!(wording(&context), "Unity, SQLite");
+    assert_eq!(wording(&context), "Keywords: Marigold, Lighthouse");
 }
 
 #[test]
-fn a_prompt_comes_before_its_keywords() {
+fn a_prompt_comes_before_its_labelled_keywords() {
     let context = Context {
         prompt: Some("A planning meeting.".into()),
-        keywords: vec!["Unity".into()],
+        keywords: vec!["Marigold".into()],
     };
-    assert_eq!(wording(&context), "A planning meeting.\nUnity");
+    assert_eq!(wording(&context), "A planning meeting.\nKeywords: Marigold");
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn the_wording_matches_the_reference_script_s_context_string() {
     };
     assert_eq!(
         wording(&context),
-        "A farewell address.\nChicago, İstanbul, Çanakkale, Ağrı Dağı"
+        "A farewell address.\nKeywords: Chicago, İstanbul, Çanakkale, Ağrı Dağı"
     );
 }
 

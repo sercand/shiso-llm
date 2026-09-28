@@ -61,7 +61,7 @@ AUDIO_PAD_ID = 151676  # `<|audio_pad|>` in tokenizer_config.json
 # `wording(Context { prompt: Some("A farewell address."), keywords: ["Chicago",
 # "İstanbul", "Çanakkale", "Ağrı Dağı"] })` under the Rust wording
 # (`qwen3_asr::context::wording`), pinned by a unit test in context_tests.rs.
-CONTEXT = "A farewell address.\nChicago, İstanbul, Çanakkale, Ağrı Dağı"
+CONTEXT = "A farewell address.\nKeywords: Chicago, İstanbul, Çanakkale, Ağrı Dağı"
 
 # The windowed-encoder, auto-language golden for speech-en, from an earlier
 # reference run. It is the windowed one (matches vLLM/FA2), not the HF

@@ -26,8 +26,16 @@
 //! recognizers runs twice, with `--asr-skip-silence` on (the default) and
 //! off, so what skipping long silences costs in words and saves in time is
 //! measured on one recording; Nemotron has no offline path and runs once.
+//!
+//! `SHISO_TEST_KEYWORDS` is optional (Task 8's wider check): when it names a
+//! file, one `keywords[]` field a line is added to every recognizer whose
+//! family accepts a context, and its aggregate line says `keywords=on`.
+//! Unset, the run is the plain baseline. A recognizer with no context
+//! encoder (Nemotron) never receives them, since it refuses one outright.
 
 #![cfg(target_os = "macos")]
+
+mod common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,6 +44,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use common::wer::{edit_distance, normalize_words};
 use serde_json::Value;
 use shiso_server::cli::{Cli, Command};
 use shiso_server::router::build_router;
@@ -73,6 +82,21 @@ fn ffmpeg() -> String {
     std::env::var("SHISO_TEST_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned())
 }
 
+/// One `keywords[]` field a non-empty line of `SHISO_TEST_KEYWORDS`; empty,
+/// so a request built from it sends none, when the variable is unset.
+fn keyword_fields() -> Vec<(String, String)> {
+    let Some(path) = std::env::var_os("SHISO_TEST_KEYWORDS").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| ("keywords[]".to_owned(), line.to_owned()))
+        .collect()
+}
+
 /// One recognizer this test runs the meeting through.
 struct Recognizer {
     /// The name it answers to in the transcription's `model` field.
@@ -88,6 +112,10 @@ struct Recognizer {
     /// Whether it transcribes a long clip offline, so it runs with silence
     /// skipped and kept.
     offline: bool,
+    /// Whether its family carries a context encoder, so `keywords[]` may be
+    /// sent to it; Nemotron has none and refuses a non-empty context
+    /// outright.
+    supports_context: bool,
 }
 
 const RECOGNIZERS: &[Recognizer] = &[
@@ -97,6 +125,7 @@ const RECOGNIZERS: &[Recognizer] = &[
         model: "gguf/Qwen3-ASR-1.7B-Q8_0.gguf",
         assert_floor: true,
         offline: true,
+        supports_context: true,
     },
     Recognizer {
         name: "qwen3-asr-mlx",
@@ -104,6 +133,7 @@ const RECOGNIZERS: &[Recognizer] = &[
         model: "mlx",
         assert_floor: true,
         offline: true,
+        supports_context: true,
     },
     Recognizer {
         name: "r2t2-q8",
@@ -111,6 +141,7 @@ const RECOGNIZERS: &[Recognizer] = &[
         model: "gguf/Confucius4-R2T2-Q8_0.gguf",
         assert_floor: true,
         offline: true,
+        supports_context: true,
     },
     Recognizer {
         name: "nemotron-q8",
@@ -118,6 +149,7 @@ const RECOGNIZERS: &[Recognizer] = &[
         model: "nvidia/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf",
         assert_floor: false,
         offline: false,
+        supports_context: false,
     },
 ];
 
@@ -243,53 +275,6 @@ fn boot(recognizer: &Recognizer, diarizer: &Path, extra: &[&str]) -> Option<Arc<
     Some(Arc::new(
         AppState::without_language_model().with_audio(audio),
     ))
-}
-
-/// Lowercases `text` with Turkish casing (`I`/`ı`, `İ`/`i` mapped before the
-/// generic lowercasing, which would otherwise fold both onto ASCII `i`), then
-/// strips everything but word characters and whitespace and splits on
-/// whitespace. Mirrors the scoring approach validated against this export
-/// during development.
-fn normalize_words(text: &str) -> Vec<String> {
-    let turkish: String = text
-        .chars()
-        .map(|c| match c {
-            'I' => 'ı',
-            'İ' => 'i',
-            other => other,
-        })
-        .collect();
-    let lowered = turkish.to_lowercase();
-    let stripped: String = lowered
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' || c.is_whitespace() {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect();
-    stripped.split_whitespace().map(str::to_owned).collect()
-}
-
-/// The word-level edit distance between `reference` and `hypothesis`: the
-/// classic single-row dynamic program, insertion, deletion and substitution
-/// all costing one word.
-fn edit_distance(reference: &[String], hypothesis: &[String]) -> usize {
-    let mut d: Vec<usize> = (0..=hypothesis.len()).collect();
-    for a in reference {
-        let mut diag = d[0];
-        d[0] += 1;
-        for (col, b) in (1..=hypothesis.len()).zip(hypothesis) {
-            let up = d[col];
-            let left = d[col - 1];
-            let cost = usize::from(a != b);
-            d[col] = (up + 1).min(left + 1).min(diag + cost);
-            diag = up;
-        }
-    }
-    d[hypothesis.len()]
 }
 
 /// A speaker's labelled span: its label and `[start, end)` in seconds.
@@ -483,6 +468,7 @@ async fn long_meeting_recognizers() {
     let audio_bytes =
         std::fs::read(&audio_path).unwrap_or_else(|error| panic!("reading the meeting: {error}"));
     let reference = load_reference(&reference_path);
+    let keywords = keyword_fields();
     say(&format!(
         "reference: {} words, {} segments",
         reference.words.len(),
@@ -498,12 +484,24 @@ async fn long_meeting_recognizers() {
         } else {
             &[("streamed", &[])]
         };
+        let context: &[(String, String)] = if recognizer.supports_context {
+            &keywords
+        } else {
+            &[]
+        };
         for &(run, extra) in runs {
             let Some(state) = boot(recognizer, &diarizer, extra) else {
                 break;
             };
-            let (wer, agreement) =
-                measure(recognizer.name, run, &state, &audio_bytes, &reference).await;
+            let (wer, agreement) = measure(
+                recognizer.name,
+                run,
+                &state,
+                &audio_bytes,
+                &reference,
+                context,
+            )
+            .await;
             if recognizer.assert_floor {
                 assert!(
                     wer < 0.5,
@@ -522,28 +520,25 @@ async fn long_meeting_recognizers() {
     }
 }
 
-/// One diarized transcription of the meeting through `state`, its aggregates
-/// said on stderr; returns its word error rate and speaker agreement.
+/// One diarized transcription of the meeting through `state`, `context`
+/// added as `keywords[]` fields when non-empty, its aggregates said on
+/// stderr; returns its word error rate and speaker agreement.
 async fn measure(
     name: &str,
     run: &str,
     state: &Arc<AppState>,
     audio_bytes: &[u8],
     reference: &Reference,
+    context: &[(String, String)],
 ) -> (f64, f64) {
     let started = Instant::now();
-    let (status, body) = post(
-        state,
-        form(
-            audio_bytes,
-            &[
-                ("model", name),
-                ("response_format", "diarized_json"),
-                ("language", "tr"),
-            ],
-        ),
-    )
-    .await;
+    let mut fields: Vec<(&str, &str)> = vec![
+        ("model", name),
+        ("response_format", "diarized_json"),
+        ("language", "tr"),
+    ];
+    fields.extend(context.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let (status, body) = post(state, form(audio_bytes, &fields)).await;
     let elapsed = started.elapsed().as_secs_f64();
     assert_eq!(status, StatusCode::OK, "{name} ({run}): request failed");
     let json: Value = serde_json::from_str(&body).expect("json");
@@ -569,10 +564,15 @@ async fn measure(
     } else {
         matched as f64 / pairs as f64
     };
+    let keyword_tag = if context.is_empty() {
+        ""
+    } else {
+        " keywords=on"
+    };
     say(&format!(
         "{name} ({run}): {elapsed:.1} s wall ({:.3}x realtime over {duration:.1} s), \
          WER {:.1}% ({edits} of {} words; {} words transcribed), {} speakers found, \
-         agreement {:.1}% over {pairs} half-second samples",
+         agreement {:.1}% over {pairs} half-second samples{keyword_tag}",
         elapsed / duration.max(1.0),
         wer * 100.0,
         reference.words.len(),
