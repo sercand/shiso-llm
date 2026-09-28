@@ -22,7 +22,7 @@
 
 pub mod batch;
 pub mod config;
-mod context;
+pub mod context;
 pub mod decoder;
 pub mod encoder;
 mod names;
@@ -72,8 +72,11 @@ pub struct Qwen3Asr {
     /// one, a batch could give other ids than the single path, so the model
     /// has no offline path whatever the batch.
     outside: Option<String>,
-    /// The encoder the system turn's context is tokenized with.
-    context: Arc<context::QwenContextEncoder>,
+    /// The encoder the system turn's context is tokenized with; `None` when
+    /// the export carries no BPE merges, so a request that sends a prompt or
+    /// keywords is refused rather than tokenized wrong (see
+    /// [`config::read_merges`]).
+    context: Option<Arc<context::QwenContextEncoder>>,
 }
 
 /// The decoder's linears by their role, embedding (the tied head) first.
@@ -126,7 +129,10 @@ fn context_of(options: &StreamOptions) -> Arc<[u32]> {
 }
 
 /// Opens the checkpoint at `path` on `backend`; `mmproj` is `--asr-mmproj`,
-/// the tower file of a text GGUF.
+/// the tower file of a text GGUF. An HF or MLX export with no BPE merges
+/// (see [`config::read_merges`]) still loads, logging a warning: it just
+/// takes no context, and a request that sends a prompt or keywords is
+/// refused rather than silently dropped.
 ///
 /// # Errors
 ///
@@ -153,10 +159,17 @@ pub fn open(
         .ok_or_else(|| AudioError::Checkpoint {
             what: "the vocabulary is shorter than its specials' first id".into(),
         })?;
-    let context = Arc::new(context::QwenContextEncoder::new(
-        &pieces,
-        &read_merges(&located, &stores)?,
-    )?);
+    let context = if let Some(merges) = read_merges(&located, &stores)? {
+        Some(Arc::new(context::QwenContextEncoder::new(
+            &pieces, &merges,
+        )?))
+    } else {
+        tracing::warn!(
+            "this export carries no BPE merges (no merges.txt or tokenizer.json beside it); \
+             a request's prompt or keywords will be refused rather than tokenized"
+        );
+        None
+    };
     // The worker frames the whole clip once; the floor-and-rescale belongs to
     // each chunk's own rows (the reference extracts every chunk's features on
     // their own), so the frames it computes stop at the log and
@@ -240,7 +253,7 @@ impl SpeechRecognizer for Qwen3Asr {
     }
 
     fn context_encoder(&self) -> Option<Arc<dyn ContextEncoder>> {
-        let concrete = Arc::clone(&self.context);
+        let concrete = Arc::clone(self.context.as_ref()?);
         let encoder: Arc<dyn ContextEncoder> = concrete;
         Some(encoder)
     }

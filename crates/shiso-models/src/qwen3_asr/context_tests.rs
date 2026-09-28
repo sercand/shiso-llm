@@ -90,3 +90,55 @@ fn a_context_past_the_cap_is_refused() {
         "{error:?}"
     );
 }
+
+/// Exactly the cap is accepted; one more id is refused. A run of `n` plain
+/// ASCII letters with no space is one pretokenizer segment that no merge in
+/// the toy vocabulary touches, so it always tokenizes to exactly `n` ids -
+/// the id count is exact by construction, not just under the cap.
+#[test]
+fn exactly_the_cap_is_accepted_and_one_more_is_refused() {
+    let cap = crate::qwen3_asr::prompt::MAX_CONTEXT_IDS;
+
+    let at_cap = "x".repeat(cap);
+    let ids = toy()
+        .encode(&Context {
+            prompt: Some(at_cap),
+            keywords: Vec::new(),
+        })
+        .expect("exactly the cap is accepted");
+    assert_eq!(ids.len(), cap);
+
+    let over_cap = "x".repeat(cap + 1);
+    let error = toy()
+        .encode(&Context {
+            prompt: Some(over_cap),
+            keywords: Vec::new(),
+        })
+        .expect_err("one more than the cap is refused");
+    assert!(
+        matches!(error, shiso_audio::AudioError::BadContext { .. }),
+        "{error:?}"
+    );
+}
+
+/// The normalizer is NFC, matching the reference tokenizer: an NFD string and
+/// its NFC form (`"I\u{0307}"`, `I` and a combining dot above, composes to
+/// `İ`, LATIN CAPITAL LETTER I WITH DOT ABOVE) encode to the same ids. Without
+/// the normalizer the two forms tokenize differently, because the combining
+/// mark is not `\p{L}` and the pretokenizer splits it into its own segment.
+#[test]
+fn nfd_and_nfc_forms_encode_to_the_same_ids() {
+    let nfc = toy()
+        .encode(&Context {
+            prompt: Some("İ".into()),
+            keywords: Vec::new(),
+        })
+        .expect("nfc ids");
+    let nfd = toy()
+        .encode(&Context {
+            prompt: Some("I\u{0307}".into()),
+            keywords: Vec::new(),
+        })
+        .expect("nfd ids");
+    assert_eq!(nfc, nfd);
+}

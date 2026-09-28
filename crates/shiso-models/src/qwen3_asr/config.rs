@@ -933,41 +933,111 @@ pub fn read_vocab(located: &Located, stores: &Stores) -> Result<PieceVocab, Audi
     }
 }
 
-/// The checkpoint's BPE merges, `"left right"` in rank order: `merges.txt`
-/// (its `#version` header dropped) for HF and MLX exports,
-/// `tokenizer.ggml.merges` for GGUF.
+/// The checkpoint's BPE merges, `"left right"` in rank order.
+///
+/// HF and MLX exports are read from `merges.txt` (its `#version` header and
+/// blank lines dropped) when it is there, falling back to `tokenizer.json`'s
+/// `model.merges` (accepting both the `"left right"` string form and the
+/// `["left", "right"]` pair form) when it is not: some exports of this
+/// family ship the merges only inside `tokenizer.json`. GGUF is read from
+/// `tokenizer.ggml.merges`, which - unlike the HF/MLX files - is always
+/// required, because it is metadata inside the checkpoint itself rather than
+/// a file that may or may not be exported beside it.
 ///
 /// # Errors
 ///
-/// [`AudioError::Checkpoint`] or [`AudioError::Io`] for merges that are
-/// missing or unreadable: a checkpoint that cannot tokenize a context
-/// refuses at load rather than tokenizing one wrong.
-pub fn read_merges(located: &Located, stores: &Stores) -> Result<Vec<String>, AudioError> {
+/// [`AudioError::Checkpoint`] for merges data that is present but cannot be
+/// parsed, or (GGUF only) missing entirely; [`AudioError::Io`] for a merges
+/// or `tokenizer.json` file that exists but cannot be read.
+// None: the export (HF or MLX only) carries no BPE merges at all - neither
+// `merges.txt` nor a `tokenizer.json` with `model.merges` is beside it. The
+// caller still loads the recognizer, without a context encoder: a request
+// that sends a prompt or keywords is refused rather than tokenized wrong.
+pub fn read_merges(located: &Located, stores: &Stores) -> Result<Option<Vec<String>>, AudioError> {
     match located.flavour {
-        Flavour::Hf | Flavour::Mlx => {
-            let path = located.dir.join("merges.txt");
-            let text = std::fs::read_to_string(&path).map_err(|source| AudioError::Io {
-                what: "reading merges.txt",
-                source,
-            })?;
-            Ok(text
-                .lines()
+        Flavour::Hf | Flavour::Mlx => hf_merges(located),
+        Flavour::Gguf => gguf_merges(stores).map(Some),
+    }
+}
+
+/// `merges.txt` beside `located`, falling back to `tokenizer.json`'s
+/// `model.merges` when there is no `merges.txt`; see [`read_merges`] for what
+/// `None` means.
+fn hf_merges(located: &Located) -> Result<Option<Vec<String>>, AudioError> {
+    let path = located.dir.join("merges.txt");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(
+            text.lines()
                 .filter(|line| !line.starts_with("#version") && !line.is_empty())
                 .map(str::to_owned)
-                .collect())
+                .collect(),
+        )),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            tokenizer_json_merges(located)
         }
-        Flavour::Gguf => {
-            let meta = meta_of(stores.text())?;
-            Ok(meta
-                .get_array("tokenizer.ggml.merges")
-                .ok_or_else(|| checkpoint("the text GGUF has no tokenizer.ggml.merges"))?
-                .strings()
-                .map_err(|e| checkpoint(format!("tokenizer.ggml.merges: {e}")))?
-                .into_iter()
-                .map(String::from)
-                .collect())
-        }
+        Err(source) => Err(AudioError::Io {
+            what: "reading merges.txt",
+            source,
+        }),
     }
+}
+
+/// `model.merges` from `tokenizer.json` beside `located`; `None` when there
+/// is no `tokenizer.json`, or it has no `model.merges`.
+fn tokenizer_json_merges(located: &Located) -> Result<Option<Vec<String>>, AudioError> {
+    let path = located.dir.join("tokenizer.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(AudioError::Io {
+                what: "reading tokenizer.json",
+                source,
+            });
+        }
+    };
+    let doc: Value =
+        serde_json::from_str(&text).map_err(|e| checkpoint(format!("{}: {e}", path.display())))?;
+    let Some(merges) = doc.pointer("/model/merges").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    merges
+        .iter()
+        .map(|entry| {
+            merge_pair(entry).ok_or_else(|| {
+                checkpoint(format!(
+                    "{}: a model.merges entry is neither \"left right\" nor [\"left\", \"right\"]",
+                    path.display()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// One `model.merges` entry as `"left right"`, from either shape
+/// `tokenizer.json` may spell it in.
+fn merge_pair(entry: &Value) -> Option<String> {
+    if let Some(pair) = entry.as_str() {
+        return Some(pair.to_owned());
+    }
+    let [left, right] = entry.as_array()?.as_slice() else {
+        return None;
+    };
+    Some(format!("{} {}", left.as_str()?, right.as_str()?))
+}
+
+/// `tokenizer.ggml.merges` from a text GGUF's metadata; always required.
+fn gguf_merges(stores: &Stores) -> Result<Vec<String>, AudioError> {
+    let meta = meta_of(stores.text())?;
+    Ok(meta
+        .get_array("tokenizer.ggml.merges")
+        .ok_or_else(|| checkpoint("the text GGUF has no tokenizer.ggml.merges"))?
+        .strings()
+        .map_err(|e| checkpoint(format!("tokenizer.ggml.merges: {e}")))?
+        .into_iter()
+        .map(String::from)
+        .collect())
 }
 
 #[cfg(test)]

@@ -51,7 +51,7 @@ impl QwenContextEncoder {
         let document = serde_json::json!({
             "version": "1.0",
             "added_tokens": [],
-            "normalizer": null,
+            "normalizer": {"type": "NFC"},
             "pre_tokenizer": {
                 "type": "Sequence",
                 "pretokenizers": [
