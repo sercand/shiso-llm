@@ -424,3 +424,78 @@ struct dense_args_embed_affine {
     uint32_t hidden;
     uint32_t n_tok;
 };
+
+/// The state-space block's causal convolution (`dense_ssm.metal`).
+///
+/// `in_stride` is the input projection's row width and `in_offset` where the
+/// convolved channels start inside a row: the kernel reads them in place rather
+/// than from a copy.
+struct dense_args_ssm_conv {
+    uint32_t n_tok;
+    uint32_t channels;
+    uint32_t taps;
+    uint32_t in_stride;
+    uint32_t in_offset;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/// The state-space scan (`dense_ssm.metal`). `dt_offset` is where the per-head
+/// step sizes start inside an input-projection row of `in_stride` floats.
+struct dense_args_ssm_scan {
+    uint32_t n_tok;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t state;
+    uint32_t groups;
+    uint32_t channels;
+    uint32_t in_stride;
+    uint32_t dt_offset;
+};
+
+/// The gated grouped norm after the scan (`dense_ssm.metal`). The gate is the
+/// first `inner` floats of each input-projection row.
+struct dense_args_ssm_norm {
+    uint32_t n_tok;
+    uint32_t inner;
+    uint32_t group_size;
+    uint32_t in_stride;
+    float eps;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/// The biased sigmoid router (`dense_moe.metal`): `norm` non-zero renormalizes
+/// the chosen weights to sum to one before `scale` multiplies them.
+struct dense_args_moe_route {
+    uint32_t experts;
+    uint32_t used;
+    float scale;
+    uint32_t norm;
+};
+
+/// One routed expert stage over row-major affine stacks (`dense_moe.metal`).
+///
+/// `by_token` non-zero reads the TOKEN's row of the input (`col / n_used`),
+/// which is the first projection; zero reads the column's own row, which is the
+/// second. `act` 1 squares the rectified output; 0 writes it as it is.
+struct dense_args_experts {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_expert;
+    uint32_t n_used;
+    uint32_t by_token;
+    uint32_t act;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+/// A flat elementwise launch over `n` floats.
+struct dense_args_flat {
+    uint32_t n;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};

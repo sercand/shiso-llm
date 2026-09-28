@@ -16,7 +16,7 @@
 //! buried in a fused kernel.
 
 use shiso_core::backend::{Backend, KernelArg, KernelRef};
-use shiso_core::{CoreResult, DeviceView, Extent3};
+use shiso_core::{CoreError, CoreResult, DeviceView, Extent3};
 
 use crate::launch::{self, BLOCK_LINEAR, GluArgs};
 use crate::projection::{self, Weight};
@@ -28,8 +28,11 @@ use crate::shape::Activation;
 /// name a buffer no host read can inspect.
 #[derive(Debug)]
 pub struct Ffn {
-    /// Gating projection, whose row the activation pushes through `silu`.
-    pub gate: Weight,
+    /// Gating projection, whose row the activation pushes through its curve.
+    ///
+    /// `None` for an ungated activation ([`Activation::Relu2`]), which reads
+    /// the up projection alone.
+    pub gate: Option<Weight>,
     /// Up projection, multiplied into the gated half.
     pub up: Weight,
     /// Projection back to the residual width.
@@ -44,7 +47,7 @@ impl Ffn {
     /// the two projections were different widths.
     #[must_use]
     pub const fn intermediate(&self) -> u32 {
-        self.gate.out_dim
+        self.up.out_dim
     }
 }
 
@@ -83,11 +86,44 @@ fn glu_args(intermediate: u32) -> GluArgs {
 /// inside the kernel would be a branch that could be got wrong at one call site
 /// without anything failing loudly. Both read the same [`GluArgs`] and both are
 /// launched over the same grid, so the pair differ in nothing but the curve.
-const fn activation_kernel(activation: Activation) -> KernelRef {
+const fn activation_kernel(activation: Activation) -> Option<KernelRef> {
     match activation {
-        Activation::SwiGlu => KernelRef::new(launch::GENERIC, "kernel_swiglu_flat_f32"),
-        Activation::GeGluTanh => KernelRef::new(launch::DENSE, "kernel_dense_geglu_flat_f32"),
+        Activation::SwiGlu => Some(KernelRef::new(launch::GENERIC, "kernel_swiglu_flat_f32")),
+        Activation::GeGluTanh => Some(KernelRef::new(launch::DENSE, "kernel_dense_geglu_flat_f32")),
+        Activation::Relu2 => None,
     }
+}
+
+/// Argument block of `kernel_dense_relu2_f32`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FlatArgs {
+    n: u32,
+    pad: [u32; 3],
+}
+
+/// `dst = max(src, 0)^2` over `n` floats, in one launch for the whole chunk.
+pub(crate) fn relu2(
+    backend: &dyn Backend,
+    src: DeviceView<'_>,
+    dst: DeviceView<'_>,
+    n: u32,
+) -> CoreResult<()> {
+    const NAME: &str = "kernel_dense_relu2_f32";
+    let args = FlatArgs { n, pad: [0; 3] };
+    launch::run(
+        backend,
+        KernelRef::new(launch::DENSE, NAME),
+        Extent3::linear(n.div_ceil(BLOCK_LINEAR).max(1)),
+        Extent3::new(BLOCK_LINEAR, 1, 1),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(src),
+            KernelArg::Buffer(dst),
+        ],
+    )
+    .map_err(|err| launch::launch_failure(NAME, err))
 }
 
 /// Runs the activation over one token's inner row.
@@ -106,7 +142,10 @@ fn activation_row(
     intermediate: u32,
 ) -> CoreResult<()> {
     let args = glu_args(intermediate);
-    let kernel = activation_kernel(activation);
+    let kernel = activation_kernel(activation).ok_or(CoreError::Unsupported {
+        what: "a gated activation row for an ungated activation",
+        backend: "engine",
+    })?;
     launch::run(
         backend,
         kernel,
@@ -156,8 +195,27 @@ pub fn run(
 ) -> CoreResult<()> {
     let inner = u64::from(ffn.intermediate());
     let row_bytes = inner.saturating_mul(launch::F32_BYTES);
-    projection::projection(backend, &ffn.gate, n_tok, input, gate_out)?;
+    // The activation decides whether a gate exists, and a weight list that
+    // disagrees with it is a binding that went wrong: an ungated curve run over
+    // a checkpoint that has a gate would drop a third of the block.
+    let gate = match (activation, ffn.gate.as_ref()) {
+        (Activation::Relu2, None) => None,
+        (Activation::SwiGlu | Activation::GeGluTanh, Some(gate)) => Some(gate),
+        (_, gate) => {
+            return Err(CoreError::ShapeMismatch {
+                field: "feed-forward gate projection",
+                expected: u64::from(!matches!(activation, Activation::Relu2)),
+                got: u64::from(gate.is_some()),
+            });
+        }
+    };
     projection::projection(backend, &ffn.up, n_tok, input, up_out)?;
+    let Some(gate) = gate else {
+        let n = u32::try_from(inner.saturating_mul(u64::from(n_tok))).unwrap_or(u32::MAX);
+        relu2(backend, up_out, mid, n)?;
+        return projection::projection(backend, &ffn.down, n_tok, mid, block_out);
+    };
+    projection::projection(backend, gate, n_tok, input, gate_out)?;
     for itok in 0..n_tok {
         let offset = u64::from(itok).saturating_mul(row_bytes);
         activation_row(

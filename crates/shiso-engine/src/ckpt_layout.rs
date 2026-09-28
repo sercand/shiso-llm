@@ -31,6 +31,7 @@
 
 use shiso_kvstore::PathLayout;
 
+use crate::kv;
 use crate::layers::Geometry;
 use crate::shape::{HybridShape, LayerKind};
 
@@ -100,7 +101,7 @@ pub(crate) fn path_layout(
         kv_width: kv_row_bytes(shape),
         n_layers: shape.n_layers(),
         n_attn_layers: shape.count(LayerKind::Attn),
-        n_gdn_layers: shape.count(LayerKind::Gdn),
+        n_gdn_layers: shape.recurrent_count(),
         vocab: geometry.vocab,
         gdn_conv_elements: conv_elements(shape),
         gdn_state_elements: state_elements(shape),
@@ -145,31 +146,26 @@ pub(crate) fn kv_row_bytes(shape: &HybridShape) -> u32 {
 /// the projection's channels.
 #[must_use]
 pub(crate) fn conv_elements(shape: &HybridShape) -> u32 {
-    let qk = shape.gdn.qk_heads.saturating_mul(shape.gdn.head_dim);
-    let v = shape.gdn.v_heads.saturating_mul(shape.gdn.head_dim);
-    let channels = qk.saturating_mul(2).saturating_add(v);
-    shape
-        .gdn
-        .conv_kernel
-        .saturating_sub(1)
-        .saturating_mul(channels)
+    let kernel = shape
+        .ssm
+        .map_or(shape.gdn.conv_kernel, |ssm| ssm.conv_kernel);
+    let channels = u32::try_from(kv::conv_channels(shape)).unwrap_or(u32::MAX);
+    kernel.saturating_sub(1).saturating_mul(channels)
 }
 
-/// Elements of one recurrent slot's state matrix: one square matrix per value head.
+/// Elements of one recurrent slot's state matrix: one square matrix per value
+/// head, or a state-space block's `head_dim x state` per head.
 #[must_use]
 pub(crate) fn state_elements(shape: &HybridShape) -> u32 {
-    shape
-        .gdn
-        .v_heads
-        .saturating_mul(shape.gdn.head_dim)
-        .saturating_mul(shape.gdn.head_dim)
+    u32::try_from(kv::state_elements(shape)).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::kv;
 
     use super::{conv_elements, kv_row_bytes, state_elements};
-    use crate::kv;
+
     use crate::shape::{
         Activation, AttnLayer, GdnShape, HybridShape, LayerKind, MediaPositions, NormScheme,
     };
@@ -199,6 +195,8 @@ mod tests {
             media_positions: MediaPositions::Mrope3D,
             v_norm: false,
             moe: None,
+            ssm: None,
+            no_ffn: Vec::new(),
         }
     }
 

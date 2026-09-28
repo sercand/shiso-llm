@@ -50,7 +50,7 @@ use crate::options::EngineOptions;
 use crate::ple_rows::{PleRows, issue_rows};
 use crate::rows::RowPages;
 use crate::sessions::Session;
-use crate::shape::{HybridShape, LayerKind, NormScheme};
+use crate::shape::{HybridShape, NormScheme};
 use crate::vision::{MediaChunk, Streams, VisionPrefill, Walk};
 
 /// Rows one forward pass may carry.
@@ -341,7 +341,7 @@ fn pool_cost(
         0
     };
     let records = u64::from(opts.spec.rollback_slots());
-    let recurrent = u64::from(shape.count(LayerKind::Gdn))
+    let recurrent = u64::from(shape.recurrent_count())
         .saturating_mul(kv::conv_state_bytes(shape).saturating_add(kv::state_bytes(shape)));
     crate::options::PoolCost {
         page_bytes: layout.page_bytes().saturating_add(head),
@@ -432,7 +432,7 @@ impl HybridStack {
         }
         let geometry = Geometry::new(&shape, embed)?;
         validate_ple(&geometry, ple.as_ref())?;
-        let recurrent_slots = usize::try_from(shape.count(LayerKind::Gdn)).unwrap_or(0);
+        let recurrent_slots = usize::try_from(shape.recurrent_count()).unwrap_or(0);
         let scratch = Scratch::new(backend, &geometry, MAX_PREFILL_CHUNK, MAX_DECODE_BATCH)?;
         let rows = RowPages::new(backend, opts.ctx, MAX_DECODE_BATCH)?;
         // The pool after the scratch, so that a pool sized to the device is

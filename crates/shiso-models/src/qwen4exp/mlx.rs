@@ -133,7 +133,11 @@ impl MlxCheckpoint {
 
     /// The body of both openers: the producer tag the shards must carry, if
     /// any, and which tensor names are the language model's.
-    fn open_as(dir: &Path, tag: Option<&'static str>, keep: fn(&str) -> bool) -> CoreResult<Self> {
+    pub(crate) fn open_as(
+        dir: &Path,
+        tag: Option<&'static str>,
+        keep: fn(&str) -> bool,
+    ) -> CoreResult<Self> {
         let text = std::fs::read_to_string(dir.join(INDEX)).map_err(CoreError::Io)?;
         let index: IndexDoc = serde_json::from_str(&text).map_err(|err| CoreError::Backend {
             backend: "qwen4exp",

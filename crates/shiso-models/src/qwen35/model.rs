@@ -317,6 +317,13 @@ fn import_weights(
                 attn_rank += 1;
                 (Block::Attn(import_attn(backend, file, layer)?), rank)
             }
+            // This family's shape holds neither; its config never states one.
+            LayerKind::Ssm => {
+                return Err(CoreError::Unsupported {
+                    what: "a state-space slot in this family",
+                    backend: "qwen35",
+                });
+            }
         };
         layers.push(LayerWeights {
             input_norm: vector(backend, file, &layer.input_norm)?,
@@ -326,13 +333,13 @@ fn import_weights(
             // these values being absent, so the launches here are the ones this
             // family has always dispatched.
             post_attn_norm: None,
-            ffn_norm: vector(backend, file, &layer.post_norm)?,
+            ffn_norm: Some(vector(backend, file, &layer.post_norm)?),
             post_ffn_norm: None,
-            ffn: Ffn {
-                gate: weight(backend, file, &layer.ffn.gate)?,
+            ffn: Some(Ffn {
+                gate: Some(weight(backend, file, &layer.ffn.gate)?),
                 up: weight(backend, file, &layer.ffn.up)?,
                 down: weight(backend, file, &layer.ffn.down)?,
-            },
+            }),
             // A dense feed-forward: this family's slots have no router.
             moe: None,
             block,
@@ -397,7 +404,7 @@ fn import_attn(
         k: Some(weight(backend, file, &bound.k)?),
         v: Some(weight(backend, file, &bound.v)?),
         output: weight(backend, file, &bound.output)?,
-        q_norm: vector(backend, file, &bound.q_norm)?,
+        q_norm: Some(vector(backend, file, &bound.q_norm)?),
         k_norm: Some(vector(backend, file, &bound.k_norm)?),
     })
 }

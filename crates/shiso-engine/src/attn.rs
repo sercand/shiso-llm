@@ -49,6 +49,10 @@ use crate::projection::Weight;
 /// own. What the shared scratch is sized by is a separate statement,
 /// [`AttnScratchSizes`], because no single slot bounds every row.
 #[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent per-slot switches, each read by a different launch"
+)]
 pub struct AttnGeometry {
     /// Query heads.
     pub n_head: u32,
@@ -79,6 +83,10 @@ pub struct AttnGeometry {
     /// Whether this slot writes the cache runs it reads. `false` for a slot that
     /// reads an earlier slot's.
     pub owns_kv: bool,
+    /// Whether the query and key heads are normalized and rotated before the
+    /// softmax reads them. `false` stores and reads the projections as they
+    /// came out.
+    pub qk_norm: bool,
 }
 
 impl AttnGeometry {
@@ -103,6 +111,7 @@ impl AttnGeometry {
             v_norm: false,
             output_gate: false,
             owns_kv: layer.owns_kv(),
+            qk_norm: layer.qk_norm,
         }
     }
 
@@ -154,14 +163,44 @@ pub struct Attn {
     pub v: Option<Weight>,
     /// Projection back to the residual width.
     pub output: Weight,
-    /// Per-head query normalization weight.
-    pub q_norm: DeviceBuffer,
+    /// Per-head query normalization weight, absent on a slot whose shape says
+    /// it normalizes nothing.
+    pub q_norm: Option<DeviceBuffer>,
     /// Per-head key normalization weight, absent on a slot that reads another's
-    /// cache.
+    /// cache and on one that normalizes nothing.
     pub k_norm: Option<DeviceBuffer>,
 }
 
 impl Attn {
+    /// The query norm, for a slot whose shape says it normalizes.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] when the loader bound the slot without one.
+    pub fn q_norm(&self) -> CoreResult<&DeviceBuffer> {
+        self.q_norm.as_ref().ok_or_else(|| CoreError::InvalidValue {
+            key: "attention weights",
+            value: "a slot that normalizes its queries was bound without a query norm".to_owned(),
+        })
+    }
+
+    /// The key and value projections of a slot that owns its cache and
+    /// normalizes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] when either is absent.
+    pub fn kv_plain(&self) -> CoreResult<(&Weight, &Weight)> {
+        match (self.k.as_ref(), self.v.as_ref()) {
+            (Some(k), Some(v)) => Ok((k, v)),
+            _ => Err(CoreError::InvalidValue {
+                key: "attention weights",
+                value: "a slot that owns its cache was bound without key/value projections"
+                    .to_owned(),
+            }),
+        }
+    }
+
     /// The key projection, the value projection and the key norm together.
     ///
     /// One accessor for the three, because they are one decision: a slot either

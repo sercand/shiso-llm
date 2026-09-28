@@ -31,11 +31,13 @@ use crate::launch::{
     GetRowsArgs, NORM_SMEM_BYTES, NormArgs, ScaleArgs, SoftcapArgs,
 };
 use crate::moe::{self, Moe, MoeIo, MoeScratch};
+use crate::moe_biased::{self, BiasedMoe};
 use crate::projection::{self, Weight, WeightAux};
 use crate::sessions::Session;
 use crate::shape::{
     Activation, HybridShape, LayerKind, MediaPositions, MoeShape, NormScheme, PerLayerShape,
 };
+use crate::ssm::{Ssm, SsmGeometry, SsmScratch};
 use crate::vision::{self, MediaChunk};
 
 /// Elements of one activation row, as the kernel counts them: `float4`.
@@ -256,6 +258,24 @@ pub enum Block {
     Gdn(Gdn),
     /// An attention slot, whose ordinal indexes the cache's per-layer runs.
     Attn(Attn),
+    /// A state-space slot, whose ordinal indexes the session's recurrent stack
+    /// as a [`Block::Gdn`] slot's does.
+    Ssm(Ssm),
+}
+
+/// The routed half of a slot, in one of the two router and expert shapes.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per slot in a small static layer vector, as `Block` is"
+)]
+pub enum Routed {
+    /// A softmax router over gated experts in the storage-tiled layout, with a
+    /// sigmoid-gated shared expert.
+    Glu(Moe),
+    /// A biased sigmoid router over ungated squared-rectifier experts in the
+    /// container's row-major layout, with an ungated shared expert.
+    Biased(BiasedMoe),
 }
 
 /// The per-layer embedding table a stack reads a row of per token.
@@ -315,27 +335,31 @@ pub struct LayerWeights {
     /// Norm the feed-forward reads, which is what GGUF stores as
     /// `blk.N.ffn_norm` (qwen35's files spell the same role
     /// `blk.N.post_attention_norm`).
-    pub ffn_norm: DeviceBuffer,
+    ///
+    /// `None` exactly when [`LayerWeights::ffn`] is: a slot with no
+    /// feed-forward half has nothing to read it.
+    pub ffn_norm: Option<DeviceBuffer>,
     /// Norm applied to the feed-forward's OUTPUT, before it is folded in.
     ///
     /// `None` for the same stacks [`LayerWeights::post_attn_norm`] is absent
     /// from: the two arrive together or not at all.
     pub post_ffn_norm: Option<DeviceBuffer>,
-    /// The feed-forward half of the slot, which every slot has.
+    /// The feed-forward half of the slot, `None` for a slot the shape lists in
+    /// [`HybridShape::no_ffn`].
     ///
     /// For a routed stack this is the SHARED expert - the always-on one - and
     /// the routed half is [`LayerWeights::moe`] beside it. The two are not
     /// alternatives with one field: a routed slot has both, the shared expert
     /// IS a dense feed-forward, and giving it the same field every dense slot
     /// uses is what lets `crate::ffn::run` serve it unchanged.
-    pub ffn: Ffn,
+    pub ffn: Option<Ffn>,
     /// The routed half of the slot, for a stack whose shape carries a router.
     ///
     /// `None` for every slot of a dense stack. A stack whose shape states a
     /// router and whose slots do not carry one is a binding that went wrong
     /// rather than a slot that quietly runs dense, and the pass refuses it by
     /// name.
-    pub moe: Option<Moe>,
+    pub moe: Option<Routed>,
     /// The block half of the slot.
     pub block: Block,
     /// Rank of this slot among the slots of its own kind, counted from zero.
@@ -459,6 +483,10 @@ pub struct Geometry {
     pub ple: Option<PerLayerGeometry>,
     /// Recurrent-block widths, or `None` for a stack with no recurrent slots.
     pub gdn: Option<GdnGeometry>,
+    /// State-space block widths, or `None` for a stack with no such slots.
+    pub ssm: Option<SsmGeometry>,
+    /// Whether each slot has a feed-forward half, index zero first.
+    pub has_ffn: Vec<bool>,
     /// Attention-block widths, one per attention slot in slot order.
     pub attn: Vec<AttnGeometry>,
     /// What the shared attention scratch is sized by: each row's maximum over
@@ -556,6 +584,20 @@ impl Geometry {
         } else {
             Some(GdnGeometry::new(&shape.gdn)?)
         };
+        let ssm = match (shape.count(LayerKind::Ssm), shape.ssm) {
+            (0, _) => None,
+            (_, Some(ssm)) => Some(SsmGeometry::new(ssm, shape.rms_eps)?),
+            (_, None) => {
+                return Err(CoreError::ShapeMismatch {
+                    field: "state-space geometry",
+                    expected: 1,
+                    got: 0,
+                });
+            }
+        };
+        let has_ffn = (0..shape.n_layers())
+            .map(|il| shape.has_ffn(shiso_core::ids::LayerIdx::new(il)))
+            .collect();
         let ple = shape
             .ple
             .map(|ple| per_layer(ple, shape.n_layers()))
@@ -575,6 +617,8 @@ impl Geometry {
             embed,
             ple,
             gdn,
+            ssm,
+            has_ffn,
             attn,
             attn_scratch,
         })
@@ -593,12 +637,13 @@ fn feed_forward(
     geometry: &Geometry,
     scratch: &Scratch,
     layer: &LayerWeights,
+    ffn: &Ffn,
     n_tok: u32,
 ) -> CoreResult<()> {
     let Some(shape) = geometry.moe else {
         return ffn::run(
             backend,
-            &layer.ffn,
+            ffn,
             geometry.activation,
             scratch.normed.view(),
             scratch.ffn_gate.view(),
@@ -611,7 +656,7 @@ fn feed_forward(
     // A shape that states a router and a slot that carries none is a binding
     // that went wrong. Running the shared expert alone would be a plausible
     // answer from a ninth of the feed-forward.
-    let (moe, moe_scratch) =
+    let (routed, moe_scratch) =
         layer
             .moe
             .as_ref()
@@ -621,20 +666,16 @@ fn feed_forward(
                 expected: 1,
                 got: 0,
             })?;
-    moe::run(
-        backend,
-        moe,
-        // The slot's own feed-forward IS the shared expert, so it is handed in
-        // rather than held twice.
-        &layer.ffn,
-        shape,
-        moe_scratch,
-        MoeIo {
-            input: scratch.normed.view(),
-            block_out: scratch.block_out.view(),
-        },
-        n_tok,
-    )
+    let io = MoeIo {
+        input: scratch.normed.view(),
+        block_out: scratch.block_out.view(),
+    };
+    // The slot's own feed-forward IS the shared expert, so it is handed in
+    // rather than held twice.
+    match routed {
+        Routed::Glu(moe) => moe::run(backend, moe, ffn, shape, moe_scratch, io, n_tok),
+        Routed::Biased(moe) => moe_biased::run(backend, moe, ffn, shape, moe_scratch, io, n_tok),
+    }
 }
 
 /// The per-layer widths a stack of `layers` slots runs, or the refusal.
@@ -809,6 +850,8 @@ pub struct Scratch {
     moe: Option<MoeScratch>,
     /// Recurrent-block scratch, absent when the stack has no recurrent slots.
     gdn: Option<GdnScratch>,
+    /// State-space block scratch, absent when the stack has no such slots.
+    ssm: Option<SsmScratch>,
     /// Attention-block scratch, sized for the widest attention slot.
     attn: AttnScratch,
 }
@@ -873,6 +916,11 @@ impl Scratch {
                 .gdn
                 .as_ref()
                 .map(|gdn| GdnScratch::new(backend, gdn, rows))
+                .transpose()?,
+            ssm: geometry
+                .ssm
+                .as_ref()
+                .map(|ssm| SsmScratch::new(backend, ssm, rows))
                 .transpose()?,
             attn: AttnScratch::new(backend, &geometry.attn_scratch, rows)?,
         })
@@ -1638,8 +1686,7 @@ pub(crate) fn forward(
     let mut per_row_states: Vec<GdnState<'_>> = Vec::new();
     for (index, layer) in weights.layers.iter().enumerate() {
         match &layer.block {
-            Block::Gdn(gdn) => {
-                let (gdn_geometry, gdn_scratch) = recurrent_slot(geometry, scratch)?;
+            Block::Gdn(_) | Block::Ssm(_) => {
                 let states = match rows {
                     PassRows::Chunk(session) => {
                         let state = session.gdn(layer.ordinal)?;
@@ -1674,19 +1721,23 @@ pub(crate) fn forward(
                     // that claims to be; nothing here builds the claim.
                     _ => None,
                 };
-                kernels.recurrent(
-                    backend,
-                    gdn,
-                    gdn_geometry,
-                    gdn_scratch,
-                    GdnIo {
-                        input: scratch.normed.view(),
-                        states,
-                        block_out: scratch.block_out.view(),
-                        trail,
-                    },
-                    n_tok,
-                )?;
+                let io = GdnIo {
+                    input: scratch.normed.view(),
+                    states,
+                    block_out: scratch.block_out.view(),
+                    trail,
+                };
+                match &layer.block {
+                    Block::Gdn(gdn) => {
+                        let (gdn_geometry, gdn_scratch) = recurrent_slot(geometry, scratch)?;
+                        kernels.recurrent(backend, gdn, gdn_geometry, gdn_scratch, io, n_tok)?;
+                    }
+                    Block::Ssm(ssm) => {
+                        let (ssm_geometry, ssm_scratch) = state_space_slot(geometry, scratch)?;
+                        crate::ssm::run(backend, ssm, ssm_geometry, ssm_scratch, io, n_tok)?;
+                    }
+                    Block::Attn(_) => {}
+                }
             }
             Block::Attn(attn) => {
                 let (attn_geometry, rank) = attention_slot(geometry, layer)?;
@@ -1725,54 +1776,67 @@ pub(crate) fn forward(
                 n_tok,
             );
         }
-        let block = norm_block_output(
+        let mut block = norm_block_output(
             backend,
             geometry,
             scratch,
             layer.post_attn_norm.as_ref(),
             n_tok,
         )?;
-        cur = close(
-            backend,
-            geometry,
-            scratch,
-            cur,
-            block,
-            layer.ffn_norm.view(),
-            n_tok,
-        )?;
-        if crate::trace::inner() {
-            crate::trace::residual(
+        // The feed-forward half, for a slot that has one. A slot without one
+        // folds its block's output in at the close below, which is the same
+        // residual block the pair would have been had its feed-forward been
+        // the next slot's.
+        let ffn_half = slot_ffn(geometry, layer, index)?;
+        if let Some((ffn, ffn_norm)) = ffn_half {
+            cur = close(
                 backend,
-                &format!("  slot {index} ffn_in"),
-                scratch.normed.view(),
-                geometry.hidden,
+                geometry,
+                scratch,
+                cur,
+                block,
+                ffn_norm.view(),
                 n_tok,
-            );
-        }
-        feed_forward(backend, geometry, scratch, layer, n_tok)?;
-        if crate::trace::inner() {
-            crate::trace::residual(
+            )?;
+            if crate::trace::inner() {
+                crate::trace::residual(
+                    backend,
+                    &format!("  slot {index} ffn_in"),
+                    scratch.normed.view(),
+                    geometry.hidden,
+                    n_tok,
+                );
+            }
+            feed_forward(backend, geometry, scratch, layer, ffn, n_tok)?;
+            if crate::trace::inner() {
+                crate::trace::residual(
+                    backend,
+                    &format!("  slot {index} ffn_out"),
+                    scratch.block_out.view(),
+                    geometry.hidden,
+                    n_tok,
+                );
+            }
+            block = norm_block_output(
                 backend,
-                &format!("  slot {index} ffn_out"),
-                scratch.block_out.view(),
-                geometry.hidden,
+                geometry,
+                scratch,
+                layer.post_ffn_norm.as_ref(),
                 n_tok,
-            );
+            )?;
         }
-        let block = norm_block_output(
-            backend,
-            geometry,
-            scratch,
-            layer.post_ffn_norm.as_ref(),
-            n_tok,
-        )?;
         // A family with a per-layer embedding table folds the feed-forward in
         // here rather than at the close, gates this slot's row against the
         // residual that leaves, and hands the close the branch's own output.
         let block = match ple.as_ref() {
             None => block,
             Some(io) => {
+                if ffn_half.is_none() {
+                    return Err(CoreError::Unsupported {
+                        what: "a per-layer embedding branch on a slot with no feed-forward",
+                        backend: "engine",
+                    });
+                }
                 let slot = layer.ple.as_ref().ok_or(CoreError::ShapeMismatch {
                     field: "per-layer slot weights",
                     expected: 1,
@@ -1799,6 +1863,7 @@ pub(crate) fn forward(
                 match &layer.block {
                     Block::Gdn(_) => "gdn",
                     Block::Attn(_) => "attn",
+                    Block::Ssm(_) => "ssm",
                 }
             ),
             scratch.stream[cur].view(),
@@ -1924,6 +1989,45 @@ fn recurrent_slot<'a>(
             field: "recurrent geometry",
             expected: 1,
             got: 0,
+        }),
+    }
+}
+
+/// The state-space widths and scratch a state-space slot runs over, or the
+/// refusal for a stack whose geometry has none.
+fn state_space_slot<'a>(
+    geometry: &'a Geometry,
+    scratch: &'a Scratch,
+) -> CoreResult<(&'a SsmGeometry, &'a SsmScratch)> {
+    match (geometry.ssm.as_ref(), scratch.ssm.as_ref()) {
+        (Some(ssm), Some(rows)) => Ok((ssm, rows)),
+        _ => Err(CoreError::ShapeMismatch {
+            field: "state-space geometry",
+            expected: 1,
+            got: 0,
+        }),
+    }
+}
+
+/// A slot's feed-forward and the norm it reads, or `None` for a slot the
+/// shape says has none.
+///
+/// The shape decides, not the weights: a slot the shape gives a feed-forward
+/// and the loader bound without one is refused rather than run as a bare
+/// block, and the other way round is refused too.
+fn slot_ffn<'a>(
+    geometry: &Geometry,
+    layer: &'a LayerWeights,
+    index: usize,
+) -> CoreResult<Option<(&'a Ffn, &'a DeviceBuffer)>> {
+    let wants = geometry.has_ffn.get(index).copied().unwrap_or(true);
+    match (wants, layer.ffn.as_ref(), layer.ffn_norm.as_ref()) {
+        (true, Some(ffn), Some(norm)) => Ok(Some((ffn, norm))),
+        (false, None, None) => Ok(None),
+        (_, ffn, _) => Err(CoreError::ShapeMismatch {
+            field: "slot feed-forward weights",
+            expected: u64::from(wants),
+            got: u64::from(ffn.is_some()),
         }),
     }
 }

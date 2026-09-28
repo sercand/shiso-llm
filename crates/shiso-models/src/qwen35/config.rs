@@ -203,6 +203,8 @@ impl Qwen35Config {
                 media_positions: MediaPositions::Mrope3D,
                 v_norm: false,
                 moe: None,
+                ssm: None,
+                no_ffn: Vec::new(),
             },
             eos_token: TokenId::new(cfg.eos_token_id),
             full_attention_interval: cfg.full_attention_interval,

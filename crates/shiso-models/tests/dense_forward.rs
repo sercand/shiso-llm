@@ -124,6 +124,8 @@ fn shape(ple: bool) -> HybridShape {
         media_positions: MediaPositions::Linear,
         v_norm: true,
         moe: None,
+        ssm: None,
+        no_ffn: Vec::new(),
     }
 }
 
@@ -162,13 +164,13 @@ fn slot(
     LayerWeights {
         input_norm: norm(backend, HIDDEN),
         post_attn_norm: Some(norm(backend, HIDDEN)),
-        ffn_norm: norm(backend, HIDDEN),
+        ffn_norm: Some(norm(backend, HIDDEN)),
         post_ffn_norm: Some(norm(backend, HIDDEN)),
-        ffn: shiso_engine::ffn::Ffn {
-            gate: weight(backend, HIDDEN, INTER),
+        ffn: Some(shiso_engine::ffn::Ffn {
+            gate: Some(weight(backend, HIDDEN, INTER)),
             up: weight(backend, HIDDEN, INTER),
             down: weight(backend, INTER, HIDDEN),
-        },
+        }),
         moe: None,
         block: Block::Attn(shiso_engine::attn::Attn {
             q: weight(backend, HIDDEN, Q_HEADS * HEAD_DIM),
@@ -177,7 +179,7 @@ fn slot(
                 .then(|| weight(backend, HIDDEN, KV_HEADS * HEAD_DIM)),
             v: kv,
             output: weight(backend, Q_HEADS * HEAD_DIM, HIDDEN),
-            q_norm: norm(backend, HEAD_DIM),
+            q_norm: Some(norm(backend, HEAD_DIM)),
             k_norm: owns.then(|| norm(backend, HEAD_DIM)),
         }),
         ordinal,

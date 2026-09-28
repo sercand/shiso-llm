@@ -47,6 +47,7 @@ mod kv;
 pub mod launch;
 pub mod layers;
 pub mod moe;
+pub mod moe_biased;
 /// Speculative decode's decidable half, shared by both stacks.
 ///
 /// A re-export rather than a module of its own, and that is Task 3.3 Step 1's
@@ -70,6 +71,7 @@ mod sampling_probs;
 mod sessions;
 pub mod shape;
 pub mod sparse;
+pub mod ssm;
 mod stack;
 pub mod trace;
 pub mod tune;

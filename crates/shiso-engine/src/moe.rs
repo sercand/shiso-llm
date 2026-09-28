@@ -468,33 +468,33 @@ pub struct MoeIo<'a> {
 #[derive(Debug)]
 pub struct MoeScratch {
     /// The router's logit block, `[n_tok, experts]`.
-    logits: DeviceBuffer,
+    pub(crate) logits: DeviceBuffer,
     /// One expert id per routed column, `int32`.
-    ids: DeviceBuffer,
+    pub(crate) ids: DeviceBuffer,
     /// One routing weight per routed column.
-    weights: DeviceBuffer,
+    pub(crate) weights: DeviceBuffer,
     /// Per-expert column counts; also the scatter's cursor.
-    counts: DeviceBuffer,
+    pub(crate) counts: DeviceBuffer,
     /// The scatter's cursor, kept apart from the histogram.
-    cursor: DeviceBuffer,
+    pub(crate) cursor: DeviceBuffer,
     /// Exclusive prefix sums over the counts, `experts + 1` of them.
-    bounds: DeviceBuffer,
+    pub(crate) bounds: DeviceBuffer,
     /// The experts that received a column, with the count at `[experts]`.
-    active: DeviceBuffer,
+    pub(crate) active: DeviceBuffer,
     /// The routed columns in expert order.
-    sorted: DeviceBuffer,
+    pub(crate) sorted: DeviceBuffer,
     /// The routed gate projection, `[columns, intermediate]`.
-    gate: DeviceBuffer,
+    pub(crate) gate: DeviceBuffer,
     /// The routed up projection.
-    up: DeviceBuffer,
+    pub(crate) up: DeviceBuffer,
     /// `silu(gate) * up`.
-    mid: DeviceBuffer,
+    pub(crate) mid: DeviceBuffer,
     /// The routed down projection, `[columns, hidden]`.
-    down: DeviceBuffer,
+    pub(crate) down: DeviceBuffer,
     /// The shared expert's scalar logit, one per token.
-    shared_logit: DeviceBuffer,
+    pub(crate) shared_logit: DeviceBuffer,
     /// The shared expert's output, `[n_tok, hidden]`.
-    shared_out: DeviceBuffer,
+    pub(crate) shared_out: DeviceBuffer,
 }
 
 impl MoeScratch {
@@ -805,7 +805,7 @@ fn route(
 /// accumulated with `atomicAdd` and outlives the layer, so without this every
 /// earlier layer's counts are still in it and an expert's span grows past what
 /// the sorted map holds.
-fn sort(
+pub(crate) fn sort(
     backend: &dyn Backend,
     shape: MoeShape,
     scratch: &MoeScratch,
@@ -892,7 +892,7 @@ fn activate(
 }
 
 /// The weighted sum of every column into one contribution per token.
-fn combine(
+pub(crate) fn combine(
     backend: &dyn Backend,
     shape: MoeShape,
     scratch: &MoeScratch,

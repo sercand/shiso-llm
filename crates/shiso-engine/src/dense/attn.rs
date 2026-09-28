@@ -96,7 +96,7 @@ fn q_norm_rope(
             // one scratch serves every slot of the stack and a family with no
             // gate simply leaves that tail alone.
             KernelArg::Buffer(scratch.qkv.view()),
-            KernelArg::Buffer(attn.q_norm.view()),
+            KernelArg::Buffer(attn.q_norm()?.view()),
             KernelArg::Buffer(pos),
         ],
     )
@@ -148,6 +148,73 @@ fn kv_norm_rope_store(
         ],
     )
     .map_err(|err| launch::launch_failure(NAME, err))
+}
+
+/// Writes keys and values into the cache as they came out of their
+/// projections, for a slot that neither normalizes nor rotates them.
+fn kv_store_plain(
+    backend: &dyn Backend,
+    geometry: &AttnGeometry,
+    scratch: &AttnScratch,
+    cache: &AttnCache<'_>,
+    pos: DeviceView<'_>,
+    n_tok: u32,
+) -> CoreResult<()> {
+    const NAME: &str = "kernel_dense_kv_store_f32";
+    let args = DenseKvNormRopeArgs {
+        head_dim: geometry.head_dim,
+        n_head_kv: geometry.n_head_kv,
+        n_rot: 0,
+        freq_dims: 0,
+        n_tok,
+        rope_base: 0.0,
+        eps: 0.0,
+        page_tokens: geometry.page_tokens,
+        v_norm: 0,
+        page_stride: cache.pages.stride(),
+    };
+    launch::run(
+        backend,
+        KernelRef::new(DENSE, NAME),
+        Extent3::new(geometry.n_head_kv, n_tok, 1),
+        Extent3::new(BLOCK_128, 1, 1),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(cache.k),
+            KernelArg::Buffer(cache.v),
+            KernelArg::Buffer(scratch.k.view()),
+            KernelArg::Buffer(scratch.v.view()),
+            KernelArg::Buffer(pos),
+            KernelArg::Buffer(cache.pages.table()),
+        ],
+    )
+    .map_err(|err| launch::launch_failure(NAME, err))
+}
+
+/// Projects the keys and values of `n_tok` rows and writes them into the
+/// cache, through the store the slot's shape names.
+fn project_and_store(
+    backend: &dyn Backend,
+    attn: &Attn,
+    geometry: &AttnGeometry,
+    scratch: &AttnScratch,
+    cache: &AttnCache<'_>,
+    rows: StoreRows<'_>,
+) -> CoreResult<()> {
+    if geometry.qk_norm {
+        let (k_proj, v_proj, k_norm) = attn.kv()?;
+        projection::projection(backend, k_proj, rows.n_tok, rows.input, scratch.k.view())?;
+        projection::projection(backend, v_proj, rows.n_tok, rows.input, scratch.v.view())?;
+        kv_norm_rope_store(
+            backend, k_norm, geometry, scratch, cache, rows.pos, rows.n_tok,
+        )
+    } else {
+        let (k_proj, v_proj) = attn.kv_plain()?;
+        projection::projection(backend, k_proj, rows.n_tok, rows.input, scratch.k.view())?;
+        projection::projection(backend, v_proj, rows.n_tok, rows.input, scratch.v.view())?;
+        kv_store_plain(backend, geometry, scratch, cache, rows.pos, rows.n_tok)
+    }
 }
 
 /// Refuses a per-row page table on an entry point that tiles rows.
@@ -257,12 +324,7 @@ pub(crate) fn store(
     cache: &AttnCache<'_>,
     rows: StoreRows<'_>,
 ) -> CoreResult<()> {
-    let (k_proj, v_proj, k_norm) = attn.kv()?;
-    projection::projection(backend, k_proj, rows.n_tok, rows.input, scratch.k.view())?;
-    projection::projection(backend, v_proj, rows.n_tok, rows.input, scratch.v.view())?;
-    kv_norm_rope_store(
-        backend, k_norm, geometry, scratch, cache, rows.pos, rows.n_tok,
-    )
+    project_and_store(backend, attn, geometry, scratch, cache, rows)
 }
 
 /// The rows [`store`] writes: their inputs, their positions and how many.
@@ -301,15 +363,29 @@ pub fn run(
     n_tok: u32,
 ) -> CoreResult<()> {
     let pos = linear_positions(io.pos)?;
-    projection::projection(backend, &attn.q, n_tok, io.input, scratch.qkv.view())?;
-    q_norm_rope(backend, attn, geometry, scratch, pos, n_tok)?;
+    if geometry.qk_norm {
+        projection::projection(backend, &attn.q, n_tok, io.input, scratch.qkv.view())?;
+        q_norm_rope(backend, attn, geometry, scratch, pos, n_tok)?;
+    } else {
+        // Nothing to do to the query, so the projection writes where the
+        // softmax reads.
+        projection::projection(backend, &attn.q, n_tok, io.input, scratch.q.view())?;
+    }
     // A shared-cache slot launches neither projection nor store: the runs its
     // `cache` names are the owner's, already filled earlier in this same pass.
     if geometry.owns_kv {
-        let (k_proj, v_proj, k_norm) = attn.kv()?;
-        projection::projection(backend, k_proj, n_tok, io.input, scratch.k.view())?;
-        projection::projection(backend, v_proj, n_tok, io.input, scratch.v.view())?;
-        kv_norm_rope_store(backend, k_norm, geometry, scratch, cache, pos, n_tok)?;
+        project_and_store(
+            backend,
+            attn,
+            geometry,
+            scratch,
+            cache,
+            StoreRows {
+                pos,
+                input: io.input,
+                n_tok,
+            },
+        )?;
     }
     softmax(backend, geometry, scratch, cache, io, n_tok)?;
     projection::projection(

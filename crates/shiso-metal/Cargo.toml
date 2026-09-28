@@ -91,6 +91,10 @@ name = "dense_block_draft"
 path = "tests/dense_block_draft.rs"
 
 [[test]]
+name = "dense_ssm_moe"
+path = "tests/dense_ssm_moe.rs"
+
+[[test]]
 name = "q35_compile"
 path = "tests/q35_compile.rs"
 

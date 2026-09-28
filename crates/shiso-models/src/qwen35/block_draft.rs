@@ -274,11 +274,11 @@ fn load_layer(backend: &Arc<dyn Backend>, t: &Tensors, i: u32) -> CoreResult<Blo
             k: Some(linear(backend, t, &name("self_attn.k_proj.weight"))?),
             v: Some(linear(backend, t, &name("self_attn.v_proj.weight"))?),
             output: linear(backend, t, &name("self_attn.o_proj.weight"))?,
-            q_norm: vector(backend, t, &name("self_attn.q_norm.weight"))?,
+            q_norm: Some(vector(backend, t, &name("self_attn.q_norm.weight"))?),
             k_norm: Some(vector(backend, t, &name("self_attn.k_norm.weight"))?),
         },
         ffn: Ffn {
-            gate: linear(backend, t, &name("mlp.gate_proj.weight"))?,
+            gate: Some(linear(backend, t, &name("mlp.gate_proj.weight"))?),
             up: linear(backend, t, &name("mlp.up_proj.weight"))?,
             down: linear(backend, t, &name("mlp.down_proj.weight"))?,
         },

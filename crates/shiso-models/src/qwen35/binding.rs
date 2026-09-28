@@ -499,6 +499,14 @@ where
     let (gdn, attn) = match kind {
         LayerKind::Gdn => (Some(bind_gdn(fetch, il, dims)?), None),
         LayerKind::Attn => (None, Some(bind_attn(fetch, il, dims)?)),
+        // This family's shape holds neither; its config never states one.
+        LayerKind::Ssm => {
+            return Err(GgufError::LayoutMismatch {
+                tensor: format!("blk.{il}").into(),
+                want: Box::from("a recurrent or attention slot"),
+                got: Box::from(format!("{kind:?}")),
+            });
+        }
     };
     Ok(LayerRoles {
         kind,
@@ -687,6 +695,8 @@ mod tests {
             media_positions: MediaPositions::Mrope3D,
             v_norm: false,
             moe: None,
+            ssm: None,
+            no_ffn: Vec::new(),
         }
     }
 

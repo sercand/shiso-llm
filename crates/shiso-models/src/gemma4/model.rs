@@ -404,13 +404,13 @@ fn import_weights_mlx(
         layers.push(LayerWeights {
             input_norm: vector_mlx(backend, st, &layer.input_norm)?,
             post_attn_norm: Some(vector_mlx(backend, st, &layer.post_attn_norm)?),
-            ffn_norm: vector_mlx(backend, st, &layer.pre_ffn_norm)?,
+            ffn_norm: Some(vector_mlx(backend, st, &layer.pre_ffn_norm)?),
             post_ffn_norm: Some(vector_mlx(backend, st, &layer.post_ffn_norm)?),
-            ffn: Ffn {
-                gate: weight_mlx(backend, st, &layer.ffn.gate)?,
+            ffn: Some(Ffn {
+                gate: Some(weight_mlx(backend, st, &layer.ffn.gate)?),
                 up: weight_mlx(backend, st, &layer.ffn.up)?,
                 down: weight_mlx(backend, st, &layer.ffn.down)?,
-            },
+            }),
             block: Block::Attn(import_attn_mlx(backend, st, layer)?),
             // A dense feed-forward: this family's slots have no router.
             moe: None,
@@ -453,7 +453,7 @@ fn import_attn_mlx(
             .map(|desc| weight_mlx(backend, st, desc))
             .transpose()?,
         output: weight_mlx(backend, st, &attn.output)?,
-        q_norm: vector_mlx(backend, st, &attn.q_norm)?,
+        q_norm: Some(vector_mlx(backend, st, &attn.q_norm)?),
         k_norm: attn
             .k_norm
             .as_ref()
@@ -554,13 +554,13 @@ fn import_weights(
             // which is what the engine's `ffn_norm` is. The two spellings agree
             // here and do not in every family, which is why the engine field is
             // named after the role rather than after a file.
-            ffn_norm: vector(backend, file, &layer.pre_ffn_norm)?,
+            ffn_norm: Some(vector(backend, file, &layer.pre_ffn_norm)?),
             post_ffn_norm: Some(vector(backend, file, &layer.post_ffn_norm)?),
-            ffn: Ffn {
-                gate: weight(backend, file, &layer.ffn.gate)?,
+            ffn: Some(Ffn {
+                gate: Some(weight(backend, file, &layer.ffn.gate)?),
                 up: weight(backend, file, &layer.ffn.up)?,
                 down: weight(backend, file, &layer.ffn.down)?,
-            },
+            }),
             block: Block::Attn(import_attn(backend, file, layer)?),
             // A dense feed-forward: this family's slots have no router.
             moe: None,
@@ -612,7 +612,7 @@ fn import_attn(
             .map(|desc| weight(backend, file, desc))
             .transpose()?,
         output: weight(backend, file, &attn.output)?,
-        q_norm: vector(backend, file, &attn.q_norm)?,
+        q_norm: Some(vector(backend, file, &attn.q_norm)?),
         k_norm: attn
             .k_norm
             .as_ref()

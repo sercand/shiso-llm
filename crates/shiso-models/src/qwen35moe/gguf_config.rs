@@ -172,6 +172,8 @@ pub fn config_from_gguf(meta: &GgufMetadata, vocab: u32) -> CoreResult<Qwen35Moe
         media_positions: MediaPositions::Mrope3D,
         v_norm: false,
         moe: Some(MoeShape::new(experts, used, 1, routed_width)),
+        ssm: None,
+        no_ffn: Vec::new(),
     };
     let eos = meta
         .get_u32("tokenizer.ggml.eos_token_id")

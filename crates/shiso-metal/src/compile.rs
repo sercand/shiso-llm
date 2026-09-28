@@ -200,6 +200,16 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "dense/dense_block_draft.metal",
         include_str!("../metal/dense/dense_block_draft.metal"),
     ),
+    // The state-space block (convolution, scan, gated norm) and the routed
+    // feed-forward over row-major affine stacks with a biased sigmoid router.
+    (
+        "dense/dense_ssm.metal",
+        include_str!("../metal/dense/dense_ssm.metal"),
+    ),
+    (
+        "dense/dense_moe.metal",
+        include_str!("../metal/dense/dense_moe.metal"),
+    ),
     // --- qwen35moe kernel set; appended, nothing above this line changed. The
     // header comes first, for the same reason the qwen35, vision and dense
     // headers do: the files after it use its argument block and its affine

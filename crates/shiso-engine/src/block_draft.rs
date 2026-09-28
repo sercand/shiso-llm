@@ -385,6 +385,7 @@ impl BlockDrafter {
             v_norm: false,
             output_gate: false,
             owns_kv: true,
+            qk_norm: true,
         };
         tracing::info!(
             layers,

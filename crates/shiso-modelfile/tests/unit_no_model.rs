@@ -361,6 +361,7 @@ fn fixture_profile_is_a_hybrid_of_24_recurrent_and_8_attention_layers() {
         match kind {
             LayerKind::Attn => attn += 1,
             LayerKind::Gdn => gdn += 1,
+            LayerKind::Ssm => panic!("layer {il}: this family has no {kind:?} slot"),
         }
     }
     assert_eq!(attn, 8);

@@ -393,6 +393,8 @@ impl Gemma4Config {
             media_positions: MediaPositions::Linear,
             v_norm: true,
             moe: None,
+            ssm: None,
+            no_ffn: Vec::new(),
         };
         shape.validate()?;
         Ok(Self {

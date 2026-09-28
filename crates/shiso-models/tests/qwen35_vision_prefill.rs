@@ -233,6 +233,8 @@ fn shape() -> HybridShape {
         media_positions: MediaPositions::Mrope3D,
         v_norm: false,
         moe: None,
+        ssm: None,
+        no_ffn: Vec::new(),
     }
 }
 
@@ -259,13 +261,13 @@ fn slot(backend: &Arc<dyn Backend>, block: Block, ordinal: u32) -> LayerWeights 
         // The pre-only scheme: nothing normalizes a block's output, and the
         // residual sum carries no scalar.
         post_attn_norm: None,
-        ffn_norm: norm(backend, HIDDEN),
+        ffn_norm: Some(norm(backend, HIDDEN)),
         post_ffn_norm: None,
-        ffn: shiso_engine::ffn::Ffn {
-            gate: weight(backend, HIDDEN, INTER),
+        ffn: Some(shiso_engine::ffn::Ffn {
+            gate: Some(weight(backend, HIDDEN, INTER)),
             up: weight(backend, HIDDEN, INTER),
             down: weight(backend, INTER, HIDDEN),
-        },
+        }),
         moe: None,
         block,
         ordinal,
@@ -302,7 +304,7 @@ fn weights(backend: &Arc<dyn Backend>) -> Weights {
         k: Some(weight(backend, HIDDEN, kv_width)),
         v: Some(weight(backend, HIDDEN, kv_width)),
         output: weight(backend, gqa.q_heads * gqa.head_dim, HIDDEN),
-        q_norm: norm(backend, gqa.head_dim),
+        q_norm: Some(norm(backend, gqa.head_dim)),
         k_norm: Some(norm(backend, gqa.head_dim)),
     });
     Weights {

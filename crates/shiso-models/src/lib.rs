@@ -19,6 +19,7 @@ pub mod audio_registry;
 pub mod gemma4;
 pub mod nemotron_asr;
 pub mod nemotron_diar;
+pub mod nemotron_h;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen3_asr;

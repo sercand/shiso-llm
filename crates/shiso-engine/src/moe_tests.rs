@@ -183,7 +183,7 @@ fn fixture_stages(n_tok: u32, gate_up: ExpertCodec, down: ExpertCodec, dtype: Ac
         )
         .expect("a block whose gate and up agree"),
         shared: Ffn {
-            gate: nvfp4(&backend, HIDDEN, INTER),
+            gate: Some(nvfp4(&backend, HIDDEN, INTER)),
             up: nvfp4(&backend, HIDDEN, INTER),
             down: nvfp4(&backend, INTER, HIDDEN),
         },
