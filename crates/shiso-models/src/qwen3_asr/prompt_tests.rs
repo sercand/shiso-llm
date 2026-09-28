@@ -128,6 +128,41 @@ fn the_prompt_ids_match_the_reference() {
     say(&format!("compared {seen} prompt fixtures"));
 }
 
+/// `prompt::ids` with the reference fixture's own context ids against the
+/// reference fixture's own whole prompt: needs no checkpoint, since the
+/// prompt's fixed ids and the context slot are all `ids` reads. Written by
+/// `scripts/reference/qwen3_asr_reference.py --context-prompt-only`, which
+/// needs no model weights either - only the reference tokenizer and chat
+/// template.
+#[test]
+#[ignore = "reads test-vectors/references/audio/qwen3asr-context-prompt.json"]
+fn the_context_prompt_matches_the_reference() {
+    let path = fixtures().join("qwen3asr-context-prompt.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return say(&format!("SKIP {}: absent", path.display()));
+    };
+    let json: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let context_ids = u32s(&json["context_ids"]);
+    let want = u32s(&json["ids"]);
+    let n_audio_pad =
+        usize::try_from(json["n_audio_pad"].as_u64().expect("a count")).expect("fits");
+    assert_eq!(n_audio_pad, 1, "the fixture carries one audio placeholder");
+    let got = ids(
+        n_audio_pad,
+        &Conditioning {
+            forced: None,
+            context: &context_ids,
+        },
+    )
+    .expect("the context prompt");
+    assert_eq!(got, want);
+    say(&format!(
+        "the context prompt matches the reference: {} ids, {} of them context",
+        got.len(),
+        context_ids.len()
+    ));
+}
+
 #[test]
 fn the_prompt_is_fifteen_ids_around_the_audio() {
     // The reference processor's prompt: 15 ids plus one placeholder per audio row, the placeholders
