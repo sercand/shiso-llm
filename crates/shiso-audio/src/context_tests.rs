@@ -17,7 +17,7 @@ fn a_prompt_or_a_keyword_is_not_empty() {
     };
     let keyword = Context {
         prompt: None,
-        keywords: vec!["Unity".into()],
+        keywords: vec!["Marigold".into()],
     };
     assert!(!prompt.is_empty());
     assert!(!keyword.is_empty());
@@ -121,4 +121,26 @@ fn turkish_casing_matches_across_the_dotted_capital() {
         "İSTANBUL İstanbul istanbul",
         &keywords(&["istanbul"])
     ));
+}
+
+#[test]
+fn a_one_word_gap_continues_the_run_but_a_two_word_gap_breaks_it() {
+    let k = keywords(&["Marigold", "Lighthouse", "Orchard"]);
+    // One filler word between each pair: the run never breaks, so three
+    // distinct keywords land in it and the list rule fires.
+    assert!(is_echo("marigold x lighthouse x orchard", &k));
+    // Two filler words between each pair: past ECHO_RUN_GAP, so each
+    // keyword starts its own run and the list rule never sees three in one.
+    // Three keywords among seven words is also short of the half-share rule.
+    assert!(!is_echo("marigold x y lighthouse x y orchard", &k));
+}
+
+#[test]
+fn a_combining_mark_is_dropped_not_treated_as_a_separator() {
+    // NFD "I" + COMBINING DOT ABOVE is canonically "İ"; keyword_words does no
+    // Unicode normalization of its own, so the combining mark must be
+    // dropped in place rather than read as whitespace, or the decomposed
+    // form would split into two words where the composed form has one.
+    assert_eq!(keyword_words("İstanbul"), ["istanbul"]);
+    assert_eq!(keyword_words("I\u{0307}stanbul"), keyword_words("İstanbul"));
 }

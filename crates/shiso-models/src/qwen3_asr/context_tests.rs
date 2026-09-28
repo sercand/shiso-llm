@@ -123,7 +123,7 @@ fn a_context_past_the_cap_is_refused() {
         })
         .expect_err("refused");
     assert!(
-        matches!(error, shiso_audio::AudioError::BadContext { .. }),
+        matches!(error, shiso_audio::AudioError::TooManyContextTokens { .. }),
         "{error:?}"
     );
 }
@@ -153,7 +153,7 @@ fn exactly_the_cap_is_accepted_and_one_more_is_refused() {
         })
         .expect_err("one more than the cap is refused");
     assert!(
-        matches!(error, shiso_audio::AudioError::BadContext { .. }),
+        matches!(error, shiso_audio::AudioError::TooManyContextTokens { .. }),
         "{error:?}"
     );
 }
@@ -182,9 +182,8 @@ fn nfd_and_nfc_forms_encode_to_the_same_ids() {
 
 /// Pins `wording` to the `CONTEXT` string
 /// `scripts/reference/qwen3_asr_reference.py --context-prompt-only` renders
-/// and tokenizes: a change to the wording (Task 8 or later) has to rebuild
-/// that string the same way and recapture the fixture, not just this
-/// assertion.
+/// and tokenizes: a later change to the wording has to rebuild that string
+/// the same way and recapture the fixture, not just this assertion.
 #[test]
 fn the_wording_matches_the_reference_script_s_context_string() {
     let context = Context {
@@ -255,9 +254,9 @@ fn check_export(path: &Path, context: &str, want: &[u32]) {
 }
 
 /// The checkpoint's own BPE against `qwen3asr-context-prompt.json`'s
-/// `context_ids`: an independent tokenizer (`transformers.AutoTokenizer`,
-/// preferring the reference package's own chat-template render) over the
-/// checkpoint's own `vocab.json`/`merges.txt` (HF) or `tokenizer.ggml.*`
+/// `context_ids`: the reference tokenizer (preferring the reference
+/// package's own chat-template render) over the checkpoint's own
+/// `vocab.json`/`merges.txt` (HF) or `tokenizer.ggml.*`
 /// (GGUF), captured with no model weights loaded. Both exports are checked
 /// when usable; each one absent (or, for the HF export, carrying no
 /// `.safetensors` shards - `Located::stores` opens every shard reading its

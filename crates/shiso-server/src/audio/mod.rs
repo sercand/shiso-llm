@@ -233,16 +233,25 @@ impl AudioService {
     ///
     /// # Errors
     ///
-    /// [`AppError::BadRequest`] naming `keywords` for a context sent to a
-    /// recognizer that takes none, one whose raw prompt and keywords text
-    /// totals more than 16 KiB, one longer than `--asr-max-context-tokens`
-    /// once encoded, or one the encoder refuses.
+    /// [`AppError::BadRequest`] naming `keywords` (or `prompt`, when the
+    /// context carries no keywords) for a context sent to a recognizer that
+    /// takes none, one whose raw prompt and keywords text totals more than
+    /// 16 KiB, one longer than `--asr-max-context-tokens` once encoded (even
+    /// when what the encoder hit first was its own, possibly looser, cap),
+    /// or one the encoder refuses for another reason.
     pub fn encode_context(&self, context: &Context) -> Result<ContextIds, AppError> {
         if context.is_empty() {
             return Ok(ContextIds::default());
         }
+        // A context with no keywords was refused over its `prompt`; one with
+        // keywords (with or without a prompt too) was refused over those.
+        let param = if context.keywords.is_empty() {
+            "prompt"
+        } else {
+            "keywords"
+        };
         let refuse =
-            |message: String| AppError::bad_request(message, Some("keywords"), "invalid_request");
+            |message: String| AppError::bad_request(message, Some(param), "invalid_request");
         let encoder = self.context.as_ref().ok_or_else(|| {
             refuse(format!(
                 "{} takes no keywords or prompt; send the audio alone",
@@ -260,14 +269,25 @@ impl AudioService {
                  most {MAX_CONTEXT_BYTES} bytes"
             )));
         }
-        let ids = encoder.encode(context).map_err(|e| refuse(e.to_string()))?;
-        if ids.len() > self.max_context_ids {
-            return Err(refuse(format!(
-                "the keywords and prompt are {} tokens; this server takes at most {} \
+        let too_many_tokens = |tokens: usize| {
+            refuse(format!(
+                "the keywords and prompt are {tokens} tokens; this server takes at most {} \
                  (--asr-max-context-tokens)",
-                ids.len(),
                 self.max_context_ids
-            )));
+            ))
+        };
+        let ids = encoder.encode(context).map_err(|e| match e {
+            // The encoder's own cap can be looser than this server's
+            // configured one, so its own message would quote a number an
+            // operator never set. Restate the refusal in this server's own
+            // terms instead of relaying the encoder's, keeping only the
+            // token count, which is accurate regardless of whose cap it is
+            // compared against.
+            AudioError::TooManyContextTokens { tokens, .. } => too_many_tokens(tokens),
+            other => refuse(other.to_string()),
+        })?;
+        if ids.len() > self.max_context_ids {
+            return Err(too_many_tokens(ids.len()));
         }
         Ok(ids)
     }

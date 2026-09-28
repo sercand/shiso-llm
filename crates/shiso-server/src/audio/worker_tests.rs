@@ -75,14 +75,22 @@ struct ScriptedEncoder;
 
 impl ContextEncoder for ScriptedEncoder {
     fn encode(&self, context: &Context) -> Result<ContextIds, AudioError> {
-        Ok(ContextIds::new(
-            context
-                .keywords
-                .iter()
-                .enumerate()
-                .map(|(i, _)| TokenId::new(1000 + u32::try_from(i).expect("small")))
-                .collect(),
-        ))
+        let ids: Vec<TokenId> = context
+            .keywords
+            .iter()
+            .enumerate()
+            .map(|(i, _)| TokenId::new(1000 + u32::try_from(i).expect("small")))
+            .collect();
+        if ids.len() > self.max_ids() {
+            // Exercises a recognizer whose own cap is tighter than the
+            // server's configured one, the way the real qwen3_asr encoder's
+            // internal cap can be.
+            return Err(AudioError::TooManyContextTokens {
+                tokens: ids.len(),
+                max: self.max_ids(),
+            });
+        }
+        Ok(ContextIds::new(ids))
     }
 
     fn max_ids(&self) -> usize {
@@ -1411,8 +1419,13 @@ async fn a_context_reaches_a_stream_opened_at_the_diarizer_turns() {
     assert_eq!(seen[0].context, ids);
 }
 
+/// Whether `error` is a [`AppError::BadRequest`] naming `param`.
+fn refused_over(error: &AppError, param: &str) -> bool {
+    matches!(error, AppError::BadRequest { param: Some(p), .. } if p == param)
+}
+
 #[test]
-fn a_context_is_refused_by_a_recognizer_that_takes_none() {
+fn a_prompt_only_context_is_refused_by_a_recognizer_that_takes_none() {
     let log = Log::default();
     let service = service_with(&ServiceShape::plain(&log));
     let error = service
@@ -1422,6 +1435,21 @@ fn a_context_is_refused_by_a_recognizer_that_takes_none() {
         })
         .expect_err("refused");
     assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{error}");
+    assert!(refused_over(&error, "prompt"), "{error}");
+}
+
+#[test]
+fn a_keyword_context_is_refused_by_a_recognizer_that_takes_none() {
+    let log = Log::default();
+    let service = service_with(&ServiceShape::plain(&log));
+    let error = service
+        .encode_context(&Context {
+            prompt: None,
+            keywords: vec!["a".into()],
+        })
+        .expect_err("refused");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{error}");
+    assert!(refused_over(&error, "keywords"), "{error}");
 }
 
 #[test]
@@ -1438,10 +1466,36 @@ fn a_context_past_the_server_cap_is_refused() {
         })
         .expect_err("refused");
     assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{error}");
+    assert!(refused_over(&error, "keywords"), "{error}");
     assert!(
         error.to_string().contains("--asr-max-context-tokens"),
         "{error}"
     );
+}
+
+#[test]
+fn a_context_past_the_encoders_own_cap_is_refused_in_the_servers_own_terms() {
+    let log = Log::default();
+    let service = service_with(&ServiceShape {
+        encoder: true,
+        ..ServiceShape::plain(&log)
+    });
+    // Five keywords tokenize to five ids: past the ScriptedEncoder's own cap
+    // of 4, so the encoder itself refuses first, before the server's own
+    // (tighter, 3) cap ever gets a count to compare. The refusal must still
+    // name the server's knob and cap, not the encoder's internal 4.
+    let error = service
+        .encode_context(&Context {
+            prompt: None,
+            keywords: vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+        })
+        .expect_err("refused");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{error}");
+    assert!(refused_over(&error, "keywords"), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("--asr-max-context-tokens"), "{message}");
+    assert!(message.contains("at most 3"), "{message}");
+    assert!(!message.contains("at most 4"), "{message}");
 }
 
 #[test]
@@ -1461,6 +1515,7 @@ fn a_context_past_the_byte_cap_is_refused_before_tokenizing() {
         })
         .expect_err("refused");
     assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{error}");
+    assert!(refused_over(&error, "prompt"), "{error}");
     assert!(
         !error.to_string().contains("--asr-max-context-tokens"),
         "the byte cap is refused before an id count exists: {error}"

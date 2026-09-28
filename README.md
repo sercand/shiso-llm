@@ -166,18 +166,21 @@ chunk by chunk, as the load log says.
 A request to the Qwen3-ASR family can also carry `keywords[]` (repeated) and
 `prompt`; they are written into its system turn as `prompt` followed by a
 `Keywords: a, b, c` line, so the model is more likely to spell those words
-the way you give them. A span whose output echoes the keyword list back
-verbatim is decoded again without that context. Keywords and prompt together
-are capped by `--asr-max-context-tokens` (default 256, at most the
-recognizer's own 512) once tokenized, and by 16 KiB of raw text before that;
-an empty keyword is refused. Nemotron, or any recognizer without context
-support, refuses both with a 400 whose `param` is `keywords`. With the
+the way you give them. A span whose text reads back like the keyword list -
+most of its words are keywords, or it lists three or more of them in a row -
+is decoded again without that context; the trade-off is that a span that
+genuinely speaks such a list keeps the no-context wording instead. Keywords
+and prompt together are capped by `--asr-max-context-tokens` (default 256, at
+most the recognizer's own 512) once tokenized, and by 16 KiB of raw text
+before that; an empty keyword is refused. Nemotron, or any recognizer without
+context support, refuses either with a 400 whose `param` names the field
+that was sent (`keywords`, or `prompt` when there were no keywords). With the
 OpenAI SDK, `extra_body={"keywords": [...]}` sends `keywords[]`.
 
 ```sh
 curl http://127.0.0.1:8090/v1/audio/transcriptions \
     -F model=qwen3 -F file=@meeting.m4a \
-    -F 'keywords[]=Unity' -F 'keywords[]=SQLite'
+    -F 'keywords[]=Marigold' -F 'keywords[]=Lighthouse'
 ```
 
 ## Configuration

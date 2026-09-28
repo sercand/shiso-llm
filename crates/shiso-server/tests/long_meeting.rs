@@ -27,7 +27,7 @@
 //! off, so what skipping long silences costs in words and saves in time is
 //! measured on one recording; Nemotron has no offline path and runs once.
 //!
-//! `SHISO_TEST_KEYWORDS` is optional (Task 8's wider check): when it names a
+//! `SHISO_TEST_KEYWORDS` is optional, widening the check: when it names a
 //! file, one `keywords[]` field a line is added to every recognizer whose
 //! family accepts a context, and its aggregate line says `keywords=on`.
 //! Unset, the run is the plain baseline. A recognizer with no context
@@ -751,9 +751,10 @@ async fn measure(
 /// segments the recognizer's own rule ([`shiso_audio::is_echo`]) would call
 /// an echo, and `redecoded_spans` how many of the offline job's spans it
 /// decoded again without the context, out of those it transcribed, read from
-/// its debug event. One `diag` line a run, aggregates only. SKIPs on stderr, needing no state, when `SHISO_TEST_KEYWORDS` is
-/// unset - the two runs would otherwise be identical - or when qwen3-asr-q8
-/// itself is unavailable (`boot` has already said why).
+/// its debug event. One `diag` line a run, aggregates only. SKIPs on
+/// stderr, needing no state, when `SHISO_TEST_KEYWORDS` is unset - the two
+/// runs would otherwise be identical - or when qwen3-asr-q8 itself is
+/// unavailable (`boot` has already said why).
 async fn diagnose_keyword_wer(diarizer: &Path, audio_bytes: &[u8], reference: &Reference) {
     let keyword_lines = keyword_fields();
     if keyword_lines.is_empty() {
@@ -770,8 +771,13 @@ async fn diagnose_keyword_wer(diarizer: &Path, audio_bytes: &[u8], reference: &R
         .map(|(_, value)| shiso_audio::keyword_words(value))
         .collect();
     let counting = count_redecodes();
-    let recognizer = &RECOGNIZERS[0];
-    debug_assert_eq!(recognizer.name, "qwen3-asr-q8", "diag targets qwen3-asr-q8");
+    // By name rather than `RECOGNIZERS[0]`, so a reordering of that list
+    // cannot silently point this diagnostic at the wrong recognizer in a
+    // release build, where a `debug_assert!` would have compiled out.
+    let recognizer = RECOGNIZERS
+        .iter()
+        .find(|r| r.name == "qwen3-asr-q8")
+        .expect("qwen3-asr-q8 is in RECOGNIZERS");
     let Some(state) = boot(recognizer, diarizer, &["--asr-skip-silence=false"]) else {
         return;
     };

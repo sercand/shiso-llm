@@ -114,10 +114,10 @@ impl ContextEncoder for QwenContextEncoder {
             .map_err(|e| bad(format!("the context does not tokenize: {e}")))?;
         let ids = encoding.get_ids();
         if ids.len() > MAX_CONTEXT_IDS {
-            return Err(bad(format!(
-                "the context is {} tokens; this model's prompt carries at most {MAX_CONTEXT_IDS}",
-                ids.len()
-            )));
+            return Err(AudioError::TooManyContextTokens {
+                tokens: ids.len(),
+                max: MAX_CONTEXT_IDS,
+            });
         }
         Ok(ContextIds::with_keywords(
             ids.iter().copied().map(TokenId::new).collect(),

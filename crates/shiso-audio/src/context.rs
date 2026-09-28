@@ -95,12 +95,19 @@ impl ContextIds {
 /// `İstanbul` would not meet `istanbul`, and a Latin keyword written in
 /// capitals (`I`) must still meet the model's lowercase `i`. Folding costs
 /// the `ı`/`i` distinction, which only this comparison sees.
+///
+/// Combining marks (U+0300-U+036F) are dropped rather than treated as
+/// punctuation: an NFD string spells the same letter as a base character
+/// plus a following mark (`I` + COMBINING DOT ABOVE for `İ`), and this
+/// function does no normalization of its own, so a mark that fell into the
+/// separator arm would split one decomposed word into two.
 #[must_use]
 pub fn keyword_words(text: &str) -> Vec<String> {
     let mut lowered = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
             'I' | 'İ' | 'ı' => lowered.push('i'),
+            '\u{0300}'..='\u{036F}' => {}
             c if c.is_alphanumeric() => lowered.extend(c.to_lowercase()),
             _ => lowered.push(' '),
         }
