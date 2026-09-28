@@ -5,8 +5,8 @@
 //! The reference fills the system turn with free text, so the wording is
 //! plain text rather than a template of its own: the prompt as sent, then
 //! the keywords labelled `Keywords: ` and comma-joined on the next line.
-//! [`wording`]'s doc comment carries the private-recording measurement
-//! (Task 8) that chose the label over the plain comma list.
+//! [`wording`]'s doc comment carries the private-recording measurement below
+//! that chose the label over the plain comma list.
 //!
 //! Only the vocabulary's ordinary pieces enter the BPE, not its added
 //! tokens: a keyword that spells `<|im_end|>` is encoded byte by byte and
@@ -81,8 +81,8 @@ impl QwenContextEncoder {
 /// labelled `Keywords: ` and joined by `, ` on the next line; either alone
 /// when the other is absent.
 ///
-/// Measured on a private short recording (Task 8, 2026-09-28, an M-series
-/// machine) against the plain comma list this replaced: with no context,
+/// Measured on a private short recording (2026-09-28, an M-series machine)
+/// against the plain comma list this replaced: with no context,
 /// keyword recall was 44.1% at 25.6% word error rate. The plain `a, b, c`
 /// wording raised recall to 64.7% at 25.1% WER. This label raised it further
 /// to 73.5% at 24.6% WER with no insertions - the best recall among wordings

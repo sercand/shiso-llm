@@ -232,6 +232,15 @@ fn keyword_score(
 
 /// The context fields one run sends, `model` aside: `keywords[]` once a
 /// keyword and/or a `prompt`, worded the way `run` names.
+///
+/// These names describe the wire shape each run sends, not the text the
+/// model reads: at `HEAD`, `keywords[]` is rendered through
+/// `qwen3_asr::context::wording`, which now emits the labelled shape this
+/// file measured as `labelled` (that measurement, taken before the fix, is
+/// what picked it). So `comma` and `labelled` put the same system text on
+/// the wire today, and `prompt+comma` is really prompt-plus-labelled. This
+/// file is not re-run to confirm that; the run names are kept as recorded
+/// so the numbers in `context.rs`'s doc comment stay traceable to them.
 fn context_fields(run: &str, keywords: &[String]) -> Vec<(String, String)> {
     /// The fixed scenario prompt `prompt+comma` pairs with `keywords[]`.
     const SCENARIO_PROMPT: &str =

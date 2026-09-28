@@ -32,6 +32,13 @@
 //! family accepts a context, and its aggregate line says `keywords=on`.
 //! Unset, the run is the plain baseline. A recognizer with no context
 //! encoder (Nemotron) never receives them, since it refuses one outright.
+//!
+//! `SHISO_TEST_DIAG` is optional and separate from the run above: when set,
+//! the ordinary recognizer loop is skipped entirely and this test instead
+//! diagnoses the keyword-driven WER rise the wider check found, on
+//! qwen3-asr-q8 alone, offline with silence kept (the worse of the two
+//! silence settings), once without keywords and once with. Unset, this
+//! test's output is exactly what it was before this diagnostic existed.
 
 #![cfg(target_os = "macos")]
 
@@ -44,7 +51,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use common::wer::{edit_distance, normalize_words};
+use common::wer::{edit_distance, edit_ops, normalize_words};
 use serde_json::Value;
 use shiso_server::cli::{Cli, Command};
 use shiso_server::router::build_router;
@@ -95,6 +102,86 @@ fn keyword_fields() -> Vec<(String, String)> {
         .filter(|line| !line.is_empty())
         .map(|line| ("keywords[]".to_owned(), line.to_owned()))
         .collect()
+}
+
+/// Non-overlapping occurrences of `needle` (normalised words) in `hay`. The
+/// same rule `keyword_bias.rs` counts with, duplicated rather than shared:
+/// this file's diagnostic needs it standalone, the way its other helpers are
+/// already duplicated across the two files.
+fn occurrences(hay: &[String], needle: &[String]) -> usize {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let (mut i, mut n) = (0, 0);
+    while i + needle.len() <= hay.len() {
+        if hay[i..i + needle.len()] == *needle {
+            n += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// Words of `hay` covered by non-overlapping occurrences of `needle`; a
+/// keyword matched twice covers twice its own word count. Keywords that
+/// overlap in the text can double-count a word, which is fine for the
+/// diagnostic's "roughly how much of this segment is keywords" reading.
+fn covered_words(hay: &[String], needle: &[String]) -> usize {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let (mut i, mut covered) = (0, 0);
+    while i + needle.len() <= hay.len() {
+        if hay[i..i + needle.len()] == *needle {
+            covered += needle.len();
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    covered
+}
+
+/// Keyword recall and insertions of `ours` against `reference`: the same
+/// per-keyword `min`/`saturating_sub` rule `keyword_bias.rs` scores with.
+fn keyword_score(
+    reference: &[String],
+    ours: &[String],
+    keywords: &[Vec<String>],
+) -> (usize, usize, usize) {
+    let (mut hits, mut total, mut inserted) = (0, 0, 0);
+    for k in keywords {
+        let (r, o) = (occurrences(reference, k), occurrences(ours, k));
+        hits += o.min(r);
+        total += r;
+        inserted += o.saturating_sub(r);
+    }
+    (hits, total, inserted)
+}
+
+/// Whether `words` (one segment, normalised) reads as a keyword echo: three
+/// or more distinct keywords matched anywhere in it, or at least half its
+/// words covered by keyword matches.
+fn is_echo_segment(words: &[String], keywords: &[Vec<String>]) -> bool {
+    if words.is_empty() {
+        return false;
+    }
+    let distinct = keywords
+        .iter()
+        .filter(|k| occurrences(words, k) >= 1)
+        .count();
+    if distinct >= 3 {
+        return true;
+    }
+    let covered: usize = keywords.iter().map(|k| covered_words(words, k)).sum();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a segment's word count fits a f64 exactly"
+    )]
+    let coverage = covered as f64 / words.len() as f64;
+    coverage >= 0.5
 }
 
 /// One recognizer this test runs the meeting through.
@@ -451,6 +538,17 @@ fn our_spans(json: &Value) -> Vec<Span> {
         .collect()
 }
 
+/// Our own diarized segments' raw `text`, in order.
+fn our_segment_texts(json: &Value) -> Vec<String> {
+    json["segments"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s["text"].as_str().map(str::to_owned))
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the private long meeting recording and a Metal device"]
 async fn long_meeting_recognizers() {
@@ -468,13 +566,18 @@ async fn long_meeting_recognizers() {
     let audio_bytes =
         std::fs::read(&audio_path).unwrap_or_else(|error| panic!("reading the meeting: {error}"));
     let reference = load_reference(&reference_path);
-    let keywords = keyword_fields();
     say(&format!(
         "reference: {} words, {} segments",
         reference.words.len(),
         reference.spans.len()
     ));
 
+    if std::env::var_os("SHISO_TEST_DIAG").is_some() {
+        diagnose_keyword_wer(&diarizer, &audio_bytes, &reference).await;
+        return;
+    }
+
+    let keywords = keyword_fields();
     for recognizer in RECOGNIZERS {
         let runs: &[(&str, &[&str])] = if recognizer.offline {
             &[
@@ -581,4 +684,84 @@ async fn measure(
         agreement * 100.0,
     ));
     (wer, agreement)
+}
+
+/// Diagnoses the WER rise `SHISO_TEST_KEYWORDS` causes on the full meeting:
+/// qwen3-asr-q8, offline with silence kept (the worse of the two silence
+/// settings measured by the ordinary run), booted once and sent two
+/// requests - one without keywords, one with. Each transcript's word errors
+/// are split into substitutions, deletions and insertions; its keyword
+/// recall and insertions are scored the way `keyword_bias.rs` scores them,
+/// against the same export `measure` compares to; and its segments are
+/// checked for "keyword echo" (three or more distinct keywords matched, or
+/// at least half the segment's words covered by one) and for an exact
+/// repeat of the previous segment's text. One `diag` line a run, aggregates
+/// only. SKIPs on stderr, needing no state, when `SHISO_TEST_KEYWORDS` is
+/// unset - the two runs would otherwise be identical - or when qwen3-asr-q8
+/// itself is unavailable (`boot` has already said why).
+async fn diagnose_keyword_wer(diarizer: &Path, audio_bytes: &[u8], reference: &Reference) {
+    let keyword_lines = keyword_fields();
+    if keyword_lines.is_empty() {
+        say("SKIP diag: SHISO_TEST_KEYWORDS is needed for the with/without comparison");
+        return;
+    }
+    let keyword_needles: Vec<Vec<String>> = keyword_lines
+        .iter()
+        .map(|(_, value)| normalize_words(value))
+        .collect();
+    let recognizer = &RECOGNIZERS[0];
+    debug_assert_eq!(recognizer.name, "qwen3-asr-q8", "diag targets qwen3-asr-q8");
+    let Some(state) = boot(recognizer, diarizer, &["--asr-skip-silence=false"]) else {
+        return;
+    };
+
+    for (run, context) in [
+        ("baseline", [].as_slice()),
+        ("keywords", keyword_lines.as_slice()),
+    ] {
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("model", recognizer.name),
+            ("response_format", "diarized_json"),
+            ("language", "tr"),
+        ];
+        fields.extend(context.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let (status, body) = post(&state, form(audio_bytes, &fields)).await;
+        assert_eq!(status, StatusCode::OK, "diag {run}: request failed");
+        let json: Value = serde_json::from_str(&body).expect("json");
+        let hyp_words = normalize_words(json["text"].as_str().expect("text"));
+        let (subs, dels, ins) = edit_ops(&reference.words, &hyp_words);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a word count fits a meeting's transcript; f64 carries it exactly"
+        )]
+        let wer = (subs + dels + ins) as f64 / reference.words.len().max(1) as f64;
+        let (keyword_hits, keyword_total, keyword_insertions) =
+            keyword_score(&reference.words, &hyp_words, &keyword_needles);
+
+        let (mut echo_segments, mut echo_words) = (0usize, 0usize);
+        let (mut repeat_segments, mut repeat_words) = (0usize, 0usize);
+        let mut previous: Option<String> = None;
+        for text in our_segment_texts(&json) {
+            let trimmed = text.trim();
+            let words = normalize_words(trimmed);
+            if is_echo_segment(&words, &keyword_needles) {
+                echo_segments += 1;
+                echo_words += words.len();
+            }
+            if previous.as_deref() == Some(trimmed) {
+                repeat_segments += 1;
+                repeat_words += words.len();
+            }
+            previous = Some(trimmed.to_owned());
+        }
+
+        say(&format!(
+            "diag run={run} wer={:.1}% subs={subs} dels={dels} ins={ins} \
+             keyword_recall={keyword_hits}/{keyword_total} keyword_insertions={keyword_insertions} \
+             words={} echo_segments={echo_segments} echo_words={echo_words} \
+             repeat_segments={repeat_segments} repeat_words={repeat_words}",
+            wer * 100.0,
+            hyp_words.len(),
+        ));
+    }
 }
