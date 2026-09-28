@@ -995,9 +995,17 @@ async fn an_offline_job_steps_one_batch_per_turn() {
         panic!("{a:?}");
     };
     assert!(matches!(b.last(), Some(TranscriptEvent::Done(_))), "{b:?}");
-    // No `RecognizerStream::open_stream` call: both jobs went offline, and
-    // `open_offline` records the options it was opened with too.
-    assert_eq!(opened.lock().expect("unpoisoned").len(), 2, "no stream");
+    // `opened` now records both `open_stream` and `open_offline` calls, so
+    // the stream count is what is left once the offline opens are taken out;
+    // here that is zero, since both jobs went offline.
+    let opened_len = opened.lock().expect("unpoisoned").len();
+    let offline_len = offline.lock().expect("unpoisoned").len();
+    assert_eq!(
+        opened_len - offline_len,
+        0,
+        "no RecognizerStream::open_stream call: both jobs went offline \
+         (opened: {opened_len}, offline: {offline_len})"
+    );
     let plans = offline.lock().expect("unpoisoned").clone();
     assert_eq!(plans.len(), 2);
     let spans = transcribed(&plans[0]);
@@ -1030,11 +1038,17 @@ async fn a_streaming_job_is_not_held_behind_an_offline_job() {
     let (batched, live) = tokio::join!(drain(batched), drain(live));
     assert!(matches!(batched.last(), Some(TranscriptEvent::Done(_))));
     assert!(matches!(live.last(), Some(TranscriptEvent::Done(_))));
-    // The streaming job streamed and the other went offline; `opened` now
-    // records the options both an open stream and an open offline job were
-    // opened with, so it holds one of each.
-    assert_eq!(opened.lock().expect("unpoisoned").len(), 2);
-    assert_eq!(offline.lock().expect("unpoisoned").len(), 1);
+    // `opened` now records both `open_stream` and `open_offline` calls, so
+    // the stream count is what is left once the offline opens are taken
+    // out: one, for the streaming job; the batched job went offline instead.
+    let opened_len = opened.lock().expect("unpoisoned").len();
+    let offline_len = offline.lock().expect("unpoisoned").len();
+    assert_eq!(
+        opened_len - offline_len,
+        1,
+        "one real stream open: the live job (opened: {opened_len}, offline: {offline_len})"
+    );
+    assert_eq!(offline_len, 1);
     let log = log.lock().expect("unpoisoned").clone();
     let first_b = log.iter().position(|l| l == "b").expect("b ran");
     let last_a = log.iter().rposition(|l| l == "off:a").expect("a stepped");
@@ -1314,13 +1328,16 @@ async fn a_clip_under_the_offline_threshold_keeps_the_chunked_stream_path() {
             offline_jobs,
             "threshold {min_secs}"
         );
-        // Whichever path the job took, `opened` records the one options it
-        // was opened with: a stream's below the threshold, an offline
-        // job's at or above it.
+        // `opened` records both `open_stream` and `open_offline` calls, so
+        // the stream count is what is left once the offline opens are taken
+        // out: one below the threshold (a real stream), zero at or above it
+        // (the job went offline instead).
+        let opened_len = opened.lock().expect("unpoisoned").len();
+        let offline_len = offline.lock().expect("unpoisoned").len();
         assert_eq!(
-            opened.lock().expect("unpoisoned").len(),
-            1,
-            "threshold {min_secs}"
+            opened_len - offline_len,
+            1 - offline_jobs,
+            "threshold {min_secs} (opened: {opened_len}, offline: {offline_len})"
         );
     }
 }
@@ -1355,6 +1372,43 @@ async fn a_context_reaches_every_stream_the_job_opens() {
     let seen = opened.lock().expect("unpoisoned");
     assert_eq!(seen.len(), 2, "one stream and one offline job");
     assert!(seen.iter().all(|options| options.context == ids));
+}
+
+/// A diarized job on a chunking recognizer waits in `Stream::AwaitingTurns`
+/// until the diarizer's turns are known, then opens through
+/// `worker::open_at_turns` rather than the immediate `open_stream` call in
+/// `worker::start`; its context must survive that wait too.
+#[tokio::test]
+async fn a_context_reaches_a_stream_opened_at_the_diarizer_turns() {
+    let log = Log::default();
+    let opened = Opened::default();
+    // `ServiceShape::plain` already loads a diarizer (`Pattern::Halves`);
+    // `chunks: true` is what sends a diarized job through `AwaitingTurns`
+    // instead of opening its stream immediately.
+    let service = service_with(&ServiceShape {
+        chunks: true,
+        opened: &opened,
+        encoder: true,
+        ..ServiceShape::plain(&log)
+    });
+    let context = Context {
+        prompt: None,
+        keywords: vec!["a".into()],
+    };
+    let ids = service.encode_context(&context).expect("encodes");
+    let events = drain(
+        service
+            .submit(TranscriptionJob {
+                context: ids.clone(),
+                ..job(6, "a", true)
+            })
+            .expect("queued"),
+    )
+    .await;
+    assert!(matches!(events.last(), Some(TranscriptEvent::Done(_))));
+    let seen = opened.lock().expect("unpoisoned").clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].context, ids);
 }
 
 #[test]

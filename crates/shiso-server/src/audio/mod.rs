@@ -234,8 +234,8 @@ impl AudioService {
     /// # Errors
     ///
     /// [`AppError::BadRequest`] naming `keywords` for a context sent to a
-    /// recognizer that takes none, one whose raw text is past
-    /// [`MAX_CONTEXT_BYTES`], one longer than `--asr-max-context-tokens`
+    /// recognizer that takes none, one whose raw prompt and keywords text
+    /// totals more than 16 KiB, one longer than `--asr-max-context-tokens`
     /// once encoded, or one the encoder refuses.
     pub fn encode_context(&self, context: &Context) -> Result<ContextIds, AppError> {
         if context.is_empty() {
@@ -257,7 +257,7 @@ impl AudioService {
         if bytes > MAX_CONTEXT_BYTES {
             return Err(refuse(format!(
                 "the keywords and prompt are {bytes} bytes of text; this server encodes at \
-                 most {MAX_CONTEXT_BYTES}"
+                 most {MAX_CONTEXT_BYTES} bytes"
             )));
         }
         let ids = encoder.encode(context).map_err(|e| refuse(e.to_string()))?;
