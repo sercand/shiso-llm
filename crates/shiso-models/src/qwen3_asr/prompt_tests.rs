@@ -4,11 +4,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use shiso_audio::Detokenizer;
+use shiso_audio::{AudioError, Detokenizer};
 
-use super::{Parsed, collapse_repeats, forced_suffix, ids, parse};
+use super::{
+    ASSISTANT, Conditioning, MAX_CONTEXT_IDS, NEWLINE, Parsed, SYSTEM, USER, collapse_repeats,
+    forced_suffix, ids, parse,
+};
 use crate::qwen3_asr::config::tests::{exports, say};
-use crate::qwen3_asr::config::{AUDIO_PAD, languages, locate, read_vocab};
+use crate::qwen3_asr::config::{
+    AUDIO_END, AUDIO_PAD, AUDIO_START, IM_END, IM_START, languages, locate, read_vocab,
+};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/references/audio")
@@ -31,6 +36,69 @@ fn parsed(language: Option<&str>, text: &str) -> Parsed {
 }
 
 #[test]
+fn an_empty_context_leaves_the_prompt_as_the_reference_captured_it() {
+    let plain = ids(3, &Conditioning::forced(None)).expect("prompt");
+    assert_eq!(
+        plain,
+        vec![
+            IM_START,
+            SYSTEM,
+            NEWLINE,
+            IM_END,
+            NEWLINE,
+            IM_START,
+            USER,
+            NEWLINE,
+            AUDIO_START,
+            AUDIO_PAD,
+            AUDIO_PAD,
+            AUDIO_PAD,
+            AUDIO_END,
+            IM_END,
+            NEWLINE,
+            IM_START,
+            ASSISTANT,
+            NEWLINE,
+        ]
+    );
+}
+
+#[test]
+fn a_context_sits_inside_the_system_turn() {
+    let context = [101, 102, 103];
+    let with = ids(
+        2,
+        &Conditioning {
+            forced: Some("English"),
+            context: &context,
+        },
+    )
+    .expect("prompt");
+    assert_eq!(&with[..3], &[IM_START, SYSTEM, NEWLINE]);
+    assert_eq!(&with[3..6], &context);
+    assert_eq!(&with[6..8], &[IM_END, NEWLINE]);
+    // The audio run moved by the context's length, and nothing else did.
+    let audio_at = with.iter().position(|&id| id == AUDIO_PAD).expect("audio");
+    assert_eq!(audio_at, 9 + context.len());
+    let plain = ids(2, &Conditioning::forced(Some("English"))).expect("prompt");
+    assert_eq!(with.len(), plain.len() + context.len());
+}
+
+#[test]
+fn a_context_past_the_cap_is_refused() {
+    let context = vec![101; MAX_CONTEXT_IDS + 1];
+    let error = ids(
+        1,
+        &Conditioning {
+            forced: None,
+            context: &context,
+        },
+    )
+    .expect_err("refused");
+    assert!(matches!(error, AudioError::BadContext { .. }), "{error:?}");
+}
+
+#[test]
 fn the_prompt_ids_match_the_reference() {
     let mut seen = 0;
     for model in ["qwen3asr", "r2t2"] {
@@ -44,13 +112,13 @@ fn the_prompt_ids_match_the_reference() {
             let n_audio = usize::try_from(json["auto"]["n_audio_pad"].as_u64().expect("count"))
                 .expect("fits");
             assert_eq!(
-                ids(n_audio, None).expect("the auto prompt"),
+                ids(n_audio, &Conditioning::forced(None)).expect("the auto prompt"),
                 u32s(&json["auto"]["ids"]),
                 "{model} {clip}: auto"
             );
             let language = json["forced"]["language"].as_str().expect("a name");
             assert_eq!(
-                ids(n_audio, Some(language)).expect("a supported language"),
+                ids(n_audio, &Conditioning::forced(Some(language))).expect("a supported language"),
                 u32s(&json["forced"]["ids"]),
                 "{model} {clip}: forced {language}"
             );
@@ -64,7 +132,7 @@ fn the_prompt_ids_match_the_reference() {
 fn the_prompt_is_fifteen_ids_around_the_audio() {
     // The reference processor's prompt: 15 ids plus one placeholder per audio row, the placeholders
     // one unbroken run.
-    let p = ids(390, None).expect("builds");
+    let p = ids(390, &Conditioning::forced(None)).expect("builds");
     assert_eq!(p.len(), 405);
     let first = p
         .iter()
@@ -73,13 +141,18 @@ fn the_prompt_is_fifteen_ids_around_the_audio() {
     assert_eq!(first, 9);
     assert!(p[first..first + 390].iter().all(|&t| t == AUDIO_PAD));
     assert_eq!(p.iter().filter(|&&t| t == AUDIO_PAD).count(), 390);
-    assert_eq!(ids(390, Some("english")).expect("any case").len(), 408);
+    assert_eq!(
+        ids(390, &Conditioning::forced(Some("english")))
+            .expect("any case")
+            .len(),
+        408
+    );
 }
 
 #[test]
 fn an_unsupported_forced_language_is_refused() {
-    assert!(ids(13, Some("Klingon")).is_err());
-    assert!(ids(13, Some("")).is_err());
+    assert!(ids(13, &Conditioning::forced(Some("Klingon"))).is_err());
+    assert!(ids(13, &Conditioning::forced(Some(""))).is_err());
 }
 
 #[test]

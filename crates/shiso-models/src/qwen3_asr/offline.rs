@@ -32,6 +32,7 @@ use shiso_audio::{AudioError, MelFrames, OfflineBatch, OfflineJob, SpanResult};
 use super::Model;
 use super::batch::BatchTranscriber;
 use super::encoder::{Encoded, Tower};
+use super::prompt::Conditioning;
 use super::stream::{chunk_events, chunk_mel, frame_word, warn_at_cap};
 
 /// Which spans a job's steps transcribe, and which of them it can hand back.
@@ -122,6 +123,8 @@ pub(crate) struct QwenOffline {
     model: Arc<Model>,
     /// The language the prompt forces, by the model's name for it.
     forced: Option<&'static str>,
+    /// The system turn's ids, shared by every span.
+    context: Arc<[u32]>,
     spans: Vec<Span>,
     schedule: Schedule,
     /// The last character the spans handed back have written.
@@ -133,6 +136,7 @@ impl QwenOffline {
     pub(crate) fn new(
         model: Arc<Model>,
         forced: Option<&'static str>,
+        context: Arc<[u32]>,
         spans: Vec<Span>,
         batch: usize,
     ) -> Result<Self, AudioError> {
@@ -145,6 +149,7 @@ impl QwenOffline {
         Ok(Self {
             model,
             forced,
+            context,
             schedule: Schedule::new(&spans, batch),
             spans,
             last_char: None,
@@ -182,7 +187,10 @@ impl QwenOffline {
             BatchTranscriber::new(&m.ops, &m.weights.text, &m.config.text).transcribe_with(
                 memory,
                 &refs,
-                self.forced,
+                &Conditioning {
+                    forced: self.forced,
+                    context: &self.context,
+                },
             )
         })
     }

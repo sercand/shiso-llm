@@ -117,6 +117,11 @@ fn forced_of(options: &StreamOptions) -> Result<Option<&'static str>, AudioError
     }
 }
 
+/// The context `options` carry, as the raw ids the prompt takes.
+fn context_of(options: &StreamOptions) -> Arc<[u32]> {
+    options.context.ids().iter().map(|id| id.get()).collect()
+}
+
 /// Opens the checkpoint at `path` on `backend`; `mmproj` is `--asr-mmproj`,
 /// the tower file of a text GGUF.
 ///
@@ -226,6 +231,7 @@ impl SpeechRecognizer for Qwen3Asr {
         Ok(Box::new(stream::QwenStream::new(
             Arc::clone(&self.model),
             forced_of(options)?,
+            context_of(options),
             options.cuts.as_deref(),
         )?))
     }
@@ -254,6 +260,7 @@ impl SpeechRecognizer for Qwen3Asr {
         Ok(Box::new(offline::QwenOffline::new(
             Arc::clone(&self.model),
             forced_of(options)?,
+            context_of(options),
             spans,
             batch,
         )?))

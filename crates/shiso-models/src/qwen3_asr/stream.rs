@@ -42,7 +42,7 @@ use super::Model;
 use super::config::{ASR_TEXT, language_code};
 use super::decoder::{Decoder, KvCache, MAX_NEW_TOKENS, POOLED_CAPACITY};
 use super::encoder::Tower;
-use super::prompt;
+use super::prompt::{self, Conditioning};
 use crate::audio_ops::Workspace;
 
 /// Seconds per mel frame, the unit of every token's frame.
@@ -483,6 +483,8 @@ pub(crate) struct QwenStream {
     model: Arc<Model>,
     /// The language the prompt forces, by the model's name for it.
     forced: Option<&'static str>,
+    /// The system turn's ids, shared by every chunk.
+    context: Arc<[u32]>,
     planner: Planner,
     /// Always `Some` until the stream is dropped and gives it back.
     memory: Option<Memory>,
@@ -501,6 +503,7 @@ impl QwenStream {
     pub(crate) fn new(
         model: Arc<Model>,
         forced: Option<&'static str>,
+        context: Arc<[u32]>,
         cuts: Option<&[u32]>,
     ) -> Result<Self, AudioError> {
         let memory = Memory::take(&model);
@@ -508,6 +511,7 @@ impl QwenStream {
             planner: Planner::new(cuts)?,
             model,
             forced,
+            context,
             memory: Some(memory),
             pending: Vec::new(),
             last_char: None,
@@ -554,7 +558,10 @@ impl QwenStream {
             &mut memory.cache,
             &mut memory.decoder,
             &audio,
-            self.forced,
+            &Conditioning {
+                forced: self.forced,
+                context: &self.context,
+            },
         )?;
         warn_at_cap(&ids, &span);
         Ok(chunk_events(

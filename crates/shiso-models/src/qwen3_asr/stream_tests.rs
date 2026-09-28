@@ -352,7 +352,7 @@ fn the_whole_stream_matches_one_shot_transcription() {
         .expect("encodes");
     let mut cache = KvCache::new(&m.config.text);
     let ids = Decoder::new(&m.ops, &m.weights.text, &m.config.text)
-        .transcribe(&mut cache, &audio, None)
+        .transcribe(&mut cache, &audio, &prompt::Conditioning::forced(None))
         .expect("decodes");
     let mut raw = Detokenizer::new(Arc::clone(&m.vocab));
     for &id in &ids {
@@ -458,11 +458,14 @@ fn the_pooled_capacity_is_the_longest_chunks_prompt_and_headroom() {
     let prompt_rows = languages()
         .iter()
         .map(|(_, name)| {
-            prompt::ids(audio_tokens(longest), Some(name))
-                .expect("a supported language")
-                .len()
+            prompt::ids(
+                audio_tokens(longest),
+                &prompt::Conditioning::forced(Some(name)),
+            )
+            .expect("a supported language")
+            .len()
         })
         .max()
         .expect("languages");
-    assert_eq!(POOLED_CAPACITY, prompt_rows + 256);
+    assert_eq!(POOLED_CAPACITY, prompt_rows + prompt::MAX_CONTEXT_IDS + 256);
 }

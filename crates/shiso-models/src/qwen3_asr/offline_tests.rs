@@ -233,8 +233,14 @@ fn offline_text_equals_streaming_text_on_long_dialogue() {
     // One and two spans a step: the longest spans go first, so the spans
     // are transcribed out of plan order and handed back in it.
     for batch in [1, 2] {
-        let mut job = super::QwenOffline::new(Arc::clone(&asr.model), None, spans.clone(), batch)
-            .expect("opens");
+        let mut job = super::QwenOffline::new(
+            Arc::clone(&asr.model),
+            None,
+            Arc::from([]),
+            spans.clone(),
+            batch,
+        )
+        .expect("opens");
         let (events, ends, _, steps) = run_job(&mut job, &mel);
         assert_eq!(events, streamed, "{batch} a step");
         assert_eq!(ends, stream_ends, "{batch} a step");
