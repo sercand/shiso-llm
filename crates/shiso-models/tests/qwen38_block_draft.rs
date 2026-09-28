@@ -1,4 +1,5 @@
-//! The dense 27B checkpoint drafting with its block drafter, on Metal.
+//! The dense 27B checkpoint drafting with its block drafter, on this platform's
+//! device: Metal on macOS, CUDA device 0 on Linux.
 //!
 //! Three claims, each against something this build did not produce:
 //!
@@ -15,7 +16,7 @@
 //! ```text
 //! SHISO_TEST_MODEL_QWEN38_27B=<MLX export> SHISO_TEST_DRAFT_BLOCK=<drafter dir> \
 //!   cargo test -p shiso-models --release --features shiso-metal/metal \
-//!   --test qwen38_block_draft_metal -- --ignored --nocapture --test-threads=1
+//!   --test qwen38_block_draft -- --ignored --nocapture --test-threads=1
 //! ```
 
 #![expect(
@@ -33,8 +34,33 @@ use shiso_core::ids::TokenId;
 use shiso_core::model::{DecodeStep, Model};
 use shiso_engine::mtp::SpecDepth;
 use shiso_engine::{EngineOptions, argmax};
-use shiso_metal::{MetalBackend, metal_available};
 use shiso_models::qwen35::{Qwen35Config, Qwen35Model};
+
+/// This platform's device, or `None` with the reason said.
+fn device() -> Option<Arc<dyn Backend>> {
+    #[cfg(target_os = "macos")]
+    {
+        if !shiso_metal::metal_available() {
+            say("SKIP: no Metal device");
+            return None;
+        }
+        let backend: Arc<dyn Backend> = shiso_metal::MetalBackend::new().expect("a Metal device");
+        Some(backend)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        match shiso_cuda::CudaBackend::new(0, shiso_cuda::CudaOptions::default()) {
+            Ok(cuda) => {
+                let backend: Arc<dyn Backend> = cuda;
+                Some(backend)
+            }
+            Err(err) => {
+                say(&format!("SKIP: no CUDA device: {err}"));
+                None
+            }
+        }
+    }
+}
 
 /// Tokens each continuation runs to.
 const STEPS: usize = 64;
@@ -100,18 +126,15 @@ fn load(backend: &Arc<dyn Backend>, model: &Path, spec: bool) -> Qwen35Model {
 }
 
 #[test]
-#[ignore = "needs the local 27B export, its block drafter and a Metal device"]
+#[ignore = "needs the local 27B export, its block drafter and a device"]
 fn speculative_greedy_decoding_is_serial_greedy_decoding() {
     let Some((model_dir, draft_dir)) = dirs() else {
         say("SKIP: SHISO_TEST_MODEL_QWEN38_27B or SHISO_TEST_DRAFT_BLOCK names no directory");
         return;
     };
-    if !metal_available() {
-        say("SKIP: no Metal device");
-        return;
-    }
+
     let reference = reference();
-    let backend: Arc<dyn Backend> = MetalBackend::new().expect("a Metal device");
+    let Some(backend) = device() else { return };
     for record in reference["records"].as_array().expect("records") {
         let name = record["prompt"].as_str().expect("a prompt name");
         let prompt = ids(&record["prompt_tokens"]);
@@ -253,11 +276,16 @@ fn serial_keyed(
 
 /// `STEPS` tokens through the two-phase step, each row's token the keyed draw
 /// at its position; and the tokens committed per round.
+/// The two-phase keyed continuation. With `oracle`, rounds also carry a
+/// caller's proposal: every third the oracle's next three tokens, and the
+/// round after it a block of the round's own first token repeated - a right
+/// proposal and a wrong one, neither of which may change a token.
 fn drafted_keyed(
     backend: &Arc<dyn Backend>,
     dirs: (&Path, &Path),
     prompt: &[TokenId],
     key: u64,
+    oracle: Option<&[TokenId]>,
 ) -> (Vec<TokenId>, f64) {
     let params = sampled();
     let pick = |row: &[f32], at: usize| {
@@ -284,9 +312,14 @@ fn drafted_keyed(
     };
     while out.len() < STEPS {
         let first = *out.last().expect("a token");
+        let proposal: Vec<TokenId> = match (oracle, rounds % 3) {
+            (Some(serial), 1) => serial.iter().skip(out.len()).take(3).copied().collect(),
+            (Some(_), 2) => vec![first; 3],
+            _ => Vec::new(),
+        };
         let spec = model.spec_mut().expect("speculative");
         let block = spec
-            .verify_block(session, first, hint)
+            .verify_block(session, first, hint, &proposal)
             .expect("verify")
             .expect("two-phase");
         let mut accepted = 0u32;
@@ -312,25 +345,22 @@ fn drafted_keyed(
 /// two-phase speculative step is the one decoded a token at a time, id for id,
 /// at temperature 1 with a top-k and a nucleus - the model's own defaults.
 #[test]
-#[ignore = "needs the local 27B export, its block drafter and a Metal device"]
+#[ignore = "needs the local 27B export, its block drafter and a device"]
 fn speculative_keyed_sampling_is_serial_keyed_sampling() {
     let Some((model_dir, draft_dir)) = dirs() else {
         say("SKIP: SHISO_TEST_MODEL_QWEN38_27B or SHISO_TEST_DRAFT_BLOCK names no directory");
         return;
     };
-    if !metal_available() {
-        say("SKIP: no Metal device");
-        return;
-    }
+
     let reference = reference();
-    let backend: Arc<dyn Backend> = MetalBackend::new().expect("a Metal device");
+    let Some(backend) = device() else { return };
     for record in reference["records"].as_array().expect("records") {
         let name = record["prompt"].as_str().expect("a prompt name");
         let prompt = ids(&record["prompt_tokens"]);
         for key in [1234u64, 1235] {
             let serial = serial_keyed(&backend, &model_dir, &prompt, key);
             let (drafted, per_round) =
-                drafted_keyed(&backend, (&model_dir, &draft_dir), &prompt, key);
+                drafted_keyed(&backend, (&model_dir, &draft_dir), &prompt, key, None);
             say(&format!(
                 "{name} key {key}: {per_round:.2} tokens/round sampled"
             ));
@@ -343,6 +373,27 @@ fn speculative_keyed_sampling_is_serial_keyed_sampling() {
                 agree, STEPS,
                 "{name} key {key}: sampled speculative decoding parted from serial at {agree}"
             );
+            // A caller's proposals, right and wrong, change which tokens are
+            // verified and never which are chosen. Once per prompt: it is one
+            // more 27B load and run.
+            if key == 1234 {
+                let (proposed, _) = drafted_keyed(
+                    &backend,
+                    (&model_dir, &draft_dir),
+                    &prompt,
+                    key,
+                    Some(&serial),
+                );
+                let agree = serial
+                    .iter()
+                    .zip(&proposed)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                assert_eq!(
+                    agree, STEPS,
+                    "{name} key {key}: decoding with proposals parted from serial at {agree}"
+                );
+            }
         }
     }
 }

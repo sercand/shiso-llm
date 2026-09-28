@@ -439,7 +439,9 @@ impl BlockDrafter {
         if let Some(id) = outcome.failed_lookup() {
             state.fails.remember(id);
         }
-        if drafted > 0 {
+        // A scaffold round says how well the caller knew its structure, not
+        // how well the drafter drafts, so it leaves the estimate alone.
+        if drafted > 0 && !matches!(outcome.source, Some(crate::mtp::DraftSource::Scaffold)) {
             let kept = f64::from(outcome.logits_row);
             state.accepted += ACCEPT_EMA * (kept - state.accepted);
         }
@@ -1115,6 +1117,7 @@ impl crate::stack::HybridStack {
         first: TokenId,
         eos: TokenId,
         hint: DraftHint,
+        proposal: &[TokenId],
     ) -> CoreResult<shiso_core::model::VerifiedBlock> {
         let live = self
             .sessions
@@ -1142,13 +1145,22 @@ impl crate::stack::HybridStack {
             .ok_or(CoreError::UnknownSession(session))?
             .reserve_to(frontier.saturating_add(block), room)?;
         let started = std::time::Instant::now();
-        let (mut drafts, source) = match self.copy(session, first, eos, budget)? {
+        let (drafts, source) = match self.copy(session, first, eos, budget)? {
             Some((tokens, id)) => (tokens, crate::mtp::DraftSource::Lookup(id)),
             None if self.drafting_pays(session) => (
                 self.draft_block(session, first, frontier, hint)?,
                 crate::mtp::DraftSource::Head,
             ),
             None => (Vec::new(), crate::mtp::DraftSource::Head),
+        };
+        // The caller's proposal where the drafts disagree with it: it is
+        // structure the caller knows comes next, so a block that does not
+        // begin with it is wrong from its first mismatch. A block that does is
+        // the proposal and more, and is kept.
+        let (mut drafts, source) = if proposal.is_empty() || drafts.starts_with(proposal) {
+            (drafts, source)
+        } else {
+            (proposal.to_vec(), crate::mtp::DraftSource::Scaffold)
         };
         drafts.truncate(budget as usize);
         let mut rows = Vec::with_capacity(drafts.len() + 1);
@@ -1264,7 +1276,7 @@ impl crate::stack::HybridStack {
         first: TokenId,
         eos: TokenId,
     ) -> CoreResult<Speculated> {
-        let block = self.draft_and_verify(session, first, eos, DraftHint::greedy())?;
+        let block = self.draft_and_verify(session, first, eos, DraftHint::greedy(), &[])?;
         let picks: Vec<TokenId> = (0..=block.drafts.len())
             .map(|i| crate::sampling::argmax(block.row(i)))
             .collect();

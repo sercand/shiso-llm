@@ -30,6 +30,7 @@ pub mod schemes;
 pub mod segment;
 pub mod string_params;
 pub mod tags;
+pub mod tool_scaffold;
 
 pub use gemma_dict::{GemmaDictError, gemma_dict_to_json};
 pub use schemes::{
@@ -39,3 +40,4 @@ pub use schemes::{
 pub use segment::Segment;
 pub use string_params::StringParams;
 pub use tags::TagParser;
+pub use tool_scaffold::ToolScaffold;

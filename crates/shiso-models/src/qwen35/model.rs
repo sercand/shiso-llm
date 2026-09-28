@@ -606,13 +606,14 @@ impl shiso_core::model::Speculating for Qwen35Model {
         session: SessionId,
         first: TokenId,
         hint: shiso_core::model::DraftHint,
+        proposal: &[TokenId],
     ) -> CoreResult<Option<shiso_core::model::VerifiedBlock>> {
         if !self.stack.block_resident() {
             return Ok(None);
         }
         let eos = self.info.stop_tokens.primary();
         self.stack
-            .draft_and_verify(session, first, eos, hint)
+            .draft_and_verify(session, first, eos, hint, proposal)
             .map(Some)
     }
 

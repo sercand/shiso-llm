@@ -146,6 +146,10 @@ pub struct GenerateRequest {
     /// from the text, and a `path` of `123` or file content that parses as JSON
     /// reaches the tool as something it never declared.
     pub string_params: Arc<shiso_parsers::StringParams>,
+    /// The declared tools' names and parameters, from which a speculative
+    /// step proposes a tool call's fixed text. Empty for a request with no
+    /// tools.
+    pub tool_scaffold: Arc<shiso_parsers::ToolScaffold>,
     /// Whether this generation runs beside standard work or only in its
     /// absence. See [`ServiceClass::Flex`] for what the scheduler does with it.
     pub service_class: ServiceClass,
@@ -170,6 +174,7 @@ impl GenerateRequest {
             media: Arc::from(Vec::new()),
             media_digests: Arc::from(Vec::new()),
             string_params: Arc::default(),
+            tool_scaffold: Arc::default(),
             service_class: ServiceClass::Standard,
         }
     }
@@ -206,6 +211,13 @@ impl GenerateRequest {
     #[must_use]
     pub fn with_string_params(mut self, strings: Arc<shiso_parsers::StringParams>) -> Self {
         self.string_params = strings;
+        self
+    }
+
+    /// The same generation, with the declared tools' scaffold attached.
+    #[must_use]
+    pub fn with_tool_scaffold(mut self, scaffold: Arc<shiso_parsers::ToolScaffold>) -> Self {
+        self.tool_scaffold = scaffold;
         self
     }
 

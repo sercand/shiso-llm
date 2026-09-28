@@ -670,6 +670,11 @@ impl Coordinator {
         // `Arc<str>`, so the clone is a refcount and not the prompt.
         let prompt_text = Arc::clone(&request.prompt_text);
         let string_params = Arc::clone(&request.string_params);
+        // The scaffold spells the Qwen 3.5 XML body; under any other tool
+        // scheme it would propose text the model never writes.
+        let scaffold = (self.parsers.1 == ToolCallScheme::Qwen35)
+            .then(|| Arc::clone(&request.tool_scaffold))
+            .filter(|scaffold| !scaffold.is_empty());
         let mut slot = SeqSlot::new(
             request,
             SlotSetup {
@@ -695,6 +700,7 @@ impl Coordinator {
                 string_params,
             ),
         );
+        slot.set_scaffold(scaffold);
         if let Some((path, spans)) = &key {
             self.key_session(&mut slot, path, spans);
         }
@@ -1237,12 +1243,15 @@ impl Coordinator {
         let Some(step) = self.slots.slots().get(at).and_then(SeqSlot::decode_step) else {
             return;
         };
-        let hint = match self.slots.get_mut(at) {
-            Some(slot) => slot.draft_hint(),
+        let (hint, proposal) = match self.slots.get_mut(at) {
+            Some(slot) => (
+                slot.draft_hint(),
+                slot.scaffold_proposal(self.vocabulary.as_deref()),
+            ),
             None => return,
         };
         let verified = match self.model.as_model_mut().spec_mut() {
-            Some(spec) => spec.verify_block(step.session, step.token, hint),
+            Some(spec) => spec.verify_block(step.session, step.token, hint, &proposal),
             None => return,
         };
         match verified {
