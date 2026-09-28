@@ -42,6 +42,8 @@ pub const DEFAULT_KVSTORE_DRAIN_SECS: u64 = 60;
 /// The default ids the turn replay keeps across finished turns: about 32 MiB
 /// of ids and text, room for sixteen conversations at a 262 144-token context.
 pub const DEFAULT_TURN_REPLAY_TOKENS: usize = 4 * 1024 * 1024;
+/// Seconds between the engine's periodic info lines.
+pub const DEFAULT_LOG_STATS_INTERVAL_SECS: u64 = 10;
 /// The default pixel ceiling one image may occupy after resizing.
 pub const DEFAULT_VISION_MAX_PIXELS: usize = 1280 * 1280;
 /// The default row-cache budget for a per-layer embedding table, in mebibytes.
@@ -243,6 +245,11 @@ pub struct ServeArgs {
     /// prefix cache. Zero keeps none.
     #[arg(long, env = "SHISO_TURN_REPLAY_TOKENS", default_value_t = DEFAULT_TURN_REPLAY_TOKENS)]
     pub turn_replay_tokens: usize,
+    /// Seconds between the engine's info lines of prefill and decode rates,
+    /// speculation acceptance and cache use, printed while requests run and
+    /// once as they finish. Zero turns the line off.
+    #[arg(long, env = "SHISO_LOG_STATS_INTERVAL", default_value_t = DEFAULT_LOG_STATS_INTERVAL_SECS)]
+    pub log_stats_interval: u64,
     /// Bearer tokens that may call the inference routes, comma separated.
     ///
     /// `hide_env_values` is set: a token must never appear in `--help`, in a

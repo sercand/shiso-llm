@@ -57,6 +57,124 @@ impl Counter<'static> {
     }
 }
 
+/// The counters one periodic log line is a difference of.
+///
+/// Plain numbers rather than a view of the atomics: two of these, taken an
+/// interval apart, are what the line reports rates over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Prompt tokens run through a forward pass.
+    pub prefill_tokens: u64,
+    /// Tokens generated.
+    pub decode_tokens: u64,
+    /// Guesses a draft head made.
+    pub drafted: u64,
+    /// Guesses the target agreed with.
+    pub accepted: u64,
+    /// Speculative steps taken, one per row.
+    pub spec_steps: u64,
+    /// Requests given a slot and a session.
+    pub admitted: u64,
+    /// Requests that resumed from a stored prefix.
+    pub checkpoint_hits: u64,
+}
+
+impl Snapshot {
+    /// What happened between `earlier` and `self`, `secs` apart.
+    ///
+    /// Saturating, so a pair taken out of order reads as nothing happening
+    /// rather than as a wrapped count.
+    #[must_use]
+    pub fn since(&self, earlier: &Self, secs: f64) -> Window {
+        let d = |now: u64, then: u64| now.saturating_sub(then);
+        Window {
+            secs,
+            prefill_tokens: d(self.prefill_tokens, earlier.prefill_tokens),
+            decode_tokens: d(self.decode_tokens, earlier.decode_tokens),
+            drafted: d(self.drafted, earlier.drafted),
+            accepted: d(self.accepted, earlier.accepted),
+            spec_steps: d(self.spec_steps, earlier.spec_steps),
+            admitted: d(self.admitted, earlier.admitted),
+            checkpoint_hits: d(self.checkpoint_hits, earlier.checkpoint_hits),
+        }
+    }
+}
+
+/// The work done over one interval, and the rates a log line reads from it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Window {
+    /// How long the interval was.
+    pub secs: f64,
+    /// Prompt tokens prefilled in it.
+    pub prefill_tokens: u64,
+    /// Tokens generated in it.
+    pub decode_tokens: u64,
+    /// Guesses drafted in it.
+    pub drafted: u64,
+    /// Guesses accepted in it.
+    pub accepted: u64,
+    /// Speculative steps in it.
+    pub spec_steps: u64,
+    /// Requests admitted in it.
+    pub admitted: u64,
+    /// Admitted requests that resumed from a stored prefix.
+    pub checkpoint_hits: u64,
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "rates and ratios printed for a human to read to one decimal place"
+)]
+impl Window {
+    /// Whether anything ran in it.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.prefill_tokens == 0 && self.decode_tokens == 0 && self.admitted == 0
+    }
+
+    /// Prompt tokens a second.
+    #[must_use]
+    pub fn prefill_tps(&self) -> f64 {
+        per_sec(self.prefill_tokens, self.secs)
+    }
+
+    /// Generated tokens a second, across every sequence.
+    #[must_use]
+    pub fn decode_tps(&self) -> f64 {
+        per_sec(self.decode_tokens, self.secs)
+    }
+
+    /// The share of drafted guesses the target kept; `None` with no drafts.
+    #[must_use]
+    pub fn acceptance(&self) -> Option<f64> {
+        (self.drafted > 0).then(|| self.accepted as f64 / self.drafted as f64)
+    }
+
+    /// Tokens one speculative step yielded: the accepted guesses plus the
+    /// token the verify pass always produces. `None` with no speculative step.
+    #[must_use]
+    pub fn tokens_per_step(&self) -> Option<f64> {
+        (self.spec_steps > 0)
+            .then(|| (self.accepted + self.spec_steps) as f64 / self.spec_steps as f64)
+    }
+
+    /// The share of admitted requests that resumed from a stored prefix;
+    /// `None` when nothing was admitted.
+    #[must_use]
+    pub fn hit_rate(&self) -> Option<f64> {
+        (self.admitted > 0).then(|| self.checkpoint_hits as f64 / self.admitted as f64)
+    }
+}
+
+/// `count` over `secs`, zero over an interval with no length.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a rate printed for a human to read"
+)]
+fn per_sec(count: u64, secs: f64) -> f64 {
+    if secs > 0.0 { count as f64 / secs } else { 0.0 }
+}
+
 /// What the coordinator has done since the process started.
 ///
 /// Shared as an `Arc` between the engine thread that writes it and the handlers
@@ -89,6 +207,9 @@ pub struct SchedulerStats {
     drafted: AtomicU64,
     /// Guesses the target agreed with.
     accepted: AtomicU64,
+    /// Speculative steps taken, one per row: what the accepted guesses are
+    /// averaged over to give the tokens one step yields.
+    spec_steps: AtomicU64,
     batched_rows: AtomicU64,
 }
 
@@ -314,6 +435,21 @@ impl SchedulerStats {
     pub fn speculated(&self, accepted: u32, drafted: u32) {
         self.accepted.fetch_add(u64::from(accepted), ORDER);
         self.drafted.fetch_add(u64::from(drafted), ORDER);
+        self.spec_steps.fetch_add(1, ORDER);
+    }
+
+    /// The counters the periodic log line takes differences of, read at once.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            prefill_tokens: self.prefill_tokens(),
+            decode_tokens: self.decode_tokens(),
+            drafted: self.drafted.load(ORDER),
+            accepted: self.accepted.load(ORDER),
+            spec_steps: self.spec_steps.load(ORDER),
+            admitted: self.admitted(),
+            checkpoint_hits: self.checkpoint_hits(),
+        }
     }
 
     /// Guesses made and guesses kept, in that order.
@@ -476,7 +612,7 @@ impl SchedulerStats {
 
 #[cfg(test)]
 mod tests {
-    use super::SchedulerStats;
+    use super::{SchedulerStats, Snapshot};
 
     #[test]
     fn an_untouched_set_of_counters_renders_every_name_at_zero() {
@@ -527,5 +663,36 @@ mod tests {
         stats.decoded(1);
         assert!((stats.mean_batch_width() - 2.0).abs() < 1e-9);
         assert_eq!(stats.decode_tokens(), 4);
+    }
+
+    /// The periodic line is a difference of two snapshots, so a step taken
+    /// between them has to show up in the window and nothing before it may.
+    #[test]
+    fn a_window_counts_only_what_happened_between_its_two_snapshots() {
+        let stats = SchedulerStats::new();
+        stats.prefilled(100);
+        let earlier = stats.snapshot();
+        stats.prefilled(400);
+        stats.speculated(3, 4);
+        stats.decoded(4);
+        stats.speculated(1, 4);
+        stats.decoded(2);
+        let window = stats.snapshot().since(&earlier, 2.0);
+        assert_eq!(window.prefill_tokens, 400);
+        assert!((window.prefill_tps() - 200.0).abs() < 1e-9);
+        assert!((window.decode_tps() - 3.0).abs() < 1e-9);
+        assert_eq!(window.acceptance(), Some(0.5));
+        // Four accepted over two steps, plus the verify token each step makes.
+        assert_eq!(window.tokens_per_step(), Some(3.0));
+        assert_eq!(window.hit_rate(), None);
+    }
+
+    #[test]
+    fn an_idle_window_is_empty_and_reports_no_ratios() {
+        let window = Snapshot::default().since(&Snapshot::default(), 10.0);
+        assert!(window.is_empty());
+        assert_eq!(window.acceptance(), None);
+        assert_eq!(window.tokens_per_step(), None);
+        assert!((window.prefill_tps() - 0.0).abs() < f64::EPSILON);
     }
 }

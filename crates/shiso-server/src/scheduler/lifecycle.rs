@@ -260,6 +260,9 @@ pub(crate) struct SeqSlot {
     flex: bool,
     /// When the planner last started leaving it out, while it still is.
     paused_since: Option<Instant>,
+    /// Guesses drafted for it, guesses kept, and speculative steps taken:
+    /// the turn's own share of the scheduler's speculation counters.
+    spec: (u64, u64, u64),
 }
 
 /// Everything a slot needs that is not derived from the request.
@@ -345,6 +348,7 @@ impl SeqSlot {
             prefill_timed: (0, Duration::ZERO),
             prefill_decodes: None,
             prefill_mixed: false,
+            spec: (0, 0, 0),
         }
     }
 
@@ -913,7 +917,7 @@ impl SeqSlot {
             reasoning_tokens: self.reasoning,
             time_to_first_token_ms: ttft.map_or(0.0, |at| at * 1000.0),
             tokens_per_second,
-            ..Usage::default()
+            accepted_prediction_tokens: self.spec.1,
         }
     }
 
@@ -946,6 +950,31 @@ impl SeqSlot {
     /// Prompt tokens a resume covered.
     pub(crate) const fn cached_tokens(&self) -> u64 {
         self.cached
+    }
+
+    /// When it was admitted.
+    pub(crate) const fn started_at(&self) -> Instant {
+        self.started_at
+    }
+
+    /// One speculative step for it made `drafted` guesses and kept `accepted`.
+    pub(crate) fn speculated(&mut self, accepted: u32, drafted: u32) {
+        let (d, a, steps) = self.spec;
+        self.spec = (d + u64::from(drafted), a + u64::from(accepted), steps + 1);
+    }
+
+    /// Guesses drafted, guesses kept, and speculative steps, in that order.
+    pub(crate) const fn speculation(&self) -> (u64, u64, u64) {
+        self.spec
+    }
+
+    /// Prompt tokens a second over the prefill calls this process made for it;
+    /// `None` when a resume covered the whole prompt. Mixed with decodes or
+    /// not: this is the rate the turn saw, not the device's solo rate.
+    pub(crate) fn prefill_rate(&self) -> Option<f64> {
+        let (tokens, elapsed) = self.prefill_timed;
+        let secs = elapsed.as_secs_f64();
+        (tokens > 0 && secs > 0.0).then(|| f64::from(tokens) / secs)
     }
 }
 

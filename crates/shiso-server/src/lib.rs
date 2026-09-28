@@ -281,6 +281,7 @@ fn boot_language_model(
     // whatever the backend kept to make those imports fast can go.
     backend.finish_imports();
     let memory = report_memory(&backend);
+    log_kv_capacity(model.as_ref(), args, tier.is_some());
 
     let model_id = args.model_id();
     let scheduler = scheduler_config(args)?;
@@ -361,6 +362,8 @@ fn scheduler_config(args: &ServeArgs) -> anyhow::Result<scheduler::SchedulerConf
     scheduler.max_num_seqs = args.max_num_seqs;
     scheduler.store.pump_bytes = args.kvstore_pump_mb.saturating_mul(1024 * 1024);
     scheduler.store.drain_timeout = std::time::Duration::from_secs(args.kvstore_drain_secs);
+    scheduler.stats_interval = (args.log_stats_interval > 0)
+        .then(|| std::time::Duration::from_secs(args.log_stats_interval));
     // Validated at boot, so the widths are known to be servable here.
     let widths = args.prefill_widths()?;
     scheduler.solo_chunk = widths.solo_chunk;
@@ -399,6 +402,46 @@ fn load_checkpoint(
         "the checkpoint is loaded"
     );
     Ok(loaded)
+}
+
+/// The KV cache's size, one info line at boot: the pool in tokens and bytes,
+/// and how many full-context requests it holds at once.
+///
+/// Nothing for a model with no paged cache.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "sizes and ratios printed for a human to read to two decimal places"
+)]
+fn log_kv_capacity(
+    model: &dyn shiso_engine::ckpt::Checkpointed,
+    args: &ServeArgs,
+    checkpoint_tier: bool,
+) {
+    let Some(cache) = model.kv_cache() else {
+        return;
+    };
+    let stats = cache.stats();
+    let geometry = cache.geometry();
+    let tokens = u64::from(stats.pool_pages) * u64::from(geometry.page_tokens);
+    let pool_bytes = u64::from(stats.pool_pages).saturating_mul(geometry.page_bytes);
+    let ckpt_bytes = u64::from(stats.ckpt_capacity).saturating_mul(geometry.ckpt_bytes);
+    let gib = |bytes: u64| format!("{:.2}", bytes as f64 / f64::from(1u32 << 30));
+    let concurrency = tokens as f64 / f64::from(args.ctx.max(1));
+    tracing::info!(
+        tokens,
+        gib = %gib(pool_bytes),
+        kib_per_token = format_args!(
+            "{:.1}",
+            geometry.page_bytes as f64 / f64::from(geometry.page_tokens.max(1)) / 1024.0
+        ),
+        ctx = args.ctx,
+        max_num_seqs = args.max_num_seqs,
+        max_concurrency = format_args!("{concurrency:.2}x"),
+        checkpoint_slots = stats.ckpt_capacity,
+        checkpoint_gib = %gib(ckpt_bytes),
+        checkpoint_tier,
+        "KV cache"
+    );
 }
 
 /// Records what the device says now in the backend's memory ledger.
