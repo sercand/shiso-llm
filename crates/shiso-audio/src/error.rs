@@ -73,6 +73,12 @@ pub enum AudioError {
         /// The tag as the caller gave it.
         tag: String,
     },
+    /// The request's context cannot be carried: too long, or not encodable.
+    #[error("the context is unusable: {reason}")]
+    BadContext {
+        /// Why.
+        reason: String,
+    },
     /// A lookahead the model was not trained for.
     #[error("lookahead {got} is not supported; this model offers {allowed:?}")]
     BadLookahead {

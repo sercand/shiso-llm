@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod chunks;
+mod context;
 mod decode;
 mod diarizer;
 mod error;
@@ -25,6 +26,7 @@ pub mod transcript;
 mod vocab;
 mod wav;
 
+pub use context::{Context, ContextEncoder, ContextIds};
 pub use decode::{DecodeLimits, decode_audio, sniff_container};
 pub use diarizer::{DiarizationPass, Diarizer};
 pub use error::AudioError;

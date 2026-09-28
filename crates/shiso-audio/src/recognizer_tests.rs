@@ -20,12 +20,14 @@ fn options_carry_the_language_and_lookahead() {
         language: Language::Auto,
         lookahead: 13,
         cuts: None,
+        context: crate::context::ContextIds::default(),
     };
     assert_eq!(auto.language, Language::Auto);
     let tagged = StreamOptions {
         language: Language::Tag("en-US".into()),
         lookahead: 3,
         cuts: Some(vec![480, 3_200]),
+        context: crate::context::ContextIds::default(),
     };
     assert_eq!(tagged.language, Language::Tag("en-US".into()));
     assert_eq!(tagged.cuts.as_deref(), Some(&[480, 3_200][..]));
@@ -108,6 +110,7 @@ fn a_recognizer_without_an_offline_path_refuses_one() {
         language: Language::Auto,
         lookahead: 0,
         cuts: None,
+        context: crate::context::ContextIds::default(),
     };
     let spans = vec![Span {
         start: 0,

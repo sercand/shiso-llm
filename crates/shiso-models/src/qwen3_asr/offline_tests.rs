@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use shiso_audio::chunks::{OfflineRule, Span, plan_offline};
 use shiso_audio::{
-    DecodeLimits, Language, MelFrames, MelFrontend, SpeechRecognizer, StreamOptions, TokenEvent,
-    decode_audio,
+    ContextIds, DecodeLimits, Language, MelFrames, MelFrontend, SpeechRecognizer, StreamOptions,
+    TokenEvent, decode_audio,
 };
 
 use super::{Schedule, check_plan};
@@ -176,6 +176,7 @@ fn offline_text_equals_streaming_text_on_long_dialogue() {
         language: Language::Auto,
         lookahead: 0,
         cuts: None,
+        context: ContextIds::default(),
     };
 
     // The stream, pushed as the server pushes.

@@ -14,7 +14,7 @@ use std::time::Duration;
 use shiso_audio::chunks::{self, OfflineRule, Span};
 use shiso_audio::transcript::{self, SpeakerActivity, TimedPiece};
 use shiso_audio::{
-    AudioError, Detokenizer, Language, MelFrames, MelFrontend, MelSpec, OfflineJob,
+    AudioError, ContextIds, Detokenizer, Language, MelFrames, MelFrontend, MelSpec, OfflineJob,
     RecognizerStream, SpeechRecognizer, StreamOptions, TokenEvent,
 };
 use tokio::sync::mpsc;
@@ -265,6 +265,7 @@ fn start(
             language,
             lookahead: desc.lookahead,
             cuts: None,
+            context: ContextIds::default(),
         })?)
     };
     Ok(Active {
@@ -415,6 +416,7 @@ fn open_offline(desc: &AudioServiceDesc, job: &mut Active) -> Option<Turn> {
             language: language.clone(),
             lookahead: desc.lookahead,
             cuts: None,
+            context: ContextIds::default(),
         },
         spans,
     );
@@ -519,6 +521,7 @@ fn open_at_turns(desc: &AudioServiceDesc, job: &mut Active) -> Option<Turn> {
                     language: language.clone(),
                     lookahead: desc.lookahead,
                     cuts: Some(cuts),
+                    context: ContextIds::default(),
                 })
                 .map(|stream| (stream, secs))
         });

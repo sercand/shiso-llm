@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use shiso_audio::{DecodeLimits, Language, MelFrontend, MelStream, StreamOptions, decode_audio};
+use shiso_audio::{
+    ContextIds, DecodeLimits, Language, MelFrontend, MelStream, StreamOptions, decode_audio,
+};
 use shiso_core::Backend;
 use shiso_models::audio_registry::{RecognizerDesc, open_speech_recognizer};
 
@@ -107,6 +109,7 @@ fn every_export_transcribes_through_the_public_path() {
                     language: Language::Auto,
                     lookahead: 13,
                     cuts: None,
+                    context: ContextIds::default(),
                 })
                 .expect("a stream opens");
             let mut mel = MelStream::new(Arc::clone(&frontend)).expect("streams");
@@ -177,6 +180,7 @@ fn the_first_chunk_leaves_as_soon_as_its_mel_rows_arrive() {
                 language: Language::Auto,
                 lookahead,
                 cuts: None,
+                context: ContextIds::default(),
             })
             .expect("opens");
         stream.push(&mel).expect("pushes");

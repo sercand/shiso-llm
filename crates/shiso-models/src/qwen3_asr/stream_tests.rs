@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use shiso_audio::chunks::silence_cuts;
 use shiso_audio::{
-    DecodeLimits, Detokenizer, Language, MelFrames, MelFrontend, PieceVocab, SpeechRecognizer,
-    StreamOptions, TokenEvent, decode_audio,
+    ContextIds, DecodeLimits, Detokenizer, Language, MelFrames, MelFrontend, PieceVocab,
+    SpeechRecognizer, StreamOptions, TokenEvent, decode_audio,
 };
 
 use super::{Planner, SPACE, chunk_events};
@@ -372,6 +372,7 @@ fn the_whole_stream_matches_one_shot_transcription() {
             language: Language::Auto,
             lookahead: 0,
             cuts: None,
+            context: ContextIds::default(),
         })
         .expect("opens");
     let mut events = Vec::new();

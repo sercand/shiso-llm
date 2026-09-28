@@ -226,6 +226,20 @@ const _: fn(shiso_audio::StreamOptions) -> Option<Vec<u32>> = stream_cuts;
 type ChunksAtCuts = fn(&(dyn shiso_audio::SpeechRecognizer + 'static)) -> bool;
 const _: ChunksAtCuts = <dyn shiso_audio::SpeechRecognizer>::chunks_at_cuts;
 
+/// A stream's options carry the context as the recognizer's own ids, from
+/// the encoder a recognizer with one hands the server.
+const _: fn(
+    shiso_audio::Language,
+    usize,
+    Option<Vec<u32>>,
+    shiso_audio::ContextIds,
+) -> shiso_audio::StreamOptions = |language, lookahead, cuts, context| shiso_audio::StreamOptions {
+    language,
+    lookahead,
+    cuts,
+    context,
+};
+
 /// A stream may name the language it read out of the model's words, and a
 /// chunking stream reports where its chunks ended, which ends its words.
 type StreamLanguage =
