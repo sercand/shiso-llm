@@ -70,6 +70,7 @@ mod lifecycle;
 #[cfg(test)]
 mod media_key_tests;
 pub mod queue;
+mod report;
 mod stats;
 pub mod stop;
 
@@ -107,7 +108,7 @@ pub use config::{
     SchedulerConfig, StorePolicy,
 };
 pub use queue::{EngineGone, EngineHandle, EngineRequest, GenerateRequest, QUEUE_CAPACITY};
-pub use stats::SchedulerStats;
+pub use stats::{SchedulerStats, Snapshot, Window};
 pub use stop::{StopStep, StopWatcher};
 
 /// Sequences one decode step carries, which is the widest batch the engines'
@@ -175,6 +176,15 @@ impl EngineModel {
                     None
                 }
             }
+        }
+    }
+
+    /// What the cache underneath holds, tier on or off; `None` for a model
+    /// that keeps no paged cache.
+    fn kv_stats(&self) -> Option<shiso_kvstore::CacheStats> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Checkpointed(model) => model.kv_cache_stats(),
         }
     }
 }
@@ -257,6 +267,8 @@ struct Coordinator {
     /// bound on how much can be *queued* is still the channel's; this is only
     /// what has come off it.
     held_flex: VecDeque<HeldFlex>,
+    /// The periodic info line.
+    report: report::StatsLog,
 }
 
 /// Starts the engine thread over a loaded model.
@@ -391,6 +403,7 @@ fn start(
         _ => PadTokens::default(),
     };
     let keyed = model.as_model_mut().spec_mut().is_some();
+    let report = report::StatsLog::new(cfg.stats_interval, &stats, cfg.clock.now());
     let coordinator = Coordinator {
         backend,
         model,
@@ -413,6 +426,7 @@ fn start(
         keyed,
         closing: false,
         held_flex: VecDeque::new(),
+        report,
     };
     let join = std::thread::Builder::new()
         .name("shiso-engine".to_owned())
@@ -452,6 +466,10 @@ impl Coordinator {
                 if self.pump_idle(&mut rx) {
                     continue;
                 }
+                // The line for the work that just ended, before the wait that
+                // may last hours: otherwise its rates would be averaged over
+                // the idle time too, whenever the next request woke the loop.
+                self.log_stats(rx.len());
                 // Nothing to run and nothing waiting: block until something
                 // arrives. An idle server burns no CPU, which a poll would not
                 // manage and which matters because this thread is pinned for the
@@ -465,6 +483,9 @@ impl Coordinator {
             self.stats.set_pending(rx.len() + self.held_flex.len());
             self.stats.set_active(self.slots.len());
             self.tick();
+            if self.report.due(self.cfg.clock.now()) {
+                self.log_stats(rx.len());
+            }
         }
 
         self.shutdown();
@@ -475,6 +496,17 @@ impl Coordinator {
             .map_err(EngineFailure::Teardown)?;
         tracing::info!("shutdown complete");
         Ok(())
+    }
+
+    /// Prints the periodic line for the interval that ends now.
+    fn log_stats(&mut self, queued: usize) {
+        let gauges = report::Gauges {
+            running: self.slots.len(),
+            waiting: queued + self.held_flex.len(),
+            kv: self.model.kv_stats(),
+        };
+        let now = self.cfg.clock.now();
+        self.report.emit(&self.stats, now, &gauges);
     }
 
     /// Admits as many waiting requests as there are free slots.
@@ -690,6 +722,15 @@ impl Coordinator {
                 }
             }
         }
+        tracing::info!(
+            id = %slot.id,
+            prompt_tokens = slot.prompt.len(),
+            cached_tokens = slot.cached_tokens(),
+            max_tokens = budget,
+            media = items.len(),
+            running = self.slots.len() + 1,
+            "request admitted"
+        );
         if let Some(refused) = self.slots.admit(slot) {
             // Unreachable while admission only happens with a free slot, and
             // still handled rather than asserted: a sequence whose session was
@@ -1153,6 +1194,7 @@ impl Coordinator {
             let Some(slot) = slots.get_mut(*at) else {
                 continue;
             };
+            slot.speculated(step.accepted, step.drafted);
             let mut events = Vec::new();
             for token in step.produced {
                 if slot.is_done() {
@@ -1219,14 +1261,14 @@ impl Coordinator {
             self.batched_decode_step(&[at]);
             return;
         }
-        let produced = {
+        let (produced, accepted, drafted) = {
             let Some(spec) = self.model.as_model_mut().spec_mut() else {
                 return;
             };
             match spec.speculate(step.session, step.token) {
                 Ok(step) => {
                     self.stats.speculated(step.accepted, step.drafted);
-                    step.produced
+                    (step.produced, step.accepted, step.drafted)
                 }
                 Err(error) => {
                     tracing::error!(%error, "a speculative decode step failed");
@@ -1247,6 +1289,7 @@ impl Coordinator {
         let Some(slot) = slots.get_mut(at) else {
             return;
         };
+        slot.speculated(accepted, drafted);
         let mut events = Vec::new();
         // A step can produce several tokens and the sequence can end inside
         // them: the ones past the end were committed to the session, which is
@@ -1304,6 +1347,7 @@ impl Coordinator {
                     break;
                 }
             }
+            slot.speculated(accepted, drafted);
             send_all(stats, slot, events);
         }
         self.stats.speculated(accepted, drafted);
@@ -1642,13 +1686,7 @@ impl Coordinator {
             }
             self.store_on_retire(&slot, ending.as_ref());
             self.remember_turn(&slot);
-            tracing::debug!(
-                slot = slot.id,
-                emitted = slot.generated().len(),
-                cached = slot.cached_tokens(),
-                ?ending,
-                "a sequence retired"
-            );
+            log_retired(&slot, ending.as_ref(), now);
             self.release(slot.session);
         }
         self.stats.set_active(self.slots.len());
@@ -1778,6 +1816,49 @@ impl Coordinator {
             "the checkpoint queue was drained on the way down"
         );
     }
+}
+
+/// The one info line a finished request ends with.
+fn log_retired(slot: &SeqSlot, ending: Option<&Ending>, now: Instant) {
+    let usage = slot.usage(now);
+    let ending = match ending {
+        Some(Ending::Stopped(reason)) => format!("{reason:?}"),
+        Some(Ending::Cancelled) => "cancelled".to_owned(),
+        Some(Ending::Failed(_)) => "failed".to_owned(),
+        None => "unknown".to_owned(),
+    };
+    let (drafted, accepted, steps) = slot.speculation();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "ratios printed for a human to read to one decimal place"
+    )]
+    let (spec_accept, spec_tokens_per_step) = if steps == 0 {
+        (None, None)
+    } else {
+        (
+            (drafted > 0).then(|| format!("{:.1}%", accepted as f64 / drafted as f64 * 100.0)),
+            Some(format!("{:.2}", (accepted + steps) as f64 / steps as f64)),
+        )
+    };
+    tracing::info!(
+        id = %slot.id,
+        %ending,
+        prompt_tokens = usage.prompt_tokens,
+        cached_tokens = usage.cached_prompt_tokens,
+        generated = usage.completion_tokens,
+        ttft_ms = format_args!("{:.0}", usage.time_to_first_token_ms),
+        prefill_tps = slot
+            .prefill_rate()
+            .map(|rate| tracing::field::display(format!("{rate:.1}"))),
+        decode_tps = format_args!("{:.1}", usage.tokens_per_second),
+        spec_accept = spec_accept.map(tracing::field::display),
+        spec_tokens_per_step = spec_tokens_per_step.map(tracing::field::display),
+        total_ms = format_args!(
+            "{:.0}",
+            now.saturating_duration_since(slot.started_at()).as_secs_f64() * 1e3
+        ),
+        "request finished"
+    );
 }
 
 /// A media prompt's prefix-cache key: its placeholder runs written in the

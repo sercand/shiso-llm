@@ -277,6 +277,9 @@ pub struct SchedulerConfig {
     /// Where finished turns are kept for the renderer to reuse their ids.
     /// `None` keeps nothing.
     pub turn_replay: Option<Arc<TurnReplay>>,
+    /// How often the engine prints its info line of rates and cache use.
+    /// `None` prints none; the binary sets it from `--log-stats-interval`.
+    pub stats_interval: Option<Duration>,
 }
 
 impl SchedulerConfig {
@@ -293,6 +296,7 @@ impl SchedulerConfig {
             store: StorePolicy::new(),
             clock: Arc::new(SystemClock),
             turn_replay: None,
+            stats_interval: None,
         }
     }
 
@@ -327,6 +331,8 @@ impl SchedulerConfig {
             clock: default.clock,
             // Shared with the renderer, so the binary builds it and sets it.
             turn_replay: None,
+            // `--log-stats-interval`, set by the binary.
+            stats_interval: None,
         }
     }
 

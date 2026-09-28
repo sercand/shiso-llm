@@ -59,6 +59,12 @@ struct Active {
     duration: f64,
     /// Whether the stream has been told the input is over.
     flushed: bool,
+    /// The worker's own count of jobs, for pairing a job's start and end lines
+    /// in the log.
+    serial: u64,
+    /// When the job was taken off the queue: the end line's wall time, and
+    /// with it the real-time factor, counts the mel pass too.
+    began: std::time::Instant,
 }
 
 /// A job's recognizer stream, or what opening it waits for.
@@ -89,6 +95,9 @@ struct Offline {
 enum Turn {
     More,
     Finished,
+    /// Ended with a failure sent to the caller. Apart from
+    /// [`Turn::Finished`] only so the end line can say which it was.
+    Failed,
     Dropped,
 }
 
@@ -102,16 +111,21 @@ pub(super) fn run(
     diarizer: &DiarizerQueue,
 ) {
     let mut active: Vec<Active> = Vec::new();
+    let mut serial = 0u64;
     loop {
         if active.is_empty() {
             let Some(queued) = rx.blocking_recv() else {
                 return;
             };
-            admit(desc, diarizer, queued, &mut active);
+            serial += 1;
+            admit(desc, diarizer, queued, serial, &mut active);
         }
         while active.len() < desc.max_streams {
             match rx.try_recv() {
-                Ok(queued) => admit(desc, diarizer, queued, &mut active),
+                Ok(queued) => {
+                    serial += 1;
+                    admit(desc, diarizer, queued, serial, &mut active);
+                }
                 Err(_) => break,
             }
         }
@@ -125,7 +139,8 @@ pub(super) fn run(
             }));
             match turn {
                 Ok(Turn::More) => i += 1,
-                Ok(Turn::Finished | Turn::Dropped) => {
+                Ok(ended @ (Turn::Finished | Turn::Failed | Turn::Dropped)) => {
+                    log_end(&active[i], &ended);
                     active.swap_remove(i);
                 }
                 Err(_panic) => {
@@ -142,6 +157,25 @@ pub(super) fn run(
     }
 }
 
+/// The one line a job ends with.
+fn log_end(job: &Active, ended: &Turn) {
+    let outcome = match ended {
+        Turn::Finished => "done",
+        Turn::Failed => "failed",
+        Turn::Dropped | Turn::More => "dropped",
+    };
+    let wall_secs = job.began.elapsed().as_secs_f64();
+    tracing::info!(
+        job = job.serial,
+        %outcome,
+        audio_secs = format_args!("{:.1}", job.duration),
+        wall_secs = format_args!("{wall_secs:.2}"),
+        // Audio seconds per wall second: above one is faster than real time.
+        speed = format_args!("{:.1}x", job.duration / wall_secs.max(1e-9)),
+        "transcription finished"
+    );
+}
+
 fn internal_failure() -> JobFailure {
     JobFailure {
         message: "the transcription failed inside this server".to_owned(),
@@ -154,6 +188,7 @@ fn admit(
     desc: &AudioServiceDesc,
     diarizer: &DiarizerQueue,
     queued: Queued,
+    serial: u64,
     active: &mut Vec<Active>,
 ) {
     let Queued { job, events } = queued;
@@ -162,7 +197,7 @@ fn admit(
         return;
     }
     let started = catch_unwind(AssertUnwindSafe(|| {
-        start(desc, diarizer, job, events.clone())
+        start(desc, diarizer, job, events.clone(), serial)
     }));
     let Ok(started) = started else {
         tracing::error!("starting a transcription job panicked; it is dropped");
@@ -170,8 +205,23 @@ fn admit(
         return;
     };
     match started {
-        Ok(job) => active.push(job),
+        Ok(job) => {
+            tracing::info!(
+                job = serial,
+                audio_secs = format_args!("{:.1}", job.duration),
+                mode = %if matches!(job.stream, Stream::AwaitingPlan(_)) {
+                    "offline"
+                } else {
+                    "stream"
+                },
+                diarize = job.diarize,
+                running = active.len() + 1,
+                "transcription started"
+            );
+            active.push(job);
+        }
         Err(error) => {
+            tracing::info!(job = serial, %error, "transcription refused");
             // Before the first row runs, a refusal is about the request: a
             // language the model does not know, audio too short to frame.
             // A device error here is still this server's.
@@ -205,6 +255,7 @@ fn start(
     diarizer: &DiarizerQueue,
     job: TranscriptionJob,
     events: mpsc::UnboundedSender<TranscriptEvent>,
+    serial: u64,
 ) -> Result<Active, AudioError> {
     let TranscriptionJob {
         pcm,
@@ -281,6 +332,8 @@ fn start(
         segments_sent: 0,
         duration: pcm.duration_secs(),
         flushed: false,
+        serial,
+        began,
     })
 }
 
@@ -341,7 +394,7 @@ fn advance(desc: &AudioServiceDesc, job: &mut Active, rows_per_turn: usize) -> T
                     message: error.to_string(),
                     caller: false,
                 }));
-                return Turn::Finished;
+                return Turn::Failed;
             }
             Ok(tokens) if !deliver(desc, job, &tokens) => return Turn::Dropped,
             Ok(_) if !job.flushed => return Turn::More,
@@ -375,7 +428,7 @@ fn fail(job: &Active, error: &AudioError, caller: bool) -> Turn {
         message: error.to_string(),
         caller,
     }));
-    Turn::Finished
+    Turn::Failed
 }
 
 /// Plans a waiting offline job over its whole clip - at the diarizer's turns
@@ -583,7 +636,7 @@ fn collect_speakers(
         return None;
     }
     let _gone = job.events.send(TranscriptEvent::Failed(failure));
-    Some(Turn::Finished)
+    Some(Turn::Failed)
 }
 
 /// Sends the text and any newly final segments; `false` when the caller has
