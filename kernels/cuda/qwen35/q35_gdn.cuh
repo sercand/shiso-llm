@@ -127,6 +127,52 @@ extern "C" __global__ void kernel_q35_gdn_conv(
     }
 }
 
+/* The convolution, also writing the window after every row but the last into
+ * a trail of `n_tok - 1` records laid out as the window is. The same body as
+ * `kernel_q35_gdn_conv` with the record written as the window moves. */
+extern "C" __global__ void kernel_q35_gdn_conv_trail(
+        const struct q35_args_gdn_conv args,
+        float *__restrict__ out,
+        float *__restrict__ state,
+        const float *__restrict__ x,
+        const float *__restrict__ w,
+        float *__restrict__ trail) {
+    const unsigned c = blockIdx.x * 256u + threadIdx.x;
+    if (c >= args.channels) {
+        return;
+    }
+    const unsigned hist = args.conv_kernel - 1u;
+    float win[8];
+    for (unsigned i = 0u; i < hist; i++) {
+        win[i] = state[(uint64_t) i * args.channels + c];
+    }
+    const float *wc = w + (uint64_t) c * args.conv_kernel;
+    for (unsigned t = 0u; t < args.n_tok; t++) {
+        const float cur = x[(uint64_t) t * args.channels + c];
+        float acc = 0.0f;
+        for (unsigned k = 0u; k < hist; k++) {
+            acc += wc[k] * win[k];
+        }
+        acc += wc[hist] * cur;
+        out[(uint64_t) t * args.channels + c] = q35_silu(acc);
+        for (unsigned k = 0u; k + 1u < hist; k++) {
+            win[k] = win[k + 1u];
+        }
+        if (hist > 0u) {
+            win[hist - 1u] = cur;
+        }
+        if (t + 1u < args.n_tok) {
+            float *rec = trail + (uint64_t) t * hist * args.channels;
+            for (unsigned i = 0u; i < hist; i++) {
+                rec[(uint64_t) i * args.channels + c] = win[i];
+            }
+        }
+    }
+    for (unsigned i = 0u; i < hist; i++) {
+        state[(uint64_t) i * args.channels + c] = win[i];
+    }
+}
+
 /* In-place L2 norm of one head of one token. Not an RMS norm: no weight, no
  * mean, and the epsilon is added to the raw sum of squares. */
 extern "C" __global__ void kernel_q35_gdn_l2norm(
@@ -219,7 +265,8 @@ template <unsigned SPLIT, unsigned SEG>
 __device__ __forceinline__ void q35_gdn_recurrent_impl(
         const struct q35_args_gdn_recurrent &args,
         float *attn_out, float *state,
-        const float *qkv, const float *decay, const float *beta) {
+        const float *qkv, const float *decay, const float *beta,
+        float *trail) {
     const unsigned head_dim = args.head_dim;
     /* Both the register layout and the rotated sweep assume one quarter of
      * 128. */
@@ -334,6 +381,15 @@ __device__ __forceinline__ void q35_gdn_recurrent_impl(
                 row[r0 + rot] = q35_fma(row[r0 + rot], dec, delta * s_k[qbase + rot]);
             }
         }
+        /* The state after this row, into its record of the trail - every row
+         * but the last, whose state is the one the state buffer keeps. */
+        if (trail != nullptr && t + 1u < args.n_tok) {
+            float *R = trail + (uint64_t) t * args.n_head_v * head_dim * head_dim
+                    + (uint64_t) h * head_dim * head_dim + (uint64_t) j * head_dim + i0;
+            for (unsigned n = 0u; n < seg; n++) {
+                R[n] = row[n];
+            }
+        }
         /* k and q are rewritten by the next token. */
         __syncthreads();
     }
@@ -348,12 +404,29 @@ extern "C" __global__ void __launch_bounds__(LANES) NAME(                     \
         const struct q35_args_gdn_recurrent args,                             \
         float *attn_out, float *state,                                        \
         const float *qkv, const float *decay, const float *beta) {            \
-    q35_gdn_recurrent_impl<SPLIT, SEG>(args, attn_out, state, qkv, decay, beta); \
+    q35_gdn_recurrent_impl<SPLIT, SEG>(args, attn_out, state, qkv, decay, beta, nullptr); \
 }
 
 Q35_GDN_RECURRENT_BODY(kernel_q35_gdn_recurrent_s1, 1u, 128u, 128)
 Q35_GDN_RECURRENT_BODY(kernel_q35_gdn_recurrent_s2, 2u, 64u, 256)
 Q35_GDN_RECURRENT_BODY(kernel_q35_gdn_recurrent_s4, 4u, 32u, 512)
+
+/* The same recurrence, also recording the state after every row but the last
+ * into a trail of `n_tok - 1` records laid out as the state is: what a verify
+ * pass needs to wind a session back to any accepted prefix. One body with the
+ * plain entries, so a recorded pass and a plain one leave the same bits. */
+#define Q35_GDN_RECURRENT_TRAIL_BODY(NAME, SPLIT, SEG, LANES)                 \
+extern "C" __global__ void __launch_bounds__(LANES) NAME(                     \
+        const struct q35_args_gdn_recurrent args,                             \
+        float *attn_out, float *state,                                        \
+        const float *qkv, const float *decay, const float *beta,              \
+        float *trail) {                                                       \
+    q35_gdn_recurrent_impl<SPLIT, SEG>(args, attn_out, state, qkv, decay, beta, trail); \
+}
+
+Q35_GDN_RECURRENT_TRAIL_BODY(kernel_q35_gdn_recurrent_trail_s1, 1u, 128u, 128)
+Q35_GDN_RECURRENT_TRAIL_BODY(kernel_q35_gdn_recurrent_trail_s2, 2u, 64u, 256)
+Q35_GDN_RECURRENT_TRAIL_BODY(kernel_q35_gdn_recurrent_trail_s4, 4u, 32u, 512)
 
 /* The always-fits recurrent variant: quarter 0 of each lane's state row staged
  * in shared memory, quarters 1, 2 and 3 in registers, 128 lanes.

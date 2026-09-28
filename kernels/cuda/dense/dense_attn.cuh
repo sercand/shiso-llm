@@ -41,7 +41,7 @@ __device__ __forceinline__ unsigned dense_attn_lo(unsigned pos, unsigned window)
  * (running max + running denominator) and the per-warp partials are merged at
  * the end by re-referencing every partial against the global max, which is what
  * makes the merge order-independent. */
-extern "C" __global__ void kernel_dense_attn_decode(
+__device__ __forceinline__ void dense_attn_decode_body(
         const struct dense_args_attn args,
         float *__restrict__ out,
         const float *__restrict__ q,
@@ -162,6 +162,22 @@ extern "C" __global__ void kernel_dense_attn_decode(
         out[qbase + i] = num * inv;
     }
 }
+
+/* The decode entry under the three names the engine launches it by: the
+ * Metal set compiles a per-head-width instantiation for 128 and 256, and the
+ * launcher picks the name by width. This body reads the width from its
+ * argument block, so one body serves all three. */
+#define DENSE_ATTN_DECODE_ENTRY(NAME)                                         \
+    extern "C" __global__ void NAME(                                          \
+            const struct dense_args_attn args, float *__restrict__ out,       \
+            const float *__restrict__ q, const __half *__restrict__ k_cache, \
+            const __half *__restrict__ v_cache, const int32_t *__restrict__ pos, \
+            const int32_t *__restrict__ bound, const int32_t *__restrict__ pages) { \
+        dense_attn_decode_body(args, out, q, k_cache, v_cache, pos, bound, pages); \
+    }
+DENSE_ATTN_DECODE_ENTRY(kernel_dense_attn_decode)
+DENSE_ATTN_DECODE_ENTRY(kernel_dense_attn_decode_hd128)
+DENSE_ATTN_DECODE_ENTRY(kernel_dense_attn_decode_hd256)
 
 /* The prefill softmax: DENSE_ATTN_QT queries per threadgroup, DENSE_ATTN_KT
  * keys per tile, one key per lane.

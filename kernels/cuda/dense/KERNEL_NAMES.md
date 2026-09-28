@@ -136,3 +136,46 @@ deliberate: the same buffer as both `out` and `in` is a documented call, and a
 restrict qualifier over an aliased pair is undefined behaviour rather than a
 hint. `kernel_vit_layer_norm` in the `vision` module is the same shape for the
 same reason.
+
+## Added for the speculative 27B path — 20 entries
+
+Twins of the Metal entries of the same names, under the same argument blocks
+and launch geometry; the engine's plans (`shiso_engine::projection::
+exact_affine_plan`, `shiso_engine::block_draft`, `shiso_engine::dense::attn`)
+drive both. Graded by `crates/shiso-cuda/tests/dense_exact_affine.rs` and
+`dense_block_draft.rs`.
+
+```
+kernel_dense_exact_qmv_4_nr1_f32
+kernel_dense_exact_qmv_4_nr2_f32
+kernel_dense_exact_qmv_8_nr1_f32
+kernel_dense_exact_qmv_8_nr2_f32
+kernel_dense_exact_qmm_4_nt1_rt1_f32
+kernel_dense_exact_qmm_4_nt2_rt1_f32
+kernel_dense_exact_qmm_4_nt4_rt1_f32
+kernel_dense_exact_qmm_4_nt1_rt2_f32
+kernel_dense_exact_qmm_4_nt2_rt2_f32
+kernel_dense_exact_qmm_4_nt4_rt2_f32
+kernel_dense_exact_qmm_8_nt1_rt1_f32
+kernel_dense_exact_qmm_8_nt2_rt1_f32
+kernel_dense_exact_qmm_8_nt4_rt1_f32
+kernel_dense_exact_qmm_8_nt1_rt2_f32
+kernel_dense_exact_qmm_8_nt2_rt2_f32
+kernel_dense_exact_qmm_8_nt4_rt2_f32
+kernel_dense_copy_rows_f32
+kernel_dense_dyn_conv_f32
+kernel_dense_attn_decode_hd128
+kernel_dense_attn_decode_hd256
+```
+
+The row-exact pair (`dense_exact_affine.cuh`) keeps the Metal set's property
+rather than its bits: a row's output is the same whatever the row count of the
+call, and the matvec's equals the matrix kernel's one-row answer. The matvec is
+launched as `ceil(N / (warps * 4 * nr))` blocks of `warps * 32` threads and the
+matrix kernel as `(ceil(N / (8 * nt)), ceil(R / (8 * rt)))` blocks of 256, both
+exactly as the Metal plan computes them; parameters after the argument block
+are `w, scales, biases, x, out`.
+
+The two `_hd` decode names are the one decode body, which reads the head width
+from its argument block: the Metal set compiles a per-width instantiation and
+the launcher picks the name by width, so this module answers to all three.

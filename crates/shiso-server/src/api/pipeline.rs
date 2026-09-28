@@ -326,6 +326,12 @@ async fn queue(
                 .tools
                 .iter()
                 .map(|tool| (tool.name.as_str(), &tool.input_schema)),
+        )))
+        .with_tool_scaffold(Arc::new(shiso_parsers::ToolScaffold::from_schemas(
+            request
+                .tools
+                .iter()
+                .map(|tool| (tool.name.as_str(), &tool.input_schema)),
         )));
     let events = engine.generate(generate).await?;
     Ok(Started {

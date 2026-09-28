@@ -522,6 +522,10 @@ pub enum DraftSource {
     Head,
     /// The prompt lookup, which the head's first token agreed with.
     Lookup(ProposalId),
+    /// The caller's own proposal: structure it knew would come next. Not the
+    /// drafter's guess, so it teaches the drafter's acceptance estimate
+    /// nothing.
+    Scaffold,
 }
 
 /// Whether a lookup proposal is worth taking in place of the head's chain.

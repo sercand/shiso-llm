@@ -146,3 +146,17 @@ fn every_gdn_variant_reports_the_block_limit_its_arithmetic_assumes() {
         None,
     );
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn recurrent_trail_records_are_the_per_row_walk() {
+    let Some(gpu) = open() else { return };
+    cases::recurrent_trail_records_are_the_per_row_walk(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn conv_trail_records_are_the_per_row_walk() {
+    let Some(gpu) = open() else { return };
+    cases::conv_trail_records_are_the_per_row_walk(&gpu);
+}

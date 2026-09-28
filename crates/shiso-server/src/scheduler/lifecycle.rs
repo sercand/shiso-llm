@@ -148,6 +148,9 @@ impl TextCursor {
     }
 }
 
+/// Generated ids a tool-call proposal decodes to find the open call.
+const SCAFFOLD_TAIL: usize = 256;
+
 /// Fewest prefilled tokens a prompt needs before its wall time says anything
 /// about the prefill rate.
 const MIN_TIMED_PREFILL: u32 = 512;
@@ -200,6 +203,9 @@ pub(crate) struct SeqSlot {
     next_input: Option<TokenId>,
     /// The ids generated, in order.
     out: Vec<TokenId>,
+    /// The declared tools a speculative step proposes a call's fixed text
+    /// from, `None` for a request with none or a scheme it does not spell.
+    scaffold: Option<Arc<shiso_parsers::ToolScaffold>>,
     /// The end-of-turn marker the turn stopped on, which `out` leaves out.
     end_marker: Option<TokenId>,
     /// How many tokens this turn may still generate.
@@ -327,6 +333,7 @@ impl SeqSlot {
             cold: true,
             next_input: None,
             out: Vec::new(),
+            scaffold: None,
             end_marker: None,
             budget: setup.budget,
             sampling: request.sampling,
@@ -587,6 +594,36 @@ impl SeqSlot {
             key: seed.get(),
             temperature: params.temperature,
         }
+    }
+
+    /// Attaches the declared tools a speculative step proposes from.
+    pub(crate) fn set_scaffold(&mut self, scaffold: Option<Arc<shiso_parsers::ToolScaffold>>) {
+        self.scaffold = scaffold;
+    }
+
+    /// The token ids of the text a tool call must say next, or empty.
+    ///
+    /// Asked only inside a call's tags - where the parser wants the draw
+    /// greedy - because that is the only place the answer is ever not empty,
+    /// and every other step would pay a decode of the tail for nothing. The
+    /// tail is the last [`SCAFFOLD_TAIL`] ids, which reach back past a call's
+    /// opening tag for any call whose values are short enough to have a
+    /// fixed part left to propose.
+    pub(crate) fn scaffold_proposal(&self, vocabulary: Option<&Vocabulary>) -> Vec<TokenId> {
+        let (Some(scaffold), Some(vocabulary)) = (self.scaffold.as_ref(), vocabulary) else {
+            return Vec::new();
+        };
+        if !self.parser.wants_greedy() {
+            return Vec::new();
+        }
+        let from = self.out.len().saturating_sub(SCAFFOLD_TAIL);
+        let Ok(text) = vocabulary.decode(&self.out[from..]) else {
+            return Vec::new();
+        };
+        scaffold
+            .next(&text)
+            .and_then(|next| vocabulary.encode(&next, false).ok())
+            .unwrap_or_default()
     }
 
     /// Whether this sequence draws by the keyed rule.

@@ -503,6 +503,12 @@ pub trait Speculating: Model {
     /// first half of a step whose tokens the caller chooses itself. `hint` is
     /// how the caller will choose them, which a drafter may follow.
     ///
+    /// `proposal` is what the caller already knows comes next - the fixed
+    /// parts of a structure it is writing, say - and may be empty. A family
+    /// verifies it in place of its own drafts wherever the two disagree. It
+    /// changes which tokens are verified and never which are accepted: every
+    /// row is still chosen by the caller's rule.
+    ///
     /// This is what lets a sampled sequence speculate. Its caller draws each
     /// row's token by a rule that depends only on that row's logits and the
     /// token's position, keeps the drafts up to the first it did not draw, and
@@ -520,8 +526,9 @@ pub trait Speculating: Model {
         session: SessionId,
         first: TokenId,
         hint: DraftHint,
+        proposal: &[TokenId],
     ) -> CoreResult<Option<VerifiedBlock>> {
-        let _ = (session, first, hint);
+        let _ = (session, first, hint, proposal);
         Ok(None)
     }
 
