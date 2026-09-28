@@ -48,12 +48,14 @@ sha2 = { workspace = true }
 # sentence stays next to the case that produces it.
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# The byte-level BPE a speech recognizer's prompt context is tokenized
+# with, built from the checkpoint's own pieces and merges.
+tokenizers = { workspace = true }
 
 [dev-dependencies]
 # The device the model tests run on, and the vocabulary the golden prompt is
 # encoded with. Dev-only: this crate names no device API.
 shiso-metal = { workspace = true }
-tokenizers = { workspace = true }
 tempfile = { workspace = true }
 # The fake devices the lifecycle tests drive record their launches behind a lock.
 parking_lot = { workspace = true }

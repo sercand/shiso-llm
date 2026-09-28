@@ -22,6 +22,7 @@
 
 pub mod batch;
 pub mod config;
+mod context;
 pub mod decoder;
 pub mod encoder;
 mod names;
@@ -35,13 +36,13 @@ use std::sync::{Arc, Mutex};
 
 use shiso_audio::chunks::Span;
 use shiso_audio::{
-    AudioError, Language, LogScale, MelSpec, OfflineJob, PieceVocab, RecognizerStream,
-    SpeechRecognizer, StreamOptions,
+    AudioError, ContextEncoder, Language, LogScale, MelSpec, OfflineJob, PieceVocab,
+    RecognizerStream, SpeechRecognizer, StreamOptions,
 };
 use shiso_core::Backend;
 
 use crate::audio_ops::Ops;
-use config::{Qwen3AsrConfig, language_name, languages, locate, read_vocab};
+use config::{Qwen3AsrConfig, language_name, languages, locate, read_merges, read_vocab};
 use weights::{QwenAsrWeights, TextWeights};
 
 /// What every stream of one loaded checkpoint shares.
@@ -71,6 +72,8 @@ pub struct Qwen3Asr {
     /// one, a batch could give other ids than the single path, so the model
     /// has no offline path whatever the batch.
     outside: Option<String>,
+    /// The encoder the system turn's context is tokenized with.
+    context: Arc<context::QwenContextEncoder>,
 }
 
 /// The decoder's linears by their role, embedding (the tied head) first.
@@ -143,6 +146,17 @@ pub fn open(
     let ops = Ops::new(Arc::clone(backend));
     let weights = QwenAsrWeights::load(&ops, &located, &config, &stores)?;
     let vocab = Arc::new(read_vocab(&located, &stores)?);
+    // The ordinary pieces only, the same ids `read_vocab` gave them.
+    let pieces: Vec<String> = (0..config::FIRST_SPECIAL)
+        .map(|id| vocab.piece(id).map(str::to_owned))
+        .collect::<Option<_>>()
+        .ok_or_else(|| AudioError::Checkpoint {
+            what: "the vocabulary is shorter than its specials' first id".into(),
+        })?;
+    let context = Arc::new(context::QwenContextEncoder::new(
+        &pieces,
+        &read_merges(&located, &stores)?,
+    )?);
     // The worker frames the whole clip once; the floor-and-rescale belongs to
     // each chunk's own rows (the reference extracts every chunk's features on
     // their own), so the frames it computes stop at the log and
@@ -165,6 +179,7 @@ pub fn open(
     Ok(Some(Qwen3Asr {
         offline_batch: 0,
         outside,
+        context,
         model: Arc::new(Model {
             ops,
             config,
@@ -222,6 +237,12 @@ impl SpeechRecognizer for Qwen3Asr {
 
     fn is_special(&self, id: u32) -> bool {
         config::is_special(id)
+    }
+
+    fn context_encoder(&self) -> Option<Arc<dyn ContextEncoder>> {
+        let concrete = Arc::clone(&self.context);
+        let encoder: Arc<dyn ContextEncoder> = concrete;
+        Some(encoder)
     }
 
     fn open_stream(

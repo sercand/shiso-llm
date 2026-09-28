@@ -99,8 +99,7 @@ pub struct Conditioning<'a> {
     /// The language forced, by the model's name for it; `None` lets the
     /// model name it.
     pub forced: Option<&'a str>,
-    /// The system turn's text, as ids from the recognizer's context encoder;
-    /// empty for none.
+    /// The system turn's text, as ids ([`super::context`]); empty for none.
     pub context: &'a [u32],
 }
 

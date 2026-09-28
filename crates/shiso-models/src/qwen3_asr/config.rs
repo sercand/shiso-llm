@@ -71,7 +71,7 @@ pub const ASR_TEXT: u32 = 151_704;
 pub const STOP_TOKENS: [u32; 2] = [IM_END, ENDOFTEXT];
 /// The first id past the byte-level alphabet: everything from here up is an
 /// added token whose text is used literally.
-const FIRST_SPECIAL: u32 = ENDOFTEXT;
+pub const FIRST_SPECIAL: u32 = ENDOFTEXT;
 
 /// The languages the model can be told to transcribe as: an ISO 639 code and
 /// the name the model writes after `language ` (the config's
@@ -929,6 +929,43 @@ pub fn read_vocab(located: &Located, stores: &Stores) -> Result<PieceVocab, Audi
                 }
             }
             PieceVocab::from_byte_level(tokens, &specials)
+        }
+    }
+}
+
+/// The checkpoint's BPE merges, `"left right"` in rank order: `merges.txt`
+/// (its `#version` header dropped) for HF and MLX exports,
+/// `tokenizer.ggml.merges` for GGUF.
+///
+/// # Errors
+///
+/// [`AudioError::Checkpoint`] or [`AudioError::Io`] for merges that are
+/// missing or unreadable: a checkpoint that cannot tokenize a context
+/// refuses at load rather than tokenizing one wrong.
+pub fn read_merges(located: &Located, stores: &Stores) -> Result<Vec<String>, AudioError> {
+    match located.flavour {
+        Flavour::Hf | Flavour::Mlx => {
+            let path = located.dir.join("merges.txt");
+            let text = std::fs::read_to_string(&path).map_err(|source| AudioError::Io {
+                what: "reading merges.txt",
+                source,
+            })?;
+            Ok(text
+                .lines()
+                .filter(|line| !line.starts_with("#version") && !line.is_empty())
+                .map(str::to_owned)
+                .collect())
+        }
+        Flavour::Gguf => {
+            let meta = meta_of(stores.text())?;
+            Ok(meta
+                .get_array("tokenizer.ggml.merges")
+                .ok_or_else(|| checkpoint("the text GGUF has no tokenizer.ggml.merges"))?
+                .strings()
+                .map_err(|e| checkpoint(format!("tokenizer.ggml.merges: {e}")))?
+                .into_iter()
+                .map(String::from)
+                .collect())
         }
     }
 }
