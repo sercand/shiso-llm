@@ -3,10 +3,11 @@
 //! Parsing and validation are two steps over plain `(name, bytes)` fields, so
 //! the rules are testable without an HTTP body. Every field this server
 //! cannot honour is refused by name rather than ignored: a caller who sent a
-//! prompt or a temperature expects it to change the answer, and a server
-//! that dropped it would answer a question nobody asked.
+//! temperature expects it to change the answer, and a server that dropped it
+//! would answer a question nobody asked.
 
 use axum::body::Bytes;
+use shiso_audio::Context;
 
 use crate::error::AppError;
 
@@ -69,6 +70,10 @@ pub struct TranscriptionForm {
     pub granularities: Vec<Granularity>,
     /// Whether to answer as a stream of events.
     pub stream: bool,
+    /// What the caller says the audio contains (`prompt`, `keywords`);
+    /// empty for neither. Whether the recognizer can use it is checked
+    /// when it is encoded, not here.
+    pub context: Context,
 }
 
 fn refuse(param: &str, message: impl Into<String>) -> AppError {
@@ -85,10 +90,6 @@ fn text(field: &Field) -> Result<&str, AppError> {
 /// passes.
 fn refuse_unhonoured(field: &Field) -> Result<(), AppError> {
     match field.name.as_str() {
-        "prompt" if !text(field)?.is_empty() => Err(refuse(
-            "prompt",
-            "this model takes no prompt; send the audio alone",
-        )),
         "temperature" => {
             let value = text(field)?;
             let t: f64 = value.parse().map_err(|_| {
@@ -131,6 +132,7 @@ impl TranscriptionForm {
         let mut response_format = ResponseFormat::Json;
         let mut granularities = Vec::new();
         let mut stream = false;
+        let mut context = Context::default();
         for field in fields {
             match field.name.as_str() {
                 "file" => file = Some(field.bytes),
@@ -182,6 +184,17 @@ impl TranscriptionForm {
                         }
                     };
                 }
+                "prompt" => {
+                    let value = text(&field)?;
+                    context.prompt = (!value.is_empty()).then(|| value.to_owned());
+                }
+                "keywords[]" | "keywords" => {
+                    let value = text(&field)?;
+                    if value.is_empty() {
+                        return Err(refuse("keywords", "a keyword is empty"));
+                    }
+                    context.keywords.push(value.to_owned());
+                }
                 _ => refuse_unhonoured(&field)?,
             }
         }
@@ -192,6 +205,7 @@ impl TranscriptionForm {
             response_format,
             granularities,
             stream,
+            context,
         })
     }
 
