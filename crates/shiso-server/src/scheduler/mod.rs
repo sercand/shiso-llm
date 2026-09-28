@@ -613,6 +613,35 @@ impl Coordinator {
         Some(sink)
     }
 
+    /// A session for a new sequence, or `None` after telling its client why
+    /// none could be opened.
+    fn open_session_for(&mut self, sink: &mpsc::Sender<StreamEvent>) -> Option<SessionId> {
+        match self.model.as_model_mut().open_session() {
+            Ok(session) => Some(session),
+            Err(error) => {
+                tracing::warn!(error = %error.chain(), "a session could not be opened");
+                send_event(
+                    sink,
+                    StreamEvent::Failed {
+                        message: error.to_string(),
+                    },
+                );
+                None
+            }
+        }
+    }
+
+    /// The declared tools a sequence of `request` proposes a call's fixed text
+    /// from, or `None` when it declared none.
+    ///
+    /// The scaffold spells the Qwen 3.5 XML body; under any other tool scheme
+    /// it would propose text the model never writes.
+    fn scaffold_for(&self, request: &GenerateRequest) -> Option<Arc<shiso_parsers::ToolScaffold>> {
+        (self.parsers.1 == ToolCallScheme::Qwen35)
+            .then(|| Arc::clone(&request.tool_scaffold))
+            .filter(|scaffold| !scaffold.is_empty())
+    }
+
     /// Gives a request whose stream is answered a session and a slot.
     fn open(&mut self, request: GenerateRequest, sink: mpsc::Sender<StreamEvent>) {
         // What a server without the right tower would refuse is refused before
@@ -631,18 +660,8 @@ impl Coordinator {
         let items = Arc::clone(&request.media);
         let key_digests = Arc::clone(&request.media_digests);
 
-        let session = match self.model.as_model_mut().open_session() {
-            Ok(session) => session,
-            Err(error) => {
-                tracing::warn!(error = %error.chain(), "a session could not be opened");
-                send_event(
-                    &sink,
-                    StreamEvent::Failed {
-                        message: error.to_string(),
-                    },
-                );
-                return;
-            }
+        let Some(session) = self.open_session_for(&sink) else {
+            return;
         };
         self.stats.admit();
 
@@ -670,11 +689,7 @@ impl Coordinator {
         // `Arc<str>`, so the clone is a refcount and not the prompt.
         let prompt_text = Arc::clone(&request.prompt_text);
         let string_params = Arc::clone(&request.string_params);
-        // The scaffold spells the Qwen 3.5 XML body; under any other tool
-        // scheme it would propose text the model never writes.
-        let scaffold = (self.parsers.1 == ToolCallScheme::Qwen35)
-            .then(|| Arc::clone(&request.tool_scaffold))
-            .filter(|scaffold| !scaffold.is_empty());
+        let scaffold = self.scaffold_for(&request);
         let mut slot = SeqSlot::new(
             request,
             SlotSetup {
