@@ -255,6 +255,69 @@ pub struct BlockDrafter {
     rows: u32,
     /// Staging for the int32 rows.
     staging: Vec<u8>,
+    /// Each speculating session's copy-lookup and acceptance state.
+    copies: std::collections::HashMap<SessionId, CopyState>,
+    /// What rounds cost on this device, smoothed.
+    costs: RoundCosts,
+}
+
+/// Where a session's generation began, the copies it has seen fail, and how
+/// well drafting has been paying for it.
+#[derive(Debug)]
+struct CopyState {
+    generated_from: u32,
+    fails: crate::mtp::FailRing,
+    /// Drafts the target kept per drafted round, smoothed.
+    accepted: f64,
+    /// Plain rounds since the last drafted one.
+    idle: u32,
+}
+
+impl CopyState {
+    fn new(generated_from: u32) -> Self {
+        Self {
+            generated_from,
+            fails: crate::mtp::FailRing::new(),
+            // A prior, not a measurement: about what the drafter keeps on
+            // prose, so a session starts drafting and learns from there.
+            accepted: 2.0,
+            idle: 0,
+        }
+    }
+}
+
+/// Weight of the newest round in the smoothed acceptance.
+const ACCEPT_EMA: f64 = 0.3;
+
+/// Weight of the newest round in the smoothed round costs.
+const COST_EMA: f64 = 0.1;
+
+/// How far below a plain round's rate a drafted round's expected rate has to
+/// fall before a session stops drafting.
+const LOSING: f64 = 0.8;
+
+/// Plain rounds after which a session that stopped drafting drafts one round
+/// again, so its acceptance estimate follows the text.
+const PROBE_EVERY: u32 = 8;
+
+/// What a round costs, smoothed, by whether it verified a block or one row.
+#[derive(Debug, Clone, Copy)]
+struct RoundCosts {
+    /// Milliseconds of a drafted round: the draft and a block-wide verify.
+    drafted_ms: f64,
+    /// Milliseconds of a one-row round.
+    plain_ms: f64,
+}
+
+impl Default for RoundCosts {
+    /// Priors from an M1 Max on the 27B: a drafted round about 1.9 plain ones.
+    /// Replaced by measurement within a few rounds.
+    fn default() -> Self {
+        Self {
+            drafted_ms: 175.0,
+            plain_ms: 92.0,
+        }
+    }
 }
 
 impl BlockDrafter {
@@ -343,7 +406,42 @@ impl BlockDrafter {
             geometry,
             rows,
             staging: Vec::new(),
+            copies: std::collections::HashMap::new(),
+            costs: RoundCosts::default(),
         })
+    }
+
+    /// Folds one round's outcome into the session's acceptance and the
+    /// device's round costs, and remembers a copy the target rejected.
+    fn learn(
+        &mut self,
+        session: SessionId,
+        outcome: &crate::mtp::StepOutcome,
+        drafted: usize,
+        took: std::time::Duration,
+    ) {
+        // A sample is held to three times the running estimate: a round that
+        // paid for compiling its pipelines, or waited on the host, is not what
+        // the next round will cost, and one of them would otherwise keep a
+        // session from drafting for dozens of rounds while the average decays.
+        let ms = took.as_secs_f64() * 1e3;
+        if drafted == 0 {
+            let est = self.costs.plain_ms;
+            self.costs.plain_ms += COST_EMA * (ms.min(3.0 * est) - est);
+        } else {
+            let est = self.costs.drafted_ms;
+            self.costs.drafted_ms += COST_EMA * (ms.min(3.0 * est) - est);
+        }
+        let Some(state) = self.copies.get_mut(&session) else {
+            return;
+        };
+        if let Some(id) = outcome.failed_lookup() {
+            state.fails.remember(id);
+        }
+        if drafted > 0 {
+            let kept = f64::from(outcome.logits_row);
+            state.accepted += ACCEPT_EMA * (kept - state.accepted);
+        }
     }
 
     /// Rows of one block.
@@ -843,6 +941,81 @@ impl crate::stack::HybridStack {
         Ok(())
     }
 
+    /// A verbatim continuation of what the session is generating, when the
+    /// text it is writing matches something earlier in the conversation on the
+    /// longest key the lookup tries.
+    ///
+    /// Text that copies - an edited file, a quoted passage - is followed more
+    /// reliably by the history than by any drafter, and a copy costs no draft
+    /// pass. So a match on the longest key replaces the drafter's block for the
+    /// round, and a copy the target rejects is remembered and not proposed from
+    /// the same place again.
+    // None: no earlier text continues what the session is writing, so the
+    // drafter drafts this round.
+    fn copy(
+        &mut self,
+        session: SessionId,
+        first: TokenId,
+        eos: TokenId,
+        budget: u32,
+    ) -> CoreResult<Option<(Vec<TokenId>, crate::mtp::ProposalId)>> {
+        let Self {
+            sessions, block, ..
+        } = self;
+        let Some(drafter) = block.as_mut() else {
+            return Ok(None);
+        };
+        let live = sessions
+            .get(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        let history = live.history();
+        let len = u32::try_from(history.len()).unwrap_or(u32::MAX);
+        let reach = budget.min(drafter.block().saturating_sub(1));
+        let state = drafter
+            .copies
+            .entry(session)
+            .or_insert_with(|| CopyState::new(len));
+        // A handle whose history is shorter than where its generation began
+        // is a new conversation under a reused handle.
+        if state.generated_from > len {
+            *state = CopyState::new(len);
+        }
+        let policy = crate::mtp::NgramPolicy::new(reach, crate::mtp::NGRAM_MAX_MATCH, eos);
+        Ok(
+            crate::mtp::propose(history, first, state.generated_from, &state.fails, policy)
+                .map(|p| (p.tokens().to_vec(), p.id())),
+        )
+    }
+
+    /// Whether a drafted round is expected to commit more tokens a
+    /// millisecond than a plain one, for this session now.
+    ///
+    /// A drafted round commits its kept drafts and one more; a plain round
+    /// commits one. On a device where every width up to a block verifies at
+    /// about the same cost, those are the only two choices worth weighing. A
+    /// session that stopped drafting drafts one round in [`PROBE_EVERY`], so
+    /// text that turns predictable is noticed.
+    fn drafting_pays(&mut self, session: SessionId) -> bool {
+        let Some(drafter) = self.block.as_mut() else {
+            return false;
+        };
+        let costs = drafter.costs;
+        let Some(state) = drafter.copies.get_mut(&session) else {
+            return true;
+        };
+        // Stopped only when drafting is clearly losing: near the break-even
+        // the two cost the same, and a session that stopped on noise gives up
+        // every round the text turns predictable again until the next probe.
+        let pays = (state.accepted + 1.0) / costs.drafted_ms > LOSING / costs.plain_ms;
+        if pays || state.idle >= PROBE_EVERY {
+            state.idle = 0;
+            true
+        } else {
+            state.idle += 1;
+            false
+        }
+    }
+
     /// The drafter's block behind `first`, which sits at `frontier`.
     fn draft_block(
         &mut self,
@@ -941,8 +1114,16 @@ impl crate::stack::HybridStack {
             .get_mut(&session)
             .ok_or(CoreError::UnknownSession(session))?
             .reserve_to(frontier.saturating_add(block), room)?;
+        let clock_start = std::time::Instant::now();
         let clock = std::time::Instant::now();
-        let mut drafts = self.draft_block(session, first, frontier)?;
+        let (mut drafts, source) = match self.copy(session, first, eos, budget)? {
+            Some((tokens, id)) => (tokens, crate::mtp::DraftSource::Lookup(id)),
+            None if self.drafting_pays(session) => (
+                self.draft_block(session, first, frontier)?,
+                crate::mtp::DraftSource::Head,
+            ),
+            None => (Vec::new(), crate::mtp::DraftSource::Head),
+        };
         drafts.truncate(budget as usize);
         let drafted = clock.elapsed();
 
@@ -960,9 +1141,12 @@ impl crate::stack::HybridStack {
             &drafts,
             picks.get(..drafts.len()).unwrap_or(&[]),
             eos,
-            (!drafts.is_empty()).then_some(crate::mtp::DraftSource::Head),
+            (!drafts.is_empty()).then_some(source),
         )?;
         let accepted = outcome.logits_row;
+        if let Some(drafter) = self.block.as_mut() {
+            drafter.learn(session, &outcome, drafts.len(), clock_start.elapsed());
+        }
         if let Some(rewind) = outcome.rollback {
             let live = self
                 .sessions
