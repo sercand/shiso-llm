@@ -649,11 +649,11 @@ pub fn resident(
         k: Some(packed(head, backend, &head.layer.self_attn.k_proj)?),
         v: Some(packed(head, backend, &head.layer.self_attn.v_proj)?),
         output: packed(head, backend, &head.layer.self_attn.o_proj)?,
-        q_norm: norm(head, backend, &head.layer.self_attn.q_norm)?,
+        q_norm: Some(norm(head, backend, &head.layer.self_attn.q_norm)?),
         k_norm: Some(norm(head, backend, &head.layer.self_attn.k_norm)?),
     };
     let ffn = Ffn {
-        gate: packed(head, backend, &head.layer.mlp.gate_proj)?,
+        gate: Some(packed(head, backend, &head.layer.mlp.gate_proj)?),
         up: packed(head, backend, &head.layer.mlp.up_proj)?,
         down: packed(head, backend, &head.layer.mlp.down_proj)?,
     };

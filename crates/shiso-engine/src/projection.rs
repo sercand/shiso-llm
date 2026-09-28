@@ -1139,6 +1139,96 @@ pub const AFFINE_GEMM_TOKENS: u32 = 8;
 /// entries close with.
 const AFFINE_SIMD_WIDTH: u32 = 32;
 
+/// Argument block of the row-exact affine entries (`dense_args_exact_affine`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ExactAffineArgs {
+    in_dim: u32,
+    out_dim: u32,
+    n_rows: u32,
+    pad: u32,
+}
+
+const _: () = assert!(size_of::<ExactAffineArgs>() == 16);
+
+/// Chunks the row-exact entries deal a row's groups to: `DENSE_EXACT_SPLITS`
+/// in `metal/dense/dense_exact_affine.metal`. A constant, not a choice made
+/// here - it is what fixes the bits, and a launch cannot change it.
+const EXACT_AFFINE_SPLITS: u32 = 8;
+
+/// One row-exact affine launch.
+#[derive(Debug, Clone, Copy)]
+struct ExactAffinePlan {
+    entry: &'static str,
+    grid: Extent3,
+    block: Extent3,
+}
+
+/// The row-exact launch for `rows` rows of an `[n, k]` weight at `bits`, or
+/// `None` for a shape the entries do not take (`k % 64 != 0` or `n % 8 != 0`).
+///
+/// One row takes the matvec, which streams weights at matvec speed; more take
+/// the MMA kernel, whose weight loads serve up to sixteen rows. Their bits are
+/// the same (see the file), so the choice here is a speed choice only. Wide
+/// outputs carry two outputs a lane and two simdgroups a threadgroup; narrow
+/// ones one output and eight simdgroups, so more threadgroups share a staging
+/// of the inputs.
+fn exact_affine_plan(bits: u32, rows: u32, n: u32, k: u32) -> Option<ExactAffinePlan> {
+    if !k.is_multiple_of(64) || !n.is_multiple_of(8) || rows == 0 || !matches!(bits, 4 | 8) {
+        return None;
+    }
+    if rows == 1 {
+        let wide = n > 2048;
+        // Measured on an M1 Max: long contractions keep more simdgroups on
+        // one staging of the inputs (4-bit 17408 -> 5120: 308 us at two, 269
+        // at four); shorter ones prefer more threadgroups resident.
+        let (nr, sgs) = match (wide, k >= 4096) {
+            (false, _) => (1, 8),
+            (true, false) => (2, 2),
+            (true, true) => (2, 4),
+        };
+        let entry = match (bits, wide) {
+            (4, false) => "kernel_dense_exact_qmv_4_nr1_f32",
+            (4, true) => "kernel_dense_exact_qmv_4_nr2_f32",
+            (_, false) => "kernel_dense_exact_qmv_8_nr1_f32",
+            (_, true) => "kernel_dense_exact_qmv_8_nr2_f32",
+        };
+        let per_tg = sgs * (32 / EXACT_AFFINE_SPLITS) * nr;
+        return Some(ExactAffinePlan {
+            entry,
+            grid: Extent3::linear(n.div_ceil(per_tg)),
+            block: Extent3::linear(sgs * 32),
+        });
+    }
+    let rt = rows.div_ceil(8).min(2);
+    let nt = if n.is_multiple_of(32) {
+        4
+    } else if n.is_multiple_of(16) {
+        2
+    } else {
+        1
+    };
+    let entry = match (bits, nt, rt) {
+        (4, 1, 1) => "kernel_dense_exact_qmm_4_nt1_rt1_f32",
+        (4, 2, 1) => "kernel_dense_exact_qmm_4_nt2_rt1_f32",
+        (4, 4, 1) => "kernel_dense_exact_qmm_4_nt4_rt1_f32",
+        (4, 1, _) => "kernel_dense_exact_qmm_4_nt1_rt2_f32",
+        (4, 2, _) => "kernel_dense_exact_qmm_4_nt2_rt2_f32",
+        (4, _, _) => "kernel_dense_exact_qmm_4_nt4_rt2_f32",
+        (_, 1, 1) => "kernel_dense_exact_qmm_8_nt1_rt1_f32",
+        (_, 2, 1) => "kernel_dense_exact_qmm_8_nt2_rt1_f32",
+        (_, 4, 1) => "kernel_dense_exact_qmm_8_nt4_rt1_f32",
+        (_, 1, _) => "kernel_dense_exact_qmm_8_nt1_rt2_f32",
+        (_, 2, _) => "kernel_dense_exact_qmm_8_nt2_rt2_f32",
+        (_, _, _) => "kernel_dense_exact_qmm_8_nt4_rt2_f32",
+    };
+    Some(ExactAffinePlan {
+        entry,
+        grid: Extent3::new(n.div_ceil(8 * nt), rows.div_ceil(8 * rt), 1),
+        block: Extent3::linear(EXACT_AFFINE_SPLITS * 32),
+    })
+}
+
 /// The refusal for a packed affine format with no entry point at its width.
 const fn unsupported_bits() -> CoreError {
     CoreError::Unsupported {
@@ -1317,6 +1407,29 @@ fn affine_projection(
             value: "affine weight is missing auxiliary scales/biases".into(),
         })?;
     let bits = weight.dtype.affine_bits().ok_or_else(unsupported_bits)?;
+    if let Some(plan) = exact_affine_plan(bits, n_tok, weight.out_dim, weight.in_dim) {
+        let args = ExactAffineArgs {
+            in_dim: weight.in_dim,
+            out_dim: weight.out_dim,
+            n_rows: n_tok,
+            pad: 0,
+        };
+        return run(
+            backend,
+            KernelRef::new(crate::launch::DENSE, plan.entry),
+            plan.grid,
+            plan.block,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(weight.view()),
+                KernelArg::Buffer(aux.scales.view()),
+                KernelArg::Buffer(aux.biases.view()),
+                KernelArg::Buffer(src),
+                KernelArg::Buffer(dst),
+            ],
+        );
+    }
     let entry = match (bits, n_tok) {
         (4, 1) => "kernel_dense_affine_qmv_4_f32",
         (8, 1) => "kernel_dense_affine_qmv_8_f32",

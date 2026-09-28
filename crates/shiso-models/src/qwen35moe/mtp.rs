@@ -146,12 +146,12 @@ impl MtpHead {
             // The SHARED expert, which is the routed block's dense half and
             // takes the same field the target's `LayerWeights::ffn` does.
             ffn: Ffn {
-                gate: self.packed(
+                gate: Some(self.packed(
                     backend,
                     &format!("{layer}.mlp.shared_expert.gate_proj"),
                     hidden,
                     shape.intermediate,
-                )?,
+                )?),
                 up: self.packed(
                     backend,
                     &format!("{layer}.mlp.shared_expert.up_proj"),
@@ -197,7 +197,7 @@ impl MtpHead {
                 widths.q_heads * widths.head_dim,
                 hidden,
             )?,
-            q_norm: self.norm(backend, &at("q_norm.weight"))?,
+            q_norm: Some(self.norm(backend, &at("q_norm.weight"))?),
             k_norm: Some(self.norm(backend, &at("k_norm.weight"))?),
         })
     }

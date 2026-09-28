@@ -80,6 +80,8 @@ fn shape() -> HybridShape {
         media_positions: MediaPositions::Linear,
         v_norm: false,
         moe: None,
+        ssm: None,
+        no_ffn: Vec::new(),
     }
 }
 
@@ -105,20 +107,20 @@ fn slot(backend: &Arc<dyn Backend>, ordinal: u32) -> LayerWeights {
     LayerWeights {
         input_norm: norm(backend, HIDDEN),
         post_attn_norm: None,
-        ffn_norm: norm(backend, HIDDEN),
+        ffn_norm: Some(norm(backend, HIDDEN)),
         post_ffn_norm: None,
-        ffn: crate::ffn::Ffn {
-            gate: weight(backend, HIDDEN, INTER),
+        ffn: Some(crate::ffn::Ffn {
+            gate: Some(weight(backend, HIDDEN, INTER)),
             up: weight(backend, HIDDEN, INTER),
             down: weight(backend, INTER, HIDDEN),
-        },
+        }),
         moe: None,
         block: Block::Attn(crate::attn::Attn {
             q: weight(backend, HIDDEN, Q_HEADS * HEAD_DIM),
             k: Some(weight(backend, HIDDEN, KV_HEADS * HEAD_DIM)),
             v: Some(weight(backend, HIDDEN, KV_HEADS * HEAD_DIM)),
             output: weight(backend, Q_HEADS * HEAD_DIM, HIDDEN),
-            q_norm: norm(backend, HEAD_DIM),
+            q_norm: Some(norm(backend, HEAD_DIM)),
             k_norm: Some(norm(backend, HEAD_DIM)),
         }),
         ordinal,
@@ -440,11 +442,11 @@ fn fixture_with_draft(count: u32) -> (HybridStack, Vec<SessionId>) {
             k: Some(weight(&backend, HIDDEN, KV_HEADS * HEAD_DIM)),
             v: Some(weight(&backend, HIDDEN, KV_HEADS * HEAD_DIM)),
             output: weight(&backend, Q_HEADS * HEAD_DIM, HIDDEN),
-            q_norm: norm(&backend, HEAD_DIM),
+            q_norm: Some(norm(&backend, HEAD_DIM)),
             k_norm: Some(norm(&backend, HEAD_DIM)),
         },
         ffn: crate::ffn::Ffn {
-            gate: weight(&backend, HIDDEN, INTER),
+            gate: Some(weight(&backend, HIDDEN, INTER)),
             up: weight(&backend, HIDDEN, INTER),
             down: weight(&backend, INTER, HIDDEN),
         },

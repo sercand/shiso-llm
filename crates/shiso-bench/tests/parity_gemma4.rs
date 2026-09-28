@@ -112,6 +112,15 @@ fn vectors_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors")
 }
 
+/// The directory a fixture's prompt paths are relative to.
+///
+/// Every fixture sits one level down, in `references/` or `goldens/`, and names
+/// its prompt `../prompts/<name>`; resolving that against the tree's root
+/// instead points above it.
+fn prompt_base() -> PathBuf {
+    vectors_dir().join("references")
+}
+
 /// The geometry document this family loads against.
 fn config_path() -> PathBuf {
     vectors_dir().join("loader/gemma4-config.json")
@@ -285,7 +294,7 @@ fn leading_token(file: &VecFile) -> TokenId {
 /// then returns the tokens it means.
 fn agreed_tokens(file: &VecFile, vocabulary: &Vocabulary, case: &LocalCase) -> Vec<TokenId> {
     let tokens =
-        case_tokens_with_leading(vocabulary, &vectors_dir(), case, Some(leading_token(file)))
+        case_tokens_with_leading(vocabulary, &prompt_base(), case, Some(leading_token(file)))
             .expect("the prompt encodes");
     assert_eq!(
         u32::try_from(tokens.len()).unwrap_or(u32::MAX),
@@ -394,7 +403,7 @@ fn the_independent_reference_row_replays_at_the_reference_budget() {
     );
     let cases = golden_cases(&file);
     let refs: Vec<&LocalCase> = cases.iter().collect();
-    let digest = prompts_digest(&vectors_dir(), &refs).expect("the prompt files read");
+    let digest = prompts_digest(&prompt_base(), &refs).expect("the prompt files read");
     assert_eq!(
         file.headers.get("prompts_digest").map(String::as_str),
         Some(digest.as_str()),
@@ -785,7 +794,7 @@ fn the_independent_mlx_reference_row_replays_at_the_cross_precision_budget() {
     );
     let cases = golden_cases(&file);
     let refs: Vec<&LocalCase> = cases.iter().collect();
-    let digest = prompts_digest(&vectors_dir(), &refs).expect("the prompt files read");
+    let digest = prompts_digest(&prompt_base(), &refs).expect("the prompt files read");
     assert_eq!(
         file.headers.get("prompts_digest").map(String::as_str),
         Some(digest.as_str()),

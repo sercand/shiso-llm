@@ -54,9 +54,11 @@ impl BlockKernels for DenseKernels {
     /// than at the launch so that the disagreement is a load failure instead of
     /// a residual stream that is short one block's contribution.
     fn validate(&self, shape: &HybridShape) -> CoreResult<()> {
+        // The state-space block's launches are the engine's own and serve any
+        // family; the gated delta-rule's are a family's.
         if shape.count(LayerKind::Gdn) > 0 {
             return Err(CoreError::Unsupported {
-                what: "a recurrent slot on the dense kernel set",
+                what: "a gated delta-rule slot on the dense kernel set",
                 backend: "engine",
             });
         }
@@ -103,6 +105,16 @@ impl BlockKernels for DenseKernels {
                         "attention slot {rank} has {} query heads over {} key/value heads, which \
                          the kernels' `h / (n_head / n_head_kv)` does not group evenly",
                         layer.q_heads, layer.kv_heads
+                    ),
+                });
+            }
+            if !layer.qk_norm && layer.n_rot != 0 {
+                return Err(CoreError::InvalidValue {
+                    key: "dense rotary width",
+                    value: format!(
+                        "attention slot {rank} rotates {} dimensions but normalizes nothing, and \
+                         the set's rotation is fused into its norm",
+                        layer.n_rot
                     ),
                 });
             }
@@ -182,6 +194,8 @@ mod tests {
             media_positions: MediaPositions::Linear,
             v_norm: true,
             moe: None,
+            ssm: None,
+            no_ffn: Vec::new(),
         }
     }
 

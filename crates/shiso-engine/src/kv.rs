@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use crate::shape::{HybridShape, LayerKind};
+use crate::shape::HybridShape;
 use shiso_core::backend::Backend;
 use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc};
 use shiso_core::error::{CoreError, CoreResult};
@@ -132,22 +132,42 @@ impl KvLayout {
         }
     }
 
+    /// Key and value runs for `slots` attention slots of one width: a block
+    /// drafter's layers, which have a pool of their own for the reason
+    /// [`KvLayout::for_one_attn_slot`] gives.
+    pub(crate) fn for_attn_slots(slots: u32, kv_heads: u32, head_dim: u32) -> Self {
+        let one = Self::for_one_attn_slot(kv_heads, head_dim);
+        Self {
+            run_bytes: (0..slots).flat_map(|_| one.run_bytes.clone()).collect(),
+        }
+    }
+
     /// Sum over runs: the cache's `page_bytes`.
     pub(crate) fn page_bytes(&self) -> u64 {
         self.run_bytes.iter().copied().fold(0, u64::saturating_add)
     }
 }
 
-/// Elements in one layer's recurrent state: one square matrix per value head.
+/// Elements in one layer's recurrent state: one square matrix per value head,
+/// or for a state-space stack one `head_dim x state` matrix per head.
 pub(crate) fn state_elements(shape: &HybridShape) -> u64 {
+    if let Some(ssm) = shape.ssm {
+        return u64::from(ssm.heads)
+            .saturating_mul(u64::from(ssm.head_dim))
+            .saturating_mul(u64::from(ssm.state));
+    }
     u64::from(shape.gdn.v_heads)
         .saturating_mul(u64::from(shape.gdn.head_dim))
         .saturating_mul(u64::from(shape.gdn.head_dim))
 }
 
 /// Channels the recurrent projection carries: the key heads, the query heads
-/// and the value heads, one head-width each.
+/// and the value heads, one head-width each - or a state-space block's
+/// convolved channels.
 pub(crate) fn conv_channels(shape: &HybridShape) -> u64 {
+    if let Some(ssm) = shape.ssm {
+        return u64::from(ssm.conv_channels());
+    }
     let qk = u64::from(shape.gdn.qk_heads).saturating_mul(u64::from(shape.gdn.head_dim));
     let v = u64::from(shape.gdn.v_heads).saturating_mul(u64::from(shape.gdn.head_dim));
     qk.saturating_mul(2).saturating_add(v)
@@ -155,7 +175,10 @@ pub(crate) fn conv_channels(shape: &HybridShape) -> u64 {
 
 /// Bytes of one layer's convolution window, as the conv kernel lays it out.
 pub(crate) fn conv_state_bytes(shape: &HybridShape) -> u64 {
-    u64::from(shape.gdn.conv_kernel - 1)
+    let kernel = shape
+        .ssm
+        .map_or(shape.gdn.conv_kernel, |ssm| ssm.conv_kernel);
+    u64::from(kernel.saturating_sub(1))
         .saturating_mul(conv_channels(shape))
         .saturating_mul(STATE_ELEMENT_BYTES)
 }
@@ -171,7 +194,7 @@ pub(crate) fn state_bytes(shape: &HybridShape) -> u64 {
 /// of the pooled-block, tile and score-block sizes the readers assume, so a page
 /// never straddles a block any of them works on.
 pub(crate) fn geometry(shape: &HybridShape) -> CacheGeometry {
-    let gdn_layers = shape.count(LayerKind::Gdn);
+    let gdn_layers = shape.recurrent_count();
     // One page is every attention layer's key and value rows for `PAGE_TOKENS`
     // positions, because a span is only reusable when all of them are present.
     // The total is the sum of the runs the pool allocates rather than a separate
@@ -619,6 +642,8 @@ mod tests {
             media_positions: MediaPositions::Mrope3D,
             v_norm: false,
             moe: None,
+            ssm: None,
+            no_ffn: Vec::new(),
         }
     }
 

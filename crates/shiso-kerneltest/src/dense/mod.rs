@@ -18,7 +18,11 @@
 
 pub mod affine;
 pub mod attn;
+pub mod block_draft;
+pub mod exact_affine;
 pub mod misc;
 pub mod ple;
 pub mod q4_0;
+pub mod routed;
+pub mod ssm;
 pub mod vision;

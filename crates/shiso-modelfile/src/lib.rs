@@ -90,5 +90,5 @@ pub use name_map::{GdnHeads, HeadAxis, HeadPermute, IdentityNames, NameMap, Role
 pub use nvfp4::{Nvfp4Layout, dequant_nvfp4};
 pub use quant::QuantBlock;
 pub use reader::{GgufError, GgufFile, GgufResult, MAX_DIMS, TensorDesc, TensorShape, TensorView};
-pub use safetensors::{AffineTriple, SafetensorsFile};
+pub use safetensors::{AffineTriple, PackedAffine, SafetensorsFile};
 pub use source::TensorSource;

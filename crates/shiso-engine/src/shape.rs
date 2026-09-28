@@ -39,6 +39,11 @@ pub enum LayerKind {
     Gdn,
     /// An attention block, which owns key/value rows in the shared cache.
     Attn,
+    /// A selective state-space block: a causal convolution and a diagonal
+    /// state recurrence, whose memory is a convolution window and one state
+    /// matrix per head that belong to one session - a recurrent slot, as
+    /// [`LayerKind::Gdn`] is, with its geometry in [`HybridShape::ssm`].
+    Ssm,
 }
 
 /// Where an attention slot's keys and values live.
@@ -104,6 +109,11 @@ pub struct AttnLayer {
     pub kv: KvSource,
     /// The softmax scale this slot applies.
     pub scale: AttnScale,
+    /// Whether the query and key heads are RMS-normalized before the rotation.
+    ///
+    /// `false` for a family whose slots take the projections as they are; such
+    /// a slot rotates nothing either, which [`Self::n_rot`] of zero states.
+    pub qk_norm: bool,
 }
 
 impl AttnLayer {
@@ -131,6 +141,16 @@ impl AttnLayer {
             window: None,
             kv: KvSource::Own,
             scale: AttnScale::InvSqrtHeadDim,
+            qk_norm: true,
+        }
+    }
+
+    /// The same slot, with neither a query nor a key norm.
+    #[must_use]
+    pub const fn without_qk_norm(self) -> Self {
+        Self {
+            qk_norm: false,
+            ..self
         }
     }
 
@@ -172,6 +192,8 @@ pub enum Activation {
     SwiGlu,
     /// `gelu_tanh(gate) * up`.
     GeGluTanh,
+    /// `max(up, 0)^2`, with no gate projection at all.
+    Relu2,
 }
 
 /// Which norms a layer slot carries.
@@ -235,6 +257,47 @@ impl GdnShape {
             head_dim,
             conv_kernel,
         }
+    }
+}
+
+/// A selective state-space block's widths.
+///
+/// `heads * head_dim` channels are mixed; `groups` input and output projections
+/// of `state` values each are shared by `heads / groups` consecutive heads; the
+/// convolution runs over the mixed channels and both projections together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsmShape {
+    /// State heads, one `head_dim x state` state matrix each.
+    pub heads: u32,
+    /// Channels one head mixes.
+    pub head_dim: u32,
+    /// Values one head's state carries per channel.
+    pub state: u32,
+    /// Groups the heads share input and output projections in.
+    pub groups: u32,
+    /// Width of the short causal convolution.
+    pub conv_kernel: u32,
+}
+
+impl SsmShape {
+    /// Channels the heads mix: `heads * head_dim`.
+    #[must_use]
+    pub const fn inner(&self) -> u32 {
+        self.heads * self.head_dim
+    }
+
+    /// Channels the convolution runs over: the mixed ones and both
+    /// projections, `inner + 2 * groups * state`.
+    #[must_use]
+    pub const fn conv_channels(&self) -> u32 {
+        self.inner() + 2 * self.groups * self.state
+    }
+
+    /// Width of the block's input projection: gate, convolved channels and
+    /// one step size per head.
+    #[must_use]
+    pub const fn in_width(&self) -> u32 {
+        self.inner() + self.conv_channels() + self.heads
     }
 }
 
@@ -388,6 +451,20 @@ pub struct HybridShape {
     /// carried before a routed hybrid arrived. See the type's own note for why
     /// an `Option` here beat a third shape.
     pub moe: Option<MoeShape>,
+    /// State-space block geometry, for a stack with [`LayerKind::Ssm`] slots.
+    ///
+    /// A stack's recurrent slots are one kind: gated delta-rule ([`Self::gdn`])
+    /// or state-space (this), never both, which [`Self::validate`] checks.
+    pub ssm: Option<SsmShape>,
+    /// Slots that carry no feed-forward half, in ascending order.
+    ///
+    /// Empty for every family whose slots all have one. A checkpoint whose
+    /// residual blocks alternate a mixing block and a feed-forward, with some
+    /// mixing blocks followed directly by another, maps the pair to one slot
+    /// and the unpaired mixing block to a slot listed here: two residual
+    /// blocks in a row are exactly what one slot computes, so the pairing
+    /// changes no arithmetic and saves a close per pair.
+    pub no_ffn: Vec<LayerIdx>,
 }
 
 impl HybridShape {
@@ -411,6 +488,40 @@ impl HybridShape {
     pub fn count(&self, kind: LayerKind) -> u32 {
         let n = self.layers.iter().filter(|slot| **slot == kind).count();
         u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// How many slots keep a session's recurrent state: the gated delta-rule
+    /// and the state-space ones.
+    #[must_use]
+    pub fn recurrent_count(&self) -> u32 {
+        self.count(LayerKind::Gdn)
+            .saturating_add(self.count(LayerKind::Ssm))
+    }
+
+    /// Refuses a [`Self::no_ffn`] list that is not ascending slots of this
+    /// stack.
+    fn validate_no_ffn(&self) -> CoreResult<()> {
+        let mut last = None;
+        for il in &self.no_ffn {
+            if il.get() >= self.n_layers() || last.is_some_and(|prev: u32| prev >= il.get()) {
+                return Err(CoreError::InvalidValue {
+                    key: "slots without a feed-forward",
+                    value: format!(
+                        "{:?} is not an ascending list of slots below {}",
+                        self.no_ffn,
+                        self.n_layers()
+                    ),
+                });
+            }
+            last = Some(il.get());
+        }
+        Ok(())
+    }
+
+    /// Whether slot `il` has a feed-forward half.
+    #[must_use]
+    pub fn has_ffn(&self, il: LayerIdx) -> bool {
+        !self.no_ffn.contains(&il)
     }
 
     /// Rank of slot `il` among the attention slots, or `None` when it holds a
@@ -529,6 +640,22 @@ impl HybridShape {
     /// [`CoreError::InvalidValue`] for a bad owner, a rotary width the head
     /// cannot carry, or a router wider than the chosen-expert arrays.
     pub fn validate(&self) -> CoreResult<()> {
+        // One recurrent kind a stack: the session's recurrent records are one
+        // size, and each kind's state is its own size.
+        if self.count(LayerKind::Gdn) > 0 && self.count(LayerKind::Ssm) > 0 {
+            return Err(CoreError::Unsupported {
+                what: "gated delta-rule and state-space slots in one stack",
+                backend: "engine",
+            });
+        }
+        self.validate_no_ffn()?;
+        if self.count(LayerKind::Ssm) > 0 && self.ssm.is_none() {
+            return Err(CoreError::ShapeMismatch {
+                field: "state-space geometry",
+                expected: 1,
+                got: 0,
+            });
+        }
         // Before the attention walk, because it is the cheapest of the six and
         // the one whose failure is widest: a token routed past the expert list
         // reads a matrix that is not an expert at all.
@@ -653,6 +780,8 @@ mod tests {
             media_positions: MediaPositions::Linear,
             v_norm: true,
             moe: None,
+            ssm: None,
+            no_ffn: Vec::new(),
         }
     }
 

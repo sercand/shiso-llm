@@ -35,6 +35,7 @@ no Python runtime.
 | Qwen 3.6 MoE | Qwen3.6-35B-A3B | GGUF, NVFP4, Splash |
 | Gemma 4 | Gemma 4 E4B | GGUF, MLX |
 | Qwen4Exp (MoE) | - | EXL3 |
+| Nemotron-H (hybrid state-space MoE) | Nemotron 3.5 Lightning 30B-A3B | MLX 4-bit |
 
 Vision towers are supported for Qwen 3.5, Qwen 3.6 MoE and Gemma 4.
 

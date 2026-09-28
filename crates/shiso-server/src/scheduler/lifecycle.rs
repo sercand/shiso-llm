@@ -167,6 +167,16 @@ enum PathMedia {
     Keyed,
 }
 
+/// How a sequence draws its tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawRule {
+    /// The stream sampler: each stochastic draw advances the seed.
+    Stream,
+    /// The keyed rule: a function of the row, the seed and the position,
+    /// which a speculating server uses so a sampled draft verifies by equality.
+    Keyed,
+}
+
 /// One resident sequence.
 #[derive(Debug)]
 pub(crate) struct SeqSlot {
@@ -199,6 +209,8 @@ pub(crate) struct SeqSlot {
     /// The PRNG state, which is per sequence so that two turns in one batch do
     /// not draw from each other's stream.
     seed: Seed,
+    /// How its tokens are drawn.
+    rule: DrawRule,
     /// The stop-sequence hold-back.
     watcher: StopWatcher,
     /// How much generated text has been sent.
@@ -265,6 +277,9 @@ pub(crate) struct SlotSetup {
     pub(crate) deadline: Option<Instant>,
     /// Tokens it may generate, already clamped against the context.
     pub(crate) budget: u32,
+    /// Whether its tokens are drawn by the keyed rule, which a speculating
+    /// server uses for every sequence so a sampled one can verify drafts.
+    pub(crate) keyed: bool,
 }
 
 impl SeqSlot {
@@ -313,6 +328,11 @@ impl SeqSlot {
             budget: setup.budget,
             sampling: request.sampling,
             seed: request.seed,
+            rule: if setup.keyed {
+                DrawRule::Keyed
+            } else {
+                DrawRule::Stream
+            },
             watcher: StopWatcher::new(&request.stop),
             text: TextCursor::default(),
             trailing: Vec::new(),
@@ -531,6 +551,43 @@ impl SeqSlot {
             params.temperature = 0.0;
         }
         (params, &mut self.seed)
+    }
+
+    /// The token this sequence draws from one row of logits for its next
+    /// position.
+    ///
+    /// Under the keyed rule the draw is a function of the row, the sequence's
+    /// seed and the position alone - the same token whether the row came from
+    /// a one-token step or from a speculative verify pass - and the seed is
+    /// never advanced. Otherwise it is the stream sampler's next draw.
+    pub(crate) fn choose(&mut self, scores: &[f32]) -> TokenId {
+        let position = self.frontier_len();
+        let keyed = self.rule == DrawRule::Keyed;
+        let (params, seed) = self.draw();
+        if keyed {
+            shiso_engine::keyed_sample(scores, &params, seed.get(), position)
+        } else {
+            shiso_engine::sample_logits(scores, &params, seed)
+        }
+    }
+
+    /// How this sequence will choose its next tokens, for a drafter to follow:
+    /// its key and its current temperature under the keyed rule, greedy
+    /// otherwise.
+    pub(crate) fn draft_hint(&mut self) -> shiso_core::model::DraftHint {
+        if self.rule != DrawRule::Keyed {
+            return shiso_core::model::DraftHint::greedy();
+        }
+        let (params, seed) = self.draw();
+        shiso_core::model::DraftHint {
+            key: seed.get(),
+            temperature: params.temperature,
+        }
+    }
+
+    /// Whether this sequence draws by the keyed rule.
+    pub(crate) fn is_keyed(&self) -> bool {
+        self.rule == DrawRule::Keyed
     }
 
     /// The half-open range of the prompt this quantum covers.
@@ -940,6 +997,7 @@ mod tests {
                 started_at: Instant::now(),
                 deadline: None,
                 budget,
+                keyed: false,
             },
             None,
             parser,

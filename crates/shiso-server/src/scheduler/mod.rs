@@ -79,8 +79,8 @@ use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use shiso_core::{
-    Backend, CoreError, DecodeStep, MediaDigest, MediaKey, MediaSpan, Model, PadTokens,
-    SamplingParams, Seed, SessionId, StopTokens, TokenId, VisionGrid, VisionPrefill,
+    Backend, CoreError, DecodeStep, MediaDigest, MediaKey, MediaSpan, Model, PadTokens, SessionId,
+    StopTokens, TokenId, VisionGrid, VisionPrefill,
 };
 use shiso_engine::Reason;
 use shiso_engine::ckpt::Checkpointed;
@@ -247,6 +247,9 @@ struct Coordinator {
     decode_steps: u64,
     /// Whether the queue has closed and the loop is draining.
     closing: bool,
+    /// Whether every sequence draws by the keyed rule: true on a server whose
+    /// model speculates, so sampled sequences can verify drafts by equality.
+    keyed: bool,
     /// Flex requests waiting for standard work to drain, oldest first.
     ///
     /// Unbounded, by decision: a flex caller asked to wait rather than to be
@@ -387,6 +390,7 @@ fn start(
         (Some(tower), Some(vocabulary)) => vocabulary.media_ids(&tower.placement()),
         _ => PadTokens::default(),
     };
+    let keyed = model.as_model_mut().spec_mut().is_some();
     let coordinator = Coordinator {
         backend,
         model,
@@ -406,6 +410,7 @@ fn start(
         scores: vec![0f32; vocab],
         next_id: 1,
         decode_steps: 0,
+        keyed,
         closing: false,
         held_flex: VecDeque::new(),
     };
@@ -642,6 +647,7 @@ impl Coordinator {
                 started_at: now,
                 deadline: self.cfg.request_timeout.map(|window| now + window),
                 budget,
+                keyed: self.keyed,
             },
             None,
             // The rendered prompt and not just the schemes: a template can
@@ -1074,7 +1080,15 @@ impl Coordinator {
         // speculative step for all of them, which a family that can verify
         // several sequences in one pass does in one pass over its weights.
         if rows.len() > 1 && rows.iter().all(|at| self.speculative(*at)) {
-            self.speculative_batch_step(rows);
+            // A sampled member is settled by the two-phase step, one session
+            // at a time; an all-greedy batch keeps the batched step.
+            if rows.iter().all(|at| self.greedy(*at)) {
+                self.speculative_batch_step(rows);
+            } else {
+                for at in rows {
+                    self.speculative_step(*at);
+                }
+            }
             return;
         }
         self.batched_decode_step(rows);
@@ -1150,21 +1164,61 @@ impl Coordinator {
         }
     }
 
-    /// Whether this row's next step can be speculative.
+    /// Whether this row's next step can be speculative: a greedy sequence on
+    /// a model that drafts, or a sampled one whose tokens are keyed and so can
+    /// be checked against a draft by equality.
     fn speculative(&mut self, at: usize) -> bool {
-        let greedy = self
+        let eligible = self
             .slots
             .slots()
             .get(at)
-            .is_some_and(|slot| slot.sampling().is_greedy());
-        greedy && self.model.as_model_mut().spec_mut().is_some()
+            .is_some_and(|slot| slot.sampling().is_greedy() || slot.is_keyed());
+        eligible && self.model.as_model_mut().spec_mut().is_some()
+    }
+
+    /// Whether this row samples greedily.
+    fn greedy(&self, at: usize) -> bool {
+        self.slots
+            .slots()
+            .get(at)
+            .is_some_and(|slot| slot.sampling().is_greedy())
     }
 
     /// One speculative step over one sequence.
+    ///
+    /// The two-phase step where the model has one: the drafted block and the
+    /// target's rows come back, and the sequence itself chooses each token -
+    /// by its own rule at that position, tool-call tags and all - keeping the
+    /// drafts up to the first it did not choose. The greedy step otherwise,
+    /// and a plain step for a sampled sequence on a model with neither.
     fn speculative_step(&mut self, at: usize) {
         let Some(step) = self.slots.slots().get(at).and_then(SeqSlot::decode_step) else {
             return;
         };
+        let hint = match self.slots.get_mut(at) {
+            Some(slot) => slot.draft_hint(),
+            None => return,
+        };
+        let verified = match self.model.as_model_mut().spec_mut() {
+            Some(spec) => spec.verify_block(step.session, step.token, hint),
+            None => return,
+        };
+        match verified {
+            Ok(Some(block)) => {
+                self.settle_two_phase(at, step, block);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, "a speculative verify failed");
+                self.fail_slot(at, &error, "a speculative verify failed");
+                return;
+            }
+        }
+        if !self.greedy(at) {
+            self.batched_decode_step(&[at]);
+            return;
+        }
         let produced = {
             let Some(spec) = self.model.as_model_mut().spec_mut() else {
                 return;
@@ -1205,6 +1259,63 @@ impl Coordinator {
             events.extend(slot.accept(token, vocabulary.as_deref(), *stop, now));
         }
         send_all(stats, slot, events);
+    }
+
+    /// Chooses the tokens of a verified block for the sequence at `at` and
+    /// settles the model on how many drafts it kept.
+    fn settle_two_phase(
+        &mut self,
+        at: usize,
+        step: DecodeStep,
+        block: shiso_core::model::VerifiedBlock,
+    ) {
+        let now = self.cfg.clock.now();
+        let drafted = u32::try_from(block.drafts.len()).unwrap_or(u32::MAX);
+        let mut accepted = 0u32;
+        let mut produced = 0usize;
+        {
+            let Self {
+                slots,
+                vocabulary,
+                stats,
+                stop,
+                ..
+            } = self;
+            let Some(slot) = slots.get_mut(at) else {
+                return;
+            };
+            let mut events = Vec::new();
+            for (i, draft) in block
+                .drafts
+                .iter()
+                .map(Some)
+                .chain(std::iter::once(None))
+                .enumerate()
+            {
+                if slot.is_done() {
+                    break;
+                }
+                let token = slot.choose(block.row(i));
+                events.extend(slot.accept(token, vocabulary.as_deref(), *stop, now));
+                produced += 1;
+                if draft == Some(&token) {
+                    accepted += 1;
+                } else {
+                    break;
+                }
+            }
+            send_all(stats, slot, events);
+        }
+        self.stats.speculated(accepted, drafted);
+        self.stats.decoded(produced);
+        let settled = match self.model.as_model_mut().spec_mut() {
+            Some(spec) => spec.settle_block(step.session, block, accepted),
+            None => return,
+        };
+        if let Err(error) = settled {
+            tracing::error!(%error, "a speculative settle failed");
+            self.fail_slot(at, &error, "a speculative settle failed");
+        }
     }
 
     /// One batched decode step over every ready sequence.
@@ -1259,8 +1370,7 @@ impl Coordinator {
                 let Some(slot) = slots.get_mut(entry.slot) else {
                     continue;
                 };
-                let (params, seed) = slot.draw();
-                sampled.push((entry.slot, sample(row, scores, &params, seed)));
+                sampled.push((entry.slot, slot.choose(fill(row, scores))));
             }
             sampled
         };
@@ -1752,18 +1862,15 @@ fn start_decoding(
     stats: &SchedulerStats,
     slot: &mut SeqSlot,
 ) {
-    let token = {
-        let (params, seed) = slot.draw();
-        sample(row, scores, &params, seed)
-    };
+    let token = slot.choose(fill(row, scores));
     let events = slot.accept(token, vocabulary, stop, now);
     send_all(stats, slot, events);
 }
 
-/// Reads one logits row out of its bytes and picks a token from it.
-fn sample(row: &[u8], scores: &mut [f32], params: &SamplingParams, seed: &mut Seed) -> TokenId {
+/// Reads one logits row out of its bytes into `scores`.
+fn fill<'a>(row: &[u8], scores: &'a mut [f32]) -> &'a [f32] {
     for (slot, bytes) in scores.iter_mut().zip(row.as_chunks::<4>().0) {
         *slot = f32::from_le_bytes(*bytes);
     }
-    shiso_engine::sample_logits(scores, params, seed)
+    scores
 }

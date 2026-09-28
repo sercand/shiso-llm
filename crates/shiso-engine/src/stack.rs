@@ -50,7 +50,7 @@ use crate::options::EngineOptions;
 use crate::ple_rows::{PleRows, issue_rows};
 use crate::rows::RowPages;
 use crate::sessions::Session;
-use crate::shape::{HybridShape, LayerKind, NormScheme};
+use crate::shape::{HybridShape, NormScheme};
 use crate::vision::{MediaChunk, Streams, VisionPrefill, Walk};
 
 /// Rows one forward pass may carry.
@@ -173,6 +173,12 @@ pub struct HybridStack {
     /// `None` is the common case and is what makes a step plain: a build with
     /// no head decodes one token a step exactly as it always did.
     pub(crate) draft: Option<crate::draft::DraftHead>,
+    /// The block drafter, once a loader has bound one.
+    ///
+    /// Exclusive with [`HybridStack::draft`]: a stack drafts one way.
+    pub(crate) block: Option<crate::block_draft::BlockDrafter>,
+    /// The block verified and not yet settled, when there is one.
+    pub(crate) pending: Option<PendingBlock>,
     pub(crate) staging: Staging,
     /// The disk tier, once a caller has turned it on.
     ///
@@ -218,6 +224,23 @@ pub struct HybridStack {
     decode_residual: Option<ResidualIndex>,
 }
 
+/// A verified block waiting to be told how much of it the caller kept.
+#[derive(Debug)]
+pub(crate) struct PendingBlock {
+    /// Whose round it is.
+    pub(crate) session: SessionId,
+    /// The token the round committed at its frontier.
+    pub(crate) first: TokenId,
+    /// The session's frontier before the round.
+    pub(crate) frontier: u32,
+    /// The drafts the round verified.
+    pub(crate) drafts: Vec<TokenId>,
+    /// Where they came from.
+    pub(crate) source: crate::mtp::DraftSource,
+    /// When the round began, for its cost.
+    pub(crate) started: Instant,
+}
+
 /// What a captured decode step belongs to.
 ///
 /// See [`HybridStack::graph_slots`] for why the session list is in here.
@@ -242,6 +265,8 @@ impl std::fmt::Debug for HybridStack {
             .field("order", &self.order)
             .field("counter", &self.counter)
             .field("draft", &self.draft.is_some())
+            .field("block", &self.block.is_some())
+            .field("pending", &self.pending.as_ref().map(|p| p.session))
             .field("staging", &self.staging)
             .field("ckpt", &self.ckpt)
             .field("clock", &self.clock)
@@ -316,7 +341,7 @@ fn pool_cost(
         0
     };
     let records = u64::from(opts.spec.rollback_slots());
-    let recurrent = u64::from(shape.count(LayerKind::Gdn))
+    let recurrent = u64::from(shape.recurrent_count())
         .saturating_mul(kv::conv_state_bytes(shape).saturating_add(kv::state_bytes(shape)));
     crate::options::PoolCost {
         page_bytes: layout.page_bytes().saturating_add(head),
@@ -407,7 +432,7 @@ impl HybridStack {
         }
         let geometry = Geometry::new(&shape, embed)?;
         validate_ple(&geometry, ple.as_ref())?;
-        let recurrent_slots = usize::try_from(shape.count(LayerKind::Gdn)).unwrap_or(0);
+        let recurrent_slots = usize::try_from(shape.recurrent_count()).unwrap_or(0);
         let scratch = Scratch::new(backend, &geometry, MAX_PREFILL_CHUNK, MAX_DECODE_BATCH)?;
         let rows = RowPages::new(backend, opts.ctx, MAX_DECODE_BATCH)?;
         // The pool after the scratch, so that a pool sized to the device is
@@ -454,6 +479,8 @@ impl HybridStack {
             order: Vec::new(),
             counter: NonZeroU64::MIN,
             draft: None,
+            block: None,
+            pending: None,
             staging: Staging::default(),
             ckpt: None,
             clock: Instant::now(),
@@ -533,6 +560,7 @@ impl HybridStack {
             resident,
             sessions,
             staging,
+            block,
             ..
         } = self;
         let resident = resident.as_ref().ok_or(CoreError::Unsupported {
@@ -665,8 +693,19 @@ impl HybridStack {
             resident.ple.as_ref(),
             n_tok,
             media,
-            trail,
+            layers::PassExtras {
+                trail,
+                taps: block.as_ref().map(crate::block_draft::BlockDrafter::sink),
+            },
         )?;
+        // A plain pass's rows are committed as they run, so they become the
+        // drafter's context now. A verify pass's are not: which of them stay
+        // is decided after it, and the drafter absorbs exactly those.
+        if !trail.records()
+            && let Some(drafter) = block.as_mut()
+        {
+            drafter.absorb(backend, live.kv().view(), 0, n_tok, start)?;
+        }
         live.push_history(tokens);
         // Recorded on the session and not on the stack: the row a draft head
         // starts from is this session's last, and a stack-wide latch would name
@@ -782,6 +821,10 @@ impl HybridStack {
         self.decode_residual = None;
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a batched pass coordinates the advance, the row uploads, the page-table pack and the captured forward, in that order"
+    )]
     fn run_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<()> {
         let n_tok = u32::try_from(steps.len()).unwrap_or(u32::MAX);
         let capacity = self.opts.ctx;
@@ -790,6 +833,10 @@ impl HybridStack {
         // to, allocated on first sight of a shape and reused forever after.
         let slot = self.decode_slot(n_tok, steps);
         let now = self.now();
+        let taps_sink = self
+            .block
+            .as_ref()
+            .map(crate::block_draft::BlockDrafter::sink);
         let Self {
             backend,
             geometry,
@@ -875,7 +922,10 @@ impl HybridStack {
                 // along one sequence, and these rows are not one sequence. The
                 // recurrent family refuses the combination; nothing here builds
                 // it.
-                Trail::None,
+                layers::PassExtras {
+                    trail: Trail::None,
+                    taps: taps_sink,
+                },
             )?);
             Ok(())
         })?;
@@ -917,6 +967,32 @@ impl HybridStack {
         Ok(())
     }
 
+    /// Hands a block drafter each member's row of the batch that just ran.
+    ///
+    /// Every row of a plain decode step is committed, and is its session's
+    /// context from now on - at that session's own position, which the advance
+    /// just moved one past, through that session's own page table.
+    fn absorb_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<()> {
+        let Self {
+            backend,
+            sessions,
+            block,
+            ..
+        } = self;
+        let Some(drafter) = block.as_mut() else {
+            return Ok(());
+        };
+        for (row, step) in steps.iter().enumerate() {
+            let live = sessions
+                .get(&step.session)
+                .ok_or(CoreError::UnknownSession(step.session))?;
+            let at = live.written().saturating_sub(1);
+            let row = u32::try_from(row).unwrap_or(u32::MAX);
+            drafter.absorb(backend, live.kv().view(), row, 1, at)?;
+        }
+        Ok(())
+    }
+
     /// Runs one verify pass: `rows` rows, recording a per-row trail.
     ///
     /// A thin name over [`HybridStack::run_rows`] so that `draft.rs` does not
@@ -928,6 +1004,19 @@ impl HybridStack {
     ) -> CoreResult<()> {
         self.run_rows(session, rows, None, Trail::Record)
             .map(|_rows| ())
+    }
+
+    /// Projects rows `0 .. n` of the pass that just ran into logits rows
+    /// `0 .. n`, in one call.
+    pub(crate) fn write_logits_rows(&self, n: u32) -> CoreResult<()> {
+        let resident = self.resident()?;
+        layers::logits_rows(
+            self.backend.as_ref(),
+            &resident.weights,
+            &self.geometry,
+            &resident.scratch,
+            n,
+        )
     }
 
     /// Projects row `token` of the pass that just ran into logits row `row`.
@@ -1623,6 +1712,7 @@ impl HybridStack {
         // would divide by a width it was handed as zero.
         if !steps.is_empty() {
             self.run_batch(steps)?;
+            self.absorb_batch(steps)?;
         }
         for (row, step) in steps.iter().enumerate() {
             let row = u32::try_from(row).unwrap_or(u32::MAX);

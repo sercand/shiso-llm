@@ -70,7 +70,7 @@ use shiso_engine::attn::Attn;
 use shiso_engine::draft::DraftHead;
 use shiso_engine::ffn::Ffn;
 use shiso_engine::gdn::{Gdn, GdnGeometry};
-use shiso_engine::layers::{Block, LayerWeights, Weights};
+use shiso_engine::layers::{Block, LayerWeights, Routed, Weights};
 use shiso_engine::moe::{ActDtype, ExpertSlab, Moe};
 use shiso_engine::projection::Weight;
 use shiso_engine::shape::{HybridShape, LayerKind};
@@ -706,7 +706,7 @@ fn import_attn(backend: &Arc<dyn Backend>, file: &ModeloptFile, slot: usize) -> 
         k: Some(weight(backend, file, &at("k_proj"))?),
         v: Some(weight(backend, file, &at("v_proj"))?),
         output: weight(backend, file, &at("o_proj"))?,
-        q_norm: vector(backend, file, &at("q_norm"))?,
+        q_norm: Some(vector(backend, file, &at("q_norm"))?),
         k_norm: Some(vector(backend, file, &at("k_norm"))?),
     })
 }
@@ -736,6 +736,13 @@ fn import_weights(
                 attn_rank += 1;
                 (Block::Attn(import_attn(backend, file, slot)?), rank)
             }
+            // This family's shape holds neither; its config never states one.
+            LayerKind::Ssm => {
+                return Err(CoreError::Unsupported {
+                    what: "a state-space slot in this family",
+                    backend: "qwen35",
+                });
+            }
         };
         let moe = import_moe(backend, file, slot, experts)?;
         layers.push(LayerWeights {
@@ -747,20 +754,20 @@ fn import_weights(
             // The pre-only scheme, as the dense hybrid has: nothing normalizes
             // a block's output and the residual sum carries no scalar.
             post_attn_norm: None,
-            ffn_norm: vector(
+            ffn_norm: Some(vector(
                 backend,
                 file,
                 &format!("{TEXT_PREFIX}layers.{slot}.post_attention_layernorm"),
-            )?,
+            )?),
             post_ffn_norm: None,
             // The SHARED expert takes the dense feed-forward's own field,
             // because that is what it is; the routed half is beside it.
-            ffn: Ffn {
-                gate: weight(
+            ffn: Some(Ffn {
+                gate: Some(weight(
                     backend,
                     file,
                     &format!("{TEXT_PREFIX}layers.{slot}.mlp.shared_expert.gate_proj"),
-                )?,
+                )?),
                 up: weight(
                     backend,
                     file,
@@ -771,8 +778,8 @@ fn import_weights(
                     file,
                     &format!("{TEXT_PREFIX}layers.{slot}.mlp.shared_expert.down_proj"),
                 )?,
-            },
-            moe: Some(moe),
+            }),
+            moe: Some(Routed::Glu(moe)),
             block,
             ordinal,
             kv_rank,

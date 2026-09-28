@@ -187,6 +187,29 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "dense/dense_affine_rows.metal",
         include_str!("../metal/dense/dense_affine_rows.metal"),
     ),
+    // The row-exact affine matmul: one arithmetic for every row count, so a
+    // verify window's rows equal the serial steps they check.
+    (
+        "dense/dense_exact_affine.metal",
+        include_str!("../metal/dense/dense_exact_affine.metal"),
+    ),
+    // The block drafter's two kernels of its own: the strided row copy that
+    // gathers the target's tapped hidden states, and the grouped dynamic
+    // causal convolution.
+    (
+        "dense/dense_block_draft.metal",
+        include_str!("../metal/dense/dense_block_draft.metal"),
+    ),
+    // The state-space block (convolution, scan, gated norm) and the routed
+    // feed-forward over row-major affine stacks with a biased sigmoid router.
+    (
+        "dense/dense_ssm.metal",
+        include_str!("../metal/dense/dense_ssm.metal"),
+    ),
+    (
+        "dense/dense_moe.metal",
+        include_str!("../metal/dense/dense_moe.metal"),
+    ),
     // --- qwen35moe kernel set; appended, nothing above this line changed. The
     // header comes first, for the same reason the qwen35, vision and dense
     // headers do: the files after it use its argument block and its affine

@@ -101,6 +101,18 @@ impl Variant {
         }
     }
 
+    /// The entry point that also records the state after every row, for a
+    /// verify pass, or `None` for a variant with no recording twin - the
+    /// chunked and hybrid shapes, which a verify-sized pass never picks.
+    pub(crate) const fn trail_entry(self) -> Option<&'static str> {
+        match self {
+            Self::S1 => Some("kernel_q35_gdn_recurrent_trail_s1"),
+            Self::S2 => Some("kernel_q35_gdn_recurrent_trail_s2"),
+            Self::S4 => Some("kernel_q35_gdn_recurrent_trail_s4"),
+            _ => None,
+        }
+    }
+
     /// Threads per threadgroup this variant must be launched at. Not a
     /// maximum and not a suggestion: the index arithmetic assumes it.
     pub(crate) const fn lanes(self) -> u32 {

@@ -203,6 +203,8 @@ impl Qwen35Config {
                 media_positions: MediaPositions::Mrope3D,
                 v_norm: false,
                 moe: None,
+                ssm: None,
+                no_ffn: Vec::new(),
             },
             eos_token: TokenId::new(cfg.eos_token_id),
             full_attention_interval: cfg.full_attention_interval,
@@ -258,35 +260,19 @@ impl Qwen35Config {
     }
 }
 
-/// Checks every dimension against the value the kernels were written for.
+/// Checks the dimensions the kernels fix, and the relations the rest must keep.
+///
+/// Two kinds of number live in a config. Some are compiled into the kernels:
+/// the attention head width, the GDN head widths, the conv window, the rotated
+/// width and the output gate, and the vocabulary that [`IM_END`] belongs to. A
+/// checkpoint that differs in one of those would run and be wrong, so each is
+/// held to its one value. The rest - depth, widths, head counts - are launch
+/// arguments, and hold for any checkpoint of this family whose counts divide
+/// the way grouped attention and grouped value heads need.
 fn check(cfg: &Qwen35TextConfig) -> CoreResult<()> {
     let expect = HfConfig::expect;
-    expect("num_hidden_layers", u64::from(cfg.num_hidden_layers), 32)?;
-    expect("hidden_size", u64::from(cfg.hidden_size), 2560)?;
     expect("vocab_size", u64::from(cfg.vocab_size), 248_320)?;
-    expect(
-        "num_attention_heads",
-        u64::from(cfg.num_attention_heads),
-        16,
-    )?;
-    expect("num_key_value_heads", u64::from(cfg.num_key_value_heads), 4)?;
     expect("head_dim", u64::from(cfg.head_dim), 256)?;
-    expect("intermediate_size", u64::from(cfg.intermediate_size), 9216)?;
-    expect(
-        "full_attention_interval",
-        u64::from(cfg.full_attention_interval),
-        4,
-    )?;
-    expect(
-        "linear_num_value_heads",
-        u64::from(cfg.linear_num_value_heads),
-        32,
-    )?;
-    expect(
-        "linear_num_key_heads",
-        u64::from(cfg.linear_num_key_heads),
-        16,
-    )?;
     expect(
         "linear_key_head_dim",
         u64::from(cfg.linear_key_head_dim),
@@ -310,7 +296,71 @@ fn check(cfg: &Qwen35TextConfig) -> CoreResult<()> {
         )),
         64,
     )?;
-    expect_bool("attn_output_gate", cfg.attn_output_gate, true)
+    expect_bool("attn_output_gate", cfg.attn_output_gate, true)?;
+    // The launch arguments: nonzero, and widths the affine matmul tiles take
+    // (inputs in whole groups of 64, outputs in whole tiles of 8).
+    for (field, value) in [
+        ("num_hidden_layers", cfg.num_hidden_layers),
+        ("full_attention_interval", cfg.full_attention_interval),
+        ("num_attention_heads", cfg.num_attention_heads),
+        ("num_key_value_heads", cfg.num_key_value_heads),
+        ("linear_num_key_heads", cfg.linear_num_key_heads),
+        ("linear_num_value_heads", cfg.linear_num_value_heads),
+    ] {
+        if value == 0 {
+            return Err(CoreError::ShapeMismatch {
+                field,
+                expected: 1,
+                got: 0,
+            });
+        }
+    }
+    for (field, value) in [
+        ("hidden_size", cfg.hidden_size),
+        ("intermediate_size", cfg.intermediate_size),
+    ] {
+        if value == 0 || !value.is_multiple_of(64) {
+            return Err(CoreError::ShapeMismatch {
+                field,
+                expected: u64::from(value.div_ceil(64).max(1) * 64),
+                got: u64::from(value),
+            });
+        }
+    }
+    // The depth is stated twice - as a count and as the per-layer list - and a
+    // checkpoint whose two statements disagree is one of them edited.
+    let listed = u32::try_from(cfg.layer_types.len()).unwrap_or(u32::MAX);
+    if cfg.num_hidden_layers != listed {
+        return Err(CoreError::ShapeMismatch {
+            field: "num_hidden_layers",
+            expected: u64::from(listed),
+            got: u64::from(cfg.num_hidden_layers),
+        });
+    }
+    divides(
+        "num_attention_heads",
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+    )?;
+    divides(
+        "linear_num_value_heads",
+        cfg.linear_num_value_heads,
+        cfg.linear_num_key_heads,
+    )
+}
+
+/// `whole` must be a multiple of `part`: query heads share key/value heads, and
+/// value heads share key heads, in whole groups.
+fn divides(field: &'static str, whole: u32, part: u32) -> CoreResult<()> {
+    if whole.is_multiple_of(part) {
+        Ok(())
+    } else {
+        Err(CoreError::ShapeMismatch {
+            field,
+            expected: u64::from(whole.div_ceil(part) * part),
+            got: u64::from(whole),
+        })
+    }
 }
 
 /// Width of the rotated part of a head.

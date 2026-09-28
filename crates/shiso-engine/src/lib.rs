@@ -35,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub mod attn;
+pub mod block_draft;
 pub mod blocks;
 pub mod ckpt;
 mod ckpt_layout;
@@ -46,6 +47,7 @@ mod kv;
 pub mod launch;
 pub mod layers;
 pub mod moe;
+pub mod moe_biased;
 /// Speculative decode's decidable half, shared by both stacks.
 ///
 /// A re-export rather than a module of its own, and that is Task 3.3 Step 1's
@@ -60,6 +62,7 @@ pub use sparse::mtp;
 mod options;
 pub mod ple_rows;
 pub mod projection;
+pub mod quantize;
 #[cfg(test)]
 mod recorder;
 mod rows;
@@ -68,6 +71,7 @@ mod sampling_probs;
 mod sessions;
 pub mod shape;
 pub mod sparse;
+pub mod ssm;
 mod stack;
 pub mod trace;
 pub mod tune;
@@ -80,7 +84,7 @@ pub use ckpt::{
 pub use ckpt_layout::CkptIdentity;
 pub use draft::{DraftHead, DraftParts};
 pub use options::{EngineOptions, KvCheck, KvFit, PoolCost};
-pub use sampling::{argmax, rng_f32, rng_next, sample_logits};
+pub use sampling::{argmax, keyed_sample, rng_f32, rng_next, sample_logits};
 pub use sampling_probs::{build_probabilities, sample_probabilities};
 /// What the cache holds, re-exported so a model crate can forward it without
 /// taking a dependency on the cache crate: the type is part of this crate's own

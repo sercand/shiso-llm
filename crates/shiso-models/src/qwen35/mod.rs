@@ -58,6 +58,7 @@
 //! [`MoeShape`]: shiso_engine::shape::MoeShape
 
 mod binding;
+pub mod block_draft;
 mod ckpt;
 mod config;
 mod kernels;

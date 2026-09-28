@@ -101,6 +101,7 @@ fn binding_reproduces_the_hybrid_pattern() {
         match expected {
             LayerKind::Gdn => gdn += 1,
             LayerKind::Attn => attn += 1,
+            LayerKind::Ssm => panic!("layer {il}: this family has no {expected:?} slot"),
         }
     }
     assert_eq!((gdn, attn), (24, 8));

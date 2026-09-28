@@ -1716,6 +1716,7 @@ name = "shiso-engine"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "half",
  "parking_lot",
  "serde_json",
  "shiso-core",

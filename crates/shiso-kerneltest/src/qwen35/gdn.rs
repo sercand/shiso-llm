@@ -1172,3 +1172,183 @@ pub fn every_viable_chunk_variant_matches_the_recurrence(gpu: &Gpu) {
     }
     assert!(ran > 0, "no chunk variant was viable on this device");
 }
+
+/// Every recording twin of a recurrent variant, with the lanes it launches at.
+pub(crate) const RECURRENT_TRAIL_VARIANTS: [(&str, &str, u32); 3] = [
+    (
+        "kernel_q35_gdn_recurrent_trail_s1",
+        "kernel_q35_gdn_recurrent_s1",
+        128,
+    ),
+    (
+        "kernel_q35_gdn_recurrent_trail_s2",
+        "kernel_q35_gdn_recurrent_s2",
+        256,
+    ),
+    (
+        "kernel_q35_gdn_recurrent_trail_s4",
+        "kernel_q35_gdn_recurrent_s4",
+        512,
+    ),
+];
+
+/// A recording twin writes, for every row but the last, exactly the state a
+/// plain launch over the rows up to it leaves - and otherwise answers exactly
+/// what the plain variant answers. Byte equality: a verify pass winds back to
+/// these records, and the serial decode it must equal ran the plain kernel.
+pub fn recurrent_trail_records_are_the_per_row_walk(gpu: &Gpu) {
+    let n_tok = 6usize;
+    let qkv = qkv_fixture(n_tok, 71);
+    let decay = decay_fixture(n_tok * N_HEAD_V, 72);
+    let beta = beta_fixture(n_tok * N_HEAD_V, 73);
+    let seed = signal(N_HEAD_V * HD * HD, 74);
+    let state_len = N_HEAD_V * HD * HD;
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let mut ran = 0usize;
+    for (trail_entry, plain, lanes) in RECURRENT_TRAIL_VARIANTS {
+        if !viable(gpu, trail_entry, lanes) {
+            continue;
+        }
+        ran += 1;
+        let qkv_buf = gpu.upload(&f32_bytes(&qkv));
+        let decay_buf = gpu.upload(&f32_bytes(&decay));
+        let beta_buf = gpu.upload(&f32_bytes(&beta));
+        let state_buf = gpu.upload(&f32_bytes(&seed));
+        let out_buf = gpu.upload(&f32_bytes(&vec![0.0; n_tok * N_HEAD_V * HD]));
+        let trail_buf = gpu.upload(&f32_bytes(&vec![0.0; (n_tok - 1) * state_len]));
+        let args = gdn_args(n_tok);
+        launch(
+            gpu,
+            trail_entry,
+            Extent3::linear(N_HEAD_V as u32),
+            lanes,
+            RECURRENT_SMEM,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(out_buf.view()),
+                KernelArg::Buffer(state_buf.view()),
+                KernelArg::Buffer(qkv_buf.view()),
+                KernelArg::Buffer(decay_buf.view()),
+                KernelArg::Buffer(beta_buf.view()),
+                KernelArg::Buffer(trail_buf.view()),
+            ],
+        );
+        drain(gpu);
+        let (got_out, got_state, trail) = (
+            gpu.read_f32(&out_buf),
+            gpu.read_f32(&state_buf),
+            gpu.read_f32(&trail_buf),
+        );
+        let (want_out, want_state) = delta_rule(
+            gpu,
+            plain,
+            lanes,
+            RECURRENT_SMEM,
+            &gpu.upload(&f32_bytes(&qkv)),
+            &gpu.upload(&f32_bytes(&decay)),
+            &gpu.upload(&f32_bytes(&beta)),
+            &gpu.upload(&f32_bytes(&seed)),
+            &gpu.upload(&f32_bytes(&vec![0.0; n_tok * N_HEAD_V * HD])),
+            n_tok,
+        );
+        assert_eq!(bits(&got_out), bits(&want_out), "{trail_entry}: output");
+        assert_eq!(
+            bits(&got_state),
+            bits(&want_state),
+            "{trail_entry}: final state"
+        );
+        for t in 0..n_tok - 1 {
+            let (_, after) = delta_rule(
+                gpu,
+                plain,
+                lanes,
+                RECURRENT_SMEM,
+                &gpu.upload(&f32_bytes(&qkv)),
+                &gpu.upload(&f32_bytes(&decay)),
+                &gpu.upload(&f32_bytes(&beta)),
+                &gpu.upload(&f32_bytes(&seed)),
+                &gpu.upload(&f32_bytes(&vec![0.0; n_tok * N_HEAD_V * HD])),
+                t + 1,
+            );
+            assert_eq!(
+                bits(&trail[t * state_len..(t + 1) * state_len]),
+                bits(&after),
+                "{trail_entry}: the record after row {t}"
+            );
+        }
+    }
+    assert!(
+        ran > 0,
+        "no recording recurrent variant was viable on this device"
+    );
+}
+
+/// The convolution's recording twin: the window after every row but the last,
+/// each the window a plain launch over the rows up to it leaves, and the plain
+/// kernel's outputs and final window. Byte equality, for the reason the
+/// recurrent case gives.
+pub fn conv_trail_records_are_the_per_row_walk(gpu: &Gpu) {
+    let n_tok = 5usize;
+    let x = signal(n_tok * STRIDE, 81);
+    let w = signal(STRIDE * CONV_KERNEL, 82);
+    let seeded = signal(CONV_HIST * STRIDE, 83);
+    let window = CONV_HIST * STRIDE;
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let x_buf = gpu.upload(&f32_bytes(&x));
+    let w_buf = gpu.upload(&f32_bytes(&w));
+    let out_buf = gpu.upload(&f32_bytes(&vec![0.0; n_tok * STRIDE]));
+    let state_buf = gpu.upload(&f32_bytes(&seeded));
+    let trail_buf = gpu.upload(&f32_bytes(&vec![0.0; (n_tok - 1) * window]));
+    let args = ConvArgs {
+        channels: STRIDE as u32,
+        conv_kernel: CONV_KERNEL as u32,
+        n_tok: n_tok as u32,
+    };
+    launch(
+        gpu,
+        "kernel_q35_gdn_conv_trail",
+        Extent3::linear((STRIDE as u32).div_ceil(CONV_BLOCK)),
+        CONV_BLOCK,
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out_buf.view()),
+            KernelArg::Buffer(state_buf.view()),
+            KernelArg::Buffer(x_buf.view()),
+            KernelArg::Buffer(w_buf.view()),
+            KernelArg::Buffer(trail_buf.view()),
+        ],
+    );
+    drain(gpu);
+    let (got_out, got_state, trail) = (
+        gpu.read_f32(&out_buf),
+        gpu.read_f32(&state_buf),
+        gpu.read_f32(&trail_buf),
+    );
+    let fresh = |n: usize| {
+        conv(
+            gpu,
+            &gpu.upload(&f32_bytes(&x)),
+            &w_buf,
+            &gpu.upload(&f32_bytes(&seeded)),
+            &gpu.upload(&f32_bytes(&vec![0.0; n_tok * STRIDE])),
+            n,
+            STRIDE,
+        )
+    };
+    let (want_out, want_state) = fresh(n_tok);
+    assert_eq!(bits(&got_out), bits(&want_out), "conv trail: output");
+    assert_eq!(
+        bits(&got_state),
+        bits(&want_state),
+        "conv trail: final window"
+    );
+    for t in 0..n_tok - 1 {
+        let (_, after) = fresh(t + 1);
+        assert_eq!(
+            bits(&trail[t * window..(t + 1) * window]),
+            bits(&after),
+            "conv trail: the record after row {t}"
+        );
+    }
+}

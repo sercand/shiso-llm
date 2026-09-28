@@ -164,11 +164,11 @@ impl Qwen35Model {
             .map_err(open_failure)?;
         let binding = bind_qwen35_desc(&file, config).map_err(open_failure)?;
         validate_layers(config.shape(), &binding)?;
-        let embed = binding.token_embd.dtype;
-        let ffn_gate = binding
-            .layers
-            .first()
-            .map_or(embed, |layer| layer.ffn.gate.dtype);
+        let embed = embedding_dtype(&file, &binding.token_embd)?;
+        let ffn_gate = match binding.layers.first() {
+            Some(layer) => stored_dtype(&file, &layer.ffn.gate)?,
+            None => embed,
+        };
         let weights = import_weights(backend, &file, &binding, config.shape())?;
         // The file is dropped here on purpose: every weight that needed its mapping
         // holds its own handle on it, so the bytes stay mapped for exactly as long
@@ -222,6 +222,32 @@ impl Qwen35Model {
             stack,
             ffn_gate,
         })
+    }
+}
+
+impl Qwen35Model {
+    /// Reads the block drafter in `dir` and binds it to this model's stack.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`crate::qwen35::block_draft::load`] reports for the directory,
+    /// and [`CoreError::Unsupported`] from the stack for a model loaded without
+    /// a speculative depth.
+    pub fn bind_block_drafter(&mut self, backend: &Arc<dyn Backend>, dir: &Path) -> CoreResult<()> {
+        let geometry = self.stack.geometry().clone();
+        let parts = crate::qwen35::block_draft::load(
+            backend,
+            dir,
+            (self.info.hidden, self.info.n_layers, self.info.vocab),
+        )?;
+        let drafter = shiso_engine::block_draft::BlockDrafter::new(
+            backend,
+            parts,
+            (&geometry, self.info.n_layers),
+            self.stack.pool_pages(),
+            MAX_PREFILL_CHUNK,
+        )?;
+        self.stack.bind_block_drafter(drafter)
     }
 }
 
@@ -291,6 +317,13 @@ fn import_weights(
                 attn_rank += 1;
                 (Block::Attn(import_attn(backend, file, layer)?), rank)
             }
+            // This family's shape holds neither; its config never states one.
+            LayerKind::Ssm => {
+                return Err(CoreError::Unsupported {
+                    what: "a state-space slot in this family",
+                    backend: "qwen35",
+                });
+            }
         };
         layers.push(LayerWeights {
             input_norm: vector(backend, file, &layer.input_norm)?,
@@ -300,13 +333,13 @@ fn import_weights(
             // these values being absent, so the launches here are the ones this
             // family has always dispatched.
             post_attn_norm: None,
-            ffn_norm: vector(backend, file, &layer.post_norm)?,
+            ffn_norm: Some(vector(backend, file, &layer.post_norm)?),
             post_ffn_norm: None,
-            ffn: Ffn {
-                gate: weight(backend, file, &layer.ffn.gate)?,
+            ffn: Some(Ffn {
+                gate: Some(weight(backend, file, &layer.ffn.gate)?),
                 up: weight(backend, file, &layer.ffn.up)?,
                 down: weight(backend, file, &layer.ffn.down)?,
-            },
+            }),
             // A dense feed-forward: this family's slots have no router.
             moe: None,
             block,
@@ -317,7 +350,7 @@ fn import_weights(
         });
     }
     Ok(Weights {
-        token_embd: weight(backend, file, &binding.token_embd)?,
+        token_embd: embedding(backend, file, &binding.token_embd)?,
         output_norm: vector(backend, file, &binding.output_norm)?,
         lm_head: binding
             .lm_head
@@ -371,7 +404,7 @@ fn import_attn(
         k: Some(weight(backend, file, &bound.k)?),
         v: Some(weight(backend, file, &bound.v)?),
         output: weight(backend, file, &bound.output)?,
-        q_norm: vector(backend, file, &bound.q_norm)?,
+        q_norm: Some(vector(backend, file, &bound.q_norm)?),
         k_norm: Some(vector(backend, file, &bound.k_norm)?),
     })
 }
@@ -394,8 +427,73 @@ fn weight(backend: &Arc<dyn Backend>, file: &ModelFile, desc: &TensorDesc) -> Co
     let dims = desc.shape.dims();
     let in_dim = extent(dims.first().copied().unwrap_or(0))?;
     let out_dim = extent(dims.get(1).copied().unwrap_or(1))?;
+    // An MLX export's projections stay packed: the affine matmul reads them as
+    // stored, and decoding a 27B export would cost four times its size in
+    // device memory. Everything else in the directory is decoded as before.
+    if let ModelFile::Safetensors(st) = file
+        && let Some(packed) = st.affine_packed(&desc.name).map_err(open_failure)?
+    {
+        return Weight::import_affine_slices(
+            backend,
+            affine_dtype(packed.layout.bits)?,
+            in_dim,
+            out_dim,
+            &packed.words,
+            &packed.scales,
+            &packed.biases,
+        );
+    }
     let (host, range) = file.tensor_host(desc).map_err(open_failure)?;
     Weight::import(backend, desc.dtype, in_dim, out_dim, host, range)
+}
+
+/// Imports the token embedding: packed when a row-gather kernel reads its packed
+/// format (4-bit affine), decoded otherwise - an 8-bit table is read by nothing
+/// but the decoded path.
+fn embedding(
+    backend: &Arc<dyn Backend>,
+    file: &ModelFile,
+    desc: &TensorDesc,
+) -> CoreResult<Weight> {
+    if embedding_dtype(file, desc)? == desc.dtype {
+        let dims = desc.shape.dims();
+        let in_dim = extent(dims.first().copied().unwrap_or(0))?;
+        let out_dim = extent(dims.get(1).copied().unwrap_or(1))?;
+        let (host, range) = file.tensor_host(desc).map_err(open_failure)?;
+        return Weight::import(backend, desc.dtype, in_dim, out_dim, host, range);
+    }
+    weight(backend, file, desc)
+}
+
+/// The format the token embedding is imported as; see [`embedding`].
+fn embedding_dtype(file: &ModelFile, desc: &TensorDesc) -> CoreResult<DType> {
+    match stored_dtype(file, desc)? {
+        DType::MlxAffine4Gs64 => Ok(DType::MlxAffine4Gs64),
+        _ => Ok(desc.dtype),
+    }
+}
+
+/// The packed format of an MLX affine weight at `bits`, in groups of 64.
+fn affine_dtype(bits: u32) -> CoreResult<DType> {
+    match bits {
+        4 => Ok(DType::MlxAffine4Gs64),
+        8 => Ok(DType::MlxAffine8Gs64),
+        _ => Err(CoreError::Unsupported {
+            what: "an MLX affine weight at a bit width with no matmul",
+            backend: "qwen35",
+        }),
+    }
+}
+
+/// The format `desc` is imported as: its packed affine format when the file
+/// keeps it packed, the binding's own otherwise.
+fn stored_dtype(file: &ModelFile, desc: &TensorDesc) -> CoreResult<DType> {
+    if let ModelFile::Safetensors(st) = file
+        && let Some(triple) = st.affine_triple(&desc.name).map_err(open_failure)?
+    {
+        return affine_dtype(triple.layout.bits);
+    }
+    Ok(desc.dtype)
 }
 
 /// Imports one weight vector, which every format stores as plain `f32`.
@@ -499,5 +597,32 @@ impl shiso_core::model::Speculating for Qwen35Model {
     ) -> CoreResult<shiso_core::model::Speculated> {
         let eos = self.info.stop_tokens.primary();
         self.stack.speculate(session, first, eos)
+    }
+
+    // None: the stack drafts with a head rather than a block drafter, whose
+    // greedy step is the only one it has.
+    fn verify_block(
+        &mut self,
+        session: SessionId,
+        first: TokenId,
+        hint: shiso_core::model::DraftHint,
+    ) -> CoreResult<Option<shiso_core::model::VerifiedBlock>> {
+        if !self.stack.block_resident() {
+            return Ok(None);
+        }
+        let eos = self.info.stop_tokens.primary();
+        self.stack
+            .draft_and_verify(session, first, eos, hint)
+            .map(Some)
+    }
+
+    fn settle_block(
+        &mut self,
+        session: SessionId,
+        block: shiso_core::model::VerifiedBlock,
+        accepted: u32,
+    ) -> CoreResult<()> {
+        let _ = block;
+        self.stack.settle_verified(session, accepted)
     }
 }

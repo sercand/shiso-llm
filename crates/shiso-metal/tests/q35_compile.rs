@@ -44,13 +44,17 @@ const GEMM_BROADCAST: [FnConst; 2] = [
 ];
 
 /// Entry points that resolve exactly as declared.
-const ENTRIES: [&str; 21] = [
+const ENTRIES: [&str; 25] = [
     "kernel_q35_gdn_conv",
+    "kernel_q35_gdn_conv_trail",
     "kernel_q35_gdn_l2norm",
     "kernel_q35_gdn_gates",
     "kernel_q35_gdn_recurrent_s1",
     "kernel_q35_gdn_recurrent_s2",
     "kernel_q35_gdn_recurrent_s4",
+    "kernel_q35_gdn_recurrent_trail_s1",
+    "kernel_q35_gdn_recurrent_trail_s2",
+    "kernel_q35_gdn_recurrent_trail_s4",
     "kernel_q35_gdn_recurrent_hybrid",
     "kernel_q35_gdn_out_gate",
     "kernel_q35_gdn_chunk_c1",

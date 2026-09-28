@@ -66,7 +66,7 @@ fn q_norm_rope(
         KernelArg::Buffer(scratch.q.view()),
         KernelArg::Buffer(scratch.gate.view()),
         KernelArg::Buffer(scratch.qkv.view()),
-        KernelArg::Buffer(attn.q_norm.view()),
+        KernelArg::Buffer(attn.q_norm()?.view()),
     ];
     // The one-dimensional entry takes the sequence position; the multimodal one
     // takes the three grid streams and no sequence position at all, because

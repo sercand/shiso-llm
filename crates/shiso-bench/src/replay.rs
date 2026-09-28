@@ -34,6 +34,7 @@ use shiso_engine::sparse::stack::SparseOptions;
 use shiso_engine::sparse::tap::ResidualTap;
 use shiso_engine::{EngineOptions, argmax};
 use shiso_models::gemma4::{Gemma4Config, Gemma4Model, PleOptions};
+use shiso_models::nemotron_h::{NemotronHConfig, NemotronHModel};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::{Qwen35Config, Qwen35Model};
 
@@ -409,6 +410,12 @@ fn load_loaded(
         }
         Err(shiso_core::CoreError::UnknownArch { .. }) => {}
         Err(other) => return Err(other.into()),
+    }
+    if NemotronHConfig::describes_type(config.model_type()) {
+        let family = NemotronHConfig::from_dir(path)?;
+        return Ok(Loaded::Other(Box::new(NemotronHModel::load(
+            backend, path, &family, opts,
+        )?)));
     }
     match Qwen4ExpConfig::from_hf(config, path) {
         Ok(family) => {

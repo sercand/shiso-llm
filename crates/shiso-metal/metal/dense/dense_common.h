@@ -305,8 +305,11 @@ static inline uint64_t dense_kv_row(device const int32_t *pages, uint64_t positi
     if (pages == nullptr) {
         return position;
     }
-    return (uint64_t) pages[position / page_tokens] * page_tokens +
-           (position % page_tokens);
+    // The divide is 32-bit: a position fits (a context is far below 2^32
+    // tokens), and a 64-bit divide is a software routine on this GPU that
+    // cost decode attention ~3000 cycles a key on an M1 Max.
+    const uint32_t p = (uint32_t) position;
+    return (uint64_t) pages[p / page_tokens] * page_tokens + (p % page_tokens);
 }
 
 /// Row `t`'s own page table inside a packed block of them.
@@ -382,6 +385,35 @@ struct dense_args_affine {
     uint32_t bits;
 };
 
+/// Strided row copy (`dense_block_draft.metal`).
+struct dense_args_copy_rows {
+    uint32_t n_rows;
+    uint32_t width;
+    uint32_t dst_stride;
+    uint32_t dst_offset;
+};
+
+/// Grouped dynamic causal convolution (`dense_block_draft.metal`).
+struct dense_args_dyn_conv {
+    uint32_t n_rows;
+    uint32_t hidden;
+    uint32_t group;
+    uint32_t taps;
+    uint32_t part;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/// Row-exact affine matmul (`dense_exact_affine.metal`): the weight's shape and
+/// the rows of the call.
+struct dense_args_exact_affine {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_rows;
+    uint32_t pad;
+};
+
 /// Widens one bf16 value by placing its 16 bits into the high half of an f32.
 static inline float dense_bf16(device const ushort *p) {
     return as_type<float>((uint) (*p) << 16);
@@ -391,4 +423,79 @@ static inline float dense_bf16(device const ushort *p) {
 struct dense_args_embed_affine {
     uint32_t hidden;
     uint32_t n_tok;
+};
+
+/// The state-space block's causal convolution (`dense_ssm.metal`).
+///
+/// `in_stride` is the input projection's row width and `in_offset` where the
+/// convolved channels start inside a row: the kernel reads them in place rather
+/// than from a copy.
+struct dense_args_ssm_conv {
+    uint32_t n_tok;
+    uint32_t channels;
+    uint32_t taps;
+    uint32_t in_stride;
+    uint32_t in_offset;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/// The state-space scan (`dense_ssm.metal`). `dt_offset` is where the per-head
+/// step sizes start inside an input-projection row of `in_stride` floats.
+struct dense_args_ssm_scan {
+    uint32_t n_tok;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t state;
+    uint32_t groups;
+    uint32_t channels;
+    uint32_t in_stride;
+    uint32_t dt_offset;
+};
+
+/// The gated grouped norm after the scan (`dense_ssm.metal`). The gate is the
+/// first `inner` floats of each input-projection row.
+struct dense_args_ssm_norm {
+    uint32_t n_tok;
+    uint32_t inner;
+    uint32_t group_size;
+    uint32_t in_stride;
+    float eps;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/// The biased sigmoid router (`dense_moe.metal`): `norm` non-zero renormalizes
+/// the chosen weights to sum to one before `scale` multiplies them.
+struct dense_args_moe_route {
+    uint32_t experts;
+    uint32_t used;
+    float scale;
+    uint32_t norm;
+};
+
+/// One routed expert stage over row-major affine stacks (`dense_moe.metal`).
+///
+/// `by_token` non-zero reads the TOKEN's row of the input (`col / n_used`),
+/// which is the first projection; zero reads the column's own row, which is the
+/// second. `act` 1 squares the rectified output; 0 writes it as it is.
+struct dense_args_experts {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_expert;
+    uint32_t n_used;
+    uint32_t by_token;
+    uint32_t act;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+/// A flat elementwise launch over `n` floats.
+struct dense_args_flat {
+    uint32_t n;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
 };

@@ -168,6 +168,7 @@ mod tests {
             crate::qwen4exp::QWEN4EXP_MODEL_ID,
             crate::gemma4::GEMMA4_MODEL_ID,
             QWEN35MOE_MODEL_ID,
+            crate::nemotron_h::NEMOTRON_H_MODEL_ID,
         ];
         for (rank, id) in ids.iter().enumerate() {
             for other in &ids[rank + 1..] {

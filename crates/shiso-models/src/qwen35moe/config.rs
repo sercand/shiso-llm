@@ -380,6 +380,8 @@ impl Qwen35MoeConfig {
                 1,
                 cfg.moe_intermediate_size,
             )),
+            ssm: None,
+            no_ffn: Vec::new(),
         };
         shape.validate()?;
         Ok(Self {

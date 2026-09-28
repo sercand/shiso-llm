@@ -48,6 +48,7 @@ use shiso_engine::sparse::stack::SparseOptions;
 use shiso_models::gemma4::{
     Gemma4AudioTower, Gemma4Config, Gemma4Model, Gemma4Tower, PleOptions, holds_audio_tower,
 };
+use shiso_models::nemotron_h::{NemotronHConfig, NemotronHModel};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::mtp::{self, AffineQuant, MtpManifest};
 use shiso_models::qwen35::{Qwen35Config, Qwen35Model, Qwen35Tower};
@@ -237,6 +238,21 @@ impl FamilyDefaults {
         speculates: true,
     };
 
+    /// Family defaults for the hybrid state-space checkpoint.
+    ///
+    /// Its template wraps reasoning in Qwen 3's tags and writes a tool call as
+    /// the Qwen 3.5 XML body, `<function=NAME>` around `<parameter=KEY>`
+    /// blocks, and takes no effort words.
+    pub const NEMOTRON_H: Self = Self {
+        reasoning: ReasoningScheme::Qwen3,
+        tools: ToolCallScheme::Qwen35,
+        thinking_default: true,
+        effort: EffortSpelling::STANDARD,
+        // No draft head is bound for this family yet; the export's own is not
+        // read. Flip this with the arm that binds one.
+        speculates: false,
+    };
+
     /// Family defaults for Gemma 4 models.
     pub const GEMMA4: Self = Self {
         reasoning: ReasoningScheme::Gemma4,
@@ -285,6 +301,9 @@ impl FamilyDefaults {
         }
         if Gemma4Config::describes(config) {
             return Ok(Self::GEMMA4);
+        }
+        if NemotronHConfig::describes_type(config.model_type()) {
+            return Ok(Self::NEMOTRON_H);
         }
         Err(FactoryError::UnknownArchitecture {
             model_type: config.model_type().to_owned(),
@@ -342,6 +361,16 @@ fn open_qwen35_tower(
     path: &Path,
 ) -> Result<Box<dyn VisionTower>, VisionError> {
     Ok(Box::new(Qwen35Tower::open(backend, path)?))
+}
+
+/// The opener of a family that ships no vision tower: `--vision` is refused.
+fn open_no_tower(
+    _backend: &Arc<dyn Backend>,
+    _path: &Path,
+) -> Result<Box<dyn VisionTower>, VisionError> {
+    Err(VisionError::Unsupported {
+        what: "a vision tower for this family",
+    })
 }
 
 /// The opener of a family that does not hear: audio input stays off.
@@ -440,6 +469,10 @@ pub fn load_model(
     // misleading one.
     match Qwen35Config::from_hf(config) {
         Ok(family) => {
+            // A block drafter is a directory of its own, not a sidecar head.
+            if let Some(dir) = block_drafter_dir(args) {
+                return load_qwen35_block(backend, path, &family, args, dir, defaults);
+            }
             // Resolved before the load and refused before a byte moves: a head
             // that cannot be found is an operator's mistake, and finding it out
             // after several gigabytes of weights is finding it out too late.
@@ -557,8 +590,75 @@ pub fn load_model(
         Err(other) => return Err(FactoryError::Load(other)),
     }
 
+    // The hybrid state-space family: a directory of MLX shards whose geometry
+    // is its own `config.json`, read again here because the parsed document
+    // carries no typed view of it.
+    if NemotronHConfig::describes_type(config.model_type()) {
+        return load_nemotron_h(backend, path, opts, defaults);
+    }
+
     Err(FactoryError::UnknownArchitecture {
         model_type: config.model_type().to_owned(),
+    })
+}
+
+/// The hybrid state-space arm: a directory of MLX shards and its config.
+///
+/// # Errors
+///
+/// [`FactoryError::Load`] for whatever the config or the checkpoint refuses.
+fn load_nemotron_h(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    let family = NemotronHConfig::from_dir(path).map_err(FactoryError::Load)?;
+    let model = NemotronHModel::load(backend, path, &family, opts).map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_no_tower,
+        open_audio: no_audio_tower,
+        // The template writes no media marker; the placement is only what a
+        // renderer is configured with.
+        placement: MediaPlacement::QWEN35,
+        defaults,
+    })
+}
+
+/// The `--draft-model` directory when it holds a block drafter: the target
+/// then loads plain, at the asked depth, and the drafter binds beside it.
+fn block_drafter_dir(args: &ServeArgs) -> Option<&Path> {
+    args.draft_model
+        .as_deref()
+        .filter(|dir| shiso_models::qwen35::block_draft::is_block_drafter(dir))
+}
+
+/// The dense arm with a block drafter beside it: the target at the asked depth,
+/// the drafter in `dir` bound to it.
+///
+/// # Errors
+///
+/// [`FactoryError::Load`] for whatever the target or the drafter refuses.
+fn load_qwen35_block(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    family: &Qwen35Config,
+    args: &ServeArgs,
+    dir: &Path,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    let mut model = Qwen35Model::load(backend, path, family, dense_options(args)?)
+        .map_err(FactoryError::Load)?;
+    model
+        .bind_block_drafter(backend, dir)
+        .map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_qwen35_tower,
+        open_audio: no_audio_tower,
+        placement: Qwen35Tower::PLACEMENT,
+        defaults,
     })
 }
 

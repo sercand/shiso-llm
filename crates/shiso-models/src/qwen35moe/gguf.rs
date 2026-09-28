@@ -54,7 +54,7 @@ use shiso_core::ids::LayerIdx;
 use shiso_engine::attn::Attn;
 use shiso_engine::ffn::Ffn;
 use shiso_engine::gdn::Gdn;
-use shiso_engine::layers::{Block, LayerWeights, Weights};
+use shiso_engine::layers::{Block, LayerWeights, Routed, Weights};
 use shiso_engine::moe::{ActDtype, ExpertCodec, ExpertSlab, Moe};
 use shiso_engine::projection::Weight;
 use shiso_engine::shape::{HybridShape, LayerKind};
@@ -155,22 +155,33 @@ pub fn import_weights_gguf(
                 attn_rank += 1;
                 (Block::Attn(import_attn(backend, file, slot)?), rank)
             }
+            // This family's shape holds neither; its config never states one.
+            LayerKind::Ssm => {
+                return Err(CoreError::Unsupported {
+                    what: "a state-space slot in this family",
+                    backend: "qwen35",
+                });
+            }
         };
         layers.push(LayerWeights {
             input_norm: vector(backend, file, &name(slot, "attn_norm.weight"))?,
             // The pre-only scheme this family has: nothing normalizes a block's
             // output and the residual sum carries no scalar.
             post_attn_norm: None,
-            ffn_norm: vector(backend, file, &name(slot, "post_attention_norm.weight"))?,
+            ffn_norm: Some(vector(
+                backend,
+                file,
+                &name(slot, "post_attention_norm.weight"),
+            )?),
             post_ffn_norm: None,
             // The SHARED expert takes the dense feed-forward's own field,
             // because that is what it is; the routed half is beside it.
-            ffn: Ffn {
-                gate: weight(backend, file, &name(slot, "ffn_gate_shexp.weight"))?,
+            ffn: Some(Ffn {
+                gate: Some(weight(backend, file, &name(slot, "ffn_gate_shexp.weight"))?),
                 up: weight(backend, file, &name(slot, "ffn_up_shexp.weight"))?,
                 down: weight(backend, file, &name(slot, "ffn_down_shexp.weight"))?,
-            },
-            moe: Some(import_moe(backend, file, slot)?),
+            }),
+            moe: Some(Routed::Glu(import_moe(backend, file, slot)?)),
             block,
             ordinal,
             kv_rank,
@@ -222,7 +233,7 @@ fn import_attn(backend: &Arc<dyn Backend>, file: &ModelFile, slot: usize) -> Cor
         k: Some(weight(backend, file, &name(slot, "attn_k.weight"))?),
         v: Some(weight(backend, file, &name(slot, "attn_v.weight"))?),
         output: weight(backend, file, &name(slot, "attn_output.weight"))?,
-        q_norm: vector(backend, file, &name(slot, "attn_q_norm.weight"))?,
+        q_norm: Some(vector(backend, file, &name(slot, "attn_q_norm.weight"))?),
         k_norm: Some(vector(backend, file, &name(slot, "attn_k_norm.weight"))?),
     })
 }

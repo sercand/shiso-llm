@@ -679,3 +679,190 @@ mod tests {
         }
     }
 }
+
+/// The token drawn from one row of logits by a rule that depends only on the
+/// row, the key and the token's position in the sequence.
+///
+/// Over the candidates the request allows - its top-k, cut to its top-p
+/// nucleus and its min-p floor - the token is the argmax of
+/// `logit / temperature + G(key, position, id)`, with `G` a Gumbel variate from
+/// a hash of the three. That is an exact draw from the softmax over those
+/// candidates, and it is the same draw whichever pass computed the row: a
+/// one-token step, or row `i` of a speculative verify. So a drafted token is
+/// kept exactly when it is the token this rule picks at its position, and a
+/// sampled sequence decoded speculatively is the one decoded a token at a time.
+///
+/// `temperature <= 0` is the argmax, as for [`sample_logits`]. Nothing is
+/// consumed from a stream: the key is fixed for the sequence.
+#[must_use]
+pub fn keyed_sample(logits: &[f32], p: &SamplingParams, key: u64, position: u32) -> TokenId {
+    let temperature = p.temperature;
+    if temperature <= 0.0 || logits.is_empty() {
+        return argmax(logits);
+    }
+    let top_p = if p.top_p <= 0.0 || p.top_p > 1.0 {
+        1.0
+    } else {
+        p.top_p
+    };
+    let min_p = p.min_p.max(0.0);
+    let top_k = p.top_k.map_or(0, |k| {
+        usize::try_from(k.get())
+            .unwrap_or(usize::MAX)
+            .min(TOP_K_LIMIT)
+    });
+    let top_k = top_k.min(logits.len());
+    let noise = |id: usize| -> f32 {
+        let u = keyed_uniform(key, position, u32::try_from(id).unwrap_or(u32::MAX));
+        -(-u.ln()).ln()
+    };
+    let inv_t = 1.0 / temperature;
+    // Pure temperature sampling: the Gumbel argmax over the whole row.
+    if top_k == 0 && top_p >= 1.0 && min_p == 0.0 {
+        let mut best = (f32::NEG_INFINITY, 0usize);
+        for (id, &l) in logits.iter().enumerate() {
+            let score = l * inv_t + noise(id);
+            if score > best.0 {
+                best = (score, id);
+            }
+        }
+        return TokenId::new(u32::try_from(best.1).unwrap_or(u32::MAX));
+    }
+    // The candidates, highest first and ties to the lower id: the top-k, or
+    // every token within reach of the nucleus. A token more than 40
+    // temperature-scaled units below the maximum carries under e^-40 of its
+    // mass, which no nucleus below 1 and no min-p floor keeps.
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut cands: Vec<(f32, u32)> = if top_k > 0 {
+        let mut all: Vec<(f32, u32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (l, u32::try_from(i).unwrap_or(u32::MAX)))
+            .collect();
+        let k = top_k.min(all.len());
+        all.select_nth_unstable_by(k - 1, |a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        all.truncate(k);
+        all
+    } else {
+        logits
+            .iter()
+            .enumerate()
+            .filter(|&(_, &l)| (l - max) * inv_t > -40.0)
+            .map(|(i, &l)| (l, u32::try_from(i).unwrap_or(u32::MAX)))
+            .collect()
+    };
+    cands.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let top = cands.first().map_or(max, |c| c.0);
+    let weights: Vec<f64> = cands
+        .iter()
+        .map(|&(l, _)| f64::from((l - top) * inv_t).exp())
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let mut keep = cands.len();
+    if top_p < 1.0 {
+        let mut cum = 0.0;
+        for (i, w) in weights.iter().enumerate() {
+            cum += w / total;
+            if cum >= f64::from(top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+    }
+    if min_p > 0.0 {
+        let floor = f64::from(min_p) * weights.first().copied().unwrap_or(1.0);
+        keep = keep.min(weights.iter().take_while(|&&w| w >= floor).count().max(1));
+    }
+    let mut best = (f32::NEG_INFINITY, cands.first().map_or(0, |c| c.1));
+    for &(l, id) in cands.iter().take(keep.max(1)) {
+        let score = l * inv_t + noise(id as usize);
+        if score > best.0 {
+            best = (score, id);
+        }
+    }
+    TokenId::new(best.1)
+}
+
+/// A uniform in `(0, 1)` from `(key, position, id)`: three rounds of the
+/// splitmix64 finalizer, 24 bits, offset half a step off both ends.
+pub(crate) fn keyed_uniform(key: u64, position: u32, id: u32) -> f32 {
+    const fn mix(mut x: u64) -> u64 {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+    let mut x = mix(key.wrapping_add(0x9E37_79B9_7F4A_7C15));
+    x = mix(x ^ u64::from(position).wrapping_mul(0xD1B5_4A32_D192_ED03));
+    x = mix(x ^ u64::from(id));
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a 24-bit integer is exact in f32"
+    )]
+    let bits = (x >> 40) as f32;
+    (bits + 0.5) * (1.0 / 16_777_216.0)
+}
+
+#[cfg(test)]
+#[expect(clippy::cast_precision_loss, reason = "small fixture values")]
+mod keyed_tests {
+    use super::keyed_sample;
+    use shiso_core::{SamplingParams, TokenId};
+
+    fn params(temperature: f32, top_k: u32, top_p: f32) -> SamplingParams {
+        let mut p = SamplingParams::neutral();
+        p.temperature = temperature;
+        p.top_k = std::num::NonZeroU32::new(top_k);
+        p.top_p = top_p;
+        p
+    }
+
+    #[test]
+    fn the_draw_depends_on_the_row_and_the_position_only() {
+        let row: Vec<f32> = (0..64).map(|i| ((i * 7) % 13) as f32 * 0.3).collect();
+        let p = params(1.0, 20, 0.95);
+        let a = keyed_sample(&row, &p, 42, 100);
+        assert_eq!(
+            a,
+            keyed_sample(&row, &p, 42, 100),
+            "same inputs, same token"
+        );
+        let spread: std::collections::HashSet<TokenId> = (0..200)
+            .map(|pos| keyed_sample(&row, &p, 42, pos))
+            .collect();
+        assert!(
+            spread.len() > 3,
+            "positions draw different tokens: {spread:?}"
+        );
+    }
+
+    #[test]
+    fn the_draws_follow_the_distribution() {
+        // Two tokens at logits ln 3 and 0: probabilities 0.75 and 0.25.
+        let row = vec![3f32.ln(), 0.0];
+        let p = params(1.0, 0, 1.0);
+        let n = 20_000u32;
+        let firsts = (0..n)
+            .filter(|&pos| keyed_sample(&row, &p, 7, pos) == TokenId::new(0))
+            .count();
+        #[expect(clippy::cast_precision_loss, reason = "a small count")]
+        let share = firsts as f64 / f64::from(n);
+        assert!((share - 0.75).abs() < 0.015, "share {share}");
+    }
+
+    #[test]
+    fn the_nucleus_and_top_k_are_respected() {
+        let row = vec![5.0, 4.9, 0.0, -1.0, -2.0];
+        for pos in 0..500 {
+            let t = keyed_sample(&row, &params(1.0, 2, 1.0), 3, pos).get();
+            assert!(t < 2, "top-k 2 drew {t}");
+            let t = keyed_sample(&row, &params(1.0, 0, 0.5), 3, pos).get();
+            assert!(t < 2, "a 0.5 nucleus drew {t}");
+        }
+        assert_eq!(
+            keyed_sample(&row, &params(0.0, 0, 1.0), 3, 0),
+            TokenId::new(0)
+        );
+    }
+}

@@ -82,6 +82,15 @@ fn vectors_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors")
 }
 
+/// The directory a fixture's prompt paths are relative to.
+///
+/// Every fixture sits one level down, in `references/` or `goldens/`, and names
+/// its prompt `../prompts/<name>`; resolving that against the tree's root
+/// instead points above it.
+fn prompt_base() -> PathBuf {
+    vectors_dir().join("references")
+}
+
 /// The model configuration the harness loads against.
 fn config_path() -> PathBuf {
     vectors_dir().join("loader/qwen35-config.json")
@@ -237,7 +246,7 @@ fn two_identical_runs_produce_bit_identical_logits() {
         .iter()
         .find(|c| c.id == "short_code_completion")
         .expect("the golden carries this case");
-    let tokens = case_tokens(&vocabulary, &vectors_dir(), case).expect("the prompt encodes");
+    let tokens = case_tokens(&vocabulary, &prompt_base(), case).expect("the prompt encodes");
 
     let first = harness
         .frontier_row(&tokens, REPLAY_CHUNK)
@@ -306,7 +315,7 @@ fn the_answer_does_not_depend_on_how_the_prompt_was_chunked() {
         .iter()
         .find(|c| c.id == "long_memory_archive")
         .expect("the golden carries this case");
-    let all = case_tokens(&vocabulary, &vectors_dir(), case).expect("the prompt encodes");
+    let all = case_tokens(&vocabulary, &prompt_base(), case).expect("the prompt encodes");
     let tokens = &all[..1200.min(all.len())];
     assert!(
         tokens.len() > *CHUNK_WIDTHS.iter().max().unwrap_or(&0),
@@ -425,7 +434,7 @@ fn the_recorded_golden_replays_at_the_same_source_budget() {
     };
     let cases = golden_cases();
     let refs: Vec<&LocalCase> = cases.iter().collect();
-    let digest = prompts_digest(&vectors_dir(), &refs).expect("the prompt files read");
+    let digest = prompts_digest(&prompt_base(), &refs).expect("the prompt files read");
     let file =
         vecfile::read(&vectors_dir().join("goldens/qwen35-local-golden.vec")).expect("it parses");
     assert_eq!(
@@ -450,7 +459,7 @@ fn the_recorded_golden_replays_at_the_same_source_budget() {
 
     let mut failures = Vec::new();
     for case in &cases {
-        let produced = run_case(&mut harness, &vocabulary, &vectors_dir(), case)
+        let produced = run_case(&mut harness, &vocabulary, &prompt_base(), case)
             .expect("the case runs against the checkpoint");
         let mut winner_checked = false;
         for budget in [&FLOOR, &REFERENCE, &STRICT] {
@@ -648,7 +657,7 @@ fn agreed_tokens(
     vocabulary: &Vocabulary,
     case: &LocalCase,
 ) -> Vec<shiso_core::TokenId> {
-    let tokens = case_tokens(vocabulary, &vectors_dir(), case).expect("the prompt encodes");
+    let tokens = case_tokens(vocabulary, &prompt_base(), case).expect("the prompt encodes");
     assert_eq!(
         u32::try_from(tokens.len()).unwrap_or(u32::MAX),
         case.frontier,
@@ -767,7 +776,7 @@ fn the_reference_captured_anchor_replays_at_the_cross_build_floor() {
         panic!("the reference fixture is a token-id fixture");
     };
     let refs: Vec<&LocalCase> = cases.iter().collect();
-    let digest = prompts_digest(&vectors_dir(), &refs).expect("the prompt files read");
+    let digest = prompts_digest(&prompt_base(), &refs).expect("the prompt files read");
     assert_eq!(
         file.headers.get("prompts_digest").map(String::as_str),
         Some(digest.as_str()),

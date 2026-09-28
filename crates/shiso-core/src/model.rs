@@ -405,6 +405,59 @@ pub struct Speculated {
     pub drafted: u32,
 }
 
+/// What a drafter may know about how the caller will choose tokens: the
+/// sequence's sampling key and temperature.
+///
+/// A drafter that scores its candidates with the same noise the caller's keyed
+/// draw will add proposes the token that draw is likely to land on, rather than
+/// the most likely token. Only acceptance depends on it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DraftHint {
+    /// The key the caller's keyed draw uses.
+    pub key: u64,
+    /// The temperature it divides by; zero or below is a greedy caller.
+    pub temperature: f32,
+}
+
+impl DraftHint {
+    /// A greedy caller: no noise to follow.
+    #[must_use]
+    pub const fn greedy() -> Self {
+        Self {
+            key: 0,
+            temperature: 0.0,
+        }
+    }
+}
+
+/// A drafted block and the target's logits over it, before anything is kept.
+///
+/// The first half of a two-phase speculative step. Row `i` of the logits is the
+/// distribution the target puts on the token after `first, drafts[..i]`, so the
+/// caller can choose each token exactly as it would have in one-token decoding -
+/// with whatever sampling rule that position would have had - and keep the
+/// drafts up to the first one it did not choose. Nothing is committed until
+/// [`Speculating::settle_block`] is told how many were kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedBlock {
+    /// The tokens drafted behind `first`, in order.
+    pub drafts: Vec<TokenId>,
+    /// `drafts.len() + 1` rows of `vocab` logits, back to back.
+    pub logits: Vec<f32>,
+    /// Entries in one row.
+    pub vocab: usize,
+}
+
+impl VerifiedBlock {
+    /// Row `i`'s logits, or an empty slice past the last row.
+    #[must_use]
+    pub fn row(&self, i: usize) -> &[f32] {
+        self.logits
+            .get(i.saturating_mul(self.vocab)..i.saturating_add(1).saturating_mul(self.vocab))
+            .unwrap_or(&[])
+    }
+}
+
 /// A model that can propose several tokens and verify them in one pass.
 ///
 /// Separate from [`Model`] for the reason [`crate::media::MediaModel`] is:
@@ -444,6 +497,53 @@ pub trait Speculating: Model {
             .iter()
             .map(|(session, first)| self.speculate(*session, *first))
             .collect()
+    }
+
+    /// Drafts behind `first` and verifies the block, committing nothing: the
+    /// first half of a step whose tokens the caller chooses itself. `hint` is
+    /// how the caller will choose them, which a drafter may follow.
+    ///
+    /// This is what lets a sampled sequence speculate. Its caller draws each
+    /// row's token by a rule that depends only on that row's logits and the
+    /// token's position, keeps the drafts up to the first it did not draw, and
+    /// hands that count to [`Speculating::settle_block`].
+    ///
+    /// The default is `None`: a family with only the greedy step speculates
+    /// greedy sequences through [`Speculating::speculate`] and no others.
+    ///
+    /// # Errors
+    ///
+    /// As [`Speculating::speculate`].
+    // None: this family has no two-phase step.
+    fn verify_block(
+        &mut self,
+        session: SessionId,
+        first: TokenId,
+        hint: DraftHint,
+    ) -> CoreResult<Option<VerifiedBlock>> {
+        let _ = (session, first, hint);
+        Ok(None)
+    }
+
+    /// Commits `first` and the first `accepted` drafts of the block
+    /// [`Speculating::verify_block`] returned for `session`.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] for a family with no two-phase step, or no
+    /// block verified for `session`; [`CoreError::ShapeMismatch`] for more kept
+    /// drafts than were drafted; and whatever the device reports.
+    fn settle_block(
+        &mut self,
+        session: SessionId,
+        block: VerifiedBlock,
+        accepted: u32,
+    ) -> CoreResult<()> {
+        let _ = (session, block, accepted);
+        Err(CoreError::Unsupported {
+            what: "a two-phase speculative step on a family that has none",
+            backend: "model",
+        })
     }
 }
 
