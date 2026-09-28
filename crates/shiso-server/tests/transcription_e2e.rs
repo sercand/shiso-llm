@@ -239,6 +239,78 @@ async fn transcriptions_end_to_end() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{wrong}");
 }
 
+/// `keywords[]` steers the Qwen3 recognizer's transcript, and the Nemotron
+/// recognizer refuses a context outright: the same clip, once plain and once
+/// with two words it really contains, then the same keywords against
+/// Nemotron.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the local speech checkpoints and a Metal device"]
+async fn keywords_end_to_end() {
+    let Some((state, _diar)) = booted_chunking(&[]) else {
+        return;
+    };
+    let speech = clip("speech-en");
+
+    let (status, plain) = post(&state, form(&speech, &[("model", "qwen3")])).await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+
+    let (status, with_keywords) = post(
+        &state,
+        form(
+            &speech,
+            &[
+                ("model", "qwen3"),
+                ("keywords[]", "Chicago"),
+                ("keywords[]", "farewell"),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{with_keywords}");
+    let json: Value = serde_json::from_str(&with_keywords).expect("json");
+    let transcript = json["text"].as_str().expect("text").to_owned();
+    say(&format!("json: {transcript:?}"));
+    let normalized = transcript
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    for word in ["chicago", "farewell"] {
+        assert!(normalized.contains(word), "{normalized:?} misses {word:?}");
+    }
+    drop(state);
+
+    // `booted()` panics if the roots are set but lack what the load needs
+    // (it mirrors the binary's own boot, which is meant to fail loudly); so
+    // check the same `nvidia` subdirs it opens before calling it, and skip
+    // rather than crash when a root is present but incomplete.
+    let asr_root = std::env::var_os("SHISO_TEST_MODEL_ASR").map(PathBuf::from);
+    let diar_root = std::env::var_os("SHISO_TEST_MODEL_DIAR").map(PathBuf::from);
+    let nemotron_ready = asr_root.is_some_and(|p| p.join("nvidia").exists())
+        && diar_root.is_some_and(|p| p.join("nvidia").exists());
+    if !nemotron_ready {
+        say("SKIP: SHISO_TEST_MODEL_ASR/nvidia or SHISO_TEST_MODEL_DIAR/nvidia is absent");
+        return;
+    }
+    let Some(nemotron) = booted() else { return };
+    let (status, refused) = post(
+        &nemotron,
+        form(
+            &speech,
+            &[
+                ("model", "nemotron-asr"),
+                ("keywords[]", "Chicago"),
+                ("keywords[]", "farewell"),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let refused: Value = serde_json::from_str(&refused).expect("json");
+    assert_eq!(refused["error"]["param"], "keywords", "{refused}");
+}
+
 /// The chunking recognizer's state: the `Q8_0` text GGUF (its mmproj found
 /// beside it) and the MLX diarizer, booted as the binary boots them with
 /// `extra` flags. Needs `SHISO_TEST_MODEL_QWEN3ASR` and
