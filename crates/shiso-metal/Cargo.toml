@@ -87,6 +87,10 @@ name = "dense_exact_affine"
 path = "tests/dense_exact_affine.rs"
 
 [[test]]
+name = "dense_block_draft"
+path = "tests/dense_block_draft.rs"
+
+[[test]]
 name = "q35_compile"
 path = "tests/q35_compile.rs"
 

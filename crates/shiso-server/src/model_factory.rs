@@ -440,6 +440,10 @@ pub fn load_model(
     // misleading one.
     match Qwen35Config::from_hf(config) {
         Ok(family) => {
+            // A block drafter is a directory of its own, not a sidecar head.
+            if let Some(dir) = block_drafter_dir(args) {
+                return load_qwen35_block(backend, path, &family, args, dir, defaults);
+            }
             // Resolved before the load and refused before a byte moves: a head
             // that cannot be found is an operator's mistake, and finding it out
             // after several gigabytes of weights is finding it out too late.
@@ -559,6 +563,42 @@ pub fn load_model(
 
     Err(FactoryError::UnknownArchitecture {
         model_type: config.model_type().to_owned(),
+    })
+}
+
+/// The `--draft-model` directory when it holds a block drafter: the target
+/// then loads plain, at the asked depth, and the drafter binds beside it.
+fn block_drafter_dir(args: &ServeArgs) -> Option<&Path> {
+    args.draft_model
+        .as_deref()
+        .filter(|dir| shiso_models::qwen35::block_draft::is_block_drafter(dir))
+}
+
+/// The dense arm with a block drafter beside it: the target at the asked depth,
+/// the drafter in `dir` bound to it.
+///
+/// # Errors
+///
+/// [`FactoryError::Load`] for whatever the target or the drafter refuses.
+fn load_qwen35_block(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    family: &Qwen35Config,
+    args: &ServeArgs,
+    dir: &Path,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    let mut model = Qwen35Model::load(backend, path, family, dense_options(args)?)
+        .map_err(FactoryError::Load)?;
+    model
+        .bind_block_drafter(backend, dir)
+        .map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_qwen35_tower,
+        open_audio: no_audio_tower,
+        placement: Qwen35Tower::PLACEMENT,
+        defaults,
     })
 }
 

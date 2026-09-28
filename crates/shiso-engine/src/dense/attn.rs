@@ -239,6 +239,43 @@ fn softmax(
     .map_err(|err| launch::launch_failure(name, err))
 }
 
+/// Writes `n_tok` rows of keys and values into the cache and nothing else.
+///
+/// The key and value halves of [`run`], for a caller whose rows are context
+/// other queries will attend to later but that ask nothing themselves: a block
+/// drafter's view of the target's committed positions. The launches are
+/// [`run`]'s own, so a row stored here reads exactly as one [`run`] stored.
+///
+/// # Errors
+///
+/// As [`run`].
+pub(crate) fn store(
+    backend: &dyn Backend,
+    attn: &Attn,
+    geometry: &AttnGeometry,
+    scratch: &AttnScratch,
+    cache: &AttnCache<'_>,
+    rows: StoreRows<'_>,
+) -> CoreResult<()> {
+    let (k_proj, v_proj, k_norm) = attn.kv()?;
+    projection::projection(backend, k_proj, rows.n_tok, rows.input, scratch.k.view())?;
+    projection::projection(backend, v_proj, rows.n_tok, rows.input, scratch.v.view())?;
+    kv_norm_rope_store(
+        backend, k_norm, geometry, scratch, cache, rows.pos, rows.n_tok,
+    )
+}
+
+/// The rows [`store`] writes: their inputs, their positions and how many.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoreRows<'a> {
+    /// `int32` positions, one a row.
+    pub(crate) pos: DeviceView<'a>,
+    /// The normalized rows the key and value projections read.
+    pub(crate) input: DeviceView<'a>,
+    /// Rows.
+    pub(crate) n_tok: u32,
+}
+
 /// Runs one dense attention block over `n_tok` rows of `io.input`.
 ///
 /// `io.pos` carries the chunk's `int32` positions and `cache` is the session's

@@ -32,6 +32,9 @@ tracing = { workspace = true }
 # The routed expert stream's slot table is shared by the binder that issues a
 # fetch and nothing else, behind a lock that cannot be poisoned.
 parking_lot = { workspace = true }
+# The load-time quantizer stores scales and biases as `bfloat16`, through the
+# same conversion the loader decodes them with.
+half = { workspace = true }
 
 [dev-dependencies]
 # The device the model tests run on. A dev-dependency only: the engine itself

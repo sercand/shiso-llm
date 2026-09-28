@@ -385,6 +385,26 @@ struct dense_args_affine {
     uint32_t bits;
 };
 
+/// Strided row copy (`dense_block_draft.metal`).
+struct dense_args_copy_rows {
+    uint32_t n_rows;
+    uint32_t width;
+    uint32_t dst_stride;
+    uint32_t dst_offset;
+};
+
+/// Grouped dynamic causal convolution (`dense_block_draft.metal`).
+struct dense_args_dyn_conv {
+    uint32_t n_rows;
+    uint32_t hidden;
+    uint32_t group;
+    uint32_t taps;
+    uint32_t part;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
 /// Row-exact affine matmul (`dense_exact_affine.metal`): the weight's shape and
 /// the rows of the call.
 struct dense_args_exact_affine {

@@ -50,6 +50,60 @@ kernel void kernel_q35_gdn_conv(
     }
 }
 
+/// `kernel_q35_gdn_conv`, also writing the window after every row but the last
+/// into a trail of `n_tok - 1` window records: a verify pass's per-row windows
+/// in one launch. The arithmetic is the plain kernel's, row for row.
+kernel void kernel_q35_gdn_conv_trail(
+        constant q35_args_gdn_conv & args [[buffer(0)]],
+        device float *out                 [[buffer(1)]],
+        device float *state               [[buffer(2)]],
+        device const float *x             [[buffer(3)]],
+        device const float *w             [[buffer(4)]],
+        device float *trail               [[buffer(5)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint c = tgpig.x * 256u + tpitg.x;
+    if (c >= args.channels) {
+        return;
+    }
+    const uint hist = args.conv_kernel - 1u;
+
+    // This channel's history, oldest first.
+    float win[8];
+    for (uint i = 0; i < hist; i++) {
+        win[i] = state[(uint64_t) i * args.channels + c];
+    }
+
+    device const float *wc = w + (uint64_t) c * args.conv_kernel;
+    for (uint t = 0; t < args.n_tok; t++) {
+        const float cur = x[(uint64_t) t * args.channels + c];
+        float acc = 0.0f;
+        for (uint k = 0; k < hist; k++) {
+            acc += wc[k] * win[k];
+        }
+        acc += wc[hist] * cur;
+        out[(uint64_t) t * args.channels + c] = q35_silu(acc);
+        for (uint k = 0; k + 1u < hist; k++) {
+            win[k] = win[k + 1u];
+        }
+        if (hist > 0u) {
+            win[hist - 1u] = cur;
+        }
+        // The window after this row, into its record - every row but the last,
+        // whose record is the window the launch leaves in `state`.
+        if (t + 1u < args.n_tok) {
+            device float *rec = trail + (uint64_t) t * hist * args.channels;
+            for (uint i = 0; i < hist; i++) {
+                rec[(uint64_t) i * args.channels + c] = win[i];
+            }
+        }
+    }
+
+    for (uint i = 0; i < hist; i++) {
+        state[(uint64_t) i * args.channels + c] = win[i];
+    }
+}
+
 /// In-place L2 norm of one head of one token.  Not an RMS norm: no weight, no
 /// mean, and the epsilon is added to the raw sum of squares.
 kernel void kernel_q35_gdn_l2norm(

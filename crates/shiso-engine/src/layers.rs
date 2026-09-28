@@ -1437,7 +1437,7 @@ fn per_layer_gate(
 /// A destination of its own rather than an add in place: the residual stream is
 /// two buffers the pass alternates between, and this writes the one the slot is
 /// about to start reading.
-fn add2(
+pub(crate) fn add2(
     backend: &dyn Backend,
     a: DeviceView<'_>,
     b: DeviceView<'_>,
@@ -1596,8 +1596,9 @@ pub(crate) fn forward(
     ple: Option<&PleTable>,
     n_tok: u32,
     media: Option<MediaChunk<'_>>,
-    trail: Trail,
+    extras: PassExtras<'_>,
 ) -> CoreResult<ResidualIndex> {
+    let trail = extras.trail;
     let Some(first) = weights.layers.first() else {
         return Err(CoreError::ShapeMismatch {
             field: "layer count",
@@ -1822,6 +1823,21 @@ pub(crate) fn forward(
         } else {
             close(backend, geometry, scratch, cur, block, next, n_tok)?
         };
+        // The slot's whole output - block and feed-forward folded in - is what
+        // the close just wrote, and it is what a block drafter reads.
+        if let Some(sink) = extras.taps {
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
+            if let Some(slot) = sink.layers.iter().position(|&l| l == index) {
+                crate::block_draft::tap_rows(
+                    backend,
+                    sink,
+                    u32::try_from(slot).unwrap_or(u32::MAX),
+                    scratch.stream[cur].view(),
+                    geometry.hidden,
+                    n_tok,
+                )?;
+            }
+        }
     }
     // Which of the two stream buffers the last close landed in. A draft head
     // reads the target's residual for the row it drafts from, and the parity of
@@ -1829,6 +1845,16 @@ pub(crate) fn forward(
     // reader that guessed the other buffer would find a residual one layer old,
     // at exactly the right shape.
     Ok(ResidualIndex(cur))
+}
+
+/// What a pass carries besides its rows: whether it records a trail, and where
+/// it writes a block drafter's taps.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PassExtras<'a> {
+    /// Whether the recurrent slots record a per-row trail.
+    pub(crate) trail: Trail,
+    /// The tapped layers and where their rows go, when a drafter is bound.
+    pub(crate) taps: Option<crate::block_draft::TapSink<'a>>,
 }
 
 /// Normalizes a block's output, for a family that normalizes it.
@@ -2062,6 +2088,45 @@ pub(crate) fn scale_rows(
         ],
     )
     .map_err(|err| launch::launch_failure("kernel_dense_scale_f32", err))
+}
+
+/// Projects normalized rows `0 .. n` into logits rows `0 .. n` in one call.
+///
+/// A verify pass's rows are contiguous in both blocks, so its logits are one
+/// projection over `n` rows - which reads the vocabulary matrix once - rather
+/// than `n` projections of one row that read it `n` times. The rows' bits are
+/// the one-row call's: the projection is row-exact.
+///
+/// # Errors
+///
+/// As [`logits_row`].
+pub(crate) fn logits_rows(
+    backend: &dyn Backend,
+    weights: &Weights,
+    geometry: &Geometry,
+    scratch: &Scratch,
+    n: u32,
+) -> CoreResult<()> {
+    let hidden = u64::from(geometry.hidden).saturating_mul(launch::F32_BYTES);
+    let vocab = u64::from(geometry.vocab).saturating_mul(launch::F32_BYTES);
+    let src = scratch
+        .normed
+        .slice(0, u64::from(n).saturating_mul(hidden))?;
+    let dst = scratch
+        .logits
+        .slice(0, u64::from(n).saturating_mul(vocab))?;
+    projection::projection(backend, weights.output_matrix(), n, src, dst)?;
+    if let Some(cap) = geometry.final_softcap {
+        for row in 0..n {
+            softcap_row(
+                backend,
+                dst.slice(u64::from(row).saturating_mul(vocab), vocab)?,
+                geometry.vocab,
+                cap,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Projects one normalized row into one logits row, capped where the family caps

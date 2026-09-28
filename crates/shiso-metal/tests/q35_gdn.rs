@@ -91,3 +91,17 @@ fn every_viable_chunk_variant_matches_the_recurrence() {
     let Some(gpu) = open() else { return };
     cases::every_viable_chunk_variant_matches_the_recurrence(&gpu);
 }
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn recurrent_trail_records_are_the_per_row_walk() {
+    let Some(gpu) = open() else { return };
+    cases::recurrent_trail_records_are_the_per_row_walk(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn conv_trail_records_are_the_per_row_walk() {
+    let Some(gpu) = open() else { return };
+    cases::conv_trail_records_are_the_per_row_walk(&gpu);
+}

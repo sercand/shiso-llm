@@ -35,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub mod attn;
+pub mod block_draft;
 pub mod blocks;
 pub mod ckpt;
 mod ckpt_layout;
@@ -60,6 +61,7 @@ pub use sparse::mtp;
 mod options;
 pub mod ple_rows;
 pub mod projection;
+pub mod quantize;
 #[cfg(test)]
 mod recorder;
 mod rows;

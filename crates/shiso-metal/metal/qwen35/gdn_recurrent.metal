@@ -47,7 +47,7 @@
 // shiso/crates/shiso-metal/src/compile.rs.
 #pragma METAL fp math_mode(safe)
 
-template <uint SPLIT, uint SEG>
+template <uint SPLIT, uint SEG, bool TRAIL>
 static inline void q35_gdn_recurrent_impl(
         constant q35_args_gdn_recurrent & args,
         device float *attn_out,
@@ -55,6 +55,7 @@ static inline void q35_gdn_recurrent_impl(
         device const float *qkv,
         device const float *decay,
         device const float *beta,
+        device float *trail,
         threadgroup float *tbuf,
         uint3 tgpig,
         ushort3 tpitg) {
@@ -188,6 +189,17 @@ static inline void q35_gdn_recurrent_impl(
                                         delta * s_k[qbase + rot]);
             }
         }
+        // The state after this row, into its record of the trail - every row
+        // but the last, whose record is the state the launch leaves behind.
+        // The registers are exactly what a launch over rows 0..=t would have
+        // written back, so a record here is bit for bit the per-row walk's.
+        if (TRAIL && t + 1u < args.n_tok) {
+            device float *R = trail + (uint64_t) t * args.n_head_v * head_dim * head_dim
+                    + (uint64_t) h * head_dim * head_dim + (uint64_t) j * head_dim + i0;
+            for (uint n = 0u; n < seg; n++) {
+                R[n] = row[n];
+            }
+        }
         // k and q are rewritten by the next token.
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -210,13 +222,35 @@ kernel void NAME(                                                             \
         threadgroup float *tbuf [[threadgroup(0)]],                           \
         uint3 tgpig[[threadgroup_position_in_grid]],                          \
         ushort3 tpitg[[thread_position_in_threadgroup]]) {                    \
-    q35_gdn_recurrent_impl<SPLIT, SEG>(                                       \
-            args, attn_out, state, qkv, decay, beta, tbuf, tgpig, tpitg);     \
+    q35_gdn_recurrent_impl<SPLIT, SEG, false>(                                \
+            args, attn_out, state, qkv, decay, beta, nullptr, tbuf, tgpig, tpitg); \
+}
+
+// The same body, also writing the state after every row but the last into a
+// trail of `n_tok - 1` state records: what a verify pass needs to wind back to
+// any row, in one launch instead of one per row.
+#define Q35_GDN_RECURRENT_TRAIL_BODY(NAME, SPLIT, SEG)                        \
+kernel void NAME(                                                             \
+        constant q35_args_gdn_recurrent & args [[buffer(0)]],                 \
+        device float *attn_out [[buffer(1)]],                                 \
+        device float *state [[buffer(2)]],                                    \
+        device const float *qkv [[buffer(3)]],                                \
+        device const float *decay [[buffer(4)]],                              \
+        device const float *beta [[buffer(5)]],                               \
+        device float *trail [[buffer(6)]],                                    \
+        threadgroup float *tbuf [[threadgroup(0)]],                           \
+        uint3 tgpig[[threadgroup_position_in_grid]],                          \
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {                    \
+    q35_gdn_recurrent_impl<SPLIT, SEG, true>(                                 \
+            args, attn_out, state, qkv, decay, beta, trail, tbuf, tgpig, tpitg); \
 }
 
 Q35_GDN_RECURRENT_BODY(kernel_q35_gdn_recurrent_s1, 1u, 128u)
 Q35_GDN_RECURRENT_BODY(kernel_q35_gdn_recurrent_s2, 2u, 64u)
 Q35_GDN_RECURRENT_BODY(kernel_q35_gdn_recurrent_s4, 4u, 32u)
+Q35_GDN_RECURRENT_TRAIL_BODY(kernel_q35_gdn_recurrent_trail_s1, 1u, 128u)
+Q35_GDN_RECURRENT_TRAIL_BODY(kernel_q35_gdn_recurrent_trail_s2, 2u, 64u)
+Q35_GDN_RECURRENT_TRAIL_BODY(kernel_q35_gdn_recurrent_trail_s4, 4u, 32u)
 
 // Back to the library-wide default for the files concatenated after this one.
 #pragma METAL fp math_mode(fast)

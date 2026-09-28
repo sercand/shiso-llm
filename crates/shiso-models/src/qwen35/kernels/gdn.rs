@@ -119,6 +119,51 @@ fn conv(
     .map_err(|err| launch::launch_failure("kernel_q35_gdn_conv", err))
 }
 
+/// The convolution over rows `0 .. n_tok`, writing the window after every row
+/// but the last into `trail`, in one launch.
+fn conv_recorded(
+    backend: &dyn Backend,
+    gdn: &Gdn,
+    geometry: &GdnGeometry,
+    scratch: &GdnScratch,
+    conv_state: DeviceView<'_>,
+    trail: DeviceView<'_>,
+    n_tok: u32,
+) -> CoreResult<()> {
+    const NAME: &str = "kernel_q35_gdn_conv_trail";
+    let need = conv_state
+        .len()
+        .saturating_mul(u64::from(n_tok.saturating_sub(1)));
+    if trail.len() < need {
+        return Err(CoreError::OutOfBounds {
+            offset: 0,
+            len: need,
+            buffer_bytes: trail.len(),
+        });
+    }
+    let args = ConvArgs {
+        channels: geometry.channels,
+        conv_kernel: geometry.conv_kernel,
+        n_tok,
+    };
+    launch::run(
+        backend,
+        KernelRef::new(Q35, NAME),
+        Extent3::linear(geometry.channels.div_ceil(BLOCK_LINEAR)),
+        Extent3::new(BLOCK_LINEAR, 1, 1),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(scratch.mix.view()),
+            KernelArg::Buffer(conv_state),
+            KernelArg::Buffer(scratch.x.view()),
+            KernelArg::Buffer(gdn.conv1d.view()),
+            KernelArg::Buffer(trail),
+        ],
+    )
+    .map_err(|err| launch::launch_failure(NAME, err))
+}
+
 /// Normalizes both the query and the key half of the mix, in place.
 ///
 /// The kernel takes a head family by offset, so the two halves are two launches
@@ -261,6 +306,58 @@ fn recurrence(
     .map_err(|err| launch::launch_failure(variant.entry(), err))
 }
 
+/// The recurrence over rows `0 .. n_tok`, writing the state after every row
+/// but the last into `trail`, in one launch of the variant's recording twin.
+fn recurrence_recorded(
+    backend: &dyn Backend,
+    geometry: &GdnGeometry,
+    scratch: &GdnScratch,
+    variant: (gdn_tune::Variant, &'static str),
+    state: DeviceView<'_>,
+    trail: DeviceView<'_>,
+    n_tok: u32,
+) -> CoreResult<()> {
+    let (variant, entry) = variant;
+    let args = RecurrentArgs {
+        head_dim: geometry.head_dim,
+        n_head_k: geometry.qk_heads,
+        n_head_v: geometry.v_heads,
+        k_offset: geometry.k_offset(),
+        v_offset: geometry.v_offset(),
+        stride: geometry.channels,
+        n_tok,
+    };
+    // A trail too short for the pass's records is refused here, before the
+    // kernel writes past it.
+    let need = state
+        .len()
+        .saturating_mul(u64::from(n_tok.saturating_sub(1)));
+    if trail.len() < need {
+        return Err(CoreError::OutOfBounds {
+            offset: 0,
+            len: need,
+            buffer_bytes: trail.len(),
+        });
+    }
+    launch::run(
+        backend,
+        KernelRef::new(Q35, entry),
+        Extent3::linear(geometry.v_heads),
+        Extent3::new(variant.lanes(), 1, 1),
+        variant.smem_bytes(),
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(scratch.attn_out.view()),
+            KernelArg::Buffer(state),
+            KernelArg::Buffer(scratch.mix.view()),
+            KernelArg::Buffer(scratch.decay.view()),
+            KernelArg::Buffer(scratch.beta_out.view()),
+            KernelArg::Buffer(trail),
+        ],
+    )
+    .map_err(|err| launch::launch_failure(entry, err))
+}
+
 /// Applies the per-head normalization and the output gate.
 ///
 /// The gate is a projection row, not a scalar: the kernel reads one head-width of
@@ -365,16 +462,31 @@ pub(super) fn run(
             // left - so a single loop would either interleave four launches per
             // row where two will do, or read a row the batched stages had not
             // reached yet.
-            walk(n_tok, |row| {
-                conv(backend, gdn, geometry, scratch, one.conv, row.span)?;
-                record(backend, trail.conv, one.conv, row)
-            })?;
+            conv_recorded(backend, gdn, geometry, scratch, one.conv, trail.conv, n_tok)?;
             normalize(backend, geometry, scratch, n_tok)?;
             gates(backend, gdn, geometry, scratch, input, n_tok)?;
-            walk(n_tok, |row| {
-                recurrence(backend, geometry, scratch, shape, one.state, row.span)?;
-                record(backend, trail.state, one.state, row)
-            })?;
+            // One launch that writes every row's record as it goes, where the
+            // variant has a recording twin; the per-row walk otherwise. The two
+            // leave the same bits in the trail and in the state.
+            match shape
+                .recurrent
+                .trail_entry()
+                .filter(|_| n_tok < launch::GDN_CHUNK_MIN)
+            {
+                Some(entry) => recurrence_recorded(
+                    backend,
+                    geometry,
+                    scratch,
+                    (shape.recurrent, entry),
+                    one.state,
+                    trail.state,
+                    n_tok,
+                )?,
+                None => walk(n_tok, |row| {
+                    recurrence(backend, geometry, scratch, shape, one.state, row.span)?;
+                    record(backend, trail.state, one.state, row)
+                })?,
+            }
         }
         (GdnStates::PerRow(rows), None) => {
             per_row(rows, n_tok)?;

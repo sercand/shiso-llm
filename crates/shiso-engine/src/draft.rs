@@ -323,7 +323,7 @@ impl HybridStack {
     /// speculative.
     #[must_use]
     pub fn draft_resident(&self) -> bool {
-        self.draft.is_some()
+        self.draft.is_some() || self.block.is_some()
     }
 
     /// How deep this stack may draft.
@@ -357,6 +357,9 @@ impl HybridStack {
         first: TokenId,
         eos: TokenId,
     ) -> CoreResult<Speculated> {
+        if self.block.is_some() {
+            return self.speculate_block(session, first, eos);
+        }
         let live = self
             .sessions
             .get(&session)
@@ -541,7 +544,7 @@ impl HybridStack {
     }
 
     /// The greedy pick of every row of the pass that just ran.
-    fn read_picks(&mut self, rows: u32) -> CoreResult<Vec<TokenId>> {
+    pub(crate) fn read_picks(&mut self, rows: u32) -> CoreResult<Vec<TokenId>> {
         let vocab = self.geometry.vocab;
         let row_bytes = u64::from(vocab).saturating_mul(F32_BYTES);
         let want = row_bytes.saturating_mul(u64::from(rows));

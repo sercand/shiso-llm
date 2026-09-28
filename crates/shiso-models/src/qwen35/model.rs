@@ -225,6 +225,32 @@ impl Qwen35Model {
     }
 }
 
+impl Qwen35Model {
+    /// Reads the block drafter in `dir` and binds it to this model's stack.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`crate::qwen35::block_draft::load`] reports for the directory,
+    /// and [`CoreError::Unsupported`] from the stack for a model loaded without
+    /// a speculative depth.
+    pub fn bind_block_drafter(&mut self, backend: &Arc<dyn Backend>, dir: &Path) -> CoreResult<()> {
+        let geometry = self.stack.geometry().clone();
+        let parts = crate::qwen35::block_draft::load(
+            backend,
+            dir,
+            (self.info.hidden, self.info.n_layers, self.info.vocab),
+        )?;
+        let drafter = shiso_engine::block_draft::BlockDrafter::new(
+            backend,
+            parts,
+            (&geometry, self.info.n_layers),
+            self.stack.pool_pages(),
+            MAX_PREFILL_CHUNK,
+        )?;
+        self.stack.bind_block_drafter(drafter)
+    }
+}
+
 /// Checks the bound layer list against the config's own.
 ///
 /// The binding already checked the roles a slot carries; what is checked here is

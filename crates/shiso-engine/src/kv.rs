@@ -132,6 +132,16 @@ impl KvLayout {
         }
     }
 
+    /// Key and value runs for `slots` attention slots of one width: a block
+    /// drafter's layers, which have a pool of their own for the reason
+    /// [`KvLayout::for_one_attn_slot`] gives.
+    pub(crate) fn for_attn_slots(slots: u32, kv_heads: u32, head_dim: u32) -> Self {
+        let one = Self::for_one_attn_slot(kv_heads, head_dim);
+        Self {
+            run_bytes: (0..slots).flat_map(|_| one.run_bytes.clone()).collect(),
+        }
+    }
+
     /// Sum over runs: the cache's `page_bytes`.
     pub(crate) fn page_bytes(&self) -> u64 {
         self.run_bytes.iter().copied().fold(0, u64::saturating_add)
