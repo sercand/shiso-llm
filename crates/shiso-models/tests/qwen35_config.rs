@@ -378,3 +378,51 @@ fn a_document_that_names_im_end_lists_it_once() {
     let stop: Vec<u32> = profile.stop_tokens().iter().map(|id| id.get()).collect();
     assert_eq!(stop, vec![248_046]);
 }
+
+/// The dense 27B checkpoint's own config document, verbatim from
+/// `Vontra/Qwen3.8-27B-MLX-4bit` (rev `70ae7fa`).
+fn fixture_27b() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-vectors/loader/qwen38-27b-config.json")
+        .normalize()
+}
+
+#[test]
+fn the_27b_checkpoint_is_the_same_family_at_other_widths() {
+    let config = HfConfig::from_file(&fixture_27b()).expect("fixture parses");
+    let profile = Qwen35Config::from_hf(&config).expect("qwen35 shape");
+    let shape = profile.shape();
+    assert_eq!(shape.n_layers(), 64);
+    assert_eq!(shape.hidden, 5120);
+    assert_eq!(shape.intermediate, 17408);
+    assert_eq!(shape.vocab, 248_320);
+    assert_eq!(shape.attn.len(), 16);
+    let attn = shape.attn.first().expect("an attention slot");
+    assert_eq!(
+        (attn.q_heads, attn.kv_heads, attn.head_dim, attn.n_rot),
+        (24, 4, 256, 64)
+    );
+    assert_eq!(shape.gdn.v_heads, 48);
+    assert_eq!(shape.gdn.qk_heads, 16);
+    assert_eq!(profile.full_attention_interval(), 4);
+}
+
+#[test]
+fn a_head_width_the_kernels_do_not_take_is_refused_at_any_size() {
+    let text = replace(
+        &std::fs::read_to_string(fixture_27b()).expect("fixture reads"),
+        "\"head_dim\": 256",
+        "\"head_dim\": 128",
+    );
+    let config = HfConfig::from_json_str(&text).expect("edited fixture parses");
+    match Qwen35Config::from_hf(&config).expect_err("the attention kernels take 256 only") {
+        CoreError::ShapeMismatch {
+            field,
+            expected,
+            got,
+        } => {
+            assert_eq!((field, expected, got), ("head_dim", 256, 128));
+        }
+        other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+}

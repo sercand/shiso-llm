@@ -187,6 +187,12 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "dense/dense_affine_rows.metal",
         include_str!("../metal/dense/dense_affine_rows.metal"),
     ),
+    // The row-exact affine matmul: one arithmetic for every row count, so a
+    // verify window's rows equal the serial steps they check.
+    (
+        "dense/dense_exact_affine.metal",
+        include_str!("../metal/dense/dense_exact_affine.metal"),
+    ),
     // --- qwen35moe kernel set; appended, nothing above this line changed. The
     // header comes first, for the same reason the qwen35, vision and dense
     // headers do: the files after it use its argument block and its affine

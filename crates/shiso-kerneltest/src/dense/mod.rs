@@ -18,6 +18,7 @@
 
 pub mod affine;
 pub mod attn;
+pub mod exact_affine;
 pub mod misc;
 pub mod ple;
 pub mod q4_0;

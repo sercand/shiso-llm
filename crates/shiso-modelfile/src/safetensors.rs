@@ -53,7 +53,7 @@ use serde::Deserialize;
 use shiso_core::DType;
 
 use crate::mlx_quant::{MlxAffineLayout, dequant_affine};
-use crate::name_map::{GdnHeads, HeadPermute, IdentityNames, NameMap, Role, ValueOp};
+use crate::name_map::{GdnHeads, HeadAxis, HeadPermute, IdentityNames, NameMap, Role, ValueOp};
 use crate::reader::{GgufError, GgufResult, TensorDesc, TensorShape, TensorView};
 use crate::source::TensorSource;
 use crate::st_header::{RawTensor, Shard, StDType, missing_file};
@@ -74,6 +74,20 @@ pub struct AffineTriple<'a> {
     pub scales: &'a [u8],
     /// Group biases.
     pub biases: &'a [u8],
+    /// Layout describing how to unpack the triple.
+    pub layout: MlxAffineLayout,
+}
+
+/// A packed affine weight in the binding layer's order: borrowed from the
+/// mapping when no value-head reordering applies, reordered copies otherwise.
+#[derive(Debug, Clone)]
+pub struct PackedAffine<'a> {
+    /// Packed storage words.
+    pub words: Cow<'a, [u8]>,
+    /// Group scales.
+    pub scales: Cow<'a, [u8]>,
+    /// Group biases.
+    pub biases: Cow<'a, [u8]>,
     /// Layout describing how to unpack the triple.
     pub layout: MlxAffineLayout,
 }
@@ -322,6 +336,9 @@ struct Entry {
     /// Value-head reordering applied after the plan runs, `None` for the
     /// tensors the recurrent block's head order does not reach.
     permute: Option<HeadPermute>,
+    /// The axis that reordering runs along, kept so a packed weight can be
+    /// reordered in its packed form (see [`SafetensorsFile::affine_packed`]).
+    axis: Option<HeadAxis>,
     /// Decoded copy, filled at most once and then kept alive for the file's
     /// lifetime, because a borrowed view has to point at a stable address.
     slot: OnceLock<Payload>,
@@ -354,6 +371,8 @@ pub struct SafetensorsFile {
     quant: QuantConfig,
     /// Name mapping used for translation.
     names: Arc<dyn NameMap>,
+    /// Head structure the value-head reorderings are derived from.
+    heads: GdnHeads,
 }
 
 impl SafetensorsFile {
@@ -423,13 +442,17 @@ impl SafetensorsFile {
         // binder looks up being present says nothing about a tensor it should
         // have looked up and did not, and a checkpoint short a layer binds
         // cleanly and answers wrongly.
+        let optional = entries
+            .iter()
+            .filter(|entry| names.optional_tensors().contains(&&*entry.desc.name))
+            .count();
         if let Some(want) = names.expected_tensors(n_layers, full_attention_interval)
-            && entries.len() != want
+            && entries.len() - optional != want
         {
             return Err(GgufError::ProfileMismatch {
                 key: Box::from("tensor_count"),
                 want: u64::try_from(want).unwrap_or(u64::MAX),
-                got: u64::try_from(entries.len()).unwrap_or(u64::MAX),
+                got: u64::try_from(entries.len() - optional).unwrap_or(u64::MAX),
             });
         }
 
@@ -458,6 +481,7 @@ impl SafetensorsFile {
             arch,
             quant,
             names,
+            heads,
         })
     }
 
@@ -541,6 +565,83 @@ impl SafetensorsFile {
             })),
             Plan::Widen { .. } => Ok(None),
         }
+    }
+
+    /// The packed affine triple for `name` in the binding layer's order: the
+    /// value-head reordering its role names applied to the packed words, scales
+    /// and biases, so the weight never has to be decoded to be reordered.
+    ///
+    /// A reordering along the rows moves whole packed rows - a row's words and
+    /// its groups' scales and biases travel together. One along the columns
+    /// moves whole value heads, which is possible packed only because a head's
+    /// channels are a whole number of groups: `value_head_dim` of 128 is two
+    /// groups of 64, sixteen 4-bit words or thirty-two 8-bit ones. A geometry
+    /// where that fails is refused rather than decoded.
+    ///
+    /// A tensor with no reordering is borrowed straight from the mapping, as
+    /// [`SafetensorsFile::affine_triple`] returns it.
+    ///
+    /// # Errors
+    ///
+    /// Shard I/O or bounds errors, and [`GgufError::LayoutMismatch`] when a
+    /// column reordering does not fall on group and word boundaries.
+    // None: `name` is a plain tensor with no `.scales`/`.biases` siblings.
+    pub fn affine_packed(&self, name: &str) -> GgufResult<Option<PackedAffine<'_>>> {
+        let entry = self.find_entry(name)?;
+        let Some(triple) = self.affine_triple(name)? else {
+            return Ok(None);
+        };
+        let Some(axis) = entry.axis else {
+            return Ok(Some(PackedAffine {
+                words: Cow::Borrowed(triple.words),
+                scales: Cow::Borrowed(triple.scales),
+                biases: Cow::Borrowed(triple.biases),
+                layout: triple.layout,
+            }));
+        };
+        let layout = triple.layout;
+        let bits = layout.bits as usize;
+        let rows = layout.out_rows;
+        let words_per_row = layout.in_dim * bits / 32;
+        let groups_per_row = layout.in_dim / layout.group_size;
+        // The head structure, restated in the units each array counts in. A
+        // row reordering needs nothing restated: its block is a whole row of
+        // whatever the array holds. A column one counts a head's channels in
+        // words for the packed array and in groups for the other two.
+        let (word_heads, group_heads) = if axis == HeadAxis::ValueColumns {
+            let dim = self.heads.value_head_dim;
+            if !(dim * bits).is_multiple_of(32) || !dim.is_multiple_of(layout.group_size) {
+                return Err(GgufError::LayoutMismatch {
+                    tensor: name.into(),
+                    want: Box::from("value heads a whole number of words and groups wide"),
+                    got: Box::from(format!(
+                        "{dim} channels at {bits} bits in groups of {}",
+                        layout.group_size
+                    )),
+                });
+            }
+            let mut words = self.heads;
+            words.value_head_dim = dim * bits / 32;
+            let mut groups = self.heads;
+            groups.value_head_dim = dim / layout.group_size;
+            (words, groups)
+        } else {
+            (self.heads, self.heads)
+        };
+        // Parsed rather than cast: an MLX payload need not sit at an aligned offset.
+        let mut words: Vec<u32> = le_words(triple.words, u32::from_le_bytes);
+        HeadPermute::new(axis, word_heads, rows, words_per_row, name)?.apply(&mut words, name)?;
+        let permute_groups = HeadPermute::new(axis, group_heads, rows, groups_per_row, name)?;
+        let mut scales: Vec<u16> = le_words(triple.scales, u16::from_le_bytes);
+        permute_groups.apply(&mut scales, name)?;
+        let mut biases: Vec<u16> = le_words(triple.biases, u16::from_le_bytes);
+        permute_groups.apply(&mut biases, name)?;
+        Ok(Some(PackedAffine {
+            words: Cow::Owned(words.iter().flat_map(|w| w.to_le_bytes()).collect()),
+            scales: Cow::Owned(scales.iter().flat_map(|w| w.to_le_bytes()).collect()),
+            biases: Cow::Owned(biases.iter().flat_map(|w| w.to_le_bytes()).collect()),
+            layout,
+        }))
     }
 
     /// Bits per weight for `name` according to the checkpoint's quantization configuration.
@@ -894,6 +995,7 @@ fn widened_entry(
             op: role.op,
         },
         permute,
+        axis: role.heads,
         slot: OnceLock::new(),
     })
 }
@@ -1029,8 +1131,19 @@ fn packed_entry(
             layout,
         },
         permute,
+        axis: role.heads,
         slot: OnceLock::new(),
     })
+}
+
+/// Little-endian values of `N` bytes each, read from `bytes` at any alignment.
+fn le_words<T, const N: usize>(bytes: &[u8], read: fn([u8; N]) -> T) -> Vec<T> {
+    bytes
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .map(|chunk| read(*chunk))
+        .collect()
 }
 
 /// Finds one of a packed weight's companion arrays.

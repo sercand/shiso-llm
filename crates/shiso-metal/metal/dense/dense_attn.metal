@@ -35,7 +35,8 @@ static inline uint dense_attn_lo(uint pos, uint window) {
 /// (running max + running denominator) and the per-simdgroup partials are merged
 /// at the end by re-referencing every partial against the global max, which is
 /// what makes the merge order-independent.
-kernel void kernel_dense_attn_decode(
+template <uint SL>
+kernel void kernel_dense_attn_decode_impl(
         constant dense_args_attn & args [[buffer(0)]],
         device float *out [[buffer(1)]],
         device const float *q [[buffer(2)]],
@@ -55,7 +56,9 @@ kernel void kernel_dense_attn_decode(
     // Query heads share key/value heads in whole groups: an integer divide, not
     // a modulo.
     const uint hkv = h / (args.n_head / args.n_head_kv);
-    const uint slots = (head_dim + 31u) / 32u;
+    // Compile-time, so the per-lane arrays below stay in registers; a
+    // runtime trip count over them spills both to memory.
+    constexpr uint slots = SL;
 
     // s_v[DENSE_ATTN_WARPS][DENSE_ATTN_HD], then s_m and s_l below it.
     threadgroup float *s_v = tbuf;
@@ -63,8 +66,8 @@ kernel void kernel_dense_attn_decode(
     threadgroup float *s_l = s_m + DENSE_ATTN_WARPS;
 
     const uint64_t qbase = ((uint64_t) t * args.n_head + h) * head_dim;
-    float qv[DENSE_ATTN_LANE_SLOTS];
-    float acc[DENSE_ATTN_LANE_SLOTS];
+    float qv[SL];
+    float acc[SL];
     for (uint j = 0u; j < slots; j++) {
         const uint i = lane + 32u * j;
         qv[j] = (i < head_dim) ? q[qbase + i] : 0.0f;
@@ -150,6 +153,15 @@ kernel void kernel_dense_attn_decode(
         out[qbase + i] = num * inv;
     }
 }
+
+typedef decltype(kernel_dense_attn_decode_impl<16>) kernel_dense_attn_decode_t;
+
+/// Any head dimension up to DENSE_ATTN_HD.
+template [[host_name("kernel_dense_attn_decode")]] kernel kernel_dense_attn_decode_t kernel_dense_attn_decode_impl<16>;
+/// Head dimensions the slot count fits exactly: the same arithmetic, fewer
+/// registers a lane.
+template [[host_name("kernel_dense_attn_decode_hd128")]] kernel kernel_dense_attn_decode_t kernel_dense_attn_decode_impl<4>;
+template [[host_name("kernel_dense_attn_decode_hd256")]] kernel kernel_dense_attn_decode_t kernel_dense_attn_decode_impl<8>;
 
 /// The prefill softmax: DENSE_ATTN_QT queries per threadgroup, DENSE_ATTN_KT
 /// keys per tile, one key per lane.

@@ -342,8 +342,11 @@ static inline uint64_t q35_kv_row(device const int32_t *pages, uint64_t position
     if (pages == nullptr) {
         return position;
     }
-    return (uint64_t) pages[position / page_tokens] * page_tokens +
-           (position % page_tokens);
+    // The divide is 32-bit: a position fits (a context is far below 2^32
+    // tokens), and a 64-bit divide is a software routine on this GPU that
+    // cost decode attention ~3000 cycles a key on an M1 Max.
+    const uint32_t p = (uint32_t) position;
+    return (uint64_t) pages[p / page_tokens] * page_tokens + (p % page_tokens);
 }
 
 /// Row `t`'s own page table inside a packed block of them.

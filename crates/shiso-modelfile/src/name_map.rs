@@ -80,6 +80,13 @@ pub trait NameMap: Send + Sync + Debug {
         let _ = (n_layers, full_attention_interval);
         None
     }
+
+    /// Translated names an export may or may not carry, left out of
+    /// [`NameMap::expected_tensors`]: an output projection, for a family whose
+    /// checkpoints tie it to the embedding in one size and store it in another.
+    fn optional_tensors(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Identity name map that maps every tensor name to itself with no transformations.

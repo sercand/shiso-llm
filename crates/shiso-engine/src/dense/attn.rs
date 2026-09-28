@@ -202,8 +202,16 @@ fn softmax(
             DENSE_ATTN_PREFILL_SMEM_BYTES,
         )
     } else {
+        // A head dimension the slot count fits exactly takes its own
+        // instantiation: the same arithmetic with the per-lane arrays sized at
+        // compile time, which keeps them out of memory.
+        let name = match geometry.head_dim {
+            128 => "kernel_dense_attn_decode_hd128",
+            256 => "kernel_dense_attn_decode_hd256",
+            _ => "kernel_dense_attn_decode",
+        };
         (
-            "kernel_dense_attn_decode",
+            name,
             Extent3::new(geometry.n_head, n_tok, 1),
             DENSE_ATTN_DECODE_SMEM_BYTES,
         )

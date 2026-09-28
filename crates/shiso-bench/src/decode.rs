@@ -266,12 +266,12 @@ impl Rig {
         let mut opts = EngineOptions::default();
         opts.ctx = CTX;
         let loading = Instant::now();
-        // The MoE family is the one whose checkpoint is a directory: three
-        // shards and two config documents, neither of which is the single
-        // container `HfConfig::from_file` below expects. A directory is never
-        // any other family this dispatcher carries, so the two arms cannot
-        // both claim the same path.
-        let model: Box<dyn Model> = if path.is_dir() {
+        // The MoE export is a directory with a second config document beside
+        // the first: `hf_quant_config.json`, the codec map. An MLX export is a
+        // directory too, but carries its codec inline in `config.json` and is
+        // read by the family dispatcher below like any container, so the
+        // codec map is what tells the two apart - not the directory itself.
+        let model: Box<dyn Model> = if path.join("hf_quant_config.json").is_file() {
             let family = Qwen35MoeConfig::from_dir(path).map_err(|source| RigError::Load {
                 path: path.to_path_buf(),
                 detail: source.to_string(),

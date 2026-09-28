@@ -305,8 +305,11 @@ static inline uint64_t dense_kv_row(device const int32_t *pages, uint64_t positi
     if (pages == nullptr) {
         return position;
     }
-    return (uint64_t) pages[position / page_tokens] * page_tokens +
-           (position % page_tokens);
+    // The divide is 32-bit: a position fits (a context is far below 2^32
+    // tokens), and a 64-bit divide is a software routine on this GPU that
+    // cost decode attention ~3000 cycles a key on an M1 Max.
+    const uint32_t p = (uint32_t) position;
+    return (uint64_t) pages[p / page_tokens] * page_tokens + (p % page_tokens);
 }
 
 /// Row `t`'s own page table inside a packed block of them.
@@ -380,6 +383,15 @@ struct dense_args_affine {
     uint32_t out_dim;
     uint32_t n_tok;
     uint32_t bits;
+};
+
+/// Row-exact affine matmul (`dense_exact_affine.metal`): the weight's shape and
+/// the rows of the call.
+struct dense_args_exact_affine {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_rows;
+    uint32_t pad;
 };
 
 /// Widens one bf16 value by placing its 16 bits into the high half of an f32.

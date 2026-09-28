@@ -18,6 +18,14 @@ impl NameMap for Qwen35Names {
     fn expected_tensors(&self, n_layers: u32, full_attention_interval: u32) -> Option<usize> {
         Some(expected_tensor_count(n_layers, full_attention_interval))
     }
+
+    /// The output projection: the 4B checkpoint ties it to the embedding and
+    /// ships none, the 27B stores its own. Leaving it unmapped read the 27B's
+    /// logits off its embedding - fluent-looking nonsense, since both matrices
+    /// have the vocabulary's shape.
+    fn optional_tensors(&self) -> &'static [&'static str] {
+        &["output.weight"]
+    }
 }
 
 /// Tensors every layer slot carries, whichever block kind it holds.
@@ -56,6 +64,7 @@ pub(crate) fn map_role(name: &str) -> Option<Role> {
     match name {
         "model.embed_tokens" => return Some(Role::plain("token_embd.weight")),
         "model.norm.weight" => return Some(Role::plain("output_norm.weight")),
+        "lm_head" | "lm_head.weight" => return Some(Role::plain("output.weight")),
         _ => {}
     }
 
