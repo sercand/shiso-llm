@@ -242,7 +242,9 @@ async fn transcriptions_end_to_end() {
 /// `keywords[]` steers the Qwen3 recognizer's transcript, and the Nemotron
 /// recognizer refuses a context outright: the same clip, once plain and once
 /// with two words it really contains, then the same keywords against
-/// Nemotron.
+/// Nemotron. Nemotron boots the way `booted_nemotron` does: the `Q8_0` GGUF
+/// under `SHISO_TEST_MODEL_ASR/nvidia` and the MLX diarizer under
+/// `SHISO_TEST_MODEL_DIAR/mlx`, the layout the binary is actually run with.
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the local speech checkpoints and a Metal device"]
@@ -281,19 +283,9 @@ async fn keywords_end_to_end() {
     }
     drop(state);
 
-    // `booted()` panics if the roots are set but lack what the load needs
-    // (it mirrors the binary's own boot, which is meant to fail loudly); so
-    // check the same `nvidia` subdirs it opens before calling it, and skip
-    // rather than crash when a root is present but incomplete.
-    let asr_root = std::env::var_os("SHISO_TEST_MODEL_ASR").map(PathBuf::from);
-    let diar_root = std::env::var_os("SHISO_TEST_MODEL_DIAR").map(PathBuf::from);
-    let nemotron_ready = asr_root.is_some_and(|p| p.join("nvidia").exists())
-        && diar_root.is_some_and(|p| p.join("nvidia").exists());
-    if !nemotron_ready {
-        say("SKIP: SHISO_TEST_MODEL_ASR/nvidia or SHISO_TEST_MODEL_DIAR/nvidia is absent");
+    let Some(nemotron) = booted_nemotron() else {
         return;
-    }
-    let Some(nemotron) = booted() else { return };
+    };
     let (status, refused) = post(
         &nemotron,
         form(
@@ -357,6 +349,55 @@ fn booted_chunking(extra: &[&str]) -> Option<(Arc<AppState>, PathBuf)> {
     Some((
         Arc::new(AppState::without_language_model().with_audio(audio)),
         diar,
+    ))
+}
+
+/// The Nemotron recognizer's state, booted the way the user actually runs
+/// it: the `Q8_0` GGUF checkpoint under `SHISO_TEST_MODEL_ASR/nvidia` and the
+/// MLX diarizer at `SHISO_TEST_MODEL_DIAR/mlx` (there is no `nvidia/` export
+/// of the diarizer on this machine). Needs `SHISO_TEST_MODEL_ASR` and
+/// `SHISO_TEST_MODEL_DIAR`; skips rather than panics when a root is set but
+/// the file it needs is absent.
+#[cfg(target_os = "macos")]
+fn booted_nemotron() -> Option<Arc<AppState>> {
+    let (Some(asr_root), Some(diar_root)) = (
+        std::env::var_os("SHISO_TEST_MODEL_ASR").map(PathBuf::from),
+        std::env::var_os("SHISO_TEST_MODEL_DIAR").map(PathBuf::from),
+    ) else {
+        say("SKIP: SHISO_TEST_MODEL_ASR and SHISO_TEST_MODEL_DIAR are needed");
+        return None;
+    };
+    if !shiso_metal::metal_available() {
+        say("SKIP: no Metal device");
+        return None;
+    }
+    let asr = asr_root.join("nvidia/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf");
+    let diar = diar_root.join("mlx");
+    for path in [&asr, &diar] {
+        if !path.exists() {
+            say(&format!("SKIP: {} is absent", path.display()));
+            return None;
+        }
+    }
+    let (asr_arg, diar_arg) = (asr.display().to_string(), diar.display().to_string());
+    let line = [
+        "shiso",
+        "serve",
+        "--asr-model",
+        &asr_arg,
+        "--asr-id",
+        "nemotron-asr",
+        "--diarization-model",
+        &diar_arg,
+    ];
+    let cli = <Cli as clap::Parser>::try_parse_from(line).expect("the command line parses");
+    let Command::Serve(args) = cli.command;
+    args.validate().expect("servable");
+    let audio = shiso_server::boot_audio(&args)
+        .expect("the speech models load")
+        .expect("an ASR was named");
+    Some(Arc::new(
+        AppState::without_language_model().with_audio(audio),
     ))
 }
 
