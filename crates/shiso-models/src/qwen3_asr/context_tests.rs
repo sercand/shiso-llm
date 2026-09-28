@@ -73,6 +73,34 @@ fn merges_apply() {
 }
 
 #[test]
+fn the_ids_carry_each_keyword_s_words_and_a_prompt_carries_none() {
+    let keyed = toy()
+        .encode(&Context {
+            prompt: Some("Marigold Lighthouse Orchard".into()),
+            keywords: vec!["Night-Shift".into(), "İzmir".into()],
+        })
+        .expect("ids");
+    assert_eq!(
+        keyed.keywords(),
+        &[
+            vec!["night".to_owned(), "shift".to_owned()],
+            vec!["izmir".to_owned()]
+        ]
+    );
+    let prompt_only = toy()
+        .encode(&Context {
+            prompt: Some("Marigold, Lighthouse, Orchard".into()),
+            keywords: Vec::new(),
+        })
+        .expect("ids");
+    assert!(!prompt_only.is_empty());
+    assert!(
+        prompt_only.keywords().is_empty(),
+        "a prompt's text is never a keyword list to echo"
+    );
+}
+
+#[test]
 fn a_special_token_written_as_text_stays_text() {
     let ids = toy()
         .encode(&Context {

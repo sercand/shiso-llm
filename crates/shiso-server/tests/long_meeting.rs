@@ -47,6 +47,7 @@ mod common;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -182,6 +183,57 @@ fn is_echo_segment(words: &[String], keywords: &[Vec<String>]) -> bool {
     )]
     let coverage = covered as f64 / words.len() as f64;
     coverage >= 0.5
+}
+
+/// Offline spans decoded again for echoing the keywords, and the spans
+/// transcribed, summed from the offline job's closing debug event while the
+/// diagnostic runs ([`RedecodeCounter`]).
+static REDECODED: AtomicU64 = AtomicU64::new(0);
+static JOB_SPANS: AtomicU64 = AtomicU64::new(0);
+
+/// Sums the `redecoded` and `spans` fields of the offline job's debug
+/// events into [`REDECODED`] and [`JOB_SPANS`]: the only place the server
+/// says how many spans it decoded again, since the response does not.
+struct RedecodeCounter;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RedecodeCounter {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        /// The two counts one event carries.
+        #[derive(Default)]
+        struct Counts {
+            redecoded: Option<u64>,
+            spans: Option<u64>,
+        }
+        impl tracing::field::Visit for Counts {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                match field.name() {
+                    "redecoded" => self.redecoded = Some(value),
+                    "spans" => self.spans = Some(value),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut counts = Counts::default();
+        event.record(&mut counts);
+        if let (Some(redecoded), Some(spans)) = (counts.redecoded, counts.spans) {
+            REDECODED.fetch_add(redecoded, Ordering::Relaxed);
+            JOB_SPANS.fetch_add(spans, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Installs [`RedecodeCounter`] for the offline job's debug events alone;
+/// whether it could (another subscriber may already be the global one).
+fn count_redecodes() -> bool {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::{Layer as _, filter::Targets};
+    let filter =
+        Targets::new().with_target("shiso_models::qwen3_asr::offline", tracing::Level::DEBUG);
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(RedecodeCounter.with_filter(filter)),
+    )
+    .is_ok()
 }
 
 /// One recognizer this test runs the meeting through.
@@ -695,8 +747,11 @@ async fn measure(
 /// against the same export `measure` compares to; and its segments are
 /// checked for "keyword echo" (three or more distinct keywords matched, or
 /// at least half the segment's words covered by one) and for an exact
-/// repeat of the previous segment's text. One `diag` line a run, aggregates
-/// only. SKIPs on stderr, needing no state, when `SHISO_TEST_KEYWORDS` is
+/// repeat of the previous segment's text. `rule_echo_segments` counts the
+/// segments the recognizer's own rule ([`shiso_audio::is_echo`]) would call
+/// an echo, and `redecoded_spans` how many of the offline job's spans it
+/// decoded again without the context, out of those it transcribed, read from
+/// its debug event. One `diag` line a run, aggregates only. SKIPs on stderr, needing no state, when `SHISO_TEST_KEYWORDS` is
 /// unset - the two runs would otherwise be identical - or when qwen3-asr-q8
 /// itself is unavailable (`boot` has already said why).
 async fn diagnose_keyword_wer(diarizer: &Path, audio_bytes: &[u8], reference: &Reference) {
@@ -709,6 +764,12 @@ async fn diagnose_keyword_wer(diarizer: &Path, audio_bytes: &[u8], reference: &R
         .iter()
         .map(|(_, value)| normalize_words(value))
         .collect();
+    // The production rule's split of each keyword, for `rule_echo_segments`.
+    let rule_needles: Vec<Vec<String>> = keyword_lines
+        .iter()
+        .map(|(_, value)| shiso_audio::keyword_words(value))
+        .collect();
+    let counting = count_redecodes();
     let recognizer = &RECOGNIZERS[0];
     debug_assert_eq!(recognizer.name, "qwen3-asr-q8", "diag targets qwen3-asr-q8");
     let Some(state) = boot(recognizer, diarizer, &["--asr-skip-silence=false"]) else {
@@ -725,8 +786,19 @@ async fn diagnose_keyword_wer(diarizer: &Path, audio_bytes: &[u8], reference: &R
             ("language", "tr"),
         ];
         fields.extend(context.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        REDECODED.store(0, Ordering::Relaxed);
+        JOB_SPANS.store(0, Ordering::Relaxed);
         let (status, body) = post(&state, form(audio_bytes, &fields)).await;
         assert_eq!(status, StatusCode::OK, "diag {run}: request failed");
+        let redecoded = if counting {
+            format!(
+                "{}/{}",
+                REDECODED.load(Ordering::Relaxed),
+                JOB_SPANS.load(Ordering::Relaxed)
+            )
+        } else {
+            "unobserved".to_owned()
+        };
         let json: Value = serde_json::from_str(&body).expect("json");
         let hyp_words = normalize_words(json["text"].as_str().expect("text"));
         let (subs, dels, ins) = edit_ops(&reference.words, &hyp_words);
@@ -740,6 +812,7 @@ async fn diagnose_keyword_wer(diarizer: &Path, audio_bytes: &[u8], reference: &R
 
         let (mut echo_segments, mut echo_words) = (0usize, 0usize);
         let (mut repeat_segments, mut repeat_words) = (0usize, 0usize);
+        let mut rule_echo_segments = 0usize;
         let mut previous: Option<String> = None;
         for text in our_segment_texts(&json) {
             let trimmed = text.trim();
@@ -747,6 +820,9 @@ async fn diagnose_keyword_wer(diarizer: &Path, audio_bytes: &[u8], reference: &R
             if is_echo_segment(&words, &keyword_needles) {
                 echo_segments += 1;
                 echo_words += words.len();
+            }
+            if shiso_audio::is_echo(trimmed, &rule_needles) {
+                rule_echo_segments += 1;
             }
             if previous.as_deref() == Some(trimmed) {
                 repeat_segments += 1;
@@ -759,7 +835,8 @@ async fn diagnose_keyword_wer(diarizer: &Path, audio_bytes: &[u8], reference: &R
             "diag run={run} wer={:.1}% subs={subs} dels={dels} ins={ins} \
              keyword_recall={keyword_hits}/{keyword_total} keyword_insertions={keyword_insertions} \
              words={} echo_segments={echo_segments} echo_words={echo_words} \
-             repeat_segments={repeat_segments} repeat_words={repeat_words}",
+             repeat_segments={repeat_segments} repeat_words={repeat_words} \
+             rule_echo_segments={rule_echo_segments} redecoded_spans={redecoded}",
             wer * 100.0,
             hyp_words.len(),
         ));

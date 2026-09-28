@@ -14,7 +14,7 @@
 
 use std::str::FromStr as _;
 
-use shiso_audio::{AudioError, Context, ContextEncoder, ContextIds};
+use shiso_audio::{AudioError, Context, ContextEncoder, ContextIds, keyword_words};
 use shiso_core::TokenId;
 
 use super::prompt::MAX_CONTEXT_IDS;
@@ -119,8 +119,9 @@ impl ContextEncoder for QwenContextEncoder {
                 ids.len()
             )));
         }
-        Ok(ContextIds::new(
+        Ok(ContextIds::with_keywords(
             ids.iter().copied().map(TokenId::new).collect(),
+            context.keywords.iter().map(|k| keyword_words(k)).collect(),
         ))
     }
 

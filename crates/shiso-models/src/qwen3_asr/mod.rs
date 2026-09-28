@@ -128,6 +128,11 @@ fn context_of(options: &StreamOptions) -> Arc<[u32]> {
     options.context.ids().iter().map(|id| id.get()).collect()
 }
 
+/// The keywords the context of `options` was made from, as word sequences.
+fn keywords_of(options: &StreamOptions) -> Arc<[Vec<String>]> {
+    options.context.keywords().into()
+}
+
 /// Opens the checkpoint at `path` on `backend`; `mmproj` is `--asr-mmproj`,
 /// the tower file of a text GGUF. An HF or MLX export with no BPE merges
 /// (see [`config::read_merges`]) still loads, logging a warning: it just
@@ -266,6 +271,7 @@ impl SpeechRecognizer for Qwen3Asr {
             Arc::clone(&self.model),
             forced_of(options)?,
             context_of(options),
+            keywords_of(options),
             options.cuts.as_deref(),
         )?))
     }
@@ -295,6 +301,7 @@ impl SpeechRecognizer for Qwen3Asr {
             Arc::clone(&self.model),
             forced_of(options)?,
             context_of(options),
+            keywords_of(options),
             spans,
             batch,
         )?))
