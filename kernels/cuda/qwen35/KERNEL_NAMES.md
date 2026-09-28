@@ -227,6 +227,23 @@ projection comes through this family rather than through a GEMM at the wide end.
 `launch::ext_module` sends this codec here beside `q6_K`. Geometry and buffer
 order are the `q6_K` family's above.
 
+### The recorded recurrence — 4 entries
+
+```
+kernel_q35_gdn_recurrent_trail_s1
+kernel_q35_gdn_recurrent_trail_s2
+kernel_q35_gdn_recurrent_trail_s4
+kernel_q35_gdn_conv_trail
+```
+
+The recurrence and the convolution with the state (or window) after every row
+but the last written into a trail of `n_tok - 1` records laid out as the state
+is: what a verify pass needs to wind a session back to any accepted prefix. The
+recurrent three are the plain recurrence's body with a trail pointer appended
+after `beta`; the convolution's appends it after `w`. Geometry is the plain
+entries'. Graded by `recurrent_trail_records_are_the_per_row_walk` and
+`conv_trail_records_are_the_per_row_walk` in `crates/shiso-cuda/tests/q35_gdn.rs`.
+
 ## Where the family's own entries are graded
 
 `crates/shiso-cuda/tests/q35_norm_rope.rs` drives
