@@ -422,6 +422,58 @@ pub(crate) fn check_temperature(t: Option<f64>) -> Result<f64, AppError> {
     }
 }
 
+// --- wire helpers shared by both surfaces -----------------------------------
+
+/// The question line as text: absent is blank.
+///
+/// Both surfaces spell the question key the same way and render it with the
+/// shared rule, so the reading lives here; whether a blank is a refusal or a
+/// dropped line is each surface's [`check_question_text`] call, not this
+/// function's business.
+pub(crate) fn question_text(value: Option<&serde_json::Value>) -> String {
+    value.map_or_else(String::new, render_text)
+}
+
+/// The `yes`/`no` wording: absent or blank is no wording at all, which drops
+/// that line from the block.
+pub(crate) fn wording(value: Option<&serde_json::Value>) -> Option<String> {
+    let text = value.map(render_text)?;
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Refuses a field the question's type has no place for - `options` on a
+/// score question is a caller expecting a different question than the one its
+/// `type` says will be scored.
+///
+/// Each wire calls this with its own struct in hand - the question's id, the
+/// type word and the field-presence table are arguments, because the fields
+/// belong to the wire - while the refusal itself is shared: the same sentence
+/// naming the same field, the same `questions` param, a 400 on both routes.
+/// A schema difference between the surfaces (400-versus-422) is about what
+/// the *body* says, not about what a misplaced field means to the scored
+/// bytes, so this refusal does not split.
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] naming the misplaced field and the question.
+pub(crate) fn refuse_fields_other_than(
+    id: &str,
+    kind: &str,
+    present: &[(&str, bool)],
+    allowed: &[&str],
+) -> Result<(), AppError> {
+    for (field, present) in present {
+        if *present && !allowed.contains(field) {
+            return Err(AppError::bad_request(
+                format!("question \"{id}\": {field} does not belong on a \"{kind}\" question"),
+                Some("questions"),
+                "invalid_request",
+            ));
+        }
+    }
+    Ok(())
+}
+
 // --- preparation and scoring fan-out ---------------------------------------
 
 /// The wire word for a kind, used in answers and in refusals alike.

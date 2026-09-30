@@ -163,7 +163,7 @@ impl SystemOneBody {
             let kind = match question.kind.as_str() {
                 TYPE_CHOICE => {
                     refuse_fields_other_than(&question, &["question", "options"])?;
-                    let text = question_text(&question);
+                    let text = core::question_text(question.question.as_ref());
                     // The blank branch exists here because the schema allows
                     // blank and the wording builder renders it.
                     core::check_question_text(&text, &question.id, true)?;
@@ -181,7 +181,7 @@ impl SystemOneBody {
                 }
                 TYPE_SCORE => {
                     refuse_fields_other_than(&question, &["question", "levels"])?;
-                    let text = question_text(&question);
+                    let text = core::question_text(question.question.as_ref());
                     core::check_question_text(&text, &question.id, true)?;
                     let levels = question.levels.unwrap_or_default();
                     core::check_score_levels(&levels, &question.id, 1)?;
@@ -192,12 +192,12 @@ impl SystemOneBody {
                 }
                 TYPE_YES_NO => {
                     refuse_fields_other_than(&question, &["question", "yes", "no"])?;
-                    let text = question_text(&question);
+                    let text = core::question_text(question.question.as_ref());
                     core::check_question_text(&text, &question.id, true)?;
                     Kind::YesNo {
                         question: text,
-                        yes: wording(question.yes.as_ref()),
-                        no: wording(question.no.as_ref()),
+                        yes: core::wording(question.yes.as_ref()),
+                        no: core::wording(question.no.as_ref()),
                     }
                 }
                 other => {
@@ -218,10 +218,7 @@ impl SystemOneBody {
         }
         if let Some(noul) = self.noul {
             for criterion in noul.criteria {
-                let text = criterion
-                    .question
-                    .as_ref()
-                    .map_or_else(String::new, core::render_text);
+                let text = core::question_text(criterion.question.as_ref());
                 questions.push(RawQuestion {
                     id: criterion.id,
                     kind: Kind::YesNo {
@@ -268,42 +265,21 @@ pub(crate) fn refuse_decisions_only(field: &str, value: Option<&Value>) -> Resul
     ))
 }
 
-/// The question line as text: absent is blank, which renders no line here.
-fn question_text(question: &QuestionWireS1) -> String {
-    question
-        .question
-        .as_ref()
-        .map_or_else(String::new, core::render_text)
-}
-
-/// The `yes`/`no` wording: absent or blank is no wording at all, which drops
-/// that line from the block.
-fn wording(value: Option<&Value>) -> Option<String> {
-    let text = value.map(core::render_text)?;
-    (!text.trim().is_empty()).then_some(text)
-}
-
-/// Refuses a field the question's type has no place for - `options` on a
-/// score question is a caller expecting a different question than the one its
-/// `type` says will be scored, and this surface relaxes blanks, not kinds.
+/// Refuses a field the question's type has no place for, projecting this
+/// struct's field list into the shared refusal. The presence table belongs to
+/// the wire struct, so that much stays here; the sentence, the param and the
+/// code are [`core::refuse_fields_other_than`]'s — the same refusal, in the
+/// same words, on both surfaces.
 fn refuse_fields_other_than(question: &QuestionWireS1, allowed: &[&str]) -> Result<(), AppError> {
-    let present: [(&str, bool); 4] = [
-        ("options", question.options.is_some()),
-        ("levels", question.levels.is_some()),
-        ("yes", question.yes.is_some()),
-        ("no", question.no.is_some()),
-    ];
-    for (field, present) in present {
-        if present && !allowed.contains(&field) {
-            return Err(AppError::bad_request(
-                format!(
-                    "question \"{}\": {field} does not belong on a \"{}\" question",
-                    question.id, question.kind
-                ),
-                Some("questions"),
-                "invalid_request",
-            ));
-        }
-    }
-    Ok(())
+    core::refuse_fields_other_than(
+        &question.id,
+        &question.kind,
+        &[
+            ("options", question.options.is_some()),
+            ("levels", question.levels.is_some()),
+            ("yes", question.yes.is_some()),
+            ("no", question.no.is_some()),
+        ],
+        allowed,
+    )
 }

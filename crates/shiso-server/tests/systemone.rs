@@ -834,6 +834,25 @@ async fn strict_bounds_still_refuse() {
                  [{"id": "q1", "type": "yes_no", "question": "ready"}]}),
             "base:lora",
         ),
+        // A field the question's type has no place for is the decisions
+        // route's refusal in the same words: a 400 naming the field, not a
+        // quietly dropped key and not a 422 schema error. The relaxation is
+        // about blanks and list minima, not about kinds.
+        (
+            json!({"state": "the input", "questions": [{"id": "q1", "type": "score",
+                 "question": "how bad", "levels": ["ok"], "options": ["p", "q"]}]}),
+            "options",
+        ),
+        (
+            json!({"state": "the input", "questions": [{"id": "q1", "type": "yes_no",
+                 "question": "ready", "options": ["p", "q"]}]}),
+            "options",
+        ),
+        (
+            json!({"state": "the input", "questions": [{"id": "q1", "type": "choice",
+                 "question": "pick", "options": ["p", "q"], "levels": ["ok"]}]}),
+            "levels",
+        ),
     ];
     for (case, want) in cases {
         let (status, body) = call(&state, post("/v1/systemone", &case)).await;
