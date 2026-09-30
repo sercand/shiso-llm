@@ -11,6 +11,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = shiso_router::cli::Cli::parse();
-    shiso_router::run(cli).await
+    let args = shiso_router::cli::RouterArgs::parse();
+    shiso_router::run(args).await
 }

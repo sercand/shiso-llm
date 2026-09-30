@@ -117,9 +117,9 @@ fn admin_ui_routes() -> Router<AppState> {
 ///
 /// Fails if the configuration cannot be loaded, the database cannot be opened,
 /// or a network listener cannot be bound.
-pub async fn run(cli: cli::Cli) -> anyhow::Result<()> {
-    let cfg = config::Config::load_with(&cli.config, &cli.overrides())
-        .map_err(|e| anyhow::anyhow!("loading config from {}: {e}", cli.config.display()))?;
+pub async fn run(args: cli::RouterArgs) -> anyhow::Result<()> {
+    let cfg = config::Config::load_with(&args.config, &args.overrides())
+        .map_err(|e| anyhow::anyhow!("loading config from {}: {e}", args.config.display()))?;
 
     let db = tokens::Db::open(&cfg.sqlite_path)?;
     let (log_sink, log_writer) = logging::start_writer(db.clone());

@@ -81,7 +81,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the router fails to start or serve.
-async fn router(args: shiso_router::cli::Cli) -> anyhow::Result<()> {
+async fn router(args: shiso_router::cli::RouterArgs) -> anyhow::Result<()> {
     shiso_router::run(args).await
 }
 /// Installs the log subscriber.

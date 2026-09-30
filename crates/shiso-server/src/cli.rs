@@ -19,6 +19,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use shiso_parsers::{ReasoningScheme, ToolCallScheme};
+pub use shiso_router::cli::RouterArgs;
 use shiso_vision::{FfmpegPolicy, ImageLimits};
 
 /// The default listen address. Loopback, so an unconfigured server is not on the
@@ -75,7 +76,7 @@ pub enum Command {
     /// Serve a checkpoint over HTTP.
     Serve(Box<ServeArgs>),
     /// Run an LLM router proxying requests to third-party or local backends.
-    Router(Box<shiso_router::cli::Cli>),
+    Router(Box<RouterArgs>),
 }
 
 /// Everything `shiso serve` accepts.

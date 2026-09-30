@@ -5,14 +5,14 @@ use clap::Parser;
 
 use crate::config::Overrides;
 
-/// HTTP router that proxies LLM API requests to third-party backends.
+/// Command-line arguments for the router.
 ///
 /// Options given on the command line take priority over the config file.
 /// Backends and models are not settable here: they live in the database and
 /// are managed through the admin API (`/admin/backends`, `/admin/models`).
 #[derive(Debug, Parser, Clone)]
 #[command(name = "shiso-router", version)]
-pub struct Cli {
+pub struct RouterArgs {
     /// Path to the TOML config file
     #[arg(short, long, default_value = "config.toml", value_name = "PATH")]
     pub config: PathBuf,
@@ -46,7 +46,7 @@ pub struct Cli {
     pub admin_token_env: Option<String>,
 }
 
-impl Cli {
+impl RouterArgs {
     /// Extracts the command-line overrides for configuration settings.
     pub fn overrides(&self) -> Overrides {
         Overrides {
@@ -59,6 +59,9 @@ impl Cli {
         }
     }
 }
+
+/// Backward-compatible alias for [`RouterArgs`].
+pub type Cli = RouterArgs;
 
 #[cfg(test)]
 mod tests {
