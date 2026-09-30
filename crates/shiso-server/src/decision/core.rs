@@ -9,23 +9,25 @@
 //! Validation lives here too so the two surfaces refuse the same bad request
 //! for the same reason; each refusal is an [`AppError::bad_request`] naming
 //! the field at fault and, wherever one is known, the question by id.
+//!
+//! Below the validators sit the shared preparation: a question rendered to a
+//! prompt, its labels proven to be one fresh token each at the prompt's end,
+//! and the scored fan-out that turns label log-probabilities into answers.
 
-// The two wires and the handler glue that call these names land in later
-// tasks, so until then nothing in a non-test build reaches them. The
-// expectation says exactly that and is scoped to the non-test build on
-// purpose: the tests here already call every one of them.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the decision routes and handler glue are these items' callers, in later tasks"
-    )
-)]
+use std::sync::Arc;
 
+use futures::future::join_all;
+use shiso_core::TokenId;
+use shiso_ir::{Message, Request, ThinkingDirective};
+
+use crate::api::pipeline::remaining_budget;
+use crate::decision::math::{label_mass, softmax};
 use crate::error::AppError;
+use crate::scheduler::ScoreRequest;
+use crate::state::AppState;
 
 /// One option of a choice question.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ChoiceOption {
     /// The option's name: what follows the letter on its line, and what the
     /// caller reads the answer back as.
@@ -35,7 +37,7 @@ pub(crate) struct ChoiceOption {
 }
 
 /// How a question is answered, which is which block [`prompt_body`] renders.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum Kind {
     /// A lettered list; the answer is one letter.
     Choice {
@@ -68,16 +70,6 @@ pub(crate) struct RawQuestion {
     /// The caller's id for the question; blank when the caller sent none.
     pub id: String,
     /// How the question is answered.
-    // Nothing in this module reads it - validation and wording see a `Kind`
-    // directly, and the module-level expectation covers the non-test build;
-    // drop this one when the glue that dispatches on it arrives.
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "the tests exercise ids, and the decision handler glue that dispatches on a question's kind lands in a later task"
-        )
-    )]
     pub kind: Kind,
 }
 
@@ -428,6 +420,402 @@ pub(crate) fn check_temperature(t: Option<f64>) -> Result<f64, AppError> {
             "invalid_request",
         )),
     }
+}
+
+// --- preparation and scoring fan-out ---------------------------------------
+
+/// The wire word for a kind, used in answers and in refusals alike.
+pub(crate) fn type_name(kind: &Kind) -> &'static str {
+    match kind {
+        Kind::Choice { .. } => "choice",
+        Kind::Score { .. } => "score",
+        Kind::YesNo { .. } => "yes_no",
+    }
+}
+
+/// The label words of a kind, in answer order: the letters, the digits, or
+/// `yes` and `no`.
+fn labels_for(kind: &Kind) -> Vec<String> {
+    match kind {
+        Kind::Choice { options, .. } => choice_labels(options.len())
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
+        Kind::Score { levels, .. } => score_labels(levels.len()),
+        Kind::YesNo { .. } => YES_NO_LABELS
+            .iter()
+            .map(|label| (*label).to_string())
+            .collect(),
+    }
+}
+
+/// The answer text of a choice question: the option name the top label names.
+/// A score kind spells its answer as the level number and a yes/no kind as
+/// its label, so every kind has a name for its `top` - which indexes that
+/// kind's own labels by construction, being the argmax of the probabilities
+/// built from exactly those.
+pub(crate) fn choice_name(kind: &Kind, top: usize) -> String {
+    match kind {
+        Kind::Choice { options, .. } => options
+            .get(top)
+            .map(|option| option.name.clone())
+            .unwrap_or_default(),
+        Kind::Score { .. } => top.to_string(),
+        Kind::YesNo { .. } => answer_label(kind, top),
+    }
+}
+
+/// The answer label of a yes/no question: `"yes"` for the first label,
+/// `"no"` for the second.
+pub(crate) fn answer_label(kind: &Kind, top: usize) -> String {
+    match kind {
+        Kind::YesNo { .. } => YES_NO_LABELS
+            .get(top)
+            .copied()
+            .unwrap_or_default()
+            .to_owned(),
+        // Not this kind's answer shape. The encoders dispatch on the kind, so
+        // this arm means a wrong caller rather than a request outcome, and an
+        // empty name says so without a panic path on a scored response.
+        _ => String::new(),
+    }
+}
+
+/// Chat-template knobs a decision request sent, validated and kept raw.
+///
+/// Every key rule fires once, in [`Self::from_wire`], so the refusal names
+/// the offending key while the request is still being read; [`Self::apply`]
+/// only lowers what survived.
+#[derive(Debug)]
+pub(crate) struct TemplateKwargs(serde_json::Map<String, serde_json::Value>);
+
+impl TemplateKwargs {
+    /// Accepts exactly three keys: `enable_thinking` (which must say false or
+    /// nothing, because scoring never opens a thinking block),
+    /// `reasoning_effort` (a spelling this server knows, or nothing), and
+    /// `preserve_thinking` (a boolean, or nothing). Every other key is a 400.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::BadRequest`] naming the key or the spelling at fault.
+    pub(crate) fn from_wire(
+        map: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Self, AppError> {
+        let mut checked = serde_json::Map::new();
+        for (key, value) in map.unwrap_or_default() {
+            match key.as_str() {
+                // The answer is the token right after the question block;
+                // a thinking block would open at that position and score a
+                // reasoning token instead of the label. `false` is accepted
+                // because callers that send the key everywhere should not
+                // have to special-case this surface.
+                "enable_thinking"
+                    if matches!(
+                        value,
+                        serde_json::Value::Bool(false) | serde_json::Value::Null
+                    ) => {}
+                "enable_thinking" => {
+                    return Err(AppError::bad_request(
+                        "a decision is scored from one prefill with thinking off; \
+                         enable_thinking must be false",
+                        Some("chat_template_kwargs"),
+                        "invalid_request",
+                    ));
+                }
+                "reasoning_effort" => match &value {
+                    serde_json::Value::Null => {}
+                    serde_json::Value::String(spelling) => {
+                        if shiso_ir::Effort::parse(spelling).is_none() {
+                            return Err(AppError::bad_request(
+                                format!(
+                                    "reasoning_effort {spelling:?} is not a level this server knows"
+                                ),
+                                Some("chat_template_kwargs"),
+                                "invalid_request",
+                            ));
+                        }
+                    }
+                    other => {
+                        return Err(AppError::bad_request(
+                            format!("reasoning_effort must be a string or null, got {other}"),
+                            Some("chat_template_kwargs"),
+                            "invalid_request",
+                        ));
+                    }
+                },
+                "preserve_thinking"
+                    if matches!(value, serde_json::Value::Bool(_) | serde_json::Value::Null) => {}
+                "preserve_thinking" => {
+                    return Err(AppError::bad_request(
+                        "preserve_thinking must be a boolean or null",
+                        Some("chat_template_kwargs"),
+                        "invalid_request",
+                    ));
+                }
+                other => {
+                    return Err(AppError::bad_request(
+                        format!(
+                            "chat_template_kwargs key {other:?} is not accepted on this surface"
+                        ),
+                        Some("chat_template_kwargs"),
+                        "invalid_request",
+                    ));
+                }
+            }
+            checked.insert(key, value);
+        }
+        Ok(Self(checked))
+    }
+
+    /// Lowers the surviving knobs onto the request a question is rendered
+    /// with.
+    pub(crate) fn apply(&self, request: &mut Request) {
+        if let Some(serde_json::Value::Bool(keep)) = self.0.get("preserve_thinking") {
+            request.preserve_thinking = Some(*keep);
+        }
+        // `enable_thinking` can only have said false or nothing, which is
+        // what every scoring render already does, so it lowers to no change.
+        // `reasoning_effort` was parsed and checked and is deliberately not
+        // lowered: scoring renders with `ThinkingDirective::Off`, so no rung
+        // would ever reach a template. A caller that named one gets the same
+        // answer as one that did not, and the check exists to refuse a typo,
+        // not to promise a thinking budget this surface cannot spend.
+    }
+}
+
+/// A question rendered, tokenized and label-checked: everything a scoring
+/// pass needs and nothing else.
+#[derive(Debug)]
+pub(crate) struct PreparedQuestion {
+    /// The caller's id for the question.
+    pub id: String,
+    /// How the question is answered.
+    pub kind: Kind,
+    /// The rendered prompt ids, in the order the model will read them.
+    pub prompt_tokens: Vec<TokenId>,
+    /// The label ids, in the question's own label order.
+    pub labels: Vec<TokenId>,
+}
+
+/// Renders one question over the shared input and proves the labels are
+/// scorable: one token each, no two the same token, and each one a fresh
+/// token at the very end of the rendered prompt.
+///
+/// The three label proofs are what make the answer mean what it says: a label
+/// that split into two tokens could not be read from one row, two labels that
+/// reached the same token could never be told apart, and a label that only
+/// re-tokenized the prompt's last chunk would score the wrong position.
+///
+/// `want_token_ids` is not needed to prepare - the id lists are assembled
+/// with the answer - but the signature keeps it so both surfaces of the
+/// decision family drive preparation with the one flag they read from their
+/// wires.
+///
+/// # Errors
+///
+/// [`AppError::NoModel`] / [`AppError::NotReady`] for a server that cannot
+/// render, [`AppError::BadRequest`] for a conversation the template refuses
+/// and for every failed proof above (naming the question), and
+/// [`AppError::ContextOverflow`] with `param` `"input"` when the rendered
+/// prompt leaves no room to read an answer.
+pub(crate) fn prepare_question(
+    state: &AppState,
+    input: &str,
+    question: &RawQuestion,
+    kwargs: &TemplateKwargs,
+    _want_token_ids: bool,
+) -> Result<PreparedQuestion, AppError> {
+    // The same three refusals `pipeline::start` makes, in the same shapes:
+    // no engine is "no model is loaded", and no renderer is "not ready".
+    state.engine()?;
+    let renderer = state.renderer.as_ref().ok_or(AppError::NotReady {
+        what: "a prompt renderer",
+    })?;
+    let vocabulary = renderer.vocabulary();
+
+    let mut request = Request::new(
+        state.model_id.clone(),
+        vec![Message::user(prompt_body(input, &question.kind))],
+    );
+    // Scoring reads the first row after the question block. A thinking block
+    // would open *at* the answer position and the row would score a reasoning
+    // token, so Off is not a preference here - it is what the answer is.
+    request.thinking = ThinkingDirective::Off;
+    kwargs.apply(&mut request);
+    let prompt = renderer.render(&request)?;
+
+    let name = question_name(&question.id);
+    let plain = vocabulary
+        .encode(&prompt.text, false)
+        .map_err(|error| AppError::internal("re-encoding the rendered prompt", error))?;
+    // The renderer's ids are this re-encode plus, when the checkpoint has an
+    // opening token and the template did not write it, that token in front.
+    // Anything else means the text the engine would score is not the text
+    // that was checked, and no answer from it means what the labels say.
+    let expected: &[TokenId] = match (vocabulary.bos(), prompt.tokens.split_first()) {
+        (Some(bos), Some((first, rest))) if *first == bos && plain.first() != Some(&bos) => rest,
+        _ => &prompt.tokens,
+    };
+    if plain != expected {
+        return Err(AppError::bad_request(
+            format!("{name}: the rendered prompt did not survive re-encoding"),
+            Some("questions"),
+            "invalid_request",
+        ));
+    }
+
+    let mut labels: Vec<TokenId> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    for label in labels_for(&question.kind) {
+        let encoded = vocabulary
+            .encode(&label, false)
+            .map_err(|error| AppError::internal("encoding a label", error))?;
+        let [only] = encoded.as_slice() else {
+            return Err(AppError::bad_request(
+                format!(
+                    "{name}: the label \"{label}\" is not one token in this server's vocabulary"
+                ),
+                Some("questions"),
+                "invalid_request",
+            ));
+        };
+        if let Some(at) = labels.iter().position(|earlier| earlier == only) {
+            return Err(AppError::bad_request(
+                format!(
+                    "{name}: the labels {:?} and {:?} are the same token in this server's vocabulary",
+                    words[at], label
+                ),
+                Some("questions"),
+                "invalid_request",
+            ));
+        }
+        // The answer position reads one token: the label must follow the
+        // rendered prompt as exactly that token, not re-tokenize together
+        // with whatever the template ended with.
+        let mut following = plain.clone();
+        following.push(*only);
+        let joined = vocabulary
+            .encode(&format!("{}{}", prompt.text, label), false)
+            .map_err(|error| AppError::internal("encoding a label after the prompt", error))?;
+        if joined != following {
+            return Err(AppError::bad_request(
+                format!(
+                    "{name}: the label \"{label}\" does not follow the rendered prompt as one fresh token"
+                ),
+                Some("questions"),
+                "invalid_request",
+            ));
+        }
+        labels.push(*only);
+        words.push(label);
+    }
+
+    let prompt_tokens = u64::try_from(prompt.tokens.len()).unwrap_or(u64::MAX);
+    // The scoring pass answers at the prompt's last row, so it needs the
+    // prompt to leave room the same way a generation does - the shared
+    // boundary, blamed on the field this surface carries.
+    remaining_budget(state.ctx, prompt_tokens).ok_or(AppError::ContextOverflow {
+        param: "input",
+        prompt_tokens,
+        ctx: state.ctx,
+    })?;
+    Ok(PreparedQuestion {
+        id: question.id.clone(),
+        kind: question.kind.clone(),
+        prompt_tokens: prompt.tokens,
+        labels,
+    })
+}
+
+/// One question's scored answer, before any wire shape.
+#[derive(Debug)]
+pub(crate) struct Answered {
+    /// The caller's id for the question.
+    pub id: String,
+    /// How the question was answered.
+    pub kind: Kind,
+    /// The label probabilities at the answer position, in label order.
+    pub probabilities: Vec<f64>,
+    /// The probability mass the labels carry together, independent of the
+    /// temperature.
+    pub label_mass: f64,
+    /// The top label: the first argmax of `probabilities`, so a tie goes to
+    /// the earlier label.
+    pub top: usize,
+    /// Tokens this question's prompt occupied.
+    pub prompt_tokens: u64,
+    /// The prompt's ids, when the caller asked for them.
+    pub prompt_token_ids: Option<Vec<u32>>,
+    /// The label ids, when the caller asked for them.
+    pub label_token_ids: Option<Vec<u32>>,
+}
+
+/// Scores every prepared question at once - one prefill each - and folds each
+/// answer's label log-probabilities into probabilities, mass and a top.
+///
+/// All questions ride concurrently because each waits on the engine, not on
+/// the caller's CPU; and one failing question fails the whole request, because
+/// a caller that asked five questions and got four answers and an error would
+/// have to guess whether the four are complete.
+///
+/// # Errors
+///
+/// Whatever [`crate::scheduler::EngineHandle::score`] answers with for any
+/// question: [`AppError::Overloaded`] when the queue stayed full, and the
+/// engine's refusals.
+pub(crate) async fn run_questions(
+    state: &Arc<AppState>,
+    prepared: Vec<PreparedQuestion>,
+    temperature: f64,
+    want_token_ids: bool,
+) -> Result<Vec<Answered>, AppError> {
+    let engine = state.engine()?;
+    let scored = join_all(prepared.into_iter().map(|question| {
+        let scored = engine.score(ScoreRequest::new(
+            Arc::from(question.prompt_tokens.clone()),
+            Arc::from(question.labels.clone()),
+        ));
+        async move {
+            let outcome = scored.await?;
+            let probabilities = softmax(&outcome.label_logprobs, temperature);
+            // `>` and never `>=`: the first argmax wins, so on a dead heat
+            // the first option and `yes` win by position rather than by coin.
+            let top = probabilities
+                .iter()
+                .enumerate()
+                .fold((0usize, f64::NEG_INFINITY), |best, (index, p)| {
+                    if *p > best.1 { (index, *p) } else { best }
+                })
+                .0;
+            let prompt_tokens = u64::try_from(question.prompt_tokens.len()).unwrap_or(u64::MAX);
+            let ids = want_token_ids.then(|| {
+                (
+                    question
+                        .prompt_tokens
+                        .iter()
+                        .map(|token| token.get())
+                        .collect::<Vec<u32>>(),
+                    question
+                        .labels
+                        .iter()
+                        .map(|token| token.get())
+                        .collect::<Vec<u32>>(),
+                )
+            });
+            Ok(Answered {
+                id: question.id,
+                kind: question.kind,
+                probabilities,
+                label_mass: label_mass(&outcome.label_logprobs),
+                top,
+                prompt_tokens,
+                prompt_token_ids: ids.as_ref().map(|(prompt, _)| prompt.clone()),
+                label_token_ids: ids.map(|(_, labels)| labels),
+            })
+        }
+    }))
+    .await;
+    scored.into_iter().collect()
 }
 
 #[cfg(test)]

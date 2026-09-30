@@ -89,6 +89,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(crate::openai::responses::get_stored_response),
         )
         .route("/v1/messages", post(crate::anthropic::messages::messages))
+        // Auth covers this route for free: the gate's `is_protected` takes
+        // every `/v1/` path, and this is one of them.
+        .route(
+            "/v1/decisions",
+            post(crate::decision::decisions::decisions_endpoint),
+        )
         .route(
             "/v1/audio/transcriptions",
             post(crate::openai::transcription::transcriptions)
