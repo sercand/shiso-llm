@@ -16,6 +16,7 @@ shiso-models = { workspace = true }
 shiso-vision = { workspace = true }
 shiso-audio = { workspace = true }
 shiso-parsers = { workspace = true }
+shiso-router = { workspace = true }
 # Declared optional so the `metal` feature below has a dep: target to enable.
 shiso-metal = { workspace = true, optional = true }
 shiso-cuda = { workspace = true, optional = true }

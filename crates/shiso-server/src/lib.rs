@@ -22,6 +22,8 @@
 //! model.
 #![forbid(unsafe_code)]
 
+pub use shiso_router;
+
 pub mod anthropic;
 pub mod api;
 pub mod audio;
@@ -70,9 +72,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     install_tracing();
     match cli.command {
         Command::Serve(args) => serve(*args).await,
+        Command::Router(args) => router(*args).await,
     }
 }
 
+/// Runs the router proxy with the given command-line arguments.
+///
+/// # Errors
+///
+/// Returns an error if the router fails to start or serve.
+async fn router(args: shiso_router::cli::Cli) -> anyhow::Result<()> {
+    shiso_router::run(args).await
+}
 /// Installs the log subscriber.
 ///
 /// Failure is ignored on purpose: a subscriber is already installed when a test

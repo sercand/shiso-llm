@@ -1,0 +1,62 @@
+# Example systemd unit for llm-router.
+#
+# Install:
+#   install -Dm755 target/release/llm-router /usr/local/bin/llm-router
+#   install -Dm644 deploy/llm-router.service /etc/systemd/system/llm-router.service
+#   install -Dm644 config.example.toml /etc/llm-router/config.toml   # then edit
+#   install -Dm600 /dev/null /etc/llm-router/env                     # then edit, see below
+#   systemctl daemon-reload && systemctl enable --now llm-router
+#
+# /etc/llm-router/env holds the secrets referenced by the config, e.g.:
+#   LLM_ROUTER_ADMIN_TOKEN=...
+#   OPENAI_API_KEY=sk-...
+#   ANTHROPIC_API_KEY=sk-ant-...
+
+[Unit]
+Description=llm-router LLM API proxy
+Documentation=https://github.com/sercand/llm-router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/llm-router --config /etc/llm-router/config.toml
+# Optional (leading "-"): only needed when the config references *_env secrets.
+EnvironmentFile=-/etc/llm-router/env
+Restart=on-failure
+RestartSec=2
+
+# Runs as a transient unprivileged user; /var/lib/llm-router is created and
+# owned automatically. Point sqlite_path there in config.toml (a relative
+# path also works — WorkingDirectory resolves it to the state directory):
+#   sqlite_path = "/var/lib/llm-router/llm-router.db"
+DynamicUser=yes
+StateDirectory=llm-router
+WorkingDirectory=/var/lib/llm-router
+
+# Hardening. IP sockets stay fully available — binding the listen port(s) and
+# connecting to backends both work; everything else (raw filesystem writes
+# outside the state dir, devices, other address families, extra syscalls,
+# capabilities) is removed because the router never uses it.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+# Uncomment to bind a port below 1024 (e.g. listen = "0.0.0.0:443"):
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -74,6 +74,8 @@ pub struct Cli {
 pub enum Command {
     /// Serve a checkpoint over HTTP.
     Serve(Box<ServeArgs>),
+    /// Run an LLM router proxying requests to third-party or local backends.
+    Router(Box<shiso_router::cli::Cli>),
 }
 
 /// Everything `shiso serve` accepts.

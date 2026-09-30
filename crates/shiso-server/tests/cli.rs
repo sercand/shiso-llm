@@ -25,7 +25,9 @@ fn parse(args: &[&str]) -> Result<ServeArgs, clap::Error> {
     let mut line = vec!["shiso", "serve"];
     line.extend_from_slice(args);
     let cli = Cli::try_parse_from(line)?;
-    let Command::Serve(serve) = cli.command;
+    let Command::Serve(serve) = cli.command else {
+        panic!("expected Command::Serve");
+    };
     Ok(*serve)
 }
 
@@ -631,4 +633,36 @@ fn a_zero_asr_batch_is_refused_naming_the_flag() {
 fn the_asr_id_can_be_named() {
     let args = parse(&["--asr-model", "/models/asr/mlx", "--asr-id", "nemotron"]).expect("parses");
     assert_eq!(args.asr_id().as_deref(), Some("nemotron"));
+}
+
+#[test]
+fn router_subcommand_parses_defaults_and_options() {
+    let cli =
+        Cli::try_parse_from(["shiso", "router"]).expect("router command parses with defaults");
+    let Command::Router(router_args) = cli.command else {
+        panic!("expected Command::Router");
+    };
+    assert_eq!(router_args.config, PathBuf::from("config.toml"));
+    assert!(router_args.listen.is_none());
+
+    let cli = Cli::try_parse_from([
+        "shiso",
+        "router",
+        "--config",
+        "/path/to/router.toml",
+        "--listen",
+        "0.0.0.0:8080",
+        "--port",
+        "8080",
+    ])
+    .expect("router command parses with options");
+    let Command::Router(router_args) = cli.command else {
+        panic!("expected Command::Router");
+    };
+    assert_eq!(router_args.config, PathBuf::from("/path/to/router.toml"));
+    assert_eq!(router_args.port, Some(8080));
+    assert_eq!(
+        router_args.listen,
+        Some("0.0.0.0:8080".parse().expect("valid address"))
+    );
 }

@@ -235,7 +235,9 @@ fn boot(recognizer: &Recognizer, diarizer: &Path, extra: &[&str]) -> Option<Arc<
     ];
     line.extend_from_slice(extra);
     let cli = <Cli as clap::Parser>::try_parse_from(line).expect("the command line parses");
-    let Command::Serve(args) = cli.command;
+    let Command::Serve(args) = cli.command else {
+        panic!("expected Command::Serve");
+    };
     args.validate().expect("servable");
     let audio = shiso_server::boot_audio(&args)
         .unwrap_or_else(|error| panic!("{}: {error}", recognizer.name))

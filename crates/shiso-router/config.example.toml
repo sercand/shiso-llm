@@ -1,0 +1,243 @@
+# llm-router example configuration.
+# Copy to config.toml and adjust. Run with: llm-router --config config.toml
+
+# Address to listen on.
+listen = "127.0.0.1:8080"
+
+# Optional: serve the admin API + UI on a separate address. When set, the
+# /admin routes (and the UI) are served ONLY here and are absent from the
+# main listener. When omitted, admin shares `listen`.
+# admin_listen = "127.0.0.1:9090"
+
+# SQLite database file for API tokens (created if missing).
+sqlite_path = "llm-router.db"
+
+# Maximum accepted request body size in bytes (default 1 GiB — sized for
+# audio uploads to /v1/audio/transcriptions; bodies are buffered in memory).
+max_body_bytes = 1073741824
+
+# Admin token protecting /admin/* endpoints.
+# Provide exactly one of admin_token / admin_token_env.
+admin_token_env = "LLM_ROUTER_ADMIN_TOKEN"
+# admin_token = "not-recommended-in-files"
+
+# --- Exclusive groups (seed only) ------------------------------------------
+# A group names one accelerator that several backends share. At most one
+# `grouped` member of a group generates at a time — the others queue for the
+# group's *lease*, or are shed to a remote fallback if they would miss their
+# deadline (see [models.qos] below). Use this when several inference servers
+# are resident on one device and contend for compute, not for memory.
+#
+#   min_hold_ms      how long a member keeps the lease before a waiting peer
+#                    can take it (anti-thrash floor)
+#   max_hold_ms      once held this long with someone waiting, the lease
+#                    moves regardless of min_hold_ms (anti-starvation)
+#   drain_timeout_ms watchdog: a drain stuck longer than this force-flips the
+#                    lease and logs at ERROR, because a wedged group takes
+#                    every model on the device down with it
+#
+# NOTE these two numbers interact: with min_hold_ms = 5000 and an interactive
+# max_wait_ms = 2000, a request arriving while the *other* model holds the
+# lease essentially always sheds — the predicted wait includes the remaining
+# hold, which exceeds the deadline by construction. That makes the system a
+# load shedder ("first model to grab the device serves locally, everyone else
+# goes remote"), which is a coherent choice. For actual interleaving instead,
+# use min_hold_ms ≈ 1000 with max_wait_ms ≈ 4000.
+
+[[exclusive_groups]]
+id = "dgx"
+min_hold_ms = 5000
+max_hold_ms = 30000
+drain_timeout_ms = 45000
+
+# --- Backends (seed only) --------------------------------------------------
+# Backends and models live in the SQLite database and are managed through
+# the admin API / UI (`/admin/backends`, `/admin/models`). The sections
+# below are imported ONCE, the first time the router starts against a
+# database with an empty catalog; after that they are ignored (the router
+# logs a warning if they are still present). Delete them once your catalog
+# is in the database.
+#
+# Scheduling fields (all optional; omitting them = today's behavior):
+#   scheduling_class  "unrestricted" (default), "exempt" or "grouped".
+#                     "grouped" = full gang scheduling against the device's
+#                     lease; "exempt" = on the device but never leased (a
+#                     small embedder interleaves harmlessly); the two
+#                     non-grouped classes behave identically at runtime and
+#                     differ only in what the admin UI can explain.
+#   exclusive_group   the group id, required by "grouped" and "exempt".
+#   max_concurrency   in-flight requests allowed on this backend (the engine's
+#                     own continuous batching handles this many fine).
+#   max_tokens_cap    ceiling clamped onto each request's generated-token
+#                     limit. REQUIRED for "grouped": it is what bounds drain
+#                     time, and therefore every other member's queue wait.
+#                     This is the single most important tuning knob here —
+#                     see the README.
+#   tok_s_estimate    seed for the observed-throughput estimator, tokens/sec.
+#
+# `kind` lists the API wire format(s) the base_url serves; requests are
+# only routed to backends that speak the endpoint they arrived on:
+#   "openai"    -> /v1/chat/completions, /v1/responses and /v1/embeddings,
+#                  outbound auth via "Authorization: Bearer <key>"
+#   "anthropic" -> /v1/messages,
+#                  outbound auth via "x-api-key: <key>" + anthropic-version
+# A gateway exposing both formats on one URL can list both:
+#   kind = ["openai", "anthropic"]
+# Provide at most one of api_key / api_key_env per backend; omit both for
+# backends that need no key (e.g. a local vllm instance) — no auth header
+# is sent upstream then.
+
+[[backends]]
+name = "openai"
+kind = "openai"
+base_url = "https://api.openai.com"
+api_key_env = "OPENAI_API_KEY"
+
+[[backends]]
+name = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+# Injected when the client does not send an anthropic-version header.
+anthropic_version = "2023-06-01"
+
+[[backends]]
+name = "vllm-local"
+kind = "openai"
+base_url = "http://127.0.0.1:8000"
+
+[[backends]]
+name = "openrouter"
+kind = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+# Two large models resident on one DGX Spark. Memory is not the constraint —
+# compute is: both use speculative decoding, which only pays off with idle
+# compute to spend, so they must not generate at the same time. The
+# asymmetric max_tokens_cap is deliberate: the dense model is ~3.5x slower
+# per token, so a smaller cap gives the two a comparable worst-case drain.
+[[backends]]
+name = "moe-local"
+kind = "openai"
+base_url = "http://dgx:8000"
+scheduling_class = "grouped"
+exclusive_group = "dgx"
+max_concurrency = 4
+max_tokens_cap = 1024
+tok_s_estimate = 90.0
+
+[[backends]]
+name = "dense-local"
+kind = "openai"
+base_url = "http://dgx:8001"
+scheduling_class = "grouped"
+exclusive_group = "dgx"
+max_concurrency = 4
+max_tokens_cap = 512
+tok_s_estimate = 25.0
+
+# On the same device, but a single bounded forward pass — it interleaves
+# harmlessly and is never made to wait for the lease.
+[[backends]]
+name = "embed-local"
+kind = "openai"
+base_url = "http://dgx:8002"
+scheduling_class = "exempt"
+exclusive_group = "dgx"
+
+# --- Model routes (seed only) ----------------------------------------------
+# Inbound `model` value -> one or more weighted targets.
+# `model` on a target renames the model before forwarding to that backend.
+# `weight` defaults to 1; load is balanced with smooth weighted round-robin.
+#
+# `aliases` (optional) are extra inbound names that clients may call the same
+# route by. They share the route's load balancing, and are resolved to the
+# model name before anything else happens: requests are logged, billed and
+# key-allowlisted under `name`, and — unless the chosen target renames the
+# model — forwarded upstream as `name` too. Every name and alias in the
+# catalog must be unique.
+#
+# Pricing (optional) is USD per 1M tokens and is used to compute the cost
+# stored with each request log and counted against key credit limits.
+# [models.pricing] is the default for every target; [models.targets.pricing]
+# overrides it per target (e.g. an internal vllm cluster is free). The
+# cached rates cover provider prompt caching: cached_input_per_mtok bills
+# cache reads, cache_write_per_mtok bills Anthropic cache creation. When
+# unset, both fall back to input_per_mtok. Models without any pricing log
+# their cost as null and only count toward token limits.
+
+[[models]]
+name = "gpt-4o"
+aliases = ["gpt-4o-latest", "gpt4o"]
+
+  [models.pricing]
+  input_per_mtok = 2.50
+  output_per_mtok = 10.00
+  cached_input_per_mtok = 1.25
+
+  [[models.targets]]
+  backend = "openai"
+  weight = 3
+
+  [[models.targets]]
+  backend = "vllm-local"
+  model = "llama-3.3-70b"
+  weight = 1
+
+    [models.targets.pricing]
+    input_per_mtok = 0.0
+    output_per_mtok = 0.0
+
+[[models]]
+name = "claude-sonnet"
+
+  [models.pricing]
+  input_per_mtok = 3.00
+  output_per_mtok = 15.00
+  cached_input_per_mtok = 0.30
+  cache_write_per_mtok = 3.75
+
+  [[models.targets]]
+  backend = "anthropic"
+  model = "claude-sonnet-4-5"
+
+# A model on a contended device. [models.qos] sets how long a request may be
+# predicted to wait before the router gives up on local hardware and sheds it
+# to a fallback target instead of queueing. `max_wait_ms` is the deadline for
+# ordinary traffic; `background_max_wait_ms` is what `x-router-qos: background`
+# selects (batch work is happy to wait a minute for free local compute). A
+# client can also name its own deadline with `x-router-max-wait-ms: <int>`.
+# Unset = wait indefinitely, which is the pre-scheduling behavior.
+#
+# `fallback_only` targets are invisible to normal weighted selection and are
+# reached only on a shed — so the OpenRouter target below costs real money
+# exactly when the local device is busy. Shed requests are logged and billed
+# normally, with the shed reason in the log row's `error` field.
+#
+# `on_shed_without_fallback` decides what happens when the deadline is missed
+# and no fallback exists: "wait" (default) or "error".
+
+[[models]]
+name = "qwen-moe"
+
+  [models.qos]
+  max_wait_ms = 2000
+  background_max_wait_ms = 60000
+
+  [[models.targets]]
+  backend = "moe-local"
+  weight = 1
+
+    [models.targets.pricing]
+    input_per_mtok = 0.0
+    output_per_mtok = 0.0
+
+  [[models.targets]]
+  backend = "openrouter"
+  model = "qwen/qwen3-30b-a3b"
+  fallback_only = true
+
+    [models.targets.pricing]
+    input_per_mtok = 0.10
+    output_per_mtok = 0.30

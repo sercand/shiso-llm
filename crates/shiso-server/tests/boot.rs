@@ -52,7 +52,9 @@ fn args(model: &Path, config: &Path) -> ServeArgs {
         "1024".to_owned(),
     ])
     .expect("the command line parses");
-    let Command::Serve(serve) = cli.command;
+    let Command::Serve(serve) = cli.command else {
+        panic!("expected Command::Serve");
+    };
     *serve
 }
 
