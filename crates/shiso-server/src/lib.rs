@@ -27,6 +27,7 @@ pub mod api;
 pub mod audio;
 pub mod auth;
 pub mod cli;
+pub mod decision;
 pub mod error;
 pub mod ids;
 pub mod media;
