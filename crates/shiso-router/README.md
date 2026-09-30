@@ -27,13 +27,13 @@ The router picks a backend based on the `model` field in the request body, swaps
 - **Model pricing** — per-model (or per-target) USD-per-million-token rates, including discounted cache-read and Anthropic cache-write rates, drive logged costs and credit limits.
 - **Device-aware scheduling** — backends that share one accelerator can be grouped so that at most one of them generates at a time, with per-backend concurrency limits and generated-token caps. See [Device-aware scheduling](#device-aware-scheduling).
 - **QoS deadlines & load shedding** — a route can declare how long a request may be *predicted* to queue on a busy device; over that, it is routed to a remote fallback target instead of waiting.
-- **Live catalog** — exclusive groups, backends and model routes live in the database and are created/edited/deleted through the admin API or UI; changes take effect on the next request, no restart. A config file's `[[exclusive_groups]]`/`[[backends]]`/`[[models]]` sections seed an empty catalog once.
+- **Live catalog** — exclusive groups, backends and model routes live in the database and are created/edited/deleted through the admin API or UI; changes take effect on the next request, no restart.
 - **Admin API + UI** — a JSON admin API (keys, groups, backends, models, logs, usage aggregates) plus a built-in single-page admin UI at `/admin/ui`, optionally on a separate listener.
 
 ## Quick start
 
 ```bash
-cp config.example.toml config.toml   # edit the seed backends/models (or add them later via /admin)
+cp config.example.toml config.toml   # adjust listen address, db path, and admin token
 export LLM_ROUTER_ADMIN_TOKEN=$(openssl rand -hex 32)
 export OPENAI_API_KEY=sk-...
 
@@ -75,9 +75,32 @@ client = Anthropic(base_url="http://localhost:8080", api_key="sk-...")
 
 ## Configuration
 
-See [`config.example.toml`](config.example.toml) for a complete annotated example.
+See [`config.example.toml`](config.example.toml) for an annotated example.
 
-Everything except backends and models can also be set on the command line, and command-line options take priority over the config file:
+The configuration file defines network and storage settings:
+
+```toml
+# Address to listen on.
+listen = "127.0.0.1:8080"
+
+# Optional: serve the admin API + UI on a separate address. When set, the
+# /admin routes (and the UI) are served ONLY here and are absent from the
+# main listener. When omitted, admin shares `listen`.
+# admin_listen = "127.0.0.1:9090"
+
+# SQLite database file for API tokens, routing catalog, and request logs.
+sqlite_path = "shiso-router.db"
+
+# Maximum accepted request body size in bytes (default 1 GiB).
+max_body_bytes = 1073741824
+
+# Admin token protecting /admin/* endpoints and the UI.
+# Provide exactly one of admin_token / admin_token_env.
+admin_token_env = "LLM_ROUTER_ADMIN_TOKEN"
+# admin_token = "not-recommended-in-files"
+```
+
+Command-line options override settings in the config file:
 
 ```bash
 # Via the shiso CLI:
@@ -91,64 +114,9 @@ shiso router --listen 0.0.0.0:8080 \
 shiso-router --config config.toml
 ```
 
-Run `shiso router --help` (or `shiso-router --help`) for the full list.
+Run `shiso router --help` (or `shiso-router --help`) for the full list of options.
 
-```toml
-listen = "127.0.0.1:8080"
-# admin_listen = "127.0.0.1:9090"          # optional: admin API+UI on its own port
-sqlite_path = "shiso-router.db"
-max_body_bytes = 1073741824                # request body cap (default 1 GiB)
-admin_token_env = "LLM_ROUTER_ADMIN_TOKEN" # or admin_token = "..." (exactly one)
-
-# Everything below is SEED DATA: it is imported into the database the first
-# time the router starts with an empty catalog and ignored afterwards, when
-# /admin/backends and /admin/models own it. New deployments can skip it
-# entirely and add backends and models through the admin UI.
-
-[[backends]]
-name = "openai"
-kind = "openai"                    # "openai" -> Authorization: Bearer <key>
-                                   # a list works too: kind = ["openai", "anthropic"]
-base_url = "https://api.openai.com"
-api_key_env = "OPENAI_API_KEY"     # or api_key = "..." (exactly one)
-# inject_usage = false             # opt out of stream_options.include_usage injection
-
-[[backends]]
-name = "anthropic"
-kind = "anthropic"                 # "anthropic" -> x-api-key + anthropic-version
-base_url = "https://api.anthropic.com"
-api_key_env = "ANTHROPIC_API_KEY"
-anthropic_version = "2023-06-01"   # injected when the client omits the header
-
-[[models]]
-name = "gpt-4o"                    # inbound model name
-aliases = ["gpt-4o-latest"]        # optional extra inbound names for this route
-
-  [models.pricing]                 # optional, USD per 1M tokens; drives cost
-  input_per_mtok = 2.50            # logging and credit limits
-  output_per_mtok = 10.00
-  cached_input_per_mtok = 1.25     # cache reads (default: input_per_mtok)
-  # cache_write_per_mtok = ...     # Anthropic cache creation (default: input_per_mtok)
-
-  [[models.targets]]
-  backend = "openai"
-  weight = 3                       # default 1
-
-  [[models.targets]]
-  backend = "vllm-local"
-  model = "llama-3.3-70b"          # rename before forwarding
-  weight = 1
-
-    [models.targets.pricing]       # per-target override: this one is free
-    input_per_mtok = 0.0
-    output_per_mtok = 0.0
-```
-
-Config is validated at startup (unknown target backends, duplicate names, zero weights, missing key sources, and unset env vars all fail fast with a clear error) — the same validators run on admin catalog writes.
-
-Backends and models are stored in SQLite (`backends`, `models`, `model_targets`). Upgrading an existing deployment needs no action: the first start after the upgrade imports the config file's sections into the empty catalog. Once that has happened, edits to those sections are ignored (the router warns), so delete them from the file and manage the catalog through `/admin`. Secrets can stay in the environment: a backend may reference `api_key_env` instead of storing the key in the database.
-
-## Device-aware scheduling
+Backends, models, and exclusive groups are not set in the configuration file: they live in the SQLite database and are managed dynamically through the admin API and Web UI (`/admin/ui`, `/admin/backends`, `/admin/models`, `/admin/groups`). Changes take effect on the next request without a restart. Secrets can stay in the environment: a backend created via the admin UI may reference `api_key_env` instead of storing the plaintext key in the database.
 
 Several inference servers can be resident on one accelerator at the same time without
 contending for *memory* while still contending badly for *compute*. Two large models that both
@@ -338,7 +306,7 @@ Backends additionally accept `scheduling_class`, `exclusive_group_id`, `max_conc
 `qos_background_max_wait_ms` and `on_shed_without_fallback`, and their targets accept
 `fallback_only`. See [Device-aware scheduling](#device-aware-scheduling).
 
-Catalog writes are validated exactly like the config file (unknown backend in a target, zero weight, both key sources set, unset `api_key_env`, …) and are applied to the live routing table before the response returns; the previous table stays in use if the rebuild fails.
+Catalog writes are validated (unknown backend in a target, zero weight, both key sources set, unset `api_key_env`, …) and are applied to the live routing table before the response returns; the previous table stays in use if the rebuild fails.
 
 Reset intervals are `never` (default), `daily`, `weekly` (Monday 00:00 UTC), or `monthly` — all windows are UTC. There is also an unauthenticated `GET /healthz` on each listener, and `GET /admin/ui` (the page itself carries no data).
 
@@ -350,10 +318,6 @@ Reset intervals are `never` (default), `daily`, `weekly` (Monday 00:00 UTC), or 
 - **Usage capture** — streaming OpenAI-style chat requests get `stream_options.include_usage: true` injected so usage appears in the stream (the extra final chunk passes through to the client, as OpenRouter does; set `inject_usage = false` on backends that reject `stream_options`). Anthropic and Responses streams already carry usage. Token counts are normalized so `prompt_tokens` always includes cached tokens; costs bill cache reads/writes at their configured rates.
 - **Embeddings** — `/v1/embeddings` routes like any other model name, so a batch job can be renamed onto a cheaper provider and stays inside the same key limits. Responses report only `prompt_tokens`, billed at `input_per_mtok` (set `output_per_mtok = 0.0`). Bodies are still streamed straight through: a multi-megabyte batch response is never buffered, and usage is recovered from the ends of the body.
 - **Limit semantics** — checks happen before dispatch against in-memory window counters (warmed from the log table at startup); usage accrues when the response finishes streaming, so concurrent in-flight requests can overshoot a limit by at most their own usage. Requests with no extractable usage accrue nothing but are still logged (with a note in `error`).
-
-## Running as a service
-
-[`deploy/llm-router.service`](deploy/llm-router.service) is an example systemd unit: it runs the release binary as an unprivileged dynamic user with `/var/lib/shiso-router` as the state directory (put `sqlite_path` there), reads config from `/etc/shiso-router/config.toml`, and loads secrets (`LLM_ROUTER_ADMIN_TOKEN`, backend API keys) from `/etc/shiso-router/env`. Install steps are in the unit file's header comment.
 
 ## Development
 

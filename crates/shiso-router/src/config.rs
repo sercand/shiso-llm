@@ -1,11 +1,12 @@
-use std::collections::HashSet;
+//! Configuration file format and loading.
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use thiserror::Error;
 
-use crate::catalog::{BackendDef, GroupDef, ModelDef, OnShedWithoutFallback, SchedulingClass};
+pub use crate::catalog::{BackendKind, PricingCfg};
 
 /// Configuration errors.
 #[derive(Debug, Error)]
@@ -46,175 +47,10 @@ pub struct Config {
     pub admin_token: Option<String>,
     /// Environment variable containing the admin API token.
     pub admin_token_env: Option<String>,
-    /// Seed data only: imported into the SQLite catalog the first time the
-    /// router starts against an empty database, then ignored — groups,
-    /// backends and models are owned by the admin API afterwards.
-    /// Seed exclusive groups imported into an empty database.
-    #[serde(default)]
-    pub exclusive_groups: Vec<ExclusiveGroupCfg>,
-    /// Seed backends imported into an empty database.
-    #[serde(default)]
-    pub backends: Vec<BackendCfg>,
-    /// Seed models imported into an empty database.
-    #[serde(default)]
-    pub models: Vec<ModelCfg>,
 }
 
 fn default_max_body_bytes() -> usize {
     1024 * 1024 * 1024
-}
-
-/// API wire format kinds supported by backends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BackendKind {
-    /// OpenAI Chat Completions, Responses, and Embeddings APIs.
-    Openai,
-    /// Anthropic Messages API.
-    Anthropic,
-}
-
-/// A set of backends that share one accelerator and must not generate at
-/// the same time. See `catalog::GroupDef` for what the timings mean.
-/// Configuration for an exclusive accelerator group.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExclusiveGroupCfg {
-    /// Group identifier.
-    pub id: String,
-    /// Anti-thrash minimum hold time in milliseconds.
-    pub min_hold_ms: i64,
-    /// Anti-starvation maximum hold time in milliseconds.
-    pub max_hold_ms: i64,
-    /// Stuck drain watchdog timeout in milliseconds.
-    pub drain_timeout_ms: i64,
-}
-
-/// Backend configuration.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BackendCfg {
-    /// Unique backend name.
-    pub name: String,
-    /// API kinds this base_url serves. Accepts a bare string
-    /// (`kind = "openai"`) or an array (`kind = ["openai", "anthropic"]`)
-    /// for gateways that expose both wire formats on one URL.
-    #[serde(deserialize_with = "kind_one_or_many")]
-    pub kind: Vec<BackendKind>,
-    /// Base URL of the upstream server.
-    pub base_url: String,
-    /// Literal API key for outbound authentication.
-    pub api_key: Option<String>,
-    /// Environment variable containing the API key.
-    pub api_key_env: Option<String>,
-    /// Anthropic version header value.
-    pub anthropic_version: Option<String>,
-    /// openai-kind only: inject `stream_options.include_usage` into
-    /// streaming chat requests that don't set it, so usage can be logged.
-    /// Escape hatch for OpenAI-compatible servers that reject the field.
-    #[serde(default = "crate::catalog::default_inject_usage")]
-    pub inject_usage: bool,
-    /// "unrestricted" (default), "exempt", or "grouped" — see
-    /// `catalog::SchedulingClass`.
-    #[serde(default)]
-    pub scheduling_class: SchedulingClass,
-    /// Id of the `[[exclusive_groups]]` entry this backend belongs to.
-    #[serde(default)]
-    pub exclusive_group: Option<String>,
-    /// Maximum in-flight requests permitted on this backend.
-    #[serde(default)]
-    pub max_concurrency: Option<u32>,
-    /// Generated token limit clamp for grouped backends.
-    #[serde(default)]
-    pub max_tokens_cap: Option<i64>,
-    /// Output throughput estimate in tokens per second.
-    #[serde(default)]
-    pub tok_s_estimate: Option<f64>,
-}
-
-fn kind_one_or_many<'de, D>(de: D) -> Result<Vec<BackendKind>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(BackendKind),
-        Many(Vec<BackendKind>),
-    }
-    Ok(match OneOrMany::deserialize(de)? {
-        OneOrMany::One(k) => vec![k],
-        OneOrMany::Many(v) => v,
-    })
-}
-
-/// Configuration for a single model route.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelCfg {
-    /// Canonical model name.
-    pub name: String,
-    /// Additional inbound names for this same route.
-    #[serde(default)]
-    pub aliases: Vec<String>,
-    /// Default pricing for every target of this model; targets may override.
-    pub pricing: Option<PricingCfg>,
-    /// Deadlines for predictive admission on grouped backends.
-    pub qos: Option<QosCfg>,
-    /// What to do when the deadline is missed and the route has no
-    /// fallback: "wait" (default) or "error".
-    #[serde(default)]
-    pub on_shed_without_fallback: OnShedWithoutFallback,
-    /// Upstream targets for this model route.
-    pub targets: Vec<TargetCfg>,
-}
-
-/// Per-route QoS deadlines, in milliseconds of predicted queue wait.
-/// An unset field means "wait indefinitely" for that class.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QosCfg {
-    /// Interactive request deadline in milliseconds.
-    pub max_wait_ms: Option<i64>,
-    /// Selected by `x-router-qos: background`.
-    pub background_max_wait_ms: Option<i64>,
-}
-
-/// A backend target for a model route.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TargetCfg {
-    /// Backend name.
-    pub backend: String,
-    /// Model name rewrite on dispatch.
-    pub model: Option<String>,
-    /// Weighted selection weight.
-    #[serde(default = "crate::catalog::default_weight")]
-    pub weight: u32,
-    /// Pricing override for this target.
-    pub pricing: Option<PricingCfg>,
-    /// Reachable only on a QoS shed, never by normal weighted selection.
-    #[serde(default)]
-    pub fallback_only: bool,
-}
-
-/// USD per 1M tokens. Cache rates differ per provider (OpenAI discounts
-/// cache reads; Anthropic bills cache reads at ~0.1x and cache writes at
-/// ~1.25x input) — when unset they fall back to `input_per_mtok`, which
-/// never undercharges.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PricingCfg {
-    /// USD per 1M prompt tokens.
-    pub input_per_mtok: f64,
-    /// USD per 1M completion tokens.
-    pub output_per_mtok: f64,
-    /// USD per 1M cached prompt tokens.
-    #[serde(default)]
-    pub cached_input_per_mtok: Option<f64>,
-    /// USD per 1M Anthropic cache write tokens.
-    #[serde(default)]
-    pub cache_write_per_mtok: Option<f64>,
 }
 
 /// Settings that can override the config file (e.g. from command-line args).
@@ -282,7 +118,7 @@ impl Config {
         }
     }
 
-    /// Validates configuration invariants and seed catalogs.
+    /// Validates configuration invariants.
     ///
     /// # Errors
     ///
@@ -304,39 +140,6 @@ impl Config {
             return Err(invalid(
                 "admin_listen must differ from listen (omit it to share the main listener)",
             ));
-        }
-
-        // The optional seed sections are checked with the same validators
-        // the admin API uses, so a config file cannot inject a catalog the
-        // API would have rejected.
-        let mut group_ids = HashSet::new();
-        for g in &self.exclusive_groups {
-            if !group_ids.insert(g.id.as_str()) {
-                return Err(invalid(format!("duplicate exclusive group id {:?}", g.id)));
-            }
-            crate::catalog::validate_group(&GroupDef::from(g)).map_err(invalid)?;
-        }
-
-        let known_groups: Vec<String> =
-            self.exclusive_groups.iter().map(|g| g.id.clone()).collect();
-        let mut names = HashSet::new();
-        for b in &self.backends {
-            if !names.insert(b.name.as_str()) {
-                return Err(invalid(format!("duplicate backend name {:?}", b.name)));
-            }
-            crate::catalog::validate_backend(&BackendDef::from(b), &known_groups)
-                .map_err(invalid)?;
-        }
-
-        let known: Vec<String> = self.backends.iter().map(|b| b.name.clone()).collect();
-        // Names and aliases share one namespace, so each model is checked
-        // against the ones already accepted — same rule the admin API applies.
-        let mut accepted: Vec<ModelDef> = Vec::with_capacity(self.models.len());
-        for m in &self.models {
-            let def = ModelDef::from(m);
-            crate::catalog::validate_model(&def, &known).map_err(invalid)?;
-            crate::catalog::validate_no_name_conflict(&def, &accepted).map_err(invalid)?;
-            accepted.push(def);
         }
 
         Ok(())
@@ -375,17 +178,6 @@ mod tests {
 listen = "127.0.0.1:8080"
 sqlite_path = "test.db"
 admin_token = "secret"
-
-[[backends]]
-name = "openai"
-kind = "openai"
-base_url = "https://api.openai.com"
-api_key = "sk-test"
-
-[[models]]
-name = "gpt-4o"
-  [[models.targets]]
-  backend = "openai"
 "#
         .to_string()
     }
@@ -401,96 +193,13 @@ name = "gpt-4o"
         let raw = include_str!("../config.example.toml");
         let cfg: Config = toml::from_str(raw).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.backends.len(), 7);
-        assert!(cfg.backends[0].inject_usage); // default
-        assert_eq!(cfg.models.len(), 3);
-        assert_eq!(cfg.models[0].aliases, ["gpt-4o-latest", "gpt4o"]);
-        assert!(cfg.models[1].aliases.is_empty());
-
-        // The scheduling seed: one device group, two grouped members with
-        // deliberately asymmetric token caps, one exempt embedder.
-        assert_eq!(cfg.exclusive_groups.len(), 1);
-        let dgx = &cfg.exclusive_groups[0];
-        assert_eq!(dgx.id, "dgx");
-        assert!(dgx.min_hold_ms <= dgx.max_hold_ms);
-        assert!(dgx.max_hold_ms <= dgx.drain_timeout_ms);
-
-        let by_name = |n: &str| cfg.backends.iter().find(|b| b.name == n).unwrap();
-        let moe = by_name("moe-local");
-        assert_eq!(moe.scheduling_class, SchedulingClass::Grouped);
-        assert_eq!(moe.exclusive_group.as_deref(), Some("dgx"));
-        assert_eq!(moe.max_concurrency, Some(4));
-        assert_eq!(moe.max_tokens_cap, Some(1024));
-        assert_eq!(moe.tok_s_estimate, Some(90.0));
-        // The slower dense model gets the smaller cap, so both drain in a
-        // comparable wall-clock time.
-        let dense = by_name("dense-local");
-        assert!(dense.max_tokens_cap < moe.max_tokens_cap);
-        assert!(dense.tok_s_estimate < moe.tok_s_estimate);
-        let embed = by_name("embed-local");
-        assert_eq!(embed.scheduling_class, SchedulingClass::Exempt);
-        assert_eq!(embed.exclusive_group.as_deref(), Some("dgx"));
-        assert_eq!(embed.max_tokens_cap, None);
-        // Everything off the device stays unrestricted by default.
+        assert_eq!(cfg.listen, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(cfg.sqlite_path, PathBuf::from("shiso-router.db"));
+        assert_eq!(cfg.max_body_bytes, 1073741824);
         assert_eq!(
-            by_name("openai").scheduling_class,
-            SchedulingClass::Unrestricted
+            cfg.admin_token_env.as_deref(),
+            Some("LLM_ROUTER_ADMIN_TOKEN")
         );
-        assert_eq!(by_name("openai").exclusive_group, None);
-
-        let qwen = cfg.models.iter().find(|m| m.name == "qwen-moe").unwrap();
-        let qos = qwen.qos.as_ref().unwrap();
-        assert_eq!(qos.max_wait_ms, Some(2000));
-        assert_eq!(qos.background_max_wait_ms, Some(60000));
-        assert_eq!(qwen.on_shed_without_fallback, OnShedWithoutFallback::Wait);
-        assert!(!qwen.targets[0].fallback_only);
-        assert!(qwen.targets[1].fallback_only);
-        // Routes that predate scheduling carry no deadline at all.
-        assert!(cfg.models[0].qos.is_none());
-        assert!(cfg.models[0].targets.iter().all(|t| !t.fallback_only));
-        assert_eq!(
-            cfg.models[0].targets[1].model.as_deref(),
-            Some("llama-3.3-70b")
-        );
-        assert_eq!(cfg.models[0].targets[0].weight, 3);
-        assert_eq!(cfg.models[1].targets[0].weight, 1); // default
-
-        let gpt = cfg.models[0].pricing.as_ref().unwrap();
-        assert_eq!(gpt.input_per_mtok, 2.50);
-        assert_eq!(gpt.output_per_mtok, 10.00);
-        assert_eq!(gpt.cached_input_per_mtok, Some(1.25));
-        assert_eq!(gpt.cache_write_per_mtok, None);
-        // vllm target overrides the model default with free pricing.
-        let vllm = cfg.models[0].targets[1].pricing.as_ref().unwrap();
-        assert_eq!(vllm.input_per_mtok, 0.0);
-        assert!(cfg.models[0].targets[0].pricing.is_none());
-        let claude = cfg.models[1].pricing.as_ref().unwrap();
-        assert_eq!(claude.cache_write_per_mtok, Some(3.75));
-    }
-
-    #[test]
-    fn kind_accepts_string_or_array() {
-        let cfg = parse(&base_config()).unwrap();
-        assert_eq!(cfg.backends[0].kind, vec![BackendKind::Openai]);
-
-        let raw = base_config().replace("kind = \"openai\"", "kind = [\"openai\", \"anthropic\"]");
-        let cfg = parse(&raw).unwrap();
-        assert_eq!(
-            cfg.backends[0].kind,
-            vec![BackendKind::Openai, BackendKind::Anthropic]
-        );
-    }
-
-    #[test]
-    fn rejects_empty_kind_list() {
-        let raw = base_config().replace("kind = \"openai\"", "kind = []");
-        assert!(matches!(parse(&raw), Err(ConfigError::Invalid(_))));
-    }
-
-    #[test]
-    fn rejects_duplicate_kind_entries() {
-        let raw = base_config().replace("kind = \"openai\"", "kind = [\"openai\", \"openai\"]");
-        assert!(matches!(parse(&raw), Err(ConfigError::Invalid(_))));
     }
 
     #[test]
@@ -509,89 +218,15 @@ name = "gpt-4o"
     }
 
     #[test]
-    fn rejects_negative_pricing() {
-        let raw = base_config().replace(
-            "name = \"gpt-4o\"",
-            "name = \"gpt-4o\"\n[models.pricing]\ninput_per_mtok = -1.0\noutput_per_mtok = 1.0",
-        );
-        assert!(matches!(parse(&raw), Err(ConfigError::Invalid(_))));
-    }
-
-    #[test]
     fn happy_path() {
         let cfg = parse(&base_config()).unwrap();
         assert_eq!(cfg.max_body_bytes, 1024 * 1024 * 1024);
         assert_eq!(cfg.resolved_admin_token().unwrap(), "secret");
-        assert_eq!(
-            BackendDef::from(&cfg.backends[0])
-                .resolved_api_key()
-                .unwrap()
-                .as_deref(),
-            Some("sk-test")
-        );
-    }
-
-    #[test]
-    fn rejects_duplicate_backend() {
-        let raw = base_config().replace(
-            "[[models]]",
-            r#"[[backends]]
-name = "openai"
-kind = "openai"
-base_url = "https://example.com"
-api_key = "x"
-
-[[models]]"#,
-        );
-        assert!(matches!(parse(&raw), Err(ConfigError::Invalid(_))));
-    }
-
-    #[test]
-    fn rejects_unknown_target_backend() {
-        let raw = base_config().replace("backend = \"openai\"", "backend = \"nope\"");
-        assert!(matches!(parse(&raw), Err(ConfigError::Invalid(_))));
-    }
-
-    #[test]
-    fn rejects_zero_weight() {
-        let raw =
-            base_config().replace("backend = \"openai\"", "backend = \"openai\"\n  weight = 0");
-        assert!(matches!(parse(&raw), Err(ConfigError::Invalid(_))));
-    }
-
-    #[test]
-    fn rejects_both_api_key_sources() {
-        let raw = base_config().replace(
-            "api_key = \"sk-test\"",
-            "api_key = \"sk-test\"\napi_key_env = \"K\"",
-        );
-        assert!(matches!(parse(&raw), Err(ConfigError::Invalid(_))));
-    }
-
-    #[test]
-    fn allows_missing_api_key_source() {
-        let raw = base_config().replace("api_key = \"sk-test\"\n", "");
-        let cfg = parse(&raw).unwrap();
-        assert_eq!(
-            BackendDef::from(&cfg.backends[0])
-                .resolved_api_key()
-                .unwrap(),
-            None
-        );
     }
 
     #[test]
     fn rejects_missing_admin_token() {
         let raw = base_config().replace("admin_token = \"secret\"\n", "");
-        assert!(matches!(parse(&raw), Err(ConfigError::Invalid(_))));
-    }
-
-    #[test]
-    fn rejects_model_without_targets() {
-        let raw = base_config().replace(
-            "name = \"gpt-4o\"\n  [[models.targets]]\n  backend = \"openai\"",
-            "name = \"gpt-4o\"\ntargets = []",
-        );
         assert!(matches!(parse(&raw), Err(ConfigError::Invalid(_))));
     }
 
@@ -629,8 +264,6 @@ api_key = "x"
             admin_token_env: Some("LLM_ROUTER_TEST_SURELY_UNSET_VAR".into()),
             ..Overrides::default()
         });
-        // The file's literal admin_token was cleared, so validate() still
-        // sees exactly one source and resolution goes through the env var.
         cfg.validate().unwrap();
         assert_eq!(cfg.admin_token, None);
         assert!(matches!(
@@ -653,18 +286,5 @@ api_key = "x"
         cfg.validate().unwrap();
         assert_eq!(cfg.admin_token_env, None);
         assert_eq!(cfg.resolved_admin_token().unwrap(), "cli-secret");
-    }
-
-    #[test]
-    fn missing_env_var_fails_resolution() {
-        let raw = base_config().replace(
-            "api_key = \"sk-test\"",
-            "api_key_env = \"LLM_ROUTER_TEST_SURELY_UNSET_VAR\"",
-        );
-        let cfg = parse(&raw).unwrap();
-        assert!(matches!(
-            BackendDef::from(&cfg.backends[0]).resolved_api_key(),
-            Err(ConfigError::MissingEnv(_))
-        ));
     }
 }

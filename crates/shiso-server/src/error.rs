@@ -58,51 +58,14 @@ impl ApiSurface {
     /// Which format a request for `path` is answered in.
     ///
     /// The path is the only thing the layers that run before a handler - the
-    /// auth gate, the 404 and the 405 - know about which client is asking, and
-    /// it is enough: a route belongs to exactly one surface. Without this, a
-    /// client of the Messages family that sent the wrong key would be handed a
-    /// refusal in the other family's shape, and report a parse failure instead
-    /// of the server's actual answer.
+    /// 404 and the 405 - know about which client is asking, and
+    /// it is enough: a route belongs to exactly one surface.
     #[must_use]
     pub fn for_path(path: &str) -> Self {
         if path == "/v1/messages" || path.starts_with("/v1/messages/") {
             Self::Anthropic
         } else {
             Self::OpenAi
-        }
-    }
-}
-
-/// Why a request was refused by the auth gate.
-///
-/// The two cases produce different `code` values and an operator reading a log
-/// needs to tell "the client never sent a token" from "the client sent one we
-/// do not know". A boolean would carry the same information and say nothing
-/// about which way round it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthReject {
-    /// No `Authorization: Bearer` header at all.
-    Missing,
-    /// A bearer token that matched none of the configured ones.
-    Invalid,
-}
-
-impl AuthReject {
-    /// The `code` field the body carries.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::Missing => "missing_api_key",
-            Self::Invalid => "invalid_api_key",
-        }
-    }
-
-    /// What the client is told.
-    #[must_use]
-    pub const fn message(self) -> &'static str {
-        match self {
-            Self::Missing => "missing bearer token",
-            Self::Invalid => "invalid bearer token",
         }
     }
 }
@@ -120,9 +83,6 @@ pub enum AppError {
         /// The name the request gave.
         model: String,
     },
-    /// The auth gate refused the request.
-    #[error("unauthorized: {}", .0.message())]
-    Unauthorized(AuthReject),
     /// No route matched the path.
     #[error("unknown endpoint {path}")]
     NotFound {
@@ -255,7 +215,7 @@ impl AppError {
             Self::NoModel | Self::NotReady { .. } | Self::Overloaded { .. } => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
-            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+
             Self::NotFound { .. } | Self::UnknownModel { .. } => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -285,7 +245,7 @@ impl AppError {
             Self::NotReady { .. } => "server_not_ready",
             Self::Overloaded { .. } => "server_overloaded",
             Self::ContextOverflow { .. } => "context_length_exceeded",
-            Self::Unauthorized(reject) => reject.code(),
+
             Self::NotFound { .. } => "unknown_endpoint",
             Self::UnknownModel { .. } => "model_not_found",
             Self::MethodNotAllowed { .. } => "method_not_allowed",

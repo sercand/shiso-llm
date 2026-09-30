@@ -11,11 +11,34 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::config::{
-    BackendCfg, BackendKind, Config, ConfigError, ExclusiveGroupCfg, ModelCfg, PricingCfg,
-    resolve_secret,
-};
+use crate::config::{ConfigError, resolve_secret};
 use crate::tokens::Db;
+
+/// API wire format kinds supported by backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    /// OpenAI Chat Completions, Responses, and Embeddings APIs.
+    Openai,
+    /// Anthropic Messages API.
+    Anthropic,
+}
+
+/// USD per 1M tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PricingCfg {
+    /// USD per 1M prompt tokens.
+    pub input_per_mtok: f64,
+    /// USD per 1M completion tokens.
+    pub output_per_mtok: f64,
+    /// USD per 1M cached prompt tokens.
+    #[serde(default)]
+    pub cached_input_per_mtok: Option<f64>,
+    /// USD per 1M Anthropic cache write tokens.
+    #[serde(default)]
+    pub cache_write_per_mtok: Option<f64>,
+}
 
 pub(crate) const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -38,13 +61,17 @@ pub(crate) fn default_weight() -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SchedulingClass {
+    /// Not on a contended accelerator device.
     #[default]
     Unrestricted,
+    /// Sits on an accelerator device but generates without waiting for the group lease.
     Exempt,
+    /// Gang-scheduled under the accelerator group lease.
     Grouped,
 }
 
 impl SchedulingClass {
+    /// Returns the static string representation of the scheduling class.
     pub fn as_str(self) -> &'static str {
         match self {
             SchedulingClass::Unrestricted => "unrestricted",
@@ -53,6 +80,7 @@ impl SchedulingClass {
         }
     }
 
+    /// Parses a scheduling class from a string slice.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "unrestricted" => Some(SchedulingClass::Unrestricted),
@@ -77,6 +105,7 @@ pub enum OnShedWithoutFallback {
 }
 
 impl OnShedWithoutFallback {
+    /// Returns the static string representation of the shed behavior.
     pub fn as_str(self) -> &'static str {
         match self {
             OnShedWithoutFallback::Wait => "wait",
@@ -84,6 +113,7 @@ impl OnShedWithoutFallback {
         }
     }
 
+    /// Parses shed behavior from a string slice.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "wait" => Some(OnShedWithoutFallback::Wait),
@@ -99,6 +129,7 @@ impl OnShedWithoutFallback {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupDef {
+    /// Exclusive group identifier.
     pub id: String,
     /// Anti-thrash floor: how long a holder keeps the lease before a
     /// waiting peer can take it.
@@ -117,18 +148,25 @@ pub struct GroupDef {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendDef {
+    /// Unique backend name.
     pub name: String,
     /// API wire formats this base_url serves.
     pub kinds: Vec<BackendKind>,
+    /// Base URL of upstream backend.
     pub base_url: String,
+    /// Literal API key for outbound authentication.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Environment variable name holding the API key.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Anthropic version header value.
     #[serde(default)]
     pub anthropic_version: Option<String>,
+    /// Whether to inject `stream_options.include_usage` for OpenAI streams.
     #[serde(default = "default_inject_usage")]
     pub inject_usage: bool,
+    /// Scheduling class for device contention.
     #[serde(default)]
     pub scheduling_class: SchedulingClass,
     /// The device this backend shares, for `grouped` and `exempt` classes.
@@ -152,21 +190,34 @@ pub struct BackendDef {
 /// back, only whether one is set.
 #[derive(Debug, Clone, Serialize)]
 pub struct BackendView {
+    /// Backend name.
     pub name: String,
+    /// Supported API wire format kinds.
     pub kinds: Vec<BackendKind>,
+    /// Base URL.
     pub base_url: String,
+    /// Whether backend has an API key configured.
     pub has_api_key: bool,
+    /// Environment variable name holding the API key.
     pub api_key_env: Option<String>,
+    /// Anthropic version header value.
     pub anthropic_version: Option<String>,
+    /// Whether usage injection is enabled.
     pub inject_usage: bool,
+    /// Scheduling class for device contention.
     pub scheduling_class: SchedulingClass,
+    /// Associated exclusive group id.
     pub exclusive_group_id: Option<String>,
+    /// Maximum concurrency limit.
     pub max_concurrency: Option<u32>,
+    /// Generated token limit clamp.
     pub max_tokens_cap: Option<i64>,
+    /// Output throughput estimate in tokens per second.
     pub tok_s_estimate: Option<f64>,
 }
 
 impl BackendDef {
+    /// Returns the sanitized API view of the backend definition.
     pub fn view(&self) -> BackendView {
         BackendView {
             name: self.name.clone(),
@@ -197,6 +248,7 @@ impl BackendDef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDef {
+    /// Canonical model name.
     pub name: String,
     /// Extra inbound names that resolve to this same route (shared load
     /// balancer state included). A request naming an alias is billed and
@@ -216,8 +268,10 @@ pub struct ModelDef {
     /// usually happy to wait far longer for local hardware.
     #[serde(default)]
     pub qos_background_max_wait_ms: Option<i64>,
+    /// Action when QoS deadline is missed and route has no fallback.
     #[serde(default)]
     pub on_shed_without_fallback: OnShedWithoutFallback,
+    /// Upstream targets for this model route.
     pub targets: Vec<TargetDef>,
 }
 
@@ -228,75 +282,25 @@ impl ModelDef {
     }
 }
 
+/// Target definition for a model route.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetDef {
+    /// Backend name to route to.
     pub backend: String,
     /// Model name to substitute when forwarding to this backend.
     #[serde(default)]
     pub model: Option<String>,
+    /// Selection weight for load balancing.
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Pricing override for this target.
     #[serde(default)]
     pub pricing: Option<PricingCfg>,
     /// Excluded from normal weighted selection; reachable only when a
     /// request is shed off a local backend for missing its QoS deadline.
     #[serde(default)]
     pub fallback_only: bool,
-}
-
-impl From<&ExclusiveGroupCfg> for GroupDef {
-    fn from(g: &ExclusiveGroupCfg) -> Self {
-        GroupDef {
-            id: g.id.clone(),
-            min_hold_ms: g.min_hold_ms,
-            max_hold_ms: g.max_hold_ms,
-            drain_timeout_ms: g.drain_timeout_ms,
-        }
-    }
-}
-
-impl From<&BackendCfg> for BackendDef {
-    fn from(b: &BackendCfg) -> Self {
-        BackendDef {
-            name: b.name.clone(),
-            kinds: b.kind.clone(),
-            base_url: b.base_url.clone(),
-            api_key: b.api_key.clone(),
-            api_key_env: b.api_key_env.clone(),
-            anthropic_version: b.anthropic_version.clone(),
-            inject_usage: b.inject_usage,
-            scheduling_class: b.scheduling_class,
-            exclusive_group_id: b.exclusive_group.clone(),
-            max_concurrency: b.max_concurrency,
-            max_tokens_cap: b.max_tokens_cap,
-            tok_s_estimate: b.tok_s_estimate,
-        }
-    }
-}
-
-impl From<&ModelCfg> for ModelDef {
-    fn from(m: &ModelCfg) -> Self {
-        ModelDef {
-            name: m.name.clone(),
-            aliases: m.aliases.clone(),
-            pricing: m.pricing,
-            qos_max_wait_ms: m.qos.as_ref().and_then(|q| q.max_wait_ms),
-            qos_background_max_wait_ms: m.qos.as_ref().and_then(|q| q.background_max_wait_ms),
-            on_shed_without_fallback: m.on_shed_without_fallback,
-            targets: m
-                .targets
-                .iter()
-                .map(|t| TargetDef {
-                    backend: t.backend.clone(),
-                    model: t.model.clone(),
-                    weight: t.weight,
-                    pricing: t.pricing,
-                    fallback_only: t.fallback_only,
-                })
-                .collect(),
-        }
-    }
 }
 
 // ---- validation ---------------------------------------------------------
@@ -546,8 +550,11 @@ pub(crate) fn validate_pricing(p: &PricingCfg, model: &str) -> Result<(), String
 /// backends reference them and models reference backends.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
+    /// Stored exclusive groups.
     pub groups: Vec<GroupDef>,
+    /// Stored backends.
     pub backends: Vec<BackendDef>,
+    /// Stored models.
     pub models: Vec<ModelDef>,
 }
 
@@ -577,7 +584,11 @@ pub(crate) fn load_all(db: &Db) -> Result<Catalog> {
 }
 
 /// Inserts an exclusive group; `false` means the id is already taken.
-pub(crate) fn insert_group(db: &Db, def: &GroupDef) -> Result<bool> {
+///
+/// # Errors
+///
+/// Returns an error if the database write fails.
+pub fn insert_group(db: &Db, def: &GroupDef) -> Result<bool> {
     db.with_write(|conn| {
         if group_exists(conn, &def.id)? {
             return Ok(false);
@@ -635,7 +646,11 @@ pub(crate) fn delete_group(db: &Db, id: &str) -> Result<DeleteGroup> {
 }
 
 /// Inserts a backend; `false` means the name is already taken.
-pub(crate) fn insert_backend(db: &Db, def: &BackendDef) -> Result<bool> {
+///
+/// # Errors
+///
+/// Returns an error if the database write fails.
+pub fn insert_backend(db: &Db, def: &BackendDef) -> Result<bool> {
     db.with_write(|conn| {
         if backend_exists(conn, &def.name)? {
             return Ok(false);
@@ -685,7 +700,11 @@ pub(crate) fn delete_backend(db: &Db, name: &str) -> Result<DeleteBackend> {
 }
 
 /// Creates a model route; `false` means the name is already taken.
-pub(crate) fn insert_model(db: &Db, def: &ModelDef) -> Result<bool> {
+///
+/// # Errors
+///
+/// Returns an error if the database write fails.
+pub fn insert_model(db: &Db, def: &ModelDef) -> Result<bool> {
     db.with_write(|conn| {
         if model_exists(conn, &def.name)? {
             return Ok(false);
@@ -715,43 +734,6 @@ pub(crate) fn delete_model(db: &Db, name: &str) -> Result<bool> {
         }
         delete_model_rows(conn, name)?;
         Ok(true)
-    })
-}
-
-/// One-time import of a config file's `[[backends]]` / `[[models]]` into an
-/// empty catalog, so existing file-configured deployments keep working
-/// after the upgrade. Returns the number of (backends, models) imported;
-/// `None` when the catalog was already populated (the file sections are
-/// then ignored — the admin API owns the catalog).
-pub(crate) fn seed_from_config(db: &Db, cfg: &Config) -> Result<Option<(usize, usize)>> {
-    let groups: Vec<GroupDef> = cfg.exclusive_groups.iter().map(GroupDef::from).collect();
-    let backends: Vec<BackendDef> = cfg.backends.iter().map(BackendDef::from).collect();
-    let models: Vec<ModelDef> = cfg.models.iter().map(ModelDef::from).collect();
-    db.with_write(|conn| {
-        let populated: i64 = conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM backends) + (SELECT COUNT(*) FROM models)
-                  + (SELECT COUNT(*) FROM exclusive_groups)",
-            [],
-            |r| r.get(0),
-        )?;
-        if populated > 0 {
-            return Ok(None);
-        }
-        if backends.is_empty() && models.is_empty() && groups.is_empty() {
-            return Ok(None);
-        }
-        let tx = conn.unchecked_transaction()?;
-        for g in &groups {
-            write_group(&tx, g)?;
-        }
-        for b in &backends {
-            write_backend(&tx, b)?;
-        }
-        for m in &models {
-            write_model(&tx, m)?;
-        }
-        tx.commit()?;
-        Ok(Some((backends.len(), models.len())))
     })
 }
 
@@ -1184,126 +1166,6 @@ mod tests {
             delete_backend(&db, "a").unwrap(),
             DeleteBackend::Missing
         ));
-    }
-
-    #[test]
-    fn seeding_only_happens_on_an_empty_catalog() {
-        let (_dir, db) = temp_db();
-        let cfg: Config = toml::from_str(
-            r#"
-listen = "127.0.0.1:8080"
-sqlite_path = "t.db"
-admin_token = "x"
-
-[[backends]]
-name = "openai"
-kind = "openai"
-base_url = "https://api.openai.com"
-api_key = "sk-test"
-
-[[models]]
-name = "gpt-4o"
-  [models.pricing]
-  input_per_mtok = 2.5
-  output_per_mtok = 10.0
-  [[models.targets]]
-  backend = "openai"
-  weight = 2
-"#,
-        )
-        .unwrap();
-        assert_eq!(seed_from_config(&db, &cfg).unwrap(), Some((1, 1)));
-        let cat = load_all(&db).unwrap();
-        assert_eq!(cat.backends[0].name, "openai");
-        assert_eq!(cat.backends[0].api_key.as_deref(), Some("sk-test"));
-        assert_eq!(cat.models[0].targets[0].weight, 2);
-        assert_eq!(cat.models[0].pricing.unwrap().input_per_mtok, 2.5);
-
-        // Second run is a no-op even though the config still lists them.
-        assert_eq!(seed_from_config(&db, &cfg).unwrap(), None);
-        assert_eq!(load_all(&db).unwrap().backends.len(), 1);
-    }
-
-    #[test]
-    fn seeding_imports_groups_and_scheduling_fields() {
-        let (_dir, db) = temp_db();
-        let cfg: Config = toml::from_str(
-            r#"
-listen = "127.0.0.1:8080"
-sqlite_path = "t.db"
-admin_token = "x"
-
-[[exclusive_groups]]
-id = "dgx"
-min_hold_ms = 5000
-max_hold_ms = 30000
-drain_timeout_ms = 45000
-
-[[backends]]
-name = "moe-local"
-kind = "openai"
-base_url = "http://dgx:8000"
-scheduling_class = "grouped"
-exclusive_group = "dgx"
-max_concurrency = 4
-max_tokens_cap = 1024
-tok_s_estimate = 90.0
-
-[[backends]]
-name = "openrouter"
-kind = "openai"
-base_url = "https://openrouter.ai/api/v1"
-
-[[models]]
-name = "qwen-moe"
-  [models.qos]
-  max_wait_ms = 2000
-  background_max_wait_ms = 60000
-  [[models.targets]]
-  backend = "moe-local"
-  [[models.targets]]
-  backend = "openrouter"
-  model = "qwen/qwen3-30b-a3b"
-  fallback_only = true
-"#,
-        )
-        .unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(seed_from_config(&db, &cfg).unwrap(), Some((2, 1)));
-
-        let cat = load_all(&db).unwrap();
-        assert_eq!(cat.groups, vec![group_with(5000, 30000, 45000)]);
-        let moe = &cat.backends[0];
-        assert_eq!(moe.name, "moe-local");
-        assert_eq!(moe.scheduling_class, SchedulingClass::Grouped);
-        assert_eq!(moe.exclusive_group_id.as_deref(), Some("dgx"));
-        assert_eq!(moe.max_concurrency, Some(4));
-        assert_eq!(moe.max_tokens_cap, Some(1024));
-        assert_eq!(moe.tok_s_estimate, Some(90.0));
-        // An unrestricted backend keeps every scheduling field unset.
-        let openrouter = &cat.backends[1];
-        assert_eq!(openrouter.scheduling_class, SchedulingClass::Unrestricted);
-        assert_eq!(openrouter.max_tokens_cap, None);
-
-        let m = &cat.models[0];
-        assert_eq!(m.qos_max_wait_ms, Some(2000));
-        assert_eq!(m.qos_background_max_wait_ms, Some(60_000));
-        assert_eq!(m.on_shed_without_fallback, OnShedWithoutFallback::Wait);
-        assert!(!m.targets[0].fallback_only);
-        assert!(m.targets[1].fallback_only);
-
-        // A populated catalog is never re-seeded — including one that only
-        // has groups in it.
-        assert_eq!(seed_from_config(&db, &cfg).unwrap(), None);
-    }
-
-    fn group_with(min: i64, max: i64, drain: i64) -> GroupDef {
-        GroupDef {
-            id: "dgx".into(),
-            min_hold_ms: min,
-            max_hold_ms: max,
-            drain_timeout_ms: drain,
-        }
     }
 
     #[test]

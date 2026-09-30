@@ -15,7 +15,7 @@ pub(crate) mod auth;
 /// Smooth weighted round-robin load balancing.
 pub(crate) mod balancer;
 /// Catalog definitions and SQLite persistence.
-pub(crate) mod catalog;
+pub mod catalog;
 /// Command line interface.
 pub mod cli;
 /// Configuration file format and loading.

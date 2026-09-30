@@ -421,42 +421,6 @@ async fn a_streamed_message_concatenates_to_the_blocking_one() {
     assert_eq!(joined, whole);
 }
 
-/// The credential header this format's clients send is the same credential, and
-/// a client that sets it must not be refused before its request is read.
-#[tokio::test]
-async fn the_key_header_this_format_uses_opens_the_gate_and_a_wrong_one_does_not() {
-    let vocabulary = test_vocabulary();
-    let (engine, _join, _teardowns) = common::fake_engine(vec![10], Some(Arc::clone(&vocabulary)));
-    let renderer = PromptRenderer::new(TEMPLATE, ToolJsonStyle::Compact, Arc::clone(&vocabulary))
-        .expect("the test template compiles");
-    let auth = shiso_server::auth::AuthConfig::new(vec!["sk-test".to_owned()])
-        .expect("one token makes a gate");
-    let state = Arc::new(
-        AppState::new(engine, "test-model".to_owned(), CTX)
-            .with_vocabulary(vocabulary)
-            .with_renderer(Arc::new(renderer))
-            .with_auth(auth),
-    );
-
-    let keyed = |key: &str| {
-        Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("content-type", "application/json")
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .body(Body::from(wire_body(&json!({})).to_string()))
-            .expect("a POST request builds")
-    };
-
-    let (status, answered) = call(&state, keyed("sk-test")).await;
-    assert_eq!(status, StatusCode::OK, "{answered}");
-    assert_eq!(answered["type"], "message");
-
-    let (status, refused) = call(&state, keyed("sk-wrong")).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}");
-}
-
 /// The opening frame carries the input accounting, and it is sent before a
 /// single token has been generated - so the number cannot come from the turn's
 /// own usage, which does not exist yet. It comes from the pipeline, which

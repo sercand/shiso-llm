@@ -53,7 +53,6 @@ fn a_bare_serve_takes_the_documented_defaults() {
     assert_eq!(args.kvstore_pump_mb, 64);
     assert_eq!(args.spec_k, 0);
     assert!(args.kvstore_dir.is_none());
-    assert!(args.auth_tokens.is_empty());
     assert!(args.vision.is_none());
     assert!(!args.video_allow_ffmpeg);
     assert!(!args.vision_allow_remote_images);
@@ -249,12 +248,6 @@ fn a_checkpoint_directory_finds_its_config_inside_itself() {
 }
 
 #[test]
-fn auth_tokens_are_a_comma_separated_list_with_blanks_dropped() {
-    let args = parse(&["--model", "m.gguf", "--auth-tokens", "a,b,,c"]).expect("it parses");
-    assert_eq!(args.auth_tokens(), vec!["a", "b", "c"]);
-}
-
-#[test]
 fn a_port_that_is_not_a_number_is_a_parse_failure() {
     let error = parse(&["--model", "m.gguf", "--port", "abc"]).expect_err("clap refuses");
     assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
@@ -336,7 +329,6 @@ fn every_documented_flag_declares_its_prefixed_environment_fallback() {
         "SHISO_KV_CHECKPOINTS",
         "SHISO_KVSTORE_DIR",
         "SHISO_KVSTORE_BUDGET_MB",
-        "SHISO_AUTH_TOKENS",
         "SHISO_SPEC_K",
         "SHISO_VISION",
         "SHISO_VIDEO_ALLOW_FFMPEG",
@@ -370,40 +362,12 @@ fn the_help_lists_every_flag_an_operator_is_told_about() {
         "--ctx",
         "--kvstore-dir",
         "--kvstore-budget-mb",
-        "--auth-tokens",
         "--vision",
         "--video-allow-ffmpeg",
         "--generation-config",
     ] {
         assert!(help.contains(flag), "{flag} is missing from the help");
     }
-}
-
-/// A bearer token must never be echoed by the help text, which clap fills in
-/// with an environment variable's value unless the flag says not to.
-///
-/// Run as a subprocess so that the variable is set for this check and for
-/// nothing else in the harness.
-#[test]
-fn the_help_text_never_prints_a_configured_bearer_token() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_shiso"))
-        .args(["serve", "--help"])
-        .env("SHISO_AUTH_TOKENS", "sk-supersecret")
-        .output()
-        .expect("the binary runs");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        text.contains("--auth-tokens"),
-        "the flag itself is still documented: {text}"
-    );
-    assert!(
-        !text.contains("sk-supersecret"),
-        "a configured token leaked into the help text: {text}"
-    );
 }
 
 /// The two prefill widths default to the scheduler's own constants.

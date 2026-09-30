@@ -23,6 +23,162 @@ struct TestRouter {
     sqlite_path: PathBuf,
     _tmp: tempfile::TempDir,
 }
+#[derive(serde::Deserialize, Default)]
+struct TestSeed {
+    #[serde(default)]
+    exclusive_groups: Vec<TestGroupSeed>,
+    #[serde(default)]
+    backends: Vec<TestBackendSeed>,
+    #[serde(default)]
+    models: Vec<TestModelSeed>,
+}
+
+#[derive(serde::Deserialize)]
+struct TestGroupSeed {
+    id: String,
+    min_hold_ms: i64,
+    max_hold_ms: i64,
+    drain_timeout_ms: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct TestBackendSeed {
+    name: String,
+    #[serde(deserialize_with = "test_kind_one_or_many")]
+    kind: Vec<shiso_router::catalog::BackendKind>,
+    base_url: String,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    anthropic_version: Option<String>,
+    #[serde(default = "default_true")]
+    inject_usage: bool,
+    #[serde(default)]
+    scheduling_class: shiso_router::catalog::SchedulingClass,
+    #[serde(default)]
+    exclusive_group: Option<String>,
+    #[serde(default)]
+    max_concurrency: Option<u32>,
+    #[serde(default)]
+    max_tokens_cap: Option<i64>,
+    #[serde(default)]
+    tok_s_estimate: Option<f64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn test_kind_one_or_many<'de, D>(de: D) -> Result<Vec<shiso_router::catalog::BackendKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(shiso_router::catalog::BackendKind),
+        Many(Vec<shiso_router::catalog::BackendKind>),
+    }
+    Ok(match <OneOrMany as serde::Deserialize>::deserialize(de)? {
+        OneOrMany::One(k) => vec![k],
+        OneOrMany::Many(v) => v,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct TestModelSeed {
+    name: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default)]
+    pricing: Option<shiso_router::catalog::PricingCfg>,
+    #[serde(default)]
+    qos: Option<TestQosSeed>,
+    #[serde(default)]
+    on_shed_without_fallback: shiso_router::catalog::OnShedWithoutFallback,
+    #[serde(default)]
+    targets: Vec<TestTargetSeed>,
+}
+
+#[derive(serde::Deserialize)]
+struct TestQosSeed {
+    max_wait_ms: Option<i64>,
+    background_max_wait_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct TestTargetSeed {
+    backend: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default = "default_weight")]
+    weight: u32,
+    #[serde(default)]
+    pricing: Option<shiso_router::catalog::PricingCfg>,
+    #[serde(default)]
+    fallback_only: bool,
+}
+
+fn default_weight() -> u32 {
+    1
+}
+
+fn seed_test_db(db: &Db, config_body: &str) {
+    if config_body.trim().is_empty() {
+        return;
+    }
+    let seed: TestSeed = toml::from_str(config_body).expect("valid test seed toml");
+    for g in seed.exclusive_groups {
+        let def = shiso_router::catalog::GroupDef {
+            id: g.id,
+            min_hold_ms: g.min_hold_ms,
+            max_hold_ms: g.max_hold_ms,
+            drain_timeout_ms: g.drain_timeout_ms,
+        };
+        shiso_router::catalog::insert_group(db, &def).expect("insert test group");
+    }
+    for b in seed.backends {
+        let def = shiso_router::catalog::BackendDef {
+            name: b.name,
+            kinds: b.kind,
+            base_url: b.base_url,
+            api_key: b.api_key,
+            api_key_env: b.api_key_env,
+            anthropic_version: b.anthropic_version,
+            inject_usage: b.inject_usage,
+            scheduling_class: b.scheduling_class,
+            exclusive_group_id: b.exclusive_group,
+            max_concurrency: b.max_concurrency,
+            max_tokens_cap: b.max_tokens_cap,
+            tok_s_estimate: b.tok_s_estimate,
+        };
+        shiso_router::catalog::insert_backend(db, &def).expect("insert test backend");
+    }
+    for m in seed.models {
+        let def = shiso_router::catalog::ModelDef {
+            name: m.name,
+            aliases: m.aliases,
+            pricing: m.pricing,
+            qos_max_wait_ms: m.qos.as_ref().and_then(|q| q.max_wait_ms),
+            qos_background_max_wait_ms: m.qos.as_ref().and_then(|q| q.background_max_wait_ms),
+            on_shed_without_fallback: m.on_shed_without_fallback,
+            targets: m
+                .targets
+                .into_iter()
+                .map(|t| shiso_router::catalog::TargetDef {
+                    backend: t.backend,
+                    model: t.model,
+                    weight: t.weight,
+                    pricing: t.pricing,
+                    fallback_only: t.fallback_only,
+                })
+                .collect(),
+        };
+        shiso_router::catalog::insert_model(db, &def).expect("insert test model");
+    }
+}
 
 impl TestRouter {
     /// Boots the router in-process on an ephemeral port with a temp SQLite
@@ -33,15 +189,15 @@ impl TestRouter {
         let admin_token = "test-admin-token".to_string();
 
         let raw = format!(
-            "listen = \"127.0.0.1:0\"\nsqlite_path = {:?}\nadmin_token = {:?}\n{}",
+            "listen = \"127.0.0.1:0\"\nsqlite_path = {:?}\nadmin_token = {:?}\n",
             sqlite_path.to_str().unwrap(),
             admin_token,
-            config_body
         );
         let cfg: Config = toml::from_str(&raw).unwrap();
         cfg.validate().unwrap();
 
         let db = Db::open(&cfg.sqlite_path).unwrap();
+        seed_test_db(&db, config_body);
         let (log_sink, _log_writer) = shiso_router::logging::start_writer(db.clone());
         let state = AppState::from_config(&cfg, db, log_sink).unwrap();
         let app = shiso_router::build_router(state);
@@ -51,7 +207,6 @@ impl TestRouter {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-
         TestRouter {
             addr,
             admin_token,
@@ -72,15 +227,15 @@ impl TestRouter {
         // are bound on ephemeral ports below; admin_listen only needs to
         // be present (and distinct) so admin_on_main becomes false.
         let raw = format!(
-            "listen = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:9\"\nsqlite_path = {:?}\nadmin_token = {:?}\n{}",
+            "listen = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:9\"\nsqlite_path = {:?}\nadmin_token = {:?}\n",
             sqlite_path.to_str().unwrap(),
             admin_token,
-            config_body
         );
         let cfg: Config = toml::from_str(&raw).unwrap();
         cfg.validate().unwrap();
 
         let db = Db::open(&cfg.sqlite_path).unwrap();
+        seed_test_db(&db, config_body);
         let (log_sink, _log_writer) = shiso_router::logging::start_writer(db.clone());
         let state = AppState::from_config(&cfg, db, log_sink).unwrap();
         let app = shiso_router::build_router(state.clone());
@@ -3558,18 +3713,14 @@ async fn backend_patch_swaps_credentials_and_keeps_untouched_fields() {
 }
 
 #[tokio::test]
-async fn catalog_persists_and_config_seeds_only_once() {
+async fn catalog_persists_across_restarts() {
     let tmp = tempfile::tempdir().unwrap();
     let sqlite_path = tmp.path().join("t.db");
-    let config = |backend: &str| {
-        format!(
-            "listen = \"127.0.0.1:0\"\nsqlite_path = {:?}\nadmin_token = \"t\"\n\
-             [[backends]]\nname = {backend:?}\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:1\"\n\
-             [[models]]\nname = \"gpt-test\"\n[[models.targets]]\nbackend = {backend:?}\n",
-            sqlite_path.to_str().unwrap()
-        )
-    };
-    let boot = |raw: String| {
+    let raw = format!(
+        "listen = \"127.0.0.1:0\"\nsqlite_path = {:?}\nadmin_token = \"t\"\n",
+        sqlite_path.to_str().unwrap()
+    );
+    let boot = || {
         let cfg: Config = toml::from_str(&raw).unwrap();
         cfg.validate().unwrap();
         let db = Db::open(&cfg.sqlite_path).unwrap();
@@ -3577,17 +3728,32 @@ async fn catalog_persists_and_config_seeds_only_once() {
         AppState::from_config(&cfg, db, sink).unwrap()
     };
 
-    let state = boot(config("seeded"));
-    assert_eq!(state.routing().backends[0].name, "seeded");
+    let state = boot();
+    assert!(state.routing().backends.is_empty());
+    let b = shiso_router::catalog::BackendDef {
+        name: "stored".into(),
+        kinds: vec![shiso_router::catalog::BackendKind::Openai],
+        base_url: "http://127.0.0.1:1".into(),
+        api_key: None,
+        api_key_env: None,
+        anthropic_version: None,
+        inject_usage: true,
+        scheduling_class: shiso_router::catalog::SchedulingClass::Unrestricted,
+        exclusive_group_id: None,
+        max_concurrency: None,
+        max_tokens_cap: None,
+        tok_s_estimate: None,
+    };
+    shiso_router::catalog::insert_backend(&state.db, &b).unwrap();
+    state.reload_routing().unwrap();
+    assert_eq!(state.routing().backends[0].name, "stored");
     drop(state);
 
-    // A second start with a different config file leaves the stored
-    // catalog alone — the database is the source of truth now.
-    let state = boot(config("different"));
+    // A second boot against the same database reloads the stored catalog.
+    let state = boot();
     let routing = state.routing();
     assert_eq!(routing.backends.len(), 1);
-    assert_eq!(routing.backends[0].name, "seeded");
-    assert_eq!(routing.models[0].targets[0].backend, "seeded");
+    assert_eq!(routing.backends[0].name, "stored");
 }
 
 #[tokio::test]

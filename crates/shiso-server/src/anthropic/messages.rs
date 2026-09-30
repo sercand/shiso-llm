@@ -20,10 +20,7 @@
 //!
 //! `anthropic-version` and `anthropic-beta` are accepted and not enforced.
 //! Nothing here varies by version, so validating one would refuse requests this
-//! server can serve in order to enforce a distinction it does not make. The
-//! credential header this format uses, `x-api-key`, *is* read - by the auth
-//! gate, beside the bearer header, because a client with a key configured would
-//! otherwise be refused before this handler ran.
+//! server can serve in order to enforce a distinction it does not make.
 //!
 //! # The service class is read from the header only
 //!

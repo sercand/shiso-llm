@@ -212,19 +212,6 @@ impl AppState {
     pub fn from_config(cfg: &Config, db: Db, log_sink: LogSink) -> Result<Self> {
         let admin_token = cfg.resolved_admin_token()?;
 
-        match catalog::seed_from_config(&db, cfg)? {
-            Some((backends, models)) => tracing::info!(
-                backends,
-                models,
-                "seeded the routing catalog from the config file"
-            ),
-            None if !cfg.backends.is_empty() || !cfg.models.is_empty() => tracing::warn!(
-                "ignoring [[backends]]/[[models]] in the config file: the catalog \
-                 is already stored in the database and is managed via /admin"
-            ),
-            None => {}
-        }
-
         let catalog = catalog::load_all(&db)?;
         if catalog.models.is_empty() {
             tracing::warn!("no models configured — add one via POST /admin/models or the admin UI");
