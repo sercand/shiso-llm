@@ -38,6 +38,7 @@ the name "ds4" for the host project.
 | `crates/shiso-kernels` | ds4, llama.cpp, exllamav3 | build and embed the kernel trees above |
 | `crates/shiso-kerneltest` | Splash Metal runtime kernels | some CPU oracles restate that arithmetic |
 | `crates/shiso-server` | - | original; wire formats follow the OpenAI and Anthropic APIs |
+| `crates/shiso-server/src/decision` | the upstream decisions server extension (the System One (TypeSafe) API surface), Apache-2.0 | ported behavior: the decisions/systemone prompt wording, the label scheme, and the confidence formulas are reproduced as "prompt format version 1"; deviations: >26 options refused on both routes, `chat_template_kwargs` restricted to renderer-known keys, and server-config refusals without a shiso analog are absent (the round-trip and label checks stand in) |
 | `crates/shiso-bench` | llama.cpp, `mlx-lm`, `transformers` | independent reference fixtures are captured from these |
 | `scripts/reference/` | Hugging Face `transformers`, Apache-2.0 | reference tooling. `render_chat_fixtures.py` calls the reference chat-template implementation from `transformers` at run time; nothing is vendored |
 | `scripts/reference/block_draft_reference.py` | mlx-lm 0.31.3 and MLX 0.31.2, MIT; the z-lab/dflash reference drafter (`model_mlx.py`, passed at run time), MIT | original; imports and runs both references to capture a block drafter's first block and greedy acceptance; nothing is vendored |
