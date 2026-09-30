@@ -85,7 +85,7 @@ impl<'de> Deserialize<'de> for OptionOrChoice {
 
 impl OptionOrChoice {
     /// The option as the core renders and validates it.
-    fn into_option(self) -> ChoiceOption {
+    pub(crate) fn into_option(self) -> ChoiceOption {
         match self {
             Self::Bare(name) => ChoiceOption {
                 name,

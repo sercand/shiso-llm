@@ -5,20 +5,6 @@
 //! `f64`, so a probability that must sum to one does and a confidence that
 //! must sit in `[0, 1]` cannot drift out of it on a float edge.
 
-// The consumers of these formulas - the scheduler fan-out and the two route
-// families - arrive in the tasks that build them, so until then nothing in a
-// non-test build calls them. The expectation says exactly that and is scoped
-// to the non-test build on purpose: the tests here already call every one of
-// them, and an expectation that was unfulfilled where they are used would
-// fail the moment it should have been fulfilled by the routes landing.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the decision scheduler and routes are these functions' callers, in later tasks"
-    )
-)]
-
 use shiso_core::TokenId;
 
 /// The log-probability of each `labels` entry under the full-vocab logits

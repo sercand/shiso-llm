@@ -95,6 +95,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/decisions",
             post(crate::decision::decisions::decisions_endpoint),
         )
+        // Auth covers this route the same way, and the schema-shaped 422 the
+        // error type carries has no other sender in this crate.
+        .route(
+            "/v1/systemone",
+            post(crate::decision::systemone::systemone_endpoint),
+        )
         .route(
             "/v1/audio/transcriptions",
             post(crate::openai::transcription::transcriptions)
