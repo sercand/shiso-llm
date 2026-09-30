@@ -13,4 +13,5 @@
 //! confidence formulas in `math`. Each surface owns its own serde structs,
 //! like every other route in this crate owns its own wire format.
 
+pub(crate) mod core;
 pub(crate) mod math;
