@@ -1,37 +1,37 @@
-# Example systemd unit for llm-router.
+# Example systemd unit for shiso-router.
 #
 # Install:
-#   install -Dm755 target/release/llm-router /usr/local/bin/llm-router
-#   install -Dm644 deploy/llm-router.service /etc/systemd/system/llm-router.service
-#   install -Dm644 config.example.toml /etc/llm-router/config.toml   # then edit
-#   install -Dm600 /dev/null /etc/llm-router/env                     # then edit, see below
-#   systemctl daemon-reload && systemctl enable --now llm-router
+#   install -Dm755 target/release/shiso-router /usr/local/bin/shiso-router
+#   install -Dm644 deploy/llm-router.service /etc/systemd/system/shiso-router.service
+#   install -Dm644 config.example.toml /etc/shiso-router/config.toml   # then edit
+#   install -Dm600 /dev/null /etc/shiso-router/env                     # then edit, see below
+#   systemctl daemon-reload && systemctl enable --now shiso-router
 #
-# /etc/llm-router/env holds the secrets referenced by the config, e.g.:
+# /etc/shiso-router/env holds the secrets referenced by the config, e.g.:
 #   LLM_ROUTER_ADMIN_TOKEN=...
 #   OPENAI_API_KEY=sk-...
 #   ANTHROPIC_API_KEY=sk-ant-...
 
 [Unit]
-Description=llm-router LLM API proxy
+Description=shiso-router LLM API proxy
 Documentation=https://github.com/sercand/llm-router
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/llm-router --config /etc/llm-router/config.toml
+ExecStart=/usr/local/bin/shiso-router --config /etc/shiso-router/config.toml
 # Optional (leading "-"): only needed when the config references *_env secrets.
-EnvironmentFile=-/etc/llm-router/env
+EnvironmentFile=-/etc/shiso-router/env
 Restart=on-failure
 RestartSec=2
 
-# Runs as a transient unprivileged user; /var/lib/llm-router is created and
+# Runs as a transient unprivileged user; /var/lib/shiso-router is created and
 # owned automatically. Point sqlite_path there in config.toml (a relative
 # path also works — WorkingDirectory resolves it to the state directory):
-#   sqlite_path = "/var/lib/llm-router/llm-router.db"
+#   sqlite_path = "/var/lib/shiso-router/shiso-router.db"
 DynamicUser=yes
-StateDirectory=llm-router
-WorkingDirectory=/var/lib/llm-router
+StateDirectory=shiso-router
+WorkingDirectory=/var/lib/shiso-router
 
 # Hardening. IP sockets stay fully available — binding the listen port(s) and
 # connecting to backends both work; everything else (raw filesystem writes

@@ -1,4 +1,4 @@
-# llm-router
+# shiso-router
 
 An HTTP router that proxies LLM API requests to third-party backend services. Clients talk to the router with the provider wire formats they already use, so official SDKs work unchanged — just point `base_url` at the router and use a router-issued API token.
 
@@ -37,7 +37,10 @@ cp config.example.toml config.toml   # edit the seed backends/models (or add the
 export LLM_ROUTER_ADMIN_TOKEN=$(openssl rand -hex 32)
 export OPENAI_API_KEY=sk-...
 
-cargo run --release -- --config config.toml
+# Run via the shiso CLI:
+cargo run --release -p shiso-server -- router --config config.toml
+# Or run the standalone shiso-router binary:
+cargo run --release -p shiso-router -- --config config.toml
 ```
 
 Create a client token:
@@ -77,19 +80,23 @@ See [`config.example.toml`](config.example.toml) for a complete annotated exampl
 Everything except backends and models can also be set on the command line, and command-line options take priority over the config file:
 
 ```bash
-llm-router --config config.toml              
-llm-router --listen 0.0.0.0:8080 \
-           --sqlite-path /var/lib/llm-router.db \
-           --max-body-bytes 5242880 \
-           --admin-token-env LLM_ROUTER_ADMIN_TOKEN
+# Via the shiso CLI:
+shiso router --config config.toml
+shiso router --listen 0.0.0.0:8080 \
+             --sqlite-path /var/lib/shiso-router.db \
+             --max-body-bytes 5242880 \
+             --admin-token-env LLM_ROUTER_ADMIN_TOKEN
+
+# Or via the standalone shiso-router binary:
+shiso-router --config config.toml
 ```
 
-Run `llm-router --help` for the full list.
+Run `shiso router --help` (or `shiso-router --help`) for the full list.
 
 ```toml
 listen = "127.0.0.1:8080"
 # admin_listen = "127.0.0.1:9090"          # optional: admin API+UI on its own port
-sqlite_path = "llm-router.db"
+sqlite_path = "shiso-router.db"
 max_body_bytes = 1073741824                # request body cap (default 1 GiB)
 admin_token_env = "LLM_ROUTER_ADMIN_TOKEN" # or admin_token = "..." (exactly one)
 
@@ -346,13 +353,13 @@ Reset intervals are `never` (default), `daily`, `weekly` (Monday 00:00 UTC), or 
 
 ## Running as a service
 
-[`deploy/llm-router.service`](deploy/llm-router.service) is an example systemd unit: it runs the release binary as an unprivileged dynamic user with `/var/lib/llm-router` as the state directory (put `sqlite_path` there), reads config from `/etc/llm-router/config.toml`, and loads secrets (`LLM_ROUTER_ADMIN_TOKEN`, backend API keys) from `/etc/llm-router/env`. Install steps are in the unit file's header comment.
+[`deploy/llm-router.service`](deploy/llm-router.service) is an example systemd unit: it runs the release binary as an unprivileged dynamic user with `/var/lib/shiso-router` as the state directory (put `sqlite_path` there), reads config from `/etc/shiso-router/config.toml`, and loads secrets (`LLM_ROUTER_ADMIN_TOKEN`, backend API keys) from `/etc/shiso-router/env`. Install steps are in the unit file's header comment.
 
 ## Development
 
 ```bash
-cargo test      # unit + integration tests (mock backends, no network)
-cargo clippy --all-targets
+cargo test -p shiso-router      # unit + integration tests (mock backends, no network)
+cargo clippy -p shiso-router --all-targets
 ```
 
 ## Not yet implemented
