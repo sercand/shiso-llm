@@ -27,12 +27,13 @@ const TYPE_YES_NO: &str = "yes_no";
 
 /// One option of a choice question: a bare name, or a name with a description.
 ///
-/// Unknown keys inside the object spelling are ignored, not refused: serde
-/// forbids `deny_unknown_fields` on an untagged variant, and the two shapes
-/// are worth more than that one extra check - the fields that decide what is
-/// scored (`name`, `description`) are checked here and by the core.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+/// Unknown keys inside the object spelling are refused by hand, naming the
+/// key: serde's derive forbids `deny_unknown_fields` on an untagged variant,
+/// so this enum implements [`Deserialize`] against a buffered [`Value`] and
+/// enforces the same rule the derived structs get for free. A silently
+/// dropped key here would mean the server scored an option its caller never
+/// described.
+#[derive(Debug)]
 pub(crate) enum OptionOrChoice {
     /// Just the name.
     Bare(String),
@@ -41,9 +42,45 @@ pub(crate) enum OptionOrChoice {
         /// What follows the letter on the option's line.
         name: String,
         /// Extra wording, shown when non-blank.
-        #[serde(default)]
         description: Option<String>,
     },
+}
+
+impl<'de> Deserialize<'de> for OptionOrChoice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::String(name) => Ok(Self::Bare(name)),
+            Value::Object(fields) => {
+                let mut name: Option<Value> = None;
+                let mut description: Option<Value> = None;
+                for (key, value) in fields {
+                    match key.as_str() {
+                        "name" => name = Some(value),
+                        "description" => description = Some(value),
+                        other => {
+                            return Err(serde::de::Error::custom(format!(
+                                "unknown field `{other}`, expected `name` or `description`"
+                            )));
+                        }
+                    }
+                }
+                let name = name.ok_or_else(|| serde::de::Error::missing_field("name"))?;
+                Ok(Self::Detailed {
+                    name: String::deserialize(name).map_err(serde::de::Error::custom)?,
+                    description: description
+                        .map(String::deserialize)
+                        .transpose()
+                        .map_err(serde::de::Error::custom)?,
+                })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "an option must be a name or a {{name, description}} object, got {other}"
+            ))),
+        }
+    }
 }
 
 impl OptionOrChoice {

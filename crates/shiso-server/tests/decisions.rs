@@ -503,6 +503,9 @@ async fn unknown_fields_are_refused_everywhere() {
                 "question": "ready"}], "nope": true}),
         json!({"input": "the input", "questions": [{"id": "q1", "type": "yes_no",
                 "question": "ready", "bogus": 1}]}),
+        json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
+                "question": "pick one",
+                "options": [{"name": "red", "bogus": 1}, {"name": "blue"}]}]}),
     ];
     for case in cases {
         let (status, body) = call(&state, post("/v1/decisions", &case)).await;
@@ -524,6 +527,38 @@ async fn unknown_fields_are_refused_everywhere() {
             .is_some_and(|message| message.contains("nope")),
         "{body}"
     );
+    // The same refusal inside an option object, which is a hand-written
+    // parse rather than a derived struct, must also name the invented key.
+    let (_status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
+                    "question": "pick one",
+                    "options": [{"name": "red", "bogus": 1}, {"name": "blue"}]}]}),
+        ),
+    )
+    .await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("bogus")),
+        "{body}"
+    );
+
+    // And the keys an option object really does have still parse: the full
+    // spelling and the name-only spelling alike.
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
+                    "question": "pick one",
+                    "options": [{"name": "red", "description": "a color"}, {"name": "blue"}]}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]
