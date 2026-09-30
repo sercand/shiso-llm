@@ -23,10 +23,12 @@ use std::time::{Duration, Instant};
 
 use shiso_core::{DecodeStep, SamplingParams, Seed, SessionId, StopTokens, TokenId};
 use shiso_ir::{BlockDelta, BlockStart, StopReason, StreamEvent, Usage};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use crate::error::AppError;
 use crate::scheduler::batching::SlotFacts;
 use crate::scheduler::stop::{StopStep, StopWatcher};
+use crate::scheduler::{ScoreOutcome, ScoreRequest};
 use crate::tokenizer::Vocabulary;
 use crate::vision::EncodedMedia;
 use shiso_parsers::Segment;
@@ -269,6 +271,24 @@ pub(crate) struct SeqSlot {
     /// Guesses drafted for it, guesses kept, and speculative steps taken:
     /// the turn's own share of the scheduler's speculation counters.
     spec: (u64, u64, u64),
+    /// The scoring half, present only on a sequence that scores its prompt
+    /// rather than generating from it.
+    score: Option<ScoreJob>,
+}
+
+/// What a scoring sequence carries that a generation turn does not: the
+/// labels to read at the prompt's last row, and the one reply the answer
+/// goes to.
+#[derive(Debug)]
+struct ScoreJob {
+    /// The label ids, in the order the request gave them.
+    labels: Arc<[TokenId]>,
+    /// Held as an `Option` because two places may answer a score - the prefill
+    /// terminus and the retirement path - and *taking* this is the record of
+    /// which one did. The invariant is exactly one reply per request: the
+    /// terminus sends `Ok`, retirement sends `Err` only through a reply the
+    /// terminus left behind, and a second sender finds `None`.
+    reply: Option<oneshot::Sender<Result<ScoreOutcome, AppError>>>,
 }
 
 /// Everything a slot needs that is not derived from the request.
@@ -289,6 +309,12 @@ pub(crate) struct SlotSetup {
     /// Whether its tokens are drawn by the keyed rule, which a speculating
     /// server uses for every sequence so a sampled one can verify drafts.
     pub(crate) keyed: bool,
+    /// The reply a scoring sequence answers through, paired with the setup the
+    /// way [`SlotSetup::sink`] is paired with a generation's. `None` for every
+    /// generation slot: a turn's reply was its stream, answered before the
+    /// slot was built, and a score's stream-less answer has nowhere else to
+    /// go.
+    pub(crate) score_reply: Option<oneshot::Sender<Result<ScoreOutcome, AppError>>>,
 }
 
 impl SeqSlot {
@@ -356,6 +382,83 @@ impl SeqSlot {
             prefill_decodes: None,
             prefill_mixed: false,
             spec: (0, 0, 0),
+            score: None,
+        }
+    }
+
+    /// A scoring sequence over `request`, holding `setup.session`.
+    ///
+    /// Built beside [`SeqSlot::new`] rather than on top of it: a score has no
+    /// text to detokenize, no stop sequences to watch, no budget to spend and
+    /// no scaffold to speculate from, and a constructor that defaulted all of
+    /// those into a generation slot would let the two kinds disagree about
+    /// their own fields. What it does carry is the prompt and the job: the
+    /// sequence reads its prompt once and answers through the reply, never a
+    /// stream - `setup.sink`'s receiver was dropped where the setup was built,
+    /// so every stream send on this slot lands on a closed channel and the
+    /// sequence is never mistaken for one with a client.
+    pub(crate) fn new_score(request: ScoreRequest, setup: SlotSetup) -> Self {
+        Self {
+            flex: request.is_flex(),
+            paused_since: None,
+            media: None,
+            // A text prompt: a scoring request carries no media, and the
+            // distinction is what keeps `checkpointable` honest - the ruling
+            // that keeps score prefixes off the tier is enforced at the
+            // retirement call site, not by lying about this.
+            path_media: PathMedia::Text,
+            audio_pads: 0,
+            // A real parser, never fed: the token stream this slot will
+            // produce is empty, and `wants_greedy` must answer something.
+            parser: shiso_parsers::parser_for_prompt_with(
+                shiso_parsers::ReasoningScheme::None,
+                shiso_parsers::ToolCallScheme::None,
+                "",
+                Arc::new(shiso_parsers::StringParams::default()),
+            ),
+            blocks: BlockCursor::default(),
+            calls_emitted: 0,
+            reasoning: 0,
+            id: setup.id,
+            session: setup.session,
+            prompt: request.prompt_tokens,
+            prompt_text: Arc::from(""),
+            sink: setup.sink,
+            cursor: 0,
+            cached: 0,
+            cold: true,
+            next_input: None,
+            out: Vec::new(),
+            scaffold: None,
+            end_marker: None,
+            // Zero, not a large number: a scoring sequence must never draw,
+            // and a budget it could spend is a bug the slot would hide.
+            budget: 0,
+            sampling: SamplingParams::neutral(),
+            // Never advanced: no draw is taken from this sequence.
+            seed: Seed::new(0),
+            rule: if setup.keyed {
+                DrawRule::Keyed
+            } else {
+                DrawRule::Stream
+            },
+            watcher: StopWatcher::new(&[]),
+            text: TextCursor::default(),
+            trailing: Vec::new(),
+            phase: Phase::Prefill,
+            ending: None,
+            started_at: setup.started_at,
+            first_token_at: None,
+            deadline: setup.deadline,
+            stored_len: 0,
+            prefill_timed: (0, Duration::ZERO),
+            prefill_decodes: None,
+            prefill_mixed: false,
+            spec: (0, 0, 0),
+            score: Some(ScoreJob {
+                labels: request.labels,
+                reply: setup.score_reply,
+            }),
         }
     }
 
@@ -890,6 +993,44 @@ impl SeqSlot {
         self.ending = Some(Ending::Failed(message));
     }
 
+    /// Whether this sequence exists to score its prompt rather than to
+    /// generate from it.
+    pub(crate) const fn is_score(&self) -> bool {
+        self.score.is_some()
+    }
+
+    /// The label ids to read at the prompt's last row.
+    ///
+    /// Empty for a generation slot - a caller asks after [`SeqSlot::is_score`],
+    /// and answering the wrong slot with an empty vector rather than panicking
+    /// keeps a routing bug a wrong number a test catches, not an engine-thread
+    /// abort.
+    pub(crate) fn score_labels(&self) -> &[TokenId] {
+        self.score.as_ref().map_or(&[], |job| &job.labels)
+    }
+
+    /// Takes the scoring reply channel, if one is still there.
+    ///
+    /// `None` means it has been claimed: the sequence already answered its
+    /// request at the prefill terminus, or was already answered with an error.
+    /// Taking rather than borrowing is what makes one reply per score a
+    /// structural fact rather than a rule each answering site has to remember.
+    pub(crate) fn take_score_reply(
+        &mut self,
+    ) -> Option<oneshot::Sender<Result<ScoreOutcome, AppError>>> {
+        self.score.as_mut().and_then(|job| job.reply.take())
+    }
+
+    /// Stands a scoring sequence at the end of its turn: the prompt has been
+    /// read, its labels read from the last row, and nothing will be generated.
+    ///
+    /// The ending is a completion - `Stopped(EndTurn)` - because the sequence
+    /// finished the work it was admitted to do; it just never had tokens to
+    /// end on.
+    pub(crate) fn finish_score(&mut self) {
+        self.stop(StopReason::EndTurn);
+    }
+
     /// The terminal events this turn ends with, in order.
     ///
     /// A cancelled turn produces none: its client is gone, and the send that
@@ -1064,6 +1205,7 @@ mod tests {
                 deadline: None,
                 budget,
                 keyed: false,
+                score_reply: None,
             },
             None,
             parser,
