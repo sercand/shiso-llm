@@ -141,9 +141,32 @@ impl TextCursor {
                 return String::new();
             }
         };
+        // An incomplete multi-byte sequence at the tail decodes to U+FFFD; hold
+        // it back until subsequent tokens complete the character.
+        if whole.ends_with('\u{FFFD}') {
+            return String::new();
+        }
         // A shrinking decode is possible in principle - a vocabulary is free to
         // render a pair differently from its parts - and `get` rather than an
         // index is what keeps that a missing fragment rather than a panic.
+        let fresh = whole.get(self.emitted..).unwrap_or_default().to_owned();
+        self.emitted = whole.len();
+        fresh
+    }
+
+    /// Delivers whatever text was held back because the tail ended with an
+    /// incomplete multi-byte character.
+    fn flush(&mut self, vocabulary: Option<&Vocabulary>, tokens: &[TokenId]) -> String {
+        let Some(vocabulary) = vocabulary else {
+            return String::new();
+        };
+        let whole = match vocabulary.decode(tokens) {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::warn!(%error, "a generated run did not decode; its text is being skipped");
+                return String::new();
+            }
+        };
         let fresh = whole.get(self.emitted..).unwrap_or_default().to_owned();
         self.emitted = whole.len();
         fresh
@@ -945,6 +968,20 @@ impl SeqSlot {
             return events;
         }
         if u32::try_from(self.out.len()).unwrap_or(u32::MAX) >= self.budget {
+            let tail = self.text.flush(vocabulary, &self.out);
+            let mut events = events;
+            if !tail.is_empty() {
+                let (text, sequence) = match self.watcher.push(&tail) {
+                    StopStep::Continue(text) => (text, None),
+                    StopStep::Stopped { text, sequence } => (text, Some(sequence)),
+                };
+                let segments = self.parser.push(&text);
+                events.extend(self.emit_segments(segments));
+                if let Some(sequence) = sequence {
+                    self.stop(StopReason::StopSequence(sequence));
+                    return events;
+                }
+            }
             self.stop(StopReason::MaxTokens);
             return events;
         }
@@ -1777,5 +1814,91 @@ mod tests {
         assert_eq!(message["content"], serde_json::Value::Null);
         assert_eq!(message["tool_calls"].as_array().map(Vec::len), Some(3));
         assert_eq!(response.usage.reasoning_tokens, 2);
+    }
+
+    /// A multi-byte character split across two tokens must be held back until
+    /// complete, so emojis and Unicode characters do not decode as replacement
+    /// characters and corrupt the slice boundary.
+    #[test]
+    fn multi_byte_emojis_survive_incremental_streaming() {
+        let document = serde_json::json!({
+            "version": "1.0",
+            "truncation": serde_json::Value::Null,
+            "padding": serde_json::Value::Null,
+            "added_tokens": [],
+            "normalizer": serde_json::Value::Null,
+            "pre_tokenizer": serde_json::Value::Null,
+            "post_processor": serde_json::Value::Null,
+            "decoder": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": false,
+                "use_regex": false
+            },
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "ĠðŁĺ": 0,
+                    "Ĭ": 1,
+                    "hello": 2,
+                },
+                "merges": [],
+            },
+        })
+        .to_string();
+        let tok = tokenizers::Tokenizer::from_str(&document).expect("stub loads");
+        let vocab = Vocabulary::from_tokenizer(tok);
+
+        let mut cursor = super::TextCursor::default();
+        let tokens = [TokenId::new(2)];
+        let first = cursor.fresh(Some(&vocab), &tokens);
+        assert_eq!(first, "hello");
+
+        let tokens = [TokenId::new(2), TokenId::new(0)];
+        let second = cursor.fresh(Some(&vocab), &tokens);
+        assert_eq!(second, "", "the incomplete emoji prefix is held back");
+
+        let tokens = [TokenId::new(2), TokenId::new(0), TokenId::new(1)];
+        let third = cursor.fresh(Some(&vocab), &tokens);
+        assert_eq!(third, " 😊", "the completed emoji arrives intact");
+    }
+
+    #[test]
+    fn text_cursor_flushes_incomplete_tail_on_demand() {
+        let document = serde_json::json!({
+            "version": "1.0",
+            "truncation": serde_json::Value::Null,
+            "padding": serde_json::Value::Null,
+            "added_tokens": [],
+            "normalizer": serde_json::Value::Null,
+            "pre_tokenizer": serde_json::Value::Null,
+            "post_processor": serde_json::Value::Null,
+            "decoder": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": false,
+                "use_regex": false
+            },
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "ĠðŁĺ": 0,
+                    "hello": 2,
+                },
+                "merges": [],
+            },
+        })
+        .to_string();
+        let tok = tokenizers::Tokenizer::from_str(&document).expect("stub loads");
+        let vocab = Vocabulary::from_tokenizer(tok);
+
+        let mut cursor = super::TextCursor::default();
+        let tokens = [TokenId::new(2), TokenId::new(0)];
+        let _ = cursor.fresh(Some(&vocab), &tokens[..1]);
+        let second = cursor.fresh(Some(&vocab), &tokens);
+        assert_eq!(second, "");
+
+        let tail = cursor.flush(Some(&vocab), &tokens);
+        assert_eq!(tail, " \u{FFFD}", "flushing delivers any uncompleted tail");
     }
 }
