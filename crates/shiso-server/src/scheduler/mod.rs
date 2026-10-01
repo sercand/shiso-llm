@@ -75,6 +75,7 @@ mod stats;
 pub mod stop;
 
 use std::collections::VecDeque;
+use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -86,9 +87,11 @@ use shiso_core::{
 use shiso_engine::Reason;
 use shiso_engine::ckpt::Checkpointed;
 use shiso_ir::{EventStream, StopReason, StreamEvent};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::decision;
+use crate::error::AppError;
 use crate::media::{MediaItem, MediaTowers};
 use crate::media_cache::{CachedRows, MediaCache};
 use crate::tokenizer::Vocabulary;
@@ -107,7 +110,10 @@ pub use config::{
     DEFAULT_PUMP_BYTES, DEFAULT_QUEUE_ADMISSION_MS, DEFAULT_SOLO_CHUNK, PREFILL_GRID,
     SchedulerConfig, StorePolicy,
 };
-pub use queue::{EngineGone, EngineHandle, EngineRequest, GenerateRequest, QUEUE_CAPACITY};
+pub use queue::{
+    EngineGone, EngineHandle, EngineRequest, GenerateRequest, QUEUE_CAPACITY, ScoreOutcome,
+    ScoreRequest,
+};
 pub use stats::{SchedulerStats, Snapshot, Window};
 pub use stop::{StopStep, StopWatcher};
 
@@ -524,21 +530,26 @@ impl Coordinator {
     }
 
     /// Gives one request a stream, and then a session and a slot - or, for a
-    /// flex request that cannot run yet, a place in the held queue.
+    /// flex request that cannot run yet, a place in the held queue. A scoring
+    /// request takes neither path: it gets a session, a slot and its answer.
     fn admit(&mut self, request: EngineRequest) {
-        let EngineRequest::Generate { request, reply } = request;
-        let Some(sink) = Self::reply_stream(&request, reply) else {
-            return;
-        };
-        if request.is_flex() && !(self.held_flex.is_empty() && self.flex_fits()) {
-            tracing::debug!(
-                held = self.held_flex.len() + 1,
-                "a flex request is held until standard work drains"
-            );
-            self.held_flex.push_back(HeldFlex { request, sink });
-            return;
+        match request {
+            EngineRequest::Generate { request, reply } => {
+                let Some(sink) = Self::reply_stream(&request, reply) else {
+                    return;
+                };
+                if request.is_flex() && !(self.held_flex.is_empty() && self.flex_fits()) {
+                    tracing::debug!(
+                        held = self.held_flex.len() + 1,
+                        "a flex request is held until standard work drains"
+                    );
+                    self.held_flex.push_back(HeldFlex { request, sink });
+                    return;
+                }
+                self.open(request, sink);
+            }
+            EngineRequest::Score { request, reply } => self.open_score(request, reply),
         }
-        self.open(request, sink);
     }
 
     /// Whether a flex request could take a slot now: there is room, no
@@ -583,7 +594,7 @@ impl Coordinator {
     /// prompt, which is told so on its stream, or a caller already gone.
     fn reply_stream(
         request: &GenerateRequest,
-        reply: tokio::sync::oneshot::Sender<Result<EventStream, crate::error::AppError>>,
+        reply: oneshot::Sender<Result<EventStream, AppError>>,
     ) -> Option<mpsc::Sender<StreamEvent>> {
         let (sink, events) = mpsc::channel(EVENT_QUEUE);
         let stream: EventStream = Box::pin(ReceiverStream::new(events));
@@ -700,6 +711,7 @@ impl Coordinator {
                 deadline: self.cfg.request_timeout.map(|window| now + window),
                 budget,
                 keyed: self.keyed,
+                score_reply: None,
             },
             None,
             // The rendered prompt and not just the schemes: a template can
@@ -760,6 +772,88 @@ impl Coordinator {
             tracing::error!(
                 slot = refused.id,
                 "a sequence was admitted with no slot for it"
+            );
+            self.release(refused.session);
+        }
+    }
+
+    /// Gives a scoring request a session and a slot; its reply is answered by
+    /// the prefill terminus, or by the retirement path if the prompt never
+    /// finishes reading.
+    ///
+    /// Deliberately bare beside [`Coordinator::open`]: a scoring prompt is
+    /// read once and kept by nobody, so the media checks, the checkpoint
+    /// resume, the scaffold and the disk store a generation passes through
+    /// are all work this request will never benefit from - and the store,
+    /// left in, would file a one-question prompt under a key no follow-up
+    /// will ever ask for. The empty prompt and empty label set are refused
+    /// here as well as at the handle: the HTTP surface and the handle both
+    /// refuse first, and the scheduler refuses too, because a forward pass
+    /// over nothing must not be reachable from any caller.
+    fn open_score(
+        &mut self,
+        request: ScoreRequest,
+        reply: oneshot::Sender<Result<ScoreOutcome, AppError>>,
+    ) {
+        if request.prompt_tokens.is_empty() || request.labels.is_empty() {
+            let _ = reply.send(Err(AppError::bad_request(
+                "a scoring request needs a prompt and at least one label",
+                None,
+                "invalid_request",
+            )));
+            return;
+        }
+        // The sink of a stream nobody will read: a scoring sequence answers
+        // through the reply, and a dropped receiver is what says so to every
+        // send the retirement path makes anyway.
+        let (sink, events) = mpsc::channel(EVENT_QUEUE);
+        drop(events);
+        // Opened directly rather than through `open_session_for`, which hands
+        // its failure to a stream this sequence does not have: here the
+        // failure's own words ride the reply.
+        let session = match self.model.as_model_mut().open_session() {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(error = %error.chain(), "a scoring session could not be opened");
+                let _ = reply.send(Err(AppError::internal(
+                    "the scoring session could not be opened",
+                    error,
+                )));
+                return;
+            }
+        };
+        self.stats.admit();
+
+        let now = self.cfg.clock.now();
+        let id = format!("{:016x}", self.next_id);
+        self.next_id = self.next_id.wrapping_add(1);
+        tracing::info!(
+            id,
+            prompt_tokens = request.prompt_tokens.len(),
+            labels = request.labels.len(),
+            running = self.slots.len() + 1,
+            "scoring request admitted"
+        );
+        if let Some(refused) = self.slots.admit(SeqSlot::new_score(
+            request,
+            SlotSetup {
+                id,
+                session,
+                sink,
+                started_at: now,
+                deadline: self.cfg.request_timeout.map(|window| now + window),
+                budget: 0,
+                keyed: false,
+                score_reply: Some(reply),
+            },
+        )) {
+            // Unreachable while admission only happens with a free slot;
+            // handled for the same reason `open` handles it - a dropped slot
+            // would leak its session. Its reply comes back as an engine
+            // failure through the dropped channel.
+            tracing::error!(
+                slot = refused.id,
+                "a scoring sequence was admitted with no slot for it"
             );
             self.release(refused.session);
         }
@@ -1569,7 +1663,11 @@ impl Coordinator {
         } = self;
         let now = cfg.clock.now();
         if let Some(slot) = slots.get_mut(step.slot) {
-            start_decoding(row, scores, vocabulary.as_deref(), *stop, now, stats, slot);
+            if slot.is_score() {
+                finish_scoring(row, scores, slot);
+            } else {
+                start_decoding(row, scores, vocabulary.as_deref(), *stop, now, stats, slot);
+            }
         }
     }
 
@@ -1698,6 +1796,28 @@ impl Coordinator {
         let now = self.cfg.clock.now();
         for mut slot in finished {
             let ending = slot.ending.clone();
+            // The other half of the reply-exactly-once invariant for scoring
+            // sequences: `Ok` is sent at the prefill terminus, and a reply
+            // still held here belongs to a sequence that ended without ever
+            // reading its prompt to the end - a failed read, a deadline, a
+            // table refusal - which its caller must hear about as exactly
+            // that. The scheduler fabricates no `AppError` for a generation
+            // turn - an error there travels as a stream event, or nowhere -
+            // and scoring is the deliberate exception: with no stream, the
+            // reply is the only place this failure can be said at all.
+            if let Some(reply) = slot.take_score_reply() {
+                let error = match ending.as_ref() {
+                    Some(Ending::Failed(message)) => AppError::internal(
+                        "a scoring prompt could not be read",
+                        io::Error::other(message.clone()),
+                    ),
+                    _ => AppError::internal(
+                        "the scoring sequence ended without an answer",
+                        io::Error::other("the prompt was never read to its end"),
+                    ),
+                };
+                let _ = reply.send(Err(error));
+            }
             let events = slot.terminal_events(now);
             let ttft = slot.ttft();
             if !events.is_empty() {
@@ -1708,8 +1828,14 @@ impl Coordinator {
                 Some(Ending::Failed(_)) => self.stats.failed(),
                 _ => {}
             }
-            self.store_on_retire(&slot, ending.as_ref());
-            self.remember_turn(&slot);
+            // A scoring prompt is read once and kept by nobody: no prefix on
+            // the disk tier - nothing will resume a one-question prompt whose
+            // answer the caller already has - and no turn replayed for the
+            // renderer, because a scoring sequence generated no turn.
+            if !slot.is_score() {
+                self.store_on_retire(&slot, ending.as_ref());
+                self.remember_turn(&slot);
+            }
             log_retired(&slot, ending.as_ref(), now);
             self.release(slot.session);
         }
@@ -1801,6 +1927,19 @@ impl Coordinator {
             for slot in &mut live {
                 if !slot.is_done() {
                     slot.stop(StopReason::EndTurn);
+                }
+                // The drain does not run `retire` - the loop only ends with
+                // the table empty, so anything here is the safety net - and a
+                // score whose reply only dropped with its slot would come back
+                // to its caller as "the engine dropped the request", which is
+                // true and less useful than the truth from here. The same
+                // reply-exactly-once invariant as `retire`: only an
+                // unanswered score still holds its reply at this point.
+                if let Some(reply) = slot.take_score_reply() {
+                    let _ = reply.send(Err(AppError::internal(
+                        "the scoring sequence ended without an answer",
+                        io::Error::other("the server shut down before the prompt was read"),
+                    )));
                 }
                 let events = slot.terminal_events(now);
                 send_all(&self.stats, slot, events);
@@ -1970,6 +2109,27 @@ fn start_decoding(
     let token = slot.choose(fill(row, scores));
     let events = slot.accept(token, vocabulary, stop, now);
     send_all(stats, slot, events);
+}
+
+/// Reads the labels off a scoring prompt's last row and sends its answer.
+///
+/// The scoring half of [`Coordinator::prefill_step`]'s terminus, beside
+/// [`start_decoding`] rather than inline: the two arms of that terminus share
+/// only the row, and a sequence that generates and a sequence that scores end
+/// their prompt in opposite ways - one stands on a sampled token, the other
+/// is over. The `fill` borrow ends with the log-probability vector, so
+/// nothing borrowed is alive across the send.
+///
+/// This send is where the reply-exactly-once invariant opens: `Ok` leaves
+/// here, and the retirement path answers only a reply this one left behind
+/// (see [`Coordinator::retire`]). A failed send is a caller that hung up
+/// mid-prefill; the sequence still retires and frees its session either way.
+fn finish_scoring(row: &[u8], scores: &mut [f32], slot: &mut SeqSlot) {
+    let label_logprobs = decision::math::label_logprobs(fill(row, scores), slot.score_labels());
+    slot.finish_score();
+    if let Some(reply) = slot.take_score_reply() {
+        let _ = reply.send(Ok(ScoreOutcome { label_logprobs }));
+    }
 }
 
 /// Reads one logits row out of its bytes into `scores`.

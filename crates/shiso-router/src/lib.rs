@@ -66,6 +66,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/audio/transcriptions", post(proxy::proxy_handler))
         .route("/v1/messages", post(proxy::proxy_handler))
         .route("/v1/v1/messages", post(proxy::proxy_handler))
+        .route("/v1/decisions", post(proxy::proxy_handler))
+        .route("/v1/systemone", post(proxy::proxy_handler))
         .route("/v1/models", get(models_endpoint::list_models))
         .route("/v1/v1/models", get(models_endpoint::list_models))
         .route("/chat/completions", post(proxy::proxy_handler))
@@ -73,6 +75,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/embeddings", post(proxy::proxy_handler))
         .route("/audio/transcriptions", post(proxy::proxy_handler))
         .route("/messages", post(proxy::proxy_handler))
+        .route("/decisions", post(proxy::proxy_handler))
+        .route("/systemone", post(proxy::proxy_handler))
         .route("/models", get(models_endpoint::list_models))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

@@ -614,8 +614,13 @@ const CHAT_ENDPOINTS = [
   { path: "/v1/messages", label: "Messages (Anthropic)", kind: "anthropic" },
   { path: "/v1/embeddings", label: "Embeddings", kind: "openai" },
   { path: "/v1/audio/transcriptions", label: "Transcription (audio)", kind: "openai" },
+  { path: "/v1/decisions", label: "Decisions (scoring)", kind: "openai" },
+  { path: "/v1/systemone", label: "System One (scoring)", kind: "openai" },
 ];
 const TRANSCRIPTIONS = "/v1/audio/transcriptions";
+const DECISIONS = "/v1/decisions";
+const SYSTEMONE = "/v1/systemone";
+const isScoring = p => p === DECISIONS || p === SYSTEMONE;
 /// `RESPONSE_FORMATS` in `admin/playground.rs`; "" is the provider default.
 const TRANSCRIPTION_FORMATS = [
   ["", "json (default)"], ["text", "text"], ["verbose_json", "verbose_json"],
@@ -629,6 +634,9 @@ const CHAT = {
   // Transcription: the picked File itself (a file input can't be refilled
   // after a repaint, so it is kept here), plus its options.
   audio: null, language: "", response_format: "", keywords: "",
+  // Scoring: the structured question list; the wire JSON is built from it
+  // at send time, so the operator never types JSON.
+  questions: [],
 };
 
 const backendNamed = name => BACKENDS.find(b => b.name === name);
@@ -689,6 +697,108 @@ function paintChatSelects() {
 
 const fmtBytes = n => n < 1024 * 1024 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
 
+/// The question kinds the scoring wires speak, mirroring the decisions
+/// API's `type` field.
+const Q_TYPES = [["yes_no", "Yes / No"], ["choice", "Choice"], ["score", "Score"]];
+
+/// A fresh question row: an auto id (decisions requires one; System One
+/// ignores blanks), and ready-made option/level lists so the common shapes
+/// need only filling in.
+const newQuestion = () => ({
+  id: "q" + (CHAT.questions.length + 1), type: "yes_no", question: "",
+  options: ["", ""], levels: ["0", "1", "2"],
+});
+
+/// The option/level editor under a choice or score question: one input per
+/// entry, each removable, plus the add button.
+function qSubList(q, i) {
+  const choice = q.type === "choice";
+  const items = choice ? q.options : q.levels;
+  const key = choice ? "opt" : "lvl";
+  return `<div class="mt-2">
+    <span class="text-xs text-neutral-500">${choice ? "Options" : "Levels"}</span>
+    <div class="mt-1 space-y-1">
+      ${items.map((v, j) => `<div class="flex items-center gap-2">
+        <input data-${key}="${i}:${j}" value="${esc(v)}" placeholder="${choice ? "option text" : "level label"}"
+          class="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-1 text-sm">
+        <button data-${key}del="${i}:${j}" title="Remove"
+          class="rounded-lg bg-neutral-800 px-2 py-1 text-[11px] text-neutral-500 hover:bg-red-900/60 hover:text-red-200">&#10005;</button>
+      </div>`).join("")}
+    </div>
+    <button data-${key}add="${i}"
+      class="mt-1 rounded-lg bg-neutral-800 px-2 py-1 text-[11px] text-neutral-400 hover:bg-neutral-700">+ ${choice ? "Option" : "Level"}</button>
+  </div>`;
+}
+
+/// The questions editor: one card per question — id, type, question text,
+/// and for choice/score the inline option/level list. Values live in
+/// CHAT.questions and every field writes through on input, so a repaint
+/// (type change, add, remove) never loses what was typed.
+function paintQuestions() {
+  const box = $("#chat-qs");
+  if (!box) return;
+  box.innerHTML = CHAT.questions.map((q, i) => `
+    <div class="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
+      <div class="grid items-end gap-2 md:grid-cols-[7rem_9rem_1fr_auto]">
+        <label class="block text-xs text-neutral-500">Id
+          ${input("qid", `data-q="${i}" data-f="id" placeholder="q${i + 1}"`, q.id)}</label>
+        <label class="block text-xs text-neutral-500">Type
+          <select data-q="${i}" data-f="type" class="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm text-neutral-200">${options(Q_TYPES, q.type)}</select></label>
+        <label class="block text-xs text-neutral-500">Question
+          ${input("qq", `data-q="${i}" data-f="question" placeholder="Is this about billing?"`, q.question)}</label>
+        <button data-del="${i}" title="Remove question"
+          class="mb-1 rounded-lg bg-neutral-800 px-2.5 py-1.5 text-xs text-neutral-400 hover:bg-red-900/60 hover:text-red-200">&#10005;</button>
+      </div>
+      ${q.type === "yes_no"
+        ? `<p class="mt-2 text-[11px] text-neutral-600">Answered from the yes/no token probabilities at the answer position.</p>`
+        : qSubList(q, i)}
+    </div>`).join("")
+    + `<button id="chat-qadd"
+        class="w-full rounded-lg border border-dashed border-neutral-700 px-3 py-1.5 text-xs text-neutral-400 hover:border-neutral-500 hover:text-neutral-200">+ Add question</button>`;
+
+  box.querySelectorAll("[data-q][data-f]").forEach(el => {
+    const q = CHAT.questions[+el.dataset.q];
+    el.addEventListener(el.tagName === "SELECT" ? "change" : "input", e => {
+      q[el.dataset.f] = e.target.value;
+      if (el.dataset.f === "type") paintQuestions();
+    });
+  });
+  box.querySelectorAll("[data-del]").forEach(el =>
+    el.addEventListener("click", () => { CHAT.questions.splice(+el.dataset.del, 1); paintQuestions(); }));
+  for (const [key, field] of [["opt", "options"], ["lvl", "levels"]]) {
+    box.querySelectorAll(`[data-${key}]`).forEach(el => {
+      const [i, j] = el.dataset[key].split(":").map(Number);
+      el.addEventListener("input", e => { CHAT.questions[i][field][j] = e.target.value; });
+    });
+    box.querySelectorAll(`[data-${key}del]`).forEach(el => el.addEventListener("click", () => {
+      const [i, j] = el.dataset[key + "del"].split(":").map(Number);
+      CHAT.questions[i][field].splice(j, 1);
+      paintQuestions();
+    }));
+    box.querySelectorAll(`[data-${key}add]`).forEach(el => el.addEventListener("click", () => {
+      CHAT.questions[+el.dataset[key + "add"]][field].push("");
+      paintQuestions();
+    }));
+  }
+  $("#chat-qadd").addEventListener("click", () => { CHAT.questions.push(newQuestion()); paintQuestions(); });
+}
+
+/// The question list as the wire JSON the console sends. Blank optional
+/// fields are dropped rather than guessed at: a blank id is omitted (each
+/// route then applies its own id rule), and half-typed blank options or
+/// levels are not data — if that leaves a question invalid, the route's own
+/// refusal is the honest result.
+function questionsPayload() {
+  return JSON.stringify(CHAT.questions.map(q => {
+    const out = { type: q.type, question: q.question };
+    const id = q.id.trim();
+    if (id) out.id = id;
+    if (q.type === "choice") out.options = q.options.map(s => s.trim()).filter(Boolean);
+    if (q.type === "score") out.levels = q.levels.map(s => s.trim()).filter(Boolean);
+    return out;
+  }));
+}
+
 /// The input area: a message box for the chat-shaped APIs, an audio picker
 /// for transcription. Repainted when the API type changes.
 function paintComposer() {
@@ -725,14 +835,24 @@ function paintComposer() {
     $("#chat-keywords").addEventListener("input", e => { CHAT.keywords = e.target.value; });
     $("#chat-send").addEventListener("click", sendTranscription);
   } else {
+    const scoring = isScoring(CHAT.path);
     box.innerHTML = `<div class="p-3">
-      <textarea id="chat-input" rows="3" placeholder="Message… (Enter to send, Shift+Enter for a newline)"
-        class="w-full resize-y rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-emerald-500"></textarea>
+      ${scoring ? `<div class="text-xs font-medium text-neutral-400">Questions</div>
+      <div id="chat-qs" class="mt-2 space-y-2"></div>
+      <p class="mt-2 text-xs text-neutral-500">Your newest message is sent as <code>input</code> (decisions) and the system prompt as <code>state</code> (System One). The token cap is ignored; temperature applies to decisions only — System One refuses it.</p>` : ""}
+      <textarea id="chat-input" rows="3" placeholder="${scoring ? "Text to score… (Enter to send)" : "Message… (Enter to send, Shift+Enter for a newline)"}"
+        class="${scoring ? "mt-3 " : ""}w-full resize-y rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-emerald-500"></textarea>
       <div class="mt-2 flex items-center justify-between">
-        <span class="text-xs text-neutral-500">Non-streaming. The whole transcript is re-sent each turn.</span>
-        ${sendBtn("Send")}
+        <span class="text-xs text-neutral-500">${scoring
+          ? "Answers come from one prefill per question — no text is generated."
+          : "Non-streaming. The whole transcript is re-sent each turn."}</span>
+        ${sendBtn(scoring ? "Score" : "Send")}
       </div>
     </div>`;
+    if (scoring) {
+      if (!CHAT.questions.length) CHAT.questions.push(newQuestion());
+      paintQuestions();
+    }
     $("#chat-send").addEventListener("click", sendChat);
     $("#chat-input").addEventListener("keydown", e => {
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
@@ -775,7 +895,7 @@ async function renderChat() {
             ${input("chat-temp", 'id="chat-temp" type="number" min="0" step="any" placeholder="provider default"', CHAT.temperature)}</label>
         </div>
         <p class="mt-1 text-xs text-neutral-500">Anthropic requires a token cap; without one the console sends 1024.
-          Embeddings ignore both and send your newest message as the input. Transcription ignores the token cap.</p>
+          Embeddings ignore both and send your newest message as the input. Transcription and the scoring endpoints ignore the token cap.</p>
       </details>
       <div id="chat-preview" class="mt-3 border-t border-neutral-800 pt-3 font-mono text-xs text-neutral-500">${chatPreview()}</div>
     </div>`, "mt-4")}
@@ -821,6 +941,7 @@ async function sendChat() {
   const text = box.value.trim();
   if (!text || CHAT.busy) return;
   if (!CHAT.backend || !CHAT.model || !CHAT.path) return toast("Pick a provider, model and API type first.");
+  if (isScoring(CHAT.path) && !CHAT.questions.length) return toast("Add a question first.");
 
   CHAT.messages.push({ role: "user", content: text });
   box.value = "";
@@ -888,6 +1009,7 @@ async function runPlayground(extra, tag = {}) {
         path: CHAT.path,
         system: CHAT.system.trim() || null,
         temperature: num(CHAT.temperature),
+        ...(isScoring(CHAT.path) ? { questions: questionsPayload() } : {}),
         ...extra,
       }),
     });
@@ -1482,7 +1604,7 @@ function openBackendForm(name) {
             <input type="checkbox" name="kinds" value="${k}" class="accent-emerald-500"
               ${b ? (b.kinds.includes(k) ? "checked" : "") : (k === "openai" ? "checked" : "")}> ${k}</label>`).join("")}
         </div>
-        <p class="mt-1 text-xs text-neutral-500">openai serves /v1/chat/completions, /v1/responses, /v1/embeddings and /v1/audio/transcriptions; anthropic serves /v1/messages.</p>
+        <p class="mt-1 text-xs text-neutral-500">openai serves /v1/chat/completions, /v1/responses, /v1/embeddings, /v1/audio/transcriptions, /v1/decisions and /v1/systemone; anthropic serves /v1/messages.</p>
       </div>
       <label class="block text-sm">Base URL
         ${input("base_url", 'required placeholder="https://api.openai.com"', b ? b.base_url : "")}</label>

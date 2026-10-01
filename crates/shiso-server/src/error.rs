@@ -137,6 +137,23 @@ pub enum AppError {
         /// The stable machine-readable code.
         code: &'static str,
     },
+    /// The request body does not match the schema this route speaks.
+    ///
+    /// The systemone route's schema refusal: bytes that do not parse, a known
+    /// field of the wrong type, or an unknown key inside a nested object. It
+    /// answers 422 rather than 400 because its clients fix whole documents
+    /// rather than one parameter, and `at` names where in the document to
+    /// look for the same reason. This is the only 422 in the crate - no other
+    /// route raises this variant - and a *refusal* on systemone (a bound, a
+    /// blank, a duplicate) stays a [`Self::BadRequest`]: the split is between
+    /// what the schema cannot express and what this server will not score.
+    #[error("{message}")]
+    SchemaViolation {
+        /// What is wrong with the document, in words a caller can act on.
+        message: String,
+        /// Where it is, as `line L column C` in the request body.
+        at: String,
+    },
     /// The request body is larger than the route accepts.
     #[error("the request body is larger than the {limit} bytes {what} accepts")]
     TooLarge {
@@ -219,6 +236,7 @@ impl AppError {
             Self::NotFound { .. } | Self::UnknownModel { .. } => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::SchemaViolation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::BadRequest { .. } | Self::ContextOverflow { .. } => StatusCode::BAD_REQUEST,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -250,6 +268,7 @@ impl AppError {
             Self::UnknownModel { .. } => "model_not_found",
             Self::MethodNotAllowed { .. } => "method_not_allowed",
             Self::TooLarge { .. } => "request_too_large",
+            Self::SchemaViolation { .. } => "invalid_schema",
             Self::BadRequest { code, .. } => code,
             Self::Internal { .. } => "internal_error",
         }
@@ -284,7 +303,12 @@ impl AppError {
 #[must_use]
 pub const fn type_for_status(status: StatusCode) -> &'static str {
     match status {
-        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE => "invalid_request_error",
+        // A schema violation answers 422 but is still the client's bad
+        // request in every client's eyes; only the code and the location
+        // tell it apart.
+        StatusCode::BAD_REQUEST
+        | StatusCode::PAYLOAD_TOO_LARGE
+        | StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
         StatusCode::UNAUTHORIZED => "authentication_error",
         StatusCode::NOT_FOUND => "not_found_error",
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_exceeded",
@@ -317,6 +341,15 @@ fn body_for(error: &AppError, surface: ApiSurface) -> Value {
                 fields.insert("n_prompt_tokens".to_owned(), json!(prompt_tokens));
                 fields.insert("n_ctx".to_owned(), json!(ctx));
             }
+            // A schema violation names its location for the same reason the
+            // context numbers ride here rather than in the prose: a client
+            // that wants to fix the document needs it as a field, not as
+            // something scraped out of the message.
+            if let AppError::SchemaViolation { at, .. } = error
+                && let Some(fields) = body.as_object_mut()
+            {
+                fields.insert("at".to_owned(), json!(at));
+            }
             json!({ "error": body })
         }
         ApiSurface::Anthropic => {
@@ -335,6 +368,15 @@ fn body_for(error: &AppError, surface: ApiSurface) -> Value {
             {
                 fields.insert("n_prompt_tokens".to_owned(), json!(prompt_tokens));
                 fields.insert("n_ctx".to_owned(), json!(ctx));
+            }
+            // The location rides here too, for the same reason and with the
+            // same note as above: 422 arises only on the systemone route in
+            // this crate, but the renderer stays one renderer for every
+            // failure that reaches it.
+            if let AppError::SchemaViolation { at, .. } = error
+                && let Some(fields) = body.as_object_mut()
+            {
+                fields.insert("at".to_owned(), json!(at));
             }
             json!({"type": "error", "error": body})
         }

@@ -213,6 +213,7 @@ mod tests {
                 deadline,
                 budget: 8,
                 keyed: false,
+                score_reply: None,
             },
             None,
             shiso_parsers::passthrough(),

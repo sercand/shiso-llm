@@ -109,7 +109,9 @@ fn boot() -> Option<Arc<AppState>> {
         "300",
     ])
     .expect("the command line parses");
-    let Command::Serve(args) = cli.command;
+    let Command::Serve(args) = cli.command else {
+        panic!("expected Command::Serve");
+    };
     args.validate().expect("servable");
     let audio = shiso_server::boot_audio(&args)
         .unwrap_or_else(|error| panic!("qwen3-asr-q8: {error}"))

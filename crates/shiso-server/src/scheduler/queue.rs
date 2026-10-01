@@ -23,6 +23,10 @@
 //! [`shiso_ir::ResponseBuilder`] - one production path, two encodings of it,
 //! which is what makes a field that only the blocking path fills in impossible.
 //!
+//! A scoring request is the deliberate exception: it generates nothing to
+//! stream, so its reply carries the answer itself, sent when the prompt has
+//! been read.
+//!
 //! # Why admission is bounded, and what a full queue answers
 //!
 //! The channel has a capacity, so a server under more load than it can carry
@@ -36,7 +40,10 @@
 //! A flex request is the exception. What its caller bought is capacity nobody
 //! else is using, at whatever latency that costs, so it waits for room in the
 //! queue for as long as it takes and is never told the server is overloaded.
-//! Its caller still cancels by going away, which drops the wait.
+//! Its caller still cancels by going away, which drops the wait. A scoring
+//! request is the exception to that exception: its wait is bounded in every
+//! class, because what waits is an answer rather than a receipt, and a held
+//! score buys its caller nothing (see [`EngineHandle::score`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,13 +66,13 @@ pub const QUEUE_CAPACITY: usize = 256;
 
 /// One unit of work for the engine thread.
 ///
-/// An enum with one variant. It stays an enum because the channel is the only
-/// path into the coordinator and a second kind of message - a cache
-/// administration request, say - would otherwise mean rewriting every call
-/// site. Cancellation is deliberately *not* such a message: a caller cancels by
-/// dropping the stream, which the coordinator observes on its next send, so a
-/// cancel variant would be a second way to say something the first way already
-/// says unambiguously.
+/// It started as an enum with one variant and stays an enum because the
+/// channel is the only path into the coordinator: a second kind of message -
+/// scoring a prompt, and later a cache administration request - would
+/// otherwise mean rewriting every call site. Cancellation is deliberately
+/// *not* such a message: a caller cancels by dropping the stream, which the
+/// coordinator observes on its next send, so a cancel variant would be a
+/// second way to say something the first way already says unambiguously.
 ///
 /// `Debug` is written out rather than derived: the reply channel carries an
 /// [`EventStream`], which is a boxed trait object with no `Debug` of its own,
@@ -84,6 +91,22 @@ pub enum EngineRequest {
         /// channel belongs to a different request.
         reply: oneshot::Sender<Result<EventStream, AppError>>,
     },
+    /// Score a prompt against a set of labels: one prefill, nothing generated.
+    ///
+    /// Unlike [`Self::Generate`], the reply carries the *answer* rather than a
+    /// receipt of admission: it is sent when the prompt has been read to its
+    /// end, with the labels' log-probabilities, or with an error when the
+    /// sequence ends any other way. A scoring sequence has no stream, so the
+    /// reply is the one place its outcome can be said.
+    Score {
+        /// What to score.
+        request: ScoreRequest,
+        /// Where the answer goes.
+        ///
+        /// Paired with the request by [`EngineHandle::score`], for the same
+        /// reason [`GenerateRequest`] replies are.
+        reply: oneshot::Sender<Result<ScoreOutcome, AppError>>,
+    },
 }
 
 impl std::fmt::Debug for EngineRequest {
@@ -91,6 +114,10 @@ impl std::fmt::Debug for EngineRequest {
         match self {
             Self::Generate { request, .. } => f
                 .debug_struct("Generate")
+                .field("request", request)
+                .finish_non_exhaustive(),
+            Self::Score { request, .. } => f
+                .debug_struct("Score")
                 .field("request", request)
                 .finish_non_exhaustive(),
         }
@@ -235,6 +262,61 @@ impl GenerateRequest {
     }
 }
 
+/// What one scoring pass needs.
+///
+/// The pass reads `prompt_tokens` once - a prefill, no decode steps - and
+/// answers with the log-probability of each of `labels` at the prompt's last
+/// position. Nothing is generated: the labels are scored, never sampled, and
+/// a scoring sequence never speaks on a stream.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ScoreRequest {
+    /// The rendered prompt, already tokenized.
+    ///
+    /// `Arc<[T]>` for the same reason [`GenerateRequest::prompt_tokens`] is:
+    /// one indirection, and the length beside the pointer.
+    pub prompt_tokens: Arc<[TokenId]>,
+    /// The label ids to read from the prompt's last row. The answer is one
+    /// log-probability per entry, in this order.
+    pub labels: Arc<[TokenId]>,
+    /// Whether this score runs beside standard work or only in its absence.
+    /// See [`ServiceClass::Flex`] for what the scheduler does with it; a flex
+    /// score is still answered through its reply, never held for one.
+    pub service_class: ServiceClass,
+}
+
+impl ScoreRequest {
+    /// A scoring pass over `prompt_tokens` reading `labels`, standard class.
+    #[must_use]
+    pub fn new(prompt_tokens: Arc<[TokenId]>, labels: Arc<[TokenId]>) -> Self {
+        Self {
+            prompt_tokens,
+            labels,
+            service_class: ServiceClass::Standard,
+        }
+    }
+
+    /// The same scoring pass, served in `class`.
+    #[must_use]
+    pub const fn with_service_class(mut self, class: ServiceClass) -> Self {
+        self.service_class = class;
+        self
+    }
+
+    /// Whether this score is served only when no standard work has the device.
+    #[must_use]
+    pub const fn is_flex(&self) -> bool {
+        matches!(self.service_class, ServiceClass::Flex)
+    }
+}
+
+/// The answer to one [`ScoreRequest`].
+#[derive(Debug)]
+pub struct ScoreOutcome {
+    /// The log-probability of each label, in the order the request gave them.
+    pub label_logprobs: Vec<f64>,
+}
+
 /// The handlers' end of the boundary.
 ///
 /// Cheap to clone - a channel sender, two snapshot fields and two `Arc`s - so it
@@ -339,6 +421,68 @@ impl EngineHandle {
                     waited_ms = self.admission.as_millis(),
                     "the scheduler queue stayed full for the whole admission window; \
                      refusing the request rather than making the caller wait without a bound"
+                );
+                return Err(AppError::Overloaded {
+                    what: "the scheduler queue is full",
+                });
+            }
+        }
+        answer
+            .await
+            .map_err(|_dropped| AppError::internal("the engine dropped the request", EngineGone))?
+    }
+
+    /// Queues a scoring pass and waits for its answer.
+    ///
+    /// Unlike [`EngineHandle::generate`], what is awaited here is completion,
+    /// not admission: the reply is sent when the prompt has been read to its
+    /// end, carrying the labels' log-probabilities.
+    ///
+    /// The wait for room in the queue is bounded by the admission window for
+    /// *every* service class, flex included. The held-flex lane exists so a
+    /// streaming caller sees its head and keepalives while it waits; a score
+    /// has nothing to show while it waits, and its answer is a prefill that
+    /// holds a slot for milliseconds - waiting one behind long work would make
+    /// the caller pay a generation's latency for a scoring pass's answer.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::BadRequest`] when the prompt or the label set is empty -
+    /// a scoring pass with nothing to read, or nothing to read *for*, answers
+    /// nothing. The HTTP surface refuses these first; the refusal is repeated
+    /// here so no in-crate caller can queue a request the engine would have
+    /// to invent an answer for. [`AppError::Overloaded`] when the queue stayed
+    /// full for the whole admission window. [`AppError::Internal`] when the
+    /// engine thread is gone - a closed channel, or a reply dropped with the
+    /// sequence that held it.
+    pub async fn score(&self, request: ScoreRequest) -> Result<ScoreOutcome, AppError> {
+        if request.prompt_tokens.is_empty() || request.labels.is_empty() {
+            return Err(AppError::bad_request(
+                "a scoring request needs a prompt and at least one label",
+                None,
+                "invalid_request",
+            ));
+        }
+        self.stats.request_queued();
+        let (reply, answer) = oneshot::channel();
+        let delivered = tokio::time::timeout(
+            self.admission,
+            self.tx.send(EngineRequest::Score { request, reply }),
+        )
+        .await;
+        match delivered {
+            Ok(Ok(())) => {}
+            // The channel closed under us. Nothing was read, and nothing will
+            // be: the thread that would have answered is gone.
+            Ok(Err(_closed)) => {
+                return Err(AppError::internal("the engine queue is closed", EngineGone));
+            }
+            Err(_elapsed) => {
+                self.stats.request_rejected();
+                tracing::warn!(
+                    waited_ms = self.admission.as_millis(),
+                    "the scheduler queue stayed full for the whole admission window; \
+                     refusing the score rather than making the caller wait without a bound"
                 );
                 return Err(AppError::Overloaded {
                     what: "the scheduler queue is full",

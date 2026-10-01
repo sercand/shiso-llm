@@ -640,8 +640,9 @@ fn deadline_ms(headers: &HeaderMap, qos: &RouteQos) -> Option<i64> {
 
 /// The API kind an inbound endpoint speaks (same mapping as
 /// `Dialect::for_path`): `/v1/messages` is Anthropic wire format,
-/// `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings` and
-/// `/v1/audio/transcriptions` are OpenAI.
+/// `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`,
+/// `/v1/audio/transcriptions`, `/v1/decisions` and `/v1/systemone` are
+/// OpenAI.
 fn required_kind(path: &str) -> BackendKind {
     if path.ends_with("/v1/messages") {
         BackendKind::Anthropic
@@ -662,6 +663,8 @@ fn canonical_path(path: &str) -> &str {
         "/audio/transcriptions" => "/v1/audio/transcriptions",
         "/messages" => "/v1/messages",
         "/v1/v1/messages" => "/v1/messages",
+        "/decisions" => "/v1/decisions",
+        "/systemone" => "/v1/systemone",
         other => other,
     }
 }
@@ -774,6 +777,10 @@ fn token_limit_field(
         // injection.
         Dialect::Anthropic => Some("max_tokens"),
         Dialect::OpenAiEmbeddings | Dialect::OpenAiTranscriptions => None,
+        // Scoring endpoints generate no tokens, so there is no limit to
+        // clamp — and injecting one would be a refusal: the decisions wire
+        // refuses unknown fields.
+        Dialect::Scoring => None,
     }
 }
 
@@ -1119,6 +1126,26 @@ mod tests {
         let out = prepare_body(&body, &clamp(Dialect::OpenAiEmbeddings, 512)).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v.as_object().unwrap().len(), 2, "nothing was added: {v}");
+    }
+
+    /// The scoring wires refuse unknown fields, so a clamped `max_tokens`
+    /// injection would turn a grouped-backend request into a 400.
+    #[test]
+    fn clamp_does_not_apply_to_scoring() {
+        let body = Bytes::from_static(br#"{"model":"m","input":"hi","questions":[]}"#);
+        let out = prepare_body(&body, &clamp(Dialect::Scoring, 512)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 3, "nothing was added: {v}");
+    }
+
+    #[test]
+    fn canonical_paths_map_the_prefixless_spellings() {
+        assert_eq!(canonical_path("/decisions"), "/v1/decisions");
+        assert_eq!(canonical_path("/systemone"), "/v1/systemone");
+        assert_eq!(canonical_path("/v1/decisions"), "/v1/decisions");
+        // And they speak the scoring dialect once canonical.
+        assert_eq!(Dialect::for_path("/v1/decisions"), Dialect::Scoring);
+        assert_eq!(Dialect::for_path("/v1/systemone"), Dialect::Scoring);
     }
 
     const FORM: &[u8] = b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\r\n\x00\x01\r\n\

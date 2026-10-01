@@ -29,9 +29,8 @@
     reason = "one harness serves every integration test here, and no single test uses all of it"
 )]
 
+use std::collections::{HashMap, VecDeque};
 pub(crate) mod wer;
-
-use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -233,6 +232,11 @@ pub(crate) struct Audit {
     pub(crate) resumes: Mutex<Vec<usize>>,
     /// Message boundaries the coordinator handed over, per session, in order.
     pub(crate) hints: Mutex<Vec<Vec<u32>>>,
+    /// Every prompt chunk the model was asked to read, whole: one entry per
+    /// `prefill_chunk`/`prefill_last`, the chunk's ids in order. A scoring
+    /// test asserts the exact ids the prompt was read with; a decode step
+    /// reads no prompt and adds nothing here.
+    pub(crate) prefill_prompts: Mutex<Vec<Vec<u32>>>,
     /// Shutdown sweeps.
     pub(crate) sweeps: AtomicU64,
 }
@@ -326,6 +330,12 @@ pub(crate) struct FakeModel {
     backend: Arc<dyn Backend>,
     logits: Option<DeviceBuffer>,
     script: Vec<u32>,
+    /// Whole logits rows to answer prefills with, in order: `prefill_last`
+    /// pops the front row and writes it verbatim instead of scripting a
+    /// spike. A scoring test scripts the exact row whose label log-probabilities
+    /// it will assert on; the queue is per-model, matching the scripted-answer
+    /// convention that every session reads the same script.
+    prefill_rows: VecDeque<Vec<f32>>,
     /// How far through the script each session is. Per session rather than
     /// global, so two sequences in one batch answer independently and a test can
     /// tell "row `i` belongs to `steps[i]`" from "every row is the same".
@@ -355,6 +365,7 @@ impl FakeModel {
                 backend: Arc::clone(backend),
                 logits: Some(logits),
                 script,
+                prefill_rows: VecDeque::new(),
                 cursors: HashMap::new(),
                 open: Vec::new(),
                 next_session: NonZeroU64::MIN,
@@ -363,6 +374,13 @@ impl FakeModel {
             },
             audit,
         )
+    }
+
+    /// The same model, answering the next `rows.len()` prefills with these
+    /// whole logits rows, in order, before falling back to the script.
+    pub(crate) fn with_prefill_rows(mut self, rows: Vec<Vec<f32>>) -> Self {
+        self.prefill_rows = VecDeque::from(rows);
+        self
     }
 
     /// The same model, held still by `gate` on every decode step.
@@ -388,6 +406,20 @@ impl FakeModel {
             source: Box::new(io::Error::other("teardown released the logits row")),
         })?;
         let offset = u64::from(row) * self.info.logits_row_bytes();
+        self.backend
+            .copy_h2d(buffer.slice(offset, bytes.len() as u64)?, &bytes)
+    }
+
+    /// Writes `row` verbatim into logits row `row_index`, through the same
+    /// host-to-device copy a scripted spike takes.
+    fn write_explicit_row(&self, row: &[f32], row_index: u32) -> CoreResult<()> {
+        let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let buffer = self.logits.as_ref().ok_or(CoreError::Backend {
+            backend: "fake",
+            op: "write_explicit_row",
+            source: Box::new(io::Error::other("teardown released the logits row")),
+        })?;
+        let offset = u64::from(row_index) * self.info.logits_row_bytes();
         self.backend
             .copy_h2d(buffer.slice(offset, bytes.len() as u64)?, &bytes)
     }
@@ -443,6 +475,10 @@ impl Model for FakeModel {
             tokens: tokens.len(),
             last: false,
         });
+        self.audit
+            .prefill_prompts
+            .lock()
+            .push(tokens.iter().map(|t| t.get()).collect());
         Ok(())
     }
 
@@ -454,7 +490,18 @@ impl Model for FakeModel {
             tokens: tokens.len(),
             last: true,
         });
-        self.write_row(session, 0)?;
+        self.audit
+            .prefill_prompts
+            .lock()
+            .push(tokens.iter().map(|t| t.get()).collect());
+        // A scripted row answers verbatim - it is what a scoring test reads
+        // back - and only once: the queue drains and the script's spikes take
+        // over, so a test that scripted one row for the score still gets
+        // scripted answers from every later prefill.
+        match self.prefill_rows.pop_front() {
+            Some(row) => self.write_explicit_row(&row, 0)?,
+            None => self.write_row(session, 0)?,
+        }
         self.block(1)
     }
 
@@ -655,6 +702,26 @@ pub(crate) fn fake_engine(
     let teardowns = Arc::clone(&audit.teardowns);
     let (engine, join) = spawn_engine(backend, Box::new(model), vocabulary, "fake-model", CAPACITY);
     (engine, join, teardowns)
+}
+
+/// Starts an engine thread over a model that answers prefills with these whole
+/// logits rows, in order, and an empty script after them: a scoring pass reads
+/// its scripted row, and anything that generates afterwards ends its turn on
+/// the script's exhaustion. The whole audit, rather than just the teardown
+/// count, because a scoring test asserts on the prompts the model read.
+pub(crate) fn fake_engine_rows(
+    rows: Vec<Vec<f32>>,
+    vocabulary: Option<Arc<Vocabulary>>,
+) -> (
+    EngineHandle,
+    std::thread::JoinHandle<Result<(), EngineFailure>>,
+    Arc<Audit>,
+) {
+    let backend: Arc<dyn Backend> = FakeBackend::new();
+    let (model, audit) = FakeModel::new(&backend, Vec::new());
+    let model = model.with_prefill_rows(rows);
+    let (engine, join) = spawn_engine(backend, Box::new(model), vocabulary, "fake-model", CAPACITY);
+    (engine, join, audit)
 }
 
 /// Starts an engine thread with a chosen configuration and the whole audit.
