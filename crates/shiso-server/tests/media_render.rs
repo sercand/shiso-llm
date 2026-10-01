@@ -487,11 +487,49 @@ fn the_bracket_is_written_around_the_image_run_only() {
     assert_eq!(ids, vec![OPEN, MARKER, MARKER, CLOSE, 1, 9, 9]);
 }
 
-/// A caller who writes a media marker as text has made a request error, not a
-/// server one: the vocabulary turns the marker text into the pad id, and the
-/// run then has no item. That is answered as a 400 saying so.
+/// A tiny template writing Qwen's media marker.
+const QWEN_WRAPPING_TEMPLATE: &str = concat!(
+    "{% for m in messages %}{% for part in m.content %}",
+    "{% if part.type == 'image' %}<|image_pad|>{% else %}{{ part.text }}{% endif %}",
+    "{% endfor %}{% endfor %}",
+);
+
+/// A vocabulary declaring Qwen's media marker.
+fn qwen_vocabulary() -> Arc<Vocabulary> {
+    let mut vocab = serde_json::Map::new();
+    vocab.insert("<unk>".to_owned(), json!(0));
+    vocab.insert("word".to_owned(), json!(1));
+    vocab.insert(MediaPlacement::QWEN35.image_marker.to_owned(), json!(2));
+    let added = vec![json!({
+        "id": 2,
+        "content": MediaPlacement::QWEN35.image_marker,
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": false,
+        "special": true,
+    })];
+    let document = json!({
+        "version": "1.0",
+        "truncation": Value::Null,
+        "padding": Value::Null,
+        "added_tokens": added,
+        "normalizer": Value::Null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": Value::Null,
+        "decoder": Value::Null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
+    })
+    .to_string();
+    let inner = tokenizers::Tokenizer::from_str(&document).expect("the vocabulary loads");
+    Arc::new(Vocabulary::from_tokenizer(inner))
+}
+
+/// A caller who writes a media marker in a message with no attached media has
+/// written standard text: the marker token passes through untouched into the prompt
+/// without raising an error.
 #[test]
-fn marker_text_in_a_message_is_a_request_error() {
+fn marker_text_in_a_media_free_message_passes_through() {
     let renderer = PromptRenderer::new(
         WRAPPING_TEMPLATE,
         ToolJsonStyle::Compact,
@@ -510,9 +548,72 @@ fn marker_text_in_a_message_is_a_request_error() {
             MediaPlacement::GEMMA4.image_marker
         ))],
     );
+    let prompt = renderer
+        .render(&request)
+        .expect("a media-free prompt carrying a marker token must render");
+    assert!(prompt.media.is_empty());
+    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
+    assert_eq!(ids, vec![1, MARKER, 1]);
+}
+
+/// A Qwen prompt carrying `<|image_pad|>` in text with no attached images renders
+/// successfully with the token preserved.
+#[test]
+fn qwen_image_pad_in_a_media_free_message_passes_through() {
+    let renderer = PromptRenderer::new(
+        QWEN_WRAPPING_TEMPLATE,
+        ToolJsonStyle::Compact,
+        qwen_vocabulary(),
+    )
+    .expect("the tiny template compiles")
+    .with_tower(
+        &one_token_spec(),
+        MediaPlacement::QWEN35,
+        ImageLimits::default(),
+    );
+    let request = Request::new(
+        "test",
+        vec![Message::user(format!(
+            "word {} word",
+            MediaPlacement::QWEN35.image_marker
+        ))],
+    );
+    let prompt = renderer
+        .render(&request)
+        .expect("a media-free prompt carrying Qwen image_pad text must render");
+    assert!(prompt.media.is_empty());
+    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
+    assert_eq!(ids, vec![1, 2, 1]);
+}
+
+/// When media items ARE attached, marker count and item count must match.
+/// Extra marker text written into a message alongside an attached item is refused.
+#[test]
+fn marker_count_mismatch_with_attached_media_is_a_request_error() {
+    let renderer = PromptRenderer::new(
+        WRAPPING_TEMPLATE,
+        ToolJsonStyle::Compact,
+        wrapping_vocabulary(),
+    )
+    .expect("the tiny template compiles")
+    .with_tower(
+        &one_token_spec(),
+        MediaPlacement::GEMMA4,
+        ImageLimits::default(),
+    );
+    let request = Request::new(
+        "test",
+        vec![Message::new(
+            Role::User,
+            vec![
+                Block::Image(MediaSource::classify(png_data_uri(48, 48))),
+                Block::Text(format!("word {} word", MediaPlacement::GEMMA4.image_marker)),
+            ],
+        )],
+    );
     let error = renderer
         .render(&request)
-        .expect_err("a marker with no item cannot be expanded");
+        .expect_err("two markers for one item must be rejected");
     assert_eq!(
         error.status(),
         axum::http::StatusCode::BAD_REQUEST,
