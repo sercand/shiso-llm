@@ -430,6 +430,42 @@ async fn questions_are_scored_against_prompts_carrying_the_shared_input() {
     );
 }
 
+/// The key-sorted compact rendering of `{"b": 1, "a": [1, 2]}`: the bytes
+/// the shared render rule owes a container input, pinned here in the order
+/// the server - not the client - chooses.
+const CONTAINER_TEXT: &str = "{\"a\":[1,2],\"b\":1}";
+
+#[tokio::test]
+async fn a_container_input_is_scored_from_its_key_sorted_rendering() {
+    // End to end, not just at the render helper: a container `input`
+    // reaches the model as compact JSON with keys sorted, so the same
+    // logical object spells one prompt whatever order its client sent -
+    // and the audited ids are exactly those of that rendering in the
+    // shared template.
+    let (state, audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": {"b": 1, "a": [1, 2]},
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let want = prompt_ids(&format!(
+        "{CONTAINER_TEXT}\n\nIs the following true? ready\nAnswer with yes or no only."
+    ));
+    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
+    assert_eq!(
+        got,
+        vec![want],
+        "the model read the key-sorted bytes: {got:?}"
+    );
+}
+
 #[tokio::test]
 async fn temperature_rescales_the_probabilities() {
     // The label log-probabilities come from the model; the temperature divides
@@ -702,6 +738,70 @@ async fn label_checks_refuse_a_question_whose_label_is_not_one_token() {
         body["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("q5")),
+        "the refusal must name the question: {body}"
+    );
+}
+
+/// `TEMPLATE` with the answer position glued flush to a word: the prompt
+/// then ends `<|assistant|>Answer`, with no whitespace boundary after it.
+/// This test vocabulary splits at punctuation as well as whitespace -
+/// `<|assistant|>` alone is already three chunks and `>` ends one - so a
+/// template that merely dropped the newline after the opener would still
+/// leave a label its own chunk; ending the prompt on a word is what makes
+/// the tail swallow a label.
+const GLUED_TEMPLATE: &str = concat!(
+    "{% for m in messages %}<|{{ m.role }}|> ",
+    "{% for part in m.content %}{{ part.text }}{% endfor %} <|end|> ",
+    "{% endfor %}<|assistant|>Answer",
+);
+
+/// A server on [`GLUED_TEMPLATE`], otherwise identical to `state_with_rows`.
+fn glued_state(rows: Vec<Vec<f32>>) -> (Arc<AppState>, Arc<common::Audit>) {
+    let vocabulary = test_vocabulary();
+    let (engine, _join, audit) = common::fake_engine_rows(rows, Some(Arc::clone(&vocabulary)));
+    let renderer = PromptRenderer::new(
+        GLUED_TEMPLATE,
+        ToolJsonStyle::Compact,
+        Arc::clone(&vocabulary),
+    )
+    .expect("the test template compiles");
+    let state = Arc::new(
+        AppState::new(engine, "test-model".to_owned(), CTX)
+            .with_vocabulary(vocabulary)
+            .with_renderer(Arc::new(renderer)),
+    );
+    (state, audit)
+}
+
+#[tokio::test]
+async fn label_checks_refuse_a_label_that_would_merge_into_the_prompt_tail() {
+    // The join arm of the label checks: a label that is one fresh token on
+    // its own but merges with the prompt's last chunk when the two are
+    // encoded together could never be read at the answer position. Here the
+    // tail word swallows it - `Answer` alone is the vocabulary's own token,
+    // but `AnswerA` encodes as one unknown chunk - so the refusal is a 400
+    // naming the question, in the same shape as the other label proofs.
+    let (state, _audit) = glued_state(vec![row_with(0.5, &[])]);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": "the input",
+                "questions": [{
+                    "id": "q9", "type": "choice", "question": "pick one",
+                    "options": ["red", "blue"],
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("q9")),
         "the refusal must name the question: {body}"
     );
 }

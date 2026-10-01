@@ -230,6 +230,9 @@ impl DecisionsBody {
             questions.push(RawQuestion {
                 id: question.id,
                 kind,
+                // The decisions wire has no noul block: every answer keeps
+                // its kind's own answer shape.
+                probability_answer: false,
             });
         }
         core::check_ids(&questions, false)?;

@@ -71,6 +71,11 @@ pub(crate) struct RawQuestion {
     pub id: String,
     /// How the question is answered.
     pub kind: Kind,
+    /// Whether the answer is reported as the probability of `yes` rather
+    /// than as a label word: the design pins "the `noul` answer is the yes
+    /// probability", so the systemone wire sets this on its noul criteria
+    /// only, and the decisions wire never sets it.
+    pub probability_answer: bool,
 }
 
 /// The text a JSON input value contributes to a prompt.
@@ -643,6 +648,9 @@ pub(crate) struct PreparedQuestion {
     pub id: String,
     /// How the question is answered.
     pub kind: Kind,
+    /// Whether the answer is the yes probability rather than a label word
+    /// ([`RawQuestion`]'s field of the same name, carried to the encoder).
+    pub probability_answer: bool,
     /// The rendered prompt ids, in the order the model will read them.
     pub prompt_tokens: Vec<TokenId>,
     /// The label ids, in the question's own label order.
@@ -774,6 +782,7 @@ pub(crate) fn prepare_question(
     Ok(PreparedQuestion {
         id: question.id.clone(),
         kind: question.kind.clone(),
+        probability_answer: question.probability_answer,
         prompt_tokens: prompt.tokens,
         labels,
     })
@@ -786,6 +795,9 @@ pub(crate) struct Answered {
     pub id: String,
     /// How the question was answered.
     pub kind: Kind,
+    /// Whether this answer is reported as the yes probability rather than
+    /// a label word ([`PreparedQuestion`]'s field of the same name).
+    pub probability_answer: bool,
     /// The label probabilities at the answer position, in label order.
     pub probabilities: Vec<f64>,
     /// The probability mass the labels carry together, independent of the
@@ -857,6 +869,7 @@ pub(crate) async fn run_questions(
             Ok(Answered {
                 id: question.id,
                 kind: question.kind,
+                probability_answer: question.probability_answer,
                 probabilities,
                 label_mass: label_mass(&outcome.label_logprobs),
                 top,
@@ -900,6 +913,7 @@ mod tests {
                 yes: None,
                 no: None,
             },
+            probability_answer: false,
         }
     }
 

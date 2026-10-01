@@ -329,13 +329,24 @@ async fn systemone(state: &Arc<AppState>) {
     check_shape(urgency, "x_label_mass", "systemone/urgency");
 
     let billing = &body["answers"]["billing"];
-    assert_eq!(
-        billing["answer"], "no",
-        "the noul criterion answered: {body}"
+    // The noul answer is the yes probability itself (the design), so the
+    // number, not a label word, carries "not about billing": below a half,
+    // equal to the first probability, with `no` above `yes` in the row.
+    let answer = billing["answer"]
+        .as_f64()
+        .expect("a noul answer is the yes probability, a number");
+    assert!(
+        answer < 0.5,
+        "the noul criterion answered yes ({answer}) over a ticket that is \
+         not about billing: {body}"
     );
     let probs = probabilities(billing);
     assert_eq!(probs.len(), 2, "a binary criterion: {body}");
     let (yes, no) = (probs[0], probs[1]);
+    assert!(
+        (answer - yes).abs() < 1e-5,
+        "the answer is the yes probability {yes}, got {answer}: {body}"
+    );
     assert!(
         no > yes,
         "the criterion leans no (yes {yes}, no {no}): {body}"

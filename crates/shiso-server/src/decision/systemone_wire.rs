@@ -214,6 +214,7 @@ impl SystemOneBody {
             questions.push(RawQuestion {
                 id: question.id,
                 kind,
+                probability_answer: false,
             });
         }
         if let Some(noul) = self.noul {
@@ -226,6 +227,11 @@ impl SystemOneBody {
                         yes: None,
                         no: None,
                     },
+                    // The design: "the `noul` answer is the yes
+                    // probability". The criterion is scored as a yes/no
+                    // question; only its answer shape differs, and the mark
+                    // says so at the one place the wire knows it.
+                    probability_answer: true,
                 });
             }
         }

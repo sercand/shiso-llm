@@ -31,8 +31,8 @@ pub(crate) fn encode(
         // top stands above a uniform draw, a score answer is how
         // concentrated it is around its top level. A noul criterion answers
         // as a yes/no question, so its confidence is the binary one over
-        // [yes, no] - and its probabilities array is where the design's
-        // "the noul answer is the yes probability" lives: entry zero is yes.
+        // [yes, no]; the design's "the `noul` answer is the yes
+        // probability" is the `answer` field itself, spelled below.
         let confidence = match &answer.kind {
             Kind::Choice { .. } => {
                 entry.insert(
@@ -50,10 +50,22 @@ pub(crate) fn encode(
                 score_confidence(&answer.probabilities)
             }
             Kind::YesNo { .. } => {
-                entry.insert(
-                    "answer".to_owned(),
-                    json!(answer_label(&answer.kind, answer.top)),
-                );
+                // A regular yes_no question answers with its label word; a
+                // noul criterion's answer *is* the yes probability - the
+                // design pins "the `noul` answer is the yes probability",
+                // and entry zero of the probabilities is yes by
+                // construction, the labels being exactly `yes` then `no`.
+                let answer_text = if answer.probability_answer {
+                    json!(
+                        answer
+                            .probabilities
+                            .first()
+                            .expect("a scored yes/no answer carries two label probabilities")
+                    )
+                } else {
+                    json!(answer_label(&answer.kind, answer.top))
+                };
+                entry.insert("answer".to_owned(), answer_text);
                 choice_confidence(&answer.probabilities)
             }
         };

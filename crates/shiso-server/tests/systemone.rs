@@ -473,16 +473,18 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     );
     assert_close(&q2["x_label_mass"], mass(&lp), "q2 x_label_mass", &body);
 
-    // The noul answer carries the yes probability the design names as the
-    // first entry of the yes_no shape's probabilities.
+    // The design: "the `noul` answer is the yes probability" - the `answer`
+    // field itself is that number (entry zero of the probabilities, the
+    // labels being `yes`, `no` in that order), while a regular yes_no
+    // question (q2 above) keeps its label word.
     let n1 = answer_of(&body, "n1");
     assert_eq!(
         n1["type"], "yes_no",
         "a criterion answers as a yes/no question"
     );
-    assert_eq!(n1["answer"], "yes");
     let lp = logprobs_answering(NOUL_BODY, &["yes", "no"]);
     let want = softmax(&lp, 1.0);
+    assert_close(&n1["answer"], want[0], "n1 answer", &body);
     assert_probabilities(&n1, &want, &body);
     assert!(want[0] > want[1], "the scripted row favours yes");
     assert_close(
@@ -868,7 +870,7 @@ async fn strict_bounds_still_refuse() {
 
     // A blank criterion id answers under "", and a blank or absent criterion
     // question answers with the bare lead line - and the flat row ties, so
-    // the first argmax says yes.
+    // the yes probability the noul answer carries is exactly one half.
     let (status, body) = call(
         &state,
         post(
@@ -896,7 +898,51 @@ async fn strict_bounds_still_refuse() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["answers"]["n1"]["answer"], "yes", "{body}");
+    assert_close(
+        &body["answers"]["n1"]["answer"],
+        0.5,
+        "a tied row answers the criterion at a half",
+        &body,
+    );
+}
+
+/// The key-sorted compact rendering of `{"b": 1, "a": [1, 2]}`: the bytes
+/// the shared render rule owes a container state, pinned here in the order
+/// the server - not the client - chooses.
+const CONTAINER_TEXT: &str = "{\"a\":[1,2],\"b\":1}";
+
+#[tokio::test]
+async fn a_container_state_is_scored_from_its_key_sorted_rendering() {
+    // The decisions route pins this at its `input`; the systemone `state`
+    // rides the same render rule, end to end: the audited prompt ids are
+    // exactly those of the key-sorted compact bytes in the shared
+    // template, and the echoed state is that same text.
+    let (state, audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": {"b": 1, "a": [1, 2]},
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let want = prompt_ids(&format!(
+        "{CONTAINER_TEXT}\n\nIs the following true? ready\nAnswer with yes or no only."
+    ));
+    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
+    assert_eq!(
+        got,
+        vec![want],
+        "the model read the key-sorted bytes: {got:?}"
+    );
+    assert_eq!(
+        body["state"], CONTAINER_TEXT,
+        "the echoed state is the rendered text: {body}"
+    );
 }
 
 #[tokio::test]
