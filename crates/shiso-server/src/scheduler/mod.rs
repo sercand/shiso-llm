@@ -1143,8 +1143,9 @@ impl Coordinator {
         // several sequences in one pass does in one pass over its weights.
         if rows.len() > 1 && rows.iter().all(|at| self.speculative(*at)) {
             // A sampled member is settled by the two-phase step, one session
-            // at a time; an all-greedy batch keeps the batched step.
-            if rows.iter().all(|at| self.greedy(*at)) {
+            // at a time; an all-greedy batch keeps the batched step. In
+            // opportunistic mode, speculative batching runs for all members.
+            if rows.iter().all(|at| self.greedy(*at)) || !self.cfg.mtp_exact_sampling {
                 self.speculative_batch_step(rows);
             } else {
                 for at in rows {
@@ -1228,14 +1229,13 @@ impl Coordinator {
     }
 
     /// Whether this row's next step can be speculative: a greedy sequence on
-    /// a model that drafts, or a sampled one whose tokens are keyed and so can
-    /// be checked against a draft by equality.
+    /// a model that drafts, a sampled one whose tokens are keyed and so can
+    /// be checked against a draft by equality, or an opportunistic sequence
+    /// when exact sampling is not requested.
     fn speculative(&mut self, at: usize) -> bool {
-        let eligible = self
-            .slots
-            .slots()
-            .get(at)
-            .is_some_and(|slot| slot.sampling().is_greedy() || slot.is_keyed());
+        let eligible = self.slots.slots().get(at).is_some_and(|slot| {
+            slot.sampling().is_greedy() || slot.is_keyed() || !self.cfg.mtp_exact_sampling
+        });
         eligible && self.model.as_model_mut().spec_mut().is_some()
     }
 
@@ -1281,7 +1281,7 @@ impl Coordinator {
                 return;
             }
         }
-        if !self.greedy(at) {
+        if !self.greedy(at) && self.cfg.mtp_exact_sampling {
             self.batched_decode_step(&[at]);
             return;
         }
