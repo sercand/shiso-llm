@@ -41,6 +41,7 @@ use crate::error::AppError;
 use crate::tokenizer::Vocabulary;
 use crate::tokenizer::chat_render::{ChatTemplate, RenderFlags};
 use crate::tokenizer::jinja_helpers::ToolJsonStyle;
+use crate::tokenizer::literal_text;
 use crate::tokenizer::message_preprocess::{
     DEFAULT_AUDIO_LIMITS, MediaPolicy, MediaWraps, expand_media_pads, preprocess,
 };
@@ -131,6 +132,9 @@ pub struct PromptRenderer {
     /// The placeholder ids this checkpoint's vocabulary gives the family's
     /// markers, resolved once when the tower was attached.
     pads: PadTokens,
+    /// The spellings of every marker and bracket above that this vocabulary
+    /// declares: what a caller's message text is kept from turning into.
+    marker_text: Vec<&'static str>,
     /// The bracket ids, for a family that brackets an image's run.
     wrap: Option<(TokenId, TokenId)>,
     /// The bracket around an audio clip's run.
@@ -173,6 +177,7 @@ impl PromptRenderer {
             vocabulary,
             vision: None,
             pads: PadTokens::default(),
+            marker_text: Vec::new(),
             wrap: None,
             audio_wrap: None,
             limits: ImageLimits::default(),
@@ -255,6 +260,7 @@ impl PromptRenderer {
                  a prompt carrying a picture will have nowhere to put its rows"
             );
         }
+        self.marker_text = self.marker_spellings(&placement);
         self.wrap = self.vocabulary.wrap_ids(&placement);
         self.audio_wrap = self.vocabulary.audio_wrap_ids(&placement);
         if self.wrap.is_none() && placement.wrap_image.is_some() {
@@ -283,6 +289,7 @@ impl PromptRenderer {
         ffmpeg: Option<FfmpegPolicy>,
     ) -> Self {
         self.pads = self.vocabulary.media_ids(&placement);
+        self.marker_text = self.marker_spellings(&placement);
         self.audio_wrap = self.vocabulary.audio_wrap_ids(&placement);
         if self.pads.audio().is_none() {
             tracing::warn!(
@@ -295,6 +302,23 @@ impl PromptRenderer {
         self.audio_limits = limits;
         self.audio_ffmpeg = ffmpeg;
         self
+    }
+
+    /// Every marker and bracket `placement` names that this vocabulary
+    /// declares as a token. Brackets are included although only the markers
+    /// are counted: a bracket a caller typed would otherwise open a picture
+    /// the model then never sees.
+    fn marker_spellings(&self, placement: &MediaPlacement) -> Vec<&'static str> {
+        let brackets = |wrap: Option<(&'static str, &'static str)>| {
+            wrap.into_iter().flat_map(|(open, close)| [open, close])
+        };
+        std::iter::once(placement.image_marker)
+            .chain(placement.video_marker)
+            .chain(placement.audio_marker)
+            .chain(brackets(placement.wrap_image))
+            .chain(brackets(placement.wrap_audio))
+            .filter(|marker| self.vocabulary.marker_id(marker).is_some())
+            .collect()
     }
 
     /// The same renderer with the remote-media policy set.
@@ -369,8 +393,12 @@ impl PromptRenderer {
             audio_ffmpeg: self.audio_ffmpeg.as_ref(),
             cache: self.media_cache.as_deref(),
         };
-        let prepared = preprocess(&request.system, &request.messages, &policy)
+        let mut prepared = preprocess(&request.system, &request.messages, &policy)
             .map_err(|error| AppError::bad_request(error.to_string(), None, "invalid_media"))?;
+        // Marker text a caller wrote is escaped here and read as plain text
+        // when encoded, so the only markers in the ids are the ones the
+        // template wrote for attached media.
+        let escaped = literal_text::escape(&mut prepared.messages, &self.marker_text);
 
         let tools = Self::tool_documents(request);
         let text = self
@@ -383,6 +411,8 @@ impl PromptRenderer {
                 // written for the person who sent it.
                 AppError::bad_request(error.to_string(), Some("messages"), "invalid_request")
             })?;
+        let (text, literal) = literal_text::unescape(text, &escaped)
+            .map_err(|error| AppError::internal("restoring escaped message text", error))?;
 
         // `encode_prompt` rather than `encode`: a template that writes the
         // opening token itself has already put it in the text and is left
@@ -390,7 +420,7 @@ impl PromptRenderer {
         // starts with exactly one, which is what the model was trained on and
         // what upstream llama.cpp produces for the same conversation.
         let tokens = self
-            .encode_with_replay(&text, prepared.media.is_empty())
+            .encode_with_replay(&text, &literal, prepared.media.is_empty())
             .map_err(|error| AppError::internal("encoding the rendered prompt", error))?;
         let wraps = MediaWraps {
             image: self.wrap,
@@ -398,14 +428,13 @@ impl PromptRenderer {
         };
         let tokens =
             expand_media_pads(tokens, &prepared.pad_counts, self.pads, wraps).map_err(|error| {
-                // The template writes one marker per item, so a count that
-                // disagrees came from the caller: extra marker text written into a
-                // message when media is attached, or media in a turn the template does not render.
+                // The template writes one marker per item and marker text in a
+                // message is read as text, so a count that disagrees is media
+                // in a turn the template does not render.
                 AppError::bad_request(
                     format!(
-                        "the prompt holds {} media marker(s) for {} attached item(s); a message \
-                         must not contain a media marker as text, and media is accepted only \
-                         where this model's template renders it",
+                        "the prompt holds {} media marker(s) for {} attached item(s); media is \
+                         accepted only where this model's template renders it",
                         error.markers, error.items
                     ),
                     Some("messages"),
@@ -426,12 +455,18 @@ impl PromptRenderer {
     ///
     /// The rest is encoded without an opening token: the replayed ids came out
     /// of this function once already and carry it. A prompt with media is
-    /// always encoded cold, because its pad markers are one id for any picture.
+    /// always encoded cold, because its pad markers are one id for any picture,
+    /// and so is one with `literal` marker text, whose ids differ from the ids
+    /// the same text would get from the template.
     fn encode_with_replay(
         &self,
         text: &str,
+        literal: &[std::ops::Range<usize>],
         text_only: bool,
     ) -> Result<Vec<TokenId>, super::TokenizerError> {
+        if !literal.is_empty() {
+            return self.vocabulary.encode_prompt_with_literals(text, literal);
+        }
         let replayed = self
             .replay
             .as_ref()
@@ -618,11 +653,11 @@ mod tests {
             .with_turn_replay(Some(replay));
         let raw = |tokens: Vec<TokenId>| tokens.iter().map(|id| id.get()).collect::<Vec<_>>();
         let spliced = renderer
-            .encode_with_replay("word word word", true)
+            .encode_with_replay("word word word", &[], true)
             .expect("encodes");
         assert_eq!(raw(spliced), [7, 8, 1]);
         let with_media = renderer
-            .encode_with_replay("word word word", false)
+            .encode_with_replay("word word word", &[], false)
             .expect("encodes");
         assert_eq!(raw(with_media), [1, 1, 1]);
     }

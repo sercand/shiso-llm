@@ -22,6 +22,7 @@
 
 pub mod chat_render;
 pub mod jinja_helpers;
+pub mod literal_text;
 pub mod message_preprocess;
 pub mod render_prompt;
 pub mod turn_replay;
@@ -173,6 +174,96 @@ impl Vocabulary {
     /// [`TokenizerError::Encode`] when the text cannot be encoded.
     pub fn encode_prompt(&self, text: &str) -> Result<Vec<TokenId>, TokenizerError> {
         let mut tokens = self.encode(text, false)?;
+        if let Some(bos) = self.bos
+            && tokens.first() != Some(&bos)
+        {
+            tokens.insert(0, bos);
+        }
+        Ok(tokens)
+    }
+
+    /// Encodes a prompt as [`Self::encode_prompt`] does, except that the byte
+    /// ranges in `literal` are read as ordinary text even where they spell an
+    /// added token.
+    ///
+    /// The ranges are text a caller wrote that happens to spell a marker; see
+    /// [`literal_text`]. The prompt is encoded once as usual, and each stretch
+    /// between two added tokens the template wrote that holds a literal range
+    /// is encoded again with added tokens read as text. Added tokens are split
+    /// out before any other step of the encoder, so such a stretch is encoded
+    /// on its own in the first pass as well, and re-encoding it alone gives the
+    /// ids the same characters would get anywhere in a prompt.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenizerError::Encode`] when the text cannot be encoded.
+    pub fn encode_prompt_with_literals(
+        &self,
+        text: &str,
+        literal: &[std::ops::Range<usize>],
+    ) -> Result<Vec<TokenId>, TokenizerError> {
+        if literal.is_empty() {
+            return self.encode_prompt(text);
+        }
+        let encode_error = |error: tokenizers::Error| TokenizerError::Encode {
+            message: error.to_string(),
+        };
+        let encoded = self.inner.encode(text, false).map_err(encode_error)?;
+        let added = self.inner.get_added_tokens_decoder();
+        // Cloned per call rather than kept: only a prompt that spells a marker
+        // in its text comes here, and a second resident copy of a large
+        // vocabulary is paid by every prompt that does not.
+        let mut as_text = self.inner.clone();
+        as_text.set_encode_special_tokens(true);
+        let overlaps = |(start, end): (usize, usize)| {
+            literal
+                .iter()
+                .any(|range| start < range.end && range.start < end)
+        };
+
+        let mut tokens = Vec::with_capacity(encoded.get_ids().len());
+        let mut stretch: Vec<TokenId> = Vec::new();
+        let mut stretch_start = 0usize;
+        let mut holds_literal = false;
+        let flush = |tokens: &mut Vec<TokenId>,
+                     stretch: &mut Vec<TokenId>,
+                     span: std::ops::Range<usize>,
+                     holds_literal: bool|
+         -> Result<(), TokenizerError> {
+            if holds_literal {
+                let piece = text.get(span).unwrap_or_default();
+                let again = as_text.encode(piece, false).map_err(encode_error)?;
+                tokens.extend(again.get_ids().iter().copied().map(TokenId::new));
+                stretch.clear();
+            } else {
+                tokens.append(stretch);
+            }
+            Ok(())
+        };
+        for (&id, &offsets) in encoded.get_ids().iter().zip(encoded.get_offsets()) {
+            let inside = overlaps(offsets);
+            if added.contains_key(&id) && !inside {
+                flush(
+                    &mut tokens,
+                    &mut stretch,
+                    stretch_start..offsets.0,
+                    holds_literal,
+                )?;
+                tokens.push(TokenId::new(id));
+                stretch_start = offsets.1;
+                holds_literal = false;
+            } else {
+                stretch.push(TokenId::new(id));
+                holds_literal |= inside;
+            }
+        }
+        flush(
+            &mut tokens,
+            &mut stretch,
+            stretch_start..text.len(),
+            holds_literal,
+        )?;
+
         if let Some(bos) = self.bos
             && tokens.first() != Some(&bos)
         {
@@ -555,5 +646,48 @@ mod detokenizer_tests {
 
         let tail = detok.flush().expect("flushes tail");
         assert_eq!(tail, " \u{FFFD}", "flushing delivers any uncompleted tail");
+    }
+
+    /// The marker the template wrote stays one id; the copy inside the literal
+    /// range is encoded as the characters it is made of.
+    #[test]
+    fn a_literal_range_is_encoded_as_text_and_the_rest_is_not() {
+        use std::str::FromStr as _;
+        let document = serde_json::json!({
+            "version": "1.0",
+            "truncation": serde_json::Value::Null,
+            "padding": serde_json::Value::Null,
+            "added_tokens": [{
+                "id": 4, "content": "<m>", "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true,
+            }],
+            "normalizer": serde_json::Value::Null,
+            "pre_tokenizer": {
+                "type": "ByteLevel", "add_prefix_space": false,
+                "trim_offsets": false, "use_regex": false
+            },
+            "post_processor": serde_json::Value::Null,
+            "decoder": serde_json::Value::Null,
+            "model": {
+                "type": "BPE",
+                "vocab": {"<": 0, "m": 1, ">": 2, "a": 3},
+                "merges": [],
+            },
+        })
+        .to_string();
+        let tokenizer = tokenizers::Tokenizer::from_str(&document).expect("loads");
+        let vocabulary = Vocabulary::from_tokenizer(tokenizer);
+        let text = "<m>a<m>a";
+        let ids = |tokens: Vec<TokenId>| tokens.iter().map(|t| t.get()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(vocabulary.encode_prompt(text).expect("encodes")),
+            vec![4, 3, 4, 3]
+        );
+        assert_eq!(
+            ids(vocabulary
+                .encode_prompt_with_literals(text, &[4..7])
+                .expect("encodes")),
+            vec![4, 3, 0, 1, 2, 3]
+        );
     }
 }
