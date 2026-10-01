@@ -381,6 +381,7 @@ fn scheduler_config(args: &ServeArgs) -> anyhow::Result<scheduler::SchedulerConf
     scheduler.store.drain_timeout = std::time::Duration::from_secs(args.kvstore_drain_secs);
     scheduler.stats_interval = (args.log_stats_interval > 0)
         .then(|| std::time::Duration::from_secs(args.log_stats_interval));
+    scheduler.mtp_exact_sampling = args.mtp_exact_sampling;
     // Validated at boot, so the widths are known to be servable here.
     let widths = args.prefill_widths()?;
     scheduler.solo_chunk = widths.solo_chunk;

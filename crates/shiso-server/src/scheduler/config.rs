@@ -57,6 +57,8 @@ const CKPT_ALIGN_ENV: &str = "SHISO_CKPT_BOUNDARY_ALIGN";
 const CKPT_TRIM_ENV: &str = "SHISO_CKPT_BOUNDARY_TRIM";
 /// The environment knob for the continued interval.
 const CKPT_CONTINUED_ENV: &str = "SHISO_CKPT_CONTINUED_INTERVAL";
+/// The environment knob for exact sampling in speculative decoding.
+const MTP_EXACT_SAMPLING_ENV: &str = "SHISO_MTP_EXACT_SAMPLING";
 
 /// Tokens a session has to add mid-answer before its frontier is offered again.
 /// Zero: only the end of a turn, which every turn offers anyway.
@@ -113,6 +115,25 @@ fn env_count(name: &str, default: usize) -> usize {
         return 1;
     }
     asked
+}
+
+/// Reads one boolean knob, falling back to `default`.
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Err(_unset) => default,
+        Ok(raw) => match raw.trim() {
+            "1" | "true" | "TRUE" | "yes" | "YES" => true,
+            "0" | "false" | "FALSE" | "no" | "NO" => false,
+            _ => {
+                tracing::warn!(
+                    knob = name,
+                    value = raw,
+                    "this setting is not a boolean; the default is being used"
+                );
+                default
+            }
+        },
+    }
 }
 
 /// When a session's prefix is written to the checkpoint tier.
@@ -280,6 +301,9 @@ pub struct SchedulerConfig {
     /// How often the engine prints its info line of rates and cache use.
     /// `None` prints none; the binary sets it from `--log-stats-interval`.
     pub stats_interval: Option<Duration>,
+    /// Whether non-greedy sequences preserve exact sampling instead of
+    /// accepting target-matching greedy drafts directly.
+    pub mtp_exact_sampling: bool,
 }
 
 impl SchedulerConfig {
@@ -297,6 +321,7 @@ impl SchedulerConfig {
             clock: Arc::new(SystemClock),
             turn_replay: None,
             stats_interval: None,
+            mtp_exact_sampling: false,
         }
     }
 
@@ -333,6 +358,7 @@ impl SchedulerConfig {
             turn_replay: None,
             // `--log-stats-interval`, set by the binary.
             stats_interval: None,
+            mtp_exact_sampling: env_bool(MTP_EXACT_SAMPLING_ENV, false),
         }
     }
 
