@@ -789,7 +789,10 @@ impl Coordinator {
     /// will ever ask for. The empty prompt and empty label set are refused
     /// here as well as at the handle: the HTTP surface and the handle both
     /// refuse first, and the scheduler refuses too, because a forward pass
-    /// over nothing must not be reachable from any caller.
+    /// over nothing must not be reachable from any caller. Media encoding
+    /// does run here, because the tower must splice its rows before the one
+    /// prefill reads them, on the scheduler thread where all model calls
+    /// live.
     fn open_score(
         &mut self,
         request: ScoreRequest,
@@ -827,14 +830,20 @@ impl Coordinator {
         let now = self.cfg.clock.now();
         let id = format!("{:016x}", self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
+        // Cloned off the request before it moves into the slot: the tower must
+        // run over the items after the slot exists, so the encode can attach
+        // its rows to it.
+        let items = Arc::clone(&request.media);
+        let digests = Arc::clone(&request.media_digests);
         tracing::info!(
             id,
             prompt_tokens = request.prompt_tokens.len(),
             labels = request.labels.len(),
+            media = items.len(),
             running = self.slots.len() + 1,
             "scoring request admitted"
         );
-        if let Some(refused) = self.slots.admit(SeqSlot::new_score(
+        let mut slot = SeqSlot::new_score(
             request,
             SlotSetup {
                 id,
@@ -846,7 +855,22 @@ impl Coordinator {
                 keyed: false,
                 score_reply: Some(reply),
             },
-        )) {
+        );
+        // The generation encode step in its plain form: a score never resumes
+        // and is never keyed, so there is no covered prefix to subtract and no
+        // resume to run ahead of. A failure fails the slot, whose still-held
+        // reply carries the message through the retirement path.
+        if !items.is_empty() {
+            match self.encode_media(&items, &digests) {
+                Ok(Some(media)) => slot.attach_media(media),
+                Ok(None) => {}
+                Err(message) => {
+                    tracing::warn!(%message, "a scoring request carrying media could not be served");
+                    slot.fail(message);
+                }
+            }
+        }
+        if let Some(refused) = self.slots.admit(slot) {
             // Unreachable while admission only happens with a free slot;
             // handled for the same reason `open` handles it - a dropped slot
             // would leak its session. Its reply comes back as an engine
@@ -1737,7 +1761,13 @@ impl Coordinator {
             .iter()
             .enumerate()
             .filter(|(_at, slot)| {
+                // A score's prompt is read once and kept by nobody: filing a
+                // mid-prefill score frontier would put a one-question prompt
+                // on the disk tier under a key no follow-up will ever ask
+                // for. The retirement site already refuses a score; this is
+                // the other half of that ruling, for the interval path.
                 !slot.is_done()
+                    && !slot.is_score()
                     && slot.checkpointable()
                     && policy.stores_continued(slot.written_len(), slot.stored_len, false)
             })
