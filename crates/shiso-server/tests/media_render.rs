@@ -312,7 +312,7 @@ fn image_and_audio_markers_expand_in_order_with_their_own_brackets() {
     };
     let pads = PadTokens::new(Some(image), None).with_audio(Some(audio));
     assert!(pads.matches(audio));
-    let expanded = expand_media_pads(
+    let (expanded, _ranges) = expand_media_pads(
         vec![image, TokenId::new(1), audio, audio],
         &[2, 3, 1],
         pads,
@@ -611,4 +611,118 @@ fn marker_text_beside_an_attached_picture_stays_text() {
     assert_eq!(prompt.media.len(), 1);
     let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
     assert_eq!(ids, vec![2, 1, 3, 4, 5, 1]);
+}
+
+// --- the per-item media spans ------------------------------------------------
+
+/// One image, unbracketed family: the span pairs the pad run in the tokens
+/// with the marker string in the text, so a caller downstream (the decision
+/// seam check) can find the tail after the item without ever seeing a marker.
+#[test]
+fn a_rendered_image_prompt_reports_its_media_spans() {
+    let request = Request::new(
+        "test",
+        vec![Message::new(
+            Role::User,
+            vec![
+                Block::Text("word".to_owned()),
+                Block::Image(MediaSource::classify(png_data_uri(96, 96))),
+            ],
+        )],
+    );
+    let prompt = qwen_renderer()
+        .render(&request)
+        .expect("one picture renders");
+    let pads = prompt.media[0].pad_count(one_token_spec().geometry.spatial_merge_size());
+    assert_eq!(pads, 4, "a 96x96 picture is four soft tokens here");
+    assert_eq!(prompt.media_spans.len(), 1);
+    let span = &prompt.media_spans[0];
+    assert_eq!(&prompt.text[span.text.clone()], MediaPlacement::QWEN35.image_marker);
+    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
+    assert_eq!(&ids[span.tokens.clone()], &vec![2u32; pads], "the run is the pads");
+    // The spans end lines up with the text after the marker: `word` before,
+    // nothing after.
+    assert_eq!(&ids[..span.tokens.start], &[1]);
+    assert_eq!(span.tokens.end, ids.len());
+}
+
+/// A bracketed family: the token span covers open bracket + pad run + close
+/// bracket, while the text span is still just the marker string - the
+/// brackets are added token-side only, which is what keeps the two tails
+/// aligned for the seam check (spec §2).
+#[test]
+fn a_bracketed_family_span_includes_the_brackets() {
+    let vocabulary = wrapping_vocabulary();
+    let renderer = PromptRenderer::new(WRAPPING_TEMPLATE, ToolJsonStyle::Compact, vocabulary)
+        .expect("the tiny template compiles")
+        .with_tower(
+            &one_token_spec(),
+            MediaPlacement::GEMMA4,
+            ImageLimits::default(),
+        );
+    let request = Request::new(
+        "test",
+        vec![Message::new(
+            Role::User,
+            vec![
+                Block::Text("word".to_owned()),
+                Block::Image(MediaSource::classify(png_data_uri(48, 48))),
+            ],
+        )],
+    );
+    let prompt = renderer.render(&request).expect("the prompt renders");
+    assert_eq!(prompt.media_spans.len(), 1);
+    let span = &prompt.media_spans[0];
+    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
+    assert_eq!(
+        &ids[span.tokens.clone()],
+        &[OPEN, MARKER, CLOSE],
+        "the span is bracket + run + bracket, one pad here"
+    );
+    assert_eq!(span.tokens.len(), 3, "pad_count + 2");
+    assert_eq!(&prompt.text[span.text.clone()], MediaPlacement::GEMMA4.image_marker);
+    assert_eq!(&ids[..span.tokens.start], &[1]);
+    assert_eq!(span.tokens.end, ids.len());
+}
+
+/// Two images in one prompt (Review Focus 4): the spans pair index-for-index
+/// with `media`, strictly increase in both ranges, and the text between the
+/// first span's end and the second's start is exactly the template's
+/// inter-marker text.
+#[test]
+fn two_images_have_ordered_spans() {
+    let request = Request::new(
+        "test",
+        vec![Message::new(
+            Role::User,
+            vec![
+                Block::Text("word".to_owned()),
+                Block::Image(MediaSource::classify(png_data_uri(48, 48))),
+                Block::Text("mid".to_owned()),
+                Block::Image(MediaSource::classify(png_data_uri(48, 48))),
+                Block::Text("tail".to_owned()),
+            ],
+        )],
+    );
+    let prompt = qwen_renderer()
+        .render(&request)
+        .expect("two pictures render");
+    assert_eq!(prompt.media_spans.len(), 2);
+    let (first, second) = (&prompt.media_spans[0], &prompt.media_spans[1]);
+    assert!(first.text.end <= second.text.start, "{first:?} {second:?}");
+    assert!(first.tokens.end <= second.tokens.start, "{first:?} {second:?}");
+    assert_eq!(&prompt.text[first.text.end..second.text.start], "mid");
+    assert_eq!(&prompt.text[second.text.end..], "tail");
+}
+
+/// A prompt with no media has no spans - the field is empty, not absent, and
+/// nothing downstream may read spans for a text-only prompt.
+#[test]
+fn a_text_only_render_has_no_spans() {
+    let request = Request::new("test", vec![Message::user("word")]);
+    let prompt = qwen_renderer()
+        .render(&request)
+        .expect("a text prompt renders");
+    assert!(prompt.media.is_empty());
+    assert!(prompt.media_spans.is_empty());
 }

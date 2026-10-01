@@ -47,6 +47,23 @@ use crate::tokenizer::message_preprocess::{
 };
 use crate::tokenizer::turn_replay::TurnReplay;
 
+/// Where one media item sits in a rendered prompt: the token range it
+/// occupies in [`Rendered::tokens`] (open bracket + pad run + close bracket,
+/// as expanded) and the byte range of its marker string in [`Rendered::text`].
+///
+/// The two ranges end where the item ends on each side, which is what lets a
+/// caller compare the text after the marker with the tokens after the run
+/// without ever seeing a marker string: the brackets are added token-side
+/// only, and the marker is one special token, so both tails begin at the
+/// same piece of the caller's prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaSpan {
+    /// The item's run in the expanded token stream, `[start, end)`.
+    pub tokens: std::ops::Range<usize>,
+    /// The item's marker string in the rendered text, as byte offsets.
+    pub text: std::ops::Range<usize>,
+}
+
 /// A rendered prompt, in all three of the forms something downstream needs.
 #[derive(Debug, Clone)]
 pub struct Rendered {
@@ -59,6 +76,9 @@ pub struct Rendered {
     pub media: Vec<MediaItem>,
     /// Each item's content digest, index for index with `media`.
     pub digests: Vec<MediaDigest>,
+    /// Where each item sits, index for index with `media`. Empty when the
+    /// prompt carries no media.
+    pub media_spans: Vec<MediaSpan>,
 }
 
 impl Rendered {
@@ -139,6 +159,11 @@ pub struct PromptRenderer {
     wrap: Option<(TokenId, TokenId)>,
     /// The bracket around an audio clip's run.
     audio_wrap: Option<(TokenId, TokenId)>,
+    /// The family's placement as the tower attached it: the marker *strings*
+    /// the template writes, kept so `render` can locate each item's marker in
+    /// the final text and report [`MediaSpan`]s. `Copy`, and the last tower
+    /// attached wins exactly as it does for `pads`.
+    placement: Option<MediaPlacement>,
     limits: ImageLimits,
     allow_remote: bool,
     ffmpeg: Option<FfmpegPolicy>,
@@ -180,6 +205,7 @@ impl PromptRenderer {
             marker_text: Vec::new(),
             wrap: None,
             audio_wrap: None,
+            placement: None,
             limits: ImageLimits::default(),
             allow_remote: false,
             ffmpeg: None,
@@ -263,6 +289,7 @@ impl PromptRenderer {
         self.marker_text = self.marker_spellings(&placement);
         self.wrap = self.vocabulary.wrap_ids(&placement);
         self.audio_wrap = self.vocabulary.audio_wrap_ids(&placement);
+        self.placement = Some(placement);
         if self.wrap.is_none() && placement.wrap_image.is_some() {
             tracing::warn!(
                 "this family brackets an image's pad run but this vocabulary declares no \
@@ -426,7 +453,7 @@ impl PromptRenderer {
             image: self.wrap,
             audio: self.audio_wrap,
         };
-        let tokens =
+        let (tokens, token_ranges) =
             expand_media_pads(tokens, &prepared.pad_counts, self.pads, wraps).map_err(|error| {
                 // The template writes one marker per item and marker text in a
                 // message is read as text, so a count that disagrees is media
@@ -441,13 +468,89 @@ impl PromptRenderer {
                     "invalid_media",
                 )
             })?;
+        let media_spans = self.locate_media_spans(&text, &literal, &token_ranges)?;
 
         Ok(Rendered {
             tokens,
             text,
             media: prepared.media,
             digests: prepared.digests,
+            media_spans,
         })
+    }
+
+    /// The byte range of each template-written marker in the final `text`,
+    /// zipped with the expanded token ranges `expand_media_pads` reported
+    /// into one [`MediaSpan`] per item.
+    ///
+    /// Marker text a caller wrote was escaped before the template ran and is
+    /// restored by `unescape`, so the final text can spell a marker as
+    /// ordinary text: an occurrence inside a `literal` range is text, not a
+    /// placeholder, and is skipped. At one position the longest spelling
+    /// wins - a family whose bracket spells a prefix of its marker must not
+    /// locate half a marker. A count that disagrees with the token side is
+    /// the same refusal as a [`super::message_preprocess::PadMismatch`]: a
+    /// prompt whose text and ids disagree is refused, not guessed at.
+    fn locate_media_spans(
+        &self,
+        text: &str,
+        literal: &[std::ops::Range<usize>],
+        token_ranges: &[std::ops::Range<usize>],
+    ) -> Result<Vec<MediaSpan>, AppError> {
+        if token_ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placement = self
+            .placement
+            .expect("a prompt with media only renders through a tower-attached renderer");
+        let spellings = [
+            Some(placement.image_marker),
+            placement.video_marker,
+            placement.audio_marker,
+        ];
+        let bytes = text.as_bytes();
+        let mut text_ranges = Vec::with_capacity(token_ranges.len());
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let hit = spellings
+                .iter()
+                .flatten()
+                .filter(|marker| bytes[at..].starts_with(marker.as_bytes()))
+                .max_by_key(|marker| marker.len());
+            match hit {
+                Some(marker) => {
+                    let span = at..at + marker.len();
+                    if !literal
+                        .iter()
+                        .any(|lit| span.start >= lit.start && span.end <= lit.end)
+                    {
+                        text_ranges.push(span.clone());
+                    }
+                    at = span.end;
+                }
+                None => at += 1,
+            }
+        }
+        if text_ranges.len() != token_ranges.len() {
+            return Err(AppError::bad_request(
+                format!(
+                    "the prompt holds {} media marker(s) for {} attached item(s); media is \
+                     accepted only where this model's template renders it",
+                    text_ranges.len(),
+                    token_ranges.len()
+                ),
+                Some("messages"),
+                "invalid_media",
+            ));
+        }
+        Ok(text_ranges
+            .into_iter()
+            .zip(token_ranges)
+            .map(|(text, tokens)| MediaSpan {
+                tokens: tokens.clone(),
+                text,
+            })
+            .collect())
     }
 
     /// Encodes `text`, taking the ids of the longest finished turn it extends
