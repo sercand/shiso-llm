@@ -41,7 +41,7 @@ use shiso_engine::projection::WeightAux;
 
 use super::config::{AUDIO_PAD, STOP_TOKENS, TextConfig};
 use super::encoder::Encoded;
-use super::prompt;
+use super::prompt::{self, Conditioning};
 use super::weights::{TextLayer, TextWeights};
 use crate::audio_ops::{
     AddRmsNormDesc, ArgmaxWideDesc, AxpyDesc, CachePlanes, CausalAttnDesc, DECODE_ATTN_SPLITS,
@@ -70,12 +70,13 @@ pub(super) const HEADROOM: usize = 256;
 /// chunk and the 5 s its cut is searched for past the mark.
 const LONGEST_CHUNK_FRAMES: usize = 3_500;
 /// The capacity a fresh cache takes for the longest chunk, in any language:
-/// the prompt and the headroom. A cache past it grew while a chunk decoded
-/// far past any speech - toward the token cap, at some 320 KB a row - and
-/// is not worth keeping once its stream closes.
+/// the prompt with the longest context, and the headroom. A cache past it
+/// grew while a chunk decoded far past any speech - toward the token cap, at
+/// some 320 KB a row - and is not worth keeping once its stream closes.
 pub(crate) const POOLED_CAPACITY: usize = prompt::FRAME_IDS
     + super::encoder::audio_tokens(LONGEST_CHUNK_FRAMES)
     + prompt::LONGEST_SUFFIX
+    + prompt::MAX_CONTEXT_IDS
     + HEADROOM;
 
 pub(super) fn bytes(floats: usize) -> u64 {
@@ -328,23 +329,24 @@ impl<'a> Decoder<'a> {
     /// The greedy transcript of `audio`'s rows, as ids: the prompt of
     /// [`prompt::ids`] with the rows in place of its placeholders, decoded
     /// until an end id (which is not returned) or [`MAX_NEW_TOKENS`]. With
-    /// `forced` the prompt ends in `language {forced}<asr_text>` and the ids
-    /// are the transcript alone; without it they start with the model's own
-    /// `language X<asr_text>`.
+    /// `cond.forced` the prompt ends in `language {forced}<asr_text>` and the
+    /// ids are the transcript alone; without it they start with the model's
+    /// own `language X<asr_text>`.
     ///
     /// # Errors
     ///
     /// [`AudioError::BadSpec`] for rows of another width than the decoder's,
     /// no rows, or a forced language the model does not support;
+    /// [`AudioError::BadContext`] for more context ids than a prompt carries;
     /// [`AudioError::Checkpoint`] for an embedding stored in an encoding no
     /// row fetch reads; a device error.
     pub fn transcribe(
         &self,
         cache: &mut KvCache,
         audio: &Encoded,
-        forced: Option<&str>,
+        cond: &Conditioning<'_>,
     ) -> Result<Vec<u32>, AudioError> {
-        self.transcribe_with(cache, &mut Workspace::new(), audio, forced)
+        self.transcribe_with(cache, &mut Workspace::new(), audio, cond)
     }
 
     /// [`Self::transcribe`] in `ws`'s buffers, which a model keeps from one
@@ -358,9 +360,9 @@ impl<'a> Decoder<'a> {
         cache: &mut KvCache,
         ws: &mut Workspace,
         audio: &Encoded,
-        forced: Option<&str>,
+        cond: &Conditioning<'_>,
     ) -> Result<Vec<u32>, AudioError> {
-        let (tokens, t) = self.timed_with(cache, ws, audio, forced)?;
+        let (tokens, t) = self.timed_with(cache, ws, audio, cond)?;
         tracing::debug!(
             prompt = t.prompt,
             prefill_ms = t.prefill.as_secs_f64() * 1e3,
@@ -378,9 +380,9 @@ impl<'a> Decoder<'a> {
         &self,
         cache: &mut KvCache,
         audio: &Encoded,
-        forced: Option<&str>,
+        cond: &Conditioning<'_>,
     ) -> Result<(Vec<u32>, Timing), AudioError> {
-        self.timed_with(cache, &mut Workspace::new(), audio, forced)
+        self.timed_with(cache, &mut Workspace::new(), audio, cond)
     }
 
     /// [`Self::transcribe_with`], with where the time went.
@@ -389,10 +391,10 @@ impl<'a> Decoder<'a> {
         cache: &mut KvCache,
         ws: &mut Workspace,
         audio: &Encoded,
-        forced: Option<&str>,
+        cond: &Conditioning<'_>,
     ) -> Result<(Vec<u32>, Timing), AudioError> {
         self.check_audio(audio)?;
-        let ids = prompt::ids(audio.tokens, forced)?;
+        let ids = prompt::ids(audio.tokens, cond)?;
         let n = ids.len();
         let start = Instant::now();
         let s = self.scratch(n, ws)?;

@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::auth::AuthConfig;
 use crate::error::AppError;
 use crate::response_store::ResponseStore;
 use crate::scheduler::{EngineHandle, SchedulerStats};
@@ -91,9 +90,6 @@ pub struct AppState {
     pub ckpt: Option<CheckpointTier>,
     /// The counters the engine thread is filling in.
     pub sched: Arc<SchedulerStats>,
-    /// The bearer tokens that may call the inference routes, when the server
-    /// was given any. `None` is an open server.
-    pub auth: Option<AuthConfig>,
     /// The vocabulary, for the edge that has to render and encode a prompt.
     pub vocabulary: Option<Arc<Vocabulary>>,
     /// The chat template and vocabulary, bound together.
@@ -129,7 +125,6 @@ impl AppState {
             ctx,
             kv: None,
             ckpt: None,
-            auth: None,
             vocabulary: None,
             renderer: None,
             response_store: ResponseStore::from_env(),
@@ -151,7 +146,6 @@ impl AppState {
             ctx: 0,
             kv: None,
             ckpt: None,
-            auth: None,
             vocabulary: None,
             renderer: None,
             response_store: ResponseStore::from_env(),
@@ -203,13 +197,6 @@ impl AppState {
     #[must_use]
     pub fn with_checkpoint_tier(mut self, tier: CheckpointTier) -> Self {
         self.ckpt = Some(tier);
-        self
-    }
-
-    /// The same state with the auth gate closed.
-    #[must_use]
-    pub fn with_auth(mut self, auth: AuthConfig) -> Self {
-        self.auth = Some(auth);
         self
     }
 

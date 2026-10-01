@@ -21,13 +21,13 @@ use super::config::{
 };
 
 /// `system`.
-const SYSTEM: u32 = 8948;
+pub(crate) const SYSTEM: u32 = 8948;
 /// `user`.
-const USER: u32 = 872;
+pub(crate) const USER: u32 = 872;
 /// `assistant`.
-const ASSISTANT: u32 = 77091;
+pub(crate) const ASSISTANT: u32 = 77091;
 /// `\n`.
-const NEWLINE: u32 = 198;
+pub(crate) const NEWLINE: u32 = 198;
 /// `language`, the first id of a forced suffix and of the model's own answer.
 const LANGUAGE: u32 = 11528;
 /// The text of the tag the transcript follows.
@@ -84,8 +84,35 @@ pub struct Parsed {
     pub text: String,
 }
 
-/// Ids of the prompt around its placeholder run: nine before it, six after.
+/// Ids of the prompt around its placeholder run and context: nine before the
+/// run, six after.
 pub(crate) const FRAME_IDS: usize = 15;
+
+/// The most context ids a prompt carries: some 350 words of mixed Turkish
+/// and English, far past any keyword list, and small beside the ~450 audio
+/// rows of a 35 s chunk, so a pooled cache sized for it stays small.
+pub(crate) const MAX_CONTEXT_IDS: usize = 512;
+
+/// What a prompt is conditioned on beyond its audio.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Conditioning<'a> {
+    /// The language forced, by the model's name for it; `None` lets the
+    /// model name it.
+    pub forced: Option<&'a str>,
+    /// The system turn's text, as ids ([`super::context`]); empty for none.
+    pub context: &'a [u32],
+}
+
+impl<'a> Conditioning<'a> {
+    /// A forced language (or none) and no context.
+    #[must_use]
+    pub const fn forced(forced: Option<&'a str>) -> Self {
+        Self {
+            forced,
+            context: &[],
+        }
+    }
+}
 
 /// Ids of the longest [`forced_suffix`].
 pub(crate) const LONGEST_SUFFIX: usize = longest_suffix();
@@ -117,23 +144,32 @@ pub fn forced_suffix(name: &str) -> Option<Vec<u32>> {
     Some(out)
 }
 
-/// The prompt for `n_audio` tower rows, captured from the reference
-/// processor with an empty context:
+/// The prompt for `n_audio` tower rows, with the context in the system turn
+/// (empty, as the reference captured it, when there is none):
 ///
 /// ```text
-/// <|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>
+/// <|im_start|>system\n{context}<|im_end|>\n<|im_start|>user\n<|audio_start|>
 /// <|audio_pad|> x n_audio <|audio_end|><|im_end|>\n<|im_start|>assistant\n
 /// ```
 ///
 /// followed, for a forced language, by `language {Name}<asr_text>`. The
-/// placeholders are one run from index 9.
+/// placeholders are one run starting at index `9 + context.len()`.
 ///
 /// # Errors
 ///
+/// [`AudioError::BadContext`] for more than [`MAX_CONTEXT_IDS`] context ids;
 /// [`AudioError::BadSpec`] for a forced language the model does not support
 /// (by the name the model writes, e.g. `English`, or an ISO code).
-pub fn ids(n_audio: usize, forced: Option<&str>) -> Result<Vec<u32>, AudioError> {
-    let suffix = match forced {
+pub fn ids(n_audio: usize, cond: &Conditioning<'_>) -> Result<Vec<u32>, AudioError> {
+    if cond.context.len() > MAX_CONTEXT_IDS {
+        return Err(AudioError::BadContext {
+            reason: format!(
+                "{} context ids; a prompt carries at most {MAX_CONTEXT_IDS}",
+                cond.context.len()
+            ),
+        });
+    }
+    let suffix = match cond.forced {
         None => Vec::new(),
         Some(name) => {
             let canonical = language_name(name).unwrap_or(name);
@@ -149,18 +185,10 @@ pub fn ids(n_audio: usize, forced: Option<&str>) -> Result<Vec<u32>, AudioError>
             })?
         }
     };
-    let mut out = Vec::with_capacity(FRAME_IDS + n_audio + suffix.len());
-    out.extend_from_slice(&[
-        IM_START,
-        SYSTEM,
-        NEWLINE,
-        IM_END,
-        NEWLINE,
-        IM_START,
-        USER,
-        NEWLINE,
-        AUDIO_START,
-    ]);
+    let mut out = Vec::with_capacity(FRAME_IDS + cond.context.len() + n_audio + suffix.len());
+    out.extend_from_slice(&[IM_START, SYSTEM, NEWLINE]);
+    out.extend_from_slice(cond.context);
+    out.extend_from_slice(&[IM_END, NEWLINE, IM_START, USER, NEWLINE, AUDIO_START]);
     out.extend(std::iter::repeat_n(AUDIO_PAD, n_audio));
     out.extend_from_slice(&[AUDIO_END, IM_END, NEWLINE, IM_START, ASSISTANT, NEWLINE]);
     out.extend_from_slice(&suffix);

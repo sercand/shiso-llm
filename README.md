@@ -163,6 +163,26 @@ chunk by chunk, as the load log says.
 `diarized_json`, `transcript.text.segment` events) ending in
 `transcript.text.done`.
 
+A request to the Qwen3-ASR family can also carry `keywords[]` (repeated) and
+`prompt`; they are written into its system turn as `prompt` followed by a
+`Keywords: a, b, c` line, so the model is more likely to spell those words
+the way you give them. A span whose text reads back like the keyword list -
+most of its words are keywords, or it lists three or more of them in a row -
+is decoded again without that context; the trade-off is that a span that
+genuinely speaks such a list keeps the no-context wording instead. Keywords
+and prompt together are capped by `--asr-max-context-tokens` (default 256, at
+most the recognizer's own 512) once tokenized, and by 16 KiB of raw text
+before that; an empty keyword is refused. Nemotron, or any recognizer without
+context support, refuses either with a 400 whose `param` names the field
+that was sent (`keywords`, or `prompt` when there were no keywords). With the
+OpenAI SDK, `extra_body={"keywords": [...]}` sends `keywords[]`.
+
+```sh
+curl http://127.0.0.1:8090/v1/audio/transcriptions \
+    -F model=qwen3 -F file=@meeting.m4a \
+    -F 'keywords[]=Marigold' -F 'keywords[]=Lighthouse'
+```
+
 ## Configuration
 
 Run `shiso serve --help` for every option. Each flag also reads a `SHISO_*`
@@ -195,6 +215,7 @@ environment variable. The ones you are most likely to want:
 | `--asr-batch` | Chunks an offline transcription decodes at once (default 8; 0 is refused) |
 | `--asr-skip-silence` | Leave out silences of 3 s or more that the diarizer finds in an offline transcription; they yield no text (default true; `--asr-skip-silence=false` turns it off) |
 | `--asr-offline-min-secs` | Shortest non-streaming clip transcribed offline, in seconds (default 300; 0 sends every one) |
+| `--asr-max-context-tokens` | Most tokens a transcription's `keywords` and `prompt` may take once tokenized (default 256; at most the recognizer's own cap, 512 for Qwen3-ASR) |
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
 

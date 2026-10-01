@@ -73,6 +73,26 @@ pub enum AudioError {
         /// The tag as the caller gave it.
         tag: String,
     },
+    /// The request's context cannot be carried: too long, or not encodable.
+    #[error("the context is unusable: {reason}")]
+    BadContext {
+        /// Why.
+        reason: String,
+    },
+    /// A context tokenized to more ids than a recognizer's own prompt cap
+    /// carries.
+    ///
+    /// A variant of its own rather than folded into [`Self::BadContext`]'s
+    /// free-text `reason`: a caller in front of the encoder (the server) may
+    /// enforce a lower cap of its own and needs the numbers to restate the
+    /// refusal in its own terms instead of the recognizer's internal one.
+    #[error("the context is {tokens} tokens; this model's prompt carries at most {max}")]
+    TooManyContextTokens {
+        /// How many ids the context tokenized to.
+        tokens: usize,
+        /// The recognizer's own cap.
+        max: usize,
+    },
     /// A lookahead the model was not trained for.
     #[error("lookahead {got} is not supported; this model offers {allowed:?}")]
     BadLookahead {

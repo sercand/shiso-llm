@@ -19,6 +19,7 @@ members = [
     "crates/shiso-ple",
     "crates/shiso-parsers",
     "crates/shiso-kerneltest",
+    "crates/shiso-router",
 ]
 
 [workspace.package]
@@ -60,6 +61,19 @@ tokio = { version = "1", features = ["full", "parking_lot"] }
 tokio-stream = "0.1"
 futures = "0.3"
 
+
+# --- router ----------------------------------------------------------------
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots", "json"] }
+toml = "0.8"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rand = "0.9"
+subtle = "2"
+bytes = "1"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+wiremock = "0.6"
 # --- tokenizer + chat templates -----------------------------------------
 minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "preserve_order"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
@@ -142,6 +156,7 @@ shiso-cuda = { path = "crates/shiso-cuda" }
 shiso-ple = { path = "crates/shiso-ple" }
 shiso-parsers = { path = "crates/shiso-parsers" }
 shiso-kerneltest = { path = "crates/shiso-kerneltest" }
+shiso-router = { path = "crates/shiso-router" }
 [workspace.lints.rust]
 # Safety. Four crates relax this with a crate-level
 # #![allow(unsafe_code, reason = "...")]: shiso-modelfile (mmap), shiso-metal (objc2),

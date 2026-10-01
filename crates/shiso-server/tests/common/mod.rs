@@ -30,6 +30,7 @@
 )]
 
 use std::collections::{HashMap, VecDeque};
+pub(crate) mod wer;
 use std::io;
 use std::num::NonZeroU64;
 use std::ops::Range;

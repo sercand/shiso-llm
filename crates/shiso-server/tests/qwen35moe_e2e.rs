@@ -152,7 +152,9 @@ fn args(dir: &Path, vision: bool) -> ServeArgs {
         line.extend_from_slice(&["--vision", &model]);
     }
     let cli = <Cli as clap::Parser>::try_parse_from(line).expect("the command line parses");
-    let Command::Serve(serve) = cli.command;
+    let Command::Serve(serve) = cli.command else {
+        panic!("expected Command::Serve");
+    };
     *serve
 }
 

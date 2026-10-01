@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use shiso_audio::{Framing, LogScale, Window};
 
 use super::{
-    AUDIO_PAD, Flavour, IM_END, Qwen3AsrConfig, language_name, languages, locate, mel_spec,
-    read_vocab,
+    AUDIO_PAD, Flavour, IM_END, Located, Qwen3AsrConfig, Stores, language_name, languages, locate,
+    mel_spec, read_merges, read_vocab,
 };
+use crate::audio_ops::store::TensorStore;
 
 #[expect(clippy::print_stderr, reason = "a skipped case says why on stderr")]
 pub(crate) fn say(line: &str) {
@@ -493,4 +494,91 @@ fn a_bare_relative_gguf_is_looked_for_beside_it_in_the_working_directory() {
         Path::new("gguf")
     );
     assert_eq!(super::dir_of(Path::new("/A-Q8_0.gguf")), Path::new("/"));
+}
+
+/// An opened `Stores`, cheap to build and unused by `read_merges` for
+/// `Flavour::Hf`/`Flavour::Mlx` (only the GGUF arm touches it): a stand-in so
+/// the HF/MLX cases below have a value of the right type to pass.
+fn stores_stub() -> Stores {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let gguf = dir.path().join("stub.gguf");
+    text_gguf(&gguf);
+    Stores {
+        text: TensorStore::open_gguf(&gguf).expect("opens"),
+        mmproj: None,
+    }
+}
+
+fn hf_located(dir: &Path) -> Located {
+    Located {
+        flavour: Flavour::Hf,
+        dir: dir.to_path_buf(),
+        weights: Vec::new(),
+        mmproj: None,
+        affine_group: None,
+        config: None,
+    }
+}
+
+#[test]
+fn an_hf_export_with_no_merges_file_at_all_loads_with_no_merges() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let located = hf_located(dir.path());
+    let stores = stores_stub();
+    assert_eq!(read_merges(&located, &stores).expect("no merges"), None);
+}
+
+#[test]
+fn an_hf_export_falls_back_to_tokenizer_json_when_merges_txt_is_absent() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let located = hf_located(dir.path());
+    let stores = stores_stub();
+
+    // Both shapes tokenizer.json may spell a merge entry in.
+    std::fs::write(
+        dir.path().join("tokenizer.json"),
+        r#"{"model": {"merges": ["a b", ["c", "d"]]}}"#,
+    )
+    .expect("writes");
+    assert_eq!(
+        read_merges(&located, &stores).expect("from tokenizer.json"),
+        Some(vec!["a b".to_owned(), "c d".to_owned()])
+    );
+
+    // merges.txt, once it shows up, wins over tokenizer.json and its
+    // #version header and blank lines are dropped.
+    std::fs::write(dir.path().join("merges.txt"), "#version: 0.2\ne f\n\ng h\n").expect("writes");
+    assert_eq!(
+        read_merges(&located, &stores).expect("from merges.txt"),
+        Some(vec!["e f".to_owned(), "g h".to_owned()])
+    );
+}
+
+#[test]
+fn a_malformed_merges_txt_is_refused_rather_than_treated_as_absent() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    // Not a directory: reading it as merges.txt fails with something other
+    // than NotFound, which must not be swallowed into a fallback.
+    std::fs::create_dir(dir.path().join("merges.txt")).expect("writes");
+    let located = hf_located(dir.path());
+    let stores = stores_stub();
+    let err = read_merges(&located, &stores).expect_err("a directory is not a merges file");
+    assert!(matches!(err, shiso_audio::AudioError::Io { .. }), "{err:?}");
+}
+
+#[test]
+fn a_malformed_tokenizer_json_merges_entry_is_refused() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(
+        dir.path().join("tokenizer.json"),
+        r#"{"model": {"merges": [123]}}"#,
+    )
+    .expect("writes");
+    let located = hf_located(dir.path());
+    let stores = stores_stub();
+    let err = read_merges(&located, &stores).expect_err("neither string nor pair");
+    assert!(
+        matches!(err, shiso_audio::AudioError::Checkpoint { .. }),
+        "{err:?}"
+    );
 }

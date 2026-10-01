@@ -33,7 +33,6 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::api::misc_handlers;
-use crate::auth::require_auth_middleware;
 use crate::state::AppState;
 
 /// The body ceiling, when nothing else is configured: 32 MiB.
@@ -56,9 +55,8 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 ///
 /// The layer order is the one a request travels through from the outside in:
 /// the panic catcher is outermost so it also covers the layers beneath it, CORS
-/// answers preflight before anything else has to, then the auth gate, then the
-/// body limit closest to the handlers. A body limit outside the auth gate would
-/// read a 32 MiB body from an unauthenticated client before refusing it.
+/// answers preflight before anything else has to, then the body limit closest to
+/// the handlers.
 pub fn build_router(state: Arc<AppState>) -> Router {
     // An audio upload is a file, not a JSON body, so the transcription routes
     // take their own, larger limit; the route's layer is the inner one and wins.
@@ -113,11 +111,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .method_not_allowed_fallback(misc_handlers::method_not_allowed)
         .fallback(misc_handlers::not_found)
-        .layer(DefaultBodyLimit::max(max_body_bytes()))
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&state),
-            require_auth_middleware,
-        ));
+        .layer(DefaultBodyLimit::max(max_body_bytes()));
 
     routes
         .layer(
