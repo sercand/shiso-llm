@@ -494,12 +494,15 @@ const QWEN_WRAPPING_TEMPLATE: &str = concat!(
     "{% endfor %}{% endfor %}",
 );
 
-/// A vocabulary declaring Qwen's media marker.
+/// A vocabulary declaring Qwen's media marker as an added token.
 fn qwen_vocabulary() -> Arc<Vocabulary> {
     let mut vocab = serde_json::Map::new();
     vocab.insert("<unk>".to_owned(), json!(0));
     vocab.insert("word".to_owned(), json!(1));
     vocab.insert(MediaPlacement::QWEN35.image_marker.to_owned(), json!(2));
+    vocab.insert("<|".to_owned(), json!(3));
+    vocab.insert("image_pad".to_owned(), json!(4));
+    vocab.insert("|>".to_owned(), json!(5));
     let added = vec![json!({
         "id": 2,
         "content": MediaPlacement::QWEN35.image_marker,
@@ -525,42 +528,9 @@ fn qwen_vocabulary() -> Arc<Vocabulary> {
     Arc::new(Vocabulary::from_tokenizer(inner))
 }
 
-/// A caller who writes a media marker in a message with no attached media has
-/// written standard text: the marker token passes through untouched into the prompt
-/// without raising an error.
-#[test]
-fn marker_text_in_a_media_free_message_passes_through() {
-    let renderer = PromptRenderer::new(
-        WRAPPING_TEMPLATE,
-        ToolJsonStyle::Compact,
-        wrapping_vocabulary(),
-    )
-    .expect("the tiny template compiles")
-    .with_tower(
-        &one_token_spec(),
-        MediaPlacement::GEMMA4,
-        ImageLimits::default(),
-    );
-    let request = Request::new(
-        "test",
-        vec![Message::user(format!(
-            "word {} word",
-            MediaPlacement::GEMMA4.image_marker
-        ))],
-    );
-    let prompt = renderer
-        .render(&request)
-        .expect("a media-free prompt carrying a marker token must render");
-    assert!(prompt.media.is_empty());
-    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
-    assert_eq!(ids, vec![1, MARKER, 1]);
-}
-
-/// A Qwen prompt carrying `<|image_pad|>` in text with no attached images renders
-/// successfully with the token preserved.
-#[test]
-fn qwen_image_pad_in_a_media_free_message_passes_through() {
-    let renderer = PromptRenderer::new(
+/// The Qwen renderer, with a one-token tower attached.
+fn qwen_renderer() -> PromptRenderer {
+    PromptRenderer::new(
         QWEN_WRAPPING_TEMPLATE,
         ToolJsonStyle::Compact,
         qwen_vocabulary(),
@@ -570,26 +540,14 @@ fn qwen_image_pad_in_a_media_free_message_passes_through() {
         &one_token_spec(),
         MediaPlacement::QWEN35,
         ImageLimits::default(),
-    );
-    let request = Request::new(
-        "test",
-        vec![Message::user(format!(
-            "word {} word",
-            MediaPlacement::QWEN35.image_marker
-        ))],
-    );
-    let prompt = renderer
-        .render(&request)
-        .expect("a media-free prompt carrying Qwen image_pad text must render");
-    assert!(prompt.media.is_empty());
-    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
-    assert_eq!(ids, vec![1, 2, 1]);
+    )
 }
 
-/// When media items ARE attached, marker count and item count must match.
-/// Extra marker text written into a message alongside an attached item is refused.
+/// A caller who writes a media marker into a message has written text, and
+/// the model is sent that text: neither a refusal nor a placeholder with no
+/// picture behind it, which the model reads as nothing at all.
 #[test]
-fn marker_count_mismatch_with_attached_media_is_a_request_error() {
+fn marker_text_in_a_message_is_encoded_as_text() {
     let renderer = PromptRenderer::new(
         WRAPPING_TEMPLATE,
         ToolJsonStyle::Compact,
@@ -601,23 +559,56 @@ fn marker_count_mismatch_with_attached_media_is_a_request_error() {
         MediaPlacement::GEMMA4,
         ImageLimits::default(),
     );
+    let marker = MediaPlacement::GEMMA4.image_marker;
+    let request = Request::new("test", vec![Message::user(format!("word {marker} word"))]);
+    let prompt = renderer
+        .render(&request)
+        .expect("a prompt that spells a marker in its text renders");
+    assert!(prompt.media.is_empty());
+    assert_eq!(prompt.text, format!("word {marker} word"));
+    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
+    assert!(!ids.contains(&MARKER), "{ids:?}");
+    assert_eq!(ids.first(), Some(&1));
+    assert_eq!(ids.last(), Some(&1));
+}
+
+/// The Qwen spelling, which is the report this guards: `<|image_pad|>` typed
+/// into a message reaches the model as the pieces of that text.
+#[test]
+fn qwen_image_pad_text_is_encoded_as_its_pieces() {
+    let request = Request::new(
+        "test",
+        vec![Message::user(format!(
+            "word {} word",
+            MediaPlacement::QWEN35.image_marker
+        ))],
+    );
+    let prompt = qwen_renderer()
+        .render(&request)
+        .expect("a prompt that spells a marker in its text renders");
+    assert!(prompt.media.is_empty());
+    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
+    assert_eq!(ids, vec![1, 3, 4, 5, 1]);
+}
+
+/// Marker text beside an attached picture stays text, and the picture still
+/// gets the one marker the template wrote for it.
+#[test]
+fn marker_text_beside_an_attached_picture_stays_text() {
     let request = Request::new(
         "test",
         vec![Message::new(
             Role::User,
             vec![
                 Block::Image(MediaSource::classify(png_data_uri(48, 48))),
-                Block::Text(format!("word {} word", MediaPlacement::GEMMA4.image_marker)),
+                Block::Text(format!("word {} word", MediaPlacement::QWEN35.image_marker)),
             ],
         )],
     );
-    let error = renderer
+    let prompt = qwen_renderer()
         .render(&request)
-        .expect_err("two markers for one item must be rejected");
-    assert_eq!(
-        error.status(),
-        axum::http::StatusCode::BAD_REQUEST,
-        "got {error:?}"
-    );
-    assert!(error.to_string().contains("marker"), "{error}");
+        .expect("one marker for one picture renders");
+    assert_eq!(prompt.media.len(), 1);
+    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
+    assert_eq!(ids, vec![2, 1, 3, 4, 5, 1]);
 }

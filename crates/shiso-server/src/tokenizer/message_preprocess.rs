@@ -461,29 +461,26 @@ pub fn expand_vision_pads(
 ///
 /// A marker is bracketed by its own kind's pair only: a clip has no bracket in
 /// families that have no clip marker at all, and a bracket invented for one
-/// would be a prompt shape no checkpoint was trained on. A conversation with
-/// no media attached passes through untouched, so that message text mentioning
-/// a special marker token is treated as regular text.
+/// would be a prompt shape no checkpoint was trained on.
 ///
 /// # Errors
 ///
-/// [`PadMismatch`] when media items are present and the marker count disagrees
-/// with the item count.
+/// [`PadMismatch`] when the marker count and the item count disagree.
 pub fn expand_media_pads(
     tokens: Vec<shiso_core::TokenId>,
     pad_counts: &[usize],
     pads: shiso_core::PadTokens,
     wraps: MediaWraps,
 ) -> Result<Vec<shiso_core::TokenId>, PadMismatch> {
-    if pad_counts.is_empty() {
-        return Ok(tokens);
-    }
     let markers = tokens.iter().filter(|token| pads.matches(**token)).count();
     if markers != pad_counts.len() {
         return Err(PadMismatch {
             markers,
             items: pad_counts.len(),
         });
+    }
+    if pad_counts.is_empty() {
+        return Ok(tokens);
     }
     let extra: usize = pad_counts
         .iter()
