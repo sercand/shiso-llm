@@ -296,6 +296,14 @@ pub struct ServeArgs {
     /// step waiting on the host. Read by the sparse family's arm.
     #[arg(long, env = "SHISO_CAPTURE_BATCH", default_value_t = false)]
     pub capture_batch: bool,
+    /// Preserve the ordinary target sampling distribution instead of accepting
+    /// target-matching greedy drafts directly.
+    ///
+    /// Off by default: opportunistic speculation accepts matching greedy drafts
+    /// even at non-zero temperature. When set, non-greedy sequences fall back
+    /// to ordinary batched decoding on models without a two-phase verifier.
+    #[arg(long, env = "SHISO_MTP_EXACT_SAMPLING", default_value_t = false)]
+    pub mtp_exact_sampling: bool,
     /// Keep half-precision projections as the checkpoint stores them rather
     /// than repacking them to twelve bits a weight at load.
     ///

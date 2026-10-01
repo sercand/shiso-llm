@@ -195,7 +195,7 @@ impl ModuleRegistry {
         // least the duration of this borrow; `name` is a live NUL-terminated
         // buffer for the whole call.
         let func = unsafe { nvidia::module_get_function(module.module, &name) }.map_err(|err| {
-            tracing::error!(
+            tracing::debug!(
                 module = kernel.module,
                 entry = kernel.entry,
                 error = %err,
