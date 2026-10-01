@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::decision::core::{self, Kind, RawQuestion};
-use crate::decision::decisions_wire::OptionOrChoice;
+use crate::decision::decisions_wire::{self, OptionOrChoice};
 use crate::error::AppError;
 
 /// How a decision question is answered, as the wire spells the discriminant.
@@ -150,6 +150,22 @@ impl SystemOneBody {
     /// [`AppError::BadRequest`] naming the field at fault.
     pub(crate) fn validate(self) -> Result<Vec<RawQuestion>, AppError> {
         core::check_model(self.model.as_deref())?;
+        // A content-block array as `state` is a caller error, not a document
+        // to score: pasting a base64 blob into a scored prompt is refused
+        // loudly with this surface's schema class (spec ruling 6). The
+        // predicate is the decisions wire's - one rule decides what a block
+        // array is, whichever field it arrives in.
+        if self
+            .state
+            .as_ref()
+            .is_some_and(decisions_wire::is_content_block_array)
+        {
+            return Err(AppError::SchemaViolation {
+                message: "state must be a string or a JSON container: systemone takes text only"
+                    .to_owned(),
+                at: "state".to_owned(),
+            });
+        }
         let state = self.state_text();
         // A blank state answers here — the schema allows it — so the input
         // check runs only over a state that says something, which is the
