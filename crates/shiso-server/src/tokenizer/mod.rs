@@ -335,9 +335,30 @@ impl<'a> Detokenizer<'a> {
             return Ok(String::new());
         };
         let whole = vocabulary.decode(&self.tokens)?;
+        // An incomplete multi-byte sequence at the tail decodes to U+FFFD; hold
+        // it back until subsequent tokens complete the character.
+        if whole.ends_with('\u{FFFD}') {
+            return Ok(String::new());
+        }
         // A shrinking decode is possible in principle - a vocabulary is free to
         // render a pair differently from its parts - and `get` rather than an
         // index is what keeps that a missing fragment rather than a panic.
+        let fresh = whole.get(self.emitted..).unwrap_or_default().to_owned();
+        self.emitted = whole.len();
+        Ok(fresh)
+    }
+
+    /// Delivers whatever text was held back because the tail ended with an
+    /// incomplete multi-byte character.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenizerError::Decode`] when the run so far cannot be decoded.
+    pub fn flush(&mut self) -> Result<String, TokenizerError> {
+        let Some(vocabulary) = self.vocabulary else {
+            return Ok(String::new());
+        };
+        let whole = vocabulary.decode(&self.tokens)?;
         let fresh = whole.get(self.emitted..).unwrap_or_default().to_owned();
         self.emitted = whole.len();
         Ok(fresh)
@@ -456,5 +477,83 @@ mod bos_tests {
             None,
             "a name this vocabulary does not declare resolves to no id at all",
         );
+    }
+}
+
+#[cfg(test)]
+mod detokenizer_tests {
+    use super::{Detokenizer, TokenId, Vocabulary};
+    use std::str::FromStr as _;
+
+    /// A vocabulary with byte-level pieces that split an emoji across two tokens.
+    fn byte_level_stub() -> tokenizers::Tokenizer {
+        let document = serde_json::json!({
+            "version": "1.0",
+            "truncation": serde_json::Value::Null,
+            "padding": serde_json::Value::Null,
+            "added_tokens": [],
+            "normalizer": serde_json::Value::Null,
+            "pre_tokenizer": serde_json::Value::Null,
+            "post_processor": serde_json::Value::Null,
+            "decoder": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": false,
+                "use_regex": false
+            },
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "ĠðŁĺ": 0,
+                    "Ĭ": 1,
+                    "hello": 2,
+                },
+                "merges": [],
+            },
+        })
+        .to_string();
+        tokenizers::Tokenizer::from_str(&document).expect("the stub vocabulary loads")
+    }
+
+    #[test]
+    fn multi_byte_character_is_held_back_until_completed() {
+        let tokenizer = byte_level_stub();
+        let vocabulary = Vocabulary::from_tokenizer(tokenizer);
+        let mut detok = Detokenizer::new(Some(&vocabulary));
+
+        // Token 2 is "hello"
+        let first = detok.push(TokenId::new(2)).expect("pushes hello");
+        assert_eq!(first, "hello");
+
+        // Token 0 is " " + first two bytes of emoji
+        let second = detok
+            .push(TokenId::new(0))
+            .expect("pushes incomplete byte piece");
+        assert_eq!(
+            second, "",
+            "an incomplete character at the tail produces no text"
+        );
+
+        // Token 1 completes the emoji into " 😊"
+        let third = detok.push(TokenId::new(1)).expect("completes emoji");
+        assert_eq!(
+            third, " 😊",
+            "the completed multi-byte character is delivered in full"
+        );
+    }
+
+    #[test]
+    fn incomplete_tail_is_delivered_on_flush() {
+        let tokenizer = byte_level_stub();
+        let vocabulary = Vocabulary::from_tokenizer(tokenizer);
+        let mut detok = Detokenizer::new(Some(&vocabulary));
+
+        let first = detok
+            .push(TokenId::new(0))
+            .expect("pushes incomplete byte piece");
+        assert_eq!(first, "");
+
+        let tail = detok.flush().expect("flushes tail");
+        assert_eq!(tail, " \u{FFFD}", "flushing delivers any uncompleted tail");
     }
 }
