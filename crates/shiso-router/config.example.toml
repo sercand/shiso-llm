@@ -1,0 +1,25 @@
+# shiso-router example configuration.
+# Copy to config.toml and adjust. Run with: shiso router --config config.toml
+
+# Address to listen on.
+listen = "127.0.0.1:8080"
+
+# Optional: serve the admin API + UI on a separate address. When set, the
+# /admin routes (and the UI) are served ONLY here and are absent from the
+# main listener. When omitted, admin shares `listen`.
+# admin_listen = "127.0.0.1:9090"
+
+# SQLite database file for API tokens, catalog, and request logs (created if missing).
+sqlite_path = "shiso-router.db"
+
+# Maximum accepted request body size in bytes (default 1 GiB — sized for
+# audio uploads to /v1/audio/transcriptions; bodies are buffered in memory).
+max_body_bytes = 1073741824
+
+# Admin token protecting /admin/* endpoints and the UI.
+# Provide exactly one of admin_token / admin_token_env.
+admin_token_env = "LLM_ROUTER_ADMIN_TOKEN"
+# admin_token = "not-recommended-in-files"
+
+# Backends, models, and exclusive groups are configured dynamically through
+# the admin API and Web UI (/admin/ui, /admin/backends, /admin/models, /admin/groups).

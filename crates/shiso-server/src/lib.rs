@@ -2,12 +2,11 @@
 //! them and the model.
 //!
 //! # The shape of the whole thing
-//!
-//! A request arrives at [`router`], passes the auth gate in [`auth`], and
-//! reaches a handler in [`api`]. A handler that needs a generation puts a
-//! message on the queue in [`scheduler::queue`] and awaits a stream of
-//! [`shiso_ir::StreamEvent`]. One OS thread on the other side of that queue
-//! owns the model and is the only thing that ever calls a method on it.
+//! A request arrives at [`router`] and reaches a handler in [`api`]. A
+//! handler that needs a generation puts a message on the queue in
+//! [`scheduler::queue`] and awaits a stream of [`shiso_ir::StreamEvent`]. One
+//! OS thread on the other side of that queue owns the model and is the only
+//! thing that ever calls a method on it.
 //!
 //! Everything a handler can fail with is [`error::AppError`], which renders
 //! itself in whichever wire format the surface that was asked for speaks.
@@ -22,10 +21,11 @@
 //! model.
 #![forbid(unsafe_code)]
 
+pub use shiso_router;
+
 pub mod anthropic;
 pub mod api;
 pub mod audio;
-pub mod auth;
 pub mod cli;
 pub mod error;
 pub mod ids;
@@ -70,9 +70,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     install_tracing();
     match cli.command {
         Command::Serve(args) => serve(*args).await,
+        Command::Router(args) => router(*args).await,
     }
 }
 
+/// Runs the router proxy with the given command-line arguments.
+///
+/// # Errors
+///
+/// Returns an error if the router fails to start or serve.
+async fn router(args: shiso_router::cli::RouterArgs) -> anyhow::Result<()> {
+    shiso_router::run(args).await
+}
 /// Installs the log subscriber.
 ///
 /// Failure is ignored on purpose: a subscriber is already installed when a test
@@ -112,12 +121,6 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     };
     if let Some(audio) = audio {
         state = state.with_audio(audio);
-    }
-    if let Some(auth) = auth::AuthConfig::new(args.auth_tokens()) {
-        tracing::info!(tokens = auth.token_count(), "bearer authentication is on");
-        state = state.with_auth(auth);
-    } else {
-        tracing::warn!("no bearer tokens configured; every inference route is open");
     }
 
     shutdown::install();

@@ -19,6 +19,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use shiso_parsers::{ReasoningScheme, ToolCallScheme};
+pub use shiso_router::cli::RouterArgs;
 use shiso_vision::{FfmpegPolicy, ImageLimits};
 
 /// The default listen address. Loopback, so an unconfigured server is not on the
@@ -74,6 +75,8 @@ pub struct Cli {
 pub enum Command {
     /// Serve a checkpoint over HTTP.
     Serve(Box<ServeArgs>),
+    /// Run an LLM router proxying requests to third-party or local backends.
+    Router(Box<RouterArgs>),
 }
 
 /// Everything `shiso serve` accepts.
@@ -250,18 +253,6 @@ pub struct ServeArgs {
     /// once as they finish. Zero turns the line off.
     #[arg(long, env = "SHISO_LOG_STATS_INTERVAL", default_value_t = DEFAULT_LOG_STATS_INTERVAL_SECS)]
     pub log_stats_interval: u64,
-    /// Bearer tokens that may call the inference routes, comma separated.
-    ///
-    /// `hide_env_values` is set: a token must never appear in `--help`, in a
-    /// clap error message, or in a usage dump, and clap echoes an environment
-    /// variable's *value* in all three unless told not to.
-    #[arg(
-        long,
-        env = "SHISO_AUTH_TOKENS",
-        value_delimiter = ',',
-        hide_env_values = true
-    )]
-    pub auth_tokens: Vec<String>,
     /// Replay a decode step's launches from a captured device graph.
     ///
     /// On by default, and off is a diagnostic rather than a second way to
@@ -1030,20 +1021,6 @@ impl ServeArgs {
             policy = policy.with_timeout_secs(seconds);
         }
         Some(policy)
-    }
-
-    /// The bearer tokens, with blank entries dropped.
-    ///
-    /// A trailing comma in `--auth-tokens a,b,` yields an empty string, and an
-    /// empty token would authenticate a request that sent `Authorization:
-    /// Bearer ` with nothing after it.
-    #[must_use]
-    pub fn auth_tokens(&self) -> Vec<String> {
-        self.auth_tokens
-            .iter()
-            .map(|token| token.trim().to_owned())
-            .filter(|token| !token.is_empty())
-            .collect()
     }
 }
 
