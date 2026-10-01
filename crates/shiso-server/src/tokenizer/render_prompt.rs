@@ -399,8 +399,8 @@ impl PromptRenderer {
         let tokens =
             expand_media_pads(tokens, &prepared.pad_counts, self.pads, wraps).map_err(|error| {
                 // The template writes one marker per item, so a count that
-                // disagrees came from the caller: marker text written into a
-                // message, or media in a turn the template does not render.
+                // disagrees came from the caller: extra marker text written into a
+                // message when media is attached, or media in a turn the template does not render.
                 AppError::bad_request(
                     format!(
                         "the prompt holds {} media marker(s) for {} attached item(s); a message \
