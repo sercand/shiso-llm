@@ -395,7 +395,9 @@ fn booted_nemotron() -> Option<Arc<AppState>> {
         &diar_arg,
     ];
     let cli = <Cli as clap::Parser>::try_parse_from(line).expect("the command line parses");
-    let Command::Serve(args) = cli.command;
+    let Command::Serve(args) = cli.command else {
+        panic!("expected Command::Serve");
+    };
     args.validate().expect("servable");
     let audio = shiso_server::boot_audio(&args)
         .expect("the speech models load")

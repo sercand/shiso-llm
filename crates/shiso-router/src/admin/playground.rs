@@ -14,6 +14,11 @@
 //! Transcriptions are the one non-chat, non-JSON call: the UI sends the
 //! audio base64-encoded in the same JSON request, and the console turns it
 //! into the multipart form a client SDK would send.
+//!
+//! The scoring endpoints (`/v1/decisions`, `/v1/systemone`) are the other
+//! non-chat calls: the console sends the newest user turn as `input` (or
+//! the system prompt as `state`) plus the operator's `questions` JSON
+//! array, and shows one line per scored answer.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -43,9 +48,20 @@ const ENDPOINTS: &[(&str, BackendKind)] = &[
     ("/v1/embeddings", BackendKind::Openai),
     ("/v1/messages", BackendKind::Anthropic),
     ("/v1/audio/transcriptions", BackendKind::Openai),
+    ("/v1/decisions", BackendKind::Openai),
+    ("/v1/systemone", BackendKind::Openai),
 ];
 
 const TRANSCRIPTIONS: &str = "/v1/audio/transcriptions";
+const DECISIONS: &str = "/v1/decisions";
+const SYSTEMONE: &str = "/v1/systemone";
+
+/// The decision-scoring endpoints: the console sends an `input`/`state`
+/// plus a `questions` JSON array instead of a transcript, and the reply is
+/// scored answers, not generated text.
+fn is_scoring(path: &str) -> bool {
+    path == DECISIONS || path == SYSTEMONE
+}
 
 /// `response_format` values `/v1/audio/transcriptions` accepts. Which ones a
 /// given model supports varies (`diarized_json` is only for the diarizing
@@ -107,6 +123,12 @@ pub(crate) struct PlaygroundRequest {
     /// document, so the console builds the same field.
     #[serde(default)]
     pub keywords: Option<Vec<String>>,
+    /// The questions to score, as raw JSON-array text; required by, and
+    /// only used for, the scoring endpoints. Kept as text so a malformed
+    /// array surfaces as the console's own 400 about the field, not as a
+    /// JSON error on the whole console request.
+    #[serde(default)]
+    pub questions: Option<String>,
 }
 
 /// An uploaded audio file, as the browser read it.
@@ -280,6 +302,11 @@ fn endpoint_kind(path: &str) -> Result<BackendKind, AppError> {
 }
 
 fn validate(req: &PlaygroundRequest) -> Result<(), AppError> {
+    if is_scoring(&req.path) && req.questions.as_deref().is_none_or(|q| q.trim().is_empty()) {
+        return Err(AppError::BadRequest(
+            "the scoring endpoints need a questions JSON array".into(),
+        ));
+    }
     if req.path == TRANSCRIPTIONS {
         if req.audio.is_none() {
             return Err(AppError::BadRequest(
@@ -378,13 +405,29 @@ fn build_body(req: &PlaygroundRequest) -> Result<Value, AppError> {
         "/v1/embeddings" => {
             // Not a conversation: the newest user turn is the input, and
             // the system prompt and token cap do not apply.
-            let input = req
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.role == "user")
-                .ok_or_else(|| AppError::BadRequest("embeddings need a user message".into()))?;
+            let input = newest_user(req, "embeddings")?;
             obj.insert("input".into(), json!(input.content));
+            return Ok(body);
+        }
+        DECISIONS => {
+            // Not a conversation either: the newest user turn is the
+            // input; the questions come from the console's own field.
+            // Temperature is a decisions knob, so it is forwarded.
+            let input = newest_user(req, "decisions")?;
+            obj.insert("input".into(), json!(input.content));
+            obj.insert("questions".into(), parse_questions(req)?);
+            if let Some(t) = req.temperature {
+                obj.insert("temperature".into(), json!(t));
+            }
+            return Ok(body);
+        }
+        SYSTEMONE => {
+            // The system prompt doubles as the System One `state`; a blank
+            // one is legal there, so it is sent as the empty string.
+            // Temperature is deliberately NOT forwarded: the systemone wire
+            // refuses it with any value, scoring always runs at 1.0.
+            obj.insert("state".into(), json!(system.unwrap_or("")));
+            obj.insert("questions".into(), parse_questions(req)?);
             return Ok(body);
         }
         other => return Err(AppError::BadRequest(format!("unsupported path {other:?}"))),
@@ -393,6 +436,37 @@ fn build_body(req: &PlaygroundRequest) -> Result<Value, AppError> {
         obj.insert("temperature".into(), json!(t));
     }
     Ok(body)
+}
+
+/// The newest user turn — the one field the non-conversational endpoints
+/// can read a console transcript into.
+fn newest_user<'a>(req: &'a PlaygroundRequest, what: &str) -> Result<&'a Message, AppError> {
+    req.messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .ok_or_else(|| AppError::BadRequest(format!("{what} need a user message")))
+}
+
+/// The console's questions field as the JSON array the scoring endpoints
+/// expect. Refused loudly: a scoring request without questions has nothing
+/// to score, and a malformed array is the console's error to name, not the
+/// upstream's to guess at.
+fn parse_questions(req: &PlaygroundRequest) -> Result<Value, AppError> {
+    let raw = req
+        .questions
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .ok_or_else(|| AppError::BadRequest("send a questions JSON array".into()))?;
+    let parsed: Value = serde_json::from_str(raw)
+        .map_err(|e| AppError::BadRequest(format!("questions is not valid JSON: {e}")))?;
+    if !parsed.is_array() {
+        return Err(AppError::BadRequest(
+            "questions must be a JSON array".into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Builds a transcription request the way the OpenAI SDK does: a multipart
@@ -659,6 +733,28 @@ fn extract_text(path: &str, body: &Value) -> Option<String> {
             let count = body["data"].as_array().map_or(1, Vec::len);
             Some(format!("{count} embedding vector(s), {dims} dimensions"))
         }
+        // One line per answer, in request order (the answers object is
+        // insertion-ordered): the chosen label, the yes/no word, or the
+        // expected score — whichever the answer carries. A System One
+        // noul answer's number is shown as-is.
+        DECISIONS | SYSTEMONE => {
+            let answers = body["answers"].as_object()?;
+            let lines: Vec<String> = answers
+                .iter()
+                .map(|(id, ans)| {
+                    let shown = match ans.get("choice").or_else(|| ans.get("answer")) {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(v @ Value::Number(_)) => v.to_string(),
+                        _ => ans["score"]
+                            .as_f64()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "?".to_string()),
+                    };
+                    format!("{id}: {shown}")
+                })
+                .collect();
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        }
         _ => None,
     }
 }
@@ -720,6 +816,7 @@ mod tests {
             language: None,
             response_format: None,
             keywords: None,
+            questions: None,
         }
     }
 
@@ -889,6 +986,97 @@ mod tests {
         assert!(b.get("system").is_none());
     }
 
+    /// `req(path)` with a two-question scoring array in its questions field.
+    fn with_questions(path: &str) -> PlaygroundRequest {
+        let mut r = req(path);
+        r.questions = Some(
+            r#"[{"id":"q1","type":"yes_no","question":"Is this about billing?"},
+                {"id":"q2","type":"choice","question":"What is it?","options":["a bug","a feature"]}]"#
+                .into(),
+        );
+        r
+    }
+
+    #[test]
+    fn decisions_body_sends_input_and_questions_and_forwards_temperature() {
+        let mut r = with_questions(DECISIONS);
+        r.temperature = Some(0.5);
+        validate(&r).unwrap();
+        let b = build_body(&r).unwrap();
+        assert_eq!(b["model"], "m");
+        assert_eq!(b["input"], "again", "the newest user turn is the input");
+        assert_eq!(b["questions"].as_array().unwrap().len(), 2);
+        assert_eq!(b["questions"][0]["id"], "q1");
+        assert_eq!(b["temperature"], 0.5);
+        assert!(b.get("messages").is_none());
+        assert!(b.get("max_tokens").is_none(), "scoring generates nothing");
+    }
+
+    #[test]
+    fn systemone_body_uses_state_and_never_forwards_temperature() {
+        let mut r = with_questions(SYSTEMONE);
+        r.temperature = Some(0.5);
+        validate(&r).unwrap();
+        let b = build_body(&r).unwrap();
+        assert_eq!(b["state"], "be brief", "the system prompt is the state");
+        assert_eq!(b["questions"].as_array().unwrap().len(), 2);
+        assert!(
+            b.get("temperature").is_none(),
+            "the systemone wire refuses temperature with any value"
+        );
+
+        let mut r = with_questions(SYSTEMONE);
+        r.system = Some("   ".into());
+        let b = build_body(&r).unwrap();
+        assert_eq!(b["state"], "", "a blank state is legal on this wire");
+    }
+
+    #[test]
+    fn questions_must_be_a_json_array() {
+        // Absent or blank fails validation before any dispatch.
+        let mut r = req(DECISIONS);
+        assert!(validate(&r).is_err());
+        r.questions = Some("  ".into());
+        assert!(validate(&r).is_err());
+
+        // Present-but-malformed fails at build with the field named.
+        let mut r = with_questions(DECISIONS);
+        r.questions = Some("[oops".into());
+        let err = build_body(&r).unwrap_err().to_string();
+        assert!(err.contains("questions"), "{err}");
+        let mut r = with_questions(SYSTEMONE);
+        r.questions = Some(r#"{"id":"q1"}"#.into());
+        let err = build_body(&r).unwrap_err().to_string();
+        assert!(err.contains("array"), "{err}");
+    }
+
+    #[test]
+    fn extracts_scoring_answers_one_line_each_in_order() {
+        let decisions = json!({"answers": {
+            "q1": {"type": "yes_no", "answer": "no", "probabilities": [0.02, 0.98]},
+            "q2": {"type": "choice", "choice": "a bug", "probabilities": [0.9, 0.1]},
+            "q3": {"type": "score", "score": 1.75, "legend": ["0", "1", "2"]}
+        }});
+        assert_eq!(
+            extract_text(DECISIONS, &decisions).as_deref(),
+            Some("q1: no\nq2: a bug\nq3: 1.75")
+        );
+
+        // A System One noul answer carries the yes probability as a number.
+        let systemone = json!({"answers": {
+            "": {"type": "yes_no", "answer": "yes", "confidence": 0.8},
+            "n1": {"type": "yes_no", "answer": 0.03, "confidence": 0.94}
+        }});
+        assert_eq!(
+            extract_text(SYSTEMONE, &systemone).as_deref(),
+            Some(": yes\nn1: 0.03")
+        );
+
+        // An error body or an answers-less reply degrades to no text.
+        assert_eq!(extract_text(DECISIONS, &json!({"error": {}})), None);
+        assert_eq!(extract_text(DECISIONS, &json!({"answers": {}})), None);
+    }
+
     #[test]
     fn extracts_text_per_dialect() {
         let openai = json!({"choices": [{"message": {"content": "hi there"}}]});
@@ -943,6 +1131,8 @@ mod tests {
             BackendKind::Anthropic
         );
         assert_eq!(endpoint_kind("/v1/responses").unwrap(), BackendKind::Openai);
+        assert_eq!(endpoint_kind(DECISIONS).unwrap(), BackendKind::Openai);
+        assert_eq!(endpoint_kind(SYSTEMONE).unwrap(), BackendKind::Openai);
         assert!(endpoint_kind("/v1/completions").is_err());
 
         let mut r = req("/v1/chat/completions");

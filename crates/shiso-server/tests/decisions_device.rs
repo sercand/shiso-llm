@@ -74,7 +74,9 @@ fn args(model: &Path, config: &Path) -> ServeArgs {
         "shiso", "serve", "--model", &model, "--config", &config, "--ctx", "2048",
     ];
     let cli = <Cli as clap::Parser>::try_parse_from(line).expect("the command line parses");
-    let Command::Serve(serve) = cli.command;
+    let Command::Serve(serve) = cli.command else {
+        panic!("expected Command::Serve");
+    };
     *serve
 }
 

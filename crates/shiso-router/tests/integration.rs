@@ -693,6 +693,77 @@ async fn prefixless_aliases_and_v1_suffixed_base_url() {
     assert_eq!(paths, ["/v1/messages", "/v1/responses", "/v1/responses"]);
 }
 
+/// The scoring endpoints ride the proxy like any other JSON endpoint:
+/// both path spellings reach the upstream as the canonical path, and the
+/// usage row parses in each wire's spelling (`prompt_tokens` on decisions,
+/// `input_tokens` on systemone).
+#[tokio::test]
+async fn scoring_endpoints_are_proxied_and_usage_logged() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/decisions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "decisions", "model": "gpt-test", "prompt_format_version": 1,
+            "answers": {"q1": {"type": "yes_no", "answer": "no", "probabilities": [0.02, 0.98], "label_mass": 1.0}},
+            "usage": {"prompt_tokens": 42, "completion_tokens": 0, "total_tokens": 42}
+        })))
+        .expect(2)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "gpt-test", "state": "",
+            "answers": {"q1": {"type": "yes_no", "answer": "no", "confidence": 0.96, "x_label_mass": 1.0}},
+            "usage": {"input_tokens": 17, "output_tokens": 0, "total_tokens": 17}
+        })))
+        .expect(2)
+        .mount(&mock)
+        .await;
+
+    let router = TestRouter::start(
+        &(backend_toml("b1", &mock.uri(), "k")
+            + "[[models]]\nname = \"gpt-test\"\n[[models.targets]]\nbackend = \"b1\"\n"),
+    )
+    .await;
+    let (token, _) = router.create_token().await;
+
+    for path in ["/v1/decisions", "/decisions", "/v1/systemone", "/systemone"] {
+        let resp = router
+            .client
+            .post(router.url(path))
+            .bearer_auth(&token)
+            .body(r#"{"model":"gpt-test","input":"the ticket","questions":[{"id":"q1","type":"yes_no","question":"Is this about billing?"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "POST {path}");
+    }
+
+    let mut logs = router.wait_for_logs(4).await;
+    logs.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    let paths: Vec<&str> = logs.iter().map(|r| r["path"].as_str().unwrap()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/v1/decisions",
+            "/v1/decisions",
+            "/v1/systemone",
+            "/v1/systemone"
+        ]
+    );
+    // Both usage spellings normalize to the same row shape: decisions
+    // rows carry 42 (prompt_tokens), systemone rows 17 (input_tokens).
+    let prompts: Vec<i64> = logs
+        .iter()
+        .map(|r| r["prompt_tokens"].as_i64().unwrap())
+        .collect();
+    assert_eq!(prompts, [42, 42, 17, 17], "rows: {logs:?}");
+    for row in &logs {
+        assert_eq!(row["completion_tokens"].as_i64(), Some(0));
+    }
+}
+
 #[tokio::test]
 async fn trace_header_is_not_forwarded_upstream() {
     let mock = MockServer::start().await;

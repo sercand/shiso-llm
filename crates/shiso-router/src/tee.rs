@@ -28,6 +28,12 @@ pub(crate) enum Dialect {
     OpenAiResponses,
     OpenAiEmbeddings,
     OpenAiTranscriptions,
+    /// The decision-scoring endpoints (`/v1/decisions`, `/v1/systemone`):
+    /// one prefill per question, no generated text. Their usage objects
+    /// spell the counts `prompt_tokens`/`completion_tokens` (decisions) and
+    /// `input_tokens`/`output_tokens` (systemone), both of which
+    /// `apply_openai_usage` already reads.
+    Scoring,
     Anthropic,
 }
 
@@ -41,6 +47,8 @@ impl Dialect {
             Dialect::OpenAiEmbeddings
         } else if path.ends_with("/v1/audio/transcriptions") {
             Dialect::OpenAiTranscriptions
+        } else if path.ends_with("/v1/decisions") || path.ends_with("/v1/systemone") {
+            Dialect::Scoring
         } else {
             Dialect::OpenAiChat
         }
@@ -411,6 +419,8 @@ fn apply_event(dialect: Dialect, ext: &mut Extracted, v: &Value) {
         // `{"type":"duration","seconds":…}` instead, which has no token
         // counts to record; `text`/`srt`/`vtt` bodies carry no usage at all.
         Dialect::OpenAiTranscriptions => apply_openai_usage(ext, &v["usage"]),
+        // Scoring replies have no finish reason: the answers are the reply.
+        Dialect::Scoring => apply_openai_usage(ext, &v["usage"]),
         Dialect::Anthropic => match v["type"].as_str() {
             Some("message_start") => {
                 apply_anthropic_usage(ext, &v["message"]["usage"]);
@@ -858,6 +868,32 @@ mod tests {
             &[b"1\n00:00:00,000 --> 00:00:01,000\nhi\n"],
         );
         assert_eq!(srt, Usage::default());
+    }
+
+    /// Both scoring wires record usage; they just spell the counts
+    /// differently (`prompt_tokens`/`completion_tokens` on decisions,
+    /// `input_tokens`/`output_tokens` on systemone), and neither has a
+    /// finish reason — the answers are the reply.
+    #[test]
+    fn scoring_json_bodies_record_usage_in_both_spellings() {
+        let decisions = feed(
+            Dialect::Scoring,
+            false,
+            &[br#"{"object":"decisions","answers":{"q1":{"type":"yes_no","answer":"no"}},"usage":{"prompt_tokens":42,"completion_tokens":0,"total_tokens":42}}"#],
+        );
+        assert_eq!(decisions.prompt_tokens, Some(42));
+        assert_eq!(decisions.completion_tokens, Some(0));
+        assert_eq!(decisions.total_tokens, Some(42));
+        assert_eq!(decisions.finish_reason, None);
+
+        let systemone = feed(
+            Dialect::Scoring,
+            false,
+            &[br#"{"model":"served","answers":{},"usage":{"input_tokens":17,"output_tokens":0,"total_tokens":17}}"#],
+        );
+        assert_eq!(systemone.prompt_tokens, Some(17));
+        assert_eq!(systemone.completion_tokens, Some(0));
+        assert_eq!(systemone.total_tokens, Some(17));
     }
 
     /// OpenRouter's embeddings response adds `id` and enriches `usage` with
