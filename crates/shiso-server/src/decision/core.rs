@@ -18,11 +18,14 @@ use std::sync::Arc;
 
 use futures::future::join_all;
 use shiso_core::TokenId;
-use shiso_ir::{Message, Request, ThinkingDirective};
+use shiso_core::media::MediaDigest;
+use shiso_ir::{Block, MediaSource, Message, Request, Role, ThinkingDirective};
 
 use crate::api::pipeline::remaining_budget;
+use crate::decision::decisions_wire::{DecisionInput, InputBlock, InputImageSource};
 use crate::decision::math::{label_mass, softmax};
 use crate::error::AppError;
+use crate::media::MediaItem;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
 
@@ -114,14 +117,14 @@ fn canonical(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// The prompt-format version-1 body for `input` and one question: the input's
-/// text, one blank line, then the kind's lines, with no trailing newline.
+/// The kind's question block: the lines that answer-position the prompt,
+/// without the input or the blank line that precedes them.
 ///
-/// The exact bytes are pinned by the golden tests below, and `input` is
-/// trimmed so the seam between it and the block is always exactly one blank
-/// line whatever whitespace the caller padded it with.
-pub(crate) fn prompt_body(input: &str, kind: &Kind) -> String {
-    let block = match kind {
+/// The exact bytes are pinned by the golden tests below, through
+/// [`prompt_body`] and, on the blocks path, through the whitespace goldens in
+/// `tests/decisions.rs`.
+pub(crate) fn question_block(kind: &Kind) -> String {
+    match kind {
         Kind::Choice { question, options } => {
             let mut lines = Vec::with_capacity(options.len() + 2);
             if !question.trim().is_empty() {
@@ -169,7 +172,17 @@ pub(crate) fn prompt_body(input: &str, kind: &Kind) -> String {
             lines.push("Answer with yes or no only.".to_string());
             lines.join("\n")
         }
-    };
+    }
+}
+
+/// The prompt-format version-1 body for `input` and one question: the input's
+/// text, one blank line, then the kind's lines, with no trailing newline.
+///
+/// The exact bytes are pinned by the golden tests below, and `input` is
+/// trimmed so the seam between it and the block is always exactly one blank
+/// line whatever whitespace the caller padded it with.
+pub(crate) fn prompt_body(input: &str, kind: &Kind) -> String {
+    let block = question_block(kind);
     let mut body = String::with_capacity(input.len() + block.len() + 2);
     body.push_str(input.trim());
     body.push_str("\n\n");
@@ -655,6 +668,44 @@ pub(crate) struct PreparedQuestion {
     pub prompt_tokens: Vec<TokenId>,
     /// The label ids, in the question's own label order.
     pub labels: Vec<TokenId>,
+    /// The decoded media the prompt refers to, in prompt order. Empty for a
+    /// text prompt - the same fact the scheduler reads to decide whether the
+    /// encode step runs.
+    pub media: Arc<[MediaItem]>,
+    /// One digest per item of `media`, in the same order.
+    pub media_digests: Arc<[MediaDigest]>,
+}
+
+/// The IR message a content-block `input` becomes: the caller's blocks in
+/// order, then one final text part carrying the question block.
+///
+/// Text parts are verbatim - the template concatenates parts with no
+/// delimiter, so the caller's spacing is the spacing. The final part's
+/// whitespace is pinned (spec §2): the blank line the string path puts
+/// between input and block survives only when the caller's last block is
+/// text; after a picture the pad run already ends the text side, and the
+/// block follows plain.
+fn blocks_message(blocks: &[InputBlock], kind: &Kind) -> Message {
+    let mut parts: Vec<Block> = blocks
+        .iter()
+        .map(|block| match block {
+            InputBlock::Text { text } => Block::Text(text.clone()),
+            InputBlock::Image(InputImageSource::Base64 { data, .. }) => {
+                Block::Image(MediaSource::Inline(data.clone()))
+            }
+            InputBlock::Image(InputImageSource::Url { url }) => {
+                Block::Image(MediaSource::Remote(url.clone()))
+            }
+        })
+        .collect();
+    let wording = question_block(kind);
+    let question_text = if matches!(blocks.last(), Some(InputBlock::Text { .. })) {
+        format!("\n\n{wording}")
+    } else {
+        wording
+    };
+    parts.push(Block::Text(question_text));
+    Message::new(Role::User, parts)
 }
 
 /// Renders one question over the shared input and proves the labels are
@@ -665,6 +716,13 @@ pub(crate) struct PreparedQuestion {
 /// that split into two tokens could not be read from one row, two labels that
 /// reached the same token could never be told apart, and a label that only
 /// re-tokenized the prompt's last chunk would score the wrong position.
+///
+/// `input` is the decisions wire's split: the text arm renders today's
+/// version-1 body byte for byte, the blocks arm renders the caller's parts
+/// with the question block appended per the spec's whitespace rule. A media
+/// prompt skips the full-text re-encode (its text spells one marker where its
+/// ids hold a pad run) and proves the seam against the tail after the last
+/// span instead.
 ///
 /// `want_token_ids` is not needed to prepare - the id lists are assembled
 /// with the answer - but the signature keeps it so both surfaces of the
@@ -680,7 +738,7 @@ pub(crate) struct PreparedQuestion {
 /// prompt leaves no room to read an answer.
 pub(crate) fn prepare_question(
     state: &AppState,
-    input: &str,
+    input: &DecisionInput,
     question: &RawQuestion,
     kwargs: &TemplateKwargs,
     _want_token_ids: bool,
@@ -693,10 +751,11 @@ pub(crate) fn prepare_question(
     })?;
     let vocabulary = renderer.vocabulary();
 
-    let mut request = Request::new(
-        state.model_id.clone(),
-        vec![Message::user(prompt_body(input, &question.kind))],
-    );
+    let message = match input {
+        DecisionInput::Text(text) => Message::user(prompt_body(text, &question.kind)),
+        DecisionInput::Blocks(blocks) => blocks_message(blocks, &question.kind),
+    };
+    let mut request = Request::new(state.model_id.clone(), vec![message]);
     // Scoring reads the first row after the question block. A thinking block
     // would open *at* the answer position and the row would score a reasoning
     // token, so Off is not a preference here - it is what the answer is.
@@ -705,24 +764,47 @@ pub(crate) fn prepare_question(
     let prompt = renderer.render(&request)?;
 
     let name = question_name(&question.id);
-    let plain = vocabulary
-        .encode(&prompt.text, false)
-        .map_err(|error| AppError::internal("re-encoding the rendered prompt", error))?;
-    // The renderer's ids are this re-encode plus, when the checkpoint has an
-    // opening token and the template did not write it, that token in front.
-    // Anything else means the text the engine would score is not the text
-    // that was checked, and no answer from it means what the labels say.
-    let expected: &[TokenId] = match (vocabulary.bos(), prompt.tokens.split_first()) {
-        (Some(bos), Some((first, rest))) if *first == bos && plain.first() != Some(&bos) => rest,
-        _ => &prompt.tokens,
+    // The seam the answer is read at: the prompt's tail text and the ids
+    // beside it. Without media the tail is the whole prompt, and the whole
+    // prompt must first survive re-encoding - the text the caller is told
+    // about and the ids the engine reads must be one object. With media the
+    // text spells one marker where the ids hold a whole pad run, so the
+    // full-text re-encode cannot match by construction and is skipped; the
+    // tail after the last span is where text and ids agree again, and the
+    // proof needs only the spans - `core` never sees a marker string.
+    let (tail_text, tail_tokens): (&str, Vec<TokenId>) = if prompt.media.is_empty() {
+        let plain = vocabulary
+            .encode(&prompt.text, false)
+            .map_err(|error| AppError::internal("re-encoding the rendered prompt", error))?;
+        // The renderer's ids are this re-encode plus, when the checkpoint has
+        // an opening token and the template did not write it, that token in
+        // front. Anything else means the text the engine would score is not
+        // the text that was checked, and no answer from it means what the
+        // labels say.
+        let expected: &[TokenId] = match (vocabulary.bos(), prompt.tokens.split_first()) {
+            (Some(bos), Some((first, rest))) if *first == bos && plain.first() != Some(&bos) => {
+                rest
+            }
+            _ => &prompt.tokens,
+        };
+        if plain != expected {
+            return Err(AppError::bad_request(
+                format!("{name}: the rendered prompt did not survive re-encoding"),
+                Some("questions"),
+                "invalid_request",
+            ));
+        }
+        (prompt.text.as_str(), plain)
+    } else {
+        let last = prompt
+            .media_spans
+            .last()
+            .expect("a prompt that rendered media reports its spans");
+        (
+            &prompt.text[last.text.end..],
+            prompt.tokens[last.tokens.end..].to_vec(),
+        )
     };
-    if plain != expected {
-        return Err(AppError::bad_request(
-            format!("{name}: the rendered prompt did not survive re-encoding"),
-            Some("questions"),
-            "invalid_request",
-        ));
-    }
 
     let mut labels: Vec<TokenId> = Vec::new();
     let mut words: Vec<String> = Vec::new();
@@ -750,12 +832,13 @@ pub(crate) fn prepare_question(
             ));
         }
         // The answer position reads one token: the label must follow the
-        // rendered prompt as exactly that token, not re-tokenize together
-        // with whatever the template ended with.
-        let mut following = plain.clone();
+        // prompt's tail as exactly that token, not re-tokenize together with
+        // whatever the tail ended with - the tail being the whole prompt
+        // without media, and the text after the last item's marker with it.
+        let mut following = tail_tokens.clone();
         following.push(*only);
         let joined = vocabulary
-            .encode(&format!("{}{}", prompt.text, label), false)
+            .encode(&format!("{tail_text}{label}"), false)
             .map_err(|error| AppError::internal("encoding a label after the prompt", error))?;
         if joined != following {
             return Err(AppError::bad_request(
@@ -785,6 +868,8 @@ pub(crate) fn prepare_question(
         probability_answer: question.probability_answer,
         prompt_tokens: prompt.tokens,
         labels,
+        media: Arc::from(prompt.media),
+        media_digests: Arc::from(prompt.digests),
     })
 }
 
@@ -835,10 +920,16 @@ pub(crate) async fn run_questions(
 ) -> Result<Vec<Answered>, AppError> {
     let engine = state.engine()?;
     let scored = join_all(prepared.into_iter().map(|question| {
-        let scored = engine.score(ScoreRequest::new(
-            Arc::from(question.prompt_tokens.clone()),
-            Arc::from(question.labels.clone()),
-        ));
+        // Always through `with_media`: empty arcs are a refcount pair and
+        // the scheduler's encode step skips on an empty list, so a text
+        // question's request is the same request it was before.
+        let scored = engine.score(
+            ScoreRequest::new(
+                Arc::from(question.prompt_tokens.clone()),
+                Arc::from(question.labels.clone()),
+            )
+            .with_media(question.media.clone(), question.media_digests.clone()),
+        );
         async move {
             let outcome = scored.await?;
             let probabilities = softmax(&outcome.label_logprobs, temperature);

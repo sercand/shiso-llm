@@ -51,6 +51,9 @@ pub(crate) fn encode(
         entry.insert("probabilities".to_owned(), json!(answer.probabilities));
         entry.insert("label_mass".to_owned(), json!(answer.label_mass));
         if want_token_ids {
+            // The ids are the ones the model read: with media they include
+            // the expanded pad runs, and their count is the prompt side of
+            // `usage.prompt_tokens` (spec §5).
             entry.insert(
                 "prompt_token_ids".to_owned(),
                 json!(answer.prompt_token_ids),

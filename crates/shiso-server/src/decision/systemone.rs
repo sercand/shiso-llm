@@ -31,6 +31,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse as _, Response};
 
 use crate::decision::core::{TemplateKwargs, prepare_question, run_questions};
+use crate::decision::decisions_wire;
 use crate::decision::systemone_encode::encode;
 use crate::decision::systemone_wire::{self, SystemOneBody};
 use crate::error::AppError;
@@ -84,14 +85,11 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     // refused are gone, so temperature is 1 and no caller asked for token
     // ids — `false` here because nothing can have said otherwise.
     let mut prepared = Vec::with_capacity(questions.len());
+    // This surface's schema refuses content-block arrays outright, so its
+    // state is always the text arm of the shared preparation input.
+    let input = decisions_wire::DecisionInput::Text(state_text.clone());
     for question in &questions {
-        prepared.push(prepare_question(
-            state,
-            &state_text,
-            question,
-            &kwargs,
-            false,
-        )?);
+        prepared.push(prepare_question(state, &input, question, &kwargs, false)?);
     }
     let answers = run_questions(state, prepared, 1.0, false).await?;
     let total_input_tokens = answers.iter().map(|answer| answer.prompt_tokens).sum();

@@ -33,6 +33,7 @@ use shiso_server::state::AppState;
 use shiso_server::tokenizer::Vocabulary;
 use shiso_server::tokenizer::jinja_helpers::ToolJsonStyle;
 use shiso_server::tokenizer::render_prompt::PromptRenderer;
+use shiso_vision::{ImageLimits, MediaPlacement};
 use tower::ServiceExt as _;
 
 /// The fake model's logits width: a scripted row must cover every logit the
@@ -1033,4 +1034,380 @@ async fn an_overloaded_engine_surfaces_as_503() {
     gate.open();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"]["code"], "server_overloaded");
+}
+
+// --- image content blocks: the scored media path -----------------------------
+
+/// The image marker's id in `media_vocabulary`: past every word of `WORDS`
+/// and inside the scripted row's width.
+const PAD: u32 = 40;
+
+/// The vocabulary the media tests render with: every word of `WORDS` plus
+/// Qwen's image marker as a declared added token. Added rather than ordinary
+/// because that is what lets the renderer fan one marker out to a pad run.
+fn media_vocabulary() -> Arc<Vocabulary> {
+    let mut vocab = serde_json::Map::new();
+    for (id, text) in WORDS.iter().enumerate() {
+        vocab.insert((*text).to_owned(), json!(id));
+    }
+    vocab.insert(MediaPlacement::QWEN35.image_marker.to_owned(), json!(PAD));
+    let added = vec![json!({
+        "id": PAD,
+        "content": MediaPlacement::QWEN35.image_marker,
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": false,
+        "special": true,
+    })];
+    let document = json!({
+        "version": "1.0",
+        "truncation": Value::Null,
+        "padding": Value::Null,
+        "added_tokens": added,
+        "normalizer": Value::Null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": Value::Null,
+        "decoder": Value::Null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
+    })
+    .to_string();
+    let inner = tokenizers::Tokenizer::from_str(&document).expect("the media vocabulary loads");
+    Arc::new(Vocabulary::from_tokenizer(inner))
+}
+
+/// `TEMPLATE` with the image branch a family's template carries: one marker
+/// per picture, text parts verbatim. For a text-only message it renders
+/// byte-identically to `TEMPLATE`.
+const MEDIA_TEMPLATE: &str = concat!(
+    "{% for m in messages %}<|{{ m.role }}|> ",
+    "{% for part in m.content %}",
+    "{% if part.type == 'image' %}<|image_pad|>{% else %}{{ part.text }}{% endif %}",
+    "{% endfor %} <|end|> ",
+    "{% endfor %}<|assistant|>\n",
+);
+
+/// [`GLUED_TEMPLATE`] with the same image branch.
+const GLUED_MEDIA_TEMPLATE: &str = concat!(
+    "{% for m in messages %}<|{{ m.role }}|> ",
+    "{% for part in m.content %}",
+    "{% if part.type == 'image' %}<|image_pad|>{% else %}{{ part.text }}{% endif %}",
+    "{% endfor %} <|end|> ",
+    "{% endfor %}<|assistant|>Answer",
+);
+
+/// A server in the shape a `--vision` server has: a renderer with the tower's
+/// geometry attached, and an engine holding a fake tower and a model that can
+/// read media. `glued` picks the template whose prompt swallows a label.
+fn media_state(rows: Vec<Vec<f32>>, ctx: u32, glued: bool) -> (Arc<AppState>, Arc<common::Audit>) {
+    let vocabulary = media_vocabulary();
+    let (engine, _join, audit, _media_calls) =
+        common::fake_media_engine(rows, Some(Arc::clone(&vocabulary)), false);
+    let template = if glued {
+        GLUED_MEDIA_TEMPLATE
+    } else {
+        MEDIA_TEMPLATE
+    };
+    let renderer = PromptRenderer::new(template, ToolJsonStyle::Compact, Arc::clone(&vocabulary))
+        .expect("the media template compiles")
+        .with_tower(
+            &common::media_spec(),
+            MediaPlacement::QWEN35,
+            ImageLimits::default(),
+        );
+    let state = Arc::new(
+        AppState::new(engine, "test-model".to_owned(), ctx)
+            .with_vocabulary(vocabulary)
+            .with_renderer(Arc::new(renderer)),
+    );
+    (state, audit)
+}
+
+/// One base64 image block as the wire spells it.
+fn image_block(data: &str) -> Value {
+    json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}})
+}
+
+/// The ids the model should read for a media prompt: the rendered text
+/// encoded through the media vocabulary, with every marker occurrence fanned
+/// out to `pads` pad ids - the expansion the renderer owes the prompt.
+fn expanded_ids(vocabulary: &Arc<Vocabulary>, text_with_markers: &str, pads: usize) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for token in vocabulary
+        .encode(text_with_markers, false)
+        .expect("the prompt encodes")
+    {
+        if token.get() == PAD {
+            ids.extend(std::iter::repeat_n(PAD, pads));
+        } else {
+            ids.push(token.get());
+        }
+    }
+    ids
+}
+
+/// The yes/no question block, as `prompt_body` spells it for this body.
+const YES_NO_BLOCK: &str = "Is the following true? ready\nAnswer with yes or no only.";
+
+#[tokio::test]
+async fn an_image_request_scores_the_expanded_prompt() {
+    // Whitespace golden 1: the caller's blocks come first, the question block
+    // last, joined by the pinned blank line because the last caller block is
+    // text. The marker reaches the model fanned to its pad run.
+    let png = common::png_data_uri(96, 96);
+    let (state, audit) = media_state(vec![row_with(0.5, &[])], CTX, false);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [image_block(&png), {"type": "text", "text": "urgent?"}],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let want = expanded_ids(
+        &media_vocabulary(),
+        &format!("<|user|> <|image_pad|>urgent?\n\n{YES_NO_BLOCK} <|end|> <|assistant|>\n"),
+        4,
+    );
+    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
+    assert_eq!(
+        got,
+        vec![want],
+        "the model read one marker fanned to four pads, the question block last: {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_trailing_image_block_pins_the_question_block_without_a_blank_line() {
+    // Whitespace golden 2: the last caller block is an image, so the question
+    // block follows the marker as plain wording - no blank line, because the
+    // pad run already ends the text side of the seam.
+    let png = common::png_data_uri(96, 96);
+    let (state, audit) = media_state(vec![row_with(0.5, &[])], CTX, false);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [{"type": "text", "text": "urgent?"}, image_block(&png)],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let want = expanded_ids(
+        &media_vocabulary(),
+        &format!("<|user|> urgent?<|image_pad|>{YES_NO_BLOCK} <|end|> <|assistant|>\n"),
+        4,
+    );
+    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
+    assert_eq!(
+        got,
+        vec![want],
+        "the question block followed the marker with no blank line: {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_image_only_input_is_valid() {
+    // "Blank" means no text *and* no images (spec ruling 2): a picture alone
+    // is a thing to score.
+    let png = common::png_data_uri(96, 96);
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX, false);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [image_block(&png)],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn the_round_trip_check_is_skipped_with_media_and_enforced_without() {
+    // With media the text spells one marker where the ids hold a whole pad
+    // run, so the full-text re-encode cannot match by construction - and the
+    // request still scores, because the seam check carries the proof instead.
+    let png = common::png_data_uri(96, 96);
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX, false);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [image_block(&png), {"type": "text", "text": "urgent?"}],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Without media, a marker typed into the input is text: the ids the
+    // engine would read are not the re-encode of the text the caller is
+    // told about, and the shared round-trip refusal still fires.
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX, false);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": "the input <|image_pad|>",
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("did not survive re-encoding")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_seam_check_still_refuses_a_glued_label_with_media() {
+    // Review Focus 4: the seam proof moves to the tail after the last span,
+    // it does not switch off. A template that ends the prompt on a word
+    // swallows the label whatever the prompt began with.
+    let png = common::png_data_uri(96, 96);
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX, true);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [{"type": "text", "text": "urgent?"}, image_block(&png)],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("yes") && message.contains("one fresh token")),
+        "the refusal must name the label and the proof: {body}"
+    );
+
+    // Two adjacent images: the proof runs against the tail after the second
+    // marker, and the glued tail swallows the label just the same.
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [image_block(&png), image_block(&png)],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("one fresh token")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn an_over_budget_image_is_a_context_overflow() {
+    // The context guard measures the expanded prompt, so a picture's pad run
+    // is charged like any other text - and blamed on `input`.
+    let png = common::png_data_uri(96, 96);
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], 12, false);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [image_block(&png)],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "context_length_exceeded", "{body}");
+    assert_eq!(body["error"]["param"], "input", "{body}");
+}
+
+#[tokio::test]
+async fn return_prompt_token_ids_with_media_returns_expanded_ids() {
+    // Review Focus 5: the ids a caller gets back are the ids the model read,
+    // pad runs included, so their count is the usage number.
+    let png = common::png_data_uri(96, 96);
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX, false);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [image_block(&png), {"type": "text", "text": "urgent?"}],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "return_prompt_token_ids": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<u64> = answer_of(&body, "q1")["prompt_token_ids"]
+        .as_array()
+        .expect("the answer carries its prompt ids")
+        .iter()
+        .map(|id| id.as_u64().expect("an id is a number"))
+        .collect();
+    let usage = body["usage"]["prompt_tokens"].as_u64().expect("usage");
+    assert_eq!(
+        u64::try_from(ids.len()).expect("a prompt fits"),
+        usage,
+        "the returned ids are the usage number"
+    );
+    assert!(
+        ids.windows(4).any(|window| window == [u64::from(PAD); 4]),
+        "the pad run is in the returned ids: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_remote_image_url_is_refused_without_the_flag() {
+    // The renderer's policy refusal is now reachable from decisions: the
+    // block parses, and the render is where the operator's flag is missed.
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX, false);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [
+                    {"type": "text", "text": "urgent?"},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}},
+                ],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--vision-allow-remote-images")),
+        "the refusal must name the flag: {body}"
+    );
 }
