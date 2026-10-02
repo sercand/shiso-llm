@@ -152,6 +152,9 @@ struct Rope4dArgs {
     /// Elements per token row: packed tensors pass `heads * head_dim`, a fused
     /// qkv row passes its full width, so `RoPE` runs in place on fused rows.
     row_stride: u32,
+    /// Where the q and k head sections start inside a row (elements).
+    q_offset: u32,
+    k_offset: u32,
 }
 
 #[repr(C)]
@@ -174,6 +177,11 @@ struct SdpaArgs {
     img_stride: u32,
     /// Elements per cached row (a cached fused-qkv row is wider than a head).
     cache_stride: u32,
+    /// Where the q/k/v head sections start inside a row (elements); zero for
+    /// packed (non-fused) bindings.
+    q_offset: u32,
+    k_offset: u32,
+    v_offset: u32,
 }
 
 #[repr(C)]
@@ -227,9 +235,9 @@ const _: () = assert!(size_of::<NormArgs>() == 12);
 const _: () = assert!(size_of::<QkNormArgs>() == 20);
 const _: () = assert!(size_of::<ConcatArgs>() == 12);
 const _: () = assert!(size_of::<GroupNormArgs>() == 20);
-const _: () = assert!(size_of::<Rope4dArgs>() == 20);
+const _: () = assert!(size_of::<Rope4dArgs>() == 28);
 const _: () = assert!(size_of::<RopeHalfArgs>() == 12);
-const _: () = assert!(size_of::<SdpaArgs>() == 32);
+const _: () = assert!(size_of::<SdpaArgs>() == 44);
 const _: () = assert!(size_of::<GqaArgs>() == 16);
 const _: () = assert!(size_of::<Conv2dArgs>() == 44);
 const _: () = assert!(size_of::<AxpyArgs>() == 8);
@@ -265,6 +273,14 @@ pub(crate) struct GemmCall<'a> {
 }
 
 /// Joint-sequence scaled dot-product attention (the transformer's blocks).
+///
+/// Fused-row contract (Task 3): every q/k/v binding is a buffer of token rows
+/// `stride` elements wide, and `q_offset`/`k_offset`/`v_offset` give where the
+/// q, k and v head sections start inside a row. The transformer passes one
+/// fused qkv view three times with offsets `0`, `heads * head_dim` and
+/// `2 * heads * head_dim`; the VAE passes separate packed tensors with all
+/// offsets zero. Head `h` of a row starts at `row * stride + offset +
+/// h * head_dim`. The cached rows carry the same layout as the live rows.
 pub(crate) struct SdpaCall<'a> {
     pub step: &'static str,
     pub out_txt: DeviceView<'a>,
@@ -275,6 +291,10 @@ pub(crate) struct SdpaCall<'a> {
     pub q_img: DeviceView<'a>,
     pub k_img: DeviceView<'a>,
     pub v_img: DeviceView<'a>,
+    /// Where the q/k/v head sections start inside a row (elements).
+    pub q_offset: usize,
+    pub k_offset: usize,
+    pub v_offset: usize,
     /// Cached reference-token keys/values, attended between the txt and img
     /// rows (the reference's `[txt, cached_ref, img]` key order);
     /// `cache_tokens == 0` binds the dummy. Softmax is order-invariant, so
@@ -430,6 +450,15 @@ pub(crate) struct UpsampleCall<'a> {
 }
 
 /// 4-axis interleaved `RoPE` applied to Q and K in one launch.
+///
+/// Fused-row contract (Task 3): the q and k bindings are token-row buffers
+/// `row_stride` elements wide, and `q_offset`/`k_offset` give where the q and
+/// k head sections start inside a row. The transformer binds the same fused
+/// qkv buffer twice with offsets `0` and `heads * head_dim`, so one launch
+/// rotates each section exactly once and the v section (which no offset
+/// points at) is never touched; packed separate q/k tensors pass zero for
+/// both. Head `h` of a row starts at `row * row_stride + offset +
+/// h * head_dim`.
 pub(crate) struct Rope4dCall<'a> {
     pub step: &'static str,
     pub q: DeviceView<'a>,
@@ -443,6 +472,9 @@ pub(crate) struct Rope4dCall<'a> {
     pub freqs_per_axis: usize,
     /// Elements per token row of the q/k buffers.
     pub row_stride: usize,
+    /// Where the q and k head sections start inside a row (elements).
+    pub q_offset: usize,
+    pub k_offset: usize,
 }
 
 /// Embedding gather: `tokens` rows of a BF16 table, widened to f32 on write.
@@ -1083,6 +1115,11 @@ impl Ops {
 
     /// Joint non-causal attention over [text; image] with optional cached
     /// reference keys/values, reading strided fused-qkv rows where asked.
+    ///
+    /// The launch layout (three q/k/v bindings per stream plus the cache, and
+    /// `SdpaArgs` with the section offsets) is the Task-3 kernel contract: a
+    /// kernel must read head `h` of a row at `row * stride + offset +
+    /// h * head_dim` for each operand's own offset.
     pub(crate) fn sdpa(&self, call: &SdpaCall<'_>) -> Result<(), ImageGenError> {
         if self.host_fallback {
             return self.sdpa_host(call);
@@ -1096,6 +1133,9 @@ impl Ops {
             txt_stride: call.txt_stride as u32,
             img_stride: call.img_stride as u32,
             cache_stride: call.cache_stride as u32,
+            q_offset: call.q_offset as u32,
+            k_offset: call.k_offset as u32,
+            v_offset: call.v_offset as u32,
         };
         let cache_k = if call.cache_tokens == 0 {
             self.dummy.view()
@@ -1160,19 +1200,27 @@ impl Ops {
             )
         };
         // Row accessor: strided fused rows for txt/img, packed rows for cache.
+        // Each operand reads its own head section at its binding's offset -
+        // the transformer binds one fused buffer three times, and reading k
+        // or v from the q offset would silently compute `softmax(q q^T) q`.
+        // The outputs accumulate host-side and go back in one upload each:
+        // a copy per (token, head) is millions of round-trips per generation.
+        let width = call.heads * hd;
+        let mut out_txt = vec![0f32; txt * width];
+        let mut out_img = vec![0f32; img * width];
         for h in 0..call.heads {
             for t in 0..(txt + img) {
                 let (qsrc, qrow) = if t < txt {
-                    (&q_txt, t * call.txt_stride + h * hd)
+                    (&q_txt, t * call.txt_stride + call.q_offset + h * hd)
                 } else {
-                    (&q_img, (t - txt) * call.img_stride + h * hd)
+                    (&q_img, (t - txt) * call.img_stride + call.q_offset + h * hd)
                 };
                 let mut scores = Vec::with_capacity(txt + img + call.cache_tokens);
                 for s in 0..(txt + img) {
                     let (ksrc, krow) = if s < txt {
-                        (&k_txt, s * call.txt_stride + h * hd)
+                        (&k_txt, s * call.txt_stride + call.k_offset + h * hd)
                     } else {
-                        (&k_img, (s - txt) * call.img_stride + h * hd)
+                        (&k_img, (s - txt) * call.img_stride + call.k_offset + h * hd)
                     };
                     let mut dot = 0f32;
                     for d in 0..hd {
@@ -1181,7 +1229,7 @@ impl Ops {
                     scores.push(dot * scale);
                 }
                 for s in 0..call.cache_tokens {
-                    let krow = s * call.cache_stride + h * hd;
+                    let krow = s * call.cache_stride + call.k_offset + h * hd;
                     let mut dot = 0f32;
                     for d in 0..hd {
                         dot += qsrc[qrow + d] * cache_k[krow + d];
@@ -1198,16 +1246,16 @@ impl Ops {
                 let mut acc = vec![0f32; hd];
                 for (s, &p) in scores.iter().enumerate().take(txt + img) {
                     let (vsrc, vrow) = if s < txt {
-                        (&v_txt, s * call.txt_stride + h * hd)
+                        (&v_txt, s * call.txt_stride + call.v_offset + h * hd)
                     } else {
-                        (&v_img, (s - txt) * call.img_stride + h * hd)
+                        (&v_img, (s - txt) * call.img_stride + call.v_offset + h * hd)
                     };
                     for d in 0..hd {
                         acc[d] += p * vsrc[vrow + d];
                     }
                 }
                 for (s, &p) in scores.iter().enumerate().skip(txt + img) {
-                    let vrow = (s - (txt + img)) * call.cache_stride + h * hd;
+                    let vrow = (s - (txt + img)) * call.cache_stride + call.v_offset + h * hd;
                     for d in 0..hd {
                         acc[d] += p * cache_v[vrow + d];
                     }
@@ -1215,16 +1263,19 @@ impl Ops {
                 for v in &mut acc {
                     *v *= inv;
                 }
-                let dst = if t < txt { call.out_txt } else { call.out_img };
-                let row = if t < txt { t } else { t - txt };
-                let bytes: Vec<u8> = acc.iter().flat_map(|v| (v).to_le_bytes()).collect();
-                let view = dst
-                    .slice((row * call.heads * hd + h * hd) as u64 * 4, (hd as u64) * 4)
-                    .map_err(fail(call.step))?;
-                self.backend
-                    .copy_h2d(view, &bytes)
-                    .map_err(fail(call.step))?;
+                if t < txt {
+                    out_txt[t * width + h * hd..t * width + h * hd + hd].copy_from_slice(&acc);
+                } else {
+                    let row = t - txt;
+                    out_img[row * width + h * hd..row * width + h * hd + hd].copy_from_slice(&acc);
+                }
             }
+        }
+        if txt > 0 {
+            self.write_back(call.step, call.out_txt, &out_txt)?;
+        }
+        if img > 0 {
+            self.write_back(call.step, call.out_img, &out_img)?;
         }
         Ok(())
     }
@@ -1303,9 +1354,14 @@ impl Ops {
         if self.host_fallback {
             let freqs = self.download(call.step, call.freqs, call.freqs_per_axis * 4)?;
             let positions = self.download(call.step, call.positions, call.tokens * 4)?;
-            for tensor in [call.q, call.k] {
+            // Rotate the q section from the q binding and the k section from
+            // the k binding, each exactly once. The transformer binds the same
+            // fused buffer to both with different offsets, so the second pass
+            // re-reads the buffer the first wrote and rotates only the k
+            // section - q is never rotated twice and v is never touched.
+            for (tensor, offset) in [(call.q, call.q_offset), (call.k, call.k_offset)] {
                 let mut x = self.download(call.step, tensor, call.tokens * call.row_stride)?;
-                rope_4d_host(&mut x, &positions, &freqs, call);
+                rope_4d_host(&mut x, &positions, &freqs, call, offset);
                 self.write_back(call.step, tensor, &x)?;
             }
             return Ok(());
@@ -1316,6 +1372,8 @@ impl Ops {
             head_dim: call.head_dim as u32,
             freqs_per_axis: call.freqs_per_axis as u32,
             row_stride: call.row_stride as u32,
+            q_offset: call.q_offset as u32,
+            k_offset: call.k_offset as u32,
         };
         self.launch(
             call.step,
@@ -1657,13 +1715,22 @@ fn rms_scale_head(row: &mut [f32], scale: &[f32], eps: f32) {
     }
 }
 
-/// Host twin of `kernel_flux2_rope_4d`: interleaved pairs within each axis.
-fn rope_4d_host(x: &mut [f32], positions: &[f32], freqs: &[f32], geom: &Rope4dCall<'_>) {
+/// Host twin of `kernel_flux2_rope_4d`: interleaved pairs within each axis,
+/// rotated in place on the `heads * head_dim` head section that starts
+/// `section_offset` elements into each row (the q or k section of a fused
+/// qkv row, or offset 0 of a packed tensor).
+fn rope_4d_host(
+    x: &mut [f32],
+    positions: &[f32],
+    freqs: &[f32],
+    geom: &Rope4dCall<'_>,
+    section_offset: usize,
+) {
     let axes = 4;
     let axis_dim = geom.head_dim / axes;
     for t in 0..geom.tokens {
         for h in 0..geom.heads {
-            let row = t * geom.row_stride + h * geom.head_dim;
+            let row = t * geom.row_stride + section_offset + h * geom.head_dim;
             for a in 0..axes {
                 let pos = positions[t * 4 + a];
                 for j in 0..geom.freqs_per_axis {

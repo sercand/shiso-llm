@@ -27,4 +27,6 @@ pub(crate) mod weights;
 #[cfg(test)]
 mod config_tests;
 #[cfg(test)]
+mod oracle_tests;
+#[cfg(test)]
 mod scheduler_tests;

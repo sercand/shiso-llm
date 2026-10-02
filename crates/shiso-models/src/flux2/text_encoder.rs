@@ -6,7 +6,8 @@
 //! rotate-half 1D `RoPE`, `SwiGLU` MLP - and taps the residual stream after
 //! layers 9, 18 and 27. Those three hidden states are concatenated into the
 //! (`seq_len`, 3 * hidden) conditioning the diffusion transformer reads. Layers
-//! past the last tap are never evaluated: their output reaches no consumer.
+//! past the last tap are neither loaded nor evaluated: their output reaches no
+//! consumer.
 //!
 //! Every dimension is read off the checkpoint's own tensors - hidden width
 //! from the layer norms, head counts from the projection widths, head
@@ -136,8 +137,12 @@ impl TextEncoder {
             &rope_half_freqs(params.head_dim, params.theta),
         )?;
 
-        let mut loaded = Vec::with_capacity(layers);
-        for l in 0..layers {
+        // Load only through the last tap layer: `prefill` runs `0..=last` and
+        // the layers past it feed no tap, so importing their weights would
+        // hold device memory for rows nothing reads.
+        let run_layers = *TAP_LAYERS.last().unwrap_or(&0) + 1;
+        let mut loaded = Vec::with_capacity(run_layers);
+        for l in 0..run_layers {
             let base = format!("model.layers.{l}.");
             loaded.push(TextLayer {
                 input_norm: ops.upload_f32(

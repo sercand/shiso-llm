@@ -116,13 +116,13 @@ pub(crate) struct DiTInput<'a> {
 
 /// Everything a block call needs beyond its own weights and the shared
 /// modulation: the residual streams (two buffers for double blocks, the
-/// joint buffer for single blocks), the `RoPE` tables, and the KV-cache
-/// state. A named bundle because the block geometry travels together and no
-/// block may take twelve arguments.
+/// joint buffer for single blocks) and the KV-cache state. The `RoPE`
+/// frequency table lives on the `DiT` (it never changes between steps). A
+/// named bundle because the block geometry travels together and no block may
+/// take twelve arguments.
 struct StepCtx<'a, 'b> {
     x_img: &'b DeviceBuffer,
     x_txt: &'b DeviceBuffer,
-    freqs: &'b DeviceBuffer,
     input: &'b DiTInput<'a>,
     kv: &'b mut Flux2KvCache,
     refs: usize,
@@ -160,6 +160,10 @@ pub(crate) struct DiT {
     inner: usize,
     head_dim: usize,
     freqs_per_axis: usize,
+    /// The 4-axis `RoPE` frequency table, uploaded once: it depends only on
+    /// `axes_dim` and `theta`, so re-uploading it every denoising step was
+    /// pure overhead.
+    rope_freqs: DeviceBuffer,
 }
 
 /// The reference's `timestep_embedding` frequency table:
@@ -368,6 +372,11 @@ impl DiT {
             });
         }
 
+        let rope_freqs = ops.upload_f32(
+            "dit rope freqs",
+            &super::rope::rope_4d_freqs(&params.axes_dim, params.theta),
+        )?;
+
         Ok(Self {
             params: params.clone(),
             img_in,
@@ -384,6 +393,7 @@ impl DiT {
             inner,
             head_dim,
             freqs_per_axis,
+            rope_freqs,
         })
     }
 
@@ -415,10 +425,6 @@ impl DiT {
         } else {
             input.ref_tokens
         };
-        let freqs = ops.upload_f32(
-            "dit rope freqs",
-            &super::rope::rope_4d_freqs(&p.axes_dim, p.theta),
-        )?;
 
         // Timestep embedding (the reference's `timestep_embedding`): the raw
         // sigma is scaled by 1000 here, the table is cos-then-sin, f32.
@@ -506,7 +512,6 @@ impl DiT {
             let mut ctx = StepCtx {
                 x_img: &x_img,
                 x_txt: &x_txt,
-                freqs: &freqs,
                 input,
                 kv: &mut *kv,
                 refs,
@@ -532,7 +537,6 @@ impl DiT {
             let mut ctx = StepCtx {
                 x_img: &joint,
                 x_txt: &joint,
-                freqs: &freqs,
                 input,
                 kv: &mut *kv,
                 refs,
@@ -628,24 +632,28 @@ impl DiT {
             q: qkv_img.view(),
             k: qkv_img.view(),
             positions: ctx.input.img_positions,
-            freqs: ctx.freqs.view(),
+            freqs: self.rope_freqs.view(),
             tokens: ctx.n_img,
             heads,
             head_dim,
             freqs_per_axis,
             row_stride: 3 * h,
+            q_offset: 0,
+            k_offset: heads * head_dim,
         })?;
         ops.rope_4d(&Rope4dCall {
             step: "dit txt rope",
             q: qkv_txt.view(),
             k: qkv_txt.view(),
             positions: ctx.input.txt_positions,
-            freqs: ctx.freqs.view(),
+            freqs: self.rope_freqs.view(),
             tokens: ctx.t_txt,
             heads,
             head_dim,
             freqs_per_axis,
             row_stride: 3 * h,
+            q_offset: 0,
+            k_offset: heads * head_dim,
         })?;
 
         // Full (unmasked) attention over the joint txt+img rows; with
@@ -668,6 +676,9 @@ impl DiT {
             q_img: qkv_img.view(),
             k_img: qkv_img.view(),
             v_img: qkv_img.view(),
+            q_offset: 0,
+            k_offset: heads * head_dim,
+            v_offset: 2 * heads * head_dim,
             cache_k,
             cache_v: cache_k,
             cache_stride: 3 * h,
@@ -827,12 +838,14 @@ impl DiT {
             q: qkv.view(),
             k: qkv.view(),
             positions: ctx.input.joint_positions,
-            freqs: ctx.freqs.view(),
+            freqs: self.rope_freqs.view(),
             tokens: s_total,
             heads,
             head_dim,
             freqs_per_axis,
             row_stride: fused,
+            q_offset: 0,
+            k_offset: heads * head_dim,
         })?;
 
         // Full attention over the joint rows (txt first), plus the cached
@@ -854,6 +867,9 @@ impl DiT {
             q_img: qkv.view(),
             k_img: qkv.view(),
             v_img: qkv.view(),
+            q_offset: 0,
+            k_offset: heads * head_dim,
+            v_offset: 2 * heads * head_dim,
             cache_k,
             cache_v: cache_k,
             cache_stride: fused,

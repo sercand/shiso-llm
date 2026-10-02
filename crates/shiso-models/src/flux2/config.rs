@@ -104,14 +104,28 @@ struct DiffusersTransformerConfig {
 )]
 pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGenError> {
     let weights_path = find_transformer_weights(&desc.model_path)?;
-    let (_shard, tensors) = Shard::open_untagged(&weights_path).map_err(|e| {
-        ImageGenError::Checkpoint(format!(
-            "opening safetensors at {}: {e}",
-            weights_path.display()
-        ))
-    })?;
-
-    let tensor_map: HashMap<String, RawTensor> = tensors.into_iter().collect();
+    // Index every shard in the resolved directory, not just the first: a
+    // multi-shard export may carry the signature tensor (or any FP8 weight)
+    // in a later shard, and the pipeline's weight store indexes the whole
+    // directory the same way, so inspecting a subset would refuse a
+    // checkpoint that then loads fine.
+    let dir = weights_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tensor_map: HashMap<String, RawTensor> = HashMap::new();
+    for file in safetensors_in(dir) {
+        let (_shard, tensors) = Shard::open_untagged(&file).map_err(|e| {
+            ImageGenError::Checkpoint(format!("opening safetensors at {}: {e}", file.display()))
+        })?;
+        tensor_map.extend(tensors);
+    }
+    if tensor_map.is_empty() {
+        return Err(ImageGenError::Checkpoint(format!(
+            "no safetensors tensors found in {}",
+            dir.display()
+        )));
+    }
 
     // Verify it is a compatible transformer by checking signature tensors
     let img_in = tensor_map
@@ -200,7 +214,19 @@ pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGe
         .as_ref()
         .and_then(|c| c.mlp_ratio)
         .unwrap_or(DEFAULT_MLP_RATIO);
-    let _ = config_opt.as_ref().and_then(|c| c.attention_head_dim);
+    // `attention_head_dim` is the one config number the tensor shapes do not
+    // independently confirm (the qkv width is `3 * hidden` either way), so
+    // cross-check it against the head split the blocks will use and refuse a
+    // mismatch loudly rather than run a transformer whose heads are the wrong
+    // width under a `RoPE` table sized for another.
+    if let Some(head_dim) = config_opt.as_ref().and_then(|c| c.attention_head_dim)
+        && head_dim * num_heads != hidden_size
+    {
+        return Err(ImageGenError::Checkpoint(format!(
+            "config attention_head_dim {head_dim} x {num_heads} heads = {} does not match hidden size {hidden_size}",
+            head_dim * num_heads
+        )));
+    }
 
     // Detect FP8 precision by scanning all tensors for any F8_E4M3 weight
     let is_fp8 = tensor_map
@@ -330,14 +356,20 @@ fn find_transformer_weights(path: &Path) -> Result<PathBuf, ImageGenError> {
 }
 
 fn first_safetensors(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut found: Vec<PathBuf> = entries
+    safetensors_in(dir).into_iter().next()
+}
+
+/// Every `*.safetensors` file in `dir`, sorted so a multi-shard export always
+/// sees the same order. The weight store indexes the whole directory the same
+/// way, so inspecting this set matches what actually loads.
+fn safetensors_in(dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|entry| entry.path())
         .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "safetensors"))
         .collect();
-    // Sorted so a multi-shard export always opens from the same shard first;
-    // the full shard set is indexed later by the weight store either way.
     found.sort();
-    found.into_iter().next()
+    found
 }

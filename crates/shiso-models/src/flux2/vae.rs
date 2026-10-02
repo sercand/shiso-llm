@@ -334,30 +334,37 @@ impl Vae {
                 x = self.resnet(ops, resnet, &x, &mut field, step)?;
             }
             if let Some(up) = &block.upsample {
+                // Reference `Upsample.forward`: nearest 2x interpolation
+                // FIRST, then the 3x3 conv over the 2x field - convolving at
+                // the low resolution and upscaling after would sample the
+                // conv weights against the wrong field.
+                let upsampled = ops.alloc_f32(
+                    "vae upsample",
+                    field.channels * (2 * field.h) * (2 * field.w),
+                )?;
+                ops.upsample_nearest(&super::ops::UpsampleCall {
+                    step: "vae upsample",
+                    out: upsampled.view(),
+                    input: x.view(),
+                    batch: 1,
+                    channels: field.channels,
+                    h: field.h,
+                    w: field.w,
+                })?;
+                drop(x);
+                field.h *= 2;
+                field.w *= 2;
                 let y = Self::conv(
                     ops,
                     up,
-                    x.view(),
+                    upsampled.view(),
                     field.channels,
                     &field,
                     "vae upsample conv",
                 )?;
-                let upsampled =
-                    ops.alloc_f32("vae upsample", up.out_c * (2 * field.h) * (2 * field.w))?;
-                ops.upsample_nearest(&super::ops::UpsampleCall {
-                    step: "vae upsample",
-                    out: upsampled.view(),
-                    input: y.view(),
-                    batch: 1,
-                    channels: up.out_c,
-                    h: field.h,
-                    w: field.w,
-                })?;
+                drop(upsampled);
                 field.channels = up.out_c;
-                field.h *= 2;
-                field.w *= 2;
-                drop(x);
-                x = upsampled;
+                x = y;
             }
         }
 
@@ -399,7 +406,12 @@ impl Vae {
     ///
     /// Feature `c * 4 + p` of the token at latent cell (li, lj) is channel
     /// `c` at spatial position `(2*li + p/2, 2*lj + p%2)` - the inverse of
-    /// the 2x2 patchification the transformer's input was built with.
+    /// the 2x2 patchification the transformer's input was built with. The
+    /// flattened feature index is channel-major (`f = c * pi * pj + p`),
+    /// pinned by the upstream pack in `AutoEncoder.encode`:
+    /// `rearrange(mean, "... c (i pi) (j pj) -> ... (c pi pj) i j")` - the
+    /// `(c pi pj)` group means the channel index varies slowest, exactly the
+    /// `(c, p)` split below.
     fn unpack_latents(
         &self,
         latents: &[f32],
@@ -584,6 +596,11 @@ impl Vae {
             q_img: qt.view(),
             k_img: kt.view(),
             v_img: vt.view(),
+            // Separate packed q/k/v tensors, not fused rows: every head
+            // section starts at column 0 of its own buffer.
+            q_offset: 0,
+            k_offset: 0,
+            v_offset: 0,
             cache_k: ops.dummy_view(),
             cache_v: ops.dummy_view(),
             cache_stride: channels,
