@@ -22,6 +22,8 @@ use shiso_parsers::{ReasoningScheme, ToolCallScheme};
 pub use shiso_router::cli::RouterArgs;
 use shiso_vision::{FfmpegPolicy, ImageLimits};
 
+use clap::parser::ValueSource;
+use shiso_hub::recipe::ServerDefaults;
 /// The default listen address. Loopback, so an unconfigured server is not on the
 /// network.
 pub const DEFAULT_BIND: &str = "127.0.0.1";
@@ -77,6 +79,16 @@ pub enum Command {
     Serve(Box<ServeArgs>),
     /// Run an LLM router proxying requests to third-party or local backends.
     Router(Box<RouterArgs>),
+    /// Download a model from the registry.
+    Pull(PullArgs),
+    /// List installed models, or the registry's catalog with `--remote`.
+    List(ListArgs),
+    /// Describe a model's recipe and variants.
+    Info(InfoArgs),
+    /// Re-hash an installed model against its recipe.
+    Verify(VerifyArgs),
+    /// Remove an installed model.
+    Rm(RmArgs),
 }
 
 /// Everything `shiso serve` accepts.
@@ -91,6 +103,12 @@ pub struct ServeArgs {
     /// can serve transcription alone.
     #[arg(short = 'm', long, env = "SHISO_MODEL")]
     pub model: Option<PathBuf>,
+    /// Model reference (registry recipe) or path.
+    ///
+    /// If it contains `/` or starts with `.` or `~`, it is treated as a path (`--model`).
+    /// Otherwise, it resolves to an installed registry model variant.
+    #[arg(value_name = "MODEL", conflicts_with = "model")]
+    pub model_ref: Option<String>,
     /// The name this checkpoint answers to on the wire. Defaults to the last
     /// component of `--model`, with any extension removed.
     ///
@@ -1080,6 +1098,261 @@ impl ParserChoice {
             Self::Qwen3 => ToolCallScheme::Qwen3,
             Self::Qwen35 => ToolCallScheme::Qwen35,
         }
+    }
+}
+/// Output format for download progress (§6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+pub enum ProgressStyle {
+    /// Bars on TTY, plain text when redirected.
+    #[default]
+    Auto,
+    /// Interactive multi-bar progress display.
+    Bars,
+    /// Plain line-oriented progress logging.
+    Plain,
+    /// NDJSON stream for programmatic integration.
+    Json,
+}
+
+/// Shared hub arguments for registry and downloading commands (§6).
+#[derive(Debug, Clone, clap::Args)]
+pub struct HubArgs {
+    /// Local storage home directory.
+    #[arg(long, env = "SHISO_HOME", default_value = "~/.shiso")]
+    pub home: String,
+
+    /// Static HTTPS registry URL.
+    #[arg(
+        long,
+        env = "SHISO_REGISTRY_URL",
+        default_value = "https://models.shiso.run/v1"
+    )]
+    pub registry_url: String,
+
+    /// Ed25519 public key (hex, base64, or key file). Required when --registry-url is custom.
+    #[arg(long, env = "SHISO_REGISTRY_KEY")]
+    pub registry_key: Option<String>,
+
+    /// Hugging Face endpoint URL.
+    #[arg(
+        long,
+        env = "SHISO_HF_ENDPOINT",
+        default_value = "https://huggingface.co"
+    )]
+    pub hf_endpoint: String,
+
+    /// Hugging Face bearer token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Maximum concurrent file downloads.
+    #[arg(long, env = "SHISO_PULL_JOBS", default_value_t = 4)]
+    pub jobs: usize,
+
+    /// Progress reporting style (`auto`, `bars`, `plain`, `json`).
+    #[arg(long, env = "SHISO_PROGRESS", default_value = "auto")]
+    pub progress: ProgressStyle,
+}
+
+/// Arguments for `shiso pull <ref>`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct PullArgs {
+    /// Model reference to download (`<name-or-alias>[:<variant-key>]`).
+    pub model_ref: String,
+    /// Common hub configuration options.
+    #[command(flatten)]
+    pub hub: HubArgs,
+}
+
+/// Arguments for `shiso list [--remote] [--task <t>] [--tag <t>]`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct ListArgs {
+    /// Query remote registry index instead of local installations.
+    #[arg(long)]
+    pub remote: bool,
+    /// Filter models by task.
+    #[arg(long)]
+    pub task: Option<String>,
+    /// Filter models by tag.
+    #[arg(long)]
+    pub tag: Option<String>,
+    /// Common hub configuration options.
+    #[command(flatten)]
+    pub hub: HubArgs,
+}
+
+/// Arguments for `shiso info <ref>`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct InfoArgs {
+    /// Model reference to describe.
+    pub model_ref: String,
+    /// Common hub configuration options.
+    #[command(flatten)]
+    pub hub: HubArgs,
+}
+
+/// Arguments for `shiso verify <ref> [--repair]`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct VerifyArgs {
+    /// Model reference to verify.
+    pub model_ref: String,
+    /// Re-download corrupt or missing files.
+    #[arg(long)]
+    pub repair: bool,
+    /// Common hub configuration options.
+    #[command(flatten)]
+    pub hub: HubArgs,
+}
+
+/// Arguments for `shiso rm <ref> [--force]`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct RmArgs {
+    /// Model reference to remove (`name` removes all variants, `name:key` removes one).
+    pub model_ref: String,
+    /// Remove even if model is in use by a running server.
+    #[arg(short, long)]
+    pub force: bool,
+    /// Common hub configuration options.
+    #[command(flatten)]
+    pub hub: HubArgs,
+}
+
+/// Classification of a positional model argument (§6.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelArgKind {
+    /// Path to a checkpoint file or directory.
+    Path(PathBuf),
+    /// Model reference from the registry.
+    RegistryRef(String),
+}
+
+/// Classifies a positional model argument as a path or registry reference (§6.6).
+#[must_use]
+pub fn classify_model_arg(arg: &str) -> ModelArgKind {
+    if arg.contains('/') || arg.starts_with('.') || arg.starts_with('~') {
+        ModelArgKind::Path(PathBuf::from(arg))
+    } else {
+        ModelArgKind::RegistryRef(arg.to_string())
+    }
+}
+
+/// Merges recipe `server_defaults` into `args` respecting precedence:
+/// `explicit CLI flag > SHISO_* env var > recipe server_defaults > built-in default` (§6.6).
+///
+/// Overwrites a field only when `matches.value_source(id) == Some(ValueSource::DefaultValue)`
+/// (or when `matches` is `None`).
+pub fn apply_recipe_defaults(
+    args: &mut ServeArgs,
+    matches: Option<&clap::ArgMatches>,
+    defaults: &ServerDefaults,
+) {
+    let check_override = |id: &str| -> bool {
+        match matches {
+            Some(m) => m.value_source(id) == Some(ValueSource::DefaultValue),
+            None => true,
+        }
+    };
+
+    if let Some(ctx) = defaults.ctx
+        && check_override("ctx")
+    {
+        args.ctx = u32::try_from(ctx).unwrap_or(args.ctx);
+        tracing::info!(ctx = args.ctx, "applied recipe default for ctx");
+    }
+
+    if let Some(max_num_seqs) = defaults.max_num_seqs
+        && check_override("max_num_seqs")
+    {
+        args.max_num_seqs = max_num_seqs;
+        tracing::info!(
+            max_num_seqs = args.max_num_seqs,
+            "applied recipe default for max_num_seqs"
+        );
+    }
+
+    if let Some(spec_k) = defaults.spec_k
+        && check_override("spec_k")
+    {
+        args.spec_k = u32::try_from(spec_k).unwrap_or(args.spec_k);
+        tracing::info!(spec_k = args.spec_k, "applied recipe default for spec_k");
+    }
+
+    if let Some(turn_replay_tokens) = defaults.turn_replay_tokens
+        && check_override("turn_replay_tokens")
+    {
+        args.turn_replay_tokens = turn_replay_tokens;
+        tracing::info!(
+            turn_replay_tokens = args.turn_replay_tokens,
+            "applied recipe default for turn_replay_tokens"
+        );
+    }
+
+    if let Some(vision_max_pixels) = defaults.vision_max_pixels
+        && check_override("vision_max_pixels")
+    {
+        args.vision_max_pixels = vision_max_pixels;
+        tracing::info!(
+            vision_max_pixels = args.vision_max_pixels,
+            "applied recipe default for vision_max_pixels"
+        );
+    }
+
+    if let Some(video_fps) = defaults.video_fps
+        && check_override("video_fps")
+    {
+        args.video_fps = f64::from(video_fps);
+        tracing::info!(
+            video_fps = args.video_fps,
+            "applied recipe default for video_fps"
+        );
+    }
+
+    if let Some(video_max_frames) = defaults.video_max_frames
+        && check_override("video_max_frames")
+    {
+        args.video_max_frames = video_max_frames;
+        tracing::info!(
+            video_max_frames = args.video_max_frames,
+            "applied recipe default for video_max_frames"
+        );
+    }
+
+    if let Some(asr_lookahead) = defaults.asr_lookahead
+        && check_override("asr_lookahead")
+    {
+        args.asr_lookahead = asr_lookahead;
+        tracing::info!(
+            asr_lookahead = args.asr_lookahead,
+            "applied recipe default for asr_lookahead"
+        );
+    }
+
+    if let Some(asr_batch) = defaults.asr_batch
+        && check_override("asr_batch")
+    {
+        args.asr_batch = asr_batch;
+        tracing::info!(
+            asr_batch = args.asr_batch,
+            "applied recipe default for asr_batch"
+        );
+    }
+
+    if let Some(residency_str) = &defaults.expert_residency
+        && check_override("expert_residency")
+    {
+        match residency_str.to_lowercase().as_str() {
+            "auto" => args.expert_residency = ExpertResidencyChoice::Auto,
+            "resident" => args.expert_residency = ExpertResidencyChoice::Resident,
+            "stream" | "streamed" => args.expert_residency = ExpertResidencyChoice::Stream,
+            _ => tracing::warn!(
+                residency = residency_str,
+                "unknown expert residency choice in recipe defaults"
+            ),
+        }
+        tracing::info!(
+            residency = residency_str,
+            "applied recipe default for expert_residency"
+        );
     }
 }
 

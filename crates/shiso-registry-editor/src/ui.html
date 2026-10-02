@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shiso Model Registry Editor</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2e3d;
+    --text: #e1e4ea;
+    --muted: #8b92a5;
+    --primary: #3b82f6;
+    --primary-hover: #2563eb;
+    --success: #10b981;
+    --danger: #ef4444;
+    --warning: #f59e0b;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.5; }
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; }
+  h1 { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .badge { padding: 2px 8px; border-radius: 9999px; font-size: 12px; font-weight: 500; }
+  .badge-success { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+  .badge-danger { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+  .badge-warning { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+  .badge-muted { background: var(--border); color: var(--muted); }
+  nav { display: flex; gap: 8px; }
+  button, .btn { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.15s; }
+  button:hover, .btn:hover { border-color: var(--muted); }
+  button.primary, .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+  button.primary:hover, .btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+  button.danger { background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.3); color: #f87171; }
+  button.danger:hover { background: rgba(239, 68, 68, 0.3); }
+  main { max-width: 1200px; margin: 24px auto; padding: 0 24px; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; margin-top: 16px; }
+  .recipe-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; justify-content: space-between; }
+  .recipe-card:hover { border-color: var(--primary); }
+  .recipe-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: baseline; }
+  .recipe-desc { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+  .tags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; }
+  .tag { background: rgba(59, 130, 246, 0.1); color: #60a5fa; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+  .form-group { margin-bottom: 14px; }
+  label { display: block; font-size: 12px; font-weight: 500; color: var(--muted); margin-bottom: 4px; }
+  input[type="text"], input[type="number"], select, textarea { width: 100%; background: #12151e; border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 13px; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); }
+  .row { display: flex; gap: 12px; }
+  .col { flex: 1; }
+  pre { background: #12151e; border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: monospace; font-size: 12px; overflow-x: auto; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Shiso Model Registry Editor</h1>
+  <div id="git-banner" style="display:flex; align-items:center; gap:8px;">
+    <span id="git-branch" class="badge badge-muted">branch: unknown</span>
+    <span id="git-status-badge" class="badge badge-success">clean</span>
+  </div>
+  <nav>
+    <button class="tab-btn" onclick="showTab('dashboard')">Dashboard</button>
+    <button class="tab-btn" onclick="showTab('new-recipe')">New Recipe</button>
+    <button class="tab-btn" onclick="showTab('inspect')">HF Inspector</button>
+    <button class="tab-btn" onclick="showTab('validation')">Validation</button>
+    <button class="tab-btn" onclick="showTab('build')">Build & Sign</button>
+  </nav>
+</header>
+
+<main>
+  <!-- Dashboard -->
+  <section id="tab-dashboard" class="tab-content active">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h2>Authored Recipes</h2>
+      <div style="display:flex; gap:8px;">
+        <input type="text" id="recipe-search" placeholder="Search models or tags..." oninput="filterRecipes()" style="width:240px;">
+        <button onclick="loadRecipes()">Refresh</button>
+      </div>
+    </div>
+    <div id="recipe-grid" class="grid"></div>
+  </section>
+
+  <!-- New / Edit Recipe -->
+  <section id="tab-new-recipe" class="tab-content">
+    <div class="card">
+      <h2 id="editor-heading" style="margin-bottom:16px;">Author Recipe Manifest</h2>
+      <div class="row">
+        <div class="col form-group">
+          <label>Model Family</label>
+          <select id="rf-family" onchange="onFamilyChange()"></select>
+        </div>
+        <div class="col form-group">
+          <label>Canonical Name</label>
+          <input type="text" id="rf-name" placeholder="e.g. qwen3.5-9b">
+        </div>
+        <div class="col form-group">
+          <label>Aliases (comma-separated)</label>
+          <input type="text" id="rf-aliases" placeholder="e.g. qwen3.5">
+        </div>
+      </div>
+      <div class="row">
+        <div class="col form-group">
+          <label>Description</label>
+          <input type="text" id="rf-description" placeholder="Brief summary of architecture and checkpoint">
+        </div>
+        <div class="col form-group" style="max-width:180px;">
+          <label>Min Shiso Version</label>
+          <input type="text" id="rf-min-version" value="0.1.0">
+        </div>
+      </div>
+      <div class="row">
+        <div class="col form-group">
+          <label>Tags (comma-separated)</label>
+          <input type="text" id="rf-tags" placeholder="e.g. vision, tools, speculative">
+        </div>
+        <div class="col form-group">
+          <label>Tasks (comma-separated)</label>
+          <input type="text" id="rf-tasks" value="chat">
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>Recipe JSON</label>
+        <textarea id="rf-json" rows="18" style="font-family:monospace; font-size:12px;"></textarea>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <button class="primary" onclick="saveRecipe()">Save Recipe (Strict Validation)</button>
+        <span id="save-status"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- HF Inspector -->
+  <section id="tab-inspect" class="tab-content">
+    <div class="card">
+      <h2 style="margin-bottom:14px;">Hugging Face Repository Inspector</h2>
+      <div class="row">
+        <div class="col form-group" style="flex:3;">
+          <label>Repository (owner/name)</label>
+          <input type="text" id="hf-repo" placeholder="e.g. shiso-community/qwen3.5-9b-mlx-4bit">
+        </div>
+        <div class="col form-group" style="flex:1;">
+          <label>Revision / Branch</label>
+          <input type="text" id="hf-revision" value="main">
+        </div>
+        <div class="col form-group" style="flex:0; align-self:flex-end;">
+          <button class="primary" onclick="runInspect()" style="height:36px;">Inspect</button>
+        </div>
+      </div>
+      <div id="inspect-result" style="margin-top:16px;"></div>
+    </div>
+  </section>
+
+  <!-- Validation -->
+  <section id="tab-validation" class="tab-content">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+        <h2>Strict Recipe Validation</h2>
+        <button class="primary" onclick="runValidation()">Validate All Recipes</button>
+      </div>
+      <div id="validation-results"></div>
+    </div>
+  </section>
+
+  <!-- Build & Sign -->
+  <section id="tab-build" class="tab-content">
+    <div class="card">
+      <h2 style="margin-bottom:14px;">Compile, Sign, and Build Registry</h2>
+      <div class="row">
+        <div class="col form-group">
+          <label>Output Directory</label>
+          <input type="text" id="build-out" value="target/registry/v1">
+        </div>
+        <div class="col form-group">
+          <label>Ed25519 Signing Key Path (optional for dev builds)</label>
+          <input type="text" id="build-key" placeholder="~/.config/shiso/registry.key">
+        </div>
+      </div>
+      <div class="form-group">
+        <label><input type="checkbox" id="build-allow-dirty" style="width:auto; margin-right:6px;"> Allow uncommitted recipe changes (skips strict git timestamp verification)</label>
+      </div>
+      <button class="primary" onclick="runBuild()">Build Registry</button>
+      <div id="build-result" style="margin-top:16px;"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+let sessionToken = "";
+let cachedFamilies = [];
+let allRecipes = [];
+
+function initAuth() {
+  if (location.hash.startsWith("#token=")) {
+    sessionToken = location.hash.substring(7);
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+}
+
+async function api(path, opts = {}) {
+  const headers = opts.headers || {};
+  if (sessionToken) {
+    headers["Authorization"] = "Bearer " + sessionToken;
+  }
+  opts.headers = headers;
+  const res = await fetch(path, opts);
+  if (res.status === 401) {
+    alert("Session unauthorized. Re-open the editor URL printed in your terminal.");
+    throw new Error("401 Unauthorized");
+  }
+  return res;
+}
+
+function showTab(name) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  const target = document.getElementById('tab-' + name);
+  if (target) target.classList.add('active');
+  if (name === 'dashboard') loadRecipes();
+  if (name === 'validation') runValidation();
+}
+
+async function loadGitStatus() {
+  try {
+    const res = await api('/api/git/status');
+    const data = await res.json();
+    document.getElementById('git-branch').innerText = "branch: " + data.branch;
+    const badge = document.getElementById('git-status-badge');
+    if (data.is_dirty) {
+      badge.className = "badge badge-warning";
+      badge.innerText = `${data.changed_recipes.length} modified`;
+    } else {
+      badge.className = "badge badge-success";
+      badge.innerText = "clean";
+    }
+  } catch (e) { console.error(e); }
+}
+
+async function loadFamilies() {
+  try {
+    const res = await api('/api/families');
+    cachedFamilies = await res.json();
+    const sel = document.getElementById('rf-family');
+    sel.innerHTML = '<option value="">-- Choose Family --</option>';
+    cachedFamilies.forEach(f => {
+      const opt = document.createElement('option');
+      opt.value = f.name;
+      opt.innerText = f.name;
+      sel.appendChild(opt);
+    });
+  } catch (e) { console.error(e); }
+}
+
+function onFamilyChange() {
+  const name = document.getElementById('rf-family').value;
+  const fam = cachedFamilies.find(f => f.name === name);
+  if (!fam) return;
+  document.getElementById('rf-tasks').value = fam.tasks.join(", ");
+}
+
+async function loadRecipes() {
+  try {
+    const res = await api('/api/recipes');
+    allRecipes = await res.json();
+    renderRecipes(allRecipes);
+  } catch (e) { console.error(e); }
+}
+
+function renderRecipes(recipes) {
+  const container = document.getElementById('recipe-grid');
+  container.innerHTML = "";
+  recipes.forEach(r => {
+    const card = document.createElement('div');
+    card.className = "recipe-card";
+    const statusBadge = r.valid
+      ? '<span class="badge badge-success">Valid</span>'
+      : `<span class="badge badge-danger" title="${r.errors.join('; ')}">Errors (${r.errors.length})</span>`;
+    card.innerHTML = `
+      <div>
+        <div class="recipe-title">
+          <span>${r.name}</span>
+          ${statusBadge}
+        </div>
+        <div class="recipe-desc">${r.file}</div>
+      </div>
+      <div style="display:flex; justify-content:flex-end; gap:6px; margin-top:12px;">
+        <button onclick="editRecipe('${r.name}')">Edit</button>
+        <button class="danger" onclick="deleteRecipe('${r.name}')">Delete</button>
+      </div>
+    `;
+    container.appendChild(card);
+  });
+}
+
+function filterRecipes() {
+  const q = document.getElementById('recipe-search').value.toLowerCase();
+  const filtered = allRecipes.filter(r => r.name.toLowerCase().includes(q) || r.file.toLowerCase().includes(q));
+  renderRecipes(filtered);
+}
+
+async function editRecipe(name) {
+  try {
+    const res = await api('/api/recipes/' + encodeURIComponent(name));
+    const json = await res.json();
+    document.getElementById('editor-heading').innerText = "Edit Recipe: " + name;
+    document.getElementById('rf-name').value = json.name;
+    document.getElementById('rf-family').value = json.family;
+    document.getElementById('rf-aliases').value = (json.aliases || []).join(", ");
+    document.getElementById('rf-description').value = json.description || "";
+    document.getElementById('rf-min-version').value = json.min_shiso_version || "0.1.0";
+    document.getElementById('rf-tags').value = (json.tags || []).join(", ");
+    document.getElementById('rf-tasks').value = (json.tasks || []).join(", ");
+    document.getElementById('rf-json').value = JSON.stringify(json, null, 2);
+    showTab('new-recipe');
+  } catch (e) { alert("Failed to load recipe: " + e.message); }
+}
+
+async function saveRecipe() {
+  const name = document.getElementById('rf-name').value.trim();
+  const content = document.getElementById('rf-json').value;
+  const statusEl = document.getElementById('save-status');
+  statusEl.innerText = "Saving and strictly validating...";
+  statusEl.style.color = "var(--muted)";
+
+  try {
+    const res = await api('/api/recipes/' + encodeURIComponent(name), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: content
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      statusEl.innerText = "Error: " + err;
+      statusEl.style.color = "var(--danger)";
+    } else {
+      statusEl.innerText = "Saved successfully.";
+      statusEl.style.color = "var(--success)";
+      loadGitStatus();
+    }
+  } catch (e) {
+    statusEl.innerText = "Error: " + e.message;
+    statusEl.style.color = "var(--danger)";
+  }
+}
+
+async function deleteRecipe(name) {
+  if (!confirm(`Are you sure you want to delete '${name}'?`)) return;
+  try {
+    const res = await api('/api/recipes/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (!res.ok) {
+      alert("Delete failed: " + await res.text());
+    } else {
+      loadRecipes();
+      loadGitStatus();
+    }
+  } catch (e) { alert("Delete error: " + e.message); }
+}
+
+async function runInspect() {
+  const repo = document.getElementById('hf-repo').value.trim();
+  const revision = document.getElementById('hf-revision').value.trim();
+  const resDiv = document.getElementById('inspect-result');
+  resDiv.innerHTML = "Inspecting repository and resolving commit SHA...";
+
+  try {
+    const res = await api('/api/hf/inspect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo, revision })
+    });
+    const data = await res.json();
+    let rows = data.files.map(f => `<tr><td>${f.name}</td><td>${f.size}</td><td><code>${f.sha256}</code></td><td>${f.lfs ? 'Yes' : 'No'}</td></tr>`).join("");
+    resDiv.innerHTML = `
+      <div style="margin-bottom:8px;"><strong>Resolved Commit:</strong> <code>${data.commit}</code></div>
+      <table style="width:100%; border-collapse:collapse; font-size:12px;">
+        <thead><tr style="text-align:left; border-bottom:1px solid var(--border);"><th style="padding:6px;">File</th><th>Size</th><th>SHA-256</th><th>LFS</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  } catch (e) { resDiv.innerHTML = `<span style="color:var(--danger)">Error: ${e.message}</span>`; }
+}
+
+async function runValidation() {
+  const container = document.getElementById('validation-results');
+  container.innerHTML = "Validating all recipes...";
+  try {
+    const res = await api('/api/validate', { method: 'POST' });
+    const reports = await res.json();
+    let html = "";
+    reports.forEach(r => {
+      const color = r.valid ? "var(--success)" : "var(--danger)";
+      const status = r.valid ? "OK" : "FAILED";
+      const errList = r.errors.length ? `<div style="margin-top:6px; color:#f87171;">${r.errors.join("<br>")}</div>` : "";
+      html += `<div style="border-bottom:1px solid var(--border); padding:10px 0;">
+        <span style="font-weight:600; color:${color};">[${status}]</span> <strong>${r.file}</strong> (${r.name})
+        ${errList}
+      </div>`;
+    });
+    container.innerHTML = html;
+  } catch (e) { container.innerHTML = `<span style="color:var(--danger)">Validation error: ${e.message}</span>`; }
+}
+
+async function runBuild() {
+  const out = document.getElementById('build-out').value.trim();
+  const key = document.getElementById('build-key').value.trim();
+  const allowDirty = document.getElementById('build-allow-dirty').checked;
+  const resDiv = document.getElementById('build-result');
+  resDiv.innerHTML = "Building registry manifests and index...";
+
+  try {
+    const res = await api('/api/build', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ out, sign_key: key || null, allow_dirty: allowDirty })
+    });
+    if (!res.ok) {
+      resDiv.innerHTML = `<span style="color:var(--danger)">Build failed: ${await res.text()}</span>`;
+    } else {
+      const data = await res.json();
+      resDiv.innerHTML = `<span style="color:var(--success)">Build succeeded!</span> ${data.diff}`;
+    }
+  } catch (e) { resDiv.innerHTML = `<span style="color:var(--danger)">Build error: ${e.message}</span>`; }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  initAuth();
+  loadGitStatus();
+  loadFamilies();
+  loadRecipes();
+});
+</script>
+</body>
+</html>

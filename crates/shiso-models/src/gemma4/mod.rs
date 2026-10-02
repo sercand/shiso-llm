@@ -35,3 +35,18 @@ pub use ckpt::{GEMMA4_MODEL_ID, quant_bits_of};
 pub use config::{ARCHES, GGUF_ARCH, Gemma4Config};
 pub use model::{Gemma4Model, PleOptions};
 pub use vision::Gemma4Tower;
+
+use crate::catalog::{FamilyFacts, FamilyFeatures};
+
+/// Family facts for Gemma 4.
+pub const FACTS: FamilyFacts = FamilyFacts {
+    name: "gemma4",
+    accepted_roles: &["base", "vision", "asr_mmproj"],
+    tasks: &["chat"],
+    features: FamilyFeatures {
+        tools: true,
+        reasoning_efforts: &["none", "low", "medium", "high"],
+        default_reasoning_effort: Some("medium"),
+        structured_output: true,
+    },
+};

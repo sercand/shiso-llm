@@ -1,0 +1,32 @@
+[package]
+name = "shiso-hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "shiso: model repository client, digest-verified downloads and blob store."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+ed25519-dalek = { workspace = true }
+semver = { workspace = true }
+sysinfo = { workspace = true }
+url = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+time = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

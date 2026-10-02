@@ -20,6 +20,8 @@ members = [
     "crates/shiso-parsers",
     "crates/shiso-kerneltest",
     "crates/shiso-router",
+    "crates/shiso-hub",
+    "crates/shiso-registry-editor",
 ]
 
 [workspace.package]
@@ -42,7 +44,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 
 # --- errors --------------------------------------------------------------
 thiserror = "2"          # library errors
-anyhow = "1"             # binary boundaries only (shiso-server main/run)
+anyhow = "1"             # binary boundaries only (shiso-server, shiso-registry-editor, shiso-router, shiso-bench)
 
 # --- concurrency + logging ----------------------------------------------
 parking_lot = "0.12"     # no poisoning, .lock() returns the guard directly
@@ -74,6 +76,11 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 wiremock = "0.6"
+# --- hub and registry -----------------------------------------------------
+indicatif = "0.17"
+sysinfo = "0.33"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+semver = { version = "1", features = ["serde"] }
 # --- tokenizer + chat templates -----------------------------------------
 minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "preserve_order"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
@@ -159,6 +166,8 @@ shiso-ple = { path = "crates/shiso-ple" }
 shiso-parsers = { path = "crates/shiso-parsers" }
 shiso-kerneltest = { path = "crates/shiso-kerneltest" }
 shiso-router = { path = "crates/shiso-router" }
+shiso-hub = { path = "crates/shiso-hub" }
+shiso-registry-editor = { path = "crates/shiso-registry-editor" }
 [workspace.lints.rust]
 # Safety. Four crates relax this with a crate-level
 # #![allow(unsafe_code, reason = "...")]: shiso-modelfile (mmap), shiso-metal (objc2),

@@ -75,3 +75,5 @@ shiso-audio = { workspace = true }
 # `tests/layer_dump.rs` reads the sparse checkpoint's own metadata for its
 # configuration, so the device case needs one variable rather than a sidecar.
 shiso-modelfile = { workspace = true }
+# The hub types crossing boundaries between server, editor and bench.
+shiso-hub = { workspace = true }

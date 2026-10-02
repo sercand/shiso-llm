@@ -39,3 +39,18 @@ pub use config::{
     shape,
 };
 pub use model::Qwen4ExpModel;
+
+use crate::catalog::{FamilyFacts, FamilyFeatures};
+
+/// Family facts for `Qwen4Exp`.
+pub const FACTS: FamilyFacts = FamilyFacts {
+    name: "qwen4exp",
+    accepted_roles: &["base"],
+    tasks: &["chat"],
+    features: FamilyFeatures {
+        tools: true,
+        reasoning_efforts: &["none", "low", "medium", "high"],
+        default_reasoning_effort: Some("medium"),
+        structured_output: true,
+    },
+};
