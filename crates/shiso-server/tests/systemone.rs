@@ -1,8 +1,9 @@
 //! `POST /v1/systemone` driven through the router: the same scoring engine as
-//! `/v1/decisions` behind the System One wire — relaxed schema at the edges
-//! (blank ids, blank state, lists of one, unknown top-level fields ignored),
-//! strict where an answer could go wrong, and schema violations answering 422
-//! with a location where the decisions route answers 400.
+//! `/v1/decisions` behind the official System One wire — map-form questions
+//! keyed by id, `noul`/`choice`/`score`, relaxed schema at the edges (blank
+//! ids, blank state, lists of one, unknown top-level fields ignored), strict
+//! where an answer could go wrong, and schema violations answering 422 with a
+//! location where the decisions route answers 400.
 //!
 //! The harness is `decisions.rs`'s, copied rather than shared: the model
 //! behind the engine answers prefills with whole rows scripted as numbers, so
@@ -26,6 +27,7 @@ use shiso_server::state::AppState;
 use shiso_server::tokenizer::Vocabulary;
 use shiso_server::tokenizer::jinja_helpers::ToolJsonStyle;
 use shiso_server::tokenizer::render_prompt::PromptRenderer;
+use shiso_vision::{ImageLimits, MediaPlacement};
 use tower::ServiceExt as _;
 
 /// The fake model's logits width: a scripted row must cover every logit the
@@ -234,13 +236,25 @@ fn score_confidence(probabilities: &[f64]) -> f64 {
     (1.0 - spread / uniform_spread).max(0.0)
 }
 
-/// The `probabilities` of one answer, as `f64`.
+/// The `probabilities` of one answer, as `f64`, from the array form the
+/// noul answer keeps as its kept extra.
 fn probabilities(answer: &Value) -> Vec<f64> {
     answer["probabilities"]
         .as_array()
         .expect("an answer carries its probabilities")
         .iter()
         .map(|p| p.as_f64().expect("a probability is a number"))
+        .collect()
+}
+
+/// The official map form of a choice or score answer's `probabilities`,
+/// read as (key, value) pairs in the map's own order.
+fn probability_map(answer: &Value) -> Vec<(String, f64)> {
+    answer["probabilities"]
+        .as_object()
+        .expect("a choice or score answer carries its probabilities as a map")
+        .iter()
+        .map(|(key, p)| (key.clone(), p.as_f64().expect("a probability is a number")))
         .collect()
 }
 
@@ -272,7 +286,23 @@ fn assert_probabilities(answer: &Value, want: &[f64], body: &Value) {
     }
 }
 
-/// The shape every 422 refusal shares on this surface.
+/// Asserts a map-form `probabilities` field — the official choice and score
+/// shape — against the keys and values the scripted row implies, in the
+/// map's own order.
+fn assert_probability_map(answer: &Value, want: &[(&str, f64)], body: &Value) {
+    let got = probability_map(answer);
+    assert_eq!(got.len(), want.len(), "{body}");
+    for (index, ((got_key, got), (want_key, want))) in got.iter().zip(want).enumerate() {
+        assert_eq!(got_key, want_key, "probability key {index}: {body}");
+        assert!(
+            (got - want).abs() < 1e-5,
+            "entry {want_key}: {got} is not {want}: {body}"
+        );
+    }
+}
+
+/// The shape every 422 refusal shares on this surface when the body itself
+/// did not parse: serde's own line and column name the spot in the bytes.
 fn assert_schema_violation(status: StatusCode, body: &Value, names: &str) {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"]["code"], "invalid_schema", "{body}");
@@ -287,6 +317,27 @@ fn assert_schema_violation(status: StatusCode, body: &Value, names: &str) {
         at.starts_with("line ") && at.contains(" column "),
         "the location is serde's line and column, got {at}: {body}"
     );
+    if !names.is_empty() {
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(names)),
+            "the refusal must name {names}: {body}"
+        );
+    }
+}
+
+/// The shape of a 422 that `validate` raises rather than the body parse: the
+/// schema class, with a location naming the field path the caller must fix
+/// (`questions`, or `questions.<id>`).
+fn assert_schema_violation_at(status: StatusCode, body: &Value, at: &str, names: &str) {
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_schema", "{body}");
+    assert_eq!(
+        body["error"]["type"], "invalid_request_error",
+        "422 is still a bad request in the client's eyes: {body}"
+    );
+    assert_eq!(body["error"]["at"], at, "{body}");
     if !names.is_empty() {
         assert!(
             body["error"]["message"]
@@ -335,19 +386,19 @@ async fn call(state: &Arc<AppState>, request: Request<Body>) -> (StatusCode, Val
     (status, body)
 }
 
-/// The smallest body that answers: one yes/no question over one state.
+/// The smallest body that answers: one noul question over one state.
 fn valid_body() -> Value {
     json!({
         "state": "the input",
-        "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+        "questions": {"q1": {"type": "noul", "instructions": "ready"}},
     })
 }
 
 // --- the scored answers -----------------------------------------------------
 
 #[tokio::test]
-// The brief pins this test's name and its scope: every answer kind and the
-// noul block in one request, because "all four in one call" is the claim.
+// The brief pins this test's name and its scope: every answer kind and a
+// noul question in one request, because "all four in one call" is the claim.
 #[expect(
     clippy::too_many_lines,
     reason = "one request exercises every answer kind, and each kind's assertions travel with it"
@@ -371,15 +422,15 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
             &json!({
                 "model": "echo-me",
                 "state": "the input",
-                "questions": [
-                    {"id": "q1", "type": "choice", "question": "pick one",
-                     "options": ["red", "blue"]},
-                    {"id": "s1", "type": "score", "question": "how bad",
-                     "levels": ["none", "some", "lots"]},
-                    {"id": "q2", "type": "yes_no", "question": "ready",
-                     "yes": "confirmed", "no": "denied"},
-                ],
-                "noul": {"criteria": [{"id": "n1", "question": "ready"}]},
+                "questions": {
+                    "q1": {"type": "choice", "instructions": "pick one",
+                           "criteria": {"red": null, "blue": null}},
+                    "s1": {"type": "score", "instructions": "how bad",
+                           "criteria": ["none", "some", "lots"]},
+                    "q2": {"type": "noul", "instructions": "ready",
+                           "criteria": {"true": "confirmed", "false": "denied"}},
+                    "n1": {"type": "noul", "instructions": "ready"},
+                },
             }),
         ),
     )
@@ -399,7 +450,7 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     assert_eq!(
         keys,
         ["q1", "s1", "q2", "n1"],
-        "questions in request order, then the noul criteria in theirs"
+        "the answers come back in the request map's insertion order"
     );
 
     let prompts = audit.prefill_prompts.lock();
@@ -422,7 +473,9 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     );
     let lp = logprobs_answering(CHOICE_BODY, &["A", "B"]);
     let want = softmax(&lp, 1.0);
-    assert_probabilities(&q1, &want, &body);
+    // The official shape: probabilities keyed by option name, in option
+    // order - the order the request's `criteria` map carried.
+    assert_probability_map(&q1, &[("red", want[0]), ("blue", want[1])], &body);
     assert_close(
         &q1["confidence"],
         choice_confidence(&want),
@@ -439,12 +492,16 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     assert_eq!(s1["type"], "score");
     assert_eq!(
         s1["legend"],
-        json!(["none", "some", "lots"]),
-        "the score answer echoes its legend: {body}"
+        json!({"0": "none", "1": "some", "2": "lots"}),
+        "the official shape echoes the legend as a string-indexed map: {body}"
     );
     let lp = logprobs_answering(SCORE_BODY, &["0", "1", "2"]);
     let want = softmax(&lp, 1.0);
-    assert_probabilities(&s1, &want, &body);
+    assert_probability_map(
+        &s1,
+        &[("0", want[0]), ("1", want[1]), ("2", want[2])],
+        &body,
+    );
     let score: f64 = want
         .iter()
         .enumerate()
@@ -460,10 +517,20 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     assert_close(&s1["x_label_mass"], mass(&lp), "s1 x_label_mass", &body);
 
     let q2 = answer_of(&body, "q2");
-    assert_eq!(q2["type"], "yes_no");
-    assert_eq!(q2["answer"], "yes");
+    assert_eq!(
+        q2["type"], "noul",
+        "a noul criterion answers under its own type"
+    );
     let lp = logprobs_answering(YES_NO_BODY, &["yes", "no"]);
     let want = softmax(&lp, 1.0);
+    // The official shape: the yes probability lives under `noul`, not
+    // `answer` - the label-word answer has no spelling on this wire.
+    assert_close(&q2["noul"], want[0], "q2 noul", &body);
+    assert!(
+        q2.get("answer").is_none(),
+        "the number moved from `answer` to `noul`: {body}"
+    );
+    // The kept extra: the pair in label order.
     assert_probabilities(&q2, &want, &body);
     assert_close(
         &q2["confidence"],
@@ -473,18 +540,18 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     );
     assert_close(&q2["x_label_mass"], mass(&lp), "q2 x_label_mass", &body);
 
-    // The design: "the `noul` answer is the yes probability" - the `answer`
+    // The design: "the `noul` answer is the yes probability" - the `noul`
     // field itself is that number (entry zero of the probabilities, the
-    // labels being `yes`, `no` in that order), while a regular yes_no
-    // question (q2 above) keeps its label word.
+    // labels being `yes`, `no` in that order). q2 above is a noul too; its
+    // `criteria` wording changes the prompt, not the answer shape.
     let n1 = answer_of(&body, "n1");
     assert_eq!(
-        n1["type"], "yes_no",
-        "a criterion answers as a yes/no question"
+        n1["type"], "noul",
+        "a noul question answers in the official noul shape"
     );
     let lp = logprobs_answering(NOUL_BODY, &["yes", "no"]);
     let want = softmax(&lp, 1.0);
-    assert_close(&n1["answer"], want[0], "n1 answer", &body);
+    assert_close(&n1["noul"], want[0], "n1 noul", &body);
     assert_probabilities(&n1, &want, &body);
     assert!(want[0] > want[1], "the scripted row favours yes");
     assert_close(
@@ -522,7 +589,7 @@ async fn unknown_top_level_fields_are_ignored_and_nested_ones_refused_422() {
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
                 "extra": 1,
                 "client": {"stamp": true},
             }),
@@ -532,66 +599,35 @@ async fn unknown_top_level_fields_are_ignored_and_nested_ones_refused_422() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // Inside a question the same key would be one the caller believes is
-    // scored, so it is refused - with the location of it.
+    // scored, so it is refused - with the question's key as the location.
     let (status, body) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready",
-                               "bogus": 1}],
+                "questions": {"q1": {"type": "noul", "instructions": "ready",
+                                     "bogus": 1}},
             }),
         ),
     )
     .await;
-    assert_schema_violation(status, &body, "bogus");
+    assert_schema_violation_at(status, &body, "questions.q1", "bogus");
 
-    // Inside a noul criterion, and inside the noul block itself.
+    // And inside the noul `criteria` object, which is its own strict shape.
     let (status, body) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [],
-                "noul": {"criteria": [{"id": "n1", "question": "ready", "bogus": 2}]},
+                "questions": {"q1": {"type": "noul", "instructions": "ready",
+                                     "criteria": {"true": "confirmed", "bogus": 2}}},
             }),
         ),
     )
     .await;
-    assert_schema_violation(status, &body, "bogus");
-    let (status, body) = call(
-        &state,
-        post(
-            "/v1/systemone",
-            &json!({
-                "state": "the input",
-                "questions": [],
-                "noul": {"criteria": [], "nope": 1},
-            }),
-        ),
-    )
-    .await;
-    assert_schema_violation(status, &body, "nope");
-
-    // Inside the string-or-object option spelling too: that form is a
-    // hand-written parse, and it refuses unknown keys exactly like the
-    // derived structs do.
-    let (status, body) = call(
-        &state,
-        post(
-            "/v1/systemone",
-            &json!({
-                "state": "the input",
-                "questions": [{"id": "q1", "type": "choice", "question": "pick one",
-                               "options": [{"name": "red", "bogus": 1},
-                                           {"name": "blue"}]}],
-            }),
-        ),
-    )
-    .await;
-    assert_schema_violation(status, &body, "bogus");
+    assert_schema_violation_at(status, &body, "questions.q1", "bogus");
 
     // The same nested key on the decisions route is a 400: the schema shape is
     // the one axis the two routes disagree on.
@@ -651,10 +687,6 @@ async fn decisions_only_fields_are_refused_when_not_null() {
 #[tokio::test]
 // The brief pins this test's name and its scope: every relaxation the schema
 // states, proven answerable against one server rather than six.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one table of relaxed shapes, each asserted as 200 against the same engine"
-)]
 async fn relaxed_bounds_and_blanks() {
     // A one-option choice answers: its single label is as confident as an
     // answer gets, and the decisions route's minimum of two is not asked here.
@@ -665,8 +697,8 @@ async fn relaxed_bounds_and_blanks() {
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "q1", "type": "choice", "question": "pick one",
-                               "options": ["only one"]}],
+                "questions": {"q1": {"type": "choice", "instructions": "pick one",
+                                     "criteria": {"only one": null}}},
             }),
         ),
     )
@@ -688,14 +720,14 @@ async fn relaxed_bounds_and_blanks() {
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "s1", "type": "score", "question": "how bad",
-                               "levels": ["none"]}],
+                "questions": {"s1": {"type": "score", "instructions": "how bad",
+                                     "criteria": ["none"]}},
             }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["answers"]["s1"]["legend"], json!(["none"]));
+    assert_eq!(body["answers"]["s1"]["legend"], json!({"0": "none"}));
     assert_close(
         &body["answers"]["s1"]["score"],
         0.0,
@@ -721,55 +753,30 @@ async fn relaxed_bounds_and_blanks() {
         &state,
         post(
             "/v1/systemone",
-            &json!({"questions": [{"id": "q1", "type": "yes_no", "question": "ready"}]}),
+            &json!({"questions": {"q1": {"type": "noul", "instructions": "ready"}}}),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{replied}");
     assert_eq!(replied["state"], "", "{replied}");
 
-    // Blank ids answer under ""; an absent id is the same blank, and two
-    // blanks do not collide into a refusal because neither names anything.
-    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[]); 4], CTX);
+    // A blank map key is a blank id and answers under ""; the map wire
+    // cannot repeat one - JSON keys are unique - so that is the whole
+    // blank-id story this surface has.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
     let (status, replied) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "", "type": "yes_no", "question": "ready"}],
+                "questions": {"": {"type": "noul", "instructions": "ready"}},
             }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{replied}");
-    assert_eq!(replied["answers"][""]["type"], "yes_no", "{replied}");
-    let (status, replied) = call(
-        &state,
-        post(
-            "/v1/systemone",
-            &json!({
-                "state": "the input",
-                "questions": [{"type": "yes_no", "question": "ready"}],
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{replied}");
-    assert_eq!(replied["answers"][""]["type"], "yes_no", "{replied}");
-    let (status, replied) = call(
-        &state,
-        post(
-            "/v1/systemone",
-            &json!({
-                "state": "the input",
-                "questions": [{"type": "yes_no", "question": "ready"},
-                              {"type": "yes_no", "question": "or"}],
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "blank ids may repeat: {replied}");
+    assert_eq!(replied["answers"][""]["type"], "noul", "{replied}");
 
     // A blank question text answers: its line drops from the version-1 block,
     // which is why the wording builder carries the blank branches at all.
@@ -780,11 +787,11 @@ async fn relaxed_bounds_and_blanks() {
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [
-                    {"id": "q1", "type": "choice", "question": "",
-                     "options": ["red", "blue"]},
-                    {"id": "q2", "type": "yes_no", "question": "   "},
-                ],
+                "questions": {
+                    "q1": {"type": "choice", "instructions": "",
+                           "criteria": {"red": null, "blue": null}},
+                    "q2": {"type": "noul", "instructions": "   "},
+                },
             }),
         ),
     )
@@ -797,63 +804,37 @@ async fn strict_bounds_still_refuse() {
     // The relaxation is about blanks and list minima, not about answers that
     // could not be read: the alphabet's twenty-six, the digit's ten, unique
     // names, and the served model are refused on this route exactly as on
-    // the decisions one - and as 400s, never 422s.
-    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[]); 3], CTX);
-    let wide: Vec<Value> = (0..27).map(|index| json!(format!("opt {index}"))).collect();
+    // the decisions one - and as 400s, never 422s. A field a question's type
+    // has no place for is no longer a bound but the schema's own refusal
+    // (the unknown-key test above pins it as a 422), and the map wire
+    // cannot deliver a duplicate id: its keys are unique by construction.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[]); 2], CTX);
+    let wide: Value = (0..27)
+        .map(|index| (format!("opt {index}"), Value::Null))
+        .collect();
     let tall: Vec<Value> = (0..11)
         .map(|index| json!(format!("level {index}")))
         .collect();
     let cases: Vec<(Value, &str)> = vec![
         (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "choice",
-                 "question": "pick", "options": wide}]}),
+            json!({"state": "the input", "questions": {"q1": {"type": "choice",
+                 "instructions": "pick", "criteria": wide}}}),
             "26",
         ),
         (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "score",
-                 "question": "how bad", "levels": tall}]}),
+            json!({"state": "the input", "questions": {"q1": {"type": "score",
+                 "instructions": "how bad", "criteria": tall}}}),
             "10",
         ),
         (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "choice",
-                 "question": "pick", "options": ["Red", "red"]}]}),
+            json!({"state": "the input", "questions": {"q1": {"type": "choice",
+                 "instructions": "pick", "criteria": {"Red": null, "red": null}}}}),
             "used more than once",
         ),
         (
-            json!({"state": "the input", "questions": [
-                 {"id": "q1", "type": "yes_no", "question": "ready"},
-                 {"id": "q1", "type": "yes_no", "question": "or"}]}),
-            "q1",
-        ),
-        (
-            json!({"state": "the input",
-                   "questions": [{"id": "shared-id", "type": "yes_no", "question": "ready"}],
-                   "noul": {"criteria": [{"id": "shared-id", "question": "or"}]}}),
-            "shared-id",
-        ),
-        (
             json!({"model": "base:lora", "state": "the input", "questions":
-                 [{"id": "q1", "type": "yes_no", "question": "ready"}]}),
+                 {"q1": {"type": "noul", "instructions": "ready"}}}),
             "base:lora",
-        ),
-        // A field the question's type has no place for is the decisions
-        // route's refusal in the same words: a 400 naming the field, not a
-        // quietly dropped key and not a 422 schema error. The relaxation is
-        // about blanks and list minima, not about kinds.
-        (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "score",
-                 "question": "how bad", "levels": ["ok"], "options": ["p", "q"]}]}),
-            "options",
-        ),
-        (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "yes_no",
-                 "question": "ready", "options": ["p", "q"]}]}),
-            "options",
-        ),
-        (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "choice",
-                 "question": "pick", "options": ["p", "q"], "levels": ["ok"]}]}),
-            "levels",
         ),
     ];
     for (case, want) in cases {
@@ -868,40 +849,38 @@ async fn strict_bounds_still_refuse() {
         );
     }
 
-    // A blank criterion id answers under "", and a blank or absent criterion
-    // question answers with the bare lead line - and the flat row ties, so
-    // the yes probability the noul answer carries is exactly one half.
+    // A blank map key answers under "", and a blank `instructions` answers
+    // with the bare lead line - and the flat row ties, so the yes
+    // probability the noul answer carries is exactly one half.
     let (status, body) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [],
-                "noul": {"criteria": [{"id": "", "question": "ready"}]},
+                "questions": {"": {"type": "noul", "instructions": "ready"}},
             }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["answers"][""]["type"], "yes_no", "{body}");
+    assert_eq!(body["answers"][""]["type"], "noul", "{body}");
     let (status, body) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [],
-                "noul": {"criteria": [{"id": "n1", "question": ""}]},
+                "questions": {"n1": {"type": "noul", "instructions": ""}},
             }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_close(
-        &body["answers"]["n1"]["answer"],
+        &body["answers"]["n1"]["noul"],
         0.5,
-        "a tied row answers the criterion at a half",
+        "a tied row answers the noul question at a half",
         &body,
     );
 }
@@ -924,7 +903,7 @@ async fn a_container_state_is_scored_from_its_key_sorted_rendering() {
             "/v1/systemone",
             &json!({
                 "state": {"b": 1, "a": [1, 2]},
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
             }),
         ),
     )
@@ -949,20 +928,39 @@ async fn a_container_state_is_scored_from_its_key_sorted_rendering() {
 async fn malformed_json_is_422_not_400() {
     let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
 
-    // A known field spelled with the wrong type is a schema violation here,
-    // where the decisions route's typed parse answers the same body 400.
+    // Yesterday's array spelling is a schema violation naming `questions`:
+    // the cutover removed the dialect, and a caller posting the old body
+    // gets the document-fix class with the field to fix, not a 500 or a
+    // silently-empty answer.
     let (status, body) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "q1", "type": 5, "question": "ready"}],
+                "questions": [{"id": "q1", "type": "noul", "instructions": "ready"}],
             }),
         ),
     )
     .await;
-    assert_schema_violation(status, &body, "");
+    assert_schema_violation_at(status, &body, "questions", "questions");
+
+    // A known field spelled with the wrong type inside a question is a
+    // schema violation here, located at the question's key, where the
+    // decisions route's typed parse answers its own spelling of the same
+    // mistake 400.
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "questions": {"q1": {"type": 5, "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_schema_violation_at(status, &body, "questions.q1", "type");
     let (status, body) = call(&state, post_raw("/v1/systemone", r#"{"questions": ["#)).await;
     assert_schema_violation(status, &body, "");
 
@@ -1004,7 +1002,7 @@ async fn a_content_block_state_is_refused_422() {
                 "/v1/systemone",
                 &json!({
                     "state": [block],
-                    "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                    "questions": {"q1": {"type": "noul", "instructions": "ready"}},
                 }),
             ),
         )
@@ -1025,6 +1023,277 @@ async fn a_content_block_state_is_refused_422() {
     }
 }
 
+// --- the clef `images` extension ---------------------------------------------
+
+/// The image marker's id in `media_vocabulary`: past every word of `WORDS`
+/// and inside the scripted row's width. The media harness is `decisions.rs`'s
+/// media shape - same fake tower geometry, same pad-run arithmetic - because
+/// systemone composes its `images` into that pipeline and nothing else.
+const PAD: u32 = 40;
+
+/// The vocabulary the media tests render with: every word of `WORDS` plus
+/// Qwen's image marker as a declared added token. Added rather than ordinary
+/// because that is what lets the renderer fan one marker out to a pad run.
+fn media_vocabulary() -> Arc<Vocabulary> {
+    let mut vocab = serde_json::Map::new();
+    for (id, text) in WORDS.iter().enumerate() {
+        vocab.insert((*text).to_owned(), json!(id));
+    }
+    vocab.insert(MediaPlacement::QWEN35.image_marker.to_owned(), json!(PAD));
+    let added = vec![json!({
+        "id": PAD,
+        "content": MediaPlacement::QWEN35.image_marker,
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": false,
+        "special": true,
+    })];
+    let document = json!({
+        "version": "1.0",
+        "truncation": Value::Null,
+        "padding": Value::Null,
+        "added_tokens": added,
+        "normalizer": Value::Null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": Value::Null,
+        "decoder": Value::Null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
+    })
+    .to_string();
+    let inner = tokenizers::Tokenizer::from_str(&document).expect("the media vocabulary loads");
+    Arc::new(Vocabulary::from_tokenizer(inner))
+}
+
+/// `TEMPLATE` with the image branch a family's template carries: one marker
+/// per picture, text parts verbatim.
+const MEDIA_TEMPLATE: &str = concat!(
+    "{% for m in messages %}<|{{ m.role }}|> ",
+    "{% for part in m.content %}",
+    "{% if part.type == 'image' %}<|image_pad|>{% else %}{{ part.text }}{% endif %}",
+    "{% endfor %} <|end|> ",
+    "{% endfor %}<|assistant|>\n",
+);
+
+/// A server in the shape a `--vision` server has: a renderer with the tower's
+/// geometry attached, and an engine holding a fake tower and a model that can
+/// read media.
+fn media_state(rows: Vec<Vec<f32>>, ctx: u32) -> (Arc<AppState>, Arc<common::Audit>) {
+    let vocabulary = media_vocabulary();
+    let (engine, _join, audit, _media_calls) =
+        common::fake_media_engine(rows, Some(Arc::clone(&vocabulary)), false);
+    let renderer = PromptRenderer::new(
+        MEDIA_TEMPLATE,
+        ToolJsonStyle::Compact,
+        Arc::clone(&vocabulary),
+    )
+    .expect("the media template compiles")
+    .with_tower(
+        &common::media_spec(),
+        MediaPlacement::QWEN35,
+        ImageLimits::default(),
+    );
+    let state = Arc::new(
+        AppState::new(engine, "test-model".to_owned(), ctx)
+            .with_vocabulary(vocabulary)
+            .with_renderer(Arc::new(renderer)),
+    );
+    (state, audit)
+}
+
+/// The ids the model should read for a media prompt: the rendered text
+/// encoded through the media vocabulary, with every marker occurrence fanned
+/// out to `pads` pad ids - the expansion the renderer owes the prompt.
+fn expanded_ids(vocabulary: &Arc<Vocabulary>, text_with_markers: &str, pads: usize) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for token in vocabulary
+        .encode(text_with_markers, false)
+        .expect("the prompt encodes")
+    {
+        if token.get() == PAD {
+            ids.extend(std::iter::repeat_n(PAD, pads));
+        } else {
+            ids.push(token.get());
+        }
+    }
+    ids
+}
+
+#[tokio::test]
+async fn an_image_only_systemone_request_is_valid() {
+    // Spec ruling 4: blank state with images is image-only, and image-only
+    // is valid - the picture is a thing to score even when no state text
+    // says anything.
+    let png = common::png_data_uri(96, 96);
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "",
+                "images": [png],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(answer_of(&body, "q1")["type"], "noul", "{body}");
+}
+
+#[tokio::test]
+async fn an_image_and_state_score_the_expanded_prompt() {
+    // Composition (spec §3): images before the state, clef's rule. The
+    // audited prompt is the pad run, then the state text, then the question
+    // block with the string path's blank line - the trim keeps that seam
+    // byte-identical - and the usage number bills the expansion.
+    let png = common::png_data_uri(96, 96);
+    let (state, audit) = media_state(vec![row_with(0.5, &[]); 2], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "  the input  ",
+                "images": [png],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let want = expanded_ids(
+        &media_vocabulary(),
+        &format!("<|user|> <|image_pad|>{NOUL_BODY} <|end|> <|assistant|>\n"),
+        4,
+    );
+    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
+    assert_eq!(
+        got,
+        vec![want],
+        "the pad run came before the trimmed state text: {got:?}"
+    );
+
+    // The same question without the picture: the expanded pads are billed,
+    // so the media request must cost strictly more input tokens. Equal costs
+    // would mean the pixels became nothing the model was scored on.
+    let (status, plain) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    assert!(
+        body["usage"]["input_tokens"].as_u64().expect("usage")
+            > plain["usage"]["input_tokens"].as_u64().expect("usage"),
+        "the picture added no input tokens: {body} vs {plain}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_images_item_is_422_naming_the_index() {
+    // The schema class with the element's 0-based index as the location -
+    // the first item is fine, the second is the one to fix.
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "images": [common::png_data_uri(96, 96), 5],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_schema_violation_at(status, &body, "images[1]", "images[1]");
+}
+
+#[tokio::test]
+async fn a_remote_image_is_refused_without_the_flag() {
+    // The url form parses at the wire and rides the renderer's existing
+    // policy refusal - the same arm decisions' url block rides, and the
+    // wire duplicates none of it.
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "images": [{"url": "https://example.com/x.png"}],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--vision-allow-remote-images")),
+        "the refusal must name the flag: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_image_without_a_vision_tower_is_refused() {
+    // The item is well-formed and the wire accepts it; the refusal is the
+    // renderer's: a text-only deployment cannot score pixels and says so.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    let png = common::png_data_uri(96, 96);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "images": [png],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no vision tower")),
+        "the refusal must name the missing tower: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_over_budget_image_is_a_context_overflow() {
+    // The context guard measures the expanded prompt, so a picture's pad run
+    // is charged like any other text - and blamed on `input`.
+    let png = common::png_data_uri(96, 96);
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], 12);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "images": [png],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "context_length_exceeded", "{body}");
+    assert_eq!(body["error"]["param"], "input", "{body}");
+}
+
 // --- prompt pairing ----------------------------------------------------------
 
 /// The choice question's exact version-1 body, as the shared builder renders
@@ -1039,7 +1308,7 @@ const SCORE_BODY: &str = "the input\n\nQuestion: how bad\n0: none\n1: some\n2: l
 /// The yes/no question's exact version-1 body.
 const YES_NO_BODY: &str = "the input\n\nIs the following true? ready\nyes: confirmed\nno: denied\nAnswer with yes or no only.";
 
-/// The noul criterion's exact version-1 body: the yes/no block without the
+/// The noul question's exact version-1 body: the yes/no block without the
 /// label-wording lines.
 const NOUL_BODY: &str = "the input\n\nIs the following true? ready\nAnswer with yes or no only.";
 

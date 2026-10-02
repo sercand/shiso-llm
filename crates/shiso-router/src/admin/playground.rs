@@ -31,7 +31,7 @@ use axum::response::IntoResponse;
 use base64::Engine;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::config::BackendKind;
 use crate::error::AppError;
@@ -129,10 +129,12 @@ pub(crate) struct PlaygroundRequest {
     /// JSON error on the whole console request.
     #[serde(default)]
     pub questions: Option<String>,
-    /// The pictures to score, for `/v1/decisions` only: with any, the
-    /// `input` becomes a content-block array carrying the turn's text and
-    /// these bytes; without any, the string form is sent unchanged. The
-    /// systemone composer has no picker and ignores this.
+    /// The pictures to score, for the scoring endpoints: with any,
+    /// `/v1/decisions` sends `input` as a content-block array carrying the
+    /// turn's text and these bytes, and `/v1/systemone` sends them as
+    /// clef's `images` array of `{"content_type", "base64"}` items. Without
+    /// any, decisions sends the string form unchanged and systemone sends
+    /// no `images` key.
     #[serde(default)]
     pub images: Vec<Image>,
 }
@@ -474,9 +476,29 @@ fn build_body(req: &PlaygroundRequest) -> Result<Value, AppError> {
             // The system prompt doubles as the System One `state`; a blank
             // one is legal there, so it is sent as the empty string.
             // Temperature is deliberately NOT forwarded: the systemone wire
-            // refuses it with any value, scoring always runs at 1.0.
+            // refuses it with any value, scoring always runs at 1.0. The
+            // editor's array becomes the official map here — the page
+            // script keeps one editor for both scoring endpoints and the
+            // dialect stays Rust's — and picked images ride as clef's
+            // base64-object items, placed before the state by the server.
             obj.insert("state".into(), json!(system.unwrap_or("")));
-            obj.insert("questions".into(), parse_questions(req)?);
+            obj.insert("questions".into(), systemone_questions(req)?);
+            if !req.images.is_empty() {
+                let images: Vec<Value> = req
+                    .images
+                    .iter()
+                    .map(|image| {
+                        json!({
+                            "content_type": image
+                                .content_type
+                                .as_deref()
+                                .unwrap_or("application/octet-stream"),
+                            "base64": image.data,
+                        })
+                    })
+                    .collect();
+                obj.insert("images".into(), Value::Array(images));
+            }
             return Ok(body);
         }
         other => return Err(AppError::BadRequest(format!("unsupported path {other:?}"))),
@@ -516,6 +538,115 @@ fn parse_questions(req: &PlaygroundRequest) -> Result<Value, AppError> {
         ));
     }
     Ok(parsed)
+}
+
+/// The console's editor array as the official System One questions map:
+/// each entry becomes a map entry keyed by its `id`, `yes_no` becomes
+/// `noul` (the `yes`/`no` wordings, when the entry carries them, move to
+/// `criteria`'s official `true`/`false` keys), `choice` options become a
+/// criteria map whose `null` values say "no description", and `score`
+/// levels become the criteria array. Keys the conversion does not consume
+/// pass through untouched: the server's `deny_unknown_fields` refuses them,
+/// and the console does not re-validate what the server already validates.
+/// A missing or blank `id`, a duplicated `id` and an unknown `type` are the
+/// console's own 400s — the map cannot be keyed without an id, two entries
+/// under one id would collapse to one question, and a type the conversion
+/// does not know has no official spelling to convert to.
+fn systemone_questions(req: &PlaygroundRequest) -> Result<Value, AppError> {
+    let parsed = parse_questions(req)?;
+    let entries = parsed.as_array().expect("parse_questions returns an array");
+    let mut questions = Map::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "every systemone question needs a non-blank id (entry {index})"
+                ))
+            })?;
+        // The map keys by id, so a second entry under one id would `insert`
+        // over the first and silently drop a question the operator wrote;
+        // the duplicate is refused by name, as the blank id above is.
+        if questions.contains_key(id) {
+            return Err(AppError::BadRequest(format!(
+                "duplicate systemone question id {id:?} (entry {index})"
+            )));
+        }
+        let (wire_type, criteria) = match entry.get("type").and_then(Value::as_str) {
+            Some("yes_no") => {
+                let mut criteria = Map::new();
+                if let Some(yes) = entry.get("yes") {
+                    criteria.insert("true".into(), yes.clone());
+                }
+                if let Some(no) = entry.get("no") {
+                    criteria.insert("false".into(), no.clone());
+                }
+                (
+                    "noul",
+                    (!criteria.is_empty()).then(|| Value::Object(criteria)),
+                )
+            }
+            Some("choice") => {
+                let criteria = match entry.get("options") {
+                    // A missing options list stays a missing criteria: the
+                    // server names that absence. A non-array one cannot
+                    // become a map, and a non-string option cannot become a
+                    // key — those are the conversion's own impossibilities,
+                    // not re-validation.
+                    Some(Value::Array(options)) => {
+                        let mut criteria = Map::new();
+                        for option in options {
+                            let name = option.as_str().ok_or_else(|| {
+                                AppError::BadRequest(format!(
+                                    "questions[{index}] has a non-string option: the criteria map keys by name"
+                                ))
+                            })?;
+                            criteria.insert(name.to_string(), Value::Null);
+                        }
+                        Some(Value::Object(criteria))
+                    }
+                    Some(_) => {
+                        return Err(AppError::BadRequest(format!(
+                            "questions[{index}] options must be a JSON array"
+                        )));
+                    }
+                    None => None,
+                };
+                ("choice", criteria)
+            }
+            // The levels ride as spelled: a non-array is the server's 422.
+            Some("score") => ("score", entry.get("levels").cloned()),
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "questions[{index}] has unknown type {other:?} (expected yes_no, choice or score)"
+                )));
+            }
+        };
+        let mut out = Map::new();
+        out.insert("type".into(), json!(wire_type));
+        if let Some(question) = entry.get("question") {
+            out.insert("instructions".into(), question.clone());
+        }
+        if let Some(criteria) = criteria {
+            out.insert("criteria".into(), criteria);
+        }
+        for (key, value) in entry
+            .as_object()
+            .expect("the id lookup only succeeds on an object")
+        {
+            if !matches!(
+                key.as_str(),
+                "id" | "type" | "question" | "options" | "levels" | "yes" | "no"
+            ) {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+        questions.insert(id.to_string(), Value::Object(out));
+    }
+    Ok(Value::Object(questions))
 }
 
 /// Builds a transcription request the way the OpenAI SDK does: a multipart
@@ -791,7 +922,11 @@ fn extract_text(path: &str, body: &Value) -> Option<String> {
             let lines: Vec<String> = answers
                 .iter()
                 .map(|(id, ans)| {
-                    let shown = match ans.get("choice").or_else(|| ans.get("answer")) {
+                    let shown = match ans
+                        .get("choice")
+                        .or_else(|| ans.get("answer"))
+                        .or_else(|| ans.get("noul"))
+                    {
                         Some(Value::String(s)) => s.clone(),
                         Some(v @ Value::Number(_)) => v.to_string(),
                         _ => ans["score"]
@@ -1069,7 +1204,7 @@ mod tests {
         validate(&r).unwrap();
         let b = build_body(&r).unwrap();
         assert_eq!(b["state"], "be brief", "the system prompt is the state");
-        assert_eq!(b["questions"].as_array().unwrap().len(), 2);
+        assert_eq!(b["questions"].as_object().unwrap().len(), 2, "the map wire");
         assert!(
             b.get("temperature").is_none(),
             "the systemone wire refuses temperature with any value"
@@ -1152,18 +1287,136 @@ mod tests {
     }
 
     #[test]
-    fn build_body_systemone_is_unchanged() {
-        // The systemone wire refuses block arrays outright; the console
-        // gives its composer no picker and sends its state as the string it
-        // always was, whatever `images` a stale request might carry.
+    fn systemone_body_sends_picked_images_in_the_clef_form() {
+        // The console's picker payload rides the systemone body as clef's
+        // base64-object items, not as decisions' content blocks.
         let mut r = with_questions(SYSTEMONE);
         r.images = two_images();
         let b = build_body(&r).unwrap();
-        assert_eq!(b["state"], "be brief");
-        assert!(
-            b.get("images").is_none(),
-            "images never ride the systemone body"
+        assert_eq!(
+            b["images"],
+            json!([
+                {
+                    "content_type": "image/png",
+                    "base64": base64::engine::general_purpose::STANDARD.encode("bytes-0"),
+                },
+                {
+                    "content_type": "image/jpeg",
+                    "base64": base64::engine::general_purpose::STANDARD.encode("bytes-1"),
+                },
+            ])
         );
+
+        // A file the browser named no MIME type for still spells a
+        // content_type; the server sniffs the bytes anyway.
+        let mut r = with_questions(SYSTEMONE);
+        r.images = vec![Image {
+            filename: "x".into(),
+            content_type: None,
+            data: "aGk=".into(),
+        }];
+        let b = build_body(&r).unwrap();
+        assert_eq!(b["images"][0]["content_type"], "application/octet-stream");
+
+        // No images picked: no key, the body stays the text-only wire.
+        let b = build_body(&with_questions(SYSTEMONE)).unwrap();
+        assert!(b.get("images").is_none());
+    }
+
+    /// The editor array covering every type: bare and worded `yes_no`,
+    /// `choice`, `score`, and an entry carrying a key the conversion does
+    /// not know.
+    fn editor_array() -> String {
+        json!([
+            {"id": "q1", "type": "yes_no", "question": "Is this about billing?"},
+            {"id": "q2", "type": "yes_no", "question": "Is a refund due?",
+             "yes": "a refund is due", "no": "no refund is due"},
+            {"id": "q3", "type": "choice", "question": "What is it?",
+             "options": ["a bug", "a feature"]},
+            {"id": "q4", "type": "score", "question": "How urgent?",
+             "levels": ["0", "1", "2"]},
+            {"id": "q5", "type": "yes_no", "question": "A stale key?", "extra": 7},
+        ])
+        .to_string()
+    }
+
+    #[test]
+    fn systemone_body_converts_the_editor_array_to_the_official_map() {
+        let mut r = req(SYSTEMONE);
+        r.questions = Some(editor_array());
+        validate(&r).unwrap();
+        let b = build_body(&r).unwrap();
+        let questions = b["questions"].as_object().expect("the map wire");
+        assert_eq!(
+            questions.keys().cloned().collect::<Vec<_>>(),
+            ["q1", "q2", "q3", "q4", "q5"],
+            "the map keeps the editor's order"
+        );
+        let q1 = &b["questions"]["q1"];
+        assert_eq!(q1["type"], "noul");
+        assert_eq!(q1["instructions"], "Is this about billing?");
+        assert!(q1.get("criteria").is_none(), "no wordings, no criteria");
+        assert!(q1.get("question").is_none(), "the editor keys are consumed");
+        assert_eq!(
+            b["questions"]["q2"]["criteria"],
+            json!({"true": "a refund is due", "false": "no refund is due"})
+        );
+        assert!(b["questions"]["q2"].get("yes").is_none());
+        assert_eq!(b["questions"]["q3"]["type"], "choice");
+        assert_eq!(
+            b["questions"]["q3"]["criteria"],
+            json!({"a bug": null, "a feature": null}),
+            "the editor's options carry no descriptions"
+        );
+        assert!(b["questions"]["q3"].get("options").is_none());
+        assert_eq!(b["questions"]["q4"]["type"], "score");
+        assert_eq!(b["questions"]["q4"]["criteria"], json!(["0", "1", "2"]));
+        assert!(b["questions"]["q4"].get("levels").is_none());
+        assert_eq!(
+            b["questions"]["q5"]["extra"], 7,
+            "unknown keys pass through; the server refuses them"
+        );
+    }
+
+    #[test]
+    fn systemone_body_refuses_blank_ids_and_unknown_types() {
+        // The map cannot be keyed without an id, and a type the conversion
+        // does not know has no official spelling: both are the console's
+        // own 400, not the server's 422.
+        let mut r = req(SYSTEMONE);
+        for questions in [
+            r#"[{"type":"yes_no","question":"no id"}]"#,
+            r#"[{"id":"  ","type":"yes_no","question":"blank id"}]"#,
+            r#"[{"id":"q1","type":"yesno","question":"unknown type"}]"#,
+            r#"[{"id":"q1","type":"choice","question":"?","options":[7]}]"#,
+        ] {
+            r.questions = Some(questions.into());
+            let err = build_body(&r).unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "{questions}: {err}");
+        }
+    }
+
+    #[test]
+    fn systemone_body_refuses_duplicate_question_ids() {
+        // The map wire keys by id, so two editor entries sharing an id would
+        // silently collapse into the last one written; the console names the
+        // duplicated id instead of dropping a question the operator wrote.
+        let mut r = req(SYSTEMONE);
+        r.questions = Some(
+            r#"[{"id":"q1","type":"yes_no","question":"first"},
+                {"id":"q1","type":"choice","question":"second","options":["a","b"]}]"#
+                .into(),
+        );
+        let err = build_body(&r).unwrap_err();
+        match err {
+            AppError::BadRequest(message) => {
+                assert!(
+                    message.contains("q1"),
+                    "the refusal must name the id: {message}"
+                );
+            }
+            other => panic!("expected a BadRequest, got {other}"),
+        }
     }
 
     #[test]
@@ -1197,14 +1450,14 @@ mod tests {
             Some("q1: no\nq2: a bug\nq3: 1.75")
         );
 
-        // A System One noul answer carries the yes probability as a number.
+        // A System One noul answer carries the yes probability under `noul`.
         let systemone = json!({"answers": {
-            "": {"type": "yes_no", "answer": "yes", "confidence": 0.8},
-            "n1": {"type": "yes_no", "answer": 0.03, "confidence": 0.94}
+            "q": {"type": "noul", "noul": 0.9, "probabilities": [0.9, 0.1], "confidence": 0.8},
+            "c": {"type": "choice", "choice": "a bug", "probabilities": {"a bug": 0.9, "a feature": 0.1}}
         }});
         assert_eq!(
             extract_text(SYSTEMONE, &systemone).as_deref(),
-            Some(": yes\nn1: 0.03")
+            Some("q: 0.9\nc: a bug")
         );
 
         // An error body or an answers-less reply degrades to no text.

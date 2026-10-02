@@ -22,8 +22,8 @@
 //!   cargo test -p shiso-server --features metal --test decisions_device -- --ignored --nocapture
 //! ```
 //!
-//! The vision case is gated on its own export and skips with a stated reason
-//! without one:
+//! The vision cases are gated on their own export and skip with a stated
+//! reason without one:
 //!
 //! ```text
 //! SHISO_TEST_MODEL_VISION=/path/to/Qwen3.5-VL \
@@ -271,12 +271,19 @@ async fn post_json(state: &Arc<AppState>, path: &str, body: &Value) -> Value {
     body
 }
 
-/// The `probabilities` of one answer, as `f64`.
+/// The `probabilities` of one answer, as `f64`, in label order: the array
+/// form the decisions route and the systemone noul answer carry, or the
+/// string-keyed map the official choice and score shapes carry (the map's
+/// insertion order is the label order).
 fn probabilities(answer: &Value) -> Vec<f64> {
-    answer["probabilities"]
-        .as_array()
-        .expect("an answer carries its probabilities")
-        .iter()
+    let field = &answer["probabilities"];
+    let values: Vec<&Value> = match (field.as_array(), field.as_object()) {
+        (Some(array), _) => array.iter().collect(),
+        (_, Some(object)) => object.values().collect(),
+        _ => panic!("an answer carries its probabilities: {answer}"),
+    };
+    values
+        .into_iter()
         .map(|p| p.as_f64().expect("a probability is a number"))
         .collect()
 }
@@ -391,22 +398,29 @@ async fn decisions(state: &Arc<AppState>) {
     say("ok: /v1/decisions answered the ticket from a real model");
 }
 
-/// The systemone surface: the same ticket, the relaxed wire, confidences.
+/// The systemone surface: the same ticket, the official map wire,
+/// confidences.
 async fn systemone(state: &Arc<AppState>) {
     let body = post_json(
         state,
         "/v1/systemone",
         &json!({
             "state": TICKET,
-            "questions": [choice_question(), score_question()],
-            "noul": {"criteria": [{"id": "billing",
-                                   "question": "Is this about billing?"}]},
+            "questions": {
+                "kind": {"type": "choice", "instructions": "What kind of report is this?",
+                         "criteria": {"a bug": null, "a feature request": null,
+                                      "a question about billing": null}},
+                "urgency": {"type": "score", "instructions": "How urgent is this report?",
+                            "criteria": ["not urgent", "moderately urgent", "urgent"]},
+                "billing": {"type": "noul", "instructions": "Is this about billing?"},
+            },
         }),
     )
     .await;
     assert_eq!(body["state"], TICKET, "the state is echoed: {body}");
 
     let kind = &body["answers"]["kind"];
+    assert_eq!(kind["type"], "choice", "{body}");
     assert_eq!(kind["choice"], "a bug", "{body}");
     let confidence = kind["confidence"]
         .as_f64()
@@ -418,20 +432,27 @@ async fn systemone(state: &Arc<AppState>) {
     check_shape(kind, "x_label_mass", "systemone/kind");
 
     let urgency = &body["answers"]["urgency"];
-    assert!(
-        urgency["legend"].is_array(),
-        "a score answer echoes its legend: {body}"
+    assert_eq!(
+        urgency["legend"],
+        json!({"0": "not urgent", "1": "moderately urgent", "2": "urgent"}),
+        "a score answer echoes its legend as the official string-indexed map: {body}"
     );
     check_score_range(urgency, "systemone/urgency");
     check_shape(urgency, "x_label_mass", "systemone/urgency");
 
     let billing = &body["answers"]["billing"];
+    assert_eq!(billing["type"], "noul", "{body}");
     // The noul answer is the yes probability itself (the design), so the
-    // number, not a label word, carries "not about billing": below a half,
-    // equal to the first probability, with `no` above `yes` in the row.
-    let answer = billing["answer"]
+    // number under `noul` - not a label word, and not the removed `answer`
+    // - carries "not about billing": below a half, equal to the first
+    // probability, with `no` above `yes` in the row.
+    let answer = billing["noul"]
         .as_f64()
         .expect("a noul answer is the yes probability, a number");
+    assert!(
+        billing.get("answer").is_none(),
+        "the number moved from `answer` to `noul`: {body}"
+    );
     assert!(
         answer < 0.5,
         "the noul criterion answered yes ({answer}) over a ticket that is \
@@ -596,6 +617,86 @@ async fn a_vision_ticket_answers_through_decisions() {
             billed(&text_only)
         );
         say("ok: /v1/decisions answered a vision ticket and billed the expanded pads");
+    };
+    let finished = tokio::time::timeout(Duration::from_secs(600), session).await;
+
+    drop(state);
+    stack.shutdown();
+    finished.expect("the session finished inside its deadline");
+}
+
+/// The vision case on the systemone surface: the same screenshot through the
+/// clef `images` field, on the same real checkpoint and tower. Shape and
+/// billing only, for the same reasons as the decisions case beside it - the
+/// load-bearing line is the `input_tokens` comparison against the same
+/// request without the picture: if the pixels never became tokens, the two
+/// requests cost the same and this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a local vision export and a Metal device"]
+async fn a_vision_ticket_answers_through_systemone() {
+    let Some((export_dir, config)) = vision_export() else {
+        say(
+            "SKIP: SHISO_TEST_MODEL_VISION names no usable vision export (a directory \
+             with a config.json in it or in its mlx/ subdirectory, and the vision \
+             sidecar beside it)",
+        );
+        return;
+    };
+    if !shiso_metal::metal_available() {
+        say("SKIP: no Metal device");
+        return;
+    }
+
+    let stack = Stack::boot_with_vision(&export_dir, &config, &export_dir);
+    say(&format!("booted vision export {}", export_dir.display()));
+    let state = Arc::clone(&stack.state);
+
+    let ticket = "The app looks broken on my phone, look at the screenshot.";
+    let question = json!({"type": "noul",
+                          "instructions": "Does the screenshot show a stuck spinner?"});
+    let picture = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(screenshot_png())
+    );
+
+    let session = async {
+        let with_picture = post_json(
+            &state,
+            "/v1/systemone",
+            &json!({
+                "state": ticket,
+                "images": [picture],
+                "questions": {"spinner": question.clone()},
+            }),
+        )
+        .await;
+        let answer = &with_picture["answers"]["spinner"];
+        assert_eq!(answer["type"], "noul", "{with_picture}");
+        check_shape(answer, "x_label_mass", "systemone-vision/spinner");
+
+        // The same request with the picture dropped: the expanded pads are
+        // billed into `input_tokens`, so the media request must cost
+        // strictly more. The comparison carries the same assumption as the
+        // decisions case beside it - do not thin the screenshot toward a
+        // one-pad fixture and call the difference noise.
+        let text_only = post_json(
+            &state,
+            "/v1/systemone",
+            &json!({"state": ticket, "questions": {"spinner": question}}),
+        )
+        .await;
+        let billed = |body: &Value| {
+            body["usage"]["input_tokens"]
+                .as_u64()
+                .expect("the accounting counts the prompts")
+        };
+        assert!(
+            billed(&with_picture) > billed(&text_only),
+            "the picture added no input tokens: {} vs {}",
+            billed(&with_picture),
+            billed(&text_only)
+        );
+        say("ok: /v1/systemone answered a vision ticket through the clef images field");
     };
     let finished = tokio::time::timeout(Duration::from_secs(600), session).await;
 
