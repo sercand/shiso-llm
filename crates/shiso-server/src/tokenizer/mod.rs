@@ -685,7 +685,7 @@ mod detokenizer_tests {
         );
         assert_eq!(
             ids(vocabulary
-                .encode_prompt_with_literals(text, &[4..7])
+                .encode_prompt_with_literals(text, std::slice::from_ref(&(4..7)))
                 .expect("encodes")),
             vec![4, 3, 0, 1, 2, 3]
         );

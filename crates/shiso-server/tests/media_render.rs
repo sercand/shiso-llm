@@ -637,9 +637,16 @@ fn a_rendered_image_prompt_reports_its_media_spans() {
     assert_eq!(pads, 4, "a 96x96 picture is four soft tokens here");
     assert_eq!(prompt.media_spans.len(), 1);
     let span = &prompt.media_spans[0];
-    assert_eq!(&prompt.text[span.text.clone()], MediaPlacement::QWEN35.image_marker);
+    assert_eq!(
+        &prompt.text[span.text.clone()],
+        MediaPlacement::QWEN35.image_marker
+    );
     let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
-    assert_eq!(&ids[span.tokens.clone()], &vec![2u32; pads], "the run is the pads");
+    assert_eq!(
+        &ids[span.tokens.clone()],
+        &vec![2u32; pads],
+        "the run is the pads"
+    );
     // The spans end lines up with the text after the marker: `word` before,
     // nothing after.
     assert_eq!(&ids[..span.tokens.start], &[1]);
@@ -680,7 +687,10 @@ fn a_bracketed_family_span_includes_the_brackets() {
         "the span is bracket + run + bracket, one pad here"
     );
     assert_eq!(span.tokens.len(), 3, "pad_count + 2");
-    assert_eq!(&prompt.text[span.text.clone()], MediaPlacement::GEMMA4.image_marker);
+    assert_eq!(
+        &prompt.text[span.text.clone()],
+        MediaPlacement::GEMMA4.image_marker
+    );
     assert_eq!(&ids[..span.tokens.start], &[1]);
     assert_eq!(span.tokens.end, ids.len());
 }
@@ -710,7 +720,10 @@ fn two_images_have_ordered_spans() {
     assert_eq!(prompt.media_spans.len(), 2);
     let (first, second) = (&prompt.media_spans[0], &prompt.media_spans[1]);
     assert!(first.text.end <= second.text.start, "{first:?} {second:?}");
-    assert!(first.tokens.end <= second.tokens.start, "{first:?} {second:?}");
+    assert!(
+        first.tokens.end <= second.tokens.start,
+        "{first:?} {second:?}"
+    );
     assert_eq!(&prompt.text[first.text.end..second.text.start], "mid");
     assert_eq!(&prompt.text[second.text.end..], "tail");
 }
@@ -725,4 +738,69 @@ fn a_text_only_render_has_no_spans() {
         .expect("a text prompt renders");
     assert!(prompt.media.is_empty());
     assert!(prompt.media_spans.is_empty());
+}
+
+/// A template that writes tool descriptions, string call arguments raw and
+/// tool results, as Qwen's does.
+const QWEN_TOOL_TEMPLATE: &str = concat!(
+    "{% for t in tools or [] %}{{ t.function.description }} {% endfor %}",
+    "{% for m in messages %}",
+    "{% for c in m.tool_calls or [] %}",
+    "{% for k, v in c.function.arguments|items %}{{ v }} {% endfor %}",
+    "{% endfor %}",
+    "{% for part in m.content %}{{ part.text }} {% endfor %}",
+    "{% endfor %}",
+);
+
+/// An agent editing a file that spells a marker sends it back in a call's
+/// arguments, in the tool's result and sometimes in a tool's description.
+/// Every one of them is text, so a prompt carrying them and no picture
+/// renders, with no marker id in it.
+#[test]
+fn marker_text_in_tool_calls_results_and_definitions_stays_text() {
+    let renderer = PromptRenderer::new(
+        QWEN_TOOL_TEMPLATE,
+        ToolJsonStyle::Compact,
+        qwen_vocabulary(),
+    )
+    .expect("the tiny template compiles")
+    .with_tower(
+        &one_token_spec(),
+        MediaPlacement::QWEN35,
+        ImageLimits::default(),
+    );
+    let marker = MediaPlacement::QWEN35.image_marker;
+    let mut request = Request::new(
+        "test",
+        vec![
+            Message::new(
+                Role::Assistant,
+                vec![Block::ToolUse(shiso_ir::ToolUse::new(
+                    "c1",
+                    "write",
+                    json!({"content": format!("word {marker}")}),
+                ))],
+            ),
+            Message::new(
+                Role::User,
+                vec![Block::ToolResult(shiso_ir::ToolResult {
+                    tool_use_id: "c1".to_owned(),
+                    content: vec![Block::Text(format!("word {marker}"))],
+                    is_error: false,
+                })],
+            ),
+        ],
+    );
+    request.tools.push(shiso_ir::ToolDefinition {
+        name: "write".to_owned(),
+        description: Some(format!("word {marker}")),
+        input_schema: json!({"type": "object"}),
+    });
+    let prompt = renderer
+        .render(&request)
+        .expect("marker text in tool traffic is text, not media");
+    assert!(prompt.media.is_empty());
+    assert_eq!(prompt.text.matches(marker).count(), 3, "{}", prompt.text);
+    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
+    assert!(!ids.contains(&2), "{ids:?}");
 }

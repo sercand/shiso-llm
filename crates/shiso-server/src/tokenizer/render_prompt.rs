@@ -425,9 +425,12 @@ impl PromptRenderer {
         // Marker text a caller wrote is escaped here and read as plain text
         // when encoded, so the only markers in the ids are the ones the
         // template wrote for attached media.
-        let escaped = literal_text::escape(&mut prepared.messages, &self.marker_text);
+        let mut escaped = literal_text::escape(&mut prepared.messages, &self.marker_text);
 
-        let tools = Self::tool_documents(request);
+        let mut tools = Self::tool_documents(request);
+        if let Some(tools) = tools.as_mut() {
+            literal_text::escape_more(tools, &self.marker_text, &mut escaped);
+        }
         let text = self
             .template
             .render(&prepared.messages, tools.as_deref(), self.flags(request))
