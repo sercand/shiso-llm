@@ -49,38 +49,48 @@ impl Escaped {
 #[error("the chat template altered an escaped span of message text")]
 pub struct Unescape;
 
-/// Escapes every occurrence of `markers` in the message text of `messages`.
+/// Escapes every occurrence of `markers` in every string of `messages`.
 ///
-/// Only text a caller wrote is touched: text parts, a turn's string content and
-/// its reasoning trace. The structural keys the template branches on - roles,
-/// part types, call ids - are left alone, and tool-call arguments are dumped
-/// as JSON by the template, which escapes the angle brackets a marker is
-/// spelled with anyway.
+/// Every string, not only text parts: a tool call's arguments are caller text
+/// too, and a template writes a string argument into the prompt raw - Qwen's
+/// writes each one between `<parameter=...>` tags - so an agent editing a file
+/// that spells a marker would otherwise put live markers in the prompt. The
+/// structural values a template branches on - roles, part types, call ids -
+/// never spell a marker, so escaping them is a no-op. Object keys are left
+/// alone: a template matches on them, and none of them is caller prose.
 pub fn escape(messages: &mut [Value], markers: &[&str]) -> Escaped {
     let mut escaped = Escaped::default();
-    if markers.is_empty() {
-        return escaped;
-    }
-    for message in messages {
-        let Some(turn) = message.as_object_mut() else {
-            continue;
-        };
-        if let Some(Value::String(trace)) = turn.get_mut("reasoning_content") {
-            escape_string(trace, markers, &mut escaped);
-        }
-        match turn.get_mut("content") {
-            Some(Value::String(text)) => escape_string(text, markers, &mut escaped),
-            Some(Value::Array(parts)) => {
-                for part in parts {
-                    if let Some(Value::String(text)) = part.get_mut("text") {
-                        escape_string(text, markers, &mut escaped);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    escape_more(messages, markers, &mut escaped);
     escaped
+}
+
+/// [`escape`] over more values - the tool list - numbering on from `escaped`,
+/// so one [`unescape`] undoes both.
+pub fn escape_more(values: &mut [Value], markers: &[&str], escaped: &mut Escaped) {
+    if markers.is_empty() {
+        return;
+    }
+    for value in values {
+        escape_value(value, markers, escaped);
+    }
+}
+
+/// Escapes every string inside `value`.
+fn escape_value(value: &mut Value, markers: &[&str], escaped: &mut Escaped) {
+    match value {
+        Value::String(text) => escape_string(text, markers, escaped),
+        Value::Array(items) => {
+            for item in items {
+                escape_value(item, markers, escaped);
+            }
+        }
+        Value::Object(fields) => {
+            for field in fields.values_mut() {
+                escape_value(field, markers, escaped);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 /// Rewrites `text` with each marker, and each escape character, replaced by an
@@ -215,5 +225,36 @@ mod tests {
         let escaped = escape(&mut messages, MARKERS);
         assert!(escaped.is_empty());
         assert_eq!(messages[0]["content"], "plain");
+    }
+
+    #[test]
+    fn tool_call_arguments_and_tool_documents_are_escaped() {
+        let mut messages = vec![json!({
+            "role": "assistant",
+            "content": [],
+            "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "write",
+                "arguments": {"content": "x <|image_pad|> y", "n": 1},
+            }}],
+        })];
+        let mut escaped = escape(&mut messages, MARKERS);
+        let mut tools = vec![json!({"type": "function", "function": {
+            "name": "read", "description": "returns <|video_pad|> verbatim",
+        }})];
+        super::escape_more(&mut tools, MARKERS, &mut escaped);
+        let argument = messages[0]["tool_calls"][0]["function"]["arguments"]["content"]
+            .as_str()
+            .expect("text")
+            .to_owned();
+        let description = tools[0]["function"]["description"]
+            .as_str()
+            .expect("text")
+            .to_owned();
+        assert!(!argument.contains("<|image_pad|>"), "{argument}");
+        assert!(!description.contains("<|video_pad|>"), "{description}");
+        let (restored, ranges) =
+            unescape(format!("{argument}|{description}"), &escaped).expect("unescapes");
+        assert_eq!(restored, "x <|image_pad|> y|returns <|video_pad|> verbatim");
+        assert_eq!(ranges.len(), 2);
     }
 }

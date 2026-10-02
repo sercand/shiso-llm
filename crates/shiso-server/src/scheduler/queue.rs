@@ -283,17 +283,42 @@ pub struct ScoreRequest {
     /// See [`ServiceClass::Flex`] for what the scheduler does with it; a flex
     /// score is still answered through its reply, never held for one.
     pub service_class: ServiceClass,
+    /// Pre-expanded media items, in the order the prompt refers to them.
+    ///
+    /// The same names [`GenerateRequest::media`] carries for the same content:
+    /// a scoring prompt can carry a picture, and the pad runs it was rendered
+    /// with must be spliced before the one prefill reads them.
+    ///
+    /// [`GenerateRequest::media`]: GenerateRequest::media
+    pub media: Arc<[MediaItem]>,
+    /// One digest per item of `media`, in the same order.
+    ///
+    /// A score is never keyed on the prefix cache, so these ride along for
+    /// the media cache lookup in `encode_media` and nothing else.
+    pub media_digests: Arc<[MediaDigest]>,
 }
 
 impl ScoreRequest {
-    /// A scoring pass over `prompt_tokens` reading `labels`, standard class.
+    /// A scoring pass over `prompt_tokens` reading `labels`, standard class,
+    /// no media.
     #[must_use]
     pub fn new(prompt_tokens: Arc<[TokenId]>, labels: Arc<[TokenId]>) -> Self {
         Self {
             prompt_tokens,
             labels,
             service_class: ServiceClass::Standard,
+            media: Arc::from(Vec::new()),
+            media_digests: Arc::from(Vec::new()),
         }
+    }
+
+    /// The same scoring request with media attached, each item beside its
+    /// digest.
+    #[must_use]
+    pub fn with_media(mut self, media: Arc<[MediaItem]>, digests: Arc<[MediaDigest]>) -> Self {
+        self.media = media;
+        self.media_digests = digests;
+        self
     }
 
     /// The same scoring pass, served in `class`.

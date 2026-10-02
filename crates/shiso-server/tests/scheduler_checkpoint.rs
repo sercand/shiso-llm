@@ -16,7 +16,7 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use shiso_core::{SamplingParams, Seed, TokenId};
 use shiso_engine::Reason;
-use shiso_server::scheduler::{GenerateRequest, SchedulerConfig, StorePolicy};
+use shiso_server::scheduler::{GenerateRequest, SchedulerConfig, ScoreRequest, StorePolicy};
 
 fn argmax() -> SamplingParams {
     SamplingParams {
@@ -227,6 +227,48 @@ async fn a_prompt_with_no_rendered_text_is_still_resumed_and_stored() {
 
     assert_eq!(audit.resumes.lock().clone(), vec![4], "it was looked up");
     assert_eq!(audit.saves.lock().len(), 1, "its turn's end was offered");
+}
+
+/// A score sequence never files a continued store entry. Its prompt is read
+/// once and kept by nobody, and with the interval path on every tick, a
+/// mid-prefill score frontier would otherwise reach the disk tier under a key
+/// no follow-up will ever ask for - the ruling that keeps scores off the tier
+/// is enforced at the retirement site *and* in the `store_continued` filter.
+#[tokio::test]
+async fn a_score_sequence_never_files_a_continued_store_entry() {
+    let cfg = SchedulerConfig {
+        // Two solo chunks of a prompt wider than the prefill grid, so the
+        // score's prefill spans two ticks: the slot must be alive and
+        // unfinished when the interval path looks at it, which a one-tick
+        // prefill never is.
+        solo_chunk: 128,
+        mixed_quantum: 128,
+        store: StorePolicy {
+            boundary_align: 0,
+            boundary_trim: 0,
+            continued_interval: 1,
+            ..StorePolicy::new()
+        },
+        ..SchedulerConfig::new()
+    };
+    let (engine, join, audit) = common::checkpointed_engine(Vec::new(), cfg, None);
+    engine
+        .score(ScoreRequest::new(
+            Arc::from(vec![TokenId::new(1); 192]),
+            Arc::from(vec![TokenId::new(0), TokenId::new(1)]),
+        ))
+        .await
+        .expect("the score is answered");
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
+
+    let saves = audit.saves.lock().clone();
+    assert!(
+        saves.iter().all(|note| note.reason != Reason::Continued),
+        "a score sequence offered a continued frontier: {saves:?}"
+    );
 }
 
 /// The sweep is the safety net for sessions the retirement path never reached.

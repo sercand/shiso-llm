@@ -132,8 +132,9 @@ pub(crate) struct DecisionsBody {
     /// the adapter colon form, which this server cannot load.
     #[serde(default)]
     pub model: Option<String>,
-    /// The text every question judges. A string, or any JSON value rendered
-    /// to text by the shared rule.
+    /// The text every question judges. A string, any JSON container rendered
+    /// to text by the shared rule, or a content-block array of text and
+    /// images (see [`decision_input`]).
     pub input: Value,
     /// The questions, in the order the answers come back.
     pub questions: Vec<QuestionWire>,
@@ -174,7 +175,25 @@ impl DecisionsBody {
             ));
         }
         core::check_model(self.model.as_deref())?;
-        core::check_input(&core::render_text(&self.input))?;
+        match decision_input(&self.input)? {
+            DecisionInput::Text(text) => core::check_input(&text)?,
+            DecisionInput::Blocks(blocks) => {
+                // "Blank" means no text *and* no images (spec ruling 2): an
+                // image-only input scores, an array of only-blank text
+                // blocks does not. An empty blocks array cannot occur -
+                // detection requires a typed element.
+                if blocks
+                    .iter()
+                    .all(|block| matches!(block, InputBlock::Text { text } if text.trim().is_empty()))
+                {
+                    return Err(AppError::bad_request(
+                        "input must not be blank",
+                        Some("input"),
+                        "invalid_request",
+                    ));
+                }
+            }
+        }
 
         let mut questions = Vec::with_capacity(self.questions.len());
         for question in self.questions {
@@ -257,4 +276,325 @@ fn refuse_fields_other_than(question: &QuestionWire, allowed: &[&str]) -> Result
         ],
         allowed,
     )
+}
+
+/// True when `value` is an array in which *any* element is an object with a
+/// `"type"` key whose value is one of `"text"`, `"image"`, `"audio"`, `"video"`.
+///
+/// The rule is deliberately "any", not "all" (spec ruling 1): an array in
+/// which *no* element has a known `type` is a JSON container by design, so
+/// arbitrary datasets that legitimately carry `"type"` keys (GeoJSON
+/// features, form schemas) keep today's compact-JSON reading. Once one
+/// element looks like a block, the array is blocks and every element is held
+/// to the block grammar - a typo'd type in a mixed array is refused loudly,
+/// never silently rendered as JSON. A top-level object is never blocks.
+pub(crate) fn is_content_block_array(value: &Value) -> bool {
+    value.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "text" | "image" | "audio" | "video"))
+        })
+    })
+}
+
+/// The decisions `input`, split per the block/container rule.
+#[derive(Debug)]
+pub(crate) enum DecisionInput {
+    /// A string or a non-block container: the compact text to score, today's path.
+    Text(String),
+    /// A strictly-validated content-block array, in the caller's order.
+    Blocks(Vec<InputBlock>),
+}
+
+/// One element of a content-block `input`.
+#[derive(Debug)]
+pub(crate) enum InputBlock {
+    /// Verbatim text: the template concatenates parts with no delimiter, so
+    /// the caller's own spacing is the spacing.
+    Text {
+        /// The text, untrimmed.
+        text: String,
+    },
+    /// An image and where its bytes come from.
+    Image(InputImageSource),
+}
+
+/// Where a content-block image's bytes come from.
+#[derive(Debug)]
+pub(crate) enum InputImageSource {
+    /// Inline base64 bytes and the media type the caller claimed. The media
+    /// type is validated and then not used downstream: the IR carries only
+    /// the bytes, and the decoder sniffs them.
+    Base64 {
+        /// The caller's claimed media type; present and non-blank.
+        media_type: String,
+        /// The base64 payload, undecoded.
+        data: String,
+    },
+    /// A remote url. It parses here; the `--vision-allow-remote-images`
+    /// policy refusal already lives in the renderer and is not duplicated.
+    Url {
+        /// The url as the caller spelled it.
+        url: String,
+    },
+}
+
+/// One block's `text` arm, strictly. The `type` discriminant is read from
+/// the element before dispatch, so this struct carries only what follows it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextBlockWire {
+    // The discriminant is read before dispatch; the field exists so
+    // `deny_unknown_fields` accepts the `type` key rather than refusing it.
+    #[expect(dead_code, reason = "carried only so `type` is a known field")]
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+}
+
+/// One block's `image` arm, strictly.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageBlockWire {
+    #[expect(dead_code, reason = "carried only so `type` is a known field")]
+    #[serde(rename = "type")]
+    kind: String,
+    source: SourceWire,
+}
+
+/// An image block's source, strictly: `deny_unknown_fields` covers both arms.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+enum SourceWire {
+    Base64 {
+        media_type: String,
+        data: String,
+    },
+    Url { url: String },
+}
+
+/// The decisions `input`, split per the block/container rule. Blocks are
+/// validated strictly; every refusal is a 400 naming `input` (and the
+/// offending element's 0-based index where the spec asks for one).
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] when an array detected as blocks holds an
+/// element the block grammar refuses, or an `audio`/`video` block.
+pub(crate) fn decision_input(value: &Value) -> Result<DecisionInput, AppError> {
+    if !is_content_block_array(value) {
+        return Ok(DecisionInput::Text(core::render_text(value)));
+    }
+    let items = value
+        .as_array()
+        .expect("is_content_block_array answers true only for arrays");
+    let mut blocks = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        // The discriminant is read by hand because serde forbids
+        // `deny_unknown_fields` on the variants of an internally-tagged
+        // enum: each arm's grammar gets its own strict struct instead.
+        let block = match item.get("type").and_then(Value::as_str) {
+            Some("text") => InputBlock::Text {
+                text: TextBlockWire::deserialize(item)
+                    .map_err(|error| block_error(index, &error))?
+                    .text,
+            },
+            Some("image") => {
+                let source = ImageBlockWire::deserialize(item)
+                    .map_err(|error| block_error(index, &error))?
+                    .source;
+                InputBlock::Image(match source {
+                    SourceWire::Base64 { media_type, data } => {
+                        if media_type.trim().is_empty() {
+                            return Err(block_error(index, &"`media_type` must not be blank"));
+                        }
+                        InputImageSource::Base64 { media_type, data }
+                    }
+                    SourceWire::Url { url } => InputImageSource::Url { url },
+                })
+            }
+            // The scoring endpoints take images only in v1: audio and video
+            // parse far enough to name their type, and are refused.
+            Some(kind @ ("audio" | "video")) => {
+                return Err(block_error(
+                    index,
+                    &format!("a `{kind}` block is not scored: this endpoint takes images only"),
+                ));
+            }
+            other => {
+                let got = match other {
+                    Some(kind) => format!("`{kind:?}`"),
+                    None => "an object without a `type`".to_owned(),
+                };
+                return Err(block_error(
+                    index,
+                    &format!(
+                        "expected a block with a `type` of `text`, `image`, `audio` or `video`, got {got}"
+                    ),
+                ));
+            }
+        };
+        blocks.push(block);
+    }
+    Ok(DecisionInput::Blocks(blocks))
+}
+
+/// A block-shape refusal: the same 400 naming `input`, prefixed with the
+/// element's 0-based index so a caller can find the element it must fix.
+fn block_error(index: usize, cause: &dyn std::fmt::Display) -> AppError {
+    AppError::bad_request(
+        format!("input block[{index}]: {cause}"),
+        Some("input"),
+        "invalid_request",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The known block discriminants, spelled once so the predicate and the
+    /// parser cannot drift apart.
+    const KNOWN_TYPES: [&str; 4] = ["text", "image", "audio", "video"];
+
+    /// Asserts `value` is refused as a 400 naming `input` and returns the
+    /// message so the caller can pin what the refusal names.
+    fn refused_message(value: &Value) -> String {
+        match decision_input(value) {
+            Err(AppError::BadRequest {
+                message,
+                param,
+                code: _,
+            }) => {
+                assert_eq!(param.as_deref(), Some("input"), "{message}");
+                message
+            }
+            Err(other) => panic!("expected a BadRequest naming input, got {other:?}"),
+            Ok(split) => panic!("expected a refusal, got {split:?}"),
+        }
+    }
+
+    #[test]
+    fn is_content_block_array_detects_any_typed_element() {
+        for value in [
+            json!([{"type": "text", "text": "x"}]),
+            json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}]),
+            // "any", not "all": one typed element makes the array blocks even
+            // beside a bare string.
+            json!([{"type": "audio"}, "bare"]),
+        ] {
+            assert!(is_content_block_array(&value), "{value}");
+        }
+        for value in [
+            json!([]),
+            // All-unknown types stay a container by design (spec ruling 1):
+            // arbitrary JSON datasets legitimately carry other "type" values.
+            json!([{"type": "photo"}]),
+            json!([{"type": "img", "source": {}}]),
+            json!([1, 2]),
+            json!([{"a": 1}]),
+            // A top-level object is never blocks.
+            json!({"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}),
+        ] {
+            assert!(!is_content_block_array(&value), "{value}");
+        }
+        // The known set is exactly the four discriminants.
+        for kind in KNOWN_TYPES {
+            assert!(is_content_block_array(&json!([{"type": kind}])));
+        }
+    }
+
+    #[test]
+    fn decision_input_passes_strings_and_containers_through_as_text() {
+        let split = decision_input(&json!("  keep me verbatim  ")).expect("a string is text");
+        assert!(
+            matches!(&split, DecisionInput::Text(text) if text == "  keep me verbatim  "),
+            "{split:?}"
+        );
+        // A container is the same key-sorted compact bytes render_text gives.
+        let container = json!({"b": 1, "a": [1, 2]});
+        let split = decision_input(&container).expect("a container is text");
+        assert!(
+            matches!(&split, DecisionInput::Text(text) if *text == core::render_text(&container)),
+            "{split:?}"
+        );
+    }
+
+    #[test]
+    fn decision_input_parses_valid_block_arrays_in_order() {
+        let split = decision_input(&json!([
+            {"type": "text", "text": "a"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+        ]))
+        .expect("a valid block array parses");
+        match split {
+            DecisionInput::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(&blocks[0], InputBlock::Text { text } if text == "a"));
+                match &blocks[1] {
+                    InputBlock::Image(InputImageSource::Base64 { media_type, data }) => {
+                        assert_eq!(media_type, "image/png");
+                        assert_eq!(data, "aGk=");
+                    }
+                    other => panic!("expected a base64 image, got {other:?}"),
+                }
+            }
+            other => panic!("expected blocks, got {other:?}"),
+        }
+        let split = decision_input(&json!([
+            {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+        ]))
+        .expect("a url source parses here; the policy refusal lives in the renderer");
+        assert!(
+            matches!(&split, DecisionInput::Blocks(blocks)
+                if matches!(&blocks[0], InputBlock::Image(InputImageSource::Url { url })
+                    if url == "https://x/y.png")),
+            "{split:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_blocks_are_refused_naming_the_element_index() {
+        for (value, index) in [
+            // Unknown key on a text block.
+            (json!([{"type": "text", "text": "a", "extra": 1}]), 0),
+            // A typo'd type in a mixed array: element 0 is a block, so the
+            // array is blocks and element 1 is held to the grammar (Review
+            // Focus 1) - it must not fall back to compact JSON.
+            (json!([{"type": "text", "text": "a"}, {"type": "img"}]), 1),
+            // A missing required field on the image source.
+            (json!([{"type": "image", "source": {"type": "base64", "data": "aGk="}}]), 0),
+            // An unknown key on the image source.
+            (
+                json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk=", "extra": 1}}]),
+                0,
+            ),
+            // A bare string element in a block array.
+            (json!(["just a string", {"type": "text", "text": "a"}]), 0),
+            // A blank media_type is present but says nothing.
+            (
+                json!([{"type": "image", "source": {"type": "base64", "media_type": "  ", "data": "aGk="}}]),
+                0,
+            ),
+        ] {
+            let message = refused_message(&value);
+            assert!(
+                message.contains(&index.to_string()),
+                "refusal of {value} must name index {index}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_and_video_blocks_are_refused_naming_the_type() {
+        for kind in ["audio", "video"] {
+            let message = refused_message(&json!([{"type": kind, "source": {}}]));
+            assert!(
+                message.contains(kind),
+                "refusal must name {kind}: {message}"
+            );
+        }
+    }
 }

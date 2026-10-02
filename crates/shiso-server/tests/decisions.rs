@@ -710,6 +710,122 @@ async fn validation_matrix() {
     }
 }
 
+// --- content-block `input`: the wire split, refused or kept by `validate` ---
+
+#[tokio::test]
+async fn a_malformed_block_array_is_refused_naming_the_element() {
+    // One element looks like a block, so the array is blocks and element 1
+    // is held to the block grammar (Review Focus 1): the typo'd `img` type
+    // is refused with a 400 naming `input` and the element's index, never
+    // fallen back to a scored compact-JSON prompt.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [{"type": "text", "text": "a"}, {"type": "img"}],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+    assert_eq!(body["error"]["param"], "input", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains('1')),
+        "the refusal must name index 1: {body}"
+    );
+}
+
+#[tokio::test]
+async fn audio_and_video_blocks_are_refused_naming_the_type() {
+    // The scoring endpoints take images only in v1: the refusal parses far
+    // enough to name the block's type.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    for kind in ["audio", "video"] {
+        let (status, body) = call(
+            &state,
+            post(
+                "/v1/decisions",
+                &json!({
+                    "input": [{"type": kind, "source": {}}],
+                    "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{kind} -> {body}");
+        assert_eq!(body["error"]["param"], "input", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(kind)),
+            "the refusal must name {kind}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_all_unknown_types_array_stays_a_container() {
+    // No element carries a known `type`, so the array is a JSON container by
+    // design (spec ruling 1) and scores as today's key-sorted compact JSON.
+    let (state, audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [{"type": "photo", "url": "x"}],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let want = prompt_ids(
+        "{\"type\":\"photo\",\"url\":\"x\"}\n\nIs the following true? ready\nAnswer with yes or no only.",
+    );
+    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
+    assert_eq!(
+        got,
+        vec![want],
+        "the model read the compact-JSON rendering: {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_object_with_a_type_key_is_never_blocks() {
+    // Review Focus 2: a top-level object is never blocks, however much it
+    // spells like an image block - it stays a container and scores as
+    // key-sorted compact JSON.
+    let (state, audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let want = prompt_ids(
+        "{\"source\":{\"data\":\"aGk=\",\"media_type\":\"image/png\",\"type\":\"base64\"},\"type\":\"image\"}\n\nIs the following true? ready\nAnswer with yes or no only.",
+    );
+    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
+    assert_eq!(
+        got,
+        vec![want],
+        "the model read the compact-JSON rendering: {got:?}"
+    );
+}
+
 #[tokio::test]
 async fn label_checks_refuse_a_question_whose_label_is_not_one_token() {
     // Five score levels need the labels 0..4. This vocabulary defines 0..2,

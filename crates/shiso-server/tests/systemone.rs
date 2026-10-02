@@ -984,6 +984,47 @@ async fn malformed_json_is_422_not_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
+#[tokio::test]
+async fn a_content_block_state_is_refused_422() {
+    // The systemone `state` is text-only: a content-block array - even a
+    // well-formed one, the refusal is by shape (Review Focus 6) - is refused
+    // with the surface's schema class naming `state`, rather than
+    // compact-JSON'ing a base64 blob into a scored prompt (spec ruling 6).
+    // The assertion is spelled out rather than through
+    // `assert_schema_violation` because that helper pins serde's
+    // `line L column C` location, and this refusal names the field.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    for block in [
+        json!({"type": "text", "text": "a"}),
+        json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}),
+    ] {
+        let (status, body) = call(
+            &state,
+            post(
+                "/v1/systemone",
+                &json!({
+                    "state": [block],
+                    "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_schema", "{body}");
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "422 is still a bad request in the client's eyes: {body}"
+        );
+        assert_eq!(body["error"]["at"], "state", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("state")),
+            "the refusal must name state: {body}"
+        );
+    }
+}
+
 // --- prompt pairing ----------------------------------------------------------
 
 /// The choice question's exact version-1 body, as the shared builder renders

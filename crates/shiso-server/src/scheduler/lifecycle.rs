@@ -421,16 +421,33 @@ impl SeqSlot {
     /// so every stream send on this slot lands on a closed channel and the
     /// sequence is never mistaken for one with a client.
     pub(crate) fn new_score(request: ScoreRequest, setup: SlotSetup) -> Self {
+        // A score may carry media. The path is never keyed - a scoring prompt
+        // is read once and kept by nobody - so media on a score is `Unkeyed`,
+        // which keeps it off the tier by `checkpointable` as well; the ruling
+        // that keeps score prefixes off the store is enforced twice more: at
+        // the retirement call site and by the `is_score` filter in
+        // `store_continued`.
+        let path_media = if request.media.is_empty() {
+            PathMedia::Text
+        } else {
+            PathMedia::Unkeyed
+        };
+        // Audio cannot reach this path through the wire - the scoring surface
+        // refuses audio blocks - but the slot must not lie about a request
+        // that hands one to the handle directly.
+        let audio_pads = request
+            .media
+            .iter()
+            .filter(|item| item.is_audio())
+            .map(|item| u32::try_from(item.pad_count(1)).unwrap_or(u32::MAX))
+            .fold(0u32, u32::saturating_add);
         Self {
             flex: request.is_flex(),
             paused_since: None,
+            // The rows attach after admission, where `encode_media` runs.
             media: None,
-            // A text prompt: a scoring request carries no media, and the
-            // distinction is what keeps `checkpointable` honest - the ruling
-            // that keeps score prefixes off the tier is enforced at the
-            // retirement call site, not by lying about this.
-            path_media: PathMedia::Text,
-            audio_pads: 0,
+            path_media,
+            audio_pads,
             // A real parser, never fed: the token stream this slot will
             // produce is empty, and `wants_greedy` must answer something.
             parser: shiso_parsers::parser_for_prompt_with(

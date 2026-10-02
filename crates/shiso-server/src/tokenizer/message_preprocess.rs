@@ -434,7 +434,8 @@ pub struct MediaWraps {
 }
 
 /// Repeats each media marker to its item's pad count, bracketing image runs
-/// only; the audio-free spelling of [`expand_media_pads`].
+/// only; the audio-free spelling of [`expand_media_pads`] that keeps only the
+/// tokens.
 ///
 /// # Errors
 ///
@@ -454,14 +455,21 @@ pub fn expand_vision_pads(
             audio: None,
         },
     )
+    .map(|(tokens, _ranges)| tokens)
 }
 
 /// Repeats each media marker `pad_counts[i]` times, in prompt order, with the
-/// bracket its kind carries.
+/// bracket its kind carries, and reports where each item landed.
 ///
 /// A marker is bracketed by its own kind's pair only: a clip has no bracket in
 /// families that have no clip marker at all, and a bracket invented for one
 /// would be a prompt shape no checkpoint was trained on.
+///
+/// The second half of the returned pair is each item's expanded token range
+/// `[start, end)` - open bracket through close bracket inclusive, for a
+/// bracketed family - index for index with `pad_counts`. The renderer pairs
+/// those with the marker's byte range in the text so a caller downstream can
+/// find the tail after an item without ever seeing a marker string.
 ///
 /// # Errors
 ///
@@ -471,7 +479,7 @@ pub fn expand_media_pads(
     pad_counts: &[usize],
     pads: shiso_core::PadTokens,
     wraps: MediaWraps,
-) -> Result<Vec<shiso_core::TokenId>, PadMismatch> {
+) -> Result<(Vec<shiso_core::TokenId>, Vec<std::ops::Range<usize>>), PadMismatch> {
     let markers = tokens.iter().filter(|token| pads.matches(**token)).count();
     if markers != pad_counts.len() {
         return Err(PadMismatch {
@@ -480,16 +488,18 @@ pub fn expand_media_pads(
         });
     }
     if pad_counts.is_empty() {
-        return Ok(tokens);
+        return Ok((tokens, Vec::new()));
     }
     let extra: usize = pad_counts
         .iter()
         .map(|count| count.saturating_sub(1).saturating_add(2))
         .sum();
     let mut out = Vec::with_capacity(tokens.len() + extra);
+    let mut ranges = Vec::with_capacity(pad_counts.len());
     let mut item = 0usize;
     for token in tokens {
         if pads.matches(token) {
+            let start = out.len();
             let count = pad_counts.get(item).copied().unwrap_or(1).max(1);
             let bracket = if Some(token) == pads.image() {
                 wraps.image
@@ -505,12 +515,13 @@ pub fn expand_media_pads(
             if let Some((_open, close)) = bracket {
                 out.push(close);
             }
+            ranges.push(start..out.len());
             item += 1;
         } else {
             out.push(token);
         }
     }
-    Ok(out)
+    Ok((out, ranges))
 }
 
 /// The rendered prompt has a different number of pad markers than there are
