@@ -156,7 +156,8 @@ struct ChoiceWire {
 }
 
 /// The `score` arm: `criteria` is the array of levels, indexed from zero.
-/// A non-string item is the shared compact rendering, never a refusal.
+/// A non-string item is the shared compact rendering; a `null` item is the
+/// one value the grammar does not enumerate and is refused.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScoreWire {
@@ -285,7 +286,7 @@ fn question_from(id: &str, entry: &Value) -> Result<RawQuestion, AppError> {
     let kind = match discriminant {
         TYPE_NOUL => {
             let wire = NoulWire::deserialize(entry).map_err(|error| question_error(id, &error))?;
-            let text = core::question_text(Some(&wire.instructions));
+            let text = instructions_text(id, &wire.instructions)?;
             core::check_question_text(&text, id, true)?;
             let criteria = wire.criteria.unwrap_or_default();
             Kind::YesNo {
@@ -297,7 +298,7 @@ fn question_from(id: &str, entry: &Value) -> Result<RawQuestion, AppError> {
         TYPE_CHOICE => {
             let wire =
                 ChoiceWire::deserialize(entry).map_err(|error| question_error(id, &error))?;
-            let text = core::question_text(Some(&wire.instructions));
+            let text = instructions_text(id, &wire.instructions)?;
             core::check_question_text(&text, id, true)?;
             let options: Vec<ChoiceOption> = wire
                 .criteria
@@ -319,16 +320,9 @@ fn question_from(id: &str, entry: &Value) -> Result<RawQuestion, AppError> {
         }
         TYPE_SCORE => {
             let wire = ScoreWire::deserialize(entry).map_err(|error| question_error(id, &error))?;
-            let text = core::question_text(Some(&wire.instructions));
+            let text = instructions_text(id, &wire.instructions)?;
             core::check_question_text(&text, id, true)?;
-            let levels: Vec<String> = wire
-                .criteria
-                .iter()
-                .map(|level| match level.as_str() {
-                    Some(text) => text.to_owned(),
-                    None => core::render_text(level),
-                })
-                .collect();
+            let levels = score_levels(id, &wire.criteria)?;
             core::check_score_levels(&levels, id, 1)?;
             Kind::Score {
                 question: text,
@@ -364,6 +358,49 @@ fn question_error(id: &str, cause: &serde_json::Error) -> AppError {
         message: format!("question \"{id}\": {cause}"),
         at: format!("questions.{id}"),
     }
+}
+
+/// The `instructions` text: the shared rendering, minus the one value the
+/// wire grammar does not enumerate. The grammar (spec §1.2) spells
+/// `instructions` as string/object/array, never null, and the shared rule
+/// would render a null as the literal word `"null"` — a question line no
+/// caller wrote, scored like any other — so the null is refused as the
+/// schema violation it already is, naming the question's key.
+fn instructions_text(id: &str, instructions: &Value) -> Result<String, AppError> {
+    if matches!(instructions, Value::Null) {
+        return Err(AppError::SchemaViolation {
+            message: format!(
+                "question \"{id}\": `instructions` must be a string, object or array, \
+                 got null"
+            ),
+            at: format!("questions.{id}"),
+        });
+    }
+    Ok(core::question_text(Some(instructions)))
+}
+
+/// The score levels as text: a string is itself, any other non-null value is
+/// the shared compact rendering. A null item is refused like `instructions`
+/// — the same grammar enumerates the items as string/object/array, and a
+/// scored `"null"` level would sit among the caller's real levels as a level
+/// nobody wrote — and the refusal names the item's index so the caller edits
+/// the right element.
+fn score_levels(id: &str, criteria: &[Value]) -> Result<Vec<String>, AppError> {
+    criteria
+        .iter()
+        .enumerate()
+        .map(|(index, level)| match level {
+            Value::String(text) => Ok(text.clone()),
+            Value::Null => Err(AppError::SchemaViolation {
+                message: format!(
+                    "question \"{id}\": a score level must be a string, object or array, \
+                     got null (level {index})"
+                ),
+                at: format!("questions.{id}"),
+            }),
+            other => Ok(core::render_text(other)),
+        })
+        .collect()
 }
 
 /// Refuses a decisions-only field that arrived with any value other than
@@ -727,6 +764,73 @@ mod tests {
                 );
             }
             other => panic!("expected a choice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_instructions_are_refused_for_every_type() {
+        // The wire grammar (spec §1.2) enumerates `instructions` as
+        // string/object/array, never null: rendering a null would score the
+        // literal word "null", so it is refused as the schema violation it
+        // is, naming the question's key.
+        for question in [
+            json!({"type": "noul", "instructions": null}),
+            json!({"type": "choice", "instructions": null, "criteria": {"red": null}}),
+            json!({"type": "score", "instructions": null, "criteria": ["none"]}),
+        ] {
+            assert_refused_at(
+                json!({"state": "the input", "questions": {"q1": question}}),
+                "questions.q1",
+                "instructions",
+            );
+        }
+    }
+
+    #[test]
+    fn a_null_score_level_is_refused() {
+        // The same grammar enumerates score `criteria` items as
+        // string/object/array: a null level would score as the literal word
+        // "null" beside the caller's real levels.
+        assert_refused_at(
+            json!({
+                "state": "the input",
+                "questions": {"q1": {"type": "score", "instructions": "how bad",
+                                     "criteria": ["none", null, "some"]}},
+            }),
+            "questions.q1",
+            "level",
+        );
+    }
+
+    #[test]
+    fn null_choice_descriptions_and_noul_wordings_keep_their_handling() {
+        // The refusal above is the grammar's business only where the grammar
+        // enumerates it: a null choice description is still "no description"
+        // and a null noul wording is still absent wording — serde reads a
+        // null into an `Option` field as absent — never a scored "null".
+        let questions = questions_of(json!({
+            "state": "the input",
+            "questions": {
+                "c1": {"type": "choice", "instructions": "pick one",
+                       "criteria": {"red": null}},
+                "n1": {"type": "noul", "instructions": "ready",
+                       "criteria": {"true": null, "false": null}},
+            },
+        }));
+        match &questions[0].kind {
+            Kind::Choice { options, .. } => assert!(
+                matches!(&options[0], ChoiceOption { name, description: None }
+                    if name == "red"),
+                "a null description is no description: {options:?}"
+            ),
+            other => panic!("expected a choice, got {other:?}"),
+        }
+        match &questions[1].kind {
+            Kind::YesNo { yes, no, .. } => {
+                assert!(yes.is_none(), "a null wording is absent wording: {yes:?}");
+                assert!(no.is_none(), "a null wording is absent wording: {no:?}");
+            }
+            other => panic!("expected a noul, got {other:?}"),
         }
     }
 

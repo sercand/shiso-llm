@@ -548,9 +548,10 @@ fn parse_questions(req: &PlaygroundRequest) -> Result<Value, AppError> {
 /// levels become the criteria array. Keys the conversion does not consume
 /// pass through untouched: the server's `deny_unknown_fields` refuses them,
 /// and the console does not re-validate what the server already validates.
-/// A missing or blank `id` and an unknown `type` are the console's own 400s
-/// — the map cannot be keyed without an id, and a type the conversion does
-/// not know has no official spelling to convert to.
+/// A missing or blank `id`, a duplicated `id` and an unknown `type` are the
+/// console's own 400s — the map cannot be keyed without an id, two entries
+/// under one id would collapse to one question, and a type the conversion
+/// does not know has no official spelling to convert to.
 fn systemone_questions(req: &PlaygroundRequest) -> Result<Value, AppError> {
     let parsed = parse_questions(req)?;
     let entries = parsed.as_array().expect("parse_questions returns an array");
@@ -566,6 +567,14 @@ fn systemone_questions(req: &PlaygroundRequest) -> Result<Value, AppError> {
                     "every systemone question needs a non-blank id (entry {index})"
                 ))
             })?;
+        // The map keys by id, so a second entry under one id would `insert`
+        // over the first and silently drop a question the operator wrote;
+        // the duplicate is refused by name, as the blank id above is.
+        if questions.contains_key(id) {
+            return Err(AppError::BadRequest(format!(
+                "duplicate systemone question id {id:?} (entry {index})"
+            )));
+        }
         let (wire_type, criteria) = match entry.get("type").and_then(Value::as_str) {
             Some("yes_no") => {
                 let mut criteria = Map::new();
@@ -1384,6 +1393,29 @@ mod tests {
             r.questions = Some(questions.into());
             let err = build_body(&r).unwrap_err();
             assert!(matches!(err, AppError::BadRequest(_)), "{questions}: {err}");
+        }
+    }
+
+    #[test]
+    fn systemone_body_refuses_duplicate_question_ids() {
+        // The map wire keys by id, so two editor entries sharing an id would
+        // silently collapse into the last one written; the console names the
+        // duplicated id instead of dropping a question the operator wrote.
+        let mut r = req(SYSTEMONE);
+        r.questions = Some(
+            r#"[{"id":"q1","type":"yes_no","question":"first"},
+                {"id":"q1","type":"choice","question":"second","options":["a","b"]}]"#
+                .into(),
+        );
+        let err = build_body(&r).unwrap_err();
+        match err {
+            AppError::BadRequest(message) => {
+                assert!(
+                    message.contains("q1"),
+                    "the refusal must name the id: {message}"
+                );
+            }
+            other => panic!("expected a BadRequest, got {other}"),
         }
     }
 
