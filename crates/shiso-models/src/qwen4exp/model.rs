@@ -984,6 +984,13 @@ impl Model for Qwen4ExpModel {
         self.stack.has_draft_head().then_some(self)
     }
 
+    /// The stack masks every logits row on the device right after the
+    /// vocabulary projection, so the list goes to it: the verify's device
+    /// pick and every row the scheduler reads back then both skip it.
+    fn suppress_tokens(&mut self, ids: &[TokenId]) -> CoreResult<()> {
+        self.stack.suppress_tokens(ids)
+    }
+
     fn media_mut(&mut self) -> Option<&mut dyn MediaModel> {
         Some(self)
     }

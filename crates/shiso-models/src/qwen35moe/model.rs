@@ -841,6 +841,12 @@ impl Model for Qwen35MoeModel {
         self.stack.draft_resident().then_some(self)
     }
 
+    /// The stack takes the verify's greedy picks itself, so the list goes to
+    /// it; the scheduler masks every row it draws from on its own.
+    fn suppress_tokens(&mut self, ids: &[TokenId]) -> CoreResult<()> {
+        self.stack_mut().suppress_tokens(ids)
+    }
+
     fn media_mut(&mut self) -> Option<&mut dyn MediaModel> {
         Some(self)
     }

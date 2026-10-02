@@ -240,6 +240,41 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
     Ok(Some(service))
 }
 
+/// The control tokens no generated token may be, handed to the model and
+/// returned for the scheduler.
+///
+/// A model that takes greedy picks of its own - a speculative verify - is told
+/// the list; the scheduler masks every row it draws from with what this
+/// returns. A failure is a model that cannot keep its own picks off the list,
+/// which is a boot failure rather than a server that sometimes ends a turn on a
+/// quoted closer. No vocabulary means no specials are known, and nothing is
+/// suppressed.
+fn suppress_control_tokens(
+    model: &mut dyn shiso_core::Model,
+    vocabulary: Option<&tokenizer::Vocabulary>,
+    (reasoning, tools): (
+        shiso_parsers::ReasoningScheme,
+        shiso_parsers::ToolCallScheme,
+    ),
+) -> anyhow::Result<Arc<[shiso_core::TokenId]>> {
+    let suppressed = vocabulary
+        .map(|vocabulary| {
+            vocabulary.generation_suppressed(
+                model.info().stop_tokens,
+                &shiso_parsers::generated_tags(reasoning, tools),
+            )
+        })
+        .unwrap_or_default();
+    model
+        .suppress_tokens(&suppressed)
+        .context("keeping the model's own picks off the control tokens")?;
+    tracing::info!(
+        count = suppressed.len(),
+        "control tokens suppressed in generation"
+    );
+    Ok(Arc::from(suppressed))
+}
+
 /// The engine thread's handle, joined at shutdown.
 type EngineThread = std::thread::JoinHandle<Result<(), scheduler::EngineFailure>>;
 
@@ -301,7 +336,7 @@ fn boot_language_model(
     log_kv_capacity(model.as_ref(), args, tier.is_some());
 
     let model_id = args.model_id();
-    let scheduler = scheduler_config(args)?;
+    let mut scheduler = scheduler_config(args)?;
     // The renderer reads the store the scheduler writes.
     let turn_replay = scheduler.turn_replay.clone();
     let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);
@@ -312,6 +347,12 @@ fn boot_language_model(
         thinking_default = defaults.thinking_default,
         "output parsers configured"
     );
+    // Before the engine thread exists, so no pass ever runs without it.
+    scheduler.suppressed = suppress_control_tokens(
+        model.as_mut(),
+        vocabulary.as_deref(),
+        (reasoning_scheme, tool_call_scheme),
+    )?;
     // One cache, read by the renderer and filled by the engine thread, so a
     // picture is decoded and encoded once however many turns carry it.
     let media_cache = (vision.is_some() || audio.is_some()).then(|| {

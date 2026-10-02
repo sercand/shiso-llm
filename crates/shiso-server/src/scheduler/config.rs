@@ -304,6 +304,11 @@ pub struct SchedulerConfig {
     /// Whether non-greedy sequences preserve exact sampling instead of
     /// accepting target-matching greedy drafts directly.
     pub mtp_exact_sampling: bool,
+    /// Token ids no generated token may be: the control tokens a model must
+    /// never write - a turn opener, a media marker - even when it is quoting
+    /// one. Every row a sequence draws from is masked with it. Empty
+    /// suppresses nothing; the binary fills it from the vocabulary.
+    pub suppressed: Arc<[shiso_core::TokenId]>,
 }
 
 impl SchedulerConfig {
@@ -322,6 +327,7 @@ impl SchedulerConfig {
             turn_replay: None,
             stats_interval: None,
             mtp_exact_sampling: false,
+            suppressed: Arc::from([]),
         }
     }
 
@@ -359,6 +365,7 @@ impl SchedulerConfig {
             // `--log-stats-interval`, set by the binary.
             stats_interval: None,
             mtp_exact_sampling: env_bool(MTP_EXACT_SAMPLING_ENV, false),
+            suppressed: default.suppressed.clone(),
         }
     }
 

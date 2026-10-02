@@ -825,6 +825,9 @@ impl SparseStack {
             MAX_LOGIT_ROWS,
             opts.engine.ctx,
         )?;
+        // The suppress list starts empty: the count is the buffer's first
+        // word, and a fresh allocation's first word is whatever was there.
+        backend.fill_zero(scratch.view(Buf::Suppress)?)?;
         let ngram = open_ngram(backend, &shape, ngram, &opts)?;
         // The pool last, so that a pool sized to the device is sized from what
         // the weights, the scratch and the n-gram tier left of it.
@@ -906,6 +909,46 @@ impl SparseStack {
         })?;
         resident.stream = Some(stream);
         Ok(())
+    }
+
+    /// Keeps every pick from the next pass on off `ids`.
+    ///
+    /// The list replaces the last one. It is written into the buffer every
+    /// logits pass already reads, so plans and captured graphs are untouched;
+    /// what it must not do is race a pass, which is why it takes the stack
+    /// mutably and a server sets it before it serves.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for more ids than
+    /// [`crate::sparse::scratch::SUPPRESS_CAPACITY`] or an id past the
+    /// vocabulary - refused rather than truncated or skipped, because either
+    /// would leave a token pickable that the caller said was not - and
+    /// [`CoreError::Unsupported`] after teardown.
+    pub fn suppress_tokens(&mut self, ids: &[TokenId]) -> CoreResult<()> {
+        let capacity = crate::sparse::scratch::SUPPRESS_CAPACITY;
+        let count = u32::try_from(ids.len())
+            .ok()
+            .filter(|count| *count <= capacity)
+            .ok_or_else(|| CoreError::InvalidValue {
+                key: "suppressed token count",
+                value: format!("{} (at most {capacity})", ids.len()),
+            })?;
+        if let Some(bad) = ids.iter().find(|id| id.get() >= self.shape.vocab) {
+            return Err(CoreError::InvalidValue {
+                key: "suppressed token id",
+                value: format!("{} (vocabulary {})", bad.get(), self.shape.vocab),
+            });
+        }
+        let mut bytes = Vec::with_capacity((ids.len() + 1) * 4);
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for id in ids {
+            bytes.extend_from_slice(&id.get().to_le_bytes());
+        }
+        let view = self
+            .scratch_view(Buf::Suppress)?
+            .slice(0, bytes.len() as u64)?;
+        self.backend.copy_h2d(view, &bytes)
     }
 
     /// The routed expert stream's running totals, on a stack that streams.

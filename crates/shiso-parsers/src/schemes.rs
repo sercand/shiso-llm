@@ -91,6 +91,38 @@ const fn reasoning_tags(reasoning: ReasoningScheme) -> (&'static str, &'static s
     }
 }
 
+/// The tags a scheme brackets a tool call with, and how its body is read.
+const fn tool_tags(tools: ToolCallScheme) -> (&'static str, &'static str, ToolBody) {
+    match tools {
+        ToolCallScheme::None => ("", "", ToolBody::None),
+        ToolCallScheme::Gemma4 => ("<|tool_call>", "<tool_call|>", ToolBody::GemmaCall),
+        ToolCallScheme::Qwen3 => ("<tool_call>", "</tool_call>", ToolBody::Json),
+        ToolCallScheme::Qwen35 => ("<tool_call>", "</tool_call>", ToolBody::QwenXml),
+    }
+}
+
+/// Every tag a model is expected to generate under these schemes: the
+/// reasoning brackets, the tool-call brackets, and the string quote a Gemma
+/// call body spells its values with.
+///
+/// What a server must leave pickable. A token whose text is one of these, or
+/// part of one, is how the model writes the structure the parser reads; a
+/// sampler that kept the model off it would leave it no way to think or to
+/// call a tool. Empty spellings are left out.
+#[must_use]
+pub fn generated_tags(reasoning: ReasoningScheme, tools: ToolCallScheme) -> Vec<&'static str> {
+    let (think_open, think_close) = reasoning_tags(reasoning);
+    let (tool_open, tool_close, body) = tool_tags(tools);
+    let quote = match body {
+        ToolBody::GemmaCall => crate::gemma_dict::STRING_QUOTE,
+        _ => "",
+    };
+    [think_open, think_close, tool_open, tool_close, quote]
+        .into_iter()
+        .filter(|tag| !tag.is_empty())
+        .collect()
+}
+
 /// Whether `prompt` leaves a reasoning block open, so that the turn continuing
 /// it starts inside the trace rather than in prose.
 ///
@@ -183,12 +215,7 @@ fn build(
 
     let (think_open, think_close) = reasoning_tags(reasoning);
 
-    let (tool_open, tool_close, tool_body) = match tools {
-        ToolCallScheme::None => ("", "", ToolBody::None),
-        ToolCallScheme::Gemma4 => ("<|tool_call>", "<tool_call|>", ToolBody::GemmaCall),
-        ToolCallScheme::Qwen3 => ("<tool_call>", "</tool_call>", ToolBody::Json),
-        ToolCallScheme::Qwen35 => ("<tool_call>", "</tool_call>", ToolBody::QwenXml),
-    };
+    let (tool_open, tool_close, tool_body) = tool_tags(tools);
 
     let tags = TagParser::new(TagParserDesc {
         think_open,

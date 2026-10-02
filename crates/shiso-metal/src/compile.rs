@@ -286,6 +286,12 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "audio/audio_lstm.metal",
         include_str!("../metal/audio/audio_lstm.metal"),
     ),
+    // --- logits stages shared by every stack; appended, nothing above this
+    // line changed.
+    (
+        "sample/suppress.metal",
+        include_str!("../metal/sample/suppress.metal"),
+    ),
 ];
 
 /// Concatenates every source into the one translation unit the device compiles.

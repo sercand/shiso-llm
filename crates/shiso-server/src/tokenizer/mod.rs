@@ -322,6 +322,37 @@ impl Vocabulary {
             .collect()
     }
 
+    /// The ids a model must never generate: every special added token except
+    /// the ones that end a turn and the ones a generated tag is spelled with.
+    ///
+    /// A model quoting a control token - writing `<|im_start|>` into its own
+    /// reasoning - tends to pick the token's single id rather than its text,
+    /// and that id then is the control token: a turn opener in the middle of
+    /// an answer, or a turn closer that stops it mid-thought. Taking those ids
+    /// off the table leaves the model the text pieces, which is what a quote
+    /// is. The stop ids stay, or no turn could end; so does any special whose
+    /// text is part of a tag the output parser reads (`tags`), or the model
+    /// could not open a reasoning channel or call a tool. Sorted, so a boot log
+    /// and a test see the same order.
+    #[must_use]
+    pub fn generation_suppressed(
+        &self,
+        stop: shiso_core::StopTokens,
+        tags: &[&str],
+    ) -> Vec<TokenId> {
+        let mut ids: Vec<TokenId> = self
+            .inner
+            .get_added_tokens_decoder()
+            .into_iter()
+            .filter(|(_, token)| token.special && !token.content.is_empty())
+            .filter(|(_, token)| !tags.iter().any(|tag| tag.contains(token.content.as_str())))
+            .map(|(id, _)| TokenId::new(id))
+            .filter(|id| !stop.contains(*id))
+            .collect();
+        ids.sort_unstable_by_key(|id| id.get());
+        ids
+    }
+
     /// The placeholder ids this family's placement resolves to here.
     ///
     /// Resolved through the vocabulary rather than written down as constants:
@@ -705,5 +736,49 @@ mod detokenizer_tests {
                 .expect("encodes")),
             vec![4, 3, 0, 1, 2, 3]
         );
+    }
+
+    /// The stop ids stay pickable or no turn could end, a special spelled
+    /// inside a parser tag stays or no channel could open, and an added token
+    /// that is not special is the parser's business: none of those is
+    /// suppressed. Every other special is.
+    #[test]
+    fn generation_suppresses_specials_but_stops_and_tags() {
+        use std::str::FromStr as _;
+        let added: Vec<serde_json::Value> = [
+            (1, "<|im_start|>", true),
+            (2, "<|im_end|>", true),
+            (3, "<|image_pad|>", true),
+            (4, "<|channel>", true),
+            (5, "<think>", false),
+        ]
+        .into_iter()
+        .map(|(id, content, special)| {
+            serde_json::json!({
+                "id": id, "content": content, "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": special,
+            })
+        })
+        .collect();
+        let document = serde_json::json!({
+            "version": "1.0",
+            "truncation": serde_json::Value::Null,
+            "padding": serde_json::Value::Null,
+            "added_tokens": added,
+            "normalizer": serde_json::Value::Null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": serde_json::Value::Null,
+            "decoder": serde_json::Value::Null,
+            "model": {"type": "WordLevel", "vocab": {
+                "<unk>": 0, "<|im_start|>": 1, "<|im_end|>": 2, "<|image_pad|>": 3,
+                "<|channel>": 4, "<think>": 5,
+            }, "unk_token": "<unk>"},
+        })
+        .to_string();
+        let vocabulary =
+            Vocabulary::from_tokenizer(tokenizers::Tokenizer::from_str(&document).expect("loads"));
+        let stop = shiso_core::StopTokens::new(&[TokenId::new(2)]).expect("one stop");
+        let ids = vocabulary.generation_suppressed(stop, &["<|channel>thought\n", "<think>"]);
+        assert_eq!(ids, vec![TokenId::new(1), TokenId::new(3)]);
     }
 }

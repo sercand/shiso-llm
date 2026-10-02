@@ -1276,7 +1276,10 @@ impl crate::stack::HybridStack {
         first: TokenId,
         eos: TokenId,
     ) -> CoreResult<Speculated> {
-        let block = self.draft_and_verify(session, first, eos, DraftHint::greedy(), &[])?;
+        let mut block = self.draft_and_verify(session, first, eos, DraftHint::greedy(), &[])?;
+        for row in block.logits.chunks_mut(block.vocab.max(1)) {
+            crate::sampling::suppress(row, &self.suppressed);
+        }
         let picks: Vec<TokenId> = (0..=block.drafts.len())
             .map(|i| crate::sampling::argmax(block.row(i)))
             .collect();

@@ -242,6 +242,8 @@ pub(crate) struct SeqSlot {
     seed: Seed,
     /// How its tokens are drawn.
     rule: DrawRule,
+    /// The ids its draws must never land on, shared by every sequence.
+    suppressed: Arc<[TokenId]>,
     /// The stop-sequence hold-back.
     watcher: StopWatcher,
     /// How much generated text has been sent.
@@ -332,6 +334,9 @@ pub(crate) struct SlotSetup {
     /// Whether its tokens are drawn by the keyed rule, which a speculating
     /// server uses for every sequence so a sampled one can verify drafts.
     pub(crate) keyed: bool,
+    /// The ids its draws must never land on; see
+    /// [`crate::scheduler::SchedulerConfig::suppressed`].
+    pub(crate) suppressed: Arc<[TokenId]>,
     /// The reply a scoring sequence answers through, paired with the setup the
     /// way [`SlotSetup::sink`] is paired with a generation's. `None` for every
     /// generation slot: a turn's reply was its stream, answered before the
@@ -392,6 +397,7 @@ impl SeqSlot {
             } else {
                 DrawRule::Stream
             },
+            suppressed: setup.suppressed,
             watcher: StopWatcher::new(&request.stop),
             text: TextCursor::default(),
             trailing: Vec::new(),
@@ -482,6 +488,7 @@ impl SeqSlot {
             } else {
                 DrawRule::Stream
             },
+            suppressed: setup.suppressed,
             watcher: StopWatcher::new(&[]),
             text: TextCursor::default(),
             trailing: Vec::new(),
@@ -714,7 +721,11 @@ impl SeqSlot {
     /// seed and the position alone - the same token whether the row came from
     /// a one-token step or from a speculative verify pass - and the seed is
     /// never advanced. Otherwise it is the stream sampler's next draw.
-    pub(crate) fn choose(&mut self, scores: &[f32]) -> TokenId {
+    ///
+    /// The row is masked in place first, so a suppressed id is not a
+    /// candidate under either rule.
+    pub(crate) fn choose(&mut self, scores: &mut [f32]) -> TokenId {
+        shiso_engine::suppress(scores, &self.suppressed);
         let position = self.frontier_len();
         let keyed = self.rule == DrawRule::Keyed;
         let (params, seed) = self.draw();
@@ -1259,6 +1270,7 @@ mod tests {
                 deadline: None,
                 budget,
                 keyed: false,
+                suppressed: Arc::from([]),
                 score_reply: None,
             },
             None,
@@ -1673,6 +1685,35 @@ mod tests {
         }
 
         assert_eq!(reported_ids, accepted_ids);
+    }
+
+    /// A suppressed id is never drawn, even holding a row's maximum by a
+    /// wide margin - greedy, and under the keyed rule a speculating server
+    /// draws with - and the row it was drawn from shows it masked.
+    #[test]
+    fn a_suppressed_id_is_never_drawn() {
+        for keyed in [false, true] {
+            let mut slot = slot(&[1], 8);
+            slot.suppressed = Arc::from([TokenId::new(3)]);
+            slot.rule = if keyed {
+                super::DrawRule::Keyed
+            } else {
+                super::DrawRule::Stream
+            };
+            slot.sampling = SamplingParams {
+                temperature: if keyed { 1.0 } else { 0.0 },
+                ..SamplingParams::neutral()
+            };
+            let mut row = vec![0.0f32, 1.0, 2.0, 40.0, 1.5];
+            let token = slot.choose(&mut row);
+            assert!(row[3].is_infinite() && row[3].is_sign_negative());
+            if keyed {
+                // A sampled draw: any id but the suppressed one.
+                assert_ne!(token, TokenId::new(3));
+            } else {
+                assert_eq!(token, TokenId::new(2), "the next best");
+            }
+        }
     }
 
     /// Inside tool-call structure the draw is greedy whatever the request asked;

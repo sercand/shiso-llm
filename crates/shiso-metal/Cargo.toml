@@ -177,3 +177,7 @@ workspace = true
 [[test]]
 name = "audio_kernels"
 path = "tests/audio_kernels.rs"
+
+[[test]]
+name = "sample_kernels"
+path = "tests/sample_kernels.rs"

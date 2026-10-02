@@ -711,6 +711,7 @@ impl Coordinator {
                 deadline: self.cfg.request_timeout.map(|window| now + window),
                 budget,
                 keyed: self.keyed,
+                suppressed: Arc::clone(&self.cfg.suppressed),
                 score_reply: None,
             },
             None,
@@ -853,6 +854,8 @@ impl Coordinator {
                 deadline: self.cfg.request_timeout.map(|window| now + window),
                 budget: 0,
                 keyed: false,
+                // A score reads label rows and never draws.
+                suppressed: Arc::from([]),
                 score_reply: Some(reply),
             },
         );
@@ -1452,7 +1455,7 @@ impl Coordinator {
         &mut self,
         at: usize,
         step: DecodeStep,
-        block: shiso_core::model::VerifiedBlock,
+        mut block: shiso_core::model::VerifiedBlock,
     ) {
         let now = self.cfg.clock.now();
         let drafted = u32::try_from(block.drafts.len()).unwrap_or(u32::MAX);
@@ -1470,8 +1473,10 @@ impl Coordinator {
                 return;
             };
             let mut events = Vec::new();
-            for (i, draft) in block
-                .drafts
+            // A copy of the drafts, so the block can lend each row out to be
+            // masked while they are compared against.
+            let drafts = block.drafts.clone();
+            for (i, draft) in drafts
                 .iter()
                 .map(Some)
                 .chain(std::iter::once(None))
@@ -1480,7 +1485,7 @@ impl Coordinator {
                 if slot.is_done() {
                     break;
                 }
-                let token = slot.choose(block.row(i));
+                let token = slot.choose(block.row_mut(i));
                 events.extend(slot.accept(token, vocabulary.as_deref(), *stop, now));
                 produced += 1;
                 if draft == Some(&token) {
@@ -2163,7 +2168,7 @@ fn finish_scoring(row: &[u8], scores: &mut [f32], slot: &mut SeqSlot) {
 }
 
 /// Reads one logits row out of its bytes into `scores`.
-fn fill<'a>(row: &[u8], scores: &'a mut [f32]) -> &'a [f32] {
+fn fill<'a>(row: &[u8], scores: &'a mut [f32]) -> &'a mut [f32] {
     for (slot, bytes) in scores.iter_mut().zip(row.as_chunks::<4>().0) {
         *slot = f32::from_le_bytes(*bytes);
     }

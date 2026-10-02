@@ -565,6 +565,12 @@ impl Model for Qwen35Model {
         self.stack.draft_resident().then_some(self)
     }
 
+    /// The stack takes the verify's greedy picks itself, so the list goes to
+    /// it; the scheduler masks every row it draws from on its own.
+    fn suppress_tokens(&mut self, ids: &[TokenId]) -> CoreResult<()> {
+        self.stack.suppress_tokens(ids)
+    }
+
     fn teardown(&mut self) -> CoreResult<()> {
         self.stack.teardown()
     }

@@ -68,6 +68,8 @@ pub const MOD_QSA_SPARSE: &str = "q4e_qsa_sparse";
 pub const MOD_IDX: &str = "q4e_idx";
 /// Elementwise helpers and the greedy row pick.
 pub const MOD_MISC: &str = "q4e_misc";
+/// The logits stages run before any pick: today, the suppress stage.
+pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a
 /// vocabulary table.
 pub const MOD_EMBED: &str = "q4e_embed";
@@ -1260,6 +1262,13 @@ pub const fn idx_expand(n_tok: u32) -> Launch {
 }
 
 // --- helpers ----------------------------------------------------------------
+
+/// The suppress stage, one block per logits row: each block writes a few
+/// dozen ids, so a wide block would be threads with nothing to do.
+#[must_use]
+pub const fn suppress_rows(rows: u32) -> Launch {
+    Launch::linear(rows, BLOCK_LINEAR)
+}
 
 /// The greedy pick, one wide block per logits row.
 #[must_use]

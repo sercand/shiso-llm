@@ -34,8 +34,9 @@ pub mod tool_scaffold;
 
 pub use gemma_dict::{GemmaDictError, gemma_dict_to_json};
 pub use schemes::{
-    PassthroughParser, ReasoningScheme, StreamParser, ToolCallScheme, gemma4, parser,
-    parser_for_prompt, parser_for_prompt_with, passthrough, qwen3, qwen35, resumes_thinking,
+    PassthroughParser, ReasoningScheme, StreamParser, ToolCallScheme, gemma4, generated_tags,
+    parser, parser_for_prompt, parser_for_prompt_with, passthrough, qwen3, qwen35,
+    resumes_thinking,
 };
 pub use segment::Segment;
 pub use string_params::StringParams;

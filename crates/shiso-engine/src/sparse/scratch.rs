@@ -54,6 +54,10 @@ pub const PROJECTION_PARTIAL_FLOATS: u32 = 2_048 * 32;
 /// padding that keeps two slabs off one bank.
 pub const PART_STRIDE: u64 = 256 + 8;
 
+/// The most token ids [`Buf::Suppress`] holds: four times the largest special
+/// set a shipped vocabulary declares (994), at 16 KiB.
+pub const SUPPRESS_CAPACITY: u32 = 4_096;
+
 /// One activation buffer a pass writes.
 ///
 /// The order is the order a pass first touches them, which is also the order
@@ -237,6 +241,13 @@ pub enum Buf {
     Logits,
     /// The greedy pick of every logits row.
     Argmax,
+    /// The token ids no pick may land on, as `[count, id...]` with room for
+    /// [`SUPPRESS_CAPACITY`] ids.
+    ///
+    /// Fixed-size and read by count from the buffer itself, so the list can be
+    /// written after plans are built - and graphs captured - without either
+    /// changing: the address and every launch argument stay what they were.
+    Suppress,
     /// The chunk's activation rounded to half precision, for the one tier that
     /// cannot read a single-precision operand.
     ///
@@ -259,7 +270,7 @@ pub enum Buf {
 
 impl Buf {
     /// Every buffer, in allocation order.
-    pub const ALL: [Self; 77] = [
+    pub const ALL: [Self; 78] = [
         Self::Ids,
         Self::Positions,
         Self::Mrope,
@@ -335,6 +346,7 @@ impl Buf {
         Self::RowPointers,
         Self::Logits,
         Self::Argmax,
+        Self::Suppress,
         Self::HalfActivation,
         Self::ProjectionPartial,
     ];
@@ -466,6 +478,7 @@ impl Buf {
             }
             Self::Logits => u64::from(logit_rows) * u64::from(shape.vocab) * F32_BYTES,
             Self::Argmax => u64::from(logit_rows) * I32_BYTES,
+            Self::Suppress => (u64::from(SUPPRESS_CAPACITY) + 1) * I32_BYTES,
             // The two split projections bound their own partial sets: the
             // single-precision one keeps the output width times the split at or
             // below 512 floats, and the half-precision one at or below the
