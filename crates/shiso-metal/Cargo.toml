@@ -175,6 +175,10 @@ metal = []
 workspace = true
 
 [[test]]
+name = "flux2_kernels"
+path = "tests/flux2_kernels.rs"
+
+[[test]]
 name = "audio_kernels"
 path = "tests/audio_kernels.rs"
 
