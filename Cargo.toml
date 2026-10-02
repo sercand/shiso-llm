@@ -77,6 +77,8 @@ wiremock = "0.6"
 # --- tokenizer + chat templates -----------------------------------------
 minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "preserve_order"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# One pass over caller text for every special-token spelling a vocabulary declares.
+aho-corasick = "1"
 
 # --- model files ---------------------------------------------------------
 # GGUF is hand-rolled (shiso-modelfile); memmap2 backs the read-only model mapping.

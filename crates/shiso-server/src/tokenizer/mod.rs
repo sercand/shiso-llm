@@ -306,6 +306,22 @@ impl Vocabulary {
         self.inner.token_to_id(marker).map(TokenId::new)
     }
 
+    /// The text of every added token this vocabulary marks special.
+    ///
+    /// What caller text is kept from encoding as a token; see
+    /// [`literal_text`]. Special only, because those are the tokens the
+    /// literal encoding reads as text: an added token that is not special is
+    /// split out of any text, which is what the families declaring one want.
+    #[must_use]
+    pub fn special_spellings(&self) -> Vec<String> {
+        self.inner
+            .get_added_tokens_decoder()
+            .into_values()
+            .filter(|token| token.special)
+            .map(|token| token.content)
+            .collect()
+    }
+
     /// The placeholder ids this family's placement resolves to here.
     ///
     /// Resolved through the vocabulary rather than written down as constants:

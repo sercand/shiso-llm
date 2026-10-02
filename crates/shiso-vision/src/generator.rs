@@ -51,7 +51,9 @@ pub enum ImageGenError {
     #[error("prompt must not be empty")]
     EmptyPrompt,
     /// Requested width or height is outside allowed bounds or not divisible by 16.
-    #[error("invalid image dimensions {width}x{height}: must be between 256 and 2048 and divisible by 16")]
+    #[error(
+        "invalid image dimensions {width}x{height}: must be between 256 and 2048 and divisible by 16"
+    )]
     InvalidDimensions {
         /// Width in pixels.
         width: u32,
@@ -112,7 +114,10 @@ impl ImageGenerationJob {
         if self.prompt.trim().is_empty() {
             return Err(ImageGenError::EmptyPrompt);
         }
-        if self.width < 256 || self.width > 2048 || self.height < 256 || self.height > 2048
+        if self.width < 256
+            || self.width > 2048
+            || self.height < 256
+            || self.height > 2048
             || self.width % 16 != 0
             || self.height % 16 != 0
         {
