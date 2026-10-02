@@ -27,6 +27,7 @@ use shiso_server::state::AppState;
 use shiso_server::tokenizer::Vocabulary;
 use shiso_server::tokenizer::jinja_helpers::ToolJsonStyle;
 use shiso_server::tokenizer::render_prompt::PromptRenderer;
+use shiso_vision::{ImageLimits, MediaPlacement};
 use tower::ServiceExt as _;
 
 /// The fake model's logits width: a scripted row must cover every logit the
@@ -1020,6 +1021,277 @@ async fn a_content_block_state_is_refused_422() {
             "the refusal must name state: {body}"
         );
     }
+}
+
+// --- the clef `images` extension ---------------------------------------------
+
+/// The image marker's id in `media_vocabulary`: past every word of `WORDS`
+/// and inside the scripted row's width. The media harness is `decisions.rs`'s
+/// media shape - same fake tower geometry, same pad-run arithmetic - because
+/// systemone composes its `images` into that pipeline and nothing else.
+const PAD: u32 = 40;
+
+/// The vocabulary the media tests render with: every word of `WORDS` plus
+/// Qwen's image marker as a declared added token. Added rather than ordinary
+/// because that is what lets the renderer fan one marker out to a pad run.
+fn media_vocabulary() -> Arc<Vocabulary> {
+    let mut vocab = serde_json::Map::new();
+    for (id, text) in WORDS.iter().enumerate() {
+        vocab.insert((*text).to_owned(), json!(id));
+    }
+    vocab.insert(MediaPlacement::QWEN35.image_marker.to_owned(), json!(PAD));
+    let added = vec![json!({
+        "id": PAD,
+        "content": MediaPlacement::QWEN35.image_marker,
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": false,
+        "special": true,
+    })];
+    let document = json!({
+        "version": "1.0",
+        "truncation": Value::Null,
+        "padding": Value::Null,
+        "added_tokens": added,
+        "normalizer": Value::Null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": Value::Null,
+        "decoder": Value::Null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
+    })
+    .to_string();
+    let inner = tokenizers::Tokenizer::from_str(&document).expect("the media vocabulary loads");
+    Arc::new(Vocabulary::from_tokenizer(inner))
+}
+
+/// `TEMPLATE` with the image branch a family's template carries: one marker
+/// per picture, text parts verbatim.
+const MEDIA_TEMPLATE: &str = concat!(
+    "{% for m in messages %}<|{{ m.role }}|> ",
+    "{% for part in m.content %}",
+    "{% if part.type == 'image' %}<|image_pad|>{% else %}{{ part.text }}{% endif %}",
+    "{% endfor %} <|end|> ",
+    "{% endfor %}<|assistant|>\n",
+);
+
+/// A server in the shape a `--vision` server has: a renderer with the tower's
+/// geometry attached, and an engine holding a fake tower and a model that can
+/// read media.
+fn media_state(rows: Vec<Vec<f32>>, ctx: u32) -> (Arc<AppState>, Arc<common::Audit>) {
+    let vocabulary = media_vocabulary();
+    let (engine, _join, audit, _media_calls) =
+        common::fake_media_engine(rows, Some(Arc::clone(&vocabulary)), false);
+    let renderer = PromptRenderer::new(
+        MEDIA_TEMPLATE,
+        ToolJsonStyle::Compact,
+        Arc::clone(&vocabulary),
+    )
+    .expect("the media template compiles")
+    .with_tower(
+        &common::media_spec(),
+        MediaPlacement::QWEN35,
+        ImageLimits::default(),
+    );
+    let state = Arc::new(
+        AppState::new(engine, "test-model".to_owned(), ctx)
+            .with_vocabulary(vocabulary)
+            .with_renderer(Arc::new(renderer)),
+    );
+    (state, audit)
+}
+
+/// The ids the model should read for a media prompt: the rendered text
+/// encoded through the media vocabulary, with every marker occurrence fanned
+/// out to `pads` pad ids - the expansion the renderer owes the prompt.
+fn expanded_ids(vocabulary: &Arc<Vocabulary>, text_with_markers: &str, pads: usize) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for token in vocabulary
+        .encode(text_with_markers, false)
+        .expect("the prompt encodes")
+    {
+        if token.get() == PAD {
+            ids.extend(std::iter::repeat_n(PAD, pads));
+        } else {
+            ids.push(token.get());
+        }
+    }
+    ids
+}
+
+#[tokio::test]
+async fn an_image_only_systemone_request_is_valid() {
+    // Spec ruling 4: blank state with images is image-only, and image-only
+    // is valid - the picture is a thing to score even when no state text
+    // says anything.
+    let png = common::png_data_uri(96, 96);
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "",
+                "images": [png],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(answer_of(&body, "q1")["type"], "noul", "{body}");
+}
+
+#[tokio::test]
+async fn an_image_and_state_score_the_expanded_prompt() {
+    // Composition (spec §3): images before the state, clef's rule. The
+    // audited prompt is the pad run, then the state text, then the question
+    // block with the string path's blank line - the trim keeps that seam
+    // byte-identical - and the usage number bills the expansion.
+    let png = common::png_data_uri(96, 96);
+    let (state, audit) = media_state(vec![row_with(0.5, &[]); 2], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "  the input  ",
+                "images": [png],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let want = expanded_ids(
+        &media_vocabulary(),
+        &format!("<|user|> <|image_pad|>{NOUL_BODY} <|end|> <|assistant|>\n"),
+        4,
+    );
+    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
+    assert_eq!(
+        got,
+        vec![want],
+        "the pad run came before the trimmed state text: {got:?}"
+    );
+
+    // The same question without the picture: the expanded pads are billed,
+    // so the media request must cost strictly more input tokens. Equal costs
+    // would mean the pixels became nothing the model was scored on.
+    let (status, plain) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    assert!(
+        body["usage"]["input_tokens"].as_u64().expect("usage")
+            > plain["usage"]["input_tokens"].as_u64().expect("usage"),
+        "the picture added no input tokens: {body} vs {plain}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_images_item_is_422_naming_the_index() {
+    // The schema class with the element's 0-based index as the location -
+    // the first item is fine, the second is the one to fix.
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "images": [common::png_data_uri(96, 96), 5],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_schema_violation_at(status, &body, "images[1]", "images[1]");
+}
+
+#[tokio::test]
+async fn a_remote_image_is_refused_without_the_flag() {
+    // The url form parses at the wire and rides the renderer's existing
+    // policy refusal - the same arm decisions' url block rides, and the
+    // wire duplicates none of it.
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "images": [{"url": "https://example.com/x.png"}],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--vision-allow-remote-images")),
+        "the refusal must name the flag: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_image_without_a_vision_tower_is_refused() {
+    // The item is well-formed and the wire accepts it; the refusal is the
+    // renderer's: a text-only deployment cannot score pixels and says so.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    let png = common::png_data_uri(96, 96);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "images": [png],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no vision tower")),
+        "the refusal must name the missing tower: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_over_budget_image_is_a_context_overflow() {
+    // The context guard measures the expanded prompt, so a picture's pad run
+    // is charged like any other text - and blamed on `input`.
+    let png = common::png_data_uri(96, 96);
+    let (state, _audit) = media_state(vec![row_with(0.5, &[])], 12);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "images": [png],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "context_length_exceeded", "{body}");
+    assert_eq!(body["error"]["param"], "input", "{body}");
 }
 
 // --- prompt pairing ----------------------------------------------------------

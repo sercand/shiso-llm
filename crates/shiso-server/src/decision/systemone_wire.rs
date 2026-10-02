@@ -28,6 +28,15 @@
 //! ids, so a caller setting one has the wrong route, and a refusal beats
 //! quietly ignoring the knob it asked for.
 //!
+//! The clef `images` extension (spec §3) is a top-level array of embedded
+//! images scored before the state. Each item is a data URL string, a
+//! `{"content_type", "base64"}` object, or a `{"url"}` object; a malformed
+//! item is a 422 naming `images[i]`, while every media *policy* refusal —
+//! bad base64, pixels, remote off, no tower, over budget — stays the 400
+//! the renderer and scheduler already raise for `/v1/decisions`. The parsed
+//! items are the decisions wire's own image sources: no new media type
+//! enters the codebase.
+//!
 //! How a failure is *classified* is this wire's business; what is refused is
 //! the shared validators' ([`super::core`]), run here with the relaxed
 //! arguments the schema allows — blank ids and question text, lists of one —
@@ -42,7 +51,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::decision::core::{self, ChoiceOption, Kind, RawQuestion};
-use crate::decision::decisions_wire;
+use crate::decision::decisions_wire::{self, InputImageSource};
 use crate::error::AppError;
 
 /// How a systemone question is answered, as the official wire spells the
@@ -92,6 +101,13 @@ pub(crate) struct SystemOneBody {
     /// [`super::core::TemplateKwargs`]'s.
     #[serde(default)]
     pub chat_template_kwargs: Option<Map<String, Value>>,
+    /// The clef extension: embedded images scored before the state. The
+    /// items stay raw `Value`s because their grammar is three shapes with
+    /// per-shape strictness, read by [`images_sources`] with the item's
+    /// 0-based index as the refusal location; a non-array `images` is the
+    /// body-parse 422 its typed field already gives it.
+    #[serde(default)]
+    pub images: Option<Vec<Value>>,
 }
 
 /// The `noul` arm: a binary criterion over the state whose answer is the yes
@@ -371,6 +387,149 @@ pub(crate) fn refuse_decisions_only(field: &str, value: Option<&Value>) -> Resul
         Some(field),
         "invalid_request",
     ))
+}
+
+/// One `images` item in clef's base64-object form, strictly: `content_type`
+/// is validated non-blank and then dropped - the decoder sniffs the bytes,
+/// the decisions rule - and an unknown key is refused because inside one of
+/// these objects a key the server does not read is a claim the caller
+/// believes the server checked.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Base64ImageItem {
+    /// The claimed media type; present and non-blank.
+    content_type: String,
+    /// The base64 payload, undecoded.
+    base64: String,
+}
+
+/// One `images` item in the url form (shiso's extra beside clef's two),
+/// strictly. It parses here; the `--vision-allow-remote-images` policy
+/// refusal already lives in the renderer - the same arm decisions' url
+/// block rides - and is not duplicated at this wire.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UrlImageItem {
+    /// The url as the caller spelled it.
+    url: String,
+}
+
+/// Turns the clef `images` array into the decisions wire's image sources.
+/// Each item is one of three forms:
+///
+/// - a **data URL string**: `data:image/<subtype>;base64,<payload>`, the
+///   prefix read case-insensitively (clef's pattern). The media type is read
+///   from the prefix, validated non-blank, and then dropped downstream - the
+///   decoder sniffs the bytes.
+/// - a **base64 object**: `{"content_type": …, "base64": …}`.
+/// - a **url object**: `{"url": …}` - it parses, and the existing
+///   `--vision-allow-remote-images` refusal in the renderer rejects it at
+///   request time when the operator's flag is off.
+///
+/// Absent or empty yields no sources, which is the handler's signal to take
+/// the text arm byte-for-byte.
+///
+/// # Errors
+///
+/// [`AppError::SchemaViolation`] naming `images[<0-based index>]` for an
+/// item none of the three forms can express. Media *policy* refusals are
+/// not this function's: they stay the 400s the renderer and scheduler
+/// already raise.
+pub(crate) fn images_sources(
+    images: Option<&Vec<Value>>,
+) -> Result<Vec<InputImageSource>, AppError> {
+    let Some(items) = images else {
+        return Ok(Vec::new());
+    };
+    let mut sources = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        // The object arms are dispatched on which keys are present because
+        // serde forbids `deny_unknown_fields` on the variants of an
+        // internally-tagged enum: each form gets its own strict struct,
+        // exactly as the question grammar above does.
+        let source = match item {
+            Value::String(text) => match parse_image_data_url(text) {
+                Ok(source) => source,
+                Err(cause) => return Err(image_error(index, &cause)),
+            },
+            Value::Object(fields) if fields.contains_key("url") => {
+                let wire =
+                    UrlImageItem::deserialize(item).map_err(|error| image_error(index, &error))?;
+                InputImageSource::Url { url: wire.url }
+            }
+            Value::Object(fields)
+                if fields.contains_key("content_type") || fields.contains_key("base64") =>
+            {
+                let wire = Base64ImageItem::deserialize(item)
+                    .map_err(|error| image_error(index, &error))?;
+                if wire.content_type.trim().is_empty() {
+                    return Err(image_error(index, &"`content_type` must not be blank"));
+                }
+                InputImageSource::Base64 {
+                    media_type: wire.content_type,
+                    data: wire.base64,
+                }
+            }
+            other => {
+                return Err(image_error(
+                    index,
+                    &format!(
+                        "an image must be a data URL string, a \
+                         `{{\"content_type\", \"base64\"}}` object or a `{{\"url\"}}` \
+                         object, got {other}"
+                    ),
+                ));
+            }
+        };
+        sources.push(source);
+    }
+    Ok(sources)
+}
+
+/// Parses clef's data URL form: `data:image/<subtype>;base64,<payload>`.
+/// The structural parts of the head fold case (clef's pattern); the payload
+/// is the caller's bytes, taken verbatim after the comma. The media type is
+/// carried in its folded spelling and dropped downstream like every other
+/// claimed media type.
+fn parse_image_data_url(text: &str) -> Result<InputImageSource, String> {
+    let (head, payload) = text.split_once(',').ok_or_else(|| {
+        "a string image must be a data URL spelled `data:image/<subtype>;base64,<payload>`"
+            .to_owned()
+    })?;
+    let head = head.to_ascii_lowercase();
+    let spec = head.strip_prefix("data:").ok_or_else(|| {
+        "a string image must be a data URL spelled `data:image/<subtype>;base64,<payload>`"
+            .to_owned()
+    })?;
+    let Some((media_type, params)) = spec.split_once(';') else {
+        return Err("a data URL must carry the `;base64` parameter".to_owned());
+    };
+    if params != "base64" {
+        return Err(format!(
+            "a data URL's parameter must be `base64`, got `{params}`"
+        ));
+    }
+    if !media_type.starts_with("image/") || media_type == "image/" {
+        return Err(format!(
+            "a data URL must name an `image/<subtype>` media type, got `{media_type}`"
+        ));
+    }
+    if payload.is_empty() {
+        return Err("a data URL must carry a non-empty base64 payload".to_owned());
+    }
+    Ok(InputImageSource::Base64 {
+        media_type: media_type.to_owned(),
+        data: payload.to_owned(),
+    })
+}
+
+/// An `images` item-shape refusal: this surface's schema class, located at
+/// the item's 0-based index so the caller edits the element it must fix.
+fn image_error(index: usize, cause: &dyn std::fmt::Display) -> AppError {
+    AppError::SchemaViolation {
+        message: format!("images[{index}]: {cause}"),
+        at: format!("images[{index}]"),
+    }
 }
 
 #[cfg(test)]
@@ -654,5 +813,158 @@ mod tests {
         }));
         let ids: Vec<&str> = questions.iter().map(|q| q.id.as_str()).collect();
         assert_eq!(ids, ["zeta", "alpha", "mid"]);
+    }
+
+    // --- the clef `images` extension -----------------------------------------
+
+    /// The sources a body's `images` array parses to. The questions ride
+    /// along because the body parse needs them; only `images_sources` is
+    /// under test here, so an item that cannot even parse as the body type
+    /// fails as a bug in the test, not as a pass.
+    fn sources_of(images: &Value) -> Vec<InputImageSource> {
+        let parsed: SystemOneBody = serde_json::from_value(json!({
+            "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            "images": images,
+        }))
+        .expect("the body parses: item refusals are images_sources'");
+        images_sources(parsed.images.as_ref()).expect("the items parse")
+    }
+
+    /// Asserts an `images` array is refused as a schema violation located at
+    /// `at` whose message contains `needle`.
+    fn assert_images_refused_at(images: &Value, at: &str, needle: &str) {
+        let parsed: SystemOneBody = serde_json::from_value(json!({
+            "questions": {"q1": {"type": "noul", "instructions": "ready"}},
+            "images": images,
+        }))
+        .expect("the body parses: item refusals are images_sources'");
+        let error = images_sources(parsed.images.as_ref()).expect_err("the item must be refused");
+        match error {
+            AppError::SchemaViolation { message, at: got } => {
+                assert_eq!(got, at, "{message}");
+                assert!(
+                    message.contains(needle),
+                    "the refusal must name {needle}: {message}"
+                );
+            }
+            other => panic!("expected a SchemaViolation at {at}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_data_url_string_parses_to_a_base64_source() {
+        let sources = sources_of(&json!(["data:image/png;base64,aGk="]));
+        assert_eq!(sources.len(), 1);
+        assert!(
+            matches!(&sources[0], InputImageSource::Base64 { media_type, data }
+                if media_type == "image/png" && data == "aGk="),
+            "{sources:?}"
+        );
+    }
+
+    #[test]
+    fn data_urls_are_read_case_insensitively() {
+        // clef's pattern: the structural parts of the prefix fold, so a
+        // caller that spells `DaTa` or `IMAGE/Png` sends the same bytes.
+        let sources = sources_of(&json!(["DaTa:IMAGE/Png;base64,aGk="]));
+        assert!(
+            matches!(&sources[0], InputImageSource::Base64 { media_type, data }
+                if media_type == "image/png" && data == "aGk="),
+            "{sources:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_data_urls_are_refused_naming_the_index() {
+        for (item, needle) in [
+            (json!("data:image/png;base64,"), "payload"),
+            (json!("data:application/pdf;base64,aGk="), "image/"),
+            (json!("data:image/png,aGk="), "base64"),
+            (json!("a bare string"), "data URL"),
+        ] {
+            assert_images_refused_at(&json!([item]), "images[0]", needle);
+        }
+    }
+
+    #[test]
+    fn a_base64_object_parses() {
+        let sources = sources_of(&json!([{"content_type": "image/png", "base64": "aGk="}]));
+        assert!(
+            matches!(&sources[0], InputImageSource::Base64 { media_type, data }
+                if media_type == "image/png" && data == "aGk="),
+            "{sources:?}"
+        );
+    }
+
+    #[test]
+    fn a_blank_content_type_is_refused() {
+        // Validated non-blank and then dropped - the decoder sniffs the
+        // bytes - but a blank claim is still the schema's business.
+        assert_images_refused_at(
+            &json!([{"content_type": "  ", "base64": "aGk="}]),
+            "images[0]",
+            "content_type",
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_inside_an_image_object_is_refused() {
+        assert_images_refused_at(
+            &json!([{"content_type": "image/png", "base64": "aGk=", "bogus": 1}]),
+            "images[0]",
+            "bogus",
+        );
+        // The two object arms are exclusive: a url item carrying a claimed
+        // media type is not half of each.
+        assert_images_refused_at(
+            &json!([{"url": "https://example.com/x.png", "content_type": "image/png"}]),
+            "images[0]",
+            "content_type",
+        );
+    }
+
+    #[test]
+    fn an_image_object_missing_a_key_is_refused() {
+        assert_images_refused_at(
+            &json!([{"content_type": "image/png"}]),
+            "images[0]",
+            "base64",
+        );
+        assert_images_refused_at(&json!([{"base64": "aGk="}]), "images[0]", "content_type");
+    }
+
+    #[test]
+    fn a_url_object_parses() {
+        // It parses here; the `--vision-allow-remote-images` refusal already
+        // lives in the renderer and is not duplicated at the wire.
+        let sources = sources_of(&json!([{"url": "https://example.com/x.png"}]));
+        assert!(
+            matches!(&sources[0], InputImageSource::Url { url }
+                if url == "https://example.com/x.png"),
+            "{sources:?}"
+        );
+    }
+
+    #[test]
+    fn an_item_of_another_json_type_is_refused() {
+        for item in [json!(5), json!(true), json!(null), json!(["a"]), json!({})] {
+            assert_images_refused_at(&json!([item]), "images[0]", "images[0]");
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_offending_index() {
+        // The first item is fine; the location is the second one's index.
+        assert_images_refused_at(&json!(["data:image/png;base64,aGk=", 5]), "images[1]", "5");
+    }
+
+    #[test]
+    fn absent_or_empty_images_yield_no_sources() {
+        assert!(
+            images_sources(None)
+                .expect("absent is not a refusal")
+                .is_empty()
+        );
+        assert!(sources_of(&json!([])).is_empty());
     }
 }
