@@ -1084,18 +1084,15 @@ mod tests {
     /// Two images as the browser read them: the same base64 shape the audio
     /// picker's reader produces.
     fn two_images() -> Vec<Image> {
-        [
-            ("a.png", Some("image/png")),
-            ("b.jpg", Some("image/jpeg")),
-        ]
-        .iter()
-        .enumerate()
-        .map(|(index, (name, mime))| Image {
-            filename: (*name).to_string(),
-            content_type: mime.map(str::to_string),
-            data: base64::engine::general_purpose::STANDARD.encode(format!("bytes-{index}")),
-        })
-        .collect()
+        [("a.png", Some("image/png")), ("b.jpg", Some("image/jpeg"))]
+            .iter()
+            .enumerate()
+            .map(|(index, (name, mime))| Image {
+                filename: (*name).to_string(),
+                content_type: mime.map(str::to_string),
+                data: base64::engine::general_purpose::STANDARD.encode(format!("bytes-{index}")),
+            })
+            .collect()
     }
 
     #[test]
@@ -1104,8 +1101,14 @@ mod tests {
         r.images = two_images();
         validate(&r).unwrap();
         let b = build_body(&r).unwrap();
-        let input = b["input"].as_array().expect("with images the input is blocks");
-        assert_eq!(input.len(), 3, "the turn's text leads, then one block per picture");
+        let input = b["input"]
+            .as_array()
+            .expect("with images the input is blocks");
+        assert_eq!(
+            input.len(),
+            3,
+            "the turn's text leads, then one block per picture"
+        );
         assert_eq!(input[0], json!({"type": "text", "text": "again"}));
         for (index, name) in (1..=2).zip(["a.png", "b.jpg"]) {
             let want_data =
@@ -1132,7 +1135,10 @@ mod tests {
             data: "aGk=".into(),
         }];
         let b = build_body(&r).unwrap();
-        assert_eq!(b["input"][1]["source"]["media_type"], "application/octet-stream");
+        assert_eq!(
+            b["input"][1]["source"]["media_type"],
+            "application/octet-stream"
+        );
     }
 
     #[test]
@@ -1154,7 +1160,10 @@ mod tests {
         r.images = two_images();
         let b = build_body(&r).unwrap();
         assert_eq!(b["state"], "be brief");
-        assert!(b.get("images").is_none(), "images never ride the systemone body");
+        assert!(
+            b.get("images").is_none(),
+            "images never ride the systemone body"
+        );
     }
 
     #[test]

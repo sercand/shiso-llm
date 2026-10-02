@@ -903,10 +903,7 @@ pub(crate) fn png_data_uri(width: u32, height: u32) -> String {
     let image = image::RgbImage::from_pixel(width, height, image::Rgb([40, 90, 160]));
     let mut bytes = Vec::new();
     image::DynamicImage::ImageRgb8(image)
-        .write_to(
-            &mut io::Cursor::new(&mut bytes),
-            image::ImageFormat::Png,
-        )
+        .write_to(&mut io::Cursor::new(&mut bytes), image::ImageFormat::Png)
         .expect("a solid-colour PNG encodes");
     format!(
         "data:image/png;base64,{}",
