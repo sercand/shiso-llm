@@ -573,7 +573,11 @@ async fn a_vision_ticket_answers_through_decisions() {
         // The same request with the picture dropped: the expanded pads are
         // billed, so the media request must cost strictly more prompt tokens
         // than the text-only one. Equal costs would mean the pixels became
-        // nothing the model was scored on.
+        // nothing the model was scored on. The comparison assumes the pad
+        // run outgrows the blank line the text-only spelling keeps and the
+        // media spelling drops (the whitespace rule): true for any real
+        // picture's grid, so do not thin the screenshot toward a one-pad
+        // fixture and call the difference noise.
         let text_only = post_json(
             &state,
             "/v1/decisions",

@@ -1411,3 +1411,33 @@ async fn a_remote_image_url_is_refused_without_the_flag() {
         "the refusal must name the flag: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_valid_image_block_without_a_vision_tower_is_refused() {
+    // The block is well-formed and the wire accepts it; the refusal is the
+    // renderer's: a text-only deployment cannot score pixels and says so,
+    // naming the missing tower rather than mangling the picture into text.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    let png = common::png_data_uri(96, 96);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": [
+                    {"type": "text", "text": "urgent?"},
+                    image_block(&png),
+                ],
+                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no vision tower")),
+        "the refusal must name the missing tower: {body}"
+    );
+}

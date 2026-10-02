@@ -431,7 +431,22 @@ pub(crate) fn decision_input(value: &Value) -> Result<DecisionInput, AppError> {
             other => {
                 let got = match other {
                     Some(kind) => format!("`{kind:?}`"),
-                    None => "an object without a `type`".to_owned(),
+                    // A non-object element is not "an object without a
+                    // `type`"; the refusal names what the caller actually
+                    // sent, beside the index the message already carries.
+                    None if item.is_object() => "an object without a string `type`".to_owned(),
+                    None => format!(
+                        "a {} element",
+                        match item {
+                            Value::Null => "null",
+                            Value::Bool(_) => "boolean",
+                            Value::Number(_) => "number",
+                            Value::String(_) => "string",
+                            Value::Array(_) => "array",
+                            // Reached only through `is_object` above.
+                            Value::Object(_) => "object",
+                        }
+                    ),
                 };
                 return Err(block_error(
                     index,
