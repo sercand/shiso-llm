@@ -129,6 +129,32 @@ pub(crate) struct PlaygroundRequest {
     /// JSON error on the whole console request.
     #[serde(default)]
     pub questions: Option<String>,
+    /// The pictures to score, for `/v1/decisions` only: with any, the
+    /// `input` becomes a content-block array carrying the turn's text and
+    /// these bytes; without any, the string form is sent unchanged. The
+    /// systemone composer has no picker and ignores this.
+    #[serde(default)]
+    pub images: Vec<Image>,
+}
+
+/// An uploaded picture, as the browser read it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Image {
+    /// Carried because the console sends it and `deny_unknown_fields` must
+    /// accept it; the content block it becomes names only the media type and
+    /// the bytes, so nothing here reads the name.
+    #[expect(
+        dead_code,
+        reason = "accepted from the console's request shape; the content block it becomes carries only the media type and the bytes"
+    )]
+    pub filename: String,
+    /// The file's MIME type; defaults to `application/octet-stream`, which
+    /// the server accepts since it sniffs the bytes anyway.
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// The file's bytes, standard base64.
+    pub data: String,
 }
 
 /// An uploaded audio file, as the browser read it.
@@ -412,9 +438,32 @@ fn build_body(req: &PlaygroundRequest) -> Result<Value, AppError> {
         DECISIONS => {
             // Not a conversation either: the newest user turn is the
             // input; the questions come from the console's own field.
-            // Temperature is a decisions knob, so it is forwarded.
+            // Temperature is a decisions knob, so it is forwarded. With
+            // picked images the input becomes a content-block array - the
+            // turn's text first, then one base64 block per picture, since
+            // a string input cannot carry one; without images the string
+            // form goes out byte-identical to before the picker existed.
             let input = newest_user(req, "decisions")?;
-            obj.insert("input".into(), json!(input.content));
+            let input_value = if req.images.is_empty() {
+                json!(input.content)
+            } else {
+                let mut blocks = vec![json!({"type": "text", "text": input.content})];
+                blocks.extend(req.images.iter().map(|image| {
+                    json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image
+                                .content_type
+                                .as_deref()
+                                .unwrap_or("application/octet-stream"),
+                            "data": image.data,
+                        },
+                    })
+                }));
+                Value::Array(blocks)
+            };
+            obj.insert("input".into(), input_value);
             obj.insert("questions".into(), parse_questions(req)?);
             if let Some(t) = req.temperature {
                 obj.insert("temperature".into(), json!(t));
@@ -817,6 +866,7 @@ mod tests {
             response_format: None,
             keywords: None,
             questions: None,
+            images: Vec::new(),
         }
     }
 
@@ -1029,6 +1079,91 @@ mod tests {
         r.system = Some("   ".into());
         let b = build_body(&r).unwrap();
         assert_eq!(b["state"], "", "a blank state is legal on this wire");
+    }
+
+    /// Two images as the browser read them: the same base64 shape the audio
+    /// picker's reader produces.
+    fn two_images() -> Vec<Image> {
+        [("a.png", Some("image/png")), ("b.jpg", Some("image/jpeg"))]
+            .iter()
+            .enumerate()
+            .map(|(index, (name, mime))| Image {
+                filename: (*name).to_string(),
+                content_type: mime.map(str::to_string),
+                data: base64::engine::general_purpose::STANDARD.encode(format!("bytes-{index}")),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_body_composes_text_and_image_blocks_for_decisions() {
+        let mut r = with_questions(DECISIONS);
+        r.images = two_images();
+        validate(&r).unwrap();
+        let b = build_body(&r).unwrap();
+        let input = b["input"]
+            .as_array()
+            .expect("with images the input is blocks");
+        assert_eq!(
+            input.len(),
+            3,
+            "the turn's text leads, then one block per picture"
+        );
+        assert_eq!(input[0], json!({"type": "text", "text": "again"}));
+        for (index, name) in (1..=2).zip(["a.png", "b.jpg"]) {
+            let want_data =
+                base64::engine::general_purpose::STANDARD.encode(format!("bytes-{}", index - 1));
+            assert_eq!(
+                input[index],
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": if name == "a.png" { "image/png" } else { "image/jpeg" },
+                        "data": want_data,
+                    },
+                }),
+                "block {index} is {name}"
+            );
+        }
+        // A file the browser named no MIME type for still spells a
+        // media_type; the server sniffs the bytes anyway.
+        let mut r = with_questions(DECISIONS);
+        r.images = vec![Image {
+            filename: "x".into(),
+            content_type: None,
+            data: "aGk=".into(),
+        }];
+        let b = build_body(&r).unwrap();
+        assert_eq!(
+            b["input"][1]["source"]["media_type"],
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn build_body_without_images_sends_the_string_form() {
+        // The golden the server's own container tests lean on: no images,
+        // no change - `input` is the newest user turn's string, byte for
+        // byte as before the picker existed.
+        let r = with_questions(DECISIONS);
+        let b = build_body(&r).unwrap();
+        assert_eq!(b["input"], json!("again"));
+    }
+
+    #[test]
+    fn build_body_systemone_is_unchanged() {
+        // The systemone wire refuses block arrays outright; the console
+        // gives its composer no picker and sends its state as the string it
+        // always was, whatever `images` a stale request might carry.
+        let mut r = with_questions(SYSTEMONE);
+        r.images = two_images();
+        let b = build_body(&r).unwrap();
+        assert_eq!(b["state"], "be brief");
+        assert!(
+            b.get("images").is_none(),
+            "images never ride the systemone body"
+        );
     }
 
     #[test]

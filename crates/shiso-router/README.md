@@ -92,6 +92,9 @@ listen = "127.0.0.1:8080"
 sqlite_path = "shiso-router.db"
 
 # Maximum accepted request body size in bytes (default 1 GiB).
+# base64 images on /v1/decisions inflate bodies by ~4/3, so an operator who
+# has lowered this below the server's own 32 MiB body limit may need to raise
+# it again for large screenshots.
 max_body_bytes = 1073741824
 
 # Admin token protecting /admin/* endpoints and the UI.

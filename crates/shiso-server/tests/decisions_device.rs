@@ -21,21 +21,32 @@
 //! SHISO_TEST_MODEL=/path/to/Qwen3.5-4B \
 //!   cargo test -p shiso-server --features metal --test decisions_device -- --ignored --nocapture
 //! ```
+//!
+//! The vision case is gated on its own export and skips with a stated reason
+//! without one:
+//!
+//! ```text
+//! SHISO_TEST_MODEL_VISION=/path/to/Qwen3.5-VL \
+//!   cargo test -p shiso-server --features metal --test decisions_device -- --ignored --nocapture a_vision_ticket
+//! ```
 
 #![cfg(feature = "metal")]
 
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use base64::Engine as _;
 use serde_json::{Value, json};
 use shiso_core::Backend;
 use shiso_server::cli::{Cli, Command, ServeArgs};
 use shiso_server::router::build_router;
 use shiso_server::scheduler::{SchedulerConfig, spawn_engine_with_checkpoints};
 use shiso_server::state::AppState;
+use shiso_server::vision::VisionTower;
 use tower::ServiceExt as _;
 
 /// Prints the test's own report; a skipped case says why and returns.
@@ -67,11 +78,45 @@ fn export() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
+/// The vision export to boot, when this machine has one: a directory that
+/// is its own checkpoint and carries its own `config.json` (or under `mlx`),
+/// with the vision sidecar beside it - the shape `--vision` reads a directory
+/// for, and the shape `export()` already accepts.
+fn vision_export() -> Option<(PathBuf, PathBuf)> {
+    let root = PathBuf::from(std::env::var("SHISO_TEST_MODEL_VISION").ok()?);
+    for candidate in [&root, &root.join("mlx")] {
+        let config = candidate.join("config.json");
+        if candidate.is_dir() && config.is_file() {
+            return Some((candidate.clone(), config));
+        }
+    }
+    None
+}
+
 /// The command line this test would have been given.
 fn args(model: &Path, config: &Path) -> ServeArgs {
     let (model, config) = (model.display().to_string(), config.display().to_string());
     let line = [
         "shiso", "serve", "--model", &model, "--config", &config, "--ctx", "2048",
+    ];
+    let cli = <Cli as clap::Parser>::try_parse_from(line).expect("the command line parses");
+    let Command::Serve(serve) = cli.command else {
+        panic!("expected Command::Serve");
+    };
+    *serve
+}
+
+/// The command line with `--vision` naming the tower, the way a multimodal
+/// checkpoint is started for real.
+fn args_with_vision(model: &Path, config: &Path, vision: &Path) -> ServeArgs {
+    let (model, config, vision) = (
+        model.display().to_string(),
+        config.display().to_string(),
+        vision.display().to_string(),
+    );
+    let line = [
+        "shiso", "serve", "--model", &model, "--config", &config, "--vision", &vision, "--ctx",
+        "2048",
     ];
     let cli = <Cli as clap::Parser>::try_parse_from(line).expect("the command line parses");
     let Command::Serve(serve) = cli.command else {
@@ -92,19 +137,39 @@ impl Stack {
     /// Loads the checkpoint and starts the coordinator, the way the binary
     /// boots it - the same sequence `e2e.rs` walks, stopped short of a socket.
     fn boot(model: &Path, config: &Path) -> Self {
-        let args = args(model, config);
+        Self::boot_args(&args(model, config))
+    }
+
+    /// The same boot with a vision tower open: `--vision` names the sidecar
+    /// (or the directory holding it), the tower comes through the family's
+    /// own opener, and the renderer learns its preprocessing geometry and
+    /// placement - the sequence `media_e2e.rs` walks, stopped short of a
+    /// socket.
+    fn boot_with_vision(model: &Path, config: &Path, vision: &Path) -> Self {
+        Self::boot_args(&args_with_vision(model, config, vision))
+    }
+
+    /// The one boot both entries share, so the multimodal case cannot drift
+    /// beside the text one: with `--vision` on the command line the tower is
+    /// opened and paired-checked, the vocabulary must declare the image
+    /// placeholder, and the engine holds the tower in its `MediaTowers`.
+    fn boot_args(args: &ServeArgs) -> Self {
         args.validate().expect("the command line is servable");
         let backend: Arc<dyn Backend> = shiso_metal::MetalBackend::new().expect("a Metal device");
         let parsed = shiso_core::HfConfig::from_file(&args.config_path()).expect("the config");
-        let loaded = shiso_server::model_factory::load_model(
+        let shiso_server::model_factory::Loaded {
+            model: mut loaded,
+            open_tower,
+            placement,
+            defaults,
+            ..
+        } = shiso_server::model_factory::load_model(
             &backend,
             args.model.as_deref().expect("this test passes --model"),
             &parsed,
-            &args,
+            args,
         )
         .expect("the checkpoint loads");
-        let model = loaded.model;
-        let defaults = loaded.defaults;
         let vocabulary = Arc::new(
             shiso_server::tokenizer::Vocabulary::from_file(&args.tokenizer_path())
                 .expect("the vocabulary loads"),
@@ -116,14 +181,44 @@ impl Stack {
             shiso_server::tokenizer::jinja_helpers::ToolJsonStyle::Compact,
             Arc::clone(&vocabulary),
         )
-        .expect("the chat template compiles")
-        .with_thinking_default(defaults.thinking_default);
+        .expect("the chat template compiles");
+
+        let (renderer, towers) = match args.vision.as_deref() {
+            None => (renderer, shiso_server::media::MediaTowers::default()),
+            Some(path) => {
+                // Through the family's own opener, which is the door the
+                // binary uses; a tower built some other way here would not
+                // be evidence about the shipped path.
+                let tower = VisionTower::from_tower(
+                    open_tower(&backend, path).expect("the family's tower loads"),
+                );
+                let hidden = shiso_core::Model::info(loaded.as_mut()).hidden;
+                tower
+                    .check_against(hidden)
+                    .expect("the tower and the checkpoint are a pair");
+                let pads = vocabulary.media_ids(&placement);
+                assert!(
+                    pads.image().is_some(),
+                    "this vocabulary declares none of this family's image placeholder; \
+                     nothing below could splice"
+                );
+                (
+                    renderer.with_tower(tower.preprocess(), placement, args.image_limits()),
+                    shiso_server::media::MediaTowers {
+                        vision: Some(tower),
+                        audio: None,
+                        cache: None,
+                    },
+                )
+            }
+        };
+        let renderer = renderer.with_thinking_default(defaults.thinking_default);
 
         let model_id = args.model_id();
         let (engine, join) = spawn_engine_with_checkpoints(
             backend,
-            model,
-            shiso_server::media::MediaTowers::default(),
+            loaded,
+            towers,
             Some(Arc::clone(&vocabulary)),
             &model_id,
             args.ctx,
@@ -389,6 +484,121 @@ async fn both_routes_answer_one_ticket_against_a_real_model() {
 
     // The engine thread exits when the last queue reference goes, so this
     // clone must be gone before the join - `e2e.rs` never had one to release.
+    drop(state);
+    stack.shutdown();
+    finished.expect("the session finished inside its deadline");
+}
+
+/// A small screenshot-style PNG, drawn here rather than committed as a
+/// binary blob: a window's title bar over a few text-like rows, at the edge
+/// a Qwen-geometry tower resizes without touching (224 px is a whole number
+/// of 32-px merge blocks, so the placeholder run is exactly the grid).
+fn screenshot_png() -> Vec<u8> {
+    let mut img = image::RgbaImage::from_pixel(224, 224, image::Rgba([248, 250, 252, 255]));
+    for x in 0..224 {
+        for y in 0..24 {
+            img.put_pixel(x, y, image::Rgba([37, 99, 235, 255]));
+        }
+    }
+    for row in 0..6u32 {
+        let y0 = 44 + row * 26;
+        let x1 = 176 - row * 18;
+        for x in 16..x1 {
+            for y in y0..y0 + 12 {
+                img.put_pixel(x, y, image::Rgba([30, 41, 59, 255]));
+            }
+        }
+    }
+    let mut png = Vec::new();
+    img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("a PNG encodes");
+    png
+}
+
+/// The vision case: a screenshot ticket through `/v1/decisions`, on a real
+/// checkpoint with a real tower. Shape only, for the same reason the text
+/// case is shape-only about its values - this is a smoke test of the join
+/// (blocks parse, the tower runs, the pads expand, an answer comes back),
+/// not an opinion about the model. The load-bearing line is the billing
+/// comparison against the same request without the picture: if the pixels
+/// never became tokens, the two requests cost the same and this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a local vision export and a Metal device"]
+async fn a_vision_ticket_answers_through_decisions() {
+    let Some((export_dir, config)) = vision_export() else {
+        say(
+            "SKIP: SHISO_TEST_MODEL_VISION names no usable vision export (a directory \
+             with a config.json in it or in its mlx/ subdirectory, and the vision \
+             sidecar beside it)",
+        );
+        return;
+    };
+    if !shiso_metal::metal_available() {
+        say("SKIP: no Metal device");
+        return;
+    }
+
+    let stack = Stack::boot_with_vision(&export_dir, &config, &export_dir);
+    say(&format!("booted vision export {}", export_dir.display()));
+    let state = Arc::clone(&stack.state);
+
+    let ticket = "The app looks broken on my phone, look at the screenshot.";
+    let question = json!({"id": "spinner", "type": "yes_no",
+                          "question": "Does the screenshot show a stuck spinner?"});
+    let picture = json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": base64::engine::general_purpose::STANDARD.encode(screenshot_png()),
+        },
+    });
+
+    let session = async {
+        let with_picture = post_json(
+            &state,
+            "/v1/decisions",
+            &json!({
+                "input": [{"type": "text", "text": ticket}, picture],
+                "questions": [question.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(with_picture["object"], "decisions", "{with_picture}");
+        assert_eq!(with_picture["prompt_format_version"], 1, "{with_picture}");
+        let answer = &with_picture["answers"]["spinner"];
+        assert_eq!(answer["type"], "yes_no", "{with_picture}");
+        check_shape(answer, "label_mass", "decisions-vision/spinner");
+
+        // The same request with the picture dropped: the expanded pads are
+        // billed, so the media request must cost strictly more prompt tokens
+        // than the text-only one. Equal costs would mean the pixels became
+        // nothing the model was scored on. The comparison assumes the pad
+        // run outgrows the blank line the text-only spelling keeps and the
+        // media spelling drops (the whitespace rule): true for any real
+        // picture's grid, so do not thin the screenshot toward a one-pad
+        // fixture and call the difference noise.
+        let text_only = post_json(
+            &state,
+            "/v1/decisions",
+            &json!({"input": ticket, "questions": [question]}),
+        )
+        .await;
+        let billed = |body: &Value| {
+            body["usage"]["prompt_tokens"]
+                .as_u64()
+                .expect("the accounting counts the prompts")
+        };
+        assert!(
+            billed(&with_picture) > billed(&text_only),
+            "the picture added no prompt tokens: {} vs {}",
+            billed(&with_picture),
+            billed(&text_only)
+        );
+        say("ok: /v1/decisions answered a vision ticket and billed the expanded pads");
+    };
+    let finished = tokio::time::timeout(Duration::from_secs(600), session).await;
+
     drop(state);
     stack.shutdown();
     finished.expect("the session finished inside its deadline");

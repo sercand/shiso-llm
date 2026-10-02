@@ -144,7 +144,10 @@ pub(crate) struct DecisionsBody {
     /// The prompt format the caller believes it is speaking. Only 1 exists.
     #[serde(default)]
     pub prompt_format_version: Option<u32>,
-    /// Whether each answer carries its prompt and label token ids.
+    /// Whether each answer carries its prompt and label token ids. When the
+    /// prompt carries media, the returned ids are the *expanded* ones the
+    /// model read - pad runs included - and their count is the prompt side
+    /// of `usage.prompt_tokens`.
     #[serde(default)]
     pub return_prompt_token_ids: Option<bool>,
     /// Chat-template knobs; the accepted keys and their rules are
@@ -182,10 +185,9 @@ impl DecisionsBody {
                 // image-only input scores, an array of only-blank text
                 // blocks does not. An empty blocks array cannot occur -
                 // detection requires a typed element.
-                if blocks
-                    .iter()
-                    .all(|block| matches!(block, InputBlock::Text { text } if text.trim().is_empty()))
-                {
+                if blocks.iter().all(
+                    |block| matches!(block, InputBlock::Text { text } if text.trim().is_empty()),
+                ) {
                     return Err(AppError::bad_request(
                         "input must not be blank",
                         Some("input"),
@@ -283,7 +285,7 @@ fn refuse_fields_other_than(question: &QuestionWire, allowed: &[&str]) -> Result
 ///
 /// The rule is deliberately "any", not "all" (spec ruling 1): an array in
 /// which *no* element has a known `type` is a JSON container by design, so
-/// arbitrary datasets that legitimately carry `"type"` keys (GeoJSON
+/// arbitrary datasets that legitimately carry `"type"` keys (`GeoJSON`
 /// features, form schemas) keep today's compact-JSON reading. Once one
 /// element looks like a block, the array is blocks and every element is held
 /// to the block grammar - a typo'd type in a mixed array is refused loudly,
@@ -328,6 +330,13 @@ pub(crate) enum InputImageSource {
     /// the bytes, and the decoder sniffs them.
     Base64 {
         /// The caller's claimed media type; present and non-blank.
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "validated at the wire and deliberately not carried further: the IR holds only the bytes, and the decoder sniffs them; the unit tests read it to pin the parse"
+            )
+        )]
         media_type: String,
         /// The base64 payload, undecoded.
         data: String,
@@ -367,10 +376,7 @@ struct ImageBlockWire {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 enum SourceWire {
-    Base64 {
-        media_type: String,
-        data: String,
-    },
+    Base64 { media_type: String, data: String },
     Url { url: String },
 }
 
@@ -425,7 +431,22 @@ pub(crate) fn decision_input(value: &Value) -> Result<DecisionInput, AppError> {
             other => {
                 let got = match other {
                     Some(kind) => format!("`{kind:?}`"),
-                    None => "an object without a `type`".to_owned(),
+                    // A non-object element is not "an object without a
+                    // `type`"; the refusal names what the caller actually
+                    // sent, beside the index the message already carries.
+                    None if item.is_object() => "an object without a string `type`".to_owned(),
+                    None => format!(
+                        "a {} element",
+                        match item {
+                            Value::Null => "null",
+                            Value::Bool(_) => "boolean",
+                            Value::Number(_) => "number",
+                            Value::String(_) => "string",
+                            Value::Array(_) => "array",
+                            // Reached only through `is_object` above.
+                            Value::Object(_) => "object",
+                        }
+                    ),
                 };
                 return Err(block_error(
                     index,
@@ -541,7 +562,7 @@ mod tests {
                     other => panic!("expected a base64 image, got {other:?}"),
                 }
             }
-            other => panic!("expected blocks, got {other:?}"),
+            other @ DecisionInput::Text(_) => panic!("expected blocks, got {other:?}"),
         }
         let split = decision_input(&json!([
             {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
@@ -565,7 +586,10 @@ mod tests {
             // Focus 1) - it must not fall back to compact JSON.
             (json!([{"type": "text", "text": "a"}, {"type": "img"}]), 1),
             // A missing required field on the image source.
-            (json!([{"type": "image", "source": {"type": "base64", "data": "aGk="}}]), 0),
+            (
+                json!([{"type": "image", "source": {"type": "base64", "data": "aGk="}}]),
+                0,
+            ),
             // An unknown key on the image source.
             (
                 json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk=", "extra": 1}}]),

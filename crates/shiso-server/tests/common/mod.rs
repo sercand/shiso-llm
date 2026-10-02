@@ -35,8 +35,9 @@ use std::io;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use base64::Engine as _;
 use parking_lot::{Condvar, Mutex};
 use shiso_core::{
     Backend, CoreError, CoreResult, DecodeStep, DeviceBuffer, DeviceView, KernelRef, LaunchArgs,
@@ -883,4 +884,233 @@ pub(crate) async fn wait_for_queued(engine: &EngineHandle, want: u64) {
         "only {} of {want} requests reached the queue",
         engine.stats().requests()
     );
+}
+
+// --- the media-capable fakes -------------------------------------------------
+
+/// The recorded geometry every media fake here shares: a 96x96 picture is a
+/// 6x6 patch grid pooled 3x3 into four soft tokens, so a pad run is four
+/// long and "the prompt was read in one piece" is a claim about more than
+/// one token.
+pub(crate) fn media_spec() -> shiso_vision::PreprocessSpec {
+    shiso_vision::PreprocessSpec::qwen35(
+        shiso_vision::PatchGeometry::new(16, 1, 3).expect("a 3x3-pooled 16-pixel patch"),
+    )
+}
+
+/// A solid-colour PNG, as the data URI a request would carry.
+pub(crate) fn png_data_uri(width: u32, height: u32) -> String {
+    let image = image::RgbImage::from_pixel(width, height, image::Rgb([40, 90, 160]));
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .expect("a solid-colour PNG encodes");
+    format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    )
+}
+
+/// A tower that hands over rows sized to each item's own post-merge grid -
+/// the contract the splice leans on - or refuses every encode.
+#[derive(Debug)]
+pub(crate) struct FakeTower {
+    pub spec: shiso_vision::PreprocessSpec,
+    pub fail: bool,
+}
+
+impl shiso_vision::VisionTower for FakeTower {
+    fn preprocess(&self) -> &shiso_vision::PreprocessSpec {
+        &self.spec
+    }
+
+    fn placement(&self) -> shiso_vision::MediaPlacement {
+        shiso_vision::MediaPlacement::QWEN35
+    }
+
+    fn out_hidden(&self) -> u32 {
+        // The fake model's residual width; the rows are `[pads, hidden]`.
+        8
+    }
+
+    fn device_bytes(&self) -> u64 {
+        0
+    }
+
+    fn encode(
+        &self,
+        backend: &Arc<dyn Backend>,
+        items: &[shiso_vision::VisionItem],
+    ) -> Result<shiso_vision::EncodedRows, shiso_vision::VisionError> {
+        if self.fail {
+            return Err(shiso_vision::VisionError::Encode {
+                step: "fake",
+                source: CoreError::Unsupported {
+                    what: "the fake tower was told to refuse",
+                    backend: "fake",
+                },
+            });
+        }
+        let merge = self.spec.geometry.spatial_merge_size().max(1);
+        let mut grids = Vec::with_capacity(items.len());
+        let mut pads = 0u64;
+        for item in items {
+            let (t, gh, gw) = item.grid();
+            let grid = shiso_core::VisionGrid::new(
+                u32::try_from(t).unwrap_or(u32::MAX),
+                u32::try_from(gh / merge).unwrap_or(u32::MAX),
+                u32::try_from(gw / merge).unwrap_or(u32::MAX),
+            );
+            pads += u64::from(grid.pad_count());
+            grids.push(grid);
+        }
+        let rows = alloc(backend, pads * 8 * 4).expect("the fake allocates");
+        Ok(shiso_vision::EncodedRows { rows, grids })
+    }
+}
+
+/// The scripted model with a media path: `prefill_media` is counted, and both
+/// entry points record through the shared audit like [`FakeModel`] does.
+#[derive(Debug)]
+pub(crate) struct FakeMediaModel {
+    inner: FakeModel,
+    media_calls: Arc<AtomicUsize>,
+}
+
+impl FakeMediaModel {
+    /// Wraps a scripted model; the counter comes back so a test can tell the
+    /// media entry point from the plain one after the model has moved to the
+    /// engine thread.
+    pub(crate) fn new(inner: FakeModel) -> (Self, Arc<AtomicUsize>) {
+        let media_calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                inner,
+                media_calls: Arc::clone(&media_calls),
+            },
+            media_calls,
+        )
+    }
+}
+
+impl Model for FakeMediaModel {
+    fn info(&self) -> &ModelInfo {
+        self.inner.info()
+    }
+
+    fn open_session(&mut self) -> CoreResult<SessionId> {
+        self.inner.open_session()
+    }
+
+    fn close_session(&mut self, session: SessionId) -> CoreResult<()> {
+        self.inner.close_session(session)
+    }
+
+    fn prefill_chunk(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<()> {
+        self.inner.prefill_chunk(session, tokens)
+    }
+
+    fn prefill_last(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<Logits<'_>> {
+        self.inner.prefill_last(session, tokens)
+    }
+
+    fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
+        self.inner.decode_batch(steps)
+    }
+
+    fn teardown(&mut self) -> CoreResult<()> {
+        self.inner.teardown()
+    }
+
+    fn media_mut(&mut self) -> Option<&mut dyn shiso_core::MediaModel> {
+        Some(self)
+    }
+}
+
+impl shiso_core::MediaModel for FakeMediaModel {
+    fn prefill_media(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        _media: &shiso_core::VisionPrefill<'_>,
+    ) -> CoreResult<Logits<'_>> {
+        self.media_calls.fetch_add(1, Ordering::SeqCst);
+        // The scripted row answers through the plain entry point, which also
+        // records the prompt: a media read and a text read differ by the
+        // counter, not by what the audit's prompt list shows.
+        self.inner.prefill_last(session, tokens)
+    }
+}
+
+impl Checkpointed for FakeMediaModel {
+    fn kv_enable(&mut self, _config: &CkptConfig) -> CoreResult<()> {
+        Ok(())
+    }
+
+    fn kv_checkpoint_enabled(&self) -> bool {
+        false
+    }
+
+    fn kv_resume(
+        &mut self,
+        _session: SessionId,
+        _prompt: &[TokenId],
+    ) -> CoreResult<Option<ResumeInfo<'_>>> {
+        Ok(None)
+    }
+
+    fn kv_save(&mut self, _session: SessionId, _reason: Reason) -> CoreResult<SaveOutcome> {
+        Ok(SaveOutcome::Refused(PersistRefusal::NoCheckpoint))
+    }
+
+    fn kv_set_hints(&mut self, _session: SessionId, _hints: &[u32]) -> CoreResult<()> {
+        Ok(())
+    }
+
+    fn kv_shutdown_sweep(&mut self) -> usize {
+        0
+    }
+}
+
+/// What a media-capable fake engine hands back: the handle, the loop's
+/// thread, the audit, and the media-prefill counter.
+pub(crate) type MediaEngine = (
+    EngineHandle,
+    std::thread::JoinHandle<Result<(), EngineFailure>>,
+    Arc<Audit>,
+    Arc<AtomicUsize>,
+);
+
+/// An engine over the media-capable fake, with `fail_tower` deciding whether
+/// the vision tower encodes or refuses. The media-call counter and the audit
+/// come back; the model does not - it lives on the engine thread now.
+pub(crate) fn fake_media_engine(
+    rows: Vec<Vec<f32>>,
+    vocabulary: Option<Arc<Vocabulary>>,
+    fail_tower: bool,
+) -> MediaEngine {
+    let backend: Arc<dyn Backend> = FakeBackend::new();
+    let (model, audit) = FakeModel::new(&backend, Vec::new());
+    let (model, media_calls) = FakeMediaModel::new(model.with_prefill_rows(rows));
+    let tower = shiso_server::vision::VisionTower::from_tower(Box::new(FakeTower {
+        spec: media_spec(),
+        fail: fail_tower,
+    }));
+    let (engine, join) = spawn_engine_with_checkpoints(
+        backend,
+        Box::new(model),
+        shiso_server::media::MediaTowers {
+            vision: Some(tower),
+            ..shiso_server::media::MediaTowers::default()
+        },
+        vocabulary,
+        "fake-model",
+        CAPACITY,
+        SchedulerConfig::new(),
+        (
+            shiso_parsers::ReasoningScheme::None,
+            shiso_parsers::ToolCallScheme::None,
+        ),
+    );
+    (engine, join, audit, media_calls)
 }

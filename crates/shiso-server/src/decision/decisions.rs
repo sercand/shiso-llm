@@ -20,7 +20,7 @@ use axum::response::{IntoResponse as _, Response};
 
 use crate::decision::core::{self, TemplateKwargs, prepare_question, run_questions};
 use crate::decision::decisions_encode::encode;
-use crate::decision::decisions_wire::DecisionsBody;
+use crate::decision::decisions_wire::{self, DecisionsBody};
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -54,7 +54,10 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     let want_token_ids = parsed.return_prompt_token_ids.unwrap_or(false);
     let kwargs_wire = parsed.chat_template_kwargs.clone();
     let temperature = core::check_temperature(parsed.temperature)?;
-    let input_text = core::render_text(&parsed.input);
+    // The same split `validate` applies, taken out while the body is still
+    // whole: the text arm scores today's compact rendering, the blocks arm
+    // carries the caller's parts - and their pictures - to the renderer.
+    let input = decisions_wire::decision_input(&parsed.input)?;
 
     let questions = parsed.validate()?;
     let kwargs = TemplateKwargs::from_wire(kwargs_wire)?;
@@ -66,7 +69,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     for question in &questions {
         prepared.push(prepare_question(
             state,
-            &input_text,
+            &input,
             question,
             &kwargs,
             want_token_ids,
