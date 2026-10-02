@@ -115,6 +115,25 @@ struct NormArgs {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct QkNormArgs {
+    tokens: u32,
+    heads: u32,
+    head_dim: u32,
+    /// Elements per fused qkv row; q and k are head sections of it.
+    row_stride: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct ConcatArgs {
+    rows: u32,
+    cols_a: u32,
+    cols_b: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct GroupNormArgs {
     batch: u32,
     num_groups: u32,
@@ -205,6 +224,8 @@ const _: () = assert!(size_of::<ModulateArgs>() == 8);
 const _: () = assert!(size_of::<AddGatedArgs>() == 8);
 const _: () = assert!(size_of::<UpsampleArgs>() == 16);
 const _: () = assert!(size_of::<NormArgs>() == 12);
+const _: () = assert!(size_of::<QkNormArgs>() == 20);
+const _: () = assert!(size_of::<ConcatArgs>() == 12);
 const _: () = assert!(size_of::<GroupNormArgs>() == 20);
 const _: () = assert!(size_of::<Rope4dArgs>() == 20);
 const _: () = assert!(size_of::<RopeHalfArgs>() == 12);
@@ -254,7 +275,10 @@ pub(crate) struct SdpaCall<'a> {
     pub q_img: DeviceView<'a>,
     pub k_img: DeviceView<'a>,
     pub v_img: DeviceView<'a>,
-    /// Cached reference-token keys/values; `cache_tokens == 0` binds the dummy.
+    /// Cached reference-token keys/values, attended between the txt and img
+    /// rows (the reference's `[txt, cached_ref, img]` key order);
+    /// `cache_tokens == 0` binds the dummy. Softmax is order-invariant, so
+    /// the host twin scores cache rows last without changing the result.
     pub cache_k: DeviceView<'a>,
     pub cache_v: DeviceView<'a>,
     /// Elements per cached row (a cached fused-qkv row is wider than a head).
@@ -325,6 +349,46 @@ pub(crate) struct NormCall<'a> {
     pub rows: usize,
     pub dim: usize,
     pub eps: f32,
+}
+
+/// Weightless `LayerNorm` over rows of `dim`: mean-subtracting, with no
+/// affine parameters (the transformer blocks' `elementwise_affine=False`
+/// norms, which are *not* the `RMSNorm` the text encoder uses).
+pub(crate) struct LayerNormCall<'a> {
+    pub step: &'static str,
+    pub out: DeviceView<'a>,
+    pub input: DeviceView<'a>,
+    pub rows: usize,
+    pub dim: usize,
+    pub eps: f32,
+}
+
+/// QK-norm: RMS normalization with a per-dimension scale over the q and k
+/// head sections of fused qkv rows, applied in place before `RoPE`.
+pub(crate) struct QkNormCall<'a> {
+    pub step: &'static str,
+    /// Fused qkv rows; q occupies `[0, heads * head_dim)`, k the next
+    /// `heads * head_dim` elements of the row.
+    pub qkv: DeviceView<'a>,
+    pub q_scale: DeviceView<'a>,
+    pub k_scale: DeviceView<'a>,
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub row_stride: usize,
+    pub eps: f32,
+}
+
+/// Row-wise concatenation: `out[r] = [a[r], b[r]]` (the single block's
+/// `linear2` input, the reference's `cat(attn, mlp_act)`).
+pub(crate) struct ConcatCall<'a> {
+    pub step: &'static str,
+    pub out: DeviceView<'a>,
+    pub a: DeviceView<'a>,
+    pub b: DeviceView<'a>,
+    pub rows: usize,
+    pub cols_a: usize,
+    pub cols_b: usize,
 }
 
 /// `AdaLN` modulation: `out = x * (1 + scale) + shift`, with the per-dimension
@@ -551,11 +615,14 @@ impl Ops {
         self.elementwise(step, "kernel_flux2_silu_f32", count, &[out, input])
     }
 
-    /// `SwiGLU` over a fused row: out[r, i] = in[r, i] * silu(in[r, inner + i]).
+    /// `SwiGLU` over a fused row: out[r, i] = silu(in[r, i]) * in[r, inner + i].
     ///
-    /// The double-block MLP and the single-block `linear1` both emit gate and
-    /// value halves in one row, so the kernel reads one strided buffer and
-    /// writes a packed (rows, inner) result.
+    /// The reference's activation gates with the *first* half of the row
+    /// (`SiLUActivation` chunks in two and applies `silu` to the first
+    /// chunk), so the double-block MLP and the single-block `linear1` both
+    /// emit (gate, value) in that order. The kernel reads one strided buffer
+    /// (the single block's halves start mid-row) and writes a packed
+    /// (rows, inner) result.
     pub(crate) fn swiglu(
         &self,
         step: &'static str,
@@ -566,13 +633,21 @@ impl Ops {
         stride: usize,
     ) -> Result<(), ImageGenError> {
         if self.host_fallback {
-            let x = self.download(step, input, rows * stride)?;
+            // Reads span `[(rows - 1) * stride, (rows - 1) * stride + 2 * inner)`
+            // of the view; the single block's view starts mid-row, so a
+            // `rows * stride` download would over-read past the buffer end.
+            let need = if rows == 0 {
+                0
+            } else {
+                (rows - 1) * stride + 2 * inner
+            };
+            let x = self.download(step, input, need)?;
             let mut y = Vec::with_capacity(rows * inner);
             for r in 0..rows {
                 for i in 0..inner {
-                    let v = x[r * stride + i];
-                    let g = x[r * stride + inner + i];
-                    y.push(v * (g / (1.0 + (-g).exp())));
+                    let g = x[r * stride + i];
+                    let v = x[r * stride + inner + i];
+                    y.push((g / (1.0 + (-g).exp())) * v);
                 }
             }
             return self.write_back(step, out, &y);
@@ -595,8 +670,9 @@ impl Ops {
         )
     }
 
-    /// out[i] = a[i] * silu(b[i]) over two packed buffers (the text encoder's
-    /// separate gate/up projections).
+    /// out[i] = silu(a[i]) * b[i] over two packed buffers (the text encoder's
+    /// separate gate/up projections, where `a` is the gate: the same
+    /// first-half gating the fused-row `swiglu` applies).
     #[expect(
         clippy::many_single_char_names,
         reason = "elementwise gate/up math reads clearer with a/b/x/g/y than with long names"
@@ -610,12 +686,12 @@ impl Ops {
         count: usize,
     ) -> Result<(), ImageGenError> {
         if self.host_fallback {
-            let x = self.download(step, a, count)?;
-            let g = self.download(step, b, count)?;
-            let y: Vec<f32> = x
+            let g = self.download(step, a, count)?;
+            let u = self.download(step, b, count)?;
+            let y: Vec<f32> = g
                 .iter()
-                .zip(&g)
-                .map(|(&v, &s)| v * (s / (1.0 + (-s).exp())))
+                .zip(&u)
+                .map(|(&s, &v)| (s / (1.0 + (-s).exp())) * v)
                 .collect();
             return self.write_back(step, out, &y);
         }
@@ -886,6 +962,121 @@ impl Ops {
                 KernelArg::Buffer(call.out),
                 KernelArg::Buffer(call.input),
                 KernelArg::Buffer(call.weight),
+            ],
+        )
+    }
+
+    /// Weightless `LayerNorm` each row: out = (x - mean) / sqrt(var + eps).
+    ///
+    /// Mean-subtracting, unlike `rmsnorm`, and with no affine parameters:
+    /// the transformer's block norms are `LayerNorm(affine=False)`, whose
+    /// shift/scale come from the `AdaLN` modulation instead.
+    pub(crate) fn layer_norm(&self, call: &LayerNormCall<'_>) -> Result<(), ImageGenError> {
+        if self.host_fallback {
+            let x = self.download(call.step, call.input, call.rows * call.dim)?;
+            let mut out = vec![0f32; x.len()];
+            for r in 0..call.rows {
+                let row = &x[r * call.dim..(r + 1) * call.dim];
+                let mean = row.iter().sum::<f32>() / call.dim as f32;
+                let var =
+                    row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / call.dim as f32;
+                let inv = 1.0 / (var + call.eps).sqrt();
+                for (i, &v) in row.iter().enumerate() {
+                    out[r * call.dim + i] = (v - mean) * inv;
+                }
+            }
+            return self.write_back(call.step, call.out, &out);
+        }
+        let args = NormArgs {
+            rows: call.rows as u32,
+            dim: call.dim as u32,
+            eps: call.eps,
+        };
+        self.launch(
+            call.step,
+            "kernel_flux2_layer_norm_f32",
+            Extent3::linear(call.rows as u32),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.out),
+                KernelArg::Buffer(call.input),
+            ],
+        )
+    }
+
+    /// QK-norm the reference applies before `RoPE`: per-head RMS
+    /// normalization with a per-dimension scale, in place on the q and k
+    /// head sections of fused qkv rows (`x * rsqrt(mean(x^2) + eps) * scale`).
+    pub(crate) fn qk_norm(&self, call: &QkNormCall<'_>) -> Result<(), ImageGenError> {
+        if self.host_fallback {
+            let qs = self.download(call.step, call.q_scale, call.head_dim)?;
+            let ks = self.download(call.step, call.k_scale, call.head_dim)?;
+            let mut x = self.download(call.step, call.qkv, call.tokens * call.row_stride)?;
+            let k_base = call.heads * call.head_dim;
+            for t in 0..call.tokens {
+                for h in 0..call.heads {
+                    let q0 = t * call.row_stride + h * call.head_dim;
+                    rms_scale_head(&mut x[q0..q0 + call.head_dim], &qs, call.eps);
+                    let k0 = q0 + k_base;
+                    rms_scale_head(&mut x[k0..k0 + call.head_dim], &ks, call.eps);
+                }
+            }
+            return self.write_back(call.step, call.qkv, &x);
+        }
+        let args = QkNormArgs {
+            tokens: call.tokens as u32,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+            row_stride: call.row_stride as u32,
+            eps: call.eps,
+        };
+        self.launch(
+            call.step,
+            "kernel_flux2_qk_norm_f32",
+            Extent3::new(call.tokens as u32, call.heads as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.qkv),
+                KernelArg::Buffer(call.q_scale),
+                KernelArg::Buffer(call.k_scale),
+            ],
+        )
+    }
+
+    /// Row-wise concatenation: out[r] = [a[r], b[r]], both sides packed.
+    pub(crate) fn concat_rows(&self, call: &ConcatCall<'_>) -> Result<(), ImageGenError> {
+        if self.host_fallback {
+            let a = self.download(call.step, call.a, call.rows * call.cols_a)?;
+            let b = self.download(call.step, call.b, call.rows * call.cols_b)?;
+            let width = call.cols_a + call.cols_b;
+            let mut out = vec![0f32; call.rows * width];
+            for r in 0..call.rows {
+                let (ra, rb) = (
+                    &a[r * call.cols_a..(r + 1) * call.cols_a],
+                    &b[r * call.cols_b..(r + 1) * call.cols_b],
+                );
+                out[r * width..r * width + call.cols_a].copy_from_slice(ra);
+                out[r * width + call.cols_a..(r + 1) * width].copy_from_slice(rb);
+            }
+            return self.write_back(call.step, call.out, &out);
+        }
+        let args = ConcatArgs {
+            rows: call.rows as u32,
+            cols_a: call.cols_a as u32,
+            cols_b: call.cols_b as u32,
+        };
+        self.launch(
+            call.step,
+            "kernel_flux2_concat_rows_f32",
+            Extent3::linear(call.rows as u32),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.out),
+                KernelArg::Buffer(call.a),
+                KernelArg::Buffer(call.b),
             ],
         )
     }
@@ -1280,9 +1471,12 @@ impl Ops {
     pub(crate) fn group_norm(&self, call: &GroupNormCall<'_>) -> Result<(), ImageGenError> {
         if self.host_fallback {
             let per_group = call.channels_per_group * call.spatial;
+            let channels = call.groups * call.channels_per_group;
             let x = self.download(call.step, call.input, call.batch * call.groups * per_group)?;
-            let w = self.download(call.step, call.weight, call.groups * per_group)?;
-            let b = self.download(call.step, call.bias, call.groups * per_group)?;
+            // The affine parameters are per channel: the buffers hold
+            // `channels` elements, not one per group element.
+            let w = self.download(call.step, call.weight, channels)?;
+            let b = self.download(call.step, call.bias, channels)?;
             let mut out = vec![0f32; x.len()];
             for g in 0..(call.batch * call.groups) {
                 let base = g * per_group;
@@ -1293,12 +1487,11 @@ impl Ops {
                     .sum::<f32>()
                     / per_group as f32;
                 let inv = 1.0 / (var + call.eps).sqrt();
-                // The affine parameters are per channel: element i of the
-                // group belongs to channel i / spatial within the group.
+                // Element i of the group belongs to channel i / spatial
+                // within the group; groups repeat per batch item.
                 for i in 0..per_group {
-                    let w_i = w[g * call.channels_per_group + i / call.spatial];
-                    let b_i = b[g * call.channels_per_group + i / call.spatial];
-                    out[base + i] = (x[base + i] - mean) * inv * w_i + b_i;
+                    let ch = (g % call.groups) * call.channels_per_group + i / call.spatial;
+                    out[base + i] = (x[base + i] - mean) * inv * w[ch] + b[ch];
                 }
             }
             return self.write_back(call.step, call.out, &out);
@@ -1450,6 +1643,17 @@ impl Ops {
                 KernelArg::Buffer(call.ids),
             ],
         )
+    }
+}
+
+/// Host twin of one QK-norm head: `x * rsqrt(mean(x^2) + eps) * scale`, the
+/// reference's `RMSNorm` evaluated entirely in f32 (the family's buffers are
+/// f32, so the reference's cast-back-then-scale step is the same multiply).
+fn rms_scale_head(row: &mut [f32], scale: &[f32], eps: f32) {
+    let ms = row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32;
+    let inv = 1.0 / (ms + eps).sqrt();
+    for (v, s) in row.iter_mut().zip(scale) {
+        *v *= inv * s;
     }
 }
 

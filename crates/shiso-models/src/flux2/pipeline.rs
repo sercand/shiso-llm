@@ -303,13 +303,17 @@ impl ImageGenerator for Flux2KleinModel {
         let mut kv = Flux2KvCache::new(self.params.depth, self.params.depth_single_blocks);
         let scheduler = FlowMatchEulerDiscreteScheduler::new(t_img, steps);
 
-        for (i, &timestep) in scheduler.timesteps.iter().enumerate() {
+        // One step per scheduled timestep. The transformer's embedding
+        // applies the reference's 1000x time factor itself, so it receives
+        // the raw sigma, not the scheduler's 1000-scaled timestep.
+        for (i, _) in scheduler.timesteps.iter().enumerate() {
+            let sigma = scheduler.sigmas[i];
             let velocity = self.dit.forward(
                 &self.ops,
                 &DiTInput {
                     latents: latents.view(),
                     txt: ctx_buf.view(),
-                    timestep,
+                    timestep: sigma,
                     img_positions: img_pos.view(),
                     txt_positions: txt_pos.view(),
                     joint_positions: joint_pos.view(),
