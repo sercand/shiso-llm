@@ -59,6 +59,7 @@ mod config;
 mod container;
 mod error;
 mod ffmpeg;
+pub mod generator;
 mod image;
 mod item;
 mod mp4;
@@ -67,12 +68,18 @@ mod tower;
 mod video;
 
 #[cfg(test)]
+mod generator_tests;
+#[cfg(test)]
 mod testing;
 
 pub use config::{ImageLimits, PatchGeometry, PreprocessSpec, Resample, ResizeRule};
 pub use container::{VisionSource, open_checkpoint, open_gguf};
 pub use error::{Container, ShardFault, VisionError};
 pub use ffmpeg::{Availability, FfmpegPolicy, decode_frames, probe, run_decoder};
+pub use generator::{
+    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat,
+    ImageStepEvent, InputReferenceImage,
+};
 pub use image::preprocess_image;
 pub use item::VisionItem;
 pub use shard::VisionShard;
