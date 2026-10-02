@@ -1,8 +1,9 @@
 //! `POST /v1/systemone` driven through the router: the same scoring engine as
-//! `/v1/decisions` behind the System One wire — relaxed schema at the edges
-//! (blank ids, blank state, lists of one, unknown top-level fields ignored),
-//! strict where an answer could go wrong, and schema violations answering 422
-//! with a location where the decisions route answers 400.
+//! `/v1/decisions` behind the official System One wire — map-form questions
+//! keyed by id, `noul`/`choice`/`score`, relaxed schema at the edges (blank
+//! ids, blank state, lists of one, unknown top-level fields ignored), strict
+//! where an answer could go wrong, and schema violations answering 422 with a
+//! location where the decisions route answers 400.
 //!
 //! The harness is `decisions.rs`'s, copied rather than shared: the model
 //! behind the engine answers prefills with whole rows scripted as numbers, so
@@ -272,7 +273,8 @@ fn assert_probabilities(answer: &Value, want: &[f64], body: &Value) {
     }
 }
 
-/// The shape every 422 refusal shares on this surface.
+/// The shape every 422 refusal shares on this surface when the body itself
+/// did not parse: serde's own line and column name the spot in the bytes.
 fn assert_schema_violation(status: StatusCode, body: &Value, names: &str) {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"]["code"], "invalid_schema", "{body}");
@@ -287,6 +289,27 @@ fn assert_schema_violation(status: StatusCode, body: &Value, names: &str) {
         at.starts_with("line ") && at.contains(" column "),
         "the location is serde's line and column, got {at}: {body}"
     );
+    if !names.is_empty() {
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(names)),
+            "the refusal must name {names}: {body}"
+        );
+    }
+}
+
+/// The shape of a 422 that `validate` raises rather than the body parse: the
+/// schema class, with a location naming the field path the caller must fix
+/// (`questions`, or `questions.<id>`).
+fn assert_schema_violation_at(status: StatusCode, body: &Value, at: &str, names: &str) {
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_schema", "{body}");
+    assert_eq!(
+        body["error"]["type"], "invalid_request_error",
+        "422 is still a bad request in the client's eyes: {body}"
+    );
+    assert_eq!(body["error"]["at"], at, "{body}");
     if !names.is_empty() {
         assert!(
             body["error"]["message"]
@@ -335,19 +358,19 @@ async fn call(state: &Arc<AppState>, request: Request<Body>) -> (StatusCode, Val
     (status, body)
 }
 
-/// The smallest body that answers: one yes/no question over one state.
+/// The smallest body that answers: one noul question over one state.
 fn valid_body() -> Value {
     json!({
         "state": "the input",
-        "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+        "questions": {"q1": {"type": "noul", "instructions": "ready"}},
     })
 }
 
 // --- the scored answers -----------------------------------------------------
 
 #[tokio::test]
-// The brief pins this test's name and its scope: every answer kind and the
-// noul block in one request, because "all four in one call" is the claim.
+// The brief pins this test's name and its scope: every answer kind and a
+// noul question in one request, because "all four in one call" is the claim.
 #[expect(
     clippy::too_many_lines,
     reason = "one request exercises every answer kind, and each kind's assertions travel with it"
@@ -371,15 +394,15 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
             &json!({
                 "model": "echo-me",
                 "state": "the input",
-                "questions": [
-                    {"id": "q1", "type": "choice", "question": "pick one",
-                     "options": ["red", "blue"]},
-                    {"id": "s1", "type": "score", "question": "how bad",
-                     "levels": ["none", "some", "lots"]},
-                    {"id": "q2", "type": "yes_no", "question": "ready",
-                     "yes": "confirmed", "no": "denied"},
-                ],
-                "noul": {"criteria": [{"id": "n1", "question": "ready"}]},
+                "questions": {
+                    "q1": {"type": "choice", "instructions": "pick one",
+                           "criteria": {"red": null, "blue": null}},
+                    "s1": {"type": "score", "instructions": "how bad",
+                           "criteria": ["none", "some", "lots"]},
+                    "q2": {"type": "noul", "instructions": "ready",
+                           "criteria": {"true": "confirmed", "false": "denied"}},
+                    "n1": {"type": "noul", "instructions": "ready"},
+                },
             }),
         ),
     )
@@ -399,7 +422,7 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     assert_eq!(
         keys,
         ["q1", "s1", "q2", "n1"],
-        "questions in request order, then the noul criteria in theirs"
+        "the answers come back in the request map's insertion order"
     );
 
     let prompts = audit.prefill_prompts.lock();
@@ -461,9 +484,12 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
 
     let q2 = answer_of(&body, "q2");
     assert_eq!(q2["type"], "yes_no");
-    assert_eq!(q2["answer"], "yes");
     let lp = logprobs_answering(YES_NO_BODY, &["yes", "no"]);
     let want = softmax(&lp, 1.0);
+    // The official wire has no label-word answer for a binary question: a
+    // `noul` answers with the yes probability, so the answer is the number
+    // the old noul criterion carried, not the word "yes".
+    assert_close(&q2["answer"], want[0], "q2 answer", &body);
     assert_probabilities(&q2, &want, &body);
     assert_close(
         &q2["confidence"],
@@ -475,12 +501,12 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
 
     // The design: "the `noul` answer is the yes probability" - the `answer`
     // field itself is that number (entry zero of the probabilities, the
-    // labels being `yes`, `no` in that order), while a regular yes_no
-    // question (q2 above) keeps its label word.
+    // labels being `yes`, `no` in that order). q2 above is a noul too; its
+    // `criteria` wording changes the prompt, not the answer shape.
     let n1 = answer_of(&body, "n1");
     assert_eq!(
         n1["type"], "yes_no",
-        "a criterion answers as a yes/no question"
+        "a noul question answers as a yes/no question"
     );
     let lp = logprobs_answering(NOUL_BODY, &["yes", "no"]);
     let want = softmax(&lp, 1.0);
@@ -522,7 +548,7 @@ async fn unknown_top_level_fields_are_ignored_and_nested_ones_refused_422() {
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
                 "extra": 1,
                 "client": {"stamp": true},
             }),
@@ -532,66 +558,35 @@ async fn unknown_top_level_fields_are_ignored_and_nested_ones_refused_422() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // Inside a question the same key would be one the caller believes is
-    // scored, so it is refused - with the location of it.
+    // scored, so it is refused - with the question's key as the location.
     let (status, body) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready",
-                               "bogus": 1}],
+                "questions": {"q1": {"type": "noul", "instructions": "ready",
+                                     "bogus": 1}},
             }),
         ),
     )
     .await;
-    assert_schema_violation(status, &body, "bogus");
+    assert_schema_violation_at(status, &body, "questions.q1", "bogus");
 
-    // Inside a noul criterion, and inside the noul block itself.
+    // And inside the noul `criteria` object, which is its own strict shape.
     let (status, body) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [],
-                "noul": {"criteria": [{"id": "n1", "question": "ready", "bogus": 2}]},
+                "questions": {"q1": {"type": "noul", "instructions": "ready",
+                                     "criteria": {"true": "confirmed", "bogus": 2}}},
             }),
         ),
     )
     .await;
-    assert_schema_violation(status, &body, "bogus");
-    let (status, body) = call(
-        &state,
-        post(
-            "/v1/systemone",
-            &json!({
-                "state": "the input",
-                "questions": [],
-                "noul": {"criteria": [], "nope": 1},
-            }),
-        ),
-    )
-    .await;
-    assert_schema_violation(status, &body, "nope");
-
-    // Inside the string-or-object option spelling too: that form is a
-    // hand-written parse, and it refuses unknown keys exactly like the
-    // derived structs do.
-    let (status, body) = call(
-        &state,
-        post(
-            "/v1/systemone",
-            &json!({
-                "state": "the input",
-                "questions": [{"id": "q1", "type": "choice", "question": "pick one",
-                               "options": [{"name": "red", "bogus": 1},
-                                           {"name": "blue"}]}],
-            }),
-        ),
-    )
-    .await;
-    assert_schema_violation(status, &body, "bogus");
+    assert_schema_violation_at(status, &body, "questions.q1", "bogus");
 
     // The same nested key on the decisions route is a 400: the schema shape is
     // the one axis the two routes disagree on.
@@ -651,10 +646,6 @@ async fn decisions_only_fields_are_refused_when_not_null() {
 #[tokio::test]
 // The brief pins this test's name and its scope: every relaxation the schema
 // states, proven answerable against one server rather than six.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one table of relaxed shapes, each asserted as 200 against the same engine"
-)]
 async fn relaxed_bounds_and_blanks() {
     // A one-option choice answers: its single label is as confident as an
     // answer gets, and the decisions route's minimum of two is not asked here.
@@ -665,8 +656,8 @@ async fn relaxed_bounds_and_blanks() {
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "q1", "type": "choice", "question": "pick one",
-                               "options": ["only one"]}],
+                "questions": {"q1": {"type": "choice", "instructions": "pick one",
+                                     "criteria": {"only one": null}}},
             }),
         ),
     )
@@ -688,8 +679,8 @@ async fn relaxed_bounds_and_blanks() {
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "s1", "type": "score", "question": "how bad",
-                               "levels": ["none"]}],
+                "questions": {"s1": {"type": "score", "instructions": "how bad",
+                                     "criteria": ["none"]}},
             }),
         ),
     )
@@ -721,55 +712,30 @@ async fn relaxed_bounds_and_blanks() {
         &state,
         post(
             "/v1/systemone",
-            &json!({"questions": [{"id": "q1", "type": "yes_no", "question": "ready"}]}),
+            &json!({"questions": {"q1": {"type": "noul", "instructions": "ready"}}}),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{replied}");
     assert_eq!(replied["state"], "", "{replied}");
 
-    // Blank ids answer under ""; an absent id is the same blank, and two
-    // blanks do not collide into a refusal because neither names anything.
-    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[]); 4], CTX);
+    // A blank map key is a blank id and answers under ""; the map wire
+    // cannot repeat one - JSON keys are unique - so that is the whole
+    // blank-id story this surface has.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
     let (status, replied) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "", "type": "yes_no", "question": "ready"}],
+                "questions": {"": {"type": "noul", "instructions": "ready"}},
             }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{replied}");
     assert_eq!(replied["answers"][""]["type"], "yes_no", "{replied}");
-    let (status, replied) = call(
-        &state,
-        post(
-            "/v1/systemone",
-            &json!({
-                "state": "the input",
-                "questions": [{"type": "yes_no", "question": "ready"}],
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{replied}");
-    assert_eq!(replied["answers"][""]["type"], "yes_no", "{replied}");
-    let (status, replied) = call(
-        &state,
-        post(
-            "/v1/systemone",
-            &json!({
-                "state": "the input",
-                "questions": [{"type": "yes_no", "question": "ready"},
-                              {"type": "yes_no", "question": "or"}],
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "blank ids may repeat: {replied}");
 
     // A blank question text answers: its line drops from the version-1 block,
     // which is why the wording builder carries the blank branches at all.
@@ -780,11 +746,11 @@ async fn relaxed_bounds_and_blanks() {
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [
-                    {"id": "q1", "type": "choice", "question": "",
-                     "options": ["red", "blue"]},
-                    {"id": "q2", "type": "yes_no", "question": "   "},
-                ],
+                "questions": {
+                    "q1": {"type": "choice", "instructions": "",
+                           "criteria": {"red": null, "blue": null}},
+                    "q2": {"type": "noul", "instructions": "   "},
+                },
             }),
         ),
     )
@@ -797,63 +763,37 @@ async fn strict_bounds_still_refuse() {
     // The relaxation is about blanks and list minima, not about answers that
     // could not be read: the alphabet's twenty-six, the digit's ten, unique
     // names, and the served model are refused on this route exactly as on
-    // the decisions one - and as 400s, never 422s.
-    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[]); 3], CTX);
-    let wide: Vec<Value> = (0..27).map(|index| json!(format!("opt {index}"))).collect();
+    // the decisions one - and as 400s, never 422s. A field a question's type
+    // has no place for is no longer a bound but the schema's own refusal
+    // (the unknown-key test above pins it as a 422), and the map wire
+    // cannot deliver a duplicate id: its keys are unique by construction.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[]); 2], CTX);
+    let wide: Value = (0..27)
+        .map(|index| (format!("opt {index}"), Value::Null))
+        .collect();
     let tall: Vec<Value> = (0..11)
         .map(|index| json!(format!("level {index}")))
         .collect();
     let cases: Vec<(Value, &str)> = vec![
         (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "choice",
-                 "question": "pick", "options": wide}]}),
+            json!({"state": "the input", "questions": {"q1": {"type": "choice",
+                 "instructions": "pick", "criteria": wide}}}),
             "26",
         ),
         (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "score",
-                 "question": "how bad", "levels": tall}]}),
+            json!({"state": "the input", "questions": {"q1": {"type": "score",
+                 "instructions": "how bad", "criteria": tall}}}),
             "10",
         ),
         (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "choice",
-                 "question": "pick", "options": ["Red", "red"]}]}),
+            json!({"state": "the input", "questions": {"q1": {"type": "choice",
+                 "instructions": "pick", "criteria": {"Red": null, "red": null}}}}),
             "used more than once",
         ),
         (
-            json!({"state": "the input", "questions": [
-                 {"id": "q1", "type": "yes_no", "question": "ready"},
-                 {"id": "q1", "type": "yes_no", "question": "or"}]}),
-            "q1",
-        ),
-        (
-            json!({"state": "the input",
-                   "questions": [{"id": "shared-id", "type": "yes_no", "question": "ready"}],
-                   "noul": {"criteria": [{"id": "shared-id", "question": "or"}]}}),
-            "shared-id",
-        ),
-        (
             json!({"model": "base:lora", "state": "the input", "questions":
-                 [{"id": "q1", "type": "yes_no", "question": "ready"}]}),
+                 {"q1": {"type": "noul", "instructions": "ready"}}}),
             "base:lora",
-        ),
-        // A field the question's type has no place for is the decisions
-        // route's refusal in the same words: a 400 naming the field, not a
-        // quietly dropped key and not a 422 schema error. The relaxation is
-        // about blanks and list minima, not about kinds.
-        (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "score",
-                 "question": "how bad", "levels": ["ok"], "options": ["p", "q"]}]}),
-            "options",
-        ),
-        (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "yes_no",
-                 "question": "ready", "options": ["p", "q"]}]}),
-            "options",
-        ),
-        (
-            json!({"state": "the input", "questions": [{"id": "q1", "type": "choice",
-                 "question": "pick", "options": ["p", "q"], "levels": ["ok"]}]}),
-            "levels",
         ),
     ];
     for (case, want) in cases {
@@ -868,17 +808,16 @@ async fn strict_bounds_still_refuse() {
         );
     }
 
-    // A blank criterion id answers under "", and a blank or absent criterion
-    // question answers with the bare lead line - and the flat row ties, so
-    // the yes probability the noul answer carries is exactly one half.
+    // A blank map key answers under "", and a blank `instructions` answers
+    // with the bare lead line - and the flat row ties, so the yes
+    // probability the noul answer carries is exactly one half.
     let (status, body) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [],
-                "noul": {"criteria": [{"id": "", "question": "ready"}]},
+                "questions": {"": {"type": "noul", "instructions": "ready"}},
             }),
         ),
     )
@@ -891,8 +830,7 @@ async fn strict_bounds_still_refuse() {
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [],
-                "noul": {"criteria": [{"id": "n1", "question": ""}]},
+                "questions": {"n1": {"type": "noul", "instructions": ""}},
             }),
         ),
     )
@@ -901,7 +839,7 @@ async fn strict_bounds_still_refuse() {
     assert_close(
         &body["answers"]["n1"]["answer"],
         0.5,
-        "a tied row answers the criterion at a half",
+        "a tied row answers the noul question at a half",
         &body,
     );
 }
@@ -924,7 +862,7 @@ async fn a_container_state_is_scored_from_its_key_sorted_rendering() {
             "/v1/systemone",
             &json!({
                 "state": {"b": 1, "a": [1, 2]},
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "questions": {"q1": {"type": "noul", "instructions": "ready"}},
             }),
         ),
     )
@@ -949,20 +887,39 @@ async fn a_container_state_is_scored_from_its_key_sorted_rendering() {
 async fn malformed_json_is_422_not_400() {
     let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
 
-    // A known field spelled with the wrong type is a schema violation here,
-    // where the decisions route's typed parse answers the same body 400.
+    // Yesterday's array spelling is a schema violation naming `questions`:
+    // the cutover removed the dialect, and a caller posting the old body
+    // gets the document-fix class with the field to fix, not a 500 or a
+    // silently-empty answer.
     let (status, body) = call(
         &state,
         post(
             "/v1/systemone",
             &json!({
                 "state": "the input",
-                "questions": [{"id": "q1", "type": 5, "question": "ready"}],
+                "questions": [{"id": "q1", "type": "noul", "instructions": "ready"}],
             }),
         ),
     )
     .await;
-    assert_schema_violation(status, &body, "");
+    assert_schema_violation_at(status, &body, "questions", "questions");
+
+    // A known field spelled with the wrong type inside a question is a
+    // schema violation here, located at the question's key, where the
+    // decisions route's typed parse answers its own spelling of the same
+    // mistake 400.
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/systemone",
+            &json!({
+                "state": "the input",
+                "questions": {"q1": {"type": 5, "instructions": "ready"}},
+            }),
+        ),
+    )
+    .await;
+    assert_schema_violation_at(status, &body, "questions.q1", "type");
     let (status, body) = call(&state, post_raw("/v1/systemone", r#"{"questions": ["#)).await;
     assert_schema_violation(status, &body, "");
 
@@ -1004,7 +961,7 @@ async fn a_content_block_state_is_refused_422() {
                 "/v1/systemone",
                 &json!({
                     "state": [block],
-                    "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                    "questions": {"q1": {"type": "noul", "instructions": "ready"}},
                 }),
             ),
         )
@@ -1039,7 +996,7 @@ const SCORE_BODY: &str = "the input\n\nQuestion: how bad\n0: none\n1: some\n2: l
 /// The yes/no question's exact version-1 body.
 const YES_NO_BODY: &str = "the input\n\nIs the following true? ready\nyes: confirmed\nno: denied\nAnswer with yes or no only.";
 
-/// The noul criterion's exact version-1 body: the yes/no block without the
+/// The noul question's exact version-1 body: the yes/no block without the
 /// label-wording lines.
 const NOUL_BODY: &str = "the input\n\nIs the following true? ready\nAnswer with yes or no only.";
 
