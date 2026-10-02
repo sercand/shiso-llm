@@ -1,0 +1,617 @@
+//! The FLUX.2 spatial VAE decoder.
+//!
+//! Decoding runs in three parts. First the latent sequence is unpacked on
+//! the host: the transformer's patchified (tokens, 128) rows become a
+//! (128, H/16, W/16) field, denormalized with the checkpoint's own
+//! `bn.running_mean`/`bn.running_var`, then spatially unpatchified to
+//! (32, H/8, W/8). Then the device runs the convolutional decoder -
+//! `post_quant_conv`, `conv_in`, the mid block (resnet, single-head spatial
+//! attention, resnet), the up blocks with their resnets and nearest
+//! upsamplers, and the final norm/conv - entirely in f32, the format the VAE
+//! stores. Finally the RGB field is read back and clamped.
+//!
+//! Every channel width, kernel size and block count is read from the weight
+//! shapes; the only config value consulted is the group count, which no
+//! tensor carries.
+
+use std::path::Path;
+
+use serde::Deserialize;
+use shiso_core::DeviceBuffer;
+use shiso_vision::generator::ImageGenError;
+
+use super::ops::{Conv2dCall, GroupNormCall, Ops};
+use super::weights::StStore;
+
+/// Group-norm epsilon the decoder uses.
+const GN_EPS: f32 = 1e-5;
+/// Batch-norm epsilon for the latent denormalization.
+const BN_EPS: f32 = 1e-5;
+
+/// One convolution with its shape read from the weight tensor.
+#[derive(Debug)]
+struct Conv {
+    w: DeviceBuffer,
+    bias: Option<DeviceBuffer>,
+    out_c: usize,
+    in_c: usize,
+    k_h: usize,
+    k_w: usize,
+}
+
+/// A residual normalization block: two (norm, silu, conv) stages and an
+/// optional 1x1 shortcut.
+#[derive(Debug)]
+struct Resnet {
+    norm1_w: DeviceBuffer,
+    norm1_b: DeviceBuffer,
+    conv1: Conv,
+    norm2_w: DeviceBuffer,
+    norm2_b: DeviceBuffer,
+    conv2: Conv,
+    shortcut: Option<Conv>,
+}
+
+/// The mid block's single-head spatial attention.
+#[derive(Debug)]
+struct AttnBlock {
+    norm_w: DeviceBuffer,
+    norm_b: DeviceBuffer,
+    q: Conv,
+    k: Conv,
+    v: Conv,
+    out: Conv,
+}
+
+#[derive(Debug)]
+struct UpBlock {
+    resnets: Vec<Resnet>,
+    upsample: Option<Conv>,
+}
+
+/// The field the decoder is carrying: channel count and spatial size. The
+/// convolutions it runs are same-padding, so only a shortcut or an upsampler
+/// changes it.
+#[derive(Debug, Clone, Copy)]
+struct Field {
+    channels: usize,
+    h: usize,
+    w: usize,
+}
+
+/// The loaded decoder.
+#[derive(Debug)]
+pub(crate) struct Vae {
+    groups: usize,
+    bn_mean: Vec<f32>,
+    bn_std: Vec<f32>,
+    post_quant: Conv,
+    conv_in: Conv,
+    mid_resnets: [Resnet; 2],
+    mid_attn: AttnBlock,
+    up_blocks: Vec<UpBlock>,
+    norm_out_w: DeviceBuffer,
+    norm_out_b: DeviceBuffer,
+    conv_out: Conv,
+}
+
+#[derive(Debug, Deserialize)]
+struct VaeConfig {
+    norm_num_groups: Option<usize>,
+}
+
+/// Reads one f32 convolution weight and its bias.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "safetensors dims are element counts of conv kernels; they fit usize on any supported target"
+)]
+fn load_conv(store: &StStore, ops: &Ops, name: &str) -> Result<Conv, ImageGenError> {
+    let weight_name = format!("{name}.weight");
+    let entry = store.require(&weight_name)?;
+    if entry.dtype != shiso_modelfile::st_header::StDType::F32 {
+        return Err(ImageGenError::Checkpoint(format!(
+            "VAE conv '{weight_name}' is {:?}, but the decoder runs f32",
+            entry.dtype
+        )));
+    }
+    let shape = &entry.shape;
+    let (out_c, in_c, k_h, k_w) = (
+        *shape
+            .first()
+            .ok_or_else(|| ImageGenError::Checkpoint(format!("'{weight_name}' has empty shape")))?
+            as usize,
+        *shape.get(1).ok_or_else(|| {
+            ImageGenError::Checkpoint(format!("'{weight_name}' is not a conv kernel"))
+        })? as usize,
+        shape.get(2).copied().unwrap_or(1) as usize,
+        shape.get(3).copied().unwrap_or(1) as usize,
+    );
+    let bias_name = format!("{name}.bias");
+    Ok(Conv {
+        w: store.import(ops.backend(), &weight_name)?,
+        bias: if store.contains(&bias_name) {
+            Some(store.import(ops.backend(), &bias_name)?)
+        } else {
+            None
+        },
+        out_c,
+        in_c,
+        k_h,
+        k_w,
+    })
+}
+
+/// Reads a group-norm affine pair (both f32 vectors of `channels`).
+fn load_norm(
+    store: &StStore,
+    backend: &std::sync::Arc<dyn shiso_core::Backend>,
+    name: &str,
+) -> Result<(DeviceBuffer, DeviceBuffer), ImageGenError> {
+    Ok((
+        store.import(backend, &format!("{name}.weight"))?,
+        store.import(backend, &format!("{name}.bias"))?,
+    ))
+}
+
+fn load_resnet(store: &StStore, ops: &Ops, base: &str) -> Result<Resnet, ImageGenError> {
+    let backend = ops.backend();
+    let (norm1_w, norm1_b) = load_norm(store, backend, &format!("{base}norm1"))?;
+    let (norm2_w, norm2_b) = load_norm(store, backend, &format!("{base}norm2"))?;
+    Ok(Resnet {
+        norm1_w,
+        norm1_b,
+        conv1: load_conv(store, ops, &format!("{base}conv1"))?,
+        norm2_w,
+        norm2_b,
+        conv2: load_conv(store, ops, &format!("{base}conv2"))?,
+        shortcut: if store.contains(&format!("{base}conv_shortcut.weight")) {
+            Some(load_conv(store, ops, &format!("{base}conv_shortcut"))?)
+        } else {
+            None
+        },
+    })
+}
+
+impl Vae {
+    /// Opens the VAE component at `path`.
+    pub(crate) fn load(path: &Path, ops: &Ops) -> Result<Self, ImageGenError> {
+        let store = StStore::open(path)?;
+        let backend = ops.backend();
+        let config: VaeConfig = read_json(&path.join("config.json")).unwrap_or(VaeConfig {
+            norm_num_groups: None,
+        });
+        let groups = config.norm_num_groups.unwrap_or(32);
+
+        let bn_mean = store.f32_vec("bn.running_mean")?;
+        let bn_var = store.f32_vec("bn.running_var")?;
+        if bn_mean.len() != bn_var.len() {
+            return Err(ImageGenError::Checkpoint(
+                "bn.running_mean and bn.running_var disagree on channel count".to_string(),
+            ));
+        }
+        let bn_std: Vec<f32> = bn_var.iter().map(|v| (v + BN_EPS).sqrt()).collect();
+
+        let post_quant = load_conv(&store, ops, "post_quant_conv")?;
+        let conv_in = load_conv(&store, ops, "decoder.conv_in")?;
+
+        let mid_resnets = [
+            load_resnet(&store, ops, "decoder.mid_block.resnets.0.")?,
+            load_resnet(&store, ops, "decoder.mid_block.resnets.1.")?,
+        ];
+        let attn_base = "decoder.mid_block.attentions.0.";
+        let norm_base = if store.contains(&format!("{attn_base}norm.weight")) {
+            "norm"
+        } else {
+            "group_norm"
+        };
+        let (norm_w, norm_b) = {
+            let n = format!("{attn_base}{norm_base}");
+            (
+                store.import(backend, &format!("{n}.weight"))?,
+                store.import(backend, &format!("{n}.bias"))?,
+            )
+        };
+        let mid_attn = AttnBlock {
+            norm_w,
+            norm_b,
+            q: load_conv(&store, ops, &format!("{attn_base}to_q"))?,
+            k: load_conv(&store, ops, &format!("{attn_base}to_k"))?,
+            v: load_conv(&store, ops, &format!("{attn_base}to_v"))?,
+            out: load_conv(&store, ops, &format!("{attn_base}proj_out"))?,
+        };
+
+        let depth = store
+            .count_blocks("decoder.up_blocks.")
+            .ok_or_else(|| ImageGenError::Checkpoint("VAE decoder has no up_blocks".to_string()))?;
+        let mut up_blocks = Vec::with_capacity(depth);
+        for i in 0..depth {
+            let base = format!("decoder.up_blocks.{i}.");
+            let resnets_depth = store.count_blocks(&format!("{base}resnets.")).unwrap_or(0);
+            if resnets_depth == 0 {
+                return Err(ImageGenError::Checkpoint(format!(
+                    "{base}resnets has no blocks"
+                )));
+            }
+            let mut resnets = Vec::with_capacity(resnets_depth);
+            for j in 0..resnets_depth {
+                resnets.push(load_resnet(&store, ops, &format!("{base}resnets.{j}."))?);
+            }
+            let upsample = if store.contains(&format!("{base}upsamplers.0.conv.weight")) {
+                Some(load_conv(&store, ops, &format!("{base}upsamplers.0.conv"))?)
+            } else {
+                None
+            };
+            up_blocks.push(UpBlock { resnets, upsample });
+        }
+
+        let norm_out_w = store.import(backend, "decoder.conv_norm_out.weight")?;
+        let norm_out_b = store.import(backend, "decoder.conv_norm_out.bias")?;
+        let conv_out = load_conv(&store, ops, "decoder.conv_out")?;
+
+        Ok(Self {
+            groups,
+            bn_mean,
+            bn_std,
+            post_quant,
+            conv_in,
+            mid_resnets,
+            mid_attn,
+            up_blocks,
+            norm_out_w,
+            norm_out_b,
+            conv_out,
+        })
+    }
+
+    /// Decodes a patchified latent sequence (tokens, `in_channels`) f32 into
+    /// an RGB field (3, height, width) f32 in [0, 255].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the decoder's stage graph, straight-line by construction"
+    )]
+    pub(crate) fn decode(
+        &self,
+        ops: &Ops,
+        latents: &[f32],
+        width: usize,
+        height: usize,
+    ) -> Result<Vec<f32>, ImageGenError> {
+        let z = self.unpack_latents(latents, width, height)?;
+        let mut x = ops.upload_f32("vae latent", &z)?;
+        let mut field = Field {
+            channels: self.post_quant.in_c,
+            h: height / 8,
+            w: width / 8,
+        };
+
+        // post_quant_conv and conv_in.
+        let y = Self::conv(
+            ops,
+            &self.post_quant,
+            x.view(),
+            field.channels,
+            &field,
+            "vae pq",
+        )?;
+        field.channels = self.post_quant.out_c;
+        drop(x);
+        x = y;
+        let y = Self::conv(
+            ops,
+            &self.conv_in,
+            x.view(),
+            field.channels,
+            &field,
+            "vae in",
+        )?;
+        field.channels = self.conv_in.out_c;
+        drop(x);
+        x = y;
+
+        // Mid block.
+        x = self.resnet(ops, &self.mid_resnets[0], &x, &mut field, "vae mid0")?;
+        x = self.attention(ops, &self.mid_attn, &x, &field)?;
+        x = self.resnet(ops, &self.mid_resnets[1], &x, &mut field, "vae mid1")?;
+
+        // Up blocks; the last one has no upsampler.
+        for (i, block) in self.up_blocks.iter().enumerate() {
+            for (j, resnet) in block.resnets.iter().enumerate() {
+                let step: &'static str = match (i, j) {
+                    (0, 0) => "vae up 0.0",
+                    (0, 1) => "vae up 0.1",
+                    (0, 2) => "vae up 0.2",
+                    (1, 0) => "vae up 1.0",
+                    (1, 1) => "vae up 1.1",
+                    (1, 2) => "vae up 1.2",
+                    (2, 0) => "vae up 2.0",
+                    (2, 1) => "vae up 2.1",
+                    (2, 2) => "vae up 2.2",
+                    (3, 0) => "vae up 3.0",
+                    (3, 1) => "vae up 3.1",
+                    (3, 2) => "vae up 3.2",
+                    _ => "vae up n",
+                };
+                x = self.resnet(ops, resnet, &x, &mut field, step)?;
+            }
+            if let Some(up) = &block.upsample {
+                let y = Self::conv(
+                    ops,
+                    up,
+                    x.view(),
+                    field.channels,
+                    &field,
+                    "vae upsample conv",
+                )?;
+                let upsampled =
+                    ops.alloc_f32("vae upsample", up.out_c * (2 * field.h) * (2 * field.w))?;
+                ops.upsample_nearest(&super::ops::UpsampleCall {
+                    step: "vae upsample",
+                    out: upsampled.view(),
+                    input: y.view(),
+                    batch: 1,
+                    channels: up.out_c,
+                    h: field.h,
+                    w: field.w,
+                })?;
+                field.channels = up.out_c;
+                field.h *= 2;
+                field.w *= 2;
+                drop(x);
+                x = upsampled;
+            }
+        }
+
+        // Final norm, silu, conv_out.
+        let spatial = field.h * field.w;
+        let normed = ops.alloc_f32("vae out norm", field.channels * spatial)?;
+        ops.group_norm(&GroupNormCall {
+            step: "vae out norm",
+            out: normed.view(),
+            input: x.view(),
+            weight: self.norm_out_w.view(),
+            bias: self.norm_out_b.view(),
+            batch: 1,
+            groups: self.groups,
+            channels_per_group: field.channels / self.groups,
+            spatial,
+            eps: GN_EPS,
+        })?;
+        ops.silu(
+            "vae out silu",
+            normed.view(),
+            normed.view(),
+            field.channels * spatial,
+        )?;
+        let rgb = Self::conv(
+            ops,
+            &self.conv_out,
+            normed.view(),
+            field.channels,
+            &field,
+            "vae out",
+        )?;
+        let out = ops.download("vae readback", rgb.view(), 3 * spatial)?;
+        Ok(out)
+    }
+
+    /// Host-side latent unpack: patchified (tokens, 128) rows to a
+    /// denormalized, unpatchified (`z_channels`, H/8, W/8) field.
+    ///
+    /// Feature `c * 4 + p` of the token at latent cell (li, lj) is channel
+    /// `c` at spatial position `(2*li + p/2, 2*lj + p%2)` - the inverse of
+    /// the 2x2 patchification the transformer's input was built with.
+    fn unpack_latents(
+        &self,
+        latents: &[f32],
+        width: usize,
+        height: usize,
+    ) -> Result<Vec<f32>, ImageGenError> {
+        let (hl, wl) = (height / 16, width / 16);
+        let zc = self.post_quant.in_c;
+        if latents.len() != hl * wl * zc * 4 {
+            return Err(ImageGenError::Backend(format!(
+                "latent sequence is {} elements, expected {}",
+                latents.len(),
+                hl * wl * zc * 4
+            )));
+        }
+        let mut z = vec![0f32; zc * height / 8 * width / 8];
+        let oh = height / 8;
+        let ow = width / 8;
+        for token in 0..(hl * wl) {
+            let (li, lj) = (token / wl, token % wl);
+            for f in 0..(zc * 4) {
+                let (c, p) = (f / 4, f % 4);
+                let (pi, pj) = (p / 2, p % 2);
+                let raw = latents[token * zc * 4 + f];
+                z[(c * oh + 2 * li + pi) * ow + 2 * lj + pj] =
+                    raw * self.bn_std[c] + self.bn_mean[c];
+            }
+        }
+        Ok(z)
+    }
+
+    /// One convolution with its bias, returning the output buffer. The
+    /// spatial size is the field's; same-padding convolutions preserve it.
+    fn conv(
+        ops: &Ops,
+        conv: &Conv,
+        input: shiso_core::DeviceView<'_>,
+        in_c: usize,
+        field: &Field,
+        step: &'static str,
+    ) -> Result<DeviceBuffer, ImageGenError> {
+        let pad = conv.k_h / 2;
+        let out_h = (field.h + 2 * pad - conv.k_h) + 1;
+        let out_w = (field.w + 2 * pad - conv.k_w) + 1;
+        let out = ops.alloc_f32(step, conv.out_c * out_h * out_w)?;
+        ops.conv2d(&Conv2dCall {
+            step,
+            out: out.view(),
+            input,
+            weight: conv.w.view(),
+            bias: conv.bias.as_ref().map(DeviceBuffer::view),
+            batch: 1,
+            in_c,
+            in_h: field.h,
+            in_w: field.w,
+            out_c: conv.out_c,
+            out_h,
+            out_w,
+            k_h: conv.k_h,
+            k_w: conv.k_w,
+            stride: 1,
+            pad,
+        })?;
+        Ok(out)
+    }
+
+    /// One residual normalization block; updates the field's channels when a
+    /// shortcut changes them.
+    fn resnet(
+        &self,
+        ops: &Ops,
+        resnet: &Resnet,
+        x: &DeviceBuffer,
+        field: &mut Field,
+        step: &'static str,
+    ) -> Result<DeviceBuffer, ImageGenError> {
+        let spatial = field.h * field.w;
+        let xn = ops.alloc_f32(step, field.channels * spatial)?;
+        ops.group_norm(&GroupNormCall {
+            step,
+            out: xn.view(),
+            input: x.view(),
+            weight: resnet.norm1_w.view(),
+            bias: resnet.norm1_b.view(),
+            batch: 1,
+            groups: self.groups,
+            channels_per_group: field.channels / self.groups,
+            spatial,
+            eps: GN_EPS,
+        })?;
+        ops.silu(step, xn.view(), xn.view(), field.channels * spatial)?;
+        let mut y = Self::conv(ops, &resnet.conv1, xn.view(), field.channels, field, step)?;
+        ops.group_norm(&GroupNormCall {
+            step,
+            out: xn.view(),
+            input: y.view(),
+            weight: resnet.norm2_w.view(),
+            bias: resnet.norm2_b.view(),
+            batch: 1,
+            groups: self.groups,
+            channels_per_group: resnet.conv1.out_c / self.groups,
+            spatial,
+            eps: GN_EPS,
+        })?;
+        ops.silu(step, xn.view(), xn.view(), resnet.conv1.out_c * spatial)?;
+        y = Self::conv(
+            ops,
+            &resnet.conv2,
+            xn.view(),
+            resnet.conv1.out_c,
+            field,
+            step,
+        )?;
+        let summed = if let Some(shortcut) = &resnet.shortcut {
+            let s = Self::conv(ops, shortcut, x.view(), field.channels, field, step)?;
+            let out = ops.alloc_f32(step, shortcut.out_c * spatial)?;
+            ops.add(
+                step,
+                out.view(),
+                s.view(),
+                y.view(),
+                shortcut.out_c * spatial,
+            )?;
+            field.channels = shortcut.out_c;
+            out
+        } else {
+            let out = ops.alloc_f32(step, field.channels * spatial)?;
+            ops.add(
+                step,
+                out.view(),
+                x.view(),
+                y.view(),
+                field.channels * spatial,
+            )?;
+            out
+        };
+        Ok(summed)
+    }
+
+    /// Single-head spatial self-attention with a residual add.
+    fn attention(
+        &self,
+        ops: &Ops,
+        attn: &AttnBlock,
+        x: &DeviceBuffer,
+        field: &Field,
+    ) -> Result<DeviceBuffer, ImageGenError> {
+        let channels = field.channels;
+        let spatial = field.h * field.w;
+        let xn = ops.alloc_f32("vae attn norm", channels * spatial)?;
+        ops.group_norm(&GroupNormCall {
+            step: "vae attn norm",
+            out: xn.view(),
+            input: x.view(),
+            weight: attn.norm_w.view(),
+            bias: attn.norm_b.view(),
+            batch: 1,
+            groups: self.groups,
+            channels_per_group: channels / self.groups,
+            spatial,
+            eps: GN_EPS,
+        })?;
+        ops.silu("vae attn silu", xn.view(), xn.view(), channels * spatial)?;
+        let q = Self::conv(ops, &attn.q, xn.view(), channels, field, "vae attn q")?;
+        let k = Self::conv(ops, &attn.k, xn.view(), channels, field, "vae attn k")?;
+        let v = Self::conv(ops, &attn.v, xn.view(), channels, field, "vae attn v")?;
+        // The attention kernel wants (spatial, channels) rows.
+        let qt = ops.alloc_f32("vae attn qt", spatial * channels)?;
+        let kt = ops.alloc_f32("vae attn kt", spatial * channels)?;
+        let vt = ops.alloc_f32("vae attn vt", spatial * channels)?;
+        ops.transpose("vae attn t", qt.view(), q.view(), channels, spatial)?;
+        ops.transpose("vae attn t", kt.view(), k.view(), channels, spatial)?;
+        ops.transpose("vae attn t", vt.view(), v.view(), channels, spatial)?;
+        let at = ops.alloc_f32("vae attn ctx", spatial * channels)?;
+        ops.sdpa(&super::ops::SdpaCall {
+            step: "vae attention",
+            out_txt: at.view(),
+            out_img: at.view(),
+            q_txt: qt.view(),
+            k_txt: kt.view(),
+            v_txt: vt.view(),
+            q_img: qt.view(),
+            k_img: kt.view(),
+            v_img: vt.view(),
+            cache_k: ops.dummy_view(),
+            cache_v: ops.dummy_view(),
+            cache_stride: channels,
+            txt_tokens: spatial,
+            img_tokens: 0,
+            cache_tokens: 0,
+            heads: 1,
+            head_dim: channels,
+            txt_stride: channels,
+            img_stride: channels,
+        })?;
+        let ctx = ops.alloc_f32("vae attn ctx ch", channels * spatial)?;
+        ops.transpose("vae attn t", ctx.view(), at.view(), spatial, channels)?;
+        let proj = Self::conv(ops, &attn.out, ctx.view(), channels, field, "vae attn proj")?;
+        let out = ops.alloc_f32("vae attn residual", channels * spatial)?;
+        ops.add(
+            "vae attn residual",
+            out.view(),
+            x.view(),
+            proj.view(),
+            channels * spatial,
+        )?;
+        Ok(out)
+    }
+}
+
+/// Reads and parses a JSON document, answering `None` when it is absent.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}

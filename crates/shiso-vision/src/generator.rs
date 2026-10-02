@@ -118,8 +118,8 @@ impl ImageGenerationJob {
             || self.width > 2048
             || self.height < 256
             || self.height > 2048
-            || self.width % 16 != 0
-            || self.height % 16 != 0
+            || !self.width.is_multiple_of(16)
+            || !self.height.is_multiple_of(16)
         {
             return Err(ImageGenError::InvalidDimensions {
                 width: self.width,

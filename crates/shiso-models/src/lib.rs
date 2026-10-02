@@ -16,7 +16,9 @@
 
 pub mod audio_ops;
 pub mod audio_registry;
+pub mod flux2;
 pub mod gemma4;
+pub mod image_registry;
 pub mod nemotron_asr;
 pub mod nemotron_diar;
 pub mod nemotron_h;
