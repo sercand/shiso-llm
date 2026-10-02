@@ -235,13 +235,25 @@ fn score_confidence(probabilities: &[f64]) -> f64 {
     (1.0 - spread / uniform_spread).max(0.0)
 }
 
-/// The `probabilities` of one answer, as `f64`.
+/// The `probabilities` of one answer, as `f64`, from the array form the
+/// noul answer keeps as its kept extra.
 fn probabilities(answer: &Value) -> Vec<f64> {
     answer["probabilities"]
         .as_array()
         .expect("an answer carries its probabilities")
         .iter()
         .map(|p| p.as_f64().expect("a probability is a number"))
+        .collect()
+}
+
+/// The official map form of a choice or score answer's `probabilities`,
+/// read as (key, value) pairs in the map's own order.
+fn probability_map(answer: &Value) -> Vec<(String, f64)> {
+    answer["probabilities"]
+        .as_object()
+        .expect("a choice or score answer carries its probabilities as a map")
+        .iter()
+        .map(|(key, p)| (key.clone(), p.as_f64().expect("a probability is a number")))
         .collect()
 }
 
@@ -269,6 +281,21 @@ fn assert_probabilities(answer: &Value, want: &[f64], body: &Value) {
         assert!(
             (got - want).abs() < 1e-5,
             "label {index}: {got} is not {want}: {body}"
+        );
+    }
+}
+
+/// Asserts a map-form `probabilities` field — the official choice and score
+/// shape — against the keys and values the scripted row implies, in the
+/// map's own order.
+fn assert_probability_map(answer: &Value, want: &[(&str, f64)], body: &Value) {
+    let got = probability_map(answer);
+    assert_eq!(got.len(), want.len(), "{body}");
+    for (index, ((got_key, got), (want_key, want))) in got.iter().zip(want).enumerate() {
+        assert_eq!(got_key, want_key, "probability key {index}: {body}");
+        assert!(
+            (got - want).abs() < 1e-5,
+            "entry {want_key}: {got} is not {want}: {body}"
         );
     }
 }
@@ -445,7 +472,9 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     );
     let lp = logprobs_answering(CHOICE_BODY, &["A", "B"]);
     let want = softmax(&lp, 1.0);
-    assert_probabilities(&q1, &want, &body);
+    // The official shape: probabilities keyed by option name, in option
+    // order - the order the request's `criteria` map carried.
+    assert_probability_map(&q1, &[("red", want[0]), ("blue", want[1])], &body);
     assert_close(
         &q1["confidence"],
         choice_confidence(&want),
@@ -462,12 +491,16 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     assert_eq!(s1["type"], "score");
     assert_eq!(
         s1["legend"],
-        json!(["none", "some", "lots"]),
-        "the score answer echoes its legend: {body}"
+        json!({"0": "none", "1": "some", "2": "lots"}),
+        "the official shape echoes the legend as a string-indexed map: {body}"
     );
     let lp = logprobs_answering(SCORE_BODY, &["0", "1", "2"]);
     let want = softmax(&lp, 1.0);
-    assert_probabilities(&s1, &want, &body);
+    assert_probability_map(
+        &s1,
+        &[("0", want[0]), ("1", want[1]), ("2", want[2])],
+        &body,
+    );
     let score: f64 = want
         .iter()
         .enumerate()
@@ -483,13 +516,20 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     assert_close(&s1["x_label_mass"], mass(&lp), "s1 x_label_mass", &body);
 
     let q2 = answer_of(&body, "q2");
-    assert_eq!(q2["type"], "yes_no");
+    assert_eq!(
+        q2["type"], "noul",
+        "a noul criterion answers under its own type"
+    );
     let lp = logprobs_answering(YES_NO_BODY, &["yes", "no"]);
     let want = softmax(&lp, 1.0);
-    // The official wire has no label-word answer for a binary question: a
-    // `noul` answers with the yes probability, so the answer is the number
-    // the old noul criterion carried, not the word "yes".
-    assert_close(&q2["answer"], want[0], "q2 answer", &body);
+    // The official shape: the yes probability lives under `noul`, not
+    // `answer` - the label-word answer has no spelling on this wire.
+    assert_close(&q2["noul"], want[0], "q2 noul", &body);
+    assert!(
+        q2.get("answer").is_none(),
+        "the number moved from `answer` to `noul`: {body}"
+    );
+    // The kept extra: the pair in label order.
     assert_probabilities(&q2, &want, &body);
     assert_close(
         &q2["confidence"],
@@ -499,18 +539,18 @@ async fn a_full_request_answers_every_question_kind_and_noul() {
     );
     assert_close(&q2["x_label_mass"], mass(&lp), "q2 x_label_mass", &body);
 
-    // The design: "the `noul` answer is the yes probability" - the `answer`
+    // The design: "the `noul` answer is the yes probability" - the `noul`
     // field itself is that number (entry zero of the probabilities, the
     // labels being `yes`, `no` in that order). q2 above is a noul too; its
     // `criteria` wording changes the prompt, not the answer shape.
     let n1 = answer_of(&body, "n1");
     assert_eq!(
-        n1["type"], "yes_no",
-        "a noul question answers as a yes/no question"
+        n1["type"], "noul",
+        "a noul question answers in the official noul shape"
     );
     let lp = logprobs_answering(NOUL_BODY, &["yes", "no"]);
     let want = softmax(&lp, 1.0);
-    assert_close(&n1["answer"], want[0], "n1 answer", &body);
+    assert_close(&n1["noul"], want[0], "n1 noul", &body);
     assert_probabilities(&n1, &want, &body);
     assert!(want[0] > want[1], "the scripted row favours yes");
     assert_close(
@@ -686,7 +726,7 @@ async fn relaxed_bounds_and_blanks() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["answers"]["s1"]["legend"], json!(["none"]));
+    assert_eq!(body["answers"]["s1"]["legend"], json!({"0": "none"}));
     assert_close(
         &body["answers"]["s1"]["score"],
         0.0,
@@ -735,7 +775,7 @@ async fn relaxed_bounds_and_blanks() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{replied}");
-    assert_eq!(replied["answers"][""]["type"], "yes_no", "{replied}");
+    assert_eq!(replied["answers"][""]["type"], "noul", "{replied}");
 
     // A blank question text answers: its line drops from the version-1 block,
     // which is why the wording builder carries the blank branches at all.
@@ -823,7 +863,7 @@ async fn strict_bounds_still_refuse() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["answers"][""]["type"], "yes_no", "{body}");
+    assert_eq!(body["answers"][""]["type"], "noul", "{body}");
     let (status, body) = call(
         &state,
         post(
@@ -837,7 +877,7 @@ async fn strict_bounds_still_refuse() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_close(
-        &body["answers"]["n1"]["answer"],
+        &body["answers"]["n1"]["noul"],
         0.5,
         "a tied row answers the noul question at a half",
         &body,
