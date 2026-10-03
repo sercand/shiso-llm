@@ -2012,9 +2012,13 @@ fn conv2d_applies_a_bias_whose_first_word_is_positive_zero() {
     );
 }
 
-/// The flag wins over the binding on the conv path too: the driver's
-/// 4-byte zero stand-in bound with the flag clear yields an unbiased
-/// convolution.
+/// The flag wins over the binding on the conv path too, in both shapes the
+/// driver can present: the 4-byte zero stand-in bound with the flag clear
+/// (the binding `Ops` actually makes for an absent bias), and a real,
+/// nonzero bias bound with the flag clear. The stand-in case alone cannot
+/// tell "the flag was honoured" from "the flag was ignored and the bound
+/// zeros were added"; the real-bias case can, exactly as the GEMM path's
+/// `gemm_bf16_ignores_the_bias_binding_when_the_flag_is_clear` does.
 #[test]
 fn conv2d_ignores_bias_when_the_flag_is_clear() {
     let Some(b) = open() else { return };
@@ -2029,6 +2033,21 @@ fn conv2d_ignores_bias_when_the_flag_is_clear() {
         &got,
         &expect_conv2d_bias(&input, &weight, None),
         "conv2d flag-clear bias",
+    );
+    // The discriminating shape: a real, nonzero bias bound with the flag
+    // clear must not be read.
+    let bias = vec![0.25f32, -0.5];
+    let bias_buf = upload_f32(&b, &bias);
+    let (got, input, weight) = conv2d_bias_case(&b, bias_buf.view(), false);
+    assert_differs(
+        &got,
+        &expect_conv2d_bias(&input, &weight, Some(&bias)),
+        "conv2d flag-clear real bias",
+    );
+    assert_close(
+        &got,
+        &expect_conv2d_bias(&input, &weight, None),
+        "conv2d flag-clear real bias",
     );
 }
 
