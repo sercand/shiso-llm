@@ -6,186 +6,317 @@
 <title>Shiso Model Registry Editor</title>
 <style>
   :root {
-    --bg: #0f1117;
-    --surface: #1a1d27;
-    --border: #2a2e3d;
-    --text: #e1e4ea;
-    --muted: #8b92a5;
+    --bg: #0b0d13;
+    --surface: #141721;
+    --surface-elevated: #1c2130;
+    --surface-hover: #23293d;
+    --border: #293046;
+    --border-focus: #3b82f6;
+    --text: #f1f3f9;
+    --text-muted: #8e98b0;
+    --text-dim: #5f6880;
     --primary: #3b82f6;
     --primary-hover: #2563eb;
     --success: #10b981;
     --danger: #ef4444;
     --warning: #f59e0b;
     --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.5; }
-  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; }
-  h1 { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-  .badge { padding: 2px 8px; border-radius: 9999px; font-size: 12px; font-weight: 500; }
-  .badge-success { background: rgba(16, 185, 129, 0.2); color: #34d399; }
-  .badge-danger { background: rgba(239, 68, 68, 0.2); color: #f87171; }
-  .badge-warning { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
-  .badge-muted { background: var(--border); color: var(--muted); }
-  nav { display: flex; gap: 8px; }
-  button, .btn { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.15s; }
-  button:hover, .btn:hover { border-color: var(--muted); }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; line-height: 1.5; }
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 28px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 50; }
+  .logo-title { display: flex; align-items: center; gap: 12px; }
+  .logo-title h1 { font-size: 16px; font-weight: 700; letter-spacing: -0.02em; }
+  .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 500; }
+  .badge-success { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+  .badge-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+  .badge-warning { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+  .badge-primary { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
+  .badge-muted { background: var(--surface-elevated); color: var(--text-muted); border: 1px solid var(--border); }
+  nav { display: flex; gap: 6px; }
+  button, .btn { background: var(--surface-elevated); border: 1px solid var(--border); color: var(--text); padding: 7px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; transition: all 0.15s; }
+  button:hover, .btn:hover { background: var(--surface-hover); border-color: var(--text-muted); }
   button.primary, .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
   button.primary:hover, .btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
-  button.danger { background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.3); color: #f87171; }
-  button.danger:hover { background: rgba(239, 68, 68, 0.3); }
-  main { max-width: 1200px; margin: 24px auto; padding: 0 24px; }
+  button.danger, .btn.danger { background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.3); color: #f87171; }
+  button.danger:hover, .btn.danger:hover { background: rgba(239, 68, 68, 0.25); border-color: var(--danger); }
+  button.sm, .btn.sm { padding: 4px 8px; font-size: 11px; }
+  nav button.active { background: var(--primary); border-color: var(--primary); color: #fff; }
+  main { max-width: 1300px; margin: 24px auto; padding: 0 28px; }
   .tab-content { display: none; }
   .tab-content.active { display: block; }
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; margin-top: 16px; }
-  .recipe-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; justify-content: space-between; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+  .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+  .card-title { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+  .recipe-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between; transition: border-color 0.15s; }
   .recipe-card:hover { border-color: var(--primary); }
-  .recipe-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: baseline; }
-  .recipe-desc { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
-  .tags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; }
-  .tag { background: rgba(59, 130, 246, 0.1); color: #60a5fa; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+  .recipe-card-title { font-size: 15px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
   .form-group { margin-bottom: 14px; }
-  label { display: block; font-size: 12px; font-weight: 500; color: var(--muted); margin-bottom: 4px; }
-  input[type="text"], input[type="number"], select, textarea { width: 100%; background: #12151e; border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 13px; }
-  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); }
-  .row { display: flex; gap: 12px; }
-  .col { flex: 1; }
-  pre { background: #12151e; border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: monospace; font-size: 12px; overflow-x: auto; }
+  .form-group.inline { display: flex; align-items: center; gap: 8px; }
+  label { display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); margin-bottom: 5px; }
+  input[type="text"], input[type="number"], select, textarea { width: 100%; background: #0e111a; border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 13px; font-family: inherit; }
+  input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus { outline: none; border-color: var(--border-focus); box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2); }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .col { flex: 1; min-width: 200px; }
+  .col-2 { flex: 2; min-width: 320px; }
+  .col-3 { flex: 3; min-width: 440px; }
+  .checkbox-group { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; padding: 6px 0; }
+  .checkbox-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; user-select: none; }
+  .checkbox-item input { cursor: pointer; accent-color: var(--primary); }
+  .variant-card { background: #11141e; border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .variant-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+  .component-card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px; margin-bottom: 12px; }
+  .component-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  table.file-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+  table.file-table th { text-align: left; padding: 8px 10px; background: #0c0e15; border-bottom: 1px solid var(--border); color: var(--text-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  table.file-table td { padding: 8px 10px; border-bottom: 1px solid rgba(41, 48, 70, 0.4); vertical-align: middle; }
+  table.file-table tr:hover { background: rgba(59, 130, 246, 0.04); }
+  table.file-table tr.selected { background: rgba(59, 130, 246, 0.08); }
+  .code { font-family: var(--mono); font-size: 12px; }
+  .info-callout { background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
+  .alert-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #fca5a5; font-size: 12px; }
+  .alert-success { background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #6ee7b7; font-size: 12px; }
+  details summary { cursor: pointer; font-weight: 600; font-size: 12px; color: var(--text-muted); user-select: none; }
+  details summary:hover { color: var(--text); }
+  pre { background: #090b10; border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: var(--mono); font-size: 12px; overflow-x: auto; max-height: 400px; }
+  .stat-pill { background: #090b10; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: var(--mono); font-size: 11px; }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>Shiso Model Registry Editor</h1>
-  <div id="git-banner" style="display:flex; align-items:center; gap:8px;">
-    <span id="git-branch" class="badge badge-muted">branch: unknown</span>
+  <div class="logo-title">
+    <h1>Shiso Model Registry</h1>
+    <span id="git-branch" class="badge badge-muted">branch: ...</span>
     <span id="git-status-badge" class="badge badge-success">clean</span>
   </div>
   <nav>
-    <button class="tab-btn" onclick="showTab('dashboard')">Dashboard</button>
-    <button class="tab-btn" onclick="showTab('new-recipe')">New Recipe</button>
-    <button class="tab-btn" onclick="showTab('inspect')">HF Inspector</button>
-    <button class="tab-btn" onclick="showTab('validation')">Validation</button>
-    <button class="tab-btn" onclick="showTab('build')">Build & Sign</button>
+    <button id="nav-dashboard" class="active" onclick="showTab('dashboard')">Dashboard</button>
+    <button id="nav-editor" onclick="startNewRecipe()">+ New Recipe</button>
+    <button id="nav-inspect" onclick="showTab('inspect')">HF Explorer</button>
+    <button id="nav-validation" onclick="showTab('validation')">Validation Suite</button>
+    <button id="nav-build" onclick="showTab('build')">Build & Publish</button>
   </nav>
 </header>
 
 <main>
-  <!-- Dashboard -->
+  <!-- TAB 1: DASHBOARD -->
   <section id="tab-dashboard" class="tab-content active">
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-      <h2>Authored Recipes</h2>
-      <div style="display:flex; gap:8px;">
-        <input type="text" id="recipe-search" placeholder="Search models or tags..." oninput="filterRecipes()" style="width:240px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+      <div>
+        <h2 style="font-size:18px; font-weight:700;">Model Recipes</h2>
+        <p style="color:var(--text-muted); font-size:12px;">Authored models available in this repository under <code>registry/recipes/</code></p>
+      </div>
+      <div style="display:flex; gap:10px;">
+        <input type="text" id="recipe-search" placeholder="Filter by name, task, or tag..." oninput="filterRecipes()" style="width:280px;">
+        <button class="primary" onclick="startNewRecipe()">+ Create Recipe</button>
         <button onclick="loadRecipes()">Refresh</button>
       </div>
     </div>
     <div id="recipe-grid" class="grid"></div>
   </section>
 
-  <!-- New / Edit Recipe -->
-  <section id="tab-new-recipe" class="tab-content">
+  <!-- TAB 2: RECIPE EDITOR (VISUAL WIZARD, NO MANUAL JSON!) -->
+  <section id="tab-editor" class="tab-content">
     <div class="card">
-      <h2 id="editor-heading" style="margin-bottom:16px;">Author Recipe Manifest</h2>
+      <div class="card-header">
+        <div>
+          <div class="card-title" id="editor-title">Author Model Recipe</div>
+          <p style="color:var(--text-muted); font-size:12px; margin-top:2px;">Configure metadata, select checkpoints from Hugging Face, and preview variants.</p>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button onclick="toggleJsonPreview()">Preview JSON</button>
+          <button class="primary" onclick="submitRecipeForm()">Save Recipe Manifest</button>
+        </div>
+      </div>
+
+      <!-- Live Validation Alert Box -->
+      <div id="editor-validation-box" style="display:none;"></div>
+
+      <!-- 1. General Metadata -->
       <div class="row">
         <div class="col form-group">
-          <label>Model Family</label>
-          <select id="rf-family" onchange="onFamilyChange()"></select>
+          <label>Model Family (shiso-models)</label>
+          <select id="f-family" onchange="onFamilySelected()"></select>
         </div>
         <div class="col form-group">
-          <label>Canonical Name</label>
-          <input type="text" id="rf-name" placeholder="e.g. qwen3.5-9b">
+          <label>Canonical Model Name (ID)</label>
+          <input type="text" id="f-name" placeholder="e.g. qwen3.5-9b" oninput="liveValidateForm()">
         </div>
         <div class="col form-group">
           <label>Aliases (comma-separated)</label>
-          <input type="text" id="rf-aliases" placeholder="e.g. qwen3.5">
+          <input type="text" id="f-aliases" placeholder="e.g. qwen3.5, qwen3.5-instruct">
         </div>
       </div>
+
+      <!-- Family Capabilities Pill -->
+      <div id="family-info-pill" class="info-callout" style="display:none;">
+        <div id="family-info-content"></div>
+      </div>
+
       <div class="row">
-        <div class="col form-group">
+        <div class="col-2 form-group">
           <label>Description</label>
-          <input type="text" id="rf-description" placeholder="Brief summary of architecture and checkpoint">
+          <input type="text" id="f-description" placeholder="One-line summary of architecture, parameters, and roles">
         </div>
-        <div class="col form-group" style="max-width:180px;">
+        <div class="col form-group" style="max-width:200px;">
           <label>Min Shiso Version</label>
-          <input type="text" id="rf-min-version" value="0.1.0">
+          <input type="text" id="f-min-shiso-version" value="0.1.0">
         </div>
-      </div>
-      <div class="row">
         <div class="col form-group">
           <label>Tags (comma-separated)</label>
-          <input type="text" id="rf-tags" placeholder="e.g. vision, tools, speculative">
-        </div>
-        <div class="col form-group">
-          <label>Tasks (comma-separated)</label>
-          <input type="text" id="rf-tasks" value="chat">
+          <input type="text" id="f-tags" placeholder="e.g. vision, tools, speculative">
         </div>
       </div>
 
-      <div class="form-group">
-        <label>Recipe JSON</label>
-        <textarea id="rf-json" rows="18" style="font-family:monospace; font-size:12px;"></textarea>
+      <!-- Tasks, Modalities, Features -->
+      <div class="row" style="background:#10131c; border:1px solid var(--border); border-radius:6px; padding:14px; margin-bottom:16px;">
+        <div class="col">
+          <label>Supported Tasks</label>
+          <div class="checkbox-group" id="f-tasks-group">
+            <label class="checkbox-item"><input type="checkbox" value="chat" checked> Chat</label>
+            <label class="checkbox-item"><input type="checkbox" value="transcription"> Transcription</label>
+            <label class="checkbox-item"><input type="checkbox" value="diarization"> Diarization</label>
+            <label class="checkbox-item"><input type="checkbox" value="image_generation"> Image Generation</label>
+            <label class="checkbox-item"><input type="checkbox" value="embedding"> Embedding</label>
+          </div>
+        </div>
+        <div class="col">
+          <label>Input Modalities</label>
+          <div class="checkbox-group" id="f-inputs-group">
+            <label class="checkbox-item"><input type="checkbox" value="text" checked> Text</label>
+            <label class="checkbox-item"><input type="checkbox" value="image"> Image</label>
+            <label class="checkbox-item"><input type="checkbox" value="video"> Video</label>
+            <label class="checkbox-item"><input type="checkbox" value="audio"> Audio</label>
+          </div>
+        </div>
+        <div class="col">
+          <label>Output Modalities</label>
+          <div class="checkbox-group" id="f-outputs-group">
+            <label class="checkbox-item"><input type="checkbox" value="text" checked> Text</label>
+            <label class="checkbox-item"><input type="checkbox" value="audio"> Audio</label>
+            <label class="checkbox-item"><input type="checkbox" value="image"> Image</label>
+          </div>
+        </div>
       </div>
 
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <button class="primary" onclick="saveRecipe()">Save Recipe (Strict Validation)</button>
-        <span id="save-status"></span>
+      <!-- Features & Reasoning -->
+      <div class="row" style="background:#10131c; border:1px solid var(--border); border-radius:6px; padding:14px; margin-bottom:20px;">
+        <div class="col form-group" style="margin-bottom:0;">
+          <label>Feature Flags</label>
+          <div class="checkbox-group">
+            <label class="checkbox-item"><input type="checkbox" id="f-feat-tools" checked> Tools enabled</label>
+            <label class="checkbox-item"><input type="checkbox" id="f-feat-struct" checked> Structured output (JSON schema)</label>
+            <label class="checkbox-item"><input type="checkbox" id="f-feat-reasoning" onchange="toggleReasoningFields()" checked> Reasoning trace support</label>
+          </div>
+        </div>
+        <div class="col" id="reasoning-fields" style="display:flex; gap:12px;">
+          <div class="form-group" style="flex:1; margin-bottom:0;">
+            <label>Reasoning Efforts</label>
+            <div class="checkbox-group" id="f-reasoning-efforts">
+              <label class="checkbox-item"><input type="checkbox" value="none" checked> none</label>
+              <label class="checkbox-item"><input type="checkbox" value="low" checked> low</label>
+              <label class="checkbox-item"><input type="checkbox" value="medium" checked> medium</label>
+              <label class="checkbox-item"><input type="checkbox" value="high" checked> high</label>
+            </div>
+          </div>
+          <div class="form-group" style="width:140px; margin-bottom:0;">
+            <label>Default Effort</label>
+            <select id="f-default-effort">
+              <option value="medium">medium</option>
+              <option value="none">none</option>
+              <option value="low">low</option>
+              <option value="high">high</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. Variants List -->
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+        <div>
+          <h3 style="font-size:15px; font-weight:600;">Model Variants</h3>
+          <p style="color:var(--text-muted); font-size:12px;">Each backend/quantization offering. Files are selected through the embedded HF Inspector.</p>
+        </div>
+        <button class="primary sm" onclick="addVariant()">+ Add Variant</button>
+      </div>
+
+      <div id="variants-container"></div>
+
+      <!-- JSON Preview Accordion -->
+      <details id="json-preview-details" style="margin-top:20px;">
+        <summary style="padding:10px 0;">Preview Generated Recipe JSON</summary>
+        <pre id="json-preview" style="margin-top:8px;"></pre>
+      </details>
+
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-top:24px; border-top:1px solid var(--border); padding-top:16px;">
+        <button onclick="showTab('dashboard')">Cancel</button>
+        <button class="primary" onclick="submitRecipeForm()">Save Recipe Manifest</button>
       </div>
     </div>
   </section>
 
-  <!-- HF Inspector -->
+  <!-- TAB 3: HF EXPLORER (STANDALONE INSPECTION) -->
   <section id="tab-inspect" class="tab-content">
     <div class="card">
-      <h2 style="margin-bottom:14px;">Hugging Face Repository Inspector</h2>
+      <div class="card-header">
+        <div class="card-title">Hugging Face Repository Explorer</div>
+      </div>
       <div class="row">
-        <div class="col form-group" style="flex:3;">
-          <label>Repository (owner/name)</label>
-          <input type="text" id="hf-repo" placeholder="e.g. shiso-community/qwen3.5-9b-mlx-4bit">
+        <div class="col-3 form-group">
+          <label>Hugging Face Repository (owner/name)</label>
+          <input type="text" id="exp-repo" placeholder="e.g. shiso-community/qwen3.5-9b-mlx-4bit">
         </div>
-        <div class="col form-group" style="flex:1;">
-          <label>Revision / Branch</label>
-          <input type="text" id="hf-revision" value="main">
+        <div class="col form-group">
+          <label>Revision / Tag / Branch</label>
+          <input type="text" id="exp-rev" value="main">
         </div>
         <div class="col form-group" style="flex:0; align-self:flex-end;">
-          <button class="primary" onclick="runInspect()" style="height:36px;">Inspect</button>
+          <button class="primary" onclick="runStandaloneInspect()" style="height:36px; padding:0 20px;">Inspect</button>
         </div>
       </div>
-      <div id="inspect-result" style="margin-top:16px;"></div>
+      <div id="exp-result" style="margin-top:16px;"></div>
     </div>
   </section>
 
-  <!-- Validation -->
+  <!-- TAB 4: VALIDATION -->
   <section id="tab-validation" class="tab-content">
     <div class="card">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-        <h2>Strict Recipe Validation</h2>
-        <button class="primary" onclick="runValidation()">Validate All Recipes</button>
+      <div class="card-header">
+        <div class="card-title">Strict Recipe Validation Suite</div>
+        <button class="primary" onclick="runValidation()">Run Full Validation</button>
       </div>
+      <p style="color:var(--text-muted); font-size:12px; margin-bottom:16px;">Strictly validates all recipe files under <code>registry/recipes/</code> against the current engine catalog and structural schema rules (§3).</p>
       <div id="validation-results"></div>
     </div>
   </section>
 
-  <!-- Build & Sign -->
+  <!-- TAB 5: BUILD & PUBLISH -->
   <section id="tab-build" class="tab-content">
     <div class="card">
-      <h2 style="margin-bottom:14px;">Compile, Sign, and Build Registry</h2>
+      <div class="card-header">
+        <div class="card-title">Compile, Sign, and Build Static Registry</div>
+      </div>
       <div class="row">
         <div class="col form-group">
           <label>Output Directory</label>
           <input type="text" id="build-out" value="target/registry/v1">
         </div>
         <div class="col form-group">
-          <label>Ed25519 Signing Key Path (optional for dev builds)</label>
+          <label>Ed25519 Signing Key Path</label>
           <input type="text" id="build-key" placeholder="~/.config/shiso/registry.key">
         </div>
       </div>
       <div class="form-group">
-        <label><input type="checkbox" id="build-allow-dirty" style="width:auto; margin-right:6px;"> Allow uncommitted recipe changes (skips strict git timestamp verification)</label>
+        <label class="checkbox-item"><input type="checkbox" id="build-allow-dirty"> Allow uncommitted recipe changes (skips strict git timestamp check)</label>
       </div>
-      <button class="primary" onclick="runBuild()">Build Registry</button>
-      <div id="build-result" style="margin-top:16px;"></div>
+      <div style="display:flex; gap:10px; margin-bottom:16px;">
+        <button class="primary" onclick="runBuild()">Run Build</button>
+        <button onclick="runKeygen()">Generate Keypair</button>
+      </div>
+      <div id="build-result"></div>
     </div>
   </section>
 </main>
@@ -194,6 +325,7 @@
 let sessionToken = "";
 let cachedFamilies = [];
 let allRecipes = [];
+let formVariants = [];
 
 function initAuth() {
   if (location.hash.startsWith("#token=")) {
@@ -204,9 +336,7 @@ function initAuth() {
 
 async function api(path, opts = {}) {
   const headers = opts.headers || {};
-  if (sessionToken) {
-    headers["Authorization"] = "Bearer " + sessionToken;
-  }
+  if (sessionToken) headers["Authorization"] = "Bearer " + sessionToken;
   opts.headers = headers;
   const res = await fetch(path, opts);
   if (res.status === 401) {
@@ -218,8 +348,11 @@ async function api(path, opts = {}) {
 
 function showTab(name) {
   document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(el => el.classList.remove('active'));
   const target = document.getElementById('tab-' + name);
+  const btn = document.getElementById('nav-' + name);
   if (target) target.classList.add('active');
+  if (btn) btn.classList.add('active');
   if (name === 'dashboard') loadRecipes();
   if (name === 'validation') runValidation();
 }
@@ -244,8 +377,8 @@ async function loadFamilies() {
   try {
     const res = await api('/api/families');
     cachedFamilies = await res.json();
-    const sel = document.getElementById('rf-family');
-    sel.innerHTML = '<option value="">-- Choose Family --</option>';
+    const sel = document.getElementById('f-family');
+    sel.innerHTML = '<option value="">-- Choose Model Family --</option>';
     cachedFamilies.forEach(f => {
       const opt = document.createElement('option');
       opt.value = f.name;
@@ -255,11 +388,42 @@ async function loadFamilies() {
   } catch (e) { console.error(e); }
 }
 
-function onFamilyChange() {
-  const name = document.getElementById('rf-family').value;
+function onFamilySelected() {
+  const name = document.getElementById('f-family').value;
+  const pill = document.getElementById('family-info-pill');
+  const content = document.getElementById('family-info-content');
   const fam = cachedFamilies.find(f => f.name === name);
-  if (!fam) return;
-  document.getElementById('rf-tasks').value = fam.tasks.join(", ");
+  if (!fam) {
+    pill.style.display = 'none';
+    return;
+  }
+
+  pill.style.display = 'flex';
+  content.innerHTML = `
+    <strong>Family '${fam.name}':</strong>
+    Accepted Roles: <code>${fam.accepted_roles.join(", ")}</code> &bull;
+    Tasks: <code>${fam.tasks.join(", ")}</code> &bull;
+    Features: Tools: ${fam.features.tools ? 'Yes' : 'No'}, Structured Output: ${fam.features.structured_output ? 'Yes' : 'No'}, Reasoning: ${fam.features.reasoning_efforts.length ? fam.features.reasoning_efforts.join('/') : 'None'}
+  `;
+
+  // Auto-configure checkboxes
+  document.getElementById('f-feat-tools').checked = fam.features.tools;
+  document.getElementById('f-feat-struct').checked = fam.features.structured_output;
+  const hasReasoning = fam.features.reasoning_efforts.length > 0;
+  document.getElementById('f-feat-reasoning').checked = hasReasoning;
+  toggleReasoningFields();
+
+  document.querySelectorAll('#f-tasks-group input').forEach(input => {
+    input.checked = fam.tasks.includes(input.value);
+  });
+
+  liveValidateForm();
+}
+
+function toggleReasoningFields() {
+  const checked = document.getElementById('f-feat-reasoning').checked;
+  document.getElementById('reasoning-fields').style.opacity = checked ? '1' : '0.4';
+  document.getElementById('reasoning-fields').style.pointerEvents = checked ? 'auto' : 'none';
 }
 
 async function loadRecipes() {
@@ -273,23 +437,31 @@ async function loadRecipes() {
 function renderRecipes(recipes) {
   const container = document.getElementById('recipe-grid');
   container.innerHTML = "";
+  if (recipes.length === 0) {
+    container.innerHTML = '<div style="color:var(--text-muted); grid-column: 1/-1;">No recipes found. Click "+ Create Recipe" to create your first model manifest.</div>';
+    return;
+  }
   recipes.forEach(r => {
     const card = document.createElement('div');
     card.className = "recipe-card";
     const statusBadge = r.valid
       ? '<span class="badge badge-success">Valid</span>'
-      : `<span class="badge badge-danger" title="${r.errors.join('; ')}">Errors (${r.errors.length})</span>`;
+      : `<span class="badge badge-danger">Errors (${r.errors.length})</span>`;
+
     card.innerHTML = `
       <div>
-        <div class="recipe-title">
+        <div class="recipe-card-title">
           <span>${r.name}</span>
           ${statusBadge}
         </div>
-        <div class="recipe-desc">${r.file}</div>
+        <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">${r.file}</div>
+        <div style="font-size:11px; margin-bottom:12px;">
+          <span class="stat-pill">family: ${r.name.includes("qwen") ? "qwen" : "model"}</span>
+        </div>
       </div>
-      <div style="display:flex; justify-content:flex-end; gap:6px; margin-top:12px;">
-        <button onclick="editRecipe('${r.name}')">Edit</button>
-        <button class="danger" onclick="deleteRecipe('${r.name}')">Delete</button>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+        <button class="sm" onclick="editRecipe('${r.name}')">Edit Recipe</button>
+        <button class="sm danger" onclick="deleteRecipe('${r.name}')">Delete</button>
       </div>
     `;
     container.appendChild(card);
@@ -302,69 +474,371 @@ function filterRecipes() {
   renderRecipes(filtered);
 }
 
+// -------------------------------------------------------------
+// RECIPE EDITOR FORM ENGINE
+// -------------------------------------------------------------
+
+function startNewRecipe() {
+  document.getElementById('editor-title').innerText = "Author New Recipe Manifest";
+  document.getElementById('f-family').value = "";
+  document.getElementById('f-name').value = "";
+  document.getElementById('f-aliases').value = "";
+  document.getElementById('f-description').value = "";
+  document.getElementById('f-min-shiso-version').value = "0.1.0";
+  document.getElementById('f-tags').value = "";
+  document.getElementById('family-info-pill').style.display = 'none';
+
+  formVariants = [];
+  addVariant(); // Add one default variant
+  showTab('editor');
+  liveValidateForm();
+}
+
 async function editRecipe(name) {
   try {
     const res = await api('/api/recipes/' + encodeURIComponent(name));
-    const json = await res.json();
-    document.getElementById('editor-heading').innerText = "Edit Recipe: " + name;
-    document.getElementById('rf-name').value = json.name;
-    document.getElementById('rf-family').value = json.family;
-    document.getElementById('rf-aliases').value = (json.aliases || []).join(", ");
-    document.getElementById('rf-description').value = json.description || "";
-    document.getElementById('rf-min-version').value = json.min_shiso_version || "0.1.0";
-    document.getElementById('rf-tags').value = (json.tags || []).join(", ");
-    document.getElementById('rf-tasks').value = (json.tasks || []).join(", ");
-    document.getElementById('rf-json').value = JSON.stringify(json, null, 2);
-    showTab('new-recipe');
-  } catch (e) { alert("Failed to load recipe: " + e.message); }
-}
+    const r = await res.json();
 
-async function saveRecipe() {
-  const name = document.getElementById('rf-name').value.trim();
-  const content = document.getElementById('rf-json').value;
-  const statusEl = document.getElementById('save-status');
-  statusEl.innerText = "Saving and strictly validating...";
-  statusEl.style.color = "var(--muted)";
+    document.getElementById('editor-title').innerText = "Edit Recipe: " + r.name;
+    document.getElementById('f-name').value = r.name;
+    document.getElementById('f-family').value = r.family;
+    document.getElementById('f-aliases').value = (r.aliases || []).join(", ");
+    document.getElementById('f-description').value = r.description || "";
+    document.getElementById('f-min-shiso-version').value = r.min_shiso_version || "0.1.0";
+    document.getElementById('f-tags').value = (r.tags || []).join(", ");
 
-  try {
-    const res = await api('/api/recipes/' + encodeURIComponent(name), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: content
+    onFamilySelected();
+
+    // Checkboxes
+    document.querySelectorAll('#f-tasks-group input').forEach(input => {
+      input.checked = (r.tasks || []).includes(input.value);
     });
-    if (!res.ok) {
-      const err = await res.text();
-      statusEl.innerText = "Error: " + err;
-      statusEl.style.color = "var(--danger)";
-    } else {
-      statusEl.innerText = "Saved successfully.";
-      statusEl.style.color = "var(--success)";
-      loadGitStatus();
+    document.querySelectorAll('#f-inputs-group input').forEach(input => {
+      input.checked = (r.modalities?.inputs || []).includes(input.value);
+    });
+    document.querySelectorAll('#f-outputs-group input').forEach(input => {
+      input.checked = (r.modalities?.outputs || []).includes(input.value);
+    });
+
+    document.getElementById('f-feat-tools').checked = !!r.features?.tools;
+    document.getElementById('f-feat-struct').checked = !!r.features?.structured_output;
+    document.getElementById('f-feat-reasoning').checked = !!r.features?.reasoning;
+    toggleReasoningFields();
+
+    document.querySelectorAll('#f-reasoning-efforts input').forEach(input => {
+      input.checked = (r.features?.reasoning_efforts || []).includes(input.value);
+    });
+    if (r.features?.default_reasoning_effort) {
+      document.getElementById('f-default-effort').value = r.features.default_reasoning_effort;
     }
+
+    formVariants = r.variants || [];
+    renderVariantsList();
+    showTab('editor');
+    liveValidateForm();
   } catch (e) {
-    statusEl.innerText = "Error: " + e.message;
-    statusEl.style.color = "var(--danger)";
+    alert("Error loading recipe: " + e.message);
   }
 }
 
-async function deleteRecipe(name) {
-  if (!confirm(`Are you sure you want to delete '${name}'?`)) return;
-  try {
-    const res = await api('/api/recipes/' + encodeURIComponent(name), { method: 'DELETE' });
-    if (!res.ok) {
-      alert("Delete failed: " + await res.text());
-    } else {
-      loadRecipes();
-      loadGitStatus();
+function addVariant() {
+  const vIndex = formVariants.length;
+  formVariants.push({
+    key: vIndex === 0 ? "metal-mlx4" : `cuda-fp8`,
+    backend: vIndex === 0 ? "metal" : "cuda",
+    quant: vIndex === 0 ? "mlx-4bit" : "fp8",
+    requires: { min_cuda_sm: vIndex === 0 ? null : 89 },
+    requirements: {
+      min_ram_bytes: 10737418240,
+      recommended_ram_bytes: 17179869184,
+      min_vram_bytes: vIndex === 0 ? null : 12884901888,
+      disk_bytes: 0
+    },
+    components: {
+      base: {
+        provider: "huggingface",
+        repo: "",
+        revision: "main",
+        entry: null,
+        files: []
+      }
+    },
+    server_defaults: {
+      ctx: 32768,
+      spec_k: null,
+      vision_max_pixels: null
     }
-  } catch (e) { alert("Delete error: " + e.message); }
+  });
+  renderVariantsList();
+  liveValidateForm();
 }
 
-async function runInspect() {
-  const repo = document.getElementById('hf-repo').value.trim();
-  const revision = document.getElementById('hf-revision').value.trim();
-  const resDiv = document.getElementById('inspect-result');
-  resDiv.innerHTML = "Inspecting repository and resolving commit SHA...";
+function deleteVariant(vIdx) {
+  if (formVariants.length <= 1) {
+    alert("Recipe must contain at least one variant.");
+    return;
+  }
+  formVariants.splice(vIdx, 1);
+  renderVariantsList();
+  liveValidateForm();
+}
+
+function renderVariantsList() {
+  const container = document.getElementById('variants-container');
+  container.innerHTML = "";
+
+  formVariants.forEach((v, vIdx) => {
+    const isCuda = v.backend === "cuda";
+    const diskBytes = calculateVariantDiskBytes(v);
+    v.requirements.disk_bytes = diskBytes;
+
+    const card = document.createElement('div');
+    card.className = "variant-card";
+    card.innerHTML = `
+      <div class="variant-card-header">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="font-weight:700; font-size:14px;">Variant #${vIdx + 1}:</span>
+          <input type="text" value="${v.key}" onchange="updateVariantField(${vIdx}, 'key', this.value)" style="width:180px; font-weight:600;">
+          <span class="badge ${isCuda ? 'badge-warning' : 'badge-primary'}">${v.backend}</span>
+          <span class="stat-pill">Disk: ${formatBytes(diskBytes)}</span>
+        </div>
+        <button class="sm danger" onclick="deleteVariant(${vIdx})">Delete Variant</button>
+      </div>
+
+      <!-- Variant basic specs -->
+      <div class="row">
+        <div class="col form-group">
+          <label>Backend</label>
+          <select onchange="updateVariantField(${vIdx}, 'backend', this.value)">
+            <option value="metal" ${v.backend === 'metal' ? 'selected' : ''}>Apple Metal</option>
+            <option value="cuda" ${v.backend === 'cuda' ? 'selected' : ''}>NVIDIA CUDA</option>
+          </select>
+        </div>
+        <div class="col form-group">
+          <label>Quantization Label</label>
+          <input type="text" value="${v.quant}" placeholder="e.g. mlx-4bit, fp8, q4_k_m" onchange="updateVariantField(${vIdx}, 'quant', this.value)">
+        </div>
+        <div class="col form-group">
+          <label>Min Host RAM (GB)</label>
+          <input type="number" step="0.5" value="${(v.requirements.min_ram_bytes / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'min_ram_bytes', this.value)">
+        </div>
+        <div class="col form-group">
+          <label>Recommended RAM (GB)</label>
+          <input type="number" step="0.5" value="${(v.requirements.recommended_ram_bytes / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'recommended_ram_bytes', this.value)">
+        </div>
+      </div>
+
+      ${isCuda ? `
+      <div class="row">
+        <div class="col form-group">
+          <label>Min CUDA Compute Capability (SM)</label>
+          <input type="number" value="${v.requires?.min_cuda_sm || 89}" onchange="updateVariantField(${vIdx}, 'min_cuda_sm', this.value)">
+        </div>
+        <div class="col form-group">
+          <label>Min VRAM (GB)</label>
+          <input type="number" step="0.5" value="${((v.requirements.min_vram_bytes || 0) / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'min_vram_bytes', this.value)">
+        </div>
+      </div>
+      ` : ''}
+
+      <!-- Components Section with Embedded HF Inspector -->
+      <div style="margin-top:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <label style="margin-bottom:0;">Components (${Object.keys(v.components).length})</label>
+          <div style="display:flex; gap:6px;">
+            <select id="add-role-select-${vIdx}" style="width:130px; padding:4px 8px; font-size:11px;">
+              <option value="draft">draft</option>
+              <option value="vision">vision</option>
+              <option value="asr">asr</option>
+              <option value="asr_mmproj">asr_mmproj</option>
+              <option value="diarization">diarization</option>
+              <option value="draft_vocab">draft_vocab</option>
+              <option value="image">image</option>
+            </select>
+            <button class="sm primary" onclick="addComponentToVariant(${vIdx})">+ Add Role</button>
+          </div>
+        </div>
+
+        <div id="components-list-${vIdx}"></div>
+      </div>
+
+      <!-- Server Defaults Form -->
+      <details style="margin-top:16px; background:#0b0d13; border:1px solid var(--border); border-radius:6px; padding:12px;">
+        <summary>Server Defaults for ${v.key}</summary>
+        <div class="row" style="margin-top:12px;">
+          <div class="col form-group">
+            <label>Context Window (--ctx)</label>
+            <input type="number" value="${v.server_defaults?.ctx || ''}" placeholder="32768" onchange="updateServerDefault(${vIdx}, 'ctx', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>Speculation Depth (--spec-k)</label>
+            <input type="number" value="${v.server_defaults?.spec_k || ''}" placeholder="3 (required if draft head is present)" onchange="updateServerDefault(${vIdx}, 'spec_k', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>Vision Max Pixels (--vision-max-pixels)</label>
+            <input type="number" value="${v.server_defaults?.vision_max_pixels || ''}" placeholder="1638400" onchange="updateServerDefault(${vIdx}, 'vision_max_pixels', this.value)">
+          </div>
+        </div>
+      </details>
+    `;
+    container.appendChild(card);
+    renderComponentsList(vIdx);
+  });
+}
+
+function calculateVariantDiskBytes(variant) {
+  let total = 0;
+  for (const comp of Object.values(variant.components)) {
+    for (const file of comp.files || []) {
+      total += (file.size || 0);
+    }
+  }
+  return total;
+}
+
+function updateVariantField(vIdx, field, val) {
+  if (field === 'key') formVariants[vIdx].key = val.trim();
+  if (field === 'backend') {
+    formVariants[vIdx].backend = val;
+    renderVariantsList();
+  }
+  if (field === 'quant') formVariants[vIdx].quant = val.trim();
+  if (field === 'min_cuda_sm') {
+    if (!formVariants[vIdx].requires) formVariants[vIdx].requires = {};
+    formVariants[vIdx].requires.min_cuda_sm = parseInt(val, 10) || null;
+  }
+  liveValidateForm();
+}
+
+function updateVariantRam(vIdx, field, valGb) {
+  const bytes = Math.round(parseFloat(valGb) * 1073741824);
+  formVariants[vIdx].requirements[field] = bytes > 0 ? bytes : null;
+  liveValidateForm();
+}
+
+function updateServerDefault(vIdx, field, val) {
+  if (!formVariants[vIdx].server_defaults) formVariants[vIdx].server_defaults = {};
+  if (!val || val.trim() === '') {
+    delete formVariants[vIdx].server_defaults[field];
+  } else {
+    formVariants[vIdx].server_defaults[field] = parseInt(val, 10);
+  }
+  liveValidateForm();
+}
+
+function addComponentToVariant(vIdx) {
+  const sel = document.getElementById(`add-role-select-${vIdx}`);
+  const role = sel.value;
+  if (formVariants[vIdx].components[role]) {
+    alert(`Role '${role}' already present in this variant.`);
+    return;
+  }
+  formVariants[vIdx].components[role] = {
+    provider: "huggingface",
+    repo: "",
+    revision: "main",
+    entry: null,
+    files: []
+  };
+  renderComponentsList(vIdx);
+  liveValidateForm();
+}
+
+function removeComponentFromVariant(vIdx, role) {
+  delete formVariants[vIdx].components[role];
+  renderVariantsList();
+  liveValidateForm();
+}
+
+function renderComponentsList(vIdx) {
+  const container = document.getElementById(`components-list-${vIdx}`);
+  if (!container) return;
+  container.innerHTML = "";
+
+  const variant = formVariants[vIdx];
+  for (const [role, comp] of Object.entries(variant.components)) {
+    const card = document.createElement('div');
+    card.className = "component-card";
+    card.innerHTML = `
+      <div class="component-header">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span class="badge badge-primary">${role.toUpperCase()}</span>
+          <span class="stat-pill">${comp.files.length} files selected</span>
+          ${comp.entry ? `<span class="stat-pill">entry: ${comp.entry}</span>` : ''}
+        </div>
+        ${role !== 'base' ? `<button class="sm danger" onclick="removeComponentFromVariant(${vIdx}, '${role}')">Remove Role</button>` : ''}
+      </div>
+
+      <!-- Hugging Face Inspector Bar -->
+      <div class="row" style="background:#090b10; border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
+        <div class="col-2 form-group" style="margin-bottom:0;">
+          <label>HF Repository</label>
+          <input type="text" id="repo-${vIdx}-${role}" value="${comp.repo}" placeholder="owner/repository" onchange="updateCompRepo(${vIdx}, '${role}', this.value)">
+        </div>
+        <div class="col form-group" style="max-width:140px; margin-bottom:0;">
+          <label>Revision / Branch</label>
+          <input type="text" id="rev-${vIdx}-${role}" value="${comp.revision}" onchange="updateCompRev(${vIdx}, '${role}', this.value)">
+        </div>
+        <div class="col form-group" style="flex:0; margin-bottom:0; align-self:flex-end;">
+          <button class="primary sm" onclick="inspectComponentRepo(${vIdx}, '${role}')" style="height:35px; white-space:nowrap;">
+            🔍 Inspect HF Files
+          </button>
+        </div>
+      </div>
+
+      <div id="inspector-output-${vIdx}-${role}">
+        ${renderComponentSelectedFilesSummary(comp)}
+      </div>
+    `;
+    container.appendChild(card);
+  }
+}
+
+function updateCompRepo(vIdx, role, val) {
+  formVariants[vIdx].components[role].repo = val.trim();
+  liveValidateForm();
+}
+
+function updateCompRev(vIdx, role, val) {
+  formVariants[vIdx].components[role].revision = val.trim();
+  liveValidateForm();
+}
+
+function renderComponentSelectedFilesSummary(comp) {
+  if (!comp.files || comp.files.length === 0) {
+    return `<div style="color:var(--text-dim); font-size:12px; font-style:italic;">No files selected yet. Click "Inspect HF Files" to browse and select files for this role.</div>`;
+  }
+  return `
+    <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">Selected Files:</div>
+    <table class="file-table">
+      <thead>
+        <tr><th>File Name</th><th>Size</th><th>SHA-256 Digest</th><th>Entry</th></tr>
+      </thead>
+      <tbody>
+        ${comp.files.map(f => `
+          <tr>
+            <td><code>${f.name}</code></td>
+            <td>${formatBytes(f.size)}</td>
+            <td><code title="${f.sha256}">${f.sha256.substring(0, 16)}...${f.sha256.substring(56)}</code></td>
+            <td>${comp.entry === f.name ? '<span class="badge badge-success">entry</span>' : ''}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+async function inspectComponentRepo(vIdx, role) {
+  const repo = document.getElementById(`repo-${vIdx}-${role}`).value.trim();
+  const revision = document.getElementById(`rev-${vIdx}-${role}`).value.trim();
+  const outDiv = document.getElementById(`inspector-output-${vIdx}-${role}`);
+
+  if (!repo || !repo.includes('/')) {
+    alert("Please enter a valid Hugging Face repository in 'owner/name' format.");
+    return;
+  }
+
+  outDiv.innerHTML = `<div style="color:var(--text-muted); padding:8px 0;"><span class="badge badge-warning">Loading...</span> Inspecting repository and computing SHA-256 digests...</div>`;
 
   try {
     const res = await api('/api/hf/inspect', {
@@ -372,21 +846,311 @@ async function runInspect() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repo, revision })
     });
+    if (!res.ok) {
+      outDiv.innerHTML = `<div class="alert-danger">Hugging Face error: ${await res.text()}</div>`;
+      return;
+    }
     const data = await res.json();
-    let rows = data.files.map(f => `<tr><td>${f.name}</td><td>${f.size}</td><td><code>${f.sha256}</code></td><td>${f.lfs ? 'Yes' : 'No'}</td></tr>`).join("");
-    resDiv.innerHTML = `
-      <div style="margin-bottom:8px;"><strong>Resolved Commit:</strong> <code>${data.commit}</code></div>
-      <table style="width:100%; border-collapse:collapse; font-size:12px;">
-        <thead><tr style="text-align:left; border-bottom:1px solid var(--border);"><th style="padding:6px;">File</th><th>Size</th><th>SHA-256</th><th>LFS</th></tr></thead>
+    formVariants[vIdx].components[role].revision = data.commit;
+    document.getElementById(`rev-${vIdx}-${role}`).value = data.commit;
+
+    renderComponentInspectorFilePicker(vIdx, role, data);
+  } catch (e) {
+    outDiv.innerHTML = `<div class="alert-danger">Inspection failed: ${e.message}</div>`;
+  }
+}
+
+function renderComponentInspectorFilePicker(vIdx, role, data) {
+  const outDiv = document.getElementById(`inspector-output-${vIdx}-${role}`);
+  const comp = formVariants[vIdx].components[role];
+  const selectedNames = new Set(comp.files.map(f => f.name));
+
+  let rows = data.files.map((f, fIdx) => {
+    const isChecked = selectedNames.has(f.name);
+    return `
+      <tr class="${isChecked ? 'selected' : ''}">
+        <td style="width:36px; text-align:center;">
+          <input type="checkbox" id="chk-${vIdx}-${role}-${fIdx}" ${isChecked ? 'checked' : ''} onchange="toggleComponentFile(${vIdx}, '${role}', ${fIdx})">
+        </td>
+        <td><strong>${f.name}</strong></td>
+        <td>${formatBytes(f.size)}</td>
+        <td><code style="font-size:11px;" title="${f.sha256}">${f.sha256.substring(0, 14)}...</code></td>
+        <td><span class="badge ${f.lfs ? 'badge-primary' : 'badge-muted'}">${f.lfs ? 'LFS' : 'raw'}</span></td>
+        <td style="text-align:center;">
+          <input type="radio" name="entry-${vIdx}-${role}" value="${f.name}" ${comp.entry === f.name ? 'checked' : ''} onchange="setComponentEntry(${vIdx}, '${role}', '${f.name}')">
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  outDiv.innerHTML = `
+    <div style="background:#0b0d13; border:1px solid var(--border); border-radius:6px; padding:12px; margin-top:10px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <div>
+          <span style="font-weight:600;">Resolved Commit:</span>
+          <code class="stat-pill">${data.commit}</code>
+        </div>
+        <div style="display:flex; gap:6px;">
+          <button class="sm" onclick="selectAllComponentFiles(${vIdx}, '${role}', true)">Select All</button>
+          <button class="sm" onclick="selectAllComponentFiles(${vIdx}, '${role}', false)">Clear Selection</button>
+        </div>
+      </div>
+
+      <table class="file-table">
+        <thead>
+          <tr>
+            <th></th>
+            <th>File Name</th>
+            <th>Size</th>
+            <th>SHA-256</th>
+            <th>Storage</th>
+            <th style="text-align:center;">Entry Point</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+    </div>
+  `;
+
+  // Store inspected files in element data for quick referencing
+  outDiv._inspectedFiles = data.files;
+}
+
+function toggleComponentFile(vIdx, role, fIdx) {
+  const outDiv = document.getElementById(`inspector-output-${vIdx}-${role}`);
+  const inspectedFiles = outDiv._inspectedFiles;
+  if (!inspectedFiles) return;
+
+  const file = inspectedFiles[fIdx];
+  const comp = formVariants[vIdx].components[role];
+  const existingIdx = comp.files.findIndex(f => f.name === file.name);
+
+  if (existingIdx >= 0) {
+    comp.files.splice(existingIdx, 1);
+    if (comp.entry === file.name) comp.entry = null;
+  } else {
+    comp.files.push({
+      name: file.name,
+      size: file.size,
+      sha256: file.sha256
+    });
+  }
+
+  // Update disk_bytes on variant
+  const diskBytes = calculateVariantDiskBytes(formVariants[vIdx]);
+  formVariants[vIdx].requirements.disk_bytes = diskBytes;
+
+  renderVariantsList();
+  liveValidateForm();
+}
+
+function selectAllComponentFiles(vIdx, role, selectAll) {
+  const outDiv = document.getElementById(`inspector-output-${vIdx}-${role}`);
+  const inspectedFiles = outDiv._inspectedFiles;
+  if (!inspectedFiles) return;
+
+  const comp = formVariants[vIdx].components[role];
+  if (selectAll) {
+    comp.files = inspectedFiles.map(f => ({ name: f.name, size: f.size, sha256: f.sha256 }));
+  } else {
+    comp.files = [];
+    comp.entry = null;
+  }
+
+  const diskBytes = calculateVariantDiskBytes(formVariants[vIdx]);
+  formVariants[vIdx].requirements.disk_bytes = diskBytes;
+
+  renderVariantsList();
+  liveValidateForm();
+}
+
+function setComponentEntry(vIdx, role, filename) {
+  formVariants[vIdx].components[role].entry = filename;
+  liveValidateForm();
+}
+
+// -------------------------------------------------------------
+// LIVE VALIDATION & SUBMISSION
+// -------------------------------------------------------------
+
+function buildRecipeObjectFromForm() {
+  const name = document.getElementById('f-name').value.trim();
+  const family = document.getElementById('f-family').value;
+  const aliasesStr = document.getElementById('f-aliases').value.trim();
+  const aliases = aliasesStr ? aliasesStr.split(',').map(s => s.trim()).filter(Boolean) : [];
+  const description = document.getElementById('f-description').value.trim();
+  const min_shiso_version = document.getElementById('f-min-shiso-version').value.trim() || "0.1.0";
+  const tagsStr = document.getElementById('f-tags').value.trim();
+  const tags = tagsStr ? tagsStr.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+  const tasks = Array.from(document.querySelectorAll('#f-tasks-group input:checked')).map(i => i.value);
+  const inputs = Array.from(document.querySelectorAll('#f-inputs-group input:checked')).map(i => i.value);
+  const outputs = Array.from(document.querySelectorAll('#f-outputs-group input:checked')).map(i => i.value);
+
+  const tools = document.getElementById('f-feat-tools').checked;
+  const structured_output = document.getElementById('f-feat-struct').checked;
+  const reasoning = document.getElementById('f-feat-reasoning').checked;
+  const reasoning_efforts = reasoning
+    ? Array.from(document.querySelectorAll('#f-reasoning-efforts input:checked')).map(i => i.value)
+    : [];
+  const default_reasoning_effort = reasoning ? document.getElementById('f-default-effort').value : null;
+
+  return {
+    schema_version: 1,
+    name,
+    aliases,
+    family,
+    min_shiso_version,
+    description,
+    tags,
+    tasks,
+    modalities: { inputs, outputs },
+    features: {
+      tools,
+      reasoning,
+      reasoning_efforts,
+      default_reasoning_effort,
+      structured_output
+    },
+    variants: formVariants
+  };
+}
+
+function liveValidateForm() {
+  const recipe = buildRecipeObjectFromForm();
+  const previewEl = document.getElementById('json-preview');
+  if (previewEl) previewEl.innerText = JSON.stringify(recipe, null, 2);
+
+  const box = document.getElementById('editor-validation-box');
+  const errors = [];
+
+  if (!recipe.name) errors.push("Model name is required");
+  else if (!/^[a-z0-9][a-z0-9._-]*$/.test(recipe.name)) errors.push("Model name must match [a-z0-9][a-z0-9._-]*");
+
+  if (!recipe.family) errors.push("Family must be selected");
+  if (!recipe.description) errors.push("Description is required");
+  if (recipe.variants.length === 0) errors.push("At least one variant is required");
+
+  recipe.variants.forEach((v, idx) => {
+    if (!v.key) errors.push(`Variant #${idx + 1}: key is required`);
+    if (!v.components.base && !v.components.asr && !v.components.image) {
+      errors.push(`Variant '${v.key}': requires at least 'base', 'asr', or 'image' component`);
+    }
+    for (const [r, comp] of Object.entries(v.components)) {
+      if (!comp.repo) errors.push(`Variant '${v.key}' role '${r}': repository is empty`);
+      if (comp.files.length === 0) errors.push(`Variant '${v.key}' role '${r}': no files selected`);
+    }
+    if (v.components.draft && (!v.server_defaults?.spec_k || v.server_defaults.spec_k <= 0)) {
+      errors.push(`Variant '${v.key}': has 'draft' component so server_defaults.spec_k must be > 0`);
+    }
+  });
+
+  if (errors.length > 0) {
+    box.style.display = 'block';
+    box.className = 'alert-danger';
+    box.innerHTML = `<strong>Validation Issues (${errors.length}):</strong><br>` + errors.join("<br>");
+  } else {
+    box.style.display = 'block';
+    box.className = 'alert-success';
+    box.innerHTML = `<strong>All checks passed!</strong> This recipe meets all strict validation rules.`;
+  }
+}
+
+function toggleJsonPreview() {
+  const details = document.getElementById('json-preview-details');
+  details.open = !details.open;
+}
+
+async function submitRecipeForm() {
+  const recipe = buildRecipeObjectFromForm();
+  liveValidateForm();
+
+  const name = recipe.name;
+  if (!name) {
+    alert("Please specify a valid model name.");
+    return;
+  }
+
+  try {
+    const res = await api('/api/recipes/' + encodeURIComponent(name), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(recipe, null, 2)
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      alert("Validation failed on server:\n" + err);
+    } else {
+      alert(`Recipe '${name}' saved and validated strictly.`);
+      loadGitStatus();
+      showTab('dashboard');
+    }
+  } catch (e) {
+    alert("Save error: " + e.message);
+  }
+}
+
+async function deleteRecipe(name) {
+  if (!confirm(`Are you sure you want to delete '${name}'?`)) return;
+  try {
+    const res = await api('/api/recipes/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (!res.ok) alert("Delete failed: " + await res.text());
+    else { loadRecipes(); loadGitStatus(); }
+  } catch (e) { alert("Delete error: " + e.message); }
+}
+
+// -------------------------------------------------------------
+// STANDALONE HF INSPECTOR TAB
+// -------------------------------------------------------------
+
+async function runStandaloneInspect() {
+  const repo = document.getElementById('exp-repo').value.trim();
+  const revision = document.getElementById('exp-rev').value.trim();
+  const out = document.getElementById('exp-result');
+
+  out.innerHTML = `<div style="color:var(--text-muted);">Inspecting Hugging Face repository...</div>`;
+  try {
+    const res = await api('/api/hf/inspect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo, revision })
+    });
+    if (!res.ok) {
+      out.innerHTML = `<div class="alert-danger">${await res.text()}</div>`;
+      return;
+    }
+    const data = await res.json();
+    let rows = data.files.map(f => `
+      <tr>
+        <td><code>${f.name}</code></td>
+        <td>${formatBytes(f.size)}</td>
+        <td><code title="${f.sha256}">${f.sha256}</code></td>
+        <td><span class="badge ${f.lfs ? 'badge-primary' : 'badge-muted'}">${f.lfs ? 'LFS' : 'raw'}</span></td>
+      </tr>
+    `).join("");
+
+    out.innerHTML = `
+      <div style="margin-bottom:12px;"><strong>Commit SHA:</strong> <code>${data.commit}</code> &bull; ${data.files.length} files</div>
+      <table class="file-table">
+        <thead><tr><th>Name</th><th>Size</th><th>SHA-256 Digest</th><th>Storage</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     `;
-  } catch (e) { resDiv.innerHTML = `<span style="color:var(--danger)">Error: ${e.message}</span>`; }
+  } catch (e) {
+    out.innerHTML = `<div class="alert-danger">${e.message}</div>`;
+  }
 }
+
+// -------------------------------------------------------------
+// VALIDATION & BUILD TABS
+// -------------------------------------------------------------
 
 async function runValidation() {
   const container = document.getElementById('validation-results');
-  container.innerHTML = "Validating all recipes...";
+  container.innerHTML = "Running strict validation across all recipes...";
   try {
     const res = await api('/api/validate', { method: 'POST' });
     const reports = await res.json();
@@ -409,7 +1173,7 @@ async function runBuild() {
   const key = document.getElementById('build-key').value.trim();
   const allowDirty = document.getElementById('build-allow-dirty').checked;
   const resDiv = document.getElementById('build-result');
-  resDiv.innerHTML = "Building registry manifests and index...";
+  resDiv.innerHTML = "Compiling manifests and signing index...";
 
   try {
     const res = await api('/api/build', {
@@ -418,12 +1182,30 @@ async function runBuild() {
       body: JSON.stringify({ out, sign_key: key || null, allow_dirty: allowDirty })
     });
     if (!res.ok) {
-      resDiv.innerHTML = `<span style="color:var(--danger)">Build failed: ${await res.text()}</span>`;
+      resDiv.innerHTML = `<div class="alert-danger">Build failed:<br>${await res.text()}</div>`;
     } else {
       const data = await res.json();
-      resDiv.innerHTML = `<span style="color:var(--success)">Build succeeded!</span> ${data.diff}`;
+      resDiv.innerHTML = `
+        <div class="alert-success">
+          <strong>Build Complete!</strong><br>${data.diff}
+        </div>
+      `;
     }
-  } catch (e) { resDiv.innerHTML = `<span style="color:var(--danger)">Build error: ${e.message}</span>`; }
+  } catch (e) { resDiv.innerHTML = `<div class="alert-danger">${e.message}</div>`; }
+}
+
+async function runKeygen() {
+  const path = prompt("Enter path to save new private key file:", "~/.config/shiso/registry.key");
+  if (!path) return;
+  alert("Run keygen headless using:\ncargo run -p shiso-registry-editor -- keygen --out " + path);
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
 window.addEventListener('DOMContentLoaded', () => {

@@ -269,9 +269,20 @@ pub(crate) async fn inspect_hf(
             });
         } else {
             let size = entry.size.unwrap_or(0);
-            let sha = entry.oid.unwrap_or_else(|| {
-                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
-            });
+            let sha = if size <= 20 * 1024 * 1024 {
+                hash_remote_non_lfs_file(&client, repo, &commit, &name, token)
+                    .await
+                    .unwrap_or_else(|| {
+                        entry.oid.unwrap_or_else(|| {
+                            "0000000000000000000000000000000000000000000000000000000000000000"
+                                .to_string()
+                        })
+                    })
+            } else {
+                entry.oid.unwrap_or_else(|| {
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+                })
+            };
             files.push(HfInspectFile {
                 name,
                 size,
@@ -287,6 +298,25 @@ pub(crate) async fn inspect_hf(
         commit,
         files,
     })
+}
+async fn hash_remote_non_lfs_file(
+    client: &reqwest::Client,
+    repo: &str,
+    commit: &str,
+    path: &str,
+    token: Option<&str>,
+) -> Option<String> {
+    let url = format!("https://huggingface.co/{repo}/resolve/{commit}/{path}");
+    let mut req = client.get(&url);
+    if let Some(tok) = token {
+        req = req.header("authorization", format!("Bearer {tok}"));
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    Some(hex::encode(Sha256Hasher::digest(&bytes)))
 }
 
 /// Builds, validates, compiles, and signs the registry output (§7.1, §7.5).
