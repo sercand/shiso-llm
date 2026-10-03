@@ -516,3 +516,26 @@ fn metal_family_and_working_set_gate_selection() {
     recipe.variants[0].requirements.min_vram_bytes = None;
     assert!(select_variant(&recipe, &headless, None).is_err());
 }
+
+#[test]
+fn ngram_role_names_its_flag_and_must_name_a_file() {
+    assert_eq!("ngram".parse::<Role>().unwrap(), Role::Ngram);
+    assert_eq!(Role::Ngram.flag_name(), "--ngram");
+
+    let mut variant = single_repo_variant();
+    let base = variant.components.get_mut(&Role::Base).unwrap();
+    base.files.push(FileEntry {
+        name: "ngram.safetensors".to_string(),
+        size: 10,
+        sha256: base.files[0].sha256.clone(),
+        binds: Some(Role::Ngram),
+    });
+    variant.requirements.disk_bytes += 10;
+    assert_eq!(
+        variant.role_paths().unwrap()[&Role::Ngram].file,
+        Some("ngram.safetensors")
+    );
+    let mut recipe = make_test_recipe();
+    recipe.variants = vec![variant];
+    validate_recipe(&recipe, ValidationMode::Strict).unwrap();
+}

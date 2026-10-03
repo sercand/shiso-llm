@@ -406,6 +406,14 @@ pub struct ServeArgs {
     #[arg(long, env = "SHISO_EXPERT_SLOTS", default_value_t = 0)]
     pub expert_slots: u32,
 
+    /// The per-layer n-gram embedding table, for a checkpoint that keeps it in
+    /// a file of its own: the sparse family's trellis export.
+    ///
+    /// Required by that checkpoint and refused beside any other: the table is
+    /// read from here and never looked for by name beside `--model`.
+    #[arg(long, env = "SHISO_NGRAM")]
+    pub ngram: Option<PathBuf>,
+
     /// The vision tower: a sidecar weights file, or a directory holding one.
     ///
     /// Absent means text only, and the encoder is never loaded.

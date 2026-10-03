@@ -71,8 +71,6 @@ const LM: &str = "model.language_model";
 const MTP: &str = "mtp";
 /// The shard index.
 const INDEX: &str = "model.safetensors.index.json";
-/// The n-gram table's own file.
-const NGRAM_FILE: &str = "ngram_embedding.safetensors";
 /// The n-gram table's tensors, under the n-gram slot's layer.
 const NGRAM_BASE: &str = "ple.ple_embedding.ngram_embedding";
 /// The codebook multiplier the trellis kernels decode with
@@ -133,17 +131,16 @@ struct NgramMeta {
 }
 
 impl NgramFile {
-    /// Maps the table file and checks it holds six-bit trellis rows of the
-    /// slot's width, decoded through the kernels' codebook.
+    /// Maps the table file at `path` and checks it holds six-bit trellis rows
+    /// of the slot's width, decoded through the kernels' codebook.
     ///
     /// # Errors
     ///
     /// [`CoreError::Io`] for a missing file, [`CoreError::Backend`] for a
     /// header that does not parse, and [`CoreError::InvalidValue`] for rows of
     /// another codec, width or codebook.
-    pub fn open(dir: &Path) -> CoreResult<Self> {
-        let path = dir.join(NGRAM_FILE);
-        let meta = read_meta(&path)?;
+    pub fn open(path: &Path) -> CoreResult<Self> {
+        let meta = read_meta(path)?;
         let want = PLE_HEAD_DIM.to_string();
         if meta.format != "exl3_ngram_trellis"
             || meta.bits != "6"
@@ -163,7 +160,7 @@ impl NgramFile {
                 ),
             });
         }
-        let (shard, table) = Shard::open_untagged(&path).map_err(|err| CoreError::Backend {
+        let (shard, table) = Shard::open_untagged(path).map_err(|err| CoreError::Backend {
             backend: "qwen4exp",
             op: "open the n-gram table",
             source: Box::new(err),

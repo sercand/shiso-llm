@@ -181,6 +181,7 @@ pub fn resolve_serve_model(
 
 fn check_component_flag_conflicts(args: &ServeArgs, ref_str: &str) -> anyhow::Result<()> {
     if args.config.is_some()
+        || args.ngram.is_some()
         || args.vision.is_some()
         || args.draft_model.is_some()
         || args.draft_vocab.is_some()
@@ -270,6 +271,7 @@ fn populate_serve_args_from_variant(
             Role::AsrMmproj => args.asr_mmproj = Some(target_path),
             Role::Diarization => args.diarization_model = Some(target_path),
             Role::Config => args.config = Some(target_path),
+            Role::Ngram => args.ngram = Some(target_path),
             Role::Image => bail!("model uses 'image' role which is not supported by serve"),
         }
     }
@@ -755,7 +757,8 @@ mod tests {
     const QWEN38: &str = include_str!("../../shiso-registry/tests/fixtures/qwen3.8-flash.json");
 
     /// The CUDA variant resolves to the directory as `--model`, the tower
-    /// file inside it as `--vision`, and the tuned knobs as recipe defaults.
+    /// and n-gram table files inside it as `--vision` and `--ngram`, and the
+    /// tuned knobs as recipe defaults.
     #[test]
     fn exl3_variant_resolves_to_directory_and_tower() {
         let recipe: Recipe = serde_json::from_str(QWEN38).expect("fixture parses");
@@ -782,6 +785,7 @@ mod tests {
         let base = vdir.join(Role::Base.as_str());
         assert_eq!(args.model, Some(base.clone()));
         assert_eq!(args.vision, Some(base.join("vision_k6.safetensors")));
+        assert_eq!(args.ngram, Some(base.join("ngram_embedding.safetensors")));
         // The head is inside the directory: no flag names it.
         assert_eq!(args.draft_model, None);
         assert_eq!(args.config, None);

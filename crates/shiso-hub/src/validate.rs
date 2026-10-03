@@ -153,17 +153,19 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
     let has_asr_mmproj = roles.contains_key(&Role::AsrMmproj);
     let has_diarization = roles.contains_key(&Role::Diarization);
 
-    // `--config` names a file; a directory there would be read as one and fail
-    // at boot, so the recipe has to say which file it is.
-    if let Some(config) = roles.get(&Role::Config)
-        && config.file.is_none()
-    {
-        return Err(HubError::Validation {
-            reason: format!(
-                "variant '{}' role 'config' must name its file with 'entry' or 'binds'",
-                variant.key.as_str()
-            ),
-        });
+    // `--config` and `--ngram` name files; a directory there would be read as
+    // one and fail at boot, so the recipe has to say which file it is.
+    for role in [Role::Config, Role::Ngram] {
+        if let Some(place) = roles.get(&role)
+            && place.file.is_none()
+        {
+            return Err(HubError::Validation {
+                reason: format!(
+                    "variant '{}' role '{role}' must name its file with 'entry' or 'binds'",
+                    variant.key.as_str()
+                ),
+            });
+        }
     }
 
     if !has_base && !has_asr && !roles.contains_key(&Role::Image) {

@@ -391,6 +391,11 @@ pub enum Role {
     Diarization,
     /// Image generation model (`image`, reserved).
     Image,
+    /// Per-layer n-gram embedding table (`--ngram`).
+    ///
+    /// For a checkpoint that keeps the table in a file of its own rather than
+    /// inside its shards; the loader reads it from the flag, never by name.
+    Ngram,
     /// Architecture config document (`--config`).
     ///
     /// For a checkpoint whose weights file carries no `config.json` beside it,
@@ -413,6 +418,7 @@ impl Role {
             Self::AsrMmproj => "--asr-mmproj",
             Self::Diarization => "--diarization-model",
             Self::Image => "--image-model",
+            Self::Ngram => "--ngram",
             Self::Config => "--config",
         }
     }
@@ -429,6 +435,7 @@ impl Role {
             Self::AsrMmproj => "asr_mmproj",
             Self::Diarization => "diarization",
             Self::Image => "image",
+            Self::Ngram => "ngram",
             Self::Config => "config",
         }
     }
@@ -452,6 +459,7 @@ impl FromStr for Role {
             "asr_mmproj" => Ok(Self::AsrMmproj),
             "diarization" => Ok(Self::Diarization),
             "image" => Ok(Self::Image),
+            "ngram" => Ok(Self::Ngram),
             "config" => Ok(Self::Config),
             _ => Err(HubError::Validation {
                 reason: format!("unknown role '{s}'"),

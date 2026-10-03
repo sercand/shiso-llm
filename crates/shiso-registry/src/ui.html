@@ -677,6 +677,7 @@ function renderVariantsList() {
               <option value="draft_vocab">draft_vocab</option>
               <option value="image">image</option>
               <option value="config">config</option>
+              <option value="ngram">ngram</option>
             </select>
             <button class="sm primary" onclick="addComponentToVariant(${vIdx})">+ Add Role</button>
           </div>
@@ -923,7 +924,7 @@ function updateCompRev(vIdx, role, val) {
 }
 
 // Roles a file can hand itself to with `binds`: the flag-bearing ones.
-const BINDABLE_ROLES = ['base', 'draft', 'draft_vocab', 'vision', 'asr', 'asr_mmproj', 'diarization', 'config'];
+const BINDABLE_ROLES = ['base', 'draft', 'draft_vocab', 'vision', 'asr', 'asr_mmproj', 'diarization', 'config', 'ngram'];
 
 // The `binds` dropdown for one file: which other role's flag it is passed to.
 // Disabled for a file that is not selected, since only selected files are
@@ -1197,7 +1198,9 @@ function liveValidateForm() {
         supplied[f.binds] = f.name;
       }
     }
-    if ('config' in supplied && !supplied.config) errors.push(`Variant '${v.key}': role 'config' must name its file as entry`);
+    for (const r of ['config', 'ngram']) {
+      if (r in supplied && !supplied[r]) errors.push(`Variant '${v.key}': role '${r}' must name its file as entry`);
+    }
     if (!('base' in supplied) && !('asr' in supplied) && !('image' in supplied)) {
       errors.push(`Variant '${v.key}': requires at least 'base', 'asr', or 'image'`);
     }

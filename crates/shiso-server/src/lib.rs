@@ -471,6 +471,16 @@ fn load_checkpoint(
     args: &ServeArgs,
     model: &std::path::Path,
 ) -> anyhow::Result<model_factory::Loaded> {
+    // A table nothing reads is an operator who believes a model is using it.
+    if let Some(ngram) = &args.ngram
+        && !model_factory::takes_ngram(config, model)
+    {
+        anyhow::bail!(
+            "--ngram {} was given, but the checkpoint at {} has no n-gram table file to read",
+            ngram.display(),
+            model.display()
+        );
+    }
     let _tag = shiso_core::ledger::scope(shiso_core::MemTag::WeightsOther);
     let started = std::time::Instant::now();
     let loaded = model_factory::load_model(backend, model, config, args)

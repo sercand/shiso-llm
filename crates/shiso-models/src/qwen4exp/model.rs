@@ -389,6 +389,9 @@ impl Qwen4ExpModel {
     /// Opens the trellis export's directory as it is published and puts it on
     /// the device, its routed banks resident.
     ///
+    /// `ngram` is the n-gram table file, which the export keeps beside its
+    /// shards and the caller names; nothing here looks for it by name.
+    ///
     /// The export carries its own draft head; `draft` loads it, and `counts`
     /// narrows its vocabulary as [`Qwen4ExpModel::load_with`] does. The
     /// trellis kernels exist on one backend, and a device without them refuses
@@ -402,13 +405,14 @@ impl Qwen4ExpModel {
     pub fn load_exl3(
         backend: &Arc<dyn Backend>,
         dir: &Path,
+        ngram: &Path,
         hf: &shiso_core::config::HfConfig,
         draft: bool,
         counts: Option<&Path>,
         opts: SparseOptions,
     ) -> CoreResult<Self> {
         let ck = exl3::open(dir)?;
-        let table = exl3::NgramFile::open(dir)?;
+        let table = exl3::NgramFile::open(ngram)?;
         let config = Qwen4ExpConfig::from_exl3(hf, dir, &table)?;
         let ngram = {
             let _tag = ledger::scope(MemTag::WeightsEmbedding);

@@ -151,7 +151,8 @@
             {
               "name": "ngram_embedding.safetensors",
               "size": 39040193720,
-              "sha256": "c63613666649014e668cdbd32a4e3f1e8beda697eb4f3a1874300d93a1bfbc75"
+              "sha256": "c63613666649014e668cdbd32a4e3f1e8beda697eb4f3a1874300d93a1bfbc75",
+              "binds": "ngram"
             },
             {
               "name": "vision_k6.safetensors",

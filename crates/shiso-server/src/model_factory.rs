@@ -960,6 +960,15 @@ fn sparse_options(
     }
 }
 
+/// Whether the checkpoint at `path` reads `--ngram`: only the sparse family's
+/// trellis export keeps its n-gram table in a file of its own.
+#[must_use]
+pub fn takes_ngram(config: &HfConfig, path: &Path) -> bool {
+    Qwen4ExpConfig::describes(config)
+        && path.is_dir()
+        && shiso_models::qwen4exp::exl3::is_exl3_dir(path)
+}
+
 /// The sparse family's directory: the trellis export when its shard index
 /// names one, the MLX or reference export otherwise.
 fn load_qwen4exp_dir(
@@ -998,9 +1007,18 @@ fn load_qwen4exp_exl3(
             ),
         }));
     }
+    let ngram = args.ngram.as_deref().ok_or_else(|| {
+        FactoryError::Load(CoreError::ConfigMissing {
+            key: format!(
+                "--ngram: {} keeps its n-gram table in a file of its own; name it",
+                path.display()
+            ),
+        })
+    })?;
     let model = Qwen4ExpModel::load_exl3(
         backend,
         path,
+        ngram,
         config,
         args.spec_k > 0,
         args.draft_vocab.as_deref(),
