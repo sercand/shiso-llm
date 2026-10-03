@@ -21,7 +21,7 @@ members = [
     "crates/shiso-kerneltest",
     "crates/shiso-router",
     "crates/shiso-hub",
-    "crates/shiso-registry-editor",
+    "crates/shiso-registry",
 ]
 
 [workspace.package]
@@ -44,7 +44,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 
 # --- errors --------------------------------------------------------------
 thiserror = "2"          # library errors
-anyhow = "1"             # binary boundaries only (shiso-server, shiso-registry-editor, shiso-router, shiso-bench)
+anyhow = "1"             # binary boundaries only (shiso-server, shiso-registry, shiso-router, shiso-bench)
 
 # --- concurrency + logging ----------------------------------------------
 parking_lot = "0.12"     # no poisoning, .lock() returns the guard directly
@@ -166,7 +166,7 @@ shiso-parsers = { path = "crates/shiso-parsers" }
 shiso-kerneltest = { path = "crates/shiso-kerneltest" }
 shiso-router = { path = "crates/shiso-router" }
 shiso-hub = { path = "crates/shiso-hub" }
-shiso-registry-editor = { path = "crates/shiso-registry-editor" }
+shiso-registry = { path = "crates/shiso-registry" }
 [workspace.lints.rust]
 # Safety. Four crates relax this with a crate-level
 # #![allow(unsafe_code, reason = "...")]: shiso-modelfile (mmap), shiso-metal (objc2),

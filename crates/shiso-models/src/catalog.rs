@@ -1,6 +1,6 @@
 //! Family catalog: facts about every checkpoint family this build can serve.
 //!
-//! Used by `shiso-registry-editor` and `shiso-hub` to validate recipes against
+//! Used by `shiso-registry` and `shiso-hub` to validate recipes against
 //! the models actually implemented in this commit.
 
 use serde::Serialize;

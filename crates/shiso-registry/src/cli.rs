@@ -1,4 +1,4 @@
-//! CLI arguments for `shiso-registry-editor` (§7.1).
+//! CLI arguments for `shiso-registry` (§7.1).
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// Maintainer CLI for editing, inspecting, validating, and building the Shiso model registry.
 #[derive(Debug, Parser)]
 #[command(
-    name = "shiso-registry-editor",
+    name = "shiso-registry",
     version,
     about = "maintainer tool for the Shiso model registry"
 )]

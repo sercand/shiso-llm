@@ -2535,7 +2535,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "shiso-registry-editor"
+name = "shiso-registry"
 version = "0.1.0"
 dependencies = [
  "anyhow",

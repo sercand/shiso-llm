@@ -1,4 +1,4 @@
-//! `shiso-registry-editor` - maintainer tool for editing, inspecting, validating and building the model registry.
+//! `shiso-registry` - maintainer tool for editing, inspecting, validating and building the model registry.
 #![forbid(unsafe_code)]
 #![expect(clippy::print_stdout, reason = "maintainer CLI command output")]
 
