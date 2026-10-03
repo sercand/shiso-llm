@@ -339,11 +339,14 @@ async fn run_stream(
                 step = progress_rx.recv(), if progress_open => {
                     match step {
                         Some(event) => {
-                            // A step event that carries no bytes produces no frame:
-                            // this event's payload is the partial image, and a step
-                            // tick has nothing to put in it. The keep-alive is what
-                            // tells a waiting client the generation is still alive.
-                            if let Some(bytes) = event.partial_image {
+                            // A step event that carries no bytes produces no
+                            // frame: this event's payload is the partial
+                            // image, and a step tick has nothing to put in
+                            // it. The keep-alive is what tells a waiting
+                            // client the generation is still alive.
+                            if !is_final_step(&event)
+                                && let Some(bytes) = event.partial_image
+                            {
                                 let frame = partial_frame(bytes, partial_index);
                                 partial_index += 1;
                                 if !send(&tx, Ok(frame.into_event()), &mut streaming) {
@@ -361,7 +364,9 @@ async fn run_stream(
         // still buffered belongs to this image and goes out before its
         // completed frame.
         while let Ok(event) = progress_rx.try_recv() {
-            if let Some(bytes) = event.partial_image {
+            if !is_final_step(&event)
+                && let Some(bytes) = event.partial_image
+            {
                 let frame = partial_frame(bytes, partial_index);
                 partial_index += 1;
                 if !send(&tx, Ok(frame.into_event()), &mut streaming) {
@@ -423,7 +428,19 @@ fn accepted_event() -> Event {
     Event::default().comment("accepted")
 }
 
+/// Whether this step is the last one. Its partial decode is the finished
+/// image byte for byte, so a partial frame for it would make every client
+/// decode the same picture twice for no new information; the completed
+/// frame carries it once.
+fn is_final_step(event: &ImageStepEvent) -> bool {
+    event.step.saturating_add(1) >= event.total_steps
+}
+
 /// One partial-image frame.
+///
+/// Partials are always PNG previews regardless of the request's
+/// `output_format`: they are progress, not the product, and the completed
+/// frame is the one that honors the format.
 fn partial_frame(bytes: Vec<u8>, index: u32) -> Frame {
     let body = ImageGenPartialImageEvent {
         r#type: "image_generation.partial_image",

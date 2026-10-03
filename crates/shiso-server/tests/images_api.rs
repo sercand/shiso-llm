@@ -601,21 +601,24 @@ async fn a_streamed_request_frames_partials_then_completed_then_done() {
         .expect("the body reads");
     let text = String::from_utf8(bytes.to_vec()).expect("frames are UTF-8");
 
-    // The frames in order: one partial per step (the mock emits bytes with
-    // every step), then the completed frame, then the terminator.
+    // The frames in order: one partial per step except the last - the
+    // final step's decode is the finished image byte for byte, so its
+    // partial frame is skipped - then the completed frame, then the
+    // terminator.
     let events = sse_frames(&text);
 
     let names: Vec<&str> = events.iter().map(|(name, _)| *name).collect();
     let steps = 4; // the server default step count the mock walks
+    let partials = steps - 1; // the final step rides the completed frame
     assert_eq!(
         names,
-        vec!["image_generation.partial_image"; 4]
+        vec!["image_generation.partial_image"; partials]
             .into_iter()
             .chain(std::iter::once("image_generation.completed"))
             // The terminator rides without an event name of its own.
             .chain(std::iter::once(""))
             .collect::<Vec<_>>(),
-        "every step with bytes becomes a partial frame, then the answer: {text}"
+        "every step but the last becomes a partial frame, then the answer: {text}"
     );
     assert_eq!(events.last().expect("a last frame").1, "[DONE]");
 
@@ -626,7 +629,7 @@ async fn a_streamed_request_frames_partials_then_completed_then_done() {
     assert_eq!(first_partial["partial_image_index"], 0);
     assert_eq!(first_partial["type"], "image_generation.partial_image");
     let completed: serde_json::Value =
-        serde_json::from_str(events[steps].1).expect("the completed frame is JSON");
+        serde_json::from_str(events[partials].1).expect("the completed frame is JSON");
     assert_eq!(completed["type"], "image_generation.completed");
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(completed["b64_json"].as_str().expect("b64_json"))

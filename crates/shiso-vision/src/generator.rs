@@ -176,6 +176,10 @@ pub trait ImageGenerator: Send + Sync + fmt::Debug {
 
     /// Generates an image, optionally emitting step progress.
     ///
+    /// The per-step partial decode is a full extra decode per step, so a
+    /// generator pays that cost only when a progress consumer exists: a
+    /// blocking caller has no consumer, and the worker hands it `None`.
+    ///
     /// # Errors
     /// [`ImageGenError`] upon device error, invalid dimensions, or encoding failure.
     fn generate(
