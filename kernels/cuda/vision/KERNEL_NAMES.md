@@ -186,6 +186,15 @@ kernel_vit_spatial_merge
 kernel_vit_splice_rows
 ```
 
+Every entry that reads a tower weight also has an `_f16` twin - the same body,
+instantiated for a tower stored in IEEE halves rather than brain floats, with
+the same parameters, grid and block: `kernel_vit_gemm_bias_f16` and
+`kernel_vit_layer_norm_f16` here, and among the tensor-core path's entries
+`kernel_vit_to_f16` (the twin of `kernel_vit_to_bf16`, writing half-precision
+operand planes), `kernel_vit_add_bias_f16`, `kernel_vit_layer_norm_split_f16`,
+`kernel_vit_bias_gelu_split_f16`, `kernel_vit_add_bias_residual_f16` and
+`kernel_vit_qkv_rope_split_f16`. The encoder picks one width per tower.
+
 Geometry and parameter order are `crates/shiso-metal/metal/vision/KERNELS.md`'s,
 because the twins share an engine that names them and hands both the same
 argument block and the same grid. The argument block is parameter 0 in all nine

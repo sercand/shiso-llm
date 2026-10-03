@@ -81,6 +81,10 @@ impl Qwen35Tower {
     pub fn open(backend: &Arc<dyn Backend>, path: &Path) -> Result<Self, VisionError> {
         let source = if path.is_dir() {
             Self::checkpoint_source(path)?
+        } else if path.extension().is_some_and(|ext| ext == "safetensors") {
+            // A tower file of a checkpoint directory rather than a standalone
+            // container: the trellis export ships its tower this way.
+            VisionSource::TrellisShard(path.to_path_buf())
         } else {
             VisionSource::SidecarGguf(path.to_path_buf())
         };
@@ -100,6 +104,9 @@ impl Qwen35Tower {
 
     /// Which of the two checkpoint layouts this directory is.
     fn checkpoint_source(dir: &Path) -> Result<VisionSource, VisionError> {
+        if let Some(tower) = loader::trellis_tower_file(dir) {
+            return Ok(VisionSource::TrellisShard(tower));
+        }
         let (_, shard) = shiso_vision::open_checkpoint(dir)?;
         if shard.is_file() {
             return Ok(VisionSource::OptiqDir(dir.to_path_buf()));

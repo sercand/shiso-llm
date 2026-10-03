@@ -152,3 +152,31 @@ fn a_tensor_core_query_never_attends_across_a_group() {
     let Some(gpu) = open() else { return };
     tower::a_tensor_core_query_never_attends_across_a_group(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_half_precision_gemm_agrees_with_a_row_times_column_loop() {
+    let Some(gpu) = open() else { return };
+    tower::the_half_precision_gemm_agrees_with_a_row_times_column_loop(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_half_precision_normalization_agrees_with_the_same_oracle() {
+    let Some(gpu) = open() else { return };
+    tower::the_half_precision_normalization_agrees_with_the_same_oracle(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_half_precision_operand_split_sums_back_to_its_input() {
+    let Some(gpu) = open() else { return };
+    tower::the_half_precision_operand_split_sums_back_to_its_input(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_half_precision_bias_repeats_with_its_period() {
+    let Some(gpu) = open() else { return };
+    tower::the_half_precision_bias_repeats_with_its_period(&gpu);
+}

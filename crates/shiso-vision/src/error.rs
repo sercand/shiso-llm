@@ -474,11 +474,12 @@ pub enum VisionError {
     ///
     /// Distinct from [`VisionError::TensorDType`], which is the loader refusing
     /// to upload a format at all: this tensor is on the device and readable, but
-    /// the kernels widen a brain-float by shifting its bits, which is exact and
-    /// is not a conversion. Handed anything else they would read wrong numbers
-    /// and say nothing.
+    /// the kernels are built per storage width - a brain float widened by a
+    /// shift, a half by its conversion - and read one width for the whole
+    /// tower. Handed anything else they would read wrong numbers and say
+    /// nothing.
     #[error(
-        "vision weight {name} is stored as {} but the encoder's kernels read bf16",
+        "vision weight {name} is stored as {}, but the encoder's kernels read the whole tower in one width, bf16 or f16",
         dtype.type_name()
     )]
     WeightDType {

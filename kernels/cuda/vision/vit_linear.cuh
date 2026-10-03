@@ -41,7 +41,8 @@
  * The block is a VIT_GEMM_TILE square and may not be anything else: a thread's
  * tile coordinates are its own `threadIdx`, and no thread returns early,
  * because every one of them reaches the two barriers inside the tile loop. */
-extern "C" __global__ void kernel_vit_gemm_bias(
+template <typename W>
+static __device__ __forceinline__ void kernel_vit_gemm_bias_body(
         const struct vit_args_gemm args,
         float *__restrict__ out,
         const float *__restrict__ in,
@@ -67,7 +68,7 @@ extern "C" __global__ void kernel_vit_gemm_bias(
                 ? in[(uint64_t) row * args.k + k]
                 : 0.0f;
         b_tile[ty][tx] = (stage_n < args.n && have_k)
-                ? vit_bf16(weight + (uint64_t) stage_n * args.k + k)
+                ? W::load(weight + (uint64_t) stage_n * args.k + k)
                 : 0.0f;
         __syncthreads();
         for (unsigned kk = 0u; kk < VIT_GEMM_TILE; kk++) {
@@ -77,8 +78,28 @@ extern "C" __global__ void kernel_vit_gemm_bias(
     }
 
     if (row < args.m && col < args.n) {
-        out[(uint64_t) row * args.n + col] = acc + vit_bf16(bias + col);
+        out[(uint64_t) row * args.n + col] = acc + W::load(bias + col);
     }
+}
+
+/* The brain-float tower's entry and the half-precision tower's twin; see
+ * `vit_w_bf16`. */
+extern "C" __global__ void kernel_vit_gemm_bias(
+        const struct vit_args_gemm args,
+        float *__restrict__ out,
+        const float *__restrict__ in,
+        const unsigned short *__restrict__ weight,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_gemm_bias_body<vit_w_bf16>(args, out, in, weight, bias);
+}
+
+extern "C" __global__ void kernel_vit_gemm_bias_f16(
+        const struct vit_args_gemm args,
+        float *__restrict__ out,
+        const float *__restrict__ in,
+        const unsigned short *__restrict__ weight,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_gemm_bias_body<vit_w_f16>(args, out, in, weight, bias);
 }
 
 /* `out[r, i] = (in[r, i] - mean) * rsqrt(var + eps) * weight[i] + bias[i]`.
@@ -97,7 +118,8 @@ extern "C" __global__ void kernel_vit_gemm_bias(
  *
  * The dynamic shared allocation is VIT_BLOCK_SUM_SLOTS floats, 132 bytes, which
  * is what both encoders and every case pass. */
-extern "C" __global__ void kernel_vit_layer_norm(
+template <typename W>
+static __device__ __forceinline__ void kernel_vit_layer_norm_body(
         const struct vit_args_layer_norm args,
         float *out,
         const float *in,
@@ -128,8 +150,28 @@ extern "C" __global__ void kernel_vit_layer_norm(
             vit_block_sum(var, scratch, tid, nthreads) / (float) args.dim + args.eps);
 
     for (unsigned i = tid; i < args.dim; i += nthreads) {
-        dst[i] = (src[i] - mean) * rstd * vit_bf16(weight + i) + vit_bf16(bias + i);
+        dst[i] = (src[i] - mean) * rstd * W::load(weight + i) + W::load(bias + i);
     }
+}
+
+/* The brain-float tower's entry and the half-precision tower's twin; see
+ * `vit_w_bf16`. */
+extern "C" __global__ void kernel_vit_layer_norm(
+        const struct vit_args_layer_norm args,
+        float *out,
+        const float *in,
+        const unsigned short *__restrict__ weight,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_layer_norm_body<vit_w_bf16>(args, out, in, weight, bias);
+}
+
+extern "C" __global__ void kernel_vit_layer_norm_f16(
+        const struct vit_args_layer_norm args,
+        float *out,
+        const float *in,
+        const unsigned short *__restrict__ weight,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_layer_norm_body<vit_w_f16>(args, out, in, weight, bias);
 }
 
 /* The blocks' activation, applied in place to a feed-forward row.

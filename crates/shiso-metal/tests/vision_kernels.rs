@@ -139,3 +139,17 @@ fn a_source_row_past_the_block_leaves_the_embedding_alone() {
     let Some(gpu) = open() else { return };
     tower::a_source_row_past_the_block_leaves_the_embedding_alone(&gpu);
 }
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_half_precision_gemm_agrees_with_a_row_times_column_loop() {
+    let Some(gpu) = open() else { return };
+    tower::the_half_precision_gemm_agrees_with_a_row_times_column_loop(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_half_precision_normalization_agrees_with_the_same_oracle() {
+    let Some(gpu) = open() else { return };
+    tower::the_half_precision_normalization_agrees_with_the_same_oracle(&gpu);
+}
