@@ -228,21 +228,51 @@ async fn post_json(
     )
 }
 
+/// GETs `/v1/models` and reads the listed ids.
+async fn model_ids(state: Arc<AppState>) -> Vec<String> {
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("builds"),
+        )
+        .await
+        .expect("the router answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body reads");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+    body["data"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter_map(|entry| entry["id"].as_str())
+        .map(str::to_owned)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // The brief's two acceptance tests.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn images_endpoint_returns_503_when_no_image_model() {
-    let state = Arc::new(AppState::without_language_model());
-    let (status, body) = post_json(
-        state,
-        "/v1/images/generations",
-        json!({"prompt": "a futuristic city"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["error"]["code"], "image_model_not_loaded", "{body}");
+    // All three spellings of the route are one handler and answer alike:
+    // a well-formed request this server could have run, refused because
+    // no generator is loaded.
+    for uri in ["/images", "/v1/images", "/v1/images/generations"] {
+        let state = Arc::new(AppState::without_language_model());
+        let (status, body) =
+            post_json(state, uri, json!({"prompt": "a futuristic city"})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        assert_eq!(
+            body["error"]["code"],
+            "image_model_not_loaded",
+            "{uri}: {body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -791,29 +821,27 @@ async fn a_stream_that_fails_after_its_first_image_ends_with_an_error_frame() {
 #[tokio::test]
 async fn the_model_listing_names_the_image_model() {
     let (state, _log) = state_with_mock(false);
-    let response = build_router(state)
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .body(Body::empty())
-                .expect("builds"),
-        )
-        .await
-        .expect("the router answers");
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("the body reads");
-    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
-    let ids: Vec<&str> = body["data"]
-        .as_array()
-        .expect("a list")
-        .iter()
-        .filter_map(|entry| entry["id"].as_str())
-        .collect();
+    let ids = model_ids(state).await;
     assert!(
-        ids.contains(&"mock-flux"),
-        "the image model is listed: {body}"
+        ids.iter().any(|id| id == "mock-flux"),
+        "the image model is listed: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_model_listing_names_no_image_model_when_none_is_loaded() {
+    // The listing is how a client discovers what to name in `model`, so
+    // the mirror of the test above matters just as much: with no generator
+    // loaded, no image id may be offered for a request to name.
+    let state = Arc::new(AppState::without_language_model());
+    let ids = model_ids(state).await;
+    assert!(
+        !ids.iter().any(|id| id.contains("flux")),
+        "no image model is loaded, so none is listed: {ids:?}"
+    );
+    assert!(
+        ids.is_empty(),
+        "this state loads no model of any kind: {ids:?}"
     );
 }
 
