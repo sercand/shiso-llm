@@ -93,8 +93,9 @@ fn bridge_python_methods(
                     "lstrip" => text.trim_start_matches(|c| set.contains(c)),
                     _ => text.trim_end_matches(|c| set.contains(c)),
                 },
-                // Python's no-argument form strips whitespace; an empty
-                // character set is a no-op, matching `strip('')`.
+                // Python's no-argument form strips whitespace. `strip('')`
+                // is a no-op there, but no template in the wild passes an
+                // empty set, so the empty set falls in with whitespace.
                 _ => match method {
                     "strip" => text.trim(),
                     "lstrip" => text.trim_start(),

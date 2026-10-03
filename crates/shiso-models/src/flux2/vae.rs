@@ -215,8 +215,9 @@ impl Vae {
         };
         // The reference names the attention output projection `to_out.0`
         // (a Sequential); an export that flattened it may carry the upstream
-        // `out` instead. Try the reference spelling first, fall back to the
-        // upstream one, and let a miss on both surface as `to_out.0`'s error.
+        // `out` instead. Try the reference spelling first and fall back to
+        // the upstream one; if neither is present the missing-tensor error
+        // names `out`, the last spelling tried.
         let out_base = if store.contains(&format!("{attn_base}to_out.0.weight")) {
             "to_out.0"
         } else {

@@ -374,7 +374,8 @@ fn find_transformer_weights(path: &Path) -> Result<PathBuf, ImageGenError> {
     Err(ImageGenError::Checkpoint(format!(
         "no safetensors file under {} carries the upstream transformer tensor \
          '{SIGNATURE_TENSOR}'; found [{}], which is not the upstream tensor layout \
-         (diffusers-name conversions are not supported)",
+         (diffusers-name conversions are not supported) — point the model path at \
+         the upstream-named single-file export instead",
         path.display(),
         candidates
             .iter()
