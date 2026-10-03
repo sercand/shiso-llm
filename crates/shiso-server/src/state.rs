@@ -112,6 +112,12 @@ pub struct AppState {
     pub memory: Option<MemorySource>,
     /// The transcription service, when a recognizer is loaded.
     pub audio: Option<crate::audio::AudioService>,
+    /// The image generation service, when a generator is loaded.
+    ///
+    /// Handlers never touch the generator itself; they reach this through
+    /// [`AppState::image`], which answers the typed "no image model" error
+    /// for a server that serves language or transcription alone.
+    pub image: Option<crate::image::ImageService>,
 }
 
 impl AppState {
@@ -132,6 +138,7 @@ impl AppState {
             sampling_preset: shiso_core::SamplingParams::neutral(),
             memory: None,
             audio: None,
+            image: None,
         }
     }
 
@@ -153,6 +160,7 @@ impl AppState {
             sampling_preset: shiso_core::SamplingParams::neutral(),
             memory: None,
             audio: None,
+            image: None,
         }
     }
 
@@ -161,6 +169,22 @@ impl AppState {
     pub fn with_audio(mut self, audio: crate::audio::AudioService) -> Self {
         self.audio = Some(audio);
         self
+    }
+
+    /// The same state with the image generation service attached.
+    #[must_use]
+    pub fn with_image(mut self, image: crate::image::ImageService) -> Self {
+        self.image = Some(image);
+        self
+    }
+
+    /// The image queue.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::NoImageModel`] when no image generator is loaded.
+    pub fn image(&self) -> Result<&crate::image::ImageService, AppError> {
+        self.image.as_ref().ok_or(AppError::NoImageModel)
     }
 
     /// The engine queue.

@@ -30,6 +30,7 @@ pub mod cli;
 pub mod decision;
 pub mod error;
 pub mod ids;
+pub mod image;
 pub mod media;
 pub mod media_cache;
 pub mod model_factory;
@@ -113,6 +114,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // memory must see their weights already resident, or it takes the memory
     // they then load into.
     let audio = boot_audio(&args)?;
+    // The image model loads before the language model for the same reason the
+    // speech models do: a KV pool sized to a share of free device memory must
+    // see its weights already resident.
+    let image = boot_image(&args)?;
     let (mut state, engine_thread) = match args.model.as_deref() {
         Some(model) => {
             let (state, join) = boot_language_model(&args, model)?;
@@ -122,6 +127,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     };
     if let Some(audio) = audio {
         state = state.with_audio(audio);
+    }
+    if let Some(image) = image {
+        state = state.with_image(image);
     }
 
     shutdown::install();
@@ -237,6 +245,56 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
         max_context_ids: args.asr_max_context_tokens,
     })
     .context("starting the audio worker")?;
+    Ok(Some(service))
+}
+
+/// Opens the image generation model and starts its worker, when
+/// `--image-model` was given.
+///
+/// On a backend instance of its own: a device that records the language
+/// model's launches for replay must not find a diffusion step's launches in
+/// the recording. The worker thread runs until every handle to the service is
+/// dropped, which is when the server stops.
+///
+/// # Errors
+///
+/// A checkpoint that will not load, an asset the locator could not find, or
+/// a device that will not open.
+// `Ok(None)` is a server without image generation: no `--image-model` was given.
+pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService>> {
+    let Some(path) = args.image_model.as_deref() else {
+        return Ok(None);
+    };
+    let backend = open_image_backend(args)?;
+    let started = std::time::Instant::now();
+    let desc = shiso_models::flux2::config::ImageModelDesc {
+        model_path: path.to_path_buf(),
+        text_encoder_path: args.image_text_encoder.clone(),
+        vae_path: args.image_vae.clone(),
+        tokenizer_path: args.image_tokenizer.clone(),
+        assets_dir: args.image_assets_dir.clone(),
+    };
+    let generator = shiso_models::image_registry::open_image_generator(&desc, &backend)
+        .with_context(|| format!("loading image model at {}", path.display()))?;
+    // Every weight this process will read for generation is resident now, so
+    // whatever the backend kept to make those imports fast can go.
+    backend.finish_imports();
+    let model_id = args
+        .image_model_id
+        .clone()
+        .unwrap_or_else(|| generator.model_id().to_string());
+    tracing::info!(
+        path = %path.display(),
+        id = %model_id,
+        seconds = started.elapsed().as_secs_f64(),
+        "the image model is resident"
+    );
+    let service = image::ImageService::start(image::ImageServiceDesc {
+        generator,
+        model_id,
+        max_queue: args.image_max_queue,
+    })
+    .context("starting image service worker")?;
     Ok(Some(service))
 }
 
@@ -700,6 +758,29 @@ fn open_audio_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::B
 /// As [`open_backend`]: this build has no device for the speech models.
 #[cfg(not(any(feature = "metal", feature = "cuda")))]
 fn open_audio_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+    open_backend(args)
+}
+
+/// Opens the backend instance the image generation model runs on: the same
+/// device, a command stream of its own, and no launch recording.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn open_image_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+    open_backend(args)
+}
+
+/// Opens the backend instance the image generation model runs on. Decode
+/// graphs stay off here: a diffusion step is never replayed.
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+fn open_image_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+    let options = shiso_cuda::CudaOptions::default().with_decode_graphs(false);
+    let backend = shiso_cuda::CudaBackend::new(0, options)
+        .context("opening the CUDA device for the image generation model")?;
+    Ok(backend)
+}
+
+/// As [`open_backend`]: this build has no device for the image generation model.
+#[cfg(not(any(feature = "metal", feature = "cuda")))]
+fn open_image_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
     open_backend(args)
 }
 

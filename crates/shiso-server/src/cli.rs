@@ -498,6 +498,42 @@ pub struct ServeArgs {
     /// family); every chunk's prefill carries them.
     #[arg(long, env = "SHISO_ASR_MAX_CONTEXT_TOKENS", default_value_t = 256)]
     pub asr_max_context_tokens: usize,
+    /// Image generation model to serve: a checkpoint file or a checkpoint
+    /// directory. Serves the image generation routes.
+    #[arg(long, env = "SHISO_IMAGE_MODEL")]
+    pub image_model: Option<PathBuf>,
+    /// The name the image generator answers to on the wire. Defaults to the
+    /// name the loaded checkpoint reports for itself.
+    #[arg(long, env = "SHISO_IMAGE_MODEL_ID")]
+    pub image_model_id: Option<String>,
+    /// Directory holding shared image assets (`text_encoder`, `vae`,
+    /// `tokenizer`) when they are not collocated with `--image-model`.
+    #[arg(long, env = "SHISO_IMAGE_ASSETS_DIR")]
+    pub image_assets_dir: Option<PathBuf>,
+    /// Explicit path to the text encoder weights when they are split from
+    /// `--image-model`. Overrides where the locator would otherwise look.
+    #[arg(long, env = "SHISO_IMAGE_TEXT_ENCODER")]
+    pub image_text_encoder: Option<PathBuf>,
+    /// Explicit path to the VAE weights when they are split from
+    /// `--image-model`. Overrides where the locator would otherwise look.
+    #[arg(long, env = "SHISO_IMAGE_VAE")]
+    pub image_vae: Option<PathBuf>,
+    /// Explicit path to the tokenizer when it is split from `--image-model`.
+    /// Overrides where the locator would otherwise look.
+    #[arg(long, env = "SHISO_IMAGE_TOKENIZER")]
+    pub image_tokenizer: Option<PathBuf>,
+    /// Image requests that may wait in the queue beyond the one generating;
+    /// the next is refused with a 503 a retry can fix.
+    #[arg(long, env = "SHISO_IMAGE_MAX_QUEUE", default_value_t = 16)]
+    pub image_max_queue: usize,
+    /// Denoising steps a request that names none gets. More is slower and,
+    /// past the point the checkpoint was distilled for, not better.
+    #[arg(long, env = "SHISO_IMAGE_DEFAULT_STEPS", default_value_t = 4)]
+    pub image_default_steps: u32,
+    /// The image size a request that names none gets, as `WxH`
+    /// (e.g. 1024x1024). Both sides must be divisible by 16.
+    #[arg(long, env = "SHISO_IMAGE_DEFAULT_SIZE", default_value = "1024x1024")]
+    pub image_default_size: String,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -546,8 +582,8 @@ pub enum ConfigError {
         /// The path as it was given.
         path: String,
     },
-    /// Neither a language model nor a recognizer was named.
-    #[error("nothing to serve: give --model, --asr-model, or both")]
+    /// Neither a language model, a recognizer, nor an image model was named.
+    #[error("nothing to serve: give --model, --asr-model, or --image-model")]
     NothingToServe,
     /// A diarizer was named with no recognizer to attribute speech from.
     #[error("--diarization-model needs --asr-model: a diarizer labels a transcript")]
@@ -671,9 +707,9 @@ impl ServeArgs {
         // model list is empty answers every request with "no such model". The
         // explicit name is the escape hatch: an operator who supplied one has
         // already answered the question this check asks.
-        match (&self.model, &self.asr_model) {
-            (None, None) => return Err(ConfigError::NothingToServe),
-            (Some(model), _) if self.model_name.is_none() && model.file_stem().is_none() => {
+        match (&self.model, &self.asr_model, &self.image_model) {
+            (None, None, None) => return Err(ConfigError::NothingToServe),
+            (Some(model), _, _) if self.model_name.is_none() && model.file_stem().is_none() => {
                 return Err(ConfigError::NamelessModel {
                     path: model.display().to_string(),
                 });
@@ -697,6 +733,19 @@ impl ServeArgs {
         if self.asr_max_context_tokens == 0 {
             return Err(ConfigError::Zero {
                 flag: "asr-max-context-tokens",
+            });
+        }
+        if self.image_max_queue == 0 {
+            return Err(ConfigError::Zero {
+                flag: "image-max-queue",
+            });
+        }
+        // A generation with no steps has nothing to denoise: the pipeline
+        // refuses it by name, and an operator who set the default to zero
+        // should hear about it at boot rather than on the first request.
+        if self.image_default_steps == 0 {
+            return Err(ConfigError::Zero {
+                flag: "image-default-steps",
             });
         }
         // A head with no depth is refused here: it is a gigabyte of weights
