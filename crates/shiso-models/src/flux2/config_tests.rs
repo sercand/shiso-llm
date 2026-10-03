@@ -74,7 +74,7 @@ fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[u64])]) {
 }
 
 /// The signature tensors plus two double blocks and one single block, in
-/// the given dtype, under the given file name.
+/// `BF16`, under the given file name.
 fn write_transformer(dir: &Path, file_name: &str, dtype: &str) -> PathBuf {
     let path = dir.join(file_name);
     write_safetensors(
@@ -160,6 +160,75 @@ fn disjoint_shards_of_one_export_all_join_the_selection() {
     let located = locate_and_inspect(&desc_for(dir.path())).expect("selection");
     assert_eq!(located.weight_files.len(), 2);
     assert_eq!(located.params.depth, 3);
+}
+
+#[test]
+fn a_config_naming_fewer_blocks_than_the_tensors_carry_is_refused() {
+    // The silent truncation this cross-check exists to stop: the config
+    // names one double block, the tensors carry two.
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_transformer(dir.path(), "model.safetensors", "BF16");
+    write_transformer_config(dir.path(), 1, 1);
+
+    let err = locate_and_inspect(&desc_for(dir.path())).expect_err("depth mismatch refuses");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("double_blocks") && msg.contains("refusing"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn a_checkpoint_with_no_reachable_transformer_config_is_refused_by_value() {
+    // No config anywhere: the head split, RoPE parameterization and MLP
+    // ratio are not derivable from shapes, so the refusal must name them
+    // rather than guess.
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_transformer(dir.path(), "model.safetensors", "BF16");
+
+    let err = locate_and_inspect(&desc_for(dir.path())).expect_err("missing config refuses");
+    let msg = err.to_string();
+    for value in [
+        "num_attention_heads",
+        "axes_dims_rope",
+        "rope_theta",
+        "mlp_ratio",
+    ] {
+        assert!(msg.contains(value), "refusal must name {value}: {msg}");
+    }
+}
+
+#[test]
+fn an_unparsable_transformer_config_is_refused_not_guessed_past() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_transformer(dir.path(), "model.safetensors", "BF16");
+    let transformer = dir.path().join("transformer");
+    std::fs::create_dir_all(&transformer).expect("create transformer dir");
+    std::fs::write(transformer.join("config.json"), "{ not json").expect("write config");
+
+    let err = locate_and_inspect(&desc_for(dir.path())).expect_err("broken config refuses");
+    assert!(err.to_string().contains("parsing"), "{err}");
+}
+
+#[test]
+fn the_config_is_found_through_assets_dir_when_the_model_dir_has_none() {
+    // The FP8 export layout: weights in one directory, the transformer
+    // config only in the BF16 tree named by `assets_dir`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let weights = dir.path().join("fp8");
+    std::fs::create_dir(&weights).expect("create fp8 dir");
+    write_transformer(&weights, "model.safetensors", "F8_E4M3");
+    let assets = dir.path().join("bf16");
+    write_transformer_config(&assets, 2, 1);
+    for asset in ["text_encoder", "vae", "tokenizer"] {
+        std::fs::create_dir(weights.join(asset)).expect("create asset dir");
+    }
+
+    let mut desc = desc_for(&weights);
+    desc.assets_dir = Some(assets);
+    let located = locate_and_inspect(&desc).expect("assets_dir config");
+    assert_eq!(located.params.num_heads, 2);
+    assert!(located.params.is_fp8);
 }
 
 #[test]

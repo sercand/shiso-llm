@@ -14,13 +14,6 @@ use serde::Deserialize;
 use shiso_modelfile::st_header::{RawTensor, Shard, StDType};
 use shiso_vision::generator::ImageGenError;
 
-/// Invariant mathematical constants for the FLUX.2 4-axis `RoPE` parameterization.
-pub const DEFAULT_AXES_DIM: [usize; 4] = [32, 32, 32, 32];
-/// Base theta frequency for rotary positional embeddings.
-pub const DEFAULT_ROPE_THETA: f32 = 2000.0;
-/// Default `SwiGLU` feedforward expansion ratio.
-pub const DEFAULT_MLP_RATIO: f32 = 3.0;
-
 /// Hyperparameters for the diffusion transformer architecture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Flux2Params {
@@ -87,6 +80,7 @@ pub struct ImageModelDesc {
 struct TransformerConfigFile {
     attention_head_dim: Option<usize>,
     axes_dims_rope: Option<[usize; 4]>,
+    guidance_embeds: Option<bool>,
     mlp_ratio: Option<f32>,
     num_attention_heads: Option<usize>,
     num_layers: Option<usize>,
@@ -180,60 +174,61 @@ pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGe
         .ok_or_else(|| ImageGenError::Checkpoint("txt_in.weight rank < 2".to_string()))?
         as usize;
 
-    // Check for optional transformer config file (the converted folder layout)
-    let config_opt = read_transformer_config(&desc.model_path);
+    // The transformer's own config document: required, because the head
+    // split, the RoPE parameterization and the MLP expansion are not
+    // derivable from tensor shapes, and read strictly, because a document
+    // that exists but cannot be parsed would otherwise fall through to
+    // guesses about the architecture it describes.
+    let config = read_transformer_config(&desc.model_path, desc.assets_dir.as_deref())?;
 
-    // Count double and single transformer blocks from tensor names
-    let depth = match config_opt.as_ref().and_then(|c| c.num_layers) {
-        Some(d) => d,
-        None => count_blocks_internal(tensor_map.keys().map(String::as_str), "double_blocks.")
-            .or_else(|| {
-                count_blocks_internal(
-                    tensor_map.keys().map(String::as_str),
-                    "transformer.double_blocks.",
-                )
-            })
-            .ok_or_else(|| {
-                ImageGenError::Checkpoint("no double_blocks found in safetensors".to_string())
-            })?,
-    };
+    // Count double and single transformer blocks from tensor names, and
+    // cross-check the config's counts against them: a config naming fewer
+    // blocks than the checkpoint carries would silently truncate the model
+    // (the extra blocks' weights never load), and one naming more would
+    // fail mid-load on a missing tensor with a less honest message.
+    let depth = reconcile_depth("double_blocks", config.num_layers, &tensor_map)?;
+    let depth_single_blocks =
+        reconcile_depth("single_blocks", config.num_single_layers, &tensor_map)?;
 
-    let depth_single_blocks = match config_opt.as_ref().and_then(|c| c.num_single_layers) {
-        Some(d) => d,
-        None => count_blocks_internal(tensor_map.keys().map(String::as_str), "single_blocks.")
-            .or_else(|| {
-                count_blocks_internal(
-                    tensor_map.keys().map(String::as_str),
-                    "transformer.single_blocks.",
-                )
-            })
-            .ok_or_else(|| {
-                ImageGenError::Checkpoint("no single_blocks found in safetensors".to_string())
-            })?,
-    };
-
-    let num_heads = config_opt
-        .as_ref()
-        .and_then(|c| c.num_attention_heads)
-        .unwrap_or(hidden_size / 128);
-    let axes_dim = config_opt
-        .as_ref()
-        .and_then(|c| c.axes_dims_rope)
-        .unwrap_or(DEFAULT_AXES_DIM);
-    let theta = config_opt
-        .as_ref()
-        .and_then(|c| c.rope_theta)
-        .unwrap_or(DEFAULT_ROPE_THETA);
-    let mlp_ratio = config_opt
-        .as_ref()
-        .and_then(|c| c.mlp_ratio)
-        .unwrap_or(DEFAULT_MLP_RATIO);
+    // The four values below have no tensor-shaped counterpart at all: the
+    // qkv width is `3 * hidden` for any head split, the RoPE table is built
+    // from the config's axes, and the MLP width check needs the ratio it
+    // was built with. A checkpoint whose config omits one is a checkpoint
+    // this loader cannot describe, so it is refused by the value's name.
+    let num_heads = config.num_attention_heads.ok_or_else(|| {
+        ImageGenError::Checkpoint(
+            "transformer config carries no num_attention_heads: the head split is not \
+             derivable from tensor shapes (the qkv width is 3 * hidden for any split)"
+                .to_string(),
+        )
+    })?;
+    let axes_dim = config.axes_dims_rope.ok_or_else(|| {
+        ImageGenError::Checkpoint(
+            "transformer config carries no axes_dims_rope: the 4-axis RoPE widths cannot \
+             be guessed without silently mis-rotating every head"
+                .to_string(),
+        )
+    })?;
+    let theta = config.rope_theta.ok_or_else(|| {
+        ImageGenError::Checkpoint(
+            "transformer config carries no rope_theta: the RoPE frequency table would be \
+             built on a guessed base"
+                .to_string(),
+        )
+    })?;
+    let mlp_ratio = config.mlp_ratio.ok_or_else(|| {
+        ImageGenError::Checkpoint(
+            "transformer config carries no mlp_ratio: the feedforward width cannot be \
+             checked against the block tensors without it"
+                .to_string(),
+        )
+    })?;
     // `attention_head_dim` is the one config number the tensor shapes do not
     // independently confirm (the qkv width is `3 * hidden` either way), so
     // cross-check it against the head split the blocks will use and refuse a
     // mismatch loudly rather than run a transformer whose heads are the wrong
     // width under a `RoPE` table sized for another.
-    if let Some(head_dim) = config_opt.as_ref().and_then(|c| c.attention_head_dim)
+    if let Some(head_dim) = config.attention_head_dim
         && head_dim * num_heads != hidden_size
     {
         return Err(ImageGenError::Checkpoint(format!(
@@ -249,6 +244,18 @@ pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGe
         .values()
         .any(|t| matches!(t.parsed_dtype("probe"), Ok(StDType::F8E4M3)));
 
+    // A guidance-conditioned checkpoint projects the guidance scale through
+    // `guidance_in.*` weights the transformer never loads. Either signal —
+    // the config flag or the tensors themselves — routes to the refusal in
+    // `DiT::load`, so such a checkpoint is refused by name instead of
+    // running unconditioned.
+    let use_guidance_embed = config.guidance_embeds.unwrap_or(false)
+        || tensor_map.keys().any(|name| {
+            name.strip_prefix("transformer.")
+                .unwrap_or(name)
+                .starts_with("guidance_in.")
+        });
+
     let params = Flux2Params {
         in_channels,
         context_in_dim,
@@ -259,7 +266,7 @@ pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGe
         axes_dim,
         theta,
         mlp_ratio,
-        use_guidance_embed: false,
+        use_guidance_embed,
         is_fp8,
     };
 
@@ -292,14 +299,110 @@ pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGe
     })
 }
 
-fn read_transformer_config(model_path: &Path) -> Option<TransformerConfigFile> {
-    let path = if model_path.is_dir() {
-        model_path.join("transformer").join("config.json")
+/// Reads the transformer's `config.json`: beside the checkpoint's own
+/// directory (or beside the weights file, when the model path names one),
+/// else beside `assets_dir` — the FP8 export ships no config of its own and
+/// reads the BF16 tree's through `--image-assets-dir`.
+///
+/// A document that exists but cannot be read or parsed is a refusal, not a
+/// miss to search past: the file describes the architecture, and silently
+/// continuing on guesses about a half-read document is how a loader runs a
+/// model it cannot describe. With no document reachable at all, the four
+/// values no tensor carries (`num_attention_heads`, `axes_dims_rope`,
+/// `rope_theta`, `mlp_ratio`) are named in the refusal.
+fn read_transformer_config(
+    model_path: &Path,
+    assets_dir: Option<&Path>,
+) -> Result<TransformerConfigFile, ImageGenError> {
+    let home = if model_path.is_dir() {
+        model_path.to_path_buf()
     } else {
-        model_path.parent()?.join("transformer").join("config.json")
+        model_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
     };
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    let mut tried = vec![home.join("transformer").join("config.json")];
+    if let Some(assets) = assets_dir {
+        let in_assets = assets.join("transformer").join("config.json");
+        if !tried.contains(&in_assets) {
+            tried.push(in_assets);
+        }
+    }
+    for path in &tried {
+        if !path.exists() {
+            continue;
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| ImageGenError::Checkpoint(format!("reading {}: {e}", path.display())))?;
+        return serde_json::from_str(&content)
+            .map_err(|e| ImageGenError::Checkpoint(format!("parsing {}: {e}", path.display())));
+    }
+    Err(ImageGenError::Checkpoint(format!(
+        "no transformer config.json reachable (searched {}); its num_attention_heads, \
+         axes_dims_rope, rope_theta and mlp_ratio are not derivable from tensor shapes, so \
+         the architecture cannot be read — point --image-assets-dir at a tree carrying \
+         transformer/config.json",
+        tried
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+/// Reads a component's own `config.json` document, refusing rather than
+/// substituting defaults: every real checkpoint carries these files beside
+/// its weights, and a missing or unparsable one means the loader would run
+/// the component with a shape nobody declared. Derivable-from-tensors
+/// fallbacks are a separate matter (pure inspection stays); a missing
+/// *document* is an error.
+pub(crate) fn read_component_config<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    component: &str,
+) -> Result<T, ImageGenError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        ImageGenError::Checkpoint(format!(
+            "{component} config {}: {e}; every {} checkpoint carries this document and no \
+             default may stand in for it",
+            path.display(),
+            component
+        ))
+    })?;
+    serde_json::from_str(&text)
+        .map_err(|e| ImageGenError::Checkpoint(format!("parsing {}: {e}", path.display())))
+}
+
+/// One block family's depth: the config's count cross-checked against the
+/// count the tensor names carry, with the pure-inspection count standing
+/// when the config names none.
+fn reconcile_depth(
+    prefix: &str,
+    config_depth: Option<usize>,
+    tensor_map: &HashMap<String, RawTensor>,
+) -> Result<usize, ImageGenError> {
+    let counted =
+        count_blocks_internal(tensor_map.keys().map(String::as_str), &format!("{prefix}."))
+            .or_else(|| {
+                count_blocks_internal(
+                    tensor_map.keys().map(String::as_str),
+                    &format!("transformer.{prefix}."),
+                )
+            });
+    match (config_depth, counted) {
+        (Some(config), Some(counted)) if config != counted => {
+            Err(ImageGenError::Checkpoint(format!(
+                "transformer config names {config} {prefix} blocks but the tensors carry \
+                 {counted}: refusing rather than loading a truncated or half-described model"
+            )))
+        }
+        (Some(config), _) => Ok(config),
+        (None, Some(counted)) => Ok(counted),
+        (None, None) => Err(ImageGenError::Checkpoint(format!(
+            "no {prefix} blocks found in safetensors and the config names none"
+        ))),
+    }
 }
 
 fn resolve_asset(

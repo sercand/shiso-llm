@@ -44,16 +44,6 @@ const MAX_TEXT_TOKENS: usize = 512;
 /// template emits a private-use codepoint of its own.
 const CONTENT_MARK: char = '\u{F000}';
 
-/// The turn structure used when the checkpoint ships no template of its own:
-/// Qwen3's chat format without the thinking switch.
-const DEFAULT_CHAT_TEMPLATE: &str = concat!(
-    "{% for message in messages %}",
-    "<|im_start|>{{ message['role'] }}\n",
-    "{{ message['content'] }}<|im_end|>\n",
-    "{% endfor %}",
-    "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
-);
-
 /// Answers the Python-shaped string methods a checkpoint's chat template
 /// calls (`startswith`, `split`, `strip('\n')`, ...) that the Rust engine
 /// exposes only as filters or not at all. Mirrors the server's tokenizer
@@ -186,7 +176,7 @@ impl Flux2KleinModel {
             .filter(|token| token.special)
             .map(|token| token.content)
             .collect();
-        let chat_template = load_chat_template(tokenizer_file.parent());
+        let chat_template = load_chat_template(tokenizer_file.parent())?;
 
         Ok(Self {
             model_id: if located.params.is_fp8 {
@@ -446,27 +436,44 @@ impl ImageGenerator for Flux2KleinModel {
 
 /// Reads the checkpoint's chat template: `chat_template.jinja` beside the
 /// tokenizer, else `tokenizer_config.json`'s `chat_template` (a string or an
-/// object with a `default`), else the built-in Qwen3 turn structure.
-fn load_chat_template(tokenizer_dir: Option<&Path>) -> String {
-    if let Some(dir) = tokenizer_dir {
-        if let Ok(text) = std::fs::read_to_string(dir.join("chat_template.jinja")) {
-            return text;
-        }
-        if let Ok(text) = std::fs::read_to_string(dir.join("tokenizer_config.json"))
-            && let Ok(document) = serde_json::from_str::<serde_json::Value>(&text)
-        {
-            match &document["chat_template"] {
-                serde_json::Value::String(template) => return template.clone(),
-                serde_json::Value::Object(map) => {
-                    if let Some(serde_json::Value::String(template)) = map.get("default") {
-                        return template.clone();
-                    }
+/// object with a `default`).
+///
+/// A checkpoint that carries neither is refused: the template decides the
+/// turn structure the text encoder was trained to read, and a built-in
+/// generic one would silently condition the transformer on markers the
+/// checkpoint's own vocabulary may not even carry. Every real checkpoint
+/// ships its template beside the tokenizer.
+fn load_chat_template(tokenizer_dir: Option<&Path>) -> Result<String, ImageGenError> {
+    let dir = tokenizer_dir.ok_or_else(|| {
+        ImageGenError::Checkpoint("the tokenizer path names no directory to read".to_string())
+    })?;
+    let jinja = dir.join("chat_template.jinja");
+    if jinja.exists() {
+        return std::fs::read_to_string(&jinja)
+            .map_err(|e| ImageGenError::Checkpoint(format!("reading {}: {e}", jinja.display())));
+    }
+    let config = dir.join("tokenizer_config.json");
+    if config.exists() {
+        let text = std::fs::read_to_string(&config)
+            .map_err(|e| ImageGenError::Checkpoint(format!("reading {}: {e}", config.display())))?;
+        let document: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| ImageGenError::Checkpoint(format!("parsing {}: {e}", config.display())))?;
+        match &document["chat_template"] {
+            serde_json::Value::String(template) => return Ok(template.clone()),
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::String(template)) = map.get("default") {
+                    return Ok(template.clone());
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
-    DEFAULT_CHAT_TEMPLATE.to_string()
+    Err(ImageGenError::Checkpoint(format!(
+        "no chat template found beside the tokenizer (searched {} and its \
+         tokenizer_config.json's chat_template); refusing to condition on a \
+         built-in template the checkpoint was not trained with",
+        jinja.display()
+    )))
 }
 
 /// Clamps a planar (3, height, width) f32 field in [0, 255] and encodes it

@@ -183,11 +183,25 @@ impl Vae {
     /// Opens the VAE component at `path`.
     pub(crate) fn load(path: &Path, ops: &Ops) -> Result<Self, ImageGenError> {
         let store = StStore::open(path)?;
-        let config: VaeConfig = read_json(&path.join("config.json")).unwrap_or(VaeConfig {
-            norm_num_groups: None,
-            batch_norm_eps: None,
-        });
-        let groups = config.norm_num_groups.unwrap_or(32);
+        // The config document is required, not optional: the group count is
+        // carried by no tensor, and a default would reshape every group
+        // norm in the decoder. The batch-norm epsilon may default (the
+        // reference trains with it); the document itself may not.
+        let config: VaeConfig =
+            super::config::read_component_config(&path.join("config.json"), "vae")?;
+        let groups = config.norm_num_groups.ok_or_else(|| {
+            ImageGenError::Checkpoint(
+                "vae/config.json carries no norm_num_groups: the group count is not \
+                 derivable from tensor shapes and a default would reshape every group norm"
+                    .to_string(),
+            )
+        })?;
+        if groups == 0 {
+            return Err(ImageGenError::Checkpoint(
+                "vae/config.json declares norm_num_groups 0; no field splits into zero groups"
+                    .to_string(),
+            ));
+        }
 
         let bn_mean = store.f32_vec("bn.running_mean")?;
         let bn_var = store.f32_vec("bn.running_var")?;
@@ -684,10 +698,4 @@ impl Vae {
         )?;
         Ok(out)
     }
-}
-
-/// Reads and parses a JSON document, answering `None` when it is absent.
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
 }

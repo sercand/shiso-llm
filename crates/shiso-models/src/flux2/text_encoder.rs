@@ -15,7 +15,8 @@
 //! from the layer norms, head counts from the projection widths, head
 //! dimension from the QK norms, depth by counting `model.layers.<n>.` names -
 //! and only `rope_theta` and the norm epsilon, which no tensor carries, come
-//! from the config document beside the weights.
+//! from the config document beside the weights. That document is required:
+//! a missing or unparsable one is refused, not defaulted.
 
 use std::path::Path;
 
@@ -79,18 +80,17 @@ impl TextEncoder {
     /// Opens the component at `path` and uploads every weight in its stored
     /// format (norms and biases widened to f32).
     #[expect(
-        clippy::cast_possible_truncation,
-        reason = "safetensors dims are element counts of model tensors; they fit usize on any supported target"
+        clippy::too_many_lines,
+        reason = "one component load: config read, shape-derived geometry with its refusals, then the per-layer weight upload, straight-line by construction"
     )]
     pub(crate) fn load(path: &Path, ops: &Ops) -> Result<Self, ImageGenError> {
         let store = StStore::open(path)?;
+        // The config document is required: `rope_theta` and `rms_norm_eps`
+        // are the two architecture numbers no tensor carries, and guessing
+        // them would rotate every head and renormalize every layer on a
+        // base nobody declared.
         let config: TextEncoderConfig =
-            path.join("config.json")
-                .pipe_read_json()
-                .unwrap_or(TextEncoderConfig {
-                    rope_theta: None,
-                    rms_norm_eps: None,
-                });
+            super::config::read_component_config(&path.join("config.json"), "text_encoder")?;
 
         let embed_entry = store.require("model.embed_tokens.weight")?;
         let hidden = usize::try_from(*embed_entry.shape.get(1).ok_or_else(|| {
@@ -117,23 +117,70 @@ impl TextEncoder {
             })?)
             .unwrap_or(usize::MAX)
         };
-        let q_heads = store
-            .require("model.layers.0.self_attn.q_proj.weight")?
-            .shape[0] as usize
-            / head_dim;
-        let kv_heads = store
-            .require("model.layers.0.self_attn.k_proj.weight")?
-            .shape[0] as usize
-            / head_dim;
-        let intermediate = store.require("model.layers.0.mlp.gate_proj.weight")?.shape[0] as usize;
+        if head_dim == 0 {
+            return Err(ImageGenError::Checkpoint(
+                "model.layers.0.self_attn.q_norm.weight declares a zero-wide head".to_string(),
+            ));
+        }
+        // Head counts come from the projection widths; a width that is not
+        // a whole number of heads, or a missing shape axis, is a malformed
+        // checkpoint and is refused rather than divided or indexed into a
+        // panic.
+        let head_count = |name: &str| -> Result<usize, ImageGenError> {
+            let rows =
+                *store.require(name)?.shape.first().ok_or_else(|| {
+                    ImageGenError::Checkpoint(format!("'{name}' has empty shape"))
+                })?;
+            if rows % u64::try_from(head_dim).unwrap_or(u64::MAX) != 0 {
+                return Err(ImageGenError::Checkpoint(format!(
+                    "'{name}' is {rows} rows wide, not a whole number of {head_dim}-wide heads"
+                )));
+            }
+            Ok(
+                usize::try_from(rows / u64::try_from(head_dim).unwrap_or(u64::MAX))
+                    .unwrap_or(usize::MAX),
+            )
+        };
+        let q_heads = head_count("model.layers.0.self_attn.q_proj.weight")?;
+        let kv_heads = head_count("model.layers.0.self_attn.k_proj.weight")?;
+        if q_heads == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
+            return Err(ImageGenError::Checkpoint(format!(
+                "text encoder has {q_heads} query heads and {kv_heads} key/value heads; \
+                 the query count must be a positive multiple of the key/value count"
+            )));
+        }
+        let intermediate = usize::try_from(
+            *store
+                .require("model.layers.0.mlp.gate_proj.weight")?
+                .shape
+                .first()
+                .ok_or_else(|| {
+                    ImageGenError::Checkpoint(
+                        "model.layers.0.mlp.gate_proj.weight has empty shape".to_string(),
+                    )
+                })?,
+        )
+        .unwrap_or(usize::MAX);
         let params = TextEncoderParams {
             hidden,
             q_heads,
             kv_heads,
             head_dim,
             intermediate,
-            theta: config.rope_theta.unwrap_or(1_000_000.0),
-            rms_eps: config.rms_norm_eps.unwrap_or(1e-6),
+            theta: config.rope_theta.ok_or_else(|| {
+                ImageGenError::Checkpoint(
+                    "text_encoder/config.json carries no rope_theta: the RoPE frequency \
+                     table would be built on a guessed base"
+                        .to_string(),
+                )
+            })?,
+            rms_eps: config.rms_norm_eps.ok_or_else(|| {
+                ImageGenError::Checkpoint(
+                    "text_encoder/config.json carries no rms_norm_eps: every norm would \
+                     run on a guessed epsilon"
+                        .to_string(),
+                )
+            })?,
         };
 
         let embed = store.import(ops.backend(), "model.embed_tokens.weight")?;
@@ -397,17 +444,5 @@ impl TextEncoder {
             }
         }
         Ok(out)
-    }
-}
-
-/// Reads and parses a JSON document, answering `None` when it is absent.
-trait PipeReadJson {
-    fn pipe_read_json<T: serde::de::DeserializeOwned>(self) -> Option<T>;
-}
-
-impl PipeReadJson for std::path::PathBuf {
-    fn pipe_read_json<T: serde::de::DeserializeOwned>(self) -> Option<T> {
-        let text = std::fs::read_to_string(self).ok()?;
-        serde_json::from_str(&text).ok()
     }
 }
