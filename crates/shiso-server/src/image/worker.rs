@@ -49,8 +49,20 @@ pub(super) fn run_worker(desc: &ImageServiceDesc, mut rx: mpsc::Receiver<Queued>
         let outcome = match outcome {
             Ok(Ok(image)) => Ok(image),
             Ok(Err(error)) => Err(refuse(error)),
-            Err(_panic) => {
-                tracing::error!("an image generation panicked; the worker goes on");
+            Err(payload) => {
+                // The payload is whatever `panic!` was handed; the two
+                // string forms are almost all of it, and the named fallback
+                // keeps a non-string payload (a `panic_any` of some struct,
+                // say) from erasing the fact of the panic from the log.
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "panicked with non-string payload".to_owned());
+                tracing::error!(
+                    detail = detail.as_str(),
+                    "an image generation panicked; the worker goes on"
+                );
                 Err(AppError::internal(
                     "image generation panicked",
                     GeneratorPanicked,
