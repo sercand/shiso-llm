@@ -7,7 +7,7 @@
 //! or a path string, and a checkpoint missing a required tensor or asset is
 //! refused by name rather than patched with a fallback default.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -53,6 +53,11 @@ pub struct Flux2Params {
 pub struct Flux2Located {
     /// Resolved safetensors file holding transformer weights.
     pub weights_path: PathBuf,
+    /// The exact safetensors files the transformer store must open: the
+    /// selected file plus its disjoint shards, never a sibling file that
+    /// re-declares the same tensor names (a second export of the same
+    /// model, e.g. an FP8 copy beside the BF16 one).
+    pub weight_files: Vec<PathBuf>,
     /// Path to text encoder checkpoint or directory.
     pub text_encoder_path: PathBuf,
     /// Path to VAE checkpoint or directory.
@@ -89,6 +94,21 @@ struct TransformerConfigFile {
     rope_theta: Option<f32>,
 }
 
+/// The transformer weight files discovery settled on, with the union of
+/// their tensors already read off the headers.
+struct WeightSelection {
+    /// The file whose header carries the signature tensor.
+    primary: PathBuf,
+    /// The primary plus every same-directory file whose tensor names are
+    /// disjoint from it (its shards). A same-directory file that shares a
+    /// name is another export of the same model, not a shard, and is left
+    /// out rather than silently overriding the winner's tensors.
+    files: Vec<PathBuf>,
+    /// Every tensor of `files`, keyed by name. Disjoint by construction:
+    /// selection only admits files with no name in common with the set.
+    tensors: HashMap<String, RawTensor>,
+}
+
 /// Discovers model hyperparameters and precision by inspecting the checkpoint's
 /// safetensors tensor headers and config documents, never by path strings.
 ///
@@ -103,30 +123,21 @@ struct TransformerConfigFile {
     reason = "safetensors dims are element counts of model tensors; they fit usize on any supported target"
 )]
 pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGenError> {
-    let weights_path = find_transformer_weights(&desc.model_path)?;
-    // Index every shard in the resolved directory, not just the first: a
-    // multi-shard export may carry the signature tensor (or any FP8 weight)
-    // in a later shard, and the pipeline's weight store indexes the whole
-    // directory the same way, so inspecting a subset would refuse a
-    // checkpoint that then loads fine. `safetensors_in` lists root-level
-    // files only, so a checkpoint home that also carries `vae/` or
-    // `text_encoder/` subfolders never has their shards folded into the
-    // transformer store (or its dtype scan).
-    let dir = weights_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut tensor_map: HashMap<String, RawTensor> = HashMap::new();
-    for file in safetensors_in(dir) {
-        let (_shard, tensors) = Shard::open_untagged(&file).map_err(|e| {
-            ImageGenError::Checkpoint(format!("opening safetensors at {}: {e}", file.display()))
-        })?;
-        tensor_map.extend(tensors);
-    }
+    // Inspect exactly the files the selection admits, and hand that same
+    // set to the pipeline: a directory holding two exports of the model (a
+    // BF16 file beside an FP8 one) must not mix their tensors into one
+    // dtype scan, one depth count, or one weight store. A multi-shard
+    // export may carry the signature tensor in any shard, so selection
+    // reads every candidate's header and admits every shard whose names
+    // are disjoint from the winner's.
+    let selection = select_weight_files(&desc.model_path)?;
+    let weights_path = selection.primary;
+    let weight_files = selection.files;
+    let tensor_map = selection.tensors;
     if tensor_map.is_empty() {
         return Err(ImageGenError::Checkpoint(format!(
             "no safetensors tensors found in {}",
-            dir.display()
+            weights_path.display()
         )));
     }
 
@@ -231,7 +242,9 @@ pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGe
         )));
     }
 
-    // Detect FP8 precision by scanning all tensors for any F8_E4M3 weight
+    // Detect FP8 precision by scanning the selected tensors for any
+    // F8_E4M3 weight. The scan sees only the selected files, so an FP8
+    // export beside the selected BF16 one cannot flip this flag.
     let is_fp8 = tensor_map
         .values()
         .any(|t| matches!(t.parsed_dtype("probe"), Ok(StDType::F8E4M3)));
@@ -271,6 +284,7 @@ pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGe
 
     Ok(Flux2Located {
         weights_path,
+        weight_files,
         text_encoder_path,
         vae_path,
         tokenizer_path,
@@ -342,17 +356,29 @@ pub(crate) fn count_blocks_internal<'a>(
 /// tensor layout (the alternative export naming), which the loader refuses.
 const SIGNATURE_TENSOR: &str = "img_in.weight";
 
-/// Picks the safetensors file holding the transformer weights by inspecting
+/// Picks the safetensors files holding the transformer weights by inspecting
 /// headers, never names-by-convention: root-level files are tried before a
-/// `transformer/` subfolder, and the winner is the first whose header carries
-/// [`SIGNATURE_TENSOR`] (or its `transformer.`-prefixed spelling). A directory
-/// whose candidates all lack it is refused by file name: a converted-folder
-/// export would index every tensor under names the loader never asks for and
-/// either fail mid-load or, worse, run a half-populated model, so guessing
-/// from the directory shape is not an option.
-fn find_transformer_weights(path: &Path) -> Result<PathBuf, ImageGenError> {
+/// `transformer/` subfolder, and the primary is the first whose header
+/// carries [`SIGNATURE_TENSOR`] (or its `transformer.`-prefixed spelling).
+/// Every same-directory file whose tensor names are disjoint from the
+/// primary's is one of its shards and joins the selection; a same-directory
+/// file that shares a tensor name is another export of the same model — a
+/// BF16 file beside an FP8 one — and is left out, because indexing both
+/// would resolve each shared name to whichever file was read last and
+/// silently load the wrong weights. A directory whose candidates all lack
+/// the signature is refused by file name: a converted-folder export would
+/// index every tensor under names the loader never asks for and either fail
+/// mid-load or, worse, run a half-populated model, so guessing from the
+/// directory shape is not an option.
+fn select_weight_files(path: &Path) -> Result<WeightSelection, ImageGenError> {
     if path.is_file() {
-        return Ok(path.to_path_buf());
+        let (_shard, tensors) = Shard::open_untagged(path)
+            .map_err(|e| ImageGenError::Checkpoint(format!("opening {}: {e}", path.display())))?;
+        return Ok(WeightSelection {
+            primary: path.to_path_buf(),
+            files: vec![path.to_path_buf()],
+            tensors: tensors.into_iter().collect(),
+        });
     }
     let mut candidates = safetensors_in(path);
     candidates.extend(safetensors_in(&path.join("transformer")));
@@ -362,29 +388,65 @@ fn find_transformer_weights(path: &Path) -> Result<PathBuf, ImageGenError> {
             path.display()
         )));
     }
+    let mut opened = Vec::with_capacity(candidates.len());
     for file in &candidates {
         let (_shard, tensors) = Shard::open_untagged(file)
             .map_err(|e| ImageGenError::Checkpoint(format!("opening {}: {e}", file.display())))?;
-        if tensors.iter().any(|(name, _)| {
-            name == SIGNATURE_TENSOR || name == &format!("transformer.{SIGNATURE_TENSOR}")
-        }) {
-            return Ok(file.clone());
-        }
+        opened.push((file.clone(), tensors));
     }
-    Err(ImageGenError::Checkpoint(format!(
-        "no safetensors file under {} carries the upstream transformer tensor \
-         '{SIGNATURE_TENSOR}'; found [{}], which is not the upstream tensor layout \
-         (the converted folder layout is not supported) — point the model path at \
-         the upstream-named single-file export instead",
-        path.display(),
-        candidates
+    let winner = opened
+        .iter()
+        .position(|(_file, tensors)| {
+            tensors.iter().any(|(name, _)| {
+                name == SIGNATURE_TENSOR || name == &format!("transformer.{SIGNATURE_TENSOR}")
+            })
+        })
+        .ok_or_else(|| {
+            ImageGenError::Checkpoint(format!(
+                "no safetensors file under {} carries the upstream transformer tensor \
+                 '{SIGNATURE_TENSOR}'; found [{}], which is not the upstream tensor layout \
+                 (the converted folder layout is not supported) — point the model path at \
+                 the upstream-named single-file export instead",
+                path.display(),
+                candidates
+                    .iter()
+                    .map(|p| p
+                        .file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned()))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ))
+        })?;
+    let (primary, winner_tensors) = opened.swap_remove(winner);
+    let primary_dir = primary
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut names: HashSet<String> = winner_tensors.iter().map(|(n, _)| n.clone()).collect();
+    let mut tensors: HashMap<String, RawTensor> = winner_tensors.into_iter().collect();
+    let mut files = vec![primary.clone()];
+    for (file, shard_tensors) in opened {
+        // Only same-directory files can be this export's shards; a
+        // `transformer/` subfolder is a different layout, not a shard set.
+        if file.parent().filter(|p| !p.as_os_str().is_empty()) != Some(primary_dir) {
+            continue;
+        }
+        if shard_tensors
             .iter()
-            .map(|p| p
-                .file_name()
-                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )))
+            .any(|(name, _)| names.contains(String::as_str(name)))
+        {
+            continue;
+        }
+        names.extend(shard_tensors.iter().map(|(n, _)| n.clone()));
+        files.push(file);
+        tensors.extend(shard_tensors);
+    }
+    files.sort();
+    Ok(WeightSelection {
+        primary,
+        files,
+        tensors,
+    })
 }
 
 /// Every `*.safetensors` file in `dir`, sorted so a multi-shard export always

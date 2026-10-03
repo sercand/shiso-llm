@@ -153,28 +153,12 @@ impl Flux2KleinModel {
             )));
         }
 
-        // A multi-shard converted export keeps the transformer's shards in
-        // one directory; index the whole directory when there is more than
-        // the one inspected file, so no block's weights are missing.
-        let dir = located
-            .weights_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
-        let shard_count = std::fs::read_dir(&dir).map_or(0, |rd| {
-            rd.flatten()
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
-                })
-                .count()
-        });
-        let store = if shard_count > 1 {
-            StStore::open(&dir)?
-        } else {
-            StStore::open(&located.weights_path)?
-        };
+        // Open exactly the files discovery selected - never the parent
+        // directory. Indexing the directory would fold a second export
+        // beside the selected weights (an FP8 copy of the same tensors)
+        // into the store, where each shared name resolves to whichever
+        // shard was indexed last: the wrong weights, silently.
+        let store = StStore::open_files(&located.weight_files)?;
         let dit = DiT::load(&store, &ops, &located.params)?;
         if dit.out_width() != located.params.in_channels {
             return Err(ImageGenError::Checkpoint(format!(

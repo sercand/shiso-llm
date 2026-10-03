@@ -8,7 +8,7 @@
 //! an intermediate buffer of ours.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use half::bf16;
@@ -47,6 +47,18 @@ pub(crate) struct StStore {
 impl StStore {
     /// Opens `path` (a `.safetensors` file, or a directory holding them) and
     /// indexes every tensor across every shard.
+    ///
+    /// Opening a directory is right only for a component home that holds
+    /// exactly one export: the transformer's store goes through
+    /// [`StStore::open_files`] with the set discovery selected, so a second
+    /// export in the same directory cannot reach this path for the
+    /// transformer at all.
+    ///
+    /// Every span the index carries is validated by the shard header parser
+    /// (`shiso-modelfile::st_header::check_raw`): a declared shape whose
+    /// product times the dtype size disagrees with the tensor's byte range,
+    /// or a range that runs past the file, is refused at open — before any
+    /// weight is imported — so no `Lin::load` below re-checks it.
     pub(crate) fn open(path: &Path) -> Result<Self, ImageGenError> {
         let files = if path.is_dir() {
             let mut found: Vec<_> = std::fs::read_dir(path)
@@ -60,15 +72,26 @@ impl StStore {
         } else {
             vec![path.to_path_buf()]
         };
+        Self::open_files(&files)
+    }
+
+    /// Opens exactly these shard files, refusing a tensor name that two of
+    /// them carry.
+    ///
+    /// A multi-shard export splits tensors across files with disjoint names;
+    /// a name in two files means two exports of the same tensors sit in one
+    /// directory (a BF16 file beside an FP8 one), and indexing both would
+    /// resolve every shared name to whichever file was read last — the wrong
+    /// weights, silently. The refusal names the tensor and both files.
+    pub(crate) fn open_files(files: &[PathBuf]) -> Result<Self, ImageGenError> {
         if files.is_empty() {
-            return Err(ImageGenError::Checkpoint(format!(
-                "no safetensors weight file found in {}",
-                path.display()
-            )));
+            return Err(ImageGenError::Checkpoint(
+                "no safetensors weight file was selected".to_string(),
+            ));
         }
         let mut shards = Vec::with_capacity(files.len());
-        let mut entries = HashMap::new();
-        for file in &files {
+        let mut entries: HashMap<String, StEntry> = HashMap::new();
+        for file in files {
             let (shard, tensors) = Shard::open_untagged(file).map_err(|e| {
                 ImageGenError::Checkpoint(format!("opening {}: {e}", file.display()))
             })?;
@@ -79,6 +102,15 @@ impl StStore {
                     .parsed_dtype(&name)
                     .map_err(|e| ImageGenError::Checkpoint(format!("{name}: {e}")))?;
                 let [start, end] = raw.data_offsets;
+                if let Some(clash) = entries.get(&name) {
+                    return Err(ImageGenError::Checkpoint(format!(
+                        "tensor '{name}' is declared by both {} and {}; a weight set must \
+                         hold either one export's shards (disjoint names) or a single \
+                         export, not two exports side by side",
+                        files[clash.shard].display(),
+                        file.display()
+                    )));
+                }
                 entries.insert(
                     name,
                     StEntry {
