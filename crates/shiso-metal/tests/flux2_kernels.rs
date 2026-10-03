@@ -70,6 +70,7 @@ struct GemmArgs {
     m: u32,
     n: u32,
     k: u32,
+    has_bias: u32,
 }
 
 #[repr(C)]
@@ -192,6 +193,7 @@ struct Conv2dArgs {
     k_w: u32,
     stride: u32,
     pad: u32,
+    has_bias: u32,
 }
 
 #[repr(C)]
@@ -404,28 +406,34 @@ fn expect_gemm(
     out
 }
 
-/// Launches one GEMM with the driver's geometry and reads the result back.
-/// `shape` is `(m, n, k)`.
-fn run_gemm(
-    b: &Arc<dyn Backend>,
+/// One GEMM launch with the driver's geometry. `has_bias` is the driver's
+/// presence flag, set from whether a real bias was bound rather than from
+/// the values.
+#[derive(Clone, Copy)]
+struct GemmRun<'a> {
     entry: &'static str,
-    weight: DeviceView<'_>,
+    weight: DeviceView<'a>,
     scale: f32,
-    bias: DeviceView<'_>,
-    input: &[f32],
+    bias: DeviceView<'a>,
+    has_bias: bool,
+    input: &'a [f32],
     shape: (usize, usize, usize),
-) -> Vec<f32> {
-    let (m, n, k) = shape;
-    let in_buf = upload_f32(b, input);
+}
+
+/// Launches one GEMM and reads the result back. `shape` is `(m, n, k)`.
+fn run_gemm(b: &Arc<dyn Backend>, run: GemmRun<'_>) -> Vec<f32> {
+    let (m, n, k) = run.shape;
+    let in_buf = upload_f32(b, run.input);
     let out_buf = alloc(b, (m * n * 4) as u64).expect("alloc out");
     let args = GemmArgs {
         m: m as u32,
         n: n as u32,
         k: k as u32,
+        has_bias: u32::from(run.has_bias),
     };
     launch(
         b,
-        entry,
+        run.entry,
         Extent3::new(
             grid_for(n as u32, GEMM_TILE),
             grid_for(m as u32, GEMM_TILE),
@@ -436,9 +444,9 @@ fn run_gemm(
             KernelArg::Bytes(bytes_of(&args)),
             KernelArg::Buffer(out_buf.view()),
             KernelArg::Buffer(in_buf.view()),
-            KernelArg::Buffer(weight),
-            KernelArg::F32(scale),
-            KernelArg::Buffer(bias),
+            KernelArg::Buffer(run.weight),
+            KernelArg::F32(run.scale),
+            KernelArg::Buffer(run.bias),
         ],
     );
     read_f32(b, out_buf.view(), m * n)
@@ -464,12 +472,15 @@ fn gemm_bf16_is_the_transposed_product_scaled_and_biased() {
     let bias_buf = upload_f32(&b, &bias);
     let got = run_gemm(
         &b,
-        "kernel_flux2_gemm_bf16",
-        wbuf.view(),
-        scale,
-        bias_buf.view(),
-        &input,
-        (m, n, k),
+        GemmRun {
+            entry: "kernel_flux2_gemm_bf16",
+            weight: wbuf.view(),
+            scale,
+            bias: bias_buf.view(),
+            has_bias: true,
+            input: &input,
+            shape: (m, n, k),
+        },
     );
     let expected = expect_gemm(&input, &weight, &bias, scale, m, n, k);
     assert_close(&got, &expected, "gemm_bf16");
@@ -489,26 +500,30 @@ fn gemm_bf16_treats_the_zero_bias_stand_in_as_no_bias() {
             .collect::<Vec<u16>>(),
     );
     // The driver's stand-in for an absent bias is a dedicated 4-byte zero
-    // buffer, not an n-wide zero vector: the kernel tells the stand-in from a
-    // real bias by the bound length, so the case must bind the real shape.
+    // buffer with the presence flag cleared; the kernel must trust the
+    // flag, so the case binds the driver's real shape.
     let stand_in = dummy(&b);
     let got = run_gemm(
         &b,
-        "kernel_flux2_gemm_bf16",
-        wbuf.view(),
-        1.0,
-        stand_in.view(),
-        &input,
-        (m, n, k),
+        GemmRun {
+            entry: "kernel_flux2_gemm_bf16",
+            weight: wbuf.view(),
+            scale: 1.0,
+            bias: stand_in.view(),
+            has_bias: false,
+            input: &input,
+            shape: (m, n, k),
+        },
     );
     let expected = expect_gemm(&input, &weight, &vec![0.0f32; n], 1.0, m, n, k);
     assert_close(&got, &expected, "gemm_bf16 no-bias stand-in");
 }
 
-/// The predicate for "no bias" is bit-exact +0.0, not `bias[0] == 0.0`:
-/// a real bias whose first word is -0.0 (a distinct bit pattern, 0x80000000)
-/// must be applied. This pins the bit-exactness - any relaxation of the
-/// predicate to a value comparison drops this bias and fails here.
+/// Regression lock from the zero-sentinel era: a real bias whose first
+/// word is -0.0 (bit pattern 0x80000000, distinct from the stand-in's
+/// +0.0) must be applied. Under the presence flag this is trivially
+/// correct - which is exactly what the flag was for - but the case stays
+/// so a reintroduced value sentinel fails here too.
 #[test]
 fn gemm_bf16_applies_a_real_bias_whose_first_word_is_negative_zero() {
     let Some(b) = open() else { return };
@@ -526,12 +541,15 @@ fn gemm_bf16_applies_a_real_bias_whose_first_word_is_negative_zero() {
     let bias_buf = upload_f32(&b, &bias);
     let got = run_gemm(
         &b,
-        "kernel_flux2_gemm_bf16",
-        wbuf.view(),
-        1.0,
-        bias_buf.view(),
-        &input,
-        (m, n, k),
+        GemmRun {
+            entry: "kernel_flux2_gemm_bf16",
+            weight: wbuf.view(),
+            scale: 1.0,
+            bias: bias_buf.view(),
+            has_bias: true,
+            input: &input,
+            shape: (m, n, k),
+        },
     );
     assert_differs(
         &got,
@@ -542,17 +560,11 @@ fn gemm_bf16_applies_a_real_bias_whose_first_word_is_negative_zero() {
     assert_close(&got, &expected, "gemm_bf16 negative-zero-first bias");
 }
 
-/// The pinned deviation: MSL has no device-side query for a bound buffer's
-/// length (checked against the MSL 4.1 specification and the current
-/// toolchain), so the kernel cannot tell the driver's 4-byte zero stand-in
-/// from a real bias whose first element is exactly +0.0 - it skips the
-/// whole bias. A real checkpoint bias with a bit-exact +0.0 first element
-/// is therefore dropped. The unambiguous fix is driver-side (a presence
-/// flag, or a stand-in word that cannot occur as a bias value); when that
-/// lands, flip this test to expect the bias applied. Until then this test
-/// is the regression lock: the behavior is documented, not silent.
+/// The case the zero sentinel silently got wrong: a real bias whose first
+/// element is exactly +0.0, bound with the presence flag set, must be
+/// applied in full. The flag, not the values, decides.
 #[test]
-fn gemm_bf16_skips_a_real_bias_whose_first_word_is_positive_zero() {
+fn gemm_bf16_applies_a_real_bias_whose_first_word_is_positive_zero() {
     let Some(b) = open() else { return };
     let (m, n, k) = (2usize, 3usize, 4usize);
     let input = vals(m * k, 7);
@@ -568,24 +580,63 @@ fn gemm_bf16_skips_a_real_bias_whose_first_word_is_positive_zero() {
     let bias_buf = upload_f32(&b, &bias);
     let got = run_gemm(
         &b,
-        "kernel_flux2_gemm_bf16",
-        wbuf.view(),
-        1.0,
-        bias_buf.view(),
-        &input,
-        (m, n, k),
+        GemmRun {
+            entry: "kernel_flux2_gemm_bf16",
+            weight: wbuf.view(),
+            scale: 1.0,
+            bias: bias_buf.view(),
+            has_bias: true,
+            input: &input,
+            shape: (m, n, k),
+        },
     );
-    let skipped = expect_gemm(&input, &weight, &vec![0.0f32; n], 1.0, m, n, k);
     assert_differs(
-        &skipped,
-        &expect_gemm(&input, &weight, &bias, 1.0, m, n, k),
-        "gemm_bf16 positive-zero-first bias: readings",
-    );
-    assert_close(
         &got,
-        &skipped,
-        "gemm_bf16 positive-zero-first bias (pinned deviation)",
+        &expect_gemm(&input, &weight, &vec![0.0f32; n], 1.0, m, n, k),
+        "gemm_bf16 positive-zero-first bias",
     );
+    let expected = expect_gemm(&input, &weight, &bias, 1.0, m, n, k);
+    assert_close(&got, &expected, "gemm_bf16 positive-zero-first bias");
+}
+
+/// The flag wins over the binding: a real, nonzero bias bound with the
+/// presence flag cleared must not be read - the output is unbiased. The
+/// stand-in case (dummy bound, flag cleared) is pinned by
+/// `gemm_bf16_treats_the_zero_bias_stand_in_as_no_bias`.
+#[test]
+fn gemm_bf16_ignores_the_bias_binding_when_the_flag_is_clear() {
+    let Some(b) = open() else { return };
+    let (m, n, k) = (2usize, 3usize, 4usize);
+    let input = vals(m * k, 8);
+    let weight: Vec<f32> = (0..n * k).map(|i| ((i % 5) as f32) * 0.25 - 0.5).collect();
+    let wbuf = upload_u16(
+        &b,
+        &weight
+            .iter()
+            .map(|&v| u16::from_le_bytes(bf16::from_f32(v).to_le_bytes()))
+            .collect::<Vec<u16>>(),
+    );
+    let bias = vals(n, 9);
+    let bias_buf = upload_f32(&b, &bias);
+    let got = run_gemm(
+        &b,
+        GemmRun {
+            entry: "kernel_flux2_gemm_bf16",
+            weight: wbuf.view(),
+            scale: 1.0,
+            bias: bias_buf.view(),
+            has_bias: false,
+            input: &input,
+            shape: (m, n, k),
+        },
+    );
+    let unbiased = expect_gemm(&input, &weight, &vec![0.0f32; n], 1.0, m, n, k);
+    assert_differs(
+        &unbiased,
+        &expect_gemm(&input, &weight, &bias, 1.0, m, n, k),
+        "gemm_bf16 flag-clear bias: readings",
+    );
+    assert_close(&got, &unbiased, "gemm_bf16 flag-clear bias");
 }
 
 #[test]
@@ -614,12 +665,15 @@ fn gemm_fp8_decodes_e4m3_bytes_and_scales_the_accumulator() {
     let bias_buf = upload_f32(&b, &bias);
     let got = run_gemm(
         &b,
-        "kernel_flux2_gemm_fp8",
-        wbuf.view(),
-        scale,
-        bias_buf.view(),
-        &input,
-        (m, n, k),
+        GemmRun {
+            entry: "kernel_flux2_gemm_fp8",
+            weight: wbuf.view(),
+            scale,
+            bias: bias_buf.view(),
+            has_bias: true,
+            input: &input,
+            shape: (m, n, k),
+        },
     );
     let expected = expect_gemm(&input, &weight, &bias, scale, m, n, k);
     // A weight read as e5m2 or as raw bytes differs by far more than the
@@ -644,12 +698,15 @@ fn gemm_f32_is_the_transposed_product() {
     let bias_buf = upload_f32(&b, &bias);
     let got = run_gemm(
         &b,
-        "kernel_flux2_gemm_f32",
-        wbuf.view(),
-        1.0,
-        bias_buf.view(),
-        &input,
-        (m, n, k),
+        GemmRun {
+            entry: "kernel_flux2_gemm_f32",
+            weight: wbuf.view(),
+            scale: 1.0,
+            bias: bias_buf.view(),
+            has_bias: true,
+            input: &input,
+            shape: (m, n, k),
+        },
     );
     let expected = expect_gemm(&input, &weight, &bias, 1.0, m, n, k);
     assert_close(&got, &expected, "gemm_f32");
@@ -1736,6 +1793,7 @@ fn conv2d_matches_the_padded_and_the_strided_sum() {
         input: &'a [f32],
         weight: &'a [f32],
         bias: &'a [f32],
+        has_bias: bool,
         batch: usize,
         in_c: usize,
         in_h: usize,
@@ -1755,7 +1813,7 @@ fn conv2d_matches_the_padded_and_the_strided_sum() {
             for oc in 0..c.out_c {
                 for oh in 0..c.out_h {
                     for ow in 0..c.out_w {
-                        let mut acc = c.bias[oc];
+                        let mut acc = if c.has_bias { c.bias[oc] } else { 0.0 };
                         for ic in 0..c.in_c {
                             for kh in 0..c.k_h {
                                 for kw in 0..c.k_w {
@@ -1785,7 +1843,13 @@ fn conv2d_matches_the_padded_and_the_strided_sum() {
     let run = |case: &Conv2dCase<'_>, b: &Arc<dyn Backend>| -> Vec<f32> {
         let in_buf = upload_f32(b, case.input);
         let w_buf = upload_f32(b, case.weight);
-        let bias_buf = upload_f32(b, case.bias);
+        // The driver's shape: a real bias bound with the flag set, the
+        // 4-byte zero stand-in bound with it clear.
+        let bias_buf = if case.has_bias {
+            upload_f32(b, case.bias)
+        } else {
+            dummy(b)
+        };
         let out_buf = alloc(
             b,
             (case.batch * case.out_c * case.out_h * case.out_w * 4) as u64,
@@ -1803,6 +1867,7 @@ fn conv2d_matches_the_padded_and_the_strided_sum() {
             k_w: case.k_w as u32,
             stride: case.stride as u32,
             pad: case.pad as u32,
+            has_bias: u32::from(case.has_bias),
         };
         launch(
             b,
@@ -1832,6 +1897,7 @@ fn conv2d_matches_the_padded_and_the_strided_sum() {
         input: &vals(2 * 3 * 3, 53),
         weight: &vals(2 * 2 * 3 * 3, 54),
         bias: &vals(2, 55),
+        has_bias: true,
         batch: 1,
         in_c: 2,
         in_h: 3,
@@ -1851,6 +1917,7 @@ fn conv2d_matches_the_padded_and_the_strided_sum() {
         input: &vals(2 * 4 * 4, 56),
         weight: &vals(3 * 2 * 3 * 3, 57),
         bias: &vals(3, 58),
+        has_bias: true,
         batch: 1,
         in_c: 2,
         in_h: 4,
@@ -1865,6 +1932,101 @@ fn conv2d_matches_the_padded_and_the_strided_sum() {
     };
     let got = run(&case2, &b);
     assert_close(&got, &reference(&case2), "conv2d pad 0 stride 2");
+}
+
+/// Runs conv2d with a fixed 1x1-kernel shape (`in_c` 1, `out_c` 2, 2x2
+/// spatial) for a given bias binding and presence flag, returning the
+/// output with the fixed input and weight so the caller can compute
+/// `out[oc][p] = in[p] * w[oc] + bias[oc]` (or without the bias term).
+fn conv2d_bias_case(
+    b: &Arc<dyn Backend>,
+    bias: DeviceView<'_>,
+    has_bias: bool,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let input = vals(4, 61);
+    let weight = vec![0.75f32, -1.25];
+    let in_buf = upload_f32(b, &input);
+    let w_buf = upload_f32(b, &weight);
+    let out_buf = alloc(b, 8 * 4).expect("alloc");
+    let args = Conv2dArgs {
+        batch: 1,
+        in_c: 1,
+        in_h: 2,
+        in_w: 2,
+        out_c: 2,
+        out_h: 2,
+        out_w: 2,
+        k_h: 1,
+        k_w: 1,
+        stride: 1,
+        pad: 0,
+        has_bias: u32::from(has_bias),
+    };
+    launch(
+        b,
+        "kernel_flux2_conv2d_f32",
+        Extent3::new(2, 2, 2),
+        Extent3::linear(BLOCK),
+        &[
+            KernelArg::Bytes(bytes_of(&args)),
+            KernelArg::Buffer(out_buf.view()),
+            KernelArg::Buffer(in_buf.view()),
+            KernelArg::Buffer(w_buf.view()),
+            KernelArg::Buffer(bias),
+        ],
+    );
+    (read_f32(b, out_buf.view(), 8), input, weight)
+}
+
+fn expect_conv2d_bias(input: &[f32], weight: &[f32], bias: Option<&[f32]>) -> Vec<f32> {
+    (0..2)
+        .flat_map(|oc| {
+            input
+                .iter()
+                .map(move |&x| x * weight[oc] + bias.map_or(0.0, |b| b[oc]))
+        })
+        .collect()
+}
+
+/// The case the zero sentinel silently got wrong, on the conv path: a
+/// real bias whose first element is exactly +0.0, bound with the presence
+/// flag set, must be applied in full.
+#[test]
+fn conv2d_applies_a_bias_whose_first_word_is_positive_zero() {
+    let Some(b) = open() else { return };
+    let bias = vec![0.0f32, 0.5];
+    let bias_buf = upload_f32(&b, &bias);
+    let (got, input, weight) = conv2d_bias_case(&b, bias_buf.view(), true);
+    assert_differs(
+        &got,
+        &expect_conv2d_bias(&input, &weight, None),
+        "conv2d positive-zero-first bias",
+    );
+    assert_close(
+        &got,
+        &expect_conv2d_bias(&input, &weight, Some(&bias)),
+        "conv2d positive-zero-first bias",
+    );
+}
+
+/// The flag wins over the binding on the conv path too: the driver's
+/// 4-byte zero stand-in bound with the flag clear yields an unbiased
+/// convolution.
+#[test]
+fn conv2d_ignores_bias_when_the_flag_is_clear() {
+    let Some(b) = open() else { return };
+    let stand_in = dummy(&b);
+    let (got, input, weight) = conv2d_bias_case(&b, stand_in.view(), false);
+    assert_differs(
+        &got,
+        &expect_conv2d_bias(&input, &weight, Some(&[0.25, -0.5])),
+        "conv2d flag-clear bias",
+    );
+    assert_close(
+        &got,
+        &expect_conv2d_bias(&input, &weight, None),
+        "conv2d flag-clear bias",
+    );
 }
 
 #[test]

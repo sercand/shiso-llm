@@ -100,34 +100,24 @@ static inline float flux2_block_sum(float v, threadgroup float *scratch, uint ti
     return scratch[n_warp];
 }
 
-/// Whether a bias binding is the driver's absent-bias stand-in.
-///
-/// The driver binds a dedicated zero-filled 4-byte buffer wherever a linear
-/// or a convolution carries no bias (`Ops::dummy`), and the argument block
-/// has no room for a presence flag. MSL offers no device-side query for a
-/// bound buffer's length - checked against the MSL 4.1 specification and
-/// the current toolchain, which declare no `buffer_length` or equivalent -
-/// so the predicate can only read `bias[0]`, and bit-exact +0.0 is the
-/// absence signal. The stand-in is always +0.0 (`fill_zero`), and every
-/// real bias in this family is >= 8 bytes, so the sole misread is a real
-/// bias whose first element is exactly +0.0: it is skipped, as the pinned
-/// test records. A -0.0 first word is present, not absent. The unambiguous
-/// fix is driver-side (a presence flag, or a stand-in that cannot occur as
-/// a bias word) and is reported with this port.
-static inline bool flux2_bias_absent(device const float *bias) {
-    return as_type<uint>(bias[0]) == 0u;
-}
-
 // --- argument blocks --------------------------------------------------------
 //
 // One block per kernel family, passed as `constant T & args [[buffer(0)]]`.
 // Field order and width are the driver's `#[repr(C)]` Pods, byte for byte.
 
 /// A linear in its stored width: `out[m,n] = in[m,k] . weight[n,k] * scale + bias[n]`.
+///
+/// `has_bias` is the bias presence contract, shared with conv2d: the
+/// driver binds a dedicated 4-byte zero stand-in (`Ops::dummy`) wherever a
+/// linear or convolution carries no bias, and MSL has no device-side query
+/// for a bound buffer's length, so the flag - never the bias values -
+/// decides whether the binding is read. `has_bias == 0` means the kernel
+/// must not read `bias` at all; `has_bias == 1` means it is a real vector.
 struct flux2_args_gemm {
     uint32_t m;
     uint32_t n;
     uint32_t k;
+    uint32_t has_bias;
 };
 
 /// One elementwise pass over `count` values.
@@ -232,7 +222,8 @@ struct flux2_args_rope_half {
     uint32_t head_dim;
 };
 
-/// One NCHW f32 convolution.
+/// One NCHW f32 convolution. `has_bias` is the presence contract from
+/// `flux2_args_gemm`.
 struct flux2_args_conv2d {
     uint32_t batch;
     uint32_t in_c;
@@ -245,6 +236,7 @@ struct flux2_args_conv2d {
     uint32_t k_w;
     uint32_t stride;
     uint32_t pad;
+    uint32_t has_bias;
 };
 
 /// Group normalization; the affine buffers hold `num_groups *
@@ -273,7 +265,7 @@ struct flux2_args_embed {
 
 // The blocks and the driver's Pods are edited together; the host asserts the
 // same widths, and so does this side so a header-only drift fails the compile.
-static_assert(sizeof(flux2_args_gemm) == 12, "GemmArgs");
+static_assert(sizeof(flux2_args_gemm) == 16, "GemmArgs");
 static_assert(sizeof(flux2_args_unary) == 4, "UnaryArgs");
 static_assert(sizeof(flux2_args_swiglu) == 12, "SwigluArgs");
 static_assert(sizeof(flux2_args_modulate) == 8, "ModulateArgs");
@@ -286,7 +278,7 @@ static_assert(sizeof(flux2_args_sdpa) == 44, "SdpaArgs");
 static_assert(sizeof(flux2_args_gqa) == 16, "GqaArgs");
 static_assert(sizeof(flux2_args_rope_4d) == 28, "Rope4dArgs");
 static_assert(sizeof(flux2_args_rope_half) == 12, "RopeHalfArgs");
-static_assert(sizeof(flux2_args_conv2d) == 44, "Conv2dArgs");
+static_assert(sizeof(flux2_args_conv2d) == 48, "Conv2dArgs");
 static_assert(sizeof(flux2_args_group_norm) == 20, "GroupNormArgs");
 static_assert(sizeof(flux2_args_upsample) == 16, "UpsampleArgs");
 static_assert(sizeof(flux2_args_embed) == 8, "EmbedArgs");

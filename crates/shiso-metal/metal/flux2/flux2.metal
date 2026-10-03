@@ -164,8 +164,9 @@ static inline float flux2_weight_value(uchar w) {
 /// `k` is a change to the numbers, not just to the speed.
 ///
 /// The scale multiplies the accumulator in the epilogue, never the weight
-/// in memory. The bias is per output column, or the driver's zero stand-in
-/// when the linear carries none.
+/// in memory. The bias is per output column, applied only when
+/// `args.has_bias` says the binding is a real vector; the driver clears
+/// the flag and binds its zero stand-in when the linear carries none.
 template <typename W>
 static inline void flux2_gemm_body(
         constant flux2_args_gemm & args,
@@ -186,7 +187,7 @@ static inline void flux2_gemm_body(
     // accumulates: the tile is filled row-per-thread-y so `k` runs along x
     // and the load stays contiguous, then read back column-wise.
     const uint stage_n = tgpig.x * FLUX2_GEMM_TILE + ty;
-    const bool has_bias = !flux2_bias_absent(bias);
+    const bool has_bias = args.has_bias != 0u;
 
     float acc = 0.0f;
     for (uint k0 = 0u; k0 < args.k; k0 += FLUX2_GEMM_TILE) {
@@ -750,7 +751,7 @@ kernel void kernel_flux2_conv2d_f32(
     acc = flux2_block_sum(acc, scratch, tid);
     if (tid == 0u) {
         out[((n * args.out_c + oc) * args.out_h + oh) * args.out_w + ow] =
-                acc + (flux2_bias_absent(bias) ? 0.0f : bias[oc]);
+                acc + (args.has_bias != 0u ? bias[oc] : 0.0f);
     }
 }
 

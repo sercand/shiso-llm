@@ -66,6 +66,11 @@ struct GemmArgs {
     m: u32,
     n: u32,
     k: u32,
+    // 1 when the bias binding is a real vector, 0 when the dummy stands in.
+    // MSL has no device-side query for a bound buffer's length, so absence
+    // must be a flag: a value sentinel (bit-exact +0.0 first word) would
+    // silently drop a real bias whose first element is exactly +0.0.
+    has_bias: u32,
 }
 
 #[repr(C)]
@@ -207,6 +212,9 @@ struct Conv2dArgs {
     k_w: u32,
     stride: u32,
     pad: u32,
+    // Presence flag, as in `GemmArgs`: the flag, not the bias values,
+    // tells the kernel whether the binding is real.
+    has_bias: u32,
 }
 
 #[repr(C)]
@@ -225,7 +233,7 @@ struct EmbedArgs {
 
 // The argument blocks and the kernel headers are edited together; a drift is
 // a wrong number under load, so it is a compile error here instead.
-const _: () = assert!(size_of::<GemmArgs>() == 12);
+const _: () = assert!(size_of::<GemmArgs>() == 16);
 const _: () = assert!(size_of::<UnaryArgs>() == 4);
 const _: () = assert!(size_of::<SwigluArgs>() == 12);
 const _: () = assert!(size_of::<ModulateArgs>() == 8);
@@ -239,7 +247,7 @@ const _: () = assert!(size_of::<Rope4dArgs>() == 28);
 const _: () = assert!(size_of::<RopeHalfArgs>() == 12);
 const _: () = assert!(size_of::<SdpaArgs>() == 44);
 const _: () = assert!(size_of::<GqaArgs>() == 16);
-const _: () = assert!(size_of::<Conv2dArgs>() == 44);
+const _: () = assert!(size_of::<Conv2dArgs>() == 48);
 const _: () = assert!(size_of::<AxpyArgs>() == 8);
 const _: () = assert!(size_of::<EmbedArgs>() == 8);
 
@@ -888,6 +896,7 @@ impl Ops {
             m: call.m as u32,
             n: call.n as u32,
             k: call.k as u32,
+            has_bias: u32::from(call.bias.is_some()),
         };
         let bias = call.bias.unwrap_or(self.dummy.view());
         let entry = match call.kind {
@@ -1454,6 +1463,7 @@ impl Ops {
             k_w: call.k_w as u32,
             stride: call.stride as u32,
             pad: call.pad as u32,
+            has_bias: u32::from(call.bias.is_some()),
         };
         let bias = call.bias.unwrap_or(self.dummy.view());
         self.launch(
