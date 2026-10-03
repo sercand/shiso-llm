@@ -4,9 +4,9 @@
 //! The prompt arrives as token ids; the encoder embeds them and runs the
 //! transformer layers causally - grouped-query attention, per-head QK `RMSNorm`,
 //! rotate-half 1D `RoPE`, `SwiGLU` MLP - and taps the residual stream after
-//! layers 9, 19 and 29. Those are the reference's `hidden_states[10]`,
-//! `[20]` and `[30]` counting `hidden_states[0]` as the embedding output,
-//! i.e. the stream after 0-indexed layers 9, 19, 29. The three hidden states
+//! layers 8, 17 and 26. Those are the reference's `hidden_states[9]`,
+//! `[18]` and `[27]` counting `hidden_states[0]` as the embedding output,
+//! i.e. the stream after 0-indexed layers 8, 17, 26. The three hidden states
 //! are concatenated into the (`seq_len`, 3 * hidden) conditioning the
 //! diffusion transformer reads. Layers past the last tap are neither loaded
 //! nor evaluated: their output reaches no consumer.
@@ -28,10 +28,10 @@ use super::rope::rope_half_freqs;
 use super::weights::{Lin, StStore};
 
 /// The residual-stream layers whose hidden states condition the transformer:
-/// the reference taps `hidden_states[10]`, `[20]` and `[30]` with
+/// the reference taps `hidden_states[9]`, `[18]` and `[27]` with
 /// `hidden_states[0]` being the embedding output, so the 0-indexed layers
-/// after which those states exist are 9, 19 and 29.
-const TAP_LAYERS: [usize; 3] = [9, 19, 29];
+/// after which those states exist are 8, 17 and 26.
+const TAP_LAYERS: [usize; 3] = [8, 17, 26];
 
 /// Architecture numbers, all derived from tensor shapes.
 #[derive(Debug, Clone)]

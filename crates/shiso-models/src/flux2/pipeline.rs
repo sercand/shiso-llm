@@ -119,11 +119,6 @@ fn bridge_python_methods(
     }
 }
 
-/// The system turn the reference pipeline renders before the prompt. The
-/// text encoder's tapped hidden states were conditioned on this turn during
-/// training, so dropping it shifts the context the transformer reads.
-const SYSTEM_MESSAGE: &str = "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object attribution and actions without speculation.";
-
 /// The FLUX.2-klein 4B generator: text encoder, transformer and VAE on one
 /// device, driven one job at a time.
 #[derive(Debug)]
@@ -226,12 +221,15 @@ impl Flux2KleinModel {
         })
     }
 
-    /// Renders the template with the reference pipeline's system turn and the
-    /// content slot filled by [`CONTENT_MARK`], and splits the result around
-    /// the mark, giving the text before and after the caller's words. The
-    /// generation prompt stays on: the assistant turn opener (and, for the
-    /// Qwen3 template with thinking disabled, its empty `think` block) belongs
-    /// to the tail that encodes after the prompt.
+    /// Renders the template with the user turn only - this encoder's
+    /// reference conditions on the user turn alone, and a system turn would
+    /// shift the tapped hidden states off the distribution the transformer
+    /// was trained to read. The content slot is filled by [`CONTENT_MARK`]
+    /// and the result is split around the mark, giving the text before and
+    /// after the caller's words. The generation prompt stays on: the
+    /// assistant turn opener (and, for the Qwen3 template with thinking
+    /// disabled, its empty `think` block) belongs to the tail that encodes
+    /// after the prompt.
     fn render(&self) -> Result<(String, String), ImageGenError> {
         let mut env = minijinja::Environment::new();
         env.set_trim_blocks(true);
@@ -243,7 +241,6 @@ impl Flux2KleinModel {
         let rendered = template
             .render(serde_json::json!({
                 "messages": [
-                    { "role": "system", "content": SYSTEM_MESSAGE },
                     { "role": "user", "content": CONTENT_MARK.to_string() },
                 ],
                 "add_generation_prompt": true,
@@ -285,7 +282,25 @@ impl Flux2KleinModel {
         } else {
             ids.extend(encode(&self.tokenizer, prompt)?);
         }
+        let tail_start = ids.len();
         ids.extend(encode(&self.tokenizer, &tail)?);
+        // Truncating to the encoder's window instead of padding it is safe:
+        // the reference pads every sequence to its 512-token maximum *with an
+        // attention mask*, and for a single sequence a masked pad contributes
+        // nothing a shorter unmasked sequence does not already omit.
+        if ids.len() > MAX_TEXT_TOKENS && tail_start < ids.len() {
+            // The tail is the assistant-opener segment, and it sits at the
+            // end, so any cut reaches it: a half-cut opener conditions the
+            // transformer on a turn structure no training sample carries.
+            // Refuse loudly and name the overflow rather than silently
+            // cutting the opener.
+            return Err(ImageGenError::Backend(format!(
+                "the rendered prompt is {} tokens, over the text encoder's \
+                 {MAX_TEXT_TOKENS}-token window; truncating would cut the \
+                 assistant turn opener",
+                ids.len()
+            )));
+        }
         ids.truncate(MAX_TEXT_TOKENS);
         if ids.is_empty() {
             return Err(ImageGenError::EmptyPrompt);

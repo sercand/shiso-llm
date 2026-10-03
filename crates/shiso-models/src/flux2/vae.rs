@@ -19,8 +19,9 @@
 //! by the widening read rather than silently dequantized.
 //!
 //! Every channel width, kernel size and block count is read from the weight
-//! shapes; the only config value consulted is the group count, which no
-//! tensor carries.
+//! shapes; the config document beside the weights supplies only what no
+//! tensor carries - the group count and, when present, the batch-norm
+//! epsilon.
 
 use std::path::Path;
 
@@ -31,10 +32,12 @@ use shiso_vision::generator::ImageGenError;
 use super::ops::{Conv2dCall, GroupNormCall, Ops};
 use super::weights::StStore;
 
-/// Group-norm epsilon the decoder uses.
-const GN_EPS: f32 = 1e-5;
-/// Batch-norm epsilon for the latent denormalization.
-const BN_EPS: f32 = 1e-5;
+/// Group-norm epsilon the decoder uses (the reference's group-norm epsilon).
+const GN_EPS: f32 = 1e-6;
+/// Batch-norm epsilon for the latent denormalization, used when the
+/// checkpoint's `vae/config.json` carries no `batch_norm_eps` (the reference
+/// trains with this value).
+const DEFAULT_BN_EPS: f32 = 1e-4;
 
 /// One convolution with its shape read from the weight tensor.
 #[derive(Debug)]
@@ -106,6 +109,7 @@ pub(crate) struct Vae {
 #[derive(Debug, Deserialize)]
 struct VaeConfig {
     norm_num_groups: Option<usize>,
+    batch_norm_eps: Option<f32>,
 }
 
 /// Reads one convolution weight and its bias, widened to the f32 the decoder
@@ -181,6 +185,7 @@ impl Vae {
         let store = StStore::open(path)?;
         let config: VaeConfig = read_json(&path.join("config.json")).unwrap_or(VaeConfig {
             norm_num_groups: None,
+            batch_norm_eps: None,
         });
         let groups = config.norm_num_groups.unwrap_or(32);
 
@@ -191,7 +196,10 @@ impl Vae {
                 "bn.running_mean and bn.running_var disagree on channel count".to_string(),
             ));
         }
-        let bn_std: Vec<f32> = bn_var.iter().map(|v| (v + BN_EPS).sqrt()).collect();
+        let bn_std: Vec<f32> = bn_var
+            .iter()
+            .map(|v| (v + config.batch_norm_eps.unwrap_or(DEFAULT_BN_EPS)).sqrt())
+            .collect();
 
         let post_quant = load_conv(&store, ops, "post_quant_conv")?;
         let conv_in = load_conv(&store, ops, "decoder.conv_in")?;
@@ -597,7 +605,8 @@ impl Vae {
         Ok(summed)
     }
 
-    /// Single-head spatial self-attention with a residual add.
+    /// Single-head spatial self-attention with a residual add: the group
+    /// norm feeds the q/k/v projections directly, with no activation between.
     fn attention(
         &self,
         ops: &Ops,
@@ -620,7 +629,11 @@ impl Vae {
             spatial,
             eps: GN_EPS,
         })?;
-        ops.silu("vae attn silu", xn.view(), xn.view(), channels * spatial)?;
+        // No activation between the norm and the projections: the reference's
+        // attention block reads the normed field straight into q/k/v, unlike
+        // the resnet blocks, which do activate after each norm. A SiLU here
+        // would bend every mid-block attention statistic away from the
+        // trained field.
         let q = Self::conv(ops, &attn.q, xn.view(), channels, field, "vae attn q")?;
         let k = Self::conv(ops, &attn.k, xn.view(), channels, field, "vae attn k")?;
         let v = Self::conv(ops, &attn.v, xn.view(), channels, field, "vae attn v")?;
