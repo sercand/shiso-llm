@@ -398,23 +398,10 @@ function onFamilySelected() {
   }
 
   pill.style.display = 'flex';
-  content.innerHTML = `
-    <strong>Family '${fam.name}':</strong>
-    Accepted Roles: <code>${fam.accepted_roles.join(", ")}</code> &bull;
-    Tasks: <code>${fam.tasks.join(", ")}</code> &bull;
-    Features: Tools: ${fam.features.tools ? 'Yes' : 'No'}, Structured Output: ${fam.features.structured_output ? 'Yes' : 'No'}, Reasoning: ${fam.features.reasoning_efforts.length ? fam.features.reasoning_efforts.join('/') : 'None'}
-  `;
+  content.innerHTML = `<strong>Family '${fam.name}':</strong>`;
 
   // Auto-configure checkboxes
-  document.getElementById('f-feat-tools').checked = fam.features.tools;
-  document.getElementById('f-feat-struct').checked = fam.features.structured_output;
-  const hasReasoning = fam.features.reasoning_efforts.length > 0;
-  document.getElementById('f-feat-reasoning').checked = hasReasoning;
   toggleReasoningFields();
-
-  document.querySelectorAll('#f-tasks-group input').forEach(input => {
-    input.checked = fam.tasks.includes(input.value);
-  });
 
   liveValidateForm();
 }
