@@ -6,7 +6,7 @@
 )]
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -215,7 +215,6 @@ async fn validate_handler(
 #[derive(Deserialize)]
 struct BuildReq {
     out: Option<String>,
-    sign_key: Option<String>,
     #[serde(default)]
     allow_dirty: bool,
 }
@@ -227,10 +226,9 @@ async fn build_handler(
     let out_dir = payload
         .out
         .map_or_else(|| state.repo.join("registry/v1"), PathBuf::from);
-    let sign_key_path = payload.sign_key.as_deref().map(Path::new);
 
-    let res = editor::build_registry(&state.repo, &out_dir, sign_key_path, payload.allow_dirty)
-        .map_err(bad_request)?;
+    let res =
+        editor::build_registry(&state.repo, &out_dir, payload.allow_dirty).map_err(bad_request)?;
     Ok(Json(res))
 }
 

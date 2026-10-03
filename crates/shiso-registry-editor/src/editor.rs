@@ -2,15 +2,11 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
-use base64::Engine as _;
-use ed25519_dalek::{Signer, SigningKey};
-use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
@@ -69,17 +65,6 @@ pub(crate) struct BuildResult {
     pub(crate) manifest_paths: Vec<PathBuf>,
     /// Index diff against current published index.
     pub(crate) diff: String,
-}
-
-/// Generated Ed25519 keypair info.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct KeygenResult {
-    /// 64-hexadecimal public key string.
-    pub(crate) public_hex: String,
-    /// Base64 public key string.
-    pub(crate) public_b64: String,
-    /// Path where the private key was written.
-    pub(crate) private_key_path: PathBuf,
 }
 
 /// Git status information for the repository banner (§7.2).
@@ -319,14 +304,13 @@ async fn hash_remote_non_lfs_file(
     Some(hex::encode(Sha256Hasher::digest(&bytes)))
 }
 
-/// Builds, validates, compiles, and signs the registry output (§7.1, §7.5).
+/// Builds and validates the registry output (§7.1, §7.5).
 ///
 /// # Errors
-/// Returns an error if validation fails, uncommitted changes exist, or signing fails.
+/// Returns an error if validation fails or uncommitted changes exist.
 pub(crate) fn build_registry(
     repo_path: &Path,
     out_dir: &Path,
-    sign_key_path: Option<&Path>,
     allow_dirty: bool,
 ) -> anyhow::Result<BuildResult> {
     let status = git_status(repo_path);
@@ -418,17 +402,6 @@ pub(crate) fn build_registry(
     let index_path = out_dir.join("index.json");
     atomic_write(&index_path, &index_bytes)?;
 
-    if let Some(key_path) = sign_key_path {
-        let key_bytes = fs::read(key_path)
-            .with_context(|| format!("reading signing key at '{}'", key_path.display()))?;
-        let secret = parse_signing_key_bytes(&key_bytes)?;
-        let signing_key = SigningKey::from_bytes(&secret);
-        let signature = signing_key.sign(&index_bytes);
-
-        let sig_path = out_dir.join("index.json.sig");
-        atomic_write(&sig_path, &signature.to_bytes())?;
-    }
-
     let diff = format!(
         "Compiled {} model manifests into '{}'",
         manifest_paths.len(),
@@ -439,47 +412,6 @@ pub(crate) fn build_registry(
         models_count: manifest_paths.len(),
         manifest_paths,
         diff,
-    })
-}
-
-/// Generates a new 32-byte Ed25519 keypair and writes private key to `out_path` (§7.1).
-///
-/// # Errors
-/// Returns an error if writing the key file fails.
-pub(crate) fn generate_keypair(out_path: &Path) -> anyhow::Result<KeygenResult> {
-    let mut secret_bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut secret_bytes);
-
-    let signing_key = SigningKey::from_bytes(&secret_bytes);
-    let verifying_key = signing_key.verifying_key();
-
-    let public_bytes = verifying_key.to_bytes();
-    let public_hex = hex::encode(public_bytes);
-    let public_b64 = base64::prelude::BASE64_STANDARD.encode(public_bytes);
-
-    let hex_secret = hex::encode(secret_bytes);
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(out_path)?;
-
-    file.write_all(hex_secret.as_bytes())?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(out_path, fs::Permissions::from_mode(0o600));
-    }
-
-    Ok(KeygenResult {
-        public_hex,
-        public_b64,
-        private_key_path: out_path.to_path_buf(),
     })
 }
 
@@ -619,24 +551,6 @@ fn get_git_timestamps(path: &Path) -> (String, String) {
 
     let now = current_iso8601();
     (now.clone(), now)
-}
-
-fn parse_signing_key_bytes(raw: &[u8]) -> anyhow::Result<[u8; 32]> {
-    if raw.len() == 32 {
-        let arr: [u8; 32] = raw.try_into()?;
-        return Ok(arr);
-    }
-
-    let text = String::from_utf8_lossy(raw).trim().to_string();
-    if text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let bytes = hex::decode(&text)?;
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("32 bytes expected"))?;
-        return Ok(arr);
-    }
-
-    bail!("signing key must be 32 bytes raw or 64 hex characters");
 }
 
 fn atomic_write(dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {

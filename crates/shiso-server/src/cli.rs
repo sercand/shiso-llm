@@ -1129,10 +1129,6 @@ pub struct HubArgs {
     )]
     pub registry_url: String,
 
-    /// Ed25519 public key (hex, base64, or key file). Required when --registry-url is custom.
-    #[arg(long, env = "SHISO_REGISTRY_KEY")]
-    pub registry_key: Option<String>,
-
     /// Hugging Face endpoint URL.
     #[arg(
         long,

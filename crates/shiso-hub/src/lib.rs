@@ -16,8 +16,8 @@ pub mod store;
 pub mod validate;
 
 pub use config::{
-    COMPILED_REGISTRY_PUBKEY, DEFAULT_HF_ENDPOINT, DEFAULT_MAX_PARALLEL_FILES,
-    DEFAULT_REGISTRY_URL, HfToken, HubConfig, RegistryEndpoint, parse_verifying_key,
+    DEFAULT_HF_ENDPOINT, DEFAULT_MAX_PARALLEL_FILES, DEFAULT_REGISTRY_URL, HfToken, HubConfig,
+    RegistryEndpoint,
 };
 pub use download::{DownloadFileDesc, Downloader};
 pub use error::HubError;

@@ -15,7 +15,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle as IndicatifStyle};
 use tokio::sync::mpsc;
 use url::Url;
 
-use shiso_hub::config::{DEFAULT_REGISTRY_URL, HfToken, HubConfig, RegistryEndpoint};
+use shiso_hub::config::{HfToken, HubConfig, RegistryEndpoint};
 use shiso_hub::download::Downloader;
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use shiso_hub::host::Backend;
@@ -80,18 +80,10 @@ pub fn resolve_home(home_str: &str) -> PathBuf {
 pub fn build_hub_config(args: &HubArgs) -> anyhow::Result<HubConfig> {
     let home = resolve_home(&args.home);
 
-    let registry = match &args.registry_key {
-        Some(key) => RegistryEndpoint::parse(&args.registry_url, key)
-            .map_err(|e| anyhow::anyhow!("invalid registry endpoint: {e}"))?,
-        None => {
-            if args.registry_url.trim_end_matches('/') == DEFAULT_REGISTRY_URL.trim_end_matches('/')
-            {
-                RegistryEndpoint::default_production()
-            } else {
-                bail!("--registry-key is required when --registry-url is custom");
-            }
-        }
-    };
+    // Any URL is accepted without key material; trust rests on HTTPS plus the
+    // per-file digests the manifest pins (§4.3).
+    let registry = RegistryEndpoint::parse(&args.registry_url)
+        .map_err(|e| anyhow::anyhow!("invalid registry URL: {e}"))?;
 
     let hf_endpoint = Url::parse(&args.hf_endpoint)
         .with_context(|| format!("invalid Hugging Face endpoint URL '{}'", args.hf_endpoint))?;

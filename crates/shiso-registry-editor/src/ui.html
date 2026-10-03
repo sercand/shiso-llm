@@ -301,16 +301,12 @@
   <section id="tab-build" class="tab-content">
     <div class="card">
       <div class="card-header">
-        <div class="card-title">Compile, Sign, and Build Static Registry</div>
+        <div class="card-title">Compile and Build Static Registry</div>
       </div>
       <div class="row">
         <div class="col form-group">
           <label>Output Directory</label>
           <input type="text" id="build-out" value="registry/v1">
-        </div>
-        <div class="col form-group">
-          <label>Ed25519 Signing Key Path</label>
-          <input type="text" id="build-key" placeholder="~/.config/shiso/registry.key">
         </div>
       </div>
       <div class="form-group">
@@ -318,7 +314,6 @@
       </div>
       <div style="display:flex; gap:10px; margin-bottom:16px;">
         <button class="primary" onclick="runBuild()">Run Build</button>
-        <button onclick="runKeygen()">Generate Keypair</button>
       </div>
       <div id="build-result"></div>
     </div>
@@ -1174,16 +1169,15 @@ async function runValidation() {
 
 async function runBuild() {
   const out = document.getElementById('build-out').value.trim();
-  const key = document.getElementById('build-key').value.trim();
   const allowDirty = document.getElementById('build-allow-dirty').checked;
   const resDiv = document.getElementById('build-result');
-  resDiv.innerHTML = "Compiling manifests and signing index...";
+  resDiv.innerHTML = "Compiling manifests...";
 
   try {
     const res = await api('/api/build', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ out, sign_key: key || null, allow_dirty: allowDirty })
+      body: JSON.stringify({ out, allow_dirty: allowDirty })
     });
     if (!res.ok) {
       resDiv.innerHTML = `<div class="alert-danger">Build failed:<br>${await res.text()}</div>`;
@@ -1197,13 +1191,6 @@ async function runBuild() {
     }
   } catch (e) { resDiv.innerHTML = `<div class="alert-danger">${e.message}</div>`; }
 }
-
-async function runKeygen() {
-  const path = prompt("Enter path to save new private key file:", "~/.config/shiso/registry.key");
-  if (!path) return;
-  alert("Run keygen headless using:\ncargo run -p shiso-registry-editor -- keygen --out " + path);
-}
-
 function formatBytes(bytes) {
   if (bytes === 0) return '0 B';
   const k = 1024;

@@ -21,16 +21,14 @@
 </head>
 <body>
 <h1>Shiso Model Registry</h1>
-<p class="lede">Model recipes and the signed index served to <code>shiso pull</code>.</p>
+<p class="lede">Model recipes and the index served to <code>shiso pull</code>.</p>
 
 <p>This site is a static host of the registry repository. There is nothing to
 browse here; the machine-readable artifacts are:</p>
 <ul>
-  <li><a href="/registry/v1/index.json">/registry/v1/index.json</a> &mdash; the signed model index</li>
-  <li><a href="/registry/v1/index.json.sig">/registry/v1/index.json.sig</a> &mdash; its Ed25519 signature</li>
+  <li><a href="/registry/v1/index.json">/registry/v1/index.json</a> &mdash; the model index</li>
   <li><a href="/registry/v1/models/">/registry/v1/models/</a> &mdash; per-model manifests</li>
   <li><a href="/recipes/">/recipes/</a> &mdash; the authored recipe sources</li>
-  <li><a href="/keys/registry.pub">/keys/registry.pub</a> &mdash; the signing public key</li>
 </ul>
 
 <p>Point a client at this host with <code>--registry-url</code> or

@@ -52,20 +52,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Build(args) => {
             let out = args.out.unwrap_or_else(|| args.repo.join("registry/v1"));
-            let res =
-                editor::build_registry(&args.repo, &out, Some(&args.sign_key), args.allow_dirty)?;
+            let res = editor::build_registry(&args.repo, &out, args.allow_dirty)?;
             println!(
                 "Build succeeded: {} model(s) compiled into {}",
                 res.models_count,
                 out.display()
             );
-        }
-        Command::Keygen(args) => {
-            let res = editor::generate_keypair(&args.out)?;
-            println!("Generated new Ed25519 keypair.");
-            println!("Private key written to: {}", res.private_key_path.display());
-            println!("Public key (hex):       {}", res.public_hex);
-            println!("Public key (base64):    {}", res.public_b64);
         }
     }
 

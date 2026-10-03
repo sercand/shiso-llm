@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use ed25519_dalek::Verifier;
 use tempfile::tempdir;
 use tower::ServiceExt;
 
@@ -42,24 +41,6 @@ fn checked_in_recipes_pass_strict_validation() {
 }
 
 #[test]
-fn checked_in_public_key_matches_compiled_constant() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir.parent().unwrap().parent().unwrap();
-    let pubkey_path = root
-        .join("model-registry")
-        .join("keys")
-        .join("registry.pub");
-
-    let content = fs::read_to_string(&pubkey_path).unwrap();
-    let trimmed = content.trim();
-    let expected = hex::encode(shiso_hub::config::COMPILED_REGISTRY_PUBKEY);
-    assert_eq!(
-        trimmed, expected,
-        "registry.pub must match shiso-hub constant"
-    );
-}
-
-#[test]
 fn atomic_put_recipe_with_stable_formatting() {
     let temp = tempdir().unwrap();
     let recipes_dir = temp.path().join("recipes");
@@ -90,7 +71,7 @@ fn atomic_put_recipe_with_stable_formatting() {
 }
 
 #[test]
-fn keygen_and_build_registry_produces_verifiable_signature() {
+fn build_registry_compiles_unsigned_index_and_manifests() {
     let temp = tempdir().unwrap();
     let recipes_dir = temp.path().join("recipes");
     fs::create_dir_all(&recipes_dir).unwrap();
@@ -104,30 +85,28 @@ fn keygen_and_build_registry_produces_verifiable_signature() {
         .join("qwen3.5-9b.json");
     fs::copy(sample, recipes_dir.join("qwen3.5-9b.json")).unwrap();
 
-    // Generate keypair
-    let key_path = temp.path().join("registry.key");
-    let keygen = editor::generate_keypair(&key_path).unwrap();
-
     // Build registry
     let out_dir = temp.path().join("registry").join("v1");
-    let build = editor::build_registry(temp.path(), &out_dir, Some(&key_path), true).unwrap();
+    let build = editor::build_registry(temp.path(), &out_dir, true).unwrap();
     assert_eq!(build.models_count, 1);
 
-    // Verify index.json exists
     let index_file = out_dir.join("index.json");
-    let sig_file = out_dir.join("index.json.sig");
     assert!(index_file.is_file());
-    assert!(sig_file.is_file());
+    assert!(out_dir.join("models").join("qwen3.5-9b.json").is_file());
+    // Unsigned model: no detached signature artifact is produced.
+    assert!(!out_dir.join("index.json.sig").exists());
 
-    let index_bytes = fs::read(&index_file).unwrap();
-    let sig_bytes = fs::read(&sig_file).unwrap();
-
-    // Verify signature with generated public key
-    let pub_bytes = hex::decode(keygen.public_hex).unwrap();
-    let verifying_key =
-        ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes.try_into().unwrap()).unwrap();
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes.try_into().unwrap());
-    assert!(verifying_key.verify(&index_bytes, &signature).is_ok());
+    // The index digest chain still holds: index.json's manifest_sha256 must
+    // equal the digest of the compiled manifest bytes.
+    let index: shiso_hub::recipe::Index =
+        serde_json::from_slice(&fs::read(&index_file).unwrap()).unwrap();
+    assert_eq!(index.models.len(), 1);
+    let manifest_bytes = fs::read(out_dir.join("models").join("qwen3.5-9b.json")).unwrap();
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(&manifest_bytes);
+    assert_eq!(
+        index.models[0].manifest_sha256.as_str(),
+        hex::encode(digest)
+    );
 }
 
 #[tokio::test]

@@ -79,7 +79,6 @@ wiremock = "0.6"
 # --- hub and registry -----------------------------------------------------
 indicatif = "0.17"
 sysinfo = "0.33"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 semver = { version = "1", features = ["serde"] }
 # --- tokenizer + chat templates -----------------------------------------
 minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "preserve_order"] }

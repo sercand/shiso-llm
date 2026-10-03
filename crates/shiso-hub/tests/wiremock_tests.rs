@@ -5,7 +5,6 @@
 use std::fs;
 use std::num::NonZeroUsize;
 
-use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 use tempfile::tempdir;
 use wiremock::matchers::{header, header_exists, method, path};
@@ -38,10 +37,8 @@ async fn cross_host_redirect_strips_authorization() {
         .await;
 
     let temp = tempdir().unwrap();
-    let signing_key = SigningKey::from_bytes(&[1u8; 32]);
     let endpoint = RegistryEndpoint {
         url: url::Url::parse(&format!("{}/v1", host_a.uri())).unwrap(),
-        verifying_key: signing_key.verifying_key(),
     };
 
     let config = HubConfig {
@@ -120,10 +117,8 @@ async fn same_host_redirect_preserves_authorization() {
         .await;
 
     let temp = tempdir().unwrap();
-    let signing_key = SigningKey::from_bytes(&[2u8; 32]);
     let endpoint = RegistryEndpoint {
         url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
-        verifying_key: signing_key.verifying_key(),
     };
 
     let config = HubConfig {
@@ -159,12 +154,8 @@ async fn same_host_redirect_preserves_authorization() {
 async fn etag_304_reuse() {
     let server = MockServer::start().await;
 
-    let signing_key = SigningKey::from_bytes(&[3u8; 32]);
-    let verifying_key = signing_key.verifying_key();
-
     let index_bytes =
         b"{\"schema_version\":1,\"generated_at\":\"2026-10-03T12:00:00Z\",\"models\":[]}";
-    let signature = signing_key.sign(index_bytes);
 
     Mock::given(method("GET"))
         .and(path("/v1/index.json"))
@@ -177,17 +168,9 @@ async fn etag_304_reuse() {
         .mount(&server)
         .await;
 
-    Mock::given(method("GET"))
-        .and(path("/v1/index.json.sig"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(signature.to_bytes().as_slice()))
-        .expect(1)
-        .mount(&server)
-        .await;
-
     let temp = tempdir().unwrap();
     let endpoint = RegistryEndpoint {
         url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
-        verifying_key,
     };
 
     let config = HubConfig {
@@ -234,10 +217,8 @@ async fn bit_flip_leads_to_digest_mismatch_and_cleanup() {
         .await;
 
     let temp = tempdir().unwrap();
-    let signing_key = SigningKey::from_bytes(&[4u8; 32]);
     let endpoint = RegistryEndpoint {
         url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
-        verifying_key: signing_key.verifying_key(),
     };
 
     let config = HubConfig {
@@ -298,10 +279,8 @@ async fn range_resume_appends() {
         .await;
 
     let temp = tempdir().unwrap();
-    let signing_key = SigningKey::from_bytes(&[5u8; 32]);
     let endpoint = RegistryEndpoint {
         url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
-        verifying_key: signing_key.verifying_key(),
     };
 
     let config = HubConfig {
@@ -358,10 +337,8 @@ async fn concurrent_pulls_single_download() {
         .await;
 
     let temp = tempdir().unwrap();
-    let signing_key = SigningKey::from_bytes(&[6u8; 32]);
     let endpoint = RegistryEndpoint {
         url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
-        verifying_key: signing_key.verifying_key(),
     };
 
     let config = HubConfig {

@@ -1,8 +1,8 @@
 # Shiso Model Registry
 
 This repository is the source of the Shiso model registry. It is served
-statically as-is: a client configured with `https://<host>/` finds the signed
-index at `/registry/v1/index.json` and the compiled manifests under
+statically as-is: a client configured with `https://<host>/` finds the index
+at `/registry/v1/index.json` and the compiled manifests under
 `/registry/v1/models/`.
 
 This directory is currently staged inside the shiso worktree as
@@ -16,10 +16,8 @@ This directory is currently staged inside the shiso worktree as
 ├── index.html              # landing page for the static host
 ├── error.html              # error page for the static host
 ├── recipes/<name>.json     # authored recipes (no timestamps)
-├── keys/registry.pub       # Ed25519 public key (matches constant in shiso-hub)
 └── registry/v1/            # built artifacts, committed; served as-is
-    ├── index.json          # signed index (signature in index.json.sig)
-    ├── index.json.sig
+    ├── index.json          # index; each entry pins its manifest's sha256
     └── models/<name>.json  # compiled manifests with Git-derived timestamps
 ```
 
@@ -36,12 +34,12 @@ This directory is currently staged inside the shiso worktree as
    cargo run -p shiso-registry-editor -- validate --repo .
    ```
 
-## Building and Signing the Registry
+## Building the Registry
 
-To compile the manifests into `registry/v1/` and regenerate the signed index:
+To compile the manifests into `registry/v1/` and regenerate the index:
 
 ```sh
-cargo run -p shiso-registry-editor -- build --repo . --sign-key ~/.config/shiso/registry.key
+cargo run -p shiso-registry-editor -- build --repo .
 ```
 
 The build derives `published_at` and `updated_at` timestamps from Git history
@@ -51,6 +49,7 @@ rebuilt `registry/v1/` alongside the recipe change.
 ## Publishing
 
 Publishing is `git push`: the static host serves this repository, so a pushed
-commit to the default branch is the release. `keys/registry.pub` must match the
-key compiled into `shiso-hub` (`COMPILED_REGISTRY_PUBKEY`); clients verify
-`index.json.sig` against that key, so the private key never lives here.
+commit to the default branch is the release. Integrity is digest-pinned, not
+signed: `index.json` records the SHA-256 of every compiled manifest, and every
+model file carries its own `sha256`, which the client verifies after download.
+Transport security is HTTPS; the registry host is the trust anchor.

@@ -5,9 +5,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::num::NonZeroUsize;
-
-use ed25519_dalek::{Signer, SigningKey};
 use tempfile::tempdir;
 
 use crate::config::{HfToken, HubConfig, RegistryEndpoint};
@@ -256,50 +253,21 @@ fn variant_selection_explicit_key_overcommit_warning() {
 }
 
 #[test]
-fn signature_and_digest_chain() {
-    let signing_key = SigningKey::from_bytes(&[42u8; 32]);
-    let verifying_key = signing_key.verifying_key();
-
-    let index_bytes =
-        b"{\"schema_version\":1,\"generated_at\":\"2026-10-03T12:00:00Z\",\"models\":[]}";
-    let signature = signing_key.sign(index_bytes);
-
-    let temp = tempdir().unwrap();
-    let endpoint = RegistryEndpoint {
-        url: url::Url::parse("http://127.0.0.1:9999/v1").unwrap(),
-        verifying_key,
-    };
-    let config = HubConfig {
-        home: temp.path().to_path_buf(),
-        registry: endpoint,
-        hf_endpoint: url::Url::parse("https://huggingface.co").unwrap(),
-        hf_token: None,
-        max_parallel_files: NonZeroUsize::new(4).unwrap(),
-    };
-    let client = crate::registry::RegistryClient::new(config);
-
-    // Verify valid signature
-    assert!(
-        client
-            .verify_signature(index_bytes, &signature.to_bytes())
-            .is_ok()
+fn registry_endpoint_parse_normalizes_and_accepts_custom_urls() {
+    // Any third-party or preview registry URL must work with no key material.
+    let endpoint =
+        RegistryEndpoint::parse("https://preview-abc.example.workers.dev/registry/v1").unwrap();
+    assert_eq!(
+        endpoint.url.as_str(),
+        "https://preview-abc.example.workers.dev/registry/v1/"
     );
 
-    // Verify flipped byte fails
-    let mut bad_bytes = index_bytes.to_vec();
-    bad_bytes[0] ^= 1;
-    assert!(
-        client
-            .verify_signature(&bad_bytes, &signature.to_bytes())
-            .is_err()
-    );
+    let with_slash =
+        RegistryEndpoint::parse("https://preview-abc.example.workers.dev/registry/v1/").unwrap();
+    assert_eq!(endpoint, with_slash);
 
-    // Verify wrong signature bytes fail
-    let mut bad_sig = signature.to_bytes();
-    bad_sig[0] ^= 1;
-    assert!(client.verify_signature(index_bytes, &bad_sig).is_err());
+    assert!(RegistryEndpoint::parse("not a url").is_err());
 }
-
 #[test]
 fn blob_store_hardlinks_and_gc() {
     let temp = tempdir().unwrap();
@@ -362,22 +330,6 @@ fn blob_store_hardlinks_and_gc() {
     assert_eq!(gc_stats.deleted_blobs, 1);
     assert_eq!(gc_stats.reclaimed_bytes, 16);
     assert!(!loose_blob.is_file());
-}
-
-#[test]
-fn checked_in_public_key_equals_compiled_constant() {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir.parent().unwrap().parent().unwrap();
-    let key_file = root.join("registry").join("keys").join("registry.pub");
-    if key_file.is_file() {
-        let content = fs::read_to_string(&key_file).unwrap();
-        let trimmed = content.trim();
-        let expected_hex = hex::encode(crate::config::COMPILED_REGISTRY_PUBKEY);
-        assert_eq!(
-            trimmed, expected_hex,
-            "checked in public key must match compiled constant"
-        );
-    }
 }
 
 #[test]

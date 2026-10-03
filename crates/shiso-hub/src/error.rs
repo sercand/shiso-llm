@@ -36,13 +36,6 @@ pub enum HubError {
         status: reqwest::StatusCode,
     },
 
-    /// Ed25519 signature verification of the registry index failed.
-    #[error("signature verification failed: {reason}")]
-    SignatureVerification {
-        /// Explanation of the verification failure.
-        reason: String,
-    },
-
     /// File contents did not match the expected SHA-256 digest.
     #[error("digest mismatch for {file}: expected {expected}, got {actual}")]
     DigestMismatch {

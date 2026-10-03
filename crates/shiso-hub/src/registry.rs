@@ -1,10 +1,8 @@
-//! Static HTTPS registry client, `ETag` caching and signature verification (§4.2, §4.3).
+//! Static HTTPS registry client with `ETag` caching (§4.2).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use base64::Engine;
-use ed25519_dalek::{Signature, Verifier};
 use reqwest::header::{ETAG, IF_NONE_MATCH};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
@@ -45,10 +43,10 @@ impl RegistryClient {
         self.config.home.join("registry")
     }
 
-    /// Fetches and verifies the registry index, using `ETag` caching if available.
+    /// Fetches the registry index, using `ETag` caching if available.
     ///
     /// # Errors
-    /// Returns [`HubError`] if downloading, caching, or signature verification fails.
+    /// Returns [`HubError`] if downloading or caching fails.
     pub async fn fetch_index(&self) -> Result<Index, HubError> {
         let cache_dir = self.cache_dir();
         fs::create_dir_all(&cache_dir).map_err(|e| HubError::Io {
@@ -57,7 +55,6 @@ impl RegistryClient {
         })?;
 
         let index_path = cache_dir.join("index.json");
-        let sig_path = cache_dir.join("index.json.sig");
         let etag_path = cache_dir.join("index.etag");
 
         let cached_etag = fs::read_to_string(&etag_path).ok();
@@ -66,11 +63,6 @@ impl RegistryClient {
         let index_url = base.join("index.json").map_err(|e| HubError::Validation {
             reason: format!("failed to form index URL: {e}"),
         })?;
-        let sig_url = base
-            .join("index.json.sig")
-            .map_err(|e| HubError::Validation {
-                reason: format!("failed to form sig URL: {e}"),
-            })?;
 
         // Try conditional GET for index.json
         let mut req = self.client.get(index_url.clone());
@@ -80,17 +72,16 @@ impl RegistryClient {
 
         match req.send().await {
             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
-                let index = self.read_cached_index(&index_path, &sig_path)?;
+                let index = Self::read_cached_index(&index_path)?;
                 Ok(index)
             }
             Ok(resp) if resp.status().is_success() => {
-                self.download_fresh_index(resp, &index_path, &sig_path, &etag_path, &sig_url)
+                self.download_fresh_index(resp, &index_path, &etag_path)
                     .await
             }
             Ok(resp) => {
                 if index_path.is_file()
-                    && sig_path.is_file()
-                    && let Ok(index) = self.read_cached_index(&index_path, &sig_path)
+                    && let Ok(index) = Self::read_cached_index(&index_path)
                 {
                     return Ok(index);
                 }
@@ -101,8 +92,7 @@ impl RegistryClient {
             }
             Err(e) => {
                 if index_path.is_file()
-                    && sig_path.is_file()
-                    && let Ok(index) = self.read_cached_index(&index_path, &sig_path)
+                    && let Ok(index) = Self::read_cached_index(&index_path)
                 {
                     return Ok(index);
                 }
@@ -118,9 +108,7 @@ impl RegistryClient {
         &self,
         resp: reqwest::Response,
         index_path: &Path,
-        sig_path: &Path,
         etag_path: &Path,
-        sig_url: &url::Url,
     ) -> Result<Index, HubError> {
         let new_etag = resp
             .headers()
@@ -132,30 +120,7 @@ impl RegistryClient {
             source: e,
         })?;
 
-        let sig_resp =
-            self.client
-                .get(sig_url.clone())
-                .send()
-                .await
-                .map_err(|e| HubError::Network {
-                    url: sig_url.to_string(),
-                    source: e,
-                })?;
-        if !sig_resp.status().is_success() {
-            return Err(HubError::HttpStatus {
-                url: sig_url.to_string(),
-                status: sig_resp.status(),
-            });
-        }
-        let sig_bytes = sig_resp.bytes().await.map_err(|e| HubError::Network {
-            url: sig_url.to_string(),
-            source: e,
-        })?;
-
-        self.verify_signature(&index_bytes, &sig_bytes)?;
-
         atomic_write(index_path, &index_bytes)?;
-        atomic_write(sig_path, &sig_bytes)?;
         if let Some(etag) = new_etag {
             atomic_write(etag_path, etag.as_bytes())?;
         }
@@ -164,34 +129,14 @@ impl RegistryClient {
         Ok(index)
     }
 
-    /// Reads and verifies a locally cached index.
-    fn read_cached_index(&self, index_path: &Path, sig_path: &Path) -> Result<Index, HubError> {
+    /// Reads a locally cached index.
+    fn read_cached_index(index_path: &Path) -> Result<Index, HubError> {
         let index_bytes = fs::read(index_path).map_err(|e| HubError::Io {
             path: index_path.to_path_buf(),
             source: e,
         })?;
-        let sig_bytes = fs::read(sig_path).map_err(|e| HubError::Io {
-            path: sig_path.to_path_buf(),
-            source: e,
-        })?;
-        self.verify_signature(&index_bytes, &sig_bytes)?;
         let index: Index = serde_json::from_slice(&index_bytes)?;
         Ok(index)
-    }
-
-    /// Verifies the Ed25519 signature over index bytes.
-    ///
-    /// # Errors
-    /// Returns [`HubError::SignatureVerification`] if the signature does not match.
-    pub fn verify_signature(&self, index_bytes: &[u8], sig_bytes: &[u8]) -> Result<(), HubError> {
-        let signature = parse_signature(sig_bytes)?;
-        self.config
-            .registry
-            .verifying_key
-            .verify(index_bytes, &signature)
-            .map_err(|e| HubError::SignatureVerification {
-                reason: format!("Ed25519 verification failed: {e}"),
-            })
     }
 
     /// Resolves a model name or alias against the index.
@@ -293,7 +238,7 @@ impl RegistryClient {
             }
         };
 
-        // Verify SHA-256 against signed index
+        // Verify SHA-256 against the index entry the manifest was resolved from
         let actual_digest = hex::encode(Sha256Hasher::digest(&manifest_bytes));
         if actual_digest != model_entry.manifest_sha256.as_str() {
             return Err(HubError::DigestMismatch {
@@ -333,47 +278,6 @@ impl RegistryClient {
             None
         }
     }
-}
-
-/// Parses an ed25519 signature from 64 raw bytes, 128 hex characters, or base64.
-fn parse_signature(bytes: &[u8]) -> Result<Signature, HubError> {
-    if bytes.len() == 64 {
-        let arr: [u8; 64] = bytes
-            .try_into()
-            .map_err(|_| HubError::SignatureVerification {
-                reason: "signature must be 64 bytes".to_string(),
-            })?;
-        return Ok(Signature::from_bytes(&arr));
-    }
-
-    let text = String::from_utf8_lossy(bytes).trim().to_string();
-    if text.len() == 128 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let raw = hex::decode(&text).map_err(|e| HubError::SignatureVerification {
-            reason: format!("invalid signature hex: {e}"),
-        })?;
-        let arr: [u8; 64] = raw
-            .try_into()
-            .map_err(|_| HubError::SignatureVerification {
-                reason: "signature must be 64 bytes".to_string(),
-            })?;
-        return Ok(Signature::from_bytes(&arr));
-    }
-
-    let clean: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    if let Ok(raw) = base64::prelude::BASE64_STANDARD.decode(&clean)
-        && raw.len() == 64
-    {
-        let arr: [u8; 64] = raw
-            .try_into()
-            .map_err(|_| HubError::SignatureVerification {
-                reason: "signature must be 64 bytes".to_string(),
-            })?;
-        return Ok(Signature::from_bytes(&arr));
-    }
-
-    Err(HubError::SignatureVerification {
-        reason: "signature must be 64 bytes (raw, 128-hex, or base64)".to_string(),
-    })
 }
 
 /// Atomically writes `bytes` to `dest` using a temporary file.
