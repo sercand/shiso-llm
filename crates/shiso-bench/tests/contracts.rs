@@ -45,7 +45,12 @@ use shiso_core::{Backend, DeviceView, Model};
 use shiso_engine::{Checkpointed, Reason, ResumeInfo, ResumeSource, SaveOutcome};
 use shiso_ir::Usage;
 use shiso_kvstore::{CommitOpts, Frontier, KvCache, KvError, Lookup, PersistOutcome, Resume};
+use shiso_models::flux2::config::ImageModelDesc;
 use shiso_server::tokenizer::{TokenizerError, Vocabulary};
+use shiso_vision::generator::{
+    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat,
+    ImageStepEvent, InputReferenceImage,
+};
 
 // ---------------------------------------------------------------------------
 // object safety
@@ -336,6 +341,106 @@ type OpenDiarizer =
         &std::sync::Arc<dyn Backend>,
     ) -> Result<std::sync::Arc<dyn shiso_audio::Diarizer>, shiso_audio::AudioError>;
 const _: OpenDiarizer = shiso_models::audio_registry::open_diarizer;
+
+// ---------------------------------------------------------------------------
+// Image generation.
+//
+// The wire handlers build a job, the server's image worker holds the
+// generator as a trait object and answers the job with encoded bytes, and
+// each family opens through the registry; losing object safety, or a field
+// type drifting on the job, the image or the service description, would
+// surface here rather than in the wire adapters.
+
+const _: Option<&dyn ImageGenerator> = None;
+
+/// The opener the server calls: a described checkpoint and a shared backend
+/// answer with the trait object the worker holds.
+type OpenImageGenerator = fn(
+    &ImageModelDesc,
+    &std::sync::Arc<dyn Backend>,
+) -> Result<std::sync::Arc<dyn ImageGenerator>, ImageGenError>;
+const _: OpenImageGenerator = shiso_models::image_registry::open_image_generator;
+
+/// A generation takes the validated job and an optional progress callback
+/// and answers with the encoded image - the one door between the worker and
+/// a family.
+type Generate = fn(
+    &(dyn ImageGenerator + 'static),
+    &ImageGenerationJob,
+    Option<&dyn Fn(ImageStepEvent)>,
+) -> Result<GeneratedImage, ImageGenError>;
+const _: Generate = <dyn ImageGenerator>::generate;
+
+/// A job read apart: prompt, pixel dimensions and step count as u32, the
+/// core `Seed` newtype rather than a raw integer the pipeline would have to
+/// reinterpret, the requested encoding, and any reference images for
+/// image-to-image work.
+type JobFields = (
+    String,
+    u32,
+    u32,
+    u32,
+    Seed,
+    ImageOutputFormat,
+    Option<u32>,
+    Vec<InputReferenceImage>,
+);
+fn image_generation_job_fields(job: ImageGenerationJob) -> JobFields {
+    (
+        job.prompt,
+        job.width,
+        job.height,
+        job.steps,
+        job.seed,
+        job.output_format,
+        job.output_compression,
+        job.input_references,
+    )
+}
+const _: fn(ImageGenerationJob) -> JobFields = image_generation_job_fields;
+
+/// A finished generation read apart: encoded bytes with the MIME string and
+/// the pixel and token counts the wire response reports.
+type GeneratedImageFields = (Vec<u8>, &'static str, u32, u32, u32, u32);
+fn generated_image_fields(image: GeneratedImage) -> GeneratedImageFields {
+    (
+        image.bytes,
+        image.media_type,
+        image.width,
+        image.height,
+        image.prompt_tokens,
+        image.completion_tokens,
+    )
+}
+const _: fn(GeneratedImage) -> GeneratedImageFields = generated_image_fields;
+
+/// What the worker thread is started with, read apart: the generator as the
+/// trait object the server holds, its wire name, and the queue ceiling.
+type ImageServiceDescFields = (std::sync::Arc<dyn ImageGenerator>, String, usize);
+fn image_service_desc_fields(
+    desc: shiso_server::image::ImageServiceDesc,
+) -> ImageServiceDescFields {
+    (desc.generator, desc.model_id, desc.max_queue)
+}
+const _: fn(shiso_server::image::ImageServiceDesc) -> ImageServiceDescFields =
+    image_service_desc_fields;
+
+/// Every variant of the generator's error, named: the wire handlers map
+/// them onto HTTP statuses, so a rename or a removed variant must stop
+/// here rather than in a downstream match arm. The match is exhaustive in
+/// both directions: a variant added upstream makes it non-exhaustive.
+fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
+    match error {
+        ImageGenError::EmptyPrompt => (0, 0, 0),
+        ImageGenError::InvalidDimensions { width, height } => (1, *width, *height),
+        ImageGenError::UnsupportedFormat(_) => (2, 0, 0),
+        ImageGenError::ReferenceImage(_) => (3, 0, 0),
+        ImageGenError::Backend(_) => (4, 0, 0),
+        ImageGenError::Encoding(_) => (5, 0, 0),
+        ImageGenError::Checkpoint(_) => (6, 0, 0),
+    }
+}
+const _: fn(&ImageGenError) -> (u8, u32, u32) = image_gen_error_variants;
 
 /// The contracts above are checked by the compiler, so this file building at
 /// all is the result. The test exists so a target that stopped being built
