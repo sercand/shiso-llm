@@ -528,11 +528,19 @@ pub struct ServeArgs {
     pub image_max_queue: usize,
     /// Denoising steps a request that names none gets. More is slower and,
     /// past the point the checkpoint was distilled for, not better.
-    #[arg(long, env = "SHISO_IMAGE_DEFAULT_STEPS", default_value_t = 4)]
+    #[arg(
+        long,
+        env = "SHISO_IMAGE_DEFAULT_STEPS",
+        default_value_t = crate::image::DEFAULT_STEPS
+    )]
     pub image_default_steps: u32,
     /// The image size a request that names none gets, as `WxH`
     /// (e.g. 1024x1024). Both sides must be divisible by 16.
-    #[arg(long, env = "SHISO_IMAGE_DEFAULT_SIZE", default_value = "1024x1024")]
+    #[arg(
+        long,
+        env = "SHISO_IMAGE_DEFAULT_SIZE",
+        default_value = crate::image::DEFAULT_SIZE
+    )]
     pub image_default_size: String,
     /// Which reasoning parser to use on model output.
     #[arg(
@@ -645,6 +653,14 @@ pub enum ConfigError {
         /// The one it needs beside it.
         missing: &'static str,
     },
+    /// An `--image-default-size` that is not a servable `WxH`.
+    #[error("--image-default-size {value} is not servable: {reason}")]
+    BadImageSize {
+        /// The value as it was given.
+        value: String,
+        /// Why it cannot be served, from the size grammar.
+        reason: String,
+    },
 }
 
 impl ServeArgs {
@@ -746,6 +762,17 @@ impl ServeArgs {
         if self.image_default_steps == 0 {
             return Err(ConfigError::Zero {
                 flag: "image-default-steps",
+            });
+        }
+        // The default size is parsed at boot, not at request time: a default
+        // the first caller trips over is an operator mistake found the
+        // expensive way. The wire clamps a caller's odd size; an operator's
+        // setting is refused rather than quietly rounded, because a default
+        // that silently moved is not the default that was configured.
+        if let Err(error) = crate::image::size::parse_exact_size(&self.image_default_size) {
+            return Err(ConfigError::BadImageSize {
+                value: self.image_default_size.clone(),
+                reason: error.to_string(),
             });
         }
         // A head with no depth is refused here: it is a gigabyte of weights
@@ -942,6 +969,26 @@ impl ServeArgs {
             || "asr".to_owned(),
             |stem| stem.to_string_lossy().into_owned(),
         ))
+    }
+
+    /// The geometry and step count an image request that names none gets.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::BadImageSize`] for a size `validate` would already have
+    /// refused; the parse is kept fallible so no caller has to assume
+    /// `validate` ran.
+    pub fn image_defaults(&self) -> Result<crate::image::ImageDefaults, ConfigError> {
+        let (width, height) = crate::image::size::parse_exact_size(&self.image_default_size)
+            .map_err(|error| ConfigError::BadImageSize {
+                value: self.image_default_size.clone(),
+                reason: error.to_string(),
+            })?;
+        Ok(crate::image::ImageDefaults {
+            steps: self.image_default_steps,
+            width,
+            height,
+        })
     }
 
     /// Where the architecture config is read from.

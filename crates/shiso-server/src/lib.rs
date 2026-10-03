@@ -129,7 +129,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         state = state.with_audio(audio);
     }
     if let Some(image) = image {
-        state = state.with_image(image);
+        state = state
+            .with_image(image)
+            .with_image_defaults(args.image_defaults()?);
     }
 
     shutdown::install();

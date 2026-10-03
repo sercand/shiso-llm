@@ -1,0 +1,414 @@
+//! `POST /images`, `POST /v1/images`, `POST /v1/images/generations`.
+//!
+//! # One request, two readings
+//!
+//! The blocking answer waits for each finished image and encodes one JSON
+//! body; the streamed one forwards the generator's step events as they happen
+//! and closes with the finished image. Both readings come from the same
+//! [`ImageGenerationJob`]s, so the `b64_json` of a streamed answer and of a
+//! blocking one are the same bytes for the same request.
+//!
+//! # What the wire values become
+//!
+//! The size grammar lives in [`crate::image::size`]: `WxH` is rounded to the
+//! generator's 16-grid and clamped to its bounds, and the named aspect ratios
+//! become the table's concrete pixels. `steps` has no wire field at all - the
+//! operator's `--image-default-steps` is the only say in it. `quality`,
+//! `user` and `session_id` are accepted and unused, each for the reason
+//! spelled out on the wire field.
+//!
+//! # Why a streamed request waits for its first frame
+//!
+//! A request the service refuses at admission - a job the generator would
+//! reject, a queue at its bound - is answered with a status code, not with a
+//! 200 whose first frame says it failed. That is the transcription route's
+//! pattern for the same reason, and past that point a failure arrives as an
+//! error frame, because a stream that has sent its 200 cannot take it back.
+
+use std::sync::Arc;
+
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::response::sse::{KeepAlive, Sse};
+use axum::response::{IntoResponse as _, Response};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use futures::StreamExt as _;
+use shiso_core::ids::Seed;
+use shiso_vision::generator::{
+    GeneratedImage, ImageGenerationJob, ImageOutputFormat, ImageStepEvent,
+};
+use tokio::sync::mpsc;
+
+use crate::api::sse::Frame;
+use crate::error::{AppError, type_for_status};
+use crate::image::ImageService;
+use crate::image::{self, size};
+use crate::openai::images_wire::{
+    ImageData, ImageGenCompletedEvent, ImageGenPartialImageEvent, ImageGenerationRequest,
+    ImageGenerationResponse, ImageGenerationUsage,
+};
+use crate::state::AppState;
+
+/// The handler for all three spellings of the route.
+///
+/// The body is taken as bytes and parsed here rather than through a typed
+/// extractor, for the chat route's reason: a malformed body must answer with
+/// this surface's error shape, not the extractor's.
+pub async fn generate_images(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    match answer(&state, &body).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+/// The handler, with its failures still typed.
+async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
+    let parsed: ImageGenerationRequest = serde_json::from_slice(body).map_err(|error| {
+        AppError::bad_request(
+            format!("the request body is not an image generation request: {error}"),
+            None,
+            "invalid_request",
+        )
+    })?;
+    // Refused before the image-model question: a body this server will never
+    // act on is the caller's fault whether or not a generator is loaded.
+    parsed.validate()?;
+    let service = state.image()?;
+    if let Some(quality) = parsed.quality.as_deref() {
+        tracing::debug!(
+            quality,
+            "quality is accepted and ignored: this server has one rendering path"
+        );
+    }
+    if let Some(model) = parsed.model.as_deref() {
+        tracing::debug!(
+            model,
+            served = service.model_id(),
+            "the named model is answered by whichever generator is loaded"
+        );
+    }
+    let plan = Plan::from_wire(&parsed, state)?;
+    if plan.stream {
+        stream(service.clone(), plan).await
+    } else {
+        buffered(service, &plan).await
+    }
+}
+
+/// One validated request as the server will run it: the job template and how
+/// many of it to make.
+///
+/// A named struct rather than a dozen arguments: the wire fields arrive
+/// together, get checked together, and both answer paths need all of them.
+#[derive(Debug)]
+struct Plan {
+    /// Prompt every image of the request carries.
+    prompt: String,
+    /// Output width, normalized to the grid.
+    width: u32,
+    /// Output height, normalized to the grid.
+    height: u32,
+    /// Denoising steps: the server default, since the wire names none.
+    steps: u32,
+    /// The seed of the first image: the named one, or entropy so the images
+    /// of one request differ from each other.
+    seed: u64,
+    /// Encoding every image is returned in.
+    output_format: ImageOutputFormat,
+    /// Compression, when the caller named one.
+    output_compression: Option<u32>,
+    /// How many images to generate, `1..=10`.
+    n: usize,
+    /// Whether the caller asked for the SSE stream.
+    stream: bool,
+}
+
+impl Plan {
+    /// Checks the wire values the format alone cannot judge - the size
+    /// grammar, the output format - and folds in the server defaults.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::BadRequest`] for a size string neither shape, and for an
+    /// output format the generator does not encode.
+    fn from_wire(parsed: &ImageGenerationRequest, state: &AppState) -> Result<Self, AppError> {
+        let (width, height) = match (parsed.size.as_deref(), parsed.aspect_ratio.as_deref()) {
+            // `size` wins when both are named: it is the more specific of the
+            // two, and a client that sends both wants the pixels it spelled.
+            (Some(value), _) => {
+                size::normalize_size(value).map_err(|error| size_error(&error, "size"))?
+            }
+            (None, Some(value)) => {
+                size::normalize_size(value).map_err(|error| size_error(&error, "aspect_ratio"))?
+            }
+            (None, None) => (state.image_defaults.width, state.image_defaults.height),
+        };
+        // The generator's own format parser is the one authority on what it
+        // encodes; its refusal is the request's fault and names the field.
+        let output_format = parsed
+            .output_format
+            .as_deref()
+            .map(str::parse::<ImageOutputFormat>)
+            .transpose()
+            .map_err(image::refuse)?;
+        Ok(Self {
+            prompt: parsed.prompt.clone(),
+            width,
+            height,
+            steps: state.image_defaults.steps,
+            // A named seed makes the request reproducible and image `i` of it
+            // gets `seed + i`; an unnamed one draws a base from the process's
+            // one entropy source so the `n` images of one request differ.
+            seed: parsed.seed.unwrap_or_else(crate::ids::entropy_u64),
+            output_format: output_format.unwrap_or_default(),
+            output_compression: parsed.output_compression,
+            n: parsed.n.unwrap_or(1),
+            stream: parsed.stream.unwrap_or(false),
+        })
+    }
+
+    /// The job for image `index` of the request.
+    fn job(&self, index: usize) -> ImageGenerationJob {
+        let offset = u64::try_from(index).unwrap_or(u64::MAX);
+        ImageGenerationJob {
+            prompt: self.prompt.clone(),
+            width: self.width,
+            height: self.height,
+            steps: self.steps,
+            seed: Seed::new(self.seed.wrapping_add(offset)),
+            output_format: self.output_format,
+            output_compression: self.output_compression,
+            input_references: Vec::new(),
+        }
+    }
+}
+
+/// A size refusal, naming the wire field that carried the value.
+fn size_error(error: &size::SizeError, param: &str) -> AppError {
+    AppError::bad_request(error.to_string(), Some(param), "invalid_request")
+}
+
+/// The token accounting across the images of one request: each image's
+/// estimate, summed.
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageTotals {
+    prompt: u32,
+    completion: u32,
+}
+
+impl UsageTotals {
+    fn add(&mut self, image: &GeneratedImage) {
+        self.prompt = self.prompt.saturating_add(image.prompt_tokens);
+        self.completion = self.completion.saturating_add(image.completion_tokens);
+    }
+
+    fn wire(self) -> ImageGenerationUsage {
+        ImageGenerationUsage {
+            prompt_tokens: self.prompt,
+            completion_tokens: self.completion,
+            total_tokens: self.prompt.saturating_add(self.completion),
+        }
+    }
+}
+
+/// The blocking answer: every image generated in turn, then one JSON body.
+///
+/// In turn, not at once: the service runs one generation at a time anyway,
+/// and a caller that asked for three gets them in request order.
+async fn buffered(service: &ImageService, plan: &Plan) -> Result<Response, AppError> {
+    let mut data = Vec::with_capacity(plan.n);
+    let mut usage = UsageTotals::default();
+    for index in 0..plan.n {
+        let generated = service.generate(plan.job(index)).await?;
+        usage.add(&generated);
+        data.push(ImageData {
+            b64_json: BASE64_STANDARD.encode(&generated.bytes),
+            media_type: Some(generated.media_type.to_owned()),
+        });
+    }
+    let body = ImageGenerationResponse {
+        created: crate::ids::unix_timestamp(),
+        data,
+        usage: Some(usage.wire()),
+    };
+    Ok(Json(body).into_response())
+}
+
+/// The streamed answer: frames from a task that runs the generations, after
+/// the first one has been admitted.
+///
+/// The handler waits for the task's first word before committing to the
+/// stream, so an admission refusal still answers with a status code.
+async fn stream(service: ImageService, plan: Plan) -> Result<Response, AppError> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<Frame, AppError>>();
+    tokio::spawn(run_stream(service, plan, tx));
+    let first = rx.recv().await.ok_or_else(|| {
+        AppError::internal("the image stream ended before it started", StreamGone)
+    })?;
+    let first = match first {
+        Err(error) => return Err(error),
+        Ok(frame) => frame,
+    };
+    let rest = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let frames = futures::stream::once(async move { Ok(first) })
+        .chain(rest)
+        .map(|item| match item {
+            Ok(frame) => Ok::<_, std::convert::Infallible>(frame.into_event()),
+            // Only the first item can carry an error and it was taken above;
+            // a later one goes out as the error frame a client already knows
+            // how to read rather than as a dropped connection.
+            Err(error) => Ok(error_frame(&error).into_event()),
+        });
+    Ok(Sse::new(frames)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+/// Runs the plan's generations and sends the frames as they happen.
+///
+/// A task rather than a stream state machine because the generation and the
+/// client's reading run at different speeds by design: a caller that stops
+/// reading does not stop the generation (the service's own rule), and the
+/// frames it missed are simply not sent.
+async fn run_stream(
+    service: ImageService,
+    plan: Plan,
+    tx: mpsc::UnboundedSender<Result<Frame, AppError>>,
+) {
+    let created = crate::ids::unix_timestamp();
+    let mut usage = UsageTotals::default();
+    let mut partial_index = 0u32;
+    // Whether any frame has been promised to the client yet: before the first
+    // one a failure is still answerable as a status code; after it, the 200
+    // is spent and the failure has to arrive as content.
+    let mut streaming = false;
+    for index in 0..plan.n {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ImageStepEvent>();
+        let mut running = Box::pin(service.generate_stream(plan.job(index), progress_tx));
+        let answer = loop {
+            tokio::select! {
+                step = progress_rx.recv() => {
+                    // A step event that carries no bytes produces no frame:
+                    // this event's payload is the partial image, and a step
+                    // tick has nothing to put in it. The keep-alive is what
+                    // tells a waiting client the generation is still alive.
+                    if let Some(event) = step
+                        && let Some(bytes) = event.partial_image
+                    {
+                        let frame = partial_frame(bytes, partial_index);
+                        partial_index += 1;
+                        if !send(&tx, Ok(frame), &mut streaming) {
+                            return;
+                        }
+                    }
+                }
+                answer = &mut running => break answer,
+            }
+        };
+        // The worker sends every step event before the reply, so anything
+        // still buffered belongs to this image and goes out before its
+        // completed frame.
+        while let Ok(event) = progress_rx.try_recv() {
+            if let Some(bytes) = event.partial_image {
+                let frame = partial_frame(bytes, partial_index);
+                partial_index += 1;
+                if !send(&tx, Ok(frame), &mut streaming) {
+                    return;
+                }
+            }
+        }
+        match answer {
+            Ok(generated) => {
+                usage.add(&generated);
+                let frame = completed_frame(created, &generated, usage.wire());
+                if !send(&tx, Ok(frame), &mut streaming) {
+                    return;
+                }
+            }
+            Err(error) => {
+                if !streaming {
+                    let _ = tx.send(Err(error));
+                    return;
+                }
+                let _ = tx.send(Ok(error_frame(&error)));
+                let _ = tx.send(Ok(Frame::done()));
+                return;
+            }
+        }
+    }
+    let _ = tx.send(Ok(Frame::done()));
+}
+
+/// Sends one frame and records that the stream has begun. `false` when the
+/// receiver is gone: the client stopped reading, and a generation nobody is
+/// waiting on does not owe the connection any more frames.
+fn send(
+    tx: &mpsc::UnboundedSender<Result<Frame, AppError>>,
+    frame: Result<Frame, AppError>,
+    streaming: &mut bool,
+) -> bool {
+    *streaming = true;
+    tx.send(frame).is_ok()
+}
+
+/// One partial-image frame.
+fn partial_frame(bytes: Vec<u8>, index: u32) -> Frame {
+    let body = ImageGenPartialImageEvent {
+        r#type: "image_generation.partial_image",
+        partial_image_index: index,
+        b64_json: BASE64_STANDARD.encode(bytes),
+    };
+    Frame::named(
+        "image_generation.partial_image",
+        serde_json::to_string(&body).expect("an event of strings and numbers always serializes"),
+    )
+}
+
+/// The completed-image frame for one finished image. Its `usage` is the
+/// request's running total, so the last frame of a multi-image stream carries
+/// the whole request's accounting.
+fn completed_frame(created: u64, image: &GeneratedImage, usage: ImageGenerationUsage) -> Frame {
+    let body = ImageGenCompletedEvent {
+        r#type: "image_generation.completed",
+        created,
+        b64_json: BASE64_STANDARD.encode(&image.bytes),
+        media_type: Some(image.media_type.to_owned()),
+        usage: Some(usage),
+    };
+    Frame::named(
+        "image_generation.completed",
+        serde_json::to_string(&body).expect("an event of strings and numbers always serializes"),
+    )
+}
+
+/// A failure that arrives after the stream has spent its 200: the same error
+/// object every other failure on this surface sends, as the frame's content,
+/// because a client that parses every frame as JSON should not have to
+/// special-case the one frame that says what went wrong (the chat surface's
+/// reasoning, verbatim).
+fn error_frame(error: &AppError) -> Frame {
+    let message = match error {
+        AppError::Internal { .. } => "internal server error".to_owned(),
+        other => other.to_string(),
+    };
+    Frame::data(
+        serde_json::json!({
+            "error": {
+                "message": message,
+                "type": type_for_status(error.status()),
+                "param": serde_json::Value::Null,
+                "code": error.code(),
+            }
+        })
+        .to_string(),
+    )
+}
+
+/// The stream task ended before it said anything.
+#[derive(Debug, thiserror::Error)]
+#[error("the image stream task ended before its first frame")]
+struct StreamGone;

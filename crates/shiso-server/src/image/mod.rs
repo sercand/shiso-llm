@@ -17,6 +17,8 @@
 
 mod worker;
 
+pub mod size;
+
 use std::sync::Arc;
 
 use shiso_vision::generator::{
@@ -25,6 +27,43 @@ use shiso_vision::generator::{
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::AppError;
+
+/// Denoising steps a request that names none gets unless `--image-default-steps`
+/// says otherwise.
+pub const DEFAULT_STEPS: u32 = 4;
+
+/// The size a request that names none gets unless `--image-default-size` says
+/// otherwise, in the `WxH` spelling the flag takes.
+pub const DEFAULT_SIZE: &str = "1024x1024";
+
+/// What an image request that names no geometry or step count gets.
+///
+/// The server-side counterpart of the wire's optional `size` and
+/// `aspect_ratio`: the operator chooses these once at boot
+/// (`--image-default-size`, `--image-default-steps`) and a caller that names
+/// nothing inherits them, exactly as a caller that names no temperature
+/// inherits [`AppState::sampling_preset`](crate::state::AppState::sampling_preset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageDefaults {
+    /// Denoising steps.
+    pub steps: u32,
+    /// Output width in pixels.
+    pub width: u32,
+    /// Output height in pixels.
+    pub height: u32,
+}
+
+impl Default for ImageDefaults {
+    /// The published defaults: [`DEFAULT_STEPS`] and the parsed form of
+    /// [`DEFAULT_SIZE`]. A test pins that the two spellings stay one fact.
+    fn default() -> Self {
+        Self {
+            steps: DEFAULT_STEPS,
+            width: 1024,
+            height: 1024,
+        }
+    }
+}
 
 /// A queued generation and where its answer and its progress go.
 #[derive(Debug)]
@@ -195,3 +234,25 @@ struct WorkerGone;
 #[derive(Debug, thiserror::Error)]
 #[error("the image generator panicked")]
 struct GeneratorPanicked;
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_SIZE, DEFAULT_STEPS, ImageDefaults, size};
+
+    /// The struct's hardcoded default and the published flag string are one
+    /// fact; a change to one without the other would make a booted server and
+    /// a test-built state answer a name-nothing request differently.
+    #[test]
+    fn the_default_defaults_are_the_published_ones() {
+        let (width, height) = size::parse_exact_size(DEFAULT_SIZE)
+            .expect("the published default size is servable by its own grammar");
+        assert_eq!(
+            ImageDefaults::default(),
+            ImageDefaults {
+                steps: DEFAULT_STEPS,
+                width,
+                height,
+            }
+        );
+    }
+}

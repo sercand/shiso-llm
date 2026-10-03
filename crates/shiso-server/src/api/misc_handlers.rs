@@ -421,6 +421,24 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
             supported_parameters: Vec::new(),
         });
     }
+    // The generator answers to its own id the same way, for the same reason:
+    // a client discovers what to name in `model` by reading this list.
+    if let Some(image) = &state.image {
+        data.push(ModelInfo {
+            id: image.model_id().to_owned(),
+            object: "model",
+            created,
+            owned_by: "shiso",
+            name: image.model_id().to_owned(),
+            context_length: 0,
+            top_provider: TopProvider {
+                context_length: 0,
+                max_completion_tokens: 0,
+                is_moderated: false,
+            },
+            supported_parameters: Vec::new(),
+        });
+    }
     ModelListResponse {
         object: "list",
         data,
