@@ -1,9 +1,9 @@
 //! The FLUX.2 unified diffusion transformer: double-stream and single-stream
 //! blocks over a joint text+image sequence.
 //!
-//! The graph mirrors the reference `Flux2` module under the checkpoint's own
-//! tensor names. `AdaLN` modulation is *shared*: one `Modulation` linear per
-//! stream kind (`double_stream_modulation_img.lin`, `..._txt`,
+//! The graph mirrors the reference's transformer module under the checkpoint's
+//! own tensor names. `AdaLN` modulation is *shared*: one modulation linear
+//! per stream kind (`double_stream_modulation_img.lin`, `..._txt`,
 //! `single_stream_modulation`) projects `silu` of the timestep embedding once
 //! per forward and every block of that kind reuses the chunks - there are no
 //! per-block modulation weights. Double blocks norm with weightless
@@ -11,7 +11,7 @@
 //! heads before `RoPE`, and run `SwiGLU` MLPs whose gate is the *first* half
 //! of the fused row. Single blocks fuse qkv and the MLP gate/value into one
 //! `linear1` (qkv | gate | value), attend over the joint sequence, and carry
-//! a single gated residual around `linear2(cat(attn, swiglu))`. The final
+//! a single gated residual around `linear2(concat(attn, swiglu))`. The final
 //! layer is `LayerNorm` + modulation + `final_layer.linear`, which is the
 //! velocity head itself.
 //!
@@ -39,7 +39,7 @@ use super::weights::{Lin, StStore};
 /// `LayerNorm` / `QK-norm` epsilon the reference blocks use.
 const NORM_EPS: f32 = 1e-6;
 
-/// The reference's `time_factor`: the pipeline hands the transformer the raw
+/// The reference's timestep scale: the pipeline hands the transformer the raw
 /// sigma and the 1000x scaling happens inside the sinusoidal embedding.
 const TIME_FACTOR: f32 = 1000.0;
 
@@ -166,7 +166,7 @@ pub(crate) struct DiT {
     rope_freqs: DeviceBuffer,
 }
 
-/// The reference's `timestep_embedding` frequency table:
+/// The reference's timestep frequency table:
 /// `exp(-ln(10000) * i / half)`.
 #[expect(
     clippy::cast_precision_loss,
@@ -263,13 +263,13 @@ impl DiT {
         let time_in_out = Lin::load(store, ops, "time_in.out_layer")?;
         expect_shape(&img_in, h, params.in_channels, "img_in")?;
         expect_shape(&txt_in, h, params.context_in_dim, "txt_in")?;
-        // The reference's `timestep_embedding` width is fixed at 256, so the
+        // The reference's timestep embedding width is fixed at 256, so the
         // embedder's input must be too.
         expect_shape(&time_in_in, h, 256, "time_in.in_layer")?;
         expect_shape(&time_in_out, h, h, "time_in.out_layer")?;
 
         // The shared modulations: one linear per stream kind, applied to
-        // silu(vec) once per forward (reference `Modulation`).
+        // silu(vec) once per forward (the reference's modulation module).
         let double_mod_img = Lin::load(store, ops, "double_stream_modulation_img.lin")?;
         let double_mod_txt = Lin::load(store, ops, "double_stream_modulation_txt.lin")?;
         let single_mod = Lin::load(store, ops, "single_stream_modulation.lin")?;
@@ -426,7 +426,7 @@ impl DiT {
             input.ref_tokens
         };
 
-        // Timestep embedding (the reference's `timestep_embedding`): the raw
+        // Timestep embedding (the reference's sinusoidal embedding): the raw
         // sigma is scaled by 1000 here, the table is cos-then-sin, f32.
         let half = self.time_in_in.in_dim / 2;
         let t = input.timestep * TIME_FACTOR;
@@ -439,9 +439,9 @@ impl DiT {
         }
         let emb_buf = ops.upload_f32("dit timestep", &emb)?;
 
-        // `MLPEmbedder`: out_layer(silu(in_layer(emb))). The two GEMMs write
-        // distinct buffers; an in-place m=1 GEMM would race its accumulator
-        // against the input it reads.
+        // The reference's MLP embedder: out_layer(silu(in_layer(emb))). The
+        // two GEMMs write distinct buffers; an in-place m=1 GEMM would race
+        // its accumulator against the input it reads.
         let temb1 = ops.alloc_f32("dit temb", h)?;
         ops.gemm(&GemmCall {
             step: "dit time in",
@@ -911,8 +911,8 @@ impl DiT {
             fused,
         )?;
 
-        // linear2 reads cat(attn, swiglu) and the block carries a single
-        // gated residual (the reference's `_out`).
+        // linear2 reads concat(attn, swiglu) and the block carries a single
+        // gated residual (the reference's output gating).
         let lin2_in = ops.alloc_f32("dit single lin2 in", s_total * (h + inner))?;
         ops.concat_rows(&ConcatCall {
             step: "dit single concat",

@@ -190,7 +190,7 @@ fn fused_values(count: usize, seed: usize) -> Vec<f32> {
 }
 
 /// Naive interleaved-pair rotation of the listed row sections, written from
-/// the reference's `apply_rope`: pair `j` of axis `a` turns by
+/// the reference's rotary embedding: pair `j` of axis `a` turns by
 /// `pos_a * freq_a` (one frequency per axis in this geometry).
 fn expect_rope(
     x: &[f32],

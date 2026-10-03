@@ -31,7 +31,7 @@ kernel void kernel_flux2_silu_f32(
 
 /// SiLU gate over a fused row: `out[r,i] = silu(in[r,i]) * in[r,inner+i]`.
 ///
-/// The gate is the FIRST half (the reference's `SiLUActivation` chunks the
+/// The gate is the FIRST half (the reference's gating chunks the
 /// row in two and silus the first chunk). The input is one strided buffer
 /// whose view may start mid-row (the single block's halves begin at column
 /// 3h of the fused row); the output is packed `(rows, inner)`. The driver
@@ -391,7 +391,8 @@ kernel void kernel_flux2_qk_norm_f32(
 }
 
 /// Row-wise concatenation: `out[r] = [a[r], b[r]]`, both sides packed (the
-/// single block's `linear2` input, the reference's `cat(attn, mlp_act)`).
+/// single block's `linear2` input, the reference's concatenation of attention
+/// and MLP output).
 kernel void kernel_flux2_concat_rows_f32(
         constant flux2_args_concat & args [[buffer(0)]],
         device float *out                  [[buffer(1)]],
@@ -625,8 +626,8 @@ kernel void kernel_flux2_gqa_f32(
 
 /// One section's interleaved-pair rotation: pair `j` of axis `a` turns by
 /// `pos_a * freq[a * freqs_per_axis + j]`, the pairs adjacent within the
-/// axis (`i0 = a * axis_dim + 2j`), exactly the reference's `apply_rope` and
-/// the host twin's loop.
+/// axis (`i0 = a * axis_dim + 2j`), exactly the reference's rotary embedding
+/// and the host twin's loop.
 static inline void flux2_rope_section(
         device float *buf, uint row,
         device const float *positions, device const float *freqs,

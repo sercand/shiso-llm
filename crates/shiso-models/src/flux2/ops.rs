@@ -403,7 +403,8 @@ pub(crate) struct QkNormCall<'a> {
 }
 
 /// Row-wise concatenation: `out[r] = [a[r], b[r]]` (the single block's
-/// `linear2` input, the reference's `cat(attn, mlp_act)`).
+/// `linear2` input, the reference's concatenation of attention and MLP
+/// output).
 pub(crate) struct ConcatCall<'a> {
     pub step: &'static str,
     pub out: DeviceView<'a>,
@@ -714,7 +715,7 @@ impl Ops {
     /// `SwiGLU` over a fused row: out[r, i] = silu(in[r, i]) * in[r, inner + i].
     ///
     /// The reference's activation gates with the *first* half of the row
-    /// (`SiLUActivation` chunks in two and applies `silu` to the first
+    /// (the reference chunks the row in two and applies `silu` to the first
     /// chunk), so the double-block MLP and the single-block `linear1` both
     /// emit (gate, value) in that order. The kernel reads one strided buffer
     /// (the single block's halves start mid-row) and writes a packed
