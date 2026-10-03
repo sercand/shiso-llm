@@ -230,10 +230,11 @@ pub type ImageAnswer = Pin<Box<dyn Future<Output = Result<GeneratedImage, AppErr
 /// The HTTP failure an [`ImageGenError`] answers with.
 ///
 /// The generator's caller-side refusals (a blank prompt, dimensions off the
-/// 16-grid, a format it does not encode, undecodable reference bytes) are the
-/// request's fault and answer 400; its device-side failures (compute,
-/// encoding, a checkpoint that went bad) are this server's fault and answer
-/// 500 with the cause kept as a real source for the log.
+/// 16-grid, a zero step count, a format it does not encode, undecodable
+/// reference bytes) are the request's fault and answer 400; its device-side
+/// failures (compute, encoding, a checkpoint that went bad) are this
+/// server's fault and answer 500 with the cause kept as a real source for
+/// the log.
 #[must_use]
 pub fn refuse(error: ImageGenError) -> AppError {
     let message = error.to_string();
@@ -243,6 +244,9 @@ pub fn refuse(error: ImageGenError) -> AppError {
         }
         ImageGenError::InvalidDimensions { .. } => {
             AppError::bad_request(message, Some("size"), "invalid_request")
+        }
+        ImageGenError::InvalidSteps { .. } => {
+            AppError::bad_request(message, Some("steps"), "invalid_request")
         }
         ImageGenError::UnsupportedFormat(_) => {
             AppError::bad_request(message, Some("output_format"), "invalid_request")

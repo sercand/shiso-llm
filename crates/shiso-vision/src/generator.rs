@@ -60,6 +60,13 @@ pub enum ImageGenError {
         /// Height in pixels.
         height: u32,
     },
+    /// Requested denoising step count is zero: a job with no steps has no
+    /// answer to give, so it is the request's fault, not a device failure.
+    #[error("invalid step count {steps}: at least one denoising step is required")]
+    InvalidSteps {
+        /// The step count as requested.
+        steps: u32,
+    },
     /// Format is not supported.
     #[error("unsupported image format {0:?}: only png and jpeg are supported")]
     UnsupportedFormat(String),
@@ -106,10 +113,11 @@ pub struct ImageGenerationJob {
 }
 
 impl ImageGenerationJob {
-    /// Validates prompt content and dimension constraints.
+    /// Validates prompt content, dimension constraints and the step count.
     ///
     /// # Errors
-    /// Returns [`ImageGenError::EmptyPrompt`] or [`ImageGenError::InvalidDimensions`].
+    /// Returns [`ImageGenError::EmptyPrompt`], [`ImageGenError::InvalidDimensions`]
+    /// or [`ImageGenError::InvalidSteps`].
     pub fn validate(&self) -> Result<(), ImageGenError> {
         if self.prompt.trim().is_empty() {
             return Err(ImageGenError::EmptyPrompt);
@@ -125,6 +133,9 @@ impl ImageGenerationJob {
                 width: self.width,
                 height: self.height,
             });
+        }
+        if self.steps == 0 {
+            return Err(ImageGenError::InvalidSteps { steps: self.steps });
         }
         Ok(())
     }

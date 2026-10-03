@@ -287,6 +287,29 @@ async fn image_service_refuses_an_invalid_job_before_queueing_it() {
 }
 
 #[tokio::test]
+async fn image_service_refuses_a_zero_step_job_as_a_bad_request() {
+    // `steps` has no wire field, so this refusal is met through the service,
+    // not the router: a zero step count is the job's own invalid input and
+    // must answer 400, not ride the device-failure 500.
+    let service = ImageService::start(ImageServiceDesc {
+        generator: Arc::new(MockGenerator),
+        model_id: "mock-flux".to_string(),
+        max_queue: 4,
+    })
+    .expect("starts image service");
+
+    let error = service
+        .generate(job("a red door", 0))
+        .await
+        .expect_err("a job with no steps has no answer");
+    assert_eq!(
+        error.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "a zero step count is the request's fault: {error}"
+    );
+}
+
+#[tokio::test]
 async fn image_service_admits_synchronously_and_answers_through_the_future() {
     // Admission is the synchronous half the stream handler is built on: a
     // refusal is in hand with nothing awaited, and an accepted job's answer

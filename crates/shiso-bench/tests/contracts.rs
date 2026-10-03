@@ -435,6 +435,7 @@ fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
     match error {
         ImageGenError::EmptyPrompt => (0, 0, 0),
         ImageGenError::InvalidDimensions { width, height } => (1, *width, *height),
+        ImageGenError::InvalidSteps { steps } => (7, *steps, 0),
         ImageGenError::UnsupportedFormat(msg) => {
             let _: &String = msg;
             (2, 0, 0)
