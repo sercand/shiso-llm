@@ -8,6 +8,7 @@
 //! `shiso-models`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -114,6 +115,48 @@ impl ImageGenerator for FailingSecondGenerator {
                 "the second job always fails".to_owned(),
             ));
         }
+        Ok(GeneratedImage {
+            bytes: png_bytes(),
+            media_type: "image/png",
+            width: job.width,
+            height: job.height,
+            prompt_tokens: 10,
+            completion_tokens: 1024,
+        })
+    }
+}
+
+/// A generator that reports it has started and then waits until the test
+/// releases it, emitting no step events at all: how a stream's head is
+/// caught while the first generation is still running and no partial
+/// exists yet.
+#[derive(Debug)]
+struct GateGenerator {
+    started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    gate: Mutex<mpsc::Receiver<()>>,
+}
+
+impl ImageGenerator for GateGenerator {
+    fn model_id(&self) -> &'static str {
+        "mock-flux"
+    }
+
+    fn generate(
+        &self,
+        job: &ImageGenerationJob,
+        _progress: Option<&dyn Fn(ImageStepEvent)>,
+    ) -> Result<GeneratedImage, ImageGenError> {
+        if let Some(sender) = self
+            .started
+            .lock()
+            .expect("the started lock is never poisoned")
+            .take()
+        {
+            let _gone = sender.send(());
+        }
+        // Waits for the test's token; when the test drops the sender the
+        // wait ends and the job completes.
+        let _gone = self.gate.lock().expect("the gate lock is never poisoned").recv();
         Ok(GeneratedImage {
             bytes: png_bytes(),
             media_type: "image/png",
@@ -461,6 +504,71 @@ fn sse_frames(text: &str) -> Vec<(&str, &str)> {
             (name, data)
         })
         .collect()
+}
+
+#[tokio::test]
+async fn a_streamed_head_arrives_at_admission_not_at_the_first_partial() {
+    // The contract the module doc states: the 200 head is flushed by the
+    // admission comment, so a client sees the status and the event-stream
+    // content type while the first generation is still inside the generator
+    // and no partial has been decoded. Before the split this call waited
+    // for the first frame, which here means waiting for the release below.
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let generator = Arc::new(GateGenerator {
+        started: Mutex::new(Some(started_tx)),
+        gate: Mutex::new(release_rx),
+    });
+    let boxed: Arc<dyn ImageGenerator> = generator;
+    let service = ImageService::start(ImageServiceDesc {
+        generator: boxed,
+        model_id: "mock-flux".to_owned(),
+        max_queue: 8,
+    })
+    .expect("starts image service");
+    let state = Arc::new(AppState::without_language_model().with_image(service));
+    // Polling the request and the start signal together: the head must
+    // arrive while the generator is provably inside the job, gate held.
+    let (response, started) = tokio::join!(
+        build_router(state).oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"prompt": "a red door", "stream": true}).to_string(),
+                ))
+                .expect("builds"),
+        ),
+        started_rx,
+    );
+    let response = response.expect("the head arrives while the generation is blocked");
+    started.expect("the generator started the job");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")),
+        "a stream says so"
+    );
+    // Release the generator and read the stream to its end.
+    drop(release_tx);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body reads");
+    let text = String::from_utf8(bytes.to_vec()).expect("frames are UTF-8");
+    assert!(
+        text.contains(": accepted"),
+        "the admission comment opens the stream: {text}"
+    );
+    // The comment is not an event: the wire event shape is unchanged -
+    // completed frame, then the terminator.
+    let events = sse_frames(&text);
+    let names: Vec<&str> = events.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names, vec!["image_generation.completed", ""], "{text}");
+    assert_eq!(events.last().expect("a last frame").1, "[DONE]");
 }
 
 #[tokio::test]

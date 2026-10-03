@@ -285,3 +285,32 @@ async fn image_service_refuses_an_invalid_job_before_queueing_it() {
         "a job the generator would refuse is the request's fault: {error}"
     );
 }
+
+#[tokio::test]
+async fn image_service_admits_synchronously_and_answers_through_the_future() {
+    // Admission is the synchronous half the stream handler is built on: a
+    // refusal is in hand with nothing awaited, and an accepted job's answer
+    // arrives on the returned future exactly as `generate` would deliver it.
+    let service = ImageService::start(ImageServiceDesc {
+        generator: Arc::new(MockGenerator),
+        model_id: "mock-flux".to_string(),
+        max_queue: 4,
+    })
+    .expect("starts image service");
+
+    let error = match service.admit(job("   ", 4), None) {
+        Ok(_answer) => panic!("a blank prompt is never admitted"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "the refusal is the same one `generate` answers with: {error}"
+    );
+
+    let answer = service
+        .admit(job("a red door", 4), None)
+        .expect("a valid job is admitted");
+    let image = answer.await.expect("the worker answers the admitted job");
+    assert_eq!(image.width, 512);
+}

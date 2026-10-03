@@ -19,20 +19,24 @@
 //! `session_id` are accepted and unused, each for the reason spelled out on
 //! the wire field.
 //!
-//! # Why a streamed request waits for its first frame
+//! # Why a streamed request waits for admission
 //!
 //! A request the service refuses at admission - a job the generator would
 //! reject, a queue at its bound - is answered with a status code, not with a
 //! 200 whose first frame says it failed. That is the transcription route's
-//! pattern for the same reason, and past that point a failure arrives as an
-//! error frame, because a stream that has sent its 200 cannot take it back.
+//! pattern for the same reason. The handler therefore waits only for the
+//! admission answer, not for the first content frame: admission sends an SSE
+//! comment (`: accepted`), which no client has to parse, and the 200 head
+//! reaches the caller the moment the job is queued rather than when the
+//! first partial is decoded. Past that point a failure arrives as an error
+//! frame, because a stream that has sent its 200 cannot take it back.
 
 use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::response::sse::{KeepAlive, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse as _, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -252,31 +256,33 @@ async fn buffered(service: &ImageService, plan: &Plan) -> Result<Response, AppEr
 /// The streamed answer: frames from a task that runs the generations, after
 /// the first one has been admitted.
 ///
-/// The handler waits for the task's first word before committing to the
-/// stream, so an admission refusal still answers with a status code.
+/// The handler waits for the task's admission answer before committing to
+/// the stream, so an admission refusal still answers with a status code;
+/// the answer on success is a comment frame, so the head is flushed at
+/// admission rather than at the first decoded partial.
 async fn stream(service: ImageService, plan: Plan) -> Result<Response, AppError> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Result<Frame, AppError>>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<Event, AppError>>();
     tokio::spawn(run_stream(service, plan, tx));
     let first = rx.recv().await.ok_or_else(|| {
         AppError::internal("the image stream ended before it started", StreamGone)
     })?;
     let first = match first {
         Err(error) => return Err(error),
-        Ok(frame) => frame,
+        Ok(event) => event,
     };
     let rest = futures::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
     });
-    let frames = futures::stream::once(async move { Ok(first) })
+    let events = futures::stream::once(async move { Ok(first) })
         .chain(rest)
         .map(|item| match item {
-            Ok(frame) => Ok::<_, std::convert::Infallible>(frame.into_event()),
+            Ok(event) => Ok::<_, std::convert::Infallible>(event),
             // Only the first item can carry an error and it was taken above;
             // a later one goes out as the error frame a client already knows
             // how to read rather than as a dropped connection.
             Err(error) => Ok(error_frame(&error).into_event()),
         });
-    Ok(Sse::new(frames)
+    Ok(Sse::new(events)
         .keep_alive(KeepAlive::default())
         .into_response())
 }
@@ -290,7 +296,7 @@ async fn stream(service: ImageService, plan: Plan) -> Result<Response, AppError>
 async fn run_stream(
     service: ImageService,
     plan: Plan,
-    tx: mpsc::UnboundedSender<Result<Frame, AppError>>,
+    tx: mpsc::UnboundedSender<Result<Event, AppError>>,
 ) {
     let created = crate::ids::unix_timestamp();
     let mut usage = UsageTotals::default();
@@ -298,28 +304,54 @@ async fn run_stream(
     // request: with n>1 the counter keeps incrementing into the second image
     // rather than restarting, which is why it lives outside the loop.
     let mut partial_index = 0u32;
-    // Whether any frame has been promised to the client yet: before the first
-    // one a failure is still answerable as a status code; after it, the 200
-    // is spent and the failure has to arrive as content.
+    // Whether any item has been promised to the client yet (the acceptance
+    // comment counts): before the first one a failure is still answerable
+    // as a status code; after it, the 200 is spent and the failure has to
+    // arrive as content.
     let mut streaming = false;
     for index in 0..plan.n {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ImageStepEvent>();
-        let mut running = Box::pin(service.generate_stream(plan.job(index), progress_tx));
+        // Admission is decided synchronously - validate and the queue slot -
+        // so a refusal is still answerable as a status code while nothing
+        // has gone out, and an accepted job can flush the head before the
+        // first step runs.
+        let mut running = match service.admit(plan.job(index), Some(progress_tx)) {
+            Ok(answer) => answer,
+            Err(error) => {
+                fail(&tx, error, streaming);
+                return;
+            }
+        };
+        // The acceptance comment: it carries no event and no data, so the
+        // wire event shape is unchanged, but it is the first item out of
+        // this task, which is the moment the handler commits to the 200.
+        if !send(&tx, Ok(accepted_event()), &mut streaming) {
+            return;
+        }
+        // The worker drops its progress sender before it sends the reply,
+        // so `recv` starts answering `None` while the answer is still
+        // pending; a bare `recv` branch would then hand back `None` forever
+        // and spin beside the running generation, so the branch is disabled
+        // once the channel says it is done.
+        let mut progress_open = true;
         let answer = loop {
             tokio::select! {
-                step = progress_rx.recv() => {
-                    // A step event that carries no bytes produces no frame:
-                    // this event's payload is the partial image, and a step
-                    // tick has nothing to put in it. The keep-alive is what
-                    // tells a waiting client the generation is still alive.
-                    if let Some(event) = step
-                        && let Some(bytes) = event.partial_image
-                    {
-                        let frame = partial_frame(bytes, partial_index);
-                        partial_index += 1;
-                        if !send(&tx, Ok(frame), &mut streaming) {
-                            return;
+                step = progress_rx.recv(), if progress_open => {
+                    match step {
+                        Some(event) => {
+                            // A step event that carries no bytes produces no frame:
+                            // this event's payload is the partial image, and a step
+                            // tick has nothing to put in it. The keep-alive is what
+                            // tells a waiting client the generation is still alive.
+                            if let Some(bytes) = event.partial_image {
+                                let frame = partial_frame(bytes, partial_index);
+                                partial_index += 1;
+                                if !send(&tx, Ok(frame.into_event()), &mut streaming) {
+                                    return;
+                                }
+                            }
                         }
+                        None => progress_open = false,
                     }
                 }
                 answer = &mut running => break answer,
@@ -332,7 +364,7 @@ async fn run_stream(
             if let Some(bytes) = event.partial_image {
                 let frame = partial_frame(bytes, partial_index);
                 partial_index += 1;
-                if !send(&tx, Ok(frame), &mut streaming) {
+                if !send(&tx, Ok(frame.into_event()), &mut streaming) {
                     return;
                 }
             }
@@ -341,34 +373,54 @@ async fn run_stream(
             Ok(generated) => {
                 usage.add(&generated);
                 let frame = completed_frame(created, &generated, usage.wire());
-                if !send(&tx, Ok(frame), &mut streaming) {
+                if !send(&tx, Ok(frame.into_event()), &mut streaming) {
                     return;
                 }
             }
             Err(error) => {
-                if !streaming {
-                    let _ = tx.send(Err(error));
-                    return;
-                }
-                let _ = tx.send(Ok(error_frame(&error)));
-                let _ = tx.send(Ok(Frame::done()));
+                fail(&tx, error, streaming);
                 return;
             }
         }
     }
-    let _ = tx.send(Ok(Frame::done()));
+    let _ = tx.send(Ok(Frame::done().into_event()));
 }
 
-/// Sends one frame and records that the stream has begun. `false` when the
+/// Reports a failure at the right altitude: while nothing has been promised
+/// it is the first item and still answers as a status code; after the 200 is
+/// spent it goes out as the error frame and the terminator, because a stream
+/// cannot take its 200 back.
+fn fail(
+    tx: &mpsc::UnboundedSender<Result<Event, AppError>>,
+    error: AppError,
+    streaming: bool,
+) {
+    if !streaming {
+        let _ = tx.send(Err(error));
+        return;
+    }
+    let _ = tx.send(Ok(error_frame(&error).into_event()));
+    let _ = tx.send(Ok(Frame::done().into_event()));
+}
+
+/// Sends one item and records that the stream has begun. `false` when the
 /// receiver is gone: the client stopped reading, and a generation nobody is
 /// waiting on does not owe the connection any more frames.
 fn send(
-    tx: &mpsc::UnboundedSender<Result<Frame, AppError>>,
-    frame: Result<Frame, AppError>,
+    tx: &mpsc::UnboundedSender<Result<Event, AppError>>,
+    event: Result<Event, AppError>,
     streaming: &mut bool,
 ) -> bool {
     *streaming = true;
-    tx.send(frame).is_ok()
+    tx.send(event).is_ok()
+}
+
+/// The SSE comment that says the request was admitted. A comment carries no
+/// event and no data - every SSE client ignores it - so the wire event shape
+/// is unchanged; its whole job is to be the first item out, which is what
+/// flushes the 200 head at admission rather than at the first partial.
+fn accepted_event() -> Event {
+    Event::default().comment("accepted")
 }
 
 /// One partial-image frame.

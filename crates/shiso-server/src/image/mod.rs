@@ -19,6 +19,8 @@ mod worker;
 
 pub mod size;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use shiso_vision::generator::{
@@ -159,12 +161,35 @@ impl ImageService {
         self.submit(job, Some(progress)).await
     }
 
-    /// The one path both entry points take: validate, admit, await.
+    /// The one path both entry points take: admit, then await the answer.
     async fn submit(
         &self,
         job: ImageGenerationJob,
         progress: Option<mpsc::UnboundedSender<ImageStepEvent>>,
     ) -> Result<GeneratedImage, AppError> {
+        self.admit(job, progress)?.await
+    }
+
+    /// Validates and queues a generation without waiting for the image:
+    /// the synchronous half of [`Self::generate`], for a caller that must
+    /// know whether it was admitted before it commits to anything - the
+    /// stream handler, which answers a refusal with a status code and only
+    /// then spends its 200.
+    ///
+    /// The returned future is the answer, exactly what [`Self::generate`]
+    /// would have awaited.
+    ///
+    /// # Errors
+    ///
+    /// The admission refusals of [`Self::generate`]: [`AppError::BadRequest`]
+    /// for a job [`ImageGenerationJob::validate`] refuses, and
+    /// [`AppError::Overloaded`] when the queue is full. Both are in hand
+    /// without an await.
+    pub fn admit(
+        &self,
+        job: ImageGenerationJob,
+        progress: Option<mpsc::UnboundedSender<ImageStepEvent>>,
+    ) -> Result<ImageAnswer, AppError> {
         // Checked before the queue: a job the generator would refuse must not
         // cost a waiting slot.
         job.validate().map_err(refuse)?;
@@ -186,11 +211,21 @@ impl ImageService {
                     AppError::internal("the image queue is closed", WorkerGone)
                 }
             })?;
-        answer.await.map_err(|_dropped| {
-            AppError::internal("the image worker dropped the request", WorkerGone)
-        })?
+        Ok(Box::pin(async move {
+            answer.await.map_err(|_dropped| {
+                AppError::internal("the image worker dropped the request", WorkerGone)
+            })?
+        }))
     }
 }
+
+/// The answer to an admitted generation: what the worker reports, or the
+/// 500 saying it is gone.
+///
+/// Boxed so [`ImageService::admit`] can hand the same future to every
+/// caller: the worker-gone mapping lives in `admit` alone, and the two
+/// entry points that await it cannot drift apart in wording.
+pub type ImageAnswer = Pin<Box<dyn Future<Output = Result<GeneratedImage, AppError>> + Send>>;
 
 /// The HTTP failure an [`ImageGenError`] answers with.
 ///
