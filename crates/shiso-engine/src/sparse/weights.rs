@@ -478,6 +478,68 @@ impl Weight {
         }))
     }
 
+    /// Puts bytes the caller assembled on the device as a weight.
+    ///
+    /// For a payload that is not a container's own bytes - a projection put
+    /// together from several tensors. Where the device reads host memory in
+    /// place the bytes are wrapped, as [`Weight::import`] wraps a mapping;
+    /// where it copies, they are copied into a fresh allocation and dropped,
+    /// because a wrapped copy keeps its source alive and every weight would
+    /// then be held twice.
+    ///
+    /// # Errors
+    ///
+    /// As [`Weight::import`].
+    pub fn uploaded(
+        backend: &Arc<dyn Backend>,
+        dtype: DType,
+        in_dim: u32,
+        out_dim: u32,
+        slots: u32,
+        bytes: Vec<u8>,
+    ) -> CoreResult<Self> {
+        if !backend.imports_copy() {
+            let len = bytes.len();
+            return Self::import(
+                backend,
+                dtype,
+                in_dim,
+                out_dim,
+                slots,
+                Arc::new(bytes),
+                0..len,
+            );
+        }
+        let total = Self::payload_bytes(dtype, in_dim, out_dim)
+            .and_then(|one| one.checked_mul(u64::from(slots)))
+            .filter(|_| slots > 0)
+            .ok_or(CoreError::ShapeMismatch {
+                field: "weight bytes",
+                expected: u64::MAX,
+                got: u64::from(in_dim),
+            })?;
+        let given = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if given != total {
+            return Err(CoreError::ShapeMismatch {
+                field: "weight upload bytes",
+                expected: total,
+                got: given,
+            });
+        }
+        let buffer = shiso_core::buffer::alloc(backend, total)?;
+        backend.copy_h2d(buffer.view(), &bytes)?;
+        Ok(Self {
+            dtype,
+            in_dim,
+            out_dim,
+            slots,
+            buffer,
+            affine: None,
+            block_scales: None,
+            resident: true,
+        })
+    }
+
     /// Wraps a buffer this crate produced as a weight of the given shape.
     ///
     /// The import above is for bytes a container holds; this is for bytes a

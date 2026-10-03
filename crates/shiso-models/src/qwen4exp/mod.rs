@@ -20,6 +20,7 @@
 mod binding;
 mod ckpt;
 mod config;
+pub mod exl3;
 pub mod fp8;
 pub mod mlx;
 mod model;

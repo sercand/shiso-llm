@@ -505,11 +505,12 @@ pub fn load_model(
         return load_qwen35moe(backend, path, args, defaults);
     }
 
-    // The sparse family's MLX container is a DIRECTORY of safetensors shards,
-    // and its geometry is in the document rather than in a container's
-    // metadata, so it takes an arm of its own ahead of the single-file one.
+    // The sparse family's directory containers - MLX shards, the reference
+    // export, the published trellis export - carry their geometry in the
+    // document rather than in a container's metadata, so they take an arm of
+    // their own ahead of the single-file one.
     if Qwen4ExpConfig::describes(config) && path.is_dir() {
-        return load_qwen4exp_mlx(backend, path, config, args, opts, defaults);
+        return load_qwen4exp_dir(backend, path, config, args, opts, defaults);
     }
 
     // The sparse family's reader takes the checkpoint as well as the document,
@@ -957,6 +958,62 @@ fn sparse_options(
         },
         ..SparseOptions::default()
     }
+}
+
+/// The sparse family's directory: the trellis export when its shard index
+/// names one, the MLX or reference export otherwise.
+fn load_qwen4exp_dir(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    args: &ServeArgs,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    if shiso_models::qwen4exp::exl3::is_exl3_dir(path) {
+        load_qwen4exp_exl3(backend, path, config, args, opts, defaults)
+    } else {
+        load_qwen4exp_mlx(backend, path, config, args, opts, defaults)
+    }
+}
+
+/// The sparse family's trellis export, as published: a directory that carries
+/// its own draft head, loaded when speculation is asked for.
+fn load_qwen4exp_exl3(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    args: &ServeArgs,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    // The head is in the directory; a second one named beside it would be a
+    // head nobody can say which of the two is serving.
+    if args.draft_model.is_some() {
+        return Err(FactoryError::Load(CoreError::InvalidValue {
+            key: "--draft-model",
+            value: format!(
+                "{} carries its own draft head under mtp.*; drop --draft-model and set --spec-k",
+                path.display()
+            ),
+        }));
+    }
+    let model = Qwen4ExpModel::load_exl3(
+        backend,
+        path,
+        config,
+        args.spec_k > 0,
+        args.draft_vocab.as_deref(),
+        sparse_options(args, opts, backend),
+    )
+    .map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_qwen35_tower,
+        open_audio: no_audio_tower,
+        placement: Qwen35Tower::PLACEMENT,
+        defaults,
+    })
 }
 
 /// The sparse family's MLX directory: the geometry from its `config.json`, the

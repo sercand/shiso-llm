@@ -357,8 +357,15 @@ impl MlxCheckpoint {
     }
 }
 
-/// Uploads owned bytes as a device buffer.
+/// Uploads owned bytes as a device buffer: wrapped where the device reads
+/// host memory in place, copied and dropped where it copies - a wrapped copy
+/// would keep the bytes alive beside the device's own.
 pub(crate) fn upload(backend: &Arc<dyn Backend>, bytes: Vec<u8>) -> CoreResult<DeviceBuffer> {
+    if backend.imports_copy() {
+        let buffer = shiso_core::buffer::alloc(backend, bytes.len() as u64)?;
+        backend.copy_h2d(buffer.view(), &bytes)?;
+        return Ok(buffer);
+    }
     let len = bytes.len();
     import_host(backend, Arc::new(bytes), 0..len)
 }
@@ -1184,6 +1191,32 @@ pub(crate) fn config_from(
     ck: &MlxCheckpoint,
     ngram_base: &str,
 ) -> CoreResult<Qwen4ExpConfig> {
+    let heads = u64::from((PLE_NGRAM - 1) * PLE_HEADS_PER_NGRAM);
+    let base = ngram_base;
+    // Read lazily: a document of another family is refused by name first,
+    // before any n-gram tensor is looked for.
+    config_checked(config, ck.dir(), || {
+        Ok(NgramHash {
+            multipliers: ck.i64s(&format!("{base}.layer_multipliers"), u64::from(PLE_NGRAM))?,
+            head_offsets: ck.i64s(&format!("{base}.ngram_heads_offsets"), heads)?,
+            head_vocab: ck.i64s(&format!("{base}.ngram_heads_vocab_sizes"), heads)?,
+            eos_token: TokenId::new(PLE_EOS_TOKEN),
+        })
+    })
+}
+
+/// The geometry of a checkpoint directory at `dir` whose n-gram hash `ngram`
+/// reads: the checks [`config_from`] makes, for a container that keeps the
+/// hash's tensors somewhere else.
+///
+/// # Errors
+///
+/// As [`Qwen4ExpConfig::from_mlx`], plus whatever `ngram` reports.
+pub(crate) fn config_checked(
+    config: &HfConfig,
+    dir: &Path,
+    ngram: impl FnOnce() -> CoreResult<NgramHash>,
+) -> CoreResult<Qwen4ExpConfig> {
     {
         if !Qwen4ExpConfig::describes(config) {
             return Err(CoreError::UnknownArch {
@@ -1249,8 +1282,8 @@ pub(crate) fn config_from(
                 });
             }
         }
-        let generation = std::fs::read_to_string(ck.dir().join("generation_config.json"))
-            .map_err(CoreError::Io)?;
+        let generation =
+            std::fs::read_to_string(dir.join("generation_config.json")).map_err(CoreError::Io)?;
         let generation: GenerationConfig =
             serde_json::from_str(&generation).map_err(|err| CoreError::Backend {
                 backend: "qwen4exp",
@@ -1265,14 +1298,7 @@ pub(crate) fn config_from(
         .ok_or_else(|| CoreError::ConfigMissing {
             key: "generation_config.json eos_token_id".to_owned(),
         })?;
-        let heads = u64::from((PLE_NGRAM - 1) * PLE_HEADS_PER_NGRAM);
-        let base = ngram_base;
-        let ngram = NgramHash {
-            multipliers: ck.i64s(&format!("{base}.layer_multipliers"), u64::from(PLE_NGRAM))?,
-            head_offsets: ck.i64s(&format!("{base}.ngram_heads_offsets"), heads)?,
-            head_vocab: ck.i64s(&format!("{base}.ngram_heads_vocab_sizes"), heads)?,
-            eos_token: TokenId::new(PLE_EOS_TOKEN),
-        };
+        let ngram = ngram()?;
         Qwen4ExpConfig::new(
             cfg::shape(),
             TokenId::new(eos),
