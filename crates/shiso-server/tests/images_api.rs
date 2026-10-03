@@ -266,6 +266,22 @@ async fn a_malformed_size_string_is_refused() {
 }
 
 #[tokio::test]
+async fn a_named_resolution_is_refused_not_normalized() {
+    // The grammar is WxH plus the ratio table and nothing else: "2K" names a
+    // resolution class, not pixels this server defined, so it is a 400 rather
+    // than a guess at what width the caller meant.
+    let (state, _log) = state_with_mock(false);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "size": "2K"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["param"], "size", "{body}");
+}
+
+#[tokio::test]
 async fn a_compression_outside_zero_to_hundred_is_refused() {
     let (state, _log) = state_with_mock(false);
     let (status, body) = post_json(

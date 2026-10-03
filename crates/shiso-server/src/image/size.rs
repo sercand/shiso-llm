@@ -81,7 +81,9 @@ const ASPECT_RATIOS: [(&str, u32, u32); 8] = [
 /// up) and clamped into [`MIN_SIDE`]..=[`MAX_SIDE`]; a named aspect ratio
 /// becomes its table entry. A ratio not in the table is refused rather than
 /// approximated: the table is the published mapping, and a second way to read
-/// a ratio would be a second answer to the same request.
+/// a ratio would be a second answer to the same request. Named resolutions
+/// (`2K`, `4K`) are deliberately out of contract - refused, not normalized -
+/// because the grammar is `WxH` plus the ratio table and nothing else.
 ///
 /// # Errors
 ///
@@ -122,7 +124,7 @@ pub fn parse_exact_size(value: &str) -> Result<(u32, u32), SizeError> {
 /// The concrete pixels a named aspect ratio means, or `None` when the server
 /// does not name that ratio.
 #[must_use]
-pub fn aspect_ratio_size(value: &str) -> Option<(u32, u32)> {
+fn aspect_ratio_size(value: &str) -> Option<(u32, u32)> {
     let value = value.trim();
     ASPECT_RATIOS
         .iter()

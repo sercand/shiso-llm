@@ -52,7 +52,8 @@ tracing = { workspace = true }
 # with, built from the checkpoint's own pieces and merges.
 tokenizers = { workspace = true }
 # The image families decode an encoded reference and encode the generated
-# pixels; only the PNG and JPEG codecs the wire format allows are enabled.
+# pixels. The pipeline only ever encodes PNG and JPEG - the wire contract -
+# while the codec feature set is the workspace's, wider than what we emit.
 image = { workspace = true }
 # The chat template a diffusion family's text encoder renders its prompt
 # through ships inside the tokenizer directory as Jinja source.
