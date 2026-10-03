@@ -350,22 +350,3 @@ impl Lin {
         })
     }
 }
-
-/// Decodes one `F8_E4M3` byte to `f32` for the host fallback paths.
-///
-/// E4M3 with implicit leading one, bias 7, no infinities; 0x7F/0xFF is NaN in
-/// the OCP spelling but never appears in a weight, and is mapped to NaN here
-/// so a corrupt scale shows up as NaN rather than a plausible number.
-pub(crate) fn f8e4m3_to_f32(byte: u8) -> f32 {
-    let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
-    let exp = (byte >> 3) & 0x0F;
-    let frac = byte & 0x07;
-    if exp == 0 {
-        // Subnormals: 0.frac * 2^-6.
-        return sign * f32::from(frac) * (1.0 / 64.0);
-    }
-    if exp == 0x0F && frac == 0x07 {
-        return f32::NAN;
-    }
-    sign * (1.0 + f32::from(frac) / 8.0) * 2f32.powi(i32::from(exp) - 7)
-}

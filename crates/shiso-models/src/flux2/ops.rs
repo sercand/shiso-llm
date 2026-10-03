@@ -4,31 +4,26 @@
 //! argument blocks are `#[repr(C)]` `Pod` structs marshalled with
 //! `bytemuck::bytes_of`, so their layout comes from the struct definition and
 //! is asserted against the kernel headers at compile time. Every launch names
-//! the `flux2` module; a backend whose module table does not carry the flux2
-//! entry points runs the same operations through the host fallback in this
-//! file - slower by orders of magnitude, numerically the same arithmetic, and
-//! the reason a build without the Metal kernels still produces an image
-//! instead of an error.
+//! the `flux2` module, and [`Ops::new`] probes the device for every entry in
+//! [`REQUIRED_KERNELS`] before a driver exists: a backend whose module table
+//! does not carry the full flux2 set is refused at load, naming the missing
+//! entries, rather than silently running the same arithmetic on the host
+//! orders of magnitude slower. The host twins of the fused-row attention and
+//! `RoPE` seams remain as `#[cfg(test)]` entry points for the oracle tests,
+//! which call them directly; no production path reaches a host twin.
 
 #![expect(
     clippy::cast_possible_truncation,
     reason = "kernel argument dimensions are element counts bounded by the generation contract (images up to 2048x2048); they fit u32 with orders of magnitude to spare"
 )]
-#![expect(
-    clippy::cast_precision_loss,
-    reason = "dimensions converted for trig and grid math are small tensor extents, far below f32's exact-integer range"
-)]
 
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use half::bf16;
 use shiso_core::{
     Backend, DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs, alloc,
 };
 use shiso_vision::generator::ImageGenError;
-
-use super::weights::f8e4m3_to_f32;
 
 /// The kernel module every flux2 entry point lives under.
 pub(crate) const MODULE: &str = "flux2";
@@ -499,27 +494,93 @@ pub(crate) struct EmbedCall<'a> {
 #[derive(Debug)]
 pub(crate) struct Ops {
     backend: Arc<dyn Backend>,
-    /// Set when the backend's module table does not carry the flux2 entries.
-    host_fallback: bool,
     /// A zero-filled 4-byte buffer bound wherever an optional bias is absent,
     /// so every launch of an entry point binds the same buffer count.
     dummy: DeviceBuffer,
 }
 
+/// Every flux2 kernel entry this driver launches: the module's full
+/// registration in `metal/flux2/flux2.metal`. [`Ops::new`] probes the device
+/// for all of them, so a build or device without the set is refused at load
+/// naming what is missing, and a launch can never fall back to a host twin
+/// unnoticed. A name launched here but absent from this list is a driver bug.
+const REQUIRED_KERNELS: &[&str] = &[
+    "kernel_flux2_silu_f32",
+    "kernel_flux2_swiglu_f32",
+    "kernel_flux2_swiglu2_f32",
+    "kernel_flux2_modulate_f32",
+    "kernel_flux2_add_gated_f32",
+    "kernel_flux2_add_f32",
+    "kernel_flux2_axpy_f32",
+    "kernel_flux2_gemm_bf16",
+    "kernel_flux2_gemm_fp8",
+    "kernel_flux2_gemm_f32",
+    "kernel_flux2_rmsnorm_f32",
+    "kernel_flux2_layer_norm_f32",
+    "kernel_flux2_qk_norm_f32",
+    "kernel_flux2_concat_rows_f32",
+    "kernel_flux2_sdpa_f32",
+    "kernel_flux2_gqa_f32",
+    "kernel_flux2_rope_4d",
+    "kernel_flux2_rope_half",
+    "kernel_flux2_conv2d_f32",
+    "kernel_flux2_group_norm_f32",
+    "kernel_flux2_upsample_nearest_f32",
+    "kernel_flux2_transpose_f32",
+    "kernel_flux2_embed_bf16_f32",
+];
+
 impl Ops {
-    /// Wraps `backend`, probing its module table once for the flux2 entries.
+    /// Wraps `backend`, probing it for every entry in [`REQUIRED_KERNELS`].
+    ///
+    /// The probe resolves each entry without launching it
+    /// ([`Backend::max_block_threads`] answers `None` for an entry the built
+    /// module does not export - the same existence probe the engine's kernel
+    /// variant tuner relies on), so a device carrying only part of the set
+    /// fails here, naming every missing entry, instead of failing mid-
+    /// generation on the first launch of the one nobody checked.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Backend`] naming the backend and every missing entry.
     pub(crate) fn new(backend: &Arc<dyn Backend>) -> Result<Self, ImageGenError> {
-        let entries = backend.module_entries(MODULE);
-        let host_fallback = !entries
+        let missing: Vec<&str> = REQUIRED_KERNELS
             .iter()
-            .any(|name| name.contains("kernel_flux2_gemm_bf16"));
+            .copied()
+            .filter(|entry| {
+                backend
+                    .max_block_threads(KernelRef::new(MODULE, entry))
+                    .is_none()
+            })
+            .collect();
+        if !missing.is_empty() {
+            return Err(ImageGenError::Backend(format!(
+                "the {} backend does not expose the flux2 kernel module: missing [{}]",
+                backend.backend_name(),
+                missing.join(", ")
+            )));
+        }
         let dummy = alloc(backend, 4).map_err(|e| ImageGenError::Backend(e.to_string()))?;
         backend
             .fill_zero(dummy.view())
             .map_err(|e| ImageGenError::Backend(e.to_string()))?;
         Ok(Self {
             backend: Arc::clone(backend),
-            host_fallback,
+            dummy,
+        })
+    }
+
+    /// The oracle seam's driver: wraps `backend` without probing the kernel
+    /// set, because the oracle tests call the host twins directly and never
+    /// launch. Production has exactly one constructor, [`Ops::new`], and it
+    /// refuses a device that does not carry the full set.
+    #[cfg(test)]
+    pub(crate) fn for_host_twins(backend: &Arc<dyn Backend>) -> Result<Self, ImageGenError> {
+        let dummy = alloc(backend, 4).map_err(|e| ImageGenError::Backend(e.to_string()))?;
+        backend
+            .fill_zero(dummy.view())
+            .map_err(|e| ImageGenError::Backend(e.to_string()))?;
+        Ok(Self {
+            backend: Arc::clone(backend),
             dummy,
         })
     }
@@ -647,11 +708,6 @@ impl Ops {
         input: DeviceView<'_>,
         count: usize,
     ) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let x = self.download(step, input, count)?;
-            let y: Vec<f32> = x.iter().map(|&v| v / (1.0 + (-v).exp())).collect();
-            return self.write_back(step, out, &y);
-        }
         self.elementwise(step, "kernel_flux2_silu_f32", count, &[out, input])
     }
 
@@ -672,26 +728,6 @@ impl Ops {
         inner: usize,
         stride: usize,
     ) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            // Reads span `[(rows - 1) * stride, (rows - 1) * stride + 2 * inner)`
-            // of the view; the single block's view starts mid-row, so a
-            // `rows * stride` download would over-read past the buffer end.
-            let need = if rows == 0 {
-                0
-            } else {
-                (rows - 1) * stride + 2 * inner
-            };
-            let x = self.download(step, input, need)?;
-            let mut y = Vec::with_capacity(rows * inner);
-            for r in 0..rows {
-                for i in 0..inner {
-                    let g = x[r * stride + i];
-                    let v = x[r * stride + inner + i];
-                    y.push((g / (1.0 + (-g).exp())) * v);
-                }
-            }
-            return self.write_back(step, out, &y);
-        }
         let args = SwigluArgs {
             rows: rows as u32,
             inner: inner as u32,
@@ -713,10 +749,6 @@ impl Ops {
     /// out[i] = silu(a[i]) * b[i] over two packed buffers (the text encoder's
     /// separate gate/up projections, where `a` is the gate: the same
     /// first-half gating the fused-row `swiglu` applies).
-    #[expect(
-        clippy::many_single_char_names,
-        reason = "elementwise gate/up math reads clearer with a/b/x/g/y than with long names"
-    )]
     pub(crate) fn swiglu2(
         &self,
         step: &'static str,
@@ -725,16 +757,6 @@ impl Ops {
         b: DeviceView<'_>,
         count: usize,
     ) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let g = self.download(step, a, count)?;
-            let u = self.download(step, b, count)?;
-            let y: Vec<f32> = g
-                .iter()
-                .zip(&u)
-                .map(|(&s, &v)| (s / (1.0 + (-s).exp())) * v)
-                .collect();
-            return self.write_back(step, out, &y);
-        }
         self.elementwise(step, "kernel_flux2_swiglu2_f32", count, &[out, a, b])
     }
 
@@ -750,17 +772,6 @@ impl Ops {
             count,
             period,
         } = *call;
-        if self.host_fallback {
-            let xv = self.download(step, x, count)?;
-            let sc = self.download(step, scale, period)?;
-            let sh = self.download(step, shift, period)?;
-            let y: Vec<f32> = xv
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| v * (1.0 + sc[i % period]) + sh[i % period])
-                .collect();
-            return self.write_back(step, out, &y);
-        }
         let args = ModulateArgs {
             count: count as u32,
             period: period as u32,
@@ -792,17 +803,6 @@ impl Ops {
             count,
             period,
         } = *call;
-        if self.host_fallback {
-            let av = self.download(step, a, count)?;
-            let g = self.download(step, gate, period)?;
-            let bv = self.download(step, b, count)?;
-            let y: Vec<f32> = av
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| v + g[i % period] * bv[i])
-                .collect();
-            return self.write_back(step, out, &y);
-        }
         let args = AddGatedArgs {
             count: count as u32,
             period: period as u32,
@@ -831,12 +831,6 @@ impl Ops {
         b: DeviceView<'_>,
         count: usize,
     ) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let av = self.download(step, a, count)?;
-            let bv = self.download(step, b, count)?;
-            let y: Vec<f32> = av.iter().zip(&bv).map(|(&v, &w)| v + w).collect();
-            return self.write_back(step, out, &y);
-        }
         self.elementwise(step, "kernel_flux2_add_f32", count, &[out, a, b])
     }
 
@@ -850,12 +844,6 @@ impl Ops {
         count: usize,
         dt: f32,
     ) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let xv = self.download(step, x, count)?;
-            let vv = self.download(step, v, count)?;
-            let y: Vec<f32> = xv.iter().zip(&vv).map(|(&a, &b)| a + dt * b).collect();
-            return self.write_back(step, out, &y);
-        }
         let args = AxpyArgs {
             count: count as u32,
             dt,
@@ -874,6 +862,9 @@ impl Ops {
         )
     }
 
+    /// Uploads f32 values over a device range. Only the host twins need it:
+    /// every kernel writes its own output.
+    #[cfg(test)]
     fn write_back(
         &self,
         step: &'static str,
@@ -889,9 +880,6 @@ impl Ops {
     /// The weight is read in its stored format - BF16 or `F8_E4M3` bytes - and
     /// the scale multiplies the accumulator, never the weight in memory.
     pub(crate) fn gemm(&self, call: &GemmCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            return self.gemm_host(call);
-        }
         let args = GemmArgs {
             m: call.m as u32,
             n: call.n as u32,
@@ -924,70 +912,8 @@ impl Ops {
         )
     }
 
-    fn gemm_host(&self, call: &GemmCall<'_>) -> Result<(), ImageGenError> {
-        let input = self.download(call.step, call.input, call.m * call.k)?;
-        let weight_bytes = self.read_bytes(call.step, call.weight)?;
-        let bias = match call.bias {
-            Some(view) => self.download(call.step, view, call.n)?,
-            None => vec![0.0; call.n],
-        };
-        let scale = call.weight_scale;
-        let mut out = vec![0f32; call.m * call.n];
-        for i in 0..call.m {
-            for j in 0..call.n {
-                let mut acc = 0f32;
-                for k in 0..call.k {
-                    let wi = j * call.k + k;
-                    let w = match call.kind {
-                        WeightKind::Fp8 => f8e4m3_to_f32(weight_bytes[wi]),
-                        WeightKind::Bf16 => {
-                            bf16::from_le_bytes([weight_bytes[wi * 2], weight_bytes[wi * 2 + 1]])
-                                .to_f32()
-                        }
-                        WeightKind::F32 => f32::from_le_bytes([
-                            weight_bytes[wi * 4],
-                            weight_bytes[wi * 4 + 1],
-                            weight_bytes[wi * 4 + 2],
-                            weight_bytes[wi * 4 + 3],
-                        ]),
-                    };
-                    acc += input[i * call.k + k] * w;
-                }
-                out[i * call.n + j] = acc * scale + bias[j];
-            }
-        }
-        self.write_back(call.step, call.out, &out)
-    }
-
-    /// Raw bytes of a device buffer (for host fallbacks over native-format weights).
-    pub(crate) fn read_bytes(
-        &self,
-        step: &'static str,
-        view: DeviceView<'_>,
-    ) -> Result<Vec<u8>, ImageGenError> {
-        let mut bytes = vec![0u8; usize::try_from(view.len()).unwrap_or(usize::MAX)];
-        self.backend
-            .copy_d2h(view, &mut bytes)
-            .map_err(fail(step))?;
-        Ok(bytes)
-    }
-
     /// `RMSNorm` each row: out = x * rsqrt(mean(x^2) + eps) * weight.
     pub(crate) fn rmsnorm(&self, call: &NormCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let x = self.download(call.step, call.input, call.rows * call.dim)?;
-            let w = self.download(call.step, call.weight, call.dim)?;
-            let mut out = vec![0f32; x.len()];
-            for r in 0..call.rows {
-                let row = &x[r * call.dim..(r + 1) * call.dim];
-                let ms = row.iter().map(|v| v * v).sum::<f32>() / call.dim as f32;
-                let inv = 1.0 / (ms + call.eps).sqrt();
-                for (i, &v) in row.iter().enumerate() {
-                    out[r * call.dim + i] = v * inv * w[i];
-                }
-            }
-            return self.write_back(call.step, call.out, &out);
-        }
         let args = NormArgs {
             rows: call.rows as u32,
             dim: call.dim as u32,
@@ -1013,21 +939,6 @@ impl Ops {
     /// the transformer's block norms are `LayerNorm(affine=False)`, whose
     /// shift/scale come from the `AdaLN` modulation instead.
     pub(crate) fn layer_norm(&self, call: &LayerNormCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let x = self.download(call.step, call.input, call.rows * call.dim)?;
-            let mut out = vec![0f32; x.len()];
-            for r in 0..call.rows {
-                let row = &x[r * call.dim..(r + 1) * call.dim];
-                let mean = row.iter().sum::<f32>() / call.dim as f32;
-                let var =
-                    row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / call.dim as f32;
-                let inv = 1.0 / (var + call.eps).sqrt();
-                for (i, &v) in row.iter().enumerate() {
-                    out[r * call.dim + i] = (v - mean) * inv;
-                }
-            }
-            return self.write_back(call.step, call.out, &out);
-        }
         let args = NormArgs {
             rows: call.rows as u32,
             dim: call.dim as u32,
@@ -1050,21 +961,6 @@ impl Ops {
     /// normalization with a per-dimension scale, in place on the q and k
     /// head sections of fused qkv rows (`x * rsqrt(mean(x^2) + eps) * scale`).
     pub(crate) fn qk_norm(&self, call: &QkNormCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let qs = self.download(call.step, call.q_scale, call.head_dim)?;
-            let ks = self.download(call.step, call.k_scale, call.head_dim)?;
-            let mut x = self.download(call.step, call.qkv, call.tokens * call.row_stride)?;
-            let k_base = call.heads * call.head_dim;
-            for t in 0..call.tokens {
-                for h in 0..call.heads {
-                    let q0 = t * call.row_stride + h * call.head_dim;
-                    rms_scale_head(&mut x[q0..q0 + call.head_dim], &qs, call.eps);
-                    let k0 = q0 + k_base;
-                    rms_scale_head(&mut x[k0..k0 + call.head_dim], &ks, call.eps);
-                }
-            }
-            return self.write_back(call.step, call.qkv, &x);
-        }
         let args = QkNormArgs {
             tokens: call.tokens as u32,
             heads: call.heads as u32,
@@ -1088,21 +984,6 @@ impl Ops {
 
     /// Row-wise concatenation: out[r] = [a[r], b[r]], both sides packed.
     pub(crate) fn concat_rows(&self, call: &ConcatCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let a = self.download(call.step, call.a, call.rows * call.cols_a)?;
-            let b = self.download(call.step, call.b, call.rows * call.cols_b)?;
-            let width = call.cols_a + call.cols_b;
-            let mut out = vec![0f32; call.rows * width];
-            for r in 0..call.rows {
-                let (ra, rb) = (
-                    &a[r * call.cols_a..(r + 1) * call.cols_a],
-                    &b[r * call.cols_b..(r + 1) * call.cols_b],
-                );
-                out[r * width..r * width + call.cols_a].copy_from_slice(ra);
-                out[r * width + call.cols_a..(r + 1) * width].copy_from_slice(rb);
-            }
-            return self.write_back(call.step, call.out, &out);
-        }
         let args = ConcatArgs {
             rows: call.rows as u32,
             cols_a: call.cols_a as u32,
@@ -1130,9 +1011,6 @@ impl Ops {
     /// kernel must read head `h` of a row at `row * stride + offset +
     /// h * head_dim` for each operand's own offset.
     pub(crate) fn sdpa(&self, call: &SdpaCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            return self.sdpa_host(call);
-        }
         let args = SdpaArgs {
             txt_tokens: call.txt_tokens as u32,
             img_tokens: call.img_tokens as u32,
@@ -1181,7 +1059,14 @@ impl Ops {
         )
     }
 
-    fn sdpa_host(&self, call: &SdpaCall<'_>) -> Result<(), ImageGenError> {
+    /// Host twin of [`Ops::sdpa`], called directly by the oracle tests; the
+    /// production `Ops` path never falls back to it.
+    #[cfg(test)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "dimensions converted for attention math are small tensor extents, far below f32's exact-integer range"
+    )]
+    pub(crate) fn sdpa_host(&self, call: &SdpaCall<'_>) -> Result<(), ImageGenError> {
         let txt = call.txt_tokens;
         let img = call.img_tokens;
         let hd = call.head_dim;
@@ -1291,9 +1176,6 @@ impl Ops {
 
     /// Causal grouped-query attention (text encoder prefill).
     pub(crate) fn gqa(&self, call: &GqaCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            return self.gqa_host(call);
-        }
         let args = GqaArgs {
             tokens: call.tokens as u32,
             q_heads: call.q_heads as u32,
@@ -1315,66 +1197,9 @@ impl Ops {
         )
     }
 
-    fn gqa_host(&self, call: &GqaCall<'_>) -> Result<(), ImageGenError> {
-        let hd = call.head_dim;
-        let q = self.download(call.step, call.q, call.tokens * call.q_heads * hd)?;
-        let k = self.download(call.step, call.k, call.tokens * call.kv_heads * hd)?;
-        let v = self.download(call.step, call.v, call.tokens * call.kv_heads * hd)?;
-        let scale = 1.0 / (hd as f32).sqrt();
-        let group = call.q_heads / call.kv_heads;
-        let mut out = vec![0f32; call.tokens * call.q_heads * hd];
-        for t in 0..call.tokens {
-            for h in 0..call.q_heads {
-                let kvh = h / group;
-                let qrow = (t * call.q_heads + h) * hd;
-                let mut scores: Vec<f32> = (0..=t)
-                    .map(|s| {
-                        let krow = (s * call.kv_heads + kvh) * hd;
-                        let mut dot = 0f32;
-                        for d in 0..hd {
-                            dot += q[qrow + d] * k[krow + d];
-                        }
-                        dot * scale
-                    })
-                    .collect();
-                let max = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                let mut sum = 0f32;
-                for x in &mut scores {
-                    *x = (*x - max).exp();
-                    sum += *x;
-                }
-                for (s, &p) in scores.iter().enumerate() {
-                    let vrow = (s * call.kv_heads + kvh) * hd;
-                    for d in 0..hd {
-                        out[qrow + d] += p * v[vrow + d];
-                    }
-                }
-                for d in 0..hd {
-                    out[qrow + d] /= sum;
-                }
-            }
-        }
-        self.write_back(call.step, call.out, &out)
-    }
-
     /// 4-axis interleaved `RoPE` on Q and K in one launch, in place, on rows of
     /// `row_stride` elements (packed or fused-qkv).
     pub(crate) fn rope_4d(&self, call: &Rope4dCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let freqs = self.download(call.step, call.freqs, call.freqs_per_axis * 4)?;
-            let positions = self.download(call.step, call.positions, call.tokens * 4)?;
-            // Rotate the q section from the q binding and the k section from
-            // the k binding, each exactly once. The transformer binds the same
-            // fused buffer to both with different offsets, so the second pass
-            // re-reads the buffer the first wrote and rotates only the k
-            // section - q is never rotated twice and v is never touched.
-            for (tensor, offset) in [(call.q, call.q_offset), (call.k, call.k_offset)] {
-                let mut x = self.download(call.step, tensor, call.tokens * call.row_stride)?;
-                rope_4d_host(&mut x, &positions, &freqs, call, offset);
-                self.write_back(call.step, tensor, &x)?;
-            }
-            return Ok(());
-        }
         let args = Rope4dArgs {
             tokens: call.tokens as u32,
             heads: call.heads as u32,
@@ -1399,6 +1224,25 @@ impl Ops {
         )
     }
 
+    /// Host twin of [`Ops::rope_4d`], called directly by the oracle tests;
+    /// the production `Ops` path never falls back to it.
+    #[cfg(test)]
+    pub(crate) fn rope_4d_host(&self, call: &Rope4dCall<'_>) -> Result<(), ImageGenError> {
+        let freqs = self.download(call.step, call.freqs, call.freqs_per_axis * 4)?;
+        let positions = self.download(call.step, call.positions, call.tokens * 4)?;
+        // Rotate the q section from the q binding and the k section from
+        // the k binding, each exactly once. The transformer binds the same
+        // fused buffer to both with different offsets, so the second pass
+        // re-reads the buffer the first wrote and rotates only the k
+        // section - q is never rotated twice and v is never touched.
+        for (tensor, offset) in [(call.q, call.q_offset), (call.k, call.k_offset)] {
+            let mut x = self.download(call.step, tensor, call.tokens * call.row_stride)?;
+            rope_4d_rotate_in_place(&mut x, &positions, &freqs, call, offset);
+            self.write_back(call.step, tensor, &x)?;
+        }
+        Ok(())
+    }
+
     /// rotate-half 1-axis `RoPE` on one (tokens, heads, `head_dim`) tensor, with
     /// the token index as the position.
     pub(crate) fn rope_half(
@@ -1410,24 +1254,6 @@ impl Ops {
         heads: usize,
         head_dim: usize,
     ) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let f = self.download(step, freqs, head_dim / 2)?;
-            let mut x = self.download(step, tensor, tokens * heads * head_dim)?;
-            for t in 0..tokens {
-                for h in 0..heads {
-                    let row = (t * heads + h) * head_dim;
-                    for i in 0..head_dim / 2 {
-                        let angle = t as f32 * f[i];
-                        let (cos, sin) = (angle.cos(), angle.sin());
-                        let x0 = x[row + i];
-                        let x1 = x[row + i + head_dim / 2];
-                        x[row + i] = x0 * cos - x1 * sin;
-                        x[row + i + head_dim / 2] = x1 * cos + x0 * sin;
-                    }
-                }
-            }
-            return self.write_back(step, tensor, &x);
-        }
         let args = RopeHalfArgs {
             tokens: tokens as u32,
             heads: heads as u32,
@@ -1448,9 +1274,6 @@ impl Ops {
 
     /// 2D convolution, NCHW, f32 throughout (the VAE stores f32).
     pub(crate) fn conv2d(&self, call: &Conv2dCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            return self.conv2d_host(call);
-        }
         let args = Conv2dArgs {
             batch: call.batch as u32,
             in_c: call.in_c as u32,
@@ -1485,85 +1308,8 @@ impl Ops {
         )
     }
 
-    fn conv2d_host(&self, call: &Conv2dCall<'_>) -> Result<(), ImageGenError> {
-        let x = self.download(
-            call.step,
-            call.input,
-            call.batch * call.in_c * call.in_h * call.in_w,
-        )?;
-        let w = self.download(
-            call.step,
-            call.weight,
-            call.out_c * call.in_c * call.k_h * call.k_w,
-        )?;
-        let b = match call.bias {
-            Some(view) => self.download(call.step, view, call.out_c)?,
-            None => vec![0.0; call.out_c],
-        };
-        let mut out = vec![0f32; call.batch * call.out_c * call.out_h * call.out_w];
-        for n in 0..call.batch {
-            for oc in 0..call.out_c {
-                for oh in 0..call.out_h {
-                    for ow in 0..call.out_w {
-                        let mut acc = b[oc];
-                        for ic in 0..call.in_c {
-                            for kh in 0..call.k_h {
-                                for kw in 0..call.k_w {
-                                    let ih = oh * call.stride + kh;
-                                    let iw = ow * call.stride + kw;
-                                    if ih < call.pad
-                                        || iw < call.pad
-                                        || ih - call.pad >= call.in_h
-                                        || iw - call.pad >= call.in_w
-                                    {
-                                        continue;
-                                    }
-                                    let xi = ((n * call.in_c + ic) * call.in_h + (ih - call.pad))
-                                        * call.in_w
-                                        + (iw - call.pad);
-                                    let wi =
-                                        ((oc * call.in_c + ic) * call.k_h + kh) * call.k_w + kw;
-                                    acc += x[xi] * w[wi];
-                                }
-                            }
-                        }
-                        out[((n * call.out_c + oc) * call.out_h + oh) * call.out_w + ow] = acc;
-                    }
-                }
-            }
-        }
-        self.write_back(call.step, call.out, &out)
-    }
-
     /// Group normalization with affine weight and bias.
     pub(crate) fn group_norm(&self, call: &GroupNormCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let per_group = call.channels_per_group * call.spatial;
-            let channels = call.groups * call.channels_per_group;
-            let x = self.download(call.step, call.input, call.batch * call.groups * per_group)?;
-            // The affine parameters are per channel: the buffers hold
-            // `channels` elements, not one per group element.
-            let w = self.download(call.step, call.weight, channels)?;
-            let b = self.download(call.step, call.bias, channels)?;
-            let mut out = vec![0f32; x.len()];
-            for g in 0..(call.batch * call.groups) {
-                let base = g * per_group;
-                let mean: f32 = x[base..base + per_group].iter().sum::<f32>() / per_group as f32;
-                let var: f32 = x[base..base + per_group]
-                    .iter()
-                    .map(|v| (v - mean) * (v - mean))
-                    .sum::<f32>()
-                    / per_group as f32;
-                let inv = 1.0 / (var + call.eps).sqrt();
-                // Element i of the group belongs to channel i / spatial
-                // within the group; groups repeat per batch item.
-                for i in 0..per_group {
-                    let ch = (g % call.groups) * call.channels_per_group + i / call.spatial;
-                    out[base + i] = (x[base + i] - mean) * inv * w[ch] + b[ch];
-                }
-            }
-            return self.write_back(call.step, call.out, &out);
-        }
         let args = GroupNormArgs {
             batch: call.batch as u32,
             num_groups: call.groups as u32,
@@ -1598,27 +1344,6 @@ impl Ops {
             h,
             w,
         } = *call;
-        if self.host_fallback {
-            let x = self.download(step, input, batch * channels * h * w)?;
-            let mut y = vec![0f32; batch * channels * (2 * h) * (2 * w)];
-            for n in 0..batch {
-                for c in 0..channels {
-                    for i in 0..h {
-                        for j in 0..w {
-                            let v = x[((n * channels + c) * h + i) * w + j];
-                            for di in 0..2 {
-                                for dj in 0..2 {
-                                    y[((n * channels + c) * 2 * h + 2 * i + di) * 2 * w
-                                        + 2 * j
-                                        + dj] = v;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return self.write_back(step, out, &y);
-        }
         let args = UpsampleArgs {
             batch: batch as u32,
             channels: channels as u32,
@@ -1647,16 +1372,6 @@ impl Ops {
         rows: usize,
         cols: usize,
     ) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let x = self.download(step, input, rows * cols)?;
-            let mut y = vec![0f32; rows * cols];
-            for r in 0..rows {
-                for c in 0..cols {
-                    y[c * rows + r] = x[r * cols + c];
-                }
-            }
-            return self.write_back(step, out, &y);
-        }
         let args = NormArgs {
             rows: rows as u32,
             dim: cols as u32,
@@ -1677,24 +1392,6 @@ impl Ops {
 
     /// Gathers `tokens` rows of a BF16 embedding table into f32 rows.
     pub(crate) fn embed(&self, call: &EmbedCall<'_>) -> Result<(), ImageGenError> {
-        if self.host_fallback {
-            let ids = self.read_bytes(call.step, call.ids)?;
-            let table = self.read_bytes(call.step, call.table)?;
-            let mut out = Vec::with_capacity(call.tokens * call.hidden);
-            for t in 0..call.tokens {
-                let id = u32::from_le_bytes([
-                    ids[t * 4],
-                    ids[t * 4 + 1],
-                    ids[t * 4 + 2],
-                    ids[t * 4 + 3],
-                ]) as usize;
-                for d in 0..call.hidden {
-                    let i = (id * call.hidden + d) * 2;
-                    out.push(bf16::from_le_bytes([table[i], table[i + 1]]).to_f32());
-                }
-            }
-            return self.write_back(call.step, call.out, &out);
-        }
         let args = EmbedArgs {
             tokens: call.tokens as u32,
             hidden: call.hidden as u32,
@@ -1714,22 +1411,12 @@ impl Ops {
     }
 }
 
-/// Host twin of one QK-norm head: `x * rsqrt(mean(x^2) + eps) * scale`, the
-/// reference's `RMSNorm` evaluated entirely in f32 (the family's buffers are
-/// f32, so the reference's cast-back-then-scale step is the same multiply).
-fn rms_scale_head(row: &mut [f32], scale: &[f32], eps: f32) {
-    let ms = row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32;
-    let inv = 1.0 / (ms + eps).sqrt();
-    for (v, s) in row.iter_mut().zip(scale) {
-        *v *= inv * s;
-    }
-}
-
 /// Host twin of `kernel_flux2_rope_4d`: interleaved pairs within each axis,
 /// rotated in place on the `heads * head_dim` head section that starts
 /// `section_offset` elements into each row (the q or k section of a fused
 /// qkv row, or offset 0 of a packed tensor).
-fn rope_4d_host(
+#[cfg(test)]
+fn rope_4d_rotate_in_place(
     x: &mut [f32],
     positions: &[f32],
     freqs: &[f32],

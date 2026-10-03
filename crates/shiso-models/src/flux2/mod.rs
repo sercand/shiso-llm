@@ -10,8 +10,8 @@
 //! [`config`] locates and inspects a checkpoint, [`pipeline`] drives one
 //! generation, and [`scheduler`], [`transformer`], [`text_encoder`] and
 //! [`vae`] are the parts it composes. [`ops`] is the family's device-kernel
-//! surface with a host twin for every entry, so builds without the flux2
-//! Metal kernels still run (slowly) on any backend.
+//! surface: it probes the backend for the full flux2 kernel set at load and
+//! refuses a device that does not carry it, naming the missing entries.
 
 pub mod config;
 pub(crate) mod kv_cache;

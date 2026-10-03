@@ -6,8 +6,9 @@
 //! out: reading k or v from the q offset silently computes `softmax(q q^T) q`,
 //! and rotating the q section twice leaves k unrotated. Both failures produce
 //! plausible image-shaped numbers, so these tests pin the arithmetic itself: a
-//! tiny fused-qkv buffer goes through the real `Ops` entry points in the
-//! transformer's own call shape, and the result is compared against naive
+//! tiny fused-qkv buffer goes through the host twins of the transformer's own
+//! call shapes (called directly - the production `Ops` path launches kernels
+//! and never falls back), and the result is compared against naive
 //! per-element reference math written here from the upstream formulas. Each
 //! test also asserts its data discriminates: the buggy reading and the
 //! correct one must differ, so a future simplification of the expected values
@@ -168,11 +169,13 @@ impl Backend for TableBackend {
     }
 }
 
-/// A driver on a device without flux2 kernels: every op takes the host twin,
-/// the only path these tests (and a kernelless build) exercise.
+/// A driver on a device without flux2 kernels, for the host twins only: the
+/// twins download and write back through the table's byte vectors, and its
+/// bounds checks turn an operand over-read into a test failure. Production
+/// cannot build this driver - `Ops::new` refuses a device without the set.
 fn host_ops() -> Ops {
     let backend: Arc<dyn Backend> = Arc::new(TableBackend::default());
-    Ops::new(&backend).expect("the table device always accepts the flux2 driver")
+    Ops::for_host_twins(&backend).expect("the table device backs the host twins")
 }
 
 /// Distinct deterministic values, so a section read from the wrong offset
@@ -292,7 +295,7 @@ fn rope_4d_rotates_each_fused_section_exactly_once() {
     let pos_buf = ops.upload_f32("test pos", &positions).expect("upload");
     let freqs_buf = ops.upload_f32("test freqs", &freqs).expect("upload");
 
-    ops.rope_4d(&Rope4dCall {
+    ops.rope_4d_host(&Rope4dCall {
         step: "test rope",
         q: fused_buf.view(),
         k: fused_buf.view(),
@@ -343,7 +346,7 @@ fn sdpa_reads_q_k_and_v_from_their_own_sections() {
     let out_txt = ops.alloc_f32("test out txt", txt * HIDDEN).expect("alloc");
     let out_img = ops.alloc_f32("test out img", img * HIDDEN).expect("alloc");
 
-    ops.sdpa(&SdpaCall {
+    ops.sdpa_host(&SdpaCall {
         step: "test sdpa",
         out_txt: out_txt.view(),
         out_img: out_img.view(),
@@ -401,7 +404,7 @@ fn sdpa_cached_rows_use_the_section_offsets() {
     let cache_buf = ops.upload_f32("test cache", &cache_row).expect("upload");
     let out_txt = ops.alloc_f32("test out txt", txt * HIDDEN).expect("alloc");
 
-    ops.sdpa(&SdpaCall {
+    ops.sdpa_host(&SdpaCall {
         step: "test sdpa cache",
         out_txt: out_txt.view(),
         out_img: ops.dummy_view(),
@@ -447,4 +450,20 @@ fn sdpa_cached_rows_use_the_section_offsets() {
         &expected[..txt * HIDDEN],
         "sdpa: txt rows with cached keys",
     );
+}
+
+/// The production constructor refuses a device that does not carry the flux2
+/// kernel set - naming the missing entries - instead of accepting it and
+/// running the host twins silently. The table device resolves no entry, so
+/// every required kernel is named.
+#[test]
+fn ops_new_refuses_a_device_without_the_flux2_kernels() {
+    let backend: Arc<dyn Backend> = Arc::new(TableBackend::default());
+    let err = Ops::new(&backend).expect_err("a device with no flux2 kernels is refused at load");
+    let msg = err.to_string();
+    // A sentinel from each end of the required list, so a probe that only
+    // checked one entry (the old bug) cannot pass.
+    assert!(msg.contains("kernel_flux2_gemm_bf16"), "{msg}");
+    assert!(msg.contains("kernel_flux2_embed_bf16_f32"), "{msg}");
+    assert!(msg.contains("kernel_flux2_sdpa_f32"), "{msg}");
 }
