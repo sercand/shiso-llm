@@ -6,7 +6,7 @@
 )]
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
@@ -223,9 +223,7 @@ async fn build_handler(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<BuildReq>,
 ) -> Result<Json<BuildResult>, (StatusCode, String)> {
-    let out_dir = payload
-        .out
-        .map_or_else(|| state.repo.join("registry/v1"), PathBuf::from);
+    let out_dir = editor::resolve_out(&state.repo, payload.out.as_deref().map(Path::new));
 
     let res =
         editor::build_registry(&state.repo, &out_dir, payload.allow_dirty).map_err(bad_request)?;

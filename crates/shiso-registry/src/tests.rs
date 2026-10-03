@@ -99,6 +99,8 @@ fn build_registry_compiles_unsigned_index_and_manifests() {
 
     // Write the vendored sample recipe into the temp repo
     fs::write(recipes_dir.join("qwen3.5-9b.json"), SAMPLE_RECIPE).unwrap();
+    // The build reads publication dates from the repository's history.
+    git(temp.path(), &["init", "-q"]);
 
     // Build registry
     let out_dir = temp.path().join("registry").join("v1");
@@ -179,4 +181,72 @@ async fn http_hardening_rejects_unauthorized_and_invalid_hosts() {
 
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Runs git in `dir` with a fixed identity and commit date.
+fn git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_COMMITTER_DATE", "2026-01-02T03:04:05+00:00")
+        .env("GIT_AUTHOR_DATE", "2026-01-02T03:04:05+00:00")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+/// The output and the git history both belong to the repository, not to the
+/// directory the tool happens to run in: a relative output lands inside the
+/// repository and the manifests carry the repository's commit dates even
+/// though this test process runs inside another git checkout.
+#[test]
+fn build_writes_into_the_repository_and_dates_from_its_history() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("recipes")).unwrap();
+    fs::write(repo.join("recipes").join("qwen3.5-9b.json"), SAMPLE_RECIPE).unwrap();
+    git(repo, &["init", "-q"]);
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "recipe"]);
+
+    for asked in [None, Some(""), Some("registry/v1")] {
+        let out = editor::resolve_out(repo, asked.map(Path::new));
+        assert_eq!(out, repo.join("registry/v1"), "{asked:?}");
+    }
+    assert_eq!(
+        editor::resolve_out(repo, Some(Path::new("/elsewhere/v1"))),
+        Path::new("/elsewhere/v1")
+    );
+
+    let out = editor::resolve_out(repo, Some(Path::new("registry/v1")));
+    editor::build_registry(repo, &out, false).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(out.join("models").join("qwen3.5-9b.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["updated_at"], "2026-01-02T03:04:05Z");
+    assert_eq!(manifest["published_at"], "2026-01-02T03:04:05Z");
+}
+
+/// A directory git cannot read is refused rather than stamped with the build
+/// time.
+#[test]
+fn build_refuses_a_repository_git_cannot_read() {
+    let temp = tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("recipes")).unwrap();
+    fs::write(
+        temp.path().join("recipes").join("qwen3.5-9b.json"),
+        SAMPLE_RECIPE,
+    )
+    .unwrap();
+    let out = editor::resolve_out(temp.path(), None);
+    let err = editor::build_registry(temp.path(), &out, true).unwrap_err();
+    assert!(err.to_string().contains("git"), "{err}");
 }

@@ -285,6 +285,21 @@ async fn hash_remote_non_lfs_file(
     Some(hex::encode(Sha256Hasher::digest(&bytes)))
 }
 
+/// Where a build writes, given the repository and what the caller asked for.
+///
+/// The output belongs to the registry repository, wherever the tool was
+/// started from: nothing (or an empty field) is `<repo>/registry/v1`, a
+/// relative path is relative to the repository, and only an absolute path
+/// leaves it.
+#[must_use]
+pub(crate) fn resolve_out(repo_path: &Path, out: Option<&Path>) -> PathBuf {
+    match out {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) if !path.as_os_str().is_empty() => repo_path.join(path),
+        _ => repo_path.join("registry/v1"),
+    }
+}
+
 /// Builds and validates the registry output (§7.1, §7.5).
 ///
 /// # Errors
@@ -330,7 +345,7 @@ pub(crate) fn build_registry(
         let bytes = fs::read(&path)?;
         let mut recipe: Recipe = serde_json::from_slice(&bytes)?;
 
-        let (published, updated) = get_git_timestamps(&path);
+        let (published, updated) = get_git_timestamps(repo_path, &path)?;
         recipe.published_at = Some(published.clone());
         recipe.updated_at = Some(updated.clone());
 
@@ -510,28 +525,63 @@ pub(crate) fn delete_recipe(repo_path: &Path, name_str: &str) -> anyhow::Result<
     Ok(())
 }
 
-fn get_git_timestamps(path: &Path) -> (String, String) {
-    let output = Command::new("git")
+/// A recipe's first and latest commit times, read from the registry
+/// repository's own history.
+///
+/// Run inside `repo_path`, never the caller's working directory: started from
+/// another repository, `git log` there knows nothing of the recipe and every
+/// manifest was stamped with the build time. A recipe with no commits yet -
+/// only buildable with `--allow-dirty` - is stamped now.
+///
+/// # Errors
+/// When git cannot read the repository's history at all.
+fn get_git_timestamps(repo_path: &Path, path: &Path) -> anyhow::Result<(String, String)> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .with_context(|| format!("running git in {}", repo_path.display()))
+    };
+    let tree = git(&["rev-parse", "--is-inside-work-tree"])?;
+    if !tree.status.success() {
+        bail!(
+            "{} is not a git repository; the build reads publication dates from its history: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&tree.stderr).trim()
+        );
+    }
+    let now = current_iso8601();
+    // A repository with no commit yet has no history to read.
+    if !git(&["rev-parse", "--verify", "-q", "HEAD"])?
+        .status
+        .success()
+    {
+        return Ok((now.clone(), now));
+    }
+    let out = Command::new("git")
         .args(["log", "--follow", "--format=%cI", "--"])
         .arg(path)
-        .output();
-
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        let lines: Vec<_> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect();
-        if !lines.is_empty() {
-            let updated = lines[0].to_string();
-            let published = lines.last().unwrap_or(&lines[0]).to_string();
-            return (published, updated);
-        }
+        .current_dir(repo_path)
+        .output()
+        .with_context(|| format!("running git in {}", repo_path.display()))?;
+    if !out.status.success() {
+        bail!(
+            "git cannot read the history of {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-
-    let now = current_iso8601();
-    (now.clone(), now)
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<_> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if let (Some(updated), Some(published)) = (lines.first(), lines.last()) {
+        return Ok(((*published).to_string(), (*updated).to_string()));
+    }
+    Ok((now.clone(), now))
 }
 
 fn atomic_write(dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {

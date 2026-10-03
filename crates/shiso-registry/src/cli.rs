@@ -75,7 +75,8 @@ pub(crate) struct BuildArgs {
     pub repo: PathBuf,
 
     /// Output directory for compiled manifests and index.
-    /// Defaults to `<repo>/registry/v1`, the path the registry repo serves.
+    /// Defaults to `<repo>/registry/v1`, the path the registry repo serves; a
+    /// relative path is relative to `--repo`, not to the working directory.
     #[arg(long)]
     pub out: Option<PathBuf>,
 

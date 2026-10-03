@@ -18,7 +18,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve(args) => {
+        // Every path the tool writes or runs git in hangs off the repository,
+        // so it is made absolute once, here, against the directory the tool was
+        // started from - and nothing later depends on that directory again.
+        Command::Serve(mut args) => {
+            args.repo = std::path::absolute(&args.repo)?;
             server::run_server(args.repo, args.port, args.open).await?;
         }
         Command::Inspect(args) => {
@@ -34,7 +38,8 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Command::Validate(args) => {
+        Command::Validate(mut args) => {
+            args.repo = std::path::absolute(&args.repo)?;
             let reports = editor::validate_all(&args.repo)?;
             let mut failed = false;
             for r in reports {
@@ -50,8 +55,9 @@ async fn main() -> anyhow::Result<()> {
             }
             println!("All recipes strictly valid.");
         }
-        Command::Build(args) => {
-            let out = args.out.unwrap_or_else(|| args.repo.join("registry/v1"));
+        Command::Build(mut args) => {
+            args.repo = std::path::absolute(&args.repo)?;
+            let out = editor::resolve_out(&args.repo, args.out.as_deref());
             let res = editor::build_registry(&args.repo, &out, args.allow_dirty)?;
             println!(
                 "Build succeeded: {} model(s) compiled into {}",
