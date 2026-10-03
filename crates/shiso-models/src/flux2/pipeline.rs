@@ -348,9 +348,10 @@ impl ImageGenerator for Flux2KleinModel {
 
         // 4-axis positions, matching the reference pipeline's id prep: image
         // tokens carry (frame 0, row, column, 0) and text tokens (0, 0, 0,
-        // index) - the text-id prep is a cartesian product of t=[0], h=[0],
-        // w=[0] and l=arange(L), so the sequence index rides the fourth axis,
-        // not the second. Single blocks run the joint sequence text-first.
+        // index) - the text-id prep enumerates every combination of t=[0],
+        // h=[0], w=[0] with l=0..L, so the sequence index rides the fourth
+        // axis, not the second. Single blocks run the joint sequence
+        // text-first.
         let mut img_positions = Vec::with_capacity(t_img * 4);
         for token in 0..t_img {
             let (li, lj) = (token / wl, token % wl);

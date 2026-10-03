@@ -65,7 +65,7 @@ struct Resnet {
 
 /// The mid block's single-head spatial attention.
 #[derive(Debug)]
-struct AttnBlock {
+struct SpatialAttention {
     norm_w: DeviceBuffer,
     norm_b: DeviceBuffer,
     q: Conv,
@@ -99,7 +99,7 @@ pub(crate) struct Vae {
     post_quant: Conv,
     conv_in: Conv,
     mid_resnets: [Resnet; 2],
-    mid_attn: AttnBlock,
+    mid_attn: SpatialAttention,
     up_blocks: Vec<UpBlock>,
     norm_out_w: DeviceBuffer,
     norm_out_b: DeviceBuffer,
@@ -245,7 +245,7 @@ impl Vae {
         } else {
             "out"
         };
-        let mid_attn = AttnBlock {
+        let mid_attn = SpatialAttention {
             norm_w,
             norm_b,
             q: load_conv(&store, ops, &format!("{attn_base}to_q"))?,
@@ -368,7 +368,7 @@ impl Vae {
                 x = self.resnet(ops, resnet, &x, &mut field, step)?;
             }
             if let Some(up) = &block.upsample {
-                // Reference `Upsample.forward`: nearest 2x interpolation
+                // The reference's upsampling: nearest 2x interpolation
                 // FIRST, then the 3x3 conv over the 2x field - convolving at
                 // the low resolution and upscaling after would sample the
                 // conv weights against the wrong field.
@@ -462,8 +462,8 @@ impl Vae {
     /// `c` at spatial position `(2*li + p/2, 2*lj + p%2)` - the inverse of
     /// the 2x2 patchification the transformer's input was built with. The
     /// flattened feature index is channel-major (`f = c * pi * pj + p`),
-    /// pinned by the upstream pack in `AutoEncoder.encode`:
-    /// `rearrange(mean, "... c (i pi) (j pj) -> ... (c pi pj) i j")` - the
+    /// pinned by the reference's packing step: its rearrangement pattern
+    /// `"... c (i pi) (j pj) -> ... (c pi pj) i j"` - the
     /// `(c pi pj)` group means the channel index varies slowest, exactly the
     /// `(c, p)` split below.
     fn unpack_latents(
@@ -482,10 +482,10 @@ impl Vae {
             )));
         }
         // The batch-norm statistics live in the PACKED space: the reference
-        // `AutoEncoder` normalises with a BatchNorm2d over `prod(ps) *
-        // z_channels` = 128 features and `inv_normalize` runs before the
-        // unpack, so entry `f` of the stats belongs to packed feature `f`,
-        // not to latent channel `f / 4`.
+        // encoder normalises with a batch normalization over `prod(ps) *
+        // z_channels` = 128 features and its inverse normalization runs
+        // before the unpack, so entry `f` of the stats belongs to packed
+        // feature `f`, not to latent channel `f / 4`.
         if self.bn_mean.len() != zc * 4 {
             return Err(ImageGenError::Checkpoint(format!(
                 "bn statistics cover {} features, expected {} ({} latent channels x 4 \
@@ -624,7 +624,7 @@ impl Vae {
     fn attention(
         &self,
         ops: &Ops,
-        attn: &AttnBlock,
+        attn: &SpatialAttention,
         x: &DeviceBuffer,
         field: &Field,
     ) -> Result<DeviceBuffer, ImageGenError> {

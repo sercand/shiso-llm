@@ -1,4 +1,4 @@
-//! `FlowMatch` Euler discrete scheduler with empirical mu time shifting.
+//! Flow-matching Euler discrete scheduler with empirical mu time shifting.
 
 /// Computes empirical mu shift factor based on image sequence length and steps.
 ///
@@ -27,7 +27,7 @@ pub(crate) fn compute_empirical_mu(image_seq_len: usize, num_steps: usize) -> f3
     a * (num_steps as f32) + b
 }
 
-/// The `FlowMatch` Euler discrete scheduler.
+/// The flow-matching Euler discrete scheduler.
 #[derive(Debug, Clone)]
 pub(crate) struct FlowMatchEulerDiscreteScheduler {
     /// Timesteps in descending order (e.g. sigma * 1000.0).
