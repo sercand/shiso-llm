@@ -28,7 +28,7 @@ pub mod qwen35moe;
 pub mod qwen3_asr;
 pub mod qwen4exp;
 
-pub use catalog::{FamilyFacts, FamilyFeatures};
+pub use catalog::FamilyFacts;
 
 /// Returns the catalog of all model families supported by `shiso-models`.
 #[must_use]

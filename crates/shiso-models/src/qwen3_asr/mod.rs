@@ -31,20 +31,10 @@ pub mod prompt;
 mod stream;
 pub mod weights;
 
-use crate::catalog::{FamilyFacts, FamilyFeatures};
+use crate::catalog::FamilyFacts;
 
 /// Family facts for Qwen3 ASR.
-pub const FACTS: FamilyFacts = FamilyFacts {
-    name: "qwen3_asr",
-    accepted_roles: &["asr", "asr_mmproj", "diarization"],
-    tasks: &["transcription", "diarization"],
-    features: FamilyFeatures {
-        tools: false,
-        reasoning_efforts: &[],
-        default_reasoning_effort: None,
-        structured_output: false,
-    },
-};
+pub const FACTS: FamilyFacts = FamilyFacts { name: "qwen3_asr" };
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

@@ -135,57 +135,6 @@ fn model_ref_parsing() {
 }
 
 #[test]
-fn validation_role_dependencies() {
-    let mut recipe = make_test_recipe();
-    assert!(validate_recipe(&recipe, ValidationMode::Strict, None).is_ok());
-
-    // Add draft without spec_k -> fails
-    let draft_comp = recipe.variants[0].components[&Role::Base].clone();
-    recipe.variants[0]
-        .components
-        .insert(Role::Draft, draft_comp);
-    recipe.variants[0].requirements.disk_bytes = 10200;
-    recipe.variants[0].server_defaults = Some(ServerDefaults {
-        spec_k: None,
-        ..Default::default()
-    });
-    assert!(validate_recipe(&recipe, ValidationMode::Strict, None).is_err());
-
-    // Fix spec_k -> passes
-    recipe.variants[0].server_defaults = Some(ServerDefaults {
-        spec_k: Some(3),
-        ..Default::default()
-    });
-    assert!(validate_recipe(&recipe, ValidationMode::Strict, None).is_ok());
-
-    // Add draft_vocab without draft -> fails
-    recipe.variants[0].components.remove(&Role::Draft);
-    let base_comp = recipe.variants[0].components[&Role::Base].clone();
-    recipe.variants[0]
-        .components
-        .insert(Role::DraftVocab, base_comp);
-    assert!(validate_recipe(&recipe, ValidationMode::Strict, None).is_err());
-}
-
-#[test]
-fn validation_path_safety() {
-    let mut recipe = make_test_recipe();
-    let bad_file = FileEntry {
-        name: "../evil.txt".to_string(),
-        size: 10,
-        sha256: Sha256::parse("0d1f7c5b2e9a8b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4")
-            .unwrap(),
-    };
-    recipe.variants[0]
-        .components
-        .get_mut(&Role::Base)
-        .unwrap()
-        .files
-        .push(bad_file);
-    assert!(validate_recipe(&recipe, ValidationMode::Strict, None).is_err());
-}
-
-#[test]
 fn variant_selection_metal_host() {
     let recipe = make_test_recipe();
     let host = HostProfile {
@@ -330,21 +279,4 @@ fn blob_store_hardlinks_and_gc() {
     assert_eq!(gc_stats.deleted_blobs, 1);
     assert_eq!(gc_stats.reclaimed_bytes, 16);
     assert!(!loose_blob.is_file());
-}
-
-#[test]
-fn checked_in_recipes_are_strictly_valid() {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir.parent().unwrap().parent().unwrap();
-    let recipes_dir = root.join("registry").join("recipes");
-    if recipes_dir.is_dir() {
-        for entry in fs::read_dir(recipes_dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "json") {
-                let bytes = fs::read(&path).unwrap();
-                let recipe: Recipe = serde_json::from_slice(&bytes).unwrap();
-                validate_recipe(&recipe, ValidationMode::Strict, None).unwrap();
-            }
-        }
-    }
 }

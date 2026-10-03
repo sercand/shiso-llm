@@ -82,17 +82,7 @@ pub use mtp::{
 pub use st_names::Qwen35Names;
 pub use vision::Qwen35Tower;
 
-use crate::catalog::{FamilyFacts, FamilyFeatures};
+use crate::catalog::FamilyFacts;
 
 /// Family facts for Qwen3.5.
-pub const FACTS: FamilyFacts = FamilyFacts {
-    name: "qwen35",
-    accepted_roles: &["base", "draft", "draft_vocab", "vision"],
-    tasks: &["chat"],
-    features: FamilyFeatures {
-        tools: true,
-        reasoning_efforts: &["none", "low", "medium", "high", "xhigh", "max"],
-        default_reasoning_effort: Some("medium"),
-        structured_output: true,
-    },
-};
+pub const FACTS: FamilyFacts = FamilyFacts { name: "qwen35" };

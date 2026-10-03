@@ -59,17 +59,7 @@ pub use model::Qwen35MoeModel;
 pub use mtp::MtpHead;
 pub use quant::{QuantAlgo, QuantConfig};
 
-use crate::catalog::{FamilyFacts, FamilyFeatures};
+use crate::catalog::FamilyFacts;
 
 /// Family facts for Qwen3.5 `MoE`.
-pub const FACTS: FamilyFacts = FamilyFacts {
-    name: "qwen35moe",
-    accepted_roles: &["base", "draft", "draft_vocab", "vision"],
-    tasks: &["chat"],
-    features: FamilyFeatures {
-        tools: true,
-        reasoning_efforts: &["none", "low", "medium", "high", "xhigh", "max"],
-        default_reasoning_effort: Some("medium"),
-        structured_output: true,
-    },
-};
+pub const FACTS: FamilyFacts = FamilyFacts { name: "qwen35moe" };

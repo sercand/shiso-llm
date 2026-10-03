@@ -99,22 +99,6 @@ struct LfsMetadata {
     size: u64,
 }
 
-/// Builds `FamilyValidationFacts` from `shiso_models::family_catalog()`.
-#[must_use]
-pub(crate) fn get_family_validation_facts() -> Vec<FamilyValidationFacts<'static>> {
-    shiso_models::family_catalog()
-        .iter()
-        .map(|f| FamilyValidationFacts {
-            name: f.name,
-            accepted_roles: f.accepted_roles,
-            tasks: f.tasks,
-            tools: f.features.tools,
-            reasoning_efforts: f.features.reasoning_efforts,
-            structured_output: f.features.structured_output,
-        })
-        .collect()
-}
-
 /// Strictly validates all recipes found under `recipes/` (§7.1, §7.3).
 ///
 /// # Errors
@@ -125,7 +109,6 @@ pub(crate) fn validate_all(repo_path: &Path) -> anyhow::Result<Vec<RecipeValidat
         bail!("directory '{}' does not exist", recipes_dir.display());
     }
 
-    let family_facts = get_family_validation_facts();
     let mut reports = Vec::new();
     let mut global_names: HashMap<String, String> = HashMap::new();
 
@@ -152,9 +135,7 @@ pub(crate) fn validate_all(repo_path: &Path) -> anyhow::Result<Vec<RecipeValidat
             Ok(recipe) => {
                 let name = recipe.name.to_string();
 
-                if let Err(e) =
-                    validate_recipe(&recipe, ValidationMode::Strict, Some(&family_facts))
-                {
+                if let Err(e) = validate_recipe(&recipe, ValidationMode::Strict) {
                     errors.push(e.to_string());
                 }
 
@@ -482,8 +463,7 @@ pub(crate) fn save_recipe(repo_path: &Path, name_str: &str, content: &str) -> an
         );
     }
 
-    let family_facts = get_family_validation_facts();
-    validate_recipe(&recipe, ValidationMode::Strict, Some(&family_facts))
+    validate_recipe(&recipe, ValidationMode::Strict)
         .map_err(|e| anyhow::anyhow!("recipe validation error: {e}"))?;
 
     let formatted = serde_json::to_string_pretty(&recipe)?;

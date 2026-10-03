@@ -252,7 +252,7 @@ impl RegistryClient {
         let recipe: Recipe = serde_json::from_slice(&manifest_bytes)?;
 
         // Validate basic rules
-        validate_recipe(&recipe, ValidationMode::Client, None)?;
+        validate_recipe(&recipe, ValidationMode::Client)?;
 
         // Check min_shiso_version
         if recipe.min_shiso_version > *current_shiso_version {

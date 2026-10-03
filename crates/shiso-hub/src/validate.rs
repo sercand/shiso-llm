@@ -13,16 +13,6 @@ use crate::recipe::{CURRENT_SCHEMA_VERSION, Recipe, Role, Variant};
 pub struct FamilyValidationFacts<'a> {
     /// Family name as `shiso-models` spells it.
     pub name: &'a str,
-    /// Roles accepted by this family.
-    pub accepted_roles: &'a [&'a str],
-    /// API tasks served by this family.
-    pub tasks: &'a [&'a str],
-    /// Whether tool calling is implemented for this family.
-    pub tools: bool,
-    /// Reasoning effort labels implemented for this family.
-    pub reasoning_efforts: &'a [&'a str],
-    /// Whether structured output is implemented for this family.
-    pub structured_output: bool,
 }
 
 /// Validation mode: client (tolerant of additive changes) or strict (denies typos).
@@ -39,20 +29,13 @@ pub enum ValidationMode {
 /// # Errors
 /// Returns [`HubError::Validation`] on rule violations, or [`HubError::UnsupportedSchemaVersion`]
 /// if the manifest schema version exceeds what this build supports.
-pub fn validate_recipe(
-    recipe: &Recipe,
-    mode: ValidationMode,
-    family_facts: Option<&[FamilyValidationFacts<'_>]>,
-) -> Result<(), HubError> {
-    validate_metadata(recipe, family_facts)?;
-    validate_variants(recipe, mode, family_facts)?;
+pub fn validate_recipe(recipe: &Recipe, mode: ValidationMode) -> Result<(), HubError> {
+    validate_metadata(recipe)?;
+    validate_variants(recipe, mode)?;
     Ok(())
 }
 
-fn validate_metadata(
-    recipe: &Recipe,
-    family_facts: Option<&[FamilyValidationFacts<'_>]>,
-) -> Result<(), HubError> {
+fn validate_metadata(recipe: &Recipe) -> Result<(), HubError> {
     if recipe.schema_version > CURRENT_SCHEMA_VERSION {
         return Err(HubError::UnsupportedSchemaVersion {
             found: recipe.schema_version,
@@ -86,59 +69,12 @@ fn validate_metadata(
         });
     }
 
-    if let Some(facts_list) = family_facts {
-        validate_family_facts(recipe, facts_list)?;
-    }
+    validate_family_facts(recipe)?;
 
     Ok(())
 }
 
-fn validate_family_facts(
-    recipe: &Recipe,
-    facts_list: &[FamilyValidationFacts<'_>],
-) -> Result<(), HubError> {
-    let facts = facts_list
-        .iter()
-        .find(|f| f.name == recipe.family)
-        .ok_or_else(|| HubError::Validation {
-            reason: format!("unknown model family '{}'", recipe.family),
-        })?;
-
-    for task in &recipe.tasks {
-        if !facts.tasks.contains(&task.as_str()) {
-            return Err(HubError::Validation {
-                reason: format!(
-                    "family '{}' does not implement task '{}'",
-                    recipe.family,
-                    task.as_str()
-                ),
-            });
-        }
-    }
-
-    if recipe.features.tools && !facts.tools {
-        return Err(HubError::Validation {
-            reason: format!("family '{}' does not implement tool calling", recipe.family),
-        });
-    }
-    if recipe.features.structured_output && !facts.structured_output {
-        return Err(HubError::Validation {
-            reason: format!(
-                "family '{}' does not implement structured output",
-                recipe.family
-            ),
-        });
-    }
-    for effort in &recipe.features.reasoning_efforts {
-        if !facts.reasoning_efforts.contains(&effort.as_str()) {
-            return Err(HubError::Validation {
-                reason: format!(
-                    "family '{}' does not implement reasoning effort '{effort}'",
-                    recipe.family
-                ),
-            });
-        }
-    }
+fn validate_family_facts(recipe: &Recipe) -> Result<(), HubError> {
     if let Some(default_effort) = &recipe.features.default_reasoning_effort
         && !recipe.features.reasoning_efforts.contains(default_effort)
     {
@@ -152,11 +88,7 @@ fn validate_family_facts(
     Ok(())
 }
 
-fn validate_variants(
-    recipe: &Recipe,
-    mode: ValidationMode,
-    family_facts: Option<&[FamilyValidationFacts<'_>]>,
-) -> Result<(), HubError> {
+fn validate_variants(recipe: &Recipe, mode: ValidationMode) -> Result<(), HubError> {
     if recipe.variants.is_empty() {
         return Err(HubError::Validation {
             reason: "recipe must declare at least one variant".to_string(),
@@ -170,17 +102,12 @@ fn validate_variants(
                 reason: format!("duplicate variant key '{}' in recipe", variant.key.as_str()),
             });
         }
-        validate_single_variant(recipe, variant, mode, family_facts)?;
+        validate_single_variant(variant, mode)?;
     }
     Ok(())
 }
 
-fn validate_single_variant(
-    recipe: &Recipe,
-    variant: &Variant,
-    mode: ValidationMode,
-    family_facts: Option<&[FamilyValidationFacts<'_>]>,
-) -> Result<(), HubError> {
+fn validate_single_variant(variant: &Variant, mode: ValidationMode) -> Result<(), HubError> {
     if variant.backend != "metal" && variant.backend != "cuda" {
         return Err(HubError::Validation {
             reason: format!(
@@ -201,24 +128,6 @@ fn validate_single_variant(
     }
 
     validate_role_dependencies(variant)?;
-
-    if let Some(facts_list) = family_facts
-        && let Some(facts) = facts_list.iter().find(|f| f.name == recipe.family)
-    {
-        for role in variant.components.keys() {
-            if !facts.accepted_roles.contains(&role.as_str()) {
-                return Err(HubError::Validation {
-                    reason: format!(
-                        "variant '{}' uses role '{}' which family '{}' does not accept",
-                        variant.key.as_str(),
-                        role.as_str(),
-                        recipe.family
-                    ),
-                });
-            }
-        }
-    }
-
     validate_components(variant, mode)?;
     Ok(())
 }
