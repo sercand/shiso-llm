@@ -201,35 +201,46 @@ async fn image_service_refuses_when_the_queue_is_full() {
     );
 
     // The worker takes the first job off the queue and blocks inside the
-    // generator, so the queue's one slot is empty and stays empty.
+    // generator, so the queue's one slot is empty - and stays empty until
+    // the release below, because the worker cannot come back to the queue
+    // while the generator holds it. That is what makes the rest of this
+    // ordering observable rather than a timing assumption.
     let first = {
         let service = Arc::clone(&service);
         tokio::spawn(async move { service.generate(job("first", 4)).await })
     };
     started_rx.await.expect("the worker started the first job");
 
-    // With the worker busy, the queue's one slot admits exactly one of the
-    // next two jobs and the other is refused. `#[tokio::test]` runs a
-    // current-thread runtime, so the two tasks send in spawn order.
+    // Put the second job in the queue and prove it is there before the
+    // third is tried: on this current-thread runtime a yield runs the
+    // spawned task to its `answer.await`, which is after its `try_send`.
+    // (The old shape released the worker before either job had been polled;
+    // a worker that drained the slot in between admitted both and the
+    // refusal never happened.)
     let second = {
         let service = Arc::clone(&service);
         tokio::spawn(async move { service.generate(job("second", 4)).await })
     };
+    tokio::task::yield_now().await;
+
+    // The queue is observably full now, so the third meets the refusal the
+    // moment it is polled and awaiting it cannot hang.
     let third = {
         let service = Arc::clone(&service);
         tokio::spawn(async move { service.generate(job("third", 4)).await })
     };
+    let third = third.await.expect("the third task runs");
 
-    // Let everything finish: one token for the blocked job, and dropping the
-    // sender ends the queued one's wait.
+    // Now let everything finish: one token for the blocked job, and dropping
+    // the sender ends the queued one's wait.
     release_tx.send(()).expect("the generator is waiting");
     drop(release_tx);
 
-    let (first, second, third) = tokio::join!(first, second, third);
+    let (first, second) = tokio::join!(first, second);
     let outcomes = [
         first.expect("the first task runs"),
         second.expect("the second task runs"),
-        third.expect("the third task runs"),
+        third,
     ];
     let refused: Vec<&AppError> = outcomes
         .iter()
