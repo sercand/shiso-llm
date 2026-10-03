@@ -414,6 +414,18 @@ impl Vae {
         // clamps there before the pipeline maps to [0, 255]. Doing the map
         // here keeps the encoder's [0, 255] contract on this function's doc
         // honest instead of letting a [-1, 1] field clamp to black.
+        //
+        // `f32::clamp` panics on a NaN operand, and a numerics failure
+        // upstream shows up as exactly that - so one pass over the whole
+        // field turns a non-finite decode into the typed backend error the
+        // caller logs, rather than unwinding the image worker through a
+        // panic the catch_unwind would only report as "the generator
+        // panicked".
+        if out.iter().any(|v| v.is_nan()) {
+            return Err(ImageGenError::Backend(
+                "VAE decode produced NaN in the decoded image field".to_owned(),
+            ));
+        }
         let out: Vec<f32> = out
             .iter()
             .map(|v| (v.clamp(-1.0, 1.0) + 1.0) * 127.5)

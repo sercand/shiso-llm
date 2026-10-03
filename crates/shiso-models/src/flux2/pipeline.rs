@@ -158,7 +158,7 @@ impl Flux2KleinModel {
             )));
         }
 
-        // A multi-shard diffusers export keeps the transformer's shards in
+        // A multi-shard converted export keeps the transformer's shards in
         // one directory; index the whole directory when there is more than
         // the one inspected file, so no block's weights are missing.
         let dir = located
@@ -357,12 +357,11 @@ impl ImageGenerator for Flux2KleinModel {
         noise.truncate(latent_count);
         let mut latents = self.ops.upload_f32("pipeline noise", &noise)?;
 
-        // 4-axis positions, matching the reference's id prep: image tokens
-        // carry (frame 0, row, column, 0) from `_prepare_latent_ids`, text
-        // tokens (0, 0, 0, index) from `_prepare_text_ids` - a cartesian
-        // product of t=[0], h=[0], w=[0] and l=arange(L), so the sequence
-        // index rides the fourth axis, not the second. Single blocks run the
-        // joint sequence text-first.
+        // 4-axis positions, matching the reference pipeline's id prep: image
+        // tokens carry (frame 0, row, column, 0) and text tokens (0, 0, 0,
+        // index) - the text-id prep is a cartesian product of t=[0], h=[0],
+        // w=[0] and l=arange(L), so the sequence index rides the fourth axis,
+        // not the second. Single blocks run the joint sequence text-first.
         let mut img_positions = Vec::with_capacity(t_img * 4);
         for token in 0..t_img {
             let (li, lj) = (token / wl, token % wl);

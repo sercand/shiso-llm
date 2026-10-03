@@ -169,7 +169,7 @@ pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGe
         .ok_or_else(|| ImageGenError::Checkpoint("txt_in.weight rank < 2".to_string()))?
         as usize;
 
-    // Check for optional transformer config file (diffusers export)
+    // Check for optional transformer config file (the converted folder layout)
     let config_opt = read_transformer_config(&desc.model_path);
 
     // Count double and single transformer blocks from tensor names
@@ -339,14 +339,14 @@ pub(crate) fn count_blocks_internal<'a>(
 
 /// The tensor that marks a store as a transformer this loader can read: the
 /// upstream patchify input projection. A file without it carries a different
-/// tensor layout (a diffusers-name conversion), which the loader refuses.
+/// tensor layout (the alternative export naming), which the loader refuses.
 const SIGNATURE_TENSOR: &str = "img_in.weight";
 
 /// Picks the safetensors file holding the transformer weights by inspecting
 /// headers, never names-by-convention: root-level files are tried before a
 /// `transformer/` subfolder, and the winner is the first whose header carries
 /// [`SIGNATURE_TENSOR`] (or its `transformer.`-prefixed spelling). A directory
-/// whose candidates all lack it is refused by file name: a diffusers-layout
+/// whose candidates all lack it is refused by file name: a converted-folder
 /// export would index every tensor under names the loader never asks for and
 /// either fail mid-load or, worse, run a half-populated model, so guessing
 /// from the directory shape is not an option.
@@ -374,7 +374,7 @@ fn find_transformer_weights(path: &Path) -> Result<PathBuf, ImageGenError> {
     Err(ImageGenError::Checkpoint(format!(
         "no safetensors file under {} carries the upstream transformer tensor \
          '{SIGNATURE_TENSOR}'; found [{}], which is not the upstream tensor layout \
-         (diffusers-name conversions are not supported) — point the model path at \
+         (the converted folder layout is not supported) — point the model path at \
          the upstream-named single-file export instead",
         path.display(),
         candidates
