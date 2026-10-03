@@ -57,6 +57,7 @@ async fn cross_host_redirect_strips_authorization() {
         name: "test.bin".to_string(),
         size: payload.len() as u64,
         sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
     };
 
     // Use our downloader to download a file where resolve redirects cross-host
@@ -134,6 +135,7 @@ async fn same_host_redirect_preserves_authorization() {
         name: "file.txt".to_string(),
         size: payload.len() as u64,
         sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
     };
 
     let res = downloader
@@ -234,6 +236,7 @@ async fn bit_flip_leads_to_digest_mismatch_and_cleanup() {
         name: "corrupt.bin".to_string(),
         size: payload.len() as u64,
         sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
     };
 
     let err = downloader
@@ -296,6 +299,7 @@ async fn range_resume_appends() {
         name: "resume.bin".to_string(),
         size: full_payload.len() as u64,
         sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
     };
 
     // Pre-create .part file with part1
@@ -354,6 +358,7 @@ async fn concurrent_pulls_single_download() {
         name: "shared.bin".to_string(),
         size: payload.len() as u64,
         sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
     };
 
     let d1 = downloader.clone();

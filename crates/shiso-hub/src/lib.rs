@@ -21,16 +21,16 @@ pub use config::{
 };
 pub use download::{DownloadFileDesc, Downloader};
 pub use error::HubError;
-pub use host::{Backend, CudaInfo, HostProfile, probe_free_disk, probe_ram};
+pub use host::{Backend, CudaInfo, HostProfile, MetalInfo, probe_free_disk, probe_ram};
 pub use progress::ProgressEvent;
 pub use recipe::{
-    CURRENT_SCHEMA_VERSION, CommitSha, Component, FileEntry, HostConstraints, Index,
-    IndexModelEntry, IndexVariantEntry, InstalledFileEntry, InstalledMetadata, ModalCapabilities,
-    Modality, ModelName, ModelRef, Recipe, RecipeFeatures, Requirements, Role, ServerDefaults,
-    Sha256, Task, Variant, VariantKey,
+    CURRENT_SCHEMA_VERSION, CommitSha, Component, ExpertResidency, FileEntry, HostConstraints,
+    Index, IndexModelEntry, IndexVariantEntry, InstalledFileEntry, InstalledMetadata,
+    ModalCapabilities, Modality, ModelName, ModelRef, Recipe, RecipeFeatures, Requirements, Role,
+    RolePath, ServerDefaults, Sha256, Task, Variant, VariantKey,
 };
 pub use registry::RegistryClient;
-pub use select::{SelectedVariant, select_variant};
+pub use select::{SelectedVariant, host_backend, select_variant};
 pub use store::{BlobStore, GcStats, InstalledVariantSummary};
 pub use validate::{FamilyValidationFacts, ValidationMode, validate_recipe};
 

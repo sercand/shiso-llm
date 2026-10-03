@@ -5,8 +5,10 @@
 use std::path::PathBuf;
 
 use clap::{CommandFactory as _, FromArgMatches as _, Parser as _};
-use shiso_hub::recipe::ServerDefaults;
-use shiso_server::cli::{Cli, ModelArgKind, ServeArgs, apply_recipe_defaults, classify_model_arg};
+use shiso_hub::recipe::{ExpertResidency, ServerDefaults};
+use shiso_server::cli::{
+    Cli, ExpertResidencyChoice, ModelArgKind, ServeArgs, apply_recipe_defaults, classify_model_arg,
+};
 use shiso_server::hub::resolve_serve_model;
 
 #[test]
@@ -88,7 +90,14 @@ fn apply_recipe_defaults_precedence() {
         video_max_frames: Some(120),
         asr_lookahead: Some(8),
         asr_batch: Some(4),
-        expert_residency: Some("resident".to_string()),
+        expert_residency: Some(ExpertResidency::Resident),
+        expert_reserve_gb: Some(12),
+        expert_slots: Some(4096),
+        spec_lookup: Some(8),
+        capture_verify: Some(true),
+        capture_batch: Some(true),
+        gpu_memory_utilization: Some(0.88),
+        solo_prefill_chunk: Some(4096),
     };
 
     apply_recipe_defaults(&mut args, Some(serve_matches), &defaults);
@@ -102,6 +111,14 @@ fn apply_recipe_defaults_precedence() {
     assert_eq!(args.video_max_frames, 120);
     assert_eq!(args.asr_lookahead, 8);
     assert_eq!(args.asr_batch, 4);
+    assert_eq!(args.expert_residency, ExpertResidencyChoice::Resident);
+    assert_eq!(args.expert_reserve_gb, 12);
+    assert_eq!(args.expert_slots, 4096);
+    assert_eq!(args.spec_lookup, 8);
+    assert!(args.capture_verify);
+    assert!(args.capture_batch);
+    assert_eq!(args.gpu_memory_utilization, Some(0.88));
+    assert_eq!(args.solo_prefill_chunk, 4096);
 
     // 2. Explicit CLI flag: wins over recipe default
     let cmd = Cli::command();

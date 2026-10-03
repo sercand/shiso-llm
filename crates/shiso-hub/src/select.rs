@@ -1,7 +1,7 @@
 //! Hardware-aware variant selection (§5.4).
 
 use crate::error::HubError;
-use crate::host::{Backend, HostProfile};
+use crate::host::{Backend, HostProfile, MetalInfo};
 use crate::recipe::{Recipe, Variant, VariantKey};
 use std::fmt::Write;
 
@@ -92,9 +92,9 @@ pub fn select_variant<'a>(
             return Ok(SelectedVariant {
                 variant: candidate,
                 explanation: format!(
-                    "selected variant '{}' (backend '{}', quant '{}') fitting recommended RAM ({} MB)",
+                    "selected variant '{}' (backends {}, quant '{}') fitting recommended RAM ({} MB)",
                     candidate.key.as_str(),
-                    candidate.backend,
+                    backend_list(candidate),
                     candidate.quant,
                     rec / (1024 * 1024)
                 ),
@@ -107,13 +107,38 @@ pub fn select_variant<'a>(
     Ok(SelectedVariant {
         variant: first,
         explanation: format!(
-            "selected variant '{}' (backend '{}', quant '{}') as best available fit",
+            "selected variant '{}' (backends {}, quant '{}') as best available fit",
             first.key.as_str(),
-            first.backend,
+            backend_list(first),
             first.quant
         ),
         warning: None,
     })
+}
+
+fn backend_list(variant: &Variant) -> String {
+    let names: Vec<&str> = variant.backends.iter().map(|b| b.as_str()).collect();
+    names.join("/")
+}
+
+/// The backend `variant` would run on here: the first one it names that this
+/// build has, so the author's preference order decides between two the host
+/// offers.
+///
+/// # Errors
+/// The reason no named backend is available, for the caller to wrap.
+pub fn host_backend(variant: &Variant, host: &HostProfile) -> Result<Backend, String> {
+    variant
+        .backends
+        .iter()
+        .copied()
+        .find(|b| host.backends.contains(b))
+        .ok_or_else(|| {
+            format!(
+                "backends {} are not supported by this build of shiso",
+                backend_list(variant)
+            )
+        })
 }
 
 fn check_hard_constraints(
@@ -121,26 +146,11 @@ fn check_hard_constraints(
     host: &HostProfile,
     model_name: &str,
 ) -> Result<(), HubError> {
-    let target_backend = match variant.backend.as_str() {
-        "metal" => Backend::Metal,
-        "cuda" => Backend::Cuda,
-        other => {
-            return Err(HubError::NoCompatibleVariant {
-                model: model_name.to_string(),
-                reasons: format!("unknown backend '{other}'"),
-            });
-        }
-    };
-
-    if !host.backends.contains(&target_backend) {
-        return Err(HubError::NoCompatibleVariant {
+    let target_backend =
+        host_backend(variant, host).map_err(|reasons| HubError::NoCompatibleVariant {
             model: model_name.to_string(),
-            reasons: format!(
-                "backend '{}' is not supported by this build of shiso",
-                variant.backend
-            ),
-        });
-    }
+            reasons,
+        })?;
 
     if target_backend == Backend::Cuda {
         let cuda = host
@@ -164,22 +174,53 @@ fn check_hard_constraints(
         }
     }
 
+    if target_backend == Backend::Metal {
+        let metal = host
+            .metal
+            .as_ref()
+            .ok_or_else(|| HubError::NoCompatibleVariant {
+                model: model_name.to_string(),
+                reasons: "Metal backend is enabled but no Metal device was detected".to_string(),
+            })?;
+        if let Some(reason) = metal_family_shortfall(variant, metal) {
+            return Err(HubError::NoCompatibleVariant {
+                model: model_name.to_string(),
+                reasons: reason,
+            });
+        }
+    }
+
     Ok(())
 }
 
-fn check_candidate_variant(variant: &Variant, host: &HostProfile) -> Result<(), String> {
-    let target_backend = match variant.backend.as_str() {
-        "metal" => Backend::Metal,
-        "cuda" => Backend::Cuda,
-        other => return Err(format!("unknown backend '{other}'")),
-    };
+/// Why the device's Apple GPU family is too old for `variant`, if it is.
+fn metal_family_shortfall(variant: &Variant, metal: &MetalInfo) -> Option<String> {
+    let min = variant.requires.as_ref().and_then(|r| r.min_metal_family)?;
+    (metal.family < min).then(|| {
+        format!(
+            "requires Apple GPU family {min} ({}) or newer, but {} is family {}",
+            apple_family_label(min),
+            metal.name,
+            metal.family
+        )
+    })
+}
 
-    if !host.backends.contains(&target_backend) {
-        return Err(format!(
-            "backend '{}' not available in this build",
-            variant.backend
-        ));
+/// The first chip generation of an Apple GPU family, for messages.
+#[must_use]
+pub const fn apple_family_label(family: u32) -> &'static str {
+    match family {
+        0..=6 => "pre-M1",
+        7 => "M1",
+        8 => "M2",
+        9 => "M3/M4",
+        10 => "M5",
+        _ => "newer than M5",
     }
+}
+
+fn check_candidate_variant(variant: &Variant, host: &HostProfile) -> Result<(), String> {
+    let target_backend = host_backend(variant, host)?;
 
     if target_backend == Backend::Cuda {
         let Some(cuda) = &host.cuda else {
@@ -199,6 +240,25 @@ fn check_candidate_variant(variant: &Variant, host: &HostProfile) -> Result<(), 
                 "requires {} MB VRAM, host has {} MB",
                 min_vram / (1024 * 1024),
                 cuda.vram_bytes / (1024 * 1024)
+            ));
+        }
+    }
+
+    if target_backend == Backend::Metal {
+        let Some(metal) = &host.metal else {
+            return Err("no Metal device detected".to_string());
+        };
+        if let Some(reason) = metal_family_shortfall(variant, metal) {
+            return Err(reason);
+        }
+        if let Some(min_set) = variant.requirements.min_vram_bytes
+            && metal.working_set_bytes < min_set
+        {
+            return Err(format!(
+                "requires {} MB GPU working set, {} recommends {} MB",
+                min_set / (1024 * 1024),
+                metal.name,
+                metal.working_set_bytes / (1024 * 1024)
             ));
         }
     }

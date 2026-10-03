@@ -326,6 +326,16 @@ let cachedFamilies = [];
 let allRecipes = [];
 let formVariants = [];
 
+// Inspected HF listings keyed by `${vIdx}:${role}`. The picker table lives
+// inside the variant cards, and every renderVariantsList() rebuild wipes it;
+// keeping the payload here lets the rebuild restore the picker with its
+// checkboxes instead of collapsing back to the selected-files summary.
+const inspectedCache = {};
+function inspectedKey(vIdx, role) { return `${vIdx}:${role}`; }
+function clearInspectedCache() {
+  for (const k of Object.keys(inspectedCache)) delete inspectedCache[k];
+}
+
 function initAuth() {
   if (location.hash.startsWith("#token=")) {
     sessionToken = location.hash.substring(7);
@@ -475,6 +485,7 @@ function startNewRecipe() {
   document.getElementById('family-info-pill').style.display = 'none';
 
   formVariants = [];
+  clearInspectedCache();
   addVariant(); // Add one default variant
   showTab('editor');
   liveValidateForm();
@@ -518,7 +529,13 @@ async function editRecipe(name) {
       document.getElementById('f-default-effort').value = r.features.default_reasoning_effort;
     }
 
-    formVariants = r.variants || [];
+    // Older recipes spell one backend as a string; the editor edits a list.
+    formVariants = (r.variants || []).map(v => {
+      if (!v.backends) v.backends = v.backend ? [v.backend] : [];
+      delete v.backend;
+      return v;
+    });
+    clearInspectedCache();
     renderVariantsList();
     showTab('editor');
     liveValidateForm();
@@ -531,7 +548,7 @@ function addVariant() {
   const vIndex = formVariants.length;
   formVariants.push({
     key: vIndex === 0 ? "metal-mlx4" : `cuda-fp8`,
-    backend: vIndex === 0 ? "metal" : "cuda",
+    backends: vIndex === 0 ? ["metal"] : ["cuda"],
     quant: vIndex === 0 ? "mlx-4bit" : "fp8",
     requires: { min_cuda_sm: vIndex === 0 ? null : 89 },
     requirements: {
@@ -550,9 +567,7 @@ function addVariant() {
       }
     },
     server_defaults: {
-      ctx: 32768,
-      spec_k: null,
-      vision_max_pixels: null
+      ctx: 32768
     }
   });
   renderVariantsList();
@@ -565,6 +580,8 @@ function deleteVariant(vIdx) {
     return;
   }
   formVariants.splice(vIdx, 1);
+  // Variant indices shift, so every cached listing key is now wrong.
+  clearInspectedCache();
   renderVariantsList();
   liveValidateForm();
 }
@@ -574,7 +591,7 @@ function renderVariantsList() {
   container.innerHTML = "";
 
   formVariants.forEach((v, vIdx) => {
-    const isCuda = v.backend === "cuda";
+    const isCuda = (v.backends || []).includes("cuda");
     const diskBytes = calculateVariantDiskBytes(v);
     v.requirements.disk_bytes = diskBytes;
 
@@ -585,7 +602,7 @@ function renderVariantsList() {
         <div style="display:flex; align-items:center; gap:8px;">
           <span style="font-weight:700; font-size:14px;">Variant #${vIdx + 1}:</span>
           <input type="text" value="${v.key}" onchange="updateVariantField(${vIdx}, 'key', this.value)" style="width:180px; font-weight:600;">
-          <span class="badge ${isCuda ? 'badge-warning' : 'badge-primary'}">${v.backend}</span>
+          <span class="badge ${isCuda ? 'badge-warning' : 'badge-primary'}">${(v.backends || []).join(' / ') || 'no backend'}</span>
           <span class="stat-pill">Disk: ${formatBytes(diskBytes)}</span>
         </div>
         <button class="sm danger" onclick="deleteVariant(${vIdx})">Delete Variant</button>
@@ -594,11 +611,11 @@ function renderVariantsList() {
       <!-- Variant basic specs -->
       <div class="row">
         <div class="col form-group">
-          <label>Backend</label>
-          <select onchange="updateVariantField(${vIdx}, 'backend', this.value)">
-            <option value="metal" ${v.backend === 'metal' ? 'selected' : ''}>Apple Metal</option>
-            <option value="cuda" ${v.backend === 'cuda' ? 'selected' : ''}>NVIDIA CUDA</option>
-          </select>
+          <label>Backends (same files, preference order)</label>
+          <div style="display:flex; gap:12px; align-items:center; padding:6px 0;">
+            <label style="margin:0; font-weight:400;"><input type="checkbox" ${(v.backends || []).includes('metal') ? 'checked' : ''} onchange="toggleVariantBackend(${vIdx}, 'metal', this.checked)"> Apple Metal</label>
+            <label style="margin:0; font-weight:400;"><input type="checkbox" ${(v.backends || []).includes('cuda') ? 'checked' : ''} onchange="toggleVariantBackend(${vIdx}, 'cuda', this.checked)"> NVIDIA CUDA</label>
+          </div>
         </div>
         <div class="col form-group">
           <label>Quantization Label</label>
@@ -627,6 +644,25 @@ function renderVariantsList() {
       </div>
       ` : ''}
 
+      ${(v.backends || []).includes('metal') ? `
+      <div class="row">
+        <div class="col form-group">
+          <label>Min Apple GPU Family (Metal)</label>
+          <select onchange="updateVariantField(${vIdx}, 'min_metal_family', this.value)">
+            <option value="" ${!v.requires?.min_metal_family ? 'selected' : ''}>any Apple silicon</option>
+            <option value="7" ${v.requires?.min_metal_family === 7 ? 'selected' : ''}>7 - M1 and newer</option>
+            <option value="8" ${v.requires?.min_metal_family === 8 ? 'selected' : ''}>8 - M2 and newer</option>
+            <option value="9" ${v.requires?.min_metal_family === 9 ? 'selected' : ''}>9 - M3/M4 and newer</option>
+            <option value="10" ${v.requires?.min_metal_family === 10 ? 'selected' : ''}>10 - M5 and newer</option>
+          </select>
+        </div>
+        <div class="col form-group">
+          <label>Min GPU Working Set (GB) - Metal, shared with CUDA min VRAM</label>
+          <input type="number" step="0.5" value="${((v.requirements.min_vram_bytes || 0) / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'min_vram_bytes', this.value)">
+        </div>
+      </div>
+      ` : ''}
+
       <!-- Components Section with Embedded HF Inspector -->
       <div style="margin-top:16px;">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
@@ -640,6 +676,7 @@ function renderVariantsList() {
               <option value="diarization">diarization</option>
               <option value="draft_vocab">draft_vocab</option>
               <option value="image">image</option>
+              <option value="config">config</option>
             </select>
             <button class="sm primary" onclick="addComponentToVariant(${vIdx})">+ Add Role</button>
           </div>
@@ -665,6 +702,76 @@ function renderVariantsList() {
             <input type="number" value="${v.server_defaults?.vision_max_pixels || ''}" placeholder="1638400" onchange="updateServerDefault(${vIdx}, 'vision_max_pixels', this.value)">
           </div>
         </div>
+        <div class="row">
+          <div class="col form-group">
+            <label>Max Concurrent Sequences (--max-num-seqs)</label>
+            <input type="number" value="${v.server_defaults?.max_num_seqs || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'max_num_seqs', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>Turn Replay Tokens (--turn-replay-tokens)</label>
+            <input type="number" value="${v.server_defaults?.turn_replay_tokens || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'turn_replay_tokens', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>Video Max Frames (--video-max-frames)</label>
+            <input type="number" value="${v.server_defaults?.video_max_frames || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'video_max_frames', this.value)">
+          </div>
+        </div>
+        <div class="row">
+          <div class="col form-group">
+            <label>Video FPS (--video-fps)</label>
+            <input type="number" step="0.1" value="${v.server_defaults?.video_fps ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'video_fps', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>ASR Lookahead Frames (--asr-lookahead)</label>
+            <input type="number" value="${v.server_defaults?.asr_lookahead || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'asr_lookahead', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>ASR Batch Size (--asr-batch)</label>
+            <input type="number" value="${v.server_defaults?.asr_batch || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'asr_batch', this.value)">
+          </div>
+        </div>
+        <div class="row">
+          <div class="col form-group">
+            <label>Expert Residency (--expert-residency)</label>
+            <select onchange="updateServerDefault(${vIdx}, 'expert_residency', this.value)">
+              <option value="" ${!v.server_defaults?.expert_residency ? 'selected' : ''}>server default</option>
+              <option value="auto" ${v.server_defaults?.expert_residency === 'auto' ? 'selected' : ''}>auto (resident when they fit, streamed when they do not)</option>
+              <option value="resident" ${v.server_defaults?.expert_residency === 'resident' ? 'selected' : ''}>resident (imported beside the other weights)</option>
+              <option value="stream" ${v.server_defaults?.expert_residency === 'stream' ? 'selected' : ''}>stream (from disk into expert slots)</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div class="col form-group">
+            <label>Expert Reserve GB (--expert-reserve-gb)</label>
+            <input type="number" value="${v.server_defaults?.expert_reserve_gb ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'expert_reserve_gb', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>Expert Slots (--expert-slots)</label>
+            <input type="number" value="${v.server_defaults?.expert_slots ?? ''}" placeholder="0 = sized from working set" onchange="updateServerDefault(${vIdx}, 'expert_slots', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>Prompt Lookup Depth (--spec-lookup)</label>
+            <input type="number" value="${v.server_defaults?.spec_lookup ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'spec_lookup', this.value)">
+          </div>
+        </div>
+        <div class="row">
+          <div class="col form-group">
+            <label>GPU Memory Utilization (--gpu-memory-utilization)</label>
+            <input type="number" step="0.01" value="${v.server_defaults?.gpu_memory_utilization ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'gpu_memory_utilization', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>Solo Prefill Chunk (--solo-prefill-chunk)</label>
+            <input type="number" value="${v.server_defaults?.solo_prefill_chunk ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'solo_prefill_chunk', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>Capture Graphs</label>
+            <div style="display:flex; gap:12px; padding:6px 0;">
+              <label style="margin:0; font-weight:400;"><input type="checkbox" ${v.server_defaults?.capture_verify ? 'checked' : ''} onchange="updateServerDefault(${vIdx}, 'capture_verify', this.checked ? 'true' : '')"> --capture-verify</label>
+              <label style="margin:0; font-weight:400;"><input type="checkbox" ${v.server_defaults?.capture_batch ? 'checked' : ''} onchange="updateServerDefault(${vIdx}, 'capture_batch', this.checked ? 'true' : '')"> --capture-batch</label>
+            </div>
+          </div>
+        </div>
       </details>
     `;
     container.appendChild(card);
@@ -684,15 +791,25 @@ function calculateVariantDiskBytes(variant) {
 
 function updateVariantField(vIdx, field, val) {
   if (field === 'key') formVariants[vIdx].key = val.trim();
-  if (field === 'backend') {
-    formVariants[vIdx].backend = val;
-    renderVariantsList();
-  }
   if (field === 'quant') formVariants[vIdx].quant = val.trim();
+  if (field === 'min_metal_family') {
+    if (!formVariants[vIdx].requires) formVariants[vIdx].requires = {};
+    const fam = parseInt(val, 10);
+    if (fam) formVariants[vIdx].requires.min_metal_family = fam;
+    else delete formVariants[vIdx].requires.min_metal_family;
+  }
   if (field === 'min_cuda_sm') {
     if (!formVariants[vIdx].requires) formVariants[vIdx].requires = {};
     formVariants[vIdx].requires.min_cuda_sm = parseInt(val, 10) || null;
   }
+  liveValidateForm();
+}
+
+function toggleVariantBackend(vIdx, backend, on) {
+  const list = formVariants[vIdx].backends || [];
+  const rest = list.filter(b => b !== backend);
+  formVariants[vIdx].backends = on ? [...rest, backend] : rest;
+  renderVariantsList();
   liveValidateForm();
 }
 
@@ -706,6 +823,12 @@ function updateServerDefault(vIdx, field, val) {
   if (!formVariants[vIdx].server_defaults) formVariants[vIdx].server_defaults = {};
   if (!val || val.trim() === '') {
     delete formVariants[vIdx].server_defaults[field];
+  } else if (field === 'expert_residency') {
+    formVariants[vIdx].server_defaults[field] = val.trim();
+  } else if (field === 'capture_verify' || field === 'capture_batch') {
+    formVariants[vIdx].server_defaults[field] = true;
+  } else if (field === 'video_fps' || field === 'gpu_memory_utilization') {
+    formVariants[vIdx].server_defaults[field] = parseFloat(val);
   } else {
     formVariants[vIdx].server_defaults[field] = parseInt(val, 10);
   }
@@ -732,6 +855,7 @@ function addComponentToVariant(vIdx) {
 
 function removeComponentFromVariant(vIdx, role) {
   delete formVariants[vIdx].components[role];
+  delete inspectedCache[inspectedKey(vIdx, role)];
   renderVariantsList();
   liveValidateForm();
 }
@@ -773,24 +897,35 @@ function renderComponentsList(vIdx) {
       </div>
 
       <div id="inspector-output-${vIdx}-${role}">
-        ${renderComponentSelectedFilesSummary(comp)}
+        ${renderComponentSelectedFilesSummary(vIdx, role, comp)}
       </div>
     `;
     container.appendChild(card);
+    // Rebuilds wipe the picker; restore it from the cached listing so the
+    // checkboxes survive any re-render of the variant cards.
+    const cached = inspectedCache[inspectedKey(vIdx, role)];
+    if (cached) renderComponentInspectorFilePicker(vIdx, role, cached);
   }
 }
 
 function updateCompRepo(vIdx, role, val) {
   formVariants[vIdx].components[role].repo = val.trim();
+  // A different source repo invalidates any inspected listing.
+  delete inspectedCache[inspectedKey(vIdx, role)];
   liveValidateForm();
 }
 
 function updateCompRev(vIdx, role, val) {
   formVariants[vIdx].components[role].revision = val.trim();
+  // A different revision invalidates any inspected listing.
+  delete inspectedCache[inspectedKey(vIdx, role)];
   liveValidateForm();
 }
 
-function renderComponentSelectedFilesSummary(comp) {
+// Roles a file can hand itself to with `binds`: the flag-bearing ones.
+const BINDABLE_ROLES = ['base', 'draft', 'draft_vocab', 'vision', 'asr', 'asr_mmproj', 'diarization', 'config'];
+
+function renderComponentSelectedFilesSummary(vIdx, role, comp) {
   if (!comp.files || comp.files.length === 0) {
     return `<div style="color:var(--text-dim); font-size:12px; font-style:italic;">No files selected yet. Click "Inspect HF Files" to browse and select files for this role.</div>`;
   }
@@ -798,7 +933,7 @@ function renderComponentSelectedFilesSummary(comp) {
     <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">Selected Files:</div>
     <table class="file-table">
       <thead>
-        <tr><th>File Name</th><th>Size</th><th>SHA-256 Digest</th><th>Entry</th></tr>
+        <tr><th>File Name</th><th>Size</th><th>SHA-256 Digest</th><th>Entry</th><th>Binds (passed to another role's flag)</th></tr>
       </thead>
       <tbody>
         ${comp.files.map(f => `
@@ -807,6 +942,12 @@ function renderComponentSelectedFilesSummary(comp) {
             <td>${formatBytes(f.size)}</td>
             <td><code title="${f.sha256}">${f.sha256.substring(0, 16)}...${f.sha256.substring(56)}</code></td>
             <td>${comp.entry === f.name ? '<span class="badge badge-success">entry</span>' : ''}</td>
+            <td>
+              <select style="padding:2px 6px; font-size:11px;" onchange="setFileBinds(${vIdx}, '${role}', '${f.name}', this.value)">
+                <option value="" ${!f.binds ? 'selected' : ''}>-</option>
+                ${BINDABLE_ROLES.filter(r => r !== role).map(r => `<option value="${r}" ${f.binds === r ? 'selected' : ''}>${r}</option>`).join('')}
+              </select>
+            </td>
           </tr>
         `).join("")}
       </tbody>
@@ -837,6 +978,7 @@ async function inspectComponentRepo(vIdx, role) {
       return;
     }
     const data = await res.json();
+    inspectedCache[inspectedKey(vIdx, role)] = data;
     formVariants[vIdx].components[role].revision = data.commit;
     document.getElementById(`rev-${vIdx}-${role}`).value = data.commit;
 
@@ -900,14 +1042,14 @@ function renderComponentInspectorFilePicker(vIdx, role, data) {
     </div>
   `;
 
-  // Store inspected files in element data for quick referencing
-  outDiv._inspectedFiles = data.files;
+  // The listing also lives in inspectedCache so re-renders can restore it.
+  inspectedCache[inspectedKey(vIdx, role)] = data;
 }
 
 function toggleComponentFile(vIdx, role, fIdx) {
-  const outDiv = document.getElementById(`inspector-output-${vIdx}-${role}`);
-  const inspectedFiles = outDiv._inspectedFiles;
-  if (!inspectedFiles) return;
+  const cached = inspectedCache[inspectedKey(vIdx, role)];
+  if (!cached) return;
+  const inspectedFiles = cached.files;
 
   const file = inspectedFiles[fIdx];
   const comp = formVariants[vIdx].components[role];
@@ -933,9 +1075,9 @@ function toggleComponentFile(vIdx, role, fIdx) {
 }
 
 function selectAllComponentFiles(vIdx, role, selectAll) {
-  const outDiv = document.getElementById(`inspector-output-${vIdx}-${role}`);
-  const inspectedFiles = outDiv._inspectedFiles;
-  if (!inspectedFiles) return;
+  const cached = inspectedCache[inspectedKey(vIdx, role)];
+  if (!cached) return;
+  const inspectedFiles = cached.files;
 
   const comp = formVariants[vIdx].components[role];
   if (selectAll) {
@@ -949,6 +1091,13 @@ function selectAllComponentFiles(vIdx, role, selectAll) {
   formVariants[vIdx].requirements.disk_bytes = diskBytes;
 
   renderVariantsList();
+  liveValidateForm();
+}
+
+function setFileBinds(vIdx, role, filename, bound) {
+  const file = formVariants[vIdx].components[role].files.find(f => f.name === filename);
+  if (!file) return;
+  if (bound) file.binds = bound; else delete file.binds;
   liveValidateForm();
 }
 
@@ -1021,15 +1170,28 @@ function liveValidateForm() {
 
   recipe.variants.forEach((v, idx) => {
     if (!v.key) errors.push(`Variant #${idx + 1}: key is required`);
-    if (!v.components.base && !v.components.asr && !v.components.image) {
-      errors.push(`Variant '${v.key}': requires at least 'base', 'asr', or 'image' component`);
+    if (!v.backends || v.backends.length === 0) errors.push(`Variant '${v.key}': pick at least one backend`);
+    // Mirror of Variant::role_paths: a role comes from its component or from
+    // one bound file, never both.
+    const supplied = {};
+    for (const [r, comp] of Object.entries(v.components)) supplied[r] = comp.entry || null;
+    for (const [r, comp] of Object.entries(v.components)) {
+      for (const f of comp.files || []) {
+        if (!f.binds) continue;
+        if (f.binds in supplied) errors.push(`Variant '${v.key}': role '${f.binds}' is supplied twice (file '${f.name}' in '${r}' binds it)`);
+        supplied[f.binds] = f.name;
+      }
+    }
+    if ('config' in supplied && !supplied.config) errors.push(`Variant '${v.key}': role 'config' must name its file as entry`);
+    if (!('base' in supplied) && !('asr' in supplied) && !('image' in supplied)) {
+      errors.push(`Variant '${v.key}': requires at least 'base', 'asr', or 'image'`);
     }
     for (const [r, comp] of Object.entries(v.components)) {
       if (!comp.repo) errors.push(`Variant '${v.key}' role '${r}': repository is empty`);
       if (comp.files.length === 0) errors.push(`Variant '${v.key}' role '${r}': no files selected`);
     }
-    if (v.components.draft && (!v.server_defaults?.spec_k || v.server_defaults.spec_k <= 0)) {
-      errors.push(`Variant '${v.key}': has 'draft' component so server_defaults.spec_k must be > 0`);
+    if (('draft' in supplied) && (!v.server_defaults?.spec_k || v.server_defaults.spec_k <= 0)) {
+      errors.push(`Variant '${v.key}': supplies 'draft' so server_defaults.spec_k must be > 0`);
     }
   });
 

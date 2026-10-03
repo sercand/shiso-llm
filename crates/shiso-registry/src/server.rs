@@ -258,13 +258,13 @@ fn open_url_in_browser(url: &str) -> std::io::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("rundll32")
+        std::process::Command::new("rundll32")
             .args(["url.dll,FileProtocolHandler", url])
-            .spawn();
+            .spawn()?;
     }
     Ok(())
 }

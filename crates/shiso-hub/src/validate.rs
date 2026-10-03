@@ -108,14 +108,24 @@ fn validate_variants(recipe: &Recipe, mode: ValidationMode) -> Result<(), HubErr
 }
 
 fn validate_single_variant(variant: &Variant, mode: ValidationMode) -> Result<(), HubError> {
-    if variant.backend != "metal" && variant.backend != "cuda" {
+    if variant.backends.is_empty() {
         return Err(HubError::Validation {
             reason: format!(
-                "variant '{}' backend must be 'metal' or 'cuda', got '{}'",
-                variant.key.as_str(),
-                variant.backend
+                "variant '{}' must name at least one backend",
+                variant.key.as_str()
             ),
         });
+    }
+    let mut seen = BTreeSet::new();
+    for backend in &variant.backends {
+        if !seen.insert(*backend) {
+            return Err(HubError::Validation {
+                reason: format!(
+                    "variant '{}' names backend '{backend}' twice",
+                    variant.key.as_str()
+                ),
+            });
+        }
     }
 
     if variant.requirements.min_ram_bytes == 0 {
@@ -133,14 +143,30 @@ fn validate_single_variant(variant: &Variant, mode: ValidationMode) -> Result<()
 }
 
 fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
-    let has_base = variant.components.contains_key(&Role::Base);
-    let has_asr = variant.components.contains_key(&Role::Asr);
-    let has_draft = variant.components.contains_key(&Role::Draft);
-    let has_draft_vocab = variant.components.contains_key(&Role::DraftVocab);
-    let has_asr_mmproj = variant.components.contains_key(&Role::AsrMmproj);
-    let has_diarization = variant.components.contains_key(&Role::Diarization);
+    // Roles a bound file supplies count exactly as a component's would: the
+    // server cannot tell the two apart, so neither can these rules.
+    let roles = variant.role_paths()?;
+    let has_base = roles.contains_key(&Role::Base);
+    let has_asr = roles.contains_key(&Role::Asr);
+    let has_draft = roles.contains_key(&Role::Draft);
+    let has_draft_vocab = roles.contains_key(&Role::DraftVocab);
+    let has_asr_mmproj = roles.contains_key(&Role::AsrMmproj);
+    let has_diarization = roles.contains_key(&Role::Diarization);
 
-    if !has_base && !has_asr && !variant.components.contains_key(&Role::Image) {
+    // `--config` names a file; a directory there would be read as one and fail
+    // at boot, so the recipe has to say which file it is.
+    if let Some(config) = roles.get(&Role::Config)
+        && config.file.is_none()
+    {
+        return Err(HubError::Validation {
+            reason: format!(
+                "variant '{}' role 'config' must name its file with 'entry' or 'binds'",
+                variant.key.as_str()
+            ),
+        });
+    }
+
+    if !has_base && !has_asr && !roles.contains_key(&Role::Image) {
         return Err(HubError::Validation {
             reason: format!(
                 "variant '{}' must contain a 'base' component unless it has 'asr' or 'image'",
@@ -158,7 +184,7 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
         if spec_k == 0 {
             return Err(HubError::Validation {
                 reason: format!(
-                    "variant '{}' has 'draft' component but server_defaults.spec_k is 0 or missing",
+                    "variant '{}' supplies 'draft' but server_defaults.spec_k is 0 or missing",
                     variant.key.as_str()
                 ),
             });
@@ -168,7 +194,7 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
     if has_draft_vocab && !has_draft {
         return Err(HubError::Validation {
             reason: format!(
-                "variant '{}' has 'draft_vocab' component which requires 'draft'",
+                "variant '{}' supplies 'draft_vocab' which requires 'draft'",
                 variant.key.as_str()
             ),
         });
@@ -177,7 +203,7 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
     if has_asr_mmproj && !has_asr {
         return Err(HubError::Validation {
             reason: format!(
-                "variant '{}' has 'asr_mmproj' component which requires 'asr'",
+                "variant '{}' supplies 'asr_mmproj' which requires 'asr'",
                 variant.key.as_str()
             ),
         });
@@ -186,7 +212,7 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
     if has_diarization && !has_asr {
         return Err(HubError::Validation {
             reason: format!(
-                "variant '{}' has 'diarization' component which requires 'asr'",
+                "variant '{}' supplies 'diarization' which requires 'asr'",
                 variant.key.as_str()
             ),
         });

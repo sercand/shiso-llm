@@ -25,8 +25,8 @@ pub struct InstalledVariantSummary {
     pub model: ModelName,
     /// Variant key.
     pub variant: VariantKey,
-    /// Target backend.
-    pub backend: String,
+    /// Backends the variant runs on; empty when its recipe is unreadable.
+    pub backends: Vec<crate::host::Backend>,
     /// Quantization label.
     pub quant: String,
     /// Roles present in installation.
@@ -494,20 +494,18 @@ impl BlobStore {
 
                     let disk_bytes: u64 = meta.files.iter().map(|f| f.size).sum();
 
-                    let (backend, quant) = if let Some(r) = &recipe {
-                        if let Some(v) = r.variants.iter().find(|v| v.key == variant_key) {
-                            (v.backend.clone(), v.quant.clone())
-                        } else {
-                            ("unknown".to_string(), "unknown".to_string())
-                        }
-                    } else {
-                        ("unknown".to_string(), "unknown".to_string())
-                    };
+                    let (backends, quant) = recipe
+                        .as_ref()
+                        .and_then(|r| r.variants.iter().find(|v| v.key == variant_key))
+                        .map_or_else(
+                            || (Vec::new(), "unknown".to_string()),
+                            |v| (v.backends.clone(), v.quant.clone()),
+                        );
 
                     list.push(InstalledVariantSummary {
                         model: model_name.clone(),
                         variant: variant_key,
-                        backend,
+                        backends,
                         quant,
                         roles,
                         disk_bytes,

@@ -13,22 +13,51 @@ use tower::ServiceExt;
 
 use crate::editor;
 use crate::server::{ServerState, build_router};
+/// Sample recipe vendored under `tests/fixtures/`. The registry itself lives
+/// in its own repository, so the editor's tests carry their own fixture to
+/// pin the shape `validate_all`, `save_recipe` and `build_registry` consume.
+const SAMPLE_RECIPE: &str = include_str!("../tests/fixtures/qwen3.5-9b.json");
+
+/// Prints the skip notice; the caller returns immediately afterwards.
+#[expect(clippy::print_stdout, reason = "the skip report is a test's output")]
+fn skip(why: &str) {
+    println!("SKIP: {why}");
+}
 
 #[test]
-fn checked_in_recipes_pass_strict_validation() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("model-registry");
-    let reports = editor::validate_all(&root).unwrap();
+fn sample_recipe_passes_strict_validation() {
+    let temp = tempdir().unwrap();
+    let recipes_dir = temp.path().join("recipes");
+    fs::create_dir_all(&recipes_dir).unwrap();
+    fs::write(recipes_dir.join("qwen3.5-9b.json"), SAMPLE_RECIPE).unwrap();
+
+    let reports = editor::validate_all(temp.path()).unwrap();
 
     assert!(
         !reports.is_empty(),
         "must find at least one recipe in recipes/"
     );
+    for r in reports {
+        assert!(
+            r.valid,
+            "recipe '{}' in '{}' failed strict validation: {}",
+            r.name,
+            r.file,
+            r.errors.join("; ")
+        );
+    }
+}
+
+/// Validates the maintainer's real registry repository when one is pointed
+/// at via `SHISO_REGISTRY_REPO`; the registry lives outside this workspace,
+/// so without the variable there is nothing here to check.
+#[test]
+fn registry_repo_recipes_pass_strict_validation() {
+    let Ok(repo) = std::env::var("SHISO_REGISTRY_REPO") else {
+        skip("SHISO_REGISTRY_REPO is not set; the registry lives in its own repository");
+        return;
+    };
+    let reports = editor::validate_all(Path::new(&repo)).unwrap();
     for r in reports {
         assert!(
             r.valid,
@@ -46,16 +75,8 @@ fn atomic_put_recipe_with_stable_formatting() {
     let recipes_dir = temp.path().join("recipes");
     fs::create_dir_all(&recipes_dir).unwrap();
 
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir.parent().unwrap().parent().unwrap();
-    let sample = root
-        .join("model-registry")
-        .join("recipes")
-        .join("qwen3.5-9b.json");
-    let content = fs::read_to_string(sample).unwrap();
-
     // Save recipe via editor function
-    editor::save_recipe(temp.path(), "qwen3.5-9b", &content).unwrap();
+    editor::save_recipe(temp.path(), "qwen3.5-9b", SAMPLE_RECIPE).unwrap();
 
     let target = recipes_dir.join("qwen3.5-9b.json");
     assert!(target.is_file());
@@ -76,14 +97,8 @@ fn build_registry_compiles_unsigned_index_and_manifests() {
     let recipes_dir = temp.path().join("recipes");
     fs::create_dir_all(&recipes_dir).unwrap();
 
-    // Copy sample recipe into temp repo
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir.parent().unwrap().parent().unwrap();
-    let sample = root
-        .join("model-registry")
-        .join("recipes")
-        .join("qwen3.5-9b.json");
-    fs::copy(sample, recipes_dir.join("qwen3.5-9b.json")).unwrap();
+    // Write the vendored sample recipe into the temp repo
+    fs::write(recipes_dir.join("qwen3.5-9b.json"), SAMPLE_RECIPE).unwrap();
 
     // Build registry
     let out_dir = temp.path().join("registry").join("v1");

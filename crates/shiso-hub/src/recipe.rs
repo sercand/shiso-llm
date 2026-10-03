@@ -7,6 +7,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::HubError;
+use crate::host::Backend;
 
 /// Current schema version produced and consumed by this build.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -390,6 +391,13 @@ pub enum Role {
     Diarization,
     /// Image generation model (`image`, reserved).
     Image,
+    /// Architecture config document (`--config`).
+    ///
+    /// For a checkpoint whose weights file carries no `config.json` beside it,
+    /// such as a converted single-file container. The server reads the
+    /// tokenizer, chat template and generation config from beside this file,
+    /// so the component ships those too.
+    Config,
 }
 
 impl Role {
@@ -405,6 +413,7 @@ impl Role {
             Self::AsrMmproj => "--asr-mmproj",
             Self::Diarization => "--diarization-model",
             Self::Image => "--image-model",
+            Self::Config => "--config",
         }
     }
 
@@ -420,6 +429,7 @@ impl Role {
             Self::AsrMmproj => "asr_mmproj",
             Self::Diarization => "diarization",
             Self::Image => "image",
+            Self::Config => "config",
         }
     }
 }
@@ -442,6 +452,7 @@ impl FromStr for Role {
             "asr_mmproj" => Ok(Self::AsrMmproj),
             "diarization" => Ok(Self::Diarization),
             "image" => Ok(Self::Image),
+            "config" => Ok(Self::Config),
             _ => Err(HubError::Validation {
                 reason: format!("unknown role '{s}'"),
             }),
@@ -589,6 +600,15 @@ pub struct FileEntry {
     pub size: u64,
     /// Expected SHA-256 hexadecimal digest.
     pub sha256: Sha256,
+    /// Another role whose flag this file is passed to.
+    ///
+    /// Lets one repository ship several roles' files - a checkpoint, its draft
+    /// head and its vision tower side by side - without the recipe repeating
+    /// the repository once per role. The file is downloaded into its own
+    /// component's directory; only the flag it feeds changes. A role is
+    /// supplied by a component or by one bound file, never both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binds: Option<Role>,
 }
 
 /// A component of a variant (e.g. `base`, `vision`, `draft`).
@@ -615,7 +635,8 @@ pub struct Requirements {
     /// Recommended host RAM in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended_ram_bytes: Option<u64>,
-    /// Minimum GPU VRAM in bytes (CUDA only).
+    /// Minimum device memory in bytes: CUDA VRAM, or the Metal device's
+    /// recommended working set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_vram_bytes: Option<u64>,
     /// Disk space required by all files in this variant in bytes.
@@ -628,6 +649,13 @@ pub struct HostConstraints {
     /// Minimum CUDA compute capability (e.g. 89 for Ada, 100 for Blackwell).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_cuda_sm: Option<u32>,
+    /// Minimum Apple GPU family (7 = M1, 8 = M2, 9 = M3/M4, 10 = M5).
+    ///
+    /// The family, not a chip list: a Pro, Max or Ultra shares its base
+    /// chip's family and differs only in memory, which `min_vram_bytes` and
+    /// the RAM requirements already express.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_metal_family: Option<u32>,
 }
 
 /// Typed server defaults allowlist (§3.4).
@@ -663,7 +691,47 @@ pub struct ServerDefaults {
     pub asr_batch: Option<usize>,
     /// Expert residency (`--expert-residency`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expert_residency: Option<String>,
+    pub expert_residency: Option<ExpertResidency>,
+    /// Working-set gibibytes the automatic residency leaves free
+    /// (`--expert-reserve-gb`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_reserve_gb: Option<u64>,
+    /// Expert slots when the banks are streamed (`--expert-slots`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_slots: Option<u32>,
+    /// Prompt-lookup speculation depth (`--spec-lookup`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_lookup: Option<u32>,
+    /// Capture verify passes as device graphs (`--capture-verify`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_verify: Option<bool>,
+    /// Capture multi-session passes as device graphs (`--capture-batch`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_batch: Option<bool>,
+    /// Fraction of device memory the server may claim
+    /// (`--gpu-memory-utilization`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_utilization: Option<f64>,
+    /// Prompt rows per pass when one session prefills alone
+    /// (`--solo-prefill-chunk`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solo_prefill_chunk: Option<usize>,
+}
+
+/// Where a sparse checkpoint's routed expert banks live (`--expert-residency`).
+///
+/// Typed rather than a free string so that a recipe naming a choice this build
+/// does not have fails to parse instead of being skipped with a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpertResidency {
+    /// Resident when every weight fits the working set, streamed otherwise.
+    Auto,
+    /// Imported beside the other weights.
+    Resident,
+    /// Streamed from disk into a pool of expert slots.
+    #[serde(alias = "streamed")]
+    Stream,
 }
 
 /// A specific backend and quantization variant of a model.
@@ -671,8 +739,13 @@ pub struct ServerDefaults {
 pub struct Variant {
     /// Unique key within the recipe (e.g. `metal-mlx4`, `cuda-fp8`).
     pub key: VariantKey,
-    /// Target backend (`"metal"` or `"cuda"`).
-    pub backend: String,
+    /// Backends this variant's files run on, in author preference order.
+    ///
+    /// A list because one set of files can serve on several backends - a
+    /// K-quant container runs on Metal and CUDA alike. The legacy single-string
+    /// `backend` spelling is read as a one-element list.
+    #[serde(alias = "backend", deserialize_with = "one_or_many_backends")]
+    pub backends: Vec<Backend>,
     /// Quantization label (e.g. `"mlx-4bit"`, `"fp8"`).
     pub quant: String,
     /// Optional host execution constraints.
@@ -685,6 +758,83 @@ pub struct Variant {
     /// Optional server defaults allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_defaults: Option<ServerDefaults>,
+}
+
+impl Variant {
+    /// Every role this variant supplies a flag for, with the component
+    /// directory the path lives under and the file inside it (`None` is the
+    /// directory itself).
+    ///
+    /// A component supplies its own role through `entry`; a file with `binds`
+    /// supplies the role it names.
+    ///
+    /// # Errors
+    /// Returns [`HubError::Validation`] when two places supply the same role,
+    /// or a file binds the role of the component that holds it.
+    pub fn role_paths(&self) -> Result<BTreeMap<Role, RolePath<'_>>, HubError> {
+        let mut paths = BTreeMap::new();
+        for (role, comp) in &self.components {
+            paths.insert(
+                *role,
+                RolePath {
+                    dir: *role,
+                    file: comp.entry.as_deref(),
+                },
+            );
+        }
+        for (role, comp) in &self.components {
+            for file in &comp.files {
+                let Some(bound) = file.binds else { continue };
+                if bound == *role {
+                    return Err(HubError::Validation {
+                        reason: format!(
+                            "variant '{}' role '{role}' file '{}' binds its own role; use 'entry' instead",
+                            self.key, file.name
+                        ),
+                    });
+                }
+                let path = RolePath {
+                    dir: *role,
+                    file: Some(file.name.as_str()),
+                };
+                if paths.insert(bound, path).is_some() {
+                    return Err(HubError::Validation {
+                        reason: format!(
+                            "variant '{}' supplies role '{bound}' twice (file '{}' in '{role}' binds it)",
+                            self.key, file.name
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(paths)
+    }
+}
+
+/// Where one role's flag points inside an installed variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolePath<'a> {
+    /// The component whose directory holds the path.
+    pub dir: Role,
+    /// The file inside that directory, or `None` for the directory itself.
+    pub file: Option<&'a str>,
+}
+
+/// Reads `"metal"` or `["metal", "cuda"]` as a list of backends.
+fn one_or_many_backends<'de, D>(deserializer: D) -> Result<Vec<Backend>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(Backend),
+        Many(Vec<Backend>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(b) => vec![b],
+        OneOrMany::Many(list) => list,
+    })
 }
 
 /// A model recipe manifest describing how to fetch and serve a model.
@@ -728,8 +878,9 @@ pub struct Recipe {
 pub struct IndexVariantEntry {
     /// Variant key.
     pub key: VariantKey,
-    /// Target backend (`"metal"` or `"cuda"`).
-    pub backend: String,
+    /// Backends the variant runs on.
+    #[serde(alias = "backend", deserialize_with = "one_or_many_backends")]
+    pub backends: Vec<Backend>,
     /// Quantization label.
     pub quant: String,
     /// Minimum host RAM in bytes.
@@ -739,6 +890,9 @@ pub struct IndexVariantEntry {
     /// Minimum CUDA compute capability, if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_cuda_sm: Option<u32>,
+    /// Minimum Apple GPU family, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_metal_family: Option<u32>,
 }
 
 /// An entry for one model inside the compact registry index.

@@ -43,6 +43,22 @@ pub struct CudaInfo {
     pub vram_bytes: u64,
 }
 
+/// Information about the Metal device.
+///
+/// Keyed on the Apple GPU family rather than on the chip's name: kernels are
+/// written against a family's feature set, and an M1 Pro, Max and Ultra share
+/// the M1's family. What tells those apart for a model is memory, which
+/// [`MetalInfo::working_set_bytes`] answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetalInfo {
+    /// The device's name (e.g. `Apple M1 Max`), for display only.
+    pub name: String,
+    /// Highest Apple GPU family supported: 7 = M1, 8 = M2, 9 = M3/M4, 10 = M5.
+    pub family: u32,
+    /// Working set the device recommends for one process, in bytes.
+    pub working_set_bytes: u64,
+}
+
 /// Host profile describing available backends and hardware memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostProfile {
@@ -52,16 +68,19 @@ pub struct HostProfile {
     pub ram_bytes: u64,
     /// CUDA hardware facts, when available.
     pub cuda: Option<CudaInfo>,
+    /// Metal device facts, when available.
+    pub metal: Option<MetalInfo>,
 }
 
 impl HostProfile {
     /// Creates a host profile with probed system RAM and caller-supplied backends.
     #[must_use]
-    pub fn probe(backends: Vec<Backend>, cuda: Option<CudaInfo>) -> Self {
+    pub fn probe(backends: Vec<Backend>, cuda: Option<CudaInfo>, metal: Option<MetalInfo>) -> Self {
         Self {
             backends,
             ram_bytes: probe_ram(),
             cuda,
+            metal,
         }
     }
 }

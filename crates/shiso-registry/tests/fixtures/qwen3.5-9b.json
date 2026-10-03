@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "name": "qwen3.5-9b",
+  "aliases": ["qwen3.5"],
+  "family": "qwen35",
+  "min_shiso_version": "0.1.0",
+  "description": "Hybrid-attention chat model with MTP draft head and vision tower",
+  "tags": ["vision", "tools", "speculative"],
+  "tasks": ["chat"],
+  "modalities": {
+    "inputs": ["text", "image", "video"],
+    "outputs": ["text"]
+  },
+  "features": {
+    "tools": true,
+    "reasoning": true,
+    "reasoning_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
+    "default_reasoning_effort": "medium",
+    "structured_output": true
+  },
+  "variants": [
+    {
+      "key": "metal-mlx4",
+      "backend": "metal",
+      "quant": "mlx-4bit",
+      "requirements": {
+        "min_ram_bytes": 10737418240,
+        "recommended_ram_bytes": 17179869184,
+        "disk_bytes": 6291433877
+      },
+      "components": {
+        "base": {
+          "provider": "huggingface",
+          "repo": "shiso-community/qwen3.5-9b-mlx-4bit",
+          "revision": "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c",
+          "files": [
+            {
+              "name": "model.safetensors",
+              "size": 5100000000,
+              "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"
+            },
+            {
+              "name": "config.json",
+              "size": 4211,
+              "sha256": "0d1f7c5b2e9a8b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4"
+            },
+            {
+              "name": "tokenizer.json",
+              "size": 11422654,
+              "sha256": "a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192"
+            },
+            {
+              "name": "chat_template.jinja",
+              "size": 7012,
+              "sha256": "92a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081"
+            }
+          ]
+        },
+        "vision": {
+          "provider": "huggingface",
+          "repo": "shiso-community/qwen3.5-9b-mlx-4bit",
+          "revision": "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c",
+          "entry": "vision.safetensors",
+          "files": [
+            {
+              "name": "vision.safetensors",
+              "size": 860000000,
+              "sha256": "9a2f7c00e62a1b920401dce9319e782a17f6946c764e523f4b6cb908e2f819a1"
+            }
+          ]
+        },
+        "draft": {
+          "provider": "huggingface",
+          "repo": "shiso-community/qwen3.5-9b-mtp",
+          "revision": "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
+          "entry": "mtp_q8_0.gguf",
+          "files": [
+            {
+              "name": "mtp_q8_0.gguf",
+              "size": 320000000,
+              "sha256": "8f32194c79893d3950efd060c42289f02c6d48fae498c117dcfcfb120ea9b4a2"
+            }
+          ]
+        }
+      },
+      "server_defaults": {
+        "spec_k": 3,
+        "ctx": 32768,
+        "vision_max_pixels": 1638400
+      }
+    },
+    {
+      "key": "cuda-fp8",
+      "backend": "cuda",
+      "quant": "fp8",
+      "requires": {
+        "min_cuda_sm": 89
+      },
+      "requirements": {
+        "min_ram_bytes": 17179869184,
+        "recommended_ram_bytes": 34359738368,
+        "min_vram_bytes": 12884901888,
+        "disk_bytes": 10211427042
+      },
+      "components": {
+        "base": {
+          "provider": "huggingface",
+          "repo": "shiso-community/qwen3.5-9b-fp8",
+          "revision": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+          "files": [
+            {
+              "name": "model.safetensors",
+              "size": 10200000000,
+              "sha256": "12aa34bb56cc78dd90ee12ff34aa56bb78cc90dd12ee34ff56aa78bb90cc12dd"
+            },
+            {
+              "name": "config.json",
+              "size": 4388,
+              "sha256": "34ff56aa78bb90cc12dd34ee56ff78aa90bb12cc34dd56ee78ff90aa12bb34cc"
+            },
+            {
+              "name": "tokenizer.json",
+              "size": 11422654,
+              "sha256": "a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192"
+            }
+          ]
+        }
+      },
+      "server_defaults": {
+        "ctx": 32768
+      }
+    }
+  ]
+}

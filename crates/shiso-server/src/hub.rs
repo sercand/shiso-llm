@@ -17,7 +17,6 @@ use url::Url;
 
 use shiso_hub::config::{HfToken, HubConfig, RegistryEndpoint};
 use shiso_hub::download::Downloader;
-#[cfg(any(feature = "metal", feature = "cuda"))]
 use shiso_hub::host::Backend;
 use shiso_hub::host::HostProfile;
 use shiso_hub::progress::ProgressEvent;
@@ -55,7 +54,16 @@ pub fn probe_host_profile() -> HostProfile {
     #[cfg(not(feature = "cuda"))]
     let cuda = None;
 
-    HostProfile::probe(backends, cuda)
+    #[cfg(feature = "metal")]
+    let metal = shiso_metal::device_facts().map(|facts| shiso_hub::host::MetalInfo {
+        name: facts.name,
+        family: facts.apple_family,
+        working_set_bytes: facts.working_set_bytes,
+    });
+    #[cfg(not(feature = "metal"))]
+    let metal = None;
+
+    HostProfile::probe(backends, cuda, metal)
 }
 
 /// Resolves `home` directory from string, expanding `~`.
@@ -172,7 +180,8 @@ pub fn resolve_serve_model(
 }
 
 fn check_component_flag_conflicts(args: &ServeArgs, ref_str: &str) -> anyhow::Result<()> {
-    if args.vision.is_some()
+    if args.config.is_some()
+        || args.vision.is_some()
         || args.draft_model.is_some()
         || args.draft_vocab.is_some()
         || args.asr_model.is_some()
@@ -240,10 +249,15 @@ fn populate_serve_args_from_variant(
     variant: &Variant,
     recipe_name: &ModelName,
 ) -> anyhow::Result<()> {
-    for (role, comp) in &variant.components {
-        let role_dir = vdir.join(role.as_str());
-        let target_path = match &comp.entry {
-            Some(entry) => role_dir.join(entry),
+    // A role is supplied by its own component or by a file another component
+    // binds to it; `role_paths` folds both into one answer per flag.
+    let roles = variant
+        .role_paths()
+        .map_err(|e| anyhow::anyhow!("installed recipe is inconsistent: {e}"))?;
+    for (role, place) in roles {
+        let role_dir = vdir.join(place.dir.as_str());
+        let target_path = match place.file {
+            Some(file) => role_dir.join(file),
             None => role_dir,
         };
 
@@ -255,6 +269,7 @@ fn populate_serve_args_from_variant(
             Role::Asr => args.asr_model = Some(target_path),
             Role::AsrMmproj => args.asr_mmproj = Some(target_path),
             Role::Diarization => args.diarization_model = Some(target_path),
+            Role::Config => args.config = Some(target_path),
             Role::Image => bail!("model uses 'image' role which is not supported by serve"),
         }
     }
@@ -264,6 +279,15 @@ fn populate_serve_args_from_variant(
     }
 
     Ok(())
+}
+
+/// The backends a variant names, as `metal/cuda`.
+fn backends_label(backends: &[Backend]) -> String {
+    if backends.is_empty() {
+        return "unknown".to_string();
+    }
+    let names: Vec<&str> = backends.iter().map(|b| b.as_str()).collect();
+    names.join("/")
 }
 
 /// Executes the `shiso pull <ref>` command (§6.1).
@@ -449,7 +473,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<()> {
                 let is_inst = installed
                     .iter()
                     .any(|iv| iv.model == model.name && iv.variant == v.key);
-                let fits_host = host.backends.iter().any(|b| b.as_str() == v.backend);
+                let fits_host = v.backends.iter().any(|b| host.backends.contains(b));
 
                 let status = match (is_inst, fits_host) {
                     (true, _) => "installed",
@@ -461,7 +485,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<()> {
                     "{:<24} {:<12} {:<10} {:<8} {:<10} {}",
                     model.name.as_str(),
                     v.key.as_str(),
-                    v.backend,
+                    backends_label(&v.backends),
                     v.quant,
                     status,
                     model.description
@@ -503,7 +527,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<()> {
             println!(
                 "{:<32} {:<10} {:<10} {:<12} {size_mb} MB",
                 format!("{}:{}", item.model, item.variant),
-                item.backend,
+                backends_label(&item.backends),
                 item.quant,
                 roles_str.join(",")
             );
@@ -550,6 +574,15 @@ pub async fn run_info(args: InfoArgs) -> anyhow::Result<()> {
     println!("Tags:        {}", recipe.tags.join(", "));
 
     let host = probe_host_profile();
+    if let Some(metal) = &host.metal {
+        println!(
+            "Host:        {} (Apple GPU family {} = {}, working set {} MB)",
+            metal.name,
+            metal.family,
+            shiso_hub::select::apple_family_label(metal.family),
+            metal.working_set_bytes / (1024 * 1024)
+        );
+    }
     let best_variant = select_variant(&recipe, &host, None)
         .ok()
         .map(|sv| sv.variant.key.clone());
@@ -563,8 +596,17 @@ pub async fn run_info(args: InfoArgs) -> anyhow::Result<()> {
             ""
         };
         println!("  - Key:       {} {marker}", v.key.as_str());
-        println!("    Backend:   {}", v.backend);
+        println!("    Backends:  {}", backends_label(&v.backends));
         println!("    Quant:     {}", v.quant);
+        if let Some(sm) = v.requires.as_ref().and_then(|r| r.min_cuda_sm) {
+            println!("    Min CUDA:  sm{sm}");
+        }
+        if let Some(family) = v.requires.as_ref().and_then(|r| r.min_metal_family) {
+            println!(
+                "    Min Metal: Apple GPU family {family} ({})",
+                shiso_hub::select::apple_family_label(family)
+            );
+        }
         println!(
             "    Min RAM:   {} MB",
             v.requirements.min_ram_bytes / (1024 * 1024)
@@ -578,7 +620,15 @@ pub async fn run_info(args: InfoArgs) -> anyhow::Result<()> {
         for (role, comp) in &v.components {
             println!("      [{}] {}@{}", role.as_str(), comp.repo, comp.revision);
             for f in &comp.files {
-                println!("        - {} ({} bytes)", f.name, f.size);
+                match f.binds {
+                    Some(bound) => println!(
+                        "        - {} ({} bytes) -> {}",
+                        f.name,
+                        f.size,
+                        bound.flag_name()
+                    ),
+                    None => println!("        - {} ({} bytes)", f.name, f.size),
+                }
             }
         }
     }
@@ -686,4 +736,88 @@ pub fn run_rm(args: &RmArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clap::{CommandFactory as _, FromArgMatches as _};
+    use shiso_hub::recipe::{Recipe, Role};
+    use shiso_hub::validate::{ValidationMode, validate_recipe};
+
+    use super::populate_serve_args_from_variant;
+    use crate::cli::{Cli, ServeArgs, apply_recipe_defaults};
+
+    /// The recipe the registry fixture carries for the sparse family: the
+    /// published trellis export as one directory, its tower file bound to
+    /// `--vision`, its draft head inside the directory.
+    const QWEN38: &str = include_str!("../../shiso-registry/tests/fixtures/qwen3.8-flash.json");
+
+    /// The CUDA variant resolves to the directory as `--model`, the tower
+    /// file inside it as `--vision`, and the tuned knobs as recipe defaults.
+    #[test]
+    fn exl3_variant_resolves_to_directory_and_tower() {
+        let recipe: Recipe = serde_json::from_str(QWEN38).expect("fixture parses");
+        validate_recipe(&recipe, ValidationMode::Strict).expect("fixture validates");
+        let variant = recipe
+            .variants
+            .iter()
+            .find(|v| v.key.as_str() == "cuda-exl3-405")
+            .expect("cuda variant");
+
+        let matches =
+            Cli::command().get_matches_from(["shiso", "serve", "--ctx", "8192", "--port", "1"]);
+        let serve = matches.subcommand_matches("serve").expect("serve");
+        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
+        let vdir = Path::new("/hub/models/qwen3.8-flash/cuda-exl3-405");
+        populate_serve_args_from_variant(&mut args, vdir, variant, &recipe.name)
+            .expect("populates");
+        apply_recipe_defaults(
+            &mut args,
+            Some(serve),
+            variant.server_defaults.as_ref().expect("defaults"),
+        );
+
+        let base = vdir.join(Role::Base.as_str());
+        assert_eq!(args.model, Some(base.clone()));
+        assert_eq!(args.vision, Some(base.join("vision_k6.safetensors")));
+        // The head is inside the directory: no flag names it.
+        assert_eq!(args.draft_model, None);
+        assert_eq!(args.config, None);
+        assert_eq!(args.model_name.as_deref(), Some("qwen3.8-flash"));
+
+        assert_eq!(args.ctx, 8192, "an explicit flag beats the recipe");
+        assert_eq!(args.spec_k, 4);
+        assert_eq!(args.spec_lookup, 8);
+        assert!(args.capture_verify && args.capture_batch);
+        assert_eq!(args.gpu_memory_utilization, Some(0.88));
+        assert_eq!(args.solo_prefill_chunk, 4096);
+    }
+
+    /// The MLX variant is a directory checkpoint with no entry file, and the
+    /// residency choice is the server's own `auto`.
+    #[test]
+    fn mlx_variant_points_at_its_directory() {
+        let recipe: Recipe = serde_json::from_str(QWEN38).expect("fixture parses");
+        let variant = recipe
+            .variants
+            .iter()
+            .find(|v| v.key.as_str() == "metal-mlx4")
+            .expect("metal variant");
+        let matches = Cli::command().get_matches_from(["shiso", "serve"]);
+        let serve = matches.subcommand_matches("serve").expect("serve");
+        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
+        // A real directory: the config is looked for inside a checkpoint
+        // directory and beside a checkpoint file, decided on the filesystem.
+        let home = tempfile::tempdir().expect("tempdir");
+        let vdir = home.path();
+        std::fs::create_dir_all(vdir.join("base")).expect("base dir");
+        populate_serve_args_from_variant(&mut args, vdir, variant, &recipe.name)
+            .expect("populates");
+        assert_eq!(args.model, Some(vdir.join("base")));
+        assert_eq!(args.config, None);
+        assert_eq!(args.config_path(), vdir.join("base").join("config.json"));
+        assert_eq!(args.draft_model, None);
+    }
 }

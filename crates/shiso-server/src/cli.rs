@@ -23,7 +23,7 @@ pub use shiso_router::cli::RouterArgs;
 use shiso_vision::{FfmpegPolicy, ImageLimits};
 
 use clap::parser::ValueSource;
-use shiso_hub::recipe::ServerDefaults;
+use shiso_hub::recipe::{ExpertResidency, ServerDefaults};
 /// The default listen address. Loopback, so an unconfigured server is not on the
 /// network.
 pub const DEFAULT_BIND: &str = "127.0.0.1";
@@ -1242,12 +1242,7 @@ pub fn apply_recipe_defaults(
     matches: Option<&clap::ArgMatches>,
     defaults: &ServerDefaults,
 ) {
-    let check_override = |id: &str| -> bool {
-        match matches {
-            Some(m) => m.value_source(id) == Some(ValueSource::DefaultValue),
-            None => true,
-        }
-    };
+    let check_override = |id: &str| defaulted(matches, id);
 
     if let Some(ctx) = defaults.ctx
         && check_override("ctx")
@@ -1333,22 +1328,87 @@ pub fn apply_recipe_defaults(
         );
     }
 
-    if let Some(residency_str) = &defaults.expert_residency
+    apply_engine_defaults(args, matches, defaults);
+}
+
+/// Whether flag `id` still holds its built-in default, which is the only case
+/// a recipe default may replace.
+fn defaulted(matches: Option<&clap::ArgMatches>, id: &str) -> bool {
+    matches.is_none_or(|m| m.value_source(id) == Some(ValueSource::DefaultValue))
+}
+
+/// The recipe defaults that tune the engine rather than the request surface:
+/// expert residency, speculation and capture, and the memory and prefill
+/// budgets.
+fn apply_engine_defaults(
+    args: &mut ServeArgs,
+    matches: Option<&clap::ArgMatches>,
+    defaults: &ServerDefaults,
+) {
+    let check_override = |id: &str| defaulted(matches, id);
+
+    if let Some(residency) = defaults.expert_residency
         && check_override("expert_residency")
     {
-        match residency_str.to_lowercase().as_str() {
-            "auto" => args.expert_residency = ExpertResidencyChoice::Auto,
-            "resident" => args.expert_residency = ExpertResidencyChoice::Resident,
-            "stream" | "streamed" => args.expert_residency = ExpertResidencyChoice::Stream,
-            _ => tracing::warn!(
-                residency = residency_str,
-                "unknown expert residency choice in recipe defaults"
-            ),
-        }
+        args.expert_residency = match residency {
+            ExpertResidency::Auto => ExpertResidencyChoice::Auto,
+            ExpertResidency::Resident => ExpertResidencyChoice::Resident,
+            ExpertResidency::Stream => ExpertResidencyChoice::Stream,
+        };
+        tracing::info!(?residency, "applied recipe default for expert_residency");
+    }
+
+    if let Some(reserve) = defaults.expert_reserve_gb
+        && check_override("expert_reserve_gb")
+    {
+        args.expert_reserve_gb = reserve;
+        tracing::info!(reserve, "applied recipe default for expert_reserve_gb");
+    }
+
+    if let Some(slots) = defaults.expert_slots
+        && check_override("expert_slots")
+    {
+        args.expert_slots = slots;
+        tracing::info!(slots, "applied recipe default for expert_slots");
+    }
+
+    if let Some(spec_lookup) = defaults.spec_lookup
+        && check_override("spec_lookup")
+    {
+        args.spec_lookup = spec_lookup;
+        tracing::info!(spec_lookup, "applied recipe default for spec_lookup");
+    }
+
+    if let Some(capture_verify) = defaults.capture_verify
+        && check_override("capture_verify")
+    {
+        args.capture_verify = capture_verify;
+        tracing::info!(capture_verify, "applied recipe default for capture_verify");
+    }
+
+    if let Some(capture_batch) = defaults.capture_batch
+        && check_override("capture_batch")
+    {
+        args.capture_batch = capture_batch;
+        tracing::info!(capture_batch, "applied recipe default for capture_batch");
+    }
+
+    // An `Option` flag has no default value source, so "not given" is `None`.
+    if let Some(fraction) = defaults.gpu_memory_utilization
+        && args.gpu_memory_utilization.is_none()
+    {
+        args.gpu_memory_utilization = Some(fraction);
         tracing::info!(
-            residency = residency_str,
-            "applied recipe default for expert_residency"
+            fraction,
+            "applied recipe default for gpu_memory_utilization"
         );
+    }
+
+    if let Some(chunk) = defaults.solo_prefill_chunk
+        && check_override("solo_prefill_chunk")
+    {
+        args.solo_prefill_chunk = chunk;
+        tracing::info!(chunk, "applied recipe default for solo_prefill_chunk");
     }
 }
 

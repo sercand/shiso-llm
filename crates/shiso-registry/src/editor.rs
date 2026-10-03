@@ -346,11 +346,12 @@ pub(crate) fn build_registry(
             .iter()
             .map(|v| IndexVariantEntry {
                 key: v.key.clone(),
-                backend: v.backend.clone(),
+                backends: v.backends.clone(),
                 quant: v.quant.clone(),
                 min_ram_bytes: v.requirements.min_ram_bytes,
                 disk_bytes: v.requirements.disk_bytes,
                 min_cuda_sm: v.requires.as_ref().and_then(|r| r.min_cuda_sm),
+                min_metal_family: v.requires.as_ref().and_then(|r| r.min_metal_family),
             })
             .collect();
 
