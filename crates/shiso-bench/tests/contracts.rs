@@ -425,19 +425,36 @@ fn image_service_desc_fields(
 const _: fn(shiso_server::image::ImageServiceDesc) -> ImageServiceDescFields =
     image_service_desc_fields;
 
-/// Every variant of the generator's error, named: the wire handlers map
-/// them onto HTTP statuses, so a rename or a removed variant must stop
-/// here rather than in a downstream match arm. The match is exhaustive in
-/// both directions: a variant added upstream makes it non-exhaustive.
+/// Every variant of the generator's error, named with its payload type:
+/// the wire handlers map them onto HTTP statuses and quote the payloads
+/// into the response, so a rename, a removed variant or a retyped payload
+/// must stop here rather than in a downstream match arm. The match is
+/// exhaustive in both directions: a variant added upstream makes it
+/// non-exhaustive.
 fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
     match error {
         ImageGenError::EmptyPrompt => (0, 0, 0),
         ImageGenError::InvalidDimensions { width, height } => (1, *width, *height),
-        ImageGenError::UnsupportedFormat(_) => (2, 0, 0),
-        ImageGenError::ReferenceImage(_) => (3, 0, 0),
-        ImageGenError::Backend(_) => (4, 0, 0),
-        ImageGenError::Encoding(_) => (5, 0, 0),
-        ImageGenError::Checkpoint(_) => (6, 0, 0),
+        ImageGenError::UnsupportedFormat(msg) => {
+            let _: &String = msg;
+            (2, 0, 0)
+        }
+        ImageGenError::ReferenceImage(msg) => {
+            let _: &String = msg;
+            (3, 0, 0)
+        }
+        ImageGenError::Backend(msg) => {
+            let _: &String = msg;
+            (4, 0, 0)
+        }
+        ImageGenError::Encoding(msg) => {
+            let _: &String = msg;
+            (5, 0, 0)
+        }
+        ImageGenError::Checkpoint(msg) => {
+            let _: &String = msg;
+            (6, 0, 0)
+        }
     }
 }
 const _: fn(&ImageGenError) -> (u8, u32, u32) = image_gen_error_variants;
