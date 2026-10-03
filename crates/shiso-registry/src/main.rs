@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         // started from - and nothing later depends on that directory again.
         Command::Serve(mut args) => {
             args.repo = std::path::absolute(&args.repo)?;
-            server::run_server(args.repo, args.port, args.open).await?;
+            server::run_server(args.repo, args.port, args.open, args.require_token).await?;
         }
         Command::Inspect(args) => {
             let res = editor::inspect_hf(&args.repo, &args.revision, None).await?;

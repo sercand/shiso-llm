@@ -28,8 +28,9 @@ const UI_HTML: &str = include_str!("ui.html");
 pub(crate) struct ServerState {
     /// Path to repository root containing `registry/`.
     pub(crate) repo: PathBuf,
-    /// Random 256-bit session token required on all `/api` calls.
-    pub(crate) session_token: String,
+    /// Random 256-bit session token required on all `/api` calls, when the
+    /// editor was started with `--require-token`; `None` requires none.
+    pub(crate) session_token: Option<String>,
     /// Bound port.
     pub(crate) port: u16,
 }
@@ -38,11 +39,18 @@ pub(crate) struct ServerState {
 ///
 /// # Errors
 /// Returns an error if binding or serving fails.
-pub(crate) async fn run_server(repo: PathBuf, port: u16, open_browser: bool) -> anyhow::Result<()> {
-    // Generate 256-bit (32-byte) random session token
-    let mut token_bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut token_bytes);
-    let session_token = hex::encode(token_bytes);
+pub(crate) async fn run_server(
+    repo: PathBuf,
+    port: u16,
+    open_browser: bool,
+    require_token: bool,
+) -> anyhow::Result<()> {
+    // A 256-bit (32-byte) random session token, only when asked for.
+    let session_token = require_token.then(|| {
+        let mut token_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut token_bytes);
+        hex::encode(token_bytes)
+    });
 
     let state = Arc::new(ServerState {
         repo,
@@ -54,7 +62,10 @@ pub(crate) async fn run_server(repo: PathBuf, port: u16, open_browser: bool) -> 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound_port = listener.local_addr()?.port();
 
-    let server_url = format!("http://127.0.0.1:{bound_port}/#token={session_token}");
+    let server_url = match &session_token {
+        Some(token) => format!("http://127.0.0.1:{bound_port}/#token={token}"),
+        None => format!("http://127.0.0.1:{bound_port}/"),
+    };
     println!("\n  Shiso Registry Editor running at:\n  {server_url}\n");
 
     if open_browser {
@@ -123,12 +134,14 @@ pub(crate) async fn security_middleware(
         }
     }
 
-    // 3. Authorization check for all /api routes
-    if req.uri().path().starts_with("/api") {
+    // 3. Authorization check for all /api routes, when a token is required
+    if let Some(token) = &state.session_token
+        && req.uri().path().starts_with("/api")
+    {
         let auth_header = headers
             .get(header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok());
-        let expected = format!("Bearer {}", state.session_token);
+        let expected = format!("Bearer {token}");
         if auth_header != Some(&expected) {
             return Err(StatusCode::UNAUTHORIZED);
         }

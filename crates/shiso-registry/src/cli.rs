@@ -46,6 +46,15 @@ pub(crate) struct ServeArgs {
     /// Open web browser automatically at startup.
     #[arg(long)]
     pub open: bool,
+
+    /// Require a per-run session token on every `/api` call.
+    ///
+    /// Off by default: the editor binds loopback only, and the Host and Origin
+    /// checks that stop a web page from reaching it stay on either way. On,
+    /// a random token is generated at startup and printed in the editor's URL,
+    /// which keeps out other local users and processes as well.
+    #[arg(long, env = "SHISO_REGISTRY_REQUIRE_TOKEN")]
+    pub require_token: bool,
 }
 
 /// Arguments for `inspect <hf-repo>`.

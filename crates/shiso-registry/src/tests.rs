@@ -131,7 +131,7 @@ async fn http_hardening_rejects_unauthorized_and_invalid_hosts() {
     let temp = tempdir().unwrap();
     let state = Arc::new(ServerState {
         repo: temp.path().to_path_buf(),
-        session_token: "test_token_secret_12345".to_string(),
+        session_token: Some("test_token_secret_12345".to_string()),
         port: 8095,
     });
 
@@ -181,6 +181,38 @@ async fn http_hardening_rejects_unauthorized_and_invalid_hosts() {
 
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Without `--require-token` the API takes requests with no token, and the
+/// Host and Origin checks still refuse what they refused before.
+#[tokio::test]
+async fn without_a_required_token_only_the_host_and_origin_checks_apply() {
+    let temp = tempdir().unwrap();
+    let app = build_router(Arc::new(ServerState {
+        repo: temp.path().to_path_buf(),
+        session_token: None,
+        port: 8095,
+    }));
+    let get = |host: &str| {
+        Request::builder()
+            .uri("/api/families")
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let resp = app.clone().oneshot(get("127.0.0.1:8095")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app.clone().oneshot(get("attacker.com")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/validate")
+        .header(header::HOST, "127.0.0.1:8095")
+        .header(header::ORIGIN, "http://malicious-website.com")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 /// Runs git in `dir` with a fixed identity and commit date.
