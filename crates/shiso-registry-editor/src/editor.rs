@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256 as Sha256Hasher};
 use shiso_hub::recipe::{
     CURRENT_SCHEMA_VERSION, Index, IndexModelEntry, IndexVariantEntry, ModelName, Recipe, Sha256,
 };
-use shiso_hub::validate::{FamilyValidationFacts, ValidationMode, validate_recipe};
+use shiso_hub::validate::{ValidationMode, validate_recipe};
 
 /// Validation report for one recipe file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
