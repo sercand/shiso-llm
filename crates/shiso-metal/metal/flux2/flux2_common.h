@@ -22,9 +22,10 @@
 #define FLUX2_BLOCK 64u
 
 // Partial slots per lane in the attention kernels: one per 64 head-dim
-// values a lane strides over, so this bounds head_dim at 512 - far past the
-// family's 128-wide heads, and a head wider than the bound would silently
-// drop its tail, so the kernels refuse it instead.
+// values a lane strides over, so this bounds head_dim at 512. The family's
+// heads are 128 wide, a quarter of the bound, and nothing here guards it:
+// a head wider than 512 would silently drop its tail, so the driver's
+// model config is what keeps head_dim inside the bound.
 #define FLUX2_ATTN_SLOTS 8u
 
 /// One brain-float, widened.
@@ -62,7 +63,11 @@ static inline float flux2_silu(float x) {
 /// Inclusive sum over one simdgroup, left-folded in decreasing-offset order
 /// so lane 0 ends up holding the total. Spelled out instead of using the
 /// builtin because the shading language leaves that summation order
-/// unspecified, and the host twin's fold is the answer being matched.
+/// unspecified: the point is a fixed association, so the kernel answers the
+/// same on every run and device. The butterfly is not the host twin's
+/// sequential fold - a lane-parallel reduction cannot reproduce that
+/// association - so the two are deterministic, not bit-identical, and the
+/// rounding difference stays far inside the 1e-4 parity tolerance.
 static inline float flux2_warp_sum(float v) {
     for (uint off = 16u; off > 0u; off >>= 1u) {
         v += simd_shuffle_down(v, off);
@@ -97,13 +102,18 @@ static inline float flux2_block_sum(float v, threadgroup float *scratch, uint ti
 
 /// Whether a bias binding is the driver's absent-bias stand-in.
 ///
-/// The driver binds a zero-filled 4-byte buffer wherever a linear or a
-/// convolution carries no bias (`Ops::dummy`), and the argument block has no
-/// room for a presence flag, so an exactly +0.0 first word is the absence
-/// signal - the same reported convention the q4e hyper-connection port uses.
-/// A real bias whose first element is exactly +0.0 would be misread as
-/// absent; the host twin has no such ambiguity, and the deviation is
-/// reported with this port.
+/// The driver binds a dedicated zero-filled 4-byte buffer wherever a linear
+/// or a convolution carries no bias (`Ops::dummy`), and the argument block
+/// has no room for a presence flag. MSL offers no device-side query for a
+/// bound buffer's length - checked against the MSL 4.1 specification and
+/// the current toolchain, which declare no `buffer_length` or equivalent -
+/// so the predicate can only read `bias[0]`, and bit-exact +0.0 is the
+/// absence signal. The stand-in is always +0.0 (`fill_zero`), and every
+/// real bias in this family is >= 8 bytes, so the sole misread is a real
+/// bias whose first element is exactly +0.0: it is skipped, as the pinned
+/// test records. A -0.0 first word is present, not absent. The unambiguous
+/// fix is driver-side (a presence flag, or a stand-in that cannot occur as
+/// a bias word) and is reported with this port.
 static inline bool flux2_bias_absent(device const float *bias) {
     return as_type<uint>(bias[0]) == 0u;
 }

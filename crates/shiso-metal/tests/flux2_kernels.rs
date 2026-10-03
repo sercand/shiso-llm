@@ -488,18 +488,104 @@ fn gemm_bf16_treats_the_zero_bias_stand_in_as_no_bias() {
             .map(|&v| u16::from_le_bytes(bf16::from_f32(v).to_le_bytes()))
             .collect::<Vec<u16>>(),
     );
-    let zero_bias = upload_f32(&b, &vec![0.0f32; n]);
+    // The driver's stand-in for an absent bias is a dedicated 4-byte zero
+    // buffer, not an n-wide zero vector: the kernel tells the stand-in from a
+    // real bias by the bound length, so the case must bind the real shape.
+    let stand_in = dummy(&b);
     let got = run_gemm(
         &b,
         "kernel_flux2_gemm_bf16",
         wbuf.view(),
         1.0,
-        zero_bias.view(),
+        stand_in.view(),
         &input,
         (m, n, k),
     );
     let expected = expect_gemm(&input, &weight, &vec![0.0f32; n], 1.0, m, n, k);
     assert_close(&got, &expected, "gemm_bf16 no-bias stand-in");
+}
+
+/// The predicate for "no bias" is bit-exact +0.0, not `bias[0] == 0.0`:
+/// a real bias whose first word is -0.0 (a distinct bit pattern, 0x80000000)
+/// must be applied. This pins the bit-exactness - any relaxation of the
+/// predicate to a value comparison drops this bias and fails here.
+#[test]
+fn gemm_bf16_applies_a_real_bias_whose_first_word_is_negative_zero() {
+    let Some(b) = open() else { return };
+    let (m, n, k) = (2usize, 3usize, 4usize);
+    let input = vals(m * k, 6);
+    let weight: Vec<f32> = (0..n * k).map(|i| ((i % 5) as f32) * 0.25 - 0.5).collect();
+    let wbuf = upload_u16(
+        &b,
+        &weight
+            .iter()
+            .map(|&v| u16::from_le_bytes(bf16::from_f32(v).to_le_bytes()))
+            .collect::<Vec<u16>>(),
+    );
+    let bias = vec![-0.0f32, 0.5, -0.25];
+    let bias_buf = upload_f32(&b, &bias);
+    let got = run_gemm(
+        &b,
+        "kernel_flux2_gemm_bf16",
+        wbuf.view(),
+        1.0,
+        bias_buf.view(),
+        &input,
+        (m, n, k),
+    );
+    assert_differs(
+        &got,
+        &expect_gemm(&input, &weight, &vec![0.0f32; n], 1.0, m, n, k),
+        "gemm_bf16 negative-zero-first bias",
+    );
+    let expected = expect_gemm(&input, &weight, &bias, 1.0, m, n, k);
+    assert_close(&got, &expected, "gemm_bf16 negative-zero-first bias");
+}
+
+/// The pinned deviation: MSL has no device-side query for a bound buffer's
+/// length (checked against the MSL 4.1 specification and the current
+/// toolchain), so the kernel cannot tell the driver's 4-byte zero stand-in
+/// from a real bias whose first element is exactly +0.0 - it skips the
+/// whole bias. A real checkpoint bias with a bit-exact +0.0 first element
+/// is therefore dropped. The unambiguous fix is driver-side (a presence
+/// flag, or a stand-in word that cannot occur as a bias value); when that
+/// lands, flip this test to expect the bias applied. Until then this test
+/// is the regression lock: the behavior is documented, not silent.
+#[test]
+fn gemm_bf16_skips_a_real_bias_whose_first_word_is_positive_zero() {
+    let Some(b) = open() else { return };
+    let (m, n, k) = (2usize, 3usize, 4usize);
+    let input = vals(m * k, 7);
+    let weight: Vec<f32> = (0..n * k).map(|i| ((i % 5) as f32) * 0.25 - 0.5).collect();
+    let wbuf = upload_u16(
+        &b,
+        &weight
+            .iter()
+            .map(|&v| u16::from_le_bytes(bf16::from_f32(v).to_le_bytes()))
+            .collect::<Vec<u16>>(),
+    );
+    let bias = vec![0.0f32, 0.5, -0.25];
+    let bias_buf = upload_f32(&b, &bias);
+    let got = run_gemm(
+        &b,
+        "kernel_flux2_gemm_bf16",
+        wbuf.view(),
+        1.0,
+        bias_buf.view(),
+        &input,
+        (m, n, k),
+    );
+    let skipped = expect_gemm(&input, &weight, &vec![0.0f32; n], 1.0, m, n, k);
+    assert_differs(
+        &skipped,
+        &expect_gemm(&input, &weight, &bias, 1.0, m, n, k),
+        "gemm_bf16 positive-zero-first bias: readings",
+    );
+    assert_close(
+        &got,
+        &skipped,
+        "gemm_bf16 positive-zero-first bias (pinned deviation)",
+    );
 }
 
 #[test]
