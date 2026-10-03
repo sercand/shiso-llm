@@ -73,8 +73,12 @@ async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
         )
     })?;
     // Refused before the image-model question: a body this server will never
-    // act on is the caller's fault whether or not a generator is loaded.
+    // act on is the caller's fault whether or not a generator is loaded. The
+    // plan is built in the same position for the same reason - a malformed
+    // size or output format is a 400 with no generator loaded too, so the 503
+    // is reserved for a well-formed request this server could have run.
     parsed.validate()?;
+    let plan = Plan::from_wire(&parsed, state)?;
     let service = state.image()?;
     if let Some(quality) = parsed.quality.as_deref() {
         tracing::debug!(
@@ -89,7 +93,6 @@ async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
             "the named model is answered by whichever generator is loaded"
         );
     }
-    let plan = Plan::from_wire(&parsed, state)?;
     if plan.stream {
         stream(service.clone(), plan).await
     } else {
@@ -281,6 +284,9 @@ async fn run_stream(
 ) {
     let created = crate::ids::unix_timestamp();
     let mut usage = UsageTotals::default();
+    // The wire's `partial_image_index` counts across ALL images of one
+    // request: with n>1 the counter keeps incrementing into the second image
+    // rather than restarting, which is why it lives outside the loop.
     let mut partial_index = 0u32;
     // Whether any frame has been promised to the client yet: before the first
     // one a failure is still answerable as a status code; after it, the 200
