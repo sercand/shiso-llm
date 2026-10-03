@@ -90,7 +90,7 @@ use crate::qwen4exp::binding::{
     NGRAM_TABLE, NgramRoles, RecurrentRoles, bind_draft, bind_qwen4exp,
 };
 use crate::qwen4exp::config::Qwen4ExpConfig;
-use crate::qwen4exp::mlx;
+use crate::qwen4exp::{exl3, mlx};
 
 /// The formats a bound projection may be stored as.
 ///
@@ -383,6 +383,65 @@ impl Qwen4ExpModel {
             },
             stack,
             expert_gate: DType::Fp8E4M3Block128,
+        })
+    }
+
+    /// Opens the trellis export's directory as it is published and puts it on
+    /// the device, its routed banks resident.
+    ///
+    /// `ngram` is the n-gram table file, which the export keeps beside its
+    /// shards and the caller names; nothing here looks for it by name.
+    ///
+    /// The export carries its own draft head; `draft` loads it, and `counts`
+    /// narrows its vocabulary as [`Qwen4ExpModel::load_with`] does. The
+    /// trellis kernels exist on one backend, and a device without them refuses
+    /// the first projection the stack is built over.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`exl3::open`], [`exl3::NgramFile::open`],
+    /// [`Qwen4ExpConfig::from_exl3`], the imports and [`SparseStack::new`]
+    /// report, and [`CoreError::Backend`] when the counts file cannot be read.
+    pub fn load_exl3(
+        backend: &Arc<dyn Backend>,
+        dir: &Path,
+        ngram: &Path,
+        hf: &shiso_core::config::HfConfig,
+        draft: bool,
+        counts: Option<&Path>,
+        opts: SparseOptions,
+    ) -> CoreResult<Self> {
+        let ck = exl3::open(dir)?;
+        let table = exl3::NgramFile::open(ngram)?;
+        let config = Qwen4ExpConfig::from_exl3(hf, dir, &table)?;
+        let ngram = {
+            let _tag = ledger::scope(MemTag::WeightsEmbedding);
+            exl3::open_ngram(backend, &table, &config, &opts)?
+        };
+        let mut weights = exl3::import(backend, &ck, &config, opts.pack_halves)?;
+        if draft {
+            let rank = config.shape().count(shiso_engine::shape::LayerKind::Attn);
+            weights.draft = Some(exl3::import_draft(backend, &ck, rank, opts.pack_halves)?);
+            if let Some(list) = counts {
+                narrow_draft_head(backend, &mut weights, list, config.shape().vocab)?;
+            }
+        }
+        let expert_gate = weights
+            .layers
+            .first()
+            .map_or(DType::Exl3K4, |layer| layer.experts.gate.dtype);
+        drop(ck);
+        let stack = SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
+        Ok(Self {
+            info: ModelInfo {
+                context_capacity: stack.context_capacity(),
+                vocab: config.shape().vocab,
+                hidden: config.shape().hidden,
+                n_layers: config.shape().n_layers(),
+                stop_tokens: StopTokens::new(&config.stop_tokens())?,
+            },
+            stack,
+            expert_gate,
         })
     }
 

@@ -27,7 +27,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSharedEvent,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary, MTLResourceOptions,
+    MTLSharedEvent,
 };
 use parking_lot::{Mutex, MutexGuard};
 use shiso_core::{
@@ -219,6 +220,32 @@ pub struct MetalBackend {
 #[must_use]
 pub fn metal_available() -> bool {
     MTLCreateSystemDefaultDevice().is_some()
+}
+
+/// The default device's name, Apple GPU family and recommended working set;
+/// `None` when there is no Metal device.
+///
+/// The family is found by asking from the newest down, because a device
+/// supports every family below its own and only the highest one says which
+/// chip generation it is.
+#[must_use]
+pub fn device_facts() -> Option<crate::DeviceFacts> {
+    const FAMILIES: [(MTLGPUFamily, u32); 4] = [
+        (MTLGPUFamily::Apple10, 10),
+        (MTLGPUFamily::Apple9, 9),
+        (MTLGPUFamily::Apple8, 8),
+        (MTLGPUFamily::Apple7, 7),
+    ];
+    let device = MTLCreateSystemDefaultDevice()?;
+    let apple_family = FAMILIES
+        .iter()
+        .find(|(family, _)| device.supportsFamily(*family))
+        .map_or(0, |(_, number)| *number);
+    Some(crate::DeviceFacts {
+        name: device.name().to_string(),
+        apple_family,
+        working_set_bytes: device.recommendedMaxWorkingSetSize(),
+    })
 }
 
 impl MetalBackend {

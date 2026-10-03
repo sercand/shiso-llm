@@ -31,17 +31,17 @@
 /// the same association a plain `for k in 0..K` loop makes. That is deliberate
 /// -- the oracle this kernel is held to is exactly that loop -- and a blocking
 /// change that reorders `k` is a change to the numbers, not just to the speed.
-kernel void kernel_vit_gemm_bias(
-        constant vit_args_gemm & args [[buffer(0)]],
-        device float *out             [[buffer(1)]],
-        device const float *in        [[buffer(2)]],
-        device const ushort *weight   [[buffer(3)]],
-        device const ushort *bias     [[buffer(4)]],
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        ushort3 tpitg[[thread_position_in_threadgroup]]) {
-    threadgroup float a_tile[VIT_GEMM_TILE][VIT_GEMM_TILE];
-    threadgroup float b_tile[VIT_GEMM_TILE][VIT_GEMM_TILE];
-
+template <typename W>
+static inline void vit_gemm_bias_body(
+        constant vit_args_gemm & args,
+        device float *out,
+        device const float *in,
+        device const ushort *weight,
+        device const ushort *bias,
+        threadgroup float (*a_tile)[VIT_GEMM_TILE],
+        threadgroup float (*b_tile)[VIT_GEMM_TILE],
+        uint3 tgpig,
+        ushort3 tpitg) {
     const uint tx = tpitg.x;
     const uint ty = tpitg.y;
     const uint row = tgpig.y * VIT_GEMM_TILE + ty;
@@ -59,7 +59,7 @@ kernel void kernel_vit_gemm_bias(
                 ? in[(uint64_t) row * args.k + k]
                 : 0.0f;
         b_tile[ty][tx] = (stage_n < args.n && have_k)
-                ? vit_bf16(weight + (uint64_t) stage_n * args.k + k)
+                ? W::load(weight + (uint64_t) stage_n * args.k + k)
                 : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0u; kk < VIT_GEMM_TILE; kk++) {
@@ -69,6 +69,34 @@ kernel void kernel_vit_gemm_bias(
     }
 
     if (row < args.m && col < args.n) {
-        out[(uint64_t) row * args.n + col] = acc + vit_bf16(bias + col);
+        out[(uint64_t) row * args.n + col] = acc + W::load(bias + col);
     }
+}
+
+// The brain-float tower's entry and the half-precision tower's twin. The
+// tiles are declared here because threadgroup memory belongs to a kernel.
+kernel void kernel_vit_gemm_bias(
+        constant vit_args_gemm & args [[buffer(0)]],
+        device float *out             [[buffer(1)]],
+        device const float *in        [[buffer(2)]],
+        device const ushort *weight   [[buffer(3)]],
+        device const ushort *bias     [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup float a_tile[VIT_GEMM_TILE][VIT_GEMM_TILE];
+    threadgroup float b_tile[VIT_GEMM_TILE][VIT_GEMM_TILE];
+    vit_gemm_bias_body<vit_w_bf16>(args, out, in, weight, bias, a_tile, b_tile, tgpig, tpitg);
+}
+
+kernel void kernel_vit_gemm_bias_f16(
+        constant vit_args_gemm & args [[buffer(0)]],
+        device float *out             [[buffer(1)]],
+        device const float *in        [[buffer(2)]],
+        device const ushort *weight   [[buffer(3)]],
+        device const ushort *bias     [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup float a_tile[VIT_GEMM_TILE][VIT_GEMM_TILE];
+    threadgroup float b_tile[VIT_GEMM_TILE][VIT_GEMM_TILE];
+    vit_gemm_bias_body<vit_w_f16>(args, out, in, weight, bias, a_tile, b_tile, tgpig, tpitg);
 }

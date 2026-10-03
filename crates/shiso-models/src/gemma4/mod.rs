@@ -35,3 +35,8 @@ pub use ckpt::{GEMMA4_MODEL_ID, quant_bits_of};
 pub use config::{ARCHES, GGUF_ARCH, Gemma4Config};
 pub use model::{Gemma4Model, PleOptions};
 pub use vision::Gemma4Tower;
+
+use crate::catalog::FamilyFacts;
+
+/// Family facts for Gemma 4.
+pub const FACTS: FamilyFacts = FamilyFacts { name: "gemma4" };

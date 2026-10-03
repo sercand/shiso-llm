@@ -30,6 +30,14 @@ pub const fn metal_available() -> bool {
     false
 }
 
+/// What the default Metal device says about itself.
+///
+/// Always `None` here: this target has no Metal runtime to ask.
+#[must_use]
+pub const fn device_facts() -> Option<crate::DeviceFacts> {
+    None
+}
+
 /// The Metal backend, on a target that has none.
 #[derive(Debug)]
 pub enum MetalBackend {}

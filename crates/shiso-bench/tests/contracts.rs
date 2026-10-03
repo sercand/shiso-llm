@@ -52,6 +52,14 @@ use shiso_vision::generator::{
     ImageStepEvent, InputReferenceImage,
 };
 
+use shiso_hub::{HostProfile, HubError, ModelRef, ProgressEvent, Recipe};
+
+const _: Option<&Recipe> = None;
+const _: Option<&ModelRef> = None;
+const _: Option<&HostProfile> = None;
+const _: Option<&ProgressEvent> = None;
+const _: Option<&HubError> = None;
+
 // ---------------------------------------------------------------------------
 // object safety
 // ---------------------------------------------------------------------------
@@ -469,10 +477,11 @@ fn the_contracts_above_are_compiled() {
     assert_eq!(
         usage_counts(&Usage::default()),
         (0, 0, 0, 0),
-        "a fresh usage block counts nothing"
+        "a fresh usage block counts nothing",
     );
+    let parsed_ref = ModelRef::parse("qwen3.5-9b:metal-mlx4").expect("valid model ref");
+    assert_eq!(parsed_ref.model.as_str(), "qwen3.5-9b");
 }
-
 /// The rig opens whatever device this machine has.
 ///
 /// Bound to the platform rather than to a backend: this file's own history is

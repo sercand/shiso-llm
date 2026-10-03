@@ -58,3 +58,8 @@ pub use gguf_config::{GGUF_ARCH, config_from_gguf, nextn_blocks};
 pub use model::Qwen35MoeModel;
 pub use mtp::MtpHead;
 pub use quant::{QuantAlgo, QuantConfig};
+
+use crate::catalog::FamilyFacts;
+
+/// Family facts for Qwen3.5 `MoE`.
+pub const FACTS: FamilyFacts = FamilyFacts { name: "qwen35moe" };

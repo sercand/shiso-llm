@@ -44,6 +44,7 @@ pub mod ckpt;
 pub mod draft;
 pub mod exec;
 pub mod exl3;
+pub mod expand;
 pub mod gather;
 pub mod headslice;
 pub mod hyper;

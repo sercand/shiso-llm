@@ -1,0 +1,401 @@
+#![expect(clippy::unwrap_used, reason = "test assertions panic on failure")]
+
+//! Mock HTTP integration tests (§9.3).
+
+use std::fs;
+use std::num::NonZeroUsize;
+
+use sha2::{Digest, Sha256 as Sha256Hasher};
+use tempfile::tempdir;
+use wiremock::matchers::{header, header_exists, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use shiso_hub::config::{HfToken, HubConfig, RegistryEndpoint};
+use shiso_hub::download::{DownloadFileDesc, Downloader};
+use shiso_hub::error::HubError;
+use shiso_hub::recipe::{FileEntry, Role, Sha256};
+use shiso_hub::registry::RegistryClient;
+
+#[tokio::test]
+async fn cross_host_redirect_strips_authorization() {
+    let host_a = MockServer::start().await;
+    let host_b = MockServer::start().await;
+
+    // Host B should NOT receive the Authorization header
+    Mock::given(method("GET"))
+        .and(path("/dest"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&host_b)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/dest"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload from host b"))
+        .expect(1)
+        .mount(&host_b)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let endpoint = RegistryEndpoint {
+        url: url::Url::parse(&format!("{}/v1", host_a.uri())).unwrap(),
+    };
+
+    let config = HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: endpoint,
+        hf_endpoint: url::Url::parse(&host_a.uri()).unwrap(),
+        hf_token: Some(HfToken::new("test-token-123")),
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    };
+
+    let downloader = Downloader::new(config);
+    let payload = b"payload from host b";
+    let sha = hex::encode(Sha256Hasher::digest(payload));
+
+    let file_entry = FileEntry {
+        name: "test.bin".to_string(),
+        size: payload.len() as u64,
+        sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
+    };
+
+    // Use our downloader to download a file where resolve redirects cross-host
+    // Target URL path in Downloader::download_file is:
+    // {hf_endpoint}/{repo}/resolve/{commit}/{name}
+    // We map repo="redirect", commit="cross", name="test.bin"
+    Mock::given(method("GET"))
+        .and(path("/redirect/resolve/cross/test.bin"))
+        .and(header("authorization", "Bearer test-token-123"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", format!("{}/dest", host_b.uri())),
+        )
+        .expect(1)
+        .mount(&host_a)
+        .await;
+
+    let res = downloader
+        .download_file(DownloadFileDesc {
+            model_name: "test-model",
+            variant_key: "var",
+            role: Role::Base,
+            repo: "redirect",
+            revision: "cross",
+            file: &file_entry,
+            progress_tx: None,
+        })
+        .await;
+    assert!(
+        res.is_ok(),
+        "download with cross-host redirect succeeded: {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn same_host_redirect_preserves_authorization() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/shiso/resolve/commit/file.txt"))
+        .and(header("authorization", "Bearer secret-token"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            format!("{}/shiso/target/file.txt", server.uri()),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let payload = b"same host payload";
+    let sha = hex::encode(Sha256Hasher::digest(payload));
+
+    Mock::given(method("GET"))
+        .and(path("/shiso/target/file.txt"))
+        .and(header("authorization", "Bearer secret-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let endpoint = RegistryEndpoint {
+        url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+    };
+
+    let config = HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: endpoint,
+        hf_endpoint: url::Url::parse(&server.uri()).unwrap(),
+        hf_token: Some(HfToken::new("secret-token")),
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    };
+
+    let downloader = Downloader::new(config);
+    let file_entry = FileEntry {
+        name: "file.txt".to_string(),
+        size: payload.len() as u64,
+        sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
+    };
+
+    let res = downloader
+        .download_file(DownloadFileDesc {
+            model_name: "m",
+            variant_key: "v",
+            role: Role::Base,
+            repo: "shiso",
+            revision: "commit",
+            file: &file_entry,
+            progress_tx: None,
+        })
+        .await;
+    assert!(res.is_ok());
+}
+
+#[tokio::test]
+async fn etag_304_reuse() {
+    let server = MockServer::start().await;
+
+    let index_bytes =
+        b"{\"schema_version\":1,\"generated_at\":\"2026-10-03T12:00:00Z\",\"models\":[]}";
+
+    Mock::given(method("GET"))
+        .and(path("/v1/index.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"etag-12345\"")
+                .set_body_bytes(index_bytes.as_slice()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let endpoint = RegistryEndpoint {
+        url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+    };
+
+    let config = HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: endpoint,
+        hf_endpoint: url::Url::parse("https://huggingface.co").unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    };
+
+    let client = RegistryClient::new(config.clone());
+
+    // First fetch: 200 OK
+    let index1 = client.fetch_index().await.unwrap();
+    assert_eq!(index1.models.len(), 0);
+
+    // Second fetch with ETag -> 304 Not Modified
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/index.json"))
+        .and(header("if-none-match", "\"etag-12345\""))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let index2 = client.fetch_index().await.unwrap();
+    assert_eq!(index2.models.len(), 0);
+}
+
+#[tokio::test]
+async fn bit_flip_leads_to_digest_mismatch_and_cleanup() {
+    let server = MockServer::start().await;
+
+    let payload = b"correct payload bytes";
+    let sha = hex::encode(Sha256Hasher::digest(payload));
+
+    let corrupted_payload = b"corrupt payload bytes";
+
+    Mock::given(method("GET"))
+        .and(path("/repo/resolve/sha/corrupt.bin"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(corrupted_payload.as_slice()))
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let endpoint = RegistryEndpoint {
+        url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+    };
+
+    let config = HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: endpoint,
+        hf_endpoint: url::Url::parse(&server.uri()).unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    };
+
+    let downloader = Downloader::new(config);
+    let file_entry = FileEntry {
+        name: "corrupt.bin".to_string(),
+        size: payload.len() as u64,
+        sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
+    };
+
+    let err = downloader
+        .download_file(DownloadFileDesc {
+            model_name: "m",
+            variant_key: "v",
+            role: Role::Base,
+            repo: "repo",
+            revision: "sha",
+            file: &file_entry,
+            progress_tx: None,
+        })
+        .await
+        .unwrap_err();
+
+    match err {
+        HubError::DigestMismatch { file, .. } => {
+            assert_eq!(file, "corrupt.bin");
+        }
+        other => panic!("expected DigestMismatch, got {other:?}"),
+    }
+
+    // Ensure the .part file was deleted
+    let part_path = downloader.tmp_dir().join(format!("{sha}.part"));
+    assert!(!part_path.exists());
+}
+
+#[tokio::test]
+async fn range_resume_appends() {
+    let server = MockServer::start().await;
+
+    let full_payload = b"part1_data_part2_data";
+    let part1 = b"part1_data_";
+    let part2 = b"part2_data";
+    let sha = hex::encode(Sha256Hasher::digest(full_payload));
+
+    Mock::given(method("GET"))
+        .and(path("/repo/resolve/sha/resume.bin"))
+        .and(header("range", format!("bytes={}-", part1.len())))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(part2.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let endpoint = RegistryEndpoint {
+        url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+    };
+
+    let config = HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: endpoint,
+        hf_endpoint: url::Url::parse(&server.uri()).unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    };
+
+    let downloader = Downloader::new(config);
+    let file_entry = FileEntry {
+        name: "resume.bin".to_string(),
+        size: full_payload.len() as u64,
+        sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
+    };
+
+    // Pre-create .part file with part1
+    fs::create_dir_all(downloader.tmp_dir()).unwrap();
+    let part_path = downloader.tmp_dir().join(format!("{sha}.part"));
+    fs::write(&part_path, part1).unwrap();
+
+    let res = downloader
+        .download_file(DownloadFileDesc {
+            model_name: "m",
+            variant_key: "v",
+            role: Role::Base,
+            repo: "repo",
+            revision: "sha",
+            file: &file_entry,
+            progress_tx: None,
+        })
+        .await;
+    assert!(res.is_ok());
+
+    // Verify committed blob has the full payload
+    let blob_path = downloader.blob_path(&file_entry.sha256);
+    let content = fs::read(blob_path).unwrap();
+    assert_eq!(content, full_payload);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_pulls_single_download() {
+    let server = MockServer::start().await;
+
+    let payload = b"shared blob bytes for concurrent test";
+    let sha = hex::encode(Sha256Hasher::digest(payload));
+
+    Mock::given(method("GET"))
+        .and(path("/repo/resolve/sha/shared.bin"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.as_slice()))
+        .expect(1) // EXACTLY ONE download despite two concurrent tasks!
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let endpoint = RegistryEndpoint {
+        url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+    };
+
+    let config = HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: endpoint,
+        hf_endpoint: url::Url::parse(&server.uri()).unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    };
+
+    let downloader = Downloader::new(config);
+    let file_entry = FileEntry {
+        name: "shared.bin".to_string(),
+        size: payload.len() as u64,
+        sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
+    };
+
+    let d1 = downloader.clone();
+    let d2 = downloader.clone();
+    let f1 = file_entry.clone();
+    let f2 = file_entry.clone();
+
+    let (res1, res2) = tokio::join!(
+        tokio::spawn(async move {
+            d1.download_file(DownloadFileDesc {
+                model_name: "m",
+                variant_key: "v1",
+                role: Role::Base,
+                repo: "repo",
+                revision: "sha",
+                file: &f1,
+                progress_tx: None,
+            })
+            .await
+        }),
+        tokio::spawn(async move {
+            d2.download_file(DownloadFileDesc {
+                model_name: "m",
+                variant_key: "v2",
+                role: Role::Base,
+                repo: "repo",
+                revision: "sha",
+                file: &f2,
+                progress_tx: None,
+            })
+            .await
+        })
+    );
+
+    res1.unwrap().unwrap();
+    res2.unwrap().unwrap();
+
+    let blob_path = downloader.blob_path(&file_entry.sha256);
+    assert!(blob_path.is_file());
+}

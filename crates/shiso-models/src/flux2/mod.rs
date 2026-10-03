@@ -24,6 +24,11 @@ pub(crate) mod transformer;
 pub(crate) mod vae;
 pub(crate) mod weights;
 
+use crate::catalog::FamilyFacts;
+
+/// Family facts for Flux2 image generation.
+pub const FACTS: FamilyFacts = FamilyFacts { name: "flux2" };
+
 #[cfg(test)]
 mod config_tests;
 #[cfg(test)]

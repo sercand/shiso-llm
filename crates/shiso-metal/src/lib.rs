@@ -33,6 +33,23 @@ mod run;
 mod stub;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub use device::{MetalBackend, metal_available};
+pub use device::{MetalBackend, device_facts, metal_available};
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
-pub use stub::{MetalBackend, metal_available};
+pub use stub::{MetalBackend, device_facts, metal_available};
+
+/// What the default Metal device says about itself, read without building a
+/// backend.
+///
+/// For deciding whether a model's files can run here before any are fetched:
+/// the GPU family is the feature set kernels are written against, and the
+/// working set is the memory budget a loader has to fit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceFacts {
+    /// The device's marketing name, such as `Apple M1 Max`. Display only.
+    pub name: String,
+    /// The highest Apple GPU family the device supports: 7 is M1, 8 is M2,
+    /// 9 is M3 and M4, 10 is M5.
+    pub apple_family: u32,
+    /// The working set the device recommends for one process, in bytes.
+    pub working_set_bytes: u64,
+}

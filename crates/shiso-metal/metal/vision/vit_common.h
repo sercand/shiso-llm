@@ -35,6 +35,21 @@ static inline float vit_bf16(device const ushort *p) {
     return as_type<float>((uint) (*p) << 16);
 }
 
+// One IEEE half, widened. Exact: every half is a single-precision value.
+static inline float vit_f16(device const ushort *p) {
+    return float(as_type<half>(*p));
+}
+
+// How a tower's weights are stored, as a type the weight-reading kernels are
+// templated on: one body per kernel, instantiated once per storage width.
+// Each entry keeps its brain-float name and gains an `_f16` twin.
+struct vit_w_bf16 {
+    static inline float load(device const ushort *p) { return vit_bf16(p); }
+};
+struct vit_w_f16 {
+    static inline float load(device const ushort *p) { return vit_f16(p); }
+};
+
 /// Inclusive sum over one simdgroup, left-folded in decreasing-offset order so
 /// lane 0 ends up holding the total.  Spelled out instead of using the builtin
 /// because the shading language leaves that summation order unspecified.

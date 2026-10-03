@@ -20,6 +20,7 @@
 mod binding;
 mod ckpt;
 mod config;
+pub mod exl3;
 pub mod fp8;
 pub mod mlx;
 mod model;
@@ -39,3 +40,8 @@ pub use config::{
     shape,
 };
 pub use model::Qwen4ExpModel;
+
+use crate::catalog::FamilyFacts;
+
+/// Family facts for `Qwen4Exp`.
+pub const FACTS: FamilyFacts = FamilyFacts { name: "qwen4exp" };

@@ -81,3 +81,8 @@ pub use mtp::{
 };
 pub use st_names::Qwen35Names;
 pub use vision::Qwen35Tower;
+
+use crate::catalog::FamilyFacts;
+
+/// Family facts for Qwen3.5.
+pub const FACTS: FamilyFacts = FamilyFacts { name: "qwen35" };

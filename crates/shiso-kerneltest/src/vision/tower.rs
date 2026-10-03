@@ -161,6 +161,28 @@ fn bf16_fixture(len: usize, seed: u32) -> (Vec<u8>, Vec<f32>) {
     (bytes, values)
 }
 
+/// A half-precision fixture: the bytes to upload and the values they hold,
+/// for the `_f16` twins.
+fn f16_fixture(len: usize, seed: u32) -> (Vec<u8>, Vec<f32>) {
+    let halves: Vec<half::f16> = oracle::signal(len, seed)
+        .into_iter()
+        .map(half::f16::from_f32)
+        .collect();
+    let bytes = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let values = halves.into_iter().map(half::f16::to_f32).collect();
+    (bytes, values)
+}
+
+/// A weight fixture in the width an entry reads: its `_f16` twin halves,
+/// every other entry brain floats.
+fn weight_fixture(entry: &str, len: usize, seed: u32) -> (Vec<u8>, Vec<f32>) {
+    if entry.ends_with("_f16") {
+        f16_fixture(len, seed)
+    } else {
+        bf16_fixture(len, seed)
+    }
+}
+
 /// Launches one vision kernel with the geometry `KERNELS.md` records for it.
 fn launch(
     gpu: &Gpu,
@@ -214,9 +236,11 @@ fn close(got: &[f32], want: &[f32], what: &str) {
 /// longer compiles breaks every consumer of the module, not just the vision
 /// path, and a typo in an entry-point name is a runtime failure with no
 /// compile-time warning anywhere.
-pub const ENTRIES: [&str; 9] = [
+pub const ENTRIES: [&str; 11] = [
     "kernel_vit_gemm_bias",
+    "kernel_vit_gemm_bias_f16",
     "kernel_vit_layer_norm",
+    "kernel_vit_layer_norm_f16",
     "kernel_vit_gelu_tanh",
     "kernel_vit_gelu_erf",
     "kernel_vit_add_inplace",
@@ -256,9 +280,19 @@ fn gemm_oracle(input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
 
 /// The blocked GEMM agrees with a row-times-column loop.
 pub fn the_blocked_gemm_agrees_with_a_row_times_column_loop(gpu: &Gpu) {
+    run_gemm(gpu, "kernel_vit_gemm_bias");
+}
+
+/// The half-precision tower's GEMM agrees with the same loop over its halves.
+pub fn the_half_precision_gemm_agrees_with_a_row_times_column_loop(gpu: &Gpu) {
+    run_gemm(gpu, "kernel_vit_gemm_bias_f16");
+}
+
+/// Runs one GEMM entry over the fixture, in the width the entry reads.
+fn run_gemm(gpu: &Gpu, entry: &'static str) {
     let input = oracle::signal(GEMM_M * GEMM_K, 11);
-    let (weight_bytes, weight) = bf16_fixture(GEMM_N * GEMM_K, 12);
-    let (bias_bytes, bias) = bf16_fixture(GEMM_N, 13);
+    let (weight_bytes, weight) = weight_fixture(entry, GEMM_N * GEMM_K, 12);
+    let (bias_bytes, bias) = weight_fixture(entry, GEMM_N, 13);
 
     let out = zeros(gpu, GEMM_M * GEMM_N);
     let d_in = gpu.upload(&f32_bytes(&input));
@@ -271,7 +305,7 @@ pub fn the_blocked_gemm_agrees_with_a_row_times_column_loop(gpu: &Gpu) {
     };
     launch(
         gpu,
-        "kernel_vit_gemm_bias",
+        entry,
         Extent3::new(blocks(GEMM_N, GEMM_TILE), blocks(GEMM_M, GEMM_TILE), 1),
         Extent3::new(GEMM_TILE, GEMM_TILE, 1),
         0,
@@ -287,7 +321,7 @@ pub fn the_blocked_gemm_agrees_with_a_row_times_column_loop(gpu: &Gpu) {
     close(
         &gpu.read_f32(&out),
         &gemm_oracle(&input, &weight, &bias),
-        "gemm",
+        entry,
     );
 }
 
@@ -318,10 +352,15 @@ fn layer_norm_oracle(
 
 /// Runs the normalization at one shape, optionally in place.
 fn run_layer_norm(gpu: &Gpu, rows: usize, dim: usize, in_place: bool) {
+    run_layer_norm_entry(gpu, "kernel_vit_layer_norm", rows, dim, in_place);
+}
+
+/// Runs one normalization entry, in the width it reads.
+fn run_layer_norm_entry(gpu: &Gpu, entry: &'static str, rows: usize, dim: usize, in_place: bool) {
     const EPS: f32 = 1e-6;
     let input = oracle::signal(rows * dim, 21);
-    let (weight_bytes, weight) = bf16_fixture(dim, 22);
-    let (bias_bytes, bias) = bf16_fixture(dim, 23);
+    let (weight_bytes, weight) = weight_fixture(entry, dim, 22);
+    let (bias_bytes, bias) = weight_fixture(entry, dim, 23);
 
     let d_in = gpu.upload(&f32_bytes(&input));
     let out = if in_place {
@@ -339,7 +378,7 @@ fn run_layer_norm(gpu: &Gpu, rows: usize, dim: usize, in_place: bool) {
     let dst = out.as_ref().unwrap_or(&d_in);
     launch(
         gpu,
-        "kernel_vit_layer_norm",
+        entry,
         Extent3::linear(rows as u32),
         Extent3::linear(NORM_BLOCK),
         NORM_SMEM,
@@ -375,6 +414,13 @@ pub fn the_normalization_subtracts_the_mean_as_well_as_scaling_by_the_deviation(
 /// The normalization is safe to run over its own input.
 pub fn the_normalization_is_safe_to_run_over_its_own_input(gpu: &Gpu) {
     run_layer_norm(gpu, 6, 1024, true);
+}
+
+/// The half-precision tower's normalization is the same function over its
+/// halves, in place or not.
+pub fn the_half_precision_normalization_agrees_with_the_same_oracle(gpu: &Gpu) {
+    run_layer_norm_entry(gpu, "kernel_vit_layer_norm_f16", 6, 1024, false);
+    run_layer_norm_entry(gpu, "kernel_vit_layer_norm_f16", 5, 100, true);
 }
 
 // -- the activations --------------------------------------------------------
@@ -1097,6 +1143,90 @@ pub fn the_brain_float_bias_repeats_with_its_period(gpu: &Gpu) {
         .map(|(i, v)| v + bf16_to_f32(bias[i % width]))
         .collect();
     close(&gpu.read_f32(&d_x), &want, "brain-float bias");
+}
+
+/// The half-precision split writes each value as its nearest half and the
+/// nearest half to what that left over: the operand a half-precision tower's
+/// BLAS projection reads.
+pub fn the_half_precision_operand_split_sums_back_to_its_input(gpu: &Gpu) {
+    let count = 1000;
+    // Every magnitude a projection operand of the tower reaches.
+    let x: Vec<f32> = oracle::signal(count, 81)
+        .iter()
+        .enumerate()
+        .map(|(i, v)| v * [1e-2, 0.1, 1.0, 10.0, 100.0, 1e3][i % 6])
+        .collect();
+    let d_x = gpu.upload(&f32_bytes(&x));
+    let out = gpu.upload(&vec![0u8; count * 4]);
+    launch(
+        gpu,
+        "kernel_vit_to_f16",
+        Extent3::linear((count as u32).div_ceil(LINEAR_BLOCK)),
+        Extent3::linear(LINEAR_BLOCK),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&CountArgs {
+                count: count as u32,
+            })),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(d_x.view()),
+        ],
+    );
+    drain(gpu);
+    let bytes = gpu.read(&out);
+    let halves: Vec<f32> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| half::f16::from_le_bytes(*pair).to_f32())
+        .collect();
+    for (i, want) in x.iter().enumerate() {
+        let (hi, lo) = (halves[i], halves[count + i]);
+        assert!(
+            (hi - want).abs() <= want.abs() * 2f32.powi(-11),
+            "value {i}: {hi} is not the nearest half to {want}"
+        );
+        // Two halves keep about 22 bits of a value, down to an absolute floor:
+        // a remainder below the smallest subnormal half, 2^-24, rounds to a
+        // multiple of it, so the pair is never further off than half of one.
+        let bound = (want.abs() * 2f32.powi(-21)).max(2f32.powi(-25));
+        assert!(
+            (hi + lo - want).abs() <= bound,
+            "value {i}: {hi} + {lo} does not sum back to {want}"
+        );
+    }
+}
+
+/// The half-precision bias repeats with its period, as the projection's own
+/// epilogue would add it.
+pub fn the_half_precision_bias_repeats_with_its_period(gpu: &Gpu) {
+    let (rows, width) = (5usize, 13usize);
+    let x = oracle::signal(rows * width, 82);
+    let (bias_bytes, bias) = f16_fixture(width, 83);
+    let d_x = gpu.upload(&f32_bytes(&x));
+    let d_bias = gpu.upload(&bias_bytes);
+    launch(
+        gpu,
+        "kernel_vit_add_bias_f16",
+        Extent3::linear(((rows * width) as u32).div_ceil(LINEAR_BLOCK)),
+        Extent3::linear(LINEAR_BLOCK),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&AddArgs {
+                count: (rows * width) as u32,
+                period: width as u32,
+            })),
+            KernelArg::Buffer(d_x.view()),
+            KernelArg::Buffer(d_bias.view()),
+        ],
+    );
+    drain(gpu);
+    let want: Vec<f32> = x
+        .iter()
+        .enumerate()
+        .map(|(i, v)| v + bias[i % width])
+        .collect();
+    close(&gpu.read_f32(&d_x), &want, "half-precision bias");
 }
 
 /// Runs the split and the tensor-core attention over `rows` rows in groups of

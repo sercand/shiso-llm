@@ -17,6 +17,9 @@ shiso-vision = { workspace = true }
 shiso-audio = { workspace = true }
 shiso-parsers = { workspace = true }
 shiso-router = { workspace = true }
+shiso-hub = { workspace = true }
+url = { workspace = true }
+semver = { workspace = true }
 # Declared optional so the `metal` feature below has a dep: target to enable.
 shiso-metal = { workspace = true, optional = true }
 shiso-cuda = { workspace = true, optional = true }
@@ -26,6 +29,7 @@ axum = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
+indicatif = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 minijinja = { workspace = true }

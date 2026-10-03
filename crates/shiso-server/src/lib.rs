@@ -29,6 +29,7 @@ pub mod audio;
 pub mod cli;
 pub mod decision;
 pub mod error;
+pub mod hub;
 pub mod ids;
 pub mod image;
 pub mod media;
@@ -69,10 +70,28 @@ const LOG_ENV: &str = "SHISO_LOG";
 /// build with no backend, a checkpoint that does not load, an address already
 /// in use.
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    run_with_matches(cli, None).await
+}
+
+/// Runs the CLI command, merging matching argument sources when provided (§6.6).
+///
+/// # Errors
+/// Returns an error if the server fails to start, model cannot be resolved,
+/// or hub subcommand encounters an error.
+pub async fn run_with_matches(cli: Cli, matches: Option<clap::ArgMatches>) -> anyhow::Result<()> {
     install_tracing();
     match cli.command {
-        Command::Serve(args) => serve(*args).await,
+        Command::Serve(mut args) => {
+            let serve_matches = matches.as_ref().and_then(|m| m.subcommand_matches("serve"));
+            let _lock = hub::resolve_serve_model(&mut args, serve_matches)?;
+            serve(*args).await
+        }
         Command::Router(args) => router(*args).await,
+        Command::Pull(args) => hub::run_pull(args).await,
+        Command::List(args) => hub::run_list(args).await,
+        Command::Info(args) => hub::run_info(args).await,
+        Command::Verify(args) => hub::run_verify(args).await,
+        Command::Rm(args) => hub::run_rm(&args),
     }
 }
 
@@ -512,6 +531,16 @@ fn load_checkpoint(
     args: &ServeArgs,
     model: &std::path::Path,
 ) -> anyhow::Result<model_factory::Loaded> {
+    // A table nothing reads is an operator who believes a model is using it.
+    if let Some(ngram) = &args.ngram
+        && !model_factory::takes_ngram(config, model)
+    {
+        anyhow::bail!(
+            "--ngram {} was given, but the checkpoint at {} has no n-gram table file to read",
+            ngram.display(),
+            model.display()
+        );
+    }
     let _tag = shiso_core::ledger::scope(shiso_core::MemTag::WeightsOther);
     let started = std::time::Instant::now();
     let loaded = model_factory::load_model(backend, model, config, args)

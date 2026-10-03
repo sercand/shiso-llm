@@ -3,9 +3,11 @@
 //! Everything this file could contain lives in the library instead, so that the
 //! whole server can be driven from a test without a process.
 
-use clap::Parser as _;
+use clap::{CommandFactory as _, FromArgMatches as _};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    shiso_server::run(shiso_server::cli::Cli::parse()).await
+    let matches = shiso_server::cli::Cli::command().get_matches();
+    let cli = shiso_server::cli::Cli::from_arg_matches(&matches)?;
+    shiso_server::run_with_matches(cli, Some(matches)).await
 }
