@@ -925,6 +925,17 @@ function updateCompRev(vIdx, role, val) {
 // Roles a file can hand itself to with `binds`: the flag-bearing ones.
 const BINDABLE_ROLES = ['base', 'draft', 'draft_vocab', 'vision', 'asr', 'asr_mmproj', 'diarization', 'config'];
 
+// The `binds` dropdown for one file: which other role's flag it is passed to.
+// Disabled for a file that is not selected, since only selected files are
+// written to the recipe.
+function bindsSelect(vIdx, role, name, current, disabled) {
+  return `
+    <select style="padding:2px 6px; font-size:11px;" ${disabled ? 'disabled' : ''} onchange="setFileBinds(${vIdx}, '${role}', '${name}', this.value)">
+      <option value="" ${!current ? 'selected' : ''}>-</option>
+      ${BINDABLE_ROLES.filter(r => r !== role).map(r => `<option value="${r}" ${current === r ? 'selected' : ''}>${r}</option>`).join('')}
+    </select>`;
+}
+
 function renderComponentSelectedFilesSummary(vIdx, role, comp) {
   if (!comp.files || comp.files.length === 0) {
     return `<div style="color:var(--text-dim); font-size:12px; font-style:italic;">No files selected yet. Click "Inspect HF Files" to browse and select files for this role.</div>`;
@@ -942,12 +953,7 @@ function renderComponentSelectedFilesSummary(vIdx, role, comp) {
             <td>${formatBytes(f.size)}</td>
             <td><code title="${f.sha256}">${f.sha256.substring(0, 16)}...${f.sha256.substring(56)}</code></td>
             <td>${comp.entry === f.name ? '<span class="badge badge-success">entry</span>' : ''}</td>
-            <td>
-              <select style="padding:2px 6px; font-size:11px;" onchange="setFileBinds(${vIdx}, '${role}', '${f.name}', this.value)">
-                <option value="" ${!f.binds ? 'selected' : ''}>-</option>
-                ${BINDABLE_ROLES.filter(r => r !== role).map(r => `<option value="${r}" ${f.binds === r ? 'selected' : ''}>${r}</option>`).join('')}
-              </select>
-            </td>
+            <td>${bindsSelect(vIdx, role, f.name, f.binds, false)}</td>
           </tr>
         `).join("")}
       </tbody>
@@ -992,6 +998,7 @@ function renderComponentInspectorFilePicker(vIdx, role, data) {
   const outDiv = document.getElementById(`inspector-output-${vIdx}-${role}`);
   const comp = formVariants[vIdx].components[role];
   const selectedNames = new Set(comp.files.map(f => f.name));
+  const boundOf = Object.fromEntries(comp.files.map(f => [f.name, f.binds]));
 
   let rows = data.files.map((f, fIdx) => {
     const isChecked = selectedNames.has(f.name);
@@ -1007,6 +1014,7 @@ function renderComponentInspectorFilePicker(vIdx, role, data) {
         <td style="text-align:center;">
           <input type="radio" name="entry-${vIdx}-${role}" value="${f.name}" ${comp.entry === f.name ? 'checked' : ''} onchange="setComponentEntry(${vIdx}, '${role}', '${f.name}')">
         </td>
+        <td>${bindsSelect(vIdx, role, f.name, boundOf[f.name], !isChecked)}</td>
       </tr>
     `;
   }).join("");
@@ -1033,6 +1041,7 @@ function renderComponentInspectorFilePicker(vIdx, role, data) {
             <th>SHA-256</th>
             <th>Storage</th>
             <th style="text-align:center;">Entry Point</th>
+            <th title="Pass this file to another role's flag, e.g. a vision tower inside the base repository">Binds</th>
           </tr>
         </thead>
         <tbody>
@@ -1081,7 +1090,13 @@ function selectAllComponentFiles(vIdx, role, selectAll) {
 
   const comp = formVariants[vIdx].components[role];
   if (selectAll) {
-    comp.files = inspectedFiles.map(f => ({ name: f.name, size: f.size, sha256: f.sha256 }));
+    // Keep the bindings files already had; only add what was missing.
+    const boundOf = Object.fromEntries(comp.files.map(f => [f.name, f.binds]));
+    comp.files = inspectedFiles.map(f => {
+      const file = { name: f.name, size: f.size, sha256: f.sha256 };
+      if (boundOf[f.name]) file.binds = boundOf[f.name];
+      return file;
+    });
   } else {
     comp.files = [];
     comp.entry = null;
