@@ -266,19 +266,63 @@ async fn a_malformed_size_string_is_refused() {
 }
 
 #[tokio::test]
-async fn a_named_resolution_is_refused_not_normalized() {
-    // The grammar is WxH plus the ratio table and nothing else: "2K" names a
-    // resolution class, not pixels this server defined, so it is a 400 rather
-    // than a guess at what width the caller meant.
-    let (state, _log) = state_with_mock(false);
+async fn a_named_resolution_is_normalized_to_its_square() {
+    // "2K" names a resolution class, and the class has one honest answer on
+    // this surface: the square of 2*1024, read through the same rounding and
+    // clamping as any other size. "4K" names 4096 and lands on the ceiling.
+    let (state, log) = state_with_mock(false);
     let (status, body) = post_json(
         state,
         "/v1/images/generations",
         json!({"prompt": "a red door", "size": "2K"}),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["param"], "size", "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let jobs = log.recorded();
+    assert_eq!((jobs[0].width, jobs[0].height), (2048, 2048));
+
+    let (state, log) = state_with_mock(false);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "size": "4k"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let jobs = log.recorded();
+    assert_eq!(
+        (jobs[0].width, jobs[0].height),
+        (2048, 2048),
+        "4K clamps to the servable ceiling rather than being refused"
+    );
+}
+
+#[tokio::test]
+async fn an_auto_size_is_an_omitted_size() {
+    // "auto" is the caller asking for the server's default, so it gets what
+    // an omitted size gets; and where a default is not the question - an
+    // aspect ratio is named - it steps aside exactly as an omitted size does.
+    let (state, log) = state_with_mock(false);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "size": "auto"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let jobs = log.recorded();
+    assert_eq!((jobs[0].width, jobs[0].height), (1024, 1024));
+
+    let (state, log) = state_with_mock(false);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "size": "AUTO", "aspect_ratio": "16:9"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let jobs = log.recorded();
+    assert_eq!((jobs[0].width, jobs[0].height), (1344, 768));
 }
 
 #[tokio::test]

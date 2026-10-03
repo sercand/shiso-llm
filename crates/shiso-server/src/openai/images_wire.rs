@@ -32,7 +32,8 @@ pub struct ImageGenerationRequest {
     /// Number of images to generate (1-10).
     #[serde(default)]
     pub n: Option<usize>,
-    /// Output dimensions, e.g. "1024x1024", "512x512", or a named aspect ratio.
+    /// Output dimensions, e.g. "1024x1024", "512x512", a named aspect ratio,
+    /// or a named resolution ("2K"). `"auto"` asks for the server default.
     #[serde(default)]
     pub size: Option<String>,
     /// Aspect ratio, e.g. "1:1", "16:9", "9:16".

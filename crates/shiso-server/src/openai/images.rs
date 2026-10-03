@@ -11,11 +11,13 @@
 //! # What the wire values become
 //!
 //! The size grammar lives in [`crate::image::size`]: `WxH` is rounded to the
-//! generator's 16-grid and clamped to its bounds, and the named aspect ratios
-//! become the table's concrete pixels. `steps` has no wire field at all - the
-//! operator's `--image-default-steps` is the only say in it. `quality`,
-//! `user` and `session_id` are accepted and unused, each for the reason
-//! spelled out on the wire field.
+//! generator's 16-grid and clamped to its bounds, the named aspect ratios
+//! become the table's concrete pixels, and a named resolution (`2K`) becomes
+//! its square. A size of `auto` is an omitted size: the caller gets the
+//! server default. `steps` has no wire field at all - the operator's
+//! `--image-default-steps` is the only say in it. `quality`, `user` and
+//! `session_id` are accepted and unused, each for the reason spelled out on
+//! the wire field.
 //!
 //! # Why a streamed request waits for its first frame
 //!
@@ -137,7 +139,15 @@ impl Plan {
     /// [`AppError::BadRequest`] for a size string neither shape, and for an
     /// output format the generator does not encode.
     fn from_wire(parsed: &ImageGenerationRequest, state: &AppState) -> Result<Self, AppError> {
-        let (width, height) = match (parsed.size.as_deref(), parsed.aspect_ratio.as_deref()) {
+        // `auto` is an omitted size: the caller is asking for this server's
+        // default, which is exactly what an omitted size gets. It is read
+        // out here rather than in the grammar because the grammar has no
+        // business knowing what the default is.
+        let size = parsed
+            .size
+            .as_deref()
+            .filter(|value| !size::is_auto(value));
+        let (width, height) = match (size, parsed.aspect_ratio.as_deref()) {
             // `size` wins when both are named: it is the more specific of the
             // two, and a client that sends both wants the pixels it spelled.
             (Some(value), _) => {
