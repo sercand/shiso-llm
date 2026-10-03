@@ -54,6 +54,75 @@ const DEFAULT_CHAT_TEMPLATE: &str = concat!(
     "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
 );
 
+/// Answers the Python-shaped string methods a checkpoint's chat template
+/// calls (`startswith`, `split`, `strip('\n')`, ...) that the Rust engine
+/// exposes only as filters or not at all. Mirrors the server's tokenizer
+/// bridge; it is duplicated rather than shared because `shiso-models` must
+/// not depend on `shiso-server`, and the templates — not our code — decide
+/// which methods exist. An argument is treated as a Python character set,
+/// which is what the Qwen3-family templates pass (`'\n'`).
+fn bridge_python_methods(
+    _state: &minijinja::State<'_, '_>,
+    value: &minijinja::Value,
+    method: &str,
+    args: &[minijinja::Value],
+) -> Result<minijinja::Value, minijinja::Error> {
+    use minijinja::value::{ValueKind, from_args};
+    if value.kind() != ValueKind::String {
+        return Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod));
+    }
+    let text = value.as_str().unwrap_or_default();
+    match method {
+        "startswith" => {
+            let (prefix,): (String,) = from_args(args)?;
+            Ok(minijinja::Value::from(text.starts_with(&prefix)))
+        }
+        "endswith" => {
+            let (suffix,): (String,) = from_args(args)?;
+            Ok(minijinja::Value::from(text.ends_with(&suffix)))
+        }
+        "replace" => {
+            let (from, to): (String, String) = from_args(args)?;
+            Ok(minijinja::Value::from(text.replace(&from, &to)))
+        }
+        "strip" | "lstrip" | "rstrip" => {
+            let (chars,): (Option<String>,) = from_args(args)?;
+            let stripped = match chars.as_deref() {
+                Some(set) if !set.is_empty() => match method {
+                    "strip" => text.trim_matches(|c| set.contains(c)),
+                    "lstrip" => text.trim_start_matches(|c| set.contains(c)),
+                    _ => text.trim_end_matches(|c| set.contains(c)),
+                },
+                // Python's no-argument form strips whitespace; an empty
+                // character set is a no-op, matching `strip('')`.
+                _ => match method {
+                    "strip" => text.trim(),
+                    "lstrip" => text.trim_start(),
+                    _ => text.trim_end(),
+                },
+            };
+            Ok(minijinja::Value::from(stripped))
+        }
+        "split" => {
+            let (sep,): (Option<String>,) = from_args(args)?;
+            let parts: Vec<String> = match sep.as_deref() {
+                Some(s) if !s.is_empty() => text.split(s).map(str::to_owned).collect(),
+                // No separator (or the empty string): Python splits on
+                // runs of whitespace, which is how the thinking-block
+                // templates never hit this path anyway.
+                _ => text.split_whitespace().map(str::to_owned).collect(),
+            };
+            Ok(minijinja::Value::from(parts))
+        }
+        _ => Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod)),
+    }
+}
+
+/// The system turn the reference pipeline renders before the prompt. The
+/// text encoder's tapped hidden states were conditioned on this turn during
+/// training, so dropping it shifts the context the transformer reads.
+const SYSTEM_MESSAGE: &str = "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object attribution and actions without speculation.";
+
 /// The FLUX.2-klein 4B generator: text encoder, transformer and VAE on one
 /// device, driven one job at a time.
 #[derive(Debug)]
@@ -156,19 +225,26 @@ impl Flux2KleinModel {
         })
     }
 
-    /// Renders the template with the content slot filled by [`CONTENT_MARK`]
-    /// and splits the result around it, giving the text before and after the
-    /// caller's words.
+    /// Renders the template with the reference pipeline's system turn and the
+    /// content slot filled by [`CONTENT_MARK`], and splits the result around
+    /// the mark, giving the text before and after the caller's words. The
+    /// generation prompt stays on: the assistant turn opener (and, for the
+    /// Qwen3 template with thinking disabled, its empty `think` block) belongs
+    /// to the tail that encodes after the prompt.
     fn render(&self) -> Result<(String, String), ImageGenError> {
         let mut env = minijinja::Environment::new();
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
+        env.set_unknown_method_callback(bridge_python_methods);
         let template = env
             .template_from_str(&self.chat_template)
             .map_err(|e| ImageGenError::Checkpoint(format!("chat template: {e}")))?;
         let rendered = template
             .render(serde_json::json!({
-                "messages": [{ "role": "user", "content": CONTENT_MARK.to_string() }],
+                "messages": [
+                    { "role": "system", "content": SYSTEM_MESSAGE },
+                    { "role": "user", "content": CONTENT_MARK.to_string() },
+                ],
                 "add_generation_prompt": true,
                 "enable_thinking": false,
             }))
@@ -280,9 +356,12 @@ impl ImageGenerator for Flux2KleinModel {
         noise.truncate(latent_count);
         let mut latents = self.ops.upload_f32("pipeline noise", &noise)?;
 
-        // 4-axis positions: image tokens carry (frame 0, row, column, 0),
-        // text tokens (frame 1, index, 0, 0); single blocks run the joint
-        // sequence text-first.
+        // 4-axis positions, matching the reference's id prep: image tokens
+        // carry (frame 0, row, column, 0) from `_prepare_latent_ids`, text
+        // tokens (0, 0, 0, index) from `_prepare_text_ids` - a cartesian
+        // product of t=[0], h=[0], w=[0] and l=arange(L), so the sequence
+        // index rides the fourth axis, not the second. Single blocks run the
+        // joint sequence text-first.
         let mut img_positions = Vec::with_capacity(t_img * 4);
         for token in 0..t_img {
             let (li, lj) = (token / wl, token % wl);
@@ -290,7 +369,7 @@ impl ImageGenerator for Flux2KleinModel {
         }
         let mut txt_positions = Vec::with_capacity(t_txt * 4);
         for token in 0..t_txt {
-            txt_positions.extend_from_slice(&[1.0, token as f32, 0.0, 0.0]);
+            txt_positions.extend_from_slice(&[0.0, 0.0, 0.0, token as f32]);
         }
         let mut joint_positions = txt_positions.clone();
         joint_positions.extend_from_slice(&img_positions);

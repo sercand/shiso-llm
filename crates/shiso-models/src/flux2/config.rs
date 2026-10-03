@@ -108,7 +108,10 @@ pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGe
     // multi-shard export may carry the signature tensor (or any FP8 weight)
     // in a later shard, and the pipeline's weight store indexes the whole
     // directory the same way, so inspecting a subset would refuse a
-    // checkpoint that then loads fine.
+    // checkpoint that then loads fine. `safetensors_in` lists root-level
+    // files only, so a checkpoint home that also carries `vae/` or
+    // `text_encoder/` subfolders never has their shards folded into the
+    // transformer store (or its dtype scan).
     let dir = weights_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -334,29 +337,53 @@ pub(crate) fn count_blocks_internal<'a>(
     max_idx.map(|m| m + 1)
 }
 
+/// The tensor that marks a store as a transformer this loader can read: the
+/// upstream patchify input projection. A file without it carries a different
+/// tensor layout (a diffusers-name conversion), which the loader refuses.
+const SIGNATURE_TENSOR: &str = "img_in.weight";
+
+/// Picks the safetensors file holding the transformer weights by inspecting
+/// headers, never names-by-convention: root-level files are tried before a
+/// `transformer/` subfolder, and the winner is the first whose header carries
+/// [`SIGNATURE_TENSOR`] (or its `transformer.`-prefixed spelling). A directory
+/// whose candidates all lack it is refused by file name: a diffusers-layout
+/// export would index every tensor under names the loader never asks for and
+/// either fail mid-load or, worse, run a half-populated model, so guessing
+/// from the directory shape is not an option.
 fn find_transformer_weights(path: &Path) -> Result<PathBuf, ImageGenError> {
     if path.is_file() {
         return Ok(path.to_path_buf());
     }
-    let nested = path.join("transformer");
-    let from_nested = nested
-        .is_dir()
-        .then(|| first_safetensors(&nested))
-        .flatten();
-    if let Some(found) = from_nested {
-        return Ok(found);
+    let mut candidates = safetensors_in(path);
+    candidates.extend(safetensors_in(&path.join("transformer")));
+    if candidates.is_empty() {
+        return Err(ImageGenError::Checkpoint(format!(
+            "no safetensors weight file found in {}",
+            path.display()
+        )));
     }
-    if let Some(found) = first_safetensors(path) {
-        return Ok(found);
+    for file in &candidates {
+        let (_shard, tensors) = Shard::open_untagged(file)
+            .map_err(|e| ImageGenError::Checkpoint(format!("opening {}: {e}", file.display())))?;
+        if tensors.iter().any(|(name, _)| {
+            name == SIGNATURE_TENSOR || name == &format!("transformer.{SIGNATURE_TENSOR}")
+        }) {
+            return Ok(file.clone());
+        }
     }
     Err(ImageGenError::Checkpoint(format!(
-        "no safetensors weight file found in {}",
-        path.display()
+        "no safetensors file under {} carries the upstream transformer tensor \
+         '{SIGNATURE_TENSOR}'; found [{}], which is not the upstream tensor layout \
+         (diffusers-name conversions are not supported)",
+        path.display(),
+        candidates
+            .iter()
+            .map(|p| p
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>()
+            .join(", "),
     )))
-}
-
-fn first_safetensors(dir: &Path) -> Option<PathBuf> {
-    safetensors_in(dir).into_iter().next()
 }
 
 /// Every `*.safetensors` file in `dir`, sorted so a multi-shard export always

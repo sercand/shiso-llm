@@ -160,7 +160,8 @@ impl StStore {
     /// Reads a small tensor as `f32` values, widening `BF16` and `F16` exactly.
     ///
     /// This is for the family's short vectors - norms, biases, statistics -
-    /// not for linear weights, which are imported whole in their stored format.
+    /// and, through [`StStore::f32_widen`], the f32-run VAE's kernels; the
+    /// transformer's linear weights are imported whole in their stored format.
     pub(crate) fn f32_vec(&self, name: &str) -> Result<Vec<f32>, ImageGenError> {
         let entry = self.require(name)?;
         let bytes = self.bytes(name)?;
@@ -198,6 +199,25 @@ impl StStore {
             )));
         }
         Ok(values)
+    }
+
+    /// Reads a tensor as f32 and uploads it as an f32 buffer, widening
+    /// `BF16` and `F16` exactly.
+    ///
+    /// This is the import for a component that runs in f32 out of a
+    /// checkpoint that stores it in `BF16` (the VAE decoder): widening is
+    /// lossless, so the zero-dequant rule - which protects *quantized*
+    /// formats from being flattened into f32 - is not engaged. `F8_E4M3`
+    /// still refuses here, because reading it as f32 would be a
+    /// dequantization; those weights stay native in the transformer.
+    pub(crate) fn f32_widen(
+        &self,
+        ops: &Ops,
+        step: &'static str,
+        name: &str,
+    ) -> Result<DeviceBuffer, ImageGenError> {
+        let values = self.f32_vec(name)?;
+        ops.upload_f32(step, &values)
     }
 
     /// The per-tensor FP8 scale companion of `name`, or 1.0 when the tensor is

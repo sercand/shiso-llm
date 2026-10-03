@@ -7,8 +7,16 @@
 //! (32, H/8, W/8). Then the device runs the convolutional decoder -
 //! `post_quant_conv`, `conv_in`, the mid block (resnet, single-head spatial
 //! attention, resnet), the up blocks with their resnets and nearest
-//! upsamplers, and the final norm/conv - entirely in f32, the format the VAE
-//! stores. Finally the RGB field is read back and clamped.
+//! upsamplers, and the final norm/conv - entirely in f32. Finally the RGB
+//! field is read back and clamped.
+//!
+//! The decoder runs f32 by plan decision, while the shipped checkpoints store
+//! the whole VAE in `BF16`. Every VAE tensor is therefore imported through
+//! the widening read: `BF16` to `F32` is lossless (the wider format holds
+//! every `BF16` value exactly), so the zero-dequant constraint - which
+//! protects *quantized* formats like `F8_E4M3` from being flattened into f32
+//! and stays native in the `DiT` - is not engaged. A quantized VAE is refused
+//! by the widening read rather than silently dequantized.
 //!
 //! Every channel width, kernel size and block count is read from the weight
 //! shapes; the only config value consulted is the group count, which no
@@ -100,7 +108,8 @@ struct VaeConfig {
     norm_num_groups: Option<usize>,
 }
 
-/// Reads one f32 convolution weight and its bias.
+/// Reads one convolution weight and its bias, widened to the f32 the decoder
+/// runs in (see the module doc: `BF16` checkpoints widen losslessly).
 #[expect(
     clippy::cast_possible_truncation,
     reason = "safetensors dims are element counts of conv kernels; they fit usize on any supported target"
@@ -108,12 +117,6 @@ struct VaeConfig {
 fn load_conv(store: &StStore, ops: &Ops, name: &str) -> Result<Conv, ImageGenError> {
     let weight_name = format!("{name}.weight");
     let entry = store.require(&weight_name)?;
-    if entry.dtype != shiso_modelfile::st_header::StDType::F32 {
-        return Err(ImageGenError::Checkpoint(format!(
-            "VAE conv '{weight_name}' is {:?}, but the decoder runs f32",
-            entry.dtype
-        )));
-    }
     let shape = &entry.shape;
     let (out_c, in_c, k_h, k_w) = (
         *shape
@@ -128,9 +131,9 @@ fn load_conv(store: &StStore, ops: &Ops, name: &str) -> Result<Conv, ImageGenErr
     );
     let bias_name = format!("{name}.bias");
     Ok(Conv {
-        w: store.import(ops.backend(), &weight_name)?,
+        w: store.f32_widen(ops, "vae conv weight", &weight_name)?,
         bias: if store.contains(&bias_name) {
-            Some(store.import(ops.backend(), &bias_name)?)
+            Some(store.f32_widen(ops, "vae conv bias", &bias_name)?)
         } else {
             None
         },
@@ -141,22 +144,22 @@ fn load_conv(store: &StStore, ops: &Ops, name: &str) -> Result<Conv, ImageGenErr
     })
 }
 
-/// Reads a group-norm affine pair (both f32 vectors of `channels`).
+/// Reads a group-norm affine pair (both widened to the f32 the decoder runs
+/// in), uploaded as vectors of `channels`.
 fn load_norm(
     store: &StStore,
-    backend: &std::sync::Arc<dyn shiso_core::Backend>,
+    ops: &Ops,
     name: &str,
 ) -> Result<(DeviceBuffer, DeviceBuffer), ImageGenError> {
     Ok((
-        store.import(backend, &format!("{name}.weight"))?,
-        store.import(backend, &format!("{name}.bias"))?,
+        store.f32_widen(ops, "vae norm affine", &format!("{name}.weight"))?,
+        store.f32_widen(ops, "vae norm affine", &format!("{name}.bias"))?,
     ))
 }
 
 fn load_resnet(store: &StStore, ops: &Ops, base: &str) -> Result<Resnet, ImageGenError> {
-    let backend = ops.backend();
-    let (norm1_w, norm1_b) = load_norm(store, backend, &format!("{base}norm1"))?;
-    let (norm2_w, norm2_b) = load_norm(store, backend, &format!("{base}norm2"))?;
+    let (norm1_w, norm1_b) = load_norm(store, ops, &format!("{base}norm1"))?;
+    let (norm2_w, norm2_b) = load_norm(store, ops, &format!("{base}norm2"))?;
     Ok(Resnet {
         norm1_w,
         norm1_b,
@@ -176,7 +179,6 @@ impl Vae {
     /// Opens the VAE component at `path`.
     pub(crate) fn load(path: &Path, ops: &Ops) -> Result<Self, ImageGenError> {
         let store = StStore::open(path)?;
-        let backend = ops.backend();
         let config: VaeConfig = read_json(&path.join("config.json")).unwrap_or(VaeConfig {
             norm_num_groups: None,
         });
@@ -207,9 +209,18 @@ impl Vae {
         let (norm_w, norm_b) = {
             let n = format!("{attn_base}{norm_base}");
             (
-                store.import(backend, &format!("{n}.weight"))?,
-                store.import(backend, &format!("{n}.bias"))?,
+                store.f32_widen(ops, "vae norm affine", &format!("{n}.weight"))?,
+                store.f32_widen(ops, "vae norm affine", &format!("{n}.bias"))?,
             )
+        };
+        // The reference names the attention output projection `to_out.0`
+        // (a Sequential); an export that flattened it may carry the upstream
+        // `out` instead. Try the reference spelling first, fall back to the
+        // upstream one, and let a miss on both surface as `to_out.0`'s error.
+        let out_base = if store.contains(&format!("{attn_base}to_out.0.weight")) {
+            "to_out.0"
+        } else {
+            "out"
         };
         let mid_attn = AttnBlock {
             norm_w,
@@ -217,7 +228,7 @@ impl Vae {
             q: load_conv(&store, ops, &format!("{attn_base}to_q"))?,
             k: load_conv(&store, ops, &format!("{attn_base}to_k"))?,
             v: load_conv(&store, ops, &format!("{attn_base}to_v"))?,
-            out: load_conv(&store, ops, &format!("{attn_base}proj_out"))?,
+            out: load_conv(&store, ops, &format!("{attn_base}{out_base}"))?,
         };
 
         let depth = store
@@ -244,8 +255,8 @@ impl Vae {
             up_blocks.push(UpBlock { resnets, upsample });
         }
 
-        let norm_out_w = store.import(backend, "decoder.conv_norm_out.weight")?;
-        let norm_out_b = store.import(backend, "decoder.conv_norm_out.bias")?;
+        let norm_out_w = store.f32_widen(ops, "vae norm affine", "decoder.conv_norm_out.weight")?;
+        let norm_out_b = store.f32_widen(ops, "vae norm affine", "decoder.conv_norm_out.bias")?;
         let conv_out = load_conv(&store, ops, "decoder.conv_out")?;
 
         Ok(Self {
@@ -398,6 +409,14 @@ impl Vae {
             "vae out",
         )?;
         let out = ops.download("vae readback", rgb.view(), 3 * spatial)?;
+        // The decoder was trained to emit an image in [-1, 1]; the reference
+        // clamps there before the pipeline maps to [0, 255]. Doing the map
+        // here keeps the encoder's [0, 255] contract on this function's doc
+        // honest instead of letting a [-1, 1] field clamp to black.
+        let out: Vec<f32> = out
+            .iter()
+            .map(|v| (v.clamp(-1.0, 1.0) + 1.0) * 127.5)
+            .collect();
         Ok(out)
     }
 
@@ -427,6 +446,20 @@ impl Vae {
                 hl * wl * zc * 4
             )));
         }
+        // The batch-norm statistics live in the PACKED space: the reference
+        // `AutoEncoder` normalises with a BatchNorm2d over `prod(ps) *
+        // z_channels` = 128 features and `inv_normalize` runs before the
+        // unpack, so entry `f` of the stats belongs to packed feature `f`,
+        // not to latent channel `f / 4`.
+        if self.bn_mean.len() != zc * 4 {
+            return Err(ImageGenError::Checkpoint(format!(
+                "bn statistics cover {} features, expected {} ({} latent channels x 4 \
+                 patch positions)",
+                self.bn_mean.len(),
+                zc * 4,
+                zc
+            )));
+        }
         let mut z = vec![0f32; zc * height / 8 * width / 8];
         let oh = height / 8;
         let ow = width / 8;
@@ -437,7 +470,7 @@ impl Vae {
                 let (pi, pj) = (p / 2, p % 2);
                 let raw = latents[token * zc * 4 + f];
                 z[(c * oh + 2 * li + pi) * ow + 2 * lj + pj] =
-                    raw * self.bn_std[c] + self.bn_mean[c];
+                    raw * self.bn_std[f] + self.bn_mean[f];
             }
         }
         Ok(z)
