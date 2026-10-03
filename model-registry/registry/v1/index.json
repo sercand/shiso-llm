@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-03T11:11:25.531823Z",
+  "models": [
+    {
+      "name": "qwen3.5-9b",
+      "aliases": [
+        "qwen3.5"
+      ],
+      "family": "qwen35",
+      "min_shiso_version": "0.1.0",
+      "description": "Hybrid-attention chat model with MTP draft head and vision tower",
+      "tags": [
+        "vision",
+        "tools",
+        "speculative"
+      ],
+      "tasks": [
+        "chat"
+      ],
+      "inputs": [
+        "text",
+        "image",
+        "video"
+      ],
+      "outputs": [
+        "text"
+      ],
+      "updated_at": "2026-10-03T14:11:15+03:00",
+      "manifest_sha256": "78ead43c3006ef76add8579e7929677df48fc75558873774935aba1f6d46b445",
+      "variants": [
+        {
+          "key": "metal-mlx4",
+          "backend": "metal",
+          "quant": "mlx-4bit",
+          "min_ram_bytes": 10737418240,
+          "disk_bytes": 6291433877
+        },
+        {
+          "key": "cuda-fp8",
+          "backend": "cuda",
+          "quant": "fp8",
+          "min_ram_bytes": 17179869184,
+          "disk_bytes": 10211427042,
+          "min_cuda_sm": 89
+        }
+      ]
+    }
+  ]
+}

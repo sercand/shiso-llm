@@ -52,12 +52,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Build(args) => {
             let out = args.out.unwrap_or_else(|| args.repo.join("registry/v1"));
-            let res = editor::build_registry(
-                &args.repo,
-                &out,
-                Some(&args.sign_key),
-                args.allow_dirty,
-            )?;
+            let res =
+                editor::build_registry(&args.repo, &out, Some(&args.sign_key), args.allow_dirty)?;
             println!(
                 "Build succeeded: {} model(s) compiled into {}",
                 res.models_count,
