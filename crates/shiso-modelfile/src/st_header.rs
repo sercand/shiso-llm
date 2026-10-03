@@ -76,6 +76,12 @@ pub enum StDType {
     /// Signed 64-bit integers: the sparse family's n-gram hash tables (its
     /// multipliers, head offsets and head sizes) are stored this way.
     I64,
+    /// Signed 16-bit words: how the trellis export stores its tiles, which
+    /// are bit fields and not numbers.
+    I16,
+    /// Signed 32-bit integers: the trellis export's per-projection codebook
+    /// word.
+    I32,
 }
 
 impl StDType {
@@ -90,6 +96,8 @@ impl StDType {
             "U8" => Some(Self::U8),
             "F8_E4M3" => Some(Self::F8E4M3),
             "I64" => Some(Self::I64),
+            "I16" => Some(Self::I16),
+            "I32" => Some(Self::I32),
             _ => None,
         }
     }
@@ -99,15 +107,15 @@ impl StDType {
     pub const fn size(self) -> u64 {
         match self {
             Self::U8 | Self::F8E4M3 => 1,
-            Self::Bf16 | Self::F16 => 2,
-            Self::F32 | Self::U32 => 4,
+            Self::Bf16 | Self::F16 | Self::I16 => 2,
+            Self::F32 | Self::U32 | Self::I32 => 4,
             Self::I64 => 8,
         }
     }
 }
 
 /// Every spelling [`StDType::parse`] accepts, for the error a refusal carries.
-const SPELLINGS: &str = "one of BF16, F16, F32, U32, U8, F8_E4M3, I64";
+const SPELLINGS: &str = "one of BF16, F16, F32, U32, U8, F8_E4M3, I64, I16, I32";
 
 /// One tensor as the shard header describes it, before translation.
 #[derive(Debug, Deserialize)]
@@ -170,6 +178,9 @@ pub struct Shard {
     path: PathBuf,
     /// The mapping itself.
     map: Mmap,
+    /// The file the mapping was taken over, kept open so its pages can be
+    /// dropped from the page cache once a copy of them is all that is read.
+    file: File,
     /// First byte of tensor payloads, just past the header.
     payload_base: u64,
 }
@@ -245,6 +256,7 @@ impl Shard {
             Self {
                 path: path.to_path_buf(),
                 map,
+                file,
                 payload_base,
             },
             tensors,
@@ -299,6 +311,16 @@ impl Shard {
         self.map.len()
     }
 
+    /// Drops `range` of the mapping from this process and from the page
+    /// cache, where the kernel will.
+    ///
+    /// For a loader that has copied those bytes somewhere of its own: kept
+    /// cached, they are memory the next allocation has to reclaim first. The
+    /// bytes stay readable; a later read faults them back in.
+    pub fn release_cached(&self, range: std::ops::Range<usize>) {
+        crate::reader::release_pages(&self.map, &self.file, range);
+    }
+
     /// Whether the mapping is empty, which a real shard never is.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -344,7 +366,7 @@ impl fmt::Debug for Shard {
             .field("path", &self.path)
             .field("len", &self.map.len())
             .field("payload_base", &self.payload_base)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
