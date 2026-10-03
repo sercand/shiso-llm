@@ -55,12 +55,15 @@ pub struct ImageDefaults {
 
 impl Default for ImageDefaults {
     /// The published defaults: [`DEFAULT_STEPS`] and the parsed form of
-    /// [`DEFAULT_SIZE`]. A test pins that the two spellings stay one fact.
+    /// [`DEFAULT_SIZE`], so the flag's published spelling and the struct's
+    /// default are one fact by construction rather than by test.
     fn default() -> Self {
+        let (width, height) = size::parse_exact_size(DEFAULT_SIZE)
+            .expect("the published default size is servable by its own grammar");
         Self {
             steps: DEFAULT_STEPS,
-            width: 1024,
-            height: 1024,
+            width,
+            height,
         }
     }
 }
@@ -237,22 +240,17 @@ struct GeneratorPanicked;
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_SIZE, DEFAULT_STEPS, ImageDefaults, size};
+    use super::ImageDefaults;
 
-    /// The struct's hardcoded default and the published flag string are one
-    /// fact; a change to one without the other would make a booted server and
-    /// a test-built state answer a name-nothing request differently.
+    /// The defaults a booted server and a test-built state both hand to a
+    /// name-nothing request are the pixels and the step count the CLI help
+    /// publishes. The struct derives them from `DEFAULT_SIZE` and
+    /// `DEFAULT_STEPS`, so what this pins is those constants themselves: a
+    /// change here has to be a deliberate edit of the published values.
     #[test]
     fn the_default_defaults_are_the_published_ones() {
-        let (width, height) = size::parse_exact_size(DEFAULT_SIZE)
-            .expect("the published default size is servable by its own grammar");
-        assert_eq!(
-            ImageDefaults::default(),
-            ImageDefaults {
-                steps: DEFAULT_STEPS,
-                width,
-                height,
-            }
-        );
+        let defaults = ImageDefaults::default();
+        assert_eq!((defaults.width, defaults.height), (1024, 1024));
+        assert_eq!(defaults.steps, 4);
     }
 }
