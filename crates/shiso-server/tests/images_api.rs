@@ -173,7 +173,11 @@ impl ImageGenerator for GateGenerator {
         }
         // Waits for the test's token; when the test drops the sender the
         // wait ends and the job completes.
-        let _gone = self.gate.lock().expect("the gate lock is never poisoned").recv();
+        let _gone = self
+            .gate
+            .lock()
+            .expect("the gate lock is never poisoned")
+            .recv();
         Ok(GeneratedImage {
             bytes: png_bytes(),
             media_type: "image/png",
@@ -264,12 +268,10 @@ async fn images_endpoint_returns_503_when_no_image_model() {
     // no generator is loaded.
     for uri in ["/images", "/v1/images", "/v1/images/generations"] {
         let state = Arc::new(AppState::without_language_model());
-        let (status, body) =
-            post_json(state, uri, json!({"prompt": "a futuristic city"})).await;
+        let (status, body) = post_json(state, uri, json!({"prompt": "a futuristic city"})).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
         assert_eq!(
-            body["error"]["code"],
-            "image_model_not_loaded",
+            body["error"]["code"], "image_model_not_loaded",
             "{uri}: {body}"
         );
     }
@@ -430,8 +432,7 @@ async fn a_compression_outside_one_to_hundred_is_refused() {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "c={compression}: {body}");
         assert_eq!(
-            body["error"]["param"],
-            "output_compression",
+            body["error"]["param"], "output_compression",
             "c={compression}: {body}"
         );
     }
@@ -536,7 +537,9 @@ async fn a_buffered_request_that_meets_a_full_queue_is_all_or_nothing() {
     tokio::spawn(async move {
         let _gone = blocker.generate(filler_job()).await;
     });
-    started_rx.await.expect("the worker is inside the blocking job");
+    started_rx
+        .await
+        .expect("the worker is inside the blocking job");
     // Then fill the one queue slot. On this current-thread runtime a yield
     // runs the spawned task past its `try_send` and to its answer await, so
     // the slot is observably full before the request is sent (the

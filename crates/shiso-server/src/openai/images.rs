@@ -147,10 +147,7 @@ impl Plan {
         // default, which is exactly what an omitted size gets. It is read
         // out here rather than in the grammar because the grammar has no
         // business knowing what the default is.
-        let size = parsed
-            .size
-            .as_deref()
-            .filter(|value| !size::is_auto(value));
+        let size = parsed.size.as_deref().filter(|value| !size::is_auto(value));
         let (width, height) = match (size, parsed.aspect_ratio.as_deref()) {
             // `size` wins when both are named: it is the more specific of the
             // two, and a client that sends both wants the pixels it spelled.
@@ -402,11 +399,7 @@ async fn run_stream(
 /// it is the first item and still answers as a status code; after the 200 is
 /// spent it goes out as the error frame and the terminator, because a stream
 /// cannot take its 200 back.
-fn fail(
-    tx: &mpsc::UnboundedSender<Result<Event, AppError>>,
-    error: AppError,
-    streaming: bool,
-) {
+fn fail(tx: &mpsc::UnboundedSender<Result<Event, AppError>>, error: AppError, streaming: bool) {
     if !streaming {
         let _ = tx.send(Err(error));
         return;
