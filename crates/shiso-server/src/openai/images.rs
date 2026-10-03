@@ -234,6 +234,13 @@ impl UsageTotals {
 ///
 /// In turn, not at once: the service runs one generation at a time anyway,
 /// and a caller that asked for three gets them in request order.
+///
+/// All-or-nothing: an overload partway through an `n > 1` request answers
+/// the whole request with the 503 and no image body. A JSON body carrying
+/// fewer than the `n` images the caller asked for would be a silent
+/// contract violation - the caller could not tell a partial success from a
+/// truncated list - so the refusal is the whole answer and a retry redoes
+/// the lot.
 async fn buffered(service: &ImageService, plan: &Plan) -> Result<Response, AppError> {
     let mut data = Vec::with_capacity(plan.n);
     let mut usage = UsageTotals::default();

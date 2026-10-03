@@ -15,18 +15,35 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use serde_json::json;
+use shiso_core::ids::Seed;
 use shiso_server::image::size::normalize_size;
 use shiso_server::image::{ImageService, ImageServiceDesc};
 use shiso_server::router::build_router;
 use shiso_server::state::AppState;
 use shiso_vision::generator::{
-    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageStepEvent,
+    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat,
+    ImageStepEvent,
 };
 use tower::ServiceExt as _;
 
 /// The encoded bytes the mock hands back: a PNG signature, no pixels.
 fn png_bytes() -> Vec<u8> {
     vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+}
+
+/// A servable job that is not the request under test: how the worker and
+/// the queue are occupied before a request arrives.
+fn filler_job() -> ImageGenerationJob {
+    ImageGenerationJob {
+        prompt: "filler".to_owned(),
+        width: 256,
+        height: 256,
+        steps: 1,
+        seed: Seed::new(1),
+        output_format: ImageOutputFormat::Png,
+        output_compression: None,
+        input_references: Vec::new(),
+    }
 }
 
 /// A generator that records every job it is handed, so a test can read the
@@ -369,16 +386,25 @@ async fn an_auto_size_is_an_omitted_size() {
 }
 
 #[tokio::test]
-async fn a_compression_outside_zero_to_hundred_is_refused() {
-    let (state, _log) = state_with_mock(false);
-    let (status, body) = post_json(
-        state,
-        "/v1/images/generations",
-        json!({"prompt": "a red door", "output_compression": 101}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["param"], "output_compression", "{body}");
+async fn a_compression_outside_one_to_hundred_is_refused() {
+    // Zero is refused, not clamped: a quality of zero has no encoding to
+    // mean it, and silently encoding at quality 1 would answer a request
+    // nobody made.
+    for compression in [0, 101] {
+        let (state, _log) = state_with_mock(false);
+        let (status, body) = post_json(
+            state,
+            "/v1/images/generations",
+            json!({"prompt": "a red door", "output_compression": compression}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "c={compression}: {body}");
+        assert_eq!(
+            body["error"]["param"],
+            "output_compression",
+            "c={compression}: {body}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +474,66 @@ async fn several_images_each_get_seed_plus_index() {
 // ---------------------------------------------------------------------------
 // The buffered body.
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_buffered_request_that_meets_a_full_queue_is_all_or_nothing() {
+    // The ruling this pins: an overload during an n>1 request is a 503
+    // for the whole request, not a body with the images that made it -
+    // a JSON body with fewer than the n asked for would be a silent
+    // contract violation. Made deterministic: one job blocks the worker
+    // inside the generator and another fills the one queue slot, so the
+    // request's jobs meet the refusal with the worker provably busy; the
+    // same `?` in the buffered loop carries a refusal that lands between
+    // two images, and it answers the same way - the whole request is the
+    // refusal, and no image body is built.
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let generator = Arc::new(GateGenerator {
+        started: Mutex::new(Some(started_tx)),
+        gate: Mutex::new(release_rx),
+    });
+    let boxed: Arc<dyn ImageGenerator> = generator;
+    let service = ImageService::start(ImageServiceDesc {
+        generator: boxed,
+        model_id: "mock-flux".to_owned(),
+        max_queue: 1,
+    })
+    .expect("starts image service");
+    // Occupy the worker first: the generator blocks inside this job until
+    // the test drops the release sender at the end, and the start signal
+    // means the worker has taken it off the queue - the slot is empty.
+    let blocker = service.clone();
+    tokio::spawn(async move {
+        let _gone = blocker.generate(filler_job()).await;
+    });
+    started_rx.await.expect("the worker is inside the blocking job");
+    // Then fill the one queue slot. On this current-thread runtime a yield
+    // runs the spawned task past its `try_send` and to its answer await, so
+    // the slot is observably full before the request is sent (the
+    // `image_service` queue test's trick).
+    let filler = service.clone();
+    tokio::spawn(async move {
+        let _gone = filler.generate(filler_job()).await;
+    });
+    tokio::task::yield_now().await;
+    let state = Arc::new(AppState::without_language_model().with_image(service));
+
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "n": 2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "server_overloaded", "{body}");
+    assert!(
+        body.get("data").is_none(),
+        "the answer is the refusal, not the images that made it: {body}"
+    );
+    // Let the worker finish what it holds: dropping the sender ends every
+    // gate wait.
+    drop(release_tx);
+}
 
 #[tokio::test]
 async fn a_buffered_response_round_trips_the_image_and_accounts_usage() {

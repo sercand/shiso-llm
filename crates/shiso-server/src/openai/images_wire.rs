@@ -54,7 +54,8 @@ pub struct ImageGenerationRequest {
     /// hosts nothing to point a URL at.
     #[serde(default)]
     pub response_format: Option<String>,
-    /// Compression level (0-100).
+    /// Compression level (1-100). Zero is refused: it names no encoding this
+    /// server can produce.
     #[serde(default)]
     pub output_compression: Option<u32>,
     /// Whether to stream partial images via SSE.
@@ -72,7 +73,9 @@ pub struct ImageGenerationRequest {
 impl ImageGenerationRequest {
     /// The refusals this format can make on the body alone: a response format
     /// this server cannot honor, an image count outside `1..=10`, a
-    /// compression level outside `0..=100`.
+    /// compression level outside `1..=100`. Zero is refused rather than
+    /// clamped: a quality of zero has no encoding to mean it, and silently
+    /// encoding at quality 1 would answer a request nobody made.
     ///
     /// The size grammar and the output format are checked by the handler,
     /// which is where the server's defaults and the generator's bounds are
@@ -104,10 +107,10 @@ impl ImageGenerationRequest {
             ));
         }
         if let Some(compression) = self.output_compression
-            && compression > 100
+            && !(1..=100).contains(&compression)
         {
             return Err(AppError::bad_request(
-                "output_compression must be between 0 and 100",
+                "output_compression must be between 1 and 100",
                 Some("output_compression"),
                 "invalid_request",
             ));
