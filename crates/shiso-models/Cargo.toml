@@ -51,6 +51,13 @@ tracing = { workspace = true }
 # The byte-level BPE a speech recognizer's prompt context is tokenized
 # with, built from the checkpoint's own pieces and merges.
 tokenizers = { workspace = true }
+# The image families decode an encoded reference and encode the generated
+# pixels. The pipeline only ever encodes PNG and JPEG - the wire contract -
+# while the codec feature set is the workspace's, wider than what we emit.
+image = { workspace = true }
+# The chat template a diffusion family's text encoder renders its prompt
+# through ships inside the tokenizer directory as Jinja source.
+minijinja = { workspace = true }
 
 [dev-dependencies]
 # The device the model tests run on, and the vocabulary the golden prompt is

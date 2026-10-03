@@ -510,6 +510,25 @@ impl SparseStack {
                     ..device
                 },
             )?;
+            // Every row, before anything picks from it: the device pick below,
+            // and every host draw over a row read back, then never lands on a
+            // token the server suppresses. One launch whatever the list holds -
+            // an empty list costs the launch and changes nothing - because a
+            // launch that came and went with the list would change the plan
+            // under a captured graph.
+            plan.launch(
+                crate::sparse::kernels::Entry::plain(
+                    crate::sparse::kernels::MOD_SAMPLE,
+                    "sample_suppress_rows_kernel",
+                ),
+                crate::sparse::kernels::suppress_rows(logit_rows),
+                // `logits, list, n_vocab`
+                crate::sparse::bind::Args::of(&[
+                    Operand::Scratch(Buf::Logits),
+                    Operand::Scratch(Buf::Suppress),
+                    Operand::U32(self.shape.vocab),
+                ]),
+            );
             // More than one logit row means a speculative verify or a decode
             // batch, and what comes back from a verify is the greedy pick of
             // every row rather than the rows themselves. A batch wants the rows,

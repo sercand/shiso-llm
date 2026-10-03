@@ -49,6 +49,11 @@ temporal group (`grid_h * grid_w`), `hidden` the tower's internal width,
 | `kernel_vit_spatial_merge` | `out, in` | `merged_rows` | 256 | 0 |
 | `kernel_vit_splice_rows` | `hidden, src, map` | `rows` | 256 | 0 |
 
+`kernel_vit_gemm_bias_f16` and `kernel_vit_layer_norm_f16` are the same two
+entries for a tower stored in IEEE halves rather than brain floats: same
+buffers, grid, block and threadgroup memory, one body each, instantiated per
+width. The encoder picks one width per tower.
+
 `kernel_vit_gemm_bias` reports 0 threadgroup bytes because its two staging tiles
 are fixed-size threadgroup arrays declared in the kernel, not a dynamic
 allocation the host sizes: 2 x 16 x 16 x 4 = 2048 B, which the compiler reserves.

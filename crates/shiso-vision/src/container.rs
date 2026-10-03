@@ -43,6 +43,10 @@ pub enum VisionSource {
     /// `model-0000N-of-0000M.safetensors` with everything else. The tower is
     /// the same tower and reaches the same manifest.
     ModeloptDir(PathBuf),
+    /// A trellis-quantized tower file inside a checkpoint directory, whose
+    /// dimensions come from the directory's own config. The path is the
+    /// tower file.
+    TrellisShard(PathBuf),
 }
 
 impl VisionSource {
@@ -50,7 +54,10 @@ impl VisionSource {
     #[must_use]
     pub fn path(&self) -> &Path {
         match self {
-            Self::OptiqDir(path) | Self::SidecarGguf(path) | Self::ModeloptDir(path) => path,
+            Self::OptiqDir(path)
+            | Self::SidecarGguf(path)
+            | Self::ModeloptDir(path)
+            | Self::TrellisShard(path) => path,
         }
     }
 }

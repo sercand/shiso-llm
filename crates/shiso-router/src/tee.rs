@@ -154,34 +154,51 @@ pub(crate) struct UsageAccumulator {
     dialect: Dialect,
     mode: Mode,
     ext: Extracted,
+    saw_token: bool,
 }
 
 impl UsageAccumulator {
     pub(crate) fn new(dialect: Dialect, is_sse: bool, content_encoded: bool) -> Self {
-        let mode = if content_encoded {
-            Mode::Skip
+        let (mode, saw_token) = if content_encoded {
+            (Mode::Skip, true)
         } else if is_sse {
-            Mode::Sse {
-                partial: Vec::new(),
-                skipping_oversized: false,
-            }
+            (
+                Mode::Sse {
+                    partial: Vec::new(),
+                    skipping_oversized: false,
+                },
+                false,
+            )
         } else if dialect == Dialect::OpenAiEmbeddings {
-            Mode::Edges {
-                head: Vec::new(),
-                tail: Vec::new(),
-                overflowed: false,
-            }
+            (
+                Mode::Edges {
+                    head: Vec::new(),
+                    tail: Vec::new(),
+                    overflowed: false,
+                },
+                true,
+            )
         } else {
-            Mode::Json {
-                buf: Vec::new(),
-                truncated: false,
-            }
+            (
+                Mode::Json {
+                    buf: Vec::new(),
+                    truncated: false,
+                },
+                true,
+            )
         };
         UsageAccumulator {
             dialect,
             mode,
             ext: Extracted::default(),
+            saw_token,
         }
+    }
+
+    /// Whether the stream has produced its first generated token or terminal event.
+    #[must_use]
+    pub(crate) fn saw_token(&self) -> bool {
+        self.saw_token
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) {
@@ -223,11 +240,11 @@ impl UsageAccumulator {
                     if *skipping_oversized {
                         *skipping_oversized = false;
                     } else if partial.is_empty() {
-                        process_data_line(self.dialect, &mut self.ext, head);
+                        process_data_line(self.dialect, &mut self.ext, &mut self.saw_token, head);
                     } else {
                         partial.extend_from_slice(head);
                         let line = std::mem::take(partial);
-                        process_data_line(self.dialect, &mut self.ext, &line);
+                        process_data_line(self.dialect, &mut self.ext, &mut self.saw_token, &line);
                     }
                     rest = &tail[1..];
                 }
@@ -255,7 +272,7 @@ impl UsageAccumulator {
             } => {
                 if !*skipping_oversized && !partial.is_empty() {
                     let line = std::mem::take(partial);
-                    process_data_line(self.dialect, &mut self.ext, &line);
+                    process_data_line(self.dialect, &mut self.ext, &mut self.saw_token, &line);
                 }
             }
             Mode::Json { buf, truncated } => {
@@ -364,7 +381,89 @@ fn last_usage_object(window: &[u8]) -> Option<Value> {
     None
 }
 
-fn process_data_line(dialect: Dialect, ext: &mut Extracted, line: &[u8]) {
+/// Whether an SSE `data:` payload is an empty prologue or heartbeat frame
+/// that carries no generated tokens or completion signals.
+///
+/// Some streaming backends emit an initial frame (such as an empty role prologue,
+/// `message_start`, or `response.created`) immediately upon admitting a request,
+/// before prompt prefill starts. Treating that frame as the first token produces
+/// an artificially low TTFB (recording scheduler admission rather than first
+/// token generation).
+fn is_prologue(dialect: Dialect, data: &str) -> bool {
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed == "[DONE]" {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    if v.get("error").is_some() {
+        return false;
+    }
+    match dialect {
+        Dialect::OpenAiChat => {
+            if let Some(choices) = v["choices"].as_array() {
+                if choices.is_empty() {
+                    return v.get("usage").is_none();
+                }
+                for c in choices {
+                    if c.get("finish_reason").is_some_and(|f| !f.is_null()) {
+                        return false;
+                    }
+                    if c["text"].as_str().is_some_and(|text| !text.is_empty()) {
+                        return false;
+                    }
+                    if let Some(delta) = c["delta"].as_object() {
+                        if delta
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                        {
+                            return false;
+                        }
+                        if delta
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                        {
+                            return false;
+                        }
+                        if delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                        {
+                            return false;
+                        }
+                        if delta
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .is_some_and(|a| !a.is_empty())
+                        {
+                            return false;
+                        }
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
+        Dialect::Anthropic => matches!(v["type"].as_str(), Some("message_start" | "ping")),
+        Dialect::OpenAiResponses => {
+            matches!(
+                v["type"].as_str(),
+                Some("response.created" | "response.in_progress")
+            )
+        }
+        _ => false,
+    }
+}
+
+fn process_data_line(dialect: Dialect, ext: &mut Extracted, saw_token: &mut bool, line: &[u8]) {
     let line = match line.last() {
         Some(b'\r') => &line[..line.len() - 1],
         _ => line,
@@ -376,6 +475,9 @@ fn process_data_line(dialect: Dialect, ext: &mut Extracted, line: &[u8]) {
         return;
     };
     let data = data.trim_start();
+    if !*saw_token && !is_prologue(dialect, data) {
+        *saw_token = true;
+    }
     if !PRE_FILTER.iter().any(|t| data.contains(t)) {
         return;
     }
@@ -496,6 +598,7 @@ struct TeeState {
     acc: UsageAccumulator,
     ctx: LogContext,
     sink: LogSink,
+    first_byte_ms: Option<i64>,
 }
 
 /// Wraps the upstream byte stream: bytes pass through unchanged; the log
@@ -521,14 +624,25 @@ impl<S> TeeStream<S> {
     ) -> Self {
         TeeStream {
             inner,
-            state: Some(TeeState { acc, ctx, sink }),
+            state: Some(TeeState {
+                acc,
+                ctx,
+                sink,
+                first_byte_ms: None,
+            }),
             expected_len,
             forwarded: 0,
         }
     }
 
     fn finalize(&mut self, stream_error: Option<String>) {
-        let Some(TeeState { acc, mut ctx, sink }) = self.state.take() else {
+        let Some(TeeState {
+            acc,
+            mut ctx,
+            sink,
+            first_byte_ms,
+        }) = self.state.take()
+        else {
             return;
         };
         let forwarded = self.forwarded;
@@ -536,6 +650,9 @@ impl<S> TeeStream<S> {
         let usage = acc.finish(status_2xx);
 
         ctx.row.duration_ms = Some(ctx.started.elapsed().as_millis() as i64);
+        if ctx.row.ttfb_ms.is_none() {
+            ctx.row.ttfb_ms = first_byte_ms.or(ctx.row.duration_ms);
+        }
         ctx.row.prompt_tokens = usage.prompt_tokens;
         ctx.row.completion_tokens = usage.completion_tokens;
         ctx.row.cached_tokens = usage.cached_tokens;
@@ -624,11 +741,14 @@ where
             Poll::Ready(Some(Ok(chunk))) => {
                 this.forwarded += chunk.len() as u64;
                 if let Some(state) = &mut this.state {
-                    if state.ctx.row.ttfb_ms.is_none() {
+                    if state.first_byte_ms.is_none() {
+                        state.first_byte_ms = Some(state.ctx.started.elapsed().as_millis() as i64);
+                    }
+                    state.acc.push(&chunk);
+                    if state.ctx.row.ttfb_ms.is_none() && state.acc.saw_token() {
                         state.ctx.row.ttfb_ms =
                             Some(state.ctx.started.elapsed().as_millis() as i64);
                     }
-                    state.acc.push(&chunk);
                     if let Some(t) = &state.ctx.trace {
                         t.body_chunk(&chunk);
                     }
@@ -1010,5 +1130,74 @@ mod tests {
             &[b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\r\n\r\n"],
         );
         assert_eq!(usage.total_tokens, Some(3));
+    }
+
+    #[test]
+    fn openai_chat_prologue_skipped_until_token() {
+        let mut acc = UsageAccumulator::new(Dialect::OpenAiChat, true, false);
+        assert!(!acc.saw_token());
+
+        // Prologue chunk: empty content with role assistant
+        acc.push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n");
+        assert!(
+            !acc.saw_token(),
+            "empty role prologue must not be counted as a token"
+        );
+
+        // First token chunk
+        acc.push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n");
+        assert!(
+            acc.saw_token(),
+            "first non-empty content chunk must be detected as a token"
+        );
+    }
+
+    #[test]
+    fn anthropic_prologue_skipped_until_token() {
+        let mut acc = UsageAccumulator::new(Dialect::Anthropic, true, false);
+        assert!(!acc.saw_token());
+
+        // Prologue chunk: message_start
+        acc.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n");
+        assert!(
+            !acc.saw_token(),
+            "message_start must not be counted as a token"
+        );
+
+        // First content delta
+        acc.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n");
+        assert!(
+            acc.saw_token(),
+            "content_block_delta must be detected as a token"
+        );
+    }
+
+    #[test]
+    fn responses_prologue_skipped_until_token() {
+        let mut acc = UsageAccumulator::new(Dialect::OpenAiResponses, true, false);
+        assert!(!acc.saw_token());
+
+        // Prologue: response.created and response.in_progress
+        acc.push(b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n");
+        assert!(!acc.saw_token());
+
+        acc.push(b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"r1\"}}\n\n");
+        assert!(!acc.saw_token());
+
+        // First token delta
+        acc.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n");
+        assert!(
+            acc.saw_token(),
+            "response.output_text.delta must be detected as a token"
+        );
+    }
+
+    #[test]
+    fn non_sse_marks_token_immediately() {
+        let acc = UsageAccumulator::new(Dialect::OpenAiChat, false, false);
+        assert!(
+            acc.saw_token(),
+            "non-SSE response should immediately treat first chunk as token"
+        );
     }
 }

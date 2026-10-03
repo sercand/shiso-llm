@@ -306,6 +306,53 @@ impl Vocabulary {
         self.inner.token_to_id(marker).map(TokenId::new)
     }
 
+    /// The text of every added token this vocabulary marks special.
+    ///
+    /// What caller text is kept from encoding as a token; see
+    /// [`literal_text`]. Special only, because those are the tokens the
+    /// literal encoding reads as text: an added token that is not special is
+    /// split out of any text, which is what the families declaring one want.
+    #[must_use]
+    pub fn special_spellings(&self) -> Vec<String> {
+        self.inner
+            .get_added_tokens_decoder()
+            .into_values()
+            .filter(|token| token.special)
+            .map(|token| token.content)
+            .collect()
+    }
+
+    /// The ids a model must never generate: every special added token except
+    /// the ones that end a turn and the ones a generated tag is spelled with.
+    ///
+    /// A model quoting a control token - writing `<|im_start|>` into its own
+    /// reasoning - tends to pick the token's single id rather than its text,
+    /// and that id then is the control token: a turn opener in the middle of
+    /// an answer, or a turn closer that stops it mid-thought. Taking those ids
+    /// off the table leaves the model the text pieces, which is what a quote
+    /// is. The stop ids stay, or no turn could end; so does any special whose
+    /// text is part of a tag the output parser reads (`tags`), or the model
+    /// could not open a reasoning channel or call a tool. Sorted, so a boot log
+    /// and a test see the same order.
+    #[must_use]
+    pub fn generation_suppressed(
+        &self,
+        stop: shiso_core::StopTokens,
+        tags: &[&str],
+    ) -> Vec<TokenId> {
+        let mut ids: Vec<TokenId> = self
+            .inner
+            .get_added_tokens_decoder()
+            .into_iter()
+            .filter(|(_, token)| token.special && !token.content.is_empty())
+            .filter(|(_, token)| !tags.iter().any(|tag| tag.contains(token.content.as_str())))
+            .map(|(id, _)| TokenId::new(id))
+            .filter(|id| !stop.contains(*id))
+            .collect();
+        ids.sort_unstable_by_key(|id| id.get());
+        ids
+    }
+
     /// The placeholder ids this family's placement resolves to here.
     ///
     /// Resolved through the vocabulary rather than written down as constants:
@@ -688,6 +735,244 @@ mod detokenizer_tests {
                 .encode_prompt_with_literals(text, std::slice::from_ref(&(4..7)))
                 .expect("encodes")),
             vec![4, 3, 0, 1, 2, 3]
+        );
+    }
+
+    /// The stop ids stay pickable or no turn could end, a special spelled
+    /// inside a parser tag stays or no channel could open, and an added token
+    /// that is not special is the parser's business: none of those is
+    /// suppressed. Every other special is.
+    #[test]
+    fn generation_suppresses_specials_but_stops_and_tags() {
+        use std::str::FromStr as _;
+        let added: Vec<serde_json::Value> = [
+            (1, "<|im_start|>", true),
+            (2, "<|im_end|>", true),
+            (3, "<|image_pad|>", true),
+            (4, "<|channel>", true),
+            (5, "<think>", false),
+        ]
+        .into_iter()
+        .map(|(id, content, special)| {
+            serde_json::json!({
+                "id": id, "content": content, "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": special,
+            })
+        })
+        .collect();
+        let document = serde_json::json!({
+            "version": "1.0",
+            "truncation": serde_json::Value::Null,
+            "padding": serde_json::Value::Null,
+            "added_tokens": added,
+            "normalizer": serde_json::Value::Null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": serde_json::Value::Null,
+            "decoder": serde_json::Value::Null,
+            "model": {"type": "WordLevel", "vocab": {
+                "<unk>": 0, "<|im_start|>": 1, "<|im_end|>": 2, "<|image_pad|>": 3,
+                "<|channel>": 4, "<think>": 5,
+            }, "unk_token": "<unk>"},
+        })
+        .to_string();
+        let vocabulary =
+            Vocabulary::from_tokenizer(tokenizers::Tokenizer::from_str(&document).expect("loads"));
+        let stop = shiso_core::StopTokens::new(&[TokenId::new(2)]).expect("one stop");
+        let ids = vocabulary.generation_suppressed(stop, &["<|channel>thought\n", "<think>"]);
+        assert_eq!(ids, vec![TokenId::new(1), TokenId::new(3)]);
+    }
+
+    /// The model-side half of the boot contract, mirrored from the engine
+    /// stack's documented refusal: a suppression list longer than the buffer
+    /// it is written into, or an id at or past the logits width, is refused
+    /// rather than truncated or skipped - either would leave a control token
+    /// pickable that the server said was not. The stub lets the boot helper
+    /// be tested without a device; what the tests below pin is that the
+    /// server propagates the refusal as a boot failure instead of sanitizing
+    /// the list into something the model would take.
+    #[derive(Debug)]
+    struct BoundCheckingModel {
+        info: shiso_core::ModelInfo,
+    }
+
+    impl BoundCheckingModel {
+        /// A model whose logits rows are `vocab` wide, ending turns on id 0.
+        fn with_width(vocab: u32) -> Self {
+            Self {
+                info: shiso_core::ModelInfo {
+                    context_capacity: 8,
+                    vocab,
+                    hidden: 8,
+                    n_layers: 1,
+                    stop_tokens: shiso_core::StopTokens::one(TokenId::new(0)),
+                },
+            }
+        }
+
+        fn refused(what: &'static str) -> shiso_core::CoreError {
+            shiso_core::CoreError::Unsupported {
+                what,
+                backend: "test",
+            }
+        }
+    }
+
+    impl shiso_core::Model for BoundCheckingModel {
+        fn info(&self) -> &shiso_core::ModelInfo {
+            &self.info
+        }
+
+        fn open_session(&mut self) -> shiso_core::CoreResult<shiso_core::SessionId> {
+            Err(Self::refused("sessions on the suppression-bound stub"))
+        }
+
+        fn close_session(&mut self, _session: shiso_core::SessionId) -> shiso_core::CoreResult<()> {
+            Err(Self::refused("sessions on the suppression-bound stub"))
+        }
+
+        fn prefill_chunk(
+            &mut self,
+            _session: shiso_core::SessionId,
+            _tokens: &[TokenId],
+        ) -> shiso_core::CoreResult<()> {
+            Err(Self::refused("prefill on the suppression-bound stub"))
+        }
+
+        fn prefill_last(
+            &mut self,
+            _session: shiso_core::SessionId,
+            _tokens: &[TokenId],
+        ) -> shiso_core::CoreResult<shiso_core::Logits<'_>> {
+            Err(Self::refused("prefill on the suppression-bound stub"))
+        }
+
+        fn decode_batch(
+            &mut self,
+            _steps: &[shiso_core::DecodeStep],
+        ) -> shiso_core::CoreResult<shiso_core::Logits<'_>> {
+            Err(Self::refused("decode on the suppression-bound stub"))
+        }
+
+        fn suppress_tokens(&mut self, ids: &[TokenId]) -> shiso_core::CoreResult<()> {
+            let capacity = shiso_engine::sparse::scratch::SUPPRESS_CAPACITY;
+            if u32::try_from(ids.len())
+                .ok()
+                .is_none_or(|count| count > capacity)
+            {
+                return Err(shiso_core::CoreError::InvalidValue {
+                    key: "suppressed token count",
+                    value: format!("{} (at most {capacity})", ids.len()),
+                });
+            }
+            if let Some(bad) = ids.iter().find(|id| id.get() >= self.info.vocab) {
+                return Err(shiso_core::CoreError::InvalidValue {
+                    key: "suppressed token id",
+                    value: format!("{} (vocabulary {})", bad.get(), self.info.vocab),
+                });
+            }
+            Ok(())
+        }
+
+        fn teardown(&mut self) -> shiso_core::CoreResult<()> {
+            Ok(())
+        }
+    }
+
+    /// The no-parser scheme pair, which asks for no generated tags: the tests
+    /// below are about the two bounds, not about tag carve-outs.
+    const NO_PARSERS: (
+        shiso_parsers::ReasoningScheme,
+        shiso_parsers::ToolCallScheme,
+    ) = (
+        shiso_parsers::ReasoningScheme::None,
+        shiso_parsers::ToolCallScheme::None,
+    );
+
+    /// A `WordLevel` vocabulary whose added tokens are exactly `specials`, so a
+    /// test can place special ids wherever a checkpoint file could.
+    fn vocabulary_with_specials(specials: &[(u32, &str)]) -> Vocabulary {
+        let mut vocab = serde_json::Map::new();
+        vocab.insert("<unk>".to_string(), serde_json::Value::from(0));
+        let added: Vec<serde_json::Value> = specials
+            .iter()
+            .map(|(id, content)| {
+                vocab.insert((*content).to_string(), serde_json::Value::from(*id));
+                serde_json::json!({
+                    "id": id, "content": content, "single_word": false, "lstrip": false,
+                    "rstrip": false, "normalized": false, "special": true,
+                })
+            })
+            .collect();
+        let document = serde_json::json!({
+            "version": "1.0",
+            "truncation": serde_json::Value::Null,
+            "padding": serde_json::Value::Null,
+            "added_tokens": added,
+            "normalizer": serde_json::Value::Null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": serde_json::Value::Null,
+            "decoder": serde_json::Value::Null,
+            "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
+        })
+        .to_string();
+        Vocabulary::from_tokenizer(
+            tokenizers::Tokenizer::from_str(&document).expect("the specials vocabulary loads"),
+        )
+    }
+
+    /// A special whose id reaches past the logits width is a vocabulary that
+    /// disagrees with the model, and boot must end over it. Dropping the id
+    /// would boot a server that can still generate a control token the
+    /// suppression list said was off the table - the exact failure the
+    /// refusal exists to prevent.
+    #[test]
+    fn a_special_id_past_the_logits_width_refuses_boot() {
+        let vocabulary = vocabulary_with_specials(&[(900, "<|far|>")]);
+        let mut model = BoundCheckingModel::with_width(64);
+        let error = crate::suppress_control_tokens(&mut model, Some(&vocabulary), NO_PARSERS)
+            .expect_err("a special id past the logits width refuses boot");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("suppressed token id") && message.contains("900 (vocabulary 64)"),
+            "the boot failure names the offending id and the width it passed: {message}"
+        );
+        // The refusal is about the width, not about refusing everything: the
+        // same model boots when the special fits inside it.
+        let tame = vocabulary_with_specials(&[(2, "<|near|>")]);
+        assert!(
+            crate::suppress_control_tokens(&mut model, Some(&tame), NO_PARSERS).is_ok(),
+            "a special inside the logits width still boots"
+        );
+    }
+
+    /// More specials than the suppression buffer holds is the same failure
+    /// from the other side: the engine refuses rather than truncate, and boot
+    /// carries that refusal out rather than serving with a silently
+    /// shortened list.
+    #[test]
+    fn more_specials_than_the_suppression_capacity_refuses_boot() {
+        let capacity = usize::try_from(shiso_engine::sparse::scratch::SUPPRESS_CAPACITY)
+            .expect("the suppression capacity fits any supported usize");
+        let specials: Vec<(u32, String)> = (0..=capacity)
+            .map(|i| {
+                let id = u32::try_from(i + 100).expect("the special ids stay inside u32");
+                (id, format!("<|s{i}>"))
+            })
+            .collect();
+        let borrowed: Vec<(u32, &str)> = specials
+            .iter()
+            .map(|(id, content)| (*id, content.as_str()))
+            .collect();
+        let vocabulary = vocabulary_with_specials(&borrowed);
+        // Wide enough that every id fits: the refusal can only be the count.
+        let mut model = BoundCheckingModel::with_width(8_192);
+        let error = crate::suppress_control_tokens(&mut model, Some(&vocabulary), NO_PARSERS)
+            .expect_err("more specials than the suppression capacity refuses boot");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("suppressed token count")
+                && message.contains(&format!("{} (at most {capacity})", capacity + 1)),
+            "the boot failure names the count and the capacity it passed: {message}"
         );
     }
 }

@@ -77,6 +77,14 @@ pub enum AppError {
     /// The server is running with no model loaded.
     #[error("no model is loaded")]
     NoModel,
+    /// The server is running with no image generation model loaded.
+    ///
+    /// Distinct from [`Self::NoModel`] because `--model` and `--image-model`
+    /// are independent: a server can serve one and not the other, and an
+    /// operator fixing a 503 from an image route needs to know which flag
+    /// was missing.
+    #[error("no image model is loaded")]
+    NoImageModel,
     /// A request named a model this server does not serve.
     #[error("the model {model:?} is not served here")]
     UnknownModel {
@@ -229,9 +237,10 @@ impl AppError {
     #[must_use]
     pub const fn status(&self) -> StatusCode {
         match self {
-            Self::NoModel | Self::NotReady { .. } | Self::Overloaded { .. } => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::NoModel
+            | Self::NoImageModel
+            | Self::NotReady { .. }
+            | Self::Overloaded { .. } => StatusCode::SERVICE_UNAVAILABLE,
 
             Self::NotFound { .. } | Self::UnknownModel { .. } => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
@@ -260,6 +269,7 @@ impl AppError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::NoModel => "model_not_loaded",
+            Self::NoImageModel => "image_model_not_loaded",
             Self::NotReady { .. } => "server_not_ready",
             Self::Overloaded { .. } => "server_overloaded",
             Self::ContextOverflow { .. } => "context_length_exceeded",

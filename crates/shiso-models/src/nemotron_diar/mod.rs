@@ -12,6 +12,13 @@ pub mod encoder;
 mod names;
 pub mod weights;
 
+use crate::catalog::FamilyFacts;
+
+/// Family facts for Nemotron Diarization.
+pub const FACTS: FamilyFacts = FamilyFacts {
+    name: "nemotron_diar",
+};
+
 use std::path::Path;
 use std::sync::Arc;
 

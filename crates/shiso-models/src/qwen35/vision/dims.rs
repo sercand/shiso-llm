@@ -145,6 +145,32 @@ impl VisionDims {
     pub const fn tensor_count(&self) -> usize {
         self.depth * TENSORS_PER_BLOCK + TENSORS_OUTSIDE_BLOCKS
     }
+
+    /// The same tower with its feed-forward inner width padded to `width`.
+    ///
+    /// For a container that quantized the feed-forward in 128-wide blocks and
+    /// so stores it padded: the padded projections are what the weights
+    /// were quantized as, and running them at the stored width is the exact
+    /// computation, where cutting them back would drop the share of the
+    /// quantization error the padding carries.
+    ///
+    /// # Errors
+    ///
+    /// [`VisionError::TowerTensorExtent`] when `width` is narrower than the
+    /// configured width.
+    pub fn with_padded_intermediate(self, width: usize) -> Result<Self, VisionError> {
+        if width < self.intermediate {
+            return Err(VisionError::TowerTensorExtent {
+                name: "mlp.linear_fc1".to_owned(),
+                got: width,
+                want: self.intermediate,
+            });
+        }
+        Ok(Self {
+            intermediate: width,
+            ..self
+        })
+    }
 }
 
 /// Tensors one transformer block holds; see [`VisionDims::tensor_count`].

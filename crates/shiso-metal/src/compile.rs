@@ -286,6 +286,20 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "audio/audio_lstm.metal",
         include_str!("../metal/audio/audio_lstm.metal"),
     ),
+    // --- logits stages shared by every stack; appended, nothing above this
+    // line changed.
+    (
+        "sample/suppress.metal",
+        include_str!("../metal/sample/suppress.metal"),
+    ),
+    // --- flux2-klein kernel set; appended, nothing above this line changed.
+    // The header comes first for the same reason every other set's does: the
+    // file after it uses its argument blocks, its decoders and its reduction.
+    (
+        "flux2_common.h",
+        include_str!("../metal/flux2/flux2_common.h"),
+    ),
+    ("flux2.metal", include_str!("../metal/flux2/flux2.metal")),
 ];
 
 /// Concatenates every source into the one translation unit the device compiles.

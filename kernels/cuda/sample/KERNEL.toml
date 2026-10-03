@@ -1,0 +1,20 @@
+# The `sample` module: what the engine does to a logits row before anything
+# picks from it. Today that is one entry, the suppress stage, which keeps the
+# control tokens a model must never generate - a turn opener, a media marker -
+# out of every pick taken on the device.
+#
+# Written for this repository; nothing here is a byte copy, so no unit carries
+# a provenance header.
+
+[build]
+sources = ["sample.cu"]
+
+includes = ["cuda/sample"]
+
+# The floor the rest of the tree is pinned at. The one kernel here needs
+# nothing past a strided loop, so it would build lower; one architecture across
+# the tree is one less thing to reason about when a number disagrees.
+arch = ["compute_80"]
+
+[modules]
+sample = "sample"

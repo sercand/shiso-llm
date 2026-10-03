@@ -775,3 +775,49 @@ fn a_channel_slowest_patch_weight_is_transposed_into_the_order_the_packer_builds
         Some(crate::qwen35::vision::manifest::PatchRows::AsStored)
     );
 }
+
+/// The expansion comes back contraction-major and the tower stores
+/// `[out, in]`: the transpose moves every half, and only moves it.
+#[test]
+fn transpose_halves_swaps_rows_and_columns() {
+    // [2, 3]: row r, column c holds r * 10 + c.
+    let src: Vec<u8> = [0u16, 1, 2, 10, 11, 12]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let out = super::transpose_halves(&src, 2, 3);
+    let words: Vec<u16> = out
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    assert_eq!(words, vec![0, 10, 1, 11, 2, 12]);
+}
+
+/// Exactly one trellis tower file is a tower; none or two is not one.
+#[test]
+fn trellis_tower_file_needs_exactly_one_candidate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert_eq!(super::trellis_tower_file(dir.path()), None);
+    std::fs::write(dir.path().join("vision_k6.safetensors"), b"x").expect("write");
+    std::fs::write(dir.path().join("model.safetensors"), b"x").expect("write");
+    assert_eq!(
+        super::trellis_tower_file(dir.path()),
+        Some(dir.path().join("vision_k6.safetensors"))
+    );
+    std::fs::write(dir.path().join("vision_k5.safetensors"), b"x").expect("write");
+    assert_eq!(super::trellis_tower_file(dir.path()), None);
+}
+
+/// A padded feed-forward may be wider than the config's, never narrower.
+#[test]
+fn padded_intermediate_only_widens() {
+    let geometry = PatchGeometry::new(16, 2, 2).expect("geometry");
+    let dims = VisionDims::new(27, 1152, 16, 4304, 2560, 2304, geometry).expect("dims");
+    assert_eq!(
+        dims.with_padded_intermediate(4352)
+            .expect("wider")
+            .intermediate(),
+        4352
+    );
+    assert!(dims.with_padded_intermediate(4096).is_err());
+}

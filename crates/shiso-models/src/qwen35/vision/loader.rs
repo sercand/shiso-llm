@@ -32,7 +32,9 @@ use std::sync::Arc;
 
 use shiso_core::{Backend, DType, alloc};
 use shiso_modelfile::modelopt::{ModeloptFile, Stored};
-use shiso_modelfile::st_header::StDType;
+use std::collections::HashMap;
+
+use shiso_modelfile::st_header::{RawTensor, Shard, StDType};
 use shiso_modelfile::{GgufFile, TensorSource};
 use shiso_vision::{VisionError, VisionShard, VisionSource, open_gguf};
 
@@ -68,12 +70,15 @@ fn st_dtype(name: &str, dtype: StDType) -> Result<DType, VisionError> {
         StDType::Bf16 => Ok(DType::BF16),
         StDType::F16 => Ok(DType::F16),
         StDType::F32 => Ok(DType::F32),
-        StDType::U8 | StDType::U32 | StDType::F8E4M3 | StDType::I64 => {
-            Err(VisionError::TensorDType {
-                name: name.to_owned(),
-                dtype: DType::I32,
-            })
-        }
+        StDType::U8
+        | StDType::U32
+        | StDType::F8E4M3
+        | StDType::I64
+        | StDType::I16
+        | StDType::I32 => Err(VisionError::TensorDType {
+            name: name.to_owned(),
+            dtype: DType::I32,
+        }),
     }
 }
 
@@ -211,7 +216,7 @@ pub fn load_vision_weights(
     backend: &Arc<dyn Backend>,
     source: &VisionSource,
 ) -> Result<VisionWeights, VisionError> {
-    let tower = Tower::open(source)?;
+    let tower = Tower::open(source, backend)?;
     let dims = tower.dims();
     let prefix = tower.prefix().to_owned();
     let manifest = TowerManifest::build(&prefix, dims);
@@ -263,6 +268,8 @@ enum Tower {
         /// Dimensions, from the checkpoint's config.
         dims: VisionDims,
     },
+    /// A trellis-quantized tower file beside a checkpoint's config.
+    Trellis(Box<TrellisTower>),
     /// A standalone tower file.
     Sidecar {
         /// The opened container.
@@ -276,11 +283,14 @@ enum Tower {
 
 impl Tower {
     /// Opens whichever container the source names and derives its dimensions.
-    fn open(source: &VisionSource) -> Result<Self, VisionError> {
+    fn open(source: &VisionSource, backend: &Arc<dyn Backend>) -> Result<Self, VisionError> {
         match source {
             VisionSource::OptiqDir(dir) => Self::open_checkpoint(dir),
             VisionSource::ModeloptDir(dir) => Self::open_modelopt(dir),
             VisionSource::SidecarGguf(path) => Self::open_sidecar(path),
+            VisionSource::TrellisShard(path) => {
+                Ok(Self::Trellis(Box::new(TrellisTower::open(path, backend)?)))
+            }
         }
     }
 
@@ -364,6 +374,7 @@ impl Tower {
             Self::Shard { dims, .. } | Self::Modelopt { dims, .. } | Self::Sidecar { dims, .. } => {
                 *dims
             }
+            Self::Trellis(tower) => tower.dims,
         }
     }
 
@@ -373,7 +384,7 @@ impl Tower {
             Self::Shard { .. } => CHECKPOINT_PREFIX,
             // The same spelling a standalone tower's short prefix uses, which
             // is what this container writes.
-            Self::Modelopt { .. } => MODELOPT_TOWER_PREFIX,
+            Self::Modelopt { .. } | Self::Trellis(_) => MODELOPT_TOWER_PREFIX,
             Self::Sidecar { prefix, .. } => prefix,
         }
     }
@@ -385,6 +396,7 @@ impl Tower {
             // Already narrowed to the prefix at open, so this is the tower's
             // own count and not the checkpoint's.
             Self::Modelopt { file, .. } => file.tensors().len(),
+            Self::Trellis(tower) => tower.tensor_count(),
             Self::Sidecar { file, prefix, .. } => {
                 let under = format!("{prefix}.");
                 file.tensors()
@@ -458,6 +470,7 @@ impl Tower {
                     AxisOrder::SlowestFirst,
                 ))
             }
+            Self::Trellis(tower) => tower.describe(name),
             Self::Sidecar { file, .. } => {
                 let desc = TensorSource::find(file.as_ref(), name).ok_or_else(|| {
                     VisionError::MissingTensor {
@@ -494,6 +507,7 @@ impl Tower {
                         source,
                     })
             }
+            Self::Trellis(tower) => tower.bytes(name),
             Self::Sidecar { file, .. } => TensorSource::get(file.as_ref(), name)
                 .map(|view| Cow::Borrowed(view.data))
                 .ok_or_else(|| VisionError::MissingTensor {
@@ -501,6 +515,250 @@ impl Tower {
                 }),
         }
     }
+}
+
+/// The trellis export's tower file, if `dir` holds one: `vision_k<bits>.safetensors`.
+#[must_use]
+pub(super) fn trellis_tower_file(dir: &Path) -> Option<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("vision_k") && name.ends_with(".safetensors"))
+        })
+        .collect();
+    found.sort();
+    // Two towers in one directory is a question nobody answered; neither is
+    // picked.
+    (found.len() == 1).then(|| found.remove(0))
+}
+
+/// Projections the trellis tower stores both fused and split: the fused
+/// query/key/value weight is kept in half precision beside quantized splits,
+/// and the encoder multiplies the fused one, so the splits are not the
+/// tower's tensors.
+const SPLIT_QKV: [&str; 3] = ["attn.q_proj.", "attn.k_proj.", "attn.v_proj."];
+
+/// The trellis-quantized tower.
+///
+/// Its projections are three tensors each - tiles, input scales, output
+/// scales - which the encoder has no tier for, so each is expanded once on
+/// the device to the half-precision `[out, in]` matrix every other container
+/// stores, by the same kernel the language model's prompt path expands its
+/// own projections with. Everything else is stored plain and goes as stored.
+struct TrellisTower {
+    shard: Shard,
+    tensors: HashMap<String, RawTensor>,
+    dims: VisionDims,
+    backend: Arc<dyn Backend>,
+    entries: shiso_engine::sparse::kernels::EntryTable,
+}
+
+impl std::fmt::Debug for TrellisTower {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrellisTower")
+            .field("shard", &self.shard)
+            .field("tensors", &self.tensors.len())
+            .field("dims", &self.dims)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TrellisTower {
+    /// Opens the tower file and derives the dimensions from the config beside
+    /// it, the feed-forward at the width the file stores.
+    fn open(path: &Path, backend: &Arc<dyn Backend>) -> Result<Self, VisionError> {
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let (config, _) = shiso_vision::open_checkpoint(dir)?;
+        let vcfg = config
+            .vision_config()
+            .map_err(|source| VisionError::TowerConfig {
+                path: dir.join("config.json"),
+                source,
+            })?
+            .ok_or_else(|| VisionError::NoVisionConfig {
+                path: dir.to_path_buf(),
+            })?;
+        let dims = VisionDims::try_from(&vcfg)?;
+        let (shard, table) =
+            Shard::open_untagged(path).map_err(|source| VisionError::TowerContainer {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let tensors: HashMap<String, RawTensor> = table.into_iter().collect();
+        let fc1 = format!("{MODELOPT_TOWER_PREFIX}.blocks.0.mlp.linear_fc1.svh");
+        let stored = tensors
+            .get(&fc1)
+            .and_then(|raw| raw.shape.first().copied())
+            .ok_or(VisionError::MissingTensor { name: fc1 })?;
+        let dims = dims.with_padded_intermediate(usize::try_from(stored).unwrap_or(0))?;
+        Ok(Self {
+            shard,
+            tensors,
+            dims,
+            backend: Arc::clone(backend),
+            entries: shiso_engine::sparse::capture::capture(backend.as_ref()),
+        })
+    }
+
+    /// Whether `name` is one of the split projections the tower does not use.
+    fn is_split_qkv(name: &str) -> bool {
+        SPLIT_QKV.iter().any(|part| name.contains(part))
+    }
+
+    /// Logical tensors under the prefix: a projection's three parts and its
+    /// codebook word count once, the unused split projections not at all.
+    fn tensor_count(&self) -> usize {
+        let under = format!("{MODELOPT_TOWER_PREFIX}.");
+        self.tensors
+            .keys()
+            .filter(|name| name.starts_with(&under) && !Self::is_split_qkv(name))
+            .filter(|name| {
+                // Tensor-name parts, not file extensions.
+                let part = name.rsplit('.').next().unwrap_or_default();
+                !matches!(part, "suh" | "svh" | "mul1")
+            })
+            .count()
+    }
+
+    /// The projection base a `.weight` name is stored as trellis parts under,
+    /// if it is.
+    fn trellis_base<'n>(&self, name: &'n str) -> Option<&'n str> {
+        let base = name.strip_suffix(".weight")?;
+        self.tensors
+            .contains_key(&format!("{base}.trellis"))
+            .then_some(base)
+    }
+
+    fn describe(&self, name: &str) -> Result<(DType, Vec<u64>, AxisOrder), VisionError> {
+        if let Some(raw) = self.tensors.get(name) {
+            let dtype = StDType::parse(&raw.dtype).ok_or_else(|| VisionError::TensorDType {
+                name: name.to_owned(),
+                dtype: DType::I32,
+            })?;
+            return Ok((
+                st_dtype(name, dtype)?,
+                raw.shape.clone(),
+                AxisOrder::SlowestFirst,
+            ));
+        }
+        let base = self
+            .trellis_base(name)
+            .ok_or_else(|| VisionError::MissingTensor {
+                name: name.to_owned(),
+            })?;
+        let (k, n) = self.widths(base)?;
+        // Expanded to the half-precision `[out, in]` matrix, the width the
+        // tower's plain tensors are stored in, so the tower is one width.
+        Ok((DType::F16, vec![n, k], AxisOrder::SlowestFirst))
+    }
+
+    /// Contraction and output widths of a trellis projection.
+    fn widths(&self, base: &str) -> Result<(u64, u64), VisionError> {
+        let raw = |part: &str| {
+            let name = format!("{base}.{part}");
+            self.tensors
+                .get(&name)
+                .ok_or(VisionError::MissingTensor { name })
+        };
+        let k = raw("suh")?.shape.first().copied().unwrap_or(0);
+        let n = raw("svh")?.shape.first().copied().unwrap_or(0);
+        Ok((k, n))
+    }
+
+    /// One stored tensor's bytes.
+    fn stored(&self, name: &str) -> Result<&[u8], VisionError> {
+        let raw = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| VisionError::MissingTensor {
+                name: name.to_owned(),
+            })?;
+        self.shard
+            .payload(raw.data_offsets[0], raw.data_offsets[1])
+            .map_err(|source| VisionError::TowerContainer {
+                path: self.shard.path().to_path_buf(),
+                source,
+            })
+    }
+
+    /// One tensor's bytes in the width it is stored in: a plain tensor as
+    /// stored, a projection as the expansion writes it.
+    fn bytes(&self, name: &str) -> Result<Cow<'_, [u8]>, VisionError> {
+        let Some(base) = self.trellis_base(name) else {
+            return self.stored(name).map(Cow::Borrowed);
+        };
+        let fail = |source| VisionError::Upload {
+            name: name.to_owned(),
+            source,
+        };
+        let (k, n) = self.widths(base)?;
+        let (k, n) = (
+            usize::try_from(k).unwrap_or(0),
+            usize::try_from(n).unwrap_or(0),
+        );
+        let tiles = self.stored(&format!("{base}.trellis"))?;
+        let bits = tiles.len().checked_mul(8).map_or(0, |b| b / (k * n).max(1));
+        let codebook = self
+            .stored(&format!("{base}.mul1"))?
+            .first_chunk::<4>()
+            .map(|word| u32::from_le_bytes(*word))
+            .unwrap_or_default();
+        if codebook != crate::qwen4exp::exl3::CODEBOOK {
+            return Err(VisionError::Unsupported {
+                what: "a trellis tower projection quantized against another codebook",
+            });
+        }
+        let t = crate::qwen4exp::exl3::Trellis {
+            tiles,
+            suh: self.stored(&format!("{base}.suh"))?,
+            svh: self.stored(&format!("{base}.svh"))?,
+            k,
+            n,
+            bits,
+        };
+        let (payload, _) =
+            crate::qwen4exp::exl3::assemble(&t, crate::qwen4exp::exl3::Move::InPlace)
+                .map_err(fail)?;
+        let dtype = match bits {
+            4 => DType::Exl3K4,
+            5 => DType::Exl3K5,
+            6 => DType::Exl3K6,
+            _ => {
+                return Err(VisionError::Unsupported {
+                    what: "a trellis tower projection of a width the kernels do not decode",
+                });
+            }
+        };
+        let weight = shiso_engine::sparse::weights::Weight::uploaded(
+            &self.backend,
+            dtype,
+            u32::try_from(k).unwrap_or(u32::MAX),
+            u32::try_from(n).unwrap_or(u32::MAX),
+            1,
+            payload,
+        )
+        .map_err(fail)?;
+        let expanded =
+            shiso_engine::sparse::expand::trellis_to_half(&self.backend, &self.entries, &weight)
+                .map_err(fail)?;
+        Ok(Cow::Owned(transpose_halves(&expanded, k, n)))
+    }
+}
+
+/// A row-major `[rows, cols]` matrix of halves as `[cols, rows]`.
+fn transpose_halves(src: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    let mut out = vec![0u8; src.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            let from = (r * cols + c) * 2;
+            let to = (c * rows + r) * 2;
+            out[to..to + 2].copy_from_slice(&src[from..from + 2]);
+        }
+    }
+    out
 }
 
 /// Moves one checked tensor to the device.

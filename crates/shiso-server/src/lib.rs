@@ -29,7 +29,9 @@ pub mod audio;
 pub mod cli;
 pub mod decision;
 pub mod error;
+pub mod hub;
 pub mod ids;
+pub mod image;
 pub mod media;
 pub mod media_cache;
 pub mod model_factory;
@@ -68,10 +70,28 @@ const LOG_ENV: &str = "SHISO_LOG";
 /// build with no backend, a checkpoint that does not load, an address already
 /// in use.
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    run_with_matches(cli, None).await
+}
+
+/// Runs the CLI command, merging matching argument sources when provided (§6.6).
+///
+/// # Errors
+/// Returns an error if the server fails to start, model cannot be resolved,
+/// or hub subcommand encounters an error.
+pub async fn run_with_matches(cli: Cli, matches: Option<clap::ArgMatches>) -> anyhow::Result<()> {
     install_tracing();
     match cli.command {
-        Command::Serve(args) => serve(*args).await,
+        Command::Serve(mut args) => {
+            let serve_matches = matches.as_ref().and_then(|m| m.subcommand_matches("serve"));
+            let _lock = hub::resolve_serve_model(&mut args, serve_matches)?;
+            serve(*args).await
+        }
         Command::Router(args) => router(*args).await,
+        Command::Pull(args) => hub::run_pull(args).await,
+        Command::List(args) => hub::run_list(args).await,
+        Command::Info(args) => hub::run_info(args).await,
+        Command::Verify(args) => hub::run_verify(args).await,
+        Command::Rm(args) => hub::run_rm(&args),
     }
 }
 
@@ -113,6 +133,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // memory must see their weights already resident, or it takes the memory
     // they then load into.
     let audio = boot_audio(&args)?;
+    // The image model loads before the language model for the same reason the
+    // speech models do: a KV pool sized to a share of free device memory must
+    // see its weights already resident.
+    let image = boot_image(&args)?;
     let (mut state, engine_thread) = match args.model.as_deref() {
         Some(model) => {
             let (state, join) = boot_language_model(&args, model)?;
@@ -122,6 +146,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     };
     if let Some(audio) = audio {
         state = state.with_audio(audio);
+    }
+    if let Some(image) = image {
+        state = state
+            .with_image(image)
+            .with_image_defaults(args.image_defaults()?);
     }
 
     shutdown::install();
@@ -240,6 +269,91 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
     Ok(Some(service))
 }
 
+/// Opens the image generation model and starts its worker, when
+/// `--image-model` was given.
+///
+/// On a backend instance of its own: a device that records the language
+/// model's launches for replay must not find a diffusion step's launches in
+/// the recording. The worker thread runs until every handle to the service is
+/// dropped, which is when the server stops.
+///
+/// # Errors
+///
+/// A checkpoint that will not load, an asset the locator could not find, or
+/// a device that will not open.
+// `Ok(None)` is a server without image generation: no `--image-model` was given.
+pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService>> {
+    let Some(path) = args.image_model.as_deref() else {
+        return Ok(None);
+    };
+    let backend = open_image_backend(args)?;
+    let started = std::time::Instant::now();
+    let desc = shiso_models::flux2::config::ImageModelDesc {
+        model_path: path.to_path_buf(),
+        text_encoder_path: args.image_text_encoder.clone(),
+        vae_path: args.image_vae.clone(),
+        tokenizer_path: args.image_tokenizer.clone(),
+        assets_dir: args.image_assets_dir.clone(),
+    };
+    let generator = shiso_models::image_registry::open_image_generator(&desc, &backend)
+        .with_context(|| format!("loading image model at {}", path.display()))?;
+    // Every weight this process will read for generation is resident now, so
+    // whatever the backend kept to make those imports fast can go.
+    backend.finish_imports();
+    let model_id = args
+        .image_model_id
+        .clone()
+        .unwrap_or_else(|| generator.model_id().to_string());
+    tracing::info!(
+        path = %path.display(),
+        id = %model_id,
+        seconds = started.elapsed().as_secs_f64(),
+        "the image model is resident"
+    );
+    let service = image::ImageService::start(image::ImageServiceDesc {
+        generator,
+        model_id,
+        max_queue: args.image_max_queue,
+    })
+    .context("starting image service worker")?;
+    Ok(Some(service))
+}
+
+/// The control tokens no generated token may be, handed to the model and
+/// returned for the scheduler.
+///
+/// A model that takes greedy picks of its own - a speculative verify - is told
+/// the list; the scheduler masks every row it draws from with what this
+/// returns. A failure is a model that cannot keep its own picks off the list,
+/// which is a boot failure rather than a server that sometimes ends a turn on a
+/// quoted closer. No vocabulary means no specials are known, and nothing is
+/// suppressed.
+fn suppress_control_tokens(
+    model: &mut dyn shiso_core::Model,
+    vocabulary: Option<&tokenizer::Vocabulary>,
+    (reasoning, tools): (
+        shiso_parsers::ReasoningScheme,
+        shiso_parsers::ToolCallScheme,
+    ),
+) -> anyhow::Result<Arc<[shiso_core::TokenId]>> {
+    let suppressed = vocabulary
+        .map(|vocabulary| {
+            vocabulary.generation_suppressed(
+                model.info().stop_tokens,
+                &shiso_parsers::generated_tags(reasoning, tools),
+            )
+        })
+        .unwrap_or_default();
+    model
+        .suppress_tokens(&suppressed)
+        .context("keeping the model's own picks off the control tokens")?;
+    tracing::info!(
+        count = suppressed.len(),
+        "control tokens suppressed in generation"
+    );
+    Ok(Arc::from(suppressed))
+}
+
 /// The engine thread's handle, joined at shutdown.
 type EngineThread = std::thread::JoinHandle<Result<(), scheduler::EngineFailure>>;
 
@@ -301,7 +415,7 @@ fn boot_language_model(
     log_kv_capacity(model.as_ref(), args, tier.is_some());
 
     let model_id = args.model_id();
-    let scheduler = scheduler_config(args)?;
+    let mut scheduler = scheduler_config(args)?;
     // The renderer reads the store the scheduler writes.
     let turn_replay = scheduler.turn_replay.clone();
     let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);
@@ -312,6 +426,12 @@ fn boot_language_model(
         thinking_default = defaults.thinking_default,
         "output parsers configured"
     );
+    // Before the engine thread exists, so no pass ever runs without it.
+    scheduler.suppressed = suppress_control_tokens(
+        model.as_mut(),
+        vocabulary.as_deref(),
+        (reasoning_scheme, tool_call_scheme),
+    )?;
     // One cache, read by the renderer and filled by the engine thread, so a
     // picture is decoded and encoded once however many turns carry it.
     let media_cache = (vision.is_some() || audio.is_some()).then(|| {
@@ -411,6 +531,16 @@ fn load_checkpoint(
     args: &ServeArgs,
     model: &std::path::Path,
 ) -> anyhow::Result<model_factory::Loaded> {
+    // A table nothing reads is an operator who believes a model is using it.
+    if let Some(ngram) = &args.ngram
+        && !model_factory::takes_ngram(config, model)
+    {
+        anyhow::bail!(
+            "--ngram {} was given, but the checkpoint at {} has no n-gram table file to read",
+            ngram.display(),
+            model.display()
+        );
+    }
     let _tag = shiso_core::ledger::scope(shiso_core::MemTag::WeightsOther);
     let started = std::time::Instant::now();
     let loaded = model_factory::load_model(backend, model, config, args)
@@ -659,6 +789,29 @@ fn open_audio_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::B
 /// As [`open_backend`]: this build has no device for the speech models.
 #[cfg(not(any(feature = "metal", feature = "cuda")))]
 fn open_audio_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+    open_backend(args)
+}
+
+/// Opens the backend instance the image generation model runs on: the same
+/// device, a command stream of its own, and no launch recording.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn open_image_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+    open_backend(args)
+}
+
+/// Opens the backend instance the image generation model runs on. Decode
+/// graphs stay off here: a diffusion step is never replayed.
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+fn open_image_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+    let options = shiso_cuda::CudaOptions::default().with_decode_graphs(false);
+    let backend = shiso_cuda::CudaBackend::new(0, options)
+        .context("opening the CUDA device for the image generation model")?;
+    Ok(backend)
+}
+
+/// As [`open_backend`]: this build has no device for the image generation model.
+#[cfg(not(any(feature = "metal", feature = "cuda")))]
+fn open_image_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
     open_backend(args)
 }
 

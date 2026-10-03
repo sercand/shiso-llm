@@ -189,6 +189,7 @@ fn the_real_manifest_tree_parses() {
             "qwen35",
             "qwen35moe",
             "repack",
+            "sample",
             "vision",
             "vision_attn",
             "vision_embed",

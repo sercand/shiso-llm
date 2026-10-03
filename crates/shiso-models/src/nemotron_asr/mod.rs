@@ -12,6 +12,12 @@ mod stream;
 pub mod transducer;
 pub mod weights;
 
+use crate::catalog::FamilyFacts;
+
+/// Family facts for Nemotron ASR.
+pub const FACTS: FamilyFacts = FamilyFacts {
+    name: "nemotron_asr",
+};
 use std::path::Path;
 use std::sync::Arc;
 

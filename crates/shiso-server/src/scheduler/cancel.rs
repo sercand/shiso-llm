@@ -213,6 +213,7 @@ mod tests {
                 deadline,
                 budget: 8,
                 keyed: false,
+                suppressed: Arc::from([]),
                 score_reply: None,
             },
             None,

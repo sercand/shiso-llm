@@ -29,6 +29,7 @@ pub mod oracle;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen4exp;
+pub mod sample;
 pub mod vision;
 
 pub use crate::harness::{Gpu, drain, f32_bytes, f32_values, run};

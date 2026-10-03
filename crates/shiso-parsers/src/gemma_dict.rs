@@ -4,6 +4,9 @@
 //! `{key1:value1,key2:value2}` where string values are quoted with `<|"|>` … `<|"|>`.
 //! This module parses that grammar and converts it to standard JSON text.
 
+/// The quote a Gemma 4 call body spells every string value between.
+pub const STRING_QUOTE: &str = "<|\"|>";
+
 /// An error that occurred while converting a Gemma dictionary to JSON.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("gemma dict parse error at byte offset {offset}: {message}")]
@@ -156,8 +159,8 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
 
         // 1. String: <|"|>...<|"|>
-        if self.input[self.pos..].starts_with("<|\"|>") {
-            let quote = "<|\"|>";
+        if self.input[self.pos..].starts_with(STRING_QUOTE) {
+            let quote = STRING_QUOTE;
             self.pos += quote.len();
             let content_start = self.pos;
             let rest = &self.input[self.pos..];

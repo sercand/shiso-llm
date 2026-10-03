@@ -292,8 +292,10 @@ impl VisionEncoder {
     ) -> Result<DeviceBuffer, VisionError> {
         let dims = weights.dims();
         let plan = Plan::new(dims, item)?;
-        let run = Run::new(backend, *self, &plan)?;
-        let positions = Self::resample_positions(backend, weights, plan.grid_h, plan.grid_w)?;
+        let width = WeightWidth::of(weights)?;
+        let run = Run::new(backend, *self, &plan, width)?;
+        let positions =
+            Self::resample_positions(backend, weights, width, plan.grid_h, plan.grid_w)?;
         Self::forward(&run, &plan, weights, item, &positions, &mut NoopSink)
     }
 
@@ -310,8 +312,10 @@ impl VisionEncoder {
     ) -> Result<VisionStages, VisionError> {
         let dims = weights.dims();
         let plan = Plan::new(dims, item)?;
-        let run = Run::new(backend, *self, &plan)?;
-        let positions = Self::resample_positions(backend, weights, plan.grid_h, plan.grid_w)?;
+        let width = WeightWidth::of(weights)?;
+        let run = Run::new(backend, *self, &plan, width)?;
+        let positions =
+            Self::resample_positions(backend, weights, width, plan.grid_h, plan.grid_w)?;
         let mut sink = CollectorSink::new(backend, weights.dims().depth());
         let _out = Self::forward(&run, &plan, weights, item, &positions, &mut sink)?;
         sink.finish()
@@ -583,13 +587,14 @@ impl VisionEncoder {
     fn resample_positions(
         backend: &Arc<dyn Backend>,
         weights: &VisionWeights,
+        width: WeightWidth,
         grid_h: usize,
         grid_w: usize,
     ) -> Result<Vec<f32>, VisionError> {
         let dims = weights.dims();
         let hidden = dims.hidden();
         let side = dims.position_grid();
-        let table = read_bf16(backend, &weights.tensors().pos_embed)?;
+        let table = read_weight(backend, &weights.tensors().pos_embed, width)?;
 
         let mut out = vec![0.0f32; grid_h * grid_w * hidden];
         let span = widen(side - 1);
@@ -690,14 +695,14 @@ fn mma_args(plan: &Plan, split: &SplitPlanes) -> AttentionMmaArgs {
     }
 }
 
-/// Widens a brain-float tensor off the device into host floats.
-fn read_bf16(backend: &Arc<dyn Backend>, tensor: &TowerTensor) -> Result<Vec<f32>, VisionError> {
-    if tensor.dtype() != DType::BF16 {
-        return Err(VisionError::WeightDType {
-            name: tensor.name().to_owned(),
-            dtype: tensor.dtype(),
-        });
-    }
+/// Widens a tower tensor off the device into host floats, in the tower's
+/// storage width.
+fn read_weight(
+    backend: &Arc<dyn Backend>,
+    tensor: &TowerTensor,
+    width: WeightWidth,
+) -> Result<Vec<f32>, VisionError> {
+    weight_view(tensor, width)?;
     let len = usize::try_from(tensor.buffer().len()).unwrap_or(usize::MAX);
     let mut bytes = vec![0u8; len];
     backend
@@ -706,12 +711,15 @@ fn read_bf16(backend: &Arc<dyn Backend>, tensor: &TowerTensor) -> Result<Vec<f32
             step: "position table read-back",
             source,
         })?;
-    Ok(bytes
+    let words = bytes
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16))
-        .collect())
+        .map(|pair| u16::from_le_bytes(*pair));
+    Ok(match width {
+        WeightWidth::Bf16 => words.map(|w| f32::from_bits(u32::from(w) << 16)).collect(),
+        WeightWidth::F16 => words.map(|w| half::f16::from_bits(w).to_f32()).collect(),
+    })
 }
 
 /// Every shape one encode needs, checked once.
@@ -832,7 +840,7 @@ impl Fast {
     };
 
     /// What `backend` offers, for a tower whose head is `head_dim` wide.
-    fn probe(backend: &Arc<dyn Backend>, head_dim: usize) -> Self {
+    fn probe(backend: &Arc<dyn Backend>, head_dim: usize, width: WeightWidth) -> Self {
         let entries = backend.module_entries(MODULE);
         let has = |name: &str| entries.iter().any(|entry| entry == name);
         let attention = has(ATTENTION_MMA)
@@ -841,7 +849,7 @@ impl Fast {
             && head_dim.is_multiple_of(2);
         Self {
             attention,
-            rope_split: attention && has(ROPE_SPLIT),
+            rope_split: attention && has(width.entry(ROPE_SPLIT)),
             blas: backend.as_blas().is_some()
                 && [
                     TO_BF16,
@@ -851,7 +859,7 @@ impl Fast {
                     BIAS_RESIDUAL,
                 ]
                 .iter()
-                .all(|name| has(name)),
+                .all(|name| has(width.entry(name))),
         }
     }
 }
@@ -892,6 +900,9 @@ struct Run<'a> {
     eps: f32,
     rope_base: f32,
     fast: Fast,
+    /// The width every weight of the tower is stored in, which picks each
+    /// weight-reading entry and the projections' BLAS type.
+    width: WeightWidth,
     /// A projection's operand as two brain-float planes, the nearest value and
     /// what it left over, sized for the widest one of this encode; `None`
     /// unless the projections run in the BLAS.
@@ -915,11 +926,12 @@ impl<'a> Run<'a> {
         backend: &'a Arc<dyn Backend>,
         encoder: VisionEncoder,
         plan: &Plan,
+        width: WeightWidth,
     ) -> Result<Self, VisionError> {
         let fast = if encoder.scalar_only {
             Fast::SCALAR
         } else {
-            Fast::probe(backend, plan.head_dim)
+            Fast::probe(backend, plan.head_dim, width)
         };
         // The widest operand any projection reads: the patch rows, the
         // hidden stream, the feed-forward rows, or the merger's folded rows,
@@ -968,6 +980,7 @@ impl<'a> Run<'a> {
             eps: encoder.eps,
             rope_base: encoder.rope_base,
             fast,
+            width,
             operand,
             split,
         })
@@ -975,6 +988,11 @@ impl<'a> Run<'a> {
 }
 
 impl Run<'_> {
+    /// One weight of the tower, checked against the tower's width.
+    fn weight<'t>(&self, tensor: &'t TowerTensor) -> Result<DeviceView<'t>, VisionError> {
+        weight_view(tensor, self.width)
+    }
+
     /// Allocates an f32 buffer of `len` values.
     ///
     /// Deliberately not zeroed. Every buffer this hands out is written in full
@@ -1045,8 +1063,8 @@ impl Run<'_> {
             self.multiply(step, out, layer, shape)?;
             return self.add_bias(step, out, layer, shape);
         }
-        let weight = bf16_view(&layer.weight)?;
-        let bias = bf16_view(&layer.bias)?;
+        let weight = self.weight(&layer.weight)?;
+        let bias = self.weight(&layer.bias)?;
         let args = GemmArgs {
             m: narrow(shape.rows),
             n: narrow(shape.out_width),
@@ -1054,7 +1072,7 @@ impl Run<'_> {
         };
         self.launch(
             step,
-            "kernel_vit_gemm_bias",
+            self.width.entry("kernel_vit_gemm_bias"),
             Extent3::new(
                 grid_for(shape.out_width, GEMM_TILE),
                 grid_for(shape.rows, GEMM_TILE),
@@ -1109,7 +1127,7 @@ impl Run<'_> {
         let planes = self.operand_planes(step, reads)?;
         self.launch(
             step,
-            TO_BF16,
+            self.width.entry(TO_BF16),
             Extent3::linear(grid_for(reads, LINEAR_BLOCK)),
             Extent3::linear(LINEAR_BLOCK),
             0,
@@ -1147,7 +1165,7 @@ impl Run<'_> {
         let reads = shape.rows * shape.in_width;
         let planes = self.operand_planes(step, reads)?;
         let plane = u64::try_from(reads).unwrap_or(u64::MAX) * 2;
-        let weight = bf16_view(&layer.weight)?;
+        let weight = self.weight(&layer.weight)?;
         let (m, n, k) = (
             narrow(shape.out_width),
             narrow(shape.rows),
@@ -1169,7 +1187,7 @@ impl Run<'_> {
                 alpha: 1.0,
                 // The second plane adds onto the first's product.
                 beta,
-                dtype: shiso_core::GemmDType::BF16,
+                dtype: self.width.gemm_dtype(),
                 reduction: shiso_core::GemmReduction::Fastest,
             })
             .map_err(fail)?;
@@ -1188,7 +1206,7 @@ impl Run<'_> {
         let writes = shape.rows * shape.out_width;
         self.launch(
             step,
-            ADD_BIAS_BF16,
+            self.width.entry(ADD_BIAS_BF16),
             Extent3::linear(grid_for(writes, LINEAR_BLOCK)),
             Extent3::linear(LINEAR_BLOCK),
             0,
@@ -1198,7 +1216,7 @@ impl Run<'_> {
                     period: narrow(shape.out_width),
                 })),
                 KernelArg::Buffer(out.view()),
-                KernelArg::Buffer(bf16_view(&layer.bias)?),
+                KernelArg::Buffer(self.weight(&layer.bias)?),
             ],
         )
     }
@@ -1221,7 +1239,7 @@ impl Run<'_> {
         };
         self.launch(
             step,
-            NORM_SPLIT,
+            self.width.entry(NORM_SPLIT),
             Extent3::linear(narrow(rows)),
             Extent3::linear(NORM_BLOCK),
             NORM_SMEM,
@@ -1229,8 +1247,8 @@ impl Run<'_> {
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(planes),
                 KernelArg::Buffer(input.view()),
-                KernelArg::Buffer(bf16_view(&layer.weight)?),
-                KernelArg::Buffer(bf16_view(&layer.bias)?),
+                KernelArg::Buffer(self.weight(&layer.weight)?),
+                KernelArg::Buffer(self.weight(&layer.bias)?),
             ],
         )
     }
@@ -1248,7 +1266,7 @@ impl Run<'_> {
         let planes = self.operand_planes(step, count)?;
         self.launch(
             step,
-            BIAS_GELU_SPLIT,
+            self.width.entry(BIAS_GELU_SPLIT),
             Extent3::linear(grid_for(count, LINEAR_BLOCK)),
             Extent3::linear(LINEAR_BLOCK),
             0,
@@ -1259,7 +1277,7 @@ impl Run<'_> {
                 })),
                 KernelArg::Buffer(planes),
                 KernelArg::Buffer(x.view()),
-                KernelArg::Buffer(bf16_view(&layer.bias)?),
+                KernelArg::Buffer(self.weight(&layer.bias)?),
             ],
         )
     }
@@ -1276,7 +1294,7 @@ impl Run<'_> {
         let count = shape.rows * shape.out_width;
         self.launch(
             step,
-            BIAS_RESIDUAL,
+            self.width.entry(BIAS_RESIDUAL),
             Extent3::linear(grid_for(count, LINEAR_BLOCK)),
             Extent3::linear(LINEAR_BLOCK),
             0,
@@ -1286,7 +1304,7 @@ impl Run<'_> {
                     period: narrow(shape.out_width),
                 })),
                 KernelArg::Buffer(x.view()),
-                KernelArg::Buffer(bf16_view(&layer.bias)?),
+                KernelArg::Buffer(self.weight(&layer.bias)?),
                 KernelArg::Buffer(residual.view()),
             ],
         )
@@ -1302,8 +1320,8 @@ impl Run<'_> {
         rows: usize,
         dim: usize,
     ) -> Result<(), VisionError> {
-        let weight = bf16_view(&layer.weight)?;
-        let bias = bf16_view(&layer.bias)?;
+        let weight = self.weight(&layer.weight)?;
+        let bias = self.weight(&layer.bias)?;
         let args = LayerNormArgs {
             rows: narrow(rows),
             dim: narrow(dim),
@@ -1311,7 +1329,7 @@ impl Run<'_> {
         };
         self.launch(
             step,
-            "kernel_vit_layer_norm",
+            self.width.entry("kernel_vit_layer_norm"),
             Extent3::linear(narrow(rows)),
             Extent3::linear(NORM_BLOCK),
             NORM_SMEM,
@@ -1529,7 +1547,7 @@ impl Run<'_> {
         };
         self.launch(
             "rotation",
-            ROPE_SPLIT,
+            self.width.entry(ROPE_SPLIT),
             Extent3::new(narrow(plan.heads), narrow(plan.rows), 1),
             Extent3::linear(ATTN_BLOCK),
             0,
@@ -1539,7 +1557,7 @@ impl Run<'_> {
                 KernelArg::Buffer(split.keys.view()),
                 KernelArg::Buffer(split.values.view()),
                 KernelArg::Buffer(qkv.view()),
-                KernelArg::Buffer(bf16_view(&layer.bias)?),
+                KernelArg::Buffer(self.weight(&layer.bias)?),
             ],
         )
     }
@@ -1575,19 +1593,98 @@ impl Run<'_> {
 
 /// A tower weight as the kernels read it, or a named refusal.
 ///
-/// The kernels widen a brain-float by shifting its bits, which is exact and
-/// cheap but is not a conversion: handed a tensor stored some other way they
-/// would read the wrong numbers and say nothing. The loader accepts three
-/// storage widths, so this is where the encoder's narrower requirement is
-/// stated, per tensor, with the tensor's own name on it.
-fn bf16_view(tensor: &TowerTensor) -> Result<DeviceView<'_>, VisionError> {
-    if tensor.dtype() != DType::BF16 {
+/// The kernels widen a weight by its storage width - a brain float by a
+/// shift, a half by the conversion - and handed a tensor stored some other
+/// way they would read the wrong numbers and say nothing. So every weight is
+/// checked against the one width the tower was found in, with the tensor's
+/// own name on a mismatch.
+fn weight_view(tensor: &TowerTensor, width: WeightWidth) -> Result<DeviceView<'_>, VisionError> {
+    if tensor.dtype() != width.dtype() {
         return Err(VisionError::WeightDType {
             name: tensor.name().to_owned(),
             dtype: tensor.dtype(),
         });
     }
     Ok(tensor.view())
+}
+
+/// The width a tower's weights are stored in, which every weight-reading
+/// kernel is built for once each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WeightWidth {
+    /// Brain floats: the checkpoint towers and the standalone one.
+    Bf16,
+    /// IEEE halves: the trellis export's tower.
+    F16,
+}
+
+impl WeightWidth {
+    /// The one width every tensor of `weights` shares.
+    ///
+    /// # Errors
+    ///
+    /// [`VisionError::WeightDType`] naming the first tensor stored in another
+    /// width than the patch projection, or in one no kernel reads.
+    fn of(weights: &VisionWeights) -> Result<Self, VisionError> {
+        let first = &weights.tensors().patch_embed.weight;
+        let width = match first.dtype() {
+            DType::BF16 => Self::Bf16,
+            DType::F16 => Self::F16,
+            other => {
+                return Err(VisionError::WeightDType {
+                    name: first.name().to_owned(),
+                    dtype: other,
+                });
+            }
+        };
+        if let Some(odd) = weights
+            .tensors()
+            .iter()
+            .find(|t| t.dtype() != width.dtype())
+        {
+            return Err(VisionError::WeightDType {
+                name: odd.name().to_owned(),
+                dtype: odd.dtype(),
+            });
+        }
+        Ok(width)
+    }
+
+    /// The element type the width is.
+    const fn dtype(self) -> DType {
+        match self {
+            Self::Bf16 => DType::BF16,
+            Self::F16 => DType::F16,
+        }
+    }
+
+    /// The BLAS type a projection over these weights multiplies in.
+    const fn gemm_dtype(self) -> shiso_core::GemmDType {
+        match self {
+            Self::Bf16 => shiso_core::GemmDType::BF16,
+            Self::F16 => shiso_core::GemmDType::F16,
+        }
+    }
+
+    /// The entry a weight-reading kernel answers to at this width: the
+    /// brain-float name as given, its `_f16` twin otherwise. A kernel that
+    /// reads no weight has one entry for both.
+    fn entry(self, bf16: &'static str) -> &'static str {
+        if self == Self::Bf16 {
+            return bf16;
+        }
+        match bf16 {
+            "kernel_vit_gemm_bias" => "kernel_vit_gemm_bias_f16",
+            "kernel_vit_layer_norm" => "kernel_vit_layer_norm_f16",
+            TO_BF16 => "kernel_vit_to_f16",
+            ADD_BIAS_BF16 => "kernel_vit_add_bias_f16",
+            NORM_SPLIT => "kernel_vit_layer_norm_split_f16",
+            BIAS_GELU_SPLIT => "kernel_vit_bias_gelu_split_f16",
+            BIAS_RESIDUAL => "kernel_vit_add_bias_residual_f16",
+            ROPE_SPLIT => "kernel_vit_qkv_rope_split_f16",
+            other => other,
+        }
+    }
 }
 
 /// A grid extent in the float domain the sample arithmetic works in.

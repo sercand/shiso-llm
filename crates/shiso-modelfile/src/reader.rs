@@ -403,13 +403,6 @@ pub(crate) struct Mapping {
     path: PathBuf,
     map: Mmap,
     /// Kept open so the page cache can be advised about the mapping's pages.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        expect(
-            dead_code,
-            reason = "only the Linux page-cache advice reads the descriptor"
-        )
-    )]
     file: File,
 }
 
@@ -447,57 +440,10 @@ impl Mapping {
     }
 
     /// Unmaps `range` from this process and drops its pages from the page
-    /// cache, where the kernel will.
-    ///
-    /// Both halves are needed: the cache keeps a page any process still maps,
-    /// so advising the file alone leaves every page this process faulted in.
-    /// Advice only - the bytes stay readable, and a later read faults them back
-    /// in from the file - so a failure is not reported.
-    #[cfg(target_os = "linux")]
+    /// cache, where the kernel will. See [`release_pages`].
     fn release(&self, range: Range<usize>) {
-        use std::os::fd::AsRawFd;
-        const PAGE: usize = 4096;
-        let Some(bytes) = self.map.get(range.clone()) else {
-            return;
-        };
-        let start = bytes.as_ptr() as usize;
-        let aligned = start.next_multiple_of(PAGE);
-        let end = (start + bytes.len()) & !(PAGE - 1);
-        if end > aligned {
-            // SAFETY: the range lies inside this read-only shared file mapping,
-            // on whole pages that hold nothing but bytes of `range`.
-            // `MADV_DONTNEED` on such a mapping only drops the page-table
-            // entries: the next access faults the same file bytes back in, so
-            // every slice handed out from the mapping stays valid and unchanged.
-            let _ = unsafe {
-                libc::madvise(
-                    aligned as *mut libc::c_void,
-                    end - aligned,
-                    libc::MADV_DONTNEED,
-                )
-            };
-        }
-        let offset = libc::off_t::try_from(range.start).unwrap_or(libc::off_t::MAX);
-        let len = libc::off_t::try_from(bytes.len()).unwrap_or(0);
-        // SAFETY: advice on a file descriptor this mapping owns; it reads and
-        // writes no memory of this process.
-        let _ = unsafe {
-            libc::posix_fadvise(
-                self.file.as_raw_fd(),
-                offset,
-                len,
-                libc::POSIX_FADV_DONTNEED,
-            )
-        };
+        release_pages(&self.map, &self.file, range);
     }
-
-    /// Nothing to release on a target without the advice calls.
-    #[cfg(not(target_os = "linux"))]
-    #[expect(
-        clippy::unused_self,
-        reason = "the Linux twin advises through the descriptor, and both share one signature"
-    )]
-    fn release(&self, _range: Range<usize>) {}
 
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.map
@@ -507,6 +453,50 @@ impl Mapping {
         u64::try_from(self.map.len()).unwrap_or(u64::MAX)
     }
 }
+
+/// Unmaps `range` of `map` from this process and drops its pages from the
+/// page cache, where the kernel will.
+///
+/// Both halves are needed: the cache keeps a page any process still maps, so
+/// advising the file alone leaves every page this process faulted in. Advice
+/// only - the bytes stay readable, and a later read faults them back in from
+/// the file - so a failure is not reported. `file` is the descriptor `map` was
+/// taken over.
+#[cfg(target_os = "linux")]
+pub(crate) fn release_pages(map: &Mmap, file: &File, range: Range<usize>) {
+    use std::os::fd::AsRawFd;
+    const PAGE: usize = 4096;
+    let Some(bytes) = map.get(range.clone()) else {
+        return;
+    };
+    let start = bytes.as_ptr() as usize;
+    let aligned = start.next_multiple_of(PAGE);
+    let end = (start + bytes.len()) & !(PAGE - 1);
+    if end > aligned {
+        // SAFETY: the range lies inside a read-only shared file mapping, on
+        // whole pages that hold nothing but bytes of `range`. `MADV_DONTNEED`
+        // on such a mapping only drops the page-table entries: the next access
+        // faults the same file bytes back in, so every slice handed out from
+        // the mapping stays valid and unchanged.
+        let _ = unsafe {
+            libc::madvise(
+                aligned as *mut libc::c_void,
+                end - aligned,
+                libc::MADV_DONTNEED,
+            )
+        };
+    }
+    let offset = libc::off_t::try_from(range.start).unwrap_or(libc::off_t::MAX);
+    let len = libc::off_t::try_from(bytes.len()).unwrap_or(0);
+    let fd = file.as_raw_fd();
+    // SAFETY: advice on a file descriptor the caller owns; it reads and writes
+    // no memory of this process.
+    let _ = unsafe { libc::posix_fadvise(fd, offset, len, libc::POSIX_FADV_DONTNEED) };
+}
+
+/// Nothing to release on a target without the advice calls.
+#[cfg(not(target_os = "linux"))]
+pub(crate) const fn release_pages(_map: &Mmap, _file: &File, _range: Range<usize>) {}
 
 impl AsRef<[u8]> for Mapping {
     fn as_ref(&self) -> &[u8] {

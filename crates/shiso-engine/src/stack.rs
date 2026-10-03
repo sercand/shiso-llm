@@ -179,6 +179,9 @@ pub struct HybridStack {
     pub(crate) block: Option<crate::block_draft::BlockDrafter>,
     /// The block verified and not yet settled, when there is one.
     pub(crate) pending: Option<PendingBlock>,
+    /// The ids no greedy pick this stack takes may land on; see
+    /// [`HybridStack::suppress_tokens`].
+    pub(crate) suppressed: Vec<TokenId>,
     pub(crate) staging: Staging,
     /// The disk tier, once a caller has turned it on.
     ///
@@ -267,6 +270,7 @@ impl std::fmt::Debug for HybridStack {
             .field("draft", &self.draft.is_some())
             .field("block", &self.block.is_some())
             .field("pending", &self.pending.as_ref().map(|p| p.session))
+            .field("suppressed", &self.suppressed.len())
             .field("staging", &self.staging)
             .field("ckpt", &self.ckpt)
             .field("clock", &self.clock)
@@ -481,6 +485,7 @@ impl HybridStack {
             draft: None,
             block: None,
             pending: None,
+            suppressed: Vec::new(),
             staging: Staging::default(),
             ckpt: None,
             clock: Instant::now(),

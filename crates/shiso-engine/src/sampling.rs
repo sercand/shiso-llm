@@ -153,6 +153,26 @@ pub fn argmax(logits: &[f32]) -> TokenId {
     TokenId::new(u32::try_from(argmax_index(logits)).unwrap_or(u32::MAX))
 }
 
+/// Writes `-inf` at every id of `ids` in `logits`, so no stage after it can
+/// pick one.
+///
+/// In place, because the rows it serves are already owned copies of what the
+/// device wrote: a copy here would be a vocabulary-wide allocation per token
+/// to change a few dozen entries. Every stage of the sampler skips a
+/// non-finite logit, so `-inf` is exactly "not a candidate". An id past the
+/// row is ignored: the list was checked against the vocabulary when it was
+/// built.
+pub fn suppress(logits: &mut [f32], ids: &[TokenId]) {
+    for id in ids {
+        if let Some(slot) = usize::try_from(id.get())
+            .ok()
+            .and_then(|at| logits.get_mut(at))
+        {
+            *slot = f32::NEG_INFINITY;
+        }
+    }
+}
+
 /// The row's largest finite logit, the lowest id attaining it, and how many
 /// entries are finite.
 ///
@@ -623,8 +643,25 @@ pub fn rng_f32(rng: &mut Seed) -> f32 {
 }
 #[cfg(test)]
 mod tests {
-    use super::{Stage, candidates, reject_boundary, sample_logits};
+    use super::{Stage, argmax, candidates, reject_boundary, sample_logits, suppress};
     use shiso_core::{SamplingParams, Seed, TokenId};
+
+    /// A suppressed id holding the maximum loses it to the next best, and an
+    /// id past the row is ignored rather than written out of bounds.
+    #[test]
+    fn a_suppressed_maximum_is_never_the_pick() {
+        let mut row = vec![0.5f32, 9.0, 1.0, 2.0];
+        suppress(&mut row, &[TokenId::new(1), TokenId::new(99)]);
+        assert!(row[1].is_infinite() && row[1].is_sign_negative());
+        assert_eq!(argmax(&row), TokenId::new(3));
+        let mut seed = Seed::new(7);
+        for _ in 0..64 {
+            assert_ne!(
+                sample_logits(&row, &SamplingParams::neutral(), &mut seed),
+                TokenId::new(1)
+            );
+        }
+    }
 
     #[test]
     fn the_rejection_boundary_is_strictly_below_the_floor() {

@@ -704,6 +704,7 @@ fn a_device_failure_names_the_step_it_happened_in() {
         eps: encoder.layer_norm_eps(),
         rope_base: encoder.rope_base(),
         fast: super::Fast::SCALAR,
+        width: super::WeightWidth::Bf16,
         operand: None,
         split: None,
     };

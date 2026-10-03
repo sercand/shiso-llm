@@ -16,7 +16,10 @@
 
 pub mod audio_ops;
 pub mod audio_registry;
+pub mod catalog;
+pub mod flux2;
 pub mod gemma4;
+pub mod image_registry;
 pub mod nemotron_asr;
 pub mod nemotron_diar;
 pub mod nemotron_h;
@@ -24,3 +27,21 @@ pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen3_asr;
 pub mod qwen4exp;
+
+pub use catalog::FamilyFacts;
+
+/// Returns the catalog of all model families supported by `shiso-models`.
+#[must_use]
+pub fn family_catalog() -> &'static [FamilyFacts] {
+    &[
+        qwen35::FACTS,
+        qwen35moe::FACTS,
+        qwen4exp::FACTS,
+        gemma4::FACTS,
+        nemotron_h::FACTS,
+        nemotron_asr::FACTS,
+        nemotron_diar::FACTS,
+        qwen3_asr::FACTS,
+        flux2::FACTS,
+    ]
+}

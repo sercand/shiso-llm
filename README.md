@@ -216,6 +216,15 @@ environment variable. The ones you are most likely to want:
 | `--asr-skip-silence` | Leave out silences of 3 s or more that the diarizer finds in an offline transcription; they yield no text (default true; `--asr-skip-silence=false` turns it off) |
 | `--asr-offline-min-secs` | Shortest non-streaming clip transcribed offline, in seconds (default 300; 0 sends every one) |
 | `--asr-max-context-tokens` | Most tokens a transcription's `keywords` and `prompt` may take once tokenized (default 256; at most the recognizer's own cap, 512 for Qwen3-ASR) |
+| `--image-model` | Image generation checkpoint (file or directory); serves the image generation routes |
+| `--image-model-id` | The name the image generator answers to on the wire (default: the name the loaded checkpoint reports) |
+| `--image-assets-dir` | Directory holding shared image assets (`text_encoder`, `vae`, `tokenizer`) when they are not collocated with `--image-model` |
+| `--image-text-encoder` | Text encoder weights path when it is split from `--image-model`; overrides where the locator would look |
+| `--image-vae` | VAE weights path when it is split from `--image-model`; overrides where the locator would look |
+| `--image-tokenizer` | Tokenizer path when it is split from `--image-model`; overrides where the locator would look |
+| `--image-max-queue` | Image requests that may wait in the queue beyond the one generating (default 16); the next is refused with a 503 a retry can fix |
+| `--image-default-steps` | Denoising steps a request that names none gets (default 4) |
+| `--image-default-size` | The image size a request that names none gets, as `WxH` (default 1024x1024; both sides divisible by 16) |
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
 
@@ -228,6 +237,7 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/audio/transcriptions` | OpenAI Audio Transcriptions (also at `/audio/transcriptions`) |
+| `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein image generation, `b64_json` only) |
 | `GET /v1/models` | OpenAI Models |
 | `GET /health`, `GET /metrics`, `GET /cache` | health, metrics, cache report |
 

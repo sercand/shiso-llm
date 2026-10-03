@@ -318,6 +318,34 @@ pub trait Model: Send + std::fmt::Debug {
         None
     }
 
+    /// Keeps every token the model picks for itself off `ids`.
+    ///
+    /// A scheduler draws from logits rows it reads back, and masks those rows
+    /// itself. What it cannot reach is a pick taken inside the model - the
+    /// greedy picks of a speculative verify - so a model that takes picks of
+    /// its own has to be told the list. The list replaces the last one, and is
+    /// set before the model serves.
+    ///
+    /// The default is right for a model that takes no picks of its own and
+    /// refuses for one that does, so a speculating family that forgot this
+    /// method is a boot failure rather than a draft that lands on a token the
+    /// server said could not be generated.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] from the default on a model with a
+    /// speculative path, and whatever an implementation refuses: an id past
+    /// the vocabulary, or a list longer than it can hold.
+    fn suppress_tokens(&mut self, ids: &[TokenId]) -> CoreResult<()> {
+        if ids.is_empty() || self.spec_mut().is_none() {
+            return Ok(());
+        }
+        Err(CoreError::Unsupported {
+            what: "suppressing tokens in a speculative path that does not implement it",
+            backend: "model",
+        })
+    }
+
     /// Releases device resources, reporting failures.
     ///
     /// Implementations also free what they can from `Drop`, but `Drop` cannot
@@ -455,6 +483,14 @@ impl VerifiedBlock {
         self.logits
             .get(i.saturating_mul(self.vocab)..i.saturating_add(1).saturating_mul(self.vocab))
             .unwrap_or(&[])
+    }
+
+    /// Row `i`'s logits, writable, or an empty slice past the last row: what
+    /// a sampler masks before it draws.
+    pub fn row_mut(&mut self, i: usize) -> &mut [f32] {
+        self.logits
+            .get_mut(i.saturating_mul(self.vocab)..i.saturating_add(1).saturating_mul(self.vocab))
+            .unwrap_or(&mut [])
     }
 }
 

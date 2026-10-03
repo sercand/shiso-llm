@@ -659,3 +659,52 @@ fn mtp_exact_sampling_flag_sets_exact_sampling() {
     let args = parse(&["--model", "m.gguf", "--mtp-exact-sampling"]).expect("it parses");
     assert!(args.mtp_exact_sampling);
 }
+
+/// The default image size is parsed at boot, not at request time: an operator
+/// who typed `--image-default-size banana` must hear about it before the first
+/// caller does. The wire clamps a caller's odd size; an operator's setting is
+/// refused rather than quietly rounded, because a default that silently moved
+/// is not the default that was configured.
+#[test]
+fn an_unservable_image_default_size_refuses_boot() {
+    for value in ["banana", "1024", "1000x1000", "100x100", "3000x3000"] {
+        let args = parse(&[
+            "--image-model",
+            "/models/flux",
+            "--image-default-size",
+            value,
+        ])
+        .expect("it parses");
+        let error = args
+            .validate()
+            .expect_err("{value} is not a servable default");
+        assert!(
+            error.to_string().contains("--image-default-size"),
+            "{value}: {error}"
+        );
+    }
+}
+
+#[test]
+fn the_image_defaults_parse_from_the_flags_that_set_them() {
+    let args = parse(&[
+        "--image-model",
+        "/models/flux",
+        "--image-default-size",
+        "768x1344",
+        "--image-default-steps",
+        "8",
+    ])
+    .expect("it parses");
+    args.validate().expect("a servable default");
+    let defaults = args.image_defaults().expect("the size parses");
+    assert_eq!((defaults.width, defaults.height), (768, 1344));
+    assert_eq!(defaults.steps, 8);
+
+    let args = parse(&["--image-model", "/models/flux"]).expect("it parses");
+    let defaults = args.image_defaults().expect("the defaults parse");
+    assert_eq!(
+        (defaults.width, defaults.height, defaults.steps),
+        (1024, 1024, 4)
+    );
+}

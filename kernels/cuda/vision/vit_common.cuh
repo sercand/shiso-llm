@@ -24,6 +24,7 @@
 #ifndef SHISO_VIT_COMMON_CUH
 #define SHISO_VIT_COMMON_CUH
 
+#include <cuda_fp16.h>
 #include <stdint.h>
 
 /* Square tile the blocked GEMM walks, in both output axes and along the
@@ -66,6 +67,22 @@ extern __shared__ __align__(16) char vit_smem[];
 __device__ __forceinline__ float vit_bf16(const unsigned short *p) {
     return __uint_as_float((unsigned) (*p) << 16);
 }
+
+/* One IEEE half, widened. Exact: every half is a single-precision value. */
+__device__ __forceinline__ float vit_f16(const unsigned short *p) {
+    return __half2float(__ushort_as_half(*p));
+}
+
+/* How a tower's weights are stored, as a type the weight-reading kernels are
+ * templated on: one body per kernel, instantiated once per storage width, so
+ * the two widths cannot drift apart in anything but the load. Each entry point
+ * keeps its brain-float name and gains an `_f16` twin. */
+struct vit_w_bf16 {
+    static __device__ __forceinline__ float load(const unsigned short *p) { return vit_bf16(p); }
+};
+struct vit_w_f16 {
+    static __device__ __forceinline__ float load(const unsigned short *p) { return vit_f16(p); }
+};
 
 /* Inclusive sum over one warp, left-folded in decreasing-offset order so lane 0
  * ends up holding the total. Spelled out rather than reduced with a library

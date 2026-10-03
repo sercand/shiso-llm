@@ -38,6 +38,37 @@
  * fragment loads fall on 32 distinct banks. */
 #define VIT_FA_PAD 8u
 
+/* The element a split operand is stored in, by the tower's weight width: the
+ * BLAS multiplies the operand against the weights, and both sides of one call
+ * are one type. A half-precision plane holds every operand this tower
+ * multiplies - each is a normalized row, an attention output or an activated
+ * one, far inside the half's range. A pair of halves keeps about 22 bits of a
+ * value, against 16 for a pair of brain floats, down to an absolute floor of
+ * 2^-25 where the remainder falls below the smallest subnormal half: an
+ * operand that small is noise in a sum over the tower's widths. */
+template <typename W> struct vit_plane;
+template <> struct vit_plane<vit_w_bf16> {
+    typedef __nv_bfloat16 t;
+    static __device__ __forceinline__ t round(float x) { return __float2bfloat16_rn(x); }
+    static __device__ __forceinline__ float back(t h) { return __bfloat162float(h); }
+};
+template <> struct vit_plane<vit_w_f16> {
+    typedef __half t;
+    static __device__ __forceinline__ t round(float x) { return __float2half_rn(x); }
+    static __device__ __forceinline__ float back(t h) { return __half2float(h); }
+};
+
+/* Writes `x` at `i` of an operand split into pairs of the plane's element: the
+ * nearest value at `out[i]`, the remainder `count` elements further on. The
+ * layout `kernel_vit_to_bf16` writes and a BLAS projection reads. */
+template <typename W>
+static __device__ __forceinline__ void vit_store_split(typename vit_plane<W>::t *out,
+                                                       uint64_t count, uint64_t i, float x) {
+    const typename vit_plane<W>::t hi = vit_plane<W>::round(x);
+    out[i] = hi;
+    out[count + i] = vit_plane<W>::round(x - vit_plane<W>::back(hi));
+}
+
 /* `in[i]` as two brain-floats whose sum it is to about sixteen bits: `hi[i]`
  * the nearest brain-float, `lo[i]` the nearest to what `hi` left over. `lo`
  * starts `count` elements after `hi`, in the same buffer.
@@ -46,23 +77,37 @@
  * two dozen blocks deep compounds that to a percent of its largest output.
  * The weights are brain-float as stored, so multiplying them by both halves
  * and summing recovers a single-precision product at twice the multiplies. */
-extern "C" __global__ void kernel_vit_to_bf16(
+template <typename W>
+static __device__ __forceinline__ void kernel_vit_to_bf16_body(
         const struct vit_args_unary args,
-        __nv_bfloat16 *__restrict__ out,
+        typename vit_plane<W>::t *__restrict__ out,
         const float *__restrict__ in) {
     const unsigned i = blockIdx.x * VIT_LINEAR_BLOCK + threadIdx.x;
     if (i >= args.count) {
         return;
     }
-    const float x = in[i];
-    const __nv_bfloat16 hi = __float2bfloat16_rn(x);
-    out[i] = hi;
-    out[(uint64_t) args.count + i] = __float2bfloat16_rn(x - __bfloat162float(hi));
+    vit_store_split<W>(out, args.count, i, in[i]);
+}
+
+/* The brain-float split and the half-precision one; see `vit_plane`. */
+extern "C" __global__ void kernel_vit_to_bf16(
+        const struct vit_args_unary args,
+        __nv_bfloat16 *__restrict__ out,
+        const float *__restrict__ in) {
+    kernel_vit_to_bf16_body<vit_w_bf16>(args, out, in);
+}
+
+extern "C" __global__ void kernel_vit_to_f16(
+        const struct vit_args_unary args,
+        __half *__restrict__ out,
+        const float *__restrict__ in) {
+    kernel_vit_to_bf16_body<vit_w_f16>(args, out, in);
 }
 
 /* `x[i] += bias[i % period]`, the bias brain-float: a projection's epilogue
  * when the multiply itself ran in the device's BLAS. */
-extern "C" __global__ void kernel_vit_add_bias_bf16(
+template <typename W>
+static __device__ __forceinline__ void kernel_vit_add_bias_bf16_body(
         const struct vit_args_add args,
         float *__restrict__ x,
         const unsigned short *__restrict__ bias) {
@@ -70,17 +115,23 @@ extern "C" __global__ void kernel_vit_add_bias_bf16(
     if (i >= args.count) {
         return;
     }
-    x[i] += vit_bf16(bias + (i % args.period));
+    x[i] += W::load(bias + (i % args.period));
 }
 
-/* Writes `x` at `i` of an operand split into brain-float pairs: the nearest
- * value at `out[i]`, the remainder `count` elements further on. The layout
- * `kernel_vit_to_bf16` writes and a BLAS projection reads. */
-static __device__ __forceinline__ void vit_store_split(__nv_bfloat16 *out, uint64_t count,
-                                                       uint64_t i, float x) {
-    const __nv_bfloat16 hi = __float2bfloat16_rn(x);
-    out[i] = hi;
-    out[count + i] = __float2bfloat16_rn(x - __bfloat162float(hi));
+/* The brain-float tower's entry and the half-precision tower's twin; see
+ * `vit_w_bf16`. */
+extern "C" __global__ void kernel_vit_add_bias_bf16(
+        const struct vit_args_add args,
+        float *__restrict__ x,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_add_bias_bf16_body<vit_w_bf16>(args, x, bias);
+}
+
+extern "C" __global__ void kernel_vit_add_bias_f16(
+        const struct vit_args_add args,
+        float *__restrict__ x,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_add_bias_bf16_body<vit_w_f16>(args, x, bias);
 }
 
 /* `kernel_vit_layer_norm` writing its rows as the next projection's split
@@ -88,9 +139,10 @@ static __device__ __forceinline__ void vit_store_split(__nv_bfloat16 *out, uint6
  * read by that projection, so writing it once as f32 and then again as the
  * pair was a whole pass over the hidden stream for nothing. The arithmetic is
  * the unfused kernel's, value for value. */
-extern "C" __global__ void kernel_vit_layer_norm_split(
+template <typename W>
+static __device__ __forceinline__ void kernel_vit_layer_norm_split_body(
         const struct vit_args_layer_norm args,
-        __nv_bfloat16 *__restrict__ out,
+        typename vit_plane<W>::t *__restrict__ out,
         const float *__restrict__ in,
         const unsigned short *__restrict__ weight,
         const unsigned short *__restrict__ bias) {
@@ -117,31 +169,71 @@ extern "C" __global__ void kernel_vit_layer_norm_split(
     const float rstd = rsqrtf(
             vit_block_sum(var, scratch, tid, nthreads) / (float) args.dim + args.eps);
     for (unsigned i = tid; i < args.dim; i += nthreads) {
-        const float y = (src[i] - mean) * rstd * vit_bf16(weight + i) + vit_bf16(bias + i);
-        vit_store_split(out, count, (uint64_t) r * args.dim + i, y);
+        const float y = (src[i] - mean) * rstd * W::load(weight + i) + W::load(bias + i);
+        vit_store_split<W>(out, count, (uint64_t) r * args.dim + i, y);
     }
+}
+
+/* The brain-float tower's entry and the half-precision tower's twin; see
+ * `vit_w_bf16`. */
+extern "C" __global__ void kernel_vit_layer_norm_split(
+        const struct vit_args_layer_norm args,
+        __nv_bfloat16 *__restrict__ out,
+        const float *__restrict__ in,
+        const unsigned short *__restrict__ weight,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_layer_norm_split_body<vit_w_bf16>(args, out, in, weight, bias);
+}
+
+extern "C" __global__ void kernel_vit_layer_norm_split_f16(
+        const struct vit_args_layer_norm args,
+        __half *__restrict__ out,
+        const float *__restrict__ in,
+        const unsigned short *__restrict__ weight,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_layer_norm_split_body<vit_w_f16>(args, out, in, weight, bias);
 }
 
 /* The first feed-forward layer's epilogue and the second's operand in one
  * pass: `gelu_tanh(x[i] + bias[i % period])`, written as a split operand. The
  * activated row is read by nothing but the second layer, so it is never
  * stored as single precision. */
-extern "C" __global__ void kernel_vit_bias_gelu_split(
+template <typename W>
+static __device__ __forceinline__ void kernel_vit_bias_gelu_split_body(
         const struct vit_args_add args,
-        __nv_bfloat16 *__restrict__ out,
+        typename vit_plane<W>::t *__restrict__ out,
         const float *__restrict__ x,
         const unsigned short *__restrict__ bias) {
     const unsigned i = blockIdx.x * VIT_LINEAR_BLOCK + threadIdx.x;
     if (i >= args.count) {
         return;
     }
-    vit_store_split(out, args.count, i, vit_gelu_tanh(x[i] + vit_bf16(bias + (i % args.period))));
+    vit_store_split<W>(out, args.count, i, vit_gelu_tanh(x[i] + W::load(bias + (i % args.period))));
+}
+
+/* The brain-float tower's entry and the half-precision tower's twin; see
+ * `vit_w_bf16`. */
+extern "C" __global__ void kernel_vit_bias_gelu_split(
+        const struct vit_args_add args,
+        __nv_bfloat16 *__restrict__ out,
+        const float *__restrict__ x,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_bias_gelu_split_body<vit_w_bf16>(args, out, x, bias);
+}
+
+extern "C" __global__ void kernel_vit_bias_gelu_split_f16(
+        const struct vit_args_add args,
+        __half *__restrict__ out,
+        const float *__restrict__ x,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_bias_gelu_split_body<vit_w_f16>(args, out, x, bias);
 }
 
 /* A projection's bias and the block's residual in one pass:
  * `x[i] = (x[i] + bias[i % period]) + residual[i]`, in the order the two
  * unfused kernels added them. */
-extern "C" __global__ void kernel_vit_add_bias_residual(
+template <typename W>
+static __device__ __forceinline__ void kernel_vit_add_bias_residual_body(
         const struct vit_args_add args,
         float *__restrict__ x,
         const unsigned short *__restrict__ bias,
@@ -150,7 +242,25 @@ extern "C" __global__ void kernel_vit_add_bias_residual(
     if (i >= args.count) {
         return;
     }
-    x[i] = (x[i] + vit_bf16(bias + (i % args.period))) + residual[i];
+    x[i] = (x[i] + W::load(bias + (i % args.period))) + residual[i];
+}
+
+/* The brain-float tower's entry and the half-precision tower's twin; see
+ * `vit_w_bf16`. */
+extern "C" __global__ void kernel_vit_add_bias_residual(
+        const struct vit_args_add args,
+        float *__restrict__ x,
+        const unsigned short *__restrict__ bias,
+        const float *__restrict__ residual) {
+    kernel_vit_add_bias_residual_body<vit_w_bf16>(args, x, bias, residual);
+}
+
+extern "C" __global__ void kernel_vit_add_bias_residual_f16(
+        const struct vit_args_add args,
+        float *__restrict__ x,
+        const unsigned short *__restrict__ bias,
+        const float *__restrict__ residual) {
+    kernel_vit_add_bias_residual_body<vit_w_f16>(args, x, bias, residual);
 }
 
 /* Two floats as one register of two brain-floats, the first in the low half:
@@ -311,7 +421,8 @@ static_assert(sizeof(struct vit_args_qkv_rope_split) == 28, "vit_args_qkv_rope_s
  * columns past the head's width are written as zeros here.
  *
  * One block per (head, row), as the rotation. */
-extern "C" __global__ void kernel_vit_qkv_rope_split(
+template <typename W>
+static __device__ __forceinline__ void kernel_vit_qkv_rope_split_body(
         const struct vit_args_qkv_rope_split args,
         float *__restrict__ q,
         __nv_bfloat16 *__restrict__ kp,
@@ -344,7 +455,7 @@ extern "C" __global__ void kernel_vit_qkv_rope_split(
     __nv_bfloat16 *vd = vp + (uint64_t) h * VIT_FA_HD * padded + prow;
 
     for (unsigned i = tid; i < VIT_FA_HD; i += nthreads) {
-        const float x = (i < hd) ? src[2u * dim + off + i] + vit_bf16(bias + 2u * dim + off + i)
+        const float x = (i < hd) ? src[2u * dim + off + i] + W::load(bias + 2u * dim + off + i)
                                  : 0.0f;
         const __nv_bfloat16 hi = __float2bfloat16_rn(x);
         vd[(uint64_t) i * padded] = hi;
@@ -361,15 +472,38 @@ extern "C" __global__ void kernel_vit_qkv_rope_split(
         const float theta = pos * inv;
         const float s = sinf(theta);
         const float c = cosf(theta);
-        const float q0 = src[off + i] + vit_bf16(bias + off + i);
-        const float q1 = src[off + i + half_hd] + vit_bf16(bias + off + i + half_hd);
+        const float q0 = src[off + i] + W::load(bias + off + i);
+        const float q1 = src[off + i + half_hd] + W::load(bias + off + i + half_hd);
         qd[i] = q0 * c - q1 * s;
         qd[i + half_hd] = q1 * c + q0 * s;
-        const float k0 = src[dim + off + i] + vit_bf16(bias + dim + off + i);
-        const float k1 = src[dim + off + i + half_hd] + vit_bf16(bias + dim + off + i + half_hd);
-        vit_store_split(kd, kplane, i, k0 * c - k1 * s);
-        vit_store_split(kd, kplane, i + half_hd, k1 * c + k0 * s);
+        const float k0 = src[dim + off + i] + W::load(bias + dim + off + i);
+        const float k1 = src[dim + off + i + half_hd] + W::load(bias + dim + off + i + half_hd);
+        vit_store_split<vit_w_bf16>(kd, kplane, i, k0 * c - k1 * s);
+        vit_store_split<vit_w_bf16>(kd, kplane, i + half_hd, k1 * c + k0 * s);
     }
+}
+
+/* The brain-float tower's entry and the half-precision tower's twin: only the
+ * bias is read in the tower's width. The key and value planes are the
+ * attention's operands, brain-float pairs whatever the weights are. */
+extern "C" __global__ void kernel_vit_qkv_rope_split(
+        const struct vit_args_qkv_rope_split args,
+        float *__restrict__ q,
+        __nv_bfloat16 *__restrict__ kp,
+        __nv_bfloat16 *__restrict__ vp,
+        const float *__restrict__ qkv,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_qkv_rope_split_body<vit_w_bf16>(args, q, kp, vp, qkv, bias);
+}
+
+extern "C" __global__ void kernel_vit_qkv_rope_split_f16(
+        const struct vit_args_qkv_rope_split args,
+        float *__restrict__ q,
+        __nv_bfloat16 *__restrict__ kp,
+        __nv_bfloat16 *__restrict__ vp,
+        const float *__restrict__ qkv,
+        const unsigned short *__restrict__ bias) {
+    kernel_vit_qkv_rope_split_body<vit_w_f16>(args, q, kp, vp, qkv, bias);
 }
 
 /* One staged key/value tile: each as its nearest brain-floats and as what

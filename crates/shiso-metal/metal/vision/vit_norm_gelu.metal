@@ -16,16 +16,17 @@
 ///
 /// Safe to run in place (`out == in`): both reductions complete before the
 /// write loop starts, and the write loop touches each index once.
-kernel void kernel_vit_layer_norm(
-        constant vit_args_layer_norm & args [[buffer(0)]],
-        device float *out                   [[buffer(1)]],
-        device const float *in              [[buffer(2)]],
-        device const ushort *weight         [[buffer(3)]],
-        device const ushort *bias           [[buffer(4)]],
-        threadgroup float *scratch          [[threadgroup(0)]],
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        ushort3 tpitg[[thread_position_in_threadgroup]],
-        ushort3 ntg[[threads_per_threadgroup]]) {
+template <typename W>
+static inline void vit_layer_norm_body(
+        constant vit_args_layer_norm & args,
+        device float *out,
+        device const float *in,
+        device const ushort *weight,
+        device const ushort *bias,
+        threadgroup float *scratch,
+        uint3 tgpig,
+        ushort3 tpitg,
+        ushort3 ntg) {
     const uint r = tgpig.x;
     if (r >= args.rows) {
         return;
@@ -49,8 +50,35 @@ kernel void kernel_vit_layer_norm(
             vit_block_sum(var, scratch, tpitg.x, nthreads) / (float) args.dim + args.eps);
 
     for (uint i = tpitg.x; i < args.dim; i += nthreads) {
-        dst[i] = (src[i] - mean) * rstd * vit_bf16(weight + i) + vit_bf16(bias + i);
+        dst[i] = (src[i] - mean) * rstd * W::load(weight + i) + W::load(bias + i);
     }
+}
+
+// The brain-float tower's entry and the half-precision tower's twin.
+kernel void kernel_vit_layer_norm(
+        constant vit_args_layer_norm & args [[buffer(0)]],
+        device float *out                   [[buffer(1)]],
+        device const float *in              [[buffer(2)]],
+        device const ushort *weight         [[buffer(3)]],
+        device const ushort *bias           [[buffer(4)]],
+        threadgroup float *scratch          [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    vit_layer_norm_body<vit_w_bf16>(args, out, in, weight, bias, scratch, tgpig, tpitg, ntg);
+}
+
+kernel void kernel_vit_layer_norm_f16(
+        constant vit_args_layer_norm & args [[buffer(0)]],
+        device float *out                   [[buffer(1)]],
+        device const float *in              [[buffer(2)]],
+        device const ushort *weight         [[buffer(3)]],
+        device const ushort *bias           [[buffer(4)]],
+        threadgroup float *scratch          [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    vit_layer_norm_body<vit_w_f16>(args, out, in, weight, bias, scratch, tgpig, tpitg, ntg);
 }
 
 /// The blocks' activation, applied in place to a feed-forward row.

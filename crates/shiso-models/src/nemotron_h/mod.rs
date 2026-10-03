@@ -13,3 +13,8 @@ mod model;
 pub use ckpt::NEMOTRON_H_MODEL_ID;
 pub use config::{Mixer, NemotronHConfig, SlotLayers};
 pub use model::NemotronHModel;
+
+use crate::catalog::FamilyFacts;
+
+/// Family facts for Nemotron-H.
+pub const FACTS: FamilyFacts = FamilyFacts { name: "nemotron_h" };

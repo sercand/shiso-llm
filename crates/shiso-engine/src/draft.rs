@@ -319,6 +319,27 @@ impl HybridStack {
         Ok(())
     }
 
+    /// Keeps every greedy pick this stack takes for itself - a verify's
+    /// target picks, on the one-phase path and the greedy block path - off
+    /// `ids`. The list replaces the last one.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for an id past the vocabulary, refused
+    /// rather than skipped because a skipped id is a token left pickable that
+    /// the caller said was not.
+    pub fn suppress_tokens(&mut self, ids: &[TokenId]) -> CoreResult<()> {
+        let vocab = self.geometry.vocab;
+        if let Some(bad) = ids.iter().find(|id| id.get() >= vocab) {
+            return Err(CoreError::InvalidValue {
+                key: "suppressed token id",
+                value: format!("{} (vocabulary {vocab})", bad.get()),
+            });
+        }
+        self.suppressed = ids.to_vec();
+        Ok(())
+    }
+
     /// Whether a draft head is resident, which is what makes a step
     /// speculative.
     #[must_use]
@@ -561,7 +582,11 @@ impl HybridStack {
         self.backend.copy_d2h(view, &mut bytes)?;
         Ok(bytes
             .chunks_exact(usize::try_from(row_bytes).unwrap_or(0))
-            .map(|row| crate::sampling::argmax(&as_floats(row)))
+            .map(|row| {
+                let mut row = as_floats(row);
+                crate::sampling::suppress(&mut row, &self.suppressed);
+                crate::sampling::argmax(&row)
+            })
             .collect())
     }
 

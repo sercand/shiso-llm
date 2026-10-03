@@ -112,6 +112,18 @@ pub struct AppState {
     pub memory: Option<MemorySource>,
     /// The transcription service, when a recognizer is loaded.
     pub audio: Option<crate::audio::AudioService>,
+    /// The image generation service, when a generator is loaded.
+    ///
+    /// Handlers never touch the generator itself; they reach this through
+    /// [`AppState::image`], which answers the typed "no image model" error
+    /// for a server that serves language or transcription alone.
+    pub image: Option<crate::image::ImageService>,
+    /// The geometry and step count an image request that names none gets.
+    ///
+    /// The image counterpart of [`AppState::sampling_preset`]: what a caller
+    /// who names nothing is served, chosen by the operator at boot
+    /// (`--image-default-size`, `--image-default-steps`).
+    pub image_defaults: crate::image::ImageDefaults,
 }
 
 impl AppState {
@@ -132,6 +144,8 @@ impl AppState {
             sampling_preset: shiso_core::SamplingParams::neutral(),
             memory: None,
             audio: None,
+            image: None,
+            image_defaults: crate::image::ImageDefaults::default(),
         }
     }
 
@@ -153,6 +167,8 @@ impl AppState {
             sampling_preset: shiso_core::SamplingParams::neutral(),
             memory: None,
             audio: None,
+            image: None,
+            image_defaults: crate::image::ImageDefaults::default(),
         }
     }
 
@@ -161,6 +177,29 @@ impl AppState {
     pub fn with_audio(mut self, audio: crate::audio::AudioService) -> Self {
         self.audio = Some(audio);
         self
+    }
+
+    /// The same state with the image generation service attached.
+    #[must_use]
+    pub fn with_image(mut self, image: crate::image::ImageService) -> Self {
+        self.image = Some(image);
+        self
+    }
+
+    /// The same state with image defaults other than the published ones.
+    #[must_use]
+    pub const fn with_image_defaults(mut self, defaults: crate::image::ImageDefaults) -> Self {
+        self.image_defaults = defaults;
+        self
+    }
+
+    /// The image queue.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::NoImageModel`] when no image generator is loaded.
+    pub fn image(&self) -> Result<&crate::image::ImageService, AppError> {
+        self.image.as_ref().ok_or(AppError::NoImageModel)
     }
 
     /// The engine queue.

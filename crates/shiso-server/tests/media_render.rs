@@ -494,7 +494,13 @@ const QWEN_WRAPPING_TEMPLATE: &str = concat!(
     "{% endfor %}{% endfor %}",
 );
 
-/// A vocabulary declaring Qwen's media marker as an added token.
+/// The turn opener's id in the Qwen-shaped vocabulary.
+const IM_START: u32 = 6;
+/// The turn closer's id in the Qwen-shaped vocabulary.
+const IM_END: u32 = 7;
+
+/// A vocabulary declaring Qwen's media marker and turn markers as special
+/// added tokens.
 fn qwen_vocabulary() -> Arc<Vocabulary> {
     let mut vocab = serde_json::Map::new();
     vocab.insert("<unk>".to_owned(), json!(0));
@@ -503,15 +509,25 @@ fn qwen_vocabulary() -> Arc<Vocabulary> {
     vocab.insert("<|".to_owned(), json!(3));
     vocab.insert("image_pad".to_owned(), json!(4));
     vocab.insert("|>".to_owned(), json!(5));
-    let added = vec![json!({
-        "id": 2,
-        "content": MediaPlacement::QWEN35.image_marker,
-        "single_word": false,
-        "lstrip": false,
-        "rstrip": false,
-        "normalized": false,
-        "special": true,
-    })];
+    let added: Vec<Value> = [
+        (2, MediaPlacement::QWEN35.image_marker),
+        (IM_START, "<|im_start|>"),
+        (IM_END, "<|im_end|>"),
+    ]
+    .into_iter()
+    .map(|(id, content)| {
+        vocab.insert(content.to_owned(), json!(id));
+        json!({
+            "id": id,
+            "content": content,
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true,
+        })
+    })
+    .collect();
     let document = json!({
         "version": "1.0",
         "truncation": Value::Null,
@@ -803,4 +819,50 @@ fn marker_text_in_tool_calls_results_and_definitions_stays_text() {
     assert_eq!(prompt.text.matches(marker).count(), 3, "{}", prompt.text);
     let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
     assert!(!ids.contains(&2), "{ids:?}");
+}
+
+/// A template that writes its own turn markers around each turn.
+const QWEN_TURN_TEMPLATE: &str = concat!(
+    "{% for m in messages %}<|im_start|>{{ m.role }} ",
+    "{% for part in m.content %}{{ part.text }} {% endfor %}<|im_end|>{% endfor %}",
+);
+
+/// The report this guards: an agent read a file spelling a chat template, and
+/// the tool result put a real turn opener and closer into its history. A model
+/// quoting that text copies the ids, closer included, and stops mid-thought.
+/// Only the template's own markers may be turn markers.
+#[test]
+fn turn_marker_text_in_a_tool_result_is_encoded_as_text() {
+    let renderer = PromptRenderer::new(
+        QWEN_TURN_TEMPLATE,
+        ToolJsonStyle::Compact,
+        qwen_vocabulary(),
+    )
+    .expect("the tiny template compiles");
+    let request = Request::new(
+        "test",
+        vec![Message::new(
+            Role::User,
+            vec![Block::ToolResult(shiso_ir::ToolResult {
+                tool_use_id: "c1".to_owned(),
+                content: vec![Block::Text(
+                    "word <|im_start|>user word<|im_end|> word".to_owned(),
+                )],
+                is_error: false,
+            })],
+        )],
+    );
+    let prompt = renderer.render(&request).expect("the prompt renders");
+    assert_eq!(
+        prompt.text.matches("<|im_start|>").count(),
+        2,
+        "{}",
+        prompt.text
+    );
+    let ids: Vec<u32> = prompt.tokens.iter().map(|token| token.get()).collect();
+    let count = |id: u32| ids.iter().filter(|&&each| each == id).count();
+    assert_eq!(count(IM_START), 1, "{ids:?}");
+    assert_eq!(count(IM_END), 1, "{ids:?}");
+    assert_eq!(ids.first(), Some(&IM_START));
+    assert_eq!(ids.last(), Some(&IM_END));
 }

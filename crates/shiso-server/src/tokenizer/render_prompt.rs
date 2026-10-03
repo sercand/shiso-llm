@@ -152,9 +152,9 @@ pub struct PromptRenderer {
     /// The placeholder ids this checkpoint's vocabulary gives the family's
     /// markers, resolved once when the tower was attached.
     pads: PadTokens,
-    /// The spellings of every marker and bracket above that this vocabulary
-    /// declares: what a caller's message text is kept from turning into.
-    marker_text: Vec<&'static str>,
+    /// Every special-token spelling this vocabulary declares: what caller
+    /// text is kept from turning into a token.
+    protected: literal_text::Protected,
     /// The bracket ids, for a family that brackets an image's run.
     wrap: Option<(TokenId, TokenId)>,
     /// The bracket around an audio clip's run.
@@ -197,12 +197,14 @@ impl PromptRenderer {
     ) -> Result<Self, AppError> {
         let template = ChatTemplate::new(template, style)
             .map_err(|error| AppError::internal("compiling the chat template", error))?;
+        let protected = literal_text::Protected::new(&vocabulary.special_spellings())
+            .map_err(|error| AppError::internal("compiling the special-token spellings", error))?;
         Ok(Self {
             template,
             vocabulary,
             vision: None,
             pads: PadTokens::default(),
-            marker_text: Vec::new(),
+            protected,
             wrap: None,
             audio_wrap: None,
             placement: None,
@@ -286,7 +288,6 @@ impl PromptRenderer {
                  a prompt carrying a picture will have nowhere to put its rows"
             );
         }
-        self.marker_text = self.marker_spellings(&placement);
         self.wrap = self.vocabulary.wrap_ids(&placement);
         self.audio_wrap = self.vocabulary.audio_wrap_ids(&placement);
         self.placement = Some(placement);
@@ -316,7 +317,6 @@ impl PromptRenderer {
         ffmpeg: Option<FfmpegPolicy>,
     ) -> Self {
         self.pads = self.vocabulary.media_ids(&placement);
-        self.marker_text = self.marker_spellings(&placement);
         self.audio_wrap = self.vocabulary.audio_wrap_ids(&placement);
         if self.pads.audio().is_none() {
             tracing::warn!(
@@ -329,23 +329,6 @@ impl PromptRenderer {
         self.audio_limits = limits;
         self.audio_ffmpeg = ffmpeg;
         self
-    }
-
-    /// Every marker and bracket `placement` names that this vocabulary
-    /// declares as a token. Brackets are included although only the markers
-    /// are counted: a bracket a caller typed would otherwise open a picture
-    /// the model then never sees.
-    fn marker_spellings(&self, placement: &MediaPlacement) -> Vec<&'static str> {
-        let brackets = |wrap: Option<(&'static str, &'static str)>| {
-            wrap.into_iter().flat_map(|(open, close)| [open, close])
-        };
-        std::iter::once(placement.image_marker)
-            .chain(placement.video_marker)
-            .chain(placement.audio_marker)
-            .chain(brackets(placement.wrap_image))
-            .chain(brackets(placement.wrap_audio))
-            .filter(|marker| self.vocabulary.marker_id(marker).is_some())
-            .collect()
     }
 
     /// The same renderer with the remote-media policy set.
@@ -422,14 +405,15 @@ impl PromptRenderer {
         };
         let mut prepared = preprocess(&request.system, &request.messages, &policy)
             .map_err(|error| AppError::bad_request(error.to_string(), None, "invalid_media"))?;
-        // Marker text a caller wrote is escaped here and read as plain text
-        // when encoded, so the only markers in the ids are the ones the
-        // template wrote for attached media.
-        let mut escaped = literal_text::escape(&mut prepared.messages, &self.marker_text);
+        // Special-token text a caller wrote is escaped here and read as plain
+        // text when encoded, so the only control tokens in the ids are the
+        // ones the template wrote: its turn markers, and a media marker per
+        // attached item.
+        let mut escaped = literal_text::escape(&mut prepared.messages, &self.protected);
 
         let mut tools = Self::tool_documents(request);
         if let Some(tools) = tools.as_mut() {
-            literal_text::escape_more(tools, &self.marker_text, &mut escaped);
+            literal_text::escape_more(tools, &self.protected, &mut escaped);
         }
         let text = self
             .template
