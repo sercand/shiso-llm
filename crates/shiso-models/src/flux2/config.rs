@@ -79,7 +79,7 @@ pub struct ImageModelDesc {
 }
 
 #[derive(Debug, Deserialize)]
-struct DiffusersTransformerConfig {
+struct TransformerConfigFile {
     attention_head_dim: Option<usize>,
     axes_dims_rope: Option<[usize; 4]>,
     mlp_ratio: Option<f32>,
@@ -278,7 +278,7 @@ pub fn locate_and_inspect(desc: &ImageModelDesc) -> Result<Flux2Located, ImageGe
     })
 }
 
-fn read_transformer_config(model_path: &Path) -> Option<DiffusersTransformerConfig> {
+fn read_transformer_config(model_path: &Path) -> Option<TransformerConfigFile> {
     let path = if model_path.is_dir() {
         model_path.join("transformer").join("config.json")
     } else {
