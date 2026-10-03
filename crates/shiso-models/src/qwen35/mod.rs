@@ -91,7 +91,7 @@ pub const FACTS: FamilyFacts = FamilyFacts {
     tasks: &["chat"],
     features: FamilyFeatures {
         tools: true,
-        reasoning_efforts: &["none", "low", "medium", "high"],
+        reasoning_efforts: &["none", "low", "medium", "high", "xhigh", "max"],
         default_reasoning_effort: Some("medium"),
         structured_output: true,
     },

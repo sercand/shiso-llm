@@ -18,12 +18,17 @@ use crate::server::{ServerState, build_router};
 #[test]
 fn checked_in_recipes_pass_strict_validation() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir.parent().unwrap().parent().unwrap();
-    let reports = editor::validate_all(root).unwrap();
+    let root = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("model-registry");
+    let reports = editor::validate_all(&root).unwrap();
 
     assert!(
         !reports.is_empty(),
-        "must find at least one recipe in registry/recipes/"
+        "must find at least one recipe in recipes/"
     );
     for r in reports {
         assert!(
@@ -40,7 +45,10 @@ fn checked_in_recipes_pass_strict_validation() {
 fn checked_in_public_key_matches_compiled_constant() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest_dir.parent().unwrap().parent().unwrap();
-    let pubkey_path = root.join("registry").join("keys").join("registry.pub");
+    let pubkey_path = root
+        .join("model-registry")
+        .join("keys")
+        .join("registry.pub");
 
     let content = fs::read_to_string(&pubkey_path).unwrap();
     let trimmed = content.trim();
@@ -54,13 +62,13 @@ fn checked_in_public_key_matches_compiled_constant() {
 #[test]
 fn atomic_put_recipe_with_stable_formatting() {
     let temp = tempdir().unwrap();
-    let recipes_dir = temp.path().join("registry").join("recipes");
+    let recipes_dir = temp.path().join("recipes");
     fs::create_dir_all(&recipes_dir).unwrap();
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest_dir.parent().unwrap().parent().unwrap();
     let sample = root
-        .join("registry")
+        .join("model-registry")
         .join("recipes")
         .join("qwen3.5-9b.json");
     let content = fs::read_to_string(sample).unwrap();
@@ -84,14 +92,14 @@ fn atomic_put_recipe_with_stable_formatting() {
 #[test]
 fn keygen_and_build_registry_produces_verifiable_signature() {
     let temp = tempdir().unwrap();
-    let recipes_dir = temp.path().join("registry").join("recipes");
+    let recipes_dir = temp.path().join("recipes");
     fs::create_dir_all(&recipes_dir).unwrap();
 
     // Copy sample recipe into temp repo
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest_dir.parent().unwrap().parent().unwrap();
     let sample = root
-        .join("registry")
+        .join("model-registry")
         .join("recipes")
         .join("qwen3.5-9b.json");
     fs::copy(sample, recipes_dir.join("qwen3.5-9b.json")).unwrap();
@@ -101,7 +109,7 @@ fn keygen_and_build_registry_produces_verifiable_signature() {
     let keygen = editor::generate_keypair(&key_path).unwrap();
 
     // Build registry
-    let out_dir = temp.path().join("target").join("registry").join("v1");
+    let out_dir = temp.path().join("registry").join("v1");
     let build = editor::build_registry(temp.path(), &out_dir, Some(&key_path), true).unwrap();
     assert_eq!(build.models_count, 1);
 

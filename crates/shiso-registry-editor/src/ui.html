@@ -107,7 +107,7 @@
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
       <div>
         <h2 style="font-size:18px; font-weight:700;">Model Recipes</h2>
-        <p style="color:var(--text-muted); font-size:12px;">Authored models available in this repository under <code>registry/recipes/</code></p>
+        <p style="color:var(--text-muted); font-size:12px;">Authored models available in this repository under <code>recipes/</code></p>
       </div>
       <div style="display:flex; gap:10px;">
         <input type="text" id="recipe-search" placeholder="Filter by name, task, or tag..." oninput="filterRecipes()" style="width:280px;">
@@ -220,6 +220,8 @@
               <label class="checkbox-item"><input type="checkbox" value="low" checked> low</label>
               <label class="checkbox-item"><input type="checkbox" value="medium" checked> medium</label>
               <label class="checkbox-item"><input type="checkbox" value="high" checked> high</label>
+              <label class="checkbox-item"><input type="checkbox" value="xhigh" checked> xhigh</label>
+              <label class="checkbox-item"><input type="checkbox" value="max" checked> max</label>
             </div>
           </div>
           <div class="form-group" style="width:140px; margin-bottom:0;">
@@ -229,6 +231,8 @@
               <option value="none">none</option>
               <option value="low">low</option>
               <option value="high">high</option>
+              <option value="xhigh">xhigh</option>
+              <option value="max">max</option>
             </select>
           </div>
         </div>
@@ -288,7 +292,7 @@
         <div class="card-title">Strict Recipe Validation Suite</div>
         <button class="primary" onclick="runValidation()">Run Full Validation</button>
       </div>
-      <p style="color:var(--text-muted); font-size:12px; margin-bottom:16px;">Strictly validates all recipe files under <code>registry/recipes/</code> against the current engine catalog and structural schema rules (§3).</p>
+      <p style="color:var(--text-muted); font-size:12px; margin-bottom:16px;">Strictly validates all recipe files under <code>recipes/</code> against the current engine catalog and structural schema rules (§3).</p>
       <div id="validation-results"></div>
     </div>
   </section>
@@ -302,7 +306,7 @@
       <div class="row">
         <div class="col form-group">
           <label>Output Directory</label>
-          <input type="text" id="build-out" value="target/registry/v1">
+          <input type="text" id="build-out" value="registry/v1">
         </div>
         <div class="col form-group">
           <label>Ed25519 Signing Key Path</label>

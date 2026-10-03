@@ -226,7 +226,7 @@ async fn build_handler(
 ) -> Result<Json<BuildResult>, (StatusCode, String)> {
     let out_dir = payload
         .out
-        .map_or_else(|| state.repo.join("target/registry/v1"), PathBuf::from);
+        .map_or_else(|| state.repo.join("registry/v1"), PathBuf::from);
     let sign_key_path = payload.sign_key.as_deref().map(Path::new);
 
     let res = editor::build_registry(&state.repo, &out_dir, sign_key_path, payload.allow_dirty)

@@ -10,8 +10,9 @@ use url::Url;
 
 use crate::error::HubError;
 
-/// Default static registry URL.
-pub const DEFAULT_REGISTRY_URL: &str = "https://models.shiso.run/v1/";
+/// Default static registry URL. The registry repository is served statically,
+/// so the index lives at `<host>/registry/v1/index.json` under its root.
+pub const DEFAULT_REGISTRY_URL: &str = "https://models.shiso.run/registry/v1/";
 
 /// Default Hugging Face endpoint URL.
 pub const DEFAULT_HF_ENDPOINT: &str = "https://huggingface.co";
@@ -21,8 +22,8 @@ pub const DEFAULT_MAX_PARALLEL_FILES: usize = 4;
 
 /// Compiled-in ed25519 public key bytes for `models.shiso.run`.
 pub const COMPILED_REGISTRY_PUBKEY: &[u8; 32] = &[
-    0x3f, 0xe9, 0x64, 0x12, 0xe1, 0xe7, 0xf2, 0x33, 0xf8, 0xc9, 0x24, 0x42, 0xb6, 0x18, 0x1d, 0x04,
-    0x3c, 0x99, 0x27, 0x8c, 0xc3, 0x4a, 0x26, 0x18, 0x1d, 0xad, 0x40, 0x28, 0xfb, 0xa2, 0x47, 0xd8,
+    0x19, 0x67, 0x44, 0xa7, 0x49, 0xbb, 0x3c, 0x6d, 0x67, 0xb6, 0x58, 0xbf, 0x15, 0xcb, 0xbe, 0x89,
+    0x9c, 0xca, 0x9f, 0x2d, 0xfa, 0x4a, 0x1a, 0x60, 0xc5, 0x2c, 0x28, 0xe8, 0x42, 0x8d, 0xc2, 0xb3,
 ];
 
 /// Secret Hugging Face bearer token.
@@ -60,7 +61,7 @@ impl fmt::Display for HfToken {
 /// Registry static endpoint URL and its Ed25519 verification key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryEndpoint {
-    /// Base URL of the registry (e.g. `https://models.shiso.run/v1`).
+    /// Base URL of the registry (e.g. `https://models.shiso.run/registry/v1`).
     pub url: Url,
     /// Ed25519 verifying key used to verify `index.json.sig`.
     pub verifying_key: VerifyingKey,

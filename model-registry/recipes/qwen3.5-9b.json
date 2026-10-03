@@ -14,7 +14,7 @@
   "features": {
     "tools": true,
     "reasoning": true,
-    "reasoning_efforts": ["none", "low", "medium", "high"],
+    "reasoning_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
     "default_reasoning_effort": "medium",
     "structured_output": true
   },

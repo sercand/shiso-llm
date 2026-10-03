@@ -25,7 +25,7 @@ pub(crate) enum Command {
     /// Inspect a Hugging Face repository for commit SHA, file sizes, and LFS digests.
     Inspect(InspectArgs),
 
-    /// Strictly validate all recipes under `registry/recipes/`.
+    /// Strictly validate all recipes under `recipes/`.
     Validate(ValidateArgs),
 
     /// Compile, validate, and sign the registry index and manifests.
@@ -38,7 +38,7 @@ pub(crate) enum Command {
 /// Arguments for `serve`.
 #[derive(Debug, clap::Args)]
 pub(crate) struct ServeArgs {
-    /// Path to repository root containing `registry/`.
+    /// Path to repository root containing `recipes/`.
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
 
@@ -65,7 +65,7 @@ pub(crate) struct InspectArgs {
 /// Arguments for `validate`.
 #[derive(Debug, clap::Args)]
 pub(crate) struct ValidateArgs {
-    /// Path to repository root containing `registry/`.
+    /// Path to repository root containing `recipes/`.
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
 }
@@ -73,7 +73,7 @@ pub(crate) struct ValidateArgs {
 /// Arguments for `build`.
 #[derive(Debug, clap::Args)]
 pub(crate) struct BuildArgs {
-    /// Path to repository root containing `registry/`.
+    /// Path to repository root containing `recipes/`.
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
 
@@ -82,10 +82,11 @@ pub(crate) struct BuildArgs {
     pub sign_key: PathBuf,
 
     /// Output directory for compiled manifests and index.
-    #[arg(long, default_value = "target/registry/v1")]
-    pub out: PathBuf,
+    /// Defaults to `<repo>/registry/v1`, the path the registry repo serves.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 
-    /// Allow building with uncommitted changes in `registry/recipes/`.
+    /// Allow building with uncommitted changes in `recipes/`.
     #[arg(long)]
     pub allow_dirty: bool,
 }

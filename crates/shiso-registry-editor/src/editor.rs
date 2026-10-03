@@ -87,7 +87,7 @@ pub(crate) struct KeygenResult {
 pub(crate) struct GitStatusResult {
     /// Current git branch name.
     pub(crate) branch: String,
-    /// Changed or untracked recipe files under `registry/recipes/`.
+    /// Changed or untracked recipe files under `recipes/`.
     pub(crate) changed_recipes: Vec<String>,
     /// Whether the recipe tree has uncommitted modifications.
     pub(crate) is_dirty: bool,
@@ -130,12 +130,12 @@ pub(crate) fn get_family_validation_facts() -> Vec<FamilyValidationFacts<'static
         .collect()
 }
 
-/// Strictly validates all recipes found under `registry/recipes/` (§7.1, §7.3).
+/// Strictly validates all recipes found under `recipes/` (§7.1, §7.3).
 ///
 /// # Errors
 /// Returns an error if the directory cannot be read.
 pub(crate) fn validate_all(repo_path: &Path) -> anyhow::Result<Vec<RecipeValidationReport>> {
-    let recipes_dir = repo_path.join("registry").join("recipes");
+    let recipes_dir = repo_path.join("recipes");
     if !recipes_dir.is_dir() {
         bail!("directory '{}' does not exist", recipes_dir.display());
     }
@@ -332,7 +332,7 @@ pub(crate) fn build_registry(
     let status = git_status(repo_path);
     if status.is_dirty && !allow_dirty {
         bail!(
-            "Build refused: uncommitted changes exist under registry/recipes/:\n  {}\nCommit your changes so Git timestamps are accurate, or pass --allow-dirty.",
+            "Build refused: uncommitted changes exist under recipes/:\n  {}\nCommit your changes so Git timestamps are accurate, or pass --allow-dirty.",
             status.changed_recipes.join("\n  ")
         );
     }
@@ -353,7 +353,7 @@ pub(crate) fn build_registry(
     let mut index_models = Vec::new();
     let mut manifest_paths = Vec::new();
 
-    let recipes_dir = repo_path.join("registry").join("recipes");
+    let recipes_dir = repo_path.join("recipes");
     let mut recipe_files: Vec<_> = fs::read_dir(&recipes_dir)?
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
@@ -499,7 +499,7 @@ pub(crate) fn git_status(repo_path: &Path) -> GitStatusResult {
         for line in text.lines() {
             if let Some(b) = line.strip_prefix("# branch.head ") {
                 branch = b.trim().to_string();
-            } else if line.contains("registry/recipes/") {
+            } else if line.contains("recipes/") {
                 let parts: Vec<_> = line.split_whitespace().collect();
                 if let Some(file) = parts.last() {
                     changed.push(file.to_string());
@@ -524,7 +524,6 @@ pub(crate) fn get_recipe(repo_path: &Path, name_str: &str) -> anyhow::Result<Rec
     let name = ModelName::parse(name_str)
         .map_err(|e| anyhow::anyhow!("invalid model name '{name_str}': {e}"))?;
     let path = repo_path
-        .join("registry")
         .join("recipes")
         .join(format!("{}.json", name.as_str()));
     let bytes =
@@ -557,7 +556,6 @@ pub(crate) fn save_recipe(repo_path: &Path, name_str: &str, content: &str) -> an
 
     let formatted = serde_json::to_string_pretty(&recipe)?;
     let target = repo_path
-        .join("registry")
         .join("recipes")
         .join(format!("{}.json", name.as_str()));
 
@@ -573,7 +571,7 @@ pub(crate) fn delete_recipe(repo_path: &Path, name_str: &str) -> anyhow::Result<
     let name = ModelName::parse(name_str)
         .map_err(|e| anyhow::anyhow!("invalid model name '{name_str}': {e}"))?;
 
-    let recipes_dir = repo_path.join("registry").join("recipes");
+    let recipes_dir = repo_path.join("recipes");
     if recipes_dir.is_dir() {
         for entry in fs::read_dir(&recipes_dir)?.flatten() {
             let path = entry.path();
