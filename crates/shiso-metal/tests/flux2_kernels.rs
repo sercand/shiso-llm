@@ -520,10 +520,13 @@ fn gemm_bf16_treats_the_zero_bias_stand_in_as_no_bias() {
 }
 
 /// Regression lock from the zero-sentinel era: a real bias whose first
-/// word is -0.0 (bit pattern 0x80000000, distinct from the stand-in's
-/// +0.0) must be applied. Under the presence flag this is trivially
-/// correct - which is exactly what the flag was for - but the case stays
-/// so a reintroduced value sentinel fails here too.
+/// word is -0.0 (bit pattern 0x80000000) must be applied. Under the
+/// presence flag this is trivially correct - which is exactly what the
+/// flag was for. It catches a sentinel relaxed to a value comparison
+/// (`bias[0] == 0.0f`, which reads -0.0 as absent); a bit-exact sentinel
+/// would pass it, and the +0.0 case is what
+/// [`gemm_bf16_applies_a_real_bias_whose_first_word_is_positive_zero`]
+/// pins.
 #[test]
 fn gemm_bf16_applies_a_real_bias_whose_first_word_is_negative_zero() {
     let Some(b) = open() else { return };
