@@ -63,7 +63,7 @@ fn captured(launch: &Launch) -> ModeloptArgs {
 }
 
 #[test]
-fn an_fp8_projection_names_the_matvec_at_a_decode_batch_and_the_gemm_past_it() {
+fn an_fp8_projection_names_the_matvec_through_a_verify_and_the_gemm_past_it() {
     // The grid and block are asserted beside the entry because they are not
     // the same shape for the two paths and the kernels cannot refuse a wrong
     // one: the matvec is one block per (row, token) at 256 threads, and the
@@ -71,11 +71,12 @@ fn an_fp8_projection_names_the_matvec_at_a_decode_batch_and_the_gemm_past_it() {
     // launched on the GEMM's grid would compute forty rows' worth of output
     // into three, and nothing would fail.
     //
-    // The widths are the threshold's own: one row, the widest decode batch,
-    // one past it, and a prefill chunk. `GEMM_MIN_TOKENS` moved from 2 to
-    // `MAX_DECODE_BATCH + 1` when the GEMM was measured at 17 GB/s against the
-    // matvec's 120, so what this pins is that a decode batch takes the matvec
-    // and a chunk takes the GEMM - which is the whole content of the change.
+    // The widths are the thresholds' own: one row, the widest decode batch,
+    // one past it, the widest verify the token-blocked matvec takes, one past
+    // that, and a prefill chunk. Up to 32 rows the matvec reads each weight
+    // once per eight tokens (two rows a block); past it a chunk takes the
+    // vendor multiply where there is one and the tile here, where the test
+    // backend has none.
     for (n_tok, entry, grid, block) in [
         (
             1,
@@ -85,14 +86,26 @@ fn an_fp8_projection_names_the_matvec_at_a_decode_batch_and_the_gemm_past_it() {
         ),
         (
             crate::MAX_DECODE_BATCH,
-            "kernel_q35moe_mv_fp8_f32",
-            Extent3::new(40, crate::MAX_DECODE_BATCH, 1),
+            "kernel_q35moe_mv_fp8_f32_t8_r2",
+            Extent3::new(20, 1, 1),
             Extent3::new(256, 1, 1),
         ),
         (
             crate::MAX_DECODE_BATCH + 1,
+            "kernel_q35moe_mv_fp8_f32_t8_r2",
+            Extent3::new(20, 2, 1),
+            Extent3::new(256, 1, 1),
+        ),
+        (
+            32,
+            "kernel_q35moe_mv_fp8_f32_t8_r2",
+            Extent3::new(20, 4, 1),
+            Extent3::new(256, 1, 1),
+        ),
+        (
+            33,
             "kernel_q35moe_mm_fp8_f32",
-            Extent3::new(3, 1, 1),
+            Extent3::new(3, 3, 1),
             Extent3::new(16, 16, 1),
         ),
         (

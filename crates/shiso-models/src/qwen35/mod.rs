@@ -63,6 +63,7 @@ mod ckpt;
 mod config;
 mod kernels;
 mod model;
+pub mod modelopt;
 pub mod mtp;
 pub mod st_names;
 pub mod vision;

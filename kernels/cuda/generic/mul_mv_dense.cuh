@@ -123,7 +123,11 @@ __device__ __forceinline__ void shiso_mul_mv_dense_4_impl(
     const W *ax[nr0];
 #pragma unroll
     for (int row = 0; row < nr0; ++row) {
-        const uint64_t offset0 = (uint64_t) (r0 + row) * args.nb01
+        /* A block's trailing rows past `ne01` are read from the last real row and
+         * never written: a one-row projection at two rows a block otherwise
+         * reads a whole row past the end of its weight. */
+        const int src_row = min(r0 + row, args.ne01 - 1);
+        const uint64_t offset0 = (uint64_t) src_row * args.nb01
                                + (uint64_t) (i12 / args.r2) * args.nb02
                                + (uint64_t) (i13 / args.r3) * args.nb03;
         ax[row] = (const W *) (src0 + offset0);

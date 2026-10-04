@@ -30,6 +30,7 @@
 #include "q35moe_common.cuh"
 #include "mv_fp8.cuh"
 #include "mv_nvfp4.cuh"
+#include "mv_multi.cuh"
 #include "experts.cuh"
 #include "experts_kblock.cuh"
 #include "experts_affine.cuh"

@@ -231,7 +231,12 @@ impl QuantConfig {
 fn parse_algo(algo: &str, group_size: Option<u32>) -> CoreResult<QuantAlgo> {
     match algo {
         "FP8" => Ok(QuantAlgo::Fp8),
-        "W4A16_NVFP4" => Ok(QuantAlgo::W4A16Nvfp4 {
+        // `NVFP4` is the same weights with an activation scale calibrated for
+        // a four-bit activation pass. No kernel here quantizes activations to
+        // four bits, so the target runs at 16-bit activations - closer to the
+        // unquantized model than the pass the scale was calibrated for, and
+        // the same codec for the weights.
+        "W4A16_NVFP4" | "NVFP4" => Ok(QuantAlgo::W4A16Nvfp4 {
             // The document states it on every NVFP4 target this checkpoint
             // carries. A target that omitted it would be a group size guessed
             // at by the decoder, which is a scale read from the wrong offset.

@@ -68,3 +68,10 @@ fn fp8_matvec_matches_the_host_codec_at_an_unaligned_width() {
     let Some(gpu) = open() else { return };
     cases::fp8_matvec_matches_the_host_codec_at_an_unaligned_width(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_token_blocked_matvec_is_the_one_token_matvec_to_the_bit() {
+    let Some(gpu) = open() else { return };
+    cases::the_token_blocked_matvec_is_the_one_token_matvec_to_the_bit(&gpu);
+}

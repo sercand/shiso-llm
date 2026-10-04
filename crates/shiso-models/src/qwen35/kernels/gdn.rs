@@ -468,8 +468,22 @@ pub(super) fn run(
             // One launch that writes every row's record as it goes, where the
             // variant has a recording twin; the per-row walk otherwise. The two
             // leave the same bits in the trail and in the state.
-            match shape
-                .recurrent
+            //
+            // The recording twin always runs at four lanes a column, whatever
+            // the tuner chose for the plain recurrence. The three splits fold
+            // to the same bits by construction (`q35_gdn_recurrent_impl`), so
+            // this changes no number; what it changes is the trail's write
+            // pattern. At one lane a column a head is one 128-thread block and
+            // each store instruction scatters over 32 lines; measured on the
+            // dense 27B with a block drafter, that shape spent 417 us a layer
+            // writing an eight-row trail - 19 ms of a 145 ms verify step.
+            let recorder = match shape.recurrent {
+                gdn_tune::Variant::S1 | gdn_tune::Variant::S2 | gdn_tune::Variant::S4 => {
+                    gdn_tune::Variant::S4
+                }
+                other => other,
+            };
+            match recorder
                 .trail_entry()
                 .filter(|_| n_tok < launch::GDN_CHUNK_MIN)
             {
@@ -477,7 +491,7 @@ pub(super) fn run(
                     backend,
                     geometry,
                     scratch,
-                    (shape.recurrent, entry),
+                    (recorder, entry),
                     one.state,
                     trail.state,
                     n_tok,

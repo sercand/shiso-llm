@@ -150,6 +150,20 @@ fn nvfp4_without_a_group_size_is_refused_rather_than_guessed_at() {
 }
 
 #[test]
+fn nvfp4_with_a_four_bit_activation_scale_reads_as_the_same_weight_codec() {
+    // The dense 27B export spells its feed-forward targets `NVFP4` and ships
+    // an `input_scale` beside each. The weights are the same codec either way;
+    // only the activation pass the scale was calibrated for differs.
+    let doc = r#"{"quantization":{"quantized_layers":{
+        "a.b":{"quant_algo":"NVFP4","group_size":16}}}}"#;
+    let quant = QuantConfig::from_json_str(doc).expect("NVFP4 has a decoder");
+    assert_eq!(
+        quant.algo_for("a.b"),
+        QuantAlgo::W4A16Nvfp4 { group_size: 16 }
+    );
+}
+
+#[test]
 fn the_longest_prefix_wins() {
     // Not a shape this checkpoint has, and the rule the walk has to follow
     // anyway: a document that quantizes a stack one way and one projection

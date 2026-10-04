@@ -160,6 +160,14 @@ impl Qwen35Model {
         opts: EngineOptions,
         head: Option<&MtpManifest>,
     ) -> CoreResult<Self> {
+        // A `modelopt` export is a third container, with its own reader and
+        // its own per-tensor storage schemes; everything after the weights are
+        // resident is the same as for the other two.
+        if crate::qwen35::modelopt::is_modelopt_dir(path) {
+            let (weights, ffn_gate) = crate::qwen35::modelopt::load(backend, path, config.shape())?;
+            let embed = crate::qwen35::modelopt::EMBED_DTYPE;
+            return Self::assemble(backend, config, opts, head, (weights, embed, ffn_gate));
+        }
         let file = ModelFile::open_with(path, Arc::new(crate::qwen35::Qwen35Names))
             .map_err(open_failure)?;
         let binding = bind_qwen35_desc(&file, config).map_err(open_failure)?;
@@ -178,7 +186,23 @@ impl Qwen35Model {
         // nothing is pinned twice because the file kept no copy of its own.
         drop(binding);
         drop(file);
+        Self::assemble(backend, config, opts, head, (weights, embed, ffn_gate))
+    }
 
+    /// Builds the stack over weights that are already resident, and binds the
+    /// draft head when the options ask for one.
+    ///
+    /// `resident` is the weights, the format the vocabulary table was imported
+    /// as, and the format of the layer-zero feed-forward gate - the three
+    /// things a container's import decides and the stack needs.
+    fn assemble(
+        backend: &Arc<dyn Backend>,
+        config: &Qwen35Config,
+        opts: EngineOptions,
+        head: Option<&MtpManifest>,
+        resident: (Weights, DType, DType),
+    ) -> CoreResult<Self> {
+        let (weights, embed, ffn_gate) = resident;
         // Measured before the stack is announced resident, because a device
         // that will run no recurrent shape at all cannot run this model and
         // should say so at load rather than at the first prompt.

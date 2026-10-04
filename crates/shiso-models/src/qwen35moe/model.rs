@@ -58,48 +58,28 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use half::{bf16, f16};
+use shiso_core::alloc;
 use shiso_core::backend::Backend;
-use shiso_core::buffer::DeviceBuffer;
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{LayerIdx, SessionId, TokenId};
 use shiso_core::media::{MediaModel, VisionPrefill};
 use shiso_core::model::{DecodeStep, Logits, Model, ModelInfo, StopTokens};
-use shiso_core::{DType, alloc};
-use shiso_engine::attn::Attn;
 use shiso_engine::draft::DraftHead;
 use shiso_engine::ffn::Ffn;
-use shiso_engine::gdn::{Gdn, GdnGeometry};
+use shiso_engine::gdn::GdnGeometry;
 use shiso_engine::layers::{Block, LayerWeights, Routed, Weights};
 use shiso_engine::moe::{ActDtype, ExpertSlab, Moe};
-use shiso_engine::projection::Weight;
 use shiso_engine::shape::{HybridShape, LayerKind};
 use shiso_engine::{EngineOptions, HybridStack, MAX_PREFILL_CHUNK};
-use shiso_modelfile::modelopt::{ModeloptFile, ModeloptTensor, Stored};
-use shiso_modelfile::{GdnHeads, HeadAxis, HeadPermute};
+use shiso_modelfile::modelopt::ModeloptFile;
 
 use crate::qwen35::Qwen35Kernels;
+use crate::qwen35::modelopt::{
+    EMBED_DTYPE, centred_norm, embedding, gdn_heads, import_attn, import_gdn, open_failure, tensor,
+    upload, weight,
+};
 use crate::qwen35moe::binding::{TEXT_PREFIX, TEXT_ROOTS, check_export};
 use crate::qwen35moe::config::Qwen35MoeConfig;
-
-/// The recurrent block's head structure, which the value-head reordering is
-/// resolved against.
-fn gdn_heads(shape: &HybridShape) -> GdnHeads {
-    GdnHeads::new(
-        shape.gdn.v_heads as usize,
-        shape.gdn.qk_heads as usize,
-        shape.gdn.head_dim as usize,
-        shape.gdn.head_dim as usize,
-    )
-}
-
-/// The format the vocabulary table is widened to.
-///
-/// `f16` rather than `f32`: `shiso_engine::layers::EmbedKernel` has a gather
-/// for both, the table is 248,320 rows of 2,048, and the wider one would cost
-/// a gigabyte of device memory for precision a gather does not use - it reads
-/// a row and hands it on.
-const EMBED_DTYPE: DType = DType::F16;
 
 /// A loaded checkpoint of this family.
 #[derive(Debug)]
@@ -278,226 +258,6 @@ impl Qwen35MoeModel {
     }
 }
 
-/// Wraps a container failure as an engine one.
-fn open_failure(err: &shiso_modelfile::GgufError) -> CoreError {
-    CoreError::InvalidValue {
-        key: "checkpoint",
-        value: err.to_string(),
-    }
-}
-
-/// The tensor called `name`, or the refusal naming it.
-fn tensor<'a>(file: &'a ModeloptFile, name: &str) -> CoreResult<&'a ModeloptTensor> {
-    file.get(name).ok_or_else(|| CoreError::InvalidValue {
-        key: "missing tensor",
-        value: name.to_string(),
-    })
-}
-
-/// A tensor's bytes, or the refusal.
-fn bytes<'a>(file: &'a ModeloptFile, t: &ModeloptTensor) -> CoreResult<&'a [u8]> {
-    file.weight_bytes(t).map_err(|err| open_failure(&err))
-}
-
-/// Widens a `BF16` array to `f32` values.
-///
-/// A copy, and it has to be: `bf16` is the top sixteen bits of an `f32`, so
-/// the widening is a shift, but nothing in this build dispatches a `BF16`
-/// projection and a kernel reading these bytes as `f32` would read two values
-/// as one.
-///
-/// Values rather than bytes because every caller either reorders them before
-/// the upload or turns them into bytes itself, and a byte-returning twin would
-/// be a second place for the widening to be written.
-fn to_f32_values(raw: &[u8]) -> Vec<f32> {
-    raw.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| bf16::from_bits(u16::from_le_bytes(*pair)).to_f32())
-        .collect()
-}
-
-/// Widens a `BF16` array to `f16` bytes.
-///
-/// Both are sixteen bits and neither is the other: `bf16` trades seven mantissa
-/// bits for three exponent bits. The conversion goes through `f32`, which is
-/// exact in that direction, and rounds once on the way down.
-fn to_f16(raw: &[u8]) -> Vec<u8> {
-    raw.as_chunks::<2>()
-        .0
-        .iter()
-        .flat_map(|pair| {
-            f16::from_f32(bf16::from_bits(u16::from_le_bytes(*pair)).to_f32())
-                .to_bits()
-                .to_le_bytes()
-        })
-        .collect()
-}
-
-/// A `BF16` vector - a norm, a bias - as an `f32` device buffer.
-fn vector(backend: &Arc<dyn Backend>, file: &ModeloptFile, name: &str) -> CoreResult<DeviceBuffer> {
-    reordered_vector(backend, file, name, None)
-}
-
-/// The same, reordering the value heads first for a vector that carries them.
-fn reordered_vector(
-    backend: &Arc<dyn Backend>,
-    file: &ModeloptFile,
-    name: &str,
-    permute: Option<HeadPermute>,
-) -> CoreResult<DeviceBuffer> {
-    let t = tensor(file, name)?;
-    let mut values = to_f32_values(bytes(file, t)?);
-    if let Some(permute) = permute {
-        permute
-            .apply(&mut values, name)
-            .map_err(|err| open_failure(&err))?;
-    }
-    let host: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    upload(backend, &host)
-}
-
-/// The recurrent decay driver, negated and exponentiated on the way in.
-///
-/// `A_log` is stored as the logarithm and the kernel wants `-exp(A_log)`. Doing
-/// it here rather than in the kernel is what the dense family does through its
-/// loader's `ValueOp::NegExp`, and it is the same arithmetic: one `exp` per
-/// value head, once per load, against one per launch.
-fn neg_exp(
-    backend: &Arc<dyn Backend>,
-    file: &ModeloptFile,
-    name: &str,
-    permute: Option<HeadPermute>,
-) -> CoreResult<DeviceBuffer> {
-    let t = tensor(file, name)?;
-    let mut values: Vec<f32> = to_f32_values(bytes(file, t)?)
-        .iter()
-        .map(|v| -v.exp())
-        .collect();
-    if let Some(permute) = permute {
-        permute
-            .apply(&mut values, name)
-            .map_err(|err| open_failure(&err))?;
-    }
-    let host: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    upload(backend, &host)
-}
-
-/// Allocates a device buffer and fills it.
-fn upload(backend: &Arc<dyn Backend>, host: &[u8]) -> CoreResult<DeviceBuffer> {
-    let buffer = alloc(backend, u64::try_from(host.len()).unwrap_or(0))?;
-    backend.copy_h2d(buffer.view(), host)?;
-    Ok(buffer)
-}
-
-/// One projection, imported under whichever scheme its bytes are stored in.
-///
-/// The scheme comes from the container, which read it off the header. A plain
-/// tensor is widened to `f32`; an FP8 one keeps its byte per weight and carries
-/// its two scalars; an NVFP4 one carries its group array and its per-tensor
-/// `f32`.
-fn weight(backend: &Arc<dyn Backend>, file: &ModeloptFile, name: &str) -> CoreResult<Weight> {
-    reordered_weight(backend, file, name, None)
-}
-
-/// The same, reordering the value heads first for a tensor that carries them.
-///
-/// The permutation is applied to whatever the container stores - the raw FP8
-/// bytes, or the widened `f32` - because it moves whole heads and a head is a
-/// whole number of elements either way.
-fn reordered_weight(
-    backend: &Arc<dyn Backend>,
-    file: &ModeloptFile,
-    name: &str,
-    permute: Option<HeadPermute>,
-) -> CoreResult<Weight> {
-    let t = tensor(file, name)?;
-    let rows = u32::try_from(t.rows()).unwrap_or(u32::MAX);
-    let cols = u32::try_from(t.cols()).unwrap_or(u32::MAX);
-    match t.stored() {
-        Stored::Plain { .. } => {
-            let mut values = to_f32_values(bytes(file, t)?);
-            if let Some(permute) = permute {
-                permute
-                    .apply(&mut values, name)
-                    .map_err(|err| open_failure(&err))?;
-            }
-            let host: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let len = host.len();
-            Weight::import(backend, DType::F32, cols, rows, Arc::new(host), 0..len)
-        }
-        Stored::Fp8 {
-            weight_scale,
-            input_scale,
-        } => {
-            let mut host = bytes(file, t)?.to_vec();
-            if let Some(permute) = permute {
-                permute
-                    .apply(&mut host, name)
-                    .map_err(|err| open_failure(&err))?;
-            }
-            let len = host.len();
-            Weight::import_fp8(
-                backend,
-                cols,
-                rows,
-                Arc::new(host),
-                0..len,
-                weight_scale,
-                input_scale,
-            )
-        }
-        Stored::Nvfp4 { global } => {
-            // No tensor of this family carries both a value-head axis and this
-            // codec - the reordering is the recurrent block's and the recurrent
-            // block is FP8 and BF16 - and permuting one would have to move the
-            // packed nibbles and the group scales in step at two different
-            // granularities. Refused rather than half-implemented.
-            if permute.is_some() {
-                return Err(CoreError::Unsupported {
-                    what: "a value-head reordering over a packed nibble weight",
-                    backend: "qwen35moe",
-                });
-            }
-            let parts = file
-                .nvfp4_parts(t)
-                .map_err(|err| open_failure(&err))?
-                .ok_or_else(|| CoreError::InvalidValue {
-                    key: "nvfp4 tensor",
-                    value: format!("{name} lost its scale array between describe and import"),
-                })?;
-            let packed = parts.weights.len();
-            let mut host = parts.weights.to_vec();
-            host.extend_from_slice(parts.scales);
-            let total = host.len();
-            Weight::import_nvfp4(
-                backend,
-                cols,
-                rows,
-                Arc::new(host),
-                0..packed,
-                packed..total,
-                global,
-            )
-        }
-    }
-}
-
-/// The vocabulary table, widened to `f16`.
-fn embedding(backend: &Arc<dyn Backend>, file: &ModeloptFile) -> CoreResult<Weight> {
-    let t = tensor(file, &format!("{TEXT_PREFIX}embed_tokens"))?;
-    let host = to_f16(bytes(file, t)?);
-    let len = host.len();
-    Weight::import(
-        backend,
-        EMBED_DTYPE,
-        u32::try_from(t.cols()).unwrap_or(u32::MAX),
-        u32::try_from(t.rows()).unwrap_or(u32::MAX),
-        Arc::new(host),
-        0..len,
-    )
-}
-
 /// One projection of every expert in a layer, stacked into three buffers.
 ///
 /// Each expert is copied straight from the mapping into its own offset. The
@@ -595,122 +355,6 @@ fn import_moe(
     )
 }
 
-/// The value-head reordering one tensor needs, resolved against its own shape.
-///
-/// Not an `Option`. Every caller below has already decided that its tensor
-/// carries the axis, so "no reordering" is not one of this function's answers:
-/// it is the `None` that the one tensor without an axis passes to
-/// [`reordered_weight`] directly. A `Result<Option<..>>` here would have made
-/// every call site read as though the question were still open.
-fn axis_for(
-    file: &ModeloptFile,
-    heads: GdnHeads,
-    name: &str,
-    axis: HeadAxis,
-) -> CoreResult<HeadPermute> {
-    let t = tensor(file, name)?;
-    HeadPermute::new(
-        axis,
-        heads,
-        usize::try_from(t.rows()).unwrap_or(usize::MAX),
-        usize::try_from(t.cols()).unwrap_or(usize::MAX),
-        name,
-    )
-    .map_err(|err| open_failure(&err))
-}
-
-/// One recurrent slot's weights, with its value heads reordered.
-///
-/// **Eight of the nine carry that axis**, and not the same one: see this
-/// module's own note. The list below is the same list
-/// `crates/shiso-models/src/qwen35/st_names.rs` carries for the sibling
-/// container. It is written out here rather than shared because the two reach
-/// their tensors through different name tables; what IS shared is
-/// `HeadPermute`, which is the part that could be got wrong quietly.
-fn import_gdn(
-    backend: &Arc<dyn Backend>,
-    file: &ModeloptFile,
-    slot: usize,
-    heads: GdnHeads,
-) -> CoreResult<Gdn> {
-    let at = |role: &str| format!("{TEXT_PREFIX}layers.{slot}.linear_attn.{role}");
-    let (qkv, gate, alpha) = (at("in_proj_qkv"), at("in_proj_z"), at("in_proj_a"));
-    let (beta, out, conv) = (at("in_proj_b"), at("out_proj"), at("conv1d"));
-    let (a_log, dt) = (at("A_log"), at("dt_bias"));
-    Ok(Gdn {
-        // The fused projection's leading `[q | k]` run is not indexed by value
-        // head; only the trailing `v` run is.
-        qkv: reordered_weight(
-            backend,
-            file,
-            &qkv,
-            Some(axis_for(file, heads, &qkv, HeadAxis::QkvTailRows)?),
-        )?,
-        gate: reordered_weight(
-            backend,
-            file,
-            &gate,
-            Some(axis_for(file, heads, &gate, HeadAxis::ValueRows)?),
-        )?,
-        alpha: reordered_weight(
-            backend,
-            file,
-            &alpha,
-            Some(axis_for(file, heads, &alpha, HeadAxis::PerHeadRows)?),
-        )?,
-        beta: reordered_weight(
-            backend,
-            file,
-            &beta,
-            Some(axis_for(file, heads, &beta, HeadAxis::PerHeadRows)?),
-        )?,
-        // The output projection reads the block's value channels, so its axis
-        // is its COLUMNS rather than its rows.
-        out: reordered_weight(
-            backend,
-            file,
-            &out,
-            Some(axis_for(file, heads, &out, HeadAxis::ValueColumns)?),
-        )?,
-        conv1d: reordered_vector(
-            backend,
-            file,
-            &conv,
-            Some(axis_for(file, heads, &conv, HeadAxis::QkvTailRows)?),
-        )?,
-        a: neg_exp(
-            backend,
-            file,
-            &a_log,
-            Some(axis_for(file, heads, &a_log, HeadAxis::PerHeadRows)?),
-        )?,
-        dt_bias: reordered_vector(
-            backend,
-            file,
-            &dt,
-            Some(axis_for(file, heads, &dt, HeadAxis::PerHeadRows)?),
-        )?,
-        // The only one of the nine with no value-head axis: it is indexed by
-        // head WIDTH, and every head shares it.
-        norm: vector(backend, file, &at("norm"))?,
-    })
-}
-
-/// One attention slot's weights.
-fn import_attn(backend: &Arc<dyn Backend>, file: &ModeloptFile, slot: usize) -> CoreResult<Attn> {
-    let at = |role: &str| format!("{TEXT_PREFIX}layers.{slot}.self_attn.{role}");
-    // Every attention slot of this family owns its cache, so all three of the
-    // key half's `Option`s are filled.
-    Ok(Attn {
-        q: weight(backend, file, &at("q_proj"))?,
-        k: Some(weight(backend, file, &at("k_proj"))?),
-        v: Some(weight(backend, file, &at("v_proj"))?),
-        output: weight(backend, file, &at("o_proj"))?,
-        q_norm: Some(vector(backend, file, &at("q_norm"))?),
-        k_norm: Some(vector(backend, file, &at("k_norm"))?),
-    })
-}
-
 /// Moves every tensor to the device, in the order the pass reads them.
 fn import_weights(
     backend: &Arc<dyn Backend>,
@@ -746,7 +390,8 @@ fn import_weights(
         };
         let moe = import_moe(backend, file, slot, experts)?;
         layers.push(LayerWeights {
-            input_norm: vector(
+            // The export stores these norms centred; see `centred_norm`.
+            input_norm: centred_norm(
                 backend,
                 file,
                 &format!("{TEXT_PREFIX}layers.{slot}.input_layernorm"),
@@ -754,7 +399,7 @@ fn import_weights(
             // The pre-only scheme, as the dense hybrid has: nothing normalizes
             // a block's output and the residual sum carries no scalar.
             post_attn_norm: None,
-            ffn_norm: Some(vector(
+            ffn_norm: Some(centred_norm(
                 backend,
                 file,
                 &format!("{TEXT_PREFIX}layers.{slot}.post_attention_layernorm"),
@@ -790,7 +435,7 @@ fn import_weights(
     }
     Ok(Weights {
         token_embd: embedding(backend, file)?,
-        output_norm: vector(backend, file, &format!("{TEXT_PREFIX}norm"))?,
+        output_norm: centred_norm(backend, file, &format!("{TEXT_PREFIX}norm"))?,
         // This family ships its own output projection, and it is NVFP4 - the
         // one target outside the feed-forward that is.
         lm_head: Some(weight(backend, file, "lm_head")?),
