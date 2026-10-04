@@ -30,8 +30,9 @@ pub enum VisionSource {
     /// A checkpoint directory. The tower rides in a shard beside the language
     /// model and its dimensions come from the directory's own config.
     OptiqDir(PathBuf),
-    /// A standalone tower file, named by the operator. Its dimensions come from
-    /// its own metadata and are then judged against the family's contract.
+    /// A standalone tower file, named by the operator: a sidecar, or a
+    /// multimodal-projector GGUF. Its dimensions come from its own metadata
+    /// and are then judged against the family's contract.
     SidecarGguf(PathBuf),
     /// A `modelopt` checkpoint directory, whose tower rides in the SAME shard
     /// set as the language model rather than in a shard of its own.
@@ -71,9 +72,6 @@ const TOWER_BLOCK_KEY: &str = "optiq_vision";
 /// Sub-key under [`TOWER_BLOCK_KEY`] naming the shard.
 const TOWER_PATH_KEY: &str = "sidecar";
 
-/// Where the tower shard sits when the config does not say.
-const DEFAULT_TOWER_SHARD: &str = "optiq/optiq_vision.safetensors";
-
 /// Reads a checkpoint's config and resolves the path of its tower shard.
 ///
 /// The shard is named, not opened: a checkpoint whose config carries no vision
@@ -85,11 +83,18 @@ const DEFAULT_TOWER_SHARD: &str = "optiq/optiq_vision.safetensors";
 /// not model. Re-reading the file for the second would let the two disagree
 /// about which config they read.
 ///
+/// The path is `None` when the config names no shard. That is not a fault
+/// here: a checkpoint that keeps its tower inside its own shard set names
+/// none, and the family decides which layout it is looking at. There is no
+/// conventional location to fall back to - the tower's file is wherever the
+/// operator or the config says it is, and a guessed path that happened to
+/// exist would load a tower nobody named.
+///
 /// # Errors
 ///
 /// [`VisionError::TowerIo`] when the config cannot be read and
 /// [`VisionError::TowerConfig`] when it does not parse.
-pub fn open_checkpoint(dir: &Path) -> Result<(HfConfig, PathBuf), VisionError> {
+pub fn open_checkpoint(dir: &Path) -> Result<(HfConfig, Option<PathBuf>), VisionError> {
     let config_path = dir.join(CONFIG_FILE);
     let text = std::fs::read_to_string(&config_path).map_err(|source| VisionError::TowerIo {
         path: config_path,
@@ -99,26 +104,21 @@ pub fn open_checkpoint(dir: &Path) -> Result<(HfConfig, PathBuf), VisionError> {
         path: dir.join(CONFIG_FILE),
         source,
     })?;
-    Ok((config, dir.join(shard_relative_path(&text))))
+    Ok((
+        config,
+        shard_relative_path(&text).map(|shard| dir.join(shard)),
+    ))
 }
 
-/// Where the tower shard sits, according to the checkpoint's own config.
-///
-/// Falls back to the conventional location rather than failing: the key is a
-/// convenience, and a checkpoint that lays its tower out conventionally but
-/// omits the key is not broken. A shard that is missing at both is reported by
-/// the open that follows, with the path in it.
-fn shard_relative_path(config_text: &str) -> PathBuf {
-    let declared = serde_json::from_str::<serde_json::Value>(config_text)
-        .ok()
-        .and_then(|document| {
-            document
-                .get(TOWER_BLOCK_KEY)?
-                .get(TOWER_PATH_KEY)?
-                .as_str()
-                .map(PathBuf::from)
-        });
-    declared.unwrap_or_else(|| PathBuf::from(DEFAULT_TOWER_SHARD))
+/// Where the tower shard sits, according to the checkpoint's own config, or
+/// `None` when the config does not say.
+fn shard_relative_path(config_text: &str) -> Option<PathBuf> {
+    serde_json::from_str::<serde_json::Value>(config_text)
+        .ok()?
+        .get(TOWER_BLOCK_KEY)?
+        .get(TOWER_PATH_KEY)?
+        .as_str()
+        .map(PathBuf::from)
 }
 
 /// Opens a standalone container the operator named.

@@ -44,7 +44,8 @@ back to the kernel it belongs to.
 | `q4e_idx` | `idx.cu` | 8 | 0 |
 | `q4e_misc` | `misc.cu` | 2 | 0 |
 | `q4e_embed` | `embed.cu` | 4 | 0 |
-| **total** | 11 units | **59** | **105** |
+| `q4e_modelopt` | `modelopt.cu` | 7 | 0 |
+| **total** | 12 units | **66** | **105** |
 
 ## Plain entries, by module
 
@@ -54,6 +55,19 @@ back to the kernel it belongs to.
 - `q4e_hc_init_add_kernel`
 - `q4e_scale_silu_kernel`
 - `q4e_hc_collapse_f16_dual_kernel`
+
+### `q4e_modelopt`
+
+Not an upstream unit: this repository's own NVFP4 routed stages and FP8
+n-gram decode, for the `modelopt` export.
+
+- `q4e_nvfp4_experts_gate_up_kernel`
+- `q4e_nvfp4_experts_down_kernel`
+- `q4e_nvfp4_experts_gemm_gate_up_kernel`
+- `q4e_nvfp4_experts_gemm_down_kernel`
+- `q4e_fp8_experts_gate_up_kernel`
+- `q4e_fp8_experts_down_kernel`
+- `q4e_ple_dequant_fp8_kernel`
 
 ### `q4e_moe`
 

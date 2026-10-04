@@ -533,3 +533,111 @@ pub fn the_matvec_and_the_gemm_agree_on_the_same_weights(gpu: &Gpu) {
     };
     assert_close(&gpu.read_f32(&mm), &want, BUDGET, "gemm against matvec");
 }
+
+/// Runs one FP8 matvec entry over `codes` and returns what it wrote.
+fn fp8_launch(
+    gpu: &Gpu,
+    entry: &'static str,
+    launch: (Extent3, Extent3),
+    codes: &[u8],
+    x: &[f32],
+    dims: (usize, usize, usize),
+) -> Vec<f32> {
+    let (out_dim, in_dim, n_tok) = dims;
+    let args = Fp8Args {
+        in_dim: in_dim as i32,
+        out_dim: out_dim as i32,
+        n_tok: n_tok as i32,
+        weight_scale: 0.004_231_5,
+    };
+    let w = gpu.upload(codes);
+    let src = gpu.upload(&f32_bytes(x));
+    let dst = gpu.upload(&f32_bytes(&vec![
+        f32::from_bits(0xA5A5_A5A5);
+        n_tok * out_dim
+    ]));
+    run(
+        gpu,
+        KernelRef::new(MODULE, entry),
+        &LaunchArgs {
+            grid: launch.0,
+            block: launch.1,
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(w.view()),
+                KernelArg::Buffer(src.view()),
+                KernelArg::Buffer(dst.view()),
+            ],
+        },
+    );
+    drain(gpu);
+    gpu.read_f32(&dst)
+}
+
+/// The token-blocked FP8 matvec answers every row with the one-token matvec's
+/// bits, at every width a verify can run and at the widths that send a row
+/// through the byte fallback.
+///
+/// The entry and its geometry are the ones `modelopt_projection` in
+/// `crates/shiso-engine/src/projection.rs` dispatches: two rows a block, and
+/// the narrowest token blocking that covers the pass. 41 rows leaves a block
+/// with one real row.
+///
+/// # Panics
+///
+/// When a launch is refused or any output differs in any bit.
+pub fn the_token_blocked_matvec_is_the_one_token_matvec_to_the_bit(gpu: &Gpu) {
+    /// Rows one block covers: `MODELOPT_FP8_MULTI_ROWS` in the engine.
+    const ROWS: u32 = 2;
+    const OUT: usize = 41;
+    for in_dim in [2048usize, 2050] {
+        let codes = weight_codes(OUT, in_dim);
+        for n_tok in [2usize, 3, 4, 5, 8, 11] {
+            let (per_block, entry) = match n_tok {
+                2 => (2, "kernel_q35moe_mv_fp8_f32_t2_r2"),
+                3 | 4 => (4, "kernel_q35moe_mv_fp8_f32_t4_r2"),
+                _ => (8, "kernel_q35moe_mv_fp8_f32_t8_r2"),
+            };
+            let x = activations(n_tok, in_dim);
+            let dims = (OUT, in_dim, n_tok);
+            let one = fp8_launch(
+                gpu,
+                "kernel_q35moe_mv_fp8_f32",
+                (
+                    Extent3::new(OUT as u32, n_tok as u32, 1),
+                    Extent3::new(MV_BLOCK, 1, 1),
+                ),
+                &codes,
+                &x,
+                dims,
+            );
+            let blocked = fp8_launch(
+                gpu,
+                entry,
+                (
+                    Extent3::new(
+                        (OUT as u32).div_ceil(ROWS),
+                        (n_tok as u32).div_ceil(per_block),
+                        1,
+                    ),
+                    Extent3::new(MV_BLOCK, 1, 1),
+                ),
+                &codes,
+                &x,
+                dims,
+            );
+            let differing = one
+                .iter()
+                .zip(&blocked)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing,
+                0,
+                "fp8 at in_dim {in_dim}, {n_tok} tokens: {differing} of {} outputs differ",
+                one.len()
+            );
+        }
+    }
+}

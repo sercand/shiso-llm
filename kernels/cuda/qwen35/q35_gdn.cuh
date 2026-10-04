@@ -261,6 +261,32 @@ extern "C" __global__ void kernel_q35_gdn_out_gate(
  * A lane that owns four quarters folds them with `q35_canonical4`; a lane that
  * owns two adds its pair and crosses one xor step; a lane that owns one crosses
  * two. All three are the same tree, so all three produce the same bits. */
+/* The first quarter lane `tid` owns at a split of SPLIT lanes per column. */
+template <unsigned SPLIT>
+__device__ __forceinline__ unsigned q_first_of(unsigned tid) {
+    return (tid % SPLIT) * (4u / SPLIT);
+}
+
+/* Writes a lane's sweep-ordered row back in natural order, a chunk of eight
+ * as two sixteen-byte stores: chunk `c` of quarter `q` is natural chunk
+ * `(c + q) & 3`. Used for the state at the end of the pass and for every
+ * trail record, whose scalar stores were the other half of what made a
+ * recording pass slow. */
+template <unsigned SPLIT, unsigned SEG>
+__device__ __forceinline__ void q35_gdn_store_row(float *out, const float *row, unsigned q_first) {
+#pragma unroll
+    for (unsigned qi = 0u; qi < 4u / SPLIT; qi++) {
+        const unsigned q = q_first + qi;
+#pragma unroll
+        for (unsigned c = 0u; c < 4u; c++) {
+            const float *v = row + qi * Q35_GDN_QUARTER + c * 8u;
+            float4 *dst = (float4 *) (out + qi * Q35_GDN_QUARTER + ((c + q) & 3u) * 8u);
+            dst[0] = make_float4(v[0], v[1], v[2], v[3]);
+            dst[1] = make_float4(v[4], v[5], v[6], v[7]);
+        }
+    }
+}
+
 template <unsigned SPLIT, unsigned SEG>
 __device__ __forceinline__ void q35_gdn_recurrent_impl(
         const struct q35_args_gdn_recurrent &args,
@@ -295,12 +321,32 @@ __device__ __forceinline__ void q35_gdn_recurrent_impl(
     float *s_k = scratch + Q35_BLOCK_SUM_SLOTS;
     float *s_q = scratch + Q35_BLOCK_SUM_SLOTS + Q35_GDN_D;
 
-    /* One quarter of the transposed state per lane, in registers. */
+    /* One quarter of the transposed state per lane, in registers, held in
+     * SWEEP order: `row[r0 + n]` is element `(n + 8q) & 31` of quarter `q`.
+     * The rotation is by whole eight-element chunks, so it is a chunk
+     * rotation - register indices stay compile-time constants and only the
+     * chunk ADDRESSES of the load and the stores depend on the lane. Indexed
+     * the natural way, `row[r0 + rot]` was a lane-dependent register index,
+     * which put the whole row in local memory: every FMA of the recurrence
+     * was a load from the stack, and a verify step spent 40 us a token a
+     * layer here. The values and the order they are combined in are
+     * unchanged. */
     float *S = state + (uint64_t) h * head_dim * head_dim
             + (uint64_t) j * head_dim + i0;
     float row[SEG];
-    for (unsigned n = 0u; n < seg; n++) {
-        row[n] = S[n];
+#pragma unroll
+    for (unsigned qi = 0u; qi < 4u / SPLIT; qi++) {
+        const unsigned q = q_first_of<SPLIT>(tid) + qi;
+#pragma unroll
+        for (unsigned c = 0u; c < 4u; c++) {
+            const float4 *src4 = (const float4 *) (S + qi * Q35_GDN_QUARTER
+                                                   + ((c + q) & 3u) * 8u);
+            const float4 a = src4[0];
+            const float4 b = src4[1];
+            float *dst = row + qi * Q35_GDN_QUARTER + c * 8u;
+            dst[0] = a.x; dst[1] = a.y; dst[2] = a.z; dst[3] = a.w;
+            dst[4] = b.x; dst[5] = b.y; dst[6] = b.z; dst[7] = b.w;
+        }
     }
     for (unsigned t = 0u; t < args.n_tok; t++) {
         const float *base = qkv + (uint64_t) t * args.stride;
@@ -327,15 +373,17 @@ __device__ __forceinline__ void q35_gdn_recurrent_impl(
 
         float part_k[4];
         float part_q[4];
-        for (unsigned qi = 0u; qi < quarters; qi++) {
+#pragma unroll
+        for (unsigned qi = 0u; qi < 4u / SPLIT; qi++) {
             const unsigned q = q_first + qi;          /* quarter, not lane */
             const unsigned qbase = q * Q35_GDN_QUARTER;
             const unsigned r0 = qi * Q35_GDN_QUARTER;
             float sk_q = 0.0f;
             float sq_q = 0.0f;
+#pragma unroll
             for (unsigned n = 0u; n < Q35_GDN_QUARTER; n++) {
                 const unsigned rot = (n + 8u * q) & (Q35_GDN_QUARTER - 1u);
-                const float mv = row[r0 + rot];
+                const float mv = row[r0 + n];
                 sk_q = q35_fma(mv, s_k[qbase + rot], sk_q);
                 sq_q = q35_fma(mv, s_q[qbase + rot], sq_q);
             }
@@ -372,13 +420,15 @@ __device__ __forceinline__ void q35_gdn_recurrent_impl(
         }
         /* The carry walks the same rotated per-quarter sequence as the read
          * above; anything else would pair a register with the wrong key. */
-        for (unsigned qi = 0u; qi < quarters; qi++) {
+#pragma unroll
+        for (unsigned qi = 0u; qi < 4u / SPLIT; qi++) {
             const unsigned q = q_first + qi;
             const unsigned qbase = q * Q35_GDN_QUARTER;
             const unsigned r0 = qi * Q35_GDN_QUARTER;
+#pragma unroll
             for (unsigned n = 0u; n < Q35_GDN_QUARTER; n++) {
                 const unsigned rot = (n + 8u * q) & (Q35_GDN_QUARTER - 1u);
-                row[r0 + rot] = q35_fma(row[r0 + rot], dec, delta * s_k[qbase + rot]);
+                row[r0 + n] = q35_fma(row[r0 + n], dec, delta * s_k[qbase + rot]);
             }
         }
         /* The state after this row, into its record of the trail - every row
@@ -386,17 +436,13 @@ __device__ __forceinline__ void q35_gdn_recurrent_impl(
         if (trail != nullptr && t + 1u < args.n_tok) {
             float *R = trail + (uint64_t) t * args.n_head_v * head_dim * head_dim
                     + (uint64_t) h * head_dim * head_dim + (uint64_t) j * head_dim + i0;
-            for (unsigned n = 0u; n < seg; n++) {
-                R[n] = row[n];
-            }
+            q35_gdn_store_row<SPLIT, SEG>(R, row, q_first);
         }
         /* k and q are rewritten by the next token. */
         __syncthreads();
     }
 
-    for (unsigned n = 0u; n < seg; n++) {
-        S[n] = row[n];
-    }
+    q35_gdn_store_row<SPLIT, SEG>(S, row, q_first);
 }
 
 #define Q35_GDN_RECURRENT_BODY(NAME, SPLIT, SEG, LANES)                       \

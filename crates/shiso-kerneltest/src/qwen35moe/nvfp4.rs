@@ -558,3 +558,92 @@ pub fn the_matvec_and_the_gemm_agree_on_the_same_weights(gpu: &Gpu) {
         );
     }
 }
+
+/// The token-blocked entry the engine dispatches at `n_tok` rows, as
+/// `modelopt_tokens_per_block` in `crates/shiso-engine/src/projection.rs`
+/// picks it: tokens per block, and the entry name at four rows a warp.
+fn blocked_entry(n_tok: usize) -> (u32, &'static str) {
+    match n_tok {
+        2 => (2, "kernel_q35moe_mv_nvfp4_f32_t2_r4"),
+        3 | 4 => (4, "kernel_q35moe_mv_nvfp4_f32_t4_r4"),
+        _ => (8, "kernel_q35moe_mv_nvfp4_f32_t8_r4"),
+    }
+}
+
+/// Runs the token-blocked matvec the engine dispatches at `n_tok` rows.
+fn blocked_matvec(gpu: &Gpu, corner: &Corner, x: &[f32], n_tok: usize) -> Vec<f32> {
+    /// Rows one warp covers and warps one block runs: `MODELOPT_NVFP4_MULTI_ROWS`
+    /// and `MODELOPT_NVFP4_MULTI_WARPS` in the engine.
+    const ROWS: u32 = 4;
+    const WARPS: u32 = 8;
+    let (per_block, entry) = blocked_entry(n_tok);
+    let args = Nvfp4Args {
+        in_dim: corner.cols as i32,
+        out_dim: corner.rows as i32,
+        n_tok: n_tok as i32,
+        global_scale: corner.global,
+    };
+    let w = gpu.upload(corner.weights);
+    let s = gpu.upload(corner.scales);
+    let src = gpu.upload(&f32_bytes(x));
+    let dst = gpu.upload(&f32_bytes(&vec![
+        f32::from_bits(0xA5A5_A5A5);
+        n_tok * corner.rows
+    ]));
+    run(
+        gpu,
+        KernelRef::new(MODULE, entry),
+        &LaunchArgs {
+            grid: Extent3::new(
+                (corner.rows as u32).div_ceil(ROWS * WARPS),
+                (n_tok as u32).div_ceil(per_block),
+                1,
+            ),
+            block: Extent3::new(32 * WARPS, 1, 1),
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(w.view()),
+                KernelArg::Buffer(s.view()),
+                KernelArg::Buffer(src.view()),
+                KernelArg::Buffer(dst.view()),
+            ],
+        },
+    );
+    drain(gpu);
+    gpu.read_f32(&dst)
+}
+
+/// The token-blocked matvec answers every row with the one-token matvec's
+/// bits, at every width a verify can run.
+///
+/// Not a budget: the blocked entries claim to fold each token in exactly the
+/// one-token entry's order, and that claim is what keeps a speculative verify's
+/// greedy pick equal to the decode step it stands in for. Eleven tokens covers
+/// a full block and a partial one; both corners' row counts leave a partial
+/// warp.
+///
+/// # Panics
+///
+/// When a launch is refused or any output differs in any bit.
+pub fn the_token_blocked_matvec_is_the_one_token_matvec_to_the_bit(gpu: &Gpu) {
+    for corner in [expert(), shared_down()] {
+        for n_tok in [2usize, 3, 4, 5, 8, 11] {
+            let x = activations(n_tok, corner.cols);
+            let one = matvec(gpu, &corner, &x, n_tok);
+            let blocked = blocked_matvec(gpu, &corner, &x, n_tok);
+            let differing = one
+                .iter()
+                .zip(&blocked)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing,
+                0,
+                "{} at {n_tok} tokens: {differing} of {} outputs differ from the one-token entry",
+                corner.name,
+                one.len()
+            );
+        }
+    }
+}

@@ -41,7 +41,7 @@ pub const QWEN35_MODEL_ID: u8 = 5;
 #[must_use]
 pub const fn quant_bits_of(gate: DType) -> u8 {
     match gate {
-        DType::Q4_0 | DType::Q4_K | DType::IQ4_NL => 4,
+        DType::Nvfp4Gs16 | DType::Q4_0 | DType::Q4_K | DType::IQ4_NL => 4,
         _ => 2,
     }
 }
@@ -118,6 +118,7 @@ mod tests {
         assert_eq!(quant_bits_of(DType::Q4_K), 4);
         assert_eq!(quant_bits_of(DType::Q4_0), 4);
         assert_eq!(quant_bits_of(DType::IQ4_NL), 4);
+        assert_eq!(quant_bits_of(DType::Nvfp4Gs16), 4);
         assert_eq!(quant_bits_of(DType::Q2_K), 2);
         assert_eq!(quant_bits_of(DType::Q8_0), 2);
         assert_eq!(quant_bits_of(DType::F16), 2);

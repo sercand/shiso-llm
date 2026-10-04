@@ -43,7 +43,7 @@ use shiso_core::error::{CoreError, CoreResult};
 
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef, WeightSet};
 use crate::sparse::exl3::{self, Fanout};
-use crate::sparse::kernels::{self, Entry, MOD_EXL3, MOD_MOE, TemplateArgs};
+use crate::sparse::kernels::{self, Entry, MOD_EXL3, MOD_MODELOPT, MOD_MOE, TemplateArgs};
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::plan::{Branch, Plan, Step, TrellisOp};
 use crate::sparse::scratch::Buf;
@@ -1037,6 +1037,13 @@ pub fn grouped_experts(
 /// Output rows one affine expert threadgroup covers (`Q4E_AFFINE_ROWS`).
 const AFFINE_EXPERT_ROWS: u32 = 8;
 
+/// Weight rows one block of the NVFP4 prompt kernels covers (`Q4E_MO_BM`).
+const NVFP4_GEMM_ROWS: u32 = 64;
+
+/// Threads one block of the NVFP4 prompt kernels runs (`Q4E_MO_THREADS`):
+/// four warps, sixteen rows each.
+const NVFP4_GEMM_THREADS: u32 = 128;
+
 /// Weight rows one tile of the routed prompt kernels covers
 /// (`Q4E_GEMM_EXPERT_ROWS`).
 const AFFINE_GEMM_EXPERT_ROWS: u32 = 64;
@@ -1055,7 +1062,7 @@ pub const fn affine_down_rows(in_dim: u32) -> u32 {
     }
 }
 
-/// The expert stages over an affine or a block-scaled FP8 bank: gate and up in
+/// The expert stages over an affine, a block-scaled FP8 or an NVFP4 bank: gate and up in
 /// one launch over the sorted columns, the activation, and the down
 /// projection, every stage reaching an expert's matrices through the layer's
 /// expert-to-slot map.
@@ -1088,8 +1095,9 @@ pub fn affine_experts(
         (desc.down, inter, hidden),
     ];
     let fp8 = desc.gate.dtype == DType::Fp8E4M3Block128;
+    let nvfp4 = desc.gate.dtype == DType::Nvfp4Gs16;
     if widths.iter().any(|(w, i, o)| {
-        !(w.dtype.is_affine() || fp8)
+        !(w.dtype.is_affine() || fp8 || nvfp4)
             || w.dtype != desc.gate.dtype
             || w.in_dim != *i
             || w.out_dim != *o
@@ -1102,13 +1110,17 @@ pub fn affine_experts(
     let columns = u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX);
     let groups = columns.min(shape.moe.experts);
     let at = |role: Role, span| Operand::Weight(WeightRef::layer(layer, role).spanning(span));
-    let map = Operand::ExpertMap(layer.index);
+    // A draft head's banks are resident even when the target's stream.
+    let map = match layer.set {
+        WeightSet::Target => Operand::ExpertMap(layer.index),
+        WeightSet::Draft => Operand::ResidentExpertMap,
+    };
     // The block-scaled kernels run a simdgroup per output row; the affine
     // ones four rows a simdgroup.
     let launch = |out_dim: u32| {
         kernels::Launch::new(
             shiso_core::Extent3::new(out_dim.div_ceil(AFFINE_EXPERT_ROWS), groups, 1),
-            if fp8 {
+            if fp8 || nvfp4 {
                 32 * AFFINE_EXPERT_ROWS
             } else {
                 matmul::AFFINE_THREADS
@@ -1129,6 +1141,78 @@ pub fn affine_experts(
             Operand::U32(shape.moe.used),
         ]
     };
+    if nvfp4 {
+        // A prompt pass takes the tensor-core tiles: a column's result then
+        // depends on the shape alone, which is the prompt's promise, and an
+        // expert's weights are decoded once a tile rather than once a column.
+        // A step keeps the warp-per-row kernels.
+        let gemm = device.row_invariant();
+        let (gate_up, down, rows, threads) = if gemm {
+            (
+                "q4e_nvfp4_experts_gemm_gate_up_kernel",
+                "q4e_nvfp4_experts_gemm_down_kernel",
+                NVFP4_GEMM_ROWS,
+                NVFP4_GEMM_THREADS,
+            )
+        } else {
+            (
+                "q4e_nvfp4_experts_gate_up_kernel",
+                "q4e_nvfp4_experts_down_kernel",
+                AFFINE_EXPERT_ROWS,
+                32 * AFFINE_EXPERT_ROWS,
+            )
+        };
+        let tiles = |out_dim: u32, copies: u32| {
+            kernels::Launch::new(
+                shiso_core::Extent3::new(copies * out_dim.div_ceil(rows), groups, 1),
+                threads,
+                0,
+            )
+        };
+        // `out_gate, out_up, gate_w, gate_s, gate_g, up_w, up_s, up_g, x,
+        //  sorted, bounds, active, map, in_dim, out_dim, n_expert, n_used`
+        let mut ops = vec![
+            Operand::Scratch(Buf::MoeGate),
+            Operand::Scratch(Buf::MoeUp),
+            at(Role::ExpertGate, WeightPart::Whole),
+            at(Role::ExpertGate, WeightPart::GroupScales),
+            at(Role::ExpertGate, WeightPart::GlobalScale),
+            at(Role::ExpertUp, WeightPart::Whole),
+            at(Role::ExpertUp, WeightPart::GroupScales),
+            at(Role::ExpertUp, WeightPart::GlobalScale),
+            Operand::Scratch(Buf::Mixed),
+        ];
+        ops.extend(tail(hidden, inter));
+        plan.launch(
+            Entry::plain(MOD_MODELOPT, gate_up),
+            // The gemm's grid holds the gate's row tiles, then the up's.
+            tiles(inter, if gemm { 2 } else { 1 }),
+            Args::of(&ops),
+        );
+        plan.append(activate(
+            shape,
+            Operand::Scratch(Buf::MoeGate),
+            Operand::Scratch(Buf::MoeUp),
+            Operand::Scratch(Buf::MoeMid),
+            n_tok,
+        ));
+        // `out, down_w, down_s, down_g, mid, sorted, bounds, active, map,
+        //  in_dim, out_dim, n_expert, n_used`
+        let mut ops = vec![
+            Operand::Scratch(Buf::MoeDown),
+            at(Role::ExpertDown, WeightPart::Whole),
+            at(Role::ExpertDown, WeightPart::GroupScales),
+            at(Role::ExpertDown, WeightPart::GlobalScale),
+            Operand::Scratch(Buf::MoeMid),
+        ];
+        ops.extend(tail(inter, hidden));
+        plan.launch(
+            Entry::plain(MOD_MODELOPT, down),
+            tiles(hidden, 1),
+            Args::of(&ops),
+        );
+        return Ok(plan);
+    }
     if fp8 {
         // `out_gate, out_up, gate_w, gate_s, up_w, up_s, x, sorted, bounds,
         //  active, map, in_dim, out_dim, n_expert, n_used`
@@ -1143,7 +1227,7 @@ pub fn affine_experts(
         ];
         ops.extend(tail(hidden, inter));
         plan.launch(
-            Entry::plain(MOD_MOE, "q4e_fp8_experts_gate_up_kernel"),
+            Entry::plain(MOD_MODELOPT, "q4e_fp8_experts_gate_up_kernel"),
             launch(inter),
             Args::of(&ops),
         );
@@ -1164,7 +1248,7 @@ pub fn affine_experts(
         ];
         ops.extend(tail(inter, hidden));
         plan.launch(
-            Entry::plain(MOD_MOE, "q4e_fp8_experts_down_kernel"),
+            Entry::plain(MOD_MODELOPT, "q4e_fp8_experts_down_kernel"),
             launch(hidden),
             Args::of(&ops),
         );
@@ -1566,7 +1650,9 @@ pub fn block(
     n_tok: u32,
     device: Device,
 ) -> CoreResult<Plan> {
-    if desc.gate.dtype.is_affine() || desc.gate.dtype == DType::Fp8E4M3Block128 {
+    if desc.gate.dtype.is_affine()
+        || matches!(desc.gate.dtype, DType::Fp8E4M3Block128 | DType::Nvfp4Gs16)
+    {
         // A decode-sized pass routes and sorts in one launch, which is the
         // same answer as the four-launch route and sort bit for bit - so a
         // prompt pass narrow enough to take it still routes a row as a wider

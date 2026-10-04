@@ -30,19 +30,16 @@ use shiso_modelfile::modelopt::{ModeloptFile, Stored};
 use super::{QuantAlgo, Qwen35MoeConfig};
 
 /// Prefix every language-model tensor carries.
-pub const TEXT_PREFIX: &str = "model.language_model.";
+pub use crate::qwen35::modelopt::TEXT_PREFIX;
 
 /// Prefix the vision tower's tensors carry, which this module does not name.
 pub const VISION_PREFIX: &str = "model.visual.";
 
 /// The output projection, which sits outside both towers.
-pub const LM_HEAD: &str = "lm_head";
+pub use crate::qwen35::modelopt::LM_HEAD;
 
 /// The prefixes a language-model load asks the container for.
-///
-/// The vision tower is described by its own loader and the draft head by
-/// nothing, so neither is in this list and neither costs a description.
-pub const TEXT_ROOTS: [&str; 2] = [TEXT_PREFIX, LM_HEAD];
+pub use crate::qwen35::modelopt::TEXT_ROOTS;
 
 /// Every tensor the forward pass reads, in the order it reads them.
 ///
@@ -113,7 +110,7 @@ pub fn expected_tensors(shape: &HybridShape) -> Vec<String> {
 /// The two vocabularies are different documents' - `hf_quant_config.json`'s
 /// `quant_algo` and the container's reading of the bytes - and this is the one
 /// place they are put beside each other.
-fn scheme_of(algo: QuantAlgo) -> &'static str {
+pub(crate) fn scheme_of(algo: QuantAlgo) -> &'static str {
     match algo {
         QuantAlgo::Fp8 => "fp8",
         QuantAlgo::W4A16Nvfp4 { .. } => "nvfp4",

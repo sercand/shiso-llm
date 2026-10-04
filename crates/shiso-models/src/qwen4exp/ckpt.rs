@@ -52,7 +52,7 @@ pub const QWEN4EXP_MODEL_ID: u8 = 6;
 #[must_use]
 pub const fn quant_bits_of(gate: DType) -> u8 {
     match gate {
-        DType::Q4_0 | DType::Q4_K | DType::IQ4_NL | DType::Exl3K4 => 4,
+        DType::Nvfp4Gs16 | DType::Q4_0 | DType::Q4_K | DType::IQ4_NL | DType::Exl3K4 => 4,
         _ => 2,
     }
 }

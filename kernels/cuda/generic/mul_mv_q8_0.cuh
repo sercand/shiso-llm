@@ -76,7 +76,11 @@ extern "C" __global__ void kernel_mul_mv_q8_0_f32(
     const struct shiso_block_q8_0 *ax[SHISO_MV_Q8_NR0];
 #pragma unroll
     for (int row = 0; row < SHISO_MV_Q8_NR0; ++row) {
-        const uint64_t offset0 = (uint64_t) (r0 + row) * args.nb01
+        /* A block's trailing rows past `ne01` are read from the last real row and
+         * never written: a one-row projection at two rows a block otherwise
+         * reads a whole row past the end of its weight. */
+        const int src_row = min(r0 + row, args.ne01 - 1);
+        const uint64_t offset0 = (uint64_t) src_row * args.nb01
                                + (uint64_t) (i12 / args.r2) * args.nb02
                                + (uint64_t) (i13 / args.r3) * args.nb03;
         ax[row] = (const struct shiso_block_q8_0 *) (src0 + offset0);

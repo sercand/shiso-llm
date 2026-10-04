@@ -63,3 +63,10 @@ fn q4_k_matvec_matches_the_oracle_dot() {
     let Some(gpu) = open() else { return };
     cases::q4_k_matvec_matches_the_oracle_dot(&gpu);
 }
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn k_quant_matvec_batches_match_the_oracle_dot() {
+    let Some(gpu) = open() else { return };
+    cases::k_quant_matvec_batches_match_the_oracle_dot(&gpu);
+}

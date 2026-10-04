@@ -129,6 +129,97 @@ const MODELOPT_NVFP4_MV_BLOCK: u32 = 32 * MODELOPT_MV_ROWS;
 /// there. Both axes, and the block is one thread per output element.
 const MODELOPT_TILE: u32 = 16;
 
+/// Grid and block of a `modelopt` launch.
+///
+/// The two codecs take DIFFERENT matvec geometries, so the grid cannot be
+/// decided before the aux is read. See `MODELOPT_MV_BLOCK` for why: at four
+/// bits a weight a row is half as many bytes, and the block-per-row shape the
+/// FP8 entry wants leaves the NVFP4 one folding more than it loads. The token-
+/// blocked entries cover several rows a warp or block; the tiled route is one
+/// shape for both, a GEMM over decoded floats.
+const fn modelopt_geometry(
+    nvfp4: bool,
+    tiled: bool,
+    per_block: u32,
+    out_dim: u32,
+    n_tok: u32,
+) -> (Extent3, Extent3) {
+    if tiled {
+        return (
+            Extent3::new(
+                out_dim.div_ceil(MODELOPT_TILE),
+                n_tok.div_ceil(MODELOPT_TILE),
+                1,
+            ),
+            Extent3::new(MODELOPT_TILE, MODELOPT_TILE, 1),
+        );
+    }
+    let token_blocks = n_tok.div_ceil(per_block);
+    match (nvfp4, per_block) {
+        (true, 1) => (
+            Extent3::new(out_dim.div_ceil(MODELOPT_MV_ROWS), n_tok, 1),
+            Extent3::linear(MODELOPT_NVFP4_MV_BLOCK),
+        ),
+        (false, 1) => (
+            Extent3::new(out_dim, n_tok, 1),
+            Extent3::linear(MODELOPT_MV_BLOCK),
+        ),
+        (true, _) => (
+            Extent3::new(
+                out_dim.div_ceil(MODELOPT_NVFP4_MULTI_WARPS * MODELOPT_NVFP4_MULTI_ROWS),
+                token_blocks,
+                1,
+            ),
+            Extent3::linear(32 * MODELOPT_NVFP4_MULTI_WARPS),
+        ),
+        (false, _) => (
+            Extent3::new(out_dim.div_ceil(MODELOPT_FP8_MULTI_ROWS), token_blocks, 1),
+            Extent3::linear(MODELOPT_MV_BLOCK),
+        ),
+    }
+}
+
+/// Rows up to which the `modelopt` codecs stay on the token-blocked matvec.
+///
+/// The widest logits pass a step makes - a batch of speculative verifies - is
+/// 32 rows, and at eight tokens a block that is four reads of each weight.
+/// The tile it replaced read them once but ran far below the bandwidth, and
+/// the vendor route would have to stage a whole `f32` copy of the matrix: for
+/// a 248,320-row output projection that is a 5 GB plane for 32 rows.
+const MODELOPT_MULTI_MAX_TOKENS: u32 = 32;
+
+/// Output rows one warp of the token-blocked NVFP4 entries covers, the `_r4`
+/// of `kernel_q35moe_mv_nvfp4_f32_t*_r4` in `kernels/cuda/qwen35moe/mv_multi.cuh`.
+///
+/// Every weight is decoded once for all of a block's tokens and every staged
+/// activation is folded into this many rows. The first token-blocked version
+/// decoded per token and loaded per row and measured 37 GB/s at eight tokens
+/// on the dense 27B export; this shape measures 163-185 GB/s.
+const MODELOPT_NVFP4_MULTI_ROWS: u32 = 4;
+
+/// Warps one block of the token-blocked NVFP4 entries runs. Every warp of a
+/// block reads the same staged activation tile, so a wider block stages it
+/// fewer times; eight measured best on the 27B shapes, 168-181 GB/s against
+/// 153-174 at four.
+const MODELOPT_NVFP4_MULTI_WARPS: u32 = 8;
+
+/// Output rows one block of the token-blocked FP8 entries covers, the `_r2`
+/// of `kernel_q35moe_mv_fp8_f32_t*_r2`: 194-219 GB/s at eight tokens on the
+/// same shapes, where four rows spilled into fewer resident blocks and two
+/// was the best measured.
+const MODELOPT_FP8_MULTI_ROWS: u32 = 2;
+
+/// Tokens one block of the `modelopt` matvec covers at `n_tok` rows: the
+/// narrowest instantiation that covers the pass in one block, capped at eight.
+const fn modelopt_tokens_per_block(n_tok: u32) -> u32 {
+    match n_tok {
+        0 | 1 => 1,
+        2 => 2,
+        3 | 4 => 4,
+        _ => 8,
+    }
+}
+
 /// Checks a packed affine weight's element type and geometry, returning the
 /// number of quantization groups one row carries.
 ///
@@ -833,6 +924,126 @@ const _: () = assert!(
      band of a full chunk runs past the scratch the stack allocated"
 );
 
+/// How [`blas_projection`] widens one weight into the `f32` plane the vendor
+/// multiply reads.
+///
+/// The block codecs share one staging family keyed by name; the two `modelopt`
+/// codecs carry a scale the plane has to fold in, and the NVFP4 one a second
+/// buffer, so each is a variant of its own rather than a name.
+enum Stager<'w> {
+    /// `kernel_dequant_plane_*`, which reads the weight alone.
+    Block(&'static str),
+    /// FP8: one `e4m3` byte per weight under one `f32`.
+    Fp8 {
+        /// The tensor's `weight_scale`.
+        scale: f32,
+    },
+    /// NVFP4: packed codes, per-group `e4m3` scales, and one `f32` above both.
+    Nvfp4 {
+        /// The per-group scale array.
+        scales: DeviceView<'w>,
+        /// The tensor's `weight_scale_2`.
+        global: f32,
+    },
+}
+
+impl<'w> Stager<'w> {
+    /// The staging route for `weight`, or `None` when its codec has none.
+    fn of(weight: &'w Weight) -> Option<Self> {
+        match weight.aux.as_ref() {
+            Some(WeightAux::Fp8 { weight_scale, .. }) => Some(Self::Fp8 {
+                scale: *weight_scale,
+            }),
+            Some(WeightAux::Nvfp4 {
+                group_scales,
+                global,
+            }) => Some(Self::Nvfp4 {
+                scales: group_scales.view(),
+                global: *global,
+            }),
+            Some(WeightAux::Affine(_)) => None,
+            None => dequant_plane_name(weight.dtype).map(Self::Block),
+        }
+    }
+
+    /// Writes `weight` into `staged` as `out_dim` rows of `in_dim` `f32`.
+    fn stage(
+        &self,
+        backend: &dyn Backend,
+        weight: &Weight,
+        staged: DeviceView<'_>,
+    ) -> CoreResult<()> {
+        let grid = dequant_plane_grid(weight.out_dim);
+        let block = Extent3::linear(DEQUANT_BLOCK);
+        let modelopt = |scale: f32| -> CoreResult<ModeloptArgs> {
+            Ok(ModeloptArgs {
+                in_dim: extent(weight.in_dim, "projection in_dim")?,
+                out_dim: extent(weight.out_dim, "projection out_dim")?,
+                n_tok: 0,
+                scale,
+            })
+        };
+        let (entry, result) = match self {
+            Self::Block(entry) => {
+                let args = DequantPlaneArgs {
+                    ne00: extent(weight.in_dim, "projection in_dim")?,
+                    ne01: extent(weight.out_dim, "projection out_dim")?,
+                    nb01: row_bytes(weight.dtype, weight.in_dim)?,
+                };
+                let result = run(
+                    backend,
+                    KernelRef::new(Q35, entry),
+                    grid,
+                    block,
+                    0,
+                    &[
+                        KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                        KernelArg::Buffer(weight.view()),
+                        KernelArg::Buffer(staged),
+                    ],
+                );
+                (*entry, result)
+            }
+            Self::Fp8 { scale } => {
+                let entry = "kernel_q35moe_dequant_plane_fp8_f32";
+                let args = modelopt(*scale)?;
+                let result = run(
+                    backend,
+                    KernelRef::new(Q35MOE, entry),
+                    grid,
+                    block,
+                    0,
+                    &[
+                        KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                        KernelArg::Buffer(weight.view()),
+                        KernelArg::Buffer(staged),
+                    ],
+                );
+                (entry, result)
+            }
+            Self::Nvfp4 { scales, global } => {
+                let entry = "kernel_q35moe_dequant_plane_nvfp4_f32";
+                let args = modelopt(*global)?;
+                let result = run(
+                    backend,
+                    KernelRef::new(Q35MOE, entry),
+                    grid,
+                    block,
+                    0,
+                    &[
+                        KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                        KernelArg::Buffer(weight.view()),
+                        KernelArg::Buffer(*scales),
+                        KernelArg::Buffer(staged),
+                    ],
+                );
+                (entry, result)
+            }
+        };
+        result.map_err(|err| launch_failure(entry, err))
+    }
+}
+
 /// The vendor-library half of [`projection`], or `false` when this device has
 /// no vendor library to route to.
 ///
@@ -893,7 +1104,7 @@ fn blas_projection(
     src: DeviceView<'_>,
     dst: DeviceView<'_>,
 ) -> CoreResult<bool> {
-    let (Some(blas), Some(entry)) = (backend.as_blas(), dequant_plane_name(weight.dtype)) else {
+    let (Some(blas), Some(widen)) = (backend.as_blas(), Stager::of(weight)) else {
         return Ok(false);
     };
     // Every call is made at ONE token count, whatever the chunk carries, and
@@ -978,24 +1189,7 @@ fn blas_projection(
     // reads - until a later layer reduces across the padded region and it
     // stops being nothing.
     backend.fill_zero(src.slice(carried, banded_src.saturating_sub(carried))?)?;
-    let args = DequantPlaneArgs {
-        ne00: extent(weight.in_dim, "projection in_dim")?,
-        ne01: extent(weight.out_dim, "projection out_dim")?,
-        nb01: row_bytes(weight.dtype, weight.in_dim)?,
-    };
-    run(
-        backend,
-        KernelRef::new(Q35, entry),
-        dequant_plane_grid(weight.out_dim),
-        Extent3::linear(DEQUANT_BLOCK),
-        0,
-        &[
-            KernelArg::Bytes(bytemuck::bytes_of(&args)),
-            KernelArg::Buffer(weight.view()),
-            KernelArg::Buffer(staged),
-        ],
-    )
-    .map_err(|err| launch_failure(entry, err))?;
+    widen.stage(backend, weight, staged)?;
     // One multiply per band, all of them the same shape. The plane is staged
     // once and every band reads it, so a narrower pad trades a second read of
     // the staged weight for less padding arithmetic - which is the whole of
@@ -1297,45 +1491,33 @@ fn modelopt_projection(
     src: DeviceView<'_>,
     dst: DeviceView<'_>,
 ) -> CoreResult<()> {
-    let tiled = n_tok >= GEMM_MIN_TOKENS;
+    // Past a verify's widest pass, a chunk goes to the vendor multiply when
+    // the device has one; the hand-written tile below is the fallback.
+    let tiled = n_tok > MODELOPT_MULTI_MAX_TOKENS;
+    if tiled && blas_projection(backend, weight, n_tok, src, dst)? {
+        return Ok(());
+    }
     let mut args = ModeloptArgs {
         in_dim: extent(weight.in_dim, "projection in_dim")?,
         out_dim: extent(weight.out_dim, "projection out_dim")?,
         n_tok: extent(n_tok, "projection n_tok")?,
         scale: 1.0,
     };
-    // The two codecs take DIFFERENT matvec geometries, so the grid cannot be
-    // decided before the aux is read. See `MODELOPT_MV_BLOCK` for why: at four
-    // bits a weight a row is half as many bytes, and the block-per-row shape
-    // the FP8 entry wants leaves the NVFP4 one folding more than it loads. The
-    // tiled route is one shape for both - it is a GEMM over decoded floats and
-    // the codec is gone by the time the tile is staged.
+    // Tokens one matvec block carries. One weight read covers this many rows,
+    // so a verify of eight reads every weight once rather than eight times;
+    // see `kernels/cuda/qwen35moe/mv_multi.cuh`.
+    let per_block = modelopt_tokens_per_block(n_tok);
     let nvfp4 = matches!(weight.aux.as_ref(), Some(WeightAux::Nvfp4 { .. }));
-    let grid = if tiled {
-        Extent3::new(
-            weight.out_dim.div_ceil(MODELOPT_TILE),
-            n_tok.div_ceil(MODELOPT_TILE),
-            1,
-        )
-    } else if nvfp4 {
-        Extent3::new(weight.out_dim.div_ceil(MODELOPT_MV_ROWS), n_tok, 1)
-    } else {
-        Extent3::new(weight.out_dim, n_tok, 1)
-    };
-    let block = if tiled {
-        Extent3::new(MODELOPT_TILE, MODELOPT_TILE, 1)
-    } else if nvfp4 {
-        Extent3::linear(MODELOPT_NVFP4_MV_BLOCK)
-    } else {
-        Extent3::linear(MODELOPT_MV_BLOCK)
-    };
+    let (grid, block) = modelopt_geometry(nvfp4, tiled, per_block, weight.out_dim, n_tok);
     match weight.aux.as_ref() {
         Some(WeightAux::Fp8 { weight_scale, .. }) => {
             args.scale = *weight_scale;
-            let entry = if tiled {
-                "kernel_q35moe_mm_fp8_f32"
-            } else {
-                "kernel_q35moe_mv_fp8_f32"
+            let entry = match (tiled, per_block) {
+                (true, _) => "kernel_q35moe_mm_fp8_f32",
+                (false, 1) => "kernel_q35moe_mv_fp8_f32",
+                (false, 2) => "kernel_q35moe_mv_fp8_f32_t2_r2",
+                (false, 4) => "kernel_q35moe_mv_fp8_f32_t4_r2",
+                (false, _) => "kernel_q35moe_mv_fp8_f32_t8_r2",
             };
             run(
                 backend,
@@ -1356,10 +1538,12 @@ fn modelopt_projection(
             global,
         }) => {
             args.scale = *global;
-            let entry = if tiled {
-                "kernel_q35moe_mm_nvfp4_f32"
-            } else {
-                "kernel_q35moe_mv_nvfp4_f32"
+            let entry = match (tiled, per_block) {
+                (true, _) => "kernel_q35moe_mm_nvfp4_f32",
+                (false, 1) => "kernel_q35moe_mv_nvfp4_f32",
+                (false, 2) => "kernel_q35moe_mv_nvfp4_f32_t2_r4",
+                (false, 4) => "kernel_q35moe_mv_nvfp4_f32_t4_r4",
+                (false, _) => "kernel_q35moe_mv_nvfp4_f32_t8_r4",
             };
             run(
                 backend,

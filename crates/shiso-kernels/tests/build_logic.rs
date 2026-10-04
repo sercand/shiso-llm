@@ -181,6 +181,7 @@ fn the_real_manifest_tree_parses() {
             "q4e_idx",
             "q4e_matvec",
             "q4e_misc",
+            "q4e_modelopt",
             "q4e_moe",
             "q4e_ple",
             "q4e_qsa",

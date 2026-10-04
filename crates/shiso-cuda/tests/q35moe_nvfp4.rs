@@ -68,3 +68,10 @@ fn every_e2m1_code_decodes_the_way_the_host_table_does() {
     let Some(gpu) = open() else { return };
     cases::every_e2m1_code_decodes_the_way_the_host_table_does(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_token_blocked_matvec_is_the_one_token_matvec_to_the_bit() {
+    let Some(gpu) = open() else { return };
+    cases::the_token_blocked_matvec_is_the_one_token_matvec_to_the_bit(&gpu);
+}

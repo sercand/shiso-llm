@@ -43,6 +43,7 @@ use super::manifest::{
     AxisOrder, CHECKPOINT_PREFIX, PUBLISHED_SIDECAR, PatchRows, SIDECAR_PREFIX,
     SIDECAR_PREFIX_CANONICAL, SidecarContract, TowerManifest, TowerTensorSpec, TowerTree,
 };
+use super::mmproj::{self, MmprojTower};
 
 /// Formats the tower loader will move to a device.
 ///
@@ -270,6 +271,8 @@ enum Tower {
     },
     /// A trellis-quantized tower file beside a checkpoint's config.
     Trellis(Box<TrellisTower>),
+    /// A multimodal-projector GGUF, under its own naming scheme.
+    Mmproj(Box<MmprojTower>),
     /// A standalone tower file.
     Sidecar {
         /// The opened container.
@@ -311,6 +314,9 @@ impl Tower {
                 path: dir.to_path_buf(),
             })?;
         let dims = VisionDims::try_from(&vcfg)?;
+        let shard_path = shard_path.ok_or_else(|| VisionError::NoTowerShard {
+            path: dir.to_path_buf(),
+        })?;
         let shard = VisionShard::open(&shard_path)?;
         Ok(Self::Shard { shard, dims })
     }
@@ -351,8 +357,15 @@ impl Tower {
     }
 
     /// Opens a standalone tower file and judges it against the contract.
+    ///
+    /// A projector GGUF is a standalone tower file too, under its own names,
+    /// and which of the two this is is read off the file's architecture rather
+    /// than asked of the operator.
     fn open_sidecar(path: &Path) -> Result<Self, VisionError> {
         let file = open_gguf(path)?;
+        if mmproj::is_mmproj(&file) {
+            return Ok(Self::Mmproj(Box::new(MmprojTower::open(file, path)?)));
+        }
         let prefix = probe_prefix(&file, path)?;
         let dims = sidecar_dims(&file)?;
         // Judged AFTER the dimensions are derived, never before: the contract
@@ -375,6 +388,7 @@ impl Tower {
                 *dims
             }
             Self::Trellis(tower) => tower.dims,
+            Self::Mmproj(tower) => tower.dims(),
         }
     }
 
@@ -385,6 +399,9 @@ impl Tower {
             // The same spelling a standalone tower's short prefix uses, which
             // is what this container writes.
             Self::Modelopt { .. } | Self::Trellis(_) => MODELOPT_TOWER_PREFIX,
+            // Not a spelling this container writes: the manifest is built
+            // under the sidecar's names and each lookup is translated.
+            Self::Mmproj(_) => SIDECAR_PREFIX,
             Self::Sidecar { prefix, .. } => prefix,
         }
     }
@@ -397,6 +414,7 @@ impl Tower {
             // own count and not the checkpoint's.
             Self::Modelopt { file, .. } => file.tensors().len(),
             Self::Trellis(tower) => tower.tensor_count(),
+            Self::Mmproj(tower) => tower.tensor_count(),
             Self::Sidecar { file, prefix, .. } => {
                 let under = format!("{prefix}.");
                 file.tensors()
@@ -471,6 +489,7 @@ impl Tower {
                 ))
             }
             Self::Trellis(tower) => tower.describe(name),
+            Self::Mmproj(tower) => tower.describe(name),
             Self::Sidecar { file, .. } => {
                 let desc = TensorSource::find(file.as_ref(), name).ok_or_else(|| {
                     VisionError::MissingTensor {
@@ -508,6 +527,7 @@ impl Tower {
                     })
             }
             Self::Trellis(tower) => tower.bytes(name),
+            Self::Mmproj(tower) => tower.bytes(name),
             Self::Sidecar { file, .. } => TensorSource::get(file.as_ref(), name)
                 .map(|view| Cow::Borrowed(view.data))
                 .ok_or_else(|| VisionError::MissingTensor {

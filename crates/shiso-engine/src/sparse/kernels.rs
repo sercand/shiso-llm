@@ -68,6 +68,11 @@ pub const MOD_QSA_SPARSE: &str = "q4e_qsa_sparse";
 pub const MOD_IDX: &str = "q4e_idx";
 /// Elementwise helpers and the greedy row pick.
 pub const MOD_MISC: &str = "q4e_misc";
+/// The `modelopt` codecs this family's NVIDIA exports store: the routed
+/// stages over an NVFP4 bank, and the FP8 n-gram row decode. Not an upstream
+/// unit, which is why it is a module of its own rather than entries in
+/// [`MOD_MOE`] or [`MOD_PLE`].
+pub const MOD_MODELOPT: &str = "q4e_modelopt";
 /// The logits stages run before any pick: today, the suppress stage.
 pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a

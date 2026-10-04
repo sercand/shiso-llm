@@ -414,7 +414,9 @@ pub struct ServeArgs {
     #[arg(long, env = "SHISO_NGRAM")]
     pub ngram: Option<PathBuf>,
 
-    /// The vision tower: a sidecar weights file, or a directory holding one.
+    /// The vision tower: a sidecar weights file, a multimodal-projector GGUF
+    /// (`mmproj-*.gguf`), or a checkpoint directory whose config names its
+    /// tower shard.
     ///
     /// Absent means text only, and the encoder is never loaded.
     #[arg(long, env = "SHISO_VISION")]

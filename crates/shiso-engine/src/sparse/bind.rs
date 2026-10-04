@@ -444,6 +444,11 @@ pub enum Operand {
     /// layer index: the identity while the banks are resident, and the stream's
     /// own map for that layer while they are streamed.
     ExpertMap(u32),
+    /// The identity expert-to-slot map of a resident bank, whatever the
+    /// target's banks are: a draft head's experts are never streamed, and
+    /// reading a streamed target layer's map against them would send every
+    /// column to the slot some other layer's expert sits at.
+    ResidentExpertMap,
     /// A pointer parameter the launcher passes as null.
     Null,
     /// An unsigned 32-bit scalar.
@@ -510,6 +515,7 @@ impl Operand {
                 | Self::CoopLocks
                 | Self::CoopStaging(_)
                 | Self::ExpertMap(_)
+                | Self::ResidentExpertMap
                 | Self::Null
         )
     }
@@ -991,7 +997,7 @@ impl<'a> Binder<'a> {
                     })?
                     .map(layer)?,
             ),
-            Operand::ExpertMap(_) => KernelArg::Buffer(
+            Operand::ExpertMap(_) | Operand::ResidentExpertMap => KernelArg::Buffer(
                 self.weights
                     .expert_map
                     .as_ref()

@@ -1614,7 +1614,8 @@ fn weight_view(tensor: &TowerTensor, width: WeightWidth) -> Result<DeviceView<'_
 pub(crate) enum WeightWidth {
     /// Brain floats: the checkpoint towers and the standalone one.
     Bf16,
-    /// IEEE halves: the trellis export's tower.
+    /// IEEE halves: the trellis export's tower and a half-precision
+    /// projector file.
     F16,
 }
 
