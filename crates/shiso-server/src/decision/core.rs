@@ -28,6 +28,7 @@ use crate::error::AppError;
 use crate::media::MediaItem;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
+use crate::tokenizer::Vocabulary;
 
 /// One option of a choice question.
 #[derive(Debug, Clone)]
@@ -123,14 +124,17 @@ fn canonical(value: &serde_json::Value) -> serde_json::Value {
 /// The exact bytes are pinned by the golden tests below, through
 /// [`prompt_body`] and, on the blocks path, through the whitespace goldens in
 /// `tests/decisions.rs`.
-pub(crate) fn question_block(kind: &Kind) -> String {
+///
+/// `labels` are the kind's label words from [`labels_for`]; a choice block
+/// letters its options with them, the other kinds spell their own.
+pub(crate) fn question_block(kind: &Kind, labels: &[String]) -> String {
     match kind {
         Kind::Choice { question, options } => {
             let mut lines = Vec::with_capacity(options.len() + 2);
             if !question.trim().is_empty() {
                 lines.push(format!("Question: {question}"));
             }
-            for (option, label) in options.iter().zip(choice_labels(options.len())) {
+            for (option, label) in options.iter().zip(labels) {
                 let mut line = format!("{label}: {}", option.name);
                 if let Some(description) = option
                     .description
@@ -142,7 +146,13 @@ pub(crate) fn question_block(kind: &Kind) -> String {
                 }
                 lines.push(line);
             }
-            lines.push("Answer with the letter of one option only.".to_string());
+            // A list within the alphabet keeps the version-1 wording byte for
+            // byte; only a wide list, whose labels are two letters, says so.
+            if options.len() <= LETTERS.len() {
+                lines.push("Answer with the letter of one option only.".to_string());
+            } else {
+                lines.push("Answer with the two-letter label of one option only.".to_string());
+            }
             lines.join("\n")
         }
         Kind::Score { question, levels } => {
@@ -181,8 +191,8 @@ pub(crate) fn question_block(kind: &Kind) -> String {
 /// The exact bytes are pinned by the golden tests below, and `input` is
 /// trimmed so the seam between it and the block is always exactly one blank
 /// line whatever whitespace the caller padded it with.
-pub(crate) fn prompt_body(input: &str, kind: &Kind) -> String {
-    let block = question_block(kind);
+pub(crate) fn prompt_body(input: &str, kind: &Kind, labels: &[String]) -> String {
+    let block = question_block(kind, labels);
     let mut body = String::with_capacity(input.len() + block.len() + 2);
     body.push_str(input.trim());
     body.push_str("\n\n");
@@ -190,17 +200,40 @@ pub(crate) fn prompt_body(input: &str, kind: &Kind) -> String {
     body
 }
 
-/// The letters `A`.. for `n` options.
+/// The single letters a list within the alphabet is labelled with.
+const LETTERS: [&str; 26] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U", "V", "W", "X", "Y", "Z",
+];
+
+/// The most options one choice question takes: the System One wire's own
+/// bound. Any vocabulary that spells most two-letter pairs as one token
+/// labels a list this long; one that cannot is refused at preparation.
+pub(crate) const MAX_CHOICE_OPTIONS: usize = 255;
+
+/// The labels for `n` options: the letters `A`.. when `n` fits the alphabet,
+/// otherwise two letters each - `AA`, `AB`, .. - keeping only the pairs
+/// `one_token` accepts, in that order.
 ///
-/// Past 26 the vector stops at `Z` rather than inventing labels:
-/// [`check_choice_options`] refuses longer lists, so a request that passed
-/// validation never sees a short label vector.
-pub(crate) fn choice_labels(n: usize) -> Vec<&'static str> {
-    const LETTERS: [&str; 26] = [
-        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
-        "S", "T", "U", "V", "W", "X", "Y", "Z",
-    ];
-    LETTERS.iter().copied().take(n.min(26)).collect()
+/// A wide list is two letters throughout rather than `A`..`Z` then `AA`..:
+/// the answer is read from one row, and a model spelling `AB` as `A`, `B`
+/// would put that answer's mass on `A`. With no single-letter label in the
+/// list, such a spelling is lost mass, never a different answer. Pairs the
+/// vocabulary splits are skipped because a split label cannot be read from
+/// one row at all.
+///
+/// The vector is shorter than `n` when the vocabulary runs out of one-token
+/// pairs; [`prepare_question`] refuses that list by name.
+pub(crate) fn choice_labels(n: usize, one_token: impl Fn(&str) -> bool) -> Vec<String> {
+    if n <= LETTERS.len() {
+        return LETTERS.iter().take(n).map(ToString::to_string).collect();
+    }
+    LETTERS
+        .iter()
+        .flat_map(|first| LETTERS.iter().map(move |second| format!("{first}{second}")))
+        .filter(|pair| one_token(pair))
+        .take(n)
+        .collect()
 }
 
 /// The numbers `0`.. for `n` levels, as label strings.
@@ -315,8 +348,9 @@ pub(crate) fn check_question_text(
 
 /// Refuse a choice option list the answer position cannot carry.
 ///
-/// The upper bound is the alphabet - labels run `A..Z`, so a longer list
-/// could not be answered by letter - and the lower bound is the surface's
+/// The upper bound is [`MAX_CHOICE_OPTIONS`] - whether this server's
+/// vocabulary can label that many is proven later, at preparation, where the
+/// vocabulary is in hand - and the lower bound is the surface's
 /// `min`, because one wire scores a binary choice and the other a real list.
 /// Names must be non-blank (a blank one renders a label pointing at nothing),
 /// free of control characters (one inside an option's name breaks the
@@ -339,11 +373,10 @@ pub(crate) fn check_choice_options(
             "invalid_request",
         ));
     }
-    if options.len() > 26 {
+    if options.len() > MAX_CHOICE_OPTIONS {
         return Err(AppError::bad_request(
             format!(
-                "{}: supports at most 26 options, got {}",
-                name,
+                "{name}: supports at most {MAX_CHOICE_OPTIONS} options per choice, got {}",
                 options.len()
             ),
             Some("questions"),
@@ -503,14 +536,12 @@ pub(crate) fn type_name(kind: &Kind) -> &'static str {
     }
 }
 
-/// The label words of a kind, in answer order: the letters, the digits, or
+/// The label words of a kind, in answer order: the letters (or, for a wide
+/// list, the one-token letter pairs `one_token` accepts), the digits, or
 /// `yes` and `no`.
-fn labels_for(kind: &Kind) -> Vec<String> {
+pub(crate) fn labels_for(kind: &Kind, one_token: impl Fn(&str) -> bool) -> Vec<String> {
     match kind {
-        Kind::Choice { options, .. } => choice_labels(options.len())
-            .into_iter()
-            .map(ToString::to_string)
-            .collect(),
+        Kind::Choice { options, .. } => choice_labels(options.len(), one_token),
         Kind::Score { levels, .. } => score_labels(levels.len()),
         Kind::YesNo { .. } => YES_NO_LABELS
             .iter()
@@ -685,7 +716,7 @@ pub(crate) struct PreparedQuestion {
 /// between input and block survives only when the caller's last block is
 /// text; after a picture the pad run already ends the text side, and the
 /// block follows plain.
-fn blocks_message(blocks: &[InputBlock], kind: &Kind) -> Message {
+fn blocks_message(blocks: &[InputBlock], kind: &Kind, labels: &[String]) -> Message {
     let mut parts: Vec<Block> = blocks
         .iter()
         .map(|block| match block {
@@ -698,7 +729,7 @@ fn blocks_message(blocks: &[InputBlock], kind: &Kind) -> Message {
             }
         })
         .collect();
-    let wording = question_block(kind);
+    let wording = question_block(kind, labels);
     let question_text = if matches!(blocks.last(), Some(InputBlock::Text { .. })) {
         format!("\n\n{wording}")
     } else {
@@ -706,6 +737,36 @@ fn blocks_message(blocks: &[InputBlock], kind: &Kind) -> Message {
     };
     parts.push(Block::Text(question_text));
     Message::new(Role::User, parts)
+}
+
+/// The kind's labels under `vocabulary`, refusing a choice list it cannot
+/// label: a wide list keeps only the pairs this vocabulary spells as one
+/// token, so it can come up short of the options it must label.
+fn vocabulary_labels(
+    vocabulary: &Vocabulary,
+    kind: &Kind,
+    name: &str,
+) -> Result<Vec<String>, AppError> {
+    let one_token = |label: &str| {
+        vocabulary
+            .encode(label, false)
+            .is_ok_and(|ids| ids.len() == 1)
+    };
+    let labels = labels_for(kind, one_token);
+    if let Kind::Choice { options, .. } = kind
+        && labels.len() < options.len()
+    {
+        return Err(AppError::bad_request(
+            format!(
+                "{name}: this server's vocabulary labels at most {} options per choice, got {}",
+                labels.len(),
+                options.len()
+            ),
+            Some("questions"),
+            "invalid_request",
+        ));
+    }
+    Ok(labels)
 }
 
 /// Renders one question over the shared input and proves the labels are
@@ -750,10 +811,16 @@ pub(crate) fn prepare_question(
         what: "a prompt renderer",
     })?;
     let vocabulary = renderer.vocabulary();
+    let name = question_name(&question.id);
+
+    // The labels are chosen before the prompt is rendered because the prompt
+    // spells them; the proofs below still check each one against the
+    // rendered tail.
+    let label_words = vocabulary_labels(vocabulary, &question.kind, &name)?;
 
     let message = match input {
-        DecisionInput::Text(text) => Message::user(prompt_body(text, &question.kind)),
-        DecisionInput::Blocks(blocks) => blocks_message(blocks, &question.kind),
+        DecisionInput::Text(text) => Message::user(prompt_body(text, &question.kind, &label_words)),
+        DecisionInput::Blocks(blocks) => blocks_message(blocks, &question.kind, &label_words),
     };
     let mut request = Request::new(state.model_id.clone(), vec![message]);
     // Scoring reads the first row after the question block. A thinking block
@@ -763,7 +830,6 @@ pub(crate) fn prepare_question(
     kwargs.apply(&mut request);
     let prompt = renderer.render(&request)?;
 
-    let name = question_name(&question.id);
     // The seam the answer is read at: the prompt's tail text and the ids
     // beside it. Without media the tail is the whole prompt, and the whole
     // prompt must first survive re-encoding - the text the caller is told
@@ -808,7 +874,7 @@ pub(crate) fn prepare_question(
 
     let mut labels: Vec<TokenId> = Vec::new();
     let mut words: Vec<String> = Vec::new();
-    for label in labels_for(&question.kind) {
+    for label in label_words {
         let encoded = vocabulary
             .encode(&label, false)
             .map_err(|error| AppError::internal("encoding a label", error))?;
@@ -987,13 +1053,19 @@ mod tests {
                 description: description.map(ToString::to_string),
             })
             .collect();
-        prompt_body(
+        body(
             kind_input,
             &Kind::Choice {
                 question: q.to_string(),
                 options,
             },
         )
+    }
+
+    /// The version-1 body under a vocabulary that spells every label as one
+    /// token, which is what the wording goldens pin.
+    fn body(input: &str, kind: &Kind) -> String {
+        prompt_body(input, kind, &labels_for(kind, |_| true))
     }
 
     fn yes_no(id: &str) -> RawQuestion {
@@ -1069,7 +1141,7 @@ mod tests {
                 .collect(),
         };
         assert_eq!(
-            prompt_body("in", &kind),
+            body("in", &kind),
             "in\n\nQuestion: how bad\n0: none\n1: some\n2: lots\nAnswer with the number of one level only."
         );
     }
@@ -1082,7 +1154,7 @@ mod tests {
             no: Some("denied".to_string()),
         };
         assert_eq!(
-            prompt_body("in", &kind),
+            body("in", &kind),
             "in\n\nIs the following true? it is ready\nyes: confirmed\nno: denied\nAnswer with yes or no only."
         );
     }
@@ -1095,7 +1167,7 @@ mod tests {
             no: None,
         };
         assert_eq!(
-            prompt_body("in", &kind),
+            body("in", &kind),
             "in\n\nIs the following true?\nAnswer with yes or no only."
         );
     }
@@ -1110,7 +1182,7 @@ mod tests {
             no: None,
         };
         assert_eq!(
-            prompt_body("the input  \n", &kind),
+            body("the input  \n", &kind),
             "the input\n\nIs the following true?\nAnswer with yes or no only."
         );
     }
@@ -1127,7 +1199,7 @@ mod tests {
 
     #[test]
     fn labels_are_letters_then_digits_then_yes_no() {
-        assert_eq!(choice_labels(3), ["A", "B", "C"]);
+        assert_eq!(choice_labels(3, |_| true), ["A", "B", "C"]);
         assert_eq!(score_labels(3), ["0", "1", "2"]);
         assert_eq!(YES_NO_LABELS, ["yes", "no"]);
     }
@@ -1157,9 +1229,55 @@ mod tests {
     }
 
     #[test]
-    fn check_choice_options_bounds_two_to_twenty_six() {
+    fn a_wide_list_is_two_letters_throughout_skipping_split_pairs() {
+        // Within the alphabet the vocabulary is never asked: the letters are
+        // the version-1 labels.
+        assert_eq!(choice_labels(26, |_| false).len(), 26);
+        let all = choice_labels(27, |_| true);
+        assert_eq!(all.len(), 27);
+        assert_eq!(all[..3], ["AA", "AB", "AC"]);
+        assert_eq!(all[26], "BA");
+        // A pair the vocabulary splits is skipped, not renamed.
+        let skipping = choice_labels(30, |pair| pair != "AB");
+        assert_eq!(skipping[..3], ["AA", "AC", "AD"]);
+        // A vocabulary that runs out comes up short; preparation refuses it.
+        assert_eq!(choice_labels(30, |pair| pair.starts_with('A')).len(), 26);
+        assert_eq!(
+            choice_labels(MAX_CHOICE_OPTIONS, |_| true).len(),
+            MAX_CHOICE_OPTIONS
+        );
+    }
+
+    #[test]
+    fn choice_body_words_a_wide_list_by_its_two_letter_labels() {
+        let opts: Vec<(String, Option<&str>)> =
+            (0..27).map(|index| (format!("o{index}"), None)).collect();
+        let opts: Vec<(&str, Option<&str>)> = opts
+            .iter()
+            .map(|(name, description)| (name.as_str(), *description))
+            .collect();
+        let rendered = choice("in", "pick one", &opts);
+        assert!(
+            rendered.starts_with("in\n\nQuestion: pick one\nAA: o0\nAB: o1\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.ends_with("\nBA: o26\nAnswer with the two-letter label of one option only."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn check_choice_options_bounds_two_to_the_wire_maximum() {
         assert!(check_choice_options(&options(26), "q", 2).is_ok());
-        assert!(check_choice_options(&options(27), "q", 2).is_err());
+        assert!(check_choice_options(&options(27), "q", 2).is_ok());
+        assert!(check_choice_options(&options(MAX_CHOICE_OPTIONS), "q", 2).is_ok());
+        let message = refusal(check_choice_options(
+            &options(MAX_CHOICE_OPTIONS + 1),
+            "q",
+            2,
+        ));
+        assert!(message.contains("options per choice"), "{message}");
         assert!(check_choice_options(&options(1), "q", 1).is_ok());
         assert!(check_choice_options(&options(1), "q", 2).is_err());
     }
