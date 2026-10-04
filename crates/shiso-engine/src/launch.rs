@@ -222,6 +222,35 @@ pub const fn ternary_mv_name(dtype: DType, n_tok: u32) -> Option<(&'static str, 
     Some((name, t))
 }
 
+/// Tokens one threadgroup of the prompt-width ternary matmul covers.
+pub const TERNARY_MM_TOKENS: u32 = 32;
+
+/// Output rows one threadgroup of either ternary matmul covers.
+pub const TERNARY_MM_ROWS: u32 = 32;
+
+/// `kernel_ternary_mmv_<tag>_f32`: two to eight rows, the weights decoded
+/// once and multiplied against every token at once.
+#[must_use]
+pub const fn ternary_mmv_name(dtype: DType) -> Option<&'static str> {
+    match dtype {
+        DType::Pq2_0 => Some("kernel_ternary_mmv_pq2_0_f32"),
+        DType::Ptq1_0 => Some("kernel_ternary_mmv_ptq1_0_f32"),
+        DType::MlxAffine2Gs128 => Some("kernel_ternary_mmv_mlx2_f32"),
+        _ => None,
+    }
+}
+
+/// `kernel_ternary_mm_<tag>_f32_n32`: a prompt chunk, 32 tokens a tile.
+#[must_use]
+pub const fn ternary_mm_name(dtype: DType) -> Option<&'static str> {
+    match dtype {
+        DType::Pq2_0 => Some("kernel_ternary_mm_pq2_0_f32_n32"),
+        DType::Ptq1_0 => Some("kernel_ternary_mm_ptq1_0_f32_n32"),
+        DType::MlxAffine2Gs128 => Some("kernel_ternary_mm_mlx2_f32_n32"),
+        _ => None,
+    }
+}
+
 /// `kernel_ternary_get_rows_<tag>_f32`.
 #[must_use]
 pub const fn ternary_rows_name(dtype: DType) -> Option<&'static str> {

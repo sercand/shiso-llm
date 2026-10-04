@@ -26,16 +26,19 @@ __device__ __forceinline__ float ternary_half(unsigned short bits) {
 
 __device__ __forceinline__ float ternary_load_x16(const float *x, float (&xt)[16]) {
     const float4 *xv = (const float4 *) x;
+    /* 4^-j for the code's position j in its half-word, j = 0..3 and 4..7. */
+    const float pre[8] = {1.0f, 1.0f / 4.0f, 1.0f / 16.0f, 1.0f / 64.0f,
+                          1.0f / 256.0f, 1.0f / 1024.0f, 1.0f / 4096.0f, 1.0f / 16384.0f};
     float sum = 0.0f;
 #pragma unroll
     for (unsigned i = 0; i < 4u; ++i) {
         const float4 v = xv[i];
         sum += (v.x + v.y) + (v.z + v.w);
         const unsigned j = (4u * i) % 8u;
-        xt[4u * i + 0u] = v.x * exp2f(-2.0f * (float) (j + 0u));
-        xt[4u * i + 1u] = v.y * exp2f(-2.0f * (float) (j + 1u));
-        xt[4u * i + 2u] = v.z * exp2f(-2.0f * (float) (j + 2u));
-        xt[4u * i + 3u] = v.w * exp2f(-2.0f * (float) (j + 3u));
+        xt[4u * i + 0u] = v.x * pre[j + 0u];
+        xt[4u * i + 1u] = v.y * pre[j + 1u];
+        xt[4u * i + 2u] = v.z * pre[j + 2u];
+        xt[4u * i + 3u] = v.w * pre[j + 3u];
     }
     return sum;
 }

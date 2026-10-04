@@ -365,7 +365,87 @@ pub fn get_rows_matches_the_host_decode(gpu: &Gpu) {
     }
 }
 
-/// Every matvec and gather entry name.
+/// The staged-tile matmul entry for `format` at `tn` tokens a threadgroup.
+#[must_use]
+pub fn mm_entry(format: Format, tn: u32) -> String {
+    format!("kernel_ternary_mm_{}_f32_n{tn}", format.tag())
+}
+
+/// The register-fragment matmul entry for `format` (two to eight rows).
+#[must_use]
+pub fn mmv_entry(format: Format) -> String {
+    format!("kernel_ternary_mmv_{}_f32", format.tag())
+}
+
+/// Runs one of the two matmul shapes over all of `x`'s rows.
+fn launch_mm(gpu: &Gpu, fx: &Fixture, format: Format, tile: Option<u32>, x: &[f32]) -> Vec<f32> {
+    let n_tok = x.len() / fx.in_dim;
+    let (w, s, b) = fx.upload(gpu, format);
+    let xb = gpu.upload(&f32_bytes(x));
+    let y = gpu.upload(&f32_bytes(&vec![0.0; n_tok * fx.out_dim]));
+    let as_u32 = |v: usize| u32::try_from(v).expect("fixture dimension");
+    let args = MvArgs {
+        in_dim: as_u32(fx.in_dim),
+        out_dim: as_u32(fx.out_dim),
+        n_tok: as_u32(n_tok),
+        splits: 1,
+    };
+    let (entry, tokens) = match tile {
+        Some(tn) => (mm_entry(format, tn), as_u32(n_tok).div_ceil(tn)),
+        None => (mmv_entry(format), 1),
+    };
+    run(
+        gpu,
+        KernelRef::new("ternary", leak(entry)),
+        &LaunchArgs {
+            grid: Extent3::new(as_u32(fx.out_dim.div_ceil(32)), tokens, 1),
+            block: Extent3::linear(128),
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(w.view()),
+                KernelArg::Buffer(s.view()),
+                KernelArg::Buffer(b.view()),
+                KernelArg::Buffer(xb.view()),
+                KernelArg::Buffer(y.view()),
+            ],
+        },
+    );
+    drain(gpu);
+    gpu.read_f32(&y)
+}
+
+/// The two matmul shapes, every format, against the host product: the
+/// register shape at two to eight rows, the staged one at both tile widths
+/// over passes that leave a partial tile.
+pub fn mm_matches_the_host_matmul(gpu: &Gpu) {
+    for (seed, (in_dim, out_dim)) in [(256, 64), (5120, 40), (1024, 96)].into_iter().enumerate() {
+        let fx = Fixture::new(in_dim, out_dim, 500 + seed as u64);
+        for format in [Format::Pq2, Format::Ptq1, Format::Mlx2] {
+            let w = fx.decoded(format);
+            for (tile, n_tok) in [
+                (None, 2_usize),
+                (None, 5),
+                (None, 8),
+                (Some(8), 3),
+                (Some(8), 8),
+                (Some(32), 9),
+                (Some(32), 40),
+            ] {
+                let x = Lcg::new(9 + n_tok as u64).floats(n_tok * in_dim);
+                let want = host_matmul(&w, &x, in_dim, out_dim);
+                let got = launch_mm(gpu, &fx, format, tile, &x);
+                let err = rel_err(&got, &want);
+                assert!(
+                    err <= 1e-4,
+                    "{format:?} {tile:?} {n_tok} rows ({in_dim}x{out_dim}): {err}"
+                );
+            }
+        }
+    }
+}
+
+/// Every matvec, matmul and gather entry name.
 #[must_use]
 pub fn entries() -> Vec<String> {
     let mut out = Vec::new();
@@ -374,6 +454,9 @@ pub fn entries() -> Vec<String> {
             out.push(mv_entry(format, t));
         }
         out.push(rows_entry(format));
+        out.push(mmv_entry(format));
+        out.push(mm_entry(format, 8));
+        out.push(mm_entry(format, 32));
     }
     out
 }

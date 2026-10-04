@@ -100,3 +100,10 @@ fn get_rows_all_formats() {
     let Some(gpu) = open() else { return };
     matmul::get_rows_matches_the_host_decode(&gpu);
 }
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn mm_all_formats() {
+    let Some(gpu) = open() else { return };
+    matmul::mm_matches_the_host_matmul(&gpu);
+}

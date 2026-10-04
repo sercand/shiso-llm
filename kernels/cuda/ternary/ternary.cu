@@ -6,3 +6,4 @@
 
 #include "rotate.cuh"
 #include "ternary_mv.cuh"
+#include "ternary_mm.cuh"

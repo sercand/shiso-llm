@@ -314,6 +314,10 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "ternary/ternary_mv.metal",
         include_str!("../metal/ternary/ternary_mv.metal"),
     ),
+    (
+        "ternary/ternary_mm.metal",
+        include_str!("../metal/ternary/ternary_mm.metal"),
+    ),
 ];
 
 /// Concatenates every source into the one translation unit the device compiles.

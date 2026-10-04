@@ -54,10 +54,11 @@ use shiso_core::{
 
 use crate::launch::{
     DEQUANT_BLOCK, DenseAffineArgs, DequantPlaneArgs, F32_BYTES, GEMM_BLOCK, GEMM_SMEM_BYTES,
-    GENERIC, MulMmArgs, MulMvArgs, MulMvExtArgs, PlainMv, Q35, Q35MOE, TERNARY, TERNARY_ROWS,
-    TernaryMvArgs, dequant_plane_grid, dequant_plane_name, ext_block, ext_consts_static, ext_grid,
-    ext_module, ext_name, ext_name_for, ext_nxpsg, ext_r1ptg, launch_failure, mm_consts_for,
-    mm_grid, mm_name, plain_block, plain_consts_for, plain_mv, plain_mv_grid, run, ternary_mv_name,
+    GENERIC, MulMmArgs, MulMvArgs, MulMvExtArgs, PlainMv, Q35, Q35MOE, TERNARY, TERNARY_MM_ROWS,
+    TERNARY_MM_TOKENS, TERNARY_ROWS, TernaryMvArgs, dequant_plane_grid, dequant_plane_name,
+    ext_block, ext_consts_static, ext_grid, ext_module, ext_name, ext_name_for, ext_nxpsg,
+    ext_r1ptg, launch_failure, mm_consts_for, mm_grid, mm_name, plain_block, plain_consts_for,
+    plain_mv, plain_mv_grid, run, ternary_mm_name, ternary_mmv_name, ternary_mv_name,
     ternary_splits, ternary_tag,
 };
 use crate::rotation::{InputRotation, RotationDirection};
@@ -1704,11 +1705,16 @@ fn affine_projection(
     )
 }
 
-/// The ternary set's matvec over a `PQ2_0`, `PTQ1_0` or 2-bit affine weight.
+/// The ternary set's product over a `PQ2_0`, `PTQ1_0` or 2-bit affine weight.
 ///
-/// Every row count takes the token-blocked matvec: a pass of more than eight
-/// rows is covered by `ceil(n_tok / 8)` row blocks, each reading the weight
-/// once.
+/// Three shapes, by the rows a pass carries, all reading the weight as stored:
+///
+/// - one row: the matvec, which streams the weight at bandwidth;
+/// - two to eight (a verify window): the register-fed matmul, which decodes
+///   each weight once and multiplies it against every row at once - the
+///   token-blocked matvec spends three operations a weight a row and measured
+///   an eight-row pass at the cost of eight one-row passes;
+/// - more (a prompt chunk): the staged-tile matmul, 32 rows a tile.
 fn ternary_projection(
     backend: &dyn Backend,
     weight: &Weight,
@@ -1716,16 +1722,9 @@ fn ternary_projection(
     src: DeviceView<'_>,
     dst: DeviceView<'_>,
 ) -> CoreResult<()> {
-    let (entry, t) = ternary_mv_name(weight.dtype, n_tok).ok_or(CoreError::Unsupported {
+    let unsupported = || CoreError::Unsupported {
         what: "a weight format the ternary set does not read",
         backend: "engine",
-    })?;
-    let splits = ternary_splits(weight.in_dim, weight.out_dim);
-    let args = TernaryMvArgs {
-        in_dim: weight.in_dim,
-        out_dim: weight.out_dim,
-        n_tok,
-        splits,
     };
     // The GGUF blocks carry their scale inside the block; their entries never
     // read the two array slots, which take the weight again to stay bound.
@@ -1739,11 +1738,42 @@ fn ternary_projection(
             });
         }
     };
+    let rows_tiles = weight.out_dim.div_ceil(TERNARY_MM_ROWS);
+    let (entry, grid, block, splits) = match n_tok {
+        0 | 1 => {
+            let (entry, t) = ternary_mv_name(weight.dtype, n_tok).ok_or_else(unsupported)?;
+            let splits = ternary_splits(weight.in_dim, weight.out_dim);
+            (
+                entry,
+                Extent3::new(weight.out_dim.div_ceil(TERNARY_ROWS), n_tok.div_ceil(t), 1),
+                Extent3::linear(64 * splits),
+                splits,
+            )
+        }
+        2..=8 => (
+            ternary_mmv_name(weight.dtype).ok_or_else(unsupported)?,
+            Extent3::new(rows_tiles, 1, 1),
+            Extent3::linear(128),
+            1,
+        ),
+        _ => (
+            ternary_mm_name(weight.dtype).ok_or_else(unsupported)?,
+            Extent3::new(rows_tiles, n_tok.div_ceil(TERNARY_MM_TOKENS), 1),
+            Extent3::linear(128),
+            1,
+        ),
+    };
+    let args = TernaryMvArgs {
+        in_dim: weight.in_dim,
+        out_dim: weight.out_dim,
+        n_tok,
+        splits,
+    };
     run(
         backend,
         KernelRef::new(TERNARY, entry),
-        Extent3::new(weight.out_dim.div_ceil(TERNARY_ROWS), n_tok.div_ceil(t), 1),
-        Extent3::linear(64 * splits),
+        grid,
+        block,
         0,
         &[
             KernelArg::Bytes(bytemuck::bytes_of(&args)),
