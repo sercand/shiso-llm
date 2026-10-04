@@ -14,6 +14,10 @@
 # kernels come from a different upstream file than the other nine: the row
 # gather is format-generic and is shared with every other model there, which
 # is why it lives outside the family header.
+#
+# `modelopt` is the exception to "byte-for-byte copy": the NVFP4 routed stages
+# and the FP8 n-gram decode the NVIDIA export needs are this repository's own,
+# and sit in a unit (and a module) of their own so no upstream unit is edited.
 
 [build]
 sources = [
@@ -28,6 +32,7 @@ sources = [
     "idx.cu",
     "misc.cu",
     "embed.cu",
+    "modelopt.cu",
 ]
 
 # Every unit includes `q4e.cuh` by bare name, and that header reaches its own
@@ -70,3 +75,4 @@ qsa_sparse = "q4e_qsa_sparse"
 idx = "q4e_idx"
 misc = "q4e_misc"
 embed = "q4e_embed"
+modelopt = "q4e_modelopt"

@@ -21,6 +21,7 @@ pub mod idx;
 pub mod indexer;
 pub mod matvec;
 pub mod misc;
+pub mod nvfp4;
 pub mod ple;
 pub mod qsa;
 pub mod route;

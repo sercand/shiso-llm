@@ -24,6 +24,7 @@ pub mod exl3;
 pub mod fp8;
 pub mod mlx;
 mod model;
+pub mod nvfp4;
 
 pub use binding::{
     AttnRoles, BlockRoles, BoundLayer, ExpertRoles, MixRoles, ModelBinding, NGRAM_BIAS,
@@ -39,7 +40,7 @@ pub use config::{
     ROPE_ORIGINAL_CONTEXT, ROPE_THETA, STREAM_RANK, STREAMS, VOCAB, is_attention, layer_kinds,
     shape,
 };
-pub use model::Qwen4ExpModel;
+pub use model::{Qwen4ExpModel, StreamedLoad};
 
 use crate::catalog::FamilyFacts;
 

@@ -318,8 +318,57 @@ impl Qwen4ExpModel {
         slots: Option<u32>,
         reserve: u64,
     ) -> CoreResult<Self> {
+        Self::load_streamed(
+            backend,
+            dir,
+            hf,
+            opts,
+            &StreamedLoad {
+                slots,
+                reserve,
+                draft: false,
+                counts: None,
+            },
+            StreamedExport::Reference,
+        )
+    }
+
+    /// Opens NVIDIA's `modelopt` export - the reference export's layout with
+    /// NVFP4 routed experts - and puts it on the device; see
+    /// [`crate::qwen4exp::nvfp4`]. Pool sizing is [`Qwen4ExpModel::load_reference`]'s;
+    /// `load.draft` binds the export's own draft head, and `load.counts`
+    /// narrows its vocabulary as [`Qwen4ExpModel::load_with`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Qwen4ExpModel::load_reference`], plus whatever the draft head's
+    /// import reports.
+    pub fn load_nvfp4(
+        backend: &Arc<dyn Backend>,
+        dir: &Path,
+        hf: &shiso_core::config::HfConfig,
+        opts: SparseOptions,
+        load: &StreamedLoad<'_>,
+    ) -> CoreResult<Self> {
+        Self::load_streamed(backend, dir, hf, opts, load, StreamedExport::Nvfp4)
+    }
+
+    /// The body of the two streamed-expert exports, which differ only in the
+    /// routed codec and in what their dense matrices become.
+    fn load_streamed(
+        backend: &Arc<dyn Backend>,
+        dir: &Path,
+        hf: &shiso_core::config::HfConfig,
+        opts: SparseOptions,
+        load: &StreamedLoad<'_>,
+        export: StreamedExport,
+    ) -> CoreResult<Self> {
         use crate::qwen4exp::config::{EXPERTS, N_LAYERS};
-        let ck = crate::qwen4exp::fp8::open(dir)?;
+        let (slots, reserve) = (load.slots, load.reserve);
+        let ck = match export {
+            StreamedExport::Reference => crate::qwen4exp::fp8::open(dir)?,
+            StreamedExport::Nvfp4 => crate::qwen4exp::nvfp4::open(dir)?,
+        };
         let config = Qwen4ExpConfig::from_reference(hf, &ck)?;
         let ngram = {
             let _tag = ledger::scope(MemTag::WeightsEmbedding);
@@ -327,14 +376,13 @@ impl Qwen4ExpModel {
         };
         let all = EXPERTS * N_LAYERS;
         let sized = slots.is_none();
+        let slot_bytes = export.slot_bytes();
         let slots = if let Some(slots) = slots {
             slots
         } else {
             {
                 let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
-                let rest = ck
-                    .resident_bytes()
-                    .saturating_sub(crate::qwen4exp::fp8::expert_bytes());
+                let rest = ck.resident_bytes().saturating_sub(export.expert_bytes());
                 // The dense weights are counted twice. They are wrapped file
                 // pages, read whole every step, and the system evicts wrapped
                 // pages first when the working set is full: sized to the last
@@ -342,8 +390,7 @@ impl Qwen4ExpModel {
                 // from disk (measured on a 64 GB machine: 0.3 tok/s, against
                 // 2.9 with this margin).
                 let room = total.saturating_sub(rest.saturating_mul(2).saturating_add(reserve));
-                let fit =
-                    u32::try_from(room / crate::qwen4exp::fp8::slot_bytes()).unwrap_or(u32::MAX);
+                let fit = u32::try_from(room / slot_bytes).unwrap_or(u32::MAX);
                 if fit < EXPERTS {
                     return Err(CoreError::Unsupported {
                         what: "a device whose working set cannot hold one layer's routed experts \
@@ -354,24 +401,38 @@ impl Qwen4ExpModel {
                 fit.min(all)
             }
         };
-        tracing::info!(slots, all, "routed expert pool of the FP8 export");
-        let weights = crate::qwen4exp::fp8::import(backend, &ck, &config)?;
+        tracing::info!(slots, all, export = ?export, "routed expert pool of the streamed export");
+        let mut weights = crate::qwen4exp::fp8::import(backend, &ck, &config, export.layout())?;
+        if load.draft {
+            let rank = config.shape().count(shiso_engine::shape::LayerKind::Attn);
+            weights.draft = Some(crate::qwen4exp::fp8::import_draft(
+                backend,
+                &ck,
+                rank,
+                export.layout(),
+            )?);
+            if let Some(list) = load.counts {
+                narrow_draft_head(backend, &mut weights, list, config.shape().vocab)?;
+            }
+        }
         let free = device_free(backend.as_ref());
         let mut stack =
             SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
         // A pool that holds every expert keeps them all; only one sized to the
         // device gives back what the stack took.
         let slots = if sized && slots < all {
-            beside_stack(
-                backend.as_ref(),
-                free,
-                slots,
-                crate::qwen4exp::fp8::slot_bytes(),
-            )
+            beside_stack(backend.as_ref(), free, slots, slot_bytes)
         } else {
             slots
         };
-        let stream = crate::qwen4exp::fp8::open_stream(backend, &ck, slots, opts.prefill_rows)?;
+        let stream = match export {
+            StreamedExport::Reference => {
+                crate::qwen4exp::fp8::open_stream(backend, &ck, slots, opts.prefill_rows)?
+            }
+            StreamedExport::Nvfp4 => {
+                crate::qwen4exp::nvfp4::open_stream(backend, &ck, slots, opts.prefill_rows)?
+            }
+        };
         stack.attach_expert_stream(stream)?;
         Ok(Self {
             info: ModelInfo {
@@ -382,7 +443,7 @@ impl Qwen4ExpModel {
                 stop_tokens: StopTokens::new(&config.stop_tokens())?,
             },
             stack,
-            expert_gate: DType::Fp8E4M3Block128,
+            expert_gate: export.layout().experts,
         })
     }
 
@@ -1128,4 +1189,56 @@ fn narrow_draft_head(
         head.head = Some(slice);
     }
     Ok(())
+}
+
+/// The two exports whose routed experts are always streamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamedExport {
+    /// Brain-float dense weights, block-scaled FP8 experts.
+    Reference,
+    /// The same layout with NVFP4 experts, NVIDIA's `modelopt` export.
+    Nvfp4,
+}
+
+impl StreamedExport {
+    /// What the import makes of the export's dense matrices and banks.
+    const fn layout(self) -> crate::qwen4exp::fp8::ImportLayout {
+        match self {
+            Self::Reference => crate::qwen4exp::fp8::ImportLayout::REFERENCE,
+            Self::Nvfp4 => crate::qwen4exp::fp8::ImportLayout {
+                dense: crate::qwen4exp::fp8::DenseFormat::Half,
+                experts: DType::Nvfp4Gs16,
+            },
+        }
+    }
+
+    /// Bytes one routed expert occupies in the pool.
+    fn slot_bytes(self) -> u64 {
+        match self {
+            Self::Reference => crate::qwen4exp::fp8::slot_bytes(),
+            Self::Nvfp4 => crate::qwen4exp::nvfp4::slot_bytes(),
+        }
+    }
+
+    /// Bytes of every layer's routed banks.
+    fn expert_bytes(self) -> u64 {
+        match self {
+            Self::Reference => crate::qwen4exp::fp8::expert_bytes(),
+            Self::Nvfp4 => crate::qwen4exp::nvfp4::expert_bytes(),
+        }
+    }
+}
+
+/// How a streamed-expert export is loaded: its pool, and whether its draft
+/// head is bound.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamedLoad<'a> {
+    /// Slots in the routed pool; `None` sizes it to the device.
+    pub slots: Option<u32>,
+    /// Bytes the sizing leaves free beyond the dense weights.
+    pub reserve: u64,
+    /// Whether the export's own draft head is imported.
+    pub draft: bool,
+    /// The draft vocabulary's counts file, which narrows the head's output.
+    pub counts: Option<&'a Path>,
 }

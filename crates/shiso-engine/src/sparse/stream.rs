@@ -29,6 +29,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use shiso_core::backend::Backend;
@@ -120,6 +121,12 @@ pub struct ExpertStream {
     experts: u32,
     slots: u32,
     state: Mutex<State>,
+    /// Set once [`ExpertStream::preload`] has put every expert of every layer
+    /// in a slot of its own. From then on no fetch can miss, so a fetch does
+    /// nothing at all - in particular it neither drains the device nor reads
+    /// the routed ids back, which a captured step cannot do and which cost a
+    /// host round trip per layer per step.
+    complete: AtomicBool,
 }
 
 impl fmt::Debug for ExpertStream {
@@ -216,6 +223,7 @@ impl ExpertStream {
                 clock: 0,
                 stats: StreamStats::default(),
             }),
+            complete: AtomicBool::new(false),
         })
     }
 
@@ -363,6 +371,7 @@ impl ExpertStream {
                 state.owner[slot as usize] = Some((layer, e));
             }
         }
+        self.complete.store(true, Ordering::Release);
         tracing::info!(
             seconds = started.elapsed().as_secs_f64(),
             "every routed expert is resident"
@@ -395,6 +404,9 @@ impl ExpertStream {
                 len: 1,
                 buffer_bytes: u64::from(self.layers),
             });
+        }
+        if self.complete.load(Ordering::Acquire) {
+            return Ok(());
         }
         let drained = std::time::Instant::now();
         backend.sync()?;

@@ -981,9 +981,64 @@ fn load_qwen4exp_dir(
 ) -> Result<Loaded, FactoryError> {
     if shiso_models::qwen4exp::exl3::is_exl3_dir(path) {
         load_qwen4exp_exl3(backend, path, config, args, opts, defaults)
+    } else if shiso_models::qwen4exp::nvfp4::is_nvfp4_export(path) {
+        // Before the MLX arm, whose reference-export test this directory also
+        // passes: the two share every name and differ in the experts' codec.
+        load_qwen4exp_nvfp4(backend, path, config, args, opts, defaults)
     } else {
         load_qwen4exp_mlx(backend, path, config, args, opts, defaults)
     }
+}
+
+/// NVIDIA's `modelopt` export of the sparse family: the reference export's
+/// layout with NVFP4 routed experts, always streamed.
+fn load_qwen4exp_nvfp4(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    args: &ServeArgs,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    let reserve = args.expert_reserve_gb.saturating_mul(1 << 30);
+    // The head is in the directory; a second one named beside it would be a
+    // head nobody can say which of the two is serving.
+    if args.draft_model.is_some() {
+        return Err(FactoryError::Load(CoreError::InvalidValue {
+            key: "--draft-model",
+            value: format!(
+                "{} carries its own draft head under mtp.*; drop --draft-model and set --spec-k",
+                path.display()
+            ),
+        }));
+    }
+    let slots = match args.expert_residency {
+        crate::cli::ExpertResidencyChoice::Resident => {
+            Some(shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS)
+        }
+        _ if args.expert_slots > 0 => Some(args.expert_slots),
+        _ => None,
+    };
+    let model = Qwen4ExpModel::load_nvfp4(
+        backend,
+        path,
+        config,
+        sparse_options(args, opts, backend),
+        &shiso_models::qwen4exp::StreamedLoad {
+            slots,
+            reserve,
+            draft: args.spec_k > 0,
+            counts: args.draft_vocab.as_deref(),
+        },
+    )
+    .map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_qwen35_tower,
+        open_audio: no_audio_tower,
+        placement: Qwen35Tower::PLACEMENT,
+        defaults,
+    })
 }
 
 /// The sparse family's trellis export, as published: a directory that carries

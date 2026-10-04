@@ -29,7 +29,7 @@ use shiso_engine::sparse::ple::NgramTable;
 use shiso_engine::sparse::stack::SparseOptions;
 use shiso_engine::sparse::stream::{ExpertSource, ExpertStream};
 use shiso_engine::sparse::weights::{
-    ExpertBank, Indexer, NgramBlock, Recurrent, SparseAttn, SparseBlock, SparseLayer,
+    DraftHead, ExpertBank, Indexer, NgramBlock, Recurrent, SparseAttn, SparseBlock, SparseLayer,
     SparseWeights, StreamMix, Weight, WeightPart, fp8_block_bytes,
 };
 use shiso_modelfile::st_header::Shard;
@@ -85,10 +85,59 @@ fn plus_one(w: f32) -> f32 {
     1.0 + w
 }
 
+/// What the dense brain-float matrices become on the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseFormat {
+    /// Kept as brain floats and wrapped in place: the backend reads them as
+    /// stored.
+    Brain,
+    /// Widened to half precision on the way in. The brain-float tier has no
+    /// matrix-unit kernel on every backend and plans a wide prompt chunk as
+    /// many sixteen-row passes, each re-reading the weight; half precision is
+    /// on the BLAS tier wherever there is one, and on the half matvec for a
+    /// step. Exact for every weight of this family's magnitude: the two
+    /// formats share a mantissa width of at least seven bits, and only a
+    /// value below half precision's subnormal floor loses anything.
+    Half,
+}
+
+/// How [`import`] reads one export: its dense format and its routed codec.
+#[derive(Debug, Clone, Copy)]
+pub struct ImportLayout {
+    /// What the dense matrices become.
+    pub dense: DenseFormat,
+    /// The routed banks' format: [`DType::Fp8E4M3Block128`] for the
+    /// reference export, [`DType::Nvfp4Gs16`] for the `modelopt` one.
+    pub experts: DType,
+}
+
+impl ImportLayout {
+    /// The reference export, as it has always loaded.
+    pub const REFERENCE: Self = Self {
+        dense: DenseFormat::Brain,
+        experts: DType::Fp8E4M3Block128,
+    };
+}
+
 /// The loader's state over one open directory.
 struct Loader<'c> {
     ck: &'c MlxCheckpoint,
     backend: &'c Arc<dyn Backend>,
+    layout: ImportLayout,
+}
+
+/// Brain-float bytes to half-precision bytes, rounding once through `f32`.
+fn brain_to_half(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|pair| {
+            half::f16::from_f32(half::bf16::from_bits(u16::from_le_bytes(*pair)).to_f32())
+                .to_bits()
+                .to_le_bytes()
+        })
+        .collect()
 }
 
 impl Loader<'_> {
@@ -108,6 +157,25 @@ impl Loader<'_> {
         let start = span.start + rows.start as usize * row_bytes;
         let end = span.start + rows.end as usize * row_bytes;
         let host: Arc<Shard> = self.ck.shard(slot);
+        if self.layout.dense == DenseFormat::Half {
+            let src = &AsRef::<[u8]>::as_ref(&*host)[start..end];
+            let moved = match how {
+                Move::InPlace => None,
+                Move::Rows {
+                    rows: r,
+                    lead,
+                    perm,
+                } => Some(permute_blocks(src, r * row_bytes, lead, perm)),
+                Move::Cols { cols, perm } => Some(permute_columns(src, row_bytes, cols * 2, perm)),
+            };
+            let halves = brain_to_half(moved.as_deref().unwrap_or(src));
+            return Ok(Weight::over(
+                DType::F16,
+                in_dim,
+                rows.end - rows.start,
+                upload(self.backend, halves)?,
+            ));
+        }
         let buffer = match how {
             Move::InPlace => import_host(self.backend, host, start..end)?,
             Move::Rows {
@@ -137,6 +205,16 @@ impl Loader<'_> {
     /// A whole brain-float matrix, as stored.
     fn matrix(&self, name: &str, in_dim: u32, out_dim: u32) -> CoreResult<Weight> {
         self.dense(name, out_dim, in_dim, 0..out_dim, Move::InPlace)
+    }
+
+    /// The vocabulary table, which a row gather reads rather than a
+    /// projection: kept as brain floats whatever the dense format, since the
+    /// gather has a brain-float entry and widening would buy it nothing.
+    fn table(&self, name: &str) -> CoreResult<Weight> {
+        let shape = [u64::from(VOCAB), u64::from(HIDDEN)];
+        let (slot, span) = self.ck.span(name, "BF16", &shape)?;
+        let buffer = import_host(self.backend, self.ck.shard(slot), span)?;
+        Ok(Weight::over(DType::BF16, HIDDEN, VOCAB, buffer))
     }
 
     /// A single-precision vector from a brain-float tensor, through `op`,
@@ -313,7 +391,7 @@ impl Loader<'_> {
         let m = format!("{base}.mlp");
         let streamed = |in_dim: u32, out_dim: u32| -> CoreResult<Weight> {
             Ok(Weight::streamed(
-                DType::Fp8E4M3Block128,
+                self.layout.experts,
                 in_dim,
                 out_dim,
                 EXPERTS,
@@ -325,6 +403,78 @@ impl Loader<'_> {
             gate: streamed(HIDDEN, EXPERT_INTERMEDIATE)?,
             up: streamed(HIDDEN, EXPERT_INTERMEDIATE)?,
             down: streamed(EXPERT_INTERMEDIATE, HIDDEN)?,
+            shared_router: self.matrix(&format!("{m}.shared_expert_gate.weight"), HIDDEN, 1)?,
+            shared_gate: self.matrix(
+                &format!("{m}.shared_expert.gate_proj.weight"),
+                HIDDEN,
+                EXPERT_INTERMEDIATE,
+            )?,
+            shared_up: self.matrix(
+                &format!("{m}.shared_expert.up_proj.weight"),
+                HIDDEN,
+                EXPERT_INTERMEDIATE,
+            )?,
+            shared_down: self.matrix(
+                &format!("{m}.shared_expert.down_proj.weight"),
+                EXPERT_INTERMEDIATE,
+                HIDDEN,
+            )?,
+        })
+    }
+
+    /// Every expert of one projection as one resident block-scaled bank:
+    /// expert `e`'s codes and block scales at slot `e`, which is the layout
+    /// the identity expert map addresses.
+    fn resident_fp8(
+        &self,
+        base: &str,
+        proj: &str,
+        in_dim: u32,
+        out_dim: u32,
+    ) -> CoreResult<Weight> {
+        let (one_codes, one_scales) = fp8_block_bytes(in_dim, out_dim);
+        let mut codes =
+            Vec::with_capacity(usize::try_from(one_codes * u64::from(EXPERTS)).unwrap_or(0));
+        let mut scales =
+            Vec::with_capacity(usize::try_from(one_scales * u64::from(EXPERTS)).unwrap_or(0));
+        let code_shape = [u64::from(out_dim), u64::from(in_dim)];
+        let scale_shape = [
+            u64::from(out_dim.div_ceil(128)),
+            u64::from(in_dim.div_ceil(128)),
+        ];
+        for e in 0..EXPERTS {
+            let at = format!("{base}.mlp.experts.{e}.{proj}");
+            for (name, dtype, shape, out) in [
+                (format!("{at}.weight"), "F8_E4M3", &code_shape, &mut codes),
+                (
+                    format!("{at}.weight_scale_inv"),
+                    "BF16",
+                    &scale_shape,
+                    &mut scales,
+                ),
+            ] {
+                let (slot, span) = self.ck.span(&name, dtype, shape)?;
+                out.extend_from_slice(&AsRef::<[u8]>::as_ref(&*self.ck.shard(slot))[span]);
+            }
+        }
+        Weight::block_scaled(
+            in_dim,
+            out_dim,
+            EXPERTS,
+            [upload(self.backend, codes)?, upload(self.backend, scales)?],
+        )
+    }
+
+    /// The draft head's routed feed-forward: block-scaled FP8 banks, resident
+    /// because a draft pass never fetches, beside the dense router and shared
+    /// expert.
+    fn draft_experts(&self, base: &str) -> CoreResult<ExpertBank> {
+        let m = format!("{base}.mlp");
+        Ok(ExpertBank {
+            router: self.matrix(&format!("{m}.gate.weight"), HIDDEN, EXPERTS)?,
+            gate: self.resident_fp8(base, "gate_proj", HIDDEN, EXPERT_INTERMEDIATE)?,
+            up: self.resident_fp8(base, "up_proj", HIDDEN, EXPERT_INTERMEDIATE)?,
+            down: self.resident_fp8(base, "down_proj", EXPERT_INTERMEDIATE, HIDDEN)?,
             shared_router: self.matrix(&format!("{m}.shared_expert_gate.weight"), HIDDEN, 1)?,
             shared_gate: self.matrix(
                 &format!("{m}.shared_expert.gate_proj.weight"),
@@ -372,7 +522,8 @@ impl Loader<'_> {
 }
 
 /// Imports every dense weight of the export; the routed banks are described
-/// and left to the stream.
+/// and left to the stream. `layout` says what the dense matrices become and
+/// which codec the banks are described as.
 ///
 /// # Errors
 ///
@@ -383,8 +534,13 @@ pub fn import(
     backend: &Arc<dyn Backend>,
     ck: &MlxCheckpoint,
     config: &Qwen4ExpConfig,
+    layout: ImportLayout,
 ) -> CoreResult<SparseWeights> {
-    let loader = Loader { ck, backend };
+    let loader = Loader {
+        ck,
+        backend,
+        layout,
+    };
     let interval = config.full_attention_interval();
     let mut layers = Vec::with_capacity(N_LAYERS as usize);
     let (mut gdn_rank, mut attn_rank) = (0u32, 0u32);
@@ -427,7 +583,7 @@ pub fn import(
     }
     let token_embd = {
         let _tag = ledger::scope(MemTag::WeightsEmbedding);
-        loader.matrix(&format!("{LM}.embed_tokens.weight"), HIDDEN, VOCAB)?
+        loader.table(&format!("{LM}.embed_tokens.weight"))?
     };
     let _tag = ledger::scope(MemTag::WeightsHead);
     let lm_head = loader.matrix("lm_head.weight", HIDDEN, VOCAB)?;
@@ -440,6 +596,62 @@ pub fn import(
         layers,
         draft: None,
         expert_map: Some(upload(backend, identity)?),
+    })
+}
+
+/// Prefix of every draft-head tensor.
+const MTP: &str = "mtp";
+
+/// Imports the draft head an export carries under `mtp.*`: one attention
+/// layer with its own stream mixes, a routed feed-forward over block-scaled
+/// FP8 experts held resident, and the two input projections and norms that
+/// fold the target's hidden state into it.
+///
+/// `rank` is the head's rank among attention slots: one past the target's
+/// last, so its cache planes are the extra rank the pool is opened with.
+///
+/// # Errors
+///
+/// As [`import`].
+pub fn import_draft(
+    backend: &Arc<dyn Backend>,
+    ck: &MlxCheckpoint,
+    rank: u32,
+    layout: ImportLayout,
+) -> CoreResult<DraftHead> {
+    let loader = Loader {
+        ck,
+        backend,
+        layout,
+    };
+    let _tag = ledger::scope(MemTag::DraftWeights);
+    let layer = format!("{MTP}.layers.0");
+    let wide = HIDDEN * STREAMS;
+    Ok(DraftHead {
+        norm_embed: loader.vector(
+            &format!("{MTP}.pre_fc_norm_embedding.weight"),
+            &[u64::from(HIDDEN)],
+            plus_one,
+            None,
+        )?,
+        norm_hidden: loader.vector(
+            &format!("{MTP}.pre_fc_norm_hidden.weight"),
+            &[u64::from(wide)],
+            plus_one,
+            None,
+        )?,
+        fc_embed: loader.matrix(&format!("{MTP}.fc_embedding.weight"), HIDDEN, HIDDEN)?,
+        fc_hidden: loader.matrix(&format!("{MTP}.fc_hidden.weight"), HIDDEN, HIDDEN)?,
+        layer: SparseLayer {
+            attn_mix: loader.mix(&format!("{layer}.attn_hyper_connection"), true)?,
+            ffn_mix: loader.mix(&format!("{layer}.mlp_hyper_connection"), true)?,
+            block: SparseBlock::Attn(loader.attn(&layer)?),
+            experts: loader.draft_experts(&layer)?,
+            ngram: None,
+            ordinal: rank,
+        },
+        output_mix: loader.mix(&format!("{MTP}.hyper_connection_mixer"), false)?,
+        head: None,
     })
 }
 

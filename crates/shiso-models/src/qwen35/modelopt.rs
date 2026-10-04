@@ -8,7 +8,7 @@
 //! [`ModeloptFile`] reads the scheme off the bytes; everything here turns a
 //! described tensor into a device weight. The routed family's loader
 //! (`crate::qwen35moe`) calls the shared half for its recurrent and attention
-//! slots, and this module's own [`load`] adds the dense feed-forward around it.
+//! slots, and this module's own `load` adds the dense feed-forward around it.
 //!
 //! # The norms are centred in this export, and nowhere else
 //!
@@ -19,7 +19,7 @@
 //! value - never see it. This export is unconverted: the 27B checkpoint's
 //! input norms average -0.04 and its gated recurrent norm 0.87. Reading the
 //! former as stored scales every residual read by about 0.04 instead of 1, and
-//! that is [`centred_norm`].
+//! that is `centred_norm`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -62,7 +62,7 @@ const QUANT_DOCUMENT: &str = "hf_quant_config.json";
 ///
 /// The quantization document is the test rather than the shard headers: it is
 /// what `modelopt` writes and what an MLX or plain export of the same family
-/// does not, and it is what [`load`] needs before it reads a weight.
+/// does not, and it is what `load` needs before it reads a weight.
 #[must_use]
 pub fn is_modelopt_dir(path: &Path) -> bool {
     path.is_dir() && path.join(QUANT_DOCUMENT).is_file()

@@ -43,7 +43,7 @@ pub use crate::ple_rows::PleRows;
 use crate::ple_rows::{fetch_rows, issue_rows};
 use crate::sparse::bind::{Args, LayerRef, NgramViews, Operand, Role, WeightRef};
 use crate::sparse::hyper;
-use crate::sparse::kernels::{self, Entry, MOD_GDN_TC, MOD_MISC, MOD_PLE};
+use crate::sparse::kernels::{self, Entry, MOD_GDN_TC, MOD_MISC, MOD_MODELOPT, MOD_PLE};
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::mtp::SpecDepth;
@@ -532,7 +532,7 @@ pub const fn decode_entry(row: DType, head_dim: u32) -> Option<Entry> {
             }
         }
         DType::MlxAffine4Gs32 => Some(Entry::plain(MOD_PLE, "q4e_ple_dequant_affine_kernel")),
-        DType::Fp8E4M3 => Some(Entry::plain(MOD_PLE, "q4e_ple_dequant_fp8_kernel")),
+        DType::Fp8E4M3 => Some(Entry::plain(MOD_MODELOPT, "q4e_ple_dequant_fp8_kernel")),
         _ => Some(Entry::plain(MOD_PLE, "q4e_ple_dequant_kernel")),
     }
 }

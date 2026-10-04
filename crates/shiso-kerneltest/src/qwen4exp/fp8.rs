@@ -178,7 +178,7 @@ pub fn the_fp8_expert_stages_follow_the_slot_map(gpu: &Gpu) {
     ];
     run(
         gpu,
-        KernelRef::new("q4e_moe", "q4e_fp8_experts_gate_up_kernel"),
+        KernelRef::new("q4e_modelopt", "q4e_fp8_experts_gate_up_kernel"),
         &LaunchArgs::new(
             Extent3::new(inter.div_ceil(8) as u32, cols.min(n_expert) as u32, 1),
             Extent3::linear(256),
@@ -218,7 +218,7 @@ pub fn the_fp8_expert_stages_follow_the_slot_map(gpu: &Gpu) {
     ];
     run(
         gpu,
-        KernelRef::new("q4e_moe", "q4e_fp8_experts_down_kernel"),
+        KernelRef::new("q4e_modelopt", "q4e_fp8_experts_down_kernel"),
         &LaunchArgs::new(
             Extent3::new(hidden.div_ceil(8) as u32, cols.min(n_expert) as u32, 1),
             Extent3::linear(256),
@@ -257,7 +257,7 @@ pub fn the_fp8_ngram_rows_decode_under_the_table_scale(gpu: &Gpu) {
     ];
     run(
         gpu,
-        KernelRef::new("q4e_ple", "q4e_ple_dequant_fp8_kernel"),
+        KernelRef::new("q4e_modelopt", "q4e_ple_dequant_fp8_kernel"),
         &LaunchArgs::new(
             Extent3::linear(n_rows as u32),
             Extent3::linear(head_dim as u32),

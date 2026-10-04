@@ -65,6 +65,12 @@ pub enum WeightPart {
     /// block, row-major over the blocks. The codes are its
     /// [`WeightPart::Whole`].
     BlockScales,
+    /// An NVFP4 weight's group scales: one `e4m3` byte per sixteen weights
+    /// along a row. The packed four-bit codes are its [`WeightPart::Whole`].
+    GroupScales,
+    /// An NVFP4 weight's per-tensor scale, one `f32`, which the group scales
+    /// are relative to. A streamed bank holds one per slot.
+    GlobalScale,
 }
 
 /// The two arrays an affine weight carries beside its codes.
@@ -145,6 +151,14 @@ pub fn fp8_block_bytes(in_dim: u32, out_dim: u32) -> (u64, u64) {
         in_dim * out_dim,
         in_dim.div_ceil(128) * out_dim.div_ceil(128) * 2,
     )
+}
+
+/// Bytes of one NVFP4 matrix's packed codes and group scales; its global
+/// scale is one `f32` beside them.
+#[must_use]
+pub fn nvfp4_bytes(in_dim: u32, out_dim: u32) -> (u64, u64) {
+    let (in_dim, out_dim) = (u64::from(in_dim), u64::from(out_dim));
+    (in_dim * out_dim / 2, in_dim.div_ceil(16) * out_dim)
 }
 
 impl Weight {
@@ -385,7 +399,9 @@ impl Weight {
                 WeightPart::Tiles
                 | WeightPart::InputScales
                 | WeightPart::OutputScales
-                | WeightPart::BlockScales => Err(CoreError::Unsupported {
+                | WeightPart::BlockScales
+                | WeightPart::GroupScales
+                | WeightPart::GlobalScale => Err(CoreError::Unsupported {
                     what: "a part an affine weight does not have",
                     backend: "engine",
                 }),
@@ -399,7 +415,9 @@ impl Weight {
                 | WeightPart::OutputScales
                 | WeightPart::AffineScales
                 | WeightPart::AffineBiases
-                | WeightPart::BlockScales => Err(CoreError::Unsupported {
+                | WeightPart::BlockScales
+                | WeightPart::GroupScales
+                | WeightPart::GlobalScale => Err(CoreError::Unsupported {
                     what: "a payload part of a weight whose format has no such part",
                     backend: "engine",
                 }),
@@ -421,12 +439,14 @@ impl Weight {
             WeightPart::Tiles => self.buffer.slice(0, tiles),
             WeightPart::InputScales => self.buffer.slice(tiles, input),
             WeightPart::OutputScales => self.buffer.slice(tiles.saturating_add(input), output),
-            WeightPart::AffineScales | WeightPart::AffineBiases | WeightPart::BlockScales => {
-                Err(CoreError::Unsupported {
-                    what: "an affine or block-scale part of a trellis weight",
-                    backend: "engine",
-                })
-            }
+            WeightPart::AffineScales
+            | WeightPart::AffineBiases
+            | WeightPart::BlockScales
+            | WeightPart::GroupScales
+            | WeightPart::GlobalScale => Err(CoreError::Unsupported {
+                what: "an affine or block-scale part of a trellis weight",
+                backend: "engine",
+            }),
         }
     }
 
