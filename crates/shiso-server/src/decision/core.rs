@@ -965,6 +965,33 @@ pub(crate) struct Answered {
     pub label_token_ids: Option<Vec<u32>>,
 }
 
+/// How many leading prompt tokens every question of a request shares, zero
+/// for a request of one question.
+///
+/// The questions render the same input ahead of their own blocks, so this is
+/// roughly the input's length - and the point the scheduler checkpoints the
+/// first question it reads, so every later one reads only its own block.
+/// A question carrying media stops the share at zero: its pad runs are one id
+/// whichever picture it is, so equal ids there say nothing about equal rows.
+fn shared_prefix(prepared: &[PreparedQuestion]) -> u32 {
+    let [first, rest @ ..] = prepared else {
+        return 0;
+    };
+    if rest.is_empty() || prepared.iter().any(|question| !question.media.is_empty()) {
+        return 0;
+    }
+    let common = rest
+        .iter()
+        .fold(first.prompt_tokens.len(), |common, question| {
+            first.prompt_tokens[..common]
+                .iter()
+                .zip(&question.prompt_tokens)
+                .take_while(|(a, b)| a == b)
+                .count()
+        });
+    u32::try_from(common).unwrap_or(u32::MAX)
+}
+
 /// Scores every prepared question at once - one prefill each - and folds each
 /// answer's label log-probabilities into probabilities, mass and a top.
 ///
@@ -985,6 +1012,7 @@ pub(crate) async fn run_questions(
     want_token_ids: bool,
 ) -> Result<Vec<Answered>, AppError> {
     let engine = state.engine()?;
+    let shared = shared_prefix(&prepared);
     let scored = join_all(prepared.into_iter().map(|question| {
         // Always through `with_media`: empty arcs are a refcount pair and
         // the scheduler's encode step skips on an empty list, so a text
@@ -994,7 +1022,8 @@ pub(crate) async fn run_questions(
                 Arc::from(question.prompt_tokens.clone()),
                 Arc::from(question.labels.clone()),
             )
-            .with_media(question.media.clone(), question.media_digests.clone()),
+            .with_media(question.media.clone(), question.media_digests.clone())
+            .with_shared_prefix(shared),
         );
         async move {
             let outcome = scored.await?;
@@ -1202,6 +1231,39 @@ mod tests {
         assert_eq!(choice_labels(3, |_| true), ["A", "B", "C"]);
         assert_eq!(score_labels(3), ["0", "1", "2"]);
         assert_eq!(YES_NO_LABELS, ["yes", "no"]);
+    }
+
+    fn prepared(ids: &[u32]) -> PreparedQuestion {
+        PreparedQuestion {
+            id: String::new(),
+            kind: Kind::YesNo {
+                question: String::new(),
+                yes: None,
+                no: None,
+            },
+            probability_answer: false,
+            prompt_tokens: ids.iter().copied().map(TokenId::new).collect(),
+            labels: Vec::new(),
+            media: Arc::from(Vec::new()),
+            media_digests: Arc::from(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn shared_prefix_is_what_every_question_starts_with() {
+        // One question shares with nobody.
+        assert_eq!(shared_prefix(&[prepared(&[1, 2, 3])]), 0);
+        assert_eq!(shared_prefix(&[]), 0);
+        // The shortest agreement wins, wherever in the list it is.
+        let questions = [
+            prepared(&[1, 2, 3, 4, 5]),
+            prepared(&[1, 2, 3, 4, 9]),
+            prepared(&[1, 2, 7]),
+        ];
+        assert_eq!(shared_prefix(&questions), 2);
+        // A prompt that is a prefix of another shares all of itself.
+        assert_eq!(shared_prefix(&[prepared(&[1, 2]), prepared(&[1, 2, 3])]), 2);
+        assert_eq!(shared_prefix(&[prepared(&[1, 2, 3]), prepared(&[4])]), 0);
     }
 
     #[test]

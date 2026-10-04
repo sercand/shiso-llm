@@ -1151,6 +1151,117 @@ impl Coordinator {
         }
     }
 
+    /// The quantum `step` as it runs: a score's first quantum resumes first
+    /// (see [`Coordinator::resume_score`]), and `None` when there is nothing
+    /// to read - no such slot, or a resume that failed it or already answered
+    /// it with a full hit.
+    ///
+    /// The plan was made before the resume moved the cursor, so a quantum
+    /// planned as a middle piece can now reach the prompt's end - and the end
+    /// is the one piece that must read its row.
+    fn ready_step(&mut self, step: PrefillStep) -> Option<Quantum> {
+        if let Some(shared) = self
+            .slots
+            .get_mut(step.slot)
+            .and_then(SeqSlot::take_score_resume)
+        {
+            self.resume_score(step.slot, shared);
+        }
+        let slot = self.slots.slots().get(step.slot)?;
+        if slot.is_done() || slot.prompt_done() {
+            return None;
+        }
+        let (start, end) = slot.prompt_window(step.tokens);
+        if start >= end {
+            return None;
+        }
+        Some(Quantum {
+            step: PrefillStep {
+                last: step.last || end == slot.prompt.len(),
+                ..step
+            },
+            session: slot.session,
+            prompt: Arc::clone(&slot.prompt),
+            window: start..end,
+        })
+    }
+
+    /// Stands a score on a stored prefix at its first prefill quantum, and
+    /// names the point its sibling questions diverge so the stack checkpoints
+    /// it there.
+    ///
+    /// The score's own boundaries are left out: its message ends lie inside
+    /// its own question, past where any sibling shares it, and a checkpoint
+    /// there would be a recurrent read-back nothing resumes. A full hit
+    /// answers from the stored row, as [`Coordinator::try_resume`] does.
+    fn resume_score(&mut self, at: usize, shared: u32) {
+        let Self {
+            model,
+            backend,
+            row,
+            scores,
+            stats,
+            slots,
+            ..
+        } = self;
+        let Some(slot) = slots.get_mut(at) else {
+            return;
+        };
+        if !slot.checkpointable() {
+            return;
+        }
+        let Some(ckpt) = model.ckpt_mut() else {
+            return;
+        };
+        if let Err(error) = ckpt.kv_set_scoring(slot.session) {
+            tracing::debug!(error = %error.chain(), "a score was not marked as one");
+        }
+        let hints: &[u32] = if shared > 0 { &[shared] } else { &[] };
+        if let Err(error) = ckpt.kv_set_hints(slot.session, hints) {
+            tracing::debug!(error = %error.chain(), "the shared prefix of a score was not recorded");
+        }
+        let whole_prompt = slot.prompt.len();
+        let reused = match ckpt.kv_resume(slot.session, &slot.prompt) {
+            Err(error) => {
+                tracing::warn!(error = %error.chain(), "a score's checkpoint resume failed; the prompt will be prefilled");
+                return;
+            }
+            Ok(None) => return,
+            Ok(Some(info)) => {
+                let reused = info.tokens_reused;
+                if usize::try_from(reused).unwrap_or(usize::MAX) >= whole_prompt {
+                    let read = info
+                        .frontier_logits
+                        .as_ref()
+                        .ok_or(CoreError::Unsupported {
+                            what: "a resume of a whole prompt without its logits row",
+                            backend: "scheduler",
+                        })
+                        .and_then(|logits| logits.row(0))
+                        .and_then(|view| backend.copy_d2h(view, row));
+                    if let Err(error) = read {
+                        tracing::warn!(error = %error.chain(), "a resumed frontier row did not read back");
+                        slot.fail(error.to_string());
+                        return;
+                    }
+                }
+                tracing::debug!(
+                    slot = slot.id,
+                    tokens_reused = reused,
+                    shared,
+                    source = ?info.source,
+                    "a score resumed a stored prefix"
+                );
+                reused
+            }
+        };
+        slot.resumed(reused);
+        stats.resumed(u64::from(reused));
+        if slot.prompt_done() {
+            finish_scoring(row, scores, slot);
+        }
+    }
+
     /// Copies queued checkpoint pages off the device while no sequence is
     /// resident. Returns `true` when a request arrived meanwhile and was
     /// admitted, so the loop runs it instead of blocking.
@@ -1586,19 +1697,12 @@ impl Coordinator {
 
     /// One bounded quantum of one sequence's prompt.
     fn prefill_step(&mut self, step: PrefillStep) {
-        let Some(slot) = self.slots.slots().get(step.slot) else {
+        let Some(quantum) = self.ready_step(step) else {
             return;
         };
-        let session = slot.session;
-        let prompt = Arc::clone(&slot.prompt);
-        let (start, end) = slot.prompt_window(step.tokens);
-        let Some(chunk) = prompt.get(start..end) else {
-            return;
-        };
+        let (step, session, prompt) = (quantum.step, quantum.session, quantum.prompt);
+        let chunk = &prompt[quantum.window];
         let covered = chunk.len();
-        if covered == 0 {
-            return;
-        }
 
         let carries_media = self
             .slots
@@ -2165,6 +2269,17 @@ fn finish_scoring(row: &[u8], scores: &mut [f32], slot: &mut SeqSlot) {
     if let Some(reply) = slot.take_score_reply() {
         let _ = reply.send(Ok(ScoreOutcome { label_logprobs }));
     }
+}
+
+/// One prefill quantum as [`Coordinator::ready_step`] hands it over: the
+/// step as it will run, and the session, prompt and non-empty window of it
+/// that it reads. `prompt_window` clamps the window to the prompt, so
+/// indexing with it cannot go out of bounds.
+struct Quantum {
+    step: PrefillStep,
+    session: SessionId,
+    prompt: Arc<[TokenId]>,
+    window: std::ops::Range<usize>,
 }
 
 /// Reads one logits row out of its bytes into `scores`.

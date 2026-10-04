@@ -593,7 +593,10 @@ impl SparseStack {
             .resident
             .as_ref()
             .is_some_and(|resident| resident.snapshot.is_some());
-        if self.ckpt.is_none() || !has_buffer || self.session(session)?.media {
+        // A scoring session's prompt end is never checkpointed, so neither
+        // is the grid point that stands in for it.
+        let live = self.session(session)?;
+        if self.ckpt.is_none() || !has_buffer || live.media || live.scoring {
             return Ok(None);
         }
         let chunk = self.opts.chunk;

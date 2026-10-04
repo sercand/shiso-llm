@@ -302,6 +302,11 @@ pub struct SparseSession {
     /// Message boundaries of the prompt being read, as absolute positions: a
     /// chunk stops at each so a checkpoint can be taken there.
     pub(crate) hints: Vec<u32>,
+    /// Whether this session reads a prompt only to score its last row. See
+    /// [`crate::ckpt::Checkpointed::kv_set_scoring`]: such a session keeps
+    /// only its shared-boundary checkpoints, in memory, because nothing will
+    /// resume its prompt's end.
+    pub(crate) scoring: bool,
     /// Whether any chunk spliced media rows in, or a media key was set. Such
     /// a path is checkpointed only under [`SparseSession::key`]: a placeholder
     /// run is one id repeated, so its own tokens cannot tell two pictures apart.
@@ -1180,6 +1185,7 @@ impl SparseStack {
             written: 0,
             history: Vec::new(),
             hints: Vec::new(),
+            scoring: false,
             media: false,
             resumed_at: 0,
             key: None,

@@ -308,6 +308,11 @@ pub(crate) struct SeqSlot {
 struct ScoreJob {
     /// The label ids, in the order the request gave them.
     labels: Arc<[TokenId]>,
+    /// The request's [`ScoreRequest::shared_prefix`].
+    shared_prefix: u32,
+    /// Whether the resume this score makes at its first prefill quantum is
+    /// still ahead of it. See [`SeqSlot::take_score_resume`].
+    resume_pending: bool,
     /// Held as an `Option` because two places may answer a score - the prefill
     /// terminus and the retirement path - and *taking* this is the record of
     /// which one did. The invariant is exactly one reply per request: the
@@ -504,6 +509,8 @@ impl SeqSlot {
             spec: (0, 0, 0),
             score: Some(ScoreJob {
                 labels: request.labels,
+                shared_prefix: request.shared_prefix,
+                resume_pending: true,
                 reply: setup.score_reply,
             }),
         }
@@ -1062,6 +1069,19 @@ impl SeqSlot {
     /// generate from it.
     pub(crate) const fn is_score(&self) -> bool {
         self.score.is_some()
+    }
+
+    /// The shared prefix to checkpoint at, the first time a score asks - the
+    /// moment it gets its first prefill quantum - and `None` ever after, and
+    /// for a generation slot.
+    ///
+    /// A score resumes there rather than at admission because its siblings
+    /// are admitted together and read one at a time: at admission none of
+    /// them has left a checkpoint to stand on, while by a later sibling's
+    /// first quantum the one read before it has.
+    pub(crate) fn take_score_resume(&mut self) -> Option<u32> {
+        let job = self.score.as_mut()?;
+        std::mem::take(&mut job.resume_pending).then_some(job.shared_prefix)
     }
 
     /// The label ids to read at the prompt's last row.
