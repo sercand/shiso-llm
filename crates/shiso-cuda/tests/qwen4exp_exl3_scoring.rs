@@ -102,6 +102,27 @@ fn last_row(
     bytes
 }
 
+/// The last row a session leaves after reading `tokens[..at]` as a chunk and
+/// the rest as the final piece: the shape a sibling question's read has after
+/// resuming at the shared boundary, without a checkpoint tier to resume from.
+fn split_row(
+    backend: &Arc<dyn Backend>,
+    model: &mut Qwen4ExpModel,
+    session: SessionId,
+    tokens: &[TokenId],
+    at: usize,
+) -> Vec<u8> {
+    model
+        .prefill_chunk(session, &tokens[..at])
+        .expect("the shared part runs");
+    assert_eq!(
+        model.stack().session(session).expect("open").written(),
+        u32::try_from(at).expect("a position"),
+        "the tail must start where the chunk stopped"
+    );
+    last_row(backend, model, session, &tokens[at..])
+}
+
 #[test]
 #[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
 fn a_scoring_session_reads_the_row_a_plain_one_reads() {
@@ -134,9 +155,12 @@ fn a_scoring_tail_answers_the_same_row_with_or_without_the_draft_warm_up() {
         return;
     };
     let tokens = prompt(1_200);
-    // A plain session warms the draft head over every row.
+    // Both sessions read the prompt as a chunk to the boundary and a 176-row
+    // tail (still a prompt-role pass), so the scoring tail is a separate piece
+    // that starts at the boundary, where its draft warm-up is skipped. A plain
+    // session warms the draft head over every row.
     let plain = model.open_session().expect("a session");
-    let want = last_row(&backend, &mut model, plain, &tokens);
+    let want = split_row(&backend, &mut model, plain, &tokens, 1_024);
     model.close_session(plain).expect("closes");
     // A scoring session with its shared boundary at 1024 warms only below it.
     let scoring = model.open_session().expect("a session");
@@ -146,7 +170,7 @@ fn a_scoring_tail_answers_the_same_row_with_or_without_the_draft_warm_up() {
         model.stack().session(scoring).expect("open").warm_until(),
         1_024
     );
-    let got = last_row(&backend, &mut model, scoring, &tokens);
+    let got = split_row(&backend, &mut model, scoring, &tokens, 1_024);
     model.close_session(scoring).expect("closes");
     assert!(want == got, "the draft head never writes the target's rows");
     model.teardown().expect("the model tears down");
