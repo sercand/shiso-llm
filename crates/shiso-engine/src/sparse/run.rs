@@ -372,6 +372,28 @@ impl SparseStack {
         )
     }
 
+    /// Warms the draft head's cache over `head`, which starts at `start`,
+    /// below the session's [`SparseSession::warm_until`] only.
+    ///
+    /// A scoring session's tail past its shared boundary is never resumed and
+    /// never drafted from, so the head's cache is warmed only over the part a
+    /// later session can stand on.
+    fn warm_draft_below_boundary(
+        &mut self,
+        session: SessionId,
+        head: &[TokenId],
+        start: u32,
+    ) -> CoreResult<()> {
+        let warm_until = self.session(session)?.warm_until;
+        let warm_end = usize::try_from(warm_until.saturating_sub(start))
+            .unwrap_or(usize::MAX)
+            .min(head.len());
+        if warm_end > 0 {
+            self.warm_draft(session, &head[..warm_end], start)?;
+        }
+        Ok(())
+    }
+
     /// Runs `tokens` in passes no wider than one chunk.
     ///
     /// `with_logits` applies to the last piece only: the pieces before it are
@@ -501,7 +523,7 @@ impl SparseStack {
             {
                 spec.staged_for = live.written;
             }
-            self.warm_draft(session, head, start)?;
+            self.warm_draft_below_boundary(session, head, start)?;
             // The rows the next piece needs are known the moment this one is
             // enqueued, and this one is about to spend its time on the device,
             // so reading them now costs nothing and the fetch that asks for

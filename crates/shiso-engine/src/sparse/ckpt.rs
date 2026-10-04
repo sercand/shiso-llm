@@ -562,6 +562,9 @@ impl SparseStack {
         live.hints.extend_from_slice(hints);
         live.hints.sort_unstable();
         live.hints.dedup();
+        if live.scoring {
+            live.warm_until = live.hints.last().copied().unwrap_or(0);
+        }
         Ok(())
     }
 
@@ -572,10 +575,14 @@ impl SparseStack {
     ///
     /// [`CoreError::UnknownSession`].
     pub fn ckpt_set_scoring(&mut self, session: SessionId) -> CoreResult<()> {
-        self.sessions
+        let live = self
+            .sessions
             .get_mut(&session)
-            .ok_or(CoreError::UnknownSession(session))?
-            .scoring = true;
+            .ok_or(CoreError::UnknownSession(session))?;
+        live.scoring = true;
+        // Nothing is warmed until hints name a boundary a later session may
+        // resume from.
+        live.warm_until = 0;
         Ok(())
     }
 

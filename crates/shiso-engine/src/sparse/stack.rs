@@ -307,6 +307,13 @@ pub struct SparseSession {
     /// only its shared-boundary checkpoints, in memory, because nothing will
     /// resume its prompt's end.
     pub(crate) scoring: bool,
+    /// The position below which this session warms the draft head's cache.
+    ///
+    /// `u32::MAX` for every session that may decode. A scoring session never
+    /// drafts, but its shared-boundary checkpoint may be resumed by one that
+    /// does, so the cache is warmed up to that boundary and not past it: the
+    /// tail beyond it is this session's alone.
+    pub(crate) warm_until: u32,
     /// Whether any chunk spliced media rows in, or a media key was set. Such
     /// a path is checkpointed only under [`SparseSession::key`]: a placeholder
     /// run is one id repeated, so its own tokens cannot tell two pictures apart.
@@ -500,6 +507,12 @@ impl SparseSession {
     #[must_use]
     pub fn recurrent_slots(&self) -> usize {
         self.states.len()
+    }
+
+    /// The position below which this session warms the draft head's cache.
+    #[must_use]
+    pub fn warm_until(&self) -> u32 {
+        self.warm_until
     }
 
     /// The handle this session was opened under.
@@ -1186,6 +1199,7 @@ impl SparseStack {
             history: Vec::new(),
             hints: Vec::new(),
             scoring: false,
+            warm_until: u32::MAX,
             media: false,
             resumed_at: 0,
             key: None,

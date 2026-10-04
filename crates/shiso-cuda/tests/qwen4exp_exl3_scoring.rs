@@ -124,6 +124,34 @@ fn a_scoring_session_reads_the_row_a_plain_one_reads() {
     model.teardown().expect("the model tears down");
 }
 
+#[test]
+#[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
+fn a_scoring_tail_answers_the_same_row_with_or_without_the_draft_warm_up() {
+    let backend: Arc<dyn Backend> =
+        CudaBackend::new(0, CudaOptions::default()).expect("a CUDA device");
+    let Some(mut model) = load_served(&backend, true) else {
+        skip("no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
+        return;
+    };
+    let tokens = prompt(1_200);
+    // A plain session warms the draft head over every row.
+    let plain = model.open_session().expect("a session");
+    let want = last_row(&backend, &mut model, plain, &tokens);
+    model.close_session(plain).expect("closes");
+    // A scoring session with its shared boundary at 1024 warms only below it.
+    let scoring = model.open_session().expect("a session");
+    model.kv_set_scoring(scoring).expect("marked");
+    model.kv_set_hints(scoring, &[1_024]).expect("hinted");
+    assert_eq!(
+        model.stack().session(scoring).expect("open").warm_until(),
+        1_024
+    );
+    let got = last_row(&backend, &mut model, scoring, &tokens);
+    model.close_session(scoring).expect("closes");
+    assert!(want == got, "the draft head never writes the target's rows");
+    model.teardown().expect("the model tears down");
+}
+
 /// Times plain prefills of a short prompt, for the profile of the pass a
 /// scoring request's questions run.
 ///
