@@ -8,7 +8,7 @@
 use shiso_core::DType;
 
 /// Every variant, so the round-trip test cannot silently skip one.
-const ALL: [DType; 20] = [
+const ALL: [DType; 22] = [
     DType::F32,
     DType::F16,
     DType::Q4_0,
@@ -29,6 +29,8 @@ const ALL: [DType; 20] = [
     DType::Exl3K5,
     DType::Exl3K6,
     DType::Exl3Ngram6,
+    DType::Pq2_0,
+    DType::Ptq1_0,
 ];
 
 #[test]
@@ -50,7 +52,7 @@ fn on_disk_ids_are_unique() {
 
 #[test]
 fn discriminants_are_the_documented_ids() {
-    let expected: [(DType, u32); 20] = [
+    let expected: [(DType, u32); 22] = [
         (DType::F32, 0),
         (DType::F16, 1),
         (DType::Q4_0, 2),
@@ -71,6 +73,8 @@ fn discriminants_are_the_documented_ids() {
         (DType::Exl3K5, 69),
         (DType::Exl3K6, 70),
         (DType::Exl3Ngram6, 72),
+        (DType::Pq2_0, 142),
+        (DType::Ptq1_0, 143),
     ];
     for (dtype, id) in expected {
         assert_eq!(dtype.gguf_id(), id);
@@ -93,7 +97,10 @@ fn unknown_id_is_none_rather_than_a_default() {
 
 #[test]
 fn block_dimensions_of_the_formats_that_matter() {
-    let pinned: [(DType, u32, u32); 5] = [
+    let pinned: [(DType, u32, u32); 8] = [
+        (DType::Pq2_0, 128, 34),
+        (DType::Ptq1_0, 128, 28),
+        (DType::MlxAffine2Gs128, 128, 36),
         (DType::Q8_0, 32, 34),
         (DType::Q4_K, 256, 144),
         (DType::MXFP4, 32, 17),
@@ -147,4 +154,19 @@ fn type_names_are_lowercase_and_distinct() {
         assert!(!seen.contains(&name), "{name} repeated");
         seen.push(name);
     }
+}
+
+#[test]
+fn ternary_and_two_bit_affine_are_told_apart() {
+    // The two ternary blocks carry their scale inside the block; the MLX
+    // 2-bit type keeps scales and biases in arrays of their own, which is why
+    // it answers the affine question and they do not.
+    for dtype in [DType::Pq2_0, DType::Ptq1_0] {
+        assert!(dtype.is_ternary(), "{dtype:?}");
+        assert!(!dtype.is_affine(), "{dtype:?}");
+        assert_eq!(dtype.affine_bits(), None, "{dtype:?}");
+    }
+    assert!(DType::MlxAffine2Gs128.is_affine());
+    assert!(!DType::MlxAffine2Gs128.is_ternary());
+    assert_eq!(DType::MlxAffine2Gs128.affine_bits(), Some(2));
 }

@@ -77,6 +77,41 @@ impl QuantBlock for BlockQ2K {
     const ELEMS: usize = QK_K;
 }
 
+/// Elements one ternary block covers.
+pub const QK_TERNARY: usize = 128;
+
+/// Ternary weights in 2-bit slots: an `f16` scale, then four codes a byte.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockPq2_0 {
+    /// fp16 scale, high bits.
+    pub d: u16,
+    /// Packed 2-bit codes, four per byte from the low bits up.
+    pub qs: [u8; QK_TERNARY / 4],
+}
+const _: () = assert!(size_of::<BlockPq2_0>() == 34);
+impl QuantBlock for BlockPq2_0 {
+    const DTYPE: DType = DType::Pq2_0;
+    const ELEMS: usize = QK_TERNARY;
+}
+
+/// Ternary weights five trits to a byte, with the `f16` scale last.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockPtq1_0 {
+    /// Five trits a byte: 120 weights.
+    pub qs: [u8; 24],
+    /// Four trits a byte: the last 8 weights.
+    pub qh: [u8; 2],
+    /// fp16 scale, high bits.
+    pub d: u16,
+}
+const _: () = assert!(size_of::<BlockPtq1_0>() == 28);
+impl QuantBlock for BlockPtq1_0 {
+    const DTYPE: DType = DType::Ptq1_0;
+    const ELEMS: usize = QK_TERNARY;
+}
+
 /// 4-bit `K`-quant: super-block scale and minimum, 12 scale bytes, packed
 /// 4-bit weights.
 #[repr(C)]

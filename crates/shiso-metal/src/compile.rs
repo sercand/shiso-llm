@@ -300,6 +300,16 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         include_str!("../metal/flux2/flux2_common.h"),
     ),
     ("flux2.metal", include_str!("../metal/flux2/flux2.metal")),
+    // --- ternary kernel set (rotated ternary checkpoints); appended, nothing
+    // above this line changed. The header first, as for every other set.
+    (
+        "ternary_common.h",
+        include_str!("../metal/ternary/ternary_common.h"),
+    ),
+    (
+        "ternary/rotate.metal",
+        include_str!("../metal/ternary/rotate.metal"),
+    ),
 ];
 
 /// Concatenates every source into the one translation unit the device compiles.

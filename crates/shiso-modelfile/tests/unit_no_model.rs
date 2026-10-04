@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use shiso_core::{DType, HfConfig, LayerIdx};
 use shiso_engine::shape::LayerKind;
 use shiso_modelfile::quant::{
-    self, BlockIq2Xxs, BlockIq4Nl, BlockMxfp4, BlockQ2K, BlockQ4K, BlockQ5_1, BlockQ5K, BlockQ6K,
-    BlockQ8_0, BlockQ8K, QuantBlock,
+    self, BlockIq2Xxs, BlockIq4Nl, BlockMxfp4, BlockPq2_0, BlockPtq1_0, BlockQ2K, BlockQ4K,
+    BlockQ5_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8K, QuantBlock,
 };
 use shiso_modelfile::reader::{GgufError, GgufFile, MAX_DIMS, TensorShape};
 use shiso_modelfile::{MetaType, MetaValue, TensorSource};
@@ -119,6 +119,8 @@ fn block_structs_agree_with_the_format_table() {
     check!(BlockMxfp4, 32, 17);
     check!(BlockQ5_1, 32, 24);
     check!(BlockIq4Nl, 32, 18);
+    check!(BlockPq2_0, 128, 34);
+    check!(BlockPtq1_0, 128, 28);
 }
 
 #[test]

@@ -185,3 +185,7 @@ path = "tests/audio_kernels.rs"
 [[test]]
 name = "sample_kernels"
 path = "tests/sample_kernels.rs"
+
+[[test]]
+name = "ternary"
+path = "tests/ternary.rs"

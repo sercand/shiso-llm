@@ -80,6 +80,7 @@ pub mod reader;
 pub mod safetensors;
 pub mod source;
 pub mod st_header;
+pub mod ternary;
 
 pub use fp8::{Fp8Layout, dequant_fp8, e4m3, quantize_activations, to_e4m3};
 pub use metadata::{GgufMetadata, MetaArray, MetaType, MetaValue};
