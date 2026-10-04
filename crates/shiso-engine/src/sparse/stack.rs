@@ -81,6 +81,23 @@ pub const MAX_DECODE_BATCH: u32 = 8;
 /// is a decode batch's sequences times one verify each.
 pub const MAX_LOGIT_ROWS: u32 = 32;
 
+/// Runs one prompt-role segmented pass may carry.
+///
+/// A prompt-role pass carries one run per scoring session, and the
+/// scheduler's slot table bounds how many are resident.
+pub const MAX_PROMPT_RUNS: u32 = 64;
+
+/// Rows of the logits block: a verify's every row, or one per prompt run.
+///
+/// One logits row per run, so the block is the wider of a verify's rows and
+/// the run cap. At 64 runs that is +30 MiB of logits and +1.3 MiB of
+/// `ResidualHold`.
+pub const LOGIT_BLOCK_ROWS: u32 = if MAX_PROMPT_RUNS > MAX_LOGIT_ROWS {
+    MAX_PROMPT_RUNS
+} else {
+    MAX_LOGIT_ROWS
+};
+
 /// Everything a sparse stack needs that is not geometry and not a weight.
 ///
 /// Composes the shared knobs rather than restating them: the context length and
@@ -840,7 +857,7 @@ impl SparseStack {
             backend,
             &shape,
             opts.prefill_rows,
-            MAX_LOGIT_ROWS,
+            LOGIT_BLOCK_ROWS,
             opts.engine.ctx,
         )?;
         // The suppress list starts empty: the count is the buffer's first

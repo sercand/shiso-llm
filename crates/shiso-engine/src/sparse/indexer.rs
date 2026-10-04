@@ -149,7 +149,7 @@ pub fn store(
                 ]),
             );
         }
-        plan.append(pool(shape, layer, rank, origin, n_tok));
+        plan.append(pool(shape, layer, rank, &origin, n_tok));
         return Ok(plan);
     }
     let (store_entry, store_launch, store_pages) = if batched {
@@ -180,7 +180,7 @@ pub fn store(
             Operand::U32(n_tok),
         ]),
     );
-    plan.append(pool(shape, layer, rank, origin, n_tok));
+    plan.append(pool(shape, layer, rank, &origin, n_tok));
     Ok(plan)
 }
 
@@ -197,9 +197,9 @@ pub fn store(
 /// than the work, which is exactly the trade the other five batched kernels were
 /// written to avoid and exactly the one that does not matter here, because it is
 /// one launch per row per attention slot rather than one per row per layer.
-fn pool(shape: &SparseShape, layer: LayerRef, rank: u32, origin: RowOrigin, n_tok: u32) -> Plan {
+fn pool(shape: &SparseShape, layer: LayerRef, rank: u32, origin: &RowOrigin, n_tok: u32) -> Plan {
     let mut plan = Plan::new();
-    let batched = origin == RowOrigin::Unrelated;
+    let batched = *origin == RowOrigin::Unrelated;
     let segments = match origin {
         RowOrigin::Segmented(runs) => Some(runs),
         RowOrigin::Sequential | RowOrigin::Unrelated => None,
@@ -220,7 +220,7 @@ fn pool(shape: &SparseShape, layer: LayerRef, rank: u32, origin: RowOrigin, n_to
                 Operand::PagesOf(row),
                 Operand::ScratchFrom(
                     Buf::Mrope,
-                    crate::sparse::inputs::segment_lookback_offset(&runs, row),
+                    crate::sparse::inputs::segment_lookback_offset(runs, row),
                 ),
                 runs.len(row),
             )

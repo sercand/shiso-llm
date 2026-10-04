@@ -62,7 +62,7 @@ use crate::sparse::media;
 use crate::sparse::moe::{self, RowOrigin};
 use crate::sparse::plan::{Plan, Step};
 use crate::sparse::ple::{self, NgramContext, PleGather};
-use crate::sparse::qsa::{self, AttnContext, AttnSlot};
+use crate::sparse::qsa::{self, AttnContext, AttnSlot, RunRows};
 use crate::sparse::recurrent::{self, Recurrence};
 use crate::sparse::scratch::Buf;
 use crate::sparse::stack::{IslandSpan, MAX_DECODE_BATCH, Pass, SparseSession, SparseStack};
@@ -154,7 +154,7 @@ impl SparseStack {
             &[live],
             n_tok,
             logit_rows,
-            RowOrigin::Sequential,
+            &RowOrigin::Sequential,
             media_rows,
             role,
         )
@@ -197,7 +197,7 @@ impl SparseStack {
         // A decode batch reads one token per session and embeds no picture: a
         // request's media is spliced during its prefill and is in the cache by
         // the time any of its rows decode.
-        self.plan_rows(&live, rows, rows, origin, None, PassRole::Step)
+        self.plan_rows(&live, rows, rows, &origin, None, PassRole::Step)
     }
 
     /// Plans one segmented pass: each session's run of consecutive positions,
@@ -222,6 +222,13 @@ impl SparseStack {
             });
         }
         let runs = moe::Segments::new(lens)?;
+        if runs.count() > MAX_DECODE_BATCH {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented verify runs",
+                expected: u64::from(MAX_DECODE_BATCH),
+                got: u64::from(runs.count()),
+            });
+        }
         let rows = runs.rows();
         if rows > crate::sparse::stack::MAX_LOGIT_ROWS {
             return Err(CoreError::ShapeMismatch {
@@ -239,7 +246,7 @@ impl SparseStack {
             &live,
             rows,
             rows,
-            RowOrigin::Segmented(runs),
+            &RowOrigin::Segmented(runs),
             None,
             PassRole::Step,
         )
@@ -256,7 +263,7 @@ impl SparseStack {
         rows: &[&SparseSession],
         n_tok: u32,
         logit_rows: u32,
-        origin: RowOrigin,
+        origin: &RowOrigin,
         media_rows: Option<u32>,
         role: PassRole,
     ) -> CoreResult<Pass> {
@@ -268,7 +275,7 @@ impl SparseStack {
             expected: 1,
             got: 0,
         })?;
-        let batched = origin != RowOrigin::Sequential;
+        let batched = *origin != RowOrigin::Sequential;
         // Only one sequence's prompt rows are promised to every pass width: a
         // batch's rows are steps by construction.
         let role = if batched { PassRole::Step } else { role };
@@ -296,7 +303,11 @@ impl SparseStack {
                         .indexer
                         .sparse_at(live.written().saturating_add(run_rows(row)))
                 })
-                .fold(0u8, |bits, (row, _)| bits | (1u8 << (row % 8)))
+                .fold(0_u64, |bits, (row, _)| {
+                    bits | 1_u64
+                        .checked_shl(u32::try_from(row).unwrap_or(u32::MAX))
+                        .unwrap_or(0)
+                })
         } else {
             0
         };
@@ -318,18 +329,20 @@ impl SparseStack {
         } else {
             u32::try_from(within(first.written(), n_tok)).unwrap_or(n_tok)
         };
-        let mut run_dense_rows = [0u8; MAX_DECODE_BATCH as usize];
+        let mut run_dense_rows = RunRows::default();
         if let RowOrigin::Segmented(runs) = origin {
-            for ((run, live), slot) in rows.iter().enumerate().zip(&mut run_dense_rows) {
-                let run = u32::try_from(run).unwrap_or(u32::MAX);
-                *slot = u8::try_from(within(live.written(), runs.len(run))).unwrap_or(u8::MAX);
+            for (run, live) in (0..runs.count()).zip(rows.iter()) {
+                run_dense_rows.set(
+                    run,
+                    u32::try_from(within(live.written(), runs.len(run))).unwrap_or(u32::MAX),
+                );
             }
         }
         let ctx = AttnContext {
             selected,
             tensor_core: self.opts.tensor_core,
             tiled: self.opts.tiled_attention,
-            origin,
+            origin: *origin,
             batch_selected,
             dense_rows,
             run_dense_rows,
@@ -398,7 +411,7 @@ impl SparseStack {
                     il,
                     half,
                     chain,
-                    ctx,
+                    &ctx,
                     origin,
                     n_tok,
                     device,
@@ -424,7 +437,7 @@ impl SparseStack {
             &mut plan,
             n_tok,
             logit_rows,
-            origin == RowOrigin::Unrelated,
+            *origin == RowOrigin::Unrelated,
             device,
         )?;
 
@@ -452,7 +465,7 @@ impl SparseStack {
             capturable,
             selected,
             rows: n_tok,
-            origin,
+            origin: *origin,
             gather,
         })
     }
@@ -564,7 +577,7 @@ impl SparseStack {
         &self,
         rows: &[&SparseSession],
         n_tok: u32,
-        origin: RowOrigin,
+        origin: &RowOrigin,
     ) -> CoreResult<Vec<PleGather>> {
         let Some(ple) = self.shape.ple else {
             return Ok(Vec::new());
@@ -582,7 +595,7 @@ impl SparseStack {
                 })
                 .collect();
         }
-        if origin == RowOrigin::Sequential {
+        if *origin == RowOrigin::Sequential {
             let live = rows.first().ok_or(CoreError::ShapeMismatch {
                 field: "pass rows",
                 expected: 1,
@@ -645,8 +658,8 @@ impl SparseStack {
         il: LayerIdx,
         half: Island,
         chain: LayerChain,
-        ctx: AttnContext,
-        origin: RowOrigin,
+        ctx: &AttnContext,
+        origin: &RowOrigin,
         n_tok: u32,
         device: Device,
     ) -> CoreResult<Plan> {
@@ -686,7 +699,7 @@ impl SparseStack {
                         slot,
                         NgramContext {
                             spec: self.opts.spec,
-                            origin,
+                            origin: *origin,
                         },
                         n_tok,
                         device,
@@ -710,7 +723,7 @@ impl SparseStack {
                         Recurrence {
                             chunk: self.opts.chunk,
                             spec: self.opts.spec,
-                            origin,
+                            origin: *origin,
                         },
                         n_tok,
                         device,
@@ -727,7 +740,7 @@ impl SparseStack {
                                 .saturating_mul(shiso_core::page::PAGE_TOKENS),
                             ctx: self.opts.engine.ctx,
                         };
-                        plan.append(qsa::block(&self.shape, &desc, attn, ctx, n_tok, device)?);
+                        plan.append(qsa::block(&self.shape, &desc, attn, *ctx, n_tok, device)?);
                     }
                 }
             }

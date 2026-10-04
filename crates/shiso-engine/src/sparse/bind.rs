@@ -48,10 +48,10 @@ pub const MAX_ARGS: usize = 24;
 
 /// Rows one binder may hold a session for.
 ///
-/// The logits block's height, because that is what bounds a decode batch: a
-/// pass that carried more rows than the block has would have nowhere to write
-/// the last of them.
-pub const MAX_ROWS: usize = crate::sparse::stack::MAX_DECODE_BATCH as usize;
+/// One row per run of the widest segmented pass, which is wider than a decode
+/// batch. Per-row pointer arrays are still packed only for a decode batch's or
+/// a verify's rows.
+pub const MAX_ROWS: usize = crate::sparse::stack::MAX_PROMPT_RUNS as usize;
 
 /// Which bound tensor an operand names.
 ///
@@ -662,8 +662,8 @@ impl<'a> Binder<'a> {
     ///
     /// # Errors
     ///
-    /// [`CoreError::Unsupported`] for an empty batch or one wider than the
-    /// logits block, which is the width every per-row array is laid out at.
+    /// [`CoreError::Unsupported`] for an empty batch or one wider than
+    /// [`MAX_ROWS`].
     pub fn batched(
         scratch: &'a Scratch,
         weights: &'a SparseWeights,
@@ -672,7 +672,7 @@ impl<'a> Binder<'a> {
     ) -> CoreResult<Self> {
         if sessions.is_empty() || sessions.len() > MAX_ROWS {
             return Err(CoreError::Unsupported {
-                what: "a decode batch wider than the logits block",
+                what: "a batch wider than one binder holds",
                 backend: "engine",
             });
         }

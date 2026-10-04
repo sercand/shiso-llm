@@ -21,6 +21,7 @@ use shiso_core::backend::Backend;
 use shiso_core::config::HfConfig;
 use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::model::Model;
+use shiso_core::model::Speculating as _;
 use shiso_cuda::{CudaBackend, CudaOptions};
 use shiso_engine::EngineOptions;
 use shiso_engine::ckpt::Checkpointed as _;
@@ -123,6 +124,19 @@ fn split_row(
     last_row(backend, model, session, &tokens[at..])
 }
 
+/// The id of a logits row's largest value.
+fn argmax(row: &[u8]) -> u32 {
+    let best = row
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .enumerate()
+        .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, v)| {
+            if v > bv { (i, v) } else { (bi, bv) }
+        })
+        .0;
+    u32::try_from(best).expect("a vocabulary id")
+}
+
 #[test]
 #[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
 fn a_scoring_session_reads_the_row_a_plain_one_reads() {
@@ -173,6 +187,78 @@ fn a_scoring_tail_answers_the_same_row_with_or_without_the_draft_warm_up() {
     let got = split_row(&backend, &mut model, scoring, &tokens, 1_024);
     model.close_session(scoring).expect("closes");
     assert!(want == got, "the draft head never writes the target's rows");
+    model.teardown().expect("the model tears down");
+}
+
+/// What four greedy sessions produce over eight batched speculative steps, one
+/// line per session, against a file the first run records.
+///
+/// The segmented verify is what Task 6 re-represents (run offsets instead of
+/// packed lengths, wider selection bits) and must leave summing exactly as it
+/// did. The GGUF verify suite cannot run on this machine, so this is the lock:
+/// record it on the code before the change, compare after.
+#[test]
+#[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
+#[expect(
+    clippy::print_stdout,
+    reason = "the recording notice is the test's output"
+)]
+fn a_batched_speculative_step_keeps_its_tokens() {
+    let backend: Arc<dyn Backend> =
+        CudaBackend::new(0, CudaOptions::default()).expect("a CUDA device");
+    let Some(mut model) = load_served(&backend, true) else {
+        skip("no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
+        return;
+    };
+    let tokens = prompt(1_400);
+    let sessions = (0..4)
+        .map(|_| model.open_session().expect("a session"))
+        .collect::<Vec<_>>();
+    let mut next = Vec::new();
+    for (at, session) in sessions.iter().enumerate() {
+        let row = last_row(
+            &backend,
+            &mut model,
+            *session,
+            &tokens[at * 100..at * 100 + 600],
+        );
+        next.push(TokenId::new(argmax(&row)));
+    }
+    let mut streams = vec![Vec::new(); sessions.len()];
+    for _ in 0..8 {
+        let steps = sessions
+            .iter()
+            .copied()
+            .zip(next.iter().copied())
+            .collect::<Vec<_>>();
+        let produced = model
+            .speculate_batch(&steps)
+            .expect("the batched step runs");
+        for ((stream, out), first) in streams.iter_mut().zip(&produced).zip(next.iter_mut()) {
+            stream.extend(out.produced.iter().map(|token| token.get()));
+            if let Some(last) = out.produced.last() {
+                *first = *last;
+            }
+        }
+    }
+    let text = streams
+        .iter()
+        .map(|stream| format!("{stream:?}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/scoring-golden/speculate-batch.txt");
+    if let Ok(want) = std::fs::read_to_string(&golden) {
+        assert_eq!(text, want, "a batched speculative step changed its tokens");
+    } else {
+        std::fs::create_dir_all(golden.parent().expect("a parent")).expect("the directory");
+        std::fs::write(&golden, &text).expect("the golden writes");
+        println!("RECORDED {}", golden.display());
+    }
+    for session in sessions {
+        model.close_session(session).expect("closes");
+    }
     model.teardown().expect("the model tears down");
 }
 

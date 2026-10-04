@@ -86,7 +86,8 @@ pub use ple::{NgramTable, NgramTier, PleGather, PleRows};
 pub use rows::{Layout, PtrArray};
 pub use shape::{IndexerShape, MoeShape, MropeSections, PleShape, SparseShape};
 pub use stack::{
-    MAX_DECODE_BATCH, MAX_PREFILL_CHUNK, Pass, SparseOptions, SparseSession, SparseStack,
+    MAX_DECODE_BATCH, MAX_PREFILL_CHUNK, MAX_PROMPT_RUNS, Pass, SparseOptions, SparseSession,
+    SparseStack,
 };
 pub use stream::{EXPERT_MATRICES, ExpertSource, ExpertStream, StreamStats};
 pub use tap::{ResidualTap, TapPoint, TapRecord};

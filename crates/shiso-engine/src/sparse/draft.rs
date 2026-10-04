@@ -203,7 +203,7 @@ impl SparseStack {
         // complete blocks than the indexer budget.
         let (origin, batch_selected) = match rows {
             DraftRows::Sequential => (RowOrigin::Sequential, 0),
-            DraftRows::Batch(bits) => (RowOrigin::Unrelated, bits),
+            DraftRows::Batch(bits) => (RowOrigin::Unrelated, u64::from(bits)),
         };
         let ctx = AttnContext {
             selected: origin == RowOrigin::Sequential && shape.indexer.sparse_at(frontier),
@@ -221,8 +221,8 @@ impl SparseStack {
                 LayerIdx::new(0),
                 half,
                 chain,
-                ctx,
-                origin,
+                &ctx,
+                &origin,
                 n_tok,
                 device,
             )?);

@@ -96,6 +96,31 @@ pub enum AttnPath {
     GatheredTensorCore,
 }
 
+/// One row count per run of a segmented pass, in run order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunRows([u32; crate::sparse::stack::MAX_PROMPT_RUNS as usize]);
+
+impl Default for RunRows {
+    fn default() -> Self {
+        Self([0; crate::sparse::stack::MAX_PROMPT_RUNS as usize])
+    }
+}
+
+impl RunRows {
+    /// Run `run`'s count, zero past the last run.
+    #[must_use]
+    pub fn get(&self, run: u32) -> u32 {
+        self.0.get(run as usize).copied().unwrap_or(0)
+    }
+
+    /// Sets run `run`'s count; a run past the cap has none to set.
+    pub fn set(&mut self, run: u32, rows: u32) {
+        if let Some(slot) = self.0.get_mut(run as usize) {
+            *slot = rows;
+        }
+    }
+}
+
 /// What the caller knows about this call that the shape does not say.
 ///
 /// Deliberately NOT `#[non_exhaustive]`: a caller builds one.
@@ -123,15 +148,16 @@ pub struct AttnContext {
     /// answer for every layer, and it decides which of two kernels the store
     /// and the attention are.
     pub origin: RowOrigin,
-    /// For a batch of unrelated rows, which rows' own contexts have outgrown
-    /// the indexer budget: bit `r` is row `r`.
+    /// For a batch of unrelated rows or the runs of a segmented pass, which
+    /// rows' or runs' own contexts have outgrown the indexer budget: bit `r`
+    /// is row or run `r`.
     ///
     /// A batch's rows are separate sequences, so whether a row attends to a
     /// selection is that row's question, answered from its own frontier - and a
     /// row that is past the budget must read the same selection a single-row
     /// step of that sequence would, or batching it would change its text.
     /// Ignored for one sequence's rows, whose answer is `selected`.
-    pub batch_selected: u8,
+    pub batch_selected: u64,
     /// For one sequence's rows when `selected` is set: how many rows at the
     /// front of the pass still sit within the budget, counted from each row's
     /// own position.
@@ -148,7 +174,7 @@ pub struct AttnContext {
     pub dense_rows: u32,
     /// The same count for each run of a segmented pass, where run `r`'s entry
     /// is read when its bit of `batch_selected` is set.
-    pub run_dense_rows: [u8; crate::sparse::stack::MAX_DECODE_BATCH as usize],
+    pub run_dense_rows: RunRows,
     /// Which reference pass the rows must reproduce. A
     /// [`PassRole::Prompt`] pass's rows are attended exactly as they would be
     /// in a pass of any other width. The kernel is then chosen as for the
@@ -239,7 +265,7 @@ pub fn path(shape: &SparseShape, ctx: AttnContext, n_tok: u32) -> AttnPath {
 /// and the projections around it are the same either way.
 #[must_use]
 pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32) -> Plan {
-    attend_at(shape, slot, ctx, n_tok, RowAt::WHOLE)
+    attend_at(shape, slot, &ctx, n_tok, RowAt::WHOLE)
 }
 
 /// [`attend`] over the rows `at` names.
@@ -249,7 +275,13 @@ pub fn attend(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32)
               transcriptions of parameter lists, and a split that broke a list \
               across two functions would hide the order being transcribed"
 )]
-fn attend_at(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32, at: RowAt) -> Plan {
+fn attend_at(
+    shape: &SparseShape,
+    slot: AttnSlot,
+    ctx: &AttnContext,
+    n_tok: u32,
+    at: RowAt,
+) -> Plan {
     let q_width = u64::from(shape.gqa.q_heads) * u64::from(shape.gqa.head_dim);
     let mut plan = Plan::new();
     let keys = Operand::CachePlane {
@@ -288,7 +320,7 @@ fn attend_at(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, n_tok: u32, 
         pages,
         Operand::U32(n_tok),
     ]);
-    match path(shape, ctx, n_tok) {
+    match path(shape, *ctx, n_tok) {
         // `out, k_cache, v_cache, q, head_dim, n_head, n_head_kv, pos,
         //  pages_arr, n_tok` - the scalar list with the page table replaced by
         // the per-row array, which is the whole of the difference.
@@ -408,8 +440,8 @@ fn segmented(
     shape: &SparseShape,
     desc: &AttnDesc,
     slot: AttnSlot,
-    ctx: AttnContext,
-    runs: Segments,
+    ctx: &AttnContext,
+    runs: &Segments,
     device: Device,
     mut plan: Plan,
 ) -> CoreResult<Plan> {
@@ -477,12 +509,12 @@ fn segmented(
     for run in 0..runs.count() {
         let first = runs.start(run);
         let rows = runs.len(run);
-        let selected = (ctx.batch_selected >> run) & 1 == 1;
+        let selected = ctx
+            .batch_selected
+            .checked_shr(run)
+            .is_some_and(|bits| bits & 1 == 1);
         let dense = if selected {
-            ctx.run_dense_rows
-                .get(run as usize)
-                .map_or(0, |&rows| u32::from(rows))
-                .min(rows)
+            ctx.run_dense_rows.get(run).min(rows)
         } else {
             rows
         };
@@ -501,12 +533,12 @@ fn segmented(
         let one = AttnContext {
             selected,
             origin: RowOrigin::Sequential,
-            ..ctx
+            ..*ctx
         };
         plan.append(attend_across(
             shape,
             slot,
-            one,
+            &one,
             rows,
             dense,
             RowAt {
@@ -582,7 +614,7 @@ impl RowAt {
 fn attend_across(
     shape: &SparseShape,
     slot: AttnSlot,
-    ctx: AttnContext,
+    ctx: &AttnContext,
     rows: u32,
     dense: u32,
     at: RowAt,
@@ -591,9 +623,9 @@ fn attend_across(
     if dense > 0 {
         let within = AttnContext {
             selected: false,
-            ..ctx
+            ..*ctx
         };
-        plan.append(attend_at(shape, slot, within, dense, at));
+        plan.append(attend_at(shape, slot, &within, dense, at));
     }
     if dense < rows {
         let past = RowAt {
@@ -609,18 +641,21 @@ fn attend_across(
 /// sequence launches it: the split kernel over the whole cache, or - for a row
 /// whose context has outgrown the budget - the selected-block kernel over the
 /// selection the indexer just made for that row alone.
-fn attend_one(shape: &SparseShape, slot: AttnSlot, ctx: AttnContext, row: u32) -> Plan {
+fn attend_one(shape: &SparseShape, slot: AttnSlot, ctx: &AttnContext, row: u32) -> Plan {
     let at = RowAt {
         row,
         pages: Operand::PagesOf(row),
     };
-    let selected = (ctx.batch_selected >> row) & 1 == 1;
+    let selected = ctx
+        .batch_selected
+        .checked_shr(row)
+        .is_some_and(|bits| bits & 1 == 1);
     let one = AttnContext {
         selected,
         origin: RowOrigin::Sequential,
-        ..ctx
+        ..*ctx
     };
-    attend_at(shape, slot, one, 1, at)
+    attend_at(shape, slot, &one, 1, at)
 }
 
 /// The tensor-core entry's argument list.
@@ -757,7 +792,7 @@ pub fn block(
     // array; every other parameter, and the grid, is the same.
     let batched = ctx.origin == RowOrigin::Unrelated;
     if let RowOrigin::Segmented(runs) = ctx.origin {
-        return segmented(shape, desc, slot, ctx, runs, device, plan);
+        return segmented(shape, desc, slot, &ctx, &runs, device, plan);
     }
     let (store_entry, store_launch, store_pages) = if batched {
         (
@@ -827,7 +862,11 @@ pub fn block(
             )?);
         }
         for row in 0..n_tok {
-            if (ctx.batch_selected >> row) & 1 == 1 {
+            if ctx
+                .batch_selected
+                .checked_shr(row)
+                .is_some_and(|bits| bits & 1 == 1)
+            {
                 plan.append(indexer::select_rows(
                     shape,
                     indexed,
@@ -835,7 +874,7 @@ pub fn block(
                     indexer::RowSpan::one(row),
                 ));
             }
-            plan.append(attend_one(shape, slot, ctx, row));
+            plan.append(attend_one(shape, slot, &ctx, row));
         }
     } else {
         let dense = if ctx.selected {
@@ -862,7 +901,7 @@ pub fn block(
                 },
             ));
         }
-        plan.append(attend_across(shape, slot, ctx, n_tok, dense, RowAt::WHOLE));
+        plan.append(attend_across(shape, slot, &ctx, n_tok, dense, RowAt::WHOLE));
     }
     plan.launch(
         Entry::plain(MOD_QSA, "q4e_qsa_gate_kernel"),
