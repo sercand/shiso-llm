@@ -106,45 +106,58 @@ void dequantize_dense_q6_K(device const shs_dense_block_q6_K *xb, short il, thre
     reg = (type4x4)reg_f;
 }
 
-// The float4 view the matvec consumes, identical in shape to
-// `dequantize_dense_q4_K_t4`: chunk `il` is elements `[4*il, 4*il+4)`, taken as
-// row `il & 3` of the 16-value group `il / 4`.
-template <typename type4>
-void dequantize_dense_q5_K_t4(device const shs_dense_block_q5_K *xb, short il, thread type4 &reg) {
-    float4x4 tmp;
-    dequantize_dense_q5_K(xb, il / 4, tmp);
-    const short row = il & 3;
-    for (int i = 0; i < 4; i++) {
-        reg[i] = tmp[row][i];
+// Sub-block `s` (32 weights) as integer codes for the K-quant matvec in
+// `metal/generic/mul_mv_ext.metal`, with the pair that folds the scales in
+// after the dot. The codes are the helpers' own above, read straight out of
+// the packed block.
+void deq32_q5_K(device const shs_dense_block_q5_K *xb, short s, thread float4 *qv, thread float2 &ab) {
+    const uchar2 sm = shs_dense_q4_K_scale_min(s, 0, xb->scales);
+    ab = float2((float)xb->d * (float)sm.x, -((float)xb->dmin * (float)sm.y));
+    device const uchar4 *q = (device const uchar4 *)(xb->qs + (s / 2) * 32);
+    device const uchar4 *h = (device const uchar4 *)(xb->qh);
+    const uchar sh = (s & 1) ? 4 : 0;
+    const uchar hmask = (uchar)(1u << (uint)s);
+    for (short k = 0; k < 8; ++k) {
+        const float4 lo = float4((q[k] >> sh) & uchar(0x0F));
+        qv[k] = lo + select(float4(0.0f), float4(16.0f), (h[k] & hmask) != uchar(0));
     }
 }
 
-template <typename type4>
-void dequantize_dense_q6_K_t4(device const shs_dense_block_q6_K *xb, short il, thread type4 &reg) {
-    float4x4 tmp;
-    dequantize_dense_q6_K(xb, il / 4, tmp);
-    const short row = il & 3;
-    for (int i = 0; i < 4; i++) {
-        reg[i] = tmp[row][i];
+// q6_K has no minimum and two signed scales per 32 weights, one per 16, so
+// the scales ride on the codes and the pair is `(d, 0)`. A q6_K block is 210
+// bytes, so a block after the first is only two-byte aligned and the bytes are
+// read through packed vectors, which carry no alignment of their own.
+void deq32_q6_K(device const shs_dense_block_q6_K *xb, short s, thread float4 *qv, thread float2 &ab) {
+    const uint n128 = (uint)s >> 2u;
+    const uint quarter = (uint)s & 3u;
+    device const packed_uchar4 *ql = (device const packed_uchar4 *)(xb->ql + n128 * 64u + (quarter & 1u) * 32u);
+    device const packed_uchar4 *qh = (device const packed_uchar4 *)(xb->qh + n128 * 32u);
+    const uchar ql_shift = (uchar)((quarter >> 1u) * 4u);
+    const uchar qh_shift = (uchar)(quarter * 2u);
+    const float sc0 = (float)((int)xb->scales[n128 * 8u + quarter * 2u]);
+    const float sc1 = (float)((int)xb->scales[n128 * 8u + quarter * 2u + 1u]);
+    ab = float2((float)xb->d, 0.0f);
+    for (short k = 0; k < 8; ++k) {
+        const uchar4 lo = (uchar4(ql[k]) >> ql_shift) & uchar(0x0F);
+        const uchar4 hi = (uchar4(qh[k]) >> qh_shift) & uchar(3);
+        const float4 v = float4(lo | (hi << uchar(4))) - 32.0f;
+        qv[k] = v * (k < 4 ? sc0 : sc1);
     }
 }
 
-// `epb` is elements per block and the dispatch template divides it by four to
-// get chunks per block, which is the same 256 the q4_K lines pass: both formats
-// carry 256 weights per block, so the chunking the matvec walks is unchanged.
-// The row-blocking constants come from the same function constants as the q4_K
-// path (indexes 600 and 601), because this is the same dispatch template.
-template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, shs_dense_block_q5_K, 256, dequantize_dense_q5_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, shs_dense_block_q5_K, 256, dequantize_dense_q5_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, shs_dense_block_q5_K, 256, dequantize_dense_q5_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, shs_dense_block_q5_K, 256, dequantize_dense_q5_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, shs_dense_block_q5_K, 256, dequantize_dense_q5_K_t4>;
+// The same K-quant dispatch the q4_K rows use, with its row-blocking constants
+// from the same function constants (indexes 600 and 601).
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_dense_block_q5_K, deq32_q5_K>;
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_dense_block_q5_K, deq32_q5_K>;
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_dense_block_q5_K, deq32_q5_K>;
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_dense_block_q5_K, deq32_q5_K>;
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_dense_block_q5_K, deq32_q5_K>;
 
-template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, shs_dense_block_q6_K, 256, dequantize_dense_q6_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, shs_dense_block_q6_K, 256, dequantize_dense_q6_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, shs_dense_block_q6_K, 256, dequantize_dense_q6_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, shs_dense_block_q6_K, 256, dequantize_dense_q6_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, shs_dense_block_q6_K, 256, dequantize_dense_q6_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_dense_block_q6_K, deq32_q6_K>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_dense_block_q6_K, deq32_q6_K>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_dense_block_q6_K, deq32_q6_K>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_dense_block_q6_K, deq32_q6_K>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_dense_block_q6_K, deq32_q6_K>;
 
 // One threadgroup per 256-element block of one row, exactly the shape of
 // `kernel_get_rows_q4_K_f32`, so the gather shares its argument block and its

@@ -73,3 +73,10 @@ fn the_dequantizers_produce_the_same_bits_they_always_have() {
     let Some(gpu) = open() else { return };
     cases::the_dequantizers_produce_the_same_bits_they_always_have(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn k_quant_matvec_batches_match_the_oracle_dot() {
+    let Some(gpu) = open() else { return };
+    cases::k_quant_matvec_batches_match_the_oracle_dot(&gpu);
+}

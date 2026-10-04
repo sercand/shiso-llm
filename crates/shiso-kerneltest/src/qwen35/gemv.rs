@@ -842,3 +842,227 @@ pub fn q4_k_matvec_matches_the_oracle_dot(gpu: &Gpu) {
         |row, e| oracle::dequant_q4_k_dense(&blocks[row], e),
     );
 }
+
+/// Blocks per row of the batched fixture. Two, so a lane walks into a second
+/// block and, for `q6_K`, reads a block that is only two-byte aligned: 210 is
+/// not a multiple of four, and every block after a row's first sits off a
+/// four-byte boundary.
+const BATCH_BLOCKS: usize = 2;
+/// Input width of the batched fixture.
+const BATCH_IN: usize = IN * BATCH_BLOCKS;
+
+/// One codec's host dequantizer, by block and element.
+type Dequant<'a> = Box<dyn Fn(usize, usize) -> f32 + 'a>;
+
+/// The three lane splits the engine dispatches, with the two-simdgroup block.
+const EXT_SPLITS: [(u32, [FnConst; 2]); 3] =
+    [(4, ext_split(4)), (8, ext_split(8)), (16, ext_split(16))];
+
+/// The specialization of one lane split.
+const fn ext_split(nxpsg: i16) -> [FnConst; 2] {
+    [
+        FnConst {
+            index: 600,
+            value: FnConstValue::I16(2),
+        },
+        FnConst {
+            index: 601,
+            value: FnConstValue::I16(nxpsg),
+        },
+    ]
+}
+
+/// Every K-quant matvec instantiation the engine reaches, against the oracle.
+///
+/// The cases above run one token at the sixteen-lane split, and a decode batch
+/// of two to five rows or a narrower input reaches the other fourteen
+/// instantiations per codec, which share the dispatch but not the row loop.
+/// Each row here is two blocks, the `q4_K` minimum is non-zero so the folded
+/// `- ml * sum(y)` term is graded, and the four-row blocking is also run over
+/// seven tokens so the tail threadgroup's guard is exercised.
+///
+/// # Panics
+///
+/// When a launch is refused or any output differs from the dot product of
+/// the host-dequantized row by more than [`oracle::TOL_QUANT`].
+pub fn k_quant_matvec_batches_match_the_oracle_dot(gpu: &Gpu) {
+    let q4: Vec<oracle::Q4K> = (0..OUT * BATCH_BLOCKS)
+        .map(|b| oracle::Q4K {
+            d: ONE_F16,
+            // 0.5: a minimum the kernel has to subtract.
+            dmin: 0x3800,
+            scales: K_SCALES,
+            qs: oracle::pack_q4_k_dense(&q4_values(b)),
+        })
+        .collect();
+    let q5: Vec<BlockQ5K> = (0..OUT * BATCH_BLOCKS)
+        .map(|b| pack_q5_k(&q5_values(b)))
+        .collect();
+    let q6: Vec<BlockQ6K> = (0..OUT * BATCH_BLOCKS)
+        .map(|b| pack_q6_k(&q6_values(b)))
+        .collect();
+    let q5_bytes: Vec<u8> = q5.iter().flat_map(bytemuck::bytes_of).copied().collect();
+    let q6_bytes: Vec<u8> = q6.iter().flat_map(bytemuck::bytes_of).copied().collect();
+
+    let codecs: [(&str, &'static str, Vec<u8>, Dequant<'_>); 3] = [
+        (
+            "q4_K",
+            "generic",
+            q4_k_bytes(&q4),
+            Box::new(|b, e| oracle::dequant_q4_k_dense(&q4[b], e)),
+        ),
+        (
+            "q5_K",
+            "qwen35",
+            q5_bytes,
+            Box::new(|b, e| dequant_q5_k(&q5[b], e)),
+        ),
+        (
+            "q6_K",
+            "qwen35",
+            q6_bytes,
+            Box::new(|b, e| dequant_q6_k(&q6[b], e)),
+        ),
+    ];
+    for (codec, module, bytes, dequant) in &codecs {
+        let rows: Vec<Vec<f32>> = (0..OUT)
+            .map(|row| {
+                (0..BATCH_IN)
+                    .map(|e| dequant(row * BATCH_BLOCKS + e / IN, e % IN))
+                    .collect()
+            })
+            .collect();
+        for r1 in 1..=5usize {
+            let tokens = if r1 == 4 { [4usize, 7] } else { [r1, r1] };
+            for (nxpsg, consts) in &EXT_SPLITS {
+                let entry = batched_entry(gpu, codec, r1, *nxpsg, consts);
+                for &n_tok in tokens.iter().take(if r1 == 4 { 2 } else { 1 }) {
+                    let x = oracle::signal(BATCH_IN * n_tok, 0x1234 + n_tok as u32);
+                    let got = batched_run(
+                        gpu,
+                        &BatchedDesc {
+                            module,
+                            entry,
+                            weight_bytes: bytes,
+                            x: &x,
+                            n_tok,
+                            r1,
+                            nxpsg: *nxpsg as usize,
+                        },
+                    );
+                    for tok in 0..n_tok {
+                        let xt = &x[tok * BATCH_IN..(tok + 1) * BATCH_IN];
+                        for (row, weights) in rows.iter().enumerate() {
+                            crate::assert_close!(
+                                got[tok * OUT + row],
+                                dot(weights, xt),
+                                oracle::TOL_QUANT,
+                                "{codec} r1={r1} nx={nxpsg} tokens={n_tok} token {tok} row {row}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The entry for one codec, row blocking and lane split, in this device's
+/// spelling.
+///
+/// Leaked because a kernel reference names its entry for the life of the
+/// process and these names are built rather than written out: sixty literals
+/// would be a second table of the engine's that could drift from it.
+fn batched_entry(
+    gpu: &Gpu,
+    codec: &str,
+    r1: usize,
+    nxpsg: u32,
+    consts: &'static [FnConst; 2],
+) -> (&'static str, &'static [FnConst]) {
+    if gpu.device().specializes_by_name() {
+        let name = format!("kernel_mul_mv_ext_{codec}_f32_r1_{r1}_nx{nxpsg}");
+        (Box::leak(name.into_boxed_str()), &[])
+    } else {
+        let name = format!("kernel_mul_mv_ext_{codec}_f32_r1_{r1}");
+        (Box::leak(name.into_boxed_str()), consts)
+    }
+}
+
+/// One launch of the batched fixture: the entry, the weights, the activation
+/// and the geometry the grid is built from.
+struct BatchedDesc<'a> {
+    module: &'static str,
+    entry: (&'static str, &'static [FnConst]),
+    weight_bytes: &'a [u8],
+    x: &'a [f32],
+    /// Token rows in `x`.
+    n_tok: usize,
+    /// Token rows one threadgroup takes, which the entry was built for.
+    r1: usize,
+    /// Lanes one output row's input is split over.
+    nxpsg: usize,
+}
+
+/// Launches the batched fixture and hands back `n_tok * OUT` outputs, token
+/// major.
+fn batched_run(gpu: &Gpu, desc: &BatchedDesc<'_>) -> Vec<f32> {
+    let BatchedDesc {
+        module,
+        entry,
+        weight_bytes,
+        x,
+        n_tok,
+        r1,
+        nxpsg,
+    } = *desc;
+    let row_bytes = (weight_bytes.len() / OUT) as u64;
+    let weights = gpu.upload(weight_bytes);
+    let src = gpu.upload(&f32_bytes(x));
+    let dst = gpu.upload(&vec![0u8; n_tok * OUT * 4]);
+    let args = MulMvExtArgs {
+        ne00: BATCH_IN as i32,
+        ne01: OUT as i32,
+        ne02: 1,
+        _pad0: 0,
+        nb00: row_bytes,
+        nb01: row_bytes,
+        nb02: row_bytes * OUT as u64,
+        nb03: row_bytes * OUT as u64,
+        ne10: BATCH_IN as i32,
+        ne11: n_tok as i32,
+        ne12: 1,
+        _pad1: 0,
+        nb10: 4,
+        nb11: (BATCH_IN * 4) as u64,
+        nb12: (BATCH_IN * 4 * n_tok) as u64,
+        nb13: (BATCH_IN * 4 * n_tok) as u64,
+        ne0: OUT as i32,
+        ne1: n_tok as i32,
+        r2: 1,
+        r3: 1,
+        _pad2: [0; 4],
+    };
+    let params = [
+        KernelArg::Bytes(bytemuck::bytes_of(&args)),
+        KernelArg::Buffer(weights.view()),
+        KernelArg::Buffer(src.view()),
+        KernelArg::Buffer(dst.view()),
+    ];
+    let rows_per_tg = (32 / nxpsg) * 2;
+    run(
+        gpu,
+        KernelRef::specialized(module, entry.0, entry.1),
+        &LaunchArgs::new(
+            Extent3::new(
+                OUT.div_ceil(rows_per_tg) as u32,
+                n_tok.div_ceil(r1) as u32,
+                1,
+            ),
+            Extent3::new(32, 2, 1),
+            &params,
+        ),
+    );
+    drain(gpu);
+    gpu.read_f32(&dst)
+}

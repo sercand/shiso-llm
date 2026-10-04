@@ -26,6 +26,7 @@ mod dims;
 mod encoder;
 mod loader;
 mod manifest;
+mod mmproj;
 
 pub use dims::VisionDims;
 pub use encoder::VisionEncoder;
@@ -108,7 +109,7 @@ impl Qwen35Tower {
             return Ok(VisionSource::TrellisShard(tower));
         }
         let (_, shard) = shiso_vision::open_checkpoint(dir)?;
-        if shard.is_file() {
+        if shard.is_some_and(|shard| shard.is_file()) {
             return Ok(VisionSource::OptiqDir(dir.to_path_buf()));
         }
         Ok(VisionSource::ModeloptDir(dir.to_path_buf()))

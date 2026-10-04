@@ -437,6 +437,39 @@ fn a_checkpoint_without_a_tower_says_so() {
     assert_eq!(backend.allocs(), 0, "nothing was uploaded");
 }
 
+/// A config that declares a tower but names no shard for it is refused by
+/// name. There is no conventional path to try: a guessed file that happened to
+/// exist would load a tower nobody named.
+#[test]
+fn a_checkpoint_that_names_no_shard_says_so() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut config: serde_json::Value =
+        serde_json::from_str(crate::qwen35::vision::testing::RECORDED_CONFIG)
+            .expect("the recorded config parses");
+    config
+        .as_object_mut()
+        .expect("the config is an object")
+        .remove("optiq_vision");
+    std::fs::write(
+        dir.path().join("config.json"),
+        serde_json::to_string(&config).expect("re-serialized"),
+    )
+    .expect("the config is written");
+    // The file the removed fallback used to name, present and ignored.
+    std::fs::create_dir(dir.path().join("optiq")).expect("the shard directory");
+    std::fs::write(dir.path().join("optiq/optiq_vision.safetensors"), b"")
+        .expect("the decoy is written");
+
+    let backend = FakeBackend::new();
+    let error = load_vision_weights(
+        &device(&backend),
+        &VisionSource::OptiqDir(dir.path().to_path_buf()),
+    )
+    .expect_err("no shard is named");
+    assert!(matches!(error, VisionError::NoTowerShard { .. }), "{error}");
+    assert_eq!(backend.allocs(), 0, "nothing was uploaded");
+}
+
 // -- the standalone container -----------------------------------------------
 
 /// A standalone tower of an architecture the contract says nothing about loads

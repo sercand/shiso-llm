@@ -318,6 +318,17 @@ pub enum VisionError {
         path: PathBuf,
     },
 
+    /// The checkpoint's config names no tower shard, and the source said the
+    /// tower is in one.
+    ///
+    /// There is no conventional path to try instead: the shard is wherever the
+    /// config's `optiq_vision.sidecar` says, or the operator names the file.
+    #[error("the config of the checkpoint at {path} names no vision tower shard")]
+    NoTowerShard {
+        /// The checkpoint directory that was asked.
+        path: PathBuf,
+    },
+
     /// The standalone tower carries neither spelling of the tower prefix.
     #[error("no vision tower found at {path} under {short:?} or {canonical:?}")]
     NoTowerPrefix {
