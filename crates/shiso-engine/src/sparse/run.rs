@@ -46,7 +46,7 @@ use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::model::{DecodeStep, Logits};
 
 use crate::sparse::ckpt::Boundary;
-use crate::sparse::kernels::{EXL3_RECONSTRUCT_ROWS, F32_BYTES, GDN_CHUNK};
+use crate::sparse::kernels::{F32_BYTES, GDN_CHUNK};
 use crate::sparse::media::MediaRun;
 use crate::sparse::passes::PassRole;
 use crate::sparse::ple::{PleGather, PleRows};
@@ -474,9 +474,18 @@ impl SparseStack {
             } else {
                 Boundary::Step
             };
-            let role = self.piece_role(session, start, head.len(), logit_rows, run.is_some())?;
-            let snapshot = role.snapshot();
-            self.run_rows_media(session, head, logit_rows, run.as_mut(), role)?;
+            let snapshot = if logit_rows > 0 && run.is_none() {
+                self.snapshot_row(session, start, head.len())?
+            } else {
+                None
+            };
+            self.run_rows_media(
+                session,
+                head,
+                logit_rows,
+                run.as_mut(),
+                PassRole::Prompt { snapshot },
+            )?;
             self.keep_rope_shift(session, run.as_ref());
             // A prompt that ends between two grid points is checkpointed at the
             // last one instead of at its end: a longer prompt continues from
@@ -529,50 +538,6 @@ impl SparseStack {
             rest = tail;
         }
         run.as_ref().map_or(Ok(()), every_row_consumed)
-    }
-
-    /// The role a piece of `rows` rows starting at `start` is read with.
-    ///
-    /// A prompt piece is a [`PassRole::Prompt`] pass, so that where the prompt
-    /// was cut moves no bit of any row. The exception is a scoring session's
-    /// short tail past its shared boundary (plan F3, scoring-prefill
-    /// throughput): a prompt-role pass of a few dozen rows rebuilds every dense
-    /// trellis weight to half precision, which is most of its time, and a
-    /// step-role pass of the same rows takes the 4-bit kernels instead. Its
-    /// rows then differ from a full-width prefill's by rounding - a 76-row
-    /// tail moved its logits by up to 0.16 but no probability by more than
-    /// 0.0023, inside the 0.01 probability budget the decision API absorbs,
-    /// with the top token unmoved - and nothing else reads them: a scoring
-    /// session's prompt end is never checkpointed.
-    ///
-    /// The boundary is the shared hint snapped down to the recurrence grid,
-    /// because that is where the shared checkpoint is taken (`shared_stop`)
-    /// and where every sibling resumes: the hint itself is a raw token count,
-    /// and a tail measured from it would almost never start past it. Every
-    /// piece below the grid point stays a prompt-role pass, so the checkpoint
-    /// siblings resume from is the row-invariant one. A non-scoring session's
-    /// `warm_until` is `u32::MAX` and never matches, but `scoring` is checked
-    /// first anyway. Tails wider than [`EXL3_RECONSTRUCT_ROWS`] reconstruct
-    /// either way and keep the prompt role, and so does a piece carrying media.
-    fn piece_role(
-        &self,
-        session: SessionId,
-        start: u32,
-        rows: usize,
-        logit_rows: u32,
-        media: bool,
-    ) -> CoreResult<PassRole> {
-        let live = self.session(session)?;
-        let boundary = live.warm_until - live.warm_until % GDN_CHUNK;
-        if live.scoring && !media && rows <= EXL3_RECONSTRUCT_ROWS as usize && start >= boundary {
-            return Ok(PassRole::Step);
-        }
-        let snapshot = if logit_rows > 0 && !media {
-            self.snapshot_row(session, start, rows)?
-        } else {
-            None
-        };
-        Ok(PassRole::Prompt { snapshot })
     }
 
     /// Records where a media chunk's walk left the rotary stream: whatever
