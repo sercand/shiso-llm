@@ -124,6 +124,9 @@ pub struct AppState {
     /// who names nothing is served, chosen by the operator at boot
     /// (`--image-default-size`, `--image-default-steps`).
     pub image_defaults: crate::image::ImageDefaults,
+    /// Whether the loaded model carries a schema decision head, which is what
+    /// answers `/v1/systemone` when it does.
+    pub decision_head: bool,
 }
 
 impl AppState {
@@ -146,6 +149,7 @@ impl AppState {
             audio: None,
             image: None,
             image_defaults: crate::image::ImageDefaults::default(),
+            decision_head: false,
         }
     }
 
@@ -169,6 +173,7 @@ impl AppState {
             audio: None,
             image: None,
             image_defaults: crate::image::ImageDefaults::default(),
+            decision_head: false,
         }
     }
 

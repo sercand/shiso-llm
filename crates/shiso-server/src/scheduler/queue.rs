@@ -48,7 +48,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use shiso_core::{SamplingParams, Seed, TokenId};
+use shiso_core::{DecisionQuestion, SamplingParams, Seed, TokenId};
 use shiso_ir::{EventStream, ServiceClass};
 use tokio::sync::{mpsc, oneshot};
 
@@ -296,6 +296,10 @@ pub struct ScoreRequest {
     /// A score is never keyed on the prefix cache, so these ride along for
     /// the media cache lookup in `encode_media` and nothing else.
     pub media_digests: Arc<[MediaDigest]>,
+    /// The schema a decision head scores, when this pass is answered by the
+    /// model's head rather than by label rows: spans of `prompt_tokens`, one
+    /// per question and one per option. `labels` is then empty.
+    pub decision: Option<Arc<[DecisionQuestion]>>,
 }
 
 impl ScoreRequest {
@@ -309,6 +313,17 @@ impl ScoreRequest {
             service_class: ServiceClass::Standard,
             media: Arc::from(Vec::new()),
             media_digests: Arc::from(Vec::new()),
+            decision: None,
+        }
+    }
+
+    /// A pass over `prompt_tokens` answered by the model's decision head over
+    /// `questions`, standard class, no media.
+    #[must_use]
+    pub fn decision(prompt_tokens: Arc<[TokenId]>, questions: Arc<[DecisionQuestion]>) -> Self {
+        Self {
+            decision: Some(questions),
+            ..Self::new(prompt_tokens, Arc::from(Vec::new()))
         }
     }
 
@@ -339,7 +354,11 @@ impl ScoreRequest {
 #[derive(Debug)]
 pub struct ScoreOutcome {
     /// The log-probability of each label, in the order the request gave them.
+    /// Empty for a decision pass.
     pub label_logprobs: Vec<f64>,
+    /// One logit per option, per question, for a decision pass; empty for a
+    /// label pass.
+    pub option_logits: Vec<Vec<f32>>,
 }
 
 /// The handlers' end of the boundary.
@@ -481,7 +500,11 @@ impl EngineHandle {
     /// engine thread is gone - a closed channel, or a reply dropped with the
     /// sequence that held it.
     pub async fn score(&self, request: ScoreRequest) -> Result<ScoreOutcome, AppError> {
-        if request.prompt_tokens.is_empty() || request.labels.is_empty() {
+        let unanswerable = match &request.decision {
+            Some(questions) => questions.is_empty(),
+            None => request.labels.is_empty(),
+        };
+        if request.prompt_tokens.is_empty() || unanswerable {
             return Err(AppError::bad_request(
                 "a scoring request needs a prompt and at least one label",
                 None,
