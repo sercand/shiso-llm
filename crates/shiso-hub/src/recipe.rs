@@ -389,8 +389,14 @@ pub enum Role {
     AsrMmproj,
     /// Speaker diarization model (`--diarization-model`).
     Diarization,
-    /// Image generation model (`image`, reserved).
+    /// Image generation model (`--image-model`): a checkpoint file or directory.
     Image,
+    /// Shared image assets directory (`--image-assets-dir`).
+    ///
+    /// For an image checkpoint that ships its transformer alone, such as an
+    /// FP8 export: the directory holds the `text_encoder`, `vae`, `tokenizer`
+    /// and `transformer/config.json` the generator reads beside the weights.
+    ImageAssets,
     /// Per-layer n-gram embedding table (`--ngram`).
     ///
     /// For a checkpoint that keeps the table in a file of its own rather than
@@ -418,6 +424,7 @@ impl Role {
             Self::AsrMmproj => "--asr-mmproj",
             Self::Diarization => "--diarization-model",
             Self::Image => "--image-model",
+            Self::ImageAssets => "--image-assets-dir",
             Self::Ngram => "--ngram",
             Self::Config => "--config",
         }
@@ -435,6 +442,7 @@ impl Role {
             Self::AsrMmproj => "asr_mmproj",
             Self::Diarization => "diarization",
             Self::Image => "image",
+            Self::ImageAssets => "image_assets",
             Self::Ngram => "ngram",
             Self::Config => "config",
         }
@@ -459,6 +467,7 @@ impl FromStr for Role {
             "asr_mmproj" => Ok(Self::AsrMmproj),
             "diarization" => Ok(Self::Diarization),
             "image" => Ok(Self::Image),
+            "image_assets" => Ok(Self::ImageAssets),
             "ngram" => Ok(Self::Ngram),
             "config" => Ok(Self::Config),
             _ => Err(HubError::Validation {

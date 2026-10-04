@@ -188,6 +188,8 @@ fn check_component_flag_conflicts(args: &ServeArgs, ref_str: &str) -> anyhow::Re
         || args.asr_model.is_some()
         || args.asr_mmproj.is_some()
         || args.diarization_model.is_some()
+        || args.image_model.is_some()
+        || args.image_assets_dir.is_some()
     {
         bail!("cannot pass component flags together with model reference '{ref_str}'");
     }
@@ -272,8 +274,13 @@ fn populate_serve_args_from_variant(
             Role::Diarization => args.diarization_model = Some(target_path),
             Role::Config => args.config = Some(target_path),
             Role::Ngram => args.ngram = Some(target_path),
-            Role::Image => bail!("model uses 'image' role which is not supported by serve"),
+            Role::Image => args.image_model = Some(target_path),
+            Role::ImageAssets => args.image_assets_dir = Some(target_path),
         }
+    }
+
+    if args.image_model.is_some() && args.image_model_id.is_none() {
+        args.image_model_id = Some(recipe_name.to_string());
     }
 
     if args.model_name.is_none() {
@@ -823,5 +830,49 @@ mod tests {
         assert_eq!(args.config, None);
         assert_eq!(args.config_path(), vdir.join("base").join("config.json"));
         assert_eq!(args.draft_model, None);
+    }
+
+    /// An image variant hands its checkpoint file to `--image-model`, its
+    /// asset tree to `--image-assets-dir`, and answers to the recipe's name.
+    #[test]
+    fn image_variant_resolves_to_model_and_assets() {
+        let recipe: Recipe = serde_json::from_str(
+            r#"{
+              "schema_version": 1, "name": "flux-test", "family": "flux2",
+              "min_shiso_version": "0.1.0", "description": "x",
+              "tasks": ["image_generation"], "features": {},
+              "modalities": {"inputs": ["text"], "outputs": ["image"]},
+              "variants": [{
+                "key": "fp8", "backends": ["metal"], "quant": "fp8",
+                "requirements": {"min_ram_bytes": 1, "disk_bytes": 20},
+                "components": {
+                  "image": {"provider": "huggingface", "repo": "o/fp8",
+                    "revision": "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c",
+                    "entry": "model.safetensors",
+                    "files": [{"name": "model.safetensors", "size": 10,
+                      "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]},
+                  "image_assets": {"provider": "huggingface", "repo": "o/bf16",
+                    "revision": "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c",
+                    "files": [{"name": "vae/config.json", "size": 10,
+                      "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]}
+                }
+              }]
+            }"#,
+        )
+        .expect("recipe parses");
+        validate_recipe(&recipe, ValidationMode::Strict).expect("recipe validates");
+        let matches = Cli::command().get_matches_from(["shiso", "serve"]);
+        let serve = matches.subcommand_matches("serve").expect("serve");
+        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
+        let vdir = Path::new("/hub/models/flux-test/fp8");
+        populate_serve_args_from_variant(&mut args, vdir, &recipe.variants[0], &recipe.name)
+            .expect("populates");
+        assert_eq!(
+            args.image_model,
+            Some(vdir.join("image").join("model.safetensors"))
+        );
+        assert_eq!(args.image_assets_dir, Some(vdir.join("image_assets")));
+        assert_eq!(args.image_model_id.as_deref(), Some("flux-test"));
+        assert_eq!(args.model, None);
     }
 }

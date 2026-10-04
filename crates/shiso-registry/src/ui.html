@@ -676,6 +676,7 @@ function renderVariantsList() {
               <option value="diarization">diarization</option>
               <option value="draft_vocab">draft_vocab</option>
               <option value="image">image</option>
+              <option value="image_assets">image_assets</option>
               <option value="config">config</option>
               <option value="ngram">ngram</option>
             </select>
@@ -924,7 +925,7 @@ function updateCompRev(vIdx, role, val) {
 }
 
 // Roles a file can hand itself to with `binds`: the flag-bearing ones.
-const BINDABLE_ROLES = ['base', 'draft', 'draft_vocab', 'vision', 'asr', 'asr_mmproj', 'diarization', 'config', 'ngram'];
+const BINDABLE_ROLES = ['base', 'draft', 'draft_vocab', 'vision', 'asr', 'asr_mmproj', 'diarization', 'image', 'config', 'ngram'];
 
 // The `binds` dropdown for one file: which other role's flag it is passed to.
 // Disabled for a file that is not selected, since only selected files are

@@ -539,3 +539,89 @@ fn ngram_role_names_its_flag_and_must_name_a_file() {
     recipe.variants = vec![variant];
     validate_recipe(&recipe, ValidationMode::Strict).unwrap();
 }
+
+/// An FP8 transformer file from one repository and the BF16 tree's text
+/// encoder, VAE and tokenizer from another, as a directory.
+fn image_variant() -> Variant {
+    let file = |name: &str| FileEntry {
+        name: name.to_string(),
+        size: 10,
+        sha256: Sha256::parse("4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a")
+            .unwrap(),
+        binds: None,
+    };
+    let component = |repo: &str, entry: Option<&str>, files: Vec<FileEntry>| Component {
+        provider: "huggingface".to_string(),
+        repo: repo.to_string(),
+        revision: CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap(),
+        entry: entry.map(str::to_string),
+        files,
+    };
+    let mut components = BTreeMap::new();
+    components.insert(
+        Role::Image,
+        component(
+            "shiso/test-fp8",
+            Some("model-fp8.safetensors"),
+            vec![file("model-fp8.safetensors")],
+        ),
+    );
+    components.insert(
+        Role::ImageAssets,
+        component(
+            "shiso/test-bf16",
+            None,
+            vec![
+                file("transformer/config.json"),
+                file("vae/config.json"),
+                file("tokenizer/tokenizer.json"),
+            ],
+        ),
+    );
+    Variant {
+        key: VariantKey::parse("fp8").unwrap(),
+        backends: vec![Backend::Metal, Backend::Cuda],
+        quant: "fp8".to_string(),
+        requires: None,
+        requirements: Requirements {
+            min_ram_bytes: 1,
+            recommended_ram_bytes: None,
+            min_vram_bytes: None,
+            disk_bytes: 40,
+        },
+        components,
+        server_defaults: None,
+    }
+}
+
+#[test]
+fn image_assets_role_is_a_directory_beside_an_image() {
+    assert_eq!("image_assets".parse::<Role>().unwrap(), Role::ImageAssets);
+    assert_eq!(Role::ImageAssets.flag_name(), "--image-assets-dir");
+    let mut recipe = make_test_recipe();
+    recipe.variants = vec![image_variant()];
+    validate_recipe(&recipe, ValidationMode::Strict).unwrap();
+
+    // A file is not a directory the locator can search.
+    let mut variant = image_variant();
+    variant
+        .components
+        .get_mut(&Role::ImageAssets)
+        .unwrap()
+        .entry = Some("vae/config.json".to_string());
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("directory"), "{err}");
+
+    // Assets with no image model have nothing to feed.
+    let mut variant = image_variant();
+    let assets = variant.components.remove(&Role::ImageAssets).unwrap();
+    variant.components.remove(&Role::Image);
+    variant.components.insert(Role::ImageAssets, assets);
+    variant.components.insert(
+        Role::Base,
+        make_test_recipe().variants[0].components[&Role::Base].clone(),
+    );
+    recipe.variants = vec![variant];
+    assert!(validate_recipe(&recipe, ValidationMode::Strict).is_err());
+}

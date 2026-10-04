@@ -152,6 +152,7 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
     let has_draft_vocab = roles.contains_key(&Role::DraftVocab);
     let has_asr_mmproj = roles.contains_key(&Role::AsrMmproj);
     let has_diarization = roles.contains_key(&Role::Diarization);
+    let has_image = roles.contains_key(&Role::Image);
 
     // `--config` and `--ngram` name files; a directory there would be read as
     // one and fail at boot, so the recipe has to say which file it is.
@@ -168,7 +169,19 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
         }
     }
 
-    if !has_base && !has_asr && !roles.contains_key(&Role::Image) {
+    // `--image-assets-dir` names a directory; a file there finds nothing.
+    if let Some(place) = roles.get(&Role::ImageAssets)
+        && place.file.is_some()
+    {
+        return Err(HubError::Validation {
+            reason: format!(
+                "variant '{}' role 'image_assets' must be a directory: no 'entry' or 'binds'",
+                variant.key.as_str()
+            ),
+        });
+    }
+
+    if !has_base && !has_asr && !has_image {
         return Err(HubError::Validation {
             reason: format!(
                 "variant '{}' must contain a 'base' component unless it has 'asr' or 'image'",
@@ -206,6 +219,15 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
         return Err(HubError::Validation {
             reason: format!(
                 "variant '{}' supplies 'asr_mmproj' which requires 'asr'",
+                variant.key.as_str()
+            ),
+        });
+    }
+
+    if roles.contains_key(&Role::ImageAssets) && !has_image {
+        return Err(HubError::Validation {
+            reason: format!(
+                "variant '{}' supplies 'image_assets' which requires 'image'",
                 variant.key.as_str()
             ),
         });
