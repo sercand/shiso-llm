@@ -290,6 +290,10 @@ impl RotationPlan {
     /// through, for a geometry of `key_heads` key heads, `value_heads` value
     /// heads of `head_dim`.
     ///
+    /// `None` is not a refusal: it means the value heads do not repeat the key
+    /// heads, so tiled and grouped order are the same order and there is
+    /// nothing to permute.
+    ///
     /// # Errors
     ///
     /// [`CoreError::InvalidValue`] when the value heads repeat the key heads
