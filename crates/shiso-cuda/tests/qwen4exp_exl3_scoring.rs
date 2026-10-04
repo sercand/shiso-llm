@@ -128,7 +128,8 @@ fn a_scoring_session_reads_the_row_a_plain_one_reads() {
 /// scoring request's questions run.
 ///
 /// `SCORING_PROFILE_TOKENS` sets the prompt width (34 by default) and
-/// `SCORING_PROFILE_PASSES` the timed passes (5); one untimed pass warms the
+/// `SCORING_PROFILE_PASSES` the timed passes (5); `SCORING_PROFILE_DRAFT=0`
+/// loads the export without its draft head; one untimed pass warms the
 /// kernels first.
 #[test]
 #[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
@@ -136,7 +137,8 @@ fn a_scoring_session_reads_the_row_a_plain_one_reads() {
 fn time_a_short_prefill() {
     let backend: Arc<dyn Backend> =
         CudaBackend::new(0, CudaOptions::default()).expect("a CUDA device");
-    let Some(mut model) = load_served(&backend, true) else {
+    let draft = std::env::var("SCORING_PROFILE_DRAFT").map_or(true, |v| v != "0");
+    let Some(mut model) = load_served(&backend, draft) else {
         skip("no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
         return;
     };
@@ -156,7 +158,7 @@ fn time_a_short_prefill() {
         let ms = started.elapsed().as_secs_f64() * 1e3;
         model.close_session(session).expect("closes");
         let label = if pass == 0 { "warm-up" } else { "timed" };
-        println!("PREFILL tokens={width} pass={pass} {label} ms={ms:.2}");
+        println!("PREFILL draft={draft} tokens={width} pass={pass} {label} ms={ms:.2}");
     }
     model.teardown().expect("the model tears down");
 }
