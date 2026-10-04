@@ -17,6 +17,7 @@
 pub mod audio_ops;
 pub mod audio_registry;
 pub mod catalog;
+pub mod clef;
 pub mod flux2;
 pub mod gemma4;
 pub mod image_registry;

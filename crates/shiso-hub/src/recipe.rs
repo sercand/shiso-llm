@@ -491,6 +491,8 @@ pub enum Task {
     ImageGeneration,
     /// Text or multimodal embeddings.
     Embedding,
+    /// Schema decisions answered by a decision head.
+    Decision,
 }
 
 impl Task {
@@ -503,6 +505,7 @@ impl Task {
             Self::Diarization => "diarization",
             Self::ImageGeneration => "image_generation",
             Self::Embedding => "embedding",
+            Self::Decision => "decision",
         }
     }
 }
@@ -522,6 +525,7 @@ impl FromStr for Task {
             "diarization" => Ok(Self::Diarization),
             "image_generation" => Ok(Self::ImageGeneration),
             "embedding" => Ok(Self::Embedding),
+            "decision" => Ok(Self::Decision),
             _ => Err(HubError::Validation {
                 reason: format!("unknown task '{s}'"),
             }),

@@ -62,6 +62,16 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     let questions = parsed.validate()?;
     let kwargs = TemplateKwargs::from_wire(kwargs_wire)?;
 
+    // A decision checkpoint answers every question from one prompt through
+    // its head, at the caller's temperature.
+    if state.decision_head {
+        let text = crate::decision::clef::input_text(&input)?;
+        let (answers, prompt_tokens) =
+            crate::decision::clef::run(state, &text, questions, temperature, want_token_ids)
+                .await?;
+        return Ok(Json(encode(model, &answers, prompt_tokens, want_token_ids)).into_response());
+    }
+
     // Every question is prepared before any is scored: a refusal to score the
     // third question should reach the caller as a refusal, not as a partial
     // answer with the first two questions already paid for.
