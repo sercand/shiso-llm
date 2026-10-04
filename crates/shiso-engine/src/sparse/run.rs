@@ -350,10 +350,17 @@ impl SparseStack {
     ///
     /// Every row is the row [`SparseStack::prefill_last`] would leave for that
     /// session and those tokens, and every session ends where that read would
-    /// leave it - but for the draft head's cache, which is not warmed over the
-    /// tail: a scoring session's tail is never drafted from, and is never
-    /// checkpointed (its prompt end is answered and dropped, and the refusals
-    /// below keep every run clear of a boundary that would be).
+    /// leave it - but for the draft head's cache, which this pass does not
+    /// write. A solo read writes it twice: over the tail (which
+    /// `warm_draft_below_boundary` skips for a scoring session's tail anyway),
+    /// and, through `warm_draft_boundary`, at the position before the tail -
+    /// the prefix's last position - from the staged row the prefix left. Both
+    /// writes are harmless to skip here: a scoring session's tail is never
+    /// drafted from, so nothing reads the head's cache at or past the
+    /// prefix's last position, and the tail is never checkpointed (its prompt
+    /// end is answered and dropped, and the refusals below keep every run
+    /// clear of a boundary that would be), so no checkpoint carries the
+    /// difference to a later session.
     ///
     /// # Errors
     ///
@@ -361,8 +368,11 @@ impl SparseStack {
     /// every session as it stood: [`CoreError::Unsupported`] for a session that
     /// is not scoring or carries media, a run inside which this session's own
     /// read would stop to take a checkpoint, more runs than
-    /// [`MAX_PROMPT_RUNS`] or more rows than one prefill chunk - all of which
-    /// a caller reads one session at a time instead;
+    /// [`MAX_PROMPT_RUNS`] or more rows than one prefill chunk, and a build
+    /// whose chunked recurrence is off or unavailable (its solo reads walk the
+    /// sequential kernel, which a segmented pass runs only through per-row
+    /// arrays it does not pack) - all of which a caller reads one session at
+    /// a time instead;
     /// [`CoreError::ContextOverflow`]; [`CoreError::ShapeMismatch`] for no runs
     /// or an empty one; [`CoreError::InvalidValue`] for a session named twice;
     /// and whatever the pass reports.
@@ -432,6 +442,15 @@ impl SparseStack {
                 field: "batched prompt runs",
                 expected: 1,
                 got: 0,
+            });
+        }
+        // Each run's recurrence is the chunked one its solo read takes; with
+        // that kernel off, the pass would fall to the verify's segmented walk,
+        // which reads per-row pointer arrays this pass never packs.
+        if self.opts.chunk.min_rows == 0 || !self.opts.chunk.available {
+            return Err(CoreError::Unsupported {
+                what: "a batched prompt pass on a build whose chunked recurrence is off",
+                backend: "engine",
             });
         }
         if runs.len() > MAX_PROMPT_RUNS as usize {

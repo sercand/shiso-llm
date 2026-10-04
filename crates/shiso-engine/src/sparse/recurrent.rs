@@ -563,9 +563,13 @@ impl RunSpan {
 ///
 /// A solo prompt read takes the chunked kernels at every width (its tier width
 /// is unbounded), and the sequential walk a verify takes sums differently - the
-/// one launch the spike found differing. The decision is the solo read's own,
-/// so a build with the chunked kernel off (`--chunk-min-rows 0`) keeps the
-/// segmented kernels, which then match its solo reads.
+/// one launch the spike found differing. The decision is the solo read's own.
+///
+/// A build with the chunked kernel off or unavailable gets `None` here and
+/// would fall to the verify's segmented kernels, which read the per-row
+/// pointer arrays a prompt pass never packs - so
+/// [`crate::sparse::stack::SparseStack::prefill_segments`] refuses such a
+/// build before planning, and this fallback is never what a prompt pass runs.
 fn prompt_runs(policy: &Recurrence, device: Device) -> Option<Segments> {
     let RowOrigin::Segmented(runs) = policy.origin else {
         return None;
@@ -574,7 +578,9 @@ fn prompt_runs(policy: &Recurrence, device: Device) -> Option<Segments> {
         origin: RowOrigin::Sequential,
         ..*policy
     };
-    (device.row_invariant() && solo.takes_chunk(device.tier_rows(runs.len(0)))).then_some(runs)
+    // The width a row-invariant pass decides tiers at, whatever its rows: the
+    // solo read of any run decides at this same width.
+    (device.row_invariant() && solo.takes_chunk(device.tier_rows(u32::MAX))).then_some(runs)
 }
 
 /// One run's convolution: the parallel convolution and the window rewrite its

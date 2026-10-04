@@ -1152,49 +1152,118 @@ fn a_batched_prompt_pass_advances_each_session_by_its_own_tail() {
     }
 }
 
+/// Pages the cache's pool holds right now.
+fn pages_used(model: &shiso_models::qwen4exp::Qwen4ExpModel) -> u32 {
+    model
+        .stack()
+        .cache_stats()
+        .expect("a resident stack")
+        .pages_used
+}
+
+/// Every refusal leaves every session where it stood and the pool holding
+/// what it held. The prefixes end eight positions short of a page, so a run
+/// that claimed before refusing would show as a page more.
 #[test]
 fn a_batched_prompt_pass_refuses_before_it_claims_anything() {
     use shiso_core::CoreError;
-    let (_dir, _fake, mut model) = loaded();
-    let sessions = scoring_sessions(&mut model, &[64, 64]);
+    type Runs<'a> = Vec<(shiso_core::SessionId, &'a [shiso_core::TokenId])>;
+    const PREFIX: u32 = shiso_core::page::PAGE_TOKENS - 8;
+    // Room for every claim a wrong order would make, so that one shows up as
+    // a page held rather than as the pool running dry.
+    let mut opts = fixture::options();
+    opts.engine.kv_pool_pages += 8;
+    let (_dir, _fake, mut model) = loaded_with(opts);
+    let sessions = scoring_sessions(&mut model, &[PREFIX, PREFIX]);
     let plain = model.open_session().expect("a session opens");
     model
-        .prefill_chunk(plain, &tokens(0, 64))
+        .prefill_chunk(plain, &tokens(0, PREFIX))
         .expect("the prefix reads");
     let far = scoring_sessions(&mut model, &[CTX - 8])[0];
     let tail = tokens(9, 16);
-
-    let error = model
-        .stack_mut()
-        .prefill_segments(&[(sessions[0], &tail), (plain, &tail)])
-        .expect_err("a plain session is read alone");
-    assert!(matches!(error, CoreError::Unsupported { .. }), "{error:?}");
-
     let wide = tokens(0, model.stack().prefill_rows() / 2 + 1);
-    let error = model
-        .stack_mut()
-        .prefill_segments(&[(sessions[0], &wide), (sessions[1], &wide)])
-        .expect_err("wider than one prefill chunk");
-    assert!(matches!(error, CoreError::Unsupported { .. }), "{error:?}");
+    let held = pages_used(&model);
 
-    let error = model
-        .stack_mut()
-        .prefill_segments(&[(sessions[1], &tail), (far, &tail)])
-        .expect_err("past the context");
-    assert!(
-        matches!(error, CoreError::ContextOverflow { .. }),
-        "{error:?}"
-    );
+    let cases: [(&str, Runs<'_>); 3] = [
+        (
+            "a plain session is read alone",
+            vec![(sessions[0], &tail), (plain, &tail)],
+        ),
+        (
+            "wider than one prefill chunk",
+            vec![(sessions[0], &wide), (sessions[1], &wide)],
+        ),
+        ("past the context", vec![(sessions[1], &tail), (far, &tail)]),
+    ];
+    for (what, runs) in cases {
+        let error = model.stack_mut().prefill_segments(&runs).expect_err(what);
+        if what == "past the context" {
+            assert!(
+                matches!(error, CoreError::ContextOverflow { .. }),
+                "{what}: {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, CoreError::Unsupported { .. }),
+                "{what}: {error:?}"
+            );
+        }
+        assert_eq!(pages_used(&model), held, "{what}: no page claimed");
+    }
 
     for (session, written) in [
-        (sessions[0], 64),
-        (sessions[1], 64),
-        (plain, 64),
+        (sessions[0], PREFIX),
+        (sessions[1], PREFIX),
+        (plain, PREFIX),
         (far, CTX - 8),
     ] {
         assert_eq!(
             model.stack().session(session).expect("open").written(),
             written
         );
+    }
+}
+
+/// A build whose chunked recurrence is off reads every scoring tail alone:
+/// its solo reads walk the sequential kernel, which a segmented pass runs only
+/// through per-row pointer arrays a prompt pass never packs. Refused before
+/// anything is claimed.
+#[test]
+fn a_batched_prompt_pass_refuses_a_build_without_the_chunked_recurrence() {
+    use shiso_core::CoreError;
+    use shiso_engine::sparse::recurrent::ChunkPolicy;
+    const PREFIX: u32 = shiso_core::page::PAGE_TOKENS - 8;
+    for chunk in [
+        ChunkPolicy {
+            min_rows: 0,
+            ..ChunkPolicy::new()
+        },
+        ChunkPolicy {
+            available: false,
+            ..ChunkPolicy::new()
+        },
+    ] {
+        let (_dir, _fake, mut model) = loaded_with(shiso_engine::sparse::stack::SparseOptions {
+            chunk,
+            ..fixture::options()
+        });
+        let sessions = scoring_sessions(&mut model, &[PREFIX, PREFIX]);
+        let tail = tokens(9, 16);
+        let held = pages_used(&model);
+        let error = model
+            .stack_mut()
+            .prefill_segments(&[(sessions[0], &tail), (sessions[1], &tail)])
+            .expect_err("no chunked recurrence to run each run's tail with");
+        assert!(
+            matches!(error, CoreError::Unsupported { .. }),
+            "{chunk:?}: {error:?}"
+        );
+        assert_eq!(pages_used(&model), held, "{chunk:?}: no page claimed");
+        for session in sessions {
+            assert_eq!(
+                model.stack().session(session).expect("open").written(),
+                PREFIX
+            );
+        }
     }
 }
