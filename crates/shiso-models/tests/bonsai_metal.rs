@@ -213,3 +213,107 @@ fn every_encoding_answers_and_they_agree() {
         assert_eq!(first_ids, ids, "{label} disagrees with mlx-2bit on a top-1");
     }
 }
+
+/// Tokens the drafted and the serial continuation run to.
+const DRAFT_STEPS: usize = 64;
+
+/// A turn long enough for drafting to show what it is worth.
+const DRAFT_PROMPT: &str = "<|im_start|>user\nWrite a Python function that returns the n-th Fibonacci number iteratively, with a docstring.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+/// The rotated 2-bit GGUF with the block drafter's GGUF beside it: drafting
+/// changes how many tokens a step commits, never which, so the drafted greedy
+/// continuation is the serial one id for id. Also prints tokens a round.
+///
+/// `SHISO_TEST_DRAFT_BONSAI=<drafter gguf>` on top of the variables above.
+#[test]
+#[ignore = "needs the local rotated checkpoint, the drafter and a Metal device"]
+fn drafted_greedy_is_serial_greedy() {
+    let Some((mlx, Some(pq2), _)) = paths() else {
+        say("SKIP: needs SHISO_TEST_MODEL_BONSAI_MLX and SHISO_TEST_MODEL_BONSAI_PQ2");
+        return;
+    };
+    let Some(draft) = std::env::var("SHISO_TEST_DRAFT_BONSAI")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+    else {
+        say("SKIP: SHISO_TEST_DRAFT_BONSAI names no file");
+        return;
+    };
+    let Some(backend) = device() else { return };
+    let tok = tokenizer(&mlx);
+    let prompt = encode(&tok, DRAFT_PROMPT);
+    let config =
+        Qwen35Config::from_hf(&HfConfig::from_file(&mlx.join("config.json")).expect("config"))
+            .expect("this family");
+    let open = |spec: bool| {
+        let mut opts = EngineOptions::default();
+        opts.ctx = 2048;
+        opts.kv_pool_pages = 64;
+        if spec {
+            opts.spec = shiso_engine::mtp::SpecDepth::new(7);
+        }
+        Qwen35Model::load(&backend, &pq2, &config, opts).expect("the checkpoint loads")
+    };
+    let vocab = config.shape().vocab;
+
+    let mut model = open(false);
+    let session = model.open_session().expect("a session");
+    let first = {
+        let last = model.prefill_last(session, &prompt).expect("prompt");
+        argmax(&row(&backend, last.row(0).expect("row"), vocab))
+    };
+    let mut serial = vec![first];
+    let clock = Instant::now();
+    while serial.len() < DRAFT_STEPS {
+        let token = *serial.last().expect("a token");
+        let out = model
+            .decode_batch(&[DecodeStep { session, token }])
+            .expect("a step");
+        serial.push(argmax(&row(&backend, out.row(0).expect("row"), vocab)));
+    }
+    let serial_secs = clock.elapsed().as_secs_f64();
+    model.close_session(session).expect("close");
+    model.teardown().expect("teardown");
+    drop(model);
+
+    let mut model = open(true);
+    model
+        .bind_block_drafter(&backend, &draft)
+        .expect("the GGUF drafter binds");
+    let session = model.open_session().expect("a session");
+    let first = {
+        let last = model.prefill_last(session, &prompt).expect("prompt");
+        argmax(&row(&backend, last.row(0).expect("row"), vocab))
+    };
+    let mut drafted = vec![first];
+    let mut rounds = 0_u32;
+    let clock = Instant::now();
+    while drafted.len() < DRAFT_STEPS {
+        let token = *drafted.last().expect("a token");
+        let spec = model
+            .spec_mut()
+            .expect("the drafter makes this model speculative");
+        let step = spec.speculate(session, token).expect("a speculative step");
+        rounds += 1;
+        drafted.extend_from_slice(&step.produced);
+    }
+    let drafted_secs = clock.elapsed().as_secs_f64();
+    model.close_session(session).expect("close");
+    model.teardown().expect("teardown");
+    drafted.truncate(DRAFT_STEPS);
+
+    let steps = f64::from(u32::try_from(DRAFT_STEPS - 1).unwrap_or(0));
+    say(&format!(
+        "serial {:.2} tok/s; drafted {:.2} tok/s, {:.2} tokens/round over {rounds} rounds",
+        steps / serial_secs,
+        steps / drafted_secs,
+        steps / f64::from(rounds)
+    ));
+    let raw: Vec<u32> = serial.iter().map(|t| t.get()).collect();
+    say(&format!(
+        "serial: {:?}",
+        tok.decode(&raw, false).expect("decodes")
+    ));
+    assert_eq!(serial, drafted, "drafted greedy parted from serial greedy");
+}

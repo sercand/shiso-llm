@@ -12,6 +12,13 @@
 //! packed weights at an eighth of the bytes a `bfloat16` matrix would stream.
 //! A drafter only proposes, so the precision this costs is paid in acceptance,
 //! never in the answer.
+//!
+//! The same drafter also ships as one GGUF file (architecture `dflash`), its
+//! projections already block-quantized. That container is read as stored -
+//! the projections stay in their `q4_K`/`q6_K` blocks and its selector
+//! codebooks stay `q4_K`, decoded a row at a time as candidates are scored -
+//! with one translation: the file counts its taps from the embedding, so
+//! hidden state `n` there is the output of layer `n - 1` here.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -25,7 +32,7 @@ use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::TokenId;
 use shiso_engine::attn::Attn;
 use shiso_engine::block_draft::{
-    BlockDraftLayer, BlockDraftParts, BlockDraftShape, Codebook, DynConv,
+    BlockDraftLayer, BlockDraftParts, BlockDraftShape, Codebook, CodebookRows, DynConv,
 };
 use shiso_engine::ffn::Ffn;
 use shiso_engine::projection::Weight;
@@ -74,9 +81,18 @@ struct DraftConfig {
     vocab_size: u32,
 }
 
-/// Whether `dir` holds a block drafter this loader reads.
+/// The `general.architecture` of the drafter's GGUF container.
+pub const GGUF_ARCHITECTURE: &str = "dflash";
+
+/// Whether `path` holds a block drafter this loader reads: a directory with
+/// the drafter's config, or a GGUF file of its architecture.
 #[must_use]
-pub fn is_block_drafter(dir: &Path) -> bool {
+pub fn is_block_drafter(path: &Path) -> bool {
+    if path.is_file() {
+        return shiso_modelfile::GgufFile::open(path)
+            .is_ok_and(|file| file.metadata().architecture() == Some(GGUF_ARCHITECTURE));
+    }
+    let dir = path;
     std::fs::read_to_string(dir.join("config.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -174,6 +190,9 @@ pub fn load(
     dir: &Path,
     target: (u32, u32, u32),
 ) -> CoreResult<BlockDraftParts> {
+    if dir.is_file() {
+        return crate::qwen35::block_draft_gguf::load(backend, dir, target);
+    }
     let (target_hidden, target_layers, target_vocab) = target;
     let text = std::fs::read_to_string(dir.join("config.json")).map_err(|err| {
         CoreError::InvalidValue {
@@ -243,7 +262,10 @@ pub fn load(
                 got: u64::from(rank),
             });
         }
-        Ok(Codebook { rank, values })
+        Ok(Codebook {
+            rank,
+            rows: CodebookRows::Bf16(values),
+        })
     };
     let parts = BlockDraftParts {
         fc: linear(backend, &t, "fc.weight")?,

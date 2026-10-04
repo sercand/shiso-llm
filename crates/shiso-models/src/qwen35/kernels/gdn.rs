@@ -477,9 +477,12 @@ pub(super) fn run(
             // each store instruction scatters over 32 lines; measured on the
             // dense 27B with a block drafter, that shape spent 417 us a layer
             // writing an eight-row trail - 19 ms of a 145 ms verify step.
+            //
+            // Where the device takes four lanes a column; see
+            // `gdn_tune::recorder_for` for what it falls back to and why.
             let recorder = match shape.recurrent {
                 gdn_tune::Variant::S1 | gdn_tune::Variant::S2 | gdn_tune::Variant::S4 => {
-                    gdn_tune::Variant::S4
+                    shape.recorder
                 }
                 other => other,
             };

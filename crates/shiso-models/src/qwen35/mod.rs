@@ -59,6 +59,7 @@
 
 mod binding;
 pub mod block_draft;
+mod block_draft_gguf;
 mod ckpt;
 mod config;
 mod kernels;

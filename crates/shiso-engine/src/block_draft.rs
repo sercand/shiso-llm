@@ -170,25 +170,51 @@ pub struct BlockDraftLayer {
     pub mlp_conv: DynConv,
 }
 
-/// A `[vocab][rank]` table held on the host as `bfloat16`.
+/// A `[vocab][rank]` table held on the host.
+///
+/// Read a row at a time, for the handful of candidates a drafted position
+/// scores, so it stays in whatever form its checkpoint stored it.
 #[derive(Debug, Clone)]
 pub struct Codebook {
     /// Values per row.
     pub rank: u32,
     /// Rows, back to back.
-    pub values: Vec<u16>,
+    pub rows: CodebookRows,
 }
 
+/// How a [`Codebook`]'s rows are stored.
+#[derive(Debug, Clone)]
+pub enum CodebookRows {
+    /// `bfloat16` bit patterns, `rank` a row.
+    Bf16(Vec<u16>),
+    /// `q4_K` super-blocks, exactly one a row: the codebook's rank is 256.
+    Q4K(Vec<u8>),
+}
+
+/// Bytes of one `q4_K` super-block.
+const Q4K_BLOCK_BYTES: usize = size_of::<shiso_modelfile::quant::BlockQ4K>();
+
 impl Codebook {
-    /// Row `id`, widened.
-    fn row(&self, id: u32) -> impl Iterator<Item = f32> + '_ {
+    /// Row `id`, widened. An id past the table reads as an empty row, which
+    /// scores a candidate on its logit alone.
+    fn row(&self, id: u32) -> Vec<f32> {
         let rank = self.rank as usize;
-        let at = id as usize * rank;
-        self.values
-            .get(at..at + rank)
-            .unwrap_or(&[])
-            .iter()
-            .map(|&bits| half_to_f32(bits))
+        let id = id as usize;
+        match &self.rows {
+            CodebookRows::Bf16(values) => values
+                .get(id * rank..(id + 1) * rank)
+                .unwrap_or(&[])
+                .iter()
+                .map(|&bits| half_to_f32(bits))
+                .collect(),
+            CodebookRows::Q4K(bytes) => bytes
+                .get(id * Q4K_BLOCK_BYTES..(id + 1) * Q4K_BLOCK_BYTES)
+                .map(|raw| {
+                    let block: shiso_modelfile::quant::BlockQ4K = bytemuck::pod_read_unaligned(raw);
+                    shiso_modelfile::quant::dequant_q4_k(&block).to_vec()
+                })
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -781,6 +807,7 @@ impl BlockDrafter {
                 .parts
                 .predecessor
                 .row(prev)
+                .into_iter()
                 .zip(hidden_row)
                 .map(|(p, h)| p * h)
                 .collect();
@@ -790,6 +817,7 @@ impl BlockDrafter {
                     .parts
                     .successor
                     .row(cand)
+                    .into_iter()
                     .zip(&weighted)
                     .map(|(s, p)| s * p)
                     .sum();

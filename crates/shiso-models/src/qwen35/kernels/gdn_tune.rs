@@ -182,6 +182,29 @@ impl TunableShape for Variant {
     }
 }
 
+/// The recording walk to dispatch: four lanes a column where the device takes
+/// it, two or one where it does not.
+///
+/// Four, because at one lane a column each store of the trail scatters over 32
+/// lines (measured on the dense 27B with a block drafter: 417 us a layer
+/// writing an eight-row trail, 19 ms of a 145 ms verify step). The splits fold
+/// to the same bits, so falling back changes no number. It falls back because
+/// the recording twins hold more registers than the plain walks the tuner
+/// probed: on an M1 Max the 512-lane twin's pipeline takes at most 448 threads
+/// while the plain 512-lane walk takes all of them.
+fn recorder_for(backend: &dyn Backend) -> Variant {
+    for variant in [Variant::S4, Variant::S2] {
+        let Some(entry) = variant.trail_entry() else {
+            continue;
+        };
+        let ceiling = backend.max_block_threads(shiso_core::backend::KernelRef::new(Q35, entry));
+        if ceiling.is_none_or(|limit| limit >= variant.lanes()) {
+            return variant;
+        }
+    }
+    Variant::S1
+}
+
 /// The variant to dispatch, given what the probe and the benchmark found.
 ///
 /// The ladder itself is [`tune::choose_shape`]; all this adds is the sentence
@@ -256,6 +279,9 @@ pub(crate) struct GdnShape {
     pub recurrent: Variant,
     /// The 64-token run, for long prefill.
     pub chunk: Variant,
+    /// The walk that records every row's state, for a verify pass: the
+    /// widest of the recording twins this device will launch at its lanes.
+    pub recorder: Variant,
 }
 
 impl GdnShape {
@@ -306,7 +332,11 @@ impl GdnShape {
             CHUNK_REFERENCE,
             &measure(backend, geometry, &CHUNK, launch::GDN_CHUNK_RUN),
         )?;
-        Ok(Self { recurrent, chunk })
+        Ok(Self {
+            recurrent,
+            chunk,
+            recorder: recorder_for(backend),
+        })
     }
 
     /// The shape `pinned` names, or `None` if any part of it names nothing.
@@ -316,6 +346,7 @@ impl GdnShape {
     /// whole use of this knob is to know exactly which kernel ran.
     fn pinned(pinned: &str) -> Option<Self> {
         let mut shape = Self {
+            recorder: Variant::S4,
             recurrent: RECURRENT_REFERENCE,
             chunk: CHUNK_REFERENCE,
         };
