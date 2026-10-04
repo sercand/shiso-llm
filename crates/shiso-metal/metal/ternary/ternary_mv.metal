@@ -24,9 +24,9 @@
 /// Inputs one scale covers.
 constant constexpr uint TERNARY_GROUP = 128u;
 /// Output rows one threadgroup covers.
-constant constexpr uint TERNARY_ROWS = 16u;
+constant constexpr uint TERNARY_ROWS = 8u;
 /// Output rows one simdgroup carries.
-constant constexpr uint TERNARY_SG_ROWS = 8u;
+constant constexpr uint TERNARY_SG_ROWS = 4u;
 /// Inputs a simdgroup sweeps at once: four groups.
 constant constexpr uint TERNARY_SWEEP = 4u * TERNARY_GROUP;
 /// Largest `splits` a launch may carry (1024 threads).
