@@ -48,10 +48,11 @@ use shiso_core::model::{DecodeStep, Logits};
 use crate::sparse::ckpt::Boundary;
 use crate::sparse::kernels::{F32_BYTES, GDN_CHUNK};
 use crate::sparse::media::MediaRun;
+use crate::sparse::moe::RowOrigin;
 use crate::sparse::passes::PassRole;
 use crate::sparse::ple::{PleGather, PleRows};
 use crate::sparse::scratch::Buf;
-use crate::sparse::stack::{MAX_DECODE_BATCH, Pass, SparseStack};
+use crate::sparse::stack::{MAX_DECODE_BATCH, MAX_PROMPT_RUNS, Pass, SparseStack};
 
 impl SparseStack {
     /// Advances a session by a prompt chunk that produces no logits.
@@ -340,6 +341,138 @@ impl SparseStack {
         self.pack_row_pointers(&sessions)?;
         self.land_gathers(gathered)?;
         self.execute_rows(&sessions, &pass)?;
+        Ok(())
+    }
+
+    /// Reads several scoring sessions' prompt tails in one prompt-role pass and
+    /// returns one logits row per run, in run order: row `r` is run `r`'s last
+    /// position.
+    ///
+    /// Every row is the row [`SparseStack::prefill_last`] would leave for that
+    /// session and those tokens, and every session ends where that read would
+    /// leave it - but for the draft head's cache, which is not warmed over the
+    /// tail: a scoring session's tail is never drafted from, and is never
+    /// checkpointed (its prompt end is answered and dropped, and the refusals
+    /// below keep every run clear of a boundary that would be).
+    ///
+    /// # Errors
+    ///
+    /// Every refusal comes before any page is claimed, so a refused call leaves
+    /// every session as it stood: [`CoreError::Unsupported`] for a session that
+    /// is not scoring or carries media, a run inside which this session's own
+    /// read would stop to take a checkpoint, more runs than
+    /// [`MAX_PROMPT_RUNS`] or more rows than one prefill chunk - all of which
+    /// a caller reads one session at a time instead;
+    /// [`CoreError::ContextOverflow`]; [`CoreError::ShapeMismatch`] for no runs
+    /// or an empty one; [`CoreError::InvalidValue`] for a session named twice;
+    /// and whatever the pass reports.
+    pub fn prefill_segments(&mut self, runs: &[(SessionId, &[TokenId])]) -> CoreResult<Logits<'_>> {
+        self.check_prompt_runs(runs)?;
+        let mut republished = false;
+        for (session, tokens) in runs {
+            republished |=
+                self.reserve(*session, u32::try_from(tokens.len()).unwrap_or(u32::MAX))?;
+        }
+        if republished && let Some(graphs) = self.backend.as_graph() {
+            graphs.invalidate_all();
+        }
+        let sessions = runs.iter().map(|(session, _)| *session).collect::<Vec<_>>();
+        let lens = runs
+            .iter()
+            .map(|(_, tokens)| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
+            .collect::<Vec<_>>();
+        let mut pass = self.plan_prompt_segments(&sessions, &lens)?;
+        let gathered = self.issue_gathers(&mut pass, runs)?;
+        self.write_segment_inputs(runs)?;
+        // No per-row pointer arrays: every launch here that reads a session's
+        // state names it by run.
+        self.land_gathers(gathered)?;
+        // The tap goes back on the failure path too, as in a solo chunk.
+        match self.tap.take() {
+            None => {
+                self.execute_rows(&sessions, &pass)?;
+            }
+            Some(mut tap) => {
+                let ran = self.execute_rows_tapped(&sessions, &pass, None, Some(&mut tap));
+                self.tap = Some(tap);
+                ran?;
+            }
+        }
+        let RowOrigin::Segmented(segments) = pass.origin else {
+            return Err(CoreError::Unsupported {
+                what: "a batched prompt pass planned as something other than segments",
+                backend: "engine",
+            });
+        };
+        // Staged before any session advances, each from its own run's last row
+        // of the residual: a solo read stages its pass's last row, and here
+        // that row is `last_row(r)`, not `r`.
+        if self.has_draft_head() {
+            for (run, session) in (0..segments.count()).zip(&sessions) {
+                self.stage_draft_row(*session, segments.last_row(run))?;
+            }
+        }
+        for (run, (session, tokens)) in (0..segments.count()).zip(runs) {
+            self.advance_at(*session, tokens, Boundary::PromptEnd, Some(run))?;
+            if let Some(live) = self.sessions.get_mut(session)
+                && let Some(spec) = live.spec.as_mut()
+            {
+                spec.staged_for = live.written;
+            }
+            self.mark_prompt_end(*session)?;
+        }
+        self.logits(segments.count())
+    }
+
+    /// The refusals of [`SparseStack::prefill_segments`], all of them before
+    /// anything is claimed or launched.
+    fn check_prompt_runs(&self, runs: &[(SessionId, &[TokenId])]) -> CoreResult<()> {
+        if runs.is_empty() || runs.iter().any(|(_, tokens)| tokens.is_empty()) {
+            return Err(CoreError::ShapeMismatch {
+                field: "batched prompt runs",
+                expected: 1,
+                got: 0,
+            });
+        }
+        if runs.len() > MAX_PROMPT_RUNS as usize {
+            return Err(CoreError::Unsupported {
+                what: "a batched prompt pass of more runs than one pass carries",
+                backend: "engine",
+            });
+        }
+        let rows = runs.iter().map(|(_, tokens)| tokens.len()).sum::<usize>();
+        if rows > usize::try_from(self.opts.prefill_rows).unwrap_or(usize::MAX) {
+            return Err(CoreError::Unsupported {
+                what: "a batched prompt pass wider than one prefill chunk",
+                backend: "engine",
+            });
+        }
+        let sessions = runs.iter().map(|(session, _)| *session).collect::<Vec<_>>();
+        crate::sparse::stack::distinct(&sessions)?;
+        for (session, tokens) in runs {
+            let live = self.session(*session)?;
+            if !live.scoring || live.media {
+                return Err(CoreError::Unsupported {
+                    what: "a batched prompt pass over a session that is not a text-only score",
+                    backend: "engine",
+                });
+            }
+            let next = u64::from(live.written())
+                .saturating_add(u64::try_from(tokens.len()).unwrap_or(u64::MAX));
+            if next > u64::from(self.opts.engine.ctx) {
+                return Err(CoreError::ContextOverflow {
+                    session: *session,
+                    cap: self.opts.engine.ctx,
+                });
+            }
+            if self.shared_stop(*session, tokens)?.is_some() {
+                return Err(CoreError::Unsupported {
+                    what: "a batched prompt run its session's own read would stop inside to \
+                           take a checkpoint",
+                    backend: "engine",
+                });
+            }
+        }
         Ok(())
     }
 

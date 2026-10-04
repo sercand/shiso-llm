@@ -252,6 +252,46 @@ impl SparseStack {
         )
     }
 
+    /// Plans one prompt-role segmented pass: each session's prompt tail at its
+    /// own frontier, in session order, every row computed as that session's own
+    /// prompt pass computes it, and only each run's last row projected.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::plan_segments`], bounded by one prefill chunk's rows
+    /// and [`MAX_PROMPT_RUNS`](crate::sparse::stack::MAX_PROMPT_RUNS) runs
+    /// instead of by the logits block.
+    pub fn plan_prompt_segments(&self, sessions: &[SessionId], lens: &[u32]) -> CoreResult<Pass> {
+        if sessions.len() != lens.len() {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented pass runs",
+                expected: sessions.len() as u64,
+                got: lens.len() as u64,
+            });
+        }
+        let runs = moe::Segments::new(lens)?;
+        if runs.rows() > self.opts.prefill_rows {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented prompt rows",
+                expected: u64::from(self.opts.prefill_rows),
+                got: u64::from(runs.rows()),
+            });
+        }
+        crate::sparse::stack::distinct(sessions)?;
+        let live = sessions
+            .iter()
+            .map(|id| self.session(*id))
+            .collect::<CoreResult<Vec<_>>>()?;
+        self.plan_rows(
+            &live,
+            runs.rows(),
+            runs.count(),
+            &RowOrigin::Segmented(runs),
+            None,
+            PassRole::Prompt { snapshot: None },
+        )
+    }
+
     /// The pass itself.
     #[expect(
         clippy::too_many_lines,
@@ -277,8 +317,14 @@ impl SparseStack {
         })?;
         let batched = *origin != RowOrigin::Sequential;
         // Only one sequence's prompt rows are promised to every pass width: a
-        // batch's rows are steps by construction.
-        let role = if batched { PassRole::Step } else { role };
+        // batch's rows are steps by construction. Each run of a segmented pass
+        // is one sequence's, so it keeps the role its caller planned - a
+        // verify's [`SparseStack::plan_segments`] asks for a step itself.
+        let role = if *origin == RowOrigin::Unrelated {
+            PassRole::Step
+        } else {
+            role
+        };
         // One sequence's frontier decides whether its selection is live. A batch
         // has one frontier per row, and each row answers for itself: its
         // attention is planned as a single-row step of its own sequence, over
@@ -431,15 +477,10 @@ impl SparseStack {
             }
         }
 
-        // A segmented pass is a verify, and a verify's output is every row's
-        // greedy pick rather than the rows themselves.
-        self.plan_logits(
-            &mut plan,
-            n_tok,
-            logit_rows,
-            *origin == RowOrigin::Unrelated,
-            device,
-        )?;
+        // A segmented verify's output is every row's greedy pick rather than
+        // the rows themselves; a prompt-role segmented pass's is each run's
+        // last row.
+        self.plan_logits(&mut plan, n_tok, logit_rows, origin, device)?;
 
         let gather = self.plan_gathers(rows, n_tok, origin)?;
         // The per-stream scratch every cooperative launch in the pass reads is
@@ -483,9 +524,15 @@ impl SparseStack {
         plan: &mut Plan,
         n_tok: u32,
         logit_rows: u32,
-        batched: bool,
+        origin: &RowOrigin,
         device: Device,
     ) -> CoreResult<()> {
+        if let RowOrigin::Segmented(runs) = *origin
+            && device.row_invariant()
+        {
+            return self.plan_run_logits(plan, n_tok, &runs, device);
+        }
+        let batched = *origin == RowOrigin::Unrelated;
         if logit_rows > 0 {
             plan.append(hyper::collapse(
                 &self.shape,
@@ -563,6 +610,69 @@ impl SparseStack {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// A prompt-role segmented pass's logits: the collapsing mix over every row
+    /// (row-invariant under Prompt role), then one single-row vocabulary
+    /// projection per run, from that run's last row into logits row `run` -
+    /// the projection a solo prompt pass ends with, at the tier one row takes.
+    /// No greedy pick: every row goes back to a caller that reads it.
+    fn plan_run_logits(
+        &self,
+        plan: &mut Plan,
+        n_tok: u32,
+        runs: &moe::Segments,
+        device: Device,
+    ) -> CoreResult<()> {
+        plan.append(hyper::collapse(
+            &self.shape,
+            &self.desc.output_mix,
+            MixRoles::output(),
+            n_tok,
+            device,
+            self.stream_elem(n_tok, device),
+        )?);
+        for run in 0..runs.count() {
+            let from = u64::from(runs.last_row(run))
+                .saturating_mul(u64::from(self.shape.hidden))
+                .saturating_mul(F32_BYTES);
+            let to = u64::from(run)
+                .saturating_mul(u64::from(self.shape.vocab))
+                .saturating_mul(F32_BYTES);
+            let out = if to == 0 {
+                Operand::Scratch(Buf::Logits)
+            } else {
+                Operand::ScratchFrom(Buf::Logits, to)
+            };
+            matmul::project(
+                plan,
+                self.desc.output,
+                Bound::new(
+                    WeightRef::model(Role::Output),
+                    Operand::ScratchFrom(Buf::Mixed, from),
+                    out,
+                ),
+                1,
+                Device {
+                    role: PassRole::Step,
+                    ..device
+                },
+            )?;
+        }
+        plan.launch(
+            crate::sparse::kernels::Entry::plain(
+                crate::sparse::kernels::MOD_SAMPLE,
+                "sample_suppress_rows_kernel",
+            ),
+            crate::sparse::kernels::suppress_rows(runs.count()),
+            // `logits, list, n_vocab`
+            crate::sparse::bind::Args::of(&[
+                Operand::Scratch(Buf::Logits),
+                Operand::Scratch(Buf::Suppress),
+                Operand::U32(self.shape.vocab),
+            ]),
+        );
         Ok(())
     }
 

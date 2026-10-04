@@ -21,7 +21,7 @@ use shiso_core::error::CoreResult;
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
 use crate::sparse::kernels::{self, Entry, MOD_GDN, MOD_GDN_TC};
 use crate::sparse::matmul::{self, Bound, Device};
-use crate::sparse::moe::RowOrigin;
+use crate::sparse::moe::{RowOrigin, Segments};
 use crate::sparse::mtp::SpecDepth;
 use crate::sparse::paged;
 use crate::sparse::plan::Plan;
@@ -157,6 +157,7 @@ pub fn block(
     // buffer, so they are derived together from the one depth.
     let conv_ckpt = rollback_args(spec, Operand::RecurrentConvCkpt(slot));
     let state_ckpt = rollback_args(spec, Operand::RecurrentStateCkpt(slot));
+    let per_run = prompt_runs(&policy, device);
     let mut plan = Plan::new();
     matmul::project(
         &mut plan,
@@ -169,7 +170,16 @@ pub fn block(
         n_tok,
         device,
     )?;
-    if let RowOrigin::Segmented(runs) = policy.origin {
+    if let Some(runs) = per_run {
+        for run in 0..runs.count() {
+            plan.append(prompt_run_conv(
+                shape,
+                at(Role::RecurrentConv1d),
+                slot,
+                RunSpan::of(&runs, run),
+            ));
+        }
+    } else if let RowOrigin::Segmented(runs) = policy.origin {
         // Each run is its own sequence's consecutive positions: the scalar
         // convolution's body over that run's rows, from that session's window,
         // with that session's rollback records - one launch for every run.
@@ -328,7 +338,11 @@ pub fn block(
             Operand::U32(n_tok),
         ]),
     );
-    if let RowOrigin::Segmented(runs) = policy.origin {
+    if let Some(runs) = per_run {
+        for run in 0..runs.count() {
+            plan.append(prompt_run_scan(shape, slot, RunSpan::of(&runs, run)));
+        }
+    } else if let RowOrigin::Segmented(runs) = policy.origin {
         // The same, for the recurrence: one sequential walk per run, every run
         // in one launch. Launched once per run instead, the walks were 32
         // blocks each on a 48-SM device and 10 ms of a four-sequence verify
@@ -513,6 +527,146 @@ const fn rollback_args(spec: SpecDepth, slab: Operand) -> (Operand, Operand) {
     } else {
         (Operand::Null, Operand::U32(0))
     }
+}
+
+/// Where one run of a prompt-role segmented pass sits in the recurrent block's
+/// buffers.
+#[derive(Debug, Clone, Copy)]
+struct RunSpan {
+    run: u32,
+    first: u64,
+    rows: u32,
+}
+
+impl RunSpan {
+    fn of(runs: &Segments, run: u32) -> Self {
+        Self {
+            run,
+            first: u64::from(runs.start(run)),
+            rows: runs.len(run),
+        }
+    }
+
+    /// `buf` from this run's first row, its rows `width` floats wide.
+    fn at(self, buf: Buf, width: u32) -> Operand {
+        let offset = self.first * u64::from(width) * 4;
+        if offset == 0 {
+            Operand::Scratch(buf)
+        } else {
+            Operand::ScratchFrom(buf, offset)
+        }
+    }
+}
+
+/// The runs of a prompt-role segmented pass whose recurrences run one run at a
+/// time, as each run's own prompt pass runs them; `None` for every other pass.
+///
+/// A solo prompt read takes the chunked kernels at every width (its tier width
+/// is unbounded), and the sequential walk a verify takes sums differently - the
+/// one launch the spike found differing. The decision is the solo read's own,
+/// so a build with the chunked kernel off (`--chunk-min-rows 0`) keeps the
+/// segmented kernels, which then match its solo reads.
+fn prompt_runs(policy: &Recurrence, device: Device) -> Option<Segments> {
+    let RowOrigin::Segmented(runs) = policy.origin else {
+        return None;
+    };
+    let solo = Recurrence {
+        origin: RowOrigin::Sequential,
+        ..*policy
+    };
+    (device.row_invariant() && solo.takes_chunk(device.tier_rows(runs.len(0)))).then_some(runs)
+}
+
+/// One run's convolution: the parallel convolution and the window rewrite its
+/// own prompt pass launches, at its own row count, over its own rows and its
+/// own session's window.
+fn prompt_run_conv(shape: &SparseShape, conv1d: WeightRef, slot: u32, span: RunSpan) -> Plan {
+    let mut plan = Plan::new();
+    let window = Operand::RecurrentConvOf {
+        slot,
+        run: span.run,
+    };
+    plan.launch(
+        Entry::plain(MOD_GDN_TC, "q4e_gdn_conv_par_kernel"),
+        kernels::gdn_conv_par(shape.gdn_in_dim(), span.rows),
+        // `out, state, x, w, channels, kernel, n_tok`
+        Args::of(&[
+            span.at(Buf::GdnConv, shape.gdn_in_dim()),
+            window,
+            span.at(Buf::GdnQkv, shape.gdn_in_dim()),
+            Operand::Weight(conv1d),
+            Operand::U32(shape.gdn_in_dim()),
+            Operand::U32(shape.gdn.conv_kernel),
+            Operand::U32(span.rows),
+        ]),
+    );
+    plan.launch(
+        Entry::plain(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
+        kernels::gdn_conv(shape.gdn_in_dim()),
+        // `state, x, channels, kernel, n_tok`
+        Args::of(&[
+            window,
+            span.at(Buf::GdnQkv, shape.gdn_in_dim()),
+            Operand::U32(shape.gdn_in_dim()),
+            Operand::U32(shape.gdn.conv_kernel),
+            Operand::U32(span.rows),
+        ]),
+    );
+    plan
+}
+
+/// One run's chunked recurrence, on tensor cores, exactly as its own prompt
+/// pass launches it. The run-wide slabs are shared between runs: the launches
+/// are serialized, and each prep rewrites what the scan before it read.
+fn prompt_run_scan(shape: &SparseShape, slot: u32, span: RunSpan) -> Plan {
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::plain(MOD_GDN_TC, "q4e_gdn_tc_prep_kernel"),
+        kernels::gdn_tc_prep(shape.gdn.v_heads, span.rows),
+        // `u, w, p, g, qkv, decay, beta, n_head_k, n_head_v, k_offset,
+        //  v_offset, stride, n_tok`
+        Args::of(&[
+            Operand::Scratch(Buf::GdnTcU),
+            Operand::Scratch(Buf::GdnTcW),
+            Operand::Scratch(Buf::GdnTcP),
+            Operand::Scratch(Buf::GdnTcG),
+            span.at(Buf::GdnConv, shape.gdn_in_dim()),
+            span.at(Buf::GdnDecay, shape.gdn.v_heads),
+            span.at(Buf::GdnBeta, shape.gdn.v_heads),
+            Operand::U32(shape.gdn.qk_heads),
+            Operand::U32(shape.gdn.v_heads),
+            Operand::U32(shape.gdn_qk_dim()),
+            Operand::U32(2 * shape.gdn_qk_dim()),
+            Operand::U32(shape.gdn_in_dim()),
+            Operand::U32(span.rows),
+        ]),
+    );
+    plan.launch(
+        Entry::plain(MOD_GDN_TC, "q4e_gdn_tc_scan_kernel"),
+        kernels::gdn_tc_scan(shape.gdn.v_heads),
+        // `attn_out, state, qkv, u, w, p, g, n_head_k, n_head_v, k_offset,
+        //  stride, n_tok, snap, snap_run` - a scoring tail takes no snapshot.
+        Args::of(&[
+            span.at(Buf::GdnAttn, shape.gdn_v_dim()),
+            Operand::RecurrentStateOf {
+                slot,
+                run: span.run,
+            },
+            span.at(Buf::GdnConv, shape.gdn_in_dim()),
+            Operand::Scratch(Buf::GdnTcU),
+            Operand::Scratch(Buf::GdnTcW),
+            Operand::Scratch(Buf::GdnTcP),
+            Operand::Scratch(Buf::GdnTcG),
+            Operand::U32(shape.gdn.qk_heads),
+            Operand::U32(shape.gdn.v_heads),
+            Operand::U32(shape.gdn_qk_dim()),
+            Operand::U32(shape.gdn_in_dim()),
+            Operand::U32(span.rows),
+            Operand::Null,
+            Operand::U32(u32::MAX),
+        ]),
+    );
+    plan
 }
 
 #[cfg(test)]

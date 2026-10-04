@@ -369,6 +369,22 @@ pub enum Operand {
     RecurrentConvCkpt(u32),
     /// One recurrent slot's per-position state matrices, laid out the same way.
     RecurrentStateCkpt(u32),
+    /// One run's convolution window for one recurrent slot: what a prompt-role
+    /// segmented pass's per-run convolution binds, in the way
+    /// [`Operand::PagesOf`] names one row's page table.
+    RecurrentConvOf {
+        /// The slot's rank among recurrent slots.
+        slot: u32,
+        /// The run, which is the binder's row.
+        run: u32,
+    },
+    /// One run's state matrix for one recurrent slot.
+    RecurrentStateOf {
+        /// The slot's rank among recurrent slots.
+        slot: u32,
+        /// The run, which is the binder's row.
+        run: u32,
+    },
     /// One segment's n-gram convolution window, by segment.
     ///
     /// What a scalar launch binds inside a segmented pass - several sessions'
@@ -503,6 +519,8 @@ impl Operand {
                 | Self::RecurrentState(_)
                 | Self::RecurrentConvCkpt(_)
                 | Self::RecurrentStateCkpt(_)
+                | Self::RecurrentConvOf { .. }
+                | Self::RecurrentStateOf { .. }
                 | Self::NgramWindowOf(_)
                 | Self::NgramWindowCkptOf(_)
                 | Self::NgramWindow
@@ -909,6 +927,12 @@ impl<'a> Binder<'a> {
             }
             Operand::RecurrentConv(slot) => KernelArg::Buffer(self.only()?.recurrent(slot)?.0),
             Operand::RecurrentState(slot) => KernelArg::Buffer(self.only()?.recurrent(slot)?.1),
+            Operand::RecurrentConvOf { slot, run } => {
+                KernelArg::Buffer(self.row(run)?.recurrent(slot)?.0)
+            }
+            Operand::RecurrentStateOf { slot, run } => {
+                KernelArg::Buffer(self.row(run)?.recurrent(slot)?.1)
+            }
             Operand::RecurrentConvCkpt(slot) => {
                 KernelArg::Buffer(self.only()?.recurrent_rollback(slot)?.0)
             }

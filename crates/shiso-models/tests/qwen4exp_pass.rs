@@ -15,7 +15,9 @@ use shiso_engine::sparse::island::Island;
 #[path = "common/qwen4exp_fixture.rs"]
 mod fixture;
 
-use fixture::{N_LAYERS, PLE_LAYER, loaded, loaded_with, speculative_options, tokens};
+use fixture::{
+    CTX, N_LAYERS, PLE_LAYER, RECURRENT_SLOTS, loaded, loaded_with, speculative_options, tokens,
+};
 
 /// Opens `rows` sessions and claims one cache row for each.
 ///
@@ -912,4 +914,287 @@ fn a_prompt_chunk_takes_the_same_route_at_every_width() {
         .plan_chunk(session, &tokens(128, 512), 1)
         .expect("a wide step plans");
     assert_ne!(routes(&step_narrow), routes(&step_wide));
+}
+
+/// Scoring sessions, one per prefix length, each standing on its own prefix
+/// read as a chunk with its shared boundary there: where a request's sibling
+/// questions stand once they have resumed.
+fn scoring_sessions(
+    model: &mut shiso_models::qwen4exp::Qwen4ExpModel,
+    prefixes: &[u32],
+) -> Vec<shiso_core::SessionId> {
+    prefixes
+        .iter()
+        .enumerate()
+        .map(|(at, &len)| {
+            let session = model.open_session().expect("a session opens");
+            model
+                .stack_mut()
+                .ckpt_set_scoring(session)
+                .expect("marked as scoring");
+            model
+                .stack_mut()
+                .ckpt_set_hints(session, &[len])
+                .expect("its boundary recorded");
+            model
+                .prefill_chunk(session, &tokens(u32::try_from(at).expect("a few"), len))
+                .expect("the prefix reads");
+            session
+        })
+        .collect()
+}
+
+/// The grid of every launch of `name`, in plan order.
+fn grids(pass: &shiso_engine::sparse::stack::Pass, name: &str) -> Vec<String> {
+    pass.plan
+        .steps()
+        .iter()
+        .filter_map(|step| match step {
+            shiso_engine::sparse::plan::Step::Kernel { entry, launch, .. }
+                if entry.name() == name =>
+            {
+                Some(format!("{:?}", launch.grid))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every operand a step binds.
+fn operands_of(
+    step: &shiso_engine::sparse::plan::Step,
+) -> Vec<shiso_engine::sparse::bind::Operand> {
+    use shiso_engine::sparse::plan::Step;
+    match step {
+        Step::Blas { a, b, c, .. } => vec![*a, *b, *c],
+        Step::Kernel { args, .. } | Step::Trellis { args, .. } => {
+            args.operands().map(<[_]>::to_vec).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The recurrence that differed in the spike: a prompt-role segmented pass
+/// launches, for every run, exactly the chunked convolution and recurrence that
+/// run's own prompt pass launches, at that run's row count - and never the
+/// verify's sequential walks over every run at once.
+#[test]
+fn a_prompt_role_segmented_pass_runs_each_recurrence_as_that_runs_own_prompt_pass() {
+    let (_dir, _fake, mut model) = loaded();
+    let sessions = scoring_sessions(&mut model, &[64, 128]);
+    let lens = [40_u32, 7];
+    let pass = model
+        .stack()
+        .plan_prompt_segments(&sessions, &lens)
+        .expect("the pass plans");
+    for name in ["q4e_gdn_conv_seg_kernel", "q4e_gdn_recurrent_seg_kernel"] {
+        assert_eq!(
+            pass.plan.count(name),
+            0,
+            "{name} is a verify's walk, not a prompt's"
+        );
+    }
+    let solos = sessions
+        .iter()
+        .zip(lens)
+        .map(|(session, len)| {
+            model
+                .stack()
+                .plan_prompt(*session, &tokens(0, len), 1)
+                .expect("a solo tail plans")
+        })
+        .collect::<Vec<_>>();
+    for name in [
+        "q4e_gdn_conv_par_kernel",
+        "q4e_gdn_conv_tail_kernel",
+        "q4e_gdn_tc_prep_kernel",
+        "q4e_gdn_tc_scan_kernel",
+    ] {
+        let want = (0..RECURRENT_SLOTS)
+            .flat_map(|layer| {
+                solos
+                    .iter()
+                    .map(move |solo| grids(solo, name)[layer].clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            want.len(),
+            2 * RECURRENT_SLOTS,
+            "{name}: once a slot in each solo tail"
+        );
+        assert_eq!(grids(&pass, name), want, "{name}");
+    }
+}
+
+/// Each run's vocabulary row is projected from that run's last row of the
+/// collapsed block into its own logits row, in run order, and nothing picks
+/// from them: a label row is its own run's, never a neighbour's.
+#[test]
+fn a_prompt_role_segmented_pass_projects_each_runs_last_row_into_its_own_logits_row() {
+    use shiso_engine::sparse::bind::Operand;
+    use shiso_engine::sparse::scratch::Buf;
+    let (_dir, _fake, mut model) = loaded();
+    let sessions = scoring_sessions(&mut model, &[64, 64, 64]);
+    let pass = model
+        .stack()
+        .plan_prompt_segments(&sessions, &[40, 7, 1])
+        .expect("the pass plans");
+    let is_mixed = |op: &Operand| {
+        matches!(
+            op,
+            Operand::Scratch(Buf::Mixed) | Operand::ScratchFrom(Buf::Mixed, _)
+        )
+    };
+    let is_logits = |op: &Operand| {
+        matches!(
+            op,
+            Operand::Scratch(Buf::Logits) | Operand::ScratchFrom(Buf::Logits, _)
+        )
+    };
+    let mut mixed = None;
+    let mut pairs = Vec::new();
+    for step in pass.plan.steps() {
+        let ops = operands_of(step);
+        if let Some(src) = ops.iter().copied().find(is_mixed) {
+            mixed = Some(src);
+        }
+        if step.name() == "sample_suppress_rows_kernel" {
+            continue;
+        }
+        if let Some(dst) = ops.iter().copied().find(is_logits) {
+            pairs.push((mixed, dst));
+        }
+    }
+    pairs.dedup();
+    let row = |at: u32| u64::from(at) * u64::from(fixture::HIDDEN) * 4;
+    let logit = |at: u32| u64::from(at) * u64::from(fixture::VOCAB) * 4;
+    assert_eq!(
+        pairs,
+        vec![
+            (
+                Some(Operand::ScratchFrom(Buf::Mixed, row(39))),
+                Operand::Scratch(Buf::Logits)
+            ),
+            (
+                Some(Operand::ScratchFrom(Buf::Mixed, row(46))),
+                Operand::ScratchFrom(Buf::Logits, logit(1))
+            ),
+            (
+                Some(Operand::ScratchFrom(Buf::Mixed, row(47))),
+                Operand::ScratchFrom(Buf::Logits, logit(2))
+            ),
+        ]
+    );
+    assert_eq!(
+        pass.plan.count("q4e_argmax_rows_kernel"),
+        0,
+        "every row goes back to its caller"
+    );
+    assert_eq!(pass.plan.count("sample_suppress_rows_kernel"), 1);
+}
+
+/// Every launch that reads a session's state names it by run, so nothing has
+/// to pack the per-row pointer arrays - which are a decode batch's width.
+#[test]
+fn a_prompt_role_segmented_pass_binds_no_per_row_array() {
+    use shiso_engine::sparse::bind::Operand;
+    let (_dir, _fake, mut model) = loaded();
+    let sessions = scoring_sessions(&mut model, &[64, 64]);
+    let pass = model
+        .stack()
+        .plan_prompt_segments(&sessions, &[9, 30])
+        .expect("the pass plans");
+    let arrays = pass
+        .plan
+        .steps()
+        .iter()
+        .flat_map(operands_of)
+        .filter(|op| {
+            matches!(
+                op,
+                Operand::PageTables
+                    | Operand::RecurrentConvs(_)
+                    | Operand::RecurrentStates(_)
+                    | Operand::RecurrentConvCkpts(_)
+                    | Operand::RecurrentStateCkpts(_)
+                    | Operand::NgramWindows
+            )
+        })
+        .count();
+    assert_eq!(arrays, 0);
+}
+
+#[test]
+fn a_batched_prompt_pass_advances_each_session_by_its_own_tail() {
+    let (_dir, _fake, mut model) = loaded();
+    let prefixes = [64_u32, 128, 64];
+    let sessions = scoring_sessions(&mut model, &prefixes);
+    let tails = [tokens(5, 40), tokens(6, 7), tokens(7, 120)];
+    let runs = sessions
+        .iter()
+        .copied()
+        .zip(tails.iter().map(Vec::as_slice))
+        .collect::<Vec<_>>();
+    let rows = model
+        .stack_mut()
+        .prefill_segments(&runs)
+        .expect("the pass runs")
+        .rows();
+    assert_eq!(rows, 3, "one logits row a run");
+    for ((session, tail), prefix) in sessions.iter().zip(&tails).zip(prefixes) {
+        let live = model.stack().session(*session).expect("open");
+        assert_eq!(
+            live.written(),
+            prefix + u32::try_from(tail.len()).expect("small")
+        );
+        let read = usize::try_from(prefix).expect("small");
+        assert_eq!(&live.history()[read..], tail.as_slice());
+    }
+}
+
+#[test]
+fn a_batched_prompt_pass_refuses_before_it_claims_anything() {
+    use shiso_core::CoreError;
+    let (_dir, _fake, mut model) = loaded();
+    let sessions = scoring_sessions(&mut model, &[64, 64]);
+    let plain = model.open_session().expect("a session opens");
+    model
+        .prefill_chunk(plain, &tokens(0, 64))
+        .expect("the prefix reads");
+    let far = scoring_sessions(&mut model, &[CTX - 8])[0];
+    let tail = tokens(9, 16);
+
+    let error = model
+        .stack_mut()
+        .prefill_segments(&[(sessions[0], &tail), (plain, &tail)])
+        .expect_err("a plain session is read alone");
+    assert!(matches!(error, CoreError::Unsupported { .. }), "{error:?}");
+
+    let wide = tokens(0, model.stack().prefill_rows() / 2 + 1);
+    let error = model
+        .stack_mut()
+        .prefill_segments(&[(sessions[0], &wide), (sessions[1], &wide)])
+        .expect_err("wider than one prefill chunk");
+    assert!(matches!(error, CoreError::Unsupported { .. }), "{error:?}");
+
+    let error = model
+        .stack_mut()
+        .prefill_segments(&[(sessions[1], &tail), (far, &tail)])
+        .expect_err("past the context");
+    assert!(
+        matches!(error, CoreError::ContextOverflow { .. }),
+        "{error:?}"
+    );
+
+    for (session, written) in [
+        (sessions[0], 64),
+        (sessions[1], 64),
+        (plain, 64),
+        (far, CTX - 8),
+    ] {
+        assert_eq!(
+            model.stack().session(session).expect("open").written(),
+            written
+        );
+    }
 }
