@@ -86,6 +86,30 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     // media the blocks arm renders, and its item refusals are the wire's.
     let images_wire = parsed.images.take();
     let questions = parsed.validate()?;
+    // A decision checkpoint answers every question from one prompt through
+    // its head. Its pictures would need a tower this build does not load for
+    // it, so they are refused rather than scored without.
+    if state.decision_head {
+        if images_wire
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+        {
+            return Err(AppError::bad_request(
+                "this decision model reads text only; images are not supported",
+                Some("images"),
+                "invalid_request",
+            ));
+        }
+        let (answers, prompt_tokens) =
+            crate::decision::clef::run(state, &state_text, questions, 1.0, false).await?;
+        return Ok(Json(encode(
+            state.model_id.clone(),
+            state_text,
+            &answers,
+            prompt_tokens,
+        ))
+        .into_response());
+    }
     let sources = systemone_wire::images_sources(images_wire.as_ref())?;
     let kwargs = TemplateKwargs::from_wire(kwargs_wire)?;
 

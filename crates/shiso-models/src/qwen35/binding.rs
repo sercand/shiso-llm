@@ -48,6 +48,9 @@ use crate::qwen35::config::Qwen35Config;
 
 /// Architecture name this binding accepts.
 const ARCH: &str = "qwen35";
+/// The decision checkpoint built on this backbone: the same blocks under its
+/// own name, with a schema head beside them that this binding never reads.
+pub(crate) const CLEF_ARCH: &str = "clef";
 /// Metadata key holding the layer count.
 const BLOCK_COUNT_KEY: &str = "block_count";
 /// Metadata key holding the attention layer stride.
@@ -351,7 +354,7 @@ where
 {
     let shape = config.shape();
     let declared = src.architecture();
-    if declared != Some(ARCH) {
+    if declared != Some(ARCH) && declared != Some(CLEF_ARCH) {
         return Err(GgufError::ArchMismatch {
             want: ARCH,
             got: Box::from(declared.unwrap_or_default()),

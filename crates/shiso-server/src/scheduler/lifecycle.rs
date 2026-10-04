@@ -308,6 +308,8 @@ pub(crate) struct SeqSlot {
 struct ScoreJob {
     /// The label ids, in the order the request gave them.
     labels: Arc<[TokenId]>,
+    /// The schema a decision head scores instead of `labels`, when it does.
+    decision: Option<Arc<[shiso_core::DecisionQuestion]>>,
     /// Held as an `Option` because two places may answer a score - the prefill
     /// terminus and the retirement path - and *taking* this is the record of
     /// which one did. The invariant is exactly one reply per request: the
@@ -504,6 +506,7 @@ impl SeqSlot {
             spec: (0, 0, 0),
             score: Some(ScoreJob {
                 labels: request.labels,
+                decision: request.decision,
                 reply: setup.score_reply,
             }),
         }
@@ -1072,6 +1075,12 @@ impl SeqSlot {
     /// abort.
     pub(crate) fn score_labels(&self) -> &[TokenId] {
         self.score.as_ref().map_or(&[], |job| &job.labels)
+    }
+
+    /// The schema this scoring sequence's decision head reads, when it is a
+    /// decision pass.
+    pub(crate) fn score_decision(&self) -> Option<&Arc<[shiso_core::DecisionQuestion]>> {
+        self.score.as_ref().and_then(|job| job.decision.as_ref())
     }
 
     /// Takes the scoring reply channel, if one is still there.
