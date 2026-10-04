@@ -71,6 +71,8 @@ pub const WEIGHT_TYPES: &[DType] = &[
     DType::Q4_K,
     DType::Q5_K,
     DType::Q6_K,
+    DType::Pq2_0,
+    DType::Ptq1_0,
 ];
 
 /// Formats a normalization or control vector may be stored in.

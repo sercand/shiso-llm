@@ -65,6 +65,7 @@ mod kernels;
 mod model;
 pub mod modelopt;
 pub mod mtp;
+pub mod rotation;
 pub mod st_names;
 pub mod vision;
 

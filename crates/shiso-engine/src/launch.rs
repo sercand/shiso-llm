@@ -151,6 +151,104 @@ pub const Q35MOE: &str = "qwen35moe";
 /// set that was compiled in.
 pub const DENSE: &str = "dense";
 
+/// Module the rotated-checkpoint kernels are registered under: the blockwise
+/// rotation and the matmuls over ternary and 2-bit affine weights.
+pub const TERNARY: &str = "ternary";
+
+/// Arguments of `kernel_ternary_mv_*`, mirroring `ternary_args_mv`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TernaryMvArgs {
+    /// Inputs a row.
+    pub in_dim: u32,
+    /// Output rows.
+    pub out_dim: u32,
+    /// Activation rows.
+    pub n_tok: u32,
+    /// Interleaved contraction slices one threadgroup carries.
+    pub splits: u32,
+}
+
+/// Arguments of `kernel_ternary_get_rows_*`, mirroring `ternary_args_rows`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TernaryRowsArgs {
+    /// Elements a row.
+    pub in_dim: u32,
+    /// Rows gathered.
+    pub n_tok: u32,
+}
+
+/// Output rows one ternary matvec threadgroup covers.
+pub const TERNARY_ROWS: u32 = 8;
+
+/// The suffix the ternary entries spell for `dtype`, or `None` for a format
+/// that set does not read.
+#[must_use]
+pub const fn ternary_tag(dtype: DType) -> Option<&'static str> {
+    match dtype {
+        DType::Pq2_0 => Some("pq2_0"),
+        DType::Ptq1_0 => Some("ptq1_0"),
+        DType::MlxAffine2Gs128 => Some("mlx2"),
+        _ => None,
+    }
+}
+
+/// `kernel_ternary_mv_<tag>_f32_t<t>`: the narrowest token blocking that
+/// covers `n_tok` in one pass, capped at eight.
+#[must_use]
+pub const fn ternary_mv_name(dtype: DType, n_tok: u32) -> Option<(&'static str, u32)> {
+    let t = match n_tok {
+        0 | 1 => 1,
+        2 => 2,
+        3 | 4 => 4,
+        _ => 8,
+    };
+    let name = match (dtype, t) {
+        (DType::Pq2_0, 1) => "kernel_ternary_mv_pq2_0_f32_t1",
+        (DType::Pq2_0, 2) => "kernel_ternary_mv_pq2_0_f32_t2",
+        (DType::Pq2_0, 4) => "kernel_ternary_mv_pq2_0_f32_t4",
+        (DType::Pq2_0, _) => "kernel_ternary_mv_pq2_0_f32_t8",
+        (DType::Ptq1_0, 1) => "kernel_ternary_mv_ptq1_0_f32_t1",
+        (DType::Ptq1_0, 2) => "kernel_ternary_mv_ptq1_0_f32_t2",
+        (DType::Ptq1_0, 4) => "kernel_ternary_mv_ptq1_0_f32_t4",
+        (DType::Ptq1_0, _) => "kernel_ternary_mv_ptq1_0_f32_t8",
+        (DType::MlxAffine2Gs128, 1) => "kernel_ternary_mv_mlx2_f32_t1",
+        (DType::MlxAffine2Gs128, 2) => "kernel_ternary_mv_mlx2_f32_t2",
+        (DType::MlxAffine2Gs128, 4) => "kernel_ternary_mv_mlx2_f32_t4",
+        (DType::MlxAffine2Gs128, _) => "kernel_ternary_mv_mlx2_f32_t8",
+        _ => return None,
+    };
+    Some((name, t))
+}
+
+/// `kernel_ternary_get_rows_<tag>_f32`.
+#[must_use]
+pub const fn ternary_rows_name(dtype: DType) -> Option<&'static str> {
+    match dtype {
+        DType::Pq2_0 => Some("kernel_ternary_get_rows_pq2_0_f32"),
+        DType::Ptq1_0 => Some("kernel_ternary_get_rows_ptq1_0_f32"),
+        DType::MlxAffine2Gs128 => Some("kernel_ternary_get_rows_mlx2_f32"),
+        _ => None,
+    }
+}
+
+/// Contraction slices a ternary matvec threadgroup carries for a weight of
+/// this shape: doubled while the grid is under 256 threadgroups and the
+/// contraction still has a 512-input sweep for every slice, at most eight.
+/// A function of the shape alone, so a row sums the same way at every pass
+/// width.
+#[must_use]
+pub const fn ternary_splits(in_dim: u32, out_dim: u32) -> u32 {
+    let tgs = out_dim.div_ceil(TERNARY_ROWS);
+    let sweeps = in_dim.div_ceil(512);
+    let mut s = 1;
+    while tgs * s < 256 && s * 2 <= 8 && sweeps >= s * 2 {
+        s *= 2;
+    }
+    s
+}
+
 /// Module the vision tower's kernels are registered under.
 ///
 /// The engine dispatches exactly one of them: the splice that overwrites a

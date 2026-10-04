@@ -28,6 +28,33 @@ impl NameMap for Qwen35Names {
     }
 }
 
+/// [`Qwen35Names`] for an export stored in a rotated basis.
+///
+/// One difference: the recurrent output projection keeps its columns in the
+/// file's grouped value-head order. Its rotation was folded in over that
+/// order and mixes a whole block of columns, so the columns cannot be moved;
+/// the activation is permuted instead, as the rotation reads it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Qwen35RotatedNames;
+
+impl NameMap for Qwen35RotatedNames {
+    fn map_role(&self, name: &str) -> Option<Role> {
+        let mut role = Qwen35Names.map_role(name)?;
+        if role.heads == Some(HeadAxis::ValueColumns) {
+            role.heads = None;
+        }
+        Some(role)
+    }
+
+    fn expected_tensors(&self, n_layers: u32, full_attention_interval: u32) -> Option<usize> {
+        Qwen35Names.expected_tensors(n_layers, full_attention_interval)
+    }
+
+    fn optional_tensors(&self) -> &'static [&'static str] {
+        Qwen35Names.optional_tensors()
+    }
+}
+
 /// Tensors every layer slot carries, whichever block kind it holds.
 const SHARED_PER_LAYER: usize = 5;
 /// Additional tensors a recurrent layer slot carries.
@@ -60,7 +87,21 @@ fn expected_tensor_count(n_layers: u32, interval: u32) -> usize {
 }
 
 /// Translates one tensor name, or reports that this loader does not know it.
+///
+/// A projection is named by its module path when it is packed (its arrays are
+/// `<module>.weight`, `.scales`, `.biases`) and by `<module>.weight` when it is
+/// stored plain, which an export that quantizes most projections but keeps a
+/// narrow one in full precision does; both spellings are this family's.
 pub(crate) fn map_role(name: &str) -> Option<Role> {
+    module_role(name).or_else(|| {
+        let module = name.strip_suffix(".weight")?;
+        let role = module_role(module)?;
+        role.gguf.ends_with(".weight").then_some(role)
+    })
+}
+
+/// [`map_role`] for one spelling.
+fn module_role(name: &str) -> Option<Role> {
     match name {
         "model.embed_tokens" => return Some(Role::plain("token_embd.weight")),
         "model.norm.weight" => return Some(Role::plain("output_norm.weight")),

@@ -5,3 +5,4 @@
  * names are the host's `&'static str` literals. */
 
 #include "rotate.cuh"
+#include "ternary_mv.cuh"

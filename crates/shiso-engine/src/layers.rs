@@ -753,6 +753,18 @@ impl EmbedKernel {
                 module: launch::DENSE,
                 entry: "kernel_dense_embed_affine4_f32",
             }),
+            // The ternary set's gathers take an argument block of their own;
+            // [`embed_rows`] launches them on a branch of their own, and this
+            // entry is what lets the geometry accept the table at load.
+            DType::Pq2_0 | DType::Ptq1_0 | DType::MlxAffine2Gs128 => {
+                match launch::ternary_rows_name(dtype) {
+                    Some(entry) => Some(Self {
+                        module: launch::TERNARY,
+                        entry,
+                    }),
+                    None => None,
+                }
+            }
             _ => None,
         }
     }
@@ -1073,6 +1085,10 @@ const ID_BYTES: u64 = 4;
 /// The three formats that have a gather share this argument block exactly, so the
 /// format only chooses the entry point; everything else about the launch is the
 /// row geometry, which is the same either way.
+///
+/// A table stored in a rotated basis is taken back to the residual stream's
+/// basis here, right after the gather, so no caller - the chunk's opening, a
+/// drafter reading the target's table - can see a rotated row.
 pub(crate) fn embed_rows(
     backend: &dyn Backend,
     weights: &Weights,
@@ -1081,6 +1097,49 @@ pub(crate) fn embed_rows(
     dst: DeviceView<'_>,
     n_tok: u32,
 ) -> CoreResult<()> {
+    gather_rows(backend, weights, geometry, scratch, dst, n_tok)?;
+    match weights.token_embd.rotation() {
+        Some(rotation) => rotation.inverse_in_place(backend, n_tok, dst),
+        None => Ok(()),
+    }
+}
+
+/// The gather [`embed_rows`] runs before any rotation.
+fn gather_rows(
+    backend: &dyn Backend,
+    weights: &Weights,
+    geometry: &Geometry,
+    scratch: &Scratch,
+    dst: DeviceView<'_>,
+    n_tok: u32,
+) -> CoreResult<()> {
+    if let Some(entry) = launch::ternary_rows_name(weights.token_embd.dtype) {
+        let table = &weights.token_embd;
+        let (scales, biases) = match table.aux().and_then(WeightAux::affine) {
+            Some(aux) => (aux.scales.view(), aux.biases.view()),
+            None => (table.view(), table.view()),
+        };
+        let args = launch::TernaryRowsArgs {
+            in_dim: geometry.hidden,
+            n_tok,
+        };
+        return launch::run(
+            backend,
+            KernelRef::new(launch::TERNARY, entry),
+            Extent3::new(geometry.hidden / TERNARY_GROUP, n_tok, 1),
+            Extent3::linear(TERNARY_GROUP),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(table.view()),
+                KernelArg::Buffer(scales),
+                KernelArg::Buffer(biases),
+                KernelArg::Buffer(scratch.ids()),
+                KernelArg::Buffer(dst),
+            ],
+        )
+        .map_err(|err| launch::launch_failure(entry, err));
+    }
     if weights.token_embd.dtype.is_affine() {
         let aux = weights
             .token_embd
@@ -1140,6 +1199,9 @@ pub(crate) fn embed_rows(
     )
     .map_err(|err| launch::launch_failure(geometry.embed.entry, err))
 }
+
+/// Elements one threadgroup of the ternary gather covers: one scale group.
+const TERNARY_GROUP: u32 = 128;
 
 /// Columns one threadgroup of the affine embedding gather covers.
 const EMBED_AFFINE_BLOCK: u32 = 64;

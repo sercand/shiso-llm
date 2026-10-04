@@ -27,7 +27,11 @@ use shiso_engine::shape::{
 const TEXT_ARCH: &str = "qwen3_5_text";
 
 /// The `model_type` values whose document carries that subtree.
-const ARCHES: [&str; 2] = ["qwen3_5", "qwen3_5_text"];
+///
+/// The third is a checkpoint of this family stored in a rotated basis: the
+/// same text subtree, with the rotation stated beside it (`hadamard.json`) and
+/// read by [`crate::qwen35::rotation`]. The geometry is this family's exactly.
+const ARCHES: [&str; 3] = ["qwen3_5", "qwen3_5_text", "prism_hadamard_qwen35"];
 
 /// `<|im_end|>`, the id every assistant turn of this family ends on.
 ///

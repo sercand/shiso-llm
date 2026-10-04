@@ -340,3 +340,74 @@ pub fn block_bytes_for(dtype: DType, shape: &TensorShape) -> Option<u64> {
         Some(tiles)
     }
 }
+
+/// One of the eight 6-bit `(scale, min)` pairs a [`BlockQ4K`] packs into 12
+/// bytes.
+const fn q4k_scale_min(j: usize, q: &[u8; 12]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
+    }
+}
+
+/// Decodes one [`BlockQ4K`] to its 256 values, on the host.
+///
+/// A reference decode for the few places a host reads a `q4_K` table row by
+/// row - a block drafter's selector codebooks, one 256-wide super-block a
+/// row - rather than a load-path conversion: a matrix the device reads stays
+/// packed.
+#[must_use]
+pub fn dequant_q4_k(block: &BlockQ4K) -> [f32; QK_K] {
+    let d = half::f16::from_bits(block.d).to_f32();
+    let dmin = half::f16::from_bits(block.dmin).to_f32();
+    let mut out = [0.0_f32; QK_K];
+    for chunk in 0..QK_K / 64 {
+        let (sc1, m1) = q4k_scale_min(2 * chunk, &block.scales);
+        let (sc2, m2) = q4k_scale_min(2 * chunk + 1, &block.scales);
+        let (d1, min1) = (d * f32::from(sc1), dmin * f32::from(m1));
+        let (d2, min2) = (d * f32::from(sc2), dmin * f32::from(m2));
+        let qs = &block.qs[32 * chunk..32 * chunk + 32];
+        for (l, &q) in qs.iter().enumerate() {
+            out[64 * chunk + l] = d1 * f32::from(q & 0xF) - min1;
+            out[64 * chunk + 32 + l] = d2 * f32::from(q >> 4) - min2;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod q4k_tests {
+    use super::*;
+
+    #[test]
+    fn q4_k_decodes_scale_times_code_minus_min_per_32() {
+        let mut block = BlockQ4K {
+            d: half::f16::from_f32(0.5).to_bits(),
+            dmin: half::f16::from_f32(0.25).to_bits(),
+            scales: [0; 12],
+            qs: [0; QK_K / 2],
+        };
+        // Sub-block 0: scale 2, min 4. Sub-block 5 (high scale bits path):
+        // scale 1 | (1 << 4) = 17, min 3.
+        block.scales[0] = 2;
+        block.scales[4] = 4;
+        block.scales[9] = 1 | (3 << 4);
+        block.scales[1] = 1 << 6;
+        block.qs[0] = 0x73;
+        block.qs[64] = 0x50;
+        let out = dequant_q4_k(&block);
+        assert_eq!(
+            out[0].to_bits(),
+            (0.5_f32 * 2.0 * 3.0 - 0.25 * 4.0).to_bits()
+        );
+        // Element 160 is the high nibble of qs[64]: sub-block 5.
+        assert_eq!(
+            out[160].to_bits(),
+            (0.5_f32 * 17.0 * 5.0 - 0.25 * 3.0).to_bits()
+        );
+    }
+}

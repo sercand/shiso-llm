@@ -22,3 +22,21 @@ struct ternary_args_rotate {
     uint32_t hd;
     uint32_t pad;
 };
+
+/// `kernel_ternary_mv_*` and `kernel_ternary_mm_*`: `y[t][o] = sum_k W[o][k] x[t][k]`.
+///
+/// `splits` is the number of interleaved slices of the contraction one
+/// threadgroup carries (a threadgroup is `64 * splits` threads); the host picks
+/// it from the weight's shape alone.
+struct ternary_args_mv {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_tok;
+    uint32_t splits;
+};
+
+/// `kernel_ternary_get_rows_*`: one weight row per token id, decoded to f32.
+struct ternary_args_rows {
+    uint32_t in_dim;
+    uint32_t n_tok;
+};

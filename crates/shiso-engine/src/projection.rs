@@ -54,11 +54,13 @@ use shiso_core::{
 
 use crate::launch::{
     DEQUANT_BLOCK, DenseAffineArgs, DequantPlaneArgs, F32_BYTES, GEMM_BLOCK, GEMM_SMEM_BYTES,
-    GENERIC, MulMmArgs, MulMvArgs, MulMvExtArgs, PlainMv, Q35, Q35MOE, dequant_plane_grid,
-    dequant_plane_name, ext_block, ext_consts_static, ext_grid, ext_module, ext_name, ext_name_for,
-    ext_nxpsg, ext_r1ptg, launch_failure, mm_consts_for, mm_grid, mm_name, plain_block,
-    plain_consts_for, plain_mv, plain_mv_grid, run,
+    GENERIC, MulMmArgs, MulMvArgs, MulMvExtArgs, PlainMv, Q35, Q35MOE, TERNARY, TERNARY_ROWS,
+    TernaryMvArgs, dequant_plane_grid, dequant_plane_name, ext_block, ext_consts_static, ext_grid,
+    ext_module, ext_name, ext_name_for, ext_nxpsg, ext_r1ptg, launch_failure, mm_consts_for,
+    mm_grid, mm_name, plain_block, plain_consts_for, plain_mv, plain_mv_grid, run, ternary_mv_name,
+    ternary_splits, ternary_tag,
 };
+use crate::rotation::{InputRotation, RotationDirection};
 
 /// One projection dimension, as the kernels spell it.
 ///
@@ -346,6 +348,9 @@ pub struct Weight {
     pub out_dim: u32,
     buffer: DeviceBuffer,
     aux: Option<WeightAux>,
+    /// Boxed: most weights carry none, and a weight is a field of several
+    /// enums whose variants would otherwise all grow by it.
+    rotation: Option<Box<InputRotation>>,
 }
 
 impl Weight {
@@ -397,6 +402,7 @@ impl Weight {
             out_dim,
             buffer,
             aux: None,
+            rotation: None,
         })
     }
 
@@ -425,6 +431,7 @@ impl Weight {
             out_dim,
             buffer,
             aux: Some(WeightAux::Affine(AffineAux { scales, biases })),
+            rotation: None,
         })
     }
 
@@ -475,6 +482,7 @@ impl Weight {
                 scales: s_buf,
                 biases: b_buf,
             })),
+            rotation: None,
         })
     }
     /// Imports an FP8 weight and the scale that decodes it.
@@ -568,7 +576,37 @@ impl Weight {
             out_dim,
             buffer,
             aux: None,
+            rotation: None,
         }
+    }
+
+    /// Attaches the rotation this weight's stored basis was folded under.
+    ///
+    /// A forward rotation is applied to the input of every projection through
+    /// this weight; an inverse one is what a gathered embedding row needs and
+    /// is only carried here, for the gather's caller to apply.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] when the rotation's width is not the
+    /// width it would be applied at: the input width for a forward rotation,
+    /// the row width (also `in_dim`) for an inverse one.
+    pub fn with_rotation(mut self, rotation: InputRotation) -> CoreResult<Self> {
+        if rotation.width() != self.in_dim {
+            return Err(CoreError::ShapeMismatch {
+                field: "rotation width",
+                expected: u64::from(self.in_dim),
+                got: u64::from(rotation.width()),
+            });
+        }
+        self.rotation = Some(Box::new(rotation));
+        Ok(self)
+    }
+
+    /// The rotation this weight's stored basis was folded under, if any.
+    #[must_use]
+    pub fn rotation(&self) -> Option<&InputRotation> {
+        self.rotation.as_deref()
     }
 
     /// Whatever this weight carries beside its own bytes.
@@ -644,7 +682,7 @@ fn finite(key: &'static str, value: f32) -> CoreResult<()> {
 ///
 /// [`CoreError::Unsupported`] naming the gap.
 fn dispatchable(dtype: DType, in_dim: u32) -> CoreResult<()> {
-    if dtype.is_affine() {
+    if dtype.is_affine() || dtype.is_ternary() {
         return Ok(());
     }
     if dtype.is_modelopt() {
@@ -791,6 +829,19 @@ pub fn projection(
             len: need_dst,
             buffer_bytes: dst.len(),
         });
+    }
+    // A weight stored in a rotated basis reads a rotated input. The rotation
+    // stages it in the model's scratch; everything below reads that instead.
+    let rotated;
+    let src = match weight.rotation.as_deref() {
+        Some(rotation) if rotation.direction() == RotationDirection::Forward => {
+            rotated = rotation.forward(backend, n_tok, src)?;
+            rotated
+        }
+        _ => src,
+    };
+    if ternary_tag(weight.dtype).is_some() {
+        return ternary_projection(backend, weight, n_tok, src, dst);
     }
     // A chunk wide enough to tile goes through the GEMM when its format has one:
     if weight.dtype.is_affine() {
@@ -1649,6 +1700,58 @@ fn affine_projection(
             KernelArg::Buffer(src),
             KernelArg::Buffer(dst),
             KernelArg::Bytes(bytemuck::bytes_of(&args)),
+        ],
+    )
+}
+
+/// The ternary set's matvec over a `PQ2_0`, `PTQ1_0` or 2-bit affine weight.
+///
+/// Every row count takes the token-blocked matvec: a pass of more than eight
+/// rows is covered by `ceil(n_tok / 8)` row blocks, each reading the weight
+/// once.
+fn ternary_projection(
+    backend: &dyn Backend,
+    weight: &Weight,
+    n_tok: u32,
+    src: DeviceView<'_>,
+    dst: DeviceView<'_>,
+) -> CoreResult<()> {
+    let (entry, t) = ternary_mv_name(weight.dtype, n_tok).ok_or(CoreError::Unsupported {
+        what: "a weight format the ternary set does not read",
+        backend: "engine",
+    })?;
+    let splits = ternary_splits(weight.in_dim, weight.out_dim);
+    let args = TernaryMvArgs {
+        in_dim: weight.in_dim,
+        out_dim: weight.out_dim,
+        n_tok,
+        splits,
+    };
+    // The GGUF blocks carry their scale inside the block; their entries never
+    // read the two array slots, which take the weight again to stay bound.
+    let (scales, biases) = match weight.aux.as_ref().and_then(WeightAux::affine) {
+        Some(aux) => (aux.scales.view(), aux.biases.view()),
+        None if weight.dtype.is_ternary() => (weight.view(), weight.view()),
+        None => {
+            return Err(CoreError::InvalidValue {
+                key: "affine aux",
+                value: "a 2-bit affine weight is missing its scales and biases".into(),
+            });
+        }
+    };
+    run(
+        backend,
+        KernelRef::new(TERNARY, entry),
+        Extent3::new(weight.out_dim.div_ceil(TERNARY_ROWS), n_tok.div_ceil(t), 1),
+        Extent3::linear(64 * splits),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(weight.view()),
+            KernelArg::Buffer(scales),
+            KernelArg::Buffer(biases),
+            KernelArg::Buffer(src),
+            KernelArg::Buffer(dst),
         ],
     )
 }

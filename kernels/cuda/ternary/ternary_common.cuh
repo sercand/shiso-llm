@@ -20,4 +20,21 @@ struct ternary_args_rotate {
 };
 static_assert(sizeof(struct ternary_args_rotate) == 32, "RotateArgs is 32 bytes");
 
+/* `kernel_ternary_mv_*`: `y[t][o] = sum_k W[o][k] x[t][k]`; a block is
+ * `64 * splits` threads over `splits` interleaved contraction slices. */
+struct ternary_args_mv {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_tok;
+    uint32_t splits;
+};
+static_assert(sizeof(struct ternary_args_mv) == 16, "MvArgs is 16 bytes");
+
+/* `kernel_ternary_get_rows_*`. */
+struct ternary_args_rows {
+    uint32_t in_dim;
+    uint32_t n_tok;
+};
+static_assert(sizeof(struct ternary_args_rows) == 8, "RowsArgs is 8 bytes");
+
 #endif

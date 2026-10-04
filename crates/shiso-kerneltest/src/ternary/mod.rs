@@ -10,6 +10,7 @@
 )]
 
 pub mod fixtures;
+pub mod matmul;
 pub mod rotate;
 
 /// Every entry point this set's cases launch, for a backend's pipeline check.

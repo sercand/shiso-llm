@@ -15,4 +15,19 @@ Argument order is the Metal twins' buffer order (`ternary_common.h`).
 
 ```
 kernel_rotate_wht_f32
+kernel_ternary_mv_pq2_0_f32_t1
+kernel_ternary_mv_pq2_0_f32_t2
+kernel_ternary_mv_pq2_0_f32_t4
+kernel_ternary_mv_pq2_0_f32_t8
+kernel_ternary_mv_mlx2_f32_t1
+kernel_ternary_mv_mlx2_f32_t2
+kernel_ternary_mv_mlx2_f32_t4
+kernel_ternary_mv_mlx2_f32_t8
+kernel_ternary_mv_ptq1_0_f32_t1
+kernel_ternary_mv_ptq1_0_f32_t2
+kernel_ternary_mv_ptq1_0_f32_t4
+kernel_ternary_mv_ptq1_0_f32_t8
+kernel_ternary_get_rows_pq2_0_f32
+kernel_ternary_get_rows_mlx2_f32
+kernel_ternary_get_rows_ptq1_0_f32
 ```

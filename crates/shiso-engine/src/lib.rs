@@ -65,6 +65,7 @@ pub mod projection;
 pub mod quantize;
 #[cfg(test)]
 mod recorder;
+pub mod rotation;
 mod rows;
 mod sampling;
 mod sampling_probs;

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use shiso_core::Backend;
 use shiso_cuda::{CudaBackend, CudaOptions};
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::ternary::rotate;
+use shiso_kerneltest::ternary::{matmul, rotate};
 
 /// Opens device 0, or says on stderr why the cases did not run.
 #[expect(
@@ -56,4 +56,25 @@ fn rotate_permuted_heads() {
 fn rotate_round_trip() {
     let Some(gpu) = open() else { return };
     rotate::forward_then_inverse_is_the_identity(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn mv_all_formats() {
+    let Some(gpu) = open() else { return };
+    matmul::mv_matches_the_host_matmul(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn mv_pq2_equals_mlx2() {
+    let Some(gpu) = open() else { return };
+    matmul::pq2_and_mlx2_agree_bitwise(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn get_rows_all_formats() {
+    let Some(gpu) = open() else { return };
+    matmul::get_rows_matches_the_host_decode(&gpu);
 }

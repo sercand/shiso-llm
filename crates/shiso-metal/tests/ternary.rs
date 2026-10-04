@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use shiso_core::{Backend, KernelRef};
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::ternary::{self, rotate};
+use shiso_kerneltest::ternary::{self, matmul, rotate};
 use shiso_metal::MetalBackend;
 
 /// Opens the device, or says on stderr why the cases did not run.
@@ -44,6 +44,12 @@ fn every_ternary_entry_point_resolves_as_a_pipeline() {
             .prepare(KernelRef::new("ternary", entry))
             .unwrap_or_else(|err| panic!("{entry} does not resolve: {err}"));
     }
+    for entry in matmul::entries() {
+        let entry: &'static str = Box::leak(entry.into_boxed_str());
+        backend
+            .prepare(KernelRef::new("ternary", entry))
+            .unwrap_or_else(|err| panic!("{entry} does not resolve: {err}"));
+    }
 }
 
 #[test]
@@ -72,4 +78,25 @@ fn rotate_permuted_heads() {
 fn rotate_round_trip() {
     let Some(gpu) = open() else { return };
     rotate::forward_then_inverse_is_the_identity(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn mv_all_formats() {
+    let Some(gpu) = open() else { return };
+    matmul::mv_matches_the_host_matmul(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn mv_pq2_equals_mlx2() {
+    let Some(gpu) = open() else { return };
+    matmul::pq2_and_mlx2_agree_bitwise(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn get_rows_all_formats() {
+    let Some(gpu) = open() else { return };
+    matmul::get_rows_matches_the_host_decode(&gpu);
 }
