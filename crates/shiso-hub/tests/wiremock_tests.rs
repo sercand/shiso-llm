@@ -399,3 +399,64 @@ async fn concurrent_pulls_single_download() {
     let blob_path = downloader.blob_path(&file_entry.sha256);
     assert!(blob_path.is_file());
 }
+
+/// The manifest is fetched from the path the index names, not from a layout
+/// the client assumes, and a path that would leave the registry is refused
+/// before any request is made.
+#[tokio::test]
+async fn manifest_is_fetched_from_the_index_path() {
+    use shiso_hub::recipe::IndexModelEntry;
+
+    let server = MockServer::start().await;
+    let manifest = br#"{"schema_version":1,"name":"m","family":"qwen35","min_shiso_version":"0.1.0","description":"d","modalities":{"inputs":["text"],"outputs":["text"]},"features":{},"variants":[{"key":"k","backends":["metal"],"quant":"q","requirements":{"min_ram_bytes":1,"disk_bytes":1},"components":{"base":{"provider":"huggingface","repo":"o/n","revision":"0123456789abcdef0123456789abcdef01234567","entry":"m.gguf","files":[{"name":"m.gguf","size":1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}}}]}"#;
+    Mock::given(method("GET"))
+        .and(path("/v1/models/m/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let client = RegistryClient::new(HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: RegistryEndpoint {
+            url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+        },
+        hf_endpoint: url::Url::parse("https://huggingface.co").unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    });
+    let entry = |manifest_path: &str| -> IndexModelEntry {
+        serde_json::from_value(serde_json::json!({
+            "name": "m",
+            "family": "qwen35",
+            "min_shiso_version": "0.1.0",
+            "description": "d",
+            "updated_at": "2026-10-05T00:00:00Z",
+            "manifest": manifest_path,
+            "manifest_sha256": hex::encode(Sha256Hasher::digest(manifest)),
+            "variants": [],
+        }))
+        .unwrap()
+    };
+    let version = semver::Version::parse("0.1.0").unwrap();
+
+    let recipe = client
+        .fetch_manifest(&entry("models/m/index.json"), &version)
+        .await
+        .unwrap();
+    assert_eq!(recipe.name.as_str(), "m");
+
+    for bad in [
+        "/models/m/index.json",
+        "../m.json",
+        "models//m.json",
+        "https://evil/m.json",
+    ] {
+        let err = client
+            .fetch_manifest(&entry(bad), &version)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("manifest path"), "{bad}: {err}");
+    }
+}

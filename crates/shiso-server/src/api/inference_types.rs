@@ -46,6 +46,25 @@ pub struct ModelInfo {
     /// would have it sending less than the server can do. Nothing here is a
     /// field the IR cannot carry.
     pub supported_parameters: Vec<&'static str>,
+    /// What an image request gets when it names no size, and the steps every
+    /// image runs; present on the image generator's entry only.
+    ///
+    /// Not part of the listing format. The wire has no steps field, so this
+    /// is the only place a client (a benchmark, say) can learn what an image
+    /// cost was measured at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageListing>,
+}
+
+/// The image generator's defaults, as the listing reports them.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ImageListing {
+    /// Denoising steps per image.
+    pub steps: u32,
+    /// Default output width in pixels.
+    pub width: u32,
+    /// Default output height in pixels.
+    pub height: u32,
 }
 
 /// The `/v1/models` body.

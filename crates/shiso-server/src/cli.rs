@@ -1231,7 +1231,7 @@ pub struct HubArgs {
     #[arg(
         long,
         env = "SHISO_REGISTRY_URL",
-        default_value = "https://models.shiso.run/registry/v1"
+        default_value = "https://hub.shiso.run/registry/v1"
     )]
     pub registry_url: String,
 

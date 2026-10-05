@@ -24,10 +24,11 @@ pub use error::HubError;
 pub use host::{Backend, CudaInfo, HostProfile, MetalInfo, probe_free_disk, probe_ram};
 pub use progress::ProgressEvent;
 pub use recipe::{
-    CURRENT_SCHEMA_VERSION, CommitSha, Component, ExpertResidency, FileEntry, HostConstraints,
-    Index, IndexModelEntry, IndexVariantEntry, InstalledFileEntry, InstalledMetadata,
-    ModalCapabilities, Modality, ModelName, ModelRef, Recipe, RecipeFeatures, Requirements, Role,
-    RolePath, ServerDefaults, Sha256, Task, Variant, VariantKey,
+    CURRENT_SCHEMA_VERSION, CardSource, CommitSha, Component, ExpertResidency, FileEntry,
+    HostConstraints, Index, IndexModelEntry, IndexVariantEntry, InstalledFileEntry,
+    InstalledMetadata, ModalCapabilities, Modality, ModelInfo, ModelName, ModelRef, QualityScope,
+    QualityScore, Recipe, RecipeFeatures, Requirements, Role, RolePath, ServerDefaults, Sha256,
+    Task, Variant, VariantKey,
 };
 pub use registry::RegistryClient;
 pub use select::{SelectedVariant, host_backend, select_variant};

@@ -81,6 +81,14 @@ pub fn encode_usage(usage: &Usage) -> Value {
             "accepted_prediction_tokens": usage.accepted_prediction_tokens,
             "rejected_prediction_tokens": 0,
         },
+        // Not part of the format. A client that reads only the standard keys
+        // ignores it; `shiso-registry bench` reads it, because timing the
+        // response from outside would fold the HTTP round trip and the
+        // rendering of the prompt into the prefill rate.
+        "timings": {
+            "time_to_first_token_ms": usage.time_to_first_token_ms,
+            "decode_tokens_per_second": usage.tokens_per_second,
+        },
     })
 }
 
@@ -261,6 +269,17 @@ mod tests {
         assert_eq!(usage["prompt_tokens_details"]["audio_tokens"], 750);
         // Nothing this server generates is audio.
         assert_eq!(usage["completion_tokens_details"]["audio_tokens"], 0);
+    }
+
+    #[test]
+    fn the_turn_timings_ride_beside_the_standard_keys() {
+        let usage = encode_usage(&Usage {
+            time_to_first_token_ms: 812.5,
+            tokens_per_second: 41.25,
+            ..Usage::default()
+        });
+        assert_eq!(usage["timings"]["time_to_first_token_ms"], 812.5);
+        assert_eq!(usage["timings"]["decode_tokens_per_second"], 41.25);
     }
 
     /// One request, one turn: the list exists because the format demands one,

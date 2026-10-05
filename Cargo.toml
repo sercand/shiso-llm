@@ -58,14 +58,14 @@ http-body = "1"
 hyper = { version = "1", features = ["server", "http1", "http2", "client"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "http1", "tokio"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
+tower-http = { version = "0.7", features = ["catch-panic", "cors", "fs"] }
 tokio = { version = "1", features = ["full", "parking_lot"] }
 tokio-stream = "0.1"
 futures = "0.3"
 
 
 # --- router ----------------------------------------------------------------
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots", "json", "multipart"] }
 toml = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rand = "0.9"
@@ -80,6 +80,10 @@ wiremock = "0.6"
 indicatif = "0.17"
 sysinfo = "0.33"
 semver = { version = "1", features = ["serde"] }
+# The hub site renders each model's README: CommonMark in, then sanitized,
+# because the README is third-party HTML published under the registry's domain.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+ammonia = "4"
 # --- tokenizer + chat templates -----------------------------------------
 minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "preserve_order"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
