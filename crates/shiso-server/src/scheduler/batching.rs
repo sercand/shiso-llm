@@ -95,6 +95,19 @@ pub(crate) struct ScoreFacts {
 /// Runs one batched prompt pass carries at most.
 pub(crate) const SCORE_BATCH_RUNS: usize = shiso_engine::sparse::MAX_PROMPT_RUNS as usize;
 
+/// Runs one batched prompt pass carries while a generation is decoding: a
+/// decode batch's width.
+///
+/// The mixed quantum already bounds the pass's rows, but not what it costs per
+/// run - each run attends, convolves and is answered on its own - so a pass of
+/// many short tails is longer than its rows say. Beside a decode it is the
+/// decoding stream that pays that, once per tick; capping the runs at what a
+/// decode batch carries keeps the tick's prompt read the size it was planned
+/// to be however many sequences `max_num_seqs` lets in.
+pub(crate) const SCORE_BATCH_RUNS_BESIDE_DECODE: usize = shiso_engine::MAX_DECODE_BATCH as usize;
+
+const _: () = assert!(SCORE_BATCH_RUNS_BESIDE_DECODE <= SCORE_BATCH_RUNS);
+
 /// The widest prompt read a tick may make: narrow beside decoding sequences,
 /// which it would otherwise stall, and wide with nobody to starve.
 pub(crate) const fn quantum(decoding: bool, cfg: &SchedulerConfig) -> usize {
@@ -106,16 +119,17 @@ pub(crate) const fn quantum(decoding: bool, cfg: &SchedulerConfig) -> usize {
 }
 
 /// The score tails one pass reads: in admission order, each fitting what is
-/// left of `quantum`, none paused.
+/// left of `quantum`, none paused, at most `max_runs` of them.
 fn score_batch(
     facts: &[SlotFacts],
     runs: &impl Fn(&SlotFacts) -> bool,
     quantum: usize,
+    max_runs: usize,
 ) -> Vec<PrefillStep> {
     let mut batch = Vec::new();
     let mut rows = 0_usize;
     for (at, fact) in facts.iter().enumerate() {
-        if batch.len() == SCORE_BATCH_RUNS {
+        if batch.len() == max_runs {
             break;
         }
         let Some(score) = fact.score else { continue };
@@ -217,8 +231,13 @@ pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
                 .score
                 .is_some_and(|score| score.tail > 0 && score.tail <= quantum)
     });
+    let max_runs = if decode.is_empty() {
+        SCORE_BATCH_RUNS
+    } else {
+        SCORE_BATCH_RUNS_BESIDE_DECODE
+    };
     let prefill_batch = if batches {
-        score_batch(facts, &runs, quantum)
+        score_batch(facts, &runs, quantum, max_runs)
     } else {
         Vec::new()
     };
@@ -375,7 +394,10 @@ impl SlotTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrefillStep, ScoreFacts, SlotFacts, on_grid, plan};
+    use super::{
+        PrefillStep, SCORE_BATCH_RUNS, SCORE_BATCH_RUNS_BESIDE_DECODE, ScoreFacts, SlotFacts,
+        on_grid, plan,
+    };
     use crate::scheduler::config::{PREFILL_GRID, SchedulerConfig};
 
     fn cfg() -> SchedulerConfig {
@@ -667,6 +689,27 @@ mod tests {
             vec![1, 2],
             "a third would pass 128 rows"
         );
+    }
+
+    #[test]
+    fn beside_a_decoding_sequence_a_batch_carries_no_more_runs_than_a_decode_batch() {
+        // Many one-row tails fit the mixed quantum's rows many times over;
+        // the runs are what is capped, so a wide `max_num_seqs` cannot make
+        // the tick beside a decode a 64-run pass.
+        let mut facts = vec![decoding()];
+        facts.extend((0..80).map(|_| scoring(1)));
+        let beside = plan(&facts, &cfg());
+        assert_eq!(beside.decode, vec![0]);
+        assert_eq!(beside.prefill_batch.len(), SCORE_BATCH_RUNS_BESIDE_DECODE);
+        assert_eq!(
+            slots(&beside.prefill_batch),
+            (1..=SCORE_BATCH_RUNS_BESIDE_DECODE).collect::<Vec<_>>(),
+            "the first in admission order, lead first"
+        );
+        // With nothing decoding there is nobody to stall, and the pass takes
+        // as many runs as it carries.
+        let alone = plan(&facts[1..], &cfg());
+        assert_eq!(alone.prefill_batch.len(), SCORE_BATCH_RUNS);
     }
 
     #[test]
