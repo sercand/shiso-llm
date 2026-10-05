@@ -314,7 +314,9 @@ fn a_scoring_tail_answers_the_same_row_with_or_without_the_draft_warm_up() {
 /// moves a pick, and a batched speculative step then keeps different tokens.
 /// The GGUF verify suite cannot run on this machine, so this is the lock. A
 /// missing golden fails the test; `SHISO_RECORD_GOLDEN=1` records one instead,
-/// on code that is known to be right.
+/// on code that is known to be right. The committed golden was recorded on
+/// 09ccad4a, before the segmented pass learned to carry prompt runs, from a
+/// separate checkout with this test copied in, on the served export.
 #[test]
 #[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
 #[expect(
@@ -365,8 +367,7 @@ fn a_batched_speculative_step_keeps_its_tokens() {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    let golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/scoring-golden/speculate-batch.txt");
+    let golden = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/speculate-batch.txt");
     if std::env::var_os("SHISO_RECORD_GOLDEN").is_some_and(|v| v == "1") {
         std::fs::create_dir_all(golden.parent().expect("a parent")).expect("the directory");
         std::fs::write(&golden, &text).expect("the golden writes");
