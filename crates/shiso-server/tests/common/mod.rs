@@ -326,6 +326,8 @@ impl Audit {
 pub(crate) struct Gate {
     permits: Mutex<u64>,
     ready: Condvar,
+    /// Calls that have reached the gate, whether or not they passed it.
+    arrived: AtomicU64,
 }
 
 impl Gate {
@@ -334,6 +336,7 @@ impl Gate {
         Arc::new(Self {
             permits: Mutex::new(0),
             ready: Condvar::new(),
+            arrived: AtomicU64::new(0),
         })
     }
 
@@ -351,8 +354,25 @@ impl Gate {
         self.ready.notify_all();
     }
 
+    /// Waits until `want` calls have reached the gate: a closed gate is then
+    /// holding the engine thread inside the last of them, past the plan of
+    /// its tick, rather than somewhere before it.
+    pub(crate) async fn wait_for_arrivals(&self, want: u64) {
+        for _ in 0..2_000 {
+            if self.arrived.load(Ordering::Acquire) >= want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!(
+            "only {} of {want} calls reached the gate",
+            self.arrived.load(Ordering::Acquire)
+        );
+    }
+
     /// Blocks until a permit is available and takes one.
     fn pass(&self) {
+        self.arrived.fetch_add(1, Ordering::Release);
         let mut permits = self.permits.lock();
         while *permits == 0 {
             self.ready.wait(&mut permits);

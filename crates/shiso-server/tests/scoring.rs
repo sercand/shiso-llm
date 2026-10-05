@@ -379,7 +379,9 @@ async fn ask_requests(
         ))
         .await
         .expect("the generation is admitted");
-    common::wait_for_calls(&audit, 1).await;
+    // Held inside its first decode step, so no question is admitted - and
+    // none planned - until every one of them is queued.
+    gate.wait_for_arrivals(1).await;
     let mut asks = Vec::new();
     for (at, request) in (2_u64..).zip(requests) {
         let engine_for_ask = engine.clone();
