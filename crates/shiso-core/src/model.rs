@@ -244,6 +244,12 @@ impl<'a> Logits<'a> {
     }
 }
 
+/// The [`CoreError::Unsupported`] `what` of a [`Model::prefill_last_many`]
+/// refusal that says the model, or this build of it, has no batched prompt
+/// pass at all - as opposed to one that refuses a single call it cannot read
+/// the way its solo reads would.
+pub const NO_BATCHED_PROMPT_PASS: &str = "a batched prompt pass on this model or build";
+
 /// A loaded model.
 ///
 /// `Send` but deliberately not `Sync`: exactly one thread owns a model at a
@@ -312,13 +318,19 @@ pub trait Model: Send + std::fmt::Debug {
     /// before reading anything, any call it cannot answer that way, so the
     /// caller can read the runs one at a time instead.
     ///
+    /// A refusal that is a fact about the model or build rather than about
+    /// this call - it has no such pass at all - carries
+    /// [`NO_BATCHED_PROMPT_PASS`] as its `what`, so a caller can stop offering
+    /// the pass; every other refusal refuses this call only.
+    ///
     /// # Errors
     ///
-    /// The default is [`CoreError::Unsupported`] and reads nothing: most
-    /// families have no such pass.
+    /// The default is [`CoreError::Unsupported`] with
+    /// [`NO_BATCHED_PROMPT_PASS`] and reads nothing: most families have no
+    /// such pass.
     fn prefill_last_many(&mut self, _runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
         Err(CoreError::Unsupported {
-            what: "a batched prompt pass",
+            what: NO_BATCHED_PROMPT_PASS,
             backend: "model",
         })
     }

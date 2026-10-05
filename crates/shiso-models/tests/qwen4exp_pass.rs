@@ -1213,8 +1213,10 @@ fn a_batched_prompt_pass_refuses_before_it_claims_anything() {
                 "{what}: {error:?}"
             );
         } else {
+            // A refusal of this call only: the build still has the pass.
             assert!(
-                matches!(error, CoreError::Unsupported { .. }),
+                matches!(error, CoreError::Unsupported { what: refused, .. }
+                    if refused != shiso_core::NO_BATCHED_PROMPT_PASS),
                 "{what}: {error:?}"
             );
         }
@@ -1265,8 +1267,14 @@ fn a_batched_prompt_pass_refuses_a_build_without_the_chunked_recurrence() {
             .prefill_segments(&[(sessions[0], &tail), (sessions[1], &tail)])
             .expect_err("no chunked recurrence to run each run's tail with");
         assert!(
-            matches!(error, CoreError::Unsupported { .. }),
-            "{chunk:?}: {error:?}"
+            matches!(
+                error,
+                CoreError::Unsupported {
+                    what: shiso_core::NO_BATCHED_PROMPT_PASS,
+                    ..
+                }
+            ),
+            "{chunk:?}: the build has no such pass at all: {error:?}"
         );
         assert_eq!(pages_used(&model), held, "{chunk:?}: no page claimed");
         for session in sessions {

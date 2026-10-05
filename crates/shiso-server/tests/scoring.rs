@@ -15,7 +15,7 @@ use shiso_core::{Backend, SamplingParams, Seed, TokenId};
 use shiso_ir::StreamEvent;
 use shiso_server::error::AppError;
 use shiso_server::scheduler::{
-    EngineFailure, EngineHandle, GenerateRequest, SchedulerConfig, ScoreRequest,
+    EngineFailure, EngineHandle, GenerateRequest, SchedulerConfig, ScoreOutcome, ScoreRequest,
     spawn_engine_configured,
 };
 use std::sync::Arc;
@@ -332,9 +332,29 @@ async fn ask_while_decoding(
     hit: Option<u32>,
     questions: &[Question],
 ) -> (Vec<Vec<f64>>, Arc<common::Audit>) {
+    let (replies, audit) =
+        ask_with_fault(cfg, batched, hit, common::BatchFault::Never, questions).await;
+    let answers = replies
+        .into_iter()
+        .map(|reply| reply.expect("answered").label_logprobs)
+        .collect();
+    (answers, audit)
+}
+
+/// [`ask_while_decoding`] over a fake whose batched passes misbehave as
+/// `fault` says, returning every question's reply as it came. Returns only
+/// once every session the engine opened - the generation's included - is
+/// closed again.
+async fn ask_with_fault(
+    cfg: SchedulerConfig,
+    batched: bool,
+    hit: Option<u32>,
+    fault: common::BatchFault,
+    questions: &[Question],
+) -> (Vec<Result<ScoreOutcome, AppError>>, Arc<common::Audit>) {
     let gate = common::Gate::closed();
     let (engine, join, audit) =
-        common::batched_scoring_engine(cfg, Arc::clone(&gate), batched, hit);
+        common::faulty_scoring_engine(cfg, Arc::clone(&gate), batched, hit, fault);
     let chat = engine
         .generate(GenerateRequest::new(
             Arc::from(vec![TokenId::new(1)]),
@@ -355,21 +375,35 @@ async fn ask_while_decoding(
         common::wait_for_queued(&engine, at).await;
     }
     gate.open();
-    let mut answers = Vec::new();
+    let mut replies = Vec::new();
     for ask in asks {
-        answers.push(
-            ask.await
-                .expect("not cancelled")
-                .expect("answered")
-                .label_logprobs,
-        );
+        replies.push(ask.await.expect("not cancelled"));
     }
     let _ = chat.collect::<Vec<_>>().await;
+    // Retirement closes a session after its reply, later in the same tick.
+    let opened = 1 + questions.len() as u64;
+    for _ in 0..2_000 {
+        if audit.closes.load(Ordering::Relaxed) >= opened {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        audit.opens.load(Ordering::Relaxed),
+        opened,
+        "one session each"
+    );
+    assert_eq!(
+        audit.closes.load(Ordering::Relaxed),
+        opened,
+        "every session closed, the failed ones too"
+    );
+    assert!(audit.live.lock().is_empty(), "nothing stays open");
     drop(engine);
     join.join()
         .expect("the engine thread does not panic")
         .expect("the loop exits cleanly");
-    (answers, audit)
+    (replies, audit)
 }
 
 /// A scheduler for eight sequences whose checkpoint floor is `floor`.
@@ -392,15 +426,7 @@ async fn six_siblings(batched: bool, hit: Option<u32>) -> (Vec<Vec<f64>>, Arc<co
 /// Each answer is the keyed row's log-probabilities for its own last token.
 fn assert_keyed_answers(answers: &[Vec<f64>]) {
     for (q, got) in answers.iter().enumerate() {
-        let row = common::keyed_row(6 + u32::try_from(q).expect("a handful"));
-        let norm = logsumexp(&row);
-        for (label, value) in got.iter().enumerate() {
-            let want = f64::from(row[label]) - norm;
-            assert!(
-                (value - want).abs() < 1e-5,
-                "question {q} label {label}: {value} vs {want}"
-            );
-        }
+        assert_keyed_answers_at(q, got);
     }
 }
 
@@ -547,4 +573,133 @@ async fn waiting_siblings_do_not_resume_again_until_a_read_crosses_the_shared_pr
         audit.resumes.lock(),
         prompt_calls(&audit)
     );
+}
+
+/// Six questions read whole (their shared prefix is below the floor), three
+/// to a pass: the mixed quantum holds three 24-token prompts.
+fn two_passes_of_three() -> (SchedulerConfig, Vec<Question>) {
+    let cfg = SchedulerConfig {
+        mixed_quantum: 72,
+        ..sibling_cfg(512)
+    };
+    let questions = (0..6_u32).map(|q| question(20, 6 + q)).collect::<Vec<_>>();
+    (cfg, questions)
+}
+
+/// The keyed answer question `q` of [`two_passes_of_three`] must get.
+fn assert_keyed(q: usize, reply: &Result<ScoreOutcome, AppError>) {
+    let got = &reply
+        .as_ref()
+        .unwrap_or_else(|error| panic!("question {q} failed: {error:?}"))
+        .label_logprobs;
+    assert_keyed_answers_at(q, got);
+}
+
+/// [`assert_keyed_answers`] for one question.
+fn assert_keyed_answers_at(q: usize, got: &[f64]) {
+    let row = common::keyed_row(6 + u32::try_from(q).expect("a handful"));
+    let norm = logsumexp(&row);
+    for (label, value) in got.iter().enumerate() {
+        let want = f64::from(row[label]) - norm;
+        assert!(
+            (value - want).abs() < 1e-5,
+            "question {q} label {label}: {value} vs {want}"
+        );
+    }
+}
+
+/// A batched pass that fails outright fails exactly its members, each with
+/// one error reply, frees their sessions, and leaves the siblings behind them
+/// to answer in a later pass.
+#[tokio::test]
+async fn a_failed_batched_pass_fails_its_members_once_and_later_siblings_answer() {
+    let (cfg, questions) = two_passes_of_three();
+    let (replies, audit) =
+        ask_with_fault(cfg, true, None, common::BatchFault::FailFirst, &questions).await;
+    for (q, reply) in replies.iter().enumerate().take(3) {
+        assert!(
+            reply.is_err(),
+            "question {q} was in the failed pass: {reply:?}"
+        );
+    }
+    for (q, reply) in replies.iter().enumerate().skip(3) {
+        assert_keyed(q, reply);
+    }
+    assert_eq!(
+        prompt_calls(&audit),
+        vec![
+            common::Call::Prefill {
+                tokens: 1,
+                last: true
+            },
+            common::Call::PrefillMany {
+                runs: 3,
+                tokens: 72
+            },
+            common::Call::PrefillMany {
+                runs: 3,
+                tokens: 72
+            },
+        ],
+        "the failed members are not read again"
+    );
+}
+
+/// A pass refused as one call after another was answered reads its lead
+/// alone and does not stop the planner offering batches: the next tick reads
+/// the rest together.
+#[tokio::test]
+async fn a_refusal_after_an_answered_pass_reads_its_lead_alone_and_batches_again() {
+    let (cfg, questions) = two_passes_of_three();
+    let (replies, audit) = ask_with_fault(
+        cfg,
+        true,
+        None,
+        common::BatchFault::RefuseSecond,
+        &questions,
+    )
+    .await;
+    for (q, reply) in replies.iter().enumerate() {
+        assert_keyed(q, reply);
+    }
+    assert_eq!(audit.batch_refusals.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        prompt_calls(&audit),
+        vec![
+            common::Call::Prefill {
+                tokens: 1,
+                last: true
+            },
+            common::Call::PrefillMany {
+                runs: 3,
+                tokens: 72
+            },
+            common::Call::Prefill {
+                tokens: 24,
+                last: true
+            },
+            common::Call::PrefillMany {
+                runs: 2,
+                tokens: 48
+            },
+        ],
+        "the refused pass's lead alone, then the other two batched again"
+    );
+}
+
+/// A run whose row cannot be read back fails alone: the pass's other members
+/// answer from their own rows, and so do the siblings after them.
+#[tokio::test]
+async fn a_run_whose_row_cannot_be_read_back_fails_alone() {
+    let (cfg, questions) = two_passes_of_three();
+    let (replies, audit) =
+        ask_with_fault(cfg, true, None, common::BatchFault::ShortFirst, &questions).await;
+    for (q, reply) in replies.iter().enumerate() {
+        if q == 2 {
+            assert!(reply.is_err(), "the run past the short block: {reply:?}");
+        } else {
+            assert_keyed(q, reply);
+        }
+    }
+    assert_eq!(audit.batched_runs(), vec![3, 3]);
 }

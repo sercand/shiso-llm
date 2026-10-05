@@ -370,6 +370,26 @@ pub(crate) struct FakeModel {
     batched: bool,
     /// Whether it answers every prompt with [`keyed_row`] of its last token.
     keyed: bool,
+    /// How its batched prompt passes misbehave.
+    fault: BatchFault,
+    /// Batched prompt passes it has been asked for, refused or not.
+    batch_calls: u32,
+}
+
+/// How a fake's batched prompt pass misbehaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum BatchFault {
+    /// It answers every pass.
+    #[default]
+    Never,
+    /// Its first pass fails as a device would, after reading.
+    FailFirst,
+    /// Its second pass is refused as a call it cannot read, after the first
+    /// was answered.
+    RefuseSecond,
+    /// Its first pass hands back one row fewer than it had runs, so the last
+    /// run's row cannot be read back.
+    ShortFirst,
 }
 
 /// The row a keyed fake answers a prompt with: a function of the prompt's last
@@ -408,6 +428,8 @@ impl FakeModel {
                 gate: None,
                 batched: false,
                 keyed: false,
+                fault: BatchFault::Never,
+                batch_calls: 0,
             },
             audit,
         )
@@ -429,6 +451,12 @@ impl FakeModel {
     /// The same model, answering batched prompt passes.
     pub(crate) const fn with_batched_prefill(mut self) -> Self {
         self.batched = true;
+        self
+    }
+
+    /// The same model, its batched prompt passes misbehaving as `fault` says.
+    pub(crate) const fn with_batch_fault(mut self, fault: BatchFault) -> Self {
+        self.fault = fault;
         self
     }
 
@@ -573,7 +601,7 @@ impl Model for FakeModel {
         if !self.batched {
             self.audit.batch_refusals.fetch_add(1, Ordering::Relaxed);
             return Err(CoreError::Unsupported {
-                what: "a batched prompt pass",
+                what: shiso_core::NO_BATCHED_PROMPT_PASS,
                 backend: "fake",
             });
         }
@@ -587,6 +615,14 @@ impl Model for FakeModel {
         if let Some(run) = runs.iter().find(|run| !self.open.contains(&run.session)) {
             return Err(CoreError::UnknownSession(run.session));
         }
+        self.batch_calls += 1;
+        if self.fault == BatchFault::RefuseSecond && self.batch_calls == 2 {
+            self.audit.batch_refusals.fetch_add(1, Ordering::Relaxed);
+            return Err(CoreError::Unsupported {
+                what: "a batched prompt pass this call cannot be read as",
+                backend: "fake",
+            });
+        }
         self.audit.calls.lock().push(Call::PrefillMany {
             runs: runs.len(),
             tokens: runs.iter().map(|run| run.tokens.len()).sum(),
@@ -598,7 +634,16 @@ impl Model for FakeModel {
                 .push(run.tokens.iter().map(|t| t.get()).collect());
             self.answer_prompt(run.session, run.tokens, at)?;
         }
-        self.block(count)
+        let first = self.batch_calls == 1;
+        match self.fault {
+            BatchFault::FailFirst if first => Err(CoreError::Backend {
+                backend: "fake",
+                op: "prefill_last_many",
+                source: Box::new(io::Error::other("an injected device failure")),
+            }),
+            BatchFault::ShortFirst if first => self.block(count - 1),
+            _ => self.block(count),
+        }
     }
 
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
@@ -1236,10 +1281,25 @@ pub(crate) fn batched_scoring_engine(
     std::thread::JoinHandle<Result<(), EngineFailure>>,
     Arc<Audit>,
 ) {
+    faulty_scoring_engine(cfg, gate, batched, hit, BatchFault::Never)
+}
+
+/// [`batched_scoring_engine`], its batched passes misbehaving as `fault` says.
+pub(crate) fn faulty_scoring_engine(
+    cfg: SchedulerConfig,
+    gate: Arc<Gate>,
+    batched: bool,
+    hit: Option<u32>,
+    fault: BatchFault,
+) -> (
+    EngineHandle,
+    std::thread::JoinHandle<Result<(), EngineFailure>>,
+    Arc<Audit>,
+) {
     let backend: Arc<dyn Backend> = FakeBackend::new();
     let (model, audit) = FakeCheckpointed::new(&backend, vec![10; 400]);
     let model = model.with_gate(gate).map_inner(|inner| {
-        let inner = inner.with_keyed_rows();
+        let inner = inner.with_keyed_rows().with_batch_fault(fault);
         if batched {
             inner.with_batched_prefill()
         } else {

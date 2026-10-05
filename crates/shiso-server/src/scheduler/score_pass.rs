@@ -20,16 +20,17 @@
 //!
 //! # A model without the pass
 //!
-//! A model that refuses the pass before it ever answered one has no such
-//! pass, and the planner stops offering batches to it. One that answered
-//! before and refuses now refused that call only, and the tails are read one
-//! a tick. Either way the refused tick reads only its lead, so a refusal never
-//! widens a tick past a solo read.
+//! A model that refuses the pass with [`NO_BATCHED_PROMPT_PASS`] has no such
+//! pass - the trait's default, or a build that cannot run it - and the planner
+//! stops offering batches to it. Any other refusal refuses that call only,
+//! whether or not a pass was answered before, and the batch is offered again
+//! on a later tick. Either way the refused tick reads only its lead, so a
+//! refusal never widens a tick past a solo read.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use shiso_core::{CoreError, PromptRun};
+use shiso_core::{CoreError, NO_BATCHED_PROMPT_PASS, PromptRun};
 
 use super::batching::{self, PrefillStep, SlotFacts};
 use super::lifecycle::SeqSlot;
@@ -43,7 +44,7 @@ pub(super) struct ScorePass {
     pub(super) shared_reads: u64,
     /// Whether the model has answered a batched pass.
     answered: bool,
-    /// Whether it refused one before ever answering: the planner stops
+    /// Whether it said it has no such pass at all: the planner stops
     /// offering batches.
     refused: bool,
 }
@@ -197,7 +198,8 @@ impl Coordinator {
     /// One prompt pass over `runs`, each a score's whole remaining prompt,
     /// each answered from its own row. A refusal reads the first run alone
     /// and leaves the rest for later ticks; any other failure fails exactly
-    /// these sequences, whose replies retirement then sends.
+    /// these sequences, whose replies retirement then sends, and a run whose
+    /// row cannot be read back fails alone while the others answer.
     fn run_score_batch(&mut self, runs: &[Quantum]) {
         let started = Instant::now();
         let decode_steps = self.decode_steps;
@@ -251,14 +253,15 @@ impl Coordinator {
                 self.stats.prefilled(rows as u64);
             }
             Err(CoreError::Unsupported { what, .. }) => {
-                if self.score_pass.answered {
-                    tracing::debug!(what, "a batched prompt pass was refused; reading alone");
-                } else {
+                if what == NO_BATCHED_PROMPT_PASS {
                     tracing::warn!(
                         what,
-                        "the model refused a batched prompt pass; score tails are read one at a time"
+                        answered = self.score_pass.answered,
+                        "the model has no batched prompt pass; score tails are read one at a time"
                     );
                     self.score_pass.refused = true;
+                } else {
+                    tracing::debug!(what, "a batched prompt pass was refused; reading alone");
                 }
                 if let Some(first) = runs.first() {
                     self.read_alone(first.step);

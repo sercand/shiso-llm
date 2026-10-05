@@ -1081,7 +1081,16 @@ fn a_model_without_a_batched_prompt_pass_refuses_one_and_reads_nothing() {
             tokens: &tokens,
         }])
         .expect_err("the default reads no batch");
-    assert!(matches!(error, CoreError::Unsupported { .. }), "{error:?}");
+    assert!(
+        matches!(
+            error,
+            CoreError::Unsupported {
+                what: shiso_core::NO_BATCHED_PROMPT_PASS,
+                ..
+            }
+        ),
+        "the default says the model has no such pass at all: {error:?}"
+    );
     // Nothing was read: the whole capacity is still there.
     let whole = vec![token(1); usize::try_from(CAPACITY).expect("small")];
     assert_eq!(

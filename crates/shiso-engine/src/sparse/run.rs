@@ -371,8 +371,9 @@ impl SparseStack {
     /// [`MAX_PROMPT_RUNS`] or more rows than one prefill chunk, and a build
     /// whose chunked recurrence is off or unavailable (its solo reads walk the
     /// sequential kernel, which a segmented pass runs only through per-row
-    /// arrays it does not pack) - all of which a caller reads one session at
-    /// a time instead;
+    /// arrays it does not pack; that one carries
+    /// [`shiso_core::NO_BATCHED_PROMPT_PASS`], the others refuse the call
+    /// only) - all of which a caller reads one session at a time instead;
     /// [`CoreError::ContextOverflow`]; [`CoreError::ShapeMismatch`] for no runs
     /// or an empty one; [`CoreError::InvalidValue`] for a session named twice;
     /// and whatever the pass reports.
@@ -447,9 +448,11 @@ impl SparseStack {
         // Each run's recurrence is the chunked one its solo read takes; with
         // that kernel off, the pass would fall to the verify's segmented walk,
         // which reads per-row pointer arrays this pass never packs.
+        // A fact about the build, not this call, so it is the refusal that
+        // says there is no such pass here at all.
         if self.opts.chunk.min_rows == 0 || !self.opts.chunk.available {
             return Err(CoreError::Unsupported {
-                what: "a batched prompt pass on a build whose chunked recurrence is off",
+                what: shiso_core::NO_BATCHED_PROMPT_PASS,
                 backend: "engine",
             });
         }
