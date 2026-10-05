@@ -40,8 +40,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use base64::Engine as _;
 use parking_lot::{Condvar, Mutex};
 use shiso_core::{
-    Backend, CoreError, CoreResult, DecodeStep, DeviceBuffer, DeviceView, KernelRef, LaunchArgs,
-    Logits, Model, ModelInfo, PromptRun, RawBuffer, SessionId, StopTokens, TokenId, alloc,
+    Backend, CoreError, CoreResult, DecisionModel, DecisionQuestion, DecodeStep, DeviceBuffer,
+    DeviceView, KernelRef, LaunchArgs, Logits, Model, ModelInfo, PromptRun, RawBuffer, SessionId,
+    StopTokens, TokenId, alloc,
 };
 use shiso_engine::PersistRefusal;
 use shiso_engine::Reason;
@@ -249,6 +250,27 @@ pub(crate) struct Audit {
     pub(crate) sweeps: AtomicU64,
     /// Batched prompt passes the fake refused.
     pub(crate) batch_refusals: AtomicU64,
+    /// Every decision the fake's head answered, in order.
+    pub(crate) decisions: Mutex<Vec<DecisionNote>>,
+}
+
+/// What a fake decision head saw of one decision pass when it answered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecisionNote {
+    /// Tokens of the prompt the head was asked to answer over.
+    pub(crate) prompt_len: usize,
+    /// Prompt rows the session read alone, through `prefill_chunk` and
+    /// `prefill_last`, after the capture began.
+    pub(crate) read_alone: usize,
+    /// Prompt rows it read as one run of a batched prompt pass.
+    pub(crate) read_batched: usize,
+}
+
+/// The option logit a fake decision head answers option `option` of a
+/// question of kind `kind` with: a function of the two alone, so a test
+/// computes the answer it expects.
+pub(crate) fn decision_logit(kind: u32, option: usize) -> f32 {
+    f32::from(u16::try_from(kind * 10).unwrap_or(0)) + f32::from(u8::try_from(option).unwrap_or(0))
 }
 
 impl Audit {
@@ -374,6 +396,11 @@ pub(crate) struct FakeModel {
     fault: BatchFault,
     /// Batched prompt passes it has been asked for, refused or not.
     batch_calls: u32,
+    /// Whether it carries a decision head.
+    decision_head: bool,
+    /// The prompt rows each session the head is capturing has read since
+    /// the capture began: alone, and in batched passes.
+    captures: HashMap<SessionId, (usize, usize)>,
 }
 
 /// How a fake's batched prompt pass misbehaves.
@@ -430,6 +457,8 @@ impl FakeModel {
                 keyed: false,
                 fault: BatchFault::Never,
                 batch_calls: 0,
+                decision_head: false,
+                captures: HashMap::new(),
             },
             audit,
         )
@@ -464,6 +493,26 @@ impl FakeModel {
     pub(crate) const fn with_keyed_rows(mut self) -> Self {
         self.keyed = true;
         self
+    }
+
+    /// The same model, carrying a decision head that answers with
+    /// [`decision_logit`] and refuses a pass whose captured rows do not cover
+    /// its prompt, as the real head does.
+    pub(crate) const fn with_decision_head(mut self) -> Self {
+        self.decision_head = true;
+        self
+    }
+
+    /// Counts `tokens` prompt rows `session` read toward its capture, when
+    /// one is running.
+    fn capture(&mut self, session: SessionId, tokens: usize, batched: bool) {
+        if let Some((alone, together)) = self.captures.get_mut(&session) {
+            if batched {
+                *together += tokens;
+            } else {
+                *alone += tokens;
+            }
+        }
     }
 
     /// Writes the row a prompt ending in `tokens` answers into logits row
@@ -561,6 +610,7 @@ impl Model for FakeModel {
         };
         self.open.remove(at);
         self.cursors.remove(&session);
+        self.captures.remove(&session);
         self.audit.closes.fetch_add(1, Ordering::Relaxed);
         self.audit.live.lock().retain(|held| *held != session);
         Ok(())
@@ -574,6 +624,7 @@ impl Model for FakeModel {
             tokens: tokens.len(),
             last: false,
         });
+        self.capture(session, tokens.len(), false);
         self.audit
             .prefill_prompts
             .lock()
@@ -589,6 +640,7 @@ impl Model for FakeModel {
             tokens: tokens.len(),
             last: true,
         });
+        self.capture(session, tokens.len(), false);
         self.audit
             .prefill_prompts
             .lock()
@@ -628,6 +680,7 @@ impl Model for FakeModel {
             tokens: runs.iter().map(|run| run.tokens.len()).sum(),
         });
         for (at, run) in (0_u32..).zip(runs) {
+            self.capture(run.session, run.tokens.len(), true);
             self.audit
                 .prefill_prompts
                 .lock()
@@ -663,10 +716,59 @@ impl Model for FakeModel {
         self.block(u32::try_from(steps.len()).unwrap_or(MAX_ROWS))
     }
 
+    fn decision_mut(&mut self) -> Option<&mut dyn DecisionModel> {
+        if self.decision_head { Some(self) } else { None }
+    }
+
     fn teardown(&mut self) -> CoreResult<()> {
         self.audit.teardowns.fetch_add(1, Ordering::Relaxed);
         self.logits = None;
         Ok(())
+    }
+}
+
+/// The fake's decision head: it answers [`decision_logit`] for every option,
+/// and only over a prompt whose every row its session read after the capture
+/// began - the real head's refusal when a resume left rows unread.
+impl DecisionModel for FakeModel {
+    fn capture_hidden(&mut self, session: SessionId) -> CoreResult<()> {
+        if !self.open.contains(&session) {
+            return Err(CoreError::UnknownSession(session));
+        }
+        self.captures.insert(session, (0, 0));
+        Ok(())
+    }
+
+    fn decide(
+        &mut self,
+        session: SessionId,
+        prompt: &[TokenId],
+        questions: &[DecisionQuestion],
+    ) -> CoreResult<Vec<Vec<f32>>> {
+        let (read_alone, read_batched) = self
+            .captures
+            .remove(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        self.audit.decisions.lock().push(DecisionNote {
+            prompt_len: prompt.len(),
+            read_alone,
+            read_batched,
+        });
+        if read_alone + read_batched != prompt.len() {
+            return Err(CoreError::ShapeMismatch {
+                field: "decision.captured_rows",
+                expected: prompt.len() as u64,
+                got: (read_alone + read_batched) as u64,
+            });
+        }
+        Ok(questions
+            .iter()
+            .map(|question| {
+                (0..question.options.len())
+                    .map(|option| decision_logit(question.kind, option))
+                    .collect()
+            })
+            .collect())
     }
 }
 
@@ -759,6 +861,10 @@ impl Model for FakeCheckpointed {
             *self.written.entry(step.session).or_insert(0) += 1;
         }
         self.inner.decode_batch(steps)
+    }
+
+    fn decision_mut(&mut self) -> Option<&mut dyn DecisionModel> {
+        self.inner.decision_mut()
     }
 
     fn teardown(&mut self) -> CoreResult<()> {
@@ -1296,10 +1402,30 @@ pub(crate) fn faulty_scoring_engine(
     std::thread::JoinHandle<Result<(), EngineFailure>>,
     Arc<Audit>,
 ) {
+    scoring_engine(cfg, gate, (batched, hit, fault), false)
+}
+
+/// [`faulty_scoring_engine`] over `(batched, hit, fault)`, carrying a fake
+/// decision head when `decision_head` is set.
+pub(crate) fn scoring_engine(
+    cfg: SchedulerConfig,
+    gate: Arc<Gate>,
+    (batched, hit, fault): (bool, Option<u32>, BatchFault),
+    decision_head: bool,
+) -> (
+    EngineHandle,
+    std::thread::JoinHandle<Result<(), EngineFailure>>,
+    Arc<Audit>,
+) {
     let backend: Arc<dyn Backend> = FakeBackend::new();
     let (model, audit) = FakeCheckpointed::new(&backend, vec![10; 400]);
     let model = model.with_gate(gate).map_inner(|inner| {
         let inner = inner.with_keyed_rows().with_batch_fault(fault);
+        let inner = if decision_head {
+            inner.with_decision_head()
+        } else {
+            inner
+        };
         if batched {
             inner.with_batched_prefill()
         } else {

@@ -352,9 +352,24 @@ async fn ask_with_fault(
     fault: common::BatchFault,
     questions: &[Question],
 ) -> (Vec<Result<ScoreOutcome, AppError>>, Arc<common::Audit>) {
+    let requests = questions
+        .iter()
+        .map(|ask| score_request(&ask.prompt, &[0, 1, 2]).with_shared_prefix(ask.shared))
+        .collect();
+    ask_requests(cfg, (batched, hit, fault), false, requests).await
+}
+
+/// [`ask_with_fault`] over whole requests, on a fake carrying a decision head
+/// when `decision_head` is set.
+async fn ask_requests(
+    cfg: SchedulerConfig,
+    fake: (bool, Option<u32>, common::BatchFault),
+    decision_head: bool,
+    requests: Vec<ScoreRequest>,
+) -> (Vec<Result<ScoreOutcome, AppError>>, Arc<common::Audit>) {
     let gate = common::Gate::closed();
-    let (engine, join, audit) =
-        common::faulty_scoring_engine(cfg, Arc::clone(&gate), batched, hit, fault);
+    let (engine, join, audit) = common::scoring_engine(cfg, Arc::clone(&gate), fake, decision_head);
+    let asked = requests.len();
     let chat = engine
         .generate(GenerateRequest::new(
             Arc::from(vec![TokenId::new(1)]),
@@ -366,8 +381,7 @@ async fn ask_with_fault(
         .expect("the generation is admitted");
     common::wait_for_calls(&audit, 1).await;
     let mut asks = Vec::new();
-    for (at, ask) in (2_u64..).zip(questions) {
-        let request = score_request(&ask.prompt, &[0, 1, 2]).with_shared_prefix(ask.shared);
+    for (at, request) in (2_u64..).zip(requests) {
         let engine_for_ask = engine.clone();
         asks.push(tokio::spawn(
             async move { engine_for_ask.score(request).await },
@@ -381,7 +395,7 @@ async fn ask_with_fault(
     }
     let _ = chat.collect::<Vec<_>>().await;
     // Retirement closes a session after its reply, later in the same tick.
-    let opened = 1 + questions.len() as u64;
+    let opened = 1 + asked as u64;
     for _ in 0..2_000 {
         if audit.closes.load(Ordering::Relaxed) >= opened {
             break;
@@ -702,4 +716,113 @@ async fn a_run_whose_row_cannot_be_read_back_fails_alone() {
         }
     }
     assert_eq!(audit.batched_runs(), vec![3, 3]);
+}
+
+/// A decision pass asked beside sibling label scores that share its prefix -
+/// and that names that prefix itself - is read alone, whole, and never stands
+/// on a stored prefix: its head needs the final row of every prompt token.
+/// The label siblings still resume and share a batched pass, and every
+/// answer is the one each would get alone.
+#[tokio::test]
+async fn a_decision_pass_beside_sibling_scores_is_read_alone_and_never_resumes() {
+    let labels = (0..5_u32).map(|q| question(64, 6 + q)).collect::<Vec<_>>();
+    let mut decision_prompt = question(64, 0).prompt;
+    decision_prompt.truncate(64);
+    decision_prompt.extend([3, 4, 5, 50, 51, 52]);
+    let questions: Arc<[shiso_core::DecisionQuestion]> = Arc::from(vec![
+        shiso_core::DecisionQuestion {
+            kind: 0,
+            span: 64..66,
+            options: vec![66..67],
+        },
+        shiso_core::DecisionQuestion {
+            kind: 1,
+            span: 64..67,
+            options: vec![67..68, 68..69, 69..70],
+        },
+    ]);
+    let decision = ScoreRequest::decision(
+        Arc::from(
+            decision_prompt
+                .iter()
+                .copied()
+                .map(TokenId::new)
+                .collect::<Vec<_>>(),
+        ),
+        questions,
+    )
+    .with_shared_prefix(64);
+    // The decision is admitted second: after the first sibling, which reads
+    // alone, and ahead of the four the planner would batch.
+    let mut decision = Some(decision);
+    let mut requests = Vec::new();
+    let mut label_at = Vec::new();
+    for (at, ask) in labels.iter().enumerate() {
+        if at == 1
+            && let Some(decision) = decision.take()
+        {
+            requests.push(decision);
+        }
+        label_at.push(requests.len());
+        requests.push(score_request(&ask.prompt, &[0, 1, 2]).with_shared_prefix(ask.shared));
+    }
+    let (replies, audit) = ask_requests(
+        sibling_cfg(64),
+        (true, Some(64), common::BatchFault::Never),
+        true,
+        requests,
+    )
+    .await;
+
+    for (q, at) in label_at.iter().enumerate() {
+        assert_keyed(q, &replies[*at]);
+    }
+    let decided = replies[1].as_ref().expect("the decision is answered");
+    assert!(decided.label_logprobs.is_empty(), "no label rows are read");
+    assert_eq!(
+        decided.option_logits,
+        vec![
+            vec![common::decision_logit(0, 0)],
+            vec![
+                common::decision_logit(1, 0),
+                common::decision_logit(1, 1),
+                common::decision_logit(1, 2),
+            ],
+        ],
+        "answered by the decision head"
+    );
+    assert_eq!(
+        audit.decisions.lock().as_slice(),
+        &[common::DecisionNote {
+            prompt_len: 70,
+            read_alone: 70,
+            read_batched: 0,
+        }],
+        "the head saw every row of the prompt, read alone"
+    );
+    assert!(
+        audit
+            .prefill_prompts
+            .lock()
+            .iter()
+            .any(|read| *read == decision_prompt),
+        "the decision's whole prompt is one solo read: {:?}",
+        audit.calls.lock()
+    );
+    assert!(
+        !audit.resumes.lock().contains(&decision_prompt.len()),
+        "the decision asked for no resume: {:?}",
+        audit.resumes.lock()
+    );
+    assert_eq!(
+        score_resumes(&audit),
+        labels.len(),
+        "each label sibling resumed: {:?}",
+        audit.resumes.lock()
+    );
+    assert!(
+        audit.batched_runs().iter().any(|runs| *runs > 1),
+        "the label siblings still share a pass: {:?}",
+        audit.calls.lock()
+    );
 }
