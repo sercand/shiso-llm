@@ -48,9 +48,16 @@ pub const MAX_ARGS: usize = 24;
 
 /// Rows one binder may hold a session for.
 ///
-/// One row per run of the widest segmented pass, which is wider than a decode
-/// batch. Per-row pointer arrays are still packed only for a decode batch's or
-/// a verify's rows.
+/// One row per run of the widest segmented pass ([`MAX_PROMPT_RUNS`]), which
+/// is wider than a decode batch: a prompt-role pass binds each run's own state
+/// by run. This bounds the binder only. The per-row pointer arrays are packed
+/// for a decode batch's or a verify's rows alone, at most
+/// [`MAX_DECODE_BATCH`] of them, into a slab the scratch sizes at the logits
+/// block's height ([`LOGIT_BLOCK_ROWS`]).
+///
+/// [`MAX_PROMPT_RUNS`]: crate::sparse::stack::MAX_PROMPT_RUNS
+/// [`MAX_DECODE_BATCH`]: crate::sparse::stack::MAX_DECODE_BATCH
+/// [`LOGIT_BLOCK_ROWS`]: crate::sparse::stack::LOGIT_BLOCK_ROWS
 pub const MAX_ROWS: usize = crate::sparse::stack::MAX_PROMPT_RUNS as usize;
 
 /// Which bound tensor an operand names.

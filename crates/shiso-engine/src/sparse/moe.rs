@@ -76,8 +76,11 @@ pub const GROUP_MIN_UNRELATED_ROWS: u32 = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[expect(
     clippy::large_enum_variant,
-    reason = "the origin is `Copy` so every attention context can carry it; a \
-              boxed run table would cost that, and one origin is built per pass"
+    reason = "the origin is `Copy` so every attention context can carry it, and it \
+              is copied into the plan of every layer of a pass - a few hundred bytes \
+              a copy, a few dozen copies a pass, against launches that cost \
+              microseconds each; a boxed run table would trade that for an \
+              allocation per pass and a clone wherever a copy is taken now"
 )]
 pub enum RowOrigin {
     /// One sequence's consecutive positions: a prefill chunk, or a speculative
@@ -196,6 +199,11 @@ impl Segments {
 
     /// The pass row of run `run`'s last position: the row its logits and its
     /// staged draft row come from.
+    ///
+    /// Every caller asks for a run below [`Segments::count`]. Past the last
+    /// run this is not an error but the pass's own last row, which is the
+    /// last run's, because [`Segments::start`] clamps to the pass's row count
+    /// there and [`Segments::len`] is zero; zero for a pass with no rows.
     #[must_use]
     pub fn last_row(&self, run: u32) -> u32 {
         self.start(run)

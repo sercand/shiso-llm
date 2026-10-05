@@ -35,11 +35,7 @@ fn render(out: &mut String, title: &str, pass: &Pass) {
         pass.plan.steps().len()
     );
     for span in &pass.islands {
-        let _ = writeln!(
-            out,
-            "island {}+{} {:?}",
-            span.start, span.len, span.key
-        );
+        let _ = writeln!(out, "island {}+{} {:?}", span.start, span.len, span.key);
     }
     for step in pass.plan.steps() {
         let _ = writeln!(out, "{}", line(step));
@@ -129,7 +125,15 @@ pub(crate) fn snapshot() -> String {
     // the prompt (one logits row) and one that does not.
     let (_dir, _fake, mut model) = loaded();
     let session = model.open_session().expect("a session opens");
-    for (rows, logits) in [(1, 1), (4, 0), (4, 1), (40, 1), (127, 1), (128, 1), (256, 0)] {
+    for (rows, logits) in [
+        (1, 1),
+        (4, 0),
+        (4, 1),
+        (40, 1),
+        (127, 1),
+        (128, 1),
+        (256, 0),
+    ] {
         let pass = model
             .stack()
             .plan_prompt(session, &tokens(0, rows), logits)
@@ -144,7 +148,11 @@ pub(crate) fn snapshot() -> String {
         let pass = model
             .plan_chunk(session, &tokens(0, rows), logits)
             .expect("a step chunk plans");
-        render(&mut out, &format!("step {rows} rows, {logits} logits"), &pass);
+        render(
+            &mut out,
+            &format!("step {rows} rows, {logits} logits"),
+            &pass,
+        );
     }
     // Past the indexer's budget, where a solo read's rows attend over a
     // selection.

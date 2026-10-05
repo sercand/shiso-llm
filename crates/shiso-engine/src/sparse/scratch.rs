@@ -477,9 +477,14 @@ impl Buf {
             Self::PleKey | Self::PleQuery | Self::PleGated | Self::PleConv => {
                 per_token(shape.stream_dim())
             }
-            // One slot per row of the widest decode batch in every array, so
+            // One slot per row of the logits block in every array
+            // (`LOGIT_BLOCK_ROWS`, the widest prompt-role pass's run count), so
             // the stride is the same at every batch width and an address a
-            // launch was planned against never moves with the row count.
+            // launch was planned against never moves with the row count. Only
+            // a decode batch or a verify packs these - at most
+            // `MAX_DECODE_BATCH` rows - so most of the slab is never written:
+            // a prompt-role segmented pass binds each run's state by run and
+            // packs no pointer at all.
             Self::RowPointers => {
                 u64::from(crate::sparse::rows::arrays(shape))
                     * u64::from(logit_rows)
