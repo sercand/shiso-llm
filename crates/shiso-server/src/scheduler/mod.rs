@@ -1775,10 +1775,6 @@ impl Coordinator {
     }
 
     /// One bounded quantum of one sequence's prompt.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the quantum and its three termini - generate, score, decide - read as one step"
-    )]
     fn prefill_step(&mut self, step: PrefillStep) {
         let Some(quantum) = self.ready_step(step) else {
             return;

@@ -735,7 +735,7 @@ async fn a_decision_pass_beside_sibling_scores_is_read_alone_and_never_resumes()
         shiso_core::DecisionQuestion {
             kind: 0,
             span: 64..66,
-            options: vec![66..67],
+            options: vec![66..67, 67..68],
         },
         shiso_core::DecisionQuestion {
             kind: 1,
@@ -784,7 +784,7 @@ async fn a_decision_pass_beside_sibling_scores_is_read_alone_and_never_resumes()
     assert_eq!(
         decided.option_logits,
         vec![
-            vec![common::decision_logit(0, 0)],
+            vec![common::decision_logit(0, 0), common::decision_logit(0, 1)],
             vec![
                 common::decision_logit(1, 0),
                 common::decision_logit(1, 1),
@@ -803,11 +803,7 @@ async fn a_decision_pass_beside_sibling_scores_is_read_alone_and_never_resumes()
         "the head saw every row of the prompt, read alone"
     );
     assert!(
-        audit
-            .prefill_prompts
-            .lock()
-            .iter()
-            .any(|read| *read == decision_prompt),
+        audit.prefill_prompts.lock().contains(&decision_prompt),
         "the decision's whole prompt is one solo read: {:?}",
         audit.calls.lock()
     );

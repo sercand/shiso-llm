@@ -2122,7 +2122,7 @@ mod tests {
                 Arc::from(vec![shiso_core::DecisionQuestion {
                     kind: 0,
                     span: 64..70,
-                    options: vec![70..72],
+                    options: vec![70..71, 71..72],
                 }]),
             )
         } else {
