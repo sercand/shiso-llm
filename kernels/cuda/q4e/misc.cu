@@ -29,3 +29,12 @@ extern "C" __global__ void q4e_argmax_rows_kernel(int32_t *out, const float *log
     q4e_block_argmax(best, best_i, &ov, &oi);
     if (threadIdx.x == 0u) out[blockIdx.x] = oi;
 }
+
+// One row copied within a buffer: a prompt-role segmented pass gathers each
+// run's last collapsed row to the front of the block, in run order, so one
+// projection covers them all. Run r's last row is at or past row r, so no copy
+// reads a row an earlier copy wrote.
+extern "C" __global__ void q4e_copy_row_kernel(float *dst, const float *src, uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}

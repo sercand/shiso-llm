@@ -51,6 +51,6 @@ pub use media::{
     VisionPrefill,
 };
 pub use model::{
-    DecodeStep, DraftHint, Logits, Model, ModelInfo, SamplingParams, Speculated, Speculating,
-    StopTokens, VerifiedBlock,
+    DecodeStep, DraftHint, Logits, Model, ModelInfo, PromptRun, SamplingParams, Speculated,
+    Speculating, StopTokens, VerifiedBlock,
 };

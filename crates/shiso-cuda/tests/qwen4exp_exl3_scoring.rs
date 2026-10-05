@@ -17,11 +17,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use shiso_core::CoreError;
 use shiso_core::backend::Backend;
 use shiso_core::config::HfConfig;
 use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::model::Logits;
 use shiso_core::model::Model;
+use shiso_core::model::PromptRun;
 use shiso_core::model::Speculating as _;
 use shiso_cuda::{CudaBackend, CudaOptions};
 use shiso_engine::EngineOptions;
@@ -559,6 +561,227 @@ fn time_a_short_prefill() {
         model.close_session(session).expect("closes");
         let label = if pass == 0 { "warm-up" } else { "timed" };
         println!("PREFILL draft={draft} tokens={width} pass={pass} {label} ms={ms:.2}");
+    }
+    model.teardown().expect("the model tears down");
+}
+
+#[test]
+#[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
+fn the_model_reads_batched_tails_through_prefill_last_many() {
+    let backend: Arc<dyn Backend> =
+        CudaBackend::new(0, CudaOptions::default()).expect("a CUDA device");
+    let Some(mut model) = load_served(&backend, true) else {
+        skip("no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
+        return;
+    };
+    let tokens = prompt(1_200);
+    let prefix = &tokens[..1_024];
+    let (a, b) = (&tokens[1_024..1_064], &tokens[1_100..1_107]);
+    let want = [
+        solo_tail(&backend, &mut model, prefix, a),
+        solo_tail(&backend, &mut model, prefix, b),
+    ];
+    let (sa, sb) = (
+        scoring_on(&mut model, prefix),
+        scoring_on(&mut model, prefix),
+    );
+    let got = {
+        let logits = model
+            .prefill_last_many(&[
+                PromptRun {
+                    session: sa,
+                    tokens: a,
+                },
+                PromptRun {
+                    session: sb,
+                    tokens: b,
+                },
+            ])
+            .expect("the batched pass runs");
+        (0..2)
+            .map(|r| read_row(&backend, &logits, r))
+            .collect::<Vec<_>>()
+    };
+    assert_rows_match(&got, &want, "through the model");
+    let plain = model.open_session().expect("a session");
+    model.prefill_chunk(plain, prefix).expect("the prefix runs");
+    let error = model
+        .prefill_last_many(&[PromptRun {
+            session: plain,
+            tokens: a,
+        }])
+        .expect_err("a plain session is read alone");
+    assert!(matches!(error, CoreError::Unsupported { .. }), "{error:?}");
+    assert_eq!(model.stack().session(plain).expect("open").written(), 1_024);
+    for session in [sa, sb, plain] {
+        model.close_session(session).expect("closes");
+    }
+    model.teardown().expect("the model tears down");
+}
+
+/// Prints the last steps of a batched plan over eight-token tails on
+/// `sessions`, where the per-run steps before the suppression end, so a
+/// profile can name the vocabulary projection's kernel.
+#[expect(clippy::print_stdout, reason = "the plan's tail is the test's output")]
+fn print_plan_tail(model: &Qwen4ExpModel, sessions: &[SessionId]) {
+    let runs = sessions.len();
+    let plan = model
+        .stack()
+        .plan_prompt_segments(sessions, &vec![8; runs])
+        .expect("plans");
+    let steps = plan.plan.steps();
+    for step in &steps[steps.len().saturating_sub(3 * runs + 1)..] {
+        let line = format!("{step:?}");
+        println!(
+            "PLAN-TAIL runs={runs} {}",
+            line.chars().take(200).collect::<String>()
+        );
+    }
+}
+
+/// Milliseconds the solo reads of `tails` take, summed, each on a scoring
+/// session of its own standing on `prefix`, clocked once the prefix drains.
+fn time_solo_tails(
+    backend: &Arc<dyn Backend>,
+    model: &mut Qwen4ExpModel,
+    prefix: &[TokenId],
+    tails: &[&[TokenId]],
+) -> f64 {
+    let mut ms = 0.0;
+    for tail in tails {
+        let session = scoring_on(model, prefix);
+        backend.sync().expect("the queue drains");
+        let started = Instant::now();
+        let _ = last_row(backend, model, session, tail);
+        ms += started.elapsed().as_secs_f64() * 1e3;
+        model.close_session(session).expect("closes");
+    }
+    ms
+}
+
+/// Times one batched prompt pass over `runs` eight-token tails against the
+/// same tails read one at a time, and prints the plan's tail so a profile can
+/// name the vocabulary projection's kernel.
+///
+/// `SCORING_RUNS` (default `1,4,8,16,32,64`) lists the run counts. Solo sums
+/// are timed up to eight runs. The export loads without its draft head, so a
+/// session is its recurrent state alone and sixty-four fit beside the scratch.
+/// If a count cannot open its sessions, the test prints how many did and stops.
+#[test]
+#[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
+#[expect(clippy::print_stdout, reason = "the timings are the test's output")]
+fn time_batched_scoring_tails() {
+    let backend: Arc<dyn Backend> =
+        CudaBackend::new(0, CudaOptions::default()).expect("a CUDA device");
+    let Some(mut model) = load_served(&backend, false) else {
+        skip("no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
+        return;
+    };
+    let counts = std::env::var("SCORING_RUNS").map_or_else(
+        |_| vec![1, 4, 8, 16, 32, 64],
+        |v| {
+            v.split(',')
+                .filter_map(|n| n.trim().parse::<usize>().ok())
+                .collect::<Vec<_>>()
+        },
+    );
+    let tokens = prompt(1_024 + 8 * 64);
+    let prefix = &tokens[..1_024];
+    'counts: for runs in counts {
+        let tails = (0..runs)
+            .map(|r| &tokens[1_024 + 8 * r..1_032 + 8 * r])
+            .collect::<Vec<_>>();
+        let (mut batched, mut solo) = (Vec::new(), Vec::new());
+        for pass in 0..=5 {
+            let mut sessions = Vec::new();
+            for _ in 0..runs {
+                match model.open_session() {
+                    Ok(session) => sessions.push(session),
+                    Err(error) => {
+                        println!("BATCH runs={runs} opened={} error={error}", sessions.len());
+                        break 'counts;
+                    }
+                }
+            }
+            for session in &sessions {
+                model.kv_set_scoring(*session).expect("marked");
+                model.kv_set_hints(*session, &[1_024]).expect("hinted");
+                model
+                    .prefill_chunk(*session, prefix)
+                    .expect("the prefix runs");
+            }
+            if pass == 0 {
+                print_plan_tail(&model, &sessions);
+            }
+            let pieces = sessions
+                .iter()
+                .zip(&tails)
+                .map(|(session, tail)| PromptRun {
+                    session: *session,
+                    tokens: tail,
+                })
+                .collect::<Vec<_>>();
+            // The prefixes' passes are still queued; the clock starts once they drain.
+            backend.sync().expect("the queue drains");
+            let started = Instant::now();
+            {
+                let logits = model.prefill_last_many(&pieces).expect("the pass runs");
+                for r in 0..u32::try_from(runs).expect("runs") {
+                    let _ = read_row(&backend, &logits, r);
+                }
+            }
+            let ms = started.elapsed().as_secs_f64() * 1e3;
+            for session in sessions {
+                model.close_session(session).expect("closes");
+            }
+            let solo_ms = if runs <= 8 {
+                time_solo_tails(&backend, &mut model, prefix, &tails)
+            } else {
+                0.0
+            };
+            if pass > 0 {
+                batched.push(ms);
+                solo.push(solo_ms);
+            }
+            println!("BATCH runs={runs} pass={pass} batched_ms={ms:.2} solo_sum_ms={solo_ms:.2}");
+        }
+        let mean = |v: &[f64]| {
+            v.iter().sum::<f64>() / f64::from(u32::try_from(v.len().max(1)).unwrap_or(1))
+        };
+        println!(
+            "BATCH runs={runs} MEAN batched_ms={:.2} solo_sum_ms={:.2}",
+            mean(&batched),
+            mean(&solo)
+        );
+    }
+    model.teardown().expect("the model tears down");
+}
+
+#[test]
+#[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
+fn batched_rows_match_their_solo_rows_at_every_run_count() {
+    let backend: Arc<dyn Backend> =
+        CudaBackend::new(0, CudaOptions::default()).expect("a CUDA device");
+    let Some(mut model) = load_served(&backend, false) else {
+        skip("no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
+        return;
+    };
+    let tokens = prompt(1_024 + 8 * 32);
+    let prefix = &tokens[..1_024];
+    let tails = (0..32)
+        .map(|r| &tokens[1_024 + 8 * r..1_032 + 8 * r])
+        .collect::<Vec<_>>();
+    let want = tails
+        .iter()
+        .map(|tail| solo_tail(&backend, &mut model, prefix, tail))
+        .collect::<Vec<_>>();
+    for runs in [2_usize, 7, 16, 32] {
+        let pairs = tails[..runs]
+            .iter()
+            .map(|tail| (prefix, *tail))
+            .collect::<Vec<_>>();
+        let got = batched_tails(&backend, &mut model, &pairs);
+        assert_rows_match(&got, &want[..runs], &format!("{runs} runs"));
     }
     model.teardown().expect("the model tears down");
 }

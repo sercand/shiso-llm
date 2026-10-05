@@ -161,6 +161,16 @@ pub struct DecodeStep {
     pub token: TokenId,
 }
 
+/// One session's piece of a batched prompt pass: the tokens it reads from its
+/// current frontier, which end its prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptRun<'a> {
+    /// Session to advance.
+    pub session: SessionId,
+    /// The tokens it reads.
+    pub tokens: &'a [TokenId],
+}
+
 /// A `[rows, vocab]` block of single-precision logits on the device.
 ///
 /// Borrowed from the model that produced it, so the rows cannot be freed while
@@ -292,6 +302,26 @@ pub trait Model: Send + std::fmt::Debug {
     /// [`CoreError::UnknownSession`] when any step names a closed or unknown
     /// session, and [`CoreError::Backend`] on a device failure.
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>>;
+
+    /// Reads several sessions' final prompt pieces in one pass, and returns
+    /// one logits row per run in run order: row `r` is the row
+    /// [`Model::prefill_last`] would return for `runs[r]`.
+    ///
+    /// A family that answers must leave every session exactly where
+    /// `prefill_last` would. It must refuse with [`CoreError::Unsupported`],
+    /// before reading anything, any call it cannot answer that way, so the
+    /// caller can read the runs one at a time instead.
+    ///
+    /// # Errors
+    ///
+    /// The default is [`CoreError::Unsupported`] and reads nothing: most
+    /// families have no such pass.
+    fn prefill_last_many(&mut self, _runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        Err(CoreError::Unsupported {
+            what: "a batched prompt pass",
+            backend: "model",
+        })
+    }
 
     /// This model's media path, when it has one.
     ///

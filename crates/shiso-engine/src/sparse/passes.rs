@@ -614,9 +614,10 @@ impl SparseStack {
     }
 
     /// A prompt-role segmented pass's logits: the collapsing mix over every row
-    /// (row-invariant under Prompt role), then one single-row vocabulary
-    /// projection per run, from that run's last row into logits row `run` -
-    /// the projection a solo prompt pass ends with, at the tier one row takes.
+    /// (row-invariant under Prompt role), then each run's last row gathered to
+    /// row `run` of the block and one vocabulary projection over all the runs,
+    /// whose row `run` is the row a solo prompt pass's one-row projection
+    /// leaves.
     /// No greedy pick: every row goes back to a caller that reads it.
     fn plan_run_logits(
         &self,
@@ -633,33 +634,46 @@ impl SparseStack {
             device,
             self.stream_elem(n_tok, device),
         )?);
+        let row_bytes = u64::from(self.shape.hidden).saturating_mul(F32_BYTES);
         for run in 0..runs.count() {
-            let from = u64::from(runs.last_row(run))
-                .saturating_mul(u64::from(self.shape.hidden))
-                .saturating_mul(F32_BYTES);
-            let to = u64::from(run)
-                .saturating_mul(u64::from(self.shape.vocab))
-                .saturating_mul(F32_BYTES);
-            let out = if to == 0 {
-                Operand::Scratch(Buf::Logits)
+            let last = runs.last_row(run);
+            if last == run {
+                continue;
+            }
+            let to = u64::from(run).saturating_mul(row_bytes);
+            let dst = if to == 0 {
+                Operand::Scratch(Buf::Mixed)
             } else {
-                Operand::ScratchFrom(Buf::Logits, to)
+                Operand::ScratchFrom(Buf::Mixed, to)
             };
-            matmul::project(
-                plan,
-                self.desc.output,
-                Bound::new(
-                    WeightRef::model(Role::Output),
-                    Operand::ScratchFrom(Buf::Mixed, from),
-                    out,
+            plan.launch(
+                crate::sparse::kernels::Entry::plain(
+                    crate::sparse::kernels::MOD_MISC,
+                    "q4e_copy_row_kernel",
                 ),
-                1,
-                Device {
-                    role: PassRole::Step,
-                    ..device
-                },
-            )?;
+                crate::sparse::kernels::elementwise(u64::from(self.shape.hidden)),
+                // `dst, src, n`
+                crate::sparse::bind::Args::of(&[
+                    dst,
+                    Operand::ScratchFrom(Buf::Mixed, u64::from(last).saturating_mul(row_bytes)),
+                    Operand::U32(self.shape.hidden),
+                ]),
+            );
         }
+        matmul::project(
+            plan,
+            self.desc.output,
+            Bound::new(
+                WeightRef::model(Role::Output),
+                Operand::ScratchFrom(Buf::Mixed, 0),
+                Operand::Scratch(Buf::Logits),
+            ),
+            runs.count(),
+            Device {
+                role: PassRole::Step,
+                ..device
+            },
+        )?;
         plan.launch(
             crate::sparse::kernels::Entry::plain(
                 crate::sparse::kernels::MOD_SAMPLE,
