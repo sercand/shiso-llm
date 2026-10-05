@@ -247,6 +247,8 @@ pub(crate) struct Audit {
     pub(crate) prefill_prompts: Mutex<Vec<Vec<u32>>>,
     /// Shutdown sweeps.
     pub(crate) sweeps: AtomicU64,
+    /// Batched prompt passes the fake refused.
+    pub(crate) batch_refusals: AtomicU64,
 }
 
 impl Audit {
@@ -569,6 +571,7 @@ impl Model for FakeModel {
 
     fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
         if !self.batched {
+            self.audit.batch_refusals.fetch_add(1, Ordering::Relaxed);
             return Err(CoreError::Unsupported {
                 what: "a batched prompt pass",
                 backend: "fake",

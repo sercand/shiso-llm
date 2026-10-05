@@ -312,8 +312,16 @@ struct ScoreJob {
     /// The request's [`ScoreRequest::shared_prefix`].
     shared_prefix: u32,
     /// Whether the resume this score makes at its first prefill quantum is
-    /// still ahead of it. See [`SeqSlot::take_score_resume`].
+    /// still ahead of it. See [`SeqSlot::take_score_resume_at`].
     resume_pending: bool,
+    /// Where a sibling's checkpoint stands it: the grid point below the
+    /// shared prefix, or zero when there is none to stand on - nothing
+    /// shared, or a grid point below the checkpoint tier's floor, which the
+    /// stack never checkpoints at. See [`SeqSlot::set_checkpoint_floor`].
+    stand_at: usize,
+    /// The shared-read epoch at which its last resume found nothing; see
+    /// [`SeqSlot::take_score_resume_at`].
+    missed_at: Option<u64>,
     /// Held as an `Option` because two places may answer a score - the prefill
     /// terminus and the retirement path - and *taking* this is the record of
     /// which one did. The invariant is exactly one reply per request: the
@@ -453,6 +461,9 @@ impl SeqSlot {
             .filter(|item| item.is_audio())
             .map(|item| u32::try_from(item.pad_count(1)).unwrap_or(u32::MAX))
             .fold(0u32, u32::saturating_add);
+        // With no floor known yet every shared grid point is one to wait
+        // for; admission lowers that to the tier's own floor.
+        let stand_at = stand_point(request.shared_prefix, request.prompt_tokens.len(), 1);
         Self {
             flex: request.is_flex(),
             paused_since: None,
@@ -512,6 +523,8 @@ impl SeqSlot {
                 labels: request.labels,
                 shared_prefix: request.shared_prefix,
                 resume_pending: true,
+                stand_at,
+                missed_at: None,
                 reply: setup.score_reply,
             }),
         }
@@ -535,8 +548,7 @@ impl SeqSlot {
                 .filter(|_| self.phase == Phase::Prefill)
                 .map(|job| {
                     let from = if job.resume_pending {
-                        self.cursor
-                            .max(shared_grid(job.shared_prefix, self.prompt.len()))
+                        self.cursor.max(job.stand_at)
                     } else {
                         self.cursor
                     };
@@ -1087,37 +1099,80 @@ impl SeqSlot {
         self.score.is_some()
     }
 
-    /// The shared prefix to checkpoint at, the first time a score asks - the
-    /// moment it gets its first prefill quantum - and `None` ever after, and
-    /// for a generation slot.
+    /// The shared prefix to checkpoint at, while a score's resume is pending
+    /// (from its first prefill quantum on), and `None` after, and for a
+    /// generation slot. A score whose last resume already missed at
+    /// shared-read epoch `epoch` gets `None` and stays in line: no read has
+    /// crossed a stand point since, so a second resume would miss too.
     ///
-    /// A score resumes there rather than at admission because its siblings
-    /// are admitted together and read one at a time: at admission none of
-    /// them has left a checkpoint to stand on, while by a later sibling's
-    /// first quantum the one read before it has.
-    pub(crate) fn take_score_resume(&mut self) -> Option<u32> {
+    /// A score resumes at its first quantum rather than at admission because
+    /// its siblings are admitted together and read one at a time: at
+    /// admission none of them has left a checkpoint to stand on, while by a
+    /// later sibling's first quantum the one read before it has.
+    pub(crate) fn take_score_resume_at(&mut self, epoch: u64) -> Option<u32> {
         let job = self.score.as_mut()?;
+        if job.missed_at == Some(epoch) {
+            return None;
+        }
         std::mem::take(&mut job.resume_pending).then_some(job.shared_prefix)
     }
 
-    /// Whether a score stands where its siblings' checkpoint puts it: on or
-    /// past the grid point below its shared prefix, or sharing too little to
-    /// have one. `false` for a generation slot.
-    pub(crate) fn score_stands_on_shared(&self) -> bool {
-        self.score.as_ref().is_some_and(|job| {
-            let grid = shared_grid(job.shared_prefix, self.prompt.len());
-            grid == 0 || self.cursor >= grid
-        })
+    /// Settles a score's pending resume before it reads alone: as
+    /// [`SeqSlot::take_score_resume_at`], except that a resume it skips is
+    /// dropped rather than left pending - the read that follows reads past it.
+    pub(crate) fn settle_score_resume(&mut self, epoch: u64) -> Option<u32> {
+        let job = self.score.as_mut()?;
+        let pending = std::mem::take(&mut job.resume_pending);
+        (pending && job.missed_at != Some(epoch)).then_some(job.shared_prefix)
     }
 
-    /// Puts a score whose resume found nothing back in line to resume again,
-    /// while nothing has been read for it: a sibling is about to write the
-    /// checkpoint it missed.
-    pub(crate) fn rearm_score_resume(&mut self) {
+    /// Records the checkpoint tier's floor: a score whose shared grid point
+    /// lies below it has no sibling checkpoint to wait for, and stands from
+    /// the start. Called once, at admission.
+    pub(crate) fn set_checkpoint_floor(&mut self, floor: u32) {
+        let len = self.prompt.len();
+        if let Some(job) = self.score.as_mut() {
+            job.stand_at = stand_point(job.shared_prefix, len, floor);
+        }
+    }
+
+    /// Whether a score stands where its siblings' checkpoint puts it: on or
+    /// past its stand point, or with none to wait for. `false` for a
+    /// generation slot.
+    pub(crate) fn score_stands_on_shared(&self) -> bool {
+        self.score
+            .as_ref()
+            .is_some_and(|job| self.cursor >= job.stand_at)
+    }
+
+    /// The point a read of this score crosses when it could write the
+    /// checkpoint its siblings stand on; `None` for a generation and for a
+    /// score with none.
+    pub(crate) fn score_stand_point(&self) -> Option<usize> {
+        self.score
+            .as_ref()
+            .map(|job| job.stand_at)
+            .filter(|at| *at > 0)
+    }
+
+    /// Whether this score's resume has already missed once: a later miss is
+    /// expected while it waits, and logged quietly.
+    pub(crate) fn score_resume_retried(&self) -> bool {
+        self.score
+            .as_ref()
+            .is_some_and(|job| job.missed_at.is_some())
+    }
+
+    /// Puts a score whose resume at shared-read epoch `epoch` found nothing
+    /// back in line to resume again, while nothing has been read for it: a
+    /// sibling is about to write the checkpoint it missed. It asks again
+    /// only once the epoch moves.
+    pub(crate) fn rearm_score_resume(&mut self, epoch: u64) {
         if self.cursor == 0
             && let Some(job) = self.score.as_mut()
         {
             job.resume_pending = true;
+            job.missed_at = Some(epoch);
         }
     }
 
@@ -1286,6 +1341,16 @@ fn shared_grid(shared_prefix: u32, prompt_len: usize) -> usize {
         .unwrap_or(usize::MAX)
         .min(prompt_len);
     shared - shared % PREFILL_GRID
+}
+
+/// Where a score stands once a sibling has read the shared prefix: its
+/// [`shared_grid`], or zero when that lies below `floor`, the checkpoint
+/// tier's `min_tokens` - the stack takes no checkpoint closer than that to a
+/// prompt's start, so a sibling's read leaves nothing there to stand on.
+fn stand_point(shared_prefix: u32, prompt_len: usize, floor: u32) -> usize {
+    let grid = shared_grid(shared_prefix, prompt_len);
+    let floor = usize::try_from(floor.max(1)).unwrap_or(usize::MAX);
+    if grid < floor { 0 } else { grid }
 }
 
 #[cfg(test)]

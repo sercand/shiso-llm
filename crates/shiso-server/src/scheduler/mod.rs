@@ -71,6 +71,7 @@ mod lifecycle;
 mod media_key_tests;
 pub mod queue;
 mod report;
+mod score_pass;
 mod stats;
 pub mod stop;
 
@@ -81,8 +82,8 @@ use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use shiso_core::{
-    Backend, CoreError, DecodeStep, MediaDigest, MediaKey, MediaSpan, Model, PadTokens, PromptRun,
-    SessionId, StopTokens, TokenId, VisionGrid, VisionPrefill,
+    Backend, CoreError, DecodeStep, MediaDigest, MediaKey, MediaSpan, Model, PadTokens, SessionId,
+    StopTokens, TokenId, VisionGrid, VisionPrefill,
 };
 use shiso_engine::Reason;
 use shiso_engine::ckpt::Checkpointed;
@@ -275,6 +276,8 @@ struct Coordinator {
     held_flex: VecDeque<HeldFlex>,
     /// The periodic info line.
     report: report::StatsLog,
+    /// What the batched prompt pass has shown so far; see [`score_pass`].
+    score_pass: score_pass::ScorePass,
 }
 
 /// Starts the engine thread over a loaded model.
@@ -433,6 +436,7 @@ fn start(
         closing: false,
         held_flex: VecDeque::new(),
         report,
+        score_pass: score_pass::ScorePass::default(),
     };
     let join = std::thread::Builder::new()
         .name("shiso-engine".to_owned())
@@ -859,6 +863,7 @@ impl Coordinator {
                 score_reply: Some(reply),
             },
         );
+        slot.set_checkpoint_floor(self.cfg.store.min_tokens);
         // The generation encode step in its plain form: a score never resumes
         // and is never keyed, so there is no covered prefix to subtract and no
         // resume to run ahead of. A failure fails the slot, whose still-held
@@ -1160,10 +1165,11 @@ impl Coordinator {
     /// planned as a middle piece can now reach the prompt's end - and the end
     /// is the one piece that must read its row.
     fn ready_step(&mut self, step: PrefillStep) -> Option<Quantum> {
+        let epoch = self.score_pass.shared_reads;
         if let Some(shared) = self
             .slots
             .get_mut(step.slot)
-            .and_then(SeqSlot::take_score_resume)
+            .and_then(|slot| slot.settle_score_resume(epoch))
         {
             self.resume_score(step.slot, shared);
         }
@@ -1223,7 +1229,13 @@ impl Coordinator {
         let whole_prompt = slot.prompt.len();
         let reused = match ckpt.kv_resume(slot.session, &slot.prompt) {
             Err(error) => {
-                tracing::warn!(error = %error.chain(), "a score's checkpoint resume failed; the prompt will be prefilled");
+                // A sibling waiting on a checkpoint asks again each time one
+                // may have been written; only its first failure is news.
+                if slot.score_resume_retried() {
+                    tracing::debug!(error = %error.chain(), "a waiting score's checkpoint resume failed again");
+                } else {
+                    tracing::warn!(error = %error.chain(), "a score's checkpoint resume failed; the prompt will be prefilled");
+                }
                 return;
             }
             Ok(None) => return,
@@ -1308,7 +1320,7 @@ impl Coordinator {
     fn tick(&mut self) {
         let now = self.cfg.clock.now();
         cancel::enforce_deadlines(&self.stats, self.slots.slots_mut(), now);
-        let plan = batching::plan(&self.slots.facts(), &self.cfg);
+        let plan = batching::plan(&self.planned_facts(), &self.cfg);
         for (at, slot) in self.slots.slots_mut().iter_mut().enumerate() {
             if slot.is_flex() {
                 slot.mark_paused(plan.paused.contains(&at), now);
@@ -1334,7 +1346,7 @@ impl Coordinator {
             let quantum = batching::quantum(!plan.decode.is_empty(), &self.cfg);
             self.prefill_batch_step(&plan.prefill_batch, quantum);
         } else if let Some(step) = plan.prefill {
-            self.prefill_step(step);
+            self.read_alone(step);
         }
         self.store_continued();
         self.retire();
@@ -1803,150 +1815,6 @@ impl Coordinator {
                 finish_scoring(row, scores, slot);
             } else {
                 start_decoding(row, scores, vocabulary.as_deref(), *stop, now, stats, slot);
-            }
-        }
-    }
-
-    /// Several scores' last quanta in one prompt pass.
-    ///
-    /// Every member resumes first, as its solo quantum would. Only members
-    /// that then stand on their shared prefix are read together: one whose
-    /// resume found nothing belongs to a request whose shared prefix nobody
-    /// has read yet, so it is put back to resume again - except the first,
-    /// which reads alone, writing the checkpoint the rest will stand on, when
-    /// no member stands. One prompt read a tick either way.
-    fn prefill_batch_step(&mut self, steps: &[PrefillStep], quantum: usize) {
-        for step in steps {
-            if let Some(shared) = self
-                .slots
-                .get_mut(step.slot)
-                .and_then(SeqSlot::take_score_resume)
-            {
-                self.resume_score(step.slot, shared);
-            }
-        }
-        let mut runs: Vec<Quantum> = Vec::new();
-        let mut missed: Vec<usize> = Vec::new();
-        let mut rows = 0_usize;
-        for step in steps {
-            let Some(slot) = self.slots.slots().get(step.slot) else {
-                continue;
-            };
-            if slot.is_done() || slot.prompt_done() {
-                continue;
-            }
-            if !slot.score_stands_on_shared() {
-                missed.push(step.slot);
-                continue;
-            }
-            let (start, end) = slot.prompt_window(usize::MAX);
-            let tokens = end - start;
-            if runs.len() == batching::SCORE_BATCH_RUNS || rows.saturating_add(tokens) > quantum {
-                continue;
-            }
-            rows += tokens;
-            runs.push(Quantum {
-                step: PrefillStep {
-                    slot: step.slot,
-                    tokens,
-                    last: true,
-                },
-                session: slot.session,
-                prompt: Arc::clone(&slot.prompt),
-                window: start..end,
-            });
-        }
-        let leader = if runs.is_empty() {
-            missed.first().copied()
-        } else {
-            None
-        };
-        for at in &missed {
-            if Some(*at) != leader
-                && let Some(slot) = self.slots.get_mut(*at)
-            {
-                slot.rearm_score_resume();
-            }
-        }
-        if let [only] = runs.as_slice() {
-            self.prefill_step(only.step);
-        } else if runs.len() > 1 {
-            self.run_score_batch(&runs);
-        } else if let Some(at) = leader
-            && let Some(fact) = self.slots.slots().get(at).map(SeqSlot::facts)
-        {
-            let tokens = batching::on_grid(fact.prompt_at, fact.prompt_remaining, quantum);
-            self.prefill_step(PrefillStep {
-                slot: at,
-                tokens,
-                last: tokens == fact.prompt_remaining,
-            });
-        }
-    }
-
-    /// One prompt pass over `runs`, each a score's whole remaining prompt,
-    /// each answered from its own row. A model without the pass reads them one
-    /// at a time; any other failure fails exactly these sequences, whose
-    /// replies retirement then sends.
-    fn run_score_batch(&mut self, runs: &[Quantum]) {
-        let started = Instant::now();
-        let decode_steps = self.decode_steps;
-        let outcome = {
-            let Self {
-                model,
-                backend,
-                slots,
-                row,
-                scores,
-                ..
-            } = self;
-            let pieces = runs
-                .iter()
-                .map(|run| PromptRun {
-                    session: run.session,
-                    tokens: &run.prompt[run.window.clone()],
-                })
-                .collect::<Vec<_>>();
-            model
-                .as_model_mut()
-                .prefill_last_many(&pieces)
-                .map(|logits| {
-                    for (at, run) in (0_u32..).zip(runs) {
-                        let Some(slot) = slots.get_mut(run.step.slot) else {
-                            continue;
-                        };
-                        let read = logits
-                            .row(at)
-                            .and_then(|view| backend.copy_d2h(view, row.as_mut_slice()));
-                        if let Err(error) = read {
-                            slot.fail(error.to_string());
-                            continue;
-                        }
-                        slot.advance_prefill(run.step.tokens);
-                        slot.time_prefill(run.step.tokens, started.elapsed(), decode_steps);
-                        finish_scoring(row, scores, slot);
-                    }
-                })
-        };
-        match outcome {
-            Ok(()) => {
-                let rows = runs.iter().map(|run| run.step.tokens).sum::<usize>();
-                tracing::debug!(
-                    runs = runs.len(),
-                    rows,
-                    "score tails read in one prompt pass"
-                );
-                self.stats.prefilled(rows as u64);
-            }
-            Err(CoreError::Unsupported { .. }) => {
-                for run in runs {
-                    self.prefill_step(run.step);
-                }
-            }
-            Err(error) => {
-                for run in runs {
-                    self.fail_slot(run.step.slot, &error, "a batched prompt pass failed");
-                }
             }
         }
     }

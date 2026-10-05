@@ -499,6 +499,9 @@ fn scheduler_config(args: &ServeArgs) -> anyhow::Result<scheduler::SchedulerConf
     scheduler.max_num_seqs = args.max_num_seqs;
     scheduler.store.pump_bytes = args.kvstore_pump_mb.saturating_mul(1024 * 1024);
     scheduler.store.drain_timeout = std::time::Duration::from_secs(args.kvstore_drain_secs);
+    // The same floor the tier is opened with, so the scheduler's idea of
+    // where a sibling's checkpoint can stand is the stack's own.
+    scheduler.store.min_tokens = args.kvstore_min_tokens;
     scheduler.stats_interval = (args.log_stats_interval > 0)
         .then(|| std::time::Duration::from_secs(args.log_stats_interval));
     scheduler.mtp_exact_sampling = args.mtp_exact_sampling;

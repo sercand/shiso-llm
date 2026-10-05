@@ -212,14 +212,20 @@ pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
     // tail fits: a generation at the front reads alone, exactly as before, and
     // a batch is bounded by the same quantum a solo read would be.
     let batches = lead.is_some_and(|(_at, fact)| {
-        !fact.indivisible_prompt && fact.score.is_some_and(|score| score.tail <= quantum)
+        !fact.indivisible_prompt
+            && fact
+                .score
+                .is_some_and(|score| score.tail > 0 && score.tail <= quantum)
     });
     let prefill_batch = if batches {
         score_batch(facts, &runs, quantum)
     } else {
         Vec::new()
     };
-    let prefill_batch = if prefill_batch.len() > 1 {
+    // The lead heads every batch - it is the first score that fits - so a
+    // batch never reads a later prompt instead of the lead's.
+    let headed = prefill_batch.first().map(|step| step.slot) == lead.map(|(at, _fact)| at);
+    let prefill_batch = if prefill_batch.len() > 1 && headed {
         prefill_batch
     } else {
         Vec::new()
@@ -684,6 +690,23 @@ mod tests {
                 last: true
             })
         );
+    }
+
+    /// A lead whose whole prompt its siblings' checkpoint would cover has no
+    /// tail to batch: it reads alone rather than be passed over.
+    #[test]
+    fn a_lead_with_no_tail_past_the_shared_point_reads_alone() {
+        let facts = [scoring_from(0, 128), scoring(10), scoring(10)];
+        let plan = plan(&facts, &cfg());
+        assert!(plan.prefill_batch.is_empty());
+        assert_eq!(plan.prefill.map(|step| step.slot), Some(0));
+    }
+
+    fn scoring_from(tail: usize, remaining: usize) -> SlotFacts {
+        SlotFacts {
+            score: Some(ScoreFacts { tail }),
+            ..prefilling(remaining)
+        }
     }
 
     #[test]
