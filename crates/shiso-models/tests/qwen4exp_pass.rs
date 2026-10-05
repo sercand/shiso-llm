@@ -1277,3 +1277,42 @@ fn a_batched_prompt_pass_refuses_a_build_without_the_chunked_recurrence() {
         }
     }
 }
+
+#[path = "common/plan_snapshot.rs"]
+mod plan_snapshot;
+
+/// The passes a standard request runs plan exactly the steps they planned on
+/// the commit the scoring work started from (8662c67a): same kernels, grids,
+/// shared memory and operands, in the same order. Scoring may add passes; it
+/// must not move one of these. `SHISO_RECORD_SNAPSHOT=1` rewrites the file,
+/// which is only right on that commit: the committed file was recorded there,
+/// from a separate checkout of 8662c67a with `common/plan_snapshot.rs` and this
+/// test copied in, and is never re-recorded on a later commit.
+#[test]
+fn a_standard_requests_passes_plan_what_they_planned_before_scoring_batched() {
+    let got = plan_snapshot::snapshot();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/qwen4exp_standard_plans.snap");
+    if std::env::var_os("SHISO_RECORD_SNAPSHOT").is_some_and(|value| value == "1") {
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the directory");
+        std::fs::write(&path, &got).expect("the snapshot writes");
+        return;
+    }
+    let want = std::fs::read_to_string(&path).expect("the committed snapshot reads");
+    if let Some((line, (got_line, want_line))) = got
+        .lines()
+        .zip(want.lines())
+        .enumerate()
+        .find(|(_, (got_line, want_line))| got_line != want_line)
+    {
+        panic!(
+            "line {}: the plan now has\n  {got_line}\nwhere the snapshot has\n  {want_line}",
+            line + 1
+        );
+    }
+    assert_eq!(
+        got.lines().count(),
+        want.lines().count(),
+        "the plans and the snapshot differ in length"
+    );
+}
