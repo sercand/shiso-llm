@@ -77,6 +77,60 @@ pub(crate) struct SlotFacts {
     /// Whether this is a flex sequence, which runs only when no standard one
     /// has work.
     pub(crate) flex: bool,
+    /// What a score's next read covers. `None` for a generation, and for a
+    /// score that is not reading its prompt.
+    pub(crate) score: Option<ScoreFacts>,
+}
+
+/// What the planner knows about a score sequence's next read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScoreFacts {
+    /// Prompt rows its next read covers if that read ends the prompt: what is
+    /// left, or - before the resume its first quantum makes - what is left
+    /// past the grid point below its shared prefix, where a sibling's
+    /// checkpoint would stand it.
+    pub(crate) tail: usize,
+}
+
+/// Runs one batched prompt pass carries at most.
+pub(crate) const SCORE_BATCH_RUNS: usize = shiso_engine::sparse::MAX_PROMPT_RUNS as usize;
+
+/// The widest prompt read a tick may make: narrow beside decoding sequences,
+/// which it would otherwise stall, and wide with nobody to starve.
+pub(crate) const fn quantum(decoding: bool, cfg: &SchedulerConfig) -> usize {
+    if decoding {
+        cfg.mixed_quantum
+    } else {
+        cfg.solo_chunk
+    }
+}
+
+/// The score tails one pass reads: in admission order, each fitting what is
+/// left of `quantum`, none paused.
+fn score_batch(
+    facts: &[SlotFacts],
+    runs: &impl Fn(&SlotFacts) -> bool,
+    quantum: usize,
+) -> Vec<PrefillStep> {
+    let mut batch = Vec::new();
+    let mut rows = 0_usize;
+    for (at, fact) in facts.iter().enumerate() {
+        if batch.len() == SCORE_BATCH_RUNS {
+            break;
+        }
+        let Some(score) = fact.score else { continue };
+        let fits = score.tail > 0 && rows.saturating_add(score.tail) <= quantum;
+        if fact.prompt_remaining == 0 || fact.indivisible_prompt || !runs(fact) || !fits {
+            continue;
+        }
+        rows += score.tail;
+        batch.push(PrefillStep {
+            slot: at,
+            tokens: score.tail,
+            last: true,
+        });
+    }
+    batch
 }
 
 impl SlotFacts {
@@ -105,6 +159,9 @@ pub(crate) struct TickPlan {
     pub(crate) decode: Vec<usize>,
     /// The one sequence that reads prompt this tick, if any.
     pub(crate) prefill: Option<PrefillStep>,
+    /// Several scores' last quanta in one prompt pass; when it is non-empty,
+    /// `prefill` is `None`.
+    pub(crate) prefill_batch: Vec<PrefillStep>,
     /// The flex sequences that had work and were left out for standard work,
     /// in slot order.
     pub(crate) paused: Vec<usize>,
@@ -116,7 +173,7 @@ impl TickPlan {
     /// Never true while something is paused: a flex sequence is only paused
     /// for a standard one with work, and that one is in the plan.
     pub(crate) const fn is_idle(&self) -> bool {
-        self.decode.is_empty() && self.prefill.is_none()
+        self.decode.is_empty() && self.prefill.is_none() && self.prefill_batch.is_empty()
     }
 }
 
@@ -146,16 +203,29 @@ pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
     // across prefilling sequences would interleave two prompts into the same
     // number of quanta while finishing neither sooner, and the one that started
     // first is the one whose client has been waiting longest.
-    let prefill = facts
+    let quantum = quantum(!decode.is_empty(), cfg);
+    let lead = facts
         .iter()
         .enumerate()
-        .find(|(_at, fact)| fact.prompt_remaining > 0 && runs(fact))
-        .map(|(at, fact)| {
-            let quantum = if decode.is_empty() {
-                cfg.solo_chunk
-            } else {
-                cfg.mixed_quantum
-            };
+        .find(|(_at, fact)| fact.prompt_remaining > 0 && runs(fact));
+    // Score tails are read together only when the lead is itself a score whose
+    // tail fits: a generation at the front reads alone, exactly as before, and
+    // a batch is bounded by the same quantum a solo read would be.
+    let batches = lead.is_some_and(|(_at, fact)| {
+        !fact.indivisible_prompt && fact.score.is_some_and(|score| score.tail <= quantum)
+    });
+    let prefill_batch = if batches {
+        score_batch(facts, &runs, quantum)
+    } else {
+        Vec::new()
+    };
+    let prefill_batch = if prefill_batch.len() > 1 {
+        prefill_batch
+    } else {
+        Vec::new()
+    };
+    let prefill = if prefill_batch.is_empty() {
+        lead.map(|(at, fact)| {
             let tokens = if fact.indivisible_prompt {
                 fact.prompt_remaining
             } else {
@@ -166,11 +236,15 @@ pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
                 tokens,
                 last: tokens == fact.prompt_remaining,
             }
-        });
+        })
+    } else {
+        None
+    };
 
     TickPlan {
         decode,
         prefill,
+        prefill_batch,
         paused,
     }
 }
@@ -182,7 +256,7 @@ pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
 /// when the grid point below lies behind `at`, which only a quantum narrower
 /// than the grid or a start off it reaches: then it runs to the grid point
 /// above, which is at most one grid step, rather than cut a run.
-fn on_grid(at: usize, remaining: usize, quantum: usize) -> usize {
+pub(crate) fn on_grid(at: usize, remaining: usize, quantum: usize) -> usize {
     let want = remaining.min(quantum.max(1));
     if want == remaining {
         return want;
@@ -295,7 +369,7 @@ impl SlotTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrefillStep, SlotFacts, on_grid, plan};
+    use super::{PrefillStep, ScoreFacts, SlotFacts, on_grid, plan};
     use crate::scheduler::config::{PREFILL_GRID, SchedulerConfig};
 
     fn cfg() -> SchedulerConfig {
@@ -313,6 +387,7 @@ mod tests {
             prompt_at: 0,
             indivisible_prompt: false,
             flex: false,
+            score: None,
         }
     }
 
@@ -323,6 +398,7 @@ mod tests {
             prompt_at: 0,
             indivisible_prompt: false,
             flex: false,
+            score: None,
         }
     }
 
@@ -505,6 +581,7 @@ mod tests {
             prompt_remaining: 0,
             prompt_at: 0,
             flex: false,
+            score: None,
         }];
         assert!(plan(&facts, &cfg()).is_idle());
         assert!(plan(&[], &cfg()).is_idle());
@@ -537,5 +614,90 @@ mod tests {
             "the end of the prompt is never rounded"
         );
         assert_eq!(on_grid(64, 100, 512), 100);
+    }
+
+    fn scoring(tail: usize) -> SlotFacts {
+        SlotFacts {
+            score: Some(ScoreFacts { tail }),
+            ..prefilling(tail)
+        }
+    }
+
+    fn slots(steps: &[PrefillStep]) -> Vec<usize> {
+        steps.iter().map(|step| step.slot).collect()
+    }
+
+    #[test]
+    fn resident_score_tails_share_one_prompt_pass() {
+        let facts = [scoring(100), scoring(90), scoring(120), scoring(60)];
+        let plan = plan(&facts, &cfg());
+        assert_eq!(plan.prefill, None);
+        assert_eq!(slots(&plan.prefill_batch), vec![0, 1, 2, 3]);
+        assert!(plan.prefill_batch.iter().all(|step| step.last));
+        assert_eq!(
+            plan.prefill_batch
+                .iter()
+                .map(|step| step.tokens)
+                .collect::<Vec<_>>(),
+            vec![100, 90, 120, 60]
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_is_not_a_score_at_the_front_reads_alone() {
+        let facts = [prefilling(300), scoring(10), scoring(10)];
+        let plan = plan(&facts, &cfg());
+        assert!(plan.prefill_batch.is_empty());
+        assert_eq!(plan.prefill.map(|step| step.slot), Some(0));
+    }
+
+    #[test]
+    fn beside_a_decoding_sequence_a_batch_stays_within_the_mixed_quantum() {
+        let facts = [decoding(), scoring(50), scoring(50), scoring(50)];
+        let plan = plan(&facts, &cfg());
+        assert_eq!(plan.decode, vec![0]);
+        assert_eq!(
+            slots(&plan.prefill_batch),
+            vec![1, 2],
+            "a third would pass 128 rows"
+        );
+    }
+
+    #[test]
+    fn a_flex_score_never_joins_a_batch_while_standard_work_runs() {
+        let facts = [scoring(10), flex(scoring(10)), scoring(10)];
+        let plan = plan(&facts, &cfg());
+        assert_eq!(slots(&plan.prefill_batch), vec![0, 2]);
+        assert_eq!(plan.paused, vec![1]);
+    }
+
+    #[test]
+    fn one_score_alone_reads_as_it_always_did() {
+        let facts = [scoring(40), prefilling(300)];
+        let plan = plan(&facts, &cfg());
+        assert!(plan.prefill_batch.is_empty());
+        assert_eq!(
+            plan.prefill,
+            Some(PrefillStep {
+                slot: 0,
+                tokens: 40,
+                last: true
+            })
+        );
+    }
+
+    #[test]
+    fn a_score_whose_tail_outgrows_the_quantum_reads_alone_in_quanta() {
+        let facts = [scoring(900), scoring(10)];
+        let plan = plan(&facts, &cfg());
+        assert!(plan.prefill_batch.is_empty());
+        assert_eq!(
+            plan.prefill,
+            Some(PrefillStep {
+                slot: 0,
+                tokens: 512,
+                last: false
+            })
+        );
     }
 }

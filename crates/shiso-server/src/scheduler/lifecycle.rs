@@ -26,7 +26,8 @@ use shiso_ir::{BlockDelta, BlockStart, StopReason, StreamEvent, Usage};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::AppError;
-use crate::scheduler::batching::SlotFacts;
+use crate::scheduler::batching::{ScoreFacts, SlotFacts};
+use crate::scheduler::config::PREFILL_GRID;
 use crate::scheduler::stop::{StopStep, StopWatcher};
 use crate::scheduler::{ScoreOutcome, ScoreRequest};
 use crate::tokenizer::Vocabulary;
@@ -528,6 +529,21 @@ impl SeqSlot {
             prompt_at: self.cursor,
             indivisible_prompt: self.media.is_some(),
             flex: self.flex,
+            score: self
+                .score
+                .as_ref()
+                .filter(|_| self.phase == Phase::Prefill)
+                .map(|job| {
+                    let from = if job.resume_pending {
+                        self.cursor
+                            .max(shared_grid(job.shared_prefix, self.prompt.len()))
+                    } else {
+                        self.cursor
+                    };
+                    ScoreFacts {
+                        tail: self.prompt.len().saturating_sub(from),
+                    }
+                }),
         }
     }
 
@@ -1084,6 +1100,27 @@ impl SeqSlot {
         std::mem::take(&mut job.resume_pending).then_some(job.shared_prefix)
     }
 
+    /// Whether a score stands where its siblings' checkpoint puts it: on or
+    /// past the grid point below its shared prefix, or sharing too little to
+    /// have one. `false` for a generation slot.
+    pub(crate) fn score_stands_on_shared(&self) -> bool {
+        self.score.as_ref().is_some_and(|job| {
+            let grid = shared_grid(job.shared_prefix, self.prompt.len());
+            grid == 0 || self.cursor >= grid
+        })
+    }
+
+    /// Puts a score whose resume found nothing back in line to resume again,
+    /// while nothing has been read for it: a sibling is about to write the
+    /// checkpoint it missed.
+    pub(crate) fn rearm_score_resume(&mut self) {
+        if self.cursor == 0
+            && let Some(job) = self.score.as_mut()
+        {
+            job.resume_pending = true;
+        }
+    }
+
     /// The label ids to read at the prompt's last row.
     ///
     /// Empty for a generation slot - a caller asks after [`SeqSlot::is_score`],
@@ -1239,6 +1276,16 @@ impl SeqSlot {
         let secs = elapsed.as_secs_f64();
         (tokens > 0 && secs > 0.0).then(|| f64::from(tokens) / secs)
     }
+}
+
+/// The grid point at or below a score's shared prefix: where a sibling's
+/// checkpoint stands a resumed score, because the stack checkpoints on the
+/// recurrence's grid ([`PREFILL_GRID`] is that grid).
+fn shared_grid(shared_prefix: u32, prompt_len: usize) -> usize {
+    let shared = usize::try_from(shared_prefix)
+        .unwrap_or(usize::MAX)
+        .min(prompt_len);
+    shared - shared % PREFILL_GRID
 }
 
 #[cfg(test)]

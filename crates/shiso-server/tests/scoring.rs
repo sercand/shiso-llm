@@ -306,3 +306,116 @@ async fn scores_and_generate_share_the_engine() {
         .expect("the engine thread does not panic")
         .expect("the loop exits cleanly");
 }
+
+/// Six sibling questions: a 64-token shared prefix and a 4-token tail each,
+/// whose last tokens differ. They are asked while a generation holds the
+/// engine in a decode step, so all six are resident before the first of them
+/// is planned. Returns each answer in question order, and the audit.
+async fn six_siblings(batched: bool, hit: Option<u32>) -> (Vec<Vec<f64>>, Arc<common::Audit>) {
+    let gate = common::Gate::closed();
+    let cfg = SchedulerConfig {
+        max_num_seqs: 8,
+        ..SchedulerConfig::new()
+    };
+    let (engine, join, audit) =
+        common::batched_scoring_engine(cfg, Arc::clone(&gate), batched, hit);
+    let chat = engine
+        .generate(GenerateRequest::new(
+            Arc::from(vec![TokenId::new(1)]),
+            argmax(),
+            Seed::new(7),
+            50,
+        ))
+        .await
+        .expect("the generation is admitted");
+    common::wait_for_calls(&audit, 1).await;
+    let shared = (0..64_u32).map(|i| 13 + i % 40).collect::<Vec<_>>();
+    let asks = (0..6_u32)
+        .map(|q| {
+            let mut prompt = shared.clone();
+            prompt.extend([3, 4, 5, 6 + q]);
+            let request = score_request(&prompt, &[0, 1, 2]).with_shared_prefix(64);
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.score(request).await })
+        })
+        .collect::<Vec<_>>();
+    common::wait_for_queued(&engine, 7).await;
+    gate.open();
+    let mut answers = Vec::new();
+    for ask in asks {
+        answers.push(
+            ask.await
+                .expect("not cancelled")
+                .expect("answered")
+                .label_logprobs,
+        );
+    }
+    let _ = chat.collect::<Vec<_>>().await;
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
+    (answers, audit)
+}
+
+/// Each answer is the keyed row's log-probabilities for its own last token.
+fn assert_keyed_answers(answers: &[Vec<f64>]) {
+    for (q, got) in answers.iter().enumerate() {
+        let row = common::keyed_row(6 + u32::try_from(q).expect("six"));
+        let norm = logsumexp(&row);
+        for (label, value) in got.iter().enumerate() {
+            let want = f64::from(row[label]) - norm;
+            assert!(
+                (value - want).abs() < 1e-5,
+                "question {q} label {label}: {value} vs {want}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sibling_scores_share_one_prompt_pass_and_answer_as_they_do_one_at_a_time() {
+    let (together, audit) = six_siblings(true, Some(64)).await;
+    let (alone, alone_audit) = six_siblings(false, Some(64)).await;
+    assert_keyed_answers(&together);
+    assert_keyed_answers(&alone);
+    // All six are resident before the first is planned, so the expected log is
+    // one pass of six; what must hold whatever the admission timing is that
+    // some pass carried several tails and every tail was read exactly once.
+    let batched = audit.batched_runs();
+    assert!(
+        batched.iter().any(|runs| *runs > 1),
+        "no batched pass: {:?}",
+        audit.calls.lock()
+    );
+    assert_eq!(
+        batched.iter().sum::<usize>() + audit.prefill_chunks().len() - 1,
+        6,
+        "each tail read once, together or alone: {:?}",
+        audit.calls.lock()
+    );
+    assert!(
+        alone_audit.batched_runs().is_empty(),
+        "a model without the pass reads none"
+    );
+    assert_eq!(
+        alone_audit.prefill_chunks().len(),
+        7,
+        "the generation's prompt and six tails, one call each"
+    );
+}
+
+#[tokio::test]
+async fn siblings_whose_shared_prefix_nobody_has_read_wait_for_the_first_to_read_it() {
+    let (answers, audit) = six_siblings(true, None).await;
+    assert_keyed_answers(&answers);
+    assert!(
+        audit.batched_runs().is_empty(),
+        "no checkpoint to stand on, so nothing was batched"
+    );
+    assert_eq!(
+        audit.prefill_chunks().len(),
+        7,
+        "each question read once, alone"
+    );
+}

@@ -41,7 +41,7 @@ use base64::Engine as _;
 use parking_lot::{Condvar, Mutex};
 use shiso_core::{
     Backend, CoreError, CoreResult, DecodeStep, DeviceBuffer, DeviceView, KernelRef, LaunchArgs,
-    Logits, Model, ModelInfo, RawBuffer, SessionId, StopTokens, TokenId, alloc,
+    Logits, Model, ModelInfo, PromptRun, RawBuffer, SessionId, StopTokens, TokenId, alloc,
 };
 use shiso_engine::PersistRefusal;
 use shiso_engine::Reason;
@@ -201,6 +201,13 @@ pub(crate) enum Call {
         /// Whether it was the chunk that produces logits.
         last: bool,
     },
+    /// A batched prompt pass over this many runs and tokens.
+    PrefillMany {
+        /// Runs the pass carried.
+        runs: usize,
+        /// Tokens across every run.
+        tokens: usize,
+    },
 }
 
 /// One offer to the checkpoint tier.
@@ -250,7 +257,7 @@ impl Audit {
             .iter()
             .filter_map(|call| match call {
                 Call::Decode(width) => Some(*width),
-                Call::Prefill { .. } => None,
+                Call::Prefill { .. } | Call::PrefillMany { .. } => None,
             })
             .collect()
     }
@@ -262,7 +269,19 @@ impl Audit {
             .iter()
             .filter_map(|call| match call {
                 Call::Prefill { tokens, .. } => Some(*tokens),
-                Call::Decode(_) => None,
+                Call::Decode(_) | Call::PrefillMany { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The run counts of every batched prompt pass, in order.
+    pub(crate) fn batched_runs(&self) -> Vec<usize> {
+        self.calls
+            .lock()
+            .iter()
+            .filter_map(|call| match call {
+                Call::PrefillMany { runs, .. } => Some(*runs),
+                _ => None,
             })
             .collect()
     }
@@ -345,6 +364,19 @@ pub(crate) struct FakeModel {
     next_session: NonZeroU64,
     audit: Arc<Audit>,
     gate: Option<Arc<Gate>>,
+    /// Whether it answers a batched prompt pass rather than refusing one.
+    batched: bool,
+    /// Whether it answers every prompt with [`keyed_row`] of its last token.
+    keyed: bool,
+}
+
+/// The row a keyed fake answers a prompt with: a function of the prompt's last
+/// token alone, so a test computes every answer whatever order the scheduler
+/// read the prompts in.
+pub(crate) fn keyed_row(last: u32) -> Vec<f32> {
+    (0..VOCAB)
+        .map(|i| f32::from(u8::try_from((i + last) % 7).unwrap_or(0)) * 0.5)
+        .collect()
 }
 
 impl FakeModel {
@@ -372,6 +404,8 @@ impl FakeModel {
                 next_session: NonZeroU64::MIN,
                 audit: Arc::clone(&audit),
                 gate: None,
+                batched: false,
+                keyed: false,
             },
             audit,
         )
@@ -388,6 +422,40 @@ impl FakeModel {
     pub(crate) fn with_gate(mut self, gate: Arc<Gate>) -> Self {
         self.gate = Some(gate);
         self
+    }
+
+    /// The same model, answering batched prompt passes.
+    pub(crate) const fn with_batched_prefill(mut self) -> Self {
+        self.batched = true;
+        self
+    }
+
+    /// The same model, answering every prompt with [`keyed_row`].
+    pub(crate) const fn with_keyed_rows(mut self) -> Self {
+        self.keyed = true;
+        self
+    }
+
+    /// Writes the row a prompt ending in `tokens` answers into logits row
+    /// `row_index`: keyed, scripted, or the session's next scripted spike.
+    fn answer_prompt(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        row_index: u32,
+    ) -> CoreResult<()> {
+        if self.keyed {
+            let last = tokens.last().map_or(0, |token| token.get());
+            return self.write_explicit_row(&keyed_row(last), row_index);
+        }
+        // A scripted row answers verbatim - it is what a scoring test reads
+        // back - and only once: the queue drains and the script's spikes take
+        // over, so a test that scripted one row for the score still gets
+        // scripted answers from every later prefill.
+        match self.prefill_rows.pop_front() {
+            Some(row) => self.write_explicit_row(&row, row_index),
+            None => self.write_row(session, row_index),
+        }
     }
 
     /// Writes one session's next scripted token into `row`.
@@ -495,15 +563,39 @@ impl Model for FakeModel {
             .prefill_prompts
             .lock()
             .push(tokens.iter().map(|t| t.get()).collect());
-        // A scripted row answers verbatim - it is what a scoring test reads
-        // back - and only once: the queue drains and the script's spikes take
-        // over, so a test that scripted one row for the score still gets
-        // scripted answers from every later prefill.
-        match self.prefill_rows.pop_front() {
-            Some(row) => self.write_explicit_row(&row, 0)?,
-            None => self.write_row(session, 0)?,
-        }
+        self.answer_prompt(session, tokens, 0)?;
         self.block(1)
+    }
+
+    fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        if !self.batched {
+            return Err(CoreError::Unsupported {
+                what: "a batched prompt pass",
+                backend: "fake",
+            });
+        }
+        let count = u32::try_from(runs.len()).unwrap_or(u32::MAX);
+        if count == 0 || count > MAX_ROWS {
+            return Err(CoreError::Unsupported {
+                what: "a batch wider than the fake's logits block",
+                backend: "fake",
+            });
+        }
+        if let Some(run) = runs.iter().find(|run| !self.open.contains(&run.session)) {
+            return Err(CoreError::UnknownSession(run.session));
+        }
+        self.audit.calls.lock().push(Call::PrefillMany {
+            runs: runs.len(),
+            tokens: runs.iter().map(|run| run.tokens.len()).sum(),
+        });
+        for (at, run) in (0_u32..).zip(runs) {
+            self.audit
+                .prefill_prompts
+                .lock()
+                .push(run.tokens.iter().map(|t| t.get()).collect());
+            self.answer_prompt(run.session, run.tokens, at)?;
+        }
+        self.block(count)
     }
 
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
@@ -566,6 +658,12 @@ impl FakeCheckpointed {
         self
     }
 
+    /// The same model, its inner fake rebuilt by `f`.
+    pub(crate) fn map_inner(mut self, f: impl FnOnce(FakeModel) -> FakeModel) -> Self {
+        self.inner = f(self.inner);
+        self
+    }
+
     /// The same model, reporting a resume of `tokens` prompt tokens to every
     /// prompt at least that long.
     pub(crate) const fn with_hit(mut self, tokens: u32) -> Self {
@@ -599,6 +697,13 @@ impl Model for FakeCheckpointed {
     fn prefill_last(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<Logits<'_>> {
         *self.written.entry(session).or_insert(0) += tokens.len();
         self.inner.prefill_last(session, tokens)
+    }
+
+    fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        for run in runs {
+            *self.written.entry(run.session).or_insert(0) += run.tokens.len();
+        }
+        self.inner.prefill_last_many(runs)
     }
 
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
@@ -1113,4 +1218,47 @@ pub(crate) fn fake_media_engine(
         ),
     );
     (engine, join, audit, media_calls)
+}
+
+/// An engine over a checkpointing fake that answers prompts with keyed rows,
+/// reads batched prompt passes when `batched` is set, resumes `hit` prompt
+/// tokens, and holds every decode step at `gate`.
+pub(crate) fn batched_scoring_engine(
+    cfg: SchedulerConfig,
+    gate: Arc<Gate>,
+    batched: bool,
+    hit: Option<u32>,
+) -> (
+    EngineHandle,
+    std::thread::JoinHandle<Result<(), EngineFailure>>,
+    Arc<Audit>,
+) {
+    let backend: Arc<dyn Backend> = FakeBackend::new();
+    let (model, audit) = FakeCheckpointed::new(&backend, vec![10; 400]);
+    let model = model.with_gate(gate).map_inner(|inner| {
+        let inner = inner.with_keyed_rows();
+        if batched {
+            inner.with_batched_prefill()
+        } else {
+            inner
+        }
+    });
+    let model = match hit {
+        Some(tokens) => model.with_hit(tokens),
+        None => model,
+    };
+    let (engine, join) = spawn_engine_with_checkpoints(
+        backend,
+        Box::new(model),
+        shiso_server::media::MediaTowers::default(),
+        None,
+        "fake-model",
+        CAPACITY,
+        cfg,
+        (
+            shiso_parsers::ReasoningScheme::None,
+            shiso_parsers::ToolCallScheme::None,
+        ),
+    );
+    (engine, join, audit)
 }
