@@ -173,10 +173,10 @@ impl RegistryClient {
         let etag_path = models_dir.join(format!("{canonical_name}.etag"));
 
         let cached_etag = fs::read_to_string(&etag_path).ok();
-        let manifest_rel = format!("models/{canonical_name}.json");
+        let manifest_rel = manifest_path_of(model_entry)?;
         let manifest_url =
             self.base_url()
-                .join(&manifest_rel)
+                .join(manifest_rel)
                 .map_err(|e| HubError::Validation {
                     reason: format!("failed to form manifest URL: {e}"),
                 })?;
@@ -242,7 +242,7 @@ impl RegistryClient {
         let actual_digest = hex::encode(Sha256Hasher::digest(&manifest_bytes));
         if actual_digest != model_entry.manifest_sha256.as_str() {
             return Err(HubError::DigestMismatch {
-                file: format!("models/{canonical_name}.json"),
+                file: manifest_rel.to_string(),
                 expected: model_entry.manifest_sha256.to_string(),
                 actual: actual_digest,
             });
@@ -278,6 +278,34 @@ impl RegistryClient {
             None
         }
     }
+}
+
+/// The entry's manifest path, refused unless it is a plain relative path.
+///
+/// The path is joined onto the registry base URL, so an absolute path, a
+/// scheme or a `..` segment would let one index entry point the client at a
+/// manifest outside the registry it trusts.
+fn manifest_path_of(entry: &IndexModelEntry) -> Result<&str, HubError> {
+    let rel = entry.manifest.as_str();
+    let refuse = |why: &str| HubError::Validation {
+        reason: format!(
+            "index entry '{}' has manifest path '{rel}' that {why}",
+            entry.name
+        ),
+    };
+    if rel.is_empty() {
+        return Err(refuse("is empty"));
+    }
+    if rel.starts_with('/') || rel.contains(['\\', ':', '?', '#', '%']) {
+        return Err(refuse("is not a plain relative path"));
+    }
+    if rel
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(refuse("has an empty, '.' or '..' segment"));
+    }
+    Ok(rel)
 }
 
 /// Atomically writes `bytes` to `dest` using a temporary file.

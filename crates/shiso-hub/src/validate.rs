@@ -70,7 +70,141 @@ fn validate_metadata(recipe: &Recipe) -> Result<(), HubError> {
     }
 
     validate_family_facts(recipe)?;
+    validate_info(recipe)?;
+    validate_quality(recipe)?;
 
+    Ok(())
+}
+
+fn invalid(reason: String) -> HubError {
+    HubError::Validation { reason }
+}
+
+/// A link the hub site renders must be `https://`: it is shown to every
+/// visitor, and a `javascript:` or plain-HTTP link there is the registry's
+/// doing, not the visitor's.
+fn require_https(what: &str, url: &str) -> Result<(), HubError> {
+    let ok = url
+        .strip_prefix("https://")
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains(char::is_whitespace));
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(format!("{what} '{url}' must be an https:// URL")))
+    }
+}
+
+fn validate_info(recipe: &Recipe) -> Result<(), HubError> {
+    let Some(info) = &recipe.info else {
+        return Ok(());
+    };
+    for (what, value) in [
+        ("info.publisher", &info.publisher),
+        ("info.license", &info.license),
+    ] {
+        if value.as_ref().is_some_and(|v| v.trim().is_empty()) {
+            return Err(invalid(format!("{what} cannot be empty when present")));
+        }
+    }
+    if let Some(homepage) = &info.homepage {
+        require_https("info.homepage", homepage)?;
+    }
+    if let Some(card) = &info.card {
+        if card.provider != "huggingface" {
+            return Err(invalid(format!(
+                "info.card provider '{}' is not supported; only 'huggingface' is",
+                card.provider
+            )));
+        }
+        if card.repo.split('/').count() != 2
+            || card
+                .repo
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return Err(invalid(format!(
+                "info.card repo '{}' must be 'owner/name'",
+                card.repo
+            )));
+        }
+    }
+    for (what, value) in [
+        ("info.parameters", info.parameters),
+        ("info.active_parameters", info.active_parameters),
+        ("info.context_length", info.context_length),
+    ] {
+        if value == Some(0) {
+            return Err(invalid(format!("{what} must be greater than zero")));
+        }
+    }
+    if let (Some(total), Some(active)) = (info.parameters, info.active_parameters)
+        && active > total
+    {
+        return Err(invalid(format!(
+            "info.active_parameters ({active}) exceeds info.parameters ({total})"
+        )));
+    }
+    Ok(())
+}
+
+/// `YYYY-MM-DD` with a plausible month and day; a score without a readable
+/// date cannot be told apart from a stale one.
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r).and_then(|p| p.parse::<u32>().ok());
+    matches!(
+        (num(0..4), num(5..7), num(8..10)),
+        (Some(_), Some(1..=12), Some(1..=31))
+    )
+}
+
+fn validate_quality(recipe: &Recipe) -> Result<(), HubError> {
+    use crate::recipe::QualityScope;
+    for (i, q) in recipe.quality.iter().enumerate() {
+        let at = format!("quality[{i}]");
+        if q.source.trim().is_empty() || q.metric.trim().is_empty() {
+            return Err(invalid(format!("{at} needs a non-empty source and metric")));
+        }
+        if !q.value.is_finite() {
+            return Err(invalid(format!("{at} value must be a finite number")));
+        }
+        if let Some(max) = q.max
+            && (!max.is_finite() || max <= 0.0 || q.value > max)
+        {
+            return Err(invalid(format!(
+                "{at} max ({max}) must be positive and at least the value ({})",
+                q.value
+            )));
+        }
+        require_https(&format!("{at} url"), &q.url)?;
+        if !is_iso_date(&q.as_of) {
+            return Err(invalid(format!(
+                "{at} as_of '{}' must be a YYYY-MM-DD date",
+                q.as_of
+            )));
+        }
+        match (q.scope, &q.variant) {
+            (QualityScope::BaseModel, None) => {}
+            (QualityScope::BaseModel, Some(key)) => {
+                return Err(invalid(format!(
+                    "{at} is scoped to the base model but names variant '{key}'"
+                )));
+            }
+            (QualityScope::Variant, None) => {
+                return Err(invalid(format!(
+                    "{at} is scoped to a variant but names none"
+                )));
+            }
+            (QualityScope::Variant, Some(key)) => {
+                if !recipe.variants.iter().any(|v| v.key == *key) {
+                    return Err(invalid(format!("{at} names unknown variant '{key}'")));
+                }
+            }
+        }
+    }
     Ok(())
 }
 

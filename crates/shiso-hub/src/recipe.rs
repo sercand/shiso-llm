@@ -858,6 +858,88 @@ where
     })
 }
 
+/// Descriptive metadata about a model, shown on the hub site.
+///
+/// Nothing here takes part in variant selection or serving: a client that
+/// ignores the whole block pulls and serves exactly the same files.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// Who trained or published the weights (e.g. `"Google"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    /// License identifier (an SPDX id where one exists, e.g. `"apache-2.0"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// Project or model homepage (`https://` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    /// Repository whose README is the model card.
+    ///
+    /// Absent, the card is read from the first variant's `base` component. A
+    /// quantized re-export often ships a stub README, so pointing this at the
+    /// original repository gives the page the publisher's own card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<CardSource>,
+    /// Total parameter count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<u64>,
+    /// Parameters active per token, for sparse (mixture-of-experts) models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_parameters: Option<u64>,
+    /// Longest context the model was trained for, in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+}
+
+/// A pinned repository revision whose `README.md` is a model's card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardSource {
+    /// Remote provider (only `"huggingface"` today).
+    pub provider: String,
+    /// Provider repository (`owner/name`).
+    pub repo: String,
+    /// Pinned commit, so the card cannot change under a published manifest.
+    pub revision: CommitSha,
+}
+
+/// What a quality score was measured on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityScope {
+    /// The unquantized model the variants were made from; it says nothing
+    /// about what a quantization lost.
+    BaseModel,
+    /// One variant's own files, named by [`QualityScore::variant`].
+    Variant,
+}
+
+/// One published quality score, with where it came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QualityScore {
+    /// Who published the score.
+    pub source: String,
+    /// The metric's name as the source spells it.
+    pub metric: String,
+    /// The score.
+    pub value: f64,
+    /// Top of the metric's scale, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    /// Where the score can be checked (`https://` only).
+    pub url: String,
+    /// Date the score was read, `YYYY-MM-DD`; sources revise their numbers.
+    pub as_of: String,
+    /// What was measured.
+    pub scope: QualityScope,
+    /// The variant measured; required for [`QualityScope::Variant`], refused
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<VariantKey>,
+    /// The scored model as the source names it, when that differs from ours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
 /// A model recipe manifest describing how to fetch and serve a model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Recipe {
@@ -886,6 +968,12 @@ pub struct Recipe {
     pub features: RecipeFeatures,
     /// Available variants in author preference order.
     pub variants: Vec<Variant>,
+    /// Descriptive metadata for the hub site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<ModelInfo>,
+    /// Quality scores published for the model or one of its variants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality: Vec<QualityScore>,
     /// Git-derived publication timestamp (compiled manifests only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
@@ -944,7 +1032,14 @@ pub struct IndexModelEntry {
     pub outputs: Vec<Modality>,
     /// Last update timestamp.
     pub updated_at: String,
-    /// SHA-256 digest of the compiled manifest (`models/<name>.json`).
+    /// Path of the compiled manifest, relative to the registry base URL
+    /// (`models/<name>/index.json`).
+    ///
+    /// Carried rather than derived so the layout can change without every
+    /// client hard-coding it; the client refuses anything that is not a plain
+    /// relative path.
+    pub manifest: String,
+    /// SHA-256 digest of the compiled manifest named by `manifest`.
     pub manifest_sha256: Sha256,
     /// Variants available for this model.
     pub variants: Vec<IndexVariantEntry>,

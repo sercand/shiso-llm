@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::api::inference_types::{
-    CacheReport, DiskReport, EngineCacheReport, ModelInfo, ModelListResponse, SUPPORTED_PARAMETERS,
-    TopProvider,
+    CacheReport, DiskReport, EngineCacheReport, ImageListing, ModelInfo, ModelListResponse,
+    SUPPORTED_PARAMETERS, TopProvider,
 };
 use crate::error::{ApiSurface, AppError};
 use crate::state::AppState;
@@ -401,6 +401,7 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
                 is_moderated: false,
             },
             supported_parameters: SUPPORTED_PARAMETERS.to_vec(),
+            image: None,
         });
     }
     // The recognizer answers to its own id, which is what a transcription's
@@ -419,6 +420,7 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
                 is_moderated: false,
             },
             supported_parameters: Vec::new(),
+            image: None,
         });
     }
     // The generator answers to its own id the same way, for the same reason:
@@ -437,6 +439,11 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
                 is_moderated: false,
             },
             supported_parameters: Vec::new(),
+            image: Some(ImageListing {
+                steps: state.image_defaults.steps,
+                width: state.image_defaults.width,
+                height: state.image_defaults.height,
+            }),
         });
     }
     ModelListResponse {

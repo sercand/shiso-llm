@@ -103,37 +103,126 @@ fn build_registry_compiles_unsigned_index_and_manifests() {
     git(temp.path(), &["init", "-q"]);
 
     // Build registry
-    let out_dir = temp.path().join("registry").join("v1");
-    let build = editor::build_registry(temp.path(), &out_dir, true).unwrap();
+    let build = editor::build_registry(temp.path(), temp.path(), true).unwrap();
     assert_eq!(build.models_count, 1);
+    let out_dir = temp.path().join("registry").join("v1");
 
     let index_file = out_dir.join("index.json");
     assert!(index_file.is_file());
-    assert!(out_dir.join("models").join("qwen3.5-9b.json").is_file());
+    let manifest_file = out_dir.join("models").join("qwen3.5-9b").join("index.json");
+    assert!(manifest_file.is_file());
     // Unsigned model: no detached signature artifact is produced.
     assert!(!out_dir.join("index.json.sig").exists());
 
-    // The index digest chain still holds: index.json's manifest_sha256 must
-    // equal the digest of the compiled manifest bytes.
+    // The index names the manifest's path, and its digest chain still holds:
+    // manifest_sha256 must equal the digest of the compiled manifest bytes.
     let index: shiso_hub::recipe::Index =
         serde_json::from_slice(&fs::read(&index_file).unwrap()).unwrap();
     assert_eq!(index.models.len(), 1);
-    let manifest_bytes = fs::read(out_dir.join("models").join("qwen3.5-9b.json")).unwrap();
+    assert_eq!(index.models[0].manifest, "models/qwen3.5-9b/index.json");
+    let manifest_bytes = fs::read(&manifest_file).unwrap();
     let digest = <sha2::Sha256 as sha2::Digest>::digest(&manifest_bytes);
     assert_eq!(
         index.models[0].manifest_sha256.as_str(),
         hex::encode(digest)
     );
+
+    // The site sits beside the registry: a catalog that embeds its search
+    // documents, and one page per model linking back with relative paths.
+    let home = fs::read_to_string(temp.path().join("index.html")).unwrap();
+    assert!(home.contains(r#"href="models/qwen3.5-9b/""#), "{home}");
+    assert!(home.contains(r#"id="search-docs""#));
+    let page = fs::read_to_string(
+        temp.path()
+            .join("models")
+            .join("qwen3.5-9b")
+            .join("index.html"),
+    )
+    .unwrap();
+    assert!(page.contains("../../registry/v1/models/qwen3.5-9b/index.json"));
+    assert!(page.contains("shiso pull qwen3.5-9b"));
+    for asset in [
+        "404.html",
+        "search-index.json",
+        "assets/site.css",
+        "assets/site.js",
+        "assets/minisearch.js",
+    ] {
+        assert!(temp.path().join(asset).is_file(), "{asset}");
+    }
+    // No card is cached in a fresh repository.
+    assert_eq!(build.missing_cards, vec!["qwen3.5-9b".to_string()]);
+}
+
+/// A model whose recipe is gone loses its page and manifest on the next
+/// build, and so does a manifest left by the old flat layout; a directory
+/// holding files the build never writes is refused instead.
+#[test]
+fn build_prunes_what_it_wrote_for_removed_models() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("recipes")).unwrap();
+    fs::write(repo.join("recipes").join("qwen3.5-9b.json"), SAMPLE_RECIPE).unwrap();
+    git(repo, &["init", "-q"]);
+
+    let gone_page = repo.join("models").join("old-model");
+    let gone_manifest = repo.join("registry/v1/models/old-model");
+    fs::create_dir_all(&gone_page).unwrap();
+    fs::create_dir_all(&gone_manifest).unwrap();
+    fs::write(gone_page.join("index.html"), "old").unwrap();
+    fs::write(gone_manifest.join("index.json"), "{}").unwrap();
+    fs::write(repo.join("registry/v1/models/old-flat.json"), "{}").unwrap();
+
+    let build = editor::build_registry(repo, repo, true).unwrap();
+    assert_eq!(build.pruned.len(), 3, "{:?}", build.pruned);
+    assert!(!gone_page.exists() && !gone_manifest.exists());
+    assert!(!repo.join("registry/v1/models/old-flat.json").exists());
+
+    let foreign = repo.join("models").join("kept");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("notes.txt"), "mine").unwrap();
+    let err = editor::build_registry(repo, repo, true).unwrap_err();
+    assert!(err.to_string().contains("notes.txt"), "{err}");
+}
+
+/// The editor serves the built site under `/hub/` and nothing under a dot
+/// path, so `.git` stays out of the preview.
+#[tokio::test]
+async fn the_hub_preview_serves_the_site_and_hides_dot_paths() {
+    let temp = tempdir().unwrap();
+    fs::write(temp.path().join("index.html"), "<p>hub</p>").unwrap();
+    fs::create_dir_all(temp.path().join(".git")).unwrap();
+    fs::write(temp.path().join(".git").join("config"), "secret").unwrap();
+    let app = build_router(Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        None,
+        8095,
+        temp.path().join("home"),
+    )));
+    let get = |uri: &str| {
+        Request::builder()
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8095")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let res = app.clone().oneshot(get("/hub/")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app.clone().oneshot(get("/hub")).await.unwrap();
+    assert!(res.status().is_redirection());
+    let res = app.clone().oneshot(get("/hub/.git/config")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn http_hardening_rejects_unauthorized_and_invalid_hosts() {
     let temp = tempdir().unwrap();
-    let state = Arc::new(ServerState {
-        repo: temp.path().to_path_buf(),
-        session_token: Some("test_token_secret_12345".to_string()),
-        port: 8095,
-    });
+    let state = Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        Some("test_token_secret_12345".to_string()),
+        8095,
+        temp.path().join("home"),
+    ));
 
     let app = build_router(state);
 
@@ -188,11 +277,12 @@ async fn http_hardening_rejects_unauthorized_and_invalid_hosts() {
 #[tokio::test]
 async fn without_a_required_token_only_the_host_and_origin_checks_apply() {
     let temp = tempdir().unwrap();
-    let app = build_router(Arc::new(ServerState {
-        repo: temp.path().to_path_buf(),
-        session_token: None,
-        port: 8095,
-    }));
+    let app = build_router(Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        None,
+        8095,
+        temp.path().join("home"),
+    )));
     let get = |host: &str| {
         Request::builder()
             .uri("/api/families")
@@ -249,20 +339,25 @@ fn build_writes_into_the_repository_and_dates_from_its_history() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "recipe"]);
 
-    for asked in [None, Some(""), Some("registry/v1")] {
+    for asked in [None, Some("")] {
         let out = editor::resolve_out(repo, asked.map(Path::new));
-        assert_eq!(out, repo.join("registry/v1"), "{asked:?}");
+        assert_eq!(out, repo, "{asked:?}");
     }
     assert_eq!(
-        editor::resolve_out(repo, Some(Path::new("/elsewhere/v1"))),
-        Path::new("/elsewhere/v1")
+        editor::resolve_out(repo, Some(Path::new("site"))),
+        repo.join("site")
+    );
+    assert_eq!(
+        editor::resolve_out(repo, Some(Path::new("/elsewhere"))),
+        Path::new("/elsewhere")
     );
 
-    let out = editor::resolve_out(repo, Some(Path::new("registry/v1")));
+    let out = editor::resolve_out(repo, None);
     editor::build_registry(repo, &out, false).unwrap();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(out.join("models").join("qwen3.5-9b.json")).unwrap())
-            .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(out.join("registry/v1/models/qwen3.5-9b/index.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(manifest["updated_at"], "2026-01-02T03:04:05Z");
     assert_eq!(manifest["published_at"], "2026-01-02T03:04:05Z");
 }

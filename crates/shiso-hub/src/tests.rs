@@ -117,6 +117,8 @@ fn make_test_recipe() -> Recipe {
             structured_output: true,
         },
         variants: vec![variant_metal, variant_cuda],
+        info: None,
+        quality: Vec::new(),
         published_at: None,
         updated_at: None,
     }
@@ -624,4 +626,69 @@ fn image_assets_role_is_a_directory_beside_an_image() {
     );
     recipe.variants = vec![variant];
     assert!(validate_recipe(&recipe, ValidationMode::Strict).is_err());
+}
+
+#[test]
+fn info_and_quality_are_checked() {
+    use crate::recipe::{CardSource, CommitSha, ModelInfo, QualityScope, QualityScore};
+    let score = |scope, variant: Option<&str>| QualityScore {
+        source: "Some Lab".to_string(),
+        metric: "Index".to_string(),
+        value: 41.0,
+        max: Some(100.0),
+        url: "https://example.com/model".to_string(),
+        as_of: "2026-10-05".to_string(),
+        scope,
+        variant: variant.map(|k| VariantKey::parse(k).unwrap()),
+        subject: None,
+    };
+    let mut recipe = make_test_recipe();
+    recipe.info = Some(ModelInfo {
+        publisher: Some("Someone".to_string()),
+        license: Some("apache-2.0".to_string()),
+        homepage: Some("https://example.com".to_string()),
+        card: Some(CardSource {
+            provider: "huggingface".to_string(),
+            repo: "owner/name".to_string(),
+            revision: CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap(),
+        }),
+        parameters: Some(27_000_000_000),
+        active_parameters: Some(3_000_000_000),
+        context_length: Some(262_144),
+    });
+    let key = recipe.variants[0].key.to_string();
+    recipe.quality = vec![
+        score(QualityScope::BaseModel, None),
+        score(QualityScope::Variant, Some(&key)),
+    ];
+    validate_recipe(&recipe, ValidationMode::Strict).unwrap();
+
+    let refused = |mutate: &dyn Fn(&mut Recipe)| {
+        let mut r = recipe.clone();
+        mutate(&mut r);
+        validate_recipe(&r, ValidationMode::Strict).is_err()
+    };
+    assert!(refused(
+        &|r| r.info.as_mut().unwrap().homepage = Some("javascript:alert(1)".into())
+    ));
+    assert!(refused(
+        &|r| r.info.as_mut().unwrap().active_parameters = Some(u64::MAX)
+    ));
+    assert!(refused(&|r| r
+        .info
+        .as_mut()
+        .unwrap()
+        .card
+        .as_mut()
+        .unwrap()
+        .repo = "name".into()));
+    assert!(refused(&|r| r.quality[0].as_of = "Oct 2026".into()));
+    assert!(refused(&|r| r.quality[0].value = 101.0));
+    assert!(refused(
+        &|r| r.quality[0].variant = r.quality[1].variant.clone()
+    ));
+    assert!(refused(
+        &|r| r.quality[1].variant = Some(VariantKey::parse("nope").unwrap())
+    ));
+    assert!(refused(&|r| r.quality[1].variant = None));
 }

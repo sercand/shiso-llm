@@ -10,7 +10,7 @@ use crate::error::HubError;
 
 /// Default static registry URL. The registry repository is served statically,
 /// so the index lives at `<host>/registry/v1/index.json` under its root.
-pub const DEFAULT_REGISTRY_URL: &str = "https://models.shiso.run/registry/v1/";
+pub const DEFAULT_REGISTRY_URL: &str = "https://hub.shiso.run/registry/v1/";
 
 /// Default Hugging Face endpoint URL.
 pub const DEFAULT_HF_ENDPOINT: &str = "https://huggingface.co";
@@ -53,7 +53,7 @@ impl fmt::Display for HfToken {
 /// Registry static endpoint URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryEndpoint {
-    /// Base URL of the registry (e.g. `https://models.shiso.run/registry/v1`).
+    /// Base URL of the registry (e.g. `https://hub.shiso.run/registry/v1`).
     pub url: Url,
 }
 

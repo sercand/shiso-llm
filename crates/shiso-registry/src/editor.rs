@@ -1,6 +1,6 @@
 //! Core editor functions shared between headless CLI and web server (§7).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -65,6 +65,12 @@ pub(crate) struct BuildResult {
     pub(crate) manifest_paths: Vec<PathBuf>,
     /// Index diff against current published index.
     pub(crate) diff: String,
+    /// Site files written, relative to the output root.
+    pub(crate) site_files: Vec<String>,
+    /// Models whose page has no card because none is cached.
+    pub(crate) missing_cards: Vec<String>,
+    /// Stale output removed (pages and manifests of models that are gone).
+    pub(crate) pruned: Vec<String>,
 }
 
 /// Git status information for the repository banner (§7.2).
@@ -287,26 +293,64 @@ async fn hash_remote_non_lfs_file(
 
 /// Where a build writes, given the repository and what the caller asked for.
 ///
-/// The output belongs to the registry repository, wherever the tool was
-/// started from: nothing (or an empty field) is `<repo>/registry/v1`, a
-/// relative path is relative to the repository, and only an absolute path
-/// leaves it.
+/// The output is the site root: `index.html` and `models/` at its top, the
+/// registry under `registry/v1/`. It belongs to the registry repository,
+/// wherever the tool was started from: nothing (or an empty field) is the
+/// repository itself, a relative path is relative to the repository, and only
+/// an absolute path leaves it.
 #[must_use]
 pub(crate) fn resolve_out(repo_path: &Path, out: Option<&Path>) -> PathBuf {
     match out {
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(path) if !path.as_os_str().is_empty() => repo_path.join(path),
-        _ => repo_path.join("registry/v1"),
+        _ => repo_path.to_path_buf(),
     }
 }
 
-/// Builds and validates the registry output (§7.1, §7.5).
+/// The registry base directory under a site root.
+pub(crate) fn registry_dir(out_root: &Path) -> PathBuf {
+    out_root.join("registry").join("v1")
+}
+
+/// A model's manifest path relative to the registry base, as the index
+/// carries it.
+pub(crate) fn manifest_rel(name: &ModelName) -> String {
+    format!("models/{name}/index.json")
+}
+
+/// Every recipe under `recipes/`, sorted by file name.
+///
+/// # Errors
+/// When the directory cannot be read or a recipe does not parse.
+pub(crate) fn load_recipes(repo_path: &Path) -> anyhow::Result<Vec<(PathBuf, Recipe)>> {
+    let recipes_dir = repo_path.join("recipes");
+    let mut files: Vec<_> = fs::read_dir(&recipes_dir)
+        .with_context(|| format!("reading {}", recipes_dir.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let recipe: Recipe = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            Ok((path, recipe))
+        })
+        .collect()
+}
+
+/// Builds and validates the registry output and the site (§7.1, §7.5).
+///
+/// Cards are read from the `cards/` cache only; refresh it first with
+/// [`crate::card::refresh_cache`] to fetch new ones.
 ///
 /// # Errors
 /// Returns an error if validation fails or uncommitted changes exist.
 pub(crate) fn build_registry(
     repo_path: &Path,
-    out_dir: &Path,
+    out_root: &Path,
     allow_dirty: bool,
 ) -> anyhow::Result<BuildResult> {
     let status = git_status(repo_path);
@@ -327,34 +371,76 @@ pub(crate) fn build_registry(
         bail!("{msg}");
     }
 
-    let models_out = out_dir.join("models");
-    fs::create_dir_all(&models_out)?;
+    let mut recipes = Vec::new();
+    for (path, mut recipe) in load_recipes(repo_path)? {
+        let (published, updated) = get_git_timestamps(repo_path, &path)?;
+        recipe.published_at = Some(published);
+        recipe.updated_at = Some(updated);
+        recipes.push(recipe);
+    }
+    recipes.sort_by(|a, b| a.name.cmp(&b.name));
+    let benchmarks = crate::bench::load_all(repo_path, &recipes)?;
 
+    let registry = registry_dir(out_root);
+    let manifest_paths = write_registry(&registry, &recipes, &benchmarks)?;
+    let (site_files, missing_cards) = write_site(repo_path, out_root, &recipes, &benchmarks)?;
+
+    let names: Vec<&str> = recipes.iter().map(|r| r.name.as_str()).collect();
+    let mut pruned = prune_models_dir(&out_root.join("models"), &names, &["index.html"], false)?;
+    pruned.extend(prune_models_dir(
+        &registry.join("models"),
+        &names,
+        &["index.json", "benchmarks.json"],
+        true,
+    )?);
+
+    let diff = format!(
+        "Compiled {} model manifests and {} site files into '{}'",
+        manifest_paths.len(),
+        site_files.len(),
+        out_root.display()
+    );
+
+    Ok(BuildResult {
+        models_count: manifest_paths.len(),
+        manifest_paths,
+        diff,
+        site_files,
+        missing_cards,
+        pruned,
+    })
+}
+
+/// Writes the manifests, their benchmark files and `index.json`.
+fn write_registry(
+    registry: &Path,
+    recipes: &[Recipe],
+    benchmarks: &BTreeMap<ModelName, Vec<crate::bench::PublishedRecord>>,
+) -> anyhow::Result<Vec<PathBuf>> {
     let mut index_models = Vec::new();
     let mut manifest_paths = Vec::new();
 
-    let recipes_dir = repo_path.join("recipes");
-    let mut recipe_files: Vec<_> = fs::read_dir(&recipes_dir)?
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-        .collect();
-    recipe_files.sort_by_key(fs::DirEntry::file_name);
-
-    for file_entry in recipe_files {
-        let path = file_entry.path();
-        let bytes = fs::read(&path)?;
-        let mut recipe: Recipe = serde_json::from_slice(&bytes)?;
-
-        let (published, updated) = get_git_timestamps(repo_path, &path)?;
-        recipe.published_at = Some(published.clone());
-        recipe.updated_at = Some(updated.clone());
-
-        let compiled_bytes = serde_json::to_vec_pretty(&recipe)?;
+    for recipe in recipes {
+        let compiled_bytes = serde_json::to_vec_pretty(recipe)?;
         let manifest_sha = hex::encode(Sha256Hasher::digest(&compiled_bytes));
-        let dest_file = models_out.join(format!("{}.json", recipe.name.as_str()));
-
+        let rel = manifest_rel(&recipe.name);
+        let dest_file = registry.join(&rel);
         atomic_write(&dest_file, &compiled_bytes)?;
         manifest_paths.push(dest_file);
+
+        let bench_file = registry.join(format!("models/{}/benchmarks.json", recipe.name));
+        match benchmarks.get(&recipe.name) {
+            Some(records) => {
+                let body = serde_json::json!({
+                    "schema_version": crate::bench::BENCH_SCHEMA_VERSION,
+                    "model": recipe.name,
+                    "records": records,
+                });
+                atomic_write(&bench_file, &serde_json::to_vec_pretty(&body)?)?;
+            }
+            None if bench_file.is_file() => fs::remove_file(&bench_file)?,
+            None => {}
+        }
 
         let variants_summary: Vec<_> = recipe
             .variants
@@ -371,45 +457,119 @@ pub(crate) fn build_registry(
             .collect();
 
         index_models.push(IndexModelEntry {
-            name: recipe.name,
-            aliases: recipe.aliases,
-            family: recipe.family,
-            min_shiso_version: recipe.min_shiso_version,
-            description: recipe.description,
-            tags: recipe.tags,
-            tasks: recipe.tasks,
-            inputs: recipe.modalities.inputs,
-            outputs: recipe.modalities.outputs,
-            updated_at: updated,
+            name: recipe.name.clone(),
+            aliases: recipe.aliases.clone(),
+            family: recipe.family.clone(),
+            min_shiso_version: recipe.min_shiso_version.clone(),
+            description: recipe.description.clone(),
+            tags: recipe.tags.clone(),
+            tasks: recipe.tasks.clone(),
+            inputs: recipe.modalities.inputs.clone(),
+            outputs: recipe.modalities.outputs.clone(),
+            updated_at: recipe.updated_at.clone().unwrap_or_default(),
+            manifest: rel,
             manifest_sha256: Sha256::parse(&manifest_sha)
                 .map_err(|e| anyhow::anyhow!("invalid sha: {e}"))?,
             variants: variants_summary,
         });
     }
 
-    index_models.sort_by(|a, b| a.name.cmp(&b.name));
-
     let index = Index {
         schema_version: CURRENT_SCHEMA_VERSION,
         generated_at: current_iso8601(),
         models: index_models,
     };
+    atomic_write(
+        &registry.join("index.json"),
+        &serde_json::to_vec_pretty(&index)?,
+    )?;
+    Ok(manifest_paths)
+}
 
-    let index_bytes = serde_json::to_vec_pretty(&index)?;
-    let index_path = out_dir.join("index.json");
-    atomic_write(&index_path, &index_bytes)?;
+/// Writes the site, returning its files and the models that have no card.
+fn write_site(
+    repo_path: &Path,
+    out_root: &Path,
+    recipes: &[Recipe],
+    benchmarks: &BTreeMap<ModelName, Vec<crate::bench::PublishedRecord>>,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let mut missing_cards = Vec::new();
+    let mut inputs = Vec::new();
+    for recipe in recipes {
+        let card = match crate::card::CardRef::of(recipe) {
+            Some(r) => crate::card::load(repo_path, &r)?,
+            None => None,
+        };
+        if card.is_none() {
+            missing_cards.push(recipe.name.to_string());
+        }
+        inputs.push(crate::site::ModelInput {
+            recipe,
+            card,
+            benchmarks: benchmarks.get(&recipe.name).map_or(&[], Vec::as_slice),
+        });
+    }
+    let site_files = crate::site::write(out_root, &inputs)?;
+    Ok((site_files, missing_cards))
+}
 
-    let diff = format!(
-        "Compiled {} model manifests into '{}'",
-        manifest_paths.len(),
-        out_dir.display()
-    );
-
-    Ok(BuildResult {
-        models_count: manifest_paths.len(),
-        manifest_paths,
-        diff,
-    })
+/// Removes what a build wrote for models that no longer have a recipe.
+///
+/// Only an entry the build could have written is removed: a directory named
+/// like a model that holds nothing but `owned` files, or a `<name>.json` left
+/// by the earlier flat manifest layout (`flat_json`, the registry directory
+/// only). Anything else is refused, because the output may be a directory the
+/// maintainer keeps other files in.
+fn prune_models_dir(
+    dir: &Path,
+    keep: &[&str],
+    owned: &[&str],
+    flat_json: bool,
+) -> anyhow::Result<Vec<String>> {
+    let mut removed = Vec::new();
+    if !dir.is_dir() {
+        return Ok(removed);
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if path.is_file() {
+            if !flat_json {
+                continue;
+            }
+            let stem = file_name.strip_suffix(".json");
+            if let Some(stem) = stem
+                && ModelName::parse(stem).is_ok()
+            {
+                fs::remove_file(&path)?;
+                removed.push(path.display().to_string());
+            }
+            continue;
+        }
+        if keep.contains(&file_name.as_str()) || ModelName::parse(&file_name).is_err() {
+            continue;
+        }
+        let mut foreign = Vec::new();
+        for inner in fs::read_dir(&path)? {
+            let name = inner?.file_name().to_string_lossy().to_string();
+            if !owned.contains(&name.as_str()) {
+                foreign.push(name);
+            }
+        }
+        if !foreign.is_empty() {
+            bail!(
+                "{} belongs to no recipe but holds files the build did not write ({}); remove it by hand",
+                path.display(),
+                foreign.join(", ")
+            );
+        }
+        fs::remove_dir_all(&path)?;
+        removed.push(path.display().to_string());
+    }
+    Ok(removed)
 }
 
 /// Runs `git status` to detect branch name and changed recipes (§7.2).
@@ -584,7 +744,7 @@ fn get_git_timestamps(repo_path: &Path, path: &Path) -> anyhow::Result<(String, 
     Ok((now.clone(), now))
 }
 
-fn atomic_write(dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
 
@@ -603,7 +763,7 @@ fn atomic_write(dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn current_iso8601() -> String {
+pub(crate) fn current_iso8601() -> String {
     use time::format_description::well_known::Rfc3339;
     time::OffsetDateTime::now_utc()
         .format(&Rfc3339)

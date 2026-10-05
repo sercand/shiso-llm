@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}shiso hub{% endblock %}</title>
+<meta name="description" content="{% block description %}Models packaged for the shiso inference server: pinned weights, hardware requirements and measured throughput.{% endblock %}">
+<link rel="stylesheet" href="{{ root }}assets/site.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-row">
+    <a class="brand" href="{{ root or './' }}"><span class="leaf" aria-hidden="true"></span>shiso <span class="muted">hub</span></a>
+    <nav class="top-nav">
+      <a href="{{ root or './' }}">Models</a>
+      <a href="{{ root }}registry/v1/index.json">Index JSON</a>
+    </nav>
+  </div>
+</header>
+<main class="wrap">
+{% block main %}{% endblock %}
+</main>
+<footer class="wrap foot">
+  <p>Every file is pinned to a commit and verified by SHA-256 on download. Built from the shiso registry recipes.</p>
+</footer>
+{% block scripts %}<script src="{{ root }}assets/site.js" defer></script>{% endblock %}
+</body>
+</html>
