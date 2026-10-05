@@ -101,6 +101,10 @@ impl Checkpointed for Qwen4ExpModel {
         self.stack_mut().ckpt_set_hints(session, hints)
     }
 
+    fn kv_set_scoring(&mut self, session: SessionId) -> CoreResult<()> {
+        self.stack_mut().ckpt_set_scoring(session)
+    }
+
     fn kv_set_media_key(
         &mut self,
         session: SessionId,

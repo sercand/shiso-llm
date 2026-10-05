@@ -11,9 +11,10 @@
 //! exactly as array order did.
 //!
 //! The kept deviations from the official doc (spec §1.3): `model` and `state`
-//! may be absent (official: both required); choice options cap at 26, not
-//! 255, because the label scheme stops at `Z`, and lists of one answer
-//! (official: two); a schema violation is a 422 and a bound or policy refusal
+//! may be absent (official: both required); choice lists of one answer
+//! (official: two), and a list past 26 options is labelled `AA`, `AB`, ..
+//! with the pairs the vocabulary spells as one token, so a vocabulary short
+//! of 255 such pairs refuses the longest lists; a schema violation is a 422 and a bound or policy refusal
 //! a 400 (official: all validation is 422); structured `instructions` render
 //! as key-sorted compact JSON rather than being restructured into the prompt.
 //!

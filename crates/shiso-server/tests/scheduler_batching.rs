@@ -118,7 +118,7 @@ async fn a_prompt_read_beside_a_decoding_turn_is_read_in_quanta() {
         .iter()
         .filter_map(|call| match call {
             Call::Prefill { tokens, .. } => Some(*tokens),
-            Call::Decode(_) => None,
+            Call::Decode(_) | Call::PrefillMany { .. } => None,
         })
         .collect();
     assert!(

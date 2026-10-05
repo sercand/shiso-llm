@@ -81,6 +81,23 @@ pub const MAX_DECODE_BATCH: u32 = 8;
 /// is a decode batch's sequences times one verify each.
 pub const MAX_LOGIT_ROWS: u32 = 32;
 
+/// Runs one prompt-role segmented pass may carry.
+///
+/// A prompt-role pass carries one run per scoring session, and the
+/// scheduler's slot table bounds how many are resident.
+pub const MAX_PROMPT_RUNS: u32 = 64;
+
+/// Rows of the logits block: a verify's every row, or one per prompt run.
+///
+/// One logits row per run, so the block is the wider of a verify's rows and
+/// the run cap. At 64 runs that is +30 MiB of logits and +1.3 MiB of
+/// `ResidualHold`.
+pub const LOGIT_BLOCK_ROWS: u32 = if MAX_PROMPT_RUNS > MAX_LOGIT_ROWS {
+    MAX_PROMPT_RUNS
+} else {
+    MAX_LOGIT_ROWS
+};
+
 /// Everything a sparse stack needs that is not geometry and not a weight.
 ///
 /// Composes the shared knobs rather than restating them: the context length and
@@ -302,6 +319,18 @@ pub struct SparseSession {
     /// Message boundaries of the prompt being read, as absolute positions: a
     /// chunk stops at each so a checkpoint can be taken there.
     pub(crate) hints: Vec<u32>,
+    /// Whether this session reads a prompt only to score its last row. See
+    /// [`crate::ckpt::Checkpointed::kv_set_scoring`]: such a session keeps
+    /// only its shared-boundary checkpoints, in memory, because nothing will
+    /// resume its prompt's end.
+    pub(crate) scoring: bool,
+    /// The position below which this session warms the draft head's cache.
+    ///
+    /// `u32::MAX` for every session that may decode. A scoring session never
+    /// drafts, but its shared-boundary checkpoint may be resumed by one that
+    /// does, so the cache is warmed up to that boundary and not past it: the
+    /// tail beyond it is this session's alone.
+    pub(crate) warm_until: u32,
     /// Whether any chunk spliced media rows in, or a media key was set. Such
     /// a path is checkpointed only under [`SparseSession::key`]: a placeholder
     /// run is one id repeated, so its own tokens cannot tell two pictures apart.
@@ -495,6 +524,12 @@ impl SparseSession {
     #[must_use]
     pub fn recurrent_slots(&self) -> usize {
         self.states.len()
+    }
+
+    /// The position below which this session warms the draft head's cache.
+    #[must_use]
+    pub fn warm_until(&self) -> u32 {
+        self.warm_until
     }
 
     /// The handle this session was opened under.
@@ -822,7 +857,7 @@ impl SparseStack {
             backend,
             &shape,
             opts.prefill_rows,
-            MAX_LOGIT_ROWS,
+            LOGIT_BLOCK_ROWS,
             opts.engine.ctx,
         )?;
         // The suppress list starts empty: the count is the buffer's first
@@ -1180,6 +1215,8 @@ impl SparseStack {
             written: 0,
             history: Vec::new(),
             hints: Vec::new(),
+            scoring: false,
+            warm_until: u32::MAX,
             media: false,
             resumed_at: 0,
             key: None,

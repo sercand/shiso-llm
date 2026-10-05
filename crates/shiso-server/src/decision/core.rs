@@ -28,6 +28,7 @@ use crate::error::AppError;
 use crate::media::MediaItem;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
+use crate::tokenizer::{AddedSeam, Vocabulary};
 
 /// One option of a choice question.
 #[derive(Debug, Clone)]
@@ -123,14 +124,17 @@ fn canonical(value: &serde_json::Value) -> serde_json::Value {
 /// The exact bytes are pinned by the golden tests below, through
 /// [`prompt_body`] and, on the blocks path, through the whitespace goldens in
 /// `tests/decisions.rs`.
-pub(crate) fn question_block(kind: &Kind) -> String {
+///
+/// `labels` are the kind's label words from [`labels_for`]; a choice block
+/// letters its options with them, the other kinds spell their own.
+pub(crate) fn question_block(kind: &Kind, labels: &[String]) -> String {
     match kind {
         Kind::Choice { question, options } => {
             let mut lines = Vec::with_capacity(options.len() + 2);
             if !question.trim().is_empty() {
                 lines.push(format!("Question: {question}"));
             }
-            for (option, label) in options.iter().zip(choice_labels(options.len())) {
+            for (option, label) in options.iter().zip(labels) {
                 let mut line = format!("{label}: {}", option.name);
                 if let Some(description) = option
                     .description
@@ -142,7 +146,13 @@ pub(crate) fn question_block(kind: &Kind) -> String {
                 }
                 lines.push(line);
             }
-            lines.push("Answer with the letter of one option only.".to_string());
+            // A list within the alphabet keeps the version-1 wording byte for
+            // byte; only a wide list, whose labels are two letters, says so.
+            if options.len() <= LETTERS.len() {
+                lines.push("Answer with the letter of one option only.".to_string());
+            } else {
+                lines.push("Answer with the two-letter label of one option only.".to_string());
+            }
             lines.join("\n")
         }
         Kind::Score { question, levels } => {
@@ -181,8 +191,8 @@ pub(crate) fn question_block(kind: &Kind) -> String {
 /// The exact bytes are pinned by the golden tests below, and `input` is
 /// trimmed so the seam between it and the block is always exactly one blank
 /// line whatever whitespace the caller padded it with.
-pub(crate) fn prompt_body(input: &str, kind: &Kind) -> String {
-    let block = question_block(kind);
+pub(crate) fn prompt_body(input: &str, kind: &Kind, labels: &[String]) -> String {
+    let block = question_block(kind, labels);
     let mut body = String::with_capacity(input.len() + block.len() + 2);
     body.push_str(input.trim());
     body.push_str("\n\n");
@@ -190,17 +200,40 @@ pub(crate) fn prompt_body(input: &str, kind: &Kind) -> String {
     body
 }
 
-/// The letters `A`.. for `n` options.
+/// The single letters a list within the alphabet is labelled with.
+const LETTERS: [&str; 26] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U", "V", "W", "X", "Y", "Z",
+];
+
+/// The most options one choice question takes: the System One wire's own
+/// bound. Any vocabulary that spells most two-letter pairs as one token
+/// labels a list this long; one that cannot is refused at preparation.
+pub(crate) const MAX_CHOICE_OPTIONS: usize = 255;
+
+/// The labels for `n` options: the letters `A`.. when `n` fits the alphabet,
+/// otherwise two letters each - `AA`, `AB`, .. - keeping only the pairs
+/// `one_token` accepts, in that order.
 ///
-/// Past 26 the vector stops at `Z` rather than inventing labels:
-/// [`check_choice_options`] refuses longer lists, so a request that passed
-/// validation never sees a short label vector.
-pub(crate) fn choice_labels(n: usize) -> Vec<&'static str> {
-    const LETTERS: [&str; 26] = [
-        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
-        "S", "T", "U", "V", "W", "X", "Y", "Z",
-    ];
-    LETTERS.iter().copied().take(n.min(26)).collect()
+/// A wide list is two letters throughout rather than `A`..`Z` then `AA`..:
+/// the answer is read from one row, and a model spelling `AB` as `A`, `B`
+/// would put that answer's mass on `A`. With no single-letter label in the
+/// list, such a spelling is lost mass, never a different answer. Pairs the
+/// vocabulary splits are skipped because a split label cannot be read from
+/// one row at all.
+///
+/// The vector is shorter than `n` when the vocabulary runs out of one-token
+/// pairs; [`prepare_question`] refuses that list by name.
+pub(crate) fn choice_labels(n: usize, one_token: impl Fn(&str) -> bool) -> Vec<String> {
+    if n <= LETTERS.len() {
+        return LETTERS.iter().take(n).map(ToString::to_string).collect();
+    }
+    LETTERS
+        .iter()
+        .flat_map(|first| LETTERS.iter().map(move |second| format!("{first}{second}")))
+        .filter(|pair| one_token(pair))
+        .take(n)
+        .collect()
 }
 
 /// The numbers `0`.. for `n` levels, as label strings.
@@ -315,8 +348,9 @@ pub(crate) fn check_question_text(
 
 /// Refuse a choice option list the answer position cannot carry.
 ///
-/// The upper bound is the alphabet - labels run `A..Z`, so a longer list
-/// could not be answered by letter - and the lower bound is the surface's
+/// The upper bound is [`MAX_CHOICE_OPTIONS`] - whether this server's
+/// vocabulary can label that many is proven later, at preparation, where the
+/// vocabulary is in hand - and the lower bound is the surface's
 /// `min`, because one wire scores a binary choice and the other a real list.
 /// Names must be non-blank (a blank one renders a label pointing at nothing),
 /// free of control characters (one inside an option's name breaks the
@@ -339,11 +373,10 @@ pub(crate) fn check_choice_options(
             "invalid_request",
         ));
     }
-    if options.len() > 26 {
+    if options.len() > MAX_CHOICE_OPTIONS {
         return Err(AppError::bad_request(
             format!(
-                "{}: supports at most 26 options, got {}",
-                name,
+                "{name}: supports at most {MAX_CHOICE_OPTIONS} options per choice, got {}",
                 options.len()
             ),
             Some("questions"),
@@ -503,14 +536,12 @@ pub(crate) fn type_name(kind: &Kind) -> &'static str {
     }
 }
 
-/// The label words of a kind, in answer order: the letters, the digits, or
+/// The label words of a kind, in answer order: the letters (or, for a wide
+/// list, the one-token letter pairs `one_token` accepts), the digits, or
 /// `yes` and `no`.
-fn labels_for(kind: &Kind) -> Vec<String> {
+pub(crate) fn labels_for(kind: &Kind, one_token: impl Fn(&str) -> bool) -> Vec<String> {
     match kind {
-        Kind::Choice { options, .. } => choice_labels(options.len())
-            .into_iter()
-            .map(ToString::to_string)
-            .collect(),
+        Kind::Choice { options, .. } => choice_labels(options.len(), one_token),
         Kind::Score { levels, .. } => score_labels(levels.len()),
         Kind::YesNo { .. } => YES_NO_LABELS
             .iter()
@@ -685,7 +716,7 @@ pub(crate) struct PreparedQuestion {
 /// between input and block survives only when the caller's last block is
 /// text; after a picture the pad run already ends the text side, and the
 /// block follows plain.
-fn blocks_message(blocks: &[InputBlock], kind: &Kind) -> Message {
+fn blocks_message(blocks: &[InputBlock], kind: &Kind, labels: &[String]) -> Message {
     let mut parts: Vec<Block> = blocks
         .iter()
         .map(|block| match block {
@@ -698,7 +729,7 @@ fn blocks_message(blocks: &[InputBlock], kind: &Kind) -> Message {
             }
         })
         .collect();
-    let wording = question_block(kind);
+    let wording = question_block(kind, labels);
     let question_text = if matches!(blocks.last(), Some(InputBlock::Text { .. })) {
         format!("\n\n{wording}")
     } else {
@@ -706,6 +737,36 @@ fn blocks_message(blocks: &[InputBlock], kind: &Kind) -> Message {
     };
     parts.push(Block::Text(question_text));
     Message::new(Role::User, parts)
+}
+
+/// The kind's labels under `vocabulary`, refusing a choice list it cannot
+/// label: a wide list keeps only the pairs this vocabulary spells as one
+/// token, so it can come up short of the options it must label.
+fn vocabulary_labels(
+    vocabulary: &Vocabulary,
+    kind: &Kind,
+    name: &str,
+) -> Result<Vec<String>, AppError> {
+    let one_token = |label: &str| {
+        vocabulary
+            .encode(label, false)
+            .is_ok_and(|ids| ids.len() == 1)
+    };
+    let labels = labels_for(kind, one_token);
+    if let Kind::Choice { options, .. } = kind
+        && labels.len() < options.len()
+    {
+        return Err(AppError::bad_request(
+            format!(
+                "{name}: this server's vocabulary labels at most {} options per choice, got {}",
+                labels.len(),
+                options.len()
+            ),
+            Some("questions"),
+            "invalid_request",
+        ));
+    }
+    Ok(labels)
 }
 
 /// Renders one question over the shared input and proves the labels are
@@ -750,10 +811,16 @@ pub(crate) fn prepare_question(
         what: "a prompt renderer",
     })?;
     let vocabulary = renderer.vocabulary();
+    let name = question_name(&question.id);
+
+    // The labels are chosen before the prompt is rendered because the prompt
+    // spells them; the proofs below still check each one against the
+    // rendered tail.
+    let label_words = vocabulary_labels(vocabulary, &question.kind, &name)?;
 
     let message = match input {
-        DecisionInput::Text(text) => Message::user(prompt_body(text, &question.kind)),
-        DecisionInput::Blocks(blocks) => blocks_message(blocks, &question.kind),
+        DecisionInput::Text(text) => Message::user(prompt_body(text, &question.kind, &label_words)),
+        DecisionInput::Blocks(blocks) => blocks_message(blocks, &question.kind, &label_words),
     };
     let mut request = Request::new(state.model_id.clone(), vec![message]);
     // Scoring reads the first row after the question block. A thinking block
@@ -763,7 +830,6 @@ pub(crate) fn prepare_question(
     kwargs.apply(&mut request);
     let prompt = renderer.render(&request)?;
 
-    let name = question_name(&question.id);
     // The seam the answer is read at: the prompt's tail text and the ids
     // beside it. Without media the tail is the whole prompt, and the whole
     // prompt must first survive re-encoding - the text the caller is told
@@ -772,9 +838,12 @@ pub(crate) fn prepare_question(
     // full-text re-encode cannot match by construction and is skipped; the
     // tail after the last span is where text and ids agree again, and the
     // proof needs only the spans - `core` never sees a marker string.
-    let (tail_text, tail_tokens): (&str, Vec<TokenId>) = if prompt.media.is_empty() {
-        let plain = vocabulary
-            .encode(&prompt.text, false)
+    let (tail_text, tail_tokens, seam): (&str, Vec<TokenId>, Option<AddedSeam>) = if prompt
+        .media
+        .is_empty()
+    {
+        let (plain, seam) = vocabulary
+            .encode_with_seam(&prompt.text)
             .map_err(|error| AppError::internal("re-encoding the rendered prompt", error))?;
         // The renderer's ids are this re-encode plus, when the checkpoint has
         // an opening token and the template did not write it, that token in
@@ -794,21 +863,93 @@ pub(crate) fn prepare_question(
                 "invalid_request",
             ));
         }
-        (prompt.text.as_str(), plain)
+        (prompt.text.as_str(), plain, seam)
     } else {
         let last = prompt
             .media_spans
             .last()
             .expect("a prompt that rendered media reports its spans");
-        (
-            &prompt.text[last.text.end..],
-            prompt.tokens[last.tokens.end..].to_vec(),
-        )
+        let tail_text = &prompt.text[last.text.end..];
+        let tail_tokens = prompt.tokens[last.tokens.end..].to_vec();
+        // The tail's ids were never re-encoded here, so its encoding is
+        // taken once to find the seam, and the seam is used only when the
+        // ids in front of it are the tail's own: otherwise every label
+        // takes the whole-tail check below, which refuses it as before.
+        let (encoded, seam) = vocabulary
+            .encode_with_seam(tail_text)
+            .map_err(|error| AppError::internal("encoding the prompt's tail", error))?;
+        let seam = seam.filter(|seam| encoded.get(..seam.tokens) == tail_tokens.get(..seam.tokens));
+        (tail_text, tail_tokens, seam)
     };
 
+    let labels = prove_labels(
+        vocabulary,
+        &name,
+        label_words,
+        &LabelSeam {
+            text: tail_text,
+            tokens: &tail_tokens,
+            seam: seam.as_ref(),
+        },
+    )?;
+
+    let prompt_tokens = u64::try_from(prompt.tokens.len()).unwrap_or(u64::MAX);
+    // The scoring pass answers at the prompt's last row, so it needs the
+    // prompt to leave room the same way a generation does - the shared
+    // boundary, blamed on the field this surface carries.
+    remaining_budget(state.ctx, prompt_tokens).ok_or(AppError::ContextOverflow {
+        param: "input",
+        prompt_tokens,
+        ctx: state.ctx,
+    })?;
+    Ok(PreparedQuestion {
+        id: question.id.clone(),
+        kind: question.kind.clone(),
+        probability_answer: question.probability_answer,
+        prompt_tokens: prompt.tokens,
+        labels,
+        media: Arc::from(prompt.media),
+        media_digests: Arc::from(prompt.digests),
+    })
+}
+
+/// A prompt's tail, as [`prove_labels`] checks labels against it.
+struct LabelSeam<'a> {
+    /// The tail's text: the whole prompt without media, the text after the
+    /// last item's marker with it.
+    text: &'a str,
+    /// The tail's ids.
+    tokens: &'a [TokenId],
+    /// Where the tail's encoding last restarted, when it did and the ids in
+    /// front of that point are the tail's own.
+    seam: Option<&'a AddedSeam>,
+}
+
+/// Encodes every label, and proves each one is one token of its own that
+/// follows the prompt's tail as exactly that token.
+///
+/// The proof per label is that the tail's text with the label appended
+/// encodes as the tail's ids with the label's id appended. Done literally,
+/// that re-encodes the whole tail once per label - a 255-option question
+/// over a long input is hundreds of whole-prompt encodes. With a seam it
+/// encodes only the stretch after the tail's last added token, plus the
+/// label: the encoder splits added tokens out first and encodes every stretch
+/// between them alone, so the ids in front of the seam are the same whatever
+/// follows it (and are the tail's own, which the caller checked), and the ids
+/// after it are what this stretch encodes to. The one way an appended label
+/// could reach behind the seam, completing an added token spelled across it,
+/// is ruled out per label by [`AddedSeam::holds_after`], and a label it does
+/// not clear takes the whole-tail check instead. Either way the answer
+/// is the literal check's: same labels accepted, same ids, same refusals.
+fn prove_labels(
+    vocabulary: &Vocabulary,
+    name: &str,
+    label_words: Vec<String>,
+    tail: &LabelSeam<'_>,
+) -> Result<Vec<TokenId>, AppError> {
     let mut labels: Vec<TokenId> = Vec::new();
     let mut words: Vec<String> = Vec::new();
-    for label in labels_for(&question.kind) {
+    for label in label_words {
         let encoded = vocabulary
             .encode(&label, false)
             .map_err(|error| AppError::internal("encoding a label", error))?;
@@ -833,12 +974,15 @@ pub(crate) fn prepare_question(
         }
         // The answer position reads one token: the label must follow the
         // prompt's tail as exactly that token, not re-tokenize together with
-        // whatever the tail ended with - the tail being the whole prompt
-        // without media, and the text after the last item's marker with it.
-        let mut following = tail_tokens.clone();
+        // whatever the tail ended with.
+        let (text, ids) = match tail.seam.filter(|seam| seam.holds_after(tail.text, &label)) {
+            Some(seam) => (&tail.text[seam.text..], &tail.tokens[seam.tokens..]),
+            None => (tail.text, tail.tokens),
+        };
+        let mut following = ids.to_vec();
         following.push(*only);
         let joined = vocabulary
-            .encode(&format!("{tail_text}{label}"), false)
+            .encode(&format!("{text}{label}"), false)
             .map_err(|error| AppError::internal("encoding a label after the prompt", error))?;
         if joined != following {
             return Err(AppError::bad_request(
@@ -852,25 +996,7 @@ pub(crate) fn prepare_question(
         labels.push(*only);
         words.push(label);
     }
-
-    let prompt_tokens = u64::try_from(prompt.tokens.len()).unwrap_or(u64::MAX);
-    // The scoring pass answers at the prompt's last row, so it needs the
-    // prompt to leave room the same way a generation does - the shared
-    // boundary, blamed on the field this surface carries.
-    remaining_budget(state.ctx, prompt_tokens).ok_or(AppError::ContextOverflow {
-        param: "input",
-        prompt_tokens,
-        ctx: state.ctx,
-    })?;
-    Ok(PreparedQuestion {
-        id: question.id.clone(),
-        kind: question.kind.clone(),
-        probability_answer: question.probability_answer,
-        prompt_tokens: prompt.tokens,
-        labels,
-        media: Arc::from(prompt.media),
-        media_digests: Arc::from(prompt.digests),
-    })
+    Ok(labels)
 }
 
 /// One question's scored answer, before any wire shape.
@@ -899,6 +1025,33 @@ pub(crate) struct Answered {
     pub label_token_ids: Option<Vec<u32>>,
 }
 
+/// How many leading prompt tokens every question of a request shares, zero
+/// for a request of one question.
+///
+/// The questions render the same input ahead of their own blocks, so this is
+/// roughly the input's length - and the point the scheduler checkpoints the
+/// first question it reads, so every later one reads only its own block.
+/// A question carrying media stops the share at zero: its pad runs are one id
+/// whichever picture it is, so equal ids there say nothing about equal rows.
+fn shared_prefix(prepared: &[PreparedQuestion]) -> u32 {
+    let [first, rest @ ..] = prepared else {
+        return 0;
+    };
+    if rest.is_empty() || prepared.iter().any(|question| !question.media.is_empty()) {
+        return 0;
+    }
+    let common = rest
+        .iter()
+        .fold(first.prompt_tokens.len(), |common, question| {
+            first.prompt_tokens[..common]
+                .iter()
+                .zip(&question.prompt_tokens)
+                .take_while(|(a, b)| a == b)
+                .count()
+        });
+    u32::try_from(common).unwrap_or(u32::MAX)
+}
+
 /// Scores every prepared question at once - one prefill each - and folds each
 /// answer's label log-probabilities into probabilities, mass and a top.
 ///
@@ -919,6 +1072,7 @@ pub(crate) async fn run_questions(
     want_token_ids: bool,
 ) -> Result<Vec<Answered>, AppError> {
     let engine = state.engine()?;
+    let shared = shared_prefix(&prepared);
     let scored = join_all(prepared.into_iter().map(|question| {
         // Always through `with_media`: empty arcs are a refcount pair and
         // the scheduler's encode step skips on an empty list, so a text
@@ -928,7 +1082,8 @@ pub(crate) async fn run_questions(
                 Arc::from(question.prompt_tokens.clone()),
                 Arc::from(question.labels.clone()),
             )
-            .with_media(question.media.clone(), question.media_digests.clone()),
+            .with_media(question.media.clone(), question.media_digests.clone())
+            .with_shared_prefix(shared),
         );
         async move {
             let outcome = scored.await?;
@@ -987,13 +1142,19 @@ mod tests {
                 description: description.map(ToString::to_string),
             })
             .collect();
-        prompt_body(
+        body(
             kind_input,
             &Kind::Choice {
                 question: q.to_string(),
                 options,
             },
         )
+    }
+
+    /// The version-1 body under a vocabulary that spells every label as one
+    /// token, which is what the wording goldens pin.
+    fn body(input: &str, kind: &Kind) -> String {
+        prompt_body(input, kind, &labels_for(kind, |_| true))
     }
 
     fn yes_no(id: &str) -> RawQuestion {
@@ -1069,7 +1230,7 @@ mod tests {
                 .collect(),
         };
         assert_eq!(
-            prompt_body("in", &kind),
+            body("in", &kind),
             "in\n\nQuestion: how bad\n0: none\n1: some\n2: lots\nAnswer with the number of one level only."
         );
     }
@@ -1082,7 +1243,7 @@ mod tests {
             no: Some("denied".to_string()),
         };
         assert_eq!(
-            prompt_body("in", &kind),
+            body("in", &kind),
             "in\n\nIs the following true? it is ready\nyes: confirmed\nno: denied\nAnswer with yes or no only."
         );
     }
@@ -1095,7 +1256,7 @@ mod tests {
             no: None,
         };
         assert_eq!(
-            prompt_body("in", &kind),
+            body("in", &kind),
             "in\n\nIs the following true?\nAnswer with yes or no only."
         );
     }
@@ -1110,7 +1271,7 @@ mod tests {
             no: None,
         };
         assert_eq!(
-            prompt_body("the input  \n", &kind),
+            body("the input  \n", &kind),
             "the input\n\nIs the following true?\nAnswer with yes or no only."
         );
     }
@@ -1127,9 +1288,42 @@ mod tests {
 
     #[test]
     fn labels_are_letters_then_digits_then_yes_no() {
-        assert_eq!(choice_labels(3), ["A", "B", "C"]);
+        assert_eq!(choice_labels(3, |_| true), ["A", "B", "C"]);
         assert_eq!(score_labels(3), ["0", "1", "2"]);
         assert_eq!(YES_NO_LABELS, ["yes", "no"]);
+    }
+
+    fn prepared(ids: &[u32]) -> PreparedQuestion {
+        PreparedQuestion {
+            id: String::new(),
+            kind: Kind::YesNo {
+                question: String::new(),
+                yes: None,
+                no: None,
+            },
+            probability_answer: false,
+            prompt_tokens: ids.iter().copied().map(TokenId::new).collect(),
+            labels: Vec::new(),
+            media: Arc::from(Vec::new()),
+            media_digests: Arc::from(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn shared_prefix_is_what_every_question_starts_with() {
+        // One question shares with nobody.
+        assert_eq!(shared_prefix(&[prepared(&[1, 2, 3])]), 0);
+        assert_eq!(shared_prefix(&[]), 0);
+        // The shortest agreement wins, wherever in the list it is.
+        let questions = [
+            prepared(&[1, 2, 3, 4, 5]),
+            prepared(&[1, 2, 3, 4, 9]),
+            prepared(&[1, 2, 7]),
+        ];
+        assert_eq!(shared_prefix(&questions), 2);
+        // A prompt that is a prefix of another shares all of itself.
+        assert_eq!(shared_prefix(&[prepared(&[1, 2]), prepared(&[1, 2, 3])]), 2);
+        assert_eq!(shared_prefix(&[prepared(&[1, 2, 3]), prepared(&[4])]), 0);
     }
 
     #[test]
@@ -1157,9 +1351,55 @@ mod tests {
     }
 
     #[test]
-    fn check_choice_options_bounds_two_to_twenty_six() {
+    fn a_wide_list_is_two_letters_throughout_skipping_split_pairs() {
+        // Within the alphabet the vocabulary is never asked: the letters are
+        // the version-1 labels.
+        assert_eq!(choice_labels(26, |_| false).len(), 26);
+        let all = choice_labels(27, |_| true);
+        assert_eq!(all.len(), 27);
+        assert_eq!(all[..3], ["AA", "AB", "AC"]);
+        assert_eq!(all[26], "BA");
+        // A pair the vocabulary splits is skipped, not renamed.
+        let skipping = choice_labels(30, |pair| pair != "AB");
+        assert_eq!(skipping[..3], ["AA", "AC", "AD"]);
+        // A vocabulary that runs out comes up short; preparation refuses it.
+        assert_eq!(choice_labels(30, |pair| pair.starts_with('A')).len(), 26);
+        assert_eq!(
+            choice_labels(MAX_CHOICE_OPTIONS, |_| true).len(),
+            MAX_CHOICE_OPTIONS
+        );
+    }
+
+    #[test]
+    fn choice_body_words_a_wide_list_by_its_two_letter_labels() {
+        let opts: Vec<(String, Option<&str>)> =
+            (0..27).map(|index| (format!("o{index}"), None)).collect();
+        let opts: Vec<(&str, Option<&str>)> = opts
+            .iter()
+            .map(|(name, description)| (name.as_str(), *description))
+            .collect();
+        let rendered = choice("in", "pick one", &opts);
+        assert!(
+            rendered.starts_with("in\n\nQuestion: pick one\nAA: o0\nAB: o1\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.ends_with("\nBA: o26\nAnswer with the two-letter label of one option only."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn check_choice_options_bounds_two_to_the_wire_maximum() {
         assert!(check_choice_options(&options(26), "q", 2).is_ok());
-        assert!(check_choice_options(&options(27), "q", 2).is_err());
+        assert!(check_choice_options(&options(27), "q", 2).is_ok());
+        assert!(check_choice_options(&options(MAX_CHOICE_OPTIONS), "q", 2).is_ok());
+        let message = refusal(check_choice_options(
+            &options(MAX_CHOICE_OPTIONS + 1),
+            "q",
+            2,
+        ));
+        assert!(message.contains("options per choice"), "{message}");
         assert!(check_choice_options(&options(1), "q", 1).is_ok());
         assert!(check_choice_options(&options(1), "q", 2).is_err());
     }
@@ -1209,5 +1449,230 @@ mod tests {
         // identifies the question instead.
         let message = refusal(check_ids(&[yes_no("a"), yes_no("")], false));
         assert!(message.contains("questions[1]"), "{message}");
+    }
+
+    /// The label proof as it was first written: every label re-encodes the
+    /// whole tail. The reference the seam proof must answer exactly as.
+    fn literal_proof(
+        vocabulary: &Vocabulary,
+        text: &str,
+        tokens: &[TokenId],
+        label_words: &[String],
+    ) -> Result<Vec<TokenId>, String> {
+        let mut labels = Vec::new();
+        for label in label_words {
+            let encoded = vocabulary.encode(label, false).map_err(|e| e.to_string())?;
+            let [only] = encoded.as_slice() else {
+                return Err(format!("{label} is not one token"));
+            };
+            if labels.contains(only) {
+                return Err(format!("{label} repeats a label"));
+            }
+            let mut following = tokens.to_vec();
+            following.push(*only);
+            let joined = vocabulary
+                .encode(&format!("{text}{label}"), false)
+                .map_err(|e| e.to_string())?;
+            if joined != following {
+                return Err(format!("{label} does not follow"));
+            }
+            labels.push(*only);
+        }
+        Ok(labels)
+    }
+
+    /// The seam proof over `text`, with refusals reduced to whether they
+    /// happened.
+    fn seam_proof(vocabulary: &Vocabulary, text: &str, label_words: &[String]) -> Option<Vec<u32>> {
+        let (tokens, seam) = vocabulary.encode_with_seam(text).expect("encodes");
+        prove_labels(
+            vocabulary,
+            "question \"q\"",
+            label_words.to_vec(),
+            &LabelSeam {
+                text,
+                tokens: &tokens,
+                seam: seam.as_ref(),
+            },
+        )
+        .ok()
+        .map(|ids| ids.iter().map(|id| id.get()).collect())
+    }
+
+    /// A word-level vocabulary with three added tokens, one of which is
+    /// spelled across a seam: `<|a|>` then a newline then `B`.
+    fn seam_vocabulary() -> Vocabulary {
+        use std::str::FromStr as _;
+        let words = [
+            "<unk>", "A", "B", "C", "AB", "yes", "no", "the", "input", "Answer", "<|u|>", "<|a|>",
+            "<|a|>\nB",
+        ];
+        let vocab: serde_json::Map<String, serde_json::Value> = words
+            .iter()
+            .enumerate()
+            .map(|(id, word)| ((*word).to_owned(), json!(id)))
+            .collect();
+        let added = |id: usize| {
+            json!({
+                "id": id, "content": words[id], "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true,
+            })
+        };
+        let document = json!({
+            "version": "1.0",
+            "truncation": serde_json::Value::Null,
+            "padding": serde_json::Value::Null,
+            "added_tokens": [added(10), added(11), added(12)],
+            "normalizer": serde_json::Value::Null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": serde_json::Value::Null,
+            "decoder": serde_json::Value::Null,
+            "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
+        })
+        .to_string();
+        Vocabulary::from_tokenizer(
+            tokenizers::Tokenizer::from_str(&document).expect("the vocabulary loads"),
+        )
+    }
+
+    #[test]
+    fn the_seam_proof_answers_exactly_what_the_whole_tail_proof_answers() {
+        let vocabulary = seam_vocabulary();
+        let labels = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        for (text, words) in [
+            // A fresh token after the opener: accepted either way.
+            ("<|u|> the input <|a|>\n", labels(&["A", "C", "yes", "no"])),
+            // A tail that ends on a word swallows the label: refused.
+            ("<|u|> the input <|a|> Answer", labels(&["A"])),
+            // No added token at all: the whole tail is the stretch.
+            ("the input ", labels(&["A", "C"])),
+            // The label completes an added token spelled across the seam
+            // (`<|a|>` + newline + `B`): the literal proof refuses it, and
+            // the seam must not be used for it.
+            ("<|u|> the input <|a|>\n", labels(&["A", "B"])),
+            // A two-letter label that is one token, then one that is not.
+            ("<|u|> the input <|a|>\n", labels(&["AB", "C"])),
+            ("<|u|> the input <|a|>\n", labels(&["A", "BC"])),
+            // Two labels that are one token.
+            ("<|u|> the input <|a|>\n", labels(&["A", "A"])),
+        ] {
+            let (tokens, _seam) = vocabulary.encode_with_seam(text).expect("encodes");
+            let want = literal_proof(&vocabulary, text, &tokens, &words)
+                .ok()
+                .map(|ids| ids.iter().map(|id| id.get()).collect::<Vec<_>>());
+            assert_eq!(
+                seam_proof(&vocabulary, text, &words),
+                want,
+                "{text:?} {words:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_seam_is_just_past_the_last_added_token_and_held_only_where_nothing_spans_it() {
+        let vocabulary = seam_vocabulary();
+        let text = "<|u|> the input <|a|>\n";
+        let (tokens, seam) = vocabulary.encode_with_seam(text).expect("encodes");
+        let seam = seam.expect("the text holds an added token");
+        assert_eq!(&text[seam.text..], "\n");
+        assert_eq!(tokens[seam.tokens - 1].get(), 11, "the seam follows <|a|>");
+        assert!(seam.holds_after(text, "A"));
+        assert!(
+            !seam.holds_after(text, "B"),
+            "`<|a|>\\nB` would match across the seam"
+        );
+        assert!(
+            !seam.holds_after(text, "\u{e9}"),
+            "a non-ASCII label is not cleared"
+        );
+        let (_tokens, none) = vocabulary.encode_with_seam("the input").expect("encodes");
+        assert!(none.is_none(), "no added token, no seam");
+    }
+
+    /// The label proof's cost on the served vocabulary: one 151-option
+    /// question over about four thousand words of input, proved the literal
+    /// way (a whole-prompt encode per label) and the seam way. Both must
+    /// accept the same labels with the same ids. Needs the served export's
+    /// directory in `SHISO_TEST_MODEL_QWEN4EXP_EXL3` for its `tokenizer.json`.
+    #[test]
+    #[ignore = "needs the served vocabulary named by SHISO_TEST_MODEL_QWEN4EXP_EXL3"]
+    #[expect(clippy::print_stdout, reason = "the timings are the test's output")]
+    fn a_wide_question_over_a_long_input_proves_its_labels_in_label_time() {
+        let Some(dir) = std::env::var_os("SHISO_TEST_MODEL_QWEN4EXP_EXL3") else {
+            println!("SKIP: no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
+            return;
+        };
+        let vocabulary = Vocabulary::from_file(&std::path::Path::new(&dir).join("tokenizer.json"))
+            .expect("the vocabulary loads");
+        let words = [
+            "the",
+            "review",
+            "says",
+            "battery",
+            "lasts",
+            "two",
+            "days",
+            "and",
+            "screen",
+            "is",
+            "bright",
+            "but",
+            "camera",
+            "struggles",
+            "at",
+            "night",
+            "while",
+            "price",
+            "seems",
+            "fair",
+        ];
+        let input = (0..4_000)
+            .map(|at| words[(at * 7 + at / 3) % words.len()])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let kind = Kind::Choice {
+            question: "Which aspect is discussed?".to_owned(),
+            options: options(151),
+        };
+        let started = std::time::Instant::now();
+        let labels = vocabulary_labels(&vocabulary, &kind, "q").expect("151 labels");
+        let labelled = started.elapsed();
+        let text = format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            prompt_body(&input, &kind, &labels)
+        );
+
+        let before = std::time::Instant::now();
+        let tokens = vocabulary.encode(&text, false).expect("encodes");
+        let want = literal_proof(&vocabulary, &text, &tokens, &labels).expect("the labels hold");
+        let before = before.elapsed();
+
+        let after = std::time::Instant::now();
+        let (seamed, seam) = vocabulary.encode_with_seam(&text).expect("encodes");
+        let got = prove_labels(
+            &vocabulary,
+            "q",
+            labels.clone(),
+            &LabelSeam {
+                text: &text,
+                tokens: &seamed,
+                seam: seam.as_ref(),
+            },
+        )
+        .expect("the labels hold");
+        let after = after.elapsed();
+
+        assert_eq!(seamed, tokens);
+        assert_eq!(got, want);
+        assert!(
+            seam.is_some(),
+            "the served template ends past an added token"
+        );
+        println!(
+            "prompt {} tokens, {} labels: label choice {labelled:?}; proof before {before:?}, \
+             after {after:?}",
+            tokens.len(),
+            labels.len()
+        );
     }
 }

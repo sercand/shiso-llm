@@ -71,6 +71,7 @@ mod lifecycle;
 mod media_key_tests;
 pub mod queue;
 mod report;
+mod score_pass;
 mod stats;
 pub mod stop;
 
@@ -275,6 +276,8 @@ struct Coordinator {
     held_flex: VecDeque<HeldFlex>,
     /// The periodic info line.
     report: report::StatsLog,
+    /// What the batched prompt pass has shown so far; see [`score_pass`].
+    score_pass: score_pass::ScorePass,
 }
 
 /// Starts the engine thread over a loaded model.
@@ -433,6 +436,7 @@ fn start(
         closing: false,
         held_flex: VecDeque::new(),
         report,
+        score_pass: score_pass::ScorePass::default(),
     };
     let join = std::thread::Builder::new()
         .name("shiso-engine".to_owned())
@@ -882,6 +886,7 @@ impl Coordinator {
                 score_reply: Some(reply),
             },
         );
+        slot.set_checkpoint_floor(self.cfg.store.min_tokens);
         // The generation encode step in its plain form: a score never resumes
         // and is never keyed, so there is no covered prefix to subtract and no
         // resume to run ahead of. A failure fails the slot, whose still-held
@@ -1174,6 +1179,126 @@ impl Coordinator {
         }
     }
 
+    /// The quantum `step` as it runs: a score's first quantum resumes first
+    /// (see [`Coordinator::resume_score`]), and `None` when there is nothing
+    /// to read - no such slot, or a resume that failed it or already answered
+    /// it with a full hit.
+    ///
+    /// The plan was made before the resume moved the cursor, so a quantum
+    /// planned as a middle piece can now reach the prompt's end - and the end
+    /// is the one piece that must read its row.
+    fn ready_step(&mut self, step: PrefillStep) -> Option<Quantum> {
+        let epoch = self.score_pass.shared_reads;
+        if let Some(shared) = self
+            .slots
+            .get_mut(step.slot)
+            .and_then(|slot| slot.settle_score_resume(epoch))
+        {
+            self.resume_score(step.slot, shared);
+        }
+        let slot = self.slots.slots().get(step.slot)?;
+        if slot.is_done() || slot.prompt_done() {
+            return None;
+        }
+        let (start, end) = slot.prompt_window(step.tokens);
+        if start >= end {
+            return None;
+        }
+        Some(Quantum {
+            step: PrefillStep {
+                last: step.last || end == slot.prompt.len(),
+                ..step
+            },
+            session: slot.session,
+            prompt: Arc::clone(&slot.prompt),
+            window: start..end,
+        })
+    }
+
+    /// Stands a score on a stored prefix at its first prefill quantum, and
+    /// names the point its sibling questions diverge so the stack checkpoints
+    /// it there.
+    ///
+    /// The score's own boundaries are left out: its message ends lie inside
+    /// its own question, past where any sibling shares it, and a checkpoint
+    /// there would be a recurrent read-back nothing resumes. A full hit
+    /// answers from the stored row, as [`Coordinator::try_resume`] does.
+    fn resume_score(&mut self, at: usize, shared: u32) {
+        let Self {
+            model,
+            backend,
+            row,
+            scores,
+            stats,
+            slots,
+            ..
+        } = self;
+        let Some(slot) = slots.get_mut(at) else {
+            return;
+        };
+        // A decision pass never stands on a stored prefix: its head reads
+        // the final row of every prompt token, which a resume never produces.
+        if !slot.checkpointable() || slot.score_decision().is_some() {
+            return;
+        }
+        let Some(ckpt) = model.ckpt_mut() else {
+            return;
+        };
+        if let Err(error) = ckpt.kv_set_scoring(slot.session) {
+            tracing::debug!(error = %error.chain(), "a score was not marked as one");
+        }
+        let hints: &[u32] = if shared > 0 { &[shared] } else { &[] };
+        if let Err(error) = ckpt.kv_set_hints(slot.session, hints) {
+            tracing::debug!(error = %error.chain(), "the shared prefix of a score was not recorded");
+        }
+        let whole_prompt = slot.prompt.len();
+        let reused = match ckpt.kv_resume(slot.session, &slot.prompt) {
+            Err(error) => {
+                // A sibling waiting on a checkpoint asks again each time one
+                // may have been written; only its first failure is news.
+                if slot.score_resume_retried() {
+                    tracing::debug!(error = %error.chain(), "a waiting score's checkpoint resume failed again");
+                } else {
+                    tracing::warn!(error = %error.chain(), "a score's checkpoint resume failed; the prompt will be prefilled");
+                }
+                return;
+            }
+            Ok(None) => return,
+            Ok(Some(info)) => {
+                let reused = info.tokens_reused;
+                if usize::try_from(reused).unwrap_or(usize::MAX) >= whole_prompt {
+                    let read = info
+                        .frontier_logits
+                        .as_ref()
+                        .ok_or(CoreError::Unsupported {
+                            what: "a resume of a whole prompt without its logits row",
+                            backend: "scheduler",
+                        })
+                        .and_then(|logits| logits.row(0))
+                        .and_then(|view| backend.copy_d2h(view, row));
+                    if let Err(error) = read {
+                        tracing::warn!(error = %error.chain(), "a resumed frontier row did not read back");
+                        slot.fail(error.to_string());
+                        return;
+                    }
+                }
+                tracing::debug!(
+                    slot = slot.id,
+                    tokens_reused = reused,
+                    shared,
+                    source = ?info.source,
+                    "a score resumed a stored prefix"
+                );
+                reused
+            }
+        };
+        slot.resumed(reused);
+        stats.resumed(u64::from(reused));
+        if slot.prompt_done() {
+            finish_scoring(row, scores, slot);
+        }
+    }
+
     /// Copies queued checkpoint pages off the device while no sequence is
     /// resident. Returns `true` when a request arrived meanwhile and was
     /// admitted, so the loop runs it instead of blocking.
@@ -1220,7 +1345,7 @@ impl Coordinator {
     fn tick(&mut self) {
         let now = self.cfg.clock.now();
         cancel::enforce_deadlines(&self.stats, self.slots.slots_mut(), now);
-        let plan = batching::plan(&self.slots.facts(), &self.cfg);
+        let plan = batching::plan(&self.planned_facts(), &self.cfg);
         for (at, slot) in self.slots.slots_mut().iter_mut().enumerate() {
             if slot.is_flex() {
                 slot.mark_paused(plan.paused.contains(&at), now);
@@ -1242,8 +1367,11 @@ impl Coordinator {
         for group in plan.decode.chunks(DECODE_GROUP_ROWS) {
             self.decode_step(group);
         }
-        if let Some(step) = plan.prefill {
-            self.prefill_step(step);
+        if !plan.prefill_batch.is_empty() {
+            let quantum = batching::quantum(!plan.decode.is_empty(), &self.cfg);
+            self.prefill_batch_step(&plan.prefill_batch, quantum);
+        } else if let Some(step) = plan.prefill {
+            self.read_alone(step);
         }
         self.store_continued();
         self.retire();
@@ -1647,24 +1775,13 @@ impl Coordinator {
     }
 
     /// One bounded quantum of one sequence's prompt.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the quantum and its three termini - generate, score, decide - read as one step"
-    )]
     fn prefill_step(&mut self, step: PrefillStep) {
-        let Some(slot) = self.slots.slots().get(step.slot) else {
+        let Some(quantum) = self.ready_step(step) else {
             return;
         };
-        let session = slot.session;
-        let prompt = Arc::clone(&slot.prompt);
-        let (start, end) = slot.prompt_window(step.tokens);
-        let Some(chunk) = prompt.get(start..end) else {
-            return;
-        };
+        let (step, session, prompt) = (quantum.step, quantum.session, quantum.prompt);
+        let chunk = &prompt[quantum.window];
         let covered = chunk.len();
-        if covered == 0 {
-            return;
-        }
 
         let carries_media = self
             .slots
@@ -2238,6 +2355,17 @@ fn finish_scoring(row: &[u8], scores: &mut [f32], slot: &mut SeqSlot) {
             option_logits: Vec::new(),
         }));
     }
+}
+
+/// One prefill quantum as [`Coordinator::ready_step`] hands it over: the
+/// step as it will run, and the session, prompt and non-empty window of it
+/// that it reads. `prompt_window` clamps the window to the prompt, so
+/// indexing with it cannot go out of bounds.
+struct Quantum {
+    step: PrefillStep,
+    session: SessionId,
+    prompt: Arc<[TokenId]>,
+    window: std::ops::Range<usize>,
 }
 
 /// Reads one logits row out of its bytes into `scores`.

@@ -40,7 +40,7 @@
 
 use shiso_core::error::CoreResult;
 use shiso_core::ids::{Seed, SessionId, TokenId};
-use shiso_core::model::{DecodeStep, Logits, SamplingParams};
+use shiso_core::model::{DecodeStep, Logits, PromptRun, SamplingParams};
 use shiso_core::{Backend, DeviceView, Model};
 use shiso_engine::{Checkpointed, Reason, ResumeInfo, ResumeSource, SaveOutcome};
 use shiso_ir::Usage;
@@ -98,6 +98,18 @@ const _: PrefillLast = <dyn Model>::prefill_last;
 type DecodeBatch =
     for<'m> fn(&'m mut (dyn Model + 'static), &[DecodeStep]) -> CoreResult<Logits<'m>>;
 const _: DecodeBatch = <dyn Model>::decode_batch;
+
+/// A batched prompt pass names each run's session beside its tokens - not two
+/// parallel slices - and borrows its rows from the model, as `prefill_last`
+/// does.
+type PrefillLastMany =
+    for<'m> fn(&'m mut (dyn Model + 'static), &[PromptRun<'_>]) -> CoreResult<Logits<'m>>;
+const _: PrefillLastMany = <dyn Model>::prefill_last_many;
+
+fn prompt_run_fields(run: PromptRun<'_>) -> (SessionId, &[TokenId]) {
+    (run.session, run.tokens)
+}
+const _: for<'a> fn(PromptRun<'a>) -> (SessionId, &'a [TokenId]) = prompt_run_fields;
 
 /// A step is read apart rather than built: `SessionId` has no public
 /// constructor by design, so the field types are pinned by a projection the

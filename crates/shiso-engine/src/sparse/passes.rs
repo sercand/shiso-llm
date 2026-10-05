@@ -62,11 +62,13 @@ use crate::sparse::media;
 use crate::sparse::moe::{self, RowOrigin};
 use crate::sparse::plan::{Plan, Step};
 use crate::sparse::ple::{self, NgramContext, PleGather};
-use crate::sparse::qsa::{self, AttnContext, AttnSlot};
+use crate::sparse::qsa::{self, AttnContext, AttnSlot, RunRows};
 use crate::sparse::recurrent::{self, Recurrence};
 use crate::sparse::scratch::Buf;
-use crate::sparse::stack::{IslandSpan, MAX_DECODE_BATCH, Pass, SparseSession, SparseStack};
-use crate::sparse::weights::BlockDesc;
+use crate::sparse::stack::{
+    IslandSpan, MAX_DECODE_BATCH, MAX_PROMPT_RUNS, Pass, SparseSession, SparseStack,
+};
+use crate::sparse::weights::{BlockDesc, WeightDesc};
 
 impl SparseStack {
     /// Plans one pass over `tokens` for one session.
@@ -154,7 +156,7 @@ impl SparseStack {
             &[live],
             n_tok,
             logit_rows,
-            RowOrigin::Sequential,
+            &RowOrigin::Sequential,
             media_rows,
             role,
         )
@@ -197,7 +199,7 @@ impl SparseStack {
         // A decode batch reads one token per session and embeds no picture: a
         // request's media is spliced during its prefill and is in the cache by
         // the time any of its rows decode.
-        self.plan_rows(&live, rows, rows, origin, None, PassRole::Step)
+        self.plan_rows(&live, rows, rows, &origin, None, PassRole::Step)
     }
 
     /// Plans one segmented pass: each session's run of consecutive positions,
@@ -222,6 +224,13 @@ impl SparseStack {
             });
         }
         let runs = moe::Segments::new(lens)?;
+        if runs.count() > MAX_DECODE_BATCH {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented verify runs",
+                expected: u64::from(MAX_DECODE_BATCH),
+                got: u64::from(runs.count()),
+            });
+        }
         let rows = runs.rows();
         if rows > crate::sparse::stack::MAX_LOGIT_ROWS {
             return Err(CoreError::ShapeMismatch {
@@ -239,9 +248,49 @@ impl SparseStack {
             &live,
             rows,
             rows,
-            RowOrigin::Segmented(runs),
+            &RowOrigin::Segmented(runs),
             None,
             PassRole::Step,
+        )
+    }
+
+    /// Plans one prompt-role segmented pass: each session's prompt tail at its
+    /// own frontier, in session order, every row computed as that session's own
+    /// prompt pass computes it, and only each run's last row projected.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::plan_segments`], bounded by one prefill chunk's rows
+    /// and [`MAX_PROMPT_RUNS`](crate::sparse::stack::MAX_PROMPT_RUNS) runs
+    /// instead of by the logits block.
+    pub fn plan_prompt_segments(&self, sessions: &[SessionId], lens: &[u32]) -> CoreResult<Pass> {
+        if sessions.len() != lens.len() {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented pass runs",
+                expected: sessions.len() as u64,
+                got: lens.len() as u64,
+            });
+        }
+        let runs = moe::Segments::new(lens)?;
+        if runs.rows() > self.opts.prefill_rows {
+            return Err(CoreError::ShapeMismatch {
+                field: "segmented prompt rows",
+                expected: u64::from(self.opts.prefill_rows),
+                got: u64::from(runs.rows()),
+            });
+        }
+        crate::sparse::stack::distinct(sessions)?;
+        let live = sessions
+            .iter()
+            .map(|id| self.session(*id))
+            .collect::<CoreResult<Vec<_>>>()?;
+        self.plan_rows(
+            &live,
+            runs.rows(),
+            runs.count(),
+            &RowOrigin::Segmented(runs),
+            None,
+            PassRole::Prompt { snapshot: None },
         )
     }
 
@@ -256,7 +305,7 @@ impl SparseStack {
         rows: &[&SparseSession],
         n_tok: u32,
         logit_rows: u32,
-        origin: RowOrigin,
+        origin: &RowOrigin,
         media_rows: Option<u32>,
         role: PassRole,
     ) -> CoreResult<Pass> {
@@ -268,10 +317,16 @@ impl SparseStack {
             expected: 1,
             got: 0,
         })?;
-        let batched = origin != RowOrigin::Sequential;
+        let batched = *origin != RowOrigin::Sequential;
         // Only one sequence's prompt rows are promised to every pass width: a
-        // batch's rows are steps by construction.
-        let role = if batched { PassRole::Step } else { role };
+        // batch's rows are steps by construction. Each run of a segmented pass
+        // is one sequence's, so it keeps the role its caller planned - a
+        // verify's [`SparseStack::plan_segments`] asks for a step itself.
+        let role = if *origin == RowOrigin::Unrelated {
+            PassRole::Step
+        } else {
+            role
+        };
         // One sequence's frontier decides whether its selection is live. A batch
         // has one frontier per row, and each row answers for itself: its
         // attention is planned as a single-row step of its own sequence, over
@@ -296,7 +351,11 @@ impl SparseStack {
                         .indexer
                         .sparse_at(live.written().saturating_add(run_rows(row)))
                 })
-                .fold(0u8, |bits, (row, _)| bits | (1u8 << (row % 8)))
+                .fold(0_u64, |bits, (row, _)| {
+                    bits | 1_u64
+                        .checked_shl(u32::try_from(row).unwrap_or(u32::MAX))
+                        .unwrap_or(0)
+                })
         } else {
             0
         };
@@ -318,18 +377,20 @@ impl SparseStack {
         } else {
             u32::try_from(within(first.written(), n_tok)).unwrap_or(n_tok)
         };
-        let mut run_dense_rows = [0u8; MAX_DECODE_BATCH as usize];
+        let mut run_dense_rows = RunRows::default();
         if let RowOrigin::Segmented(runs) = origin {
-            for ((run, live), slot) in rows.iter().enumerate().zip(&mut run_dense_rows) {
-                let run = u32::try_from(run).unwrap_or(u32::MAX);
-                *slot = u8::try_from(within(live.written(), runs.len(run))).unwrap_or(u8::MAX);
+            for (run, live) in (0..runs.count()).zip(rows.iter()) {
+                run_dense_rows.set(
+                    run,
+                    u32::try_from(within(live.written(), runs.len(run))).unwrap_or(u32::MAX),
+                );
             }
         }
         let ctx = AttnContext {
             selected,
             tensor_core: self.opts.tensor_core,
             tiled: self.opts.tiled_attention,
-            origin,
+            origin: *origin,
             batch_selected,
             dense_rows,
             run_dense_rows,
@@ -398,7 +459,7 @@ impl SparseStack {
                     il,
                     half,
                     chain,
-                    ctx,
+                    &ctx,
                     origin,
                     n_tok,
                     device,
@@ -418,15 +479,10 @@ impl SparseStack {
             }
         }
 
-        // A segmented pass is a verify, and a verify's output is every row's
-        // greedy pick rather than the rows themselves.
-        self.plan_logits(
-            &mut plan,
-            n_tok,
-            logit_rows,
-            origin == RowOrigin::Unrelated,
-            device,
-        )?;
+        // A segmented verify's output is every row's greedy pick rather than
+        // the rows themselves; a prompt-role segmented pass's is each run's
+        // last row.
+        self.plan_logits(&mut plan, n_tok, logit_rows, origin, device)?;
 
         let gather = self.plan_gathers(rows, n_tok, origin)?;
         // The per-stream scratch every cooperative launch in the pass reads is
@@ -452,7 +508,7 @@ impl SparseStack {
             capturable,
             selected,
             rows: n_tok,
-            origin,
+            origin: *origin,
             gather,
         })
     }
@@ -470,9 +526,15 @@ impl SparseStack {
         plan: &mut Plan,
         n_tok: u32,
         logit_rows: u32,
-        batched: bool,
+        origin: &RowOrigin,
         device: Device,
     ) -> CoreResult<()> {
+        if let RowOrigin::Segmented(runs) = *origin
+            && device.row_invariant()
+        {
+            return self.plan_run_logits(plan, n_tok, &runs, device);
+        }
+        let batched = *origin == RowOrigin::Unrelated;
         if logit_rows > 0 {
             plan.append(hyper::collapse(
                 &self.shape,
@@ -553,6 +615,61 @@ impl SparseStack {
         Ok(())
     }
 
+    /// A prompt-role segmented pass's logits: the collapsing mix over every row
+    /// (row-invariant under Prompt role), then the vocabulary projection of
+    /// each run's last row into logits row `run`, each row the row a solo
+    /// prompt pass's one-row projection leaves. No greedy pick: every row goes
+    /// back to a caller that reads it.
+    ///
+    /// One projection over the gathered rows when [`gathered_projection`]
+    /// shows it is the one-row projection's own launch, a one-row projection
+    /// per run otherwise.
+    fn plan_run_logits(
+        &self,
+        plan: &mut Plan,
+        n_tok: u32,
+        runs: &moe::Segments,
+        device: Device,
+    ) -> CoreResult<()> {
+        plan.append(hyper::collapse(
+            &self.shape,
+            &self.desc.output_mix,
+            MixRoles::output(),
+            n_tok,
+            device,
+            self.stream_elem(n_tok, device),
+        )?);
+        let step = Device {
+            role: PassRole::Step,
+            ..device
+        };
+        if gathered_projection(self.desc.output, runs.count(), step)? {
+            plan_gathered_logits(plan, self.desc.output, self.shape.hidden, runs, step)?;
+        } else {
+            plan_per_run_logits(
+                plan,
+                self.desc.output,
+                (self.shape.hidden, self.shape.vocab),
+                runs,
+                step,
+            )?;
+        }
+        plan.launch(
+            crate::sparse::kernels::Entry::plain(
+                crate::sparse::kernels::MOD_SAMPLE,
+                "sample_suppress_rows_kernel",
+            ),
+            crate::sparse::kernels::suppress_rows(runs.count()),
+            // `logits, list, n_vocab`
+            crate::sparse::bind::Args::of(&[
+                Operand::Scratch(Buf::Logits),
+                Operand::Scratch(Buf::Suppress),
+                Operand::U32(self.shape.vocab),
+            ]),
+        );
+        Ok(())
+    }
+
     /// The n-gram gathers this pass will need, one per row.
     ///
     /// A batch's rows are different sequences, so each hashes its own trailing
@@ -564,7 +681,7 @@ impl SparseStack {
         &self,
         rows: &[&SparseSession],
         n_tok: u32,
-        origin: RowOrigin,
+        origin: &RowOrigin,
     ) -> CoreResult<Vec<PleGather>> {
         let Some(ple) = self.shape.ple else {
             return Ok(Vec::new());
@@ -582,7 +699,7 @@ impl SparseStack {
                 })
                 .collect();
         }
-        if origin == RowOrigin::Sequential {
+        if *origin == RowOrigin::Sequential {
             let live = rows.first().ok_or(CoreError::ShapeMismatch {
                 field: "pass rows",
                 expected: 1,
@@ -645,8 +762,8 @@ impl SparseStack {
         il: LayerIdx,
         half: Island,
         chain: LayerChain,
-        ctx: AttnContext,
-        origin: RowOrigin,
+        ctx: &AttnContext,
+        origin: &RowOrigin,
         n_tok: u32,
         device: Device,
     ) -> CoreResult<Plan> {
@@ -686,7 +803,7 @@ impl SparseStack {
                         slot,
                         NgramContext {
                             spec: self.opts.spec,
-                            origin,
+                            origin: *origin,
                         },
                         n_tok,
                         device,
@@ -710,7 +827,7 @@ impl SparseStack {
                         Recurrence {
                             chunk: self.opts.chunk,
                             spec: self.opts.spec,
-                            origin,
+                            origin: *origin,
                         },
                         n_tok,
                         device,
@@ -727,7 +844,7 @@ impl SparseStack {
                                 .saturating_mul(shiso_core::page::PAGE_TOKENS),
                             ctx: self.opts.engine.ctx,
                         };
-                        plan.append(qsa::block(&self.shape, &desc, attn, ctx, n_tok, device)?);
+                        plan.append(qsa::block(&self.shape, &desc, attn, *ctx, n_tok, device)?);
                     }
                 }
             }
@@ -832,4 +949,275 @@ pub(crate) fn with_reservation(body: Plan, islands: Vec<IslandSpan>) -> (Plan, V
         })
         .collect();
     (plan, shifted)
+}
+
+// A prompt-role segmented pass projects at most this many rows at once, and
+// below the expansion bound a trellis projection's tier never reads the row
+// count: the gathered projection stays in the cooperative kernel the one-row
+// projection takes, which `gathered_projection` checks per weight.
+const _: () = assert!(MAX_PROMPT_RUNS <= crate::sparse::kernels::EXL3_RECONSTRUCT_ROWS);
+
+/// Whether one vocabulary projection over `runs` gathered rows leaves every
+/// row the bits a one-row projection of it leaves.
+///
+/// Only the cooperative trellis launch is proven so (byte-equal on the device
+/// at 2 to 64 runs): it sums each row alone, and its plan does not read the
+/// row count. Every other tier - the half-precision ladder, which moves to the
+/// BLAS tier past its row kernel's width, the brain-float row passes, the
+/// decode-shaped trellis launch, whose tiling does read it - keeps one one-row
+/// projection per run.
+///
+/// # Errors
+///
+/// What [`matmul::plan`] refuses.
+pub(crate) fn gathered_projection(output: WeightDesc, runs: u32, step: Device) -> CoreResult<bool> {
+    let one = matmul::plan(output.dtype, output.in_dim, output.out_dim, 1, step)?;
+    if runs <= 1 || !matches!(one, matmul::Projection::Trellis { .. }) {
+        return Ok(false);
+    }
+    let many = matmul::plan(output.dtype, output.in_dim, output.out_dim, runs, step)?;
+    Ok(many == one)
+}
+
+/// Each run's last row of the collapsed block copied to row `run` of
+/// [`Buf::Mixed`], in run order, then one projection over the gathered rows.
+///
+/// Run `r`'s last row is at or past row `r`, so no copy reads a row an earlier
+/// one wrote, and a run whose last row already is row `r` is not copied.
+fn plan_gathered_logits(
+    plan: &mut Plan,
+    output: WeightDesc,
+    hidden: u32,
+    runs: &moe::Segments,
+    step: Device,
+) -> CoreResult<()> {
+    let row_bytes = u64::from(hidden).saturating_mul(F32_BYTES);
+    for run in 0..runs.count() {
+        let last = runs.last_row(run);
+        if last == run {
+            continue;
+        }
+        let to = u64::from(run).saturating_mul(row_bytes);
+        let dst = if to == 0 {
+            Operand::Scratch(Buf::Mixed)
+        } else {
+            Operand::ScratchFrom(Buf::Mixed, to)
+        };
+        plan.launch(
+            crate::sparse::kernels::Entry::plain(
+                crate::sparse::kernels::MOD_MISC,
+                "q4e_copy_row_kernel",
+            ),
+            crate::sparse::kernels::elementwise(u64::from(hidden)),
+            // `dst, src, n`
+            crate::sparse::bind::Args::of(&[
+                dst,
+                Operand::ScratchFrom(Buf::Mixed, u64::from(last).saturating_mul(row_bytes)),
+                Operand::U32(hidden),
+            ]),
+        );
+    }
+    matmul::project(
+        plan,
+        output,
+        Bound::new(
+            WeightRef::model(Role::Output),
+            Operand::ScratchFrom(Buf::Mixed, 0),
+            Operand::Scratch(Buf::Logits),
+        ),
+        runs.count(),
+        step,
+    )
+}
+
+/// One one-row projection per run, from that run's last row of the collapsed
+/// block into logits row `run`: the projection a solo prompt pass ends with,
+/// at the tier one row takes.
+fn plan_per_run_logits(
+    plan: &mut Plan,
+    output: WeightDesc,
+    (hidden, vocab): (u32, u32),
+    runs: &moe::Segments,
+    step: Device,
+) -> CoreResult<()> {
+    for run in 0..runs.count() {
+        let from = u64::from(runs.last_row(run))
+            .saturating_mul(u64::from(hidden))
+            .saturating_mul(F32_BYTES);
+        let to = u64::from(run)
+            .saturating_mul(u64::from(vocab))
+            .saturating_mul(F32_BYTES);
+        let out = if to == 0 {
+            Operand::Scratch(Buf::Logits)
+        } else {
+            Operand::ScratchFrom(Buf::Logits, to)
+        };
+        matmul::project(
+            plan,
+            output,
+            Bound::new(
+                WeightRef::model(Role::Output),
+                Operand::ScratchFrom(Buf::Mixed, from),
+                out,
+            ),
+            1,
+            step,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use shiso_core::DType;
+
+    use super::*;
+
+    /// The served head's shape class: wide in and out, so the cooperative
+    /// trellis launch is the tier at one row and at every run count.
+    const IN: u32 = 2_048;
+    const OUT: u32 = 151_552;
+
+    fn step() -> Device {
+        Device {
+            blas: true,
+            max_co_resident: 48,
+            role: PassRole::Step,
+            ..Device::default()
+        }
+    }
+
+    /// Steps that write the logits block, with the block-input operand they
+    /// read and the row count a trellis launch is handed.
+    fn logit_writes(plan: &Plan) -> Vec<(Operand, Operand, Option<u32>)> {
+        let is_logits = |op: &Operand| {
+            matches!(
+                op,
+                Operand::Scratch(Buf::Logits) | Operand::ScratchFrom(Buf::Logits, _)
+            )
+        };
+        plan.steps()
+            .iter()
+            .filter_map(|step| {
+                let ops = match step {
+                    Step::Blas { a, b, c, .. } => vec![*a, *b, *c],
+                    _ => step.operands().ok()?.to_vec(),
+                };
+                let dst = ops.iter().copied().find(is_logits)?;
+                let src = ops.iter().copied().find(|op| {
+                    matches!(
+                        op,
+                        Operand::Scratch(Buf::Mixed) | Operand::ScratchFrom(Buf::Mixed, _)
+                    )
+                })?;
+                let rows = match step {
+                    Step::Trellis { .. } => match ops.get(3) {
+                        Some(Operand::U32(rows)) => Some(*rows),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                Some((src, dst, rows))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_the_cooperative_trellis_head_is_projected_once_over_the_gathered_rows() {
+        for runs in [2, 7, 16, 32, 33, 64] {
+            for dtype in [DType::Exl3K4, DType::Exl3K6] {
+                let head = WeightDesc::new(dtype, IN, OUT);
+                assert!(
+                    gathered_projection(head, runs, step()).expect("plans"),
+                    "{dtype:?} at {runs}"
+                );
+            }
+            for dtype in [DType::F16, DType::BF16] {
+                let head = WeightDesc::new(dtype, IN, OUT);
+                assert!(
+                    !gathered_projection(head, runs, step()).expect("plans"),
+                    "{dtype:?} at {runs}"
+                );
+            }
+            // A narrow trellis weight takes the decode-shaped launch, whose
+            // tiling reads the row count.
+            let narrow = WeightDesc::new(DType::Exl3K4, 256, 128);
+            assert!(
+                !gathered_projection(narrow, runs, step()).expect("plans"),
+                "narrow at {runs}"
+            );
+        }
+        let head = WeightDesc::new(DType::Exl3K6, IN, OUT);
+        assert!(
+            !gathered_projection(head, 1, step()).expect("plans"),
+            "one run is its own row"
+        );
+    }
+
+    #[test]
+    fn a_gathered_projection_copies_only_the_rows_not_already_in_place_and_projects_them_once() {
+        let head = WeightDesc::new(DType::Exl3K6, IN, OUT);
+        let hidden = 64_u32;
+        let row = |at: u32| u64::from(at) * u64::from(hidden) * 4;
+        // Runs of one row are already at their own row; the third ends at 6.
+        let runs = moe::Segments::new(&[1, 1, 5]).expect("three runs");
+        let mut plan = Plan::new();
+        plan_gathered_logits(&mut plan, head, hidden, &runs, step()).expect("plans");
+        let copies = plan
+            .steps()
+            .iter()
+            .filter(|step| step.name() == "q4e_copy_row_kernel")
+            .map(|step| step.operands().expect("operands").to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            copies,
+            vec![vec![
+                Operand::ScratchFrom(Buf::Mixed, row(2)),
+                Operand::ScratchFrom(Buf::Mixed, row(6)),
+                Operand::U32(hidden),
+            ]]
+        );
+        assert_eq!(
+            logit_writes(&plan),
+            vec![(
+                Operand::ScratchFrom(Buf::Mixed, 0),
+                Operand::Scratch(Buf::Logits),
+                Some(3)
+            )],
+            "one trellis launch over the three gathered rows"
+        );
+    }
+
+    #[test]
+    fn a_half_precision_head_keeps_one_one_row_projection_per_run() {
+        let head = WeightDesc::new(DType::F16, IN, OUT);
+        let (hidden, vocab) = (64_u32, OUT);
+        let runs = moe::Segments::new(&[3, 1, 4]).expect("three runs");
+        let mut plan = Plan::new();
+        plan_per_run_logits(&mut plan, head, (hidden, vocab), &runs, step()).expect("plans");
+        assert_eq!(plan.count("q4e_copy_row_kernel"), 0);
+        let writes = logit_writes(&plan)
+            .into_iter()
+            .map(|(src, dst, _)| (src, dst))
+            .collect::<Vec<_>>();
+        let row = |at: u32| u64::from(at) * u64::from(hidden) * 4;
+        let logit = |at: u32| u64::from(at) * u64::from(vocab) * 4;
+        assert_eq!(
+            writes,
+            vec![
+                (
+                    Operand::ScratchFrom(Buf::Mixed, row(2)),
+                    Operand::Scratch(Buf::Logits)
+                ),
+                (
+                    Operand::ScratchFrom(Buf::Mixed, row(3)),
+                    Operand::ScratchFrom(Buf::Logits, logit(1))
+                ),
+                (
+                    Operand::ScratchFrom(Buf::Mixed, row(7)),
+                    Operand::ScratchFrom(Buf::Logits, logit(2))
+                ),
+            ]
+        );
+    }
 }

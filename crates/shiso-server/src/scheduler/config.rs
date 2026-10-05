@@ -176,12 +176,17 @@ pub struct StorePolicy {
     pub pump_bytes: u64,
     /// How long a shutdown waits for queued checkpoint writes.
     pub drain_timeout: Duration,
+    /// The checkpoint tier's floor, its `min_tokens`: no checkpoint is taken
+    /// closer than this to a prompt's start. A scoring request whose shared
+    /// prefix ends below it has no sibling checkpoint to wait for, so its
+    /// questions are read whole, together.
+    pub min_tokens: u32,
 }
 
 impl StorePolicy {
     /// The defaults: 256-token alignment, 64 tokens of patience for it, the end
-    /// of each turn only, a 64 MiB pump per tick and a minute
-    /// to drain on the way down.
+    /// of each turn only, a 64 MiB pump per tick, a minute to drain on the
+    /// way down, and the tier's default floor.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -190,6 +195,7 @@ impl StorePolicy {
             continued_interval: DEFAULT_CONTINUED_INTERVAL,
             pump_bytes: DEFAULT_PUMP_BYTES,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+            min_tokens: shiso_engine::ckpt::CKPT_MIN_TOKENS_DEFAULT,
         }
     }
 
@@ -204,10 +210,11 @@ impl StorePolicy {
                 CKPT_CONTINUED_ENV,
                 default.continued_interval.into(),
             )),
-            // `--kvstore-pump-mb` and `--kvstore-drain-secs` are flags, set
-            // over these by the binary.
+            // `--kvstore-pump-mb`, `--kvstore-drain-secs` and
+            // `--kvstore-min-tokens` are flags, set over these by the binary.
             pump_bytes: default.pump_bytes,
             drain_timeout: default.drain_timeout,
+            min_tokens: default.min_tokens,
         }
     }
 

@@ -72,7 +72,7 @@ use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::ledger::{self, MemTag};
 use shiso_core::media::{MediaModel, VisionPrefill};
 use shiso_core::model::{
-    DecodeStep, Logits, Model, ModelInfo, Speculated, Speculating, StopTokens,
+    DecodeStep, Logits, Model, ModelInfo, PromptRun, Speculated, Speculating, StopTokens,
 };
 
 use shiso_engine::sparse::headslice;
@@ -1096,6 +1096,16 @@ impl Model for Qwen4ExpModel {
 
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
         self.stack.decode_batch(steps)
+    }
+
+    /// The stack's batched prompt pass, which refuses everything but scoring
+    /// tails it can read byte-for-byte as their solo reads.
+    fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        let pairs = runs
+            .iter()
+            .map(|run| (run.session, run.tokens))
+            .collect::<Vec<_>>();
+        self.stack.prefill_segments(&pairs)
     }
 
     fn spec_mut(&mut self) -> Option<&mut dyn Speculating> {

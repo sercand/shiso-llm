@@ -809,7 +809,7 @@ async fn strict_bounds_still_refuse() {
     // (the unknown-key test above pins it as a 422), and the map wire
     // cannot deliver a duplicate id: its keys are unique by construction.
     let (state, _audit) = state_with_rows(vec![row_with(0.5, &[]); 2], CTX);
-    let wide: Value = (0..27)
+    let wide: Value = (0..256)
         .map(|index| (format!("opt {index}"), Value::Null))
         .collect();
     let tall: Vec<Value> = (0..11)
@@ -819,7 +819,7 @@ async fn strict_bounds_still_refuse() {
         (
             json!({"state": "the input", "questions": {"q1": {"type": "choice",
                  "instructions": "pick", "criteria": wide}}}),
-            "26",
+            "255",
         ),
         (
             json!({"state": "the input", "questions": {"q1": {"type": "score",

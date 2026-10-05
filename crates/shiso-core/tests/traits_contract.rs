@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 use shiso_core::{
     Backend, CoreError, CoreResult, DecodeStep, DeviceBuffer, DeviceView, Extent3, GraphBackend,
     GraphCapture, GraphKey, HostBytes, KernelArg, KernelRef, LaunchArgs, Logits, Model, ModelInfo,
-    RawBuffer, SessionId, StopTokens, TokenId, alloc, import_host,
+    PromptRun, RawBuffer, SessionId, StopTokens, TokenId, alloc, import_host,
 };
 use shiso_core::{MemLedger, MemTag, alloc_tagged, ledger};
 
@@ -1067,5 +1067,37 @@ fn a_foreign_error_chains_through_the_free_function() {
     assert_eq!(
         shiso_core::chain_of(&error).to_string(),
         "the device refused a 4 byte copy",
+    );
+}
+
+#[test]
+fn a_model_without_a_batched_prompt_pass_refuses_one_and_reads_nothing() {
+    let mut model = FakeModel::new();
+    let session = model.open_session().expect("a session");
+    let tokens = [token(5), token(6)];
+    let error = model
+        .prefill_last_many(&[PromptRun {
+            session,
+            tokens: &tokens,
+        }])
+        .expect_err("the default reads no batch");
+    assert!(
+        matches!(
+            error,
+            CoreError::Unsupported {
+                what: shiso_core::NO_BATCHED_PROMPT_PASS,
+                ..
+            }
+        ),
+        "the default says the model has no such pass at all: {error:?}"
+    );
+    // Nothing was read: the whole capacity is still there.
+    let whole = vec![token(1); usize::try_from(CAPACITY).expect("small")];
+    assert_eq!(
+        model
+            .prefill_last(session, &whole)
+            .expect("still empty")
+            .rows(),
+        1
     );
 }

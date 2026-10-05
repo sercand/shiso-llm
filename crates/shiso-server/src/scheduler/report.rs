@@ -96,6 +96,8 @@ fn log_window(window: &Window, gauges: &Gauges) {
         spec_tokens_per_step = window
             .tokens_per_step()
             .map(|mean| display(format!("{mean:.2}"))),
+        score_passes = (window.score_passes > 0).then_some(window.score_passes),
+        score_pass_runs = (window.score_passes > 0).then_some(window.score_pass_runs),
         "engine stats"
     );
 }

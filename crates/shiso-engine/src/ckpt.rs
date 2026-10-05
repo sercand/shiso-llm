@@ -349,6 +349,23 @@ pub trait Checkpointed: Model {
         Ok(())
     }
 
+    /// Marks `session` as reading its prompt only to score the last row.
+    ///
+    /// Such a prompt's end is answered and dropped, so the stack takes no
+    /// checkpoint there, none at its stride points, and stores nothing on
+    /// disk; the shared boundaries its hints name are still checkpointed in
+    /// memory, which is how sibling questions over one input resume each
+    /// other. A no-op by default: a stack that does not distinguish keeps
+    /// checkpointing as it would for any prompt.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`].
+    fn kv_set_scoring(&mut self, session: SessionId) -> CoreResult<()> {
+        let _ = session;
+        Ok(())
+    }
+
     /// Files `session`'s path under `key`, the content key of the media prompt
     /// `prompt` it is about to resume or read, so its prefix can be stored and
     /// resumed like a text prompt's.

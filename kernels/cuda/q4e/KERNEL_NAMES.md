@@ -42,10 +42,10 @@ back to the kernel it belongs to.
 | `q4e_qsa` | `qsa.cu` | 7 | 0 |
 | `q4e_qsa_sparse` | `qsa_sparse.cu` | 4 | 0 |
 | `q4e_idx` | `idx.cu` | 8 | 0 |
-| `q4e_misc` | `misc.cu` | 2 | 0 |
+| `q4e_misc` | `misc.cu` | 3 | 0 |
 | `q4e_embed` | `embed.cu` | 4 | 0 |
 | `q4e_modelopt` | `modelopt.cu` | 7 | 0 |
-| **total** | 12 units | **66** | **105** |
+| **total** | 12 units | **67** | **105** |
 
 ## Plain entries, by module
 
@@ -152,6 +152,7 @@ n-gram decode, for the `modelopt` export.
 
 - `q4e_add2_kernel`
 - `q4e_argmax_rows_kernel`
+- `q4e_copy_row_kernel`
 
 ### `q4e_embed`
 
@@ -608,6 +609,7 @@ shipped 4. Their tile widths differ (`Q4E_IDX_TC_BT` vs `Q4E_IDX_BT`), so the
 |---|---|---|---|
 | `q4e_add2_kernel` | `ceil(n / 256)` | `256` | `0` |
 | `q4e_argmax_rows_kernel` | `n_rows` | `1024` | `0` |
+| `q4e_copy_row_kernel` | `ceil(n / 256)` | `256` | `0` |
 
 ### `q4e_embed`
 
