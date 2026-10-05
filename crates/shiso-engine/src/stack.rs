@@ -225,6 +225,9 @@ pub struct HybridStack {
     /// slot committed by something other than the code below, so it refuses
     /// rather than guessing a buffer.
     decode_residual: Option<ResidualIndex>,
+    /// The final normalized rows kept for each session a decision head will
+    /// read, `hidden` floats per prompt token, in the order they were read.
+    captures: HashMap<SessionId, Vec<f32>>,
 }
 
 /// A verified block waiting to be told how much of it the caller kept.
@@ -277,6 +280,7 @@ impl std::fmt::Debug for HybridStack {
             .field("graph_slots", &self.graph_slots.len())
             .field("next_graph_slot", &self.next_graph_slot)
             .field("decode_residual", &self.decode_residual)
+            .field("captures", &self.captures.len())
             .finish()
     }
 }
@@ -492,6 +496,7 @@ impl HybridStack {
             graph_slots: HashMap::new(),
             next_graph_slot: 0,
             decode_residual: None,
+            captures: HashMap::new(),
         })
     }
 
@@ -1040,6 +1045,60 @@ impl HybridStack {
         self.commit(session, false, None)
     }
 
+    /// Appends the chunk's final normalized rows to `session`'s capture, when
+    /// a decision head asked for them.
+    fn capture_rows(&mut self, session: SessionId, n_tok: u32) -> CoreResult<()> {
+        let Some(rows) = self.captures.get_mut(&session) else {
+            return Ok(());
+        };
+        let hidden = self.geometry.hidden as usize;
+        let take = hidden * n_tok as usize;
+        let resident = self.resident.as_ref().ok_or(CoreError::Unsupported {
+            what: "a model whose device state teardown already released",
+            backend: "engine",
+        })?;
+        let view = resident
+            .scratch
+            .normed()
+            .slice(0, (take * size_of::<f32>()) as u64)?;
+        let mut bytes = vec![0u8; take * size_of::<f32>()];
+        self.backend.copy_d2h(view, &mut bytes)?;
+        rows.extend(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b)),
+        );
+        Ok(())
+    }
+
+    /// Keeps the final normalized row of every token `session` reads from now
+    /// on, for a decision head to read once the prompt is complete.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`] for a closed or unknown id.
+    pub fn capture_hidden(&mut self, session: SessionId) -> CoreResult<()> {
+        if !self.sessions.contains_key(&session) {
+            return Err(CoreError::UnknownSession(session));
+        }
+        self.captures.insert(session, Vec::new());
+        Ok(())
+    }
+
+    /// The rows [`HybridStack::capture_hidden`] kept for `session`, which stops
+    /// keeping them: `hidden` floats per token read since the capture began.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`] when nothing was being captured for it.
+    pub fn take_hidden(&mut self, session: SessionId) -> CoreResult<Vec<f32>> {
+        self.captures
+            .remove(&session)
+            .ok_or(CoreError::UnknownSession(session))
+    }
+
     /// Writes one logits row from the chunk's last normalized row.
     fn write_logits(&self, token: u32, row: u32) -> CoreResult<()> {
         let resident = self.resident()?;
@@ -1113,6 +1172,9 @@ impl HybridStack {
                 .ok_or(CoreError::UnknownSession(session))?
                 .written();
             let n_tok = self.run_chunk(session, head, run.as_mut())?;
+            // Before anything else touches the scratch: the draft head's warm
+            // pass reuses the normalized rows this pass just left there.
+            self.capture_rows(session, n_tok)?;
             // The draft head's own cache, over the rows this chunk just left in
             // the residual. Without it the head attends to key and value rows
             // nothing wrote - it still answers, because attention reads
@@ -1560,6 +1622,7 @@ impl HybridStack {
             .remove(&session)
             .ok_or(CoreError::UnknownSession(session))?;
         self.order.retain(|id| *id != session);
+        self.captures.remove(&session);
         // Every captured decode step names this session's recurrent state and
         // its page references by address, and both are about to be released.
         // Dropped BEFORE the session is, so that no window exists in which a

@@ -148,6 +148,13 @@ impl Coordinator {
             if slot.is_done() || slot.prompt_done() {
                 continue;
             }
+            // Never planned into a batch - its facts carry no score - and kept
+            // out here too: a run of this pass is answered from its logits
+            // row, so a decision pass in one would never reach its head. As a
+            // lead it is then read alone, through the decision terminus.
+            if slot.score_decision().is_some() {
+                continue;
+            }
             if !slot.score_stands_on_shared() {
                 missed.push(step.slot);
                 continue;

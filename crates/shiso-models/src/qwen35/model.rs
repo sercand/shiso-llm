@@ -47,7 +47,9 @@ use shiso_core::buffer::{DeviceBuffer, import_host};
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{LayerIdx, SessionId, TokenId};
 use shiso_core::media::{MediaModel, VisionPrefill};
-use shiso_core::model::{DecodeStep, Logits, Model, ModelInfo, StopTokens};
+use shiso_core::model::{
+    DecisionModel, DecisionQuestion, DecodeStep, Logits, Model, ModelInfo, StopTokens,
+};
 use shiso_engine::attn::Attn;
 use shiso_engine::draft::DraftHead;
 use shiso_engine::ffn::Ffn;
@@ -89,6 +91,9 @@ pub struct Qwen35Model {
     /// are resident, and the checkpoint tier has to be able to say what width the
     /// rows it stores were produced at long afterwards.
     ffn_gate: DType,
+    /// The joint schema head of a Clef checkpoint: the same backbone with a
+    /// decision head beside it. `None` for every other checkpoint.
+    decision: Option<crate::clef::ClefHead>,
 }
 
 impl Qwen35Model {
@@ -178,6 +183,15 @@ impl Qwen35Model {
             None => embed,
         };
         let weights = import_weights(backend, &file, &binding, config.shape())?;
+        // A Clef checkpoint is this backbone under its own architecture name,
+        // with the schema head the binding never reads beside it.
+        let decision = if shiso_modelfile::source::TensorSource::architecture(&file)
+            == Some(crate::qwen35::binding::CLEF_ARCH)
+        {
+            Some(crate::clef::ClefHead::load(backend, path)?)
+        } else {
+            None
+        };
         // The file is dropped here on purpose: every weight that needed its mapping
         // holds its own handle on it, so the bytes stay mapped for exactly as long
         // as some device buffer names them and no longer. The same sentence covers
@@ -186,7 +200,9 @@ impl Qwen35Model {
         // nothing is pinned twice because the file kept no copy of its own.
         drop(binding);
         drop(file);
-        Self::assemble(backend, config, opts, head, (weights, embed, ffn_gate))
+        let mut model = Self::assemble(backend, config, opts, head, (weights, embed, ffn_gate))?;
+        model.decision = decision;
+        Ok(model)
     }
 
     /// Builds the stack over weights that are already resident, and binds the
@@ -245,6 +261,7 @@ impl Qwen35Model {
             },
             stack,
             ffn_gate,
+            decision: None,
         })
     }
 }
@@ -583,6 +600,10 @@ impl Model for Qwen35Model {
         Some(self)
     }
 
+    fn decision_mut(&mut self) -> Option<&mut dyn DecisionModel> {
+        self.decision.is_some().then_some(self)
+    }
+
     fn spec_mut(&mut self) -> Option<&mut dyn shiso_core::model::Speculating> {
         // The head is what makes a step speculative, and a build without one
         // answers no here rather than one verify pass later.
@@ -597,6 +618,28 @@ impl Model for Qwen35Model {
 
     fn teardown(&mut self) -> CoreResult<()> {
         self.stack.teardown()
+    }
+}
+
+/// The schema decision path, which a Clef checkpoint has because its head
+/// reads this stack's final rows.
+impl DecisionModel for Qwen35Model {
+    fn capture_hidden(&mut self, session: SessionId) -> CoreResult<()> {
+        self.stack.capture_hidden(session)
+    }
+
+    fn decide(
+        &mut self,
+        session: SessionId,
+        prompt: &[TokenId],
+        questions: &[DecisionQuestion],
+    ) -> CoreResult<Vec<Vec<f32>>> {
+        let rows = self.stack.take_hidden(session)?;
+        let head = self.decision.as_ref().ok_or(CoreError::Unsupported {
+            what: "a schema decision on a checkpoint without a decision head",
+            backend: "qwen35",
+        })?;
+        head.score(&rows, prompt, questions)
     }
 }
 

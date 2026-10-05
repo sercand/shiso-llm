@@ -803,7 +803,11 @@ impl Coordinator {
         request: ScoreRequest,
         reply: oneshot::Sender<Result<ScoreOutcome, AppError>>,
     ) {
-        if request.prompt_tokens.is_empty() || request.labels.is_empty() {
+        let decision = request.decision.is_some();
+        if request.prompt_tokens.is_empty()
+            || (decision && request.decision.as_ref().is_some_and(|q| q.is_empty()))
+            || (!decision && request.labels.is_empty())
+        {
             let _ = reply.send(Err(AppError::bad_request(
                 "a scoring request needs a prompt and at least one label",
                 None,
@@ -830,6 +834,25 @@ impl Coordinator {
                 return;
             }
         };
+        // A decision pass needs every final row of its prompt, so the stack is
+        // told to keep them before the first chunk is read.
+        if decision {
+            let marked = match self.model.as_model_mut().decision_mut() {
+                Some(head) => head.capture_hidden(session).map_err(|error| {
+                    AppError::internal("the decision head could not be prepared", error)
+                }),
+                None => Err(AppError::bad_request(
+                    "this model has no decision head",
+                    None,
+                    "invalid_request",
+                )),
+            };
+            if let Err(error) = marked {
+                let _ = self.model.as_model_mut().close_session(session);
+                let _ = reply.send(Err(error));
+                return;
+            }
+        }
         self.stats.admit();
 
         let now = self.cfg.clock.now();
@@ -1213,7 +1236,9 @@ impl Coordinator {
         let Some(slot) = slots.get_mut(at) else {
             return;
         };
-        if !slot.checkpointable() {
+        // A decision pass never stands on a stored prefix: its head reads
+        // the final row of every prompt token, which a resume never produces.
+        if !slot.checkpointable() || slot.score_decision().is_some() {
             return;
         }
         let Some(ckpt) = model.ckpt_mut() else {
@@ -1710,7 +1735,50 @@ impl Coordinator {
         }
     }
 
+    /// Answers a decision pass from the model's head once its prompt is read.
+    ///
+    /// Returns whether the slot was a decision pass, answered or failed here;
+    /// `false` leaves a label score or a generation to the logits row.
+    fn finish_decision(&mut self, index: usize, session: SessionId, prompt: &[TokenId]) -> bool {
+        let Some(questions) = self
+            .slots
+            .slots()
+            .get(index)
+            .and_then(|slot| slot.score_decision().cloned())
+        else {
+            return false;
+        };
+        let decided = self
+            .model
+            .as_model_mut()
+            .decision_mut()
+            .ok_or(CoreError::Unsupported {
+                what: "a decision pass on a model without a decision head",
+                backend: "scheduler",
+            })
+            .and_then(|head| head.decide(session, prompt, &questions));
+        match decided {
+            Ok(option_logits) => {
+                if let Some(slot) = self.slots.get_mut(index) {
+                    slot.finish_score();
+                    if let Some(reply) = slot.take_score_reply() {
+                        let _ = reply.send(Ok(ScoreOutcome {
+                            label_logprobs: Vec::new(),
+                            option_logits,
+                        }));
+                    }
+                }
+            }
+            Err(error) => self.fail_slot(index, &error, "a decision could not be scored"),
+        }
+        true
+    }
+
     /// One bounded quantum of one sequence's prompt.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the quantum and its three termini - generate, score, decide - read as one step"
+    )]
     fn prefill_step(&mut self, step: PrefillStep) {
         let Some(quantum) = self.ready_step(step) else {
             return;
@@ -1798,6 +1866,10 @@ impl Coordinator {
             }
         }
         self.finish_prompt(step.slot, covered, started);
+
+        if self.finish_decision(step.slot, session, &prompt) {
+            return;
+        }
 
         let Self {
             slots,
@@ -2282,7 +2354,10 @@ fn finish_scoring(row: &[u8], scores: &mut [f32], slot: &mut SeqSlot) {
     let label_logprobs = decision::math::label_logprobs(fill(row, scores), slot.score_labels());
     slot.finish_score();
     if let Some(reply) = slot.take_score_reply() {
-        let _ = reply.send(Ok(ScoreOutcome { label_logprobs }));
+        let _ = reply.send(Ok(ScoreOutcome {
+            label_logprobs,
+            option_logits: Vec::new(),
+        }));
     }
 }
 

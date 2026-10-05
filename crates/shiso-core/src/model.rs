@@ -360,6 +360,14 @@ pub trait Model: Send + std::fmt::Debug {
         None
     }
 
+    /// The schema decision head, when the checkpoint carries one.
+    ///
+    /// `None` for every model whose only answer is a logits row, which is the
+    /// truthful answer for every family but a decision checkpoint's.
+    fn decision_mut(&mut self) -> Option<&mut dyn DecisionModel> {
+        None
+    }
+
     /// Keeps every token the model picks for itself off `ids`.
     ///
     /// A scheduler draws from logits rows it reads back, and masks those rows
@@ -399,6 +407,56 @@ pub trait Model: Send + std::fmt::Debug {
     /// Releasing continues past the first failure so as much as possible is
     /// reclaimed, and the first error is the one returned.
     fn teardown(&mut self) -> CoreResult<()>;
+}
+
+/// One question of a schema decision, as token spans of the prompt that
+/// carries it.
+///
+/// Spans are `[start, end)` indices into the prompt the session read, so the
+/// head pools exactly the rows the encoder said belong to the question and to
+/// each of its options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionQuestion {
+    /// The question's kind as the head's type table indexes it: `0` for a
+    /// binary question, `1` for a choice, `2` for a score.
+    pub kind: u32,
+    /// The question's own wording.
+    pub span: std::ops::Range<usize>,
+    /// One span per allowed option, in the order the answers come back.
+    pub options: Vec<std::ops::Range<usize>>,
+}
+
+/// A schema decision model: a head that reads the prompt's final hidden rows
+/// and scores every option of every question in one pass.
+///
+/// The scheduler marks a session before its prompt is read, so the backbone
+/// keeps every row the head needs, then asks for the scores once the prompt
+/// is complete. Nothing is generated.
+pub trait DecisionModel {
+    /// Keeps the final normalized row of every prompt token `session` reads
+    /// from now on, until [`DecisionModel::decide`] or the session closes.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`] for a closed or unknown id.
+    fn capture_hidden(&mut self, session: SessionId) -> CoreResult<()>;
+
+    /// Scores `questions` over the rows `session` captured while reading
+    /// `prompt`, and releases those rows.
+    ///
+    /// Returns one logit per option, per question, in the order given.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] when the captured rows do not cover the
+    /// prompt or a span falls outside it, and [`CoreError::Backend`] on a
+    /// device failure.
+    fn decide(
+        &mut self,
+        session: SessionId,
+        prompt: &[TokenId],
+        questions: &[DecisionQuestion],
+    ) -> CoreResult<Vec<Vec<f32>>>;
 }
 
 /// Sampling configuration for one request.
