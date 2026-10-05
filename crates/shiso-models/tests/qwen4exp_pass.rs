@@ -1026,10 +1026,14 @@ fn a_prompt_role_segmented_pass_runs_each_recurrence_as_that_runs_own_prompt_pas
     }
 }
 
-/// Each run's last row of the collapsed block is gathered to row `run`, in run
-/// order, before one vocabulary projection reads the gathered rows into the
-/// logits block, and nothing picks from them: a label row is its own run's,
-/// never a neighbour's.
+/// Each run's vocabulary row is projected from that run's last row of the
+/// collapsed block into its own logits row, in run order, and nothing picks
+/// from them: a label row is its own run's, never a neighbour's.
+///
+/// The fixture's head is half precision, whose ladder moves to another tier
+/// past its row kernel's width, so it keeps one one-row projection per run
+/// and gathers nothing: only a cooperative trellis head is projected once
+/// over gathered rows (the engine's own tests state that case).
 #[test]
 fn a_prompt_role_segmented_pass_projects_each_runs_last_row_into_its_own_logits_row() {
     use shiso_engine::sparse::bind::Operand;
@@ -1052,14 +1056,10 @@ fn a_prompt_role_segmented_pass_projects_each_runs_last_row_into_its_own_logits_
             Operand::Scratch(Buf::Logits) | Operand::ScratchFrom(Buf::Logits, _)
         )
     };
-    let (mut copies, mut writes) = (Vec::new(), Vec::new());
     let mut mixed = None;
-    for (at, step) in pass.plan.steps().iter().enumerate() {
+    let mut pairs = Vec::new();
+    for step in pass.plan.steps() {
         let ops = operands_of(step);
-        if step.name() == "q4e_copy_row_kernel" {
-            copies.push((at, ops[0], ops[1]));
-            continue;
-        }
         if let Some(src) = ops.iter().copied().find(is_mixed) {
             mixed = Some(src);
         }
@@ -1067,44 +1067,34 @@ fn a_prompt_role_segmented_pass_projects_each_runs_last_row_into_its_own_logits_
             continue;
         }
         if let Some(dst) = ops.iter().copied().find(is_logits) {
-            writes.push((at, mixed, dst));
+            pairs.push((mixed, dst));
         }
     }
+    pairs.dedup();
     let row = |at: u32| u64::from(at) * u64::from(fixture::HIDDEN) * 4;
+    let logit = |at: u32| u64::from(at) * u64::from(fixture::VOCAB) * 4;
     assert_eq!(
-        copies
-            .iter()
-            .map(|&(_, dst, src)| (dst, src))
-            .collect::<Vec<_>>(),
+        pairs,
         vec![
             (
-                Operand::Scratch(Buf::Mixed),
-                Operand::ScratchFrom(Buf::Mixed, row(39))
-            ),
-            (
-                Operand::ScratchFrom(Buf::Mixed, row(1)),
-                Operand::ScratchFrom(Buf::Mixed, row(46))
-            ),
-            (
-                Operand::ScratchFrom(Buf::Mixed, row(2)),
-                Operand::ScratchFrom(Buf::Mixed, row(47))
-            ),
-        ],
-        "each run's last row lands on its own row, in run order"
-    );
-    let gathered = copies.last().map_or(0, |&(at, _, _)| at);
-    assert!(!writes.is_empty(), "the projection writes the logits");
-    for &(at, src, dst) in &writes {
-        assert!(at > gathered, "the projection reads the gathered rows");
-        assert_eq!(
-            (src, dst),
-            (
-                Some(Operand::ScratchFrom(Buf::Mixed, 0)),
+                Some(Operand::ScratchFrom(Buf::Mixed, row(39))),
                 Operand::Scratch(Buf::Logits)
             ),
-            "one projection over the gathered block, from row 0 into logits row 0"
-        );
-    }
+            (
+                Some(Operand::ScratchFrom(Buf::Mixed, row(46))),
+                Operand::ScratchFrom(Buf::Logits, logit(1))
+            ),
+            (
+                Some(Operand::ScratchFrom(Buf::Mixed, row(47))),
+                Operand::ScratchFrom(Buf::Logits, logit(2))
+            ),
+        ]
+    );
+    assert_eq!(
+        pass.plan.count("q4e_copy_row_kernel"),
+        0,
+        "a half-precision head gathers nothing"
+    );
     assert_eq!(
         pass.plan.count("q4e_argmax_rows_kernel"),
         0,

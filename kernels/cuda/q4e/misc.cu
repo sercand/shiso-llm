@@ -3,6 +3,10 @@
  * Deltas against the source, and nothing else: D1 (extern "C" linkage on the non-template kernels).
  * No line of kernel arithmetic was edited, reordered or
  * reformatted; a change to any of it is a defect, not a cleanup.
+ *
+ * One exception, which has no source: q4e_copy_row_kernel at the end of this
+ * file is this tree's own, written for the prompt-role segmented pass's
+ * gathered vocabulary projection.
  */
 
 #include "q4e.cuh"

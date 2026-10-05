@@ -766,16 +766,16 @@ fn batched_rows_match_their_solo_rows_at_every_run_count() {
         skip("no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
         return;
     };
-    let tokens = prompt(1_024 + 8 * 32);
+    let tokens = prompt(1_024 + 8 * 64);
     let prefix = &tokens[..1_024];
-    let tails = (0..32)
+    let tails = (0..64)
         .map(|r| &tokens[1_024 + 8 * r..1_032 + 8 * r])
         .collect::<Vec<_>>();
     let want = tails
         .iter()
         .map(|tail| solo_tail(&backend, &mut model, prefix, tail))
         .collect::<Vec<_>>();
-    for runs in [2_usize, 7, 16, 32] {
+    for runs in [2_usize, 7, 16, 32, 64] {
         let pairs = tails[..runs]
             .iter()
             .map(|tail| (prefix, *tail))
