@@ -28,7 +28,7 @@ use crate::error::AppError;
 use crate::media::MediaItem;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
-use crate::tokenizer::Vocabulary;
+use crate::tokenizer::{AddedSeam, Vocabulary};
 
 /// One option of a choice question.
 #[derive(Debug, Clone)]
@@ -838,9 +838,12 @@ pub(crate) fn prepare_question(
     // full-text re-encode cannot match by construction and is skipped; the
     // tail after the last span is where text and ids agree again, and the
     // proof needs only the spans - `core` never sees a marker string.
-    let (tail_text, tail_tokens): (&str, Vec<TokenId>) = if prompt.media.is_empty() {
-        let plain = vocabulary
-            .encode(&prompt.text, false)
+    let (tail_text, tail_tokens, seam): (&str, Vec<TokenId>, Option<AddedSeam>) = if prompt
+        .media
+        .is_empty()
+    {
+        let (plain, seam) = vocabulary
+            .encode_with_seam(&prompt.text)
             .map_err(|error| AppError::internal("re-encoding the rendered prompt", error))?;
         // The renderer's ids are this re-encode plus, when the checkpoint has
         // an opening token and the template did not write it, that token in
@@ -860,18 +863,90 @@ pub(crate) fn prepare_question(
                 "invalid_request",
             ));
         }
-        (prompt.text.as_str(), plain)
+        (prompt.text.as_str(), plain, seam)
     } else {
         let last = prompt
             .media_spans
             .last()
             .expect("a prompt that rendered media reports its spans");
-        (
-            &prompt.text[last.text.end..],
-            prompt.tokens[last.tokens.end..].to_vec(),
-        )
+        let tail_text = &prompt.text[last.text.end..];
+        let tail_tokens = prompt.tokens[last.tokens.end..].to_vec();
+        // The tail's ids were never re-encoded here, so its encoding is
+        // taken once to find the seam, and the seam is used only when the
+        // ids in front of it are the tail's own: otherwise every label
+        // takes the whole-tail check below, which refuses it as before.
+        let (encoded, seam) = vocabulary
+            .encode_with_seam(tail_text)
+            .map_err(|error| AppError::internal("encoding the prompt's tail", error))?;
+        let seam = seam.filter(|seam| encoded.get(..seam.tokens) == tail_tokens.get(..seam.tokens));
+        (tail_text, tail_tokens, seam)
     };
 
+    let labels = prove_labels(
+        vocabulary,
+        &name,
+        label_words,
+        &LabelSeam {
+            text: tail_text,
+            tokens: &tail_tokens,
+            seam: seam.as_ref(),
+        },
+    )?;
+
+    let prompt_tokens = u64::try_from(prompt.tokens.len()).unwrap_or(u64::MAX);
+    // The scoring pass answers at the prompt's last row, so it needs the
+    // prompt to leave room the same way a generation does - the shared
+    // boundary, blamed on the field this surface carries.
+    remaining_budget(state.ctx, prompt_tokens).ok_or(AppError::ContextOverflow {
+        param: "input",
+        prompt_tokens,
+        ctx: state.ctx,
+    })?;
+    Ok(PreparedQuestion {
+        id: question.id.clone(),
+        kind: question.kind.clone(),
+        probability_answer: question.probability_answer,
+        prompt_tokens: prompt.tokens,
+        labels,
+        media: Arc::from(prompt.media),
+        media_digests: Arc::from(prompt.digests),
+    })
+}
+
+/// A prompt's tail, as [`prove_labels`] checks labels against it.
+struct LabelSeam<'a> {
+    /// The tail's text: the whole prompt without media, the text after the
+    /// last item's marker with it.
+    text: &'a str,
+    /// The tail's ids.
+    tokens: &'a [TokenId],
+    /// Where the tail's encoding last restarted, when it did and the ids in
+    /// front of that point are the tail's own.
+    seam: Option<&'a AddedSeam>,
+}
+
+/// Encodes every label, and proves each one is one token of its own that
+/// follows the prompt's tail as exactly that token.
+///
+/// The proof per label is that the tail's text with the label appended
+/// encodes as the tail's ids with the label's id appended. Done literally,
+/// that re-encodes the whole tail once per label - a 255-option question
+/// over a long input is hundreds of whole-prompt encodes. With a seam it
+/// encodes only the stretch after the tail's last added token, plus the
+/// label: the encoder splits added tokens out first and encodes every stretch
+/// between them alone, so the ids in front of the seam are the same whatever
+/// follows it (and are the tail's own, which the caller checked), and the ids
+/// after it are what this stretch encodes to. The one way an appended label
+/// could reach behind the seam, completing an added token spelled across it,
+/// is ruled out per label by [`AddedSeam::holds_after`], and a label it does
+/// not clear takes the whole-tail check instead. Either way the answer
+/// is the literal check's: same labels accepted, same ids, same refusals.
+fn prove_labels(
+    vocabulary: &Vocabulary,
+    name: &str,
+    label_words: Vec<String>,
+    tail: &LabelSeam<'_>,
+) -> Result<Vec<TokenId>, AppError> {
     let mut labels: Vec<TokenId> = Vec::new();
     let mut words: Vec<String> = Vec::new();
     for label in label_words {
@@ -899,12 +974,15 @@ pub(crate) fn prepare_question(
         }
         // The answer position reads one token: the label must follow the
         // prompt's tail as exactly that token, not re-tokenize together with
-        // whatever the tail ended with - the tail being the whole prompt
-        // without media, and the text after the last item's marker with it.
-        let mut following = tail_tokens.clone();
+        // whatever the tail ended with.
+        let (text, ids) = match tail.seam.filter(|seam| seam.holds_after(tail.text, &label)) {
+            Some(seam) => (&tail.text[seam.text..], &tail.tokens[seam.tokens..]),
+            None => (tail.text, tail.tokens),
+        };
+        let mut following = ids.to_vec();
         following.push(*only);
         let joined = vocabulary
-            .encode(&format!("{tail_text}{label}"), false)
+            .encode(&format!("{text}{label}"), false)
             .map_err(|error| AppError::internal("encoding a label after the prompt", error))?;
         if joined != following {
             return Err(AppError::bad_request(
@@ -918,25 +996,7 @@ pub(crate) fn prepare_question(
         labels.push(*only);
         words.push(label);
     }
-
-    let prompt_tokens = u64::try_from(prompt.tokens.len()).unwrap_or(u64::MAX);
-    // The scoring pass answers at the prompt's last row, so it needs the
-    // prompt to leave room the same way a generation does - the shared
-    // boundary, blamed on the field this surface carries.
-    remaining_budget(state.ctx, prompt_tokens).ok_or(AppError::ContextOverflow {
-        param: "input",
-        prompt_tokens,
-        ctx: state.ctx,
-    })?;
-    Ok(PreparedQuestion {
-        id: question.id.clone(),
-        kind: question.kind.clone(),
-        probability_answer: question.probability_answer,
-        prompt_tokens: prompt.tokens,
-        labels,
-        media: Arc::from(prompt.media),
-        media_digests: Arc::from(prompt.digests),
-    })
+    Ok(labels)
 }
 
 /// One question's scored answer, before any wire shape.
@@ -1389,5 +1449,230 @@ mod tests {
         // identifies the question instead.
         let message = refusal(check_ids(&[yes_no("a"), yes_no("")], false));
         assert!(message.contains("questions[1]"), "{message}");
+    }
+
+    /// The label proof as it was first written: every label re-encodes the
+    /// whole tail. The reference the seam proof must answer exactly as.
+    fn literal_proof(
+        vocabulary: &Vocabulary,
+        text: &str,
+        tokens: &[TokenId],
+        label_words: &[String],
+    ) -> Result<Vec<TokenId>, String> {
+        let mut labels = Vec::new();
+        for label in label_words {
+            let encoded = vocabulary.encode(label, false).map_err(|e| e.to_string())?;
+            let [only] = encoded.as_slice() else {
+                return Err(format!("{label} is not one token"));
+            };
+            if labels.contains(only) {
+                return Err(format!("{label} repeats a label"));
+            }
+            let mut following = tokens.to_vec();
+            following.push(*only);
+            let joined = vocabulary
+                .encode(&format!("{text}{label}"), false)
+                .map_err(|e| e.to_string())?;
+            if joined != following {
+                return Err(format!("{label} does not follow"));
+            }
+            labels.push(*only);
+        }
+        Ok(labels)
+    }
+
+    /// The seam proof over `text`, with refusals reduced to whether they
+    /// happened.
+    fn seam_proof(vocabulary: &Vocabulary, text: &str, label_words: &[String]) -> Option<Vec<u32>> {
+        let (tokens, seam) = vocabulary.encode_with_seam(text).expect("encodes");
+        prove_labels(
+            vocabulary,
+            "question \"q\"",
+            label_words.to_vec(),
+            &LabelSeam {
+                text,
+                tokens: &tokens,
+                seam: seam.as_ref(),
+            },
+        )
+        .ok()
+        .map(|ids| ids.iter().map(|id| id.get()).collect())
+    }
+
+    /// A word-level vocabulary with three added tokens, one of which is
+    /// spelled across a seam: `<|a|>` then a newline then `B`.
+    fn seam_vocabulary() -> Vocabulary {
+        use std::str::FromStr as _;
+        let words = [
+            "<unk>", "A", "B", "C", "AB", "yes", "no", "the", "input", "Answer", "<|u|>", "<|a|>",
+            "<|a|>\nB",
+        ];
+        let vocab: serde_json::Map<String, serde_json::Value> = words
+            .iter()
+            .enumerate()
+            .map(|(id, word)| ((*word).to_owned(), json!(id)))
+            .collect();
+        let added = |id: usize| {
+            json!({
+                "id": id, "content": words[id], "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true,
+            })
+        };
+        let document = json!({
+            "version": "1.0",
+            "truncation": serde_json::Value::Null,
+            "padding": serde_json::Value::Null,
+            "added_tokens": [added(10), added(11), added(12)],
+            "normalizer": serde_json::Value::Null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": serde_json::Value::Null,
+            "decoder": serde_json::Value::Null,
+            "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
+        })
+        .to_string();
+        Vocabulary::from_tokenizer(
+            tokenizers::Tokenizer::from_str(&document).expect("the vocabulary loads"),
+        )
+    }
+
+    #[test]
+    fn the_seam_proof_answers_exactly_what_the_whole_tail_proof_answers() {
+        let vocabulary = seam_vocabulary();
+        let labels = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        for (text, words) in [
+            // A fresh token after the opener: accepted either way.
+            ("<|u|> the input <|a|>\n", labels(&["A", "C", "yes", "no"])),
+            // A tail that ends on a word swallows the label: refused.
+            ("<|u|> the input <|a|> Answer", labels(&["A"])),
+            // No added token at all: the whole tail is the stretch.
+            ("the input ", labels(&["A", "C"])),
+            // The label completes an added token spelled across the seam
+            // (`<|a|>` + newline + `B`): the literal proof refuses it, and
+            // the seam must not be used for it.
+            ("<|u|> the input <|a|>\n", labels(&["A", "B"])),
+            // A two-letter label that is one token, then one that is not.
+            ("<|u|> the input <|a|>\n", labels(&["AB", "C"])),
+            ("<|u|> the input <|a|>\n", labels(&["A", "BC"])),
+            // Two labels that are one token.
+            ("<|u|> the input <|a|>\n", labels(&["A", "A"])),
+        ] {
+            let (tokens, _seam) = vocabulary.encode_with_seam(text).expect("encodes");
+            let want = literal_proof(&vocabulary, text, &tokens, &words)
+                .ok()
+                .map(|ids| ids.iter().map(|id| id.get()).collect::<Vec<_>>());
+            assert_eq!(
+                seam_proof(&vocabulary, text, &words),
+                want,
+                "{text:?} {words:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_seam_is_just_past_the_last_added_token_and_held_only_where_nothing_spans_it() {
+        let vocabulary = seam_vocabulary();
+        let text = "<|u|> the input <|a|>\n";
+        let (tokens, seam) = vocabulary.encode_with_seam(text).expect("encodes");
+        let seam = seam.expect("the text holds an added token");
+        assert_eq!(&text[seam.text..], "\n");
+        assert_eq!(tokens[seam.tokens - 1].get(), 11, "the seam follows <|a|>");
+        assert!(seam.holds_after(text, "A"));
+        assert!(
+            !seam.holds_after(text, "B"),
+            "`<|a|>\\nB` would match across the seam"
+        );
+        assert!(
+            !seam.holds_after(text, "\u{e9}"),
+            "a non-ASCII label is not cleared"
+        );
+        let (_tokens, none) = vocabulary.encode_with_seam("the input").expect("encodes");
+        assert!(none.is_none(), "no added token, no seam");
+    }
+
+    /// The label proof's cost on the served vocabulary: one 151-option
+    /// question over about four thousand words of input, proved the literal
+    /// way (a whole-prompt encode per label) and the seam way. Both must
+    /// accept the same labels with the same ids. Needs the served export's
+    /// directory in `SHISO_TEST_MODEL_QWEN4EXP_EXL3` for its `tokenizer.json`.
+    #[test]
+    #[ignore = "needs the served vocabulary named by SHISO_TEST_MODEL_QWEN4EXP_EXL3"]
+    #[expect(clippy::print_stdout, reason = "the timings are the test's output")]
+    fn a_wide_question_over_a_long_input_proves_its_labels_in_label_time() {
+        let Some(dir) = std::env::var_os("SHISO_TEST_MODEL_QWEN4EXP_EXL3") else {
+            println!("SKIP: no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
+            return;
+        };
+        let vocabulary = Vocabulary::from_file(&std::path::Path::new(&dir).join("tokenizer.json"))
+            .expect("the vocabulary loads");
+        let words = [
+            "the",
+            "review",
+            "says",
+            "battery",
+            "lasts",
+            "two",
+            "days",
+            "and",
+            "screen",
+            "is",
+            "bright",
+            "but",
+            "camera",
+            "struggles",
+            "at",
+            "night",
+            "while",
+            "price",
+            "seems",
+            "fair",
+        ];
+        let input = (0..4_000)
+            .map(|at| words[(at * 7 + at / 3) % words.len()])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let kind = Kind::Choice {
+            question: "Which aspect is discussed?".to_owned(),
+            options: options(151),
+        };
+        let started = std::time::Instant::now();
+        let labels = vocabulary_labels(&vocabulary, &kind, "q").expect("151 labels");
+        let labelled = started.elapsed();
+        let text = format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            prompt_body(&input, &kind, &labels)
+        );
+
+        let before = std::time::Instant::now();
+        let tokens = vocabulary.encode(&text, false).expect("encodes");
+        let want = literal_proof(&vocabulary, &text, &tokens, &labels).expect("the labels hold");
+        let before = before.elapsed();
+
+        let after = std::time::Instant::now();
+        let (seamed, seam) = vocabulary.encode_with_seam(&text).expect("encodes");
+        let got = prove_labels(
+            &vocabulary,
+            "q",
+            labels.clone(),
+            &LabelSeam {
+                text: &text,
+                tokens: &seamed,
+                seam: seam.as_ref(),
+            },
+        )
+        .expect("the labels hold");
+        let after = after.elapsed();
+
+        assert_eq!(seamed, tokens);
+        assert_eq!(got, want);
+        assert!(
+            seam.is_some(),
+            "the served template ends past an added token"
+        );
+        println!(
+            "prompt {} tokens, {} labels: label choice {labelled:?}; proof before {before:?}, \
+             after {after:?}",
+            tokens.len(),
+            labels.len()
+        );
     }
 }

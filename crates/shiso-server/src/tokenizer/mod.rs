@@ -272,6 +272,67 @@ impl Vocabulary {
         Ok(tokens)
     }
 
+    /// Encodes `text` as [`Self::encode`] does, and says where in it the
+    /// encoder last restarted: just past its last added token.
+    ///
+    /// Added tokens are split out before any other step of the encoder (see
+    /// [`Self::encode_prompt_with_literals`]), so the stretch after the last
+    /// one is normalized, pre-tokenized and merged on its own - its ids are
+    /// the ids of that stretch encoded alone, whatever came before it. What a
+    /// caller appends to `text` can only change the ids from that point on,
+    /// unless the appended text completes an added token that started before
+    /// it, which [`AddedSeam::holds_after`] rules out per appended string.
+    ///
+    /// `None` for the seam when the encoding holds no added token, and when
+    /// this vocabulary declares any added token that strips the whitespace
+    /// around it or matches only as a whole word: either lets a match depend
+    /// on characters across the split, so the split is not a clean restart.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenizerError::Encode`] when the text cannot be encoded.
+    pub fn encode_with_seam(
+        &self,
+        text: &str,
+    ) -> Result<(Vec<TokenId>, Option<AddedSeam>), TokenizerError> {
+        let encoded = self
+            .inner
+            .encode(text, false)
+            .map_err(|error| TokenizerError::Encode {
+                message: error.to_string(),
+            })?;
+        let tokens: Vec<TokenId> = encoded
+            .get_ids()
+            .iter()
+            .copied()
+            .map(TokenId::new)
+            .collect();
+        let added = self.inner.get_added_tokens_decoder();
+        if added
+            .values()
+            .any(|token| token.lstrip || token.rstrip || token.single_word)
+        {
+            return Ok((tokens, None));
+        }
+        let seam = encoded
+            .get_ids()
+            .iter()
+            .zip(encoded.get_offsets())
+            .enumerate()
+            .rev()
+            .find(|(_, (id, _))| added.contains_key(id))
+            .map(|(at, (_, offsets))| AddedSeam {
+                text: offsets.1,
+                tokens: at + 1,
+                spellings: added
+                    .values()
+                    .map(|token| token.content.clone())
+                    .filter(|content| !content.is_empty())
+                    .collect(),
+            });
+        Ok((tokens, seam))
+    }
+
     /// Decodes a run of ids back to text.
     ///
     /// # Errors
@@ -385,6 +446,54 @@ impl Vocabulary {
     pub fn audio_wrap_ids(&self, placement: &MediaPlacement) -> Option<(TokenId, TokenId)> {
         let (open, close) = placement.wrap_audio?;
         Some((self.marker_id(open)?, self.marker_id(close)?))
+    }
+}
+
+/// Where an encoding last restarted: just past its last added token.
+///
+/// Returned by [`Vocabulary::encode_with_seam`]. Encoding `text[self.text..]`
+/// followed by an appended string gives the ids of `text` followed by that
+/// string from index [`AddedSeam::tokens`] on, whenever
+/// [`AddedSeam::holds_after`] says the appended string cannot complete an added
+/// token that began before the seam. That is what lets a caller check many
+/// strings appended to one long text at the cost of the short stretch after
+/// the seam each, instead of the whole text each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddedSeam {
+    /// The byte in the text just past the last added token.
+    pub text: usize,
+    /// The index in the ids just past it.
+    pub tokens: usize,
+    /// Every added token's spelling, for [`AddedSeam::holds_after`].
+    spellings: Vec<String>,
+}
+
+impl AddedSeam {
+    /// Whether the seam still splits `text` followed by `appended`.
+    ///
+    /// The one way appending can reach behind the seam is an added token
+    /// spelled as some suffix of `text` that starts before the seam, followed
+    /// by a prefix of `appended`: the encoder would match it across the seam.
+    /// A match that starts at or after the seam lies inside the stretch the
+    /// caller encodes, so it is seen there. `appended` must also be ASCII, so
+    /// that normalizing it cannot compose it with the character before it.
+    #[must_use]
+    pub fn holds_after(&self, text: &str, appended: &str) -> bool {
+        if !appended.is_ascii() {
+            return false;
+        }
+        let after = text.len().saturating_sub(self.text);
+        !self.spellings.iter().any(|spelling| {
+            (1..=spelling.len().min(appended.len())).any(|tail| {
+                let split = spelling.len() - tail;
+                spelling.is_char_boundary(split)
+                    && appended
+                        .as_bytes()
+                        .starts_with(&spelling.as_bytes()[split..])
+                    && split > after
+                    && text.ends_with(&spelling[..split])
+            })
+        })
     }
 }
 
