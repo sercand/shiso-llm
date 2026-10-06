@@ -34,6 +34,14 @@ const MODULE: &str = "flux2";
 const BLOCK: u32 = 64;
 /// Tile edge of the GEMM kernels, as the driver launches it.
 const GEMM_TILE: u32 = 16;
+/// Output tile edge of the simdgroup GEMM and convolution kernels.
+const G64_TILE: u32 = 64;
+/// Threads per simdgroup-tile threadgroup.
+const G64_THREADS: u32 = 128;
+/// Query rows per fused-attention threadgroup.
+const FA_QROWS: u32 = 32;
+/// Threads per fused-attention threadgroup.
+const FA_THREADS: u32 = 128;
 
 /// Every entry point the driver launches, per the Task-3 contract table.
 const ENTRIES: &[&str] = &[
@@ -60,6 +68,14 @@ const ENTRIES: &[&str] = &[
     "kernel_flux2_upsample_nearest_f32",
     "kernel_flux2_transpose_f32",
     "kernel_flux2_embed_bf16_f32",
+    "kernel_flux2_gemm64_f32",
+    "kernel_flux2_gemm64_bf16",
+    "kernel_flux2_gemm64_fp8",
+    "kernel_flux2_conv2d_gemm_f32",
+    "kernel_flux2_flash_sdpa_f32",
+    "kernel_flux2_gemm64_fused_f32",
+    "kernel_flux2_gemm64_fused_bf16",
+    "kernel_flux2_gemm64_fused_fp8",
 ];
 
 // --- argument blocks: byte-for-byte the driver's `#[repr(C)]` Pods ---------
@@ -70,6 +86,18 @@ struct GemmArgs {
     m: u32,
     n: u32,
     k: u32,
+    has_bias: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GemmFusedArgs {
+    m: u32,
+    n: u32,
+    cols_a: u32,
+    inner: u32,
+    gu_stride: u32,
+    gu_offset: u32,
     has_bias: u32,
 }
 
@@ -757,7 +785,7 @@ fn swiglu_gates_the_first_half_of_strided_rows() {
     launch(
         &b,
         "kernel_flux2_swiglu_f32",
-        Extent3::new(inner as u32, rows as u32, 1),
+        Extent3::new(grid_for(inner as u32, BLOCK), rows as u32, 1),
         Extent3::linear(BLOCK),
         &[
             KernelArg::Bytes(bytes_of(&args)),
@@ -810,7 +838,7 @@ fn swiglu_reads_a_view_that_starts_mid_row() {
     launch(
         &b,
         "kernel_flux2_swiglu_f32",
-        Extent3::new(inner as u32, rows as u32, 1),
+        Extent3::new(grid_for(inner as u32, BLOCK), rows as u32, 1),
         Extent3::linear(BLOCK),
         &[
             KernelArg::Bytes(bytes_of(&args)),
@@ -2232,4 +2260,790 @@ fn embed_gathers_bf16_table_rows_as_f32() {
     }
     let got = read_f32(&b, out_buf.view(), tokens * hidden);
     assert_close(&got, &expected, "embed_bf16");
+}
+
+// --- simdgroup tiles: gemm64, implicit-gemm conv, fused attention -----------
+
+/// One simdgroup-tile GEMM launch with the driver's geometry; `shape` is
+/// `(m, n, k)` with `k % 16 == 0`.
+fn run_gemm64(b: &Arc<dyn Backend>, run: GemmRun<'_>) -> Vec<f32> {
+    let (m, n, k) = run.shape;
+    let in_buf = upload_f32(b, run.input);
+    let out_buf = alloc(b, (m * n * 4) as u64).expect("alloc out");
+    let args = GemmArgs {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+        has_bias: u32::from(run.has_bias),
+    };
+    launch(
+        b,
+        run.entry,
+        Extent3::new(
+            grid_for(n as u32, G64_TILE),
+            grid_for(m as u32, G64_TILE),
+            1,
+        ),
+        Extent3::linear(G64_THREADS),
+        &[
+            KernelArg::Bytes(bytes_of(&args)),
+            KernelArg::Buffer(out_buf.view()),
+            KernelArg::Buffer(in_buf.view()),
+            KernelArg::Buffer(run.weight),
+            KernelArg::F32(run.scale),
+            KernelArg::Buffer(run.bias),
+        ],
+    );
+    read_f32(b, out_buf.view(), m * n)
+}
+
+/// Shapes that leave partial 64x64 tiles in both axes and cross several
+/// 16-wide k slices, so the edge zero-fill and the slice prefetch both run.
+const G64_SHAPE: (usize, usize, usize) = (70, 67, 48);
+
+#[test]
+fn gemm64_f32_matches_the_transposed_product_on_ragged_tiles() {
+    let Some(b) = open() else { return };
+    let (m, n, k) = G64_SHAPE;
+    let input = vals(m * k, 61);
+    let weight = vals(n * k, 62);
+    let bias = vals(n, 63);
+    let w_buf = upload_f32(&b, &weight);
+    let bias_buf = upload_f32(&b, &bias);
+    let got = run_gemm64(
+        &b,
+        GemmRun {
+            entry: "kernel_flux2_gemm64_f32",
+            weight: w_buf.view(),
+            scale: 1.0,
+            bias: bias_buf.view(),
+            has_bias: true,
+            input: &input,
+            shape: (m, n, k),
+        },
+    );
+    let expected = expect_gemm(&input, &weight, &bias, 1.0, m, n, k);
+    assert_close(&got, &expected, "gemm64_f32");
+}
+
+#[test]
+fn gemm64_bf16_widens_the_weight_and_skips_an_unflagged_bias() {
+    let Some(b) = open() else { return };
+    let (m, n, k) = G64_SHAPE;
+    let input = vals(m * k, 64);
+    // Multiples of 1/8 in a small range are exact in bf16.
+    let weight: Vec<f32> = vals(n * k, 65);
+    let bits: Vec<u16> = weight
+        .iter()
+        .map(|&v| bf16::from_f32(v).to_bits())
+        .collect();
+    let w_buf = upload_u16(&b, &bits);
+    let stand_in = dummy(&b);
+    let zero = vec![0f32; n];
+    let got = run_gemm64(
+        &b,
+        GemmRun {
+            entry: "kernel_flux2_gemm64_bf16",
+            weight: w_buf.view(),
+            scale: 0.5,
+            bias: stand_in.view(),
+            has_bias: false,
+            input: &input,
+            shape: (m, n, k),
+        },
+    );
+    let expected = expect_gemm(&input, &weight, &zero, 0.5, m, n, k);
+    assert_close(&got, &expected, "gemm64_bf16");
+}
+
+#[test]
+fn gemm64_fp8_decodes_every_e4m3_byte_and_scales_the_accumulator() {
+    let Some(b) = open() else { return };
+    let (m, n, k) = G64_SHAPE;
+    let input: Vec<f32> = vals(m * k, 66).iter().map(|v| v * 0.01).collect();
+    // Every byte value except the two NaN patterns, so the branch-free
+    // decode is checked against the reference decode across the whole code.
+    let bytes: Vec<u8> = (0..n * k)
+        .map(|i| {
+            let byte = u8::try_from((i * 7) % 256).unwrap_or(0);
+            if byte & 0x7F == 0x7F { 0x11 } else { byte }
+        })
+        .collect();
+    let weight: Vec<f32> = bytes.iter().map(|&v| e4m3(v)).collect();
+    let bias = vals(n, 67);
+    let w_buf = upload_u8(&b, &bytes);
+    let bias_buf = upload_f32(&b, &bias);
+    let got = run_gemm64(
+        &b,
+        GemmRun {
+            entry: "kernel_flux2_gemm64_fp8",
+            weight: w_buf.view(),
+            scale: 0.25,
+            bias: bias_buf.view(),
+            has_bias: true,
+            input: &input,
+            shape: (m, n, k),
+        },
+    );
+    let expected = expect_gemm(&input, &weight, &bias, 0.25, m, n, k);
+    assert_close(&got, &expected, "gemm64_fp8");
+}
+
+/// The reference E4M3 decode: 1 sign, 4 exponent (bias 7), 3 mantissa.
+fn e4m3(byte: u8) -> f32 {
+    let e = i32::from((byte >> 3) & 0xF);
+    let m = f32::from(byte & 7);
+    let v = if e == 0 {
+        m * 2f32.powi(-9)
+    } else {
+        (1.0 + m / 8.0) * 2f32.powi(e - 7)
+    };
+    if byte & 0x80 == 0 { v } else { -v }
+}
+
+/// One NCHW convolution case for the implicit-GEMM entry.
+struct ConvCase {
+    batch: usize,
+    in_c: usize,
+    in_h: usize,
+    in_w: usize,
+    out_c: usize,
+    k: usize,
+    stride: usize,
+    pad: usize,
+}
+
+impl ConvCase {
+    fn out_h(&self) -> usize {
+        (self.in_h + 2 * self.pad - self.k) / self.stride + 1
+    }
+    fn out_w(&self) -> usize {
+        (self.in_w + 2 * self.pad - self.k) / self.stride + 1
+    }
+}
+
+fn expect_conv(c: &ConvCase, input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
+    let (oh_n, ow_n) = (c.out_h(), c.out_w());
+    let mut out = vec![0f32; c.batch * c.out_c * oh_n * ow_n];
+    for n in 0..c.batch {
+        for oc in 0..c.out_c {
+            for oh in 0..oh_n {
+                for ow in 0..ow_n {
+                    let mut acc = 0f32;
+                    for ic in 0..c.in_c {
+                        for kh in 0..c.k {
+                            for kw in 0..c.k {
+                                let ih = oh * c.stride + kh;
+                                let iw = ow * c.stride + kw;
+                                if ih < c.pad
+                                    || iw < c.pad
+                                    || ih - c.pad >= c.in_h
+                                    || iw - c.pad >= c.in_w
+                                {
+                                    continue;
+                                }
+                                acc += input[((n * c.in_c + ic) * c.in_h + ih - c.pad) * c.in_w
+                                    + iw
+                                    - c.pad]
+                                    * weight[((oc * c.in_c + ic) * c.k + kh) * c.k + kw];
+                            }
+                        }
+                    }
+                    out[((n * c.out_c + oc) * oh_n + oh) * ow_n + ow] = acc + bias[oc];
+                }
+            }
+        }
+    }
+    out
+}
+
+fn run_conv_gemm(b: &Arc<dyn Backend>, c: &ConvCase, seed: usize) -> (Vec<f32>, Vec<f32>) {
+    let input: Vec<f32> = vals(c.batch * c.in_c * c.in_h * c.in_w, seed)
+        .iter()
+        .map(|v| v * 0.1)
+        .collect();
+    let weight: Vec<f32> = vals(c.out_c * c.in_c * c.k * c.k, seed + 1)
+        .iter()
+        .map(|v| v * 0.1)
+        .collect();
+    let bias = vals(c.out_c, seed + 2);
+    let (oh, ow) = (c.out_h(), c.out_w());
+    let in_buf = upload_f32(b, &input);
+    let w_buf = upload_f32(b, &weight);
+    let bias_buf = upload_f32(b, &bias);
+    let out_buf = alloc(b, (c.batch * c.out_c * oh * ow * 4) as u64).expect("alloc");
+    let args = Conv2dArgs {
+        batch: c.batch as u32,
+        in_c: c.in_c as u32,
+        in_h: c.in_h as u32,
+        in_w: c.in_w as u32,
+        out_c: c.out_c as u32,
+        out_h: oh as u32,
+        out_w: ow as u32,
+        k_h: c.k as u32,
+        k_w: c.k as u32,
+        stride: c.stride as u32,
+        pad: c.pad as u32,
+        has_bias: 1,
+    };
+    launch(
+        b,
+        "kernel_flux2_conv2d_gemm_f32",
+        Extent3::new(
+            grid_for(c.out_c as u32, G64_TILE),
+            grid_for((oh * ow) as u32, G64_TILE),
+            c.batch as u32,
+        ),
+        Extent3::linear(G64_THREADS),
+        &[
+            KernelArg::Bytes(bytes_of(&args)),
+            KernelArg::Buffer(out_buf.view()),
+            KernelArg::Buffer(in_buf.view()),
+            KernelArg::Buffer(w_buf.view()),
+            KernelArg::Buffer(bias_buf.view()),
+        ],
+    );
+    let got = read_f32(b, out_buf.view(), c.batch * c.out_c * oh * ow);
+    (got, expect_conv(c, &input, &weight, &bias))
+}
+
+#[test]
+fn conv2d_gemm_matches_the_padded_3x3_sum_across_batches() {
+    let Some(b) = open() else { return };
+    // 16 input channels x 9 taps = 144, a multiple of the k slice; 70 output
+    // channels and 121 pixels leave partial tiles in both axes.
+    let case = ConvCase {
+        batch: 2,
+        in_c: 16,
+        in_h: 11,
+        in_w: 11,
+        out_c: 70,
+        k: 3,
+        stride: 1,
+        pad: 1,
+    };
+    let (got, expected) = run_conv_gemm(&b, &case, 71);
+    assert_close(&got, &expected, "conv2d_gemm 3x3 pad 1");
+}
+
+#[test]
+fn conv2d_gemm_matches_the_strided_and_the_pointwise_sum() {
+    let Some(b) = open() else { return };
+    let strided = ConvCase {
+        batch: 1,
+        in_c: 16,
+        in_h: 9,
+        in_w: 7,
+        out_c: 5,
+        k: 3,
+        stride: 2,
+        pad: 0,
+    };
+    let (got, expected) = run_conv_gemm(&b, &strided, 74);
+    assert_close(&got, &expected, "conv2d_gemm 3x3 stride 2");
+    let pointwise = ConvCase {
+        batch: 1,
+        in_c: 32,
+        in_h: 5,
+        in_w: 13,
+        out_c: 9,
+        k: 1,
+        stride: 1,
+        pad: 0,
+    };
+    let (got, expected) = run_conv_gemm(&b, &pointwise, 77);
+    assert_close(&got, &expected, "conv2d_gemm 1x1");
+}
+
+/// Launches the fused attention with the driver's geometry.
+fn run_flash(b: &Arc<dyn Backend>, c: &Joint<'_>) -> (Vec<f32>, Vec<f32>) {
+    let hidden = c.heads * c.hd;
+    let stream = |v: &[f32]| -> DeviceBuffer {
+        if v.is_empty() {
+            dummy(b)
+        } else {
+            upload_f32(b, v)
+        }
+    };
+    let bufs: Vec<DeviceBuffer> = [
+        c.q_txt, c.k_txt, c.v_txt, c.q_img, c.k_img, c.v_img, c.cache_k, c.cache_v,
+    ]
+    .iter()
+    .map(|v| stream(v))
+    .collect();
+    let out_txt_buf = alloc(b, (c.txt * hidden * 4) as u64).expect("alloc");
+    let out_img_buf = alloc(b, (c.img * hidden * 4) as u64).expect("alloc");
+    let args = SdpaArgs {
+        txt_tokens: c.txt as u32,
+        img_tokens: c.img as u32,
+        cache_tokens: c.cache as u32,
+        heads: c.heads as u32,
+        head_dim: c.hd as u32,
+        txt_stride: c.txt_stride as u32,
+        img_stride: c.img_stride as u32,
+        cache_stride: c.cache_stride as u32,
+        q_offset: c.q_off as u32,
+        k_offset: c.k_off as u32,
+        v_offset: c.v_off as u32,
+    };
+    let mut kargs = vec![
+        KernelArg::Bytes(bytes_of(&args)),
+        KernelArg::Buffer(out_txt_buf.view()),
+        KernelArg::Buffer(out_img_buf.view()),
+    ];
+    kargs.extend(bufs.iter().map(|buf| KernelArg::Buffer(buf.view())));
+    launch(
+        b,
+        "kernel_flux2_flash_sdpa_f32",
+        Extent3::new(
+            grid_for((c.txt + c.img) as u32, FA_QROWS),
+            c.heads as u32,
+            1,
+        ),
+        Extent3::linear(FA_THREADS),
+        &kargs,
+    );
+    (
+        read_f32(b, out_txt_buf.view(), c.txt * hidden),
+        read_f32(b, out_img_buf.view(), c.img * hidden),
+    )
+}
+
+fn expect_all(c: &Joint<'_>) -> Vec<f32> {
+    let mut expected = Vec::new();
+    for t in 0..(c.txt + c.img) {
+        for h in 0..c.heads {
+            expected.extend(expect_joint(c, t, h));
+        }
+    }
+    expected
+}
+
+#[test]
+fn flash_sdpa_matches_joint_attention_over_fused_rows_and_a_cache() {
+    let Some(b) = open() else { return };
+    // The transformer's head width; 5 txt + 40 img rows straddle two query
+    // tiles, and 45 + 19 keys leave a partial 16-key block at the end.
+    let (heads, hd) = (2usize, 128usize);
+    let hidden = heads * hd;
+    let fused = 3 * hidden;
+    let (txt, img, cache) = (5usize, 40usize, 19usize);
+    let small =
+        |n: usize, seed: usize| -> Vec<f32> { vals(n, seed).iter().map(|v| v * 0.05).collect() };
+    let txt_rows = small(txt * fused, 81);
+    let img_rows = small(img * fused, 82);
+    let cache_rows = small(cache * fused, 83);
+    let case = Joint {
+        q_txt: &txt_rows,
+        k_txt: &txt_rows,
+        v_txt: &txt_rows,
+        q_img: &img_rows,
+        k_img: &img_rows,
+        v_img: &img_rows,
+        cache_k: &cache_rows,
+        cache_v: &cache_rows,
+        txt,
+        img,
+        cache,
+        heads,
+        hd,
+        txt_stride: fused,
+        img_stride: fused,
+        cache_stride: fused,
+        q_off: 0,
+        k_off: hidden,
+        v_off: 2 * hidden,
+    };
+    let expected = expect_all(&case);
+    let (got_txt, got_img) = run_flash(&b, &case);
+    assert_close(&got_txt, &expected[..txt * hidden], "flash sdpa: txt rows");
+    assert_close(&got_img, &expected[txt * hidden..], "flash sdpa: img rows");
+}
+
+#[test]
+fn flash_sdpa_matches_the_per_row_kernel_on_packed_narrow_heads() {
+    let Some(b) = open() else { return };
+    // A 64-wide head (fewer fragments than the maximum) over packed rows.
+    let (heads, hd) = (3usize, 64usize);
+    let hidden = heads * hd;
+    let (txt, img) = (3usize, 30usize);
+    let small =
+        |n: usize, seed: usize| -> Vec<f32> { vals(n, seed).iter().map(|v| v * 0.1).collect() };
+    let (qt, kt, vt) = (
+        small(txt * hidden, 91),
+        small(txt * hidden, 92),
+        small(txt * hidden, 93),
+    );
+    let (qi, ki, vi) = (
+        small(img * hidden, 94),
+        small(img * hidden, 95),
+        small(img * hidden, 96),
+    );
+    let empty: Vec<f32> = Vec::new();
+    let case = Joint {
+        q_txt: &qt,
+        k_txt: &kt,
+        v_txt: &vt,
+        q_img: &qi,
+        k_img: &ki,
+        v_img: &vi,
+        cache_k: &empty,
+        cache_v: &empty,
+        txt,
+        img,
+        cache: 0,
+        heads,
+        hd,
+        txt_stride: hidden,
+        img_stride: hidden,
+        cache_stride: hidden,
+        q_off: 0,
+        k_off: 0,
+        v_off: 0,
+    };
+    let (flash_txt, flash_img) = run_flash(&b, &case);
+    let (row_txt, row_img) = run_sdpa(&b, &case);
+    assert_close(&flash_txt, &row_txt, "flash vs per-row: txt rows");
+    assert_close(&flash_img, &row_img, "flash vs per-row: img rows");
+    let expected = expect_all(&case);
+    assert_close(
+        &flash_img,
+        &expected[txt * hidden..],
+        "flash sdpa packed: img rows",
+    );
+}
+
+/// Runs the fused attention over one packed-fused stream (no img rows, no
+/// cache), as the single blocks call it.
+fn run_flash_joint(b: &Arc<dyn Backend>, c: &Joint<'_>) -> Vec<f32> {
+    let hidden = c.heads * c.hd;
+    let qkv = upload_f32(b, c.q_txt);
+    let stand_in = dummy(b);
+    let out = alloc(b, (c.txt * hidden * 4) as u64).expect("alloc");
+    let args = SdpaArgs {
+        txt_tokens: c.txt as u32,
+        img_tokens: 0,
+        cache_tokens: 0,
+        heads: c.heads as u32,
+        head_dim: c.hd as u32,
+        txt_stride: c.txt_stride as u32,
+        img_stride: c.img_stride as u32,
+        cache_stride: c.cache_stride as u32,
+        q_offset: c.q_off as u32,
+        k_offset: c.k_off as u32,
+        v_offset: c.v_off as u32,
+    };
+    launch(
+        b,
+        "kernel_flux2_flash_sdpa_f32",
+        Extent3::new(grid_for(c.txt as u32, FA_QROWS), c.heads as u32, 1),
+        Extent3::linear(FA_THREADS),
+        &[
+            KernelArg::Bytes(bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(qkv.view()),
+            KernelArg::Buffer(qkv.view()),
+            KernelArg::Buffer(qkv.view()),
+            KernelArg::Buffer(stand_in.view()),
+            KernelArg::Buffer(stand_in.view()),
+            KernelArg::Buffer(stand_in.view()),
+            KernelArg::Buffer(stand_in.view()),
+            KernelArg::Buffer(stand_in.view()),
+        ],
+    );
+    read_f32(b, out.view(), c.txt * hidden)
+}
+
+fn assert_bit_identical(a: &[f32], b: &[f32], what: &str) {
+    let differing = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{what}: {differing} values differ between runs"
+    );
+}
+
+/// A fixed seed must give the same image on every run, so the simdgroup
+/// kernels must give the same bits on every launch. Run at the transformer's
+/// own sizes (1046 joint rows, 24 heads of 128): a race between lane stores
+/// and fragment loads in the fused attention showed up there - one row in
+/// eight occasionally kept a stale rescale - and not on the small cases.
+#[test]
+fn flash_sdpa_and_gemm64_are_bit_identical_across_runs_at_model_sizes() {
+    let Some(b) = open() else { return };
+    let (heads, hd) = (24usize, 128usize);
+    let hidden = heads * hd;
+    let fused = 3 * hidden;
+    let rows = 1046usize;
+    let data: Vec<f32> = vals(rows * fused, 5).iter().map(|v| v * 0.03).collect();
+    let empty: Vec<f32> = Vec::new();
+    let case = Joint {
+        q_txt: &data,
+        k_txt: &data,
+        v_txt: &data,
+        q_img: &empty,
+        k_img: &empty,
+        v_img: &empty,
+        cache_k: &empty,
+        cache_v: &empty,
+        txt: rows,
+        img: 0,
+        cache: 0,
+        heads,
+        hd,
+        txt_stride: fused,
+        img_stride: fused,
+        cache_stride: fused,
+        q_off: 0,
+        k_off: hidden,
+        v_off: 2 * hidden,
+    };
+    let first = run_flash_joint(&b, &case);
+    for _ in 0..5 {
+        assert_bit_identical(&first, &run_flash_joint(&b, &case), "flash sdpa");
+    }
+
+    let (m, n, k) = (1046usize, 3072usize, 3072usize);
+    let input: Vec<f32> = vals(m * k, 9).iter().map(|v| v * 0.01).collect();
+    let weight: Vec<f32> = vals(n * k, 10).iter().map(|v| v * 0.01).collect();
+    let w_buf = upload_f32(&b, &weight);
+    let stand_in = dummy(&b);
+    let run = || {
+        run_gemm64(
+            &b,
+            GemmRun {
+                entry: "kernel_flux2_gemm64_f32",
+                weight: w_buf.view(),
+                scale: 1.0,
+                bias: stand_in.view(),
+                has_bias: false,
+                input: &input,
+                shape: (m, n, k),
+            },
+        )
+    };
+    let first = run();
+    for _ in 0..5 {
+        assert_bit_identical(&first, &run(), "gemm64");
+    }
+}
+
+/// `residual + gate * (x . w^T * scale + bias)` with `x = [a | silu(g) * u]`.
+struct FusedCase<'a> {
+    residual: &'a [f32],
+    a: &'a [f32],
+    gu: &'a [f32],
+    weight: &'a [f32],
+    bias: &'a [f32],
+    gate: &'a [f32],
+    scale: f32,
+    m: usize,
+    n: usize,
+    cols_a: usize,
+    inner: usize,
+    gu_stride: usize,
+    gu_offset: usize,
+}
+
+fn expect_fused(c: &FusedCase<'_>) -> Vec<f32> {
+    let k = c.cols_a + c.inner;
+    let mut out = c.residual.to_vec();
+    for r in 0..c.m {
+        let mut x = Vec::with_capacity(k);
+        x.extend_from_slice(&c.a[r * c.cols_a..(r + 1) * c.cols_a]);
+        let row = &c.gu[r * c.gu_stride + c.gu_offset..];
+        x.extend((0..c.inner).map(|i| silu(row[i]) * row[c.inner + i]));
+        for col in 0..c.n {
+            let dot: f32 = (0..k).map(|kk| x[kk] * c.weight[col * k + kk]).sum();
+            out[r * c.n + col] += c.gate[col] * (dot * c.scale + c.bias[col]);
+        }
+    }
+    out
+}
+
+fn run_fused(
+    b: &Arc<dyn Backend>,
+    c: &FusedCase<'_>,
+    entry: &'static str,
+    weight: DeviceView<'_>,
+) -> Vec<f32> {
+    let res_buf = upload_f32(b, c.residual);
+    let a_buf = if c.cols_a == 0 {
+        dummy(b)
+    } else {
+        upload_f32(b, c.a)
+    };
+    let gu_buf = if c.inner == 0 {
+        dummy(b)
+    } else {
+        upload_f32(b, c.gu)
+    };
+    let bias_buf = upload_f32(b, c.bias);
+    let gate_buf = upload_f32(b, c.gate);
+    let args = GemmFusedArgs {
+        m: c.m as u32,
+        n: c.n as u32,
+        cols_a: c.cols_a as u32,
+        inner: c.inner as u32,
+        gu_stride: c.gu_stride as u32,
+        gu_offset: c.gu_offset as u32,
+        has_bias: 1,
+    };
+    launch(
+        b,
+        entry,
+        Extent3::new(
+            grid_for(c.n as u32, G64_TILE),
+            grid_for(c.m as u32, G64_TILE),
+            1,
+        ),
+        Extent3::linear(G64_THREADS),
+        &[
+            KernelArg::Bytes(bytes_of(&args)),
+            KernelArg::Buffer(res_buf.view()),
+            KernelArg::Buffer(a_buf.view()),
+            KernelArg::Buffer(gu_buf.view()),
+            KernelArg::Buffer(weight),
+            KernelArg::F32(c.scale),
+            KernelArg::Buffer(bias_buf.view()),
+            KernelArg::Buffer(gate_buf.view()),
+        ],
+    );
+    read_f32(b, res_buf.view(), c.m * c.n)
+}
+
+#[test]
+fn gemm64_fused_reads_dense_then_swiglu_columns_and_adds_the_gated_residual() {
+    let Some(b) = open() else { return };
+    // The single block's shape in miniature: 16 dense columns, then a 32-wide
+    // swiglu whose gate starts 8 columns into a 72-wide fused row.
+    let (m, n, cols_a, inner) = (70usize, 67usize, 16usize, 32usize);
+    let (gu_stride, gu_offset) = (2 * inner + 8, 8usize);
+    let k = cols_a + inner;
+    let small = |count: usize, seed: usize| -> Vec<f32> {
+        vals(count, seed).iter().map(|v| v * 0.1).collect()
+    };
+    let (residual, a, gu) = (
+        small(m * n, 101),
+        small(m * cols_a, 102),
+        small(m * gu_stride, 103),
+    );
+    let (weight, bias, gate) = (small(n * k, 104), small(n, 105), small(n, 106));
+    let case = FusedCase {
+        residual: &residual,
+        a: &a,
+        gu: &gu,
+        weight: &weight,
+        bias: &bias,
+        gate: &gate,
+        scale: 1.0,
+        m,
+        n,
+        cols_a,
+        inner,
+        gu_stride,
+        gu_offset,
+    };
+    let w_buf = upload_f32(&b, &weight);
+    let got = run_fused(&b, &case, "kernel_flux2_gemm64_fused_f32", w_buf.view());
+    let expected = expect_fused(&case);
+    // The same rows with gate and up swapped must give a different answer,
+    // or the case cannot tell gate-first from gate-second.
+    let mut swapped_gu = gu.clone();
+    for r in 0..m {
+        for i in 0..inner {
+            swapped_gu.swap(
+                r * gu_stride + gu_offset + i,
+                r * gu_stride + gu_offset + inner + i,
+            );
+        }
+    }
+    let swapped = expect_fused(&FusedCase {
+        gu: &swapped_gu,
+        ..case
+    });
+    assert_differs(
+        &expected,
+        &swapped,
+        "gemm64_fused: gate-first vs gate-second",
+    );
+    assert_close(&got, &expected, "gemm64_fused f32");
+}
+
+#[test]
+fn gemm64_fused_takes_a_swiglu_only_input_over_fp8_weights() {
+    let Some(b) = open() else { return };
+    // The double block's MLP down projection: no dense part.
+    let (m, n, inner) = (40usize, 70usize, 48usize);
+    let gu_stride = 2 * inner;
+    let small = |count: usize, seed: usize| -> Vec<f32> {
+        vals(count, seed).iter().map(|v| v * 0.1).collect()
+    };
+    let (residual, gu) = (small(m * n, 111), small(m * gu_stride, 112));
+    let (bias, gate) = (small(n, 113), small(n, 114));
+    let bytes: Vec<u8> = (0..n * inner)
+        .map(|i| u8::try_from((i * 13) % 120).unwrap_or(0))
+        .collect();
+    let weight: Vec<f32> = bytes.iter().map(|&v| e4m3(v)).collect();
+    let empty: Vec<f32> = Vec::new();
+    let case = FusedCase {
+        residual: &residual,
+        a: &empty,
+        gu: &gu,
+        weight: &weight,
+        bias: &bias,
+        gate: &gate,
+        scale: 0.5,
+        m,
+        n,
+        cols_a: 0,
+        inner,
+        gu_stride,
+        gu_offset: 0,
+    };
+    let w_buf = upload_u8(&b, &bytes);
+    let got = run_fused(&b, &case, "kernel_flux2_gemm64_fused_fp8", w_buf.view());
+    assert_close(&got, &expect_fused(&case), "gemm64_fused fp8 swiglu-only");
+}
+
+#[test]
+fn gemm64_fused_takes_a_dense_only_input_over_bf16_weights() {
+    let Some(b) = open() else { return };
+    // The double block's attention output projection: no swiglu part.
+    let (m, n, cols_a) = (33usize, 65usize, 64usize);
+    let small = |count: usize, seed: usize| -> Vec<f32> {
+        vals(count, seed).iter().map(|v| v * 0.1).collect()
+    };
+    let (residual, a) = (small(m * n, 121), small(m * cols_a, 122));
+    let (bias, gate) = (small(n, 123), small(n, 124));
+    // Multiples of 1/80 are not all exact in bf16, so the expected product
+    // uses the widened values the kernel reads.
+    let bits: Vec<u16> = small(n * cols_a, 125)
+        .iter()
+        .map(|&v| bf16::from_f32(v).to_bits())
+        .collect();
+    let weight: Vec<f32> = bits.iter().map(|&v| bf16::from_bits(v).to_f32()).collect();
+    let empty: Vec<f32> = Vec::new();
+    let case = FusedCase {
+        residual: &residual,
+        a: &a,
+        gu: &empty,
+        weight: &weight,
+        bias: &bias,
+        gate: &gate,
+        scale: 1.0,
+        m,
+        n,
+        cols_a,
+        inner: 0,
+        gu_stride: 0,
+        gu_offset: 0,
+    };
+    let w_buf = upload_u16(&b, &bits);
+    let got = run_fused(&b, &case, "kernel_flux2_gemm64_fused_bf16", w_buf.view());
+    assert_close(&got, &expect_fused(&case), "gemm64_fused bf16 dense-only");
 }

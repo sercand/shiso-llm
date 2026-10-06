@@ -14,8 +14,8 @@
 //! generator's 16-grid and clamped to its bounds, the named aspect ratios
 //! become the table's concrete pixels, and a named resolution (`2K`) becomes
 //! its square. A size of `auto` is an omitted size: the caller gets the
-//! server default. `steps` has no wire field at all - the operator's
-//! `--image-default-steps` is the only say in it. `quality`, `user` and
+//! server default. `steps` names the denoising steps per image; omitted, it
+//! is the operator's `--image-default-steps`. `quality`, `user` and
 //! `session_id` are accepted and unused, each for the reason spelled out on
 //! the wire field.
 //!
@@ -119,7 +119,7 @@ struct Plan {
     width: u32,
     /// Output height, normalized to the grid.
     height: u32,
-    /// Denoising steps: the server default, since the wire names none.
+    /// Denoising steps: the named count, or the server default.
     steps: u32,
     /// The seed of the first image: the named one, or entropy so the images
     /// of one request differ from each other.
@@ -171,7 +171,7 @@ impl Plan {
             prompt: parsed.prompt.clone(),
             width,
             height,
-            steps: state.image_defaults.steps,
+            steps: parsed.steps.unwrap_or(state.image_defaults.steps),
             // A named seed makes the request reproducible and image `i` of it
             // gets `seed + i`; an unnamed one draws a base from the process's
             // one entropy source so the `n` images of one request differ.
