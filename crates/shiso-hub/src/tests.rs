@@ -11,9 +11,9 @@ use crate::config::{HfToken, HubConfig, RegistryEndpoint};
 use crate::error::HubError;
 use crate::host::{Backend, CudaInfo, HostProfile, MetalInfo};
 use crate::recipe::{
-    CURRENT_SCHEMA_VERSION, CommitSha, Component, FileEntry, HostConstraints, ModalCapabilities,
-    Modality, ModelName, ModelRef, Provider, Recipe, RecipeFeatures, Requirements, Role,
-    ServerDefaults, Sha256, Task, Variant, VariantKey, hub_file_name_ok,
+    CURRENT_SCHEMA_VERSION, CommitSha, Component, FileEntry, HUB_FILE_MAX_BYTES, HostConstraints,
+    ModalCapabilities, Modality, ModelName, ModelRef, Provider, Recipe, RecipeFeatures,
+    Requirements, Role, ServerDefaults, Sha256, Task, Variant, VariantKey, hub_file_name_ok,
 };
 use crate::select::select_variant;
 use crate::store::BlobStore;
@@ -743,4 +743,115 @@ fn hub_file_names_are_flat_and_not_reserved() {
     ] {
         assert!(!hub_file_name_ok(bad), "{bad}");
     }
+}
+
+/// A variant whose base speculates through its own built-in head (no `draft`
+/// role), with a hub-hosted draft vocabulary.
+fn hub_vocab_variant() -> Variant {
+    let mut variant = single_repo_variant();
+    // Drop the bound draft so only `spec_k` says the variant speculates.
+    variant.components.get_mut(&Role::Base).unwrap().files[1].binds = None;
+    variant.components.insert(
+        Role::DraftVocab,
+        Component {
+            provider: Provider::Shiso,
+            repo: None,
+            revision: None,
+            entry: Some("draft_vocab_counts.txt".to_string()),
+            files: vec![FileEntry {
+                name: "draft_vocab_counts.txt".to_string(),
+                size: 10,
+                sha256: Sha256::parse(
+                    "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a",
+                )
+                .unwrap(),
+                binds: None,
+            }],
+        },
+    );
+    variant.requirements.disk_bytes += 10;
+    variant
+}
+
+fn hub_recipe(variant: Variant) -> Recipe {
+    let mut recipe = make_test_recipe();
+    recipe.min_shiso_version = semver::Version::new(0, 2, 0);
+    recipe.variants = vec![variant];
+    recipe
+}
+
+#[test]
+fn a_hub_draft_vocabulary_beside_a_speculating_base_validates() {
+    validate_recipe(&hub_recipe(hub_vocab_variant()), ValidationMode::Strict).unwrap();
+}
+
+#[test]
+fn a_draft_vocabulary_needs_a_draft_or_a_speculation_depth() {
+    let mut variant = hub_vocab_variant();
+    variant.server_defaults = None;
+    let err = validate_recipe(&hub_recipe(variant), ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("draft_vocab"), "{err}");
+}
+
+#[test]
+fn a_draft_vocabulary_is_a_file() {
+    let mut variant = hub_vocab_variant();
+    variant.components.get_mut(&Role::DraftVocab).unwrap().entry = None;
+    assert!(validate_recipe(&hub_recipe(variant), ValidationMode::Strict).is_err());
+}
+
+#[test]
+fn a_hub_component_refuses_repo_revision_nested_names_and_big_files() {
+    let cases: [fn(&mut Component); 5] = [
+        |c| c.repo = Some("o/r".to_string()),
+        |c| {
+            c.revision =
+                Some(CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap());
+        },
+        |c| {
+            c.files[0].name = "sub/v.txt".to_string();
+            c.entry = Some("sub/v.txt".to_string());
+        },
+        |c| {
+            c.files[0].name = "index.json".to_string();
+            c.entry = Some("index.json".to_string());
+        },
+        |c| c.files[0].size = HUB_FILE_MAX_BYTES + 1,
+    ];
+    for (i, edit) in cases.iter().enumerate() {
+        let mut variant = hub_vocab_variant();
+        edit(variant.components.get_mut(&Role::DraftVocab).unwrap());
+        let size = variant.components[&Role::DraftVocab].files[0].size;
+        variant.requirements.disk_bytes = variant.requirements.disk_bytes - 10 + size;
+        assert!(
+            validate_recipe(&hub_recipe(variant), ValidationMode::Strict).is_err(),
+            "case {i} should be refused"
+        );
+    }
+}
+
+#[test]
+fn a_huggingface_component_still_needs_repo_and_revision() {
+    let mut variant = hub_vocab_variant();
+    variant.components.get_mut(&Role::Base).unwrap().revision = None;
+    assert!(validate_recipe(&hub_recipe(variant), ValidationMode::Strict).is_err());
+}
+
+#[test]
+fn hub_files_need_a_client_that_knows_them() {
+    let mut recipe = hub_recipe(hub_vocab_variant());
+    recipe.min_shiso_version = semver::Version::new(0, 1, 0);
+    let err = validate_recipe(&recipe, ValidationMode::Client).unwrap_err();
+    assert!(err.to_string().contains("min_shiso_version"), "{err}");
+}
+
+#[test]
+fn the_hub_component_supplies_its_role_through_its_entry() {
+    let variant = hub_vocab_variant();
+    let roles = variant.role_paths().unwrap();
+    assert_eq!(roles[&Role::DraftVocab].dir, Role::DraftVocab);
+    assert_eq!(
+        roles[&Role::DraftVocab].file,
+        Some("draft_vocab_counts.txt")
+    );
 }
