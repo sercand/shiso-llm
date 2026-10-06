@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use shiso_hub::recipe::{Recipe, Role};
+use shiso_hub::recipe::{Component, Recipe, Role};
 
 /// Where a model's card comes from: a Hugging Face repository at a commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,17 +41,17 @@ impl CardRef {
             });
         }
         let components = &recipe.variants.first()?.components;
-        let comp = components
+        let (repo, revision) = components
             .get(&Role::Base)
-            .or_else(|| components.values().find(|c| c.provider == "huggingface"))?;
-        let safe = comp.repo.split('/').count() == 2
-            && comp
-                .repo
+            .and_then(Component::hf_source)
+            .or_else(|| components.values().find_map(Component::hf_source))?;
+        let safe = repo.split('/').count() == 2
+            && repo
                 .split('/')
                 .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
-        (comp.provider == "huggingface" && safe).then(|| Self {
-            repo: comp.repo.clone(),
-            revision: comp.revision.to_string(),
+        safe.then(|| Self {
+            repo: repo.to_string(),
+            revision: revision.to_string(),
         })
     }
 

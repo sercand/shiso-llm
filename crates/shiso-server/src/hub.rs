@@ -627,7 +627,10 @@ pub async fn run_info(args: InfoArgs) -> anyhow::Result<()> {
 
         println!("    Components:");
         for (role, comp) in &v.components {
-            println!("      [{}] {}@{}", role.as_str(), comp.repo, comp.revision);
+            match comp.hf_source() {
+                Some((repo, rev)) => println!("      [{}] {repo}@{rev}", role.as_str()),
+                None => println!("      [{}] hub", role.as_str()),
+            }
             for f in &comp.files {
                 match f.binds {
                     Some(bound) => println!(

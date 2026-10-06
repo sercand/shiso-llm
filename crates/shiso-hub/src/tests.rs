@@ -12,8 +12,8 @@ use crate::error::HubError;
 use crate::host::{Backend, CudaInfo, HostProfile, MetalInfo};
 use crate::recipe::{
     CURRENT_SCHEMA_VERSION, CommitSha, Component, FileEntry, HostConstraints, ModalCapabilities,
-    Modality, ModelName, ModelRef, Recipe, RecipeFeatures, Requirements, Role, ServerDefaults,
-    Sha256, Task, Variant, VariantKey,
+    Modality, ModelName, ModelRef, Provider, Recipe, RecipeFeatures, Requirements, Role,
+    ServerDefaults, Sha256, Task, Variant, VariantKey, hub_file_name_ok,
 };
 use crate::select::select_variant;
 use crate::store::BlobStore;
@@ -33,9 +33,9 @@ fn make_test_recipe() -> Recipe {
     components.insert(
         Role::Base,
         Component {
-            provider: "huggingface".to_string(),
-            repo: "shiso/test-model".to_string(),
-            revision: CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap(),
+            provider: Provider::HuggingFace,
+            repo: Some("shiso/test-model".to_string()),
+            revision: Some(CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap()),
             entry: None,
             files: vec![
                 FileEntry {
@@ -380,9 +380,9 @@ fn single_repo_variant() -> Variant {
     components.insert(
         Role::Base,
         Component {
-            provider: "huggingface".to_string(),
-            repo: "shiso/test-gguf".to_string(),
-            revision: CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap(),
+            provider: Provider::HuggingFace,
+            repo: Some("shiso/test-gguf".to_string()),
+            revision: Some(CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap()),
             entry: Some("model.gguf".to_string()),
             files: vec![
                 file("model.gguf", None),
@@ -394,9 +394,9 @@ fn single_repo_variant() -> Variant {
     components.insert(
         Role::Config,
         Component {
-            provider: "huggingface".to_string(),
-            repo: "shiso/test-upstream".to_string(),
-            revision: CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap(),
+            provider: Provider::HuggingFace,
+            repo: Some("shiso/test-upstream".to_string()),
+            revision: Some(CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap()),
             entry: Some("config.json".to_string()),
             files: vec![file("config.json", None), file("tokenizer.json", None)],
         },
@@ -553,9 +553,9 @@ fn image_variant() -> Variant {
         binds: None,
     };
     let component = |repo: &str, entry: Option<&str>, files: Vec<FileEntry>| Component {
-        provider: "huggingface".to_string(),
-        repo: repo.to_string(),
-        revision: CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap(),
+        provider: Provider::HuggingFace,
+        repo: Some(repo.to_string()),
+        revision: Some(CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap()),
         entry: entry.map(str::to_string),
         files,
     };
@@ -691,4 +691,56 @@ fn info_and_quality_are_checked() {
         &|r| r.quality[1].variant = Some(VariantKey::parse("nope").unwrap())
     ));
     assert!(refused(&|r| r.quality[1].variant = None));
+}
+
+#[test]
+fn a_huggingface_component_round_trips_byte_for_byte() {
+    let text = include_str!("../../shiso-registry/tests/fixtures/qwen3.8-flash.json");
+    let recipe: Recipe = serde_json::from_str(text).unwrap();
+    let again = serde_json::to_string_pretty(&recipe).unwrap();
+    let reparsed: Recipe = serde_json::from_str(&again).unwrap();
+    assert_eq!(recipe, reparsed);
+    let comp = &recipe.variants[0].components[&Role::Base];
+    assert_eq!(comp.provider, Provider::HuggingFace);
+    let (repo, rev) = comp.hf_source().unwrap();
+    assert!(repo.contains('/'));
+    assert_eq!(rev.as_str().len(), 40);
+    // `repo` and `revision` are written exactly where they were.
+    assert!(again.contains("\"repo\": \"") && again.contains("\"revision\": \""));
+}
+
+#[test]
+fn a_hub_component_parses_without_repo_or_revision() {
+    let comp: Component = serde_json::from_str(
+        r#"{"provider": "shiso", "entry": "v.txt",
+            "files": [{"name": "v.txt", "size": 3,
+              "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(comp.provider, Provider::Shiso);
+    assert!(comp.hf_source().is_none());
+    let out = serde_json::to_string(&comp).unwrap();
+    assert!(!out.contains("repo") && !out.contains("revision"), "{out}");
+}
+
+#[test]
+fn an_unknown_provider_does_not_parse() {
+    let res: Result<Component, _> = serde_json::from_str(r#"{"provider": "s3", "files": []}"#);
+    assert!(res.is_err());
+}
+
+#[test]
+fn hub_file_names_are_flat_and_not_reserved() {
+    assert!(hub_file_name_ok("draft_vocab_counts.txt"));
+    for bad in [
+        "",
+        "a/b.txt",
+        "..",
+        ".",
+        "index.json",
+        "benchmarks.json",
+        "/x",
+    ] {
+        assert!(!hub_file_name_ok(bad), "{bad}");
+    }
 }

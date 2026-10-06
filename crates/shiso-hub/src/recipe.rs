@@ -632,20 +632,74 @@ pub struct FileEntry {
     pub binds: Option<Role>,
 }
 
+/// Largest file the hub hosts for a recipe: one mebibyte. Hub files are side
+/// files (a draft vocabulary, a template), not weights.
+pub const HUB_FILE_MAX_BYTES: u64 = 1_048_576;
+
+/// Files the registry build writes into a model's directory, which a hosted
+/// file sharing that directory may not be named.
+pub const RESERVED_MODEL_FILES: [&str; 2] = ["index.json", "benchmarks.json"];
+
+/// Whether `name` can be a hub-hosted file: one plain path segment, not one of
+/// the build's own files.
+#[must_use]
+pub fn hub_file_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\'])
+        && !RESERVED_MODEL_FILES.contains(&name)
+}
+
+/// Where a component's files are downloaded from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Provider {
+    /// A Hugging Face repository at a pinned commit.
+    #[serde(rename = "huggingface")]
+    HuggingFace,
+    /// The shiso hub itself: files committed beside the model's manifest in
+    /// the registry repository, at most [`HUB_FILE_MAX_BYTES`] each.
+    #[serde(rename = "shiso")]
+    Shiso,
+}
+
+impl fmt::Display for Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::HuggingFace => "huggingface",
+            Self::Shiso => "shiso",
+        })
+    }
+}
+
 /// A component of a variant (e.g. `base`, `vision`, `draft`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Component {
-    /// Remote provider (e.g. `"huggingface"`).
-    pub provider: String,
-    /// Provider repository (e.g. `"shiso-community/qwen3.5-9b-mlx-4bit"`).
-    pub repo: String,
-    /// Pinned commit SHA.
-    pub revision: CommitSha,
+    /// Where the files come from.
+    pub provider: Provider,
+    /// Provider repository (e.g. `"shiso-community/qwen3.5-9b-mlx-4bit"`);
+    /// required for Hugging Face, absent for the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Pinned commit SHA; required for Hugging Face, absent for the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<CommitSha>,
     /// Which file the component flag points at (absent = component directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
     /// List of all files making up this component.
     pub files: Vec<FileEntry>,
+}
+
+impl Component {
+    /// The Hugging Face repository and commit, when this component has both.
+    #[must_use]
+    pub fn hf_source(&self) -> Option<(&str, &CommitSha)> {
+        match (self.provider, self.repo.as_deref(), self.revision.as_ref()) {
+            (Provider::HuggingFace, Some(repo), Some(rev)) => Some((repo, rev)),
+            _ => None,
+        }
+    }
 }
 
 /// Hardware requirements for running a variant.

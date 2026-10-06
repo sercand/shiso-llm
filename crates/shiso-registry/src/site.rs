@@ -258,24 +258,30 @@ impl VariantView {
             components: v
                 .components
                 .iter()
-                .map(|(role, c)| ComponentView {
-                    role: role.to_string(),
-                    repo: c.repo.clone(),
-                    revision: c.revision.to_string(),
-                    revision_short: short(c.revision.as_str(), 10),
-                    url: format!("https://huggingface.co/{}/tree/{}", c.repo, c.revision),
-                    entry: c.entry.clone(),
-                    files: c
-                        .files
-                        .iter()
-                        .map(|f| FileView {
-                            name: f.name.clone(),
-                            size: gib(f.size),
-                            sha: f.sha256.to_string(),
-                            sha_short: short(f.sha256.as_str(), 12),
-                            binds: f.binds.map(|b| b.to_string()),
-                        })
-                        .collect(),
+                .map(|(role, c)| {
+                    let (repo, revision) = c
+                        .hf_source()
+                        .map(|(r, v)| (r.to_string(), v.to_string()))
+                        .unwrap_or_default();
+                    ComponentView {
+                        role: role.to_string(),
+                        revision_short: short(&revision, 10),
+                        url: format!("https://huggingface.co/{repo}/tree/{revision}"),
+                        repo,
+                        revision,
+                        entry: c.entry.clone(),
+                        files: c
+                            .files
+                            .iter()
+                            .map(|f| FileView {
+                                name: f.name.clone(),
+                                size: gib(f.size),
+                                sha: f.sha256.to_string(),
+                                sha_short: short(f.sha256.as_str(), 12),
+                                binds: f.binds.map(|b| b.to_string()),
+                            })
+                            .collect(),
+                    }
                 })
                 .collect(),
             server_defaults,

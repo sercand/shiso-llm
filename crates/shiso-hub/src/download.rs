@@ -130,8 +130,12 @@ impl Downloader {
                 }
                 items.push(DownloadItem {
                     role: *role,
-                    repo: comp.repo.clone(),
-                    revision: comp.revision.to_string(),
+                    repo: comp.repo.clone().unwrap_or_default(),
+                    revision: comp
+                        .revision
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
                     file: file.clone(),
                 });
             }

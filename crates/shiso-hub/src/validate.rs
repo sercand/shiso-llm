@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::error::HubError;
-use crate::recipe::{CURRENT_SCHEMA_VERSION, Recipe, Role, Variant};
+use crate::recipe::{CURRENT_SCHEMA_VERSION, Provider, Recipe, Role, Variant};
 
 /// External family facts passed to validator to verify a recipe matches engine capabilities.
 #[derive(Debug, Clone, Copy)]
@@ -382,7 +382,7 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
 fn validate_components(variant: &Variant, mode: ValidationMode) -> Result<(), HubError> {
     let mut total_disk_bytes: u64 = 0;
     for (role, comp) in &variant.components {
-        if comp.provider != "huggingface" {
+        if comp.provider != Provider::HuggingFace {
             return Err(HubError::Validation {
                 reason: format!(
                     "variant '{}' role '{}' provider must be 'huggingface', got '{}'",
@@ -393,13 +393,14 @@ fn validate_components(variant: &Variant, mode: ValidationMode) -> Result<(), Hu
             });
         }
 
-        if !comp.repo.contains('/') || comp.repo.starts_with('/') || comp.repo.ends_with('/') {
+        let repo = comp.repo.as_deref().unwrap_or("");
+        if !repo.contains('/') || repo.starts_with('/') || repo.ends_with('/') {
             return Err(HubError::Validation {
                 reason: format!(
                     "variant '{}' role '{}' repo '{}' must be in 'owner/name' format",
                     variant.key.as_str(),
                     role.as_str(),
-                    comp.repo
+                    repo
                 ),
             });
         }
