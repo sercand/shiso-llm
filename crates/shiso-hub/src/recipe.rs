@@ -640,14 +640,18 @@ pub const HUB_FILE_MAX_BYTES: u64 = 1_048_576;
 /// file sharing that directory may not be named.
 pub const RESERVED_MODEL_FILES: [&str; 2] = ["index.json", "benchmarks.json"];
 
-/// Whether `name` can be a hub-hosted file: one plain path segment, not one of
-/// the build's own files.
+/// Whether `name` can be a hub-hosted file: `[A-Za-z0-9][A-Za-z0-9._-]*`,
+/// not one of the build's own files.
+///
+/// Narrower than a path segment on purpose. The name becomes a URL path
+/// segment as-is (so no `?`, `#`, `%` or spaces), a path `git status` prints
+/// unquoted and whitespace-free (so the dirty check can see it), and a file
+/// the static host serves (so no leading dot).
 #[must_use]
 pub fn hub_file_name_ok(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\\'])
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         && !RESERVED_MODEL_FILES.contains(&name)
 }
 

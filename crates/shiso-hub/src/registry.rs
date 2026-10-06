@@ -238,6 +238,17 @@ impl RegistryClient {
             }
         };
 
+        // The index entry names the version its manifest needs, so a manifest
+        // written for a newer client is refused before this client tries to
+        // parse it: a provider or role it has never heard of would otherwise
+        // be a parse error instead of "upgrade shiso".
+        if model_entry.min_shiso_version > *current_shiso_version {
+            return Err(HubError::VersionMismatch {
+                min_version: model_entry.min_shiso_version.to_string(),
+                current_version: current_shiso_version.to_string(),
+            });
+        }
+
         // Verify SHA-256 against the index entry the manifest was resolved from
         let actual_digest = hex::encode(Sha256Hasher::digest(&manifest_bytes));
         if actual_digest != model_entry.manifest_sha256.as_str() {

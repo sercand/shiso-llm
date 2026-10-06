@@ -562,3 +562,28 @@ async fn the_upload_route_refuses_bad_names_and_big_bodies() {
         "nothing was written"
     );
 }
+
+/// A hub file name that is not a plain name is reported, and never read: a
+/// recipe under review cannot point the validator at a file outside its
+/// model's directory.
+#[test]
+fn a_hosted_file_with_an_unsafe_name_is_not_read() {
+    let temp = repo_with_hosted_file(b"198 3037739\n");
+    let outside = temp.path().join("outside.txt");
+    fs::write(&outside, b"secret").unwrap();
+    let recipe_path = temp.path().join("recipes").join("qwen3.8-flash.json");
+    let text = fs::read_to_string(&recipe_path).unwrap();
+    let escaped = format!("../../../../{}", "outside.txt");
+    fs::write(
+        &recipe_path,
+        text.replace("\"draft_vocab_counts.txt\"", &format!("{escaped:?}")),
+    )
+    .unwrap();
+    let reports = editor::validate_all(temp.path()).unwrap();
+    let errors = &reports[0].errors;
+    assert!(!reports[0].valid);
+    assert!(
+        errors.iter().all(|e| !e.contains("on disk")),
+        "the outside file was read: {errors:?}"
+    );
+}

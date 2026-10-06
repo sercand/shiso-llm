@@ -330,22 +330,40 @@ pub(crate) fn check_hosted_files(repo: &Path, recipe: &Recipe) -> Vec<String> {
                 continue;
             }
             for file in &comp.files {
+                // A name the recipe rules refuse is already reported by them,
+                // and is never turned into a path: a recipe under review must
+                // not point the validator at a file outside its directory.
+                if !hub_file_name_ok(&file.name) {
+                    continue;
+                }
                 let path = hosted_file_path(repo, recipe.name.as_str(), &file.name);
                 let what = format!(
                     "variant '{}' role '{role}' hub file '{}'",
                     variant.key.as_str(),
                     file.name
                 );
-                let Ok(bytes) = fs::read(&path) else {
+                let Ok(meta) = fs::metadata(&path) else {
                     errors.push(format!("{what} is missing at {}", path.display()));
                     continue;
                 };
-                let size = bytes.len() as u64;
+                if !meta.is_file() {
+                    errors.push(format!(
+                        "{what} is not a regular file at {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                let size = meta.len();
                 if size > HUB_FILE_MAX_BYTES {
                     errors.push(format!(
                         "{what} is {size} bytes; the hub hosts at most {HUB_FILE_MAX_BYTES}"
                     ));
+                    continue;
                 }
+                let Ok(bytes) = fs::read(&path) else {
+                    errors.push(format!("{what} could not be read at {}", path.display()));
+                    continue;
+                };
                 if size != file.size {
                     errors.push(format!(
                         "{what} size is {size} on disk, {} in the recipe",

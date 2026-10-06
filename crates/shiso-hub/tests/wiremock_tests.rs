@@ -613,3 +613,45 @@ async fn a_corrupt_hub_file_is_a_digest_mismatch_and_leaves_nothing() {
     assert!(!downloader.tmp_dir().join(format!("{sha}.part")).exists());
     assert!(!downloader.blob_path(&file.sha256).exists());
 }
+
+/// A recipe for a newer client that this client cannot even parse (a provider
+/// it has never heard of) still answers "upgrade": the index entry already
+/// says which version it needs.
+#[tokio::test]
+async fn a_recipe_this_client_cannot_parse_still_asks_for_an_upgrade() {
+    use shiso_hub::recipe::IndexModelEntry;
+
+    let server = MockServer::start().await;
+    let manifest = br#"{"schema_version":1,"name":"m","family":"qwen35","min_shiso_version":"99.0.0","description":"d","modalities":{"inputs":["text"],"outputs":["text"]},"features":{},"variants":[{"key":"k","backends":["metal"],"quant":"q","requirements":{"min_ram_bytes":1,"disk_bytes":1},"components":{"base":{"provider":"s3","bucket":"b","files":[{"name":"m.gguf","size":1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}}}]}"#;
+    Mock::given(method("GET"))
+        .and(path("/v1/models/m/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest.as_slice()))
+        .mount(&server)
+        .await;
+    let temp = tempdir().unwrap();
+    let client = RegistryClient::new(HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: RegistryEndpoint {
+            url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+        },
+        hf_endpoint: url::Url::parse("https://huggingface.co").unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    });
+    let entry: IndexModelEntry = serde_json::from_value(serde_json::json!({
+        "name": "m",
+        "family": "qwen35",
+        "min_shiso_version": "99.0.0",
+        "description": "d",
+        "updated_at": "2026-10-05T00:00:00Z",
+        "manifest": "models/m/index.json",
+        "manifest_sha256": hex::encode(Sha256Hasher::digest(manifest)),
+        "variants": [],
+    }))
+    .unwrap();
+    let err = client
+        .fetch_manifest(&entry, &semver::Version::new(0, 2, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HubError::VersionMismatch { .. }), "{err:?}");
+}

@@ -855,3 +855,22 @@ fn the_hub_component_supplies_its_role_through_its_entry() {
         Some("draft_vocab_counts.txt")
     );
 }
+
+#[test]
+fn hub_file_names_are_plain_url_and_git_safe() {
+    for ok in ["draft_vocab_counts.txt", "v1.2-x_y.txt", "A9"] {
+        assert!(hub_file_name_ok(ok), "{ok}");
+    }
+    for bad in [
+        "my vocab.txt",
+        "a?b.txt",
+        "a#b.txt",
+        "%41.txt",
+        ".hidden",
+        "-x.txt",
+        "çok.txt",
+        "a\tb",
+    ] {
+        assert!(!hub_file_name_ok(bad), "{bad:?}");
+    }
+}
