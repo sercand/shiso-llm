@@ -18,6 +18,21 @@ use crate::host::probe_free_disk;
 use crate::progress::ProgressEvent;
 use crate::recipe::{FileEntry, Role, Sha256, Variant};
 
+/// Where one file is downloaded from.
+#[derive(Debug, Clone, Copy)]
+pub enum FileOrigin<'a> {
+    /// `<hf endpoint>/<repo>/resolve/<revision>/<name>`.
+    HuggingFace {
+        /// Repository (`owner/name`).
+        repo: &'a str,
+        /// Commit SHA.
+        revision: &'a str,
+    },
+    /// `<registry url>/models/<model>/<name>`: a file the hub hosts beside the
+    /// model's manifest. No Hugging Face token is ever sent there.
+    Hub,
+}
+
 /// Description of a single file download operation (§5.5).
 #[derive(Debug, Clone)]
 pub struct DownloadFileDesc<'a> {
@@ -27,10 +42,8 @@ pub struct DownloadFileDesc<'a> {
     pub variant_key: &'a str,
     /// Component role.
     pub role: Role,
-    /// Repository (e.g. `owner/name`).
-    pub repo: &'a str,
-    /// Commit SHA.
-    pub revision: &'a str,
+    /// Where the file comes from.
+    pub origin: FileOrigin<'a>,
     /// File entry metadata.
     pub file: &'a FileEntry,
     /// Optional progress event channel.
@@ -40,8 +53,9 @@ pub struct DownloadFileDesc<'a> {
 #[derive(Debug)]
 struct DownloadItem {
     role: Role,
-    repo: String,
-    revision: String,
+    /// The Hugging Face repository and commit; `None` is a hub-hosted file
+    /// (validation guarantees a Hugging Face component has both).
+    hf: Option<(String, String)>,
     file: FileEntry,
 }
 
@@ -70,6 +84,24 @@ impl Downloader {
             .unwrap_or_else(|_| reqwest::Client::new());
 
         Self { client, config }
+    }
+
+    /// The hub URL of `name` beside model `model`'s manifest.
+    ///
+    /// # Errors
+    /// Returns [`HubError::Validation`] if the joined URL does not parse.
+    pub fn hub_file_url(&self, model: &str, name: &str) -> Result<Url, HubError> {
+        let mut base = self.config.registry.url.clone();
+        // `join` replaces the last segment of a base without a trailing
+        // slash, which would drop the registry's `v1`.
+        if !base.path().ends_with('/') {
+            let path = format!("{}/", base.path());
+            base.set_path(&path);
+        }
+        base.join(&format!("models/{model}/{name}"))
+            .map_err(|e| HubError::Validation {
+                reason: format!("invalid hub file URL for '{model}/{name}': {e}"),
+            })
     }
 
     /// Returns the blobs directory (`{home}/blobs/sha256`).
@@ -130,12 +162,9 @@ impl Downloader {
                 }
                 items.push(DownloadItem {
                     role: *role,
-                    repo: comp.repo.clone().unwrap_or_default(),
-                    revision: comp
-                        .revision
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
+                    hf: comp
+                        .hf_source()
+                        .map(|(repo, rev)| (repo.to_string(), rev.to_string())),
                     file: file.clone(),
                 });
             }
@@ -191,8 +220,10 @@ impl Downloader {
                     model_name: &model,
                     variant_key: &variant_key,
                     role: item.role,
-                    repo: &item.repo,
-                    revision: &item.revision,
+                    origin: match &item.hf {
+                        Some((repo, revision)) => FileOrigin::HuggingFace { repo, revision },
+                        None => FileOrigin::Hub,
+                    },
                     file: &item.file,
                     progress_tx: tx.as_ref(),
                 };
@@ -355,16 +386,25 @@ impl Downloader {
         existing_bytes: u64,
         initial_hasher: Sha256Hasher,
     ) -> Result<(), HubError> {
-        let url_str = format!(
-            "{}/{}/resolve/{}/{}",
-            self.config.hf_endpoint.as_str().trim_end_matches('/'),
-            desc.repo,
-            desc.revision,
-            desc.file.name
-        );
-        let url = Url::parse(&url_str).map_err(|e| HubError::Validation {
-            reason: format!("invalid download URL '{url_str}': {e}"),
-        })?;
+        let url = match desc.origin {
+            FileOrigin::HuggingFace { repo, revision } => {
+                let url_str = format!(
+                    "{}/{}/resolve/{}/{}",
+                    self.config.hf_endpoint.as_str().trim_end_matches('/'),
+                    repo,
+                    revision,
+                    desc.file.name
+                );
+                Url::parse(&url_str).map_err(|e| HubError::Validation {
+                    reason: format!("invalid download URL '{url_str}': {e}"),
+                })?
+            }
+            FileOrigin::Hub => self.hub_file_url(desc.model_name, &desc.file.name)?,
+        };
+        // The token belongs to Hugging Face: a hub file never carries it, even
+        // when the registry and the HF endpoint share a host.
+        let send_token = matches!(desc.origin, FileOrigin::HuggingFace { .. })
+            && url.host_str() == self.config.hf_endpoint.host_str();
 
         if let Some(tx) = desc.progress_tx {
             let _ = tx
@@ -380,7 +420,7 @@ impl Downloader {
 
         let mut req = self.client.get(url.clone());
         if let Some(token) = &self.config.hf_token
-            && url.host_str() == self.config.hf_endpoint.host_str()
+            && send_token
         {
             let auth_val = format!("Bearer {}", token.as_str());
             if let Ok(hv) = HeaderValue::from_str(&auth_val) {
@@ -400,8 +440,11 @@ impl Downloader {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(HubError::Auth {
-                repo: desc.repo.to_string(),
-                token_sent: self.config.hf_token.is_some(),
+                repo: match desc.origin {
+                    FileOrigin::HuggingFace { repo, .. } => repo.to_string(),
+                    FileOrigin::Hub => format!("hub:{}/{}", desc.model_name, desc.file.name),
+                },
+                token_sent: send_token && self.config.hf_token.is_some(),
             });
         }
 
