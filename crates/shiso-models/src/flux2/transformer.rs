@@ -31,8 +31,8 @@ use shiso_vision::generator::ImageGenError;
 use super::config::Flux2Params;
 use super::kv_cache::Flux2KvCache;
 use super::ops::{
-    AddGatedCall, ConcatCall, GemmCall, LayerNormCall, ModulateCall, Ops, QkNormCall, Rope4dCall,
-    SdpaCall, SliceExt,
+    GemmCall, LayerNormCall, LinearResidualCall, ModulateCall, Ops, QkNormCall, Rope4dCall,
+    SdpaCall, SliceExt, SwigluInput,
 };
 use super::weights::{Lin, StStore};
 
@@ -704,28 +704,19 @@ impl DiT {
 
         // Attention residual and MLP, image stream, then text stream. The
         // scratch row buffer is sized for whichever stream is longer.
-        let rows = ctx.n_img.max(ctx.t_txt);
-        let tmp = ops.alloc_f32("dit attn proj", rows * h)?;
-        ops.gemm(&GemmCall {
+        ops.linear_residual(&LinearResidualCall {
             step: "dit img proj",
-            out: tmp.view(),
-            input: out_img.view(),
+            residual: ctx.x_img.view(),
+            gate: mod_img.view().cut(2 * h as u64 * 4, h as u64 * 4)?,
+            dense: Some(out_img.view()),
+            dense_cols: h,
+            swiglu: None,
             weight: block.img_proj.w.view(),
             weight_scale: block.img_proj.scale,
             bias: block.img_proj.bias.as_ref().map(DeviceBuffer::view),
+            kind: block.img_proj.kind,
             m: ctx.n_img,
             n: h,
-            k: h,
-            kind: block.img_proj.kind,
-        })?;
-        ops.add_gated(&AddGatedCall {
-            step: "dit img attn residual",
-            out: ctx.x_img.view(),
-            a: ctx.x_img.view(),
-            gate: mod_img.view().cut(2 * h as u64 * 4, h as u64 * 4)?,
-            b: tmp.view(),
-            count: ctx.n_img * h,
-            period: h,
         })?;
         self.mlp(
             ops,
@@ -736,26 +727,19 @@ impl DiT {
             "dit img mlp",
         )?;
 
-        ops.gemm(&GemmCall {
+        ops.linear_residual(&LinearResidualCall {
             step: "dit txt proj",
-            out: tmp.view(),
-            input: out_txt.view(),
+            residual: ctx.x_txt.view(),
+            gate: mod_txt.view().cut(2 * h as u64 * 4, h as u64 * 4)?,
+            dense: Some(out_txt.view()),
+            dense_cols: h,
+            swiglu: None,
             weight: block.txt_proj.w.view(),
             weight_scale: block.txt_proj.scale,
             bias: block.txt_proj.bias.as_ref().map(DeviceBuffer::view),
+            kind: block.txt_proj.kind,
             m: ctx.t_txt,
             n: h,
-            k: h,
-            kind: block.txt_proj.kind,
-        })?;
-        ops.add_gated(&AddGatedCall {
-            step: "dit txt attn residual",
-            out: ctx.x_txt.view(),
-            a: ctx.x_txt.view(),
-            gate: mod_txt.view().cut(2 * h as u64 * 4, h as u64 * 4)?,
-            b: tmp.view(),
-            count: ctx.t_txt * h,
-            period: h,
         })?;
         self.mlp(
             ops,
@@ -896,54 +880,29 @@ impl DiT {
             ctx.kv.num_ref_tokens = ctx.refs;
         }
 
-        // MLP half of linear1: silu(gate) * value, the gate half starting
-        // mid-row at column 3h of the fused buffer.
-        let act = ops.alloc_f32("dit single act", s_total * inner)?;
-        let gate_rows = qkv
-            .view()
-            .cut(3 * h as u64 * 4, (s_total * fused - 3 * h) as u64 * 4)?;
-        ops.swiglu(
-            "dit single swiglu",
-            act.view(),
-            gate_rows,
-            s_total,
-            inner,
-            fused,
-        )?;
-
-        // linear2 reads concat(attn, swiglu) and the block carries a single
-        // gated residual (the reference's output gating).
-        let lin2_in = ops.alloc_f32("dit single lin2 in", s_total * (h + inner))?;
-        ops.concat_rows(&ConcatCall {
-            step: "dit single concat",
-            out: lin2_in.view(),
-            a: attn.view(),
-            b: act.view(),
-            rows: s_total,
-            cols_a: h,
-            cols_b: inner,
-        })?;
-        let tmp = ops.alloc_f32("dit single proj", s_total * h)?;
-        ops.gemm(&GemmCall {
+        // linear2 reads concat(attn, silu(gate) * value) - the gate half
+        // starting mid-row at column 3h of the fused buffer - and the block
+        // carries a single gated residual (the reference's output gating).
+        // One launch: the activation and the concatenation are formed as the
+        // GEMM stages its input and never written out.
+        ops.linear_residual(&LinearResidualCall {
             step: "dit single linear2",
-            out: tmp.view(),
-            input: lin2_in.view(),
+            residual: joint.view(),
+            gate: shared.view().cut(2 * h as u64 * 4, h as u64 * 4)?,
+            dense: Some(attn.view()),
+            dense_cols: h,
+            swiglu: Some(SwigluInput {
+                rows: qkv.view(),
+                stride: fused,
+                offset: 3 * h,
+                inner,
+            }),
             weight: block.linear2.w.view(),
             weight_scale: block.linear2.scale,
             bias: block.linear2.bias.as_ref().map(DeviceBuffer::view),
+            kind: block.linear2.kind,
             m: s_total,
             n: h,
-            k: h + inner,
-            kind: block.linear2.kind,
-        })?;
-        ops.add_gated(&AddGatedCall {
-            step: "dit single residual",
-            out: joint.view(),
-            a: joint.view(),
-            gate: shared.view().cut(2 * h as u64 * 4, h as u64 * 4)?,
-            b: tmp.view(),
-            count: s_total * h,
-            period: h,
         })?;
         Ok(())
     }
@@ -1095,29 +1054,24 @@ impl DiT {
             k: h,
             kind: mlp.fc1.kind,
         })?;
-        let act = ops.alloc_f32(step, tokens * inner)?;
-        ops.swiglu(step, act.view(), fused.view(), tokens, inner, 2 * inner)?;
-        let tmp = ops.alloc_f32(step, tokens * h)?;
-        ops.gemm(&GemmCall {
+        ops.linear_residual(&LinearResidualCall {
             step,
-            out: tmp.view(),
-            input: act.view(),
+            residual: x.view(),
+            gate: mod2.view().cut(5 * h as u64 * 4, h as u64 * 4)?,
+            dense: None,
+            dense_cols: 0,
+            swiglu: Some(SwigluInput {
+                rows: fused.view(),
+                stride: 2 * inner,
+                offset: 0,
+                inner,
+            }),
             weight: mlp.fc2.w.view(),
             weight_scale: mlp.fc2.scale,
             bias: mlp.fc2.bias.as_ref().map(DeviceBuffer::view),
+            kind: mlp.fc2.kind,
             m: tokens,
             n: h,
-            k: inner,
-            kind: mlp.fc2.kind,
-        })?;
-        ops.add_gated(&AddGatedCall {
-            step,
-            out: x.view(),
-            a: x.view(),
-            gate: mod2.view().cut(5 * h as u64 * 4, h as u64 * 4)?,
-            b: tmp.view(),
-            count: tokens * h,
-            period: h,
         })
     }
 }

@@ -17,6 +17,26 @@
 // launches (`GEMM_TILE` in ops.rs).
 #define FLUX2_GEMM_TILE 16u
 
+// The simdgroup-matrix GEMM tile (`kernel_flux2_gemm64_*` and the implicit-
+// GEMM convolution): a 64x64 output tile per threadgroup of 128 threads, four
+// simdgroups each owning a 32x32 quarter, k staged 16 at a time. The driver
+// sends only products whose reduction length is a multiple of the k slice
+// here and everything else to the 16x16 kernels.
+#define FLUX2_G64_TILE 64u
+#define FLUX2_G64_K 16u
+#define FLUX2_G64_THREADS 128u
+
+// The fused attention tile (`kernel_flux2_flash_sdpa_f32`): 32 query rows per
+// threadgroup of four simdgroups (eight rows each), keys streamed 16 at a
+// time, heads up to FLUX2_FA_MAX_D wide in multiples of eight. The driver
+// sends wider or ragged heads to `kernel_flux2_sdpa_f32`.
+#define FLUX2_FA_QROWS 32u
+#define FLUX2_FA_KEYS 16u
+#define FLUX2_FA_MAX_D 128u
+#define FLUX2_FA_THREADS 128u
+
+#define FLUX2_UNROLL _Pragma("clang loop unroll(full)")
+
 // Threads per elementwise threadgroup, as the driver launches it
 // (`BLOCK` in ops.rs). Every reduction here is sized for exactly this.
 #define FLUX2_BLOCK 64u
@@ -52,6 +72,19 @@ static inline float flux2_e4m3(uint b) {
     } else {
         v = (1.0f + float(m) * 0.125f) * exp2(float(e) - 7.0f);
     }
+    return (b & 0x80u) ? -v : v;
+}
+
+/// [`flux2_e4m3`] without branches, for the GEMM tile's staging loads:
+/// normal values are rebuilt as f32 bits directly (exponent rebias 7 -> 127,
+/// mantissa shifted up), subnormals as `m * 2^-9`, the all-ones pattern NaN.
+/// Every byte decodes to the same float the branching form returns.
+static inline float flux2_e4m3_bits(uint b) {
+    const uint e = (b >> 3u) & 0xFu;
+    const uint m = b & 7u;
+    float v = (e == 0u) ? float(m) * 0.001953125f
+                        : as_type<float>(((e + 120u) << 23) | (m << 20));
+    v = (e == 15u && m == 7u) ? NAN : v;
     return (b & 0x80u) ? -v : v;
 }
 
@@ -117,6 +150,22 @@ struct flux2_args_gemm {
     uint32_t m;
     uint32_t n;
     uint32_t k;
+    uint32_t has_bias;
+};
+
+/// A linear fused with what surrounds it in the transformer blocks:
+/// `out[m,n] += gate[n] * (x[m,:] . weight[n,:] * scale + bias[n])`, with
+/// the input row `x = [a (cols_a) | silu(g) * u (inner)]` formed while
+/// staging - `g` at column `gu_offset` of a `gu_stride`-wide row of `gu`,
+/// `u` `inner` columns after it. Either part may be empty; `cols_a` and
+/// `inner` are multiples of four and their sum a multiple of 16.
+struct flux2_args_gemm_fused {
+    uint32_t m;
+    uint32_t n;
+    uint32_t cols_a;
+    uint32_t inner;
+    uint32_t gu_stride;
+    uint32_t gu_offset;
     uint32_t has_bias;
 };
 
@@ -267,6 +316,7 @@ struct flux2_args_embed {
 // same widths, and so does this side so a header-only drift fails the compile.
 static_assert(sizeof(flux2_args_gemm) == 16, "GemmArgs");
 static_assert(sizeof(flux2_args_unary) == 4, "UnaryArgs");
+static_assert(sizeof(flux2_args_gemm_fused) == 28, "GemmFusedArgs");
 static_assert(sizeof(flux2_args_swiglu) == 12, "SwigluArgs");
 static_assert(sizeof(flux2_args_modulate) == 8, "ModulateArgs");
 static_assert(sizeof(flux2_args_add_gated) == 8, "AddGatedArgs");
