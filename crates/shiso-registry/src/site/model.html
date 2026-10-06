@@ -115,7 +115,7 @@
     <summary><code>{{ v.key }}</code> <span class="muted">{{ v.disk }} · {{ v.components|length }} component{{ 's' if v.components|length != 1 }}</span></summary>
     {% if v.server_defaults %}<p class="small">Server defaults: {% for d in v.server_defaults %}<code>{{ d }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
     {% for c in v.components %}
-    <h3>{{ c.role }} <a class="small" href="{{ c.url }}" rel="noopener noreferrer">{{ c.repo }}@{{ c.revision_short }}</a></h3>
+    <h3>{{ c.role }} <a class="small" href="{{ c.url }}" rel="noopener noreferrer">{{ c.label }}</a></h3>
     <div class="table-wrap">
     <table class="compact">
       <thead><tr><th>File</th><th class="num">Size</th><th>SHA-256</th></tr></thead>

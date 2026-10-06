@@ -191,9 +191,8 @@ struct FileView {
 #[derive(Serialize)]
 struct ComponentView {
     role: String,
-    repo: String,
-    revision: String,
-    revision_short: String,
+    /// `owner/name@rev10` for Hugging Face, `hosted on the hub` for the hub.
+    label: String,
     url: String,
     entry: Option<String>,
     files: Vec<FileView>,
@@ -259,16 +258,27 @@ impl VariantView {
                 .components
                 .iter()
                 .map(|(role, c)| {
-                    let (repo, revision) = c
-                        .hf_source()
-                        .map(|(r, v)| (r.to_string(), v.to_string()))
-                        .unwrap_or_default();
+                    let (label, url) = match c.hf_source() {
+                        Some((repo, rev)) => (
+                            format!("{repo}@{}", short(rev.as_str(), 10)),
+                            format!("https://huggingface.co/{repo}/tree/{rev}"),
+                        ),
+                        None => (
+                            "hosted on the hub".to_string(),
+                            // Relative to the model page at models/<name>/.
+                            format!(
+                                "../../registry/v1/models/{model}/{}",
+                                c.entry
+                                    .as_deref()
+                                    .or(c.files.first().map(|f| f.name.as_str()))
+                                    .unwrap_or("")
+                            ),
+                        ),
+                    };
                     ComponentView {
                         role: role.to_string(),
-                        revision_short: short(&revision, 10),
-                        url: format!("https://huggingface.co/{repo}/tree/{revision}"),
-                        repo,
-                        revision,
+                        label,
+                        url,
                         entry: c.entry.clone(),
                         files: c
                             .files

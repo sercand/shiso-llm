@@ -469,3 +469,26 @@ fn an_uncommitted_hosted_file_makes_the_build_dirty() {
     );
     assert!(editor::build_registry(temp.path(), temp.path(), false).is_err());
 }
+
+#[test]
+fn the_model_page_links_a_hosted_file_to_the_hub() {
+    let temp = repo_with_hosted_file(b"198 3037739\n");
+    git(temp.path(), &["init", "-q"]);
+    editor::build_registry(temp.path(), temp.path(), true).unwrap();
+    let page = fs::read_to_string(
+        temp.path()
+            .join("models")
+            .join("qwen3.8-flash")
+            .join("index.html"),
+    )
+    .unwrap();
+    assert!(page.contains("hosted on the hub"), "{page}");
+    assert!(
+        page.contains("registry/v1/models/qwen3.8-flash/draft_vocab_counts.txt"),
+        "{page}"
+    );
+    assert!(
+        page.contains("turboderp/Qwen3.8-Flash-Next-exl3@"),
+        "the HF component keeps its label"
+    );
+}
