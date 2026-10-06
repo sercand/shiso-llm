@@ -377,3 +377,95 @@ fn build_refuses_a_repository_git_cannot_read() {
     let err = editor::build_registry(temp.path(), &out, true).unwrap_err();
     assert!(err.to_string().contains("git"), "{err}");
 }
+
+/// The fixture recipe with a hub-hosted draft vocabulary added to its first
+/// variant, and the file it names written where the hub serves it.
+fn repo_with_hosted_file(contents: &[u8]) -> tempfile::TempDir {
+    let temp = tempdir().unwrap();
+    let recipes_dir = temp.path().join("recipes");
+    fs::create_dir_all(&recipes_dir).unwrap();
+    let mut recipe: shiso_hub::recipe::Recipe =
+        serde_json::from_str(include_str!("../tests/fixtures/qwen3.8-flash.json")).unwrap();
+    let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(contents));
+    recipe.min_shiso_version = serde_json::from_value(serde_json::json!("0.2.0")).unwrap();
+    let variant = &mut recipe.variants[0];
+    variant.components.insert(
+        shiso_hub::recipe::Role::DraftVocab,
+        serde_json::from_value(serde_json::json!({
+            "provider": "shiso", "entry": "draft_vocab_counts.txt",
+            "files": [{"name": "draft_vocab_counts.txt", "size": contents.len(), "sha256": sha}]
+        }))
+        .unwrap(),
+    );
+    variant.requirements.disk_bytes += contents.len() as u64;
+    fs::write(
+        recipes_dir.join("qwen3.8-flash.json"),
+        serde_json::to_string_pretty(&recipe).unwrap(),
+    )
+    .unwrap();
+    let hosted = editor::hosted_file_path(temp.path(), "qwen3.8-flash", "draft_vocab_counts.txt");
+    fs::create_dir_all(hosted.parent().unwrap()).unwrap();
+    fs::write(&hosted, contents).unwrap();
+    temp
+}
+
+#[test]
+fn a_hosted_file_must_match_its_recipe() {
+    let temp = repo_with_hosted_file(b"198 3037739\n");
+    let reports = editor::validate_all(temp.path()).unwrap();
+    assert!(reports.iter().all(|r| r.valid), "{:?}", reports[0].errors);
+
+    let hosted = editor::hosted_file_path(temp.path(), "qwen3.8-flash", "draft_vocab_counts.txt");
+    fs::write(&hosted, b"198 3037740\n").unwrap(); // same size, different bytes
+    let reports = editor::validate_all(temp.path()).unwrap();
+    assert!(
+        reports[0].errors.iter().any(|e| e.contains("sha256")),
+        "{:?}",
+        reports[0].errors
+    );
+
+    fs::write(&hosted, b"198\n").unwrap();
+    let reports = editor::validate_all(temp.path()).unwrap();
+    assert!(
+        reports[0].errors.iter().any(|e| e.contains("size")),
+        "{:?}",
+        reports[0].errors
+    );
+
+    fs::remove_file(&hosted).unwrap();
+    let reports = editor::validate_all(temp.path()).unwrap();
+    assert!(
+        reports[0].errors.iter().any(|e| e.contains("missing")),
+        "{:?}",
+        reports[0].errors
+    );
+}
+
+#[test]
+fn a_build_into_another_directory_carries_the_hosted_file() {
+    let temp = repo_with_hosted_file(b"198 3037739\n");
+    git(temp.path(), &["init", "-q"]);
+    let out = tempdir().unwrap();
+    editor::build_registry(temp.path(), out.path(), true).unwrap();
+    let copied = editor::hosted_file_path(out.path(), "qwen3.8-flash", "draft_vocab_counts.txt");
+    assert_eq!(fs::read(copied).unwrap(), b"198 3037739\n");
+}
+
+#[test]
+fn an_uncommitted_hosted_file_makes_the_build_dirty() {
+    let temp = repo_with_hosted_file(b"198 3037739\n");
+    git(temp.path(), &["init", "-q"]);
+    git(temp.path(), &["add", "recipes"]);
+    git(temp.path(), &["commit", "-qm", "r"]);
+    let status = editor::git_status(temp.path());
+    assert!(status.is_dirty, "the hosted file is untracked");
+    assert!(
+        status
+            .changed_recipes
+            .iter()
+            .any(|f| f.ends_with("draft_vocab_counts.txt")),
+        "{:?}",
+        status.changed_recipes
+    );
+    assert!(editor::build_registry(temp.path(), temp.path(), false).is_err());
+}
