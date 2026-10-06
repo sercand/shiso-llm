@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256 as Sha256Hasher};
 
 use shiso_hub::recipe::{
     CURRENT_SCHEMA_VERSION, HUB_FILE_MAX_BYTES, Index, IndexModelEntry, IndexVariantEntry,
-    ModelName, Provider, RESERVED_MODEL_FILES, Recipe, Sha256,
+    ModelName, Provider, RESERVED_MODEL_FILES, Recipe, Sha256, hub_file_name_ok,
 };
 use shiso_hub::validate::{ValidationMode, validate_recipe};
 
@@ -363,6 +363,44 @@ pub(crate) fn check_hosted_files(repo: &Path, recipe: &Recipe) -> Vec<String> {
         }
     }
     errors
+}
+
+/// A hosted file as written: what the recipe's file entry needs.
+#[derive(Debug, Serialize)]
+pub(crate) struct HostedFile {
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+/// Writes `bytes` as model `model`'s hosted file `name`, after the same checks
+/// the recipe validation applies to it.
+pub(crate) fn write_hosted_file(
+    repo: &Path,
+    model: &str,
+    name: &str,
+    bytes: &[u8],
+) -> anyhow::Result<HostedFile> {
+    ModelName::parse(model).map_err(|e| anyhow::anyhow!("model name '{model}': {e}"))?;
+    if !hub_file_name_ok(name) {
+        bail!(
+            "'{name}' cannot be a hosted file name: one plain name, not index.json or benchmarks.json"
+        );
+    }
+    let size = bytes.len() as u64;
+    if size > HUB_FILE_MAX_BYTES {
+        bail!("'{name}' is {size} bytes; the hub hosts at most {HUB_FILE_MAX_BYTES}");
+    }
+    let path = hosted_file_path(repo, model, name);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&path, bytes)?;
+    Ok(HostedFile {
+        name: name.to_string(),
+        size,
+        sha256: hex::encode(Sha256Hasher::digest(bytes)),
+    })
 }
 
 /// Copies every recipe's hosted files from the repository to a build root

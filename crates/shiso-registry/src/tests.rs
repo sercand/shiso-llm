@@ -492,3 +492,73 @@ fn the_model_page_links_a_hosted_file_to_the_hub() {
         "the HF component keeps its label"
     );
 }
+
+#[tokio::test]
+async fn the_upload_route_writes_a_hosted_file_and_answers_its_digest() {
+    let temp = tempdir().unwrap();
+    let app = build_router(Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        None,
+        8095,
+        temp.path().join("home"),
+    )));
+    let body = b"198 3037739\n".to_vec();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/models/qwen3.8-flash/files/draft_vocab_counts.txt")
+        .header(header::HOST, "127.0.0.1:8095")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["size"], 12);
+    assert_eq!(
+        v["sha256"],
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body))
+    );
+    let path = editor::hosted_file_path(temp.path(), "qwen3.8-flash", "draft_vocab_counts.txt");
+    assert_eq!(fs::read(path).unwrap(), body);
+}
+
+#[tokio::test]
+async fn the_upload_route_refuses_bad_names_and_big_bodies() {
+    let temp = tempdir().unwrap();
+    let app = build_router(Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        None,
+        8095,
+        temp.path().join("home"),
+    )));
+    let put = |uri: &str, body: Vec<u8>| {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8095")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    for uri in [
+        "/api/models/qwen3.8-flash/files/index.json",
+        "/api/models/qwen3.8-flash/files/..",
+        "/api/models/qwen3.8-flash/files/a%2Fb.txt",
+        "/api/models/Not%20A%20Model/files/x.txt",
+    ] {
+        let res = app.clone().oneshot(put(uri, b"x".to_vec())).await.unwrap();
+        assert!(res.status().is_client_error(), "{uri}: {}", res.status());
+    }
+    let big = vec![b'x'; 1_048_577];
+    let res = app
+        .clone()
+        .oneshot(put("/api/models/qwen3.8-flash/files/big.txt", big))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        !temp.path().join("registry").exists(),
+        "nothing was written"
+    );
+}

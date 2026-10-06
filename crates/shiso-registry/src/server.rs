@@ -142,6 +142,11 @@ pub(crate) fn build_router(state: Arc<ServerState>) -> Router {
             get(get_recipe).put(put_recipe).delete(delete_recipe),
         )
         .route("/api/hf/inspect", post(inspect_hf_handler))
+        .route(
+            "/api/models/{model}/files/{file}",
+            axum::routing::put(put_hosted_file_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(HOSTED_FILE_BODY_LIMIT)),
+        )
         .route("/api/validate", post(validate_handler))
         .route("/api/build", post(build_handler))
         .route("/api/git/status", get(git_status_handler))
@@ -293,6 +298,24 @@ async fn inspect_hf_handler(
         .await
         .map_err(internal_error)?;
     Ok(Json(result))
+}
+
+/// The upload route's body limit: the hub's per-file limit, so an oversized
+/// file is refused before it is buffered.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "one mebibyte fits every usize this builds for"
+)]
+const HOSTED_FILE_BODY_LIMIT: usize = shiso_hub::recipe::HUB_FILE_MAX_BYTES as usize;
+
+async fn put_hosted_file_handler(
+    State(state): State<Arc<ServerState>>,
+    AxumPath((model, file)): AxumPath<(String, String)>,
+    body: axum::body::Bytes,
+) -> Result<Json<editor::HostedFile>, (StatusCode, String)> {
+    editor::write_hosted_file(&state.repo, &model, &file, &body)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
 }
 
 async fn validate_handler(
