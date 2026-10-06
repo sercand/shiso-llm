@@ -251,16 +251,18 @@ impl RegistryClient {
         // Deserialize in client mode (ignoring unknown fields for additive changes)
         let recipe: Recipe = serde_json::from_slice(&manifest_bytes)?;
 
-        // Validate basic rules
-        validate_recipe(&recipe, ValidationMode::Client)?;
-
-        // Check min_shiso_version
+        // The version gate first: a recipe written for a newer shiso may use
+        // rules this build does not know, and "upgrade shiso" is the answer
+        // that helps, where a validation message about a rule would not.
         if recipe.min_shiso_version > *current_shiso_version {
             return Err(HubError::VersionMismatch {
                 min_version: recipe.min_shiso_version.to_string(),
                 current_version: current_shiso_version.to_string(),
             });
         }
+
+        // Validate basic rules
+        validate_recipe(&recipe, ValidationMode::Client)?;
 
         Ok(recipe)
     }
