@@ -945,6 +945,34 @@ function addComponentToVariant(vIdx) {
   liveValidateForm();
 }
 
+function setCompProvider(vIdx, role, provider) {
+  const comp = formVariants[vIdx].components[role];
+  comp.provider = provider;
+  if (provider === 'shiso') { delete comp.repo; delete comp.revision; }
+  else { comp.repo = ""; comp.revision = "main"; }
+  comp.files = [];
+  comp.entry = null;
+  delete inspectedCache[inspectedKey(vIdx, role)];
+  renderComponentsList(vIdx);
+  liveValidateForm();
+}
+
+async function uploadHostedFile(vIdx, role, file) {
+  if (!file) return;
+  if (file.size > 1048576) { alert(`${file.name} is ${file.size} bytes; the hub hosts at most 1 MiB.`); return; }
+  const model = buildRecipeObjectFromForm().name;
+  if (!model) { alert("Set the model name first: the file is stored beside that model's index.json."); return; }
+  const res = await api(`/api/models/${encodeURIComponent(model)}/files/${encodeURIComponent(file.name)}`,
+                        { method: 'PUT', body: await file.arrayBuffer() });
+  if (!res.ok) { alert(await res.text()); return; }
+  const entry = await res.json();
+  const comp = formVariants[vIdx].components[role];
+  comp.files = comp.files.filter(f => f.name !== entry.name).concat([entry]);
+  if (!comp.entry) comp.entry = entry.name;
+  renderComponentsList(vIdx);
+  liveValidateForm();
+}
+
 function removeComponentFromVariant(vIdx, role) {
   delete formVariants[vIdx].components[role];
   delete inspectedCache[inspectedKey(vIdx, role)];
@@ -971,6 +999,22 @@ function renderComponentsList(vIdx) {
         ${role !== 'base' ? `<button class="sm danger" onclick="removeComponentFromVariant(${vIdx}, '${role}')">Remove Role</button>` : ''}
       </div>
 
+      <div class="form-group" style="max-width:240px;">
+        <label>Source</label>
+        <select onchange="setCompProvider(${vIdx}, '${role}', this.value)">
+          <option value="huggingface" ${comp.provider === 'huggingface' ? 'selected' : ''}>Hugging Face</option>
+          <option value="shiso" ${comp.provider === 'shiso' ? 'selected' : ''}>shiso hub (files up to 1 MiB)</option>
+        </select>
+      </div>
+
+      ${comp.provider === 'shiso' ? `
+      <!-- Hub-hosted file upload -->
+      <div class="row" style="background:#090b10; border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
+        <div class="col form-group" style="margin-bottom:0;">
+          <label>Add a file the hub hosts (next to the model's index.json)</label>
+          <input type="file" onchange="uploadHostedFile(${vIdx}, '${role}', this.files[0])">
+        </div>
+      </div>` : `
       <!-- Hugging Face Inspector Bar -->
       <div class="row" style="background:#090b10; border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
         <div class="col-2 form-group" style="margin-bottom:0;">
@@ -986,7 +1030,7 @@ function renderComponentsList(vIdx) {
             🔍 Inspect HF Files
           </button>
         </div>
-      </div>
+      </div>`}
 
       <div id="inspector-output-${vIdx}-${role}">
         ${renderComponentSelectedFilesSummary(vIdx, role, comp)}
@@ -1289,15 +1333,19 @@ function liveValidateForm() {
         supplied[f.binds] = f.name;
       }
     }
-    for (const r of ['config', 'ngram']) {
+    for (const r of ['config', 'ngram', 'draft_vocab']) {
       if (r in supplied && !supplied[r]) errors.push(`Variant '${v.key}': role '${r}' must name its file as entry`);
     }
     if (!('base' in supplied) && !('asr' in supplied) && !('image' in supplied)) {
       errors.push(`Variant '${v.key}': requires at least 'base', 'asr', or 'image'`);
     }
     for (const [r, comp] of Object.entries(v.components)) {
-      if (!comp.repo) errors.push(`Variant '${v.key}' role '${r}': repository is empty`);
-      if (comp.files.length === 0) errors.push(`Variant '${v.key}' role '${r}': no files selected`);
+      if (comp.provider === 'shiso') {
+        if (comp.files.length === 0) errors.push(`Variant '${v.key}' role '${r}': no file uploaded`);
+      } else {
+        if (!comp.repo) errors.push(`Variant '${v.key}' role '${r}': repository is empty`);
+        if (comp.files.length === 0) errors.push(`Variant '${v.key}' role '${r}': no files selected`);
+      }
     }
     if (('draft' in supplied) && (!v.server_defaults?.spec_k || v.server_defaults.spec_k <= 0)) {
       errors.push(`Variant '${v.key}': supplies 'draft' so server_defaults.spec_k must be > 0`);

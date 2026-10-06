@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
 use shiso_hub::recipe::{
-    CURRENT_SCHEMA_VERSION, Index, IndexModelEntry, IndexVariantEntry, ModelName, Recipe, Sha256,
+    CURRENT_SCHEMA_VERSION, HUB_FILE_MAX_BYTES, Index, IndexModelEntry, IndexVariantEntry,
+    ModelName, Provider, RESERVED_MODEL_FILES, Recipe, Sha256, hub_file_name_ok,
 };
 use shiso_hub::validate::{ValidationMode, validate_recipe};
 
@@ -144,6 +145,7 @@ pub(crate) fn validate_all(repo_path: &Path) -> anyhow::Result<Vec<RecipeValidat
                 if let Err(e) = validate_recipe(&recipe, ValidationMode::Strict) {
                     errors.push(e.to_string());
                 }
+                errors.extend(check_hosted_files(repo_path, &recipe));
 
                 if let Some(prev) = global_names.insert(name.clone(), rel_file.clone()) {
                     errors.push(format!("model name '{name}' already declared in '{prev}'"));
@@ -312,6 +314,138 @@ pub(crate) fn registry_dir(out_root: &Path) -> PathBuf {
     out_root.join("registry").join("v1")
 }
 
+/// Where a hub-hosted file lives under a repository or build root: beside the
+/// model's manifest, so the static host serves it from the same place.
+pub(crate) fn hosted_file_path(root: &Path, model: &str, name: &str) -> PathBuf {
+    registry_dir(root).join("models").join(model).join(name)
+}
+
+/// Every problem with a recipe's hub-hosted files as committed in `repo`:
+/// missing, a different size, a different digest, or over the hub's limit.
+pub(crate) fn check_hosted_files(repo: &Path, recipe: &Recipe) -> Vec<String> {
+    let mut errors = Vec::new();
+    for variant in &recipe.variants {
+        for (role, comp) in &variant.components {
+            if comp.provider != Provider::Shiso {
+                continue;
+            }
+            for file in &comp.files {
+                // A name the recipe rules refuse is already reported by them,
+                // and is never turned into a path: a recipe under review must
+                // not point the validator at a file outside its directory.
+                if !hub_file_name_ok(&file.name) {
+                    continue;
+                }
+                let path = hosted_file_path(repo, recipe.name.as_str(), &file.name);
+                let what = format!(
+                    "variant '{}' role '{role}' hub file '{}'",
+                    variant.key.as_str(),
+                    file.name
+                );
+                let Ok(meta) = fs::metadata(&path) else {
+                    errors.push(format!("{what} is missing at {}", path.display()));
+                    continue;
+                };
+                if !meta.is_file() {
+                    errors.push(format!(
+                        "{what} is not a regular file at {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                let size = meta.len();
+                if size > HUB_FILE_MAX_BYTES {
+                    errors.push(format!(
+                        "{what} is {size} bytes; the hub hosts at most {HUB_FILE_MAX_BYTES}"
+                    ));
+                    continue;
+                }
+                let Ok(bytes) = fs::read(&path) else {
+                    errors.push(format!("{what} could not be read at {}", path.display()));
+                    continue;
+                };
+                if size != file.size {
+                    errors.push(format!(
+                        "{what} size is {size} on disk, {} in the recipe",
+                        file.size
+                    ));
+                }
+                let digest = hex::encode(Sha256Hasher::digest(&bytes));
+                if digest != file.sha256.as_str() {
+                    errors.push(format!(
+                        "{what} sha256 is {digest} on disk, {} in the recipe",
+                        file.sha256.as_str()
+                    ));
+                }
+            }
+        }
+    }
+    errors
+}
+
+/// A hosted file as written: what the recipe's file entry needs.
+#[derive(Debug, Serialize)]
+pub(crate) struct HostedFile {
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+/// Writes `bytes` as model `model`'s hosted file `name`, after the same checks
+/// the recipe validation applies to it.
+pub(crate) fn write_hosted_file(
+    repo: &Path,
+    model: &str,
+    name: &str,
+    bytes: &[u8],
+) -> anyhow::Result<HostedFile> {
+    ModelName::parse(model).map_err(|e| anyhow::anyhow!("model name '{model}': {e}"))?;
+    if !hub_file_name_ok(name) {
+        bail!(
+            "'{name}' cannot be a hosted file name: one plain name, not index.json or benchmarks.json"
+        );
+    }
+    let size = bytes.len() as u64;
+    if size > HUB_FILE_MAX_BYTES {
+        bail!("'{name}' is {size} bytes; the hub hosts at most {HUB_FILE_MAX_BYTES}");
+    }
+    let path = hosted_file_path(repo, model, name);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&path, bytes)?;
+    Ok(HostedFile {
+        name: name.to_string(),
+        size,
+        sha256: hex::encode(Sha256Hasher::digest(bytes)),
+    })
+}
+
+/// Copies every recipe's hosted files from the repository to a build root
+/// that is somewhere else; with the default root they are already in place.
+fn copy_hosted_files(repo_path: &Path, out_root: &Path, recipes: &[Recipe]) -> anyhow::Result<()> {
+    if fs::canonicalize(repo_path).ok() == fs::canonicalize(out_root).ok() {
+        return Ok(());
+    }
+    for recipe in recipes {
+        for comp in recipe.variants.iter().flat_map(|v| v.components.values()) {
+            if comp.provider != Provider::Shiso {
+                continue;
+            }
+            for file in &comp.files {
+                let from = hosted_file_path(repo_path, recipe.name.as_str(), &file.name);
+                let to = hosted_file_path(out_root, recipe.name.as_str(), &file.name);
+                if let Some(dir) = to.parent() {
+                    fs::create_dir_all(dir)?;
+                }
+                fs::copy(&from, &to)
+                    .with_context(|| format!("copying hosted file {}", from.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A model's manifest path relative to the registry base, as the index
 /// carries it.
 pub(crate) fn manifest_rel(name: &ModelName) -> String {
@@ -356,7 +490,7 @@ pub(crate) fn build_registry(
     let status = git_status(repo_path);
     if status.is_dirty && !allow_dirty {
         bail!(
-            "Build refused: uncommitted changes exist under recipes/:\n  {}\nCommit your changes so Git timestamps are accurate, or pass --allow-dirty.",
+            "Build refused: uncommitted changes exist under recipes/ or in hosted files:\n  {}\nCommit your changes so Git timestamps are accurate, or pass --allow-dirty.",
             status.changed_recipes.join("\n  ")
         );
     }
@@ -383,6 +517,7 @@ pub(crate) fn build_registry(
 
     let registry = registry_dir(out_root);
     let manifest_paths = write_registry(&registry, &recipes, &benchmarks)?;
+    copy_hosted_files(repo_path, out_root, &recipes)?;
     let (site_files, missing_cards) = write_site(repo_path, out_root, &recipes, &benchmarks)?;
 
     let names: Vec<&str> = recipes.iter().map(|r| r.name.as_str()).collect();
@@ -572,11 +707,29 @@ fn prune_models_dir(
     Ok(removed)
 }
 
+/// Whether a `git status --porcelain=v2` line is about a hosted file: a file
+/// under a model's registry directory other than the build's own.
+fn touches_hosted_file(line: &str) -> bool {
+    line.split_whitespace().last().is_some_and(|path| {
+        path.strip_prefix("registry/v1/models/")
+            .is_some_and(|rest| {
+                rest.rsplit('/')
+                    .next()
+                    .is_some_and(|name| rest.contains('/') && !RESERVED_MODEL_FILES.contains(&name))
+            })
+    })
+}
+
 /// Runs `git status` to detect branch name and changed recipes (§7.2).
 #[must_use]
 pub(crate) fn git_status(repo_path: &Path) -> GitStatusResult {
     let output = Command::new("git")
-        .args(["status", "--porcelain=v2", "--branch"])
+        .args([
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=all",
+        ])
         .current_dir(repo_path)
         .output();
 
@@ -588,7 +741,7 @@ pub(crate) fn git_status(repo_path: &Path) -> GitStatusResult {
         for line in text.lines() {
             if let Some(b) = line.strip_prefix("# branch.head ") {
                 branch = b.trim().to_string();
-            } else if line.contains("recipes/") {
+            } else if line.contains("recipes/") || touches_hosted_file(line) {
                 let parts: Vec<_> = line.split_whitespace().collect();
                 if let Some(file) = parts.last() {
                     changed.push(file.to_string());

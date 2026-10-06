@@ -11,7 +11,7 @@ use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use shiso_hub::config::{HfToken, HubConfig, RegistryEndpoint};
-use shiso_hub::download::{DownloadFileDesc, Downloader};
+use shiso_hub::download::{DownloadFileDesc, Downloader, FileOrigin};
 use shiso_hub::error::HubError;
 use shiso_hub::recipe::{FileEntry, Role, Sha256};
 use shiso_hub::registry::RegistryClient;
@@ -79,8 +79,10 @@ async fn cross_host_redirect_strips_authorization() {
             model_name: "test-model",
             variant_key: "var",
             role: Role::Base,
-            repo: "redirect",
-            revision: "cross",
+            origin: FileOrigin::HuggingFace {
+                repo: "redirect",
+                revision: "cross",
+            },
             file: &file_entry,
             progress_tx: None,
         })
@@ -143,8 +145,10 @@ async fn same_host_redirect_preserves_authorization() {
             model_name: "m",
             variant_key: "v",
             role: Role::Base,
-            repo: "shiso",
-            revision: "commit",
+            origin: FileOrigin::HuggingFace {
+                repo: "shiso",
+                revision: "commit",
+            },
             file: &file_entry,
             progress_tx: None,
         })
@@ -244,8 +248,10 @@ async fn bit_flip_leads_to_digest_mismatch_and_cleanup() {
             model_name: "m",
             variant_key: "v",
             role: Role::Base,
-            repo: "repo",
-            revision: "sha",
+            origin: FileOrigin::HuggingFace {
+                repo: "repo",
+                revision: "sha",
+            },
             file: &file_entry,
             progress_tx: None,
         })
@@ -312,8 +318,10 @@ async fn range_resume_appends() {
             model_name: "m",
             variant_key: "v",
             role: Role::Base,
-            repo: "repo",
-            revision: "sha",
+            origin: FileOrigin::HuggingFace {
+                repo: "repo",
+                revision: "sha",
+            },
             file: &file_entry,
             progress_tx: None,
         })
@@ -372,8 +380,10 @@ async fn concurrent_pulls_single_download() {
                 model_name: "m",
                 variant_key: "v1",
                 role: Role::Base,
-                repo: "repo",
-                revision: "sha",
+                origin: FileOrigin::HuggingFace {
+                    repo: "repo",
+                    revision: "sha",
+                },
                 file: &f1,
                 progress_tx: None,
             })
@@ -384,8 +394,10 @@ async fn concurrent_pulls_single_download() {
                 model_name: "m",
                 variant_key: "v2",
                 role: Role::Base,
-                repo: "repo",
-                revision: "sha",
+                origin: FileOrigin::HuggingFace {
+                    repo: "repo",
+                    revision: "sha",
+                },
                 file: &f2,
                 progress_tx: None,
             })
@@ -459,4 +471,187 @@ async fn manifest_is_fetched_from_the_index_path() {
             .unwrap_err();
         assert!(err.to_string().contains("manifest path"), "{bad}: {err}");
     }
+}
+
+/// A manifest written for a newer client that this client's rules would also
+/// refuse (a hub component carrying a `repo`): the answer is "upgrade", not
+/// the rule.
+#[tokio::test]
+async fn a_recipe_for_a_newer_client_asks_for_an_upgrade() {
+    use shiso_hub::recipe::IndexModelEntry;
+
+    let server = MockServer::start().await;
+    let manifest = br#"{"schema_version":1,"name":"m","family":"qwen35","min_shiso_version":"99.0.0","description":"d","modalities":{"inputs":["text"],"outputs":["text"]},"features":{},"variants":[{"key":"k","backends":["metal"],"quant":"q","requirements":{"min_ram_bytes":1,"disk_bytes":2},"server_defaults":{"spec_k":4},"components":{"base":{"provider":"huggingface","repo":"o/n","revision":"0123456789abcdef0123456789abcdef01234567","entry":"m.gguf","files":[{"name":"m.gguf","size":1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]},"draft_vocab":{"provider":"shiso","repo":"o/r","entry":"v.txt","files":[{"name":"v.txt","size":1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}}}]}"#;
+    Mock::given(method("GET"))
+        .and(path("/v1/models/m/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest.as_slice()))
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let client = RegistryClient::new(HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: RegistryEndpoint {
+            url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+        },
+        hf_endpoint: url::Url::parse("https://huggingface.co").unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    });
+    let entry: IndexModelEntry = serde_json::from_value(serde_json::json!({
+        "name": "m",
+        "family": "qwen35",
+        "min_shiso_version": "99.0.0",
+        "description": "d",
+        "updated_at": "2026-10-05T00:00:00Z",
+        "manifest": "models/m/index.json",
+        "manifest_sha256": hex::encode(Sha256Hasher::digest(manifest)),
+        "variants": [],
+    }))
+    .unwrap();
+
+    let err = client
+        .fetch_manifest(&entry, &semver::Version::new(0, 2, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HubError::VersionMismatch { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_hub_file_is_fetched_beside_the_manifest_without_a_token() {
+    let server = MockServer::start().await;
+    let payload = b"198 3037739\n11 1468292\n";
+    let sha = hex::encode(Sha256Hasher::digest(payload));
+    // Any request carrying a token fails the test.
+    Mock::given(method("GET"))
+        .and(path("/v1/models/qwen-test/draft_vocab_counts.txt"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models/qwen-test/draft_vocab_counts.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let config = HubConfig {
+        home: temp.path().to_path_buf(),
+        // No trailing slash on purpose: the join must still land under /v1/.
+        registry: RegistryEndpoint {
+            url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+        },
+        // Same host as the registry, and a token: the token must still stay home.
+        hf_endpoint: url::Url::parse(&server.uri()).unwrap(),
+        hf_token: Some(HfToken::new("secret-token")),
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    };
+    let downloader = Downloader::new(config);
+    let file = FileEntry {
+        name: "draft_vocab_counts.txt".to_string(),
+        size: payload.len() as u64,
+        sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
+    };
+    downloader
+        .download_file(DownloadFileDesc {
+            model_name: "qwen-test",
+            variant_key: "v",
+            role: Role::DraftVocab,
+            origin: FileOrigin::Hub,
+            file: &file,
+            progress_tx: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read(downloader.blob_path(&file.sha256)).unwrap(),
+        payload
+    );
+}
+
+#[tokio::test]
+async fn a_corrupt_hub_file_is_a_digest_mismatch_and_leaves_nothing() {
+    let server = MockServer::start().await;
+    let payload = b"good";
+    let sha = hex::encode(Sha256Hasher::digest(payload));
+    Mock::given(method("GET"))
+        .and(path("/v1/models/m/f.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bad!".as_slice()))
+        .mount(&server)
+        .await;
+    let temp = tempdir().unwrap();
+    let downloader = Downloader::new(HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: RegistryEndpoint {
+            url: url::Url::parse(&format!("{}/v1/", server.uri())).unwrap(),
+        },
+        hf_endpoint: url::Url::parse("https://hf.invalid").unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    });
+    let file = FileEntry {
+        name: "f.txt".to_string(),
+        size: 4,
+        sha256: Sha256::parse(&sha).unwrap(),
+        binds: None,
+    };
+    let err = downloader
+        .download_file(DownloadFileDesc {
+            model_name: "m",
+            variant_key: "v",
+            role: Role::DraftVocab,
+            origin: FileOrigin::Hub,
+            file: &file,
+            progress_tx: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HubError::DigestMismatch { .. }), "{err:?}");
+    assert!(!downloader.tmp_dir().join(format!("{sha}.part")).exists());
+    assert!(!downloader.blob_path(&file.sha256).exists());
+}
+
+/// A recipe for a newer client that this client cannot even parse (a provider
+/// it has never heard of) still answers "upgrade": the index entry already
+/// says which version it needs.
+#[tokio::test]
+async fn a_recipe_this_client_cannot_parse_still_asks_for_an_upgrade() {
+    use shiso_hub::recipe::IndexModelEntry;
+
+    let server = MockServer::start().await;
+    let manifest = br#"{"schema_version":1,"name":"m","family":"qwen35","min_shiso_version":"99.0.0","description":"d","modalities":{"inputs":["text"],"outputs":["text"]},"features":{},"variants":[{"key":"k","backends":["metal"],"quant":"q","requirements":{"min_ram_bytes":1,"disk_bytes":1},"components":{"base":{"provider":"s3","bucket":"b","files":[{"name":"m.gguf","size":1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}}}]}"#;
+    Mock::given(method("GET"))
+        .and(path("/v1/models/m/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest.as_slice()))
+        .mount(&server)
+        .await;
+    let temp = tempdir().unwrap();
+    let client = RegistryClient::new(HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: RegistryEndpoint {
+            url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+        },
+        hf_endpoint: url::Url::parse("https://huggingface.co").unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    });
+    let entry: IndexModelEntry = serde_json::from_value(serde_json::json!({
+        "name": "m",
+        "family": "qwen35",
+        "min_shiso_version": "99.0.0",
+        "description": "d",
+        "updated_at": "2026-10-05T00:00:00Z",
+        "manifest": "models/m/index.json",
+        "manifest_sha256": hex::encode(Sha256Hasher::digest(manifest)),
+        "variants": [],
+    }))
+    .unwrap();
+    let err = client
+        .fetch_manifest(&entry, &semver::Version::new(0, 2, 0))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HubError::VersionMismatch { .. }), "{err:?}");
 }

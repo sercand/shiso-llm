@@ -555,7 +555,7 @@ pub fn load_model(
                 backend,
                 path,
                 args.draft_model.as_deref(),
-                args.draft_vocab.as_deref(),
+                draft_vocab_of(args),
                 &family,
                 sparse_options(args, opts, backend)?,
             )
@@ -932,6 +932,16 @@ pub fn draft_manifest(args: &ServeArgs) -> Result<Option<MtpManifest>, CoreError
 ///
 /// [`FactoryError::PrefillTooWide`] for a prefill width past the widest pass
 /// the stack can be built with.
+/// The draft vocabulary a load narrows the draft head with, said once in the
+/// log: nothing else shows the narrowing except the speed.
+fn draft_vocab_of(args: &ServeArgs) -> Option<&Path> {
+    let path = args.draft_vocab.as_deref();
+    if let Some(path) = path {
+        tracing::info!(path = %path.display(), "narrowed the draft head's vocabulary");
+    }
+    path
+}
+
 fn sparse_options(
     args: &ServeArgs,
     engine: EngineOptions,
@@ -1065,7 +1075,7 @@ fn load_qwen4exp_nvfp4(
             slots,
             reserve,
             draft: args.spec_k > 0,
-            counts: args.draft_vocab.as_deref(),
+            counts: draft_vocab_of(args),
         },
     )
     .map_err(FactoryError::Load)?;
@@ -1113,7 +1123,7 @@ fn load_qwen4exp_exl3(
         ngram,
         config,
         args.spec_k > 0,
-        args.draft_vocab.as_deref(),
+        draft_vocab_of(args),
         sparse_options(args, opts, backend)?,
     )
     .map_err(FactoryError::Load)?;

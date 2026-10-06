@@ -191,9 +191,8 @@ struct FileView {
 #[derive(Serialize)]
 struct ComponentView {
     role: String,
-    repo: String,
-    revision: String,
-    revision_short: String,
+    /// `owner/name@rev10` for Hugging Face, `hosted on the hub` for the hub.
+    label: String,
     url: String,
     entry: Option<String>,
     files: Vec<FileView>,
@@ -258,24 +257,41 @@ impl VariantView {
             components: v
                 .components
                 .iter()
-                .map(|(role, c)| ComponentView {
-                    role: role.to_string(),
-                    repo: c.repo.clone(),
-                    revision: c.revision.to_string(),
-                    revision_short: short(c.revision.as_str(), 10),
-                    url: format!("https://huggingface.co/{}/tree/{}", c.repo, c.revision),
-                    entry: c.entry.clone(),
-                    files: c
-                        .files
-                        .iter()
-                        .map(|f| FileView {
-                            name: f.name.clone(),
-                            size: gib(f.size),
-                            sha: f.sha256.to_string(),
-                            sha_short: short(f.sha256.as_str(), 12),
-                            binds: f.binds.map(|b| b.to_string()),
-                        })
-                        .collect(),
+                .map(|(role, c)| {
+                    let (label, url) = match c.hf_source() {
+                        Some((repo, rev)) => (
+                            format!("{repo}@{}", short(rev.as_str(), 10)),
+                            format!("https://huggingface.co/{repo}/tree/{rev}"),
+                        ),
+                        None => (
+                            "hosted on the hub".to_string(),
+                            // Relative to the model page at models/<name>/.
+                            format!(
+                                "../../registry/v1/models/{model}/{}",
+                                c.entry
+                                    .as_deref()
+                                    .or(c.files.first().map(|f| f.name.as_str()))
+                                    .unwrap_or("")
+                            ),
+                        ),
+                    };
+                    ComponentView {
+                        role: role.to_string(),
+                        label,
+                        url,
+                        entry: c.entry.clone(),
+                        files: c
+                            .files
+                            .iter()
+                            .map(|f| FileView {
+                                name: f.name.clone(),
+                                size: gib(f.size),
+                                sha: f.sha256.to_string(),
+                                sha_short: short(f.sha256.as_str(), 12),
+                                binds: f.binds.map(|b| b.to_string()),
+                            })
+                            .collect(),
+                    }
                 })
                 .collect(),
             server_defaults,
