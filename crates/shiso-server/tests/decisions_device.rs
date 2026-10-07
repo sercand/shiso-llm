@@ -276,6 +276,14 @@ async fn post_json(state: &Arc<AppState>, path: &str, body: &Value) -> Value {
 /// string-keyed map the official choice and score shapes carry (the map's
 /// insertion order is the label order).
 fn probabilities(answer: &Value) -> Vec<f64> {
+    if answer["type"] == "predicate" {
+        // The official predicate carries only P(yes); the complement is the
+        // other label's share of the same row.
+        let yes = answer["probability"]
+            .as_f64()
+            .expect("a predicate carries its probability");
+        return vec![yes, 1.0 - yes];
+    }
     let field = &answer["probabilities"];
     let values: Vec<&Value> = match (field.as_array(), field.as_object()) {
         (Some(array), _) => array.iter().collect(),
@@ -284,8 +292,26 @@ fn probabilities(answer: &Value) -> Vec<f64> {
     };
     values
         .into_iter()
-        .map(|p| p.as_f64().expect("a probability is a number"))
+        .map(|entry| match entry.as_object() {
+            // The decisions surface spells probabilities as
+            // `{value, probability}` pairs; systemone keeps plain numbers.
+            Some(object) => object["probability"]
+                .as_f64()
+                .expect("a probability entry carries its number"),
+            None => entry.as_f64().expect("a probability is a number"),
+        })
         .collect()
+}
+
+/// The answer of one question name, read from the answers array.
+fn answer_of(body: &Value, name: &str) -> Value {
+    body["answers"]
+        .as_array()
+        .expect("answers is an array")
+        .iter()
+        .find(|entry| entry["name"] == json!(name))
+        .cloned()
+        .unwrap_or_else(|| panic!("no answer named {name}: {body}"))
 }
 
 /// The shape every answer must have whatever the model thought: the
@@ -338,15 +364,19 @@ const TICKET: &str = "The login page shows a spinner forever after entering the 
 
 fn choice_question() -> Value {
     json!({
-        "id": "kind", "type": "choice", "question": "What kind of report is this?",
-        "options": ["a bug", "a feature request", "a question about billing"],
+        "name": "kind", "type": "choice", "instructions": "What kind of report is this?",
+        "choices": ["a bug", "a feature request", "a question about billing"],
     })
 }
 
 fn score_question() -> Value {
     json!({
-        "id": "urgency", "type": "score", "question": "How urgent is this report?",
-        "levels": ["not urgent", "moderately urgent", "urgent"],
+        "name": "urgency", "type": "score", "instructions": "How urgent is this report?",
+        "levels": [
+            {"label": "not urgent"},
+            {"label": "moderately urgent"},
+            {"label": "urgent"},
+        ],
     })
 }
 
@@ -358,41 +388,45 @@ async fn decisions(state: &Arc<AppState>) {
         &json!({
             "input": TICKET,
             "questions": [choice_question(), score_question(),
-                          {"id": "billing", "type": "yes_no",
-                           "question": "Is this about billing?"}],
+                          {"name": "billing", "type": "predicate",
+                           "instructions": "Is this about billing?"}],
         }),
     )
     .await;
     assert_eq!(body["object"], "decisions", "{body}");
     assert_eq!(body["prompt_format_version"], 1, "{body}");
 
-    let kind = &body["answers"]["kind"];
+    let kind = answer_of(&body, "kind");
     assert_eq!(kind["type"], "choice", "{body}");
     assert_eq!(
         kind["choice"], "a bug",
         "the obvious reading of the ticket wins the argmax: {body}"
     );
-    check_shape(kind, "label_mass", "decisions/kind");
+    check_shape(&kind, "label_mass", "decisions/kind");
 
-    let urgency = &body["answers"]["urgency"];
+    let urgency = answer_of(&body, "urgency");
     assert_eq!(urgency["type"], "score", "{body}");
-    check_score_range(urgency, "decisions/urgency");
-    check_shape(urgency, "label_mass", "decisions/urgency");
+    check_score_range(&urgency, "decisions/urgency");
+    check_shape(&urgency, "label_mass", "decisions/urgency");
 
-    let billing = &body["answers"]["billing"];
-    assert_eq!(billing["type"], "yes_no", "{body}");
-    assert_eq!(
-        billing["answer"], "no",
-        "the ticket is not about billing: {body}"
+    let billing = answer_of(&body, "billing");
+    assert_eq!(billing["type"], "predicate", "{body}");
+    let probability = billing["probability"]
+        .as_f64()
+        .expect("a predicate carries its probability");
+    assert!(
+        probability < 0.5,
+        "the predicate answered yes ({probability}) to a ticket that is not \
+         about billing: {body}"
     );
-    check_shape(billing, "label_mass", "decisions/billing");
+    check_shape(&billing, "label_mass", "decisions/billing");
 
-    let prompt_tokens = body["usage"]["prompt_tokens"]
+    let prompt_tokens = body["usage"]["input_tokens"]
         .as_u64()
         .expect("the accounting counts the prompts");
     assert!(prompt_tokens > 0, "three prefills counted nothing: {body}");
     assert_eq!(
-        body["usage"]["completion_tokens"], 0,
+        body["usage"]["output_tokens"], 0,
         "nothing was generated on this surface: {body}"
     );
     say("ok: /v1/decisions answered the ticket from a real model");
@@ -564,15 +598,14 @@ async fn a_vision_ticket_answers_through_decisions() {
     let state = Arc::clone(&stack.state);
 
     let ticket = "The app looks broken on my phone, look at the screenshot.";
-    let question = json!({"id": "spinner", "type": "yes_no",
-                          "question": "Does the screenshot show a stuck spinner?"});
+    let question = json!({"name": "spinner", "type": "predicate",
+                          "instructions": "Does the screenshot show a stuck spinner?"});
     let picture = json!({
-        "type": "image",
-        "source": {
-            "type": "base64",
-            "media_type": "image/png",
-            "data": base64::engine::general_purpose::STANDARD.encode(screenshot_png()),
-        },
+        "type": "input_image",
+        "image_url": format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(screenshot_png())
+        ),
     });
 
     let session = async {
@@ -580,16 +613,17 @@ async fn a_vision_ticket_answers_through_decisions() {
             &state,
             "/v1/decisions",
             &json!({
-                "input": [{"type": "text", "text": ticket}, picture],
+                "input": [{"role": "user", "content": [
+                    json!({"type": "input_text", "text": ticket}), picture]}],
                 "questions": [question.clone()],
             }),
         )
         .await;
         assert_eq!(with_picture["object"], "decisions", "{with_picture}");
         assert_eq!(with_picture["prompt_format_version"], 1, "{with_picture}");
-        let answer = &with_picture["answers"]["spinner"];
-        assert_eq!(answer["type"], "yes_no", "{with_picture}");
-        check_shape(answer, "label_mass", "decisions-vision/spinner");
+        let answer = answer_of(&with_picture, "spinner");
+        assert_eq!(answer["type"], "predicate", "{with_picture}");
+        check_shape(&answer, "label_mass", "decisions-vision/spinner");
 
         // The same request with the picture dropped: the expanded pads are
         // billed, so the media request must cost strictly more prompt tokens
@@ -606,7 +640,7 @@ async fn a_vision_ticket_answers_through_decisions() {
         )
         .await;
         let billed = |body: &Value| {
-            body["usage"]["prompt_tokens"]
+            body["usage"]["input_tokens"]
                 .as_u64()
                 .expect("the accounting counts the prompts")
         };
