@@ -86,12 +86,13 @@ impl<'de> Deserialize<'de> for OptionOrChoice {
 impl OptionOrChoice {
     /// The option as the core renders and validates it.
     pub(crate) fn into_option(self) -> ChoiceOption {
-        match self {
-            Self::Bare(name) => ChoiceOption {
-                name,
-                description: None,
-            },
-            Self::Detailed { name, description } => ChoiceOption { name, description },
+        let (name, description) = match self {
+            Self::Bare(name) => (name, None),
+            Self::Detailed { name, description } => (name, description),
+        };
+        ChoiceOption {
+            value: core::ChoiceValue::Str(name),
+            description,
         }
     }
 }
@@ -220,7 +221,15 @@ impl DecisionsBody {
                     refuse_fields_other_than(&question, &["question", "levels"])?;
                     let text = core::question_text(question.question.as_ref());
                     core::check_question_text(&text, &question.id, false)?;
-                    let levels = question.levels.unwrap_or_default();
+                    let levels = question
+                        .levels
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|label| core::ScoreLevel {
+                            label,
+                            description: None,
+                        })
+                        .collect::<Vec<_>>();
                     core::check_score_levels(&levels, &question.id, 2)?;
                     Kind::Score {
                         question: text,

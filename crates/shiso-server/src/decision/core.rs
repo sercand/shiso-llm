@@ -30,12 +30,51 @@ use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
 use crate::tokenizer::{AddedSeam, Vocabulary};
 
+/// The value of a choice option, typed as the official wire types it: a
+/// string and a boolean with the same text are distinct options, so the
+/// answer can echo the value back with the type the caller sent.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ChoiceValue {
+    /// A string value, spelled verbatim on the option's line.
+    Str(String),
+    /// A boolean value, spelled `true`/`false` on the option's line.
+    Bool(bool),
+}
+
+impl ChoiceValue {
+    /// The text the option's line spells for this value.
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::Str(text) => text.clone(),
+            Self::Bool(value) => value.to_string(),
+        }
+    }
+
+    /// The value as JSON, for an answer that echoes it back with its type.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Str(text) => serde_json::Value::String(text.clone()),
+            Self::Bool(value) => serde_json::Value::Bool(*value),
+        }
+    }
+}
+
+/// One level of a score question: the name the digit line spells, and the
+/// wording shown after `" - "` when non-blank.
+#[derive(Debug, Clone)]
+pub(crate) struct ScoreLevel {
+    /// The level's label: what follows the digit on its line.
+    pub label: String,
+    /// Extra wording, shown when non-blank.
+    pub description: Option<String>,
+}
+
 /// One option of a choice question.
 #[derive(Debug, Clone)]
 pub(crate) struct ChoiceOption {
-    /// The option's name: what follows the letter on its line, and what the
-    /// caller reads the answer back as.
-    pub name: String,
+    /// The option's value: what follows the letter on its line, and what the
+    /// caller reads the answer back as (with its type).
+    pub value: ChoiceValue,
     /// Extra wording shown after `" - "` when non-blank.
     pub description: Option<String>,
 }
@@ -54,8 +93,8 @@ pub(crate) enum Kind {
     Score {
         /// The line above the levels; the line is dropped when blank.
         question: String,
-        /// The level names, indexed from zero.
-        levels: Vec<String>,
+        /// The levels, indexed from zero.
+        levels: Vec<ScoreLevel>,
     },
     /// A binary judgement; the answer is `yes` or `no`.
     YesNo {
@@ -135,7 +174,7 @@ pub(crate) fn question_block(kind: &Kind, labels: &[String]) -> String {
                 lines.push(format!("Question: {question}"));
             }
             for (option, label) in options.iter().zip(labels) {
-                let mut line = format!("{label}: {}", option.name);
+                let mut line = format!("{label}: {}", option.value.text());
                 if let Some(description) = option
                     .description
                     .as_deref()
@@ -161,7 +200,16 @@ pub(crate) fn question_block(kind: &Kind, labels: &[String]) -> String {
                 lines.push(format!("Question: {question}"));
             }
             for (level, label) in levels.iter().zip(score_labels(levels.len())) {
-                lines.push(format!("{label}: {level}"));
+                let mut line = format!("{label}: {}", level.label);
+                if let Some(description) = level
+                    .description
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    line.push_str(" - ");
+                    line.push_str(description);
+                }
+                lines.push(line);
             }
             lines.push("Answer with the number of one level only.".to_string());
             lines.join("\n")
@@ -352,11 +400,12 @@ pub(crate) fn check_question_text(
 /// vocabulary can label that many is proven later, at preparation, where the
 /// vocabulary is in hand - and the lower bound is the surface's
 /// `min`, because one wire scores a binary choice and the other a real list.
-/// Names must be non-blank (a blank one renders a label pointing at nothing),
-/// free of control characters (one inside an option's name breaks the
-/// one-option-per-line shape of the block), and unique after trimming and
-/// case folding (a collision would score two letters against the same answer
-/// text, so one of them could never win).
+/// String values must be non-blank (a blank one renders a label pointing at
+/// nothing) and free of control characters (one inside an option's value
+/// breaks the one-option-per-line shape of the block); values must be unique
+/// within their type after trimming and case folding (a collision would score
+/// two letters against the same answer text, so one of them could never win),
+/// while a string and a boolean with the same text stay distinct.
 pub(crate) fn check_choice_options(
     options: &[ChoiceOption],
     id: &str,
@@ -384,33 +433,39 @@ pub(crate) fn check_choice_options(
         ));
     }
     for (index, option) in options.iter().enumerate() {
-        let trimmed = option.name.trim();
-        if trimmed.is_empty() {
-            return Err(AppError::bad_request(
-                format!("{name}: option {} must have a non-blank name", index + 1),
-                Some("questions"),
-                "invalid_request",
-            ));
+        if let ChoiceValue::Str(text) = &option.value {
+            if text.trim().is_empty() {
+                return Err(AppError::bad_request(
+                    format!("{name}: option {} must have a non-blank value", index + 1),
+                    Some("questions"),
+                    "invalid_request",
+                ));
+            }
+            if text.chars().any(char::is_control) {
+                return Err(AppError::bad_request(
+                    format!("{name}: option value {text:?} contains a control character"),
+                    Some("questions"),
+                    "invalid_request",
+                ));
+            }
         }
-        if option.name.chars().any(char::is_control) {
+        // Duplicates are typed: a string and a boolean with the same text
+        // are distinct options, and only same-type values compare (strings
+        // after trim and case folding).
+        let duplicate = options[..index].iter().any(|earlier| {
+            match (&earlier.value, &option.value) {
+                (ChoiceValue::Str(a), ChoiceValue::Str(b)) => {
+                    a.trim().to_lowercase() == b.trim().to_lowercase()
+                }
+                (ChoiceValue::Bool(a), ChoiceValue::Bool(b)) => a == b,
+                _ => false,
+            }
+        });
+        if duplicate {
             return Err(AppError::bad_request(
                 format!(
-                    "{name}: option name {:?} contains a control character",
-                    option.name
-                ),
-                Some("questions"),
-                "invalid_request",
-            ));
-        }
-        let folded = trimmed.to_lowercase();
-        if options[..index]
-            .iter()
-            .any(|earlier| earlier.name.trim().to_lowercase() == folded)
-        {
-            return Err(AppError::bad_request(
-                format!(
-                    "{name}: option name {:?} is used more than once",
-                    option.name
+                    "{name}: option value {:?} is used more than once",
+                    option.value.text()
                 ),
                 Some("questions"),
                 "invalid_request",
@@ -426,7 +481,7 @@ pub(crate) fn check_choice_options(
 /// eleventh level could not be answered with one number, and the lower bound
 /// is the surface's `min`. A blank level is refused outright: it still takes
 /// a digit, and a digit pointing at nothing is a level no answer maps to.
-pub(crate) fn check_score_levels(levels: &[String], id: &str, min: usize) -> Result<(), AppError> {
+pub(crate) fn check_score_levels(levels: &[ScoreLevel], id: &str, min: usize) -> Result<(), AppError> {
     let name = question_name(id);
     if levels.len() < min {
         return Err(AppError::bad_request(
@@ -443,7 +498,7 @@ pub(crate) fn check_score_levels(levels: &[String], id: &str, min: usize) -> Res
         ));
     }
     for (index, level) in levels.iter().enumerate() {
-        if level.trim().is_empty() {
+        if level.label.trim().is_empty() {
             return Err(AppError::bad_request(
                 format!("{name}: level {} must not be blank", index + 1),
                 Some("questions"),
@@ -550,19 +605,19 @@ pub(crate) fn labels_for(kind: &Kind, one_token: impl Fn(&str) -> bool) -> Vec<S
     }
 }
 
-/// The answer text of a choice question: the option name the top label names.
-/// A score kind spells its answer as the level number and a yes/no kind as
-/// its label, so every kind has a name for its `top` - which indexes that
-/// kind's own labels by construction, being the argmax of the probabilities
-/// built from exactly those.
-pub(crate) fn choice_name(kind: &Kind, top: usize) -> String {
+/// The answer value of a choice question: the typed option value the top
+/// label names. A score kind spells its answer as the level number and a
+/// yes/no kind as its label, so every kind has a value for its `top` - which
+/// indexes that kind's own labels by construction, being the argmax of the
+/// probabilities built from exactly those.
+pub(crate) fn choice_name(kind: &Kind, top: usize) -> ChoiceValue {
     match kind {
         Kind::Choice { options, .. } => options
             .get(top)
-            .map(|option| option.name.clone())
-            .unwrap_or_default(),
-        Kind::Score { .. } => top.to_string(),
-        Kind::YesNo { .. } => answer_label(kind, top),
+            .map(|option| option.value.clone())
+            .unwrap_or_else(|| ChoiceValue::Str(String::new())),
+        Kind::Score { .. } => ChoiceValue::Str(top.to_string()),
+        Kind::YesNo { .. } => ChoiceValue::Str(answer_label(kind, top)),
     }
 }
 
@@ -1137,8 +1192,8 @@ mod tests {
     fn choice(kind_input: &str, q: &str, opts: &[(&str, Option<&str>)]) -> String {
         let options = opts
             .iter()
-            .map(|(name, description)| ChoiceOption {
-                name: (*name).to_string(),
+            .map(|(value, description)| ChoiceOption {
+                value: ChoiceValue::Str((*value).to_string()),
                 description: description.map(ToString::to_string),
             })
             .collect();
@@ -1171,7 +1226,7 @@ mod tests {
 
     fn option(name: &str) -> ChoiceOption {
         ChoiceOption {
-            name: name.to_string(),
+            value: ChoiceValue::Str(name.to_string()),
             description: None,
         }
     }
@@ -1182,8 +1237,13 @@ mod tests {
             .collect()
     }
 
-    fn levels(n: usize) -> Vec<String> {
-        (0..n).map(|index| format!("level {index}")).collect()
+    fn levels(n: usize) -> Vec<ScoreLevel> {
+        (0..n)
+            .map(|index| ScoreLevel {
+                label: format!("level {index}"),
+                description: None,
+            })
+            .collect()
     }
 
     fn refusal(result: Result<(), AppError>) -> String {
@@ -1226,7 +1286,10 @@ mod tests {
             question: "how bad".to_string(),
             levels: ["none", "some", "lots"]
                 .iter()
-                .map(|level| (*level).to_string())
+                .map(|level| ScoreLevel {
+                    label: (*level).to_string(),
+                    description: None,
+                })
                 .collect(),
         };
         assert_eq!(
@@ -1389,6 +1452,87 @@ mod tests {
         );
     }
 
+    fn str_option(name: &str) -> ChoiceOption {
+        ChoiceOption {
+            value: ChoiceValue::Str(name.to_string()),
+            description: None,
+        }
+    }
+
+    fn bool_option(value: bool) -> ChoiceOption {
+        ChoiceOption {
+            value: ChoiceValue::Bool(value),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn a_boolean_choice_value_renders_as_the_word() {
+        // The official wire's choice values are typed; a boolean spells
+        // itself `true`/`false` on the option's line.
+        let kind = Kind::Choice {
+            question: "q".to_string(),
+            options: vec![bool_option(true), bool_option(false)],
+        };
+        assert_eq!(
+            body("in", &kind),
+            "in\n\nQuestion: q\nA: true\nB: false\nAnswer with the letter of one option only."
+        );
+    }
+
+    #[test]
+    fn a_score_level_description_shares_its_digit_line() {
+        let kind = Kind::Score {
+            question: "how bad".to_string(),
+            levels: vec![
+                ScoreLevel {
+                    label: "Cosmetic".to_string(),
+                    description: None,
+                },
+                ScoreLevel {
+                    label: "Blocked".to_string(),
+                    description: Some("no workaround".to_string()),
+                },
+            ],
+        };
+        assert_eq!(
+            body("in", &kind),
+            "in\n\nQuestion: how bad\n0: Cosmetic\n1: Blocked - no workaround\nAnswer with the number of one level only."
+        );
+    }
+
+    #[test]
+    fn a_blank_score_level_description_keeps_the_bare_line() {
+        let kind = Kind::Score {
+            question: "how bad".to_string(),
+            levels: vec![
+                ScoreLevel {
+                    label: "a".to_string(),
+                    description: Some("   ".to_string()),
+                },
+                ScoreLevel {
+                    label: "b".to_string(),
+                    description: None,
+                },
+            ],
+        };
+        assert_eq!(
+            body("in", &kind),
+            "in\n\nQuestion: how bad\n0: a\n1: b\nAnswer with the number of one level only."
+        );
+    }
+
+    #[test]
+    fn typed_choice_values_collide_only_within_their_type() {
+        // The official wire says a string and a boolean with the same text
+        // are distinct options: `"true"` beside `true` is a legal list.
+        assert!(check_choice_options(&[str_option("true"), bool_option(true)], "q", 2).is_ok());
+        // Two booleans spelling the same word are the same option.
+        assert!(check_choice_options(&[bool_option(true), bool_option(true)], "q", 2).is_err());
+        // Strings keep today's trim-and-fold comparison.
+        assert!(check_choice_options(&[str_option("Red"), str_option(" red ")], "q", 2).is_err());
+    }
+
     #[test]
     fn check_choice_options_bounds_two_to_the_wire_maximum() {
         assert!(check_choice_options(&options(26), "q", 2).is_ok());
@@ -1419,7 +1563,23 @@ mod tests {
         assert!(check_score_levels(&levels(11), "q", 2).is_err());
         assert!(check_score_levels(&levels(1), "q", 1).is_ok());
         assert!(check_score_levels(&levels(1), "q", 2).is_err());
-        assert!(check_score_levels(&["ok".to_string(), "  ".to_string()], "q", 2).is_err());
+        assert!(
+            check_score_levels(
+                &[
+                    ScoreLevel {
+                        label: "ok".to_string(),
+                        description: None
+                    },
+                    ScoreLevel {
+                        label: "  ".to_string(),
+                        description: None
+                    },
+                ],
+                "q",
+                2
+            )
+            .is_err()
+        );
     }
 
     #[test]

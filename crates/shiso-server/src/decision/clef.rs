@@ -67,7 +67,7 @@ fn head_options(kind: &Kind) -> Vec<(usize, Option_)> {
                     (
                         index,
                         Option_ {
-                            id: option.name.clone(),
+                            id: option.value.text(),
                             description: option.description.clone(),
                         },
                     )
@@ -84,7 +84,7 @@ fn head_options(kind: &Kind) -> Vec<(usize, Option_)> {
                     index,
                     Option_ {
                         id: index.to_string(),
-                        description: Some(level.clone()),
+                        description: Some(level.label.clone()),
                     },
                 )
             })
@@ -466,7 +466,7 @@ mod tests {
                     options: ["tech", "billing", "abuse"]
                         .iter()
                         .map(|name| ChoiceOption {
-                            name: (*name).to_owned(),
+                            value: crate::decision::core::ChoiceValue::Str((*name).to_owned()),
                             description: None,
                         })
                         .collect(),
@@ -477,7 +477,13 @@ mod tests {
                 id: "urgency".to_owned(),
                 kind: Kind::Score {
                     question: String::new(),
-                    levels: vec!["later".to_owned(), "now".to_owned()],
+                    levels: ["later", "now"]
+                        .iter()
+                        .map(|label| crate::decision::core::ScoreLevel {
+                            label: (*label).to_owned(),
+                            description: None,
+                        })
+                        .collect(),
                 },
                 probability_answer: false,
             },

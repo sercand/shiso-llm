@@ -32,7 +32,7 @@ pub(crate) fn encode(
             Kind::Choice { .. } => {
                 entry.insert(
                     "choice".to_owned(),
-                    json!(choice_name(&answer.kind, answer.top)),
+                    json!(choice_name(&answer.kind, answer.top).text()),
                 );
             }
             Kind::Score { .. } => {

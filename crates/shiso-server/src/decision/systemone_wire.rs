@@ -305,7 +305,7 @@ fn question_from(id: &str, entry: &Value) -> Result<RawQuestion, AppError> {
                 .criteria
                 .into_iter()
                 .map(|(name, description)| ChoiceOption {
-                    name,
+                    value: core::ChoiceValue::Str(name),
                     // `null` says "no detail"; any other value is the shared
                     // rendering, so a container description is compact JSON
                     // text, never a refusal.
@@ -386,12 +386,15 @@ fn instructions_text(id: &str, instructions: &Value) -> Result<String, AppError>
 /// scored `"null"` level would sit among the caller's real levels as a level
 /// nobody wrote — and the refusal names the item's index so the caller edits
 /// the right element.
-fn score_levels(id: &str, criteria: &[Value]) -> Result<Vec<String>, AppError> {
+fn score_levels(id: &str, criteria: &[Value]) -> Result<Vec<core::ScoreLevel>, AppError> {
     criteria
         .iter()
         .enumerate()
         .map(|(index, level)| match level {
-            Value::String(text) => Ok(text.clone()),
+            Value::String(text) => Ok(core::ScoreLevel {
+                label: text.clone(),
+                description: None,
+            }),
             Value::Null => Err(AppError::SchemaViolation {
                 message: format!(
                     "question \"{id}\": a score level must be a string, object or array, \
@@ -399,7 +402,10 @@ fn score_levels(id: &str, criteria: &[Value]) -> Result<Vec<String>, AppError> {
                 ),
                 at: format!("questions.{id}"),
             }),
-            other => Ok(core::render_text(other)),
+            other => Ok(core::ScoreLevel {
+                label: core::render_text(other),
+                description: None,
+            }),
         })
         .collect()
 }
@@ -625,7 +631,7 @@ mod tests {
         match &questions[0].kind {
             Kind::Choice { question, options } => {
                 assert_eq!(question, "pick one");
-                let names: Vec<&str> = options.iter().map(|o| o.name.as_str()).collect();
+                let names: Vec<String> = options.iter().map(|o| o.value.text()).collect();
                 assert_eq!(names, ["red", "blue"]);
                 assert!(
                     options.iter().all(|o| o.description.is_none()),
@@ -638,7 +644,7 @@ mod tests {
         match &questions[1].kind {
             Kind::Score { question, levels } => {
                 assert_eq!(question, "how bad");
-                let names: Vec<&str> = levels.iter().map(String::as_str).collect();
+                let names: Vec<&str> = levels.iter().map(|l| l.label.as_str()).collect();
                 assert_eq!(names, ["none", "some"]);
             }
             other => panic!("expected a score, got {other:?}"),
@@ -754,13 +760,13 @@ mod tests {
         match &questions[0].kind {
             Kind::Choice { options, .. } => {
                 assert!(
-                    matches!(&options[0], ChoiceOption { name, description: None }
-                        if name == "red"),
+                    matches!(&options[0], ChoiceOption { value, description: None }
+                        if value.text() == "red"),
                     "{options:?}"
                 );
                 assert!(
-                    matches!(&options[1], ChoiceOption { name, description }
-                        if name == "blue" && description.as_deref() == Some("the sky one")),
+                    matches!(&options[1], ChoiceOption { value, description }
+                        if value.text() == "blue" && description.as_deref() == Some("the sky one")),
                     "{options:?}"
                 );
             }
@@ -820,8 +826,8 @@ mod tests {
         }));
         match &questions[0].kind {
             Kind::Choice { options, .. } => assert!(
-                matches!(&options[0], ChoiceOption { name, description: None }
-                    if name == "red"),
+                matches!(&options[0], ChoiceOption { value, description: None }
+                    if value.text() == "red"),
                 "a null description is no description: {options:?}"
             ),
             other => panic!("expected a choice, got {other:?}"),
