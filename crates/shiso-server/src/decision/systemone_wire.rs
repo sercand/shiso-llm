@@ -531,40 +531,11 @@ pub(crate) fn images_sources(
 }
 
 /// Parses clef's data URL form: `data:image/<subtype>;base64,<payload>`.
-/// The structural parts of the head fold case (clef's pattern); the payload
-/// is the caller's bytes, taken verbatim after the comma. The media type is
-/// carried in its folded spelling and dropped downstream like every other
-/// claimed media type.
+/// The rule is the decisions wire's own - one parser reads a data URL,
+/// whichever field it arrives in - and the folded spelling of the prefix
+/// (clef's pattern) lives there.
 fn parse_image_data_url(text: &str) -> Result<InputImageSource, String> {
-    let (head, payload) = text.split_once(',').ok_or_else(|| {
-        "a string image must be a data URL spelled `data:image/<subtype>;base64,<payload>`"
-            .to_owned()
-    })?;
-    let head = head.to_ascii_lowercase();
-    let spec = head.strip_prefix("data:").ok_or_else(|| {
-        "a string image must be a data URL spelled `data:image/<subtype>;base64,<payload>`"
-            .to_owned()
-    })?;
-    let Some((media_type, params)) = spec.split_once(';') else {
-        return Err("a data URL must carry the `;base64` parameter".to_owned());
-    };
-    if params != "base64" {
-        return Err(format!(
-            "a data URL's parameter must be `base64`, got `{params}`"
-        ));
-    }
-    if !media_type.starts_with("image/") || media_type == "image/" {
-        return Err(format!(
-            "a data URL must name an `image/<subtype>` media type, got `{media_type}`"
-        ));
-    }
-    if payload.is_empty() {
-        return Err("a data URL must carry a non-empty base64 payload".to_owned());
-    }
-    Ok(InputImageSource::Base64 {
-        media_type: media_type.to_owned(),
-        data: payload.to_owned(),
-    })
+    decisions_wire::parse_image_data_url(text)
 }
 
 /// An `images` item-shape refusal: this surface's schema class, located at
