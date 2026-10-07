@@ -1,5 +1,5 @@
 //! The `POST /v1/decisions` answer, assembled as JSON in the official
-//! OpenAI Decisions shape: an `answers` array in question order, each answer
+//! `OpenAI` Decisions shape: an `answers` array in question order, each answer
 //! typed `predicate`, `choice` or `score` and echoing its `name` (or null),
 //! and a `usage` object that counts only input tokens.
 //!
@@ -337,7 +337,10 @@ mod tests {
 
     #[test]
     fn answers_keep_the_request_order() {
-        let answers = vec![yes_no("b", &[1.0, 0.0], 1.0, 0), yes_no("a", &[0.0, 1.0], 1.0, 1)];
+        let answers = vec![
+            yes_no("b", &[1.0, 0.0], 1.0, 0),
+            yes_no("a", &[0.0, 1.0], 1.0, 1),
+        ];
         let body = body(&answers, false);
         let names: Vec<&str> = body["answers"]
             .as_array()
@@ -369,7 +372,13 @@ mod tests {
         let body = body(&answers, false);
         assert_eq!(
             keys(&body),
-            ["object", "model", "prompt_format_version", "answers", "usage"]
+            [
+                "object",
+                "model",
+                "prompt_format_version",
+                "answers",
+                "usage"
+            ]
         );
         assert_eq!(body["object"], json!("decisions"));
         assert_eq!(body["model"], json!("test-model"));

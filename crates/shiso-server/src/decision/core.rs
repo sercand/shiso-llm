@@ -362,7 +362,7 @@ pub(crate) fn check_ids(questions: &[RawQuestion], blanks_allowed: bool) -> Resu
         {
             return Err(AppError::bad_request(
                 format!(
-                    "question id \"{}\" is used by questions[{first}] and questions[{index}]",
+                    "question \"{}\" is used by questions[{first}] and questions[{index}]",
                     question.id
                 ),
                 Some("questions"),
@@ -452,15 +452,16 @@ pub(crate) fn check_choice_options(
         // Duplicates are typed: a string and a boolean with the same text
         // are distinct options, and only same-type values compare (strings
         // after trim and case folding).
-        let duplicate = options[..index].iter().any(|earlier| {
-            match (&earlier.value, &option.value) {
-                (ChoiceValue::Str(a), ChoiceValue::Str(b)) => {
-                    a.trim().to_lowercase() == b.trim().to_lowercase()
-                }
-                (ChoiceValue::Bool(a), ChoiceValue::Bool(b)) => a == b,
-                _ => false,
-            }
-        });
+        let duplicate =
+            options[..index]
+                .iter()
+                .any(|earlier| match (&earlier.value, &option.value) {
+                    (ChoiceValue::Str(a), ChoiceValue::Str(b)) => {
+                        a.trim().to_lowercase() == b.trim().to_lowercase()
+                    }
+                    (ChoiceValue::Bool(a), ChoiceValue::Bool(b)) => a == b,
+                    _ => false,
+                });
         if duplicate {
             return Err(AppError::bad_request(
                 format!(
@@ -481,7 +482,11 @@ pub(crate) fn check_choice_options(
 /// eleventh level could not be answered with one number, and the lower bound
 /// is the surface's `min`. A blank level is refused outright: it still takes
 /// a digit, and a digit pointing at nothing is a level no answer maps to.
-pub(crate) fn check_score_levels(levels: &[ScoreLevel], id: &str, min: usize) -> Result<(), AppError> {
+pub(crate) fn check_score_levels(
+    levels: &[ScoreLevel],
+    id: &str,
+    min: usize,
+) -> Result<(), AppError> {
     let name = question_name(id);
     if levels.len() < min {
         return Err(AppError::bad_request(
@@ -612,10 +617,10 @@ pub(crate) fn labels_for(kind: &Kind, one_token: impl Fn(&str) -> bool) -> Vec<S
 /// probabilities built from exactly those.
 pub(crate) fn choice_name(kind: &Kind, top: usize) -> ChoiceValue {
     match kind {
-        Kind::Choice { options, .. } => options
-            .get(top)
-            .map(|option| option.value.clone())
-            .unwrap_or_else(|| ChoiceValue::Str(String::new())),
+        Kind::Choice { options, .. } => options.get(top).map_or_else(
+            || ChoiceValue::Str(String::new()),
+            |option| option.value.clone(),
+        ),
         Kind::Score { .. } => ChoiceValue::Str(top.to_string()),
         Kind::YesNo { .. } => ChoiceValue::Str(answer_label(kind, top)),
     }

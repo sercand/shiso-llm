@@ -1,4 +1,4 @@
-//! The `POST /v1/decisions` request body, exactly as the official OpenAI
+//! The `POST /v1/decisions` request body, exactly as the official `OpenAI`
 //! Decisions API spells it: a `model`, an `input` that is a string or an
 //! array of user messages carrying text and inline images, and `questions`
 //! of type `predicate`, `choice` or `score`.
@@ -221,10 +221,7 @@ impl<'de> Deserialize<'de> for ChoiceWire {
                         )));
                     }
                 };
-                Ok(Self {
-                    value,
-                    description,
-                })
+                Ok(Self { value, description })
             }
             other => Err(serde::de::Error::custom(format!(
                 "a choice must be a string, a boolean, or a {{value, description}} object, got {other}"
@@ -555,17 +552,10 @@ pub(crate) fn decision_input(value: &Value) -> Result<DecisionInput, AppError> {
                 if wire.role != "user" {
                     return Err(input_error(
                         Some(index),
-                        &format!(
-                            "only `user` messages are scored, got role {:?}",
-                            wire.role
-                        ),
+                        &format!("only `user` messages are scored, got role {:?}", wire.role),
                     ));
                 }
-                if wire
-                    .r#type
-                    .as_deref()
-                    .is_some_and(|kind| kind != "message")
-                {
+                if wire.r#type.as_deref().is_some_and(|kind| kind != "message") {
                     return Err(input_error(
                         Some(index),
                         &format!(
@@ -597,7 +587,9 @@ pub(crate) fn decision_input(value: &Value) -> Result<DecisionInput, AppError> {
             if images > MAX_INPUT_IMAGES {
                 return Err(input_error(
                     None,
-                    &format!("input carries {images} images; at most {MAX_INPUT_IMAGES} are allowed"),
+                    &format!(
+                        "input carries {images} images; at most {MAX_INPUT_IMAGES} are allowed"
+                    ),
                 ));
             }
             Ok(DecisionInput::Blocks(blocks))
@@ -618,11 +610,12 @@ pub(crate) fn decision_input(value: &Value) -> Result<DecisionInput, AppError> {
 fn input_part(part: &Value) -> Result<InputBlock, String> {
     match part.get("type").and_then(Value::as_str) {
         Some("input_text") => Ok(InputBlock::Text {
-            text: InputTextWire::deserialize(part).map_err(|error| error.to_string())?.text,
+            text: InputTextWire::deserialize(part)
+                .map_err(|error| error.to_string())?
+                .text,
         }),
         Some("input_image") => {
-            let wire =
-                InputImageWire::deserialize(part).map_err(|error| error.to_string())?;
+            let wire = InputImageWire::deserialize(part).map_err(|error| error.to_string())?;
             if let Some(detail) = &wire.detail
                 && !IMAGE_DETAILS.contains(&detail.as_str())
             {
@@ -685,9 +678,10 @@ fn value_kind(value: &Value) -> &'static str {
 /// A message-shape refusal: the same 400 naming `input`, prefixed with the
 /// message's 0-based index so a caller can find the element it must fix.
 fn input_error(index: Option<usize>, cause: &dyn std::fmt::Display) -> AppError {
-    let at = index.map_or_else(|| "input".to_owned(), |index| {
-        format!("input message[{index}]")
-    });
+    let at = index.map_or_else(
+        || "input".to_owned(),
+        |index| format!("input message[{index}]"),
+    );
     AppError::bad_request(format!("{at}: {cause}"), Some("input"), "invalid_request")
 }
 
@@ -778,7 +772,10 @@ mod tests {
                 question, yes, no, ..
             } => {
                 assert_eq!(question, "is it damaged");
-                assert!(yes.is_none() && no.is_none(), "a predicate spells no wordings");
+                assert!(
+                    yes.is_none() && no.is_none(),
+                    "a predicate spells no wordings"
+                );
             }
             other => panic!("expected a predicate, got {other:?}"),
         }
@@ -862,7 +859,7 @@ mod tests {
     fn blank_instructions_are_refused_naming_the_name() {
         let message = refused_message(json!({"input": "x", "questions": [
             {"type": "predicate", "name": "q", "instructions": "  "}]}));
-        assert!(message.contains("q"), "{message}");
+        assert!(message.contains('q'), "{message}");
     }
 
     #[test]
@@ -876,10 +873,22 @@ mod tests {
     #[test]
     fn fields_do_not_cross_question_types() {
         for (kind, field) in [
-            ("predicate", json!({"choices": [{"value": "a"}, {"value": "b"}]})),
-            ("predicate", json!({"levels": [{"label": "a"}, {"label": "b"}]})),
-            ("choice", json!({"levels": [{"label": "a"}, {"label": "b"}]})),
-            ("score", json!({"choices": [{"value": "a"}, {"value": "b"}]})),
+            (
+                "predicate",
+                json!({"choices": [{"value": "a"}, {"value": "b"}]}),
+            ),
+            (
+                "predicate",
+                json!({"levels": [{"label": "a"}, {"label": "b"}]}),
+            ),
+            (
+                "choice",
+                json!({"levels": [{"label": "a"}, {"label": "b"}]}),
+            ),
+            (
+                "score",
+                json!({"choices": [{"value": "a"}, {"value": "b"}]}),
+            ),
         ] {
             let key = field
                 .as_object()
@@ -916,7 +925,7 @@ mod tests {
         let questions = validated(json!({"input": "x", "questions": [
             {"type": "choice", "name": "q", "instructions": "i",
              "choices": ["billing", {"value": false, "description": "not urgent"}]}]}))
-            .expect("bare values and objects both parse");
+        .expect("bare values and objects both parse");
         match &questions[0].kind {
             Kind::Choice { options, .. } => {
                 assert_eq!(options[0].value, ChoiceValue::Str("billing".to_owned()));
@@ -966,7 +975,7 @@ mod tests {
         for value in [json!("user-1"), json!(null)] {
             validated(json!({"input": "x", "safety_identifier": value,
                 "questions": [{"type": "predicate", "instructions": "i"}]}))
-                .expect("the official field is accepted and ignored");
+            .expect("the official field is accepted and ignored");
         }
         parse_refused(
             json!({"input": "x", "safety_identifier": 5,
@@ -977,12 +986,16 @@ mod tests {
 
     #[test]
     fn unknown_top_level_fields_are_refused() {
-        parse_refused(json!({"input": "x", "questions": [], "options": 1}), "options");
+        parse_refused(
+            json!({"input": "x", "questions": [], "options": 1}),
+            "options",
+        );
     }
 
     #[test]
     fn prompt_format_version_must_say_one() {
-        let message = refused_message(json!({"input": "x", "prompt_format_version": 2, "questions": []}));
+        let message =
+            refused_message(json!({"input": "x", "prompt_format_version": 2, "questions": []}));
         assert!(message.contains("prompt_format_version"), "{message}");
     }
 
@@ -990,7 +1003,7 @@ mod tests {
     fn input_string_is_the_text_arm_verbatim() {
         match decision_input(&json!("  keep me  ")).expect("a string is text") {
             DecisionInput::Text(text) => assert_eq!(text, "  keep me  "),
-            other => panic!("expected text, got {other:?}"),
+            other @ DecisionInput::Blocks(_) => panic!("expected text, got {other:?}"),
         }
     }
 
@@ -1027,7 +1040,7 @@ mod tests {
                     "{blocks:?}"
                 );
             }
-            other => panic!("expected blocks, got {other:?}"),
+            other @ DecisionInput::Text(_) => panic!("expected blocks, got {other:?}"),
         }
     }
 

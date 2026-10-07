@@ -252,8 +252,7 @@ const CHOICE_BODY: &str =
 
 /// The predicate question the shape test pins: its exact version-1 body. A
 /// predicate renders the version-1 yes/no block with no label wordings.
-const YES_NO_BODY: &str =
-    "the input\n\nIs the following true? ready\nAnswer with yes or no only.";
+const YES_NO_BODY: &str = "the input\n\nIs the following true? ready\nAnswer with yes or no only.";
 
 /// The ids of one expected prompt, encoded through the test vocabulary.
 fn prompt_ids(body: &str) -> Vec<u32> {
@@ -393,7 +392,9 @@ async fn a_predicate_question_answers_with_the_yes_probability() {
 
     let norm = logsumexp(&row);
     let want = softmax(&[3.0 - norm, 0.0 - norm], 1.0);
-    let got = q1["probability"].as_f64().expect("a predicate carries its probability");
+    let got = q1["probability"]
+        .as_f64()
+        .expect("a predicate carries its probability");
     assert!(
         (got - want[0]).abs() < 1e-5,
         "the probability is P(yes) = {}, got {got}: {body}",
@@ -815,7 +816,6 @@ async fn a_non_message_array_is_refused_naming_the_message() {
     }
 }
 
-
 #[tokio::test]
 async fn label_checks_refuse_a_question_whose_label_is_not_one_token() {
     // Five score levels need the labels 0..4. This vocabulary defines 0..2,
@@ -1118,7 +1118,7 @@ fn image_part(data: &str) -> Value {
 }
 
 /// One user message carrying these content parts.
-fn user_message(parts: Vec<Value>) -> Value {
+fn user_message(parts: &[Value]) -> Value {
     json!({"role": "user", "content": parts})
 }
 
@@ -1155,7 +1155,7 @@ async fn an_image_request_scores_the_expanded_prompt() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [user_message(vec![image_part(&png), json!({"type": "input_text", "text": "urgent?"})])],
+                "input": [user_message(&[image_part(&png), json!({"type": "input_text", "text": "urgent?"})])],
                 "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
@@ -1187,7 +1187,7 @@ async fn a_trailing_image_pins_the_question_block_without_a_blank_line() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [user_message(vec![json!({"type": "input_text", "text": "urgent?"}), image_part(&png)])],
+                "input": [user_message(&[json!({"type": "input_text", "text": "urgent?"}), image_part(&png)])],
                 "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
@@ -1218,7 +1218,7 @@ async fn an_image_only_input_is_valid() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [user_message(vec![image_part(&png)])],
+                "input": [user_message(&[image_part(&png)])],
                 "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
@@ -1239,7 +1239,7 @@ async fn the_round_trip_check_is_skipped_with_media_and_enforced_without() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [user_message(vec![image_part(&png), json!({"type": "input_text", "text": "urgent?"})])],
+                "input": [user_message(&[image_part(&png), json!({"type": "input_text", "text": "urgent?"})])],
                 "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
@@ -1283,7 +1283,7 @@ async fn the_seam_check_still_refuses_a_glued_label_with_media() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [user_message(vec![json!({"type": "input_text", "text": "urgent?"}), image_part(&png)])],
+                "input": [user_message(&[json!({"type": "input_text", "text": "urgent?"}), image_part(&png)])],
                 "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
@@ -1304,7 +1304,7 @@ async fn the_seam_check_still_refuses_a_glued_label_with_media() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [user_message(vec![image_part(&png), image_part(&png)])],
+                "input": [user_message(&[image_part(&png), image_part(&png)])],
                 "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
@@ -1330,7 +1330,7 @@ async fn an_over_budget_image_is_a_context_overflow() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [user_message(vec![image_part(&png)])],
+                "input": [user_message(&[image_part(&png)])],
                 "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
@@ -1352,7 +1352,7 @@ async fn return_prompt_token_ids_with_media_returns_expanded_ids() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [user_message(vec![image_part(&png), json!({"type": "input_text", "text": "urgent?"})])],
+                "input": [user_message(&[image_part(&png), json!({"type": "input_text", "text": "urgent?"})])],
                 "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
                 "return_prompt_token_ids": true,
             }),
@@ -1388,7 +1388,7 @@ async fn a_remote_image_url_is_refused_without_the_flag() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [user_message(vec![
+                "input": [user_message(&[
                     json!({"type": "input_text", "text": "urgent?"}),
                     json!({"type": "input_image", "image_url": "https://example.com/x.png"}),
                 ])],
@@ -1418,7 +1418,7 @@ async fn a_valid_image_part_without_a_vision_tower_is_refused() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [user_message(vec![
+                "input": [user_message(&[
                     json!({"type": "input_text", "text": "urgent?"}),
                     image_part(&png),
                 ])],

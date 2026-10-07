@@ -11,7 +11,11 @@
 //! shared parts (question model, prompt-format version 1 wording, validation,
 //! label checks, scoring fan-out) live in `core`, the probability and
 //! confidence formulas in `math`. Each surface owns its own serde structs,
-//! like every other route in this crate owns its own wire format.
+//! like every other route in this crate owns its own wire format: `/v1/decisions`
+//! speaks the official `OpenAI` Decisions API (public beta) shape, `/v1/systemone`
+//! the System One shape with its `images` extension, and the two differ exactly
+//! where their wires do - a `predicate` question and a `noul` criterion are the
+//! same `Kind::YesNo` underneath.
 
 pub(crate) mod clef;
 pub(crate) mod core;
