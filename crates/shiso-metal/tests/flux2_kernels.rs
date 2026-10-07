@@ -2423,12 +2423,12 @@ impl ConvCase {
 }
 
 fn expect_conv(c: &ConvCase, input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
-    let (oh_n, ow_n) = (c.out_h(), c.out_w());
-    let mut out = vec![0f32; c.batch * c.out_c * oh_n * ow_n];
+    let (out_rows, out_cols) = (c.out_h(), c.out_w());
+    let mut out = vec![0f32; c.batch * c.out_c * out_rows * out_cols];
     for n in 0..c.batch {
         for oc in 0..c.out_c {
-            for oh in 0..oh_n {
-                for ow in 0..ow_n {
+            for oh in 0..out_rows {
+                for ow in 0..out_cols {
                     let mut acc = 0f32;
                     for ic in 0..c.in_c {
                         for kh in 0..c.k {
@@ -2449,7 +2449,7 @@ fn expect_conv(c: &ConvCase, input: &[f32], weight: &[f32], bias: &[f32]) -> Vec
                             }
                         }
                     }
-                    out[((n * c.out_c + oc) * oh_n + oh) * ow_n + ow] = acc + bias[oc];
+                    out[((n * c.out_c + oc) * out_rows + oh) * out_cols + ow] = acc + bias[oc];
                 }
             }
         }
@@ -2917,6 +2917,10 @@ fn run_fused(
 }
 
 #[test]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "m, n, k and a are the GEMM's own names for its extents and operand"
+)]
 fn gemm64_fused_reads_dense_then_swiglu_columns_and_adds_the_gated_residual() {
     let Some(b) = open() else { return };
     // The single block's shape in miniature: 16 dense columns, then a 32-wide
@@ -3022,11 +3026,14 @@ fn gemm64_fused_takes_a_dense_only_input_over_bf16_weights() {
     let (bias, gate) = (small(n, 123), small(n, 124));
     // Multiples of 1/80 are not all exact in bf16, so the expected product
     // uses the widened values the kernel reads.
-    let bits: Vec<u16> = small(n * cols_a, 125)
+    let weight_bits: Vec<u16> = small(n * cols_a, 125)
         .iter()
         .map(|&v| bf16::from_f32(v).to_bits())
         .collect();
-    let weight: Vec<f32> = bits.iter().map(|&v| bf16::from_bits(v).to_f32()).collect();
+    let weight: Vec<f32> = weight_bits
+        .iter()
+        .map(|&v| bf16::from_bits(v).to_f32())
+        .collect();
     let empty: Vec<f32> = Vec::new();
     let case = FusedCase {
         residual: &residual,
@@ -3043,7 +3050,7 @@ fn gemm64_fused_takes_a_dense_only_input_over_bf16_weights() {
         gu_stride: 0,
         gu_offset: 0,
     };
-    let w_buf = upload_u16(&b, &bits);
+    let w_buf = upload_u16(&b, &weight_bits);
     let got = run_fused(&b, &case, "kernel_flux2_gemm64_fused_bf16", w_buf.view());
     assert_close(&got, &expect_fused(&case), "gemm64_fused bf16 dense-only");
 }

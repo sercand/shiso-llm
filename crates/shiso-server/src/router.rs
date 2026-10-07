@@ -118,6 +118,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/images/generations",
             post(crate::openai::images::generate_images),
         )
+        // `/embeddings` is the OpenRouter spelling, `/v1/embeddings` the
+        // OpenAI one; one handler answers both.
+        .route(
+            "/embeddings",
+            post(crate::openai::embeddings::create_embeddings),
+        )
+        .route(
+            "/v1/embeddings",
+            post(crate::openai::embeddings::create_embeddings),
+        )
         .method_not_allowed_fallback(misc_handlers::method_not_allowed)
         .fallback(misc_handlers::not_found)
         .layer(DefaultBodyLimit::max(max_body_bytes()));

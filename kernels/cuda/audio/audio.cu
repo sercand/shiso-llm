@@ -10,7 +10,8 @@
  * output tile per 128-thread block with 12288 bytes of dynamic shared memory
  * (the 64-row GEMM 64x64 per 256 threads with 20480),
  * the window and causal attention one warp per (head, block of eight
- * queries), and decode attention a warp per (kv head, split) with four to a
+ * queries), the span attention a block per (kv head, tile of query items) with
+ * a warp per (eight items, 64 head columns), and decode attention a warp per (kv head, split) with four to a
  * block, closed by a 256-thread merge per head.
  */
 
@@ -68,6 +69,22 @@ extern "C" __global__ void kernel_audio_silu_mul_f32(
     }
     const float g = gate[i];
     out[i] = g * audio_sigmoid(g) * up[i];
+}
+
+/* out[r][c] = gelu_tanh(gate[r][c]) * up[r * up_stride + up_offset + c], as
+ * the Metal twin: the tanh form of GELU with the accurate tanhf; out may be
+ * gate. */
+extern "C" __global__ void kernel_audio_gelu_tanh_mul_f32(
+        const struct audio_args_gelu_mul args, float *out, const float *gate, const float *up) {
+    const uint i = blockIdx.x * AUDIO_LINEAR_BLOCK + threadIdx.x;
+    if (i >= args.rows * args.cols) {
+        return;
+    }
+    const uint r = i / args.cols;
+    const uint c = i - r * args.cols;
+    const float g = gate[i];
+    const float t = tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g));
+    out[i] = 0.5f * g * (1.0f + t) * up[(uint64_t) r * args.up_stride + args.up_offset + c];
 }
 
 extern "C" __global__ void kernel_audio_bias_rows_f32(
@@ -1982,4 +1999,339 @@ extern "C" __global__ void kernel_audio_embed_token_batch_affine8w(
     const uint64_t g = (uint64_t) k * (args.width / args.group) + u / args.group;
     const float qv = (float) ((words[i >> 2u] >> (8u * (uint) (i & 3u))) & 0xffu);
     row[u] = fmaf(qv, audio_bf16(scales + g), audio_bf16(biases + g));
+}
+
+
+/* ---- span attention -------------------------------------------------------- */
+
+/* The pair as its nearest brain-floats (`*big`) and what those left over
+ * (`*small`), each packed low element first. */
+static __device__ __forceinline__ void audio_split_bf16(float x, float y, uint32_t *big,
+                                                        uint32_t *small) {
+    const __nv_bfloat162 hi = __floats2bfloat162_rn(x, y);
+    const float2 back = __bfloat1622float2(hi);
+    const __nv_bfloat162 lo = __floats2bfloat162_rn(x - back.x, y - back.y);
+    *big = *reinterpret_cast<const uint32_t *>(&hi);
+    *small = *reinterpret_cast<const uint32_t *>(&lo);
+}
+
+/* `d += a * b` over one 16x8x16 brain-float fragment, single-precision
+ * accumulate. With `g = lane / 4` and `t = lane % 4`, `a` holds rows `g` and
+ * `g + 8` at columns `2t, 2t+1` and `2t+8, 2t+9`; `b` holds rows `2t, 2t+1`
+ * and `2t+8, 2t+9` of column `g`; `d` holds rows `g` and `g + 8` at columns
+ * `2t, 2t+1` (the PTX ISA's layouts). */
+static __device__ __forceinline__ void audio_mma_bf16(float d[4], const uint32_t a[4],
+                                                      uint32_t b0, uint32_t b1) {
+    asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+/* `d += a * b` for single-precision operands carried as brain-float pairs:
+ * the big halves' product and both cross terms. The small halves' product is
+ * below what the accumulator keeps and is left out, so each product carries
+ * some sixteen bits of each operand where one brain-float carries eight. */
+static __device__ __forceinline__ void audio_mma_bf16x3(float d[4], const uint32_t ah[4],
+                                                        const uint32_t al[4], uint32_t bh0,
+                                                        uint32_t bh1, uint32_t bl0,
+                                                        uint32_t bl1) {
+    audio_mma_bf16(d, al, bh0, bh1);
+    audio_mma_bf16(d, ah, bl0, bl1);
+    audio_mma_bf16(d, ah, bh0, bh1);
+}
+
+/* The Metal twin's `audio_span_flash` on tensor-core fragments, with the
+ * same tiling, threads and shared memory: a block per (kv head, tile of
+ * `8 * row_groups` query items, an item one (row, query head) of the group),
+ * warp `(rg, cs)` taking items `8rg .. 8rg + 8` over head columns
+ * `cs*W .. cs*W + W`.
+ *
+ * The instruction's eight-wide side is the items, so a warp forms the
+ * transposed scores `S^T = K . Q^T` (16 keys by 8 items, the keys read
+ * straight from global memory into the left operand) and the transposed
+ * output `O^T = V^T . P^T`. The slices' partial scores go through shared
+ * memory, which also turns them from the accumulator's layout (a lane holds
+ * two items of one key) into the right operand's (a lane holds four keys of
+ * one item); every warp of a row group then runs the same online softmax on
+ * the same sums. Every operand is a brain-float pair multiplied as three
+ * products (`audio_mma_bf16x3`): one brain-float rounding of the queries and
+ * keys moves a logit by ~2^-9 of its magnitude, which the softmax of a
+ * norm-scaled head turns into percent-level weight errors. */
+template <uint W, uint KB>
+static __device__ __forceinline__ void audio_span_flash(
+        const struct audio_args_span_attn &args, float *out, const float *q, const float *k,
+        const float *v, const uint *segments, float *part, uint *bounds) {
+    const uint lane = threadIdx.x & 31u;
+    const uint warp = threadIdx.x >> 5u;
+    const uint g = lane >> 2u;
+    const uint t = lane & 3u;
+    const uint n = args.n;
+    const uint hd = args.head_dim;
+    const uint group = args.heads / args.kv_heads;
+    const uint slices = (hd + W - 1u) / W;
+    const uint rg = warp / slices;
+    const uint cs = warp - rg * slices;
+    const uint tile = args.row_groups * 8u;
+    const uint items = n * group;
+    const uint item0 = blockIdx.y * tile;
+    const uint kvh = blockIdx.x;
+    const uint w = args.heads * hd;
+    const uint kvw = args.kv_heads * hd;
+
+    /* Each item's visible keys [lo, hi) and the tile's union, as the twin. */
+    if (warp == 0u) {
+        uint lo = 0xffffffffu;
+        uint hi = 0u;
+        if (lane < tile) {
+            const uint item = item0 + lane;
+            uint ilo = 1u;
+            uint ihi = 0u;
+            if (item < items) {
+                const uint i = item / group;
+                uint s = 0u;
+                uint e = n;
+                if (args.segmented != 0u) {
+                    s = segments[2u * i];
+                    e = min(segments[2u * i + 1u], n);
+                }
+                ilo = max(s, i > args.left ? i - args.left : 0u);
+                ihi = min(e, i + args.right + 1u);
+            }
+            bounds[2u * lane] = ilo;
+            bounds[2u * lane + 1u] = ihi;
+            if (ilo < ihi) {
+                lo = ilo;
+                hi = ihi;
+            }
+        }
+        lo = __reduce_min_sync(0xffffffffu, lo);
+        hi = __reduce_max_sync(0xffffffffu, hi);
+        if (lane == 0u) {
+            bounds[2u * AUDIO_SPAN_MAX_ITEMS] = lo;
+            bounds[2u * AUDIO_SPAN_MAX_ITEMS + 1u] = hi;
+        }
+    }
+    __syncthreads();
+
+    /* The item this lane holds in the right operand (and its softmax state),
+     * item `g` of the row group. */
+    const uint tb = rg * 8u + g;
+    const uint my_lo = bounds[2u * tb];
+    const uint my_hi = bounds[2u * tb + 1u];
+    const uint jlo = bounds[2u * AUDIO_SPAN_MAX_ITEMS];
+    const uint jhi = bounds[2u * AUDIO_SPAN_MAX_ITEMS + 1u];
+    const uint d0 = cs * W;
+    /* 16-column steps of this slice inside the head (a multiple of 32). */
+    const uint steps = min(W, hd - d0) / 16u;
+    const float *kp = k + kvh * hd + d0;
+    const float *vp = v + kvh * hd + d0;
+
+    uint32_t qh[W / 16u][2];
+    uint32_t ql[W / 16u][2];
+    {
+        const uint item = min(item0 + tb, items - 1u);
+        const uint row = item / group;
+        const uint h = kvh * group + (item - row * group);
+        const float *qrow = q + (uint64_t) row * w + h * hd + d0;
+#pragma unroll
+        for (uint st = 0; st < W / 16u; ++st) {
+            float2 lo2 = make_float2(0.0f, 0.0f);
+            float2 hi2 = make_float2(0.0f, 0.0f);
+            if (st < steps) {
+                lo2 = *reinterpret_cast<const float2 *>(qrow + 16u * st + 2u * t);
+                hi2 = *reinterpret_cast<const float2 *>(qrow + 16u * st + 2u * t + 8u);
+            }
+            audio_split_bf16(lo2.x * args.scale, lo2.y * args.scale, &qh[st][0], &ql[st][0]);
+            audio_split_bf16(hi2.x * args.scale, hi2.y * args.scale, &qh[st][1], &ql[st][1]);
+        }
+    }
+
+    float o[W / 16u][4];
+#pragma unroll
+    for (uint mi = 0; mi < W / 16u; ++mi) {
+        o[mi][0] = o[mi][1] = o[mi][2] = o[mi][3] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float *mine = part + warp * (8u * KB);
+    const float *peers = part + rg * slices * (8u * KB);
+    for (uint base = jlo; base < jhi; base += KB) {
+        /* Partial S^T over this slice: 16 keys by 8 items per fragment. */
+        float s[KB / 16u][4];
+#pragma unroll
+        for (uint mk = 0; mk < KB / 16u; ++mk) {
+            s[mk][0] = s[mk][1] = s[mk][2] = s[mk][3] = 0.0f;
+            const float *ka = kp + (uint64_t) min(base + 16u * mk + g, n - 1u) * kvw + 2u * t;
+            const float *kb = kp + (uint64_t) min(base + 16u * mk + g + 8u, n - 1u) * kvw + 2u * t;
+#pragma unroll
+            for (uint st = 0; st < W / 16u; ++st) {
+                if (st < steps) {
+                    const float2 a0 = *reinterpret_cast<const float2 *>(ka + 16u * st);
+                    const float2 a1 = *reinterpret_cast<const float2 *>(kb + 16u * st);
+                    const float2 a2 = *reinterpret_cast<const float2 *>(ka + 16u * st + 8u);
+                    const float2 a3 = *reinterpret_cast<const float2 *>(kb + 16u * st + 8u);
+                    uint32_t ah[4];
+                    uint32_t al[4];
+                    audio_split_bf16(a0.x, a0.y, &ah[0], &al[0]);
+                    audio_split_bf16(a1.x, a1.y, &ah[1], &al[1]);
+                    audio_split_bf16(a2.x, a2.y, &ah[2], &al[2]);
+                    audio_split_bf16(a3.x, a3.y, &ah[3], &al[3]);
+                    audio_mma_bf16x3(s[mk], ah, al, qh[st][0], qh[st][1], ql[st][0], ql[st][1]);
+                }
+            }
+        }
+        /* `[item][key]` in this warp's slot; the accumulator holds keys `g`
+         * and `g + 8` of items `2t` and `2t + 1`. */
+#pragma unroll
+        for (uint mk = 0; mk < KB / 16u; ++mk) {
+            mine[(2u * t) * KB + 16u * mk + g] = s[mk][0];
+            mine[(2u * t + 1u) * KB + 16u * mk + g] = s[mk][1];
+            mine[(2u * t) * KB + 16u * mk + g + 8u] = s[mk][2];
+            mine[(2u * t + 1u) * KB + 16u * mk + g + 8u] = s[mk][3];
+        }
+        __syncthreads();
+        /* Item `g`'s scores at keys `16kk + 2t + {0, 1, 8, 9}`, the right
+         * operand's layout, summed over the slices in a fixed order. */
+        float p[KB / 16u][4];
+#pragma unroll
+        for (uint kk = 0; kk < KB / 16u; ++kk) {
+#pragma unroll
+            for (uint e = 0; e < 4u; ++e) {
+                const uint at = g * KB + 16u * kk + 2u * t + (e & 1u) + 8u * (e >> 1u);
+                float sum = 0.0f;
+                for (uint sl = 0; sl < slices; ++sl) {
+                    sum += peers[sl * 8u * KB + at];
+                }
+                p[kk][e] = sum;
+            }
+        }
+        __syncthreads();
+
+        float block_max = -INFINITY;
+#pragma unroll
+        for (uint kk = 0; kk < KB / 16u; ++kk) {
+#pragma unroll
+            for (uint e = 0; e < 4u; ++e) {
+                const uint j = base + 16u * kk + 2u * t + (e & 1u) + 8u * (e >> 1u);
+                p[kk][e] = (j >= my_lo && j < my_hi) ? p[kk][e] : -INFINITY;
+                block_max = fmaxf(block_max, p[kk][e]);
+            }
+        }
+        block_max = fmaxf(block_max, __shfl_xor_sync(0xffffffffu, block_max, 1));
+        block_max = fmaxf(block_max, __shfl_xor_sync(0xffffffffu, block_max, 2));
+        const float m_new = fmaxf(m, block_max);
+        /* A row that has seen only masked keys keeps a maximum of minus
+         * infinity; its rescale is one so nothing becomes NaN. */
+        const float alpha = (m_new == -INFINITY) ? 1.0f : expf(m - m_new);
+        float block_sum = 0.0f;
+#pragma unroll
+        for (uint kk = 0; kk < KB / 16u; ++kk) {
+#pragma unroll
+            for (uint e = 0; e < 4u; ++e) {
+                p[kk][e] = (p[kk][e] == -INFINITY) ? 0.0f : expf(p[kk][e] - m_new);
+                block_sum += p[kk][e];
+            }
+        }
+        block_sum += __shfl_xor_sync(0xffffffffu, block_sum, 1);
+        block_sum += __shfl_xor_sync(0xffffffffu, block_sum, 2);
+        l = l * alpha + block_sum;
+        m = m_new;
+
+        /* The output's accumulator holds items `2t` and `2t + 1`, whose
+         * rescales lanes `8t` and `8t + 4` computed. */
+        const float alpha0 = __shfl_sync(0xffffffffu, alpha, 8u * t);
+        const float alpha1 = __shfl_sync(0xffffffffu, alpha, 8u * t + 4u);
+#pragma unroll
+        for (uint mi = 0; mi < W / 16u; ++mi) {
+            o[mi][0] *= alpha0;
+            o[mi][1] *= alpha1;
+            o[mi][2] *= alpha0;
+            o[mi][3] *= alpha1;
+        }
+#pragma unroll
+        for (uint kk = 0; kk < KB / 16u; ++kk) {
+            uint32_t ph[2];
+            uint32_t pl[2];
+            audio_split_bf16(p[kk][0], p[kk][1], &ph[0], &pl[0]);
+            audio_split_bf16(p[kk][2], p[kk][3], &ph[1], &pl[1]);
+            /* V^T's fragment: head columns `g` and `g + 8` of the step's
+             * keys `2t, 2t+1` and `2t+8, 2t+9`. */
+            const uint j0 = base + 16u * kk + 2u * t;
+            const float *v0 = vp + (uint64_t) min(j0, n - 1u) * kvw + g;
+            const float *v1 = vp + (uint64_t) min(j0 + 1u, n - 1u) * kvw + g;
+            const float *v8 = vp + (uint64_t) min(j0 + 8u, n - 1u) * kvw + g;
+            const float *v9 = vp + (uint64_t) min(j0 + 9u, n - 1u) * kvw + g;
+#pragma unroll
+            for (uint mi = 0; mi < W / 16u; ++mi) {
+                if (mi < steps) {
+                    const uint c = 16u * mi;
+                    uint32_t ah[4];
+                    uint32_t al[4];
+                    audio_split_bf16(v0[c], v1[c], &ah[0], &al[0]);
+                    audio_split_bf16(v0[c + 8u], v1[c + 8u], &ah[1], &al[1]);
+                    audio_split_bf16(v8[c], v9[c], &ah[2], &al[2]);
+                    audio_split_bf16(v8[c + 8u], v9[c + 8u], &ah[3], &al[3]);
+                    audio_mma_bf16x3(o[mi], ah, al, ph[0], ph[1], pl[0], pl[1]);
+                }
+            }
+        }
+    }
+
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    const float inv0 = __shfl_sync(0xffffffffu, inv, 8u * t);
+    const float inv1 = __shfl_sync(0xffffffffu, inv, 8u * t + 4u);
+#pragma unroll
+    for (uint e = 0; e < 2u; ++e) {
+        const uint item = item0 + rg * 8u + 2u * t + e;
+        if (item < items) {
+            const uint row = item / group;
+            const uint h = kvh * group + (item - row * group);
+            float *orow = out + (uint64_t) row * w + h * hd + d0 + g;
+            const float sc = e == 0u ? inv0 : inv1;
+#pragma unroll
+            for (uint mi = 0; mi < W / 16u; ++mi) {
+                if (mi < steps) {
+                    orow[16u * mi] = o[mi][e] * sc;
+                    orow[16u * mi + 8u] = o[mi][2u + e] * sc;
+                }
+            }
+        }
+    }
+}
+
+/* Bidirectional grouped-query attention over a window of each row's
+ * segment, with no cache, as the Metal twin: AUDIO_SPAN_W-column slices,
+ * AUDIO_SPAN_KB-key blocks. */
+extern "C" __global__ void kernel_audio_span_attn_f32(
+        const struct audio_args_span_attn args, float *out, const float *q, const float *k,
+        const float *v, const uint *segments) {
+    extern __shared__ float part[];
+    __shared__ uint bounds[2u * AUDIO_SPAN_MAX_ITEMS + 2u];
+    audio_span_flash<AUDIO_SPAN_W, AUDIO_SPAN_KB>(args, out, q, k, v, segments, part, bounds);
+}
+
+/* The rotation at each row's own position, as the Metal twin:
+ * `(pos0 + positions[row]) * theta^(-2m/hd)`. */
+extern "C" __global__ void kernel_audio_rope_half_pos_f32(
+        const struct audio_args_rope args, float *x, const uint *positions) {
+    const uint half_dim = args.head_dim / 2u;
+    const uint i = blockIdx.x * AUDIO_LINEAR_BLOCK + threadIdx.x;
+    if (i >= args.rows * args.heads * half_dim) {
+        return;
+    }
+    const uint m = i % half_dim;
+    const uint rh = i / half_dim;
+    const uint row = rh / args.heads;
+    float *p = x + (uint64_t) rh * args.head_dim;
+    const float inv_freq = powf(args.theta, -2.0f * (float) m / (float) args.head_dim);
+    const float ang = (float) (args.pos0 + positions[row]) * inv_freq;
+    float s;
+    float c;
+    sincosf(ang, &s, &c);
+    const float a = p[m];
+    const float b = p[m + half_dim];
+    p[m] = a * c - b * s;
+    p[m + half_dim] = b * c + a * s;
 }

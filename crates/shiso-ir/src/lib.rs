@@ -48,12 +48,14 @@
 //! needs the server's preset and its seed source as inputs - see [`request`].
 #![forbid(unsafe_code)]
 
+mod embed;
 mod message;
 mod request;
 mod response;
 mod stream;
 mod tools;
 
+pub use embed::{EmbedEncoding, EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage};
 pub use message::{Block, MediaKind, MediaSource, Message, Role, Thinking, ToolResult, ToolUse};
 pub use request::{Effort, Request, ResponseFormat, Sampling, ServiceClass, ThinkingDirective};
 pub use response::{Alternative, Logprobs, Response, StopReason, TokenLogprob, Usage};

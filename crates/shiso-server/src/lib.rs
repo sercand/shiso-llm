@@ -28,6 +28,7 @@ pub mod api;
 pub mod audio;
 pub mod cli;
 pub mod decision;
+pub mod embed;
 pub mod error;
 pub mod hub;
 pub mod ids;
@@ -138,6 +139,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // see its weights already resident.
     let image = boot_image(&args)?;
     let (mut state, engine_thread) = match args.model.as_deref() {
+        // An embedding checkpoint is not a language model: it gets its own
+        // worker instead of the engine thread, and every generation route
+        // answers "no model".
+        Some(model) if shiso_models::embedder::is_embedder(model) => (
+            AppState::without_language_model().with_embedding(boot_embedding(&args, model)?),
+            None,
+        ),
         Some(model) => {
             let (state, join) = boot_language_model(&args, model)?;
             (state, Some(join))
@@ -317,6 +325,79 @@ pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService
     })
     .context("starting image service worker")?;
     Ok(Some(service))
+}
+
+/// Opens an embedding checkpoint and starts its worker, when `--model` names
+/// one.
+///
+/// The projector, when there is one, is `--vision`: the same flag that names
+/// a chat model's tower names this one's, and it carries the audio tower
+/// beside the vision one. The vocabulary is required rather than optional as
+/// it is for a chat model, because text cannot be embedded as ids nobody can
+/// produce.
+///
+/// # Errors
+///
+/// A checkpoint or projector that will not load, a missing vocabulary, or a
+/// device that will not open.
+pub fn boot_embedding(
+    args: &ServeArgs,
+    model: &std::path::Path,
+) -> anyhow::Result<embed::EmbeddingService> {
+    let backend = open_backend(args)?;
+    mark_memory(backend.as_ref(), "before_load");
+    let started = std::time::Instant::now();
+    let sidecar = args
+        .config_path()
+        .parent()
+        .map(std::path::Path::to_path_buf);
+    let embedder = shiso_models::embedder::open_embedder(
+        &shiso_models::embedder::EmbedderDesc {
+            model,
+            mmproj: args.vision.as_deref(),
+            sidecar: sidecar.as_deref(),
+        },
+        &backend,
+    )
+    .with_context(|| format!("opening the embedding model at {}", model.display()))?;
+    backend.finish_imports();
+    let tokenizer = args.tokenizer_path();
+    let vocabulary = Arc::new(
+        tokenizer::Vocabulary::from_file(&tokenizer).with_context(|| {
+            format!(
+                "reading the embedding model's vocabulary at {}; pass --tokenizer",
+                tokenizer.display()
+            )
+        })?,
+    );
+    let model_id = args
+        .model_name
+        .clone()
+        .unwrap_or_else(|| embedder.info().model_id.clone());
+    let frontend = embedder.frontend();
+    tracing::info!(
+        path = %model.display(),
+        id = %model_id,
+        dim = embedder.info().dim,
+        vision = frontend.image.is_some(),
+        audio = frontend.audio.is_some(),
+        seconds = started.elapsed().as_secs_f64(),
+        "the embedding model is resident"
+    );
+    embed::EmbeddingService::start(embed::EmbeddingServiceDesc {
+        embedder,
+        vocabulary,
+        model_id,
+        max_queue: args.embedding_max_queue,
+        media: embed::MediaRules {
+            image_limits: args.image_limits(),
+            allow_remote: args.vision_allow_remote_images,
+            video_ffmpeg: args.ffmpeg_policy(),
+            audio_limits: args.audio_limits(),
+            audio_ffmpeg: args.audio_ffmpeg_policy(),
+        },
+    })
+    .context("starting the embedding worker")
 }
 
 /// The control tokens no generated token may be, handed to the model and

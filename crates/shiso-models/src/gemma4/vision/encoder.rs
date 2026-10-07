@@ -70,8 +70,6 @@ const MODULE_DENSE: &str = "dense";
 /// Registry module the language model's normalization lives in.
 const MODULE_GENERIC: &str = "generic";
 
-/// Square tile the blocked GEMM walks; `VIT_GEMM_TILE` in the kernel set.
-const GEMM_TILE: u32 = 16;
 /// Threads the elementwise kernels are launched with. They stride by this
 /// value internally, so it is the one block size they may be launched with.
 const LINEAR_BLOCK: u32 = 256;
@@ -110,15 +108,6 @@ fn grid_for(total: usize, block: u32) -> u32 {
 }
 
 // -- argument blocks, mirroring the kernel headers ---------------------------
-
-/// `vit_args_gemm`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct GemmArgs {
-    m: u32,
-    n: u32,
-    k: u32,
-}
 
 /// `vit_args_add`.
 #[repr(C)]
@@ -215,7 +204,6 @@ struct NormArgs {
 /// The layouts the kernels read. A field added on one side and not the other
 /// would bind silently, so the widths are asserted rather than trusted.
 const _: () = {
-    assert!(size_of::<GemmArgs>() == 12);
     assert!(size_of::<AddArgs>() == 8);
     assert!(size_of::<AttentionArgs>() == 20);
     assert!(size_of::<Rope2dArgs>() == 24);
@@ -586,7 +574,7 @@ fn encode_item_with_sink<S: StageSink>(
         &streams.x,
         &patch_in,
         &weights.patch,
-        &weights.zero_bias,
+        crate::audio_ops::GemmType::Bf16,
         rows,
         plan.hidden,
         dims.patch_dim,
@@ -600,7 +588,7 @@ fn encode_item_with_sink<S: StageSink>(
     add_inplace(backend, "position add", &streams.x, &pos, n, n)?;
     sink.on_pos_added(&streams.x)?;
     for (i, block) in weights.blocks.iter().enumerate() {
-        encode_block(backend, &plan, block, &weights.zero_bias, &streams)?;
+        encode_block(backend, &plan, block, &streams)?;
         sink.on_block(i, &streams.x)?;
     }
 
@@ -634,7 +622,7 @@ fn encode_item_with_sink<S: StageSink>(
         &out,
         &normed,
         &weights.projection.weight,
-        &weights.zero_bias,
+        weights.projection.dtype,
         tokens,
         plan.out_hidden,
         plan.hidden,
@@ -670,7 +658,6 @@ fn encode_block(
     backend: &Arc<dyn Backend>,
     plan: &Plan,
     block: &Gemma4Block,
-    zero_bias: &DeviceBuffer,
     s: &Streams,
 ) -> Result<(), VisionError> {
     let rows = plan.rows;
@@ -687,39 +674,9 @@ fn encode_block(
         rows,
         plan.eps,
     )?;
-    projected(
-        backend,
-        plan,
-        &block.attn_q,
-        zero_bias,
-        &s.h,
-        &s.c1,
-        &s.q,
-        h,
-        h,
-    )?;
-    projected(
-        backend,
-        plan,
-        &block.attn_k,
-        zero_bias,
-        &s.h,
-        &s.c1,
-        &s.k,
-        h,
-        h,
-    )?;
-    projected(
-        backend,
-        plan,
-        &block.attn_v,
-        zero_bias,
-        &s.h,
-        &s.c1,
-        &s.v,
-        h,
-        h,
-    )?;
+    projected(backend, plan, &block.attn_q, &s.h, &s.c1, &s.q, h, h)?;
+    projected(backend, plan, &block.attn_k, &s.h, &s.c1, &s.k, h, h)?;
+    projected(backend, plan, &block.attn_v, &s.h, &s.c1, &s.v, h, h)?;
     rope2d(
         backend,
         &s.q,
@@ -730,17 +687,7 @@ fn encode_block(
         plan,
     )?;
     attention(backend, &s.attn, &s.q, &s.k, &s.v, plan)?;
-    projected(
-        backend,
-        plan,
-        &block.attn_out,
-        zero_bias,
-        &s.attn,
-        &s.c1,
-        &s.q,
-        h,
-        h,
-    )?;
+    projected(backend, plan, &block.attn_out, &s.attn, &s.c1, &s.q, h, h)?;
     rms_norm_mul(
         backend,
         "attn post norm",
@@ -760,7 +707,6 @@ fn encode_block(
         backend,
         plan,
         &block.ffn_gate,
-        zero_bias,
         &s.h,
         &s.c1,
         &s.gate,
@@ -771,7 +717,6 @@ fn encode_block(
         backend,
         plan,
         &block.ffn_up,
-        zero_bias,
         &s.h,
         &s.c1,
         &s.up,
@@ -783,7 +728,6 @@ fn encode_block(
         backend,
         plan,
         &block.ffn_down,
-        zero_bias,
         &s.mid,
         &s.c2,
         &s.up,
@@ -814,7 +758,6 @@ fn projected(
     backend: &Arc<dyn Backend>,
     plan: &Plan,
     layer: &Gemma4Linear,
-    zero_bias: &DeviceBuffer,
     input: &DeviceBuffer,
     copy: &DeviceBuffer,
     out: &DeviceBuffer,
@@ -840,7 +783,7 @@ fn projected(
         out,
         src,
         &layer.weight,
-        zero_bias,
+        layer.dtype,
         plan.rows,
         width,
         in_width,
@@ -858,40 +801,37 @@ fn projected(
     )
 }
 
-/// `out[m, n] = in[m, k] . weight[n, k] + bias[n]`, the vision set's blocked
-/// GEMM: f32 activations, brain-float weights widened on read.
+/// `out[m, n] = in[m, k] . weight[n, k]`: f32 activations against the
+/// tower's weights - brain-float, or `Q8_0` blocks as a quantized projector
+/// stores them - on the shared encoder set's tiled GEMM.
+///
+/// That GEMM tiles on the matrix units and the vision set's own blocked one
+/// does not; on a 640x480 picture (2394 patch rows through sixteen blocks)
+/// the projections are most of the tower's time. This tower has no biases,
+/// so the product alone is the result.
 fn gemm(
     backend: &Arc<dyn Backend>,
     step: &'static str,
     out: &DeviceBuffer,
     input: &DeviceBuffer,
     weight: &DeviceBuffer,
-    bias: &DeviceBuffer,
+    dtype: crate::audio_ops::GemmType,
     m: usize,
     n: usize,
     k: usize,
 ) -> Result<(), VisionError> {
-    let args = GemmArgs {
-        m: narrow(m),
-        n: narrow(n),
-        k: narrow(k),
-    };
-    launch(
-        backend,
-        step,
-        MODULE_VISION,
-        "kernel_vit_gemm_bias",
-        Extent3::new(grid_for(n, GEMM_TILE), grid_for(m, GEMM_TILE), 1),
-        Extent3::new(GEMM_TILE, GEMM_TILE, 1),
-        0,
-        &[
-            KernelArg::Bytes(bytemuck::bytes_of(&args)),
-            KernelArg::Buffer(out.view()),
-            KernelArg::Buffer(input.view()),
-            KernelArg::Buffer(weight.view()),
-            KernelArg::Buffer(bias.view()),
-        ],
+    let ops = crate::audio_ops::Ops::new(Arc::clone(backend));
+    let bytes = |floats: usize| u64::try_from(floats * 4).unwrap_or(u64::MAX);
+    let encode = |source| VisionError::Encode { step, source };
+    ops.gemm(
+        dtype,
+        out.slice(0, bytes(m * n)).map_err(encode)?,
+        input.slice(0, bytes(m * k)).map_err(encode)?,
+        weight.view(),
+        None,
+        (m, n, k),
     )
+    .map_err(encode)
 }
 
 /// `x[i] += addend[i % period]`, in place.
@@ -925,7 +865,46 @@ fn add_inplace(
 
 /// Bidirectional attention over the item's single temporal group, at the
 /// scale this family's reference uses: one. The score is the bare dot.
+///
+/// On the shared encoder set's tiled span attention whenever the head is a
+/// whole number of 32-lane slices, as every shipped tower's 64-wide head is:
+/// over a 640x480 picture's 2394 rows the vision set's one-row-per-group
+/// kernel was most of the tower's time. Any other width keeps that kernel.
 fn attention(
+    backend: &Arc<dyn Backend>,
+    out: &DeviceBuffer,
+    q: &DeviceBuffer,
+    k: &DeviceBuffer,
+    v: &DeviceBuffer,
+    plan: &Plan,
+) -> Result<(), VisionError> {
+    if !plan.head_dim.is_multiple_of(32) || plan.head_dim > 512 {
+        return attention_scalar(backend, out, q, k, v, plan);
+    }
+    let ops = crate::audio_ops::Ops::new(Arc::clone(backend));
+    ops.span_attention(&crate::audio_ops::SpanAttnDesc {
+        out: out.view(),
+        q: q.view(),
+        k: k.view(),
+        v: v.view(),
+        segments: None,
+        n: plan.rows,
+        heads: plan.heads,
+        kv_heads: plan.heads,
+        head_dim: plan.head_dim,
+        left: plan.rows,
+        right: plan.rows,
+        scale: 1.0,
+    })
+    .map_err(|source| VisionError::Encode {
+        step: "attention",
+        source,
+    })
+}
+
+/// [`attention`] on the vision set's own kernel: one row per threadgroup,
+/// any head width. The fallback for a head the tiled kernel does not take.
+fn attention_scalar(
     backend: &Arc<dyn Backend>,
     out: &DeviceBuffer,
     q: &DeviceBuffer,

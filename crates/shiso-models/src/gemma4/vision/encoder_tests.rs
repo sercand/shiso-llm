@@ -412,34 +412,41 @@ fn build(backend: &Arc<dyn Backend>, clamps: Clamps) -> (Gemma4VisionWeights, Re
         blocks.push(Gemma4Block {
             ln1: dev_f32(backend, &ln1),
             attn_q: Gemma4Linear {
+                dtype: crate::audio_ops::GemmType::Bf16,
                 weight: q_d,
                 clamps,
             },
             attn_k: Gemma4Linear {
+                dtype: crate::audio_ops::GemmType::Bf16,
                 weight: k_d,
                 clamps,
             },
             attn_v: Gemma4Linear {
+                dtype: crate::audio_ops::GemmType::Bf16,
                 weight: v_d,
                 clamps,
             },
             q_norm: dev_f32(backend, &qn),
             k_norm: dev_f32(backend, &kn),
             attn_out: Gemma4Linear {
+                dtype: crate::audio_ops::GemmType::Bf16,
                 weight: o_d,
                 clamps,
             },
             attn_post_norm: dev_f32(backend, &apn),
             ln2: dev_f32(backend, &ln2),
             ffn_gate: Gemma4Linear {
+                dtype: crate::audio_ops::GemmType::Bf16,
                 weight: g_d,
                 clamps,
             },
             ffn_up: Gemma4Linear {
+                dtype: crate::audio_ops::GemmType::Bf16,
                 weight: u_d,
                 clamps,
             },
             ffn_down: Gemma4Linear {
+                dtype: crate::audio_ops::GemmType::Bf16,
                 weight: dn_d,
                 clamps,
             },
@@ -465,7 +472,6 @@ fn build(backend: &Arc<dyn Backend>, clamps: Clamps) -> (Gemma4VisionWeights, Re
         let w = signal(d.out_hidden * h, 99);
         (dev_bf16(backend, &w), widen(&w))
     };
-    let maxw = h.max(d.intermediate).max(d.out_hidden).max(d.patch_dim);
     let weights = Gemma4VisionWeights {
         dims: d,
         patch: dev_bf16(backend, &patch),
@@ -473,10 +479,10 @@ fn build(backend: &Arc<dyn Backend>, clamps: Clamps) -> (Gemma4VisionWeights, Re
         position_y: pos_y.clone(),
         blocks,
         projection: Gemma4Linear {
+            dtype: crate::audio_ops::GemmType::Bf16,
             weight: proj_d,
             clamps: NO_CLAMPS,
         },
-        zero_bias: dev_bf16(backend, &vec![0.0f32; maxw]),
         ones: dev_f32(backend, &vec![1.0f32; h]),
     };
     let reference = RefTower {

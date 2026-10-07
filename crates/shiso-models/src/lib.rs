@@ -18,6 +18,8 @@ pub mod audio_ops;
 pub mod audio_registry;
 pub mod catalog;
 pub mod clef;
+pub mod embedder;
+pub mod embedding_gemma2;
 pub mod flux2;
 pub mod gemma4;
 pub mod image_registry;
@@ -44,5 +46,6 @@ pub fn family_catalog() -> &'static [FamilyFacts] {
         nemotron_diar::FACTS,
         qwen3_asr::FACTS,
         flux2::FACTS,
+        embedding_gemma2::FACTS,
     ]
 }

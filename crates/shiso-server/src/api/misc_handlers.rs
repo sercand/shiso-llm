@@ -423,6 +423,27 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
             image: None,
         });
     }
+    // An embedding model answers to its own id too, with the positions one
+    // input may occupy as its context: that is the number a client sizes
+    // its chunks by.
+    if let Some(embedding) = &state.embedding {
+        let max = u32::try_from(embedding.info().max_tokens).unwrap_or(u32::MAX);
+        data.push(ModelInfo {
+            id: embedding.model_id().to_owned(),
+            object: "model",
+            created,
+            owned_by: "shiso",
+            name: embedding.model_id().to_owned(),
+            context_length: max,
+            top_provider: TopProvider {
+                context_length: max,
+                max_completion_tokens: 0,
+                is_moderated: false,
+            },
+            supported_parameters: vec!["dimensions", "encoding_format", "input_type"],
+            image: None,
+        });
+    }
     // The generator answers to its own id the same way, for the same reason:
     // a client discovers what to name in `model` by reading this list.
     if let Some(image) = &state.image {

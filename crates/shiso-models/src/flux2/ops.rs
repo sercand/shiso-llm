@@ -958,7 +958,7 @@ impl Ops {
         let bias = call.bias.unwrap_or(self.dummy.view());
         // The simdgroup tile stages whole 16-wide k slices; every linear in
         // the family qualifies, and the scalar kernels keep any other shape.
-        let tiled = call.k % G64_K == 0;
+        let tiled = call.k.is_multiple_of(G64_K);
         let entry = match (call.kind, tiled) {
             (WeightKind::Fp8, true) => "kernel_flux2_gemm64_fp8",
             (WeightKind::Bf16, true) => "kernel_flux2_gemm64_bf16",
@@ -1025,7 +1025,7 @@ impl Ops {
                 call.step
             )));
         }
-        if dense_cols % 4 != 0 || inner % 4 != 0 || k % G64_K != 0 {
+        if !dense_cols.is_multiple_of(4) || !inner.is_multiple_of(4) || !k.is_multiple_of(G64_K) {
             return self.linear_residual_unfused(call, dense_cols, inner);
         }
         let args = GemmFusedArgs {
@@ -1256,7 +1256,7 @@ impl Ops {
         let rows = (call.txt_tokens + call.img_tokens) as u32;
         // The fused kernel holds a head as 8x8 fragments in registers; the
         // transformer's 128-wide heads qualify, the VAE's 512-wide one does not.
-        let (entry, grid, block) = if call.head_dim % 8 == 0 && call.head_dim <= FA_MAX_D {
+        let (entry, grid, block) = if call.head_dim.is_multiple_of(8) && call.head_dim <= FA_MAX_D {
             (
                 "kernel_flux2_flash_sdpa_f32",
                 Extent3::new(grid_for(rows, FA_QROWS), call.heads as u32, 1),
@@ -1522,7 +1522,7 @@ impl Ops {
         let bias = call.bias.unwrap_or(self.dummy.view());
         // As an implicit GEMM the reduction is the taps; every VAE conv has
         // a multiple of 16 of them, and the per-pixel kernel keeps the rest.
-        let (entry, grid, block) = if (call.in_c * call.k_h * call.k_w) % G64_K == 0 {
+        let (entry, grid, block) = if (call.in_c * call.k_h * call.k_w).is_multiple_of(G64_K) {
             (
                 "kernel_flux2_conv2d_gemm_f32",
                 Extent3::new(

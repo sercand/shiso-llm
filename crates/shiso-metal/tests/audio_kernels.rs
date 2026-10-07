@@ -98,6 +98,9 @@ device_cases!(
     batched_decode_attention_reads_each_length,
     batched_step_stops_each_sequence_alone,
     batched_embed_token_takes_each_state_token_row,
+    span_attention_matches_windowed_bidirectional_and_causal,
+    gelu_tanh_mul_gates_plain_and_strided_up_rows,
+    rope_half_pos_takes_each_rows_position,
 );
 
 #[test]
