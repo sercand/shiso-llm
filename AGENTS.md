@@ -12,8 +12,12 @@ Run everything from the repository root so `rust-toolchain.toml` (1.98.1)
 applies. Pass `--locked` because `Cargo.lock` is committed.
 
 ```sh
-bash scripts/check.sh          # the whole gate; there is no CI
-bash scripts/api_gate.sh       # rules, unsafe audit, type contracts, forbidden shapes
+bash scripts/check.sh                  # the gate, scoped to crates changed since master + dependents
+bash scripts/check.sh shiso-router     # these crates + their dependents
+bash scripts/check.sh --all            # the whole workspace (root manifest, lockfile, gate edits do this anyway)
+bash scripts/check.sh --no-dependents  # inner loop only: skips dependents, so not a gate
+bash scripts/check.sh --only clippy,test   # or --skip doc; steps: fmt tree clippy test doc deny libcuda perf
+bash scripts/api_gate.sh               # standalone: tree rules plus contracts, fmt, clippy, deny
 
 # individual steps (macOS needs the metal feature; Linux uses cuda or none)
 SHISO_SKIP_BUILD=1 cargo test --workspace --locked --features shiso-server/metal
@@ -23,6 +27,10 @@ cargo doc --workspace --no-deps --locked --features shiso-server/metal
 cargo test -p <crate> --test <name>          # a single test target
 ```
 
+- `check.sh` already runs everything in `api_gate.sh` (it calls it with
+  `--tree-only` and runs the cargo steps itself), so there is no need to run
+  both. `scripts/scope.py` decides the scope; there is no CI, so there is
+  no separate full run before merging unless you ask for `--all`.
 - `SHISO_SKIP_BUILD=1` stubs out the CUDA kernel compile. A real compile needs
   `SHISO_CUDA_COMPILE=1` and nvcc; `SHISO_CUDA_ARCH` overrides the target
   architectures.

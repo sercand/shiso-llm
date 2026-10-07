@@ -267,8 +267,9 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 
 ## Contributing
 
-`bash scripts/check.sh` runs the full test and lint suite; it has to pass
-before a change lands. Read [`AGENTS.md`](AGENTS.md) for the architecture and
+`bash scripts/check.sh` runs the test and lint suite over the crates a change
+touches and everything that depends on them (`--all` for the whole
+workspace); it has to pass before a change lands. Read [`AGENTS.md`](AGENTS.md) for the architecture and
 the rules the checks enforce.
 
 ## Acknowledgements
