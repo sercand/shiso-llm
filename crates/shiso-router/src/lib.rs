@@ -6,6 +6,8 @@
     reason = "imported router crate uses standard idioms and internal lock unwraps"
 )]
 
+/// Access log for every inbound request.
+pub(crate) mod access;
 /// Active in-flight requests.
 pub(crate) mod active;
 /// Admin API and UI endpoints.
@@ -68,6 +70,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/v1/messages", post(proxy::proxy_handler))
         .route("/v1/decisions", post(proxy::proxy_handler))
         .route("/v1/systemone", post(proxy::proxy_handler))
+        .route("/v1/images/generations", post(proxy::proxy_handler))
+        .route("/v1/images", post(proxy::proxy_handler))
         .route("/v1/models", get(models_endpoint::list_models))
         .route("/v1/v1/models", get(models_endpoint::list_models))
         .route("/chat/completions", post(proxy::proxy_handler))
@@ -77,6 +81,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/messages", post(proxy::proxy_handler))
         .route("/decisions", post(proxy::proxy_handler))
         .route("/systemone", post(proxy::proxy_handler))
+        .route("/images/generations", post(proxy::proxy_handler))
+        .route("/images", post(proxy::proxy_handler))
         .route("/models", get(models_endpoint::list_models))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -90,7 +96,9 @@ pub fn build_router(state: AppState) -> Router {
             .merge(admin_ui_routes());
     }
     app.route("/healthz", get(|| async { "ok" }))
+        .fallback(access::unknown_endpoint)
         .layer(DefaultBodyLimit::max(state.max_body_bytes))
+        .layer(middleware::from_fn(access::log_request))
         .with_state(state)
 }
 
@@ -103,7 +111,9 @@ pub fn build_admin_router(state: AppState) -> Router {
         .merge(admin_routes(state.clone()))
         .merge(admin_ui_routes())
         .route("/healthz", get(|| async { "ok" }))
+        .fallback(access::unknown_endpoint)
         .layer(DefaultBodyLimit::max(state.max_body_bytes))
+        .layer(middleware::from_fn(access::log_request))
         .with_state(state)
 }
 

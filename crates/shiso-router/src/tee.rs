@@ -34,6 +34,12 @@ pub(crate) enum Dialect {
     /// `input_tokens`/`output_tokens` (systemone), both of which
     /// `apply_openai_usage` already reads.
     Scoring,
+    /// Image generation (`/v1/images/generations`). Bodies are mostly
+    /// base64 image data, and the usage object rides at the end of the
+    /// response (or of each streamed `image_generation.completed` frame),
+    /// so it is recovered from a bounded tail window rather than a whole
+    /// parse.
+    Images,
     Anthropic,
 }
 
@@ -49,6 +55,8 @@ impl Dialect {
             Dialect::OpenAiTranscriptions
         } else if path.ends_with("/v1/decisions") || path.ends_with("/v1/systemone") {
             Dialect::Scoring
+        } else if path.ends_with("/v1/images/generations") {
+            Dialect::Images
         } else {
             Dialect::OpenAiChat
         }
@@ -119,6 +127,10 @@ enum Mode {
     Sse {
         partial: Vec<u8>,
         skipping_oversized: bool,
+        /// The last `MAX_EDGE_WINDOW` bytes of the line being skipped, kept
+        /// only for `Dialect::Images`: a streamed image frame is far over
+        /// `MAX_SSE_LINE`, and the completed frame's `usage` is at its end.
+        oversized_tail: Vec<u8>,
     },
     Json {
         buf: Vec<u8>,
@@ -166,10 +178,11 @@ impl UsageAccumulator {
                 Mode::Sse {
                     partial: Vec::new(),
                     skipping_oversized: false,
+                    oversized_tail: Vec::new(),
                 },
                 false,
             )
-        } else if dialect == Dialect::OpenAiEmbeddings {
+        } else if matches!(dialect, Dialect::OpenAiEmbeddings | Dialect::Images) {
             (
                 Mode::Edges {
                     head: Vec::new(),
@@ -233,12 +246,18 @@ impl UsageAccumulator {
             Mode::Sse {
                 partial,
                 skipping_oversized,
+                oversized_tail,
             } => {
+                let keep_tail = self.dialect == Dialect::Images;
                 let mut rest = chunk;
                 while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
                     let (head, tail) = rest.split_at(pos);
                     if *skipping_oversized {
                         *skipping_oversized = false;
+                        if keep_tail {
+                            push_window(oversized_tail, head);
+                            finish_oversized_line(&mut self.ext, oversized_tail);
+                        }
                     } else if partial.is_empty() {
                         process_data_line(self.dialect, &mut self.ext, &mut self.saw_token, head);
                     } else {
@@ -248,14 +267,27 @@ impl UsageAccumulator {
                     }
                     rest = &tail[1..];
                 }
-                if !rest.is_empty() && !*skipping_oversized {
-                    if partial.len() + rest.len() > MAX_SSE_LINE {
-                        // Give up on this line; scan for the next newline.
-                        partial.clear();
-                        *skipping_oversized = true;
-                    } else {
-                        partial.extend_from_slice(rest);
+                if rest.is_empty() {
+                    return;
+                }
+                if *skipping_oversized {
+                    if keep_tail {
+                        push_window(oversized_tail, rest);
                     }
+                } else if partial.len() + rest.len() > MAX_SSE_LINE {
+                    // Give up on parsing this line whole; scan for the next
+                    // newline. A line this long carries a payload, so it
+                    // is never a prologue.
+                    self.saw_token = true;
+                    if keep_tail {
+                        oversized_tail.clear();
+                        push_window(oversized_tail, partial);
+                        push_window(oversized_tail, rest);
+                    }
+                    partial.clear();
+                    *skipping_oversized = true;
+                } else {
+                    partial.extend_from_slice(rest);
                 }
             }
         }
@@ -269,8 +301,11 @@ impl UsageAccumulator {
             Mode::Sse {
                 partial,
                 skipping_oversized,
+                oversized_tail,
             } => {
-                if !*skipping_oversized && !partial.is_empty() {
+                if *skipping_oversized {
+                    finish_oversized_line(&mut self.ext, oversized_tail);
+                } else if !partial.is_empty() {
                     let line = std::mem::take(partial);
                     process_data_line(self.dialect, &mut self.ext, &mut self.saw_token, &line);
                 }
@@ -325,6 +360,26 @@ impl UsageAccumulator {
             error: ext.body_error,
         }
     }
+}
+
+/// Appends `bytes` to a window that keeps only its last `MAX_EDGE_WINDOW`
+/// bytes.
+fn push_window(window: &mut Vec<u8>, bytes: &[u8]) {
+    window.extend_from_slice(bytes);
+    if window.len() > MAX_EDGE_WINDOW {
+        window.drain(..window.len() - MAX_EDGE_WINDOW);
+    }
+}
+
+/// Recovers usage from the tail of an SSE line too long to parse whole.
+/// Empty for every dialect but `Images`, which is the only one that fills
+/// the tail; base64 carries no quotes, so `last_usage_object` cannot be
+/// fooled by the image payload in front of the `usage` key.
+fn finish_oversized_line(ext: &mut Extracted, tail: &mut Vec<u8>) {
+    if let Some(usage) = last_usage_object(tail) {
+        apply_openai_usage(ext, &usage);
+    }
+    tail.clear();
 }
 
 /// Parses a complete non-SSE response body: usage plus, for a body that
@@ -523,6 +578,9 @@ fn apply_event(dialect: Dialect, ext: &mut Extracted, v: &Value) {
         Dialect::OpenAiTranscriptions => apply_openai_usage(ext, &v["usage"]),
         // Scoring replies have no finish reason: the answers are the reply.
         Dialect::Scoring => apply_openai_usage(ext, &v["usage"]),
+        // Streamed usage is cumulative over the request's images, so the
+        // last completed frame's value is the total.
+        Dialect::Images => apply_openai_usage(ext, &v["usage"]),
         Dialect::Anthropic => match v["type"].as_str() {
             Some("message_start") => {
                 apply_anthropic_usage(ext, &v["message"]["usage"]);
@@ -792,6 +850,47 @@ mod tests {
             acc.push(c);
         }
         acc.finish(true)
+    }
+
+    /// A JSON image response is mostly base64; usage is recovered from the
+    /// tail even when the body is far past the whole-body cap.
+    #[test]
+    fn images_json_body_recovers_usage_past_the_buffer_cap() {
+        let b64 = "A".repeat(MAX_JSON_BUFFER + 1);
+        let body = format!(
+            r#"{{"created":1,"data":[{{"b64_json":"{b64}","media_type":"image/png"}}],"usage":{{"prompt_tokens":12,"completion_tokens":0,"total_tokens":12}}}}"#
+        );
+        let usage = feed(Dialect::Images, false, &[body.as_bytes()]);
+        assert_eq!(usage.prompt_tokens, Some(12));
+        assert_eq!(usage.completion_tokens, Some(0));
+        assert_eq!(usage.total_tokens, Some(12));
+    }
+
+    /// Streamed image frames are far over the SSE line cap; the completed
+    /// frame's usage still comes out of its tail, and the last frame wins.
+    #[test]
+    fn images_sse_recovers_usage_from_oversized_completed_frames() {
+        let b64 = "B".repeat(MAX_SSE_LINE * 3);
+        let frame = |n: u32| {
+            format!(
+                "event: image_generation.completed\ndata: {{\"type\":\"image_generation.completed\",\"created\":1,\"b64_json\":\"{b64}\",\"media_type\":\"image/png\",\"usage\":{{\"prompt_tokens\":{n},\"completion_tokens\":0,\"total_tokens\":{n}}}}}\n\n"
+            )
+        };
+        let first = frame(7);
+        let second = frame(14);
+        // Split mid-payload so the oversized line spans several chunks.
+        let (a, b) = first.as_bytes().split_at(1000);
+        let mut acc = UsageAccumulator::new(Dialect::Images, true, false);
+        acc.push(b": accepted\n\n");
+        assert!(!acc.saw_token());
+        acc.push(a);
+        acc.push(b);
+        assert!(acc.saw_token(), "an oversized frame is a payload");
+        acc.push(second.as_bytes());
+        acc.push(b"data: [DONE]\n\n");
+        let usage = acc.finish(true);
+        assert_eq!(usage.prompt_tokens, Some(14));
+        assert_eq!(usage.total_tokens, Some(14));
     }
 
     #[test]

@@ -641,8 +641,8 @@ fn deadline_ms(headers: &HeaderMap, qos: &RouteQos) -> Option<i64> {
 /// The API kind an inbound endpoint speaks (same mapping as
 /// `Dialect::for_path`): `/v1/messages` is Anthropic wire format,
 /// `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`,
-/// `/v1/audio/transcriptions`, `/v1/decisions` and `/v1/systemone` are
-/// OpenAI.
+/// `/v1/audio/transcriptions`, `/v1/decisions`, `/v1/systemone` and
+/// `/v1/images/generations` are OpenAI.
 fn required_kind(path: &str) -> BackendKind {
     if path.ends_with("/v1/messages") {
         BackendKind::Anthropic
@@ -665,6 +665,10 @@ fn canonical_path(path: &str) -> &str {
         "/v1/v1/messages" => "/v1/messages",
         "/decisions" => "/v1/decisions",
         "/systemone" => "/v1/systemone",
+        // `/v1/images/generations` is the OpenAI spelling; `/images` (the
+        // OpenRouter one) and `/v1/images` are the shorthands clients reach
+        // for. All of them go upstream as the OpenAI path.
+        "/images" | "/v1/images" | "/images/generations" => "/v1/images/generations",
         other => other,
     }
 }
@@ -781,6 +785,8 @@ fn token_limit_field(
         // clamp — and injecting one would be a refusal: the decisions wire
         // refuses unknown fields.
         Dialect::Scoring => None,
+        // An image's cost is its step count and size, not a token budget.
+        Dialect::Images => None,
     }
 }
 
@@ -1134,6 +1140,30 @@ mod tests {
     fn clamp_does_not_apply_to_scoring() {
         let body = Bytes::from_static(br#"{"model":"m","input":"hi","questions":[]}"#);
         let out = prepare_body(&body, &clamp(Dialect::Scoring, 512)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 3, "nothing was added: {v}");
+    }
+
+    #[test]
+    fn canonical_paths_fold_the_image_spellings() {
+        for p in [
+            "/images",
+            "/v1/images",
+            "/images/generations",
+            "/v1/images/generations",
+        ] {
+            assert_eq!(canonical_path(p), "/v1/images/generations");
+        }
+        assert_eq!(Dialect::for_path("/v1/images/generations"), Dialect::Images);
+        assert_eq!(required_kind("/v1/images/generations"), BackendKind::Openai);
+    }
+
+    /// The image wire has no token limit; an injected `max_tokens` would
+    /// be a field the generator never asked for.
+    #[test]
+    fn clamp_does_not_apply_to_images() {
+        let body = Bytes::from_static(br#"{"model":"m","prompt":"a fox","steps":20}"#);
+        let out = prepare_body(&body, &clamp(Dialect::Images, 512)).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v.as_object().unwrap().len(), 3, "nothing was added: {v}");
     }
