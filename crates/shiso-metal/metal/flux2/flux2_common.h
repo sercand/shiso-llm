@@ -27,11 +27,11 @@
 #define FLUX2_G64_THREADS 128u
 
 // The fused attention tile (`kernel_flux2_flash_sdpa_f32`): 32 query rows per
-// threadgroup of four simdgroups (eight rows each), keys streamed 16 at a
+// threadgroup of four simdgroups (eight rows each), keys streamed 32 at a
 // time, heads up to FLUX2_FA_MAX_D wide in multiples of eight. The driver
 // sends wider or ragged heads to `kernel_flux2_sdpa_f32`.
 #define FLUX2_FA_QROWS 32u
-#define FLUX2_FA_KEYS 16u
+#define FLUX2_FA_KEYS 32u
 #define FLUX2_FA_MAX_D 128u
 #define FLUX2_FA_THREADS 128u
 
@@ -133,6 +133,27 @@ static inline float flux2_block_sum(float v, threadgroup float *scratch, uint ti
     return scratch[n_warp];
 }
 
+/// [`flux2_block_sum`]'s shape with `max` in place of `+`.
+static inline float flux2_block_max(float v, threadgroup float *scratch, uint tid) {
+    const uint lane = tid & 31u;
+    const uint warp = tid >> 5u;
+    v = simd_max(v);
+    if (lane == 0u) {
+        scratch[warp] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint n_warp = FLUX2_BLOCK / 32u;
+    v = (tid < n_warp) ? scratch[tid] : -INFINITY;
+    if (warp == 0u) {
+        v = simd_max(v);
+    }
+    if (tid == 0u) {
+        scratch[n_warp] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return scratch[n_warp];
+}
+
 // --- argument blocks --------------------------------------------------------
 //
 // One block per kernel family, passed as `constant T & args [[buffer(0)]]`.
@@ -208,6 +229,13 @@ struct flux2_args_norm {
     uint32_t rows;
     uint32_t dim;
     float eps;
+};
+
+/// Row softmax of `scale * x`, in place, over `rows` rows of `cols`.
+struct flux2_args_softmax {
+    uint32_t rows;
+    uint32_t cols;
+    float scale;
 };
 
 /// Per-head RMS normalization with a per-dimension scale over the q and k
@@ -296,6 +324,8 @@ struct flux2_args_group_norm {
     uint32_t channels_per_group;
     uint32_t spatial;
     float eps;
+    /// Slices each group is split into, one threadgroup apiece.
+    uint32_t chunks;
 };
 
 /// Nearest-neighbour 2x upsampling of an NCHW field.
@@ -322,6 +352,7 @@ static_assert(sizeof(flux2_args_modulate) == 8, "ModulateArgs");
 static_assert(sizeof(flux2_args_add_gated) == 8, "AddGatedArgs");
 static_assert(sizeof(flux2_args_axpy) == 8, "AxpyArgs");
 static_assert(sizeof(flux2_args_norm) == 12, "NormArgs");
+static_assert(sizeof(flux2_args_softmax) == 12, "SoftmaxArgs");
 static_assert(sizeof(flux2_args_qk_norm) == 20, "QkNormArgs");
 static_assert(sizeof(flux2_args_concat) == 12, "ConcatArgs");
 static_assert(sizeof(flux2_args_sdpa) == 44, "SdpaArgs");
@@ -329,6 +360,6 @@ static_assert(sizeof(flux2_args_gqa) == 16, "GqaArgs");
 static_assert(sizeof(flux2_args_rope_4d) == 28, "Rope4dArgs");
 static_assert(sizeof(flux2_args_rope_half) == 12, "RopeHalfArgs");
 static_assert(sizeof(flux2_args_conv2d) == 48, "Conv2dArgs");
-static_assert(sizeof(flux2_args_group_norm) == 20, "GroupNormArgs");
+static_assert(sizeof(flux2_args_group_norm) == 24, "GroupNormArgs");
 static_assert(sizeof(flux2_args_upsample) == 16, "UpsampleArgs");
 static_assert(sizeof(flux2_args_embed) == 8, "EmbedArgs");

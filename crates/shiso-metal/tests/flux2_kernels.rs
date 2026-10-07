@@ -64,7 +64,9 @@ const ENTRIES: &[&str] = &[
     "kernel_flux2_rope_4d",
     "kernel_flux2_rope_half",
     "kernel_flux2_conv2d_f32",
-    "kernel_flux2_group_norm_f32",
+    "kernel_flux2_group_norm_stats_f32",
+    "kernel_flux2_group_norm_apply_f32",
+    "kernel_flux2_softmax_rows_f32",
     "kernel_flux2_upsample_nearest_f32",
     "kernel_flux2_transpose_f32",
     "kernel_flux2_embed_bf16_f32",
@@ -232,6 +234,7 @@ struct GroupNormArgs {
     channels_per_group: u32,
     spatial: u32,
     eps: f32,
+    chunks: u32,
 }
 
 #[repr(C)]
@@ -348,6 +351,19 @@ fn assert_close(got: &[f32], expected: &[f32], what: &str) {
     for (i, (&g, &e)) in got.iter().zip(expected).enumerate() {
         assert!(
             (g - e).abs() <= 1e-4 * e.abs().max(1.0),
+            "{what}: element {i} got {g}, expected {e}"
+        );
+    }
+}
+
+/// The fused attention stages q, k, v and the probabilities as half and
+/// accumulates in f32: about three decimal digits on these cases' values,
+/// still well inside what [`assert_differs`] tells apart.
+fn assert_close_half(got: &[f32], expected: &[f32], what: &str) {
+    assert_eq!(got.len(), expected.len(), "{what}: length");
+    for (i, (&g, &e)) in got.iter().zip(expected).enumerate() {
+        assert!(
+            (g - e).abs() <= 2e-3 * e.abs().max(0.05),
             "{what}: element {i} got {g}, expected {e}"
         );
     }
@@ -2082,7 +2098,7 @@ fn conv2d_ignores_bias_when_the_flag_is_clear() {
 #[test]
 fn group_norm_normalizes_each_group_and_affines_by_channel() {
     let Some(b) = open() else { return };
-    let (batch, groups, cpg, spatial, eps) = (2usize, 2usize, 2usize, 3usize, 1e-5f32);
+    let (batch, groups, cpg, spatial, eps) = (2usize, 2usize, 2usize, 37usize, 1e-5f32);
     let channels = groups * cpg;
     let per_group = cpg * spatial;
     let x = vals(batch * groups * per_group, 59);
@@ -2094,30 +2110,6 @@ fn group_norm_normalizes_each_group_and_affines_by_channel() {
     let bias = (0..channels)
         .map(|i| -0.25 * (i as f32))
         .collect::<Vec<f32>>();
-    let in_buf = upload_f32(&b, &x);
-    let w_buf = upload_f32(&b, &w);
-    let bias_buf = upload_f32(&b, &bias);
-    let out_buf = alloc(&b, (x.len() * 4) as u64).expect("alloc");
-    let args = GroupNormArgs {
-        batch: batch as u32,
-        num_groups: groups as u32,
-        channels_per_group: cpg as u32,
-        spatial: spatial as u32,
-        eps,
-    };
-    launch(
-        &b,
-        "kernel_flux2_group_norm_f32",
-        Extent3::linear((batch * groups) as u32),
-        Extent3::linear(BLOCK),
-        &[
-            KernelArg::Bytes(bytes_of(&args)),
-            KernelArg::Buffer(out_buf.view()),
-            KernelArg::Buffer(in_buf.view()),
-            KernelArg::Buffer(w_buf.view()),
-            KernelArg::Buffer(bias_buf.view()),
-        ],
-    );
     let mut expected = vec![0f32; x.len()];
     for g in 0..(batch * groups) {
         let base = g * per_group;
@@ -2133,8 +2125,93 @@ fn group_norm_normalizes_each_group_and_affines_by_channel() {
             expected[base + i] = (x[base + i] - mean) * inv * w[ch] + bias[ch];
         }
     }
-    let got = read_f32(&b, out_buf.view(), x.len());
-    assert_close(&got, &expected, "group_norm");
+    let in_buf = upload_f32(&b, &x);
+    let w_buf = upload_f32(&b, &w);
+    let bias_buf = upload_f32(&b, &bias);
+    // One slice (the whole group), ragged slices across a channel boundary,
+    // and more slices than the group can fill (25 slices of 3 over 74
+    // elements leave the last one empty).
+    for chunks in [1usize, 3, 25] {
+        let out_buf = alloc(&b, (x.len() * 4) as u64).expect("alloc");
+        let partials = alloc(&b, (batch * groups * chunks * 2 * 4) as u64).expect("alloc");
+        let args = GroupNormArgs {
+            batch: batch as u32,
+            num_groups: groups as u32,
+            channels_per_group: cpg as u32,
+            spatial: spatial as u32,
+            eps,
+            chunks: chunks as u32,
+        };
+        let grid = Extent3::new((batch * groups) as u32, chunks as u32, 1);
+        launch(
+            &b,
+            "kernel_flux2_group_norm_stats_f32",
+            grid,
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(partials.view()),
+                KernelArg::Buffer(in_buf.view()),
+            ],
+        );
+        launch(
+            &b,
+            "kernel_flux2_group_norm_apply_f32",
+            grid,
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(out_buf.view()),
+                KernelArg::Buffer(in_buf.view()),
+                KernelArg::Buffer(w_buf.view()),
+                KernelArg::Buffer(bias_buf.view()),
+                KernelArg::Buffer(partials.view()),
+            ],
+        );
+        let got = read_f32(&b, out_buf.view(), x.len());
+        assert_close(&got, &expected, "group_norm");
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SoftmaxArgs {
+    rows: u32,
+    cols: u32,
+    scale: f32,
+}
+
+#[test]
+fn softmax_rows_normalizes_each_scaled_row_in_place() {
+    let Some(b) = open() else { return };
+    // 70 columns: more than one pass of the 64-thread block, ragged.
+    let (rows, cols, scale) = (3usize, 70usize, 0.3f32);
+    let x: Vec<f32> = vals(rows * cols, 71).iter().map(|v| v * 20.0).collect();
+    let buf = upload_f32(&b, &x);
+    let args = SoftmaxArgs {
+        rows: rows as u32,
+        cols: cols as u32,
+        scale,
+    };
+    launch(
+        &b,
+        "kernel_flux2_softmax_rows_f32",
+        Extent3::linear(rows as u32),
+        Extent3::linear(BLOCK),
+        &[
+            KernelArg::Bytes(bytes_of(&args)),
+            KernelArg::Buffer(buf.view()),
+        ],
+    );
+    let mut expected = Vec::with_capacity(x.len());
+    for row in x.chunks_exact(cols) {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let e: Vec<f32> = row.iter().map(|v| ((v - max) * scale).exp()).collect();
+        let sum: f32 = e.iter().sum();
+        expected.extend(e.iter().map(|v| v / sum));
+    }
+    let got = read_f32(&b, buf.view(), x.len());
+    assert_close(&got, &expected, "softmax_rows");
 }
 
 #[test]
@@ -2656,8 +2733,8 @@ fn flash_sdpa_matches_joint_attention_over_fused_rows_and_a_cache() {
     };
     let expected = expect_all(&case);
     let (got_txt, got_img) = run_flash(&b, &case);
-    assert_close(&got_txt, &expected[..txt * hidden], "flash sdpa: txt rows");
-    assert_close(&got_img, &expected[txt * hidden..], "flash sdpa: img rows");
+    assert_close_half(&got_txt, &expected[..txt * hidden], "flash sdpa: txt rows");
+    assert_close_half(&got_img, &expected[txt * hidden..], "flash sdpa: img rows");
 }
 
 #[test]
@@ -2703,10 +2780,10 @@ fn flash_sdpa_matches_the_per_row_kernel_on_packed_narrow_heads() {
     };
     let (flash_txt, flash_img) = run_flash(&b, &case);
     let (row_txt, row_img) = run_sdpa(&b, &case);
-    assert_close(&flash_txt, &row_txt, "flash vs per-row: txt rows");
-    assert_close(&flash_img, &row_img, "flash vs per-row: img rows");
+    assert_close_half(&flash_txt, &row_txt, "flash vs per-row: txt rows");
+    assert_close_half(&flash_img, &row_img, "flash vs per-row: img rows");
     let expected = expect_all(&case);
-    assert_close(
+    assert_close_half(
         &flash_img,
         &expected[txt * hidden..],
         "flash sdpa packed: img rows",
