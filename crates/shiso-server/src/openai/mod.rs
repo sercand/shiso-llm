@@ -23,6 +23,8 @@ pub mod chat_sse;
 pub mod chat_to_ir;
 pub mod chat_wire;
 pub mod completions;
+pub mod embeddings;
+pub mod embeddings_wire;
 pub mod images;
 pub mod images_wire;
 pub mod responses;

@@ -13,6 +13,7 @@ listed.
 | `kernel_audio_argmax_merge_f32` | `audio_args_argmax_split` | out u32 `[1]`, parts (from the entry above) | 1 × 256, 0 |
 | `kernel_audio_glu_f32` | `audio_args_glu{rows, channels}` | out `[rows][C]`, in `[rows][2C]` | `ceil(rows·C/256)` × 256, 0 |
 | `kernel_audio_silu_mul_f32` | `audio_args_silu_mul{count}` | out, gate, up (`out` may be `gate`) | `ceil(count/256)` × 256, 0 |
+| `kernel_audio_gelu_tanh_mul_f32` | `audio_args_gelu_mul{rows, cols, up_stride, up_offset}` | out `[rows][cols]`, gate `[rows][cols]` (`out` may be `gate`), up (row `r` at `r·up_stride + up_offset`) | `ceil(rows·cols/256)` × 256, 0 |
 | `kernel_audio_add_rms_norm_f32` | `audio_args_norm{rows, dim, eps, flags}` | out (may be add, not x), x (in/out) `[rows][dim]`, add, weight `[dim]` | rows × 256, 132 |
 | `kernel_audio_layer_norm_f32` | `audio_args_norm{rows, dim, eps, flags}` | out, in, weight `[dim]`, bias `[dim]` | rows × 256, 132 |
 | `kernel_audio_rms_norm_f32` | `audio_args_norm{rows, dim, eps, flags}` | out, in, weight `[dim]` | rows × 256, 132 |
@@ -36,7 +37,9 @@ listed.
 | `kernel_audio_transpose_f32` | `audio_args_transpose{batch, rows, cols}` | out `[b][cols][rows]`, in `[b][rows][cols]` | `ceil(b·rows·cols/256)` × 256, 0 |
 | `kernel_audio_rel_scores_f32` | `audio_args_window_attn` (as below) | scores `[n_q][H][n_d]`, q `[n_q][H·hd]`, bias_v `[H·hd]`, q_dim_scale `[hd]`, rel `[n_d][H·hd]` | `(ceil(n_d/4), heads, ceil(n_q/8))` × 32, 0 |
 | `kernel_audio_window_attn_f32` | `audio_args_window_attn{n_q, n_k, heads, head_dim, q_abs0, k_abs0, k_end, chunk, left_chunks, d_min, n_d, scale, ac_scale, softcap, has_bias_uv, has_q_dim_scale}` | out, q `[n_q][H·hd]`, k, v `[n_k][H·hd]`, bias_u `[H·hd]`, q_dim_scale `[hd]`, rel_scores `[n_q][H][n_d]` (from the entry above; unread when `n_d` is 0) | `(heads, ceil(n_q/8))` × 32, 8·hd·4 |
+| `kernel_audio_span_attn_f32` | `audio_args_span_attn{n, heads, kv_heads, head_dim, left, right, scale, row_groups, segmented}` | out `[n][H·hd]`, q `[n][H·hd]`, k `[n][Hkv·hd]`, v `[n][Hkv·hd]` (all 16-byte aligned), segments u32 `[n][2]` (unread when `segmented` is 0) | `(kv_heads, ceil(n·(H/Hkv)/(8·row_groups)))` × `32·row_groups·ceil(hd/64)`, `row_groups·ceil(hd/64)·8·16·4` |
 | `kernel_audio_rope_half_f32` | `audio_args_rope{rows, heads, head_dim, pos0, theta}` | x (in place) `[rows][H·hd]` | `ceil(rows·H·hd/2/256)` × 256, 0 |
+| `kernel_audio_rope_half_pos_f32` | `audio_args_rope{rows, heads, head_dim, pos0, theta}` (`pos0` added to every row's position) | x (in place) `[rows][H·hd]`, positions u32 `[rows]` | `ceil(rows·H·hd/2/256)` × 256, 0 |
 | `kernel_audio_lstm_cell_f32` (the reference form of the next) | `audio_args_lstm{hidden}` | h_out `[H]`, c (in/out) `[H]`, gates `[4H]` | `ceil(H/256)` × 256, 0 |
 | `kernel_audio_lstm_cell_gated_f32` | `audio_args_lstm{hidden}` | x_out `[H]`, h (in/out) `[H]`, c (in/out) `[H]`, gates `[4H]`, state u32 `[8]` | `ceil(H/256)` × 256, 0 |
 | `kernel_audio_greedy_window_f32` | `audio_args_greedy_window{rows, cols, avail}` | out `[rows][cols]`, pending `[avail][cols]`, dec `[cols]`, state u32 `[8]` | `ceil(rows·cols/256)` × 256, 0 |
@@ -128,6 +131,19 @@ cache before it queues a batch that would reach it. The step writes the
 token to `out[slot]`, or `0xffffffff` for a step that emitted nothing: an end id (which is never emitted), a done
 state, or a state that already has `max_tokens`. Once done, a later step in the batch changes no word but the emit
 flag, which it lowers.
+
+Span attention visibility: query `i` sees key rows `j` of kv head `h / (heads / kv_heads)` with
+`max(start_i, i − left) ≤ j ≤ min(end_i − 1, i + right)`, with the logit `scale · q·k`, where `[start_i, end_i)` is
+`segments[i]` (`end_i` clamped to `n`) or `[0, n)` when `segmented` is 0: `right = 0` is causal, and `left` and
+`right` at `n` are unbounded (the host clamps both to `n`). A row whose range holds no key comes out zero. A query
+item is one (row, query head of the kv head's group), item `r·(H/Hkv) + g`; a threadgroup takes `8·row_groups ≤ 32`
+items and the union of their visible keys, 16 at a time; the host takes `row_groups = clamp(8 / ceil(hd/64), 1, 4)`.
+Simdgroup `(rg, cs)` (index `rg·ceil(hd/64) + cs`) holds items `8rg..8rg+8` over head columns `64cs..64cs+64`; the
+slices' partial scores are summed through the threadgroup memory in slice order, and every slice runs the same online
+softmax on the sums. Metal multiplies f32 `simdgroup_float8x8` fragments (the transposed scores `K·Qᵀ`, then `P·V`);
+CUDA carries every operand as a brain-float pair (nearest value and remainder) and multiplies three `m16n8k16`
+products, the transposed scores `K·Qᵀ` and output `Vᵀ·Pᵀ`, so the items are the instruction's eight-wide side. Both
+take the precise `exp`.
 
 Causal attention visibility: query `i` sits at `pos0 + i` and sees cache rows `0..=pos0 + i` of kv head
 `h / (heads / kv_heads)`, with the logit `scale · q·k`; rows past `pos0 + n_q − 1` are never read.

@@ -85,6 +85,13 @@ pub enum AppError {
     /// was missing.
     #[error("no image model is loaded")]
     NoImageModel,
+    /// The server is running with no embedding model loaded.
+    ///
+    /// Its own variant for [`Self::NoImageModel`]'s reason: the operator
+    /// fixing the 503 needs to know that this route wants `--model` to name
+    /// an embedding checkpoint.
+    #[error("no embedding model is loaded")]
+    NoEmbeddingModel,
     /// A request named a model this server does not serve.
     #[error("the model {model:?} is not served here")]
     UnknownModel {
@@ -239,6 +246,7 @@ impl AppError {
         match self {
             Self::NoModel
             | Self::NoImageModel
+            | Self::NoEmbeddingModel
             | Self::NotReady { .. }
             | Self::Overloaded { .. } => StatusCode::SERVICE_UNAVAILABLE,
 
@@ -270,6 +278,7 @@ impl AppError {
         match self {
             Self::NoModel => "model_not_loaded",
             Self::NoImageModel => "image_model_not_loaded",
+            Self::NoEmbeddingModel => "embedding_model_not_loaded",
             Self::NotReady { .. } => "server_not_ready",
             Self::Overloaded { .. } => "server_overloaded",
             Self::ContextOverflow { .. } => "context_length_exceeded",

@@ -27,6 +27,7 @@ mod affine;
 mod batched;
 mod fused;
 mod rows;
+mod span;
 pub use affine::{
     affine8_fused_products_are_the_chain, affine8_products_match_the_dequantised_weight,
 };
@@ -42,6 +43,10 @@ pub use fused::{
     qk_norm_rope_append_is_the_chain_it_replaces,
 };
 pub use rows::matvec_rows_are_each_row_alone;
+pub use span::{
+    gelu_tanh_mul_gates_plain_and_strided_up_rows, rope_half_pos_takes_each_rows_position,
+    span_attention_matches_windowed_bidirectional_and_causal,
+};
 
 /// Every entry the set exports, in contract-table order. Each kernel group
 /// appends its entries here; the pipeline check resolves exactly this list.
@@ -133,6 +138,9 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_matvec_silu_rows_f16w",
     "kernel_audio_matvec_silu_rows_q8_0w",
     "kernel_audio_matvec_silu_rows_affine8w",
+    "kernel_audio_gelu_tanh_mul_f32",
+    "kernel_audio_span_attn_f32",
+    "kernel_audio_rope_half_pos_f32",
 ];
 
 const LINEAR_BLOCK: u32 = 256;

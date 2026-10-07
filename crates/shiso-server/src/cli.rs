@@ -554,6 +554,11 @@ pub struct ServeArgs {
     /// the next is refused with a 503 a retry can fix.
     #[arg(long, env = "SHISO_IMAGE_MAX_QUEUE", default_value_t = 16)]
     pub image_max_queue: usize,
+    /// Embedding requests that may wait in the queue beyond the one running,
+    /// when `--model` is an embedding checkpoint; the next is refused with a
+    /// 503 a retry can fix.
+    #[arg(long, env = "SHISO_EMBEDDING_MAX_QUEUE", default_value_t = 64)]
+    pub embedding_max_queue: usize,
     /// Denoising steps a request that names none gets. More is slower and,
     /// past the point the checkpoint was distilled for, not better.
     #[arg(
@@ -777,6 +782,11 @@ impl ServeArgs {
         if self.asr_max_context_tokens == 0 {
             return Err(ConfigError::Zero {
                 flag: "asr-max-context-tokens",
+            });
+        }
+        if self.embedding_max_queue == 0 {
+            return Err(ConfigError::Zero {
+                flag: "embedding-max-queue",
             });
         }
         if self.image_max_queue == 0 {

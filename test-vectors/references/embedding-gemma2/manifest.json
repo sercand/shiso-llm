@@ -1,0 +1,51 @@
+{
+  "checkpoint": "google/embeddinggemma-2",
+  "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+  "transformers": "5.19.0.dev0",
+  "torch": "2.14.1",
+  "sentence_transformers": "6.1.0",
+  "pyav": "19.0.1",
+  "dtype": "float32",
+  "device": "cpu",
+  "attn_implementation": "sdpa",
+  "attn_note": "sdpa and eager agree to 2.5e-7 on every text, image and video case, but the audio tower's eager path inverts its mask (cosine 0.75 against sdpa on both audio cases), so captures use sdpa",
+  "pipeline": "SentenceTransformer(modules.json): Transformer -> Pooling(mean, include_prompt) -> Normalize",
+  "produced_by": "scripts/reference/embedding_gemma2_reference.py",
+  "how": "each case: SentenceTransformer.encode([input], prompt_name) gives `embedding`; encode(truncate_dim=d, normalize_embeddings=True) gives `truncated[d]`; model.preprocess(...) then EmbeddingGemma2Model(**features) gives `last_hidden_state`, whose mean over the attention mask is `pooled_unnormalized`; its L2 normalization must match `embedding` within 1e-5 or the capture stops",
+  "media": {
+    "image-synthetic.png": "1080c73ce5098dc27e2cae1a33698de327b9d9dcade2dffebe1b1419a7dc6421",
+    "audio-speech-10s.wav": "3e670a54f6540e4b39acb6e533261d9b837e74fe19af24a308cf90e7aba3de58",
+    "video-synthetic.mp4": "94930b5544b940228a7bc1147be9a623d7ee55ef3e1712d5cacc632b00100728"
+  },
+  "cases": {
+    "query-northern-lights": {
+      "file": "query-northern-lights.json",
+      "description": "text query with the SearchQuery prompt"
+    },
+    "doc-northern-lights": {
+      "file": "doc-northern-lights.json",
+      "description": "text document with the Document prompt"
+    },
+    "plain-multilingual": {
+      "file": "plain-multilingual.json",
+      "description": "Turkish text, no prompt"
+    },
+    "code": {
+      "file": "code.json",
+      "description": "a 16-line Rust function with the CodeRetrieval prompt"
+    },
+    "image-synthetic": {
+      "file": "image-synthetic.json",
+      "description": "image-synthetic.png alone (640x480 RGB), no prompt"
+    },
+    "audio-speech": {
+      "file": "audio-speech.json",
+      "description": "the first 10 s of references/audio/clips/speech-en.wav, alone, no prompt"
+    },
+    "video-synthetic": {
+      "file": "video-synthetic.json",
+      "description": "video-synthetic.mp4 alone (320x240, 8 fps, 4 s, H.264 yuv420p), no prompt; decoded with PyAV to rgb24"
+    }
+  },
+  "committed": "a subset of the capture: the per-token hidden states, tower intermediates and the long-1500, image-text-interleaved and audio-30s cases are left out to keep the tree small; rerun the script to regenerate them"
+}
