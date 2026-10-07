@@ -271,19 +271,13 @@ async fn post_json(state: &Arc<AppState>, path: &str, body: &Value) -> Value {
     body
 }
 
-/// The `probabilities` of one answer, as `f64`, in label order: the array
-/// form the decisions route and the systemone noul answer carry, or the
-/// string-keyed map the official choice and score shapes carry (the map's
-/// insertion order is the label order).
+/// The `probabilities` of one answer, as `f64`, in label order: the array of
+/// `{value, probability}` entries the decisions choice and score shapes
+/// carry, the plain array the systemone noul answer carries, or the
+/// string-keyed map the official systemone choice and score shapes carry
+/// (the map's insertion order is the label order). A decisions `predicate`
+/// carries no probabilities field - only P(yes) - and is not read here.
 fn probabilities(answer: &Value) -> Vec<f64> {
-    if answer["type"] == "predicate" {
-        // The official predicate carries only P(yes); the complement is the
-        // other label's share of the same row.
-        let yes = answer["probability"]
-            .as_f64()
-            .expect("a predicate carries its probability");
-        return vec![yes, 1.0 - yes];
-    }
     let field = &answer["probabilities"];
     let values: Vec<&Value> = match (field.as_array(), field.as_object()) {
         (Some(array), _) => array.iter().collect(),
@@ -320,19 +314,33 @@ fn answer_of(body: &Value, name: &str) -> Value {
 /// values themselves are the model's business; these bounds are arithmetic,
 /// not an opinion about the ticket.
 fn check_shape(answer: &Value, mass_key: &str, label: &str) {
-    let probs = probabilities(answer);
-    assert!(!probs.is_empty(), "{label}: no probabilities in {answer}");
-    for (index, p) in probs.iter().enumerate() {
+    // A decisions `predicate` carries only P(yes) - the official shape has
+    // no probabilities array - so the distribution checks have nothing to
+    // sum without inventing the complement. Its own bound is the one the
+    // answer does state.
+    if answer["type"] == "predicate" {
+        let yes = answer["probability"]
+            .as_f64()
+            .expect("a predicate carries its probability");
         assert!(
-            *p >= 0.0 && *p <= 1.0,
-            "{label}: probability {index} is {p}: {answer}"
+            (0.0..=1.0).contains(&yes),
+            "{label}: P(yes) {yes} is not a probability: {answer}"
+        );
+    } else {
+        let probs = probabilities(answer);
+        assert!(!probs.is_empty(), "{label}: no probabilities in {answer}");
+        for (index, p) in probs.iter().enumerate() {
+            assert!(
+                *p >= 0.0 && *p <= 1.0,
+                "{label}: probability {index} is {p}: {answer}"
+            );
+        }
+        let sum: f64 = probs.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "{label}: probabilities sum to {sum}: {answer}"
         );
     }
-    let sum: f64 = probs.iter().sum();
-    assert!(
-        (sum - 1.0).abs() < 1e-6,
-        "{label}: probabilities sum to {sum}: {answer}"
-    );
     let mass = answer[mass_key]
         .as_f64()
         .unwrap_or_else(|| panic!("{label}: no {mass_key} in {answer}"));

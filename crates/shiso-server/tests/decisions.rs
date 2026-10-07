@@ -81,10 +81,6 @@ const WORDS: &[&str] = &[
     "following",
     "true?",
     "ready",
-    "yes:",
-    "confirmed",
-    "no:",
-    "denied",
     "or",
 ];
 
@@ -336,6 +332,68 @@ async fn a_choice_question_answers_the_scripted_argmax() {
     );
     assert_eq!(body["usage"]["output_tokens"], 0, "nothing generated");
     assert_eq!(body["usage"]["total_tokens"], prompt_tokens);
+}
+
+#[tokio::test]
+async fn a_boolean_choice_wins_and_echoes_by_type_through_the_router() {
+    // `"plain"` beside `true` is a legal typed list; the scripted row lifts
+    // B, the boolean, so the answer's `choice` is a JSON boolean and the
+    // probability pairs keep each value's own type.
+    let row = row_with(0.0, &[(word("A"), 2.0), (word("B"), 4.0)]);
+    let (state, _audit) = state_with_rows(vec![row], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": "the input",
+                "questions": [{
+                    "name": "q1",
+                    "type": "choice",
+                    "instructions": "pick one",
+                    "choices": ["plain", true],
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let q1 = answer_of(&body, "q1");
+    assert_eq!(
+        q1["choice"],
+        json!(true),
+        "the echo keeps the JSON type: {body}"
+    );
+    let values: Vec<&Value> = q1["probabilities"]
+        .as_array()
+        .expect("an answer carries its probabilities")
+        .iter()
+        .map(|entry| &entry["value"])
+        .collect();
+    assert_eq!(values, [&json!("plain"), &json!(true)], "{body}");
+}
+
+#[tokio::test]
+async fn an_unnamed_question_answers_with_a_null_name() {
+    // The official wire makes `name` optional; the answer echoes null and
+    // still arrives at its position.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": "the input",
+                "questions": [{"type": "predicate", "instructions": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let answers = body["answers"].as_array().expect("answers is an array");
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0]["name"], Value::Null, "{body}");
+    assert_eq!(answers[0]["type"], "predicate", "{body}");
 }
 
 #[tokio::test]

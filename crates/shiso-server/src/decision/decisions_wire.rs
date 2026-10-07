@@ -241,14 +241,64 @@ impl ChoiceWire {
 }
 
 /// One level of a score question, in the official object spelling.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// Like [`ChoiceWire`], this parses against a buffered [`Value`] so the
+/// refusals spell the wire's field names instead of serde's internal struct
+/// name, and a bare string level is refused with the shape it should have
+/// used.
+#[derive(Debug)]
 pub(crate) struct LevelWire {
     /// The level's label: what follows the digit on its line.
     label: String,
     /// Extra wording, shown when non-blank.
-    #[serde(default)]
     description: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for LevelWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::Object(fields) => {
+                let mut label: Option<Value> = None;
+                let mut description: Option<Value> = None;
+                for (key, value_in) in fields {
+                    match key.as_str() {
+                        "label" => label = Some(value_in),
+                        "description" => description = Some(value_in),
+                        other => {
+                            return Err(serde::de::Error::custom(format!(
+                                "unknown field `{other}`, expected `label` or `description`"
+                            )));
+                        }
+                    }
+                }
+                let label = match label {
+                    Some(Value::String(text)) => text,
+                    Some(other) => {
+                        return Err(serde::de::Error::custom(format!(
+                            "`label` must be a string, got {other}"
+                        )));
+                    }
+                    None => return Err(serde::de::Error::missing_field("label")),
+                };
+                let description = match description {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(text)) => Some(text),
+                    Some(other) => {
+                        return Err(serde::de::Error::custom(format!(
+                            "`description` must be a string or null, got {other}"
+                        )));
+                    }
+                };
+                Ok(Self { label, description })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "a score level must be a {{label, description}} object, got {other}"
+            ))),
+        }
+    }
 }
 
 impl LevelWire {
@@ -648,19 +698,19 @@ fn input_part(part: &Value) -> Result<InputBlock, String> {
 
 /// The `image_url` of an input image: a base64 data URL, or - shiso's
 /// extension beside the official data-URL-only rule - an http(s) url whose
-/// policy refusal already lives in the renderer.
+/// policy refusal already lives in the renderer. The scheme is matched
+/// case-insensitively (RFC 3986), like the data URL's head inside the parser.
 fn image_source(url: &str) -> Result<InputBlock, String> {
-    if url.starts_with("data:") {
-        return parse_image_data_url(url).map(InputBlock::Image);
-    }
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return Ok(InputBlock::Image(InputImageSource::Url {
+    let scheme = url[..url.find([':', '/']).unwrap_or(url.len())].to_ascii_lowercase();
+    match scheme.as_str() {
+        "data" => parse_image_data_url(url).map(InputBlock::Image),
+        "http" | "https" => Ok(InputBlock::Image(InputImageSource::Url {
             url: url.to_owned(),
-        }));
+        })),
+        _ => Err(format!(
+            "`image_url` must be a base64 data URL or an http(s) url, got {url:?}"
+        )),
     }
-    Err(format!(
-        "`image_url` must be a base64 data URL or an http(s) url, got {url:?}"
-    ))
 }
 
 /// The name of a JSON value's kind, for refusals that say what arrived.
@@ -961,7 +1011,7 @@ mod tests {
         parse_refused(
             json!({"input": "x", "questions": [{"type": "score", "instructions": "i",
                    "levels": ["low"]}]}),
-            "LevelWire",
+            "label, description",
         );
         parse_refused(
             json!({"input": "x", "questions": [{"type": "score", "instructions": "i",
@@ -1080,6 +1130,38 @@ mod tests {
             );
             assert!(message.contains(needle), "{message} must name {needle}");
         }
+    }
+
+    #[test]
+    fn image_url_schemes_fold_case_and_file_references_are_refused() {
+        // RFC 3986: a scheme's case carries no meaning, and the data URL's
+        // head folds inside the parser, so a folded spelling is the same
+        // bytes as the folded one.
+        match decision_input(&json!([{"role": "user", "content": [
+            {"type": "input_image", "image_url": "DATA:IMAGE/PNG;BASE64,aGk="},
+            {"type": "input_image", "image_url": "HTTPS://example.com/x.png"},
+        ]}]))
+        .expect("folded schemes parse")
+        {
+            DecisionInput::Blocks(blocks) => {
+                assert!(
+                    matches!(&blocks[0], InputBlock::Image(InputImageSource::Base64 { media_type, .. })
+                        if media_type == "image/png"),
+                    "{blocks:?}"
+                );
+                assert!(
+                    matches!(&blocks[1], InputBlock::Image(InputImageSource::Url { .. })),
+                    "{blocks:?}"
+                );
+            }
+            other @ DecisionInput::Text(_) => panic!("expected blocks, got {other:?}"),
+        }
+        // The official `{type: "input_image", file_id}` spelling is refused
+        // for the field this server does read: the bytes must arrive with
+        // the request, because there is no file store to fetch them from.
+        let message = refused_input(&json!([{"role": "user", "content": [
+            {"type": "input_image", "file_id": "file-abc"}]}]));
+        assert!(message.contains("image_url"), "{message}");
     }
 
     #[test]

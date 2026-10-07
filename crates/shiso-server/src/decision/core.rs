@@ -297,7 +297,7 @@ pub(crate) const YES_NO_LABELS: [&str; 2] = ["yes", "no"];
 /// Not one of the shared names - it only shapes the sentence. A blank id has
 /// no name to give; the validator that can refuse a blank id,
 /// [`check_ids`], is also the one that knows the position and names it there.
-fn question_name(id: &str) -> String {
+pub(crate) fn question_name(id: &str) -> String {
     if id.trim().is_empty() {
         "this question".to_owned()
     } else {
@@ -576,7 +576,10 @@ pub(crate) fn refuse_fields_other_than(
     for (field, present) in present {
         if *present && !allowed.contains(field) {
             return Err(AppError::bad_request(
-                format!("question \"{id}\": {field} does not belong on a \"{kind}\" question"),
+                format!(
+                    "{}: {field} does not belong on a \"{kind}\" question",
+                    question_name(id)
+                ),
                 Some("questions"),
                 "invalid_request",
             ));
