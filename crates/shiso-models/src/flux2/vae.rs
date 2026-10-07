@@ -29,11 +29,15 @@ use serde::Deserialize;
 use shiso_core::DeviceBuffer;
 use shiso_vision::generator::ImageGenError;
 
-use super::ops::{Conv2dCall, GroupNormCall, Ops};
+use super::ops::{Conv2dCall, GemmCall, GroupNormCall, Ops, Scratch, SliceExt, WeightKind};
 use super::weights::StStore;
 
 /// Group-norm epsilon the decoder uses (the reference's group-norm epsilon).
 const GN_EPS: f32 = 1e-6;
+/// Scores the mid-block attention forms at once, in f32 elements (1 GiB):
+/// a 1024x1024 image's 16384 query rows fit in one block, and a 2048x2048
+/// one takes four.
+const ATTN_SCORE_BUDGET: usize = 1 << 28;
 /// Batch-norm epsilon for the latent denormalization, used when the
 /// checkpoint's `vae/config.json` carries no `batch_norm_eps` (the reference
 /// trains with this value).
@@ -311,7 +315,7 @@ impl Vae {
         height: usize,
     ) -> Result<Vec<f32>, ImageGenError> {
         let z = self.unpack_latents(latents, width, height)?;
-        let mut x = ops.upload_f32("vae latent", &z)?;
+        let mut x = ops.upload_scratch("vae latent", &z)?;
         let mut field = Field {
             channels: self.post_quant.in_c,
             h: height / 8,
@@ -513,14 +517,14 @@ impl Vae {
 
     /// One convolution with its bias, returning the output buffer. The
     /// spatial size is the field's; same-padding convolutions preserve it.
-    fn conv(
-        ops: &Ops,
+    fn conv<'o>(
+        ops: &'o Ops,
         conv: &Conv,
         input: shiso_core::DeviceView<'_>,
         in_c: usize,
         field: &Field,
         step: &'static str,
-    ) -> Result<DeviceBuffer, ImageGenError> {
+    ) -> Result<Scratch<'o>, ImageGenError> {
         let pad = conv.k_h / 2;
         let out_h = (field.h + 2 * pad - conv.k_h) + 1;
         let out_w = (field.w + 2 * pad - conv.k_w) + 1;
@@ -548,14 +552,14 @@ impl Vae {
 
     /// One residual normalization block; updates the field's channels when a
     /// shortcut changes them.
-    fn resnet(
+    fn resnet<'o>(
         &self,
-        ops: &Ops,
+        ops: &'o Ops,
         resnet: &Resnet,
         x: &DeviceBuffer,
         field: &mut Field,
         step: &'static str,
-    ) -> Result<DeviceBuffer, ImageGenError> {
+    ) -> Result<Scratch<'o>, ImageGenError> {
         let spatial = field.h * field.w;
         let xn = ops.alloc_f32(step, field.channels * spatial)?;
         ops.group_norm(&GroupNormCall {
@@ -621,13 +625,13 @@ impl Vae {
 
     /// Single-head spatial self-attention with a residual add: the group
     /// norm feeds the q/k/v projections directly, with no activation between.
-    fn attention(
+    fn attention<'o>(
         &self,
-        ops: &Ops,
+        ops: &'o Ops,
         attn: &SpatialAttention,
         x: &DeviceBuffer,
         field: &Field,
-    ) -> Result<DeviceBuffer, ImageGenError> {
+    ) -> Result<Scratch<'o>, ImageGenError> {
         let channels = field.channels;
         let spatial = field.h * field.w;
         let xn = ops.alloc_f32("vae attn norm", channels * spatial)?;
@@ -651,40 +655,54 @@ impl Vae {
         let q = Self::conv(ops, &attn.q, xn.view(), channels, field, "vae attn q")?;
         let k = Self::conv(ops, &attn.k, xn.view(), channels, field, "vae attn k")?;
         let v = Self::conv(ops, &attn.v, xn.view(), channels, field, "vae attn v")?;
-        // The attention kernel wants (spatial, channels) rows.
+        // softmax(q k^T / sqrt(c)) v as two tiled GEMMs around a row
+        // softmax, a block of query rows at a time: the scores of a
+        // 1024x1024 image are 16384 x 16384, and the per-row attention
+        // kernel, which never forms them, spent 3.4 s there on an M1 Max.
+        // The GEMM reads its right operand as (n, k) rows, so q and k go to
+        // (spatial, channels) and v is read as it stands, (channels, spatial).
         let qt = ops.alloc_f32("vae attn qt", spatial * channels)?;
         let kt = ops.alloc_f32("vae attn kt", spatial * channels)?;
-        let vt = ops.alloc_f32("vae attn vt", spatial * channels)?;
         ops.transpose("vae attn t", qt.view(), q.view(), channels, spatial)?;
         ops.transpose("vae attn t", kt.view(), k.view(), channels, spatial)?;
-        ops.transpose("vae attn t", vt.view(), v.view(), channels, spatial)?;
         let at = ops.alloc_f32("vae attn ctx", spatial * channels)?;
-        ops.sdpa(&super::ops::SdpaCall {
-            step: "vae attention",
-            out_txt: at.view(),
-            out_img: at.view(),
-            q_txt: qt.view(),
-            k_txt: kt.view(),
-            v_txt: vt.view(),
-            q_img: qt.view(),
-            k_img: kt.view(),
-            v_img: vt.view(),
-            // Separate packed q/k/v tensors, not fused rows: every head
-            // section starts at column 0 of its own buffer.
-            q_offset: 0,
-            k_offset: 0,
-            v_offset: 0,
-            cache_k: ops.dummy_view(),
-            cache_v: ops.dummy_view(),
-            cache_stride: channels,
-            txt_tokens: spatial,
-            img_tokens: 0,
-            cache_tokens: 0,
-            heads: 1,
-            head_dim: channels,
-            txt_stride: channels,
-            img_stride: channels,
-        })?;
+        let block = (ATTN_SCORE_BUDGET / spatial).clamp(1, spatial);
+        let scores = ops.alloc_f32("vae attn scores", block * spatial)?;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a channel count (512) is exact in f32"
+        )]
+        let scale = 1.0 / (channels as f32).sqrt();
+        let row_bytes = |n: usize| (n * channels * 4) as u64;
+        for r0 in (0..spatial).step_by(block) {
+            let rows = block.min(spatial - r0);
+            let slab = scores.view().cut(0, (rows * spatial * 4) as u64)?;
+            ops.gemm(&GemmCall {
+                step: "vae attn scores",
+                out: slab,
+                input: qt.view().cut(row_bytes(r0), row_bytes(rows))?,
+                weight: kt.view(),
+                weight_scale: 1.0,
+                bias: None,
+                m: rows,
+                n: spatial,
+                k: channels,
+                kind: WeightKind::F32,
+            })?;
+            ops.softmax_rows("vae attn softmax", slab, rows, spatial, scale)?;
+            ops.gemm(&GemmCall {
+                step: "vae attn values",
+                out: at.view().cut(row_bytes(r0), row_bytes(rows))?,
+                input: slab,
+                weight: v.view(),
+                weight_scale: 1.0,
+                bias: None,
+                m: rows,
+                n: channels,
+                k: spatial,
+                kind: WeightKind::F32,
+            })?;
+        }
         let ctx = ops.alloc_f32("vae attn ctx ch", channels * spatial)?;
         ops.transpose("vae attn t", ctx.view(), at.view(), spatial, channels)?;
         let proj = Self::conv(ops, &attn.out, ctx.view(), channels, field, "vae attn proj")?;

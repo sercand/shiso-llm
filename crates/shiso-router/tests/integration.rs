@@ -1110,6 +1110,129 @@ async fn embeddings_are_routed_renamed_and_logged() {
     assert!((row["cost"].as_f64().unwrap() - 8.0 / 1e6 * 2.0).abs() < 1e-12);
 }
 
+/// Every spelling of the image endpoint reaches the backend as the OpenAI
+/// path, with the model renamed and usage logged from the end of a body
+/// that is almost all base64.
+#[tokio::test]
+async fn images_are_routed_renamed_and_logged() {
+    let b64 = "A".repeat(5 * 1024 * 1024);
+    let upstream_body = format!(
+        r#"{{"created":1,"data":[{{"b64_json":"{b64}","media_type":"image/png"}}],"usage":{{"prompt_tokens":9,"completion_tokens":0,"total_tokens":9}}}}"#
+    );
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer k"))
+        .and(body_json_string(
+            r#"{"model":"flux2-klein","prompt":"a fox","steps":4}"#,
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(upstream_body.clone().into_bytes(), "application/json"),
+        )
+        .mount(&mock)
+        .await;
+
+    let config = backend_toml("b1", &mock.uri(), "k")
+        + "[[models]]\nname = \"image-model\"\n\
+           [[models.targets]]\nbackend = \"b1\"\nmodel = \"flux2-klein\"\n";
+    let router = TestRouter::start(&config).await;
+    let (token, _) = router.create_token().await;
+
+    let spellings = [
+        "/v1/images/generations",
+        "/v1/images",
+        "/images",
+        "/images/generations",
+    ];
+    for p in spellings {
+        let resp = router
+            .client
+            .post(router.url(p))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .body(r#"{"model":"image-model","prompt":"a fox","steps":4}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{p}");
+        assert_eq!(resp.bytes().await.unwrap().len(), upstream_body.len());
+    }
+
+    let rows = router.wait_for_logs(spellings.len()).await;
+    for row in &rows {
+        assert_eq!(row["model"], "image-model");
+        assert_eq!(row["upstream_model"], "flux2-klein");
+        assert_eq!(row["path"], "/v1/images/generations");
+        assert_eq!(row["status"], 200);
+        assert_eq!(row["prompt_tokens"], 9);
+        assert_eq!(row["total_tokens"], 9);
+    }
+}
+
+/// A streamed image's frames are each far past the SSE line cap; the last
+/// completed frame's cumulative usage still lands in the log row.
+#[tokio::test]
+async fn streamed_images_log_usage_from_the_completed_frame() {
+    let b64 = "B".repeat(512 * 1024);
+    let completed = |n: u32| {
+        format!(
+            "event: image_generation.completed\ndata: {{\"type\":\"image_generation.completed\",\"created\":1,\"b64_json\":\"{b64}\",\"media_type\":\"image/png\",\"usage\":{{\"prompt_tokens\":{n},\"completion_tokens\":0,\"total_tokens\":{n}}}}}\n\n"
+        )
+    };
+    let sse = format!(
+        ": accepted\n\n{}{}data: [DONE]\n\n",
+        completed(6),
+        completed(12)
+    );
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"),
+        )
+        .mount(&mock)
+        .await;
+
+    let config = backend_toml("b1", &mock.uri(), "k")
+        + "[[models]]\nname = \"image-model\"\n[[models.targets]]\nbackend = \"b1\"\n";
+    let router = TestRouter::start(&config).await;
+    let (token, _) = router.create_token().await;
+
+    let resp = router
+        .client
+        .post(router.url("/v1/images/generations"))
+        .bearer_auth(&token)
+        .body(r#"{"model":"image-model","prompt":"a fox","n":2,"stream":true}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.bytes().await.unwrap();
+
+    let rows = router.wait_for_logs(1).await;
+    assert_eq!(rows[0]["streamed"], true);
+    assert_eq!(rows[0]["prompt_tokens"], 12);
+    assert_eq!(rows[0]["total_tokens"], 12);
+}
+
+/// An unmatched path is a provider-style 404 on both listeners, without
+/// demanding auth first.
+#[tokio::test]
+async fn unknown_endpoint_is_a_parseable_404() {
+    let router = TestRouter::start(&backend_toml("b1", "http://127.0.0.1:1", "k")).await;
+    let resp = router
+        .client
+        .post(router.url("/v1/completions"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "not_found_error");
+}
+
 /// A batch embedding response is mostly vector data and can be far larger
 /// than the whole-body parse cap; usage still has to come out of it.
 #[tokio::test]

@@ -32,7 +32,7 @@ use super::config::Flux2Params;
 use super::kv_cache::Flux2KvCache;
 use super::ops::{
     GemmCall, LayerNormCall, LinearResidualCall, ModulateCall, Ops, QkNormCall, Rope4dCall,
-    SdpaCall, SliceExt, SwigluInput,
+    Scratch, SdpaCall, SliceExt, SwigluInput,
 };
 use super::weights::{Lin, StStore};
 
@@ -409,12 +409,12 @@ impl DiT {
         clippy::too_many_lines,
         reason = "one denoising step's block graph, straight-line by construction"
     )]
-    pub(crate) fn forward(
+    pub(crate) fn forward<'o>(
         &self,
-        ops: &Ops,
+        ops: &'o Ops,
         input: &DiTInput<'_>,
         kv: &mut Flux2KvCache,
-    ) -> Result<DeviceBuffer, ImageGenError> {
+    ) -> Result<Scratch<'o>, ImageGenError> {
         let p = &self.params;
         let h = p.hidden_size;
 
@@ -691,7 +691,7 @@ impl DiT {
             img_stride: 3 * h,
         })?;
         if ctx.input.kv_mode == KvMode::Extract && ctx.refs > 0 {
-            let cache = ops.alloc_f32("dit kv cache", ctx.refs * 3 * h)?;
+            let cache = ops.alloc_owned_f32("dit kv cache", ctx.refs * 3 * h)?;
             ops.copy(
                 "dit kv extract",
                 cache.view(),
@@ -866,7 +866,7 @@ impl DiT {
             img_stride: fused,
         })?;
         if ctx.input.kv_mode == KvMode::Extract && ctx.refs > 0 {
-            let cache = ops.alloc_f32("dit single kv cache", ctx.refs * fused)?;
+            let cache = ops.alloc_owned_f32("dit single kv cache", ctx.refs * fused)?;
             ops.copy(
                 "dit single kv extract",
                 cache.view(),
@@ -927,14 +927,14 @@ impl DiT {
     }
 
     /// Shared `AdaLN` vector: silu(vec) @ modulation.lin, (width,) f32.
-    fn mod_vec(
+    fn mod_vec<'o>(
         &self,
-        ops: &Ops,
+        ops: &'o Ops,
         module: &Lin,
         vec_silu: &DeviceBuffer,
         width: usize,
         step: &'static str,
-    ) -> Result<DeviceBuffer, ImageGenError> {
+    ) -> Result<Scratch<'o>, ImageGenError> {
         let vec = ops.alloc_f32(step, width)?;
         ops.gemm(&GemmCall {
             step,
@@ -954,7 +954,11 @@ impl DiT {
     /// Weightless `LayerNorm` + `AdaLN` modulation (mod1) + fused qkv +
     /// `QK-norm`, in that reference order. The `QK-norm` runs before `RoPE`
     /// because the reference norms the heads and then rotates them.
-    fn attention_pre(&self, ops: &Ops, call: &PreCall<'_>) -> Result<DeviceBuffer, ImageGenError> {
+    fn attention_pre<'o>(
+        &self,
+        ops: &'o Ops,
+        call: &PreCall<'_>,
+    ) -> Result<Scratch<'o>, ImageGenError> {
         let PreCall {
             qkv,
             q_norm,

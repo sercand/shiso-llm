@@ -319,6 +319,10 @@ impl ImageGenerator for Flux2KleinModel {
             ));
         }
 
+        // Declared first so it drops last, after every working buffer of this
+        // generation is back in the pool: an idle server should not hold a
+        // 1024x1024 image's activations.
+        let _trim = TrimPool(&self.ops);
         let steps = job.steps as usize;
         let began = Instant::now();
         let ids = self.tokenize(&job.prompt)?;
@@ -363,7 +367,7 @@ impl ImageGenerator for Flux2KleinModel {
             noise.push(radius * angle.sin());
         }
         noise.truncate(latent_count);
-        let mut latents = self.ops.upload_f32("pipeline noise", &noise)?;
+        let mut latents = self.ops.upload_scratch("pipeline noise", &noise)?;
 
         // 4-axis positions, matching the reference pipeline's id prep: image
         // tokens carry (frame 0, row, column, 0) and text tokens (0, 0, 0,
@@ -499,6 +503,15 @@ impl ImageGenerator for Flux2KleinModel {
             prompt_tokens: t_txt as u32,
             completion_tokens: (t_img * steps) as u32,
         })
+    }
+}
+
+/// Empties the working-buffer pool when a generation ends, however it ends.
+struct TrimPool<'o>(&'o Ops);
+
+impl Drop for TrimPool<'_> {
+    fn drop(&mut self) {
+        self.0.trim_pool();
     }
 }
 
