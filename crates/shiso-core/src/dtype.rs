@@ -39,10 +39,25 @@ pub enum DType {
     Q8_K = 15,
     /// 2-bit i-quant, extra-small, 256 elements per block.
     IQ2_XXS = 16,
+    /// 2-bit i-quant, extra-small, 256 elements per block: the wider sibling
+    /// of [`DType::IQ2_XXS`].
+    IQ2_XS = 17,
+    /// 3-bit i-quant, extra-extra-small, 256 elements per block.
+    IQ3_XXS = 18,
+    /// 1-bit i-quant, small, 256 elements per block.
+    IQ1_S = 19,
     /// 4-bit non-linear quant, 32 elements per block.
     IQ4_NL = 20,
+    /// 3-bit i-quant, small, 256 elements per block.
+    IQ3_S = 21,
+    /// 2-bit i-quant, small, 256 elements per block.
+    IQ2_S = 22,
+    /// 4-bit i-quant, extra-small, 256 elements per block.
+    IQ4_XS = 23,
     /// 32-bit signed integer tensor (vocabulary and index maps).
     I32 = 26,
+    /// 1-bit i-quant, medium, 256 elements per block.
+    IQ1_M = 29,
     /// Brain floating point, binary16 width exponent.
     BF16 = 30,
     /// Microscaling 4-bit with one shared exponent per 32 elements.
@@ -154,8 +169,15 @@ impl DType {
             14 => Some(Self::Q6_K),
             15 => Some(Self::Q8_K),
             16 => Some(Self::IQ2_XXS),
+            17 => Some(Self::IQ2_XS),
+            18 => Some(Self::IQ3_XXS),
+            19 => Some(Self::IQ1_S),
             20 => Some(Self::IQ4_NL),
+            21 => Some(Self::IQ3_S),
+            22 => Some(Self::IQ2_S),
+            23 => Some(Self::IQ4_XS),
             26 => Some(Self::I32),
+            29 => Some(Self::IQ1_M),
             30 => Some(Self::BF16),
             39 => Some(Self::MXFP4),
             68 => Some(Self::Exl3K4),
@@ -193,8 +215,15 @@ impl DType {
             Self::Q6_K => "q6_k",
             Self::Q8_K => "q8_k",
             Self::IQ2_XXS => "iq2_xxs",
+            Self::IQ2_XS => "iq2_xs",
+            Self::IQ3_XXS => "iq3_xxs",
+            Self::IQ1_S => "iq1_s",
             Self::IQ4_NL => "iq4_nl",
+            Self::IQ3_S => "iq3_s",
+            Self::IQ2_S => "iq2_s",
+            Self::IQ4_XS => "iq4_xs",
             Self::I32 => "i32",
+            Self::IQ1_M => "iq1_m",
             Self::BF16 => "bf16",
             Self::MXFP4 => "mxfp4",
             Self::Exl3K4 => "exl3_k4",
@@ -245,6 +274,13 @@ impl DType {
             | Self::Q6_K
             | Self::Q8_K
             | Self::IQ2_XXS
+            | Self::IQ2_XS
+            | Self::IQ3_XXS
+            | Self::IQ1_S
+            | Self::IQ3_S
+            | Self::IQ2_S
+            | Self::IQ4_XS
+            | Self::IQ1_M
             | Self::Exl3K4
             | Self::Exl3K5
             | Self::Exl3K6 => 256,
@@ -269,6 +305,13 @@ impl DType {
             Self::Q8_0 | Self::Pq2_0 => 34,
             Self::MXFP4 => 17,
             Self::IQ2_XXS => 66,
+            Self::IQ2_XS => 74,
+            Self::IQ3_XXS => 98,
+            Self::IQ1_S => 50,
+            Self::IQ3_S => 110,
+            Self::IQ2_S => 82,
+            Self::IQ4_XS => 136,
+            Self::IQ1_M => 56,
             Self::Q2_K => 84,
             Self::Q4_K => 144,
             Self::Q5_K => 176,
