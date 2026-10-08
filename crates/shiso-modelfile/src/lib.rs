@@ -68,6 +68,7 @@
 )]
 
 pub mod fp8;
+pub mod iq_quant;
 pub mod metadata;
 pub mod mlx_quant;
 pub mod modelfile;
