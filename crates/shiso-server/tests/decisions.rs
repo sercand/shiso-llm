@@ -81,10 +81,6 @@ const WORDS: &[&str] = &[
     "following",
     "true?",
     "ready",
-    "yes:",
-    "confirmed",
-    "no:",
-    "denied",
     "or",
 ];
 
@@ -184,19 +180,30 @@ fn softmax(logprobs: &[f64], temperature: f64) -> Vec<f64> {
     exps.iter().map(|value| value / sum).collect()
 }
 
-/// The `probabilities` of one answer, as `f64`.
+/// The `probabilities` of one choice or score answer, as `f64`, in the
+/// official array-of-objects spelling.
 fn probabilities(answer: &Value) -> Vec<f64> {
     answer["probabilities"]
         .as_array()
         .expect("an answer carries its probabilities")
         .iter()
-        .map(|p| p.as_f64().expect("a probability is a number"))
+        .map(|entry| {
+            entry["probability"]
+                .as_f64()
+                .expect("a probability entry carries its number")
+        })
         .collect()
 }
 
-/// The answer of one question id.
-fn answer_of(body: &Value, id: &str) -> Value {
-    body["answers"][id].clone()
+/// The answer of one question name, read from the answers array.
+fn answer_of(body: &Value, name: &str) -> Value {
+    body["answers"]
+        .as_array()
+        .expect("answers is an array")
+        .iter()
+        .find(|entry| entry["name"] == json!(name))
+        .cloned()
+        .unwrap_or_else(|| panic!("no answer named {name}: {body}"))
 }
 
 /// One POST with a JSON body.
@@ -227,11 +234,11 @@ async fn call(state: &Arc<AppState>, request: Request<Body>) -> (StatusCode, Val
     (status, body)
 }
 
-/// The smallest body that answers: one yes/no question over one input.
+/// The smallest body that answers: one predicate question over one input.
 fn valid_body() -> Value {
     json!({
         "input": "the input",
-        "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+        "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
     })
 }
 
@@ -239,8 +246,9 @@ fn valid_body() -> Value {
 const CHOICE_BODY: &str =
     "the input\n\nQuestion: pick one\nA: red\nB: blue\nAnswer with the letter of one option only.";
 
-/// The yes/no question the shape test pins: its exact version-1 body.
-const YES_NO_BODY: &str = "the input\n\nIs the following true? ready\nyes: confirmed\nno: denied\nAnswer with yes or no only.";
+/// The predicate question the shape test pins: its exact version-1 body. A
+/// predicate renders the version-1 yes/no block with no label wordings.
+const YES_NO_BODY: &str = "the input\n\nIs the following true? ready\nAnswer with yes or no only.";
 
 /// The ids of one expected prompt, encoded through the test vocabulary.
 fn prompt_ids(body: &str) -> Vec<u32> {
@@ -268,10 +276,10 @@ async fn a_choice_question_answers_the_scripted_argmax() {
                 "model": "echo-me",
                 "input": "the input",
                 "questions": [{
-                    "id": "q1",
+                    "name": "q1",
                     "type": "choice",
-                    "question": "pick one",
-                    "options": ["first option", "second option"],
+                    "instructions": "pick one",
+                    "choices": ["first option", "second option"],
                 }],
             }),
         ),
@@ -281,13 +289,13 @@ async fn a_choice_question_answers_the_scripted_argmax() {
     assert_eq!(body["object"], "decisions");
     assert_eq!(body["model"], "echo-me", "the model string is echoed");
     assert_eq!(body["prompt_format_version"], 1);
-    let keys: Vec<&str> = body["answers"]
-        .as_object()
-        .expect("answers is an object")
-        .keys()
-        .map(String::as_str)
+    let names: Vec<&str> = body["answers"]
+        .as_array()
+        .expect("answers is an array")
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("a name"))
         .collect();
-    assert_eq!(keys, ["q1"], "the answers keep the request's order");
+    assert_eq!(names, ["q1"], "the answers keep the request's order");
     let q1 = answer_of(&body, "q1");
     assert_eq!(q1["type"], "choice");
     assert_eq!(
@@ -312,7 +320,7 @@ async fn a_choice_question_answers_the_scripted_argmax() {
         "{body}"
     );
 
-    let prompt_tokens = body["usage"]["prompt_tokens"]
+    let prompt_tokens = body["usage"]["input_tokens"]
         .as_u64()
         .expect("the accounting counts the prompt");
     let prompts = audit.prefill_prompts.lock();
@@ -322,8 +330,70 @@ async fn a_choice_question_answers_the_scripted_argmax() {
         u64::try_from(prompts[0].len()).expect("a small prompt"),
         "the count is the prompt that was read: {body}"
     );
-    assert_eq!(body["usage"]["completion_tokens"], 0, "nothing generated");
+    assert_eq!(body["usage"]["output_tokens"], 0, "nothing generated");
     assert_eq!(body["usage"]["total_tokens"], prompt_tokens);
+}
+
+#[tokio::test]
+async fn a_boolean_choice_wins_and_echoes_by_type_through_the_router() {
+    // `"plain"` beside `true` is a legal typed list; the scripted row lifts
+    // B, the boolean, so the answer's `choice` is a JSON boolean and the
+    // probability pairs keep each value's own type.
+    let row = row_with(0.0, &[(word("A"), 2.0), (word("B"), 4.0)]);
+    let (state, _audit) = state_with_rows(vec![row], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": "the input",
+                "questions": [{
+                    "name": "q1",
+                    "type": "choice",
+                    "instructions": "pick one",
+                    "choices": ["plain", true],
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let q1 = answer_of(&body, "q1");
+    assert_eq!(
+        q1["choice"],
+        json!(true),
+        "the echo keeps the JSON type: {body}"
+    );
+    let values: Vec<&Value> = q1["probabilities"]
+        .as_array()
+        .expect("an answer carries its probabilities")
+        .iter()
+        .map(|entry| &entry["value"])
+        .collect();
+    assert_eq!(values, [&json!("plain"), &json!(true)], "{body}");
+}
+
+#[tokio::test]
+async fn an_unnamed_question_answers_with_a_null_name() {
+    // The official wire makes `name` optional; the answer echoes null and
+    // still arrives at its position.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/decisions",
+            &json!({
+                "input": "the input",
+                "questions": [{"type": "predicate", "instructions": "ready"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let answers = body["answers"].as_array().expect("answers is an array");
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0]["name"], Value::Null, "{body}");
+    assert_eq!(answers[0]["type"], "predicate", "{body}");
 }
 
 #[tokio::test]
@@ -337,10 +407,10 @@ async fn a_score_question_returns_the_expectation() {
             &json!({
                 "input": "the input",
                 "questions": [{
-                    "id": "s1",
+                    "name": "s1",
                     "type": "score",
-                    "question": "how bad",
-                    "levels": ["none", "some", "lots"],
+                    "instructions": "how bad",
+                    "levels": [{"label": "none"}, {"label": "some"}, {"label": "lots"}],
                 }],
             }),
         ),
@@ -370,21 +440,24 @@ async fn a_score_question_returns_the_expectation() {
 }
 
 #[tokio::test]
-async fn a_yes_no_question_answers_with_a_label() {
+async fn a_predicate_question_answers_with_the_yes_probability() {
     let row = row_with(0.0, &[(word("yes"), 3.0)]);
     let (state, _audit) = state_with_rows(vec![row.clone()], CTX);
     let (status, body) = call(&state, post("/v1/decisions", &valid_body())).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let q1 = answer_of(&body, "q1");
-    assert_eq!(q1["type"], "yes_no");
-    assert_eq!(q1["answer"], "yes");
+    assert_eq!(q1["type"], "predicate");
 
     let norm = logsumexp(&row);
     let want = softmax(&[3.0 - norm, 0.0 - norm], 1.0);
-    let got = probabilities(&q1);
-    for (got, want) in got.iter().zip(&want) {
-        assert!((got - want).abs() < 1e-5, "{body}");
-    }
+    let got = q1["probability"]
+        .as_f64()
+        .expect("a predicate carries its probability");
+    assert!(
+        (got - want[0]).abs() < 1e-5,
+        "the probability is P(yes) = {}, got {got}: {body}",
+        want[0]
+    );
 }
 
 #[tokio::test]
@@ -401,10 +474,9 @@ async fn questions_are_scored_against_prompts_carrying_the_shared_input() {
             &json!({
                 "input": "the input",
                 "questions": [
-                    {"id": "q1", "type": "choice", "question": "pick one",
-                     "options": ["red", "blue"]},
-                    {"id": "q2", "type": "yes_no", "question": "ready",
-                     "yes": "confirmed", "no": "denied"},
+                    {"name": "q1", "type": "choice", "instructions": "pick one",
+                     "choices": ["red", "blue"]},
+                    {"name": "q2", "type": "predicate", "instructions": "ready"},
                 ],
             }),
         ),
@@ -425,46 +497,44 @@ async fn questions_are_scored_against_prompts_carrying_the_shared_input() {
     );
     let total = want_choice.len() + want_yes_no.len();
     assert_eq!(
-        body["usage"]["prompt_tokens"],
+        body["usage"]["input_tokens"],
         json!(u64::try_from(total).expect("a small prompt")),
         "the accounting is the two prompts together: {body}"
     );
 }
 
-/// The key-sorted compact rendering of `{"b": 1, "a": [1, 2]}`: the bytes
-/// the shared render rule owes a container input, pinned here in the order
-/// the server - not the client - chooses.
-const CONTAINER_TEXT: &str = "{\"a\":[1,2],\"b\":1}";
-
 #[tokio::test]
-async fn a_container_input_is_scored_from_its_key_sorted_rendering() {
-    // End to end, not just at the render helper: a container `input`
-    // reaches the model as compact JSON with keys sorted, so the same
-    // logical object spells one prompt whatever order its client sent -
-    // and the audited ids are exactly those of that rendering in the
-    // shared template.
-    let (state, audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
-    let (status, body) = call(
-        &state,
-        post(
-            "/v1/decisions",
-            &json!({
-                "input": {"b": 1, "a": [1, 2]},
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let want = prompt_ids(&format!(
-        "{CONTAINER_TEXT}\n\nIs the following true? ready\nAnswer with yes or no only."
-    ));
-    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
-    assert_eq!(
-        got,
-        vec![want],
-        "the model read the key-sorted bytes: {got:?}"
-    );
+async fn a_container_input_is_refused() {
+    // The official route reads `input` as a string or user messages only:
+    // yesterday's compact-JSON container path is gone, and a top-level
+    // object - however scoreable its bytes would be - is a 400 naming
+    // `input` rather than a silently rendered prompt.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    for input in [
+        json!({"b": 1, "a": [1, 2]}),
+        // An object that spells like an old image block is still an object.
+        json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}),
+    ] {
+        let (status, body) = call(
+            &state,
+            post(
+                "/v1/decisions",
+                &json!({
+                    "input": input,
+                    "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{input} -> {body}");
+        assert_eq!(body["error"]["param"], "input", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("string or an array")),
+            "{body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -481,8 +551,8 @@ async fn temperature_rescales_the_probabilities() {
                 "input": "the input",
                 "temperature": 2.0,
                 "questions": [{
-                    "id": "q1", "type": "choice", "question": "pick one",
-                    "options": ["red", "blue"],
+                    "name": "q1", "type": "choice", "instructions": "pick one",
+                    "choices": ["red", "blue"],
                 }],
             }),
         ),
@@ -536,13 +606,13 @@ async fn return_prompt_token_ids_adds_both_id_lists() {
 async fn unknown_fields_are_refused_everywhere() {
     let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
     let cases = vec![
-        json!({"input": "the input", "questions": [{"id": "q1", "type": "yes_no",
-                "question": "ready"}], "nope": true}),
-        json!({"input": "the input", "questions": [{"id": "q1", "type": "yes_no",
-                "question": "ready", "bogus": 1}]}),
-        json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
-                "question": "pick one",
-                "options": [{"name": "red", "bogus": 1}, {"name": "blue"}]}]}),
+        json!({"input": "the input", "questions": [{"name": "q1", "type": "predicate",
+                "instructions": "ready"}], "nope": true}),
+        json!({"input": "the input", "questions": [{"name": "q1", "type": "predicate",
+                "instructions": "ready", "bogus": 1}]}),
+        json!({"input": "the input", "questions": [{"name": "q1", "type": "choice",
+                "instructions": "pick one",
+                "choices": [{"value": "red", "bogus": 1}, {"value": "blue"}]}]}),
     ];
     for case in cases {
         let (status, body) = call(&state, post("/v1/decisions", &case)).await;
@@ -570,9 +640,9 @@ async fn unknown_fields_are_refused_everywhere() {
         &state,
         post(
             "/v1/decisions",
-            &json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
-                    "question": "pick one",
-                    "options": [{"name": "red", "bogus": 1}, {"name": "blue"}]}]}),
+            &json!({"input": "the input", "questions": [{"name": "q1", "type": "choice",
+                    "instructions": "pick one",
+                    "choices": [{"value": "red", "bogus": 1}, {"value": "blue"}]}]}),
         ),
     )
     .await;
@@ -589,9 +659,9 @@ async fn unknown_fields_are_refused_everywhere() {
         &state,
         post(
             "/v1/decisions",
-            &json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
-                    "question": "pick one",
-                    "options": [{"name": "red", "description": "a color"}, {"name": "blue"}]}]}),
+            &json!({"input": "the input", "questions": [{"name": "q1", "type": "choice",
+                    "instructions": "pick one",
+                    "choices": [{"value": "red", "description": "a color"}, {"value": "blue"}]}]}),
         ),
     )
     .await;
@@ -618,78 +688,78 @@ async fn validation_matrix() {
     }
     let mut tall = Vec::new();
     for index in 0..11 {
-        tall.push(json!(format!("level {index}")));
+        tall.push(json!({"label": format!("level {index}")}));
     }
     let cases: Vec<(Value, Option<(&str, &str)>)> = vec![
         (
-            json!({"input": "   ", "questions": [{"id": "q1", "type": "yes_no",
-             "question": "ready"}]}),
+            json!({"input": "   ", "questions": [{"name": "q1", "type": "predicate",
+             "instructions": "ready"}]}),
             Some(("param", "input")),
         ),
         (
-            json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
-             "question": "  ", "options": ["red", "blue"]}]}),
+            json!({"input": "the input", "questions": [{"name": "q1", "type": "choice",
+             "instructions": "  ", "choices": ["red", "blue"]}]}),
             None,
         ),
         (
-            json!({"input": "the input", "questions": [{"id": "", "type": "yes_no",
-             "question": "ready"}]}),
+            json!({"input": "the input", "questions": [{"name": "", "type": "predicate",
+             "instructions": "ready"}]}),
             None,
         ),
         (
             json!({"input": "the input", "questions": [
-             {"id": "q1", "type": "yes_no", "question": "a"},
-             {"id": "q1", "type": "yes_no", "question": "b"}]}),
+             {"name": "q1", "type": "predicate", "instructions": "a"},
+             {"name": "q1", "type": "predicate", "instructions": "b"}]}),
             None,
         ),
         (
-            json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
-             "question": "pick", "options": wide}]}),
+            json!({"input": "the input", "questions": [{"name": "q1", "type": "choice",
+             "instructions": "pick", "choices": wide}]}),
             None,
         ),
         (
-            json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
-             "question": "pick", "options": options(&["only"])}]}),
+            json!({"input": "the input", "questions": [{"name": "q1", "type": "choice",
+             "instructions": "pick", "choices": options(&["only"])}]}),
             None,
         ),
         (
-            json!({"input": "the input", "questions": [{"id": "q1", "type": "score",
-             "question": "how bad", "levels": ["ok", " "]}]}),
+            json!({"input": "the input", "questions": [{"name": "q1", "type": "score",
+             "instructions": "how bad", "levels": [{"label": "ok"}, {"label": " "}]}]}),
             None,
         ),
         (
-            json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
-             "question": "pick", "options": options(&["Red", "red"])}]}),
+            json!({"input": "the input", "questions": [{"name": "q1", "type": "choice",
+             "instructions": "pick", "choices": options(&["Red", "red"])}]}),
             None,
         ),
         (
-            json!({"input": "the input", "questions": [{"id": "q1", "type": "score",
-             "question": "how bad", "levels": tall}]}),
+            json!({"input": "the input", "questions": [{"name": "q1", "type": "score",
+             "instructions": "how bad", "levels": tall}]}),
             None,
         ),
         (
             json!({"input": "the input", "temperature": 0.0, "questions":
-             [{"id": "q1", "type": "yes_no", "question": "ready"}]}),
+             [{"name": "q1", "type": "predicate", "instructions": "ready"}]}),
             Some(("param", "temperature")),
         ),
         (
             json!({"model": "base:lora", "input": "the input", "questions":
-             [{"id": "q1", "type": "yes_no", "question": "ready"}]}),
+             [{"name": "q1", "type": "predicate", "instructions": "ready"}]}),
             Some(("param", "model")),
         ),
         (
-            json!({"input": "the input", "questions": [{"id": "q1", "type": "choice",
-             "options": ["red", "blue"]}]}),
+            json!({"input": "the input", "questions": [{"name": "q1", "type": "choice",
+             "choices": ["red", "blue"]}]}),
             None,
         ),
         (
-            json!({"input": "the input", "questions": [{"id": "q1", "type": "score",
-             "question": "how bad", "levels": ["a", "b"], "options": ["x", "y"]}]}),
-            Some(("message", "options")),
+            json!({"input": "the input", "questions": [{"name": "q1", "type": "score",
+             "instructions": "how bad", "levels": [{"label": "a"}, {"label": "b"}], "choices": ["x", "y"]}]}),
+            Some(("message", "choices")),
         ),
         (
-            json!({"input": "the input", "questions": [{"id": "q9", "type": "mystery",
-             "question": "ready"}]}),
+            json!({"input": "the input", "questions": [{"name": "q9", "type": "mystery",
+             "instructions": "ready"}]}),
             Some(("message", "q9")),
         ),
     ];
@@ -711,22 +781,22 @@ async fn validation_matrix() {
     }
 }
 
-// --- content-block `input`: the wire split, refused or kept by `validate` ---
+// --- message `input`: the wire split, refused or kept by `validate` ---------
 
 #[tokio::test]
-async fn a_malformed_block_array_is_refused_naming_the_element() {
-    // One element looks like a block, so the array is blocks and element 1
-    // is held to the block grammar (Review Focus 1): the typo'd `img` type
-    // is refused with a 400 naming `input` and the element's index, never
-    // fallen back to a scored compact-JSON prompt.
+async fn a_malformed_part_is_refused_naming_its_position() {
+    // A typo'd part type inside a message is held to the part grammar: the
+    // refusal is a 400 naming `input` and the message's and part's indices,
+    // never fallen back to a scored rendering of the caller's JSON.
     let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
     let (status, body) = call(
         &state,
         post(
             "/v1/decisions",
             &json!({
-                "input": [{"type": "text", "text": "a"}, {"type": "img"}],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": "a"}, {"type": "img"}]}],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )
@@ -737,24 +807,24 @@ async fn a_malformed_block_array_is_refused_naming_the_element() {
     assert!(
         body["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains('1')),
-        "the refusal must name index 1: {body}"
+            .is_some_and(|message| message.contains("message[0] part[1]")),
+        "the refusal must name message 0 part 1: {body}"
     );
 }
 
 #[tokio::test]
-async fn audio_and_video_blocks_are_refused_naming_the_type() {
-    // The scoring endpoints take images only in v1: the refusal parses far
-    // enough to name the block's type.
+async fn unsupported_part_types_are_refused_naming_the_type() {
+    // The scoring endpoint takes text and images only: the other official
+    // input-item types parse far enough to name themselves, and are refused.
     let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
-    for kind in ["audio", "video"] {
+    for kind in ["input_audio", "input_file", "file", "item_reference"] {
         let (status, body) = call(
             &state,
             post(
                 "/v1/decisions",
                 &json!({
-                    "input": [{"type": kind, "source": {}}],
-                    "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                    "input": [{"role": "user", "content": [{"type": kind}]}],
+                    "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
                 }),
             ),
         )
@@ -771,60 +841,37 @@ async fn audio_and_video_blocks_are_refused_naming_the_type() {
 }
 
 #[tokio::test]
-async fn an_all_unknown_types_array_stays_a_container() {
-    // No element carries a known `type`, so the array is a JSON container by
-    // design (spec ruling 1) and scores as today's key-sorted compact JSON.
-    let (state, audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
-    let (status, body) = call(
-        &state,
-        post(
-            "/v1/decisions",
-            &json!({
-                "input": [{"type": "photo", "url": "x"}],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let want = prompt_ids(
-        "{\"type\":\"photo\",\"url\":\"x\"}\n\nIs the following true? ready\nAnswer with yes or no only.",
-    );
-    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
-    assert_eq!(
-        got,
-        vec![want],
-        "the model read the compact-JSON rendering: {got:?}"
-    );
-}
-
-#[tokio::test]
-async fn an_object_with_a_type_key_is_never_blocks() {
-    // Review Focus 2: a top-level object is never blocks, however much it
-    // spells like an image block - it stays a container and scores as
-    // key-sorted compact JSON.
-    let (state, audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
-    let (status, body) = call(
-        &state,
-        post(
-            "/v1/decisions",
-            &json!({
-                "input": {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let want = prompt_ids(
-        "{\"source\":{\"data\":\"aGk=\",\"media_type\":\"image/png\",\"type\":\"base64\"},\"type\":\"image\"}\n\nIs the following true? ready\nAnswer with yes or no only.",
-    );
-    let got: Vec<Vec<u32>> = audit.prefill_prompts.lock().clone();
-    assert_eq!(
-        got,
-        vec![want],
-        "the model read the compact-JSON rendering: {got:?}"
-    );
+async fn a_non_message_array_is_refused_naming_the_message() {
+    // Yesterday's flat block array - and any other array whose elements are
+    // not messages - is a 400 naming the message that lacks a role, never a
+    // container rendering.
+    let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
+    for input in [
+        json!([{"type": "input_text", "text": "a"}]),
+        json!([{"type": "photo", "url": "x"}]),
+        json!([]),
+    ] {
+        let (status, body) = call(
+            &state,
+            post(
+                "/v1/decisions",
+                &json!({
+                    "input": input,
+                    "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{input} -> {body}");
+        assert_eq!(body["error"]["param"], "input", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("message[0]")
+                    || message.contains("at least one message")),
+            "{body} must name the message or the empty array"
+        );
+    }
 }
 
 #[tokio::test]
@@ -842,8 +889,8 @@ async fn label_checks_refuse_a_question_whose_label_is_not_one_token() {
             &json!({
                 "input": "the input",
                 "questions": [{
-                    "id": "q5", "type": "score", "question": "how bad",
-                    "levels": ["a", "b", "c", "d", "e"],
+                    "name": "q5", "type": "score", "instructions": "how bad",
+                    "levels": [{"label": "a"}, {"label": "b"}, {"label": "c"}, {"label": "d"}, {"label": "e"}],
                 }],
             }),
         ),
@@ -906,8 +953,8 @@ async fn label_checks_refuse_a_label_that_would_merge_into_the_prompt_tail() {
             &json!({
                 "input": "the input",
                 "questions": [{
-                    "id": "q9", "type": "choice", "question": "pick one",
-                    "options": ["red", "blue"],
+                    "name": "q9", "type": "choice", "instructions": "pick one",
+                    "choices": ["red", "blue"],
                 }],
             }),
         ),
@@ -1036,7 +1083,7 @@ async fn an_overloaded_engine_surfaces_as_503() {
     assert_eq!(body["error"]["code"], "server_overloaded");
 }
 
-// --- image content blocks: the scored media path -----------------------------
+// --- inline image parts: the scored media path -----------------------------
 
 /// The image marker's id in `media_vocabulary`: past every word of `WORDS`
 /// and inside the scripted row's width.
@@ -1123,9 +1170,14 @@ fn media_state(rows: Vec<Vec<f32>>, ctx: u32, glued: bool) -> (Arc<AppState>, Ar
     (state, audit)
 }
 
-/// One base64 image block as the wire spells it.
-fn image_block(data: &str) -> Value {
-    json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}})
+/// One inline image part as the official wire spells it.
+fn image_part(data: &str) -> Value {
+    json!({"type": "input_image", "image_url": data})
+}
+
+/// One user message carrying these content parts.
+fn user_message(parts: &[Value]) -> Value {
+    json!({"role": "user", "content": parts})
 }
 
 /// The ids the model should read for a media prompt: the rendered text
@@ -1161,8 +1213,8 @@ async fn an_image_request_scores_the_expanded_prompt() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [image_block(&png), {"type": "text", "text": "urgent?"}],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [user_message(&[image_part(&png), json!({"type": "input_text", "text": "urgent?"})])],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )
@@ -1182,7 +1234,7 @@ async fn an_image_request_scores_the_expanded_prompt() {
 }
 
 #[tokio::test]
-async fn a_trailing_image_block_pins_the_question_block_without_a_blank_line() {
+async fn a_trailing_image_pins_the_question_block_without_a_blank_line() {
     // Whitespace golden 2: the last caller block is an image, so the question
     // block follows the marker as plain wording - no blank line, because the
     // pad run already ends the text side of the seam.
@@ -1193,8 +1245,8 @@ async fn a_trailing_image_block_pins_the_question_block_without_a_blank_line() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [{"type": "text", "text": "urgent?"}, image_block(&png)],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [user_message(&[json!({"type": "input_text", "text": "urgent?"}), image_part(&png)])],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )
@@ -1224,8 +1276,8 @@ async fn an_image_only_input_is_valid() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [image_block(&png)],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [user_message(&[image_part(&png)])],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )
@@ -1245,8 +1297,8 @@ async fn the_round_trip_check_is_skipped_with_media_and_enforced_without() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [image_block(&png), {"type": "text", "text": "urgent?"}],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [user_message(&[image_part(&png), json!({"type": "input_text", "text": "urgent?"})])],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )
@@ -1263,7 +1315,7 @@ async fn the_round_trip_check_is_skipped_with_media_and_enforced_without() {
             "/v1/decisions",
             &json!({
                 "input": "the input <|image_pad|>",
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )
@@ -1289,8 +1341,8 @@ async fn the_seam_check_still_refuses_a_glued_label_with_media() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [{"type": "text", "text": "urgent?"}, image_block(&png)],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [user_message(&[json!({"type": "input_text", "text": "urgent?"}), image_part(&png)])],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )
@@ -1310,8 +1362,8 @@ async fn the_seam_check_still_refuses_a_glued_label_with_media() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [image_block(&png), image_block(&png)],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [user_message(&[image_part(&png), image_part(&png)])],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )
@@ -1336,8 +1388,8 @@ async fn an_over_budget_image_is_a_context_overflow() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [image_block(&png)],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [user_message(&[image_part(&png)])],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )
@@ -1358,8 +1410,8 @@ async fn return_prompt_token_ids_with_media_returns_expanded_ids() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [image_block(&png), {"type": "text", "text": "urgent?"}],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [user_message(&[image_part(&png), json!({"type": "input_text", "text": "urgent?"})])],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
                 "return_prompt_token_ids": true,
             }),
         ),
@@ -1372,7 +1424,7 @@ async fn return_prompt_token_ids_with_media_returns_expanded_ids() {
         .iter()
         .map(|id| id.as_u64().expect("an id is a number"))
         .collect();
-    let usage = body["usage"]["prompt_tokens"].as_u64().expect("usage");
+    let usage = body["usage"]["input_tokens"].as_u64().expect("usage");
     assert_eq!(
         u64::try_from(ids.len()).expect("a prompt fits"),
         usage,
@@ -1387,18 +1439,18 @@ async fn return_prompt_token_ids_with_media_returns_expanded_ids() {
 #[tokio::test]
 async fn a_remote_image_url_is_refused_without_the_flag() {
     // The renderer's policy refusal is now reachable from decisions: the
-    // block parses, and the render is where the operator's flag is missed.
+    // part parses, and the render is where the operator's flag is missed.
     let (state, _audit) = media_state(vec![row_with(0.5, &[])], CTX, false);
     let (status, body) = call(
         &state,
         post(
             "/v1/decisions",
             &json!({
-                "input": [
-                    {"type": "text", "text": "urgent?"},
-                    {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}},
-                ],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [user_message(&[
+                    json!({"type": "input_text", "text": "urgent?"}),
+                    json!({"type": "input_image", "image_url": "https://example.com/x.png"}),
+                ])],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )
@@ -1413,8 +1465,8 @@ async fn a_remote_image_url_is_refused_without_the_flag() {
 }
 
 #[tokio::test]
-async fn a_valid_image_block_without_a_vision_tower_is_refused() {
-    // The block is well-formed and the wire accepts it; the refusal is the
+async fn a_valid_image_part_without_a_vision_tower_is_refused() {
+    // The part is well-formed and the wire accepts it; the refusal is the
     // renderer's: a text-only deployment cannot score pixels and says so,
     // naming the missing tower rather than mangling the picture into text.
     let (state, _audit) = state_with_rows(vec![row_with(0.5, &[])], CTX);
@@ -1424,11 +1476,11 @@ async fn a_valid_image_block_without_a_vision_tower_is_refused() {
         post(
             "/v1/decisions",
             &json!({
-                "input": [
-                    {"type": "text", "text": "urgent?"},
-                    image_block(&png),
-                ],
-                "questions": [{"id": "q1", "type": "yes_no", "question": "ready"}],
+                "input": [user_message(&[
+                    json!({"type": "input_text", "text": "urgent?"}),
+                    image_part(&png),
+                ])],
+                "questions": [{"name": "q1", "type": "predicate", "instructions": "ready"}],
             }),
         ),
     )

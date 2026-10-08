@@ -35,7 +35,7 @@
 //! corrected, because a constant was the original bug and a corrected constant
 //! is the same bug on a different part.
 
-use shiso_core::backend::{Backend, KernelArg};
+use shiso_core::backend::{Backend, KernelArg, KernelRef};
 use shiso_core::buffer::{DeviceView, RawBuffer};
 use shiso_core::{CoreResult, Extent3};
 
@@ -221,6 +221,45 @@ const CHUNK: [Variant; 5] = [
     Variant::ChunkHybrid,
 ];
 
+/// The recording twins, widest first.
+///
+/// Widest first because the trail is what the twin is chosen on: at four
+/// lanes a column a head's stores coalesce, and at one they scatter over 32
+/// lines each (`gdn::block` has the measurement). All three fold to the same
+/// bits, so walking down this list changes speed and never output.
+const RECORDERS: [Variant; 3] = [Variant::S4, Variant::S2, Variant::S1];
+
+/// The widest recording twin this device's pipelines accept, by the same
+/// rule [`tune::choose_shape`] reads limits with.
+///
+/// Every limit `None` is a backend that cannot say, and the reference S4
+/// stands, as it always has there. Otherwise the first twin whose own
+/// pipeline admits its lane count; `None` when none does, which sends a
+/// verify pass to the per-row walk of the plain shape rather than to a launch
+/// the device has already said it will refuse.
+fn choose_recorder(backend: &dyn Backend) -> Option<Variant> {
+    let limits = RECORDERS.map(|variant| {
+        let entry = variant.trail_entry()?;
+        backend.max_block_threads(KernelRef::new(Q35, entry))
+    });
+    if limits.iter().all(Option::is_none) {
+        return Some(Variant::S4);
+    }
+    let recorder = RECORDERS
+        .into_iter()
+        .zip(limits)
+        .find(|(variant, limit)| matches!(limit, Some(limit) if *limit >= variant.lanes()))
+        .map(|(variant, _)| variant);
+    if recorder != Some(Variant::S4) {
+        tracing::info!(
+            limits = ?limits,
+            recorder = recorder.map(Variant::lanes),
+            "the widest GDN recording twin does not fit this device; a narrower one records the trail",
+        );
+    }
+    recorder
+}
+
 /// The shape the build has always dispatched the per-token walk at.
 ///
 /// It is the reference, not a default: [`tune::choose_shape`] returns it only
@@ -256,6 +295,17 @@ pub(crate) struct GdnShape {
     pub recurrent: Variant,
     /// The 64-token run, for long prefill.
     pub chunk: Variant,
+    /// The recording twin a verify pass launches, or `None` for the per-row
+    /// walk of [`Self::recurrent`] when the device accepts no twin at all.
+    ///
+    /// Chosen apart from [`Self::recurrent`] because the two are ranked on
+    /// different things: the plain walk on time, the twin on its trail's write
+    /// pattern (see `gdn::block`). And probed apart from it, because the
+    /// twin is a separate pipeline with its own register budget - a device
+    /// that launches `recurrent_s4` at 512 can still cap `recurrent_trail_s4`
+    /// below it, which is how a verify pass came to be refused on a device
+    /// whose tuner had found nothing wrong.
+    pub recorder: Option<Variant>,
 }
 
 impl GdnShape {
@@ -282,7 +332,7 @@ impl GdnShape {
     /// of either kernel, which ends the load rather than the first request.
     pub(crate) fn choose(backend: &dyn Backend, geometry: &GdnGeometry) -> CoreResult<Self> {
         if let Ok(pinned) = std::env::var(VARIANT_ENV) {
-            if let Some(shape) = Self::pinned(&pinned) {
+            if let Some(shape) = Self::pinned(&pinned, backend) {
                 tracing::info!(
                     %pinned,
                     recurrent = shape.recurrent.entry(),
@@ -306,7 +356,11 @@ impl GdnShape {
             CHUNK_REFERENCE,
             &measure(backend, geometry, &CHUNK, launch::GDN_CHUNK_RUN),
         )?;
-        Ok(Self { recurrent, chunk })
+        Ok(Self {
+            recurrent,
+            chunk,
+            recorder: choose_recorder(backend),
+        })
     }
 
     /// The shape `pinned` names, or `None` if any part of it names nothing.
@@ -314,10 +368,15 @@ impl GdnShape {
     /// Refused rather than ignored: a misspelled pin that quietly measured
     /// instead would report the timings of a shape nobody asked about, and the
     /// whole use of this knob is to know exactly which kernel ran.
-    fn pinned(pinned: &str) -> Option<Self> {
+    ///
+    /// The recorder is not part of the pin: it is probed even here, since a
+    /// pinned run that still dispatched an unlaunchable twin would reproduce
+    /// the wrong refusal.
+    fn pinned(pinned: &str, backend: &dyn Backend) -> Option<Self> {
         let mut shape = Self {
             recurrent: RECURRENT_REFERENCE,
             chunk: CHUNK_REFERENCE,
+            recorder: choose_recorder(backend),
         };
         for token in pinned.split(',') {
             match token.trim() {
@@ -707,7 +766,7 @@ mod device_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use shiso_core::CoreError;
-    use shiso_core::backend::{Backend, KernelRef, LaunchArgs};
+    use shiso_core::backend::{Backend, LaunchArgs};
     use shiso_core::buffer::{DeviceView, RawBuffer};
 
     use shiso_core::DType;
@@ -839,6 +898,12 @@ mod device_tests {
         for variant in [shape.recurrent, shape.chunk] {
             fits(backend, TunableShape::kernel(variant), variant.lanes());
         }
+        // The verify pass's twin is its own pipeline, and the one that was
+        // refused at 512 threads of 448 while the plain walk above was fine.
+        if let Some(recorder) = shape.recorder {
+            let entry = recorder.trail_entry().expect("a recorder has a twin");
+            fits(backend, KernelRef::new(Q35, entry), recorder.lanes());
+        }
     }
 
     /// The probe fills a row per variant and times the ones the device
@@ -960,5 +1025,79 @@ mod device_tests {
             Some(1024),
             "the limit is still reported: the refusal was not a lane-count one",
         );
+    }
+
+    /// A backend that answers one thread limit for the recording twins and
+    /// launches nothing.
+    #[derive(Debug)]
+    struct CappedBackend {
+        /// What `max_block_threads` reports for a `recurrent_trail` entry.
+        trail_limit: Option<u32>,
+    }
+
+    impl Backend for CappedBackend {
+        fn backend_name(&self) -> &'static str {
+            "capped"
+        }
+
+        fn alloc_raw(&self, _bytes: u64) -> CoreResult<RawBuffer> {
+            Err(CoreError::Unsupported {
+                what: "allocation on a backend that only reports limits",
+                backend: "capped",
+            })
+        }
+
+        fn free_raw(&self, _raw: RawBuffer) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn copy_h2d(&self, _dst: DeviceView<'_>, _src: &[u8]) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn copy_d2h(&self, _src: DeviceView<'_>, _dst: &mut [u8]) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn copy_d2d(&self, _dst: DeviceView<'_>, _src: DeviceView<'_>) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn max_block_threads(&self, kernel: KernelRef) -> Option<u32> {
+            if kernel.entry.contains("recurrent_trail") {
+                self.trail_limit
+            } else {
+                None
+            }
+        }
+
+        fn run(&self, _kernel: KernelRef, _args: &LaunchArgs<'_>) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn sync(&self) -> CoreResult<()> {
+            Ok(())
+        }
+    }
+
+    /// The recorder is the widest twin the pipeline admits, not S4 by fiat.
+    ///
+    /// 448 is what an M1 Max reported for `recurrent_trail_s4`: the register
+    /// budget of that pipeline, below the 512 lanes S4 is written for. The
+    /// verify pass used to launch S4 anyway and was refused at the first
+    /// speculative step.
+    #[test]
+    fn the_recorder_steps_down_to_what_the_pipeline_admits() {
+        let pick = |trail_limit| choose_recorder(&CappedBackend { trail_limit });
+        assert_eq!(
+            pick(None),
+            Some(Variant::S4),
+            "no opinion keeps the reference"
+        );
+        assert_eq!(pick(Some(1024)), Some(Variant::S4));
+        assert_eq!(pick(Some(512)), Some(Variant::S4));
+        assert_eq!(pick(Some(448)), Some(Variant::S2));
+        assert_eq!(pick(Some(128)), Some(Variant::S1));
+        assert_eq!(pick(Some(64)), None, "nothing fits: the per-row walk");
     }
 }

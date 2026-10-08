@@ -46,14 +46,14 @@ pub(crate) fn encode(
             Kind::Choice { options, .. } => {
                 entry.insert(
                     "choice".to_owned(),
-                    json!(choice_name(&answer.kind, answer.top)),
+                    json!(choice_name(&answer.kind, answer.top).text()),
                 );
                 // The official shape keys the probabilities by option name;
                 // the map order is the option order, which is the order the
                 // caller's `criteria` map carried.
                 let mut probabilities = Map::new();
                 for (option, probability) in options.iter().zip(&answer.probabilities) {
-                    probabilities.insert(option.name.clone(), json!(probability));
+                    probabilities.insert(option.value.text(), json!(probability));
                 }
                 entry.insert("probabilities".to_owned(), Value::Object(probabilities));
                 choice_confidence(&answer.probabilities)
@@ -68,7 +68,7 @@ pub(crate) fn encode(
                 let mut legend = Map::new();
                 let mut probabilities = Map::new();
                 for (index, level) in levels.iter().enumerate() {
-                    legend.insert(index.to_string(), json!(level));
+                    legend.insert(index.to_string(), json!(level.label));
                 }
                 for (index, probability) in answer.probabilities.iter().enumerate() {
                     probabilities.insert(index.to_string(), json!(probability));
@@ -141,7 +141,7 @@ pub(crate) fn encode(
 #[cfg(test)]
 mod tests {
     use super::encode;
-    use crate::decision::core::{Answered, ChoiceOption, Kind};
+    use crate::decision::core::{Answered, ChoiceOption, ChoiceValue, Kind, ScoreLevel};
     use serde_json::{Value, json};
 
     /// One scored answer with every field the encoder reads set by hand, and
@@ -238,15 +238,15 @@ mod tests {
                 question: "pick one".to_owned(),
                 options: vec![
                     ChoiceOption {
-                        name: "red".to_owned(),
+                        value: ChoiceValue::Str("red".to_owned()),
                         description: None,
                     },
                     ChoiceOption {
-                        name: "blue".to_owned(),
+                        value: ChoiceValue::Str("blue".to_owned()),
                         description: Some("the sky".to_owned()),
                     },
                     ChoiceOption {
-                        name: "green".to_owned(),
+                        value: ChoiceValue::Str("green".to_owned()),
                         description: None,
                     },
                 ],
@@ -282,7 +282,10 @@ mod tests {
                 question: "how bad".to_owned(),
                 levels: ["none", "some", "lots", "max"]
                     .into_iter()
-                    .map(ToString::to_string)
+                    .map(|label| ScoreLevel {
+                        label: label.to_owned(),
+                        description: None,
+                    })
                     .collect(),
             },
             false,
@@ -363,7 +366,7 @@ mod tests {
                 Kind::Choice {
                     question: String::new(),
                     options: vec![ChoiceOption {
-                        name: "red".to_owned(),
+                        value: ChoiceValue::Str("red".to_owned()),
                         description: None,
                     }],
                 },
