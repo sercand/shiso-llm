@@ -207,6 +207,146 @@ impl QuantBlock for BlockIq2Xxs {
     const ELEMS: usize = QK_K;
 }
 
+/// 2-bit `i`-quant, small: an fp16 scale, grid indices with the sign folded
+/// into each index word, and 4-bit sub-block scales.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIq2Xs {
+    /// fp16 scale.
+    pub d: u16,
+    /// Eight weights per `u16`: the low nine bits index
+    /// [`crate::quant_tables::IQ2XS_GRID`] and the top seven select one of
+    /// the 128 sign patterns ([`crate::quant_tables::KSIGNS64`] is their
+    /// mask form).
+    pub qs: [u16; QK_K / 8],
+    /// Two 4-bit scales a byte, one per 16-weight half of a 32-weight group.
+    pub scales: [u8; QK_K / 32],
+}
+const _: () = assert!(size_of::<BlockIq2Xs>() == 74);
+impl QuantBlock for BlockIq2Xs {
+    const DTYPE: DType = DType::IQ2_XS;
+    const ELEMS: usize = QK_K;
+}
+
+/// 2-bit `i`-quant, small with explicit signs: a wider grid than
+/// [`BlockIq2Xs`] and one sign bit per weight instead of per index word.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIq2S {
+    /// fp16 scale.
+    pub d: u16,
+    /// Low eight bits of each index into [`crate::quant_tables::IQ2S_GRID`],
+    /// then 32 bytes of signs, one bit per weight.
+    pub qs: [u8; QK_K / 4],
+    /// High two bits of each grid index, four indices a byte.
+    pub qh: [u8; QK_K / 32],
+    /// Two 4-bit scales a byte, one per 16-weight half of a 32-weight group.
+    pub scales: [u8; QK_K / 32],
+}
+const _: () = assert!(size_of::<BlockIq2S>() == 82);
+impl QuantBlock for BlockIq2S {
+    const DTYPE: DType = DType::IQ2_S;
+    const ELEMS: usize = QK_K;
+}
+
+/// 3-bit `i`-quant, extra-extra-small: an fp16 scale and one packed byte
+/// stream of grid indices and sign-plus-scale words.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIq3Xxs {
+    /// fp16 scale.
+    pub d: u16,
+    /// 64 indices into [`crate::quant_tables::IQ3XXS_GRID`], then 32 bytes
+    /// each packing four 7-bit sign-pattern indices and a 4-bit group scale.
+    pub qs: [u8; 3 * QK_K / 8],
+}
+const _: () = assert!(size_of::<BlockIq3Xxs>() == 98);
+impl QuantBlock for BlockIq3Xxs {
+    const DTYPE: DType = DType::IQ3_XXS;
+    const ELEMS: usize = QK_K;
+}
+
+/// 3-bit `i`-quant, small: grid indices split across two planes, per-weight
+/// signs, and 4-bit group scales.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIq3S {
+    /// fp16 scale.
+    pub d: u16,
+    /// Low eight bits of each index into [`crate::quant_tables::IQ3S_GRID`].
+    pub qs: [u8; QK_K / 4],
+    /// High bit pair of each grid index, four indices a byte per group.
+    pub qh: [u8; QK_K / 32],
+    /// One sign bit per weight.
+    pub signs: [u8; QK_K / 8],
+    /// Two 4-bit scales a byte, one per 32-weight group.
+    pub scales: [u8; QK_K / 64],
+}
+const _: () = assert!(size_of::<BlockIq3S>() == 110);
+impl QuantBlock for BlockIq3S {
+    const DTYPE: DType = DType::IQ3_S;
+    const ELEMS: usize = QK_K;
+}
+
+/// 1-bit `i`-quant, small: grid indices whose high bits, scale multiplier,
+/// and grid-shift sign share one `u16` per 32-weight group.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIq1S {
+    /// fp16 scale.
+    pub d: u16,
+    /// Low eight bits of each index into [`crate::quant_tables::IQ1S_GRID`].
+    pub qs: [u8; QK_K / 8],
+    /// Per 32-weight group: the high three bits of four grid indices, a 3-bit
+    /// scale multiplier, and the sign of the grid shift.
+    pub qh: [u16; QK_K / 32],
+}
+const _: () = assert!(size_of::<BlockIq1S>() == 50);
+impl QuantBlock for BlockIq1S {
+    const DTYPE: DType = DType::IQ1_S;
+    const ELEMS: usize = QK_K;
+}
+
+/// 1-bit `i`-quant, medium: like [`BlockIq1S`] but with no `d` field - the
+/// fp16 block scale is assembled from nibbles of the scale bytes at decode.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIq1M {
+    /// Low eight bits of each index into [`crate::quant_tables::IQ1S_GRID`].
+    pub qs: [u8; QK_K / 8],
+    /// High three bits of two grid indices a byte, plus each pair's
+    /// grid-shift sign.
+    pub qh: [u8; QK_K / 16],
+    /// 3-bit scale per 16 weights; the top nibbles of these bytes also carry
+    /// the fp16 block scale.
+    pub scales: [u8; QK_K / 32],
+}
+const _: () = assert!(size_of::<BlockIq1M>() == 56);
+impl QuantBlock for BlockIq1M {
+    const DTYPE: DType = DType::IQ1_M;
+    const ELEMS: usize = QK_K;
+}
+
+/// 4-bit `i`-quant, extra-small: an fp16 scale, 6-bit sub-block scales split
+/// across two planes, and nibble indices into the 4-bit non-linear codebook.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockIq4Xs {
+    /// fp16 scale.
+    pub d: u16,
+    /// High two bits of each of the eight 6-bit sub-block scales.
+    pub scales_h: u16,
+    /// Low four bits of each sub-block scale, two a byte.
+    pub scales_l: [u8; QK_K / 64],
+    /// 4-bit indices into [`crate::quant_tables::IQ4NL_VALUES`], two a byte.
+    pub qs: [u8; QK_K / 2],
+}
+const _: () = assert!(size_of::<BlockIq4Xs>() == 136);
+impl QuantBlock for BlockIq4Xs {
+    const DTYPE: DType = DType::IQ4_XS;
+    const ELEMS: usize = QK_K;
+}
+
 /// Microscaling 4-bit: one shared exponent plus 16 packed nibbles.
 ///
 /// Note the size, 17 bytes: the shared exponent is a single byte, not the fp16

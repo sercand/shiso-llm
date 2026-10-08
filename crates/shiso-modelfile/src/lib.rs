@@ -15,7 +15,7 @@
 //! | [`reader`] | header, metadata table, tensor directory, the mapping |
 //! | [`metadata`] | key/value metadata, lazily decoded arrays, compat getters |
 //! | [`quant`] | one `#[repr(C)]` struct per quant block format, block sizing |
-//! | [`quant_tables`] | the fixed lookup tables the 2-bit and 4-bit formats use |
+//! | [`quant_tables`] | the fixed codebook tables the non-linear and `i`-quant formats use |
 //! | [`source`] | the one trait a role mapping needs from a container |
 //! | [`st_header`] | the safetensors container itself: header, spans, formats |
 //! | [`safetensors`] | the MLX/OptiQ export: affine triples, role translation |
