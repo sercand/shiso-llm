@@ -275,7 +275,7 @@ pub struct BlockIq3S {
     pub d: u16,
     /// Low eight bits of each index into [`crate::quant_tables::IQ3S_GRID`].
     pub qs: [u8; QK_K / 4],
-    /// High bit pair of each grid index, four indices a byte per group.
+    /// High bit of each grid index, eight indices a byte.
     pub qh: [u8; QK_K / 32],
     /// One sign bit per weight.
     pub signs: [u8; QK_K / 8],
