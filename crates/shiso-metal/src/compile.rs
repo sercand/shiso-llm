@@ -26,6 +26,15 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "00_common.metal",
         include_str!("../metal/generic/00_common.metal"),
     ),
+    // The i-quant codebook tables, before every file that reads them:
+    // `get_rows.metal` decodes IQ1_M rows through `IQ1S_GRID` and
+    // `mul_mv_ext.metal` decodes all nine formats through the grids, and the
+    // library is one translation unit, so the declarations have to precede
+    // both.
+    (
+        "iq_tables.metal",
+        include_str!("../metal/generic/iq_tables.metal"),
+    ),
     ("norm.metal", include_str!("../metal/generic/norm.metal")),
     (
         "softmax.metal",

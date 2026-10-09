@@ -36,6 +36,12 @@ struct shs_get_rows_block_q4_K {
     uchar qs[128];
 };
 
+struct shs_get_rows_block_iq1_m {
+    uchar qs[32];
+    uchar qh[16];
+    uchar scales[8];
+};
+
 static inline uchar2 shs_get_rows_q4_K_scale_min(int j, int k, device const uchar *q) {
     return j < 4 ? uchar2{uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63)}
                  : uchar2{uchar((q[j + 4 + k] & 0x0f) | ((q[j - 4 + k] & 0xc0) >> 2)),
@@ -226,6 +232,60 @@ kernel void kernel_get_rows_q4_K_f32(
             const uint q = ((uint)qb->qs[byte_off] >> shift) & 0x0fu;
             out[idx] = (float)qb->d * (float)sm.x * (float)q -
                        (float)qb->dmin * (float)sm.y;
+        }
+    }
+}
+
+// Gathers IQ1_M embedding rows. The format has no stored block scale: the f16
+// is the four top nibbles of the odd scale bytes, least significant first,
+// and each 16-weight subblock carries its own 3-bit scale multiplier beside
+// it. The decode is the row-at-a-time twin of `deq32_iq1_m` in
+// `mul_mv_ext.metal` and of the host reference in `shiso_modelfile::iq_quant`.
+kernel void kernel_get_rows_iq1_m_f32(
+        constant shs_metal_args_get_rows_q8_0 & args,
+        device const char    * src0,
+        device const char    * src1,
+        device       char    * dst,
+        uint3                  tgpig[[threadgroup_position_in_grid]],
+        ushort                 tiitg[[thread_index_in_threadgroup]],
+        ushort3                ntg [[threads_per_threadgroup]]) {
+    const int32_t block = (int32_t)tgpig.x;
+    const int32_t tok_i = (int32_t)tgpig.y;
+    if (tok_i >= args.n_tokens) return;
+
+    const int32_t token =
+        ((const device int32_t *)(src1 + (uint64_t)tok_i * args.token_stride))[0];
+    if (token < 0 || token >= args.n_vocab) return;
+
+    const device shs_get_rows_block_iq1_m *row =
+        (const device shs_get_rows_block_iq1_m *)(src0 + (uint64_t)token * args.src_row_bytes);
+    const device shs_get_rows_block_iq1_m *qb = row + block;
+    device float *out =
+        (device float *)(dst + (uint64_t)tok_i * args.dst_row_bytes);
+
+    const uint w0 = (uint)qb->scales[0] | ((uint)qb->scales[1] << 8);
+    const uint w1 = (uint)qb->scales[2] | ((uint)qb->scales[3] << 8);
+    const uint w2 = (uint)qb->scales[4] | ((uint)qb->scales[5] << 8);
+    const uint w3 = (uint)qb->scales[6] | ((uint)qb->scales[7] << 8);
+    const ushort dbits = (ushort)((w0 >> 12) | ((w1 >> 8) & 0x00F0) | ((w2 >> 4) & 0x0F00) | (w3 & 0xF000));
+    const float d = (float)as_type<half>(dbits);
+    const uint words[4] = { w0, w1, w2, w3 };
+
+    const int32_t i0 = block * 256;
+    for (int32_t i = (int32_t)tiitg; i < 256; i += (int32_t)ntg.x) {
+        const int32_t idx = i0 + i;
+        if (idx < args.n_embd) {
+            const uint ib = (uint)i >> 5u;          // 32-weight group
+            const uint m  = ((uint)i >> 3u) & 3u;   // quad in the group
+            const uint j  = (uint)i & 7u;           // weight in the quad
+            const uint shift = 6u * (ib & 1u) + 3u * (m >> 1u);
+            const float dl = d * (float)(2u * ((words[ib >> 1u] >> shift) & 7u) + 1u);
+            const uchar qhb = qb->qh[2u * ib + (m >> 1u)];
+            const uint grid_idx = (uint)qb->qs[4u * ib + m]
+                                | ((((uint)qhb) << ((m & 1u) ? 4u : 8u)) & 0x700u);
+            const float delta = (qhb & ((m & 1u) ? 0x80u : 0x08u)) ? -0.125f : 0.125f;
+            const ulong grid = IQ1S_GRID[grid_idx];
+            out[idx] = dl * ((float)(char)((grid >> (8u * j)) & 0xFFu) + delta);
         }
     }
 }
