@@ -13,6 +13,10 @@
 //! An embedding table can be stored rotated too, and then each gathered row
 //! has to be taken back: `y = signs * H(row)`. That is
 //! [`RotationDirection::Inverse`], and it runs in place on the gathered rows.
+//! The same table read as a tied output head is `E R^T`, and its logits are
+//! right only over a rotated input, `(E R^T)(R h) = E h`: so an inverse
+//! rotation that carries a scratch also runs the forward transform, and the
+//! projection runs it for every rotated weight whatever its direction.
 //!
 //! A forward rotation writes into a [`RotationScratch`] one model shares
 //! between all its rotated weights. That is sound because projections are
@@ -118,8 +122,9 @@ pub struct RotationDesc<'a> {
     pub signs: &'a [f32],
     /// A head permutation to read the input through (forward only).
     pub heads: Option<HeadOrder>,
-    /// Where a forward rotation stages its output; `None` for an inverse one,
-    /// which runs in place.
+    /// Where the forward transform stages its output. A forward rotation
+    /// needs one; an inverse one runs its own direction in place and needs one
+    /// only when its table is also read as a projection (a tied output head).
     pub scratch: Option<Arc<RotationScratch>>,
 }
 
@@ -132,6 +137,9 @@ pub struct InputRotation {
     direction: RotationDirection,
     heads: Option<HeadOrder>,
     signs: DeviceBuffer,
+    /// The signs as bits, one per input (set for `-1`), kept on the host so
+    /// two rotations can be told equal without reading the device.
+    sign_bits: Box<[u64]>,
     scratch: Option<Arc<RotationScratch>>,
 }
 
@@ -187,6 +195,14 @@ impl InputRotation {
                 return Err(invalid(format!("heads {h:?} do not tile width {width}")));
             }
         }
+        let mut sign_bits = vec![0_u64; desc.signs.len().div_ceil(64)].into_boxed_slice();
+        for (at, sign) in desc.signs.iter().enumerate() {
+            if sign.is_sign_negative()
+                && let Some(word) = sign_bits.get_mut(at / 64)
+            {
+                *word |= 1 << (at % 64);
+            }
+        }
         let bytes: Vec<u8> = desc.signs.iter().flat_map(|s| s.to_le_bytes()).collect();
         let signs = alloc(backend, u64::from(width) * F32_BYTES)?;
         backend.copy_h2d(signs.view(), &bytes)?;
@@ -196,6 +212,7 @@ impl InputRotation {
             direction: desc.direction,
             heads: desc.heads,
             signs,
+            sign_bits,
             scratch: desc.scratch,
         })
     }
@@ -212,11 +229,23 @@ impl InputRotation {
         self.width
     }
 
-    /// Launches the transform of `n_tok` rows from `src` into `dst`.
+    /// Whether `other` runs the same forward transform, so that an input
+    /// rotated for one is the input the other reads.
+    #[must_use]
+    pub fn same_forward(&self, other: &Self) -> bool {
+        self.block == other.block
+            && self.width == other.width
+            && self.heads == other.heads
+            && self.sign_bits == other.sign_bits
+    }
+
+    /// Launches the transform of `n_tok` rows from `src` into `dst`, the
+    /// inverse direction when `inverse`.
     fn launch(
         &self,
         backend: &dyn Backend,
         n_tok: u32,
+        inverse: bool,
         src: DeviceView<'_>,
         dst: DeviceView<'_>,
     ) -> CoreResult<()> {
@@ -229,7 +258,7 @@ impl InputRotation {
             n_tok,
             width: self.width,
             block: self.block,
-            inverse: u32::from(self.direction == RotationDirection::Inverse),
+            inverse: u32::from(inverse),
             nk: heads.key_heads,
             rep: heads.group,
             hd: heads.head_dim,
@@ -253,9 +282,13 @@ impl InputRotation {
     /// Rotates `n_tok` rows of `src` into the scratch and returns the view a
     /// projection then reads.
     ///
+    /// This is the forward transform whatever the direction: an inverse
+    /// rotation's table read as a projection is a tied output head, and that
+    /// reads a forward-rotated input (see the module docs).
+    ///
     /// # Errors
     ///
-    /// [`CoreError::InvalidValue`] for an inverse rotation,
+    /// [`CoreError::InvalidValue`] for a rotation built without a scratch,
     /// [`CoreError::OutOfBounds`] when `src` is short or the rows do not fit
     /// the scratch, and whatever the launch reports.
     pub(crate) fn forward<'s>(
@@ -264,10 +297,12 @@ impl InputRotation {
         n_tok: u32,
         src: DeviceView<'_>,
     ) -> CoreResult<DeviceView<'s>> {
-        let (RotationDirection::Forward, Some(scratch)) = (self.direction, &self.scratch) else {
+        let Some(scratch) = &self.scratch else {
             return Err(CoreError::InvalidValue {
                 key: "input rotation",
-                value: "an inverse rotation has no forward pass".into(),
+                value: "a rotated table read as a projection needs a scratch to stage \
+                        its rotated input in, and this one was built without"
+                    .into(),
             });
         };
         let floats = u64::from(self.width) * u64::from(n_tok);
@@ -286,7 +321,7 @@ impl InputRotation {
             });
         }
         let dst = scratch.buffer.view();
-        self.launch(backend, n_tok, src, dst)?;
+        self.launch(backend, n_tok, false, src, dst)?;
         Ok(scratch.buffer.view())
     }
 
@@ -317,6 +352,6 @@ impl InputRotation {
                 buffer_bytes: rows.len(),
             });
         }
-        self.launch(backend, n_tok, rows, rows)
+        self.launch(backend, n_tok, true, rows, rows)
     }
 }

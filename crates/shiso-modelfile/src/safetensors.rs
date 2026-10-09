@@ -1141,6 +1141,20 @@ fn packed_entry(
             HeadPermute::new(axis, heads, rows, cols, base)
         })
         .transpose()?;
+    // One format for both arrays: a triple reports one `ScaleFormat`, so a
+    // file that stored its scales in one half format and its biases in the
+    // other would have every group's bias decoded as the wrong one.
+    let (scales, biases) = (half_source(base, scales)?, half_source(base, biases)?);
+    if scales.dtype != biases.dtype {
+        return Err(GgufError::LayoutMismatch {
+            tensor: base.into(),
+            want: Box::from("scales and biases in the same half format"),
+            got: Box::from(format!(
+                "{:?} scales, {:?} biases",
+                scales.dtype, biases.dtype
+            )),
+        });
+    }
     Ok(Entry {
         desc: TensorDesc {
             name: role.gguf.as_str().into(),
@@ -1156,8 +1170,8 @@ fn packed_entry(
                 end: raw.data_offsets[1],
                 dtype: StDType::U32,
             },
-            scales: half_source(base, scales)?,
-            biases: half_source(base, biases)?,
+            scales,
+            biases,
             layout,
         },
         permute,

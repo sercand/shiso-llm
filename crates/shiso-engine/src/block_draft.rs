@@ -195,25 +195,30 @@ pub enum CodebookRows {
 const Q4K_BLOCK_BYTES: usize = size_of::<shiso_modelfile::quant::BlockQ4K>();
 
 impl Codebook {
-    /// Row `id`, widened. An id past the table reads as an empty row, which
-    /// scores a candidate on its logit alone.
-    fn row(&self, id: u32) -> Vec<f32> {
+    /// Row `id`, widened into `out`, which is cleared first. An id past the
+    /// table reads as an empty row, which scores a candidate on its logit
+    /// alone.
+    ///
+    /// Into a caller's buffer because it runs once per candidate per drafted
+    /// position; a `q4_K` row decodes on the stack and is copied in.
+    fn row_into(&self, id: u32, out: &mut Vec<f32>) {
+        out.clear();
         let rank = self.rank as usize;
         let id = id as usize;
         match &self.rows {
-            CodebookRows::Bf16(values) => values
-                .get(id * rank..(id + 1) * rank)
-                .unwrap_or(&[])
-                .iter()
-                .map(|&bits| half_to_f32(bits))
-                .collect(),
-            CodebookRows::Q4K(bytes) => bytes
-                .get(id * Q4K_BLOCK_BYTES..(id + 1) * Q4K_BLOCK_BYTES)
-                .map(|raw| {
+            CodebookRows::Bf16(values) => out.extend(
+                values
+                    .get(id * rank..(id + 1) * rank)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|&bits| half_to_f32(bits)),
+            ),
+            CodebookRows::Q4K(bytes) => {
+                if let Some(raw) = bytes.get(id * Q4K_BLOCK_BYTES..(id + 1) * Q4K_BLOCK_BYTES) {
                     let block: shiso_modelfile::quant::BlockQ4K = bytemuck::pod_read_unaligned(raw);
-                    shiso_modelfile::quant::dequant_q4_k(&block).to_vec()
-                })
-                .unwrap_or_default(),
+                    out.extend(shiso_modelfile::quant::dequant_q4_k(&block));
+                }
+            }
         }
     }
 }
@@ -796,6 +801,8 @@ impl BlockDrafter {
         let sampled = hint.temperature > 0.0;
         let mut prev = first.get();
         let mut out = Vec::with_capacity(shape.block as usize - 1);
+        let mut code = Vec::with_capacity(rank);
+        let mut weighted = Vec::with_capacity(rank);
         for (i, (row, hidden_row)) in logits
             .chunks_exact(vocab)
             .zip(projected.chunks_exact(rank))
@@ -803,24 +810,13 @@ impl BlockDrafter {
         {
             let position = at + u32::try_from(i).unwrap_or(u32::MAX);
             let candidates = top_k(row, k);
-            let weighted: Vec<f32> = self
-                .parts
-                .predecessor
-                .row(prev)
-                .into_iter()
-                .zip(hidden_row)
-                .map(|(p, h)| p * h)
-                .collect();
+            self.parts.predecessor.row_into(prev, &mut code);
+            weighted.clear();
+            weighted.extend(code.iter().zip(hidden_row).map(|(p, h)| p * h));
             let mut best = (f32::NEG_INFINITY, candidates.first().copied().unwrap_or(0));
             for &cand in &candidates {
-                let edge: f32 = self
-                    .parts
-                    .successor
-                    .row(cand)
-                    .into_iter()
-                    .zip(&weighted)
-                    .map(|(s, p)| s * p)
-                    .sum();
+                self.parts.successor.row_into(cand, &mut code);
+                let edge: f32 = code.iter().zip(&weighted).map(|(s, p)| s * p).sum();
                 let mut score = row[cand as usize] + edge;
                 if sampled {
                     let u = crate::sampling::keyed_uniform(hint.key, position, cand);

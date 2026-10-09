@@ -61,7 +61,7 @@ use crate::launch::{
     plain_mv, plain_mv_grid, run, ternary_mm_name, ternary_mmv_name, ternary_mv_name,
     ternary_splits, ternary_tag,
 };
-use crate::rotation::{InputRotation, RotationDirection};
+use crate::rotation::InputRotation;
 
 /// One projection dimension, as the kernels spell it.
 ///
@@ -810,6 +810,78 @@ pub fn projection(
     src: DeviceView<'_>,
     dst: DeviceView<'_>,
 ) -> CoreResult<()> {
+    check_operands(weight, n_tok, src, dst)?;
+    // A weight stored in a rotated basis reads a rotated input. The rotation
+    // stages it in the model's scratch; everything below reads that instead.
+    // An inverse rotation lands here only as a tied output head over a rotated
+    // table, and that reads the forward transform too (see `rotation`).
+    let rotated;
+    let src = match weight.rotation.as_deref() {
+        Some(rotation) => {
+            rotated = rotation.forward(backend, n_tok, src)?;
+            rotated
+        }
+        None => src,
+    };
+    dispatch(backend, weight, n_tok, src, dst)
+}
+
+/// Multiplies several resident weights by one activation block, each into its
+/// own output.
+///
+/// The same product as one [`projection`] per pair. What it saves is the
+/// rotation: when every weight reads its input through the same transform -
+/// the q/k/v of one slot, the gate and up of one feed-forward over a rotated
+/// export - the input is rotated once rather than once per weight, which is
+/// four or five transforms of the same rows a layer on the decode path.
+///
+/// # Errors
+///
+/// Whatever [`projection`] reports for any pair, checked before anything is
+/// launched.
+pub fn projections(
+    backend: &dyn Backend,
+    n_tok: u32,
+    src: DeviceView<'_>,
+    pairs: &[(&Weight, DeviceView<'_>)],
+) -> CoreResult<()> {
+    for (weight, dst) in pairs {
+        check_operands(weight, n_tok, src, *dst)?;
+    }
+    let shared = match pairs.split_first() {
+        Some(((first, _), rest)) => first.rotation.as_deref().filter(|rotation| {
+            rest.iter().all(|(weight, _)| {
+                weight
+                    .rotation
+                    .as_deref()
+                    .is_some_and(|other| rotation.same_forward(other))
+            })
+        }),
+        None => return Ok(()),
+    };
+    let Some(rotation) = shared else {
+        for (weight, dst) in pairs {
+            projection(backend, weight, n_tok, src, *dst)?;
+        }
+        return Ok(());
+    };
+    // One transform for every weight. Sound for the reason the shared scratch
+    // is: the launches below are enqueued in order on one queue, and nothing
+    // between them rotates anything else into the scratch.
+    let rotated = rotation.forward(backend, n_tok, src)?;
+    for (weight, dst) in pairs {
+        dispatch(backend, weight, n_tok, rotated, *dst)?;
+    }
+    Ok(())
+}
+
+/// The two activation lengths [`projection`] checks before it launches.
+fn check_operands(
+    weight: &Weight,
+    n_tok: u32,
+    src: DeviceView<'_>,
+    dst: DeviceView<'_>,
+) -> CoreResult<()> {
     let tokens = u64::from(n_tok);
     let need_src = u64::from(weight.in_dim)
         .saturating_mul(tokens)
@@ -831,16 +903,17 @@ pub fn projection(
             buffer_bytes: dst.len(),
         });
     }
-    // A weight stored in a rotated basis reads a rotated input. The rotation
-    // stages it in the model's scratch; everything below reads that instead.
-    let rotated;
-    let src = match weight.rotation.as_deref() {
-        Some(rotation) if rotation.direction() == RotationDirection::Forward => {
-            rotated = rotation.forward(backend, n_tok, src)?;
-            rotated
-        }
-        _ => src,
-    };
+    Ok(())
+}
+
+/// [`projection`] past its checks, over an input already in the weight's basis.
+fn dispatch(
+    backend: &dyn Backend,
+    weight: &Weight,
+    n_tok: u32,
+    src: DeviceView<'_>,
+    dst: DeviceView<'_>,
+) -> CoreResult<()> {
     if ternary_tag(weight.dtype).is_some() {
         return ternary_projection(backend, weight, n_tok, src, dst);
     }
@@ -1741,11 +1814,11 @@ fn ternary_projection(
     let rows_tiles = weight.out_dim.div_ceil(TERNARY_MM_ROWS);
     let (entry, grid, block, splits) = match n_tok {
         0 | 1 => {
-            let (entry, t) = ternary_mv_name(weight.dtype, n_tok).ok_or_else(unsupported)?;
+            let entry = ternary_mv_name(weight.dtype).ok_or_else(unsupported)?;
             let splits = ternary_splits(weight.in_dim, weight.out_dim);
             (
                 entry,
-                Extent3::new(weight.out_dim.div_ceil(TERNARY_ROWS), n_tok.div_ceil(t), 1),
+                Extent3::new(weight.out_dim.div_ceil(TERNARY_ROWS), n_tok, 1),
                 Extent3::linear(64 * splits),
                 splits,
             )
@@ -1784,6 +1857,7 @@ fn ternary_projection(
             KernelArg::Buffer(dst),
         ],
     )
+    .map_err(|err| launch_failure(entry, err))
 }
 
 #[cfg(test)]

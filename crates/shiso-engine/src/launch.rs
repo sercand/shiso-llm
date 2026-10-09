@@ -194,32 +194,19 @@ pub const fn ternary_tag(dtype: DType) -> Option<&'static str> {
     }
 }
 
-/// `kernel_ternary_mv_<tag>_f32_t<t>`: the narrowest token blocking that
-/// covers `n_tok` in one pass, capped at eight.
+/// `kernel_ternary_mv_<tag>_f32_t1`: the one-row matvec.
+///
+/// Built at one token a launch only. Two rows and up go to
+/// [`ternary_mmv_name`], which decodes each weight once for every row, so a
+/// token-blocked matvec would be compiled and never dispatched.
 #[must_use]
-pub const fn ternary_mv_name(dtype: DType, n_tok: u32) -> Option<(&'static str, u32)> {
-    let t = match n_tok {
-        0 | 1 => 1,
-        2 => 2,
-        3 | 4 => 4,
-        _ => 8,
-    };
-    let name = match (dtype, t) {
-        (DType::Pq2_0, 1) => "kernel_ternary_mv_pq2_0_f32_t1",
-        (DType::Pq2_0, 2) => "kernel_ternary_mv_pq2_0_f32_t2",
-        (DType::Pq2_0, 4) => "kernel_ternary_mv_pq2_0_f32_t4",
-        (DType::Pq2_0, _) => "kernel_ternary_mv_pq2_0_f32_t8",
-        (DType::Ptq1_0, 1) => "kernel_ternary_mv_ptq1_0_f32_t1",
-        (DType::Ptq1_0, 2) => "kernel_ternary_mv_ptq1_0_f32_t2",
-        (DType::Ptq1_0, 4) => "kernel_ternary_mv_ptq1_0_f32_t4",
-        (DType::Ptq1_0, _) => "kernel_ternary_mv_ptq1_0_f32_t8",
-        (DType::MlxAffine2Gs128, 1) => "kernel_ternary_mv_mlx2_f32_t1",
-        (DType::MlxAffine2Gs128, 2) => "kernel_ternary_mv_mlx2_f32_t2",
-        (DType::MlxAffine2Gs128, 4) => "kernel_ternary_mv_mlx2_f32_t4",
-        (DType::MlxAffine2Gs128, _) => "kernel_ternary_mv_mlx2_f32_t8",
-        _ => return None,
-    };
-    Some((name, t))
+pub const fn ternary_mv_name(dtype: DType) -> Option<&'static str> {
+    match dtype {
+        DType::Pq2_0 => Some("kernel_ternary_mv_pq2_0_f32_t1"),
+        DType::Ptq1_0 => Some("kernel_ternary_mv_ptq1_0_f32_t1"),
+        DType::MlxAffine2Gs128 => Some("kernel_ternary_mv_mlx2_f32_t1"),
+        _ => None,
+    }
 }
 
 /// Tokens one threadgroup of the prompt-width ternary matmul covers.

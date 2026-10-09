@@ -1,5 +1,5 @@
-/* Matrix-vector products over ternary and 2-bit affine weights, 1..=8
- * activation rows a launch, and the row gather; the twins of
+/* Matrix-vector products over ternary and 2-bit affine weights, one
+ * activation row a block (only `T = 1` is instantiated), and the row gather; the twins of
  * `crates/shiso-metal/metal/ternary/ternary_mv.metal`, whose header comment
  * states the formats, the arithmetic and the geometry. A warp here is a Metal
  * simdgroup: 32 lanes, four output rows, eight lanes a 128-input group. */
@@ -240,17 +240,8 @@ __device__ __forceinline__ void ternary_project(const struct ternary_args_mv &ar
     }
 
 TERNARY_MV(pq2_0, TERNARY_PQ2, 1)
-TERNARY_MV(pq2_0, TERNARY_PQ2, 2)
-TERNARY_MV(pq2_0, TERNARY_PQ2, 4)
-TERNARY_MV(pq2_0, TERNARY_PQ2, 8)
 TERNARY_MV(mlx2, TERNARY_MLX2, 1)
-TERNARY_MV(mlx2, TERNARY_MLX2, 2)
-TERNARY_MV(mlx2, TERNARY_MLX2, 4)
-TERNARY_MV(mlx2, TERNARY_MLX2, 8)
 TERNARY_MV(ptq1_0, TERNARY_PTQ1, 1)
-TERNARY_MV(ptq1_0, TERNARY_PTQ1, 2)
-TERNARY_MV(ptq1_0, TERNARY_PTQ1, 4)
-TERNARY_MV(ptq1_0, TERNARY_PTQ1, 8)
 
 /* One weight row per token id, decoded to f32. Grid `(in_dim / 128, n_tok)`,
  * 128 threads. */

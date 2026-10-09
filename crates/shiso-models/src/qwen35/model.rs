@@ -208,7 +208,6 @@ impl Qwen35Model {
             None => embed,
         };
         let rotation = Rotation::for_file(backend, &file, path, config.shape())?;
-        refuse_unrotated_ternary(&binding, rotation.as_ref())?;
         let weights = import_weights(backend, &file, &binding, config.shape(), rotation.as_ref())?;
         // A Clef checkpoint is this backbone under its own architecture name,
         // with the schema head the binding never reads beside it.
@@ -497,7 +496,7 @@ fn weight(
     let stored = stored_weight(backend, file, desc)?;
     match rot {
         Some(rotation) => rotation.attach(backend, &desc.name, stored),
-        None => Ok(stored),
+        None => refuse_unrotated(&desc.name, stored),
     }
 }
 
@@ -633,20 +632,25 @@ fn widened_bf16(
     Weight::import(backend, DType::F32, in_dim, out_dim, Arc::new(wide), 0..len)
 }
 
-/// Refuses a ternary checkpoint that states no rotation.
+/// Refuses a ternary or 2-bit weight from a checkpoint that states no
+/// rotation.
 ///
-/// The ternary formats exist for rotated exports, and a ternary file read in
-/// the plain basis loads without complaint and generates nonsense; this is the
-/// one place that can tell the two apart.
-fn refuse_unrotated_ternary(binding: &DescBinding, rot: Option<&Rotation>) -> CoreResult<()> {
-    if rot.is_some() || !binding.token_embd.dtype.is_ternary() {
-        return Ok(());
+/// Those formats exist for rotated exports, and one read in the plain basis
+/// loads without complaint and generates nonsense. Checked per weight as it is
+/// imported, not on the vocabulary table alone: an export can keep its table
+/// at eight bits or half precision and still store every projection ternary.
+/// [`Rotation::attach`] is the same check for a file that does state one.
+fn refuse_unrotated(name: &str, weight: Weight) -> CoreResult<Weight> {
+    if !weight.dtype.is_ternary() && weight.dtype != DType::MlxAffine2Gs128 {
+        return Ok(weight);
     }
     Err(CoreError::InvalidValue {
         key: "prism.hadamard",
-        value: "ternary tensors without rotation metadata are stored in a basis this loader \
-                cannot recover; refusing rather than generating nonsense"
-            .into(),
+        value: format!(
+            "{name} is stored ternary or 2-bit, but the checkpoint carries no rotation \
+             metadata; it is in a basis this loader cannot recover, so it is refused \
+             rather than generating nonsense"
+        ),
     })
 }
 
@@ -720,7 +724,10 @@ impl Rotation {
                 direction,
                 signs: self.plan.signs(weight.in_dim)?,
                 heads,
-                scratch: forward.then(|| Arc::clone(&self.scratch)),
+                // An inverse rotation carries the scratch too: a table with no
+                // separate output head is also read as the head, and that
+                // projection rotates its input forward (`shiso_engine::rotation`).
+                scratch: Some(Arc::clone(&self.scratch)),
             },
         )?;
         weight.with_rotation(rotation)

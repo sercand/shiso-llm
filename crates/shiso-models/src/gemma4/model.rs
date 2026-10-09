@@ -61,7 +61,7 @@ use shiso_engine::layers::{Block, LayerWeights, PerLayerWeights, PleTable, Weigh
 use shiso_engine::projection::Weight;
 use shiso_engine::shape::HybridShape;
 use shiso_engine::{EngineOptions, HybridStack};
-use shiso_modelfile::safetensors::SafetensorsFile;
+use shiso_modelfile::safetensors::{AffineTriple, SafetensorsFile, ScaleFormat};
 use shiso_modelfile::{ModelFile, TensorDesc};
 use shiso_ple::{PleConfig, PleStats, PleStream};
 
@@ -317,6 +317,22 @@ fn open_table(
     })
 }
 
+/// Refuses a packed triple whose scales are not brain floats.
+///
+/// Every affine kernel this family reaches - the 4- and 8-bit matmuls and the
+/// per-layer table's repack - reads `bf16` scales and biases. An `f16` pair is
+/// the same width, so read as the other it decodes every weight wrong past the
+/// third digit without a single launch failing.
+fn refuse_f16_scales(triple: &AffineTriple<'_>) -> CoreResult<()> {
+    if triple.scale_format == ScaleFormat::Bf16 {
+        return Ok(());
+    }
+    Err(CoreError::Unsupported {
+        what: "an MLX affine weight whose scale format its matmul does not read",
+        backend: "gemma4",
+    })
+}
+
 /// Holds the per-layer table for an MLX checkpoint.
 fn open_table_mlx(
     backend: &Arc<dyn Backend>,
@@ -332,6 +348,7 @@ fn open_table_mlx(
             key: "per_layer_token_embd",
             value: "missing affine triple for per_layer_token_embd".into(),
         })?;
+    refuse_f16_scales(&triple)?;
 
     let n_layers = config.shape().n_layers();
     let rows = u64::from(config.ple_vocab());
@@ -472,6 +489,7 @@ fn weight_mlx(
     let out_dim = extent(dims.get(1).copied().unwrap_or(1))?;
 
     if let Some(triple) = st.affine_triple(&desc.name).map_err(open_failure)? {
+        refuse_f16_scales(&triple)?;
         let bits = st.bits_for(&desc.name);
         let dtype = match bits {
             4 => DType::MlxAffine4Gs64,

@@ -246,6 +246,30 @@ fn architecture_prefixed_lookup() {
     assert_eq!(model.metadata().arch_u32("absent"), None);
 }
 
+#[test]
+fn the_architecture_probe_reads_the_key_wherever_it_sits() {
+    // After an array and a scalar, so the walk has to skip both to reach it.
+    let kvs: Vec<(&str, Kv)> = vec![
+        ("tokenizer.tokens", Kv::StrArray(&["a", "b", "c"])),
+        ("test.u32", Kv::U32(7)),
+        ("general.architecture", Kv::Str("dflash")),
+    ];
+    let file = write_model(&kvs, &[]);
+    let arch = GgufFile::read_architecture(file.path()).expect("the probe reads the header");
+    assert_eq!(arch.as_deref(), Some("dflash"));
+
+    let none = write_model(&[("test.u32", Kv::U32(7))], &[]);
+    let arch = GgufFile::read_architecture(none.path()).expect("the probe reads the header");
+    assert_eq!(arch, None);
+
+    let foreign = NamedTempFile::new().expect("temporary file");
+    std::fs::write(foreign.path(), [0_u8; 32]).expect("foreign bytes written");
+    assert!(matches!(
+        GgufFile::read_architecture(foreign.path()),
+        Err(GgufError::NotGguf)
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // (c) malformed input
 // ---------------------------------------------------------------------------

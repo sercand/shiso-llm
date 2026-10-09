@@ -8,7 +8,7 @@
 //!
 //! The expected values were computed directly from the table text in
 //! `kernels/cuda/mmq/ggml-common.h` (the vendored, read-only format
-//! definition) by a throwaway parse of its `GGML_TABLE_BEGIN` blocks, not from
+//! definition) by a throwaway parse of its table-macro blocks, not from
 //! the Rust transcription below, so the two sides of each assertion are
 //! independent. The header line ranges are named next to each checksum.
 

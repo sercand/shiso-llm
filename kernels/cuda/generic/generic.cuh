@@ -3,8 +3,8 @@
  *
  * Nothing here is copied. The two argument structs are the field order
  * `crates/shiso-engine/src/launch.rs` declares, transcribed so the kernels
- * below read the same bytes the host packs; the block structs are ggml's file
- * layouts, which are file data rather than anybody's source; the codebook
+ * below read the same bytes the host packs; the block structs are the GGUF
+ * container's file layouts, which are file data rather than anybody's source; the codebook
  * tables at the bottom are format data transcribed from
  * `crates/shiso-modelfile/src/quant_tables.rs`; and the dequantizers are the
  * arithmetic of the formats, derived from the Metal twins in
@@ -437,7 +437,7 @@ __device__ __forceinline__ void shiso_dequantize_q5_K_t4(
 /* One q8_0 block: a half scale and 32 signed bytes, in element order.
  *
  * `block_q8_0` in `crates/shiso-metal/metal/generic/00_common.metal`, which is
- * ggml's file layout rather than anybody's source. A qwen35 `Q4_K_M` container
+ * the GGUF container's file layout rather than anybody's source. A qwen35 `Q4_K_M` container
  * keeps this family's two gate projections - `ssm_alpha` and `ssm_beta`, 24 of
  * each - at this codec, so the dense hybrid cannot decode a token without it. */
 struct shiso_block_q8_0 {

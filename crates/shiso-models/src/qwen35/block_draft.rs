@@ -89,8 +89,11 @@ pub const GGUF_ARCHITECTURE: &str = "dflash";
 #[must_use]
 pub fn is_block_drafter(path: &Path) -> bool {
     if path.is_file() {
-        return shiso_modelfile::GgufFile::open(path)
-            .is_ok_and(|file| file.metadata().architecture() == Some(GGUF_ARCHITECTURE));
+        // The architecture key alone: a target model's GGUF passed here by
+        // mistake would otherwise have its whole metadata and tensor table
+        // parsed to answer no.
+        return shiso_modelfile::GgufFile::read_architecture(path)
+            .is_ok_and(|arch| arch.as_deref() == Some(GGUF_ARCHITECTURE));
     }
     let dir = path;
     std::fs::read_to_string(dir.join("config.json"))

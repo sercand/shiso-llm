@@ -1,7 +1,8 @@
-//! The rotated ternary Bonsai 27B against the vendor's own llama.cpp fork.
+//! The rotated ternary Bonsai 27B against the checkpoint vendor's own runtime
+//! (named in `PROVENANCE.md`; "the fork" below).
 //!
 //! The recordings were made by a different implementation of the same files -
-//! the fork's `llama-server` on this machine's Metal device, by
+//! the fork's server on this machine's Metal device, by
 //! `scripts/reference/llama_server_vec.py`, which sends the ids this
 //! vocabulary produces - so a disagreement is a defect in one of the two
 //! stacks rather than a changed answer. The fork shares no kernel with this

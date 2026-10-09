@@ -519,6 +519,50 @@ impl GgufMetadata {
     }
 }
 
+/// Walks `n_kv` entries for the string stored under `want`, stopping there.
+///
+/// The probe [`crate::GgufFile::read_architecture`] runs: it decodes nothing
+/// past the key it is after, so a writer that puts the architecture first -
+/// which they do - costs one entry rather than the vocabulary's arrays.
+/// `Ok(None)` when no entry has that key or its value is not a string.
+pub(crate) fn find_str(
+    cursor: &mut Cursor<'_>,
+    n_kv: u64,
+    want: &str,
+) -> GgufResult<Option<Box<str>>> {
+    for _ in 0..n_kv {
+        let key = cursor.string("metadata key")?;
+        let type_id = cursor.u32()?;
+        let ty = MetaType::from_id(type_id).ok_or_else(|| GgufError::LayoutMismatch {
+            tensor: key.clone(),
+            want: Box::from("a known metadata type id"),
+            got: Box::from(type_id.to_string()),
+        })?;
+        if ty == MetaType::Array {
+            let elem =
+                MetaType::from_id(cursor.u32()?).ok_or_else(|| GgufError::LayoutMismatch {
+                    tensor: key.clone(),
+                    want: Box::from("a known array element type id"),
+                    got: Box::from(type_id.to_string()),
+                })?;
+            let len = cursor.u64()?;
+            skip_body(cursor, elem, len, 1, &key)?;
+            if &*key == want {
+                return Ok(None);
+            }
+            continue;
+        }
+        let value = decode(cursor, ty, 0, &key)?;
+        if &*key == want {
+            return Ok(match value {
+                MetaValue::Str(s) => Some(s),
+                _ => None,
+            });
+        }
+    }
+    Ok(None)
+}
+
 /// Builds an architecture-prefixed key.
 fn arch_key(arch: &str, suffix: &str) -> String {
     format!("{arch}.{suffix}")

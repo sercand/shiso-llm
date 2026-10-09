@@ -578,6 +578,26 @@ impl GgufFile {
         Self::open_with(path.as_ref(), true)
     }
 
+    /// The file's `general.architecture`, read without parsing the rest.
+    ///
+    /// For a caller asking only what a file is: [`GgufFile::open`] parses the
+    /// whole metadata table and tensor directory, which for a large model's
+    /// vocabulary arrays is real work for a yes-or-no answer. This maps the
+    /// file and walks the table only as far as the key. `Ok(None)` when the
+    /// file states no architecture.
+    ///
+    /// # Errors
+    ///
+    /// [`GgufError::Io`] if the file cannot be opened or mapped, and the
+    /// header and metadata errors of [`GgufFile::open`] for whatever part of
+    /// the table it reads.
+    pub fn read_architecture(path: impl AsRef<Path>) -> GgufResult<Option<Box<str>>> {
+        let mapping = Mapping::open(path.as_ref(), false)?;
+        let mut cursor = Cursor::new(mapping.bytes());
+        let header = read_header(&mut cursor)?;
+        crate::metadata::find_str(&mut cursor, header.n_kv, "general.architecture")
+    }
+
     /// Shared body of the two openers.
     fn open_with(path: &Path, shared: bool) -> GgufResult<Self> {
         let mapping = Arc::new(Mapping::open(path, shared)?);

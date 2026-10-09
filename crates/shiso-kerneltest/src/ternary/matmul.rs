@@ -41,8 +41,9 @@ struct RowsArgs {
 /// Inputs per group.
 const GROUP: usize = 128;
 
-/// Token blockings the matvec is built with.
-pub const TOKEN_BLOCKS: [u32; 4] = [1, 2, 4, 8];
+/// Token blockings the matvec is built with. Only one: two rows and up go to
+/// the register-fed matmul, so a wider blocking would be built and never run.
+pub const TOKEN_BLOCKS: [u32; 1] = [1];
 
 /// One of the three storage formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

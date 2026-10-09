@@ -1,9 +1,9 @@
 //! The mixed i-quant Saluki 27B against the reference runtime.
 //!
 //! The recording was made by a different implementation of the same file -
-//! upstream llama.cpp's `llama-server` on this machine's Metal device, by
-//! `scripts/reference/llama_server_vec.py`, which sends the ids this vocabulary
-//! produces - so a disagreement is a defect in one of the two stacks rather
+//! the reference runtime named in `PROVENANCE.md`, served on this machine's
+//! Metal device, by `scripts/reference/llama_server_vec.py`, which sends the
+//! ids this vocabulary produces - so a disagreement is a defect in one of the two stacks rather
 //! than a changed answer. The reference shares no kernel with this port: not
 //! the nine i-quant decoders, not the GDN recurrence, not the reduction order.
 //!

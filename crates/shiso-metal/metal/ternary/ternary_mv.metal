@@ -1,5 +1,6 @@
-// Matrix-vector products over ternary and 2-bit affine weights, 1..=8
-// activation rows a launch.
+// Matrix-vector products over ternary and 2-bit affine weights, one
+// activation row a threadgroup (the engine sends two rows and up to the
+// matmuls, so only `T = 1` is instantiated).
 //
 // Three storage formats, one arithmetic. Every weight is `scale * c + bias`
 // with one scale and one bias per 128 consecutive inputs of a row:
@@ -262,17 +263,8 @@ kernel void kernel_ternary_mv(
                               device float *, uint2, uint, uint);
 
 TERNARY_MV(pq2_0, TERNARY_PQ2, 1)
-TERNARY_MV(pq2_0, TERNARY_PQ2, 2)
-TERNARY_MV(pq2_0, TERNARY_PQ2, 4)
-TERNARY_MV(pq2_0, TERNARY_PQ2, 8)
 TERNARY_MV(mlx2, TERNARY_MLX2, 1)
-TERNARY_MV(mlx2, TERNARY_MLX2, 2)
-TERNARY_MV(mlx2, TERNARY_MLX2, 4)
-TERNARY_MV(mlx2, TERNARY_MLX2, 8)
 TERNARY_MV(ptq1_0, TERNARY_PTQ1, 1)
-TERNARY_MV(ptq1_0, TERNARY_PTQ1, 2)
-TERNARY_MV(ptq1_0, TERNARY_PTQ1, 4)
-TERNARY_MV(ptq1_0, TERNARY_PTQ1, 8)
 
 /// One weight row per token id, decoded to f32: the embedding gather.
 ///
