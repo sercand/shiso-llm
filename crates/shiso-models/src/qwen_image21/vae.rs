@@ -53,8 +53,8 @@ use shiso_core::{DeviceBuffer, DeviceView};
 use shiso_vision::generator::ImageGenError;
 
 use crate::diffusion::ops::{
-    ChannelRmsCall, Conv2dCall, DupUpCall, GemmCall, Ops, Scratch, SliceExt, VaeConvCall,
-    VaeConvInput, WeightKind, dup_up_map,
+    ChannelRmsCall, Conv2dCall, DupUpCall, GemmCall, LinWeight, Ops, Scratch, SliceExt,
+    VaeConvCall, VaeConvInput, dup_up_map,
 };
 use crate::diffusion::weights::StStore;
 
@@ -1153,14 +1153,9 @@ fn f32_gemm(
         step,
         out,
         input,
-        weight,
-        weight_scale: 1.0,
-        row_scale: None,
-        rotate: None,
-        bias: None,
+        weight: LinWeight::f32(weight),
         m,
         n,
         k,
-        kind: WeightKind::F32,
     })
 }
