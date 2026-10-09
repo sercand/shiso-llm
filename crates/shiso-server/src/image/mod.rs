@@ -344,7 +344,8 @@ pub type ImageAnswer = Pin<Box<dyn Future<Output = Result<GeneratedImage, AppErr
 /// The HTTP failure an [`ImageGenError`] answers with.
 ///
 /// The generator's caller-side refusals (a blank or over-long prompt, dimensions off the
-/// model's grid, a step count off its schedule, a zero step count, a format it does not encode, undecodable
+/// model's grid, a step count off its schedule, a zero step count, a size whose decode is
+/// over the host's memory budget, a format it does not encode, undecodable
 /// reference bytes) are the request's fault and answer 400; its device-side
 /// failures (compute, encoding, a checkpoint that went bad) are this
 /// server's fault and answer 500 with the cause kept as a real source for
@@ -356,7 +357,7 @@ pub fn refuse(error: ImageGenError) -> AppError {
         ImageGenError::EmptyPrompt | ImageGenError::PromptTooLong { .. } => {
             AppError::bad_request(message, Some("prompt"), "invalid_request")
         }
-        ImageGenError::InvalidDimensions { .. } => {
+        ImageGenError::InvalidDimensions { .. } | ImageGenError::DecodeTooLarge { .. } => {
             AppError::bad_request(message, Some("size"), "invalid_request")
         }
         ImageGenError::InvalidSteps { .. } | ImageGenError::StepsFixed { .. } => {

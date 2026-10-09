@@ -110,6 +110,23 @@ pub enum ImageGenError {
         /// The only count the model runs.
         fixed: u32,
     },
+    /// The requested size's estimated decode working set is over the memory
+    /// budget the generator runs under: the image is too large for this
+    /// host, which is the request's to change, not a device failure.
+    #[error(
+        "a {width}x{height} image needs about {needed_mib} MiB of decoder working memory, \
+         over this host's {budget_mib} MiB budget"
+    )]
+    DecodeTooLarge {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// The decoder's estimated working set, in MiB (rounded up).
+        needed_mib: u64,
+        /// The budget it was refused against, in MiB (rounded down).
+        budget_mib: u64,
+    },
     /// Format is not supported.
     #[error("unsupported image format {0:?}: only png and jpeg are supported")]
     UnsupportedFormat(String),

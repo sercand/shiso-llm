@@ -357,6 +357,53 @@ struct dit_args_embed {
     uint32_t hidden;
 };
 
+/// Per-pixel inverse norm over the channel axis of an NCHW field (the
+/// channel RMS norm of the residual VAE decoder): `inv[s] = scale /
+/// max(||x[:, s]||_2, eps)`, so `x[c, s] * inv[s] * gamma[c]` is the
+/// reference's `normalize(x, dim=channels) * sqrt(C) * gamma`.
+struct dit_args_channel_rms {
+    uint32_t channels;
+    uint32_t spatial;
+    float scale;
+    float eps;
+};
+
+/// A same-padded, stride-1 square convolution of the residual VAE decoder
+/// with its input transform fused into the im2col gather (channel-RMS
+/// norm, optionally SiLU; or a nearest 2x upsample) and an optional
+/// accumulate epilogue (`out += conv`, the residual add). `in_h`/`in_w` are
+/// the stored field's; for the upsampling entry the convolved field is
+/// twice that, and `out_h`/`out_w` say so.
+struct dit_args_conv_vae {
+    uint32_t in_c;
+    uint32_t in_h;
+    uint32_t in_w;
+    uint32_t out_c;
+    uint32_t out_h;
+    uint32_t out_w;
+    uint32_t k;
+    uint32_t pad;
+    uint32_t has_bias;
+    uint32_t accumulate;
+    uint32_t silu;
+    uint32_t reserved;
+};
+
+/// The residual VAE decoder's parameter-free upsampling shortcut, added
+/// into a field at twice the source's size: `out[c, y, x] += in[(c * factor
+/// + offset + (y & 1) * 2 + (x & 1)) / repeats, y / 2, x / 2]`. `factor` is
+/// the temporal times the 2x2 spatial factor, `offset` selects the last
+/// temporal slot (a single frame keeps only it), `repeats` is the channel
+/// duplication `out_c * factor / in_c`.
+struct dit_args_dup_up {
+    uint32_t out_c;
+    uint32_t h;
+    uint32_t w;
+    uint32_t factor;
+    uint32_t offset;
+    uint32_t repeats;
+};
+
 // The blocks and the driver's Pods are edited together; the host asserts the
 // same widths, and so does this side so a header-only drift fails the compile.
 static_assert(sizeof(dit_args_gemm) == 16, "GemmArgs");
@@ -379,3 +426,6 @@ static_assert(sizeof(dit_args_conv2d) == 48, "Conv2dArgs");
 static_assert(sizeof(dit_args_group_norm) == 24, "GroupNormArgs");
 static_assert(sizeof(dit_args_upsample) == 16, "UpsampleArgs");
 static_assert(sizeof(dit_args_embed) == 8, "EmbedArgs");
+static_assert(sizeof(dit_args_channel_rms) == 16, "ChannelRmsArgs");
+static_assert(sizeof(dit_args_conv_vae) == 48, "ConvVaeArgs");
+static_assert(sizeof(dit_args_dup_up) == 24, "DupUpArgs");

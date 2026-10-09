@@ -27,7 +27,7 @@ use shiso_core::{
     Backend, DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs, alloc,
 };
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::diffusion::int8;
+use shiso_kerneltest::diffusion::{int8, vae};
 use shiso_metal::MetalBackend;
 
 /// The module every diffusion entry lives under.
@@ -84,6 +84,10 @@ const ENTRIES: &[&str] = &[
     "kernel_dit_gemm64_i8",
     "kernel_dit_gemm64_fused_i8",
     "kernel_dit_hadamard256_f32",
+    "kernel_dit_channel_rms_inv_f32",
+    "kernel_dit_conv2d_rms_gemm_f32",
+    "kernel_dit_conv2d_up2_gemm_f32",
+    "kernel_dit_dup_up_add_f32",
 ];
 
 // --- argument blocks: byte-for-byte the driver's `#[repr(C)]` Pods ---------
@@ -3184,6 +3188,39 @@ fn every_int8_case_entry_is_registered() {
         assert!(
             ENTRIES.contains(&entry),
             "{entry} is launched by the INT8 cases but missing from ENTRIES"
+        );
+    }
+}
+
+// --- residual VAE decoder: the shared cases in `shiso-kerneltest` -------------
+
+/// One ignored wrapper per shared VAE case.
+macro_rules! vae_cases {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[test]
+            #[ignore = "requires a Metal device"]
+            fn $name() {
+                let Some(gpu) = open_gpu() else { return };
+                vae::$name(&gpu);
+            }
+        )*
+    };
+}
+
+vae_cases!(
+    channel_rms_inv_is_the_scaled_inverse_pixel_norm,
+    conv2d_rms_is_the_conv_of_the_normalized_activated_field,
+    conv2d_up2_is_the_conv_of_the_upsampled_field,
+    dup_up_add_matches_the_reshaped_shortcut,
+);
+
+#[test]
+fn every_vae_case_entry_is_registered() {
+    for entry in vae::ENTRIES {
+        assert!(
+            ENTRIES.contains(&entry),
+            "{entry} is launched by the VAE cases but missing from ENTRIES"
         );
     }
 }

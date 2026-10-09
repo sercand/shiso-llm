@@ -1715,3 +1715,194 @@ kernel void kernel_dit_hadamard256_f32(
     o[tid + 128u] = y.z;
     o[tid + 192u] = y.w;
 }
+
+// --- residual VAE decoder: channel RMS norm, fused convolutions, dup-up -------
+//
+// The residual VAE decoder normalizes over the channel axis of each pixel
+// (`x / max(||x[:, s]||, eps) * sqrt(C) * gamma`, no mean, no groups) and
+// always feeds the normalized field straight into a convolution. So the
+// norm is split: one pass writes a per-pixel inverse norm, and the
+// convolution's gather applies it (with the gain and, in the resnets, the
+// SiLU) as it stages each tap. The normalized field - the decoder's largest
+// tensor at full resolution - is never written. The upsamplers' nearest 2x
+// interpolation rides the gather the same way.
+
+/// Channel RMS norm, pass 1: `inv[s] = scale / max(sqrt(sum_c x[c, s]^2),
+/// eps)`, the squares folded in channel order. One thread per pixel;
+/// adjacent threads read adjacent pixels of one channel plane, so every load
+/// is coalesced. Grid `ceil(spatial / 64)` x 64 threads.
+kernel void kernel_dit_channel_rms_inv_f32(
+        constant dit_args_channel_rms & args [[buffer(0)]],
+        device float *inv                      [[buffer(1)]],
+        device const float *in                 [[buffer(2)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint s = tgpig.x * DIT_BLOCK + tpitg.x;
+    if (s >= args.spatial) {
+        return;
+    }
+    float ss = 0.0f;
+    for (uint c = 0; c < args.channels; ++c) {
+        const float v = in[(uint64_t) c * args.spatial + s];
+        ss += v * v;
+    }
+    inv[s] = args.scale / max(sqrt(ss), args.eps);
+}
+
+/// The gather transforms of the VAE convolutions.
+#define DIT_VAE_RMS 0u
+#define DIT_VAE_UP2 1u
+
+/// The convolution's left operand, as `dit_im2col` (stride 1, square
+/// kernel), with the input transform applied per tap:
+///
+/// - `DIT_VAE_RMS`: the tap reads `x[ic, p] * inv[p] * gamma[ic]`, then
+///   SiLU when `silu` is set - the reference's norm -> (silu) -> conv;
+/// - `DIT_VAE_UP2`: the convolved field is the stored one upsampled 2x by
+///   nearest neighbour (`(f_h, f_w) == 2 * (in_h, in_w)`), so tap
+///   `(ih, iw)` reads stored pixel `(ih / 2, iw / 2)`.
+///
+/// Taps outside the convolved field read as zero: the reference pads the
+/// transformed field, so the padding is never normalized or activated.
+template <uint MODE>
+struct dit_im2col_vae {
+    device const float *in;
+    device const float *inv;
+    device const float *gamma;
+    uint in_h;
+    uint in_w;
+    uint f_h;
+    uint f_w;
+    uint out_w;
+    uint k;
+    uint pad;
+    bool silu;
+    float4 load4(uint r, uint kk) const {
+        const uint oh = r / out_w;
+        const uint ow = r - oh * out_w;
+        const uint khw = k * k;
+        uint ic = kk / khw;
+        const uint rem = kk - ic * khw;
+        uint kh = rem / k;
+        uint kw = rem - kh * k;
+        const int ih0 = int(oh) - int(pad);
+        const int iw0 = int(ow) - int(pad);
+        const uint plane = in_h * in_w;
+        float v[4];
+        DIT_UNROLL for (uint c = 0; c < 4u; ++c) {
+            const int ih = ih0 + int(kh);
+            const int iw = iw0 + int(kw);
+            if (ih < 0 || iw < 0 || ih >= int(f_h) || iw >= int(f_w)) {
+                v[c] = 0.0f;
+            } else if (MODE == DIT_VAE_UP2) {
+                v[c] = in[(uint64_t) ic * plane + (uint(ih) >> 1u) * in_w + (uint(iw) >> 1u)];
+            } else {
+                const uint p = uint(ih) * in_w + uint(iw);
+                const float x = in[(uint64_t) ic * plane + p] * inv[p] * gamma[ic];
+                v[c] = silu ? dit_silu(x) : x;
+            }
+            if (++kw == k) {
+                kw = 0u;
+                if (++kh == k) {
+                    kh = 0u;
+                    ++ic;
+                }
+            }
+        }
+        return float4(v[0], v[1], v[2], v[3]);
+    }
+};
+
+/// NCHW epilogue with the residual add: `out = conv + bias`, or
+/// `out += conv + bias` when `accumulate` is set. Each output element is
+/// read and written by the one thread that stores it, so accumulating into
+/// the residual stream in place is race-free.
+struct dit_store_nchw_acc {
+    device float *out;
+    uint plane;
+    device const float *bias;
+    bool has_bias;
+    bool accumulate;
+    void store(uint r, uint c, float v) const {
+        const uint64_t i = (uint64_t) c * plane + r;
+        const float y = v + (has_bias ? bias[c] : 0.0f);
+        out[i] = accumulate ? out[i] + y : y;
+    }
+};
+
+/// norm -> (silu) -> conv as one implicit GEMM: M = out_h * out_w pixels,
+/// N = out_c, K = in_c * k * k taps (a multiple of 16, which the driver
+/// guarantees). `inv` is pass 1's per-pixel inverse norm of `in`, `gamma`
+/// the norm's per-channel gain. Grid `(ceil(out_c/64), ceil(M/64))` x 128.
+kernel void kernel_dit_conv2d_rms_gemm_f32(
+        constant dit_args_conv_vae & args [[buffer(0)]],
+        device float *out                    [[buffer(1)]],
+        device const float *in               [[buffer(2)]],
+        device const float *weight           [[buffer(3)]],
+        device const float *bias             [[buffer(4)]],
+        device const float *inv              [[buffer(5)]],
+        device const float *gamma            [[buffer(6)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[DIT_G64_SMEM];
+    const uint plane = args.out_h * args.out_w;
+    const uint taps = args.in_c * args.k * args.k;
+    const dit_im2col_vae<DIT_VAE_RMS> a{
+            in, inv, gamma, args.in_h, args.in_w, args.in_h, args.in_w,
+            args.out_w, args.k, args.pad, args.silu != 0u};
+    const dit_store_nchw_acc ep{out, plane, bias, args.has_bias != 0u, args.accumulate != 0u};
+    dit_gemm64_tile(plane, args.out_c, taps, a, dit_wrows_f32{weight, taps}, ep,
+                      smem, tgpig, tid, lane, sg);
+}
+
+/// nearest-2x -> conv as one implicit GEMM over the upsampled field, which
+/// is never materialized: `(in_h, in_w)` is the stored field, `(out_h,
+/// out_w)` the convolved one (twice it, same padding). Grid and K contract
+/// as `kernel_dit_conv2d_rms_gemm_f32`; `silu` is ignored.
+kernel void kernel_dit_conv2d_up2_gemm_f32(
+        constant dit_args_conv_vae & args [[buffer(0)]],
+        device float *out                    [[buffer(1)]],
+        device const float *in               [[buffer(2)]],
+        device const float *weight           [[buffer(3)]],
+        device const float *bias             [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[DIT_G64_SMEM];
+    const uint plane = args.out_h * args.out_w;
+    const uint taps = args.in_c * args.k * args.k;
+    const dit_im2col_vae<DIT_VAE_UP2> a{
+            in, in, in, args.in_h, args.in_w, 2u * args.in_h, 2u * args.in_w,
+            args.out_w, args.k, args.pad, false};
+    const dit_store_nchw_acc ep{out, plane, bias, args.has_bias != 0u, args.accumulate != 0u};
+    dit_gemm64_tile(plane, args.out_c, taps, a, dit_wrows_f32{weight, taps}, ep,
+                      smem, tgpig, tid, lane, sg);
+}
+
+/// The up block's parameter-free shortcut, added in place into the
+/// upsampler's output (`dit_args_dup_up`): every source value is
+/// duplicated across `repeats` channels and spread over a 2x2 (and, for
+/// a temporal factor, a frame) neighbourhood, of which a single frame keeps
+/// the slot `offset` selects. Grid `(ceil(4hw / 64), out_c)` x 64 threads.
+kernel void kernel_dit_dup_up_add_f32(
+        constant dit_args_dup_up & args [[buffer(0)]],
+        device float *out                 [[buffer(1)]],
+        device const float *in            [[buffer(2)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint ow = 2u * args.w;
+    const uint plane = ow * 2u * args.h;
+    const uint p = tgpig.x * DIT_BLOCK + tpitg.x;
+    const uint c = tgpig.y;
+    if (p >= plane || c >= args.out_c) {
+        return;
+    }
+    const uint y = p / ow;
+    const uint x = p - y * ow;
+    const uint src = (c * args.factor + args.offset + (y & 1u) * 2u + (x & 1u)) / args.repeats;
+    out[(uint64_t) c * plane + p] +=
+            in[((uint64_t) src * args.h + (y >> 1u)) * args.w + (x >> 1u)];
+}

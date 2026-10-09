@@ -486,6 +486,15 @@ fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
             (1, *width, *height)
         }
         ImageGenError::StepsFixed { steps, fixed } => (8, *steps, *fixed),
+        ImageGenError::DecodeTooLarge {
+            width,
+            height,
+            needed_mib,
+            budget_mib,
+        } => {
+            let _: (&u64, &u64) = (needed_mib, budget_mib);
+            (9, *width, *height)
+        }
         ImageGenError::InvalidSteps { steps } => (7, *steps, 0),
         ImageGenError::UnsupportedFormat(msg) => {
             let _: &String = msg;
