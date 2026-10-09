@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use shiso_core::{DType, HfConfig, LayerIdx};
 use shiso_engine::shape::LayerKind;
 use shiso_modelfile::quant::{
-    self, BlockIq2Xxs, BlockIq4Nl, BlockMxfp4, BlockQ2K, BlockQ4K, BlockQ5_1, BlockQ5K, BlockQ6K,
-    BlockQ8_0, BlockQ8K, QuantBlock,
+    self, BlockIq1M, BlockIq1S, BlockIq2S, BlockIq2Xs, BlockIq2Xxs, BlockIq3S, BlockIq3Xxs,
+    BlockIq4Nl, BlockIq4Xs, BlockMxfp4, BlockPq2_0, BlockPtq1_0, BlockQ2K, BlockQ4K, BlockQ5_1,
+    BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8K, QuantBlock,
 };
 use shiso_modelfile::reader::{GgufError, GgufFile, MAX_DIMS, TensorShape};
 use shiso_modelfile::{MetaType, MetaValue, TensorSource};
@@ -116,9 +117,18 @@ fn block_structs_agree_with_the_format_table() {
     check!(BlockQ6K, 256, 210);
     check!(BlockQ8K, 256, 292);
     check!(BlockIq2Xxs, 256, 66);
+    check!(BlockIq2Xs, 256, 74);
+    check!(BlockIq3Xxs, 256, 98);
+    check!(BlockIq1S, 256, 50);
+    check!(BlockIq3S, 256, 110);
+    check!(BlockIq2S, 256, 82);
+    check!(BlockIq4Xs, 256, 136);
+    check!(BlockIq1M, 256, 56);
     check!(BlockMxfp4, 32, 17);
     check!(BlockQ5_1, 32, 24);
     check!(BlockIq4Nl, 32, 18);
+    check!(BlockPq2_0, 128, 34);
+    check!(BlockPtq1_0, 128, 28);
 }
 
 #[test]
@@ -234,6 +244,30 @@ fn architecture_prefixed_lookup() {
     assert_eq!(model.metadata().arch_u32("block_count"), Some(32));
     assert_eq!(model.metadata().arch_f32("rope.freq_base"), Some(1.0e7));
     assert_eq!(model.metadata().arch_u32("absent"), None);
+}
+
+#[test]
+fn the_architecture_probe_reads_the_key_wherever_it_sits() {
+    // After an array and a scalar, so the walk has to skip both to reach it.
+    let kvs: Vec<(&str, Kv)> = vec![
+        ("tokenizer.tokens", Kv::StrArray(&["a", "b", "c"])),
+        ("test.u32", Kv::U32(7)),
+        ("general.architecture", Kv::Str("dflash")),
+    ];
+    let file = write_model(&kvs, &[]);
+    let arch = GgufFile::read_architecture(file.path()).expect("the probe reads the header");
+    assert_eq!(arch.as_deref(), Some("dflash"));
+
+    let none = write_model(&[("test.u32", Kv::U32(7))], &[]);
+    let arch = GgufFile::read_architecture(none.path()).expect("the probe reads the header");
+    assert_eq!(arch, None);
+
+    let foreign = NamedTempFile::new().expect("temporary file");
+    std::fs::write(foreign.path(), [0_u8; 32]).expect("foreign bytes written");
+    assert!(matches!(
+        GgufFile::read_architecture(foreign.path()),
+        Err(GgufError::NotGguf)
+    ));
 }
 
 // ---------------------------------------------------------------------------

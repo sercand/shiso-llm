@@ -34,14 +34,23 @@ pub const QWEN35_MODEL_ID: u8 = 5;
 ///
 /// The layer-zero feed-forward gate is the witness: it is present in every slot of
 /// every checkpoint of this family, and its format is the one the bulk of the weights
-/// are stored in. Four-bit formats report four and everything else reports two, which
-/// is the split the disk tier's own header accepts - a build whose weights are
-/// neither ends up unable to checkpoint at all, which is the right outcome for bytes
-/// nothing downstream can check.
+/// are stored in. Four- and three-bit formats report four and everything else
+/// reports two, which is the split the disk tier's own header accepts - a build
+/// whose weights are neither ends up unable to checkpoint at all, which is the
+/// right outcome for bytes nothing downstream can check.
 #[must_use]
 pub const fn quant_bits_of(gate: DType) -> u8 {
     match gate {
-        DType::Nvfp4Gs16 | DType::Q4_0 | DType::Q4_K | DType::IQ4_NL => 4,
+        // The `iq4_xs`, `iq3_xxs` and `iq3_s` members of the mixed i-quant set
+        // join the four-bit witnesses; the 1- and 2-bit members (`iq1_s`,
+        // `iq1_m`, `iq2_*`) fall through to two with `q2_K`.
+        DType::Nvfp4Gs16
+        | DType::Q4_0
+        | DType::Q4_K
+        | DType::IQ4_NL
+        | DType::IQ4_XS
+        | DType::IQ3_XXS
+        | DType::IQ3_S => 4,
         _ => 2,
     }
 }
@@ -122,5 +131,16 @@ mod tests {
         assert_eq!(quant_bits_of(DType::Q2_K), 2);
         assert_eq!(quant_bits_of(DType::Q8_0), 2);
         assert_eq!(quant_bits_of(DType::F16), 2);
+        // The Saluki export's gate is one of the sub-4-bit i-quants, and the
+        // disk tier still has to be told a width: the three ~4-bit formats
+        // report four and the 1- and 2-bit ones fall through to two.
+        assert_eq!(quant_bits_of(DType::IQ4_XS), 4);
+        assert_eq!(quant_bits_of(DType::IQ3_XXS), 4);
+        assert_eq!(quant_bits_of(DType::IQ3_S), 4);
+        assert_eq!(quant_bits_of(DType::IQ2_XXS), 2);
+        assert_eq!(quant_bits_of(DType::IQ2_XS), 2);
+        assert_eq!(quant_bits_of(DType::IQ2_S), 2);
+        assert_eq!(quant_bits_of(DType::IQ1_S), 2);
+        assert_eq!(quant_bits_of(DType::IQ1_M), 2);
     }
 }

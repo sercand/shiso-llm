@@ -37,12 +37,27 @@ pub enum DType {
     Q6_K = 14,
     /// K-quant 8-bit, 256 elements per block.
     Q8_K = 15,
-    /// 2-bit i-quant, extra-small, 256 elements per block.
+    /// 2-bit i-quant, extra-extra-small, 256 elements per block.
     IQ2_XXS = 16,
+    /// 2-bit i-quant, extra-small, 256 elements per block: the wider sibling
+    /// of [`DType::IQ2_XXS`].
+    IQ2_XS = 17,
+    /// 3-bit i-quant, extra-extra-small, 256 elements per block.
+    IQ3_XXS = 18,
+    /// 1-bit i-quant, small, 256 elements per block.
+    IQ1_S = 19,
     /// 4-bit non-linear quant, 32 elements per block.
     IQ4_NL = 20,
+    /// 3-bit i-quant, small, 256 elements per block.
+    IQ3_S = 21,
+    /// 2-bit i-quant, small, 256 elements per block.
+    IQ2_S = 22,
+    /// 4-bit i-quant, extra-small, 256 elements per block.
+    IQ4_XS = 23,
     /// 32-bit signed integer tensor (vocabulary and index maps).
     I32 = 26,
+    /// 1-bit i-quant, medium, 256 elements per block.
+    IQ1_M = 29,
     /// Brain floating point, binary16 width exponent.
     BF16 = 30,
     /// Microscaling 4-bit with one shared exponent per 32 elements.
@@ -110,6 +125,30 @@ pub enum DType {
     ///
     /// [`block_bytes`]: DType::block_bytes
     F16Pack12 = 204,
+    /// Ternary weights in 2-bit slots, 128 elements per block: an `f16` scale
+    /// first, then 32 bytes of codes, four to a byte from the low bits up.
+    ///
+    /// A code `c` decodes to `scale * (c - 1)`. The format has room for
+    /// `c = 3` (twice the scale) and a reader must honour it even though a
+    /// ternary export never writes one.
+    Pq2_0 = 142,
+    /// Ternary weights packed five trits to a byte, 128 elements per block: 24
+    /// bytes of five-trit codes, 2 bytes of four-trit codes, then an `f16`
+    /// scale.
+    ///
+    /// A trit `t` decodes to `scale * (t - 1)`. The element order inside a
+    /// block is not the byte order - see `shiso_modelfile::ternary` for the
+    /// three stages the bytes are read in.
+    Ptq1_0 = 143,
+    /// MLX 2-bit affine block quant, group size 128: 32 bytes of words + 2
+    /// bytes scale + 2 bytes bias, by the same convention as the other MLX
+    /// affine types.
+    ///
+    /// Unlike the 4- and 8-bit types, whose scales and biases are brain
+    /// floats, this one's are IEEE `f16`: the only export of it is a lossless
+    /// re-encoding of a [`DType::Pq2_0`] file, whose scales are `f16`, and a
+    /// brain float would round three of their mantissa bits away.
+    MlxAffine2Gs128 = 212,
 }
 
 impl DType {
@@ -130,14 +169,23 @@ impl DType {
             14 => Some(Self::Q6_K),
             15 => Some(Self::Q8_K),
             16 => Some(Self::IQ2_XXS),
+            17 => Some(Self::IQ2_XS),
+            18 => Some(Self::IQ3_XXS),
+            19 => Some(Self::IQ1_S),
             20 => Some(Self::IQ4_NL),
+            21 => Some(Self::IQ3_S),
+            22 => Some(Self::IQ2_S),
+            23 => Some(Self::IQ4_XS),
             26 => Some(Self::I32),
+            29 => Some(Self::IQ1_M),
             30 => Some(Self::BF16),
             39 => Some(Self::MXFP4),
             68 => Some(Self::Exl3K4),
             69 => Some(Self::Exl3K5),
             70 => Some(Self::Exl3K6),
             72 => Some(Self::Exl3Ngram6),
+            142 => Some(Self::Pq2_0),
+            143 => Some(Self::Ptq1_0),
             _ => None,
         }
     }
@@ -167,8 +215,15 @@ impl DType {
             Self::Q6_K => "q6_k",
             Self::Q8_K => "q8_k",
             Self::IQ2_XXS => "iq2_xxs",
+            Self::IQ2_XS => "iq2_xs",
+            Self::IQ3_XXS => "iq3_xxs",
+            Self::IQ1_S => "iq1_s",
             Self::IQ4_NL => "iq4_nl",
+            Self::IQ3_S => "iq3_s",
+            Self::IQ2_S => "iq2_s",
+            Self::IQ4_XS => "iq4_xs",
             Self::I32 => "i32",
+            Self::IQ1_M => "iq1_m",
             Self::BF16 => "bf16",
             Self::MXFP4 => "mxfp4",
             Self::Exl3K4 => "exl3_k4",
@@ -182,6 +237,9 @@ impl DType {
             Self::Fp8E4M3 => "fp8_e4m3",
             Self::Nvfp4Gs16 => "nvfp4_gs16",
             Self::F16Pack12 => "f16_pack12",
+            Self::Pq2_0 => "pq2_0",
+            Self::Ptq1_0 => "ptq1_0",
+            Self::MlxAffine2Gs128 => "mlx_affine_2_gs128",
         }
     }
 }
@@ -209,12 +267,20 @@ impl DType {
             | Self::MlxAffine4Gs32 => 32,
             Self::MlxAffine4Gs64 | Self::MlxAffine8Gs64 => 64,
             Self::Exl3Ngram6 => 160,
+            Self::Pq2_0 | Self::Ptq1_0 | Self::MlxAffine2Gs128 => 128,
             Self::Q2_K
             | Self::Q4_K
             | Self::Q5_K
             | Self::Q6_K
             | Self::Q8_K
             | Self::IQ2_XXS
+            | Self::IQ2_XS
+            | Self::IQ3_XXS
+            | Self::IQ1_S
+            | Self::IQ3_S
+            | Self::IQ2_S
+            | Self::IQ4_XS
+            | Self::IQ1_M
             | Self::Exl3K4
             | Self::Exl3K5
             | Self::Exl3K6 => 256,
@@ -236,9 +302,16 @@ impl DType {
             Self::Q4_0 | Self::IQ4_NL => 18,
             Self::Q5_0 => 22,
             Self::Q5_1 => 24,
-            Self::Q8_0 => 34,
+            Self::Q8_0 | Self::Pq2_0 => 34,
             Self::MXFP4 => 17,
             Self::IQ2_XXS => 66,
+            Self::IQ2_XS => 74,
+            Self::IQ3_XXS => 98,
+            Self::IQ1_S => 50,
+            Self::IQ3_S => 110,
+            Self::IQ2_S => 82,
+            Self::IQ4_XS => 136,
+            Self::IQ1_M => 56,
             Self::Q2_K => 84,
             Self::Q4_K => 144,
             Self::Q5_K => 176,
@@ -248,7 +321,7 @@ impl DType {
             Self::Exl3K5 => 160,
             Self::Exl3K6 => 192,
             Self::Exl3Ngram6 => 122,
-            Self::MlxAffine4Gs64 => 36,
+            Self::MlxAffine4Gs64 | Self::MlxAffine2Gs128 => 36,
             Self::MlxAffine8Gs64 => 68,
             Self::MlxAffine4Gs32 => 20,
             // The packed weights of one group, without the `e4m3` scale byte
@@ -257,6 +330,7 @@ impl DType {
             Self::Nvfp4Gs16 => 8,
             // The two planes of two weights; see the variant.
             Self::F16Pack12 => 3,
+            Self::Ptq1_0 => 28,
         };
         expect_nonzero(bytes)
     }
@@ -272,7 +346,18 @@ impl DType {
     /// Whether this is one of the MLX affine packed formats.
     #[must_use]
     pub const fn is_affine(self) -> bool {
-        matches!(self, Self::MlxAffine4Gs64 | Self::MlxAffine8Gs64)
+        matches!(
+            self,
+            Self::MlxAffine4Gs64 | Self::MlxAffine8Gs64 | Self::MlxAffine2Gs128
+        )
+    }
+
+    /// Whether this is one of the two ternary block formats, whose one `f16`
+    /// scale per 128 weights lives inside the block and whose bias is always
+    /// minus that scale.
+    #[must_use]
+    pub const fn is_ternary(self) -> bool {
+        matches!(self, Self::Pq2_0 | Self::Ptq1_0)
     }
 
     /// Whether this is one of the two formats `modelopt` writes, whose scales
@@ -293,6 +378,7 @@ impl DType {
         match self {
             Self::MlxAffine4Gs64 => Some(4),
             Self::MlxAffine8Gs64 => Some(8),
+            Self::MlxAffine2Gs128 => Some(2),
             _ => None,
         }
     }

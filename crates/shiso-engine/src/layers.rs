@@ -715,10 +715,9 @@ pub struct EmbedKernel {
 impl EmbedKernel {
     /// The gather for `dtype`, or `None` when no kernel reads that format.
     ///
-    /// The five that exist share `GetRowsArgs` exactly, which is what makes one
-    /// launch site enough; a sixth format would need its own argument block and
-    /// would therefore need its own launch, so this returns `None` rather than
-    /// guessing.
+    /// The six that share `GetRowsArgs` exactly are what makes one launch site
+    /// enough; a seventh format with its own argument block would need its own
+    /// launch, so this returns `None` rather than guessing.
     ///
     /// The `f16` entry is the odd one, because it is the only unpacked table
     /// here. It is what a directory checkpoint arrives as: its vocabulary table
@@ -749,10 +748,29 @@ impl EmbedKernel {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_q4_0_f32",
             }),
+            // The Saluki export stores its vocabulary table in `iq1_m`; the
+            // gather takes the same argument block as the other five, so it
+            // needs the pair and no new launch.
+            DType::IQ1_M => Some(Self {
+                module: launch::GENERIC,
+                entry: "kernel_get_rows_iq1_m_f32",
+            }),
             DType::MlxAffine4Gs64 => Some(Self {
                 module: launch::DENSE,
                 entry: "kernel_dense_embed_affine4_f32",
             }),
+            // The ternary set's gathers take an argument block of their own;
+            // [`embed_rows`] launches them on a branch of their own, and this
+            // entry is what lets the geometry accept the table at load.
+            DType::Pq2_0 | DType::Ptq1_0 | DType::MlxAffine2Gs128 => {
+                match launch::ternary_rows_name(dtype) {
+                    Some(entry) => Some(Self {
+                        module: launch::TERNARY,
+                        entry,
+                    }),
+                    None => None,
+                }
+            }
             _ => None,
         }
     }
@@ -1073,6 +1091,10 @@ const ID_BYTES: u64 = 4;
 /// The three formats that have a gather share this argument block exactly, so the
 /// format only chooses the entry point; everything else about the launch is the
 /// row geometry, which is the same either way.
+///
+/// A table stored in a rotated basis is taken back to the residual stream's
+/// basis here, right after the gather, so no caller - the chunk's opening, a
+/// drafter reading the target's table - can see a rotated row.
 pub(crate) fn embed_rows(
     backend: &dyn Backend,
     weights: &Weights,
@@ -1081,6 +1103,49 @@ pub(crate) fn embed_rows(
     dst: DeviceView<'_>,
     n_tok: u32,
 ) -> CoreResult<()> {
+    gather_rows(backend, weights, geometry, scratch, dst, n_tok)?;
+    match weights.token_embd.rotation() {
+        Some(rotation) => rotation.inverse_in_place(backend, n_tok, dst),
+        None => Ok(()),
+    }
+}
+
+/// The gather [`embed_rows`] runs before any rotation.
+fn gather_rows(
+    backend: &dyn Backend,
+    weights: &Weights,
+    geometry: &Geometry,
+    scratch: &Scratch,
+    dst: DeviceView<'_>,
+    n_tok: u32,
+) -> CoreResult<()> {
+    if let Some(entry) = launch::ternary_rows_name(weights.token_embd.dtype) {
+        let table = &weights.token_embd;
+        let (scales, biases) = match table.aux().and_then(WeightAux::affine) {
+            Some(aux) => (aux.scales.view(), aux.biases.view()),
+            None => (table.view(), table.view()),
+        };
+        let args = launch::TernaryRowsArgs {
+            in_dim: geometry.hidden,
+            n_tok,
+        };
+        return launch::run(
+            backend,
+            KernelRef::new(launch::TERNARY, entry),
+            Extent3::new(geometry.hidden / TERNARY_GROUP, n_tok, 1),
+            Extent3::linear(TERNARY_GROUP),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(table.view()),
+                KernelArg::Buffer(scales),
+                KernelArg::Buffer(biases),
+                KernelArg::Buffer(scratch.ids()),
+                KernelArg::Buffer(dst),
+            ],
+        )
+        .map_err(|err| launch::launch_failure(entry, err));
+    }
     if weights.token_embd.dtype.is_affine() {
         let aux = weights
             .token_embd
@@ -1140,6 +1205,9 @@ pub(crate) fn embed_rows(
     )
     .map_err(|err| launch::launch_failure(geometry.embed.entry, err))
 }
+
+/// Elements one threadgroup of the ternary gather covers: one scale group.
+const TERNARY_GROUP: u32 = 128;
 
 /// Columns one threadgroup of the affine embedding gather covers.
 const EMBED_AFFINE_BLOCK: u32 = 64;
@@ -2270,4 +2338,22 @@ pub(crate) fn logits_row(
         softcap_row(backend, dst, geometry.vocab, cap)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmbedKernel;
+    use crate::launch;
+    use shiso_core::DType;
+
+    #[test]
+    fn the_iq1_m_embedding_reads_the_generic_gather() {
+        // The Saluki export stores its vocabulary table in `iq1_m`, so the
+        // gather is the one entry point that format has; the pair is what the
+        // load records and the launch replays, and a misspelling here is a
+        // driver failure at the first embed, not a compile error.
+        let kernel = EmbedKernel::for_dtype(DType::IQ1_M).expect("the iq1_m gather exists");
+        assert_eq!(kernel.entry, "kernel_get_rows_iq1_m_f32");
+        assert_eq!(kernel.module, launch::GENERIC);
+    }
 }

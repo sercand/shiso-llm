@@ -364,3 +364,326 @@ template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_2")]] kernel mul_mv_ext_kq_f
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_dense_block_q4_K, deq32_q4_K>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_dense_block_q4_K, deq32_q4_K>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_dense_block_q4_K, deq32_q4_K>;
+
+// The mixed i-quant formats and the 2-bit K-quant, on the same kq walk.
+//
+// All nine blocks are 256 weights, so the lane split above needs no change:
+// lane `s` of a block owns weights `32*s .. 32*s+32`, which for the i-quants
+// is exactly one of their eight 32-weight groups (and for q2_K two of its
+// sixteen 16-weight subblocks). The dequantizers below are the device twins of
+// the host reference decoders in `shiso_modelfile::iq_quant` — same block
+// bytes in, same f32 values out, in the same multiplication order — and the
+// codebooks they read are the `constant` arrays of `iq_tables.metal`.
+//
+// The i-quants are non-linear: a weight is a codebook byte times a sign, not
+// an affine image of a small integer code, so there is no `(a, b)` pair to
+// fold the dot into. Each dequantizer therefore writes the fully dequantized
+// weights and hands back `ab = (1, 0)`; the template's `b * sum(y)` leg then
+// contributes nothing and `a * sum(q * y)` is the plain dot of the weights.
+// q2_K is affine per 16-weight subblock but the two subblocks of a 32-weight
+// lane carry different scale/min pairs, so it takes the same route.
+
+// The grid byte `j` of a packed entry, as a float (the 2- and 3-bit grids).
+static inline float shs_iq_byte(ulong grid, short j) {
+    return (float)((grid >> (8 * j)) & 0xFF);
+}
+
+// The same for the ternary grid, whose bytes are signed.
+static inline float shs_iq_sbyte(ulong grid, short j) {
+    return (float)(char)((grid >> (8 * j)) & 0xFF);
+}
+
+// The sign lane `j` of a sign byte: the 2- and 3-bit formats negate the grid
+// byte where the byte's bit `j` is set.
+static inline float shs_iq_sign(uchar signs, short j) {
+    return (signs & (uchar)(1u << j)) ? -1.0f : 1.0f;
+}
+
+struct shs_block_q2_K {
+    uchar scales[16];
+    uchar qs[64];
+    half d;
+    half dmin;
+};
+
+// q2_K stores its weights plane by plane, not in subblock order: the 16
+// weights of subblock `16*(8*plane + 2*j + h)` sit at byte `32*plane + 16*h`
+// of `qs` in bit field `2*j`, and take scale byte `8*plane + 2*j + h` as
+// `d * (sc & 0xF) * q - dmin * (sc >> 4)`. A 32-weight lane is one `j` of one
+// plane, so it reads 32 bytes at a fixed shift and two scale bytes.
+void deq32_q2_K(device const shs_block_q2_K *xb, short s, thread float4 *qv, thread float2 &ab) {
+    const short plane = s >> 2;
+    const short shift = 2 * (s & 3);
+    device const uchar * q = xb->qs + plane * 32;
+    device const uchar * sc = xb->scales + plane * 8 + 2 * (s & 3);
+    for (short h = 0; h < 2; ++h) {
+        const float dl = (float)xb->d * (float)(sc[h] & 0xF);
+        const float ml = (float)xb->dmin * (float)(sc[h] >> 4);
+        for (short l = 0; l < 16; ++l) {
+            qv[h * 4 + l / 4][l % 4] = dl * (float)((q[h * 16 + l] >> shift) & 3) - ml;
+        }
+    }
+    ab = float2(1.0f, 0.0f);
+}
+
+struct shs_block_iq2_xxs {
+    half d;
+    ushort qs[32];
+};
+
+// Two index words then two sign-and-scale words per 32-weight group, as four
+// u16s; the group's scale is the top nibble of the second word. The index
+// words are read as u16 pairs because a 66-byte block only ever lands on a
+// 2-byte boundary.
+void deq32_iq2_xxs(device const shs_block_iq2_xxs *xb, short s, thread float4 *qv, thread float2 &ab) {
+    const uint aux0 = (uint)xb->qs[4 * s + 0] | ((uint)xb->qs[4 * s + 1] << 16);
+    const uint aux1 = (uint)xb->qs[4 * s + 2] | ((uint)xb->qs[4 * s + 3] << 16);
+    const float db = (float)xb->d * (0.5f + (float)((aux1 >> 28) & 0xF)) * 0.25f;
+    for (short l = 0; l < 4; ++l) {
+        const ulong grid = IQ2XXS_GRID[(aux0 >> (8 * l)) & 0xFF];
+        const uchar signs = KSIGNS_IQ2XS[(aux1 >> (7 * l)) & 0x7F];
+        for (short j = 0; j < 8; ++j) {
+            qv[2 * l + j / 4][j % 4] = db * shs_iq_byte(grid, j) * shs_iq_sign(signs, j);
+        }
+    }
+    ab = float2(1.0f, 0.0f);
+}
+
+struct shs_block_iq2_xs {
+    half d;
+    ushort qs[32];
+    uchar scales[8];
+};
+
+// Nine index bits into the grid, seven sign bits above them, two 4-bit scales
+// a byte for the group's two 16-weight halves.
+void deq32_iq2_xs(device const shs_block_iq2_xs *xb, short s, thread float4 *qv, thread float2 &ab) {
+    const float d = (float)xb->d;
+    const uchar sc = xb->scales[s];
+    const float db0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+    const float db1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+    for (short l = 0; l < 4; ++l) {
+        const ushort q = xb->qs[4 * s + l];
+        const ulong grid = IQ2XS_GRID[q & 511];
+        const uchar signs = KSIGNS_IQ2XS[q >> 9];
+        const float db = (l < 2) ? db0 : db1;
+        for (short j = 0; j < 8; ++j) {
+            qv[2 * l + j / 4][j % 4] = db * shs_iq_byte(grid, j) * shs_iq_sign(signs, j);
+        }
+    }
+    ab = float2(1.0f, 0.0f);
+}
+
+struct shs_block_iq2_s {
+    half d;
+    uchar qs[64];
+    uchar qh[8];
+    uchar scales[8];
+};
+
+// The grid indices occupy the first half of `qs` and the per-weight signs the
+// second; two high index bits per quad come from `qh`.
+void deq32_iq2_s(device const shs_block_iq2_s *xb, short s, thread float4 *qv, thread float2 &ab) {
+    const float d = (float)xb->d;
+    const uchar sc = xb->scales[s];
+    const float db0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+    const float db1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+    const uint qh = xb->qh[s];
+    for (short l = 0; l < 4; ++l) {
+        const uint idx = (uint)xb->qs[4 * s + l] | ((qh << (8 - 2 * l)) & 0x300);
+        const ulong grid = IQ2S_GRID[idx];
+        const uchar signs = xb->qs[QK_K / 8 + 4 * s + l];
+        const float db = (l < 2) ? db0 : db1;
+        for (short j = 0; j < 8; ++j) {
+            qv[2 * l + j / 4][j % 4] = db * shs_iq_byte(grid, j) * shs_iq_sign(signs, j);
+        }
+    }
+    ab = float2(1.0f, 0.0f);
+}
+
+struct shs_block_iq3_xxs {
+    half d;
+    uchar qs[96];
+};
+
+// Sixty-four grid-index bytes, then one sign-and-scale word per group after
+// them. Each index covers four weights, so a quad reads two grid entries and
+// splits its eight weights between them.
+void deq32_iq3_xxs(device const shs_block_iq3_xxs *xb, short s, thread float4 *qv, thread float2 &ab) {
+    device const uchar * a = xb->qs + QK_K / 4 + 4 * s;
+    const uint aux = (uint)a[0] | ((uint)a[1] << 8) | ((uint)a[2] << 16) | ((uint)a[3] << 24);
+    const float db = (float)xb->d * (0.5f + (float)((aux >> 28) & 0xF)) * 0.5f;
+    for (short l = 0; l < 4; ++l) {
+        const uchar signs = KSIGNS_IQ2XS[(aux >> (7 * l)) & 0x7F];
+        const uint g1 = IQ3XXS_GRID[xb->qs[8 * s + 2 * l]];
+        const uint g2 = IQ3XXS_GRID[xb->qs[8 * s + 2 * l + 1]];
+        for (short j = 0; j < 4; ++j) {
+            qv[2 * l + j / 4][j % 4] = db * (float)((g1 >> (8 * j)) & 0xFF) * shs_iq_sign(signs, j);
+            qv[2 * l + (j + 4) / 4][(j + 4) % 4] = db * (float)((g2 >> (8 * j)) & 0xFF) * shs_iq_sign(signs, j + 4);
+        }
+    }
+    ab = float2(1.0f, 0.0f);
+}
+
+struct shs_block_iq3_s {
+    half d;
+    uchar qs[64];
+    uchar qh[8];
+    uchar signs[32];
+    uchar scales[4];
+};
+
+// Odd 4-bit scales (`1 + 2 * nibble`), one scale byte per two groups; the
+// high index bit of each of a group's eight indices is one bit of `qh`, and
+// the signs are one byte per quad.
+void deq32_iq3_s(device const shs_block_iq3_s *xb, short s, thread float4 *qv, thread float2 &ab) {
+    const float d = (float)xb->d;
+    const uchar sc = xb->scales[s / 2];
+    const float db = d * (1.0f + 2.0f * (float)((s & 1) ? (sc >> 4) : (sc & 0xF)));
+    const uint qh = xb->qh[s];
+    for (short l = 0; l < 4; ++l) {
+        const uint g1 = IQ3S_GRID[(uint)xb->qs[8 * s + 2 * l] | ((qh << (8 - 2 * l)) & 256)];
+        const uint g2 = IQ3S_GRID[(uint)xb->qs[8 * s + 2 * l + 1] | ((qh << (7 - 2 * l)) & 256)];
+        const uchar signs = xb->signs[4 * s + l];
+        for (short j = 0; j < 4; ++j) {
+            qv[2 * l + j / 4][j % 4] = db * (float)((g1 >> (8 * j)) & 0xFF) * shs_iq_sign(signs, j);
+            qv[2 * l + (j + 4) / 4][(j + 4) % 4] = db * (float)((g2 >> (8 * j)) & 0xFF) * shs_iq_sign(signs, j + 4);
+        }
+    }
+    ab = float2(1.0f, 0.0f);
+}
+
+struct shs_block_iq1_s {
+    half d;
+    uchar qs[32];
+    ushort qh[8];
+};
+
+// The group word carries the high three index bits of each quad (three bits
+// a quad from bit 0 up), a 3-bit scale multiplier at bits 12..14, and the
+// sign of the grid shift at bit 15: a weight is `dl * (grid + delta)`, and
+// skipping the delta is wrong, not merely imprecise.
+void deq32_iq1_s(device const shs_block_iq1_s *xb, short s, thread float4 *qv, thread float2 &ab) {
+    const ushort qh = xb->qh[s];
+    const float dl = (float)xb->d * (float)(2 * ((qh >> 12) & 7) + 1);
+    const float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+    for (short l = 0; l < 4; ++l) {
+        const uint idx = (uint)xb->qs[4 * s + l] | (uint(((qh >> (3 * l)) & 7)) << 8);
+        const ulong grid = IQ1S_GRID[idx];
+        for (short j = 0; j < 8; ++j) {
+            qv[2 * l + j / 4][j % 4] = dl * (shs_iq_sbyte(grid, j) + delta);
+        }
+    }
+    ab = float2(1.0f, 0.0f);
+}
+
+struct shs_block_iq1_m {
+    uchar qs[32];
+    uchar qh[16];
+    uchar scales[8];
+};
+
+// The block f16 is not stored: it is the four top nibbles of the odd scale
+// bytes, least significant first. Each 16-weight subblock then carries its
+// own 3-bit scale multiplier, and each quad its own grid-shift sign, so the
+// lane assembles two scales and four deltas for its 32 weights.
+void deq32_iq1_m(device const shs_block_iq1_m *xb, short s, thread float4 *qv, thread float2 &ab) {
+    const uint w0 = (uint)xb->scales[0] | ((uint)xb->scales[1] << 8);
+    const uint w1 = (uint)xb->scales[2] | ((uint)xb->scales[3] << 8);
+    const uint w2 = (uint)xb->scales[4] | ((uint)xb->scales[5] << 8);
+    const uint w3 = (uint)xb->scales[6] | ((uint)xb->scales[7] << 8);
+    const ushort dbits = (ushort)((w0 >> 12) | ((w1 >> 8) & 0x00F0) | ((w2 >> 4) & 0x0F00) | (w3 & 0xF000));
+    const float d = (float)as_type<half>(dbits);
+    const uint words[4] = { w0, w1, w2, w3 };
+    const uint word = words[s / 2];
+    const short shift = 6 * (s % 2);
+    const float dl0 = d * (float)(2 * ((word >> shift) & 7) + 1);
+    const float dl1 = d * (float)(2 * ((word >> (shift + 3)) & 7) + 1);
+    for (short m = 0; m < 4; ++m) {
+        const uchar qhb = xb->qh[2 * s + m / 2];
+        const uint idx = (uint)xb->qs[4 * s + m] | ((((uint)qhb) << ((m & 1) ? 4 : 8)) & 0x700);
+        const float delta = (qhb & ((m & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;
+        const float dl = (m < 2) ? dl0 : dl1;
+        const ulong grid = IQ1S_GRID[idx];
+        for (short j = 0; j < 8; ++j) {
+            qv[2 * m + j / 4][j % 4] = dl * (shs_iq_sbyte(grid, j) + delta);
+        }
+    }
+    ab = float2(1.0f, 0.0f);
+}
+
+struct shs_block_iq4_xs {
+    half d;
+    ushort scales_h;
+    uchar scales_l[4];
+    uchar qs[128];
+};
+
+// A 6-bit subblock scale split across two planes, offset so 32 means no
+// scaling; the weights are nibble indices into the non-linear codebook, low
+// nibble first for the group's first 16 weights.
+void deq32_iq4_xs(device const shs_block_iq4_xs *xb, short s, thread float4 *qv, thread float2 &ab) {
+    const uint ls = ((uint)(xb->scales_l[s / 2] >> (4 * (s % 2))) & 0xF)
+                  | ((((uint)xb->scales_h) >> (2 * s)) & 3) << 4;
+    const float dl = (float)xb->d * ((float)ls - 32.0f);
+    for (short j = 0; j < 16; ++j) {
+        const uchar q = xb->qs[16 * s + j];
+        qv[j / 4][j % 4] = dl * (float)IQ4NL[q & 0xF];
+        qv[4 + j / 4][j % 4] = dl * (float)IQ4NL[q >> 4];
+    }
+    ab = float2(1.0f, 0.0f);
+}
+
+template [[host_name("kernel_mul_mv_ext_q2_K_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_block_q2_K, deq32_q2_K>;
+template [[host_name("kernel_mul_mv_ext_q2_K_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_block_q2_K, deq32_q2_K>;
+template [[host_name("kernel_mul_mv_ext_q2_K_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_block_q2_K, deq32_q2_K>;
+template [[host_name("kernel_mul_mv_ext_q2_K_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_block_q2_K, deq32_q2_K>;
+template [[host_name("kernel_mul_mv_ext_q2_K_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_block_q2_K, deq32_q2_K>;
+
+template [[host_name("kernel_mul_mv_ext_iq2_xxs_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_block_iq2_xxs, deq32_iq2_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xxs_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_block_iq2_xxs, deq32_iq2_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xxs_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_block_iq2_xxs, deq32_iq2_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xxs_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_block_iq2_xxs, deq32_iq2_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xxs_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_block_iq2_xxs, deq32_iq2_xxs>;
+
+template [[host_name("kernel_mul_mv_ext_iq2_xs_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_block_iq2_xs, deq32_iq2_xs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xs_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_block_iq2_xs, deq32_iq2_xs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xs_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_block_iq2_xs, deq32_iq2_xs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xs_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_block_iq2_xs, deq32_iq2_xs>;
+template [[host_name("kernel_mul_mv_ext_iq2_xs_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_block_iq2_xs, deq32_iq2_xs>;
+
+template [[host_name("kernel_mul_mv_ext_iq2_s_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_block_iq2_s, deq32_iq2_s>;
+template [[host_name("kernel_mul_mv_ext_iq2_s_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_block_iq2_s, deq32_iq2_s>;
+template [[host_name("kernel_mul_mv_ext_iq2_s_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_block_iq2_s, deq32_iq2_s>;
+template [[host_name("kernel_mul_mv_ext_iq2_s_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_block_iq2_s, deq32_iq2_s>;
+template [[host_name("kernel_mul_mv_ext_iq2_s_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_block_iq2_s, deq32_iq2_s>;
+
+template [[host_name("kernel_mul_mv_ext_iq3_xxs_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_block_iq3_xxs, deq32_iq3_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq3_xxs_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_block_iq3_xxs, deq32_iq3_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq3_xxs_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_block_iq3_xxs, deq32_iq3_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq3_xxs_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_block_iq3_xxs, deq32_iq3_xxs>;
+template [[host_name("kernel_mul_mv_ext_iq3_xxs_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_block_iq3_xxs, deq32_iq3_xxs>;
+
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_block_iq3_s, deq32_iq3_s>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_block_iq3_s, deq32_iq3_s>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_block_iq3_s, deq32_iq3_s>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_block_iq3_s, deq32_iq3_s>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_block_iq3_s, deq32_iq3_s>;
+
+template [[host_name("kernel_mul_mv_ext_iq1_s_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_block_iq1_s, deq32_iq1_s>;
+template [[host_name("kernel_mul_mv_ext_iq1_s_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_block_iq1_s, deq32_iq1_s>;
+template [[host_name("kernel_mul_mv_ext_iq1_s_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_block_iq1_s, deq32_iq1_s>;
+template [[host_name("kernel_mul_mv_ext_iq1_s_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_block_iq1_s, deq32_iq1_s>;
+template [[host_name("kernel_mul_mv_ext_iq1_s_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_block_iq1_s, deq32_iq1_s>;
+
+template [[host_name("kernel_mul_mv_ext_iq1_m_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_block_iq1_m, deq32_iq1_m>;
+template [[host_name("kernel_mul_mv_ext_iq1_m_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_block_iq1_m, deq32_iq1_m>;
+template [[host_name("kernel_mul_mv_ext_iq1_m_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_block_iq1_m, deq32_iq1_m>;
+template [[host_name("kernel_mul_mv_ext_iq1_m_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_block_iq1_m, deq32_iq1_m>;
+template [[host_name("kernel_mul_mv_ext_iq1_m_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_block_iq1_m, deq32_iq1_m>;
+
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_1")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<1, shs_block_iq4_xs, deq32_iq4_xs>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_2")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<2, shs_block_iq4_xs, deq32_iq4_xs>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_3")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<3, shs_block_iq4_xs, deq32_iq4_xs>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_block_iq4_xs, deq32_iq4_xs>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_block_iq4_xs, deq32_iq4_xs>;

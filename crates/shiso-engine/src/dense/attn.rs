@@ -204,15 +204,23 @@ fn project_and_store(
 ) -> CoreResult<()> {
     if geometry.qk_norm {
         let (k_proj, v_proj, k_norm) = attn.kv()?;
-        projection::projection(backend, k_proj, rows.n_tok, rows.input, scratch.k.view())?;
-        projection::projection(backend, v_proj, rows.n_tok, rows.input, scratch.v.view())?;
+        projection::projections(
+            backend,
+            rows.n_tok,
+            rows.input,
+            &[(k_proj, scratch.k.view()), (v_proj, scratch.v.view())],
+        )?;
         kv_norm_rope_store(
             backend, k_norm, geometry, scratch, cache, rows.pos, rows.n_tok,
         )
     } else {
         let (k_proj, v_proj) = attn.kv_plain()?;
-        projection::projection(backend, k_proj, rows.n_tok, rows.input, scratch.k.view())?;
-        projection::projection(backend, v_proj, rows.n_tok, rows.input, scratch.v.view())?;
+        projection::projections(
+            backend,
+            rows.n_tok,
+            rows.input,
+            &[(k_proj, scratch.k.view()), (v_proj, scratch.v.view())],
+        )?;
         kv_store_plain(backend, geometry, scratch, cache, rows.pos, rows.n_tok)
     }
 }

@@ -56,20 +56,28 @@ use shiso_engine::ffn::Ffn;
 use shiso_engine::gdn::{Gdn, GdnGeometry};
 use shiso_engine::layers::{Block, LayerWeights, Weights};
 use shiso_engine::projection::Weight;
+use shiso_engine::rotation::{
+    HeadOrder, InputRotation, RotationDesc, RotationDirection, RotationScratch,
+};
 use shiso_engine::shape::{HybridShape, LayerKind};
 use shiso_engine::{EngineOptions, HybridStack, MAX_PREFILL_CHUNK};
-use shiso_modelfile::{ModelFile, TensorDesc};
+use shiso_modelfile::{ModelFile, ScaleFormat, TensorDesc};
 
 use crate::qwen35::binding::{DescBinding, LayerRoles, bind_qwen35_desc};
 use crate::qwen35::config::Qwen35Config;
 use crate::qwen35::kernels::Qwen35Kernels;
 use crate::qwen35::mtp::{MtpManifest, MtpWeights};
+use crate::qwen35::rotation::{MLX_FILE as MLX_ROTATION, Rotated, RotationPlan};
 
 /// The formats a bound tensor may be stored as.
 ///
 /// A tensor outside this list ends the load rather than selecting a slower path:
 /// a model that quietly ran a dequantized copy of one tensor would produce logits
 /// nobody can attribute to a kernel.
+///
+/// The nine sub-4-bit formats at the end are the mixed set of the Saluki export,
+/// accepted as a set: that file pairs a gate in one codec with an up projection
+/// in another, so a list holding some of them would refuse the file anyway.
 const SUPPORTED: &[DType] = &[
     DType::F32,
     DType::F16,
@@ -77,6 +85,17 @@ const SUPPORTED: &[DType] = &[
     DType::Q4_K,
     DType::Q5_K,
     DType::Q6_K,
+    DType::Pq2_0,
+    DType::Ptq1_0,
+    DType::Q2_K,
+    DType::IQ2_XXS,
+    DType::IQ2_XS,
+    DType::IQ2_S,
+    DType::IQ3_XXS,
+    DType::IQ3_S,
+    DType::IQ1_S,
+    DType::IQ1_M,
+    DType::IQ4_XS,
 ];
 
 /// A loaded checkpoint of this family.
@@ -173,8 +192,14 @@ impl Qwen35Model {
             let embed = crate::qwen35::modelopt::EMBED_DTYPE;
             return Self::assemble(backend, config, opts, head, (weights, embed, ffn_gate));
         }
-        let file = ModelFile::open_with(path, Arc::new(crate::qwen35::Qwen35Names))
-            .map_err(open_failure)?;
+        // A rotated directory keeps its output projection's columns where the
+        // file put them; see `Qwen35RotatedNames`.
+        let names: Arc<dyn shiso_modelfile::NameMap> = if path.join(MLX_ROTATION).is_file() {
+            Arc::new(crate::qwen35::st_names::Qwen35RotatedNames)
+        } else {
+            Arc::new(crate::qwen35::Qwen35Names)
+        };
+        let file = ModelFile::open_with(path, names).map_err(open_failure)?;
         let binding = bind_qwen35_desc(&file, config).map_err(open_failure)?;
         validate_layers(config.shape(), &binding)?;
         let embed = embedding_dtype(&file, &binding.token_embd)?;
@@ -182,7 +207,8 @@ impl Qwen35Model {
             Some(layer) => stored_dtype(&file, &layer.ffn.gate)?,
             None => embed,
         };
-        let weights = import_weights(backend, &file, &binding, config.shape())?;
+        let rotation = Rotation::for_file(backend, &file, path, config.shape())?;
+        let weights = import_weights(backend, &file, &binding, config.shape(), rotation.as_ref())?;
         // A Clef checkpoint is this backbone under its own architecture name,
         // with the schema head the binding never reads beside it.
         let decision = if shiso_modelfile::source::TensorSource::architecture(&file)
@@ -335,6 +361,7 @@ fn import_weights(
     file: &ModelFile,
     binding: &DescBinding,
     shape: &HybridShape,
+    rot: Option<&Rotation>,
 ) -> CoreResult<Weights> {
     let mut gdn_rank = 0;
     let mut attn_rank = 0;
@@ -351,12 +378,12 @@ fn import_weights(
             LayerKind::Gdn => {
                 let rank = gdn_rank;
                 gdn_rank += 1;
-                (Block::Gdn(import_gdn(backend, file, layer)?), rank)
+                (Block::Gdn(import_gdn(backend, file, layer, rot)?), rank)
             }
             LayerKind::Attn => {
                 let rank = attn_rank;
                 attn_rank += 1;
-                (Block::Attn(import_attn(backend, file, layer)?), rank)
+                (Block::Attn(import_attn(backend, file, layer, rot)?), rank)
             }
             // This family's shape holds neither; its config never states one.
             LayerKind::Ssm => {
@@ -377,9 +404,9 @@ fn import_weights(
             ffn_norm: Some(vector(backend, file, &layer.post_norm)?),
             post_ffn_norm: None,
             ffn: Some(Ffn {
-                gate: Some(weight(backend, file, &layer.ffn.gate)?),
-                up: weight(backend, file, &layer.ffn.up)?,
-                down: weight(backend, file, &layer.ffn.down)?,
+                gate: Some(weight(backend, file, rot, &layer.ffn.gate)?),
+                up: weight(backend, file, rot, &layer.ffn.up)?,
+                down: weight(backend, file, rot, &layer.ffn.down)?,
             }),
             // A dense feed-forward: this family's slots have no router.
             moe: None,
@@ -391,12 +418,12 @@ fn import_weights(
         });
     }
     Ok(Weights {
-        token_embd: embedding(backend, file, &binding.token_embd)?,
+        token_embd: embedding(backend, file, rot, &binding.token_embd)?,
         output_norm: vector(backend, file, &binding.output_norm)?,
         lm_head: binding
             .lm_head
             .as_ref()
-            .map(|view| weight(backend, file, view))
+            .map(|view| weight(backend, file, rot, view))
             .transpose()?,
         ple_model_proj: None,
         ple_proj_norm: None,
@@ -409,17 +436,18 @@ fn import_gdn(
     backend: &Arc<dyn Backend>,
     file: &ModelFile,
     layer: &LayerRoles<TensorDesc>,
+    rot: Option<&Rotation>,
 ) -> CoreResult<Gdn> {
     let bound = layer.gdn.as_ref().ok_or(CoreError::InvalidValue {
         key: "layer kind",
         value: "a recurrent slot bound without recurrent weights".to_owned(),
     })?;
     Ok(Gdn {
-        qkv: weight(backend, file, &bound.qkv)?,
-        gate: weight(backend, file, &bound.gate)?,
-        alpha: weight(backend, file, &bound.alpha)?,
-        beta: weight(backend, file, &bound.beta)?,
-        out: weight(backend, file, &bound.out)?,
+        qkv: weight(backend, file, rot, &bound.qkv)?,
+        gate: weight(backend, file, rot, &bound.gate)?,
+        alpha: weight(backend, file, rot, &bound.alpha)?,
+        beta: weight(backend, file, rot, &bound.beta)?,
+        out: weight(backend, file, rot, &bound.out)?,
         conv1d: vector(backend, file, &bound.conv1d)?,
         a: vector(backend, file, &bound.a)?,
         dt_bias: vector(backend, file, &bound.dt_bias)?,
@@ -432,6 +460,7 @@ fn import_attn(
     backend: &Arc<dyn Backend>,
     file: &ModelFile,
     layer: &LayerRoles<TensorDesc>,
+    rot: Option<&Rotation>,
 ) -> CoreResult<Attn> {
     let bound = layer.attn.as_ref().ok_or(CoreError::InvalidValue {
         key: "layer kind",
@@ -441,10 +470,10 @@ fn import_attn(
     // key half's `Option`s are filled: a slot that reads another's would carry
     // none of them, and there is no such slot here.
     Ok(Attn {
-        q: weight(backend, file, &bound.q)?,
-        k: Some(weight(backend, file, &bound.k)?),
-        v: Some(weight(backend, file, &bound.v)?),
-        output: weight(backend, file, &bound.output)?,
+        q: weight(backend, file, rot, &bound.q)?,
+        k: Some(weight(backend, file, rot, &bound.k)?),
+        v: Some(weight(backend, file, rot, &bound.v)?),
+        output: weight(backend, file, rot, &bound.output)?,
         q_norm: Some(vector(backend, file, &bound.q_norm)?),
         k_norm: Some(vector(backend, file, &bound.k_norm)?),
     })
@@ -458,7 +487,28 @@ fn import_attn(
 /// separately, a format for which no matvec exists in this build. A file can pass
 /// the first and fail the second - that is a build that cannot run a legitimate
 /// checkpoint, which is a different problem and deserves a different message.
-fn weight(backend: &Arc<dyn Backend>, file: &ModelFile, desc: &TensorDesc) -> CoreResult<Weight> {
+fn weight(
+    backend: &Arc<dyn Backend>,
+    file: &ModelFile,
+    rot: Option<&Rotation>,
+    desc: &TensorDesc,
+) -> CoreResult<Weight> {
+    let stored = stored_weight(backend, file, desc)?;
+    match rot {
+        Some(rotation) => rotation.attach(backend, &desc.name, stored),
+        None => refuse_unrotated(&desc.name, stored),
+    }
+}
+
+/// [`weight`] before any rotation is attached.
+fn stored_weight(
+    backend: &Arc<dyn Backend>,
+    file: &ModelFile,
+    desc: &TensorDesc,
+) -> CoreResult<Weight> {
+    if desc.dtype == DType::BF16 && matches!(file, ModelFile::Gguf(_)) {
+        return widened_bf16(backend, file, desc);
+    }
     if !SUPPORTED.contains(&desc.dtype) {
         return Err(CoreError::Unsupported {
             what: "a weight stored in a format this family's loader does not accept",
@@ -474,9 +524,23 @@ fn weight(backend: &Arc<dyn Backend>, file: &ModelFile, desc: &TensorDesc) -> Co
     if let ModelFile::Safetensors(st) = file
         && let Some(packed) = st.affine_packed(&desc.name).map_err(open_failure)?
     {
+        let dtype = affine_dtype(packed.layout.bits, packed.layout.group_size)?;
+        // The 2-bit kernels read `f16` scales and the 4- and 8-bit ones brain
+        // floats; the two are the same width, so the pairing is checked here.
+        let want = if dtype == DType::MlxAffine2Gs128 {
+            ScaleFormat::F16
+        } else {
+            ScaleFormat::Bf16
+        };
+        if packed.scale_format != want {
+            return Err(CoreError::Unsupported {
+                what: "an MLX affine weight whose scale format its matmul does not read",
+                backend: "qwen35",
+            });
+        }
         return Weight::import_affine_slices(
             backend,
-            affine_dtype(packed.layout.bits)?,
+            dtype,
             in_dim,
             out_dim,
             &packed.words,
@@ -494,33 +558,39 @@ fn weight(backend: &Arc<dyn Backend>, file: &ModelFile, desc: &TensorDesc) -> Co
 fn embedding(
     backend: &Arc<dyn Backend>,
     file: &ModelFile,
+    rot: Option<&Rotation>,
     desc: &TensorDesc,
 ) -> CoreResult<Weight> {
-    if embedding_dtype(file, desc)? == desc.dtype {
+    if embedding_dtype(file, desc)? == desc.dtype && !desc.dtype.is_ternary() {
         let dims = desc.shape.dims();
         let in_dim = extent(dims.first().copied().unwrap_or(0))?;
         let out_dim = extent(dims.get(1).copied().unwrap_or(1))?;
         let (host, range) = file.tensor_host(desc).map_err(open_failure)?;
-        return Weight::import(backend, desc.dtype, in_dim, out_dim, host, range);
+        let table = Weight::import(backend, desc.dtype, in_dim, out_dim, host, range)?;
+        return match rot {
+            Some(rotation) => rotation.attach(backend, &desc.name, table),
+            None => Ok(table),
+        };
     }
-    weight(backend, file, desc)
+    weight(backend, file, rot, desc)
 }
 
 /// The format the token embedding is imported as; see [`embedding`].
 fn embedding_dtype(file: &ModelFile, desc: &TensorDesc) -> CoreResult<DType> {
     match stored_dtype(file, desc)? {
-        DType::MlxAffine4Gs64 => Ok(DType::MlxAffine4Gs64),
+        packed @ (DType::MlxAffine4Gs64 | DType::MlxAffine2Gs128) => Ok(packed),
         _ => Ok(desc.dtype),
     }
 }
 
-/// The packed format of an MLX affine weight at `bits`, in groups of 64.
-fn affine_dtype(bits: u32) -> CoreResult<DType> {
-    match bits {
-        4 => Ok(DType::MlxAffine4Gs64),
-        8 => Ok(DType::MlxAffine8Gs64),
+/// The packed format of an MLX affine weight at `bits` in groups of `group`.
+fn affine_dtype(bits: u32, group: usize) -> CoreResult<DType> {
+    match (bits, group) {
+        (4, 64) => Ok(DType::MlxAffine4Gs64),
+        (8, 64) => Ok(DType::MlxAffine8Gs64),
+        (2, 128) => Ok(DType::MlxAffine2Gs128),
         _ => Err(CoreError::Unsupported {
-            what: "an MLX affine weight at a bit width with no matmul",
+            what: "an MLX affine weight at a bit width and group size with no matmul",
             backend: "qwen35",
         }),
     }
@@ -532,9 +602,136 @@ fn stored_dtype(file: &ModelFile, desc: &TensorDesc) -> CoreResult<DType> {
     if let ModelFile::Safetensors(st) = file
         && let Some(triple) = st.affine_triple(&desc.name).map_err(open_failure)?
     {
-        return affine_dtype(triple.layout.bits);
+        return affine_dtype(triple.layout.bits, triple.layout.group_size);
     }
     Ok(desc.dtype)
+}
+
+/// Imports a GGUF's `bfloat16` matrix widened to `f32`.
+///
+/// No projection reads brain floats, and the only ones a file of this family
+/// stores are the recurrent block's two narrow gate projections - 48 rows a
+/// layer. Widening is exact, costs a few megabytes, and keeps the projection
+/// off a format no kernel was written for.
+fn widened_bf16(
+    backend: &Arc<dyn Backend>,
+    file: &ModelFile,
+    desc: &TensorDesc,
+) -> CoreResult<Weight> {
+    let dims = desc.shape.dims();
+    let in_dim = extent(dims.first().copied().unwrap_or(0))?;
+    let out_dim = extent(dims.get(1).copied().unwrap_or(1))?;
+    let bytes = file.tensor_bytes(&desc.name).map_err(open_failure)?;
+    let wide: Vec<u8> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|h| half::bf16::from_le_bytes(*h).to_f32().to_le_bytes())
+        .collect();
+    let len = wide.len();
+    Weight::import(backend, DType::F32, in_dim, out_dim, Arc::new(wide), 0..len)
+}
+
+/// Refuses a ternary or 2-bit weight from a checkpoint that states no
+/// rotation.
+///
+/// Those formats exist for rotated exports, and one read in the plain basis
+/// loads without complaint and generates nonsense. Checked per weight as it is
+/// imported, not on the vocabulary table alone: an export can keep its table
+/// at eight bits or half precision and still store every projection ternary.
+/// [`Rotation::attach`] is the same check for a file that does state one.
+fn refuse_unrotated(name: &str, weight: Weight) -> CoreResult<Weight> {
+    if !weight.dtype.is_ternary() && weight.dtype != DType::MlxAffine2Gs128 {
+        return Ok(weight);
+    }
+    Err(CoreError::InvalidValue {
+        key: "prism.hadamard",
+        value: format!(
+            "{name} is stored ternary or 2-bit, but the checkpoint carries no rotation \
+             metadata; it is in a basis this loader cannot recover, so it is refused \
+             rather than generating nonsense"
+        ),
+    })
+}
+
+/// A checkpoint's rotation, with the scratch its projections share.
+#[derive(Debug)]
+struct Rotation {
+    plan: RotationPlan,
+    scratch: Arc<RotationScratch>,
+    /// The recurrent output projection's head permutation, when the value
+    /// heads repeat the key heads.
+    value_heads: Option<HeadOrder>,
+}
+
+impl Rotation {
+    /// The rotation `file` states, or `None` for an ordinary checkpoint.
+    fn for_file(
+        backend: &Arc<dyn Backend>,
+        file: &ModelFile,
+        path: &Path,
+        shape: &HybridShape,
+    ) -> CoreResult<Option<Self>> {
+        let plan = match file {
+            ModelFile::Gguf(gguf) => RotationPlan::from_gguf(gguf.metadata())?,
+            ModelFile::Safetensors(_) if path.join(MLX_ROTATION).is_file() => {
+                Some(RotationPlan::from_mlx_dir(path)?)
+            }
+            _ => None,
+        };
+        let Some(plan) = plan else {
+            return Ok(None);
+        };
+        let gdn = &shape.gdn;
+        let value_heads = plan.value_heads(gdn.head_dim, gdn.qk_heads, gdn.v_heads)?;
+        let scratch = RotationScratch::new(backend, plan.widest(), MAX_PREFILL_CHUNK)?;
+        Ok(Some(Self {
+            plan,
+            scratch,
+            value_heads,
+        }))
+    }
+
+    /// Attaches the rotation the plan states for `name` to `weight`.
+    ///
+    /// A ternary or 2-bit weight the plan does not list is refused: those
+    /// formats exist for rotated exports, and one left in the plain basis
+    /// means this reader has misread the file.
+    fn attach(&self, backend: &Arc<dyn Backend>, name: &str, weight: Weight) -> CoreResult<Weight> {
+        let Some(role) = self.plan.role(name) else {
+            if weight.dtype.is_ternary() || weight.dtype == DType::MlxAffine2Gs128 {
+                return Err(CoreError::InvalidValue {
+                    key: "prism.hadamard.weight_names",
+                    value: format!("{name} is ternary but not listed as rotated"),
+                });
+            }
+            return Ok(weight);
+        };
+        let direction = match role {
+            Rotated::Forward => RotationDirection::Forward,
+            Rotated::Inverse => RotationDirection::Inverse,
+        };
+        let forward = direction == RotationDirection::Forward;
+        let heads = if forward && name.ends_with(".ssm_out.weight") {
+            self.value_heads
+        } else {
+            None
+        };
+        let rotation = InputRotation::new(
+            backend,
+            RotationDesc {
+                block: self.plan.block(),
+                direction,
+                signs: self.plan.signs(weight.in_dim)?,
+                heads,
+                // An inverse rotation carries the scratch too: a table with no
+                // separate output head is also read as the head, and that
+                // projection rotates its input forward (`shiso_engine::rotation`).
+                scratch: Some(Arc::clone(&self.scratch)),
+            },
+        )?;
+        weight.with_rotation(rotation)
+    }
 }
 
 /// Imports one weight vector, which every format stores as plain `f32`.
@@ -698,5 +895,36 @@ impl shiso_core::model::Speculating for Qwen35Model {
     ) -> CoreResult<()> {
         let _ = block;
         self.stack.settle_verified(session, accepted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SUPPORTED;
+    use shiso_core::DType;
+
+    /// The nine mixed i-quant formats of the Saluki export, accepted together
+    /// or not at all: a loader that takes the gate's `iq1_s` but refuses the
+    /// up projection's `iq1_m` cannot load the file at all, so a partial list
+    /// is no list.
+    #[test]
+    fn the_loader_accepts_the_mixed_i_quant_formats() {
+        for dtype in [
+            DType::Q2_K,
+            DType::IQ2_XXS,
+            DType::IQ2_XS,
+            DType::IQ2_S,
+            DType::IQ3_XXS,
+            DType::IQ3_S,
+            DType::IQ1_S,
+            DType::IQ1_M,
+            DType::IQ4_XS,
+        ] {
+            assert!(
+                SUPPORTED.contains(&dtype),
+                "the family must accept a weight stored in {}",
+                dtype.type_name()
+            );
+        }
     }
 }

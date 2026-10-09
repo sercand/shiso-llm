@@ -286,9 +286,16 @@ pub(super) fn run(
     // Every qwen35 slot owns its cache, so all three are present; asking once
     // here is what makes the four launches below unconditional.
     let (k_proj, v_proj, k_norm) = attn.kv()?;
-    projection::projection(backend, &attn.q, n_tok, input, scratch.qkv.view())?;
-    projection::projection(backend, k_proj, n_tok, input, scratch.k.view())?;
-    projection::projection(backend, v_proj, n_tok, input, scratch.v.view())?;
+    projection::projections(
+        backend,
+        n_tok,
+        input,
+        &[
+            (&attn.q, scratch.qkv.view()),
+            (k_proj, scratch.k.view()),
+            (v_proj, scratch.v.view()),
+        ],
+    )?;
     q_norm_rope(backend, attn, geometry, scratch, pos, n_tok)?;
     k_norm_rope_kv(backend, k_norm, geometry, scratch, cache, pos, n_tok)?;
     // The softmax reads sequence positions only: what a query may see is a

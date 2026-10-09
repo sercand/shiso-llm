@@ -161,3 +161,30 @@ fn affine_triple_returns_the_three_payloads_and_their_layout() {
     let b = file.affine_triple("b.weight").expect("query succeeds");
     assert!(b.is_none());
 }
+
+#[test]
+fn a_triple_with_scales_and_biases_in_different_half_formats_is_refused() {
+    // One `ScaleFormat` describes both arrays, so a pair that disagrees would
+    // have every bias decoded as the wrong half format.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    write_shard(
+        &dir.path().join("model.safetensors"),
+        &[
+            ("a.weight", "U32", &[1, 8], &[0, 32]),
+            ("a.scales", "F16", &[1, 1], &[32, 34]),
+            ("a.biases", "BF16", &[1, 1], &[34, 36]),
+        ],
+        &[0_u8; 36],
+    );
+    let config_json = serde_json::json!({
+        "quantization": { "group_size": 64, "bits": 4, "mode": "affine" }
+    });
+    std::fs::write(dir.path().join("config.json"), config_json.to_string()).expect("write config");
+
+    let refused = shiso_modelfile::SafetensorsFile::open(dir.path())
+        .and_then(|file| file.affine_triple("a.weight").map(|_| ()));
+    assert!(
+        matches!(refused, Err(GgufError::LayoutMismatch { .. })),
+        "{refused:?}"
+    );
+}

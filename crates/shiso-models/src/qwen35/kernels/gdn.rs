@@ -200,19 +200,16 @@ fn normalize(
 
 /// Runs the two per-head gates over the chunk.
 ///
-/// Both drivers are projected from the same residual rows the mix was projected
-/// from, so the block reads the block's own input three times instead of keeping
+/// Both drivers were projected by [`run`] from the same residual rows the mix
+/// was, so the block reads its own input once per projection instead of keeping
 /// a second copy of the residual stream around for them.
 fn gates(
     backend: &dyn Backend,
     gdn: &Gdn,
     geometry: &GdnGeometry,
     scratch: &GdnScratch,
-    input: DeviceView<'_>,
     n_tok: u32,
 ) -> CoreResult<()> {
-    projection::projection(backend, &gdn.alpha, n_tok, input, scratch.alpha_proj.view())?;
-    projection::projection(backend, &gdn.beta, n_tok, input, scratch.beta_proj.view())?;
     let args = GateArgs {
         n_head: geometry.v_heads,
         n_tok,
@@ -441,14 +438,26 @@ pub(super) fn run(
     io: GdnIo<'_>,
     n_tok: u32,
 ) -> CoreResult<()> {
-    let input = io.input;
-    projection::projection(backend, &gdn.qkv, n_tok, input, scratch.x.view())?;
+    // All four input projections at once, so a rotated export rotates the
+    // block's input once rather than four times. The gate and the two drivers
+    // land in buffers nothing before `out_gate` and `gates` writes.
+    projection::projections(
+        backend,
+        n_tok,
+        io.input,
+        &[
+            (&gdn.qkv, scratch.x.view()),
+            (&gdn.gate, scratch.z.view()),
+            (&gdn.alpha, scratch.alpha_proj.view()),
+            (&gdn.beta, scratch.beta_proj.view()),
+        ],
+    )?;
     let whole = RowSpan::all(n_tok);
     match (io.states, io.trail) {
         (GdnStates::Chunk(one), None) => {
             conv(backend, gdn, geometry, scratch, one.conv, whole)?;
             normalize(backend, geometry, scratch, n_tok)?;
-            gates(backend, gdn, geometry, scratch, input, n_tok)?;
+            gates(backend, gdn, geometry, scratch, n_tok)?;
             recurrence(backend, geometry, scratch, shape, one.state, whole)?;
         }
         (GdnStates::Chunk(one), Some(trail)) => {
@@ -464,7 +473,7 @@ pub(super) fn run(
             // reached yet.
             conv_recorded(backend, gdn, geometry, scratch, one.conv, trail.conv, n_tok)?;
             normalize(backend, geometry, scratch, n_tok)?;
-            gates(backend, gdn, geometry, scratch, input, n_tok)?;
+            gates(backend, gdn, geometry, scratch, n_tok)?;
             // One launch that writes every row's record as it goes, where the
             // variant has a recording twin; the per-row walk otherwise. The two
             // leave the same bits in the trail and in the state.
@@ -507,7 +516,7 @@ pub(super) fn run(
                 conv(backend, gdn, geometry, scratch, row.conv, RowSpan::one(at))?;
             }
             normalize(backend, geometry, scratch, n_tok)?;
-            gates(backend, gdn, geometry, scratch, input, n_tok)?;
+            gates(backend, gdn, geometry, scratch, n_tok)?;
             for (at, row) in rows.iter().enumerate() {
                 let at = u32::try_from(at).unwrap_or(u32::MAX);
                 recurrence(
@@ -535,7 +544,6 @@ pub(super) fn run(
             });
         }
     }
-    projection::projection(backend, &gdn.gate, n_tok, input, scratch.z.view())?;
     out_gate(backend, gdn, geometry, scratch, n_tok)?;
     projection::projection(backend, &gdn.out, n_tok, scratch.gated.view(), io.block_out)
 }

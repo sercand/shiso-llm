@@ -76,6 +76,22 @@ pub struct AffineTriple<'a> {
     pub biases: &'a [u8],
     /// Layout describing how to unpack the triple.
     pub layout: MlxAffineLayout,
+    /// The half-precision format the scales and biases are stored in.
+    pub scale_format: ScaleFormat,
+}
+
+/// The half-precision format a packed affine weight's scales and biases are
+/// stored in.
+///
+/// Both are two bytes a value and nothing in the bytes says which, so it is
+/// carried beside them: a kernel that read one as the other would decode
+/// numbers right to three digits and wrong in the fourth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleFormat {
+    /// Brain floats, what MLX writes by default.
+    Bf16,
+    /// IEEE half precision, what a re-encoding of `f16`-scaled blocks keeps.
+    F16,
 }
 
 /// A packed affine weight in the binding layer's order: borrowed from the
@@ -90,6 +106,8 @@ pub struct PackedAffine<'a> {
     pub biases: Cow<'a, [u8]>,
     /// Layout describing how to unpack the triple.
     pub layout: MlxAffineLayout,
+    /// The half-precision format the scales and biases are stored in.
+    pub scale_format: ScaleFormat,
 }
 
 /// Architecture this container reports, matching the name the binding binds.
@@ -562,6 +580,7 @@ impl SafetensorsFile {
                 scales: self.bytes(scales)?,
                 biases: self.bytes(biases)?,
                 layout: *layout,
+                scale_format: scale_format(scales.dtype),
             })),
             Plan::Widen { .. } => Ok(None),
         }
@@ -597,6 +616,7 @@ impl SafetensorsFile {
                 scales: Cow::Borrowed(triple.scales),
                 biases: Cow::Borrowed(triple.biases),
                 layout: triple.layout,
+                scale_format: triple.scale_format,
             }));
         };
         let layout = triple.layout;
@@ -641,6 +661,7 @@ impl SafetensorsFile {
             scales: Cow::Owned(scales.iter().flat_map(|w| w.to_le_bytes()).collect()),
             biases: Cow::Owned(biases.iter().flat_map(|w| w.to_le_bytes()).collect()),
             layout,
+            scale_format: triple.scale_format,
         }))
     }
 
@@ -717,6 +738,13 @@ impl SafetensorsFile {
                 biases,
                 layout,
             } => {
+                if scales.dtype != StDType::Bf16 {
+                    return Err(GgufError::LayoutMismatch {
+                        tensor: entry.desc.name.clone(),
+                        want: Box::from("BF16 scales, the only ones the host decode reads"),
+                        got: Box::from("F16 scales, which are read packed only"),
+                    });
+                }
                 let mut values = Vec::new();
                 dequant_affine(
                     self.bytes(weight)?,
@@ -885,25 +913,24 @@ fn shard_files(dir: &Path, names: &dyn NameMap) -> GgufResult<Vec<String>> {
 }
 
 fn resolve_arch(config: &CheckpointConfig) -> String {
-    if let Some(mt) = &config.model_type {
+    // The document's own type first, then its text subtree's: a wrapper type
+    // that names no family this reader knows (a rotated export names its
+    // storage scheme there) still carries the family in the subtree.
+    let known = |mt: &str| {
         if mt.starts_with("qwen3") {
-            return "qwen35".to_string();
+            Some("qwen35".to_string())
+        } else if mt.starts_with("gemma4") {
+            Some("gemma4".to_string())
+        } else {
+            None
         }
-        if mt.starts_with("gemma4") {
-            return "gemma4".to_string();
-        }
-        return mt.clone();
-    }
-    if let Some(tc) = &config.text_config {
-        if tc.model_type.starts_with("qwen3") {
-            return "qwen35".to_string();
-        }
-        if tc.model_type.starts_with("gemma4") {
-            return "gemma4".to_string();
-        }
-        return tc.model_type.clone();
-    }
-    ARCH.to_string()
+    };
+    let top = config.model_type.as_deref();
+    let text = config.text_config.as_ref().map(|tc| tc.model_type.as_str());
+    top.and_then(known)
+        .or_else(|| text.and_then(known))
+        .or_else(|| top.or(text).map(str::to_string))
+        .unwrap_or_else(|| ARCH.to_string())
 }
 
 /// Groups the raw arrays into tensors and translates each one.
@@ -1114,6 +1141,20 @@ fn packed_entry(
             HeadPermute::new(axis, heads, rows, cols, base)
         })
         .transpose()?;
+    // One format for both arrays: a triple reports one `ScaleFormat`, so a
+    // file that stored its scales in one half format and its biases in the
+    // other would have every group's bias decoded as the wrong one.
+    let (scales, biases) = (half_source(base, scales)?, half_source(base, biases)?);
+    if scales.dtype != biases.dtype {
+        return Err(GgufError::LayoutMismatch {
+            tensor: base.into(),
+            want: Box::from("scales and biases in the same half format"),
+            got: Box::from(format!(
+                "{:?} scales, {:?} biases",
+                scales.dtype, biases.dtype
+            )),
+        });
+    }
     Ok(Entry {
         desc: TensorDesc {
             name: role.gguf.as_str().into(),
@@ -1129,8 +1170,8 @@ fn packed_entry(
                 end: raw.data_offsets[1],
                 dtype: StDType::U32,
             },
-            scales: bf16_source(base, scales)?,
-            biases: bf16_source(base, biases)?,
+            scales,
+            biases,
             layout,
         },
         permute,
@@ -1164,28 +1205,36 @@ fn companion<'a>(
         })
 }
 
-/// Turns a companion array into a source, insisting it is `bf16`.
+/// Turns a companion array into a source, insisting it is `bf16` or `f16`.
 ///
-/// The decode reads scales and biases as `bf16` because that is what the format
-/// stores. An `f16` array here would decode to numbers that look right to three
-/// digits and are wrong in the fourth, so the format is checked rather than
-/// guessed.
-fn bf16_source(base: &str, array: (usize, &RawTensor)) -> GgufResult<Source> {
+/// Which one is recorded rather than assumed: the two are the same width, and
+/// a reader that took one for the other would decode numbers that look right
+/// to three digits and are wrong in the fourth. The host decode reads `bf16`
+/// only and refuses the other; the packed path hands the format on.
+fn half_source(base: &str, array: (usize, &RawTensor)) -> GgufResult<Source> {
     let (shard, raw) = array;
-    let dtype = StDType::parse(&raw.dtype).filter(|&dtype| dtype == StDType::Bf16);
-    if dtype.is_none() {
-        return Err(GgufError::LayoutMismatch {
+    let dtype = StDType::parse(&raw.dtype)
+        .filter(|&dtype| matches!(dtype, StDType::Bf16 | StDType::F16))
+        .ok_or_else(|| GgufError::LayoutMismatch {
             tensor: base.into(),
-            want: Box::from("BF16 scales and biases"),
+            want: Box::from("BF16 or F16 scales and biases"),
             got: Box::from(raw.dtype.as_str()),
-        });
-    }
+        })?;
     Ok(Source {
         shard,
         start: raw.data_offsets[0],
         end: raw.data_offsets[1],
-        dtype: StDType::Bf16,
+        dtype,
     })
+}
+
+/// The scale format a [`half_source`] recorded.
+fn scale_format(dtype: StDType) -> ScaleFormat {
+    if dtype == StDType::F16 {
+        ScaleFormat::F16
+    } else {
+        ScaleFormat::Bf16
+    }
 }
 
 /// Reads a rank-2 shape, which is the only rank a packed triple can have.

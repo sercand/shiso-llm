@@ -62,6 +62,10 @@ const INTERVAL_KEY: &str = "full_attention_interval";
 /// projections are usually wider than the rest, and the small vectors are kept
 /// in `f32`. Rejecting a file because it uses one format everywhere would make
 /// the loader useless on real checkpoints.
+///
+/// The nine sub-4-bit formats at the end are the mixed set of the Saluki
+/// export, where even a gate/up pair of one width arrives in two different
+/// codecs; each role keeps its own, which is what the loader dispatches on.
 pub const WEIGHT_TYPES: &[DType] = &[
     DType::F32,
     DType::F16,
@@ -71,6 +75,17 @@ pub const WEIGHT_TYPES: &[DType] = &[
     DType::Q4_K,
     DType::Q5_K,
     DType::Q6_K,
+    DType::Pq2_0,
+    DType::Ptq1_0,
+    DType::Q2_K,
+    DType::IQ2_XXS,
+    DType::IQ2_XS,
+    DType::IQ2_S,
+    DType::IQ3_XXS,
+    DType::IQ3_S,
+    DType::IQ1_S,
+    DType::IQ1_M,
+    DType::IQ4_XS,
 ];
 
 /// Formats a normalization or control vector may be stored in.
@@ -669,7 +684,8 @@ fn key(suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Dims;
+    use super::{Dims, WEIGHT_TYPES};
+    use shiso_core::DType;
     use shiso_engine::shape::{
         Activation, AttnLayer, GdnShape, HybridShape, LayerKind, MediaPositions, NormScheme,
     };
@@ -745,6 +761,32 @@ mod tests {
                 "the refusal says what was missing: {got}"
             ),
             other => panic!("expected an empty-profile refusal, got {other:?}"),
+        }
+    }
+
+    /// The binder accepts the nine mixed i-quant formats of the Saluki export.
+    ///
+    /// The binder is where a format is refused before any weight is read, so a
+    /// list that misses one turns a legitimate checkpoint into a load error
+    /// naming a perfectly good tensor.
+    #[test]
+    fn weight_types_include_the_mixed_i_quants() {
+        for dtype in [
+            DType::Q2_K,
+            DType::IQ2_XXS,
+            DType::IQ2_XS,
+            DType::IQ2_S,
+            DType::IQ3_XXS,
+            DType::IQ3_S,
+            DType::IQ1_S,
+            DType::IQ1_M,
+            DType::IQ4_XS,
+        ] {
+            assert!(
+                WEIGHT_TYPES.contains(&dtype),
+                "a weight matrix stored in {} is a format this family ships",
+                dtype.type_name()
+            );
         }
     }
 }

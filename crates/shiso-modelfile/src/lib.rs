@@ -15,7 +15,7 @@
 //! | [`reader`] | header, metadata table, tensor directory, the mapping |
 //! | [`metadata`] | key/value metadata, lazily decoded arrays, compat getters |
 //! | [`quant`] | one `#[repr(C)]` struct per quant block format, block sizing |
-//! | [`quant_tables`] | the fixed lookup tables the 2-bit and 4-bit formats use |
+//! | [`quant_tables`] | the fixed codebook tables the non-linear and `i`-quant formats use |
 //! | [`source`] | the one trait a role mapping needs from a container |
 //! | [`st_header`] | the safetensors container itself: header, spans, formats |
 //! | [`safetensors`] | the MLX/OptiQ export: affine triples, role translation |
@@ -68,6 +68,7 @@
 )]
 
 pub mod fp8;
+pub mod iq_quant;
 pub mod metadata;
 pub mod mlx_quant;
 pub mod modelfile;
@@ -80,6 +81,7 @@ pub mod reader;
 pub mod safetensors;
 pub mod source;
 pub mod st_header;
+pub mod ternary;
 
 pub use fp8::{Fp8Layout, dequant_fp8, e4m3, quantize_activations, to_e4m3};
 pub use metadata::{GgufMetadata, MetaArray, MetaType, MetaValue};
@@ -90,5 +92,5 @@ pub use name_map::{GdnHeads, HeadAxis, HeadPermute, IdentityNames, NameMap, Role
 pub use nvfp4::{Nvfp4Layout, dequant_nvfp4};
 pub use quant::QuantBlock;
 pub use reader::{GgufError, GgufFile, GgufResult, MAX_DIMS, TensorDesc, TensorShape, TensorView};
-pub use safetensors::{AffineTriple, PackedAffine, SafetensorsFile};
+pub use safetensors::{AffineTriple, PackedAffine, SafetensorsFile, ScaleFormat};
 pub use source::TensorSource;

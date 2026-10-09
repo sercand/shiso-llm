@@ -209,13 +209,18 @@ pub fn run(
             });
         }
     };
-    projection::projection(backend, &ffn.up, n_tok, input, up_out)?;
     let Some(gate) = gate else {
+        projection::projection(backend, &ffn.up, n_tok, input, up_out)?;
         let n = u32::try_from(inner.saturating_mul(u64::from(n_tok))).unwrap_or(u32::MAX);
         relu2(backend, up_out, mid, n)?;
         return projection::projection(backend, &ffn.down, n_tok, mid, block_out);
     };
-    projection::projection(backend, gate, n_tok, input, gate_out)?;
+    projection::projections(
+        backend,
+        n_tok,
+        input,
+        &[(&ffn.up, up_out), (gate, gate_out)],
+    )?;
     for itok in 0..n_tok {
         let offset = u64::from(itok).saturating_mul(row_bytes);
         activation_row(

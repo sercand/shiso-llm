@@ -1,0 +1,27 @@
+# The `ternary` module: the blockwise rotation a rotated checkpoint's
+# activations pass through, and the matmuls over its ternary and 2-bit affine
+# weights.
+#
+# ONE translation unit, because a module name is the key of a separately
+# compiled image and the engine dispatches the whole set under
+# `launch::TERNARY = "ternary"`. `ternary.cu` includes the focused `.cuh`
+# pieces and is the whole of the module.
+#
+# Nothing here is a byte copy of anything: the arithmetic is the Metal twins'
+# in `crates/shiso-metal/metal/ternary`, graded by the same
+# `shiso-kerneltest::ternary` cases.
+
+[build]
+sources = ["ternary.cu"]
+
+# The headers reach only their own directory.
+includes = ["cuda/ternary"]
+
+# No `--use_fast_math`: the rotation's 1/sqrt(block) is exact at every block
+# size it accepts, and the oracles grade these kernels to a few ulps.
+base_flags = ["-O3", "-g", "-lineinfo"]
+
+arch = ["compute_80"]
+
+[modules]
+ternary = "ternary"

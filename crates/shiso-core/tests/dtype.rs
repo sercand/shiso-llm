@@ -8,7 +8,7 @@
 use shiso_core::DType;
 
 /// Every variant, so the round-trip test cannot silently skip one.
-const ALL: [DType; 20] = [
+const ALL: [DType; 29] = [
     DType::F32,
     DType::F16,
     DType::Q4_0,
@@ -21,14 +21,23 @@ const ALL: [DType; 20] = [
     DType::Q6_K,
     DType::Q8_K,
     DType::IQ2_XXS,
+    DType::IQ2_XS,
+    DType::IQ3_XXS,
+    DType::IQ1_S,
     DType::IQ4_NL,
+    DType::IQ3_S,
+    DType::IQ2_S,
+    DType::IQ4_XS,
     DType::I32,
+    DType::IQ1_M,
     DType::BF16,
     DType::MXFP4,
     DType::Exl3K4,
     DType::Exl3K5,
     DType::Exl3K6,
     DType::Exl3Ngram6,
+    DType::Pq2_0,
+    DType::Ptq1_0,
 ];
 
 #[test]
@@ -50,7 +59,7 @@ fn on_disk_ids_are_unique() {
 
 #[test]
 fn discriminants_are_the_documented_ids() {
-    let expected: [(DType, u32); 20] = [
+    let expected: [(DType, u32); 29] = [
         (DType::F32, 0),
         (DType::F16, 1),
         (DType::Q4_0, 2),
@@ -63,14 +72,23 @@ fn discriminants_are_the_documented_ids() {
         (DType::Q6_K, 14),
         (DType::Q8_K, 15),
         (DType::IQ2_XXS, 16),
+        (DType::IQ2_XS, 17),
+        (DType::IQ3_XXS, 18),
+        (DType::IQ1_S, 19),
         (DType::IQ4_NL, 20),
+        (DType::IQ3_S, 21),
+        (DType::IQ2_S, 22),
+        (DType::IQ4_XS, 23),
         (DType::I32, 26),
+        (DType::IQ1_M, 29),
         (DType::BF16, 30),
         (DType::MXFP4, 39),
         (DType::Exl3K4, 68),
         (DType::Exl3K5, 69),
         (DType::Exl3K6, 70),
         (DType::Exl3Ngram6, 72),
+        (DType::Pq2_0, 142),
+        (DType::Ptq1_0, 143),
     ];
     for (dtype, id) in expected {
         assert_eq!(dtype.gguf_id(), id);
@@ -93,12 +111,22 @@ fn unknown_id_is_none_rather_than_a_default() {
 
 #[test]
 fn block_dimensions_of_the_formats_that_matter() {
-    let pinned: [(DType, u32, u32); 5] = [
+    let pinned: [(DType, u32, u32); 15] = [
+        (DType::Pq2_0, 128, 34),
+        (DType::Ptq1_0, 128, 28),
+        (DType::MlxAffine2Gs128, 128, 36),
         (DType::Q8_0, 32, 34),
         (DType::Q4_K, 256, 144),
         (DType::MXFP4, 32, 17),
         (DType::IQ2_XXS, 256, 66),
         (DType::Exl3Ngram6, 160, 122),
+        (DType::IQ2_XS, 256, 74),
+        (DType::IQ3_XXS, 256, 98),
+        (DType::IQ1_S, 256, 50),
+        (DType::IQ3_S, 256, 110),
+        (DType::IQ2_S, 256, 82),
+        (DType::IQ4_XS, 256, 136),
+        (DType::IQ1_M, 256, 56),
     ];
     for (dtype, elems, bytes) in pinned {
         assert_eq!(dtype.block_elems().get(), elems, "{dtype:?} elems");
@@ -147,4 +175,19 @@ fn type_names_are_lowercase_and_distinct() {
         assert!(!seen.contains(&name), "{name} repeated");
         seen.push(name);
     }
+}
+
+#[test]
+fn ternary_and_two_bit_affine_are_told_apart() {
+    // The two ternary blocks carry their scale inside the block; the MLX
+    // 2-bit type keeps scales and biases in arrays of their own, which is why
+    // it answers the affine question and they do not.
+    for dtype in [DType::Pq2_0, DType::Ptq1_0] {
+        assert!(dtype.is_ternary(), "{dtype:?}");
+        assert!(!dtype.is_affine(), "{dtype:?}");
+        assert_eq!(dtype.affine_bits(), None, "{dtype:?}");
+    }
+    assert!(DType::MlxAffine2Gs128.is_affine());
+    assert!(!DType::MlxAffine2Gs128.is_ternary());
+    assert_eq!(DType::MlxAffine2Gs128.affine_bits(), Some(2));
 }

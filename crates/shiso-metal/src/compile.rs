@@ -26,6 +26,15 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "00_common.metal",
         include_str!("../metal/generic/00_common.metal"),
     ),
+    // The i-quant codebook tables, before every file that reads them:
+    // `get_rows.metal` decodes IQ1_M rows through `IQ1S_GRID` and
+    // `mul_mv_ext.metal` decodes all nine formats through the grids, and the
+    // library is one translation unit, so the declarations have to precede
+    // both.
+    (
+        "iq_tables.metal",
+        include_str!("../metal/generic/iq_tables.metal"),
+    ),
     ("norm.metal", include_str!("../metal/generic/norm.metal")),
     (
         "softmax.metal",
@@ -300,6 +309,24 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         include_str!("../metal/flux2/flux2_common.h"),
     ),
     ("flux2.metal", include_str!("../metal/flux2/flux2.metal")),
+    // --- ternary kernel set (rotated ternary checkpoints); appended, nothing
+    // above this line changed. The header first, as for every other set.
+    (
+        "ternary_common.h",
+        include_str!("../metal/ternary/ternary_common.h"),
+    ),
+    (
+        "ternary/rotate.metal",
+        include_str!("../metal/ternary/rotate.metal"),
+    ),
+    (
+        "ternary/ternary_mv.metal",
+        include_str!("../metal/ternary/ternary_mv.metal"),
+    ),
+    (
+        "ternary/ternary_mm.metal",
+        include_str!("../metal/ternary/ternary_mm.metal"),
+    ),
 ];
 
 /// Concatenates every source into the one translation unit the device compiles.
