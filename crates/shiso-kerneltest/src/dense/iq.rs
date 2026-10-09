@@ -377,18 +377,24 @@ impl Codes {
 /// is an `Inf` or a `NaN` about one block in a hundred - which would compare
 /// unequal to itself and fail the case for a reason that has nothing to do
 /// with a kernel. The scale is the only field with a float interpretation,
-/// so it is the only field that is not left random.
-const D_SCALES: [u16; 4] = [0x3C00, 0x3800, 0x4000, 0x2C00];
-/// The same, for `q2_K`'s second scale field.
-const DMIN_SCALES: [u16; 4] = [0x3400, 0x3000, 0x4400, 0x2800];
+/// so it is the only field that is not left random - but pinning it to
+/// powers of two would hold every mantissa bit of the scale path at zero,
+/// so all four values (1.5, 0.75, 2.5, 1.125) carry a nonzero mantissa.
+const D_SCALES: [u16; 4] = [0x3E00, 0x3A00, 0x4100, 0x3C80];
+/// The same, for `q2_K`'s second scale field. `dmin` is that format's
+/// signed component, so the table mixes signs (-1.5, 1.25, -0.75, 3.0) and
+/// the fixture exercises the `f16` sign path as well as the mantissa.
+const DMIN_SCALES: [u16; 4] = [0xBE00, 0x3D00, 0xBA00, 0x4200];
 
 /// Pins one block's scale field(s) to finite `f16` patterns, leaving every
 /// code, sign and index byte random.
 ///
 /// `q2_K` keeps its two `f16`s at the end of the block. `iq1_m` stores no
-/// `f16` at all: it is the four top nibbles of the odd scale bytes, so those
-/// nibbles are pinned and the 3-bit multiplier bits below them stay random.
-/// Every other format stores its `f16` as the block's first two bytes.
+/// `f16` at all: it is assembled from the four top nibbles of the odd scale
+/// bytes, so only those nibbles are written and every other bit of the
+/// scale words stays random - including the multiplier bits, whose top two
+/// bits live in the even bytes the pinning does not touch. Every other
+/// format stores its `f16` as the block's first two bytes.
 fn pin_scales(fmt: &Format, block: &mut [u8], index: usize) {
     let d = D_SCALES[index % D_SCALES.len()];
     match fmt.dtype {
@@ -398,7 +404,6 @@ fn pin_scales(fmt: &Format, block: &mut [u8], index: usize) {
         }
         DType::IQ1_M => {
             for word in 0..4 {
-                block[48 + 2 * word] &= 0x3F;
                 block[48 + 2 * word + 1] =
                     (block[48 + 2 * word + 1] & 0x0F) | (((d >> (4 * word)) & 0xF) as u8) << 4;
             }
@@ -429,8 +434,8 @@ fn random_blocks(fmt: &Format, count: usize, seed: u64) -> Vec<u8> {
     }
     let or_all = bytes.iter().fold(0u8, |acc, &b| acc | b);
     let and_all = bytes.iter().fold(0xFFu8, |acc, &b| acc & b);
-    assert_eq!(or_all, 0xFF, "{} fixture never sets a code bit", fmt.tag,);
-    assert_eq!(and_all, 0x00, "{} fixture always sets a code bit", fmt.tag,);
+    assert_eq!(or_all, 0xFF, "{} fixture never sets a code bit", fmt.tag);
+    assert_eq!(and_all, 0x00, "{} fixture always sets a code bit", fmt.tag);
     bytes
 }
 
