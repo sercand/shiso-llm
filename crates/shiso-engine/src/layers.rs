@@ -715,10 +715,9 @@ pub struct EmbedKernel {
 impl EmbedKernel {
     /// The gather for `dtype`, or `None` when no kernel reads that format.
     ///
-    /// The five that exist share `GetRowsArgs` exactly, which is what makes one
-    /// launch site enough; a sixth format would need its own argument block and
-    /// would therefore need its own launch, so this returns `None` rather than
-    /// guessing.
+    /// The six that share `GetRowsArgs` exactly are what makes one launch site
+    /// enough; a seventh format with its own argument block would need its own
+    /// launch, so this returns `None` rather than guessing.
     ///
     /// The `f16` entry is the odd one, because it is the only unpacked table
     /// here. It is what a directory checkpoint arrives as: its vocabulary table
@@ -748,6 +747,13 @@ impl EmbedKernel {
             DType::Q4_0 => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_q4_0_f32",
+            }),
+            // The Saluki export stores its vocabulary table in `iq1_m`; the
+            // gather takes the same argument block as the other five, so it
+            // needs the pair and no new launch.
+            DType::IQ1_M => Some(Self {
+                module: launch::GENERIC,
+                entry: "kernel_get_rows_iq1_m_f32",
             }),
             DType::MlxAffine4Gs64 => Some(Self {
                 module: launch::DENSE,
@@ -2332,4 +2338,22 @@ pub(crate) fn logits_row(
         softcap_row(backend, dst, geometry.vocab, cap)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmbedKernel;
+    use crate::launch;
+    use shiso_core::DType;
+
+    #[test]
+    fn the_iq1_m_embedding_reads_the_generic_gather() {
+        // The Saluki export stores its vocabulary table in `iq1_m`, so the
+        // gather is the one entry point that format has; the pair is what the
+        // load records and the launch replays, and a misspelling here is a
+        // driver failure at the first embed, not a compile error.
+        let kernel = EmbedKernel::for_dtype(DType::IQ1_M).expect("the iq1_m gather exists");
+        assert_eq!(kernel.entry, "kernel_get_rows_iq1_m_f32");
+        assert_eq!(kernel.module, launch::GENERIC);
+    }
 }

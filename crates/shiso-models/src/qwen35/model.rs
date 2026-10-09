@@ -74,6 +74,10 @@ use crate::qwen35::rotation::{MLX_FILE as MLX_ROTATION, Rotated, RotationPlan};
 /// A tensor outside this list ends the load rather than selecting a slower path:
 /// a model that quietly ran a dequantized copy of one tensor would produce logits
 /// nobody can attribute to a kernel.
+///
+/// The nine sub-4-bit formats at the end are the mixed set of the Saluki export,
+/// accepted as a set: that file pairs a gate in one codec with an up projection
+/// in another, so a list holding some of them would refuse the file anyway.
 const SUPPORTED: &[DType] = &[
     DType::F32,
     DType::F16,
@@ -83,6 +87,15 @@ const SUPPORTED: &[DType] = &[
     DType::Q6_K,
     DType::Pq2_0,
     DType::Ptq1_0,
+    DType::Q2_K,
+    DType::IQ2_XXS,
+    DType::IQ2_XS,
+    DType::IQ2_S,
+    DType::IQ3_XXS,
+    DType::IQ3_S,
+    DType::IQ1_S,
+    DType::IQ1_M,
+    DType::IQ4_XS,
 ];
 
 /// A loaded checkpoint of this family.
@@ -875,5 +888,36 @@ impl shiso_core::model::Speculating for Qwen35Model {
     ) -> CoreResult<()> {
         let _ = block;
         self.stack.settle_verified(session, accepted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SUPPORTED;
+    use shiso_core::DType;
+
+    /// The nine mixed i-quant formats of the Saluki export, accepted together
+    /// or not at all: a loader that takes the gate's `iq1_s` but refuses the
+    /// up projection's `iq1_m` cannot load the file at all, so a partial list
+    /// is no list.
+    #[test]
+    fn the_loader_accepts_the_mixed_i_quant_formats() {
+        for dtype in [
+            DType::Q2_K,
+            DType::IQ2_XXS,
+            DType::IQ2_XS,
+            DType::IQ2_S,
+            DType::IQ3_XXS,
+            DType::IQ3_S,
+            DType::IQ1_S,
+            DType::IQ1_M,
+            DType::IQ4_XS,
+        ] {
+            assert!(
+                SUPPORTED.contains(&dtype),
+                "the family must accept a weight stored in {}",
+                dtype.type_name()
+            );
+        }
     }
 }

@@ -1332,6 +1332,91 @@ const EXT_Q6_K: [Option<&str>; 5] = [
     Some("kernel_mul_mv_ext_q6_K_f32_r1_5"),
 ];
 
+/// The `q2_K` instantiations, the widest of the sub-4-bit formats the Saluki
+/// export mixes.
+const EXT_Q2_K: [Option<&str>; 5] = [
+    Some("kernel_mul_mv_ext_q2_K_f32_r1_1"),
+    Some("kernel_mul_mv_ext_q2_K_f32_r1_2"),
+    Some("kernel_mul_mv_ext_q2_K_f32_r1_3"),
+    Some("kernel_mul_mv_ext_q2_K_f32_r1_4"),
+    Some("kernel_mul_mv_ext_q2_K_f32_r1_5"),
+];
+
+/// The `iq2_xxs` instantiations.
+const EXT_IQ2_XXS: [Option<&str>; 5] = [
+    Some("kernel_mul_mv_ext_iq2_xxs_f32_r1_1"),
+    Some("kernel_mul_mv_ext_iq2_xxs_f32_r1_2"),
+    Some("kernel_mul_mv_ext_iq2_xxs_f32_r1_3"),
+    Some("kernel_mul_mv_ext_iq2_xxs_f32_r1_4"),
+    Some("kernel_mul_mv_ext_iq2_xxs_f32_r1_5"),
+];
+
+/// The `iq2_xs` instantiations.
+const EXT_IQ2_XS: [Option<&str>; 5] = [
+    Some("kernel_mul_mv_ext_iq2_xs_f32_r1_1"),
+    Some("kernel_mul_mv_ext_iq2_xs_f32_r1_2"),
+    Some("kernel_mul_mv_ext_iq2_xs_f32_r1_3"),
+    Some("kernel_mul_mv_ext_iq2_xs_f32_r1_4"),
+    Some("kernel_mul_mv_ext_iq2_xs_f32_r1_5"),
+];
+
+/// The `iq2_s` instantiations.
+const EXT_IQ2_S: [Option<&str>; 5] = [
+    Some("kernel_mul_mv_ext_iq2_s_f32_r1_1"),
+    Some("kernel_mul_mv_ext_iq2_s_f32_r1_2"),
+    Some("kernel_mul_mv_ext_iq2_s_f32_r1_3"),
+    Some("kernel_mul_mv_ext_iq2_s_f32_r1_4"),
+    Some("kernel_mul_mv_ext_iq2_s_f32_r1_5"),
+];
+
+/// The `iq3_xxs` instantiations.
+const EXT_IQ3_XXS: [Option<&str>; 5] = [
+    Some("kernel_mul_mv_ext_iq3_xxs_f32_r1_1"),
+    Some("kernel_mul_mv_ext_iq3_xxs_f32_r1_2"),
+    Some("kernel_mul_mv_ext_iq3_xxs_f32_r1_3"),
+    Some("kernel_mul_mv_ext_iq3_xxs_f32_r1_4"),
+    Some("kernel_mul_mv_ext_iq3_xxs_f32_r1_5"),
+];
+
+/// The `iq3_s` instantiations.
+const EXT_IQ3_S: [Option<&str>; 5] = [
+    Some("kernel_mul_mv_ext_iq3_s_f32_r1_1"),
+    Some("kernel_mul_mv_ext_iq3_s_f32_r1_2"),
+    Some("kernel_mul_mv_ext_iq3_s_f32_r1_3"),
+    Some("kernel_mul_mv_ext_iq3_s_f32_r1_4"),
+    Some("kernel_mul_mv_ext_iq3_s_f32_r1_5"),
+];
+
+/// The `iq1_s` instantiations, the narrowest format the export stores a
+/// projection in.
+const EXT_IQ1_S: [Option<&str>; 5] = [
+    Some("kernel_mul_mv_ext_iq1_s_f32_r1_1"),
+    Some("kernel_mul_mv_ext_iq1_s_f32_r1_2"),
+    Some("kernel_mul_mv_ext_iq1_s_f32_r1_3"),
+    Some("kernel_mul_mv_ext_iq1_s_f32_r1_4"),
+    Some("kernel_mul_mv_ext_iq1_s_f32_r1_5"),
+];
+
+/// The `iq1_m` instantiations, which the export pairs with `iq1_s` at the same
+/// role width: a gate and an up projection of one shape in two codecs, which is
+/// why each dispatches off its own table rather than a shared one.
+const EXT_IQ1_M: [Option<&str>; 5] = [
+    Some("kernel_mul_mv_ext_iq1_m_f32_r1_1"),
+    Some("kernel_mul_mv_ext_iq1_m_f32_r1_2"),
+    Some("kernel_mul_mv_ext_iq1_m_f32_r1_3"),
+    Some("kernel_mul_mv_ext_iq1_m_f32_r1_4"),
+    Some("kernel_mul_mv_ext_iq1_m_f32_r1_5"),
+];
+
+/// The `iq4_xs` instantiations, the 4-bit end of the mixed set.
+const EXT_IQ4_XS: [Option<&str>; 5] = [
+    Some("kernel_mul_mv_ext_iq4_xs_f32_r1_1"),
+    Some("kernel_mul_mv_ext_iq4_xs_f32_r1_2"),
+    Some("kernel_mul_mv_ext_iq4_xs_f32_r1_3"),
+    Some("kernel_mul_mv_ext_iq4_xs_f32_r1_4"),
+    Some("kernel_mul_mv_ext_iq4_xs_f32_r1_5"),
+];
+
 /// One plain-matvec launch: the entry point plus the geometry it was compiled
 /// for.
 ///
@@ -1490,6 +1575,18 @@ pub const fn ext_name(dtype: DType, r1ptg: u32) -> Option<&'static str> {
         DType::Q8_0 => EXT_Q8_0,
         DType::Q5_K => EXT_Q5_K,
         DType::Q6_K => EXT_Q6_K,
+        // The mixed i-quant set of the Saluki export: every one of them is
+        // instantiated at all five row blockings, so none of these tables has
+        // a `None` slot the way `q8_0`'s does.
+        DType::Q2_K => EXT_Q2_K,
+        DType::IQ2_XXS => EXT_IQ2_XXS,
+        DType::IQ2_XS => EXT_IQ2_XS,
+        DType::IQ2_S => EXT_IQ2_S,
+        DType::IQ3_XXS => EXT_IQ3_XXS,
+        DType::IQ3_S => EXT_IQ3_S,
+        DType::IQ1_S => EXT_IQ1_S,
+        DType::IQ1_M => EXT_IQ1_M,
+        DType::IQ4_XS => EXT_IQ4_XS,
         // `f16` has no extended instantiation on either backend, and a row here
         // named four kernels no library holds: every chunk of two to five tokens
         // over an `f16` weight failed in the driver. It takes the plain matvec
@@ -1999,8 +2096,8 @@ pub(crate) fn plain_consts_static(nsg: u32) -> Option<&'static [FnConst]> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXT_NSG_INDEX, PLAIN_NSG_CAP, PLAIN_ROWS, PLAIN_SHORT_ROWS, PLAIN_SMEM_BYTES, TensorDesc,
-        WARP, plain_block, plain_consts, plain_mv, plain_mv_grid,
+        EXT_NSG_INDEX, GENERIC, PLAIN_NSG_CAP, PLAIN_ROWS, PLAIN_SHORT_ROWS, PLAIN_SMEM_BYTES,
+        TensorDesc, WARP, ext_module, ext_name, plain_block, plain_consts, plain_mv, plain_mv_grid,
     };
     use shiso_core::backend::FnConstValue;
     use shiso_core::dtype::DType;
@@ -2161,5 +2258,55 @@ mod tests {
     #[should_panic(expected = "simdgroup count fits i16")]
     fn a_simdgroup_count_that_cannot_be_a_short_is_a_bug() {
         assert!(plain_consts(u32::from(u16::MAX)).is_empty());
+    }
+
+    /// The nine mixed i-quant formats of the Saluki export, each with the tag
+    /// its kernel entry point spells between `ext_` and `_f32`.
+    ///
+    /// The tags are written out rather than derived from [`DType::type_name`]
+    /// because `q2_K` is the one format whose entry point does not spell the
+    /// format the way the dtype names itself: a derivation would have renamed
+    /// every `q2_K` entry to lowercase, and the miss would surface as a driver
+    /// failure at launch rather than here.
+    const SALUKI_MATVEC_TAGS: [(DType, &str); 9] = [
+        (DType::Q2_K, "q2_K"),
+        (DType::IQ2_XXS, "iq2_xxs"),
+        (DType::IQ2_XS, "iq2_xs"),
+        (DType::IQ2_S, "iq2_s"),
+        (DType::IQ3_XXS, "iq3_xxs"),
+        (DType::IQ3_S, "iq3_s"),
+        (DType::IQ1_S, "iq1_s"),
+        (DType::IQ1_M, "iq1_m"),
+        (DType::IQ4_XS, "iq4_xs"),
+    ];
+
+    #[test]
+    fn the_mixed_i_quants_dispatch_at_every_row_blocking() {
+        for (dtype, tag) in SALUKI_MATVEC_TAGS {
+            for r1ptg in 1..=5 {
+                let want = format!("kernel_mul_mv_ext_{tag}_f32_r1_{r1ptg}");
+                assert_eq!(
+                    ext_name(dtype, r1ptg),
+                    Some(want.as_str()),
+                    "{dtype:?} at {r1ptg} rows per threadgroup must name the entry point \
+                     the generic kernel set exports"
+                );
+            }
+            assert_eq!(
+                ext_name(dtype, 0),
+                None,
+                "{dtype:?} has no zero-row table slot"
+            );
+            assert_eq!(
+                ext_name(dtype, 6),
+                None,
+                "{dtype:?} is not instantiated at six rows per threadgroup"
+            );
+            assert_eq!(
+                ext_module(dtype),
+                GENERIC,
+                "{dtype:?} was compiled into the generic set, not the qwen35 one"
+            );
+        }
     }
 }
