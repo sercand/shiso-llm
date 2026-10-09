@@ -26,7 +26,7 @@ use shiso_vision::generator::ImageGenError;
 use super::{BLOCK, G64_K, G64_THREADS, G64_TILE, Ops, grid_for};
 
 /// The norm's floor on the per-pixel L2 norm (the reference normalizes with
-/// the default `F.normalize` epsilon).
+/// its default normalization epsilon).
 pub(crate) const CHANNEL_NORM_EPS: f32 = 1e-12;
 
 #[repr(C)]

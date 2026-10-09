@@ -25,7 +25,7 @@
 //! left live at full resolution is the residual stream, one convolution's
 //! output and the block's shortcut source.
 //!
-//! The checkpoint stores BF16 in the original (non-`diffusers`) layout and
+//! The checkpoint stores BF16 in the original layout (not the reference implementation's renamed one) and
 //! names: `conv2` is `post_quant_conv`, `decoder.conv1` is `conv_in`,
 //! `decoder.middle.{0,1,2}` the mid block, `decoder.upsamples.<i>.upsamples.<j>`
 //! the up blocks' resnets (`residual.{0,2,3,6}` = norm1, conv1, norm2,
@@ -470,7 +470,7 @@ impl QwenVae {
     /// # Errors
     /// [`ImageGenError::Checkpoint`] for a missing or misshapen tensor, a
     /// config this decoder does not implement (not residual, patchified, a
-    /// spatial factor other than 16), or latent statistics that do not fit;
+    /// spatial factor other than 16, an output other than RGBA), or latent statistics that do not fit;
     /// [`ImageGenError::Backend`] when an upload fails.
     #[expect(
         clippy::too_many_lines,
@@ -664,6 +664,12 @@ impl QwenVae {
             )));
         }
         let gamma_out = load_gamma(&store, ops, "decoder.head.0.gamma", width)?;
+        if conv_out.out_c != 4 {
+            return Err(ImageGenError::Checkpoint(format!(
+                "decoder.head.2 emits {} channels; the RGBA image takes 4",
+                conv_out.out_c
+            )));
+        }
 
         let plan = DecodePlan {
             z_dim,
@@ -725,7 +731,7 @@ impl QwenVae {
     /// with an optional observer of intermediate stages.
     ///
     /// # Errors
-    /// As [`QwenVae::decode`], plus a channel count other than four.
+    /// As [`QwenVae::decode`].
     #[expect(
         clippy::too_many_lines,
         reason = "the decoder's stage graph, straight-line by construction"
@@ -880,11 +886,6 @@ impl QwenVae {
             spatial,
         })?;
         let out_c = self.conv_out.out_c;
-        if out_c != 4 {
-            return Err(ImageGenError::Checkpoint(format!(
-                "the decoder emits {out_c} channels; the RGBA image takes 4"
-            )));
-        }
         let rgba = ops.alloc_f32(step, out_c * spatial)?;
         ops.vae_conv(&VaeConvCall {
             step,
