@@ -675,6 +675,7 @@ impl DiT {
             head_dim,
             txt_stride: 3 * h,
             img_stride: 3 * h,
+            causal: false,
         })?;
         if ctx.input.kv_mode == KvMode::Extract && ctx.refs > 0 {
             let cache = ops.alloc_owned_f32("dit kv cache", ctx.refs * 3 * h)?;
@@ -841,6 +842,7 @@ impl DiT {
             head_dim,
             txt_stride: fused,
             img_stride: fused,
+            causal: false,
         })?;
         if ctx.input.kv_mode == KvMode::Extract && ctx.refs > 0 {
             let cache = ops.alloc_owned_f32("dit single kv cache", ctx.refs * fused)?;

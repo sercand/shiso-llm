@@ -27,7 +27,7 @@ use shiso_core::{
     Backend, DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs, alloc,
 };
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::diffusion::{int8, vae};
+use shiso_kerneltest::diffusion::{int8, prefix, vae};
 use shiso_metal::MetalBackend;
 
 /// The module every diffusion entry lives under.
@@ -58,6 +58,10 @@ const ENTRIES: &[&str] = &[
     "kernel_dit_add_f32",
     "kernel_dit_axpy_f32",
     "kernel_dit_layer_norm_f32",
+    "kernel_dit_tanh_f32",
+    "kernel_dit_gelu_tanh_f32",
+    "kernel_dit_qk_norm_rope_f32",
+    "kernel_dit_flash_sdpa_causal_f32",
     "kernel_dit_rmsnorm_f32",
     "kernel_dit_qk_norm_f32",
     "kernel_dit_concat_rows_f32",
@@ -3221,6 +3225,38 @@ fn every_vae_case_entry_is_registered() {
         assert!(
             ENTRIES.contains(&entry),
             "{entry} is launched by the VAE cases but missing from ENTRIES"
+        );
+    }
+}
+
+// --- prefix-cached transformer: the shared cases in `shiso-kerneltest` -------
+
+/// One ignored wrapper per shared prefix case.
+macro_rules! prefix_cases {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[test]
+            #[ignore = "requires a Metal device"]
+            fn $name() {
+                let Some(gpu) = open_gpu() else { return };
+                prefix::$name(&gpu);
+            }
+        )*
+    };
+}
+
+prefix_cases!(
+    flash_sdpa_causal_masks_every_later_key,
+    qk_norm_rope_normalizes_then_turns_adjacent_pairs,
+    tanh_and_gelu_tanh_match_their_formulas,
+);
+
+#[test]
+fn every_prefix_case_entry_is_registered() {
+    for entry in prefix::ENTRIES {
+        assert!(
+            ENTRIES.contains(&entry),
+            "{entry} is launched by the prefix cases but missing from ENTRIES"
         );
     }
 }

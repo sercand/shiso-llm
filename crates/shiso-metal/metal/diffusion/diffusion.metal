@@ -29,6 +29,39 @@ kernel void kernel_dit_silu_f32(
     out[i] = dit_silu(in[i]);
 }
 
+/// `out[i] = tanh(in[i])`: the shared modulation's residual gates. The
+/// precise form, because the library compiles under fast math and a gate
+/// multiplies every block's whole branch.
+kernel void kernel_dit_tanh_f32(
+        constant dit_args_unary & args [[buffer(0)]],
+        device float *out                [[buffer(1)]],
+        device const float *in           [[buffer(2)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint i = tgpig.x * DIT_BLOCK + tpitg.x;
+    if (i >= args.count) {
+        return;
+    }
+    out[i] = precise::tanh(in[i]);
+}
+
+/// `out[i] = gelu(in[i])` in the tanh form:
+/// `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`.
+kernel void kernel_dit_gelu_tanh_f32(
+        constant dit_args_unary & args [[buffer(0)]],
+        device float *out                [[buffer(1)]],
+        device const float *in           [[buffer(2)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint i = tgpig.x * DIT_BLOCK + tpitg.x;
+    if (i >= args.count) {
+        return;
+    }
+    const float x = in[i];
+    const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    out[i] = 0.5f * x * (1.0f + precise::tanh(inner));
+}
+
 /// SiLU gate over a fused row: `out[r,i] = silu(in[r,i]) * in[r,inner+i]`.
 ///
 /// The gate is the FIRST half (the reference's gating chunks the
@@ -453,6 +486,61 @@ kernel void kernel_dit_qk_norm_f32(
         }
         // The second section's reduction reuses the scratch; hold until
         // every thread has consumed the first broadcast.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+/// Per-head RMS normalization with a per-dimension scale, then interleaved
+/// RoPE from a per-token angle table, over separate packed q and k buffers,
+/// in place: the QK-norm and rotation of a block whose projections are
+/// three separate linears.
+///
+/// One threadgroup per (token, head); each thread owns whole pairs
+/// `(x[2i], x[2i+1])`, so the rotation reads only values its own thread
+/// normalized. The pairs are adjacent (interleaved), not the two halves of
+/// the head. `cos`/`sin` are `(tokens, head_dim / 2)`.
+kernel void kernel_dit_qk_norm_rope_f32(
+        constant dit_args_qk_norm_rope & args [[buffer(0)]],
+        device float *q                          [[buffer(1)]],
+        device float *k                          [[buffer(2)]],
+        device const float *q_scale              [[buffer(3)]],
+        device const float *k_scale              [[buffer(4)]],
+        device const float *cos_t                [[buffer(5)]],
+        device const float *sin_t                [[buffer(6)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup float scratch[3];
+    const uint t = tgpig.x;
+    const uint h = tgpig.y;
+    const uint tid = tpitg.x;
+    if (t >= args.tokens || h >= args.heads) {
+        return;
+    }
+    const uint half_d = args.head_dim / 2u;
+    device const float *ct = cos_t + (uint64_t) t * half_d;
+    device const float *st = sin_t + (uint64_t) t * half_d;
+    for (uint section = 0u; section < 2u; section++) {
+        device float *row = section == 0u
+                ? q + (uint64_t) t * args.q_stride + h * args.head_dim
+                : k + (uint64_t) t * args.k_stride + h * args.head_dim;
+        device const float *scale = section == 0u ? q_scale : k_scale;
+        float part = 0.0f;
+        for (uint d = tid; d < args.head_dim; d += DIT_BLOCK) {
+            const float v = row[d];
+            part += v * v;
+        }
+        const float ms = dit_block_sum(part, scratch, tid) / float(args.head_dim);
+        const float inv = 1.0f / sqrt(ms + args.eps);
+        for (uint p = tid; p < half_d; p += DIT_BLOCK) {
+            const float x0 = row[2u * p] * inv * scale[2u * p];
+            const float x1 = row[2u * p + 1u] * inv * scale[2u * p + 1u];
+            const float c = ct[p];
+            const float s = st[p];
+            row[2u * p] = x0 * c - x1 * s;
+            row[2u * p + 1u] = x0 * s + x1 * c;
+        }
+        // The k section's reduction reuses the scratch; hold until every
+        // thread has consumed the q broadcast.
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
@@ -1372,22 +1460,31 @@ static inline half4 dit_half4_sat(float4 v) {
 /// Keys past the end are masked to -inf, so ragged sequence lengths need no
 /// special case. The softmax is the max-subtracted form the per-row kernel
 /// computes, accumulated block by block.
-kernel void kernel_dit_flash_sdpa_f32(
-        constant dit_args_sdpa & args [[buffer(0)]],
-        device float *out_txt            [[buffer(1)]],
-        device float *out_img            [[buffer(2)]],
-        device const float *q_txt        [[buffer(3)]],
-        device const float *k_txt        [[buffer(4)]],
-        device const float *v_txt        [[buffer(5)]],
-        device const float *q_img        [[buffer(6)]],
-        device const float *k_img        [[buffer(7)]],
-        device const float *v_img        [[buffer(8)]],
-        device const float *cache_k      [[buffer(9)]],
-        device const float *cache_v      [[buffer(10)]],
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        ushort tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
+///
+/// The causal instantiation (`kernel_dit_flash_sdpa_causal_f32`) masks every
+/// key after the query's own joint row (`s > t`) and stops streaming at the
+/// tile's last row, so a prefix of P rows costs half the score blocks of the
+/// bidirectional pass. The driver sends it no cached rows: a cached key
+/// sits after every live row and would always be masked.
+#define DIT_FLASH_SDPA_PARAMS \
+        constant dit_args_sdpa & args [[buffer(0)]], \
+        device float *out_txt            [[buffer(1)]], \
+        device float *out_img            [[buffer(2)]], \
+        device const float *q_txt        [[buffer(3)]], \
+        device const float *k_txt        [[buffer(4)]], \
+        device const float *v_txt        [[buffer(5)]], \
+        device const float *q_img        [[buffer(6)]], \
+        device const float *k_img        [[buffer(7)]], \
+        device const float *v_img        [[buffer(8)]], \
+        device const float *cache_k      [[buffer(9)]], \
+        device const float *cache_v      [[buffer(10)]], \
+        uint3 tgpig[[threadgroup_position_in_grid]], \
+        ushort tid [[thread_index_in_threadgroup]], \
+        ushort lane [[thread_index_in_simdgroup]], \
+        ushort sg [[simdgroup_index_in_threadgroup]]
+
+template <bool CAUSAL>
+kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
     const uint QR = DIT_FA_QROWS;
     const uint KB = DIT_FA_KEYS;
     const uint NB = KB / 8u;
@@ -1402,7 +1499,9 @@ kernel void kernel_dit_flash_sdpa_f32(
     const uint hd = args.head_dim;
     const uint nd = hd / 8u;
     const uint rows = args.txt_tokens + args.img_tokens;
-    const uint keys = rows + args.cache_tokens;
+    // A causal tile's last row sees no key past itself, so the stream stops
+    // there; rows past the end stage zero queries and are never written.
+    const uint keys = CAUSAL ? min(rows, q0 + QR) : rows + args.cache_tokens;
     if (h >= args.heads) {
         return;
     }
@@ -1429,6 +1528,9 @@ kernel void kernel_dit_flash_sdpa_f32(
     // The lane's place in every 8x8 fragment: columns `fn, fn + 1` of one
     // row; the four lanes sharing a row differ in lane bits 0 and 3.
     const ushort fn = ((lane / 4u) & 2u) * 2u + (lane % 2u) * 2u;
+    // ...and its row: lane bits 1-2 and 4. The causal mask compares the
+    // key's joint index against this query row's.
+    const uint qrow = q0 + sg * 8u + ((lane / 4u) & 4u) + ((lane / 2u) % 4u);
     float run_max = -INFINITY;
     float run_sum = 0.0f;
     threadgroup half *sk = kv;
@@ -1489,7 +1591,8 @@ kernel void kernel_dit_flash_sdpa_f32(
         float block_max = -INFINITY;
         DIT_UNROLL for (uint b = 0; b < NB; ++b) {
             DIT_UNROLL for (uint c = 0; c < 2u; ++c) {
-                if (s0 + 8u * b + fn + c >= keys) {
+                const uint key = s0 + 8u * b + fn + c;
+                if (key >= keys || (CAUSAL && key > qrow)) {
                     sf[b].thread_elements()[c] = -INFINITY;
                 }
                 block_max = max(block_max, sf[b].thread_elements()[c]);
@@ -1547,6 +1650,12 @@ kernel void kernel_dit_flash_sdpa_f32(
         }
     }
 }
+
+template [[host_name("kernel_dit_flash_sdpa_f32")]]
+kernel void kernel_dit_flash_sdpa<false>(DIT_FLASH_SDPA_PARAMS);
+
+template [[host_name("kernel_dit_flash_sdpa_causal_f32")]]
+kernel void kernel_dit_flash_sdpa<true>(DIT_FLASH_SDPA_PARAMS);
 
 // --- fused linear: swiglu/concat input, gated-residual output --------------------
 

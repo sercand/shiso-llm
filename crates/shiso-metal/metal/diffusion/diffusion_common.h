@@ -263,6 +263,19 @@ struct dit_args_qk_norm {
     float eps;
 };
 
+/// Per-head RMS normalization with a per-dimension scale, then interleaved
+/// RoPE from a per-token table, over separate packed q and k buffers, in
+/// place. `cos`/`sin` hold `head_dim / 2` angles per token: pair `i` of a
+/// head, `(x[2i], x[2i+1])`, turns by the angle in column `i`.
+struct dit_args_qk_norm_rope {
+    uint32_t tokens;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t q_stride;
+    uint32_t k_stride;
+    float eps;
+};
+
 /// Row-wise concatenation: `out[r] = [a[r], b[r]]`.
 struct dit_args_concat {
     uint32_t rows;
@@ -417,6 +430,7 @@ static_assert(sizeof(dit_args_axpy) == 8, "AxpyArgs");
 static_assert(sizeof(dit_args_norm) == 12, "NormArgs");
 static_assert(sizeof(dit_args_softmax) == 12, "SoftmaxArgs");
 static_assert(sizeof(dit_args_qk_norm) == 20, "QkNormArgs");
+static_assert(sizeof(dit_args_qk_norm_rope) == 24, "QkNormRopeArgs");
 static_assert(sizeof(dit_args_concat) == 12, "ConcatArgs");
 static_assert(sizeof(dit_args_sdpa) == 44, "SdpaArgs");
 static_assert(sizeof(dit_args_gqa) == 16, "GqaArgs");

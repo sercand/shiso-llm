@@ -369,6 +369,7 @@ fn sdpa_reads_q_k_and_v_from_their_own_sections() {
         head_dim: HEAD_DIM,
         txt_stride: FUSED,
         img_stride: FUSED,
+        causal: false,
     })
     .expect("the host sdpa twin runs");
 
@@ -427,6 +428,7 @@ fn sdpa_cached_rows_use_the_section_offsets() {
         head_dim: HEAD_DIM,
         txt_stride: FUSED,
         img_stride: FUSED,
+        causal: false,
     })
     .expect("the host sdpa twin runs");
 

@@ -194,6 +194,17 @@ struct QkNormArgs {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct QkNormRopeArgs {
+    tokens: u32,
+    heads: u32,
+    head_dim: u32,
+    q_stride: u32,
+    k_stride: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct ConcatArgs {
     rows: u32,
     cols_a: u32,
@@ -328,6 +339,7 @@ const _: () = assert!(size_of::<UpsampleArgs>() == 16);
 const _: () = assert!(size_of::<NormArgs>() == 12);
 const _: () = assert!(size_of::<SoftmaxArgs>() == 12);
 const _: () = assert!(size_of::<QkNormArgs>() == 20);
+const _: () = assert!(size_of::<QkNormRopeArgs>() == 24);
 const _: () = assert!(size_of::<ConcatArgs>() == 12);
 const _: () = assert!(size_of::<GroupNormArgs>() == 24);
 const _: () = assert!(size_of::<Rope4dArgs>() == 28);
@@ -516,6 +528,10 @@ pub(crate) struct SdpaCall<'a> {
     /// Elements per token row in the strided q/k/v buffers (a fused qkv row).
     pub txt_stride: usize,
     pub img_stride: usize,
+    /// Mask every key after the query's own joint row (`s > t`): a
+    /// prefix whose rows never see later ones. Refused with cached rows,
+    /// which sit after every live row and would always be masked.
+    pub causal: bool,
 }
 
 /// Grouped-query causal attention (the text encoder's prefill).
@@ -601,6 +617,28 @@ pub(crate) struct QkNormCall<'a> {
     pub heads: usize,
     pub head_dim: usize,
     pub row_stride: usize,
+    pub eps: f32,
+}
+
+/// QK-norm then interleaved `RoPE` from a per-token angle table, in place,
+/// over separate packed q and k buffers (a block whose q, k and v come from
+/// three separate linears). Pair `i` of a head, `(x[2i], x[2i+1])`, turns
+/// by the angle whose cosine and sine are column `i` of `cos`/`sin`, each
+/// `(tokens, head_dim / 2)`.
+pub(crate) struct QkNormRopeCall<'a> {
+    pub step: &'static str,
+    pub q: DeviceView<'a>,
+    pub k: DeviceView<'a>,
+    pub q_scale: DeviceView<'a>,
+    pub k_scale: DeviceView<'a>,
+    pub cos: DeviceView<'a>,
+    pub sin: DeviceView<'a>,
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    /// Elements per token row of each buffer.
+    pub q_stride: usize,
+    pub k_stride: usize,
     pub eps: f32,
 }
 
@@ -776,6 +814,10 @@ const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_gemm64_fp8",
     "kernel_dit_conv2d_gemm_f32",
     "kernel_dit_flash_sdpa_f32",
+    "kernel_dit_flash_sdpa_causal_f32",
+    "kernel_dit_tanh_f32",
+    "kernel_dit_gelu_tanh_f32",
+    "kernel_dit_qk_norm_rope_f32",
     "kernel_dit_gemm64_fused_f32",
     "kernel_dit_gemm64_fused_bf16",
     "kernel_dit_gemm64_fused_fp8",
@@ -1029,6 +1071,28 @@ impl Ops {
         count: usize,
     ) -> Result<(), ImageGenError> {
         self.elementwise(step, "kernel_dit_silu_f32", count, &[out, input])
+    }
+
+    /// out[i] = tanh(input[i]).
+    pub(crate) fn tanh(
+        &self,
+        step: &'static str,
+        out: DeviceView<'_>,
+        input: DeviceView<'_>,
+        count: usize,
+    ) -> Result<(), ImageGenError> {
+        self.elementwise(step, "kernel_dit_tanh_f32", count, &[out, input])
+    }
+
+    /// out[i] = gelu(input[i]), tanh approximation.
+    pub(crate) fn gelu_tanh(
+        &self,
+        step: &'static str,
+        out: DeviceView<'_>,
+        input: DeviceView<'_>,
+        count: usize,
+    ) -> Result<(), ImageGenError> {
+        self.elementwise(step, "kernel_dit_gelu_tanh_f32", count, &[out, input])
     }
 
     /// `SwiGLU` over a fused row: out[r, i] = silu(in[r, i]) * in[r, inner + i].
@@ -1546,6 +1610,40 @@ impl Ops {
         )
     }
 
+    /// QK-norm then table `RoPE` on separate q and k buffers, in place (see
+    /// [`QkNormRopeCall`]).
+    pub(crate) fn qk_norm_rope(&self, call: &QkNormRopeCall<'_>) -> Result<(), ImageGenError> {
+        if !call.head_dim.is_multiple_of(2) {
+            return Err(ImageGenError::Backend(format!(
+                "{}: a {}-wide head has no whole rotation pairs",
+                call.step, call.head_dim
+            )));
+        }
+        let args = QkNormRopeArgs {
+            tokens: call.tokens as u32,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+            q_stride: call.q_stride as u32,
+            k_stride: call.k_stride as u32,
+            eps: call.eps,
+        };
+        self.launch(
+            call.step,
+            "kernel_dit_qk_norm_rope_f32",
+            Extent3::new(call.tokens as u32, call.heads as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.q),
+                KernelArg::Buffer(call.k),
+                KernelArg::Buffer(call.q_scale),
+                KernelArg::Buffer(call.k_scale),
+                KernelArg::Buffer(call.cos),
+                KernelArg::Buffer(call.sin),
+            ],
+        )
+    }
+
     /// Row-wise concatenation: out[r] = [a[r], b[r]], both sides packed.
     pub(crate) fn concat_rows(&self, call: &ConcatCall<'_>) -> Result<(), ImageGenError> {
         let args = ConcatArgs {
@@ -1601,9 +1699,20 @@ impl Ops {
         let rows = (call.txt_tokens + call.img_tokens) as u32;
         // The fused kernel holds a head as 8x8 fragments in registers; the
         // transformer's 128-wide heads qualify, the VAE's 512-wide one does not.
-        let (entry, grid, block) = if call.head_dim.is_multiple_of(8) && call.head_dim <= FA_MAX_D {
+        let flash = call.head_dim.is_multiple_of(8) && call.head_dim <= FA_MAX_D;
+        if call.causal && (call.cache_tokens > 0 || !flash) {
+            return Err(ImageGenError::Backend(format!(
+                "{}: causal attention takes no cached rows and needs a head of at most {FA_MAX_D} in multiples of 8 (got {} cached rows, head {})",
+                call.step, call.cache_tokens, call.head_dim
+            )));
+        }
+        let (entry, grid, block) = if flash {
             (
-                "kernel_dit_flash_sdpa_f32",
+                if call.causal {
+                    "kernel_dit_flash_sdpa_causal_f32"
+                } else {
+                    "kernel_dit_flash_sdpa_f32"
+                },
                 Extent3::new(grid_for(rows, FA_QROWS), call.heads as u32, 1),
                 Extent3::linear(FA_THREADS),
             )
@@ -1641,6 +1750,10 @@ impl Ops {
     #[expect(
         clippy::cast_precision_loss,
         reason = "dimensions converted for attention math are small tensor extents, far below f32's exact-integer range"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the oracle's one straight-line pass over every row, head and key, kept whole so it reads against the kernel"
     )]
     pub(crate) fn sdpa_host(&self, call: &SdpaCall<'_>) -> Result<(), ImageGenError> {
         let txt = call.txt_tokens;
@@ -1686,7 +1799,13 @@ impl Ops {
                     (&q_img, (t - txt) * call.img_stride + call.q_offset + h * hd)
                 };
                 let mut scores = Vec::with_capacity(txt + img + call.cache_tokens);
+                // A causal key past the query's own row scores -inf, which
+                // the max-subtracted exponent turns into an exact zero.
                 for s in 0..(txt + img) {
+                    if call.causal && s > t {
+                        scores.push(f32::NEG_INFINITY);
+                        continue;
+                    }
                     let (ksrc, krow) = if s < txt {
                         (&k_txt, s * call.txt_stride + call.k_offset + h * hd)
                     } else {
