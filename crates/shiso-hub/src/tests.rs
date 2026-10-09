@@ -628,6 +628,84 @@ fn image_assets_role_is_a_directory_beside_an_image() {
     assert!(validate_recipe(&recipe, ValidationMode::Strict).is_err());
 }
 
+/// An image variant whose text encoder and VAE are files of one more repository
+/// bound to their roles, as a single-repo image recipe ships them.
+fn split_image_variant() -> Variant {
+    let mut variant = image_variant();
+    variant.components.remove(&Role::ImageAssets);
+    let image = variant.components.get_mut(&Role::Image).unwrap();
+    let sha = image.files[0].sha256.clone();
+    for (name, role) in [
+        ("te.safetensors", Role::ImageTextEncoder),
+        ("vae.safetensors", Role::ImageVae),
+    ] {
+        image.files.push(FileEntry {
+            name: name.to_string(),
+            size: 10,
+            sha256: sha.clone(),
+            binds: Some(role),
+        });
+    }
+    variant.requirements.disk_bytes = 30;
+    variant
+}
+
+#[test]
+fn image_text_encoder_and_vae_roles_bind_files_beside_an_image() {
+    assert_eq!(
+        "image_text_encoder".parse::<Role>().unwrap(),
+        Role::ImageTextEncoder
+    );
+    assert_eq!("image_vae".parse::<Role>().unwrap(), Role::ImageVae);
+    assert_eq!(Role::ImageTextEncoder.flag_name(), "--image-text-encoder");
+    assert_eq!(Role::ImageVae.flag_name(), "--image-vae");
+
+    let mut recipe = make_test_recipe();
+    let variant = split_image_variant();
+    let paths = variant.role_paths().unwrap();
+    assert_eq!(paths[&Role::ImageTextEncoder].file, Some("te.safetensors"));
+    assert_eq!(paths[&Role::ImageVae].file, Some("vae.safetensors"));
+    recipe.variants = vec![variant];
+    validate_recipe(&recipe, ValidationMode::Strict).unwrap();
+
+    // Neither has anything to feed without an image model.
+    for role in [Role::ImageTextEncoder, Role::ImageVae] {
+        let mut variant = split_image_variant();
+        let image = variant.components.remove(&Role::Image).unwrap();
+        let mut stray = image.clone();
+        stray.entry = None;
+        stray.files.retain(|f| f.binds == Some(role));
+        variant.components.insert(Role::Vision, stray);
+        variant.components.insert(
+            Role::Base,
+            make_test_recipe().variants[0].components[&Role::Base].clone(),
+        );
+        recipe.variants = vec![variant];
+        let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+        assert!(err.to_string().contains(role.as_str()), "{err}");
+    }
+
+    // A directory is not a file the loader can open.
+    let mut variant = image_variant();
+    variant.components.insert(
+        Role::ImageTextEncoder,
+        variant.components[&Role::ImageAssets].clone(),
+    );
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("image_text_encoder"), "{err}");
+
+    // One role, one source.
+    let mut variant = split_image_variant();
+    let mut vae = variant.components[&Role::Image].clone();
+    vae.entry = None;
+    vae.files.retain(|f| f.binds == Some(Role::ImageVae));
+    variant.components.insert(Role::ImageVae, vae);
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("image_vae"), "{err}");
+}
+
 #[test]
 fn info_and_quality_are_checked() {
     use crate::recipe::{CardSource, CommitSha, ModelInfo, QualityScope, QualityScore};

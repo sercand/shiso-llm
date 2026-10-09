@@ -397,6 +397,15 @@ pub enum Role {
     /// FP8 export: the directory holds the `text_encoder`, `vae`, `tokenizer`
     /// and `transformer/config.json` the generator reads beside the weights.
     ImageAssets,
+    /// Text encoder weights file (`--image-text-encoder`).
+    ///
+    /// For an image checkpoint whose text encoder is a single file of another
+    /// repository, so no assets directory carries it. Names a file.
+    ImageTextEncoder,
+    /// VAE weights file (`--image-vae`).
+    ///
+    /// The counterpart of [`Role::ImageTextEncoder`] for the VAE. Names a file.
+    ImageVae,
     /// Per-layer n-gram embedding table (`--ngram`).
     ///
     /// For a checkpoint that keeps the table in a file of its own rather than
@@ -425,6 +434,8 @@ impl Role {
             Self::Diarization => "--diarization-model",
             Self::Image => "--image-model",
             Self::ImageAssets => "--image-assets-dir",
+            Self::ImageTextEncoder => "--image-text-encoder",
+            Self::ImageVae => "--image-vae",
             Self::Ngram => "--ngram",
             Self::Config => "--config",
         }
@@ -443,6 +454,8 @@ impl Role {
             Self::Diarization => "diarization",
             Self::Image => "image",
             Self::ImageAssets => "image_assets",
+            Self::ImageTextEncoder => "image_text_encoder",
+            Self::ImageVae => "image_vae",
             Self::Ngram => "ngram",
             Self::Config => "config",
         }
@@ -468,6 +481,8 @@ impl FromStr for Role {
             "diarization" => Ok(Self::Diarization),
             "image" => Ok(Self::Image),
             "image_assets" => Ok(Self::ImageAssets),
+            "image_text_encoder" => Ok(Self::ImageTextEncoder),
+            "image_vae" => Ok(Self::ImageVae),
             "ngram" => Ok(Self::Ngram),
             "config" => Ok(Self::Config),
             _ => Err(HubError::Validation {

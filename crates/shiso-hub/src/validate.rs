@@ -3,12 +3,12 @@
 //! Enforces structural, component, role dependency, and path-safety rules
 //! for both client parsing and strict maintainer validation.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::error::HubError;
 use crate::recipe::{
-    CURRENT_SCHEMA_VERSION, Component, HUB_FILE_MAX_BYTES, Provider, Recipe, Role, Variant,
-    hub_file_name_ok,
+    CURRENT_SCHEMA_VERSION, Component, HUB_FILE_MAX_BYTES, Provider, Recipe, Role, RolePath,
+    Variant, hub_file_name_ok,
 };
 
 /// External family facts passed to validator to verify a recipe matches engine capabilities.
@@ -293,21 +293,20 @@ fn validate_single_variant(variant: &Variant, mode: ValidationMode) -> Result<()
     Ok(())
 }
 
-fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
-    // Roles a bound file supplies count exactly as a component's would: the
-    // server cannot tell the two apart, so neither can these rules.
-    let roles = variant.role_paths()?;
-    let has_base = roles.contains_key(&Role::Base);
-    let has_asr = roles.contains_key(&Role::Asr);
-    let has_draft = roles.contains_key(&Role::Draft);
-    let has_draft_vocab = roles.contains_key(&Role::DraftVocab);
-    let has_asr_mmproj = roles.contains_key(&Role::AsrMmproj);
-    let has_diarization = roles.contains_key(&Role::Diarization);
-    let has_image = roles.contains_key(&Role::Image);
-
-    // `--config` and `--ngram` name files; a directory there would be read as
+/// Whether each role names a file or a directory, as its flag expects.
+fn validate_role_shapes(
+    variant: &Variant,
+    roles: &BTreeMap<Role, RolePath<'_>>,
+) -> Result<(), HubError> {
+    // `--config`, `--ngram` and the split image weights name files; a directory there would be read as
     // one and fail at boot, so the recipe has to say which file it is.
-    for role in [Role::Config, Role::Ngram, Role::DraftVocab] {
+    for role in [
+        Role::Config,
+        Role::Ngram,
+        Role::DraftVocab,
+        Role::ImageTextEncoder,
+        Role::ImageVae,
+    ] {
         if let Some(place) = roles.get(&role)
             && place.file.is_none()
         {
@@ -331,6 +330,22 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
             ),
         });
     }
+    Ok(())
+}
+
+fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
+    // Roles a bound file supplies count exactly as a component's would: the
+    // server cannot tell the two apart, so neither can these rules.
+    let roles = variant.role_paths()?;
+    let has_base = roles.contains_key(&Role::Base);
+    let has_asr = roles.contains_key(&Role::Asr);
+    let has_draft = roles.contains_key(&Role::Draft);
+    let has_draft_vocab = roles.contains_key(&Role::DraftVocab);
+    let has_asr_mmproj = roles.contains_key(&Role::AsrMmproj);
+    let has_diarization = roles.contains_key(&Role::Diarization);
+    let has_image = roles.contains_key(&Role::Image);
+
+    validate_role_shapes(variant, &roles)?;
 
     if !has_base && !has_asr && !has_image {
         return Err(HubError::Validation {
@@ -388,6 +403,17 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
                 variant.key.as_str()
             ),
         });
+    }
+
+    for role in [Role::ImageTextEncoder, Role::ImageVae] {
+        if roles.contains_key(&role) && !has_image {
+            return Err(HubError::Validation {
+                reason: format!(
+                    "variant '{}' supplies '{role}' which requires 'image'",
+                    variant.key.as_str()
+                ),
+            });
+        }
     }
 
     if has_diarization && !has_asr {
