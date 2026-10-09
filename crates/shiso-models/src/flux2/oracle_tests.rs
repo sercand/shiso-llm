@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use shiso_core::{Backend, CoreError, CoreResult, DeviceView, KernelRef, LaunchArgs, RawBuffer};
 
-use super::ops::{Ops, Rope4dCall, SdpaCall};
 use super::rope::rope_4d_freqs;
+use crate::diffusion::ops::{Ops, Rope4dCall, SdpaCall};
 
 /// Two heads of eight dims: the smallest head that the 4-axis interleaved
 /// `RoPE` can rotate at all (one frequency pair per axis), so a wrong
@@ -463,7 +463,7 @@ fn ops_new_refuses_a_device_without_the_flux2_kernels() {
     let msg = err.to_string();
     // A sentinel from each end of the required list, so a probe that only
     // checked one entry (the old bug) cannot pass.
-    assert!(msg.contains("kernel_flux2_gemm_bf16"), "{msg}");
-    assert!(msg.contains("kernel_flux2_embed_bf16_f32"), "{msg}");
-    assert!(msg.contains("kernel_flux2_sdpa_f32"), "{msg}");
+    assert!(msg.contains("kernel_dit_gemm_bf16"), "{msg}");
+    assert!(msg.contains("kernel_dit_embed_bf16_f32"), "{msg}");
+    assert!(msg.contains("kernel_dit_sdpa_f32"), "{msg}");
 }

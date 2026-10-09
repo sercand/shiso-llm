@@ -1066,7 +1066,7 @@ static inline void audio_span_flash(
         // `S^T(key, item)` in, `S(item, key)` back: every lane reads exactly
         // what the same lane of each slice's simdgroup wrote. Threadgroup
         // barriers, not simdgroup ones, around the hand-off (see
-        // `kernel_flux2_flash_sdpa_f32` for what a simdgroup barrier let
+        // `kernel_dit_flash_sdpa_f32` for what a simdgroup barrier let
         // through on an M1 Max); the second keeps the next block's writes
         // from overtaking a slow reader.
         AUDIO_UNROLL for (uint b = 0; b < KB / 8u; ++b) {

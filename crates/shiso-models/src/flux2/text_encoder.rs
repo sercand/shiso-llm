@@ -24,9 +24,10 @@ use serde::Deserialize;
 use shiso_core::DeviceBuffer;
 use shiso_vision::generator::ImageGenError;
 
-use super::ops::{GemmCall, GqaCall, NormCall, Ops};
 use super::rope::rope_half_freqs;
-use super::weights::{Lin, StStore};
+use crate::diffusion::lin::Lin;
+use crate::diffusion::ops::{GemmCall, GqaCall, NormCall, Ops};
+use crate::diffusion::weights::StStore;
 
 /// The residual-stream layers whose hidden states condition the transformer:
 /// the reference taps `hidden_states[9]`, `[18]` and `[27]` with
@@ -259,7 +260,7 @@ impl TextEncoder {
 
         let ids_buf = ops.upload_u32("text ids", ids)?;
         let x = ops.alloc_f32("text embed", t * p.hidden)?;
-        ops.embed(&super::ops::EmbedCall {
+        ops.embed(&crate::diffusion::ops::EmbedCall {
             step: "text embed",
             out: x.view(),
             table: self.embed.view(),

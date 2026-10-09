@@ -30,12 +30,12 @@ use shiso_vision::generator::{
 
 use super::config::{Flux2Located, Flux2Params};
 use super::kv_cache::Flux2KvCache;
-use super::ops::Ops;
-use super::scheduler::FlowMatchEulerDiscreteScheduler;
+use super::scheduler::new_scheduler;
 use super::text_encoder::TextEncoder;
 use super::transformer::{DiT, DiTInput, KvMode};
 use super::vae::Vae;
-use super::weights::StStore;
+use crate::diffusion::ops::Ops;
+use crate::diffusion::weights::StStore;
 
 /// The text encoder reads at most this many prompt tokens.
 const MAX_TEXT_TOKENS: usize = 512;
@@ -393,7 +393,7 @@ impl ImageGenerator for Flux2KleinModel {
             .upload_f32("pipeline joint pos", &joint_positions)?;
 
         let mut kv = Flux2KvCache::new(self.params.depth, self.params.depth_single_blocks);
-        let scheduler = FlowMatchEulerDiscreteScheduler::new(t_img, steps);
+        let scheduler = new_scheduler(t_img, steps);
 
         // One step per scheduled timestep. The transformer's embedding
         // applies the reference's 1000x time factor itself, so it receives

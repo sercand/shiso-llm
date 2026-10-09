@@ -18,6 +18,7 @@ pub mod audio_ops;
 pub mod audio_registry;
 pub mod catalog;
 pub mod clef;
+pub(crate) mod diffusion;
 pub mod embedder;
 pub mod embedding_gemma2;
 pub mod flux2;

@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use super::config::*;
-use super::weights::StStore;
+use crate::diffusion::weights::{StStore, count_blocks_internal};
 
 #[test]
 fn count_blocks_from_tensor_map() {

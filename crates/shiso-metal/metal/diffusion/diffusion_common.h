@@ -1,9 +1,9 @@
-// Shared argument blocks and helpers for the flux2-klein kernel set.
+// Shared argument blocks and helpers for the diffusion DiT kernel set.
 //
-// This file is concatenated ahead of every other flux2 entry, so the kernels
+// This file is concatenated ahead of every other dit entry, so the kernels
 // may not redeclare a block or a helper. The field order of every struct is
 // the binding contract the driver mirrors
-// (`crates/shiso-models/src/flux2/ops.rs` marshals `#[repr(C)]` Pods with
+// (`crates/shiso-models/src/diffusion/ops.rs` marshals `#[repr(C)]` Pods with
 // `bytemuck::bytes_of`); a drift is a wrong number under load, so the sizes
 // are asserted here as well as on the host.
 //
@@ -15,38 +15,38 @@
 // Square tile of the GEMM kernels in every axis: 16x16 threads is one
 // threadgroup of 256 and two 1 KiB staging tiles, the shape the driver
 // launches (`GEMM_TILE` in ops.rs).
-#define FLUX2_GEMM_TILE 16u
+#define DIT_GEMM_TILE 16u
 
-// The simdgroup-matrix GEMM tile (`kernel_flux2_gemm64_*` and the implicit-
+// The simdgroup-matrix GEMM tile (`kernel_dit_gemm64_*` and the implicit-
 // GEMM convolution): a 64x64 output tile per threadgroup of 128 threads, four
 // simdgroups each owning a 32x32 quarter, k staged 16 at a time. The driver
 // sends only products whose reduction length is a multiple of the k slice
 // here and everything else to the 16x16 kernels.
-#define FLUX2_G64_TILE 64u
-#define FLUX2_G64_K 16u
-#define FLUX2_G64_THREADS 128u
+#define DIT_G64_TILE 64u
+#define DIT_G64_K 16u
+#define DIT_G64_THREADS 128u
 
-// The fused attention tile (`kernel_flux2_flash_sdpa_f32`): 32 query rows per
+// The fused attention tile (`kernel_dit_flash_sdpa_f32`): 32 query rows per
 // threadgroup of four simdgroups (eight rows each), keys streamed 32 at a
-// time, heads up to FLUX2_FA_MAX_D wide in multiples of eight. The driver
-// sends wider or ragged heads to `kernel_flux2_sdpa_f32`.
-#define FLUX2_FA_QROWS 32u
-#define FLUX2_FA_KEYS 32u
-#define FLUX2_FA_MAX_D 128u
-#define FLUX2_FA_THREADS 128u
+// time, heads up to DIT_FA_MAX_D wide in multiples of eight. The driver
+// sends wider or ragged heads to `kernel_dit_sdpa_f32`.
+#define DIT_FA_QROWS 32u
+#define DIT_FA_KEYS 32u
+#define DIT_FA_MAX_D 128u
+#define DIT_FA_THREADS 128u
 
-#define FLUX2_UNROLL _Pragma("clang loop unroll(full)")
+#define DIT_UNROLL _Pragma("clang loop unroll(full)")
 
 // Threads per elementwise threadgroup, as the driver launches it
 // (`BLOCK` in ops.rs). Every reduction here is sized for exactly this.
-#define FLUX2_BLOCK 64u
+#define DIT_BLOCK 64u
 
 // Partial slots per lane in the attention kernels: one per 64 head-dim
 // values a lane strides over, so this bounds head_dim at 512. The family's
 // heads are 128 wide, a quarter of the bound, and nothing here guards it:
 // a head wider than 512 would silently drop its tail, so the driver's
 // model config is what keeps head_dim inside the bound.
-#define FLUX2_ATTN_SLOTS 8u
+#define DIT_ATTN_SLOTS 8u
 
 /// One brain-float, widened.
 ///
@@ -54,14 +54,14 @@
 /// f32 rather than being cast through a native type: exact for every finite
 /// value, and the same widening the driver's host twin does on the fallback
 /// path, so the two read identical numbers.
-static inline float flux2_bf16(device const ushort *p) {
+static inline float dit_bf16(device const ushort *p) {
     return as_type<float>((uint)(*p) << 16);
 }
 
 /// One E4M3 byte as a float: 1 sign, 4 exponent (bias 7), 3 mantissa bits,
 /// no infinities, the all-ones pattern NaN. The exact inverse of the
 /// checkpoint's quantizer, and the same decode the driver's host twin runs.
-static inline float flux2_e4m3(uint b) {
+static inline float dit_e4m3(uint b) {
     const uint e = (b >> 3u) & 0xFu;
     const uint m = b & 7u;
     float v;
@@ -75,11 +75,11 @@ static inline float flux2_e4m3(uint b) {
     return (b & 0x80u) ? -v : v;
 }
 
-/// [`flux2_e4m3`] without branches, for the GEMM tile's staging loads:
+/// [`dit_e4m3`] without branches, for the GEMM tile's staging loads:
 /// normal values are rebuilt as f32 bits directly (exponent rebias 7 -> 127,
 /// mantissa shifted up), subnormals as `m * 2^-9`, the all-ones pattern NaN.
 /// Every byte decodes to the same float the branching form returns.
-static inline float flux2_e4m3_bits(uint b) {
+static inline float dit_e4m3_bits(uint b) {
     const uint e = (b >> 3u) & 0xFu;
     const uint m = b & 7u;
     float v = (e == 0u) ? float(m) * 0.001953125f
@@ -89,7 +89,7 @@ static inline float flux2_e4m3_bits(uint b) {
 }
 
 /// SiLU, in the host twin's own form (`x / (1 + exp(-x))`).
-static inline float flux2_silu(float x) {
+static inline float dit_silu(float x) {
     return x / (1.0f + exp(-x));
 }
 
@@ -101,7 +101,7 @@ static inline float flux2_silu(float x) {
 /// sequential fold - a lane-parallel reduction cannot reproduce that
 /// association - so the two are deterministic, not bit-identical, and the
 /// rounding difference stays far inside the 1e-4 parity tolerance.
-static inline float flux2_warp_sum(float v) {
+static inline float dit_warp_sum(float v) {
     for (uint off = 16u; off > 0u; off >>= 1u) {
         v += simd_shuffle_down(v, off);
     }
@@ -113,18 +113,18 @@ static inline float flux2_warp_sum(float v) {
 /// re-sums, thread 0 broadcasts through the last slot. `scratch` needs three
 /// floats and is passed in because an inlined helper has no threadgroup array
 /// of its own to keep.
-static inline float flux2_block_sum(float v, threadgroup float *scratch, uint tid) {
+static inline float dit_block_sum(float v, threadgroup float *scratch, uint tid) {
     const uint lane = tid & 31u;
     const uint warp = tid >> 5u;
-    v = flux2_warp_sum(v);
+    v = dit_warp_sum(v);
     if (lane == 0u) {
         scratch[warp] = v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint n_warp = FLUX2_BLOCK / 32u;
+    const uint n_warp = DIT_BLOCK / 32u;
     v = (tid < n_warp) ? scratch[tid] : 0.0f;
     if (warp == 0u) {
-        v = flux2_warp_sum(v);
+        v = dit_warp_sum(v);
     }
     if (tid == 0u) {
         scratch[n_warp] = v;
@@ -133,8 +133,8 @@ static inline float flux2_block_sum(float v, threadgroup float *scratch, uint ti
     return scratch[n_warp];
 }
 
-/// [`flux2_block_sum`]'s shape with `max` in place of `+`.
-static inline float flux2_block_max(float v, threadgroup float *scratch, uint tid) {
+/// [`dit_block_sum`]'s shape with `max` in place of `+`.
+static inline float dit_block_max(float v, threadgroup float *scratch, uint tid) {
     const uint lane = tid & 31u;
     const uint warp = tid >> 5u;
     v = simd_max(v);
@@ -142,7 +142,7 @@ static inline float flux2_block_max(float v, threadgroup float *scratch, uint ti
         scratch[warp] = v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint n_warp = FLUX2_BLOCK / 32u;
+    const uint n_warp = DIT_BLOCK / 32u;
     v = (tid < n_warp) ? scratch[tid] : -INFINITY;
     if (warp == 0u) {
         v = simd_max(v);
@@ -167,7 +167,7 @@ static inline float flux2_block_max(float v, threadgroup float *scratch, uint ti
 /// for a bound buffer's length, so the flag - never the bias values -
 /// decides whether the binding is read. `has_bias == 0` means the kernel
 /// must not read `bias` at all; `has_bias == 1` means it is a real vector.
-struct flux2_args_gemm {
+struct dit_args_gemm {
     uint32_t m;
     uint32_t n;
     uint32_t k;
@@ -180,7 +180,7 @@ struct flux2_args_gemm {
 /// staging - `g` at column `gu_offset` of a `gu_stride`-wide row of `gu`,
 /// `u` `inner` columns after it. Either part may be empty; `cols_a` and
 /// `inner` are multiples of four and their sum a multiple of 16.
-struct flux2_args_gemm_fused {
+struct dit_args_gemm_fused {
     uint32_t m;
     uint32_t n;
     uint32_t cols_a;
@@ -191,14 +191,14 @@ struct flux2_args_gemm_fused {
 };
 
 /// One elementwise pass over `count` values.
-struct flux2_args_unary {
+struct dit_args_unary {
     uint32_t count;
 };
 
 /// SiLU gate over a fused row: the gate is the FIRST half
 /// (`out[r,i] = silu(in[r,i]) * in[r,inner+i]`), read from a strided buffer
 /// whose view may start mid-row, and written packed.
-struct flux2_args_swiglu {
+struct dit_args_swiglu {
     uint32_t rows;
     uint32_t inner;
     uint32_t stride;
@@ -206,33 +206,33 @@ struct flux2_args_swiglu {
 
 /// AdaLN modulation: `out = x * (1 + scale) + shift`, the per-dimension
 /// vectors of `period` elements broadcast over the rows.
-struct flux2_args_modulate {
+struct dit_args_modulate {
     uint32_t count;
     uint32_t period;
 };
 
 /// Gated residual add: `out = a + gate * b`, `gate` broadcast over `period`.
-struct flux2_args_add_gated {
+struct dit_args_add_gated {
     uint32_t count;
     uint32_t period;
 };
 
 /// Euler latent update: `out = x + dt * v`.
-struct flux2_args_axpy {
+struct dit_args_axpy {
     uint32_t count;
     float dt;
 };
 
 /// Row normalization (`rmsnorm`, `layer_norm`) and, with `eps` unused, the
 /// (rows, dim) transpose.
-struct flux2_args_norm {
+struct dit_args_norm {
     uint32_t rows;
     uint32_t dim;
     float eps;
 };
 
 /// Row softmax of `scale * x`, in place, over `rows` rows of `cols`.
-struct flux2_args_softmax {
+struct dit_args_softmax {
     uint32_t rows;
     uint32_t cols;
     float scale;
@@ -240,7 +240,7 @@ struct flux2_args_softmax {
 
 /// Per-head RMS normalization with a per-dimension scale over the q and k
 /// head sections of fused qkv rows, in place.
-struct flux2_args_qk_norm {
+struct dit_args_qk_norm {
     uint32_t tokens;
     uint32_t heads;
     uint32_t head_dim;
@@ -249,7 +249,7 @@ struct flux2_args_qk_norm {
 };
 
 /// Row-wise concatenation: `out[r] = [a[r], b[r]]`.
-struct flux2_args_concat {
+struct dit_args_concat {
     uint32_t rows;
     uint32_t cols_a;
     uint32_t cols_b;
@@ -258,7 +258,7 @@ struct flux2_args_concat {
 /// Joint-sequence attention over fused or packed rows. Head `h` of a row
 /// starts at `row * stride + offset + h * head_dim` for each operand's own
 /// offset; the cached rows carry the same layout against `cache_stride`.
-struct flux2_args_sdpa {
+struct dit_args_sdpa {
     uint32_t txt_tokens;
     uint32_t img_tokens;
     uint32_t cache_tokens;
@@ -273,7 +273,7 @@ struct flux2_args_sdpa {
 };
 
 /// Causal grouped-query attention over packed rows (text encoder prefill).
-struct flux2_args_gqa {
+struct dit_args_gqa {
     uint32_t tokens;
     uint32_t q_heads;
     uint32_t kv_heads;
@@ -282,7 +282,7 @@ struct flux2_args_gqa {
 
 /// 4-axis interleaved RoPE on the q and k head sections of strided rows, in
 /// place, one launch for both.
-struct flux2_args_rope_4d {
+struct dit_args_rope_4d {
     uint32_t tokens;
     uint32_t heads;
     uint32_t head_dim;
@@ -293,15 +293,15 @@ struct flux2_args_rope_4d {
 };
 
 /// Rotate-half 1-axis RoPE on one packed (tokens, heads, head_dim) tensor.
-struct flux2_args_rope_half {
+struct dit_args_rope_half {
     uint32_t tokens;
     uint32_t heads;
     uint32_t head_dim;
 };
 
 /// One NCHW f32 convolution. `has_bias` is the presence contract from
-/// `flux2_args_gemm`.
-struct flux2_args_conv2d {
+/// `dit_args_gemm`.
+struct dit_args_conv2d {
     uint32_t batch;
     uint32_t in_c;
     uint32_t in_h;
@@ -318,7 +318,7 @@ struct flux2_args_conv2d {
 
 /// Group normalization; the affine buffers hold `num_groups *
 /// channels_per_group` elements, indexed by channel.
-struct flux2_args_group_norm {
+struct dit_args_group_norm {
     uint32_t batch;
     uint32_t num_groups;
     uint32_t channels_per_group;
@@ -329,7 +329,7 @@ struct flux2_args_group_norm {
 };
 
 /// Nearest-neighbour 2x upsampling of an NCHW field.
-struct flux2_args_upsample {
+struct dit_args_upsample {
     uint32_t batch;
     uint32_t channels;
     uint32_t h;
@@ -337,29 +337,29 @@ struct flux2_args_upsample {
 };
 
 /// Gather of a BF16 embedding table, widened to f32 on write.
-struct flux2_args_embed {
+struct dit_args_embed {
     uint32_t tokens;
     uint32_t hidden;
 };
 
 // The blocks and the driver's Pods are edited together; the host asserts the
 // same widths, and so does this side so a header-only drift fails the compile.
-static_assert(sizeof(flux2_args_gemm) == 16, "GemmArgs");
-static_assert(sizeof(flux2_args_unary) == 4, "UnaryArgs");
-static_assert(sizeof(flux2_args_gemm_fused) == 28, "GemmFusedArgs");
-static_assert(sizeof(flux2_args_swiglu) == 12, "SwigluArgs");
-static_assert(sizeof(flux2_args_modulate) == 8, "ModulateArgs");
-static_assert(sizeof(flux2_args_add_gated) == 8, "AddGatedArgs");
-static_assert(sizeof(flux2_args_axpy) == 8, "AxpyArgs");
-static_assert(sizeof(flux2_args_norm) == 12, "NormArgs");
-static_assert(sizeof(flux2_args_softmax) == 12, "SoftmaxArgs");
-static_assert(sizeof(flux2_args_qk_norm) == 20, "QkNormArgs");
-static_assert(sizeof(flux2_args_concat) == 12, "ConcatArgs");
-static_assert(sizeof(flux2_args_sdpa) == 44, "SdpaArgs");
-static_assert(sizeof(flux2_args_gqa) == 16, "GqaArgs");
-static_assert(sizeof(flux2_args_rope_4d) == 28, "Rope4dArgs");
-static_assert(sizeof(flux2_args_rope_half) == 12, "RopeHalfArgs");
-static_assert(sizeof(flux2_args_conv2d) == 48, "Conv2dArgs");
-static_assert(sizeof(flux2_args_group_norm) == 24, "GroupNormArgs");
-static_assert(sizeof(flux2_args_upsample) == 16, "UpsampleArgs");
-static_assert(sizeof(flux2_args_embed) == 8, "EmbedArgs");
+static_assert(sizeof(dit_args_gemm) == 16, "GemmArgs");
+static_assert(sizeof(dit_args_unary) == 4, "UnaryArgs");
+static_assert(sizeof(dit_args_gemm_fused) == 28, "GemmFusedArgs");
+static_assert(sizeof(dit_args_swiglu) == 12, "SwigluArgs");
+static_assert(sizeof(dit_args_modulate) == 8, "ModulateArgs");
+static_assert(sizeof(dit_args_add_gated) == 8, "AddGatedArgs");
+static_assert(sizeof(dit_args_axpy) == 8, "AxpyArgs");
+static_assert(sizeof(dit_args_norm) == 12, "NormArgs");
+static_assert(sizeof(dit_args_softmax) == 12, "SoftmaxArgs");
+static_assert(sizeof(dit_args_qk_norm) == 20, "QkNormArgs");
+static_assert(sizeof(dit_args_concat) == 12, "ConcatArgs");
+static_assert(sizeof(dit_args_sdpa) == 44, "SdpaArgs");
+static_assert(sizeof(dit_args_gqa) == 16, "GqaArgs");
+static_assert(sizeof(dit_args_rope_4d) == 28, "Rope4dArgs");
+static_assert(sizeof(dit_args_rope_half) == 12, "RopeHalfArgs");
+static_assert(sizeof(dit_args_conv2d) == 48, "Conv2dArgs");
+static_assert(sizeof(dit_args_group_norm) == 24, "GroupNormArgs");
+static_assert(sizeof(dit_args_upsample) == 16, "UpsampleArgs");
+static_assert(sizeof(dit_args_embed) == 8, "EmbedArgs");

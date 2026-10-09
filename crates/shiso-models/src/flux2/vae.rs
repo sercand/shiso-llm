@@ -29,8 +29,10 @@ use serde::Deserialize;
 use shiso_core::DeviceBuffer;
 use shiso_vision::generator::ImageGenError;
 
-use super::ops::{Conv2dCall, GemmCall, GroupNormCall, Ops, Scratch, SliceExt, WeightKind};
-use super::weights::StStore;
+use crate::diffusion::ops::{
+    Conv2dCall, GemmCall, GroupNormCall, Ops, Scratch, SliceExt, WeightKind,
+};
+use crate::diffusion::weights::StStore;
 
 /// Group-norm epsilon the decoder uses (the reference's group-norm epsilon).
 const GN_EPS: f32 = 1e-6;
@@ -380,7 +382,7 @@ impl Vae {
                     "vae upsample",
                     field.channels * (2 * field.h) * (2 * field.w),
                 )?;
-                ops.upsample_nearest(&super::ops::UpsampleCall {
+                ops.upsample_nearest(&crate::diffusion::ops::UpsampleCall {
                     step: "vae upsample",
                     out: upsampled.view(),
                     input: x.view(),

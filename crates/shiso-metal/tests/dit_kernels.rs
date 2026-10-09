@@ -1,6 +1,6 @@
-//! Metal's run of the flux2 kernel pack.
+//! Metal's run of the diffusion kernel pack.
 //!
-//! Every entry point the flux2 driver (`shiso-models/src/flux2/ops.rs`)
+//! Every entry point the diffusion driver (`shiso-models/src/diffusion/ops.rs`)
 //! launches is exercised here against expected values computed independently
 //! in this file - the host twins are never called, so a kernel and its twin
 //! cannot agree on the same mistake. The launch geometry, argument structs
@@ -28,8 +28,8 @@ use shiso_core::{
 };
 use shiso_metal::MetalBackend;
 
-/// The module every flux2 entry lives under.
-const MODULE: &str = "flux2";
+/// The module every diffusion entry lives under.
+const MODULE: &str = "diffusion";
 /// Threads per elementwise threadgroup, as the driver launches it.
 const BLOCK: u32 = 64;
 /// Tile edge of the GEMM kernels, as the driver launches it.
@@ -45,39 +45,39 @@ const FA_THREADS: u32 = 128;
 
 /// Every entry point the driver launches, per the Task-3 contract table.
 const ENTRIES: &[&str] = &[
-    "kernel_flux2_gemm_bf16",
-    "kernel_flux2_gemm_fp8",
-    "kernel_flux2_gemm_f32",
-    "kernel_flux2_silu_f32",
-    "kernel_flux2_swiglu_f32",
-    "kernel_flux2_swiglu2_f32",
-    "kernel_flux2_modulate_f32",
-    "kernel_flux2_add_gated_f32",
-    "kernel_flux2_add_f32",
-    "kernel_flux2_axpy_f32",
-    "kernel_flux2_layer_norm_f32",
-    "kernel_flux2_rmsnorm_f32",
-    "kernel_flux2_qk_norm_f32",
-    "kernel_flux2_concat_rows_f32",
-    "kernel_flux2_sdpa_f32",
-    "kernel_flux2_gqa_f32",
-    "kernel_flux2_rope_4d",
-    "kernel_flux2_rope_half",
-    "kernel_flux2_conv2d_f32",
-    "kernel_flux2_group_norm_stats_f32",
-    "kernel_flux2_group_norm_apply_f32",
-    "kernel_flux2_softmax_rows_f32",
-    "kernel_flux2_upsample_nearest_f32",
-    "kernel_flux2_transpose_f32",
-    "kernel_flux2_embed_bf16_f32",
-    "kernel_flux2_gemm64_f32",
-    "kernel_flux2_gemm64_bf16",
-    "kernel_flux2_gemm64_fp8",
-    "kernel_flux2_conv2d_gemm_f32",
-    "kernel_flux2_flash_sdpa_f32",
-    "kernel_flux2_gemm64_fused_f32",
-    "kernel_flux2_gemm64_fused_bf16",
-    "kernel_flux2_gemm64_fused_fp8",
+    "kernel_dit_gemm_bf16",
+    "kernel_dit_gemm_fp8",
+    "kernel_dit_gemm_f32",
+    "kernel_dit_silu_f32",
+    "kernel_dit_swiglu_f32",
+    "kernel_dit_swiglu2_f32",
+    "kernel_dit_modulate_f32",
+    "kernel_dit_add_gated_f32",
+    "kernel_dit_add_f32",
+    "kernel_dit_axpy_f32",
+    "kernel_dit_layer_norm_f32",
+    "kernel_dit_rmsnorm_f32",
+    "kernel_dit_qk_norm_f32",
+    "kernel_dit_concat_rows_f32",
+    "kernel_dit_sdpa_f32",
+    "kernel_dit_gqa_f32",
+    "kernel_dit_rope_4d",
+    "kernel_dit_rope_half",
+    "kernel_dit_conv2d_f32",
+    "kernel_dit_group_norm_stats_f32",
+    "kernel_dit_group_norm_apply_f32",
+    "kernel_dit_softmax_rows_f32",
+    "kernel_dit_upsample_nearest_f32",
+    "kernel_dit_transpose_f32",
+    "kernel_dit_embed_bf16_f32",
+    "kernel_dit_gemm64_f32",
+    "kernel_dit_gemm64_bf16",
+    "kernel_dit_gemm64_fp8",
+    "kernel_dit_conv2d_gemm_f32",
+    "kernel_dit_flash_sdpa_f32",
+    "kernel_dit_gemm64_fused_f32",
+    "kernel_dit_gemm64_fused_bf16",
+    "kernel_dit_gemm64_fused_fp8",
 ];
 
 // --- argument blocks: byte-for-byte the driver's `#[repr(C)]` Pods ---------
@@ -262,7 +262,7 @@ struct EmbedArgs {
 )]
 fn open() -> Option<Arc<dyn Backend>> {
     if !shiso_metal::metal_available() {
-        eprintln!("note: no Metal device on this machine, skipping the flux2 GPU cases");
+        eprintln!("note: no Metal device on this machine, skipping the diffusion GPU cases");
         return None;
     }
     let metal = MetalBackend::new().expect("the embedded kernel library compiles");
@@ -388,7 +388,7 @@ fn assert_differs(a: &[f32], b: &[f32], what: &str) {
     clippy::print_stderr,
     reason = "a machine with no Metal device skips rather than fails, and the reason belongs on stderr"
 )]
-fn every_flux2_entry_point_resolves_as_a_pipeline() {
+fn every_dit_entry_point_resolves_as_a_pipeline() {
     if !shiso_metal::metal_available() {
         eprintln!("note: no Metal device on this machine, skipping the pipeline check");
         return;
@@ -402,7 +402,7 @@ fn every_flux2_entry_point_resolves_as_a_pipeline() {
 }
 
 /// The driver decides kernel-vs-host by probing `module_entries` for a name
-/// containing `kernel_flux2_gemm_bf16` (`ops.rs::Ops::new`). Metal's table
+/// containing `kernel_dit_gemm_bf16` (`ops.rs::Ops::new`). Metal's table
 /// lists CUDA-style mangled names only, so the registration must carry one
 /// or the whole kernel pack is dead code behind the host fallback.
 #[test]
@@ -410,7 +410,7 @@ fn every_flux2_entry_point_resolves_as_a_pipeline() {
     clippy::print_stderr,
     reason = "a machine with no Metal device skips rather than fails, and the reason belongs on stderr"
 )]
-fn the_driver_probe_finds_the_flux2_kernel_set() {
+fn the_driver_probe_finds_the_diffusion_kernel_set() {
     if !shiso_metal::metal_available() {
         eprintln!("note: no Metal device on this machine, skipping the probe check");
         return;
@@ -420,7 +420,7 @@ fn the_driver_probe_finds_the_flux2_kernel_set() {
     assert!(
         entries
             .iter()
-            .any(|name| name.contains("kernel_flux2_gemm_bf16")),
+            .any(|name| name.contains("kernel_dit_gemm_bf16")),
         "the driver's probe would fall back to the host path: {entries:?}"
     );
 }
@@ -517,7 +517,7 @@ fn gemm_bf16_is_the_transposed_product_scaled_and_biased() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_bf16",
+            entry: "kernel_dit_gemm_bf16",
             weight: wbuf.view(),
             scale,
             bias: bias_buf.view(),
@@ -550,7 +550,7 @@ fn gemm_bf16_treats_the_zero_bias_stand_in_as_no_bias() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_bf16",
+            entry: "kernel_dit_gemm_bf16",
             weight: wbuf.view(),
             scale: 1.0,
             bias: stand_in.view(),
@@ -589,7 +589,7 @@ fn gemm_bf16_applies_a_real_bias_whose_first_word_is_negative_zero() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_bf16",
+            entry: "kernel_dit_gemm_bf16",
             weight: wbuf.view(),
             scale: 1.0,
             bias: bias_buf.view(),
@@ -628,7 +628,7 @@ fn gemm_bf16_applies_a_real_bias_whose_first_word_is_positive_zero() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_bf16",
+            entry: "kernel_dit_gemm_bf16",
             weight: wbuf.view(),
             scale: 1.0,
             bias: bias_buf.view(),
@@ -668,7 +668,7 @@ fn gemm_bf16_ignores_the_bias_binding_when_the_flag_is_clear() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_bf16",
+            entry: "kernel_dit_gemm_bf16",
             weight: wbuf.view(),
             scale: 1.0,
             bias: bias_buf.view(),
@@ -713,7 +713,7 @@ fn gemm_fp8_decodes_e4m3_bytes_and_scales_the_accumulator() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_fp8",
+            entry: "kernel_dit_gemm_fp8",
             weight: wbuf.view(),
             scale,
             bias: bias_buf.view(),
@@ -746,7 +746,7 @@ fn gemm_f32_is_the_transposed_product() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_f32",
+            entry: "kernel_dit_gemm_f32",
             weight: wbuf.view(),
             scale: 1.0,
             bias: bias_buf.view(),
@@ -772,7 +772,7 @@ fn silu_matches_the_sigmoid_product() {
     };
     launch(
         &b,
-        "kernel_flux2_silu_f32",
+        "kernel_dit_silu_f32",
         Extent3::linear(grid_for(x.len() as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -800,7 +800,7 @@ fn swiglu_gates_the_first_half_of_strided_rows() {
     };
     launch(
         &b,
-        "kernel_flux2_swiglu_f32",
+        "kernel_dit_swiglu_f32",
         Extent3::new(grid_for(inner as u32, BLOCK), rows as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -853,7 +853,7 @@ fn swiglu_reads_a_view_that_starts_mid_row() {
     };
     launch(
         &b,
-        "kernel_flux2_swiglu_f32",
+        "kernel_dit_swiglu_f32",
         Extent3::new(grid_for(inner as u32, BLOCK), rows as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -885,7 +885,7 @@ fn swiglu2_is_silu_of_a_times_b() {
     };
     launch(
         &b,
-        "kernel_flux2_swiglu2_f32",
+        "kernel_dit_swiglu2_f32",
         Extent3::linear(grid_for(a.len() as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -917,7 +917,7 @@ fn modulate_broadcasts_scale_and_shift_over_the_period() {
     };
     launch(
         &b,
-        "kernel_flux2_modulate_f32",
+        "kernel_dit_modulate_f32",
         Extent3::linear(grid_for(count as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -952,7 +952,7 @@ fn add_gated_is_a_plus_the_broadcast_gate_times_b() {
     };
     launch(
         &b,
-        "kernel_flux2_add_gated_f32",
+        "kernel_dit_add_gated_f32",
         Extent3::linear(grid_for(count as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -981,7 +981,7 @@ fn add_is_the_elementwise_sum() {
     };
     launch(
         &b,
-        "kernel_flux2_add_f32",
+        "kernel_dit_add_f32",
         Extent3::linear(grid_for(a.len() as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -1011,7 +1011,7 @@ fn axpy_adds_dt_times_v() {
     };
     launch(
         &b,
-        "kernel_flux2_axpy_f32",
+        "kernel_dit_axpy_f32",
         Extent3::linear(grid_for(x.len() as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -1042,7 +1042,7 @@ fn layer_norm_subtracts_the_mean_and_divides_by_the_deviation() {
     };
     launch(
         &b,
-        "kernel_flux2_layer_norm_f32",
+        "kernel_dit_layer_norm_f32",
         Extent3::linear(rows as u32),
         Extent3::linear(BLOCK),
         &[
@@ -1092,7 +1092,7 @@ fn rmsnorm_scales_the_normalized_row_by_the_weight() {
     };
     launch(
         &b,
-        "kernel_flux2_rmsnorm_f32",
+        "kernel_dit_rmsnorm_f32",
         Extent3::linear(rows as u32),
         Extent3::linear(BLOCK),
         &[
@@ -1138,7 +1138,7 @@ fn qk_norm_normalizes_the_q_and_k_sections_and_leaves_v() {
     };
     launch(
         &b,
-        "kernel_flux2_qk_norm_f32",
+        "kernel_dit_qk_norm_f32",
         Extent3::new(tokens as u32, heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1194,7 +1194,7 @@ fn concat_rows_joins_the_two_row_blocks() {
     };
     launch(
         &b,
-        "kernel_flux2_concat_rows_f32",
+        "kernel_dit_concat_rows_f32",
         Extent3::linear(rows as u32),
         Extent3::linear(BLOCK),
         &[
@@ -1332,7 +1332,7 @@ fn run_sdpa(b: &Arc<dyn Backend>, c: &Joint<'_>) -> (Vec<f32>, Vec<f32>) {
     };
     launch(
         b,
-        "kernel_flux2_sdpa_f32",
+        "kernel_dit_sdpa_f32",
         Extent3::new((c.txt + c.img) as u32, c.heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1571,7 +1571,7 @@ fn gqa_is_causal_grouped_attention() {
     };
     launch(
         &b,
-        "kernel_flux2_gqa_f32",
+        "kernel_dit_gqa_f32",
         Extent3::new(tokens as u32, q_heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1677,7 +1677,7 @@ fn rope_4d_rotates_each_fused_section_exactly_once() {
     };
     launch(
         &b,
-        "kernel_flux2_rope_4d",
+        "kernel_dit_rope_4d",
         Extent3::new(tokens as u32, heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1749,7 +1749,7 @@ fn rope_4d_rotates_packed_operands_with_several_frequencies() {
     };
     launch(
         &b,
-        "kernel_flux2_rope_4d",
+        "kernel_dit_rope_4d",
         Extent3::new(tokens as u32, heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1800,7 +1800,7 @@ fn rope_half_rotates_pairs_across_the_halves() {
     };
     launch(
         &b,
-        "kernel_flux2_rope_half",
+        "kernel_dit_rope_half",
         Extent3::new(tokens as u32, heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1918,7 +1918,7 @@ fn conv2d_matches_the_padded_and_the_strided_sum() {
         };
         launch(
             b,
-            "kernel_flux2_conv2d_f32",
+            "kernel_dit_conv2d_f32",
             Extent3::new(
                 case.out_w as u32,
                 case.out_c as u32,
@@ -2011,7 +2011,7 @@ fn conv2d_bias_case(
     };
     launch(
         b,
-        "kernel_flux2_conv2d_f32",
+        "kernel_dit_conv2d_f32",
         Extent3::new(2, 2, 2),
         Extent3::linear(BLOCK),
         &[
@@ -2145,7 +2145,7 @@ fn group_norm_normalizes_each_group_and_affines_by_channel() {
         let grid = Extent3::new((batch * groups) as u32, chunks as u32, 1);
         launch(
             &b,
-            "kernel_flux2_group_norm_stats_f32",
+            "kernel_dit_group_norm_stats_f32",
             grid,
             Extent3::linear(BLOCK),
             &[
@@ -2156,7 +2156,7 @@ fn group_norm_normalizes_each_group_and_affines_by_channel() {
         );
         launch(
             &b,
-            "kernel_flux2_group_norm_apply_f32",
+            "kernel_dit_group_norm_apply_f32",
             grid,
             Extent3::linear(BLOCK),
             &[
@@ -2195,7 +2195,7 @@ fn softmax_rows_normalizes_each_scaled_row_in_place() {
     };
     launch(
         &b,
-        "kernel_flux2_softmax_rows_f32",
+        "kernel_dit_softmax_rows_f32",
         Extent3::linear(rows as u32),
         Extent3::linear(BLOCK),
         &[
@@ -2233,7 +2233,7 @@ fn upsample_nearest_doubles_the_field() {
     };
     launch(
         &b,
-        "kernel_flux2_upsample_nearest_f32",
+        "kernel_dit_upsample_nearest_f32",
         Extent3::new(w as u32, h as u32, (batch * channels) as u32),
         Extent3::linear(BLOCK),
         &[
@@ -2277,7 +2277,7 @@ fn transpose_swaps_the_two_axes() {
     };
     launch(
         &b,
-        "kernel_flux2_transpose_f32",
+        "kernel_dit_transpose_f32",
         Extent3::linear(grid_for((rows * cols) as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -2319,7 +2319,7 @@ fn embed_gathers_bf16_table_rows_as_f32() {
     };
     launch(
         &b,
-        "kernel_flux2_embed_bf16_f32",
+        "kernel_dit_embed_bf16_f32",
         Extent3::new(tokens as u32, grid_for(hidden as u32, BLOCK), 1),
         Extent3::linear(BLOCK),
         &[
@@ -2390,7 +2390,7 @@ fn gemm64_f32_matches_the_transposed_product_on_ragged_tiles() {
     let got = run_gemm64(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm64_f32",
+            entry: "kernel_dit_gemm64_f32",
             weight: w_buf.view(),
             scale: 1.0,
             bias: bias_buf.view(),
@@ -2420,7 +2420,7 @@ fn gemm64_bf16_widens_the_weight_and_skips_an_unflagged_bias() {
     let got = run_gemm64(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm64_bf16",
+            entry: "kernel_dit_gemm64_bf16",
             weight: w_buf.view(),
             scale: 0.5,
             bias: stand_in.view(),
@@ -2453,7 +2453,7 @@ fn gemm64_fp8_decodes_every_e4m3_byte_and_scales_the_accumulator() {
     let got = run_gemm64(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm64_fp8",
+            entry: "kernel_dit_gemm64_fp8",
             weight: w_buf.view(),
             scale: 0.25,
             bias: bias_buf.view(),
@@ -2565,7 +2565,7 @@ fn run_conv_gemm(b: &Arc<dyn Backend>, c: &ConvCase, seed: usize) -> (Vec<f32>, 
     };
     launch(
         b,
-        "kernel_flux2_conv2d_gemm_f32",
+        "kernel_dit_conv2d_gemm_f32",
         Extent3::new(
             grid_for(c.out_c as u32, G64_TILE),
             grid_for((oh * ow) as u32, G64_TILE),
@@ -2671,7 +2671,7 @@ fn run_flash(b: &Arc<dyn Backend>, c: &Joint<'_>) -> (Vec<f32>, Vec<f32>) {
     kargs.extend(bufs.iter().map(|buf| KernelArg::Buffer(buf.view())));
     launch(
         b,
-        "kernel_flux2_flash_sdpa_f32",
+        "kernel_dit_flash_sdpa_f32",
         Extent3::new(
             grid_for((c.txt + c.img) as u32, FA_QROWS),
             c.heads as u32,
@@ -2812,7 +2812,7 @@ fn run_flash_joint(b: &Arc<dyn Backend>, c: &Joint<'_>) -> Vec<f32> {
     };
     launch(
         b,
-        "kernel_flux2_flash_sdpa_f32",
+        "kernel_dit_flash_sdpa_f32",
         Extent3::new(grid_for(c.txt as u32, FA_QROWS), c.heads as u32, 1),
         Extent3::linear(FA_THREADS),
         &[
@@ -2893,7 +2893,7 @@ fn flash_sdpa_and_gemm64_are_bit_identical_across_runs_at_model_sizes() {
         run_gemm64(
             &b,
             GemmRun {
-                entry: "kernel_flux2_gemm64_f32",
+                entry: "kernel_dit_gemm64_f32",
                 weight: w_buf.view(),
                 scale: 1.0,
                 bias: stand_in.view(),
@@ -3030,7 +3030,7 @@ fn gemm64_fused_reads_dense_then_swiglu_columns_and_adds_the_gated_residual() {
         gu_offset,
     };
     let w_buf = upload_f32(&b, &weight);
-    let got = run_fused(&b, &case, "kernel_flux2_gemm64_fused_f32", w_buf.view());
+    let got = run_fused(&b, &case, "kernel_dit_gemm64_fused_f32", w_buf.view());
     let expected = expect_fused(&case);
     // The same rows with gate and up swapped must give a different answer,
     // or the case cannot tell gate-first from gate-second.
@@ -3087,7 +3087,7 @@ fn gemm64_fused_takes_a_swiglu_only_input_over_fp8_weights() {
         gu_offset: 0,
     };
     let w_buf = upload_u8(&b, &bytes);
-    let got = run_fused(&b, &case, "kernel_flux2_gemm64_fused_fp8", w_buf.view());
+    let got = run_fused(&b, &case, "kernel_dit_gemm64_fused_fp8", w_buf.view());
     assert_close(&got, &expect_fused(&case), "gemm64_fused fp8 swiglu-only");
 }
 
@@ -3128,6 +3128,6 @@ fn gemm64_fused_takes_a_dense_only_input_over_bf16_weights() {
         gu_offset: 0,
     };
     let w_buf = upload_u16(&b, &weight_bits);
-    let got = run_fused(&b, &case, "kernel_flux2_gemm64_fused_bf16", w_buf.view());
+    let got = run_fused(&b, &case, "kernel_dit_gemm64_fused_bf16", w_buf.view());
     assert_close(&got, &expect_fused(&case), "gemm64_fused bf16 dense-only");
 }

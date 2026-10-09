@@ -9,20 +9,19 @@
 //!
 //! [`config`] locates and inspects a checkpoint, [`pipeline`] drives one
 //! generation, and [`scheduler`], [`transformer`], [`text_encoder`] and
-//! [`vae`] are the parts it composes. [`ops`] is the family's device-kernel
-//! surface: it probes the backend for the full flux2 kernel set at load and
-//! refuses a device that does not carry it, naming the missing entries.
+//! [`vae`] are the parts it composes. The device-kernel driver, weight store
+//! and linear layer are the shared `crate::diffusion` toolkit: it probes the
+//! backend for the full diffusion kernel set at load and refuses a device that
+//! does not carry it, naming the missing entries.
 
 pub mod config;
 pub(crate) mod kv_cache;
-pub(crate) mod ops;
 pub(crate) mod pipeline;
 pub(crate) mod rope;
 pub(crate) mod scheduler;
 pub(crate) mod text_encoder;
 pub(crate) mod transformer;
 pub(crate) mod vae;
-pub(crate) mod weights;
 
 use crate::catalog::FamilyFacts;
 

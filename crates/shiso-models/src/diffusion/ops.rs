@@ -1,12 +1,12 @@
-//! The flux2 kernel driver: every device operation the pipeline issues.
+//! The diffusion kernel driver: every device operation a `DiT` image pipeline issues.
 //!
 //! One funnel, like the vision encoder's `Run` and the audio family's `Ops`:
 //! argument blocks are `#[repr(C)]` `Pod` structs marshalled with
 //! `bytemuck::bytes_of`, so their layout comes from the struct definition and
 //! is asserted against the kernel headers at compile time. Every launch names
-//! the `flux2` module, and [`Ops::new`] probes the device for every entry in
+//! the `diffusion` module, and [`Ops::new`] probes the device for every entry in
 //! [`REQUIRED_KERNELS`] before a driver exists: a backend whose module table
-//! does not carry the full flux2 set is refused at load, naming the missing
+//! does not carry the full diffusion set is refused at load, naming the missing
 //! entries, rather than silently running the same arithmetic on the host
 //! orders of magnitude slower. The host twins of the fused-row attention and
 //! `RoPE` seams remain as `#[cfg(test)]` entry points for the oracle tests,
@@ -27,8 +27,8 @@ use shiso_core::{
 };
 use shiso_vision::generator::ImageGenError;
 
-/// The kernel module every flux2 entry point lives under.
-pub(crate) const MODULE: &str = "flux2";
+/// The kernel module every diffusion entry point lives under.
+pub(crate) const MODULE: &str = "diffusion";
 
 /// Threads per elementwise block.
 const BLOCK: u32 = 64;
@@ -569,7 +569,7 @@ pub(crate) struct EmbedCall<'a> {
     pub hidden: usize,
 }
 
-/// The driver every flux2 component shares.
+/// The driver every image-family component shares.
 #[derive(Debug)]
 pub(crate) struct Ops {
     backend: Arc<dyn Backend>,
@@ -616,45 +616,45 @@ impl Drop for Scratch<'_> {
     }
 }
 
-/// Every flux2 kernel entry this driver launches: the module's full
-/// registration in `metal/flux2/flux2.metal`. [`Ops::new`] probes the device
+/// Every diffusion kernel entry this driver launches: the module's full
+/// registration in `metal/diffusion/diffusion.metal`. [`Ops::new`] probes the device
 /// for all of them, so a build or device without the set is refused at load
 /// naming what is missing, and a launch can never fall back to a host twin
 /// unnoticed. A name launched here but absent from this list is a driver bug.
 const REQUIRED_KERNELS: &[&str] = &[
-    "kernel_flux2_silu_f32",
-    "kernel_flux2_swiglu_f32",
-    "kernel_flux2_swiglu2_f32",
-    "kernel_flux2_modulate_f32",
-    "kernel_flux2_add_gated_f32",
-    "kernel_flux2_add_f32",
-    "kernel_flux2_axpy_f32",
-    "kernel_flux2_gemm_bf16",
-    "kernel_flux2_gemm_fp8",
-    "kernel_flux2_gemm_f32",
-    "kernel_flux2_rmsnorm_f32",
-    "kernel_flux2_layer_norm_f32",
-    "kernel_flux2_softmax_rows_f32",
-    "kernel_flux2_qk_norm_f32",
-    "kernel_flux2_concat_rows_f32",
-    "kernel_flux2_sdpa_f32",
-    "kernel_flux2_gqa_f32",
-    "kernel_flux2_rope_4d",
-    "kernel_flux2_rope_half",
-    "kernel_flux2_conv2d_f32",
-    "kernel_flux2_group_norm_stats_f32",
-    "kernel_flux2_group_norm_apply_f32",
-    "kernel_flux2_upsample_nearest_f32",
-    "kernel_flux2_transpose_f32",
-    "kernel_flux2_embed_bf16_f32",
-    "kernel_flux2_gemm64_f32",
-    "kernel_flux2_gemm64_bf16",
-    "kernel_flux2_gemm64_fp8",
-    "kernel_flux2_conv2d_gemm_f32",
-    "kernel_flux2_flash_sdpa_f32",
-    "kernel_flux2_gemm64_fused_f32",
-    "kernel_flux2_gemm64_fused_bf16",
-    "kernel_flux2_gemm64_fused_fp8",
+    "kernel_dit_silu_f32",
+    "kernel_dit_swiglu_f32",
+    "kernel_dit_swiglu2_f32",
+    "kernel_dit_modulate_f32",
+    "kernel_dit_add_gated_f32",
+    "kernel_dit_add_f32",
+    "kernel_dit_axpy_f32",
+    "kernel_dit_gemm_bf16",
+    "kernel_dit_gemm_fp8",
+    "kernel_dit_gemm_f32",
+    "kernel_dit_rmsnorm_f32",
+    "kernel_dit_layer_norm_f32",
+    "kernel_dit_softmax_rows_f32",
+    "kernel_dit_qk_norm_f32",
+    "kernel_dit_concat_rows_f32",
+    "kernel_dit_sdpa_f32",
+    "kernel_dit_gqa_f32",
+    "kernel_dit_rope_4d",
+    "kernel_dit_rope_half",
+    "kernel_dit_conv2d_f32",
+    "kernel_dit_group_norm_stats_f32",
+    "kernel_dit_group_norm_apply_f32",
+    "kernel_dit_upsample_nearest_f32",
+    "kernel_dit_transpose_f32",
+    "kernel_dit_embed_bf16_f32",
+    "kernel_dit_gemm64_f32",
+    "kernel_dit_gemm64_bf16",
+    "kernel_dit_gemm64_fp8",
+    "kernel_dit_conv2d_gemm_f32",
+    "kernel_dit_flash_sdpa_f32",
+    "kernel_dit_gemm64_fused_f32",
+    "kernel_dit_gemm64_fused_bf16",
+    "kernel_dit_gemm64_fused_fp8",
 ];
 
 impl Ops {
@@ -681,7 +681,7 @@ impl Ops {
             .collect();
         if !missing.is_empty() {
             return Err(ImageGenError::Backend(format!(
-                "the {} backend does not expose the flux2 kernel module: missing [{}]",
+                "the {} backend does not expose the diffusion kernel module: missing [{}]",
                 backend.backend_name(),
                 missing.join(", ")
             )));
@@ -896,7 +896,7 @@ impl Ops {
         input: DeviceView<'_>,
         count: usize,
     ) -> Result<(), ImageGenError> {
-        self.elementwise(step, "kernel_flux2_silu_f32", count, &[out, input])
+        self.elementwise(step, "kernel_dit_silu_f32", count, &[out, input])
     }
 
     /// `SwiGLU` over a fused row: out[r, i] = silu(in[r, i]) * in[r, inner + i].
@@ -923,7 +923,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_swiglu_f32",
+            "kernel_dit_swiglu_f32",
             Extent3::new(grid_for(inner as u32, BLOCK), rows as u32, 1),
             Extent3::linear(BLOCK),
             &[
@@ -945,7 +945,7 @@ impl Ops {
         b: DeviceView<'_>,
         count: usize,
     ) -> Result<(), ImageGenError> {
-        self.elementwise(step, "kernel_flux2_swiglu2_f32", count, &[out, a, b])
+        self.elementwise(step, "kernel_dit_swiglu2_f32", count, &[out, a, b])
     }
 
     /// out = x * (1 + scale) + shift, with `scale`/`shift` a per-dimension
@@ -966,7 +966,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_modulate_f32",
+            "kernel_dit_modulate_f32",
             Extent3::linear(grid_for(count as u32, BLOCK)),
             Extent3::linear(BLOCK),
             &[
@@ -997,7 +997,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_add_gated_f32",
+            "kernel_dit_add_gated_f32",
             Extent3::linear(grid_for(count as u32, BLOCK)),
             Extent3::linear(BLOCK),
             &[
@@ -1019,7 +1019,7 @@ impl Ops {
         b: DeviceView<'_>,
         count: usize,
     ) -> Result<(), ImageGenError> {
-        self.elementwise(step, "kernel_flux2_add_f32", count, &[out, a, b])
+        self.elementwise(step, "kernel_dit_add_f32", count, &[out, a, b])
     }
 
     /// out = x + dt * v (the Euler latent update).
@@ -1038,7 +1038,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_axpy_f32",
+            "kernel_dit_axpy_f32",
             Extent3::linear(grid_for(count as u32, BLOCK)),
             Extent3::linear(BLOCK),
             &[
@@ -1079,12 +1079,12 @@ impl Ops {
         // the family qualifies, and the scalar kernels keep any other shape.
         let tiled = call.k.is_multiple_of(G64_K);
         let entry = match (call.kind, tiled) {
-            (WeightKind::Fp8, true) => "kernel_flux2_gemm64_fp8",
-            (WeightKind::Bf16, true) => "kernel_flux2_gemm64_bf16",
-            (WeightKind::F32, true) => "kernel_flux2_gemm64_f32",
-            (WeightKind::Fp8, false) => "kernel_flux2_gemm_fp8",
-            (WeightKind::Bf16, false) => "kernel_flux2_gemm_bf16",
-            (WeightKind::F32, false) => "kernel_flux2_gemm_f32",
+            (WeightKind::Fp8, true) => "kernel_dit_gemm64_fp8",
+            (WeightKind::Bf16, true) => "kernel_dit_gemm64_bf16",
+            (WeightKind::F32, true) => "kernel_dit_gemm64_f32",
+            (WeightKind::Fp8, false) => "kernel_dit_gemm_fp8",
+            (WeightKind::Bf16, false) => "kernel_dit_gemm_bf16",
+            (WeightKind::F32, false) => "kernel_dit_gemm_f32",
         };
         let (grid, block) = if tiled {
             (
@@ -1157,9 +1157,9 @@ impl Ops {
             has_bias: u32::from(call.bias.is_some()),
         };
         let entry = match call.kind {
-            WeightKind::Fp8 => "kernel_flux2_gemm64_fused_fp8",
-            WeightKind::Bf16 => "kernel_flux2_gemm64_fused_bf16",
-            WeightKind::F32 => "kernel_flux2_gemm64_fused_f32",
+            WeightKind::Fp8 => "kernel_dit_gemm64_fused_fp8",
+            WeightKind::Bf16 => "kernel_dit_gemm64_fused_bf16",
+            WeightKind::F32 => "kernel_dit_gemm64_fused_f32",
         };
         self.launch(
             call.step,
@@ -1259,7 +1259,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_rmsnorm_f32",
+            "kernel_dit_rmsnorm_f32",
             Extent3::linear(call.rows as u32),
             Extent3::linear(BLOCK),
             &[
@@ -1284,7 +1284,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_layer_norm_f32",
+            "kernel_dit_layer_norm_f32",
             Extent3::linear(call.rows as u32),
             Extent3::linear(BLOCK),
             &[
@@ -1308,7 +1308,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_qk_norm_f32",
+            "kernel_dit_qk_norm_f32",
             Extent3::new(call.tokens as u32, call.heads as u32, 1),
             Extent3::linear(BLOCK),
             &[
@@ -1329,7 +1329,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_concat_rows_f32",
+            "kernel_dit_concat_rows_f32",
             Extent3::linear(call.rows as u32),
             Extent3::linear(BLOCK),
             &[
@@ -1377,13 +1377,13 @@ impl Ops {
         // transformer's 128-wide heads qualify, the VAE's 512-wide one does not.
         let (entry, grid, block) = if call.head_dim.is_multiple_of(8) && call.head_dim <= FA_MAX_D {
             (
-                "kernel_flux2_flash_sdpa_f32",
+                "kernel_dit_flash_sdpa_f32",
                 Extent3::new(grid_for(rows, FA_QROWS), call.heads as u32, 1),
                 Extent3::linear(FA_THREADS),
             )
         } else {
             (
-                "kernel_flux2_sdpa_f32",
+                "kernel_dit_sdpa_f32",
                 Extent3::new(rows, call.heads as u32, 1),
                 Extent3::linear(BLOCK),
             )
@@ -1534,7 +1534,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_gqa_f32",
+            "kernel_dit_gqa_f32",
             Extent3::new(call.tokens as u32, call.q_heads as u32, 1),
             Extent3::linear(BLOCK),
             &[
@@ -1561,7 +1561,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_rope_4d",
+            "kernel_dit_rope_4d",
             Extent3::new(call.tokens as u32, call.heads as u32, 1),
             Extent3::linear(BLOCK),
             &[
@@ -1611,7 +1611,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_rope_half",
+            "kernel_dit_rope_half",
             Extent3::new(tokens as u32, heads as u32, 1),
             Extent3::linear(BLOCK),
             &[
@@ -1643,7 +1643,7 @@ impl Ops {
         // a multiple of 16 of them, and the per-pixel kernel keeps the rest.
         let (entry, grid, block) = if (call.in_c * call.k_h * call.k_w).is_multiple_of(G64_K) {
             (
-                "kernel_flux2_conv2d_gemm_f32",
+                "kernel_dit_conv2d_gemm_f32",
                 Extent3::new(
                     grid_for(call.out_c as u32, G64_TILE),
                     grid_for((call.out_h * call.out_w) as u32, G64_TILE),
@@ -1653,7 +1653,7 @@ impl Ops {
             )
         } else {
             (
-                "kernel_flux2_conv2d_f32",
+                "kernel_dit_conv2d_f32",
                 Extent3::new(
                     call.out_w as u32,
                     call.out_c as u32,
@@ -1694,7 +1694,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_softmax_rows_f32",
+            "kernel_dit_softmax_rows_f32",
             Extent3::linear(rows as u32),
             Extent3::linear(BLOCK),
             &[
@@ -1722,7 +1722,7 @@ impl Ops {
         let grid = Extent3::new(groups as u32, chunks as u32, 1);
         self.launch(
             call.step,
-            "kernel_flux2_group_norm_stats_f32",
+            "kernel_dit_group_norm_stats_f32",
             grid,
             Extent3::linear(BLOCK),
             &[
@@ -1733,7 +1733,7 @@ impl Ops {
         )?;
         self.launch(
             call.step,
-            "kernel_flux2_group_norm_apply_f32",
+            "kernel_dit_group_norm_apply_f32",
             grid,
             Extent3::linear(BLOCK),
             &[
@@ -1767,7 +1767,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_upsample_nearest_f32",
+            "kernel_dit_upsample_nearest_f32",
             Extent3::new(w as u32, h as u32, (batch * channels) as u32),
             Extent3::linear(BLOCK),
             &[
@@ -1794,7 +1794,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_transpose_f32",
+            "kernel_dit_transpose_f32",
             Extent3::linear(grid_for((rows * cols) as u32, BLOCK)),
             Extent3::linear(BLOCK),
             &[
@@ -1813,7 +1813,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_embed_bf16_f32",
+            "kernel_dit_embed_bf16_f32",
             Extent3::new(call.tokens as u32, grid_for(call.hidden as u32, BLOCK), 1),
             Extent3::linear(BLOCK),
             &[
@@ -1826,7 +1826,7 @@ impl Ops {
     }
 }
 
-/// Host twin of `kernel_flux2_rope_4d`: interleaved pairs within each axis,
+/// Host twin of `kernel_dit_rope_4d`: interleaved pairs within each axis,
 /// rotated in place on the `heads * head_dim` head section that starts
 /// `section_offset` elements into each row (the q or k section of a fused
 /// qkv row, or offset 0 of a packed tensor).

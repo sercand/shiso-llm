@@ -30,11 +30,12 @@ use shiso_vision::generator::ImageGenError;
 
 use super::config::Flux2Params;
 use super::kv_cache::Flux2KvCache;
-use super::ops::{
+use crate::diffusion::lin::Lin;
+use crate::diffusion::ops::{
     GemmCall, LayerNormCall, LinearResidualCall, ModulateCall, Ops, QkNormCall, Rope4dCall,
     Scratch, SdpaCall, SliceExt, SwigluInput,
 };
-use super::weights::{Lin, StStore};
+use crate::diffusion::weights::StStore;
 
 /// `LayerNorm` / `QK-norm` epsilon the reference blocks use.
 const NORM_EPS: f32 = 1e-6;

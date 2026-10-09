@@ -301,14 +301,17 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "sample/suppress.metal",
         include_str!("../metal/sample/suppress.metal"),
     ),
-    // --- flux2-klein kernel set; appended, nothing above this line changed.
+    // --- diffusion DiT kernel set; appended, nothing above this line changed.
     // The header comes first for the same reason every other set's does: the
     // file after it uses its argument blocks, its decoders and its reduction.
     (
-        "flux2_common.h",
-        include_str!("../metal/flux2/flux2_common.h"),
+        "diffusion_common.h",
+        include_str!("../metal/diffusion/diffusion_common.h"),
     ),
-    ("flux2.metal", include_str!("../metal/flux2/flux2.metal")),
+    (
+        "diffusion.metal",
+        include_str!("../metal/diffusion/diffusion.metal"),
+    ),
     // --- ternary kernel set (rotated ternary checkpoints); appended, nothing
     // above this line changed. The header first, as for every other set.
     (

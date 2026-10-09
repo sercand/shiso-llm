@@ -1,4 +1,4 @@
-//! Flow-matching Euler discrete scheduler with empirical mu time shifting.
+//! FLUX.2's empirical mu time shift over the shared flow-match Euler ladder.
 
 /// Computes empirical mu shift factor based on image sequence length and steps.
 ///
@@ -27,43 +27,18 @@ pub(crate) fn compute_empirical_mu(image_seq_len: usize, num_steps: usize) -> f3
     a * (num_steps as f32) + b
 }
 
-/// The flow-matching Euler discrete scheduler.
-#[derive(Debug, Clone)]
-pub(crate) struct FlowMatchEulerDiscreteScheduler {
-    /// Timesteps in descending order (e.g. sigma * 1000.0).
-    pub timesteps: Vec<f32>,
-    /// Shifted sigmas.
-    pub sigmas: Vec<f32>,
-}
+/// The flow-matching Euler discrete scheduler, shifted by FLUX.2's fit.
+pub(crate) type FlowMatchEulerDiscreteScheduler =
+    crate::diffusion::euler::FlowMatchEulerDiscreteScheduler;
 
-impl FlowMatchEulerDiscreteScheduler {
-    /// Creates a scheduler for `image_seq_len` tokens across `num_inference_steps`.
-    #[must_use]
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "step indices are small inference-step counts, exact in f32"
-    )]
-    pub(crate) fn new(image_seq_len: usize, num_inference_steps: usize) -> Self {
-        let mu = compute_empirical_mu(image_seq_len, num_inference_steps);
-        let mut sigmas = Vec::with_capacity(num_inference_steps + 1);
-        for i in 0..=num_inference_steps {
-            let s = 1.0 - (i as f32) / (num_inference_steps as f32);
-            let shifted = if s <= 0.0 {
-                0.0
-            } else if s >= 1.0 {
-                1.0
-            } else {
-                let exp_mu = mu.exp();
-                (exp_mu * s) / (exp_mu * s + (1.0 - s))
-            };
-            sigmas.push(shifted);
-        }
-
-        let mut timesteps = Vec::with_capacity(num_inference_steps);
-        for &s in sigmas.iter().take(num_inference_steps) {
-            timesteps.push(s * 1000.0);
-        }
-
-        Self { timesteps, sigmas }
-    }
+/// Creates the scheduler for `image_seq_len` tokens across `num_inference_steps`.
+#[must_use]
+pub(crate) fn new_scheduler(
+    image_seq_len: usize,
+    num_inference_steps: usize,
+) -> FlowMatchEulerDiscreteScheduler {
+    FlowMatchEulerDiscreteScheduler::with_mu(
+        compute_empirical_mu(image_seq_len, num_inference_steps),
+        num_inference_steps,
+    )
 }
