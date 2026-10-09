@@ -30,7 +30,7 @@ use shiso_core::DeviceBuffer;
 use shiso_vision::generator::ImageGenError;
 
 use crate::diffusion::ops::{
-    Conv2dCall, GemmCall, GroupNormCall, Ops, Scratch, SliceExt, WeightKind,
+    Conv2dCall, GemmCall, GroupNormCall, LinWeight, Ops, Scratch, SliceExt,
 };
 use crate::diffusion::weights::StStore;
 
@@ -683,30 +683,20 @@ impl Vae {
                 step: "vae attn scores",
                 out: slab,
                 input: qt.view().cut(row_bytes(r0), row_bytes(rows))?,
-                weight: kt.view(),
-                weight_scale: 1.0,
-                row_scale: None,
-                rotate: None,
-                bias: None,
+                weight: LinWeight::f32(kt.view()),
                 m: rows,
                 n: spatial,
                 k: channels,
-                kind: WeightKind::F32,
             })?;
             ops.softmax_rows("vae attn softmax", slab, rows, spatial, scale)?;
             ops.gemm(&GemmCall {
                 step: "vae attn values",
                 out: at.view().cut(row_bytes(r0), row_bytes(rows))?,
                 input: slab,
-                weight: v.view(),
-                weight_scale: 1.0,
-                row_scale: None,
-                rotate: None,
-                bias: None,
+                weight: LinWeight::f32(v.view()),
                 m: rows,
                 n: channels,
                 k: spatial,
-                kind: WeightKind::F32,
             })?;
         }
         let ctx = ops.alloc_f32("vae attn ctx ch", channels * spatial)?;

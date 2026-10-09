@@ -21,11 +21,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use shiso_core::{Backend, DeviceBuffer};
+use shiso_core::Backend;
 use shiso_vision::generator::ImageGenError;
 
 use super::lin::Lin;
-use super::ops::{GemmCall, LinearResidualCall, Ops, WeightKind};
+use super::ops::{GemmCall, LinWeight, LinearResidualCall, Ops, WeightKind};
 use super::quant::{RotGroup, parse_quant_spec, read_int8_layout, unrotate_row_f32};
 use super::weights::StStore;
 
@@ -445,15 +445,10 @@ fn the_real_int8_linears_match_the_reference_on_the_device() {
             step: "int8 real gemm",
             out: d_y.view(),
             input: d_x.view(),
-            weight: lin.w.view(),
-            weight_scale: lin.scale,
-            row_scale: lin.row_scale.as_ref().map(DeviceBuffer::view),
-            rotate: lin.rotate,
-            bias: lin.bias.as_ref().map(DeviceBuffer::view),
+            weight: lin.weight(),
             m: ROWS,
             n: out,
             k: input,
-            kind: lin.kind,
         })
         .expect("gemm");
         backend.sync().expect("sync");
@@ -475,12 +470,7 @@ fn the_real_int8_linears_match_the_reference_on_the_device() {
             dense: Some(d_x.view()),
             dense_cols: input,
             swiglu: None,
-            weight: lin.w.view(),
-            weight_scale: lin.scale,
-            row_scale: lin.row_scale.as_ref().map(DeviceBuffer::view),
-            rotate: lin.rotate,
-            bias: lin.bias.as_ref().map(DeviceBuffer::view),
-            kind: lin.kind,
+            weight: lin.weight(),
             m: ROWS,
             n: out,
         })
@@ -501,4 +491,51 @@ fn the_real_int8_linears_match_the_reference_on_the_device() {
             assert!(min_cos >= 0.9999, "{base} {what}: cosine vs BF16 {cos:?}");
         }
     }
+}
+
+/// Only the INT8 export stores a rotated weight, so a rotation riding any
+/// other kind is a loader bug: both entries refuse it rather than rotate a
+/// BF16/FP8/F32 product's input and return a different answer.
+#[test]
+fn a_rotation_on_a_weight_that_is_not_int8_is_refused() {
+    let Some(backend) = device() else { return };
+    let ops = Ops::new(&backend).expect("the diffusion kernel set");
+    let (m, n, k) = (2, 4, 256);
+    let weight = ops.upload_f32("w", &vec![0.5f32; n * k]).expect("w");
+    let input = ops.upload_f32("x", &vec![1f32; m * k]).expect("x");
+    let out = ops.alloc_owned_f32("out", m * n).expect("out");
+    let gate = ops.upload_f32("gate", &vec![1f32; n]).expect("gate");
+    let rotated = LinWeight::f32(weight.view()).with_rotation(Some(RotGroup::Hadamard256));
+    let refused = |result: Result<(), ImageGenError>, what: &str| match result {
+        Err(ImageGenError::Backend(message)) => {
+            assert!(message.contains("rotation"), "{what}: {message}");
+        }
+        other => panic!("{what}: expected a refusal, got {other:?}"),
+    };
+    refused(
+        ops.gemm(&GemmCall {
+            step: "refuse",
+            out: out.view(),
+            input: input.view(),
+            weight: rotated,
+            m,
+            n,
+            k,
+        }),
+        "gemm",
+    );
+    refused(
+        ops.linear_residual(&LinearResidualCall {
+            step: "refuse",
+            residual: out.view(),
+            gate: gate.view(),
+            dense: Some(input.view()),
+            dense_cols: k,
+            swiglu: None,
+            weight: rotated,
+            m,
+            n,
+        }),
+        "linear_residual",
+    );
 }

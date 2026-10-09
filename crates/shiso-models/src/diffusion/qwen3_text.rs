@@ -585,15 +585,10 @@ impl TextEncoder {
                 step,
                 out: out.view(),
                 input: input.view(),
-                weight: lin.w.view(),
-                weight_scale: lin.scale,
-                row_scale: lin.row_scale.as_ref().map(DeviceBuffer::view),
-                rotate: lin.rotate,
-                bias: lin.bias.as_ref().map(DeviceBuffer::view),
+                weight: lin.weight(),
                 m: t,
                 n,
                 k,
-                kind: lin.kind,
             })
         };
 

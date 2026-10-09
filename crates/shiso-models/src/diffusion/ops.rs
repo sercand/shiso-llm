@@ -72,13 +72,21 @@ fn fail(step: &'static str) -> impl Fn(shiso_core::CoreError) -> ImageGenError {
 /// The epilogue-scale binding a GEMM entry of `kind` takes: the per-row
 /// vector for [`WeightKind::Int8Row`], the scalar for every other kind. A
 /// mismatch is a loader bug, refused rather than run with a scale of one.
+///
+/// A rotation on any kind but [`WeightKind::Int8Row`] is refused the same
+/// way: only the INT8 export stores a rotated weight, so rotating the input
+/// of a BF16/FP8/F32 product would silently change its answer.
 fn scale_binding<'a>(
     step: &'static str,
-    kind: WeightKind,
-    weight_scale: f32,
-    row_scale: Option<DeviceView<'a>>,
+    weight: &LinWeight<'a>,
 ) -> Result<KernelArg<'a>, ImageGenError> {
-    match (kind, row_scale) {
+    let kind = weight.kind;
+    if weight.rotate.is_some() && kind != WeightKind::Int8Row {
+        return Err(ImageGenError::Backend(format!(
+            "{step}: an input rotation was passed with a {kind:?} weight; only per-row INT8 weights are stored rotated"
+        )));
+    }
+    match (kind, weight.row_scale) {
         (WeightKind::Int8Row, Some(rows)) => Ok(KernelArg::Buffer(rows)),
         (WeightKind::Int8Row, None) => Err(ImageGenError::Backend(format!(
             "{step}: a per-row INT8 weight was passed without its row scales"
@@ -86,7 +94,7 @@ fn scale_binding<'a>(
         (_, Some(_)) => Err(ImageGenError::Backend(format!(
             "{step}: row scales were passed with a {kind:?} weight, which takes a tensor scale"
         ))),
-        (_, None) => Ok(KernelArg::F32(weight_scale)),
+        (_, None) => Ok(KernelArg::F32(weight.scale)),
     }
 }
 
@@ -344,28 +352,80 @@ pub(crate) enum WeightKind {
     Int8Row,
 }
 
+/// Everything a GEMM entry needs to know about the weight side of a product,
+/// as one value.
+///
+/// The fields are private and there are exactly two ways to build one:
+/// [`Lin::weight`](super::lin::Lin::weight), which copies every fact the
+/// loader read (format, scale, per-row scales, bias, input rotation), and
+/// [`LinWeight::f32`] for a raw F32 operand that is not a checkpoint linear
+/// (the VAE attention's products), which has no scale, bias or rotation to
+/// forget. A call site holding a [`super::lin::Lin`] therefore cannot drop
+/// its `ConvRot` rotation or its row scales: there is no field to leave out.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LinWeight<'a> {
+    /// BF16, `F8_E4M3`, F32 or I8 weight rows, (n, k), exactly as the
+    /// checkpoint stored them.
+    w: DeviceView<'a>,
+    kind: WeightKind,
+    /// Multiplier applied to the accumulated dot product: the FP8 tensor's
+    /// `weight_scale`, or 1.0 otherwise. It rides the epilogue, so the weight
+    /// is never rescaled in memory.
+    scale: f32,
+    /// The `n` per-row scales of an [`WeightKind::Int8Row`] weight (and of
+    /// no other kind), riding the epilogue in place of `scale`.
+    row_scale: Option<DeviceView<'a>>,
+    /// The rotation the weight was stored under; the driver rotates the
+    /// input into a scratch buffer first, never the caller's buffer.
+    rotate: Option<RotGroup>,
+    bias: Option<DeviceView<'a>>,
+}
+
+impl<'a> LinWeight<'a> {
+    /// A raw F32 `(n, k)` operand with no scale, bias or rotation.
+    pub(crate) fn f32(w: DeviceView<'a>) -> Self {
+        Self {
+            w,
+            kind: WeightKind::F32,
+            scale: 1.0,
+            row_scale: None,
+            rotate: None,
+            bias: None,
+        }
+    }
+
+    /// Forces a rotation onto any weight: the refusal tests' way to build
+    /// the mismatch no production constructor can.
+    #[cfg(test)]
+    pub(crate) fn with_rotation(mut self, rotate: Option<RotGroup>) -> Self {
+        self.rotate = rotate;
+        self
+    }
+
+    /// Every fact of a loaded linear. Reached through
+    /// [`Lin::weight`](super::lin::Lin::weight).
+    pub(super) fn of(lin: &'a super::lin::Lin) -> Self {
+        Self {
+            w: lin.w.view(),
+            kind: lin.kind,
+            scale: lin.scale,
+            row_scale: lin.row_scale.as_ref().map(DeviceBuffer::view),
+            rotate: lin.rotate,
+            bias: lin.bias.as_ref().map(DeviceBuffer::view),
+        }
+    }
+}
+
 /// One matrix multiply against a linear weight stored in its native format.
 pub(crate) struct GemmCall<'a> {
     pub step: &'static str,
     pub out: DeviceView<'a>,
     pub input: DeviceView<'a>,
-    /// BF16, `F8_E4M3`, F32 or I8 weight rows, (n, k), exactly as the checkpoint stored them.
-    pub weight: DeviceView<'a>,
-    /// Multiplier applied to the accumulated dot product: the FP8 tensor's
-    /// `weight_scale`, or 1.0 otherwise. It rides the epilogue, so the weight
-    /// is never rescaled in memory.
-    pub weight_scale: f32,
-    /// The `n` per-row scales of an [`WeightKind::Int8Row`] weight (and of
-    /// no other kind), riding the epilogue in place of `weight_scale`.
-    pub row_scale: Option<DeviceView<'a>>,
-    /// The rotation the weight was stored under; the driver rotates the
-    /// input into a scratch buffer first, never the caller's buffer.
-    pub rotate: Option<RotGroup>,
-    pub bias: Option<DeviceView<'a>>,
+    /// The weight side: format, scales, bias and input rotation together.
+    pub weight: LinWeight<'a>,
     pub m: usize,
     pub n: usize,
     pub k: usize,
-    pub kind: WeightKind,
 }
 
 /// The gated half of a fused row pair: `silu(rows[r, offset + i]) *
@@ -393,14 +453,9 @@ pub(crate) struct LinearResidualCall<'a> {
     pub dense_cols: usize,
     /// The trailing part of the input, formed from a gate/up row pair.
     pub swiglu: Option<SwigluInput<'a>>,
-    pub weight: DeviceView<'a>,
-    pub weight_scale: f32,
-    /// As [`GemmCall::row_scale`].
-    pub row_scale: Option<DeviceView<'a>>,
-    /// As [`GemmCall::rotate`]: the formed `[dense | swiglu]` row is rotated.
-    pub rotate: Option<RotGroup>,
-    pub bias: Option<DeviceView<'a>>,
-    pub kind: WeightKind,
+    /// As [`GemmCall::weight`]; a rotation applies to the formed
+    /// `[dense | swiglu]` row.
+    pub weight: LinWeight<'a>,
     pub m: usize,
     pub n: usize,
 }
@@ -1142,9 +1197,10 @@ impl Ops {
     /// the one place every linear passes through, so no call site can forget
     /// it and the caller's input is never written.
     pub(crate) fn gemm(&self, call: &GemmCall<'_>) -> Result<(), ImageGenError> {
-        let scale_arg = scale_binding(call.step, call.kind, call.weight_scale, call.row_scale)?;
+        let lw = &call.weight;
+        let scale_arg = scale_binding(call.step, lw)?;
         let rotated;
-        let input = match call.rotate {
+        let input = match lw.rotate {
             Some(group) => {
                 rotated = self.alloc_f32(call.step, call.m * call.k)?;
                 self.rotate(&RotateCall {
@@ -1164,13 +1220,13 @@ impl Ops {
             m: call.m as u32,
             n: call.n as u32,
             k: call.k as u32,
-            has_bias: u32::from(call.bias.is_some()),
+            has_bias: u32::from(lw.bias.is_some()),
         };
-        let bias = call.bias.unwrap_or(self.dummy.view());
+        let bias = lw.bias.unwrap_or(self.dummy.view());
         // The simdgroup tile stages whole 16-wide k slices; every linear in
         // the family qualifies, and the scalar kernels keep any other shape.
         let tiled = call.k.is_multiple_of(G64_K);
-        let entry = match (call.kind, tiled) {
+        let entry = match (lw.kind, tiled) {
             (WeightKind::Fp8, true) => "kernel_dit_gemm64_fp8",
             (WeightKind::Bf16, true) => "kernel_dit_gemm64_bf16",
             (WeightKind::F32, true) => "kernel_dit_gemm64_f32",
@@ -1208,7 +1264,7 @@ impl Ops {
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(call.out),
                 KernelArg::Buffer(input),
-                KernelArg::Buffer(call.weight),
+                KernelArg::Buffer(lw.w),
                 scale_arg,
                 KernelArg::Buffer(bias),
             ],
@@ -1238,13 +1294,14 @@ impl Ops {
                 call.step
             )));
         }
-        let scale_arg = scale_binding(call.step, call.kind, call.weight_scale, call.row_scale)?;
+        let lw = &call.weight;
+        let scale_arg = scale_binding(call.step, lw)?;
         // A rotated weight takes the formed row rotated: the rotation pass
         // forms `[dense | swiglu]` itself and writes it packed, and the fused
         // tile then reads that as a dense-only row. The group divides k, so
         // the shape always suits the tile.
         let rotated;
-        let (dense, dense_cols, swiglu, inner) = match call.rotate {
+        let (dense, dense_cols, swiglu, inner) = match lw.rotate {
             Some(group) => {
                 rotated = self.alloc_f32(call.step, call.m * k)?;
                 self.rotate(&RotateCall {
@@ -1270,9 +1327,9 @@ impl Ops {
             inner: inner as u32,
             gu_stride: swiglu.map_or(0, |s| s.stride) as u32,
             gu_offset: swiglu.map_or(0, |s| s.offset) as u32,
-            has_bias: u32::from(call.bias.is_some()),
+            has_bias: u32::from(lw.bias.is_some()),
         };
-        let entry = match call.kind {
+        let entry = match lw.kind {
             WeightKind::Fp8 => "kernel_dit_gemm64_fused_fp8",
             WeightKind::Bf16 => "kernel_dit_gemm64_fused_bf16",
             WeightKind::F32 => "kernel_dit_gemm64_fused_f32",
@@ -1292,9 +1349,9 @@ impl Ops {
                 KernelArg::Buffer(call.residual),
                 KernelArg::Buffer(dense.unwrap_or(self.dummy.view())),
                 KernelArg::Buffer(swiglu.map_or(self.dummy.view(), |s| s.rows)),
-                KernelArg::Buffer(call.weight),
+                KernelArg::Buffer(lw.w),
                 scale_arg,
-                KernelArg::Buffer(call.bias.unwrap_or(self.dummy.view())),
+                KernelArg::Buffer(lw.bias.unwrap_or(self.dummy.view())),
                 KernelArg::Buffer(call.gate),
             ],
         )
@@ -1348,17 +1405,13 @@ impl Ops {
             step: call.step,
             out: tmp.view(),
             input,
+            // Only an unrotated linear reaches the separate passes (a rotated
+            // one always suits the fused tile), so the weight is passed on
+            // whole and its rotation, were there one, would still run.
             weight: call.weight,
-            weight_scale: call.weight_scale,
-            row_scale: call.row_scale,
-            // Only an unrotated linear reaches the separate passes: a rotated
-            // one always suits the fused tile.
-            rotate: None,
-            bias: call.bias,
             m,
             n: call.n,
             k: dense_cols + inner,
-            kind: call.kind,
         })?;
         self.add_gated(&AddGatedCall {
             step: call.step,

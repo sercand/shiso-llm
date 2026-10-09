@@ -9,7 +9,7 @@ use shiso_core::DeviceBuffer;
 use shiso_modelfile::st_header::StDType;
 use shiso_vision::generator::ImageGenError;
 
-use super::ops::{Ops, WeightKind};
+use super::ops::{LinWeight, Ops, WeightKind};
 use super::quant::{RotGroup, read_int8_layout};
 use super::weights::StStore;
 
@@ -105,5 +105,12 @@ impl Lin {
             out_dim,
             in_dim,
         })
+    }
+
+    /// The weight side of a GEMM against this linear: every fact the
+    /// loader read, as the one value the GEMM entries take, so a call site
+    /// cannot forget the rotation or the row scales.
+    pub(crate) fn weight(&self) -> LinWeight<'_> {
+        LinWeight::of(self)
     }
 }
