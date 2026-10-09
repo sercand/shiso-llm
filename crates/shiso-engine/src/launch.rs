@@ -1757,6 +1757,282 @@ const EXT_Q5_K_BY_NAME: [[&str; 3]; 5] = [
     ],
 ];
 
+/// The `q2_K` instantiations, spelled the same way and for the same reason as
+/// the four above: a CUDA module holds one symbol per instantiation, so the
+/// lane split that is a function constant on Metal is part of the symbol there.
+///
+/// `q2_K` and the eight i-quant tables below are the mixed set of the Saluki
+/// export. All nine decode through the `kq` walk - one whole 32-weight
+/// sub-block a lane, the twin of `kernel_mul_mv_ext_kq_f32_disp` in
+/// `crates/shiso-metal/metal/generic/mul_mv_ext.metal` - and all fifteen
+/// `(r1ptg, nxpsg)` pairs are instantiated in
+/// `kernels/cuda/generic/generic.cu`, because a pair that is merely absent is
+/// a decode that resolves at one prompt width and refuses at another. Without
+/// these tables [`ext_name_for`] answered `None` for them on a backend that
+/// specializes by name, the projection fell through to `plain_projection`,
+/// and the pass refused with "`Q2_K` has no plain matvec at this width".
+const EXT_Q2_K_BY_NAME: [[&str; 3]; 5] = [
+    [
+        "kernel_mul_mv_ext_q2_K_f32_r1_1_nx4",
+        "kernel_mul_mv_ext_q2_K_f32_r1_1_nx8",
+        "kernel_mul_mv_ext_q2_K_f32_r1_1_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_q2_K_f32_r1_2_nx4",
+        "kernel_mul_mv_ext_q2_K_f32_r1_2_nx8",
+        "kernel_mul_mv_ext_q2_K_f32_r1_2_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_q2_K_f32_r1_3_nx4",
+        "kernel_mul_mv_ext_q2_K_f32_r1_3_nx8",
+        "kernel_mul_mv_ext_q2_K_f32_r1_3_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_q2_K_f32_r1_4_nx4",
+        "kernel_mul_mv_ext_q2_K_f32_r1_4_nx8",
+        "kernel_mul_mv_ext_q2_K_f32_r1_4_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_q2_K_f32_r1_5_nx4",
+        "kernel_mul_mv_ext_q2_K_f32_r1_5_nx8",
+        "kernel_mul_mv_ext_q2_K_f32_r1_5_nx16",
+    ],
+];
+
+/// The `iq2_xxs` instantiations.
+const EXT_IQ2_XXS_BY_NAME: [[&str; 3]; 5] = [
+    [
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_1_nx4",
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_1_nx8",
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_1_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_2_nx4",
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_2_nx8",
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_2_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_3_nx4",
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_3_nx8",
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_3_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_4_nx4",
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_4_nx8",
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_4_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_5_nx4",
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_5_nx8",
+        "kernel_mul_mv_ext_iq2_xxs_f32_r1_5_nx16",
+    ],
+];
+
+/// The `iq2_xs` instantiations.
+const EXT_IQ2_XS_BY_NAME: [[&str; 3]; 5] = [
+    [
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_1_nx4",
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_1_nx8",
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_1_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_2_nx4",
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_2_nx8",
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_2_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_3_nx4",
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_3_nx8",
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_3_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_4_nx4",
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_4_nx8",
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_4_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_5_nx4",
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_5_nx8",
+        "kernel_mul_mv_ext_iq2_xs_f32_r1_5_nx16",
+    ],
+];
+
+/// The `iq2_s` instantiations.
+const EXT_IQ2_S_BY_NAME: [[&str; 3]; 5] = [
+    [
+        "kernel_mul_mv_ext_iq2_s_f32_r1_1_nx4",
+        "kernel_mul_mv_ext_iq2_s_f32_r1_1_nx8",
+        "kernel_mul_mv_ext_iq2_s_f32_r1_1_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_s_f32_r1_2_nx4",
+        "kernel_mul_mv_ext_iq2_s_f32_r1_2_nx8",
+        "kernel_mul_mv_ext_iq2_s_f32_r1_2_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_s_f32_r1_3_nx4",
+        "kernel_mul_mv_ext_iq2_s_f32_r1_3_nx8",
+        "kernel_mul_mv_ext_iq2_s_f32_r1_3_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_s_f32_r1_4_nx4",
+        "kernel_mul_mv_ext_iq2_s_f32_r1_4_nx8",
+        "kernel_mul_mv_ext_iq2_s_f32_r1_4_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq2_s_f32_r1_5_nx4",
+        "kernel_mul_mv_ext_iq2_s_f32_r1_5_nx8",
+        "kernel_mul_mv_ext_iq2_s_f32_r1_5_nx16",
+    ],
+];
+
+/// The `iq3_xxs` instantiations.
+const EXT_IQ3_XXS_BY_NAME: [[&str; 3]; 5] = [
+    [
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_1_nx4",
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_1_nx8",
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_1_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_2_nx4",
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_2_nx8",
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_2_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_3_nx4",
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_3_nx8",
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_3_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_4_nx4",
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_4_nx8",
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_4_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_5_nx4",
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_5_nx8",
+        "kernel_mul_mv_ext_iq3_xxs_f32_r1_5_nx16",
+    ],
+];
+
+/// The `iq3_s` instantiations.
+const EXT_IQ3_S_BY_NAME: [[&str; 3]; 5] = [
+    [
+        "kernel_mul_mv_ext_iq3_s_f32_r1_1_nx4",
+        "kernel_mul_mv_ext_iq3_s_f32_r1_1_nx8",
+        "kernel_mul_mv_ext_iq3_s_f32_r1_1_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq3_s_f32_r1_2_nx4",
+        "kernel_mul_mv_ext_iq3_s_f32_r1_2_nx8",
+        "kernel_mul_mv_ext_iq3_s_f32_r1_2_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq3_s_f32_r1_3_nx4",
+        "kernel_mul_mv_ext_iq3_s_f32_r1_3_nx8",
+        "kernel_mul_mv_ext_iq3_s_f32_r1_3_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq3_s_f32_r1_4_nx4",
+        "kernel_mul_mv_ext_iq3_s_f32_r1_4_nx8",
+        "kernel_mul_mv_ext_iq3_s_f32_r1_4_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq3_s_f32_r1_5_nx4",
+        "kernel_mul_mv_ext_iq3_s_f32_r1_5_nx8",
+        "kernel_mul_mv_ext_iq3_s_f32_r1_5_nx16",
+    ],
+];
+
+/// The `iq1_s` instantiations.
+const EXT_IQ1_S_BY_NAME: [[&str; 3]; 5] = [
+    [
+        "kernel_mul_mv_ext_iq1_s_f32_r1_1_nx4",
+        "kernel_mul_mv_ext_iq1_s_f32_r1_1_nx8",
+        "kernel_mul_mv_ext_iq1_s_f32_r1_1_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq1_s_f32_r1_2_nx4",
+        "kernel_mul_mv_ext_iq1_s_f32_r1_2_nx8",
+        "kernel_mul_mv_ext_iq1_s_f32_r1_2_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq1_s_f32_r1_3_nx4",
+        "kernel_mul_mv_ext_iq1_s_f32_r1_3_nx8",
+        "kernel_mul_mv_ext_iq1_s_f32_r1_3_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq1_s_f32_r1_4_nx4",
+        "kernel_mul_mv_ext_iq1_s_f32_r1_4_nx8",
+        "kernel_mul_mv_ext_iq1_s_f32_r1_4_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq1_s_f32_r1_5_nx4",
+        "kernel_mul_mv_ext_iq1_s_f32_r1_5_nx8",
+        "kernel_mul_mv_ext_iq1_s_f32_r1_5_nx16",
+    ],
+];
+
+/// The `iq1_m` instantiations. The export also stores the vocabulary table at
+/// `iq1_m`; that gather is a separate entry (`kernel_get_rows_iq1_m_f32`),
+/// not this family.
+const EXT_IQ1_M_BY_NAME: [[&str; 3]; 5] = [
+    [
+        "kernel_mul_mv_ext_iq1_m_f32_r1_1_nx4",
+        "kernel_mul_mv_ext_iq1_m_f32_r1_1_nx8",
+        "kernel_mul_mv_ext_iq1_m_f32_r1_1_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq1_m_f32_r1_2_nx4",
+        "kernel_mul_mv_ext_iq1_m_f32_r1_2_nx8",
+        "kernel_mul_mv_ext_iq1_m_f32_r1_2_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq1_m_f32_r1_3_nx4",
+        "kernel_mul_mv_ext_iq1_m_f32_r1_3_nx8",
+        "kernel_mul_mv_ext_iq1_m_f32_r1_3_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq1_m_f32_r1_4_nx4",
+        "kernel_mul_mv_ext_iq1_m_f32_r1_4_nx8",
+        "kernel_mul_mv_ext_iq1_m_f32_r1_4_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq1_m_f32_r1_5_nx4",
+        "kernel_mul_mv_ext_iq1_m_f32_r1_5_nx8",
+        "kernel_mul_mv_ext_iq1_m_f32_r1_5_nx16",
+    ],
+];
+
+/// The `iq4_xs` instantiations, the 4-bit end of the mixed set.
+const EXT_IQ4_XS_BY_NAME: [[&str; 3]; 5] = [
+    [
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_1_nx4",
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_1_nx8",
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_1_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_2_nx4",
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_2_nx8",
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_2_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_3_nx4",
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_3_nx8",
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_3_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_4_nx4",
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_4_nx8",
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_4_nx16",
+    ],
+    [
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_5_nx4",
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_5_nx8",
+        "kernel_mul_mv_ext_iq4_xs_f32_r1_5_nx16",
+    ],
+];
+
 /// Where a lane split sits in [`EXT_Q4_0_BY_NAME`]'s second axis.
 ///
 /// `None` for a split the family is not built with, which is every value except
@@ -1779,13 +2055,14 @@ const fn nxpsg_slot(nxpsg: u32) -> Option<usize> {
 /// symbol per instantiation and refuses a constant at launch rather than
 /// launching a variant the caller did not ask for.
 ///
-/// Four formats have the by-name spelling - the `q4_0` every Gemma 4 linear
-/// layer is packed at, the `q6_K` its tied output head is, and the `q4_K` and
-/// `q5_K` a qwen35 `Q4_K_M` container keeps 131 and 48 tensors at - and `None`
-/// for any other is a deliberate refusal rather than an omission: the remaining formats have no
-/// instantiation under that spelling anywhere in the tree, and returning the
-/// unspecialized name would hand back an entry whose lane split is whatever the
-/// module happened to be built with.
+/// Thirteen formats have the by-name spelling - the `q4_0` every Gemma 4 linear
+/// layer is packed at, the `q6_K` its tied output head is, the `q4_K` and
+/// `q5_K` a qwen35 `Q4_K_M` container keeps 131 and 48 tensors at, and the
+/// nine mixed sub-4-bit formats of the Saluki export - and `None` for any
+/// other is a deliberate refusal rather than an omission: the remaining
+/// formats have no instantiation under that spelling anywhere in the tree,
+/// and returning the unspecialized name would hand back an entry whose lane
+/// split is whatever the module happened to be built with.
 #[must_use]
 pub const fn ext_name_for(
     dtype: DType,
@@ -1804,6 +2081,15 @@ pub const fn ext_name_for(
         DType::Q4_K => &EXT_Q4_K_BY_NAME,
         DType::Q5_K => &EXT_Q5_K_BY_NAME,
         DType::Q6_K => &EXT_Q6_K_BY_NAME,
+        DType::Q2_K => &EXT_Q2_K_BY_NAME,
+        DType::IQ2_XXS => &EXT_IQ2_XXS_BY_NAME,
+        DType::IQ2_XS => &EXT_IQ2_XS_BY_NAME,
+        DType::IQ2_S => &EXT_IQ2_S_BY_NAME,
+        DType::IQ3_XXS => &EXT_IQ3_XXS_BY_NAME,
+        DType::IQ3_S => &EXT_IQ3_S_BY_NAME,
+        DType::IQ1_S => &EXT_IQ1_S_BY_NAME,
+        DType::IQ1_M => &EXT_IQ1_M_BY_NAME,
+        DType::IQ4_XS => &EXT_IQ4_XS_BY_NAME,
         _ => return None,
     };
     match nxpsg_slot(nxpsg) {
@@ -2097,7 +2383,8 @@ pub(crate) fn plain_consts_static(nsg: u32) -> Option<&'static [FnConst]> {
 mod tests {
     use super::{
         EXT_NSG_INDEX, GENERIC, PLAIN_NSG_CAP, PLAIN_ROWS, PLAIN_SHORT_ROWS, PLAIN_SMEM_BYTES,
-        TensorDesc, WARP, ext_module, ext_name, plain_block, plain_consts, plain_mv, plain_mv_grid,
+        TensorDesc, WARP, ext_module, ext_name, ext_name_for, plain_block, plain_consts, plain_mv,
+        plain_mv_grid,
     };
     use shiso_core::backend::FnConstValue;
     use shiso_core::dtype::DType;
@@ -2306,6 +2593,47 @@ mod tests {
                 ext_module(dtype),
                 GENERIC,
                 "{dtype:?} was compiled into the generic set, not the qwen35 one"
+            );
+        }
+    }
+
+    /// The same nine formats under the by-name spelling, at every pair the
+    /// tables hold.
+    ///
+    /// The name is written from the tag rather than copied out of a table
+    /// because that is the claim worth grading: the entry point is the
+    /// constant spelling's name with `_nx4`, `_nx8` or `_nx16` appended, and
+    /// nothing else changes. `ext_matvec_entries` then checks that each of
+    /// these names has an instantiation in the CUDA generic set, which is
+    /// what makes the pair of tables and sources a checked thing rather than
+    /// two lists somebody keeps in their heads.
+    #[test]
+    fn the_mixed_i_quants_have_by_name_spellings() {
+        for (dtype, tag) in SALUKI_MATVEC_TAGS {
+            for r1ptg in 1..=5 {
+                for nxpsg in [4u32, 8, 16] {
+                    let want = format!("kernel_mul_mv_ext_{tag}_f32_r1_{r1ptg}_nx{nxpsg}");
+                    assert_eq!(
+                        ext_name_for(dtype, r1ptg, nxpsg, true),
+                        Some(want.as_str()),
+                        "{dtype:?} at {r1ptg} rows and {nxpsg} lanes must name the                          instantiation the CUDA generic set exports"
+                    );
+                }
+            }
+            assert_eq!(
+                ext_name_for(dtype, 0, 4, true),
+                None,
+                "{dtype:?} has no zero-row table slot"
+            );
+            assert_eq!(
+                ext_name_for(dtype, 6, 4, true),
+                None,
+                "{dtype:?} is not instantiated at six rows per threadgroup"
+            );
+            assert_eq!(
+                ext_name_for(dtype, 1, 32, true),
+                None,
+                "{dtype:?} is not instantiated at a 32-lane split"
             );
         }
     }

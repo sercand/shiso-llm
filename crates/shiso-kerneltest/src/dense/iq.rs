@@ -13,16 +13,18 @@
 //! only prove the two encoders agree.
 //!
 //! The matvec cases launch the `kernel_mul_mv_ext_<fmt>_f32_r1_<1..=5>`
-//! family on the same geometry `shiso_engine::launch` picks, and the gather
-//! launches `kernel_get_rows_iq1_m_f32` with the same argument block and grid
-//! as the engine's single gather launch site. The table case reads the nine
-//! `constant` arrays of `iq_tables.metal` back off the device through
-//! `kernel_iq_table_copy` and byte-compares them against the host tables:
-//! those values are format data, and one changed byte silently redefines
-//! every checkpoint on disk.
+//! family on the same geometry `shiso_engine::launch` picks - the constant
+//! spelling on Metal, the by-name spelling on a device that folds the lane
+//! split into the symbol - and the gather launches `kernel_get_rows_iq1_m_f32`
+//! with the same argument block and grid as the engine's single gather launch
+//! site. The table case reads the nine codebook tables back off the device
+//! through `kernel_iq_table_copy` and byte-compares them against the host
+//! tables: those values are format data, and one changed byte silently
+//! redefines every checkpoint on disk.
 //!
 //! The `#[test]` wrappers live in each backend's own driver -
-//! `crates/shiso-metal/tests/dense_iq.rs`.
+//! `crates/shiso-metal/tests/dense_iq.rs` and
+//! `crates/shiso-cuda/tests/dense_iq.rs`.
 #![expect(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -128,6 +130,12 @@ struct Format {
     block_bytes: usize,
     /// The five row-blocked instantiations, indexed by `r1ptg - 1`.
     entries: [&'static str; 5],
+    /// The same fifteen entry points with the lane split folded into the
+    /// name, indexed by `[r1ptg - 1][nxpsg slot]`, mirroring the engine's
+    /// `EXT_*_BY_NAME` tables. A CUDA module holds one symbol per
+    /// instantiation, so the split that is a pipeline constant on Metal is
+    /// part of the symbol there.
+    entries_by_name: [[&'static str; 3]; 5],
 }
 
 /// The nine formats the `kq` walk reads, in the order the engine's dispatch
@@ -144,6 +152,33 @@ const FORMATS: [Format; 9] = [
             "kernel_mul_mv_ext_q2_K_f32_r1_4",
             "kernel_mul_mv_ext_q2_K_f32_r1_5",
         ],
+        entries_by_name: [
+            [
+                "kernel_mul_mv_ext_q2_K_f32_r1_1_nx4",
+                "kernel_mul_mv_ext_q2_K_f32_r1_1_nx8",
+                "kernel_mul_mv_ext_q2_K_f32_r1_1_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_q2_K_f32_r1_2_nx4",
+                "kernel_mul_mv_ext_q2_K_f32_r1_2_nx8",
+                "kernel_mul_mv_ext_q2_K_f32_r1_2_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_q2_K_f32_r1_3_nx4",
+                "kernel_mul_mv_ext_q2_K_f32_r1_3_nx8",
+                "kernel_mul_mv_ext_q2_K_f32_r1_3_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_q2_K_f32_r1_4_nx4",
+                "kernel_mul_mv_ext_q2_K_f32_r1_4_nx8",
+                "kernel_mul_mv_ext_q2_K_f32_r1_4_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_q2_K_f32_r1_5_nx4",
+                "kernel_mul_mv_ext_q2_K_f32_r1_5_nx8",
+                "kernel_mul_mv_ext_q2_K_f32_r1_5_nx16",
+            ],
+        ],
     },
     Format {
         dtype: DType::IQ2_XXS,
@@ -155,6 +190,33 @@ const FORMATS: [Format; 9] = [
             "kernel_mul_mv_ext_iq2_xxs_f32_r1_3",
             "kernel_mul_mv_ext_iq2_xxs_f32_r1_4",
             "kernel_mul_mv_ext_iq2_xxs_f32_r1_5",
+        ],
+        entries_by_name: [
+            [
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_1_nx4",
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_1_nx8",
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_1_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_2_nx4",
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_2_nx8",
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_2_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_3_nx4",
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_3_nx8",
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_3_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_4_nx4",
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_4_nx8",
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_4_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_5_nx4",
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_5_nx8",
+                "kernel_mul_mv_ext_iq2_xxs_f32_r1_5_nx16",
+            ],
         ],
     },
     Format {
@@ -168,6 +230,33 @@ const FORMATS: [Format; 9] = [
             "kernel_mul_mv_ext_iq2_xs_f32_r1_4",
             "kernel_mul_mv_ext_iq2_xs_f32_r1_5",
         ],
+        entries_by_name: [
+            [
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_1_nx4",
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_1_nx8",
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_1_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_2_nx4",
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_2_nx8",
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_2_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_3_nx4",
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_3_nx8",
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_3_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_4_nx4",
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_4_nx8",
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_4_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_5_nx4",
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_5_nx8",
+                "kernel_mul_mv_ext_iq2_xs_f32_r1_5_nx16",
+            ],
+        ],
     },
     Format {
         dtype: DType::IQ2_S,
@@ -179,6 +268,33 @@ const FORMATS: [Format; 9] = [
             "kernel_mul_mv_ext_iq2_s_f32_r1_3",
             "kernel_mul_mv_ext_iq2_s_f32_r1_4",
             "kernel_mul_mv_ext_iq2_s_f32_r1_5",
+        ],
+        entries_by_name: [
+            [
+                "kernel_mul_mv_ext_iq2_s_f32_r1_1_nx4",
+                "kernel_mul_mv_ext_iq2_s_f32_r1_1_nx8",
+                "kernel_mul_mv_ext_iq2_s_f32_r1_1_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_s_f32_r1_2_nx4",
+                "kernel_mul_mv_ext_iq2_s_f32_r1_2_nx8",
+                "kernel_mul_mv_ext_iq2_s_f32_r1_2_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_s_f32_r1_3_nx4",
+                "kernel_mul_mv_ext_iq2_s_f32_r1_3_nx8",
+                "kernel_mul_mv_ext_iq2_s_f32_r1_3_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_s_f32_r1_4_nx4",
+                "kernel_mul_mv_ext_iq2_s_f32_r1_4_nx8",
+                "kernel_mul_mv_ext_iq2_s_f32_r1_4_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq2_s_f32_r1_5_nx4",
+                "kernel_mul_mv_ext_iq2_s_f32_r1_5_nx8",
+                "kernel_mul_mv_ext_iq2_s_f32_r1_5_nx16",
+            ],
         ],
     },
     Format {
@@ -192,6 +308,33 @@ const FORMATS: [Format; 9] = [
             "kernel_mul_mv_ext_iq3_xxs_f32_r1_4",
             "kernel_mul_mv_ext_iq3_xxs_f32_r1_5",
         ],
+        entries_by_name: [
+            [
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_1_nx4",
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_1_nx8",
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_1_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_2_nx4",
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_2_nx8",
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_2_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_3_nx4",
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_3_nx8",
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_3_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_4_nx4",
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_4_nx8",
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_4_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_5_nx4",
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_5_nx8",
+                "kernel_mul_mv_ext_iq3_xxs_f32_r1_5_nx16",
+            ],
+        ],
     },
     Format {
         dtype: DType::IQ3_S,
@@ -203,6 +346,33 @@ const FORMATS: [Format; 9] = [
             "kernel_mul_mv_ext_iq3_s_f32_r1_3",
             "kernel_mul_mv_ext_iq3_s_f32_r1_4",
             "kernel_mul_mv_ext_iq3_s_f32_r1_5",
+        ],
+        entries_by_name: [
+            [
+                "kernel_mul_mv_ext_iq3_s_f32_r1_1_nx4",
+                "kernel_mul_mv_ext_iq3_s_f32_r1_1_nx8",
+                "kernel_mul_mv_ext_iq3_s_f32_r1_1_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq3_s_f32_r1_2_nx4",
+                "kernel_mul_mv_ext_iq3_s_f32_r1_2_nx8",
+                "kernel_mul_mv_ext_iq3_s_f32_r1_2_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq3_s_f32_r1_3_nx4",
+                "kernel_mul_mv_ext_iq3_s_f32_r1_3_nx8",
+                "kernel_mul_mv_ext_iq3_s_f32_r1_3_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq3_s_f32_r1_4_nx4",
+                "kernel_mul_mv_ext_iq3_s_f32_r1_4_nx8",
+                "kernel_mul_mv_ext_iq3_s_f32_r1_4_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq3_s_f32_r1_5_nx4",
+                "kernel_mul_mv_ext_iq3_s_f32_r1_5_nx8",
+                "kernel_mul_mv_ext_iq3_s_f32_r1_5_nx16",
+            ],
         ],
     },
     Format {
@@ -216,6 +386,33 @@ const FORMATS: [Format; 9] = [
             "kernel_mul_mv_ext_iq1_s_f32_r1_4",
             "kernel_mul_mv_ext_iq1_s_f32_r1_5",
         ],
+        entries_by_name: [
+            [
+                "kernel_mul_mv_ext_iq1_s_f32_r1_1_nx4",
+                "kernel_mul_mv_ext_iq1_s_f32_r1_1_nx8",
+                "kernel_mul_mv_ext_iq1_s_f32_r1_1_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq1_s_f32_r1_2_nx4",
+                "kernel_mul_mv_ext_iq1_s_f32_r1_2_nx8",
+                "kernel_mul_mv_ext_iq1_s_f32_r1_2_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq1_s_f32_r1_3_nx4",
+                "kernel_mul_mv_ext_iq1_s_f32_r1_3_nx8",
+                "kernel_mul_mv_ext_iq1_s_f32_r1_3_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq1_s_f32_r1_4_nx4",
+                "kernel_mul_mv_ext_iq1_s_f32_r1_4_nx8",
+                "kernel_mul_mv_ext_iq1_s_f32_r1_4_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq1_s_f32_r1_5_nx4",
+                "kernel_mul_mv_ext_iq1_s_f32_r1_5_nx8",
+                "kernel_mul_mv_ext_iq1_s_f32_r1_5_nx16",
+            ],
+        ],
     },
     Format {
         dtype: DType::IQ1_M,
@@ -228,6 +425,33 @@ const FORMATS: [Format; 9] = [
             "kernel_mul_mv_ext_iq1_m_f32_r1_4",
             "kernel_mul_mv_ext_iq1_m_f32_r1_5",
         ],
+        entries_by_name: [
+            [
+                "kernel_mul_mv_ext_iq1_m_f32_r1_1_nx4",
+                "kernel_mul_mv_ext_iq1_m_f32_r1_1_nx8",
+                "kernel_mul_mv_ext_iq1_m_f32_r1_1_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq1_m_f32_r1_2_nx4",
+                "kernel_mul_mv_ext_iq1_m_f32_r1_2_nx8",
+                "kernel_mul_mv_ext_iq1_m_f32_r1_2_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq1_m_f32_r1_3_nx4",
+                "kernel_mul_mv_ext_iq1_m_f32_r1_3_nx8",
+                "kernel_mul_mv_ext_iq1_m_f32_r1_3_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq1_m_f32_r1_4_nx4",
+                "kernel_mul_mv_ext_iq1_m_f32_r1_4_nx8",
+                "kernel_mul_mv_ext_iq1_m_f32_r1_4_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq1_m_f32_r1_5_nx4",
+                "kernel_mul_mv_ext_iq1_m_f32_r1_5_nx8",
+                "kernel_mul_mv_ext_iq1_m_f32_r1_5_nx16",
+            ],
+        ],
     },
     Format {
         dtype: DType::IQ4_XS,
@@ -239,6 +463,33 @@ const FORMATS: [Format; 9] = [
             "kernel_mul_mv_ext_iq4_xs_f32_r1_3",
             "kernel_mul_mv_ext_iq4_xs_f32_r1_4",
             "kernel_mul_mv_ext_iq4_xs_f32_r1_5",
+        ],
+        entries_by_name: [
+            [
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_1_nx4",
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_1_nx8",
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_1_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_2_nx4",
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_2_nx8",
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_2_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_3_nx4",
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_3_nx8",
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_3_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_4_nx4",
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_4_nx8",
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_4_nx16",
+            ],
+            [
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_5_nx4",
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_5_nx8",
+                "kernel_mul_mv_ext_iq4_xs_f32_r1_5_nx16",
+            ],
         ],
     },
 ];
@@ -484,17 +735,16 @@ fn fixture(fmt: &Format, seed: u64) -> Fixture {
 /// The entry name and constant table for one `(r1ptg, nxpsg)` pair of one
 /// format.
 ///
-/// This family has only the constant spelling. `shiso_engine::launch::ext_name_for`
-/// returns `None` for these nine on a device that folds the lane split into
-/// the entry name, because no such instantiation exists anywhere in the tree,
-/// and a case that invented the name would be launching a kernel nobody built.
-/// Metal is not such a device, which is why the assertion below has never
-/// fired on the device these cases gate.
+/// Metal spells the format once per row blocking and carries the lane split
+/// beside it as a function constant; CUDA folds the split into the symbol and
+/// launches with an empty constant table, exactly as
+/// `shiso_engine::launch::ext_name_for` splits the two spellings and as this
+/// crate's own `dense::q4_0::matvec_entry` does.
 ///
 /// # Panics
 ///
-/// When `nxpsg` is not one of the three splits the family is built with, or
-/// when the device spells specializations into entry names.
+/// When `r1ptg` is not one of the five row blockings, or `nxpsg` is not one
+/// of the three lane splits the family is built with.
 fn matvec_entry(
     gpu: &Gpu,
     fmt: &Format,
@@ -502,21 +752,26 @@ fn matvec_entry(
     nxpsg: u32,
 ) -> (&'static str, &'static [FnConst]) {
     assert!(
-        !gpu.device().specializes_by_name(),
-        "the nine mixed formats have no by-name instantiation; {} cannot run on this device",
-        fmt.tag,
-    );
-    assert!(
         (1..=5).contains(&r1ptg),
         "{r1ptg} is not a row blocking the family is built with"
     );
+    let slot = match nxpsg {
+        4 => 0,
+        8 => 1,
+        16 => 2,
+        other => panic!("{other} is not a lane split the extended family is built with"),
+    };
+    let row = r1ptg as usize - 1;
+    if gpu.device().specializes_by_name() {
+        return (fmt.entries_by_name[row][slot], &[]);
+    }
     let consts: &'static [FnConst] = match nxpsg {
         4 => &EXT_CONSTS_4,
         8 => &EXT_CONSTS_8,
         16 => &EXT_CONSTS_16,
         other => panic!("{other} is not a lane split the extended family is built with"),
     };
-    (fmt.entries[r1ptg as usize - 1], consts)
+    (fmt.entries[row], consts)
 }
 
 /// Runs one format's matvec at one `(r1ptg, nxpsg)` pair over `n_tok` tokens

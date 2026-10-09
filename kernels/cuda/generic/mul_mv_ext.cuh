@@ -19,15 +19,17 @@
  * invisible at any single width: the model loads, answers at one prompt length
  * and refuses at another.
  *
- * # One body, one codec parameter
+ * # One body per walk, one codec parameter
  *
- * The Metal side is one template over a block struct, an elements-per-block
- * count and a four-element dequantizer. This is the same template with the same
- * three, spelled as a traits struct because a CUDA entry point cannot be a
- * template instantiation and the macro at the bottom has to name a codec. The
- * q4_0 instantiations are graded at every one of the fifteen pairs by
- * `crates/shiso-cuda/tests/dense_q4_0.rs`, which is what keeps a change made
- * for the second codec from moving the first.
+ * The Metal side is two templates over a block struct and a dequantizer: the
+ * four-element walk (`kernel_mul_mv_ext_q4_f32_disp`) and the whole-sub-block
+ * walk (`kernel_mul_mv_ext_kq_f32_disp`). These are the same two templates
+ * with the same two, spelled as traits structs because a CUDA entry point
+ * cannot be a template instantiation and the macros at the bottom have to
+ * name a codec. The q4_0 instantiations are graded at every one of the
+ * fifteen pairs by `crates/shiso-cuda/tests/dense_q4_0.rs`, which is what
+ * keeps a change made for the second codec from moving the first, and the
+ * nine `kq` codecs at every pair by `crates/shiso-cuda/tests/dense_iq.rs`.
  *
  * # What the loop assumes about the row width
  *
@@ -93,6 +95,91 @@ struct shiso_mv_codec_q5_K {
         shiso_dequantize_q5_K_t4(xb, il, reg);
     }
 };
+
+/* The nine mixed i-quant codecs and the `q2_K` one beside them.
+ *
+ * These do not carry a `chunks_per_block` and a four-element unpack like the
+ * four above: all nine blocks are 256 weights and none of them unpacks to a
+ * four-element chunk without re-deriving a group's scale and signs nine
+ * times over, so they take the `kq` walk below - one whole 32-weight
+ * sub-block a lane a turn - exactly as they do on Metal. The `deq32` member
+ * is `shiso_deq32_<format>` from `generic.cuh`, which writes the sub-block's
+ * 32 dequantized weights as eight `float4` and the pair `(a, b)` such that
+ * the sub-block's contribution is `a * sum(q * y) + b * sum(y)`; for the
+ * i-quants that pair is `(1, 0)` because the weights are already fully
+ * dequantized. */
+struct shiso_mv_codec_q2_K {
+    typedef struct shiso_block_q2_K block_t;
+    static __device__ __forceinline__ void deq32(
+            const block_t *xb, int s, float4 *qv, float2 *ab) {
+        shiso_deq32_q2_K(xb, s, qv, ab);
+    }
+};
+
+struct shiso_mv_codec_iq2_xxs {
+    typedef struct shiso_block_iq2_xxs block_t;
+    static __device__ __forceinline__ void deq32(
+            const block_t *xb, int s, float4 *qv, float2 *ab) {
+        shiso_deq32_iq2_xxs(xb, s, qv, ab);
+    }
+};
+
+struct shiso_mv_codec_iq2_xs {
+    typedef struct shiso_block_iq2_xs block_t;
+    static __device__ __forceinline__ void deq32(
+            const block_t *xb, int s, float4 *qv, float2 *ab) {
+        shiso_deq32_iq2_xs(xb, s, qv, ab);
+    }
+};
+
+struct shiso_mv_codec_iq2_s {
+    typedef struct shiso_block_iq2_s block_t;
+    static __device__ __forceinline__ void deq32(
+            const block_t *xb, int s, float4 *qv, float2 *ab) {
+        shiso_deq32_iq2_s(xb, s, qv, ab);
+    }
+};
+
+struct shiso_mv_codec_iq3_xxs {
+    typedef struct shiso_block_iq3_xxs block_t;
+    static __device__ __forceinline__ void deq32(
+            const block_t *xb, int s, float4 *qv, float2 *ab) {
+        shiso_deq32_iq3_xxs(xb, s, qv, ab);
+    }
+};
+
+struct shiso_mv_codec_iq3_s {
+    typedef struct shiso_block_iq3_s block_t;
+    static __device__ __forceinline__ void deq32(
+            const block_t *xb, int s, float4 *qv, float2 *ab) {
+        shiso_deq32_iq3_s(xb, s, qv, ab);
+    }
+};
+
+struct shiso_mv_codec_iq1_s {
+    typedef struct shiso_block_iq1_s block_t;
+    static __device__ __forceinline__ void deq32(
+            const block_t *xb, int s, float4 *qv, float2 *ab) {
+        shiso_deq32_iq1_s(xb, s, qv, ab);
+    }
+};
+
+struct shiso_mv_codec_iq1_m {
+    typedef struct shiso_block_iq1_m block_t;
+    static __device__ __forceinline__ void deq32(
+            const block_t *xb, int s, float4 *qv, float2 *ab) {
+        shiso_deq32_iq1_m(xb, s, qv, ab);
+    }
+};
+
+struct shiso_mv_codec_iq4_xs {
+    typedef struct shiso_block_iq4_xs block_t;
+    static __device__ __forceinline__ void deq32(
+            const block_t *xb, int s, float4 *qv, float2 *ab) {
+        shiso_deq32_iq4_xs(xb, s, qv, ab);
+    }
+};
+
 
 template <typename codec, int r1ptg, int nxpsg>
 __device__ __forceinline__ void shiso_mul_mv_ext_f32_impl(
@@ -215,6 +302,143 @@ __device__ __forceinline__ void shiso_mul_mv_ext_f32_impl(
     }
 }
 
+/* The `kq` walk: one whole 32-weight sub-block a lane a turn.
+ *
+ * The same grid, the same lane split, the same argument block and the same
+ * reduction as `shiso_mul_mv_ext_f32_impl` above, so the host cannot tell
+ * the two apart beyond the entry name. What differs is the unit a lane
+ * takes. The four-element walk above unpacks four weights per turn, and for
+ * the mixed i-quants that means re-deriving a group's grid indices, signs
+ * and scale nine times over its 32 weights; the Metal twin measured the same
+ * shape for the K-quants and moved to the whole-sub-block walk for it. Here
+ * a lane takes sub-block `u`, `deq32` unpacks its 32 weights once, and the
+ * fold is `a * sum(q * y) + b * sum(y)` in the order the Metal twin folds
+ * them - `((qy.x + qy.y) + (qy.z + qy.w))` after eight sequential
+ * component-wise adds - because a golden that pins a decode step pins the
+ * order its partial sums were added in.
+ *
+ * Every block this family reads is 256 weights, eight sub-blocks of 32, so
+ * the walk needs no `chunks_per_block`: sub-block `u` lives at block `u / 8`
+ * and field `u % 8`, and the row's sub-block count is `ne00 / 32` - a whole
+ * number for every width `ext_nxpsg` accepts. */
+template <typename codec, int r1ptg, int nxpsg>
+__device__ __forceinline__ void shiso_mul_mv_ext_kq_f32_impl(
+        const struct shiso_args_mul_mv_ext args,
+        const char *__restrict__ src0,
+        const char *__restrict__ src1,
+        char *__restrict__ dst) {
+    constexpr int nypsg = 32 / nxpsg;
+
+    const int tiisg = (int) threadIdx.x;
+    const int sgitg = (int) threadIdx.y;
+
+    const int tx = tiisg % nxpsg;
+    const int ty = tiisg / nxpsg;
+
+    const int i01 = (int) blockIdx.x * (nypsg * SHISO_EXT_NSG) + nypsg * sgitg + ty;
+    const int i11 = (int) blockIdx.y * r1ptg;
+    const int i1m = (int) blockIdx.z;
+
+    const int i12 = i1m % args.ne12;
+    const int i13 = i1m / args.ne12;
+
+    const uint64_t offset0 = (uint64_t) i01 * args.nb01
+                           + (uint64_t) (i12 / args.r2) * args.nb02
+                           + (uint64_t) (i13 / args.r3) * args.nb03;
+    const uint64_t offset1 = (uint64_t) i11 * args.nb11
+                           + (uint64_t) i12 * args.nb12
+                           + (uint64_t) i13 * args.nb13;
+
+    /* A row past the output extent still runs, reading row zero, because the
+     * reduction below is a whole-warp operation and a lane that returned
+     * early would take its partial sums out of it. Only the store is
+     * guarded. Unlike the four-element walk, the lane's first sub-block is
+     * `tx` rather than a chunk offset into the block, so `xq` starts at the
+     * row itself. */
+    typedef typename codec::block_t block_t;
+    const block_t *xq = (i01 < args.ne01)
+                            ? (const block_t *) (src0 + offset0)
+                            : (const block_t *) src0;
+
+    const float4 *y4[r1ptg];
+#pragma unroll
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        y4[ir1] = (i11 + ir1 < args.ne11)
+                      ? (const float4 *) (src1 + offset1 + (uint64_t) ir1 * args.nb11)
+                      : (const float4 *) src1;
+    }
+
+    float sumf[r1ptg];
+#pragma unroll
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        sumf[ir1] = 0.0f;
+    }
+
+    const int nsub = args.ne00 / 32;
+
+    for (int u = tx; u < nsub; u += nxpsg) {
+        float4 qv[8];
+        float2 ab;
+        codec::deq32(xq + u / 8, u % 8, qv, &ab);
+        const float *qf = (const float *) qv;
+
+#pragma unroll
+        for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+            const float4 *y = y4[ir1] + u * 8;
+            float qy[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            float sy[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const float4 yk = y[k];
+                qy[0] += qf[4 * k + 0] * yk.x;
+                qy[1] += qf[4 * k + 1] * yk.y;
+                qy[2] += qf[4 * k + 2] * yk.z;
+                qy[3] += qf[4 * k + 3] * yk.w;
+                sy[0] += yk.x;
+                sy[1] += yk.y;
+                sy[2] += yk.z;
+                sy[3] += yk.w;
+            }
+            sumf[ir1] += ab.x * ((qy[0] + qy[1]) + (qy[2] + qy[3]))
+                       + ab.y * ((sy[0] + sy[1]) + (sy[2] + sy[3]));
+        }
+    }
+
+    /* Only the lanes of one row, and in the order the Metal twin folds
+     * them, exactly as `shiso_mul_mv_ext_f32_impl` states. */
+#pragma unroll
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        if (nxpsg >= 32) {
+            sumf[ir1] += __shfl_down_sync(0xffffffffu, sumf[ir1], 16, nxpsg);
+        }
+        if (nxpsg >= 16) {
+            sumf[ir1] += __shfl_down_sync(0xffffffffu, sumf[ir1], 8, nxpsg);
+        }
+        if (nxpsg >= 8) {
+            sumf[ir1] += __shfl_down_sync(0xffffffffu, sumf[ir1], 4, nxpsg);
+        }
+        if (nxpsg >= 4) {
+            sumf[ir1] += __shfl_down_sync(0xffffffffu, sumf[ir1], 2, nxpsg);
+        }
+        if (nxpsg >= 2) {
+            sumf[ir1] += __shfl_down_sync(0xffffffffu, sumf[ir1], 1, nxpsg);
+        }
+    }
+
+    if (tx != 0 || i01 >= args.ne01) {
+        return;
+    }
+#pragma unroll
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        if (i11 + ir1 < args.ne11) {
+            float *dst_f32 = (float *) dst
+                           + (uint64_t) i1m * (uint64_t) args.ne0 * (uint64_t) args.ne1
+                           + (uint64_t) (i11 + ir1) * (uint64_t) args.ne0;
+            dst_f32[i01] = sumf[ir1];
+        }
+    }
+}
+
 /* One `.visible .entry` per pair. The names are the host's - the engine writes
  * them as `&'static str` literals in `launch::EXT_Q4_0_BY_NAME`,
  * `EXT_Q4_K_BY_NAME`, `EXT_Q5_K_BY_NAME` and `EXT_Q6_K_BY_NAME` - so the
@@ -245,6 +469,19 @@ __device__ __forceinline__ void shiso_mul_mv_ext_f32_impl(
             const struct shiso_args_mul_mv_ext args, const char *__restrict__ src0,     \
             const char *__restrict__ src1, char *__restrict__ dst) {                    \
         shiso_mul_mv_ext_f32_impl<shiso_mv_codec_q5_K, R, NX>(args, src0, src1, dst);   \
+    }
+
+/* The `kq` walk's macro, one per format and pair. The format tag is the
+ * first argument and appears in the entry name verbatim - `q2_K` keeps the
+ * capital `K` the Metal twin was named with - and selects the codec struct
+ * `shiso_mv_codec_##FMT` beside it, so a name in `launch::EXT_Q2_K_BY_NAME`
+ * and the instantiation that answers it are spelled from one token. */
+#define SHISO_MV_EXT_KQ(FMT, R, NX)                                                     \
+    extern "C" __global__ void kernel_mul_mv_ext_##FMT##_f32_r1_##R##_nx##NX(           \
+            const struct shiso_args_mul_mv_ext args, const char *__restrict__ src0,     \
+            const char *__restrict__ src1, char *__restrict__ dst) {                    \
+        shiso_mul_mv_ext_kq_f32_impl<shiso_mv_codec_##FMT, R, NX>(                      \
+                args, src0, src1, dst);                                                 \
     }
 
 #endif /* SHISO_MUL_MV_EXT_CUH */
