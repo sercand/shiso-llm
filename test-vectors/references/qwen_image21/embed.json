@@ -1,0 +1,46 @@
+{
+ "dim": 4096,
+ "timestep_sinusoid": "cos block first (128), then sin block (128); freq_j = exp(-ln(10000) * j / 128); argument = 1000 * timestep * freq_j; timestep is sigma (the pipeline passes t / 1000).",
+ "modulation_layout": "modulation = Linear(SiLU(temb)) -> 4 * 4096, no bias. chunk(2): mod1 (attention), mod2 (mlp); each chunk(2): [scale, gate]. There is no shift: x * (1 + scale), residual += tanh(gate) * branch.",
+ "rows": {
+  "sigma1.0": {
+   "sigma": 1.0,
+   "timestep_arg": 1.0,
+   "sinusoid_max_abs_vs_numpy_f64": 4.136032978277471e-05,
+   "sinusoid": "embed_sigma1.0_sinusoid.f32",
+   "temb": "embed_sigma1.0_temb.f32",
+   "modulation": "embed_sigma1.0_modulation.f32"
+  },
+  "sigma0.414568": {
+   "sigma": 0.414568,
+   "timestep_arg": 0.4145680069923401,
+   "sinusoid_max_abs_vs_numpy_f64": 3.0450459983566436e-05,
+   "sinusoid": "embed_sigma0.414568_sinusoid.f32",
+   "temb": "embed_sigma0.414568_temb.f32",
+   "modulation": "embed_sigma0.414568_modulation.f32"
+  },
+  "sigma0.02": {
+   "sigma": 0.02,
+   "timestep_arg": 0.019999999552965164,
+   "sinusoid_max_abs_vs_numpy_f64": 7.20153011779523e-07,
+   "sinusoid": "embed_sigma0.02_sinusoid.f32",
+   "temb": "embed_sigma0.02_temb.f32",
+   "modulation": "embed_sigma0.02_modulation.f32"
+  },
+  "t0": {
+   "sigma": 0.0,
+   "timestep_arg": 0.0,
+   "sinusoid_max_abs_vs_numpy_f64": 0.0,
+   "sinusoid": "embed_t0_sinusoid.f32",
+   "temb": "embed_t0_temb.f32",
+   "modulation": "embed_t0_modulation.f32"
+  }
+ },
+ "txt_in": {
+  "x": "embed_txt_in_x.f32",
+  "normed": "embed_txt_in_normed.f32",
+  "out": "embed_txt_in_out.f32",
+  "seed": 11
+ },
+ "t0_row": "the t = 0 row used for text and condition tokens under causal_condition"
+}

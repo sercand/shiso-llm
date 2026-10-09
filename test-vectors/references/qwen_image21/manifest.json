@@ -1,0 +1,1066 @@
+{
+ "captures": {
+  "block": {
+   "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
+  },
+  "convrot": {
+   "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
+  },
+  "embed": {
+   "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
+  },
+  "rope": {
+   "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
+  },
+  "sigmas": {
+   "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
+  },
+  "tokenizer": {
+   "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
+  },
+  "vae": {
+   "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
+  }
+ },
+ "files": {
+  "block.json": {
+   "description": "One-layer QwenImage21Transformer2DModel (non-block weights plus block 0 or block 31 in slot 0, f32) over 20 text tokens and a 4x4 target at sigma 0.704534: per-stage tensors, the full block-causal path and the prefix-KV-cache path.",
+   "dtype": "json",
+   "sha256": "2d6f5bad3be3e44b449b74237f0d131db7faa5fe490a3715d9ec38ef11b7bdde",
+   "shape": null
+  },
+  "block00_block_in.f32": {
+   "description": "Block input [36, 4096]: 20 text then 16 image tokens.",
+   "dtype": "f32le",
+   "sha256": "8586c64eaea186dc6bbcde8b2b168cf17759f7a1026a247e022a8cf2295d3b38",
+   "shape": [
+    36,
+    4096
+   ]
+  },
+  "block00_block_out.f32": {
+   "description": "Block output [36, 4096], full block-causal path.",
+   "dtype": "f32le",
+   "sha256": "9919cdd9a8b339a02e363596c7a611232955f73a76e9d3edd7570a07b468ed88",
+   "shape": [
+    36,
+    4096
+   ]
+  },
+  "block00_cached_block_in.f32": {
+   "description": "Cached-path block input [16, 4096] (target tokens only).",
+   "dtype": "f32le",
+   "sha256": "a310d4138579041696f36409991dbf711afe86c4792974cc152c279981c66e4d",
+   "shape": [
+    16,
+    4096
+   ]
+  },
+  "block00_cached_block_out.f32": {
+   "description": "Cached-path block output [16, 4096].",
+   "dtype": "f32le",
+   "sha256": "da8f82b044a32601b62d6a50d371da8e7f6b80dba150fddf2bdd5a226141dfee",
+   "shape": [
+    16,
+    4096
+   ]
+  },
+  "block00_cached_out.f32": {
+   "description": "Cached-path model output for the target tokens [16, 64] at sigma 0.704534.",
+   "dtype": "f32le",
+   "sha256": "7f788dcdd713a311c863ae6134d8e938924f9d2c12e7639c1c7c8f2b524dd5b7",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "block00_cached_q_head0.f32": {
+   "description": "Cached-path q head 0 [16, 128].",
+   "dtype": "f32le",
+   "sha256": "123eb1978bc777124bd0b7f329f72bdcf5a1d600e7c64420b85173e728f01ce5",
+   "shape": [
+    16,
+    128
+   ]
+  },
+  "block00_img_in.f32": {
+   "description": "img_in output [16, 4096] (before the joint scatter).",
+   "dtype": "f32le",
+   "sha256": "a310d4138579041696f36409991dbf711afe86c4792974cc152c279981c66e4d",
+   "shape": [
+    16,
+    4096
+   ]
+  },
+  "block00_k_head0.f32": {
+   "description": "k after RMSNorm and RoPE, head 0 [36, 128].",
+   "dtype": "f32le",
+   "sha256": "5a37ff5a55b1c6fc0cf6f38bdbe298521d2c25c073a413d2559736a86af82222",
+   "shape": [
+    36,
+    128
+   ]
+  },
+  "block00_model_out.f32": {
+   "description": "Model output over the joint sequence [36, 64] (proj_out).",
+   "dtype": "f32le",
+   "sha256": "54c63fc1b65f85fe285414754f423e7fa840f215914dfb6bdbf3d9fc385f204d",
+   "shape": [
+    36,
+    64
+   ]
+  },
+  "block00_modulation.f32": {
+   "description": "Shared modulation [2, 16384]: row 0 = sigma, row 1 = t 0.",
+   "dtype": "f32le",
+   "sha256": "b6bd3e2d7bc5c64b8aac4ac554cb71064f7779085b6d21532088ff113a6989c5",
+   "shape": [
+    2,
+    16384
+   ]
+  },
+  "block00_prefill_target_out.f32": {
+   "description": "Full-path target output at sigma 1.0 [16, 64].",
+   "dtype": "f32le",
+   "sha256": "3596ebe520751e0d8f15111fe9511f4f4f53c41a31a79975e3121b90f511088c",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "block00_q_head0.f32": {
+   "description": "q after RMSNorm and RoPE, head 0 [36, 128].",
+   "dtype": "f32le",
+   "sha256": "eff73dedbda5b53a532b9227ffc17cf38a626acde4e6723e98c601d9cb88746c",
+   "shape": [
+    36,
+    128
+   ]
+  },
+  "block00_rope_cos.f32": {
+   "description": "Rotary cos [36, 64] the block received.",
+   "dtype": "f32le",
+   "sha256": "999d959dd1bfd01613d62607075cae338a0659c0691e913c9c88147c76fb31e4",
+   "shape": [
+    36,
+    64
+   ]
+  },
+  "block00_rope_sin.f32": {
+   "description": "Rotary sin [36, 64].",
+   "dtype": "f32le",
+   "sha256": "4d43e76b13087aaf7275c01001ed68d6e94c35f4bf065fe090e9d3a083bcea4b",
+   "shape": [
+    36,
+    64
+   ]
+  },
+  "block00_target_out.f32": {
+   "description": "Target-token slice of the model output [16, 64].",
+   "dtype": "f32le",
+   "sha256": "7f788dcdd713a311c863ae6134d8e938924f9d2c12e7639c1c7c8f2b524dd5b7",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "block00_temb.f32": {
+   "description": "time_text_embed output [2, 4096]: row 0 = sigma, row 1 = t 0.",
+   "dtype": "f32le",
+   "sha256": "97ff8085b7caf4e559b892d62768a5d633c54f7031f31945e11e06ceddc0303e",
+   "shape": [
+    2,
+    4096
+   ]
+  },
+  "block00_txt_in.f32": {
+   "description": "txt_in output [20, 4096].",
+   "dtype": "f32le",
+   "sha256": "729f245e22319ed772ebb08a6561c296beb6da4774ad712a94a487e5d4ed9e87",
+   "shape": [
+    20,
+    4096
+   ]
+  },
+  "block31_block_in.f32": {
+   "description": "Block input [36, 4096]: 20 text then 16 image tokens.",
+   "dtype": "f32le",
+   "sha256": "8586c64eaea186dc6bbcde8b2b168cf17759f7a1026a247e022a8cf2295d3b38",
+   "shape": [
+    36,
+    4096
+   ]
+  },
+  "block31_block_out.f32": {
+   "description": "Block output [36, 4096], full block-causal path.",
+   "dtype": "f32le",
+   "sha256": "5fcec6f3827d2cc52f31ce1577687e1c4807465a19ae1acd379091ac3932a1ae",
+   "shape": [
+    36,
+    4096
+   ]
+  },
+  "block31_cached_block_in.f32": {
+   "description": "Cached-path block input [16, 4096] (target tokens only).",
+   "dtype": "f32le",
+   "sha256": "a310d4138579041696f36409991dbf711afe86c4792974cc152c279981c66e4d",
+   "shape": [
+    16,
+    4096
+   ]
+  },
+  "block31_cached_block_out.f32": {
+   "description": "Cached-path block output [16, 4096].",
+   "dtype": "f32le",
+   "sha256": "75ed12742fa9f75f25f517498a8a7323685a5e1da3fff94ae581f02dde487989",
+   "shape": [
+    16,
+    4096
+   ]
+  },
+  "block31_cached_out.f32": {
+   "description": "Cached-path model output for the target tokens [16, 64] at sigma 0.704534.",
+   "dtype": "f32le",
+   "sha256": "a52da6426730383d62b8e22279d6952e121231ebf9c068be973ce71a295df8ac",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "block31_cached_q_head0.f32": {
+   "description": "Cached-path q head 0 [16, 128].",
+   "dtype": "f32le",
+   "sha256": "6799caf547b25172527aee335d5fc770c5f15aff981725c3924a486ea2db423b",
+   "shape": [
+    16,
+    128
+   ]
+  },
+  "block31_img_in.f32": {
+   "description": "img_in output [16, 4096] (before the joint scatter).",
+   "dtype": "f32le",
+   "sha256": "a310d4138579041696f36409991dbf711afe86c4792974cc152c279981c66e4d",
+   "shape": [
+    16,
+    4096
+   ]
+  },
+  "block31_k_head0.f32": {
+   "description": "k after RMSNorm and RoPE, head 0 [36, 128].",
+   "dtype": "f32le",
+   "sha256": "1d40b2f955c5806f64d0ac1766eecc08a682c6e16b67d55b148d3d8e245905ca",
+   "shape": [
+    36,
+    128
+   ]
+  },
+  "block31_model_out.f32": {
+   "description": "Model output over the joint sequence [36, 64] (proj_out).",
+   "dtype": "f32le",
+   "sha256": "65b22c9b266037528db2a0abb16c8e8048e9274059978acebda7dd831adf8bf0",
+   "shape": [
+    36,
+    64
+   ]
+  },
+  "block31_modulation.f32": {
+   "description": "Shared modulation [2, 16384]: row 0 = sigma, row 1 = t 0.",
+   "dtype": "f32le",
+   "sha256": "b6bd3e2d7bc5c64b8aac4ac554cb71064f7779085b6d21532088ff113a6989c5",
+   "shape": [
+    2,
+    16384
+   ]
+  },
+  "block31_prefill_target_out.f32": {
+   "description": "Full-path target output at sigma 1.0 [16, 64].",
+   "dtype": "f32le",
+   "sha256": "fa8195e63fb3ecc59929a43a1c029b7393b97447ebaf08131e1fb5edf030d555",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "block31_q_head0.f32": {
+   "description": "q after RMSNorm and RoPE, head 0 [36, 128].",
+   "dtype": "f32le",
+   "sha256": "ec250e60b0aac6dd1f02f8582db0f2bc4c07ec70b25ddb326549e5a88e9526f7",
+   "shape": [
+    36,
+    128
+   ]
+  },
+  "block31_rope_cos.f32": {
+   "description": "Rotary cos [36, 64] the block received.",
+   "dtype": "f32le",
+   "sha256": "999d959dd1bfd01613d62607075cae338a0659c0691e913c9c88147c76fb31e4",
+   "shape": [
+    36,
+    64
+   ]
+  },
+  "block31_rope_sin.f32": {
+   "description": "Rotary sin [36, 64].",
+   "dtype": "f32le",
+   "sha256": "4d43e76b13087aaf7275c01001ed68d6e94c35f4bf065fe090e9d3a083bcea4b",
+   "shape": [
+    36,
+    64
+   ]
+  },
+  "block31_target_out.f32": {
+   "description": "Target-token slice of the model output [16, 64].",
+   "dtype": "f32le",
+   "sha256": "a52da6426730383d62b8e22279d6952e121231ebf9c068be973ce71a295df8ac",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "block31_temb.f32": {
+   "description": "time_text_embed output [2, 4096]: row 0 = sigma, row 1 = t 0.",
+   "dtype": "f32le",
+   "sha256": "97ff8085b7caf4e559b892d62768a5d633c54f7031f31945e11e06ceddc0303e",
+   "shape": [
+    2,
+    4096
+   ]
+  },
+  "block31_txt_in.f32": {
+   "description": "txt_in output [20, 4096].",
+   "dtype": "f32le",
+   "sha256": "729f245e22319ed772ebb08a6561c296beb6da4774ad712a94a487e5d4ed9e87",
+   "shape": [
+    20,
+    4096
+   ]
+  },
+  "block_in_encoder.f32": {
+   "description": "Seeded randn [20, 4096] * 1.0 text features (same stream, second).",
+   "dtype": "f32le",
+   "sha256": "babb9e4056d29457e8a34d637c67ee5fa9972291dc2f010f44accde081ff706a",
+   "shape": [
+    20,
+    4096
+   ]
+  },
+  "block_in_latents.f32": {
+   "description": "Seeded randn [16, 64] target latent tokens (seed 1234 stream, first).",
+   "dtype": "f32le",
+   "sha256": "fae18849a77123cec728e410e8d5c77e1be3da8d023411de4262d4e978fef3f2",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "convrot.json": {
+   "description": "Cosine and error of the Comfy INT8 convrot weights against the official BF16 weights for block 0 attn.to_q, img_mlp.gate_up and img_mlp.out, with seeded inputs and outputs.",
+   "dtype": "json",
+   "sha256": "aff1d078dd4072380a1172978be986ab181858f1421d52b69a809a7711dd5d43",
+   "shape": null
+  },
+  "convrot_attn_to_q_q64.f32": {
+   "description": "INT8 weight top-left 64 x 64 (as f32, exact).",
+   "dtype": "f32le",
+   "sha256": "5446b6b36db85c11d3cabcf4abcbf9e34fc6066a99c73e3532d381c1185e104b",
+   "shape": [
+    64,
+    64
+   ]
+  },
+  "convrot_attn_to_q_scale64.f32": {
+   "description": "First 64 per-row weight scales.",
+   "dtype": "f32le",
+   "sha256": "359697768a4b2541f73cf9effa7504804e386b3560a2c3bd7817717b9a063f95",
+   "shape": [
+    64
+   ]
+  },
+  "convrot_attn_to_q_x.f32": {
+   "description": "Seeded randn x [8, 4096] for attn.to_q.",
+   "dtype": "f32le",
+   "sha256": "1c56bd3f35e9e8d1acd24da3818da1d51ebebcc169544cc95ebdcb506b1ea559",
+   "shape": [
+    8,
+    4096
+   ]
+  },
+  "convrot_attn_to_q_y_bf16.f32": {
+   "description": "x . W^T with the official BF16 weight(s) upcast, f64 accumulate [8, 4096].",
+   "dtype": "f32le",
+   "sha256": "334cfb6dacbe8f555f1db52d7ed5a84e5b6bb05f556f7f1f5e799dc12a9adbf4",
+   "shape": [
+    8,
+    4096
+   ]
+  },
+  "convrot_attn_to_q_y_int8.f32": {
+   "description": "rot(x) . (q * scale)^T from the Comfy INT8 weight, f64 accumulate.",
+   "dtype": "f32le",
+   "sha256": "c71410f16afaf91887a1798dfb228a049817dc3a1e2917538cd0f7c3b6d2b787",
+   "shape": [
+    8,
+    4096
+   ]
+  },
+  "convrot_hadamard_row0.f32": {
+   "description": "First row of the group-256 normalised Hadamard H (kron^4 of H4, / 16).",
+   "dtype": "f32le",
+   "sha256": "da8d70defcd4e0e028f96e2d0fd26b461d1974099568a64bf06072a97bcf4558",
+   "shape": [
+    256
+   ]
+  },
+  "convrot_img_mlp_gate_up_q64.f32": {
+   "description": "INT8 weight top-left 64 x 64 (as f32, exact).",
+   "dtype": "f32le",
+   "sha256": "35e823151605cd258f8974a0e85ddf79043eceabcd650aa66c977fd3863b10d2",
+   "shape": [
+    64,
+    64
+   ]
+  },
+  "convrot_img_mlp_gate_up_scale64.f32": {
+   "description": "First 64 per-row weight scales.",
+   "dtype": "f32le",
+   "sha256": "3957d6b8c2e44a930de7cd964ef88401b898c559aecc7531daf54fb1d1ce14fc",
+   "shape": [
+    64
+   ]
+  },
+  "convrot_img_mlp_gate_up_x.f32": {
+   "description": "Seeded randn x [8, 4096] for img_mlp.gate_up.",
+   "dtype": "f32le",
+   "sha256": "7a61e1f91436a892dea78aeb2358099923b4f711458938afd404ee5ed014cc8a",
+   "shape": [
+    8,
+    4096
+   ]
+  },
+  "convrot_img_mlp_gate_up_y_bf16.f32": {
+   "description": "x . W^T with the official BF16 weight(s) upcast, f64 accumulate [8, 24576].",
+   "dtype": "f32le",
+   "sha256": "f8fde7baa6a924360235711977415e188d892b1ca0b2f8809565e5d0b4d810d7",
+   "shape": [
+    8,
+    24576
+   ]
+  },
+  "convrot_img_mlp_gate_up_y_int8.f32": {
+   "description": "rot(x) . (q * scale)^T from the Comfy INT8 weight, f64 accumulate.",
+   "dtype": "f32le",
+   "sha256": "5a932eb428cb18fbf218416dca8c20f3ca6c66183ddf0bb8c623d67ebb91697b",
+   "shape": [
+    8,
+    24576
+   ]
+  },
+  "convrot_img_mlp_out_q64.f32": {
+   "description": "INT8 weight top-left 64 x 64 (as f32, exact).",
+   "dtype": "f32le",
+   "sha256": "040920d178ad8571217ab3c92a47b07b2aef956fcdbb1a115526df38ade377fb",
+   "shape": [
+    64,
+    64
+   ]
+  },
+  "convrot_img_mlp_out_scale64.f32": {
+   "description": "First 64 per-row weight scales.",
+   "dtype": "f32le",
+   "sha256": "02e7b9655a3570ba3723e94b99fac1dc34cecaae337d03385f0cb1bf7a8b46b9",
+   "shape": [
+    64
+   ]
+  },
+  "convrot_img_mlp_out_x.f32": {
+   "description": "Seeded randn x [8, 12288] for img_mlp.out.",
+   "dtype": "f32le",
+   "sha256": "2583eab6981f27425de9881854409fccc2c526c9ab19df90b60a0b329ae88038",
+   "shape": [
+    8,
+    12288
+   ]
+  },
+  "convrot_img_mlp_out_y_bf16.f32": {
+   "description": "x . W^T with the official BF16 weight(s) upcast, f64 accumulate [8, 4096].",
+   "dtype": "f32le",
+   "sha256": "f9bc80dbdd171b568654c60d18927b952f2ddeae2c2f495088bbf6b99c594499",
+   "shape": [
+    8,
+    4096
+   ]
+  },
+  "convrot_img_mlp_out_y_int8.f32": {
+   "description": "rot(x) . (q * scale)^T from the Comfy INT8 weight, f64 accumulate.",
+   "dtype": "f32le",
+   "sha256": "e9e9e3c3e436fe4fc9efdb8d73da29e0997b067b2be55302bb4d229f9f5ba284",
+   "shape": [
+    8,
+    4096
+   ]
+  },
+  "embed.json": {
+   "description": "Timestep embedding, shared modulation and txt_in on the real Turbo weights (f32 math) at sigma 1.0, 0.414568, 0.02 and the t = 0 row.",
+   "dtype": "json",
+   "sha256": "2f5a4298b309d205ac98623335299c5ee254635dbe70af5d73c3b87ba8f1e35f",
+   "shape": null
+  },
+  "embed_sigma0.02_modulation.f32": {
+   "description": "modulation(temb) (16384) at sigma 0.02.",
+   "dtype": "f32le",
+   "sha256": "58740962eb0ba17e571434526df7c4706f32f1d28a668d32bfa29dc29c41d11e",
+   "shape": [
+    16384
+   ]
+  },
+  "embed_sigma0.02_sinusoid.f32": {
+   "description": "Sinusoid(256) at sigma 0.02: cos then sin.",
+   "dtype": "f32le",
+   "sha256": "02a5d7a22afc1e20a22f16ac92a09bf7172330b29279860892eeacf30f772cee",
+   "shape": [
+    256
+   ]
+  },
+  "embed_sigma0.02_temb.f32": {
+   "description": "time_text_embed output (4096) at sigma 0.02.",
+   "dtype": "f32le",
+   "sha256": "005eff942bc13eedbffcaa95abe2f8227e33535938b8dd00aa6c4425ba92c37e",
+   "shape": [
+    4096
+   ]
+  },
+  "embed_sigma0.414568_modulation.f32": {
+   "description": "modulation(temb) (16384) at sigma 0.414568.",
+   "dtype": "f32le",
+   "sha256": "9e383b30c0ffc0b35cb7d42c7ec16635cf9bd7acec9678c6bcfd5959726d03cd",
+   "shape": [
+    16384
+   ]
+  },
+  "embed_sigma0.414568_sinusoid.f32": {
+   "description": "Sinusoid(256) at sigma 0.414568: cos then sin.",
+   "dtype": "f32le",
+   "sha256": "c5c4030546542175eea7dfa649e9f46fae9ee0562acfa343e172116c99f6b40c",
+   "shape": [
+    256
+   ]
+  },
+  "embed_sigma0.414568_temb.f32": {
+   "description": "time_text_embed output (4096) at sigma 0.414568.",
+   "dtype": "f32le",
+   "sha256": "326cdcf06b2c7f1fb19f0e851df8cde30e98ba3facbf86079895e3e507fdbb54",
+   "shape": [
+    4096
+   ]
+  },
+  "embed_sigma1.0_modulation.f32": {
+   "description": "modulation(temb) (16384) at sigma 1.0.",
+   "dtype": "f32le",
+   "sha256": "98462a7709b70a601f8c9320f69241aefe42b9046d2298527a182fecbc36a86b",
+   "shape": [
+    16384
+   ]
+  },
+  "embed_sigma1.0_sinusoid.f32": {
+   "description": "Sinusoid(256) at sigma 1.0: cos then sin.",
+   "dtype": "f32le",
+   "sha256": "95a7318f119b8a4b0f8118aae779b496c7d6b6fdad484c2714946d5ab86e5766",
+   "shape": [
+    256
+   ]
+  },
+  "embed_sigma1.0_temb.f32": {
+   "description": "time_text_embed output (4096) at sigma 1.0.",
+   "dtype": "f32le",
+   "sha256": "ec75a00e862e7327c34f13b12e6c1f5cf7c1f7da1ee4bd19fab0dd8c02e87c6e",
+   "shape": [
+    4096
+   ]
+  },
+  "embed_t0_modulation.f32": {
+   "description": "modulation(temb) (16384) at sigma 0.0.",
+   "dtype": "f32le",
+   "sha256": "3d6181d798066cc061f78f3b96307c979efc9d34b1041b861048c03025c4aa5c",
+   "shape": [
+    16384
+   ]
+  },
+  "embed_t0_sinusoid.f32": {
+   "description": "Sinusoid(256) at sigma 0.0: cos then sin.",
+   "dtype": "f32le",
+   "sha256": "25b46962a925321d49682da3799817ff3c48aaabfd40e1c759496466461e14b7",
+   "shape": [
+    256
+   ]
+  },
+  "embed_t0_temb.f32": {
+   "description": "time_text_embed output (4096) at sigma 0.0.",
+   "dtype": "f32le",
+   "sha256": "cf7a59fc82db02271c08479f243bccb08b8aa357f70775ce970ae43f8b4fc113",
+   "shape": [
+    4096
+   ]
+  },
+  "embed_txt_in_normed.f32": {
+   "description": "txt_in.text_norm output: zero-centred RMSNorm, eps 1e-6, scale = weight + 1.",
+   "dtype": "f32le",
+   "sha256": "76f0b3f35fd2cf95f9f0d95755c9510fc2f865dacd5cbd2ef8a6ff9414ba26a7",
+   "shape": [
+    12,
+    4096
+   ]
+  },
+  "embed_txt_in_out.f32": {
+   "description": "txt_in output [12, 4096]: norm, in_layer, GELU(tanh), out_layer, no biases.",
+   "dtype": "f32le",
+   "sha256": "c1521136eb17984716f29c9bc3f8cac42cb04f0b5795b24f598f4352ffe0344b",
+   "shape": [
+    12,
+    4096
+   ]
+  },
+  "embed_txt_in_x.f32": {
+   "description": "Seeded randn [12, 4096] fed to txt_in (seed 11).",
+   "dtype": "f32le",
+   "sha256": "cab74afadeea241de8a049daa9398406b7325da9c4141982878a18b5636bd9a0",
+   "shape": [
+    12,
+    4096
+   ]
+  },
+  "rope.json": {
+   "description": "RoPE table for 10 text tokens followed by a 4 x 6 latent block, with per-axis positions, plus a rotation of a seeded q.",
+   "dtype": "json",
+   "sha256": "eb538b6377e82cd87b69120d92512d62fd7a6807e6eb63078941d8e5e92774d7",
+   "shape": null
+  },
+  "rope_cos.f32": {
+   "description": "cos of the rotary table [34, 64]: 16 frame + 28 height + 28 width pairs.",
+   "dtype": "f32le",
+   "sha256": "486f31ce770afec9cfad773aed910f29b3933e9e83b4ba93e710ea7f940cc5f1",
+   "shape": [
+    34,
+    64
+   ]
+  },
+  "rope_q_in.f32": {
+   "description": "Seeded q [34, 2 heads, 128] (seed 3) for the rotation check.",
+   "dtype": "f32le",
+   "sha256": "851e34dfc68ecf9e26226ead3579c9aaebc173e328ac9828ffe105a72d584927",
+   "shape": [
+    34,
+    2,
+    128
+   ]
+  },
+  "rope_q_out.f32": {
+   "description": "apply_rotary_emb_qwen(q, table): consecutive pairs (x[2i], x[2i+1]) rotated as complex.",
+   "dtype": "f32le",
+   "sha256": "7358a3fb98a362654cf571f884c1bda7b7cd5bd7846bc45ff649d7f782625ad6",
+   "shape": [
+    34,
+    2,
+    128
+   ]
+  },
+  "rope_sin.f32": {
+   "description": "sin of the rotary table [34, 64].",
+   "dtype": "f32le",
+   "sha256": "78c3cab5e8aa2aed4711a72b4679eb3a25adcbae03f9542be48141447be0ea81",
+   "shape": [
+    34,
+    64
+   ]
+  },
+  "sigmas.json": {
+   "description": "Sampling schedules from the pipeline's own calculate_shift/retrieve_timesteps: Turbo (model_index sample_sigmas, no shift) at 512/1024/2048 px and base (dynamic exponential shift, shift_terminal) at 40 steps for 1024/2048 px and 8 steps for 512 px. sigmas has the terminal 0 appended; timesteps = sigma * 1000.",
+   "dtype": "json",
+   "sha256": "6598a35b3d4e26fa94d52227832f044dc17e684a0818591fa287dd90dd7c8506",
+   "shape": null
+  },
+  "sigmas_step_prev.f32": {
+   "description": "scheduler.step(v, t0, x): x + (sigma1 - sigma0) * v.",
+   "dtype": "f32le",
+   "sha256": "692c03421caaeff91e6bcf22f711ed0e3405dbad452f51f79cf3e7122f1d1ddf",
+   "shape": [
+    16
+   ]
+  },
+  "sigmas_step_v.f32": {
+   "description": "Seeded model output for the Euler step check.",
+   "dtype": "f32le",
+   "sha256": "6f7c563336a654809808b7f3f0e63312b3573cf23fa7fc0fbb02cd63dbacf705",
+   "shape": [
+    16
+   ]
+  },
+  "sigmas_step_x.f32": {
+   "description": "Seeded sample for the Euler step check (turbo 1024 step 0).",
+   "dtype": "f32le",
+   "sha256": "302bd85d52c474f10e3e08a85a9245509ba9f507e85ed7024f7f3c4039ade67c",
+   "shape": [
+    16
+   ]
+  },
+  "tokenizer.json": {
+   "description": "Full token ids the pipeline's text encoder sees for each prompt (pipeline template, drop_idx), the kept ids after dropping the system prefix, and the tokens as strings. Literal special-token text in a prompt is encoded as the special id (tokenizer default).",
+   "dtype": "json",
+   "sha256": "10082c5c804becbba9ea8e93564b78ba76b7389ca7cbe6039d3f02aeed8077bf",
+   "shape": null
+  },
+  "vae.json": {
+   "description": "AutoencoderKLQwenImage21 decode (f32) of a seeded 16 x 16 latent to 256 x 256 RGBA, with post_quant_conv, decoder.conv_in and mid-block activations.",
+   "dtype": "json",
+   "sha256": "1d0562dae1bc60672d3880e2683173e6dd2b326a2bce58e6622b1c75cc23556a",
+   "shape": null
+  },
+  "vae_decoder_conv_in.f32": {
+   "description": "decoder.conv_in output [1152, 16, 16].",
+   "dtype": "f32le",
+   "sha256": "e9975d9082a22d8ba0463480ac5ebd4d431efede9702400966bb0503fb188e1a",
+   "shape": [
+    1152,
+    16,
+    16
+   ]
+  },
+  "vae_image.f32": {
+   "description": "Decoded RGBA [4, 256, 256], clamped to [-1, 1].",
+   "dtype": "f32le",
+   "sha256": "247d473df77b0e1343a195a5265f4572ff47391290aae686fd2ddfe2c9621cd1",
+   "shape": [
+    4,
+    256,
+    256
+   ]
+  },
+  "vae_latents_packed.f32": {
+   "description": "Seeded randn [256, 64] packed latents (seed 77): the pipeline's tokens x channels layout, PRE-denorm.",
+   "dtype": "f32le",
+   "sha256": "eb84403d7d216b72cdeb460fb6ca57a8682dd7f1734706b023ecc2394f726f34",
+   "shape": [
+    256,
+    64
+   ]
+  },
+  "vae_latents_post_denorm.f32": {
+   "description": "The decode input [64, 16, 16]: unpacked, then * latents_std + latents_mean (POST-denorm).",
+   "dtype": "f32le",
+   "sha256": "d0a411e1e3268c9ad29e4346bf3d3254eb8f4531516cbeea7c6be22a0dfbe618",
+   "shape": [
+    64,
+    16,
+    16
+   ]
+  },
+  "vae_mid_block.f32": {
+   "description": "decoder.mid_block output [1152, 16, 16].",
+   "dtype": "f32le",
+   "sha256": "9a51a157ba806eeb31859bf185ab7e39b5f71560674d9e2de1d111ba521feb39",
+   "shape": [
+    1152,
+    16,
+    16
+   ]
+  },
+  "vae_post_quant_conv.f32": {
+   "description": "post_quant_conv output [64, 16, 16].",
+   "dtype": "f32le",
+   "sha256": "dc9122f0c97f87d4afac1ca4f3747fa13ed29b5f166cca33adc0401ac9494474",
+   "shape": [
+    64,
+    16,
+    16
+   ]
+  }
+ },
+ "global": {
+  "base": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "revision": "d26bb61231c349cf6b7896fa83353113880e1ba3"
+  },
+  "comfy": {
+   "file": "diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors",
+   "repo": "Comfy-Org/Qwen-Image-2.1",
+   "revision": "a3c1a9e2efcba96124a9dc8600c0c07d6f5e68aa"
+  },
+  "diffusers": "0.41.0.dev0",
+  "diffusers_commit": "da1d3829cf08d4f329b526d89e17cc035c049d8d",
+  "numpy": "2.5.3",
+  "torch": "2.14.1",
+  "transformers": "5.19.0",
+  "turbo": {
+   "repo": "Qwen/Qwen-Image-2.1-Turbo",
+   "revision": "d65dbc9a7e8f6b5479e33dee6030eaab2a906509"
+  }
+ },
+ "inputs": {
+  "comfy-file": {
+   "size": 7256783064,
+   "source": "local"
+  },
+  "comfy-turbo-int8:transformer_blocks.0.attn.to_q.weight": {
+   "dtype": "I8",
+   "sha256": "1bb63ee88cf84a17236f0733cd361e61c8719a39eeac2ae4cdab84f6f75b53e6",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "comfy-turbo-int8:transformer_blocks.0.attn.to_q.weight_scale": {
+   "dtype": "F32",
+   "sha256": "daa6416c8fcf332db48db871215b24419860d263aa88c4062de255187c508b0d",
+   "shape": [
+    4096,
+    1
+   ]
+  },
+  "comfy-turbo-int8:transformer_blocks.0.img_mlp.gate_up.weight": {
+   "dtype": "I8",
+   "sha256": "aebd49817ccb33be4aee91e0cd7029b3014d92ff66f971d1aa2b2652cc0f3b75",
+   "shape": [
+    24576,
+    4096
+   ]
+  },
+  "comfy-turbo-int8:transformer_blocks.0.img_mlp.gate_up.weight_scale": {
+   "dtype": "F32",
+   "sha256": "24e4f095bd71b9ebff5ab1e77689be66819f486c30cad8d3471ebc363cfd5829",
+   "shape": [
+    24576,
+    1
+   ]
+  },
+  "comfy-turbo-int8:transformer_blocks.0.img_mlp.out.weight": {
+   "dtype": "I8",
+   "sha256": "7bed775baf16b049159924610da0ee6d78e0211daeb527f9fea7e505ea336e68",
+   "shape": [
+    4096,
+    12288
+   ]
+  },
+  "comfy-turbo-int8:transformer_blocks.0.img_mlp.out.weight_scale": {
+   "dtype": "F32",
+   "sha256": "fab5476c86a2c580bcccdc51cd59f613bea66d3014d66a2ad14573fd2eefcb65",
+   "shape": [
+    4096,
+    1
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:img_in.weight": {
+   "dtype": "BF16",
+   "sha256": "a1630fa61276dcc25f22903abcd9c0a14bb64675546ec553658cd6f518c7cff1",
+   "shape": [
+    4096,
+    64
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:modulation.1.weight": {
+   "dtype": "BF16",
+   "sha256": "a517d75bb2e58d4043cf3a9e4350691d3d56cfb1d14272b27e4347a2d7b47ac1",
+   "shape": [
+    16384,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:time_text_embed.timestep_embedder.linear_1.weight": {
+   "dtype": "BF16",
+   "sha256": "e5ae6e46ba2e88eab96e9884040490f82a74e51b32d5505d850e76b61337f946",
+   "shape": [
+    4096,
+    256
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:time_text_embed.timestep_embedder.linear_2.weight": {
+   "dtype": "BF16",
+   "sha256": "4411bc91cde3293c6871e389a8ceaa1a7f8b61f34982638e153a9cd3c1d76de1",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:transformer_blocks.0.attn.norm_k.weight": {
+   "dtype": "BF16",
+   "sha256": "572f201a7f1f0eb25c33d65be6a3afc6e237af9753c94cb0c924c54622d33277",
+   "shape": [
+    128
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:transformer_blocks.0.attn.norm_q.weight": {
+   "dtype": "BF16",
+   "sha256": "3faf374413f8b2585700421c2f9bb39c1e846227f105e3ff10e1a8220ffde022",
+   "shape": [
+    128
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:transformer_blocks.0.attn.to_k.weight": {
+   "dtype": "BF16",
+   "sha256": "a9d2be18a8693efb3785101f236baae078dff4a264c0ecf2055b5ab5c9e9cf26",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:transformer_blocks.0.attn.to_out.0.weight": {
+   "dtype": "BF16",
+   "sha256": "5dffbd6e17a5df7615378f8847c4e71ade191f17c4175967a307f59a959dc8af",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:transformer_blocks.0.attn.to_q.weight": {
+   "dtype": "BF16",
+   "sha256": "34f192410dd361fb958b4d531f225e1489188eac7646aeb6d16c110b3038843d",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:transformer_blocks.0.attn.to_v.weight": {
+   "dtype": "BF16",
+   "sha256": "c564cd8cd6c37c8e9963e4a0b7605243f9e4a99bd84c0236d2440b79dc6d9213",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:transformer_blocks.0.img_mlp.gate_layer.weight": {
+   "dtype": "BF16",
+   "sha256": "621311cb56fe4786c714bbb38e763abb97e3fcd05f9ab1daa3f5b84747e0a972",
+   "shape": [
+    12288,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:transformer_blocks.0.img_mlp.out.weight": {
+   "dtype": "BF16",
+   "sha256": "c6af53bd3decb702f92d4a35b1af79cc48ee3f374d3482b5dd05aa611d2679c9",
+   "shape": [
+    4096,
+    12288
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:transformer_blocks.0.img_mlp.proj.weight": {
+   "dtype": "BF16",
+   "sha256": "20ad5727ecd8fc10180a857b1cee4e914031747c64c36c5d29acfbf646a2a109",
+   "shape": [
+    12288,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:txt_in.in_layer.weight": {
+   "dtype": "BF16",
+   "sha256": "7570369fde34442cedd7e36e40178b9e70f64250478f3c44b16c1e03775864b1",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:txt_in.out_layer.weight": {
+   "dtype": "BF16",
+   "sha256": "1e020bda2ccd20580f3ff841982a676f905e877dcc6a2ec7a7652ff7a72af539",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00001-of-00002.safetensors:txt_in.text_norm.weight": {
+   "dtype": "BF16",
+   "sha256": "bfd1f6efe5e2f6ccbd2a9c041a08ad8613a69563d1a7927e57c0170d07570613",
+   "shape": [
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:norm_out.linear.weight": {
+   "dtype": "BF16",
+   "sha256": "fa549d319affc0e2361fca5c369a953c695c0b5c4491a7cd8cc77a1b237c4c1e",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:proj_out.weight": {
+   "dtype": "BF16",
+   "sha256": "0677bd54aa733d578f1cbba85d89f3cdec10f34e8055a963c2ea7dc414f22c7b",
+   "shape": [
+    64,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:transformer_blocks.31.attn.norm_k.weight": {
+   "dtype": "BF16",
+   "sha256": "c35261d78c7d5177ab9ec1e8412a59853981c038e6ba41066dc216d9a394f1e9",
+   "shape": [
+    128
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:transformer_blocks.31.attn.norm_q.weight": {
+   "dtype": "BF16",
+   "sha256": "e0f1c31a771f5948f3f2d2bb96d4e0ed2a897b5d275251486e07c7d7ebb1651a",
+   "shape": [
+    128
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:transformer_blocks.31.attn.to_k.weight": {
+   "dtype": "BF16",
+   "sha256": "8b29217570fe8712b953da8731d674e7b7150ae7091d169a799157877bc5fac2",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:transformer_blocks.31.attn.to_out.0.weight": {
+   "dtype": "BF16",
+   "sha256": "e3eae7d52b985eef707bbfcaeb3cd9b70c379c2124fc97c5f467b761a8f35923",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:transformer_blocks.31.attn.to_q.weight": {
+   "dtype": "BF16",
+   "sha256": "b6f216f0e038d41fe207068f335c03b1112be3516a0c8c90598a800043f93943",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:transformer_blocks.31.attn.to_v.weight": {
+   "dtype": "BF16",
+   "sha256": "190fc30c1e5409727989f480a352cd565f4ed0de404d43b397036810820e6c86",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:transformer_blocks.31.img_mlp.gate_layer.weight": {
+   "dtype": "BF16",
+   "sha256": "a923db78e441e77704289b95efe881a3016fd9b27aa2b120543f6e30dced83d2",
+   "shape": [
+    12288,
+    4096
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:transformer_blocks.31.img_mlp.out.weight": {
+   "dtype": "BF16",
+   "sha256": "070c6c5e53f371661c8a3f7d2eb01f2b4f5eef96547b100a6305ebf377d6eb0b",
+   "shape": [
+    4096,
+    12288
+   ]
+  },
+  "turbo-diffusion_pytorch_model-00002-of-00002.safetensors:transformer_blocks.31.img_mlp.proj.weight": {
+   "dtype": "BF16",
+   "sha256": "7915096b72c50771b521e7c670e065d3297b753b042e58e3832cd51ea71d3795",
+   "shape": [
+    12288,
+    4096
+   ]
+  },
+  "vae-weights": {
+   "bytes": 675508656,
+   "sha256": "71879ffd5321e6d10c3c87513e2b474b1252efa7f3dec2969214a9bf06a6dd5c"
+  }
+ }
+}

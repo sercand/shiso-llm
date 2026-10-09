@@ -1,0 +1,94 @@
+{
+ "layout": {
+  "text_tokens": 20,
+  "latent_h": 4,
+  "latent_w": 4,
+  "slots": 4,
+  "img_mask": "20 False then 4 True (each slot stands for 4 latent tokens)"
+ },
+ "sigma": 0.704534,
+ "prefill_sigma": 1.0,
+ "timestep_passed": 0.7045339941978455,
+ "encoder_std": 1.0,
+ "seed": 1234,
+ "inputs": {
+  "latents": "block_in_latents.f32",
+  "encoder": "block_in_encoder.f32"
+ },
+ "kv_cache": "step 0 = kv_cache_mode 'extract' at sigma 1.0 (full pass, stores prefix K/V after RoPE); the later step = 'cached' at sigma 0.704534 with the same prefix, computing target tokens only.",
+ "model_config": {
+  "_class_name": "QwenImage21Transformer2DModel",
+  "_diffusers_version": "0.41.0.dev0",
+  "attention_head_dim": 128,
+  "axes_dims_rope": [
+   16,
+   56,
+   56
+  ],
+  "causal_condition": true,
+  "context_in_dim": 4096,
+  "eps": 1e-06,
+  "in_channels": 64,
+  "mlp_ratio": 3,
+  "num_attention_heads": 32,
+  "num_layers": 32,
+  "out_channels": 64,
+  "patch_size": 1
+ },
+ "cases": {
+  "block00": {
+   "checkpoint_block": 0,
+   "files": {
+    "txt_in": "block00_txt_in.f32",
+    "img_in": "block00_img_in.f32",
+    "temb": "block00_temb.f32",
+    "modulation": "block00_modulation.f32",
+    "rope_cos": "block00_rope_cos.f32",
+    "rope_sin": "block00_rope_sin.f32",
+    "block_in": "block00_block_in.f32",
+    "block_out": "block00_block_out.f32",
+    "q_head0": "block00_q_head0.f32",
+    "k_head0": "block00_k_head0.f32",
+    "model_out": "block00_model_out.f32",
+    "target_out": "block00_target_out.f32",
+    "cached_block_in": "block00_cached_block_in.f32",
+    "cached_block_out": "block00_cached_block_out.f32",
+    "cached_q_head0": "block00_cached_q_head0.f32",
+    "cached_out": "block00_cached_out.f32",
+    "prefill_sigma1_target_out": "block00_prefill_target_out.f32"
+   },
+   "output_abs_max": 8.930558204650879,
+   "max_abs_diff_full_vs_cached": 0.0,
+   "max_abs_diff_prefill_full_vs_extract": 0.0,
+   "max_abs_diff_segmented_vs_dense_mask": 4.76837158203125e-06,
+   "negative_control_max_abs_diff_k_scaled_1p01": 0.024753451347351074
+  },
+  "block31": {
+   "checkpoint_block": 31,
+   "files": {
+    "txt_in": "block31_txt_in.f32",
+    "img_in": "block31_img_in.f32",
+    "temb": "block31_temb.f32",
+    "modulation": "block31_modulation.f32",
+    "rope_cos": "block31_rope_cos.f32",
+    "rope_sin": "block31_rope_sin.f32",
+    "block_in": "block31_block_in.f32",
+    "block_out": "block31_block_out.f32",
+    "q_head0": "block31_q_head0.f32",
+    "k_head0": "block31_k_head0.f32",
+    "model_out": "block31_model_out.f32",
+    "target_out": "block31_target_out.f32",
+    "cached_block_in": "block31_cached_block_in.f32",
+    "cached_block_out": "block31_cached_block_out.f32",
+    "cached_q_head0": "block31_cached_q_head0.f32",
+    "cached_out": "block31_cached_out.f32",
+    "prefill_sigma1_target_out": "block31_prefill_target_out.f32"
+   },
+   "output_abs_max": 7.921842098236084,
+   "max_abs_diff_full_vs_cached": 0.0,
+   "max_abs_diff_prefill_full_vs_extract": 0.0,
+   "max_abs_diff_segmented_vs_dense_mask": 4.0531158447265625e-06,
+   "negative_control_max_abs_diff_k_scaled_1p01": 0.08679962158203125
+  }
+ }
+}
