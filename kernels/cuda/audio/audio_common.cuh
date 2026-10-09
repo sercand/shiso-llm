@@ -4,6 +4,7 @@
 #ifndef SHISO_AUDIO_COMMON_CUH
 #define SHISO_AUDIO_COMMON_CUH
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
 
@@ -28,6 +29,11 @@
 #define AUDIO_ADD_RMS_RUN 8u
 #define AUDIO_ATTN_SLOTS 4u
 #define AUDIO_ATTN_QB 8u
+/* The span attention's head-column slice a warp takes, the keys it scores at
+ * once, and the most query items one block holds, as the Metal twin's. */
+#define AUDIO_SPAN_W 64u
+#define AUDIO_SPAN_KB 16u
+#define AUDIO_SPAN_MAX_ITEMS 32u
 #define AUDIO_REL_ROWS 4u
 #define AUDIO_ARGMAX_BLOCK 256u
 #define AUDIO_DECODE_KB 4u
@@ -57,6 +63,7 @@ struct audio_args_bias_rows { uint rows; uint cols; };
 struct audio_args_argmax { uint rows; uint cols; };
 struct audio_args_glu { uint rows; uint channels; };
 struct audio_args_silu_mul { uint count; };
+struct audio_args_gelu_mul { uint rows; uint cols; uint up_stride; uint up_offset; };
 struct audio_args_norm { uint rows; uint dim; float eps; uint flags; };
 struct audio_args_gemm { uint m; uint n; uint k; uint flags; uint k_chunk; uint splits; };
 struct audio_args_matvec3 { uint n0; uint n1; uint n2; uint k; };
@@ -104,6 +111,10 @@ struct audio_args_qk_rope_seq {
 };
 struct audio_args_decode_step_batch {
     uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; uint seqs;
+};
+struct audio_args_span_attn {
+    uint n; uint heads; uint kv_heads; uint head_dim; uint left; uint right; float scale;
+    uint row_groups; uint segmented;
 };
 
 /* Greedy search's state on the device, as the Metal twin's. */

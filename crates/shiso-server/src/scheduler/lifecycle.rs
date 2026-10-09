@@ -26,7 +26,8 @@ use shiso_ir::{BlockDelta, BlockStart, StopReason, StreamEvent, Usage};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::AppError;
-use crate::scheduler::batching::SlotFacts;
+use crate::scheduler::batching::{ScoreFacts, SlotFacts};
+use crate::scheduler::config::PREFILL_GRID;
 use crate::scheduler::stop::{StopStep, StopWatcher};
 use crate::scheduler::{ScoreOutcome, ScoreRequest};
 use crate::tokenizer::Vocabulary;
@@ -310,6 +311,19 @@ struct ScoreJob {
     labels: Arc<[TokenId]>,
     /// The schema a decision head scores instead of `labels`, when it does.
     decision: Option<Arc<[shiso_core::DecisionQuestion]>>,
+    /// The request's [`ScoreRequest::shared_prefix`].
+    shared_prefix: u32,
+    /// Whether the resume this score makes at its first prefill quantum is
+    /// still ahead of it. See [`SeqSlot::take_score_resume_at`].
+    resume_pending: bool,
+    /// Where a sibling's checkpoint stands it: the grid point below the
+    /// shared prefix, or zero when there is none to stand on - nothing
+    /// shared, or a grid point below the checkpoint tier's floor, which the
+    /// stack never checkpoints at. See [`SeqSlot::set_checkpoint_floor`].
+    stand_at: usize,
+    /// The shared-read epoch at which its last resume found nothing; see
+    /// [`SeqSlot::take_score_resume_at`].
+    missed_at: Option<u64>,
     /// Held as an `Option` because two places may answer a score - the prefill
     /// terminus and the retirement path - and *taking* this is the record of
     /// which one did. The invariant is exactly one reply per request: the
@@ -449,6 +463,16 @@ impl SeqSlot {
             .filter(|item| item.is_audio())
             .map(|item| u32::try_from(item.pad_count(1)).unwrap_or(u32::MAX))
             .fold(0u32, u32::saturating_add);
+        // With no floor known yet every shared grid point is one to wait
+        // for; admission lowers that to the tier's own floor. A decision pass
+        // stands on nothing: its head needs the final row of every prompt
+        // token, and a resumed prefix leaves those rows unread.
+        let decides = request.decision.is_some();
+        let stand_at = if decides {
+            0
+        } else {
+            stand_point(request.shared_prefix, request.prompt_tokens.len(), 1)
+        };
         Self {
             flex: request.is_flex(),
             paused_since: None,
@@ -507,6 +531,10 @@ impl SeqSlot {
             score: Some(ScoreJob {
                 labels: request.labels,
                 decision: request.decision,
+                shared_prefix: if decides { 0 } else { request.shared_prefix },
+                resume_pending: !decides,
+                stand_at,
+                missed_at: None,
                 reply: setup.score_reply,
             }),
         }
@@ -524,6 +552,22 @@ impl SeqSlot {
             prompt_at: self.cursor,
             indivisible_prompt: self.media.is_some(),
             flex: self.flex,
+            // A decision pass is planned as a solo prefill: it never joins a
+            // batched score pass, whose rows its head would never see.
+            score: self
+                .score
+                .as_ref()
+                .filter(|job| self.phase == Phase::Prefill && job.decision.is_none())
+                .map(|job| {
+                    let from = if job.resume_pending {
+                        self.cursor.max(job.stand_at)
+                    } else {
+                        self.cursor
+                    };
+                    ScoreFacts {
+                        tail: self.prompt.len().saturating_sub(from),
+                    }
+                }),
         }
     }
 
@@ -1067,6 +1111,85 @@ impl SeqSlot {
         self.score.is_some()
     }
 
+    /// The shared prefix to checkpoint at, while a score's resume is pending
+    /// (from its first prefill quantum on), and `None` after, for a
+    /// generation slot, and always for a decision pass, which reads every row
+    /// of its prompt itself. A score whose last resume already missed at
+    /// shared-read epoch `epoch` gets `None` and stays in line: no read has
+    /// crossed a stand point since, so a second resume would miss too.
+    ///
+    /// A score resumes at its first quantum rather than at admission because
+    /// its siblings are admitted together and read one at a time: at
+    /// admission none of them has left a checkpoint to stand on, while by a
+    /// later sibling's first quantum the one read before it has.
+    pub(crate) fn take_score_resume_at(&mut self, epoch: u64) -> Option<u32> {
+        let job = self.score.as_mut().filter(|job| job.decision.is_none())?;
+        if job.missed_at == Some(epoch) {
+            return None;
+        }
+        std::mem::take(&mut job.resume_pending).then_some(job.shared_prefix)
+    }
+
+    /// Settles a score's pending resume before it reads alone: as
+    /// [`SeqSlot::take_score_resume_at`], except that a resume it skips is
+    /// dropped rather than left pending - the read that follows reads past it.
+    pub(crate) fn settle_score_resume(&mut self, epoch: u64) -> Option<u32> {
+        let job = self.score.as_mut().filter(|job| job.decision.is_none())?;
+        let pending = std::mem::take(&mut job.resume_pending);
+        (pending && job.missed_at != Some(epoch)).then_some(job.shared_prefix)
+    }
+
+    /// Records the checkpoint tier's floor: a score whose shared grid point
+    /// lies below it has no sibling checkpoint to wait for, and stands from
+    /// the start. Called once, at admission.
+    pub(crate) fn set_checkpoint_floor(&mut self, floor: u32) {
+        let len = self.prompt.len();
+        if let Some(job) = self.score.as_mut().filter(|job| job.decision.is_none()) {
+            job.stand_at = stand_point(job.shared_prefix, len, floor);
+        }
+    }
+
+    /// Whether a score stands where its siblings' checkpoint puts it: on or
+    /// past its stand point, or with none to wait for. `false` for a
+    /// generation slot.
+    pub(crate) fn score_stands_on_shared(&self) -> bool {
+        self.score
+            .as_ref()
+            .is_some_and(|job| self.cursor >= job.stand_at)
+    }
+
+    /// The point a read of this score crosses when it could write the
+    /// checkpoint its siblings stand on; `None` for a generation and for a
+    /// score with none.
+    pub(crate) fn score_stand_point(&self) -> Option<usize> {
+        self.score
+            .as_ref()
+            .map(|job| job.stand_at)
+            .filter(|at| *at > 0)
+    }
+
+    /// Whether this score's resume has already missed once: a later miss is
+    /// expected while it waits, and logged quietly.
+    pub(crate) fn score_resume_retried(&self) -> bool {
+        self.score
+            .as_ref()
+            .is_some_and(|job| job.missed_at.is_some())
+    }
+
+    /// Puts a score whose resume at shared-read epoch `epoch` found nothing
+    /// back in line to resume again, while nothing has been read for it: a
+    /// sibling is about to write the checkpoint it missed. It asks again
+    /// only once the epoch moves.
+    pub(crate) fn rearm_score_resume(&mut self, epoch: u64) {
+        if self.cursor == 0
+            && let Some(job) = self.score.as_mut()
+            && job.decision.is_none()
+        {
+            job.resume_pending = true;
+            job.missed_at = Some(epoch);
+        }
+    }
+
     /// The label ids to read at the prompt's last row.
     ///
     /// Empty for a generation slot - a caller asks after [`SeqSlot::is_score`],
@@ -1228,6 +1351,26 @@ impl SeqSlot {
         let secs = elapsed.as_secs_f64();
         (tokens > 0 && secs > 0.0).then(|| f64::from(tokens) / secs)
     }
+}
+
+/// The grid point at or below a score's shared prefix: where a sibling's
+/// checkpoint stands a resumed score, because the stack checkpoints on the
+/// recurrence's grid ([`PREFILL_GRID`] is that grid).
+fn shared_grid(shared_prefix: u32, prompt_len: usize) -> usize {
+    let shared = usize::try_from(shared_prefix)
+        .unwrap_or(usize::MAX)
+        .min(prompt_len);
+    shared - shared % PREFILL_GRID
+}
+
+/// Where a score stands once a sibling has read the shared prefix: its
+/// [`shared_grid`], or zero when that lies below `floor`, the checkpoint
+/// tier's `min_tokens` - the stack takes no checkpoint closer than that to a
+/// prompt's start, so a sibling's read leaves nothing there to stand on.
+fn stand_point(shared_prefix: u32, prompt_len: usize, floor: u32) -> usize {
+    let grid = shared_grid(shared_prefix, prompt_len);
+    let floor = usize::try_from(floor.max(1)).unwrap_or(usize::MAX);
+    if grid < floor { 0 } else { grid }
 }
 
 #[cfg(test)]
@@ -1967,5 +2110,63 @@ mod tests {
 
         let tail = cursor.flush(Some(&vocab), &tokens);
         assert_eq!(tail, " \u{FFFD}", "flushing delivers any uncompleted tail");
+    }
+
+    /// A scoring slot over 80 tokens sharing their first 64, as a label score
+    /// when `decides` is unset and as a decision pass otherwise.
+    fn score_slot(decides: bool) -> SeqSlot {
+        let prompt: Arc<[TokenId]> = (0..80).map(TokenId::new).collect();
+        let request = if decides {
+            crate::scheduler::ScoreRequest::decision(
+                prompt,
+                Arc::from(vec![shiso_core::DecisionQuestion {
+                    kind: 0,
+                    span: 64..70,
+                    options: vec![70..71, 71..72],
+                }]),
+            )
+        } else {
+            crate::scheduler::ScoreRequest::new(prompt, Arc::from(vec![TokenId::new(1)]))
+        }
+        .with_shared_prefix(64);
+        let (sink, _rx) = tokio::sync::mpsc::channel(8);
+        let mut ids = NonZeroU64::MIN;
+        let mut slot = SeqSlot::new_score(
+            request,
+            SlotSetup {
+                id: "score".to_owned(),
+                session: SessionId::next(&mut ids).expect("a session id"),
+                sink,
+                started_at: Instant::now(),
+                deadline: None,
+                budget: 0,
+                keyed: false,
+                suppressed: Arc::from([]),
+                score_reply: None,
+            },
+        );
+        slot.set_checkpoint_floor(16);
+        slot
+    }
+
+    /// A decision pass is planned as a solo prefill and never resumes, however
+    /// much of its prompt it says it shares: its head reads the final row of
+    /// every prompt token. A label score over the same prompt does both.
+    #[test]
+    fn a_decision_pass_is_never_a_batched_score_and_never_resumes() {
+        let mut label = score_slot(false);
+        assert!(label.facts().score.is_some());
+        assert_eq!(label.score_stand_point(), Some(64));
+        assert_eq!(label.take_score_resume_at(0), Some(64));
+
+        let mut decision = score_slot(true);
+        assert_eq!(decision.facts().score, None, "planned like a solo prefill");
+        assert_eq!(decision.facts().prompt_remaining, 80);
+        assert_eq!(decision.score_stand_point(), None, "no sibling waits on it");
+        assert_eq!(decision.take_score_resume_at(0), None);
+        assert_eq!(decision.settle_score_resume(0), None);
+        decision.rearm_score_resume(0);
+        assert_eq!(decision.take_score_resume_at(1), None, "never re-armed");
+        assert_eq!(decision.settle_score_resume(1), None);
     }
 }

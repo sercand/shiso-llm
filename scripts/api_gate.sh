@@ -9,8 +9,20 @@
 #
 # It reports every failure it finds rather than stopping at the first, because
 # the thing a gate is worst at is telling you about one problem at a time.
+#
+# `--tree-only` stops after the checks that read the tree and skips the ones
+# that build it (the contracts test, fmt, clippy, deny). scripts/check.sh passes
+# it because it runs those steps itself, scoped to what changed; run bare, this
+# script is still the whole story.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+tree_only=0
+case "${1:-}" in
+    --tree-only) tree_only=1 ;;
+    "") ;;
+    *) echo "api_gate: unknown argument $1 (usage: api_gate.sh [--tree-only])" >&2; exit 2 ;;
+esac
 
 fail=0
 bad() { printf 'api_gate: FAIL  %s\n' "$*" >&2; fail=1; }
@@ -200,6 +212,18 @@ fi
 # argument fails the clippy step below and has to become a named struct.
 ok "argument-count rule is clippy's (too_many_arguments is not allowed anywhere)"
 
+finish() {
+    echo
+    if [ "$fail" -ne 0 ]; then
+        echo "api_gate: FAILED" >&2
+        echo "  None of these is fixed by loosening the check that found it." >&2
+        exit 1
+    fi
+    echo "api_gate: OK"
+    exit 0
+}
+[ "$tree_only" -eq 1 ] && finish
+
 # ---------------------------------------------------------------------------
 section "cross-crate type contracts"
 # ---------------------------------------------------------------------------
@@ -217,9 +241,10 @@ fi
 # ---------------------------------------------------------------------------
 section "format, lint, dependencies, file size"
 # ---------------------------------------------------------------------------
-# scripts/check.sh runs these too. They are repeated here so this script is the
-# whole story: a gate that only works when it is called from another gate is one
-# more thing to get wrong.
+# scripts/check.sh runs these too, and calls this script with --tree-only so
+# they run once. They are here so this script run bare is the whole story: a
+# gate that only works when it is called from another gate is one more thing to
+# get wrong.
 FEATURES=()
 if [ "$(uname -s)" = "Darwin" ]; then
     FEATURES=(--features shiso-server/metal)
@@ -240,11 +265,4 @@ else
     bad "cargo-deny is not installed; install it with: cargo install cargo-deny --locked"
 fi
 
-# ---------------------------------------------------------------------------
-echo
-if [ "$fail" -ne 0 ]; then
-    echo "api_gate: FAILED" >&2
-    echo "  None of these is fixed by loosening the check that found it." >&2
-    exit 1
-fi
-echo "api_gate: OK"
+finish

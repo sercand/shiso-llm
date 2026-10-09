@@ -409,6 +409,25 @@ fn payload(
     }
 }
 
+/// The bytes behind a media source under a remote policy alone: the
+/// embeddings route decodes the same sources as a chat turn and must refuse
+/// an address for the same reason, in the same words.
+///
+/// # Errors
+///
+/// The refusals of the chat path: a remote address, bytes that are not
+/// base64, a source spelling this build does not know.
+pub(crate) fn media_bytes(
+    source: &MediaSource,
+    allow_remote: bool,
+) -> Result<Vec<u8>, PreprocessError> {
+    let policy = MediaPolicy {
+        allow_remote,
+        ..MediaPolicy::default()
+    };
+    payload(source, &policy, "media")
+}
+
 /// Decodes an inline payload, with or without a data-URI wrapper.
 fn decode_inline(value: &str) -> Result<Vec<u8>, PreprocessError> {
     use base64::Engine as _;

@@ -298,6 +298,13 @@ impl SparseStack {
         let q = live.written();
         let earned = boundary.earned();
         let periodic = q > 0 && q.is_multiple_of(MAX_PREFILL_CHUNK);
+        // A scoring session's prompt end is answered and dropped, and its
+        // stride points are what the shared boundary already covers better:
+        // each would be a full recurrent read-back for a checkpoint nothing
+        // resumes. Only a shared boundary - where its sibling questions
+        // diverge - is worth one.
+        let scoring = live.scoring;
+        let wanted = !scoring || boundary == Boundary::Shared;
         // A speculating session's blob carries its staged draft row, and a
         // resume marks that row usable because the blob carried it. So a session
         // that has not staged one is not checkpointed at all rather than
@@ -312,6 +319,7 @@ impl SparseStack {
         // under a content key - its placeholder runs cannot tell two pictures
         // apart - and never inside a run, where no later pass could continue.
         let admit = (earned || periodic)
+            && wanted
             && staged
             && keyed_at(live, q)
             && (earned
@@ -343,7 +351,10 @@ impl SparseStack {
             if frontier_row.is_some() {
                 opts = opts.logits_row(staging.logits.as_slice());
             }
-            if earned {
+            // A scoring session's shared boundary serves the questions of the
+            // request that is reading it now, from memory; the disk tier
+            // would only be paying for a prefix no later process asks for.
+            if earned && !scoring {
                 // Written behind: this queues the checkpoint and pins the pages
                 // the disk does not have yet, and the pump copies them later.
                 opts = opts.persist(reason);
@@ -551,6 +562,27 @@ impl SparseStack {
         live.hints.extend_from_slice(hints);
         live.hints.sort_unstable();
         live.hints.dedup();
+        if live.scoring {
+            live.warm_until = live.hints.last().copied().unwrap_or(0);
+        }
+        Ok(())
+    }
+
+    /// Marks `session` as reading a prompt only to score it. See
+    /// [`crate::ckpt::Checkpointed::kv_set_scoring`].
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`].
+    pub fn ckpt_set_scoring(&mut self, session: SessionId) -> CoreResult<()> {
+        let live = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        live.scoring = true;
+        // Nothing is warmed until hints name a boundary a later session may
+        // resume from.
+        live.warm_until = 0;
         Ok(())
     }
 

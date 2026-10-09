@@ -40,7 +40,7 @@
 
 use shiso_core::error::CoreResult;
 use shiso_core::ids::{Seed, SessionId, TokenId};
-use shiso_core::model::{DecodeStep, Logits, SamplingParams};
+use shiso_core::model::{DecodeStep, Logits, PromptRun, SamplingParams};
 use shiso_core::{Backend, DeviceView, Model};
 use shiso_engine::{Checkpointed, Reason, ResumeInfo, ResumeSource, SaveOutcome};
 use shiso_ir::Usage;
@@ -98,6 +98,18 @@ const _: PrefillLast = <dyn Model>::prefill_last;
 type DecodeBatch =
     for<'m> fn(&'m mut (dyn Model + 'static), &[DecodeStep]) -> CoreResult<Logits<'m>>;
 const _: DecodeBatch = <dyn Model>::decode_batch;
+
+/// A batched prompt pass names each run's session beside its tokens - not two
+/// parallel slices - and borrows its rows from the model, as `prefill_last`
+/// does.
+type PrefillLastMany =
+    for<'m> fn(&'m mut (dyn Model + 'static), &[PromptRun<'_>]) -> CoreResult<Logits<'m>>;
+const _: PrefillLastMany = <dyn Model>::prefill_last_many;
+
+fn prompt_run_fields(run: PromptRun<'_>) -> (SessionId, &[TokenId]) {
+    (run.session, run.tokens)
+}
+const _: for<'a> fn(PromptRun<'a>) -> (SessionId, &'a [TokenId]) = prompt_run_fields;
 
 /// A step is read apart rather than built: `SessionId` has no public
 /// constructor by design, so the field types are pinned by a projection the
@@ -467,6 +479,67 @@ fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
     }
 }
 const _: fn(&ImageGenError) -> (u8, u32, u32) = image_gen_error_variants;
+
+// ---------------------------------------------------------------------------
+// Embeddings.
+//
+// The wire handler builds an IR request, the service turns each input into
+// the family-neutral parts the model reads, the worker holds the model as a
+// trait object, and each family opens through the registry. The text side of
+// a part is a `TokenId` list - the vocabulary's own spelling - so a token-id
+// input and a tokenized string cross this seam as one type.
+
+const _: Option<&dyn shiso_models::embedder::Embedder> = None;
+
+/// The opener the server calls: a described checkpoint and a shared backend
+/// answer with the trait object the worker holds.
+type OpenEmbedder =
+    fn(
+        &shiso_models::embedder::EmbedderDesc<'_>,
+        &std::sync::Arc<dyn Backend>,
+    )
+        -> Result<Box<dyn shiso_models::embedder::Embedder>, shiso_models::embedder::EmbedError>;
+const _: OpenEmbedder = shiso_models::embedder::open_embedder;
+
+/// One input in, one pooled vector and its per-modality positions out.
+type Embed = fn(
+    &mut (dyn shiso_models::embedder::Embedder + 'static),
+    &[shiso_models::embedder::EmbedPart],
+) -> Result<shiso_models::embedder::Embedding, shiso_models::embedder::EmbedError>;
+const _: Embed = <dyn shiso_models::embedder::Embedder>::embed;
+
+/// A text part is the vocabulary's own token type.
+fn embed_text_part(ids: Vec<TokenId>) -> shiso_models::embedder::EmbedPart {
+    shiso_models::embedder::EmbedPart::Text(ids)
+}
+const _: fn(Vec<TokenId>) -> shiso_models::embedder::EmbedPart = embed_text_part;
+
+/// The IR request read apart: model, inputs, the width the caller asked
+/// for, the encoding and the task name. A token-id input stays `u32` on the
+/// IR side - the IR counts tokens and does not name them.
+type EmbedRequestFields = (
+    String,
+    Vec<shiso_ir::EmbedInput>,
+    Option<u32>,
+    shiso_ir::EmbedEncoding,
+    Option<String>,
+);
+fn embed_request_fields(request: shiso_ir::EmbedRequest) -> EmbedRequestFields {
+    (
+        request.model,
+        request.inputs,
+        request.dimensions,
+        request.encoding,
+        request.task,
+    )
+}
+const _: fn(shiso_ir::EmbedRequest) -> EmbedRequestFields = embed_request_fields;
+const _: fn(Vec<u32>) -> shiso_ir::EmbedInput = shiso_ir::EmbedInput::Tokens;
+
+/// The truncation every surface shares: a vector and a width in, a unit
+/// vector out.
+type Matryoshka = fn(&[f32], usize) -> Result<Vec<f32>, shiso_models::embedder::EmbedError>;
+const _: Matryoshka = shiso_models::embedder::matryoshka;
 
 /// The contracts above are checked by the compiler, so this file building at
 /// all is the result. The test exists so a target that stopped being built

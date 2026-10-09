@@ -53,6 +53,7 @@ impl Qwen35Kernels {
             recurrent_lanes = gdn_shape.recurrent.lanes(),
             chunk = gdn_shape.chunk.entry(),
             chunk_lanes = gdn_shape.chunk.lanes(),
+            recorder = gdn_shape.recorder.and_then(gdn_tune::Variant::trail_entry),
             // Not "the fastest shapes": a pinned run reaches this line too,
             // and the line a reader greps for should say what is dispatched
             // rather than how it was arrived at. The tuner logs that itself.

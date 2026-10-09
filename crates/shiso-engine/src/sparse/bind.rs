@@ -48,10 +48,17 @@ pub const MAX_ARGS: usize = 24;
 
 /// Rows one binder may hold a session for.
 ///
-/// The logits block's height, because that is what bounds a decode batch: a
-/// pass that carried more rows than the block has would have nowhere to write
-/// the last of them.
-pub const MAX_ROWS: usize = crate::sparse::stack::MAX_DECODE_BATCH as usize;
+/// One row per run of the widest segmented pass ([`MAX_PROMPT_RUNS`]), which
+/// is wider than a decode batch: a prompt-role pass binds each run's own state
+/// by run. This bounds the binder only. The per-row pointer arrays are packed
+/// for a decode batch's or a verify's rows alone, at most
+/// [`MAX_DECODE_BATCH`] of them, into a slab the scratch sizes at the logits
+/// block's height ([`LOGIT_BLOCK_ROWS`]).
+///
+/// [`MAX_PROMPT_RUNS`]: crate::sparse::stack::MAX_PROMPT_RUNS
+/// [`MAX_DECODE_BATCH`]: crate::sparse::stack::MAX_DECODE_BATCH
+/// [`LOGIT_BLOCK_ROWS`]: crate::sparse::stack::LOGIT_BLOCK_ROWS
+pub const MAX_ROWS: usize = crate::sparse::stack::MAX_PROMPT_RUNS as usize;
 
 /// Which bound tensor an operand names.
 ///
@@ -369,6 +376,22 @@ pub enum Operand {
     RecurrentConvCkpt(u32),
     /// One recurrent slot's per-position state matrices, laid out the same way.
     RecurrentStateCkpt(u32),
+    /// One run's convolution window for one recurrent slot: what a prompt-role
+    /// segmented pass's per-run convolution binds, in the way
+    /// [`Operand::PagesOf`] names one row's page table.
+    RecurrentConvOf {
+        /// The slot's rank among recurrent slots.
+        slot: u32,
+        /// The run, which is the binder's row.
+        run: u32,
+    },
+    /// One run's state matrix for one recurrent slot.
+    RecurrentStateOf {
+        /// The slot's rank among recurrent slots.
+        slot: u32,
+        /// The run, which is the binder's row.
+        run: u32,
+    },
     /// One segment's n-gram convolution window, by segment.
     ///
     /// What a scalar launch binds inside a segmented pass - several sessions'
@@ -503,6 +526,8 @@ impl Operand {
                 | Self::RecurrentState(_)
                 | Self::RecurrentConvCkpt(_)
                 | Self::RecurrentStateCkpt(_)
+                | Self::RecurrentConvOf { .. }
+                | Self::RecurrentStateOf { .. }
                 | Self::NgramWindowOf(_)
                 | Self::NgramWindowCkptOf(_)
                 | Self::NgramWindow
@@ -662,8 +687,8 @@ impl<'a> Binder<'a> {
     ///
     /// # Errors
     ///
-    /// [`CoreError::Unsupported`] for an empty batch or one wider than the
-    /// logits block, which is the width every per-row array is laid out at.
+    /// [`CoreError::Unsupported`] for an empty batch or one wider than
+    /// [`MAX_ROWS`].
     pub fn batched(
         scratch: &'a Scratch,
         weights: &'a SparseWeights,
@@ -672,7 +697,7 @@ impl<'a> Binder<'a> {
     ) -> CoreResult<Self> {
         if sessions.is_empty() || sessions.len() > MAX_ROWS {
             return Err(CoreError::Unsupported {
-                what: "a decode batch wider than the logits block",
+                what: "a batch wider than one binder holds",
                 backend: "engine",
             });
         }
@@ -909,6 +934,12 @@ impl<'a> Binder<'a> {
             }
             Operand::RecurrentConv(slot) => KernelArg::Buffer(self.only()?.recurrent(slot)?.0),
             Operand::RecurrentState(slot) => KernelArg::Buffer(self.only()?.recurrent(slot)?.1),
+            Operand::RecurrentConvOf { slot, run } => {
+                KernelArg::Buffer(self.row(run)?.recurrent(slot)?.0)
+            }
+            Operand::RecurrentStateOf { slot, run } => {
+                KernelArg::Buffer(self.row(run)?.recurrent(slot)?.1)
+            }
             Operand::RecurrentConvCkpt(slot) => {
                 KernelArg::Buffer(self.only()?.recurrent_rollback(slot)?.0)
             }

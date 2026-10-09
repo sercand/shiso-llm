@@ -76,6 +76,30 @@ kernel void kernel_audio_silu_mul_f32(
     out[i] = g * audio_sigmoid(g) * up[i];
 }
 
+/// `out[r][c] = gelu_tanh(gate[r][c]) * up[r * up_stride + up_offset + c]`: a
+/// gated-GELU MLP's product of its gate and value projections, the value read from a
+/// strided slice so a per-layer column block of a wider matrix needs no copy.
+/// The tanh form of GELU, `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`,
+/// with the tanh evaluated precisely as the unary entry's is. `out` may be
+/// `gate`.
+kernel void kernel_audio_gelu_tanh_mul_f32(
+        constant audio_args_gelu_mul & args [[buffer(0)]],
+        device float *out                   [[buffer(1)]],
+        device const float *gate            [[buffer(2)]],
+        device const float *up              [[buffer(3)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint i = tgpig.x * AUDIO_LINEAR_BLOCK + tpitg.x;
+    if (i >= args.rows * args.cols) {
+        return;
+    }
+    const uint r = i / args.cols;
+    const uint c = i - r * args.cols;
+    const float g = gate[i];
+    const float t = precise::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g));
+    out[i] = 0.5f * g * (1.0f + t) * up[(uint64_t) r * args.up_stride + args.up_offset + c];
+}
+
 /// `y[r][c] += b[c]`: a linear's bias after a projection that carries none.
 kernel void kernel_audio_bias_rows_f32(
         constant audio_args_bias_rows & args [[buffer(0)]],

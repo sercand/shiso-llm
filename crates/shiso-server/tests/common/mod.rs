@@ -40,8 +40,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use base64::Engine as _;
 use parking_lot::{Condvar, Mutex};
 use shiso_core::{
-    Backend, CoreError, CoreResult, DecodeStep, DeviceBuffer, DeviceView, KernelRef, LaunchArgs,
-    Logits, Model, ModelInfo, RawBuffer, SessionId, StopTokens, TokenId, alloc,
+    Backend, CoreError, CoreResult, DecisionModel, DecisionQuestion, DecodeStep, DeviceBuffer,
+    DeviceView, KernelRef, LaunchArgs, Logits, Model, ModelInfo, PromptRun, RawBuffer, SessionId,
+    StopTokens, TokenId, alloc,
 };
 use shiso_engine::PersistRefusal;
 use shiso_engine::Reason;
@@ -201,6 +202,13 @@ pub(crate) enum Call {
         /// Whether it was the chunk that produces logits.
         last: bool,
     },
+    /// A batched prompt pass over this many runs and tokens.
+    PrefillMany {
+        /// Runs the pass carried.
+        runs: usize,
+        /// Tokens across every run.
+        tokens: usize,
+    },
 }
 
 /// One offer to the checkpoint tier.
@@ -240,6 +248,29 @@ pub(crate) struct Audit {
     pub(crate) prefill_prompts: Mutex<Vec<Vec<u32>>>,
     /// Shutdown sweeps.
     pub(crate) sweeps: AtomicU64,
+    /// Batched prompt passes the fake refused.
+    pub(crate) batch_refusals: AtomicU64,
+    /// Every decision the fake's head answered, in order.
+    pub(crate) decisions: Mutex<Vec<DecisionNote>>,
+}
+
+/// What a fake decision head saw of one decision pass when it answered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecisionNote {
+    /// Tokens of the prompt the head was asked to answer over.
+    pub(crate) prompt_len: usize,
+    /// Prompt rows the session read alone, through `prefill_chunk` and
+    /// `prefill_last`, after the capture began.
+    pub(crate) read_alone: usize,
+    /// Prompt rows it read as one run of a batched prompt pass.
+    pub(crate) read_batched: usize,
+}
+
+/// The option logit a fake decision head answers option `option` of a
+/// question of kind `kind` with: a function of the two alone, so a test
+/// computes the answer it expects.
+pub(crate) fn decision_logit(kind: u32, option: usize) -> f32 {
+    f32::from(u16::try_from(kind * 10).unwrap_or(0)) + f32::from(u8::try_from(option).unwrap_or(0))
 }
 
 impl Audit {
@@ -250,7 +281,7 @@ impl Audit {
             .iter()
             .filter_map(|call| match call {
                 Call::Decode(width) => Some(*width),
-                Call::Prefill { .. } => None,
+                Call::Prefill { .. } | Call::PrefillMany { .. } => None,
             })
             .collect()
     }
@@ -262,7 +293,19 @@ impl Audit {
             .iter()
             .filter_map(|call| match call {
                 Call::Prefill { tokens, .. } => Some(*tokens),
-                Call::Decode(_) => None,
+                Call::Decode(_) | Call::PrefillMany { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The run counts of every batched prompt pass, in order.
+    pub(crate) fn batched_runs(&self) -> Vec<usize> {
+        self.calls
+            .lock()
+            .iter()
+            .filter_map(|call| match call {
+                Call::PrefillMany { runs, .. } => Some(*runs),
+                _ => None,
             })
             .collect()
     }
@@ -283,6 +326,8 @@ impl Audit {
 pub(crate) struct Gate {
     permits: Mutex<u64>,
     ready: Condvar,
+    /// Calls that have reached the gate, whether or not they passed it.
+    arrived: AtomicU64,
 }
 
 impl Gate {
@@ -291,6 +336,7 @@ impl Gate {
         Arc::new(Self {
             permits: Mutex::new(0),
             ready: Condvar::new(),
+            arrived: AtomicU64::new(0),
         })
     }
 
@@ -308,8 +354,25 @@ impl Gate {
         self.ready.notify_all();
     }
 
+    /// Waits until `want` calls have reached the gate: a closed gate is then
+    /// holding the engine thread inside the last of them, past the plan of
+    /// its tick, rather than somewhere before it.
+    pub(crate) async fn wait_for_arrivals(&self, want: u64) {
+        for _ in 0..2_000 {
+            if self.arrived.load(Ordering::Acquire) >= want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!(
+            "only {} of {want} calls reached the gate",
+            self.arrived.load(Ordering::Acquire)
+        );
+    }
+
     /// Blocks until a permit is available and takes one.
     fn pass(&self) {
+        self.arrived.fetch_add(1, Ordering::Release);
         let mut permits = self.permits.lock();
         while *permits == 0 {
             self.ready.wait(&mut permits);
@@ -345,6 +408,44 @@ pub(crate) struct FakeModel {
     next_session: NonZeroU64,
     audit: Arc<Audit>,
     gate: Option<Arc<Gate>>,
+    /// Whether it answers a batched prompt pass rather than refusing one.
+    batched: bool,
+    /// Whether it answers every prompt with [`keyed_row`] of its last token.
+    keyed: bool,
+    /// How its batched prompt passes misbehave.
+    fault: BatchFault,
+    /// Batched prompt passes it has been asked for, refused or not.
+    batch_calls: u32,
+    /// Whether it carries a decision head.
+    decision_head: bool,
+    /// The prompt rows each session the head is capturing has read since
+    /// the capture began: alone, and in batched passes.
+    captures: HashMap<SessionId, (usize, usize)>,
+}
+
+/// How a fake's batched prompt pass misbehaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum BatchFault {
+    /// It answers every pass.
+    #[default]
+    Never,
+    /// Its first pass fails as a device would, after reading.
+    FailFirst,
+    /// Its second pass is refused as a call it cannot read, after the first
+    /// was answered.
+    RefuseSecond,
+    /// Its first pass hands back one row fewer than it had runs, so the last
+    /// run's row cannot be read back.
+    ShortFirst,
+}
+
+/// The row a keyed fake answers a prompt with: a function of the prompt's last
+/// token alone, so a test computes every answer whatever order the scheduler
+/// read the prompts in.
+pub(crate) fn keyed_row(last: u32) -> Vec<f32> {
+    (0..VOCAB)
+        .map(|i| f32::from(u8::try_from((i + last) % 7).unwrap_or(0)) * 0.5)
+        .collect()
 }
 
 impl FakeModel {
@@ -372,6 +473,12 @@ impl FakeModel {
                 next_session: NonZeroU64::MIN,
                 audit: Arc::clone(&audit),
                 gate: None,
+                batched: false,
+                keyed: false,
+                fault: BatchFault::Never,
+                batch_calls: 0,
+                decision_head: false,
+                captures: HashMap::new(),
             },
             audit,
         )
@@ -388,6 +495,66 @@ impl FakeModel {
     pub(crate) fn with_gate(mut self, gate: Arc<Gate>) -> Self {
         self.gate = Some(gate);
         self
+    }
+
+    /// The same model, answering batched prompt passes.
+    pub(crate) const fn with_batched_prefill(mut self) -> Self {
+        self.batched = true;
+        self
+    }
+
+    /// The same model, its batched prompt passes misbehaving as `fault` says.
+    pub(crate) const fn with_batch_fault(mut self, fault: BatchFault) -> Self {
+        self.fault = fault;
+        self
+    }
+
+    /// The same model, answering every prompt with [`keyed_row`].
+    pub(crate) const fn with_keyed_rows(mut self) -> Self {
+        self.keyed = true;
+        self
+    }
+
+    /// The same model, carrying a decision head that answers with
+    /// [`decision_logit`] and refuses a pass whose captured rows do not cover
+    /// its prompt, as the real head does.
+    pub(crate) const fn with_decision_head(mut self) -> Self {
+        self.decision_head = true;
+        self
+    }
+
+    /// Counts `tokens` prompt rows `session` read toward its capture, when
+    /// one is running.
+    fn capture(&mut self, session: SessionId, tokens: usize, batched: bool) {
+        if let Some((alone, together)) = self.captures.get_mut(&session) {
+            if batched {
+                *together += tokens;
+            } else {
+                *alone += tokens;
+            }
+        }
+    }
+
+    /// Writes the row a prompt ending in `tokens` answers into logits row
+    /// `row_index`: keyed, scripted, or the session's next scripted spike.
+    fn answer_prompt(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        row_index: u32,
+    ) -> CoreResult<()> {
+        if self.keyed {
+            let last = tokens.last().map_or(0, |token| token.get());
+            return self.write_explicit_row(&keyed_row(last), row_index);
+        }
+        // A scripted row answers verbatim - it is what a scoring test reads
+        // back - and only once: the queue drains and the script's spikes take
+        // over, so a test that scripted one row for the score still gets
+        // scripted answers from every later prefill.
+        match self.prefill_rows.pop_front() {
+            Some(row) => self.write_explicit_row(&row, row_index),
+            None => self.write_row(session, row_index),
+        }
     }
 
     /// Writes one session's next scripted token into `row`.
@@ -463,6 +630,7 @@ impl Model for FakeModel {
         };
         self.open.remove(at);
         self.cursors.remove(&session);
+        self.captures.remove(&session);
         self.audit.closes.fetch_add(1, Ordering::Relaxed);
         self.audit.live.lock().retain(|held| *held != session);
         Ok(())
@@ -476,6 +644,7 @@ impl Model for FakeModel {
             tokens: tokens.len(),
             last: false,
         });
+        self.capture(session, tokens.len(), false);
         self.audit
             .prefill_prompts
             .lock()
@@ -491,19 +660,63 @@ impl Model for FakeModel {
             tokens: tokens.len(),
             last: true,
         });
+        self.capture(session, tokens.len(), false);
         self.audit
             .prefill_prompts
             .lock()
             .push(tokens.iter().map(|t| t.get()).collect());
-        // A scripted row answers verbatim - it is what a scoring test reads
-        // back - and only once: the queue drains and the script's spikes take
-        // over, so a test that scripted one row for the score still gets
-        // scripted answers from every later prefill.
-        match self.prefill_rows.pop_front() {
-            Some(row) => self.write_explicit_row(&row, 0)?,
-            None => self.write_row(session, 0)?,
-        }
+        self.answer_prompt(session, tokens, 0)?;
         self.block(1)
+    }
+
+    fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        if !self.batched {
+            self.audit.batch_refusals.fetch_add(1, Ordering::Relaxed);
+            return Err(CoreError::Unsupported {
+                what: shiso_core::NO_BATCHED_PROMPT_PASS,
+                backend: "fake",
+            });
+        }
+        let count = u32::try_from(runs.len()).unwrap_or(u32::MAX);
+        if count == 0 || count > MAX_ROWS {
+            return Err(CoreError::Unsupported {
+                what: "a batch wider than the fake's logits block",
+                backend: "fake",
+            });
+        }
+        if let Some(run) = runs.iter().find(|run| !self.open.contains(&run.session)) {
+            return Err(CoreError::UnknownSession(run.session));
+        }
+        self.batch_calls += 1;
+        if self.fault == BatchFault::RefuseSecond && self.batch_calls == 2 {
+            self.audit.batch_refusals.fetch_add(1, Ordering::Relaxed);
+            return Err(CoreError::Unsupported {
+                what: "a batched prompt pass this call cannot be read as",
+                backend: "fake",
+            });
+        }
+        self.audit.calls.lock().push(Call::PrefillMany {
+            runs: runs.len(),
+            tokens: runs.iter().map(|run| run.tokens.len()).sum(),
+        });
+        for (at, run) in (0_u32..).zip(runs) {
+            self.capture(run.session, run.tokens.len(), true);
+            self.audit
+                .prefill_prompts
+                .lock()
+                .push(run.tokens.iter().map(|t| t.get()).collect());
+            self.answer_prompt(run.session, run.tokens, at)?;
+        }
+        let first = self.batch_calls == 1;
+        match self.fault {
+            BatchFault::FailFirst if first => Err(CoreError::Backend {
+                backend: "fake",
+                op: "prefill_last_many",
+                source: Box::new(io::Error::other("an injected device failure")),
+            }),
+            BatchFault::ShortFirst if first => self.block(count - 1),
+            _ => self.block(count),
+        }
     }
 
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
@@ -523,10 +736,59 @@ impl Model for FakeModel {
         self.block(u32::try_from(steps.len()).unwrap_or(MAX_ROWS))
     }
 
+    fn decision_mut(&mut self) -> Option<&mut dyn DecisionModel> {
+        if self.decision_head { Some(self) } else { None }
+    }
+
     fn teardown(&mut self) -> CoreResult<()> {
         self.audit.teardowns.fetch_add(1, Ordering::Relaxed);
         self.logits = None;
         Ok(())
+    }
+}
+
+/// The fake's decision head: it answers [`decision_logit`] for every option,
+/// and only over a prompt whose every row its session read after the capture
+/// began - the real head's refusal when a resume left rows unread.
+impl DecisionModel for FakeModel {
+    fn capture_hidden(&mut self, session: SessionId) -> CoreResult<()> {
+        if !self.open.contains(&session) {
+            return Err(CoreError::UnknownSession(session));
+        }
+        self.captures.insert(session, (0, 0));
+        Ok(())
+    }
+
+    fn decide(
+        &mut self,
+        session: SessionId,
+        prompt: &[TokenId],
+        questions: &[DecisionQuestion],
+    ) -> CoreResult<Vec<Vec<f32>>> {
+        let (read_alone, read_batched) = self
+            .captures
+            .remove(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        self.audit.decisions.lock().push(DecisionNote {
+            prompt_len: prompt.len(),
+            read_alone,
+            read_batched,
+        });
+        if read_alone + read_batched != prompt.len() {
+            return Err(CoreError::ShapeMismatch {
+                field: "decision.captured_rows",
+                expected: prompt.len() as u64,
+                got: (read_alone + read_batched) as u64,
+            });
+        }
+        Ok(questions
+            .iter()
+            .map(|question| {
+                (0..question.options.len())
+                    .map(|option| decision_logit(question.kind, option))
+                    .collect()
+            })
+            .collect())
     }
 }
 
@@ -566,6 +828,12 @@ impl FakeCheckpointed {
         self
     }
 
+    /// The same model, its inner fake rebuilt by `f`.
+    pub(crate) fn map_inner(mut self, f: impl FnOnce(FakeModel) -> FakeModel) -> Self {
+        self.inner = f(self.inner);
+        self
+    }
+
     /// The same model, reporting a resume of `tokens` prompt tokens to every
     /// prompt at least that long.
     pub(crate) const fn with_hit(mut self, tokens: u32) -> Self {
@@ -601,11 +869,22 @@ impl Model for FakeCheckpointed {
         self.inner.prefill_last(session, tokens)
     }
 
+    fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        for run in runs {
+            *self.written.entry(run.session).or_insert(0) += run.tokens.len();
+        }
+        self.inner.prefill_last_many(runs)
+    }
+
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
         for step in steps {
             *self.written.entry(step.session).or_insert(0) += 1;
         }
         self.inner.decode_batch(steps)
+    }
+
+    fn decision_mut(&mut self) -> Option<&mut dyn DecisionModel> {
+        self.inner.decision_mut()
     }
 
     fn teardown(&mut self) -> CoreResult<()> {
@@ -1113,4 +1392,82 @@ pub(crate) fn fake_media_engine(
         ),
     );
     (engine, join, audit, media_calls)
+}
+
+/// An engine over a checkpointing fake that answers prompts with keyed rows,
+/// reads batched prompt passes when `batched` is set, resumes `hit` prompt
+/// tokens, and holds every decode step at `gate`.
+pub(crate) fn batched_scoring_engine(
+    cfg: SchedulerConfig,
+    gate: Arc<Gate>,
+    batched: bool,
+    hit: Option<u32>,
+) -> (
+    EngineHandle,
+    std::thread::JoinHandle<Result<(), EngineFailure>>,
+    Arc<Audit>,
+) {
+    faulty_scoring_engine(cfg, gate, batched, hit, BatchFault::Never)
+}
+
+/// [`batched_scoring_engine`], its batched passes misbehaving as `fault` says.
+pub(crate) fn faulty_scoring_engine(
+    cfg: SchedulerConfig,
+    gate: Arc<Gate>,
+    batched: bool,
+    hit: Option<u32>,
+    fault: BatchFault,
+) -> (
+    EngineHandle,
+    std::thread::JoinHandle<Result<(), EngineFailure>>,
+    Arc<Audit>,
+) {
+    scoring_engine(cfg, gate, (batched, hit, fault), false)
+}
+
+/// [`faulty_scoring_engine`] over `(batched, hit, fault)`, carrying a fake
+/// decision head when `decision_head` is set.
+pub(crate) fn scoring_engine(
+    cfg: SchedulerConfig,
+    gate: Arc<Gate>,
+    (batched, hit, fault): (bool, Option<u32>, BatchFault),
+    decision_head: bool,
+) -> (
+    EngineHandle,
+    std::thread::JoinHandle<Result<(), EngineFailure>>,
+    Arc<Audit>,
+) {
+    let backend: Arc<dyn Backend> = FakeBackend::new();
+    let (model, audit) = FakeCheckpointed::new(&backend, vec![10; 400]);
+    let model = model.with_gate(gate).map_inner(|inner| {
+        let inner = inner.with_keyed_rows().with_batch_fault(fault);
+        let inner = if decision_head {
+            inner.with_decision_head()
+        } else {
+            inner
+        };
+        if batched {
+            inner.with_batched_prefill()
+        } else {
+            inner
+        }
+    });
+    let model = match hit {
+        Some(tokens) => model.with_hit(tokens),
+        None => model,
+    };
+    let (engine, join) = spawn_engine_with_checkpoints(
+        backend,
+        Box::new(model),
+        shiso_server::media::MediaTowers::default(),
+        None,
+        "fake-model",
+        CAPACITY,
+        cfg,
+        (
+            shiso_parsers::ReasoningScheme::None,
+            shiso_parsers::ToolCallScheme::None,
+        ),
+    );
+    (engine, join, audit)
 }

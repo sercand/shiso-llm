@@ -127,6 +127,12 @@ pub struct AppState {
     /// Whether the loaded model carries a schema decision head, which is what
     /// answers `/v1/systemone` when it does.
     pub decision_head: bool,
+    /// The embedding service, when the loaded model is an embedding model.
+    ///
+    /// Handlers reach it through [`AppState::embedding`], which answers the
+    /// typed "no embedding model" error for a server that serves something
+    /// else.
+    pub embedding: Option<crate::embed::EmbeddingService>,
 }
 
 impl AppState {
@@ -150,6 +156,7 @@ impl AppState {
             image: None,
             image_defaults: crate::image::ImageDefaults::default(),
             decision_head: false,
+            embedding: None,
         }
     }
 
@@ -174,6 +181,7 @@ impl AppState {
             image: None,
             image_defaults: crate::image::ImageDefaults::default(),
             decision_head: false,
+            embedding: None,
         }
     }
 
@@ -182,6 +190,22 @@ impl AppState {
     pub fn with_audio(mut self, audio: crate::audio::AudioService) -> Self {
         self.audio = Some(audio);
         self
+    }
+
+    /// The same state with the embedding service attached.
+    #[must_use]
+    pub fn with_embedding(mut self, embedding: crate::embed::EmbeddingService) -> Self {
+        self.embedding = Some(embedding);
+        self
+    }
+
+    /// The embedding service.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::NoEmbeddingModel`] when no embedding model is loaded.
+    pub fn embedding(&self) -> Result<&crate::embed::EmbeddingService, AppError> {
+        self.embedding.as_ref().ok_or(AppError::NoEmbeddingModel)
     }
 
     /// The same state with the image generation service attached.

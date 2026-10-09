@@ -77,6 +77,10 @@ pub struct Snapshot {
     pub admitted: u64,
     /// Requests that resumed from a stored prefix.
     pub checkpoint_hits: u64,
+    /// Batched prompt passes over several scores' tails.
+    pub score_passes: u64,
+    /// Score tails those passes read.
+    pub score_pass_runs: u64,
 }
 
 impl Snapshot {
@@ -96,6 +100,8 @@ impl Snapshot {
             spec_steps: d(self.spec_steps, earlier.spec_steps),
             admitted: d(self.admitted, earlier.admitted),
             checkpoint_hits: d(self.checkpoint_hits, earlier.checkpoint_hits),
+            score_passes: d(self.score_passes, earlier.score_passes),
+            score_pass_runs: d(self.score_pass_runs, earlier.score_pass_runs),
         }
     }
 }
@@ -119,6 +125,10 @@ pub struct Window {
     pub admitted: u64,
     /// Admitted requests that resumed from a stored prefix.
     pub checkpoint_hits: u64,
+    /// Batched prompt passes over several scores' tails in it.
+    pub score_passes: u64,
+    /// Score tails those passes read.
+    pub score_pass_runs: u64,
 }
 
 #[expect(
@@ -211,6 +221,8 @@ pub struct SchedulerStats {
     /// averaged over to give the tokens one step yields.
     spec_steps: AtomicU64,
     batched_rows: AtomicU64,
+    score_passes: AtomicU64,
+    score_pass_runs: AtomicU64,
 }
 
 impl SchedulerStats {
@@ -410,6 +422,21 @@ impl SchedulerStats {
         self.reused_tokens.fetch_add(tokens, ORDER);
     }
 
+    /// One batched prompt pass read `runs` scores' tails.
+    pub fn score_pass(&self, runs: u64) {
+        self.score_passes.fetch_add(1, ORDER);
+        self.score_pass_runs.fetch_add(runs, ORDER);
+    }
+
+    /// Batched prompt passes, and the score tails they read, in that order.
+    #[must_use]
+    pub fn score_passes(&self) -> (u64, u64) {
+        (
+            self.score_passes.load(ORDER),
+            self.score_pass_runs.load(ORDER),
+        )
+    }
+
     /// A prefix was written to the checkpoint tier.
     pub fn checkpoint_written(&self) {
         self.checkpoint_writes.fetch_add(1, ORDER);
@@ -449,6 +476,8 @@ impl SchedulerStats {
             spec_steps: self.spec_steps.load(ORDER),
             admitted: self.admitted(),
             checkpoint_hits: self.checkpoint_hits(),
+            score_passes: self.score_passes.load(ORDER),
+            score_pass_runs: self.score_pass_runs.load(ORDER),
         }
     }
 

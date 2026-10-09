@@ -17,7 +17,9 @@
     reason = "kernel argument dimensions are element counts bounded by the generation contract (images up to 2048x2048); they fit u32 with orders of magnitude to spare"
 )]
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytemuck::{Pod, Zeroable};
 use shiso_core::{
@@ -30,8 +32,28 @@ pub(crate) const MODULE: &str = "flux2";
 
 /// Threads per elementwise block.
 const BLOCK: u32 = 64;
-/// Tile edge of the GEMM kernels.
+/// Group-norm elements per slice threadgroup: enough work per group to
+/// hide its launch, small enough that a decoder field fills the GPU.
+const GN_SLICE: usize = 16_384;
+/// Upper bound on a group's slices; pass 2 folds every slice's statistics
+/// in every thread, so this bounds that serial loop.
+const GN_MAX_SLICES: usize = 1024;
+/// Tile edge of the scalar GEMM kernels.
 const GEMM_TILE: u32 = 16;
+/// Output tile edge of the simdgroup GEMM and convolution kernels.
+const G64_TILE: u32 = 64;
+/// The simdgroup tile's k slice: a reduction length that is not a multiple
+/// of it goes to the scalar kernels.
+const G64_K: usize = 16;
+/// Threads per simdgroup-tile threadgroup (four simdgroups).
+const G64_THREADS: u32 = 128;
+/// Query rows per fused-attention threadgroup.
+const FA_QROWS: u32 = 32;
+/// Threads per fused-attention threadgroup (four simdgroups).
+const FA_THREADS: u32 = 128;
+/// Widest head the fused attention takes; wider heads (the VAE's single
+/// 512-wide head) go to the per-row kernel.
+const FA_MAX_D: usize = 128;
 
 fn grid_for(total: u32, tile: u32) -> u32 {
     total.div_ceil(tile).max(1)
@@ -115,6 +137,14 @@ struct NormArgs {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct SoftmaxArgs {
+    rows: u32,
+    cols: u32,
+    scale: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct QkNormArgs {
     tokens: u32,
     heads: u32,
@@ -140,6 +170,7 @@ struct GroupNormArgs {
     channels_per_group: u32,
     spatial: u32,
     eps: f32,
+    chunks: u32,
 }
 
 #[repr(C)]
@@ -214,6 +245,18 @@ struct Conv2dArgs {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct GemmFusedArgs {
+    m: u32,
+    n: u32,
+    cols_a: u32,
+    inner: u32,
+    gu_stride: u32,
+    gu_offset: u32,
+    has_bias: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct AxpyArgs {
     count: u32,
     dt: f32,
@@ -235,15 +278,17 @@ const _: () = assert!(size_of::<ModulateArgs>() == 8);
 const _: () = assert!(size_of::<AddGatedArgs>() == 8);
 const _: () = assert!(size_of::<UpsampleArgs>() == 16);
 const _: () = assert!(size_of::<NormArgs>() == 12);
+const _: () = assert!(size_of::<SoftmaxArgs>() == 12);
 const _: () = assert!(size_of::<QkNormArgs>() == 20);
 const _: () = assert!(size_of::<ConcatArgs>() == 12);
-const _: () = assert!(size_of::<GroupNormArgs>() == 20);
+const _: () = assert!(size_of::<GroupNormArgs>() == 24);
 const _: () = assert!(size_of::<Rope4dArgs>() == 28);
 const _: () = assert!(size_of::<RopeHalfArgs>() == 12);
 const _: () = assert!(size_of::<SdpaArgs>() == 44);
 const _: () = assert!(size_of::<GqaArgs>() == 16);
 const _: () = assert!(size_of::<Conv2dArgs>() == 48);
 const _: () = assert!(size_of::<AxpyArgs>() == 8);
+const _: () = assert!(size_of::<GemmFusedArgs>() == 28);
 const _: () = assert!(size_of::<EmbedArgs>() == 8);
 
 /// The stored format of a linear weight, taken from the tensor header.
@@ -273,6 +318,39 @@ pub(crate) struct GemmCall<'a> {
     pub n: usize,
     pub k: usize,
     pub kind: WeightKind,
+}
+
+/// The gated half of a fused row pair: `silu(rows[r, offset + i]) *
+/// rows[r, offset + inner + i]` for `i < inner`, rows `stride` wide.
+#[derive(Clone, Copy)]
+pub(crate) struct SwigluInput<'a> {
+    pub rows: DeviceView<'a>,
+    pub stride: usize,
+    pub offset: usize,
+    pub inner: usize,
+}
+
+/// A block's output linear with its gated residual:
+/// `residual[m, n] += gate[n] * linear(x)` where `x` is the row
+/// `[dense (dense_cols) | swiglu (inner)]`. Either input part may be absent,
+/// not both.
+pub(crate) struct LinearResidualCall<'a> {
+    pub step: &'static str,
+    /// The stream, `(m, n)`, updated in place.
+    pub residual: DeviceView<'a>,
+    /// Per-column gate, `n` values.
+    pub gate: DeviceView<'a>,
+    /// Packed `(m, dense_cols)` rows, the leading part of the input.
+    pub dense: Option<DeviceView<'a>>,
+    pub dense_cols: usize,
+    /// The trailing part of the input, formed from a gate/up row pair.
+    pub swiglu: Option<SwigluInput<'a>>,
+    pub weight: DeviceView<'a>,
+    pub weight_scale: f32,
+    pub bias: Option<DeviceView<'a>>,
+    pub kind: WeightKind,
+    pub m: usize,
+    pub n: usize,
 }
 
 /// Joint-sequence scaled dot-product attention (the transformer's blocks).
@@ -498,6 +576,44 @@ pub(crate) struct Ops {
     /// A zero-filled 4-byte buffer bound wherever an optional bias is absent,
     /// so every launch of an entry point binds the same buffer count.
     dummy: DeviceBuffer,
+    /// Released [`Scratch`] buffers by byte length, handed out again before
+    /// the device is asked for fresh memory. See [`Ops::alloc_f32`].
+    pool: Mutex<HashMap<u64, Vec<DeviceBuffer>>>,
+}
+
+/// A pooled working buffer: derefs to the [`DeviceBuffer`] it holds and goes
+/// back to its [`Ops`]'s pool when dropped, not to the device.
+///
+/// Reuse while earlier launches are still queued is safe because every
+/// launch lands, in issue order, in the backend's one serial queue: a launch
+/// that writes a recycled buffer runs after every launch that read it.
+#[derive(Debug)]
+pub(crate) struct Scratch<'o> {
+    buffer: Option<DeviceBuffer>,
+    pool: &'o Mutex<HashMap<u64, Vec<DeviceBuffer>>>,
+}
+
+impl Deref for Scratch<'_> {
+    type Target = DeviceBuffer;
+
+    fn deref(&self) -> &DeviceBuffer {
+        self.buffer
+            .as_ref()
+            .expect("a scratch buffer is only taken by its own drop")
+    }
+}
+
+impl Drop for Scratch<'_> {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.pool
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(buffer.len())
+                .or_default()
+                .push(buffer);
+        }
+    }
 }
 
 /// Every flux2 kernel entry this driver launches: the module's full
@@ -518,6 +634,7 @@ const REQUIRED_KERNELS: &[&str] = &[
     "kernel_flux2_gemm_f32",
     "kernel_flux2_rmsnorm_f32",
     "kernel_flux2_layer_norm_f32",
+    "kernel_flux2_softmax_rows_f32",
     "kernel_flux2_qk_norm_f32",
     "kernel_flux2_concat_rows_f32",
     "kernel_flux2_sdpa_f32",
@@ -525,10 +642,19 @@ const REQUIRED_KERNELS: &[&str] = &[
     "kernel_flux2_rope_4d",
     "kernel_flux2_rope_half",
     "kernel_flux2_conv2d_f32",
-    "kernel_flux2_group_norm_f32",
+    "kernel_flux2_group_norm_stats_f32",
+    "kernel_flux2_group_norm_apply_f32",
     "kernel_flux2_upsample_nearest_f32",
     "kernel_flux2_transpose_f32",
     "kernel_flux2_embed_bf16_f32",
+    "kernel_flux2_gemm64_f32",
+    "kernel_flux2_gemm64_bf16",
+    "kernel_flux2_gemm64_fp8",
+    "kernel_flux2_conv2d_gemm_f32",
+    "kernel_flux2_flash_sdpa_f32",
+    "kernel_flux2_gemm64_fused_f32",
+    "kernel_flux2_gemm64_fused_bf16",
+    "kernel_flux2_gemm64_fused_fp8",
 ];
 
 impl Ops {
@@ -567,6 +693,7 @@ impl Ops {
         Ok(Self {
             backend: Arc::clone(backend),
             dummy,
+            pool: Mutex::default(),
         })
     }
 
@@ -583,6 +710,7 @@ impl Ops {
         Ok(Self {
             backend: Arc::clone(backend),
             dummy,
+            pool: Mutex::default(),
         })
     }
 
@@ -596,21 +724,80 @@ impl Ops {
         self.dummy.view()
     }
 
-    /// Allocates an uninitialized f32 buffer of `count` elements.
+    /// An uninitialized f32 working buffer of `count` elements, from the pool
+    /// when a released one has the same length.
+    ///
+    /// A 1024x1024 step allocates ~12 GB of activations, layer after layer of
+    /// the same few shapes. Fresh, every one is new pages the GPU faults in
+    /// on first touch - ~3.3 GB/s on an M1 Max, which made a 160 ms linear
+    /// take 300 ms - and the step's one command buffer holds every released
+    /// one until it completes. Pooled, a step touches one layer's worth.
+    /// [`Ops::trim_pool`] gives the memory back after a generation.
     pub(crate) fn alloc_f32(
         &self,
         step: &'static str,
         count: usize,
-    ) -> Result<DeviceBuffer, ImageGenError> {
-        alloc(&self.backend, u64::try_from(count).unwrap_or(u64::MAX) * 4).map_err(fail(step))
+    ) -> Result<Scratch<'_>, ImageGenError> {
+        let bytes = u64::try_from(count).unwrap_or(u64::MAX).saturating_mul(4);
+        let reused = self
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&bytes)
+            .and_then(Vec::pop);
+        let buffer = match reused {
+            Some(buffer) => buffer,
+            None => alloc(&self.backend, bytes).map_err(fail(step))?,
+        };
+        Ok(Scratch {
+            buffer: Some(buffer),
+            pool: &self.pool,
+        })
     }
 
-    /// Uploads f32 values.
+    /// An uninitialized f32 buffer of `count` elements outside the pool, for
+    /// a value that outlives the forward pass that made it.
+    pub(crate) fn alloc_owned_f32(
+        &self,
+        step: &'static str,
+        count: usize,
+    ) -> Result<DeviceBuffer, ImageGenError> {
+        alloc(
+            &self.backend,
+            u64::try_from(count).unwrap_or(u64::MAX).saturating_mul(4),
+        )
+        .map_err(fail(step))
+    }
+
+    /// Frees every pooled buffer.
+    pub(crate) fn trim_pool(&self) {
+        self.pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Uploads f32 values into a buffer of their own, outside the pool:
+    /// weights and other values that live as long as the model.
     pub(crate) fn upload_f32(
         &self,
         step: &'static str,
         values: &[f32],
     ) -> Result<DeviceBuffer, ImageGenError> {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let buffer = alloc(&self.backend, bytes.len() as u64).map_err(fail(step))?;
+        self.backend
+            .copy_h2d(buffer.view(), &bytes)
+            .map_err(fail(step))?;
+        Ok(buffer)
+    }
+
+    /// Uploads f32 values into a pooled working buffer.
+    pub(crate) fn upload_scratch(
+        &self,
+        step: &'static str,
+        values: &[f32],
+    ) -> Result<Scratch<'_>, ImageGenError> {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let buffer = self.alloc_f32(step, values.len())?;
         self.backend
@@ -737,7 +924,7 @@ impl Ops {
         self.launch(
             step,
             "kernel_flux2_swiglu_f32",
-            Extent3::new(inner as u32, rows as u32, 1),
+            Extent3::new(grid_for(inner as u32, BLOCK), rows as u32, 1),
             Extent3::linear(BLOCK),
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
@@ -888,20 +1075,41 @@ impl Ops {
             has_bias: u32::from(call.bias.is_some()),
         };
         let bias = call.bias.unwrap_or(self.dummy.view());
-        let entry = match call.kind {
-            WeightKind::Fp8 => "kernel_flux2_gemm_fp8",
-            WeightKind::Bf16 => "kernel_flux2_gemm_bf16",
-            WeightKind::F32 => "kernel_flux2_gemm_f32",
+        // The simdgroup tile stages whole 16-wide k slices; every linear in
+        // the family qualifies, and the scalar kernels keep any other shape.
+        let tiled = call.k.is_multiple_of(G64_K);
+        let entry = match (call.kind, tiled) {
+            (WeightKind::Fp8, true) => "kernel_flux2_gemm64_fp8",
+            (WeightKind::Bf16, true) => "kernel_flux2_gemm64_bf16",
+            (WeightKind::F32, true) => "kernel_flux2_gemm64_f32",
+            (WeightKind::Fp8, false) => "kernel_flux2_gemm_fp8",
+            (WeightKind::Bf16, false) => "kernel_flux2_gemm_bf16",
+            (WeightKind::F32, false) => "kernel_flux2_gemm_f32",
+        };
+        let (grid, block) = if tiled {
+            (
+                Extent3::new(
+                    grid_for(call.n as u32, G64_TILE),
+                    grid_for(call.m as u32, G64_TILE),
+                    1,
+                ),
+                Extent3::linear(G64_THREADS),
+            )
+        } else {
+            (
+                Extent3::new(
+                    grid_for(call.n as u32, GEMM_TILE),
+                    grid_for(call.m as u32, GEMM_TILE),
+                    1,
+                ),
+                Extent3::new(GEMM_TILE, GEMM_TILE, 1),
+            )
         };
         self.launch(
             call.step,
             entry,
-            Extent3::new(
-                grid_for(call.n as u32, GEMM_TILE),
-                grid_for(call.m as u32, GEMM_TILE),
-                1,
-            ),
-            Extent3::new(GEMM_TILE, GEMM_TILE, 1),
+            grid,
+            block,
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(call.out),
@@ -911,6 +1119,135 @@ impl Ops {
                 KernelArg::Buffer(bias),
             ],
         )
+    }
+
+    /// `residual += gate * linear([dense | swiglu])` in one launch: the
+    /// input row is formed while the tile stages it and the gated add rides
+    /// the epilogue, so neither the activation, the concatenation nor the
+    /// projection is ever written out. A shape the tile cannot stage (part
+    /// widths not multiples of four, a total not a multiple of 16) runs as
+    /// the separate passes instead, with the same result.
+    pub(crate) fn linear_residual(
+        &self,
+        call: &LinearResidualCall<'_>,
+    ) -> Result<(), ImageGenError> {
+        let inner = call.swiglu.map_or(0, |s| s.inner);
+        let dense_cols = if call.dense.is_some() {
+            call.dense_cols
+        } else {
+            0
+        };
+        let k = dense_cols + inner;
+        if k == 0 {
+            return Err(ImageGenError::Backend(format!(
+                "{}: a linear with neither a dense nor a swiglu input",
+                call.step
+            )));
+        }
+        if !dense_cols.is_multiple_of(4) || !inner.is_multiple_of(4) || !k.is_multiple_of(G64_K) {
+            return self.linear_residual_unfused(call, dense_cols, inner);
+        }
+        let args = GemmFusedArgs {
+            m: call.m as u32,
+            n: call.n as u32,
+            cols_a: dense_cols as u32,
+            inner: inner as u32,
+            gu_stride: call.swiglu.map_or(0, |s| s.stride) as u32,
+            gu_offset: call.swiglu.map_or(0, |s| s.offset) as u32,
+            has_bias: u32::from(call.bias.is_some()),
+        };
+        let entry = match call.kind {
+            WeightKind::Fp8 => "kernel_flux2_gemm64_fused_fp8",
+            WeightKind::Bf16 => "kernel_flux2_gemm64_fused_bf16",
+            WeightKind::F32 => "kernel_flux2_gemm64_fused_f32",
+        };
+        self.launch(
+            call.step,
+            entry,
+            Extent3::new(
+                grid_for(call.n as u32, G64_TILE),
+                grid_for(call.m as u32, G64_TILE),
+                1,
+            ),
+            Extent3::linear(G64_THREADS),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.residual),
+                KernelArg::Buffer(call.dense.unwrap_or(self.dummy.view())),
+                KernelArg::Buffer(call.swiglu.map_or(self.dummy.view(), |s| s.rows)),
+                KernelArg::Buffer(call.weight),
+                KernelArg::F32(call.weight_scale),
+                KernelArg::Buffer(call.bias.unwrap_or(self.dummy.view())),
+                KernelArg::Buffer(call.gate),
+            ],
+        )
+    }
+
+    /// [`Ops::linear_residual`] as separate passes, for shapes the fused
+    /// tile does not stage.
+    fn linear_residual_unfused(
+        &self,
+        call: &LinearResidualCall<'_>,
+        dense_cols: usize,
+        inner: usize,
+    ) -> Result<(), ImageGenError> {
+        let m = call.m;
+        let act = match call.swiglu {
+            Some(sw) => {
+                let act = self.alloc_f32(call.step, m * inner)?;
+                let start = sw.offset as u64 * 4;
+                let rows = sw.rows.cut(start, sw.rows.len() - start)?;
+                self.swiglu(call.step, act.view(), rows, m, inner, sw.stride)?;
+                Some(act)
+            }
+            None => None,
+        };
+        let joined;
+        let input = match (call.dense, &act) {
+            (Some(dense), Some(act)) => {
+                joined = self.alloc_f32(call.step, m * (dense_cols + inner))?;
+                self.concat_rows(&ConcatCall {
+                    step: call.step,
+                    out: joined.view(),
+                    a: dense,
+                    b: act.view(),
+                    rows: m,
+                    cols_a: dense_cols,
+                    cols_b: inner,
+                })?;
+                joined.view()
+            }
+            (Some(dense), None) => dense,
+            (None, Some(act)) => act.view(),
+            (None, None) => {
+                return Err(ImageGenError::Backend(format!(
+                    "{}: a linear with neither a dense nor a swiglu input",
+                    call.step
+                )));
+            }
+        };
+        let tmp = self.alloc_f32(call.step, m * call.n)?;
+        self.gemm(&GemmCall {
+            step: call.step,
+            out: tmp.view(),
+            input,
+            weight: call.weight,
+            weight_scale: call.weight_scale,
+            bias: call.bias,
+            m,
+            n: call.n,
+            k: dense_cols + inner,
+            kind: call.kind,
+        })?;
+        self.add_gated(&AddGatedCall {
+            step: call.step,
+            out: call.residual,
+            a: call.residual,
+            gate: call.gate,
+            b: tmp.view(),
+            count: m * call.n,
+            period: call.n,
+        })
     }
 
     /// `RMSNorm` each row: out = x * rsqrt(mean(x^2) + eps) * weight.
@@ -1035,15 +1372,27 @@ impl Ops {
         } else {
             call.cache_v
         };
+        let rows = (call.txt_tokens + call.img_tokens) as u32;
+        // The fused kernel holds a head as 8x8 fragments in registers; the
+        // transformer's 128-wide heads qualify, the VAE's 512-wide one does not.
+        let (entry, grid, block) = if call.head_dim.is_multiple_of(8) && call.head_dim <= FA_MAX_D {
+            (
+                "kernel_flux2_flash_sdpa_f32",
+                Extent3::new(grid_for(rows, FA_QROWS), call.heads as u32, 1),
+                Extent3::linear(FA_THREADS),
+            )
+        } else {
+            (
+                "kernel_flux2_sdpa_f32",
+                Extent3::new(rows, call.heads as u32, 1),
+                Extent3::linear(BLOCK),
+            )
+        };
         self.launch(
             call.step,
-            "kernel_flux2_sdpa_f32",
-            Extent3::new(
-                (call.txt_tokens + call.img_tokens) as u32,
-                call.heads as u32,
-                1,
-            ),
-            Extent3::linear(BLOCK),
+            entry,
+            grid,
+            block,
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(call.out_txt),
@@ -1290,15 +1639,34 @@ impl Ops {
             has_bias: u32::from(call.bias.is_some()),
         };
         let bias = call.bias.unwrap_or(self.dummy.view());
+        // As an implicit GEMM the reduction is the taps; every VAE conv has
+        // a multiple of 16 of them, and the per-pixel kernel keeps the rest.
+        let (entry, grid, block) = if (call.in_c * call.k_h * call.k_w).is_multiple_of(G64_K) {
+            (
+                "kernel_flux2_conv2d_gemm_f32",
+                Extent3::new(
+                    grid_for(call.out_c as u32, G64_TILE),
+                    grid_for((call.out_h * call.out_w) as u32, G64_TILE),
+                    call.batch as u32,
+                ),
+                Extent3::linear(G64_THREADS),
+            )
+        } else {
+            (
+                "kernel_flux2_conv2d_f32",
+                Extent3::new(
+                    call.out_w as u32,
+                    call.out_c as u32,
+                    (call.batch * call.out_h) as u32,
+                ),
+                Extent3::linear(BLOCK),
+            )
+        };
         self.launch(
             call.step,
-            "kernel_flux2_conv2d_f32",
-            Extent3::new(
-                call.out_w as u32,
-                call.out_c as u32,
-                (call.batch * call.out_h) as u32,
-            ),
-            Extent3::linear(BLOCK),
+            entry,
+            grid,
+            block,
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(call.out),
@@ -1309,19 +1677,64 @@ impl Ops {
         )
     }
 
-    /// Group normalization with affine weight and bias.
+    /// Softmax of `scale * x` over each of `rows` rows of `cols`, in place.
+    /// `scale` must be positive.
+    pub(crate) fn softmax_rows(
+        &self,
+        step: &'static str,
+        x: DeviceView<'_>,
+        rows: usize,
+        cols: usize,
+        scale: f32,
+    ) -> Result<(), ImageGenError> {
+        let args = SoftmaxArgs {
+            rows: rows as u32,
+            cols: cols as u32,
+            scale,
+        };
+        self.launch(
+            step,
+            "kernel_flux2_softmax_rows_f32",
+            Extent3::linear(rows as u32),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(x),
+            ],
+        )
+    }
+
+    /// Group normalization with affine weight and bias: slice statistics,
+    /// then one combine-and-apply pass (see the kernels).
     pub(crate) fn group_norm(&self, call: &GroupNormCall<'_>) -> Result<(), ImageGenError> {
+        let per_group = call.channels_per_group * call.spatial;
+        let chunks = per_group.div_ceil(GN_SLICE).clamp(1, GN_MAX_SLICES);
+        let groups = call.batch * call.groups;
+        let partials = self.alloc_f32(call.step, groups * chunks * 2)?;
         let args = GroupNormArgs {
             batch: call.batch as u32,
             num_groups: call.groups as u32,
             channels_per_group: call.channels_per_group as u32,
             spatial: call.spatial as u32,
             eps: call.eps,
+            chunks: chunks as u32,
         };
+        let grid = Extent3::new(groups as u32, chunks as u32, 1);
         self.launch(
             call.step,
-            "kernel_flux2_group_norm_f32",
-            Extent3::linear((call.batch * call.groups) as u32),
+            "kernel_flux2_group_norm_stats_f32",
+            grid,
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(partials.view()),
+                KernelArg::Buffer(call.input),
+            ],
+        )?;
+        self.launch(
+            call.step,
+            "kernel_flux2_group_norm_apply_f32",
+            grid,
             Extent3::linear(BLOCK),
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
@@ -1329,6 +1742,7 @@ impl Ops {
                 KernelArg::Buffer(call.input),
                 KernelArg::Buffer(call.weight),
                 KernelArg::Buffer(call.bias),
+                KernelArg::Buffer(partials.view()),
             ],
         )
     }

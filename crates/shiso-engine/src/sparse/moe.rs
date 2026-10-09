@@ -48,6 +48,7 @@ use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::plan::{Branch, Plan, Step, TrellisOp};
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
+use crate::sparse::stack::{MAX_DECODE_BATCH, MAX_PROMPT_RUNS};
 use crate::sparse::weights::{ExpertDesc, WeightPart};
 
 /// Rows from which columns are grouped by expert before the down projection.
@@ -73,6 +74,14 @@ pub const GROUP_MIN_UNRELATED_ROWS: u32 = 32;
 /// An enum rather than a `bool` because the threshold it selects differs by a
 /// factor of eight, and at a call site `true` says nothing about which way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the origin is `Copy` so every attention context can carry it, and it \
+              is copied into the plan of every layer of a pass - a few hundred bytes \
+              a copy, a few dozen copies a pass, against launches that cost \
+              microseconds each; a boxed run table would trade that for an \
+              allocation per pass and a clone wherever a copy is taken now"
+)]
 pub enum RowOrigin {
     /// One sequence's consecutive positions: a prefill chunk, or a speculative
     /// verify.
@@ -94,15 +103,31 @@ pub enum RowOrigin {
     Segmented(Segments),
 }
 
-/// The runs of a segmented pass: how many consecutive rows each session has,
+/// The runs of a segmented pass: where each session's consecutive rows start,
 /// in pass order.
 ///
-/// A fixed array rather than a vector so the origin stays `Copy`: at most one
-/// run per decode-batch row, each at most a verify's width.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Row offsets rather than lengths: a prompt-role pass reads each scoring
+/// session's whole tail as one run - hundreds of rows, up to
+/// [`MAX_PROMPT_RUNS`] runs - and what every consumer asks is where a run
+/// starts or ends. A fixed array rather than a vector so the origin stays
+/// `Copy`. A verify's kernels take the lengths packed into one argument
+/// instead, which [`Segments::packed_lens`] produces and refuses past a
+/// verify's own bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segments {
-    lens: [u8; crate::sparse::stack::MAX_DECODE_BATCH as usize],
-    count: u8,
+    /// `starts[r]` is run `r`'s first pass row; `starts[count]` is the pass's
+    /// row count.
+    starts: [u32; MAX_PROMPT_RUNS as usize + 1],
+    count: u32,
+}
+
+impl Default for Segments {
+    fn default() -> Self {
+        Self {
+            starts: [0; MAX_PROMPT_RUNS as usize + 1],
+            count: 0,
+        }
+    }
 }
 
 impl Segments {
@@ -110,71 +135,104 @@ impl Segments {
     ///
     /// # Errors
     ///
-    /// [`CoreError::ShapeMismatch`] for no runs, more runs than a decode batch
-    /// holds, an empty run, or one wider than a byte counts.
+    /// [`CoreError::ShapeMismatch`] for no runs, more than
+    /// [`MAX_PROMPT_RUNS`], an empty run, or more rows than a `u32` counts.
     pub fn new(lens: &[u32]) -> CoreResult<Self> {
         let mut out = Self::default();
-        if lens.is_empty() || lens.len() > out.lens.len() {
+        if lens.is_empty() || lens.len() > MAX_PROMPT_RUNS as usize {
             return Err(CoreError::ShapeMismatch {
                 field: "segmented pass runs",
-                expected: out.lens.len() as u64,
+                expected: u64::from(MAX_PROMPT_RUNS),
                 got: lens.len() as u64,
             });
         }
-        for (slot, len) in out.lens.iter_mut().zip(lens) {
-            *slot =
-                u8::try_from(*len)
-                    .ok()
-                    .filter(|len| *len > 0)
-                    .ok_or(CoreError::ShapeMismatch {
-                        field: "segmented pass run rows",
-                        expected: u64::from(u8::MAX),
-                        got: u64::from(*len),
-                    })?;
+        let mut at = 0_u32;
+        for (slot, len) in out.starts.iter_mut().skip(1).zip(lens) {
+            if *len == 0 {
+                return Err(CoreError::ShapeMismatch {
+                    field: "segmented pass run rows",
+                    expected: 1,
+                    got: 0,
+                });
+            }
+            at = at.checked_add(*len).ok_or(CoreError::ShapeMismatch {
+                field: "segmented pass rows",
+                expected: u64::from(u32::MAX),
+                got: u64::from(at) + u64::from(*len),
+            })?;
+            *slot = at;
         }
-        out.count = u8::try_from(lens.len()).unwrap_or(u8::MAX);
+        out.count = u32::try_from(lens.len()).unwrap_or(MAX_PROMPT_RUNS);
         Ok(out)
     }
 
     /// Runs in the pass.
     #[must_use]
     pub const fn count(&self) -> u32 {
-        self.count as u32
+        self.count
     }
 
-    /// Rows run `run` covers.
-    #[must_use]
-    pub fn len(&self, run: u32) -> u32 {
-        self.lens.get(run as usize).map_or(0, |len| u32::from(*len))
-    }
-
-    /// The pass row run `run` starts at.
+    /// The pass row run `run` starts at; the pass's row count past the last.
     #[must_use]
     pub fn start(&self, run: u32) -> u32 {
-        (0..run).map(|earlier| self.len(earlier)).sum()
+        self.starts
+            .get(run.min(self.count) as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Rows run `run` covers, zero past the last.
+    #[must_use]
+    pub fn len(&self, run: u32) -> u32 {
+        if run >= self.count {
+            0
+        } else {
+            self.start(run + 1) - self.start(run)
+        }
     }
 
     /// Rows in the whole pass.
     #[must_use]
     pub fn rows(&self) -> u32 {
-        self.start(self.count())
+        self.start(self.count)
     }
 
-    /// The run lengths as the segmented kernels take them: one byte per run,
-    /// run 0 in the low byte.
+    /// The pass row of run `run`'s last position: the row its logits and its
+    /// staged draft row come from.
     ///
-    /// By value, because a pass is at most eight runs of at most a byte's rows
-    /// each - which [`Segments::new`] enforces - so the table fits one kernel
-    /// argument and needs no buffer the host fills before every pass.
+    /// Every caller asks for a run below [`Segments::count`]. Past the last
+    /// run this is not an error but the pass's own last row, which is the
+    /// last run's, because [`Segments::start`] clamps to the pass's row count
+    /// there and [`Segments::len`] is zero; zero for a pass with no rows.
     #[must_use]
-    pub fn packed_lens(&self) -> u64 {
-        self.lens
-            .iter()
-            .take(self.count as usize)
-            .enumerate()
-            .fold(0, |packed, (run, len)| {
-                packed | (u64::from(*len) << (8 * run))
-            })
+    pub fn last_row(&self, run: u32) -> u32 {
+        self.start(run)
+            .saturating_add(self.len(run))
+            .saturating_sub(1)
+    }
+
+    /// The run lengths as a verify's segmented kernels take them: one byte per
+    /// run, run 0 in the low byte.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] for more runs than a decode batch or a run
+    /// wider than a byte counts: the table is one kernel argument, and a
+    /// prompt-role pass never asks for it (its recurrences run per run).
+    pub fn packed_lens(&self) -> CoreResult<u64> {
+        if self.count > MAX_DECODE_BATCH {
+            return Err(CoreError::Unsupported {
+                what: "a segmented verify of more runs than one kernel argument packs",
+                backend: "engine",
+            });
+        }
+        (0..self.count).try_fold(0_u64, |packed, run| {
+            let len = u8::try_from(self.len(run)).map_err(|_| CoreError::Unsupported {
+                what: "a segmented verify run wider than one byte counts",
+                backend: "engine",
+            })?;
+            Ok(packed | (u64::from(len) << (8 * run)))
+        })
     }
 }
 
@@ -1755,6 +1813,42 @@ pub fn block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segments_carry_up_to_sixty_four_runs_of_any_width() {
+        let runs = Segments::new(&[300, 5, 1]).expect("three runs");
+        assert_eq!((runs.count(), runs.rows()), (3, 306));
+        assert_eq!([runs.start(0), runs.start(1), runs.start(2)], [0, 300, 305]);
+        assert_eq!(
+            [runs.last_row(0), runs.last_row(1), runs.last_row(2)],
+            [299, 304, 305]
+        );
+        assert_eq!(runs.len(3), 0, "past the last run there are no rows");
+        let widest = vec![1_u32; MAX_PROMPT_RUNS as usize];
+        assert_eq!(Segments::new(&widest).expect("the widest pass").count(), 64);
+    }
+
+    #[test]
+    fn segments_refuse_no_runs_an_empty_run_and_one_run_too_many() {
+        Segments::new(&[]).expect_err("no runs");
+        Segments::new(&[4, 0]).expect_err("an empty run");
+        let over = vec![1_u32; MAX_PROMPT_RUNS as usize + 1];
+        Segments::new(&over).expect_err("sixty-five runs");
+    }
+
+    #[test]
+    fn a_verify_packs_its_run_table_as_before_and_a_prompt_pass_cannot() {
+        let verify = Segments::new(&[3, 4]).expect("a verify");
+        assert_eq!(verify.packed_lens().expect("it fits"), 0x0403);
+        Segments::new(&[256])
+            .expect("one prompt run")
+            .packed_lens()
+            .expect_err("a run wider than a byte counts");
+        Segments::new(&[1; 9])
+            .expect("nine runs")
+            .packed_lens()
+            .expect_err("more runs than a verify batch");
+    }
 
     #[test]
     fn only_the_draft_heads_single_row_takes_the_grouped_launches() {

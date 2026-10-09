@@ -483,6 +483,35 @@ async fn a_request_that_names_nothing_gets_the_server_defaults() {
 }
 
 #[tokio::test]
+async fn a_named_step_count_overrides_the_server_default() {
+    let (state, log) = state_with_mock(false);
+    let (status, body) = post_json(
+        state,
+        "/v1/images",
+        json!({"prompt": "a red door", "steps": 8}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(log.recorded()[0].steps, 8);
+}
+
+#[tokio::test]
+async fn a_step_count_outside_one_to_hundred_is_refused() {
+    for steps in [0, 101] {
+        let (state, log) = state_with_mock(false);
+        let (status, body) = post_json(
+            state,
+            "/v1/images/generations",
+            json!({"prompt": "a red door", "steps": steps}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "steps={steps}: {body}");
+        assert_eq!(body["error"]["param"], "steps", "steps={steps}: {body}");
+        assert!(log.recorded().is_empty(), "steps={steps}: no job ran");
+    }
+}
+
+#[tokio::test]
 async fn several_images_each_get_seed_plus_index() {
     let (state, log) = state_with_mock(false);
     let (status, body) = post_json(

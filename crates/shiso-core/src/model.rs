@@ -161,6 +161,16 @@ pub struct DecodeStep {
     pub token: TokenId,
 }
 
+/// One session's piece of a batched prompt pass: the tokens it reads from its
+/// current frontier, which end its prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptRun<'a> {
+    /// Session to advance.
+    pub session: SessionId,
+    /// The tokens it reads.
+    pub tokens: &'a [TokenId],
+}
+
 /// A `[rows, vocab]` block of single-precision logits on the device.
 ///
 /// Borrowed from the model that produced it, so the rows cannot be freed while
@@ -234,6 +244,12 @@ impl<'a> Logits<'a> {
     }
 }
 
+/// The [`CoreError::Unsupported`] `what` of a [`Model::prefill_last_many`]
+/// refusal that says the model, or this build of it, has no batched prompt
+/// pass at all - as opposed to one that refuses a single call it cannot read
+/// the way its solo reads would.
+pub const NO_BATCHED_PROMPT_PASS: &str = "a batched prompt pass on this model or build";
+
 /// A loaded model.
 ///
 /// `Send` but deliberately not `Sync`: exactly one thread owns a model at a
@@ -292,6 +308,32 @@ pub trait Model: Send + std::fmt::Debug {
     /// [`CoreError::UnknownSession`] when any step names a closed or unknown
     /// session, and [`CoreError::Backend`] on a device failure.
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>>;
+
+    /// Reads several sessions' final prompt pieces in one pass, and returns
+    /// one logits row per run in run order: row `r` is the row
+    /// [`Model::prefill_last`] would return for `runs[r]`.
+    ///
+    /// A family that answers must leave every session exactly where
+    /// `prefill_last` would. It must refuse with [`CoreError::Unsupported`],
+    /// before reading anything, any call it cannot answer that way, so the
+    /// caller can read the runs one at a time instead.
+    ///
+    /// A refusal that is a fact about the model or build rather than about
+    /// this call - it has no such pass at all - carries
+    /// [`NO_BATCHED_PROMPT_PASS`] as its `what`, so a caller can stop offering
+    /// the pass; every other refusal refuses this call only.
+    ///
+    /// # Errors
+    ///
+    /// The default is [`CoreError::Unsupported`] with
+    /// [`NO_BATCHED_PROMPT_PASS`] and reads nothing: most families have no
+    /// such pass.
+    fn prefill_last_many(&mut self, _runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        Err(CoreError::Unsupported {
+            what: NO_BATCHED_PROMPT_PASS,
+            backend: "model",
+        })
+    }
 
     /// This model's media path, when it has one.
     ///

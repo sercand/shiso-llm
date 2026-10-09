@@ -14,7 +14,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use shiso_core::{DecisionQuestion, TokenId};
 
-use crate::decision::core::{Answered, Kind, RawQuestion};
+use crate::decision::core::{self, Answered, Kind, RawQuestion};
 use crate::error::AppError;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
@@ -67,7 +67,7 @@ fn head_options(kind: &Kind) -> Vec<(usize, Option_)> {
                     (
                         index,
                         Option_ {
-                            id: option.name.clone(),
+                            id: option.value.text(),
                             description: option.description.clone(),
                         },
                     )
@@ -84,7 +84,7 @@ fn head_options(kind: &Kind) -> Vec<(usize, Option_)> {
                     index,
                     Option_ {
                         id: index.to_string(),
-                        description: Some(level.clone()),
+                        description: Some(level.label.clone()),
                     },
                 )
             })
@@ -292,6 +292,38 @@ pub(crate) fn encode(
     })
 }
 
+/// Refuse a choice list the decision head cannot read.
+///
+/// The head's schema names each option by the text of its value, so a list
+/// where two values spell the same word - the label route's legal `"true"`
+/// beside `true` - would render two identical option lines and score a
+/// coin-flip between them. The letters keep those options distinct on the
+/// label route; the head has no letters, so this path refuses the list by
+/// name instead.
+fn check_head_option_spellings(questions: &[RawQuestion]) -> Result<(), AppError> {
+    for question in questions {
+        if let Kind::Choice { options, .. } = &question.kind {
+            for (index, option) in options.iter().enumerate() {
+                let text = option.value.text();
+                if options[..index]
+                    .iter()
+                    .any(|earlier| earlier.value.text() == text)
+                {
+                    return Err(AppError::bad_request(
+                        format!(
+                            "{}: the decision head cannot score two options spelled {text:?}",
+                            core::question_name(&question.id)
+                        ),
+                        Some("questions"),
+                        "invalid_request",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Scores `questions` over `state` with the model's decision head.
 ///
 /// Returns the answers in the order of `questions` and the prompt's length.
@@ -307,6 +339,7 @@ pub(crate) async fn run(
     temperature: f64,
     want_token_ids: bool,
 ) -> Result<(Vec<Answered>, u64), AppError> {
+    check_head_option_spellings(&questions)?;
     let vocabulary = state.vocabulary.as_ref().ok_or(AppError::NotReady {
         what: "a vocabulary",
     })?;
@@ -409,8 +442,8 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{encode, softmax};
-    use crate::decision::core::{ChoiceOption, Kind, RawQuestion};
+    use super::{check_head_option_spellings, encode, softmax};
+    use crate::decision::core::{ChoiceOption, ChoiceValue, Kind, RawQuestion, ScoreLevel};
     use crate::tokenizer::Vocabulary;
 
     /// A whitespace word vocabulary in which every word of these tests is
@@ -466,7 +499,7 @@ mod tests {
                     options: ["tech", "billing", "abuse"]
                         .iter()
                         .map(|name| ChoiceOption {
-                            name: (*name).to_owned(),
+                            value: ChoiceValue::Str((*name).to_owned()),
                             description: None,
                         })
                         .collect(),
@@ -477,11 +510,50 @@ mod tests {
                 id: "urgency".to_owned(),
                 kind: Kind::Score {
                     question: String::new(),
-                    levels: vec!["later".to_owned(), "now".to_owned()],
+                    levels: ["later", "now"]
+                        .iter()
+                        .map(|label| ScoreLevel {
+                            label: (*label).to_owned(),
+                            description: None,
+                        })
+                        .collect(),
                 },
                 probability_answer: false,
             },
         ]
+    }
+
+    #[test]
+    fn the_head_refuses_options_that_spell_the_same_word() {
+        // `"true"` beside `true` is a legal label-route list; the head's
+        // schema would carry two identical option lines, so this path
+        // refuses it by name instead of scoring a coin-flip.
+        let choice = |options: Vec<ChoiceOption>| RawQuestion {
+            id: "q".to_owned(),
+            kind: Kind::Choice {
+                question: "pick".to_owned(),
+                options,
+            },
+            probability_answer: false,
+        };
+        let str_option = |text: &str| ChoiceOption {
+            value: ChoiceValue::Str(text.to_owned()),
+            description: None,
+        };
+        assert!(
+            check_head_option_spellings(&[choice(vec![str_option("true"), str_option("false")])])
+                .is_ok()
+        );
+        let error = check_head_option_spellings(&[choice(vec![
+            str_option("true"),
+            ChoiceOption {
+                value: ChoiceValue::Bool(true),
+                description: None,
+            },
+        ])])
+        .expect_err("two options spelled `true` are refused on this path");
+        let message = error.to_string();
+        assert!(message.contains("\"true\""), "{message}");
     }
 
     #[test]

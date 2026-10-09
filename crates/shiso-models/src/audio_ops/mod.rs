@@ -21,6 +21,8 @@ mod fused;
 mod linear;
 pub mod load;
 mod runs;
+#[cfg(test)]
+mod span_tests;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -43,9 +45,9 @@ pub use workspace::Workspace;
 
 use args::{
     ArgmaxArgs, AxpyArgs, BiasRowsArgs, CacheAttnArgs, Conv2dArgs, DecodeStepArgs, DwConv1dArgs,
-    EmbedRowArgs, GemmArgs, GluArgs, GreedyStepArgs, GreedyWindowArgs, KeepArgs, KvAppendArgs,
-    LstmArgs, NormArgs, RopeArgs, SiluMulArgs, TransposeArgs, UnaryArgs, UnfoldArgs,
-    WindowAttnArgs,
+    EmbedRowArgs, GeluMulArgs, GemmArgs, GluArgs, GreedyStepArgs, GreedyWindowArgs, KeepArgs,
+    KvAppendArgs, LstmArgs, NormArgs, RopeArgs, SiluMulArgs, SpanAttnArgs, TransposeArgs,
+    UnaryArgs, UnfoldArgs, WindowAttnArgs,
 };
 
 /// The kernel module every launch here names.
@@ -196,6 +198,21 @@ const GEMM64_BLOCK: u32 = 128;
 const GEMM64_SMEM: u32 = 9_472;
 /// Largest head dimension the attention holds in a lane's registers.
 const MAX_HEAD_DIM: usize = 128;
+/// Head columns one span-attention simdgroup takes: its queries and its
+/// slice of the output are eight fragments each, 16 floats a lane apiece.
+const SPAN_SLICE: usize = 64;
+/// Keys one span-attention block scores at once.
+const SPAN_KEYS: usize = 16;
+/// Widest head the span attention takes.
+const SPAN_MAX_HEAD_DIM: usize = 512;
+/// Span-attention simdgroups a threadgroup runs: row groups of eight query
+/// items times the head's column slices, the row groups capped at four (32
+/// items, the most the kernel's bounds table holds). Measured on an M1 Max
+/// against 4 and 16, which were no faster at 256 wide and up to 40% slower at
+/// 512 (see the kernel's notes).
+const SPAN_SIMDGROUPS: usize = 8;
+/// Most row groups of eight query items one threadgroup takes.
+const SPAN_MAX_ROW_GROUPS: usize = 4;
 /// Query heads of a kv head's group one decode-attention simdgroup scores
 /// against each cached row it reads; a larger group takes more simdgroups.
 const DECODE_GROUP_TILE: usize = 2;
@@ -309,6 +326,28 @@ pub struct SiluMulDesc<'a> {
     pub up: DeviceView<'a>,
     /// Values.
     pub count: usize,
+}
+
+/// `out[r][c] = gelu_tanh(gate[r][c]) * up[r * up_stride + up_offset + c]`
+/// over `rows` rows of `cols`, with the tanh form of GELU (`0.5 x (1 +
+/// tanh(sqrt(2/pi) (x + 0.044715 x^3)))`); `out` may be `gate`.
+#[derive(Debug, Clone, Copy)]
+pub struct GeluMulDesc<'a> {
+    /// Destination, `[rows][cols]`.
+    pub out: DeviceView<'a>,
+    /// The gate projection's output, `[rows][cols]`.
+    pub gate: DeviceView<'a>,
+    /// The value projection's output, row `r` at `r * up_stride + up_offset`.
+    pub up: DeviceView<'a>,
+    /// Rows.
+    pub rows: usize,
+    /// Values a row.
+    pub cols: usize,
+    /// Floats between the starts of two rows of `up`: `cols` for a plain
+    /// gated GELU, more when `up` is one column block of a wider matrix.
+    pub up_stride: usize,
+    /// First column of the block `up` is read from, within each row.
+    pub up_offset: usize,
 }
 
 /// A row normalization; `out` may be `input`.
@@ -525,6 +564,24 @@ pub struct RopeDesc<'a> {
     pub theta: f32,
 }
 
+/// Half-split rotary embedding at a position read per row, in place: rows of
+/// several packed sequences each count from their own start.
+#[derive(Debug, Clone, Copy)]
+pub struct RopePosDesc<'a> {
+    /// `[rows][heads * head_dim]`.
+    pub x: DeviceView<'a>,
+    /// Each row's position, u32 `[rows]`.
+    pub positions: DeviceView<'a>,
+    /// Rows.
+    pub rows: usize,
+    /// Heads.
+    pub heads: usize,
+    /// Width of one head, even.
+    pub head_dim: usize,
+    /// Frequency base.
+    pub theta: f32,
+}
+
 /// One step of the recurrent cell under greedy search's emit flag.
 #[derive(Debug, Clone, Copy)]
 pub struct LstmDesc<'a> {
@@ -642,6 +699,42 @@ pub struct CausalAttnDesc<'a> {
     pub heads: usize,
     /// Absolute position of query row 0.
     pub pos0: usize,
+    /// Scale on the logit.
+    pub scale: f32,
+}
+
+/// Grouped-query attention where query `i` sees keys `j` with
+/// `max(start_i, i - left) <= j <= min(end_i - 1, i + right)`, `[start_i,
+/// end_i)` being the rows of the sequence row `i` belongs to (no cache).
+#[derive(Debug, Clone, Copy)]
+pub struct SpanAttnDesc<'a> {
+    /// Destination, `[n][heads * head_dim]`.
+    pub out: DeviceView<'a>,
+    /// Queries, as the destination.
+    pub q: DeviceView<'a>,
+    /// Keys, row-major `[n][kv_heads * head_dim]` (not cache planes).
+    pub k: DeviceView<'a>,
+    /// Values, as the keys.
+    pub v: DeviceView<'a>,
+    /// Several sequences packed in one pass: per row, the u32 pair
+    /// `[start, end)` of its sequence's rows, `[n][2]`. A row outside its
+    /// own range, or an empty range, sees no key and comes out zero. `None`
+    /// is one sequence, `[0, n)`.
+    pub segments: Option<DeviceView<'a>>,
+    /// Rows: queries, keys and values alike.
+    pub n: usize,
+    /// Query heads, a multiple of `kv_heads`.
+    pub heads: usize,
+    /// Key and value heads; query head `h` reads kv head
+    /// `h / (heads / kv_heads)`.
+    pub kv_heads: usize,
+    /// Width of one head, a multiple of 32 up to 512.
+    pub head_dim: usize,
+    /// Keys visible to the left of each query; `n` or more is unbounded.
+    pub left: usize,
+    /// Keys visible to the right of each query: 0 is causal, `n` or more is
+    /// fully bidirectional.
+    pub right: usize,
     /// Scale on the logit.
     pub scale: f32,
 }
@@ -1100,6 +1193,54 @@ impl Ops {
         self.launch(
             "kernel_audio_silu_mul_f32",
             linear_grid(d.count)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.gate),
+                KernelArg::Buffer(d.up),
+            ],
+        )
+    }
+
+    /// A gated-GELU MLP's product of its gate and value projections, the value read
+    /// from a strided column block.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a column block that does not fit in
+    /// `up_stride`; [`CoreError::ShapeMismatch`] for a short view; or the
+    /// launch's error.
+    pub fn gelu_tanh_mul(&self, d: &GeluMulDesc<'_>) -> CoreResult<()> {
+        // A block running past its row would read the next row's columns, a
+        // plausible wrong value rather than a fault.
+        limit(
+            d.up_offset + d.cols <= d.up_stride,
+            "gelu_tanh_mul.up_stride",
+            d.up_stride,
+        )?;
+        let count = d.rows * d.cols;
+        need(d.out, count, "gelu_tanh_mul.out")?;
+        need(d.gate, count, "gelu_tanh_mul.gate")?;
+        if d.rows > 0 {
+            need(
+                d.up,
+                (d.rows - 1) * d.up_stride + d.up_offset + d.cols,
+                "gelu_tanh_mul.up",
+            )?;
+        }
+        let args = GeluMulArgs {
+            rows: dim(d.rows, "gelu_tanh_mul.rows")?,
+            cols: dim(d.cols, "gelu_tanh_mul.cols")?,
+            up_stride: dim(d.up_stride, "gelu_tanh_mul.up_stride")?,
+            up_offset: dim(d.up_offset, "gelu_tanh_mul.up_offset")?,
+        };
+        // The kernel's flat index is a u32.
+        dim(count, "gelu_tanh_mul.count")?;
+        self.launch(
+            "kernel_audio_gelu_tanh_mul_f32",
+            linear_grid(count)?,
             LINEAR_BLOCK,
             0,
             &[
@@ -1691,6 +1832,43 @@ impl Ops {
         )
     }
 
+    /// Half-split rotary embedding with each row's position read from
+    /// `positions`: [`Ops::rope_half`]'s rotation, row for row, when
+    /// `positions[r] == pos0 + r`.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for an odd head,
+    /// [`CoreError::ShapeMismatch`] for a short view, or the launch's error.
+    pub fn rope_half_rows(&self, d: &RopePosDesc<'_>) -> CoreResult<()> {
+        limit(
+            d.head_dim.is_multiple_of(2),
+            "rope_half_rows.head_dim",
+            d.head_dim,
+        )?;
+        let total = d.rows * d.heads * d.head_dim;
+        need(d.x, total, "rope_half_rows.x")?;
+        need(d.positions, d.rows, "rope_half_rows.positions")?;
+        let args = RopeArgs {
+            rows: dim(d.rows, "rope_half_rows.rows")?,
+            heads: dim(d.heads, "rope_half_rows.heads")?,
+            head_dim: dim(d.head_dim, "rope_half_rows.head_dim")?,
+            pos0: 0,
+            theta: d.theta,
+        };
+        self.launch(
+            "kernel_audio_rope_half_pos_f32",
+            linear_grid(total / 2)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.x),
+                KernelArg::Buffer(d.positions),
+            ],
+        )
+    }
+
     /// One LSTM cell step under greedy search's emit flag: the new hidden
     /// state always goes to `x_out`, and replaces `h` and `c` only when the
     /// search state's last step emitted, so a step that found only blanks
@@ -1887,6 +2065,89 @@ impl Ops {
                 KernelArg::Buffer(d.q),
                 KernelArg::Buffer(d.cache.k),
                 KernelArg::Buffer(d.cache.v),
+            ],
+        )
+    }
+
+    /// Grouped-query attention of `n` rows over themselves, each query
+    /// seeing the keys of its own segment within `left` before and `right`
+    /// after it, on the matrix units: a threadgroup per (kv head, up to 32
+    /// query items of its group), a simdgroup per (8 items, 64 head
+    /// columns).
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a head width that is not a multiple of
+    /// 32 up to 512, query heads that are not a multiple of the kv heads, or
+    /// a view not 16-byte aligned; [`CoreError::ShapeMismatch`] for a short
+    /// view; or the launch's error.
+    pub fn span_attention(&self, d: &SpanAttnDesc<'_>) -> CoreResult<()> {
+        let hd = d.head_dim;
+        limit(
+            hd > 0 && hd.is_multiple_of(32) && hd <= SPAN_MAX_HEAD_DIM,
+            "span_attention.head_dim",
+            hd,
+        )?;
+        limit(
+            d.kv_heads > 0 && d.heads.is_multiple_of(d.kv_heads),
+            "span_attention.heads",
+            d.heads,
+        )?;
+        need(d.out, d.n * d.heads * hd, "span_attention.out")?;
+        need(d.q, d.n * d.heads * hd, "span_attention.q")?;
+        need(d.k, d.n * d.kv_heads * hd, "span_attention.k")?;
+        need(d.v, d.n * d.kv_heads * hd, "span_attention.v")?;
+        // Rows are read two floats at a time.
+        for (view, field) in [
+            (d.out, "span_attention.out"),
+            (d.q, "span_attention.q"),
+            (d.k, "span_attention.k"),
+            (d.v, "span_attention.v"),
+        ] {
+            aligned16(view, field)?;
+        }
+        if let Some(seg) = d.segments {
+            need(seg, 2 * d.n, "span_attention.segments")?;
+        }
+        let slices = hd.div_ceil(SPAN_SLICE);
+        let row_groups = (SPAN_SIMDGROUPS / slices).clamp(1, SPAN_MAX_ROW_GROUPS);
+        let items = d.n * (d.heads / d.kv_heads);
+        // Clamped to `n` (still unbounded there), so the kernel's window
+        // bounds `i + right + 1` cannot wrap a u32; nor can the item count.
+        let args = SpanAttnArgs {
+            n: dim(d.n, "span_attention.n")?,
+            heads: dim(d.heads, "span_attention.heads")?,
+            kv_heads: dim(d.kv_heads, "span_attention.kv_heads")?,
+            head_dim: dim(hd, "span_attention.head_dim")?,
+            left: dim(d.left.min(d.n), "span_attention.left")?,
+            right: dim(d.right.min(d.n), "span_attention.right")?,
+            scale: d.scale,
+            row_groups: dim(row_groups, "span_attention.row_groups")?,
+            segmented: u32::from(d.segments.is_some()),
+        };
+        dim(2 * d.n + 1, "span_attention.n")?;
+        dim(items, "span_attention.n")?;
+        let tile = 8 * row_groups;
+        self.launch(
+            "kernel_audio_span_attn_f32",
+            Extent3::new(
+                dim(d.kv_heads, "span_attention.kv_heads")?,
+                dim(items.div_ceil(tile).max(1), "span_attention.n")?,
+                1,
+            ),
+            dim(row_groups * slices * 32, "span_attention.threads")?,
+            dim(
+                row_groups * slices * 8 * SPAN_KEYS * 4,
+                "span_attention.smem",
+            )?,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.out),
+                KernelArg::Buffer(d.q),
+                KernelArg::Buffer(d.k),
+                KernelArg::Buffer(d.v),
+                // Unread without segments; any live view binds the slot.
+                KernelArg::Buffer(d.segments.unwrap_or(d.q)),
             ],
         )
     }

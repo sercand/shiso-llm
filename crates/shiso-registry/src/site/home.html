@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block main %}
+<section class="hero">
+  <h1>Models for shiso</h1>
+  <p class="lede">Each model has pinned weights, hardware requirements and, where measured, prefill and decode speeds on real devices.</p>
+  <div class="cmd"><code>shiso pull &lt;name&gt;</code><button class="copy" data-copy="shiso pull " type="button">Copy</button></div>
+</section>
+
+<section class="finder" aria-label="Search models">
+  <div class="search">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    <input id="q" type="search" placeholder="Search models, tags, quants…  ( / )" autocomplete="off" spellcheck="false" aria-label="Search models">
+  </div>
+  <div class="chips" role="group" aria-label="Filters">
+    {% for key, lab, n in facets.tasks %}<button type="button" class="chip" data-filter="task" data-value="{{ key }}" aria-pressed="false">{{ lab }} <span>{{ n }}</span></button>{% endfor %}
+    <span class="sep" aria-hidden="true"></span>
+    {% for b, n in facets.backends %}<button type="button" class="chip" data-filter="backend" data-value="{{ b }}" aria-pressed="false">{{ b|upper if b == "cuda" else b|capitalize }} <span>{{ n }}</span></button>{% endfor %}
+    <span class="sep" aria-hidden="true"></span>
+    {% for i, n in facets.inputs %}<button type="button" class="chip" data-filter="input" data-value="{{ i }}" aria-pressed="false">{{ i|capitalize }} in <span>{{ n }}</span></button>{% endfor %}
+  </div>
+  <p class="count" id="count" aria-live="polite">{{ models|length }} models</p>
+</section>
+
+<section id="models" class="grid">
+{% for m in models %}
+  <a class="card" href="{{ m.page }}" data-model="{{ m.name }}" data-task="{{ m.task_keys|join(' ') }}" data-backend="{{ m.backends|join(' ') }}" data-input="{{ m.inputs|join(' ') }}">
+    <div class="card-head">
+      <h2>{{ m.name }}</h2>
+      <span class="family">{{ m.family }}</span>
+    </div>
+    <p class="desc">{{ m.description }}</p>
+    <div class="pills">
+      {% for t in m.tasks %}<span class="pill task">{{ t }}</span>{% endfor %}
+      {% for i in m.inputs %}{% if i != "text" %}<span class="pill">{{ i }}</span>{% endif %}{% endfor %}
+      {% for t in m.tags %}{% if t not in m.inputs %}<span class="pill soft">{{ t }}</span>{% endif %}{% endfor %}
+    </div>
+    <dl class="facts">
+      <div><dt>Runs on</dt><dd>{% for b in m.backends %}<span class="be be-{{ b }}">{{ b }}</span>{% endfor %}</dd></div>
+      <div><dt>RAM from</dt><dd>{{ m.min_ram }}</dd></div>
+      <div><dt>Variants</dt><dd>{{ m.variants|length }}</dd></div>
+      {% if m.headline %}<div><dt>Measured</dt><dd>{{ m.headline }}</dd></div>{% elif m.parameters %}<div><dt>Params</dt><dd>{{ m.parameters }}</dd></div>{% endif %}
+    </dl>
+  </a>
+{% endfor %}
+</section>
+<p class="empty" id="empty" hidden>No model matches. Try fewer words or clear a filter.</p>
+<script type="application/json" id="search-docs">{{ search_docs|safe }}</script>
+{% endblock %}
+{% block scripts %}<script src="{{ root }}assets/minisearch.js" defer></script><script src="{{ root }}assets/site.js" defer></script>{% endblock %}

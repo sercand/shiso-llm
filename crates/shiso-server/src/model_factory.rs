@@ -75,6 +75,22 @@ pub enum FactoryError {
     /// The family was recognised but the checkpoint would not load.
     #[error("the checkpoint could not be loaded")]
     Load(#[source] CoreError),
+    /// The scheduler's prefill width is wider than this model's widest pass.
+    ///
+    /// A solo read wider than a pass is split into passes underneath, but a
+    /// batched scoring pass is planned at that width and must be one pass:
+    /// past it every batch would be refused call by call. Refused at boot, by
+    /// the flags that set the width, rather than discovered per request.
+    #[error(
+        "--solo-prefill-chunk / --mixed-prefill-quantum (or --max-num-batched-tokens) ask for \
+         {widest} prompt rows a step, wider than this model's widest pass of {rows}"
+    )]
+    PrefillTooWide {
+        /// The widest prefill width the scheduler was configured with.
+        widest: usize,
+        /// The rows one pass of this model reads at most.
+        rows: u32,
+    },
 }
 
 /// How a family's vision tower is opened, when the operator names one.
@@ -539,9 +555,9 @@ pub fn load_model(
                 backend,
                 path,
                 args.draft_model.as_deref(),
-                args.draft_vocab.as_deref(),
+                draft_vocab_of(args),
                 &family,
-                sparse_options(args, opts, backend),
+                sparse_options(args, opts, backend)?,
             )
             .map_err(FactoryError::Load)?;
             // This family shares the Qwen template's markers AND its tower:
@@ -911,11 +927,26 @@ pub fn draft_manifest(args: &ServeArgs) -> Result<Option<MtpManifest>, CoreError
 /// backend whose kernel set leaves one out - the Metal port has neither the
 /// matrix-unit nor the large-shared-memory layouts - gets the always-correct
 /// fallback rather than a launch of an entry that does not exist.
+///
+/// # Errors
+///
+/// [`FactoryError::PrefillTooWide`] for a prefill width past the widest pass
+/// the stack can be built with.
+/// The draft vocabulary a load narrows the draft head with, said once in the
+/// log: nothing else shows the narrowing except the speed.
+fn draft_vocab_of(args: &ServeArgs) -> Option<&Path> {
+    let path = args.draft_vocab.as_deref();
+    if let Some(path) = path {
+        tracing::info!(path = %path.display(), "narrowed the draft head's vocabulary");
+    }
+    path
+}
+
 fn sparse_options(
     args: &ServeArgs,
     engine: EngineOptions,
     backend: &Arc<dyn Backend>,
-) -> SparseOptions {
+) -> Result<SparseOptions, FactoryError> {
     let entries = capture::capture(backend.as_ref());
     let co_resident_blocks = capture::co_resident_blocks(backend.as_ref(), entries);
     let paths = capture::optional_paths(backend.as_ref());
@@ -932,10 +963,11 @@ fn sparse_options(
         .map_or(shiso_engine::sparse::MAX_PREFILL_CHUNK as usize, |widths| {
             widths.solo_chunk.max(widths.mixed_quantum)
         });
+    let prefill_rows = sparse_prefill_rows(widest)?;
     // The lookup proposes past the head's chain, so the depth the records are
     // sized for is the deeper of the two; the head still chains its own.
     let depth = SpecDepth::new(args.spec_k.max(args.spec_lookup));
-    SparseOptions {
+    Ok(SparseOptions {
         engine,
         spec: depth,
         head_drafts: args.spec_k,
@@ -948,7 +980,7 @@ fn sparse_options(
         },
         entries,
         co_resident_blocks,
-        prefill_rows: SparseOptions::prefill_rows_for(widest),
+        prefill_rows,
         tensor_core: paths.tensor_core,
         tiled_attention: paths.tiled_attention,
         prompt_matmul: paths.prompt_matmul,
@@ -957,7 +989,22 @@ fn sparse_options(
             ..shiso_engine::sparse::recurrent::ChunkPolicy::new()
         },
         ..SparseOptions::default()
+    })
+}
+
+/// The rows one sparse pass is built for when the scheduler's widest prefill
+/// is `widest`.
+///
+/// # Errors
+///
+/// [`FactoryError::PrefillTooWide`] when that is narrower than `widest`, which
+/// only a width past the stack's ceiling makes it.
+fn sparse_prefill_rows(widest: usize) -> Result<u32, FactoryError> {
+    let rows = SparseOptions::prefill_rows_for(widest);
+    if widest > usize::try_from(rows).unwrap_or(usize::MAX) {
+        return Err(FactoryError::PrefillTooWide { widest, rows });
     }
+    Ok(rows)
 }
 
 /// Whether the checkpoint at `path` reads `--ngram`: only the sparse family's
@@ -1023,12 +1070,12 @@ fn load_qwen4exp_nvfp4(
         backend,
         path,
         config,
-        sparse_options(args, opts, backend),
+        sparse_options(args, opts, backend)?,
         &shiso_models::qwen4exp::StreamedLoad {
             slots,
             reserve,
             draft: args.spec_k > 0,
-            counts: args.draft_vocab.as_deref(),
+            counts: draft_vocab_of(args),
         },
     )
     .map_err(FactoryError::Load)?;
@@ -1076,8 +1123,8 @@ fn load_qwen4exp_exl3(
         ngram,
         config,
         args.spec_k > 0,
-        args.draft_vocab.as_deref(),
-        sparse_options(args, opts, backend),
+        draft_vocab_of(args),
+        sparse_options(args, opts, backend)?,
     )
     .map_err(FactoryError::Load)?;
     Ok(Loaded {
@@ -1133,7 +1180,7 @@ fn load_qwen4exp_mlx(
             backend,
             path,
             config,
-            sparse_options(args, opts, backend),
+            sparse_options(args, opts, backend)?,
             slots,
             reserve,
         )
@@ -1150,7 +1197,7 @@ fn load_qwen4exp_mlx(
         backend,
         path,
         config,
-        sparse_options(args, opts, backend),
+        sparse_options(args, opts, backend)?,
         residency,
         reserve,
     )
@@ -1177,4 +1224,28 @@ pub fn recognises(config: &HfConfig) -> bool {
     ) || Qwen35MoeConfig::describes(config)
         || Qwen4ExpConfig::describes(config)
         || Gemma4Config::describes(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FactoryError, sparse_prefill_rows};
+
+    #[test]
+    fn a_prefill_width_past_the_widest_sparse_pass_is_refused_at_boot() {
+        let ceiling = shiso_engine::sparse::MAX_PREFILL_CHUNK;
+        let ceiling_width = usize::try_from(ceiling).expect("a host width");
+        assert_eq!(sparse_prefill_rows(4_096).expect("fits"), 4_096);
+        assert_eq!(sparse_prefill_rows(3_000).expect("fits"), 3_072);
+        assert_eq!(sparse_prefill_rows(ceiling_width).expect("fits"), ceiling);
+        let error = sparse_prefill_rows(ceiling_width + 512).expect_err("one pass cannot hold it");
+        assert!(
+            matches!(error, FactoryError::PrefillTooWide { widest, rows }
+                if widest == ceiling_width + 512 && rows == ceiling),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("--solo-prefill-chunk"),
+            "{error}"
+        );
+    }
 }

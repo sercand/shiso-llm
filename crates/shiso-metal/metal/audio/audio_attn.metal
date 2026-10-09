@@ -259,6 +259,34 @@ kernel void kernel_audio_rope_half_state_f32(
     p[m + half_dim] = b * c + a * s;
 }
 
+/// The rotation above at each row's own position: row `row` turns by
+/// `(pos0 + positions[row]) * theta^(-2m/hd)`, so rows of several packed
+/// sequences each count from their own start.
+kernel void kernel_audio_rope_half_pos_f32(
+        constant audio_args_rope & args [[buffer(0)]],
+        device float *x                 [[buffer(1)]],
+        device const uint *positions    [[buffer(2)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint half_dim = args.head_dim / 2u;
+    const uint i = tgpig.x * AUDIO_LINEAR_BLOCK + tpitg.x;
+    if (i >= args.rows * args.heads * half_dim) {
+        return;
+    }
+    const uint m = i % half_dim;
+    const uint rh = i / half_dim;
+    const uint row = rh / args.heads;
+    device float *p = x + (uint64_t) rh * args.head_dim;
+    const float inv_freq = precise::pow(args.theta, -2.0f * (float) m / (float) args.head_dim);
+    const float ang = (float) (args.pos0 + positions[row]) * inv_freq;
+    float c;
+    const float s = precise::sincos(ang, c);
+    const float a = p[m];
+    const float b = p[m + half_dim];
+    p[m] = a * c - b * s;
+    p[m + half_dim] = b * c + a * s;
+}
+
 /// `rows` new key and value rows, `[rows][kv_heads * hd]`, into one layer's
 /// cache planes `[kv_heads][cap][hd]` from the decoder state's position on.
 /// A row that would land at or past `cap` is dropped: the host sizes the
@@ -872,4 +900,273 @@ kernel void kernel_audio_decode_attn_merge_f32(
         const float inv = total > 0.0f ? 1.0f / total : 0.0f;
         ((device float4 *) (out + (uint64_t) h * hd))[lane] = sum * inv;
     }
+}
+
+/// Where a lane's two elements of an 8x8 simdgroup matrix sit: row `y`,
+/// columns `x` and `x + 1`. The lanes of one row differ only in bits 0 and 3,
+/// so a row's reduction is the shuffles across 1 and 8.
+static inline ushort2 audio_frag_xy(ushort lane) {
+    const ushort quad = lane >> 2;
+    return ushort2(((quad & 2u) << 1) + ((lane & 1u) << 1), (quad & 4u) + ((lane >> 1) & 3u));
+}
+
+/// Span attention on simdgroup matrices: one threadgroup per (kv head, tile
+/// of `8 * row_groups` query items), an item being one (row, query head) of
+/// the kv head's group, so the group's heads share every key and value the
+/// tile reads. Simdgroup `(rg, cs)` takes the tile's items `8rg .. 8rg + 8`
+/// over head columns `cs*W .. cs*W + W`: it holds those queries and its slice
+/// of the output in registers, and a 512-wide head is several slices rather
+/// than one simdgroup's 128 + 128 floats a lane, which would spill.
+///
+/// The keys come `KB` at a time from the union of the tile's visible ranges.
+/// Each simdgroup forms its slice's partial transposed scores `K.Q^T`, so a
+/// key fragment's lane reads two neighbouring floats of one key row, as a
+/// value fragment's does. The partial scores go through threadgroup memory,
+/// which sums the slices and hands each lane the scores of its own item row,
+/// the layout the probabilities need as a left operand; every simdgroup of
+/// the row group then runs the same online softmax on the same sums (the
+/// summation order is fixed, so the copies agree to the bit) and adds its
+/// probabilities times its slice of the values. The fragments are read
+/// straight from device memory, each lane its own two elements, with the key
+/// row clamped into the input; the mask gives a clamped or invisible key no
+/// weight.
+///
+/// Measured on an M1 Max over 8192 rows, four query heads, per launch: a
+/// 1025-key window at 256 wide over two kv heads, and 512 wide over one
+/// kv head unbounded. Here (64 columns, 16 keys, 8 simdgroups): 14.7 and 282
+/// ms. 128 columns: 15.7 and 296; 32 keys: 27.5 and 496, 8 keys 19.1 and 368
+/// (32 keys' fragments cost the threadgroups a core); the scores' keys as the
+/// fragments' columns, a lane's two keys a row apart, 32.7 and 561 at 32
+/// keys; two item fragments a simdgroup, each key read feeding two products,
+/// no better (17.3 and 267 at its best); keys and values staged through
+/// threadgroup memory in 8-key blocks, 18.6 and 343 (four barriers a block).
+///
+/// The scores and the products are f32 throughout (the fragments' multiply
+/// is an f32 FMA), and the exponential is the precise one.
+template <uint W, uint KB>
+static inline void audio_span_flash(
+        constant audio_args_span_attn & args,
+        device float *out, device const float *q,
+        device const float *k, device const float *v,
+        device const uint *segments, threadgroup float *part,
+        threadgroup uint *bounds, uint3 tgpig, ushort lane, ushort sg) {
+    const uint n = args.n;
+    const uint hd = args.head_dim;
+    const uint group = args.heads / args.kv_heads;
+    const uint slices = (hd + W - 1u) / W;
+    const uint rg = sg / slices;
+    const uint cs = sg - rg * slices;
+    const uint tile = args.row_groups * 8u;
+    const uint items = n * group;
+    const uint item0 = tgpig.y * tile;
+    const uint kvh = tgpig.x;
+    const uint w = args.heads * hd;
+    const uint kvw = args.kv_heads * hd;
+
+    // Each item's visible keys `[lo, hi)` and, past them, the tile's union.
+    // An item past the input, or a row whose segment is empty, sees nothing.
+    if (sg == 0) {
+        uint lo = 0xffffffffu;
+        uint hi = 0u;
+        if (lane < tile) {
+            const uint item = item0 + lane;
+            uint ilo = 1u;
+            uint ihi = 0u;
+            if (item < items) {
+                const uint i = item / group;
+                uint s = 0u;
+                uint e = n;
+                if (args.segmented != 0u) {
+                    s = segments[2u * i];
+                    e = min(segments[2u * i + 1u], n);
+                }
+                // The host clamps `left` and `right` to `n`: no sum wraps.
+                ilo = max(s, i > args.left ? i - args.left : 0u);
+                ihi = min(e, i + args.right + 1u);
+            }
+            bounds[2u * lane] = ilo;
+            bounds[2u * lane + 1u] = ihi;
+            if (ilo < ihi) {
+                lo = ilo;
+                hi = ihi;
+            }
+        }
+        lo = simd_min(lo);
+        hi = simd_max(hi);
+        if (lane == 0) {
+            bounds[2u * AUDIO_SPAN_MAX_ITEMS] = lo;
+            bounds[2u * AUDIO_SPAN_MAX_ITEMS + 1u] = hi;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ushort2 xy = audio_frag_xy(lane);
+    const uint t0 = rg * 8u;
+    // This lane's item row `y`: its visible keys.
+    const uint my_lo = bounds[2u * (t0 + xy.y)];
+    const uint my_hi = bounds[2u * (t0 + xy.y) + 1u];
+    const uint jlo = bounds[2u * AUDIO_SPAN_MAX_ITEMS];
+    const uint jhi = bounds[2u * AUDIO_SPAN_MAX_ITEMS + 1u];
+    const uint d0 = cs * W;
+    // Fragments of this slice inside the head: the head is a multiple of 32
+    // wide, so a slice is whole fragments, and only the last may be short.
+    const uint frags = min(W, hd - d0) / 8u;
+    device const float *kp = k + kvh * hd + d0;
+    device const float *vp = v + kvh * hd + d0;
+
+    // The queries transposed, `Q^T(d, item)`: this lane holds items `x` and
+    // `x + 1` at head column `8c + y`.
+    simdgroup_float8x8 qf[W / 8u];
+    simdgroup_float8x8 of[W / 8u];
+    {
+        device const float *qcol[2];
+        AUDIO_UNROLL for (uint e = 0; e < 2u; ++e) {
+            const uint it = min(item0 + t0 + xy.x + e, items - 1u);
+            const uint r = it / group;
+            qcol[e] = q + (uint64_t) r * w + (kvh * group + (it - r * group)) * hd + d0 + xy.y;
+        }
+        AUDIO_UNROLL for (uint c = 0; c < W / 8u; ++c) {
+            float2 qv = float2(0.0f);
+            if (c < frags) {
+                qv = float2(qcol[0][8u * c], qcol[1][8u * c]) * args.scale;
+            }
+            qf[c].thread_elements()[0] = qv.x;
+            qf[c].thread_elements()[1] = qv.y;
+            of[c] = simdgroup_float8x8(0.0f);
+        }
+    }
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    threadgroup float *mine = part + sg * (8u * KB);
+    threadgroup const float *peers = part + rg * slices * (8u * KB);
+    for (uint base = jlo; base < jhi; base += KB) {
+        simdgroup_float8x8 sf[KB / 8u];
+        AUDIO_UNROLL for (uint b = 0; b < KB / 8u; ++b) {
+            sf[b] = simdgroup_float8x8(0.0f);
+        }
+        // K(j, d): this lane's key `y` of each fragment, head columns `x` and
+        // `x + 1`. Slice column outer, so the block's accumulators are
+        // independent chains (key fragment outer measured 37.7 and 680 ms).
+        device const float *krow[KB / 8u];
+        AUDIO_UNROLL for (uint b = 0; b < KB / 8u; ++b) {
+            krow[b] = kp + (uint64_t) min(base + 8u * b + xy.y, n - 1u) * kvw + xy.x;
+        }
+        AUDIO_UNROLL for (uint c = 0; c < W / 8u; ++c) {
+            if (c < frags) {
+                AUDIO_UNROLL for (uint b = 0; b < KB / 8u; ++b) {
+                    const float2 kv = float2(*((device const packed_float2 *) (krow[b] + 8u * c)));
+                    simdgroup_float8x8 kf;
+                    kf.thread_elements()[0] = kv.x;
+                    kf.thread_elements()[1] = kv.y;
+                    simdgroup_multiply_accumulate(sf[b], kf, qf[c], sf[b]);
+                }
+            }
+        }
+        // `S^T(key, item)` in, `S(item, key)` back: every lane reads exactly
+        // what the same lane of each slice's simdgroup wrote. Threadgroup
+        // barriers, not simdgroup ones, around the hand-off (see
+        // `kernel_flux2_flash_sdpa_f32` for what a simdgroup barrier let
+        // through on an M1 Max); the second keeps the next block's writes
+        // from overtaking a slow reader.
+        AUDIO_UNROLL for (uint b = 0; b < KB / 8u; ++b) {
+            mine[xy.x * KB + 8u * b + xy.y] = sf[b].thread_elements()[0];
+            mine[(xy.x + 1u) * KB + 8u * b + xy.y] = sf[b].thread_elements()[1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float s[KB / 8u][2];
+        AUDIO_UNROLL for (uint b = 0; b < KB / 8u; ++b) {
+            const uint at = xy.y * KB + 8u * b + xy.x;
+            float2 sum = float2(0.0f);
+            for (uint p = 0; p < slices; ++p) {
+                sum += float2(peers[p * 8u * KB + at], peers[p * 8u * KB + at + 1u]);
+            }
+            s[b][0] = sum.x;
+            s[b][1] = sum.y;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float block_max = -INFINITY;
+        AUDIO_UNROLL for (uint b = 0; b < KB / 8u; ++b) {
+            AUDIO_UNROLL for (uint e = 0; e < 2u; ++e) {
+                const uint j = base + 8u * b + xy.x + e;
+                s[b][e] = j >= my_lo && j < my_hi ? s[b][e] : -INFINITY;
+                block_max = max(block_max, s[b][e]);
+            }
+        }
+        block_max = max(block_max, simd_shuffle_xor(block_max, 1));
+        block_max = max(block_max, simd_shuffle_xor(block_max, 8));
+        const float m_new = max(m, block_max);
+        // A row that has seen only masked keys keeps a maximum of minus
+        // infinity; its rescale is one so nothing becomes NaN.
+        const float alpha = m_new == -INFINITY ? 1.0f : precise::exp(m - m_new);
+        float block_sum = 0.0f;
+        simdgroup_float8x8 pf[KB / 8u];
+        AUDIO_UNROLL for (uint b = 0; b < KB / 8u; ++b) {
+            AUDIO_UNROLL for (uint e = 0; e < 2u; ++e) {
+                const float p = s[b][e] == -INFINITY ? 0.0f : precise::exp(s[b][e] - m_new);
+                block_sum += p;
+                pf[b].thread_elements()[e] = p;
+            }
+        }
+        block_sum += simd_shuffle_xor(block_sum, 1);
+        block_sum += simd_shuffle_xor(block_sum, 8);
+        l = l * alpha + block_sum;
+        m = m_new;
+
+        // An output fragment's lane holds the same item row as its
+        // probability fragment's, so the rescale is per lane, with no
+        // diagonal product.
+        AUDIO_UNROLL for (uint c = 0; c < W / 8u; ++c) {
+            of[c].thread_elements()[0] *= alpha;
+            of[c].thread_elements()[1] *= alpha;
+        }
+        AUDIO_UNROLL for (uint b = 0; b < KB / 8u; ++b) {
+            device const float *vrow = vp + (uint64_t) min(base + 8u * b + xy.y, n - 1u) * kvw + xy.x;
+            AUDIO_UNROLL for (uint c = 0; c < W / 8u; ++c) {
+                if (c < frags) {
+                    const float2 vv = float2(*((device const packed_float2 *) (vrow + 8u * c)));
+                    simdgroup_float8x8 vf;
+                    vf.thread_elements()[0] = vv.x;
+                    vf.thread_elements()[1] = vv.y;
+                    simdgroup_multiply_accumulate(of[c], pf[b], vf, of[c]);
+                }
+            }
+        }
+    }
+
+    const uint t = t0 + xy.y;
+    if (item0 + t < items) {
+        const uint it = item0 + t;
+        const uint r = it / group;
+        const uint h = kvh * group + (it - r * group);
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        device float *orow = out + (uint64_t) r * w + h * hd + d0 + xy.x;
+        AUDIO_UNROLL for (uint c = 0; c < W / 8u; ++c) {
+            if (c < frags) {
+                *((device packed_float2 *) (orow + 8u * c)) = packed_float2(
+                        of[c].thread_elements()[0] * inv, of[c].thread_elements()[1] * inv);
+            }
+        }
+    }
+}
+
+/// Bidirectional grouped-query attention over a window of each row's
+/// segment, with no cache: `audio_span_flash` at `AUDIO_SPAN_W`-column slices
+/// and `AUDIO_SPAN_KB`-key blocks. Grid `(kv_heads, ceil(n * heads/kv_heads /
+/// (8 * row_groups)))`, `row_groups * ceil(hd/W)` simdgroups.
+kernel void kernel_audio_span_attn_f32(
+        constant audio_args_span_attn & args [[buffer(0)]],
+        device float *out                    [[buffer(1)]],
+        device const float *q                [[buffer(2)]],
+        device const float *k                [[buffer(3)]],
+        device const float *v                [[buffer(4)]],
+        device const uint *segments          [[buffer(5)]],
+        threadgroup float *part              [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint bounds[2u * AUDIO_SPAN_MAX_ITEMS + 2u];
+    audio_span_flash<AUDIO_SPAN_W, AUDIO_SPAN_KB>(
+            args, out, q, k, v, segments, part, bounds, tgpig, lane, sg);
 }

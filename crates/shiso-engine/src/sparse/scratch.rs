@@ -58,6 +58,11 @@ pub const PART_STRIDE: u64 = 256 + 8;
 /// set a shipped vocabulary declares (994), at 16 KiB.
 pub const SUPPRESS_CAPACITY: u32 = 4_096;
 
+/// Look-back rows the rotary table holds beyond its two copies of the pass's
+/// rows: the lead-in in front of the first row, and one group in front of
+/// each run of the widest segmented pass.
+const MROPE_LOOKBACKS: u64 = ((crate::sparse::stack::MAX_PROMPT_RUNS + 1) * MROPE_BACK) as u64;
+
 /// One activation buffer a pass writes.
 ///
 /// The order is the order a pass first touches them, which is also the order
@@ -369,8 +374,12 @@ impl Buf {
             // The rotary table carries a prefix in front of the chunk's first
             // token, because the pooled-key pass derives a pooled row's position
             // by rounding down to the compression boundary and can name a
-            // position a few slots before the chunk starts.
-            Self::Mrope => (rows + u64::from(MROPE_BACK)) * u64::from(MROPE_AXES) * I32_BYTES,
+            // position a few slots before the chunk starts. A segmented pass
+            // then writes a second copy of every row, each run behind a
+            // look-back group of its own (`inputs::fill_segments`): sized at
+            // `rows + MROPE_BACK`, a 64-run, 4096-row pass would write past the
+            // table.
+            Self::Mrope => (2 * rows + MROPE_LOOKBACKS) * u64::from(MROPE_AXES) * I32_BYTES,
             Self::Embed | Self::Mixed | Self::BlockOut => per_token(shape.hidden),
             Self::Residual | Self::Normed | Self::Expanded => per_token(shape.stream_dim()),
             Self::LowRank => per_token(shape.stream_rank),
@@ -468,9 +477,14 @@ impl Buf {
             Self::PleKey | Self::PleQuery | Self::PleGated | Self::PleConv => {
                 per_token(shape.stream_dim())
             }
-            // One slot per row of the widest decode batch in every array, so
+            // One slot per row of the logits block in every array
+            // (`LOGIT_BLOCK_ROWS`, the widest prompt-role pass's run count), so
             // the stride is the same at every batch width and an address a
-            // launch was planned against never moves with the row count.
+            // launch was planned against never moves with the row count. Only
+            // a decode batch or a verify packs these - at most
+            // `MAX_DECODE_BATCH` rows - so most of the slab is never written:
+            // a prompt-role segmented pass binds each run's state by run and
+            // packs no pointer at all.
             Self::RowPointers => {
                 u64::from(crate::sparse::rows::arrays(shape))
                     * u64::from(logit_rows)
@@ -752,10 +766,26 @@ mod tests {
     #[test]
     fn the_rotary_table_carries_its_prefix_rows() {
         let shape = shape();
+        let runs = crate::sparse::stack::MAX_PROMPT_RUNS;
         assert_eq!(
             Buf::Mrope.bytes(&shape, 1, 1, CTX),
-            (1 + u64::from(MROPE_BACK)) * u64::from(MROPE_AXES) * I32_BYTES
+            u64::from(2 + (runs + 1) * MROPE_BACK) * u64::from(MROPE_AXES) * I32_BYTES
         );
+    }
+
+    #[test]
+    fn the_rotary_table_holds_a_segmented_pass_of_the_widest_shape() {
+        let shape = shape();
+        let runs = crate::sparse::stack::MAX_PROMPT_RUNS;
+        for rows in [1_u32, 64, 4_096] {
+            // `fill_segments`: the lead-in, every row, then a look-back group
+            // and that run's rows again for every run.
+            let need = u64::from(MROPE_BACK + rows + runs * MROPE_BACK + rows);
+            assert!(
+                Buf::Mrope.bytes(&shape, rows, 1, CTX) >= need * u64::from(MROPE_AXES) * I32_BYTES,
+                "{rows} rows"
+            );
+        }
     }
 
     #[test]

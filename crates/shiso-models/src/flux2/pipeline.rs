@@ -19,6 +19,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use image::ImageEncoder as _;
 use shiso_core::Backend;
@@ -318,15 +319,37 @@ impl ImageGenerator for Flux2KleinModel {
             ));
         }
 
+        // Declared first so it drops last, after every working buffer of this
+        // generation is back in the pool: an idle server should not hold a
+        // 1024x1024 image's activations.
+        let _trim = TrimPool(&self.ops);
         let steps = job.steps as usize;
+        let began = Instant::now();
         let ids = self.tokenize(&job.prompt)?;
         let t_txt = ids.len();
-        let context = self.text.prefill(&self.ops, &ids)?;
-        let ctx_buf = self.ops.upload_f32("pipeline context", &context)?;
-
         let (w, h) = (job.width as usize, job.height as usize);
         let (wl, hl) = (w / 16, h / 16);
         let t_img = wl * hl;
+        tracing::info!(
+            width = w,
+            height = h,
+            steps,
+            txt_tokens = t_txt,
+            img_tokens = t_img,
+            streaming = progress.is_some(),
+            "image generation started"
+        );
+
+        // The prefill ends in a readback, so the clock covers the device work.
+        let phase = Instant::now();
+        let context = self.text.prefill(&self.ops, &ids)?;
+        let ctx_buf = self.ops.upload_f32("pipeline context", &context)?;
+        tracing::info!(
+            seconds = phase.elapsed().as_secs_f64(),
+            txt_tokens = t_txt,
+            "image prompt encoded"
+        );
+
         let latent_count = t_img * self.params.in_channels;
 
         // Standard-normal noise by Box-Muller, drawn from the job's seed:
@@ -344,7 +367,7 @@ impl ImageGenerator for Flux2KleinModel {
             noise.push(radius * angle.sin());
         }
         noise.truncate(latent_count);
-        let mut latents = self.ops.upload_f32("pipeline noise", &noise)?;
+        let mut latents = self.ops.upload_scratch("pipeline noise", &noise)?;
 
         // 4-axis positions, matching the reference pipeline's id prep: image
         // tokens carry (frame 0, row, column, 0) and text tokens (0, 0, 0,
@@ -375,7 +398,9 @@ impl ImageGenerator for Flux2KleinModel {
         // One step per scheduled timestep. The transformer's embedding
         // applies the reference's 1000x time factor itself, so it receives
         // the raw sigma, not the scheduler's 1000-scaled timestep.
+        let denoise = Instant::now();
         for (i, _) in scheduler.timesteps.iter().enumerate() {
+            let phase = Instant::now();
             let sigma = scheduler.sigmas[i];
             let velocity = self.dit.forward(
                 &self.ops,
@@ -404,26 +429,72 @@ impl ImageGenerator for Flux2KleinModel {
                 dt,
             )?;
             latents = next;
+            // Launches only queue; draining here charges the step's device
+            // work to the step that issued it. One drain per step is noise
+            // beside a transformer pass.
+            self.ops
+                .backend()
+                .sync()
+                .map_err(|e| ImageGenError::Backend(format!("pipeline step sync: {e}")))?;
+            tracing::info!(
+                step = i + 1,
+                steps,
+                sigma,
+                seconds = phase.elapsed().as_secs_f64(),
+                "image denoising step"
+            );
 
             if let Some(report) = progress {
-                let host = self
-                    .ops
-                    .download("pipeline progress", latents.view(), latent_count)?;
-                let rgb = self.vae.decode(&self.ops, &host, w, h)?;
-                let bytes = encode_image(&rgb, w, h, ImageOutputFormat::Png, None)?;
+                // The last step's preview would be the finished image byte
+                // for byte, which the consumer drops in favour of the
+                // completed frame; decoding it would cost a whole extra VAE
+                // pass. Its tick still goes out.
+                let partial_image = if i + 1 == steps {
+                    None
+                } else {
+                    let phase = Instant::now();
+                    let host =
+                        self.ops
+                            .download("pipeline progress", latents.view(), latent_count)?;
+                    let rgb = self.vae.decode(&self.ops, &host, w, h)?;
+                    let bytes = encode_image(&rgb, w, h, ImageOutputFormat::Png, None)?;
+                    tracing::info!(
+                        step = i + 1,
+                        seconds = phase.elapsed().as_secs_f64(),
+                        "image partial preview decoded"
+                    );
+                    Some(bytes)
+                };
                 report(ImageStepEvent {
                     step: i as u32,
                     total_steps: job.steps,
-                    partial_image: Some(bytes),
+                    partial_image,
                 });
             }
         }
+        tracing::info!(
+            seconds = denoise.elapsed().as_secs_f64(),
+            steps,
+            "image denoising finished"
+        );
 
+        let phase = Instant::now();
         let host = self
             .ops
             .download("pipeline final", latents.view(), latent_count)?;
         let rgb = self.vae.decode(&self.ops, &host, w, h)?;
+        tracing::info!(
+            seconds = phase.elapsed().as_secs_f64(),
+            "image latents decoded"
+        );
+        let phase = Instant::now();
         let bytes = encode_image(&rgb, w, h, job.output_format, job.output_compression)?;
+        tracing::info!(
+            seconds = phase.elapsed().as_secs_f64(),
+            total_seconds = began.elapsed().as_secs_f64(),
+            bytes = bytes.len(),
+            "image encoded"
+        );
         Ok(GeneratedImage {
             bytes,
             media_type: job.output_format.mime_type(),
@@ -432,6 +503,15 @@ impl ImageGenerator for Flux2KleinModel {
             prompt_tokens: t_txt as u32,
             completion_tokens: (t_img * steps) as u32,
         })
+    }
+}
+
+/// Empties the working-buffer pool when a generation ends, however it ends.
+struct TrimPool<'o>(&'o Ops);
+
+impl Drop for TrimPool<'_> {
+    fn drop(&mut self) {
+        self.0.trim_pool();
     }
 }
 

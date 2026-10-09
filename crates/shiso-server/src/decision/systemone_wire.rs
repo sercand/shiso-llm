@@ -11,9 +11,10 @@
 //! exactly as array order did.
 //!
 //! The kept deviations from the official doc (spec §1.3): `model` and `state`
-//! may be absent (official: both required); choice options cap at 26, not
-//! 255, because the label scheme stops at `Z`, and lists of one answer
-//! (official: two); a schema violation is a 422 and a bound or policy refusal
+//! may be absent (official: both required); choice lists of one answer
+//! (official: two), and a list past 26 options is labelled `AA`, `AB`, ..
+//! with the pairs the vocabulary spells as one token, so a vocabulary short
+//! of 255 such pairs refuses the longest lists; a schema violation is a 422 and a bound or policy refusal
 //! a 400 (official: all validation is 422); structured `instructions` render
 //! as key-sorted compact JSON rather than being restructured into the prompt.
 //!
@@ -304,7 +305,7 @@ fn question_from(id: &str, entry: &Value) -> Result<RawQuestion, AppError> {
                 .criteria
                 .into_iter()
                 .map(|(name, description)| ChoiceOption {
-                    name,
+                    value: core::ChoiceValue::Str(name),
                     // `null` says "no detail"; any other value is the shared
                     // rendering, so a container description is compact JSON
                     // text, never a refusal.
@@ -385,12 +386,15 @@ fn instructions_text(id: &str, instructions: &Value) -> Result<String, AppError>
 /// scored `"null"` level would sit among the caller's real levels as a level
 /// nobody wrote — and the refusal names the item's index so the caller edits
 /// the right element.
-fn score_levels(id: &str, criteria: &[Value]) -> Result<Vec<String>, AppError> {
+fn score_levels(id: &str, criteria: &[Value]) -> Result<Vec<core::ScoreLevel>, AppError> {
     criteria
         .iter()
         .enumerate()
         .map(|(index, level)| match level {
-            Value::String(text) => Ok(text.clone()),
+            Value::String(text) => Ok(core::ScoreLevel {
+                label: text.clone(),
+                description: None,
+            }),
             Value::Null => Err(AppError::SchemaViolation {
                 message: format!(
                     "question \"{id}\": a score level must be a string, object or array, \
@@ -398,7 +402,10 @@ fn score_levels(id: &str, criteria: &[Value]) -> Result<Vec<String>, AppError> {
                 ),
                 at: format!("questions.{id}"),
             }),
-            other => Ok(core::render_text(other)),
+            other => Ok(core::ScoreLevel {
+                label: core::render_text(other),
+                description: None,
+            }),
         })
         .collect()
 }
@@ -524,40 +531,11 @@ pub(crate) fn images_sources(
 }
 
 /// Parses clef's data URL form: `data:image/<subtype>;base64,<payload>`.
-/// The structural parts of the head fold case (clef's pattern); the payload
-/// is the caller's bytes, taken verbatim after the comma. The media type is
-/// carried in its folded spelling and dropped downstream like every other
-/// claimed media type.
+/// The rule is the decisions wire's own - one parser reads a data URL,
+/// whichever field it arrives in - and the folded spelling of the prefix
+/// (clef's pattern) lives there.
 fn parse_image_data_url(text: &str) -> Result<InputImageSource, String> {
-    let (head, payload) = text.split_once(',').ok_or_else(|| {
-        "a string image must be a data URL spelled `data:image/<subtype>;base64,<payload>`"
-            .to_owned()
-    })?;
-    let head = head.to_ascii_lowercase();
-    let spec = head.strip_prefix("data:").ok_or_else(|| {
-        "a string image must be a data URL spelled `data:image/<subtype>;base64,<payload>`"
-            .to_owned()
-    })?;
-    let Some((media_type, params)) = spec.split_once(';') else {
-        return Err("a data URL must carry the `;base64` parameter".to_owned());
-    };
-    if params != "base64" {
-        return Err(format!(
-            "a data URL's parameter must be `base64`, got `{params}`"
-        ));
-    }
-    if !media_type.starts_with("image/") || media_type == "image/" {
-        return Err(format!(
-            "a data URL must name an `image/<subtype>` media type, got `{media_type}`"
-        ));
-    }
-    if payload.is_empty() {
-        return Err("a data URL must carry a non-empty base64 payload".to_owned());
-    }
-    Ok(InputImageSource::Base64 {
-        media_type: media_type.to_owned(),
-        data: payload.to_owned(),
-    })
+    decisions_wire::parse_image_data_url(text)
 }
 
 /// An `images` item-shape refusal: this surface's schema class, located at
@@ -624,7 +602,7 @@ mod tests {
         match &questions[0].kind {
             Kind::Choice { question, options } => {
                 assert_eq!(question, "pick one");
-                let names: Vec<&str> = options.iter().map(|o| o.name.as_str()).collect();
+                let names: Vec<String> = options.iter().map(|o| o.value.text()).collect();
                 assert_eq!(names, ["red", "blue"]);
                 assert!(
                     options.iter().all(|o| o.description.is_none()),
@@ -637,7 +615,7 @@ mod tests {
         match &questions[1].kind {
             Kind::Score { question, levels } => {
                 assert_eq!(question, "how bad");
-                let names: Vec<&str> = levels.iter().map(String::as_str).collect();
+                let names: Vec<&str> = levels.iter().map(|l| l.label.as_str()).collect();
                 assert_eq!(names, ["none", "some"]);
             }
             other => panic!("expected a score, got {other:?}"),
@@ -753,13 +731,13 @@ mod tests {
         match &questions[0].kind {
             Kind::Choice { options, .. } => {
                 assert!(
-                    matches!(&options[0], ChoiceOption { name, description: None }
-                        if name == "red"),
+                    matches!(&options[0], ChoiceOption { value, description: None }
+                        if value.text() == "red"),
                     "{options:?}"
                 );
                 assert!(
-                    matches!(&options[1], ChoiceOption { name, description }
-                        if name == "blue" && description.as_deref() == Some("the sky one")),
+                    matches!(&options[1], ChoiceOption { value, description }
+                        if value.text() == "blue" && description.as_deref() == Some("the sky one")),
                     "{options:?}"
                 );
             }
@@ -819,8 +797,8 @@ mod tests {
         }));
         match &questions[0].kind {
             Kind::Choice { options, .. } => assert!(
-                matches!(&options[0], ChoiceOption { name, description: None }
-                    if name == "red"),
+                matches!(&options[0], ChoiceOption { value, description: None }
+                    if value.text() == "red"),
                 "a null description is no description: {options:?}"
             ),
             other => panic!("expected a choice, got {other:?}"),

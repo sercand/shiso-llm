@@ -52,5 +52,6 @@ pub use media::{
 };
 pub use model::{
     DecisionModel, DecisionQuestion, DecodeStep, DraftHint, Logits, Model, ModelInfo,
-    SamplingParams, Speculated, Speculating, StopTokens, VerifiedBlock,
+    NO_BATCHED_PROMPT_PASS, PromptRun, SamplingParams, Speculated, Speculating, StopTokens,
+    VerifiedBlock,
 };

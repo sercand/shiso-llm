@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}{{ m.name }} · shiso hub{% endblock %}
+{% block description %}{{ m.description }}{% endblock %}
+{% block main %}
+<nav class="crumbs"><a href="{{ root }}">Models</a> <span aria-hidden="true">/</span> {{ m.name }}</nav>
+
+<section class="model-head">
+  <div>
+    <h1>{{ m.name }}</h1>
+    {% if m.aliases %}<p class="aliases">also {% for a in m.aliases %}<code>{{ a }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+    <p class="lede">{{ m.description }}</p>
+    <div class="pills">
+      {% for t in m.tasks %}<span class="pill task">{{ t }}</span>{% endfor %}
+      {% for t in m.tags %}<span class="pill soft">{{ t }}</span>{% endfor %}
+    </div>
+  </div>
+  <div class="quick">
+    <div class="cmd"><code>{{ m.variants[0].pull }}</code><button class="copy" data-copy="{{ m.variants[0].pull }}" type="button">Copy</button></div>
+    <div class="cmd"><code>shiso serve {{ m.name }}</code><button class="copy" data-copy="shiso serve {{ m.name }}" type="button">Copy</button></div>
+    <p class="hint">A bare pull takes the first variant that fits this host.</p>
+  </div>
+</section>
+
+<section class="sheet">
+  <dl class="spec">
+    <div><dt>Family</dt><dd>{{ m.family }}</dd></div>
+    {% if m.publisher %}<div><dt>Publisher</dt><dd>{{ m.publisher }}</dd></div>{% endif %}
+    {% if m.parameters %}<div><dt>Parameters</dt><dd>{{ m.parameters }}</dd></div>{% endif %}
+    {% if m.context %}<div><dt>Context</dt><dd>{{ m.context }} tokens</dd></div>{% endif %}
+    <div><dt>Input</dt><dd>{{ m.inputs|join(', ') }}</dd></div>
+    <div><dt>Output</dt><dd>{{ m.outputs|join(', ') }}</dd></div>
+    {% if m.features %}<div><dt>Features</dt><dd>{{ m.features|join(', ') }}{% if m.reasoning_efforts %} <span class="muted">(effort: {{ m.reasoning_efforts|join(', ') }})</span>{% endif %}</dd></div>{% endif %}
+    {% if m.license %}<div><dt>License</dt><dd>{{ m.license }}</dd></div>{% endif %}
+    {% if m.homepage %}<div><dt>Homepage</dt><dd><a href="{{ m.homepage }}" rel="noopener noreferrer">{{ m.homepage }}</a></dd></div>{% endif %}
+    <div><dt>Updated</dt><dd>{{ m.updated }}{% if m.published and m.published != m.updated %} <span class="muted">(first published {{ m.published }})</span>{% endif %}</dd></div>
+  </dl>
+</section>
+
+<section>
+  <h2 id="variants">Variants</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Variant</th><th>Quant</th><th>Runs on</th><th class="num">RAM</th><th class="num">Disk</th><th>Needs</th><th>Pull</th></tr></thead>
+    <tbody>
+    {% for v in m.variants %}
+      <tr>
+        <td><code>{{ v.key }}</code></td>
+        <td>{{ v.quant }}</td>
+        <td>{% for b in v.backends %}<span class="be be-{{ b }}">{{ b }}</span>{% endfor %}</td>
+        <td class="num">{{ v.min_ram }}{% if v.recommended_ram %}<span class="muted"> · {{ v.recommended_ram }} rec.</span>{% endif %}</td>
+        <td class="num">{{ v.disk }}</td>
+        <td>{{ v.requires|join(', ') or '—' }}</td>
+        <td><button class="copy small" data-copy="{{ v.pull }}" type="button" title="{{ v.pull }}">Copy pull</button></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="benchmarks">Throughput</h2>
+  {% if m.bench_groups %}
+  <p class="hint">Medians measured with <code>shiso-registry bench</code> against a running <code>shiso serve</code>, after one discarded warm-up.</p>
+  {% for g in m.bench_groups %}
+  {% if m.bench_groups|length > 1 %}<h3 class="bench-title">{{ g.title }}</h3>{% endif %}
+  <p class="hint">{{ g.hint }}</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Device</th><th>Variant</th>{% for c in g.columns %}<th class="{{ 'num' if loop.index0 > 0 else '' }}">{{ c }}</th>{% endfor %}<th>Measured</th></tr></thead>
+    <tbody>
+    {% for b in g.records %}{% for row in b.rows %}
+      <tr{% if b.stale %} class="stale"{% endif %}>
+        {% if loop.first %}<td rowspan="{{ b.rows|length }}"><strong>{{ b.device }}</strong><div class="muted small">{{ b.chip }} · {{ b.ram }} · {{ b.backend }}</div>{% if b.stale %}<div class="warn small">measured on older weights</div>{% endif %}</td>
+        <td rowspan="{{ b.rows|length }}"><code>{{ b.variant }}</code></td>{% endif %}
+        {% for cell in row %}<td class="{{ 'num' if loop.index0 > 0 else '' }}{{ ' strong' if loop.index0 == g.lead else '' }}">{{ cell }}</td>{% endfor %}
+        {% if loop.first %}<td rowspan="{{ b.rows|length }}">{{ b.measured }}<div class="muted small">shiso {{ b.shiso_version }} · {{ b.runs }} runs{% if b.context %} · ctx {{ b.context }}{% endif %}</div>{% if b.notes %}<div class="muted small">{{ b.notes }}</div>{% endif %}</td>{% endif %}
+      </tr>
+    {% endfor %}{% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endfor %}
+  {% else %}
+  <p class="muted">Not measured yet. Run <code>shiso-registry bench {{ m.name }}</code> on a device with the model installed and commit the record.</p>
+  {% endif %}
+</section>
+
+{% if m.quality %}
+<section>
+  <h2 id="quality">Quality</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Metric</th><th class="num">Score</th><th>Measured on</th><th>Source</th></tr></thead>
+    <tbody>
+    {% for q in m.quality %}
+      <tr>
+        <td>{{ q.metric }}{% if q.subject %}<div class="muted small">{{ q.subject }}</div>{% endif %}</td>
+        <td class="num strong">{{ q.value }}</td>
+        <td>{{ q.scope }}</td>
+        <td><a href="{{ q.url }}" rel="noopener noreferrer">{{ q.source }}</a> <span class="muted small">{{ q.as_of }}</span></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p class="hint">A base-model score describes the unquantized model, not what a variant's quantization kept.</p>
+</section>
+{% endif %}
+
+<section>
+  <h2 id="files">Files</h2>
+  {% for v in m.variants %}
+  <details class="files">
+    <summary><code>{{ v.key }}</code> <span class="muted">{{ v.disk }} · {{ v.components|length }} component{{ 's' if v.components|length != 1 }}</span></summary>
+    {% if v.server_defaults %}<p class="small">Server defaults: {% for d in v.server_defaults %}<code>{{ d }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+    {% for c in v.components %}
+    <h3>{{ c.role }} <a class="small" href="{{ c.url }}" rel="noopener noreferrer">{{ c.label }}</a></h3>
+    <div class="table-wrap">
+    <table class="compact">
+      <thead><tr><th>File</th><th class="num">Size</th><th>SHA-256</th></tr></thead>
+      <tbody>
+      {% for f in c.files %}
+        <tr><td><code>{{ f.name }}</code>{% if c.entry == f.name %} <span class="pill soft">entry</span>{% endif %}{% if f.binds %} <span class="pill soft">→ {{ f.binds }}</span>{% endif %}</td><td class="num">{{ f.size }}</td><td><code title="{{ f.sha }}">{{ f.sha_short }}…</code></td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% endfor %}
+  </details>
+  {% endfor %}
+  <p class="small"><a href="{{ root }}{{ m.manifest }}">Manifest JSON</a></p>
+</section>
+
+{% if m.card_html %}
+<section>
+  <h2 id="card">Model card</h2>
+  <p class="hint">From <a href="{{ m.card_source }}" rel="noopener noreferrer">the README on Hugging Face</a> at the pinned revision.</p>
+  <article class="readme">{{ m.card_html|safe }}</article>
+</section>
+{% endif %}
+{% endblock %}

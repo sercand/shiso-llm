@@ -18,6 +18,11 @@ use crate::error::AppError;
 /// The most images one request may ask for.
 pub const MAX_IMAGES_PER_REQUEST: usize = 10;
 
+/// The most denoising steps one image may ask for. The generator runs one job
+/// at a time, so an unbounded count would let a single request hold the queue
+/// for as long as it liked.
+pub const MAX_STEPS_PER_IMAGE: u32 = 100;
+
 /// Request payload matching `OpenRouter`'s `/images` and `OpenAI`'s
 /// `/v1/images/generations`.
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +49,10 @@ pub struct ImageGenerationRequest {
     /// reason to refuse a picture the caller can still use.
     #[serde(default)]
     pub quality: Option<String>,
+    /// Denoising steps per image (1-100). Not part of either published shape;
+    /// omitted, the image gets the operator's `--image-default-steps`.
+    #[serde(default)]
+    pub steps: Option<u32>,
     /// Deterministic seed. Image `i` of a multi-image request gets `seed + i`.
     #[serde(default)]
     pub seed: Option<u64>,
@@ -72,8 +81,8 @@ pub struct ImageGenerationRequest {
 
 impl ImageGenerationRequest {
     /// The refusals this format can make on the body alone: a response format
-    /// this server cannot honor, an image count outside `1..=10`, a
-    /// compression level outside `1..=100`. Zero is refused rather than
+    /// this server cannot honor, an image count outside `1..=10`, a step
+    /// count outside `1..=100`, a compression level outside `1..=100`. Zero is refused rather than
     /// clamped: a quality of zero has no encoding to mean it, and silently
     /// encoding at quality 1 would answer a request nobody made.
     ///
@@ -103,6 +112,15 @@ impl ImageGenerationRequest {
             return Err(AppError::bad_request(
                 format!("n must be between 1 and {MAX_IMAGES_PER_REQUEST}"),
                 Some("n"),
+                "invalid_request",
+            ));
+        }
+        if let Some(steps) = self.steps
+            && (steps == 0 || steps > MAX_STEPS_PER_IMAGE)
+        {
+            return Err(AppError::bad_request(
+                format!("steps must be between 1 and {MAX_STEPS_PER_IMAGE}"),
+                Some("steps"),
                 "invalid_request",
             ));
         }

@@ -296,6 +296,12 @@ pub struct ScoreRequest {
     /// A score is never keyed on the prefix cache, so these ride along for
     /// the media cache lookup in `encode_media` and nothing else.
     pub media_digests: Arc<[MediaDigest]>,
+    /// How many leading tokens this prompt shares with the other questions
+    /// of its request, zero when it shares none worth naming.
+    ///
+    /// The scheduler checkpoints the prompt there, so the sibling questions
+    /// read after it resume from that point and read only their own tails.
+    pub shared_prefix: u32,
     /// The schema a decision head scores, when this pass is answered by the
     /// model's head rather than by label rows: spans of `prompt_tokens`, one
     /// per question and one per option. `labels` is then empty.
@@ -313,6 +319,7 @@ impl ScoreRequest {
             service_class: ServiceClass::Standard,
             media: Arc::from(Vec::new()),
             media_digests: Arc::from(Vec::new()),
+            shared_prefix: 0,
             decision: None,
         }
     }
@@ -325,6 +332,14 @@ impl ScoreRequest {
             decision: Some(questions),
             ..Self::new(prompt_tokens, Arc::from(Vec::new()))
         }
+    }
+
+    /// The same scoring request, sharing its first `tokens` with the other
+    /// questions of its request.
+    #[must_use]
+    pub const fn with_shared_prefix(mut self, tokens: u32) -> Self {
+        self.shared_prefix = tokens;
+        self
     }
 
     /// The same scoring request with media attached, each item beside its

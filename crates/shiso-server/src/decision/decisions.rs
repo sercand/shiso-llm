@@ -55,8 +55,9 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     let kwargs_wire = parsed.chat_template_kwargs.clone();
     let temperature = core::check_temperature(parsed.temperature)?;
     // The same split `validate` applies, taken out while the body is still
-    // whole: the text arm scores today's compact rendering, the blocks arm
-    // carries the caller's parts - and their pictures - to the renderer.
+    // whole: the text arm is a string `input`, the blocks arm carries the
+    // flattened parts of the caller's user messages - and their pictures -
+    // to the renderer.
     let input = decisions_wire::decision_input(&parsed.input)?;
 
     let questions = parsed.validate()?;

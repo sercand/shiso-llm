@@ -103,37 +103,126 @@ fn build_registry_compiles_unsigned_index_and_manifests() {
     git(temp.path(), &["init", "-q"]);
 
     // Build registry
-    let out_dir = temp.path().join("registry").join("v1");
-    let build = editor::build_registry(temp.path(), &out_dir, true).unwrap();
+    let build = editor::build_registry(temp.path(), temp.path(), true).unwrap();
     assert_eq!(build.models_count, 1);
+    let out_dir = temp.path().join("registry").join("v1");
 
     let index_file = out_dir.join("index.json");
     assert!(index_file.is_file());
-    assert!(out_dir.join("models").join("qwen3.5-9b.json").is_file());
+    let manifest_file = out_dir.join("models").join("qwen3.5-9b").join("index.json");
+    assert!(manifest_file.is_file());
     // Unsigned model: no detached signature artifact is produced.
     assert!(!out_dir.join("index.json.sig").exists());
 
-    // The index digest chain still holds: index.json's manifest_sha256 must
-    // equal the digest of the compiled manifest bytes.
+    // The index names the manifest's path, and its digest chain still holds:
+    // manifest_sha256 must equal the digest of the compiled manifest bytes.
     let index: shiso_hub::recipe::Index =
         serde_json::from_slice(&fs::read(&index_file).unwrap()).unwrap();
     assert_eq!(index.models.len(), 1);
-    let manifest_bytes = fs::read(out_dir.join("models").join("qwen3.5-9b.json")).unwrap();
+    assert_eq!(index.models[0].manifest, "models/qwen3.5-9b/index.json");
+    let manifest_bytes = fs::read(&manifest_file).unwrap();
     let digest = <sha2::Sha256 as sha2::Digest>::digest(&manifest_bytes);
     assert_eq!(
         index.models[0].manifest_sha256.as_str(),
         hex::encode(digest)
     );
+
+    // The site sits beside the registry: a catalog that embeds its search
+    // documents, and one page per model linking back with relative paths.
+    let home = fs::read_to_string(temp.path().join("index.html")).unwrap();
+    assert!(home.contains(r#"href="models/qwen3.5-9b/""#), "{home}");
+    assert!(home.contains(r#"id="search-docs""#));
+    let page = fs::read_to_string(
+        temp.path()
+            .join("models")
+            .join("qwen3.5-9b")
+            .join("index.html"),
+    )
+    .unwrap();
+    assert!(page.contains("../../registry/v1/models/qwen3.5-9b/index.json"));
+    assert!(page.contains("shiso pull qwen3.5-9b"));
+    for asset in [
+        "404.html",
+        "search-index.json",
+        "assets/site.css",
+        "assets/site.js",
+        "assets/minisearch.js",
+    ] {
+        assert!(temp.path().join(asset).is_file(), "{asset}");
+    }
+    // No card is cached in a fresh repository.
+    assert_eq!(build.missing_cards, vec!["qwen3.5-9b".to_string()]);
+}
+
+/// A model whose recipe is gone loses its page and manifest on the next
+/// build, and so does a manifest left by the old flat layout; a directory
+/// holding files the build never writes is refused instead.
+#[test]
+fn build_prunes_what_it_wrote_for_removed_models() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("recipes")).unwrap();
+    fs::write(repo.join("recipes").join("qwen3.5-9b.json"), SAMPLE_RECIPE).unwrap();
+    git(repo, &["init", "-q"]);
+
+    let gone_page = repo.join("models").join("old-model");
+    let gone_manifest = repo.join("registry/v1/models/old-model");
+    fs::create_dir_all(&gone_page).unwrap();
+    fs::create_dir_all(&gone_manifest).unwrap();
+    fs::write(gone_page.join("index.html"), "old").unwrap();
+    fs::write(gone_manifest.join("index.json"), "{}").unwrap();
+    fs::write(repo.join("registry/v1/models/old-flat.json"), "{}").unwrap();
+
+    let build = editor::build_registry(repo, repo, true).unwrap();
+    assert_eq!(build.pruned.len(), 3, "{:?}", build.pruned);
+    assert!(!gone_page.exists() && !gone_manifest.exists());
+    assert!(!repo.join("registry/v1/models/old-flat.json").exists());
+
+    let foreign = repo.join("models").join("kept");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("notes.txt"), "mine").unwrap();
+    let err = editor::build_registry(repo, repo, true).unwrap_err();
+    assert!(err.to_string().contains("notes.txt"), "{err}");
+}
+
+/// The editor serves the built site under `/hub/` and nothing under a dot
+/// path, so `.git` stays out of the preview.
+#[tokio::test]
+async fn the_hub_preview_serves_the_site_and_hides_dot_paths() {
+    let temp = tempdir().unwrap();
+    fs::write(temp.path().join("index.html"), "<p>hub</p>").unwrap();
+    fs::create_dir_all(temp.path().join(".git")).unwrap();
+    fs::write(temp.path().join(".git").join("config"), "secret").unwrap();
+    let app = build_router(Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        None,
+        8095,
+        temp.path().join("home"),
+    )));
+    let get = |uri: &str| {
+        Request::builder()
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8095")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let res = app.clone().oneshot(get("/hub/")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app.clone().oneshot(get("/hub")).await.unwrap();
+    assert!(res.status().is_redirection());
+    let res = app.clone().oneshot(get("/hub/.git/config")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn http_hardening_rejects_unauthorized_and_invalid_hosts() {
     let temp = tempdir().unwrap();
-    let state = Arc::new(ServerState {
-        repo: temp.path().to_path_buf(),
-        session_token: Some("test_token_secret_12345".to_string()),
-        port: 8095,
-    });
+    let state = Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        Some("test_token_secret_12345".to_string()),
+        8095,
+        temp.path().join("home"),
+    ));
 
     let app = build_router(state);
 
@@ -188,11 +277,12 @@ async fn http_hardening_rejects_unauthorized_and_invalid_hosts() {
 #[tokio::test]
 async fn without_a_required_token_only_the_host_and_origin_checks_apply() {
     let temp = tempdir().unwrap();
-    let app = build_router(Arc::new(ServerState {
-        repo: temp.path().to_path_buf(),
-        session_token: None,
-        port: 8095,
-    }));
+    let app = build_router(Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        None,
+        8095,
+        temp.path().join("home"),
+    )));
     let get = |host: &str| {
         Request::builder()
             .uri("/api/families")
@@ -249,20 +339,25 @@ fn build_writes_into_the_repository_and_dates_from_its_history() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "recipe"]);
 
-    for asked in [None, Some(""), Some("registry/v1")] {
+    for asked in [None, Some("")] {
         let out = editor::resolve_out(repo, asked.map(Path::new));
-        assert_eq!(out, repo.join("registry/v1"), "{asked:?}");
+        assert_eq!(out, repo, "{asked:?}");
     }
     assert_eq!(
-        editor::resolve_out(repo, Some(Path::new("/elsewhere/v1"))),
-        Path::new("/elsewhere/v1")
+        editor::resolve_out(repo, Some(Path::new("site"))),
+        repo.join("site")
+    );
+    assert_eq!(
+        editor::resolve_out(repo, Some(Path::new("/elsewhere"))),
+        Path::new("/elsewhere")
     );
 
-    let out = editor::resolve_out(repo, Some(Path::new("registry/v1")));
+    let out = editor::resolve_out(repo, None);
     editor::build_registry(repo, &out, false).unwrap();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(out.join("models").join("qwen3.5-9b.json")).unwrap())
-            .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(out.join("registry/v1/models/qwen3.5-9b/index.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(manifest["updated_at"], "2026-01-02T03:04:05Z");
     assert_eq!(manifest["published_at"], "2026-01-02T03:04:05Z");
 }
@@ -281,4 +376,214 @@ fn build_refuses_a_repository_git_cannot_read() {
     let out = editor::resolve_out(temp.path(), None);
     let err = editor::build_registry(temp.path(), &out, true).unwrap_err();
     assert!(err.to_string().contains("git"), "{err}");
+}
+
+/// The fixture recipe with a hub-hosted draft vocabulary added to its first
+/// variant, and the file it names written where the hub serves it.
+fn repo_with_hosted_file(contents: &[u8]) -> tempfile::TempDir {
+    let temp = tempdir().unwrap();
+    let recipes_dir = temp.path().join("recipes");
+    fs::create_dir_all(&recipes_dir).unwrap();
+    let mut recipe: shiso_hub::recipe::Recipe =
+        serde_json::from_str(include_str!("../tests/fixtures/qwen3.8-flash.json")).unwrap();
+    let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(contents));
+    recipe.min_shiso_version = serde_json::from_value(serde_json::json!("0.2.0")).unwrap();
+    let variant = &mut recipe.variants[0];
+    variant.components.insert(
+        shiso_hub::recipe::Role::DraftVocab,
+        serde_json::from_value(serde_json::json!({
+            "provider": "shiso", "entry": "draft_vocab_counts.txt",
+            "files": [{"name": "draft_vocab_counts.txt", "size": contents.len(), "sha256": sha}]
+        }))
+        .unwrap(),
+    );
+    variant.requirements.disk_bytes += contents.len() as u64;
+    fs::write(
+        recipes_dir.join("qwen3.8-flash.json"),
+        serde_json::to_string_pretty(&recipe).unwrap(),
+    )
+    .unwrap();
+    let hosted = editor::hosted_file_path(temp.path(), "qwen3.8-flash", "draft_vocab_counts.txt");
+    fs::create_dir_all(hosted.parent().unwrap()).unwrap();
+    fs::write(&hosted, contents).unwrap();
+    temp
+}
+
+#[test]
+fn a_hosted_file_must_match_its_recipe() {
+    let temp = repo_with_hosted_file(b"198 3037739\n");
+    let reports = editor::validate_all(temp.path()).unwrap();
+    assert!(reports.iter().all(|r| r.valid), "{:?}", reports[0].errors);
+
+    let hosted = editor::hosted_file_path(temp.path(), "qwen3.8-flash", "draft_vocab_counts.txt");
+    fs::write(&hosted, b"198 3037740\n").unwrap(); // same size, different bytes
+    let reports = editor::validate_all(temp.path()).unwrap();
+    assert!(
+        reports[0].errors.iter().any(|e| e.contains("sha256")),
+        "{:?}",
+        reports[0].errors
+    );
+
+    fs::write(&hosted, b"198\n").unwrap();
+    let reports = editor::validate_all(temp.path()).unwrap();
+    assert!(
+        reports[0].errors.iter().any(|e| e.contains("size")),
+        "{:?}",
+        reports[0].errors
+    );
+
+    fs::remove_file(&hosted).unwrap();
+    let reports = editor::validate_all(temp.path()).unwrap();
+    assert!(
+        reports[0].errors.iter().any(|e| e.contains("missing")),
+        "{:?}",
+        reports[0].errors
+    );
+}
+
+#[test]
+fn a_build_into_another_directory_carries_the_hosted_file() {
+    let temp = repo_with_hosted_file(b"198 3037739\n");
+    git(temp.path(), &["init", "-q"]);
+    let out = tempdir().unwrap();
+    editor::build_registry(temp.path(), out.path(), true).unwrap();
+    let copied = editor::hosted_file_path(out.path(), "qwen3.8-flash", "draft_vocab_counts.txt");
+    assert_eq!(fs::read(copied).unwrap(), b"198 3037739\n");
+}
+
+#[test]
+fn an_uncommitted_hosted_file_makes_the_build_dirty() {
+    let temp = repo_with_hosted_file(b"198 3037739\n");
+    git(temp.path(), &["init", "-q"]);
+    git(temp.path(), &["add", "recipes"]);
+    git(temp.path(), &["commit", "-qm", "r"]);
+    let status = editor::git_status(temp.path());
+    assert!(status.is_dirty, "the hosted file is untracked");
+    assert!(
+        status
+            .changed_recipes
+            .iter()
+            .any(|f| f.ends_with("draft_vocab_counts.txt")),
+        "{:?}",
+        status.changed_recipes
+    );
+    assert!(editor::build_registry(temp.path(), temp.path(), false).is_err());
+}
+
+#[test]
+fn the_model_page_links_a_hosted_file_to_the_hub() {
+    let temp = repo_with_hosted_file(b"198 3037739\n");
+    git(temp.path(), &["init", "-q"]);
+    editor::build_registry(temp.path(), temp.path(), true).unwrap();
+    let page = fs::read_to_string(
+        temp.path()
+            .join("models")
+            .join("qwen3.8-flash")
+            .join("index.html"),
+    )
+    .unwrap();
+    assert!(page.contains("hosted on the hub"), "{page}");
+    assert!(
+        page.contains("registry/v1/models/qwen3.8-flash/draft_vocab_counts.txt"),
+        "{page}"
+    );
+    assert!(
+        page.contains("turboderp/Qwen3.8-Flash-Next-exl3@"),
+        "the HF component keeps its label"
+    );
+}
+
+#[tokio::test]
+async fn the_upload_route_writes_a_hosted_file_and_answers_its_digest() {
+    let temp = tempdir().unwrap();
+    let app = build_router(Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        None,
+        8095,
+        temp.path().join("home"),
+    )));
+    let body = b"198 3037739\n".to_vec();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/models/qwen3.8-flash/files/draft_vocab_counts.txt")
+        .header(header::HOST, "127.0.0.1:8095")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["size"], 12);
+    assert_eq!(
+        v["sha256"],
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body))
+    );
+    let path = editor::hosted_file_path(temp.path(), "qwen3.8-flash", "draft_vocab_counts.txt");
+    assert_eq!(fs::read(path).unwrap(), body);
+}
+
+#[tokio::test]
+async fn the_upload_route_refuses_bad_names_and_big_bodies() {
+    let temp = tempdir().unwrap();
+    let app = build_router(Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        None,
+        8095,
+        temp.path().join("home"),
+    )));
+    let put = |uri: &str, body: Vec<u8>| {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8095")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    for uri in [
+        "/api/models/qwen3.8-flash/files/index.json",
+        "/api/models/qwen3.8-flash/files/..",
+        "/api/models/qwen3.8-flash/files/a%2Fb.txt",
+        "/api/models/Not%20A%20Model/files/x.txt",
+    ] {
+        let res = app.clone().oneshot(put(uri, b"x".to_vec())).await.unwrap();
+        assert!(res.status().is_client_error(), "{uri}: {}", res.status());
+    }
+    let big = vec![b'x'; 1_048_577];
+    let res = app
+        .clone()
+        .oneshot(put("/api/models/qwen3.8-flash/files/big.txt", big))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        !temp.path().join("registry").exists(),
+        "nothing was written"
+    );
+}
+
+/// A hub file name that is not a plain name is reported, and never read: a
+/// recipe under review cannot point the validator at a file outside its
+/// model's directory.
+#[test]
+fn a_hosted_file_with_an_unsafe_name_is_not_read() {
+    let temp = repo_with_hosted_file(b"198 3037739\n");
+    let outside = temp.path().join("outside.txt");
+    fs::write(&outside, b"secret").unwrap();
+    let recipe_path = temp.path().join("recipes").join("qwen3.8-flash.json");
+    let text = fs::read_to_string(&recipe_path).unwrap();
+    let escaped = format!("../../../../{}", "outside.txt");
+    fs::write(
+        &recipe_path,
+        text.replace("\"draft_vocab_counts.txt\"", &format!("{escaped:?}")),
+    )
+    .unwrap();
+    let reports = editor::validate_all(temp.path()).unwrap();
+    let errors = &reports[0].errors;
+    assert!(!reports[0].valid);
+    assert!(
+        errors.iter().all(|e| !e.contains("on disk")),
+        "the outside file was read: {errors:?}"
+    );
 }

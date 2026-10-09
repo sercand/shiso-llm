@@ -62,6 +62,17 @@ pub(crate) struct SiluMulArgs {
 }
 const _: () = assert!(size_of::<SiluMulArgs>() == 4);
 
+/// `audio_args_gelu_mul`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct GeluMulArgs {
+    pub(crate) rows: u32,
+    pub(crate) cols: u32,
+    pub(crate) up_stride: u32,
+    pub(crate) up_offset: u32,
+}
+const _: () = assert!(size_of::<GeluMulArgs>() == 16);
+
 /// `audio_args_norm`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -344,3 +355,19 @@ pub(crate) struct DecodeStepBatchArgs {
     pub(crate) seqs: u32,
 }
 const _: () = assert!(size_of::<DecodeStepBatchArgs>() == 24);
+
+/// `audio_args_span_attn`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct SpanAttnArgs {
+    pub(crate) n: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) left: u32,
+    pub(crate) right: u32,
+    pub(crate) scale: f32,
+    pub(crate) row_groups: u32,
+    pub(crate) segmented: u32,
+}
+const _: () = assert!(size_of::<SpanAttnArgs>() == 36);

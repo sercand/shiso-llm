@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::api::inference_types::{
-    CacheReport, DiskReport, EngineCacheReport, ModelInfo, ModelListResponse, SUPPORTED_PARAMETERS,
-    TopProvider,
+    CacheReport, DiskReport, EngineCacheReport, ImageListing, ModelInfo, ModelListResponse,
+    SUPPORTED_PARAMETERS, TopProvider,
 };
 use crate::error::{ApiSurface, AppError};
 use crate::state::AppState;
@@ -401,6 +401,7 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
                 is_moderated: false,
             },
             supported_parameters: SUPPORTED_PARAMETERS.to_vec(),
+            image: None,
         });
     }
     // The recognizer answers to its own id, which is what a transcription's
@@ -419,6 +420,28 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
                 is_moderated: false,
             },
             supported_parameters: Vec::new(),
+            image: None,
+        });
+    }
+    // An embedding model answers to its own id too, with the positions one
+    // input may occupy as its context: that is the number a client sizes
+    // its chunks by.
+    if let Some(embedding) = &state.embedding {
+        let max = u32::try_from(embedding.info().max_tokens).unwrap_or(u32::MAX);
+        data.push(ModelInfo {
+            id: embedding.model_id().to_owned(),
+            object: "model",
+            created,
+            owned_by: "shiso",
+            name: embedding.model_id().to_owned(),
+            context_length: max,
+            top_provider: TopProvider {
+                context_length: max,
+                max_completion_tokens: 0,
+                is_moderated: false,
+            },
+            supported_parameters: vec!["dimensions", "encoding_format", "input_type"],
+            image: None,
         });
     }
     // The generator answers to its own id the same way, for the same reason:
@@ -437,6 +460,11 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
                 is_moderated: false,
             },
             supported_parameters: Vec::new(),
+            image: Some(ImageListing {
+                steps: state.image_defaults.steps,
+                width: state.image_defaults.width,
+                height: state.image_defaults.height,
+            }),
         });
     }
     ModelListResponse {

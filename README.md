@@ -36,6 +36,7 @@ no Python runtime.
 | Gemma 4 | Gemma 4 E4B | GGUF, MLX |
 | Qwen4Exp (MoE) | - | EXL3 |
 | Nemotron-H (hybrid state-space MoE) | Nemotron 3.5 Lightning 30B-A3B | MLX 4-bit |
+| EmbeddingGemma 2 (embeddings) | embeddinggemma-2 | GGUF (BF16, Q8_0) |
 
 Vision towers are supported for Qwen 3.5, Qwen 3.6 MoE and Gemma 4.
 
@@ -48,6 +49,27 @@ Gemma 4 also takes audio input: `input_audio` parts on Chat Completions and
 Responses, up to 30 seconds a clip. The audio tower loads from the same
 `--vision` path, either the MLX export directory or the mmproj GGUF. WAV is
 decoded natively; other containers need `--audio-allow-ffmpeg`.
+
+EmbeddingGemma 2 serves `/v1/embeddings` instead of the chat routes: start
+the server with `--model` naming its GGUF and `--vision` naming its mmproj,
+and text, images, video and audio - alone or interleaved in one input - land
+in one 768-d space. `dimensions` cuts a vector to 512, 256 or 128 (the widths
+the model was trained for), and `input_type` selects the checkpoint's task
+prompt (`search_query`, `search_document`, or any prompt name it ships, such
+as `Classification`). The tokenizer is read from `tokenizer.json` beside
+`--config`, or from `--tokenizer`. Video needs `--video-allow-ffmpeg` for
+containers other than GIF; media is sent inline (data URIs or base64).
+
+```sh
+shiso serve embeddinggemma-2 --video-allow-ffmpeg
+curl localhost:8090/v1/embeddings -H 'Content-Type: application/json' -d '{
+  "input": [{"content": [
+    {"type": "text", "text": "A scenic boardwalk through a green meadow"},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+  ]}],
+  "input_type": "search_document", "dimensions": 256
+}'
+```
 
 ## Supported hardware
 
@@ -225,6 +247,7 @@ environment variable. The ones you are most likely to want:
 | `--image-max-queue` | Image requests that may wait in the queue beyond the one generating (default 16); the next is refused with a 503 a retry can fix |
 | `--image-default-steps` | Denoising steps a request that names none gets (default 4) |
 | `--image-default-size` | The image size a request that names none gets, as `WxH` (default 1024x1024; both sides divisible by 16) |
+| `--embedding-max-queue` | Embedding requests that may wait in the queue beyond the one running (default 64), when `--model` is an embedding checkpoint |
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
 
@@ -238,13 +261,15 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/audio/transcriptions` | OpenAI Audio Transcriptions (also at `/audio/transcriptions`) |
 | `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein image generation, `b64_json` only) |
+| `POST /v1/embeddings` | OpenAI and OpenRouter Embeddings (also at `/embeddings`; text, token-id and multimodal `content` inputs, `dimensions`, `encoding_format` `float` or `base64`, `input_type`) |
 | `GET /v1/models` | OpenAI Models |
 | `GET /health`, `GET /metrics`, `GET /cache` | health, metrics, cache report |
 
 ## Contributing
 
-`bash scripts/check.sh` runs the full test and lint suite; it has to pass
-before a change lands. Read [`AGENTS.md`](AGENTS.md) for the architecture and
+`bash scripts/check.sh` runs the test and lint suite over the crates a change
+touches and everything that depends on them (`--all` for the whole
+workspace); it has to pass before a change lands. Read [`AGENTS.md`](AGENTS.md) for the architecture and
 the rules the checks enforce.
 
 ## Acknowledgements

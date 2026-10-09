@@ -18,6 +18,11 @@
 //! projection is F32 in the file and BF16 on the device, and the rounding is
 //! part of what the encoder's host reference reproduces.
 //!
+//! A quantized projector stores its linears as `Q8_0` blocks instead. Those are
+//! uploaded exactly as stored and multiplied in that form - the GEMM reads the
+//! blocks - so a `Q8_0` file costs the device half what a BF16 one does; its
+//! norms, patch convolution and position table are F32 like the shipped file's.
+//!
 //! # The one tensor that is rearranged, not converted
 //!
 //! `v.patch_embd.weight` is a convolution kernel — `[x][y][channel][out]` with
@@ -32,14 +37,21 @@ use std::path::Path;
 use std::sync::Arc;
 
 use shiso_core::{Backend, DType, DeviceBuffer, alloc};
+
+use crate::audio_ops::GemmType;
 use shiso_modelfile::safetensors::SafetensorsFile;
 use shiso_modelfile::{GgufFile, NameMap, Role, TensorSource};
 use shiso_vision::{VisionError, open_gguf};
 
-/// Formats this loader moves to a device: the two the shipped file uses, and
-/// nothing else. A block-quantized tower is a different loading problem, as in
-/// the Qwen loader, and is refused by name rather than uploaded.
+/// Formats this loader moves to a device for anything but a linear's weight:
+/// the norms, the patch convolution and the position table are read as
+/// floats, and a block-quantized one would have to be decoded on the host.
 const UPLOADABLE: &[DType] = &[DType::F32, DType::BF16];
+
+/// Formats a linear's weight may be stored in: the two float widths, and
+/// `Q8_0`, which a quantized projector stores its linears in and which the
+/// tower's GEMM multiplies as it is, so it is uploaded unconverted.
+const LINEAR_UPLOADABLE: &[DType] = &[DType::F32, DType::BF16, DType::Q8_0];
 
 /// The architecture string a Gemma 4 mmproj declares.
 const ARCH: &str = "clip";
@@ -136,8 +148,12 @@ pub(super) const NO_CLAMPS: Clamps = Clamps {
 /// One linear projection: its weight rows and the clamps around it.
 #[derive(Debug)]
 pub(super) struct Gemma4Linear {
-    /// BF16 weight, `[out][in]` row-major — the order the GEMM reads.
+    /// The weight, `[out][in]` row-major — the order the GEMM reads — in
+    /// [`Gemma4Linear::dtype`]'s storage.
     pub(super) weight: DeviceBuffer,
+    /// How the weight is stored: BF16, or `Q8_0` blocks kept as the file
+    /// holds them, which the GEMM reads directly.
+    pub(super) dtype: GemmType,
     /// The four scalars, read on the host.
     pub(super) clamps: Clamps,
 }
@@ -191,9 +207,6 @@ pub(super) struct Gemma4VisionWeights {
     pub(super) blocks: Vec<Gemma4Block>,
     /// The final projection into the language model, `[out_hidden][hidden]`.
     pub(super) projection: Gemma4Linear,
-    /// BF16 zeros, `max(hidden, intermediate, out_hidden)` wide: the GEMM's
-    /// bias operand for every projection, since this tower has no biases.
-    pub(super) zero_bias: DeviceBuffer,
     /// F32 ones, `[hidden]`: the weight of the final unweighted normalization,
     /// which is the only way that kernel expresses "no weight".
     pub(super) ones: DeviceBuffer,
@@ -226,7 +239,6 @@ impl Gemma4VisionWeights {
                 + linear(&b.ffn_down)
         };
         self.patch.len()
-            + self.zero_bias.len()
             + self.ones.len()
             + linear(&self.projection)
             + self.blocks.iter().map(block).sum::<u64>()
@@ -259,12 +271,6 @@ pub(super) fn load_gemma4_weights(
         dims.out_hidden,
         dims.hidden,
     )?;
-    let zero_bias = upload(
-        backend,
-        "patch bias (zeros)",
-        DType::BF16,
-        &vec![0u8; 2 * max_width(&dims)],
-    )?;
     let ones = upload(
         backend,
         "pool norm weight (ones)",
@@ -278,19 +284,8 @@ pub(super) fn load_gemma4_weights(
         position_y,
         blocks,
         projection,
-        zero_bias,
         ones,
     })
-}
-
-/// The widest output row any projection in the tower produces; the resident
-/// zero bias has to be at least this long because the GEMM reads `bias[col]`
-/// for every output column.
-fn max_width(dims: &Gemma4Dims) -> usize {
-    dims.hidden
-        .max(dims.intermediate)
-        .max(dims.out_hidden)
-        .max(dims.patch_dim)
 }
 
 /// Refuses a file that is not a Gemma 4 vision projector, by name.
@@ -475,10 +470,20 @@ fn tensor<'a>(
     name: &str,
     dims: &[usize],
 ) -> Result<shiso_modelfile::TensorView<'a>, VisionError> {
+    tensor_in(file, name, dims, UPLOADABLE)
+}
+
+/// [`tensor`], accepting the formats in `allowed`.
+fn tensor_in<'a>(
+    file: &'a GgufFile,
+    name: &str,
+    dims: &[usize],
+    allowed: &[DType],
+) -> Result<shiso_modelfile::TensorView<'a>, VisionError> {
     let view = file.get(name).ok_or_else(|| VisionError::MissingTensor {
         name: name.to_owned(),
     })?;
-    if !UPLOADABLE.contains(&view.dtype) {
+    if !allowed.contains(&view.dtype) {
         return Err(VisionError::TensorDType {
             name: name.to_owned(),
             dtype: view.dtype,
@@ -529,7 +534,8 @@ fn read_clamps(file: &GgufFile, name: &str) -> Result<Clamps, VisionError> {
     })
 }
 
-/// Reads one linear projection: its BF16 weight rows and its four scalars.
+/// Reads one linear projection: its weight rows - BF16, or `Q8_0` blocks as
+/// stored - and its four scalars.
 ///
 /// The scalars hang off the projection's own name and not off its weight's -
 /// `v.blk.0.attn_q.input_min`, beside `v.blk.0.attn_q.weight` - so `prefix` is
@@ -545,10 +551,26 @@ fn load_linear(
     inp: usize,
 ) -> Result<Gemma4Linear, VisionError> {
     let name = format!("{prefix}.weight");
-    let view = tensor(file, &name, &[inp, out])?;
+    let view = tensor_in(file, &name, &[inp, out], LINEAR_UPLOADABLE)?;
+    if view.dtype == DType::Q8_0 {
+        // A row is a whole number of 32-element blocks or it is not a row
+        // the GEMM can address; the shape check above has the element count.
+        if !inp.is_multiple_of(32) || view.data.len() != out * inp / 32 * 34 {
+            return Err(VisionError::TensorDType {
+                name,
+                dtype: view.dtype,
+            });
+        }
+        return Ok(Gemma4Linear {
+            weight: upload(backend, &name, DType::Q8_0, view.data)?,
+            dtype: GemmType::Q8_0,
+            clamps: read_clamps(file, prefix)?,
+        });
+    }
     let bytes = widen_or_narrow(view.data, view.dtype, DType::BF16, &name)?;
     Ok(Gemma4Linear {
         weight: upload(backend, &name, DType::BF16, &bytes)?,
+        dtype: GemmType::Bf16,
         clamps: read_clamps(file, prefix)?,
     })
 }
@@ -892,6 +914,7 @@ fn load_gemma4_weights_mlx(
     }
 
     let projection = Gemma4Linear {
+        dtype: GemmType::Bf16,
         weight: upload(
             backend,
             "mm.input_projection.weight",
@@ -907,12 +930,6 @@ fn load_gemma4_weights_mlx(
         clamps: NO_CLAMPS,
     };
 
-    let zero_bias = upload(
-        backend,
-        "patch bias (zeros)",
-        DType::BF16,
-        &vec![0u8; 2 * max_width(&dims)],
-    )?;
     let ones = upload(
         backend,
         "pool norm weight (ones)",
@@ -927,7 +944,6 @@ fn load_gemma4_weights_mlx(
         position_y,
         blocks,
         projection,
-        zero_bias,
         ones,
     })
 }
@@ -1105,6 +1121,7 @@ fn load_linear_mlx(
         &narrowed(st, &name, out * inp)?,
     )?;
     Ok(Gemma4Linear {
+        dtype: GemmType::Bf16,
         weight,
         clamps: read_clamps_mlx(st, prefix)?,
     })

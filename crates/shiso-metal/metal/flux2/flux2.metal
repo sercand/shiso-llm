@@ -34,20 +34,16 @@ kernel void kernel_flux2_silu_f32(
 /// The gate is the FIRST half (the reference's gating chunks the
 /// row in two and silus the first chunk). The input is one strided buffer
 /// whose view may start mid-row (the single block's halves begin at column
-/// 3h of the fused row); the output is packed `(rows, inner)`. The driver
-/// launches one threadgroup per output element, so thread 0 of each group
-/// owns it.
+/// 3h of the fused row); the output is packed `(rows, inner)`. One thread
+/// per output element: grid `(ceil(inner / 64), rows)`.
 kernel void kernel_flux2_swiglu_f32(
         constant flux2_args_swiglu & args [[buffer(0)]],
         device float *out                  [[buffer(1)]],
         device const float *in             [[buffer(2)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]]) {
-    if (tpitg.x != 0u) {
-        return;
-    }
     const uint r = tgpig.y;
-    const uint i = tgpig.x;
+    const uint i = tgpig.x * FLUX2_BLOCK + tpitg.x;
     if (r >= args.rows || i >= args.inner) {
         return;
     }
@@ -308,6 +304,42 @@ kernel void kernel_flux2_rmsnorm_f32(
     const float inv = 1.0f / sqrt(ms + args.eps);
     for (uint d = tid; d < args.dim; d += FLUX2_BLOCK) {
         dst[d] = row[d] * inv * weight[d];
+    }
+}
+
+/// Row softmax of `scale * x`, in place; one 64-thread group per row.
+///
+/// The decoder's single-head attention runs as two GEMMs around this: at a
+/// 1024x1024 image that is 16384 x 16384 scores over 512-wide rows, which the
+/// per-row attention kernel spent 3.4 s on (on an M1 Max) and the tiled
+/// GEMMs take a fraction of. `scale` must be positive, so the max of the
+/// scaled row is the scaled max.
+kernel void kernel_flux2_softmax_rows_f32(
+        constant flux2_args_softmax & args [[buffer(0)]],
+        device float *x                     [[buffer(1)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup float scratch[3];
+    const uint r = tgpig.x;
+    const uint tid = tpitg.x;
+    if (r >= args.rows) {
+        return;
+    }
+    device float *row = x + (uint64_t) r * args.cols;
+    float m = -INFINITY;
+    for (uint d = tid; d < args.cols; d += FLUX2_BLOCK) {
+        m = max(m, row[d]);
+    }
+    m = flux2_block_max(m, scratch, tid);
+    float part = 0.0f;
+    for (uint d = tid; d < args.cols; d += FLUX2_BLOCK) {
+        const float e = exp((row[d] - m) * args.scale);
+        row[d] = e;
+        part += e;
+    }
+    const float inv = 1.0f / flux2_block_sum(part, scratch, tid);
+    for (uint d = tid; d < args.cols; d += FLUX2_BLOCK) {
+        row[d] *= inv;
     }
 }
 
@@ -756,43 +788,104 @@ kernel void kernel_flux2_conv2d_f32(
     }
 }
 
-/// Group normalization with per-channel affine parameters. One threadgroup
-/// per (batch, group): the mean and variance run over the group's
-/// `channels_per_group * spatial` elements, and element `i` of the group
-/// belongs to channel `(g % groups) * channels_per_group + i / spatial` -
-/// the affine buffers hold `channels` elements, not one per group element.
-kernel void kernel_flux2_group_norm_f32(
+/// Elements `[start, end)` of a group's slice `c` of `chunks`.
+static inline uint2 flux2_gn_slice(uint per_group, uint chunks, uint c) {
+    const uint len = (per_group + chunks - 1u) / chunks;
+    const uint start = min(c * len, per_group);
+    return uint2(start, min(start + len, per_group));
+}
+
+/// Group normalization, pass 1 of 2: the mean and the centered sum of
+/// squares (`M2`) of one slice of one (batch, group), written as
+/// `partials[(g * chunks + c) * 2 + {0, 1}]`. Grid `(batch * groups,
+/// chunks)` x 64 threads.
+///
+/// One threadgroup per whole group kept 32 threadgroups streaming a
+/// 1024x1024 decoder field: 70 ms per norm on an M1 Max, ~1.5 s of a
+/// decode. Slicing the group puts the whole GPU on it; the slice statistics
+/// are combined in pass 2 by Chan's formula, in slice order, so the result
+/// is the same on every run.
+kernel void kernel_flux2_group_norm_stats_f32(
+        constant flux2_args_group_norm & args [[buffer(0)]],
+        device float *partials                 [[buffer(1)]],
+        device const float *in                 [[buffer(2)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup float scratch[3];
+    const uint g = tgpig.x;
+    const uint c = tgpig.y;
+    const uint tid = tpitg.x;
+    const uint per_group = args.channels_per_group * args.spatial;
+    if (g >= args.batch * args.num_groups || c >= args.chunks) {
+        return;
+    }
+    const uint2 span = flux2_gn_slice(per_group, args.chunks, c);
+    device const float *src = in + (uint64_t) g * per_group;
+    const float n = float(span.y - span.x);
+    float part = 0.0f;
+    for (uint i = span.x + tid; i < span.y; i += FLUX2_BLOCK) {
+        part += src[i];
+    }
+    const float mean = n > 0.0f ? flux2_block_sum(part, scratch, tid) / n : 0.0f;
+    float m2 = 0.0f;
+    for (uint i = span.x + tid; i < span.y; i += FLUX2_BLOCK) {
+        const float dv = src[i] - mean;
+        m2 += dv * dv;
+    }
+    m2 = flux2_block_sum(m2, scratch, tid);
+    if (tid == 0u) {
+        partials[((uint64_t) g * args.chunks + c) * 2u] = mean;
+        partials[((uint64_t) g * args.chunks + c) * 2u + 1u] = m2;
+    }
+}
+
+/// Group normalization, pass 2 of 2: combines the group's slice statistics
+/// and writes `(x - mean) / sqrt(var + eps) * weight[ch] + bias[ch]` over
+/// one slice. Element `i` of a group belongs to channel
+/// `(g % groups) * channels_per_group + i / spatial` - the affine buffers
+/// hold `channels` elements, not one per group element. Same grid as pass 1.
+kernel void kernel_flux2_group_norm_apply_f32(
         constant flux2_args_group_norm & args [[buffer(0)]],
         device float *out                      [[buffer(1)]],
         device const float *in                 [[buffer(2)]],
         device const float *weight             [[buffer(3)]],
         device const float *bias               [[buffer(4)]],
+        device const float *partials           [[buffer(5)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]]) {
-    threadgroup float scratch[3];
     const uint g = tgpig.x;
+    const uint c = tgpig.y;
     const uint tid = tpitg.x;
     const uint per_group = args.channels_per_group * args.spatial;
-    if (g >= args.batch * args.num_groups) {
+    if (g >= args.batch * args.num_groups || c >= args.chunks) {
         return;
     }
-    const uint base = g * per_group;
-    device const float *src = in + base;
-    device float *dst = out + base;
-    float part = 0.0f;
-    for (uint i = tid; i < per_group; i += FLUX2_BLOCK) {
-        part += src[i];
+    // Every thread folds the same slices in the same order (Chan et al.'s
+    // pairwise update), so the whole group agrees on one mean and variance.
+    float count = 0.0f;
+    float mean = 0.0f;
+    float m2 = 0.0f;
+    for (uint j = 0; j < args.chunks; ++j) {
+        const uint2 span = flux2_gn_slice(per_group, args.chunks, j);
+        const float nb = float(span.y - span.x);
+        if (nb == 0.0f) {
+            continue;
+        }
+        const float mb = partials[((uint64_t) g * args.chunks + j) * 2u];
+        const float m2b = partials[((uint64_t) g * args.chunks + j) * 2u + 1u];
+        const float total = count + nb;
+        const float delta = mb - mean;
+        mean += delta * (nb / total);
+        m2 += m2b + delta * delta * (count * nb / total);
+        count = total;
     }
-    const float mean = flux2_block_sum(part, scratch, tid) / float(per_group);
-    float var = 0.0f;
-    for (uint i = tid; i < per_group; i += FLUX2_BLOCK) {
-        const float dv = src[i] - mean;
-        var += dv * dv;
-    }
-    const float inv = 1.0f / sqrt(flux2_block_sum(var, scratch, tid) / float(per_group) + args.eps);
-    for (uint i = tid; i < per_group; i += FLUX2_BLOCK) {
-        const uint ch = (g % args.num_groups) * args.channels_per_group + i / args.spatial;
-        dst[i] = (src[i] - mean) * inv * weight[ch] + bias[ch];
+    const float inv = 1.0f / sqrt(m2 / float(per_group) + args.eps);
+    const uint2 span = flux2_gn_slice(per_group, args.chunks, c);
+    const uint64_t base = (uint64_t) g * per_group;
+    const uint ch0 = (g % args.num_groups) * args.channels_per_group;
+    for (uint i = span.x + tid; i < span.y; i += FLUX2_BLOCK) {
+        const uint ch = ch0 + i / args.spatial;
+        out[base + i] = (in[base + i] - mean) * inv * weight[ch] + bias[ch];
     }
 }
 
@@ -857,4 +950,613 @@ kernel void kernel_flux2_embed_bf16_f32(
     }
     const uint id = ids[t];
     out[(uint64_t)t * args.hidden + d] = flux2_bf16(table + ((uint64_t)id * args.hidden + d));
+}
+
+// --- simdgroup-matrix gemm --------------------------------------------------------
+//
+// The 16x16 kernels above compute one output per thread with scalar
+// multiply-adds; on the transformer's 1024-row products they run at a few
+// hundred GFLOP/s, which made the denoising step take ~11 s of GEMM on an
+// M1 Max. This tile is the audio set's 64x64 layout: four simdgroups in a
+// 2x2 grid, each owning a 32x32 quarter as a 4x4 grid of 8x8 accumulators,
+// k staged 16 at a time with the activations as `[row][k]` and the weights
+// transposed to `[k][col]`, each staged row padded by four floats against
+// bank conflicts. The next slice's global reads are issued after the current
+// slice's multiplies so they overlap the math.
+//
+// The operands are reached through small reader structs, so the same body
+// serves a dense linear (rows of `in`) and the VAE's convolutions (an im2col
+// gather of the input field, never materialized). Every output element is
+// the multiply-accumulates of its row and column over 8-k steps in k order
+// from zero; the association differs from the 16x16 kernels' scalar fold,
+// so the two agree to rounding, not bit for bit.
+
+/// Dense activation rows: element (r, k) of `x[m][k]`. `packed_float4` so a
+/// view that starts on any 4-byte boundary is read correctly.
+struct flux2_rows_f32 {
+    device const float *x;
+    uint k;
+    float4 load4(uint r, uint kk) const {
+        return float4(*((device const packed_float4 *) (x + (uint64_t) r * k + kk)));
+    }
+};
+
+/// Weight rows in their stored width, widened on read. The packed vector
+/// types carry the element's own alignment, which is all a mapped
+/// checkpoint's tensor offsets promise.
+struct flux2_wrows_f32 {
+    device const float *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        return float4(*((device const packed_float4 *) (w + (uint64_t) n * k + kk)));
+    }
+};
+
+struct flux2_wrows_bf16 {
+    device const ushort *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        const packed_ushort4 b = *((device const packed_ushort4 *) (w + (uint64_t) n * k + kk));
+        return float4(as_type<float>((uint) b.x << 16), as_type<float>((uint) b.y << 16),
+                      as_type<float>((uint) b.z << 16), as_type<float>((uint) b.w << 16));
+    }
+};
+
+struct flux2_wrows_fp8 {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        const packed_uchar4 b = *((device const packed_uchar4 *) (w + (uint64_t) n * k + kk));
+        return float4(flux2_e4m3_bits(b.x), flux2_e4m3_bits(b.y),
+                      flux2_e4m3_bits(b.z), flux2_e4m3_bits(b.w));
+    }
+};
+
+/// A linear's epilogue: `out[r][c] = acc * scale + bias[c]`, the bias read
+/// only when the driver's presence flag says the binding is real.
+struct flux2_store_rows {
+    device float *out;
+    uint n;
+    float scale;
+    device const float *bias;
+    bool has_bias;
+    void store(uint r, uint c, float v) const {
+        out[(uint64_t) r * n + c] = v * scale + (has_bias ? bias[c] : 0.0f);
+    }
+};
+
+/// Threadgroup floats the tile stages through: `[64][16+4]` activations and
+/// `[16][64+4]` weights.
+#define FLUX2_G64_SMEM (FLUX2_G64_TILE * (FLUX2_G64_K + 4u) + FLUX2_G64_K * (FLUX2_G64_TILE + 4u))
+
+template <typename AR, typename WR, typename EP>
+static inline void flux2_gemm64_tile(
+        uint M, uint N, uint K,
+        const AR a, const WR w, const EP ep,
+        threadgroup float *smem,
+        uint3 tgpig, ushort tid, ushort lane, ushort sg) {
+    const uint BM = FLUX2_G64_TILE;
+    const uint BN = FLUX2_G64_TILE;
+    const uint BK = FLUX2_G64_K;
+    const uint NT = FLUX2_G64_THREADS;
+    const uint LDA = BK + 4u;
+    const uint LDB = BN + 4u;
+    threadgroup float *sa = smem;            // [BM rows][BK k]
+    threadgroup float *sb = smem + BM * LDA; // [BK k][BN cols]
+    const uint n0 = tgpig.x * BN;
+    const uint m0 = tgpig.y * BM;
+    const uint r0 = (sg >> 1u) * 32u;
+    const uint c0 = (sg & 1u) * 32u;
+    // Two float4 slots per thread per operand: slot e is row e / 4, k (e % 4) * 4.
+    const uint SLOTS = BM * BK / 4u / NT;
+    float4 ra[SLOTS];
+    float4 rb[SLOTS];
+    auto fetch = [&](uint k0) {
+        FLUX2_UNROLL for (uint q = 0; q < SLOTS; ++q) {
+            const uint e = tid + q * NT;
+            const uint rr = e / (BK / 4u);
+            const uint kk = (e - rr * (BK / 4u)) * 4u;
+            ra[q] = m0 + rr < M ? a.load4(m0 + rr, k0 + kk) : float4(0.0f);
+            rb[q] = n0 + rr < N ? w.load4(n0 + rr, k0 + kk) : float4(0.0f);
+        }
+    };
+
+    simdgroup_float8x8 acc[4][4];
+    FLUX2_UNROLL for (uint i = 0; i < 4u; ++i) {
+        FLUX2_UNROLL for (uint j = 0; j < 4u; ++j) {
+            acc[i][j] = simdgroup_float8x8(0.0f);
+        }
+    }
+    fetch(0);
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        FLUX2_UNROLL for (uint q = 0; q < SLOTS; ++q) {
+            const uint e = tid + q * NT;
+            const uint rr = e / (BK / 4u);
+            const uint kk = (e - rr * (BK / 4u)) * 4u;
+            *((threadgroup float4 *) (sa + rr * LDA + kk)) = ra[q];
+            sb[(kk + 0u) * LDB + rr] = rb[q].x;
+            sb[(kk + 1u) * LDB + rr] = rb[q].y;
+            sb[(kk + 2u) * LDB + rr] = rb[q].z;
+            sb[(kk + 3u) * LDB + rr] = rb[q].w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        FLUX2_UNROLL for (uint kk = 0; kk < BK; kk += 8u) {
+            simdgroup_float8x8 af[4];
+            simdgroup_float8x8 bf[4];
+            FLUX2_UNROLL for (uint i = 0; i < 4u; ++i) {
+                simdgroup_load(af[i], sa + (r0 + 8u * i) * LDA + kk, LDA);
+            }
+            FLUX2_UNROLL for (uint j = 0; j < 4u; ++j) {
+                simdgroup_load(bf[j], sb + kk * LDB + c0 + 8u * j, LDB);
+            }
+            FLUX2_UNROLL for (uint i = 0; i < 4u; ++i) {
+                FLUX2_UNROLL for (uint j = 0; j < 4u; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+                }
+            }
+        }
+        if (k0 + BK < K) {
+            fetch(k0 + BK);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The staged operands are done with; each simdgroup drains its fragments
+    // through its own 8x8 slot at the start of the staging area.
+    threadgroup float *slot = smem + sg * 64u;
+    FLUX2_UNROLL for (uint i = 0; i < 4u; ++i) {
+        FLUX2_UNROLL for (uint j = 0; j < 4u; ++j) {
+            simdgroup_store(acc[i][j], slot, 8u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = lane; e < 64u; e += 32u) {
+                const uint gm = m0 + r0 + 8u * i + (e >> 3u);
+                const uint gn = n0 + c0 + 8u * j + (e & 7u);
+                if (gm < M && gn < N) {
+                    ep.store(gm, gn, slot[e]);
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+#define FLUX2_GEMM64_PARAMS(WT) \
+        constant flux2_args_gemm & args    [[buffer(0)]], \
+        device float *out                  [[buffer(1)]], \
+        device const float *in             [[buffer(2)]], \
+        device const WT *weight            [[buffer(3)]], \
+        constant float &weight_scale       [[buffer(4)]], \
+        device const float *bias           [[buffer(5)]], \
+        uint3 tgpig[[threadgroup_position_in_grid]], \
+        ushort tid [[thread_index_in_threadgroup]], \
+        ushort lane [[thread_index_in_simdgroup]], \
+        ushort sg [[simdgroup_index_in_threadgroup]]
+
+/// `out[m,n] = in[m,k] . weight[n,k] * scale + bias[n]` on the simdgroup
+/// tile, `k % 16 == 0`. Grid `(ceil(n/64), ceil(m/64))` x 128 threads.
+kernel void kernel_flux2_gemm64_f32(FLUX2_GEMM64_PARAMS(float)) {
+    threadgroup float smem[FLUX2_G64_SMEM];
+    flux2_gemm64_tile(args.m, args.n, args.k,
+                      flux2_rows_f32{in, args.k}, flux2_wrows_f32{weight, args.k},
+                      flux2_store_rows{out, args.n, weight_scale, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+/// The same tile over a brain-float weight.
+kernel void kernel_flux2_gemm64_bf16(FLUX2_GEMM64_PARAMS(ushort)) {
+    threadgroup float smem[FLUX2_G64_SMEM];
+    flux2_gemm64_tile(args.m, args.n, args.k,
+                      flux2_rows_f32{in, args.k}, flux2_wrows_bf16{weight, args.k},
+                      flux2_store_rows{out, args.n, weight_scale, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+/// The same tile over an E4M3 weight, decoded while staging; the tensor's
+/// scale multiplies the accumulator in the epilogue.
+kernel void kernel_flux2_gemm64_fp8(FLUX2_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[FLUX2_G64_SMEM];
+    flux2_gemm64_tile(args.m, args.n, args.k,
+                      flux2_rows_f32{in, args.k}, flux2_wrows_fp8{weight, args.k},
+                      flux2_store_rows{out, args.n, weight_scale, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+// --- implicit-gemm convolution -----------------------------------------------------
+
+/// The convolution's left operand without an im2col buffer: row `r` is
+/// output pixel `(r / out_w, r % out_w)` of one batch image and column `t` is
+/// tap `(ic, kh, kw)` in the weight's own `[ic][kh][kw]` order, so the weight
+/// `[out_c][in_c][kh][kw]` is already the `[n][k]` matrix the tile reads.
+/// Taps outside the padded field read as zero.
+struct flux2_im2col {
+    device const float *in; // this batch image's (in_c, in_h, in_w) field
+    uint in_h;
+    uint in_w;
+    uint out_w;
+    uint k_h;
+    uint k_w;
+    uint stride;
+    uint pad;
+    /// Four consecutive taps of one output pixel. The pixel and the first
+    /// tap are decomposed once and the tap is then stepped (kw, then kh,
+    /// then ic): integer division is the slow path on the GPU, and
+    /// decomposing every tap from scratch - sixteen divisions per load - held
+    /// the decoder's convolutions to a third of the plain GEMM's rate on the
+    /// same tile.
+    float4 load4(uint r, uint kk) const {
+        const uint oh = r / out_w;
+        const uint ow = r - oh * out_w;
+        const uint khw = k_h * k_w;
+        uint ic = kk / khw;
+        const uint rem = kk - ic * khw;
+        uint kh = rem / k_w;
+        uint kw = rem - kh * k_w;
+        const int ih0 = int(oh * stride) - int(pad);
+        const int iw0 = int(ow * stride) - int(pad);
+        float v[4];
+        FLUX2_UNROLL for (uint c = 0; c < 4u; ++c) {
+            const int ih = ih0 + int(kh);
+            const int iw = iw0 + int(kw);
+            v[c] = (ih < 0 || iw < 0 || ih >= int(in_h) || iw >= int(in_w))
+                    ? 0.0f
+                    : in[((uint64_t) ic * in_h + uint(ih)) * in_w + uint(iw)];
+            if (++kw == k_w) {
+                kw = 0u;
+                if (++kh == k_h) {
+                    kh = 0u;
+                    ++ic;
+                }
+            }
+        }
+        return float4(v[0], v[1], v[2], v[3]);
+    }
+};
+
+/// NCHW epilogue: column `c` is the output channel, row `r` the pixel.
+struct flux2_store_nchw {
+    device float *out; // this batch image's (out_c, out_h * out_w) field
+    uint plane;
+    device const float *bias;
+    bool has_bias;
+    void store(uint r, uint c, float v) const {
+        out[(uint64_t) c * plane + r] = v + (has_bias ? bias[c] : 0.0f);
+    }
+};
+
+/// One NCHW f32 convolution as an implicit GEMM on the simdgroup tile:
+/// M = out_h * out_w pixels, N = out_c, K = in_c * k_h * k_w taps, which the
+/// driver guarantees is a multiple of 16. Grid
+/// `(ceil(out_c/64), ceil(out_h*out_w/64), batch)` x 128 threads.
+///
+/// The per-pixel kernel above spent ~97 s of a 512x512 decode on an M1 Max:
+/// one 64-thread group per output value, each re-reading its whole receptive
+/// field. Here every staged input value feeds 64 output channels.
+kernel void kernel_flux2_conv2d_gemm_f32(
+        constant flux2_args_conv2d & args [[buffer(0)]],
+        device float *out                  [[buffer(1)]],
+        device const float *in             [[buffer(2)]],
+        device const float *weight         [[buffer(3)]],
+        device const float *bias           [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[FLUX2_G64_SMEM];
+    const uint b = tgpig.z;
+    const uint plane = args.out_h * args.out_w;
+    const uint taps = args.in_c * args.k_h * args.k_w;
+    const flux2_im2col a{
+            in + (uint64_t) b * args.in_c * args.in_h * args.in_w,
+            args.in_h, args.in_w, args.out_w, args.k_h, args.k_w, args.stride, args.pad};
+    const flux2_store_nchw ep{
+            out + (uint64_t) b * args.out_c * plane, plane, bias, args.has_bias != 0u};
+    flux2_gemm64_tile(plane, args.out_c, taps, a, flux2_wrows_f32{weight, taps}, ep,
+                      smem, tgpig, tid, lane, sg);
+}
+
+// --- fused attention -----------------------------------------------------------------
+
+/// Where head `h` of joint row `t` starts for one operand, with that
+/// operand's own section offset (see `kernel_flux2_sdpa_f32`).
+static inline device const float *flux2_joint_row(
+        constant flux2_args_sdpa & args, uint t, uint h, uint offset,
+        device const float *txt, device const float *img, device const float *cache) {
+    const uint hd = args.head_dim;
+    if (t < args.txt_tokens) {
+        return txt + (uint64_t) t * args.txt_stride + offset + h * hd;
+    }
+    if (t < args.txt_tokens + args.img_tokens) {
+        return img + (uint64_t) (t - args.txt_tokens) * args.img_stride + offset + h * hd;
+    }
+    return cache + (uint64_t) (t - args.txt_tokens - args.img_tokens) * args.cache_stride
+            + offset + h * hd;
+}
+
+/// `v` narrowed to half, saturating: a value past half's range stages as
+/// the largest finite half, not as an infinity that would turn the whole
+/// row's softmax into NaN.
+static inline half4 flux2_half4_sat(float4 v) {
+    return half4(clamp(v, float4(-65504.0f), float4(65504.0f)));
+}
+
+/// Joint-sequence attention in one pass over the keys with an online
+/// softmax, on simdgroup matrices: the same contract, bindings and output as
+/// `kernel_flux2_sdpa_f32`, for `head_dim % 8 == 0` and `head_dim <= 128`.
+///
+/// A threadgroup takes 32 query rows of one head (eight per simdgroup, held
+/// in registers as 8x8 fragments, pre-scaled by 1/sqrt(head_dim)) and
+/// streams the keys 32 at a time through threadgroup memory, the next block
+/// loading into registers while the current one is multiplied. The softmax
+/// never leaves registers: a lane holds two columns of one row of each score
+/// fragment, the four lanes of a row (lane bits 0 and 3) fold the running
+/// maximum and denominator with two shuffles, and the value accumulators,
+/// laid out the same way, are rescaled lane by lane.
+///
+/// q, k, v and the probabilities are staged as half; every product
+/// accumulates in f32. Half carries more mantissa than the bf16 the
+/// reference attends in, q and k come out of `QK-norm`, and the staging
+/// saturates (`flux2_half4_sat`). Against the f32 version of this kernel it
+/// halves the threadgroup traffic that bounds it: 4115 joint rows x 24 heads
+/// of 128 (a 1024x1024 image) take 115 ms per layer on an M1 Max, from 228 ms
+/// for the previous kernel, which kept the scores in f32 and handed them
+/// through threadgroup memory four barriers per 16 keys.
+///
+/// Keys past the end are masked to -inf, so ragged sequence lengths need no
+/// special case. The softmax is the max-subtracted form the per-row kernel
+/// computes, accumulated block by block.
+kernel void kernel_flux2_flash_sdpa_f32(
+        constant flux2_args_sdpa & args [[buffer(0)]],
+        device float *out_txt            [[buffer(1)]],
+        device float *out_img            [[buffer(2)]],
+        device const float *q_txt        [[buffer(3)]],
+        device const float *k_txt        [[buffer(4)]],
+        device const float *v_txt        [[buffer(5)]],
+        device const float *q_img        [[buffer(6)]],
+        device const float *k_img        [[buffer(7)]],
+        device const float *v_img        [[buffer(8)]],
+        device const float *cache_k      [[buffer(9)]],
+        device const float *cache_v      [[buffer(10)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint QR = FLUX2_FA_QROWS;
+    const uint KB = FLUX2_FA_KEYS;
+    const uint NB = KB / 8u;
+    const uint NT = FLUX2_FA_THREADS;
+    // The f32 output staging; the half query tile and the K and V blocks
+    // reuse the same 16 KiB before it.
+    threadgroup float ostage[FLUX2_FA_QROWS * FLUX2_FA_MAX_D];
+    threadgroup half *kv = (threadgroup half *) ostage;
+
+    const uint h = tgpig.y;
+    const uint q0 = tgpig.x * QR;
+    const uint hd = args.head_dim;
+    const uint nd = hd / 8u;
+    const uint rows = args.txt_tokens + args.img_tokens;
+    const uint keys = rows + args.cache_tokens;
+    if (h >= args.heads) {
+        return;
+    }
+    const float scale = 1.0f / sqrt(float(hd));
+
+    // The query tile, pre-scaled; rows past the end stage as zero.
+    for (uint e = tid; e < QR * hd; e += NT) {
+        const uint r = e / hd;
+        const uint d = e - r * hd;
+        const uint t = q0 + r;
+        const float q = t < rows
+                ? flux2_joint_row(args, t, h, args.q_offset, q_txt, q_img, q_txt)[d] * scale
+                : 0.0f;
+        kv[e] = half(clamp(q, -65504.0f, 65504.0f));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 qf[FLUX2_FA_MAX_D / 8u];
+    simdgroup_float8x8 of[FLUX2_FA_MAX_D / 8u];
+    for (uint i = 0; i < nd; ++i) {
+        simdgroup_load(qf[i], kv + (sg * 8u) * hd + 8u * i, hd);
+        of[i] = simdgroup_float8x8(0.0f);
+    }
+
+    // The lane's place in every 8x8 fragment: columns `fn, fn + 1` of one
+    // row; the four lanes sharing a row differ in lane bits 0 and 3.
+    const ushort fn = ((lane / 4u) & 2u) * 2u + (lane % 2u) * 2u;
+    float run_max = -INFINITY;
+    float run_sum = 0.0f;
+    threadgroup half *sk = kv;
+    threadgroup half *sv = kv + KB * hd;
+    // Four consecutive head values per load (head_dim is a multiple of
+    // eight); a key past the end stages as zero and is masked below.
+    const uint SL = KB * FLUX2_FA_MAX_D / 4u / NT;
+    const uint hd4 = hd / 4u;
+    float4 rk[SL];
+    float4 rv[SL];
+    auto fetch = [&](uint s0) {
+        FLUX2_UNROLL for (uint q = 0; q < SL; ++q) {
+            const uint e = tid + q * NT;
+            const uint j = e / hd4;
+            const uint d = (e - j * hd4) * 4u;
+            const uint s = s0 + j;
+            rk[q] = float4(0.0f);
+            rv[q] = float4(0.0f);
+            if (e < KB * hd4 && s < keys) {
+                rk[q] = float4(*((device const packed_float4 *)
+                        (flux2_joint_row(args, s, h, args.k_offset, k_txt, k_img, cache_k) + d)));
+                rv[q] = float4(*((device const packed_float4 *)
+                        (flux2_joint_row(args, s, h, args.v_offset, v_txt, v_img, cache_v) + d)));
+            }
+        }
+    };
+    fetch(0);
+    for (uint s0 = 0; s0 < keys; s0 += KB) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        FLUX2_UNROLL for (uint q = 0; q < SL; ++q) {
+            const uint e = tid + q * NT;
+            if (e < KB * hd4) {
+                const uint j = e / hd4;
+                const uint d = (e - j * hd4) * 4u;
+                *((threadgroup half4 *) (sk + j * hd + d)) = flux2_half4_sat(rk[q]);
+                *((threadgroup half4 *) (sv + j * hd + d)) = flux2_half4_sat(rv[q]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s0 + KB < keys) {
+            fetch(s0 + KB);
+        }
+
+        // Scores: S (8 x KB) = Q (8 x hd) . K^T, one fragment per 8 keys.
+        simdgroup_float8x8 sf[NB];
+        FLUX2_UNROLL for (uint b = 0; b < NB; ++b) {
+            sf[b] = simdgroup_float8x8(0.0f);
+        }
+        for (uint i = 0; i < nd; ++i) {
+            FLUX2_UNROLL for (uint b = 0; b < NB; ++b) {
+                simdgroup_half8x8 kt;
+                // kt(r, c) = K[8b + c][8i + r]: the transposed load.
+                simdgroup_load(kt, sk + 8u * b * hd + 8u * i, hd, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(sf[b], qf[i], kt, sf[b]);
+            }
+        }
+
+        float block_max = -INFINITY;
+        FLUX2_UNROLL for (uint b = 0; b < NB; ++b) {
+            FLUX2_UNROLL for (uint c = 0; c < 2u; ++c) {
+                if (s0 + 8u * b + fn + c >= keys) {
+                    sf[b].thread_elements()[c] = -INFINITY;
+                }
+                block_max = max(block_max, sf[b].thread_elements()[c]);
+            }
+        }
+        block_max = max(block_max, simd_shuffle_xor(block_max, 1));
+        block_max = max(block_max, simd_shuffle_xor(block_max, 8));
+        const float new_max = max(run_max, block_max);
+        const float alpha = exp(run_max - new_max);
+        float block_sum = 0.0f;
+        simdgroup_half8x8 pf[NB];
+        FLUX2_UNROLL for (uint b = 0; b < NB; ++b) {
+            FLUX2_UNROLL for (uint c = 0; c < 2u; ++c) {
+                const float p = exp(sf[b].thread_elements()[c] - new_max);
+                pf[b].thread_elements()[c] = half(p);
+                block_sum += p;
+            }
+        }
+        block_sum += simd_shuffle_xor(block_sum, 1);
+        block_sum += simd_shuffle_xor(block_sum, 8);
+        run_sum = run_sum * alpha + block_sum;
+        run_max = new_max;
+        for (uint i = 0; i < nd; ++i) {
+            of[i].thread_elements()[0] *= alpha;
+            of[i].thread_elements()[1] *= alpha;
+            FLUX2_UNROLL for (uint b = 0; b < NB; ++b) {
+                simdgroup_half8x8 vf;
+                simdgroup_load(vf, sv + 8u * b * hd + 8u * i, hd);
+                simdgroup_multiply_accumulate(of[i], pf[b], vf, of[i]);
+            }
+        }
+    }
+
+    // Normalize by the denominators, stage the 32 x hd tile and write it out.
+    const float inv = 1.0f / run_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < nd; ++i) {
+        of[i].thread_elements()[0] *= inv;
+        of[i].thread_elements()[1] *= inv;
+        simdgroup_store(of[i], ostage + (sg * 8u) * hd + 8u * i, hd);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint width = args.heads * hd;
+    for (uint e = tid; e < QR * hd; e += NT) {
+        const uint r = e / hd;
+        const uint d = e - r * hd;
+        const uint t = q0 + r;
+        if (t >= rows) {
+            continue;
+        }
+        if (t < args.txt_tokens) {
+            out_txt[(uint64_t) t * width + h * hd + d] = ostage[e];
+        } else {
+            out_img[(uint64_t) (t - args.txt_tokens) * width + h * hd + d] = ostage[e];
+        }
+    }
+}
+
+// --- fused linear: swiglu/concat input, gated-residual output --------------------
+
+/// The input row of a block's output linear without materializing it:
+/// columns `[0, cols_a)` are `a`'s row, columns past it are
+/// `silu(g) * u` of the fused gate/up row. A float4 never straddles the two
+/// parts because both widths are multiples of four.
+struct flux2_rows_swiglu {
+    device const float *a;
+    device const float *gu;
+    uint cols_a;
+    uint inner;
+    uint gu_stride;
+    uint gu_offset;
+    float4 load4(uint r, uint kk) const {
+        if (kk < cols_a) {
+            return float4(*((device const packed_float4 *) (a + (uint64_t) r * cols_a + kk)));
+        }
+        device const float *g = gu + (uint64_t) r * gu_stride + gu_offset + (kk - cols_a);
+        const float4 gv = float4(*((device const packed_float4 *) g));
+        const float4 uv = float4(*((device const packed_float4 *) (g + inner)));
+        return float4(flux2_silu(gv.x), flux2_silu(gv.y), flux2_silu(gv.z), flux2_silu(gv.w)) * uv;
+    }
+};
+
+/// The gated residual in the epilogue: each output element is read and
+/// written by the one thread that owns it, so updating the stream in place
+/// is race-free.
+struct flux2_store_gated {
+    device float *out;
+    uint n;
+    float scale;
+    device const float *bias;
+    bool has_bias;
+    device const float *gate;
+    void store(uint r, uint c, float v) const {
+        const uint64_t i = (uint64_t) r * n + c;
+        out[i] += gate[c] * (v * scale + (has_bias ? bias[c] : 0.0f));
+    }
+};
+
+#define FLUX2_GEMM_FUSED_PARAMS(WT) \
+        constant flux2_args_gemm_fused & args [[buffer(0)]], \
+        device float *out                     [[buffer(1)]], \
+        device const float *a                 [[buffer(2)]], \
+        device const float *gu                [[buffer(3)]], \
+        device const WT *weight               [[buffer(4)]], \
+        constant float &weight_scale          [[buffer(5)]], \
+        device const float *bias              [[buffer(6)]], \
+        device const float *gate              [[buffer(7)]], \
+        uint3 tgpig[[threadgroup_position_in_grid]], \
+        ushort tid [[thread_index_in_threadgroup]], \
+        ushort lane [[thread_index_in_simdgroup]], \
+        ushort sg [[simdgroup_index_in_threadgroup]]
+
+#define FLUX2_GEMM_FUSED_BODY(WR) \
+    threadgroup float smem[FLUX2_G64_SMEM]; \
+    const uint k = args.cols_a + args.inner; \
+    flux2_gemm64_tile(args.m, args.n, k, \
+                      flux2_rows_swiglu{a, gu, args.cols_a, args.inner, args.gu_stride, args.gu_offset}, \
+                      WR{weight, k}, \
+                      flux2_store_gated{out, args.n, weight_scale, bias, args.has_bias != 0u, gate}, \
+                      smem, tgpig, tid, lane, sg);
+
+/// `out += gate * linear([a | swiglu(gu)])` on the simdgroup tile. Grid
+/// `(ceil(n/64), ceil(m/64))` x 128 threads.
+///
+/// One launch replaces four in every transformer block: the swiglu pass,
+/// the concat, the linear into a scratch buffer and the gated add - and the
+/// two full-width intermediates they wrote and read back.
+kernel void kernel_flux2_gemm64_fused_f32(FLUX2_GEMM_FUSED_PARAMS(float)) {
+    FLUX2_GEMM_FUSED_BODY(flux2_wrows_f32)
+}
+
+kernel void kernel_flux2_gemm64_fused_bf16(FLUX2_GEMM_FUSED_PARAMS(ushort)) {
+    FLUX2_GEMM_FUSED_BODY(flux2_wrows_bf16)
+}
+
+kernel void kernel_flux2_gemm64_fused_fp8(FLUX2_GEMM_FUSED_PARAMS(uchar)) {
+    FLUX2_GEMM_FUSED_BODY(flux2_wrows_fp8)
 }

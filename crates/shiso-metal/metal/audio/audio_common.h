@@ -39,6 +39,12 @@
 #define AUDIO_ATTN_SLOTS 4u
 // Queries one attention simdgroup takes at once.
 #define AUDIO_ATTN_QB 8u
+// The span attention's head-column slice a simdgroup takes, the keys it
+// scores at once, and the most query items one threadgroup holds (eight per
+// row group). See `audio_span_flash` for the measurements behind 64 and 16.
+#define AUDIO_SPAN_W 64u
+#define AUDIO_SPAN_KB 16u
+#define AUDIO_SPAN_MAX_ITEMS 32u
 // Distance rows one relative-score simdgroup takes at once.
 #define AUDIO_REL_ROWS 4u
 // Threads one row argmax spreads a row over.
@@ -75,6 +81,7 @@ typedef struct { uint rows; uint cols; } audio_args_bias_rows;
 typedef struct { uint rows; uint cols; } audio_args_argmax;
 typedef struct { uint rows; uint channels; } audio_args_glu;
 typedef struct { uint count; } audio_args_silu_mul;
+typedef struct { uint rows; uint cols; uint up_stride; uint up_offset; } audio_args_gelu_mul;
 typedef struct { uint rows; uint dim; float eps; uint flags; } audio_args_norm;
 typedef struct { uint m; uint n; uint k; uint flags; uint k_chunk; uint splits; } audio_args_gemm;
 typedef struct { uint n0; uint n1; uint n2; uint k; } audio_args_matvec3;
@@ -123,6 +130,10 @@ typedef struct {
 typedef struct {
     uint eos0; uint eos1; uint max_tokens; uint advance; uint slot; uint seqs;
 } audio_args_decode_step_batch;
+typedef struct {
+    uint n; uint heads; uint kv_heads; uint head_dim; uint left; uint right; float scale;
+    uint row_groups; uint segmented;
+} audio_args_span_attn;
 
 // Greedy search's state on the device, one u32 each: the frame (relative to
 // the first pending row), the symbols emitted on it, whether the search has

@@ -98,6 +98,8 @@
     <button id="nav-inspect" onclick="showTab('inspect')">HF Explorer</button>
     <button id="nav-validation" onclick="showTab('validation')">Validation Suite</button>
     <button id="nav-build" onclick="showTab('build')">Build & Publish</button>
+    <button id="nav-bench" onclick="showTab('bench')">Benchmarks</button>
+    <button id="nav-hub" onclick="window.open('/hub/', '_blank')" title="The built site, as the host serves it">Hub Preview ↗</button>
   </nav>
 </header>
 
@@ -306,17 +308,103 @@
       </div>
       <div class="row">
         <div class="col form-group">
-          <label>Output Directory (relative to the registry repository)</label>
-          <input type="text" id="build-out" value="registry/v1" placeholder="registry/v1">
+          <label>Site Root (relative to the registry repository; empty = the repository, which the host and Hub Preview serve)</label>
+          <input type="text" id="build-out" value="" placeholder="(repository root)">
         </div>
       </div>
       <div class="form-group">
         <label class="checkbox-item"><input type="checkbox" id="build-allow-dirty"> Allow uncommitted recipe changes (skips strict git timestamp check)</label>
+        <label class="checkbox-item"><input type="checkbox" id="build-offline"> Offline: use cached model cards only, fetch no README</label>
       </div>
       <div style="display:flex; gap:10px; margin-bottom:16px;">
         <button class="primary" onclick="runBuild()">Run Build</button>
       </div>
       <div id="build-result"></div>
+    </div>
+  </section>
+
+  <!-- TAB 6: BENCHMARKS -->
+  <section id="tab-bench" class="tab-content">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Measure Throughput on This Device</div>
+      </div>
+      <p style="color:var(--text-muted); font-size:13px; margin:0 0 14px;">
+        Start <code>shiso serve &lt;name&gt;:&lt;variant&gt;</code> (release build) for an installed variant, then run the bench here.
+        What is measured follows the recipe's task: tokens a second for chat, milliseconds a decision, seconds an image, and the real-time multiple for transcription.
+        The record is written to <code>benchmarks/&lt;model&gt;/&lt;variant&gt;/&lt;device&gt;.json</code>; commit it and rebuild to publish.
+      </p>
+      <div class="row">
+        <div class="col form-group">
+          <label>Installed Variant</label>
+          <select id="bench-model"></select>
+        </div>
+        <div class="col form-group">
+          <label>Server URL</label>
+          <input type="text" id="bench-url" value="http://127.0.0.1:8090">
+        </div>
+        <div class="col form-group">
+          <label>Device (empty = derived from the chip)</label>
+          <input type="text" id="bench-device" placeholder="e.g. m1-max, gb10">
+        </div>
+      </div>
+      <div class="row">
+        <div class="col form-group">
+          <label>Task</label>
+          <select id="bench-task" onchange="toggleBenchFields()">
+            <option value="">From the recipe</option>
+            <option value="chat">chat</option>
+            <option value="decision">decision</option>
+            <option value="image_generation">image_generation</option>
+            <option value="transcription">transcription</option>
+          </select>
+        </div>
+        <div class="col form-group bench-tokens">
+          <label>Prompt Tokens (comma separated)</label>
+          <input type="text" id="bench-prompts" value="512,4096">
+        </div>
+        <div class="col form-group bench-chat">
+          <label>Decode Tokens</label>
+          <input type="number" id="bench-decode" value="128" min="2">
+        </div>
+        <div class="col form-group">
+          <label>Runs (after one warm-up)</label>
+          <input type="number" id="bench-runs" value="3" min="1">
+        </div>
+      </div>
+      <div class="row">
+        <div class="col form-group bench-image">
+          <label>Image Sizes (WxH, comma separated; empty = server default)</label>
+          <input type="text" id="bench-image-sizes" placeholder="e.g. 1024x1024,512x512">
+        </div>
+        <div class="col form-group bench-audio">
+          <label>Audio Clip (WAV path; empty = synthesized speech on macOS)</label>
+          <input type="text" id="bench-audio" placeholder="/path/to/clip.wav">
+        </div>
+      </div>
+      <div class="row">
+        <div class="col form-group">
+          <label>shiso Version (empty = <code>shiso --version</code>)</label>
+          <input type="text" id="bench-version" placeholder="e.g. 0.1.0">
+        </div>
+        <div class="col form-group" style="flex:2;">
+          <label>Notes</label>
+          <input type="text" id="bench-notes" placeholder="e.g. on battery, --spec-k 0">
+        </div>
+      </div>
+      <div style="display:flex; gap:10px; margin-bottom:16px;">
+        <button class="primary" id="bench-start" onclick="startBench()">Run Benchmark</button>
+        <button onclick="loadInstalled()">Refresh Installed</button>
+      </div>
+      <div id="bench-state"></div>
+      <pre id="bench-log" style="display:none; max-height:320px; overflow:auto;"></pre>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Recorded Benchmarks</div>
+        <button class="sm" onclick="loadBenchRecords()">Refresh</button>
+      </div>
+      <div id="bench-records"></div>
     </div>
   </section>
 </main>
@@ -365,6 +453,7 @@ function showTab(name) {
   if (btn) btn.classList.add('active');
   if (name === 'dashboard') loadRecipes();
   if (name === 'validation') runValidation();
+  if (name === 'bench') { loadInstalled(); loadBenchRecords(); pollBench(); }
 }
 
 async function loadGitStatus() {
@@ -856,6 +945,34 @@ function addComponentToVariant(vIdx) {
   liveValidateForm();
 }
 
+function setCompProvider(vIdx, role, provider) {
+  const comp = formVariants[vIdx].components[role];
+  comp.provider = provider;
+  if (provider === 'shiso') { delete comp.repo; delete comp.revision; }
+  else { comp.repo = ""; comp.revision = "main"; }
+  comp.files = [];
+  comp.entry = null;
+  delete inspectedCache[inspectedKey(vIdx, role)];
+  renderComponentsList(vIdx);
+  liveValidateForm();
+}
+
+async function uploadHostedFile(vIdx, role, file) {
+  if (!file) return;
+  if (file.size > 1048576) { alert(`${file.name} is ${file.size} bytes; the hub hosts at most 1 MiB.`); return; }
+  const model = buildRecipeObjectFromForm().name;
+  if (!model) { alert("Set the model name first: the file is stored beside that model's index.json."); return; }
+  const res = await api(`/api/models/${encodeURIComponent(model)}/files/${encodeURIComponent(file.name)}`,
+                        { method: 'PUT', body: await file.arrayBuffer() });
+  if (!res.ok) { alert(await res.text()); return; }
+  const entry = await res.json();
+  const comp = formVariants[vIdx].components[role];
+  comp.files = comp.files.filter(f => f.name !== entry.name).concat([entry]);
+  if (!comp.entry) comp.entry = entry.name;
+  renderComponentsList(vIdx);
+  liveValidateForm();
+}
+
 function removeComponentFromVariant(vIdx, role) {
   delete formVariants[vIdx].components[role];
   delete inspectedCache[inspectedKey(vIdx, role)];
@@ -882,6 +999,22 @@ function renderComponentsList(vIdx) {
         ${role !== 'base' ? `<button class="sm danger" onclick="removeComponentFromVariant(${vIdx}, '${role}')">Remove Role</button>` : ''}
       </div>
 
+      <div class="form-group" style="max-width:240px;">
+        <label>Source</label>
+        <select onchange="setCompProvider(${vIdx}, '${role}', this.value)">
+          <option value="huggingface" ${comp.provider === 'huggingface' ? 'selected' : ''}>Hugging Face</option>
+          <option value="shiso" ${comp.provider === 'shiso' ? 'selected' : ''}>shiso hub (files up to 1 MiB)</option>
+        </select>
+      </div>
+
+      ${comp.provider === 'shiso' ? `
+      <!-- Hub-hosted file upload -->
+      <div class="row" style="background:#090b10; border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
+        <div class="col form-group" style="margin-bottom:0;">
+          <label>Add a file the hub hosts (next to the model's index.json)</label>
+          <input type="file" onchange="uploadHostedFile(${vIdx}, '${role}', this.files[0])">
+        </div>
+      </div>` : `
       <!-- Hugging Face Inspector Bar -->
       <div class="row" style="background:#090b10; border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
         <div class="col-2 form-group" style="margin-bottom:0;">
@@ -897,7 +1030,7 @@ function renderComponentsList(vIdx) {
             🔍 Inspect HF Files
           </button>
         </div>
-      </div>
+      </div>`}
 
       <div id="inspector-output-${vIdx}-${role}">
         ${renderComponentSelectedFilesSummary(vIdx, role, comp)}
@@ -1200,15 +1333,19 @@ function liveValidateForm() {
         supplied[f.binds] = f.name;
       }
     }
-    for (const r of ['config', 'ngram']) {
+    for (const r of ['config', 'ngram', 'draft_vocab']) {
       if (r in supplied && !supplied[r]) errors.push(`Variant '${v.key}': role '${r}' must name its file as entry`);
     }
     if (!('base' in supplied) && !('asr' in supplied) && !('image' in supplied)) {
       errors.push(`Variant '${v.key}': requires at least 'base', 'asr', or 'image'`);
     }
     for (const [r, comp] of Object.entries(v.components)) {
-      if (!comp.repo) errors.push(`Variant '${v.key}' role '${r}': repository is empty`);
-      if (comp.files.length === 0) errors.push(`Variant '${v.key}' role '${r}': no files selected`);
+      if (comp.provider === 'shiso') {
+        if (comp.files.length === 0) errors.push(`Variant '${v.key}' role '${r}': no file uploaded`);
+      } else {
+        if (!comp.repo) errors.push(`Variant '${v.key}' role '${r}': repository is empty`);
+        if (comp.files.length === 0) errors.push(`Variant '${v.key}' role '${r}': no files selected`);
+      }
     }
     if (('draft' in supplied) && (!v.server_defaults?.spec_k || v.server_defaults.spec_k <= 0)) {
       errors.push(`Variant '${v.key}': supplies 'draft' so server_defaults.spec_k must be > 0`);
@@ -1343,10 +1480,11 @@ async function runBuild() {
   resDiv.innerHTML = "Compiling manifests...";
 
   try {
+    const offline = document.getElementById('build-offline').checked;
     const res = await api('/api/build', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ out, allow_dirty: allowDirty })
+      body: JSON.stringify({ out, allow_dirty: allowDirty, offline })
     });
     if (!res.ok) {
       resDiv.innerHTML = `<div class="alert-danger">Build failed:<br>${await res.text()}</div>`;
@@ -1354,12 +1492,126 @@ async function runBuild() {
       const data = await res.json();
       resDiv.innerHTML = `
         <div class="alert-success">
-          <strong>Build Complete!</strong><br>${data.diff}
+          <strong>Build Complete!</strong><br>${esc(data.diff)}
+          ${data.missing_cards.length ? `<br>No model card for: ${esc(data.missing_cards.join(', '))}` : ''}
+          ${data.pruned.length ? `<br>Removed stale: ${esc(data.pruned.join(', '))}` : ''}
+          ${out ? '' : `<br><a href="/hub/" target="_blank">Open the Hub Preview ↗</a>`}
         </div>
       `;
     }
   } catch (e) { resDiv.innerHTML = `<div class="alert-danger">${e.message}</div>`; }
 }
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadInstalled() {
+  const sel = document.getElementById('bench-model');
+  try {
+    const res = await api('/api/installed');
+    const rows = await res.json();
+    const keep = sel.value;
+    sel.innerHTML = rows.length
+      ? rows.map(r => `<option value="${esc(r.model)}:${esc(r.variant)}">${esc(r.model)}:${esc(r.variant)} (${esc(r.quant)})</option>`).join('')
+      : '<option value="">No installed variants (run shiso pull)</option>';
+    if (keep && rows.some(r => `${r.model}:${r.variant}` === keep)) sel.value = keep;
+  } catch (e) { sel.innerHTML = `<option value="">${esc(e.message)}</option>`; }
+}
+
+let benchTimer = null;
+function toggleBenchFields() {
+  // Every field shows until a task is chosen: the recipe decides otherwise.
+  const task = document.getElementById('bench-task').value;
+  const show = (cls, on) => document.querySelectorAll('.' + cls).forEach(el => el.style.display = on ? '' : 'none');
+  show('bench-tokens', !task || task === 'chat' || task === 'decision');
+  show('bench-chat', !task || task === 'chat');
+  show('bench-image', !task || task === 'image_generation');
+  show('bench-audio', !task || task === 'transcription');
+}
+
+function benchSummary(x) {
+  switch (x.kind) {
+    case 'chat': return `${x.prompt_tokens} prompt tokens: prefill ${x.prefill_tokens_per_second.toFixed(0)} tok/s, <strong>decode ${x.decode_tokens_per_second.toFixed(1)} tok/s</strong>, TTFT ${x.time_to_first_token_ms.toFixed(0)} ms`;
+    case 'decision': return `${x.prompt_tokens} prompt tokens: <strong>${x.latency_ms.toFixed(0)} ms</strong> per decision, ${x.prompt_tokens_per_second.toFixed(0)} tok/s`;
+    case 'image': return `${x.width}×${x.height}, ${x.steps} steps: <strong>${x.seconds_per_image.toFixed(2)} s</strong> per image`;
+    case 'transcription': return `${esc(x.clip)}, ${x.audio_seconds.toFixed(1)} s: <strong>${x.realtime_multiple.toFixed(1)}× real time</strong>, first text ${x.first_text_ms.toFixed(0)} ms`;
+    default: return esc(JSON.stringify(x));
+  }
+}
+function renderBench(job) {
+  const state = document.getElementById('bench-state');
+  const log = document.getElementById('bench-log');
+  const btn = document.getElementById('bench-start');
+  btn.disabled = !!job.running;
+  if (!job.model) { state.innerHTML = ''; log.style.display = 'none'; return; }
+  log.style.display = 'block';
+  log.textContent = (job.log || []).join('\n');
+  log.scrollTop = log.scrollHeight;
+  if (job.running) state.innerHTML = `<div class="info-callout">Measuring <strong>${esc(job.model)}</strong>…</div>`;
+  else if (job.error) state.innerHTML = `<div class="alert-danger">Benchmark failed: ${esc(job.error)}</div>`;
+  else if (job.record) state.innerHTML = `<div class="alert-success">Wrote <code>${esc(job.record)}</code>. Commit it, then rebuild to publish.</div>`;
+}
+
+async function pollBench() {
+  clearTimeout(benchTimer);
+  try {
+    const res = await api('/api/bench/status');
+    const job = await res.json();
+    renderBench(job);
+    if (job.running) benchTimer = setTimeout(pollBench, 1000);
+    else if (job.record) loadBenchRecords();
+  } catch (e) { /* the next tab switch polls again */ }
+}
+
+async function startBench() {
+  const model = document.getElementById('bench-model').value;
+  if (!model) { alert('Pick an installed variant first.'); return; }
+  const prompts = document.getElementById('bench-prompts').value.split(',').map(s => parseInt(s.trim(), 10)).filter(n => n > 0);
+  const sizes = document.getElementById('bench-image-sizes').value.split(',').map(s => s.trim()).filter(Boolean);
+  const body = {
+    model,
+    task: document.getElementById('bench-task').value,
+    image_sizes: sizes,
+    audio: document.getElementById('bench-audio').value.trim(),
+    server_url: document.getElementById('bench-url').value.trim(),
+    device: document.getElementById('bench-device').value.trim(),
+    prompt_tokens: prompts,
+    decode_tokens: parseInt(document.getElementById('bench-decode').value, 10),
+    runs: parseInt(document.getElementById('bench-runs').value, 10),
+    shiso_version: document.getElementById('bench-version').value.trim(),
+    notes: document.getElementById('bench-notes').value.trim(),
+  };
+  const res = await api('/api/bench', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    document.getElementById('bench-state').innerHTML = `<div class="alert-danger">${esc(await res.text())}</div>`;
+    return;
+  }
+  pollBench();
+}
+
+async function loadBenchRecords() {
+  const div = document.getElementById('bench-records');
+  try {
+    const res = await api('/api/bench/records');
+    if (!res.ok) { div.innerHTML = `<div class="alert-danger">${esc(await res.text())}</div>`; return; }
+    const records = await res.json();
+    if (!records.length) { div.innerHTML = '<span style="color:var(--text-muted)">No records yet.</span>'; return; }
+    let rows = '';
+    records.forEach(r => r.results.forEach(x => {
+      rows += `<tr${r.stale ? ' style="opacity:.55" title="measured on older weights"' : ''}>
+        <td>${esc(r.model)}:${esc(r.variant)}</td><td>${esc(x.kind)}</td>
+        <td>${esc(r.device)}<br><span style="color:var(--text-muted)">${esc(r.chip)}</span></td>
+        <td>${benchSummary(x)}</td>
+        <td>${esc(r.measured_at.slice(0, 10))}${r.stale ? ' (stale)' : ''}</td></tr>`;
+    }));
+    div.innerHTML = `<table class="file-table"><thead><tr><th>Variant</th><th>Kind</th><th>Device</th><th>Result</th><th>Measured</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch (e) { div.innerHTML = `<div class="alert-danger">${esc(e.message)}</div>`; }
+}
+
 function formatBytes(bytes) {
   if (bytes === 0) return '0 B';
   const k = 1024;

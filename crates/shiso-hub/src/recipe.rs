@@ -632,20 +632,78 @@ pub struct FileEntry {
     pub binds: Option<Role>,
 }
 
+/// Largest file the hub hosts for a recipe: one mebibyte. Hub files are side
+/// files (a draft vocabulary, a template), not weights.
+pub const HUB_FILE_MAX_BYTES: u64 = 1_048_576;
+
+/// Files the registry build writes into a model's directory, which a hosted
+/// file sharing that directory may not be named.
+pub const RESERVED_MODEL_FILES: [&str; 2] = ["index.json", "benchmarks.json"];
+
+/// Whether `name` can be a hub-hosted file: `[A-Za-z0-9][A-Za-z0-9._-]*`,
+/// not one of the build's own files.
+///
+/// Narrower than a path segment on purpose. The name becomes a URL path
+/// segment as-is (so no `?`, `#`, `%` or spaces), a path `git status` prints
+/// unquoted and whitespace-free (so the dirty check can see it), and a file
+/// the static host serves (so no leading dot).
+#[must_use]
+pub fn hub_file_name_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !RESERVED_MODEL_FILES.contains(&name)
+}
+
+/// Where a component's files are downloaded from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Provider {
+    /// A Hugging Face repository at a pinned commit.
+    #[serde(rename = "huggingface")]
+    HuggingFace,
+    /// The shiso hub itself: files committed beside the model's manifest in
+    /// the registry repository, at most [`HUB_FILE_MAX_BYTES`] each.
+    #[serde(rename = "shiso")]
+    Shiso,
+}
+
+impl fmt::Display for Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::HuggingFace => "huggingface",
+            Self::Shiso => "shiso",
+        })
+    }
+}
+
 /// A component of a variant (e.g. `base`, `vision`, `draft`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Component {
-    /// Remote provider (e.g. `"huggingface"`).
-    pub provider: String,
-    /// Provider repository (e.g. `"shiso-community/qwen3.5-9b-mlx-4bit"`).
-    pub repo: String,
-    /// Pinned commit SHA.
-    pub revision: CommitSha,
+    /// Where the files come from.
+    pub provider: Provider,
+    /// Provider repository (e.g. `"shiso-community/qwen3.5-9b-mlx-4bit"`);
+    /// required for Hugging Face, absent for the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Pinned commit SHA; required for Hugging Face, absent for the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<CommitSha>,
     /// Which file the component flag points at (absent = component directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
     /// List of all files making up this component.
     pub files: Vec<FileEntry>,
+}
+
+impl Component {
+    /// The Hugging Face repository and commit, when this component has both.
+    #[must_use]
+    pub fn hf_source(&self) -> Option<(&str, &CommitSha)> {
+        match (self.provider, self.repo.as_deref(), self.revision.as_ref()) {
+            (Provider::HuggingFace, Some(repo), Some(rev)) => Some((repo, rev)),
+            _ => None,
+        }
+    }
 }
 
 /// Hardware requirements for running a variant.
@@ -858,6 +916,88 @@ where
     })
 }
 
+/// Descriptive metadata about a model, shown on the hub site.
+///
+/// Nothing here takes part in variant selection or serving: a client that
+/// ignores the whole block pulls and serves exactly the same files.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// Who trained or published the weights (e.g. `"Google"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    /// License identifier (an SPDX id where one exists, e.g. `"apache-2.0"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// Project or model homepage (`https://` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    /// Repository whose README is the model card.
+    ///
+    /// Absent, the card is read from the first variant's `base` component. A
+    /// quantized re-export often ships a stub README, so pointing this at the
+    /// original repository gives the page the publisher's own card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<CardSource>,
+    /// Total parameter count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<u64>,
+    /// Parameters active per token, for sparse (mixture-of-experts) models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_parameters: Option<u64>,
+    /// Longest context the model was trained for, in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+}
+
+/// A pinned repository revision whose `README.md` is a model's card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardSource {
+    /// Remote provider (only `"huggingface"` today).
+    pub provider: String,
+    /// Provider repository (`owner/name`).
+    pub repo: String,
+    /// Pinned commit, so the card cannot change under a published manifest.
+    pub revision: CommitSha,
+}
+
+/// What a quality score was measured on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityScope {
+    /// The unquantized model the variants were made from; it says nothing
+    /// about what a quantization lost.
+    BaseModel,
+    /// One variant's own files, named by [`QualityScore::variant`].
+    Variant,
+}
+
+/// One published quality score, with where it came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QualityScore {
+    /// Who published the score.
+    pub source: String,
+    /// The metric's name as the source spells it.
+    pub metric: String,
+    /// The score.
+    pub value: f64,
+    /// Top of the metric's scale, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    /// Where the score can be checked (`https://` only).
+    pub url: String,
+    /// Date the score was read, `YYYY-MM-DD`; sources revise their numbers.
+    pub as_of: String,
+    /// What was measured.
+    pub scope: QualityScope,
+    /// The variant measured; required for [`QualityScope::Variant`], refused
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<VariantKey>,
+    /// The scored model as the source names it, when that differs from ours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
 /// A model recipe manifest describing how to fetch and serve a model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Recipe {
@@ -886,6 +1026,12 @@ pub struct Recipe {
     pub features: RecipeFeatures,
     /// Available variants in author preference order.
     pub variants: Vec<Variant>,
+    /// Descriptive metadata for the hub site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<ModelInfo>,
+    /// Quality scores published for the model or one of its variants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality: Vec<QualityScore>,
     /// Git-derived publication timestamp (compiled manifests only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
@@ -944,7 +1090,14 @@ pub struct IndexModelEntry {
     pub outputs: Vec<Modality>,
     /// Last update timestamp.
     pub updated_at: String,
-    /// SHA-256 digest of the compiled manifest (`models/<name>.json`).
+    /// Path of the compiled manifest, relative to the registry base URL
+    /// (`models/<name>/index.json`).
+    ///
+    /// Carried rather than derived so the layout can change without every
+    /// client hard-coding it; the client refuses anything that is not a plain
+    /// relative path.
+    pub manifest: String,
+    /// SHA-256 digest of the compiled manifest named by `manifest`.
     pub manifest_sha256: Sha256,
     /// Variants available for this model.
     pub variants: Vec<IndexVariantEntry>,

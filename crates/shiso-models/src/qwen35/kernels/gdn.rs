@@ -469,32 +469,27 @@ pub(super) fn run(
             // variant has a recording twin; the per-row walk otherwise. The two
             // leave the same bits in the trail and in the state.
             //
-            // The recording twin always runs at four lanes a column, whatever
-            // the tuner chose for the plain recurrence. The three splits fold
-            // to the same bits by construction (`q35_gdn_recurrent_impl`), so
-            // this changes no number; what it changes is the trail's write
-            // pattern. At one lane a column a head is one 128-thread block and
-            // each store instruction scatters over 32 lines; measured on the
-            // dense 27B with a block drafter, that shape spent 417 us a layer
-            // writing an eight-row trail - 19 ms of a 145 ms verify step.
-            //
-            // Where the device takes four lanes a column; see
-            // `gdn_tune::recorder_for` for what it falls back to and why.
-            let recorder = match shape.recurrent {
-                gdn_tune::Variant::S1 | gdn_tune::Variant::S2 | gdn_tune::Variant::S4 => {
-                    shape.recorder
-                }
-                other => other,
-            };
-            match recorder
-                .trail_entry()
-                .filter(|_| n_tok < launch::GDN_CHUNK_MIN)
-            {
-                Some(entry) => recurrence_recorded(
+            // The recording twin runs at the widest split the device accepts
+            // (`GdnShape::recorder`), whatever the tuner chose for the plain
+            // recurrence. The three splits fold to the same bits by
+            // construction (`q35_gdn_recurrent_impl`), so this changes no
+            // number; what it changes is the trail's write pattern. At one
+            // lane a column a head is one 128-thread block and each store
+            // instruction scatters over 32 lines; measured on the dense 27B
+            // with a block drafter, that shape spent 417 us a layer writing an
+            // eight-row trail - 19 ms of a 145 ms verify step.
+            let recorder = shape.recorder.and_then(|recorder| {
+                recorder
+                    .trail_entry()
+                    .filter(|_| n_tok < launch::GDN_CHUNK_MIN)
+                    .map(|entry| (recorder, entry))
+            });
+            match recorder {
+                Some(recorder) => recurrence_recorded(
                     backend,
                     geometry,
                     scratch,
-                    (recorder, entry),
+                    recorder,
                     one.state,
                     trail.state,
                     n_tok,

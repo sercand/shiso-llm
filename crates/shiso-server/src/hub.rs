@@ -627,7 +627,18 @@ pub async fn run_info(args: InfoArgs) -> anyhow::Result<()> {
 
         println!("    Components:");
         for (role, comp) in &v.components {
-            println!("      [{}] {}@{}", role.as_str(), comp.repo, comp.revision);
+            match comp.hf_source() {
+                Some((repo, rev)) => println!("      [{}] {repo}@{rev}", role.as_str()),
+                None => println!(
+                    "      [{}] hub:{}",
+                    role.as_str(),
+                    comp.files
+                        .iter()
+                        .map(|f| f.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
             for f in &comp.files {
                 match f.binds {
                     Some(bound) => println!(
@@ -830,6 +841,46 @@ mod tests {
         assert_eq!(args.config, None);
         assert_eq!(args.config_path(), vdir.join("base").join("config.json"));
         assert_eq!(args.draft_model, None);
+    }
+
+    /// A hub-hosted draft vocabulary reaches `--draft-vocab` from its own
+    /// component directory, beside a base that speculates by itself.
+    #[test]
+    fn a_hub_draft_vocabulary_resolves_to_its_file() {
+        let recipe: Recipe = serde_json::from_str(
+            r#"{
+              "schema_version": 1, "name": "q-test", "family": "qwen4exp",
+              "min_shiso_version": "0.2.0", "description": "x",
+              "tasks": ["chat"], "features": {},
+              "modalities": {"inputs": ["text"], "outputs": ["text"]},
+              "variants": [{
+                "key": "exl3", "backends": ["cuda"], "quant": "exl3",
+                "requirements": {"min_ram_bytes": 1, "disk_bytes": 20},
+                "server_defaults": {"spec_k": 4},
+                "components": {
+                  "base": {"provider": "huggingface", "repo": "o/q",
+                    "revision": "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c",
+                    "files": [{"name": "model.safetensors", "size": 10,
+                      "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]},
+                  "draft_vocab": {"provider": "shiso", "entry": "draft_vocab_counts.txt",
+                    "files": [{"name": "draft_vocab_counts.txt", "size": 10,
+                      "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]}
+                }
+              }]
+            }"#,
+        )
+        .expect("recipe parses");
+        validate_recipe(&recipe, ValidationMode::Strict).expect("recipe validates");
+        let matches = Cli::command().get_matches_from(["shiso", "serve"]);
+        let serve = matches.subcommand_matches("serve").expect("serve");
+        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
+        let vdir = Path::new("/hub/models/q-test/exl3");
+        populate_serve_args_from_variant(&mut args, vdir, &recipe.variants[0], &recipe.name)
+            .expect("populates");
+        assert_eq!(
+            args.draft_vocab,
+            Some(vdir.join("draft_vocab").join("draft_vocab_counts.txt"))
+        );
     }
 
     /// An image variant hands its checkpoint file to `--image-model`, its

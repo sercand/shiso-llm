@@ -10,6 +10,7 @@ An HTTP router that proxies LLM API requests to third-party backend services. Cl
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/embeddings` | OpenAI Embeddings |
 | `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/images/generations` | OpenAI Image Generation (also `/v1/images`, `/images`) |
 
 The router picks a backend based on the `model` field in the request body, swaps the client's router token for the backend's real API key, optionally renames the model, and streams the response through untouched.
 
@@ -321,6 +322,8 @@ Reset intervals are `never` (default), `daily`, `weekly` (Monday 00:00 UTC), or 
 - **Errors** — rendered as provider-style JSON (`{"error":{"message","type"}}`): 400 invalid body, 401 bad token, 403 disabled key / model not allowed, 404 unknown model, 429 limit exhausted, 503 QoS deadline missed with no fallback (`on_shed_without_fallback = "error"`), 502 all backends unreachable. If every backend returns 5xx, the last upstream 5xx response is relayed verbatim.
 - **Usage capture** — streaming OpenAI-style chat requests get `stream_options.include_usage: true` injected so usage appears in the stream (the extra final chunk passes through to the client, as OpenRouter does; set `inject_usage = false` on backends that reject `stream_options`). Anthropic and Responses streams already carry usage. Token counts are normalized so `prompt_tokens` always includes cached tokens; costs bill cache reads/writes at their configured rates.
 - **Embeddings** — `/v1/embeddings` routes like any other model name, so a batch job can be renamed onto a cheaper provider and stays inside the same key limits. Responses report only `prompt_tokens`, billed at `input_per_mtok` (set `output_per_mtok = 0.0`). Bodies are still streamed straight through: a multi-megabyte batch response is never buffered, and usage is recovered from the ends of the body.
+- **Image generation** — `/v1/images/generations`, `/v1/images` and `/images` all route by `model` and are forwarded upstream as `/v1/images/generations`. JSON and SSE bodies are mostly base64 and are streamed straight through; usage is recovered from the end of the body, or of each streamed `image_generation.completed` frame (the last one carries the request's total).
+- **Access log** — every request on either listener, matched or not, gets one tracing line with method, path (no query string), status and time to response headers. Unmatched paths also log an `unknown endpoint` warning and get a provider-style 404 body. Set `RUST_LOG=shiso_router=warn` to keep only the warnings.
 - **Limit semantics** — checks happen before dispatch against in-memory window counters (warmed from the log table at startup); usage accrues when the response finishes streaming, so concurrent in-flight requests can overshoot a limit by at most their own usage. Requests with no extractable usage accrue nothing but are still logged (with a note in `error`).
 
 ## Development
