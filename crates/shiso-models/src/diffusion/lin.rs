@@ -10,14 +10,15 @@ use shiso_modelfile::st_header::StDType;
 use shiso_vision::generator::ImageGenError;
 
 use super::ops::{Ops, WeightKind};
+use super::quant::{RotGroup, read_int8_layout};
 use super::weights::StStore;
 
 /// A linear layer's weight in its stored native format, with its bias widened
-/// to f32 and its FP8 scale read at load.
+/// to f32 and its FP8 scale (or per-row INT8 scales) read at load.
 ///
 /// The weight buffer is an import of the shard mapping's byte range: BF16,
-/// `F8_E4M3` and F32 weights all reach the device as the bytes the checkpoint
-/// wrote, and the GEMM entry point is chosen from the header dtype. Only the
+/// `F8_E4M3`, F32 and I8 weights all reach the device as the bytes the
+/// checkpoint wrote, and the GEMM entry point is chosen from the header dtype. Only the
 /// bias - a vector of at most a few tens of thousands of elements - is
 /// widened, so the norm/bias rule and the zero-dequant rule for matrices
 /// stay separate.
@@ -29,6 +30,11 @@ pub(crate) struct Lin {
     pub kind: WeightKind,
     /// Epilogue multiplier (the FP8 tensor's `weight_scale`, else 1.0).
     pub scale: f32,
+    /// One f32 scale per weight row, for [`WeightKind::Int8Row`] only.
+    pub row_scale: Option<DeviceBuffer>,
+    /// The rotation the export stored the weight's input axis under; the
+    /// GEMM entry rotates the input to match (see [`super::quant`]).
+    pub rotate: Option<RotGroup>,
     /// Bias as f32, if the checkpoint carries one.
     pub bias: Option<DeviceBuffer>,
     /// Rows of the weight matrix.
@@ -47,6 +53,7 @@ impl Lin {
             StDType::Bf16 => WeightKind::Bf16,
             StDType::F8E4M3 => WeightKind::Fp8,
             StDType::F32 => WeightKind::F32,
+            StDType::I8 => WeightKind::Int8Row,
             other => {
                 return Err(ImageGenError::Checkpoint(format!(
                     "'{weight_name}' has dtype {other:?}, which no diffusion GEMM entry reads"
@@ -57,6 +64,17 @@ impl Lin {
             store.weight_scale(&weight_name)?
         } else {
             1.0
+        };
+        // The codes' layout comes from the export's own document and scale
+        // tensor, checked before a byte reaches the device.
+        let (row_scale, rotate) = if kind == WeightKind::Int8Row {
+            let layout = read_int8_layout(store, name)?;
+            (
+                Some(ops.upload_f32("load row scale", &layout.row_scale)?),
+                layout.rotate,
+            )
+        } else {
+            (None, None)
         };
         let w = store.import(ops.backend(), &weight_name)?;
         let shape = &entry.shape;
@@ -81,6 +99,8 @@ impl Lin {
             w,
             kind,
             scale,
+            row_scale,
+            rotate,
             bias,
             out_dim,
             in_dim,

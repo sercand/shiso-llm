@@ -151,6 +151,23 @@ static inline float dit_weight_value(uchar w) {
     return dit_e4m3(uint(w));
 }
 
+static inline float dit_weight_value(char w) {
+    return float(w);
+}
+
+/// The epilogue multiplier of a linear: one value for the whole tensor (the
+/// FP8 `weight_scale`, or 1.0), or one per weight row (the INT8 export's
+/// `weight_scale [out, 1]`), indexed by the output column the row produces.
+struct dit_scale_tensor {
+    float s;
+    float at(uint) const { return s; }
+};
+
+struct dit_scale_rows {
+    device const float *s;
+    float at(uint col) const { return s[col]; }
+};
+
 /// The staged 16x16 tile body every weight width shares.
 ///
 /// `k` is walked strictly in increasing order - the tile loop advances by
@@ -163,13 +180,13 @@ static inline float dit_weight_value(uchar w) {
 /// in memory. The bias is per output column, applied only when
 /// `args.has_bias` says the binding is a real vector; the driver clears
 /// the flag and binds its zero stand-in when the linear carries none.
-template <typename W>
+template <typename W, typename SC>
 static inline void dit_gemm_body(
         constant dit_args_gemm & args,
         device float *out,
         device const float *in,
         device const W *weight,
-        float scale,
+        const SC scale,
         device const float *bias,
         threadgroup float (*a_tile)[DIT_GEMM_TILE],
         threadgroup float (*b_tile)[DIT_GEMM_TILE],
@@ -205,7 +222,7 @@ static inline void dit_gemm_body(
 
     if (row < args.m && col < args.n) {
         out[(uint64_t)row * args.n + col] =
-                acc * scale + (has_bias ? bias[col] : 0.0f);
+                acc * scale.at(col) + (has_bias ? bias[col] : 0.0f);
     }
 }
 
@@ -223,7 +240,7 @@ kernel void kernel_dit_gemm_f32(
     // driver launches these with no dynamic threadgroup request.
     threadgroup float a_tile[DIT_GEMM_TILE][DIT_GEMM_TILE];
     threadgroup float b_tile[DIT_GEMM_TILE][DIT_GEMM_TILE];
-    dit_gemm_body<float>(args, out, in, weight, weight_scale, bias,
+    dit_gemm_body(args, out, in, weight, dit_scale_tensor{weight_scale}, bias,
                            a_tile, b_tile, tgpig, tpitg);
 }
 
@@ -241,8 +258,26 @@ kernel void kernel_dit_gemm_fp8(
         ushort3 tpitg[[thread_position_in_threadgroup]]) {
     threadgroup float a_tile[DIT_GEMM_TILE][DIT_GEMM_TILE];
     threadgroup float b_tile[DIT_GEMM_TILE][DIT_GEMM_TILE];
-    dit_gemm_body<uchar>(args, out, in, weight_fp8, weight_scale, bias,
+    dit_gemm_body(args, out, in, weight_fp8, dit_scale_tensor{weight_scale}, bias,
                            a_tile, b_tile, tgpig, tpitg);
+}
+
+/// The same product over a per-row INT8 weight: the signed bytes are widened
+/// in registers and `row_scale[n]` - one value per weight row, which is one
+/// per output column - multiplies the accumulator in the epilogue.
+kernel void kernel_dit_gemm_i8(
+        constant dit_args_gemm & args    [[buffer(0)]],
+        device float *out                  [[buffer(1)]],
+        device const float *in             [[buffer(2)]],
+        device const char *weight_i8       [[buffer(3)]],
+        device const float *row_scale      [[buffer(4)]],
+        device const float *bias           [[buffer(5)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup float a_tile[DIT_GEMM_TILE][DIT_GEMM_TILE];
+    threadgroup float b_tile[DIT_GEMM_TILE][DIT_GEMM_TILE];
+    dit_gemm_body(args, out, in, weight_i8, dit_scale_rows{row_scale}, bias,
+                  a_tile, b_tile, tgpig, tpitg);
 }
 
 // The brain-float GEMM is a template with two named instantiations because
@@ -267,7 +302,7 @@ template <bool ProbeAlias>
 kernel void kernel_dit_gemm_bf16_kernel(DIT_GEMM_BF16_PARAMS) {
     threadgroup float a_tile[DIT_GEMM_TILE][DIT_GEMM_TILE];
     threadgroup float b_tile[DIT_GEMM_TILE][DIT_GEMM_TILE];
-    dit_gemm_body<ushort>(args, out, in, weight, weight_scale, bias,
+    dit_gemm_body(args, out, in, weight, dit_scale_tensor{weight_scale}, bias,
                             a_tile, b_tile, tgpig, tpitg);
 }
 
@@ -1002,6 +1037,17 @@ struct dit_wrows_bf16 {
     }
 };
 
+/// Signed INT8 codes, widened exactly (every code is an integer f32 holds);
+/// the per-row scale rides the epilogue.
+struct dit_wrows_i8 {
+    device const char *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        const packed_char4 b = *((device const packed_char4 *) (w + (uint64_t) n * k + kk));
+        return float4(b);
+    }
+};
+
 struct dit_wrows_fp8 {
     device const uchar *w;
     uint k;
@@ -1012,16 +1058,17 @@ struct dit_wrows_fp8 {
     }
 };
 
-/// A linear's epilogue: `out[r][c] = acc * scale + bias[c]`, the bias read
+/// A linear's epilogue: `out[r][c] = acc * scale(c) + bias[c]`, the bias read
 /// only when the driver's presence flag says the binding is real.
+template <typename SC>
 struct dit_store_rows {
     device float *out;
     uint n;
-    float scale;
+    SC scale;
     device const float *bias;
     bool has_bias;
     void store(uint r, uint c, float v) const {
-        out[(uint64_t) r * n + c] = v * scale + (has_bias ? bias[c] : 0.0f);
+        out[(uint64_t) r * n + c] = v * scale.at(c) + (has_bias ? bias[c] : 0.0f);
     }
 };
 
@@ -1138,7 +1185,7 @@ kernel void kernel_dit_gemm64_f32(DIT_GEMM64_PARAMS(float)) {
     threadgroup float smem[DIT_G64_SMEM];
     dit_gemm64_tile(args.m, args.n, args.k,
                       dit_rows_f32{in, args.k}, dit_wrows_f32{weight, args.k},
-                      dit_store_rows{out, args.n, weight_scale, bias, args.has_bias != 0u},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
                       smem, tgpig, tid, lane, sg);
 }
 
@@ -1147,7 +1194,7 @@ kernel void kernel_dit_gemm64_bf16(DIT_GEMM64_PARAMS(ushort)) {
     threadgroup float smem[DIT_G64_SMEM];
     dit_gemm64_tile(args.m, args.n, args.k,
                       dit_rows_f32{in, args.k}, dit_wrows_bf16{weight, args.k},
-                      dit_store_rows{out, args.n, weight_scale, bias, args.has_bias != 0u},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
                       smem, tgpig, tid, lane, sg);
 }
 
@@ -1157,7 +1204,28 @@ kernel void kernel_dit_gemm64_fp8(DIT_GEMM64_PARAMS(uchar)) {
     threadgroup float smem[DIT_G64_SMEM];
     dit_gemm64_tile(args.m, args.n, args.k,
                       dit_rows_f32{in, args.k}, dit_wrows_fp8{weight, args.k},
-                      dit_store_rows{out, args.n, weight_scale, bias, args.has_bias != 0u},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+/// The same tile over a per-row INT8 weight, widened while staging; the
+/// row's scale multiplies the accumulator in the epilogue. Binding 4 is the
+/// `n`-long scale vector, not a scalar.
+kernel void kernel_dit_gemm64_i8(
+        constant dit_args_gemm & args    [[buffer(0)]],
+        device float *out                  [[buffer(1)]],
+        device const float *in             [[buffer(2)]],
+        device const char *weight          [[buffer(3)]],
+        device const float *row_scale      [[buffer(4)]],
+        device const float *bias           [[buffer(5)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_i8{weight, args.k},
+                      dit_store_rows<dit_scale_rows>{out, args.n, {row_scale}, bias, args.has_bias != 0u},
                       smem, tgpig, tid, lane, sg);
 }
 
@@ -1507,26 +1575,27 @@ struct dit_rows_swiglu {
 /// The gated residual in the epilogue: each output element is read and
 /// written by the one thread that owns it, so updating the stream in place
 /// is race-free.
+template <typename SC>
 struct dit_store_gated {
     device float *out;
     uint n;
-    float scale;
+    SC scale;
     device const float *bias;
     bool has_bias;
     device const float *gate;
     void store(uint r, uint c, float v) const {
         const uint64_t i = (uint64_t) r * n + c;
-        out[i] += gate[c] * (v * scale + (has_bias ? bias[c] : 0.0f));
+        out[i] += gate[c] * (v * scale.at(c) + (has_bias ? bias[c] : 0.0f));
     }
 };
 
-#define DIT_GEMM_FUSED_PARAMS(WT) \
+#define DIT_GEMM_FUSED_PARAMS_SCALED(WT, SCALE) \
         constant dit_args_gemm_fused & args [[buffer(0)]], \
         device float *out                     [[buffer(1)]], \
         device const float *a                 [[buffer(2)]], \
         device const float *gu                [[buffer(3)]], \
         device const WT *weight               [[buffer(4)]], \
-        constant float &weight_scale          [[buffer(5)]], \
+        SCALE                                 [[buffer(5)]], \
         device const float *bias              [[buffer(6)]], \
         device const float *gate              [[buffer(7)]], \
         uint3 tgpig[[threadgroup_position_in_grid]], \
@@ -1534,14 +1603,18 @@ struct dit_store_gated {
         ushort lane [[thread_index_in_simdgroup]], \
         ushort sg [[simdgroup_index_in_threadgroup]]
 
-#define DIT_GEMM_FUSED_BODY(WR) \
+#define DIT_GEMM_FUSED_PARAMS(WT) DIT_GEMM_FUSED_PARAMS_SCALED(WT, constant float &weight_scale)
+
+#define DIT_GEMM_FUSED_BODY_SCALED(WR, SC, SCALE) \
     threadgroup float smem[DIT_G64_SMEM]; \
     const uint k = args.cols_a + args.inner; \
     dit_gemm64_tile(args.m, args.n, k, \
                       dit_rows_swiglu{a, gu, args.cols_a, args.inner, args.gu_stride, args.gu_offset}, \
                       WR{weight, k}, \
-                      dit_store_gated{out, args.n, weight_scale, bias, args.has_bias != 0u, gate}, \
+                      dit_store_gated<SC>{out, args.n, {SCALE}, bias, args.has_bias != 0u, gate}, \
                       smem, tgpig, tid, lane, sg);
+
+#define DIT_GEMM_FUSED_BODY(WR) DIT_GEMM_FUSED_BODY_SCALED(WR, dit_scale_tensor, weight_scale)
 
 /// `out += gate * linear([a | swiglu(gu)])` on the simdgroup tile. Grid
 /// `(ceil(n/64), ceil(m/64))` x 128 threads.
@@ -1559,4 +1632,86 @@ kernel void kernel_dit_gemm64_fused_bf16(DIT_GEMM_FUSED_PARAMS(ushort)) {
 
 kernel void kernel_dit_gemm64_fused_fp8(DIT_GEMM_FUSED_PARAMS(uchar)) {
     DIT_GEMM_FUSED_BODY(dit_wrows_fp8)
+}
+
+/// The same fused linear over a per-row INT8 weight; binding 5 is the
+/// `n`-long row-scale vector. A ConvRot weight's input must already be
+/// rotated: the driver writes `[a | swiglu(gu)]` rotated into a packed
+/// scratch row with `kernel_dit_hadamard256_f32` and binds it as `a`.
+kernel void kernel_dit_gemm64_fused_i8(DIT_GEMM_FUSED_PARAMS_SCALED(char, device const float *row_scale)) {
+    DIT_GEMM_FUSED_BODY_SCALED(dit_wrows_i8, dit_scale_rows, row_scale)
+}
+
+// --- ConvRot activation rotation ----------------------------------------------
+//
+// `x . H` for each 256-wide group of a row, `H = kron(H4, H4, H4, H4) / 16`
+// with `H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]`. Element `i` of a
+// group has base-4 digits (i3 i2 i1 i0) and `H[i][j] = prod_d H4[i_d][j_d]`,
+// so the product is four radix-4 butterflies, one per digit, each applying
+// the symmetric H4 to the four elements that differ only in that digit:
+// `y_j = S - 2 * v_(3-j)` with `S` their sum. Every factor is +-1 until the
+// final 1/16, which is a power of two, so each output is a fixed-order sum
+// of signed inputs scaled exactly.
+
+/// The input element (r, kk) of a rotated linear: a plain row, or the
+/// `[a | silu(g) * u]` row the fused linear forms.
+static inline float dit_rot_input(constant dit_args_hadamard & args,
+                                  device const float *a, device const float *gu,
+                                  uint r, uint kk) {
+    if (kk < args.cols_a) {
+        return a[(uint64_t) r * args.cols_a + kk];
+    }
+    device const float *g = gu + (uint64_t) r * args.gu_stride + args.gu_offset + (kk - args.cols_a);
+    return dit_silu(g[0]) * g[args.inner];
+}
+
+static inline float4 dit_h4(float4 v) {
+    const float s = (v.x + v.y) + (v.z + v.w);
+    return float4(s - 2.0f * v.w, s - 2.0f * v.z, s - 2.0f * v.y, s - 2.0f * v.x);
+}
+
+/// `out[r, :] = rot([a | swiglu(gu)][r, :])`, packed `cols_a + inner` wide,
+/// a multiple of 256. Grid `(width / 256, rows)` x 64 threads: one
+/// threadgroup per (row, group), four elements per thread per stage.
+kernel void kernel_dit_hadamard256_f32(
+        constant dit_args_hadamard & args [[buffer(0)]],
+        device float *out                   [[buffer(1)]],
+        device const float *a               [[buffer(2)]],
+        device const float *gu              [[buffer(3)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float v[256];
+    const uint r = tgpig.y;
+    const uint base = tgpig.x * 256u;
+    const uint width = args.cols_a + args.inner;
+    // Digit 0: the four elements 4t..4t+3 are this thread's own, so the
+    // first butterfly runs on the loaded values before anything is staged.
+    float4 x = float4(dit_rot_input(args, a, gu, r, base + 4u * tid),
+                      dit_rot_input(args, a, gu, r, base + 4u * tid + 1u),
+                      dit_rot_input(args, a, gu, r, base + 4u * tid + 2u),
+                      dit_rot_input(args, a, gu, r, base + 4u * tid + 3u));
+    x = dit_h4(x);
+    *((threadgroup float4 *) (v + 4u * tid)) = x;
+    // Digits 1 and 2 (strides 4 and 16) through threadgroup memory: thread t
+    // owns the tuple whose free digit is the stage's, at `hi * 4s + lo`.
+    DIT_UNROLL for (uint stride = 4u; stride <= 16u; stride *= 4u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint lo = tid % stride;
+        const uint b = (tid - lo) * 4u + lo;
+        float4 y = dit_h4(float4(v[b], v[b + stride], v[b + 2u * stride], v[b + 3u * stride]));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        v[b] = y.x;
+        v[b + stride] = y.y;
+        v[b + 2u * stride] = y.z;
+        v[b + 3u * stride] = y.w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Digit 3 (stride 64): thread t owns t, t+64, t+128, t+192 and writes
+    // them straight out - consecutive threads, consecutive addresses.
+    float4 y = dit_h4(float4(v[tid], v[tid + 64u], v[tid + 128u], v[tid + 192u])) * 0.0625f;
+    device float *o = out + (uint64_t) r * width + base;
+    o[tid] = y.x;
+    o[tid + 64u] = y.y;
+    o[tid + 128u] = y.z;
+    o[tid + 192u] = y.w;
 }

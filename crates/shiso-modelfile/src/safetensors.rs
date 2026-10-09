@@ -836,7 +836,8 @@ fn widen(bytes: &[u8], dtype: StDType, tensor: &str) -> GgufResult<Vec<f32>> {
         | StDType::F8E4M3
         | StDType::I64
         | StDType::I16
-        | StDType::I32 => Err(GgufError::LayoutMismatch {
+        | StDType::I32
+        | StDType::I8 => Err(GgufError::LayoutMismatch {
             tensor: tensor.into(),
             want: Box::from("a float array"),
             got: Box::from("packed bytes with no scales"),

@@ -26,6 +26,8 @@ use half::bf16;
 use shiso_core::{
     Backend, DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs, alloc,
 };
+use shiso_kerneltest::Gpu;
+use shiso_kerneltest::diffusion::int8;
 use shiso_metal::MetalBackend;
 
 /// The module every diffusion entry lives under.
@@ -78,6 +80,10 @@ const ENTRIES: &[&str] = &[
     "kernel_dit_gemm64_fused_f32",
     "kernel_dit_gemm64_fused_bf16",
     "kernel_dit_gemm64_fused_fp8",
+    "kernel_dit_gemm_i8",
+    "kernel_dit_gemm64_i8",
+    "kernel_dit_gemm64_fused_i8",
+    "kernel_dit_hadamard256_f32",
 ];
 
 // --- argument blocks: byte-for-byte the driver's `#[repr(C)]` Pods ---------
@@ -3130,4 +3136,218 @@ fn gemm64_fused_takes_a_dense_only_input_over_bf16_weights() {
     let w_buf = upload_u16(&b, &weight_bits);
     let got = run_fused(&b, &case, "kernel_dit_gemm64_fused_bf16", w_buf.view());
     assert_close(&got, &expect_fused(&case), "gemm64_fused bf16 dense-only");
+}
+
+// --- per-row INT8 + ConvRot: the shared cases in `shiso-kerneltest` ----------
+
+/// Opens the device for the shared cases, or says on stderr why they did not run.
+#[expect(
+    clippy::print_stderr,
+    reason = "the GPU cases are opt-in, so the reason they did not run belongs on stderr"
+)]
+fn open_gpu() -> Option<Gpu> {
+    if !shiso_metal::metal_available() {
+        eprintln!("note: no Metal device on this machine, skipping the INT8 GPU cases");
+        return None;
+    }
+    let metal = MetalBackend::new().expect("the embedded kernel library compiles");
+    let device: Arc<dyn Backend> = metal.clone();
+    Some(Gpu::new(device, Box::new(metal)))
+}
+
+/// One ignored wrapper per shared case.
+macro_rules! int8_cases {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[test]
+            #[ignore = "requires a Metal device"]
+            fn $name() {
+                let Some(gpu) = open_gpu() else { return };
+                int8::$name(&gpu);
+            }
+        )*
+    };
+}
+
+int8_cases!(
+    hadamard256_matches_the_explicit_matrix,
+    hadamard256_is_its_own_inverse,
+    hadamard256_rotates_the_swiglu_row_it_forms,
+    gemm_i8_matches_the_dequantized_product,
+    gemm_i8_scales_each_output_row_not_each_input_column,
+    fused_i8_is_the_unfused_composition,
+);
+
+#[test]
+fn every_int8_case_entry_is_registered() {
+    for entry in int8::ENTRIES {
+        assert!(
+            ENTRIES.contains(&entry),
+            "{entry} is launched by the INT8 cases but missing from ENTRIES"
+        );
+    }
+}
+
+// --- throughput -------------------------------------------------------------
+
+/// Median seconds per launch of one simdgroup-tile GEMM entry over `(m, n, k)`:
+/// seven samples of five back-to-back launches each, after a warm-up, so a
+/// launch's queueing and one cold run do not land in the number.
+fn time_gemm64(
+    b: &Arc<dyn Backend>,
+    entry: &'static str,
+    weight: DeviceView<'_>,
+    scale: KernelArg<'_>,
+    shape: (usize, usize, usize),
+) -> f64 {
+    const REPS: u32 = 5;
+    let (m, n, k) = shape;
+    let input = upload_f32(
+        b,
+        &vals(m * k, 3).iter().map(|v| v * 0.1).collect::<Vec<_>>(),
+    );
+    let out = alloc(b, (m * n * 4) as u64).expect("alloc out");
+    let stand_in = dummy(b);
+    let args = GemmArgs {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+        has_bias: 0,
+    };
+    let once = || {
+        launch(
+            b,
+            entry,
+            Extent3::new(
+                grid_for(n as u32, G64_TILE),
+                grid_for(m as u32, G64_TILE),
+                1,
+            ),
+            Extent3::linear(G64_THREADS),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(input.view()),
+                KernelArg::Buffer(weight),
+                scale,
+                KernelArg::Buffer(stand_in.view()),
+            ],
+        );
+    };
+    once();
+    b.sync().expect("sync");
+    let mut samples: Vec<f64> = (0..7)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            for _ in 0..REPS {
+                once();
+            }
+            b.sync().expect("sync");
+            start.elapsed().as_secs_f64() / f64::from(REPS)
+        })
+        .collect();
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
+/// Not a correctness case: reports the BF16 and per-row INT8 tiles'
+/// throughput on the image transformer's linear shapes at 1024 tokens.
+#[test]
+#[ignore = "a throughput probe on a Metal device, not a correctness case"]
+#[expect(
+    clippy::print_stderr,
+    reason = "the probe's whole output is the numbers it measured"
+)]
+fn gemm64_throughput_bf16_vs_i8() {
+    let Some(b) = open() else { return };
+    for (m, n, k) in [
+        (1024usize, 4096usize, 4096usize),
+        (1024, 24576, 4096),
+        (1024, 4096, 12288),
+    ] {
+        let bf = upload_u16(&b, &vec![0x3c00u16; n * k]);
+        let i8w = upload_u8(
+            &b,
+            &(0..n * k)
+                .map(|i| u8::try_from(i % 251).unwrap_or(0))
+                .collect::<Vec<_>>(),
+        );
+        let scales = upload_f32(&b, &vec![0.01f32; n]);
+        let flop = 2.0 * (m * n * k) as f64;
+        let t_bf = time_gemm64(
+            &b,
+            "kernel_dit_gemm64_bf16",
+            bf.view(),
+            KernelArg::F32(1.0),
+            (m, n, k),
+        );
+        let t_i8 = time_gemm64(
+            &b,
+            "kernel_dit_gemm64_i8",
+            i8w.view(),
+            KernelArg::Buffer(scales.view()),
+            (m, n, k),
+        );
+        let t_rot = time_rotation(&b, m, k);
+        eprintln!(
+            "gemm64 m={m} n={n} k={k}: bf16 {:.2} ms {:.2} TFLOPS | i8 {:.2} ms {:.2} TFLOPS | rotate input {:.3} ms",
+            t_bf * 1e3,
+            flop / t_bf / 1e12,
+            t_i8 * 1e3,
+            flop / t_i8 / 1e12,
+            t_rot * 1e3
+        );
+    }
+}
+
+/// Median seconds per launch of the `ConvRot` rotation over `m` rows of `k`.
+fn time_rotation(b: &Arc<dyn Backend>, m: usize, k: usize) -> f64 {
+    const REPS: u32 = 20;
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    struct HadamardArgs {
+        rows: u32,
+        cols_a: u32,
+        inner: u32,
+        gu_stride: u32,
+        gu_offset: u32,
+    }
+    let input = upload_f32(b, &vals(m * k, 5));
+    let out = alloc(b, (m * k * 4) as u64).expect("alloc out");
+    let stand_in = dummy(b);
+    let args = HadamardArgs {
+        rows: m as u32,
+        cols_a: k as u32,
+        inner: 0,
+        gu_stride: 0,
+        gu_offset: 0,
+    };
+    let once = || {
+        launch(
+            b,
+            "kernel_dit_hadamard256_f32",
+            Extent3::new((k / 256) as u32, m as u32, 1),
+            Extent3::linear(64),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(input.view()),
+                KernelArg::Buffer(stand_in.view()),
+            ],
+        );
+    };
+    once();
+    b.sync().expect("sync");
+    let mut samples: Vec<f64> = (0..7)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            for _ in 0..REPS {
+                once();
+            }
+            b.sync().expect("sync");
+            start.elapsed().as_secs_f64() / f64::from(REPS)
+        })
+        .collect();
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
 }

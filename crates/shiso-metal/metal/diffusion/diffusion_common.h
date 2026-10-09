@@ -190,6 +190,21 @@ struct dit_args_gemm_fused {
     uint32_t has_bias;
 };
 
+/// The rotation every ConvRot linear's input takes before its INT8 GEMM:
+/// `out[r, g*256 .. g*256+256] = x[r, g*256 .. +256] . H` for each 256-wide
+/// group `g`, `H = kron^4(H4) / 16`. The input row is read the way the fused
+/// linear reads it (`[a (cols_a) | silu(g) * u (inner)]`, `inner == 0` for a
+/// plain row), so a block's output linear rotates its swiglu input without a
+/// separate pass; the output is packed, `cols_a + inner` wide, and never
+/// aliases the input.
+struct dit_args_hadamard {
+    uint32_t rows;
+    uint32_t cols_a;
+    uint32_t inner;
+    uint32_t gu_stride;
+    uint32_t gu_offset;
+};
+
 /// One elementwise pass over `count` values.
 struct dit_args_unary {
     uint32_t count;
@@ -347,6 +362,7 @@ struct dit_args_embed {
 static_assert(sizeof(dit_args_gemm) == 16, "GemmArgs");
 static_assert(sizeof(dit_args_unary) == 4, "UnaryArgs");
 static_assert(sizeof(dit_args_gemm_fused) == 28, "GemmFusedArgs");
+static_assert(sizeof(dit_args_hadamard) == 20, "HadamardArgs");
 static_assert(sizeof(dit_args_swiglu) == 12, "SwigluArgs");
 static_assert(sizeof(dit_args_modulate) == 8, "ModulateArgs");
 static_assert(sizeof(dit_args_add_gated) == 8, "AddGatedArgs");
