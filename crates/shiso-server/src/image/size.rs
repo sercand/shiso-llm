@@ -1,11 +1,11 @@
 //! The size grammar: what a `size` or `aspect_ratio` string means in pixels.
 //!
 //! Two readers share this one grammar, and they differ in one way on purpose.
-//! The wire field is forgiving: a `WxH` off the 16-pixel wire grid is rounded
+//! The wire field is forgiving for a model on the 16-pixel wire grid: a `WxH` off it is rounded
 //! to it (ties up) and a side outside the loaded model's bounds is clamped to
 //! them, because a caller that asks for 1000 pixels wants the nearest thing
-//! this server can actually make, not a refusal. A size the model's own grid
-//! is coarser than 16 still refuses afterwards, at
+//! this server can actually make, not a refusal. A model on any other grid
+//! reads `WxH` exactly and refuses off-grid pixels, at
 //! [`ImageGenerationJob::validate`](shiso_vision::generator::ImageGenerationJob::validate),
 //! naming that grid. The operator's `--image-default-size` is exact: a default
 //! that quietly moved is not the default that was configured, so it is read
@@ -64,7 +64,9 @@ const ASPECT_RATIOS: [(&str, u32, u32); 8] = [
 /// The wire's forgiving read of a size or ratio string.
 ///
 /// `WxH` has each side rounded to the nearest multiple of [`WIRE_GRID`] (ties
-/// up) and clamped into the model's bounds; a named aspect ratio becomes its
+/// up) and clamped into the model's bounds when the model sits on that grid,
+/// and is passed through exactly (for the job's validation to accept or
+/// refuse) when it does not; a named aspect ratio becomes its
 /// table entry and a named resolution (`2K`, `4K`) the square of N*1024, both
 /// rounded to the model's `size_multiple` and clamped, so `2K` is 2048x2048
 /// where the model allows it and `4K` lands on the ceiling rather than being
@@ -88,6 +90,13 @@ pub fn normalize_size(value: &str, limits: &ImageLimits) -> Result<(u32, u32), S
         return Ok((side, side));
     }
     let (width, height) = split_size(value).ok_or_else(|| malformed(value))?;
+    // A model on the wire grid keeps the forgiving read. Any other model is
+    // exact-or-refuse: rounding 1020 to 1024 on a 32 grid would answer pixels
+    // the caller did not name, while 1000 is refused, so the generator's own
+    // check (which names the multiple and bounds) judges the numbers as given.
+    if limits.size_multiple != WIRE_GRID {
+        return Ok((width, height));
+    }
     Ok((
         round_side(width, WIRE_GRID, limits),
         round_side(height, WIRE_GRID, limits),
@@ -222,6 +231,23 @@ mod tests {
         assert_eq!(norm("1004x1004"), (1008, 1008));
         assert_eq!(norm("10x10"), (256, 256));
         assert_eq!(norm("99999x99999"), (2048, 2048));
+    }
+
+    /// Off the 16 grid a model is exact-or-refuse: nothing is rounded.
+    #[test]
+    fn a_coarser_grid_reads_wxh_exactly() {
+        let coarse = ImageLimits {
+            size_multiple: 32,
+            ..LIMITS
+        };
+        assert_eq!(
+            normalize_size("1020x1020", &coarse).expect("passes through"),
+            (1020, 1020)
+        );
+        assert_eq!(
+            normalize_size("1024x768", &coarse).expect("exact"),
+            (1024, 768)
+        );
     }
 
     /// A model's own bounds are the clamp, not a fixed pair.

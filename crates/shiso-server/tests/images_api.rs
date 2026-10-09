@@ -1073,3 +1073,43 @@ async fn a_request_that_names_nothing_gets_the_models_own_defaults() {
     let job = &log.recorded()[0];
     assert_eq!((job.width, job.height, job.steps), (1024, 1024, 40));
 }
+
+#[tokio::test]
+async fn a_coarse_grid_model_reads_an_explicit_size_exactly() {
+    let (state, log) = state_with_limits(false, COARSE);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "size": "1020x1020"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("multiples of 32"), "{body}");
+    assert!(log.recorded().is_empty());
+
+    let (state, log) = state_with_limits(false, COARSE);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "size": "1024x768"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let job = &log.recorded()[0];
+    assert_eq!((job.width, job.height), (1024, 768));
+}
+
+#[tokio::test]
+async fn a_wire_grid_model_still_rounds_an_explicit_size() {
+    let (state, log) = state_with_mock(false);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "size": "1000x1000"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let job = &log.recorded()[0];
+    assert_eq!((job.width, job.height), (1008, 1008));
+}
