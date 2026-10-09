@@ -8,7 +8,9 @@
 //! store and linear layer ([`weights`], [`lin`]) that bind a checkpoint's
 //! stored dtype to a GEMM entry point without dequantizing it; and the
 //! flow-match Euler sigma ladder ([`euler`]); the PNG/JPEG encoder ([`encode`]) takes
-//! interleaved RGB or RGBA bytes. A family keeps its own config,
+//! interleaved RGB or RGBA bytes; the Qwen3-style prefill text encoder
+//! ([`qwen3_text`]) and the injection-safe prompt tokenizer ([`prompt`]) the
+//! families condition through. A family keeps its own config,
 //! tensor names, positional encoding and time-shift fit, and composes these.
 //!
 //! New weight dtypes extend [`ops::WeightKind`] and [`lin::Lin::load`]; the
@@ -19,7 +21,9 @@ pub(crate) mod encode;
 pub(crate) mod euler;
 pub(crate) mod lin;
 pub(crate) mod ops;
+pub(crate) mod prompt;
 pub(crate) mod quant;
+pub(crate) mod qwen3_text;
 pub(crate) mod weights;
 
 #[cfg(test)]

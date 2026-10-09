@@ -67,6 +67,16 @@ pub enum ImageGenError {
     /// Prompt text is empty.
     #[error("prompt must not be empty")]
     EmptyPrompt,
+    /// The prompt encodes to more tokens than the model's text encoder
+    /// reads. Refused rather than truncated: a cut prompt is a different
+    /// request than the one the caller sent.
+    #[error("prompt is {tokens} tokens, over this model's {max}-token limit")]
+    PromptTooLong {
+        /// Prompt tokens the request encodes to.
+        tokens: u32,
+        /// The most prompt tokens the model reads.
+        max: u32,
+    },
     /// Requested width or height is outside the model's bounds or off its grid.
     #[error(
         "width and height must be multiples of {multiple} between {min} and {max}, got {width}x{height}"

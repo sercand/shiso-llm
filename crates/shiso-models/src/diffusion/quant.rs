@@ -196,13 +196,6 @@ pub(crate) fn read_int8_layout(store: &StStore, name: &str) -> Result<Int8Layout
 /// per base-4 digit of the index, then the exact `1/16`. The same association
 /// the device kernel makes, so the two agree to the last bit wherever the
 /// device does not contract a multiply-add.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "reached through `unrotate_row_f32`, whose first production caller is the INT8 text encoder"
-    )
-)]
 fn rotate_group(v: &mut [f32]) {
     for stride in [1usize, 4, 16, 64] {
         for hi in 0..ROT_GROUP / (4 * stride) {
@@ -232,13 +225,6 @@ fn rotate_group(v: &mut [f32]) {
 /// # Errors
 /// [`ImageGenError::Checkpoint`] when `group` is not the implemented 256 or
 /// the row is not a whole number of groups.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the INT8 text encoder's embedding gather is its first production caller"
-    )
-)]
 pub(crate) fn unrotate_row_f32(row: &mut [f32], group: usize) -> Result<(), ImageGenError> {
     if group != ROT_GROUP {
         return Err(refuse(format!(

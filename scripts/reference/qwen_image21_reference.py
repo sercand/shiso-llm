@@ -24,6 +24,7 @@ deleting it deliberately is how it is recaptured.
                 block-causal full path and the prefix-KV-cache path compared
     vae         AutoencoderKLQwenImage21 decode of a seeded latent
     text-encoder  Qwen3-VL prompt features (needs ~40 GB of RAM; not run on a laptop)
+    text-encoder-streamed  the same features one decoder layer at a time (range-read, evicted after use)
 
 Weights are never downloaded whole except the 675 MB VAE: single tensors are
 read from the hub with HTTP Range requests (safetensors header first) and cached
@@ -213,12 +214,27 @@ class Safetensors:
                 f.seek(start)
                 data = f.read(length)
         else:
-            r = _session().get(
-                self.url, headers={"Range": f"bytes={start}-{start + length - 1}"}, timeout=300
-            )
-            if r.status_code != 206:
-                raise RuntimeError(f"{self.url}: Range request answered {r.status_code}")
-            data = r.content
+            import time
+
+            import requests
+
+            for attempt in range(6):
+                try:
+                    r = _session().get(
+                        self.url, headers={"Range": f"bytes={start}-{start + length - 1}"}, timeout=300
+                    )
+                    if r.status_code != 206:
+                        raise RuntimeError(f"{self.url}: Range request answered {r.status_code}")
+                    data = r.content
+                    if len(data) == length:
+                        break
+                except (requests.ConnectionError, requests.Timeout) as e:
+                    # The hub drops a connection now and then under parallel range reads; a dropped read is retried,
+                    # a wrong status is not.
+                    if attempt == 5:
+                        raise
+                    print(f"{self.label}: range read retried after {e!r}", file=sys.stderr)
+                    time.sleep(2 ** attempt)
         if len(data) != length:
             raise RuntimeError(f"{self.label}: short read {len(data)} of {length}")
         return data
@@ -305,6 +321,37 @@ def stub_pipeline(cache: Path, scheduler_cfg: Path | None = None):
     )
 
 
+class Capture:
+    """Stands in for the text encoder: records what the pipeline feeds it, returns zeros."""
+
+    def __init__(self):
+        import torch
+
+        self.seen = None
+        self.model = type("M", (), {"language_model": type("L", (torch.nn.Module,), {"norm": torch.nn.Identity()})()})()
+
+    def __call__(self, input_ids, attention_mask, output_hidden_states, **kw):
+        import torch
+
+        self.seen = (input_ids.clone(), attention_mask.clone())
+        h = torch.zeros(*input_ids.shape, 4)
+        return type("O", (), {"hidden_states": (h, h)})()
+
+
+def pipeline_ids(pipe, prompt: str) -> list[int]:
+    """The full token ids the pipeline's own `_get_qwen_prompt_embeds` hands its text encoder for `prompt`."""
+    import torch
+
+    saved = pipe.text_encoder
+    cap = Capture()
+    pipe.text_encoder = cap
+    try:
+        pipe._get_qwen_prompt_embeds(prompt, None, torch.device("cpu"))
+    finally:
+        pipe.text_encoder = saved
+    return cap.seen[0][0].tolist()
+
+
 # ---------------------------------------------------------------- tokenizer
 
 def cmd_tokenizer(args):
@@ -313,18 +360,6 @@ def cmd_tokenizer(args):
     cache = Path(args.cache_dir).expanduser()
     out = Out("tokenizer")
     pipe = stub_pipeline(cache)
-
-    class Capture:
-        """Stands in for the text encoder: records what the pipeline feeds it, returns zeros."""
-
-        def __init__(self):
-            self.seen = None
-            self.model = type("M", (), {"language_model": type("L", (torch.nn.Module,), {"norm": torch.nn.Identity()})()})()
-
-        def __call__(self, input_ids, attention_mask, output_hidden_states, **kw):
-            self.seen = (input_ids.clone(), attention_mask.clone())
-            h = torch.zeros(*input_ids.shape, 4)
-            return type("O", (), {"hidden_states": (h, h)})()
 
     cap = Capture()
     pipe.text_encoder = cap  # bypass register_modules type bookkeeping: only attribute access is used
@@ -960,6 +995,233 @@ def cmd_text_encoder(args):
     out.finish()
 
 
+# ---------------------------------------------------------------- text encoder, layer-streamed
+
+TE_FILE = "text_encoder/model.safetensors"
+TE_PREFIX = "model.language_model."
+# Every sixth decoder layer's output is kept for debugging a drift: 0-indexed layers 5, 11, ..., 29;
+# the last layer (35) is the feature itself.
+TE_DEBUG_EVERY = 6
+
+
+def prefetch(src: Safetensors, names, workers: int = 8, chunk: int = 32 << 20):
+    """Range-read whole tensors into `src`'s cache in parallel chunks (the hub answers ~10 MB/s per connection)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    jobs = []
+    for name in names:
+        lo, hi = src.header[name]["data_offsets"]
+        dest = src.dir / (name.replace("/", "_") + ".bin")
+        if dest.exists() and dest.stat().st_size == hi - lo:
+            continue
+        part = dest.with_suffix(".part")
+        with open(part, "wb") as f:
+            f.truncate(hi - lo)
+        for off in range(0, hi - lo, chunk):
+            jobs.append((part, src.base + lo + off, off, min(chunk, hi - lo - off)))
+        jobs.append((dest, None, None, None))  # rename marker
+
+    def one(job):
+        part, start, off, length = job
+        data = src._read(start, length)
+        with open(part, "r+b") as f:
+            f.seek(off)
+            f.write(data)
+
+    reads = [j for j in jobs if j[1] is not None]
+    with ThreadPoolExecutor(workers) as pool:
+        list(pool.map(one, reads))
+    for dest, start, _, _ in jobs:
+        if start is None:
+            dest.with_suffix(".part").rename(dest)
+
+
+def evict(src: Safetensors, names):
+    for name in names:
+        (src.dir / (name.replace("/", "_") + ".bin")).unlink(missing_ok=True)
+
+
+def embed_rows(src: Safetensors, ids) -> np.ndarray:
+    """Embedding rows for `ids`, each range-read on its own (8 KiB apiece), never the 1.2 GB table."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    name = TE_PREFIX + "embed_tokens.weight"
+    meta = src.header[name]
+    assert meta["dtype"] == "BF16"
+    width = meta["shape"][1]
+    lo, _ = meta["data_offsets"]
+    rows_dir = src.dir / "embed_rows"
+    rows_dir.mkdir(exist_ok=True)
+
+    def row(i):
+        cached = rows_dir / f"{i}.bin"
+        if cached.exists() and cached.stat().st_size == 2 * width:
+            return cached.read_bytes()
+        data = src._read(src.base + lo + i * 2 * width, 2 * width)
+        cached.write_bytes(data)
+        return data
+
+    uniq = sorted(set(ids))
+    with ThreadPoolExecutor(8) as pool:
+        got = dict(zip(uniq, pool.map(row, uniq)))
+    table = {i: (np.frombuffer(b, dtype="<u2").astype(np.uint32) << 16).view(np.float32) for i, b in got.items()}
+    return np.stack([table[i] for i in ids]).astype(np.float32), {i: sha256_bytes(b) for i, b in got.items()}
+
+
+def layer_names(src: Safetensors, layer: int):
+    p = f"{TE_PREFIX}layers.{layer}."
+    return sorted(n for n in src.header if n.startswith(p))
+
+
+def build_layer(src: Safetensors, tcfg, layer: int):
+    import torch
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextDecoderLayer
+
+    p = f"{TE_PREFIX}layers.{layer}."
+    mod = Qwen3VLTextDecoderLayer(tcfg, layer).eval()
+    sd = {n[len(p):]: torch.from_numpy(src.tensor(n).copy()) for n in layer_names(src, layer)}
+    mod.load_state_dict(sd, strict=True)
+    return mod
+
+
+def cmd_text_encoder_streamed(args):
+    """The Qwen3-VL text encoder's prompt features without holding it: one f32 decoder layer at a time.
+
+    The BF16 checkpoint is 17.5 GB (about 40 GB as f32), so the layers are range-read one by one from the hub,
+    instantiated as transformers' own `Qwen3VLTextDecoderLayer`, run over every prompt with the text model's own
+    rotary table (`Qwen3VLTextRotaryEmbedding`) and causal mask (`create_causal_mask`), and evicted from the cache.
+    The loop is first checked against the pipeline's own `_get_qwen_prompt_embeds` on a real-weight model cut to
+    two decoder layers (positions, mask, the final-norm bypass and drop_idx all come from the official code there).
+    """
+    import gc
+    import threading
+
+    import torch
+    from diffusers import QwenImage21Pipeline
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+    from transformers.masking_utils import create_causal_mask
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextRotaryEmbedding
+
+    torch.set_grad_enabled(False)
+    cache = Path(args.cache_dir).expanduser()
+    out = Out("text-encoder-streamed")
+    url = hub_url(TURBO_REPO, TURBO_REV, TE_FILE)
+    src = Safetensors(cache, "turbo-text_encoder", url=url)
+    out.input("text-encoder-file", {"source": "range", "url": url})
+    cfg_path = turbo_file(cache, "text_encoder/config.json")
+    full_cfg = Qwen3VLConfig.from_pretrained(str(cfg_path.parent))
+    tcfg = full_cfg.text_config
+    tcfg._attn_implementation = "eager"
+    layers = tcfg.num_hidden_layers
+    pipe = stub_pipeline(cache)
+    drop = pipe._drop_idx
+
+    ids = {key: pipeline_ids(pipe, PROMPTS[key]) for key in TEXT_ENCODER_PROMPTS}
+    all_ids = sorted({i for v in ids.values() for i in v})
+    _, row_digests = embed_rows(src, all_ids)
+    out.input("text-encoder-embed-rows", {"tensor": TE_PREFIX + "embed_tokens.weight", "sha256_per_row": {str(k): v for k, v in row_digests.items()}})
+    embeds = {key: embed_rows(src, v)[0] for key, v in ids.items()}
+
+    # ---- cross-check: the official pipeline on a two-layer cut of the real model, against this loop.
+    cut = 2
+    prefetch(src, [n for l in range(cut) for n in layer_names(src, l)] + [TE_PREFIX + "norm.weight"])
+    small = Qwen3VLConfig.from_pretrained(str(cfg_path.parent))
+    small.text_config.num_hidden_layers = cut
+    small.vision_config.depth = 1
+    small.vision_config.deepstack_visual_indexes = []
+    small.tie_word_embeddings = True
+    small.text_config._attn_implementation = "eager"
+    small._attn_implementation = "eager"
+    model = Qwen3VLForConditionalGeneration(small).to(torch.float32).eval()
+    lm = model.model.language_model
+    with torch.no_grad():
+        lm.embed_tokens.weight.zero_()
+        rows, _ = embed_rows(src, all_ids)
+        lm.embed_tokens.weight[torch.tensor(all_ids)] = torch.from_numpy(rows)
+        for l in range(cut):
+            lm.layers[l].load_state_dict(build_layer(src, tcfg, l).state_dict(), strict=True)
+        lm.norm.weight.copy_(torch.from_numpy(src.tensor(TE_PREFIX + "norm.weight").copy()))
+    note_input(out, src, TE_PREFIX + "norm.weight")
+    pipe.text_encoder = model
+    official_cut = {}
+    for key in TEXT_ENCODER_PROMPTS:
+        e, _, _ = pipe._get_qwen_prompt_embeds(PROMPTS[key], None, torch.device("cpu"))
+        official_cut[key] = e[0].numpy().copy()
+    pipe.text_encoder = None
+    del model, lm
+    gc.collect()
+
+    # ---- the streamed loop.
+    rotary = Qwen3VLTextRotaryEmbedding(tcfg)
+    state = {}
+    for key, e in embeds.items():
+        h = torch.from_numpy(e)[None]
+        t = h.shape[1]
+        # The text model's own default for text-only input: every axis carries the token index.
+        pos = torch.arange(t).view(1, 1, -1).expand(4, 1, -1)
+        mask = create_causal_mask(config=tcfg, inputs_embeds=h, attention_mask=torch.ones(1, t, dtype=torch.long),
+                                  past_key_values=None, position_ids=pos[0])
+        state[key] = {"h": h, "pe": rotary(h, pos[1:]), "mask": mask, "pos": pos[0]}
+
+    debug = {key: {} for key in embeds}
+    cross = {}
+    pending = None
+    for l in range(layers):
+        names = layer_names(src, l)
+        if pending is not None:
+            pending.join()
+        prefetch(src, names)  # no-op when the background fetch already landed it
+        nxt = layer_names(src, l + 1) if l + 1 < layers else []
+        pending = threading.Thread(target=prefetch, args=(src, nxt)) if nxt else None
+        if pending is not None:
+            pending.start()
+        for n in names:
+            note_input(out, src, n)
+        layer = build_layer(src, tcfg, l)
+        for key, st in state.items():
+            st["h"] = layer(st["h"], position_embeddings=st["pe"], attention_mask=st["mask"], position_ids=st["pos"])
+            if l + 1 == cut:
+                got = st["h"][0, drop:].numpy()
+                cross[key] = float(np.abs(got - official_cut[key]).max())
+            if (l + 1) % TE_DEBUG_EVERY == 0 and l + 1 < layers:
+                debug[key][l] = st["h"][0, drop:].numpy().copy()
+        del layer
+        evict(src, names)
+        print(f"[text-encoder-streamed] layer {l} done", flush=True)
+    if pending is not None:
+        pending.join()
+    evict(src, [TE_PREFIX + "norm.weight"])
+    print("cross-check max |streamed - official| after", cut, "layers:", cross)
+    assert all(v <= 1e-4 for v in cross.values()), cross
+
+    cases = {}
+    for key, st in state.items():
+        feat = st["h"][0, drop:].numpy()
+        cases[key] = {
+            "prompt": PROMPTS[key], "ids": ids[key], "drop_idx": drop, "shape": list(feat.shape),
+            "hidden": out.f32(f"te_{key}_hidden.f32", feat,
+                              f"Prompt features [kept tokens, {feat.shape[1]}] for {key!r}: output of the last decoder layer "
+                              "(35), before the final RMSNorm, after drop_idx."),
+            "layers": {str(l): out.f32(f"te_{key}_layer{l:02d}.f32", v,
+                                       f"Residual stream after 0-indexed decoder layer {l} for {key!r}, after drop_idx (debugging).")
+                       for l, v in debug[key].items()},
+            "feature_std": float(feat.std()), "feature_abs_max": float(np.abs(feat).max()),
+        }
+    out.json(
+        "te_streamed.json",
+        {
+            "drop_idx": drop, "layers": layers, "debug_every": TE_DEBUG_EVERY,
+            "cross_check": {"decoder_layers": cut, "max_abs_diff": cross,
+                            "against": "QwenImage21Pipeline._get_qwen_prompt_embeds on Qwen3VLForConditionalGeneration "
+                                       "cut to two text layers with the same real weights"},
+            "cases": cases,
+        },
+        "Qwen3-VL-8B text encoder prompt features (f32 over the official BF16 weights), computed one decoder layer at a "
+        "time, with every sixth layer's residual stream, and the two-layer cross-check against the pipeline's own code.",
+    )
+    out.finish()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cache-dir", default="~/.cache/shiso-ref/qwen-image21",
@@ -974,6 +1236,8 @@ def main():
                            "qwen_image_2.1_turbo_int8_convrot.safetensors",
                            help=f"local copy of the Comfy INT8 file, used only if it is exactly {COMFY_SIZE} bytes; "
                                 "otherwise the tensors are range-read from the hub")
+    p = sub.add_parser("text-encoder-streamed", help="layer-streamed text encoder (peak ~2 GB disk, ~3 GB RAM)")
+    p.set_defaults(fn=cmd_text_encoder_streamed)
     p = sub.add_parser("text-encoder", help="needs ~40 GB RAM")
     p.set_defaults(fn=cmd_text_encoder)
     p.add_argument("--text-encoder-dir", required=True, help="the Turbo repo's text_encoder/ directory (model.safetensors, config)")

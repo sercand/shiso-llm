@@ -60,19 +60,7 @@ impl StStore {
     /// or a range that runs past the file, is refused at open — before any
     /// weight is imported — so no `Lin::load` below re-checks it.
     pub(crate) fn open(path: &Path) -> Result<Self, ImageGenError> {
-        let files = if path.is_dir() {
-            let mut found: Vec<_> = std::fs::read_dir(path)
-                .map_err(|e| ImageGenError::Checkpoint(format!("reading {}: {e}", path.display())))?
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "safetensors"))
-                .collect();
-            found.sort();
-            found
-        } else {
-            vec![path.to_path_buf()]
-        };
-        Self::open_files(&files)
+        Self::open_files(&safetensors_files(path)?)
     }
 
     /// Opens exactly these shard files, refusing a tensor name that two of
@@ -273,6 +261,22 @@ impl StStore {
     pub(crate) fn count_blocks(&self, prefix: &str) -> Option<usize> {
         count_blocks_internal(self.names(), prefix)
     }
+}
+
+/// The `.safetensors` files `path` names: the file itself, or every one
+/// directly inside the directory, sorted by name.
+pub(crate) fn safetensors_files(path: &Path) -> Result<Vec<PathBuf>, ImageGenError> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut found: Vec<_> = std::fs::read_dir(path)
+        .map_err(|e| ImageGenError::Checkpoint(format!("reading {}: {e}", path.display())))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "safetensors"))
+        .collect();
+    found.sort();
+    Ok(found)
 }
 
 /// The block count of a `prefix<n>.` run among `keys`: one past the highest

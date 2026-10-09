@@ -474,6 +474,7 @@ const _: fn(shiso_server::image::ImageServiceDesc) -> ImageServiceDescFields =
 fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
     match error {
         ImageGenError::EmptyPrompt => (0, 0, 0),
+        ImageGenError::PromptTooLong { tokens, max } => (9, *tokens, *max),
         ImageGenError::InvalidDimensions {
             width,
             height,
