@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use shiso_core::ids::Seed;
 use shiso_metal::MetalBackend;
-use shiso_models::flux2::config::ImageModelDesc;
+use shiso_models::image_registry::ImageModelDesc;
 use shiso_vision::generator::{GeneratedImage, ImageGenerationJob, ImageOutputFormat};
 
 /// Decoded-pixel standard deviation a real photograph clears by orders of

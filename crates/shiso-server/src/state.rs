@@ -118,12 +118,6 @@ pub struct AppState {
     /// [`AppState::image`], which answers the typed "no image model" error
     /// for a server that serves language or transcription alone.
     pub image: Option<crate::image::ImageService>,
-    /// The geometry and step count an image request that names none gets.
-    ///
-    /// The image counterpart of [`AppState::sampling_preset`]: what a caller
-    /// who names nothing is served, chosen by the operator at boot
-    /// (`--image-default-size`, `--image-default-steps`).
-    pub image_defaults: crate::image::ImageDefaults,
     /// Whether the loaded model carries a schema decision head, which is what
     /// answers `/v1/systemone` when it does.
     pub decision_head: bool,
@@ -154,7 +148,6 @@ impl AppState {
             memory: None,
             audio: None,
             image: None,
-            image_defaults: crate::image::ImageDefaults::default(),
             decision_head: false,
             embedding: None,
         }
@@ -179,7 +172,6 @@ impl AppState {
             memory: None,
             audio: None,
             image: None,
-            image_defaults: crate::image::ImageDefaults::default(),
             decision_head: false,
             embedding: None,
         }
@@ -212,13 +204,6 @@ impl AppState {
     #[must_use]
     pub fn with_image(mut self, image: crate::image::ImageService) -> Self {
         self.image = Some(image);
-        self
-    }
-
-    /// The same state with image defaults other than the published ones.
-    #[must_use]
-    pub const fn with_image_defaults(mut self, defaults: crate::image::ImageDefaults) -> Self {
-        self.image_defaults = defaults;
         self
     }
 

@@ -461,9 +461,9 @@ pub fn model_listing(state: &AppState) -> ModelListResponse {
             },
             supported_parameters: Vec::new(),
             image: Some(ImageListing {
-                steps: state.image_defaults.steps,
-                width: state.image_defaults.width,
-                height: state.image_defaults.height,
+                steps: image.defaults().steps,
+                width: image.defaults().width,
+                height: image.defaults().height,
             }),
         });
     }

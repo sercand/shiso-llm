@@ -6,13 +6,15 @@
 //! implicit-GEMM convolution, the norms and the scratch pool; the safetensors
 //! store and linear layer ([`weights`], [`lin`]) that bind a checkpoint's
 //! stored dtype to a GEMM entry point without dequantizing it; and the
-//! flow-match Euler sigma ladder ([`euler`]). A family keeps its own config,
+//! flow-match Euler sigma ladder ([`euler`]); the PNG/JPEG encoder ([`encode`]) takes
+//! interleaved RGB or RGBA bytes. A family keeps its own config,
 //! tensor names, positional encoding and time-shift fit, and composes these.
 //!
 //! New weight dtypes extend [`ops::WeightKind`] and [`lin::Lin::load`]; the
 //! device kernels they launch are registered in
 //! `crates/shiso-metal/metal/diffusion/`.
 
+pub(crate) mod encode;
 pub(crate) mod euler;
 pub(crate) mod lin;
 pub(crate) mod ops;

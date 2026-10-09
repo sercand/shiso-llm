@@ -21,12 +21,17 @@ use shiso_server::image::{ImageService, ImageServiceDesc};
 use shiso_server::router::build_router;
 use shiso_server::state::AppState;
 use shiso_vision::generator::{
-    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat,
-    ImageStepEvent,
+    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits,
+    ImageOutputFormat, ImageStepEvent,
 };
 use tower::ServiceExt as _;
 
 /// The encoded bytes the mock hands back: a PNG signature, no pixels.
+/// The grammar read against the flux-like limits.
+fn normalize_size_default(value: &str) -> Result<(u32, u32), shiso_server::image::size::SizeError> {
+    normalize_size(value, &FLUX_LIKE)
+}
+
 fn png_bytes() -> Vec<u8> {
     vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
 }
@@ -53,13 +58,26 @@ fn filler_job() -> ImageGenerationJob {
 struct RecordingGenerator {
     jobs: Mutex<Vec<ImageGenerationJob>>,
     partials: bool,
+    limits: ImageLimits,
 }
 
+/// The limits the flux-like mocks answer with: the 16 grid, 256..=2048, 1024
+/// square at 4 steps.
+const FLUX_LIKE: ImageLimits = ImageLimits {
+    size_multiple: 16,
+    min_side: 256,
+    max_side: 2048,
+    default_size: (1024, 1024),
+    default_steps: 4,
+    fixed_steps: None,
+};
+
 impl RecordingGenerator {
-    fn new(partials: bool) -> Self {
+    fn new(partials: bool, limits: ImageLimits) -> Self {
         Self {
             jobs: Mutex::new(Vec::new()),
             partials,
+            limits,
         }
     }
 
@@ -74,6 +92,10 @@ impl RecordingGenerator {
 impl ImageGenerator for RecordingGenerator {
     fn model_id(&self) -> &'static str {
         "mock-flux"
+    }
+
+    fn limits(&self) -> ImageLimits {
+        self.limits
     }
 
     fn generate(
@@ -122,6 +144,10 @@ impl ImageGenerator for FailingSecondGenerator {
         "mock-flux"
     }
 
+    fn limits(&self) -> ImageLimits {
+        FLUX_LIKE
+    }
+
     fn generate(
         &self,
         job: &ImageGenerationJob,
@@ -158,6 +184,10 @@ impl ImageGenerator for GateGenerator {
         "mock-flux"
     }
 
+    fn limits(&self) -> ImageLimits {
+        FLUX_LIKE
+    }
+
     fn generate(
         &self,
         job: &ImageGenerationJob,
@@ -192,7 +222,15 @@ impl ImageGenerator for GateGenerator {
 /// The state for one test: a server with no language model and the mock
 /// generator attached, plus the log the generator writes into.
 fn state_with_mock(partials: bool) -> (Arc<AppState>, Arc<RecordingGenerator>) {
-    let generator = Arc::new(RecordingGenerator::new(partials));
+    state_with_limits(partials, FLUX_LIKE)
+}
+
+/// The same, for a model whose limits are `limits`.
+fn state_with_limits(
+    partials: bool,
+    limits: ImageLimits,
+) -> (Arc<AppState>, Arc<RecordingGenerator>) {
+    let generator = Arc::new(RecordingGenerator::new(partials, limits));
     let concrete = Arc::clone(&generator);
     let boxed: Arc<dyn ImageGenerator> = concrete;
     let service = ImageService::start(ImageServiceDesc {
@@ -883,9 +921,18 @@ async fn the_model_listing_names_no_image_model_when_none_is_loaded() {
 
 #[test]
 fn the_exact_shape_passes_through() {
-    assert_eq!(normalize_size("1024x1024").expect("exact"), (1024, 1024));
-    assert_eq!(normalize_size("512x512").expect("exact"), (512, 512));
-    assert_eq!(normalize_size("2048x256").expect("exact"), (2048, 256));
+    assert_eq!(
+        normalize_size_default("1024x1024").expect("exact"),
+        (1024, 1024)
+    );
+    assert_eq!(
+        normalize_size_default("512x512").expect("exact"),
+        (512, 512)
+    );
+    assert_eq!(
+        normalize_size_default("2048x256").expect("exact"),
+        (2048, 256)
+    );
 }
 
 #[test]
@@ -902,7 +949,7 @@ fn the_aspect_table_names_servable_pixels() {
     ];
     for (ratio, want) in table {
         assert_eq!(
-            normalize_size(ratio).expect("a listed ratio"),
+            normalize_size_default(ratio).expect("a listed ratio"),
             want,
             "{ratio}"
         );
@@ -915,13 +962,19 @@ fn the_aspect_table_names_servable_pixels() {
 #[test]
 fn a_nonstandard_size_rounds_to_the_grid_and_clamps_to_the_bounds() {
     assert_eq!(
-        normalize_size("1000x1000").expect("roundable"),
+        normalize_size_default("1000x1000").expect("roundable"),
         (1008, 1008)
     );
-    assert_eq!(normalize_size("996x996").expect("roundable"), (992, 992));
-    assert_eq!(normalize_size("100x100").expect("clamped up"), (256, 256));
     assert_eq!(
-        normalize_size("3000x3000").expect("clamped down"),
+        normalize_size_default("996x996").expect("roundable"),
+        (992, 992)
+    );
+    assert_eq!(
+        normalize_size_default("100x100").expect("clamped up"),
+        (256, 256)
+    );
+    assert_eq!(
+        normalize_size_default("3000x3000").expect("clamped down"),
         (2048, 2048)
     );
 }
@@ -930,8 +983,93 @@ fn a_nonstandard_size_rounds_to_the_grid_and_clamps_to_the_bounds() {
 fn a_string_that_is_neither_size_nor_listed_ratio_is_refused() {
     for value in ["banana", "1024", "1024x", "x1024", "13:7", "", "1:1:1"] {
         assert!(
-            normalize_size(value).is_err(),
+            normalize_size_default(value).is_err(),
             "{value:?} must not name a size"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-model limits: the loaded model, not the server, says what is servable.
+// ---------------------------------------------------------------------------
+
+/// A 32-grid model whose schedule is free and whose defaults are its own.
+const COARSE: ImageLimits = ImageLimits {
+    size_multiple: 32,
+    min_side: 256,
+    max_side: 2048,
+    default_size: (1024, 1024),
+    default_steps: 40,
+    fixed_steps: None,
+};
+
+#[tokio::test]
+async fn a_size_off_the_models_grid_is_refused_naming_the_grid() {
+    for size in ["1000x1000", "1040x1040"] {
+        let (state, log) = state_with_limits(false, COARSE);
+        let (status, body) = post_json(
+            state,
+            "/v1/images/generations",
+            json!({"prompt": "a red door", "size": size}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{size}: {body}");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("multiples of 32"), "{size}: {body}");
+        assert!(log.recorded().is_empty(), "{size}: no job ran");
+    }
+    let (state, log) = state_with_limits(false, COARSE);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "size": "1024x1024"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(log.recorded().len(), 1);
+}
+
+#[tokio::test]
+async fn a_fixed_schedule_refuses_other_step_counts_and_supplies_its_own() {
+    let fixed = ImageLimits {
+        fixed_steps: Some(8),
+        default_steps: 8,
+        ..COARSE
+    };
+    let (state, log) = state_with_limits(false, fixed);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "steps": 4}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["param"], "steps", "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("fixed at 8 steps"), "{body}");
+    assert!(log.recorded().is_empty());
+
+    let (state, log) = state_with_limits(false, fixed);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(log.recorded()[0].steps, 8);
+}
+
+#[tokio::test]
+async fn a_request_that_names_nothing_gets_the_models_own_defaults() {
+    let (state, log) = state_with_limits(false, COARSE);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let job = &log.recorded()[0];
+    assert_eq!((job.width, job.height, job.steps), (1024, 1024, 40));
 }

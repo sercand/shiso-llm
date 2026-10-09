@@ -561,20 +561,14 @@ pub struct ServeArgs {
     pub embedding_max_queue: usize,
     /// Denoising steps a request that names none gets. More is slower and,
     /// past the point the checkpoint was distilled for, not better.
-    #[arg(
-        long,
-        env = "SHISO_IMAGE_DEFAULT_STEPS",
-        default_value_t = crate::image::DEFAULT_STEPS
-    )]
-    pub image_default_steps: u32,
+    /// Unset, the loaded model's own default (or fixed schedule) is used.
+    #[arg(long, env = "SHISO_IMAGE_DEFAULT_STEPS")]
+    pub image_default_steps: Option<u32>,
     /// The image size a request that names none gets, as `WxH`
-    /// (e.g. 1024x1024). Both sides must be divisible by 16.
-    #[arg(
-        long,
-        env = "SHISO_IMAGE_DEFAULT_SIZE",
-        default_value = crate::image::DEFAULT_SIZE
-    )]
-    pub image_default_size: String,
+    /// (e.g. 1024x1024). Both sides must sit on the loaded model's grid and
+    /// within its bounds; unset, the model's own default size is used.
+    #[arg(long, env = "SHISO_IMAGE_DEFAULT_SIZE")]
+    pub image_default_size: Option<String>,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -797,7 +791,7 @@ impl ServeArgs {
         // A generation with no steps has nothing to denoise: the pipeline
         // refuses it by name, and an operator who set the default to zero
         // should hear about it at boot rather than on the first request.
-        if self.image_default_steps == 0 {
+        if self.image_default_steps == Some(0) {
             return Err(ConfigError::Zero {
                 flag: "image-default-steps",
             });
@@ -807,9 +801,13 @@ impl ServeArgs {
         // expensive way. The wire clamps a caller's odd size; an operator's
         // setting is refused rather than quietly rounded, because a default
         // that silently moved is not the default that was configured.
-        if let Err(error) = crate::image::size::parse_exact_size(&self.image_default_size) {
+        // Only the shape is judged here; whether the loaded model's grid and
+        // bounds admit the pixels is judged at boot, when the model is known.
+        if let Some(value) = &self.image_default_size
+            && let Err(error) = crate::image::size::parse_exact_size(value)
+        {
             return Err(ConfigError::BadImageSize {
-                value: self.image_default_size.clone(),
+                value: value.clone(),
                 reason: error.to_string(),
             });
         }
@@ -1009,23 +1007,30 @@ impl ServeArgs {
         ))
     }
 
-    /// The geometry and step count an image request that names none gets.
+    /// The operator's explicit image defaults; a flag left unset stays `None`
+    /// so the loaded model's own value applies.
     ///
     /// # Errors
     ///
     /// [`ConfigError::BadImageSize`] for a size `validate` would already have
     /// refused; the parse is kept fallible so no caller has to assume
     /// `validate` ran.
-    pub fn image_defaults(&self) -> Result<crate::image::ImageDefaults, ConfigError> {
-        let (width, height) = crate::image::size::parse_exact_size(&self.image_default_size)
-            .map_err(|error| ConfigError::BadImageSize {
-                value: self.image_default_size.clone(),
-                reason: error.to_string(),
-            })?;
-        Ok(crate::image::ImageDefaults {
+    pub fn image_overrides(&self) -> Result<crate::image::ImageOverrides, ConfigError> {
+        let size = self
+            .image_default_size
+            .as_deref()
+            .map(|value| {
+                crate::image::size::parse_exact_size(value).map_err(|error| {
+                    ConfigError::BadImageSize {
+                        value: value.to_owned(),
+                        reason: error.to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        Ok(crate::image::ImageOverrides {
             steps: self.image_default_steps,
-            width,
-            height,
+            size,
         })
     }
 

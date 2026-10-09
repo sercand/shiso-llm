@@ -44,21 +44,44 @@ impl FromStr for ImageOutputFormat {
     }
 }
 
+/// What one image model accepts and defaults to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageLimits {
+    /// Width and height must be multiples of this.
+    pub size_multiple: u32,
+    /// Smallest accepted side, in pixels.
+    pub min_side: u32,
+    /// Largest accepted side, in pixels.
+    pub max_side: u32,
+    /// Size used when the request names none.
+    pub default_size: (u32, u32),
+    /// Steps used when the request names none.
+    pub default_steps: u32,
+    /// `Some(n)` when the checkpoint's schedule is fixed: any other step count is refused.
+    pub fixed_steps: Option<u32>,
+}
+
 /// Errors occurring during image generation job preparation or execution.
 #[derive(Debug, thiserror::Error)]
 pub enum ImageGenError {
     /// Prompt text is empty.
     #[error("prompt must not be empty")]
     EmptyPrompt,
-    /// Requested width or height is outside allowed bounds or not divisible by 16.
+    /// Requested width or height is outside the model's bounds or off its grid.
     #[error(
-        "invalid image dimensions {width}x{height}: must be between 256 and 2048 and divisible by 16"
+        "width and height must be multiples of {multiple} between {min} and {max}, got {width}x{height}"
     )]
     InvalidDimensions {
         /// Width in pixels.
         width: u32,
         /// Height in pixels.
         height: u32,
+        /// The grid the model's sides must sit on.
+        multiple: u32,
+        /// The model's smallest side.
+        min: u32,
+        /// The model's largest side.
+        max: u32,
     },
     /// Requested denoising step count is zero: a job with no steps has no
     /// answer to give, so it is the request's fault, not a device failure.
@@ -66,6 +89,16 @@ pub enum ImageGenError {
     InvalidSteps {
         /// The step count as requested.
         steps: u32,
+    },
+    /// The checkpoint's schedule is fixed and the request named another count:
+    /// a distilled schedule run at a different length is a different, worse
+    /// model, so it is refused rather than silently rewritten.
+    #[error("this model's schedule is fixed at {fixed} steps, got {steps}")]
+    StepsFixed {
+        /// The step count as requested.
+        steps: u32,
+        /// The only count the model runs.
+        fixed: u32,
     },
     /// Format is not supported.
     #[error("unsupported image format {0:?}: only png and jpeg are supported")]
@@ -96,9 +129,9 @@ pub struct InputReferenceImage {
 pub struct ImageGenerationJob {
     /// Text description of the desired image.
     pub prompt: String,
-    /// Output width in pixels (divisible by 16).
+    /// Output width in pixels (a multiple of the model's grid).
     pub width: u32,
-    /// Output height in pixels (divisible by 16).
+    /// Output height in pixels (a multiple of the model's grid).
     pub height: u32,
     /// Number of denoising inference steps.
     pub steps: u32,
@@ -113,29 +146,39 @@ pub struct ImageGenerationJob {
 }
 
 impl ImageGenerationJob {
-    /// Validates prompt content, dimension constraints and the step count.
+    /// Validates prompt content, the dimensions against the model's grid and
+    /// bounds, and the step count against its schedule.
     ///
     /// # Errors
-    /// Returns [`ImageGenError::EmptyPrompt`], [`ImageGenError::InvalidDimensions`]
-    /// or [`ImageGenError::InvalidSteps`].
-    pub fn validate(&self) -> Result<(), ImageGenError> {
+    /// Returns [`ImageGenError::EmptyPrompt`], [`ImageGenError::InvalidDimensions`],
+    /// [`ImageGenError::InvalidSteps`] or [`ImageGenError::StepsFixed`].
+    pub fn validate(&self, limits: &ImageLimits) -> Result<(), ImageGenError> {
         if self.prompt.trim().is_empty() {
             return Err(ImageGenError::EmptyPrompt);
         }
-        if self.width < 256
-            || self.width > 2048
-            || self.height < 256
-            || self.height > 2048
-            || !self.width.is_multiple_of(16)
-            || !self.height.is_multiple_of(16)
-        {
+        let side_ok = |side: u32| {
+            (limits.min_side..=limits.max_side).contains(&side)
+                && side.is_multiple_of(limits.size_multiple)
+        };
+        if !side_ok(self.width) || !side_ok(self.height) {
             return Err(ImageGenError::InvalidDimensions {
                 width: self.width,
                 height: self.height,
+                multiple: limits.size_multiple,
+                min: limits.min_side,
+                max: limits.max_side,
             });
         }
         if self.steps == 0 {
             return Err(ImageGenError::InvalidSteps { steps: self.steps });
+        }
+        if let Some(fixed) = limits.fixed_steps
+            && self.steps != fixed
+        {
+            return Err(ImageGenError::StepsFixed {
+                steps: self.steps,
+                fixed,
+            });
         }
         Ok(())
     }
@@ -173,6 +216,9 @@ pub struct ImageStepEvent {
 pub trait ImageGenerator: Send + Sync + fmt::Debug {
     /// Stable model identifier reported to clients.
     fn model_id(&self) -> &str;
+
+    /// What this model accepts and defaults to.
+    fn limits(&self) -> ImageLimits;
 
     /// Generates an image, optionally emitting step progress.
     ///

@@ -662,12 +662,12 @@ fn mtp_exact_sampling_flag_sets_exact_sampling() {
 
 /// The default image size is parsed at boot, not at request time: an operator
 /// who typed `--image-default-size banana` must hear about it before the first
-/// caller does. The wire clamps a caller's odd size; an operator's setting is
-/// refused rather than quietly rounded, because a default that silently moved
-/// is not the default that was configured.
+/// caller does. Only its shape is judged here; the grid and bounds belong to
+/// the loaded model and are checked when it loads
+/// (`ImageOverrides::resolve`).
 #[test]
-fn an_unservable_image_default_size_refuses_boot() {
-    for value in ["banana", "1024", "1000x1000", "100x100", "3000x3000"] {
+fn a_malformed_image_default_size_refuses_boot() {
+    for value in ["banana", "1024", "0x1024", "2K", "auto"] {
         let args = parse(&[
             "--image-model",
             "/models/flux",
@@ -697,14 +697,12 @@ fn the_image_defaults_parse_from_the_flags_that_set_them() {
     ])
     .expect("it parses");
     args.validate().expect("a servable default");
-    let defaults = args.image_defaults().expect("the size parses");
-    assert_eq!((defaults.width, defaults.height), (768, 1344));
-    assert_eq!(defaults.steps, 8);
+    let overrides = args.image_overrides().expect("the size parses");
+    assert_eq!(overrides.size, Some((768, 1344)));
+    assert_eq!(overrides.steps, Some(8));
 
+    // Unset flags stay unset: the loaded model's own defaults apply.
     let args = parse(&["--image-model", "/models/flux"]).expect("it parses");
-    let defaults = args.image_defaults().expect("the defaults parse");
-    assert_eq!(
-        (defaults.width, defaults.height, defaults.steps),
-        (1024, 1024, 4)
-    );
+    let overrides = args.image_overrides().expect("nothing to parse");
+    assert_eq!((overrides.size, overrides.steps), (None, None));
 }

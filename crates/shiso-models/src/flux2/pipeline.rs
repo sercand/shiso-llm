@@ -21,11 +21,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use image::ImageEncoder as _;
 use shiso_core::Backend;
 use shiso_vision::generator::{
-    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat,
-    ImageStepEvent,
+    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits,
+    ImageOutputFormat, ImageStepEvent,
 };
 
 use super::config::{Flux2Located, Flux2Params};
@@ -34,6 +33,7 @@ use super::scheduler::new_scheduler;
 use super::text_encoder::TextEncoder;
 use super::transformer::{DiT, DiTInput, KvMode};
 use super::vae::Vae;
+use crate::diffusion::encode::{Channels, encode_image as encode_rgb8};
 use crate::diffusion::ops::Ops;
 use crate::diffusion::weights::StStore;
 
@@ -289,6 +289,19 @@ impl ImageGenerator for Flux2KleinModel {
         &self.model_id
     }
 
+    fn limits(&self) -> ImageLimits {
+        // The grid is the 8x VAE times the 2x2 latent patch; the bounds and
+        // the 4-step default are what the distilled checkpoint was served at.
+        ImageLimits {
+            size_multiple: 16,
+            min_side: 256,
+            max_side: 2048,
+            default_size: (1024, 1024),
+            default_steps: 4,
+            fixed_steps: None,
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one full generation: tokenize, noise, positions, the Euler loop, decode and encode, straight-line by construction"
@@ -306,7 +319,7 @@ impl ImageGenerator for Flux2KleinModel {
         job: &ImageGenerationJob,
         progress: Option<&dyn Fn(ImageStepEvent)>,
     ) -> Result<GeneratedImage, ImageGenError> {
-        job.validate()?;
+        job.validate(&self.limits())?;
         if job.steps == 0 {
             return Err(ImageGenError::Backend(
                 "steps must be at least one".to_string(),
@@ -457,7 +470,7 @@ impl ImageGenerator for Flux2KleinModel {
                         self.ops
                             .download("pipeline progress", latents.view(), latent_count)?;
                     let rgb = self.vae.decode(&self.ops, &host, w, h)?;
-                    let bytes = encode_image(&rgb, w, h, ImageOutputFormat::Png, None)?;
+                    let bytes = encode_planar(&rgb, w, h, ImageOutputFormat::Png, None)?;
                     tracing::info!(
                         step = i + 1,
                         seconds = phase.elapsed().as_secs_f64(),
@@ -488,7 +501,7 @@ impl ImageGenerator for Flux2KleinModel {
             "image latents decoded"
         );
         let phase = Instant::now();
-        let bytes = encode_image(&rgb, w, h, job.output_format, job.output_compression)?;
+        let bytes = encode_planar(&rgb, w, h, job.output_format, job.output_compression)?;
         tracing::info!(
             seconds = phase.elapsed().as_secs_f64(),
             total_seconds = began.elapsed().as_secs_f64(),
@@ -567,7 +580,7 @@ fn load_chat_template(tokenizer_dir: Option<&Path>) -> Result<String, ImageGenEr
     clippy::cast_sign_loss,
     reason = "colour samples are clamped to [0, 255] before the u8 cast, so they are non-negative"
 )]
-fn encode_image(
+fn encode_planar(
     rgb: &[f32],
     width: usize,
     height: usize,
@@ -591,35 +604,12 @@ fn encode_image(
             clamp8(&rgb[2 * plane + i]),
         ]);
     }
-    let buffer = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(
+    encode_rgb8(
+        &pixels,
         width as u32,
         height as u32,
-        pixels,
+        Channels::Rgb,
+        format,
+        compression,
     )
-    .ok_or_else(|| ImageGenError::Encoding("pixel buffer does not match dimensions".to_string()))?;
-    let mut out = Vec::new();
-    match format {
-        ImageOutputFormat::Png => {
-            image::codecs::png::PngEncoder::new(&mut out)
-                .write_image(
-                    buffer.as_raw(),
-                    width as u32,
-                    height as u32,
-                    image::ExtendedColorType::Rgb8,
-                )
-                .map_err(|e| ImageGenError::Encoding(format!("png: {e}")))?;
-        }
-        ImageOutputFormat::Jpeg => {
-            let quality = compression.unwrap_or(90).clamp(1, 100) as u8;
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
-                .write_image(
-                    buffer.as_raw(),
-                    width as u32,
-                    height as u32,
-                    image::ExtendedColorType::Rgb8,
-                )
-                .map_err(|e| ImageGenError::Encoding(format!("jpeg: {e}")))?;
-        }
-    }
-    Ok(out)
 }

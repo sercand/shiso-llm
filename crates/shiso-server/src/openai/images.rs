@@ -84,7 +84,7 @@ async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
     // size or output format is a 400 with no generator loaded too, so the 503
     // is reserved for a well-formed request this server could have run.
     parsed.validate()?;
-    let plan = Plan::from_wire(&parsed, state)?;
+    let plan = Plan::from_wire(&parsed, state.image.as_ref())?;
     let service = state.image()?;
     if let Some(quality) = parsed.quality.as_deref() {
         tracing::debug!(
@@ -142,7 +142,14 @@ impl Plan {
     ///
     /// [`AppError::BadRequest`] for a size string neither shape, and for an
     /// output format the generator does not encode.
-    fn from_wire(parsed: &ImageGenerationRequest, state: &AppState) -> Result<Self, AppError> {
+    fn from_wire(
+        parsed: &ImageGenerationRequest,
+        service: Option<&ImageService>,
+    ) -> Result<Self, AppError> {
+        // With no model loaded the request is still judged for shape, against
+        // the published limits, so a malformed one stays a 400 ahead of the 503.
+        let limits = service.map_or(image::UNLOADED_LIMITS, |s| *s.limits());
+        let defaults = service.map_or_else(|| image::ImageDefaults::of(&limits), |s| *s.defaults());
         // `auto` is an omitted size: the caller is asking for this server's
         // default, which is exactly what an omitted size gets. It is read
         // out here rather than in the grammar because the grammar has no
@@ -152,12 +159,11 @@ impl Plan {
             // `size` wins when both are named: it is the more specific of the
             // two, and a client that sends both wants the pixels it spelled.
             (Some(value), _) => {
-                size::normalize_size(value).map_err(|error| size_error(&error, "size"))?
+                size::normalize_size(value, &limits).map_err(|error| size_error(&error, "size"))?
             }
-            (None, Some(value)) => {
-                size::normalize_size(value).map_err(|error| size_error(&error, "aspect_ratio"))?
-            }
-            (None, None) => (state.image_defaults.width, state.image_defaults.height),
+            (None, Some(value)) => size::normalize_size(value, &limits)
+                .map_err(|error| size_error(&error, "aspect_ratio"))?,
+            (None, None) => (defaults.width, defaults.height),
         };
         // The generator's own format parser is the one authority on what it
         // encodes; its refusal is the request's fault and names the field.
@@ -171,7 +177,7 @@ impl Plan {
             prompt: parsed.prompt.clone(),
             width,
             height,
-            steps: parsed.steps.unwrap_or(state.image_defaults.steps),
+            steps: parsed.steps.unwrap_or(defaults.steps),
             // A named seed makes the request reproducible and image `i` of it
             // gets `seed + i`; an unnamed one draws a base from the process's
             // one entropy source so the `n` images of one request differ.

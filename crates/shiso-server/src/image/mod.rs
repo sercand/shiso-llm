@@ -24,27 +24,21 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use shiso_vision::generator::{
-    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageStepEvent,
+    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits, ImageStepEvent,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::AppError;
 
-/// Denoising steps a request that names none gets unless `--image-default-steps`
-/// says otherwise.
-pub const DEFAULT_STEPS: u32 = 4;
-
-/// The size a request that names none gets unless `--image-default-size` says
-/// otherwise, in the `WxH` spelling the flag takes.
-pub const DEFAULT_SIZE: &str = "1024x1024";
-
 /// What an image request that names no geometry or step count gets.
 ///
 /// The server-side counterpart of the wire's optional `size` and
-/// `aspect_ratio`: the operator chooses these once at boot
-/// (`--image-default-size`, `--image-default-steps`) and a caller that names
-/// nothing inherits them, exactly as a caller that names no temperature
-/// inherits [`AppState::sampling_preset`](crate::state::AppState::sampling_preset).
+/// `aspect_ratio`: the loaded model's [`ImageLimits`] say what it was built to
+/// run at, and the operator may move either value at boot
+/// (`--image-default-size`, `--image-default-steps`) through
+/// [`ImageOverrides`]. A caller that names nothing inherits the result,
+/// exactly as a caller that names no temperature inherits
+/// [`AppState::sampling_preset`](crate::state::AppState::sampling_preset).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageDefaults {
     /// Denoising steps.
@@ -55,20 +49,112 @@ pub struct ImageDefaults {
     pub height: u32,
 }
 
-impl Default for ImageDefaults {
-    /// The published defaults: [`DEFAULT_STEPS`] and the parsed form of
-    /// [`DEFAULT_SIZE`], so the flag's published spelling and the struct's
-    /// default are one fact by construction rather than by test.
-    fn default() -> Self {
-        let (width, height) = size::parse_exact_size(DEFAULT_SIZE)
-            .expect("the published default size is servable by its own grammar");
+impl ImageDefaults {
+    /// What the model itself defaults to: its fixed schedule when it has one,
+    /// else its default step count, and its default size.
+    #[must_use]
+    pub fn of(limits: &ImageLimits) -> Self {
         Self {
-            steps: DEFAULT_STEPS,
-            width,
-            height,
+            steps: limits.fixed_steps.unwrap_or(limits.default_steps),
+            width: limits.default_size.0,
+            height: limits.default_size.1,
         }
     }
 }
+
+/// The operator's explicit choices, each `None` when the flag was not given.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImageOverrides {
+    /// `--image-default-steps`.
+    pub steps: Option<u32>,
+    /// `--image-default-size`, already parsed.
+    pub size: Option<(u32, u32)>,
+}
+
+/// An operator override the loaded model cannot honour.
+///
+/// Refused at boot rather than clamped: a default that silently moved is not
+/// the default that was configured, and one the model refuses would fail
+/// every request that relied on it.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum OverrideError {
+    /// The size is off the model's grid or outside its bounds.
+    #[error(
+        "--image-default-size {width}x{height} is not servable by this model: both sides must be \
+         a multiple of {multiple} within {min}..={max}"
+    )]
+    Size {
+        /// Width as configured.
+        width: u32,
+        /// Height as configured.
+        height: u32,
+        /// The model's grid.
+        multiple: u32,
+        /// The model's smallest side.
+        min: u32,
+        /// The model's largest side.
+        max: u32,
+    },
+    /// The model runs one schedule and the flag names another.
+    #[error(
+        "--image-default-steps {steps} contradicts this model's fixed schedule of {fixed} steps"
+    )]
+    Steps {
+        /// Steps as configured.
+        steps: u32,
+        /// The only count the model runs.
+        fixed: u32,
+    },
+}
+
+impl ImageOverrides {
+    /// The model's defaults with these overrides applied.
+    ///
+    /// # Errors
+    ///
+    /// [`OverrideError`] when an override is one the model would refuse.
+    pub fn resolve(self, limits: &ImageLimits) -> Result<ImageDefaults, OverrideError> {
+        let mut defaults = ImageDefaults::of(limits);
+        if let Some((width, height)) = self.size {
+            let side_ok = |side: u32| {
+                (limits.min_side..=limits.max_side).contains(&side)
+                    && side.is_multiple_of(limits.size_multiple)
+            };
+            if !side_ok(width) || !side_ok(height) {
+                return Err(OverrideError::Size {
+                    width,
+                    height,
+                    multiple: limits.size_multiple,
+                    min: limits.min_side,
+                    max: limits.max_side,
+                });
+            }
+            defaults.width = width;
+            defaults.height = height;
+        }
+        if let Some(steps) = self.steps {
+            if let Some(fixed) = limits.fixed_steps
+                && steps != fixed
+            {
+                return Err(OverrideError::Steps { steps, fixed });
+            }
+            defaults.steps = steps;
+        }
+        Ok(defaults)
+    }
+}
+
+/// The limits the size grammar judges a request against when no image model
+/// is loaded: the request is still refused as malformed before the 503, and
+/// no model exists to ask.
+pub const UNLOADED_LIMITS: ImageLimits = ImageLimits {
+    size_multiple: 16,
+    min_side: 256,
+    max_side: 2048,
+    default_size: (1024, 1024),
+    default_steps: 4,
+    fixed_steps: None,
+};
 
 /// A queued generation and where its answer and its progress go.
 #[derive(Debug)]
@@ -96,6 +182,8 @@ pub struct ImageServiceDesc {
 pub struct ImageService {
     tx: mpsc::Sender<Queued>,
     model_id: String,
+    limits: ImageLimits,
+    defaults: ImageDefaults,
 }
 
 impl ImageService {
@@ -114,14 +202,40 @@ impl ImageService {
         // and `ServeArgs::validate` is what refuses `--image-max-queue 0`
         // for the operator's path.
         let (tx, rx) = mpsc::channel(desc.max_queue.max(1));
+        let limits = desc.generator.limits();
         let service = Self {
             tx,
             model_id: desc.model_id.clone(),
+            limits,
+            defaults: ImageDefaults::of(&limits),
         };
         std::thread::Builder::new()
             .name("shiso-image".to_owned())
             .spawn(move || worker::run_worker(&desc, rx))?;
         Ok(service)
+    }
+
+    /// The same service with the operator's default size and step count
+    /// applied over the model's own.
+    ///
+    /// # Errors
+    ///
+    /// [`OverrideError`] for an override the model would refuse.
+    pub fn with_overrides(mut self, overrides: ImageOverrides) -> Result<Self, OverrideError> {
+        self.defaults = overrides.resolve(&self.limits)?;
+        Ok(self)
+    }
+
+    /// What the loaded model accepts.
+    #[must_use]
+    pub const fn limits(&self) -> &ImageLimits {
+        &self.limits
+    }
+
+    /// What a request that names no size or steps gets.
+    #[must_use]
+    pub const fn defaults(&self) -> &ImageDefaults {
+        &self.defaults
     }
 
     /// The name the generator answers to on the wire.
@@ -192,7 +306,7 @@ impl ImageService {
     ) -> Result<ImageAnswer, AppError> {
         // Checked before the queue: a job the generator would refuse must not
         // cost a waiting slot.
-        job.validate().map_err(refuse)?;
+        job.validate(&self.limits).map_err(refuse)?;
         let (reply, answer) = oneshot::channel();
         // `try_send`, not `send`: a full queue is refused now rather than
         // awaited, because an image that arrives behind a queue nobody
@@ -230,7 +344,7 @@ pub type ImageAnswer = Pin<Box<dyn Future<Output = Result<GeneratedImage, AppErr
 /// The HTTP failure an [`ImageGenError`] answers with.
 ///
 /// The generator's caller-side refusals (a blank prompt, dimensions off the
-/// 16-grid, a zero step count, a format it does not encode, undecodable
+/// model's grid, a step count off its schedule, a zero step count, a format it does not encode, undecodable
 /// reference bytes) are the request's fault and answer 400; its device-side
 /// failures (compute, encoding, a checkpoint that went bad) are this
 /// server's fault and answer 500 with the cause kept as a real source for
@@ -245,7 +359,7 @@ pub fn refuse(error: ImageGenError) -> AppError {
         ImageGenError::InvalidDimensions { .. } => {
             AppError::bad_request(message, Some("size"), "invalid_request")
         }
-        ImageGenError::InvalidSteps { .. } => {
+        ImageGenError::InvalidSteps { .. } | ImageGenError::StepsFixed { .. } => {
             AppError::bad_request(message, Some("steps"), "invalid_request")
         }
         ImageGenError::UnsupportedFormat(_) => {
@@ -279,17 +393,68 @@ struct GeneratorPanicked;
 
 #[cfg(test)]
 mod tests {
-    use super::ImageDefaults;
+    use shiso_vision::generator::ImageLimits;
 
-    /// The defaults a booted server and a test-built state both hand to a
-    /// name-nothing request are the pixels and the step count the CLI help
-    /// publishes. The struct derives them from `DEFAULT_SIZE` and
-    /// `DEFAULT_STEPS`, so what this pins is those constants themselves: a
-    /// change here has to be a deliberate edit of the published values.
+    use super::{ImageDefaults, ImageOverrides, OverrideError};
+
+    const LIMITS: ImageLimits = ImageLimits {
+        size_multiple: 32,
+        min_side: 256,
+        max_side: 2048,
+        default_size: (1024, 1024),
+        default_steps: 40,
+        fixed_steps: None,
+    };
+
+    /// With no flag given, the model's own numbers are the defaults, and a
+    /// fixed schedule wins over its default step count.
     #[test]
-    fn the_default_defaults_are_the_published_ones() {
-        let defaults = ImageDefaults::default();
-        assert_eq!((defaults.width, defaults.height), (1024, 1024));
-        assert_eq!(defaults.steps, 4);
+    fn the_model_supplies_the_defaults_when_no_flag_is_given() {
+        let defaults = ImageOverrides::default().resolve(&LIMITS).expect("none");
+        assert_eq!(
+            defaults,
+            ImageDefaults {
+                steps: 40,
+                width: 1024,
+                height: 1024
+            }
+        );
+        let fixed = ImageLimits {
+            fixed_steps: Some(8),
+            ..LIMITS
+        };
+        assert_eq!(ImageDefaults::of(&fixed).steps, 8);
+    }
+
+    /// An explicit flag moves the default but not past what the model accepts.
+    #[test]
+    fn an_override_the_model_would_refuse_is_refused_at_boot() {
+        let moved = ImageOverrides {
+            steps: Some(12),
+            size: Some((768, 1344)),
+        }
+        .resolve(&LIMITS)
+        .expect("servable");
+        assert_eq!((moved.steps, moved.width, moved.height), (12, 768, 1344));
+        let off_grid = ImageOverrides {
+            size: Some((1008, 1008)),
+            ..ImageOverrides::default()
+        };
+        assert!(matches!(
+            off_grid.resolve(&LIMITS),
+            Err(OverrideError::Size { multiple: 32, .. })
+        ));
+        let fixed = ImageLimits {
+            fixed_steps: Some(8),
+            ..LIMITS
+        };
+        let wrong_steps = ImageOverrides {
+            steps: Some(4),
+            ..ImageOverrides::default()
+        };
+        assert_eq!(
+            wrong_steps.resolve(&fixed),
+            Err(OverrideError::Steps { steps: 4, fixed: 8 })
+        );
     }
 }

@@ -15,6 +15,7 @@ use shiso_modelfile::st_header::{RawTensor, Shard, StDType};
 use shiso_vision::generator::ImageGenError;
 
 use crate::diffusion::weights::count_blocks_internal;
+use crate::image_registry::ImageModelDesc;
 
 /// Hyperparameters for the diffusion transformer architecture.
 #[derive(Debug, Clone, PartialEq)]
@@ -61,21 +62,6 @@ pub struct Flux2Located {
     pub tokenizer_path: PathBuf,
     /// Discovered model parameters.
     pub params: Flux2Params,
-}
-
-/// What an image model checkpoint is described with at load time.
-#[derive(Debug, Clone)]
-pub struct ImageModelDesc {
-    /// Transformer weights path (file or directory).
-    pub model_path: PathBuf,
-    /// Path to text encoder checkpoint (or directory containing `text_encoder`).
-    pub text_encoder_path: Option<PathBuf>,
-    /// Path to VAE checkpoint (or directory containing vae).
-    pub vae_path: Option<PathBuf>,
-    /// Path to tokenizer directory or tokenizer.json.
-    pub tokenizer_path: Option<PathBuf>,
-    /// Optional directory to search for shared companion assets.
-    pub assets_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,5 +1,15 @@
 use super::*;
+use crate::generator::ImageLimits;
 use shiso_core::ids::Seed;
+
+const LIMITS: ImageLimits = ImageLimits {
+    size_multiple: 16,
+    min_side: 256,
+    max_side: 2048,
+    default_size: (1024, 1024),
+    default_steps: 4,
+    fixed_steps: None,
+};
 
 #[test]
 fn output_format_mime_types() {
@@ -37,7 +47,7 @@ fn job_dimension_validation() {
         output_compression: None,
         input_references: Vec::new(),
     };
-    assert!(job.validate().is_ok());
+    assert!(job.validate(&LIMITS).is_ok());
 
     let invalid_job = ImageGenerationJob {
         prompt: String::new(),
@@ -50,7 +60,7 @@ fn job_dimension_validation() {
         input_references: Vec::new(),
     };
     assert!(matches!(
-        invalid_job.validate(),
+        invalid_job.validate(&LIMITS),
         Err(ImageGenError::EmptyPrompt)
     ));
 }
@@ -71,7 +81,53 @@ fn job_refuses_a_zero_step_count_as_invalid_input() {
         input_references: Vec::new(),
     };
     assert!(matches!(
-        job.validate(),
+        job.validate(&LIMITS),
         Err(ImageGenError::InvalidSteps { steps: 0 })
     ));
+}
+
+fn job_of(width: u32, height: u32, steps: u32) -> ImageGenerationJob {
+    ImageGenerationJob {
+        prompt: "test prompt".to_string(),
+        width,
+        height,
+        steps,
+        seed: Seed::new(42),
+        output_format: ImageOutputFormat::Png,
+        output_compression: None,
+        input_references: Vec::new(),
+    }
+}
+
+#[test]
+fn dimensions_are_judged_against_the_models_grid_and_bounds() {
+    let coarse = ImageLimits {
+        size_multiple: 32,
+        ..LIMITS
+    };
+    let error = job_of(1000, 1000, 4)
+        .validate(&coarse)
+        .expect_err("off the grid");
+    assert_eq!(
+        error.to_string(),
+        "width and height must be multiples of 32 between 256 and 2048, got 1000x1000"
+    );
+    assert!(job_of(1008, 1008, 4).validate(&LIMITS).is_ok());
+    assert!(job_of(1008, 1008, 4).validate(&coarse).is_err());
+    assert!(job_of(2064, 1024, 4).validate(&LIMITS).is_err());
+    assert!(job_of(128, 1024, 4).validate(&LIMITS).is_err());
+}
+
+#[test]
+fn a_fixed_schedule_refuses_any_other_step_count() {
+    let fixed = ImageLimits {
+        fixed_steps: Some(8),
+        ..LIMITS
+    };
+    let error = job_of(1024, 1024, 4).validate(&fixed).expect_err("fixed");
+    assert_eq!(
+        error.to_string(),
+        "this model's schedule is fixed at 8 steps, got 4"
+    );
+    assert!(job_of(1024, 1024, 8).validate(&fixed).is_ok());
 }

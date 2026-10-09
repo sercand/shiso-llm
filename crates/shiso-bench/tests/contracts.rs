@@ -45,11 +45,11 @@ use shiso_core::{Backend, DeviceView, Model};
 use shiso_engine::{Checkpointed, Reason, ResumeInfo, ResumeSource, SaveOutcome};
 use shiso_ir::Usage;
 use shiso_kvstore::{CommitOpts, Frontier, KvCache, KvError, Lookup, PersistOutcome, Resume};
-use shiso_models::flux2::config::ImageModelDesc;
+use shiso_models::image_registry::{ImageFamily, ImageModelDesc};
 use shiso_server::tokenizer::{TokenizerError, Vocabulary};
 use shiso_vision::generator::{
-    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat,
-    ImageStepEvent, InputReferenceImage,
+    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits,
+    ImageOutputFormat, ImageStepEvent, InputReferenceImage,
 };
 
 use shiso_hub::{HostProfile, HubError, ModelRef, ProgressEvent, Recipe};
@@ -391,6 +391,26 @@ type Generate = fn(
 ) -> Result<GeneratedImage, ImageGenError>;
 const _: Generate = <dyn ImageGenerator>::generate;
 
+/// What the model accepts and defaults to: the trait's required method, the
+/// struct's six fields, and the family detector the registry dispatches on.
+const _: fn(&(dyn ImageGenerator + 'static)) -> ImageLimits = <dyn ImageGenerator>::limits;
+type ImageLimitsFields = (u32, u32, u32, (u32, u32), u32, Option<u32>);
+fn image_limits_fields(limits: ImageLimits) -> ImageLimitsFields {
+    (
+        limits.size_multiple,
+        limits.min_side,
+        limits.max_side,
+        limits.default_size,
+        limits.default_steps,
+        limits.fixed_steps,
+    )
+}
+const _: fn(ImageLimits) -> ImageLimitsFields = image_limits_fields;
+const _: fn(&ImageGenerationJob, &ImageLimits) -> Result<(), ImageGenError> =
+    ImageGenerationJob::validate;
+const _: fn(&ImageModelDesc) -> Result<ImageFamily, ImageGenError> =
+    shiso_models::image_registry::detect_image_family;
+
 /// A job read apart: prompt, pixel dimensions and step count as u32, the
 /// core `Seed` newtype rather than a raw integer the pipeline would have to
 /// reinterpret, the requested encoding, and any reference images for
@@ -454,7 +474,17 @@ const _: fn(shiso_server::image::ImageServiceDesc) -> ImageServiceDescFields =
 fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
     match error {
         ImageGenError::EmptyPrompt => (0, 0, 0),
-        ImageGenError::InvalidDimensions { width, height } => (1, *width, *height),
+        ImageGenError::InvalidDimensions {
+            width,
+            height,
+            multiple,
+            min,
+            max,
+        } => {
+            let _: (&u32, &u32, &u32) = (multiple, min, max);
+            (1, *width, *height)
+        }
+        ImageGenError::StepsFixed { steps, fixed } => (8, *steps, *fixed),
         ImageGenError::InvalidSteps { steps } => (7, *steps, 0),
         ImageGenError::UnsupportedFormat(msg) => {
             let _: &String = msg;

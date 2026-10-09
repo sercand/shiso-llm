@@ -156,9 +156,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         state = state.with_audio(audio);
     }
     if let Some(image) = image {
-        state = state
-            .with_image(image)
-            .with_image_defaults(args.image_defaults()?);
+        state = state.with_image(image);
     }
 
     shutdown::install();
@@ -296,7 +294,7 @@ pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService
     };
     let backend = open_image_backend(args)?;
     let started = std::time::Instant::now();
-    let desc = shiso_models::flux2::config::ImageModelDesc {
+    let desc = shiso_models::image_registry::ImageModelDesc {
         model_path: path.to_path_buf(),
         text_encoder_path: args.image_text_encoder.clone(),
         vae_path: args.image_vae.clone(),
@@ -324,6 +322,11 @@ pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService
         max_queue: args.image_max_queue,
     })
     .context("starting image service worker")?;
+    // The operator's flags are judged against the model that actually loaded:
+    // a default the model would refuse on every request is refused here.
+    let service = service
+        .with_overrides(args.image_overrides()?)
+        .context("--image-default-size / --image-default-steps")?;
     Ok(Some(service))
 }
 

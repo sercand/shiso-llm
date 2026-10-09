@@ -24,6 +24,8 @@ pub mod embedding_gemma2;
 pub mod flux2;
 pub mod gemma4;
 pub mod image_registry;
+#[cfg(test)]
+mod image_registry_tests;
 pub mod nemotron_asr;
 pub mod nemotron_diar;
 pub mod nemotron_h;
