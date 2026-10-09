@@ -36,6 +36,9 @@
 //! - [`DType::IQ4_XS`]: 4-bit indices into [`crate::quant_tables::IQ4NL_VALUES`]
 //!   with 6-bit sub-block scales split across two planes, offset so that 32
 //!   means "no scaling" (`d * (ls - 32)`).
+//!
+//! The block structs are read as native-endian integers, so the decoders
+//! assume a little-endian host.
 
 use half::f16;
 use shiso_core::DType;
@@ -49,6 +52,10 @@ use crate::quant_tables::{
     KMASK_IQ2XS, KSIGNS_IQ2XS,
 };
 use crate::reader::GgufError;
+
+/// The decoders read block structs as native-endian integers; a big-endian
+/// host would have to swap every field.
+const _: () = assert!(cfg!(target_endian = "little"));
 
 /// The subject the errors in this module name.
 const SUBJECT: &str = "i-quant block";

@@ -37,7 +37,7 @@ pub enum DType {
     Q6_K = 14,
     /// K-quant 8-bit, 256 elements per block.
     Q8_K = 15,
-    /// 2-bit i-quant, extra-small, 256 elements per block.
+    /// 2-bit i-quant, extra-extra-small, 256 elements per block.
     IQ2_XXS = 16,
     /// 2-bit i-quant, extra-small, 256 elements per block: the wider sibling
     /// of [`DType::IQ2_XXS`].

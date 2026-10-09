@@ -207,8 +207,8 @@ impl QuantBlock for BlockIq2Xxs {
     const ELEMS: usize = QK_K;
 }
 
-/// 2-bit `i`-quant, small: an fp16 scale, grid indices with the sign folded
-/// into each index word, and 4-bit sub-block scales.
+/// 2-bit `i`-quant, extra-small: an fp16 scale, grid indices with the sign
+/// folded into each index word, and 4-bit sub-block scales.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BlockIq2Xs {

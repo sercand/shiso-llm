@@ -78,7 +78,7 @@ constant const ulong IQ2XXS_GRID[256] = {
     0x2b2b082b08080808ul, 0x2b2b190808192b08ul, 0x2b2b2b0819190808ul, 0x2b2b2b1908081908ul,
 };
 
-/// Weight grid for the 2-bit small format: eight packed weights an index.
+/// Weight grid for the 2-bit extra-small format: eight packed weights an index.
 constant const ulong IQ2XS_GRID[512] = {
     0x0808080808080808ul, 0x080808080808082bul, 0x0808080808081919ul, 0x0808080808082b08ul,
     0x0808080808082b2bul, 0x0808080808190819ul, 0x0808080808191908ul, 0x080808080819192bul,
@@ -1091,12 +1091,12 @@ constant const ulong IQ1S_GRID[2048] = {
 };
 
 /// The 4-bit non-linear codebook, indexed by a nibble.
-constant const char IQ4NL[16] = {
+alignas(8) constant const char IQ4NL[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
 
 /// Sign patterns for the 2-bit format, indexed by the high byte of a grid pair.
-constant const uchar KSIGNS_IQ2XS[128] = {
+alignas(8) constant const uchar KSIGNS_IQ2XS[128] = {
     0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
     144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
     160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,

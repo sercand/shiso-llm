@@ -2616,7 +2616,8 @@ mod tests {
                     assert_eq!(
                         ext_name_for(dtype, r1ptg, nxpsg, true),
                         Some(want.as_str()),
-                        "{dtype:?} at {r1ptg} rows and {nxpsg} lanes must name the                          instantiation the CUDA generic set exports"
+                        "{dtype:?} at {r1ptg} rows and {nxpsg} lanes must name the \
+                         instantiation the CUDA generic set exports"
                     );
                 }
             }

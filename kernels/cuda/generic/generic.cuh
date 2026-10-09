@@ -1933,7 +1933,7 @@ __device__ __forceinline__ float shiso_iq_sign(unsigned char signs, int j) {
 /* Sub-block `s` (32 weights) of a q2_K block as dequantized weights.
  *
  * q2_K stores its weights plane by plane, not in subblock order: the 16
- * weights of subblock `16*(4*plane + 2*j + h)` sit at byte `32*plane + 16*h`
+ * weights of subblock `16*(8*plane + 2*j + h)` sit at byte `32*plane + 16*h`
  * of `qs` in bit field `2*j`, and take scale byte `8*plane + 2*j + h` as
  * `d * (sc & 0xF) * q - dmin * (sc >> 4)`. A 32-weight lane is one `j` of
  * one plane, so it reads 32 bytes at a fixed shift and two scale bytes. */

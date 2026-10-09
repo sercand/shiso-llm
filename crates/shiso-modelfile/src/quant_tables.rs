@@ -302,6 +302,7 @@ pub const IQ2XXS_GRID: [u64; 256] = [
 /// Sign patterns as full-byte masks: each entry expands the eight sign bits
 /// of one [`KSIGNS_IQ2XS`] pattern to `0xff` per negative lane and `0x00`
 /// otherwise, packed into a `u64` a kernel can apply as a mask.
+/// This mask-form twin is consumed by the table-equality grading, not by a decoder.
 #[expect(
     clippy::unreadable_literal,
     reason = "each word is packed lanes and the table is reproduced verbatim"
