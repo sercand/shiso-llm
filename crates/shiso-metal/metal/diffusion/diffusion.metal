@@ -1598,7 +1598,7 @@ static inline half4 dit_half4_sat(float4 v) {
         ushort lane [[thread_index_in_simdgroup]], \
         ushort sg [[simdgroup_index_in_threadgroup]]
 
-template <bool CAUSAL, uint RB, uint NSG, uint HD>
+template <bool CAUSAL, uint RB, uint NSG, uint HD, bool UNIT_SCALE = false>
 kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
     const uint QR = 8u * RB * NSG;
     const uint KB = DIT_FA_KEYS;
@@ -1623,7 +1623,8 @@ kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
     if (h >= args.heads) {
         return;
     }
-    const float scale = 1.0f / sqrt(float(hd));
+    // A query-key-normed tower (the vision encoders) attends at scale one.
+    const float scale = UNIT_SCALE ? 1.0f : 1.0f / sqrt(float(hd));
 
     // The lane's place in every 8x8 fragment: columns `fn, fn + 1` of row
     // `fr`; the four lanes sharing a row differ in lane bits 0 and 3.
@@ -1796,6 +1797,9 @@ kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 128u>(DIT_FLASH_S
 
 template [[host_name("kernel_dit_flash_sdpa_causal_d128_f32")]]
 kernel void kernel_dit_flash_sdpa<true, DIT_FA_RB, DIT_FA_SG, 128u>(DIT_FLASH_SDPA_PARAMS);
+
+template [[host_name("kernel_dit_flash_sdpa_unit_d64_f32")]]
+kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 64u, true>(DIT_FLASH_SDPA_PARAMS);
 
 // --- fused linear: swiglu/concat input, gated-residual output --------------------
 

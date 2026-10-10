@@ -254,6 +254,43 @@ impl Linear {
 }
 
 impl Linear {
+    /// [`Self::forward`], with a pass of up to [`FEW_ROWS`] rows on the
+    /// multi-row matrix-vector kernel instead of a tile: the tile pads a
+    /// dozen rows to 32 and splits k to find enough threadgroups, while the
+    /// matrix-vector kernel streams each weight once per four rows. Measured
+    /// on an M4, an `EmbeddingGemma` 2 pass of 10 rows took 6.3 ms against
+    /// 12.9, and of 40 rows 17.1 against 18.4.
+    ///
+    /// The kernels sum in different orders, so a row's bits differ between
+    /// a pass of up to [`FEW_ROWS`] rows and a longer one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward`].
+    pub fn forward_few(
+        &self,
+        ops: &Ops,
+        x: DeviceView<'_>,
+        y: DeviceView<'_>,
+        rows: usize,
+    ) -> CoreResult<()> {
+        if let LinearWeight::Gemm { dtype, buffer, .. } = &self.weight
+            && rows <= FEW_ROWS
+        {
+            let bias = self.bias.as_ref().map(DeviceBuffer::view);
+            let weight = WeightView::Dense(*dtype, buffer.view());
+            if ops.matvec(weight, y, x, bias, (rows, self.out_dim(), self.in_dim()))? {
+                return Ok(());
+            }
+        }
+        self.forward(ops, x, y, rows)
+    }
+}
+
+/// The most rows [`Linear::forward_few`] keeps on the matrix-vector kernel.
+pub(crate) const FEW_ROWS: usize = 40;
+
+impl Linear {
     /// The weight as the audio set's own kernels read it: the audio GEMM's
     /// rows (checked against the shape), or an 8-bit affine weight with its
     /// scales and biases; `None` for any other projected weight.

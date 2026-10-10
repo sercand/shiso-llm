@@ -18,14 +18,14 @@
 //! where `ple_l = norm(x0 W_l / sqrt(hidden))` is layer `l`'s slice of the
 //! per-layer signal, made from the input rows `x0` alone.
 
-use shiso_core::{DeviceBuffer, DeviceView};
+use shiso_core::{DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs};
 
 use super::config::EncoderConfig;
 use super::weights::EncoderWeights;
 use crate::audio_ops::load::download_f32;
 use crate::audio_ops::{
-    AddRmsNormDesc, AxpyDesc, GeluMulDesc, NormDesc, Ops, RopeDesc, RopePosDesc, SpanAttnDesc,
-    UnaryDesc, UnaryOp, Workspace,
+    AddRmsNormDesc, AxpyDesc, GeluMulDesc, GemmType, NormDesc, Ops, RopeDesc, RopePosDesc,
+    SpanAttnDesc, TransposeDesc, UnaryDesc, UnaryOp, Workspace,
 };
 use crate::embedder::EmbedError;
 
@@ -53,7 +53,11 @@ mod slot {
     pub(super) const SEGMENTS: usize = 11;
     /// Each row's position in its sequence, u32 `[rows]`, when packed.
     pub(super) const POSITIONS: usize = 12;
-    pub(super) const COUNT: usize = 13;
+    /// One chunk of a global layer's scores, when it runs as products.
+    pub(super) const SCORES: usize = 13;
+    /// A global layer's values transposed, `[head_dim][rows]`, likewise.
+    pub(super) const VALUES_T: usize = 14;
+    pub(super) const COUNT: usize = 15;
 }
 
 /// The resident encoder.
@@ -153,6 +157,17 @@ impl Encoder {
         sizes[slot::PLE] = rows * cfg.ple_dim;
         sizes[slot::SEGMENTS] = rows * 2;
         sizes[slot::POSITIONS] = rows;
+        let product_attention = lengths.len() == 1
+            && rows >= PRODUCT_ATTN_MIN_ROWS
+            && self
+                .ops
+                .backend()
+                .max_block_threads(KernelRef::new(SOFTMAX_MODULE, SOFTMAX_ENTRY))
+                .is_some();
+        if product_attention {
+            sizes[slot::SCORES] = score_chunk(rows, cfg.q_heads) * rows;
+            sizes[slot::VALUES_T] = rows * widest_head;
+        }
         self.work.reserve(&self.ops, &sizes)?;
 
         let ops = &self.ops;
@@ -207,9 +222,9 @@ impl Encoder {
                 width,
                 cfg.eps,
             ))?;
-            lw.q.forward(ops, normed, q, rows)?;
-            lw.k.forward(ops, normed, k, rows)?;
-            lw.v.forward(ops, normed, v, rows)?;
+            lw.q.forward_few(ops, normed, q, rows)?;
+            lw.k.forward_few(ops, normed, k, rows)?;
+            lw.v.forward_few(ops, normed, v, rows)?;
             // Per head: a query or key row of `heads * hd` is `heads` rows
             // of `hd`, so the head norms are one launch over all of them.
             ops.rms_norm(&norm(
@@ -254,23 +269,38 @@ impl Encoder {
             // A global layer sees the whole input; `rows` on both sides is
             // every row there is.
             let radius = dims.radius.unwrap_or(rows);
-            ops.span_attention(&SpanAttnDesc {
-                out: attn,
-                q,
-                k,
-                v,
-                segments: packed.then_some(segments),
-                n: rows,
-                heads: cfg.q_heads,
-                kv_heads: dims.kv_heads,
-                head_dim: hd,
-                left: radius,
-                right: radius,
-                // The query and key norms stand in for the usual
-                // `1/sqrt(hd)`: the reference multiplies by exactly 1.
-                scale: 1.0,
-            })?;
-            lw.o.forward(ops, attn, block, rows)?;
+            if product_attention && dims.radius.is_none() && dims.kv_heads == 1 {
+                product_attn(&ProductAttn {
+                    ops,
+                    out: attn,
+                    q,
+                    k,
+                    v,
+                    scores: work.get(slot::SCORES),
+                    values_t: view(work.get(slot::VALUES_T), rows * hd)?,
+                    rows,
+                    heads: cfg.q_heads,
+                    head_dim: hd,
+                })?;
+            } else {
+                ops.span_attention(&SpanAttnDesc {
+                    out: attn,
+                    q,
+                    k,
+                    v,
+                    segments: packed.then_some(segments),
+                    n: rows,
+                    heads: cfg.q_heads,
+                    kv_heads: dims.kv_heads,
+                    head_dim: hd,
+                    left: radius,
+                    right: radius,
+                    // The query and key norms stand in for the usual
+                    // `1/sqrt(hd)`: the reference multiplies by exactly 1.
+                    scale: 1.0,
+                })?;
+            }
+            lw.o.forward_few(ops, attn, block, rows)?;
             ops.rms_norm(&norm(
                 block,
                 block,
@@ -293,8 +323,8 @@ impl Encoder {
             let inter = cfg.intermediate;
             let gate = view(work.get(slot::GATE), rows * inter)?;
             let up = view(work.get(slot::UP), rows * inter)?;
-            lw.gate.forward(ops, normed, gate, rows)?;
-            lw.up.forward(ops, normed, up, rows)?;
+            lw.gate.forward_few(ops, normed, gate, rows)?;
+            lw.up.forward_few(ops, normed, up, rows)?;
             ops.gelu_tanh_mul(&GeluMulDesc {
                 out: gate,
                 gate,
@@ -304,7 +334,7 @@ impl Encoder {
                 up_stride: inter,
                 up_offset: 0,
             })?;
-            lw.down.forward(ops, gate, block, rows)?;
+            lw.down.forward_few(ops, gate, block, rows)?;
             ops.rms_norm(&norm(
                 block,
                 block,
@@ -324,7 +354,7 @@ impl Encoder {
             // gates a bottleneck over the stream.
             let pd = cfg.ple_dim;
             let ple = view(work.get(slot::PLE), rows * pd)?;
-            wts.ple_model_proj[l].forward(ops, x0, ple, rows)?;
+            wts.ple_model_proj[l].forward_few(ops, x0, ple, rows)?;
             ops.unary(&UnaryDesc {
                 op: UnaryOp::Scale(ple_scale),
                 out: ple,
@@ -333,7 +363,7 @@ impl Encoder {
             })?;
             ops.rms_norm(&norm(ple, ple, Some(&wts.ple_proj_norm), rows, pd, cfg.eps))?;
             let ple_gate = view(work.get(slot::GATE), rows * pd)?;
-            lw.ple_gate.forward(ops, stream, ple_gate, rows)?;
+            lw.ple_gate.forward_few(ops, stream, ple_gate, rows)?;
             ops.gelu_tanh_mul(&GeluMulDesc {
                 out: ple_gate,
                 gate: ple_gate,
@@ -343,7 +373,7 @@ impl Encoder {
                 up_stride: pd,
                 up_offset: 0,
             })?;
-            lw.ple_proj.forward(ops, ple_gate, block, rows)?;
+            lw.ple_proj.forward_few(ops, ple_gate, block, rows)?;
             ops.rms_norm(&norm(
                 block,
                 block,
@@ -444,4 +474,103 @@ fn norm<'a>(
 )]
 pub(super) fn f32_of(n: usize) -> f32 {
     n as f32
+}
+
+/// Rows from which a lone input's global layers run as products - scores by
+/// the tiled GEMM, a row softmax, the values by the GEMM - instead of the
+/// span kernel. A 512-wide head is eight of the span kernel's column slices
+/// with only 8 query rows a threadgroup, so every key is re-read per eight
+/// queries; the GEMM tile reads it once per 64. Packed inputs keep the span
+/// kernel, which skips the keys of other inputs. Measured on an M4: 514 rows
+/// 91.1 -> 89.1 ms a pass, 2050 rows 449 -> 399, 8002 rows 2910 -> 2324,
+/// the vectors equal to a cosine of 1 - 3e-13.
+const PRODUCT_ATTN_MIN_ROWS: usize = 512;
+/// The most score floats one chunk holds: 64 MiB.
+const SCORE_CHUNK_FLOATS: usize = 16 << 20;
+const SOFTMAX_MODULE: &str = "diffusion";
+const SOFTMAX_ENTRY: &str = "kernel_dit_softmax_rows_f32";
+/// Threads of one softmax row.
+const SOFTMAX_BLOCK: u32 = 64;
+
+/// Query rows (a row being one head of one position) one chunk of scores
+/// covers: a multiple of the 64-row tile, at most every row there is.
+fn score_chunk(rows: usize, heads: usize) -> usize {
+    let all = rows * heads;
+    (SCORE_CHUNK_FLOATS / rows.max(1) / 64 * 64).clamp(64, all.max(64))
+}
+
+/// One global layer's attention as products.
+struct ProductAttn<'a> {
+    ops: &'a Ops,
+    /// `[rows][heads * head_dim]`.
+    out: DeviceView<'a>,
+    /// `[rows][heads * head_dim]`, read as `[rows * heads][head_dim]`.
+    q: DeviceView<'a>,
+    /// `[rows][head_dim]`: one kv head.
+    k: DeviceView<'a>,
+    /// As `k`.
+    v: DeviceView<'a>,
+    /// At least [`score_chunk`] × `rows` floats.
+    scores: &'a DeviceBuffer,
+    /// `[head_dim][rows]`.
+    values_t: DeviceView<'a>,
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SoftmaxArgs {
+    rows: u32,
+    cols: u32,
+    scale: f32,
+}
+const _: () = assert!(size_of::<SoftmaxArgs>() == 12);
+
+/// `softmax(Q K^T) V` with one kv head: the query rows of every head of
+/// every position are the rows of one `[rows * heads][head_dim]` matrix, in
+/// the order the output is laid out, so each chunk is two GEMMs and a
+/// softmax. The scale is one (see the span call).
+fn product_attn(d: &ProductAttn<'_>) -> Result<(), EmbedError> {
+    let (n, hd) = (d.rows, d.head_dim);
+    let floats = |x: usize| u64::try_from(x * 4).unwrap_or(u64::MAX);
+    d.ops.transpose(&TransposeDesc {
+        out: d.values_t,
+        input: d.v,
+        batch: 1,
+        rows: n,
+        cols: hd,
+    })?;
+    let all = n * d.heads;
+    let chunk = score_chunk(n, d.heads);
+    let mut c0 = 0;
+    while c0 < all {
+        let m = chunk.min(all - c0);
+        let scores = d.scores.slice(0, floats(m * n))?;
+        let q = d.q.slice(floats(c0 * hd), floats(m * hd))?;
+        let out = d.out.slice(floats(c0 * hd), floats(m * hd))?;
+        d.ops
+            .gemm(GemmType::F32, scores, q, d.k, None, (m, n, hd))?;
+        let args = SoftmaxArgs {
+            rows: u32::try_from(m).unwrap_or(u32::MAX),
+            cols: u32::try_from(n).unwrap_or(u32::MAX),
+            scale: 1.0,
+        };
+        d.ops.backend().run(
+            KernelRef::new(SOFTMAX_MODULE, SOFTMAX_ENTRY),
+            &LaunchArgs::new(
+                Extent3::linear(args.rows),
+                Extent3::linear(SOFTMAX_BLOCK),
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(scores),
+                ],
+            ),
+        )?;
+        d.ops
+            .gemm(GemmType::F32, out, scores, d.values_t, None, (m, hd, n))?;
+        c0 += m;
+    }
+    Ok(())
 }
