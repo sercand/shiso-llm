@@ -38,14 +38,6 @@
 //! act only on a second frame and are never read; the encoder is never
 //! loaded.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the decoder is reached only from its device tests until the Qwen-Image-2.1 pipeline lands"
-    )
-)]
-
 use std::path::Path;
 
 use serde::Deserialize;
@@ -702,6 +694,7 @@ impl QwenVae {
     }
 
     /// Image channels the decoder emits (4: RGBA).
+    #[cfg(test)]
     pub(crate) fn out_channels(&self) -> usize {
         self.conv_out.out_c
     }

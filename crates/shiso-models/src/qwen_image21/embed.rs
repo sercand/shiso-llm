@@ -65,6 +65,13 @@ pub(crate) fn sinusoid(sigma: f32) -> Vec<f32> {
 /// The time conditioning of one sigma, on the device.
 pub(crate) struct TimeCond<'o> {
     /// `temb`, `(hidden)`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the head reads the final scale derived from it; only the device tests read temb itself"
+        )
+    )]
     pub temb: Scratch<'o>,
     /// `[scale1 | gate1 | scale2 | gate2]`, `(4 * hidden)`; the gates are
     /// raw until [`Embedders::tanh_gates`] runs.

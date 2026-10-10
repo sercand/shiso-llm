@@ -33,13 +33,6 @@ pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen3_asr;
 pub mod qwen4exp;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Qwen-Image pipeline that serves this family is its first production caller"
-    )
-)]
 pub(crate) mod qwen_image21;
 
 pub use catalog::FamilyFacts;
@@ -57,6 +50,7 @@ pub fn family_catalog() -> &'static [FamilyFacts] {
         nemotron_diar::FACTS,
         qwen3_asr::FACTS,
         flux2::FACTS,
+        qwen_image21::FACTS,
         embedding_gemma2::FACTS,
     ]
 }

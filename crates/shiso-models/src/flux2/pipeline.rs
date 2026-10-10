@@ -236,21 +236,7 @@ impl ImageGenerator for Flux2KleinModel {
 
         let latent_count = t_img * self.params.in_channels;
 
-        // Standard-normal noise by Box-Muller, drawn from the job's seed:
-        // the same seed gives the same image on any machine, because the
-        // stream and the transform are both fixed here, not by the RNG's
-        // platform.
-        let mut rng = job.seed;
-        let mut noise = Vec::with_capacity(latent_count + 2);
-        while noise.len() < latent_count {
-            let u1 = rng.next_f32().max(f32::MIN_POSITIVE);
-            let u2 = rng.next_f32();
-            let radius = (-2.0f32 * u1.ln()).sqrt();
-            let angle = std::f32::consts::TAU * u2;
-            noise.push(radius * angle.cos());
-            noise.push(radius * angle.sin());
-        }
-        noise.truncate(latent_count);
+        let noise = crate::diffusion::noise::gaussian(job.seed, latent_count);
         let mut latents = self.ops.upload_scratch("pipeline noise", &noise)?;
 
         // 4-axis positions, matching the reference pipeline's id prep: image

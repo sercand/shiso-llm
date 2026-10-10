@@ -70,13 +70,6 @@ pub(crate) enum TapSet {
     /// in list order.
     Layers(Vec<usize>),
     /// The last layer's output, with the model's final norm *not* applied.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Qwen-Image pipeline that conditions on it is its first production caller"
-        )
-    )]
     LastPreNorm,
 }
 

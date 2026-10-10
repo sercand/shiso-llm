@@ -13,13 +13,6 @@ use shiso_vision::generator::{ImageGenError, ImageOutputFormat};
 pub(crate) enum Channels {
     /// Red, green, blue.
     Rgb,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "first constructed by the alpha-producing family in a later phase; the unit tests build it now"
-        )
-    )]
     /// Red, green, blue, straight (non-premultiplied) alpha.
     Rgba,
 }

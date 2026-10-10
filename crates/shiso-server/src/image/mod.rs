@@ -357,7 +357,9 @@ pub fn refuse(error: ImageGenError) -> AppError {
         ImageGenError::EmptyPrompt | ImageGenError::PromptTooLong { .. } => {
             AppError::bad_request(message, Some("prompt"), "invalid_request")
         }
-        ImageGenError::InvalidDimensions { .. } | ImageGenError::DecodeTooLarge { .. } => {
+        ImageGenError::InvalidDimensions { .. }
+        | ImageGenError::DecodeTooLarge { .. }
+        | ImageGenError::TooLargeForMemory { .. } => {
             AppError::bad_request(message, Some("size"), "invalid_request")
         }
         ImageGenError::InvalidSteps { .. } | ImageGenError::StepsFixed { .. } => {

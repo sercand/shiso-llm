@@ -28,7 +28,31 @@ pub struct ImageModelDesc {
     pub tokenizer_path: Option<PathBuf>,
     /// Optional directory to search for shared companion assets.
     pub assets_dir: Option<PathBuf>,
+    /// Which components stay loaded across jobs.
+    pub residency: ImageResidency,
+    /// Bytes of the device working set left to the rest of the host.
+    pub reserve_bytes: u64,
+    /// Raw sigma nodes overriding the checkpoint's schedule (shifted like a
+    /// linear ladder's), for a distilled checkpoint whose `model_index.json`
+    /// carries none. `None` runs the checkpoint's own schedule.
+    pub sigmas: Option<Vec<f32>>,
 }
+
+/// Which pipeline components stay loaded across jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageResidency {
+    /// Every component resident when they fit the device's working set
+    /// beside a job, else swapped.
+    #[default]
+    Auto,
+    /// Every component resident; a job that does not fit is refused.
+    Resident,
+    /// The text encoder and the transformer take turns on the device.
+    Swap,
+}
+
+/// The default `reserve_bytes`: 1.5 GiB.
+pub const DEFAULT_IMAGE_RESERVE_BYTES: u64 = 3 << 29;
 
 /// The image families this build recognises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +73,8 @@ const FLUX2_SIGNATURE: &str =
     "'img_in.weight' plus any 'double_blocks.*' or 'single_blocks.*' tensor";
 /// The signature the second family looks for, spelled for the refusal message.
 const QWEN_IMAGE21_SIGNATURE: &str = "'transformer_blocks.0.attn.to_q.weight' plus \
-     'transformer_blocks.0.*modulation.1.weight' or '*_mod.1.weight' (optionally under 'model.diffusion_model.')";
+     the shared 'modulation.1.weight' or a per-block 'transformer_blocks.0.*modulation.1.weight' \
+     or '*_mod.1.weight' (optionally under 'model.diffusion_model.')";
 
 /// Decides which family `desc.model_path` holds.
 ///
@@ -91,13 +116,28 @@ pub fn open_image_generator(
 ) -> Result<Arc<dyn ImageGenerator>, ImageGenError> {
     match detect_image_family(desc)? {
         ImageFamily::Flux2 => {
+            if desc.sigmas.is_some() {
+                return Err(ImageGenError::Checkpoint(
+                    "--image-sigmas is for a checkpoint that reads raw sigma nodes; this \
+                     flux2 checkpoint fits its own schedule"
+                        .to_owned(),
+                ));
+            }
+            if desc.residency == ImageResidency::Swap {
+                return Err(ImageGenError::Checkpoint(
+                    "--image-residency swap is not implemented for the flux2 family, \
+                     which keeps every component resident"
+                        .to_owned(),
+                ));
+            }
             let located = crate::flux2::config::locate_and_inspect(desc)?;
             let model = crate::flux2::pipeline::Flux2KleinModel::load(&located, backend)?;
             Ok(Arc::new(model))
         }
-        ImageFamily::QwenImage21 => Err(ImageGenError::Checkpoint(
-            "qwen_image21 family is not built yet".to_owned(),
-        )),
+        ImageFamily::QwenImage21 => {
+            let model = crate::qwen_image21::pipeline::QwenImage21Model::load(desc, backend)?;
+            Ok(Arc::new(model))
+        }
     }
 }
 
@@ -121,8 +161,9 @@ fn looks_like_flux2(names: &HashSet<String>) -> bool {
 }
 
 /// Block zero's query projection and a modulation linear, with or without
-/// the `model.diffusion_model.` nesting. The brief's `modulation.1` spelling
-/// and the diffusers `img_mod.1` / `txt_mod.1` one both count.
+/// the `model.diffusion_model.` nesting: the shipped export's one shared
+/// top-level `modulation.1`, or a per-block `modulation.1` / `img_mod.1` /
+/// `txt_mod.1`.
 fn looks_like_qwen_image21(names: &HashSet<String>) -> bool {
     let bare: Vec<&str> = names
         .iter()
@@ -130,8 +171,9 @@ fn looks_like_qwen_image21(names: &HashSet<String>) -> bool {
         .collect();
     bare.contains(&"transformer_blocks.0.attn.to_q.weight")
         && bare.iter().any(|n| {
-            n.starts_with("transformer_blocks.0.")
-                && (n.ends_with("modulation.1.weight") || n.ends_with("_mod.1.weight"))
+            *n == "modulation.1.weight"
+                || (n.starts_with("transformer_blocks.0.")
+                    && (n.ends_with("modulation.1.weight") || n.ends_with("_mod.1.weight")))
         })
 }
 

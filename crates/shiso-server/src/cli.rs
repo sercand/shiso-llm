@@ -569,6 +569,27 @@ pub struct ServeArgs {
     /// within its bounds; unset, the model's own default size is used.
     #[arg(long, env = "SHISO_IMAGE_DEFAULT_SIZE")]
     pub image_default_size: Option<String>,
+    /// Which image pipeline components stay loaded across jobs: `auto`
+    /// keeps all of them when they fit the device's working set beside a
+    /// job and otherwise swaps; `resident` refuses a job that does not fit;
+    /// `swap` lets the text encoder and the transformer take turns.
+    #[arg(
+        long,
+        env = "SHISO_IMAGE_RESIDENCY",
+        value_enum,
+        default_value_t = ImageResidencyChoice::Auto
+    )]
+    pub image_residency: ImageResidencyChoice,
+    /// GiB of the device working set the image pipeline leaves to the rest
+    /// of the host when it plans what stays loaded.
+    #[arg(long, env = "SHISO_IMAGE_RESERVE_GB", default_value_t = 1.5)]
+    pub image_reserve_gb: f64,
+    /// Raw sigma nodes, comma-separated (e.g. `1.0,0.9375,0.875,0.75,0.5,0.25`),
+    /// for a distilled image checkpoint that ships its schedule outside its
+    /// own documents. The nodes are shifted like a linear ladder's and fix
+    /// the step count to their number.
+    #[arg(long, env = "SHISO_IMAGE_SIGMAS")]
+    pub image_sigmas: Option<String>,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -680,6 +701,20 @@ pub enum ConfigError {
         /// The one it needs beside it.
         missing: &'static str,
     },
+    /// An `--image-reserve-gb` that is negative or not a number.
+    #[error("--image-reserve-gb {value} must be a finite number of GiB, at least 0")]
+    BadImageReserve {
+        /// The value as it was given.
+        value: f64,
+    },
+    /// An `--image-sigmas` list that is not comma-separated numbers.
+    #[error("--image-sigmas {value} is not a comma-separated list of numbers: {reason}")]
+    BadImageSigmas {
+        /// The value as it was given.
+        value: String,
+        /// The entry that did not parse.
+        reason: String,
+    },
     /// An `--image-default-size` that is not a servable `WxH`.
     #[error("--image-default-size {value} is not servable: {reason}")]
     BadImageSize {
@@ -783,14 +818,11 @@ impl ServeArgs {
                 flag: "embedding-max-queue",
             });
         }
-        if self.image_max_queue == 0 {
-            return Err(ConfigError::Zero {
-                flag: "image-max-queue",
-            });
-        }
+        self.image_queue()?;
         // A generation with no steps has nothing to denoise: the pipeline
         // refuses it by name, and an operator who set the default to zero
         // should hear about it at boot rather than on the first request.
+        self.image_sigmas()?;
         if self.image_default_steps == Some(0) {
             return Err(ConfigError::Zero {
                 flag: "image-default-steps",
@@ -803,6 +835,7 @@ impl ServeArgs {
         // that silently moved is not the default that was configured.
         // Only the shape is judged here; whether the loaded model's grid and
         // bounds admit the pixels is judged at boot, when the model is known.
+        self.image_reserve_bytes()?;
         if let Some(value) = &self.image_default_size
             && let Err(error) = crate::image::size::parse_exact_size(value)
         {
@@ -1034,6 +1067,61 @@ impl ServeArgs {
         })
     }
 
+    /// Refuses an image queue of zero: every request would be turned away.
+    fn image_queue(&self) -> Result<(), ConfigError> {
+        if self.image_max_queue == 0 {
+            return Err(ConfigError::Zero {
+                flag: "image-max-queue",
+            });
+        }
+        Ok(())
+    }
+
+    /// `--image-reserve-gb` in bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::BadImageReserve`] for a negative or non-finite value.
+    pub fn image_reserve_bytes(&self) -> Result<u64, ConfigError> {
+        let gb = self.image_reserve_gb;
+        if !gb.is_finite() || gb < 0.0 {
+            return Err(ConfigError::BadImageReserve { value: gb });
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a finite, non-negative GiB count; anything past u64 saturates"
+        )]
+        let bytes = (gb * f64::from(1u32 << 30)) as u64;
+        Ok(bytes)
+    }
+
+    /// `--image-sigmas` as numbers. Whether they make a schedule is the
+    /// loaded model's to judge.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::BadImageSigmas`] for an entry that is not a number.
+    // `Ok(None)` is no override: the checkpoint's own schedule runs.
+    pub fn image_sigmas(&self) -> Result<Option<Vec<f32>>, ConfigError> {
+        let Some(value) = &self.image_sigmas else {
+            return Ok(None);
+        };
+        value
+            .split(',')
+            .map(|entry| {
+                entry
+                    .trim()
+                    .parse::<f32>()
+                    .map_err(|e| ConfigError::BadImageSigmas {
+                        value: value.clone(),
+                        reason: format!("{entry:?}: {e}"),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
     /// Where the architecture config is read from.
     ///
     /// Beside the checkpoint, and for a checkpoint *directory* that means inside
@@ -1180,6 +1268,27 @@ pub enum ExpertResidencyChoice {
     Resident,
     /// Streamed from disk into a pool of expert slots.
     Stream,
+}
+
+/// `--image-residency`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ImageResidencyChoice {
+    /// Resident when everything fits, else swap.
+    Auto,
+    /// Everything resident; a job that does not fit is refused.
+    Resident,
+    /// The text encoder and the transformer take turns.
+    Swap,
+}
+
+impl From<ImageResidencyChoice> for shiso_models::image_registry::ImageResidency {
+    fn from(choice: ImageResidencyChoice) -> Self {
+        match choice {
+            ImageResidencyChoice::Auto => Self::Auto,
+            ImageResidencyChoice::Resident => Self::Resident,
+            ImageResidencyChoice::Swap => Self::Swap,
+        }
+    }
 }
 
 /// The parser choice specified via CLI flags.

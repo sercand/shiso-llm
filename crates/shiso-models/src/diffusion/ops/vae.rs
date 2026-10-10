@@ -11,14 +11,6 @@
 //! decode's largest tensors; neither the normalized copy nor the upsampled
 //! copy of one ever exists.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the residual VAE decoder is reached only from its device tests until the image pipeline that decodes with it lands"
-    )
-)]
-
 use bytemuck::{Pod, Zeroable};
 use shiso_core::{DeviceView, Extent3, KernelArg};
 use shiso_vision::generator::ImageGenError;

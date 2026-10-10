@@ -127,6 +127,27 @@ pub enum ImageGenError {
         /// The budget it was refused against, in MiB (rounded down).
         budget_mib: u64,
     },
+    /// The job's peak memory - the weights it needs loaded at once plus its
+    /// activations at this size - is over the host's working set under every
+    /// residency the generator may use. The request's to change: a smaller
+    /// image fits.
+    #[error(
+        "a {width}x{height} image needs about {needed_mib} MiB at its peak, over this \
+         host's {budget_mib} MiB budget; the largest square image that fits is \
+         {largest_side}x{largest_side}"
+    )]
+    TooLargeForMemory {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// The job's estimated peak, in MiB (rounded up).
+        needed_mib: u64,
+        /// The budget it was refused against, in MiB (rounded down).
+        budget_mib: u64,
+        /// The largest square side that fits (0 when none does).
+        largest_side: u32,
+    },
     /// Format is not supported.
     #[error("unsupported image format {0:?}: only png and jpeg are supported")]
     UnsupportedFormat(String),

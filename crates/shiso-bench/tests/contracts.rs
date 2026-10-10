@@ -495,6 +495,16 @@ fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
             let _: (&u64, &u64) = (needed_mib, budget_mib);
             (9, *width, *height)
         }
+        ImageGenError::TooLargeForMemory {
+            width,
+            height,
+            needed_mib,
+            budget_mib,
+            largest_side,
+        } => {
+            let _: (&u64, &u64, &u32) = (needed_mib, budget_mib, largest_side);
+            (10, *width, *height)
+        }
         ImageGenError::InvalidSteps { steps } => (7, *steps, 0),
         ImageGenError::UnsupportedFormat(msg) => {
             let _: &String = msg;

@@ -114,6 +114,9 @@ fn desc_for(model_path: &Path) -> ImageModelDesc {
         vae_path: None,
         tokenizer_path: None,
         assets_dir: None,
+        residency: crate::image_registry::ImageResidency::Auto,
+        reserve_bytes: crate::image_registry::DEFAULT_IMAGE_RESERVE_BYTES,
+        sigmas: None,
     }
 }
 

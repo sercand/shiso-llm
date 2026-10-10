@@ -39,6 +39,9 @@ fn desc_for(path: &Path) -> ImageModelDesc {
         vae_path: None,
         tokenizer_path: None,
         assets_dir: None,
+        residency: crate::image_registry::ImageResidency::Auto,
+        reserve_bytes: crate::image_registry::DEFAULT_IMAGE_RESERVE_BYTES,
+        sigmas: None,
     }
 }
 
@@ -81,7 +84,9 @@ fn qwen_names_select_qwen_with_and_without_the_prefix() {
         let q = format!("{prefix}transformer_blocks.0.attn.to_q.weight");
         let m = format!("{prefix}transformer_blocks.0.img_mod.1.weight");
         let m2 = format!("{prefix}transformer_blocks.0.modulation.1.weight");
-        for modulation in [&m, &m2] {
+        // The shipped export: one modulation shared by every block.
+        let shared = format!("{prefix}modulation.1.weight");
+        for modulation in [&m, &m2, &shared] {
             let family = detect(&[&q, modulation]).expect("qwen");
             assert_eq!(family, ImageFamily::QwenImage21, "prefix {prefix:?}");
         }

@@ -17,6 +17,7 @@ use shiso_modelfile::st_header::{Shard, StDType};
 use shiso_vision::generator::ImageGenError;
 
 use super::ops::Ops;
+use super::residency::{FileSpan, coalesce};
 
 /// One tensor as its shard header described it, resolved to a shard slot.
 #[derive(Debug)]
@@ -255,6 +256,25 @@ impl StStore {
         Err(ImageGenError::Checkpoint(format!(
             "FP8 tensor '{name}' has no weight_scale companion ('{name}_scale' or '{name}.weight_scale')"
         )))
+    }
+
+    /// The file byte ranges of every tensor whose name `keep` accepts,
+    /// sorted and merged: what an import of those tensors will read.
+    pub(crate) fn spans(&self, keep: impl Fn(&str) -> bool) -> Vec<FileSpan> {
+        let spans = self
+            .entries
+            .iter()
+            .filter(|(name, _)| keep(name))
+            .map(|(_, e)| {
+                let shard = &self.shards[e.shard];
+                FileSpan {
+                    path: shard.path().to_path_buf(),
+                    start: shard.payload_base() + e.start,
+                    end: shard.payload_base() + e.end,
+                }
+            })
+            .collect();
+        coalesce(spans)
     }
 
     /// Counts `prefix.<n>.` blocks from the indexed names.
