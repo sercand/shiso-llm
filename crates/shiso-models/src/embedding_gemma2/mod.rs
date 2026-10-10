@@ -31,7 +31,7 @@ mod tests;
 use std::path::Path;
 use std::sync::Arc;
 
-use shiso_audio::AudioTower;
+use shiso_audio::{AudioClip, AudioTower};
 use shiso_core::{Backend, TokenId};
 use shiso_modelfile::GgufFile;
 use shiso_vision::{PreprocessSpec, ResizeRule, VisionItem, VisionTower};
@@ -207,14 +207,23 @@ impl EmbeddingGemma2 {
 
     /// One input's rows as the encoder reads them, and its positions by
     /// modality.
-    fn rows(&self, parts: &[EmbedPart]) -> Result<(Vec<f32>, EmbedUsage), EmbedError> {
+    ///
+    /// `audio` holds the encoded rows of every clip of the inputs being
+    /// embedded together, in order; `cursor` is how many of its floats the
+    /// inputs before this one used.
+    fn rows(
+        &self,
+        parts: &[EmbedPart],
+        audio: &[f32],
+        cursor: &mut usize,
+    ) -> Result<(Vec<f32>, EmbedUsage), EmbedError> {
         if parts.is_empty() {
             return Err(EmbedError::Input {
                 what: "an empty input".to_owned(),
             });
         }
         let (slots, usage) = self.layout(parts)?;
-        let media = self.media_rows(parts)?;
+        let media = self.media_rows(parts, audio, cursor)?;
         let h = self.encoder.config().hidden;
         // The reference scales a token row by `sqrt(hidden)` as it reads it,
         // and splices a media row in as the tower projected it.
@@ -323,8 +332,12 @@ impl EmbeddingGemma2 {
     }
 
     /// Every media row the input splices in, in reading order, on the host.
-    fn media_rows(&self, parts: &[EmbedPart]) -> Result<Vec<f32>, EmbedError> {
-        let backend = self.encoder.ops().backend();
+    fn media_rows(
+        &self,
+        parts: &[EmbedPart],
+        audio: &[f32],
+        cursor: &mut usize,
+    ) -> Result<Vec<f32>, EmbedError> {
         let h = self.encoder.config().hidden;
         let mut rows = Vec::new();
         for part in parts {
@@ -333,18 +346,50 @@ impl EmbeddingGemma2 {
                 EmbedPart::Image(item) => self.encode_vision(std::slice::from_ref(item))?,
                 EmbedPart::Video(frames) => self.encode_vision(frames)?,
                 EmbedPart::Audio(clip) => {
-                    let tower = self
-                        .audio
-                        .as_ref()
-                        .ok_or(EmbedError::NoTower { modality: "audio" })?;
-                    let out = tower.encode(backend, std::slice::from_ref(clip))?;
-                    (out, clip.tokens())
+                    let want = clip.tokens() * h;
+                    let src =
+                        audio
+                            .get(*cursor..*cursor + want)
+                            .ok_or_else(|| EmbedError::Input {
+                                what: "fewer encoded audio rows than soft tokens".to_owned(),
+                            })?;
+                    rows.extend_from_slice(src);
+                    *cursor += want;
+                    continue;
                 }
             };
             let (out, n) = encoded;
             rows.extend(download_f32(self.encoder.ops(), out.rows.view(), n * h)?);
         }
         Ok(rows)
+    }
+
+    /// Every audio clip of `inputs` through the audio tower in one pass, the
+    /// rows on the host in reading order: the tower's projections are most of
+    /// a clip's cost and run once over all the clips' rows.
+    fn audio_rows(&self, inputs: &[Vec<EmbedPart>]) -> Result<Vec<f32>, EmbedError> {
+        let clips: Vec<_> = inputs
+            .iter()
+            .flatten()
+            .filter_map(|p| match p {
+                EmbedPart::Audio(clip) => Some(clip.clone()),
+                _ => None,
+            })
+            .collect();
+        if clips.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tower = self
+            .audio
+            .as_ref()
+            .ok_or(EmbedError::NoTower { modality: "audio" })?;
+        let out = tower.encode(self.encoder.ops().backend(), &clips)?;
+        let n: usize = clips.iter().map(AudioClip::tokens).sum();
+        Ok(download_f32(
+            self.encoder.ops(),
+            out.rows.view(),
+            n * self.encoder.config().hidden,
+        )?)
     }
 
     /// One picture's or one clip's frames through the vision tower, and the
@@ -390,7 +435,8 @@ impl Embedder for EmbeddingGemma2 {
     }
 
     fn embed(&mut self, parts: &[EmbedPart]) -> Result<Embedding, EmbedError> {
-        let (rows, usage) = self.rows(parts)?;
+        let audio = self.audio_rows(std::slice::from_ref(&parts.to_vec()))?;
+        let (rows, usage) = self.rows(parts, &audio, &mut 0)?;
         let len = rows.len() / self.encoder.config().hidden;
         let mut out = Vec::with_capacity(1);
         self.run_pack(&rows, &[len], &mut vec![usage], &mut out)?;
@@ -406,8 +452,15 @@ impl Embedder for EmbeddingGemma2 {
         let mut lengths: Vec<usize> = Vec::new();
         let mut usages: Vec<EmbedUsage> = Vec::new();
         let began = std::time::Instant::now();
+        // Every input is checked before the audio tower runs, so a bad input
+        // costs no tower pass.
         for parts in inputs {
-            let (rows, usage) = self.rows(parts)?;
+            self.layout(parts)?;
+        }
+        let audio = self.audio_rows(inputs)?;
+        let mut cursor = 0;
+        for parts in inputs {
+            let (rows, usage) = self.rows(parts, &audio, &mut cursor)?;
             let len = rows.len() / h;
             // A pack is closed before it would pass the longest single input
             // the model reads: the scratch is sized for that, and a longer

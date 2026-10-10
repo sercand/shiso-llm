@@ -881,6 +881,13 @@ fn attention(
     if !plan.head_dim.is_multiple_of(32) || plan.head_dim > 512 {
         return attention_scalar(backend, out, q, k, v, plan);
     }
+    if plan.head_dim == FLASH_HEAD_DIM
+        && backend
+            .max_block_threads(KernelRef::new(FLASH_MODULE, FLASH_ENTRY))
+            .is_some()
+    {
+        return attention_flash(backend, out, q, k, v, plan);
+    }
     let ops = crate::audio_ops::Ops::new(Arc::clone(backend));
     ops.span_attention(&crate::audio_ops::SpanAttnDesc {
         out: out.view(),
@@ -900,6 +907,85 @@ fn attention(
         step: "attention",
         source,
     })
+}
+
+/// The 64-row flash kernel's module, entry and head width.
+const FLASH_MODULE: &str = "diffusion";
+const FLASH_ENTRY: &str = "kernel_dit_flash_sdpa_unit_d64_f32";
+const FLASH_HEAD_DIM: usize = 64;
+/// Query rows and threads of one flash threadgroup.
+const FLASH_QROWS: u32 = 64;
+const FLASH_THREADS: u32 = 256;
+
+/// The flash kernel's arguments: a one-section sequence, no cache.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct FlashArgs {
+    txt_tokens: u32,
+    img_tokens: u32,
+    cache_tokens: u32,
+    heads: u32,
+    head_dim: u32,
+    txt_stride: u32,
+    img_stride: u32,
+    cache_stride: u32,
+    q_offset: u32,
+    k_offset: u32,
+    v_offset: u32,
+}
+const _: () = assert!(size_of::<FlashArgs>() == 44);
+
+/// [`attention`] on the image transformer's flash kernel where the device
+/// has it: 64 query rows a threadgroup share every key and value block,
+/// staged as half with f32 sums, where the span kernel's tile of 32 rows
+/// read them straight from memory. Measured on an M4 over a 640x480
+/// picture's 2394 rows, 12 heads of 64: see the commit that added it.
+fn attention_flash(
+    backend: &Arc<dyn Backend>,
+    out: &DeviceBuffer,
+    q: &DeviceBuffer,
+    k: &DeviceBuffer,
+    v: &DeviceBuffer,
+    plan: &Plan,
+) -> Result<(), VisionError> {
+    let width = narrow(plan.heads * plan.head_dim);
+    let args = FlashArgs {
+        txt_tokens: 0,
+        img_tokens: narrow(plan.rows),
+        cache_tokens: 0,
+        heads: narrow(plan.heads),
+        head_dim: narrow(plan.head_dim),
+        txt_stride: width,
+        img_stride: width,
+        cache_stride: width,
+        q_offset: 0,
+        k_offset: 0,
+        v_offset: 0,
+    };
+    // The text-section and cache slots are unread with no rows in them;
+    // any live buffer binds them.
+    launch(
+        backend,
+        "attention",
+        FLASH_MODULE,
+        FLASH_ENTRY,
+        Extent3::new(grid_for(plan.rows, FLASH_QROWS), narrow(plan.heads), 1),
+        Extent3::linear(FLASH_THREADS),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(q.view()),
+            KernelArg::Buffer(k.view()),
+            KernelArg::Buffer(v.view()),
+            KernelArg::Buffer(q.view()),
+            KernelArg::Buffer(k.view()),
+            KernelArg::Buffer(v.view()),
+            KernelArg::Buffer(k.view()),
+            KernelArg::Buffer(v.view()),
+        ],
+    )
 }
 
 /// [`attention`] on the vision set's own kernel: one row per threadgroup,

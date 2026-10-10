@@ -39,6 +39,10 @@ struct Args {
     /// Timed runs per case, after one warm-up.
     #[arg(long, default_value_t = 7)]
     runs: usize,
+    /// Writes the first input's vector of the last run here, one value a
+    /// line, for comparing two builds' answers.
+    #[arg(long)]
+    dump: Option<PathBuf>,
     /// Only these cases, comma-separated.
     #[arg(long)]
     only: Option<String>,
@@ -156,6 +160,10 @@ fn main() -> Result<()> {
         let mut tokens = 0u64;
         let (median, spread) = time(args.runs, || {
             let out = model.embed_batch(inputs)?;
+            if let Some(path) = args.dump.as_ref() {
+                let v: Vec<String> = out[0].vector.iter().map(ToString::to_string).collect();
+                std::fs::write(path, v.join("\n"))?;
+            }
             tokens = out.iter().map(|e| u64::from(e.usage.total())).sum();
             Ok(())
         })?;
