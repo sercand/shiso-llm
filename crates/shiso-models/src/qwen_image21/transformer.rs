@@ -47,8 +47,8 @@ use std::path::Path;
 use shiso_core::{DeviceBuffer, DeviceView};
 use shiso_vision::generator::ImageGenError;
 
-use super::config::{DitConfig, DitNames, MlpNaming};
-use super::embed::{Embedders, TimeCond};
+use super::config::{DitConfig, DitNames, MlpNaming, SINUSOID_DIM};
+use super::embed::{Embedders, TimeCond, sinusoid};
 use super::rope::{angle_table, target_positions, text_positions};
 use super::vae::LatentGrid;
 use crate::diffusion::lin::Lin;
@@ -99,10 +99,24 @@ pub(crate) struct PrefixKv {
     tokens: usize,
     layers: usize,
     hidden: usize,
-    /// The target's `[cos | sin]` table, `2 * (cells, head_dim / 2)`, for
-    /// the grid it was built for: a job's steps share one grid, so it is
-    /// built on the first step and reused.
-    target_table: Option<(LatentGrid, DeviceBuffer)>,
+    /// The job's step inputs, uploaded once by [`QwenDit::prepare_steps`].
+    steps: Option<StepTables>,
+}
+
+/// What every step of one job reads from the host, uploaded once before
+/// the first: an upload drains the device queue (the host copy waits for
+/// queued work), so doing it per step would hide a sync inside
+/// [`QwenDit::velocity`].
+#[derive(Debug)]
+struct StepTables {
+    /// The grid the rotary table was built for.
+    grid: LatentGrid,
+    /// The target's `[cos | sin]` table, `2 * (cells, head_dim / 2)`.
+    rope: DeviceBuffer,
+    /// The sigmas the sinusoid rows were built for, in row order.
+    sigmas: Vec<f32>,
+    /// One `SINUSOID_DIM` row per sigma.
+    sinusoids: DeviceBuffer,
 }
 
 impl PrefixKv {
@@ -322,7 +336,7 @@ impl QwenDit {
             tokens: p,
             layers,
             hidden: h,
-            target_table: None,
+            steps: None,
         };
         let x = self.embed.txt_in(ops, text_feats, p)?;
         let (cos, sin) = angle_table(&text_positions(p), self.axes);
@@ -349,8 +363,42 @@ impl QwenDit {
         Ok((kv, x))
     }
 
+    /// Uploads what the job's steps read from the host - the target grid's
+    /// rotary table and the timestep sinusoid of every sigma - once, so
+    /// [`QwenDit::velocity`] issues no host transfer and no hidden sync.
+    /// The two uploads each drain the queue, once per job.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Backend`] for an empty ladder or a failed upload.
+    pub(crate) fn prepare_steps(
+        &self,
+        ops: &Ops,
+        kv: &mut PrefixKv,
+        sigmas: &[f32],
+        grid: LatentGrid,
+    ) -> Result<(), ImageGenError> {
+        if sigmas.is_empty() || grid.cells() == 0 {
+            return Err(ImageGenError::Backend(
+                "prepare_steps: no sigmas or an empty grid".to_string(),
+            ));
+        }
+        let (cos, sin) = angle_table(&target_positions(kv.tokens, grid), self.axes);
+        let rope = ops.upload_f32("qwen target rope", &[cos, sin].concat())?;
+        let rows: Vec<f32> = sigmas.iter().flat_map(|&s| sinusoid(s)).collect();
+        let sinusoids = ops.upload_f32("qwen sinusoids", &rows)?;
+        kv.steps = Some(StepTables {
+            grid,
+            rope,
+            sigmas: sigmas.to_vec(),
+            sinusoids,
+        });
+        Ok(())
+    }
+
     /// The velocity of the target latents `(cells, in_channels)` at
     /// `sigma`, into `out` `(cells, out_channels)`, attending over `kv`.
+    /// `sigma` and `grid` must be ones [`QwenDit::prepare_steps`] uploaded
+    /// for `kv`; nothing is uploaded here.
     ///
     /// # Errors
     /// [`ImageGenError::Backend`] for a sigma outside [0, 1], a prefix from
@@ -358,7 +406,7 @@ impl QwenDit {
     pub(crate) fn velocity(
         &self,
         ops: &Ops,
-        kv: &mut PrefixKv,
+        kv: &PrefixKv,
         latents: DeviceView<'_>,
         grid: LatentGrid,
         sigma: f32,
@@ -391,7 +439,7 @@ impl QwenDit {
     pub(crate) fn target_stream<'o>(
         &self,
         ops: &'o Ops,
-        kv: &mut PrefixKv,
+        kv: &PrefixKv,
         latents: DeviceView<'_>,
         grid: LatentGrid,
         sigma: f32,
@@ -421,18 +469,32 @@ impl QwenDit {
                 latents.len()
             )));
         }
-        if kv.target_table.as_ref().map(|(g, _)| *g) != Some(grid) {
-            let (cos, sin) = angle_table(&target_positions(kv.tokens, grid), self.axes);
-            let table = ops.upload_f32("qwen target rope", &[cos, sin].concat())?;
-            kv.target_table = Some((grid, table));
-        }
-        let table = kv
-            .target_table
+        let steps = kv
+            .steps
             .as_ref()
-            .map(|(_, table)| table.view())
-            .ok_or_else(|| ImageGenError::Backend("velocity: no target table".to_string()))?;
+            .filter(|s| s.grid == grid)
+            .ok_or_else(|| {
+                ImageGenError::Backend(format!(
+                    "velocity: no step tables for a {}x{} grid; prepare_steps first",
+                    grid.h, grid.w
+                ))
+            })?;
+        let row = steps
+            .sigmas
+            .iter()
+            .position(|s| s.to_bits() == sigma.to_bits())
+            .ok_or_else(|| {
+                ImageGenError::Backend(format!(
+                    "velocity: sigma {sigma} is not one prepare_steps uploaded"
+                ))
+            })?;
+        let table = steps.rope.view();
+        let features = steps
+            .sinusoids
+            .view()
+            .cut(bytes(row * SINUSOID_DIM), bytes(SINUSOID_DIM))?;
         let half = t * self.head_dim / 2;
-        let cond = self.embed.time_cond(ops, sigma)?;
+        let cond = self.embed.time_cond_of(ops, features)?;
         self.embed.tanh_gates(ops, cond.modulation.view())?;
         let x = ops.alloc_f32("qwen target stream", t * h)?;
         self.embed.img_in(ops, latents, t, x.view())?;

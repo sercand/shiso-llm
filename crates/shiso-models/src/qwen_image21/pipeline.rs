@@ -21,8 +21,16 @@
 //! 3. If the transformer fits beside the decode it stays loaded after the
 //!    job - a later job whose prompt features are cached never needs the
 //!    encoder and runs with no swap at all. Otherwise it is dropped before
-//!    the decode and the encoder's pages are read ahead behind the decode,
-//!    for the next job.
+//!    the decode and, when the encoder's pages fit beside the decoder and
+//!    the decode's working set, they are read ahead behind the decode for
+//!    the next job. A transformer import cancels any such read-ahead (its
+//!    pages may be evicted by the import, so a later job reads them again).
+//!
+//! Every transformer import goes through one function, which in swap mode
+//! drops the encoder first - also after a cached prompt or a failed encode -
+//! so the two are never loaded together. Dropped components keep their
+//! pages in the page cache (the shard's `release_cached` is not called):
+//! the next swap-in of the same file is then partly a cache hit.
 //!
 //! The decoder (1 GB widened) is loaded once and kept. Every read-ahead only
 //! warms the page cache: nothing is imported to the device while another
@@ -466,16 +474,16 @@ impl QwenImage21Model {
             let residency = model.plan_job(&state, grid, PLAN_TOKENS)?;
             tracing::info!(?residency, "qwen image load-time residency");
             if matches!(residency, Residency::Swap { .. }) {
-                model.ensure_denoiser(&mut state, None)?;
+                model.ensure_denoiser(&mut state, None, true)?;
                 model.release(&mut state, Component::Denoiser);
                 model.ensure_encoder(&mut state)?;
                 model.release(&mut state, Component::Encoder);
-                model.ensure_denoiser(&mut state, None)?;
+                model.ensure_denoiser(&mut state, None, true)?;
                 model.release(&mut state, Component::Denoiser);
             }
             model.ensure_encoder(&mut state)?;
             if residency == Residency::Resident {
-                model.ensure_denoiser(&mut state, None)?;
+                model.ensure_denoiser(&mut state, None, false)?;
             }
         }
         tracing::info!(
@@ -587,13 +595,25 @@ impl QwenImage21Model {
 
     /// Loads the transformer if it is not. `ahead` is a read-ahead of its
     /// first spans already running; the rest is read here.
+    ///
+    /// This is the only place the transformer is imported, and with `swap`
+    /// it drops the encoder first - whatever path led here (a cached prompt
+    /// after a resident job, an encode that failed) - so a swapping host
+    /// never holds both. An encoder read-ahead left from an earlier decode
+    /// is cancelled: this import may evict its pages, and a later job must
+    /// read them again rather than trust a stale result.
     fn ensure_denoiser(
         &self,
         state: &mut State,
         ahead: Option<ReadAhead>,
+        swap: bool,
     ) -> Result<(), ImageGenError> {
+        state.encoder_prefetch = None;
         if state.denoiser.is_some() {
             return Ok(());
+        }
+        if swap {
+            self.release(state, Component::Encoder);
         }
         let phase = Instant::now();
         let (head, rest) = match ahead {
@@ -704,27 +724,69 @@ impl QwenImage21Model {
             }
         }
         let phase = Instant::now();
+        let encoded = self.encode(state, ids);
+        tracing::info!(
+            ms = ms(phase),
+            tokens = ids.ids.len(),
+            ok = encoded.is_ok(),
+            "qwen image phase encode"
+        );
+        // Dropped whether the encode worked or not: a failed job must not
+        // leave the encoder where the next job's transformer goes.
+        if swap {
+            self.release(state, Component::Encoder);
+        }
+        let features = encoded?;
+        state.features.insert(0, (kept, features.clone()));
+        state.features.truncate(FEATURE_CACHE);
+        Ok((features, ahead))
+    }
+
+    /// The prompt's kept feature rows from the loaded encoder.
+    fn encode(
+        &self,
+        state: &State,
+        ids: &super::prompt::PromptIds,
+    ) -> Result<Vec<f32>, ImageGenError> {
         let encoder = state
             .encoder
             .as_ref()
             .ok_or_else(|| ImageGenError::Backend("the text encoder is not loaded".to_string()))?;
         let all = encoder.prefill(&self.ops, &ids.ids)?;
         let width = encoder.context_width();
-        let features = all
+        Ok(all
             .get(ids.drop * width..)
             .ok_or_else(|| ImageGenError::Backend("the encoder returned too few rows".to_string()))?
-            .to_vec();
-        tracing::info!(
-            ms = ms(phase),
-            tokens = ids.ids.len(),
-            "qwen image phase encode"
-        );
-        if swap {
-            self.release(state, Component::Encoder);
-        }
-        state.features.insert(0, (kept, features.clone()));
-        state.features.truncate(FEATURE_CACHE);
-        Ok((features, ahead))
+            .to_vec())
+    }
+
+    /// Puts the model where a resident job on a larger host leaves a
+    /// swapping one: the encoder loaded, the transformer not. Both are
+    /// never loaded together here either.
+    #[cfg(test)]
+    pub(crate) fn stage_encoder_loaded(&self) -> Result<(), ImageGenError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.release(&mut state, Component::Denoiser);
+        self.ensure_encoder(&mut state)
+    }
+
+    /// Runs a swap-mode encode of `prompt` with a vision placeholder id
+    /// appended, which the encoder refuses after it is loaded: a real
+    /// failure between the encoder's import and its drop.
+    #[cfg(test)]
+    pub(crate) fn failing_encode(&self, prompt: &str) -> Result<(), ImageGenError> {
+        const IMAGE_PAD: u32 = 151_655;
+        let mut ids = self.prompt.tokenize(prompt)?;
+        ids.ids.push(IMAGE_PAD);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.features(
+            &mut state,
+            &ids,
+            Residency::Swap {
+                keep_denoiser: true,
+            },
+        )
+        .map(|_| ())
     }
 
     /// The residency changes so far, oldest first.
@@ -799,7 +861,8 @@ impl ImageGenerator for QwenImage21Model {
         );
 
         let (features, ahead) = self.features(&mut state, &ids, residency)?;
-        self.ensure_denoiser(&mut state, ahead)?;
+        let swap = matches!(residency, Residency::Swap { .. });
+        self.ensure_denoiser(&mut state, ahead, swap)?;
         let dit = state
             .denoiser
             .as_ref()
@@ -816,6 +879,7 @@ impl ImageGenerator for QwenImage21Model {
         let text = ops.upload_scratch("qwen text features", &features)?;
         let mut kv = dit.prefix(ops, text.view(), kept)?;
         drop(text);
+        dit.prepare_steps(ops, &mut kv, &sigmas[..steps], grid)?;
         sync()?;
         tracing::info!(
             ms = ms(phase),
@@ -831,7 +895,7 @@ impl ImageGenerator for QwenImage21Model {
         for i in 0..steps {
             let phase = Instant::now();
             let sigma = sigmas[i];
-            dit.velocity(ops, &mut kv, latents.view(), grid, sigma, velocity.view())?;
+            dit.velocity(ops, &kv, latents.view(), grid, sigma, velocity.view())?;
             ops.axpy(
                 "qwen euler",
                 latents.view(),
@@ -866,11 +930,22 @@ impl ImageGenerator for QwenImage21Model {
         {
             self.release(&mut state, Component::Denoiser);
             // The transformer's room is free: the next job's encoder pages
-            // read in behind this decode.
-            state.encoder_prefetch = Some(Prefetch::spawn(
-                "encoder",
-                self.encoder_files.spans.clone(),
-            )?);
+            // read in behind this decode, but only when they fit beside the
+            // decoder and the decode's working set - otherwise the read
+            // would evict pages the decode is using.
+            let decode_peak = self.peaks(&state, grid, ids.ids.len()).decode;
+            let budget = self.working_set.saturating_sub(self.reserve);
+            if self.footprint.encoder + self.footprint.decoder + decode_peak <= budget {
+                state.encoder_prefetch = Some(Prefetch::spawn(
+                    "encoder",
+                    self.encoder_files.spans.clone(),
+                )?);
+            } else {
+                tracing::info!(
+                    decode_peak_mb = mb(decode_peak),
+                    "qwen image encoder read-ahead skipped: it does not fit beside the decode"
+                );
+            }
         }
         let loaded = match residency {
             Residency::Resident => {

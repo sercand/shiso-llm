@@ -231,8 +231,10 @@ fn one_block_matches_the_reference_on_the_cached_path() {
         eprintln!("{case}: prefix k head 0 cosine min {kmin:.6} mean {kmean:.6}");
         assert!(kmin >= 0.999, "{case} prefix keys");
 
+        dit.prepare_steps(&ops, &mut kv, &[sigma, 1.0], grid)
+            .expect("the step tables upload");
         let (x, _) = dit
-            .target_stream(&ops, &mut kv, lat.view(), grid, sigma)
+            .target_stream(&ops, &kv, lat.view(), grid, sigma)
             .expect("the target stream");
         let stream = ops.download("stream", x.view(), t * hidden).expect("read");
         drop(x);
@@ -245,7 +247,7 @@ fn one_block_matches_the_reference_on_the_cached_path() {
         assert!(bmin >= 0.999, "{case} block out");
 
         let out = ops.alloc_f32("velocity", t * channels).expect("alloc");
-        dit.velocity(&ops, &mut kv, lat.view(), grid, sigma, out.view())
+        dit.velocity(&ops, &kv, lat.view(), grid, sigma, out.view())
             .expect("the velocity");
         let velocity = ops
             .download("velocity", out.view(), t * channels)
@@ -259,7 +261,7 @@ fn one_block_matches_the_reference_on_the_cached_path() {
         assert!(vmin >= 0.998, "{case} model out");
         // The same prefix at another sigma still answers (the table and the
         // cache are reused, not consumed).
-        dit.velocity(&ops, &mut kv, lat.view(), grid, 1.0, out.view())
+        dit.velocity(&ops, &kv, lat.view(), grid, 1.0, out.view())
             .expect("a second step");
         let again = ops
             .download("velocity", out.view(), t * channels)
@@ -320,10 +322,12 @@ fn full_model_time_at_512() {
         prefix_ms.push(t0.elapsed().as_secs_f64() * 1e3);
     }
     let mut kv = kv.expect("a prefix ran");
+    dit.prepare_steps(&ops, &mut kv, &[0.9], grid)
+        .expect("the step tables upload");
     let mut velocity_ms = Vec::new();
     for _ in 0..4 {
         let t0 = Instant::now();
-        dit.velocity(&ops, &mut kv, lat.view(), grid, 0.9, out.view())
+        dit.velocity(&ops, &kv, lat.view(), grid, 0.9, out.view())
             .expect("velocity");
         sync();
         velocity_ms.push(t0.elapsed().as_secs_f64() * 1e3);

@@ -1,6 +1,7 @@
 //! Swap residency on the device: the encoder's bytes leave before the
-//! transformer's arrive, back-to-back jobs both finish, and a cached
-//! prompt runs with no swap.
+//! transformer's arrive, back-to-back jobs both finish, a cached prompt
+//! runs with no swap, and no path - a cached prompt after a resident job,
+//! a failed encode - imports the transformer beside the encoder.
 //!
 //! Requires a Metal device and `SHISO_TEST_MODEL_QWEN_IMAGE21` (the
 //! `turbo-int8` directory); without either it says so on stderr and
@@ -34,20 +35,16 @@ fn job(prompt: &str) -> ImageGenerationJob {
     }
 }
 
-#[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one scenario: load, two swapping jobs, the event audit, a cached job"
-)]
-#[ignore = "requires a Metal device and SHISO_TEST_MODEL_QWEN_IMAGE21"]
-fn swap_mode_releases_the_encoder_before_importing_the_transformer() {
+/// The Turbo install in forced swap mode, or `None` (with the reason on
+/// stderr) when the device or the model is missing.
+fn open_swap() -> Option<QwenImage21Model> {
     let Some(root) = std::env::var_os("SHISO_TEST_MODEL_QWEN_IMAGE21") else {
         eprintln!("note: SHISO_TEST_MODEL_QWEN_IMAGE21 is unset, skipping the swap case");
-        return;
+        return None;
     };
     if !shiso_metal::metal_available() {
         eprintln!("note: no Metal device on this machine, skipping the swap case");
-        return;
+        return None;
     }
     let root = PathBuf::from(root);
     let metal = shiso_metal::MetalBackend::new().expect("the kernel library compiles");
@@ -84,23 +81,13 @@ fn swap_mode_releases_the_encoder_before_importing_the_transformer() {
         ),
         "swap mode starts with the encoder loaded: {loaded:?}"
     );
+    Some(model)
+}
 
-    for (i, prompt) in [
-        "a lighthouse on a cliff at dusk",
-        "a bowl of ramen, top view",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let began = Instant::now();
-        let image = model
-            .generate(&job(prompt), None)
-            .expect("the job finishes");
-        assert!(!image.bytes.is_empty());
-        eprintln!("job {i}: {:.2} s", began.elapsed().as_secs_f64());
-    }
-    let events = model.events();
-    eprintln!("events: {events:?}");
+/// Walks the log: the transformer is never imported while the encoder is
+/// loaded, and each encoder drop gives back what its load took. Returns
+/// the encoder drops from `from` on.
+fn audit(events: &[ResidencyEvent], from: usize) -> usize {
     let te_load = events.iter().find_map(|e| match e {
         ResidencyEvent::Loaded {
             component: Component::Encoder,
@@ -108,10 +95,7 @@ fn swap_mode_releases_the_encoder_before_importing_the_transformer() {
         } => Some(*device_bytes),
         _ => None,
     });
-    // Every encoder drop is followed by the transformer's import, never
-    // preceded by it while the encoder is still loaded.
     let mut encoder_loaded = false;
-    let at_load = loaded.len();
     let mut te_drops = 0;
     for (index, event) in events.iter().enumerate() {
         match *event {
@@ -124,7 +108,7 @@ fn swap_mode_releases_the_encoder_before_importing_the_transformer() {
                 device_bytes,
             } => {
                 encoder_loaded = false;
-                if index >= at_load {
+                if index >= from {
                     te_drops += 1;
                 }
                 if let Some(added) = te_load {
@@ -146,13 +130,114 @@ fn swap_mode_releases_the_encoder_before_importing_the_transformer() {
             ResidencyEvent::Dropped { .. } => {}
         }
     }
-    assert_eq!(te_drops, 2, "both jobs encoded and dropped the encoder");
+    te_drops
+}
 
-    // The first prompt's features are cached: no component moves.
+#[test]
+#[ignore = "requires a Metal device and SHISO_TEST_MODEL_QWEN_IMAGE21"]
+fn swap_mode_releases_the_encoder_before_importing_the_transformer() {
+    let Some(model) = open_swap() else {
+        return;
+    };
+    let at_load = model.events().len();
+    for (i, prompt) in [
+        "a lighthouse on a cliff at dusk",
+        "a bowl of ramen, top view",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let began = Instant::now();
+        let image = model
+            .generate(&job(prompt), None)
+            .expect("the job finishes");
+        assert!(!image.bytes.is_empty());
+        eprintln!("job {i}: {:.2} s", began.elapsed().as_secs_f64());
+    }
+    let events = model.events();
+    eprintln!("events: {events:?}");
+    assert_eq!(
+        audit(&events, at_load),
+        2,
+        "both jobs encoded and dropped the encoder"
+    );
+
+    // The first prompt's features are cached and the transformer was kept:
+    // no component moves.
     let before = model.events().len();
     model
         .generate(&job("a lighthouse on a cliff at dusk"), None)
         .expect("the cached job finishes");
     let after = model.events();
-    eprintln!("cached-prompt job events: {:?}", &after[before..]);
+    assert_eq!(
+        after.len(),
+        before,
+        "a cached prompt moved components: {:?}",
+        &after[before..]
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal device and SHISO_TEST_MODEL_QWEN_IMAGE21"]
+fn no_path_imports_the_transformer_beside_the_encoder() {
+    let Some(model) = open_swap() else {
+        return;
+    };
+    let cached = "a lighthouse on a cliff at dusk";
+    model
+        .generate(&job(cached), None)
+        .expect("the first job finishes");
+
+    // (b) An encode that fails after the encoder is imported, then a job
+    // whose prompt is cached: the failed job must not leave the encoder
+    // where the cached job's transformer import lands.
+    let error = model
+        .failing_encode("a red fox in snow")
+        .expect_err("a vision placeholder id is refused");
+    eprintln!("failed encode: {error}");
+    let events = model.events();
+    assert!(
+        matches!(
+            events.last(),
+            Some(ResidencyEvent::Dropped {
+                component: Component::Encoder,
+                ..
+            })
+        ),
+        "the failed encode left the encoder loaded: {events:?}"
+    );
+    model
+        .generate(&job(cached), None)
+        .expect("the cached job after a failure finishes");
+    audit(&model.events(), 0);
+
+    // (a) The encoder loaded and the transformer not, as a resident job on
+    // a larger host leaves a model that is then re-planned to swap, then a
+    // cached prompt: the encoder must go before the transformer comes.
+    model.stage_encoder_loaded().expect("the encoder loads");
+    let before = model.events().len();
+    model
+        .generate(&job(cached), None)
+        .expect("the cached job after a resident state finishes");
+    let events = model.events();
+    eprintln!("after the staged resident state: {:?}", &events[before..]);
+    audit(&events, 0);
+    assert!(
+        matches!(
+            events[before..],
+            [
+                ResidencyEvent::Dropped {
+                    component: Component::Encoder,
+                    ..
+                },
+                ResidencyEvent::Loaded {
+                    component: Component::Denoiser,
+                    ..
+                }
+            ]
+        ),
+        "a cached prompt from the resident state must drop the encoder, then import the \
+         transformer: {:?}",
+        &events[before..]
+    );
 }

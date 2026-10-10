@@ -304,6 +304,18 @@ fn bad_schedules_are_refused() {
         resolve(ScheduleSource::Nodes(&[1.0, 0.5]), &turbo, 3, 1024),
         Err(ImageGenError::StepsFixed { steps: 3, fixed: 2 })
     ));
+    // A fixed ladder under a shifting config would not be run verbatim.
+    let (mut dynamic, mut static_shift, mut terminal) =
+        (turbo.clone(), turbo.clone(), turbo.clone());
+    dynamic.use_dynamic_shifting = true;
+    static_shift.shift = 3.0;
+    terminal.shift_terminal = Some(0.02);
+    for shifted in [dynamic, static_shift, terminal] {
+        assert!(matches!(
+            resolve(ScheduleSource::Fixed(&sample), &shifted, 8, 1024),
+            Err(ImageGenError::Checkpoint(_))
+        ));
+    }
     for bad in [&[1.0f32, 1.0][..], &[1.0, 0.0], &[0.5, 0.7], &[1.5, 0.5]] {
         assert!(
             matches!(

@@ -153,21 +153,29 @@ impl Embedders {
     }
 
     /// `temb`, the raw modulation and the output scale at `sigma`.
+    ///
+    /// Uploads the sinusoid, and an upload drains the device queue first:
+    /// for the load-time `t = 0` row and the tests. A step reads a row the
+    /// job uploaded once instead ([`Embedders::time_cond_of`]).
     pub(crate) fn time_cond<'o>(
         &self,
         ops: &'o Ops,
         sigma: f32,
     ) -> Result<TimeCond<'o>, ImageGenError> {
-        let h = self.hidden;
         let features = ops.upload_scratch("qwen sinusoid", &sinusoid(sigma))?;
+        self.time_cond_of(ops, features.view())
+    }
+
+    /// [`Embedders::time_cond`] from sinusoid features already on the
+    /// device, `(SINUSOID_DIM)`: no host transfer.
+    pub(crate) fn time_cond_of<'o>(
+        &self,
+        ops: &'o Ops,
+        features: DeviceView<'_>,
+    ) -> Result<TimeCond<'o>, ImageGenError> {
+        let h = self.hidden;
         let hidden1 = ops.alloc_f32("qwen temb", h)?;
-        Self::row(
-            ops,
-            "qwen temb 1",
-            &self.time_1,
-            features.view(),
-            hidden1.view(),
-        )?;
+        Self::row(ops, "qwen temb 1", &self.time_1, features, hidden1.view())?;
         ops.silu("qwen temb silu", hidden1.view(), hidden1.view(), h)?;
         let temb = ops.alloc_f32("qwen temb", h)?;
         Self::row(

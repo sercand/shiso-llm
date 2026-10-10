@@ -183,6 +183,20 @@ pub(crate) fn resolve(
     };
     let nodes: Vec<f64> = match source {
         ScheduleSource::Fixed(sigmas) => {
+            // A shipped ladder is run verbatim, which equals the reference
+            // only under an identity shift; any other shift would move every
+            // rung, so it is refused rather than silently ignored.
+            if shift.use_dynamic_shifting
+                || shift.shift.to_bits() != 1.0f64.to_bits()
+                || shift.shift_terminal.is_some()
+            {
+                return Err(ImageGenError::Checkpoint(format!(
+                    "sample_sigmas are run verbatim, but the scheduler config shifts them \
+                     (use_dynamic_shifting {}, shift {}, shift_terminal {:?}); a shifted \
+                     fixed ladder is not implemented",
+                    shift.use_dynamic_shifting, shift.shift, shift.shift_terminal
+                )));
+            }
             fixed_len(sigmas.len())?;
             check_falling("sample_sigmas", sigmas)?;
             let mut out = sigmas.to_vec();

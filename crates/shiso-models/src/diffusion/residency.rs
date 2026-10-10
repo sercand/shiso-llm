@@ -320,6 +320,7 @@ fn read_all(spans: &[FileSpan], stop: &AtomicBool) -> Result<PrefetchStats, Stri
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .get_or_insert(format!("opening {}: {e}", path.display()));
+                                stop.store(true, Ordering::Relaxed);
                                 return;
                             }
                         }
@@ -333,6 +334,9 @@ fn read_all(spans: &[FileSpan], stop: &AtomicBool) -> Result<PrefetchStats, Stri
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .get_or_insert(format!("reading {} at {from}: {e}", path.display()));
+                        // The import that follows would fail on the same
+                        // bytes: stop the other readers now.
+                        stop.store(true, Ordering::Relaxed);
                         return;
                     }
                     read.fetch_add(to - from, Ordering::Relaxed);
