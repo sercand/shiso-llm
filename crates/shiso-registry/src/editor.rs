@@ -316,8 +316,25 @@ pub(crate) fn registry_dir(out_root: &Path) -> PathBuf {
 
 /// Where a hub-hosted file lives under a repository or build root: beside the
 /// model's manifest, so the static host serves it from the same place.
+///
+/// `name` is a validated hub file name (see [`hub_file_name_ok`]): its
+/// segments never hold `.`/`..`, a separator other than `/` or a root, so the
+/// join stays under the model's directory; the assertion is a backstop for a
+/// caller that skipped the check.
 pub(crate) fn hosted_file_path(root: &Path, model: &str, name: &str) -> PathBuf {
-    registry_dir(root).join("models").join(model).join(name)
+    debug_assert!(
+        hub_file_name_ok(name),
+        "hosted file name '{name}' was not validated"
+    );
+    let dir = registry_dir(root).join("models").join(model);
+    let path = name.split('/').fold(dir.clone(), |p, seg| p.join(seg));
+    debug_assert!(
+        path.starts_with(&dir)
+            && !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+    );
+    path
 }
 
 /// Every problem with a recipe's hub-hosted files as committed in `repo`:
@@ -402,7 +419,7 @@ pub(crate) fn write_hosted_file(
     ModelName::parse(model).map_err(|e| anyhow::anyhow!("model name '{model}': {e}"))?;
     if !hub_file_name_ok(name) {
         bail!(
-            "'{name}' cannot be a hosted file name: one plain name, not index.json or benchmarks.json"
+            "'{name}' cannot be a hosted file name: 1-4 plain '/'-separated names, none starting with '.', not index.json or benchmarks.json"
         );
     }
     let size = bytes.len() as u64;
@@ -713,9 +730,10 @@ fn touches_hosted_file(line: &str) -> bool {
     line.split_whitespace().last().is_some_and(|path| {
         path.strip_prefix("registry/v1/models/")
             .is_some_and(|rest| {
-                rest.rsplit('/')
-                    .next()
-                    .is_some_and(|name| rest.contains('/') && !RESERVED_MODEL_FILES.contains(&name))
+                // `<model>/<file...>`: the build's own files are directly
+                // under the model; a nested `sub/index.json` is hosted.
+                rest.split_once('/')
+                    .is_some_and(|(_, file)| !RESERVED_MODEL_FILES.contains(&file))
             })
     })
 }

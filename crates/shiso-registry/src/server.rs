@@ -143,7 +143,7 @@ pub(crate) fn build_router(state: Arc<ServerState>) -> Router {
         )
         .route("/api/hf/inspect", post(inspect_hf_handler))
         .route(
-            "/api/models/{model}/files/{file}",
+            "/api/models/{model}/files/{*file}",
             axum::routing::put(put_hosted_file_handler)
                 .layer(axum::extract::DefaultBodyLimit::max(HOSTED_FILE_BODY_LIMIT)),
         )

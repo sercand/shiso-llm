@@ -664,19 +664,59 @@ pub const HUB_FILE_MAX_BYTES: u64 = 1_048_576;
 /// file sharing that directory may not be named.
 pub const RESERVED_MODEL_FILES: [&str; 2] = ["index.json", "benchmarks.json"];
 
-/// Whether `name` can be a hub-hosted file: `[A-Za-z0-9][A-Za-z0-9._-]*`,
-/// not one of the build's own files.
+/// Most `/`-separated segments a hub file name may have.
+pub const HUB_FILE_MAX_SEGMENTS: usize = 4;
+
+/// Longest hub file name, in bytes.
+pub const HUB_FILE_NAME_MAX_LEN: usize = 255;
+
+/// Whether `name` can be a hub-hosted file: one to four `/`-separated
+/// segments, each `[A-Za-z0-9][A-Za-z0-9._-]*`, and neither the name nor its
+/// first segment is one of the build's own files.
 ///
-/// Narrower than a path segment on purpose. The name becomes a URL path
-/// segment as-is (so no `?`, `#`, `%` or spaces), a path `git status` prints
-/// unquoted and whitespace-free (so the dirty check can see it), and a file
-/// the static host serves (so no leading dot).
+/// Narrower than a path on purpose. The name becomes a URL path as-is (so no
+/// `?`, `#`, `%`, spaces or `\`), a path `git status` prints unquoted and
+/// whitespace-free (so the dirty check can see it), and files the static host
+/// serves (so no leading dot in any segment). The first-character rule also
+/// rules out `.` and `..`, so a join under the model directory cannot leave
+/// it. Nesting exists for diffusers-style asset directories
+/// (`scheduler/scheduler_config.json`). Reserving the first segment keeps
+/// `index.json/x` from shadowing the manifest with a directory. Whether two
+/// names are a file and a directory of each other is a property of a set of
+/// names, checked by [`hub_file_set_conflict`].
 #[must_use]
 pub fn hub_file_name_ok(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        && !RESERVED_MODEL_FILES.contains(&name)
+    if name.len() > HUB_FILE_NAME_MAX_LEN {
+        return false;
+    }
+    let mut count = 0;
+    for segment in name.split('/') {
+        count += 1;
+        let mut chars = segment.chars();
+        let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !ok || (count == 1 && RESERVED_MODEL_FILES.contains(&segment)) {
+            return false;
+        }
+    }
+    count <= HUB_FILE_MAX_SEGMENTS
+}
+
+/// The first pair of names in `names` where one is a directory prefix of the
+/// other (`a` and `a/b`): no file system holds both.
+#[must_use]
+pub fn hub_file_set_conflict<'a>(names: &[&'a str]) -> Option<(&'a str, &'a str)> {
+    for file in names {
+        for other in names {
+            if other.len() > file.len()
+                && other.starts_with(file)
+                && other.as_bytes()[file.len()] == b'/'
+            {
+                return Some((file, other));
+            }
+        }
+    }
+    None
 }
 
 /// Where a component's files are downloaded from.

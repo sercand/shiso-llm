@@ -655,3 +655,72 @@ async fn a_recipe_this_client_cannot_parse_still_asks_for_an_upgrade() {
         .unwrap_err();
     assert!(matches!(err, HubError::VersionMismatch { .. }), "{err:?}");
 }
+
+/// A nested hub file is fetched from `models/<name>/<nested name>` and lands at
+/// `<variant dir>/<role dir>/<nested name>`, parent directories created.
+#[tokio::test]
+async fn a_nested_hub_file_is_fetched_and_installed_under_its_directory() {
+    use shiso_hub::recipe::Recipe;
+    use shiso_hub::store::BlobStore;
+
+    let server = MockServer::start().await;
+    let payload = br#"{"shift": 3.0}"#;
+    let sha = hex::encode(Sha256Hasher::digest(payload));
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/models/qwen-image-test/scheduler/scheduler_config.json",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let config = HubConfig {
+        home: temp.path().to_path_buf(),
+        registry: RegistryEndpoint {
+            url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+        },
+        hf_endpoint: url::Url::parse("https://hf.invalid").unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    };
+    let recipe: Recipe = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "name": "qwen-image-test",
+        "family": "qwen-image",
+        "min_shiso_version": "0.2.0",
+        "description": "d",
+        "modalities": {"inputs": ["text"], "outputs": ["image"]},
+        "features": {},
+        "variants": [{
+            "key": "k",
+            "backends": ["metal"],
+            "quant": "q",
+            "requirements": {"min_ram_bytes": 1, "disk_bytes": payload.len()},
+            "components": {"image_assets": {
+                "provider": "shiso",
+                "files": [{"name": "scheduler/scheduler_config.json",
+                           "size": payload.len(), "sha256": sha}]
+            }}
+        }]
+    }))
+    .unwrap();
+    let variant = &recipe.variants[0];
+
+    Downloader::new(config.clone())
+        .download_variant("qwen-image-test", variant, None)
+        .await
+        .unwrap();
+    let store = BlobStore::new(config);
+    let manifest_sha = Sha256::parse(&"0".repeat(64)).unwrap();
+    store
+        .install_variant(&recipe, variant, &manifest_sha)
+        .unwrap();
+    let installed = store
+        .variant_dir(&recipe.name, &variant.key)
+        .join("image_assets")
+        .join("scheduler")
+        .join("scheduler_config.json");
+    assert_eq!(fs::read(installed).unwrap(), payload);
+}

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use crate::error::HubError;
 use crate::recipe::{
     CURRENT_SCHEMA_VERSION, Component, HUB_FILE_MAX_BYTES, Provider, Recipe, Role, RolePath,
-    Variant, hub_file_name_ok,
+    Variant, hub_file_name_ok, hub_file_set_conflict,
 };
 
 /// External family facts passed to validator to verify a recipe matches engine capabilities.
@@ -460,6 +460,17 @@ fn validate_components(variant: &Variant, mode: ValidationMode) -> Result<(), Hu
             total_disk_bytes = total_disk_bytes.saturating_add(file.size);
         }
 
+        let names: Vec<&str> = comp.files.iter().map(|f| f.name.as_str()).collect();
+        if let Some((file, dir)) = hub_file_set_conflict(&names) {
+            return Err(HubError::Validation {
+                reason: format!(
+                    "variant '{}' role '{}' declares '{file}' as a file and '{dir}' beneath it",
+                    variant.key.as_str(),
+                    role.as_str()
+                ),
+            });
+        }
+
         if let Some(entry) = &comp.entry
             && !file_names.contains(entry)
         {
@@ -527,7 +538,7 @@ fn validate_provider(variant: &Variant, role: Role, comp: &Component) -> Result<
                         variant,
                         role,
                         &format!(
-                            "hub file '{}' must be one plain name, not index.json or benchmarks.json",
+                            "hub file '{}' must be 1-4 plain '/'-separated names (letters, digits, '.', '_', '-'; at most 255 bytes) and not start with index.json or benchmarks.json",
                             file.name
                         ),
                     ));

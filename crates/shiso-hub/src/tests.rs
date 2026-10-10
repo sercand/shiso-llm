@@ -889,19 +889,50 @@ fn an_unknown_provider_does_not_parse() {
 }
 
 #[test]
-fn hub_file_names_are_flat_and_not_reserved() {
-    assert!(hub_file_name_ok("draft_vocab_counts.txt"));
+fn hub_file_names_may_nest_up_to_four_safe_segments() {
+    for ok in [
+        "draft_vocab_counts.txt",
+        "scheduler/scheduler_config.json",
+        "a/b/c/d.json",
+        "model_index.json",
+    ] {
+        assert!(hub_file_name_ok(ok), "{ok}");
+    }
+    let long_segment = "a".repeat(256);
     for bad in [
         "",
-        "a/b.txt",
         "..",
         ".",
         "index.json",
         "benchmarks.json",
+        "index.json/x",
+        "benchmarks.json/x",
         "/x",
+        "/a",
+        "a/",
+        "a//b",
+        "../a",
+        "a/../b",
+        "a/./b",
+        "a\\b",
+        ".hidden/x",
+        "a/.hidden",
+        "a/b/c/d/e.json",
+        long_segment.as_str(),
     ] {
         assert!(!hub_file_name_ok(bad), "{bad}");
     }
+    // Only the first segment is reserved: a nested `index.json` is a file.
+    assert!(hub_file_name_ok("vae/index.json"));
+}
+
+#[test]
+fn a_file_and_a_directory_of_the_same_name_conflict() {
+    use crate::recipe::hub_file_set_conflict;
+    assert_eq!(hub_file_set_conflict(&["a", "a/b"]), Some(("a", "a/b")));
+    assert_eq!(hub_file_set_conflict(&["a/b", "a"]), Some(("a", "a/b")));
+    assert_eq!(hub_file_set_conflict(&["a", "ab/c", "a.b"]), None);
+    assert_eq!(hub_file_set_conflict(&["s/a.json", "s/b.json"]), None);
 }
 
 /// A variant whose base speculates through its own built-in head (no `draft`
@@ -940,6 +971,22 @@ fn hub_recipe(variant: Variant) -> Recipe {
 }
 
 #[test]
+fn a_nested_hub_file_validates_but_a_file_and_its_directory_do_not() {
+    let mut variant = hub_vocab_variant();
+    let comp = variant.components.get_mut(&Role::DraftVocab).unwrap();
+    comp.files[0].name = "scheduler/scheduler_config.json".to_string();
+    comp.entry = Some(comp.files[0].name.clone());
+    validate_recipe(&hub_recipe(variant.clone()), ValidationMode::Strict).unwrap();
+
+    let comp = variant.components.get_mut(&Role::DraftVocab).unwrap();
+    let mut clash = comp.files[0].clone();
+    clash.name = "scheduler".to_string();
+    comp.files.push(clash);
+    let err = validate_recipe(&hub_recipe(variant), ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("beneath"), "{err}");
+}
+
+#[test]
 fn a_hub_draft_vocabulary_beside_a_speculating_base_validates() {
     validate_recipe(&hub_recipe(hub_vocab_variant()), ValidationMode::Strict).unwrap();
 }
@@ -960,7 +1007,7 @@ fn a_draft_vocabulary_is_a_file() {
 }
 
 #[test]
-fn a_hub_component_refuses_repo_revision_nested_names_and_big_files() {
+fn a_hub_component_refuses_repo_revision_deep_names_and_big_files() {
     let cases: [fn(&mut Component); 5] = [
         |c| c.repo = Some("o/r".to_string()),
         |c| {
@@ -968,8 +1015,8 @@ fn a_hub_component_refuses_repo_revision_nested_names_and_big_files() {
                 Some(CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap());
         },
         |c| {
-            c.files[0].name = "sub/v.txt".to_string();
-            c.entry = Some("sub/v.txt".to_string());
+            c.files[0].name = "a/b/c/d/v.txt".to_string();
+            c.entry = Some("a/b/c/d/v.txt".to_string());
         },
         |c| {
             c.files[0].name = "index.json".to_string();

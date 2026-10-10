@@ -965,7 +965,7 @@ async function uploadHostedFile(vIdx, role, file) {
   if (file.size > 1048576) { alert(`${file.name} is ${file.size} bytes; the hub hosts at most 1 MiB.`); return; }
   const model = buildRecipeObjectFromForm().name;
   if (!model) { alert("Set the model name first: the file is stored beside that model's index.json."); return; }
-  const res = await api(`/api/models/${encodeURIComponent(model)}/files/${encodeURIComponent(file.name)}`,
+  const res = await api(`/api/models/${encodeURIComponent(model)}/files/${file.name.split("/").map(encodeURIComponent).join("/")}`,
                         { method: 'PUT', body: await file.arrayBuffer() });
   if (!res.ok) { alert(await res.text()); return; }
   const entry = await res.json();
