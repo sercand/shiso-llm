@@ -706,6 +706,87 @@ fn image_text_encoder_and_vae_roles_bind_files_beside_an_image() {
     assert!(err.to_string().contains("image_vae"), "{err}");
 }
 
+/// An image variant whose prompt tokenizer is a `tokenizer.json` of the
+/// image repository bound to `image_tokenizer`, beside the assets.
+fn tokenizer_image_variant() -> Variant {
+    let mut variant = image_variant();
+    let image = variant.components.get_mut(&Role::Image).unwrap();
+    let sha = image.files[0].sha256.clone();
+    image.files.push(FileEntry {
+        name: "tokenizer.json".to_string(),
+        size: 10,
+        sha256: sha,
+        binds: Some(Role::ImageTokenizer),
+    });
+    variant.requirements.disk_bytes = 50;
+    variant
+}
+
+#[test]
+fn image_tokenizer_role_binds_a_file_beside_an_image() {
+    assert_eq!(
+        "image_tokenizer".parse::<Role>().unwrap(),
+        Role::ImageTokenizer
+    );
+    assert_eq!(Role::ImageTokenizer.as_str(), "image_tokenizer");
+    assert_eq!(Role::ImageTokenizer.flag_name(), "--image-tokenizer");
+
+    let mut recipe = make_test_recipe();
+    let variant = tokenizer_image_variant();
+    let paths = variant.role_paths().unwrap();
+    assert_eq!(paths[&Role::ImageTokenizer].dir, Role::Image);
+    assert_eq!(paths[&Role::ImageTokenizer].file, Some("tokenizer.json"));
+    recipe.variants = vec![variant];
+    validate_recipe(&recipe, ValidationMode::Strict).unwrap();
+
+    // Nothing to tokenize for without an image model.
+    let mut variant = tokenizer_image_variant();
+    variant.components.remove(&Role::ImageAssets);
+    let image = variant.components.remove(&Role::Image).unwrap();
+    let mut stray = image.clone();
+    stray.entry = None;
+    stray
+        .files
+        .retain(|f| f.binds == Some(Role::ImageTokenizer));
+    variant.components.insert(Role::Vision, stray);
+    variant.components.insert(
+        Role::Base,
+        make_test_recipe().variants[0].components[&Role::Base].clone(),
+    );
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("image_tokenizer"), "{err}");
+
+    // A directory is not the file the flag names.
+    let mut variant = image_variant();
+    variant.components.insert(
+        Role::ImageTokenizer,
+        variant.components[&Role::ImageAssets].clone(),
+    );
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("image_tokenizer"), "{err}");
+
+    // A component of its own naming the file by entry is the other source.
+    let mut variant = image_variant();
+    let mut own = variant.components[&Role::ImageAssets].clone();
+    own.entry = Some("tokenizer/tokenizer.json".to_string());
+    variant.components.insert(Role::ImageTokenizer, own);
+    variant.requirements.disk_bytes = 70;
+    recipe.variants = vec![variant];
+    validate_recipe(&recipe, ValidationMode::Strict).unwrap();
+
+    // One role, one source.
+    let mut variant = tokenizer_image_variant();
+    let mut own = variant.components[&Role::Image].clone();
+    own.entry = None;
+    own.files.retain(|f| f.binds == Some(Role::ImageTokenizer));
+    variant.components.insert(Role::ImageTokenizer, own);
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("image_tokenizer"), "{err}");
+}
+
 #[test]
 fn info_and_quality_are_checked() {
     use crate::recipe::{CardSource, CommitSha, ModelInfo, QualityScope, QualityScore};

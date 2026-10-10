@@ -298,7 +298,7 @@ fn validate_role_shapes(
     variant: &Variant,
     roles: &BTreeMap<Role, RolePath<'_>>,
 ) -> Result<(), HubError> {
-    // `--config`, `--ngram` and the split image weights name files; a directory there would be read as
+    // `--config`, `--ngram` and the split image files name files; a directory there would be read as
     // one and fail at boot, so the recipe has to say which file it is.
     for role in [
         Role::Config,
@@ -306,6 +306,7 @@ fn validate_role_shapes(
         Role::DraftVocab,
         Role::ImageTextEncoder,
         Role::ImageVae,
+        Role::ImageTokenizer,
     ] {
         if let Some(place) = roles.get(&role)
             && place.file.is_none()
@@ -405,7 +406,7 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
         });
     }
 
-    for role in [Role::ImageTextEncoder, Role::ImageVae] {
+    for role in [Role::ImageTextEncoder, Role::ImageVae, Role::ImageTokenizer] {
         if roles.contains_key(&role) && !has_image {
             return Err(HubError::Validation {
                 reason: format!(

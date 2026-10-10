@@ -142,3 +142,28 @@ fn an_over_long_prompt_is_refused_with_its_count() {
         .expect("a prompt at the cap encodes");
     assert_eq!(ok.kept().len(), MAX_PROMPT_TOKENS);
 }
+
+/// `--image-tokenizer` (and the hub's `image_tokenizer` role) names a lone
+/// `tokenizer.json` file: copied into an empty directory, with no
+/// `tokenizer_config.json` or chat template beside it, it loads and
+/// encodes every fixture prompt exactly as the processor directory does.
+#[test]
+fn a_lone_tokenizer_file_encodes_like_the_processor_directory() {
+    let Some(dir) = processor_dir() else { return };
+    let lone = std::env::temp_dir().join(format!("shiso-qwen-tokenizer-{}", std::process::id()));
+    std::fs::create_dir_all(&lone).expect("mkdir");
+    let file = lone.join("tokenizer.json");
+    std::fs::copy(dir.join("tokenizer.json"), &file).expect("copy");
+    let from_dir = QwenImagePrompt::load(&dir).expect("the processor directory loads");
+    let from_file = QwenImagePrompt::load(&file).expect("the lone file loads");
+    let fixture = fixture();
+    for case in ["cat", "empty", "scene60", "cjk", "special_literal"] {
+        let text = fixture["cases"][case]["prompt"].as_str().expect("a prompt");
+        assert_eq!(
+            from_file.tokenize(text).expect("encodes").ids,
+            from_dir.tokenize(text).expect("encodes").ids,
+            "{case}"
+        );
+    }
+    std::fs::remove_dir_all(&lone).expect("cleanup");
+}

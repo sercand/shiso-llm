@@ -406,6 +406,12 @@ pub enum Role {
     ///
     /// The counterpart of [`Role::ImageTextEncoder`] for the VAE. Names a file.
     ImageVae,
+    /// Prompt tokenizer file (`--image-tokenizer`), a `tokenizer.json`.
+    ///
+    /// The counterpart of [`Role::ImageTextEncoder`] for the tokenizer the
+    /// prompt is split with, when no assets directory carries it. Names a
+    /// file.
+    ImageTokenizer,
     /// Per-layer n-gram embedding table (`--ngram`).
     ///
     /// For a checkpoint that keeps the table in a file of its own rather than
@@ -436,6 +442,7 @@ impl Role {
             Self::ImageAssets => "--image-assets-dir",
             Self::ImageTextEncoder => "--image-text-encoder",
             Self::ImageVae => "--image-vae",
+            Self::ImageTokenizer => "--image-tokenizer",
             Self::Ngram => "--ngram",
             Self::Config => "--config",
         }
@@ -456,6 +463,7 @@ impl Role {
             Self::ImageAssets => "image_assets",
             Self::ImageTextEncoder => "image_text_encoder",
             Self::ImageVae => "image_vae",
+            Self::ImageTokenizer => "image_tokenizer",
             Self::Ngram => "ngram",
             Self::Config => "config",
         }
@@ -483,6 +491,7 @@ impl FromStr for Role {
             "image_assets" => Ok(Self::ImageAssets),
             "image_text_encoder" => Ok(Self::ImageTextEncoder),
             "image_vae" => Ok(Self::ImageVae),
+            "image_tokenizer" => Ok(Self::ImageTokenizer),
             "ngram" => Ok(Self::Ngram),
             "config" => Ok(Self::Config),
             _ => Err(HubError::Validation {
