@@ -679,3 +679,247 @@ pub fn the_output_gate_is_a_sigmoid_and_stops_at_n(gpu: &Gpu) {
         .collect();
     agree(&gpu.read_f32(&x_dev), &want, 1e-5, "output gate");
 }
+
+// ---------------------------------------------------------------------------
+// the tensor-core attention
+// ---------------------------------------------------------------------------
+
+/// The module of the exact tensor-core attention, mirroring
+/// `kernels::MOD_EXACT`.
+const MODULE_EXACT: &str = "q4e_exact";
+/// Keys per tile of the tensor-core attention, `kernels::TC_KT`.
+const TC_KT: u32 = 64;
+/// Shared memory of the ported tensor-core attention, `kernels::TC_SMEM`: the
+/// query, key and value tiles, the score rows, the f16 weights and the rescale
+/// factors.
+const TC_SMEM: u32 = (16 + 2 * TC_KT) * HD * 2 + 16 * TC_KT * 4 + 16 * TC_KT * 2 + 16 * 4;
+/// Shared memory of the exact one, `kernels::TC_EXACT_SMEM`: the same plus the
+/// low half of every weight.
+const TC_EXACT_SMEM: u32 = TC_SMEM + 16 * TC_KT * 2;
+/// Splits the sparse entry takes at a row count, `kernels::tc_splits_sparse`.
+const fn tc_splits_sparse(n_tok: u32) -> u32 {
+    if n_tok * KV_HEADS >= 64 {
+        1
+    } else {
+        ATTN_GSPLITS
+    }
+}
+
+/// The error budget of the tensor-core attention against the `f64` oracle.
+///
+/// The ported kernel rounds each softmax weight to f16 before the P V product
+/// while the denominator sums the f32 weights, a relative error up to 2^-11 a
+/// weight that nothing cancels; over a short key list that is ~1e-4 on the
+/// output. The exact kernel carries the weight as two f16 halves, which leaves
+/// the f32 sum order and the fast `exp`. Measured on a GB10 over the cases
+/// below (gathered, dense): ported 1.2e-4 and 1.6e-4, exact 3.5e-7 and 6.0e-7.
+/// The budget sits between the two, so it says which kernel ran.
+const TC_EXACT_TOL: f64 = 2e-5;
+
+/// Which tensor-core attention entry a case runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcEntry {
+    /// `q4e_qsa_attention_tc_kernel`, the ported kernel the engine no longer
+    /// routes to.
+    Ported,
+    /// `q4e_qsa_attention_tc_exact_kernel`.
+    Exact,
+}
+
+impl TcEntry {
+    fn kernel(self) -> KernelRef {
+        match self {
+            Self::Ported => KernelRef::new(MODULE_SPARSE, "q4e_qsa_attention_tc_kernel"),
+            Self::Exact => KernelRef::new(MODULE_EXACT, "q4e_qsa_attention_tc_exact_kernel"),
+        }
+    }
+
+    const fn smem(self) -> u32 {
+        match self {
+            Self::Ported => TC_SMEM,
+            Self::Exact => TC_EXACT_SMEM,
+        }
+    }
+}
+
+/// The largest `|got - want| / (1 + |want|)` over a pass, and where it is.
+fn worst(got: &[f32], want: &[f64]) -> (f64, usize) {
+    assert_eq!(got.len(), want.len(), "lengths");
+    got.iter()
+        .zip(want)
+        .map(|(&g, &w)| (f64::from(g) - w).abs() / (1.0 + w.abs()))
+        .enumerate()
+        .fold((0.0, 0), |acc, (i, e)| if e > acc.0 { (e, i) } else { acc })
+}
+
+/// Runs a tensor-core attention over the selection `lists`, sliced the way the
+/// sparse entry slices it, and returns the folded output with its oracle.
+fn tc_gathered(gpu: &Gpu, entry: TcEntry, lists: &[Vec<i32>], seed: u32) -> (Vec<f32>, Vec<f64>) {
+    let cache = Cache::new(gpu);
+    let n_tok = lists.len() as u32;
+    let splits = tc_splits_sparse(n_tok);
+    let q = queries(n_tok, seed);
+    let mut tokens = vec![-1i32; (n_tok * IDX_WIDTH) as usize];
+    let mut counts = Vec::new();
+    for (t, list) in lists.iter().enumerate() {
+        let base = t * IDX_WIDTH as usize;
+        tokens[base..base + list.len()].copy_from_slice(list);
+        counts.push(list.len() as i32);
+    }
+    // Zero positions: the gathered entry reads its list, never a position.
+    let positions = vec![0i32; n_tok as usize];
+    let out_len = (n_tok * HEADS * HD) as usize;
+    let out = gpu.upload(&f32_bytes(&vec![f32::NAN; out_len]));
+    let part_len = (n_tok * HEADS * splits * PART_STRIDE) as usize;
+    let part = gpu.upload(&f32_bytes(&vec![f32::NAN; part_len]));
+    let q_dev = gpu.upload(&f32_bytes(&q));
+    let tokens_dev = gpu.upload(&i32_bytes(&tokens));
+    let counts_dev = gpu.upload(&i32_bytes(&counts));
+    let pos_dev = gpu.upload(&i32_bytes(&positions));
+    // One slice writes the destination; more write slabs the combine folds.
+    let (out_arg, part_arg) = if splits == 1 {
+        (KernelArg::Buffer(out.view()), KernelArg::U64(0))
+    } else {
+        (KernelArg::U64(0), KernelArg::Buffer(part.view()))
+    };
+    run(
+        gpu,
+        entry.kernel(),
+        &LaunchArgs {
+            grid: Extent3::new(splits, KV_HEADS, n_tok),
+            block: Extent3::new(BLOCK_LINEAR, 1, 1),
+            smem_bytes: entry.smem(),
+            args: &[
+                out_arg,
+                part_arg,
+                KernelArg::Buffer(cache.k_dev.view()),
+                KernelArg::Buffer(cache.v_dev.view()),
+                KernelArg::Buffer(q_dev.view()),
+                KernelArg::Buffer(tokens_dev.view()),
+                KernelArg::Buffer(counts_dev.view()),
+                KernelArg::Buffer(pos_dev.view()),
+                KernelArg::Buffer(cache.pages_dev.view()),
+                KernelArg::U32(IDX_WIDTH),
+                KernelArg::U32(HEADS),
+                KernelArg::U32(KV_HEADS),
+                KernelArg::U32(splits),
+            ],
+        },
+    );
+    if splits > 1 {
+        combine(gpu, &out, &part, n_tok, splits);
+    }
+    drain(gpu);
+    let group = (HEADS / KV_HEADS) as usize;
+    let mut want = Vec::new();
+    for (t, list) in lists.iter().enumerate() {
+        for h in 0..HEADS as usize {
+            let qs = scaled_query(&q, t, h, true);
+            want.extend(cache.attend(&qs, h / group, list.iter().map(|&p| p as u32)));
+        }
+    }
+    (gpu.read_f32(&out), want)
+}
+
+/// Runs a tensor-core attention over the dense causal range of each row - no
+/// selection list, one slice, the destination written directly - and returns
+/// the output with its oracle.
+fn tc_dense(gpu: &Gpu, entry: TcEntry, positions: &[i32], seed: u32) -> (Vec<f32>, Vec<f64>) {
+    let cache = Cache::new(gpu);
+    let n_tok = positions.len() as u32;
+    let q = queries(n_tok, seed);
+    let out_len = (n_tok * HEADS * HD) as usize;
+    let out = gpu.upload(&f32_bytes(&vec![f32::NAN; out_len]));
+    let q_dev = gpu.upload(&f32_bytes(&q));
+    let pos_dev = gpu.upload(&i32_bytes(positions));
+    run(
+        gpu,
+        entry.kernel(),
+        &LaunchArgs {
+            grid: Extent3::new(1, KV_HEADS, n_tok),
+            block: Extent3::new(BLOCK_LINEAR, 1, 1),
+            smem_bytes: entry.smem(),
+            args: &[
+                KernelArg::Buffer(out.view()),
+                KernelArg::U64(0),
+                KernelArg::Buffer(cache.k_dev.view()),
+                KernelArg::Buffer(cache.v_dev.view()),
+                KernelArg::Buffer(q_dev.view()),
+                KernelArg::U64(0),
+                KernelArg::U64(0),
+                KernelArg::Buffer(pos_dev.view()),
+                KernelArg::Buffer(cache.pages_dev.view()),
+                KernelArg::U32(IDX_WIDTH),
+                KernelArg::U32(HEADS),
+                KernelArg::U32(KV_HEADS),
+                KernelArg::U32(1),
+            ],
+        },
+    );
+    drain(gpu);
+    (
+        gpu.read_f32(&out),
+        causal_oracle(&cache, &q, positions, true),
+    )
+}
+
+/// The selection rows of the gathered cases: a long row over every slice and
+/// a short one whose 37 keys leave each weight's rounding nowhere to average
+/// out.
+fn tc_lists() -> [Vec<i32>; 2] {
+    [selection(3_000, 2_048), selection(700, 37)]
+}
+
+/// Sixteen rows (the dense entry's floor) at positions from the first key to
+/// past a page boundary: the short rows are where a rounded weight shows.
+fn tc_positions() -> Vec<i32> {
+    [0, 1, 2, 3, 5, 8, 13, 21]
+        .into_iter()
+        .chain(250..258)
+        .collect()
+}
+
+/// The exact tensor-core attention over a selection agrees with the `f64`
+/// oracle's f32-weighted softmax within [`TC_EXACT_TOL`].
+pub fn the_tensor_core_attention_matches_fp32_weights(gpu: &Gpu) {
+    let (got, want) = tc_gathered(gpu, TcEntry::Exact, &tc_lists(), 43);
+    agree(
+        &got,
+        &want,
+        TC_EXACT_TOL,
+        "exact tensor-core attention, gathered",
+    );
+}
+
+/// The same over the dense causal range, the prefill path.
+pub fn the_dense_tensor_core_attention_matches_fp32_weights(gpu: &Gpu) {
+    let (got, want) = tc_dense(gpu, TcEntry::Exact, &tc_positions(), 47);
+    agree(
+        &got,
+        &want,
+        TC_EXACT_TOL,
+        "exact tensor-core attention, dense",
+    );
+}
+
+/// The budget the two cases above grade at is one the ported kernel fails,
+/// over both paths: without this, a budget loose enough to pass the rounded
+/// weights would make those cases say nothing about which kernel ran.
+///
+/// # Panics
+///
+/// When the ported kernel meets the exact kernel's budget.
+pub fn the_ported_tensor_core_attention_misses_that_budget(gpu: &Gpu) {
+    let (got, want) = tc_gathered(gpu, TcEntry::Ported, &tc_lists(), 43);
+    let (err, at) = worst(&got, &want);
+    assert!(
+        err > TC_EXACT_TOL,
+        "ported gathered: worst error {err:e} at {at} is inside {TC_EXACT_TOL:e}"
+    );
+    let (got, want) = tc_dense(gpu, TcEntry::Ported, &tc_positions(), 47);
+    let (err, at) = worst(&got, &want);
+    assert!(
+        err > TC_EXACT_TOL,
+        "ported dense: worst error {err:e} at {at} is inside {TC_EXACT_TOL:e}"
+    );
+}

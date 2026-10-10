@@ -771,7 +771,7 @@ fn a_pass_that_crosses_the_indexer_budget_attends_each_row_as_its_own_step_would
         "the two rows below the budget attend densely, in every attention slot"
     );
     assert_eq!(
-        rows_of(&pass, "q4e_qsa_attention_tc_kernel", 'z'),
+        rows_of(&pass, "q4e_qsa_attention_tc_exact_kernel", 'z'),
         vec![2; fixture::ATTN_SLOTS],
         "the two rows past it attend over their selections"
     );
@@ -801,7 +801,7 @@ fn a_pass_wholly_past_the_budget_attends_in_one_launch() {
     assert!(pass.selected);
     assert!(rows_of(&pass, "q4e_qsa_attention_split_kernel", 'x').is_empty());
     assert_eq!(
-        rows_of(&pass, "q4e_qsa_attention_tc_kernel", 'z'),
+        rows_of(&pass, "q4e_qsa_attention_tc_exact_kernel", 'z'),
         vec![4; fixture::ATTN_SLOTS]
     );
 }
@@ -832,7 +832,7 @@ fn each_run_of_a_segmented_verify_crosses_the_budget_where_its_own_rows_do() {
         "the crossing run's one row below the budget attends densely"
     );
     assert_eq!(
-        rows_of(&pass, "q4e_qsa_attention_tc_kernel", 'z'),
+        rows_of(&pass, "q4e_qsa_attention_tc_exact_kernel", 'z'),
         [3, 4].repeat(fixture::ATTN_SLOTS),
         "the rest of the crossing run, and the whole of the other, attend over selections"
     );
@@ -1295,7 +1295,11 @@ mod plan_snapshot;
 /// must not move one of these. `SHISO_RECORD_SNAPSHOT=1` rewrites the file,
 /// which is only right on that commit: the committed file was recorded there,
 /// from a separate checkout of 8662c67a with `common/plan_snapshot.rs` and this
-/// test copied in, and is never re-recorded on a later commit.
+/// test copied in, and is never re-recorded on a later commit - with one
+/// exception: both tensor-core attention paths moved to the exact-weight
+/// entry (`q4e_exact`, 81,984 bytes of shared memory), and the snapshot was
+/// re-recorded for that and checked to differ in exactly those 24 launches'
+/// module, entry and size.
 #[test]
 fn a_standard_requests_passes_plan_what_they_planned_before_scoring_batched() {
     let got = plan_snapshot::snapshot();

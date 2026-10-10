@@ -27,7 +27,7 @@ use shiso_core::error::CoreResult;
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
 use crate::sparse::indexer::{self, Scorer};
 use crate::sparse::inputs::MROPE_PREFIX_BYTES;
-use crate::sparse::kernels::{self, Entry, MOD_QSA, MOD_QSA_SPARSE};
+use crate::sparse::kernels::{self, Entry, MOD_EXACT, MOD_QSA, MOD_QSA_SPARSE};
 use crate::sparse::matmul::{self, Bound, Device, PassRole};
 use crate::sparse::moe::{RowOrigin, Segments};
 use crate::sparse::paged::Plane;
@@ -352,10 +352,14 @@ fn attend_at(
         ),
         // One slice, so the kernel writes the destination itself and there is
         // nothing to fold. The dense entry reads the whole causal range, which
-        // is what the absent selection list says.
+        // is what the absent selection list says. Both tensor-core paths take
+        // the exact entry: the ported one rounds every softmax weight to f16
+        // before the P V product, an error the f32 denominator does not share
+        // (1.6e-4 against 6e-7 on the kernel case's short rows). It is the
+        // ported kernel's arguments and grid, so it is a drop-in.
         AttnPath::TensorCore => plan.launch(
-            Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_tc_kernel"),
-            kernels::qsa_attention_tc(shape.gqa.kv_heads, n_tok, 1),
+            Entry::plain(MOD_EXACT, "q4e_qsa_attention_tc_exact_kernel"),
+            kernels::qsa_attention_tc_exact(shape.gqa.kv_heads, n_tok, 1),
             tc_args(shape, slot, 1, false, at),
         ),
         AttnPath::Split => {
@@ -413,8 +417,8 @@ fn attend_at(
                 },
             );
             plan.launch(
-                Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_tc_kernel"),
-                kernels::qsa_attention_tc(shape.gqa.kv_heads, n_tok, splits),
+                Entry::plain(MOD_EXACT, "q4e_qsa_attention_tc_exact_kernel"),
+                kernels::qsa_attention_tc_exact(shape.gqa.kv_heads, n_tok, splits),
                 tc_args(shape, slot, splits, true, at),
             );
             // A single slice wrote the destination itself; folding anyway would
