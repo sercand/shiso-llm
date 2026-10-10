@@ -26,14 +26,22 @@
 #define DIT_G64_K 16u
 #define DIT_G64_THREADS 128u
 
-// The fused attention tile (`kernel_dit_flash_sdpa_f32`): 32 query rows per
-// threadgroup of four simdgroups (eight rows each), keys streamed 32 at a
-// time, heads up to DIT_FA_MAX_D wide in multiples of eight. The driver
-// sends wider or ragged heads to `kernel_dit_sdpa_f32`.
-#define DIT_FA_QROWS 32u
+// The fused attention tile (`kernel_dit_flash_sdpa_f32`): 64 query rows per
+// threadgroup of eight simdgroups (DIT_FA_RB blocks of eight rows each),
+// keys streamed 32 at a time, heads up to DIT_FA_MAX_D wide in multiples of
+// eight. The driver sends wider or ragged heads to `kernel_dit_sdpa_f32`.
+//
+// Measured on an M4 (10-core GPU) at a 1024x1024 Qwen-Image-2.1 step (4096
+// rows over 22 cached, 32 heads of 128), with the head width fixed at 128:
+// 98 ms per layer at 8 simdgroups x 8 rows, 118 ms at 4, 106 ms at 16;
+// two row blocks per simdgroup (16 rows) ran 112-117 ms and 16-key blocks
+// were no better. The previous 32-row, runtime-width tile took 205 ms.
+#define DIT_FA_RB 1u
+#define DIT_FA_SG 8u
+#define DIT_FA_QROWS (8u * DIT_FA_RB * DIT_FA_SG)
 #define DIT_FA_KEYS 32u
 #define DIT_FA_MAX_D 128u
-#define DIT_FA_THREADS 128u
+#define DIT_FA_THREADS (32u * DIT_FA_SG)
 
 #define DIT_UNROLL _Pragma("clang loop unroll(full)")
 

@@ -103,6 +103,44 @@ pub(crate) struct PrefixKv {
     steps: Option<StepTables>,
 }
 
+/// A span of middle blocks whose effect one step records and a later step
+/// at the same size replays instead of running them: the replaying step
+/// adds the recorded `x_after - x_before` where the span would start and
+/// skips it. An approximation, not an identity: the span's residual
+/// changes with the sigma, which is what the replaying step gives up.
+#[derive(Debug, Clone)]
+pub(crate) enum BlockReuse<'a> {
+    /// Run every block and write the span's residual into `residual`
+    /// `(rows, hidden)`.
+    Record {
+        /// The blocks, by index.
+        span: std::ops::Range<usize>,
+        /// Where the residual goes.
+        residual: DeviceView<'a>,
+    },
+    /// Add `residual` in place of running the span.
+    Replay {
+        /// The blocks, by index.
+        span: std::ops::Range<usize>,
+        /// A residual a `Record` step wrote.
+        residual: DeviceView<'a>,
+    },
+}
+
+impl BlockReuse<'_> {
+    fn span(&self) -> std::ops::Range<usize> {
+        match self {
+            Self::Record { span, .. } | Self::Replay { span, .. } => span.clone(),
+        }
+    }
+
+    fn residual(&self) -> DeviceView<'_> {
+        match self {
+            Self::Record { residual, .. } | Self::Replay { residual, .. } => *residual,
+        }
+    }
+}
+
 /// What every step of one job reads from the host, uploaded once before
 /// the first: an upload drains the device queue (the host copy waits for
 /// queued work), so doing it per step would hide a sync inside
@@ -158,6 +196,13 @@ enum Attend<'a> {
         cache_v: DeviceView<'a>,
         cache_tokens: usize,
     },
+}
+
+/// How one step's velocity departs from the exact pass, if at all.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StepOpts<'a> {
+    /// A span of blocks to record or replay ([`BlockReuse`]).
+    pub reuse: Option<BlockReuse<'a>>,
 }
 
 /// One block's inputs beyond its weights.
@@ -403,6 +448,7 @@ impl QwenDit {
     /// # Errors
     /// [`ImageGenError::Backend`] for a sigma outside [0, 1], a prefix from
     /// another model, a buffer too short for the grid, or a failed launch.
+    #[cfg(test)]
     pub(crate) fn velocity(
         &self,
         ops: &Ops,
@@ -412,6 +458,23 @@ impl QwenDit {
         sigma: f32,
         out: DeviceView<'_>,
     ) -> Result<(), ImageGenError> {
+        self.velocity_with(ops, kv, (latents, grid, sigma), out, StepOpts::default())
+    }
+
+    /// [`QwenDit::velocity`] with the step's approximations ([`StepOpts`]).
+    ///
+    /// # Errors
+    /// As [`QwenDit::velocity`], and [`ImageGenError::Backend`] for a reuse
+    /// span outside the model's blocks or a residual buffer of the wrong
+    /// size.
+    pub(crate) fn velocity_with(
+        &self,
+        ops: &Ops,
+        kv: &PrefixKv,
+        (latents, grid, sigma): (DeviceView<'_>, LatentGrid, f32),
+        out: DeviceView<'_>,
+        step: StepOpts<'_>,
+    ) -> Result<(), ImageGenError> {
         let t = grid.cells();
         if out.len() < bytes(t * self.out_channels) {
             return Err(ImageGenError::Backend(format!(
@@ -420,7 +483,7 @@ impl QwenDit {
                 out.len()
             )));
         }
-        let (x, cond) = self.target_stream(ops, kv, latents, grid, sigma)?;
+        let (x, cond) = self.target_stream_with(ops, kv, (latents, grid, sigma), step)?;
         let normed = ops.alloc_f32("qwen head norm", t * self.hidden)?;
         self.norm_scale(ops, x.view(), normed.view(), cond.final_scale.view(), t)?;
         ops.gemm(&GemmCall {
@@ -436,6 +499,7 @@ impl QwenDit {
 
     /// The target stream after every block, with the step's conditioning:
     /// [`QwenDit::velocity`] up to the head.
+    #[cfg(test)]
     pub(crate) fn target_stream<'o>(
         &self,
         ops: &'o Ops,
@@ -444,6 +508,21 @@ impl QwenDit {
         grid: LatentGrid,
         sigma: f32,
     ) -> Result<(Scratch<'o>, TimeCond<'o>), ImageGenError> {
+        self.target_stream_with(ops, kv, (latents, grid, sigma), StepOpts::default())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the checks, the conditioning and the block loop with its reuse arms, straight-line"
+    )]
+    fn target_stream_with<'o>(
+        &self,
+        ops: &'o Ops,
+        kv: &PrefixKv,
+        (latents, grid, sigma): (DeviceView<'_>, LatentGrid, f32),
+        step: StepOpts<'_>,
+    ) -> Result<(Scratch<'o>, TimeCond<'o>), ImageGenError> {
+        let reuse = step.reuse;
         let t = grid.cells();
         let h = self.hidden;
         if !(0.0..=1.0).contains(&sigma) {
@@ -498,7 +577,55 @@ impl QwenDit {
         self.embed.tanh_gates(ops, cond.modulation.view())?;
         let x = ops.alloc_f32("qwen target stream", t * h)?;
         self.embed.img_in(ops, latents, t, x.view())?;
+        if let Some(r) = &reuse {
+            let span = r.span();
+            if span.start >= span.end
+                || span.end > self.blocks.len()
+                || r.residual().len() < bytes(t * h)
+            {
+                return Err(ImageGenError::Backend(format!(
+                    "velocity: block reuse over {span:?} of {} blocks with a {}-byte residual \
+                     for {t} rows of {h}",
+                    self.blocks.len(),
+                    r.residual().len()
+                )));
+            }
+        }
         for (l, block) in self.blocks.iter().enumerate() {
+            match &reuse {
+                Some(BlockReuse::Record { span, residual }) => {
+                    // residual = x before the span, then x after it minus that.
+                    if l == span.start {
+                        ops.axpy(
+                            "qwen reuse record",
+                            *residual,
+                            x.view(),
+                            x.view(),
+                            t * h,
+                            0.0,
+                        )?;
+                    }
+                    if l == span.end {
+                        ops.axpy(
+                            "qwen reuse record",
+                            *residual,
+                            x.view(),
+                            *residual,
+                            t * h,
+                            -1.0,
+                        )?;
+                    }
+                }
+                Some(BlockReuse::Replay { span, residual }) => {
+                    if l == span.start {
+                        ops.add("qwen reuse replay", x.view(), x.view(), *residual, t * h)?;
+                    }
+                    if span.contains(&l) {
+                        continue;
+                    }
+                }
+                None => {}
+            }
             self.block(
                 ops,
                 block,
@@ -514,6 +641,18 @@ impl QwenDit {
                         cache_tokens: kv.tokens,
                     },
                 },
+            )?;
+        }
+        if let Some(BlockReuse::Record { span, residual }) = &reuse
+            && span.end == self.blocks.len()
+        {
+            ops.axpy(
+                "qwen reuse record",
+                *residual,
+                x.view(),
+                *residual,
+                t * h,
+                -1.0,
             )?;
         }
         Ok((x, cond))

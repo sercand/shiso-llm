@@ -32,6 +32,15 @@ pub struct ImageModelDesc {
     pub residency: ImageResidency,
     /// Bytes of the device working set left to the rest of the host.
     pub reserve_bytes: u64,
+    /// Leading denoising steps of every job run at half the image's
+    /// resolution before the job finishes at its own size (0: none). A
+    /// family without a draft stage refuses a nonzero count at load.
+    pub draft_steps: u32,
+    /// Transformer blocks `[start, end)` the last step of a job skips,
+    /// adding instead the residual the step before it recorded over them
+    /// (both steps must run at the image's own size). `None` runs every
+    /// block of every step. A family without block reuse refuses it at load.
+    pub final_reuse: Option<(u32, u32)>,
 }
 
 /// Which pipeline components stay loaded across jobs.
@@ -116,6 +125,18 @@ pub fn open_image_generator(
                 return Err(ImageGenError::Checkpoint(
                     "--image-residency swap is not implemented for the flux2 family, \
                      which keeps every component resident"
+                        .to_owned(),
+                ));
+            }
+            if desc.final_reuse.is_some() {
+                return Err(ImageGenError::Checkpoint(
+                    "--image-final-reuse is not implemented for the flux2 family".to_owned(),
+                ));
+            }
+            if desc.draft_steps != 0 {
+                return Err(ImageGenError::Checkpoint(
+                    "--image-draft-steps is not implemented for the flux2 family, \
+                     which runs every step at the requested size"
                         .to_owned(),
                 ));
             }

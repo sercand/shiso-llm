@@ -11,7 +11,7 @@ use shiso_vision::generator::ImageGenError;
 
 use super::ops::{LinWeight, Ops, WeightKind};
 use super::quant::{RotGroup, read_int8_layout};
-use super::weights::StStore;
+use super::weights::{BlockFormat, StStore};
 
 /// A linear layer's weight in its stored native format, with its bias widened
 /// to f32 and its FP8 scale (or per-row INT8 scales) read at load.
@@ -49,16 +49,10 @@ impl Lin {
     pub(crate) fn load(store: &StStore, ops: &Ops, name: &str) -> Result<Self, ImageGenError> {
         let weight_name = format!("{name}.weight");
         let entry = store.require(&weight_name)?;
-        let kind = match entry.dtype {
-            StDType::Bf16 => WeightKind::Bf16,
-            StDType::F8E4M3 => WeightKind::Fp8,
-            StDType::F32 => WeightKind::F32,
-            StDType::I8 => WeightKind::Int8Row,
-            other => {
-                return Err(ImageGenError::Checkpoint(format!(
-                    "'{weight_name}' has dtype {other:?}, which no diffusion GEMM entry reads"
-                )));
-            }
+        let kind = match (entry.block, entry.dtype) {
+            (Some(BlockFormat::Q4K), _) => WeightKind::Q4K,
+            (Some(BlockFormat::Q6K), _) => WeightKind::Q6K,
+            (None, dtype) => Self::plain_kind(&weight_name, dtype)?,
         };
         let scale = if kind == WeightKind::Fp8 {
             store.weight_scale(&weight_name)?
@@ -105,6 +99,19 @@ impl Lin {
             out_dim,
             in_dim,
         })
+    }
+
+    /// The GEMM kind of a weight stored as a plain safetensors dtype.
+    fn plain_kind(weight_name: &str, dtype: StDType) -> Result<WeightKind, ImageGenError> {
+        match dtype {
+            StDType::Bf16 => Ok(WeightKind::Bf16),
+            StDType::F8E4M3 => Ok(WeightKind::Fp8),
+            StDType::F32 => Ok(WeightKind::F32),
+            StDType::I8 => Ok(WeightKind::Int8Row),
+            other => Err(ImageGenError::Checkpoint(format!(
+                "'{weight_name}' has dtype {other:?}, which no diffusion GEMM entry reads"
+            ))),
+        }
     }
 
     /// The weight side of a GEMM against this linear: every fact the

@@ -27,7 +27,7 @@ use shiso_core::{
     Backend, DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs, alloc,
 };
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::diffusion::{int8, prefix, vae};
+use shiso_kerneltest::diffusion::{int8, kquant, prefix, vae};
 use shiso_metal::MetalBackend;
 
 /// The module every diffusion entry lives under.
@@ -41,9 +41,9 @@ const G64_TILE: u32 = 64;
 /// Threads per simdgroup-tile threadgroup.
 const G64_THREADS: u32 = 128;
 /// Query rows per fused-attention threadgroup.
-const FA_QROWS: u32 = 32;
+const FA_QROWS: u32 = 64;
 /// Threads per fused-attention threadgroup.
-const FA_THREADS: u32 = 128;
+const FA_THREADS: u32 = 256;
 
 /// Every entry point the driver launches, per the Task-3 contract table.
 const ENTRIES: &[&str] = &[
@@ -81,12 +81,18 @@ const ENTRIES: &[&str] = &[
     "kernel_dit_gemm64_fp8",
     "kernel_dit_conv2d_gemm_f32",
     "kernel_dit_flash_sdpa_f32",
+    "kernel_dit_flash_sdpa_d128_f32",
+    "kernel_dit_flash_sdpa_causal_d128_f32",
     "kernel_dit_gemm64_fused_f32",
     "kernel_dit_gemm64_fused_bf16",
     "kernel_dit_gemm64_fused_fp8",
     "kernel_dit_gemm_i8",
     "kernel_dit_gemm64_i8",
     "kernel_dit_gemm64_fused_i8",
+    "kernel_dit_gemm64_q4k",
+    "kernel_dit_gemm64_q6k",
+    "kernel_dit_gemm64_fused_q4k",
+    "kernel_dit_gemm64_fused_q6k",
     "kernel_dit_hadamard256_f32",
     "kernel_dit_channel_rms_inv_f32",
     "kernel_dit_conv2d_rms_gemm_f32",
@@ -2683,9 +2689,15 @@ fn run_flash(b: &Arc<dyn Backend>, c: &Joint<'_>) -> (Vec<f32>, Vec<f32>) {
         KernelArg::Buffer(out_img_buf.view()),
     ];
     kargs.extend(bufs.iter().map(|buf| KernelArg::Buffer(buf.view())));
+    // The driver's choice: the fixed-width entry for 128-wide heads.
+    let entry = if c.hd == 128 {
+        "kernel_dit_flash_sdpa_d128_f32"
+    } else {
+        "kernel_dit_flash_sdpa_f32"
+    };
     launch(
         b,
-        "kernel_dit_flash_sdpa_f32",
+        entry,
         Extent3::new(
             grid_for((c.txt + c.img) as u32, FA_QROWS),
             c.heads as u32,
@@ -3186,6 +3198,35 @@ int8_cases!(
     fused_i8_is_the_unfused_composition,
 );
 
+/// One ignored wrapper per shared k-quant case.
+macro_rules! kquant_cases {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[test]
+            #[ignore = "requires a Metal device"]
+            fn $name() {
+                let Some(gpu) = open_gpu() else { return };
+                kquant::$name(&gpu);
+            }
+        )*
+    };
+}
+
+kquant_cases!(
+    gemm_kquant_matches_the_decoded_product,
+    fused_kquant_is_the_unfused_composition,
+);
+
+#[test]
+fn every_kquant_case_entry_is_registered() {
+    for entry in kquant::ENTRIES {
+        assert!(
+            ENTRIES.contains(&entry),
+            "{entry} is launched by the k-quant cases but missing from ENTRIES"
+        );
+    }
+}
+
 #[test]
 fn every_int8_case_entry_is_registered() {
     for entry in int8::ENTRIES {
@@ -3354,7 +3395,7 @@ fn gemm64_throughput_bf16_vs_i8() {
             KernelArg::F32(1.0),
             (m, n, k),
         );
-        let t_i8 = time_gemm64(
+        let int8_time = time_gemm64(
             &b,
             "kernel_dit_gemm64_i8",
             i8w.view(),
@@ -3366,8 +3407,8 @@ fn gemm64_throughput_bf16_vs_i8() {
             "gemm64 m={m} n={n} k={k}: bf16 {:.2} ms {:.2} TFLOPS | i8 {:.2} ms {:.2} TFLOPS | rotate input {:.3} ms",
             t_bf * 1e3,
             flop / t_bf / 1e12,
-            t_i8 * 1e3,
-            flop / t_i8 / 1e12,
+            int8_time * 1e3,
+            flop / int8_time / 1e12,
             t_rot * 1e3
         );
     }
@@ -3423,4 +3464,280 @@ fn time_rotation(b: &Arc<dyn Backend>, m: usize, k: usize) -> f64 {
         .collect();
     samples.sort_by(f64::total_cmp);
     samples[samples.len() / 2]
+}
+
+/// Not a correctness case: the fused attention's throughput at a 1024x1024
+/// Qwen-Image-2.1 step (4096 target rows over 22 cached prefix rows, 32
+/// heads of 128, separate packed q, k and v).
+#[test]
+#[ignore = "a throughput probe on a Metal device, not a correctness case"]
+#[expect(
+    clippy::print_stderr,
+    clippy::many_single_char_names,
+    reason = "the probe's whole output is the numbers it measured, over the formula's q, k, v"
+)]
+fn flash_sdpa_throughput_at_qwen_image_1024() {
+    const REPS: u32 = 3;
+    let Some(b) = open() else { return };
+    let (img, cache, heads, hd) = (4096usize, 22usize, 32usize, 128usize);
+    let hidden = heads * hd;
+    let q = upload_f32(
+        &b,
+        &vals(img * hidden, 1)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect::<Vec<_>>(),
+    );
+    let k = upload_f32(
+        &b,
+        &vals(img * hidden, 2)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect::<Vec<_>>(),
+    );
+    let v = upload_f32(
+        &b,
+        &vals(img * hidden, 3)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect::<Vec<_>>(),
+    );
+    let ck = upload_f32(&b, &vals(cache * hidden, 4));
+    let cv = upload_f32(&b, &vals(cache * hidden, 5));
+    let out = alloc(&b, (img * hidden * 4) as u64).expect("alloc");
+    let stand_in = dummy(&b);
+    let args = SdpaArgs {
+        txt_tokens: 0,
+        img_tokens: img as u32,
+        cache_tokens: cache as u32,
+        heads: heads as u32,
+        head_dim: hd as u32,
+        txt_stride: hidden as u32,
+        img_stride: hidden as u32,
+        cache_stride: hidden as u32,
+        q_offset: 0,
+        k_offset: 0,
+        v_offset: 0,
+    };
+    let once = || {
+        launch(
+            &b,
+            "kernel_dit_flash_sdpa_d128_f32",
+            Extent3::new(grid_for(img as u32, FA_QROWS), heads as u32, 1),
+            Extent3::linear(FA_THREADS),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(stand_in.view()),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(stand_in.view()),
+                KernelArg::Buffer(stand_in.view()),
+                KernelArg::Buffer(stand_in.view()),
+                KernelArg::Buffer(q.view()),
+                KernelArg::Buffer(k.view()),
+                KernelArg::Buffer(v.view()),
+                KernelArg::Buffer(ck.view()),
+                KernelArg::Buffer(cv.view()),
+            ],
+        );
+    };
+    once();
+    b.sync().expect("sync");
+    let mut samples: Vec<f64> = (0..5)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            for _ in 0..REPS {
+                once();
+            }
+            b.sync().expect("sync");
+            start.elapsed().as_secs_f64() / f64::from(REPS)
+        })
+        .collect();
+    samples.sort_by(f64::total_cmp);
+    let t = samples[samples.len() / 2];
+    let flop = 4.0 * (img * (img + cache) * hidden) as f64;
+    eprintln!(
+        "flash sdpa img={img} cache={cache} heads={heads}x{hd}: {:.2} ms per layer, {:.2} TFLOPS",
+        t * 1e3,
+        flop / t / 1e12
+    );
+}
+
+/// The fused VAE convolution's argument block, as `diffusion_common.h`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ConvVaeProbeArgs {
+    in_c: u32,
+    in_h: u32,
+    in_w: u32,
+    out_c: u32,
+    out_h: u32,
+    out_w: u32,
+    k: u32,
+    pad: u32,
+    has_bias: u32,
+    accumulate: u32,
+    silu: u32,
+    reserved: u32,
+}
+
+/// Not a correctness case: the VAE decoder's norm -> silu -> 3x3
+/// convolution against the plain GEMM of the same M, N and K, at the
+/// decoder's level shapes.
+#[test]
+#[ignore = "a throughput probe on a Metal device, not a correctness case"]
+#[expect(
+    clippy::print_stderr,
+    reason = "the probe's whole output is the numbers it measured"
+)]
+fn vae_conv_throughput_against_the_plain_gemm() {
+    const REPS: u32 = 3;
+    let Some(b) = open() else { return };
+    for (c, side) in [(576usize, 256usize), (144, 1024)] {
+        let s = side * side;
+        let x = upload_f32(
+            &b,
+            &vals(c * s, 1).iter().map(|v| v * 0.1).collect::<Vec<_>>(),
+        );
+        let w = upload_f32(
+            &b,
+            &vals(c * c * 9, 2)
+                .iter()
+                .map(|v| v * 0.01)
+                .collect::<Vec<_>>(),
+        );
+        let inv = upload_f32(&b, &vec![1.0; s]);
+        let gamma = upload_f32(&b, &vec![1.0; c]);
+        let out = alloc(&b, (c * s * 4) as u64).expect("alloc");
+        let stand_in = dummy(&b);
+        let args = ConvVaeProbeArgs {
+            in_c: c as u32,
+            in_h: side as u32,
+            in_w: side as u32,
+            out_c: c as u32,
+            out_h: side as u32,
+            out_w: side as u32,
+            k: 3,
+            pad: 1,
+            has_bias: 0,
+            accumulate: 1,
+            silu: 1,
+            reserved: 0,
+        };
+        let once = || {
+            launch(
+                &b,
+                "kernel_dit_conv2d_rms_gemm_f32",
+                Extent3::new(
+                    grid_for(c as u32, G64_TILE),
+                    grid_for(s as u32, G64_TILE),
+                    1,
+                ),
+                Extent3::linear(G64_THREADS),
+                &[
+                    KernelArg::Bytes(bytes_of(&args)),
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(x.view()),
+                    KernelArg::Buffer(w.view()),
+                    KernelArg::Buffer(stand_in.view()),
+                    KernelArg::Buffer(inv.view()),
+                    KernelArg::Buffer(gamma.view()),
+                ],
+            );
+        };
+        once();
+        b.sync().expect("sync");
+        let mut samples: Vec<f64> = (0..5)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                for _ in 0..REPS {
+                    once();
+                }
+                b.sync().expect("sync");
+                start.elapsed().as_secs_f64() / f64::from(REPS)
+            })
+            .collect();
+        samples.sort_by(f64::total_cmp);
+        let t_conv = samples[samples.len() / 2];
+        let t_gemm = time_gemm64(
+            &b,
+            "kernel_dit_gemm64_f32",
+            w.view(),
+            KernelArg::F32(1.0),
+            (s, c, 9 * c),
+        );
+        let flop = 2.0 * (s * c * 9 * c) as f64;
+        eprintln!(
+            "vae conv c={c} {side}x{side}: conv {:.1} ms {:.2} TFLOPS | gemm {:.1} ms {:.2} TFLOPS",
+            t_conv * 1e3,
+            flop / t_conv / 1e12,
+            t_gemm * 1e3,
+            flop / t_gemm / 1e12
+        );
+    }
+}
+
+/// Not a correctness case: the k-quant tiles' throughput against the INT8
+/// tile at a 1024x1024 Qwen-Image-2.1 step's square linear.
+#[test]
+#[ignore = "a throughput probe on a Metal device, not a correctness case"]
+#[expect(
+    clippy::print_stderr,
+    clippy::many_single_char_names,
+    reason = "the probe's whole output is the numbers it measured, over the product's m, n, k"
+)]
+fn gemm64_throughput_kquants() {
+    let Some(b) = open() else { return };
+    let (m, n, k) = (4096usize, 4096usize, 4096usize);
+    let flop = 2.0 * (m * n * k) as f64;
+    // Unit block scales so the decoded weights stay finite.
+    let block = |bytes: usize, d_at: usize| -> Vec<u8> {
+        let mut v: Vec<u8> = (0..bytes)
+            .map(|i| u8::try_from(i * 7 % 251).unwrap_or(0))
+            .collect();
+        v[d_at..d_at + 2].copy_from_slice(&0x2000u16.to_le_bytes());
+        v
+    };
+    let rows = |b1: Vec<u8>| -> Vec<u8> {
+        b1.iter()
+            .copied()
+            .cycle()
+            .take(b1.len() * n * k / 256)
+            .collect()
+    };
+    let q4 = upload_u8(&b, &rows(block(144, 0)));
+    let q6 = upload_u8(&b, &rows(block(210, 208)));
+    let i8w = upload_u8(
+        &b,
+        &(0..n * k)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect::<Vec<_>>(),
+    );
+    let scales = upload_f32(&b, &vec![0.01f32; n]);
+    let int8_time = time_gemm64(
+        &b,
+        "kernel_dit_gemm64_i8",
+        i8w.view(),
+        KernelArg::Buffer(scales.view()),
+        (m, n, k),
+    );
+    let q4k_time = time_gemm64(
+        &b,
+        "kernel_dit_gemm64_q4k",
+        q4.view(),
+        KernelArg::F32(1.0),
+        (m, n, k),
+    );
+    let q6k_time = time_gemm64(
+        &b,
+        "kernel_dit_gemm64_q6k",
+        q6.view(),
+        KernelArg::F32(1.0),
+        (m, n, k),
+    );
+    eprintln!(
+        "gemm64 {m}x{n}x{k}: i8 {:.2} TFLOPS | q4_k {:.2} TFLOPS | q6_k {:.2} TFLOPS",
+        flop / int8_time / 1e12,
+        flop / q4k_time / 1e12,
+        flop / q6k_time / 1e12
+    );
 }

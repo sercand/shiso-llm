@@ -375,9 +375,29 @@ pub(crate) fn rgba8_from_field(field: &[f32], plane: usize) -> Result<Vec<u8>, I
     Ok(out)
 }
 
+/// How a convolution's weight is laid out on the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvLayout {
+    /// The checkpoint's own `[o][i][k][k]`, for the generic convolution.
+    Stored,
+    /// `[o][k][k][i]`, for the fused VAE convolutions
+    /// ([`Ops::vae_conv`]): a k slice is sixteen channels of one tap, so
+    /// its gather reads adjacent pixels as one vector. Measured on an M4 at
+    /// a 1024x1024 decode: the 576-wide 3x3 convolution at 256x256 runs
+    /// at 2.49 TFLOPS against 1.99 in the stored order, and the whole
+    /// decode takes 7.3 s against 9.0 s.
+    TapMajor,
+}
+
 /// Reads a convolution kernel `[o, i, k, k]` or `[o, i, 1, k, k]` (a
-/// causal kernel with a unit time axis) and its bias, widened to f32.
-fn load_conv(store: &StStore, ops: &Ops, name: &str) -> Result<Conv, ImageGenError> {
+/// causal kernel with a unit time axis) and its bias, widened to f32 and
+/// laid out as `layout` says.
+fn load_conv(
+    store: &StStore,
+    ops: &Ops,
+    name: &str,
+    layout: ConvLayout,
+) -> Result<Conv, ImageGenError> {
     let weight_name = format!("{name}.weight");
     let shape: Vec<usize> = store
         .require(&weight_name)?
@@ -395,8 +415,24 @@ fn load_conv(store: &StStore, ops: &Ops, name: &str) -> Result<Conv, ImageGenErr
         }
     };
     let bias_name = format!("{name}.bias");
+    let w = match layout {
+        ConvLayout::Stored => store.f32_widen(ops, "vae conv weight", &weight_name)?,
+        ConvLayout::TapMajor => {
+            let stored = store.f32_vec(&weight_name)?;
+            let taps = k * k;
+            let mut w = vec![0.0f32; stored.len()];
+            for o in 0..out_c {
+                for i in 0..in_c {
+                    for t in 0..taps {
+                        w[(o * taps + t) * in_c + i] = stored[(o * in_c + i) * taps + t];
+                    }
+                }
+            }
+            ops.upload_f32("vae conv weight", &w)?
+        }
+    };
     Ok(Conv {
-        w: store.f32_widen(ops, "vae conv weight", &weight_name)?,
+        w,
         bias: if store.contains(&bias_name) {
             Some(store.f32_widen(ops, "vae conv bias", &bias_name)?)
         } else {
@@ -426,11 +462,21 @@ fn load_gamma(
 }
 
 fn load_resnet(store: &StStore, ops: &Ops, base: &str) -> Result<Resnet, ImageGenError> {
-    let conv1 = load_conv(store, ops, &format!("{base}.residual.2"))?;
-    let conv2 = load_conv(store, ops, &format!("{base}.residual.6"))?;
+    let conv1 = load_conv(
+        store,
+        ops,
+        &format!("{base}.residual.2"),
+        ConvLayout::TapMajor,
+    )?;
+    let conv2 = load_conv(
+        store,
+        ops,
+        &format!("{base}.residual.6"),
+        ConvLayout::TapMajor,
+    )?;
     let shortcut_name = format!("{base}.shortcut");
     let shortcut = if store.contains(&format!("{shortcut_name}.weight")) {
-        Some(load_conv(store, ops, &shortcut_name)?)
+        Some(load_conv(store, ops, &shortcut_name, ConvLayout::Stored)?)
     } else {
         None
     };
@@ -535,7 +581,7 @@ impl QwenVae {
             k: 1,
         };
 
-        let conv_in = load_conv(&store, ops, "decoder.conv1")?;
+        let conv_in = load_conv(&store, ops, "decoder.conv1", ConvLayout::Stored)?;
         if conv_in.in_c != z_dim {
             return Err(ImageGenError::Checkpoint(format!(
                 "decoder.conv1 reads {} channels, the latent has {z_dim}",
@@ -549,8 +595,8 @@ impl QwenVae {
         ];
         let mid_attn = Attention {
             gamma: load_gamma(&store, ops, "decoder.middle.1.norm.gamma", mid_c)?,
-            qkv: load_conv(&store, ops, "decoder.middle.1.to_qkv")?,
-            proj: load_conv(&store, ops, "decoder.middle.1.proj")?,
+            qkv: load_conv(&store, ops, "decoder.middle.1.to_qkv", ConvLayout::TapMajor)?,
+            proj: load_conv(&store, ops, "decoder.middle.1.proj", ConvLayout::Stored)?,
         };
         if mid_resnets
             .iter()
@@ -603,7 +649,12 @@ impl QwenVae {
                         )));
                     }
                     upsampler = Some(Upsampler {
-                        conv: load_conv(&store, ops, &format!("{entry}.resample.1"))?,
+                        conv: load_conv(
+                            &store,
+                            ops,
+                            &format!("{entry}.resample.1"),
+                            ConvLayout::TapMajor,
+                        )?,
                         factor_t: if temporal { 2 } else { 1 },
                     });
                 } else {
@@ -648,7 +699,7 @@ impl QwenVae {
             });
         }
 
-        let conv_out = load_conv(&store, ops, "decoder.head.2")?;
+        let conv_out = load_conv(&store, ops, "decoder.head.2", ConvLayout::TapMajor)?;
         if conv_out.in_c != width {
             return Err(ImageGenError::Checkpoint(format!(
                 "decoder.head.2 reads {} channels, the last up block emits {width}",

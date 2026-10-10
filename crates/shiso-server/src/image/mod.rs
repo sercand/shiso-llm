@@ -362,7 +362,9 @@ pub fn refuse(error: ImageGenError) -> AppError {
         | ImageGenError::TooLargeForMemory { .. } => {
             AppError::bad_request(message, Some("size"), "invalid_request")
         }
-        ImageGenError::InvalidSteps { .. } | ImageGenError::StepsFixed { .. } => {
+        ImageGenError::InvalidSteps { .. }
+        | ImageGenError::StepsFixed { .. }
+        | ImageGenError::DraftTakesEveryStep { .. } => {
             AppError::bad_request(message, Some("steps"), "invalid_request")
         }
         ImageGenError::UnsupportedFormat(_) => {

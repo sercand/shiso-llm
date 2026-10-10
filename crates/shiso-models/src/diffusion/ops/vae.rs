@@ -100,7 +100,9 @@ pub(crate) struct VaeConvCall<'a> {
     /// The stored field, `(in_c, in_h, in_w)`.
     pub input: DeviceView<'a>,
     pub transform: VaeConvInput<'a>,
-    /// `[out_c][in_c][k][k]` f32.
+    /// `[out_c][k][k][in_c]` f32: the taps channel-fastest, so a k slice
+    /// of the tile is channels of one tap (the checkpoint's `[o][i][k][k]`
+    /// reordered at load).
     pub weight: DeviceView<'a>,
     pub bias: Option<DeviceView<'a>>,
     pub in_c: usize,
@@ -187,11 +189,11 @@ impl Ops {
     /// fallback: a tap count off the simdgroup tile's 16-wide k slice, or
     /// an even kernel, is refused.
     pub(crate) fn vae_conv(&self, call: &VaeConvCall<'_>) -> Result<(), ImageGenError> {
-        let taps = call.in_c * call.k * call.k;
-        if !taps.is_multiple_of(G64_K) || call.k.is_multiple_of(2) {
+        if !call.in_c.is_multiple_of(G64_K) || call.k.is_multiple_of(2) {
             return Err(ImageGenError::Backend(format!(
-                "{}: a {}x{} convolution over {} channels has {taps} taps; the fused VAE \
-                 convolution needs an odd kernel and a multiple of {G64_K} taps",
+                "{}: a {}x{} convolution over {} channels; the fused VAE convolution needs \
+                 an odd kernel and a multiple of {G64_K} channels, so that a k slice is \
+                 channels of one tap",
                 call.step, call.k, call.k, call.in_c
             )));
         }

@@ -456,8 +456,9 @@ const _: fn(GeneratedImage) -> GeneratedImageFields = generated_image_fields;
 
 /// What the server hands the registry to open a checkpoint, read apart: the
 /// four component paths and the assets directory, then the residency policy
-/// and the byte reserve left to the host. The schedule is not here: it is
-/// the checkpoint's own documents. The server
+/// and the byte reserve left to the host, then the speed approximations: the
+/// half-size draft steps and the last step's reused block span. The schedule
+/// is not here: it is the checkpoint's own documents. The server
 /// builds these across the crate seam from its flags.
 type ImageModelDescFields = (
     std::path::PathBuf,
@@ -467,6 +468,8 @@ type ImageModelDescFields = (
     Option<std::path::PathBuf>,
     shiso_models::image_registry::ImageResidency,
     u64,
+    u32,
+    Option<(u32, u32)>,
 );
 fn image_model_desc_fields(desc: ImageModelDesc) -> ImageModelDescFields {
     (
@@ -477,6 +480,8 @@ fn image_model_desc_fields(desc: ImageModelDesc) -> ImageModelDescFields {
         desc.assets_dir,
         desc.residency,
         desc.reserve_bytes,
+        desc.draft_steps,
+        desc.final_reuse,
     )
 }
 const _: fn(ImageModelDesc) -> ImageModelDescFields = image_model_desc_fields;
@@ -524,6 +529,7 @@ fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
             (1, *width, *height)
         }
         ImageGenError::StepsFixed { steps, fixed } => (8, *steps, *fixed),
+        ImageGenError::DraftTakesEveryStep { draft, steps } => (13, *draft, *steps),
         ImageGenError::DecodeTooLarge {
             width,
             height,
