@@ -2,12 +2,23 @@
 //!
 //! `test-vectors/references/qwen_image21/te_*` were captured by
 //! `scripts/reference/qwen_image21_reference.py text-encoder-streamed`: the
-//! official BF16 weights in f32, one transformers decoder layer at a time,
+//! official BF16 weights in f32, one reference decoder layer at a time,
 //! cross-checked against the pipeline's own prompt-embedding code on a
 //! two-layer cut. This case runs the per-row INT8 export (the file the
 //! family ships) on the device and grades its last-layer features per token;
 //! the bar is a cosine, because INT8 weights are not expected to match BF16
 //! to a tolerance, only to point the same way.
+//!
+//! The device case fails by design at the 0.995 bar: the checkpoint itself
+//! misses it. The worst token is the user turn's `<|im_start|>` (min 0.98657
+//! at the last layer, mean 0.9978 on `cat`; every earlier tap stays above
+//! 0.9992). `scripts/reference/qwen_image21_reference.py
+//! text-encoder-int8-emulation` separates the export's rounding from kernel
+//! error: it runs the f32 reference layers over the INT8 weights dequantized
+//! and un-rotated and gets min 0.986558 on that same token, and the device
+//! against that emulation is cos 1.0000000, so the kernels add nothing and
+//! the shortfall is INT8 quantization of the encoder. The bar is kept at
+//! 0.995 so the miss stays visible rather than being tuned away.
 //!
 //! Requires a Metal device and `SHISO_TEST_MODEL_QWEN_IMAGE21` (the
 //! `turbo-int8` directory, with `image/text_encoders/` and

@@ -38,11 +38,14 @@ const MAX_PERIOD: f32 = 10_000.0;
 /// The timestep sinusoid of `sigma`: cosines then sines, `SINUSOID_DIM`
 /// values.
 ///
-/// Every operation is the `f32` one the reference runs, in its order
-/// (exponent, `exp`, times the timestep, times 1000), because at `t = 1000`
-/// one `f32` ulp of the argument is 6e-5 of the sine: computing the angle
-/// more precisely would move the features further from the ones the model
-/// was trained on, not closer.
+/// Every operation is in `f32`, in the order exponent, `exp`, times the
+/// sigma, times 1000. The reference scales the sigma first (1000 sigma, then
+/// times the frequency), so the two orders can differ by an `f32` rounding
+/// in the angle; at `t = 1000` one ulp of the argument is 6e-5 of the sine.
+/// Measured against the captured reference the sinusoid agrees to that
+/// level, and the end-to-end image is unchanged, so the order stays as
+/// written rather than being made more precise: a more exact angle would
+/// move the features away from the ones the model ran on in the reference.
 #[expect(
     clippy::cast_precision_loss,
     reason = "frequency indices are below 128, exact in f32"

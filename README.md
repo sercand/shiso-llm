@@ -245,8 +245,11 @@ environment variable. The ones you are most likely to want:
 | `--image-vae` | VAE weights path when it is split from `--image-model`; overrides where the locator would look |
 | `--image-tokenizer` | Tokenizer path when it is split from `--image-model`; overrides where the locator would look |
 | `--image-max-queue` | Image requests that may wait in the queue beyond the one generating (default 16); the next is refused with a 503 a retry can fix |
-| `--image-default-steps` | Denoising steps a request that names none gets (default 4) |
-| `--image-default-size` | The image size a request that names none gets, as `WxH` (default 1024x1024; both sides divisible by 16) |
+| `--image-default-steps` | Denoising steps a request that names none gets (default: the loaded model's own: 4 for FLUX.2-klein, 8 fixed for Qwen-Image-2.1-Turbo) |
+| `--image-default-size` | The image size a request that names none gets, as `WxH` (default: the loaded model's own: 1024x1024 on a 16-pixel grid for FLUX.2-klein, 512x512 on a 32-pixel grid for Qwen-Image-2.1, where sizes must be exact multiples of 32); a size off the model's grid is refused at boot |
+| `--image-residency` | Which image pipeline components stay loaded across jobs: `auto` (default) keeps all of them when they fit the device's working set beside a job and otherwise swaps, `resident` refuses a job that does not fit, `swap` lets the text encoder and the transformer take turns |
+| `--image-reserve-gb` | GiB of the device working set the image pipeline leaves to the rest of the host when it plans what stays loaded (default 1.5) |
+| `--image-sigmas` | Comma-separated sigma nodes for a distilled image checkpoint that ships its schedule outside its own documents; the step count becomes their number |
 | `--embedding-max-queue` | Embedding requests that may wait in the queue beyond the one running (default 64), when `--model` is an embedding checkpoint |
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
@@ -260,7 +263,7 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/audio/transcriptions` | OpenAI Audio Transcriptions (also at `/audio/transcriptions`) |
-| `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein image generation, `b64_json` only) |
+| `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein and Qwen-Image-2.1 (Turbo, base, and fine-tunes in the same format, with `--image-sigmas` for a schedule the files do not carry); `b64_json` only) |
 | `POST /v1/embeddings` | OpenAI and OpenRouter Embeddings (also at `/embeddings`; text, token-id and multimodal `content` inputs, `dimensions`, `encoding_format` `float` or `base64`, `input_type`) |
 | `GET /v1/models` | OpenAI Models |
 | `GET /health`, `GET /metrics`, `GET /cache` | health, metrics, cache report |

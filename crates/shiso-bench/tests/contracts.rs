@@ -454,6 +454,45 @@ fn generated_image_fields(image: GeneratedImage) -> GeneratedImageFields {
 }
 const _: fn(GeneratedImage) -> GeneratedImageFields = generated_image_fields;
 
+/// What the server hands the registry to open a checkpoint, read apart: the
+/// four component paths and the assets directory, then the residency policy,
+/// the byte reserve left to the host and the schedule override. The server
+/// builds these across the crate seam from its flags.
+type ImageModelDescFields = (
+    std::path::PathBuf,
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+    shiso_models::image_registry::ImageResidency,
+    u64,
+    Option<Vec<f32>>,
+);
+fn image_model_desc_fields(desc: ImageModelDesc) -> ImageModelDescFields {
+    (
+        desc.model_path,
+        desc.text_encoder_path,
+        desc.vae_path,
+        desc.tokenizer_path,
+        desc.assets_dir,
+        desc.residency,
+        desc.reserve_bytes,
+        desc.sigmas,
+    )
+}
+const _: fn(ImageModelDesc) -> ImageModelDescFields = image_model_desc_fields;
+
+/// The residency policy is exhaustive in all three of its choices.
+fn residency_choices(residency: shiso_models::image_registry::ImageResidency) -> u8 {
+    use shiso_models::image_registry::ImageResidency;
+    match residency {
+        ImageResidency::Auto => 0,
+        ImageResidency::Resident => 1,
+        ImageResidency::Swap => 2,
+    }
+}
+const _: fn(shiso_models::image_registry::ImageResidency) -> u8 = residency_choices;
+
 /// What the worker thread is started with, read apart: the generator as the
 /// trait object the server holds, its wire name, and the queue ceiling.
 type ImageServiceDescFields = (std::sync::Arc<dyn ImageGenerator>, String, usize);
@@ -493,7 +532,7 @@ fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
             budget_mib,
         } => {
             let _: (&u64, &u64) = (needed_mib, budget_mib);
-            (9, *width, *height)
+            (11, *width, *height)
         }
         ImageGenError::TooLargeForMemory {
             width,
@@ -503,7 +542,7 @@ fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
             largest_side,
         } => {
             let _: (&u64, &u64, &u32) = (needed_mib, budget_mib, largest_side);
-            (10, *width, *height)
+            (12, *width, *height)
         }
         ImageGenError::InvalidSteps { steps } => (7, *steps, 0),
         ImageGenError::UnsupportedFormat(msg) => {

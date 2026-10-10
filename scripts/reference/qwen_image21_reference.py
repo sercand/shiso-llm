@@ -25,6 +25,8 @@ deleting it deliberately is how it is recaptured.
     vae         AutoencoderKLQwenImage21 decode of a seeded latent
     text-encoder  Qwen3-VL prompt features (needs ~40 GB of RAM; not run on a laptop)
     text-encoder-streamed  the same features one decoder layer at a time (range-read, evicted after use)
+    text-encoder-int8-emulation  f32 layers over the Comfy INT8 text encoder (dequantized, un-rotated) vs those
+                features; prints cosines, writes nothing
 
 Weights are never downloaded whole except the 675 MB VAE: single tensors are
 read from the hub with HTTP Range requests (safetensors header first) and cached
@@ -1222,6 +1224,82 @@ def cmd_text_encoder_streamed(args):
     out.finish()
 
 
+def cmd_text_encoder_int8_emulation(args):
+    """Separates the INT8 export's own rounding from kernel error in the device text-encoder case.
+
+    Runs the same f32 decoder layers as `text-encoder-streamed`, but over the Comfy INT8 weights: each
+    projection is `int8 * per-row scale`, then un-rotated (the file stores `W . H` per 256-group of the input
+    axis and `H` is its own inverse). Token embeddings are dequantized and un-rotated the same way. The result
+    is graded against the BF16 fixtures that `text-encoder-streamed` wrote, every sixth layer and the last.
+    Measured (min per-token cosine at the last layer): 0.986558 for this emulation against 0.98657 for the
+    device case, and device against emulation 1.0000000, so the checkpoint itself misses a 0.995 bar and the
+    kernels add nothing. Reads the Comfy file locally (it is 8 GB); writes no fixture, only prints.
+    """
+    import torch
+    from transformers import Qwen3VLConfig
+    from transformers.masking_utils import create_causal_mask
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextDecoderLayer, Qwen3VLTextRotaryEmbedding
+
+    torch.set_grad_enabled(False)
+    cache = Path(args.cache_dir).expanduser()
+    fixtures = Path(args.fixture_dir).expanduser()
+    src = Safetensors(cache, "comfy-te-int8", path=Path(args.comfy_te_file).expanduser())
+    h256 = hadamard_256().astype(np.float32)
+
+    def unrotated(name: str) -> np.ndarray:
+        w = src.tensor(name + ".weight").astype(np.float32) * src.tensor(name + ".weight_scale").astype(np.float32)
+        o, i = w.shape
+        return (w.reshape(o, i // 256, 256) @ h256).reshape(o, i)
+
+    doc = json.loads((fixtures / "te_streamed.json").read_text())
+    cfg = Qwen3VLConfig.from_pretrained(str(Path(args.text_encoder_dir).expanduser()))
+    tcfg = cfg.text_config
+    tcfg._attn_implementation = "eager"
+    rot = Qwen3VLTextRotaryEmbedding(tcfg)
+    drop_idx = 14  # the template's fixed system turn, which the fixtures leave out
+
+    q = src.tensor("model.embed_tokens.weight")
+    scale = src.tensor("model.embed_tokens.weight_scale")
+    state = {}
+    for key, case in doc["cases"].items():
+        ids = case["ids"]
+        rows = q[ids].astype(np.float32) * scale[ids]
+        e = (rows.reshape(len(ids), -1, 256) @ h256).reshape(len(ids), -1)
+        h = torch.from_numpy(np.ascontiguousarray(e, dtype=np.float32))[None]
+        t = h.shape[1]
+        pos = torch.arange(t).view(1, 1, -1).expand(4, 1, -1)
+        mask = create_causal_mask(config=tcfg, inputs_embeds=h, attention_mask=torch.ones(1, t, dtype=torch.long),
+                                  past_key_values=None, position_ids=pos[0])
+        state[key] = dict(h=h, pe=rot(h, pos[1:]), mask=mask, pos=pos[0])
+
+    def cos_rows(a, b):
+        a = a.astype(np.float64)
+        b = b.astype(np.float64)
+        return (a * b).sum(1) / np.linalg.norm(a, axis=1) / np.linalg.norm(b, axis=1)
+
+    for l in range(36):
+        p = f"model.layers.{l}."
+        layer = Qwen3VLTextDecoderLayer(tcfg, l).eval()
+        sd = {n + ".weight": torch.from_numpy(unrotated(p + n)) for n in (
+            "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+            "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")}
+        for n in ("input_layernorm.weight", "post_attention_layernorm.weight",
+                  "self_attn.q_norm.weight", "self_attn.k_norm.weight"):
+            sd[n] = torch.from_numpy(src.tensor(p + n).copy())
+        layer.load_state_dict(sd, strict=True)
+        for key, st in state.items():
+            st["h"] = layer(st["h"], position_embeddings=st["pe"], attention_mask=st["mask"], position_ids=st["pos"])
+            if l in (5, 11, 17, 23, 29, 35):
+                got = st["h"][0, drop_idx:].numpy()
+                name = f"te_{key}_hidden.f32" if l == 35 else f"te_{key}_layer{l:02d}.f32"
+                want = np.fromfile(fixtures / name, dtype="<f4").reshape(got.shape)
+                c = cos_rows(got, want)
+                print(f"{key} layer {l}: cos min {c.min():.6f} mean {c.mean():.6f} first {c[0]:.6f}", flush=True)
+        for f in src.dir.glob(f"model.layers.{l}.*"):
+            f.unlink()
+        del layer
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cache-dir", default="~/.cache/shiso-ref/qwen-image21",
@@ -1238,6 +1316,14 @@ def main():
                                 "otherwise the tensors are range-read from the hub")
     p = sub.add_parser("text-encoder-streamed", help="layer-streamed text encoder (peak ~2 GB disk, ~3 GB RAM)")
     p.set_defaults(fn=cmd_text_encoder_streamed)
+    p = sub.add_parser("text-encoder-int8-emulation",
+                       help="f32 layers over the dequantized, un-rotated Comfy INT8 text encoder vs the BF16 fixtures")
+    p.set_defaults(fn=cmd_text_encoder_int8_emulation)
+    p.add_argument("--comfy-te-file", default="~/.shiso/staging/qwen-image-2.1/turbo-int8/image/text_encoders/"
+                   "qwen3vl_8b_int8_convrot.safetensors", help="local copy of the Comfy INT8 text encoder")
+    p.add_argument("--text-encoder-dir", required=True, help="the Turbo repo's text_encoder/ directory (for its config)")
+    p.add_argument("--fixture-dir", default="test-vectors/references/qwen_image21",
+                   help="where text-encoder-streamed wrote te_*.f32 and te_streamed.json")
     p = sub.add_parser("text-encoder", help="needs ~40 GB RAM")
     p.set_defaults(fn=cmd_text_encoder)
     p.add_argument("--text-encoder-dir", required=True, help="the Turbo repo's text_encoder/ directory (model.safetensors, config)")
