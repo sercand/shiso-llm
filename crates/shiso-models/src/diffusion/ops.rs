@@ -53,9 +53,9 @@ const G64_K: usize = 16;
 /// Threads per simdgroup-tile threadgroup (four simdgroups).
 const G64_THREADS: u32 = 128;
 /// Query rows per fused-attention threadgroup.
-const FA_QROWS: u32 = 32;
-/// Threads per fused-attention threadgroup (four simdgroups).
-const FA_THREADS: u32 = 128;
+const FA_QROWS: u32 = 64;
+/// Threads per fused-attention threadgroup (eight simdgroups).
+const FA_THREADS: u32 = 256;
 /// Widest head the fused attention takes; wider heads (the VAE's single
 /// 512-wide head) go to the per-row kernel.
 const FA_MAX_D: usize = 128;
@@ -365,6 +365,11 @@ pub(crate) enum WeightKind {
     /// natively: the codes are widened while the tile stages them and the
     /// row's scale multiplies the accumulator in the epilogue.
     Int8Row,
+    /// GGUF `Q4_K` blocks along each row, decoded while the tile stages
+    /// them; the reduction length must be a multiple of 256.
+    Q4K,
+    /// GGUF `Q6_K` blocks, as [`WeightKind::Q4K`].
+    Q6K,
 }
 
 /// Everything a GEMM entry needs to know about the weight side of a product,
@@ -815,6 +820,8 @@ const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_conv2d_gemm_f32",
     "kernel_dit_flash_sdpa_f32",
     "kernel_dit_flash_sdpa_causal_f32",
+    "kernel_dit_flash_sdpa_d128_f32",
+    "kernel_dit_flash_sdpa_causal_d128_f32",
     "kernel_dit_tanh_f32",
     "kernel_dit_gelu_tanh_f32",
     "kernel_dit_qk_norm_rope_f32",
@@ -824,6 +831,10 @@ const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_gemm_i8",
     "kernel_dit_gemm64_i8",
     "kernel_dit_gemm64_fused_i8",
+    "kernel_dit_gemm64_q4k",
+    "kernel_dit_gemm64_q6k",
+    "kernel_dit_gemm64_fused_q4k",
+    "kernel_dit_gemm64_fused_q6k",
     "kernel_dit_hadamard256_f32",
     "kernel_dit_channel_rms_inv_f32",
     "kernel_dit_conv2d_rms_gemm_f32",
@@ -1302,6 +1313,15 @@ impl Ops {
             (WeightKind::Bf16, true) => "kernel_dit_gemm64_bf16",
             (WeightKind::F32, true) => "kernel_dit_gemm64_f32",
             (WeightKind::Int8Row, true) => "kernel_dit_gemm64_i8",
+            (WeightKind::Q4K, true) => "kernel_dit_gemm64_q4k",
+            (WeightKind::Q6K, true) => "kernel_dit_gemm64_q6k",
+            (WeightKind::Q4K | WeightKind::Q6K, false) => {
+                return Err(ImageGenError::Backend(format!(
+                    "{}: a k-quant weight needs a reduction length that is a multiple of 256, \
+                     got {}",
+                    call.step, call.k
+                )));
+            }
             (WeightKind::Fp8, false) => "kernel_dit_gemm_fp8",
             (WeightKind::Bf16, false) => "kernel_dit_gemm_bf16",
             (WeightKind::F32, false) => "kernel_dit_gemm_f32",
@@ -1405,6 +1425,8 @@ impl Ops {
             WeightKind::Bf16 => "kernel_dit_gemm64_fused_bf16",
             WeightKind::F32 => "kernel_dit_gemm64_fused_f32",
             WeightKind::Int8Row => "kernel_dit_gemm64_fused_i8",
+            WeightKind::Q4K => "kernel_dit_gemm64_fused_q4k",
+            WeightKind::Q6K => "kernel_dit_gemm64_fused_q6k",
         };
         self.launch(
             call.step,
@@ -1700,6 +1722,7 @@ impl Ops {
         // The fused kernel holds a head as 8x8 fragments in registers; the
         // transformer's 128-wide heads qualify, the VAE's 512-wide one does not.
         let flash = call.head_dim.is_multiple_of(8) && call.head_dim <= FA_MAX_D;
+
         if call.causal && (call.cache_tokens > 0 || !flash) {
             return Err(ImageGenError::Backend(format!(
                 "{}: causal attention takes no cached rows and needs a head of at most {FA_MAX_D} in multiples of 8 (got {} cached rows, head {})",
@@ -1708,10 +1731,15 @@ impl Ops {
         }
         let (entry, grid, block) = if flash {
             (
-                if call.causal {
-                    "kernel_dit_flash_sdpa_causal_f32"
-                } else {
-                    "kernel_dit_flash_sdpa_f32"
+                // The 128-wide entries fix the head width at compile time so
+                // every head loop unrolls and the fragments stay in
+                // registers: 98 ms against 136 ms per layer at a 1024x1024
+                // Qwen-Image-2.1 step on an M4.
+                match (call.causal, call.head_dim == 128) {
+                    (true, true) => "kernel_dit_flash_sdpa_causal_d128_f32",
+                    (true, false) => "kernel_dit_flash_sdpa_causal_f32",
+                    (false, true) => "kernel_dit_flash_sdpa_d128_f32",
+                    (false, false) => "kernel_dit_flash_sdpa_f32",
                 },
                 Extent3::new(grid_for(rows, FA_QROWS), call.heads as u32, 1),
                 Extent3::linear(FA_THREADS),

@@ -108,6 +108,8 @@ fn qwen_image21_turbo_generates_a_real_rgba_image() {
         assets_dir: Some(root.join("image_assets")),
         residency: ImageResidency::Auto,
         reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
+        draft_steps: 0,
+        final_reuse: None,
     };
     let began = Instant::now();
     let generator = shiso_models::image_registry::open_image_generator(&desc, &backend)

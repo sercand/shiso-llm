@@ -6,8 +6,9 @@
 //! second backend's twin of them is graded by the same cases from its first
 //! run, as are the residual VAE decoder's fused entries ([`vae`]) and the
 //! prefix-cached transformer's causal attention, table `RoPE` and
-//! activations ([`prefix`]).
+//! activations ([`prefix`]), and the GGUF k-quant linears ([`kquant`]).
 
 pub mod int8;
+pub mod kquant;
 pub mod prefix;
 pub mod vae;

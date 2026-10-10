@@ -249,6 +249,8 @@ environment variable. The ones you are most likely to want:
 | `--image-default-size` | The image size a request that names none gets, as `WxH` (default: the loaded model's own: 1024x1024 on a 16-pixel grid for FLUX.2-klein, 512x512 on a 32-pixel grid for Qwen-Image-2.1, where sizes must be exact multiples of 32); a size off the model's grid is refused at boot |
 | `--image-residency` | Which image pipeline components stay loaded across jobs: `auto` (default) keeps all of them when they fit the device's working set beside a job and otherwise swaps, `resident` refuses a job that does not fit, `swap` lets the text encoder and the transformer take turns |
 | `--image-reserve-gb` | GiB of the device working set the image pipeline leaves to the rest of the host when it plans what stays loaded (default 1.5) |
+| `--image-draft-steps` | Leading denoising steps of every image job run at half the requested resolution, then handed over to the full size (Qwen-Image-2.1 only; default 0). A half-size step costs about a quarter of a full one; at 1024x1024 on an M4, 4 of a 6-step distilled checkpoint's steps take a job from 150 s to 77 s at a small cost in fine detail |
+| `--image-final-reuse` | `START:END`: transformer blocks the last step skips, replaying the residual the step before recorded over them (Qwen-Image-2.1 only; the last two steps must run at full size). Faster, visibly softer |
 | `--embedding-max-queue` | Embedding requests that may wait in the queue beyond the one running (default 64), when `--model` is an embedding checkpoint |
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).

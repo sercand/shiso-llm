@@ -110,6 +110,18 @@ pub enum ImageGenError {
         /// The only count the model runs.
         fixed: u32,
     },
+    /// The draft stage would take every step of the job, leaving none at
+    /// the requested size to finish it.
+    #[error(
+        "{draft} draft steps leave none of the job's {steps} steps at full size; \
+         lower the draft step count or ask for more steps"
+    )]
+    DraftTakesEveryStep {
+        /// The configured draft steps.
+        draft: u32,
+        /// The job's step count.
+        steps: u32,
+    },
     /// The requested size's estimated decode working set is over the memory
     /// budget the generator runs under: the image is too large for this
     /// host, which is the request's to change, not a device failure.

@@ -584,6 +584,22 @@ pub struct ServeArgs {
     /// of the host when it plans what stays loaded.
     #[arg(long, env = "SHISO_IMAGE_RESERVE_GB", default_value_t = 1.5)]
     pub image_reserve_gb: f64,
+    /// Leading denoising steps of every image job run at half the
+    /// requested resolution; the job then finishes at its own size. Each
+    /// such step costs about a quarter of a full one, at some cost in fine
+    /// detail. 0 runs every step at full size. A job must keep at least one
+    /// full-size step, and a model without a draft stage refuses a nonzero
+    /// count at boot.
+    #[arg(long, env = "SHISO_IMAGE_DRAFT_STEPS", default_value_t = 0)]
+    pub image_draft_steps: u32,
+    /// Transformer blocks `START:END` (end exclusive) the last denoising
+    /// step of every image job skips, adding instead the residual the step
+    /// before recorded over the same blocks. Saves `(END - START) / blocks`
+    /// of that step at some cost in fidelity. The job's last two steps must
+    /// both run at full size (see `--image-draft-steps`). Unset, every
+    /// block of every step runs.
+    #[arg(long, env = "SHISO_IMAGE_FINAL_REUSE", value_parser = parse_block_span)]
+    pub image_final_reuse: Option<BlockSpan>,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -600,6 +616,32 @@ pub struct ServeArgs {
         default_value_t = ParserChoice::Auto
     )]
     pub tool_call_parser: ParserChoice,
+}
+
+/// A span of transformer blocks, `START:END` with `END` exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSpan {
+    /// The first block in the span.
+    pub start: u32,
+    /// One past the last block in the span.
+    pub end: u32,
+}
+
+/// Parses `START:END` into a non-empty [`BlockSpan`].
+fn parse_block_span(text: &str) -> Result<BlockSpan, String> {
+    let (start, end) = text
+        .split_once(':')
+        .ok_or_else(|| format!("'{text}' is not START:END"))?;
+    let parse = |v: &str| {
+        v.trim()
+            .parse::<u32>()
+            .map_err(|e| format!("'{v}' in '{text}': {e}"))
+    };
+    let (start, end) = (parse(start)?, parse(end)?);
+    if start >= end {
+        return Err(format!("'{text}' is empty: START must be below END"));
+    }
+    Ok(BlockSpan { start, end })
 }
 
 /// A setting that parses but cannot be served.

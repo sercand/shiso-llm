@@ -104,6 +104,20 @@ fn upload(gpu: &Gpu, values: &[f32]) -> DeviceBuffer {
     gpu.upload(&f32_bytes(values))
 }
 
+/// A `[o][i][kh][kw]` kernel reordered to the fused convolutions'
+/// `[o][kh][kw][i]`, as the driver stores it.
+fn tap_major(weight: &[f32], out_c: usize, in_c: usize, k: usize) -> Vec<f32> {
+    let mut out = vec![0.0; weight.len()];
+    for o in 0..out_c {
+        for i in 0..in_c {
+            for t in 0..k * k {
+                out[(o * k * k + t) * in_c + i] = weight[(o * in_c + i) * k * k + t];
+            }
+        }
+    }
+    out
+}
+
 fn silu(v: f64) -> f64 {
     v / (1.0 + (-v).exp())
 }
@@ -325,7 +339,11 @@ fn rms_conv_device(gpu: &Gpu, case: &RmsConv<'_>) -> Vec<f32> {
         ],
     );
     let d_out = upload(gpu, prior.unwrap_or(&vec![0.0; out_c * s]));
-    let (d_w, d_b, d_g) = (upload(gpu, weight), upload(gpu, bias), upload(gpu, gamma));
+    let (d_w, d_b, d_g) = (
+        upload(gpu, &tap_major(weight, out_c, in_c, k)),
+        upload(gpu, bias),
+        upload(gpu, gamma),
+    );
     let args = conv_args(in_c, (h, w), out_c, k, prior.is_some(), with_silu, false);
     launch(
         gpu,
@@ -476,7 +494,10 @@ pub fn conv2d_up2_is_the_conv_of_the_upsampled_field(gpu: &Gpu) {
     });
     let d_x = upload(gpu, &x);
     let d_out = upload(gpu, &vec![0.0; out_c * uh * uw]);
-    let (d_w, d_b) = (upload(gpu, &weight), upload(gpu, &bias));
+    let (d_w, d_b) = (
+        upload(gpu, &tap_major(&weight, out_c, in_c, k)),
+        upload(gpu, &bias),
+    );
     let args = conv_args(in_c, (h, w), out_c, k, false, false, true);
     launch(
         gpu,

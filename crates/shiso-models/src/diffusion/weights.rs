@@ -1,29 +1,44 @@
-//! The safetensors weight store one checkpoint component is read through.
+//! The weight store one checkpoint component is read through.
 //!
-//! A component (transformer, text encoder, VAE) is a directory of shards or a
-//! single file. This opens every shard of one component, indexes the union of
-//! their tensors, and hands tensors to a device as borrowed imports: the shard
+//! A component (transformer, text encoder, VAE) is a directory of
+//! safetensors shards, a single safetensors file, or a single GGUF file.
+//! This opens every shard of one component, indexes the union of their
+//! tensors, and hands tensors to a device as borrowed imports: the shard
 //! mapping is the host memory the device wraps, so a weight travels as
 //! (mapping, byte range) and is never re-encoded, dequantized, or copied into
-//! an intermediate buffer of ours.
+//! an intermediate buffer of ours. A GGUF file's k-quant blocks reach the
+//! device as the bytes the file wrote, tagged with their [`BlockFormat`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use half::bf16;
-use shiso_core::{Backend, DeviceBuffer, import_host};
+use shiso_core::{Backend, DType, DeviceBuffer, HostBytes, import_host};
+use shiso_modelfile::GgufFile;
 use shiso_modelfile::st_header::{Shard, StDType};
 use shiso_vision::generator::ImageGenError;
 
 use super::ops::Ops;
 use super::residency::{FileSpan, coalesce};
 
+/// A GGUF k-quant block format, stored as raw bytes along each row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockFormat {
+    /// 256 weights in 144 bytes: 4-bit codes, 6-bit scales and mins.
+    Q4K,
+    /// 256 weights in 210 bytes: 6-bit codes, 8-bit scales.
+    Q6K,
+}
+
 /// One tensor as its shard header described it, resolved to a shard slot.
 #[derive(Debug)]
 pub(crate) struct StEntry {
-    /// Declared storage format.
+    /// Declared storage format; [`StDType::U8`] for a k-quant tensor, whose
+    /// blocks [`StEntry::block`] names.
     pub dtype: StDType,
+    /// The k-quant block format of a GGUF tensor, else `None`.
+    pub block: Option<BlockFormat>,
     /// Dimensions, slowest-varying axis first.
     pub shape: Vec<u64>,
     shard: usize,
@@ -38,10 +53,74 @@ impl StEntry {
     }
 }
 
+/// One mapped file of a store.
+#[derive(Debug)]
+enum Backing {
+    /// A safetensors shard; entry offsets are relative to its payload.
+    St(Arc<Shard>),
+    /// A GGUF file's shared mapping (which keeps the file mapped);
+    /// entry offsets are into it.
+    Gguf {
+        host: Arc<dyn HostBytes>,
+        path: PathBuf,
+    },
+}
+
+impl Backing {
+    fn payload(&self, start: u64, end: u64) -> Result<&[u8], String> {
+        match self {
+            Self::St(shard) => shard.payload(start, end).map_err(|e| e.to_string()),
+            Self::Gguf { host, .. } => {
+                let bytes: &[u8] = (**host).as_ref();
+                usize::try_from(start)
+                    .ok()
+                    .zip(usize::try_from(end).ok())
+                    .and_then(|(s, e)| bytes.get(s..e))
+                    .ok_or_else(|| format!("bytes {start}..{end} run past the file"))
+            }
+        }
+    }
+
+    fn import(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<(Arc<dyn HostBytes>, std::ops::Range<usize>), String> {
+        match self {
+            Self::St(shard) => {
+                let range = shard.payload_range(start, end).map_err(|e| e.to_string())?;
+                let shard: Arc<Shard> = Arc::clone(shard);
+                let host: Arc<dyn HostBytes> = shard;
+                Ok((host, range))
+            }
+            Self::Gguf { host, .. } => {
+                self.payload(start, end)?;
+                let range = usize::try_from(start).unwrap_or(usize::MAX)
+                    ..usize::try_from(end).unwrap_or(usize::MAX);
+                Ok((Arc::clone(host), range))
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::St(shard) => shard.path(),
+            Self::Gguf { path, .. } => path,
+        }
+    }
+
+    fn payload_base(&self) -> u64 {
+        match self {
+            Self::St(shard) => shard.payload_base(),
+            Self::Gguf { .. } => 0,
+        }
+    }
+}
+
 /// Every tensor of one component's shards, addressable by name.
 #[derive(Debug)]
 pub(crate) struct StStore {
-    shards: Vec<Arc<Shard>>,
+    shards: Vec<Backing>,
     entries: HashMap<String, StEntry>,
 }
 
@@ -61,7 +140,67 @@ impl StStore {
     /// or a range that runs past the file, is refused at open — before any
     /// weight is imported — so no `Lin::load` below re-checks it.
     pub(crate) fn open(path: &Path) -> Result<Self, ImageGenError> {
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "gguf") {
+            return Self::open_gguf(path);
+        }
         Self::open_files(&safetensors_files(path)?)
+    }
+
+    /// Opens one GGUF file, mapped shared so the device can wrap it.
+    ///
+    /// GGUF lists a tensor's dimensions fastest-varying first; they are
+    /// reversed here into the safetensors order every caller reads. `F32`
+    /// and `BF16` tensors index as their safetensors twins; `Q4_K` and
+    /// `Q6_K` as raw bytes tagged with their [`BlockFormat`]; any other
+    /// format is refused at open, before a byte is imported.
+    pub(crate) fn open_gguf(path: &Path) -> Result<Self, ImageGenError> {
+        let file = GgufFile::open_shared(path)
+            .map_err(|e| ImageGenError::Checkpoint(format!("opening {}: {e}", path.display())))?;
+        let mut entries = HashMap::new();
+        for desc in file.tensors() {
+            let (dtype, block) = match desc.dtype {
+                DType::F32 => (StDType::F32, None),
+                DType::BF16 => (StDType::Bf16, None),
+                DType::F16 => (StDType::F16, None),
+                DType::Q4_K => (StDType::U8, Some(BlockFormat::Q4K)),
+                DType::Q6_K => (StDType::U8, Some(BlockFormat::Q6K)),
+                other => {
+                    return Err(ImageGenError::Checkpoint(format!(
+                        "{}: tensor '{}' is {other:?}, which no diffusion kernel reads",
+                        path.display(),
+                        desc.name
+                    )));
+                }
+            };
+            let range = file.range_of(desc);
+            if u64::try_from(range.len()).ok() != Some(desc.bytes) {
+                return Err(ImageGenError::Checkpoint(format!(
+                    "{}: tensor '{}' runs past the end of the file",
+                    path.display(),
+                    desc.name
+                )));
+            }
+            let shape: Vec<u64> = desc.shape.dims().iter().rev().copied().collect();
+            entries.insert(
+                desc.name.to_string(),
+                StEntry {
+                    dtype,
+                    block,
+                    shape,
+                    shard: 0,
+                    start: desc.abs_offset,
+                    end: desc.abs_offset + desc.bytes,
+                },
+            );
+        }
+        let host = file.mapping();
+        Ok(Self {
+            shards: vec![Backing::Gguf {
+                host,
+                path: path.to_path_buf(),
+            }],
+            entries,
+        })
     }
 
     /// Opens exactly these shard files, refusing a tensor name that two of
@@ -85,7 +224,7 @@ impl StStore {
                 ImageGenError::Checkpoint(format!("opening {}: {e}", file.display()))
             })?;
             let slot = shards.len();
-            shards.push(Arc::new(shard));
+            shards.push(Backing::St(Arc::new(shard)));
             for (name, raw) in tensors {
                 let dtype = raw
                     .parsed_dtype(&name)
@@ -104,6 +243,7 @@ impl StStore {
                     name,
                     StEntry {
                         dtype,
+                        block: None,
                         shape: raw.shape,
                         shard: slot,
                         start,
@@ -160,11 +300,9 @@ impl StStore {
         name: &str,
     ) -> Result<DeviceBuffer, ImageGenError> {
         let entry = self.require(name)?;
-        let range = self.shards[entry.shard]
-            .payload_range(entry.start, entry.end)
+        let (host, range) = self.shards[entry.shard]
+            .import(entry.start, entry.end)
             .map_err(|e| ImageGenError::Checkpoint(format!("{name}: {e}")))?;
-        let shard: Arc<Shard> = Arc::clone(&self.shards[entry.shard]);
-        let host: Arc<dyn shiso_core::HostBytes> = shard;
         import_host(backend, host, range)
             .map_err(|e| ImageGenError::Backend(format!("importing '{name}': {e}")))
     }

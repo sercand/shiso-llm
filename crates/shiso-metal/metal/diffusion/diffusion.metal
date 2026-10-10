@@ -1146,6 +1146,67 @@ struct dit_wrows_fp8 {
     }
 };
 
+/// GGUF k-quant weight rows: a row of `k` weights is `k / 256` blocks.
+///
+/// Q4_K (144 bytes): `half d, dmin; uchar scales[12]; uchar qs[128]`. The
+/// 256 weights are four runs of 64, each the low then the high nibbles of
+/// 32 bytes of `qs`; each run of 32 has a 6-bit scale and min packed in
+/// `scales`, and the weight is `d * sc * q - dmin * m`. Four weights from
+/// a 4-aligned `kk` share one run, so one load decodes one scale/min pair
+/// and four adjacent nibbles.
+struct dit_wrows_q4k {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        device const uchar *b = w + (uint64_t) n * (k / 256u) * 144u + (kk / 256u) * 144u;
+        const uint i = kk % 256u;
+        const uint chunk = i / 64u;
+        const uint within = i % 64u;
+        const uint sub = 2u * chunk + (within >= 32u ? 1u : 0u);
+        device const uchar *sc = b + 4;
+        uint scale;
+        uint min;
+        if (sub < 4u) {
+            scale = sc[sub] & 63u;
+            min = sc[sub + 4u] & 63u;
+        } else {
+            scale = (sc[sub + 4u] & 0xFu) | ((sc[sub - 4u] >> 6u) << 4u);
+            min = (sc[sub + 4u] >> 4u) | ((sc[sub] >> 6u) << 4u);
+        }
+        const float d = float(*((device const half *) b)) * float(scale);
+        const float m = float(*((device const half *) (b + 2))) * float(min);
+        const uchar4 q = uchar4(*((device const packed_uchar4 *) (b + 16 + 32u * chunk + within % 32u)));
+        const uint4 code = within >= 32u ? uint4(q) >> 4u : uint4(q) & 0xFu;
+        return d * float4(code) - m;
+    }
+};
+
+/// Q6_K (210 bytes): `uchar ql[128]; uchar qh[64]; char scales[16]; half
+/// d`. Each half of 128 weights is four runs of 32: run `r` takes the low
+/// (runs 0, 1) or high (runs 2, 3) nibbles of `ql[32 * (r & 1) ..]` and
+/// bits `2r, 2r + 1` of `qh`, minus 32, with one int8 scale per 16
+/// weights; the weight is `d * scale * q`.
+struct dit_wrows_q6k {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        device const uchar *b = w + (uint64_t) n * (k / 256u) * 210u + (kk / 256u) * 210u;
+        const uint i = kk % 256u;
+        const uint half_ = i / 128u;
+        const uint r = (i % 128u) / 32u;
+        const uint l = i % 32u;
+        const uchar4 ql = uchar4(*((device const packed_uchar4 *)
+                (b + 64u * half_ + 32u * (r & 1u) + l)));
+        const uchar4 qh = uchar4(*((device const packed_uchar4 *) (b + 128u + 32u * half_ + l)));
+        const uint4 lo = r >= 2u ? uint4(ql) >> 4u : uint4(ql) & 0xFu;
+        const uint4 hi = (uint4(qh) >> (2u * r)) & 3u;
+        const int4 q = int4(lo | (hi << 4u)) - 32;
+        const float scale = float(((device const char *) (b + 192u))[8u * half_ + l / 16u + 2u * r]);
+        const float d = float(*((device const half *) (b + 208u)));
+        return d * scale * float4(q);
+    }
+};
+
 /// A linear's epilogue: `out[r][c] = acc * scale(c) + bias[c]`, the bias read
 /// only when the driver's presence flag says the binding is real.
 template <typename SC>
@@ -1159,6 +1220,21 @@ struct dit_store_rows {
         out[(uint64_t) r * n + c] = v * scale.at(c) + (has_bias ? bias[c] : 0.0f);
     }
 };
+
+/// Whether a left-operand reader gathers along the pixels instead of along
+/// k (`load4m(r, kk)`: four consecutive rows of one column), and whether an
+/// epilogue wants the fragment drained row-fastest. Both are for the
+/// channel-first convolutions: four adjacent output pixels of one tap are
+/// adjacent input values, where four taps of one pixel are four scattered
+/// ones, and adjacent pixels of one output channel are adjacent stores.
+template <typename AR> struct dit_reads_along_m { enum { value = 0 }; };
+template <typename EP> struct dit_stores_rows_fast { enum { value = 0 }; };
+/// The pixel-wise gather, for readers that declare one; this overload is
+/// the stand-in the tile compiles for every other reader and never calls.
+template <typename AR>
+static inline float4 dit_load4m(const AR a, uint r, uint kk, uint m) {
+    return float4(0.0f);
+}
 
 /// Threadgroup floats the tile stages through: `[64][16+4]` activations and
 /// `[16][64+4]` weights.
@@ -1186,12 +1262,20 @@ static inline void dit_gemm64_tile(
     const uint SLOTS = BM * BK / 4u / NT;
     float4 ra[SLOTS];
     float4 rb[SLOTS];
+    const bool along_m = dit_reads_along_m<AR>::value != 0;
     auto fetch = [&](uint k0) {
         DIT_UNROLL for (uint q = 0; q < SLOTS; ++q) {
             const uint e = tid + q * NT;
             const uint rr = e / (BK / 4u);
             const uint kk = (e - rr * (BK / 4u)) * 4u;
-            ra[q] = m0 + rr < M ? a.load4(m0 + rr, k0 + kk) : float4(0.0f);
+            if (along_m) {
+                // Slot e is column e / (BM / 4), rows (e % (BM / 4)) * 4 + 0..3.
+                const uint ka = e / (BM / 4u);
+                const uint ma = (e - ka * (BM / 4u)) * 4u;
+                ra[q] = dit_load4m(a, m0 + ma, k0 + ka, M);
+            } else {
+                ra[q] = m0 + rr < M ? a.load4(m0 + rr, k0 + kk) : float4(0.0f);
+            }
             rb[q] = n0 + rr < N ? w.load4(n0 + rr, k0 + kk) : float4(0.0f);
         }
     };
@@ -1209,7 +1293,16 @@ static inline void dit_gemm64_tile(
             const uint e = tid + q * NT;
             const uint rr = e / (BK / 4u);
             const uint kk = (e - rr * (BK / 4u)) * 4u;
-            *((threadgroup float4 *) (sa + rr * LDA + kk)) = ra[q];
+            if (along_m) {
+                const uint ka = e / (BM / 4u);
+                const uint ma = (e - ka * (BM / 4u)) * 4u;
+                sa[(ma + 0u) * LDA + ka] = ra[q].x;
+                sa[(ma + 1u) * LDA + ka] = ra[q].y;
+                sa[(ma + 2u) * LDA + ka] = ra[q].z;
+                sa[(ma + 3u) * LDA + ka] = ra[q].w;
+            } else {
+                *((threadgroup float4 *) (sa + rr * LDA + kk)) = ra[q];
+            }
             sb[(kk + 0u) * LDB + rr] = rb[q].x;
             sb[(kk + 1u) * LDB + rr] = rb[q].y;
             sb[(kk + 2u) * LDB + rr] = rb[q].z;
@@ -1244,10 +1337,14 @@ static inline void dit_gemm64_tile(
             simdgroup_store(acc[i][j], slot, 8u);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             for (uint e = lane; e < 64u; e += 32u) {
-                const uint gm = m0 + r0 + 8u * i + (e >> 3u);
-                const uint gn = n0 + c0 + 8u * j + (e & 7u);
+                // Row-fastest drains let adjacent lanes store adjacent rows.
+                const bool rows_fast = dit_stores_rows_fast<EP>::value != 0;
+                const uint fr = rows_fast ? (e & 7u) : (e >> 3u);
+                const uint fc = rows_fast ? (e >> 3u) : (e & 7u);
+                const uint gm = m0 + r0 + 8u * i + fr;
+                const uint gn = n0 + c0 + 8u * j + fc;
                 if (gm < M && gn < N) {
-                    ep.store(gm, gn, slot[e]);
+                    ep.store(gm, gn, slot[fr * 8u + fc]);
                 }
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -1292,6 +1389,24 @@ kernel void kernel_dit_gemm64_fp8(DIT_GEMM64_PARAMS(uchar)) {
     threadgroup float smem[DIT_G64_SMEM];
     dit_gemm64_tile(args.m, args.n, args.k,
                       dit_rows_f32{in, args.k}, dit_wrows_fp8{weight, args.k},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+/// The same tile over GGUF Q4_K and Q6_K weights, decoded while staging
+/// (`k % 256 == 0`); binding 4 is the unit scale.
+kernel void kernel_dit_gemm64_q4k(DIT_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_q4k{weight, args.k},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_dit_gemm64_q6k(DIT_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_q6k{weight, args.k},
                       dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
                       smem, tgpig, tid, lane, sg);
 }
@@ -1483,77 +1598,90 @@ static inline half4 dit_half4_sat(float4 v) {
         ushort lane [[thread_index_in_simdgroup]], \
         ushort sg [[simdgroup_index_in_threadgroup]]
 
-template <bool CAUSAL>
+template <bool CAUSAL, uint RB, uint NSG, uint HD>
 kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
-    const uint QR = DIT_FA_QROWS;
+    const uint QR = 8u * RB * NSG;
     const uint KB = DIT_FA_KEYS;
     const uint NB = KB / 8u;
-    const uint NT = DIT_FA_THREADS;
-    // The f32 output staging; the half query tile and the K and V blocks
-    // reuse the same 16 KiB before it.
-    threadgroup float ostage[DIT_FA_QROWS * DIT_FA_MAX_D];
-    threadgroup half *kv = (threadgroup half *) ostage;
+    const uint NT = 32u * NSG;
+    const uint LDK = DIT_FA_MAX_D + 8u;
+    // Only the K and V blocks pass through threadgroup memory; each row is
+    // padded by eight halves so the transposed K loads do not land eight rows
+    // on one bank.
+    threadgroup half kv[2u * DIT_FA_KEYS * (DIT_FA_MAX_D + 8u)];
 
     const uint h = tgpig.y;
     const uint q0 = tgpig.x * QR;
-    const uint hd = args.head_dim;
+    // HD == 0 reads the head width from the arguments; a fixed width lets
+    // every head loop unroll, so the fragment arrays stay in registers.
+    const uint hd = HD == 0u ? args.head_dim : HD;
     const uint nd = hd / 8u;
     const uint rows = args.txt_tokens + args.img_tokens;
     // A causal tile's last row sees no key past itself, so the stream stops
-    // there; rows past the end stage zero queries and are never written.
+    // there; rows past the end load zero queries and are never written.
     const uint keys = CAUSAL ? min(rows, q0 + QR) : rows + args.cache_tokens;
     if (h >= args.heads) {
         return;
     }
     const float scale = 1.0f / sqrt(float(hd));
 
-    // The query tile, pre-scaled; rows past the end stage as zero.
-    for (uint e = tid; e < QR * hd; e += NT) {
-        const uint r = e / hd;
-        const uint d = e - r * hd;
-        const uint t = q0 + r;
-        const float q = t < rows
-                ? dit_joint_row(args, t, h, args.q_offset, q_txt, q_img, q_txt)[d] * scale
-                : 0.0f;
-        kv[e] = half(clamp(q, -65504.0f, 65504.0f));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_half8x8 qf[DIT_FA_MAX_D / 8u];
-    simdgroup_float8x8 of[DIT_FA_MAX_D / 8u];
-    for (uint i = 0; i < nd; ++i) {
-        simdgroup_load(qf[i], kv + (sg * 8u) * hd + 8u * i, hd);
-        of[i] = simdgroup_float8x8(0.0f);
+    // The lane's place in every 8x8 fragment: columns `fn, fn + 1` of row
+    // `fr`; the four lanes sharing a row differ in lane bits 0 and 3.
+    const ushort fn = ((lane / 4u) & 2u) * 2u + (lane % 2u) * 2u;
+    const ushort fr = ((lane / 4u) & 4u) + ((lane / 2u) % 4u);
+    uint qrow[RB];
+    DIT_UNROLL for (uint rb = 0; rb < RB; ++rb) {
+        qrow[rb] = q0 + (sg * RB + rb) * 8u + fr;
     }
 
-    // The lane's place in every 8x8 fragment: columns `fn, fn + 1` of one
-    // row; the four lanes sharing a row differ in lane bits 0 and 3.
-    const ushort fn = ((lane / 4u) & 2u) * 2u + (lane % 2u) * 2u;
-    // ...and its row: lane bits 1-2 and 4. The causal mask compares the
-    // key's joint index against this query row's.
-    const uint qrow = q0 + sg * 8u + ((lane / 4u) & 4u) + ((lane / 2u) % 4u);
-    float run_max = -INFINITY;
-    float run_sum = 0.0f;
+    // The query fragments, pre-scaled and narrowed, read straight into the
+    // lane's own fragment elements (a fragment's element layout is the same
+    // for every element type).
+    simdgroup_half8x8 qf[RB][DIT_FA_MAX_D / 8u];
+    simdgroup_float8x8 of[RB][DIT_FA_MAX_D / 8u];
+    DIT_UNROLL for (uint rb = 0; rb < RB; ++rb) {
+        const bool live = qrow[rb] < rows;
+        device const float *qp = live
+                ? dit_joint_row(args, qrow[rb], h, args.q_offset, q_txt, q_img, q_txt)
+                : q_txt;
+        DIT_UNROLL for (uint i = 0; i < (HD == 0u ? nd : HD / 8u); ++i) {
+            const float2 qv = live ? float2(qp[8u * i + fn], qp[8u * i + fn + 1u]) * scale
+                                   : float2(0.0f);
+            const half2 qh = half2(clamp(qv, float2(-65504.0f), float2(65504.0f)));
+            qf[rb][i].thread_elements()[0] = qh.x;
+            qf[rb][i].thread_elements()[1] = qh.y;
+            of[rb][i] = simdgroup_float8x8(0.0f);
+        }
+    }
+
+    float run_max[RB];
+    float run_sum[RB];
+    DIT_UNROLL for (uint rb = 0; rb < RB; ++rb) {
+        run_max[rb] = -INFINITY;
+        run_sum[rb] = 0.0f;
+    }
     threadgroup half *sk = kv;
-    threadgroup half *sv = kv + KB * hd;
-    // Four consecutive head values per load (head_dim is a multiple of
-    // eight); a key past the end stages as zero and is masked below.
-    const uint SL = KB * DIT_FA_MAX_D / 4u / NT;
+    threadgroup half *sv = kv + KB * LDK;
+    // Four consecutive head values per load, narrowed as they arrive so the
+    // prefetch holds halves; a key past the end stages as zero and is
+    // masked below.
+    const uint SL = (KB * DIT_FA_MAX_D / 4u + NT - 1u) / NT;
     const uint hd4 = hd / 4u;
-    float4 rk[SL];
-    float4 rv[SL];
+    half4 rk[SL];
+    half4 rv[SL];
     auto fetch = [&](uint s0) {
         DIT_UNROLL for (uint q = 0; q < SL; ++q) {
             const uint e = tid + q * NT;
             const uint j = e / hd4;
             const uint d = (e - j * hd4) * 4u;
             const uint s = s0 + j;
-            rk[q] = float4(0.0f);
-            rv[q] = float4(0.0f);
+            rk[q] = half4(0.0h);
+            rv[q] = half4(0.0h);
             if (e < KB * hd4 && s < keys) {
-                rk[q] = float4(*((device const packed_float4 *)
-                        (dit_joint_row(args, s, h, args.k_offset, k_txt, k_img, cache_k) + d)));
-                rv[q] = float4(*((device const packed_float4 *)
-                        (dit_joint_row(args, s, h, args.v_offset, v_txt, v_img, cache_v) + d)));
+                rk[q] = dit_half4_sat(float4(*((device const packed_float4 *)
+                        (dit_joint_row(args, s, h, args.k_offset, k_txt, k_img, cache_k) + d))));
+                rv[q] = dit_half4_sat(float4(*((device const packed_float4 *)
+                        (dit_joint_row(args, s, h, args.v_offset, v_txt, v_img, cache_v) + d))));
             }
         }
     };
@@ -1565,8 +1693,8 @@ kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
             if (e < KB * hd4) {
                 const uint j = e / hd4;
                 const uint d = (e - j * hd4) * 4u;
-                *((threadgroup half4 *) (sk + j * hd + d)) = dit_half4_sat(rk[q]);
-                *((threadgroup half4 *) (sv + j * hd + d)) = dit_half4_sat(rv[q]);
+                *((threadgroup half4 *) (sk + j * LDK + d)) = rk[q];
+                *((threadgroup half4 *) (sv + j * LDK + d)) = rv[q];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1574,88 +1702,100 @@ kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
             fetch(s0 + KB);
         }
 
-        // Scores: S (8 x KB) = Q (8 x hd) . K^T, one fragment per 8 keys.
-        simdgroup_float8x8 sf[NB];
-        DIT_UNROLL for (uint b = 0; b < NB; ++b) {
-            sf[b] = simdgroup_float8x8(0.0f);
+        // Scores: S (8 x KB) = Q (8 x hd) . K^T per row block, one fragment
+        // per 8 keys; each K fragment is loaded once for every row block.
+        simdgroup_float8x8 sf[RB][NB];
+        DIT_UNROLL for (uint rb = 0; rb < RB; ++rb) {
+            DIT_UNROLL for (uint b = 0; b < NB; ++b) {
+                sf[rb][b] = simdgroup_float8x8(0.0f);
+            }
         }
-        for (uint i = 0; i < nd; ++i) {
+        DIT_UNROLL for (uint i = 0; i < (HD == 0u ? nd : HD / 8u); ++i) {
             DIT_UNROLL for (uint b = 0; b < NB; ++b) {
                 simdgroup_half8x8 kt;
                 // kt(r, c) = K[8b + c][8i + r]: the transposed load.
-                simdgroup_load(kt, sk + 8u * b * hd + 8u * i, hd, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(sf[b], qf[i], kt, sf[b]);
+                simdgroup_load(kt, sk + 8u * b * LDK + 8u * i, LDK, ulong2(0, 0), true);
+                DIT_UNROLL for (uint rb = 0; rb < RB; ++rb) {
+                    simdgroup_multiply_accumulate(sf[rb][b], qf[rb][i], kt, sf[rb][b]);
+                }
             }
         }
 
-        float block_max = -INFINITY;
-        DIT_UNROLL for (uint b = 0; b < NB; ++b) {
-            DIT_UNROLL for (uint c = 0; c < 2u; ++c) {
-                const uint key = s0 + 8u * b + fn + c;
-                if (key >= keys || (CAUSAL && key > qrow)) {
-                    sf[b].thread_elements()[c] = -INFINITY;
+        simdgroup_half8x8 pf[RB][NB];
+        float alpha[RB];
+        DIT_UNROLL for (uint rb = 0; rb < RB; ++rb) {
+            float block_max = -INFINITY;
+            DIT_UNROLL for (uint b = 0; b < NB; ++b) {
+                DIT_UNROLL for (uint c = 0; c < 2u; ++c) {
+                    const uint key = s0 + 8u * b + fn + c;
+                    if (key >= keys || (CAUSAL && key > qrow[rb])) {
+                        sf[rb][b].thread_elements()[c] = -INFINITY;
+                    }
+                    block_max = max(block_max, sf[rb][b].thread_elements()[c]);
                 }
-                block_max = max(block_max, sf[b].thread_elements()[c]);
             }
-        }
-        block_max = max(block_max, simd_shuffle_xor(block_max, 1));
-        block_max = max(block_max, simd_shuffle_xor(block_max, 8));
-        const float new_max = max(run_max, block_max);
-        const float alpha = exp(run_max - new_max);
-        float block_sum = 0.0f;
-        simdgroup_half8x8 pf[NB];
-        DIT_UNROLL for (uint b = 0; b < NB; ++b) {
-            DIT_UNROLL for (uint c = 0; c < 2u; ++c) {
-                const float p = exp(sf[b].thread_elements()[c] - new_max);
-                pf[b].thread_elements()[c] = half(p);
-                block_sum += p;
+            block_max = max(block_max, simd_shuffle_xor(block_max, 1));
+            block_max = max(block_max, simd_shuffle_xor(block_max, 8));
+            const float new_max = max(run_max[rb], block_max);
+            alpha[rb] = exp(run_max[rb] - new_max);
+            float block_sum = 0.0f;
+            DIT_UNROLL for (uint b = 0; b < NB; ++b) {
+                DIT_UNROLL for (uint c = 0; c < 2u; ++c) {
+                    const float p = exp(sf[rb][b].thread_elements()[c] - new_max);
+                    pf[rb][b].thread_elements()[c] = half(p);
+                    block_sum += p;
+                }
             }
+            block_sum += simd_shuffle_xor(block_sum, 1);
+            block_sum += simd_shuffle_xor(block_sum, 8);
+            run_sum[rb] = run_sum[rb] * alpha[rb] + block_sum;
+            run_max[rb] = new_max;
         }
-        block_sum += simd_shuffle_xor(block_sum, 1);
-        block_sum += simd_shuffle_xor(block_sum, 8);
-        run_sum = run_sum * alpha + block_sum;
-        run_max = new_max;
-        for (uint i = 0; i < nd; ++i) {
-            of[i].thread_elements()[0] *= alpha;
-            of[i].thread_elements()[1] *= alpha;
+        DIT_UNROLL for (uint i = 0; i < (HD == 0u ? nd : HD / 8u); ++i) {
+            DIT_UNROLL for (uint rb = 0; rb < RB; ++rb) {
+                of[rb][i].thread_elements()[0] *= alpha[rb];
+                of[rb][i].thread_elements()[1] *= alpha[rb];
+            }
             DIT_UNROLL for (uint b = 0; b < NB; ++b) {
                 simdgroup_half8x8 vf;
-                simdgroup_load(vf, sv + 8u * b * hd + 8u * i, hd);
-                simdgroup_multiply_accumulate(of[i], pf[b], vf, of[i]);
+                simdgroup_load(vf, sv + 8u * b * LDK + 8u * i, LDK);
+                DIT_UNROLL for (uint rb = 0; rb < RB; ++rb) {
+                    simdgroup_multiply_accumulate(of[rb][i], pf[rb][b], vf, of[rb][i]);
+                }
             }
         }
     }
 
-    // Normalize by the denominators, stage the 32 x hd tile and write it out.
-    const float inv = 1.0f / run_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = 0; i < nd; ++i) {
-        of[i].thread_elements()[0] *= inv;
-        of[i].thread_elements()[1] *= inv;
-        simdgroup_store(of[i], ostage + (sg * 8u) * hd + 8u * i, hd);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Normalize by the denominators and write each lane's two elements of
+    // every fragment straight to its row.
     const uint width = args.heads * hd;
-    for (uint e = tid; e < QR * hd; e += NT) {
-        const uint r = e / hd;
-        const uint d = e - r * hd;
-        const uint t = q0 + r;
+    DIT_UNROLL for (uint rb = 0; rb < RB; ++rb) {
+        const uint t = qrow[rb];
         if (t >= rows) {
             continue;
         }
-        if (t < args.txt_tokens) {
-            out_txt[(uint64_t) t * width + h * hd + d] = ostage[e];
-        } else {
-            out_img[(uint64_t) (t - args.txt_tokens) * width + h * hd + d] = ostage[e];
+        const float inv = 1.0f / run_sum[rb];
+        device float *op = t < args.txt_tokens
+                ? out_txt + (uint64_t) t * width + h * hd
+                : out_img + (uint64_t) (t - args.txt_tokens) * width + h * hd;
+        DIT_UNROLL for (uint i = 0; i < (HD == 0u ? nd : HD / 8u); ++i) {
+            op[8u * i + fn] = of[rb][i].thread_elements()[0] * inv;
+            op[8u * i + fn + 1u] = of[rb][i].thread_elements()[1] * inv;
         }
     }
 }
 
 template [[host_name("kernel_dit_flash_sdpa_f32")]]
-kernel void kernel_dit_flash_sdpa<false>(DIT_FLASH_SDPA_PARAMS);
+kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 0u>(DIT_FLASH_SDPA_PARAMS);
 
 template [[host_name("kernel_dit_flash_sdpa_causal_f32")]]
-kernel void kernel_dit_flash_sdpa<true>(DIT_FLASH_SDPA_PARAMS);
+kernel void kernel_dit_flash_sdpa<true, DIT_FA_RB, DIT_FA_SG, 0u>(DIT_FLASH_SDPA_PARAMS);
+
+template [[host_name("kernel_dit_flash_sdpa_d128_f32")]]
+kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 128u>(DIT_FLASH_SDPA_PARAMS);
+
+template [[host_name("kernel_dit_flash_sdpa_causal_d128_f32")]]
+kernel void kernel_dit_flash_sdpa<true, DIT_FA_RB, DIT_FA_SG, 128u>(DIT_FLASH_SDPA_PARAMS);
 
 // --- fused linear: swiglu/concat input, gated-residual output --------------------
 
@@ -1741,6 +1881,14 @@ kernel void kernel_dit_gemm64_fused_bf16(DIT_GEMM_FUSED_PARAMS(ushort)) {
 
 kernel void kernel_dit_gemm64_fused_fp8(DIT_GEMM_FUSED_PARAMS(uchar)) {
     DIT_GEMM_FUSED_BODY(dit_wrows_fp8)
+}
+
+kernel void kernel_dit_gemm64_fused_q4k(DIT_GEMM_FUSED_PARAMS(uchar)) {
+    DIT_GEMM_FUSED_BODY(dit_wrows_q4k)
+}
+
+kernel void kernel_dit_gemm64_fused_q6k(DIT_GEMM_FUSED_PARAMS(uchar)) {
+    DIT_GEMM_FUSED_BODY(dit_wrows_q6k)
 }
 
 /// The same fused linear over a per-row INT8 weight; binding 5 is the
@@ -1858,12 +2006,28 @@ kernel void kernel_dit_channel_rms_inv_f32(
     inv[s] = args.scale / max(sqrt(ss), args.eps);
 }
 
+/// `n / d` for `n < 2^24`: a float reciprocal estimate, which is off by at
+/// most one there, then corrected exactly. The integer divide is a long
+/// software sequence on the GPU, and three of them per gathered vector cost
+/// the VAE convolution 8% (2.36 against 2.55 TFLOPS with the divisors
+/// constant, on an M4).
+static inline uint dit_div(uint n, uint d) {
+    uint q = uint(float(n) / float(d));
+    if (q * d > n) {
+        --q;
+    } else if ((q + 1u) * d <= n) {
+        ++q;
+    }
+    return q;
+}
+
 /// The gather transforms of the VAE convolutions.
 #define DIT_VAE_RMS 0u
 #define DIT_VAE_UP2 1u
 
 /// The convolution's left operand, as `dit_im2col` (stride 1, square
-/// kernel), with the input transform applied per tap:
+/// kernel) but with the taps ordered channel-fastest (see `load4m`), with
+/// the input transform applied per tap:
 ///
 /// - `DIT_VAE_RMS`: the tap reads `x[ic, p] * inv[p] * gamma[ic]`, then
 ///   SiLU when `silu` is set - the reference's norm -> (silu) -> conv;
@@ -1886,41 +2050,77 @@ struct dit_im2col_vae {
     uint k;
     uint pad;
     bool silu;
+    uint in_c_;
+    /// The tile reads this operand through `load4m` only
+    /// (`dit_reads_along_m`); the k-wise gather is never called.
     float4 load4(uint r, uint kk) const {
-        const uint oh = r / out_w;
-        const uint ow = r - oh * out_w;
-        const uint khw = k * k;
-        uint ic = kk / khw;
-        const uint rem = kk - ic * khw;
-        uint kh = rem / k;
-        uint kw = rem - kh * k;
-        const int ih0 = int(oh) - int(pad);
-        const int iw0 = int(ow) - int(pad);
+        return float4(0.0f);
+    }
+    /// Column `kk` of the four output pixels `r..r+3`, zero past row `m`.
+    /// The fused convolutions order their taps channel-fastest, `kk = (kh *
+    /// k + kw) * in_c + ic` (the driver stores the weight `[o][kh][kw][i]`),
+    /// so a 16-wide k slice is sixteen channels of one tap and the
+    /// decomposition below runs once per column, not per value. Four
+    /// pixels of one output row whose taps all land inside the field are
+    /// four adjacent inputs, read as one vector; the edges take the
+    /// per-value path.
+    float4 load4m(uint r, uint kk, uint m) const {
+        const uint tap = dit_div(kk, in_c_);
+        const uint ic = kk - tap * in_c_;
+        const uint kh = dit_div(tap, k);
+        const uint kw = tap - kh * k;
         const uint plane = in_h * in_w;
-        float v[4];
-        DIT_UNROLL for (uint c = 0; c < 4u; ++c) {
-            const int ih = ih0 + int(kh);
-            const int iw = iw0 + int(kw);
-            if (ih < 0 || iw < 0 || ih >= int(f_h) || iw >= int(f_w)) {
-                v[c] = 0.0f;
-            } else if (MODE == DIT_VAE_UP2) {
-                v[c] = in[(uint64_t) ic * plane + (uint(ih) >> 1u) * in_w + (uint(iw) >> 1u)];
+        const float g = MODE == DIT_VAE_RMS ? gamma[ic] : 1.0f;
+        const uint oh = dit_div(r, out_w);
+        const uint ow = r - oh * out_w;
+        const int ih = int(oh) - int(pad) + int(kh);
+        const int iw = int(ow) - int(pad) + int(kw);
+        float4 v;
+        if (r + 3u < m && ow + 3u < out_w && ih >= 0 && ih < int(f_h) && iw >= 0
+                && iw + 3 < int(f_w)) {
+            if (MODE == DIT_VAE_UP2) {
+                // Columns iw..iw+3 of the doubled field are stored columns
+                // iw/2 .. (iw+3)/2: two or three values, each repeated.
+                device const float *row = in + (uint64_t) ic * plane + (uint(ih) >> 1u) * in_w;
+                const uint c0 = uint(iw);
+                v = float4(row[c0 >> 1u], row[(c0 + 1u) >> 1u], row[(c0 + 2u) >> 1u],
+                           row[(c0 + 3u) >> 1u]);
             } else {
                 const uint p = uint(ih) * in_w + uint(iw);
-                const float x = in[(uint64_t) ic * plane + p] * inv[p] * gamma[ic];
-                v[c] = silu ? dit_silu(x) : x;
+                const float4 x = float4(*((device const packed_float4 *) (in + (uint64_t) ic * plane + p)))
+                        * float4(*((device const packed_float4 *) (inv + p))) * g;
+                v = silu ? float4(dit_silu(x.x), dit_silu(x.y), dit_silu(x.z), dit_silu(x.w)) : x;
             }
-            if (++kw == k) {
-                kw = 0u;
-                if (++kh == k) {
-                    kh = 0u;
-                    ++ic;
-                }
+            return v;
+        }
+        uint ph = oh;
+        uint pw = ow;
+        float e[4];
+        DIT_UNROLL for (uint c = 0; c < 4u; ++c) {
+            const int yh = int(ph) - int(pad) + int(kh);
+            const int xw = int(pw) - int(pad) + int(kw);
+            if (r + c >= m || yh < 0 || xw < 0 || yh >= int(f_h) || xw >= int(f_w)) {
+                e[c] = 0.0f;
+            } else if (MODE == DIT_VAE_UP2) {
+                e[c] = in[(uint64_t) ic * plane + (uint(yh) >> 1u) * in_w + (uint(xw) >> 1u)];
+            } else {
+                const uint p = uint(yh) * in_w + uint(xw);
+                const float x = in[(uint64_t) ic * plane + p] * inv[p] * g;
+                e[c] = silu ? dit_silu(x) : x;
+            }
+            if (++pw == out_w) {
+                pw = 0u;
+                ++ph;
             }
         }
-        return float4(v[0], v[1], v[2], v[3]);
+        return float4(e[0], e[1], e[2], e[3]);
     }
 };
+template <uint MODE> struct dit_reads_along_m<dit_im2col_vae<MODE>> { enum { value = 1 }; };
+template <uint MODE>
+static inline float4 dit_load4m(const dit_im2col_vae<MODE> a, uint r, uint kk, uint m) {
+    return a.load4m(r, kk, m);
+}
 
 /// NCHW epilogue with the residual add: `out = conv + bias`, or
 /// `out += conv + bias` when `accumulate` is set. Each output element is
@@ -1938,6 +2138,7 @@ struct dit_store_nchw_acc {
         out[i] = accumulate ? out[i] + y : y;
     }
 };
+template <> struct dit_stores_rows_fast<dit_store_nchw_acc> { enum { value = 1 }; };
 
 /// norm -> (silu) -> conv as one implicit GEMM: M = out_h * out_w pixels,
 /// N = out_c, K = in_c * k * k taps (a multiple of 16, which the driver
@@ -1960,7 +2161,7 @@ kernel void kernel_dit_conv2d_rms_gemm_f32(
     const uint taps = args.in_c * args.k * args.k;
     const dit_im2col_vae<DIT_VAE_RMS> a{
             in, inv, gamma, args.in_h, args.in_w, args.in_h, args.in_w,
-            args.out_w, args.k, args.pad, args.silu != 0u};
+            args.out_w, args.k, args.pad, args.silu != 0u, args.in_c};
     const dit_store_nchw_acc ep{out, plane, bias, args.has_bias != 0u, args.accumulate != 0u};
     dit_gemm64_tile(plane, args.out_c, taps, a, dit_wrows_f32{weight, taps}, ep,
                       smem, tgpig, tid, lane, sg);
@@ -1985,7 +2186,7 @@ kernel void kernel_dit_conv2d_up2_gemm_f32(
     const uint taps = args.in_c * args.k * args.k;
     const dit_im2col_vae<DIT_VAE_UP2> a{
             in, in, in, args.in_h, args.in_w, 2u * args.in_h, 2u * args.in_w,
-            args.out_w, args.k, args.pad, false};
+            args.out_w, args.k, args.pad, false, args.in_c};
     const dit_store_nchw_acc ep{out, plane, bias, args.has_bias != 0u, args.accumulate != 0u};
     dit_gemm64_tile(plane, args.out_c, taps, a, dit_wrows_f32{weight, taps}, ep,
                       smem, tgpig, tid, lane, sg);

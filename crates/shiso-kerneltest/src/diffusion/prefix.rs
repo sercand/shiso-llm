@@ -24,9 +24,11 @@ use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::signal;
 
 /// Every entry point this file's cases launch.
-pub const ENTRIES: [&str; 5] = [
+pub const ENTRIES: [&str; 7] = [
     "kernel_dit_flash_sdpa_f32",
     "kernel_dit_flash_sdpa_causal_f32",
+    "kernel_dit_flash_sdpa_d128_f32",
+    "kernel_dit_flash_sdpa_causal_d128_f32",
     "kernel_dit_qk_norm_rope_f32",
     "kernel_dit_tanh_f32",
     "kernel_dit_gelu_tanh_f32",
@@ -36,9 +38,9 @@ const MODULE: &str = "diffusion";
 /// Threads per elementwise / per-(token, head) threadgroup.
 const BLOCK: u32 = 64;
 /// Query rows per fused-attention threadgroup.
-const FA_QROWS: u32 = 32;
+const FA_QROWS: u32 = 64;
 /// Threads per fused-attention threadgroup.
-const FA_THREADS: u32 = 128;
+const FA_THREADS: u32 = 256;
 
 // Argument blocks: byte for byte `diffusion_common.h` and the driver's Pods.
 
@@ -228,17 +230,31 @@ pub fn flash_sdpa_causal_masks_every_later_key(gpu: &Gpu) {
         let (q, k, v) = (scaled(seed), scaled(seed + 1), scaled(seed + 2));
         let shape = (rows, heads, hd);
         let want = attention_host(&q, &k, &v, shape, true);
-        let got = flash_txt_only(gpu, "kernel_dit_flash_sdpa_causal_f32", (&q, &k, &v), shape);
-        close(&got, &want, 3e-3, 0.05, "causal flash sdpa");
-        let full = flash_txt_only(gpu, "kernel_dit_flash_sdpa_f32", (&q, &k, &v), shape);
-        close(
-            &full,
-            &attention_host(&q, &k, &v, shape, false),
-            3e-3,
-            0.05,
-            "bidirectional flash sdpa",
-        );
-        differs(&got, &full, 1e-2, "causal vs bidirectional");
+        // The 128-wide entries are the same kernel with the head width
+        // fixed at compile time; they take only that width.
+        let mut pairs = vec![(
+            "kernel_dit_flash_sdpa_causal_f32",
+            "kernel_dit_flash_sdpa_f32",
+        )];
+        if hd == 128 {
+            pairs.push((
+                "kernel_dit_flash_sdpa_causal_d128_f32",
+                "kernel_dit_flash_sdpa_d128_f32",
+            ));
+        }
+        for (causal, bidirectional) in pairs {
+            let got = flash_txt_only(gpu, causal, (&q, &k, &v), shape);
+            close(&got, &want, 3e-3, 0.05, causal);
+            let full = flash_txt_only(gpu, bidirectional, (&q, &k, &v), shape);
+            close(
+                &full,
+                &attention_host(&q, &k, &v, shape, false),
+                3e-3,
+                0.05,
+                bidirectional,
+            );
+            differs(&got, &full, 1e-2, "causal vs bidirectional");
+        }
     }
 }
 

@@ -54,8 +54,9 @@ use shiso_vision::generator::{
 use super::config::QwenImageConfig;
 use super::prompt::QwenImagePrompt;
 use super::scheduler::{ScheduleSource, check_nodes, euler_dt, resolve};
-use super::transformer::{DitDesc, QwenDit};
+use super::transformer::{BlockReuse, DitDesc, QwenDit, StepOpts};
 use super::vae::{LatentGrid, QwenVae, QwenVaeDesc, SPATIAL_FACTOR};
+use crate::diffusion::draft::upsample2x_noisy;
 use crate::diffusion::encode::{Channels, encode_image};
 use crate::diffusion::noise::gaussian;
 use crate::diffusion::ops::Ops;
@@ -184,6 +185,12 @@ pub(crate) struct QwenImage21Model {
     working_set: u64,
     reserve: u64,
     footprint: Footprint,
+    /// Leading steps of every job run on the half-size grid
+    /// ([`crate::diffusion::draft`]).
+    draft_steps: usize,
+    /// Blocks the last step replays from the step before
+    /// ([`super::transformer::BlockReuse`]).
+    final_reuse: Option<std::ops::Range<usize>>,
     state: Mutex<State>,
 }
 
@@ -203,6 +210,13 @@ fn delta(before: Option<u64>, after: Option<u64>) -> i64 {
         _ => 0,
     }
 }
+
+/// How much of the draft's upsampled state the hand-over keeps
+/// ([`upsample2x_noisy`]'s `keep`): 1/4 keeps all of it, the most the
+/// nearest-neighbour covariance allows. Measured on a 6-step distilled
+/// checkpoint at 1024x1024 (4 draft steps): 1/8 and 1/16 start the
+/// full-size steps at a higher sigma with no visible gain in detail.
+const DRAFT_KEEP: f32 = 0.25;
 
 fn ms(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -302,6 +316,32 @@ impl QwenImage21Model {
             }
             None => Schedule::Linear,
         };
+        if let Some(fixed) = schedule.fixed_steps()
+            && desc.draft_steps >= fixed
+        {
+            return Err(ImageGenError::Checkpoint(format!(
+                "--image-draft-steps {} leaves none of this model's fixed {fixed} steps at full size",
+                desc.draft_steps
+            )));
+        }
+        if let Some((start, end)) = desc.final_reuse
+            && (start >= end || end as usize > config.dit.num_layers)
+        {
+            return Err(ImageGenError::Checkpoint(format!(
+                "--image-final-reuse {start}:{end} is not a span of this model's {} blocks",
+                config.dit.num_layers
+            )));
+        }
+        if let Some(fixed) = schedule.fixed_steps()
+            && desc.final_reuse.is_some()
+            && fixed.saturating_sub(desc.draft_steps) < 2
+        {
+            return Err(ImageGenError::Checkpoint(format!(
+                "--image-final-reuse needs the last two of this model's fixed {fixed} steps at \
+                 full size, and --image-draft-steps {} leaves fewer",
+                desc.draft_steps
+            )));
+        }
         let model_id = "qwen-image-2.1".to_string();
         let prompt = QwenImagePrompt::load(
             desc.tokenizer_path
@@ -424,6 +464,10 @@ impl QwenImage21Model {
             working_set,
             reserve: desc.reserve_bytes,
             footprint,
+            draft_steps: desc.draft_steps as usize,
+            final_reuse: desc
+                .final_reuse
+                .map(|(start, end)| start as usize..end as usize),
             state: Mutex::new(State {
                 encoder: None,
                 denoiser: None,
@@ -820,12 +864,45 @@ impl ImageGenerator for QwenImage21Model {
         };
         let residency = self.plan_job(&state, grid, ids.ids.len())?;
         let steps = job.steps as usize;
-        let sigmas = resolve(
+        let mut sigmas = resolve(
             self.schedule.source(),
             &self.config.shift,
             steps,
             grid.cells(),
         )?;
+        let draft = self.draft_steps;
+        if draft >= steps && draft > 0 {
+            return Err(ImageGenError::DraftTakesEveryStep {
+                draft: u32::try_from(draft).unwrap_or(u32::MAX),
+                steps: job.steps,
+            });
+        }
+        // The draft grid is half the job's along each side (sizes sit on a
+        // 32-pixel grid, so the latent grid is even), with its own ladder:
+        // the dynamic shift follows the token count the steps run at.
+        let draft_grid = LatentGrid {
+            h: grid.h / 2,
+            w: grid.w / 2,
+        };
+        // The last step replays a span of blocks the one before recorded,
+        // when both run at full size.
+        let reuse_span = self.final_reuse.clone().filter(|_| steps >= draft + 2);
+        if self.final_reuse.is_some() && reuse_span.is_none() {
+            return Err(ImageGenError::DraftTakesEveryStep {
+                draft: u32::try_from(draft + 1).unwrap_or(u32::MAX),
+                steps: job.steps,
+            });
+        }
+        let draft_sigmas = if draft > 0 {
+            resolve(
+                self.schedule.source(),
+                &self.config.shift,
+                steps,
+                draft_grid.cells(),
+            )?
+        } else {
+            Vec::new()
+        };
         tracing::info!(
             width = job.width,
             height = job.height,
@@ -855,7 +932,11 @@ impl ImageGenerator for QwenImage21Model {
         let text = ops.upload_scratch("qwen text features", &features)?;
         let mut kv = dit.prefix(ops, text.view(), kept)?;
         drop(text);
-        dit.prepare_steps(ops, &mut kv, &sigmas[..steps], grid)?;
+        if draft > 0 {
+            dit.prepare_steps(ops, &mut kv, &draft_sigmas[..draft], draft_grid)?;
+        } else {
+            dit.prepare_steps(ops, &mut kv, &sigmas[..steps], grid)?;
+        }
         sync()?;
         tracing::info!(
             ms = ms(phase),
@@ -863,28 +944,90 @@ impl ImageGenerator for QwenImage21Model {
             "qwen image phase prefix"
         );
 
-        let count = grid.cells() * self.config.dit.in_channels;
-        let latents = ops.upload_f32("qwen latents", &gaussian(job.seed, count))?;
+        let channels = self.config.dit.in_channels;
+        let count = grid.cells() * channels;
+        // One noise stream per job: the draft's starting noise first, then
+        // the full-size noise its clean estimate is re-noised with, so a
+        // seed fixes both.
+        let draft_count = if draft > 0 {
+            draft_grid.cells() * channels
+        } else {
+            0
+        };
+        let noise = gaussian(job.seed, draft_count + count);
+        let (draft_noise, full_noise) = noise.split_at(draft_count);
+        let mut latents = ops.upload_f32(
+            "qwen latents",
+            if draft > 0 { draft_noise } else { full_noise },
+        )?;
         let velocity =
             ops.alloc_owned_f32("qwen velocity", grid.cells() * self.config.dit.out_channels)?;
+        let residual = match reuse_span {
+            Some(_) => Some(ops.alloc_owned_f32(
+                "qwen reuse residual",
+                grid.cells() * self.config.dit.hidden(),
+            )?),
+            None => None,
+        };
         let denoise = Instant::now();
         for i in 0..steps {
             let phase = Instant::now();
-            let sigma = sigmas[i];
-            dit.velocity(ops, &kv, latents.view(), grid, sigma, velocity.view())?;
+            let drafting = i < draft;
+            let (at, ladder, n) = if drafting {
+                (draft_grid, &draft_sigmas, draft_count)
+            } else {
+                (grid, &sigmas, count)
+            };
+            let sigma = ladder[i];
+            let reuse = match (&reuse_span, &residual) {
+                (Some(span), Some(r)) if i + 2 == steps => Some(BlockReuse::Record {
+                    span: span.clone(),
+                    residual: r.view(),
+                }),
+                (Some(span), Some(r)) if i + 1 == steps => Some(BlockReuse::Replay {
+                    span: span.clone(),
+                    residual: r.view(),
+                }),
+                _ => None,
+            };
+            dit.velocity_with(
+                ops,
+                &kv,
+                (latents.view(), at, sigma),
+                velocity.view(),
+                StepOpts { reuse },
+            )?;
+            let dt = euler_dt(ladder, i)?;
             ops.axpy(
                 "qwen euler",
                 latents.view(),
                 latents.view(),
                 velocity.view(),
-                count,
-                euler_dt(&sigmas, i)?,
+                n,
+                dt,
             )?;
+            if i + 1 == draft {
+                let state = ops.download("qwen draft latents", latents.view(), draft_count)?;
+                let mut up = full_noise.to_vec();
+                let handed = upsample2x_noisy(
+                    &state,
+                    (draft_grid.h, draft_grid.w, channels),
+                    draft_sigmas[draft],
+                    DRAFT_KEEP,
+                    &mut up,
+                );
+                latents = ops.upload_f32("qwen latents", &up)?;
+                // The full-size steps start where the hand-over put the
+                // state, then walk the job's own ladder.
+                sigmas[draft] = handed;
+                dit.prepare_steps(ops, &mut kv, &sigmas[draft..steps], grid)?;
+            }
             sync()?;
             tracing::info!(
                 step = i + 1,
                 steps,
                 sigma,
+                draft = drafting,
                 ms = ms(phase),
                 "qwen image phase step"
             );
@@ -900,6 +1043,7 @@ impl ImageGenerator for QwenImage21Model {
         drop(kv);
         drop(velocity);
 
+        let mut read_after_decode = false;
         if let Residency::Swap {
             keep_denoiser: false,
         } = residency
@@ -919,8 +1063,9 @@ impl ImageGenerator for QwenImage21Model {
             } else {
                 tracing::info!(
                     decode_peak_mb = mb(decode_peak),
-                    "qwen image encoder read-ahead skipped: it does not fit beside the decode"
+                    "qwen image encoder read-ahead deferred: it does not fit beside the decode"
                 );
+                read_after_decode = true;
             }
         }
         let loaded = match residency {
@@ -942,6 +1087,21 @@ impl ImageGenerator for QwenImage21Model {
         let rgba = state.decoder.decode(ops, latents.view(), grid, budget)?;
         drop(latents);
         tracing::info!(ms = ms(phase), "qwen image phase decode");
+        // The read-ahead that could not run beside the decode runs after
+        // it, once the decode's working buffers are released: a next job
+        // that arrives after it finished finds the encoder's pages cached
+        // (on an M4, the next job's ~3 s encoder read-ahead then takes 0).
+        if read_after_decode
+            && state.encoder.is_none()
+            && self.footprint.encoder + self.footprint.decoder
+                <= self.working_set.saturating_sub(self.reserve)
+        {
+            self.ops.trim_pool();
+            state.encoder_prefetch = Some(Prefetch::spawn(
+                "encoder",
+                self.encoder_files.spans.clone(),
+            )?);
+        }
 
         let phase = Instant::now();
         let bytes = encode_image(
