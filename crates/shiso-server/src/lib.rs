@@ -302,7 +302,6 @@ pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService
         assets_dir: args.image_assets_dir.clone(),
         residency: args.image_residency.into(),
         reserve_bytes: args.image_reserve_bytes()?,
-        sigmas: args.image_sigmas()?,
     };
     let generator = shiso_models::image_registry::open_image_generator(&desc, &backend)
         .with_context(|| format!("loading image model at {}", path.display()))?;

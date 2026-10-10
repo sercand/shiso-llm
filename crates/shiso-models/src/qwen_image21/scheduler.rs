@@ -2,23 +2,23 @@
 //! sigmas from 1 down to a terminal 0, the latent stepped
 //! `x += (sigma[i+1] - sigma[i]) * v` between rungs.
 //!
-//! Three sources build the ladder ([`ScheduleSource`]):
+//! The ladder is built from nodes `t` in (0, 1] ([`ScheduleSource`]): a
+//! distilled checkpoint's own (`model_index.json` `sample_sigmas`, whose
+//! count is the step count), else `linspace(1, 1/steps, steps)`. Either way
+//! every node is time-shifted by `scheduler_config.json`, exactly as the
+//! reference scheduler treats the sigmas a pipeline hands it, so a
+//! fine-tune is described entirely by the two documents it ships:
 //!
-//! - **Fixed**: a distilled checkpoint's own sigmas (`model_index.json`
-//!   `sample_sigmas`), run verbatim, whatever the resolution. The count is
-//!   the checkpoint's; another is refused ([`ImageGenError::StepsFixed`]).
-//! - **Nodes**: raw nodes `t` in (0, 1], each time-shifted. With dynamic
-//!   shifting the shift depends on the image's latent token count `seq`:
-//!   `mu = base_shift + (max_shift - base_shift) / (max_seq - base_seq) *
-//!   (seq - base_seq)` and `sigma = e^mu / (e^mu + (1/t - 1))` (the
-//!   exponential time shift); without it the static `shift * t / (1 +
-//!   (shift - 1) * t)`. A non-null `shift_terminal` then stretches the
-//!   ladder so its last rung lands on that value:
+//! - With dynamic shifting the shift depends on the image's latent token
+//!   count `seq`: `mu = base_shift + (max_shift - base_shift) / (max_seq -
+//!   base_seq) * (seq - base_seq)` and `sigma = e^mu / (e^mu + (1/t - 1))`
+//!   (the exponential time shift; the linear one is `mu / (mu + (1/t -
+//!   1))`). Without it, the static `shift * t / (1 + (shift - 1) * t)`;
+//!   a shift of 1 is the identity, so the official Turbo's sigmas run
+//!   verbatim.
+//! - A non-null `shift_terminal` then stretches the ladder so its last rung
+//!   lands on that value:
 //!   `sigma' = 1 - (1 - sigma) * (1 - shift_terminal) / (1 - sigma_last)`.
-//!   A step-distilled checkpoint whose index carries no sigmas is run this
-//!   way from the nodes its recipe names.
-//! - **Linear**: the undistilled default, `linspace(1, 1/steps, steps)` as
-//!   the nodes.
 //!
 //! The arithmetic runs in `f64` and each sigma is rounded to `f32` once;
 //! the scheduler this mirrors computes in `f32`, which is at most a few
@@ -48,7 +48,7 @@ pub(crate) struct ShiftConfig {
     pub shift_terminal: Option<f64>,
     /// Whether `mu` follows the token count.
     pub use_dynamic_shifting: bool,
-    /// The time-shift form; only `exponential` is implemented.
+    /// The dynamic time-shift form, `exponential` or `linear`.
     pub time_shift_type: String,
     #[serde(default)]
     use_karras_sigmas: bool,
@@ -81,9 +81,11 @@ impl ShiftConfig {
                 "scheduler option {name} is set; this scheduler does not implement it"
             )));
         }
-        if self.use_dynamic_shifting && self.time_shift_type != "exponential" {
+        if self.use_dynamic_shifting
+            && !matches!(self.time_shift_type.as_str(), "exponential" | "linear")
+        {
             return Err(ImageGenError::Checkpoint(format!(
-                "time_shift_type '{}' is not implemented (only 'exponential')",
+                "time_shift_type '{}' is not implemented (only 'exponential' and 'linear')",
                 self.time_shift_type
             )));
         }
@@ -123,24 +125,32 @@ impl ShiftConfig {
     }
 }
 
-/// Where a job's sigma ladder comes from (see the module docs).
+/// Where a job's nodes come from (see the module docs); both are shifted.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ScheduleSource<'a> {
-    /// A distilled checkpoint's own sigmas, run verbatim.
-    Fixed(&'a [f32]),
-    /// Raw nodes in (0, 1], each time-shifted.
+    /// A checkpoint's own nodes (`sample_sigmas`); their count is the step
+    /// count.
     Nodes(&'a [f32]),
-    /// `linspace(1, 1/steps, steps)` as the nodes.
+    /// `linspace(1, 1/steps, steps)`.
     Linear,
 }
 
-/// Checks a ladder's rungs lie in `(0, 1]` and strictly fall: a zero or a
+/// Checks a checkpoint's nodes: non-empty, starting at 1 (pure noise, which
+/// every shift keeps at 1), falling strictly within (0, 1]. A zero or a
 /// repeat would be a step that does nothing, a rise one that adds noise.
-fn check_falling(what: &str, values: &[f32]) -> Result<(), ImageGenError> {
+///
+/// # Errors
+/// [`ImageGenError::Checkpoint`] naming the nodes.
+pub(crate) fn check_nodes(nodes: &[f32]) -> Result<(), ImageGenError> {
     let in_range = |v: f32| v.is_finite() && v > 0.0 && v <= 1.0;
-    if values.iter().any(|&v| !in_range(v)) || values.windows(2).any(|w| w[1] >= w[0]) {
+    if nodes
+        .first()
+        .is_none_or(|v| v.to_bits() != 1.0f32.to_bits())
+        || nodes.iter().any(|&v| !in_range(v))
+        || nodes.windows(2).any(|w| w[1] >= w[0])
+    {
         return Err(ImageGenError::Checkpoint(format!(
-            "{what} {values:?} must fall strictly within (0, 1]"
+            "sample_sigmas {nodes:?} must start at 1.0 and fall strictly within (0, 1]"
         )));
     }
     Ok(())
@@ -151,9 +161,9 @@ fn check_falling(what: &str, values: &[f32]) -> Result<(), ImageGenError> {
 ///
 /// # Errors
 /// [`ImageGenError::InvalidSteps`] for zero steps;
-/// [`ImageGenError::StepsFixed`] when a fixed ladder or a node list has
-/// another length than `steps`; [`ImageGenError::Checkpoint`] for sigmas or
-/// nodes that are not a strictly falling run in range.
+/// [`ImageGenError::StepsFixed`] when a node list has another length than
+/// `steps`; [`ImageGenError::Checkpoint`] for nodes that are not a strictly
+/// falling run from 1, or a linear shift whose `mu` is not positive.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "each sigma is rounded to the f32 the sampler steps in, once, on purpose"
@@ -171,41 +181,15 @@ pub(crate) fn resolve(
     if steps == 0 {
         return Err(ImageGenError::InvalidSteps { steps: 0 });
     }
-    let fixed_len = |len: usize| -> Result<(), ImageGenError> {
-        if len == steps {
-            Ok(())
-        } else {
-            Err(ImageGenError::StepsFixed {
-                steps: u32::try_from(steps).unwrap_or(u32::MAX),
-                fixed: u32::try_from(len).unwrap_or(u32::MAX),
-            })
-        }
-    };
     let nodes: Vec<f64> = match source {
-        ScheduleSource::Fixed(sigmas) => {
-            // A shipped ladder is run verbatim, which equals the reference
-            // only under an identity shift; any other shift would move every
-            // rung, so it is refused rather than silently ignored.
-            if shift.use_dynamic_shifting
-                || shift.shift.to_bits() != 1.0f64.to_bits()
-                || shift.shift_terminal.is_some()
-            {
-                return Err(ImageGenError::Checkpoint(format!(
-                    "sample_sigmas are run verbatim, but the scheduler config shifts them \
-                     (use_dynamic_shifting {}, shift {}, shift_terminal {:?}); a shifted \
-                     fixed ladder is not implemented",
-                    shift.use_dynamic_shifting, shift.shift, shift.shift_terminal
-                )));
-            }
-            fixed_len(sigmas.len())?;
-            check_falling("sample_sigmas", sigmas)?;
-            let mut out = sigmas.to_vec();
-            out.push(0.0);
-            return Ok(out);
-        }
         ScheduleSource::Nodes(nodes) => {
-            fixed_len(nodes.len())?;
-            check_falling("schedule nodes", nodes)?;
+            if nodes.len() != steps {
+                return Err(ImageGenError::StepsFixed {
+                    steps: u32::try_from(steps).unwrap_or(u32::MAX),
+                    fixed: u32::try_from(nodes.len()).unwrap_or(u32::MAX),
+                });
+            }
+            check_nodes(nodes)?;
             nodes.iter().map(|&t| f64::from(t)).collect()
         }
         // `start + i * step` in f64, as a linspace forms it, then held as
@@ -218,9 +202,24 @@ pub(crate) fn resolve(
         }
     };
     let mut sigmas: Vec<f64> = if shift.use_dynamic_shifting {
-        let e = shift.mu(seq).exp();
-        nodes.iter().map(|&t| e / (e + (1.0 / t - 1.0))).collect()
+        let mu = shift.mu(seq);
+        let scale = if shift.time_shift_type == "linear" {
+            if mu.is_nan() || mu <= 0.0 {
+                return Err(ImageGenError::Checkpoint(format!(
+                    "a linear time shift needs a positive mu; {seq} latent tokens give {mu}"
+                )));
+            }
+            mu
+        } else {
+            mu.exp()
+        };
+        nodes
+            .iter()
+            .map(|&t| scale / (scale + (1.0 / t - 1.0)))
+            .collect()
     } else {
+        // A shift of exactly 1 is `t / 1`, so shipped sigmas pass through
+        // bit for bit.
         let s = shift.shift;
         nodes
             .iter()

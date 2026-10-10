@@ -149,7 +149,6 @@ fn generate_once(
         assets_dir,
         residency: shiso_models::image_registry::ImageResidency::Auto,
         reserve_bytes: shiso_models::image_registry::DEFAULT_IMAGE_RESERVE_BYTES,
-        sigmas: None,
     };
     let load_start = Instant::now();
     let generator = shiso_models::image_registry::open_image_generator(&desc, backend)
@@ -276,7 +275,6 @@ async fn test_flux2_klein_metal_generation() {
                 assets_dir,
                 residency: shiso_models::image_registry::ImageResidency::Auto,
                 reserve_bytes: shiso_models::image_registry::DEFAULT_IMAGE_RESERVE_BYTES,
-                sigmas: None,
             };
             let load_start = Instant::now();
             let generator = shiso_models::image_registry::open_image_generator(&desc, &backend)

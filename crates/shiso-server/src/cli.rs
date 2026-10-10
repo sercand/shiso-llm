@@ -584,12 +584,6 @@ pub struct ServeArgs {
     /// of the host when it plans what stays loaded.
     #[arg(long, env = "SHISO_IMAGE_RESERVE_GB", default_value_t = 1.5)]
     pub image_reserve_gb: f64,
-    /// Raw sigma nodes, comma-separated (e.g. `1.0,0.9375,0.875,0.75,0.5,0.25`),
-    /// for a distilled image checkpoint that ships its schedule outside its
-    /// own documents. The nodes are shifted like a linear ladder's and fix
-    /// the step count to their number.
-    #[arg(long, env = "SHISO_IMAGE_SIGMAS")]
-    pub image_sigmas: Option<String>,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -707,14 +701,6 @@ pub enum ConfigError {
         /// The value as it was given.
         value: f64,
     },
-    /// An `--image-sigmas` list that is not comma-separated numbers.
-    #[error("--image-sigmas {value} is not a comma-separated list of numbers: {reason}")]
-    BadImageSigmas {
-        /// The value as it was given.
-        value: String,
-        /// The entry that did not parse.
-        reason: String,
-    },
     /// An `--image-default-size` that is not a servable `WxH`.
     #[error("--image-default-size {value} is not servable: {reason}")]
     BadImageSize {
@@ -822,7 +808,6 @@ impl ServeArgs {
         // A generation with no steps has nothing to denoise: the pipeline
         // refuses it by name, and an operator who set the default to zero
         // should hear about it at boot rather than on the first request.
-        self.image_sigmas()?;
         if self.image_default_steps == Some(0) {
             return Err(ConfigError::Zero {
                 flag: "image-default-steps",
@@ -1094,32 +1079,6 @@ impl ServeArgs {
         )]
         let bytes = (gb * f64::from(1u32 << 30)) as u64;
         Ok(bytes)
-    }
-
-    /// `--image-sigmas` as numbers. Whether they make a schedule is the
-    /// loaded model's to judge.
-    ///
-    /// # Errors
-    ///
-    /// [`ConfigError::BadImageSigmas`] for an entry that is not a number.
-    // `Ok(None)` is no override: the checkpoint's own schedule runs.
-    pub fn image_sigmas(&self) -> Result<Option<Vec<f32>>, ConfigError> {
-        let Some(value) = &self.image_sigmas else {
-            return Ok(None);
-        };
-        value
-            .split(',')
-            .map(|entry| {
-                entry
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|e| ConfigError::BadImageSigmas {
-                        value: value.clone(),
-                        reason: format!("{entry:?}: {e}"),
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
     }
 
     /// Where the architecture config is read from.

@@ -455,8 +455,9 @@ fn generated_image_fields(image: GeneratedImage) -> GeneratedImageFields {
 const _: fn(GeneratedImage) -> GeneratedImageFields = generated_image_fields;
 
 /// What the server hands the registry to open a checkpoint, read apart: the
-/// four component paths and the assets directory, then the residency policy,
-/// the byte reserve left to the host and the schedule override. The server
+/// four component paths and the assets directory, then the residency policy
+/// and the byte reserve left to the host. The schedule is not here: it is
+/// the checkpoint's own documents. The server
 /// builds these across the crate seam from its flags.
 type ImageModelDescFields = (
     std::path::PathBuf,
@@ -466,7 +467,6 @@ type ImageModelDescFields = (
     Option<std::path::PathBuf>,
     shiso_models::image_registry::ImageResidency,
     u64,
-    Option<Vec<f32>>,
 );
 fn image_model_desc_fields(desc: ImageModelDesc) -> ImageModelDescFields {
     (
@@ -477,7 +477,6 @@ fn image_model_desc_fields(desc: ImageModelDesc) -> ImageModelDescFields {
         desc.assets_dir,
         desc.residency,
         desc.reserve_bytes,
-        desc.sigmas,
     )
 }
 const _: fn(ImageModelDesc) -> ImageModelDescFields = image_model_desc_fields;

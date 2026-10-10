@@ -108,13 +108,12 @@ fn qwen_image21_turbo_generates_a_real_rgba_image() {
         assets_dir: Some(root.join("image_assets")),
         residency: ImageResidency::Auto,
         reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
-        sigmas: None,
     };
     let began = Instant::now();
     let generator = shiso_models::image_registry::open_image_generator(&desc, &backend)
         .expect("the Turbo install loads");
     eprintln!("load: {:.2} s", began.elapsed().as_secs_f64());
-    assert_eq!(generator.model_id(), "qwen-image-2.1-turbo");
+    assert_eq!(generator.model_id(), "qwen-image-2.1");
     assert_eq!(generator.limits().fixed_steps, Some(8));
 
     let first = generate(&generator, 42, "seed 42");

@@ -32,10 +32,6 @@ pub struct ImageModelDesc {
     pub residency: ImageResidency,
     /// Bytes of the device working set left to the rest of the host.
     pub reserve_bytes: u64,
-    /// Raw sigma nodes overriding the checkpoint's schedule (shifted like a
-    /// linear ladder's), for a distilled checkpoint whose `model_index.json`
-    /// carries none. `None` runs the checkpoint's own schedule.
-    pub sigmas: Option<Vec<f32>>,
 }
 
 /// Which pipeline components stay loaded across jobs.
@@ -116,13 +112,6 @@ pub fn open_image_generator(
 ) -> Result<Arc<dyn ImageGenerator>, ImageGenError> {
     match detect_image_family(desc)? {
         ImageFamily::Flux2 => {
-            if desc.sigmas.is_some() {
-                return Err(ImageGenError::Checkpoint(
-                    "--image-sigmas is for a checkpoint that reads raw sigma nodes; this \
-                     flux2 checkpoint fits its own schedule"
-                        .to_owned(),
-                ));
-            }
             if desc.residency == ImageResidency::Swap {
                 return Err(ImageGenError::Checkpoint(
                     "--image-residency swap is not implemented for the flux2 family, \

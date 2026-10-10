@@ -63,7 +63,6 @@ fn open_swap() -> Option<QwenImage21Model> {
             assets_dir: Some(root.join("image_assets")),
             residency: ImageResidency::Swap,
             reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
-            sigmas: None,
         },
         &backend,
     )

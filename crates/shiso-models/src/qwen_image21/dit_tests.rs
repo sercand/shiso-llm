@@ -18,7 +18,7 @@ use shiso_vision::generator::ImageGenError;
 use super::config::QwenImageConfig;
 use super::embed::sinusoid;
 use super::rope::{angle_table, target_positions, text_positions};
-use super::scheduler::{ScheduleSource, ShiftConfig, euler_dt, resolve};
+use super::scheduler::{ScheduleSource, ShiftConfig, check_nodes, euler_dt, resolve};
 use super::vae::LatentGrid;
 
 fn fixture_dir() -> PathBuf {
@@ -176,9 +176,10 @@ fn floats(v: &Value) -> Vec<f32> {
         .collect()
 }
 
-/// Turbo's fixed sigmas verbatim plus a terminal 0 at every size, and the
-/// base model's dynamic shift with its terminal stretch (40 steps at 1024
-/// and 2048, 8 at 512) from the linear default nodes, all within 1e-6.
+/// Turbo's shipped sigmas through its identity shift (verbatim plus a
+/// terminal 0, bit for bit) at every size, and the base model's dynamic
+/// shift with its terminal stretch (40 steps at 1024 and 2048, 8 at 512)
+/// from the linear default nodes, all within 1e-6.
 #[test]
 fn every_reference_schedule_is_reproduced() {
     let sigmas = read_json("sigmas.json");
@@ -192,7 +193,12 @@ fn every_reference_schedule_is_reproduced() {
         let mu = case["mu"].as_f64().expect("mu");
         let got = match case["kind"].as_str() {
             Some("turbo") => {
-                resolve(ScheduleSource::Fixed(&sample), &turbo, steps, seq).expect("turbo")
+                let got =
+                    resolve(ScheduleSource::Nodes(&sample), &turbo, steps, seq).expect("turbo");
+                let verbatim: Vec<u32> = sample.iter().chain(&[0.0]).map(|v| v.to_bits()).collect();
+                let bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(bits, verbatim, "{name}: an identity shift is verbatim");
+                got
             }
             Some("base") => {
                 assert!((base.mu(seq) - mu).abs() <= 1e-12, "{name}: mu");
@@ -223,8 +229,19 @@ fn the_euler_step_matches_the_reference() {
     assert!(euler_dt(&ladder, 1).is_err(), "no step past the last rung");
 }
 
-/// The step-distilled checkpoint whose index carries no sigmas: its six
-/// raw nodes, each shifted by the resolution's `mu`, no terminal stretch.
+/// The six-step fine-tune's `scheduler_config.json`, as it ships.
+const SIX_STEP_SCHEDULER: &str = r#"{"base_image_seq_len": 256, "base_shift": 0.5, "invert_sigmas": false,
+    "max_image_seq_len": 8192, "max_shift": 0.9, "num_train_timesteps": 1000,
+    "shift": 1.0, "shift_terminal": null, "stochastic_sampling": false,
+    "time_shift_type": "exponential", "use_beta_sigmas": false,
+    "use_dynamic_shifting": true, "use_exponential_sigmas": false,
+    "use_karras_sigmas": false}"#;
+
+/// The six-step fine-tune's `sample_sigmas`.
+const SIX_STEP_NODES: [f32; 6] = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25];
+
+/// A step-distilled fine-tune's six `sample_sigmas` under its dynamic-shift
+/// config: each node shifted by the resolution's `mu`, no terminal stretch.
 ///
 /// `mu = 0.5 + (0.9 - 0.5) / (8192 - 256) * (seq - 256)`:
 /// - 512x512, seq 1024: `mu = 0.5 + 0.4 * 768 / 7936 = 0.538709677`,
@@ -235,20 +252,8 @@ fn the_euler_step_matches_the_reference() {
 /// `sigma = e^mu / (e^mu + (1/t - 1))`; e.g. at 512, t = 0.5 gives
 /// `1.713794 / 2.713794 = 0.631512`, t = 0.25 gives `1.713794 / 4.713794 =
 /// 0.363570`, and t = 1 stays 1.
-#[test]
-fn raw_nodes_are_shifted_by_the_resolutions_mu() {
-    let six_step: ShiftConfig = serde_json::from_str(
-        r#"{"base_image_seq_len": 256, "base_shift": 0.5, "invert_sigmas": false,
-            "max_image_seq_len": 8192, "max_shift": 0.9, "num_train_timesteps": 1000,
-            "shift": 1.0, "shift_terminal": null, "stochastic_sampling": false,
-            "time_shift_type": "exponential", "use_beta_sigmas": false,
-            "use_dynamic_shifting": true, "use_exponential_sigmas": false,
-            "use_karras_sigmas": false}"#,
-    )
-    .expect("the checkpoint's scheduler config");
-    six_step.validate().expect("supported");
-    let nodes = [1.0f32, 0.9375, 0.875, 0.75, 0.5, 0.25];
-    let cases: [(usize, [f64; 6]); 2] = [
+fn six_step_ladders() -> [(usize, [f64; 6]); 2] {
+    [
         (
             1024,
             [
@@ -271,22 +276,36 @@ fn raw_nodes_are_shifted_by_the_resolutions_mu() {
                 0.400_096_293_430_902_64,
             ],
         ),
-    ];
-    for (seq, want) in cases {
-        let got = resolve(ScheduleSource::Nodes(&nodes), &six_step, 6, seq).expect("nodes");
-        assert_eq!(got.len(), 7, "six rungs and the terminal 0");
-        assert_eq!(got[6].to_bits(), 0, "a terminal +0");
-        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
-            assert!(
-                (f64::from(g) - w).abs() <= 1e-6,
-                "seq {seq} rung {i}: {g} vs {w}"
-            );
-        }
+    ]
+}
+
+fn assert_six_step(got: &[f32], seq: usize, want: &[f64; 6]) {
+    assert_eq!(got.len(), 7, "six rungs and the terminal 0");
+    assert_eq!(got[6].to_bits(), 0, "a terminal +0");
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            (f64::from(g) - w).abs() <= 1e-6,
+            "seq {seq} rung {i}: {g} vs {w}"
+        );
     }
 }
 
-/// The refusals: no steps, a step count other than a fixed ladder's or a
-/// node list's, and nodes that do not strictly fall within (0, 1].
+/// The ladders above, from the nodes and the config directly.
+#[test]
+fn shipped_nodes_are_shifted_by_the_resolutions_mu() {
+    let six_step: ShiftConfig =
+        serde_json::from_str(SIX_STEP_SCHEDULER).expect("the checkpoint's scheduler config");
+    six_step.validate().expect("supported");
+    for (seq, want) in six_step_ladders() {
+        let got =
+            resolve(ScheduleSource::Nodes(&SIX_STEP_NODES), &six_step, 6, seq).expect("nodes");
+        assert_six_step(&got, seq, &want);
+    }
+}
+
+/// The refusals: no steps, a step count other than the node list's, and
+/// nodes that are empty, do not start at 1, or do not strictly fall within
+/// (0, 1].
 #[test]
 fn bad_schedules_are_refused() {
     let sigmas = read_json("sigmas.json");
@@ -297,26 +316,25 @@ fn bad_schedules_are_refused() {
         Err(ImageGenError::InvalidSteps { steps: 0 })
     ));
     assert!(matches!(
-        resolve(ScheduleSource::Fixed(&sample), &turbo, 4, 1024),
+        resolve(ScheduleSource::Nodes(&sample), &turbo, 4, 1024),
         Err(ImageGenError::StepsFixed { steps: 4, fixed: 8 })
     ));
     assert!(matches!(
         resolve(ScheduleSource::Nodes(&[1.0, 0.5]), &turbo, 3, 1024),
         Err(ImageGenError::StepsFixed { steps: 3, fixed: 2 })
     ));
-    // A fixed ladder under a shifting config would not be run verbatim.
-    let (mut dynamic, mut static_shift, mut terminal) =
-        (turbo.clone(), turbo.clone(), turbo.clone());
-    dynamic.use_dynamic_shifting = true;
-    static_shift.shift = 3.0;
-    terminal.shift_terminal = Some(0.02);
-    for shifted in [dynamic, static_shift, terminal] {
-        assert!(matches!(
-            resolve(ScheduleSource::Fixed(&sample), &shifted, 8, 1024),
-            Err(ImageGenError::Checkpoint(_))
-        ));
-    }
-    for bad in [&[1.0f32, 1.0][..], &[1.0, 0.0], &[0.5, 0.7], &[1.5, 0.5]] {
+    assert!(matches!(
+        check_nodes(&[]),
+        Err(ImageGenError::Checkpoint(_))
+    ));
+    for bad in [
+        &[1.0f32, 1.0][..],
+        &[1.0, 0.0],
+        &[0.5, 0.7],
+        &[1.5, 0.5],
+        &[0.9, 0.5],
+        &[1.0, f32::NAN],
+    ] {
         assert!(
             matches!(
                 resolve(ScheduleSource::Nodes(bad), &turbo, 2, 1024),
@@ -325,6 +343,54 @@ fn bad_schedules_are_refused() {
             "{bad:?}"
         );
     }
+}
+
+/// A static `shift` other than 1 applies `shift * t / (1 + (shift - 1) *
+/// t)` to shipped nodes, whatever the resolution; with a terminal it then
+/// stretches. At shift 3: t = 0.5 gives `1.5 / 2 = 0.75`, t = 0.25 gives
+/// `0.75 / 1.5 = 0.5`.
+#[test]
+fn a_static_shift_is_applied_to_shipped_nodes() {
+    let sigmas = read_json("sigmas.json");
+    let mut config = shift_config(&sigmas, "turbo_scheduler_config");
+    config.shift = 3.0;
+    config.validate().expect("supported");
+    let nodes = [1.0f32, 0.5, 0.25];
+    for seq in [1024, 4096] {
+        let got = resolve(ScheduleSource::Nodes(&nodes), &config, 3, seq).expect("static");
+        assert_eq!(got, [1.0, 0.75, 0.5, 0.0], "seq {seq}");
+    }
+    // Stretched so the last rung lands on 0.2: factor (1 - 0.5) / 0.8.
+    config.shift_terminal = Some(0.2);
+    let got = resolve(ScheduleSource::Nodes(&nodes), &config, 3, 1024).expect("stretched");
+    let want = [1.0, 1.0 - 0.25 / 0.625, 0.2, 0.0];
+    for (g, w) in got.iter().zip(want) {
+        assert!((f64::from(*g) - w).abs() <= 1e-7, "{got:?}");
+    }
+}
+
+/// The linear dynamic shift `mu / (mu + (1/t - 1))`: at seq 1024 under the
+/// 0.5..0.9 line `mu = 0.538709677`, so t = 0.5 gives `mu / (mu + 1) =
+/// 0.350105`.
+#[test]
+fn the_linear_time_shift_is_applied() {
+    let sigmas = read_json("sigmas.json");
+    let mut config = shift_config(&sigmas, "turbo_scheduler_config");
+    config.use_dynamic_shifting = true;
+    config.time_shift_type = "linear".to_string();
+    config.validate().expect("supported");
+    let got = resolve(ScheduleSource::Nodes(&[1.0, 0.5]), &config, 2, 1024).expect("linear");
+    let mu = 0.5 + 0.4 * 768.0 / 7936.0;
+    assert_eq!(got[0].to_bits(), 1.0f32.to_bits());
+    assert!(
+        (f64::from(got[1]) - mu / (mu + 1.0)).abs() <= 1e-7,
+        "{got:?}"
+    );
+    config.time_shift_type = "cosine".to_string();
+    assert!(
+        config.validate().is_err(),
+        "an unknown shift form is refused"
+    );
 }
 
 // --- the install's documents ---------------------------------------------------------
@@ -355,8 +421,8 @@ fn the_install_documents_are_read_and_the_index_is_required() {
     let config = QwenImageConfig::read(&dir).expect("the documents read");
     assert_eq!(config.dit.hidden(), 4096);
     assert_eq!(config.dit.rope_axes().expect("axes"), [16, 56, 56]);
-    let sample = config.sample_sigmas.as_deref().expect("fixed sigmas");
-    let ladder = resolve(ScheduleSource::Fixed(sample), &config.shift, 8, 1024).expect("ladder");
+    let sample = config.sample_sigmas.as_deref().expect("shipped sigmas");
+    let ladder = resolve(ScheduleSource::Nodes(sample), &config.shift, 8, 1024).expect("ladder");
     assert_eq!(ladder.len(), 9);
     std::fs::remove_file(dir.join("model_index.json")).expect("rm");
     match QwenImageConfig::read(&dir) {
@@ -366,4 +432,96 @@ fn the_install_documents_are_read_and_the_index_is_required() {
         other => panic!("expected a refusal naming model_index.json, got {other:?}"),
     }
     std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// The ladder a load would run: the install's `sample_sigmas` (checked as
+/// the load checks them) or the linear nodes, shifted by its config.
+fn ladder_from(assets: &Path, steps: usize, seq: usize) -> Vec<f32> {
+    let config = QwenImageConfig::read(assets).expect("the documents read");
+    let source = match config.sample_sigmas.as_deref() {
+        Some(nodes) => {
+            check_nodes(nodes).expect("well-formed nodes");
+            ScheduleSource::Nodes(nodes)
+        }
+        None => ScheduleSource::Linear,
+    };
+    resolve(source, &config.shift, steps, seq).expect("a ladder")
+}
+
+/// A fine-tune described by its files alone: an index carrying the six
+/// nodes beside the fine-tune's own dynamic-shift config gives the
+/// hand-computed ladders at 512x512 and 1024x1024; the same documents
+/// without the nodes fall back to the linear default.
+#[test]
+fn a_fine_tune_is_described_by_its_documents() {
+    let dir = std::env::temp_dir().join(format!("shiso-qwen-image-six-{}", std::process::id()));
+    let write = |rel: &str, body: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(path, body).expect("write");
+    };
+    write(
+        "transformer/config.json",
+        &read_json("block.json")["model_config"].to_string(),
+    );
+    write("scheduler/scheduler_config.json", SIX_STEP_SCHEDULER);
+    let index = serde_json::json!({
+        "_class_name": "QwenImage21Pipeline",
+        "sample_sigmas": SIX_STEP_NODES,
+    });
+    write("model_index.json", &index.to_string());
+    for (seq, want) in six_step_ladders() {
+        assert_six_step(&ladder_from(&dir, 6, seq), seq, &want);
+    }
+    write(
+        "model_index.json",
+        r#"{"_class_name": "QwenImage21Pipeline"}"#,
+    );
+    let config = QwenImageConfig::read(&dir).expect("the documents read");
+    assert!(config.sample_sigmas.is_none());
+    let linear = resolve(ScheduleSource::Linear, &config.shift, 6, 1024).expect("linear");
+    assert_eq!(ladder_from(&dir, 6, 1024), linear);
+    write("model_index.json", r#"{"sample_sigmas": [0.9, 0.5]}"#);
+    let config = QwenImageConfig::read(&dir).expect("the documents read");
+    assert!(
+        matches!(
+            check_nodes(config.sample_sigmas.as_deref().expect("nodes")),
+            Err(ImageGenError::Checkpoint(_))
+        ),
+        "nodes that do not start at 1 are refused"
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// The staged Turbo install's own documents give exactly the reference's
+/// Turbo ladders. Reads `SHISO_TEST_MODEL_QWEN_IMAGE21` (the directory
+/// holding `image_assets/`); without it, says so on stderr and returns.
+#[expect(
+    clippy::print_stderr,
+    reason = "a machine without the install skips with its reason on stderr"
+)]
+#[test]
+fn the_turbo_install_documents_give_the_reference_ladders() {
+    let Some(root) = std::env::var_os("SHISO_TEST_MODEL_QWEN_IMAGE21") else {
+        eprintln!("SKIP: SHISO_TEST_MODEL_QWEN_IMAGE21 is unset");
+        return;
+    };
+    let assets = PathBuf::from(root).join("image_assets");
+    let sigmas = read_json("sigmas.json");
+    for (name, case) in sigmas["cases"].as_object().expect("cases") {
+        if case["kind"].as_str() != Some("turbo") {
+            continue;
+        }
+        let steps = case["num_steps"].as_u64().expect("steps") as usize;
+        let seq = case["image_seq_len"].as_u64().expect("seq") as usize;
+        let want: Vec<u32> = floats(&case["sigmas"])
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let got: Vec<u32> = ladder_from(&assets, steps, seq)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(got, want, "{name}");
+    }
 }

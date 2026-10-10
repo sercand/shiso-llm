@@ -139,8 +139,8 @@ struct ModelIndex {
 pub(crate) struct QwenImageConfig {
     /// The transformer geometry.
     pub dit: DitConfig,
-    /// A distilled checkpoint's own sigma schedule (`model_index.json`),
-    /// run verbatim when present.
+    /// A distilled checkpoint's own sigma nodes (`model_index.json`),
+    /// shifted by [`Self::shift`] like any other nodes.
     pub sample_sigmas: Option<Vec<f32>>,
     /// The scheduler's time-shift parameters.
     pub shift: ShiftConfig,

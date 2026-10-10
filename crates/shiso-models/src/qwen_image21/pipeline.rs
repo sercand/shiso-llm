@@ -53,7 +53,7 @@ use shiso_vision::generator::{
 
 use super::config::QwenImageConfig;
 use super::prompt::QwenImagePrompt;
-use super::scheduler::{ScheduleSource, euler_dt, resolve};
+use super::scheduler::{ScheduleSource, check_nodes, euler_dt, resolve};
 use super::transformer::{DitDesc, QwenDit};
 use super::vae::{LatentGrid, QwenVae, QwenVaeDesc, SPATIAL_FACTOR};
 use crate::diffusion::encode::{Channels, encode_image};
@@ -85,21 +85,19 @@ const BASE_STEPS: u32 = 40;
 /// plus the system turn.
 const PLAN_TOKENS: usize = super::prompt::MAX_PROMPT_TOKENS + super::prompt::DROP_IDX;
 
-/// Where the sigma ladder comes from.
+/// Where the sigma ladder's nodes come from; both are shifted by the
+/// scheduler config.
 #[derive(Debug, Clone)]
 enum Schedule {
-    /// `model_index.json`'s `sample_sigmas`, run verbatim.
-    Fixed(Vec<f32>),
-    /// Raw nodes from the operator, shifted.
+    /// `model_index.json`'s `sample_sigmas`.
     Nodes(Vec<f32>),
-    /// The base model's linear ladder, shifted.
+    /// The base model's linear nodes.
     Linear,
 }
 
 impl Schedule {
     fn source(&self) -> ScheduleSource<'_> {
         match self {
-            Self::Fixed(s) => ScheduleSource::Fixed(s),
             Self::Nodes(n) => ScheduleSource::Nodes(n),
             Self::Linear => ScheduleSource::Linear,
         }
@@ -107,7 +105,7 @@ impl Schedule {
 
     fn fixed_steps(&self) -> Option<u32> {
         match self {
-            Self::Fixed(v) | Self::Nodes(v) => Some(u32::try_from(v.len()).unwrap_or(u32::MAX)),
+            Self::Nodes(v) => Some(u32::try_from(v.len()).unwrap_or(u32::MAX)),
             Self::Linear => None,
         }
     }
@@ -274,33 +272,13 @@ fn locate_weights(
     )))
 }
 
-/// The operator's nodes, checked: they replace a schedule the checkpoint
-/// does not carry, start at 1 (pure noise) and fall strictly within (0, 1].
-fn check_nodes(nodes: &[f32], index_sigmas: bool) -> Result<(), ImageGenError> {
-    if index_sigmas {
-        return Err(ImageGenError::Checkpoint(
-            "--image-sigmas names a schedule but model_index.json carries sample_sigmas; \
-             two schedules for one checkpoint is ambiguous"
-                .to_string(),
-        ));
-    }
-    let falling = nodes.windows(2).all(|w| w[1] < w[0]);
-    let in_range = nodes.iter().all(|&v| v.is_finite() && v > 0.0 && v <= 1.0);
-    if nodes.first() != Some(&1.0) || !falling || !in_range {
-        return Err(ImageGenError::Checkpoint(format!(
-            "--image-sigmas {nodes:?} must start at 1.0 and fall strictly within (0, 1]"
-        )));
-    }
-    Ok(())
-}
-
 impl QwenImage21Model {
     /// Locates the install, reads its documents, loads the decoder, and
     /// loads whatever the residency plan for a default job keeps loaded.
     ///
     /// # Errors
     /// [`ImageGenError::Checkpoint`] for a missing document or weight file,
-    /// a schedule conflict, or components that disagree; whatever a
+    /// malformed `sample_sigmas`, or components that disagree; whatever a
     /// component load refuses.
     #[expect(
         clippy::too_many_lines,
@@ -314,19 +292,17 @@ impl QwenImage21Model {
         let ops = Ops::new(backend)?;
         let assets = locate_assets(desc)?;
         let config = QwenImageConfig::read(&assets)?;
-        let schedule = match (&desc.sigmas, &config.sample_sigmas) {
-            (Some(nodes), index) => {
-                check_nodes(nodes, index.is_some())?;
+        // The checkpoint's documents are its whole schedule: shipped nodes
+        // are checked here so a malformed index fails the load, not the
+        // first request.
+        let schedule = match &config.sample_sigmas {
+            Some(nodes) => {
+                check_nodes(nodes)?;
                 Schedule::Nodes(nodes.clone())
             }
-            (None, Some(sigmas)) => Schedule::Fixed(sigmas.clone()),
-            (None, None) => Schedule::Linear,
+            None => Schedule::Linear,
         };
-        let model_id = match &schedule {
-            Schedule::Fixed(_) => "qwen-image-2.1-turbo".to_string(),
-            Schedule::Nodes(n) => format!("qwen-image-2.1-{}step", n.len()),
-            Schedule::Linear => "qwen-image-2.1".to_string(),
-        };
+        let model_id = "qwen-image-2.1".to_string();
         let prompt = QwenImagePrompt::load(
             desc.tokenizer_path
                 .as_deref()
