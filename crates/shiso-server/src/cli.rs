@@ -561,20 +561,29 @@ pub struct ServeArgs {
     pub embedding_max_queue: usize,
     /// Denoising steps a request that names none gets. More is slower and,
     /// past the point the checkpoint was distilled for, not better.
-    #[arg(
-        long,
-        env = "SHISO_IMAGE_DEFAULT_STEPS",
-        default_value_t = crate::image::DEFAULT_STEPS
-    )]
-    pub image_default_steps: u32,
+    /// Unset, the loaded model's own default (or fixed schedule) is used.
+    #[arg(long, env = "SHISO_IMAGE_DEFAULT_STEPS")]
+    pub image_default_steps: Option<u32>,
     /// The image size a request that names none gets, as `WxH`
-    /// (e.g. 1024x1024). Both sides must be divisible by 16.
+    /// (e.g. 1024x1024). Both sides must sit on the loaded model's grid and
+    /// within its bounds; unset, the model's own default size is used.
+    #[arg(long, env = "SHISO_IMAGE_DEFAULT_SIZE")]
+    pub image_default_size: Option<String>,
+    /// Which image pipeline components stay loaded across jobs: `auto`
+    /// keeps all of them when they fit the device's working set beside a
+    /// job and otherwise swaps; `resident` refuses a job that does not fit;
+    /// `swap` lets the text encoder and the transformer take turns.
     #[arg(
         long,
-        env = "SHISO_IMAGE_DEFAULT_SIZE",
-        default_value = crate::image::DEFAULT_SIZE
+        env = "SHISO_IMAGE_RESIDENCY",
+        value_enum,
+        default_value_t = ImageResidencyChoice::Auto
     )]
-    pub image_default_size: String,
+    pub image_residency: ImageResidencyChoice,
+    /// GiB of the device working set the image pipeline leaves to the rest
+    /// of the host when it plans what stays loaded.
+    #[arg(long, env = "SHISO_IMAGE_RESERVE_GB", default_value_t = 1.5)]
+    pub image_reserve_gb: f64,
     /// Which reasoning parser to use on model output.
     #[arg(
         long,
@@ -686,6 +695,12 @@ pub enum ConfigError {
         /// The one it needs beside it.
         missing: &'static str,
     },
+    /// An `--image-reserve-gb` that is negative or not a number.
+    #[error("--image-reserve-gb {value} must be a finite number of GiB, at least 0")]
+    BadImageReserve {
+        /// The value as it was given.
+        value: f64,
+    },
     /// An `--image-default-size` that is not a servable `WxH`.
     #[error("--image-default-size {value} is not servable: {reason}")]
     BadImageSize {
@@ -789,15 +804,11 @@ impl ServeArgs {
                 flag: "embedding-max-queue",
             });
         }
-        if self.image_max_queue == 0 {
-            return Err(ConfigError::Zero {
-                flag: "image-max-queue",
-            });
-        }
+        self.image_queue()?;
         // A generation with no steps has nothing to denoise: the pipeline
         // refuses it by name, and an operator who set the default to zero
         // should hear about it at boot rather than on the first request.
-        if self.image_default_steps == 0 {
+        if self.image_default_steps == Some(0) {
             return Err(ConfigError::Zero {
                 flag: "image-default-steps",
             });
@@ -807,9 +818,14 @@ impl ServeArgs {
         // expensive way. The wire clamps a caller's odd size; an operator's
         // setting is refused rather than quietly rounded, because a default
         // that silently moved is not the default that was configured.
-        if let Err(error) = crate::image::size::parse_exact_size(&self.image_default_size) {
+        // Only the shape is judged here; whether the loaded model's grid and
+        // bounds admit the pixels is judged at boot, when the model is known.
+        self.image_reserve_bytes()?;
+        if let Some(value) = &self.image_default_size
+            && let Err(error) = crate::image::size::parse_exact_size(value)
+        {
             return Err(ConfigError::BadImageSize {
-                value: self.image_default_size.clone(),
+                value: value.clone(),
                 reason: error.to_string(),
             });
         }
@@ -1009,24 +1025,60 @@ impl ServeArgs {
         ))
     }
 
-    /// The geometry and step count an image request that names none gets.
+    /// The operator's explicit image defaults; a flag left unset stays `None`
+    /// so the loaded model's own value applies.
     ///
     /// # Errors
     ///
     /// [`ConfigError::BadImageSize`] for a size `validate` would already have
     /// refused; the parse is kept fallible so no caller has to assume
     /// `validate` ran.
-    pub fn image_defaults(&self) -> Result<crate::image::ImageDefaults, ConfigError> {
-        let (width, height) = crate::image::size::parse_exact_size(&self.image_default_size)
-            .map_err(|error| ConfigError::BadImageSize {
-                value: self.image_default_size.clone(),
-                reason: error.to_string(),
-            })?;
-        Ok(crate::image::ImageDefaults {
+    pub fn image_overrides(&self) -> Result<crate::image::ImageOverrides, ConfigError> {
+        let size = self
+            .image_default_size
+            .as_deref()
+            .map(|value| {
+                crate::image::size::parse_exact_size(value).map_err(|error| {
+                    ConfigError::BadImageSize {
+                        value: value.to_owned(),
+                        reason: error.to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        Ok(crate::image::ImageOverrides {
             steps: self.image_default_steps,
-            width,
-            height,
+            size,
         })
+    }
+
+    /// Refuses an image queue of zero: every request would be turned away.
+    fn image_queue(&self) -> Result<(), ConfigError> {
+        if self.image_max_queue == 0 {
+            return Err(ConfigError::Zero {
+                flag: "image-max-queue",
+            });
+        }
+        Ok(())
+    }
+
+    /// `--image-reserve-gb` in bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::BadImageReserve`] for a negative or non-finite value.
+    pub fn image_reserve_bytes(&self) -> Result<u64, ConfigError> {
+        let gb = self.image_reserve_gb;
+        if !gb.is_finite() || gb < 0.0 {
+            return Err(ConfigError::BadImageReserve { value: gb });
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a finite, non-negative GiB count; anything past u64 saturates"
+        )]
+        let bytes = (gb * f64::from(1u32 << 30)) as u64;
+        Ok(bytes)
     }
 
     /// Where the architecture config is read from.
@@ -1175,6 +1227,27 @@ pub enum ExpertResidencyChoice {
     Resident,
     /// Streamed from disk into a pool of expert slots.
     Stream,
+}
+
+/// `--image-residency`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ImageResidencyChoice {
+    /// Resident when everything fits, else swap.
+    Auto,
+    /// Everything resident; a job that does not fit is refused.
+    Resident,
+    /// The text encoder and the transformer take turns.
+    Swap,
+}
+
+impl From<ImageResidencyChoice> for shiso_models::image_registry::ImageResidency {
+    fn from(choice: ImageResidencyChoice) -> Self {
+        match choice {
+            ImageResidencyChoice::Auto => Self::Auto,
+            ImageResidencyChoice::Resident => Self::Resident,
+            ImageResidencyChoice::Swap => Self::Swap,
+        }
+    }
 }
 
 /// The parser choice specified via CLI flags.

@@ -7,7 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use super::config::*;
-use super::weights::StStore;
+use crate::diffusion::weights::{StStore, count_blocks_internal};
+use crate::image_registry::ImageModelDesc;
 
 #[test]
 fn count_blocks_from_tensor_map() {
@@ -113,6 +114,8 @@ fn desc_for(model_path: &Path) -> ImageModelDesc {
         vae_path: None,
         tokenizer_path: None,
         assets_dir: None,
+        residency: crate::image_registry::ImageResidency::Auto,
+        reserve_bytes: crate::image_registry::DEFAULT_IMAGE_RESERVE_BYTES,
     }
 }
 

@@ -82,6 +82,9 @@ pub enum StDType {
     /// Signed 32-bit integers: the trellis export's per-projection codebook
     /// word.
     I32,
+    /// Signed bytes: the per-row INT8 image export's weight codes, one
+    /// weight to a byte, read with a per-output-row `F32` scale beside them.
+    I8,
 }
 
 impl StDType {
@@ -98,6 +101,7 @@ impl StDType {
             "I64" => Some(Self::I64),
             "I16" => Some(Self::I16),
             "I32" => Some(Self::I32),
+            "I8" => Some(Self::I8),
             _ => None,
         }
     }
@@ -106,7 +110,7 @@ impl StDType {
     #[must_use]
     pub const fn size(self) -> u64 {
         match self {
-            Self::U8 | Self::F8E4M3 => 1,
+            Self::U8 | Self::F8E4M3 | Self::I8 => 1,
             Self::Bf16 | Self::F16 | Self::I16 => 2,
             Self::F32 | Self::U32 | Self::I32 => 4,
             Self::I64 => 8,
@@ -115,7 +119,7 @@ impl StDType {
 }
 
 /// Every spelling [`StDType::parse`] accepts, for the error a refusal carries.
-const SPELLINGS: &str = "one of BF16, F16, F32, U32, U8, F8_E4M3, I64, I16, I32";
+const SPELLINGS: &str = "one of BF16, F16, F32, U32, U8, F8_E4M3, I64, I16, I32, I8";
 
 /// One tensor as the shard header describes it, before translation.
 #[derive(Debug, Deserialize)]

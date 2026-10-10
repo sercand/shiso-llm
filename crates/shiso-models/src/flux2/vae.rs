@@ -29,8 +29,10 @@ use serde::Deserialize;
 use shiso_core::DeviceBuffer;
 use shiso_vision::generator::ImageGenError;
 
-use super::ops::{Conv2dCall, GemmCall, GroupNormCall, Ops, Scratch, SliceExt, WeightKind};
-use super::weights::StStore;
+use crate::diffusion::ops::{
+    Conv2dCall, GemmCall, GroupNormCall, LinWeight, Ops, Scratch, SliceExt,
+};
+use crate::diffusion::weights::StStore;
 
 /// Group-norm epsilon the decoder uses (the reference's group-norm epsilon).
 const GN_EPS: f32 = 1e-6;
@@ -380,7 +382,7 @@ impl Vae {
                     "vae upsample",
                     field.channels * (2 * field.h) * (2 * field.w),
                 )?;
-                ops.upsample_nearest(&super::ops::UpsampleCall {
+                ops.upsample_nearest(&crate::diffusion::ops::UpsampleCall {
                     step: "vae upsample",
                     out: upsampled.view(),
                     input: x.view(),
@@ -681,26 +683,20 @@ impl Vae {
                 step: "vae attn scores",
                 out: slab,
                 input: qt.view().cut(row_bytes(r0), row_bytes(rows))?,
-                weight: kt.view(),
-                weight_scale: 1.0,
-                bias: None,
+                weight: LinWeight::f32(kt.view()),
                 m: rows,
                 n: spatial,
                 k: channels,
-                kind: WeightKind::F32,
             })?;
             ops.softmax_rows("vae attn softmax", slab, rows, spatial, scale)?;
             ops.gemm(&GemmCall {
                 step: "vae attn values",
                 out: at.view().cut(row_bytes(r0), row_bytes(rows))?,
                 input: slab,
-                weight: v.view(),
-                weight_scale: 1.0,
-                bias: None,
+                weight: LinWeight::f32(v.view()),
                 m: rows,
                 n: channels,
                 k: spatial,
-                kind: WeightKind::F32,
             })?;
         }
         let ctx = ops.alloc_f32("vae attn ctx ch", channels * spatial)?;

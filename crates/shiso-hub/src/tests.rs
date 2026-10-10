@@ -628,6 +628,165 @@ fn image_assets_role_is_a_directory_beside_an_image() {
     assert!(validate_recipe(&recipe, ValidationMode::Strict).is_err());
 }
 
+/// An image variant whose text encoder and VAE are files of one more repository
+/// bound to their roles, as a single-repo image recipe ships them.
+fn split_image_variant() -> Variant {
+    let mut variant = image_variant();
+    variant.components.remove(&Role::ImageAssets);
+    let image = variant.components.get_mut(&Role::Image).unwrap();
+    let sha = image.files[0].sha256.clone();
+    for (name, role) in [
+        ("te.safetensors", Role::ImageTextEncoder),
+        ("vae.safetensors", Role::ImageVae),
+    ] {
+        image.files.push(FileEntry {
+            name: name.to_string(),
+            size: 10,
+            sha256: sha.clone(),
+            binds: Some(role),
+        });
+    }
+    variant.requirements.disk_bytes = 30;
+    variant
+}
+
+#[test]
+fn image_text_encoder_and_vae_roles_bind_files_beside_an_image() {
+    assert_eq!(
+        "image_text_encoder".parse::<Role>().unwrap(),
+        Role::ImageTextEncoder
+    );
+    assert_eq!("image_vae".parse::<Role>().unwrap(), Role::ImageVae);
+    assert_eq!(Role::ImageTextEncoder.flag_name(), "--image-text-encoder");
+    assert_eq!(Role::ImageVae.flag_name(), "--image-vae");
+
+    let mut recipe = make_test_recipe();
+    let variant = split_image_variant();
+    let paths = variant.role_paths().unwrap();
+    assert_eq!(paths[&Role::ImageTextEncoder].file, Some("te.safetensors"));
+    assert_eq!(paths[&Role::ImageVae].file, Some("vae.safetensors"));
+    recipe.variants = vec![variant];
+    validate_recipe(&recipe, ValidationMode::Strict).unwrap();
+
+    // Neither has anything to feed without an image model.
+    for role in [Role::ImageTextEncoder, Role::ImageVae] {
+        let mut variant = split_image_variant();
+        let image = variant.components.remove(&Role::Image).unwrap();
+        let mut stray = image.clone();
+        stray.entry = None;
+        stray.files.retain(|f| f.binds == Some(role));
+        variant.components.insert(Role::Vision, stray);
+        variant.components.insert(
+            Role::Base,
+            make_test_recipe().variants[0].components[&Role::Base].clone(),
+        );
+        recipe.variants = vec![variant];
+        let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+        assert!(err.to_string().contains(role.as_str()), "{err}");
+    }
+
+    // A directory is not a file the loader can open.
+    let mut variant = image_variant();
+    variant.components.insert(
+        Role::ImageTextEncoder,
+        variant.components[&Role::ImageAssets].clone(),
+    );
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("image_text_encoder"), "{err}");
+
+    // One role, one source.
+    let mut variant = split_image_variant();
+    let mut vae = variant.components[&Role::Image].clone();
+    vae.entry = None;
+    vae.files.retain(|f| f.binds == Some(Role::ImageVae));
+    variant.components.insert(Role::ImageVae, vae);
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("image_vae"), "{err}");
+}
+
+/// An image variant whose prompt tokenizer is a `tokenizer.json` of the
+/// image repository bound to `image_tokenizer`, beside the assets.
+fn tokenizer_image_variant() -> Variant {
+    let mut variant = image_variant();
+    let image = variant.components.get_mut(&Role::Image).unwrap();
+    let sha = image.files[0].sha256.clone();
+    image.files.push(FileEntry {
+        name: "tokenizer.json".to_string(),
+        size: 10,
+        sha256: sha,
+        binds: Some(Role::ImageTokenizer),
+    });
+    variant.requirements.disk_bytes = 50;
+    variant
+}
+
+#[test]
+fn image_tokenizer_role_binds_a_file_beside_an_image() {
+    assert_eq!(
+        "image_tokenizer".parse::<Role>().unwrap(),
+        Role::ImageTokenizer
+    );
+    assert_eq!(Role::ImageTokenizer.as_str(), "image_tokenizer");
+    assert_eq!(Role::ImageTokenizer.flag_name(), "--image-tokenizer");
+
+    let mut recipe = make_test_recipe();
+    let variant = tokenizer_image_variant();
+    let paths = variant.role_paths().unwrap();
+    assert_eq!(paths[&Role::ImageTokenizer].dir, Role::Image);
+    assert_eq!(paths[&Role::ImageTokenizer].file, Some("tokenizer.json"));
+    recipe.variants = vec![variant];
+    validate_recipe(&recipe, ValidationMode::Strict).unwrap();
+
+    // Nothing to tokenize for without an image model.
+    let mut variant = tokenizer_image_variant();
+    variant.components.remove(&Role::ImageAssets);
+    let image = variant.components.remove(&Role::Image).unwrap();
+    let mut stray = image.clone();
+    stray.entry = None;
+    stray
+        .files
+        .retain(|f| f.binds == Some(Role::ImageTokenizer));
+    variant.components.insert(Role::Vision, stray);
+    variant.components.insert(
+        Role::Base,
+        make_test_recipe().variants[0].components[&Role::Base].clone(),
+    );
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("image_tokenizer"), "{err}");
+
+    // A directory is not the file the flag names.
+    let mut variant = image_variant();
+    variant.components.insert(
+        Role::ImageTokenizer,
+        variant.components[&Role::ImageAssets].clone(),
+    );
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("image_tokenizer"), "{err}");
+
+    // A component of its own naming the file by entry is the other source.
+    let mut variant = image_variant();
+    let mut own = variant.components[&Role::ImageAssets].clone();
+    own.entry = Some("tokenizer/tokenizer.json".to_string());
+    variant.components.insert(Role::ImageTokenizer, own);
+    variant.requirements.disk_bytes = 70;
+    recipe.variants = vec![variant];
+    validate_recipe(&recipe, ValidationMode::Strict).unwrap();
+
+    // One role, one source.
+    let mut variant = tokenizer_image_variant();
+    let mut own = variant.components[&Role::Image].clone();
+    own.entry = None;
+    own.files.retain(|f| f.binds == Some(Role::ImageTokenizer));
+    variant.components.insert(Role::ImageTokenizer, own);
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("image_tokenizer"), "{err}");
+}
+
 #[test]
 fn info_and_quality_are_checked() {
     use crate::recipe::{CardSource, CommitSha, ModelInfo, QualityScope, QualityScore};
@@ -730,19 +889,50 @@ fn an_unknown_provider_does_not_parse() {
 }
 
 #[test]
-fn hub_file_names_are_flat_and_not_reserved() {
-    assert!(hub_file_name_ok("draft_vocab_counts.txt"));
+fn hub_file_names_may_nest_up_to_four_safe_segments() {
+    for ok in [
+        "draft_vocab_counts.txt",
+        "scheduler/scheduler_config.json",
+        "a/b/c/d.json",
+        "model_index.json",
+    ] {
+        assert!(hub_file_name_ok(ok), "{ok}");
+    }
+    let long_segment = "a".repeat(256);
     for bad in [
         "",
-        "a/b.txt",
         "..",
         ".",
         "index.json",
         "benchmarks.json",
+        "index.json/x",
+        "benchmarks.json/x",
         "/x",
+        "/a",
+        "a/",
+        "a//b",
+        "../a",
+        "a/../b",
+        "a/./b",
+        "a\\b",
+        ".hidden/x",
+        "a/.hidden",
+        "a/b/c/d/e.json",
+        long_segment.as_str(),
     ] {
         assert!(!hub_file_name_ok(bad), "{bad}");
     }
+    // Only the first segment is reserved: a nested `index.json` is a file.
+    assert!(hub_file_name_ok("vae/index.json"));
+}
+
+#[test]
+fn a_file_and_a_directory_of_the_same_name_conflict() {
+    use crate::recipe::hub_file_set_conflict;
+    assert_eq!(hub_file_set_conflict(&["a", "a/b"]), Some(("a", "a/b")));
+    assert_eq!(hub_file_set_conflict(&["a/b", "a"]), Some(("a", "a/b")));
+    assert_eq!(hub_file_set_conflict(&["a", "ab/c", "a.b"]), None);
+    assert_eq!(hub_file_set_conflict(&["s/a.json", "s/b.json"]), None);
 }
 
 /// A variant whose base speculates through its own built-in head (no `draft`
@@ -781,6 +971,22 @@ fn hub_recipe(variant: Variant) -> Recipe {
 }
 
 #[test]
+fn a_nested_hub_file_validates_but_a_file_and_its_directory_do_not() {
+    let mut variant = hub_vocab_variant();
+    let comp = variant.components.get_mut(&Role::DraftVocab).unwrap();
+    comp.files[0].name = "scheduler/scheduler_config.json".to_string();
+    comp.entry = Some(comp.files[0].name.clone());
+    validate_recipe(&hub_recipe(variant.clone()), ValidationMode::Strict).unwrap();
+
+    let comp = variant.components.get_mut(&Role::DraftVocab).unwrap();
+    let mut clash = comp.files[0].clone();
+    clash.name = "scheduler".to_string();
+    comp.files.push(clash);
+    let err = validate_recipe(&hub_recipe(variant), ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("beneath"), "{err}");
+}
+
+#[test]
 fn a_hub_draft_vocabulary_beside_a_speculating_base_validates() {
     validate_recipe(&hub_recipe(hub_vocab_variant()), ValidationMode::Strict).unwrap();
 }
@@ -801,7 +1007,7 @@ fn a_draft_vocabulary_is_a_file() {
 }
 
 #[test]
-fn a_hub_component_refuses_repo_revision_nested_names_and_big_files() {
+fn a_hub_component_refuses_repo_revision_deep_names_and_big_files() {
     let cases: [fn(&mut Component); 5] = [
         |c| c.repo = Some("o/r".to_string()),
         |c| {
@@ -809,8 +1015,8 @@ fn a_hub_component_refuses_repo_revision_nested_names_and_big_files() {
                 Some(CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap());
         },
         |c| {
-            c.files[0].name = "sub/v.txt".to_string();
-            c.entry = Some("sub/v.txt".to_string());
+            c.files[0].name = "a/b/c/d/v.txt".to_string();
+            c.entry = Some("a/b/c/d/v.txt".to_string());
         },
         |c| {
             c.files[0].name = "index.json".to_string();

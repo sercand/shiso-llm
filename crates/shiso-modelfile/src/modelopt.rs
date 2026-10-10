@@ -601,6 +601,11 @@ fn describe_one(
             want: Box::from("a format this container stores"),
             got: Box::from("64-bit integers, which no weight of this container is"),
         }),
+        StDType::I8 => Err(GgufError::LayoutMismatch {
+            tensor: base.into(),
+            want: Box::from("a format this container stores"),
+            got: Box::from("signed byte codes, which are the per-row INT8 image export's"),
+        }),
     }
 }
 

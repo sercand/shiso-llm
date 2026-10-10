@@ -12,8 +12,8 @@ use shiso_core::ids::Seed;
 use shiso_server::error::AppError;
 use shiso_server::image::{ImageService, ImageServiceDesc};
 use shiso_vision::generator::{
-    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat,
-    ImageStepEvent,
+    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits,
+    ImageOutputFormat, ImageStepEvent,
 };
 
 /// The encoded bytes a mock hands back: a PNG signature, no pixels.
@@ -47,6 +47,16 @@ struct MockGenerator;
 impl ImageGenerator for MockGenerator {
     fn model_id(&self) -> &'static str {
         "mock-flux"
+    }
+    fn limits(&self) -> ImageLimits {
+        ImageLimits {
+            size_multiple: 16,
+            min_side: 256,
+            max_side: 2048,
+            default_size: (1024, 1024),
+            default_steps: 4,
+            fixed_steps: None,
+        }
     }
     fn generate(
         &self,
@@ -85,6 +95,16 @@ impl ImageGenerator for BlockingGenerator {
     fn model_id(&self) -> &'static str {
         "mock-flux"
     }
+    fn limits(&self) -> ImageLimits {
+        ImageLimits {
+            size_multiple: 16,
+            min_side: 256,
+            max_side: 2048,
+            default_size: (1024, 1024),
+            default_steps: 4,
+            fixed_steps: None,
+        }
+    }
     fn generate(
         &self,
         job: &ImageGenerationJob,
@@ -116,6 +136,16 @@ struct SteppingGenerator;
 impl ImageGenerator for SteppingGenerator {
     fn model_id(&self) -> &'static str {
         "mock-flux"
+    }
+    fn limits(&self) -> ImageLimits {
+        ImageLimits {
+            size_multiple: 16,
+            min_side: 256,
+            max_side: 2048,
+            default_size: (1024, 1024),
+            default_steps: 4,
+            fixed_steps: None,
+        }
     }
     fn generate(
         &self,

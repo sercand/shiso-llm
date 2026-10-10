@@ -544,7 +544,10 @@ async fn the_upload_route_refuses_bad_names_and_big_bodies() {
     for uri in [
         "/api/models/qwen3.8-flash/files/index.json",
         "/api/models/qwen3.8-flash/files/..",
-        "/api/models/qwen3.8-flash/files/a%2Fb.txt",
+        "/api/models/qwen3.8-flash/files/a%2F..%2Fb.txt",
+        "/api/models/qwen3.8-flash/files/a/b/c/d/e.txt",
+        "/api/models/qwen3.8-flash/files/index.json/x",
+        "/api/models/qwen3.8-flash/files/a//b.txt",
         "/api/models/Not%20A%20Model/files/x.txt",
     ] {
         let res = app.clone().oneshot(put(uri, b"x".to_vec())).await.unwrap();
@@ -586,4 +589,117 @@ fn a_hosted_file_with_an_unsafe_name_is_not_read() {
         errors.iter().all(|e| !e.contains("on disk")),
         "the outside file was read: {errors:?}"
     );
+}
+
+/// A repository whose hosted file is nested (`scheduler/scheduler_config.json`).
+fn repo_with_nested_hosted_file(contents: &[u8]) -> tempfile::TempDir {
+    let temp = repo_with_hosted_file(contents);
+    let flat = editor::hosted_file_path(temp.path(), "qwen3.8-flash", "draft_vocab_counts.txt");
+    fs::remove_file(flat).unwrap();
+    let recipe_path = temp.path().join("recipes").join("qwen3.8-flash.json");
+    let text = fs::read_to_string(&recipe_path).unwrap();
+    fs::write(
+        &recipe_path,
+        text.replace("draft_vocab_counts.txt", "scheduler/scheduler_config.json"),
+    )
+    .unwrap();
+    let nested = editor::hosted_file_path(
+        temp.path(),
+        "qwen3.8-flash",
+        "scheduler/scheduler_config.json",
+    );
+    fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    fs::write(nested, contents).unwrap();
+    temp
+}
+
+#[test]
+fn a_nested_hosted_file_validates_and_a_missing_one_is_refused() {
+    let temp = repo_with_nested_hosted_file(b"198 3037739\n");
+    let reports = editor::validate_all(temp.path()).unwrap();
+    assert!(reports.iter().all(|r| r.valid), "{:?}", reports[0].errors);
+
+    let nested = editor::hosted_file_path(
+        temp.path(),
+        "qwen3.8-flash",
+        "scheduler/scheduler_config.json",
+    );
+    fs::remove_file(&nested).unwrap();
+    let reports = editor::validate_all(temp.path()).unwrap();
+    assert!(
+        reports[0].errors.iter().any(|e| e.contains("missing")),
+        "{:?}",
+        reports[0].errors
+    );
+}
+
+#[test]
+fn a_build_into_another_directory_carries_a_nested_hosted_file() {
+    let temp = repo_with_nested_hosted_file(b"198 3037739\n");
+    git(temp.path(), &["init", "-q"]);
+    let out = tempdir().unwrap();
+    editor::build_registry(temp.path(), out.path(), true).unwrap();
+    let copied = editor::hosted_file_path(
+        out.path(),
+        "qwen3.8-flash",
+        "scheduler/scheduler_config.json",
+    );
+    assert_eq!(fs::read(copied).unwrap(), b"198 3037739\n");
+
+    // Without the file the build refuses, as it does a flat one.
+    let nested = editor::hosted_file_path(
+        temp.path(),
+        "qwen3.8-flash",
+        "scheduler/scheduler_config.json",
+    );
+    fs::remove_file(nested).unwrap();
+    let out = tempdir().unwrap();
+    assert!(editor::build_registry(temp.path(), out.path(), true).is_err());
+}
+
+#[test]
+fn an_uncommitted_nested_hosted_file_makes_the_build_dirty() {
+    let temp = repo_with_nested_hosted_file(b"198 3037739\n");
+    git(temp.path(), &["init", "-q"]);
+    git(temp.path(), &["add", "recipes"]);
+    git(temp.path(), &["commit", "-qm", "r"]);
+    let status = editor::git_status(temp.path());
+    assert!(status.is_dirty, "the nested hosted file is untracked");
+    assert!(
+        status
+            .changed_recipes
+            .iter()
+            .any(|f| f.ends_with("scheduler_config.json")),
+        "{:?}",
+        status.changed_recipes
+    );
+}
+
+#[tokio::test]
+async fn the_upload_route_writes_a_nested_hosted_file() {
+    let temp = tempdir().unwrap();
+    let app = build_router(Arc::new(ServerState::new(
+        temp.path().to_path_buf(),
+        None,
+        8096,
+        temp.path().join("home"),
+    )));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/models/qwen3.8-flash/files/scheduler/scheduler_config.json")
+                .header(header::HOST, "127.0.0.1:8096")
+                .body(Body::from(b"{}".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let path = editor::hosted_file_path(
+        temp.path(),
+        "qwen3.8-flash",
+        "scheduler/scheduler_config.json",
+    );
+    assert_eq!(fs::read(path).unwrap(), b"{}");
 }

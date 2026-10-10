@@ -1,0 +1,126 @@
+{
+ "hadamard": {
+  "base": [
+   [
+    1,
+    1,
+    1,
+    -1
+   ],
+   [
+    1,
+    1,
+    -1,
+    1
+   ],
+   [
+    1,
+    -1,
+    1,
+    1
+   ],
+   [
+    -1,
+    1,
+    1,
+    1
+   ]
+  ],
+  "group": 256,
+  "normalisation": "kron^4(H4) / 16, orthogonal",
+  "row0": "convrot_hadamard_row0.f32"
+ },
+ "rule": "y = rot(x) . (q * scale)^T, rot(x)[g] = x[g] . H for each contiguous 256-group of the input axis; scale is per output row. Implemented in this script from comfy-kitchen 0.2.37 _build_hadamard / _rotate_activation (the package has no macOS wheel).",
+ "gate_up_row_order": "gate rows first, then proj rows",
+ "layers": {
+  "attn.to_q": {
+   "in_dim": 4096,
+   "out_dim": 4096,
+   "official_tensors": [
+    "transformer_blocks.0.attn.to_q.weight"
+   ],
+   "comfy_tensor": "transformer_blocks.0.attn.to_q.weight",
+   "comfy_quant": "{\"format\": \"int8_tensorwise\", \"convrot\": true, \"convrot_groupsize\": 256}",
+   "cosine_per_row": [
+    0.9999586272806374,
+    0.99996047389111,
+    0.9999591191039975,
+    0.9999576584941817,
+    0.9999693946827288,
+    0.9999622057823018,
+    0.999960876676945,
+    0.999953954454696
+   ],
+   "cosine_min": 0.999953954454696,
+   "cosine_overall": 0.9999606898115315,
+   "relative_l2_error": 0.008867954454246142,
+   "files": {
+    "x": "convrot_attn_to_q_x.f32",
+    "y_bf16": "convrot_attn_to_q_y_bf16.f32",
+    "y_int8": "convrot_attn_to_q_y_int8.f32",
+    "q_top_left_64": "convrot_attn_to_q_q64.f32",
+    "scale_first_64": "convrot_attn_to_q_scale64.f32"
+   }
+  },
+  "img_mlp.gate_up": {
+   "in_dim": 4096,
+   "out_dim": 24576,
+   "official_tensors": [
+    "transformer_blocks.0.img_mlp.gate_layer.weight",
+    "transformer_blocks.0.img_mlp.proj.weight"
+   ],
+   "comfy_tensor": "transformer_blocks.0.img_mlp.gate_up.weight",
+   "comfy_quant": "{\"format\": \"int8_tensorwise\", \"convrot\": true, \"convrot_groupsize\": 256}",
+   "cosine_per_row": [
+    0.9999594182160796,
+    0.9999621332363055,
+    0.9999640075623082,
+    0.9999627108731554,
+    0.9999627695526644,
+    0.9999608467304182,
+    0.999964481420306,
+    0.9999627179576386
+   ],
+   "cosine_min": 0.9999594182160796,
+   "cosine_overall": 0.9999624424983796,
+   "relative_l2_error": 0.008666943798447924,
+   "cosine_overall_if_proj_first": -0.0012025096817318002,
+   "files": {
+    "x": "convrot_img_mlp_gate_up_x.f32",
+    "y_bf16": "convrot_img_mlp_gate_up_y_bf16.f32",
+    "y_int8": "convrot_img_mlp_gate_up_y_int8.f32",
+    "q_top_left_64": "convrot_img_mlp_gate_up_q64.f32",
+    "scale_first_64": "convrot_img_mlp_gate_up_scale64.f32"
+   }
+  },
+  "img_mlp.out": {
+   "in_dim": 12288,
+   "out_dim": 4096,
+   "official_tensors": [
+    "transformer_blocks.0.img_mlp.out.weight"
+   ],
+   "comfy_tensor": "transformer_blocks.0.img_mlp.out.weight",
+   "comfy_quant": "{\"format\": \"int8_tensorwise\", \"convrot\": true, \"convrot_groupsize\": 256}",
+   "cosine_per_row": [
+    0.9999543261694133,
+    0.9999536689315593,
+    0.9999625664864712,
+    0.9999549541306666,
+    0.9999575335639858,
+    0.999963437625291,
+    0.999953578392311,
+    0.9999545180357292
+   ],
+   "cosine_min": 0.999953578392311,
+   "cosine_overall": 0.9999571051849555,
+   "relative_l2_error": 0.009262750997170603,
+   "files": {
+    "x": "convrot_img_mlp_out_x.f32",
+    "y_bf16": "convrot_img_mlp_out_y_bf16.f32",
+    "y_int8": "convrot_img_mlp_out_y_int8.f32",
+    "q_top_left_64": "convrot_img_mlp_out_q64.f32",
+    "scale_first_64": "convrot_img_mlp_out_scale64.f32"
+   }
+  }
+ }
+}

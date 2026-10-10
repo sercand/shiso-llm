@@ -1,33 +1,30 @@
 //! The size grammar: what a `size` or `aspect_ratio` string means in pixels.
 //!
 //! Two readers share this one grammar, and they differ in one way on purpose.
-//! The wire field is forgiving: a size off the generator's 16-grid is rounded
-//! to it (ties up) and a size outside the servable bounds is clamped to them,
-//! because a caller that asks for 1000 pixels wants the nearest thing this
-//! server can actually make, not a refusal. The operator's
-//! `--image-default-size` is exact: a default that quietly moved is not the
-//! default that was configured, so anything off the grid or outside the
-//! bounds is refused at boot by the same parse.
+//! The wire field is forgiving for a model on the 16-pixel wire grid: a `WxH` off it is rounded
+//! to it (ties up) and a side outside the loaded model's bounds is clamped to
+//! them, because a caller that asks for 1000 pixels wants the nearest thing
+//! this server can actually make, not a refusal. A model on any other grid
+//! reads `WxH` exactly and refuses off-grid pixels, at
+//! [`ImageGenerationJob::validate`](shiso_vision::generator::ImageGenerationJob::validate),
+//! naming that grid. The operator's `--image-default-size` is exact: a default
+//! that quietly moved is not the default that was configured, so it is read
+//! without rounding and checked against the model's limits at boot.
 //!
 //! The grammar is `WxH`, the named aspect ratios, and the named resolutions
-//! (`2K`, `4K`): a named resolution is the square of N*1024 read through the
-//! same rounding and clamping as any other side. `auto` is not a size here -
-//! the wire handler reads it as an omitted size ([`is_auto`]) and falls to
-//! the server default, which this module has no business knowing.
-//!
-//! The bounds and the grid are the ones
-//! [`ImageGenerationJob::validate`](shiso_vision::generator::ImageGenerationJob::validate)
-//! enforces, so a size that survives this module always survives that check.
+//! (`2K`, `4K`): a named resolution is the square of N*1024. The names are
+//! ours to make servable, so they are rounded to the model's own
+//! `size_multiple` and clamped to its bounds. `auto` is not a size here - the
+//! wire handler reads it as an omitted size ([`is_auto`]) and falls to the
+//! server default, which this module has no business knowing.
 
+use shiso_vision::generator::ImageLimits;
 use thiserror::Error;
 
-/// The shortest side a generated image may have, in pixels.
-pub const MIN_SIDE: u32 = 256;
-/// The longest side a generated image may have, in pixels.
-pub const MAX_SIDE: u32 = 2048;
-/// Every side is a multiple of this: the latent grid the generator denoises
-/// on, so an off-grid request cannot be honored and is rounded instead.
-pub const SIDE_GRID: u32 = 16;
+/// The grid a wire `WxH` is rounded to whatever the model: the finest
+/// multiple any shipped model accepts, so a caller's odd size lands near what
+/// it asked for. A model with a coarser grid refuses the rounded size by name.
+pub const WIRE_GRID: u32 = 16;
 
 /// A size string the server cannot turn into pixels.
 #[derive(Debug, Error)]
@@ -43,31 +40,12 @@ pub enum SizeError {
         /// The value as it arrived.
         value: String,
     },
-    /// The string parsed as `WxH` but names pixels this server will not make,
-    /// and the caller asked for exactness rather than a clamp - which only
-    /// the operator's setting path does.
-    #[error(
-        "{width}x{height} is not a servable size: both sides must be a \
-         multiple of {grid} within {min}..={max}"
-    )]
-    Unservable {
-        /// The width as parsed.
-        width: u32,
-        /// The height as parsed.
-        height: u32,
-        /// The shortest servable side, for the message.
-        min: u32,
-        /// The longest servable side, for the message.
-        max: u32,
-        /// The grid every side must sit on, for the message.
-        grid: u32,
-    },
 }
 
 /// The aspect ratios the server names, and the concrete pixels each one means.
 ///
-/// Every pair is a multiple of [`SIDE_GRID`] inside [`MIN_SIDE`]..=[`MAX_SIDE`],
-/// and every pair keeps a roughly one-megapixel area so that switching ratio
+/// Every pair is a multiple of 32 inside 256..=2048 (so the table is servable
+/// by every shipped model as written), and every pair keeps a roughly one-megapixel area so that switching ratio
 /// does not silently change what a generation costs. The pairs are exact for
 /// the simple ratios (`1:1`, `4:3`, `2:3` and their transposes); `16:9` is
 /// 1344x768 - 1.75 to 1, the closest the 16-grid keeps beside the megapixel -
@@ -85,11 +63,13 @@ const ASPECT_RATIOS: [(&str, u32, u32); 8] = [
 
 /// The wire's forgiving read of a size or ratio string.
 ///
-/// `WxH` has each side rounded to the nearest multiple of [`SIDE_GRID`] (ties
-/// up) and clamped into [`MIN_SIDE`]..=[`MAX_SIDE`]; a named aspect ratio
-/// becomes its table entry; a named resolution (`2K`, `4K`) becomes the
-/// square of N*1024 through the same rounding and clamping, so `2K` is
-/// 2048x2048 and `4K` lands on the servable ceiling rather than being
+/// `WxH` has each side rounded to the nearest multiple of [`WIRE_GRID`] (ties
+/// up) and clamped into the model's bounds when the model sits on that grid,
+/// and is passed through exactly (for the job's validation to accept or
+/// refuse) when it does not; a named aspect ratio becomes its
+/// table entry and a named resolution (`2K`, `4K`) the square of N*1024, both
+/// rounded to the model's `size_multiple` and clamped, so `2K` is 2048x2048
+/// where the model allows it and `4K` lands on the ceiling rather than being
 /// refused. A ratio not in the table is refused rather than approximated:
 /// the table is the published mapping, and a second way to read a ratio
 /// would be a second answer to the same request.
@@ -97,16 +77,30 @@ const ASPECT_RATIOS: [(&str, u32, u32); 8] = [
 /// # Errors
 ///
 /// [`SizeError::Malformed`] when the string is none of these shapes.
-pub fn normalize_size(value: &str) -> Result<(u32, u32), SizeError> {
+pub fn normalize_size(value: &str, limits: &ImageLimits) -> Result<(u32, u32), SizeError> {
     if value.contains(':') {
-        return aspect_ratio_size(value).ok_or_else(|| malformed(value));
+        let (width, height) = aspect_ratio_size(value).ok_or_else(|| malformed(value))?;
+        return Ok((
+            round_side(width, limits.size_multiple, limits),
+            round_side(height, limits.size_multiple, limits),
+        ));
     }
     if let Some(side) = named_resolution(value) {
-        let side = round_side(side);
+        let side = round_side(side, limits.size_multiple, limits);
         return Ok((side, side));
     }
     let (width, height) = split_size(value).ok_or_else(|| malformed(value))?;
-    Ok((round_side(width), round_side(height)))
+    // A model on the wire grid keeps the forgiving read. Any other model is
+    // exact-or-refuse: rounding 1020 to 1024 on a 32 grid would answer pixels
+    // the caller did not name, while 1000 is refused, so the generator's own
+    // check (which names the multiple and bounds) judges the numbers as given.
+    if limits.size_multiple != WIRE_GRID {
+        return Ok((width, height));
+    }
+    Ok((
+        round_side(width, WIRE_GRID, limits),
+        round_side(height, WIRE_GRID, limits),
+    ))
 }
 
 /// Whether a wire `size` string names `auto`: the caller asking for the
@@ -123,27 +117,17 @@ pub fn is_auto(value: &str) -> bool {
 /// The operator's exact read of a `WxH` string: no rounding, no clamping,
 /// and no names - `auto` and `2K` are refused here, because a default that
 /// quietly moved or arrived as a resolution class is not the default that
-/// was configured.
+/// was configured. Whether the model can serve the pixels is checked at boot,
+/// when the model is known ([`ImageOverrides::resolve`](super::ImageOverrides::resolve)).
 ///
 /// # Errors
 ///
-/// [`SizeError::Malformed`] for a string that is not `WxH` of two numbers,
-/// and [`SizeError::Unservable`] for numbers off the grid or outside the
-/// bounds.
+/// [`SizeError::Malformed`] for a string that is not `WxH` of two non-zero
+/// numbers.
 pub fn parse_exact_size(value: &str) -> Result<(u32, u32), SizeError> {
     let (width, height) = split_size(value).ok_or_else(|| malformed(value))?;
-    if !(MIN_SIDE..=MAX_SIDE).contains(&width)
-        || !(MIN_SIDE..=MAX_SIDE).contains(&height)
-        || !width.is_multiple_of(SIDE_GRID)
-        || !height.is_multiple_of(SIDE_GRID)
-    {
-        return Err(SizeError::Unservable {
-            width,
-            height,
-            min: MIN_SIDE,
-            max: MAX_SIDE,
-            grid: SIDE_GRID,
-        });
+    if width == 0 || height == 0 {
+        return Err(malformed(value));
     }
     Ok((width, height))
 }
@@ -181,10 +165,10 @@ fn split_size(value: &str) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-/// The nearest grid multiple, ties up, then the servable bounds.
-fn round_side(value: u32) -> u32 {
-    let rounded = (value.saturating_add(SIDE_GRID / 2) / SIDE_GRID) * SIDE_GRID;
-    rounded.clamp(MIN_SIDE, MAX_SIDE)
+/// The nearest multiple of `grid`, ties up, then the model's bounds.
+fn round_side(value: u32, grid: u32, limits: &ImageLimits) -> u32 {
+    let rounded = (value.saturating_add(grid / 2) / grid) * grid;
+    rounded.clamp(limits.min_side, limits.max_side)
 }
 
 /// The refusal for a string neither shape.
@@ -196,25 +180,41 @@ fn malformed(value: &str) -> SizeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ASPECT_RATIOS, MAX_SIDE, MIN_SIDE, SIDE_GRID, is_auto, normalize_size, parse_exact_size,
+    use shiso_vision::generator::ImageLimits;
+
+    use super::{ASPECT_RATIOS, is_auto, normalize_size, parse_exact_size};
+
+    const LIMITS: ImageLimits = ImageLimits {
+        size_multiple: 16,
+        min_side: 256,
+        max_side: 2048,
+        default_size: (1024, 1024),
+        default_steps: 4,
+        fixed_steps: None,
     };
 
+    fn norm(value: &str) -> (u32, u32) {
+        normalize_size(value, &LIMITS).expect("servable")
+    }
+
     /// The table is the published mapping, so its entries are servable by
-    /// construction and a test fails the day one of them is not.
+    /// construction (on a 32 grid too) and a test fails the day one is not.
     #[test]
     fn every_table_entry_is_a_servable_size() {
+        let coarse = ImageLimits {
+            size_multiple: 32,
+            ..LIMITS
+        };
         for (name, width, height) in ASPECT_RATIOS {
-            assert!(
-                width.is_multiple_of(SIDE_GRID) && (MIN_SIDE..=MAX_SIDE).contains(&width),
-                "{name}"
-            );
-            assert!(
-                height.is_multiple_of(SIDE_GRID) && (MIN_SIDE..=MAX_SIDE).contains(&height),
-                "{name}"
-            );
+            for side in [width, height] {
+                assert!(
+                    side.is_multiple_of(32) && (256..=2048).contains(&side),
+                    "{name}"
+                );
+            }
+            assert_eq!(norm(name), (width, height));
             assert_eq!(
-                normalize_size(name).expect("a listed ratio"),
+                normalize_size(name, &coarse).expect("a listed ratio"),
                 (width, height)
             );
         }
@@ -225,20 +225,42 @@ mod tests {
     /// a bound rather than beside one.
     #[test]
     fn rounding_is_nearest_with_ties_up() {
-        assert_eq!(normalize_size("992x992").expect("on the grid"), (992, 992));
-        assert_eq!(normalize_size("996x996").expect("nearer down"), (992, 992));
+        assert_eq!(norm("992x992"), (992, 992));
+        assert_eq!(norm("996x996"), (992, 992));
+        assert_eq!(norm("1000x1000"), (1008, 1008));
+        assert_eq!(norm("1004x1004"), (1008, 1008));
+        assert_eq!(norm("10x10"), (256, 256));
+        assert_eq!(norm("99999x99999"), (2048, 2048));
+    }
+
+    /// Off the 16 grid a model is exact-or-refuse: nothing is rounded.
+    #[test]
+    fn a_coarser_grid_reads_wxh_exactly() {
+        let coarse = ImageLimits {
+            size_multiple: 32,
+            ..LIMITS
+        };
         assert_eq!(
-            normalize_size("1000x1000").expect("tie goes up"),
-            (1008, 1008)
+            normalize_size("1020x1020", &coarse).expect("passes through"),
+            (1020, 1020)
         );
         assert_eq!(
-            normalize_size("1004x1004").expect("nearer up"),
-            (1008, 1008)
+            normalize_size("1024x768", &coarse).expect("exact"),
+            (1024, 768)
         );
-        assert_eq!(normalize_size("10x10").expect("clamped up"), (256, 256));
+    }
+
+    /// A model's own bounds are the clamp, not a fixed pair.
+    #[test]
+    fn the_clamp_is_the_models_bounds() {
+        let narrow = ImageLimits {
+            min_side: 512,
+            max_side: 1536,
+            ..LIMITS
+        };
         assert_eq!(
-            normalize_size("99999x99999").expect("clamped down"),
-            (2048, 2048)
+            normalize_size("100x4000", &narrow).expect("clamps"),
+            (512, 1536)
         );
     }
 
@@ -247,10 +269,10 @@ mod tests {
     /// `2K` is exactly the ceiling, and `4K` names 4096 and lands on it.
     #[test]
     fn a_named_resolution_is_a_square_through_the_same_round_and_clamp() {
-        assert_eq!(normalize_size("2K").expect("named"), (2048, 2048));
-        assert_eq!(normalize_size("2k").expect("lower case"), (2048, 2048));
-        assert_eq!(normalize_size("1K").expect("named"), (1024, 1024));
-        assert_eq!(normalize_size("4K").expect("clamped down"), (2048, 2048));
+        assert_eq!(norm("2K"), (2048, 2048));
+        assert_eq!(norm("2k"), (2048, 2048));
+        assert_eq!(norm("1K"), (1024, 1024));
+        assert_eq!(norm("4K"), (2048, 2048));
     }
 
     /// `auto` is not a size, so the grammar refuses it; the wire handler
@@ -261,16 +283,17 @@ mod tests {
         assert!(is_auto(" Auto "));
         assert!(!is_auto("2K"));
         assert!(
-            normalize_size("auto").is_err(),
+            normalize_size("auto", &LIMITS).is_err(),
             "auto names the default, not pixels"
         );
     }
 
-    /// The operator's knob takes neither name: a default that moved is not
-    /// the default that was configured.
+    /// The operator's knob takes neither name, and no zero side.
     #[test]
     fn the_exact_read_takes_no_names() {
         assert!(parse_exact_size("2K").is_err());
         assert!(parse_exact_size("auto").is_err());
+        assert!(parse_exact_size("0x1024").is_err());
+        assert_eq!(parse_exact_size("1000x1000").expect("exact"), (1000, 1000));
     }
 }

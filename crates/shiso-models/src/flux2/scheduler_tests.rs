@@ -15,7 +15,7 @@ fn empirical_mu_calculation() {
 
 #[test]
 fn scheduler_4_steps_monotonic_timesteps() {
-    let scheduler = FlowMatchEulerDiscreteScheduler::new(4096, 4);
+    let scheduler = new_scheduler(4096, 4);
     assert_eq!(scheduler.timesteps.len(), 4);
     for i in 1..4 {
         assert!(scheduler.timesteps[i] < scheduler.timesteps[i - 1]);

@@ -14,6 +14,9 @@ use serde::Deserialize;
 use shiso_modelfile::st_header::{RawTensor, Shard, StDType};
 use shiso_vision::generator::ImageGenError;
 
+use crate::diffusion::weights::count_blocks_internal;
+use crate::image_registry::ImageModelDesc;
+
 /// Hyperparameters for the diffusion transformer architecture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Flux2Params {
@@ -59,21 +62,6 @@ pub struct Flux2Located {
     pub tokenizer_path: PathBuf,
     /// Discovered model parameters.
     pub params: Flux2Params,
-}
-
-/// What an image model checkpoint is described with at load time.
-#[derive(Debug, Clone)]
-pub struct ImageModelDesc {
-    /// Transformer weights path (file or directory).
-    pub model_path: PathBuf,
-    /// Path to text encoder checkpoint (or directory containing `text_encoder`).
-    pub text_encoder_path: Option<PathBuf>,
-    /// Path to VAE checkpoint (or directory containing vae).
-    pub vae_path: Option<PathBuf>,
-    /// Path to tokenizer directory or tokenizer.json.
-    pub tokenizer_path: Option<PathBuf>,
-    /// Optional directory to search for shared companion assets.
-    pub assets_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -436,22 +424,6 @@ fn resolve_asset(
     Err(ImageGenError::Checkpoint(format!(
         "could not locate required asset '{name}'; specify --image-assets-dir or --image-{name}"
     )))
-}
-
-pub(crate) fn count_blocks_internal<'a>(
-    keys: impl Iterator<Item = &'a str>,
-    prefix: &str,
-) -> Option<usize> {
-    let mut max_idx = None;
-    for k in keys {
-        if let Some(rest) = k.strip_prefix(prefix)
-            && let Some(idx_str) = rest.split('.').next()
-            && let Ok(idx) = idx_str.parse::<usize>()
-        {
-            max_idx = Some(max_idx.map_or(idx, |m: usize| m.max(idx)));
-        }
-    }
-    max_idx.map(|m| m + 1)
 }
 
 /// The tensor that marks a store as a transformer this loader can read: the

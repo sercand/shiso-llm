@@ -1,12 +1,12 @@
-//! The flux2 kernel driver: every device operation the pipeline issues.
+//! The diffusion kernel driver: every device operation a `DiT` image pipeline issues.
 //!
 //! One funnel, like the vision encoder's `Run` and the audio family's `Ops`:
 //! argument blocks are `#[repr(C)]` `Pod` structs marshalled with
 //! `bytemuck::bytes_of`, so their layout comes from the struct definition and
 //! is asserted against the kernel headers at compile time. Every launch names
-//! the `flux2` module, and [`Ops::new`] probes the device for every entry in
+//! the `diffusion` module, and [`Ops::new`] probes the device for every entry in
 //! [`REQUIRED_KERNELS`] before a driver exists: a backend whose module table
-//! does not carry the full flux2 set is refused at load, naming the missing
+//! does not carry the full diffusion set is refused at load, naming the missing
 //! entries, rather than silently running the same arithmetic on the host
 //! orders of magnitude slower. The host twins of the fused-row attention and
 //! `RoPE` seams remain as `#[cfg(test)]` entry points for the oracle tests,
@@ -27,8 +27,13 @@ use shiso_core::{
 };
 use shiso_vision::generator::ImageGenError;
 
-/// The kernel module every flux2 entry point lives under.
-pub(crate) const MODULE: &str = "flux2";
+use super::quant::RotGroup;
+
+mod vae;
+pub(crate) use vae::{ChannelRmsCall, DupUpCall, VaeConvCall, VaeConvInput, dup_up_map};
+
+/// The kernel module every diffusion entry point lives under.
+pub(crate) const MODULE: &str = "diffusion";
 
 /// Threads per elementwise block.
 const BLOCK: u32 = 64;
@@ -55,12 +60,45 @@ const FA_THREADS: u32 = 128;
 /// 512-wide head) go to the per-row kernel.
 const FA_MAX_D: usize = 128;
 
+/// Threads per rotation threadgroup: one (row, group) each, four elements
+/// per thread per butterfly stage.
+const ROT_THREADS: u32 = 64;
+
 fn grid_for(total: u32, tile: u32) -> u32 {
     total.div_ceil(tile).max(1)
 }
 
 fn fail(step: &'static str) -> impl Fn(shiso_core::CoreError) -> ImageGenError {
     move |source| ImageGenError::Backend(format!("{step}: {source}"))
+}
+
+/// The epilogue-scale binding a GEMM entry of `kind` takes: the per-row
+/// vector for [`WeightKind::Int8Row`], the scalar for every other kind. A
+/// mismatch is a loader bug, refused rather than run with a scale of one.
+///
+/// A rotation on any kind but [`WeightKind::Int8Row`] is refused the same
+/// way: only the INT8 export stores a rotated weight, so rotating the input
+/// of a BF16/FP8/F32 product would silently change its answer.
+fn scale_binding<'a>(
+    step: &'static str,
+    weight: &LinWeight<'a>,
+) -> Result<KernelArg<'a>, ImageGenError> {
+    let kind = weight.kind;
+    if weight.rotate.is_some() && kind != WeightKind::Int8Row {
+        return Err(ImageGenError::Backend(format!(
+            "{step}: an input rotation was passed with a {kind:?} weight; only per-row INT8 weights are stored rotated"
+        )));
+    }
+    match (kind, weight.row_scale) {
+        (WeightKind::Int8Row, Some(rows)) => Ok(KernelArg::Buffer(rows)),
+        (WeightKind::Int8Row, None) => Err(ImageGenError::Backend(format!(
+            "{step}: a per-row INT8 weight was passed without its row scales"
+        ))),
+        (_, Some(_)) => Err(ImageGenError::Backend(format!(
+            "{step}: row scales were passed with a {kind:?} weight, which takes a tensor scale"
+        ))),
+        (_, None) => Ok(KernelArg::F32(weight.scale)),
+    }
 }
 
 /// `DeviceView::slice` answers a core error; the family's drivers speak
@@ -151,6 +189,17 @@ struct QkNormArgs {
     head_dim: u32,
     /// Elements per fused qkv row; q and k are head sections of it.
     row_stride: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct QkNormRopeArgs {
+    tokens: u32,
+    heads: u32,
+    head_dim: u32,
+    q_stride: u32,
+    k_stride: u32,
     eps: f32,
 }
 
@@ -257,6 +306,16 @@ struct GemmFusedArgs {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct HadamardArgs {
+    rows: u32,
+    cols_a: u32,
+    inner: u32,
+    gu_stride: u32,
+    gu_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct AxpyArgs {
     count: u32,
     dt: f32,
@@ -280,6 +339,7 @@ const _: () = assert!(size_of::<UpsampleArgs>() == 16);
 const _: () = assert!(size_of::<NormArgs>() == 12);
 const _: () = assert!(size_of::<SoftmaxArgs>() == 12);
 const _: () = assert!(size_of::<QkNormArgs>() == 20);
+const _: () = assert!(size_of::<QkNormRopeArgs>() == 24);
 const _: () = assert!(size_of::<ConcatArgs>() == 12);
 const _: () = assert!(size_of::<GroupNormArgs>() == 24);
 const _: () = assert!(size_of::<Rope4dArgs>() == 28);
@@ -289,6 +349,7 @@ const _: () = assert!(size_of::<GqaArgs>() == 16);
 const _: () = assert!(size_of::<Conv2dArgs>() == 48);
 const _: () = assert!(size_of::<AxpyArgs>() == 8);
 const _: () = assert!(size_of::<GemmFusedArgs>() == 28);
+const _: () = assert!(size_of::<HadamardArgs>() == 20);
 const _: () = assert!(size_of::<EmbedArgs>() == 8);
 
 /// The stored format of a linear weight, taken from the tensor header.
@@ -300,6 +361,74 @@ pub(crate) enum WeightKind {
     Fp8,
     /// IEEE single, executed natively.
     F32,
+    /// Signed byte codes with one `f32` scale per weight row, executed
+    /// natively: the codes are widened while the tile stages them and the
+    /// row's scale multiplies the accumulator in the epilogue.
+    Int8Row,
+}
+
+/// Everything a GEMM entry needs to know about the weight side of a product,
+/// as one value.
+///
+/// The fields are private and there are exactly two ways to build one:
+/// [`Lin::weight`](super::lin::Lin::weight), which copies every fact the
+/// loader read (format, scale, per-row scales, bias, input rotation), and
+/// [`LinWeight::f32`] for a raw F32 operand that is not a checkpoint linear
+/// (the VAE attention's products), which has no scale, bias or rotation to
+/// forget. A call site holding a [`super::lin::Lin`] therefore cannot drop
+/// its `ConvRot` rotation or its row scales: there is no field to leave out.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LinWeight<'a> {
+    /// BF16, `F8_E4M3`, F32 or I8 weight rows, (n, k), exactly as the
+    /// checkpoint stored them.
+    w: DeviceView<'a>,
+    kind: WeightKind,
+    /// Multiplier applied to the accumulated dot product: the FP8 tensor's
+    /// `weight_scale`, or 1.0 otherwise. It rides the epilogue, so the weight
+    /// is never rescaled in memory.
+    scale: f32,
+    /// The `n` per-row scales of an [`WeightKind::Int8Row`] weight (and of
+    /// no other kind), riding the epilogue in place of `scale`.
+    row_scale: Option<DeviceView<'a>>,
+    /// The rotation the weight was stored under; the driver rotates the
+    /// input into a scratch buffer first, never the caller's buffer.
+    rotate: Option<RotGroup>,
+    bias: Option<DeviceView<'a>>,
+}
+
+impl<'a> LinWeight<'a> {
+    /// A raw F32 `(n, k)` operand with no scale, bias or rotation.
+    pub(crate) fn f32(w: DeviceView<'a>) -> Self {
+        Self {
+            w,
+            kind: WeightKind::F32,
+            scale: 1.0,
+            row_scale: None,
+            rotate: None,
+            bias: None,
+        }
+    }
+
+    /// Forces a rotation onto any weight: the refusal tests' way to build
+    /// the mismatch no production constructor can.
+    #[cfg(test)]
+    pub(crate) fn with_rotation(mut self, rotate: Option<RotGroup>) -> Self {
+        self.rotate = rotate;
+        self
+    }
+
+    /// Every fact of a loaded linear. Reached through
+    /// [`Lin::weight`](super::lin::Lin::weight).
+    pub(super) fn of(lin: &'a super::lin::Lin) -> Self {
+        Self {
+            w: lin.w.view(),
+            kind: lin.kind,
+            scale: lin.scale,
+            row_scale: lin.row_scale.as_ref().map(DeviceBuffer::view),
+            rotate: lin.rotate,
+            bias: lin.bias.as_ref().map(DeviceBuffer::view),
+        }
+    }
 }
 
 /// One matrix multiply against a linear weight stored in its native format.
@@ -307,17 +436,11 @@ pub(crate) struct GemmCall<'a> {
     pub step: &'static str,
     pub out: DeviceView<'a>,
     pub input: DeviceView<'a>,
-    /// BF16, `F8_E4M3` or F32 weight rows, (n, k), exactly as the checkpoint stored them.
-    pub weight: DeviceView<'a>,
-    /// Multiplier applied to the accumulated dot product: the FP8 tensor's
-    /// `weight_scale`, or 1.0 otherwise. It rides the epilogue, so the weight
-    /// is never rescaled in memory.
-    pub weight_scale: f32,
-    pub bias: Option<DeviceView<'a>>,
+    /// The weight side: format, scales, bias and input rotation together.
+    pub weight: LinWeight<'a>,
     pub m: usize,
     pub n: usize,
     pub k: usize,
-    pub kind: WeightKind,
 }
 
 /// The gated half of a fused row pair: `silu(rows[r, offset + i]) *
@@ -345,12 +468,25 @@ pub(crate) struct LinearResidualCall<'a> {
     pub dense_cols: usize,
     /// The trailing part of the input, formed from a gate/up row pair.
     pub swiglu: Option<SwigluInput<'a>>,
-    pub weight: DeviceView<'a>,
-    pub weight_scale: f32,
-    pub bias: Option<DeviceView<'a>>,
-    pub kind: WeightKind,
+    /// As [`GemmCall::weight`]; a rotation applies to the formed
+    /// `[dense | swiglu]` row.
+    pub weight: LinWeight<'a>,
     pub m: usize,
     pub n: usize,
+}
+
+/// The `ConvRot` rotation of a linear's input rows: `out[r] = rot(x[r])` with
+/// `x = [dense (dense_cols) | swiglu (inner)]` formed as the fused linear
+/// forms it, `rot` multiplying each 256-wide group by `H`. `out` is packed,
+/// `dense_cols + inner` wide, and must not alias either input.
+pub(crate) struct RotateCall<'a> {
+    pub step: &'static str,
+    pub out: DeviceView<'a>,
+    pub dense: Option<DeviceView<'a>>,
+    pub dense_cols: usize,
+    pub swiglu: Option<SwigluInput<'a>>,
+    pub rows: usize,
+    pub group: RotGroup,
 }
 
 /// Joint-sequence scaled dot-product attention (the transformer's blocks).
@@ -392,6 +528,10 @@ pub(crate) struct SdpaCall<'a> {
     /// Elements per token row in the strided q/k/v buffers (a fused qkv row).
     pub txt_stride: usize,
     pub img_stride: usize,
+    /// Mask every key after the query's own joint row (`s > t`): a
+    /// prefix whose rows never see later ones. Refused with cached rows,
+    /// which sit after every live row and would always be masked.
+    pub causal: bool,
 }
 
 /// Grouped-query causal attention (the text encoder's prefill).
@@ -477,6 +617,28 @@ pub(crate) struct QkNormCall<'a> {
     pub heads: usize,
     pub head_dim: usize,
     pub row_stride: usize,
+    pub eps: f32,
+}
+
+/// QK-norm then interleaved `RoPE` from a per-token angle table, in place,
+/// over separate packed q and k buffers (a block whose q, k and v come from
+/// three separate linears). Pair `i` of a head, `(x[2i], x[2i+1])`, turns
+/// by the angle whose cosine and sine are column `i` of `cos`/`sin`, each
+/// `(tokens, head_dim / 2)`.
+pub(crate) struct QkNormRopeCall<'a> {
+    pub step: &'static str,
+    pub q: DeviceView<'a>,
+    pub k: DeviceView<'a>,
+    pub q_scale: DeviceView<'a>,
+    pub k_scale: DeviceView<'a>,
+    pub cos: DeviceView<'a>,
+    pub sin: DeviceView<'a>,
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    /// Elements per token row of each buffer.
+    pub q_stride: usize,
+    pub k_stride: usize,
     pub eps: f32,
 }
 
@@ -569,7 +731,7 @@ pub(crate) struct EmbedCall<'a> {
     pub hidden: usize,
 }
 
-/// The driver every flux2 component shares.
+/// The driver every image-family component shares.
 #[derive(Debug)]
 pub(crate) struct Ops {
     backend: Arc<dyn Backend>,
@@ -616,45 +778,57 @@ impl Drop for Scratch<'_> {
     }
 }
 
-/// Every flux2 kernel entry this driver launches: the module's full
-/// registration in `metal/flux2/flux2.metal`. [`Ops::new`] probes the device
+/// Every diffusion kernel entry this driver launches: the module's full
+/// registration in `metal/diffusion/diffusion.metal`. [`Ops::new`] probes the device
 /// for all of them, so a build or device without the set is refused at load
 /// naming what is missing, and a launch can never fall back to a host twin
 /// unnoticed. A name launched here but absent from this list is a driver bug.
 const REQUIRED_KERNELS: &[&str] = &[
-    "kernel_flux2_silu_f32",
-    "kernel_flux2_swiglu_f32",
-    "kernel_flux2_swiglu2_f32",
-    "kernel_flux2_modulate_f32",
-    "kernel_flux2_add_gated_f32",
-    "kernel_flux2_add_f32",
-    "kernel_flux2_axpy_f32",
-    "kernel_flux2_gemm_bf16",
-    "kernel_flux2_gemm_fp8",
-    "kernel_flux2_gemm_f32",
-    "kernel_flux2_rmsnorm_f32",
-    "kernel_flux2_layer_norm_f32",
-    "kernel_flux2_softmax_rows_f32",
-    "kernel_flux2_qk_norm_f32",
-    "kernel_flux2_concat_rows_f32",
-    "kernel_flux2_sdpa_f32",
-    "kernel_flux2_gqa_f32",
-    "kernel_flux2_rope_4d",
-    "kernel_flux2_rope_half",
-    "kernel_flux2_conv2d_f32",
-    "kernel_flux2_group_norm_stats_f32",
-    "kernel_flux2_group_norm_apply_f32",
-    "kernel_flux2_upsample_nearest_f32",
-    "kernel_flux2_transpose_f32",
-    "kernel_flux2_embed_bf16_f32",
-    "kernel_flux2_gemm64_f32",
-    "kernel_flux2_gemm64_bf16",
-    "kernel_flux2_gemm64_fp8",
-    "kernel_flux2_conv2d_gemm_f32",
-    "kernel_flux2_flash_sdpa_f32",
-    "kernel_flux2_gemm64_fused_f32",
-    "kernel_flux2_gemm64_fused_bf16",
-    "kernel_flux2_gemm64_fused_fp8",
+    "kernel_dit_silu_f32",
+    "kernel_dit_swiglu_f32",
+    "kernel_dit_swiglu2_f32",
+    "kernel_dit_modulate_f32",
+    "kernel_dit_add_gated_f32",
+    "kernel_dit_add_f32",
+    "kernel_dit_axpy_f32",
+    "kernel_dit_gemm_bf16",
+    "kernel_dit_gemm_fp8",
+    "kernel_dit_gemm_f32",
+    "kernel_dit_rmsnorm_f32",
+    "kernel_dit_layer_norm_f32",
+    "kernel_dit_softmax_rows_f32",
+    "kernel_dit_qk_norm_f32",
+    "kernel_dit_concat_rows_f32",
+    "kernel_dit_sdpa_f32",
+    "kernel_dit_gqa_f32",
+    "kernel_dit_rope_4d",
+    "kernel_dit_rope_half",
+    "kernel_dit_conv2d_f32",
+    "kernel_dit_group_norm_stats_f32",
+    "kernel_dit_group_norm_apply_f32",
+    "kernel_dit_upsample_nearest_f32",
+    "kernel_dit_transpose_f32",
+    "kernel_dit_embed_bf16_f32",
+    "kernel_dit_gemm64_f32",
+    "kernel_dit_gemm64_bf16",
+    "kernel_dit_gemm64_fp8",
+    "kernel_dit_conv2d_gemm_f32",
+    "kernel_dit_flash_sdpa_f32",
+    "kernel_dit_flash_sdpa_causal_f32",
+    "kernel_dit_tanh_f32",
+    "kernel_dit_gelu_tanh_f32",
+    "kernel_dit_qk_norm_rope_f32",
+    "kernel_dit_gemm64_fused_f32",
+    "kernel_dit_gemm64_fused_bf16",
+    "kernel_dit_gemm64_fused_fp8",
+    "kernel_dit_gemm_i8",
+    "kernel_dit_gemm64_i8",
+    "kernel_dit_gemm64_fused_i8",
+    "kernel_dit_hadamard256_f32",
+    "kernel_dit_channel_rms_inv_f32",
+    "kernel_dit_conv2d_rms_gemm_f32",
+    "kernel_dit_conv2d_up2_gemm_f32",
+    "kernel_dit_dup_up_add_f32",
 ];
 
 impl Ops {
@@ -681,7 +855,7 @@ impl Ops {
             .collect();
         if !missing.is_empty() {
             return Err(ImageGenError::Backend(format!(
-                "the {} backend does not expose the flux2 kernel module: missing [{}]",
+                "the {} backend does not expose the diffusion kernel module: missing [{}]",
                 backend.backend_name(),
                 missing.join(", ")
             )));
@@ -896,7 +1070,29 @@ impl Ops {
         input: DeviceView<'_>,
         count: usize,
     ) -> Result<(), ImageGenError> {
-        self.elementwise(step, "kernel_flux2_silu_f32", count, &[out, input])
+        self.elementwise(step, "kernel_dit_silu_f32", count, &[out, input])
+    }
+
+    /// out[i] = tanh(input[i]).
+    pub(crate) fn tanh(
+        &self,
+        step: &'static str,
+        out: DeviceView<'_>,
+        input: DeviceView<'_>,
+        count: usize,
+    ) -> Result<(), ImageGenError> {
+        self.elementwise(step, "kernel_dit_tanh_f32", count, &[out, input])
+    }
+
+    /// out[i] = gelu(input[i]), tanh approximation.
+    pub(crate) fn gelu_tanh(
+        &self,
+        step: &'static str,
+        out: DeviceView<'_>,
+        input: DeviceView<'_>,
+        count: usize,
+    ) -> Result<(), ImageGenError> {
+        self.elementwise(step, "kernel_dit_gelu_tanh_f32", count, &[out, input])
     }
 
     /// `SwiGLU` over a fused row: out[r, i] = silu(in[r, i]) * in[r, inner + i].
@@ -923,7 +1119,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_swiglu_f32",
+            "kernel_dit_swiglu_f32",
             Extent3::new(grid_for(inner as u32, BLOCK), rows as u32, 1),
             Extent3::linear(BLOCK),
             &[
@@ -945,7 +1141,7 @@ impl Ops {
         b: DeviceView<'_>,
         count: usize,
     ) -> Result<(), ImageGenError> {
-        self.elementwise(step, "kernel_flux2_swiglu2_f32", count, &[out, a, b])
+        self.elementwise(step, "kernel_dit_swiglu2_f32", count, &[out, a, b])
     }
 
     /// out = x * (1 + scale) + shift, with `scale`/`shift` a per-dimension
@@ -966,7 +1162,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_modulate_f32",
+            "kernel_dit_modulate_f32",
             Extent3::linear(grid_for(count as u32, BLOCK)),
             Extent3::linear(BLOCK),
             &[
@@ -997,7 +1193,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_add_gated_f32",
+            "kernel_dit_add_gated_f32",
             Extent3::linear(grid_for(count as u32, BLOCK)),
             Extent3::linear(BLOCK),
             &[
@@ -1019,7 +1215,7 @@ impl Ops {
         b: DeviceView<'_>,
         count: usize,
     ) -> Result<(), ImageGenError> {
-        self.elementwise(step, "kernel_flux2_add_f32", count, &[out, a, b])
+        self.elementwise(step, "kernel_dit_add_f32", count, &[out, a, b])
     }
 
     /// out = x + dt * v (the Euler latent update).
@@ -1038,7 +1234,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_axpy_f32",
+            "kernel_dit_axpy_f32",
             Extent3::linear(grid_for(count as u32, BLOCK)),
             Extent3::linear(BLOCK),
             &[
@@ -1067,24 +1263,49 @@ impl Ops {
     ///
     /// The weight is read in its stored format - BF16 or `F8_E4M3` bytes - and
     /// the scale multiplies the accumulator, never the weight in memory.
+    ///
+    /// A rotated weight's input is rotated into a pooled scratch buffer here,
+    /// the one place every linear passes through, so no call site can forget
+    /// it and the caller's input is never written.
     pub(crate) fn gemm(&self, call: &GemmCall<'_>) -> Result<(), ImageGenError> {
+        let lw = &call.weight;
+        let scale_arg = scale_binding(call.step, lw)?;
+        let rotated;
+        let input = match lw.rotate {
+            Some(group) => {
+                rotated = self.alloc_f32(call.step, call.m * call.k)?;
+                self.rotate(&RotateCall {
+                    step: call.step,
+                    out: rotated.view(),
+                    dense: Some(call.input),
+                    dense_cols: call.k,
+                    swiglu: None,
+                    rows: call.m,
+                    group,
+                })?;
+                rotated.view()
+            }
+            None => call.input,
+        };
         let args = GemmArgs {
             m: call.m as u32,
             n: call.n as u32,
             k: call.k as u32,
-            has_bias: u32::from(call.bias.is_some()),
+            has_bias: u32::from(lw.bias.is_some()),
         };
-        let bias = call.bias.unwrap_or(self.dummy.view());
+        let bias = lw.bias.unwrap_or(self.dummy.view());
         // The simdgroup tile stages whole 16-wide k slices; every linear in
         // the family qualifies, and the scalar kernels keep any other shape.
         let tiled = call.k.is_multiple_of(G64_K);
-        let entry = match (call.kind, tiled) {
-            (WeightKind::Fp8, true) => "kernel_flux2_gemm64_fp8",
-            (WeightKind::Bf16, true) => "kernel_flux2_gemm64_bf16",
-            (WeightKind::F32, true) => "kernel_flux2_gemm64_f32",
-            (WeightKind::Fp8, false) => "kernel_flux2_gemm_fp8",
-            (WeightKind::Bf16, false) => "kernel_flux2_gemm_bf16",
-            (WeightKind::F32, false) => "kernel_flux2_gemm_f32",
+        let entry = match (lw.kind, tiled) {
+            (WeightKind::Fp8, true) => "kernel_dit_gemm64_fp8",
+            (WeightKind::Bf16, true) => "kernel_dit_gemm64_bf16",
+            (WeightKind::F32, true) => "kernel_dit_gemm64_f32",
+            (WeightKind::Int8Row, true) => "kernel_dit_gemm64_i8",
+            (WeightKind::Fp8, false) => "kernel_dit_gemm_fp8",
+            (WeightKind::Bf16, false) => "kernel_dit_gemm_bf16",
+            (WeightKind::F32, false) => "kernel_dit_gemm_f32",
+            (WeightKind::Int8Row, false) => "kernel_dit_gemm_i8",
         };
         let (grid, block) = if tiled {
             (
@@ -1113,9 +1334,9 @@ impl Ops {
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(call.out),
-                KernelArg::Buffer(call.input),
-                KernelArg::Buffer(call.weight),
-                KernelArg::F32(call.weight_scale),
+                KernelArg::Buffer(input),
+                KernelArg::Buffer(lw.w),
+                scale_arg,
                 KernelArg::Buffer(bias),
             ],
         )
@@ -1144,6 +1365,29 @@ impl Ops {
                 call.step
             )));
         }
+        let lw = &call.weight;
+        let scale_arg = scale_binding(call.step, lw)?;
+        // A rotated weight takes the formed row rotated: the rotation pass
+        // forms `[dense | swiglu]` itself and writes it packed, and the fused
+        // tile then reads that as a dense-only row. The group divides k, so
+        // the shape always suits the tile.
+        let rotated;
+        let (dense, dense_cols, swiglu, inner) = match lw.rotate {
+            Some(group) => {
+                rotated = self.alloc_f32(call.step, call.m * k)?;
+                self.rotate(&RotateCall {
+                    step: call.step,
+                    out: rotated.view(),
+                    dense: call.dense,
+                    dense_cols,
+                    swiglu: call.swiglu,
+                    rows: call.m,
+                    group,
+                })?;
+                (Some(rotated.view()), k, None, 0)
+            }
+            None => (call.dense, dense_cols, call.swiglu, inner),
+        };
         if !dense_cols.is_multiple_of(4) || !inner.is_multiple_of(4) || !k.is_multiple_of(G64_K) {
             return self.linear_residual_unfused(call, dense_cols, inner);
         }
@@ -1152,14 +1396,15 @@ impl Ops {
             n: call.n as u32,
             cols_a: dense_cols as u32,
             inner: inner as u32,
-            gu_stride: call.swiglu.map_or(0, |s| s.stride) as u32,
-            gu_offset: call.swiglu.map_or(0, |s| s.offset) as u32,
-            has_bias: u32::from(call.bias.is_some()),
+            gu_stride: swiglu.map_or(0, |s| s.stride) as u32,
+            gu_offset: swiglu.map_or(0, |s| s.offset) as u32,
+            has_bias: u32::from(lw.bias.is_some()),
         };
-        let entry = match call.kind {
-            WeightKind::Fp8 => "kernel_flux2_gemm64_fused_fp8",
-            WeightKind::Bf16 => "kernel_flux2_gemm64_fused_bf16",
-            WeightKind::F32 => "kernel_flux2_gemm64_fused_f32",
+        let entry = match lw.kind {
+            WeightKind::Fp8 => "kernel_dit_gemm64_fused_fp8",
+            WeightKind::Bf16 => "kernel_dit_gemm64_fused_bf16",
+            WeightKind::F32 => "kernel_dit_gemm64_fused_f32",
+            WeightKind::Int8Row => "kernel_dit_gemm64_fused_i8",
         };
         self.launch(
             call.step,
@@ -1173,11 +1418,11 @@ impl Ops {
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(call.residual),
-                KernelArg::Buffer(call.dense.unwrap_or(self.dummy.view())),
-                KernelArg::Buffer(call.swiglu.map_or(self.dummy.view(), |s| s.rows)),
-                KernelArg::Buffer(call.weight),
-                KernelArg::F32(call.weight_scale),
-                KernelArg::Buffer(call.bias.unwrap_or(self.dummy.view())),
+                KernelArg::Buffer(dense.unwrap_or(self.dummy.view())),
+                KernelArg::Buffer(swiglu.map_or(self.dummy.view(), |s| s.rows)),
+                KernelArg::Buffer(lw.w),
+                scale_arg,
+                KernelArg::Buffer(lw.bias.unwrap_or(self.dummy.view())),
                 KernelArg::Buffer(call.gate),
             ],
         )
@@ -1231,13 +1476,13 @@ impl Ops {
             step: call.step,
             out: tmp.view(),
             input,
+            // Only an unrotated linear reaches the separate passes (a rotated
+            // one always suits the fused tile), so the weight is passed on
+            // whole and its rotation, were there one, would still run.
             weight: call.weight,
-            weight_scale: call.weight_scale,
-            bias: call.bias,
             m,
             n: call.n,
             k: dense_cols + inner,
-            kind: call.kind,
         })?;
         self.add_gated(&AddGatedCall {
             step: call.step,
@@ -1250,6 +1495,51 @@ impl Ops {
         })
     }
 
+    /// `out[r] = rot([dense | swiglu][r])`, each 256-wide group of the row
+    /// multiplied by `H` (see [`RotateCall`]).
+    ///
+    /// # Errors
+    /// [`ImageGenError::Backend`] when the row width is not a whole number of
+    /// groups, or the launch fails.
+    pub(crate) fn rotate(&self, call: &RotateCall<'_>) -> Result<(), ImageGenError> {
+        let dense_cols = if call.dense.is_some() {
+            call.dense_cols
+        } else {
+            0
+        };
+        let inner = call.swiglu.map_or(0, |s| s.inner);
+        let width = dense_cols + inner;
+        let group = call.group.width();
+        if width == 0 || !width.is_multiple_of(group) {
+            return Err(ImageGenError::Backend(format!(
+                "{}: a {width}-wide row is not a whole number of {group}-wide rotation groups",
+                call.step
+            )));
+        }
+        let entry = match call.group {
+            RotGroup::Hadamard256 => "kernel_dit_hadamard256_f32",
+        };
+        let args = HadamardArgs {
+            rows: call.rows as u32,
+            cols_a: dense_cols as u32,
+            inner: inner as u32,
+            gu_stride: call.swiglu.map_or(0, |s| s.stride) as u32,
+            gu_offset: call.swiglu.map_or(0, |s| s.offset) as u32,
+        };
+        self.launch(
+            call.step,
+            entry,
+            Extent3::new((width / group) as u32, call.rows as u32, 1),
+            Extent3::linear(ROT_THREADS),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.out),
+                KernelArg::Buffer(call.dense.unwrap_or(self.dummy.view())),
+                KernelArg::Buffer(call.swiglu.map_or(self.dummy.view(), |s| s.rows)),
+            ],
+        )
+    }
+
     /// `RMSNorm` each row: out = x * rsqrt(mean(x^2) + eps) * weight.
     pub(crate) fn rmsnorm(&self, call: &NormCall<'_>) -> Result<(), ImageGenError> {
         let args = NormArgs {
@@ -1259,7 +1549,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_rmsnorm_f32",
+            "kernel_dit_rmsnorm_f32",
             Extent3::linear(call.rows as u32),
             Extent3::linear(BLOCK),
             &[
@@ -1284,7 +1574,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_layer_norm_f32",
+            "kernel_dit_layer_norm_f32",
             Extent3::linear(call.rows as u32),
             Extent3::linear(BLOCK),
             &[
@@ -1308,7 +1598,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_qk_norm_f32",
+            "kernel_dit_qk_norm_f32",
             Extent3::new(call.tokens as u32, call.heads as u32, 1),
             Extent3::linear(BLOCK),
             &[
@@ -1316,6 +1606,40 @@ impl Ops {
                 KernelArg::Buffer(call.qkv),
                 KernelArg::Buffer(call.q_scale),
                 KernelArg::Buffer(call.k_scale),
+            ],
+        )
+    }
+
+    /// QK-norm then table `RoPE` on separate q and k buffers, in place (see
+    /// [`QkNormRopeCall`]).
+    pub(crate) fn qk_norm_rope(&self, call: &QkNormRopeCall<'_>) -> Result<(), ImageGenError> {
+        if !call.head_dim.is_multiple_of(2) {
+            return Err(ImageGenError::Backend(format!(
+                "{}: a {}-wide head has no whole rotation pairs",
+                call.step, call.head_dim
+            )));
+        }
+        let args = QkNormRopeArgs {
+            tokens: call.tokens as u32,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+            q_stride: call.q_stride as u32,
+            k_stride: call.k_stride as u32,
+            eps: call.eps,
+        };
+        self.launch(
+            call.step,
+            "kernel_dit_qk_norm_rope_f32",
+            Extent3::new(call.tokens as u32, call.heads as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.q),
+                KernelArg::Buffer(call.k),
+                KernelArg::Buffer(call.q_scale),
+                KernelArg::Buffer(call.k_scale),
+                KernelArg::Buffer(call.cos),
+                KernelArg::Buffer(call.sin),
             ],
         )
     }
@@ -1329,7 +1653,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_concat_rows_f32",
+            "kernel_dit_concat_rows_f32",
             Extent3::linear(call.rows as u32),
             Extent3::linear(BLOCK),
             &[
@@ -1375,15 +1699,26 @@ impl Ops {
         let rows = (call.txt_tokens + call.img_tokens) as u32;
         // The fused kernel holds a head as 8x8 fragments in registers; the
         // transformer's 128-wide heads qualify, the VAE's 512-wide one does not.
-        let (entry, grid, block) = if call.head_dim.is_multiple_of(8) && call.head_dim <= FA_MAX_D {
+        let flash = call.head_dim.is_multiple_of(8) && call.head_dim <= FA_MAX_D;
+        if call.causal && (call.cache_tokens > 0 || !flash) {
+            return Err(ImageGenError::Backend(format!(
+                "{}: causal attention takes no cached rows and needs a head of at most {FA_MAX_D} in multiples of 8 (got {} cached rows, head {})",
+                call.step, call.cache_tokens, call.head_dim
+            )));
+        }
+        let (entry, grid, block) = if flash {
             (
-                "kernel_flux2_flash_sdpa_f32",
+                if call.causal {
+                    "kernel_dit_flash_sdpa_causal_f32"
+                } else {
+                    "kernel_dit_flash_sdpa_f32"
+                },
                 Extent3::new(grid_for(rows, FA_QROWS), call.heads as u32, 1),
                 Extent3::linear(FA_THREADS),
             )
         } else {
             (
-                "kernel_flux2_sdpa_f32",
+                "kernel_dit_sdpa_f32",
                 Extent3::new(rows, call.heads as u32, 1),
                 Extent3::linear(BLOCK),
             )
@@ -1415,6 +1750,10 @@ impl Ops {
     #[expect(
         clippy::cast_precision_loss,
         reason = "dimensions converted for attention math are small tensor extents, far below f32's exact-integer range"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the oracle's one straight-line pass over every row, head and key, kept whole so it reads against the kernel"
     )]
     pub(crate) fn sdpa_host(&self, call: &SdpaCall<'_>) -> Result<(), ImageGenError> {
         let txt = call.txt_tokens;
@@ -1460,7 +1799,13 @@ impl Ops {
                     (&q_img, (t - txt) * call.img_stride + call.q_offset + h * hd)
                 };
                 let mut scores = Vec::with_capacity(txt + img + call.cache_tokens);
+                // A causal key past the query's own row scores -inf, which
+                // the max-subtracted exponent turns into an exact zero.
                 for s in 0..(txt + img) {
+                    if call.causal && s > t {
+                        scores.push(f32::NEG_INFINITY);
+                        continue;
+                    }
                     let (ksrc, krow) = if s < txt {
                         (&k_txt, s * call.txt_stride + call.k_offset + h * hd)
                     } else {
@@ -1534,7 +1879,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_gqa_f32",
+            "kernel_dit_gqa_f32",
             Extent3::new(call.tokens as u32, call.q_heads as u32, 1),
             Extent3::linear(BLOCK),
             &[
@@ -1561,7 +1906,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_rope_4d",
+            "kernel_dit_rope_4d",
             Extent3::new(call.tokens as u32, call.heads as u32, 1),
             Extent3::linear(BLOCK),
             &[
@@ -1611,7 +1956,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_rope_half",
+            "kernel_dit_rope_half",
             Extent3::new(tokens as u32, heads as u32, 1),
             Extent3::linear(BLOCK),
             &[
@@ -1643,7 +1988,7 @@ impl Ops {
         // a multiple of 16 of them, and the per-pixel kernel keeps the rest.
         let (entry, grid, block) = if (call.in_c * call.k_h * call.k_w).is_multiple_of(G64_K) {
             (
-                "kernel_flux2_conv2d_gemm_f32",
+                "kernel_dit_conv2d_gemm_f32",
                 Extent3::new(
                     grid_for(call.out_c as u32, G64_TILE),
                     grid_for((call.out_h * call.out_w) as u32, G64_TILE),
@@ -1653,7 +1998,7 @@ impl Ops {
             )
         } else {
             (
-                "kernel_flux2_conv2d_f32",
+                "kernel_dit_conv2d_f32",
                 Extent3::new(
                     call.out_w as u32,
                     call.out_c as u32,
@@ -1694,7 +2039,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_softmax_rows_f32",
+            "kernel_dit_softmax_rows_f32",
             Extent3::linear(rows as u32),
             Extent3::linear(BLOCK),
             &[
@@ -1722,7 +2067,7 @@ impl Ops {
         let grid = Extent3::new(groups as u32, chunks as u32, 1);
         self.launch(
             call.step,
-            "kernel_flux2_group_norm_stats_f32",
+            "kernel_dit_group_norm_stats_f32",
             grid,
             Extent3::linear(BLOCK),
             &[
@@ -1733,7 +2078,7 @@ impl Ops {
         )?;
         self.launch(
             call.step,
-            "kernel_flux2_group_norm_apply_f32",
+            "kernel_dit_group_norm_apply_f32",
             grid,
             Extent3::linear(BLOCK),
             &[
@@ -1767,7 +2112,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_upsample_nearest_f32",
+            "kernel_dit_upsample_nearest_f32",
             Extent3::new(w as u32, h as u32, (batch * channels) as u32),
             Extent3::linear(BLOCK),
             &[
@@ -1794,7 +2139,7 @@ impl Ops {
         };
         self.launch(
             step,
-            "kernel_flux2_transpose_f32",
+            "kernel_dit_transpose_f32",
             Extent3::linear(grid_for((rows * cols) as u32, BLOCK)),
             Extent3::linear(BLOCK),
             &[
@@ -1813,7 +2158,7 @@ impl Ops {
         };
         self.launch(
             call.step,
-            "kernel_flux2_embed_bf16_f32",
+            "kernel_dit_embed_bf16_f32",
             Extent3::new(call.tokens as u32, grid_for(call.hidden as u32, BLOCK), 1),
             Extent3::linear(BLOCK),
             &[
@@ -1826,7 +2171,7 @@ impl Ops {
     }
 }
 
-/// Host twin of `kernel_flux2_rope_4d`: interleaved pairs within each axis,
+/// Host twin of `kernel_dit_rope_4d`: interleaved pairs within each axis,
 /// rotated in place on the `heads * head_dim` head section that starts
 /// `section_offset` elements into each row (the q or k section of a fused
 /// qkv row, or offset 0 of a packed tensor).

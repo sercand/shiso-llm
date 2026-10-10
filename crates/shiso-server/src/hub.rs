@@ -190,6 +190,9 @@ fn check_component_flag_conflicts(args: &ServeArgs, ref_str: &str) -> anyhow::Re
         || args.diarization_model.is_some()
         || args.image_model.is_some()
         || args.image_assets_dir.is_some()
+        || args.image_text_encoder.is_some()
+        || args.image_vae.is_some()
+        || args.image_tokenizer.is_some()
     {
         bail!("cannot pass component flags together with model reference '{ref_str}'");
     }
@@ -276,6 +279,9 @@ fn populate_serve_args_from_variant(
             Role::Ngram => args.ngram = Some(target_path),
             Role::Image => args.image_model = Some(target_path),
             Role::ImageAssets => args.image_assets_dir = Some(target_path),
+            Role::ImageTextEncoder => args.image_text_encoder = Some(target_path),
+            Role::ImageVae => args.image_vae = Some(target_path),
+            Role::ImageTokenizer => args.image_tokenizer = Some(target_path),
         }
     }
 
@@ -881,6 +887,64 @@ mod tests {
             args.draft_vocab,
             Some(vdir.join("draft_vocab").join("draft_vocab_counts.txt"))
         );
+    }
+
+    /// Files bound to `image_text_encoder`, `image_vae` and
+    /// `image_tokenizer` reach their own flags as paths inside the component
+    /// that downloads them.
+    #[test]
+    fn image_variant_routes_bound_text_encoder_vae_and_tokenizer() {
+        let recipe: Recipe = serde_json::from_str(
+            r#"{
+              "schema_version": 1, "name": "qwen-test", "family": "flux2",
+              "min_shiso_version": "0.1.0", "description": "x",
+              "tasks": ["image_generation"], "features": {},
+              "modalities": {"inputs": ["text"], "outputs": ["image"]},
+              "variants": [{
+                "key": "fp8", "backends": ["metal"], "quant": "fp8",
+                "requirements": {"min_ram_bytes": 1, "disk_bytes": 40},
+                "components": {
+                  "image": {"provider": "huggingface", "repo": "o/split",
+                    "revision": "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c",
+                    "entry": "dit.safetensors",
+                    "files": [
+                      {"name": "dit.safetensors", "size": 10,
+                       "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"},
+                      {"name": "te.safetensors", "size": 10, "binds": "image_text_encoder",
+                       "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"},
+                      {"name": "vae.safetensors", "size": 10, "binds": "image_vae",
+                       "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"},
+                      {"name": "tokenizer.json", "size": 10, "binds": "image_tokenizer",
+                       "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]}
+                }
+              }]
+            }"#,
+        )
+        .expect("recipe parses");
+        validate_recipe(&recipe, ValidationMode::Strict).expect("recipe validates");
+        let matches = Cli::command().get_matches_from(["shiso", "serve"]);
+        let serve = matches.subcommand_matches("serve").expect("serve");
+        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
+        let vdir = Path::new("/hub/models/qwen-test/fp8");
+        populate_serve_args_from_variant(&mut args, vdir, &recipe.variants[0], &recipe.name)
+            .expect("populates");
+        assert_eq!(
+            args.image_model,
+            Some(vdir.join("image").join("dit.safetensors"))
+        );
+        assert_eq!(
+            args.image_text_encoder,
+            Some(vdir.join("image").join("te.safetensors"))
+        );
+        assert_eq!(
+            args.image_vae,
+            Some(vdir.join("image").join("vae.safetensors"))
+        );
+        assert_eq!(
+            args.image_tokenizer,
+            Some(vdir.join("image").join("tokenizer.json"))
+        );
+        assert_eq!(args.image_assets_dir, None);
     }
 
     /// An image variant hands its checkpoint file to `--image-model`, its

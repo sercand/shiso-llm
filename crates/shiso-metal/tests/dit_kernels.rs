@@ -1,6 +1,6 @@
-//! Metal's run of the flux2 kernel pack.
+//! Metal's run of the diffusion kernel pack.
 //!
-//! Every entry point the flux2 driver (`shiso-models/src/flux2/ops.rs`)
+//! Every entry point the diffusion driver (`shiso-models/src/diffusion/ops.rs`)
 //! launches is exercised here against expected values computed independently
 //! in this file - the host twins are never called, so a kernel and its twin
 //! cannot agree on the same mistake. The launch geometry, argument structs
@@ -26,10 +26,12 @@ use half::bf16;
 use shiso_core::{
     Backend, DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs, alloc,
 };
+use shiso_kerneltest::Gpu;
+use shiso_kerneltest::diffusion::{int8, prefix, vae};
 use shiso_metal::MetalBackend;
 
-/// The module every flux2 entry lives under.
-const MODULE: &str = "flux2";
+/// The module every diffusion entry lives under.
+const MODULE: &str = "diffusion";
 /// Threads per elementwise threadgroup, as the driver launches it.
 const BLOCK: u32 = 64;
 /// Tile edge of the GEMM kernels, as the driver launches it.
@@ -45,39 +47,51 @@ const FA_THREADS: u32 = 128;
 
 /// Every entry point the driver launches, per the Task-3 contract table.
 const ENTRIES: &[&str] = &[
-    "kernel_flux2_gemm_bf16",
-    "kernel_flux2_gemm_fp8",
-    "kernel_flux2_gemm_f32",
-    "kernel_flux2_silu_f32",
-    "kernel_flux2_swiglu_f32",
-    "kernel_flux2_swiglu2_f32",
-    "kernel_flux2_modulate_f32",
-    "kernel_flux2_add_gated_f32",
-    "kernel_flux2_add_f32",
-    "kernel_flux2_axpy_f32",
-    "kernel_flux2_layer_norm_f32",
-    "kernel_flux2_rmsnorm_f32",
-    "kernel_flux2_qk_norm_f32",
-    "kernel_flux2_concat_rows_f32",
-    "kernel_flux2_sdpa_f32",
-    "kernel_flux2_gqa_f32",
-    "kernel_flux2_rope_4d",
-    "kernel_flux2_rope_half",
-    "kernel_flux2_conv2d_f32",
-    "kernel_flux2_group_norm_stats_f32",
-    "kernel_flux2_group_norm_apply_f32",
-    "kernel_flux2_softmax_rows_f32",
-    "kernel_flux2_upsample_nearest_f32",
-    "kernel_flux2_transpose_f32",
-    "kernel_flux2_embed_bf16_f32",
-    "kernel_flux2_gemm64_f32",
-    "kernel_flux2_gemm64_bf16",
-    "kernel_flux2_gemm64_fp8",
-    "kernel_flux2_conv2d_gemm_f32",
-    "kernel_flux2_flash_sdpa_f32",
-    "kernel_flux2_gemm64_fused_f32",
-    "kernel_flux2_gemm64_fused_bf16",
-    "kernel_flux2_gemm64_fused_fp8",
+    "kernel_dit_gemm_bf16",
+    "kernel_dit_gemm_fp8",
+    "kernel_dit_gemm_f32",
+    "kernel_dit_silu_f32",
+    "kernel_dit_swiglu_f32",
+    "kernel_dit_swiglu2_f32",
+    "kernel_dit_modulate_f32",
+    "kernel_dit_add_gated_f32",
+    "kernel_dit_add_f32",
+    "kernel_dit_axpy_f32",
+    "kernel_dit_layer_norm_f32",
+    "kernel_dit_tanh_f32",
+    "kernel_dit_gelu_tanh_f32",
+    "kernel_dit_qk_norm_rope_f32",
+    "kernel_dit_flash_sdpa_causal_f32",
+    "kernel_dit_rmsnorm_f32",
+    "kernel_dit_qk_norm_f32",
+    "kernel_dit_concat_rows_f32",
+    "kernel_dit_sdpa_f32",
+    "kernel_dit_gqa_f32",
+    "kernel_dit_rope_4d",
+    "kernel_dit_rope_half",
+    "kernel_dit_conv2d_f32",
+    "kernel_dit_group_norm_stats_f32",
+    "kernel_dit_group_norm_apply_f32",
+    "kernel_dit_softmax_rows_f32",
+    "kernel_dit_upsample_nearest_f32",
+    "kernel_dit_transpose_f32",
+    "kernel_dit_embed_bf16_f32",
+    "kernel_dit_gemm64_f32",
+    "kernel_dit_gemm64_bf16",
+    "kernel_dit_gemm64_fp8",
+    "kernel_dit_conv2d_gemm_f32",
+    "kernel_dit_flash_sdpa_f32",
+    "kernel_dit_gemm64_fused_f32",
+    "kernel_dit_gemm64_fused_bf16",
+    "kernel_dit_gemm64_fused_fp8",
+    "kernel_dit_gemm_i8",
+    "kernel_dit_gemm64_i8",
+    "kernel_dit_gemm64_fused_i8",
+    "kernel_dit_hadamard256_f32",
+    "kernel_dit_channel_rms_inv_f32",
+    "kernel_dit_conv2d_rms_gemm_f32",
+    "kernel_dit_conv2d_up2_gemm_f32",
+    "kernel_dit_dup_up_add_f32",
 ];
 
 // --- argument blocks: byte-for-byte the driver's `#[repr(C)]` Pods ---------
@@ -262,7 +276,7 @@ struct EmbedArgs {
 )]
 fn open() -> Option<Arc<dyn Backend>> {
     if !shiso_metal::metal_available() {
-        eprintln!("note: no Metal device on this machine, skipping the flux2 GPU cases");
+        eprintln!("note: no Metal device on this machine, skipping the diffusion GPU cases");
         return None;
     }
     let metal = MetalBackend::new().expect("the embedded kernel library compiles");
@@ -388,7 +402,7 @@ fn assert_differs(a: &[f32], b: &[f32], what: &str) {
     clippy::print_stderr,
     reason = "a machine with no Metal device skips rather than fails, and the reason belongs on stderr"
 )]
-fn every_flux2_entry_point_resolves_as_a_pipeline() {
+fn every_dit_entry_point_resolves_as_a_pipeline() {
     if !shiso_metal::metal_available() {
         eprintln!("note: no Metal device on this machine, skipping the pipeline check");
         return;
@@ -402,7 +416,7 @@ fn every_flux2_entry_point_resolves_as_a_pipeline() {
 }
 
 /// The driver decides kernel-vs-host by probing `module_entries` for a name
-/// containing `kernel_flux2_gemm_bf16` (`ops.rs::Ops::new`). Metal's table
+/// containing `kernel_dit_gemm_bf16` (`ops.rs::Ops::new`). Metal's table
 /// lists CUDA-style mangled names only, so the registration must carry one
 /// or the whole kernel pack is dead code behind the host fallback.
 #[test]
@@ -410,7 +424,7 @@ fn every_flux2_entry_point_resolves_as_a_pipeline() {
     clippy::print_stderr,
     reason = "a machine with no Metal device skips rather than fails, and the reason belongs on stderr"
 )]
-fn the_driver_probe_finds_the_flux2_kernel_set() {
+fn the_driver_probe_finds_the_diffusion_kernel_set() {
     if !shiso_metal::metal_available() {
         eprintln!("note: no Metal device on this machine, skipping the probe check");
         return;
@@ -420,7 +434,7 @@ fn the_driver_probe_finds_the_flux2_kernel_set() {
     assert!(
         entries
             .iter()
-            .any(|name| name.contains("kernel_flux2_gemm_bf16")),
+            .any(|name| name.contains("kernel_dit_gemm_bf16")),
         "the driver's probe would fall back to the host path: {entries:?}"
     );
 }
@@ -517,7 +531,7 @@ fn gemm_bf16_is_the_transposed_product_scaled_and_biased() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_bf16",
+            entry: "kernel_dit_gemm_bf16",
             weight: wbuf.view(),
             scale,
             bias: bias_buf.view(),
@@ -550,7 +564,7 @@ fn gemm_bf16_treats_the_zero_bias_stand_in_as_no_bias() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_bf16",
+            entry: "kernel_dit_gemm_bf16",
             weight: wbuf.view(),
             scale: 1.0,
             bias: stand_in.view(),
@@ -589,7 +603,7 @@ fn gemm_bf16_applies_a_real_bias_whose_first_word_is_negative_zero() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_bf16",
+            entry: "kernel_dit_gemm_bf16",
             weight: wbuf.view(),
             scale: 1.0,
             bias: bias_buf.view(),
@@ -628,7 +642,7 @@ fn gemm_bf16_applies_a_real_bias_whose_first_word_is_positive_zero() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_bf16",
+            entry: "kernel_dit_gemm_bf16",
             weight: wbuf.view(),
             scale: 1.0,
             bias: bias_buf.view(),
@@ -668,7 +682,7 @@ fn gemm_bf16_ignores_the_bias_binding_when_the_flag_is_clear() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_bf16",
+            entry: "kernel_dit_gemm_bf16",
             weight: wbuf.view(),
             scale: 1.0,
             bias: bias_buf.view(),
@@ -713,7 +727,7 @@ fn gemm_fp8_decodes_e4m3_bytes_and_scales_the_accumulator() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_fp8",
+            entry: "kernel_dit_gemm_fp8",
             weight: wbuf.view(),
             scale,
             bias: bias_buf.view(),
@@ -746,7 +760,7 @@ fn gemm_f32_is_the_transposed_product() {
     let got = run_gemm(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm_f32",
+            entry: "kernel_dit_gemm_f32",
             weight: wbuf.view(),
             scale: 1.0,
             bias: bias_buf.view(),
@@ -772,7 +786,7 @@ fn silu_matches_the_sigmoid_product() {
     };
     launch(
         &b,
-        "kernel_flux2_silu_f32",
+        "kernel_dit_silu_f32",
         Extent3::linear(grid_for(x.len() as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -800,7 +814,7 @@ fn swiglu_gates_the_first_half_of_strided_rows() {
     };
     launch(
         &b,
-        "kernel_flux2_swiglu_f32",
+        "kernel_dit_swiglu_f32",
         Extent3::new(grid_for(inner as u32, BLOCK), rows as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -853,7 +867,7 @@ fn swiglu_reads_a_view_that_starts_mid_row() {
     };
     launch(
         &b,
-        "kernel_flux2_swiglu_f32",
+        "kernel_dit_swiglu_f32",
         Extent3::new(grid_for(inner as u32, BLOCK), rows as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -885,7 +899,7 @@ fn swiglu2_is_silu_of_a_times_b() {
     };
     launch(
         &b,
-        "kernel_flux2_swiglu2_f32",
+        "kernel_dit_swiglu2_f32",
         Extent3::linear(grid_for(a.len() as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -917,7 +931,7 @@ fn modulate_broadcasts_scale_and_shift_over_the_period() {
     };
     launch(
         &b,
-        "kernel_flux2_modulate_f32",
+        "kernel_dit_modulate_f32",
         Extent3::linear(grid_for(count as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -952,7 +966,7 @@ fn add_gated_is_a_plus_the_broadcast_gate_times_b() {
     };
     launch(
         &b,
-        "kernel_flux2_add_gated_f32",
+        "kernel_dit_add_gated_f32",
         Extent3::linear(grid_for(count as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -981,7 +995,7 @@ fn add_is_the_elementwise_sum() {
     };
     launch(
         &b,
-        "kernel_flux2_add_f32",
+        "kernel_dit_add_f32",
         Extent3::linear(grid_for(a.len() as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -1011,7 +1025,7 @@ fn axpy_adds_dt_times_v() {
     };
     launch(
         &b,
-        "kernel_flux2_axpy_f32",
+        "kernel_dit_axpy_f32",
         Extent3::linear(grid_for(x.len() as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -1042,7 +1056,7 @@ fn layer_norm_subtracts_the_mean_and_divides_by_the_deviation() {
     };
     launch(
         &b,
-        "kernel_flux2_layer_norm_f32",
+        "kernel_dit_layer_norm_f32",
         Extent3::linear(rows as u32),
         Extent3::linear(BLOCK),
         &[
@@ -1092,7 +1106,7 @@ fn rmsnorm_scales_the_normalized_row_by_the_weight() {
     };
     launch(
         &b,
-        "kernel_flux2_rmsnorm_f32",
+        "kernel_dit_rmsnorm_f32",
         Extent3::linear(rows as u32),
         Extent3::linear(BLOCK),
         &[
@@ -1138,7 +1152,7 @@ fn qk_norm_normalizes_the_q_and_k_sections_and_leaves_v() {
     };
     launch(
         &b,
-        "kernel_flux2_qk_norm_f32",
+        "kernel_dit_qk_norm_f32",
         Extent3::new(tokens as u32, heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1194,7 +1208,7 @@ fn concat_rows_joins_the_two_row_blocks() {
     };
     launch(
         &b,
-        "kernel_flux2_concat_rows_f32",
+        "kernel_dit_concat_rows_f32",
         Extent3::linear(rows as u32),
         Extent3::linear(BLOCK),
         &[
@@ -1332,7 +1346,7 @@ fn run_sdpa(b: &Arc<dyn Backend>, c: &Joint<'_>) -> (Vec<f32>, Vec<f32>) {
     };
     launch(
         b,
-        "kernel_flux2_sdpa_f32",
+        "kernel_dit_sdpa_f32",
         Extent3::new((c.txt + c.img) as u32, c.heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1571,7 +1585,7 @@ fn gqa_is_causal_grouped_attention() {
     };
     launch(
         &b,
-        "kernel_flux2_gqa_f32",
+        "kernel_dit_gqa_f32",
         Extent3::new(tokens as u32, q_heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1677,7 +1691,7 @@ fn rope_4d_rotates_each_fused_section_exactly_once() {
     };
     launch(
         &b,
-        "kernel_flux2_rope_4d",
+        "kernel_dit_rope_4d",
         Extent3::new(tokens as u32, heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1749,7 +1763,7 @@ fn rope_4d_rotates_packed_operands_with_several_frequencies() {
     };
     launch(
         &b,
-        "kernel_flux2_rope_4d",
+        "kernel_dit_rope_4d",
         Extent3::new(tokens as u32, heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1800,7 +1814,7 @@ fn rope_half_rotates_pairs_across_the_halves() {
     };
     launch(
         &b,
-        "kernel_flux2_rope_half",
+        "kernel_dit_rope_half",
         Extent3::new(tokens as u32, heads as u32, 1),
         Extent3::linear(BLOCK),
         &[
@@ -1918,7 +1932,7 @@ fn conv2d_matches_the_padded_and_the_strided_sum() {
         };
         launch(
             b,
-            "kernel_flux2_conv2d_f32",
+            "kernel_dit_conv2d_f32",
             Extent3::new(
                 case.out_w as u32,
                 case.out_c as u32,
@@ -2011,7 +2025,7 @@ fn conv2d_bias_case(
     };
     launch(
         b,
-        "kernel_flux2_conv2d_f32",
+        "kernel_dit_conv2d_f32",
         Extent3::new(2, 2, 2),
         Extent3::linear(BLOCK),
         &[
@@ -2145,7 +2159,7 @@ fn group_norm_normalizes_each_group_and_affines_by_channel() {
         let grid = Extent3::new((batch * groups) as u32, chunks as u32, 1);
         launch(
             &b,
-            "kernel_flux2_group_norm_stats_f32",
+            "kernel_dit_group_norm_stats_f32",
             grid,
             Extent3::linear(BLOCK),
             &[
@@ -2156,7 +2170,7 @@ fn group_norm_normalizes_each_group_and_affines_by_channel() {
         );
         launch(
             &b,
-            "kernel_flux2_group_norm_apply_f32",
+            "kernel_dit_group_norm_apply_f32",
             grid,
             Extent3::linear(BLOCK),
             &[
@@ -2195,7 +2209,7 @@ fn softmax_rows_normalizes_each_scaled_row_in_place() {
     };
     launch(
         &b,
-        "kernel_flux2_softmax_rows_f32",
+        "kernel_dit_softmax_rows_f32",
         Extent3::linear(rows as u32),
         Extent3::linear(BLOCK),
         &[
@@ -2233,7 +2247,7 @@ fn upsample_nearest_doubles_the_field() {
     };
     launch(
         &b,
-        "kernel_flux2_upsample_nearest_f32",
+        "kernel_dit_upsample_nearest_f32",
         Extent3::new(w as u32, h as u32, (batch * channels) as u32),
         Extent3::linear(BLOCK),
         &[
@@ -2277,7 +2291,7 @@ fn transpose_swaps_the_two_axes() {
     };
     launch(
         &b,
-        "kernel_flux2_transpose_f32",
+        "kernel_dit_transpose_f32",
         Extent3::linear(grid_for((rows * cols) as u32, BLOCK)),
         Extent3::linear(BLOCK),
         &[
@@ -2319,7 +2333,7 @@ fn embed_gathers_bf16_table_rows_as_f32() {
     };
     launch(
         &b,
-        "kernel_flux2_embed_bf16_f32",
+        "kernel_dit_embed_bf16_f32",
         Extent3::new(tokens as u32, grid_for(hidden as u32, BLOCK), 1),
         Extent3::linear(BLOCK),
         &[
@@ -2390,7 +2404,7 @@ fn gemm64_f32_matches_the_transposed_product_on_ragged_tiles() {
     let got = run_gemm64(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm64_f32",
+            entry: "kernel_dit_gemm64_f32",
             weight: w_buf.view(),
             scale: 1.0,
             bias: bias_buf.view(),
@@ -2420,7 +2434,7 @@ fn gemm64_bf16_widens_the_weight_and_skips_an_unflagged_bias() {
     let got = run_gemm64(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm64_bf16",
+            entry: "kernel_dit_gemm64_bf16",
             weight: w_buf.view(),
             scale: 0.5,
             bias: stand_in.view(),
@@ -2453,7 +2467,7 @@ fn gemm64_fp8_decodes_every_e4m3_byte_and_scales_the_accumulator() {
     let got = run_gemm64(
         &b,
         GemmRun {
-            entry: "kernel_flux2_gemm64_fp8",
+            entry: "kernel_dit_gemm64_fp8",
             weight: w_buf.view(),
             scale: 0.25,
             bias: bias_buf.view(),
@@ -2565,7 +2579,7 @@ fn run_conv_gemm(b: &Arc<dyn Backend>, c: &ConvCase, seed: usize) -> (Vec<f32>, 
     };
     launch(
         b,
-        "kernel_flux2_conv2d_gemm_f32",
+        "kernel_dit_conv2d_gemm_f32",
         Extent3::new(
             grid_for(c.out_c as u32, G64_TILE),
             grid_for((oh * ow) as u32, G64_TILE),
@@ -2671,7 +2685,7 @@ fn run_flash(b: &Arc<dyn Backend>, c: &Joint<'_>) -> (Vec<f32>, Vec<f32>) {
     kargs.extend(bufs.iter().map(|buf| KernelArg::Buffer(buf.view())));
     launch(
         b,
-        "kernel_flux2_flash_sdpa_f32",
+        "kernel_dit_flash_sdpa_f32",
         Extent3::new(
             grid_for((c.txt + c.img) as u32, FA_QROWS),
             c.heads as u32,
@@ -2812,7 +2826,7 @@ fn run_flash_joint(b: &Arc<dyn Backend>, c: &Joint<'_>) -> Vec<f32> {
     };
     launch(
         b,
-        "kernel_flux2_flash_sdpa_f32",
+        "kernel_dit_flash_sdpa_f32",
         Extent3::new(grid_for(c.txt as u32, FA_QROWS), c.heads as u32, 1),
         Extent3::linear(FA_THREADS),
         &[
@@ -2893,7 +2907,7 @@ fn flash_sdpa_and_gemm64_are_bit_identical_across_runs_at_model_sizes() {
         run_gemm64(
             &b,
             GemmRun {
-                entry: "kernel_flux2_gemm64_f32",
+                entry: "kernel_dit_gemm64_f32",
                 weight: w_buf.view(),
                 scale: 1.0,
                 bias: stand_in.view(),
@@ -3030,7 +3044,7 @@ fn gemm64_fused_reads_dense_then_swiglu_columns_and_adds_the_gated_residual() {
         gu_offset,
     };
     let w_buf = upload_f32(&b, &weight);
-    let got = run_fused(&b, &case, "kernel_flux2_gemm64_fused_f32", w_buf.view());
+    let got = run_fused(&b, &case, "kernel_dit_gemm64_fused_f32", w_buf.view());
     let expected = expect_fused(&case);
     // The same rows with gate and up swapped must give a different answer,
     // or the case cannot tell gate-first from gate-second.
@@ -3087,7 +3101,7 @@ fn gemm64_fused_takes_a_swiglu_only_input_over_fp8_weights() {
         gu_offset: 0,
     };
     let w_buf = upload_u8(&b, &bytes);
-    let got = run_fused(&b, &case, "kernel_flux2_gemm64_fused_fp8", w_buf.view());
+    let got = run_fused(&b, &case, "kernel_dit_gemm64_fused_fp8", w_buf.view());
     assert_close(&got, &expect_fused(&case), "gemm64_fused fp8 swiglu-only");
 }
 
@@ -3128,6 +3142,285 @@ fn gemm64_fused_takes_a_dense_only_input_over_bf16_weights() {
         gu_offset: 0,
     };
     let w_buf = upload_u16(&b, &weight_bits);
-    let got = run_fused(&b, &case, "kernel_flux2_gemm64_fused_bf16", w_buf.view());
+    let got = run_fused(&b, &case, "kernel_dit_gemm64_fused_bf16", w_buf.view());
     assert_close(&got, &expect_fused(&case), "gemm64_fused bf16 dense-only");
+}
+
+// --- per-row INT8 + ConvRot: the shared cases in `shiso-kerneltest` ----------
+
+/// Opens the device for the shared cases, or says on stderr why they did not run.
+#[expect(
+    clippy::print_stderr,
+    reason = "the GPU cases are opt-in, so the reason they did not run belongs on stderr"
+)]
+fn open_gpu() -> Option<Gpu> {
+    if !shiso_metal::metal_available() {
+        eprintln!("note: no Metal device on this machine, skipping the INT8 GPU cases");
+        return None;
+    }
+    let metal = MetalBackend::new().expect("the embedded kernel library compiles");
+    let device: Arc<dyn Backend> = metal.clone();
+    Some(Gpu::new(device, Box::new(metal)))
+}
+
+/// One ignored wrapper per shared case.
+macro_rules! int8_cases {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[test]
+            #[ignore = "requires a Metal device"]
+            fn $name() {
+                let Some(gpu) = open_gpu() else { return };
+                int8::$name(&gpu);
+            }
+        )*
+    };
+}
+
+int8_cases!(
+    hadamard256_matches_the_explicit_matrix,
+    hadamard256_is_its_own_inverse,
+    hadamard256_rotates_the_swiglu_row_it_forms,
+    gemm_i8_matches_the_dequantized_product,
+    gemm_i8_scales_each_output_row_not_each_input_column,
+    fused_i8_is_the_unfused_composition,
+);
+
+#[test]
+fn every_int8_case_entry_is_registered() {
+    for entry in int8::ENTRIES {
+        assert!(
+            ENTRIES.contains(&entry),
+            "{entry} is launched by the INT8 cases but missing from ENTRIES"
+        );
+    }
+}
+
+// --- residual VAE decoder: the shared cases in `shiso-kerneltest` -------------
+
+/// One ignored wrapper per shared VAE case.
+macro_rules! vae_cases {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[test]
+            #[ignore = "requires a Metal device"]
+            fn $name() {
+                let Some(gpu) = open_gpu() else { return };
+                vae::$name(&gpu);
+            }
+        )*
+    };
+}
+
+vae_cases!(
+    channel_rms_inv_is_the_scaled_inverse_pixel_norm,
+    conv2d_rms_is_the_conv_of_the_normalized_activated_field,
+    conv2d_up2_is_the_conv_of_the_upsampled_field,
+    dup_up_add_matches_the_reshaped_shortcut,
+);
+
+#[test]
+fn every_vae_case_entry_is_registered() {
+    for entry in vae::ENTRIES {
+        assert!(
+            ENTRIES.contains(&entry),
+            "{entry} is launched by the VAE cases but missing from ENTRIES"
+        );
+    }
+}
+
+// --- prefix-cached transformer: the shared cases in `shiso-kerneltest` -------
+
+/// One ignored wrapper per shared prefix case.
+macro_rules! prefix_cases {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[test]
+            #[ignore = "requires a Metal device"]
+            fn $name() {
+                let Some(gpu) = open_gpu() else { return };
+                prefix::$name(&gpu);
+            }
+        )*
+    };
+}
+
+prefix_cases!(
+    flash_sdpa_causal_masks_every_later_key,
+    qk_norm_rope_normalizes_then_turns_adjacent_pairs,
+    tanh_and_gelu_tanh_match_their_formulas,
+);
+
+#[test]
+fn every_prefix_case_entry_is_registered() {
+    for entry in prefix::ENTRIES {
+        assert!(
+            ENTRIES.contains(&entry),
+            "{entry} is launched by the prefix cases but missing from ENTRIES"
+        );
+    }
+}
+
+// --- throughput -------------------------------------------------------------
+
+/// Median seconds per launch of one simdgroup-tile GEMM entry over `(m, n, k)`:
+/// seven samples of five back-to-back launches each, after a warm-up, so a
+/// launch's queueing and one cold run do not land in the number.
+fn time_gemm64(
+    b: &Arc<dyn Backend>,
+    entry: &'static str,
+    weight: DeviceView<'_>,
+    scale: KernelArg<'_>,
+    shape: (usize, usize, usize),
+) -> f64 {
+    const REPS: u32 = 5;
+    let (m, n, k) = shape;
+    let input = upload_f32(
+        b,
+        &vals(m * k, 3).iter().map(|v| v * 0.1).collect::<Vec<_>>(),
+    );
+    let out = alloc(b, (m * n * 4) as u64).expect("alloc out");
+    let stand_in = dummy(b);
+    let args = GemmArgs {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+        has_bias: 0,
+    };
+    let once = || {
+        launch(
+            b,
+            entry,
+            Extent3::new(
+                grid_for(n as u32, G64_TILE),
+                grid_for(m as u32, G64_TILE),
+                1,
+            ),
+            Extent3::linear(G64_THREADS),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(input.view()),
+                KernelArg::Buffer(weight),
+                scale,
+                KernelArg::Buffer(stand_in.view()),
+            ],
+        );
+    };
+    once();
+    b.sync().expect("sync");
+    let mut samples: Vec<f64> = (0..7)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            for _ in 0..REPS {
+                once();
+            }
+            b.sync().expect("sync");
+            start.elapsed().as_secs_f64() / f64::from(REPS)
+        })
+        .collect();
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
+/// Not a correctness case: reports the BF16 and per-row INT8 tiles'
+/// throughput on the image transformer's linear shapes at 1024 tokens.
+#[test]
+#[ignore = "a throughput probe on a Metal device, not a correctness case"]
+#[expect(
+    clippy::print_stderr,
+    reason = "the probe's whole output is the numbers it measured"
+)]
+fn gemm64_throughput_bf16_vs_i8() {
+    let Some(b) = open() else { return };
+    for (m, n, k) in [
+        (1024usize, 4096usize, 4096usize),
+        (1024, 24576, 4096),
+        (1024, 4096, 12288),
+    ] {
+        let bf = upload_u16(&b, &vec![0x3c00u16; n * k]);
+        let i8w = upload_u8(
+            &b,
+            &(0..n * k)
+                .map(|i| u8::try_from(i % 251).unwrap_or(0))
+                .collect::<Vec<_>>(),
+        );
+        let scales = upload_f32(&b, &vec![0.01f32; n]);
+        let flop = 2.0 * (m * n * k) as f64;
+        let t_bf = time_gemm64(
+            &b,
+            "kernel_dit_gemm64_bf16",
+            bf.view(),
+            KernelArg::F32(1.0),
+            (m, n, k),
+        );
+        let t_i8 = time_gemm64(
+            &b,
+            "kernel_dit_gemm64_i8",
+            i8w.view(),
+            KernelArg::Buffer(scales.view()),
+            (m, n, k),
+        );
+        let t_rot = time_rotation(&b, m, k);
+        eprintln!(
+            "gemm64 m={m} n={n} k={k}: bf16 {:.2} ms {:.2} TFLOPS | i8 {:.2} ms {:.2} TFLOPS | rotate input {:.3} ms",
+            t_bf * 1e3,
+            flop / t_bf / 1e12,
+            t_i8 * 1e3,
+            flop / t_i8 / 1e12,
+            t_rot * 1e3
+        );
+    }
+}
+
+/// Median seconds per launch of the `ConvRot` rotation over `m` rows of `k`.
+fn time_rotation(b: &Arc<dyn Backend>, m: usize, k: usize) -> f64 {
+    const REPS: u32 = 20;
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    struct HadamardArgs {
+        rows: u32,
+        cols_a: u32,
+        inner: u32,
+        gu_stride: u32,
+        gu_offset: u32,
+    }
+    let input = upload_f32(b, &vals(m * k, 5));
+    let out = alloc(b, (m * k * 4) as u64).expect("alloc out");
+    let stand_in = dummy(b);
+    let args = HadamardArgs {
+        rows: m as u32,
+        cols_a: k as u32,
+        inner: 0,
+        gu_stride: 0,
+        gu_offset: 0,
+    };
+    let once = || {
+        launch(
+            b,
+            "kernel_dit_hadamard256_f32",
+            Extent3::new((k / 256) as u32, m as u32, 1),
+            Extent3::linear(64),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(input.view()),
+                KernelArg::Buffer(stand_in.view()),
+            ],
+        );
+    };
+    once();
+    b.sync().expect("sync");
+    let mut samples: Vec<f64> = (0..7)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            for _ in 0..REPS {
+                once();
+            }
+            b.sync().expect("sync");
+            start.elapsed().as_secs_f64() / f64::from(REPS)
+        })
+        .collect();
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
 }

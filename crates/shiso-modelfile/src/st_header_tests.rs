@@ -38,7 +38,9 @@ fn every_spelling_both_containers_meet_parses_to_its_own_width() {
     // word as a 32-bit integer.
     assert_eq!(StDType::parse("I16"), Some(StDType::I16));
     assert_eq!(StDType::parse("I32"), Some(StDType::I32));
-    assert_eq!(StDType::parse("I8"), None);
+    // The per-row INT8 image export stores its weight codes as signed bytes.
+    assert_eq!(StDType::parse("I8"), Some(StDType::I8));
+    assert_eq!(StDType::parse("U16"), None);
 
     // A byte is a byte whatever it means. An `F8_E4M3` element is one byte and
     // so is a `U8`, which for NVFP4 holds TWO weights - so a header's element
@@ -52,6 +54,7 @@ fn every_spelling_both_containers_meet_parses_to_its_own_width() {
     assert_eq!(StDType::I64.size(), 8);
     assert_eq!(StDType::I16.size(), 2);
     assert_eq!(StDType::I32.size(), 4);
+    assert_eq!(StDType::I8.size(), 1);
 }
 
 #[test]

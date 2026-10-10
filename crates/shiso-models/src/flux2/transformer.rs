@@ -30,11 +30,12 @@ use shiso_vision::generator::ImageGenError;
 
 use super::config::Flux2Params;
 use super::kv_cache::Flux2KvCache;
-use super::ops::{
+use crate::diffusion::lin::Lin;
+use crate::diffusion::ops::{
     GemmCall, LayerNormCall, LinearResidualCall, ModulateCall, Ops, QkNormCall, Rope4dCall,
     Scratch, SdpaCall, SliceExt, SwigluInput,
 };
-use super::weights::{Lin, StStore};
+use crate::diffusion::weights::StStore;
 
 /// `LayerNorm` / `QK-norm` epsilon the reference blocks use.
 const NORM_EPS: f32 = 1e-6;
@@ -447,13 +448,10 @@ impl DiT {
             step: "dit time in",
             out: temb1.view(),
             input: emb_buf.view(),
-            weight: self.time_in_in.w.view(),
-            weight_scale: self.time_in_in.scale,
-            bias: self.time_in_in.bias.as_ref().map(DeviceBuffer::view),
+            weight: self.time_in_in.weight(),
             m: 1,
             n: h,
             k: self.time_in_in.in_dim,
-            kind: self.time_in_in.kind,
         })?;
         ops.silu("dit time silu", temb1.view(), temb1.view(), h)?;
         let vec = ops.alloc_f32("dit vec", h)?;
@@ -461,13 +459,10 @@ impl DiT {
             step: "dit time out",
             out: vec.view(),
             input: temb1.view(),
-            weight: self.time_in_out.w.view(),
-            weight_scale: self.time_in_out.scale,
-            bias: self.time_in_out.bias.as_ref().map(DeviceBuffer::view),
+            weight: self.time_in_out.weight(),
             m: 1,
             n: h,
             k: h,
-            kind: self.time_in_out.kind,
         })?;
         let vec_silu = ops.alloc_f32("dit vec silu", h)?;
         ops.silu("dit vec silu", vec_silu.view(), vec.view(), h)?;
@@ -486,26 +481,20 @@ impl DiT {
             step: "dit img_in",
             out: x_img.view(),
             input: input.latents,
-            weight: self.img_in.w.view(),
-            weight_scale: self.img_in.scale,
-            bias: self.img_in.bias.as_ref().map(DeviceBuffer::view),
+            weight: self.img_in.weight(),
             m: n_img,
             n: h,
             k: p.in_channels,
-            kind: self.img_in.kind,
         })?;
         let x_txt = ops.alloc_f32("dit x_txt", t_txt * h)?;
         ops.gemm(&GemmCall {
             step: "dit txt_in",
             out: x_txt.view(),
             input: input.txt,
-            weight: self.txt_in.w.view(),
-            weight_scale: self.txt_in.scale,
-            bias: self.txt_in.bias.as_ref().map(DeviceBuffer::view),
+            weight: self.txt_in.weight(),
             m: t_txt,
             n: h,
             k: p.context_in_dim,
-            kind: self.txt_in.kind,
         })?;
 
         for (i, block) in self.double.iter().enumerate() {
@@ -573,13 +562,10 @@ impl DiT {
             step: "dit head",
             out: out.view(),
             input: xn.view(),
-            weight: self.final_linear.w.view(),
-            weight_scale: self.final_linear.scale,
-            bias: self.final_linear.bias.as_ref().map(DeviceBuffer::view),
+            weight: self.final_linear.weight(),
             m: n_img,
             n: self.final_linear.out_dim,
             k: h,
-            kind: self.final_linear.kind,
         })?;
         Ok(out)
     }
@@ -689,6 +675,7 @@ impl DiT {
             head_dim,
             txt_stride: 3 * h,
             img_stride: 3 * h,
+            causal: false,
         })?;
         if ctx.input.kv_mode == KvMode::Extract && ctx.refs > 0 {
             let cache = ops.alloc_owned_f32("dit kv cache", ctx.refs * 3 * h)?;
@@ -711,10 +698,7 @@ impl DiT {
             dense: Some(out_img.view()),
             dense_cols: h,
             swiglu: None,
-            weight: block.img_proj.w.view(),
-            weight_scale: block.img_proj.scale,
-            bias: block.img_proj.bias.as_ref().map(DeviceBuffer::view),
-            kind: block.img_proj.kind,
+            weight: block.img_proj.weight(),
             m: ctx.n_img,
             n: h,
         })?;
@@ -734,10 +718,7 @@ impl DiT {
             dense: Some(out_txt.view()),
             dense_cols: h,
             swiglu: None,
-            weight: block.txt_proj.w.view(),
-            weight_scale: block.txt_proj.scale,
-            bias: block.txt_proj.bias.as_ref().map(DeviceBuffer::view),
-            kind: block.txt_proj.kind,
+            weight: block.txt_proj.weight(),
             m: ctx.t_txt,
             n: h,
         })?;
@@ -798,13 +779,10 @@ impl DiT {
             step: "dit single linear1",
             out: qkv.view(),
             input: xn.view(),
-            weight: block.linear1.w.view(),
-            weight_scale: block.linear1.scale,
-            bias: block.linear1.bias.as_ref().map(DeviceBuffer::view),
+            weight: block.linear1.weight(),
             m: s_total,
             n: fused,
             k: h,
-            kind: block.linear1.kind,
         })?;
         ops.qk_norm(&QkNormCall {
             step: "dit single qk norm",
@@ -864,6 +842,7 @@ impl DiT {
             head_dim,
             txt_stride: fused,
             img_stride: fused,
+            causal: false,
         })?;
         if ctx.input.kv_mode == KvMode::Extract && ctx.refs > 0 {
             let cache = ops.alloc_owned_f32("dit single kv cache", ctx.refs * fused)?;
@@ -897,10 +876,7 @@ impl DiT {
                 offset: 3 * h,
                 inner,
             }),
-            weight: block.linear2.w.view(),
-            weight_scale: block.linear2.scale,
-            bias: block.linear2.bias.as_ref().map(DeviceBuffer::view),
-            kind: block.linear2.kind,
+            weight: block.linear2.weight(),
             m: s_total,
             n: h,
         })?;
@@ -940,13 +916,10 @@ impl DiT {
             step,
             out: vec.view(),
             input: vec_silu.view(),
-            weight: module.w.view(),
-            weight_scale: module.scale,
-            bias: module.bias.as_ref().map(DeviceBuffer::view),
+            weight: module.weight(),
             m: 1,
             n: width,
             k: self.params.hidden_size,
-            kind: module.kind,
         })?;
         Ok(vec)
     }
@@ -991,13 +964,10 @@ impl DiT {
             step: "dit qkv",
             out: out.view(),
             input: xn.view(),
-            weight: qkv.w.view(),
-            weight_scale: qkv.scale,
-            bias: qkv.bias.as_ref().map(DeviceBuffer::view),
+            weight: qkv.weight(),
             m: tokens,
             n: 3 * h,
             k: h,
-            kind: qkv.kind,
         })?;
         ops.qk_norm(&QkNormCall {
             step: "dit qk norm",
@@ -1050,13 +1020,10 @@ impl DiT {
             step,
             out: fused.view(),
             input: xn.view(),
-            weight: mlp.fc1.w.view(),
-            weight_scale: mlp.fc1.scale,
-            bias: mlp.fc1.bias.as_ref().map(DeviceBuffer::view),
+            weight: mlp.fc1.weight(),
             m: tokens,
             n: 2 * inner,
             k: h,
-            kind: mlp.fc1.kind,
         })?;
         ops.linear_residual(&LinearResidualCall {
             step,
@@ -1070,10 +1037,7 @@ impl DiT {
                 offset: 0,
                 inner,
             }),
-            weight: mlp.fc2.w.view(),
-            weight_scale: mlp.fc2.scale,
-            bias: mlp.fc2.bias.as_ref().map(DeviceBuffer::view),
-            kind: mlp.fc2.kind,
+            weight: mlp.fc2.weight(),
             m: tokens,
             n: h,
         })

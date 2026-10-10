@@ -17,6 +17,7 @@ use shiso_modelfile::st_header::{Shard, StDType};
 use shiso_vision::generator::ImageGenError;
 
 use super::ops::Ops;
+use super::residency::{FileSpan, coalesce};
 
 /// One tensor as its shard header described it, resolved to a shard slot.
 #[derive(Debug)]
@@ -60,19 +61,7 @@ impl StStore {
     /// or a range that runs past the file, is refused at open — before any
     /// weight is imported — so no `Lin::load` below re-checks it.
     pub(crate) fn open(path: &Path) -> Result<Self, ImageGenError> {
-        let files = if path.is_dir() {
-            let mut found: Vec<_> = std::fs::read_dir(path)
-                .map_err(|e| ImageGenError::Checkpoint(format!("reading {}: {e}", path.display())))?
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "safetensors"))
-                .collect();
-            found.sort();
-            found
-        } else {
-            vec![path.to_path_buf()]
-        };
-        Self::open_files(&files)
+        Self::open_files(&safetensors_files(path)?)
     }
 
     /// Opens exactly these shard files, refusing a tensor name that two of
@@ -269,84 +258,61 @@ impl StStore {
         )))
     }
 
+    /// The file byte ranges of every tensor whose name `keep` accepts,
+    /// sorted and merged: what an import of those tensors will read.
+    pub(crate) fn spans(&self, keep: impl Fn(&str) -> bool) -> Vec<FileSpan> {
+        let spans = self
+            .entries
+            .iter()
+            .filter(|(name, _)| keep(name))
+            .map(|(_, e)| {
+                let shard = &self.shards[e.shard];
+                FileSpan {
+                    path: shard.path().to_path_buf(),
+                    start: shard.payload_base() + e.start,
+                    end: shard.payload_base() + e.end,
+                }
+            })
+            .collect();
+        coalesce(spans)
+    }
+
     /// Counts `prefix.<n>.` blocks from the indexed names.
     pub(crate) fn count_blocks(&self, prefix: &str) -> Option<usize> {
-        crate::flux2::config::count_blocks_internal(self.names(), prefix)
+        count_blocks_internal(self.names(), prefix)
     }
 }
 
-/// A linear layer's weight in its stored native format, with its bias widened
-/// to f32 and its FP8 scale read at load.
-///
-/// The weight buffer is an import of the shard mapping's byte range: BF16,
-/// `F8_E4M3` and F32 weights all reach the device as the bytes the checkpoint
-/// wrote, and the GEMM entry point is chosen from the header dtype. Only the
-/// bias - a vector of at most a few tens of thousands of elements - is
-/// widened, so the norm/bias rule and the zero-dequant rule for matrices
-/// stay separate.
-#[derive(Debug)]
-pub(crate) struct Lin {
-    /// Weight rows (`out_dim`, `in_dim`) in their stored format.
-    pub w: DeviceBuffer,
-    /// Stored format of `w`.
-    pub kind: crate::flux2::ops::WeightKind,
-    /// Epilogue multiplier (the FP8 tensor's `weight_scale`, else 1.0).
-    pub scale: f32,
-    /// Bias as f32, if the checkpoint carries one.
-    pub bias: Option<DeviceBuffer>,
-    /// Rows of the weight matrix.
-    pub out_dim: usize,
-    /// Columns of the weight matrix.
-    pub in_dim: usize,
+/// The `.safetensors` files `path` names: the file itself, or every one
+/// directly inside the directory, sorted by name.
+pub(crate) fn safetensors_files(path: &Path) -> Result<Vec<PathBuf>, ImageGenError> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut found: Vec<_> = std::fs::read_dir(path)
+        .map_err(|e| ImageGenError::Checkpoint(format!("reading {}: {e}", path.display())))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "safetensors"))
+        .collect();
+    found.sort();
+    Ok(found)
 }
 
-impl Lin {
-    /// Loads `{name}.weight` (and `{name}.bias` when present) onto the ops'
-    /// backend, refusing a dtype no GEMM entry point reads.
-    pub(crate) fn load(store: &StStore, ops: &Ops, name: &str) -> Result<Self, ImageGenError> {
-        let weight_name = format!("{name}.weight");
-        let entry = store.require(&weight_name)?;
-        let kind = match entry.dtype {
-            StDType::Bf16 => crate::flux2::ops::WeightKind::Bf16,
-            StDType::F8E4M3 => crate::flux2::ops::WeightKind::Fp8,
-            StDType::F32 => crate::flux2::ops::WeightKind::F32,
-            other => {
-                return Err(ImageGenError::Checkpoint(format!(
-                    "'{weight_name}' has dtype {other:?}, which no flux2 GEMM entry reads"
-                )));
-            }
-        };
-        let scale = if kind == crate::flux2::ops::WeightKind::Fp8 {
-            store.weight_scale(&weight_name)?
-        } else {
-            1.0
-        };
-        let w = store.import(ops.backend(), &weight_name)?;
-        let shape = &entry.shape;
-        let (out_dim, in_dim) = (
-            usize::try_from(*shape.first().ok_or_else(|| {
-                ImageGenError::Checkpoint(format!("'{weight_name}' has empty shape"))
-            })?)
-            .unwrap_or(usize::MAX),
-            usize::try_from(*shape.get(1).ok_or_else(|| {
-                ImageGenError::Checkpoint(format!("'{weight_name}' is not a matrix"))
-            })?)
-            .unwrap_or(usize::MAX),
-        );
-        let bias_name = format!("{name}.bias");
-        let bias = if store.contains(&bias_name) {
-            let values = store.f32_vec(&bias_name)?;
-            Some(ops.upload_f32("load bias", &values)?)
-        } else {
-            None
-        };
-        Ok(Self {
-            w,
-            kind,
-            scale,
-            bias,
-            out_dim,
-            in_dim,
-        })
+/// The block count of a `prefix<n>.` run among `keys`: one past the highest
+/// index found, or `None` when no key carries the prefix.
+pub(crate) fn count_blocks_internal<'a>(
+    keys: impl Iterator<Item = &'a str>,
+    prefix: &str,
+) -> Option<usize> {
+    let mut max_idx = None;
+    for k in keys {
+        if let Some(rest) = k.strip_prefix(prefix)
+            && let Some(idx_str) = rest.split('.').next()
+            && let Ok(idx) = idx_str.parse::<usize>()
+        {
+            max_idx = Some(max_idx.map_or(idx, |m: usize| m.max(idx)));
+        }
     }
+    max_idx.map(|m| m + 1)
 }

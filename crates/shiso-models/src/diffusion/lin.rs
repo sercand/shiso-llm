@@ -1,0 +1,116 @@
+//! A linear layer in its stored native format.
+//!
+//! [`Lin`] pairs a weight buffer with the [`WeightKind`] that selects its GEMM
+//! entry point. A new weight dtype is a new [`WeightKind`] variant plus one arm
+//! in [`Lin::load`]; callers that only forward `kind` to the GEMM calls stay
+//! unchanged.
+
+use shiso_core::DeviceBuffer;
+use shiso_modelfile::st_header::StDType;
+use shiso_vision::generator::ImageGenError;
+
+use super::ops::{LinWeight, Ops, WeightKind};
+use super::quant::{RotGroup, read_int8_layout};
+use super::weights::StStore;
+
+/// A linear layer's weight in its stored native format, with its bias widened
+/// to f32 and its FP8 scale (or per-row INT8 scales) read at load.
+///
+/// The weight buffer is an import of the shard mapping's byte range: BF16,
+/// `F8_E4M3`, F32 and I8 weights all reach the device as the bytes the
+/// checkpoint wrote, and the GEMM entry point is chosen from the header dtype. Only the
+/// bias - a vector of at most a few tens of thousands of elements - is
+/// widened, so the norm/bias rule and the zero-dequant rule for matrices
+/// stay separate.
+#[derive(Debug)]
+pub(crate) struct Lin {
+    /// Weight rows (`out_dim`, `in_dim`) in their stored format.
+    pub w: DeviceBuffer,
+    /// Stored format of `w`.
+    pub kind: WeightKind,
+    /// Epilogue multiplier (the FP8 tensor's `weight_scale`, else 1.0).
+    pub scale: f32,
+    /// One f32 scale per weight row, for [`WeightKind::Int8Row`] only.
+    pub row_scale: Option<DeviceBuffer>,
+    /// The rotation the export stored the weight's input axis under; the
+    /// GEMM entry rotates the input to match (see [`super::quant`]).
+    pub rotate: Option<RotGroup>,
+    /// Bias as f32, if the checkpoint carries one.
+    pub bias: Option<DeviceBuffer>,
+    /// Rows of the weight matrix.
+    pub out_dim: usize,
+    /// Columns of the weight matrix.
+    pub in_dim: usize,
+}
+
+impl Lin {
+    /// Loads `{name}.weight` (and `{name}.bias` when present) onto the ops'
+    /// backend, refusing a dtype no GEMM entry point reads.
+    pub(crate) fn load(store: &StStore, ops: &Ops, name: &str) -> Result<Self, ImageGenError> {
+        let weight_name = format!("{name}.weight");
+        let entry = store.require(&weight_name)?;
+        let kind = match entry.dtype {
+            StDType::Bf16 => WeightKind::Bf16,
+            StDType::F8E4M3 => WeightKind::Fp8,
+            StDType::F32 => WeightKind::F32,
+            StDType::I8 => WeightKind::Int8Row,
+            other => {
+                return Err(ImageGenError::Checkpoint(format!(
+                    "'{weight_name}' has dtype {other:?}, which no diffusion GEMM entry reads"
+                )));
+            }
+        };
+        let scale = if kind == WeightKind::Fp8 {
+            store.weight_scale(&weight_name)?
+        } else {
+            1.0
+        };
+        // The codes' layout comes from the export's own document and scale
+        // tensor, checked before a byte reaches the device.
+        let (row_scale, rotate) = if kind == WeightKind::Int8Row {
+            let layout = read_int8_layout(store, name)?;
+            (
+                Some(ops.upload_f32("load row scale", &layout.row_scale)?),
+                layout.rotate,
+            )
+        } else {
+            (None, None)
+        };
+        let w = store.import(ops.backend(), &weight_name)?;
+        let shape = &entry.shape;
+        let (out_dim, in_dim) = (
+            usize::try_from(*shape.first().ok_or_else(|| {
+                ImageGenError::Checkpoint(format!("'{weight_name}' has empty shape"))
+            })?)
+            .unwrap_or(usize::MAX),
+            usize::try_from(*shape.get(1).ok_or_else(|| {
+                ImageGenError::Checkpoint(format!("'{weight_name}' is not a matrix"))
+            })?)
+            .unwrap_or(usize::MAX),
+        );
+        let bias_name = format!("{name}.bias");
+        let bias = if store.contains(&bias_name) {
+            let values = store.f32_vec(&bias_name)?;
+            Some(ops.upload_f32("load bias", &values)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            w,
+            kind,
+            scale,
+            row_scale,
+            rotate,
+            bias,
+            out_dim,
+            in_dim,
+        })
+    }
+
+    /// The weight side of a GEMM against this linear: every fact the
+    /// loader read, as the one value the GEMM entries take, so a call site
+    /// cannot forget the rotation or the row scales.
+    pub(crate) fn weight(&self) -> LinWeight<'_> {
+        LinWeight::of(self)
+    }
+}

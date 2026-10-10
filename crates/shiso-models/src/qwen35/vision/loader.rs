@@ -76,7 +76,8 @@ fn st_dtype(name: &str, dtype: StDType) -> Result<DType, VisionError> {
         | StDType::F8E4M3
         | StDType::I64
         | StDType::I16
-        | StDType::I32 => Err(VisionError::TensorDType {
+        | StDType::I32
+        | StDType::I8 => Err(VisionError::TensorDType {
             name: name.to_owned(),
             dtype: DType::I32,
         }),

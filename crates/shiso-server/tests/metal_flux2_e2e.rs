@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use shiso_core::ids::Seed;
 use shiso_metal::MetalBackend;
-use shiso_models::flux2::config::ImageModelDesc;
+use shiso_models::image_registry::ImageModelDesc;
 use shiso_vision::generator::{GeneratedImage, ImageGenerationJob, ImageOutputFormat};
 
 /// Decoded-pixel standard deviation a real photograph clears by orders of
@@ -147,6 +147,8 @@ fn generate_once(
         vae_path: None,
         tokenizer_path: None,
         assets_dir,
+        residency: shiso_models::image_registry::ImageResidency::Auto,
+        reserve_bytes: shiso_models::image_registry::DEFAULT_IMAGE_RESERVE_BYTES,
     };
     let load_start = Instant::now();
     let generator = shiso_models::image_registry::open_image_generator(&desc, backend)
@@ -216,15 +218,15 @@ async fn test_flux2_klein_metal_generation() {
     let backend: Arc<dyn shiso_core::Backend> = MetalBackend::new().expect("Metal backend opens");
 
     // The host fallback is numerically the same arithmetic but orders of
-    // magnitude slower; if the module table does not carry the flux2
+    // magnitude slower; if the module table does not carry the diffusion
     // entries, this test would silently benchmark the fallback instead of
     // the kernels it exists to exercise.
-    let entries = backend.module_entries("flux2");
+    let entries = backend.module_entries("diffusion");
     assert!(
         entries
             .iter()
-            .any(|name| name.contains("kernel_flux2_gemm_bf16")),
-        "the Metal backend does not expose the flux2 kernel module; the host \
+            .any(|name| name.contains("kernel_dit_gemm_bf16")),
+        "the Metal backend does not expose the diffusion kernel module; the host \
          fallback would engage and the test would not exercise the kernels"
     );
 
@@ -271,6 +273,8 @@ async fn test_flux2_klein_metal_generation() {
                 vae_path: None,
                 tokenizer_path: None,
                 assets_dir,
+                residency: shiso_models::image_registry::ImageResidency::Auto,
+                reserve_bytes: shiso_models::image_registry::DEFAULT_IMAGE_RESERVE_BYTES,
             };
             let load_start = Instant::now();
             let generator = shiso_models::image_registry::open_image_generator(&desc, &backend)
