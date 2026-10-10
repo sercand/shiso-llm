@@ -45,7 +45,8 @@ back to the kernel it belongs to.
 | `q4e_misc` | `misc.cu` | 3 | 0 |
 | `q4e_embed` | `embed.cu` | 4 | 0 |
 | `q4e_modelopt` | `modelopt.cu` | 7 | 0 |
-| **total** | 12 units | **67** | **105** |
+| `q4e_exact` | `exact.cu` | 2 | 0 |
+| **total** | 13 units | **69** | **105** |
 
 ## Plain entries, by module
 
@@ -68,6 +69,18 @@ n-gram decode, for the `modelopt` export.
 - `q4e_fp8_experts_gate_up_kernel`
 - `q4e_fp8_experts_down_kernel`
 - `q4e_ple_dequant_fp8_kernel`
+
+### `q4e_exact`
+
+Not an upstream unit: this repository's own variants of two ported paths,
+derived from `qsa_sparse.cu` and `gdn.cu` and kept out of them so neither
+ported unit is edited.
+
+- `q4e_qsa_attention_tc_exact_kernel` - `q4e_qsa_attention_tc_kernel` with
+  every softmax weight carried into the P V product as two fp16 halves.
+- `q4e_gdn_step_kernel` - one decode row of a recurrent layer after its
+  convolution: the two L2 norms, the gates, the recurrence and the output
+  gate, bit for bit the five launches it replaces.
 
 ### `q4e_moe`
 
@@ -575,6 +588,23 @@ tensor-core paths and has the same geometry at all three call sites; only the
 split count it is handed differs (`Q4E_ATTN_SPLITS`, `Q4E_ATTN_GSPLITS`, and
 `splits` respectively). It is skipped entirely when the tensor-core path ran at
 `splits == 1`, because that path wrote the destination directly.
+
+### `q4e_exact`
+
+| Kernel | Grid | Block | Dynamic shared memory |
+|---|---|---|---|
+| `q4e_qsa_attention_tc_exact_kernel` | `(splits, n_head_kv, n_tok)` | `256` | `Q4E_EX_TC_SMEM` — **opt-in** |
+| `q4e_gdn_step_kernel` | `n_head_v` | `head_dim * 4` | `head_dim * (head_dim + 1) * 4` — **opt-in** |
+
+`Q4E_EX_TC_SMEM` is `Q4E_TC_SMEM` plus the low-half weight tile, `16 *
+Q4E_EX_TC_KT * 2`: 81,984 B. Its argument list, grid and `splits` rule are the
+ported tensor-core kernel's (above); both tensor-core paths launch it in place
+of that kernel.
+
+`q4e_gdn_step_kernel` carries the sequential recurrence's geometry and state
+tile unchanged, 66,048 B at the one head width it is planned at (128). It is
+planned only for one row of one session's decode step; every other pass runs
+the chain it replaces.
 
 ### `q4e_idx`
 

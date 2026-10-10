@@ -614,3 +614,352 @@ pub fn recurrent_rollback_and_replay(gpu: &Gpu) {
         "replay: the slab is read-only"
     );
 }
+
+// --- the fused decode step ----------------------------------------------------
+
+/// The module of the fused decode step, mirroring `kernels::MOD_EXACT`.
+const MODULE_EXACT: &str = "q4e_exact";
+
+/// What one recurrent layer reads besides its state: the weights, and the
+/// projections of every row the case runs.
+struct StepWeights {
+    conv_w: DeviceBuffer,
+    dt_bias: DeviceBuffer,
+    a: DeviceBuffer,
+    norm_w: DeviceBuffer,
+}
+
+impl StepWeights {
+    fn new(gpu: &Gpu) -> Self {
+        let conv_w: Vec<f32> = signal(IN_DIM * CONV_KERNEL, 61)
+            .iter()
+            .map(|v| v * 0.5)
+            .collect();
+        let dt_bias: Vec<f32> = signal(V_HEADS, 67).iter().map(|v| v * 2.0).collect();
+        let a: Vec<f32> = signal(V_HEADS, 71)
+            .iter()
+            .map(|v| -(v.abs() * 8.0 + 0.1))
+            .collect();
+        let norm_w: Vec<f32> = signal(HEAD_DIM, 73).iter().map(|v| 1.0 + 0.5 * v).collect();
+        Self {
+            conv_w: gpu.upload(&f32_bytes(&conv_w)),
+            dt_bias: gpu.upload(&f32_bytes(&dt_bias)),
+            a: gpu.upload(&f32_bytes(&a)),
+            norm_w: gpu.upload(&f32_bytes(&norm_w)),
+        }
+    }
+}
+
+/// The projections of `n_tok` rows: the fused q|k|v row before its
+/// convolution, the two gate inputs and the output gate, as the projections
+/// hand them over.
+struct StepRows {
+    n_tok: usize,
+    qkv: Vec<f32>,
+    alpha: Vec<f32>,
+    beta: Vec<f32>,
+    z: Vec<f32>,
+}
+
+impl StepRows {
+    /// Rows from seed `seed`. The alpha inputs reach past the softplus guard
+    /// at 20 for some heads, so both of the gate's branches run.
+    fn new(n_tok: usize, seed: u32) -> Self {
+        Self {
+            n_tok,
+            qkv: signal(n_tok * IN_DIM, seed),
+            alpha: signal(n_tok * V_HEADS, seed + 1)
+                .iter()
+                .map(|v| v * 24.0)
+                .collect(),
+            beta: signal(n_tok * V_HEADS, seed + 2)
+                .iter()
+                .map(|v| v * 6.0)
+                .collect(),
+            z: signal(n_tok * V_HEADS * HEAD_DIM, seed + 3)
+                .iter()
+                .map(|v| v * 4.0)
+                .collect(),
+        }
+    }
+}
+
+/// A layer's state, host side: the convolution window and the recurrent
+/// state matrices.
+#[derive(Clone, PartialEq)]
+struct StepState {
+    conv: Vec<f32>,
+    rec: Vec<f32>,
+}
+
+impl StepState {
+    /// A session's first state: both zero.
+    fn fresh() -> Self {
+        Self {
+            conv: vec![0.0; (CONV_KERNEL - 1) * IN_DIM],
+            rec: vec![0.0; V_HEADS * HEAD_DIM * HEAD_DIM],
+        }
+    }
+}
+
+/// The convolution, as the engine launches it on a pass with no rollback
+/// slab: `out, state, x, w, channels, kernel, n_tok, ckpt, ckpt_cap`.
+fn launch_conv(
+    gpu: &Gpu,
+    out: &DeviceBuffer,
+    state: &DeviceBuffer,
+    x: &DeviceBuffer,
+    w: &StepWeights,
+    n_tok: usize,
+) {
+    run(
+        gpu,
+        KernelRef::new(MODULE, "q4e_gdn_conv_kernel"),
+        &LaunchArgs {
+            grid: Extent3::linear(blocks_for(IN_DIM, BLOCK_LINEAR)),
+            block: Extent3::linear(BLOCK_LINEAR),
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(state.view()),
+                KernelArg::Buffer(x.view()),
+                KernelArg::Buffer(w.conv_w.view()),
+                KernelArg::U32(IN_DIM as u32),
+                KernelArg::U32(CONV_KERNEL as u32),
+                KernelArg::U32(n_tok as u32),
+                NULL,
+                KernelArg::U32(0),
+            ],
+        },
+    );
+}
+
+/// Runs the chain a recurrent layer launches between its projections - the
+/// convolution, both norms, the gates, the recurrence and the output gate -
+/// over `rows` from `state`, and returns the gated rows and the new state.
+fn run_chain(
+    gpu: &Gpu,
+    w: &StepWeights,
+    rows: &StepRows,
+    state: &StepState,
+) -> (Vec<f32>, StepState) {
+    let n_tok = rows.n_tok;
+    let conv = sentinel(gpu, n_tok * IN_DIM);
+    let conv_state = gpu.upload(&f32_bytes(&state.conv));
+    let rec_state = gpu.upload(&f32_bytes(&state.rec));
+    let qkv = gpu.upload(&f32_bytes(&rows.qkv));
+    let alpha = gpu.upload(&f32_bytes(&rows.alpha));
+    let beta_proj = gpu.upload(&f32_bytes(&rows.beta));
+    let z = gpu.upload(&f32_bytes(&rows.z));
+    let decay = sentinel(gpu, n_tok * V_HEADS);
+    let beta = sentinel(gpu, n_tok * V_HEADS);
+    let attn = sentinel(gpu, n_tok * V_HEADS * HEAD_DIM);
+    let gated = sentinel(gpu, n_tok * V_HEADS * HEAD_DIM);
+    launch_conv(gpu, &conv, &conv_state, &qkv, w, n_tok);
+    for offset in [0, QK_DIM] {
+        run(
+            gpu,
+            KernelRef::new(MODULE, "q4e_gdn_l2norm_kernel"),
+            &LaunchArgs {
+                grid: Extent3::new(QK_HEADS as u32, n_tok as u32, 1),
+                block: Extent3::linear(BLOCK_NARROW),
+                smem_bytes: 0,
+                args: &[
+                    KernelArg::Buffer(conv.view()),
+                    KernelArg::U32(HEAD_DIM as u32),
+                    KernelArg::U32(QK_HEADS as u32),
+                    KernelArg::U32(IN_DIM as u32),
+                    KernelArg::U32(offset as u32),
+                ],
+            },
+        );
+    }
+    run(
+        gpu,
+        KernelRef::new(MODULE, "q4e_gdn_gates_kernel"),
+        &LaunchArgs {
+            grid: Extent3::linear(blocks_for(n_tok * V_HEADS, BLOCK_LINEAR)),
+            block: Extent3::linear(BLOCK_LINEAR),
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Buffer(decay.view()),
+                KernelArg::Buffer(beta.view()),
+                KernelArg::Buffer(alpha.view()),
+                KernelArg::Buffer(beta_proj.view()),
+                KernelArg::Buffer(w.dt_bias.view()),
+                KernelArg::Buffer(w.a.view()),
+                KernelArg::U32(V_HEADS as u32),
+                KernelArg::U32(n_tok as u32),
+            ],
+        },
+    );
+    let rec_args = [
+        KernelArg::Buffer(attn.view()),
+        KernelArg::Buffer(rec_state.view()),
+        KernelArg::Buffer(conv.view()),
+        KernelArg::Buffer(decay.view()),
+        KernelArg::Buffer(beta.view()),
+        KernelArg::U32(HEAD_DIM as u32),
+        KernelArg::U32(QK_HEADS as u32),
+        KernelArg::U32(V_HEADS as u32),
+        KernelArg::U32(QK_DIM as u32),
+        KernelArg::U32(2 * QK_DIM as u32),
+        KernelArg::U32(IN_DIM as u32),
+        KernelArg::U32(n_tok as u32),
+        NULL,
+        KernelArg::U32(0),
+    ];
+    run(
+        gpu,
+        KernelRef::new(MODULE, "q4e_gdn_recurrent_kernel"),
+        &recurrent_launch(gpu, &rec_args),
+    );
+    run(
+        gpu,
+        KernelRef::new(MODULE, "q4e_gdn_out_gate_kernel"),
+        &LaunchArgs {
+            grid: Extent3::linear((n_tok * V_HEADS) as u32),
+            block: Extent3::linear(BLOCK_NARROW),
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Buffer(gated.view()),
+                KernelArg::Buffer(attn.view()),
+                KernelArg::Buffer(z.view()),
+                KernelArg::Buffer(w.norm_w.view()),
+                KernelArg::U32(HEAD_DIM as u32),
+                KernelArg::U32(V_HEADS as u32),
+                KernelArg::F32(STEP_EPS),
+            ],
+        },
+    );
+    drain(gpu);
+    (
+        gpu.read_f32(&gated),
+        StepState {
+            conv: gpu.read_f32(&conv_state),
+            rec: gpu.read_f32(&rec_state),
+        },
+    )
+}
+
+/// The output norm's epsilon in the step cases.
+const STEP_EPS: f32 = 1e-6;
+
+/// Runs the convolution and then `q4e_gdn_step_kernel` over one row from
+/// `state`, as the engine plans a decode row, and returns the gated row and
+/// the new state.
+fn run_step(
+    gpu: &Gpu,
+    w: &StepWeights,
+    rows: &StepRows,
+    state: &StepState,
+) -> (Vec<f32>, StepState) {
+    assert_eq!(rows.n_tok, 1, "the step kernel takes one row");
+    let conv = sentinel(gpu, IN_DIM);
+    let conv_state = gpu.upload(&f32_bytes(&state.conv));
+    let rec_state = gpu.upload(&f32_bytes(&state.rec));
+    let qkv = gpu.upload(&f32_bytes(&rows.qkv));
+    let alpha = gpu.upload(&f32_bytes(&rows.alpha));
+    let beta_proj = gpu.upload(&f32_bytes(&rows.beta));
+    let z = gpu.upload(&f32_bytes(&rows.z));
+    let gated = sentinel(gpu, V_HEADS * HEAD_DIM);
+    launch_conv(gpu, &conv, &conv_state, &qkv, w, 1);
+    let args = [
+        KernelArg::Buffer(gated.view()),
+        KernelArg::Buffer(rec_state.view()),
+        KernelArg::Buffer(conv.view()),
+        KernelArg::Buffer(alpha.view()),
+        KernelArg::Buffer(beta_proj.view()),
+        KernelArg::Buffer(w.dt_bias.view()),
+        KernelArg::Buffer(w.a.view()),
+        KernelArg::Buffer(z.view()),
+        KernelArg::Buffer(w.norm_w.view()),
+        KernelArg::U32(HEAD_DIM as u32),
+        KernelArg::U32(QK_HEADS as u32),
+        KernelArg::U32(V_HEADS as u32),
+        KernelArg::U32(QK_DIM as u32),
+        KernelArg::U32(2 * QK_DIM as u32),
+        KernelArg::F32(STEP_EPS),
+    ];
+    // The recurrence's geometry, which the step kernel keeps: one block of
+    // 4 * head_dim threads per value head, the state tile's shared memory.
+    run(
+        gpu,
+        KernelRef::new(MODULE_EXACT, "q4e_gdn_step_kernel"),
+        &recurrent_launch(gpu, &args),
+    );
+    drain(gpu);
+    (
+        gpu.read_f32(&gated),
+        StepState {
+            conv: gpu.read_f32(&conv_state),
+            rec: gpu.read_f32(&rec_state),
+        },
+    )
+}
+
+/// The index and both values of the first element where two runs differ in
+/// their bits, if any.
+fn first_bit_difference(a: &[f32], b: &[f32]) -> Option<(usize, f32, f32)> {
+    assert_eq!(a.len(), b.len(), "lengths");
+    a.iter()
+        .zip(b)
+        .enumerate()
+        .find(|(_, (x, y))| x.to_bits() != y.to_bits())
+        .map(|(i, (&x, &y))| (i, x, y))
+}
+
+/// Decodes `steps` rows from `state` through both the chain and the step
+/// kernel, each from its own copy of the same state, and requires the same
+/// bits from both at every row; returns the state after the last row.
+fn decode_both(
+    gpu: &Gpu,
+    w: &StepWeights,
+    mut state: StepState,
+    steps: u32,
+    seed: u32,
+    what: &str,
+) -> StepState {
+    for step in 0..steps {
+        let rows = StepRows::new(1, seed + 10 * step);
+        let (chain_out, chain_state) = run_chain(gpu, w, &rows, &state);
+        let (step_out, step_state) = run_step(gpu, w, &rows, &state);
+        assert!(
+            chain_out.iter().all(|v| v.is_finite()),
+            "{what}, row {step}: the chain wrote every output"
+        );
+        for (name, a, b) in [
+            ("gated output", &chain_out, &step_out),
+            ("convolution window", &chain_state.conv, &step_state.conv),
+            ("recurrent state", &chain_state.rec, &step_state.rec),
+        ] {
+            if let Some((i, x, y)) = first_bit_difference(a, b) {
+                panic!(
+                    "{what}, row {step}: {name} element {i} is {y} from the step and {x} from the chain"
+                );
+            }
+        }
+        state = chain_state;
+    }
+    state
+}
+
+/// One decode row through `q4e_gdn_step_kernel` gives the bits the chain it
+/// replaces gives - the gated row, the convolution window and the recurrent
+/// state - from a fresh session's zero state, over the rows after it, and
+/// after a 37-row prefill has filled the window and moved the state off zero.
+///
+/// # Panics
+///
+/// When any element of any of the three differs in its bits.
+pub fn step_decode_matches_the_chain(gpu: &Gpu) {
+    let w = StepWeights::new(gpu);
+    let state = decode_both(gpu, &w, StepState::fresh(), 3, 101, "fresh session");
+    // A prefill through the chain, as a prompt would leave the layer.
+    let (_, prefilled) = run_chain(gpu, &w, &StepRows::new(PREFILL, 211), &state);
+    assert!(
+        prefilled != StepState::fresh(),
+        "the prefill moved the state"
+    );
+    decode_both(gpu, &w, prefilled, 3, 307, "after a 37-row prefill");
+}

@@ -108,3 +108,12 @@ fn recurrent_rollback_and_replay() {
         gdn::recurrent_rollback_and_replay(&gpu);
     }
 }
+
+/// `shiso_kerneltest::qwen4exp::gdn::step_decode_matches_the_chain` on this device.
+#[test]
+#[ignore = "requires a Metal device"]
+fn step_decode_matches_the_chain() {
+    if let Some(gpu) = open() {
+        gdn::step_decode_matches_the_chain(&gpu);
+    }
+}

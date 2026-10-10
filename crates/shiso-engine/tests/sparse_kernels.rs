@@ -709,6 +709,12 @@ fn the_geometry_of_every_kernel_is_the_expression_its_launcher_computes() {
     assert_eq!(recurrent.block.x, 128 * kernels::GDN_SPLIT);
     assert_eq!(recurrent.smem, 66_048);
 
+    // The fused decode step keeps the recurrence's geometry and tile.
+    assert_eq!(
+        kernels::gdn_step(shape.gdn.head_dim, shape.gdn.v_heads),
+        recurrent
+    );
+
     let chunk = kernels::gdn_chunk(shape.gdn.head_dim, shape.gdn.v_heads);
     assert_eq!(chunk.block.x, 128 * kernels::GDN_CSPLIT);
     assert_eq!(chunk.smem, 99_072);
@@ -845,6 +851,7 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "idx.cu",
         "misc.cu",
         "embed.cu",
+        "exact.cu",
     ] {
         let path = dir.join(unit);
         let text = std::fs::read_to_string(&path)
@@ -1281,6 +1288,151 @@ fn the_two_recurrent_normalizations_differ_only_in_the_offset_they_are_handed() 
     assert_eq!(offsets[1].1, Operand::U32(shape.gdn_qk_dim()));
 }
 
+/// The recurrent block's launches at `rows` rows under `policy`, as entry
+/// names in order.
+fn recurrent_entries(policy: &Recurrence, rows: u32, device: Device) -> Vec<&'static str> {
+    let shape = shape();
+    recurrent::block(
+        &shape,
+        &recurrent_desc(&shape),
+        LayerRef::target(0),
+        0,
+        *policy,
+        rows,
+        device,
+    )
+    .expect("a half-precision recurrent block has a tier")
+    .steps()
+    .iter()
+    .filter_map(|step| step.entry().map(|entry| entry.name()))
+    .collect()
+}
+
+#[test]
+fn a_decode_row_plans_the_fused_step_and_a_verify_window_plans_the_chain() {
+    const CHAIN: [&str; 5] = [
+        "q4e_gdn_l2norm_kernel",
+        "q4e_gdn_gates_kernel",
+        "q4e_gdn_recurrent_kernel",
+        "q4e_gdn_out_gate_kernel",
+        "q4e_gdn_conv_kernel",
+    ];
+    let shape = shape();
+    assert!(recurrent::step_eligible(&shape), "the shipped geometry");
+    for spec in [SpecDepth::NONE, SpecDepth::new(4)] {
+        let policy = Recurrence {
+            spec,
+            ..Recurrence::default()
+        };
+        // One row of one session's decode: the convolution, then the step, and
+        // none of the four launches it replaces.
+        let decode = recurrent_entries(&policy, 1, GPU);
+        assert_eq!(
+            decode
+                .iter()
+                .filter(|name| **name == "q4e_gdn_step_kernel")
+                .count(),
+            1
+        );
+        assert!(decode.contains(&"q4e_gdn_conv_kernel"));
+        for name in &CHAIN[..4] {
+            assert!(!decode.contains(name), "{name} ran beside the step");
+        }
+        // Between the projections, two launches where the chain has six: the
+        // convolution, then the step - and every input projection ahead of
+        // them, so only the output projection follows.
+        let gdn: Vec<&str> = decode
+            .iter()
+            .copied()
+            .filter(|name| name.starts_with("q4e_gdn"))
+            .collect();
+        assert_eq!(gdn, ["q4e_gdn_conv_kernel", "q4e_gdn_step_kernel"]);
+        let after = decode
+            .iter()
+            .position(|name| *name == "q4e_gdn_step_kernel")
+            .expect("the step ran");
+        let mut out = Plan::new();
+        matmul::project(
+            &mut out,
+            recurrent_desc(&shape).out,
+            Bound::new(
+                WeightRef::layer(LayerRef::target(0), Role::RecurrentOut),
+                Operand::Scratch(Buf::GdnGated),
+                Operand::Scratch(Buf::BlockOut),
+            ),
+            1,
+            GPU,
+        )
+        .expect("the output projection has a tier");
+        let out: Vec<&str> = out
+            .steps()
+            .iter()
+            .filter_map(|step| step.entry().map(|entry| entry.name()))
+            .collect();
+        assert_eq!(
+            decode[after + 1..],
+            out[..],
+            "only the output projection follows the step: {decode:?}"
+        );
+        // A verify window is more than one row and a rollback may reach it, so
+        // it keeps the chain that records; so does a decode batch, whose rows
+        // carry a state each, and a one-row prompt pass.
+        for rows in [2_u32, 5] {
+            let verify = recurrent_entries(&policy, rows, GPU);
+            assert!(!verify.contains(&"q4e_gdn_step_kernel"), "{rows} rows");
+            for name in CHAIN {
+                assert!(verify.contains(&name), "{name} missing at {rows} rows");
+            }
+        }
+    }
+    let unrelated = Recurrence {
+        origin: RowOrigin::Unrelated,
+        ..Recurrence::default()
+    };
+    assert!(!unrelated.takes_step(1, PassRole::Step));
+    assert!(!recurrent_entries(&unrelated, 1, GPU).contains(&"q4e_gdn_step_kernel"));
+    let prompt = PassRole::Prompt { snapshot: None };
+    assert!(!Recurrence::default().takes_step(1, prompt));
+    let no_chunk = Recurrence {
+        chunk: ChunkPolicy {
+            min_rows: 0,
+            ..ChunkPolicy::new()
+        },
+        ..Recurrence::default()
+    };
+    assert!(
+        !recurrent_entries(
+            &no_chunk,
+            1,
+            Device {
+                role: prompt,
+                ..GPU
+            }
+        )
+        .contains(&"q4e_gdn_step_kernel")
+    );
+}
+
+#[test]
+fn a_head_width_the_step_kernel_is_not_sized_for_keeps_the_chain() {
+    let mut shape = shape();
+    shape.gdn.head_dim = 64;
+    assert!(!recurrent::step_eligible(&shape));
+    assert!(Recurrence::default().takes_step(1, PassRole::Step));
+    let plan = recurrent::block(
+        &shape,
+        &recurrent_desc(&shape),
+        LayerRef::target(0),
+        0,
+        Recurrence::default(),
+        1,
+        GPU,
+    )
+    .expect("a half-precision recurrent block has a tier");
+    assert_eq!(plan.count("q4e_gdn_step_kernel"), 0);
+    assert_eq!(plan.count("q4e_gdn_recurrent_kernel"), 1);
+}
+
 #[test]
 fn the_combine_binds_the_next_block_s_norm_and_a_null_where_the_chain_breaks() {
     let shape = shape();
@@ -1335,7 +1487,7 @@ fn the_tensor_core_attention_is_handed_a_destination_or_a_slab_and_never_both() 
         let step = plan
             .steps()
             .iter()
-            .find(|step| step.name() == "q4e_qsa_attention_tc_kernel")
+            .find(|step| step.name() == "q4e_qsa_attention_tc_exact_kernel")
             .expect("the tensor-core entry is the one that ran");
         let args = step.operands().expect("the list fits a launch");
         let folded = plan.count("q4e_qsa_attention_combine_kernel") > 0;

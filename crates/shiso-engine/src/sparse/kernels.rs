@@ -73,6 +73,10 @@ pub const MOD_MISC: &str = "q4e_misc";
 /// unit, which is why it is a module of its own rather than entries in
 /// [`MOD_MOE`] or [`MOD_PLE`].
 pub const MOD_MODELOPT: &str = "q4e_modelopt";
+/// This family's own variants of two ported paths: the tensor-core attention
+/// with exact softmax weights, and the fused decode row of a recurrent layer.
+/// Not an upstream unit, for the reason [`MOD_MODELOPT`] is not.
+pub const MOD_EXACT: &str = "q4e_exact";
 /// The logits stages run before any pick: today, the suppress stage.
 pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a
@@ -168,6 +172,9 @@ pub const TC_KT: u32 = 64;
 pub const TC_HD: u32 = 256;
 /// Shared memory the tensor-core attention block reserves.
 pub const TC_SMEM: u32 = (16 + 2 * TC_KT) * TC_HD * 2 + 16 * TC_KT * 4 + 16 * TC_KT * 2 + 16 * 4;
+/// Shared memory the exact tensor-core attention reserves: the ported block's,
+/// plus a second f16 weight tile for the low half of every softmax weight.
+pub const TC_EXACT_SMEM: u32 = TC_SMEM + 16 * TC_KT * 2;
 
 /// Rows past which a trellis projection is expanded once and multiplied by the
 /// BLAS tier instead of streamed by the cooperative kernel.
@@ -780,6 +787,13 @@ pub const fn gdn_recurrent(head_dim: u32, v_heads: u32) -> Launch {
     )
 }
 
+/// The fused decode row of a recurrent layer: the sequential recurrence's
+/// grid, block and state tile, which it carries unchanged.
+#[must_use]
+pub const fn gdn_step(head_dim: u32, v_heads: u32) -> Launch {
+    gdn_recurrent(head_dim, v_heads)
+}
+
 /// The same recurrence with one sequence's state per row.
 #[must_use]
 pub const fn gdn_recurrent_batch(head_dim: u32, v_heads: u32, n_row: u32) -> Launch {
@@ -1165,6 +1179,17 @@ pub const fn qsa_attention_tc(kv_heads: u32, n_tok: u32, splits: u32) -> Launch 
     Launch::new(Extent3::new(splits, kv_heads, n_tok), BLOCK_LINEAR, TC_SMEM)
 }
 
+/// The exact tensor-core attention: the ported kernel's grid and block, with
+/// the larger shared-memory reservation of its second weight tile.
+#[must_use]
+pub const fn qsa_attention_tc_exact(kv_heads: u32, n_tok: u32, splits: u32) -> Launch {
+    Launch::new(
+        Extent3::new(splits, kv_heads, n_tok),
+        BLOCK_LINEAR,
+        TC_EXACT_SMEM,
+    )
+}
+
 /// The combine that folds a split attention's partial slabs.
 ///
 /// Its geometry is the same at all three of its call sites; only the split
@@ -1320,6 +1345,7 @@ mod tests {
     fn the_sparse_attention_slabs_sit_under_the_default_and_the_tensor_core_one_does_not() {
         assert_eq!(qsa_sparse_smem(), 41_984);
         assert_eq!(TC_SMEM, 79_936);
+        assert_eq!(TC_EXACT_SMEM, 81_984);
         assert_eq!(qsa_tiled_smem(256), 50_176);
         assert_eq!(IDX_TC_SMEM, 49_152);
         assert_eq!(idx_score_smem(4), 32_768);

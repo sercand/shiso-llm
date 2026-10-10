@@ -36,8 +36,9 @@ use shiso_core::{Backend, Extent3};
 
 use crate::sparse::exl3::{self as exl3, GemmShape};
 use crate::sparse::kernels::{
-    self, Elem, Entry, EntryTable, Instantiation, MOD_EMBED, MOD_EXL3, MOD_GDN, MOD_GDN_TC, MOD_HC,
-    MOD_IDX, MOD_MATVEC, MOD_MISC, MOD_MOE, MOD_PLE, MOD_QSA, MOD_QSA_SPARSE, TemplateArgs,
+    self, Elem, Entry, EntryTable, Instantiation, MOD_EMBED, MOD_EXACT, MOD_EXL3, MOD_GDN,
+    MOD_GDN_TC, MOD_HC, MOD_IDX, MOD_MATVEC, MOD_MISC, MOD_MOE, MOD_PLE, MOD_QSA, MOD_QSA_SPARSE,
+    TemplateArgs,
 };
 
 /// Every module the sparse stack launches out of.
@@ -57,6 +58,7 @@ const MODULES: &[&str] = &[
     MOD_IDX,
     MOD_MISC,
     MOD_EMBED,
+    MOD_EXACT,
     MOD_EXL3,
 ];
 
@@ -405,7 +407,8 @@ pub fn optional_paths(backend: &dyn Backend) -> OptionalPaths {
             .is_some()
     };
     let paths = OptionalPaths {
-        tensor_core: has(MOD_QSA_SPARSE, "q4e_qsa_attention_tc_kernel")
+        // The exact entry, because it is the one both tensor-core paths launch.
+        tensor_core: has(MOD_EXACT, "q4e_qsa_attention_tc_exact_kernel")
             && has(MOD_IDX, "q4e_idx_score_tc_kernel"),
         tiled_attention: has(MOD_QSA, "q4e_qsa_attention_tiled_kernel"),
         chunked_recurrence: has(MOD_GDN_TC, "q4e_gdn_tc_prep_kernel")

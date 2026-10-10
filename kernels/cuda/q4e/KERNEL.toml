@@ -18,6 +18,10 @@
 # `modelopt` is the exception to "byte-for-byte copy": the NVFP4 routed stages
 # and the FP8 n-gram decode the NVIDIA export needs are this repository's own,
 # and sit in a unit (and a module) of their own so no upstream unit is edited.
+# `exact` is the other: the tensor-core attention with its softmax weights
+# carried into the P V product as two fp16 halves, and the fused decode row of
+# a recurrent layer - both derived from ported kernels, and kept out of their
+# units for the same reason.
 
 [build]
 sources = [
@@ -33,6 +37,7 @@ sources = [
     "misc.cu",
     "embed.cu",
     "modelopt.cu",
+    "exact.cu",
 ]
 
 # Every unit includes `q4e.cuh` by bare name, and that header reaches its own
@@ -43,8 +48,9 @@ includes = ["cuda/q4e"]
 # `defines`, `std`, `base_flags` and `outputs` take the tree defaults. `arch`
 # does not, and the reason is the sharpest failure mode in this directory.
 #
-# Four entries - `q4e_idx_score_tc_kernel`, `q4e_qsa_attention_tc_kernel` and the
-# two matrix-fragment helpers they call - are guarded on `__CUDA_ARCH__ >= 800`
+# Five entries - `q4e_idx_score_tc_kernel`, `q4e_qsa_attention_tc_kernel`, its
+# exact twin `q4e_qsa_attention_tc_exact_kernel`, and the two matrix-fragment
+# helpers they call - are guarded on `__CUDA_ARCH__ >= 800`
 # and fall back to WRITING ZEROS below it. The host picks between the
 # tensor-core entry and its scalar twin by asking about a shared-memory
 # attribute, not about the architecture. So a module built at the tree default
@@ -76,3 +82,4 @@ idx = "q4e_idx"
 misc = "q4e_misc"
 embed = "q4e_embed"
 modelopt = "q4e_modelopt"
+exact = "q4e_exact"

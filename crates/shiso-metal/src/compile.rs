@@ -266,6 +266,9 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         include_str!("../metal/q4e/affine.metal"),
     ),
     ("q4e/fp8.metal", include_str!("../metal/q4e/fp8.metal")),
+    // This family's own fused decode row of a recurrent layer; after
+    // `gdn.metal`, whose helpers and constants it uses.
+    ("q4e/exact.metal", include_str!("../metal/q4e/exact.metal")),
     // --- audio encoder kernel set; appended, nothing above this line changed.
     (
         "audio_common.h",

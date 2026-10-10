@@ -19,8 +19,8 @@
 use shiso_core::error::CoreResult;
 
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
-use crate::sparse::kernels::{self, Entry, MOD_GDN, MOD_GDN_TC};
-use crate::sparse::matmul::{self, Bound, Device};
+use crate::sparse::kernels::{self, Entry, MOD_EXACT, MOD_GDN, MOD_GDN_TC};
+use crate::sparse::matmul::{self, Bound, Device, PassRole};
 use crate::sparse::moe::{RowOrigin, Segments};
 use crate::sparse::mtp::SpecDepth;
 use crate::sparse::paged;
@@ -118,6 +118,31 @@ impl Recurrence {
     pub const fn is_batched(&self) -> bool {
         matches!(self.origin, RowOrigin::Unrelated)
     }
+
+    /// Whether a pass of `n_tok` rows in `role` takes the fused decode step
+    /// rather than the sequential chain.
+    ///
+    /// Only one row of one session's decode: the step kernel is the chain's
+    /// single-row body and records nothing, so a verify window (more than one
+    /// row, which a rollback may reach) keeps the chain that writes the
+    /// rollback records; a batch's rows carry a state each; and a prompt pass
+    /// keeps the ladder its every width shares. The step kernel is the
+    /// sequential arithmetic, which is what one row takes under every chunk
+    /// policy: [`ChunkPolicy::takes_chunk`] wants more rows than a verify.
+    #[must_use]
+    pub const fn takes_step(&self, n_tok: u32, role: PassRole) -> bool {
+        n_tok == 1 && matches!(self.origin, RowOrigin::Sequential) && matches!(role, PassRole::Step)
+    }
+}
+
+/// Whether the fused decode step's kernel is written for this geometry.
+///
+/// Its shared rows are sized for one head width; any other width takes the
+/// chain, which reads the width from its arguments. A planner decision, so
+/// the kernel itself never has to refuse a shape.
+#[must_use]
+pub const fn step_eligible(shape: &SparseShape) -> bool {
+    shape.gdn.head_dim == kernels::GDN_STATE_HEAD_DIM && shape.gdn.qk_heads != 0
 }
 
 /// One recurrent block, in launch order.
@@ -157,6 +182,9 @@ pub fn block(
     // buffer, so they are derived together from the one depth.
     let conv_ckpt = rollback_args(spec, Operand::RecurrentConvCkpt(slot));
     let state_ckpt = rollback_args(spec, Operand::RecurrentStateCkpt(slot));
+    if policy.takes_step(n_tok, device.role) && step_eligible(shape) {
+        return decode_step(shape, desc, layer, slot, conv_ckpt, device);
+    }
     let per_run = prompt_runs(&policy, device);
     let mut plan = Plan::new();
     matmul::project(
@@ -267,24 +295,13 @@ pub fn block(
             );
         }
     } else {
-        plan.launch(
-            Entry::plain(MOD_GDN, "q4e_gdn_conv_kernel"),
-            kernels::gdn_conv(shape.gdn_in_dim()),
-            // `out, state, x, w, channels, kernel, n_tok, ckpt, ckpt_cap` - the
-            // checkpoint slab is the speculative rollback's, absent on a plain
-            // pass.
-            Args::of(&[
-                Operand::Scratch(Buf::GdnConv),
-                Operand::RecurrentConv(slot),
-                Operand::Scratch(Buf::GdnQkv),
-                Operand::Weight(at(Role::RecurrentConv1d)),
-                Operand::U32(shape.gdn_in_dim()),
-                Operand::U32(shape.gdn.conv_kernel),
-                Operand::U32(n_tok),
-                conv_ckpt.0,
-                conv_ckpt.1,
-            ]),
-        );
+        plan.append(sequential_conv(
+            shape,
+            at(Role::RecurrentConv1d),
+            slot,
+            n_tok,
+            conv_ckpt,
+        ));
     }
     // `qk, head_dim, n_heads, stride, offset` - the query rows start the fused
     // projection and the key rows follow them.
@@ -510,6 +527,124 @@ pub fn block(
             Operand::Scratch(Buf::BlockOut),
         ),
         n_tok,
+        device,
+    )?;
+    Ok(plan)
+}
+
+/// The sequential convolution over one session's rows, from its window.
+///
+/// `ckpt` is the speculative rollback's slab and count, the null pair on a
+/// plain pass.
+fn sequential_conv(
+    shape: &SparseShape,
+    conv1d: WeightRef,
+    slot: u32,
+    n_tok: u32,
+    ckpt: (Operand, Operand),
+) -> Plan {
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::plain(MOD_GDN, "q4e_gdn_conv_kernel"),
+        kernels::gdn_conv(shape.gdn_in_dim()),
+        // `out, state, x, w, channels, kernel, n_tok, ckpt, ckpt_cap`
+        Args::of(&[
+            Operand::Scratch(Buf::GdnConv),
+            Operand::RecurrentConv(slot),
+            Operand::Scratch(Buf::GdnQkv),
+            Operand::Weight(conv1d),
+            Operand::U32(shape.gdn_in_dim()),
+            Operand::U32(shape.gdn.conv_kernel),
+            Operand::U32(n_tok),
+            ckpt.0,
+            ckpt.1,
+        ]),
+    );
+    plan
+}
+
+/// One decode row of a recurrent block: the four input projections, the
+/// convolution, the fused step, and the output projection.
+///
+/// Two launches between the projections where the chain takes six, and the
+/// same bits: the step kernel is the two norms, the gates, the recurrence and
+/// the output gate in one launch, each phase the standalone kernel's
+/// arithmetic. The gate
+/// projection moves up beside the other three, which reads the same input and
+/// changes no value. The convolution stays a launch of its own, because value
+/// heads that share a key head would otherwise read that head's window while
+/// another block rewrites it (see `kernels/cuda/q4e/exact.cu`).
+///
+/// At one row the convolution writes no checkpoint and the recurrence records
+/// nothing, so a speculative session's slab is handed to the convolution as
+/// the chain hands it, and the step kernel takes none.
+fn decode_step(
+    shape: &SparseShape,
+    desc: &RecurrentDesc,
+    layer: LayerRef,
+    slot: u32,
+    conv_ckpt: (Operand, Operand),
+    device: Device,
+) -> CoreResult<Plan> {
+    let at = |role: Role| WeightRef::layer(layer, role);
+    let mut plan = Plan::new();
+    for (weight, role, out) in [
+        (desc.qkv, Role::RecurrentQkv, Buf::GdnQkv),
+        (desc.alpha, Role::RecurrentAlpha, Buf::GdnAlphaProj),
+        (desc.beta, Role::RecurrentBeta, Buf::GdnBetaProj),
+        (desc.gate, Role::RecurrentGate, Buf::GdnGate),
+    ] {
+        matmul::project(
+            &mut plan,
+            weight,
+            Bound::new(
+                at(role),
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(out),
+            ),
+            1,
+            device,
+        )?;
+    }
+    plan.append(sequential_conv(
+        shape,
+        at(Role::RecurrentConv1d),
+        slot,
+        1,
+        conv_ckpt,
+    ));
+    plan.launch(
+        Entry::plain(MOD_EXACT, "q4e_gdn_step_kernel"),
+        kernels::gdn_step(shape.gdn.head_dim, shape.gdn.v_heads),
+        // `gated_out, state, conv, alpha_proj, beta_proj, dt_bias, a, z,
+        //  norm_w, head_dim, n_head_k, n_head_v, k_offset, v_offset, eps`
+        Args::of(&[
+            Operand::Scratch(Buf::GdnGated),
+            Operand::RecurrentState(slot),
+            Operand::Scratch(Buf::GdnConv),
+            Operand::Scratch(Buf::GdnAlphaProj),
+            Operand::Scratch(Buf::GdnBetaProj),
+            Operand::Weight(at(Role::RecurrentDecayBias)),
+            Operand::Weight(at(Role::RecurrentDecayBase)),
+            Operand::Scratch(Buf::GdnGate),
+            Operand::Weight(at(Role::RecurrentNorm)),
+            Operand::U32(shape.gdn.head_dim),
+            Operand::U32(shape.gdn.qk_heads),
+            Operand::U32(shape.gdn.v_heads),
+            Operand::U32(shape.gdn_qk_dim()),
+            Operand::U32(2 * shape.gdn_qk_dim()),
+            Operand::f32(shape.rms_eps),
+        ]),
+    );
+    matmul::project(
+        &mut plan,
+        desc.out,
+        Bound::new(
+            at(Role::RecurrentOut),
+            Operand::Scratch(Buf::GdnGated),
+            Operand::Scratch(Buf::BlockOut),
+        ),
+        1,
         device,
     )?;
     Ok(plan)
