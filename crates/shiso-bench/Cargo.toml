@@ -53,6 +53,8 @@ tracing-subscriber = { workspace = true }
 # reference writes too; `from_f32` is the round-to-nearest-even conversion.
 half = { workspace = true }
 shiso-vision = { workspace = true }
+# The embedding bench frames its audio fixture into a clip.
+shiso-audio = { workspace = true }
 
 [lints]
 workspace = true
@@ -69,9 +71,6 @@ shiso-ir = { workspace = true }
 shiso-kvstore = { workspace = true }
 # The vocabulary: the single place in the workspace where text becomes TokenId.
 shiso-server = { workspace = true }
-# The speech contracts: a recognizer's tokens are the one TokenId, and the
-# recognizer, diarizer and audio tower stay reachable as trait objects.
-shiso-audio = { workspace = true }
 # `tests/layer_dump.rs` reads the sparse checkpoint's own metadata for its
 # configuration, so the device case needs one variable rather than a sidecar.
 shiso-modelfile = { workspace = true }

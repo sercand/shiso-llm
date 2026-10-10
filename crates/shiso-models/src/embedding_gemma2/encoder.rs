@@ -207,9 +207,9 @@ impl Encoder {
                 width,
                 cfg.eps,
             ))?;
-            lw.q.forward(ops, normed, q, rows)?;
-            lw.k.forward(ops, normed, k, rows)?;
-            lw.v.forward(ops, normed, v, rows)?;
+            lw.q.forward_few(ops, normed, q, rows)?;
+            lw.k.forward_few(ops, normed, k, rows)?;
+            lw.v.forward_few(ops, normed, v, rows)?;
             // Per head: a query or key row of `heads * hd` is `heads` rows
             // of `hd`, so the head norms are one launch over all of them.
             ops.rms_norm(&norm(
@@ -270,7 +270,7 @@ impl Encoder {
                 // `1/sqrt(hd)`: the reference multiplies by exactly 1.
                 scale: 1.0,
             })?;
-            lw.o.forward(ops, attn, block, rows)?;
+            lw.o.forward_few(ops, attn, block, rows)?;
             ops.rms_norm(&norm(
                 block,
                 block,
@@ -293,8 +293,8 @@ impl Encoder {
             let inter = cfg.intermediate;
             let gate = view(work.get(slot::GATE), rows * inter)?;
             let up = view(work.get(slot::UP), rows * inter)?;
-            lw.gate.forward(ops, normed, gate, rows)?;
-            lw.up.forward(ops, normed, up, rows)?;
+            lw.gate.forward_few(ops, normed, gate, rows)?;
+            lw.up.forward_few(ops, normed, up, rows)?;
             ops.gelu_tanh_mul(&GeluMulDesc {
                 out: gate,
                 gate,
@@ -304,7 +304,7 @@ impl Encoder {
                 up_stride: inter,
                 up_offset: 0,
             })?;
-            lw.down.forward(ops, gate, block, rows)?;
+            lw.down.forward_few(ops, gate, block, rows)?;
             ops.rms_norm(&norm(
                 block,
                 block,
@@ -324,7 +324,7 @@ impl Encoder {
             // gates a bottleneck over the stream.
             let pd = cfg.ple_dim;
             let ple = view(work.get(slot::PLE), rows * pd)?;
-            wts.ple_model_proj[l].forward(ops, x0, ple, rows)?;
+            wts.ple_model_proj[l].forward_few(ops, x0, ple, rows)?;
             ops.unary(&UnaryDesc {
                 op: UnaryOp::Scale(ple_scale),
                 out: ple,
@@ -333,7 +333,7 @@ impl Encoder {
             })?;
             ops.rms_norm(&norm(ple, ple, Some(&wts.ple_proj_norm), rows, pd, cfg.eps))?;
             let ple_gate = view(work.get(slot::GATE), rows * pd)?;
-            lw.ple_gate.forward(ops, stream, ple_gate, rows)?;
+            lw.ple_gate.forward_few(ops, stream, ple_gate, rows)?;
             ops.gelu_tanh_mul(&GeluMulDesc {
                 out: ple_gate,
                 gate: ple_gate,
@@ -343,7 +343,7 @@ impl Encoder {
                 up_stride: pd,
                 up_offset: 0,
             })?;
-            lw.ple_proj.forward(ops, ple_gate, block, rows)?;
+            lw.ple_proj.forward_few(ops, ple_gate, block, rows)?;
             ops.rms_norm(&norm(
                 block,
                 block,
