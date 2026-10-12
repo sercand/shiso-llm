@@ -815,6 +815,15 @@ impl Coordinator {
             )));
             return;
         }
+        // Refused before a session exists, as `open` refuses a generation:
+        // media this server cannot look at is the caller's to fix or the
+        // operator's to enable, and failing it later, mid-read, would reach
+        // the caller as a server fault.
+        if let Some(message) = self.media_refusal(&request.media) {
+            tracing::warn!(%message, "a scoring request carrying media could not be served");
+            let _ = reply.send(Err(AppError::bad_request(message, None, "invalid_media")));
+            return;
+        }
         // The sink of a stream nobody will read: a scoring sequence answers
         // through the reply, and a dropped receiver is what says so to every
         // send the retirement path makes anyway.

@@ -821,6 +821,10 @@ impl Model for Qwen35Model {
 /// The schema decision path, which a Clef checkpoint has because its head
 /// reads this stack's final rows.
 impl DecisionModel for Qwen35Model {
+    fn layout(&self) -> Arc<dyn shiso_core::DecisionLayout> {
+        Arc::new(crate::clef::ClefLayout)
+    }
+
     fn capture_hidden(&mut self, session: SessionId) -> CoreResult<()> {
         self.stack.capture_hidden(session)
     }

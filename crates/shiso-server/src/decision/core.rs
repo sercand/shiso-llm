@@ -779,17 +779,20 @@ pub(crate) struct PreparedQuestion {
 /// between input and block survives only when the caller's last block is
 /// text; after a picture the pad run already ends the text side, and the
 /// block follows plain.
+/// The IR block an input picture is decoded from.
+pub(crate) fn image_block(source: &InputImageSource) -> Block {
+    match source {
+        InputImageSource::Base64 { data, .. } => Block::Image(MediaSource::Inline(data.clone())),
+        InputImageSource::Url { url } => Block::Image(MediaSource::Remote(url.clone())),
+    }
+}
+
 fn blocks_message(blocks: &[InputBlock], kind: &Kind, labels: &[String]) -> Message {
     let mut parts: Vec<Block> = blocks
         .iter()
         .map(|block| match block {
             InputBlock::Text { text } => Block::Text(text.clone()),
-            InputBlock::Image(InputImageSource::Base64 { data, .. }) => {
-                Block::Image(MediaSource::Inline(data.clone()))
-            }
-            InputBlock::Image(InputImageSource::Url { url }) => {
-                Block::Image(MediaSource::Remote(url.clone()))
-            }
+            InputBlock::Image(source) => image_block(source),
         })
         .collect();
     let wording = question_block(kind, labels);

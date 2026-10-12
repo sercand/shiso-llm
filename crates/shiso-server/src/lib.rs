@@ -477,9 +477,10 @@ fn boot_language_model(
     // Before anything stands on a session: the tier is a property of the cache
     // the sessions draw their pages from, so it is chosen while there are none.
     let tier = open_checkpoint_tier(model.as_mut(), args);
-    // Asked before the model moves to the engine thread: the systemone route
-    // answers through the head when there is one, and the answer is fixed.
-    let decision_head = model.as_mut().decision_mut().is_some();
+    // Asked before the model moves to the engine thread: the decision routes
+    // answer through the head when there is one, and build its prompts on
+    // their own threads with the layout it hands over here.
+    let decision_layout = model.as_mut().decision_mut().map(|head| head.layout());
     // Shared with the request threads: `/cache` reads it and a queued request prefetches.
     let cache = tier.as_ref().and_then(|_| model.kv_cache());
 
@@ -546,7 +547,7 @@ fn boot_language_model(
     );
 
     let mut state = AppState::new(engine, model_id, args.ctx);
-    state.decision_head = decision_head;
+    state.decision_layout = decision_layout;
     if let Some(memory) = memory {
         state = state.with_memory(memory);
     }

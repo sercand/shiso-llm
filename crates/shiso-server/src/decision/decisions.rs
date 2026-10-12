@@ -21,6 +21,7 @@ use axum::response::{IntoResponse as _, Response};
 use crate::decision::core::{self, TemplateKwargs, prepare_question, run_questions};
 use crate::decision::decisions_encode::encode;
 use crate::decision::decisions_wire::{self, DecisionsBody};
+use crate::decision::head;
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -64,12 +65,20 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     let kwargs = TemplateKwargs::from_wire(kwargs_wire)?;
 
     // A decision checkpoint answers every question from one prompt through
-    // its head, at the caller's temperature.
-    if state.decision_head {
-        let text = crate::decision::clef::input_text(&input)?;
-        let (answers, prompt_tokens) =
-            crate::decision::clef::run(state, &text, questions, temperature, want_token_ids)
-                .await?;
+    // its head, at the caller's temperature, laid out the way its family
+    // lays it out.
+    if let Some(layout) = state.decision_layout.as_deref() {
+        let (text, media) = head::split_input(&input);
+        let (answers, prompt_tokens) = head::run(
+            state,
+            layout,
+            &text,
+            media,
+            questions,
+            temperature,
+            want_token_ids,
+        )
+        .await?;
         return Ok(Json(encode(model, &answers, prompt_tokens, want_token_ids)).into_response());
     }
 

@@ -433,6 +433,12 @@ pub struct DecisionQuestion {
 /// keeps every row the head needs, then asks for the scores once the prompt
 /// is complete. Nothing is generated.
 pub trait DecisionModel {
+    /// How this head's prompt is laid out.
+    ///
+    /// Taken once, before the model moves to the scheduler thread, and shared
+    /// with the request threads that build each prompt.
+    fn layout(&self) -> std::sync::Arc<dyn crate::decision::DecisionLayout>;
+
     /// Keeps the final normalized row of every prompt token `session` reads
     /// from now on, until [`DecisionModel::decide`] or the session closes.
     ///

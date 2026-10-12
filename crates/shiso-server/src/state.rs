@@ -118,9 +118,9 @@ pub struct AppState {
     /// [`AppState::image`], which answers the typed "no image model" error
     /// for a server that serves language or transcription alone.
     pub image: Option<crate::image::ImageService>,
-    /// Whether the loaded model carries a schema decision head, which is what
-    /// answers `/v1/systemone` when it does.
-    pub decision_head: bool,
+    /// The prompt layout of the loaded model's schema decision head, when it
+    /// carries one: what answers `/v1/decisions` and `/v1/systemone` then.
+    pub decision_layout: Option<Arc<dyn shiso_core::DecisionLayout>>,
     /// The embedding service, when the loaded model is an embedding model.
     ///
     /// Handlers reach it through [`AppState::embedding`], which answers the
@@ -148,7 +148,7 @@ impl AppState {
             memory: None,
             audio: None,
             image: None,
-            decision_head: false,
+            decision_layout: None,
             embedding: None,
         }
     }
@@ -172,7 +172,7 @@ impl AppState {
             memory: None,
             audio: None,
             image: None,
-            decision_head: false,
+            decision_layout: None,
             embedding: None,
         }
     }

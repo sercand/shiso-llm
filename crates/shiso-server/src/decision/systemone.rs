@@ -36,8 +36,9 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse as _, Response};
 
-use crate::decision::core::{TemplateKwargs, prepare_question, run_questions};
+use crate::decision::core::{self, TemplateKwargs, prepare_question, run_questions};
 use crate::decision::decisions_wire;
+use crate::decision::head;
 use crate::decision::systemone_encode::encode;
 use crate::decision::systemone_wire::{self, SystemOneBody};
 use crate::error::AppError;
@@ -86,22 +87,17 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     // media the blocks arm renders, and its item refusals are the wire's.
     let images_wire = parsed.images.take();
     let questions = parsed.validate()?;
+    let sources = systemone_wire::images_sources(images_wire.as_ref())?;
+    let kwargs = TemplateKwargs::from_wire(kwargs_wire)?;
+
     // A decision checkpoint answers every question from one prompt through
-    // its head. Its pictures would need a tower this build does not load for
-    // it, so they are refused rather than scored without.
-    if state.decision_head {
-        if images_wire
-            .as_ref()
-            .is_some_and(|images| !images.is_empty())
-        {
-            return Err(AppError::bad_request(
-                "this decision model reads text only; images are not supported",
-                Some("images"),
-                "invalid_request",
-            ));
-        }
+    // its head, pictures and all, laid out the way its family lays it out:
+    // the state as the caller sent it, and the pictures wherever the layout
+    // puts them.
+    if let Some(layout) = state.decision_layout.as_deref() {
+        let media = sources.iter().map(core::image_block).collect();
         let (answers, prompt_tokens) =
-            crate::decision::clef::run(state, &state_text, questions, 1.0, false).await?;
+            head::run(state, layout, &state_text, media, questions, 1.0, false).await?;
         return Ok(Json(encode(
             state.model_id.clone(),
             state_text,
@@ -110,15 +106,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
         ))
         .into_response());
     }
-    let sources = systemone_wire::images_sources(images_wire.as_ref())?;
-    let kwargs = TemplateKwargs::from_wire(kwargs_wire)?;
 
-    // Every question is prepared before any is scored, as on the decisions
-    // route, so a refusal to score the last criterion is a refusal rather
-    // than a partial answer already paid for. The scoring knobs this wire
-    // refused are gone, so temperature is 1 and no caller asked for token
-    // ids — `false` here because nothing can have said otherwise.
-    let mut prepared = Vec::with_capacity(questions.len());
     // Composition (spec §3): images before the state, clef's rule. With no
     // images the text arm is taken byte-for-byte as it always was; with
     // them the state enters as a *trimmed* text block, which is what keeps
@@ -138,6 +126,13 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
         }
         decisions_wire::DecisionInput::Blocks(blocks)
     };
+
+    // Every question is prepared before any is scored, as on the decisions
+    // route, so a refusal to score the last criterion is a refusal rather
+    // than a partial answer already paid for. The scoring knobs this wire
+    // refused are gone, so temperature is 1 and no caller asked for token
+    // ids — `false` here because nothing can have said otherwise.
+    let mut prepared = Vec::with_capacity(questions.len());
     for question in &questions {
         prepared.push(prepare_question(state, &input, question, &kwargs, false)?);
     }

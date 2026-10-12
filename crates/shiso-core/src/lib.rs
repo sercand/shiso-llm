@@ -25,6 +25,7 @@
 pub mod backend;
 pub mod buffer;
 pub mod config;
+pub mod decision;
 pub mod dtype;
 pub mod error;
 pub mod ids;
@@ -42,6 +43,10 @@ pub use buffer::{
     DeviceBuffer, DeviceView, HostBytes, RawBuffer, alloc, alloc_tagged, import_host,
 };
 pub use config::{HfConfig, HiddenAct, VisionConfig};
+pub use decision::{
+    DecisionLayout, DecisionLayoutError, DecisionMedia, DecisionMediaKind, DecisionPrompt,
+    DecisionRecord, PromptEncoder, SchemaAnswer, SchemaOption, SchemaQuestion,
+};
 pub use dtype::DType;
 pub use error::{Chain, CoreError, CoreResult, chain_of};
 pub use ids::{LayerIdx, Seed, SessionId, TokenId, TokenOutOfRange};

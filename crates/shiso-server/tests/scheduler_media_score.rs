@@ -16,6 +16,7 @@ use std::sync::atomic::Ordering;
 use serde_json::{Value, json};
 use shiso_core::TokenId;
 use shiso_ir::{Block, MediaSource, Message, Role};
+use shiso_server::error::AppError;
 use shiso_server::media::MediaItem;
 use shiso_server::scheduler::ScoreRequest;
 use shiso_server::tokenizer::Vocabulary;
@@ -195,6 +196,33 @@ async fn a_media_encode_failure_fails_the_score_reply() {
     // and the prompt was never read.
     assert!(outcome.is_err(), "the encode failure must fail the reply");
     assert_eq!(media_calls.load(Ordering::SeqCst), 0);
+
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
+}
+
+#[tokio::test]
+async fn media_on_a_server_without_a_tower_is_the_callers_error() {
+    let (item, digest) = one_picture();
+    let (engine, join, audit, media_calls) =
+        common::fake_media_engine_without_tower(vec![label_row()], Some(qwen_vocabulary()));
+
+    let error = engine
+        .score(
+            ScoreRequest::new(padded_prompt(), labels())
+                .with_media(Arc::from(vec![item]), Arc::from(vec![digest])),
+        )
+        .await
+        .expect_err("a picture with no tower to look at it is refused");
+
+    // Refused before a session opened, as a request the caller or the
+    // operator can fix - not as a server fault - and naming the flag.
+    assert!(matches!(error, AppError::BadRequest { .. }), "{error:?}");
+    assert!(error.to_string().contains("--vision"), "{error}");
+    assert_eq!(media_calls.load(Ordering::SeqCst), 0);
+    assert!(audit.prefill_chunks().is_empty(), "nothing was read");
 
     drop(engine);
     join.join()

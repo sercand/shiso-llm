@@ -17,11 +17,11 @@
 //! where their wires do - a `predicate` question and a `noul` criterion are the
 //! same `Kind::YesNo` underneath.
 
-pub(crate) mod clef;
 pub(crate) mod core;
 pub(crate) mod decisions;
 pub(crate) mod decisions_encode;
 pub(crate) mod decisions_wire;
+pub(crate) mod head;
 pub(crate) mod math;
 pub(crate) mod systemone;
 pub(crate) mod systemone_encode;
