@@ -88,6 +88,23 @@ impl MediaPlacement {
         audio_marker: Some("<|audio|>"),
         wrap_audio: Some(("<|audio>", "<audio|>")),
     };
+
+    /// The LFM2 vision-language family's placement: one `<image>` per soft
+    /// token, the run bracketed by `<|image_start|>` and `<|image_end|>`, no
+    /// clip and no audio.
+    ///
+    /// This is the single-tile layout. The family's processor also has a tiled
+    /// one, which interleaves `<|img_row_R_col_C|>` markers and a thumbnail run
+    /// inside the bracket; that layout is several runs per picture and is not
+    /// expressible as one marker and a wrap, which is why the tower never
+    /// produces it (see the family's vision module).
+    pub const LFM2: Self = Self {
+        image_marker: "<image>",
+        video_marker: None,
+        wrap_image: Some(("<|image_start|>", "<|image_end|>")),
+        audio_marker: None,
+        wrap_audio: None,
+    };
 }
 
 /// One request's encoder output, in the single block a splice can address.

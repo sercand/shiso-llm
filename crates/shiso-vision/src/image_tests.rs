@@ -645,3 +645,52 @@ fn webp_and_bmp_decode_to_the_same_item_as_png() {
         assert_eq!(got.as_flat(), want.as_flat(), "{format:?} pixels");
     }
 }
+
+/// The LFM2 vision-language spec at its shipped band: a 16-pixel patch under
+/// a 2x2 unshuffle, 64 to 256 merged tokens.
+fn lfm2() -> PreprocessSpec {
+    let geometry = crate::config::PatchGeometry::new(16, 1, 2).expect("a valid geometry");
+    PreprocessSpec::lfm2(geometry, 64, 256)
+}
+
+#[test]
+fn token_range_matches_transformers() {
+    // (h, w) -> (h', w'), each pair printed by transformers 5.19.0's own
+    // `Lfm2VlImageProcessor.smart_resize(h, w, 2, 64, 256, 16)`. The cases
+    // cover the in-band snap, both rescales, the half-unit ties (16 / 32 and
+    // 2000 / 32 both sit exactly on .5, and both go to even), and a strip.
+    let cases = [
+        ((384, 384), (384, 384)),
+        ((256, 1024), (256, 1024)),
+        ((480, 640), (416, 576)),
+        ((100, 100), (256, 256)),
+        ((1, 1), (256, 256)),
+        ((48, 48), (256, 256)),
+        ((720, 1280), (384, 672)),
+        ((3000, 40), (3008, 32)),
+        ((16, 2000), (32, 2880)),
+        ((1024, 1024), (512, 512)),
+        ((336, 592), (320, 576)),
+        ((80, 272), (160, 480)),
+    ];
+    for ((h, w), want) in cases {
+        assert_eq!(target_size_for(h, w, &lfm2(), None), want, "{h}x{w}");
+    }
+}
+
+#[test]
+fn a_token_range_target_stays_in_its_band() {
+    for (h, w) in [(1, 1), (17, 3999), (4000, 3000), (512, 512), (31, 33)] {
+        let (th, tw) = target_size_for(h, w, &lfm2(), None);
+        assert_eq!(th % GU, 0, "{h}x{w}");
+        assert_eq!(tw % GU, 0, "{h}x{w}");
+        let tokens = (th / GU) * (tw / GU);
+        assert!((64..=256).contains(&tokens), "{h}x{w} -> {tokens} tokens");
+    }
+}
+
+#[test]
+fn a_declared_area_bound_still_caps_the_token_range() {
+    let (th, tw) = target_size_for(1024, 1024, &lfm2(), bound(256 * 256));
+    assert!(u64::from(th) * u64::from(tw) <= 256 * 256);
+}

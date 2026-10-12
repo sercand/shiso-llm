@@ -1,0 +1,39 @@
+{
+  "model_dir": "/Users/sercand/.cache/huggingface/hub/models--LiquidAI--d1-3B/snapshots/051bcc464b01b9f92942b364d9586b0ef5912432",
+  "transformers": "5.19.0",
+  "torch": "2.14.1",
+  "dtype": "float32",
+  "device": "cpu",
+  "cases": [
+    {
+      "name": "square-384",
+      "height": 384,
+      "width": 384,
+      "grid_h": 24,
+      "grid_w": 24,
+      "tokens": 144,
+      "png_sha256": "259531792c69f198dc8cfad49ad898598e1fa25c350dd30956ecfc2010916f73",
+      "features_sha256": "f3984e4cfba308f5a2fa1b23c67dea03d54968516c6fcb5dc52ce265d7b29e58"
+    },
+    {
+      "name": "strip-96",
+      "height": 96,
+      "width": 1536,
+      "grid_h": 6,
+      "grid_w": 96,
+      "tokens": 144,
+      "png_sha256": "a71702ab659e22dabe5682e37d7ba6ac732987c4ca76e93ec94afc7777c680c0",
+      "features_sha256": "e1e82d5b27623a24a47a382ade1833321dfd1a6e2f7f33d70770b008717f2963"
+    },
+    {
+      "name": "photo-480",
+      "height": 480,
+      "width": 640,
+      "grid_h": 26,
+      "grid_w": 36,
+      "tokens": 234,
+      "png_sha256": "365759d9adb9c6086b9de01425e3c66ee1032723905980b7c7f49f1a3f29aaa2",
+      "features_sha256": "4aa0c40988ec3fe4f7c3d18274e4c94b2b9f59021cf45185cb736f85ab939c27"
+    }
+  ]
+}
