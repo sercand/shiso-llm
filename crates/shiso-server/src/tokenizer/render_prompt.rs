@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use shiso_core::{PadTokens, TokenId, VisionConfig};
-use shiso_ir::{Effort, Request, ThinkingDirective};
+use shiso_ir::{Block, Effort, Message, Request, Role, ThinkingDirective};
 use shiso_vision::{FfmpegPolicy, ImageLimits, MediaPlacement, PreprocessSpec};
 
 use shiso_audio::{AudioTower, DecodeLimits};
@@ -62,6 +62,18 @@ pub struct MediaSpan {
     pub tokens: std::ops::Range<usize>,
     /// The item's marker string in the rendered text, as byte offsets.
     pub text: std::ops::Range<usize>,
+}
+
+/// Media decoded for a prompt the template does not write.
+#[derive(Debug)]
+pub struct DecodedMedia {
+    /// The decoded media, in the order the blocks gave it.
+    pub media: Vec<MediaItem>,
+    /// Each item's content digest, index for index with `media`.
+    pub digests: Vec<MediaDigest>,
+    /// How many placeholder rows each item occupies, index for index with
+    /// `media`.
+    pub pad_counts: Vec<usize>,
 }
 
 /// A rendered prompt, in all three of the forms something downstream needs.
@@ -392,17 +404,7 @@ impl PromptRenderer {
     /// cannot encode the text the template produced, which is a checkpoint
     /// mismatch rather than a request defect.
     pub fn render(&self, request: &Request) -> Result<Rendered, AppError> {
-        let policy = MediaPolicy {
-            vision: self.vision.as_ref(),
-            limits: self.limits,
-            allow_remote: self.allow_remote,
-            ffmpeg: self.ffmpeg.as_ref(),
-            video_fps: self.video_fps,
-            audio: self.audio.as_deref(),
-            audio_limits: self.audio_limits,
-            audio_ffmpeg: self.audio_ffmpeg.as_ref(),
-            cache: self.media_cache.as_deref(),
-        };
+        let policy = self.media_policy();
         let mut prepared = preprocess(&request.system, &request.messages, &policy)
             .map_err(|error| AppError::bad_request(error.to_string(), None, "invalid_media"))?;
         // Special-token text a caller wrote is escaped here and read as plain
@@ -464,6 +466,43 @@ impl PromptRenderer {
             digests: prepared.digests,
             media_spans,
         })
+    }
+
+    /// Decodes the media in `blocks` for a prompt the template does not
+    /// write, under the same policy and cache [`PromptRenderer::render`]
+    /// uses: a decision head's layout places the runs itself, and needs only
+    /// how long each one is.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::BadRequest`] for media this server will not decode, the
+    /// same refusals `render` makes: a picture sent to a server with no tower
+    /// among them.
+    pub fn decode_media(&self, blocks: Vec<Block>) -> Result<DecodedMedia, AppError> {
+        let policy = self.media_policy();
+        let message = Message::new(Role::User, blocks);
+        let prepared = preprocess(&[], std::slice::from_ref(&message), &policy)
+            .map_err(|error| AppError::bad_request(error.to_string(), None, "invalid_media"))?;
+        Ok(DecodedMedia {
+            media: prepared.media,
+            digests: prepared.digests,
+            pad_counts: prepared.pad_counts,
+        })
+    }
+
+    /// What the media layer may do, as the operator configured it.
+    fn media_policy(&self) -> MediaPolicy<'_> {
+        MediaPolicy {
+            vision: self.vision.as_ref(),
+            limits: self.limits,
+            allow_remote: self.allow_remote,
+            ffmpeg: self.ffmpeg.as_ref(),
+            video_fps: self.video_fps,
+            audio: self.audio.as_deref(),
+            audio_limits: self.audio_limits,
+            audio_ffmpeg: self.audio_ffmpeg.as_ref(),
+            cache: self.media_cache.as_deref(),
+        }
     }
 
     /// The byte range of each template-written marker in the final `text`,

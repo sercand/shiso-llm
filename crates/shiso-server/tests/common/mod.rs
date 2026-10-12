@@ -747,10 +747,59 @@ impl Model for FakeModel {
     }
 }
 
+/// The fake head's layout: the state's characters, then one token per
+/// question and one per option, each its own span, in the caller's order.
+#[derive(Debug)]
+pub(crate) struct FakeLayout;
+
+impl shiso_core::DecisionLayout for FakeLayout {
+    fn encode(
+        &self,
+        encoder: &dyn shiso_core::PromptEncoder,
+        record: &shiso_core::DecisionRecord<'_>,
+    ) -> Result<shiso_core::DecisionPrompt, shiso_core::DecisionLayoutError> {
+        let mut tokens = encoder
+            .encode(record.state, std::slice::from_ref(&(0..record.state.len())))
+            .map_err(shiso_core::DecisionLayoutError::Encode)?;
+        let mut questions = Vec::with_capacity(record.questions.len());
+        let mut order = Vec::with_capacity(record.questions.len());
+        for question in record.questions {
+            let options = match &question.answer {
+                shiso_core::SchemaAnswer::YesNo { .. } => 2,
+                shiso_core::SchemaAnswer::Choice(options)
+                | shiso_core::SchemaAnswer::Score(options) => options.len(),
+            };
+            let span = tokens.len()..tokens.len() + 1;
+            tokens.push(TokenId::new(1));
+            let options: Vec<_> = (0..options)
+                .map(|_| {
+                    tokens.push(TokenId::new(2));
+                    tokens.len() - 1..tokens.len()
+                })
+                .collect();
+            order.push((0..options.len()).collect());
+            questions.push(DecisionQuestion {
+                kind: 0,
+                span,
+                options,
+            });
+        }
+        Ok(shiso_core::DecisionPrompt {
+            tokens,
+            questions,
+            order,
+        })
+    }
+}
+
 /// The fake's decision head: it answers [`decision_logit`] for every option,
 /// and only over a prompt whose every row its session read after the capture
 /// began - the real head's refusal when a resume left rows unread.
 impl DecisionModel for FakeModel {
+    fn layout(&self) -> Arc<dyn shiso_core::DecisionLayout> {
+        Arc::new(FakeLayout)
+    }
+
     fn capture_hidden(&mut self, session: SessionId) -> CoreResult<()> {
         if !self.open.contains(&session) {
             return Err(CoreError::UnknownSession(session));
@@ -1368,18 +1417,35 @@ pub(crate) fn fake_media_engine(
     vocabulary: Option<Arc<Vocabulary>>,
     fail_tower: bool,
 ) -> MediaEngine {
-    let backend: Arc<dyn Backend> = FakeBackend::new();
-    let (model, audit) = FakeModel::new(&backend, Vec::new());
-    let (model, media_calls) = FakeMediaModel::new(model.with_prefill_rows(rows));
     let tower = shiso_server::vision::VisionTower::from_tower(Box::new(FakeTower {
         spec: media_spec(),
         fail: fail_tower,
     }));
+    media_engine_with(rows, vocabulary, Some(tower))
+}
+
+/// As [`fake_media_engine`], with the media path and no vision tower: a
+/// server started without `--vision`.
+pub(crate) fn fake_media_engine_without_tower(
+    rows: Vec<Vec<f32>>,
+    vocabulary: Option<Arc<Vocabulary>>,
+) -> MediaEngine {
+    media_engine_with(rows, vocabulary, None)
+}
+
+fn media_engine_with(
+    rows: Vec<Vec<f32>>,
+    vocabulary: Option<Arc<Vocabulary>>,
+    vision: Option<shiso_server::vision::VisionTower>,
+) -> MediaEngine {
+    let backend: Arc<dyn Backend> = FakeBackend::new();
+    let (model, audit) = FakeModel::new(&backend, Vec::new());
+    let (model, media_calls) = FakeMediaModel::new(model.with_prefill_rows(rows));
     let (engine, join) = spawn_engine_with_checkpoints(
         backend,
         Box::new(model),
         shiso_server::media::MediaTowers {
-            vision: Some(tower),
+            vision,
             ..shiso_server::media::MediaTowers::default()
         },
         vocabulary,

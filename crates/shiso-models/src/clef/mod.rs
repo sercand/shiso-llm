@@ -25,6 +25,9 @@
 )]
 
 mod host;
+mod prompt;
+#[cfg(test)]
+mod prompt_tests;
 #[cfg(test)]
 mod tests;
 
@@ -42,6 +45,7 @@ use crate::audio_ops::{
 };
 
 use host::{HostNorm, l2_normalized, mean_rows};
+pub use prompt::ClefLayout;
 
 /// The architecture name a Clef GGUF declares.
 pub const ARCH: &str = "clef";
