@@ -25,5 +25,6 @@ pub mod misc;
 pub mod ple;
 pub mod q4_0;
 pub mod routed;
+pub mod short_conv;
 pub mod ssm;
 pub mod vision;

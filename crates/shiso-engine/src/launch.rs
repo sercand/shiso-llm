@@ -401,7 +401,7 @@ const _: () = assert!(DENSE_PLE_BLOCK_BYTES == DType::Q6_K.block_bytes().get() a
 pub const DENSE_PLE_SMEM_BYTES: u32 = 4 * (33 + DENSE_PLE_DIM);
 
 /// Elements in one `q6_K` block, which is the span a gather threadgroup unpacks.
-const QK_K: u32 = 256;
+pub(crate) const QK_K: u32 = 256;
 
 /// Threads per block of the `q6_K` gather.
 pub const GET_ROWS_BLOCK: u32 = 256;
@@ -2188,13 +2188,6 @@ pub(crate) const fn mm_grid(out_dim: u32, n_tok: u32) -> Extent3 {
         out_dim.div_ceil(GEMM_TILE_ROWS),
         1,
     )
-}
-
-/// Grid of a `q6_K` gather: one threadgroup per 256-element block of a row, one
-/// row per token.
-#[must_use]
-pub(crate) const fn get_rows_grid(in_dim: u32, n_tok: u32) -> Extent3 {
-    Extent3::new(in_dim.div_ceil(QK_K), n_tok, 1)
 }
 
 // ---------------------------------------------------------------------------------------

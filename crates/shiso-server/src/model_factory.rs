@@ -48,6 +48,7 @@ use shiso_engine::sparse::stack::SparseOptions;
 use shiso_models::gemma4::{
     Gemma4AudioTower, Gemma4Config, Gemma4Model, Gemma4Tower, PleOptions, holds_audio_tower,
 };
+use shiso_models::lfm2::{Lfm2Config, Lfm2Model};
 use shiso_models::nemotron_h::{NemotronHConfig, NemotronHModel};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::mtp::{self, AffineQuant, MtpManifest};
@@ -269,6 +270,22 @@ impl FamilyDefaults {
         speculates: false,
     };
 
+    /// Family defaults for the LFM2 hybrid.
+    ///
+    /// Its template wraps reasoning in Qwen 3's `<think>` tags but opens no
+    /// reasoning block of its own, so thinking defaults off. It writes a tool
+    /// call as a bracketed Python call list between `<|tool_call_start|>` and
+    /// `<|tool_call_end|>`, which no reader in this build parses, so a call
+    /// comes back as prose rather than being misread as another family's.
+    pub const LFM2: Self = Self {
+        reasoning: ReasoningScheme::Qwen3,
+        tools: ToolCallScheme::None,
+        thinking_default: false,
+        effort: EffortSpelling::STANDARD,
+        // No draft head exists for this family.
+        speculates: false,
+    };
+
     /// Family defaults for Gemma 4 models.
     pub const GEMMA4: Self = Self {
         reasoning: ReasoningScheme::Gemma4,
@@ -321,6 +338,9 @@ impl FamilyDefaults {
         if NemotronHConfig::describes_type(config.model_type()) {
             return Ok(Self::NEMOTRON_H);
         }
+        if Lfm2Config::describes(config) {
+            return Ok(Self::LFM2);
+        }
         Err(FactoryError::UnknownArchitecture {
             model_type: config.model_type().to_owned(),
         })
@@ -370,6 +390,16 @@ impl std::fmt::Debug for Loaded {
             .finish_non_exhaustive()
     }
 }
+
+/// The LFM2 template's placement: one `<image>` marker per picture, the run
+/// bracketed by the picture's start and end tokens.
+const LFM2_PLACEMENT: MediaPlacement = MediaPlacement {
+    image_marker: "<image>",
+    video_marker: None,
+    wrap_image: Some(("<|image_start|>", "<|image_end|>")),
+    audio_marker: None,
+    wrap_audio: None,
+};
 
 /// The Qwen family's opener.
 fn open_qwen35_tower(
@@ -612,6 +642,24 @@ pub fn load_model(
     // carries no typed view of it.
     if NemotronHConfig::describes_type(config.model_type()) {
         return load_nemotron_h(backend, path, opts, defaults);
+    }
+
+    // The LFM2 hybrid reads every width out of its container and checks the
+    // document's against them, so its reader takes the checkpoint too.
+    match Lfm2Config::from_hf(config, path) {
+        Ok(family) => {
+            let model =
+                Lfm2Model::load(backend, path, &family, opts).map_err(FactoryError::Load)?;
+            return Ok(Loaded {
+                model: Box::new(model),
+                open_tower: open_no_tower,
+                open_audio: no_audio_tower,
+                placement: LFM2_PLACEMENT,
+                defaults,
+            });
+        }
+        Err(CoreError::UnknownArch { .. }) => {}
+        Err(other) => return Err(FactoryError::Load(other)),
     }
 
     Err(FactoryError::UnknownArchitecture {
@@ -1224,6 +1272,7 @@ pub fn recognises(config: &HfConfig) -> bool {
     ) || Qwen35MoeConfig::describes(config)
         || Qwen4ExpConfig::describes(config)
         || Gemma4Config::describes(config)
+        || Lfm2Config::describes(config)
 }
 
 #[cfg(test)]

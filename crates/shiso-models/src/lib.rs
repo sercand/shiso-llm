@@ -26,6 +26,7 @@ pub mod gemma4;
 pub mod image_registry;
 #[cfg(test)]
 mod image_registry_tests;
+pub mod lfm2;
 pub mod nemotron_asr;
 pub mod nemotron_diar;
 pub mod nemotron_h;
@@ -52,5 +53,6 @@ pub fn family_catalog() -> &'static [FamilyFacts] {
         flux2::FACTS,
         qwen_image21::FACTS,
         embedding_gemma2::FACTS,
+        lfm2::FACTS,
     ]
 }

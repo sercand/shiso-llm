@@ -522,9 +522,9 @@ fn dense_expected(shape: &HybridShape) -> CoreResult<Vec<(String, Expect)>> {
                 ]);
             }
             // This family's shape holds neither; its config never states one.
-            LayerKind::Ssm => {
+            LayerKind::Ssm | LayerKind::ShortConv => {
                 return Err(CoreError::Unsupported {
-                    what: "a state-space slot in this family",
+                    what: "a state-space or short-convolution slot in this family",
                     backend: "qwen35",
                 });
             }
@@ -655,9 +655,9 @@ fn import_dense(
                 (Block::Attn(attn), rank)
             }
             // This family's shape holds neither; its config never states one.
-            LayerKind::Ssm => {
+            LayerKind::Ssm | LayerKind::ShortConv => {
                 return Err(CoreError::Unsupported {
-                    what: "a state-space slot in this family",
+                    what: "a state-space or short-convolution slot in this family",
                     backend: "qwen35",
                 });
             }
@@ -732,6 +732,7 @@ mod tests {
             v_norm: false,
             moe: None,
             ssm: None,
+            short_conv: None,
             no_ffn: Vec::new(),
         }
     }

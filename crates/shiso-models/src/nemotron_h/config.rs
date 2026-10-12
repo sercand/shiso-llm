@@ -237,6 +237,7 @@ impl NemotronHConfig {
                 groups: doc.n_groups,
                 conv_kernel: doc.conv_kernel,
             }),
+            short_conv: None,
             no_ffn,
         };
         shape.validate()?;

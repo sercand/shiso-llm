@@ -219,6 +219,11 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "dense/dense_moe.metal",
         include_str!("../metal/dense/dense_moe.metal"),
     ),
+    // The gated short convolution block's one sequential kernel.
+    (
+        "dense/dense_short_conv.metal",
+        include_str!("../metal/dense/dense_short_conv.metal"),
+    ),
     // --- qwen35moe kernel set; appended, nothing above this line changed. The
     // header comes first, for the same reason the qwen35, vision and dense
     // headers do: the files after it use its argument block and its affine

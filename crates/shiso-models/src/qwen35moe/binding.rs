@@ -83,7 +83,7 @@ pub fn expected_tensors(shape: &HybridShape) -> Vec<String> {
                 }
             }
             // This family's shape holds neither; its config never states one.
-            LayerKind::Ssm => {}
+            LayerKind::Ssm | LayerKind::ShortConv => {}
         }
         // The router itself, the shared expert's own scalar gate, the shared
         // expert, and then one tensor per expert per projection - which is what

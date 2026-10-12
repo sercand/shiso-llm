@@ -81,6 +81,7 @@ fn shape() -> HybridShape {
         v_norm: false,
         moe: None,
         ssm: None,
+        short_conv: None,
         no_ffn: Vec::new(),
     }
 }

@@ -71,6 +71,7 @@ mod sampling;
 mod sampling_probs;
 mod sessions;
 pub mod shape;
+pub mod short_conv;
 pub mod sparse;
 pub mod ssm;
 mod stack;

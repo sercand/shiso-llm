@@ -467,6 +467,16 @@ struct dense_args_ssm_norm {
     uint32_t pad2;
 };
 
+/// The gated short convolution (`dense_short_conv.metal`). Each input-projection
+/// row is `3 * channels` floats wide, `[b | c | x]`; there is no bias and no
+/// activation, so no other field is needed.
+struct dense_args_short_conv {
+    uint32_t n_tok;
+    uint32_t channels;
+    uint32_t taps;
+    uint32_t pad0;
+};
+
 /// The biased sigmoid router (`dense_moe.metal`): `norm` non-zero renormalizes
 /// the chosen weights to sum to one before `scale` multiplies them.
 struct dense_args_moe_route {

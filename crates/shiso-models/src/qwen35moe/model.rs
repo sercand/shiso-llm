@@ -381,9 +381,9 @@ fn import_weights(
                 (Block::Attn(import_attn(backend, file, slot)?), rank)
             }
             // This family's shape holds neither; its config never states one.
-            LayerKind::Ssm => {
+            LayerKind::Ssm | LayerKind::ShortConv => {
                 return Err(CoreError::Unsupported {
-                    what: "a state-space slot in this family",
+                    what: "a state-space or short-convolution slot in this family",
                     backend: "qwen35",
                 });
             }

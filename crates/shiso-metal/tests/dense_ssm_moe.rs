@@ -1,4 +1,5 @@
-//! Metal's run of the shared state-space and routed feed-forward cases.
+//! Metal's run of the shared state-space, short-convolution and routed
+//! feed-forward cases.
 //!
 //! The pipeline check is not ignore-gated; the rest run with
 //! `cargo test -p shiso-metal --features metal --test dense_ssm_moe -- --ignored`.
@@ -8,7 +9,7 @@ use std::sync::Arc;
 
 use shiso_core::{Backend, KernelRef};
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::dense::{routed, ssm};
+use shiso_kerneltest::dense::{routed, short_conv, ssm};
 use shiso_metal::MetalBackend;
 
 /// Opens the device, or says on stderr why the cases did not run.
@@ -37,7 +38,11 @@ fn every_entry_point_resolves_as_a_pipeline() {
         return;
     }
     let backend = MetalBackend::new().expect("the embedded kernel library compiles");
-    for entry in ssm::ENTRIES.iter().chain(routed::ENTRIES.iter()) {
+    for entry in ssm::ENTRIES
+        .iter()
+        .chain(routed::ENTRIES.iter())
+        .chain(short_conv::ENTRIES.iter())
+    {
         backend
             .prepare(KernelRef::new("dense", entry))
             .unwrap_or_else(|err| panic!("{entry} does not resolve: {err}"));
@@ -56,6 +61,13 @@ fn ssm_conv_carries_its_window_across_chunks() {
 fn ssm_scan_carries_its_state_across_chunks() {
     let Some(gpu) = open() else { return };
     ssm::ssm_scan_carries_its_state_across_chunks(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn short_conv_carries_its_window_across_chunks() {
+    let Some(gpu) = open() else { return };
+    short_conv::short_conv_carries_its_window_across_chunks(&gpu);
 }
 
 #[test]

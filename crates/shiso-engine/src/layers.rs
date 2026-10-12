@@ -37,6 +37,7 @@ use crate::sessions::Session;
 use crate::shape::{
     Activation, HybridShape, LayerKind, MediaPositions, MoeShape, NormScheme, PerLayerShape,
 };
+use crate::short_conv::{ShortConv, ShortConvGeometry, ShortConvScratch};
 use crate::ssm::{Ssm, SsmGeometry, SsmScratch};
 use crate::vision::{self, MediaChunk};
 
@@ -261,6 +262,9 @@ pub enum Block {
     /// A state-space slot, whose ordinal indexes the session's recurrent stack
     /// as a [`Block::Gdn`] slot's does.
     Ssm(Ssm),
+    /// A gated short-convolution slot, whose ordinal indexes the session's
+    /// recurrent stack as a [`Block::Gdn`] slot's does.
+    ShortConv(ShortConv),
 }
 
 /// The routed half of a slot, in one of the two router and expert shapes.
@@ -485,6 +489,8 @@ pub struct Geometry {
     pub gdn: Option<GdnGeometry>,
     /// State-space block widths, or `None` for a stack with no such slots.
     pub ssm: Option<SsmGeometry>,
+    /// Short-convolution block widths, or `None` for a stack with no such slots.
+    pub short_conv: Option<ShortConvGeometry>,
     /// Whether each slot has a feed-forward half, index zero first.
     pub has_ffn: Vec<bool>,
     /// Attention-block widths, one per attention slot in slot order.
@@ -595,6 +601,17 @@ impl Geometry {
                 });
             }
         };
+        let short_conv = match (shape.count(LayerKind::ShortConv), shape.short_conv) {
+            (0, _) => None,
+            (_, Some(short)) => Some(ShortConvGeometry::new(short, shape.hidden)?),
+            (_, None) => {
+                return Err(CoreError::ShapeMismatch {
+                    field: "short-convolution geometry",
+                    expected: 1,
+                    got: 0,
+                });
+            }
+        };
         let has_ffn = (0..shape.n_layers())
             .map(|il| shape.has_ffn(shiso_core::ids::LayerIdx::new(il)))
             .collect();
@@ -618,6 +635,7 @@ impl Geometry {
             ple,
             gdn,
             ssm,
+            short_conv,
             has_ffn,
             attn,
             attn_scratch,
@@ -699,6 +717,10 @@ fn per_layer(ple: PerLayerShape, layers: u32) -> CoreResult<PerLayerGeometry> {
     })
 }
 
+/// Elements of one `q8_0` or `q4_0` block, which is what their gathers
+/// index a threadgroup by.
+const GATHER_BLOCK_32: u32 = 32;
+
 /// The row-gather entry point one embedding format is read by.
 ///
 /// A typed reference rather than a formatted name: the three formats that have a
@@ -710,6 +732,13 @@ pub struct EmbedKernel {
     module: &'static str,
     /// The entry point itself.
     entry: &'static str,
+    /// Elements of a row one threadgroup writes: the format's block.
+    ///
+    /// The gathers index their threadgroups by block, so the grid has to be
+    /// counted in the same unit. A 256-element span for a format whose block
+    /// is 32 launches an eighth of the threadgroups, and every row comes back
+    /// with its first 256 values right and the rest left as they were.
+    span: u32,
 }
 
 impl EmbedKernel {
@@ -731,22 +760,27 @@ impl EmbedKernel {
             DType::Q6_K => Some(Self {
                 module: launch::Q35,
                 entry: "kernel_get_rows_q6_K_f32",
+                span: launch::QK_K,
             }),
             DType::F16 => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_f16_f32",
+                span: launch::QK_K,
             }),
             DType::Q4_K => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_q4_K_f32",
+                span: launch::QK_K,
             }),
             DType::Q8_0 => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_q8_0_f32",
+                span: GATHER_BLOCK_32,
             }),
             DType::Q4_0 => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_q4_0_f32",
+                span: GATHER_BLOCK_32,
             }),
             // The Saluki export stores its vocabulary table in `iq1_m`; the
             // gather takes the same argument block as the other five, so it
@@ -754,10 +788,12 @@ impl EmbedKernel {
             DType::IQ1_M => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_iq1_m_f32",
+                span: launch::QK_K,
             }),
             DType::MlxAffine4Gs64 => Some(Self {
                 module: launch::DENSE,
                 entry: "kernel_dense_embed_affine4_f32",
+                span: launch::QK_K,
             }),
             // The ternary set's gathers take an argument block of their own;
             // [`embed_rows`] launches them on a branch of their own, and this
@@ -767,6 +803,7 @@ impl EmbedKernel {
                     Some(entry) => Some(Self {
                         module: launch::TERNARY,
                         entry,
+                        span: launch::QK_K,
                     }),
                     None => None,
                 }
@@ -870,6 +907,8 @@ pub struct Scratch {
     gdn: Option<GdnScratch>,
     /// State-space block scratch, absent when the stack has no such slots.
     ssm: Option<SsmScratch>,
+    /// Short-convolution block scratch, absent when the stack has no such slots.
+    short_conv: Option<ShortConvScratch>,
     /// Attention-block scratch, sized for the widest attention slot.
     attn: AttnScratch,
 }
@@ -939,6 +978,11 @@ impl Scratch {
                 .ssm
                 .as_ref()
                 .map(|ssm| SsmScratch::new(backend, ssm, rows))
+                .transpose()?,
+            short_conv: geometry
+                .short_conv
+                .as_ref()
+                .map(|short| ShortConvScratch::new(backend, short, rows))
                 .transpose()?,
             attn: AttnScratch::new(backend, &geometry.attn_scratch, rows)?,
         })
@@ -1193,8 +1237,8 @@ fn gather_rows(
     launch::run(
         backend,
         KernelRef::new(geometry.embed.module, geometry.embed.entry),
-        launch::get_rows_grid(geometry.hidden, n_tok),
-        Extent3::new(launch::GET_ROWS_BLOCK, 1, 1),
+        Extent3::new(geometry.hidden.div_ceil(geometry.embed.span), n_tok, 1),
+        Extent3::new(geometry.embed.span.min(launch::GET_ROWS_BLOCK), 1, 1),
         0,
         &[
             KernelArg::Bytes(bytemuck::bytes_of(&args)),
@@ -1754,7 +1798,7 @@ pub(crate) fn forward(
     let mut per_row_states: Vec<GdnState<'_>> = Vec::new();
     for (index, layer) in weights.layers.iter().enumerate() {
         match &layer.block {
-            Block::Gdn(_) | Block::Ssm(_) => {
+            Block::Gdn(_) | Block::Ssm(_) | Block::ShortConv(_) => {
                 let states = match rows {
                     PassRows::Chunk(session) => {
                         let state = session.gdn(layer.ordinal)?;
@@ -1803,6 +1847,17 @@ pub(crate) fn forward(
                     Block::Ssm(ssm) => {
                         let (ssm_geometry, ssm_scratch) = state_space_slot(geometry, scratch)?;
                         crate::ssm::run(backend, ssm, ssm_geometry, ssm_scratch, io, n_tok)?;
+                    }
+                    Block::ShortConv(short) => {
+                        let (short_geometry, short_scratch) = short_conv_slot(geometry, scratch)?;
+                        crate::short_conv::run(
+                            backend,
+                            short,
+                            short_geometry,
+                            short_scratch,
+                            io,
+                            n_tok,
+                        )?;
                     }
                     Block::Attn(_) => {}
                 }
@@ -1932,6 +1987,7 @@ pub(crate) fn forward(
                     Block::Gdn(_) => "gdn",
                     Block::Attn(_) => "attn",
                     Block::Ssm(_) => "ssm",
+                    Block::ShortConv(_) => "short_conv",
                 }
             ),
             scratch.stream[cur].view(),
@@ -2071,6 +2127,22 @@ fn state_space_slot<'a>(
         (Some(ssm), Some(rows)) => Ok((ssm, rows)),
         _ => Err(CoreError::ShapeMismatch {
             field: "state-space geometry",
+            expected: 1,
+            got: 0,
+        }),
+    }
+}
+
+/// The short-convolution widths and scratch a short-convolution slot runs
+/// over, or the refusal for a stack whose geometry has none.
+fn short_conv_slot<'a>(
+    geometry: &'a Geometry,
+    scratch: &'a Scratch,
+) -> CoreResult<(&'a ShortConvGeometry, &'a ShortConvScratch)> {
+    match (geometry.short_conv.as_ref(), scratch.short_conv.as_ref()) {
+        (Some(short), Some(rows)) => Ok((short, rows)),
+        _ => Err(CoreError::ShapeMismatch {
+            field: "short-convolution geometry",
             expected: 1,
             got: 0,
         }),
