@@ -646,20 +646,8 @@ pub fn load_model(
 
     // The LFM2 hybrid reads every width out of its container and checks the
     // document's against them, so its reader takes the checkpoint too.
-    match Lfm2Config::from_hf(config, path) {
-        Ok(family) => {
-            let model =
-                Lfm2Model::load(backend, path, &family, opts).map_err(FactoryError::Load)?;
-            return Ok(Loaded {
-                model: Box::new(model),
-                open_tower: open_no_tower,
-                open_audio: no_audio_tower,
-                placement: LFM2_PLACEMENT,
-                defaults,
-            });
-        }
-        Err(CoreError::UnknownArch { .. }) => {}
-        Err(other) => return Err(FactoryError::Load(other)),
+    if Lfm2Config::describes(config) {
+        return load_lfm2(backend, path, config, opts, defaults);
     }
 
     Err(FactoryError::UnknownArchitecture {
@@ -687,6 +675,29 @@ fn load_nemotron_h(
         // The template writes no media marker; the placement is only what a
         // renderer is configured with.
         placement: MediaPlacement::QWEN35,
+        defaults,
+    })
+}
+
+/// The LFM2 arm: a GGUF container whose geometry is its own metadata.
+///
+/// # Errors
+///
+/// [`FactoryError::Load`] for whatever the config or the checkpoint refuses.
+fn load_lfm2(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    let family = Lfm2Config::from_hf(config, path).map_err(FactoryError::Load)?;
+    let model = Lfm2Model::load(backend, path, &family, opts).map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_lfm2_tower,
+        open_audio: no_audio_tower,
+        placement: Lfm2Tower::PLACEMENT,
         defaults,
     })
 }
