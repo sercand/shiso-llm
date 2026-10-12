@@ -167,7 +167,7 @@ pub fn run(
         scratch.proj.view(),
     )?;
     match io.states {
-        GdnStates::Chunk(state) => conv(backend, block, geometry, scratch, 0, n_tok, state)?,
+        GdnStates::Chunk(state) => conv(backend, block, *geometry, scratch, 0, n_tok, state)?,
         GdnStates::PerRow(states) => {
             if states.len() != n_tok as usize {
                 return Err(CoreError::ShapeMismatch {
@@ -177,7 +177,7 @@ pub fn run(
                 });
             }
             for (row, state) in (0..n_tok).zip(states) {
-                conv(backend, block, geometry, scratch, row, 1, *state)?;
+                conv(backend, block, *geometry, scratch, row, 1, *state)?;
             }
         }
     }
@@ -204,7 +204,7 @@ fn rows_of(buffer: &DeviceBuffer, width: u32, first: u32, rows: u32) -> CoreResu
 fn conv(
     backend: &dyn Backend,
     block: &ShortConv,
-    geometry: &ShortConvGeometry,
+    geometry: ShortConvGeometry,
     scratch: &ShortConvScratch,
     first: u32,
     rows: u32,

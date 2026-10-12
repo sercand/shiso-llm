@@ -522,6 +522,37 @@ impl HybridShape {
             .saturating_add(self.count(LayerKind::ShortConv))
     }
 
+    /// Refuses a stack that mixes recurrent kinds or names one without its
+    /// geometry: the session's recurrent records are one size, and each
+    /// kind's state is its own size.
+    fn validate_recurrent(&self) -> CoreResult<()> {
+        let kinds = [LayerKind::Gdn, LayerKind::Ssm, LayerKind::ShortConv]
+            .into_iter()
+            .filter(|kind| self.count(*kind) > 0)
+            .count();
+        if kinds > 1 {
+            return Err(CoreError::Unsupported {
+                what: "more than one recurrent block kind in one stack",
+                backend: "engine",
+            });
+        }
+        if self.count(LayerKind::Ssm) > 0 && self.ssm.is_none() {
+            return Err(CoreError::ShapeMismatch {
+                field: "state-space geometry",
+                expected: 1,
+                got: 0,
+            });
+        }
+        if self.count(LayerKind::ShortConv) > 0 && self.short_conv.is_none() {
+            return Err(CoreError::ShapeMismatch {
+                field: "short-convolution geometry",
+                expected: 1,
+                got: 0,
+            });
+        }
+        self.validate_no_ffn()
+    }
+
     /// Refuses a [`Self::no_ffn`] list that is not ascending slots of this
     /// stack.
     fn validate_no_ffn(&self) -> CoreResult<()> {
@@ -666,31 +697,7 @@ impl HybridShape {
     pub fn validate(&self) -> CoreResult<()> {
         // One recurrent kind a stack: the session's recurrent records are one
         // size, and each kind's state is its own size.
-        let kinds = [LayerKind::Gdn, LayerKind::Ssm, LayerKind::ShortConv]
-            .into_iter()
-            .filter(|kind| self.count(*kind) > 0)
-            .count();
-        if kinds > 1 {
-            return Err(CoreError::Unsupported {
-                what: "more than one recurrent block kind in one stack",
-                backend: "engine",
-            });
-        }
-        self.validate_no_ffn()?;
-        if self.count(LayerKind::Ssm) > 0 && self.ssm.is_none() {
-            return Err(CoreError::ShapeMismatch {
-                field: "state-space geometry",
-                expected: 1,
-                got: 0,
-            });
-        }
-        if self.count(LayerKind::ShortConv) > 0 && self.short_conv.is_none() {
-            return Err(CoreError::ShapeMismatch {
-                field: "short-convolution geometry",
-                expected: 1,
-                got: 0,
-            });
-        }
+        self.validate_recurrent()?;
         // Before the attention walk, because it is the cheapest of the six and
         // the one whose failure is widest: a token routed past the expert list
         // reads a matrix that is not an expert at all.
