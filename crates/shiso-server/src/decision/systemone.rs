@@ -39,6 +39,7 @@ use axum::response::{IntoResponse as _, Response};
 use crate::decision::core::{self, TemplateKwargs, prepare_question, run_questions};
 use crate::decision::decisions_wire;
 use crate::decision::head;
+use crate::decision::readout;
 use crate::decision::systemone_encode::encode;
 use crate::decision::systemone_wire::{self, SystemOneBody};
 use crate::error::AppError;
@@ -83,6 +84,12 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     // not among them: the response names the served model.
     let kwargs_wire = parsed.chat_template_kwargs.clone();
     let state_text = parsed.state_text();
+    // A readout family spells a structured state its own way, from the value
+    // the caller sent rather than from the wire's compact rendering of it.
+    let readout_state = state
+        .decision_readout
+        .as_deref()
+        .and_then(|readout| readout::spell_state(parsed.state.as_ref(), readout.state_spelling()));
     // `images` is taken out the same way: it is not a scored text, it is the
     // media the blocks arm renders, and its item refusals are the wire's.
     let images_wire = parsed.images.take();
@@ -98,6 +105,29 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
         let media = sources.iter().map(core::image_block).collect();
         let (answers, prompt_tokens) =
             head::run(state, layout, &state_text, media, questions, 1.0, false).await?;
+        return Ok(Json(encode(
+            state.model_id.clone(),
+            state_text,
+            &answers,
+            prompt_tokens,
+        ))
+        .into_response());
+    }
+
+    // A decision checkpoint with no head answers each question from its own
+    // prompt's next-token row, laid out the way its family lays it out.
+    if let Some(layout) = state.decision_readout.as_deref() {
+        let media = sources.iter().map(core::image_block).collect();
+        let (answers, prompt_tokens) = readout::run(
+            state,
+            layout,
+            readout_state.as_deref(),
+            media,
+            questions,
+            1.0,
+            false,
+        )
+        .await?;
         return Ok(Json(encode(
             state.model_id.clone(),
             state_text,

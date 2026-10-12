@@ -128,6 +128,23 @@ pub enum DecisionLayoutError {
     /// The tokenizer refused the text.
     #[error("the decision prompt could not be encoded")]
     Encode(#[source] CoreError),
+    /// A layout that cuts nothing laid out a prompt longer than the budget.
+    #[error("the decision prompt needs {tokens} tokens, and the prompt holds {budget}")]
+    PromptTooLong {
+        /// Tokens the longest question's prompt needs.
+        tokens: usize,
+        /// Tokens the prompt may hold.
+        budget: usize,
+    },
+    /// The vocabulary cannot spell a question's answers as single tokens, so
+    /// no row could be read for them.
+    #[error("question {question}: {reason}")]
+    Unreadable {
+        /// The question's index in the schema.
+        question: usize,
+        /// What the vocabulary lacks.
+        reason: String,
+    },
 }
 
 /// The tokenizer, as a layout reaches it.
@@ -161,4 +178,140 @@ pub trait DecisionLayout: Send + Sync + fmt::Debug {
         encoder: &dyn PromptEncoder,
         record: &DecisionRecord<'_>,
     ) -> Result<DecisionPrompt, DecisionLayoutError>;
+}
+
+/// How a structured state - a JSON object or array, rather than a string -
+/// is spelled before a readout layout reads it.
+///
+/// A checkpoint was trained on one spelling, and the bytes are scored, so the
+/// spelling is the family's call and not the wire's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateSpelling {
+    /// Compact JSON with every object's keys sorted, the wire's own default.
+    CompactSorted,
+    /// JSON indented two spaces, keys in the order the caller sent them, and
+    /// non-ASCII text left unescaped.
+    Indented,
+}
+
+/// Everything a readout layout reads to build one decision's prompts.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadoutRecord<'a> {
+    /// The state the questions are asked about, already spelled as text;
+    /// `None` when the caller sent none and the media are the whole state.
+    pub state: Option<&'a str>,
+    /// The decoded media, in the order their rows will be spliced.
+    pub media: &'a [DecisionMedia],
+    /// The schema, in the caller's order.
+    pub questions: &'a [SchemaQuestion],
+    /// The most tokens one question's prompt may hold: the server's context.
+    pub budget: usize,
+}
+
+/// One question of a readout decision: its continuation of the shared trunk,
+/// and the tokens each of its options is read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadoutQuestion {
+    /// The tokens after the trunk, ending at the answer slot.
+    pub branch: Vec<TokenId>,
+    /// One group per option, in the caller's order. An option scores the best
+    /// of its group's log-probabilities, so a group is every spelling of that
+    /// answer the model may put its mass on - `yes` and `Yes`, a code with
+    /// and without a leading space.
+    pub options: Vec<Vec<TokenId>>,
+}
+
+impl ReadoutQuestion {
+    /// Every token the answer slot is read at, the groups back to back: the
+    /// label list a scoring pass is asked for.
+    #[must_use]
+    pub fn labels(&self) -> Vec<TokenId> {
+        self.options.iter().flatten().copied().collect()
+    }
+
+    /// Folds the log-probabilities of [`ReadoutQuestion::labels`], in that
+    /// order, into one score per option: the maximum over its group.
+    ///
+    /// A missing entry reads as impossible rather than panicking: the caller
+    /// asked for exactly these labels, so a short vector is a bug a test sees
+    /// as a zero probability.
+    #[must_use]
+    pub fn pool(&self, label_logprobs: &[f64]) -> Vec<f64> {
+        let mut at = 0usize;
+        self.options
+            .iter()
+            .map(|group| {
+                let best = label_logprobs
+                    .get(at..at + group.len())
+                    .unwrap_or(&[])
+                    .iter()
+                    .fold(f64::NEG_INFINITY, |best, value| best.max(*value));
+                at += group.len();
+                best
+            })
+            .collect()
+    }
+}
+
+/// The prompts a readout layout lays a decision out as.
+///
+/// Every question's prompt is `trunk` followed by its own branch: the trunk
+/// holds what all questions share - the state and its pictures - so a server
+/// can read it once and continue it per question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadoutPrompt {
+    /// The tokens every question's prompt opens with, media runs at full
+    /// length.
+    pub trunk: Vec<TokenId>,
+    /// One entry per question, in the caller's order.
+    pub questions: Vec<ReadoutQuestion>,
+}
+
+/// A decision family that answers from the next-token distribution at an
+/// answer slot rather than through a head.
+///
+/// Each question gets its own prompt, and the answer is a softmax over the
+/// best log-probability each option's token group has at the prompt's last
+/// row. The wording, the option codes and which spellings count are the
+/// checkpoint's own, which is why the layout lives with the family and the
+/// server only reads rows.
+pub trait DecisionReadout: Send + Sync + fmt::Debug {
+    /// How a structured state is spelled before [`DecisionReadout::encode`]
+    /// reads it.
+    fn state_spelling(&self) -> StateSpelling;
+
+    /// Lays `record` out as a shared trunk and one branch per question.
+    ///
+    /// # Errors
+    ///
+    /// [`DecisionLayoutError::PromptTooLong`] when a question's prompt does
+    /// not fit the budget, [`DecisionLayoutError::Unreadable`] when the
+    /// vocabulary cannot spell a question's answers as single tokens, and
+    /// [`DecisionLayoutError::Encode`] when the tokenizer refuses.
+    fn encode(
+        &self,
+        encoder: &dyn PromptEncoder,
+        record: &ReadoutRecord<'_>,
+    ) -> Result<ReadoutPrompt, DecisionLayoutError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadoutQuestion;
+    use crate::ids::TokenId;
+
+    #[test]
+    fn each_option_scores_the_best_of_its_group() {
+        let question = ReadoutQuestion {
+            branch: Vec::new(),
+            options: vec![
+                vec![TokenId::new(1), TokenId::new(2)],
+                vec![TokenId::new(3)],
+            ],
+        };
+        assert_eq!(question.labels().len(), 3);
+        assert_eq!(question.pool(&[-3.0, -1.0, -2.0]), vec![-1.0, -2.0]);
+        // A short vector leaves the option impossible, never a panic.
+        assert_eq!(question.pool(&[-3.0]), vec![f64::NEG_INFINITY; 2]);
+    }
 }

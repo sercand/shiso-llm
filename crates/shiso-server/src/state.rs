@@ -121,6 +121,10 @@ pub struct AppState {
     /// The prompt layout of the loaded model's schema decision head, when it
     /// carries one: what answers `/v1/decisions` and `/v1/systemone` then.
     pub decision_layout: Option<Arc<dyn shiso_core::DecisionLayout>>,
+    /// The answer-slot readout of a decision checkpoint that has no head:
+    /// what answers `/v1/decisions` and `/v1/systemone` when
+    /// [`AppState::decision_layout`] is `None` and this is not.
+    pub decision_readout: Option<Arc<dyn shiso_core::DecisionReadout>>,
     /// The embedding service, when the loaded model is an embedding model.
     ///
     /// Handlers reach it through [`AppState::embedding`], which answers the
@@ -149,6 +153,7 @@ impl AppState {
             audio: None,
             image: None,
             decision_layout: None,
+            decision_readout: None,
             embedding: None,
         }
     }
@@ -173,6 +178,7 @@ impl AppState {
             audio: None,
             image: None,
             decision_layout: None,
+            decision_readout: None,
             embedding: None,
         }
     }

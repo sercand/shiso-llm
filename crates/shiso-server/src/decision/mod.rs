@@ -23,6 +23,7 @@ pub(crate) mod decisions_encode;
 pub(crate) mod decisions_wire;
 pub(crate) mod head;
 pub(crate) mod math;
+pub(crate) mod readout;
 pub(crate) mod systemone;
 pub(crate) mod systemone_encode;
 pub(crate) mod systemone_wire;

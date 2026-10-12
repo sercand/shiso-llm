@@ -1,0 +1,1294 @@
+{
+ "cases": [
+  {
+   "name": "noul_plain",
+   "state": "I was charged twice this month, please refund one of them.",
+   "questions": [
+    {
+     "type": "noul",
+     "instructions": "Is the customer asking for a refund?"
+    }
+   ],
+   "prefix_text": "<|startoftext|><|im_start|>user\nI was charged twice this month, please refund one of them.\n\n\nQUESTION:\n",
+   "suffix_texts": [
+    "Is the customer asking for a refund?\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "text": "<|startoftext|><|im_start|>user\nI was charged twice this month, please refund one of them.\n\n\nQUESTION:\nIs the customer asking for a refund?\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    49,
+    452,
+    14917,
+    10625,
+    532,
+    5304,
+    20,
+    8193,
+    52966,
+    734,
+    302,
+    876,
+    64673,
+    63509,
+    833,
+    4439,
+    278,
+    13107,
+    13564,
+    374,
+    267,
+    52966,
+    64929,
+    57922,
+    415,
+    18171,
+    432,
+    794,
+    1049,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207
+   ],
+   "groups": [
+    [
+     [
+      11683,
+      12447
+     ],
+     [
+      2243,
+      4547,
+      19598
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "noul_criteria",
+   "state": "The door is open.",
+   "questions": [
+    {
+     "type": "noul",
+     "instructions": "Is it safe?",
+     "criteria": {
+      "true": "Nothing is open",
+      "false": null
+     }
+    }
+   ],
+   "prefix_text": "<|startoftext|><|im_start|>user\nThe door is open.\n\n\nQUESTION:\n",
+   "suffix_texts": [
+    "Is it safe?\nYes: Nothing is open\nNo: None\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "text": "<|startoftext|><|im_start|>user\nThe door is open.\n\n\nQUESTION:\nIs it safe?\nYes: Nothing is open\nNo: None\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    597,
+    4608,
+    355,
+    2213,
+    64673,
+    63509,
+    833,
+    4439,
+    435,
+    5966,
+    1283,
+    12447,
+    34,
+    28156,
+    355,
+    2213,
+    207,
+    4547,
+    34,
+    10856,
+    8,
+    57922,
+    415,
+    18171,
+    432,
+    794,
+    1049,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207
+   ],
+   "groups": [
+    [
+     [
+      11683,
+      12447
+     ],
+     [
+      2243,
+      4547,
+      19598
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "choice_desc",
+   "state": "I was charged twice this month, please refund one of them.",
+   "questions": [
+    {
+     "type": "choice",
+     "instructions": "Which team should handle this?",
+     "criteria": {
+      "billing": "Charges, refunds, invoices",
+      "technical": "App or site faults",
+      "fraud": "Suspected unauthorised use"
+     }
+    }
+   ],
+   "prefix_text": "<|startoftext|><|im_start|>user\nI was charged twice this month, please refund one of them.\n\n\nQUESTION:\n",
+   "suffix_texts": [
+    "Which team should handle this?\n\nOptions:\nA Charges, refunds, invoices\nB App or site faults\nC Suspected unauthorised use\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "text": "<|startoftext|><|im_start|>user\nI was charged twice this month, please refund one of them.\n\n\nQUESTION:\nWhich team should handle this?\n\nOptions:\nA Charges, refunds, invoices\nB App or site faults\nC Suspected unauthorised use\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    49,
+    452,
+    14917,
+    10625,
+    532,
+    5304,
+    20,
+    8193,
+    52966,
+    734,
+    302,
+    876,
+    64673,
+    63509,
+    833,
+    28327,
+    2909,
+    1252,
+    9435,
+    532,
+    64929,
+    13314,
+    833,
+    41,
+    120315,
+    20,
+    52966,
+    91,
+    20,
+    60326,
+    1363,
+    207,
+    42,
+    4634,
+    432,
+    2974,
+    49521,
+    207,
+    43,
+    11130,
+    7436,
+    58505,
+    2350,
+    1016,
+    8,
+    57922,
+    415,
+    278,
+    7331,
+    4713,
+    1049,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207
+   ],
+   "groups": [
+    [
+     [
+      41,
+      334
+     ],
+     [
+      42,
+      378
+     ],
+     [
+      43,
+      340
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "choice_bare",
+   "state": "hello",
+   "questions": [
+    {
+     "type": "choice",
+     "instructions": "Pick one",
+     "criteria": {
+      "red_wine": null,
+      "blue": "",
+      "x": "the x"
+     }
+    }
+   ],
+   "prefix_text": "<|startoftext|><|im_start|>user\nhello\n\n\nQUESTION:\n",
+   "suffix_texts": [
+    "Pick one\n\nOptions:\nA red wine\nB blue\nC the x\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "text": "<|startoftext|><|im_start|>user\nhello\n\n\nQUESTION:\nPick one\n\nOptions:\nA red wine\nB blue\nC the x\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    52071,
+    7,
+    63509,
+    833,
+    94741,
+    734,
+    8,
+    13314,
+    833,
+    41,
+    2959,
+    13058,
+    207,
+    42,
+    6542,
+    207,
+    43,
+    278,
+    2552,
+    8,
+    57922,
+    415,
+    278,
+    7331,
+    4713,
+    1049,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207
+   ],
+   "groups": [
+    [
+     [
+      41,
+      334
+     ],
+     [
+      42,
+      378
+     ],
+     [
+      43,
+      340
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "choice_letters",
+   "state": "hello",
+   "questions": [
+    {
+     "type": "choice",
+     "instructions": "Which?",
+     "criteria": {
+      "B": "bee",
+      "A": "ay",
+      "q": "queue"
+     }
+    }
+   ],
+   "prefix_text": "<|startoftext|><|im_start|>user\nhello\n\n\nQUESTION:\n",
+   "suffix_texts": [
+    "Which?\n\nOptions:\nB bee\nA ay\nq queue\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "text": "<|startoftext|><|im_start|>user\nhello\n\n\nQUESTION:\nWhich?\n\nOptions:\nB bee\nA ay\nq queue\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    52071,
+    7,
+    63509,
+    833,
+    28327,
+    64929,
+    13314,
+    833,
+    42,
+    18138,
+    207,
+    41,
+    9036,
+    207,
+    89,
+    27337,
+    8,
+    57922,
+    415,
+    278,
+    7331,
+    4713,
+    1049,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207
+   ],
+   "groups": [
+    [
+     [
+      42,
+      378
+     ],
+     [
+      41,
+      334
+     ],
+     [
+      89,
+      8616
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "choice_wide",
+   "state": "w",
+   "questions": [
+    {
+     "type": "choice",
+     "instructions": "Wide",
+     "criteria": {
+      "opt0": "option 0",
+      "opt1": "option 1",
+      "opt2": "option 2",
+      "opt3": "option 3",
+      "opt4": "option 4",
+      "opt5": "option 5",
+      "opt6": "option 6",
+      "opt7": "option 7",
+      "opt8": "option 8",
+      "opt9": "option 9",
+      "opt10": "option 10",
+      "opt11": "option 11",
+      "opt12": "option 12",
+      "opt13": "option 13",
+      "opt14": "option 14",
+      "opt15": "option 15",
+      "opt16": "option 16",
+      "opt17": "option 17",
+      "opt18": "option 18",
+      "opt19": "option 19",
+      "opt20": "option 20",
+      "opt21": "option 21",
+      "opt22": "option 22",
+      "opt23": "option 23",
+      "opt24": "option 24",
+      "opt25": "option 25",
+      "opt26": "option 26",
+      "opt27": "option 27",
+      "opt28": "option 28",
+      "opt29": "option 29"
+     }
+    }
+   ],
+   "prefix_text": "<|startoftext|><|im_start|>user\nw\n\n\nQUESTION:\n",
+   "suffix_texts": [
+    "Wide\n\nOptions:\n00 option 0\n01 option 1\n02 option 2\n03 option 3\n04 option 4\n05 option 5\n06 option 6\n07 option 7\n08 option 8\n09 option 9\n10 option 10\n11 option 11\n12 option 12\n13 option 13\n14 option 14\n15 option 15\n16 option 16\n17 option 17\n18 option 18\n19 option 19\n20 option 20\n21 option 21\n22 option 22\n23 option 23\n24 option 24\n25 option 25\n26 option 26\n27 option 27\n28 option 28\n29 option 29\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "text": "<|startoftext|><|im_start|>user\nw\n\n\nQUESTION:\nWide\n\nOptions:\n00 option 0\n01 option 1\n02 option 2\n03 option 3\n04 option 4\n05 option 5\n06 option 6\n07 option 7\n08 option 8\n09 option 9\n10 option 10\n11 option 11\n12 option 12\n13 option 13\n14 option 14\n15 option 15\n16 option 16\n17 option 17\n18 option 18\n19 option 19\n20 option 20\n21 option 21\n22 option 22\n23 option 23\n24 option 24\n25 option 25\n26 option 26\n27 option 27\n28 option 28\n29 option 29\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    95,
+    7,
+    63509,
+    833,
+    63,
+    581,
+    8,
+    13314,
+    833,
+    555,
+    7331,
+    229,
+    24,
+    207,
+    4040,
+    7331,
+    229,
+    25,
+    207,
+    5342,
+    7331,
+    229,
+    26,
+    207,
+    5634,
+    7331,
+    229,
+    27,
+    207,
+    5825,
+    7331,
+    229,
+    28,
+    207,
+    3153,
+    7331,
+    229,
+    29,
+    207,
+    5967,
+    7331,
+    229,
+    30,
+    207,
+    4471,
+    7331,
+    229,
+    31,
+    207,
+    4027,
+    7331,
+    229,
+    32,
+    207,
+    4404,
+    7331,
+    229,
+    33,
+    207,
+    654,
+    7331,
+    229,
+    654,
+    207,
+    1131,
+    7331,
+    229,
+    1131,
+    207,
+    873,
+    7331,
+    229,
+    873,
+    207,
+    1031,
+    7331,
+    229,
+    1031,
+    207,
+    1035,
+    7331,
+    229,
+    1035,
+    207,
+    885,
+    7331,
+    229,
+    885,
+    207,
+    942,
+    7331,
+    229,
+    942,
+    207,
+    916,
+    7331,
+    229,
+    916,
+    207,
+    632,
+    7331,
+    229,
+    632,
+    207,
+    412,
+    7331,
+    229,
+    412,
+    207,
+    397,
+    7331,
+    229,
+    397,
+    207,
+    1696,
+    7331,
+    229,
+    1696,
+    207,
+    1518,
+    7331,
+    229,
+    1518,
+    207,
+    1467,
+    7331,
+    229,
+    1467,
+    207,
+    1325,
+    7331,
+    229,
+    1325,
+    207,
+    1197,
+    7331,
+    229,
+    1197,
+    207,
+    1616,
+    7331,
+    229,
+    1616,
+    207,
+    1641,
+    7331,
+    229,
+    1641,
+    207,
+    1637,
+    7331,
+    229,
+    1637,
+    207,
+    1734,
+    7331,
+    229,
+    1734,
+    8,
+    57922,
+    415,
+    278,
+    7331,
+    4713,
+    1049,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207
+   ],
+   "groups": [
+    [
+     [
+      555
+     ],
+     [
+      4040
+     ],
+     [
+      5342
+     ],
+     [
+      5634
+     ],
+     [
+      5825
+     ],
+     [
+      3153
+     ],
+     [
+      5967
+     ],
+     [
+      4471
+     ],
+     [
+      4027
+     ],
+     [
+      4404
+     ],
+     [
+      654
+     ],
+     [
+      1131
+     ],
+     [
+      873
+     ],
+     [
+      1031
+     ],
+     [
+      1035
+     ],
+     [
+      885
+     ],
+     [
+      942
+     ],
+     [
+      916
+     ],
+     [
+      632
+     ],
+     [
+      412
+     ],
+     [
+      397
+     ],
+     [
+      1696
+     ],
+     [
+      1518
+     ],
+     [
+      1467
+     ],
+     [
+      1325
+     ],
+     [
+      1197
+     ],
+     [
+      1616
+     ],
+     [
+      1641
+     ],
+     [
+      1637
+     ],
+     [
+      1734
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "score",
+   "state": "Down for an hour.",
+   "questions": [
+    {
+     "type": "score",
+     "instructions": "How urgent is this?",
+     "criteria": [
+      "Can wait",
+      "Today",
+      "Blocking the customer now"
+     ]
+    }
+   ],
+   "prefix_text": "<|startoftext|><|im_start|>user\nDown for an hour.\n\n\nQUESTION:\n",
+   "suffix_texts": [
+    "How urgent is this?\n\n0 Can wait\n1 Today\n2 Blocking the customer now\n\nReply with a single digit 0-2 only.<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "text": "<|startoftext|><|im_start|>user\nDown for an hour.\n\n\nQUESTION:\nHow urgent is this?\n\n0 Can wait\n1 Today\n2 Blocking the customer now\n\nReply with a single digit 0-2 only.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    14231,
+    374,
+    401,
+    8330,
+    64673,
+    63509,
+    833,
+    3522,
+    30648,
+    355,
+    532,
+    64929,
+    24,
+    2076,
+    6997,
+    207,
+    25,
+    10767,
+    207,
+    26,
+    18077,
+    299,
+    278,
+    13107,
+    1665,
+    8,
+    57922,
+    415,
+    267,
+    2936,
+    19763,
+    229,
+    24,
+    21,
+    26,
+    1049,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207
+   ],
+   "groups": [
+    [
+     [
+      24
+     ],
+     [
+      25
+     ],
+     [
+      26
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "json_state",
+   "state": {
+    "user": "Zoë",
+    "items": [
+     1,
+     2.5,
+     true,
+     null
+    ],
+    "nested": {
+     "b": 1,
+     "a": "x"
+    }
+   },
+   "questions": [
+    {
+     "type": "noul",
+     "instructions": "Is there a user?"
+    }
+   ],
+   "prefix_text": "<|startoftext|><|im_start|>user\n{\n  \"user\": \"Zoë\",\n  \"items\": [\n    1,\n    2.5,\n    true,\n    null\n  ],\n  \"nested\": {\n    \"b\": 1,\n    \"a\": \"x\"\n  }\n}\n\n\nQUESTION:\n",
+   "suffix_texts": [
+    "Is there a user?\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "text": "<|startoftext|><|im_start|>user\n{\n  \"user\": \"Zoë\",\n  \"items\": [\n    1,\n    2.5,\n    true,\n    null\n  ],\n  \"nested\": {\n    \"b\": 1,\n    \"a\": \"x\"\n  }\n}\n\n\nQUESTION:\nIs there a user?\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    2718,
+    229,
+    496,
+    5922,
+    6380,
+    496,
+    105707,
+    6785,
+    6107,
+    229,
+    496,
+    25706,
+    6380,
+    19843,
+    360,
+    229,
+    25,
+    920,
+    360,
+    229,
+    26,
+    22,
+    29,
+    920,
+    360,
+    2846,
+    920,
+    360,
+    3495,
+    207,
+    229,
+    40439,
+    229,
+    496,
+    86,
+    7774,
+    6380,
+    827,
+    360,
+    496,
+    74,
+    6380,
+    229,
+    25,
+    920,
+    360,
+    496,
+    73,
+    6380,
+    496,
+    96,
+    1110,
+    229,
+    1130,
+    64024,
+    63509,
+    833,
+    4439,
+    912,
+    267,
+    4695,
+    64929,
+    57922,
+    415,
+    18171,
+    432,
+    794,
+    1049,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207
+   ],
+   "groups": [
+    [
+     [
+      11683,
+      12447
+     ],
+     [
+      2243,
+      4547,
+      19598
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "no_state",
+   "state": null,
+   "questions": [
+    {
+     "type": "noul",
+     "instructions": "Is this a cat?"
+    }
+   ],
+   "prefix_text": "<|startoftext|><|im_start|>user\n",
+   "suffix_texts": [
+    "Is this a cat?\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "text": "<|startoftext|><|im_start|>user\nIs this a cat?\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    4439,
+    532,
+    267,
+    5140,
+    64929,
+    57922,
+    415,
+    18171,
+    432,
+    794,
+    1049,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207
+   ],
+   "groups": [
+    [
+     [
+      11683,
+      12447
+     ],
+     [
+      2243,
+      4547,
+      19598
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "multi",
+   "state": "I was charged twice this month, please refund one of them.",
+   "questions": [
+    {
+     "type": "noul",
+     "instructions": "Is the customer asking for a refund?"
+    },
+    {
+     "type": "choice",
+     "instructions": "Which team should handle this?",
+     "criteria": {
+      "billing": "Charges, refunds, invoices",
+      "technical": "App or site faults"
+     }
+    },
+    {
+     "type": "score",
+     "instructions": "How urgent is this?",
+     "criteria": [
+      "Can wait",
+      "Today"
+     ]
+    }
+   ],
+   "prefix_text": "<|startoftext|><|im_start|>user\nI was charged twice this month, please refund one of them.\n\n\nQUESTION:\n",
+   "suffix_texts": [
+    "Is the customer asking for a refund?\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n",
+    "Which team should handle this?\n\nOptions:\nA Charges, refunds, invoices\nB App or site faults\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n",
+    "How urgent is this?\n\n0 Can wait\n1 Today\n\nReply with a single digit 0-1 only.<|im_end|>\n<|im_start|>assistant\n"
+   ],
+   "trunk": [
+    124894,
+    124899,
+    5922,
+    207,
+    49,
+    452,
+    14917,
+    10625,
+    532,
+    5304,
+    20,
+    8193,
+    52966,
+    734,
+    302,
+    876,
+    64673,
+    63509,
+    833
+   ],
+   "branches": [
+    [
+     4439,
+     278,
+     13107,
+     13564,
+     374,
+     267,
+     52966,
+     64929,
+     57922,
+     415,
+     18171,
+     432,
+     794,
+     1049,
+     22,
+     124900,
+     207,
+     124899,
+     63514,
+     207
+    ],
+    [
+     28327,
+     2909,
+     1252,
+     9435,
+     532,
+     64929,
+     13314,
+     833,
+     41,
+     120315,
+     20,
+     52966,
+     91,
+     20,
+     60326,
+     1363,
+     207,
+     42,
+     4634,
+     432,
+     2974,
+     49521,
+     8,
+     57922,
+     415,
+     278,
+     7331,
+     4713,
+     1049,
+     22,
+     124900,
+     207,
+     124899,
+     63514,
+     207
+    ],
+    [
+     3522,
+     30648,
+     355,
+     532,
+     64929,
+     24,
+     2076,
+     6997,
+     207,
+     25,
+     10767,
+     8,
+     57922,
+     415,
+     267,
+     2936,
+     19763,
+     229,
+     24,
+     21,
+     25,
+     1049,
+     22,
+     124900,
+     207,
+     124899,
+     63514,
+     207
+    ]
+   ],
+   "groups": [
+    [
+     [
+      11683,
+      12447
+     ],
+     [
+      2243,
+      4547,
+      19598
+     ]
+    ],
+    [
+     [
+      41,
+      334
+     ],
+     [
+      42,
+      378
+     ]
+    ],
+    [
+     [
+      24
+     ],
+     [
+      25
+     ]
+    ]
+   ]
+  }
+ ],
+ "images": {
+  "markup": "<image><image>",
+  "ids": [
+   125009,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   125010,
+   125009,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   124907,
+   125010,
+   57
+  ],
+  "image_tokens": {
+   "<|image_start|>": 125009,
+   "<image>": 124907,
+   "<|image_end|>": 125010
+  },
+  "runs": [
+   64,
+   77
+  ]
+ },
+ "bos": "<|startoftext|>"
+}
