@@ -175,6 +175,13 @@ objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSError
 # Page size for the page-aligned no-copy weight wrap (`_SC_PAGESIZE`).
 libc = "0.2"
 
+# --- VideoToolbox (shiso-media-sys, macOS target table) -------------------
+objc2-core-foundation = { version = "0.3", default-features = false }
+objc2-core-media = { version = "0.3", default-features = false }
+objc2-core-video = { version = "0.3", default-features = false }
+objc2-video-toolbox = { version = "0.3", default-features = false }
+block2 = "0.6"
+
 # --- workspace crates ----------------------------------------------------
 shiso-core = { path = "crates/shiso-core" }
 shiso-modelfile = { path = "crates/shiso-modelfile" }

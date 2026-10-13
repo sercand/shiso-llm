@@ -26,5 +26,14 @@ libc = { workspace = true, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = { workspace = true }
 
+# VideoToolbox, through the objc2 framework bindings. A target table, not a
+# feature: the OS decoder is always compiled where the OS has one.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { workspace = true }
+objc2-core-foundation = { workspace = true, features = ["std", "CFBase", "CFData", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-media = { workspace = true, features = ["std", "objc2", "CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
+objc2-core-video = { workspace = true, features = ["std", "objc2", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-video-toolbox = { workspace = true, features = ["std", "objc2", "VTBase", "VTDecompressionProperties", "VTDecompressionSession", "VTErrors", "VTSession", "VTUtilities", "block2", "objc2-core-media", "objc2-core-video"] }
+
 [lints]
 workspace = true
