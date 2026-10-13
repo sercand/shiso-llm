@@ -16,6 +16,7 @@ use crate::error::AppError;
 
 /// The thread body: runs until every service handle is gone.
 pub(super) fn run_worker(desc: &ImageServiceDesc, mut rx: mpsc::Receiver<Queued>) {
+    let mut served: u64 = 0;
     while let Some(request) = rx.blocking_recv() {
         let Queued {
             job,
@@ -43,6 +44,11 @@ pub(super) fn run_worker(desc: &ImageServiceDesc, mut rx: mpsc::Receiver<Queued>
         };
         // A panic inside the generator ends that job, not the thread: the
         // queue holds other callers who did nothing wrong.
+        served += 1;
+        let region = desc
+            .profile
+            .as_ref()
+            .and_then(|sink| sink.begin(format!("{served:06}")));
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             desc.generator.generate(&job, progress_cb)
         }));
@@ -69,6 +75,11 @@ pub(super) fn run_worker(desc: &ImageServiceDesc, mut rx: mpsc::Receiver<Queued>
                 ))
             }
         };
+        if let Some(region) = region
+            && let Some(sink) = desc.profile.as_ref()
+        {
+            sink.end(region, "image");
+        }
         tracing::info!(
             seconds = began.elapsed().as_secs_f64(),
             ok = outcome.is_ok(),

@@ -37,6 +37,7 @@ pub mod media;
 pub mod media_cache;
 pub mod model_factory;
 pub mod openai;
+pub mod profile;
 pub mod response_store;
 pub mod router;
 pub mod scheduler;
@@ -324,6 +325,11 @@ pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService
         generator,
         model_id,
         max_queue: args.image_max_queue,
+        profile: args
+            .profile_dir
+            .as_deref()
+            .map(|dir| profile::ProfileSink::new(dir, Arc::clone(&backend)))
+            .transpose()?,
     })
     .context("starting image service worker")?;
     // The operator's flags are judged against the model that actually loaded:
@@ -403,6 +409,11 @@ pub fn boot_embedding(
             audio_limits: args.audio_limits(),
             audio_ffmpeg: args.audio_ffmpeg_policy(),
         },
+        profile: args
+            .profile_dir
+            .as_deref()
+            .map(|dir| profile::ProfileSink::new(dir, Arc::clone(&backend)))
+            .transpose()?,
     })
     .context("starting the embedding worker")
 }
@@ -508,6 +519,11 @@ fn boot_language_model(
 
     let model_id = args.model_id();
     let mut scheduler = scheduler_config(args)?;
+    scheduler.profile = args
+        .profile_dir
+        .as_deref()
+        .map(|dir| profile::ProfileSink::new(dir, Arc::clone(&backend)))
+        .transpose()?;
     // The renderer reads the store the scheduler writes.
     let turn_replay = scheduler.turn_replay.clone();
     let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);

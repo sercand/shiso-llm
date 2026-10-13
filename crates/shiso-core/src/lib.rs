@@ -33,6 +33,7 @@ pub mod ledger;
 pub mod media;
 pub mod model;
 pub mod page;
+pub mod profile;
 
 pub use backend::{
     Backend, BlasBackend, CoopLaunch, DEVICE_POINTER_BYTES, Extent3, FnConst, FnConstValue,
@@ -60,3 +61,4 @@ pub use model::{
     NO_BATCHED_PROMPT_PASS, PromptRun, SamplingParams, Speculated, Speculating, StopTokens,
     VerifiedBlock,
 };
+pub use profile::{KernelTiming, LaunchKey, LaunchSample, ProfileRegion, ProfileReport, Profiler};

@@ -5,12 +5,16 @@
 //! discipline - the queue, the refusals, the progress forwarding - not the
 //! diffusion math, which is `shiso-models`' business.
 
+mod common;
+
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use shiso_core::ids::Seed;
+use shiso_core::{Backend, Extent3, KernelRef, LaunchArgs};
 use shiso_server::error::AppError;
 use shiso_server::image::{ImageService, ImageServiceDesc};
+use shiso_server::profile::ProfileSink;
 use shiso_vision::generator::{
     GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits,
     ImageOutputFormat, ImageStepEvent,
@@ -172,6 +176,7 @@ async fn image_service_submits_and_completes_job() {
         generator,
         model_id: "mock-flux".to_string(),
         max_queue: 4,
+        profile: None,
     })
     .expect("starts image service");
 
@@ -197,6 +202,7 @@ async fn image_service_streams_step_events() {
         generator: Arc::new(SteppingGenerator),
         model_id: "mock-flux".to_string(),
         max_queue: 4,
+        profile: None,
     })
     .expect("starts image service");
 
@@ -226,6 +232,7 @@ async fn image_service_refuses_when_the_queue_is_full() {
             generator,
             model_id: "mock-flux".to_string(),
             max_queue: 1,
+            profile: None,
         })
         .expect("starts image service"),
     );
@@ -302,6 +309,7 @@ async fn image_service_refuses_an_invalid_job_before_queueing_it() {
         generator: Arc::new(MockGenerator),
         model_id: "mock-flux".to_string(),
         max_queue: 4,
+        profile: None,
     })
     .expect("starts image service");
 
@@ -325,6 +333,7 @@ async fn image_service_refuses_a_zero_step_job_as_a_bad_request() {
         generator: Arc::new(MockGenerator),
         model_id: "mock-flux".to_string(),
         max_queue: 4,
+        profile: None,
     })
     .expect("starts image service");
 
@@ -348,6 +357,7 @@ async fn image_service_admits_synchronously_and_answers_through_the_future() {
         generator: Arc::new(MockGenerator),
         model_id: "mock-flux".to_string(),
         max_queue: 4,
+        profile: None,
     })
     .expect("starts image service");
 
@@ -366,4 +376,72 @@ async fn image_service_admits_synchronously_and_answers_through_the_future() {
         .expect("a valid job is admitted");
     let image = answer.await.expect("the worker answers the admitted job");
     assert_eq!(image.width, 512);
+}
+
+/// A generator that launches one kernel per job on the device it was given,
+/// so a profile region around the job has exactly one launch in it.
+#[derive(Debug)]
+struct LaunchingGenerator(Arc<dyn Backend>);
+impl ImageGenerator for LaunchingGenerator {
+    fn model_id(&self) -> &'static str {
+        "mock-flux"
+    }
+    fn limits(&self) -> ImageLimits {
+        MockGenerator.limits()
+    }
+    fn generate(
+        &self,
+        job: &ImageGenerationJob,
+        _progress: Option<&dyn Fn(ImageStepEvent)>,
+    ) -> Result<GeneratedImage, ImageGenError> {
+        self.0
+            .run(
+                KernelRef::new("fake", "kernel_denoise"),
+                &LaunchArgs::new(Extent3::linear(1), Extent3::linear(1), &[]),
+            )
+            .expect("the fake device launches anything");
+        Ok(png_image(job.width, job.height))
+    }
+}
+
+#[tokio::test]
+async fn under_profile_dir_each_generation_writes_its_own_report() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let device: Arc<dyn Backend> = common::FakeBackend::profiling();
+    let service = ImageService::start(ImageServiceDesc {
+        generator: Arc::new(LaunchingGenerator(Arc::clone(&device))),
+        model_id: "mock-flux".to_string(),
+        max_queue: 4,
+        profile: Some(ProfileSink::new(dir.path(), device).expect("the fake profiles")),
+    })
+    .expect("starts image service");
+
+    service.generate(job("one", 4)).await.expect("generates");
+    service.generate(job("two", 4)).await.expect("generates");
+
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("the profile dir exists")
+        .map(|entry| {
+            entry
+                .expect("readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(
+        names.iter().all(|name| name.starts_with("image-")),
+        "{names:?}"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join(&names[0])).expect("readable"))
+            .expect("a report is JSON");
+    assert_eq!(body["kind"], "image");
+    assert_eq!(
+        body["report"]["launches"], 1,
+        "the region wraps the generation"
+    );
+    assert_eq!(body["report"]["kernels"][0]["entry"], "kernel_denoise");
 }

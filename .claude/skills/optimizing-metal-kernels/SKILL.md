@@ -102,9 +102,41 @@ registers. Never dequantize a whole matrix to float in memory.
 Iterate on MSL without rebuilding: `SHISO_METAL_SOURCE_DIR=crates/shiso-metal/metal`
 (read at device creation, so it applies to tests and bench bins too).
 
-To time one kernel, capture a run with Instruments
-(`xcrun xctrace record --template 'Metal System Trace' --launch -- <cmd>`) or
-read per-dispatch GPU time in an Xcode GPU capture.
+## Profiling
+
+Three tools, one question each. All of them time every launch on its own
+(one command buffer per launch), so a profiled total is **above** the batched
+time by the overlap and submission gaps it gives up. Read the per-kernel
+shares, and take speed from the batched number each tool prints beside them.
+
+```sh
+# Where does a text model's decode step (or prefill) spend its GPU time?
+cargo run --release -p shiso-bench --bin profile -- \
+  --model <ckpt.gguf | moe-dir> --phase decode --steps 32 --json /tmp/decode.json
+#   --phase prefill --prompt-tokens 512   for prefill; --config <cfg> for a non-recorded shape
+
+# Is this kernel faster? (A/B one kernel at a realistic shape)
+cargo run --release -p shiso-bench --bin kernel_bench -- --list
+cargo run --release -p shiso-bench --bin kernel_bench -- q4_0 --reps 200 --json /tmp/kb.json
+#   add a case: a `pub(crate) fn bench_*` beside the kernel's correctness case in
+#   shiso-kerneltest, plus a row in `bench::CASES`
+
+# Embedding / vision passes
+cargo run --release -p shiso-bench --bin embedding -- --model <gguf> --profile /tmp/emb/
+cargo run --release -p shiso-bench --bin vision_stages -- --model <mmproj.gguf> --family qwen35 \
+  --image <png> --out /tmp/stages --profile /tmp/vision.json
+
+# A real server request (chat, completions, decisions, images, embeddings)
+shiso serve <model-id | --model ckpt> --max-num-seqs 1 --profile-dir /tmp/prof
+#   one <kind>-<pid>-<id>.json per request (kind: engine | image | embed); refused
+#   with --asr-model. <id> is the engine's own counter, in arrival order, not the
+#   HTTP `cmpl-...` id. A report covers only its service's backend.
+```
+
+The JSON is `ProfileReport::to_json` (schema 1). Times are integer ns. Rows
+are keyed by entry, specialization constants, grid and block, and sorted by
+`total_ns`. For the overlapped timeline (what the serialized numbers cannot
+show) use `xcrun xctrace record --template 'Metal System Trace' --launch -- <cmd>`.
 
 ## Benchmarking and correctness commands
 

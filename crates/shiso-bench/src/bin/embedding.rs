@@ -46,6 +46,10 @@ struct Args {
     /// Only these cases, comma-separated.
     #[arg(long)]
     only: Option<String>,
+    /// Writes one GPU-time-per-kernel report per case into this directory,
+    /// from one extra pass after the timed ones.
+    #[arg(long)]
+    profile: Option<PathBuf>,
 }
 
 fn fixtures() -> PathBuf {
@@ -173,6 +177,32 @@ fn main() -> Result<()> {
             "{name:<20} {tokens:>8} {median:>10.2} {per:>10.2} {:>7.1}% {tps:>10.0}",
             spread * 100.0
         );
+        if let Some(dir) = args.profile.as_deref() {
+            profile_case(dir, backend.as_ref(), name, inputs.len(), || {
+                model.embed_batch(inputs)?;
+                Ok(())
+            })?;
+        }
     }
+    Ok(())
+}
+
+/// One more pass of a case inside a profile region, written as
+/// `<dir>/<name>.json` and printed as a table.
+fn profile_case(
+    dir: &Path,
+    backend: &dyn Backend,
+    name: &str,
+    inputs: usize,
+    pass: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let ((), report) = shiso_bench::profile::scoped(backend, pass)?;
+    shiso_bench::profile::write(
+        &dir.join(format!("{name}.json")),
+        &serde_json::json!({ "case": name, "inputs": inputs }),
+        &report,
+    )?;
+    println!("{}", report.table(15));
     Ok(())
 }

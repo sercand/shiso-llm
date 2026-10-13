@@ -46,6 +46,11 @@ struct Args {
     /// Device backend: metal.
     #[arg(long, default_value = "metal")]
     backend: String,
+
+    /// Writes the GPU time per kernel of one plain encode of the image here,
+    /// after a warm-up encode.
+    #[arg(long)]
+    profile: Option<PathBuf>,
 }
 
 /// Metadata record for one captured stage in manifest.json.
@@ -85,6 +90,20 @@ fn main() -> Result<()> {
         .with_context(|| format!("reading image from {}", args.image.display()))?;
     let item = preprocess_image(&image_bytes, tower.preprocess(), ImageLimits::default())
         .context("preprocessing image")?;
+    if let Some(path) = args.profile.as_deref() {
+        let items = std::slice::from_ref(&item);
+        tower.encode(&backend, items).context("warm-up encode")?;
+        let ((), report) = shiso_bench::profile::scoped(backend.as_ref(), || -> Result<()> {
+            tower.encode(&backend, items).context("profiled encode")?;
+            Ok(())
+        })?;
+        shiso_bench::profile::write(
+            path,
+            &serde_json::json!({ "family": args.family, "grid": format!("{:?}", item.grid()) }),
+            &report,
+        )?;
+        tracing::info!(path = %path.display(), "wrote the vision profile");
+    }
     eprintln!(
         "Encoding stages for family={}, image={}, grid={:?}",
         args.family,

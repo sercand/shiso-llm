@@ -164,6 +164,14 @@ pub struct ServeArgs {
     /// decoded in several passes a step.
     #[arg(long, env = "SHISO_MAX_NUM_SEQS", default_value_t = crate::scheduler::DEFAULT_MAX_NUM_SEQS)]
     pub max_num_seqs: usize,
+    /// Writes one GPU-time-per-kernel report per request into this directory,
+    /// as `<kind>-<pid>-<id>.json`.
+    ///
+    /// Every launch is submitted and timed on its own while a request runs, so
+    /// serving is slower: a development tool, not a serving mode. Needs
+    /// `--max-num-seqs 1`, so a report is one request's kernels.
+    #[arg(long, env = "SHISO_PROFILE_DIR")]
+    pub profile_dir: Option<PathBuf>,
     /// Prompt tokens one prefill chunk covers when nothing else is decoding.
     ///
     /// Wide, because with nobody to starve the only thing a narrow chunk buys is
@@ -737,6 +745,20 @@ pub enum ConfigError {
         /// The one it needs beside it.
         missing: &'static str,
     },
+    /// `--profile-dir` with more than one sequence resident at once.
+    #[error(
+        "--profile-dir needs --max-num-seqs 1 (got {max_num_seqs}): a report covers one request's kernels"
+    )]
+    ProfileNeedsOneSequence {
+        /// The value given.
+        max_num_seqs: usize,
+    },
+    /// `--profile-dir` with the speech service, whose worker interleaves
+    /// streams.
+    #[error(
+        "--profile-dir cannot be combined with --asr-model: the audio worker interleaves streams, so a report could not be one request's"
+    )]
+    ProfileWithAudio,
     /// An `--image-reserve-gb` that is negative or not a number.
     #[error("--image-reserve-gb {value} must be a finite number of GiB, at least 0")]
     BadImageReserve {
@@ -766,6 +788,9 @@ impl ServeArgs {
     /// [`ConfigError::HalfSpeculative`] when a draft head was given with no
     /// depth to use it at. A depth with no head is left to the family arm,
     /// which is the only party that knows whether that family has a default.
+    /// [`ConfigError::ProfileNeedsOneSequence`] and
+    /// [`ConfigError::ProfileWithAudio`] when `--profile-dir` is given where a
+    /// report could not be one request's kernels.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.ctx == 0 {
             return Err(ConfigError::Zero { flag: "ctx" });
@@ -890,6 +915,23 @@ impl ServeArgs {
                 given: "draft-model",
                 missing: "spec-k",
             });
+        }
+        self.validate_profile()
+    }
+
+    /// `--profile-dir` needs every report to be one request's kernels: one
+    /// resident sequence, and no audio worker interleaving streams.
+    fn validate_profile(&self) -> Result<(), ConfigError> {
+        if self.profile_dir.is_none() {
+            return Ok(());
+        }
+        if self.max_num_seqs != 1 {
+            return Err(ConfigError::ProfileNeedsOneSequence {
+                max_num_seqs: self.max_num_seqs,
+            });
+        }
+        if self.asr_model.is_some() {
+            return Err(ConfigError::ProfileWithAudio);
         }
         Ok(())
     }

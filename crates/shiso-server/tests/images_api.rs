@@ -237,6 +237,7 @@ fn state_with_limits(
         generator: boxed,
         model_id: "mock-flux".to_owned(),
         max_queue: 8,
+        profile: None,
     })
     .expect("starts image service");
     let state = Arc::new(AppState::without_language_model().with_image(service));
@@ -595,6 +596,7 @@ async fn a_buffered_request_that_meets_a_full_queue_is_all_or_nothing() {
         generator: boxed,
         model_id: "mock-flux".to_owned(),
         max_queue: 1,
+        profile: None,
     })
     .expect("starts image service");
     // Occupy the worker first: the generator blocks inside this job until
@@ -710,6 +712,7 @@ async fn a_streamed_head_arrives_at_admission_not_at_the_first_partial() {
         generator: boxed,
         model_id: "mock-flux".to_owned(),
         max_queue: 8,
+        profile: None,
     })
     .expect("starts image service");
     let state = Arc::new(AppState::without_language_model().with_image(service));
@@ -838,6 +841,7 @@ async fn a_stream_that_fails_after_its_first_image_ends_with_an_error_frame() {
         generator: boxed,
         model_id: "mock-flux".to_owned(),
         max_queue: 8,
+        profile: None,
     })
     .expect("starts image service");
     let state = Arc::new(AppState::without_language_model().with_image(service));

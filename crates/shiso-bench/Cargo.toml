@@ -22,6 +22,9 @@ shiso-models = { workspace = true }
 # The device the numbers describe. A baseline that does not say which backend
 # produced it is not a baseline, so the runner names it in the record it writes.
 shiso-metal = { workspace = true }
+# The kernel bench times the correctness suite's own fixtures at realistic
+# shapes, so a benchmarked launch is one the suite has already graded.
+shiso-kerneltest = { workspace = true }
 # The other device a parity run can be pointed at. A plain dependency rather
 # than a target-gated one: this crate builds against the backend's stub arm
 # everywhere, which is what lets the code path that opens an NVIDIA device be

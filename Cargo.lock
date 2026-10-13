@@ -2472,6 +2472,7 @@ dependencies = [
  "shiso-engine",
  "shiso-hub",
  "shiso-ir",
+ "shiso-kerneltest",
  "shiso-kvstore",
  "shiso-metal",
  "shiso-modelfile",
