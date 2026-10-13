@@ -238,3 +238,11 @@ template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<h
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, shs_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
 // Two 16-element halves to a 32-element block, the same nl the q8_0 line takes.
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_0, 2, dequantize_q4_0, float, float4x4, float, float2x4>;
+// A `Q4_K_M` export keeps about half of its `ffn_down` and `attn_v` tensors
+// at q6_K, and without a tile those took the matvec through every prefill
+// chunk, re-reading the whole matrix once per row block: on a 3B hybrid that
+// left the q4_K_M export slower to prefill than its q8_0 twin. The block
+// struct and `dequantize_dense_q6_K` come from `gemv_ext_q5k_q6k.metal`, which
+// precedes this file; `nl` is 16, one 16-element group per `il`, the walk the
+// q4_K line takes over the same 256-element block.
+template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, shs_dense_block_q6_K, 16, dequantize_dense_q6_K, float, float4x4, float, float2x4>;

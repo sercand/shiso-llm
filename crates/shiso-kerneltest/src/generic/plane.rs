@@ -54,21 +54,23 @@
 
 use bytemuck::{Pod, Zeroable};
 use shiso_core::{DeviceBuffer, Extent3, KernelArg, KernelRef};
+use shiso_modelfile::quant::BlockQ6K;
 
 use crate::dense::q4_0::{dequant_q4_0, pack_q4_0};
 use crate::generic::product::{QK_K, QK8_0, to_f16_and_back};
 use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle;
-use crate::qwen35::gemv::{exact_q4_k, q4_k_bytes};
+use crate::qwen35::gemv::{dequant_q6_k, exact_q4_k, pack_q6_k, q4_k_bytes};
 
 /// Every entry point this file's case launches, which is exactly the table
 /// `shiso_engine::launch::dequant_plane_name` answers from. Written out so a
 /// codec that gained a staging entry and no case is a diff in this list.
-pub const ENTRIES: [&str; 4] = [
+pub const ENTRIES: [&str; 5] = [
     "kernel_dequant_plane_q4_K_f32",
     "kernel_dequant_plane_q4_0_f32",
     "kernel_dequant_plane_q8_0_f32",
     "kernel_dequant_plane_f16_f32",
+    "kernel_dequant_plane_q6_K_f32",
 ];
 
 /// The module the engine dispatches the staging pass under,
@@ -265,6 +267,33 @@ fn q8_0_plane() -> Fixture {
     (bytemuck::cast_slice(&blocks).to_vec(), want, row_bytes)
 }
 
+/// The `q6_K` fixture: `ROWS * (WIDTH / 256)` blocks of 210 bytes, so every
+/// odd block starts off a four-byte boundary, each with its own codes.
+fn q6_k_plane() -> Fixture {
+    let per_row = WIDTH / QK_K;
+    let blocks: Vec<BlockQ6K> = (0..ROWS * per_row)
+        .map(|index| {
+            let mut values = [0u8; QK_K];
+            for (e, slot) in values.iter_mut().enumerate() {
+                *slot = ((e * 11 + index * 7) % 64) as u8;
+            }
+            pack_q6_k(&values)
+        })
+        .collect();
+    let mut want = vec![0.0f32; ROWS * WIDTH];
+    for (index, block) in blocks.iter().enumerate() {
+        for e in 0..QK_K {
+            want[index * QK_K + e] = dequant_q6_k(block, e);
+        }
+    }
+    let bytes: Vec<u8> = blocks
+        .iter()
+        .flat_map(bytemuck::bytes_of)
+        .copied()
+        .collect();
+    (bytes, want, (per_row * size_of::<BlockQ6K>()) as u64)
+}
+
 /// The `f16` fixture: the shared signal rounded to half and back, which is
 /// what an unquantized weight actually holds.
 fn f16_plane() -> Fixture {
@@ -275,10 +304,10 @@ fn f16_plane() -> Fixture {
 /// The staged plane is the weight plane, element for element, at every codec
 /// the vendor route can name.
 ///
-/// Walked over all four rather than spot-checked at one, because the walk is
+/// Walked over all five rather than spot-checked at one, because the walk is
 /// per-codec: `shiso_dequant_plane_body` steps its source pointer by
 /// `shiso_dequant_plane_chunks<codec>()`, so a codec whose type is not a block
-/// struct has its own pointer arithmetic and passing at the other three says
+/// struct has its own pointer arithmetic and passing at the other four says
 /// nothing about it. `f16` is the codec that is not a block, and it is the one
 /// that was wrong.
 ///
@@ -287,11 +316,12 @@ fn f16_plane() -> Fixture {
 /// When any staged element differs from the reference plane, which is what the
 /// case is for.
 pub fn the_staged_plane_matches_the_weight_at_every_codec(gpu: &Gpu) {
-    let cases: [(&str, &'static str, Fixture); 4] = [
+    let cases: [(&str, &'static str, Fixture); 5] = [
         ("q4_K", ENTRIES[0], q4_k_plane()),
         ("q4_0", ENTRIES[1], q4_0_plane()),
         ("q8_0", ENTRIES[2], q8_0_plane()),
         ("f16", ENTRIES[3], f16_plane()),
+        ("q6_K", ENTRIES[4], q6_k_plane()),
     ];
     for (codec, entry, (weight, want, row_bytes)) in cases {
         assert_eq!(

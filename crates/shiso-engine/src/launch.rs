@@ -2120,14 +2120,17 @@ pub(crate) fn plain_consts_for(nsg: u32, by_name: bool) -> Option<&'static [FnCo
 
 /// The prefill GEMM for a weight format, when one exists.
 ///
-/// Four formats have a GEMM. `q5_K` and `q6_K` do not, which is affordable
-/// because those two are the embedding and the tied output rather than the bulk of
-/// a block. The packed affine formats are absent for the reason given on
-/// [`ext_name`].
+/// Five formats have a GEMM. `q6_K` is among them because a `Q4_K_M` export
+/// keeps about half of its down projections and value projections at it: read
+/// through the matvec, a prefill chunk re-read each of those matrices once per
+/// row block, and on an M1 Max that left a 3B `Q4_K_M` export slower to
+/// prefill than its `q8_0` twin. `q5_K` has none. The packed affine formats
+/// are absent for the reason given on [`ext_name`].
 #[must_use]
 pub const fn mm_name(dtype: DType) -> Option<&'static str> {
     match dtype {
         DType::Q4_K => Some("kernel_mul_mm_q4_K_f32"),
+        DType::Q6_K => Some("kernel_mul_mm_q6_K_f32"),
         DType::Q4_0 => Some("kernel_mul_mm_q4_0_f32"),
         DType::Q8_0 => Some("kernel_mul_mm_q8_0_f32"),
         DType::F16 => Some("kernel_mul_mm_f16_f32"),
@@ -2148,6 +2151,7 @@ pub const fn mm_name(dtype: DType) -> Option<&'static str> {
 pub const fn dequant_plane_name(dtype: DType) -> Option<&'static str> {
     match dtype {
         DType::Q4_K => Some("kernel_dequant_plane_q4_K_f32"),
+        DType::Q6_K => Some("kernel_dequant_plane_q6_K_f32"),
         DType::Q4_0 => Some("kernel_dequant_plane_q4_0_f32"),
         DType::Q8_0 => Some("kernel_dequant_plane_q8_0_f32"),
         DType::F16 => Some("kernel_dequant_plane_f16_f32"),

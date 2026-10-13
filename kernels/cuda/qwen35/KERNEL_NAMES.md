@@ -49,19 +49,21 @@ The two `_mrope` entries reuse the same two argument blocks unchanged: three
 position streams are three more buffers, not more fields.
 
 
-### The prefill GEMMs — 4 entries
+### The prefill GEMMs — 5 entries
 
 ```
 kernel_mul_mm_q4_0_f32
 kernel_mul_mm_f16_f32
 kernel_mul_mm_q4_K_f32
 kernel_mul_mm_q8_0_f32
+kernel_mul_mm_q6_K_f32
 ```
 
-One per codec `launch::mm_name` answers for, and there is no fifth: a name that
+One per codec `launch::mm_name` answers for, and there is no sixth: a name that
 table hands out and this module does not export is a prefill that refuses at
 its first chunk of two tokens or more. The `q8_0` one is this family's two gate
-projections, `ssm_alpha` and `ssm_beta`.
+projections, `ssm_alpha` and `ssm_beta`. The `q6_K` one is the down and value
+projections a `Q4_K_M` export keeps at that codec, about half of each.
 
 `launch::mm_name` hands every codec's tiled product to this module whatever
 family the weight belongs to. Geometry: grid
@@ -69,13 +71,14 @@ family the weight belongs to. Geometry: grid
 bytes of dynamic shared memory. Buffers after the argument block: `src0`,
 `src1`, `dst`.
 
-### The prefill staging kernels — 4 entries
+### The prefill staging kernels — 5 entries
 
 ```
 kernel_dequant_plane_q4_0_f32
 kernel_dequant_plane_f16_f32
 kernel_dequant_plane_q4_K_f32
 kernel_dequant_plane_q8_0_f32
+kernel_dequant_plane_q6_K_f32
 ```
 
 The first half of the vendor-GEMM route: `cublas` has no quantized operand

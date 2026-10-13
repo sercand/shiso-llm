@@ -59,6 +59,13 @@ fn q4_k_prefill_gemm_matches_a_triple_loop() {
 
 #[test]
 #[ignore = "requires a Metal device"]
+fn q6_k_prefill_gemm_matches_a_triple_loop() {
+    let Some(gpu) = open() else { return };
+    cases::q6_k_prefill_gemm_matches_a_triple_loop(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
 fn q4_k_matvec_matches_the_oracle_dot() {
     let Some(gpu) = open() else { return };
     cases::q4_k_matvec_matches_the_oracle_dot(&gpu);

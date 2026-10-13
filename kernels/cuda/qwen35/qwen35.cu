@@ -53,10 +53,12 @@ SHISO_MM(q4_0, struct shiso_block_q4_0)
 SHISO_MM(f16, __half)
 SHISO_MM(q4_K, struct shiso_block_q4_K)
 SHISO_MM(q8_0, struct shiso_block_q8_0)
+/* About half of a `Q4_K_M` export's down projections. */
+SHISO_MM(q6_K, struct shiso_block_q6_K)
 
 /* The staging half of the vendor-GEMM route, one entry per codec above.
  *
- * Deliberately the same four and in the same order: `launch::mm_name` and
+ * Deliberately the same five and in the same order: `launch::mm_name` and
  * `launch::dequant_plane_name` are read together by
  * `projection::mm_projection`, which asks the vendor library first and falls
  * back to the tile, so a codec with a tile and no stager would silently never
@@ -66,6 +68,7 @@ SHISO_DEQUANT_PLANE(q4_0, struct shiso_block_q4_0)
 SHISO_DEQUANT_PLANE(f16, struct shiso_block_f16)
 SHISO_DEQUANT_PLANE(q4_K, struct shiso_block_q4_K)
 SHISO_DEQUANT_PLANE(q8_0, struct shiso_block_q8_0)
+SHISO_DEQUANT_PLANE(q6_K, struct shiso_block_q6_K)
 
 /* Fifteen pairs of the q6_K matvec, for the same reason the generic module
  * carries fifteen of the q4_0 one: `ext_r1ptg` and `ext_nxpsg` pick the row

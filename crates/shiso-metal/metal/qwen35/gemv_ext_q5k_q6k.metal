@@ -73,35 +73,42 @@ void dequantize_dense_q5_K(device const shs_dense_block_q5_K *xb, short il, thre
 // as four 32-element quarters, with the two high bits interleaved four per byte
 // and one signed scale per 16 elements. The -32 bias is folded before the
 // multiply, as upstream folds it.
+//
+// The bytes are read two at a time and the quarter is resolved once, outside
+// the loop, into a nibble shift and a high-bit shift. The prefill GEMM calls
+// this once per thread per k tile, and the earlier spelling - a four-way
+// branch and two byte loads per element - held that tile to 0.8 TFLOP/s
+// against 5 for q4_K on an M1 Max. Every element is still built as
+// `d * (float)((int)v - 32)` from the same two bytes, so the values are
+// bit-identical to that spelling. A word load is as wide as this can go: a
+// block is 210 bytes, so every odd block starts two bytes off a word boundary.
 template <typename type4x4>
 void dequantize_dense_q6_K(device const shs_dense_block_q6_K *xb, short il, thread type4x4 &reg) {
     const short n128 = il / 8;
     const short il128 = il & 7;
     const short quarter = il128 / 2;
     const short l0 = (il128 & 1) * 16;
-    const uint ql_base = (uint)n128 * 64u;
-    const uint qh_base = (uint)n128 * 32u;
     const uint sc_base = (uint)n128 * 8u + (uint)quarter * 2u + (uint)(il128 & 1);
     const float d = (float)xb->d * (float)((int)xb->scales[sc_base]);
+    // The odd quarters read the second 32 bytes of the half; the high quarters
+    // read the upper nibble of the same bytes the low ones read.
+    device const ushort *ql =
+        (device const ushort *)(xb->ql + (uint)n128 * 64u + ((quarter & 1) ? 32u : 0u) + (uint)l0);
+    device const ushort *qh = (device const ushort *)(xb->qh + (uint)n128 * 32u + (uint)l0);
+    const uint lo_shift = quarter >= 2 ? 4u : 0u;
+    const uint hi_shift = (uint)quarter * 2u;
 
     float4x4 reg_f;
-    for (int i = 0; i < 16; ++i) {
-        const uint l = (uint)l0 + (uint)i;
-        uint v;
-        if (quarter == 0) {
-            v = ((uint)xb->ql[ql_base + l] & 0x0Fu) |
-                ((((uint)xb->qh[qh_base + l] >> 0u) & 3u) << 4u);
-        } else if (quarter == 1) {
-            v = ((uint)xb->ql[ql_base + 32u + l] & 0x0Fu) |
-                ((((uint)xb->qh[qh_base + l] >> 2u) & 3u) << 4u);
-        } else if (quarter == 2) {
-            v = ((uint)xb->ql[ql_base + l] >> 4u) |
-                ((((uint)xb->qh[qh_base + l] >> 4u) & 3u) << 4u);
-        } else {
-            v = ((uint)xb->ql[ql_base + 32u + l] >> 4u) |
-                ((((uint)xb->qh[qh_base + l] >> 6u) & 3u) << 4u);
+    for (short k = 0; k < 8; ++k) {
+        const uint lo2 = (uint)ql[k];
+        const uint hi2 = (uint)qh[k];
+        for (short b = 0; b < 2; ++b) {
+            const uint lo = (lo2 >> (8u * (uint)b)) & 0xFFu;
+            const uint hi = (hi2 >> (8u * (uint)b)) & 0xFFu;
+            const uint v = ((lo >> lo_shift) & 0x0Fu) | (((hi >> hi_shift) & 3u) << 4u);
+            const short i = 2 * k + b;
+            reg_f[i / 4][i % 4] = d * (float)((int)v - 32);
         }
-        reg_f[i / 4][i % 4] = d * (float)((int)v - 32);
     }
     reg = (type4x4)reg_f;
 }
