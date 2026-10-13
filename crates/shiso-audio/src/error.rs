@@ -13,8 +13,11 @@ use shiso_vision::VisionError;
 pub enum AudioError {
     /// The bytes are a container no decoder in this build handled.
     ///
-    /// WAV is always read; anything else needs the `decode-native` feature or,
-    /// with `decode-ffmpeg`, an `--ffmpeg-path` the operator set.
+    /// WAV is always read. Anything else goes down the chain this build has:
+    /// symphonia (`decode-native`: mp3, AAC in mp4/m4a, FLAC, Vorbis and PCM
+    /// in their usual containers), then ffmpeg (`decode-ffmpeg`, and only when
+    /// the operator set `--ffmpeg-path`). This is what is left when every step
+    /// there said it does not read the bytes, e.g. Opus without ffmpeg.
     #[error(
         "no audio decoder in this build handled {container}{}; WAV is always accepted, \
          other containers need the `decode-native` feature or --ffmpeg-path",
@@ -25,6 +28,20 @@ pub enum AudioError {
         container: &'static str,
         /// The codec, when the container was read far enough to know it.
         codec: Option<String>,
+    },
+    /// A non-WAV stream that a decoder in this build reads, but whose bytes
+    /// break the format: a bad frame, a truncated header, garbage after a
+    /// valid-looking signature.
+    ///
+    /// Refused, never handed to the next decoder: only a container or codec
+    /// the decoder does not read moves the chain on, and a second decoder
+    /// would only spend its own budget to say the same thing.
+    #[error("the {container} audio is malformed: {reason}")]
+    Malformed {
+        /// The sniffed container name, e.g. `mp3`.
+        container: &'static str,
+        /// The decoder's own account of what was wrong.
+        reason: String,
     },
     /// A WAV file whose structure is broken.
     #[error("the WAV file is malformed: {reason}")]
@@ -57,7 +74,13 @@ pub enum AudioError {
         /// The offending rate.
         rate: u32,
     },
-    /// The subprocess decoder failed; the inner error says how.
+    /// A decoder ran out of its budget or failed to run; the inner error says
+    /// how.
+    ///
+    /// The ffmpeg step reports its spawn, cap and exit failures here, and the
+    /// in-process step reports a passed deadline as
+    /// [`VisionError::DecoderTimeout`], so one deadline reads the same
+    /// whichever decoder hit it.
     #[error(transparent)]
     Decoder(#[from] VisionError),
     /// A frontend spec whose fields contradict each other.

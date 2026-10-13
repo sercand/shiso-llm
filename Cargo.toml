@@ -36,6 +36,11 @@ license = "MIT"
 [workspace.dependencies]
 # The real-input FFT of the log-mel frontends: planned once per frontend, f64.
 realfft = "3"
+# Pure-Rust audio decoding for shiso-audio's `decode-native` step. The codec
+# list is explicit: mp3, aac and isomp4 are off in symphonia's defaults, and the
+# defaults' SIMD and metadata features stay off so the set is the one the
+# design names and nothing more.
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "aac", "isomp4", "flac", "ogg", "vorbis", "wav", "pcm", "mkv"] }
 # --- serialization -------------------------------------------------------
 # preserve_order keeps JSON object keys in insertion order (IndexMap). The chat
 # template renderer must reproduce the transformers `tojson` key order, so this

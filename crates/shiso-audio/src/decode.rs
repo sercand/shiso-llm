@@ -1,10 +1,17 @@
 //! Request bytes to model-rate mono.
 //!
 //! WAV is parsed here, and everything else goes down the decoders this build
-//! has, in order: the pure-Rust ones (`decode-native`), then the ffmpeg
-//! subprocess when the operator named a binary. Either way the result is capped
-//! in duration BEFORE resampling where the decoder allows it, so an hour-long
-//! upload to a server that accepts ten minutes costs a parse, not a resample.
+//! has, in order:
+//!
+//! 1. symphonia in process (`decode-native`, in `native.rs`);
+//! 2. the ffmpeg subprocess (`decode-ffmpeg`), only when the operator named a
+//!    binary;
+//! 3. nothing left: [`AudioError::UnsupportedContainer`].
+//!
+//! A step hands the bytes on only when it does not read that container or
+//! codec. Malformed bytes are refused by the first step that reads the format.
+//! Every step caps the duration BEFORE resampling, so an hour-long upload to a
+//! server that accepts ten minutes costs a parse, not a resample.
 
 #[cfg(feature = "decode-ffmpeg")]
 use std::num::NonZeroUsize;
@@ -14,6 +21,8 @@ use std::num::{NonZeroU32, NonZeroU64};
 use shiso_vision::{FfmpegPolicy, VisionError, run_decoder};
 
 use crate::error::AudioError;
+#[cfg(feature = "decode-native")]
+use crate::native;
 use crate::num::f64_of;
 use crate::pcm::{MODEL_RATE, Pcm};
 use crate::resample::resample;
@@ -135,8 +144,11 @@ fn too_long(pcm: &Pcm, limits: DecodeLimits) -> Result<(), AudioError> {
 /// - [`AudioError::UnsupportedContainer`] for a non-WAV container no decoder in
 ///   this build handled.
 /// - [`AudioError::TooLong`] past the cap.
+/// - [`AudioError::Malformed`] for a stream a decoder here reads but that
+///   breaks its own format.
 /// - The WAV reader's refusals.
-/// - [`AudioError::Decoder`] carrying the subprocess decoder's own failure.
+/// - [`AudioError::Decoder`] carrying a passed deadline, or the subprocess
+///   decoder's own failure.
 pub fn decode_audio(
     bytes: &[u8],
     limits: &DecodeLimits,
@@ -173,15 +185,29 @@ fn decode_with_steps(
     limits: DecodeLimits,
     policy: &AudioDecodePolicy,
 ) -> Result<Pcm, AudioError> {
+    // The codec a step identified but could not decode, carried into the
+    // refusal so the caller learns why (e.g. "opus") rather than just "mp4".
+    #[cfg(feature = "decode-native")]
+    let codec = match native::decode(
+        bytes,
+        container,
+        limits,
+        native::Deadline::after(policy.timeout_secs()),
+    )? {
+        native::Native::Decoded(pcm) => return Ok(pcm),
+        native::Native::Unsupported { codec } => {
+            tracing::debug!(container, ?codec, "symphonia passed on this audio");
+            codec
+        }
+    };
+    #[cfg(not(feature = "decode-native"))]
+    let codec = None;
     #[cfg(feature = "decode-ffmpeg")]
     if let Some(ffmpeg) = policy.ffmpeg() {
         return decode_ffmpeg(bytes, limits, ffmpeg);
     }
     let _ = (bytes, limits, policy);
-    Err(AudioError::UnsupportedContainer {
-        container,
-        codec: None,
-    })
+    Err(AudioError::UnsupportedContainer { container, codec })
 }
 
 /// The ffmpeg step: the container goes to the subprocess and raw `f32` samples
