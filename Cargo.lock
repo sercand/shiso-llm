@@ -2605,6 +2605,7 @@ dependencies = [
 name = "shiso-media-sys"
 version = "0.2.2"
 dependencies = [
+ "libloading",
  "thiserror",
  "tracing",
 ]
