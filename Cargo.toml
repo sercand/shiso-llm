@@ -17,6 +17,7 @@ members = [
     "crates/shiso-kernels",
     "crates/shiso-cuda",
     "crates/shiso-ple",
+    "crates/shiso-media-sys",
     "crates/shiso-parsers",
     "crates/shiso-kerneltest",
     "crates/shiso-router",
@@ -171,15 +172,17 @@ shiso-bench = { path = "crates/shiso-bench" }
 shiso-kernels = { path = "crates/shiso-kernels" }
 shiso-cuda = { path = "crates/shiso-cuda" }
 shiso-ple = { path = "crates/shiso-ple" }
+shiso-media-sys = { path = "crates/shiso-media-sys", default-features = false }
 shiso-parsers = { path = "crates/shiso-parsers" }
 shiso-kerneltest = { path = "crates/shiso-kerneltest" }
 shiso-router = { path = "crates/shiso-router" }
 shiso-hub = { path = "crates/shiso-hub" }
 shiso-registry = { path = "crates/shiso-registry" }
 [workspace.lints.rust]
-# Safety. Four crates relax this with a crate-level
+# Safety. Five crates relax this with a crate-level
 # #![allow(unsafe_code, reason = "...")]: shiso-modelfile (mmap), shiso-metal (objc2),
-# shiso-cuda (driver FFI), shiso-ple (io-uring). Everywhere else it stands.
+# shiso-cuda (driver FFI), shiso-ple (io-uring), shiso-media-sys (OS video decoders).
+# Everywhere else it stands.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 

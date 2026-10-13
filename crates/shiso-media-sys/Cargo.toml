@@ -1,0 +1,20 @@
+[package]
+name = "shiso-media-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "shiso: OS video decoders (VideoToolbox, NVDEC) and the AV1 decoder behind a safe API - the one place media FFI lives."
+
+[features]
+# The pure-Rust AV1 decoder. The OS decoders are always compiled; this adds the
+# one codec a machine without an OS AV1 decoder still has to be able to read.
+decode-native = []
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

@@ -2602,6 +2602,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shiso-media-sys"
+version = "0.2.2"
+dependencies = [
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "shiso-metal"
 version = "0.2.2"
 dependencies = [

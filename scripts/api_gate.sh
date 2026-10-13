@@ -33,7 +33,7 @@ section() { printf '\n== %s\n' "$*"; }
 # The crates permitted to relax `unsafe_code`, and the reason each one needs it.
 # A fifth name here is a design decision, not an oversight, so the set is
 # asserted rather than counted.
-UNSAFE_CRATES="shiso-cuda shiso-modelfile shiso-metal shiso-ple"
+UNSAFE_CRATES="shiso-cuda shiso-media-sys shiso-modelfile shiso-metal shiso-ple"
 
 # ---------------------------------------------------------------------------
 section "missing_docs is deny"

@@ -86,8 +86,11 @@ What each feature adds:
   - `symphonia` 0.6 with **explicit** features
     `["mp3", "aac", "isomp4", "flac", "ogg", "vorbis", "wav", "pcm", "mkv"]`
     (mp3, aac and isomp4 are off in its defaults), `default-features = false`;
-  - `rav1d` 1.1 (BSD-2-Clause), consumed inside `shiso-media-sys`;
-  - `yuvutils-rs` (YUV→RGB, BSD-3-Clause OR Apache-2.0).
+  - `rav1d` 1.1 (BSD-2-Clause), consumed inside `shiso-media-sys`.
+  - YUV→RGB is not a dependency: `shiso-media-sys::colour` converts I420,
+    NV12 and 10-bit I420 in safe code with the stream's matrix and range, so
+    NVDEC (always compiled) and AV1 share one implementation without a
+    feature-gated crate.
   - `matroska-demuxer` (Zlib OR MIT OR Apache-2.0) is not in this list: the
     demuxer is always compiled.
   - Licences all appear in `deny.toml`'s allow list; confirm with
@@ -214,8 +217,8 @@ same `open`/`decode`/`flush` shape and the same `HwFrame`/`HwError`. The
 module is a thin wrapper over `rav1d`'s `dav1d_*` C-ABI functions
 (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_picture_unref`,
 `dav1d_close`). Pictures are unref'd on every path, including errors
-(rule 9). Planar YUV is converted to RGB8 with `yuvutils-rs` in safe code,
-honouring the sequence's matrix and range.
+(rule 9). Planar YUV is converted to RGB8 by `shiso_media_sys::colour` in safe
+code, honouring the sequence's matrix and range.
 
 - **Check at implementation:** that `rav1d`'s `asm` feature (default on)
   builds on the pinned toolchain for both targets. Start with
@@ -261,7 +264,7 @@ Dropping a decoder releases every OS or library handle.
   `cuvidDecodePicture`, and the display callback runs `cuvidMapVideoFrame` for
   kept frames.
 - **Colour:** the NV12 surface is copied to host memory and converted with the
-  same YUV→RGB code the AV1 path uses, honouring the stream's matrix and range.
+  same `colour` module the AV1 path uses, honouring the stream's matrix and range.
 - **Concurrency:** at most `MAX_NVDEC_SESSIONS = 4` sessions per process,
   guarded by a counting semaphore; extra decodes wait. GB10 has one NVDEC
   engine, and sessions time-share it.
@@ -411,7 +414,7 @@ merged on its own:
 3. **Demux:** MP4 and MKV/WebM, `SamplePlan`, the Annex-B helper.
 4. **`shiso-media-sys` on macOS:** VideoToolbox, the OS step, device tests on
    this machine.
-5. **Rust AV1:** `rav1d` in `shiso-media-sys`, `yuvutils-rs` conversion.
+5. **Rust AV1:** `rav1d` in `shiso-media-sys`, the in-house `colour` conversion.
 6. **`shiso-media-sys` on Linux:** NVDEC, device tests on the GB10.
 
 ## Later (not in this design)
