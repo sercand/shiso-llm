@@ -294,6 +294,124 @@ impl std::fmt::Debug for HybridStack {
     }
 }
 
+/// The pieces of `layout` as the pass reads them, each in its run's session
+/// and the trunk forked into `forks`.
+fn segment_runs<'s>(
+    runs: &[PromptRun<'_>],
+    layout: &RunLayout,
+    sessions: &'s HashMap<SessionId, Session>,
+    forks: &'s [&'s Session],
+) -> CoreResult<Vec<layers::SegmentRun<'s>>> {
+    layout
+        .pieces
+        .iter()
+        .map(|piece| {
+            let id = runs[piece.run].session;
+            Ok(layers::SegmentRun {
+                session: sessions.get(&id).ok_or(CoreError::UnknownSession(id))?,
+                start: piece.start,
+                rows: piece.rows,
+                forks: if piece.trunk { forks } else { &[] },
+            })
+        })
+        .collect()
+}
+
+/// Shortest opening several fresh prompts must share before a batched pass
+/// reads it once: below this the copies that fork it cost about what the
+/// rows they save do.
+const MIN_SHARED_TRUNK: usize = 8;
+
+/// One piece of a batched prompt pass: rows of one run, read in its session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunPiece {
+    /// Which run the rows belong to.
+    run: usize,
+    /// The session position of the first row.
+    start: u32,
+    /// How many rows.
+    rows: u32,
+    /// Whether this is the shared trunk, forked into every other run.
+    trunk: bool,
+}
+
+/// How a batched prompt pass lays its runs out.
+///
+/// Runs whose sessions are all fresh and whose prompts open with the same
+/// tokens read that opening once: it runs in the first run's session and is
+/// forked into the others, and each run then reads only what follows it. A
+/// run keeps at least one row of its own, which is the row its answer is read
+/// from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunLayout {
+    /// The ids of every row, in pass order.
+    tokens: Vec<TokenId>,
+    /// The session position of every row, in pass order.
+    positions: Vec<u32>,
+    /// The pieces, in pass order.
+    pieces: Vec<RunPiece>,
+    /// Tokens of the shared trunk, zero when nothing is shared.
+    shared: u32,
+    /// Each run's last row in the pass, in run order.
+    last_rows: Vec<u32>,
+}
+
+impl RunLayout {
+    /// Lays `runs` out over sessions standing at `starts`.
+    fn new(runs: &[PromptRun<'_>], starts: &[u32]) -> Self {
+        let fresh = runs.len() > 1 && starts.iter().all(|&at| at == 0);
+        let shared = if fresh {
+            let shortest = runs.iter().map(|run| run.tokens.len()).min().unwrap_or(0);
+            let first = runs.first().map_or(&[][..], |run| run.tokens);
+            let common = (0..shortest.saturating_sub(1))
+                .take_while(|&at| runs.iter().all(|run| run.tokens[at] == first[at]))
+                .count();
+            if common >= MIN_SHARED_TRUNK {
+                common
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let mut layout = Self {
+            tokens: Vec::new(),
+            positions: Vec::new(),
+            pieces: Vec::new(),
+            shared: u32::try_from(shared).unwrap_or(u32::MAX),
+            last_rows: Vec::with_capacity(runs.len()),
+        };
+        if shared > 0 {
+            layout.push(0, &runs[0].tokens[..shared], starts[0], true);
+        }
+        for (index, (run, start)) in runs.iter().zip(starts).enumerate() {
+            let from = start.saturating_add(layout.shared);
+            layout.push(index, &run.tokens[shared..], from, false);
+            layout.last_rows.push(layout.rows().saturating_sub(1));
+        }
+        layout
+    }
+
+    /// Appends one piece.
+    fn push(&mut self, run: usize, tokens: &[TokenId], start: u32, trunk: bool) {
+        let rows = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+        self.tokens.extend_from_slice(tokens);
+        self.positions
+            .extend((0..rows).map(|row| start.saturating_add(row)));
+        self.pieces.push(RunPiece {
+            run,
+            start,
+            rows,
+            trunk,
+        });
+    }
+
+    /// Rows the pass carries.
+    fn rows(&self) -> u32 {
+        u32::try_from(self.tokens.len()).unwrap_or(u32::MAX)
+    }
+}
+
 /// Uploads the three per-row inputs a decode step reads: the token ids, the
 /// positions they land at, and the bound each row may attend up to.
 ///
@@ -1851,20 +1969,17 @@ impl HybridStack {
     /// Every refusal comes before any session is advanced.
     /// [`CoreError::Unsupported`] with [`shiso_core::NO_BATCHED_PROMPT_PASS`]
     /// for a stack that drafts (a draft head warms per chunk, which this pass
-    /// does not), and without it for more runs than [`MAX_PROMPT_RUNS`], more
-    /// rows than [`MAX_PREFILL_CHUNK`], a session that read media or keeps a
+    /// does not), and without it for more runs than [`MAX_PROMPT_RUNS`], a
+    /// pass wider than [`MAX_PREFILL_CHUNK`] rows once a shared trunk is
+    /// counted once, a session that read media or keeps a
     /// decision capture, and a session named twice; [`CoreError::ShapeMismatch`]
     /// for no runs or an empty one; [`CoreError::UnknownSession`];
     /// [`CoreError::ContextOverflow`]; and whatever the device reports.
     pub fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
         self.check_prompt_runs(runs)?;
-        let n_tok = runs
-            .iter()
-            .map(|run| u32::try_from(run.tokens.len()).unwrap_or(u32::MAX))
-            .fold(0u32, u32::saturating_add);
         let capacity = self.opts.ctx;
         let now = self.now();
-        {
+        let last_rows = {
             let Self {
                 backend,
                 geometry,
@@ -1878,48 +1993,60 @@ impl HybridStack {
                 what: "a model whose device state teardown already released",
                 backend: "engine",
             })?;
-            let tokens: Vec<TokenId> = runs
+            let starts = runs
                 .iter()
-                .flat_map(|run| run.tokens.iter().copied())
-                .collect();
-            let rows = open_ple(resident, geometry, &tokens)?;
-            let mut positions = Vec::with_capacity(tokens.len());
+                .map(|run| {
+                    sessions
+                        .get(&run.session)
+                        .map(Session::written)
+                        .ok_or(CoreError::UnknownSession(run.session))
+                })
+                .collect::<CoreResult<Vec<_>>>()?;
+            let layout = RunLayout::new(runs, &starts);
+            // Measured on the layout rather than the runs: a trunk read once
+            // is what lets several prompts of a few hundred tokens share one
+            // pass at all.
+            if layout.rows() > MAX_PREFILL_CHUNK {
+                return Err(CoreError::Unsupported {
+                    what: "a batched prompt pass wider than one prefill chunk",
+                    backend: "engine",
+                });
+            }
+            let rows = open_ple(resident, geometry, &layout.tokens)?;
             for run in runs {
-                let live = sessions
-                    .get_mut(&run.session)
-                    .ok_or(CoreError::UnknownSession(run.session))?;
-                let start = live.written();
-                positions.extend(
-                    (0..run.tokens.len())
-                        .map(|t| start.saturating_add(u32::try_from(t).unwrap_or(u32::MAX))),
-                );
                 let room = kv::Room {
                     cache: &resident.cache,
                     now,
                 };
-                live.advance(run.tokens, capacity, room)?;
+                sessions
+                    .get_mut(&run.session)
+                    .ok_or(CoreError::UnknownSession(run.session))?
+                    .advance(run.tokens, capacity, room)?;
             }
             upload_decode_rows(
                 backend.as_ref(),
                 &mut staging.ids,
                 &resident.scratch,
-                &tokens,
-                &positions,
+                &layout.tokens,
+                &layout.positions,
             )?;
             if let Some(rows) = rows {
                 stage_ple(backend.as_ref(), resident, &mut staging.ple, rows)?;
             }
-            let segments: Vec<layers::SegmentRun<'_>> = runs
-                .iter()
-                .map(|run| {
-                    Ok(layers::SegmentRun {
-                        session: sessions
+            // The sessions the trunk is forked into: every run's but the first.
+            let forks: Vec<&Session> = if layout.shared > 0 {
+                runs.iter()
+                    .skip(1)
+                    .map(|run| {
+                        sessions
                             .get(&run.session)
-                            .ok_or(CoreError::UnknownSession(run.session))?,
-                        rows: u32::try_from(run.tokens.len()).unwrap_or(u32::MAX),
+                            .ok_or(CoreError::UnknownSession(run.session))
                     })
-                })
-                .collect::<CoreResult<_>>()?;
+                    .collect::<CoreResult<_>>()?
+            } else {
+                Vec::new()
+            };
+            let segments = segment_runs(runs, &layout, sessions, &forks)?;
             let residual = layers::forward(
                 backend.as_ref(),
                 &resident.weights,
@@ -1929,7 +2056,7 @@ impl HybridStack {
                 &resident.kv,
                 layers::PassRows::Segments(&segments),
                 resident.ple.as_ref(),
-                n_tok,
+                layout.rows(),
                 None,
                 layers::PassExtras {
                     trail: Trail::None,
@@ -1937,28 +2064,29 @@ impl HybridStack {
                 },
             )?;
             drop(segments);
-            let mut last = 0u32;
-            for run in runs {
-                let rows = u32::try_from(run.tokens.len()).unwrap_or(u32::MAX);
-                last = last.saturating_add(rows);
+            drop(forks);
+            for (run, last) in runs.iter().zip(&layout.last_rows) {
                 let live = sessions
                     .get_mut(&run.session)
                     .ok_or(CoreError::UnknownSession(run.session))?;
                 live.push_history(run.tokens);
-                live.record_pass(residual, last.saturating_sub(1));
+                live.record_pass(residual, *last);
             }
-        }
-        self.answer_prompt_runs(runs)
+            layout.last_rows
+        };
+        self.answer_prompt_runs(runs, &last_rows)
     }
 
     /// Each run's last row of the pass that just ran into its own logits row,
     /// and the commit a solo final chunk makes, carrying that row; then the
     /// block of those rows.
-    fn answer_prompt_runs(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
-        let mut last = 0u32;
-        for (row, run) in (0u32..).zip(runs) {
-            last = last.saturating_add(u32::try_from(run.tokens.len()).unwrap_or(u32::MAX));
-            self.write_logits(last.saturating_sub(1), row)?;
+    fn answer_prompt_runs(
+        &mut self,
+        runs: &[PromptRun<'_>],
+        last_rows: &[u32],
+    ) -> CoreResult<Logits<'_>> {
+        for ((row, run), last) in (0u32..).zip(runs).zip(last_rows) {
+            self.write_logits(*last, row)?;
             self.commit(run.session, true, Some(row))?;
         }
         let rows = u32::try_from(runs.len()).unwrap_or(u32::MAX);
@@ -1993,13 +2121,6 @@ impl HybridStack {
         if runs.len() > MAX_PROMPT_RUNS as usize {
             return Err(CoreError::Unsupported {
                 what: "a batched prompt pass of more runs than the logits block holds",
-                backend: "engine",
-            });
-        }
-        let rows = runs.iter().map(|run| run.tokens.len()).sum::<usize>();
-        if rows > MAX_PREFILL_CHUNK as usize {
-            return Err(CoreError::Unsupported {
-                what: "a batched prompt pass wider than one prefill chunk",
                 backend: "engine",
             });
         }
@@ -2098,5 +2219,97 @@ impl Drop for HybridStack {
         if let Err(error) = self.teardown() {
             tracing::warn!(%error, "teardown from drop could not report cleanly");
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{PromptRun, RunLayout, RunPiece};
+    use shiso_core::ids::{SessionId, TokenId};
+
+    fn ids(values: &[u32]) -> Vec<TokenId> {
+        values.iter().copied().map(TokenId::new).collect()
+    }
+
+    fn runs(prompts: &[Vec<TokenId>]) -> Vec<PromptRun<'_>> {
+        let mut counter = std::num::NonZeroU64::MIN;
+        prompts
+            .iter()
+            .map(|tokens| PromptRun {
+                session: SessionId::next(&mut counter).expect("a handle"),
+                tokens,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fresh_runs_sharing_an_opening_read_it_once() {
+        let opening: Vec<u32> = (1..=10).collect();
+        let prompts: Vec<Vec<TokenId>> = [vec![20, 21], vec![30], vec![40, 41, 42]]
+            .into_iter()
+            .map(|tail| ids(&[opening.clone(), tail].concat()))
+            .collect();
+        let layout = RunLayout::new(&runs(&prompts), &[0, 0, 0]);
+        assert_eq!(layout.shared, 10);
+        assert_eq!(
+            layout.pieces,
+            vec![
+                RunPiece {
+                    run: 0,
+                    start: 0,
+                    rows: 10,
+                    trunk: true
+                },
+                RunPiece {
+                    run: 0,
+                    start: 10,
+                    rows: 2,
+                    trunk: false
+                },
+                RunPiece {
+                    run: 1,
+                    start: 10,
+                    rows: 1,
+                    trunk: false
+                },
+                RunPiece {
+                    run: 2,
+                    start: 10,
+                    rows: 3,
+                    trunk: false
+                },
+            ]
+        );
+        assert_eq!(layout.last_rows, vec![11, 12, 15]);
+        assert_eq!(layout.rows(), 16);
+        assert_eq!(&layout.positions[10..13], &[10, 11, 10]);
+    }
+
+    #[test]
+    fn a_run_keeps_its_own_last_row_and_a_short_opening_is_not_shared() {
+        // One prompt is the other's opening: the shared part stops one short
+        // of it, so it still has the row its answer is read from.
+        let long: Vec<u32> = (1..=12).collect();
+        let prompts = vec![ids(&long), ids(&long[..9])];
+        let layout = RunLayout::new(&runs(&prompts), &[0, 0]);
+        assert_eq!(layout.shared, 8);
+        assert_eq!(layout.last_rows, vec![11, 12]);
+
+        let prompts = vec![ids(&[1, 2, 3, 9]), ids(&[1, 2, 3, 8])];
+        let layout = RunLayout::new(&runs(&prompts), &[0, 0]);
+        assert_eq!(layout.shared, 0);
+        assert_eq!(layout.last_rows, vec![3, 7]);
+    }
+
+    #[test]
+    fn a_resumed_session_shares_nothing() {
+        let opening: Vec<u32> = (1..=10).collect();
+        let prompts = vec![
+            ids(&[opening.clone(), vec![5]].concat()),
+            ids(&[opening, vec![6]].concat()),
+        ];
+        let layout = RunLayout::new(&runs(&prompts), &[0, 64]);
+        assert_eq!(layout.shared, 0);
+        assert_eq!(layout.positions[11], 64);
     }
 }

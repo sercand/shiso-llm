@@ -1130,6 +1130,9 @@ fn ple_row(
 /// Bytes of one token id and of one position, both of which are `int32`.
 const ID_BYTES: u64 = 4;
 
+/// Bytes one cached key or value element occupies: the cache is f16.
+const F16_BYTES: u64 = 2;
+
 /// Gathers one embedding row per token id.
 ///
 /// The three formats that have a gather share this argument block exactly, so the
@@ -1703,8 +1706,75 @@ pub(crate) enum PassRows<'a> {
 pub(crate) struct SegmentRun<'a> {
     /// The session the run's rows belong to.
     pub(crate) session: &'a Session,
+    /// The position of the run's first row in its session.
+    pub(crate) start: u32,
     /// How many consecutive rows of the pass are this run's.
     pub(crate) rows: u32,
+    /// Sessions that read this run's rows as their own: after the run's
+    /// attention, its cache rows are copied into each of theirs at the same
+    /// positions, and after its recurrent block, its state is copied over
+    /// theirs. Empty for a run nothing shares.
+    ///
+    /// This is how a trunk several prompts open with is read once: the trunk
+    /// runs in one session and is forked into the others layer by layer, each
+    /// before that layer's runs of theirs read it. What they receive is what
+    /// they would have computed, so their answers do not move.
+    pub(crate) forks: &'a [&'a Session],
+}
+
+/// Copies `run`'s recurrent state for slot `ordinal` over every fork's.
+fn fork_state(backend: &dyn Backend, run: &SegmentRun<'_>, ordinal: u32) -> CoreResult<()> {
+    let from = run.session.gdn(ordinal)?;
+    for fork in run.forks {
+        let to = fork.gdn(ordinal)?;
+        backend.copy_d2d(to.conv(), from.conv())?;
+        backend.copy_d2d(to.state(), from.state())?;
+    }
+    Ok(())
+}
+
+/// The physical page `session` keeps position `at` in.
+fn page_of(session: &Session, at: u32) -> CoreResult<u64> {
+    let table = session.kv().frontier().table().as_slice();
+    table
+        .get(usize::try_from(at / PAGE_TOKENS).unwrap_or(usize::MAX))
+        .map(|page| u64::from(u32::from(*page)))
+        .ok_or(CoreError::ShapeMismatch {
+            field: "forked cache page",
+            expected: u64::from(at / PAGE_TOKENS) + 1,
+            got: u64::try_from(table.len()).unwrap_or(u64::MAX),
+        })
+}
+
+/// Copies `run`'s cache rows of one attention slot - keys in `k`, values in
+/// `v`, `row_bytes` a position - into every fork's pages at the same
+/// positions, one copy a page each side.
+fn fork_rows(
+    backend: &dyn Backend,
+    (k, v): (DeviceView<'_>, DeviceView<'_>),
+    row_bytes: u64,
+    run: &SegmentRun<'_>,
+) -> CoreResult<()> {
+    let end = run.start.saturating_add(run.rows);
+    let mut at = run.start;
+    while at < end {
+        let within = at % PAGE_TOKENS;
+        let take = (PAGE_TOKENS - within).min(end - at);
+        let bytes = u64::from(take).saturating_mul(row_bytes);
+        let offset = |page: u64| {
+            page.saturating_mul(u64::from(PAGE_TOKENS))
+                .saturating_add(u64::from(within))
+                .saturating_mul(row_bytes)
+        };
+        let from = offset(page_of(run.session, at)?);
+        for fork in run.forks {
+            let to = offset(page_of(fork, at)?);
+            backend.copy_d2d(k.slice(to, bytes)?, k.slice(from, bytes)?)?;
+            backend.copy_d2d(v.slice(to, bytes)?, v.slice(from, bytes)?)?;
+        }
+        at = at.saturating_add(take);
+    }
+    Ok(())
 }
 
 impl<'a> PassRows<'a> {
@@ -1901,6 +1971,7 @@ pub(crate) fn forward(
                             io,
                             run.rows,
                         )?;
+                        fork_state(backend, run, layer.ordinal)?;
                         first = first.saturating_add(run.rows);
                     }
                 } else {
@@ -1987,6 +2058,14 @@ pub(crate) fn forward(
                             &cache,
                             run.rows,
                         )?;
+                        // A slot that reads another slot's cache has no rows
+                        // of its own to hand on: the owner's fork carried them.
+                        if attn_geometry.owns_kv && !run.forks.is_empty() {
+                            let kv_row = u64::from(attn_geometry.n_head_kv)
+                                .saturating_mul(u64::from(attn_geometry.head_dim))
+                                .saturating_mul(F16_BYTES);
+                            fork_rows(backend, (k, v), kv_row, run)?;
+                        }
                         first = first.saturating_add(run.rows);
                     }
                 } else {
