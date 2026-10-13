@@ -59,6 +59,7 @@ the name "ds4" for the host project.
 | `crates/shiso-hub` | - | original to this repository |
 | `crates/shiso-registry` | - | original to this repository |
 | `crates/shiso-bench` | llama.cpp, `mlx-lm`, `transformers` | independent reference fixtures are captured from these |
+| `vendor/rav1d` | [rav1d](https://github.com/memorysafety/rav1d) 1.1.0 (a Rust port of dav1d), BSD-2-Clause | vendored from the crates.io release with one edit (the `on_error` unwrap that aborts the process on a damaged tile), the assembly sources and non-rlib crate types removed; see `vendor/rav1d/VENDOR.md` |
 | `scripts/reference/` | Hugging Face `transformers`, Apache-2.0 | reference tooling. `render_chat_fixtures.py` calls the reference chat-template implementation from `transformers` at run time; nothing is vendored |
 | `scripts/reference/block_draft_reference.py` | mlx-lm 0.31.3 and MLX 0.31.2, MIT; the z-lab/dflash reference drafter (`model_mlx.py`, passed at run time), MIT | original; imports and runs both references to capture a block drafter's first block and greedy acceptance; nothing is vendored |
 | `scripts/reference/mlx_logit_vectors.py` | [mlx-lm](https://github.com/ml-explore/mlx-lm) 0.31.3 and MLX 0.31.2, MIT; `tokenizers` | original; imports and runs the reference's own model loader and forward pass to capture independent logit fixtures; nothing is vendored |
