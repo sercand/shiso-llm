@@ -1686,15 +1686,87 @@ pub(crate) enum PassRows<'a> {
         /// Their page tables, packed one row per member.
         pages: crate::attn::Pages<'a>,
     },
+    /// Several sessions' prompt runs back to back: `runs[0].rows` rows of the
+    /// first session at consecutive positions, then the second's, and so on -
+    /// a batched prompt pass.
+    ///
+    /// Everything that reads a row alone - the projections, the norms, the
+    /// feed-forward - runs once over every row. The two blocks that read a
+    /// session's history run once per run over that run's rows, through
+    /// exactly the chunk path a solo read of the run takes: attention through
+    /// the session's own page table, a recurrent block through its own state.
+    Segments(&'a [SegmentRun<'a>]),
+}
+
+/// One session's run inside a [`PassRows::Segments`] pass.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SegmentRun<'a> {
+    /// The session the run's rows belong to.
+    pub(crate) session: &'a Session,
+    /// How many consecutive rows of the pass are this run's.
+    pub(crate) rows: u32,
 }
 
 impl<'a> PassRows<'a> {
     /// The page table each row reads.
-    fn pages(self) -> crate::attn::Pages<'a> {
+    ///
+    /// `None` for a segmented pass, whose runs each read their own session's
+    /// table and are dispatched one at a time.
+    fn pages(self) -> Option<crate::attn::Pages<'a>> {
         match self {
-            Self::Chunk(session) => crate::attn::Pages::shared(session.kv().view()),
-            Self::Batch { pages, .. } => pages,
+            Self::Chunk(session) => Some(crate::attn::Pages::shared(session.kv().view())),
+            Self::Batch { pages, .. } => Some(pages),
+            Self::Segments(_) => None,
         }
+    }
+}
+
+/// The refusal of a whole-pass path handed a segmented pass, which the
+/// branches above it dispatch run by run before it is reached.
+fn segments_here() -> CoreError {
+    CoreError::Unsupported {
+        what: "a segmented pass on a path that reads one table or one state for every row",
+        backend: "engine",
+    }
+}
+
+/// Rows `first .. first + rows` of a buffer whose rows are `row_bytes` wide.
+fn row_span(
+    view: DeviceView<'_>,
+    row_bytes: u64,
+    first: u32,
+    rows: u32,
+) -> CoreResult<DeviceView<'_>> {
+    view.slice(
+        u64::from(first).saturating_mul(row_bytes),
+        u64::from(rows).saturating_mul(row_bytes),
+    )
+}
+
+/// One recurrent slot's block over `n_tok` rows of `io`.
+fn recurrent_block(
+    backend: &dyn Backend,
+    kernels: &dyn BlockKernels,
+    geometry: &Geometry,
+    scratch: &Scratch,
+    block: &Block,
+    io: GdnIo<'_>,
+    n_tok: u32,
+) -> CoreResult<()> {
+    match block {
+        Block::Gdn(gdn) => {
+            let (gdn_geometry, gdn_scratch) = recurrent_slot(geometry, scratch)?;
+            kernels.recurrent(backend, gdn, gdn_geometry, gdn_scratch, io, n_tok)
+        }
+        Block::Ssm(ssm) => {
+            let (ssm_geometry, ssm_scratch) = state_space_slot(geometry, scratch)?;
+            crate::ssm::run(backend, ssm, ssm_geometry, ssm_scratch, io, n_tok)
+        }
+        Block::ShortConv(short) => {
+            let (short_geometry, short_scratch) = short_conv_slot(geometry, scratch)?;
+            crate::short_conv::run(backend, short, short_geometry, short_scratch, io, n_tok)
+        }
+        Block::Attn(_) => Ok(()),
     }
 }
 
@@ -1799,95 +1871,149 @@ pub(crate) fn forward(
     for (index, layer) in weights.layers.iter().enumerate() {
         match &layer.block {
             Block::Gdn(_) | Block::Ssm(_) | Block::ShortConv(_) => {
-                let states = match rows {
-                    PassRows::Chunk(session) => {
-                        let state = session.gdn(layer.ordinal)?;
-                        GdnStates::Chunk(GdnState {
-                            conv: state.conv(),
-                            state: state.state(),
-                        })
-                    }
-                    PassRows::Batch { members, .. } => {
-                        // Refilled rather than rebuilt: the buffer is hoisted
-                        // out of this loop, so a forty-slot pass costs one host
-                        // allocation instead of forty.
-                        per_row_states.clear();
-                        for session in members {
-                            let state = session.gdn(layer.ordinal)?;
-                            per_row_states.push(GdnState {
+                let row_bytes = u64::from(geometry.hidden).saturating_mul(launch::F32_BYTES);
+                if let PassRows::Segments(runs) = rows {
+                    // Each run folds its rows into its own session's state in
+                    // order, exactly as its solo chunk would.
+                    let mut first = 0u32;
+                    for run in runs {
+                        let state = run.session.gdn(layer.ordinal)?;
+                        let io = GdnIo {
+                            input: row_span(scratch.normed.view(), row_bytes, first, run.rows)?,
+                            states: GdnStates::Chunk(GdnState {
                                 conv: state.conv(),
                                 state: state.state(),
-                            });
-                        }
-                        GdnStates::PerRow(&per_row_states)
-                    }
-                };
-                // A trail only on a pass a rejection may undo. A prefill chunk
-                // carries no trail even on a speculative session: it would
-                // record the first few rows of a 512-row chunk, which is tens
-                // of mebibytes copied per slot for records that name positions
-                // no rollback can reach.
-                let trail = match (trail.records(), rows) {
-                    (true, PassRows::Chunk(session)) => session.gdn_trail(layer.ordinal)?,
-                    // A batch cannot be recorded, and the family refuses one
-                    // that claims to be; nothing here builds the claim.
-                    _ => None,
-                };
-                let io = GdnIo {
-                    input: scratch.normed.view(),
-                    states,
-                    block_out: scratch.block_out.view(),
-                    trail,
-                };
-                match &layer.block {
-                    Block::Gdn(gdn) => {
-                        let (gdn_geometry, gdn_scratch) = recurrent_slot(geometry, scratch)?;
-                        kernels.recurrent(backend, gdn, gdn_geometry, gdn_scratch, io, n_tok)?;
-                    }
-                    Block::Ssm(ssm) => {
-                        let (ssm_geometry, ssm_scratch) = state_space_slot(geometry, scratch)?;
-                        crate::ssm::run(backend, ssm, ssm_geometry, ssm_scratch, io, n_tok)?;
-                    }
-                    Block::ShortConv(short) => {
-                        let (short_geometry, short_scratch) = short_conv_slot(geometry, scratch)?;
-                        crate::short_conv::run(
+                            }),
+                            block_out: row_span(
+                                scratch.block_out.view(),
+                                row_bytes,
+                                first,
+                                run.rows,
+                            )?,
+                            trail: None,
+                        };
+                        recurrent_block(
                             backend,
-                            short,
-                            short_geometry,
-                            short_scratch,
+                            kernels,
+                            geometry,
+                            scratch,
+                            &layer.block,
                             io,
-                            n_tok,
+                            run.rows,
                         )?;
+                        first = first.saturating_add(run.rows);
                     }
-                    Block::Attn(_) => {}
+                } else {
+                    let states = match rows {
+                        PassRows::Chunk(session) => {
+                            let state = session.gdn(layer.ordinal)?;
+                            GdnStates::Chunk(GdnState {
+                                conv: state.conv(),
+                                state: state.state(),
+                            })
+                        }
+                        PassRows::Batch { members, .. } => {
+                            // Refilled rather than rebuilt: the buffer is hoisted
+                            // out of this loop, so a forty-slot pass costs one host
+                            // allocation instead of forty.
+                            per_row_states.clear();
+                            for session in members {
+                                let state = session.gdn(layer.ordinal)?;
+                                per_row_states.push(GdnState {
+                                    conv: state.conv(),
+                                    state: state.state(),
+                                });
+                            }
+                            GdnStates::PerRow(&per_row_states)
+                        }
+                        PassRows::Segments(_) => return Err(segments_here()),
+                    };
+                    // A trail only on a pass a rejection may undo. A prefill chunk
+                    // carries no trail even on a speculative session: it would
+                    // record the first few rows of a 512-row chunk, which is tens
+                    // of mebibytes copied per slot for records that name positions
+                    // no rollback can reach.
+                    let trail = match (trail.records(), rows) {
+                        (true, PassRows::Chunk(session)) => session.gdn_trail(layer.ordinal)?,
+                        // A batch cannot be recorded, and the family refuses one
+                        // that claims to be; nothing here builds the claim.
+                        _ => None,
+                    };
+                    let io = GdnIo {
+                        input: scratch.normed.view(),
+                        states,
+                        block_out: scratch.block_out.view(),
+                        trail,
+                    };
+                    recurrent_block(backend, kernels, geometry, scratch, &layer.block, io, n_tok)?;
                 }
             }
             Block::Attn(attn) => {
                 let (attn_geometry, rank) = attention_slot(geometry, layer)?;
                 let (k, v) = kv.layer_runs(rank)?;
-                let cache = AttnCache {
-                    k,
-                    v,
-                    pages: rows.pages(),
-                };
-                kernels.attention(
-                    backend,
-                    attn,
-                    attn_geometry,
-                    &scratch.attn,
-                    AttnIo {
-                        input: scratch.normed.view(),
-                        pos: positions,
-                        // How far along the sequence each token may look. The
-                        // positions again wherever attention is causal, which
-                        // is every text chunk and every slot of a family whose
-                        // media spans are causal too.
-                        bound: scratch.bound(),
-                        block_out: scratch.block_out.view(),
-                    },
-                    &cache,
-                    n_tok,
-                )?;
+                if let PassRows::Segments(runs) = rows {
+                    // Each run attends through its own session's table, as
+                    // its solo chunk would; a segmented pass carries no media,
+                    // so its positions are the linear row.
+                    let row_bytes = u64::from(geometry.hidden).saturating_mul(launch::F32_BYTES);
+                    let mut first = 0u32;
+                    for run in runs {
+                        let cache = AttnCache {
+                            k,
+                            v,
+                            pages: crate::attn::Pages::shared(run.session.kv().view()),
+                        };
+                        kernels.attention(
+                            backend,
+                            attn,
+                            attn_geometry,
+                            &scratch.attn,
+                            AttnIo {
+                                input: row_span(scratch.normed.view(), row_bytes, first, run.rows)?,
+                                pos: Positions::Linear(row_span(
+                                    scratch.positions(),
+                                    ID_BYTES,
+                                    first,
+                                    run.rows,
+                                )?),
+                                bound: row_span(scratch.bound(), ID_BYTES, first, run.rows)?,
+                                block_out: row_span(
+                                    scratch.block_out.view(),
+                                    row_bytes,
+                                    first,
+                                    run.rows,
+                                )?,
+                            },
+                            &cache,
+                            run.rows,
+                        )?;
+                        first = first.saturating_add(run.rows);
+                    }
+                } else {
+                    let cache = AttnCache {
+                        k,
+                        v,
+                        pages: rows.pages().ok_or_else(segments_here)?,
+                    };
+                    kernels.attention(
+                        backend,
+                        attn,
+                        attn_geometry,
+                        &scratch.attn,
+                        AttnIo {
+                            input: scratch.normed.view(),
+                            pos: positions,
+                            // How far along the sequence each token may look. The
+                            // positions again wherever attention is causal, which
+                            // is every text chunk and every slot of a family whose
+                            // media spans are causal too.
+                            bound: scratch.bound(),
+                            block_out: scratch.block_out.view(),
+                        },
+                        &cache,
+                        n_tok,
+                    )?;
+                }
             }
         }
         if crate::trace::inner() {

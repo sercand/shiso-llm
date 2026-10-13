@@ -38,7 +38,7 @@ use std::time::Instant;
 use shiso_core::backend::Backend;
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
-use shiso_core::model::{DecodeStep, Logits};
+use shiso_core::model::{DecodeStep, Logits, PromptRun};
 use shiso_core::{DType, DeviceView, GraphKey};
 use shiso_kvstore::{CacheStats, CommitOpts, KvCache, Reason};
 
@@ -67,6 +67,15 @@ pub const MAX_PREFILL_CHUNK: u32 = 512;
 /// chose the batch and the rows it gets back are indexed by its own order, so
 /// quietly running half of it would misalign every row.
 pub const MAX_DECODE_BATCH: u32 = 8;
+
+/// Prompt runs one batched prompt pass may carry, which with
+/// [`MAX_DECODE_BATCH`] sets the height of the logits block.
+///
+/// A pass answers one logits row per run, so this is a bound on rows the
+/// block holds rather than on work: sixteen rows of a 65,536-entry vocabulary
+/// are four mebibytes. A wider batch is refused rather than split, for the
+/// reason [`MAX_DECODE_BATCH`] gives.
+pub const MAX_PROMPT_RUNS: u32 = 16;
 
 /// Everything that lives on the device, in construction order.
 ///
@@ -441,7 +450,12 @@ impl HybridStack {
         let geometry = Geometry::new(&shape, embed)?;
         validate_ple(&geometry, ple.as_ref())?;
         let recurrent_slots = usize::try_from(shape.recurrent_count()).unwrap_or(0);
-        let scratch = Scratch::new(backend, &geometry, MAX_PREFILL_CHUNK, MAX_DECODE_BATCH)?;
+        let scratch = Scratch::new(
+            backend,
+            &geometry,
+            MAX_PREFILL_CHUNK,
+            MAX_DECODE_BATCH.max(MAX_PROMPT_RUNS),
+        )?;
         let rows = RowPages::new(backend, opts.ctx, MAX_DECODE_BATCH)?;
         // The pool after the scratch, so that a pool sized to the device is
         // sized from what the weights and the scratch left of it.
@@ -1799,6 +1813,204 @@ impl HybridStack {
             rows,
             self.geometry.vocab,
         )
+    }
+
+    /// Reads several sessions' final prompt runs in one pass and returns one
+    /// logits row per run, in run order: row `r` is the row
+    /// [`HybridStack::prefill_last`] would return for `runs[r]`, and every
+    /// session is left where that read would leave it.
+    ///
+    /// The runs are laid end to end as one pass ([`layers::PassRows::Segments`]):
+    /// the projections, norms and feed-forward read every row at once, and
+    /// attention and the recurrent blocks read each run through its own
+    /// session's chunk path. A projection's output row is a function of its
+    /// input row alone, so a run's rows are the ones its solo read computes.
+    ///
+    /// # Errors
+    ///
+    /// Every refusal comes before any session is advanced.
+    /// [`CoreError::Unsupported`] with [`shiso_core::NO_BATCHED_PROMPT_PASS`]
+    /// for a stack that drafts (a draft head warms per chunk, which this pass
+    /// does not), and without it for more runs than [`MAX_PROMPT_RUNS`], more
+    /// rows than [`MAX_PREFILL_CHUNK`], a session that read media or keeps a
+    /// decision capture, and a session named twice; [`CoreError::ShapeMismatch`]
+    /// for no runs or an empty one; [`CoreError::UnknownSession`];
+    /// [`CoreError::ContextOverflow`]; and whatever the device reports.
+    pub fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        self.check_prompt_runs(runs)?;
+        let n_tok = runs
+            .iter()
+            .map(|run| u32::try_from(run.tokens.len()).unwrap_or(u32::MAX))
+            .fold(0u32, u32::saturating_add);
+        let capacity = self.opts.ctx;
+        let now = self.now();
+        {
+            let Self {
+                backend,
+                geometry,
+                kernels,
+                resident,
+                sessions,
+                staging,
+                ..
+            } = self;
+            let resident = resident.as_ref().ok_or(CoreError::Unsupported {
+                what: "a model whose device state teardown already released",
+                backend: "engine",
+            })?;
+            let tokens: Vec<TokenId> = runs
+                .iter()
+                .flat_map(|run| run.tokens.iter().copied())
+                .collect();
+            let rows = open_ple(resident, geometry, &tokens)?;
+            let mut positions = Vec::with_capacity(tokens.len());
+            for run in runs {
+                let live = sessions
+                    .get_mut(&run.session)
+                    .ok_or(CoreError::UnknownSession(run.session))?;
+                let start = live.written();
+                positions.extend(
+                    (0..run.tokens.len())
+                        .map(|t| start.saturating_add(u32::try_from(t).unwrap_or(u32::MAX))),
+                );
+                let room = kv::Room {
+                    cache: &resident.cache,
+                    now,
+                };
+                live.advance(run.tokens, capacity, room)?;
+            }
+            upload_decode_rows(
+                backend.as_ref(),
+                &mut staging.ids,
+                &resident.scratch,
+                &tokens,
+                &positions,
+            )?;
+            if let Some(rows) = rows {
+                stage_ple(backend.as_ref(), resident, &mut staging.ple, rows)?;
+            }
+            let segments: Vec<layers::SegmentRun<'_>> = runs
+                .iter()
+                .map(|run| {
+                    Ok(layers::SegmentRun {
+                        session: sessions
+                            .get(&run.session)
+                            .ok_or(CoreError::UnknownSession(run.session))?,
+                        rows: u32::try_from(run.tokens.len()).unwrap_or(u32::MAX),
+                    })
+                })
+                .collect::<CoreResult<_>>()?;
+            let residual = layers::forward(
+                backend.as_ref(),
+                &resident.weights,
+                geometry,
+                &resident.scratch,
+                kernels.as_ref(),
+                &resident.kv,
+                layers::PassRows::Segments(&segments),
+                resident.ple.as_ref(),
+                n_tok,
+                None,
+                layers::PassExtras {
+                    trail: Trail::None,
+                    taps: None,
+                },
+            )?;
+            drop(segments);
+            let mut last = 0u32;
+            for run in runs {
+                let rows = u32::try_from(run.tokens.len()).unwrap_or(u32::MAX);
+                last = last.saturating_add(rows);
+                let live = sessions
+                    .get_mut(&run.session)
+                    .ok_or(CoreError::UnknownSession(run.session))?;
+                live.push_history(run.tokens);
+                live.record_pass(residual, last.saturating_sub(1));
+            }
+        }
+        self.answer_prompt_runs(runs)
+    }
+
+    /// Each run's last row of the pass that just ran into its own logits row,
+    /// and the commit a solo final chunk makes, carrying that row; then the
+    /// block of those rows.
+    fn answer_prompt_runs(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        let mut last = 0u32;
+        for (row, run) in (0u32..).zip(runs) {
+            last = last.saturating_add(u32::try_from(run.tokens.len()).unwrap_or(u32::MAX));
+            self.write_logits(last.saturating_sub(1), row)?;
+            self.commit(run.session, true, Some(row))?;
+        }
+        let rows = u32::try_from(runs.len()).unwrap_or(u32::MAX);
+        let resident = self.resident()?;
+        let bytes = logits_row_bytes(resident).saturating_mul(u64::from(rows));
+        Logits::new(
+            resident.scratch.logits().slice(0, bytes)?,
+            rows,
+            self.geometry.vocab,
+        )
+    }
+
+    /// The refusals of [`HybridStack::prefill_last_many`], all of them before
+    /// anything is advanced or launched.
+    fn check_prompt_runs(&self, runs: &[PromptRun<'_>]) -> CoreResult<()> {
+        // A fact about this stack rather than the call: a draft head warms its
+        // own cache chunk by chunk and a block drafter absorbs every pass's
+        // rows, and this pass does neither.
+        if self.draft.is_some() || self.block.is_some() {
+            return Err(CoreError::Unsupported {
+                what: shiso_core::NO_BATCHED_PROMPT_PASS,
+                backend: "engine",
+            });
+        }
+        if runs.is_empty() || runs.iter().any(|run| run.tokens.is_empty()) {
+            return Err(CoreError::ShapeMismatch {
+                field: "batched prompt runs",
+                expected: 1,
+                got: 0,
+            });
+        }
+        if runs.len() > MAX_PROMPT_RUNS as usize {
+            return Err(CoreError::Unsupported {
+                what: "a batched prompt pass of more runs than the logits block holds",
+                backend: "engine",
+            });
+        }
+        let rows = runs.iter().map(|run| run.tokens.len()).sum::<usize>();
+        if rows > MAX_PREFILL_CHUNK as usize {
+            return Err(CoreError::Unsupported {
+                what: "a batched prompt pass wider than one prefill chunk",
+                backend: "engine",
+            });
+        }
+        for (at, run) in runs.iter().enumerate() {
+            let live = self
+                .sessions
+                .get(&run.session)
+                .ok_or(CoreError::UnknownSession(run.session))?;
+            if runs[..at].iter().any(|seen| seen.session == run.session) {
+                return Err(CoreError::Unsupported {
+                    what: "a batched prompt pass naming one session twice",
+                    backend: "engine",
+                });
+            }
+            if live.carries_media() || self.captures.contains_key(&run.session) {
+                return Err(CoreError::Unsupported {
+                    what: "a batched prompt run over a session that read media or keeps \
+                           a decision capture",
+                    backend: "engine",
+                });
+            }
+            let next = u64::from(live.written())
+                .saturating_add(u64::try_from(run.tokens.len()).unwrap_or(u64::MAX));
+            if next > u64::from(self.opts.ctx) {
+                return Err(CoreError::ContextOverflow {
+                    session: run.session,
+                    cap: self.opts.ctx,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Releases device resources, reporting failures.

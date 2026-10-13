@@ -20,7 +20,7 @@ use shiso_core::buffer::{DeviceBuffer, import_host};
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{LayerIdx, SessionId, TokenId};
 use shiso_core::media::{MediaModel, VisionPrefill};
-use shiso_core::model::{DecodeStep, Logits, Model, ModelInfo, StopTokens};
+use shiso_core::model::{DecodeStep, Logits, Model, ModelInfo, PromptRun, StopTokens};
 use shiso_core::{Backend, DType, DecisionReadout};
 use shiso_engine::attn::Attn;
 use shiso_engine::dense::DenseKernels;
@@ -332,6 +332,14 @@ impl Model for Lfm2Model {
 
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
         self.stack.decode_batch(steps)
+    }
+
+    // A decision request reads one prompt per question, all short and all
+    // opening with the same state; read one at a time, each pass is a handful
+    // of rows through every weight. One pass over all of them reads the
+    // weights once.
+    fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        self.stack.prefill_last_many(runs)
     }
 
     // The stack splices a tower's rows wherever the placeholder runs are; the

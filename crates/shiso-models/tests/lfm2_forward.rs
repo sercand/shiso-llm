@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use shiso_core::backend::Backend;
 use shiso_core::ids::TokenId;
-use shiso_core::model::Model;
+use shiso_core::model::{Model, PromptRun};
 use shiso_engine::EngineOptions;
 use shiso_metal::{MetalBackend, metal_available};
 use shiso_modelfile::GgufFile;
@@ -110,6 +110,20 @@ fn load(path: &Path) -> Loaded {
         model,
         vocab,
     }
+}
+
+/// The log-softmax of a little-endian f32 logits row.
+fn log_softmax(bytes: &[u8]) -> Vec<f64> {
+    let row: Vec<f64> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f64::from(f32::from_le_bytes(*b)))
+        .collect();
+    let max = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let sum: f64 = row.iter().map(|v| (v - max).exp()).sum();
+    let lse = max + sum.ln();
+    row.iter().map(|v| v - lse).collect()
 }
 
 /// The log-softmax of the last row after reading `chunks` in order.
@@ -271,5 +285,96 @@ fn a_prompt_read_in_two_chunks_answers_as_one_read() {
         .fold(0.0f64, f64::max);
     report(&format!("two chunks against one: worst |dlogp| {worst:.6}"));
     assert!(worst < 1e-3, "a split read moved the row by {worst}");
+    loaded.model.teardown().expect("the model tears down");
+}
+
+/// The decision prompts of the fixture - one per question, sharing their
+/// opening - read in one batched pass answer as each read alone.
+///
+/// The pass lays the runs end to end: the projections read every row at once
+/// and attention and the convolution read each run through its own session.
+/// A run shorter than the tiled product's threshold reads its projections
+/// through the matvec alone and through the tile here, so the rows agree to
+/// rounding rather than to the bit; a misrouted row or a window carried across
+/// runs moves them by whole nats.
+#[test]
+#[ignore = "needs SHISO_TEST_MODEL_D1, the reference fixture and a Metal device"]
+fn a_batched_prompt_pass_answers_as_each_run_read_alone() {
+    if !metal_available() {
+        skip("no Metal device");
+        return;
+    }
+    let Some(path) = container("SHISO_TEST_MODEL_D1") else {
+        skip("SHISO_TEST_MODEL_D1 does not name a local container");
+        return;
+    };
+    let Some(reference) = fixture(F32_REFERENCE) else {
+        skip("no test-vectors/references/d1/lfm2-logits.json");
+        return;
+    };
+    let mut loaded = load(&path);
+    let cases = reference["cases"].as_array().expect("cases");
+    let prompts: Vec<Vec<TokenId>> = cases
+        .iter()
+        .filter(|case| {
+            case["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("decision_"))
+        })
+        .map(ids)
+        .collect();
+    assert!(
+        prompts.len() >= 3,
+        "the fixture carries the three decision prompts"
+    );
+    let alone: Vec<Vec<f64>> = prompts.iter().map(|p| logz(&mut loaded, &[p])).collect();
+
+    let sessions: Vec<_> = prompts
+        .iter()
+        .map(|_| loaded.model.open_session().expect("a session opens"))
+        .collect();
+    let runs: Vec<PromptRun<'_>> = sessions
+        .iter()
+        .zip(&prompts)
+        .map(|(session, tokens)| PromptRun {
+            session: *session,
+            tokens,
+        })
+        .collect();
+    let mut rows = vec![vec![0u8; loaded.vocab * 4]; prompts.len()];
+    {
+        let logits = loaded
+            .model
+            .prefill_last_many(&runs)
+            .expect("the pass runs");
+        for (at, row) in (0u32..).zip(rows.iter_mut()) {
+            loaded
+                .backend
+                .copy_d2h(logits.row(at).expect("the row"), row)
+                .expect("the row reads back");
+        }
+    }
+    for session in sessions {
+        loaded
+            .model
+            .close_session(session)
+            .expect("the session closes");
+    }
+    for (index, (row, want)) in rows.iter().zip(&alone).enumerate() {
+        let have = log_softmax(row);
+        let worst = have
+            .iter()
+            .zip(want)
+            .filter(|(_, w)| **w > -12.0)
+            .map(|(h, w)| (h - w).abs())
+            .fold(0.0f64, f64::max);
+        report(&format!(
+            "run {index} batched against alone: worst |dlogp| {worst:.6}"
+        ));
+        assert!(
+            worst < 0.02,
+            "run {index} moved by {worst} in the batched pass"
+        );
+    }
     loaded.model.teardown().expect("the model tears down");
 }
