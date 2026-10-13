@@ -21,7 +21,7 @@ use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{LayerIdx, SessionId, TokenId};
 use shiso_core::media::{MediaModel, VisionPrefill};
 use shiso_core::model::{DecodeStep, Logits, Model, ModelInfo, StopTokens};
-use shiso_core::{Backend, DType};
+use shiso_core::{Backend, DType, DecisionReadout};
 use shiso_engine::attn::Attn;
 use shiso_engine::dense::DenseKernels;
 use shiso_engine::ffn::Ffn;
@@ -33,6 +33,7 @@ use shiso_engine::{EngineOptions, HybridStack};
 use shiso_modelfile::{GgufFile, TensorDesc};
 
 use crate::lfm2::config::{GGUF_ARCH, Lfm2Config, Lfm2Readout};
+use crate::lfm2::decision::D1Readout;
 
 /// Formats a projection of this family may be stored in: the two the
 /// published exports use and the `q8_0` of the higher-precision one.
@@ -337,6 +338,16 @@ impl Model for Lfm2Model {
     // tower itself is the family's and is opened beside the model.
     fn media_mut(&mut self) -> Option<&mut dyn MediaModel> {
         Some(self)
+    }
+
+    // Only a checkpoint whose container names the d1 readout answers this
+    // way; a plain LFM2 language model stays a chat model, because reading
+    // its next-token row as a calibrated answer is not what it was made for.
+    fn decision_readout(&self) -> Option<Arc<dyn DecisionReadout>> {
+        match self.readout {
+            Lfm2Readout::Decision => Some(Arc::new(D1Readout)),
+            Lfm2Readout::Generative => None,
+        }
     }
 
     fn teardown(&mut self) -> CoreResult<()> {

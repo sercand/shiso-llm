@@ -48,7 +48,7 @@ use shiso_engine::sparse::stack::SparseOptions;
 use shiso_models::gemma4::{
     Gemma4AudioTower, Gemma4Config, Gemma4Model, Gemma4Tower, PleOptions, holds_audio_tower,
 };
-use shiso_models::lfm2::{Lfm2Config, Lfm2Model};
+use shiso_models::lfm2::{Lfm2Config, Lfm2Model, Lfm2Tower};
 use shiso_models::nemotron_h::{NemotronHConfig, NemotronHModel};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::mtp::{self, AffineQuant, MtpManifest};
@@ -391,15 +391,13 @@ impl std::fmt::Debug for Loaded {
     }
 }
 
-/// The LFM2 template's placement: one `<image>` marker per picture, the run
-/// bracketed by the picture's start and end tokens.
-const LFM2_PLACEMENT: MediaPlacement = MediaPlacement {
-    image_marker: "<image>",
-    video_marker: None,
-    wrap_image: Some(("<|image_start|>", "<|image_end|>")),
-    audio_marker: None,
-    wrap_audio: None,
-};
+/// The LFM2 family's opener.
+fn open_lfm2_tower(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+) -> Result<Box<dyn VisionTower>, VisionError> {
+    Ok(Box::new(Lfm2Tower::open(backend, path)?))
+}
 
 /// The Qwen family's opener.
 fn open_qwen35_tower(
