@@ -111,6 +111,12 @@ hex = "0.4"
 # --- vision --------------------------------------------------------------
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 base64 = "0.22"
+# The AV1 decoder behind shiso-media-sys's `decode-native` (BSD-2-Clause).
+# Without `asm`: the 1.1.0 package does not build with it on aarch64 macOS (its
+# assembly includes a header the published crate leaves out), x86_64 would add
+# nasm to the build, and the portable build decodes 720p at 3.8 ms a frame on
+# an M4 (crates/shiso-media-sys/src/av1.rs).
+rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 
 # --- dev -----------------------------------------------------------------
 tempfile = "3"
