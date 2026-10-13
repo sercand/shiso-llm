@@ -324,3 +324,214 @@ kernel void kernel_dense_attn_prefill(
         }
     }
 }
+
+/// The prefill softmax on simdgroup matrices, for a head `HD` wide: the same
+/// span, the same scale and the same paged cache as `kernel_dense_attn_prefill`,
+/// with the products on the matrix units.
+///
+/// The scalar entry above scores one key per lane and blends the values one
+/// key at a time, re-translating every value row through the page table for
+/// every query. On an M1 Max that held a 3B hybrid's eight attention layers to
+/// about 40 GFLOP/s, so a 512-token chunk at position 3584 cost 2.4 s more
+/// than the same chunk at position 0. This is the vision tower's flash shape
+/// (`metal/vision/vit_attn.metal`) over the cache: a threadgroup takes 64
+/// query rows of one head - eight per simdgroup, held as 8x8 fragments - and
+/// streams the union of their spans through threadgroup memory `KB` keys at a
+/// time, the next block loading into registers while the current one is
+/// multiplied, with an online softmax per row.
+///
+/// Queries, staged keys and values, scores and probabilities are all f32; the
+/// cache's f16 values widen exactly on the way in. A score is therefore the
+/// scalar entry's dot product summed in another order, and the softmax is the
+/// same max-subtracted form accumulated block by block.
+///
+/// Each row is masked by its own span, so a row whose span holds no key of a
+/// block - or no key at all - is carried through with its running maximum at
+/// -inf and contributes a row of zeros, as the scalar entry does.
+///
+/// grid `(n_head, ceil(n_tok / 64))`, block 256, no dynamic threadgroup
+/// memory. `head_dim` is the instantiation's `HD`; the host picks the entry by
+/// it.
+template <uint HD, uint KB>
+kernel void kernel_dense_attn_flash(
+        constant dense_args_attn & args [[buffer(0)]],
+        device float *out [[buffer(1)]],
+        device const float *q [[buffer(2)]],
+        device const half *k_cache [[buffer(3)]],
+        device const half *v_cache [[buffer(4)]],
+        device const int32_t *pos [[buffer(5)]],
+        device const int32_t *bound [[buffer(6)]],
+        device const int32_t *pages [[buffer(7)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint QR = DENSE_FLASH_QROWS;
+    const uint NT = DENSE_FLASH_THREADS;
+    const uint NB = KB / 8u;
+    const uint ND = HD / 8u;
+    // Each staged row padded by four floats so the transposed key loads do
+    // not land eight rows on one bank.
+    const uint LDK = HD + 4u;
+    threadgroup float kv[2u * KB * (HD + 4u)];
+
+    const uint h = tgpig.x;
+    const uint t0 = tgpig.y * QR;
+    // Uniform across the threadgroup, so no barrier below is skipped by part
+    // of it.
+    if (t0 >= args.n_tok) {
+        return;
+    }
+    const uint n_q = min(args.n_tok - t0, QR);
+    const uint hkv = h / (args.n_head / args.n_head_kv);
+
+    // The union of the tile's spans, as the scalar entry takes it: a block
+    // some of the tile's rows cannot see is a wasted load, not a wrong answer.
+    uint tile_lo = 0xFFFFFFFFu;
+    uint tile_hi = 0u;
+    for (uint i = 0u; i < n_q; i++) {
+        tile_lo = min(tile_lo, dense_attn_lo((uint32_t) pos[t0 + i], args.window));
+        tile_hi = max(tile_hi, (uint32_t) bound[t0 + i]);
+    }
+
+    // The lane's place in every 8x8 fragment: columns `fn, fn + 1` of row
+    // `fr`; the four lanes sharing a row differ in lane bits 0 and 3.
+    const ushort fn = ((lane / 4u) & 2u) * 2u + (lane % 2u) * 2u;
+    const ushort fr = ((lane / 4u) & 4u) + ((lane / 2u) % 4u);
+    const uint row = sg * 8u + fr;
+    const bool live = row < n_q;
+    const uint qrow = t0 + (live ? row : 0u);
+    // A row past the chunk reads nothing: its span is empty.
+    const uint q_lo = live ? dense_attn_lo((uint32_t) pos[qrow], args.window) : 1u;
+    const uint q_hi = live ? (uint32_t) bound[qrow] : 0u;
+
+    simdgroup_float8x8 qf[ND];
+    simdgroup_float8x8 of[ND];
+    device const float *qp = q + ((uint64_t) qrow * args.n_head + h) * HD;
+    DENSE_UNROLL for (uint i = 0; i < ND; ++i) {
+        qf[i].thread_elements()[0] = live ? qp[8u * i + fn] : 0.0f;
+        qf[i].thread_elements()[1] = live ? qp[8u * i + fn + 1u] : 0.0f;
+        of[i] = simdgroup_float8x8(0.0f);
+    }
+
+    float run_max = -INFINITY;
+    float run_sum = 0.0f;
+    threadgroup float *sk = kv;
+    threadgroup float *sv = kv + KB * LDK;
+    // Four consecutive head values per load. A key past the tile's last
+    // stages as zero and is masked below.
+    const uint HD4 = HD / 4u;
+    const uint SL = (KB * HD4 + NT - 1u) / NT;
+    float4 rk[SL];
+    float4 rv[SL];
+    auto fetch = [&](uint s0) {
+        DENSE_UNROLL for (uint t = 0; t < SL; ++t) {
+            const uint e = tid + t * NT;
+            const uint j = e / HD4;
+            const uint d = (e - j * HD4) * 4u;
+            const uint s = s0 + j;
+            rk[t] = float4(0.0f);
+            rv[t] = float4(0.0f);
+            if (e < KB * HD4 && s <= tile_hi) {
+                const uint64_t r = dense_kv_row(pages, s, args.page_tokens);
+                const uint64_t src = (r * args.n_head_kv + hkv) * HD + d;
+                rk[t] = float4(*((device const half4 *) (k_cache + src)));
+                rv[t] = float4(*((device const half4 *) (v_cache + src)));
+            }
+        }
+    };
+    if (tile_lo <= tile_hi) {
+        fetch(tile_lo);
+    }
+    for (uint s0 = tile_lo; s0 <= tile_hi; s0 += KB) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        DENSE_UNROLL for (uint t = 0; t < SL; ++t) {
+            const uint e = tid + t * NT;
+            if (e < KB * HD4) {
+                const uint j = e / HD4;
+                const uint d = (e - j * HD4) * 4u;
+                *((threadgroup float4 *) (sk + j * LDK + d)) = rk[t];
+                *((threadgroup float4 *) (sv + j * LDK + d)) = rv[t];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s0 + KB <= tile_hi) {
+            fetch(s0 + KB);
+        }
+
+        // Scores: S (8 x KB) = Q (8 x HD) . K^T, one fragment per 8 keys.
+        simdgroup_float8x8 sf[NB];
+        DENSE_UNROLL for (uint b = 0; b < NB; ++b) {
+            sf[b] = simdgroup_float8x8(0.0f);
+        }
+        DENSE_UNROLL for (uint i = 0; i < ND; ++i) {
+            DENSE_UNROLL for (uint b = 0; b < NB; ++b) {
+                simdgroup_float8x8 kt;
+                // kt(r, c) = K[8b + c][8i + r]: the transposed load.
+                simdgroup_load(kt, sk + 8u * b * LDK + 8u * i, LDK, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(sf[b], qf[i], kt, sf[b]);
+            }
+        }
+
+        float block_max = -INFINITY;
+        DENSE_UNROLL for (uint b = 0; b < NB; ++b) {
+            DENSE_UNROLL for (uint c = 0; c < 2u; ++c) {
+                const uint s = s0 + 8u * b + fn + c;
+                const bool seen = s >= q_lo && s <= q_hi;
+                const float score = seen ? sf[b].thread_elements()[c] * args.scale : -INFINITY;
+                sf[b].thread_elements()[c] = score;
+                block_max = max(block_max, score);
+            }
+        }
+        block_max = max(block_max, simd_shuffle_xor(block_max, 1));
+        block_max = max(block_max, simd_shuffle_xor(block_max, 8));
+        const float new_max = max(run_max, block_max);
+        // A row that has seen no key yet keeps its maximum at -inf; the
+        // guards keep -inf - -inf from turning it into NaN.
+        const bool empty = new_max == -INFINITY;
+        const float alpha = empty ? 1.0f : exp(run_max - new_max);
+        float block_sum = 0.0f;
+        DENSE_UNROLL for (uint b = 0; b < NB; ++b) {
+            DENSE_UNROLL for (uint c = 0; c < 2u; ++c) {
+                const float score = sf[b].thread_elements()[c];
+                const float p = score == -INFINITY ? 0.0f : exp(score - new_max);
+                sf[b].thread_elements()[c] = p;
+                block_sum += p;
+            }
+        }
+        block_sum += simd_shuffle_xor(block_sum, 1);
+        block_sum += simd_shuffle_xor(block_sum, 8);
+        run_sum = run_sum * alpha + block_sum;
+        run_max = new_max;
+
+        DENSE_UNROLL for (uint i = 0; i < ND; ++i) {
+            of[i].thread_elements()[0] *= alpha;
+            of[i].thread_elements()[1] *= alpha;
+            DENSE_UNROLL for (uint b = 0; b < NB; ++b) {
+                simdgroup_float8x8 vf;
+                simdgroup_load(vf, sv + 8u * b * LDK + 8u * i, LDK);
+                simdgroup_multiply_accumulate(of[i], sf[b], vf, of[i]);
+            }
+        }
+    }
+
+    // Normalize by the denominator and write each lane's two elements of
+    // every fragment straight to its row. An empty span writes zeros.
+    if (!live) {
+        return;
+    }
+    const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
+    device float *op = out + ((uint64_t) qrow * args.n_head + h) * HD;
+    DENSE_UNROLL for (uint i = 0; i < ND; ++i) {
+        op[8u * i + fn] = of[i].thread_elements()[0] * inv;
+        op[8u * i + fn + 1u] = of[i].thread_elements()[1] * inv;
+    }
+}
+
+typedef decltype(kernel_dense_attn_flash<64u, 32u>) kernel_dense_attn_flash_t;
+
+// One instantiation per head width a dense family reads at this shape. The
+// key block narrows as the head widens so the two staged f32 blocks stay
+// under 18 KiB of threadgroup memory: 2 x 32 x 68 x 4 and 2 x 16 x 132 x 4.
+template [[host_name("kernel_dense_attn_flash_hd64")]] kernel kernel_dense_attn_flash_t kernel_dense_attn_flash<64u, 32u>;
+template [[host_name("kernel_dense_attn_flash_hd128")]] kernel kernel_dense_attn_flash_t kernel_dense_attn_flash<128u, 16u>;

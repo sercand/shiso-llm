@@ -366,6 +366,26 @@ pub const DENSE_ATTN_KT: u32 = 16;
 /// `half`, at the widest head the set carries.
 pub const DENSE_ATTN_PREFILL_SMEM_BYTES: u32 = DENSE_ATTN_HEAD_DIM * DENSE_ATTN_KT * 2;
 
+/// Query rows per threadgroup of the simdgroup-matrix prefill softmax,
+/// `DENSE_FLASH_QROWS` in `metal/dense/dense_common.h`: eight per simdgroup.
+pub const DENSE_ATTN_FLASH_ROWS: u32 = 64;
+
+/// The simdgroup-matrix prefill softmax for a head `head_dim` wide, when one is
+/// instantiated (`metal/dense/dense_attn.metal`).
+///
+/// A backend that does not carry the entry is asked rather than assumed: the
+/// dispatch probes it with [`Backend::max_block_threads`](shiso_core::backend::Backend::max_block_threads)
+/// and runs the tiled scalar entry otherwise, so nothing above the backend
+/// names a device.
+#[must_use]
+pub const fn dense_attn_flash_name(head_dim: u32) -> Option<&'static str> {
+    match head_dim {
+        64 => Some("kernel_dense_attn_flash_hd64"),
+        128 => Some("kernel_dense_attn_flash_hd128"),
+        _ => None,
+    }
+}
+
 /// Weights in one per-layer embedding row, which is one `q6_K` block exactly.
 ///
 /// `DENSE_PLE_DIM` in `metal/dense/dense_common.h`. Not a width the shape may

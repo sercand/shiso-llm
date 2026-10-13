@@ -282,6 +282,14 @@ struct dense_args_clamp {
 #define DENSE_ATTN_QT 16u
 // Keys per prefill tile, one per lane of the low half of a simdgroup.
 #define DENSE_ATTN_KT 16u
+// Query rows per threadgroup of the simdgroup-matrix prefill softmax: eight
+// per simdgroup, one 8x8 fragment row each.
+#define DENSE_FLASH_QROWS (8u * DENSE_ATTN_WARPS)
+// Threads per threadgroup of the same entry.
+#define DENSE_FLASH_THREADS (32u * DENSE_ATTN_WARPS)
+// Full unrolling of the fixed-trip fragment loops, which keeps the fragment
+// arrays in registers.
+#define DENSE_UNROLL _Pragma("clang loop unroll(full)")
 // Weights in one per-layer embedding row, which is one q6_K block exactly.  The
 // prepare kernel stages a decoded row of this width in threadgroup memory, so
 // it bounds `dense_args_ple::dim` and the engine asserts the equality on the

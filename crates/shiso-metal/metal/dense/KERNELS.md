@@ -54,6 +54,7 @@ disagree, the kernel is right and this file is the bug.
 | `kernel_dense_kv_norm_rope_store` | `k_cache, v_cache, k_in, v_in, kw, pos, pages` | `(n_head_kv, n_tok)` | 128 | 2180 |
 | `kernel_dense_attn_decode` | `out, q, k_cache, v_cache, pos, bound, pages` | `(n_head, n_tok)` | 256 | 16448 |
 | `kernel_dense_attn_prefill` | `out, q, k_cache, v_cache, pos, bound, pages` | `(n_head, ceil(n_tok/16))` | 256 | 16384 |
+| `kernel_dense_attn_flash_hd64`, `kernel_dense_attn_flash_hd128` | `out, q, k_cache, v_cache, pos, bound, pages` | `(n_head, ceil(n_tok/64))` | 256 | 0 (static) |
 | `kernel_dense_ple_prepare_q6_K` | `out, proj, norm_w, rows, ids` | `(n_layers, n_tok)` | 128 | 1156 |
 | `kernel_dense_ple_gate_mul` | `gate, ple` | `ceil(n_tok*dim/256)` | 256 | 0 |
 | `kernel_dense_affine_qmv_4_f32` | `w, scales, biases, x, y`, then the args block LAST | `out_dim` | 32 | 0 |
@@ -156,6 +157,16 @@ for field in `crates/shiso-engine/src/launch.rs`.
   window's low end) contributes a row of zeros rather than a row of NaN.
   The prefill entry stages the transposed key tile as `half` and masks each query
   by its own span inside a tile whose range is the union of the tile's spans.
+- `kernel_dense_attn_flash_hd64` and `kernel_dense_attn_flash_hd128`: the same
+  span, scale and empty-span contract as the prefill entry, on simdgroup
+  matrices. A threadgroup takes 64 query rows of one head as 8x8 fragments and
+  streams the union of their spans through a static threadgroup array 32 keys
+  (hd64) or 16 keys (hd128) at a time, keys and values widened to f32, with an
+  online softmax per row: `2 x KB x (HD + 4) x 4` bytes, under 18 KiB at both
+  widths. Everything is f32 from the cache on, so a score is the prefill
+  entry's dot summed in another order. The engine dispatches it for a chunk
+  of 16 tokens or more at those two head widths, after asking the device for
+  it (`max_block_threads`); a device without it runs the prefill entry.
 - `kernel_dense_ple_prepare_q6_K`: per (token `t`, layer slot `l`), with
   `row = resident ? ids[t] : t`, `p_i = proj[t, l*dim + i] * proj_scale`,
   `p_i <- p_i * rsqrt(sum_i(p_i^2) / dim + eps) * norm_w[i]`,
