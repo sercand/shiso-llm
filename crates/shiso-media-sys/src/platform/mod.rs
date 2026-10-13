@@ -10,7 +10,10 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{Session, probe};
 
-#[cfg(target_os = "linux")]
+// Also compiled for tests on other Unix hosts, so its driver-free pieces are
+// unit-tested on machines without an NVIDIA GPU. Unix only: the bindings'
+// layout asserts assume an LP64 `unsigned long`, which Windows does not have.
+#[cfg(any(target_os = "linux", all(test, unix)))]
 mod linux;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{Session, probe};

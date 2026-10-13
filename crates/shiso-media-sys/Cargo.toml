@@ -16,5 +16,10 @@ decode-native = []
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# NVDEC: libcuda and libnvcuvid are opened at run time, never linked, so a
+# machine without the NVIDIA driver runs the same binary.
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = { workspace = true }
+
 [lints]
 workspace = true

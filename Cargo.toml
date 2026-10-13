@@ -132,6 +132,8 @@ cudarc = { version = "0.19", default-features = false, features = [
     "std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-version-from-build-system",
 ] }
 io-uring = "0.7"
+# Run-time loading of the NVDEC driver libraries (shiso-media-sys, Linux only).
+libloading = "0.9"
 
 # --- Apple Metal ---------------------------------------------------------
 objc2 = "0.6"
