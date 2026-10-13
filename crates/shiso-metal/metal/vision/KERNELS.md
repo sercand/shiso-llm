@@ -48,11 +48,32 @@ temporal group (`grid_h * grid_w`), `hidden` the tower's internal width,
 | `kernel_vit_attention` | `out, q, k, v` | `(heads, rows)` | 128 | `4 * (head_dim * (block/32 + 1) + 2 * block/32)` |
 | `kernel_vit_spatial_merge` | `out, in` | `merged_rows` | 256 | 0 |
 | `kernel_vit_splice_rows` | `hidden, src, map` | `rows` | 256 | 0 |
+| `kernel_vit_gemm64_bias` | `out, in, weight, bias` | `(ceil(n/64), ceil(m/64))` | 128 | 0 |
+| `kernel_vit_flash_attn_d{64,72,80}` | `out, q, k, v` | `(groups * ceil(plane/64), heads)` | 256 | 0 |
 
 `kernel_vit_gemm_bias_f16` and `kernel_vit_layer_norm_f16` are the same two
 entries for a tower stored in IEEE halves rather than brain floats: same
 buffers, grid, block and threadgroup memory, one body each, instantiated per
 width. The encoder picks one width per tower.
+
+## The simdgroup-matrix entries
+
+`kernel_vit_gemm64_bias` (and its `_f16` twin) and `kernel_vit_flash_attn_d*`
+exist only in this Metal set. They are the counterpart of the CUDA set's
+tensor-core path. The encoder resolves them per tower, and an absent or
+unresolvable entry falls back to the scalar kernel above it.
+
+- `kernel_vit_gemm64_bias` computes `kernel_vit_gemm_bias`'s product with
+  `k % 16 == 0` and 16-byte-aligned input rows. The encoder sends every other
+  width to the blocked kernel. Operands stay f32, the weights are widened
+  exactly, and accumulation is in 8-k steps in k order. Its staging is 9472 B
+  of fixed threadgroup arrays.
+- `kernel_vit_flash_attn_d{64,72,80}` computes `kernel_vit_attention`'s
+  output for a head that wide. It takes the same argument block, applies the
+  same `scale` to every score, and attends over the same temporal-group span.
+  It runs in one pass with an online softmax, everything f32, and its key and
+  value staging is a fixed `2 * 32 * (HD + 4)` floats. A wider head would not
+  fit two f32 blocks in 32 KiB, so none is instantiated.
 
 `kernel_vit_gemm_bias` reports 0 threadgroup bytes because its two staging tiles
 are fixed-size threadgroup arrays declared in the kernel, not a dynamic

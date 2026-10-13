@@ -224,15 +224,12 @@ fn a_batch_of_four_issues_one_set_of_projection_launches() {
 
 /// And the number, so that a regression says how far it regressed.
 ///
-/// A four-row batch costs one pass and nine more launches than a one-row one,
-/// and both halves of that are worth naming because neither is the page table:
-/// the per-row page table costs a device copy per row, not a launch.
-///
-/// - **three** are the logits rows. A row of the block is a row of the block,
-///   so the vocabulary projection stays per row whatever else batches.
-/// - **six** are the activation. `ffn::run` dispatches the flat gate kernel
-///   once per token by design - its own header says so - so two layers at four
-///   rows issue eight where two layers at one row issue two.
+/// A four-row batch costs one pass and three more launches than a one-row
+/// one, and they are worth naming because they are not the page table: the
+/// per-row page table costs a device copy per row, not a launch. The three
+/// are the logits rows. A row of the block is a row of the block, so the
+/// vocabulary projection stays per row whatever else batches. The activation
+/// is one flat launch over every row of the chunk.
 ///
 /// What this pins is the shape: a small additive cost on top of ONE pass,
 /// rather than a multiple of it. A stack with recurrent slots pays more, since
@@ -258,9 +255,9 @@ fn a_batch_of_four_costs_one_pass_and_a_handful_of_launches() {
     // the batch.
     assert_eq!(
         quad,
-        single + 9,
-        "a batch of four should cost one pass plus three logits rows and six \
-         per-token activation launches: one row issued {single}, four issued {quad}"
+        single + 3,
+        "a batch of four should cost one pass plus three logits rows: one row \
+         issued {single}, four issued {quad}"
     );
 }
 

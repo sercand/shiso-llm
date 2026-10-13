@@ -16,6 +16,26 @@
 // staging tiles, which fits every device this runs on with room to spare.
 #define VIT_GEMM_TILE 16u
 
+// The simdgroup-matrix GEMM's tile: 64 rows by 64 columns a threadgroup of
+// four simdgroups, k staged 16 deep, each staged row padded by four floats
+// against bank conflicts. See `kernel_vit_gemm64_bias`.
+#define VIT_GEMM64_TILE 64u
+#define VIT_GEMM64_K 16u
+#define VIT_GEMM64_THREADS 128u
+
+// Full unroll of a loop whose trip count is a compile-time constant. The
+// simdgroup-matrix fragments only stay in registers when every loop that
+// indexes them is unrolled; left as loops they spill and the tile runs several
+// times slower.
+#define VIT_UNROLL _Pragma("clang loop unroll(full)")
+
+// The simdgroup-matrix attention: eight simdgroups of eight query rows a
+// threadgroup, keys streamed 32 at a time. See `kernel_vit_flash_attn_d*`.
+#define VIT_FLASH_SG 8u
+#define VIT_FLASH_QROWS (8u * VIT_FLASH_SG)
+#define VIT_FLASH_KEYS 32u
+#define VIT_FLASH_THREADS (32u * VIT_FLASH_SG)
+
 // Per-lane accumulator slots in the attention kernel: one per 32 head-dim
 // values a lane strides over, so it bounds head_dim at 256.  Written as a fixed
 // array because a lane's accumulator has to live in registers for the online
@@ -43,11 +63,20 @@ static inline float vit_f16(device const ushort *p) {
 // How a tower's weights are stored, as a type the weight-reading kernels are
 // templated on: one body per kernel, instantiated once per storage width.
 // Each entry keeps its brain-float name and gains an `_f16` twin.
+// `load4` widens four consecutive values; it reads through a packed vector
+// because a weight row is only element-aligned in general.
 struct vit_w_bf16 {
     static inline float load(device const ushort *p) { return vit_bf16(p); }
+    static inline float4 load4(device const ushort *p) {
+        const uint4 bits = uint4(ushort4(*((device const packed_ushort4 *) p)));
+        return as_type<float4>(bits << 16);
+    }
 };
 struct vit_w_f16 {
     static inline float load(device const ushort *p) { return vit_f16(p); }
+    static inline float4 load4(device const ushort *p) {
+        return float4(as_type<half4>(ushort4(*((device const packed_ushort4 *) p))));
+    }
 };
 
 /// Inclusive sum over one simdgroup, left-folded in decreasing-offset order so

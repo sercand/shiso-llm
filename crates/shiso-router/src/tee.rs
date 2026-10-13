@@ -29,10 +29,9 @@ pub(crate) enum Dialect {
     OpenAiEmbeddings,
     OpenAiTranscriptions,
     /// The decision-scoring endpoints (`/v1/decisions`, `/v1/systemone`):
-    /// one prefill per question, no generated text. Their usage objects
-    /// spell the counts `prompt_tokens`/`completion_tokens` (decisions) and
-    /// `input_tokens`/`output_tokens` (systemone), both of which
-    /// `apply_openai_usage` already reads.
+    /// scored answers, no generated text. Both usage objects spell the counts
+    /// `input_tokens`/`output_tokens`, which `apply_openai_usage` already
+    /// reads.
     Scoring,
     /// Image generation (`/v1/images/generations`). Bodies are mostly
     /// base64 image data, and the usage object rides at the end of the
@@ -1089,16 +1088,15 @@ mod tests {
         assert_eq!(srt, Usage::default());
     }
 
-    /// Both scoring wires record usage; they just spell the counts
-    /// differently (`prompt_tokens`/`completion_tokens` on decisions,
-    /// `input_tokens`/`output_tokens` on systemone), and neither has a
-    /// finish reason — the answers are the reply.
+    /// Both scoring wires record usage from their `input_tokens` and
+    /// `output_tokens`, and neither has a finish reason — the answers are the
+    /// reply.
     #[test]
-    fn scoring_json_bodies_record_usage_in_both_spellings() {
+    fn scoring_json_bodies_record_usage() {
         let decisions = feed(
             Dialect::Scoring,
             false,
-            &[br#"{"object":"decisions","answers":{"q1":{"type":"yes_no","answer":"no"}},"usage":{"prompt_tokens":42,"completion_tokens":0,"total_tokens":42}}"#],
+            &[br#"{"object":"decisions","answers":[{"type":"predicate","name":"q1","probability":0.02}],"usage":{"input_tokens":42,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":42}}"#],
         );
         assert_eq!(decisions.prompt_tokens, Some(42));
         assert_eq!(decisions.completion_tokens, Some(0));

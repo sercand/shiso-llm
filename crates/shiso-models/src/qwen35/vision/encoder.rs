@@ -51,6 +51,11 @@ const MODULE: &str = "vision";
 
 /// Square tile the blocked GEMM walks; `VIT_GEMM_TILE` in the kernel set.
 const GEMM_TILE: u32 = 16;
+/// The simdgroup-matrix GEMM's output tile, its k step and its threads:
+/// `VIT_GEMM64_TILE`, `VIT_GEMM64_K` and `VIT_GEMM64_THREADS`.
+const GEMM64_TILE: u32 = 64;
+const GEMM64_K: usize = 16;
+const GEMM64_THREADS: u32 = 128;
 /// Threads the elementwise kernels are launched with. They stride by this value
 /// internally, so it is the one block size they may be launched with.
 const LINEAR_BLOCK: u32 = 256;
@@ -829,6 +834,12 @@ pub(crate) struct Fast {
     /// `kernel_vit_qkv_rope_split`, which folds the fused projection's bias,
     /// the rotation and the key/value split into one pass.
     rope_split: bool,
+    /// `kernel_vit_gemm64_bias` at the tower's width, the simdgroup-matrix
+    /// projection, for a device that has no BLAS route.
+    tile: Option<&'static str>,
+    /// `kernel_vit_flash_attn_d*` for this tower's head width, the
+    /// simdgroup-matrix attention, for a device without the tensor-core one.
+    flash: Option<&'static str>,
 }
 
 impl Fast {
@@ -837,6 +848,8 @@ impl Fast {
         attention: false,
         blas: false,
         rope_split: false,
+        tile: None,
+        flash: None,
     };
 
     /// What `backend` offers, for a tower whose head is `head_dim` wide.
@@ -860,10 +873,40 @@ impl Fast {
                 ]
                 .iter()
                 .all(|name| has(width.entry(name))),
+            // Resolved rather than looked up in the entry list: a backend
+            // lists only the entries it can name, and on Metal that is the
+            // template instantiations, not a plain kernel like this one.
+            tile: Some(width.entry(GEMM64)).filter(|&entry| {
+                backend
+                    .max_block_threads(KernelRef::new(MODULE, entry))
+                    .is_some_and(|threads| threads >= GEMM64_THREADS)
+            }),
+            flash: flash_entry(head_dim).filter(|&entry| {
+                !attention
+                    && backend
+                        .max_block_threads(KernelRef::new(MODULE, entry))
+                        .is_some_and(|threads| threads >= FLASH_THREADS)
+            }),
         }
     }
 }
 
+/// The simdgroup-matrix attention's entry for a head `head_dim` wide, when
+/// one is instantiated; see `metal/vision/vit_attn.metal`.
+const fn flash_entry(head_dim: usize) -> Option<&'static str> {
+    match head_dim {
+        64 => Some("kernel_vit_flash_attn_d64"),
+        72 => Some("kernel_vit_flash_attn_d72"),
+        80 => Some("kernel_vit_flash_attn_d80"),
+        _ => None,
+    }
+}
+/// Query rows and threads of one simdgroup-matrix attention threadgroup:
+/// `VIT_FLASH_QROWS` and `VIT_FLASH_THREADS`.
+const FLASH_QROWS: u32 = 64;
+const FLASH_THREADS: u32 = 256;
+/// The simdgroup-matrix projection; see `metal/vision/vit_gemm.metal`.
+const GEMM64: &str = "kernel_vit_gemm64_bias";
 /// The tensor-core attention's entry; see `kernels/cuda/vision/vit_fast.cuh`.
 const ATTENTION_MMA: &str = "kernel_vit_attention_mma";
 /// The operand rounding a BLAS projection reads.
@@ -1070,6 +1113,33 @@ impl Run<'_> {
             n: narrow(shape.out_width),
             k: narrow(shape.in_width),
         };
+        let planes = [
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(input.view()),
+            KernelArg::Buffer(weight),
+            KernelArg::Buffer(bias),
+        ];
+        // The tile takes whole 16-wide k slices; every width of the shipped
+        // towers is one, and any other reaches the blocked kernel.
+        if let Some(entry) = self
+            .fast
+            .tile
+            .filter(|_| shape.in_width.is_multiple_of(GEMM64_K))
+        {
+            return self.launch(
+                step,
+                entry,
+                Extent3::new(
+                    grid_for(shape.out_width, GEMM64_TILE),
+                    grid_for(shape.rows, GEMM64_TILE),
+                    1,
+                ),
+                Extent3::linear(GEMM64_THREADS),
+                0,
+                &planes,
+            );
+        }
         self.launch(
             step,
             self.width.entry("kernel_vit_gemm_bias"),
@@ -1080,13 +1150,7 @@ impl Run<'_> {
             ),
             Extent3::new(GEMM_TILE, GEMM_TILE, 1),
             0,
-            &[
-                KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                KernelArg::Buffer(out.view()),
-                KernelArg::Buffer(input.view()),
-                KernelArg::Buffer(weight),
-                KernelArg::Buffer(bias),
-            ],
+            &planes,
         )
     }
 
@@ -1473,6 +1537,21 @@ impl Run<'_> {
             )?;
             return self.attention_staged(plan, out, q);
         }
+        if let Some(entry) = self.fast.flash {
+            let groups = plan.rows / plan.plane.max(1);
+            return self.launch(
+                "attention",
+                entry,
+                Extent3::new(
+                    narrow(groups) * grid_for(plan.plane, FLASH_QROWS),
+                    narrow(plan.heads),
+                    1,
+                ),
+                Extent3::linear(FLASH_THREADS),
+                0,
+                &planes,
+            );
+        }
         // The query row, one accumulator per simdgroup, then the per-simdgroup
         // softmax maximum and denominator. Same formula as `KERNELS.md`.
         let warps = ATTN_BLOCK / 32;
@@ -1676,6 +1755,7 @@ impl WeightWidth {
         }
         match bf16 {
             "kernel_vit_gemm_bias" => "kernel_vit_gemm_bias_f16",
+            GEMM64 => "kernel_vit_gemm64_bias_f16",
             "kernel_vit_layer_norm" => "kernel_vit_layer_norm_f16",
             TO_BF16 => "kernel_vit_to_f16",
             ADD_BIAS_BF16 => "kernel_vit_add_bias_f16",

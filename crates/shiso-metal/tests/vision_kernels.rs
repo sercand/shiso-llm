@@ -42,7 +42,7 @@ fn every_vision_entry_point_resolves_as_a_pipeline() {
         return;
     }
     let backend = MetalBackend::new().expect("the embedded kernel library compiles");
-    for entry in tower::ENTRIES {
+    for entry in tower::ENTRIES.iter().chain(&tower::METAL_ENTRIES) {
         backend
             .prepare(KernelRef::new("vision", entry))
             .unwrap_or_else(|err| panic!("{entry} does not resolve: {err}"));
@@ -152,4 +152,32 @@ fn the_half_precision_gemm_agrees_with_a_row_times_column_loop() {
 fn the_half_precision_normalization_agrees_with_the_same_oracle() {
     let Some(gpu) = open() else { return };
     tower::the_half_precision_normalization_agrees_with_the_same_oracle(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_tiled_gemm_agrees_with_a_row_times_column_loop() {
+    let Some(gpu) = open() else { return };
+    tower::the_tiled_gemm_agrees_with_a_row_times_column_loop(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_half_precision_tiled_gemm_agrees_with_a_row_times_column_loop() {
+    let Some(gpu) = open() else { return };
+    tower::the_half_precision_tiled_gemm_agrees_with_a_row_times_column_loop(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_flash_attention_agrees_with_a_plain_softmax() {
+    let Some(gpu) = open() else { return };
+    tower::the_flash_attention_agrees_with_a_plain_softmax(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn a_flash_query_never_attends_across_a_group() {
+    let Some(gpu) = open() else { return };
+    tower::a_flash_query_never_attends_across_a_group(&gpu);
 }

@@ -359,16 +359,12 @@ fn the_first_layer_dispatches_the_shape_it_was_given() {
         // block output into the stream and normalizes for the feed-forward.
         "kernel_rms_norm_mul_f32_4",
         "kernel_add_rms_norm_mul_f32_4",
-        // The feed-forward, on the gated GELU this family takes.
+        // The feed-forward, on the gated GELU this family takes. The
+        // activation is flat over every row of the chunk, so it is one launch.
         PROJ,
         PROJ,
-    ];
-    // The activation is flat over one token's inner row, so a chunk costs one
-    // launch per token.
-    expected.extend(std::iter::repeat_n(
         "kernel_dense_geglu_flat_f32",
-        usize::try_from(PROMPT).expect("the prompt fits this host"),
-    ));
+    ];
     expected.extend([
         PROJ,
         // The post-feed-forward norm, and the close that carries the slot's own
@@ -842,11 +838,8 @@ fn assert_per_layer_sequence(seen: &[Launch]) {
         "kernel_add_rms_norm_mul_f32_4",
         PROJ,
         PROJ,
-    ];
-    expected.extend(std::iter::repeat_n(
         "kernel_dense_geglu_flat_f32",
-        usize::try_from(PROMPT).expect("the prompt fits this host"),
-    ));
+    ];
     expected.extend([
         PROJ,
         "kernel_rms_norm_mul_f32_4",
