@@ -1179,12 +1179,20 @@ impl HybridStack {
                 Some(run) => run.walk.split_point(rest, width),
                 None => rest.len().min(width),
             };
-            let (head, tail) = rest.split_at(take);
-            let start = self
+            let live = self
                 .sessions
                 .get(&session)
-                .ok_or(CoreError::UnknownSession(session))?
-                .written();
+                .ok_or(CoreError::UnknownSession(session))?;
+            let start = live.written();
+            // A chunk also stops at a shared boundary inside it, so the state
+            // there is committed - and checkpointed - before the rest is read:
+            // a sibling sharing exactly that much stands on it.
+            let end = start.saturating_add(u32::try_from(take).unwrap_or(u32::MAX));
+            let take = live
+                .hint_between(start, end)
+                .and_then(|at| usize::try_from(at - start).ok())
+                .unwrap_or(take);
+            let (head, tail) = rest.split_at(take);
             let n_tok = self.run_chunk(session, head, run.as_mut())?;
             // Before anything else touches the scratch: the draft head's warm
             // pass reuses the normalized rows this pass just left there.
@@ -1280,7 +1288,19 @@ impl HybridStack {
         // repeats - and a stride position still has to be the cache's own stop.
         // A session that read media is never checkpointed: its placeholder
         // runs cannot tell two pictures apart.
-        let periodic = q > 0 && q.is_multiple_of(MAX_PREFILL_CHUNK);
+        //
+        // A shared boundary is admitted as a prompt's end is, whether the
+        // chunk ended there or the prompt did. A scoring session's prompt
+        // end is answered and dropped, so it takes a checkpoint at its
+        // shared boundaries and nowhere else: a snapshot at its end or at
+        // its strides is one nothing resumes, and in a full store it takes
+        // the slot a sibling's boundary needed.
+        let hint = live.is_hint(q);
+        let (earned, periodic) = if live.scoring() {
+            (hint, false)
+        } else {
+            (earned || hint, q > 0 && q.is_multiple_of(MAX_PREFILL_CHUNK))
+        };
         let admit = (earned || periodic)
             && !live.carries_media()
             && (earned

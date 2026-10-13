@@ -627,12 +627,44 @@ impl HybridStack {
         stored
     }
 
+    /// Records the shared boundaries of the prompt `session` is about to read.
+    /// See [`Checkpointed::kv_set_hints`].
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`].
+    pub fn ckpt_set_hints(&mut self, session: SessionId, hints: &[u32]) -> CoreResult<()> {
+        self.sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?
+            .set_hints(hints);
+        Ok(())
+    }
+
+    /// Marks `session` as reading its prompt only to score it. See
+    /// [`Checkpointed::kv_set_scoring`].
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`].
+    pub fn ckpt_set_scoring(&mut self, session: SessionId) -> CoreResult<()> {
+        self.sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?
+            .set_scoring();
+        Ok(())
+    }
+
     /// Stands `session` on the deepest usable checkpoint of `prompt`. See
     /// [`Checkpointed::kv_resume`].
     ///
-    /// `Ok(None)` is a cold start and not a refusal: no directory is open, or
-    /// nothing stored matched. The caller prefills, exactly as it would have
-    /// with no checkpoint tier at all.
+    /// `Ok(None)` is a cold start and not a refusal: nothing stored matched.
+    /// The caller prefills, exactly as it would have with nothing stored.
+    ///
+    /// No directory need be open. The cache keeps the checkpoints a commit
+    /// admits in memory whether or not it has a disk tier, and the disk is
+    /// only where they also persist; a server started without one still
+    /// stands a sibling question on the state its first question just read.
     ///
     /// # Errors
     ///
@@ -643,9 +675,6 @@ impl HybridStack {
         session: SessionId,
         prompt: &[TokenId],
     ) -> CoreResult<Option<ResumeInfo<'_>>> {
-        if self.ckpt.is_none() {
-            return Ok(None);
-        }
         if !self.sessions.contains_key(&session) {
             return Err(CoreError::UnknownSession(session));
         }
