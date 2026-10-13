@@ -637,6 +637,23 @@ pub fn load_model(
         Err(other) => return Err(FactoryError::Load(other)),
     }
 
+    load_last_arms(backend, path, config, opts, defaults)
+}
+
+/// The arms tried after the Gemma 4 one, and the refusal when none of them
+/// recognises the document either.
+///
+/// # Errors
+///
+/// [`FactoryError::UnknownArchitecture`] when no arm recognises the config,
+/// and [`FactoryError::Load`] when one did and the checkpoint would not load.
+fn load_last_arms(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
     // The hybrid state-space family: a directory of MLX shards whose geometry
     // is its own `config.json`, read again here because the parsed document
     // carries no typed view of it.
