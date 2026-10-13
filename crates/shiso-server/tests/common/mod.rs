@@ -41,8 +41,8 @@ use base64::Engine as _;
 use parking_lot::{Condvar, Mutex};
 use shiso_core::{
     Backend, CoreError, CoreResult, DecisionModel, DecisionQuestion, DecodeStep, DeviceBuffer,
-    DeviceView, KernelRef, LaunchArgs, Logits, Model, ModelInfo, PromptRun, RawBuffer, SessionId,
-    StopTokens, TokenId, alloc,
+    DeviceView, KernelRef, LaunchArgs, LaunchKey, LaunchSample, Logits, Model, ModelInfo, Profiler,
+    PromptRun, RawBuffer, SessionId, StopTokens, TokenId, alloc,
 };
 use shiso_engine::PersistRefusal;
 use shiso_engine::Reason;
@@ -74,12 +74,24 @@ const MAX_ROWS: u32 = 16;
 pub(crate) struct FakeBackend {
     allocations: Mutex<HashMap<u64, Vec<u8>>>,
     next_id: AtomicU64,
+    /// `Some` for a device that can time launches; the inner `Option` is the
+    /// open region's samples.
+    profiler: Option<Mutex<Option<Vec<LaunchSample>>>>,
 }
 
 impl FakeBackend {
     /// A device with nothing allocated on it.
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// A device that can time launches: every `run` inside a region is one
+    /// sample of one nanosecond.
+    pub(crate) fn profiling() -> Arc<Self> {
+        Arc::new(Self {
+            profiler: Some(Mutex::new(None)),
+            ..Self::default()
+        })
     }
 
     fn fail(op: &'static str, detail: String) -> CoreError {
@@ -181,12 +193,52 @@ impl Backend for FakeBackend {
         Ok(())
     }
 
-    fn run(&self, _kernel: KernelRef, _args: &LaunchArgs<'_>) -> CoreResult<()> {
+    fn run(&self, kernel: KernelRef, args: &LaunchArgs<'_>) -> CoreResult<()> {
+        if let Some(region) = self.profiler.as_ref()
+            && let Some(samples) = region.lock().as_mut()
+        {
+            samples.push(LaunchSample {
+                key: LaunchKey {
+                    entry: kernel.entry,
+                    consts: kernel.consts,
+                    grid: args.grid,
+                    block: args.block,
+                },
+                gpu_ns: 1,
+            });
+        }
         Ok(())
     }
 
     fn sync(&self) -> CoreResult<()> {
         Ok(())
+    }
+
+    fn as_profiler(&self) -> Option<&dyn Profiler> {
+        self.profiler.as_ref()?;
+        Some(self)
+    }
+}
+
+impl Profiler for FakeBackend {
+    fn start(&self) -> CoreResult<()> {
+        let region = self
+            .profiler
+            .as_ref()
+            .ok_or_else(|| Self::fail("profile", "this fake cannot time launches".to_owned()))?;
+        let mut open = region.lock();
+        if open.is_some() {
+            return Err(Self::fail("profile", "a region is already open".to_owned()));
+        }
+        *open = Some(Vec::new());
+        Ok(())
+    }
+
+    fn stop(&self) -> CoreResult<Vec<LaunchSample>> {
+        self.profiler
+            .as_ref()
+            .and_then(|region| region.lock().take())
+            .ok_or_else(|| Self::fail("profile", "no region is open".to_owned()))
     }
 }
 

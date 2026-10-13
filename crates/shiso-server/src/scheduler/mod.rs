@@ -259,6 +259,11 @@ struct Coordinator {
     /// The same row as floats, reused for the same reason.
     scores: Vec<f32>,
     next_id: u64,
+    /// The open profile region, while a request runs under `--profile-dir`.
+    profiling: Option<crate::profile::OpenRegion>,
+    /// Regions opened, for naming one that closes before its request is
+    /// given an id.
+    profiled: u64,
     /// Decode steps run so far: a prompt whose prefill saw none of them ran on
     /// the device alone, and its wall time is a fair measure of prefill speed.
     decode_steps: u64,
@@ -431,6 +436,8 @@ fn start(
         row: vec![0u8; vocab.saturating_mul(4)],
         scores: vec![0f32; vocab],
         next_id: 1,
+        profiling: None,
+        profiled: 0,
         decode_steps: 0,
         keyed,
         closing: false,
@@ -466,6 +473,10 @@ impl Coordinator {
             // strand one.
             self.admit_held_flex();
             if self.slots.is_empty() {
+                // Every request - served, refused or cut - has passed through
+                // here by the time it is over, and nothing after this point
+                // (idle checkpoint I/O, the blocking wait) is a request's.
+                self.profile_settle();
                 if self.closing {
                     break;
                 }
@@ -659,6 +670,7 @@ impl Coordinator {
 
     /// Gives a request whose stream is answered a session and a slot.
     fn open(&mut self, request: GenerateRequest, sink: mpsc::Sender<StreamEvent>) {
+        self.profile_begin();
         // What a server without the right tower would refuse is refused before
         // a session is opened, because it is cheaper to refuse with nothing
         // standing on it. A request whose pictures cannot be encoded is FAILED
@@ -683,6 +695,7 @@ impl Coordinator {
         let now = self.cfg.clock.now();
         let id = format!("{:016x}", self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
+        self.profile_label(&id);
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs());
@@ -803,6 +816,7 @@ impl Coordinator {
         request: ScoreRequest,
         reply: oneshot::Sender<Result<ScoreOutcome, AppError>>,
     ) {
+        self.profile_begin();
         let decision = request.decision.is_some();
         if request.prompt_tokens.is_empty()
             || (decision && request.decision.as_ref().is_some_and(|q| q.is_empty()))
@@ -867,6 +881,7 @@ impl Coordinator {
         let now = self.cfg.clock.now();
         let id = format!("{:016x}", self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
+        self.profile_label(&id);
         // Cloned off the request before it moves into the slot: the tower must
         // run over the items after the slot exists, so the encode can attach
         // its rows to it.
@@ -2117,6 +2132,34 @@ impl Coordinator {
         };
         if self.save(slot.session, reason) && reason == Reason::Shutdown {
             self.stats.swept(1);
+        }
+    }
+
+    /// Opens a profile region for the request being admitted, when
+    /// `--profile-dir` is set and none is open.
+    fn profile_begin(&mut self) {
+        if self.profiling.is_some() {
+            return;
+        }
+        if let Some(sink) = self.cfg.profile.as_ref() {
+            self.profiled += 1;
+            self.profiling = sink.begin(format!("pending-{}", self.profiled));
+        }
+    }
+
+    /// Names the open region after the id the request was just given.
+    fn profile_label(&mut self, id: &str) {
+        if let Some(region) = self.profiling.as_mut() {
+            region.relabel(id.to_owned());
+        }
+    }
+
+    /// Writes the open region, if there is one.
+    fn profile_settle(&mut self) {
+        if let Some(region) = self.profiling.take()
+            && let Some(sink) = self.cfg.profile.as_ref()
+        {
+            sink.end(region, "engine");
         }
     }
 

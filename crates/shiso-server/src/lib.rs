@@ -37,6 +37,7 @@ pub mod media;
 pub mod media_cache;
 pub mod model_factory;
 pub mod openai;
+pub mod profile;
 pub mod response_store;
 pub mod router;
 pub mod scheduler;
@@ -508,6 +509,11 @@ fn boot_language_model(
 
     let model_id = args.model_id();
     let mut scheduler = scheduler_config(args)?;
+    scheduler.profile = args
+        .profile_dir
+        .as_deref()
+        .map(|dir| profile::ProfileSink::new(dir, Arc::clone(&backend)))
+        .transpose()?;
     // The renderer reads the store the scheduler writes.
     let turn_replay = scheduler.turn_replay.clone();
     let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);

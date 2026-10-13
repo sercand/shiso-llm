@@ -325,6 +325,7 @@ fn every_documented_flag_declares_its_prefixed_environment_fallback() {
         "SHISO_PORT",
         "SHISO_CTX",
         "SHISO_MAX_NUM_SEQS",
+        "SHISO_PROFILE_DIR",
         "SHISO_KV_CACHE_TOKENS",
         "SHISO_GPU_MEMORY_UTILIZATION",
         "SHISO_KV_CHECKPOINTS",
@@ -705,4 +706,53 @@ fn the_image_defaults_parse_from_the_flags_that_set_them() {
     let args = parse(&["--image-model", "/models/flux"]).expect("it parses");
     let overrides = args.image_overrides().expect("nothing to parse");
     assert_eq!((overrides.size, overrides.steps), (None, None));
+}
+
+#[test]
+fn profiling_needs_one_resident_sequence() {
+    let error = parse(&[
+        "--model",
+        "m.gguf",
+        "--profile-dir",
+        "/tmp/p",
+        "--max-num-seqs",
+        "2",
+    ])
+    .expect("parses")
+    .validate()
+    .expect_err("a report must be one request's kernels");
+    assert!(error.to_string().contains("--max-num-seqs 1"), "{error}");
+}
+
+#[test]
+fn profiling_is_refused_beside_the_speech_service() {
+    let error = parse(&[
+        "--model",
+        "m.gguf",
+        "--profile-dir",
+        "/tmp/p",
+        "--max-num-seqs",
+        "1",
+        "--asr-model",
+        "/models/asr",
+    ])
+    .expect("parses")
+    .validate()
+    .expect_err("the audio worker interleaves streams");
+    assert!(error.to_string().contains("--asr-model"), "{error}");
+}
+
+#[test]
+fn profiling_with_one_sequence_is_accepted() {
+    parse(&[
+        "--model",
+        "m.gguf",
+        "--profile-dir",
+        "/tmp/p",
+        "--max-num-seqs",
+        "1",
+    ])
+    .expect("parses")
+    .validate()
+    .expect("one sequence at a time is what profiling needs");
 }

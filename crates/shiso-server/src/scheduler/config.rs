@@ -316,6 +316,8 @@ pub struct SchedulerConfig {
     /// one. Every row a sequence draws from is masked with it. Empty
     /// suppresses nothing; the binary fills it from the vocabulary.
     pub suppressed: Arc<[shiso_core::TokenId]>,
+    /// Where per-request profile reports go; `None` unless `--profile-dir`.
+    pub profile: Option<crate::profile::ProfileSink>,
 }
 
 impl SchedulerConfig {
@@ -335,6 +337,7 @@ impl SchedulerConfig {
             stats_interval: None,
             mtp_exact_sampling: false,
             suppressed: Arc::from([]),
+            profile: None,
         }
     }
 
@@ -373,6 +376,7 @@ impl SchedulerConfig {
             stats_interval: None,
             mtp_exact_sampling: env_bool(MTP_EXACT_SAMPLING_ENV, false),
             suppressed: default.suppressed.clone(),
+            profile: None,
         }
     }
 
