@@ -26,6 +26,10 @@
 //!   build has it. It is off unless a caller hands a policy over, and
 //!   [`Option::None`] IS the off state, so no value exists that means
 //!   "configured but disabled".
+//! - [`demux`] reads an MP4/MOV or Matroska/WebM container into one video
+//!   track's coded samples (ranges of the request buffer, in decode order),
+//!   and [`demux::SamplePlan`] decides which of them an in-process decoder
+//!   converts. It is always compiled: reading a container links no codec.
 //! - [`VisionTower`] is the contract a family's tower meets and the server
 //!   consumes, and [`MediaPlacement`] is what that family's template writes for
 //!   a picture. Both are here rather than in the server because a server that
@@ -61,13 +65,13 @@
 mod chain;
 mod config;
 mod container;
+pub mod demux;
 mod error;
 #[cfg(feature = "decode-ffmpeg")]
 mod ffmpeg;
 pub mod generator;
 mod image;
 mod item;
-#[cfg(feature = "decode-ffmpeg")]
 mod mp4;
 pub mod shard;
 mod tower;

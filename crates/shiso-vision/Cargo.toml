@@ -27,6 +27,10 @@ bytemuck = { workspace = true }
 # no device API and no HTTP stack. `thiserror` because a rejected decode is a
 # typed outcome the server turns into a 400, not a string.
 image = { workspace = true }
+# Matroska/WebM container parsing for the demuxer, which is always compiled:
+# reading a container links no codec, so it is not behind a decode feature.
+# MP4 is read in house (src/demux/mp4.rs) on the box walker faststart uses.
+matroska-demuxer = { workspace = true }
 shiso-core = { workspace = true }
 # The standalone tower container, and the tensor descriptors both towers are
 # checked against. This crate reads a model file but never a quantized block:
