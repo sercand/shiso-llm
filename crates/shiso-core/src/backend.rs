@@ -554,6 +554,14 @@ pub trait Backend: Send + Sync + fmt::Debug {
     fn as_pointers(&self) -> Option<&dyn PointerPack> {
         None
     }
+
+    /// Per-launch GPU timing, absent by default.
+    ///
+    /// A backend that returns `Some` submits every launch on its own while a
+    /// [`crate::ProfileRegion`] is open, and batches as usual otherwise.
+    fn as_profiler(&self) -> Option<&dyn crate::profile::Profiler> {
+        None
+    }
 }
 
 /// Device memory at one moment, in bytes.
