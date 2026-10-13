@@ -57,6 +57,7 @@ pub mod layers;
 pub mod measure;
 pub mod ple;
 pub mod prefill;
+pub mod profile;
 pub mod replay;
 pub mod rows;
 pub mod run;

@@ -41,7 +41,9 @@
 use shiso_core::error::CoreResult;
 use shiso_core::ids::{Seed, SessionId, TokenId};
 use shiso_core::model::{DecodeStep, Logits, PromptRun, SamplingParams};
-use shiso_core::{Backend, DeviceView, Model};
+use shiso_core::{
+    Backend, DeviceView, LaunchSample, Model, ProfileRegion, ProfileReport, Profiler,
+};
 use shiso_engine::{Checkpointed, Reason, ResumeInfo, ResumeSource, SaveOutcome};
 use shiso_ir::Usage;
 use shiso_kvstore::{CommitOpts, Frontier, KvCache, KvError, Lookup, PersistOutcome, Resume};
@@ -53,6 +55,19 @@ use shiso_vision::generator::{
 };
 
 use shiso_hub::{HostProfile, HubError, ModelRef, ProgressEvent, Recipe};
+
+// The profiling surface the bench, the kernel bench and the server all build
+// on. Pinned through wrappers: `ProfileRegion`'s lifetime is a parameter of
+// its impl, so its methods do not coerce to a higher-ranked fn pointer.
+fn profile_through(backend: &dyn Backend) -> Option<CoreResult<ProfileReport>> {
+    let profiler: &dyn Profiler = backend.as_profiler()?;
+    Some(ProfileRegion::open(profiler).and_then(ProfileRegion::finish))
+}
+const _: fn(&dyn Backend) -> Option<CoreResult<ProfileReport>> = profile_through;
+type FromSamples = fn(&[LaunchSample], u64) -> ProfileReport;
+const _: FromSamples = ProfileReport::from_samples;
+type ReportJson = fn(&ProfileReport) -> serde_json::Value;
+const _: ReportJson = ProfileReport::to_json;
 
 const _: Option<&Recipe> = None;
 const _: Option<&ModelRef> = None;
