@@ -125,6 +125,7 @@ fn shape(ple: bool) -> HybridShape {
         v_norm: true,
         moe: None,
         ssm: None,
+        short_conv: None,
         no_ffn: Vec::new(),
     }
 }

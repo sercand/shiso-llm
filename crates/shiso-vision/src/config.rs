@@ -235,6 +235,33 @@ pub enum ResizeRule {
         /// Patches the target may cost, counted before pooling.
         max_patches: u32,
     },
+    /// The LFM2 vision-language rule: snap each side to the nearest multiple
+    /// of [`PatchGeometry::grid_unit`], then rescale into a band of merged
+    /// tokens, `min_tokens..=max_tokens`, one token being one
+    /// `grid_unit x grid_unit` square.
+    ///
+    /// With `f` the grid unit, `lo = min_tokens * f^2` and
+    /// `hi = max_tokens * f^2` pixels:
+    ///
+    /// ```text
+    /// h' = max(f, round(h / f) * f);  w' likewise
+    /// if h' * w' > hi:  beta = sqrt(h * w / hi)
+    ///                   h' = max(f, floor(h / beta / f) * f);  w' likewise
+    /// elif h' * w' < lo: beta = sqrt(lo / (h * w))
+    ///                   h' = ceil(h * beta / f) * f;  w' likewise
+    /// ```
+    ///
+    /// `round` is round-half-to-even, as the reference's integer rounding is,
+    /// and the arithmetic is double precision in the reference's operation
+    /// order, so a side that lands exactly on a half unit goes the way the
+    /// reference sends it. Upscaling is allowed: a small picture is grown to
+    /// the lower edge of the band.
+    TokenRange {
+        /// Fewest merged tokens a picture may cost.
+        min_tokens: u32,
+        /// Most merged tokens a picture may cost.
+        max_tokens: u32,
+    },
 }
 
 /// Everything about turning a decoded frame into patch rows that varies by
@@ -297,6 +324,26 @@ impl PreprocessSpec {
         Self {
             geometry,
             resize: ResizeRule::GridUnit,
+            mean: HALF,
+            std: HALF,
+            resample: Resample::CatmullRom,
+        }
+    }
+
+    /// The LFM2 vision-language spec over a geometry already in hand: the
+    /// token-band resize, the `0.5` statistics and the cubic filter.
+    ///
+    /// The band is not in the tower's container - the mmproj states the patch
+    /// and the unshuffle factor and nothing about how many tokens a picture
+    /// may cost - so the family passes it in from its own processor facts.
+    #[must_use]
+    pub const fn lfm2(geometry: PatchGeometry, min_tokens: u32, max_tokens: u32) -> Self {
+        Self {
+            geometry,
+            resize: ResizeRule::TokenRange {
+                min_tokens,
+                max_tokens,
+            },
             mean: HALF,
             std: HALF,
             resample: Resample::CatmullRom,

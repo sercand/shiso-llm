@@ -40,9 +40,9 @@ use shiso_core::error::{CoreError, CoreResult};
 use crate::attn::{Attn, AttnCache, AttnGeometry, AttnScratch, Pages, Positions};
 use crate::blocks::AttnIo;
 use crate::launch::{
-    self, BLOCK_128, BLOCK_LINEAR, DENSE, DENSE_ATTN_DECODE_SMEM_BYTES,
+    self, BLOCK_128, BLOCK_LINEAR, DENSE, DENSE_ATTN_DECODE_SMEM_BYTES, DENSE_ATTN_FLASH_ROWS,
     DENSE_ATTN_PREFILL_SMEM_BYTES, DENSE_ATTN_PREFILL_TILE, DENSE_NORM_ROPE_SMEM_BYTES,
-    DenseAttnArgs, DenseKvNormRopeArgs, DenseQNormRopeArgs,
+    DenseAttnArgs, DenseKvNormRopeArgs, DenseQNormRopeArgs, dense_attn_flash_name,
 };
 use crate::projection;
 
@@ -245,6 +245,23 @@ fn one_table_per_tile(pages: Pages<'_>) -> CoreResult<()> {
     })
 }
 
+/// The simdgroup-matrix prefill softmax for this head width, when the device
+/// carries it.
+///
+/// Asked of the backend rather than assumed: a device without the entry - one
+/// whose kernel set has no matrix-unit twin, or a build that compiled none -
+/// answers `None` and the chunk takes the tiled scalar entry, which computes
+/// the same softmax. The answer is a property of a pipeline the device has
+/// already built after the first chunk, so asking again per launch is a cache
+/// lookup.
+fn flash_entry(backend: &dyn Backend, head_dim: u32) -> Option<&'static str> {
+    dense_attn_flash_name(head_dim).filter(|&name| {
+        backend
+            .max_block_threads(KernelRef::new(DENSE, name))
+            .is_some_and(|threads| threads >= BLOCK_LINEAR)
+    })
+}
+
 /// Runs the softmax over the session's cache.
 ///
 /// The two entry points are one softmax over the same rows. The prefill one tiles
@@ -271,11 +288,20 @@ fn softmax(
     };
     let (name, grid, smem) = if n_tok >= DENSE_ATTN_PREFILL_TILE {
         one_table_per_tile(cache.pages)?;
-        (
-            "kernel_dense_attn_prefill",
-            Extent3::new(geometry.n_head, n_tok.div_ceil(DENSE_ATTN_PREFILL_TILE), 1),
-            DENSE_ATTN_PREFILL_SMEM_BYTES,
-        )
+        match flash_entry(backend, geometry.head_dim) {
+            // Its key blocks live in a static threadgroup array, so the launch
+            // asks for no dynamic memory.
+            Some(name) => (
+                name,
+                Extent3::new(geometry.n_head, n_tok.div_ceil(DENSE_ATTN_FLASH_ROWS), 1),
+                0,
+            ),
+            None => (
+                "kernel_dense_attn_prefill",
+                Extent3::new(geometry.n_head, n_tok.div_ceil(DENSE_ATTN_PREFILL_TILE), 1),
+                DENSE_ATTN_PREFILL_SMEM_BYTES,
+            ),
+        }
     } else {
         // A head dimension the slot count fits exactly takes its own
         // instantiation: the same arithmetic with the per-lane arrays sized at

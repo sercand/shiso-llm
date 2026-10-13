@@ -36,6 +36,10 @@ shapes differ.
 - **Quantized prompt GEMM** (4ebe5a0, `q4e/affine.metal`):
   - The general tile is 32×32 with 4 simdgroups of 16×16, dequantizing into threadgroup memory.
   - Routed MoE experts get only about a dozen columns per chunk, so their tile is 16 columns × 64 rows. A 32-wide tile wasted 2/3 of its MMAs on zeros.
+- **The quantized prefill tile (`qwen35/gemm_q4k.metal`, 64 rows x 32 tokens, 4 simdgroups) is a local optimum on the M1 Max** (2026-10-13, d1-3B shapes, interleaved A/B in one process, outputs bit-identical across widths):
+  - 64 tokens per threadgroup (each simdgroup 32x32, 16 accumulators) was slower or equal everywhere: `ffn_down` 10752->2048 at 64 tokens went 0.69 -> 0.94 ms. Half the threadgroups cost more occupancy than the doubled weight reuse saved.
+  - 16 tokens per threadgroup was slower everywhere (0.54 -> 0.64 ms at 39 tokens, up to 60% slower at 154): every dequantized weight is reused across fewer tokens.
+  - What it reaches: q8_0 5.2-5.9 TFLOP/s, q4_K ~15% less (costlier unpack), narrow outputs (2048 rows, 64 threadgroups at <= 64 tokens) 3.5-4.1.
 - **Implicit-GEMM convolution:** gather im2col inside the operand reader and never materialize it. VAE decode went **97 s → 2.8 s**.
 - **Reader and epilogue structs** let one tile body serve linear, convolution and fused variants.
 

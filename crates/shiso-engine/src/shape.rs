@@ -44,6 +44,12 @@ pub enum LayerKind {
     /// matrix per head that belong to one session - a recurrent slot, as
     /// [`LayerKind::Gdn`] is, with its geometry in [`HybridShape::ssm`].
     Ssm,
+    /// A gated short convolution: two elementwise gates around a depthwise
+    /// causal convolution of a few taps over the residual width. Its memory is
+    /// the last few gated inputs and nothing else, which belongs to one
+    /// session - a recurrent slot, with its geometry in
+    /// [`HybridShape::short_conv`].
+    ShortConv,
 }
 
 /// Where an attention slot's keys and values live.
@@ -301,6 +307,17 @@ impl SsmShape {
     }
 }
 
+/// A gated short-convolution block's widths.
+///
+/// The convolution runs over the residual width itself, so the one number a
+/// checkpoint states is how many taps it has; everything else is
+/// [`HybridShape::hidden`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortConvShape {
+    /// Width of the causal convolution, the current input included.
+    pub taps: u32,
+}
+
 /// Experts one token may reach, above which both routers write past their
 /// chosen-weight and chosen-id arrays.
 ///
@@ -456,6 +473,12 @@ pub struct HybridShape {
     /// A stack's recurrent slots are one kind: gated delta-rule ([`Self::gdn`])
     /// or state-space (this), never both, which [`Self::validate`] checks.
     pub ssm: Option<SsmShape>,
+    /// Gated short-convolution geometry, for a stack with
+    /// [`LayerKind::ShortConv`] slots.
+    ///
+    /// Like [`Self::ssm`], a third recurrent kind that never shares a stack
+    /// with either of the other two, which [`Self::validate`] checks.
+    pub short_conv: Option<ShortConvShape>,
     /// Slots that carry no feed-forward half, in ascending order.
     ///
     /// Empty for every family whose slots all have one. A checkpoint whose
@@ -490,12 +513,44 @@ impl HybridShape {
         u32::try_from(n).unwrap_or(u32::MAX)
     }
 
-    /// How many slots keep a session's recurrent state: the gated delta-rule
-    /// and the state-space ones.
+    /// How many slots keep a session's recurrent state: the gated delta-rule,
+    /// the state-space and the short-convolution ones.
     #[must_use]
     pub fn recurrent_count(&self) -> u32 {
         self.count(LayerKind::Gdn)
             .saturating_add(self.count(LayerKind::Ssm))
+            .saturating_add(self.count(LayerKind::ShortConv))
+    }
+
+    /// Refuses a stack that mixes recurrent kinds or names one without its
+    /// geometry: the session's recurrent records are one size, and each
+    /// kind's state is its own size.
+    fn validate_recurrent(&self) -> CoreResult<()> {
+        let kinds = [LayerKind::Gdn, LayerKind::Ssm, LayerKind::ShortConv]
+            .into_iter()
+            .filter(|kind| self.count(*kind) > 0)
+            .count();
+        if kinds > 1 {
+            return Err(CoreError::Unsupported {
+                what: "more than one recurrent block kind in one stack",
+                backend: "engine",
+            });
+        }
+        if self.count(LayerKind::Ssm) > 0 && self.ssm.is_none() {
+            return Err(CoreError::ShapeMismatch {
+                field: "state-space geometry",
+                expected: 1,
+                got: 0,
+            });
+        }
+        if self.count(LayerKind::ShortConv) > 0 && self.short_conv.is_none() {
+            return Err(CoreError::ShapeMismatch {
+                field: "short-convolution geometry",
+                expected: 1,
+                got: 0,
+            });
+        }
+        self.validate_no_ffn()
     }
 
     /// Refuses a [`Self::no_ffn`] list that is not ascending slots of this
@@ -642,20 +697,7 @@ impl HybridShape {
     pub fn validate(&self) -> CoreResult<()> {
         // One recurrent kind a stack: the session's recurrent records are one
         // size, and each kind's state is its own size.
-        if self.count(LayerKind::Gdn) > 0 && self.count(LayerKind::Ssm) > 0 {
-            return Err(CoreError::Unsupported {
-                what: "gated delta-rule and state-space slots in one stack",
-                backend: "engine",
-            });
-        }
-        self.validate_no_ffn()?;
-        if self.count(LayerKind::Ssm) > 0 && self.ssm.is_none() {
-            return Err(CoreError::ShapeMismatch {
-                field: "state-space geometry",
-                expected: 1,
-                got: 0,
-            });
-        }
+        self.validate_recurrent()?;
         // Before the attention walk, because it is the cheapest of the six and
         // the one whose failure is widest: a token routed past the expert list
         // reads a matrix that is not an expert at all.
@@ -781,6 +823,7 @@ mod tests {
             v_norm: true,
             moe: None,
             ssm: None,
+            short_conv: None,
             no_ffn: Vec::new(),
         }
     }

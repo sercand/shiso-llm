@@ -190,14 +190,16 @@ them changes a summation order:
 
 ## Entry points not listed here
 
-`kernel_mul_mm_f16_f32`, `kernel_mul_mm_q8_0_f32`, `kernel_mul_mm_q4_K_f32` and
-`kernel_mul_mm_q4_0_f32`
+`kernel_mul_mm_f16_f32`, `kernel_mul_mm_q8_0_f32`, `kernel_mul_mm_q4_K_f32`,
+`kernel_mul_mm_q4_0_f32` and `kernel_mul_mm_q6_K_f32`
 (`gemm_q4k.metal`) are the prefill GEMM. They are copied verbatim from the generic
 kernel set with instantiations deleted and nothing else, so their launch geometry
 and argument block (`shs_metal_args_mul_mm`) are the generic ones, including the
 function constants the generic set declares for them. The `q4_0` instantiation is
 this file's own addition, of the same template over the block struct and
-`dequantize_q4_0` the generic set declares.
+`dequantize_q4_0` the generic set declares. So is the `q6_K` one, over the block
+struct and `dequantize_dense_q6_K` that `gemv_ext_q5k_q6k.metal` declares ahead
+of this file.
 
 `kernel_mul_mv_ext_q5_K_f32_r1_{1..5}` and `kernel_mul_mv_ext_q6_K_f32_r1_{1..5}`
 are instantiations of the generic `kernel_mul_mv_ext_q4_f32_disp` template with

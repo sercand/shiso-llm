@@ -37,6 +37,7 @@ use crate::sessions::Session;
 use crate::shape::{
     Activation, HybridShape, LayerKind, MediaPositions, MoeShape, NormScheme, PerLayerShape,
 };
+use crate::short_conv::{ShortConv, ShortConvGeometry, ShortConvScratch};
 use crate::ssm::{Ssm, SsmGeometry, SsmScratch};
 use crate::vision::{self, MediaChunk};
 
@@ -261,6 +262,9 @@ pub enum Block {
     /// A state-space slot, whose ordinal indexes the session's recurrent stack
     /// as a [`Block::Gdn`] slot's does.
     Ssm(Ssm),
+    /// A gated short-convolution slot, whose ordinal indexes the session's
+    /// recurrent stack as a [`Block::Gdn`] slot's does.
+    ShortConv(ShortConv),
 }
 
 /// The routed half of a slot, in one of the two router and expert shapes.
@@ -485,6 +489,8 @@ pub struct Geometry {
     pub gdn: Option<GdnGeometry>,
     /// State-space block widths, or `None` for a stack with no such slots.
     pub ssm: Option<SsmGeometry>,
+    /// Short-convolution block widths, or `None` for a stack with no such slots.
+    pub short_conv: Option<ShortConvGeometry>,
     /// Whether each slot has a feed-forward half, index zero first.
     pub has_ffn: Vec<bool>,
     /// Attention-block widths, one per attention slot in slot order.
@@ -595,6 +601,17 @@ impl Geometry {
                 });
             }
         };
+        let short_conv = match (shape.count(LayerKind::ShortConv), shape.short_conv) {
+            (0, _) => None,
+            (_, Some(short)) => Some(ShortConvGeometry::new(short, shape.hidden)?),
+            (_, None) => {
+                return Err(CoreError::ShapeMismatch {
+                    field: "short-convolution geometry",
+                    expected: 1,
+                    got: 0,
+                });
+            }
+        };
         let has_ffn = (0..shape.n_layers())
             .map(|il| shape.has_ffn(shiso_core::ids::LayerIdx::new(il)))
             .collect();
@@ -618,6 +635,7 @@ impl Geometry {
             ple,
             gdn,
             ssm,
+            short_conv,
             has_ffn,
             attn,
             attn_scratch,
@@ -699,6 +717,10 @@ fn per_layer(ple: PerLayerShape, layers: u32) -> CoreResult<PerLayerGeometry> {
     })
 }
 
+/// Elements of one `q8_0` or `q4_0` block, which is what their gathers
+/// index a threadgroup by.
+const GATHER_BLOCK_32: u32 = 32;
+
 /// The row-gather entry point one embedding format is read by.
 ///
 /// A typed reference rather than a formatted name: the three formats that have a
@@ -710,6 +732,13 @@ pub struct EmbedKernel {
     module: &'static str,
     /// The entry point itself.
     entry: &'static str,
+    /// Elements of a row one threadgroup writes: the format's block.
+    ///
+    /// The gathers index their threadgroups by block, so the grid has to be
+    /// counted in the same unit. A 256-element span for a format whose block
+    /// is 32 launches an eighth of the threadgroups, and every row comes back
+    /// with its first 256 values right and the rest left as they were.
+    span: u32,
 }
 
 impl EmbedKernel {
@@ -731,22 +760,27 @@ impl EmbedKernel {
             DType::Q6_K => Some(Self {
                 module: launch::Q35,
                 entry: "kernel_get_rows_q6_K_f32",
+                span: launch::QK_K,
             }),
             DType::F16 => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_f16_f32",
+                span: launch::QK_K,
             }),
             DType::Q4_K => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_q4_K_f32",
+                span: launch::QK_K,
             }),
             DType::Q8_0 => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_q8_0_f32",
+                span: GATHER_BLOCK_32,
             }),
             DType::Q4_0 => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_q4_0_f32",
+                span: GATHER_BLOCK_32,
             }),
             // The Saluki export stores its vocabulary table in `iq1_m`; the
             // gather takes the same argument block as the other five, so it
@@ -754,10 +788,12 @@ impl EmbedKernel {
             DType::IQ1_M => Some(Self {
                 module: launch::GENERIC,
                 entry: "kernel_get_rows_iq1_m_f32",
+                span: launch::QK_K,
             }),
             DType::MlxAffine4Gs64 => Some(Self {
                 module: launch::DENSE,
                 entry: "kernel_dense_embed_affine4_f32",
+                span: launch::QK_K,
             }),
             // The ternary set's gathers take an argument block of their own;
             // [`embed_rows`] launches them on a branch of their own, and this
@@ -767,6 +803,7 @@ impl EmbedKernel {
                     Some(entry) => Some(Self {
                         module: launch::TERNARY,
                         entry,
+                        span: launch::QK_K,
                     }),
                     None => None,
                 }
@@ -870,6 +907,8 @@ pub struct Scratch {
     gdn: Option<GdnScratch>,
     /// State-space block scratch, absent when the stack has no such slots.
     ssm: Option<SsmScratch>,
+    /// Short-convolution block scratch, absent when the stack has no such slots.
+    short_conv: Option<ShortConvScratch>,
     /// Attention-block scratch, sized for the widest attention slot.
     attn: AttnScratch,
 }
@@ -939,6 +978,11 @@ impl Scratch {
                 .ssm
                 .as_ref()
                 .map(|ssm| SsmScratch::new(backend, ssm, rows))
+                .transpose()?,
+            short_conv: geometry
+                .short_conv
+                .as_ref()
+                .map(|short| ShortConvScratch::new(backend, short, rows))
                 .transpose()?,
             attn: AttnScratch::new(backend, &geometry.attn_scratch, rows)?,
         })
@@ -1086,6 +1130,9 @@ fn ple_row(
 /// Bytes of one token id and of one position, both of which are `int32`.
 const ID_BYTES: u64 = 4;
 
+/// Bytes one cached key or value element occupies: the cache is f16.
+const F16_BYTES: u64 = 2;
+
 /// Gathers one embedding row per token id.
 ///
 /// The three formats that have a gather share this argument block exactly, so the
@@ -1193,8 +1240,8 @@ fn gather_rows(
     launch::run(
         backend,
         KernelRef::new(geometry.embed.module, geometry.embed.entry),
-        launch::get_rows_grid(geometry.hidden, n_tok),
-        Extent3::new(launch::GET_ROWS_BLOCK, 1, 1),
+        Extent3::new(geometry.hidden.div_ceil(geometry.embed.span), n_tok, 1),
+        Extent3::new(geometry.embed.span.min(launch::GET_ROWS_BLOCK), 1, 1),
         0,
         &[
             KernelArg::Bytes(bytemuck::bytes_of(&args)),
@@ -1642,15 +1689,154 @@ pub(crate) enum PassRows<'a> {
         /// Their page tables, packed one row per member.
         pages: crate::attn::Pages<'a>,
     },
+    /// Several sessions' prompt runs back to back: `runs[0].rows` rows of the
+    /// first session at consecutive positions, then the second's, and so on -
+    /// a batched prompt pass.
+    ///
+    /// Everything that reads a row alone - the projections, the norms, the
+    /// feed-forward - runs once over every row. The two blocks that read a
+    /// session's history run once per run over that run's rows, through
+    /// exactly the chunk path a solo read of the run takes: attention through
+    /// the session's own page table, a recurrent block through its own state.
+    Segments(&'a [SegmentRun<'a>]),
+}
+
+/// One session's run inside a [`PassRows::Segments`] pass.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SegmentRun<'a> {
+    /// The session the run's rows belong to.
+    pub(crate) session: &'a Session,
+    /// The position of the run's first row in its session.
+    pub(crate) start: u32,
+    /// How many consecutive rows of the pass are this run's.
+    pub(crate) rows: u32,
+    /// Sessions that read this run's rows as their own: after the run's
+    /// attention, its cache rows are copied into each of theirs at the same
+    /// positions, and after its recurrent block, its state is copied over
+    /// theirs. Empty for a run nothing shares.
+    ///
+    /// This is how a trunk several prompts open with is read once: the trunk
+    /// runs in one session and is forked into the others layer by layer, each
+    /// before that layer's runs of theirs read it. What they receive is what
+    /// they would have computed, so their answers do not move.
+    pub(crate) forks: &'a [&'a Session],
+}
+
+/// Copies `run`'s recurrent state for slot `ordinal` over every fork's.
+fn fork_state(backend: &dyn Backend, run: &SegmentRun<'_>, ordinal: u32) -> CoreResult<()> {
+    let from = run.session.gdn(ordinal)?;
+    for fork in run.forks {
+        let to = fork.gdn(ordinal)?;
+        backend.copy_d2d(to.conv(), from.conv())?;
+        backend.copy_d2d(to.state(), from.state())?;
+    }
+    Ok(())
+}
+
+/// The physical page `session` keeps position `at` in.
+fn page_of(session: &Session, at: u32) -> CoreResult<u64> {
+    let table = session.kv().frontier().table().as_slice();
+    table
+        .get(usize::try_from(at / PAGE_TOKENS).unwrap_or(usize::MAX))
+        .map(|page| u64::from(u32::from(*page)))
+        .ok_or(CoreError::ShapeMismatch {
+            field: "forked cache page",
+            expected: u64::from(at / PAGE_TOKENS) + 1,
+            got: u64::try_from(table.len()).unwrap_or(u64::MAX),
+        })
+}
+
+/// Copies `run`'s cache rows of one attention slot - keys in `k`, values in
+/// `v`, `row_bytes` a position - into every fork's pages at the same
+/// positions, one copy a page each side.
+fn fork_rows(
+    backend: &dyn Backend,
+    (k, v): (DeviceView<'_>, DeviceView<'_>),
+    row_bytes: u64,
+    run: &SegmentRun<'_>,
+) -> CoreResult<()> {
+    let end = run.start.saturating_add(run.rows);
+    let mut at = run.start;
+    while at < end {
+        let within = at % PAGE_TOKENS;
+        let take = (PAGE_TOKENS - within).min(end - at);
+        let bytes = u64::from(take).saturating_mul(row_bytes);
+        let offset = |page: u64| {
+            page.saturating_mul(u64::from(PAGE_TOKENS))
+                .saturating_add(u64::from(within))
+                .saturating_mul(row_bytes)
+        };
+        let from = offset(page_of(run.session, at)?);
+        for fork in run.forks {
+            let to = offset(page_of(fork, at)?);
+            backend.copy_d2d(k.slice(to, bytes)?, k.slice(from, bytes)?)?;
+            backend.copy_d2d(v.slice(to, bytes)?, v.slice(from, bytes)?)?;
+        }
+        at = at.saturating_add(take);
+    }
+    Ok(())
 }
 
 impl<'a> PassRows<'a> {
     /// The page table each row reads.
-    fn pages(self) -> crate::attn::Pages<'a> {
+    ///
+    /// `None` for a segmented pass, whose runs each read their own session's
+    /// table and are dispatched one at a time.
+    fn pages(self) -> Option<crate::attn::Pages<'a>> {
         match self {
-            Self::Chunk(session) => crate::attn::Pages::shared(session.kv().view()),
-            Self::Batch { pages, .. } => pages,
+            Self::Chunk(session) => Some(crate::attn::Pages::shared(session.kv().view())),
+            Self::Batch { pages, .. } => Some(pages),
+            Self::Segments(_) => None,
         }
+    }
+}
+
+/// The refusal of a whole-pass path handed a segmented pass, which the
+/// branches above it dispatch run by run before it is reached.
+fn segments_here() -> CoreError {
+    CoreError::Unsupported {
+        what: "a segmented pass on a path that reads one table or one state for every row",
+        backend: "engine",
+    }
+}
+
+/// Rows `first .. first + rows` of a buffer whose rows are `row_bytes` wide.
+fn row_span(
+    view: DeviceView<'_>,
+    row_bytes: u64,
+    first: u32,
+    rows: u32,
+) -> CoreResult<DeviceView<'_>> {
+    view.slice(
+        u64::from(first).saturating_mul(row_bytes),
+        u64::from(rows).saturating_mul(row_bytes),
+    )
+}
+
+/// One recurrent slot's block over `n_tok` rows of `io`.
+fn recurrent_block(
+    backend: &dyn Backend,
+    kernels: &dyn BlockKernels,
+    geometry: &Geometry,
+    scratch: &Scratch,
+    block: &Block,
+    io: GdnIo<'_>,
+    n_tok: u32,
+) -> CoreResult<()> {
+    match block {
+        Block::Gdn(gdn) => {
+            let (gdn_geometry, gdn_scratch) = recurrent_slot(geometry, scratch)?;
+            kernels.recurrent(backend, gdn, gdn_geometry, gdn_scratch, io, n_tok)
+        }
+        Block::Ssm(ssm) => {
+            let (ssm_geometry, ssm_scratch) = state_space_slot(geometry, scratch)?;
+            crate::ssm::run(backend, ssm, ssm_geometry, ssm_scratch, io, n_tok)
+        }
+        Block::ShortConv(short) => {
+            let (short_geometry, short_scratch) = short_conv_slot(geometry, scratch)?;
+            crate::short_conv::run(backend, short, short_geometry, short_scratch, io, n_tok)
+        }
+        Block::Attn(_) => Ok(()),
     }
 }
 
@@ -1754,85 +1940,159 @@ pub(crate) fn forward(
     let mut per_row_states: Vec<GdnState<'_>> = Vec::new();
     for (index, layer) in weights.layers.iter().enumerate() {
         match &layer.block {
-            Block::Gdn(_) | Block::Ssm(_) => {
-                let states = match rows {
-                    PassRows::Chunk(session) => {
-                        let state = session.gdn(layer.ordinal)?;
-                        GdnStates::Chunk(GdnState {
-                            conv: state.conv(),
-                            state: state.state(),
-                        })
-                    }
-                    PassRows::Batch { members, .. } => {
-                        // Refilled rather than rebuilt: the buffer is hoisted
-                        // out of this loop, so a forty-slot pass costs one host
-                        // allocation instead of forty.
-                        per_row_states.clear();
-                        for session in members {
-                            let state = session.gdn(layer.ordinal)?;
-                            per_row_states.push(GdnState {
+            Block::Gdn(_) | Block::Ssm(_) | Block::ShortConv(_) => {
+                let row_bytes = u64::from(geometry.hidden).saturating_mul(launch::F32_BYTES);
+                if let PassRows::Segments(runs) = rows {
+                    // Each run folds its rows into its own session's state in
+                    // order, exactly as its solo chunk would.
+                    let mut first = 0u32;
+                    for run in runs {
+                        let state = run.session.gdn(layer.ordinal)?;
+                        let io = GdnIo {
+                            input: row_span(scratch.normed.view(), row_bytes, first, run.rows)?,
+                            states: GdnStates::Chunk(GdnState {
                                 conv: state.conv(),
                                 state: state.state(),
-                            });
+                            }),
+                            block_out: row_span(
+                                scratch.block_out.view(),
+                                row_bytes,
+                                first,
+                                run.rows,
+                            )?,
+                            trail: None,
+                        };
+                        recurrent_block(
+                            backend,
+                            kernels,
+                            geometry,
+                            scratch,
+                            &layer.block,
+                            io,
+                            run.rows,
+                        )?;
+                        fork_state(backend, run, layer.ordinal)?;
+                        first = first.saturating_add(run.rows);
+                    }
+                } else {
+                    let states = match rows {
+                        PassRows::Chunk(session) => {
+                            let state = session.gdn(layer.ordinal)?;
+                            GdnStates::Chunk(GdnState {
+                                conv: state.conv(),
+                                state: state.state(),
+                            })
                         }
-                        GdnStates::PerRow(&per_row_states)
-                    }
-                };
-                // A trail only on a pass a rejection may undo. A prefill chunk
-                // carries no trail even on a speculative session: it would
-                // record the first few rows of a 512-row chunk, which is tens
-                // of mebibytes copied per slot for records that name positions
-                // no rollback can reach.
-                let trail = match (trail.records(), rows) {
-                    (true, PassRows::Chunk(session)) => session.gdn_trail(layer.ordinal)?,
-                    // A batch cannot be recorded, and the family refuses one
-                    // that claims to be; nothing here builds the claim.
-                    _ => None,
-                };
-                let io = GdnIo {
-                    input: scratch.normed.view(),
-                    states,
-                    block_out: scratch.block_out.view(),
-                    trail,
-                };
-                match &layer.block {
-                    Block::Gdn(gdn) => {
-                        let (gdn_geometry, gdn_scratch) = recurrent_slot(geometry, scratch)?;
-                        kernels.recurrent(backend, gdn, gdn_geometry, gdn_scratch, io, n_tok)?;
-                    }
-                    Block::Ssm(ssm) => {
-                        let (ssm_geometry, ssm_scratch) = state_space_slot(geometry, scratch)?;
-                        crate::ssm::run(backend, ssm, ssm_geometry, ssm_scratch, io, n_tok)?;
-                    }
-                    Block::Attn(_) => {}
+                        PassRows::Batch { members, .. } => {
+                            // Refilled rather than rebuilt: the buffer is hoisted
+                            // out of this loop, so a forty-slot pass costs one host
+                            // allocation instead of forty.
+                            per_row_states.clear();
+                            for session in members {
+                                let state = session.gdn(layer.ordinal)?;
+                                per_row_states.push(GdnState {
+                                    conv: state.conv(),
+                                    state: state.state(),
+                                });
+                            }
+                            GdnStates::PerRow(&per_row_states)
+                        }
+                        PassRows::Segments(_) => return Err(segments_here()),
+                    };
+                    // A trail only on a pass a rejection may undo. A prefill chunk
+                    // carries no trail even on a speculative session: it would
+                    // record the first few rows of a 512-row chunk, which is tens
+                    // of mebibytes copied per slot for records that name positions
+                    // no rollback can reach.
+                    let trail = match (trail.records(), rows) {
+                        (true, PassRows::Chunk(session)) => session.gdn_trail(layer.ordinal)?,
+                        // A batch cannot be recorded, and the family refuses one
+                        // that claims to be; nothing here builds the claim.
+                        _ => None,
+                    };
+                    let io = GdnIo {
+                        input: scratch.normed.view(),
+                        states,
+                        block_out: scratch.block_out.view(),
+                        trail,
+                    };
+                    recurrent_block(backend, kernels, geometry, scratch, &layer.block, io, n_tok)?;
                 }
             }
             Block::Attn(attn) => {
                 let (attn_geometry, rank) = attention_slot(geometry, layer)?;
                 let (k, v) = kv.layer_runs(rank)?;
-                let cache = AttnCache {
-                    k,
-                    v,
-                    pages: rows.pages(),
-                };
-                kernels.attention(
-                    backend,
-                    attn,
-                    attn_geometry,
-                    &scratch.attn,
-                    AttnIo {
-                        input: scratch.normed.view(),
-                        pos: positions,
-                        // How far along the sequence each token may look. The
-                        // positions again wherever attention is causal, which
-                        // is every text chunk and every slot of a family whose
-                        // media spans are causal too.
-                        bound: scratch.bound(),
-                        block_out: scratch.block_out.view(),
-                    },
-                    &cache,
-                    n_tok,
-                )?;
+                if let PassRows::Segments(runs) = rows {
+                    // Each run attends through its own session's table, as
+                    // its solo chunk would; a segmented pass carries no media,
+                    // so its positions are the linear row.
+                    let row_bytes = u64::from(geometry.hidden).saturating_mul(launch::F32_BYTES);
+                    let mut first = 0u32;
+                    for run in runs {
+                        let cache = AttnCache {
+                            k,
+                            v,
+                            pages: crate::attn::Pages::shared(run.session.kv().view()),
+                        };
+                        kernels.attention(
+                            backend,
+                            attn,
+                            attn_geometry,
+                            &scratch.attn,
+                            AttnIo {
+                                input: row_span(scratch.normed.view(), row_bytes, first, run.rows)?,
+                                pos: Positions::Linear(row_span(
+                                    scratch.positions(),
+                                    ID_BYTES,
+                                    first,
+                                    run.rows,
+                                )?),
+                                bound: row_span(scratch.bound(), ID_BYTES, first, run.rows)?,
+                                block_out: row_span(
+                                    scratch.block_out.view(),
+                                    row_bytes,
+                                    first,
+                                    run.rows,
+                                )?,
+                            },
+                            &cache,
+                            run.rows,
+                        )?;
+                        // A slot that reads another slot's cache has no rows
+                        // of its own to hand on: the owner's fork carried them.
+                        if attn_geometry.owns_kv && !run.forks.is_empty() {
+                            let kv_row = u64::from(attn_geometry.n_head_kv)
+                                .saturating_mul(u64::from(attn_geometry.head_dim))
+                                .saturating_mul(F16_BYTES);
+                            fork_rows(backend, (k, v), kv_row, run)?;
+                        }
+                        first = first.saturating_add(run.rows);
+                    }
+                } else {
+                    let cache = AttnCache {
+                        k,
+                        v,
+                        pages: rows.pages().ok_or_else(segments_here)?,
+                    };
+                    kernels.attention(
+                        backend,
+                        attn,
+                        attn_geometry,
+                        &scratch.attn,
+                        AttnIo {
+                            input: scratch.normed.view(),
+                            pos: positions,
+                            // How far along the sequence each token may look. The
+                            // positions again wherever attention is causal, which
+                            // is every text chunk and every slot of a family whose
+                            // media spans are causal too.
+                            bound: scratch.bound(),
+                            block_out: scratch.block_out.view(),
+                        },
+                        &cache,
+                        n_tok,
+                    )?;
+                }
             }
         }
         if crate::trace::inner() {
@@ -1932,6 +2192,7 @@ pub(crate) fn forward(
                     Block::Gdn(_) => "gdn",
                     Block::Attn(_) => "attn",
                     Block::Ssm(_) => "ssm",
+                    Block::ShortConv(_) => "short_conv",
                 }
             ),
             scratch.stream[cur].view(),
@@ -2071,6 +2332,22 @@ fn state_space_slot<'a>(
         (Some(ssm), Some(rows)) => Ok((ssm, rows)),
         _ => Err(CoreError::ShapeMismatch {
             field: "state-space geometry",
+            expected: 1,
+            got: 0,
+        }),
+    }
+}
+
+/// The short-convolution widths and scratch a short-convolution slot runs
+/// over, or the refusal for a stack whose geometry has none.
+fn short_conv_slot<'a>(
+    geometry: &'a Geometry,
+    scratch: &'a Scratch,
+) -> CoreResult<(&'a ShortConvGeometry, &'a ShortConvScratch)> {
+    match (geometry.short_conv.as_ref(), scratch.short_conv.as_ref()) {
+        (Some(short), Some(rows)) => Ok((short, rows)),
+        _ => Err(CoreError::ShapeMismatch {
+            field: "short-convolution geometry",
             expected: 1,
             got: 0,
         }),

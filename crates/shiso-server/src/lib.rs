@@ -492,6 +492,10 @@ fn boot_language_model(
     // answer through the head when there is one, and build its prompts on
     // their own threads with the layout it hands over here.
     let decision_layout = model.as_mut().decision_mut().map(|head| head.layout());
+    // A decision checkpoint with no head answers from its next-token rows,
+    // laid out the way its family lays them out; taken here for the same
+    // reason the head's layout is.
+    let decision_readout = model.decision_readout();
     // Shared with the request threads: `/cache` reads it and a queued request prefetches.
     let cache = tier.as_ref().and_then(|_| model.kv_cache());
 
@@ -564,6 +568,7 @@ fn boot_language_model(
 
     let mut state = AppState::new(engine, model_id, args.ctx);
     state.decision_layout = decision_layout;
+    state.decision_readout = decision_readout;
     if let Some(memory) = memory {
         state = state.with_memory(memory);
     }

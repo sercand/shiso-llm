@@ -30,13 +30,13 @@ bytemuck = { workspace = true }
 # loader uses, so the fixture never hand-rolls a float conversion.
 half = { workspace = true }
 
+# Every device-opening kernel case is one target, so the process compiles the
+# kernel library once and links once. They were 33 targets, and each paid about a
+# minute of runtime MSL compile and its own link. Run one file's cases with
+# `--test kernels <file>::`. `tests/kernels.rs` lists the modules.
 [[test]]
-name = "q4e_route"
-path = "tests/q4e_route.rs"
-
-[[test]]
-name = "contract"
-path = "tests/contract.rs"
+name = "kernels"
+path = "tests/kernels.rs"
 
 [[test]]
 name = "kernel_bench"
@@ -45,70 +45,6 @@ path = "tests/kernel_bench.rs"
 [[test]]
 name = "profile"
 path = "tests/profile.rs"
-
-[[test]]
-name = "metal_kernels"
-path = "tests/metal_kernels.rs"
-
-[[test]]
-name = "q35_gdn"
-path = "tests/q35_gdn.rs"
-
-[[test]]
-name = "q35_attn"
-path = "tests/q35_attn.rs"
-
-[[test]]
-name = "q35_norm_rope"
-path = "tests/q35_norm_rope.rs"
-
-[[test]]
-name = "q35_gemv"
-path = "tests/q35_gemv.rs"
-
-[[test]]
-name = "dense_q4_0"
-path = "tests/dense_q4_0.rs"
-
-[[test]]
-name = "dense_iq"
-path = "tests/dense_iq.rs"
-
-[[test]]
-name = "dense_misc"
-path = "tests/dense_misc.rs"
-
-[[test]]
-name = "dense_attn"
-path = "tests/dense_attn.rs"
-
-[[test]]
-name = "dense_ple"
-path = "tests/dense_ple.rs"
-
-[[test]]
-name = "dense_vision"
-path = "tests/dense_vision.rs"
-
-[[test]]
-name = "dense_affine"
-path = "tests/dense_affine.rs"
-
-[[test]]
-name = "dense_exact_affine"
-path = "tests/dense_exact_affine.rs"
-
-[[test]]
-name = "dense_block_draft"
-path = "tests/dense_block_draft.rs"
-
-[[test]]
-name = "dense_ssm_moe"
-path = "tests/dense_ssm_moe.rs"
-
-[[test]]
-name = "q35_compile"
-path = "tests/q35_compile.rs"
 
 # Host-only: pure text scanning over the embedded kernel sources, so it runs on
 # every platform with no device and no compile of the library at all.
@@ -121,50 +57,6 @@ path = "tests/metal_source_pragmas.rs"
 [[test]]
 name = "q35_gdn_chunk_fold"
 path = "tests/q35_gdn_chunk_fold.rs"
-
-[[test]]
-name = "vision_kernels"
-path = "tests/vision_kernels.rs"
-
-[[test]]
-name = "q35moe_moe"
-path = "tests/q35moe_moe.rs"
-
-[[test]]
-name = "q4e_hc"
-path = "tests/q4e_hc.rs"
-
-[[test]]
-name = "q4e_gdn"
-path = "tests/q4e_gdn.rs"
-
-[[test]]
-name = "q4e_ple"
-path = "tests/q4e_ple.rs"
-
-[[test]]
-name = "q4e_matvec"
-path = "tests/q4e_matvec.rs"
-
-[[test]]
-name = "q4e_qsa"
-path = "tests/q4e_qsa.rs"
-
-[[test]]
-name = "q4e_idx"
-path = "tests/q4e_idx.rs"
-
-[[test]]
-name = "q4e_misc"
-path = "tests/q4e_misc.rs"
-
-[[test]]
-name = "q4e_affine"
-path = "tests/q4e_affine.rs"
-
-[[test]]
-name = "q4e_fp8"
-path = "tests/q4e_fp8.rs"
 
 
 # Cargo features are target-independent, and an optional dependency may not carry
@@ -186,18 +78,3 @@ metal = []
 [lints]
 workspace = true
 
-[[test]]
-name = "dit_kernels"
-path = "tests/dit_kernels.rs"
-
-[[test]]
-name = "audio_kernels"
-path = "tests/audio_kernels.rs"
-
-[[test]]
-name = "sample_kernels"
-path = "tests/sample_kernels.rs"
-
-[[test]]
-name = "ternary"
-path = "tests/ternary.rs"

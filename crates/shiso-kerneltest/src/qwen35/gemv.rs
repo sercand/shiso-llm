@@ -263,7 +263,7 @@ const QH_SHIFTS: [u32; 4] = [0, 2, 4, 6];
 /// quarter picks the `ql` byte (odd quarters live in the pair's second 32 bytes),
 /// the nibble (low for quarters 0 and 1, high for the next two) and the 2-bit
 /// field of `qh`.
-fn pack_q6_k(values: &[u8; IN]) -> BlockQ6K {
+pub(crate) fn pack_q6_k(values: &[u8; IN]) -> BlockQ6K {
     let mut block = BlockQ6K {
         ql: [0u8; 128],
         qh: [0u8; 64],
@@ -298,7 +298,7 @@ fn dequant_q5_k(block: &BlockQ5K, e: usize) -> f32 {
 /// Element `e` of a `q6_K` block as `dequantize_dense_q6_K` reads it: low and
 /// high nibbles of `ql` alternate with the 2-bit fields of `qh`, and the `-32`
 /// bias is folded before the multiply.
-fn dequant_q6_k(block: &BlockQ6K, e: usize) -> f32 {
+pub(crate) fn dequant_q6_k(block: &BlockQ6K, e: usize) -> f32 {
     let half = e / 128;
     let quarter = (e % 128) / 32;
     let l = e % 32;
@@ -746,26 +746,72 @@ pub fn q4_k_prefill_gemm_matches_a_triple_loop(gpu: &Gpu) {
             qs: oracle::pack_q4_k_dense(&q4_values(out)),
         })
         .collect();
+    prefill_gemm_case(
+        gpu,
+        "kernel_mul_mm_q4_K_f32",
+        &q4_k_bytes(&blocks),
+        GEMM_IN,
+        |out, e| oracle::dequant_q4_k_dense(&blocks[out], e),
+    );
+}
+
+/// The same triple loop for `q6_K`, the codec a `Q4_K_M` export keeps about
+/// half of its down projections at.
+///
+/// Every weight is an integer no wider than `f16` holds exactly - a signed
+/// scale of at most 64 times a code in `-32..32` - so the case stays
+/// bit-for-bit. Each row is two blocks, so the second one starts 210 bytes in
+/// and is only two-byte aligned, which is what the tile's halfword loads are
+/// written for.
+pub fn q6_k_prefill_gemm_matches_a_triple_loop(gpu: &Gpu) {
+    let blocks: Vec<BlockQ6K> = (0..GEMM_OUT * BATCH_BLOCKS)
+        .map(|block| pack_q6_k(&q6_values(block)))
+        .collect();
+    let weight_bytes: Vec<u8> = blocks
+        .iter()
+        .flat_map(bytemuck::bytes_of)
+        .copied()
+        .collect();
+    prefill_gemm_case(
+        gpu,
+        "kernel_mul_mm_q6_K_f32",
+        &weight_bytes,
+        IN * BATCH_BLOCKS,
+        |out, e| dequant_q6_k(&blocks[out * BATCH_BLOCKS + e / IN], e % IN),
+    );
+}
+
+/// Runs one codec's prefill GEMM over [`GEMM_OUT`] rows of `in_dim` packed in
+/// `weight_bytes` and [`GEMM_TOK`] tokens of small integers, and holds every
+/// output to the left-to-right dot of the host-dequantized row.
+fn prefill_gemm_case(
+    gpu: &Gpu,
+    entry: &'static str,
+    weight_bytes: &[u8],
+    in_dim: usize,
+    dequant: impl Fn(usize, usize) -> f32,
+) {
     // Small integers, exactly what the `f16` tile the GEMM stages can hold.
-    let activations: Vec<f32> = (0..GEMM_TOK * GEMM_IN)
+    let activations: Vec<f32> = (0..GEMM_TOK * in_dim)
         .map(|i| oracle::f16_to_f32(f16_of_int((i % 9) as i32)))
         .collect();
+    let row_bytes = weight_bytes.len() / GEMM_OUT;
 
-    let weights = gpu.upload(&q4_k_bytes(&blocks));
+    let weights = gpu.upload(weight_bytes);
     let src = gpu.upload(&f32_bytes(&activations));
     let dst = gpu.upload(&vec![0u8; GEMM_TOK * GEMM_OUT * 4]);
     let args = MulMmArgs {
-        ne00: GEMM_IN as i32,
+        ne00: in_dim as i32,
         ne02: 1,
-        nb01: size_of::<BlockQ4K>() as u64,
-        nb02: (size_of::<BlockQ4K>() * GEMM_OUT) as u64,
-        nb03: (size_of::<BlockQ4K>() * GEMM_OUT) as u64,
+        nb01: row_bytes as u64,
+        nb02: weight_bytes.len() as u64,
+        nb03: weight_bytes.len() as u64,
         ne12: 1,
         _pad0: 0,
         nb10: 4,
-        nb11: (GEMM_IN * 4) as u64,
-        nb12: (GEMM_IN * GEMM_TOK * 4) as u64,
-        nb13: (GEMM_IN * GEMM_TOK * 4) as u64,
+        nb11: (in_dim * 4) as u64,
+        nb12: (in_dim * GEMM_TOK * 4) as u64,
+        nb13: (in_dim * GEMM_TOK * 4) as u64,
         ne0: GEMM_OUT as i32,
         ne1: GEMM_TOK as i32,
         r2: 1,
@@ -792,22 +838,20 @@ pub fn q4_k_prefill_gemm_matches_a_triple_loop(gpu: &Gpu) {
     launch.smem_bytes = GEMM_SMEM;
     run(
         gpu,
-        KernelRef::specialized("qwen35", "kernel_mul_mm_q4_K_f32", gemm_consts(gpu)),
+        KernelRef::specialized("qwen35", entry, gemm_consts(gpu)),
         &launch,
     );
     drain(gpu);
     let got = gpu.read_f32(&dst);
     for tok in 0..GEMM_TOK {
-        let x = &activations[tok * GEMM_IN..(tok + 1) * GEMM_IN];
+        let x = &activations[tok * in_dim..(tok + 1) * in_dim];
         for out in 0..GEMM_OUT {
-            let dequantized: Vec<f32> = (0..GEMM_IN)
-                .map(|e| oracle::dequant_q4_k_dense(&blocks[out], e))
-                .collect();
+            let dequantized: Vec<f32> = (0..in_dim).map(|e| dequant(out, e)).collect();
             crate::assert_close!(
                 got[tok * GEMM_OUT + out],
                 dot(&dequantized, x),
                 oracle::TOL_QUANT,
-                "token {tok} output {out}",
+                "{entry}: token {tok} output {out}",
             );
         }
     }

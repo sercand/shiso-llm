@@ -149,8 +149,17 @@ impl KvLayout {
 }
 
 /// Elements in one layer's recurrent state: one square matrix per value head,
-/// or for a state-space stack one `head_dim x state` matrix per head.
+/// for a state-space stack one `head_dim x state` matrix per head, and for a
+/// short-convolution stack a single placeholder.
 pub(crate) fn state_elements(shape: &HybridShape) -> u64 {
+    // A short-convolution block keeps no state matrix, only its window. One
+    // unread float stands in for the matrix rather than zero bytes, because
+    // the record is allocated, cleared, checkpointed and copied by the same
+    // paths every recurrent kind takes, and a zero-length device buffer is not
+    // something every backend will hand out.
+    if shape.short_conv.is_some() {
+        return 1;
+    }
     if let Some(ssm) = shape.ssm {
         return u64::from(ssm.heads)
             .saturating_mul(u64::from(ssm.head_dim))
@@ -163,8 +172,11 @@ pub(crate) fn state_elements(shape: &HybridShape) -> u64 {
 
 /// Channels the recurrent projection carries: the key heads, the query heads
 /// and the value heads, one head-width each - or a state-space block's
-/// convolved channels.
+/// convolved channels, or a short-convolution block's residual width.
 pub(crate) fn conv_channels(shape: &HybridShape) -> u64 {
+    if shape.short_conv.is_some() {
+        return u64::from(shape.hidden);
+    }
     if let Some(ssm) = shape.ssm {
         return u64::from(ssm.conv_channels());
     }
@@ -175,9 +187,11 @@ pub(crate) fn conv_channels(shape: &HybridShape) -> u64 {
 
 /// Bytes of one layer's convolution window, as the conv kernel lays it out.
 pub(crate) fn conv_state_bytes(shape: &HybridShape) -> u64 {
-    let kernel = shape
-        .ssm
-        .map_or(shape.gdn.conv_kernel, |ssm| ssm.conv_kernel);
+    let kernel = match (shape.short_conv, shape.ssm) {
+        (Some(short), _) => short.taps,
+        (None, Some(ssm)) => ssm.conv_kernel,
+        (None, None) => shape.gdn.conv_kernel,
+    };
     u64::from(kernel.saturating_sub(1))
         .saturating_mul(conv_channels(shape))
         .saturating_mul(STATE_ELEMENT_BYTES)
@@ -643,6 +657,7 @@ mod tests {
             v_norm: false,
             moe: None,
             ssm: None,
+            short_conv: None,
             no_ffn: Vec::new(),
         }
     }

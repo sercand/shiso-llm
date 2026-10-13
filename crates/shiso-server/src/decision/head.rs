@@ -26,7 +26,7 @@ use crate::state::AppState;
 use crate::tokenizer::Vocabulary;
 
 /// The vocabulary, as a layout reaches it.
-struct Encoder<'a>(&'a Vocabulary);
+pub(crate) struct Encoder<'a>(pub(crate) &'a Vocabulary);
 
 impl PromptEncoder for Encoder<'_> {
     fn encode(&self, text: &str, literal: &[Range<usize>]) -> Result<Vec<TokenId>, CoreError> {
@@ -59,7 +59,7 @@ impl PromptEncoder for Encoder<'_> {
 }
 
 /// A question as the layout reads it.
-fn schema_question(question: &RawQuestion) -> SchemaQuestion {
+pub(crate) fn schema_question(question: &RawQuestion) -> SchemaQuestion {
     let (wording, answer) = match &question.kind {
         Kind::YesNo { question, yes, no } => (
             question,
@@ -128,7 +128,11 @@ pub(crate) fn split_input(input: &DecisionInput) -> (String, Vec<Block>) {
 }
 
 /// What a refusal of the layout tells the caller.
-fn layout_refusal(error: DecisionLayoutError, questions: &[RawQuestion], ctx: u32) -> AppError {
+pub(crate) fn layout_refusal(
+    error: DecisionLayoutError,
+    questions: &[RawQuestion],
+    ctx: u32,
+) -> AppError {
     match error {
         DecisionLayoutError::SchemaTooLong { tokens, .. } => AppError::ContextOverflow {
             param: "questions",

@@ -258,6 +258,14 @@ pub(crate) struct Session {
     /// The position a resume stood this session on, zero for one prefilled
     /// from nothing: what files a prompt's end as cold or as a continuation.
     resumed_at: u32,
+    /// Shared boundaries of the prompt this session is reading, ascending: a
+    /// chunk stops at each and its state is checkpointed there, so a sibling
+    /// sharing only that much stands on it.
+    hints: Vec<u32>,
+    /// Whether this session reads its prompt only to score the last row. Its
+    /// prompt's end is answered and dropped, so it is checkpointed at its hints
+    /// and nowhere else.
+    scoring: bool,
 }
 
 impl Session {
@@ -289,6 +297,8 @@ impl Session {
             spec,
             media: false,
             resumed_at: 0,
+            hints: Vec::new(),
+            scoring: false,
         })
     }
 
@@ -568,6 +578,38 @@ impl Session {
     /// Records that a chunk spliced media rows in.
     pub(crate) fn mark_media(&mut self) {
         self.media = true;
+    }
+
+    /// Records the shared boundaries of the prompt this session is about to
+    /// read, ascending and without repeats.
+    pub(crate) fn set_hints(&mut self, hints: &[u32]) {
+        self.hints.clear();
+        self.hints.extend_from_slice(hints);
+        self.hints.sort_unstable();
+        self.hints.dedup();
+    }
+
+    /// The first shared boundary strictly after `from` and before `to`.
+    #[must_use]
+    pub(crate) fn hint_between(&self, from: u32, to: u32) -> Option<u32> {
+        self.hints.iter().copied().find(|&at| at > from && at < to)
+    }
+
+    /// Whether `at` is one of this session's shared boundaries.
+    #[must_use]
+    pub(crate) fn is_hint(&self, at: u32) -> bool {
+        self.hints.binary_search(&at).is_ok()
+    }
+
+    /// Marks this session as reading its prompt only to score it.
+    pub(crate) fn set_scoring(&mut self) {
+        self.scoring = true;
+    }
+
+    /// Whether this session reads its prompt only to score it.
+    #[must_use]
+    pub(crate) const fn scoring(&self) -> bool {
+        self.scoring
     }
 
     /// The position a resume stood this session on.

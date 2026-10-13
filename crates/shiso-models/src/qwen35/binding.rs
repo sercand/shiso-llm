@@ -518,7 +518,7 @@ where
         LayerKind::Gdn => (Some(bind_gdn(fetch, il, dims)?), None),
         LayerKind::Attn => (None, Some(bind_attn(fetch, il, dims)?)),
         // This family's shape holds neither; its config never states one.
-        LayerKind::Ssm => {
+        LayerKind::Ssm | LayerKind::ShortConv => {
             return Err(GgufError::LayoutMismatch {
                 tensor: format!("blk.{il}").into(),
                 want: Box::from("a recurrent or attention slot"),
@@ -715,6 +715,7 @@ mod tests {
             v_norm: false,
             moe: None,
             ssm: None,
+            short_conv: None,
             no_ffn: Vec::new(),
         }
     }

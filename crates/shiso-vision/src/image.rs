@@ -171,6 +171,10 @@ pub(crate) fn target_size_for(
         ResizeRule::PatchBudget { max_patches } => {
             patch_budget_target(orig_h, orig_w, spec.geometry, grid_unit, max_patches)
         }
+        ResizeRule::TokenRange {
+            min_tokens,
+            max_tokens,
+        } => token_range_target(orig_h, orig_w, grid_unit, min_tokens, max_tokens),
     };
     shrink_under_cap(target_h, target_w, orig_h, orig_w, grid_unit, max_pixels)
 }
@@ -271,6 +275,61 @@ fn patch_budget_target(
             .clamp(side_mult, max_side);
     }
     (target_h, target_w)
+}
+
+/// The LFM2 vision-language target: snap to the grid, then rescale into the
+/// token band. See [`ResizeRule::TokenRange`] for the rule and why each
+/// rounding is the one it is.
+///
+/// Like the patch-budget rule this spends a budget rather than capping one, so
+/// a small picture grows to the band's lower edge and [`ABS_MAX_DIM`] is not
+/// applied: the band's upper edge already bounds the area, and a strip only
+/// one unit tall is still `max_tokens` units long at most.
+fn token_range_target(
+    orig_h: u32,
+    orig_w: u32,
+    unit: u32,
+    min_tokens: u32,
+    max_tokens: u32,
+) -> (u32, u32) {
+    let f = f64::from(unit.max(1));
+    let h = f64::from(orig_h.max(1));
+    let w = f64::from(orig_w.max(1));
+    let unit_area = u64::from(unit) * u64::from(unit);
+    let lo = widen(u64::from(min_tokens).saturating_mul(unit_area));
+    let hi = widen(u64::from(max_tokens).saturating_mul(unit_area));
+    // `round(x / f) * f` with the reference's half-to-even integer rounding.
+    let snap = |side: f64| floor_u32((side / f).round_ties_even()).saturating_mul(unit);
+    let mut target_h = snap(h).max(unit);
+    let mut target_w = snap(w).max(unit);
+    let area = widen(u64::from(target_h) * u64::from(target_w));
+    if area > hi {
+        let beta = (h * w / hi).sqrt();
+        target_h = floor_u32(h / beta / f).saturating_mul(unit).max(unit);
+        target_w = floor_u32(w / beta / f).saturating_mul(unit).max(unit);
+    } else if area < lo {
+        let beta = (lo / (h * w)).sqrt();
+        target_h = ceil_u32(h * beta / f).saturating_mul(unit);
+        target_w = ceil_u32(w * beta / f).saturating_mul(unit);
+    }
+    (target_h, target_w)
+}
+
+/// Rounds a non-negative scale result UP to a `u32`, saturating at both ends.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is clamped into the u32 range on the lines above, so the conversion is exact"
+)]
+fn ceil_u32(value: f64) -> u32 {
+    let ceiled = value.ceil();
+    if !ceiled.is_finite() || ceiled <= 0.0 {
+        return 0;
+    }
+    if ceiled >= f64::from(u32::MAX) {
+        return u32::MAX;
+    }
+    ceiled as u32
 }
 
 /// Brings a chosen target back under the caller's area cap, a grid unit at a

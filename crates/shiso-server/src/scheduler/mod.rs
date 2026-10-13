@@ -172,12 +172,19 @@ impl EngineModel {
         }
     }
 
-    /// The disk tier, when this model has one that is switched on.
+    /// The checkpoint path, when this model keeps one.
+    ///
+    /// A model whose sessions draw on a paged cache keeps checkpoints in
+    /// memory whether or not a disk tier was opened - the directory only makes
+    /// them persist - so resuming from one, a sibling question's shared state
+    /// included, does not wait on `--kvstore-dir`. The disk-only calls behind
+    /// this (a save, a pump, the shutdown sweep) answer that nothing was
+    /// stored when no directory is open.
     fn ckpt_mut(&mut self) -> Option<&mut dyn Checkpointed> {
         match self {
             Self::Plain(_) => None,
             Self::Checkpointed(model) => {
-                if model.kv_checkpoint_enabled() {
+                if model.kv_checkpoint_enabled() || model.kv_cache().is_some() {
                     Some(model.as_mut())
                 } else {
                     None

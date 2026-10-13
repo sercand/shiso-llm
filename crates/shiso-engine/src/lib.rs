@@ -71,6 +71,7 @@ mod sampling;
 mod sampling_probs;
 mod sessions;
 pub mod shape;
+pub mod short_conv;
 pub mod sparse;
 pub mod ssm;
 mod stack;
@@ -96,4 +97,4 @@ pub use shiso_kvstore::CacheStats;
 // refused save and a `PumpReport` is what a pump did. A model crate that speaks only
 // to the checkpoint tier should not have to depend on the store to name them.
 pub use shiso_kvstore::{EntryKey, KvCache, PersistRefusal, PumpReport, Reason};
-pub use stack::{HybridStack, MAX_DECODE_BATCH, MAX_PREFILL_CHUNK};
+pub use stack::{HybridStack, MAX_DECODE_BATCH, MAX_PREFILL_CHUNK, MAX_PROMPT_RUNS};

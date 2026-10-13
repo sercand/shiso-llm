@@ -18,6 +18,7 @@
 
 pub mod affine;
 pub mod attn;
+pub mod attn_flash;
 pub mod block_draft;
 pub mod exact_affine;
 pub mod iq;
@@ -25,5 +26,6 @@ pub mod misc;
 pub mod ple;
 pub mod q4_0;
 pub mod routed;
+pub mod short_conv;
 pub mod ssm;
 pub mod vision;

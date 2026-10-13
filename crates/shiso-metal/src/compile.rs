@@ -8,6 +8,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{MTLCompileOptions, MTLDevice, MTLLibrary};
+use parking_lot::Mutex;
 use shiso_core::{CoreError, CoreResult};
 
 use crate::device::MetalError;
@@ -219,6 +220,11 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "dense/dense_moe.metal",
         include_str!("../metal/dense/dense_moe.metal"),
     ),
+    // The gated short convolution block's one sequential kernel.
+    (
+        "dense/dense_short_conv.metal",
+        include_str!("../metal/dense/dense_short_conv.metal"),
+    ),
     // --- qwen35moe kernel set; appended, nothing above this line changed. The
     // header comes first, for the same reason the qwen35, vision and dense
     // headers do: the files after it use its argument block and its affine
@@ -378,10 +384,10 @@ pub(crate) fn full_source() -> CoreResult<String> {
 /// [`CoreError::Backend`] carrying the compiler's own diagnostic as the error
 /// source, so `{:#}` reaches it. The full diagnostic is also logged, because a
 /// truncated `CoreError` display is useless for fixing a kernel.
-pub(crate) fn compile_library(
+fn compile_source(
     device: &ProtocolObject<dyn MTLDevice>,
+    source: &str,
 ) -> CoreResult<Retained<ProtocolObject<dyn MTLLibrary>>> {
-    let source = full_source()?;
     // Defaults, and the q35 sources depend on that: `MTLCompileOptions` leaves
     // math mode Fast, and the qwen35 kernels are written against it.
     //
@@ -401,7 +407,7 @@ pub(crate) fn compile_library(
     // pragmas and this call together, or not at all.
     let options = MTLCompileOptions::new();
     let compiled =
-        device.newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options));
+        device.newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options));
     match compiled {
         Ok(library) => {
             tracing::debug!(
@@ -425,4 +431,45 @@ pub(crate) fn compile_library(
             })
         }
     }
+}
+
+/// One compiled library, with the device and the exact source it came from.
+struct CachedLibrary {
+    device_id: u64,
+    source: String,
+    library: Retained<ProtocolObject<dyn MTLLibrary>>,
+}
+
+/// Libraries this process has compiled. Compiling the whole source takes about a
+/// minute on an M1 Max, and a test binary that opens many backends paid it once
+/// per backend, so a second open of the same source on the same device reuses
+/// the first. The lock is held across the compile on purpose: callers racing for
+/// the same library wait for it instead of each compiling their own.
+static COMPILED: Mutex<Vec<CachedLibrary>> = Mutex::new(Vec::new());
+
+/// The kernel library for `device`, compiled once per process per distinct
+/// source (`SHISO_METAL_SOURCE_DIR` can change the source between calls).
+///
+/// # Errors
+///
+/// As [`full_source`] and the compiler; a failure is not cached.
+pub(crate) fn compile_library(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> CoreResult<Retained<ProtocolObject<dyn MTLLibrary>>> {
+    let source = full_source()?;
+    let device_id = device.registryID();
+    let mut compiled = COMPILED.lock();
+    if let Some(hit) = compiled
+        .iter()
+        .find(|c| c.device_id == device_id && c.source == source)
+    {
+        return Ok(hit.library.clone());
+    }
+    let library = compile_source(device, &source)?;
+    compiled.push(CachedLibrary {
+        device_id,
+        source,
+        library: library.clone(),
+    });
+    Ok(library)
 }

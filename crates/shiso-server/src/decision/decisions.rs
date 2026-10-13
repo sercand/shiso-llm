@@ -22,6 +22,7 @@ use crate::decision::core::{self, TemplateKwargs, prepare_question, run_question
 use crate::decision::decisions_encode::encode;
 use crate::decision::decisions_wire::{self, DecisionsBody};
 use crate::decision::head;
+use crate::decision::readout;
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -73,6 +74,26 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
             state,
             layout,
             &text,
+            media,
+            questions,
+            temperature,
+            want_token_ids,
+        )
+        .await?;
+        return Ok(Json(encode(model, &answers, prompt_tokens, want_token_ids)).into_response());
+    }
+
+    // A decision checkpoint with no head answers each question from its own
+    // prompt's next-token row, at the caller's temperature. The input is text
+    // here, never a structured value, so it reaches the layout verbatim.
+    if let Some(layout) = state.decision_readout.as_deref() {
+        let (text, media) = head::split_input(&input);
+        let text = serde_json::Value::String(text);
+        let text = readout::spell_state(Some(&text), layout.state_spelling());
+        let (answers, prompt_tokens) = readout::run(
+            state,
+            layout,
+            text.as_deref(),
             media,
             questions,
             temperature,

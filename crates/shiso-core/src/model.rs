@@ -368,6 +368,17 @@ pub trait Model: Send + std::fmt::Debug {
         None
     }
 
+    /// The answer-slot readout of a decision checkpoint that has no head: how
+    /// its questions are laid out as prompts whose next-token rows are the
+    /// answers.
+    ///
+    /// Taken once, before the model moves to the scheduler thread, and shared
+    /// with the request threads that build each prompt. `None` for every
+    /// model that was not trained to answer that way.
+    fn decision_readout(&self) -> Option<std::sync::Arc<dyn crate::decision::DecisionReadout>> {
+        None
+    }
+
     /// Keeps every token the model picks for itself off `ids`.
     ///
     /// A scheduler draws from logits rows it reads back, and masks those rows

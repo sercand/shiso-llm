@@ -23,6 +23,7 @@ impl RegistryClient {
     #[must_use]
     pub fn new(config: HubConfig) -> Self {
         let client = reqwest::Client::builder()
+            .tls_built_in_root_certs(config.registry.url.scheme() != "http")
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { client, config }

@@ -3,7 +3,7 @@
 //! The cases themselves live in `shiso-kerneltest`, so this file is the
 //! backend's half only: open a device, or say why the cases did not run.
 //!
-//! GPU cases: `cargo test -p shiso-metal --features metal --test q35_gemv --
+//! GPU cases: `cargo test -p shiso-metal --features metal --test kernels q35_gemv:: --
 //! --ignored`.
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
@@ -55,6 +55,13 @@ fn q6_k_gather_matches_the_dense_unpack() {
 fn q4_k_prefill_gemm_matches_a_triple_loop() {
     let Some(gpu) = open() else { return };
     cases::q4_k_prefill_gemm_matches_a_triple_loop(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn q6_k_prefill_gemm_matches_a_triple_loop() {
+    let Some(gpu) = open() else { return };
+    cases::q6_k_prefill_gemm_matches_a_triple_loop(&gpu);
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //! The cases live in `shiso-kerneltest`; this file opens a device or says why
 //! the cases did not run. The pipeline check is not ignore-gated, so a missing
 //! entry point fails the default gate. The rest run with
-//! `cargo test -p shiso-metal --features metal --test dense_exact_affine -- --ignored`.
+//! `cargo test -p shiso-metal --features metal --test kernels dense_exact_affine:: -- --ignored`.
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::sync::Arc;

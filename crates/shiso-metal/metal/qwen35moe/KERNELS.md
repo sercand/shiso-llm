@@ -209,7 +209,7 @@ Every entry here has a device case in
 and printing the divergence it measured beside its budget. They need a device:
 
 ```
-cargo test -p shiso-metal --features metal --test q35moe_moe -- --ignored --test-threads=1
+cargo test -p shiso-metal --features metal --test kernels q35moe_moe:: -- --ignored --test-threads=1
 ```
 
 `--test-threads=1` is not optional on these machines: Metal runs one workload at

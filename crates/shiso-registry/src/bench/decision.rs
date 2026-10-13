@@ -32,15 +32,15 @@ async fn decide(server: &Server, input: &str) -> anyhow::Result<(u64, f64)> {
         "model": server.model_id,
         "input": input,
         "questions": [{
-            "id": "q1",
-            "type": "yes_no",
-            "question": "The notes mention a river.",
+            "name": "q1",
+            "type": "predicate",
+            "instructions": "The notes mention a river.",
         }],
     });
     let (value, elapsed): (Value, _) = server.post_json("/v1/decisions", &body).await?;
-    let tokens = value["usage"]["prompt_tokens"]
+    let tokens = value["usage"]["input_tokens"]
         .as_u64()
-        .context("the decision answer carries no usage.prompt_tokens")?;
+        .context("the decision answer carries no usage.input_tokens")?;
     Ok((tokens, elapsed.as_secs_f64() * 1000.0))
 }
 

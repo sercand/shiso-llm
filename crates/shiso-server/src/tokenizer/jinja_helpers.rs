@@ -76,7 +76,7 @@ pub fn build_environment(
     template: &str,
     style: ToolJsonStyle,
 ) -> Result<Environment<'static>, TemplateError> {
-    let leaked: &'static str = Box::leak(template.to_owned().into_boxed_str());
+    let leaked: &'static str = Box::leak(strip_generation_blocks(template).into_boxed_str());
     let mut env = Environment::new();
     env.set_lstrip_blocks(true);
     env.set_trim_blocks(true);
@@ -119,6 +119,34 @@ pub fn build_environment(
             message: error.to_string(),
         })?;
     Ok(env)
+}
+
+/// The template with every `{% generation %}` and `{% endgeneration %}` tag
+/// removed.
+///
+/// Those two tags are a Python engine's extension: they mark the assistant's
+/// own tokens so a training run can mask everything else, and they render
+/// nothing. This engine has no such tag, so a template that carries them -
+/// the LFM2 family's does, around every assistant turn - would not compile at
+/// all and the server would render no prompt. Dropping the markers renders
+/// exactly what the Python engine renders.
+pub(crate) fn strip_generation_blocks(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{%") {
+        let Some(close) = rest[open..].find("%}") else {
+            break;
+        };
+        let tag = &rest[open + 2..open + close];
+        let name = tag.trim_matches(|c: char| c == '-' || c == '+' || c.is_whitespace());
+        out.push_str(&rest[..open]);
+        if name != "generation" && name != "endgeneration" {
+            out.push_str(&rest[open..open + close + 2]);
+        }
+        rest = &rest[open + close + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Answers the string and map methods a Python-written template calls.
@@ -252,7 +280,25 @@ impl serde_json::ser::Formatter for SpacedFormatter {
 
 #[cfg(test)]
 mod tests {
-    use super::{TEMPLATE_NAME, ToolJsonStyle, build_environment};
+    use super::{TEMPLATE_NAME, ToolJsonStyle, build_environment, strip_generation_blocks};
+
+    /// The training-mask markers render nothing, and every other tag -
+    /// whitespace control included - survives untouched.
+    #[test]
+    fn generation_markers_are_dropped_and_nothing_else_is() {
+        let source = "{%- if a -%}x{%- generation -%}{{ y }}{% endgeneration %}{% endif %}";
+        assert_eq!(
+            strip_generation_blocks(source),
+            "{%- if a -%}x{{ y }}{% endif %}"
+        );
+        let env = build_environment(source, ToolJsonStyle::Compact).expect("it compiles");
+        let text = env
+            .get_template(TEMPLATE_NAME)
+            .expect("registered")
+            .render(minijinja::context! { a => true, y => "z" })
+            .expect("it renders");
+        assert_eq!(text, "xz");
+    }
 
     /// Renders a one-expression template over one named value.
     fn render(source: &str, name: &str, value: &minijinja::Value) -> String {

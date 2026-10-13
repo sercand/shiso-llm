@@ -84,6 +84,7 @@ fn profile() -> Qwen35Config {
         v_norm: false,
         moe: None,
         ssm: None,
+        short_conv: None,
         no_ffn: Vec::new(),
     };
     Qwen35Config::new(shape, TokenId::new(0), INTERVAL)

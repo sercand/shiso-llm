@@ -173,6 +173,7 @@ pub fn config_from_gguf(meta: &GgufMetadata, vocab: u32) -> CoreResult<Qwen35Moe
         v_norm: false,
         moe: Some(MoeShape::new(experts, used, 1, routed_width)),
         ssm: None,
+        short_conv: None,
         no_ffn: Vec::new(),
     };
     let eos = meta

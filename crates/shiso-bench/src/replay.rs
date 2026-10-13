@@ -34,6 +34,7 @@ use shiso_engine::sparse::stack::SparseOptions;
 use shiso_engine::sparse::tap::ResidualTap;
 use shiso_engine::{EngineOptions, argmax};
 use shiso_models::gemma4::{Gemma4Config, Gemma4Model, PleOptions};
+use shiso_models::lfm2::{Lfm2Config, Lfm2Model};
 use shiso_models::nemotron_h::{NemotronHConfig, NemotronHModel};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::{Qwen35Config, Qwen35Model};
@@ -410,6 +411,14 @@ fn load_loaded(
         }
         Err(shiso_core::CoreError::UnknownArch { .. }) => {}
         Err(other) => return Err(other.into()),
+    }
+    // The hybrid reads every width out of its container and checks the
+    // document against them, so its reader takes the checkpoint too.
+    if Lfm2Config::describes(config) {
+        let family = Lfm2Config::from_hf(config, path)?;
+        return Ok(Loaded::Other(Box::new(Lfm2Model::load(
+            backend, path, &family, opts,
+        )?)));
     }
     if NemotronHConfig::describes_type(config.model_type()) {
         let family = NemotronHConfig::from_dir(path)?;

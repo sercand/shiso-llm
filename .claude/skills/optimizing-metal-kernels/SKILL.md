@@ -31,8 +31,8 @@ with numbers. Read the section that matches your kernel before you start.
 3. **Make one change.** Pick it from the Optimization checklist below.
 4. **Prove correctness.** Run the kernel's `shiso-kerneltest` case on the
    device (cases live in `crates/shiso-kerneltest/src/<set>/<file>.rs`; the
-   Metal test target that runs them is named after that file, e.g.
-   `qwen35/gemv.rs` → `--test q35_gemv`; `grep -l <case_fn> crates/shiso-metal/tests/`
+   Metal test module that runs them (all in the one `kernels` target) is named after that file, e.g.
+   `qwen35/gemv.rs` → `--test kernels q35_gemv::`; `grep -l <case_fn> crates/shiso-metal/tests/`
    finds it), then model parity. Both must pass. "Greedy text unchanged" is the
    minimum you report.
 5. **Measure again** with the same protocol. Keep the change only if the median
@@ -142,7 +142,7 @@ show) use `xcrun xctrace record --template 'Metal System Trace' --launch -- <cmd
 
 ```sh
 # kernel cases on the device (pick the test target)
-cargo test -p shiso-metal --features metal --test q35_gemv -- --ignored
+cargo test -p shiso-metal --features metal --test kernels q35_gemv:: -- --ignored
 
 # quick throughput number (prefill + decode tok/s); also: gemma4, q35moe, q35moe_gguf
 SHISO_TEST_MODEL=/path/model.gguf cargo run --release -p shiso-bench --bin qwen35

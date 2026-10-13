@@ -78,7 +78,14 @@ impl Downloader {
             }
         });
 
+        // Building a client loads the platform trust store, which on macOS is a
+        // keychain round trip that took 35-60s on a developer machine. An
+        // endpoint pair that is plain http (a local mock or registry) never
+        // does TLS, so it skips that load.
+        let plain_http =
+            config.registry.url.scheme() == "http" && config.hf_endpoint.scheme() == "http";
         let client = reqwest::Client::builder()
+            .tls_built_in_root_certs(!plain_http)
             .redirect(redirect_policy)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());

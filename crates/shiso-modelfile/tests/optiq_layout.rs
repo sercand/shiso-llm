@@ -316,7 +316,9 @@ fn the_translated_names_bind_as_a_qwen35_model() {
         match want {
             LayerKind::Gdn => gdn += 1,
             LayerKind::Attn => attn += 1,
-            LayerKind::Ssm => panic!("layer {il}: this family has no {want:?} slot"),
+            LayerKind::Ssm | LayerKind::ShortConv => {
+                panic!("layer {il}: this family has no {want:?} slot")
+            }
         }
     }
     assert_eq!((gdn, attn), (24, 8));

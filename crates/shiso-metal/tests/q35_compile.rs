@@ -87,11 +87,12 @@ const EXT_ENTRIES: [&str; 10] = [
 ];
 
 /// The prefill matmul prefill matmul instantiations kept by `gemm_q4k.metal`.
-const GEMM_ENTRIES: [&str; 4] = [
+const GEMM_ENTRIES: [&str; 5] = [
     "kernel_mul_mm_f16_f32",
     "kernel_mul_mm_q8_0_f32",
     "kernel_mul_mm_q4_K_f32",
     "kernel_mul_mm_q4_0_f32",
+    "kernel_mul_mm_q6_K_f32",
 ];
 
 /// Every name in the Produces list resolves to a pipeline.

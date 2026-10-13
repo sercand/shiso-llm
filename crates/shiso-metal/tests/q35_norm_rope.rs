@@ -3,7 +3,7 @@
 //! The cases themselves live in `shiso-kerneltest`, so this file is the
 //! backend's half only: open a device, or say why the cases did not run.
 //!
-//! GPU cases: `cargo test -p shiso-metal --features metal --test q35_norm_rope --
+//! GPU cases: `cargo test -p shiso-metal --features metal --test kernels q35_norm_rope:: --
 //! --ignored`.
 #![cfg(all(feature = "metal", target_os = "macos"))]
 

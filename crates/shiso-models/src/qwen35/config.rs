@@ -208,6 +208,7 @@ impl Qwen35Config {
                 v_norm: false,
                 moe: None,
                 ssm: None,
+                short_conv: None,
                 no_ffn: Vec::new(),
             },
             eos_token: TokenId::new(cfg.eos_token_id),

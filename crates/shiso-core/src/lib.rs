@@ -46,7 +46,8 @@ pub use buffer::{
 pub use config::{HfConfig, HiddenAct, VisionConfig};
 pub use decision::{
     DecisionLayout, DecisionLayoutError, DecisionMedia, DecisionMediaKind, DecisionPrompt,
-    DecisionRecord, PromptEncoder, SchemaAnswer, SchemaOption, SchemaQuestion,
+    DecisionReadout, DecisionRecord, PromptEncoder, ReadoutPrompt, ReadoutQuestion, ReadoutRecord,
+    SchemaAnswer, SchemaOption, SchemaQuestion, StateSpelling,
 };
 pub use dtype::DType;
 pub use error::{Chain, CoreError, CoreResult, chain_of};

@@ -366,6 +366,26 @@ pub const DENSE_ATTN_KT: u32 = 16;
 /// `half`, at the widest head the set carries.
 pub const DENSE_ATTN_PREFILL_SMEM_BYTES: u32 = DENSE_ATTN_HEAD_DIM * DENSE_ATTN_KT * 2;
 
+/// Query rows per threadgroup of the simdgroup-matrix prefill softmax,
+/// `DENSE_FLASH_QROWS` in `metal/dense/dense_common.h`: eight per simdgroup.
+pub const DENSE_ATTN_FLASH_ROWS: u32 = 64;
+
+/// The simdgroup-matrix prefill softmax for a head `head_dim` wide, when one is
+/// instantiated (`metal/dense/dense_attn.metal`).
+///
+/// A backend that does not carry the entry is asked rather than assumed: the
+/// dispatch probes it with [`Backend::max_block_threads`](shiso_core::backend::Backend::max_block_threads)
+/// and runs the tiled scalar entry otherwise, so nothing above the backend
+/// names a device.
+#[must_use]
+pub const fn dense_attn_flash_name(head_dim: u32) -> Option<&'static str> {
+    match head_dim {
+        64 => Some("kernel_dense_attn_flash_hd64"),
+        128 => Some("kernel_dense_attn_flash_hd128"),
+        _ => None,
+    }
+}
+
 /// Weights in one per-layer embedding row, which is one `q6_K` block exactly.
 ///
 /// `DENSE_PLE_DIM` in `metal/dense/dense_common.h`. Not a width the shape may
@@ -401,7 +421,7 @@ const _: () = assert!(DENSE_PLE_BLOCK_BYTES == DType::Q6_K.block_bytes().get() a
 pub const DENSE_PLE_SMEM_BYTES: u32 = 4 * (33 + DENSE_PLE_DIM);
 
 /// Elements in one `q6_K` block, which is the span a gather threadgroup unpacks.
-const QK_K: u32 = 256;
+pub(crate) const QK_K: u32 = 256;
 
 /// Threads per block of the `q6_K` gather.
 pub const GET_ROWS_BLOCK: u32 = 256;
@@ -2120,14 +2140,17 @@ pub(crate) fn plain_consts_for(nsg: u32, by_name: bool) -> Option<&'static [FnCo
 
 /// The prefill GEMM for a weight format, when one exists.
 ///
-/// Four formats have a GEMM. `q5_K` and `q6_K` do not, which is affordable
-/// because those two are the embedding and the tied output rather than the bulk of
-/// a block. The packed affine formats are absent for the reason given on
-/// [`ext_name`].
+/// Five formats have a GEMM. `q6_K` is among them because a `Q4_K_M` export
+/// keeps about half of its down projections and value projections at it: read
+/// through the matvec, a prefill chunk re-read each of those matrices once per
+/// row block, and on an M1 Max that left a 3B `Q4_K_M` export slower to
+/// prefill than its `q8_0` twin. `q5_K` has none. The packed affine formats
+/// are absent for the reason given on [`ext_name`].
 #[must_use]
 pub const fn mm_name(dtype: DType) -> Option<&'static str> {
     match dtype {
         DType::Q4_K => Some("kernel_mul_mm_q4_K_f32"),
+        DType::Q6_K => Some("kernel_mul_mm_q6_K_f32"),
         DType::Q4_0 => Some("kernel_mul_mm_q4_0_f32"),
         DType::Q8_0 => Some("kernel_mul_mm_q8_0_f32"),
         DType::F16 => Some("kernel_mul_mm_f16_f32"),
@@ -2148,6 +2171,7 @@ pub const fn mm_name(dtype: DType) -> Option<&'static str> {
 pub const fn dequant_plane_name(dtype: DType) -> Option<&'static str> {
     match dtype {
         DType::Q4_K => Some("kernel_dequant_plane_q4_K_f32"),
+        DType::Q6_K => Some("kernel_dequant_plane_q6_K_f32"),
         DType::Q4_0 => Some("kernel_dequant_plane_q4_0_f32"),
         DType::Q8_0 => Some("kernel_dequant_plane_q8_0_f32"),
         DType::F16 => Some("kernel_dequant_plane_f16_f32"),
@@ -2188,13 +2212,6 @@ pub(crate) const fn mm_grid(out_dim: u32, n_tok: u32) -> Extent3 {
         out_dim.div_ceil(GEMM_TILE_ROWS),
         1,
     )
-}
-
-/// Grid of a `q6_K` gather: one threadgroup per 256-element block of a row, one
-/// row per token.
-#[must_use]
-pub(crate) const fn get_rows_grid(in_dim: u32, n_tok: u32) -> Extent3 {
-    Extent3::new(in_dim.div_ceil(QK_K), n_tok, 1)
 }
 
 // ---------------------------------------------------------------------------------------

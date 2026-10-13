@@ -37,7 +37,7 @@ use crate::oracle::{TOL_F32, TOL_QUANT};
 const BLOCK_128: u32 = 128;
 /// Threads per threadgroup of the two softmax entry points, mirroring
 /// `shiso_engine::launch::BLOCK_LINEAR`: eight simdgroups.
-const BLOCK_256: u32 = 256;
+pub(super) const BLOCK_256: u32 = 256;
 /// Threadgroup bytes the norm-and-rotate kernels ask for, mirroring
 /// `shiso_engine::launch::DENSE_NORM_ROPE_SMEM_BYTES`: the block reduction's
 /// slots plus the widest head this set carries.
@@ -112,18 +112,18 @@ const _: () = assert!(size_of::<KvNormRopeArgs>() == 40);
 /// `dense_args_attn`, mirroring `shiso_engine::launch::DenseAttnArgs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct AttnArgs {
-    head_dim: u32,
-    n_head: u32,
-    n_head_kv: u32,
-    n_tok: u32,
-    page_tokens: u32,
-    window: u32,
-    scale: f32,
+pub(super) struct AttnArgs {
+    pub(super) head_dim: u32,
+    pub(super) n_head: u32,
+    pub(super) n_head_kv: u32,
+    pub(super) n_tok: u32,
+    pub(super) page_tokens: u32,
+    pub(super) window: u32,
+    pub(super) scale: f32,
     /// Entries between one row's page table and the next; `0` when every row
     /// of the launch reads the table the pointer names, which is what these
     /// single-session fixtures want.
-    page_stride: u32,
+    pub(super) page_stride: u32,
 }
 
 const _: () = assert!(size_of::<AttnArgs>() == 32);
@@ -131,7 +131,7 @@ const _: () = assert!(size_of::<AttnArgs>() == 32);
 // -- helpers ----------------------------------------------------------------
 
 /// Launches one dense entry point, naming the geometry if the driver refuses it.
-fn launch(
+pub(super) fn launch(
     gpu: &Gpu,
     entry: &'static str,
     grid: Extent3,
@@ -162,7 +162,7 @@ fn zeros_f16(gpu: &Gpu, len: usize) -> DeviceBuffer {
 }
 
 /// Asserts every value agrees within `tol`, scaled by the expected magnitude.
-fn close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+pub(super) fn close(got: &[f32], want: &[f32], tol: f32, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     for (index, (&have, &expect)) in got.iter().zip(want).enumerate() {
         let bound = tol * expect.abs().max(1.0);
@@ -175,13 +175,13 @@ fn close(got: &[f32], want: &[f32], tol: f32, what: &str) {
 
 /// Little-endian bytes of an `int32` array, which is how positions, bounds and
 /// page tables reach a kernel.
-fn i32_bytes(values: &[i32]) -> Vec<u8> {
+pub(super) fn i32_bytes(values: &[i32]) -> Vec<u8> {
     values.iter().copied().flat_map(i32::to_le_bytes).collect()
 }
 
 /// Little-endian bytes of a whole fixture as `f16`, through the same conversion
 /// the loader uses.
-fn f16_bytes(values: &[f32]) -> Vec<u8> {
+pub(super) fn f16_bytes(values: &[f32]) -> Vec<u8> {
     values
         .iter()
         .flat_map(|&v| f16::from_f32(v).to_le_bytes())
@@ -203,7 +203,7 @@ fn f16_values(bytes: &[u8]) -> Vec<f32> {
 /// cache round trip is exact and any difference is arithmetic. The period is
 /// coprime with the head, position and dimension strides, so no two heads and no
 /// two positions read the same row.
-fn fixture(len: usize, salt: usize) -> Vec<f32> {
+pub(super) fn fixture(len: usize, salt: usize) -> Vec<f32> {
     (0..len)
         .map(|i| ((i * 7 + salt * 31) % 23) as f32 * 0.125 - 1.0)
         .collect()
@@ -430,21 +430,21 @@ const KV_TOK: usize = 3;
 /// because the oracle has to perform the same translation from the same two
 /// numbers rather than from a second copy of the rule.
 #[derive(Debug, Clone, Copy)]
-struct Paging {
-    page_tokens: u32,
-    pages: &'static [i32],
+pub(super) struct Paging {
+    pub(super) page_tokens: u32,
+    pub(super) pages: &'static [i32],
 }
 
 impl Paging {
     /// Physical cache rows this table addresses, which is what the fixture and
     /// the cache allocation are sized by.
-    const fn rows(self) -> usize {
+    pub(super) const fn rows(self) -> usize {
         self.pages.len() * self.page_tokens as usize
     }
 
     /// The translation `dense_kv_row` performs:
     /// `pages[p / page_tokens] * page_tokens + p % page_tokens`.
-    fn row(self, position: u32) -> usize {
+    pub(super) fn row(self, position: u32) -> usize {
         let page = self.pages[(position / self.page_tokens) as usize] as usize;
         page * self.page_tokens as usize + (position % self.page_tokens) as usize
     }
@@ -474,7 +474,7 @@ const _: () = assert!(ONE_PAGE.rows() >= N_POS);
 const _: () = assert!(SHUFFLED_PAGES.rows() >= N_POS);
 
 /// Uploads one page table.
-fn page_table(gpu: &Gpu, paging: Paging) -> DeviceBuffer {
+pub(super) fn page_table(gpu: &Gpu, paging: Paging) -> DeviceBuffer {
     gpu.upload(&i32_bytes(paging.pages))
 }
 
@@ -598,7 +598,7 @@ const MIN_IN_SPAN_WEIGHT: f32 = 0.02;
 /// `0` is no window at all, which makes the span everything up to the bound -
 /// and the bound is not the query's own position, so a span reaching forward is
 /// a span this kernel has to serve.
-fn key_span(pos: u32, bound: u32, window: u32) -> std::ops::RangeInclusive<u32> {
+pub(super) fn key_span(pos: u32, bound: u32, window: u32) -> std::ops::RangeInclusive<u32> {
     let lo = if window != 0 && pos + 1 > window {
         pos + 1 - window
     } else {
@@ -862,10 +862,10 @@ pub fn scale_is_an_argument(gpu: &Gpu) {
 /// tell "wrote a row of zeros" from "wrote nothing at all", and the contract
 /// asks for the first. Finite and enormous, so a failure reads as untouched
 /// rather than as arithmetic.
-const POISON: f32 = -1.0e30;
+pub(super) const POISON: f32 = -1.0e30;
 
 /// An `f32` device buffer of `len` copies of [`POISON`].
-fn poisoned(gpu: &Gpu, len: usize) -> DeviceBuffer {
+pub(super) fn poisoned(gpu: &Gpu, len: usize) -> DeviceBuffer {
     gpu.upload(&f32_bytes(&vec![POISON; len]))
 }
 

@@ -28,8 +28,8 @@
  * `mm_consts_for(by_name)` hands this backend an empty constant table for the
  * same reason. A row width that is not a whole number of 32 would need the
  * input tail the host never asks for, and no quantized codec here can have one:
- * `q4_0` and `q8_0` pack 32 elements to a block and `q4_K` packs 256, so a row
- * of any of the three is a whole number of 32-wide k tiles by construction.
+ * `q4_0` and `q8_0` pack 32 elements to a block and `q4_K` and `q6_K` pack 256,
+ * so a row of any of them is a whole number of 32-wide k tiles by construction.
  */
 #ifndef SHISO_MUL_MM_CUH
 #define SHISO_MUL_MM_CUH
@@ -104,6 +104,34 @@ __device__ __forceinline__ void shiso_mm_stage_weights<struct shiso_block_q4_K>(
 #pragma unroll
     for (int c = 0; c < 16; ++c) {
         sa[w_row * SHISO_MM_NK + 16 * w_half + c] = __float2half(tmp[c]);
+    }
+}
+
+/* q6_K: one sixteen-element group of one 256-weight super-block, the same
+ * group arithmetic as the q4_K stage above - the Metal instantiation walks this
+ * codec with the same `nl` of 16 - read as four of the four-element chunks the
+ * matvec and the staging plane use, so the value of every weight is theirs. A
+ * `Q4_K_M` export keeps about half of its down projections at this codec, and
+ * without a tile they took the matvec through every prefill chunk. */
+template <>
+__device__ __forceinline__ void shiso_mm_stage_weights<struct shiso_block_q6_K>(
+        const struct shiso_args_mul_mm &args, const char *__restrict__ src0,
+        uint64_t offset0, int r0, int w_row, int w_half, int kb, __half *sa) {
+    const int e0 = kb * SHISO_MM_NK + 16 * w_half;
+    const struct shiso_block_q6_K *x =
+        (const struct shiso_block_q6_K *) (src0 + args.nb01 * (uint64_t) (r0 + w_row)
+                                           + offset0)
+        + e0 / SHISO_QK_K;
+    const int group = (e0 % SHISO_QK_K) / 16;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        float4 chunk;
+        shiso_dequantize_q6_K_t4(x, 4 * group + c, &chunk);
+        __half *slot = sa + w_row * SHISO_MM_NK + 16 * w_half + 4 * c;
+        slot[0] = __float2half(chunk.x);
+        slot[1] = __float2half(chunk.y);
+        slot[2] = __float2half(chunk.z);
+        slot[3] = __float2half(chunk.w);
     }
 }
 

@@ -6,14 +6,14 @@
 //! One case is not ignore-gated: the pipelines have to resolve, and a missing or
 //! misnamed entry point should fail the default gate rather than hide behind the
 //! GPU gate. The rest are `#[ignore]`d: `cargo test -p shiso-metal --features
-//! metal --test dense_attn -- --ignored`.
+//! metal --test kernels dense_attn:: -- --ignored`.
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::sync::Arc;
 
 use shiso_core::{Backend, KernelRef};
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::dense::attn;
+use shiso_kerneltest::dense::{attn, attn_flash};
 use shiso_metal::MetalBackend;
 
 /// Opens the device, or says on stderr why the cases did not run.
@@ -42,7 +42,10 @@ fn every_dense_attention_entry_point_resolves_as_a_pipeline() {
         return;
     }
     let backend = MetalBackend::new().expect("the embedded kernel library compiles");
-    for entry in attn::ENTRIES {
+    for entry in attn::ENTRIES
+        .into_iter()
+        .chain(attn_flash::ENTRIES.map(|(entry, _)| entry))
+    {
         backend
             .prepare(KernelRef::new("dense", entry))
             .unwrap_or_else(|err| panic!("{entry} does not resolve: {err}"));
@@ -89,4 +92,25 @@ fn scale_is_an_argument() {
 fn an_empty_span_contributes_zeros_rather_than_nan() {
     let Some(gpu) = open() else { return };
     attn::an_empty_span_contributes_zeros_rather_than_nan(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn flash_long_causal_spans_match_the_oracle() {
+    let Some(gpu) = open() else { return };
+    attn_flash::long_causal_spans_match_the_oracle(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn flash_a_forward_bound_reads_past_the_query() {
+    let Some(gpu) = open() else { return };
+    attn_flash::a_forward_bound_reads_past_the_query(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn flash_empty_spans_write_zeros_beside_live_ones() {
+    let Some(gpu) = open() else { return };
+    attn_flash::empty_spans_write_zeros_beside_live_ones(&gpu);
 }

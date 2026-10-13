@@ -17,6 +17,7 @@ hex = { workspace = true }
 tokio = { workspace = true }
 semver = { workspace = true }
 sysinfo = { workspace = true }
+rustix = { workspace = true }
 url = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true }

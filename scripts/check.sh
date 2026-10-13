@@ -99,7 +99,23 @@ if [ "$macos" -eq 1 ] && [ "$has_server" -eq 1 ]; then
     FEATURES=(--features shiso-server/metal)
 fi
 
-step() { printf '\n== check: %s\n' "$1"; }
+# Each step reports how long it took, so a slow gate says which step to look at
+# instead of leaving a half-hour guess.
+step_name=""
+step_start=$SECONDS
+timings=""
+end_step() {
+    if [ -n "$step_name" ]; then
+        timings="$timings$(printf '  %-10s %4ds' "$step_name" $((SECONDS - step_start)))
+"
+    fi
+}
+step() {
+    end_step
+    step_name="$1"
+    step_start=$SECONDS
+    printf '\n== check: %s\n' "$1"
+}
 
 if want fmt; then
     step fmt
@@ -185,4 +201,6 @@ if want perf && [ "$has_bench" -eq 1 ]; then
     fi
 fi
 
+end_step
+printf '\ncheck: step timings\n%s' "$timings"
 printf '\ncheck: all gates green\n'

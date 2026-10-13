@@ -48,6 +48,7 @@ use shiso_engine::sparse::stack::SparseOptions;
 use shiso_models::gemma4::{
     Gemma4AudioTower, Gemma4Config, Gemma4Model, Gemma4Tower, PleOptions, holds_audio_tower,
 };
+use shiso_models::lfm2::{Lfm2Config, Lfm2Model, Lfm2Tower};
 use shiso_models::nemotron_h::{NemotronHConfig, NemotronHModel};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::mtp::{self, AffineQuant, MtpManifest};
@@ -269,6 +270,22 @@ impl FamilyDefaults {
         speculates: false,
     };
 
+    /// Family defaults for the LFM2 hybrid.
+    ///
+    /// Its template wraps reasoning in Qwen 3's `<think>` tags but opens no
+    /// reasoning block of its own, so thinking defaults off. It writes a tool
+    /// call as a bracketed Python call list between `<|tool_call_start|>` and
+    /// `<|tool_call_end|>`, which no reader in this build parses, so a call
+    /// comes back as prose rather than being misread as another family's.
+    pub const LFM2: Self = Self {
+        reasoning: ReasoningScheme::Qwen3,
+        tools: ToolCallScheme::None,
+        thinking_default: false,
+        effort: EffortSpelling::STANDARD,
+        // No draft head exists for this family.
+        speculates: false,
+    };
+
     /// Family defaults for Gemma 4 models.
     pub const GEMMA4: Self = Self {
         reasoning: ReasoningScheme::Gemma4,
@@ -321,6 +338,9 @@ impl FamilyDefaults {
         if NemotronHConfig::describes_type(config.model_type()) {
             return Ok(Self::NEMOTRON_H);
         }
+        if Lfm2Config::describes(config) {
+            return Ok(Self::LFM2);
+        }
         Err(FactoryError::UnknownArchitecture {
             model_type: config.model_type().to_owned(),
         })
@@ -369,6 +389,14 @@ impl std::fmt::Debug for Loaded {
             .field("defaults", &self.defaults)
             .finish_non_exhaustive()
     }
+}
+
+/// The LFM2 family's opener.
+fn open_lfm2_tower(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+) -> Result<Box<dyn VisionTower>, VisionError> {
+    Ok(Box::new(Lfm2Tower::open(backend, path)?))
 }
 
 /// The Qwen family's opener.
@@ -607,11 +635,34 @@ pub fn load_model(
         Err(other) => return Err(FactoryError::Load(other)),
     }
 
+    load_last_arms(backend, path, config, opts, defaults)
+}
+
+/// The arms tried after the Gemma 4 one, and the refusal when none of them
+/// recognises the document either.
+///
+/// # Errors
+///
+/// [`FactoryError::UnknownArchitecture`] when no arm recognises the config,
+/// and [`FactoryError::Load`] when one did and the checkpoint would not load.
+fn load_last_arms(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
     // The hybrid state-space family: a directory of MLX shards whose geometry
     // is its own `config.json`, read again here because the parsed document
     // carries no typed view of it.
     if NemotronHConfig::describes_type(config.model_type()) {
         return load_nemotron_h(backend, path, opts, defaults);
+    }
+
+    // The LFM2 hybrid reads every width out of its container and checks the
+    // document's against them, so its reader takes the checkpoint too.
+    if Lfm2Config::describes(config) {
+        return load_lfm2(backend, path, config, opts, defaults);
     }
 
     Err(FactoryError::UnknownArchitecture {
@@ -639,6 +690,29 @@ fn load_nemotron_h(
         // The template writes no media marker; the placement is only what a
         // renderer is configured with.
         placement: MediaPlacement::QWEN35,
+        defaults,
+    })
+}
+
+/// The LFM2 arm: a GGUF container whose geometry is its own metadata.
+///
+/// # Errors
+///
+/// [`FactoryError::Load`] for whatever the config or the checkpoint refuses.
+fn load_lfm2(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    let family = Lfm2Config::from_hf(config, path).map_err(FactoryError::Load)?;
+    let model = Lfm2Model::load(backend, path, &family, opts).map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_lfm2_tower,
+        open_audio: no_audio_tower,
+        placement: Lfm2Tower::PLACEMENT,
         defaults,
     })
 }
@@ -1224,6 +1298,7 @@ pub fn recognises(config: &HfConfig) -> bool {
     ) || Qwen35MoeConfig::describes(config)
         || Qwen4ExpConfig::describes(config)
         || Gemma4Config::describes(config)
+        || Lfm2Config::describes(config)
 }
 
 #[cfg(test)]
