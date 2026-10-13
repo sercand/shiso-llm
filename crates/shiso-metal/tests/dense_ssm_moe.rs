@@ -2,7 +2,7 @@
 //! feed-forward cases.
 //!
 //! The pipeline check is not ignore-gated; the rest run with
-//! `cargo test -p shiso-metal --features metal --test dense_ssm_moe -- --ignored`.
+//! `cargo test -p shiso-metal --features metal --test kernels dense_ssm_moe:: -- --ignored`.
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::sync::Arc;

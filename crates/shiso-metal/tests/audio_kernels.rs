@@ -6,7 +6,7 @@
 //! One case is not ignore-gated: the pipelines have to resolve, and a missing or
 //! misnamed entry point should fail the default gate rather than hide behind the
 //! GPU gate. The rest are `#[ignore]`d: `cargo test -p shiso-metal --features
-//! metal --test audio_kernels -- --ignored`.
+//! metal --test kernels audio_kernels:: -- --ignored`.
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::sync::Arc;

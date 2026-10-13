@@ -27,6 +27,16 @@ cargo doc --workspace --no-deps --locked --features shiso-server/metal
 cargo test -p <crate> --test <name>          # a single test target
 ```
 
+- While iterating, run the crate and the test target you are changing
+  (`cargo test -p <crate> --test <name>`, or `bash scripts/check.sh <crate>
+  --no-dependents --only clippy,test`), not the whole gate. The full gate
+  builds and links the workspace's ~190 test executables, which is tens of
+  minutes on a laptop, so run it once, when a change is done. It prints each
+  step's duration at the end.
+- The device-opening Metal kernel cases are one test target:
+  `cargo test -p shiso-metal --features metal --test kernels <file>:: -- --ignored`.
+  Add a new kernel file to `crates/shiso-metal/tests/kernels.rs`, or it is not
+  built.
 - `check.sh` already runs everything in `api_gate.sh` (it calls it with
   `--tree-only` and runs the cargo steps itself), so there is no need to run
   both. `scripts/scope.py` decides the scope; there is no CI, so there is

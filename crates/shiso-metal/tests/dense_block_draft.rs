@@ -1,7 +1,7 @@
 //! Metal's run of the shared block drafter cases.
 //!
 //! The pipeline check is not ignore-gated; the rest run with
-//! `cargo test -p shiso-metal --features metal --test dense_block_draft -- --ignored`.
+//! `cargo test -p shiso-metal --features metal --test kernels dense_block_draft:: -- --ignored`.
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::sync::Arc;

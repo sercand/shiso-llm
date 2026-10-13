@@ -79,6 +79,8 @@ wiremock = "0.6"
 # --- hub and registry -----------------------------------------------------
 indicatif = "0.17"
 sysinfo = "0.33"
+# Safe statvfs for the hub's free-disk probe; already in the lockfile through other crates.
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 semver = { version = "1", features = ["serde"] }
 # The hub site renders each model's README: CommonMark in, then sanitized,
 # because the README is third-party HTML published under the registry's domain.
@@ -244,11 +246,18 @@ panic = "unwind"   # the HTTP stack's catch-panic layer requires unwinding
 [profile.bench]
 inherits = "release"
 
+# Line tables are enough for panics, backtraces and the profiler. Full debuginfo
+# is paid by every test executable at link time, and the workspace links ~190.
+[profile.dev]
+debug = "line-tables-only"
+
 # Dequant oracles and golden-vector replays are unusably slow in a debug build of
 # their dependencies; the workspace crates stay at opt-level 0 so `cargo test`
-# still recompiles fast.
+# still recompiles fast. Dependencies carry no debuginfo: nothing steps into them.
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 [profile.test.package."*"]
 opt-level = 2
+debug = false

@@ -191,5 +191,5 @@ for field in `crates/shiso-engine/src/launch.rs`.
 Device cases: `crates/shiso-metal/tests/dense_misc.rs`,
 `crates/shiso-metal/tests/dense_attn.rs` and
 `crates/shiso-metal/tests/dense_ple.rs`
-(`cargo test -p shiso-metal --features metal --test dense_misc -- --ignored`,
-`--test dense_attn -- --ignored`, `--test dense_ple -- --ignored`).
+(`cargo test -p shiso-metal --features metal --test kernels dense_misc:: -- --ignored`,
+`--test kernels dense_attn:: -- --ignored`, `--test kernels dense_ple:: -- --ignored`).

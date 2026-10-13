@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use sysinfo::{Disks, RefreshKind, System};
+use sysinfo::{RefreshKind, System};
 
 use crate::error::HubError;
 
@@ -97,31 +97,20 @@ pub fn probe_ram() -> u64 {
 
 /// Probes available free disk space on the filesystem containing `path`.
 ///
+/// Asks the filesystem of the nearest existing ancestor directly. Enumerating
+/// every mount instead took 25s on a developer machine with a few disk images
+/// and network volumes attached, once per download.
+///
 /// # Errors
 /// Returns [`HubError::Io`] if free disk space cannot be determined.
 pub fn probe_free_disk(path: &Path) -> Result<u64, HubError> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let disks = Disks::new_with_refreshed_list();
-
-    // Find the disk mount with the longest matching prefix
-    let mut best_match: Option<(usize, u64)> = None;
-    for disk in &disks {
-        let mount_point = disk.mount_point();
-        if canonical.starts_with(mount_point) {
-            let match_len = mount_point.as_os_str().len();
-            if best_match.as_ref().is_none_or(|(len, _)| match_len > *len) {
-                best_match = Some((match_len, disk.available_space()));
-            }
-        }
-    }
-
-    if let Some((_, space)) = best_match {
-        Ok(space)
-    } else if let Some(first) = disks.first() {
-        Ok(first.available_space())
-    } else {
-        Err(HubError::Other(
-            "could not determine free disk space".to_string(),
-        ))
-    }
+    let existing = path
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .unwrap_or_else(|| Path::new("."));
+    let stat = rustix::fs::statvfs(existing).map_err(|e| HubError::Io {
+        path: existing.to_path_buf(),
+        source: e.into(),
+    })?;
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }

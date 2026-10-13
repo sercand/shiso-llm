@@ -3,7 +3,7 @@
 //! The cases live in `shiso-kerneltest`; this file opens a device or says why
 //! the cases did not run.
 //!
-//! GPU cases: `cargo test -p shiso-metal --test sample_kernels -- --ignored`.
+//! GPU cases: `cargo test -p shiso-metal --test kernels sample_kernels:: -- --ignored`.
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use std::sync::Arc;

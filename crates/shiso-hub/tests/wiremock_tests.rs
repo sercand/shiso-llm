@@ -182,7 +182,7 @@ async fn etag_304_reuse() {
     let config = HubConfig {
         home: temp.path().to_path_buf(),
         registry: endpoint,
-        hf_endpoint: url::Url::parse("https://huggingface.co").unwrap(),
+        hf_endpoint: url::Url::parse("http://hf.invalid").unwrap(),
         hf_token: None,
         max_parallel_files: NonZeroUsize::new(4).unwrap(),
     };
@@ -434,7 +434,7 @@ async fn manifest_is_fetched_from_the_index_path() {
         registry: RegistryEndpoint {
             url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
         },
-        hf_endpoint: url::Url::parse("https://huggingface.co").unwrap(),
+        hf_endpoint: url::Url::parse("http://hf.invalid").unwrap(),
         hf_token: None,
         max_parallel_files: NonZeroUsize::new(4).unwrap(),
     });
@@ -494,7 +494,7 @@ async fn a_recipe_for_a_newer_client_asks_for_an_upgrade() {
         registry: RegistryEndpoint {
             url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
         },
-        hf_endpoint: url::Url::parse("https://huggingface.co").unwrap(),
+        hf_endpoint: url::Url::parse("http://hf.invalid").unwrap(),
         hf_token: None,
         max_parallel_files: NonZeroUsize::new(4).unwrap(),
     });
@@ -588,7 +588,7 @@ async fn a_corrupt_hub_file_is_a_digest_mismatch_and_leaves_nothing() {
         registry: RegistryEndpoint {
             url: url::Url::parse(&format!("{}/v1/", server.uri())).unwrap(),
         },
-        hf_endpoint: url::Url::parse("https://hf.invalid").unwrap(),
+        hf_endpoint: url::Url::parse("http://hf.invalid").unwrap(),
         hf_token: None,
         max_parallel_files: NonZeroUsize::new(4).unwrap(),
     });
@@ -634,7 +634,7 @@ async fn a_recipe_this_client_cannot_parse_still_asks_for_an_upgrade() {
         registry: RegistryEndpoint {
             url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
         },
-        hf_endpoint: url::Url::parse("https://huggingface.co").unwrap(),
+        hf_endpoint: url::Url::parse("http://hf.invalid").unwrap(),
         hf_token: None,
         max_parallel_files: NonZeroUsize::new(4).unwrap(),
     });
@@ -681,7 +681,7 @@ async fn a_nested_hub_file_is_fetched_and_installed_under_its_directory() {
         registry: RegistryEndpoint {
             url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
         },
-        hf_endpoint: url::Url::parse("https://hf.invalid").unwrap(),
+        hf_endpoint: url::Url::parse("http://hf.invalid").unwrap(),
         hf_token: None,
         max_parallel_files: NonZeroUsize::new(4).unwrap(),
     };
