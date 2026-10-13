@@ -10,11 +10,16 @@ description = "shiso: OS video decoders (VideoToolbox, NVDEC) and the AV1 decode
 [features]
 # The pure-Rust AV1 decoder. The OS decoders are always compiled; this adds the
 # one codec a machine without an OS AV1 decoder still has to be able to read.
-decode-native = []
+decode-native = ["dep:rav1d", "dep:libc"]
 
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# decode-native: the AV1 decoder, and libc for the errno values its C ABI
+# returns (EAGAIN differs between macOS and Linux).
+rav1d = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 
 # NVDEC: libcuda and libnvcuvid are opened at run time, never linked, so a
 # machine without the NVIDIA driver runs the same binary.
