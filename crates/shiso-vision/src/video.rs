@@ -304,11 +304,10 @@ pub fn decode_clip(
     if let Some(step) = &ffmpeg_step {
         steps.push(step);
     }
-    let frames = run_chain(
+    run_chain(
         &steps,
         &StepInput::new(bytes, container, target_fps, policy),
-    )?;
-    DecodedClip::new(frames, target_fps)
+    )
 }
 
 /// Identifies a container from its leading bytes.

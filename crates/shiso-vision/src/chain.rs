@@ -16,10 +16,14 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use crate::error::{Container, VisionError};
 #[cfg(feature = "decode-ffmpeg")]
 use crate::ffmpeg::FfmpegPolicy;
-use crate::video::{DEFAULT_MAX_FRAMES, DecodedFrame};
+use crate::video::{DEFAULT_MAX_FRAMES, DecodedClip};
 
 /// Wall-clock budget for one decode when the operator gave none.
 const DEFAULT_TIMEOUT_SECS: u64 = 20;
+
+/// Bytes of decoded RGB an in-process step may produce for one request: the
+/// same bound the ffmpeg runner applies to its output pipe.
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 512 * 1024 * 1024;
 
 /// Operator policy for decoding video that is not a GIF.
 ///
@@ -32,6 +36,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 20;
 pub struct VideoDecodePolicy {
     timeout_secs: NonZeroU64,
     max_frames: NonZeroUsize,
+    max_output_bytes: NonZeroUsize,
     #[cfg(feature = "decode-ffmpeg")]
     ffmpeg: Option<FfmpegPolicy>,
 }
@@ -43,9 +48,18 @@ impl VideoDecodePolicy {
         Self {
             timeout_secs,
             max_frames,
+            max_output_bytes: NonZeroUsize::new(DEFAULT_MAX_OUTPUT_BYTES)
+                .unwrap_or(NonZeroUsize::MIN),
             #[cfg(feature = "decode-ffmpeg")]
             ffmpeg: None,
         }
+    }
+
+    /// Caps the decoded RGB bytes an in-process step may produce.
+    #[must_use]
+    pub fn with_max_output_bytes(mut self, bytes: NonZeroUsize) -> Self {
+        self.max_output_bytes = bytes;
+        self
     }
 
     /// Adds the ffmpeg step, run under `policy`'s own caps.
@@ -66,6 +80,12 @@ impl VideoDecodePolicy {
     #[must_use]
     pub fn max_frames(&self) -> usize {
         self.max_frames.get()
+    }
+
+    /// Decoded RGB bytes an in-process step may produce.
+    #[must_use]
+    pub fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes.get()
     }
 
     /// The ffmpeg step's policy, when the operator pointed the server at one.
@@ -124,8 +144,10 @@ impl<'a> StepInput<'a> {
 /// What a step made of the input.
 #[derive(Debug)]
 pub enum Attempt {
-    /// The step decoded it: frames already sampled at the requested rate.
-    Done(Vec<DecodedFrame>),
+    /// The step decoded it. The clip carries the rate its frames represent: the
+    /// requested one for a step that samples while decoding at that rate, the
+    /// rate actually kept for a step that picks frames by plan.
+    Done(DecodedClip),
     /// The step cannot handle this input and says why. The chain moves on.
     Unsupported(String),
 }
@@ -154,11 +176,11 @@ pub trait VideoStep {
 pub fn run_chain(
     steps: &[&dyn VideoStep],
     input: &StepInput<'_>,
-) -> Result<Vec<DecodedFrame>, VisionError> {
+) -> Result<DecodedClip, VisionError> {
     let mut tried = Vec::with_capacity(steps.len());
     for step in steps {
         match step.decode(input)? {
-            Attempt::Done(frames) => return Ok(frames),
+            Attempt::Done(clip) => return Ok(clip),
             Attempt::Unsupported(reason) => {
                 tracing::debug!(step = step.name(), %reason, "decoder step declined");
                 tried.push(step.name());
@@ -184,7 +206,8 @@ impl VideoStep for FfmpegStep<'_> {
     }
 
     fn decode(&self, input: &StepInput<'_>) -> Result<Attempt, VisionError> {
-        crate::ffmpeg::decode_frames(input.bytes, input.target_fps, self.0).map(Attempt::Done)
+        let frames = crate::ffmpeg::decode_frames(input.bytes, input.target_fps, self.0)?;
+        DecodedClip::new(frames, input.target_fps).map(Attempt::Done)
     }
 }
 

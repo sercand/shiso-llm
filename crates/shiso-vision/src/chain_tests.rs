@@ -1,6 +1,7 @@
 //! The chain's fall-through rules, against fake steps.
 
 use super::*;
+use crate::video::DecodedFrame;
 
 /// A step that always answers the same way.
 struct Fake {
@@ -22,7 +23,7 @@ fn frame() -> DecodedFrame {
     DecodedFrame::from_rgb8(1, 1, vec![0, 0, 0]).expect("1x1 rgb")
 }
 
-fn run(steps: &[&dyn VideoStep]) -> Result<Vec<DecodedFrame>, VisionError> {
+fn run(steps: &[&dyn VideoStep]) -> Result<DecodedClip, VisionError> {
     let policy = VideoDecodePolicy::default();
     run_chain(steps, &StepInput::new(b"x", Container::Mp4, 2.0, &policy))
 }
@@ -35,9 +36,9 @@ fn an_unsupported_step_falls_through_to_the_next() {
     };
     let done = Fake {
         name: "ffmpeg",
-        answer: || Ok(Attempt::Done(vec![frame()])),
+        answer: || DecodedClip::new(vec![frame()], 2.0).map(Attempt::Done),
     };
-    assert_eq!(run(&[&skip, &done]).expect("decodes").len(), 1);
+    assert_eq!(run(&[&skip, &done]).expect("decodes").frames().len(), 1);
 }
 
 #[test]
