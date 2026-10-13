@@ -51,16 +51,17 @@ impl Ffn {
     }
 }
 
-/// The gate unit's argument block for one token's inner row.
+/// The gate unit's argument block for `count` flat elements.
 ///
 /// `alpha` 1.0 and `limit` 0.0 are the only pair this model uses: the kernel
 /// scales by `alpha` unconditionally and skips the clamp pair when `limit` is at
-/// or below its epsilon, so the row comes out as `silu(gate) * up` with no extra
-/// factor. The two row offsets are zero because the caller hands each token a
-/// view already sliced to its own row.
-fn glu_args(intermediate: u32) -> GluArgs {
-    let width = i32::try_from(u64::from(intermediate)).unwrap_or(i32::MAX);
-    let row = u64::from(intermediate).saturating_mul(launch::F32_BYTES);
+/// or below its epsilon, so each element comes out as `silu(gate) * up` with no
+/// extra factor. The two offsets are zero because the caller hands views that
+/// start at the chunk's first row. The flat kernel reads no row stride; the
+/// strides are filled in as the whole run, which is what they describe.
+fn glu_args(count: u32) -> GluArgs {
+    let width = i32::try_from(u64::from(count)).unwrap_or(i32::MAX);
+    let row = u64::from(count).saturating_mul(launch::F32_BYTES);
     GluArgs {
         ne00: width,
         pad0: [0; 4],
@@ -126,22 +127,37 @@ pub(crate) fn relu2(
     .map_err(|err| launch::launch_failure(NAME, err))
 }
 
-/// Runs the activation over one token's inner row.
+/// Runs the activation over a chunk's inner rows in one launch.
 ///
-/// The kernel is flat: it takes its element index straight from the grid and
-/// reaches the row through the offsets in the argument block, so a chunk costs
-/// one launch per token rather than a taller grid. At decode that is one launch,
-/// and a prefill chunk trades an extra launch per token for a kernel with no row
-/// arithmetic in it.
-fn activation_row(
+/// The kernel is flat: it takes its element index straight from the grid, and
+/// the gate, up and output rows are all laid out `[n_tok][intermediate]`, so
+/// one flat index names the same element in all three and a chunk of any
+/// length is a single launch. It used to be one launch per token, which cost a
+/// 146-token prefill of a 32-layer model about 4,700 launches for no change in
+/// any value (measured on an M4).
+///
+/// # Errors
+///
+/// [`CoreError::ShapeMismatch`] when the chunk holds more elements than the
+/// kernel's 32-bit count can name, and [`CoreError::Backend`] when the launch
+/// fails.
+fn activation(
     backend: &dyn Backend,
     activation: Activation,
-    gate: DeviceView<'_>,
-    up: DeviceView<'_>,
-    dst: DeviceView<'_>,
+    (gate, up, dst): (DeviceView<'_>, DeviceView<'_>, DeviceView<'_>),
     intermediate: u32,
+    n_tok: u32,
 ) -> CoreResult<()> {
-    let args = glu_args(intermediate);
+    let total = u64::from(intermediate) * u64::from(n_tok);
+    let count = u32::try_from(total)
+        .ok()
+        .filter(|&count| i32::try_from(count).is_ok())
+        .ok_or(CoreError::ShapeMismatch {
+            field: "gated activation elements",
+            expected: u64::from(i32::MAX.unsigned_abs()),
+            got: total,
+        })?;
+    let args = glu_args(count);
     let kernel = activation_kernel(activation).ok_or(CoreError::Unsupported {
         what: "a gated activation row for an ungated activation",
         backend: "engine",
@@ -149,7 +165,7 @@ fn activation_row(
     launch::run(
         backend,
         kernel,
-        Extent3::linear(intermediate.div_ceil(BLOCK_LINEAR)),
+        Extent3::linear(count.div_ceil(BLOCK_LINEAR)),
         Extent3::new(BLOCK_LINEAR, 1, 1),
         0,
         &[
@@ -221,16 +237,17 @@ pub fn run(
         input,
         &[(&ffn.up, up_out), (gate, gate_out)],
     )?;
-    for itok in 0..n_tok {
-        let offset = u64::from(itok).saturating_mul(row_bytes);
-        activation_row(
-            backend,
-            activation,
-            gate_out.slice(offset, row_bytes)?,
-            up_out.slice(offset, row_bytes)?,
-            mid.slice(offset, row_bytes)?,
-            ffn.intermediate(),
-        )?;
-    }
+    let bytes = row_bytes.saturating_mul(u64::from(n_tok));
+    self::activation(
+        backend,
+        activation,
+        (
+            gate_out.slice(0, bytes)?,
+            up_out.slice(0, bytes)?,
+            mid.slice(0, bytes)?,
+        ),
+        ffn.intermediate(),
+        n_tok,
+    )?;
     projection::projection(backend, &ffn.down, n_tok, mid, block_out)
 }

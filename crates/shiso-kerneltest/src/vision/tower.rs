@@ -1347,3 +1347,198 @@ pub fn a_tensor_core_query_never_attends_across_a_group(gpu: &Gpu) {
         "the first group moved when a second joined it"
     );
 }
+
+// -- the simdgroup-matrix entries (Metal) -------------------------------------
+//
+// The Metal twin of the tensor-core path above: a tiled projection and a
+// one-pass attention on simdgroup matrices, both in f32 throughout. The host
+// resolves them and falls back to the scalar set when they are absent, so
+// only Metal runs these cases. The oracles are the scalar set's, at the
+// scalar set's tolerance: every operand stays f32, so the only difference
+// left is the order the sums associate in.
+
+/// The Metal-only entry points, which the pipeline check resolves beside
+/// [`ENTRIES`].
+pub const METAL_ENTRIES: [&str; 5] = [
+    "kernel_vit_gemm64_bias",
+    "kernel_vit_gemm64_bias_f16",
+    "kernel_vit_flash_attn_d64",
+    "kernel_vit_flash_attn_d72",
+    "kernel_vit_flash_attn_d80",
+];
+
+/// Rows, output width and reduction width of the tiled GEMM fixture: rows and
+/// columns past a whole 64-wide tile, so the edge guards run, and a reduction
+/// width that is whole 16-wide slices, as the tile requires.
+const TILE_M: usize = 70;
+const TILE_N: usize = 75;
+const TILE_K: usize = 48;
+/// Threads of the tiled GEMM and its output tile: `VIT_GEMM64_THREADS`,
+/// `VIT_GEMM64_TILE`.
+const TILE_THREADS: u32 = 128;
+const TILE_SIDE: u32 = 64;
+
+/// The tiled GEMM agrees with a row-times-column loop.
+pub fn the_tiled_gemm_agrees_with_a_row_times_column_loop(gpu: &Gpu) {
+    run_tiled_gemm(gpu, "kernel_vit_gemm64_bias");
+}
+
+/// The half-precision tower's tiled GEMM agrees with the same loop.
+pub fn the_half_precision_tiled_gemm_agrees_with_a_row_times_column_loop(gpu: &Gpu) {
+    run_tiled_gemm(gpu, "kernel_vit_gemm64_bias_f16");
+}
+
+/// Runs one tiled GEMM entry over its fixture, in the width the entry reads.
+fn run_tiled_gemm(gpu: &Gpu, entry: &'static str) {
+    let input = oracle::signal(TILE_M * TILE_K, 14);
+    let (weight_bytes, weight) = weight_fixture(entry, TILE_N * TILE_K, 15);
+    let (bias_bytes, bias) = weight_fixture(entry, TILE_N, 16);
+    let out = zeros(gpu, TILE_M * TILE_N);
+    let d_in = gpu.upload(&f32_bytes(&input));
+    let d_w = gpu.upload(&weight_bytes);
+    let d_b = gpu.upload(&bias_bytes);
+    let args = GemmArgs {
+        m: TILE_M as u32,
+        n: TILE_N as u32,
+        k: TILE_K as u32,
+    };
+    launch(
+        gpu,
+        entry,
+        Extent3::new(blocks(TILE_N, TILE_SIDE), blocks(TILE_M, TILE_SIDE), 1),
+        Extent3::linear(TILE_THREADS),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(d_in.view()),
+            KernelArg::Buffer(d_w.view()),
+            KernelArg::Buffer(d_b.view()),
+        ],
+    );
+    drain(gpu);
+    let mut want = vec![0.0f32; TILE_M * TILE_N];
+    for m in 0..TILE_M {
+        for n in 0..TILE_N {
+            let acc: f32 = (0..TILE_K)
+                .map(|k| input[m * TILE_K + k] * weight[n * TILE_K + k])
+                .sum();
+            want[m * TILE_N + n] = acc + bias[n];
+        }
+    }
+    close(&gpu.read_f32(&out), &want, entry);
+}
+
+/// A group longer than one 64-query block and not a multiple of the 32-key
+/// block, so the partial query block and the masked key block both run.
+const FLASH_PLANE: usize = 150;
+/// Query rows and threads of one flash threadgroup: `VIT_FLASH_QROWS`,
+/// `VIT_FLASH_THREADS`.
+const FLASH_QROWS: usize = 64;
+const FLASH_THREADS: u32 = 256;
+
+/// Runs one flash-attention entry over `rows` rows in groups of `plane`,
+/// `heads` heads of `head_dim`.
+fn run_flash(
+    gpu: &Gpu,
+    entry: &'static str,
+    (q, k, v): (&[f32], &[f32], &[f32]),
+    (rows, heads, head_dim, plane): (usize, usize, usize, usize),
+) -> Vec<f32> {
+    let out = zeros(gpu, rows * heads * head_dim);
+    let (d_q, d_k, d_v) = (
+        gpu.upload(&f32_bytes(q)),
+        gpu.upload(&f32_bytes(k)),
+        gpu.upload(&f32_bytes(v)),
+    );
+    let args = AttentionArgs {
+        rows: rows as u32,
+        heads: heads as u32,
+        head_dim: head_dim as u32,
+        plane: plane as u32,
+        scale: 1.0 / (head_dim as f32).sqrt(),
+    };
+    launch(
+        gpu,
+        entry,
+        Extent3::new(
+            ((rows / plane) * plane.div_ceil(FLASH_QROWS)) as u32,
+            heads as u32,
+            1,
+        ),
+        Extent3::linear(FLASH_THREADS),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(d_q.view()),
+            KernelArg::Buffer(d_k.view()),
+            KernelArg::Buffer(d_v.view()),
+        ],
+    );
+    drain(gpu);
+    gpu.read_f32(&out)
+}
+
+/// Every flash-attention instantiation agrees with the plain softmax across
+/// two temporal groups, a partial query block and a masked key block.
+pub fn the_flash_attention_agrees_with_a_plain_softmax(gpu: &Gpu) {
+    let heads = 2;
+    let rows = 2 * FLASH_PLANE;
+    for (entry, head_dim) in [
+        ("kernel_vit_flash_attn_d64", 64),
+        ("kernel_vit_flash_attn_d72", 72),
+        ("kernel_vit_flash_attn_d80", 80),
+    ] {
+        let dim = heads * head_dim;
+        // Scaled up so the softmax is peaked rather than nearly uniform: a
+        // flat distribution would hide an error in the maximum's bookkeeping.
+        let scaled = |seed| -> Vec<f32> {
+            oracle::signal(rows * dim, seed)
+                .iter()
+                .map(|v| v * 4.0)
+                .collect()
+        };
+        let (q, k, v) = (scaled(101), scaled(102), oracle::signal(rows * dim, 103));
+        let got = run_flash(
+            gpu,
+            entry,
+            (&q, &k, &v),
+            (rows, heads, head_dim, FLASH_PLANE),
+        );
+        let want = attention_oracle(&q, &k, &v, rows, heads, head_dim, FLASH_PLANE);
+        close(&got, &want, entry);
+    }
+}
+
+/// The first group's rows come out the same, bit for bit, whether or not a
+/// second group follows it: no query reads a key across the boundary.
+pub fn a_flash_query_never_attends_across_a_group(gpu: &Gpu) {
+    let (heads, head_dim) = (2, 72);
+    let dim = heads * head_dim;
+    let rows = 2 * FLASH_PLANE;
+    let (q, k, v) = (
+        oracle::signal(rows * dim, 104),
+        oracle::signal(rows * dim, 105),
+        oracle::signal(rows * dim, 106),
+    );
+    let entry = "kernel_vit_flash_attn_d72";
+    let both = run_flash(
+        gpu,
+        entry,
+        (&q, &k, &v),
+        (rows, heads, head_dim, FLASH_PLANE),
+    );
+    let first = FLASH_PLANE * dim;
+    let alone = run_flash(
+        gpu,
+        entry,
+        (&q[..first], &k[..first], &v[..first]),
+        (FLASH_PLANE, heads, head_dim, FLASH_PLANE),
+    );
+    assert_eq!(
+        both[..first],
+        alone[..],
+        "the first group moved when a second joined it"
+    );
+}

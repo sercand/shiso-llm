@@ -695,8 +695,7 @@ async fn prefixless_aliases_and_v1_suffixed_base_url() {
 
 /// The scoring endpoints ride the proxy like any other JSON endpoint:
 /// both path spellings reach the upstream as the canonical path, and the
-/// usage row parses in each wire's spelling (`prompt_tokens` on decisions,
-/// `input_tokens` on systemone).
+/// usage row parses from each wire's `input_tokens`.
 #[tokio::test]
 async fn scoring_endpoints_are_proxied_and_usage_logged() {
     let mock = MockServer::start().await;
@@ -704,8 +703,9 @@ async fn scoring_endpoints_are_proxied_and_usage_logged() {
         .and(path("/v1/decisions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "object": "decisions", "model": "gpt-test", "prompt_format_version": 1,
-            "answers": {"q1": {"type": "yes_no", "answer": "no", "probabilities": [0.02, 0.98], "label_mass": 1.0}},
-            "usage": {"prompt_tokens": 42, "completion_tokens": 0, "total_tokens": 42}
+            "answers": [{"type": "predicate", "name": "q1", "probability": 0.02, "label_mass": 1.0}],
+            "usage": {"input_tokens": 42, "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
+                      "output_tokens": 0, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 42}
         })))
         .expect(2)
         .mount(&mock)
@@ -733,7 +733,7 @@ async fn scoring_endpoints_are_proxied_and_usage_logged() {
             .client
             .post(router.url(path))
             .bearer_auth(&token)
-            .body(r#"{"model":"gpt-test","input":"the ticket","questions":[{"id":"q1","type":"yes_no","question":"Is this about billing?"}]}"#)
+            .body(r#"{"model":"gpt-test","input":"the ticket","questions":[{"name":"q1","type":"predicate","instructions":"Is this about billing?"}]}"#)
             .send()
             .await
             .unwrap();
@@ -752,8 +752,8 @@ async fn scoring_endpoints_are_proxied_and_usage_logged() {
             "/v1/systemone"
         ]
     );
-    // Both usage spellings normalize to the same row shape: decisions
-    // rows carry 42 (prompt_tokens), systemone rows 17 (input_tokens).
+    // Both wires' usage normalizes to the same row shape: decisions rows
+    // carry 42, systemone rows 17.
     let prompts: Vec<i64> = logs
         .iter()
         .map(|r| r["prompt_tokens"].as_i64().unwrap())

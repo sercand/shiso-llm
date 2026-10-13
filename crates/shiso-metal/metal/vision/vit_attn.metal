@@ -186,3 +186,192 @@ kernel void kernel_vit_attention(
         out[(uint64_t) n * dim + off + d] = (den > 0.0f) ? (num / den) : 0.0f;
     }
 }
+
+/// The same attention on simdgroup matrices, for a head `HD` wide: one pass
+/// over each temporal group's keys with an online softmax, everything in f32.
+///
+/// A threadgroup takes 64 query rows of one head - eight per simdgroup, held
+/// as 8x8 fragments - inside one temporal group, and streams that group's keys
+/// 32 at a time through threadgroup memory, the next block loading into
+/// registers while the current one is multiplied. A lane holds two columns of
+/// one row of each score fragment; the four lanes of a row (lane bits 0 and 3)
+/// fold the running maximum and denominator with two shuffles, and the value
+/// accumulators, laid out the same way, are rescaled lane by lane.
+///
+/// Queries, keys, values and probabilities stay f32 - nothing is narrowed on
+/// the way to a fragment - so a score is the scalar kernel's dot product
+/// summed in another order, and the softmax is the same max-subtracted form,
+/// accumulated block by block. Keys past the group's end are masked to -inf,
+/// so a group that is not a whole number of blocks needs no special case.
+/// Measured on an M4 over a 640x480 picture (1200 patch rows, 16 heads of 72):
+/// 58.8 ms a block for the per-row kernel above, 2.6 ms for this one.
+///
+/// grid `(groups * ceil(plane / 64), heads)`, block 256, no dynamic
+/// threadgroup memory.
+#define VIT_FLASH_PARAMS \
+        constant vit_args_attention & args [[buffer(0)]], \
+        device float *out                  [[buffer(1)]], \
+        device const float *q              [[buffer(2)]], \
+        device const float *k              [[buffer(3)]], \
+        device const float *v              [[buffer(4)]], \
+        uint3 tgpig[[threadgroup_position_in_grid]], \
+        ushort tid [[thread_index_in_threadgroup]], \
+        ushort lane [[thread_index_in_simdgroup]], \
+        ushort sg [[simdgroup_index_in_threadgroup]]
+
+template <uint HD>
+kernel void kernel_vit_flash_attn(VIT_FLASH_PARAMS) {
+    const uint QR = VIT_FLASH_QROWS;
+    const uint KB = VIT_FLASH_KEYS;
+    const uint NB = KB / 8u;
+    const uint NT = VIT_FLASH_THREADS;
+    const uint ND = HD / 8u;
+    // Each staged row padded by four floats so the transposed key loads do
+    // not land eight rows on one bank.
+    const uint LDK = HD + 4u;
+    threadgroup float kv[2u * VIT_FLASH_KEYS * (HD + 4u)];
+
+    const uint h = tgpig.y;
+    const uint tiles = (args.plane + QR - 1u) / QR;
+    const uint base = (tgpig.x / tiles) * args.plane;
+    const uint end = min(base + args.plane, args.rows);
+    const uint q0 = base + (tgpig.x % tiles) * QR;
+    if (h >= args.heads || base >= args.rows) {
+        return;
+    }
+    const uint dim = args.heads * HD;
+    const uint off = h * HD;
+    const float scale = args.scale;
+
+    // The lane's place in every 8x8 fragment: columns `fn, fn + 1` of row
+    // `fr`; the four lanes sharing a row differ in lane bits 0 and 3.
+    const ushort fn = ((lane / 4u) & 2u) * 2u + (lane % 2u) * 2u;
+    const ushort fr = ((lane / 4u) & 4u) + ((lane / 2u) % 4u);
+    const uint qrow = q0 + sg * 8u + fr;
+    const bool live = qrow < end;
+
+    // The query fragments, read straight into the lane's own elements (a
+    // fragment's element layout is the same for every element type).
+    simdgroup_float8x8 qf[ND];
+    simdgroup_float8x8 of[ND];
+    device const float *qp = q + (uint64_t) (live ? qrow : base) * dim + off;
+    VIT_UNROLL for (uint i = 0; i < ND; ++i) {
+        qf[i].thread_elements()[0] = live ? qp[8u * i + fn] : 0.0f;
+        qf[i].thread_elements()[1] = live ? qp[8u * i + fn + 1u] : 0.0f;
+        of[i] = simdgroup_float8x8(0.0f);
+    }
+
+    float run_max = -INFINITY;
+    float run_sum = 0.0f;
+    threadgroup float *sk = kv;
+    threadgroup float *sv = kv + KB * LDK;
+    // Four consecutive head values per load; a key past the group's end
+    // stages as zero and is masked below.
+    const uint HD4 = HD / 4u;
+    const uint SL = (KB * HD4 + NT - 1u) / NT;
+    float4 rk[SL];
+    float4 rv[SL];
+    auto fetch = [&](uint s0) {
+        VIT_UNROLL for (uint t = 0; t < SL; ++t) {
+            const uint e = tid + t * NT;
+            const uint j = e / HD4;
+            const uint d = (e - j * HD4) * 4u;
+            const uint s = s0 + j;
+            rk[t] = float4(0.0f);
+            rv[t] = float4(0.0f);
+            if (e < KB * HD4 && s < end) {
+                rk[t] = float4(*((device const packed_float4 *) (k + (uint64_t) s * dim + off + d)));
+                rv[t] = float4(*((device const packed_float4 *) (v + (uint64_t) s * dim + off + d)));
+            }
+        }
+    };
+    fetch(base);
+    for (uint s0 = base; s0 < end; s0 += KB) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        VIT_UNROLL for (uint t = 0; t < SL; ++t) {
+            const uint e = tid + t * NT;
+            if (e < KB * HD4) {
+                const uint j = e / HD4;
+                const uint d = (e - j * HD4) * 4u;
+                *((threadgroup float4 *) (sk + j * LDK + d)) = rk[t];
+                *((threadgroup float4 *) (sv + j * LDK + d)) = rv[t];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s0 + KB < end) {
+            fetch(s0 + KB);
+        }
+
+        // Scores: S (8 x KB) = Q (8 x HD) . K^T, one fragment per 8 keys.
+        simdgroup_float8x8 sf[NB];
+        VIT_UNROLL for (uint b = 0; b < NB; ++b) {
+            sf[b] = simdgroup_float8x8(0.0f);
+        }
+        VIT_UNROLL for (uint i = 0; i < ND; ++i) {
+            VIT_UNROLL for (uint b = 0; b < NB; ++b) {
+                simdgroup_float8x8 kt;
+                // kt(r, c) = K[8b + c][8i + r]: the transposed load.
+                simdgroup_load(kt, sk + 8u * b * LDK + 8u * i, LDK, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(sf[b], qf[i], kt, sf[b]);
+            }
+        }
+
+        float block_max = -INFINITY;
+        VIT_UNROLL for (uint b = 0; b < NB; ++b) {
+            VIT_UNROLL for (uint c = 0; c < 2u; ++c) {
+                const float score = sf[b].thread_elements()[c] * scale;
+                const bool real = s0 + 8u * b + fn + c < end;
+                sf[b].thread_elements()[c] = real ? score : -INFINITY;
+                block_max = max(block_max, sf[b].thread_elements()[c]);
+            }
+        }
+        block_max = max(block_max, simd_shuffle_xor(block_max, 1));
+        block_max = max(block_max, simd_shuffle_xor(block_max, 8));
+        const float new_max = max(run_max, block_max);
+        const float alpha = exp(run_max - new_max);
+        float block_sum = 0.0f;
+        VIT_UNROLL for (uint b = 0; b < NB; ++b) {
+            VIT_UNROLL for (uint c = 0; c < 2u; ++c) {
+                const float p = exp(sf[b].thread_elements()[c] - new_max);
+                sf[b].thread_elements()[c] = p;
+                block_sum += p;
+            }
+        }
+        block_sum += simd_shuffle_xor(block_sum, 1);
+        block_sum += simd_shuffle_xor(block_sum, 8);
+        run_sum = run_sum * alpha + block_sum;
+        run_max = new_max;
+
+        VIT_UNROLL for (uint i = 0; i < ND; ++i) {
+            of[i].thread_elements()[0] *= alpha;
+            of[i].thread_elements()[1] *= alpha;
+            VIT_UNROLL for (uint b = 0; b < NB; ++b) {
+                simdgroup_float8x8 vf;
+                simdgroup_load(vf, sv + 8u * b * LDK + 8u * i, LDK);
+                simdgroup_multiply_accumulate(of[i], sf[b], vf, of[i]);
+            }
+        }
+    }
+
+    // Normalize by the denominator and write each lane's two elements of
+    // every fragment straight to its row.
+    if (!live) {
+        return;
+    }
+    const float inv = 1.0f / run_sum;
+    device float *op = out + (uint64_t) qrow * dim + off;
+    VIT_UNROLL for (uint i = 0; i < ND; ++i) {
+        op[8u * i + fn] = of[i].thread_elements()[0] * inv;
+        op[8u * i + fn + 1u] = of[i].thread_elements()[1] * inv;
+    }
+}
+
+// One instantiation per head width a tower ships with: 64 and 80 beside the
+// 72 of the Qwen 3.5 towers. A wider head would need more than the 32 KiB of
+// threadgroup memory two f32 key blocks of 32 rows hold.
+template [[host_name("kernel_vit_flash_attn_d64")]]
+kernel void kernel_vit_flash_attn<64u>(VIT_FLASH_PARAMS);
+template [[host_name("kernel_vit_flash_attn_d72")]]
+kernel void kernel_vit_flash_attn<72u>(VIT_FLASH_PARAMS);
+template [[host_name("kernel_vit_flash_attn_d80")]]
+kernel void kernel_vit_flash_attn<80u>(VIT_FLASH_PARAMS);

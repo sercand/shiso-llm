@@ -17,8 +17,9 @@
 //!
 //! The scoring endpoints (`/v1/decisions`, `/v1/systemone`) are the other
 //! non-chat calls: the console sends the newest user turn as `input` (or
-//! the system prompt as `state`) plus the operator's `questions` JSON
-//! array, and shows one line per scored answer.
+//! the system prompt as `state`) plus the operator's questions, converted
+//! from the editor's one array into each wire's own spelling, and shows one
+//! line per scored answer.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -130,11 +131,11 @@ pub(crate) struct PlaygroundRequest {
     #[serde(default)]
     pub questions: Option<String>,
     /// The pictures to score, for the scoring endpoints: with any,
-    /// `/v1/decisions` sends `input` as a content-block array carrying the
-    /// turn's text and these bytes, and `/v1/systemone` sends them as
-    /// clef's `images` array of `{"content_type", "base64"}` items. Without
-    /// any, decisions sends the string form unchanged and systemone sends
-    /// no `images` key.
+    /// `/v1/decisions` sends `input` as one user message whose parts are the
+    /// turn's text and one `input_image` data URL per picture, and
+    /// `/v1/systemone` sends them as clef's `images` array of
+    /// `{"content_type", "base64"}` items. Without any, decisions sends the
+    /// string form and systemone sends no `images` key.
     #[serde(default)]
     pub images: Vec<Image>,
 }
@@ -143,16 +144,13 @@ pub(crate) struct PlaygroundRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Image {
-    /// Carried because the console sends it and `deny_unknown_fields` must
-    /// accept it; the content block it becomes names only the media type and
-    /// the bytes, so nothing here reads the name.
-    #[expect(
-        dead_code,
-        reason = "accepted from the console's request shape; the content block it becomes carries only the media type and the bytes"
-    )]
+    /// The picked file's name. Neither wire carries it; it names the file
+    /// in a refusal.
     pub filename: String,
-    /// The file's MIME type; defaults to `application/octet-stream`, which
-    /// the server accepts since it sniffs the bytes anyway.
+    /// The file's MIME type. System One defaults a missing one to
+    /// `application/octet-stream`, since its server sniffs the bytes; the
+    /// decisions data URL needs an `image/` type and refuses the file
+    /// without one.
     #[serde(default)]
     pub content_type: Option<String>,
     /// The file's bytes, standard base64.
@@ -441,32 +439,25 @@ fn build_body(req: &PlaygroundRequest) -> Result<Value, AppError> {
             // Not a conversation either: the newest user turn is the
             // input; the questions come from the console's own field.
             // Temperature is a decisions knob, so it is forwarded. With
-            // picked images the input becomes a content-block array - the
-            // turn's text first, then one base64 block per picture, since
-            // a string input cannot carry one; without images the string
-            // form goes out byte-identical to before the picker existed.
+            // picked images the input becomes the wire's message form - one
+            // user message, the turn's text first, then one `input_image`
+            // data URL per picture, since a string input cannot carry one;
+            // without images it is the plain string.
             let input = newest_user(req, "decisions")?;
             let input_value = if req.images.is_empty() {
                 json!(input.content)
             } else {
-                let mut blocks = vec![json!({"type": "text", "text": input.content})];
-                blocks.extend(req.images.iter().map(|image| {
-                    json!({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": image
-                                .content_type
-                                .as_deref()
-                                .unwrap_or("application/octet-stream"),
-                            "data": image.data,
-                        },
-                    })
-                }));
-                Value::Array(blocks)
+                let mut parts = vec![json!({"type": "input_text", "text": input.content})];
+                for image in &req.images {
+                    parts.push(json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{};base64,{}", image_media_type(image)?, image.data),
+                    }));
+                }
+                json!([{"role": "user", "content": parts}])
             };
             obj.insert("input".into(), input_value);
-            obj.insert("questions".into(), parse_questions(req)?);
+            obj.insert("questions".into(), decisions_questions(req)?);
             if let Some(t) = req.temperature {
                 obj.insert("temperature".into(), json!(t));
             }
@@ -538,6 +529,92 @@ fn parse_questions(req: &PlaygroundRequest) -> Result<Value, AppError> {
         ));
     }
     Ok(parsed)
+}
+
+/// A picked image's media type, which the decisions wire spells inside its
+/// data URL and requires to be `image/<subtype>`. A file the browser could
+/// not type is refused by name rather than sent as a guess the server would
+/// refuse with a less useful message.
+fn image_media_type(image: &Image) -> Result<&str, AppError> {
+    image
+        .content_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| t.len() > "image/".len() && t.starts_with("image/") && !t.contains([';', ',']))
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "image {:?} has no image media type ({:?}); the decisions wire needs one",
+                image.filename,
+                image.content_type.as_deref().unwrap_or("")
+            ))
+        })
+}
+
+/// The console's editor array as the official decisions questions array:
+/// `id` becomes `name`, `yes_no` becomes `predicate`, `question` becomes
+/// `instructions`, `options` become `choices`, and each `levels` label
+/// becomes a `{"label"}` level. A blank id is already dropped by the page,
+/// which leaves the question answering by position. Keys the conversion does
+/// not consume pass through untouched for the server's `deny_unknown_fields`
+/// to judge; an unknown `type` is the console's own 400, since it has no
+/// official spelling to convert to.
+fn decisions_questions(req: &PlaygroundRequest) -> Result<Value, AppError> {
+    let parsed = parse_questions(req)?;
+    let entries = parsed.as_array().expect("parse_questions returns an array");
+    let mut questions = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let fields = entry.as_object().ok_or_else(|| {
+            AppError::BadRequest(format!("questions[{index}] must be a JSON object"))
+        })?;
+        let wire_type = match fields.get("type").and_then(Value::as_str) {
+            Some("yes_no") => "predicate",
+            Some("choice") => "choice",
+            Some("score") => "score",
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "questions[{index}] has unknown type {other:?} (expected yes_no, choice or score)"
+                )));
+            }
+        };
+        let mut out = Map::new();
+        if let Some(id) = fields.get("id") {
+            out.insert("name".into(), id.clone());
+        }
+        out.insert("type".into(), json!(wire_type));
+        if let Some(question) = fields.get("question") {
+            out.insert("instructions".into(), question.clone());
+        }
+        if let Some(options) = fields.get("options") {
+            out.insert("choices".into(), options.clone());
+        }
+        if let Some(levels) = fields.get("levels") {
+            // A bare string is the editor's spelling of a level's label; any
+            // other shape rides as written for the server to judge.
+            let levels = match levels {
+                Value::Array(items) => Value::Array(
+                    items
+                        .iter()
+                        .map(|item| match item {
+                            Value::String(label) => json!({"label": label}),
+                            other => other.clone(),
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            };
+            out.insert("levels".into(), levels);
+        }
+        for (key, value) in fields {
+            if !matches!(
+                key.as_str(),
+                "id" | "type" | "question" | "options" | "levels"
+            ) {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+        questions.push(Value::Object(out));
+    }
+    Ok(Value::Array(questions))
 }
 
 /// The console's editor array as the official System One questions map:
@@ -913,11 +990,39 @@ fn extract_text(path: &str, body: &Value) -> Option<String> {
             let count = body["data"].as_array().map_or(1, Vec::len);
             Some(format!("{count} embedding vector(s), {dims} dimensions"))
         }
+        // One line per answer, in question order: the chosen value, a
+        // predicate's yes probability, or the expected score - whichever the
+        // answer carries. An unnamed question answers by position.
+        DECISIONS => {
+            let answers = body["answers"].as_array()?;
+            let lines: Vec<String> = answers
+                .iter()
+                .enumerate()
+                .map(|(index, ans)| {
+                    let name = ans["name"]
+                        .as_str()
+                        .map_or_else(|| format!("#{}", index + 1), str::to_string);
+                    let shown = match ans["type"].as_str() {
+                        Some("predicate") => ans["probability"]
+                            .as_f64()
+                            .map(|p| format!("P(yes) {p:.3}")),
+                        Some("choice") => match &ans["choice"] {
+                            Value::String(s) => Some(s.clone()),
+                            Value::Null => None,
+                            other => Some(other.to_string()),
+                        },
+                        Some("score") => ans["score"].as_f64().map(|s| format!("{s:.3}")),
+                        _ => None,
+                    };
+                    format!("{name}: {}", shown.as_deref().unwrap_or("?"))
+                })
+                .collect();
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        }
         // One line per answer, in request order (the answers object is
-        // insertion-ordered): the chosen label, the yes/no word, or the
-        // expected score — whichever the answer carries. A System One
-        // noul answer's number is shown as-is.
-        DECISIONS | SYSTEMONE => {
+        // insertion-ordered): the chosen label or the expected score, and a
+        // noul answer's yes probability as-is.
+        SYSTEMONE => {
             let answers = body["answers"].as_object()?;
             let lines: Vec<String> = answers
                 .iter()
@@ -1190,11 +1295,43 @@ mod tests {
         let b = build_body(&r).unwrap();
         assert_eq!(b["model"], "m");
         assert_eq!(b["input"], "again", "the newest user turn is the input");
-        assert_eq!(b["questions"].as_array().unwrap().len(), 2);
-        assert_eq!(b["questions"][0]["id"], "q1");
+        assert_eq!(
+            b["questions"],
+            json!([
+                {"name": "q1", "type": "predicate", "instructions": "Is this about billing?"},
+                {"name": "q2", "type": "choice", "instructions": "What is it?",
+                 "choices": ["a bug", "a feature"]},
+            ]),
+            "the editor's array in the official decisions spelling"
+        );
         assert_eq!(b["temperature"], 0.5);
         assert!(b.get("messages").is_none());
         assert!(b.get("max_tokens").is_none(), "scoring generates nothing");
+    }
+
+    #[test]
+    fn decisions_questions_spell_levels_as_label_objects_and_keep_extras() {
+        let mut r = req(DECISIONS);
+        r.questions = Some(
+            r#"[{"type":"score","question":"How urgent?","levels":["low","high"]},
+                {"id":"x","type":"choice","question":"Which?","options":["a","b"],"extra":1}]"#
+                .into(),
+        );
+        let b = build_body(&r).unwrap();
+        assert_eq!(
+            b["questions"],
+            json!([
+                {"type": "score", "instructions": "How urgent?",
+                 "levels": [{"label": "low"}, {"label": "high"}]},
+                {"name": "x", "type": "choice", "instructions": "Which?",
+                 "choices": ["a", "b"], "extra": 1},
+            ]),
+            "no id answers by position; an unknown key rides for the server to refuse"
+        );
+
+        r.questions = Some(r#"[{"type":"noul","question":"?"}]"#.into());
+        let err = build_body(&r).unwrap_err().to_string();
+        assert!(err.contains("unknown type"), "{err}");
     }
 
     #[test]
@@ -1231,56 +1368,43 @@ mod tests {
     }
 
     #[test]
-    fn build_body_composes_text_and_image_blocks_for_decisions() {
+    fn build_body_sends_decisions_images_as_one_user_message() {
         let mut r = with_questions(DECISIONS);
         r.images = two_images();
         validate(&r).unwrap();
         let b = build_body(&r).unwrap();
-        let input = b["input"]
-            .as_array()
-            .expect("with images the input is blocks");
+        let encoded = |index: usize| {
+            base64::engine::general_purpose::STANDARD.encode(format!("bytes-{index}"))
+        };
         assert_eq!(
-            input.len(),
-            3,
-            "the turn's text leads, then one block per picture"
+            b["input"],
+            json!([{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "again"},
+                    {"type": "input_image", "image_url": format!("data:image/png;base64,{}", encoded(0))},
+                    {"type": "input_image", "image_url": format!("data:image/jpeg;base64,{}", encoded(1))},
+                ],
+            }]),
+            "the turn's text leads, then one data URL per picture"
         );
-        assert_eq!(input[0], json!({"type": "text", "text": "again"}));
-        for (index, name) in (1..=2).zip(["a.png", "b.jpg"]) {
-            let want_data =
-                base64::engine::general_purpose::STANDARD.encode(format!("bytes-{}", index - 1));
-            assert_eq!(
-                input[index],
-                json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": if name == "a.png" { "image/png" } else { "image/jpeg" },
-                        "data": want_data,
-                    },
-                }),
-                "block {index} is {name}"
-            );
-        }
-        // A file the browser named no MIME type for still spells a
-        // media_type; the server sniffs the bytes anyway.
+
+        // A file the browser named no image type for cannot be spelled as a
+        // data URL, and is refused by name.
         let mut r = with_questions(DECISIONS);
         r.images = vec![Image {
-            filename: "x".into(),
-            content_type: None,
+            filename: "x.bin".into(),
+            content_type: Some("application/octet-stream".into()),
             data: "aGk=".into(),
         }];
-        let b = build_body(&r).unwrap();
-        assert_eq!(
-            b["input"][1]["source"]["media_type"],
-            "application/octet-stream"
-        );
+        let err = build_body(&r).unwrap_err().to_string();
+        assert!(err.contains("x.bin"), "{err}");
     }
 
     #[test]
     fn build_body_without_images_sends_the_string_form() {
         // The golden the server's own container tests lean on: no images,
-        // no change - `input` is the newest user turn's string, byte for
-        // byte as before the picker existed.
+        // no change - `input` is the newest user turn's string.
         let r = with_questions(DECISIONS);
         let b = build_body(&r).unwrap();
         assert_eq!(b["input"], json!("again"));
@@ -1440,14 +1564,16 @@ mod tests {
 
     #[test]
     fn extracts_scoring_answers_one_line_each_in_order() {
-        let decisions = json!({"answers": {
-            "q1": {"type": "yes_no", "answer": "no", "probabilities": [0.02, 0.98]},
-            "q2": {"type": "choice", "choice": "a bug", "probabilities": [0.9, 0.1]},
-            "q3": {"type": "score", "score": 1.75, "legend": ["0", "1", "2"]}
-        }});
+        let decisions = json!({"object": "decisions", "answers": [
+            {"type": "predicate", "name": "q1", "probability": 0.0213, "label_mass": 1.0},
+            {"type": "choice", "name": "q2", "choice": "a bug",
+             "probabilities": [{"value": "a bug", "probability": 0.9}], "confidence": 1.0},
+            {"type": "score", "name": null, "score": 1.75,
+             "probabilities": [{"value": 0, "label": "low", "probability": 0.1}]}
+        ]});
         assert_eq!(
             extract_text(DECISIONS, &decisions).as_deref(),
-            Some("q1: no\nq2: a bug\nq3: 1.75")
+            Some("q1: P(yes) 0.021\nq2: a bug\n#3: 1.750")
         );
 
         // A System One noul answer carries the yes probability under `noul`.
@@ -1462,7 +1588,7 @@ mod tests {
 
         // An error body or an answers-less reply degrades to no text.
         assert_eq!(extract_text(DECISIONS, &json!({"error": {}})), None);
-        assert_eq!(extract_text(DECISIONS, &json!({"answers": {}})), None);
+        assert_eq!(extract_text(DECISIONS, &json!({"answers": []})), None);
     }
 
     #[test]
