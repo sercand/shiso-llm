@@ -226,6 +226,10 @@ fn audio_sent_to_a_checkpoint_with_no_audio_tower_is_refused() {
     );
 }
 
+// Without `decode-native` no step reads mp3, so the refusal is "no decoder".
+// With it, symphonia reads mp3 and these bytes (a tag and no frames) are
+// refused as malformed instead; `shiso-audio`'s own tests cover that.
+#[cfg(not(feature = "decode-native"))]
 #[test]
 fn an_mp3_no_decoder_handles_is_refused_naming_the_way_out() {
     let tower = stand();
