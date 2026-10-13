@@ -107,11 +107,45 @@ async fn a_request_whose_caller_left_does_not_absorb_the_next_report() {
     drop(engine.generate(request(3)).await.expect("accepted"));
     let id = run_turn(&engine).await;
 
-    let names = reports(dir.path(), 1).await;
+    // The abandoned request is written under its own name, so the served
+    // one's report holds only its own kernels.
+    let names = reports(dir.path(), 2).await;
+    assert_eq!(names.len(), 2, "{names:?}");
     assert!(
         names
             .iter()
             .any(|name| name.ends_with(&format!("-{id}.json"))),
         "the served request has its own report: {names:?}"
     );
+}
+
+#[tokio::test]
+async fn queued_requests_each_get_their_own_report() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (engine, _join, _audit) =
+        common::scheduled_engine(vec![10, 11, 12, 13, 14, 15], profiled_cfg(dir.path()), None);
+
+    // Both are queued before either is read, so the second is admitted by the
+    // same loop pass that retires the first.
+    let first = engine.generate(request(3)).await.expect("accepted");
+    let second = engine.generate(request(3)).await.expect("accepted");
+    let mut ids = Vec::new();
+    for mut stream in [first, second] {
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::Start { id, .. } = event {
+                ids.push(id);
+            }
+        }
+    }
+    assert_eq!(ids.len(), 2);
+
+    let names = reports(dir.path(), 2).await;
+    for id in &ids {
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with(&format!("-{id}.json"))),
+            "no report of its own for {id}: {names:?}"
+        );
+    }
 }

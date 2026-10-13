@@ -2136,11 +2136,15 @@ impl Coordinator {
     }
 
     /// Opens a profile region for the request being admitted, when
-    /// `--profile-dir` is set and none is open.
+    /// `--profile-dir` is set.
+    ///
+    /// A region still open here belongs to a request that already ended: under
+    /// the one sequence `--profile-dir` requires, a request is only admitted
+    /// into an empty table, and a queued request is admitted by the same loop
+    /// pass that retired the last one, before the empty-table settle runs. So
+    /// it is written first, or the two requests' kernels would share a report.
     fn profile_begin(&mut self) {
-        if self.profiling.is_some() {
-            return;
-        }
+        self.profile_settle();
         if let Some(sink) = self.cfg.profile.as_ref() {
             self.profiled += 1;
             self.profiling = sink.begin(format!("pending-{}", self.profiled));
