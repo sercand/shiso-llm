@@ -116,6 +116,9 @@ hex = "0.4"
 # --- vision --------------------------------------------------------------
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 base64 = "0.22"
+# Matroska/WebM demux for the in-process video decoders. Pure Rust,
+# forbid(unsafe_code), no dependencies; Zlib OR MIT OR Apache-2.0.
+matroska-demuxer = "0.8"
 
 # --- dev -----------------------------------------------------------------
 tempfile = "3"

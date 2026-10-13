@@ -15,23 +15,39 @@
 //! not recognise, including a fragmented file (whose `moof` boxes carry their
 //! own offsets) and any box that does not parse, is passed through untouched
 //! for the decoder to accept or refuse as before.
+//!
+//! The box walker itself ([`boxes`], [`header`]) is shared with the in-house
+//! demuxer in [`crate::demux`], which is always compiled; only the remux is
+//! tied to the ffmpeg step, because only a decoder reading a pipe needs it.
 
+#[cfg(feature = "decode-ffmpeg")]
 use std::borrow::Cow;
 
-/// One top-level box: where it starts and how long it is, header included.
+/// One box: where it starts and how long it is, header included.
 #[derive(Debug, Clone, Copy)]
-struct Span {
-    kind: [u8; 4],
-    start: usize,
-    len: usize,
+pub(crate) struct Span {
+    pub(crate) kind: [u8; 4],
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+}
+
+impl Span {
+    /// Where the box ends, one past its last byte.
+    ///
+    /// Cannot overflow: [`boxes`] only builds spans whose end it has already
+    /// checked against the buffer.
+    pub(crate) fn end(self) -> usize {
+        self.start.saturating_add(self.len)
+    }
 }
 
 /// Containers on the path from `moov` to the chunk-offset tables.
+#[cfg(feature = "decode-ffmpeg")]
 const CONTAINERS: [&[u8; 4]; 5] = [b"moov", b"trak", b"mdia", b"minf", b"stbl"];
 
 /// The boxes laid end to end in `bytes[from..to]`, or `None` when they do not
 /// tile it exactly.
-fn boxes(bytes: &[u8], from: usize, to: usize) -> Option<Vec<Span>> {
+pub(crate) fn boxes(bytes: &[u8], from: usize, to: usize) -> Option<Vec<Span>> {
     let mut out = Vec::new();
     let mut at = from;
     while at < to {
@@ -60,8 +76,8 @@ fn boxes(bytes: &[u8], from: usize, to: usize) -> Option<Vec<Span>> {
 }
 
 /// Header bytes of a box: eight, or sixteen with a 64-bit size.
-fn header(bytes: &[u8], span: Span) -> usize {
-    if bytes[span.start..span.start + 4] == [0, 0, 0, 1] {
+pub(crate) fn header(bytes: &[u8], span: Span) -> usize {
+    if bytes.get(span.start..span.start.saturating_add(4)) == Some(&[0, 0, 0, 1]) {
         16
     } else {
         8
@@ -70,6 +86,7 @@ fn header(bytes: &[u8], span: Span) -> usize {
 
 /// Adds `shift` to every chunk offset under `span`, in place; `None` when a
 /// table does not parse or an offset would leave the media.
+#[cfg(feature = "decode-ffmpeg")]
 fn patch(moov: &mut [u8], span: Span, shift: u64, media: (u64, u64)) -> Option<()> {
     let body = span.start + header(moov, span);
     if CONTAINERS.contains(&&span.kind) {
@@ -115,6 +132,7 @@ fn patch(moov: &mut [u8], span: Span, shift: u64, media: (u64, u64)) -> Option<(
 /// `bytes` with a trailing `moov` moved ahead of the first `mdat` and its
 /// chunk offsets shifted to match; `bytes` itself when the index already
 /// leads, the file is fragmented, or anything fails to parse.
+#[cfg(feature = "decode-ffmpeg")]
 pub(crate) fn faststart(bytes: &[u8]) -> Cow<'_, [u8]> {
     match reorder(bytes) {
         Some(moved) => Cow::Owned(moved),
@@ -122,6 +140,7 @@ pub(crate) fn faststart(bytes: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+#[cfg(feature = "decode-ffmpeg")]
 fn reorder(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.get(4..8)? != b"ftyp" {
         return None;
@@ -166,6 +185,6 @@ fn reorder(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "decode-ffmpeg"))]
 #[path = "mp4_tests.rs"]
 mod tests;
