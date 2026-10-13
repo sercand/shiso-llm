@@ -75,6 +75,11 @@ fn fixture(name: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&text).ok()
 }
 
+/// A token id or a width as a host index.
+fn index(value: u64) -> usize {
+    usize::try_from(value).expect("an index fits the host")
+}
+
 fn container(var: &str) -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var(var).ok()?);
     path.is_file().then_some(path)
@@ -99,7 +104,7 @@ fn load(path: &Path) -> Loaded {
     let config = Lfm2Config::from_gguf(&file).expect("the container's geometry");
     drop(file);
     let model = Lfm2Model::load(&backend, path, &config, options()).expect("the container loads");
-    let vocab = config.shape().vocab as usize;
+    let vocab = index(u64::from(config.shape().vocab));
     Loaded {
         backend,
         model,
@@ -173,7 +178,7 @@ fn grade(var: &str, reference_name: &str, budget: f64) {
         let name = case["name"].as_str().expect("a name");
         let have = logz(&mut loaded, &[&ids(case)]);
         let top = case["top"].as_array().expect("top");
-        let want_top = top[0][0].as_u64().expect("an id") as usize;
+        let want_top = top[0][0].as_u64().map(index).expect("an id");
         let have_top = have
             .iter()
             .enumerate()
@@ -196,7 +201,7 @@ fn grade(var: &str, reference_name: &str, budget: f64) {
             if want < -12.0 {
                 continue;
             }
-            worst = worst.max((have[id as usize] - want).abs());
+            worst = worst.max((have[index(id)] - want).abs());
         }
         report(&format!(
             "{var} vs {reference_name} {name}: top-1 {have_top} (reference {want_top}), worst |dlogp| {worst:.4}"
