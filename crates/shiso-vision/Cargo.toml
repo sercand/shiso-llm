@@ -7,6 +7,17 @@ license.workspace = true
 publish = false
 description = "shiso: host vision pipeline - image/video preprocess, both-tower weight loaders, encoder driver."
 
+[features]
+# Neither feature is on by default: a dependent that wants a decoder asks for
+# one, so a native-only server cannot have ffmpeg switched back on by feature
+# unification. See docs/specs/native-media-decoding.md.
+#
+# The ffmpeg subprocess step. It still only runs when the operator names a
+# binary.
+decode-ffmpeg = []
+# The pure-Rust and library decoders that add build time.
+decode-native = []
+
 [dependencies]
 # The kernel argument blocks are `#[repr(C)]` structs marshalled through
 # `bytemuck`, so their layout comes from the struct definition rather than from

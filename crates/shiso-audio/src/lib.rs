@@ -27,7 +27,7 @@ mod vocab;
 mod wav;
 
 pub use context::{Context, ContextEncoder, ContextIds, is_echo, keyword_words};
-pub use decode::{DecodeLimits, decode_audio, sniff_container};
+pub use decode::{AudioDecodePolicy, DecodeLimits, decode_audio, sniff_container};
 pub use diarizer::{DiarizationPass, Diarizer};
 pub use error::AudioError;
 pub use mel::{

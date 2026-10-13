@@ -16,9 +16,10 @@ mod worker;
 
 use std::sync::Arc;
 
+use shiso_audio::AudioDecodePolicy;
 use shiso_ir::{EmbedRequest, EmbedResponse, EmbedUsage};
 use shiso_models::embedder::{EmbedError, EmbedFrontend, EmbedPart, Embedder, EmbedderInfo};
-use shiso_vision::{FfmpegPolicy, ImageLimits};
+use shiso_vision::{ImageLimits, VideoDecodePolicy};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::AppError;
@@ -36,12 +37,12 @@ pub struct MediaRules {
     /// Whether an http or https address may be named. This build fetches
     /// nothing either way; the flag only changes which refusal is given.
     pub allow_remote: bool,
-    /// The subprocess video decoder, or `None` when only GIF is read.
-    pub video_ffmpeg: Option<FfmpegPolicy>,
+    /// The video decode chain's policy, or `None` when only GIF is read.
+    pub video_decode: Option<VideoDecodePolicy>,
     /// Decode limits for one audio clip.
     pub audio_limits: shiso_audio::DecodeLimits,
-    /// The subprocess audio decoder, or `None` when only WAV is read.
-    pub audio_ffmpeg: Option<FfmpegPolicy>,
+    /// How audio other than WAV is decoded.
+    pub audio_decode: AudioDecodePolicy,
 }
 
 /// What the worker thread is started with.

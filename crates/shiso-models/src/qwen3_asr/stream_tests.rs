@@ -340,7 +340,8 @@ fn the_whole_stream_matches_one_shot_transcription() {
         .join("../../test-vectors/references/audio/clips/speech-en.wav");
     let bytes = std::fs::read(&wav).expect("the clip");
     let limits = DecodeLimits::new(std::num::NonZeroU32::new(600).expect("non-zero"));
-    let pcm = decode_audio(&bytes, &limits, None).expect("decodes");
+    let pcm =
+        decode_audio(&bytes, &limits, &shiso_audio::AudioDecodePolicy::default()).expect("decodes");
 
     // One shot: the whole clip framed and floored at once, one prompt.
     let m = &asr.model;

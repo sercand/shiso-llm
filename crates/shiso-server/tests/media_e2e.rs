@@ -342,7 +342,7 @@ fn with_audio(
             tower,
             placement,
             args.audio_limits(),
-            args.audio_ffmpeg_policy(),
+            args.audio_decode_policy(),
         ),
         None => renderer,
     }
@@ -442,7 +442,7 @@ impl Stack {
         // thing the patch rows are about to be fed to, and this is the path the
         // binary takes when one is open.
         .with_tower(tower.preprocess(), placement, args.image_limits())
-        .with_video(args.ffmpeg_policy(), args.video_fps)
+        .with_video(args.video_decode_policy(), args.video_fps)
         // Thinking off, and the reason is about what is being measured: with it
         // on, a budget of a few dozen tokens is spent entirely inside the
         // thinking block, and what the pair of answers would be compared on is

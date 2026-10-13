@@ -527,7 +527,7 @@ fn service_with(shape: &ServiceShape<'_>) -> AudioService {
         max_streams,
         queue,
         limits: crate::tokenizer::message_preprocess::DEFAULT_AUDIO_LIMITS,
-        ffmpeg: None,
+        decode: shiso_audio::AudioDecodePolicy::default(),
         max_upload_bytes,
         offline_min_secs,
         skip_silence,

@@ -20,9 +20,12 @@
 //!   type with a temporal extent above one. One type for both, because a still
 //!   is genuinely the degenerate video: the tower's patch dimension spans
 //!   several frames whether or not the input moves.
-//! - [`FfmpegPolicy`] and [`probe`] are the subprocess decode backend. It is
-//!   off unless a caller hands a policy over, and [`Option::None`] IS the off
-//!   state, so no value exists that means "configured but disabled".
+//! - [`VideoDecodePolicy`] and [`run_chain`] are the video decode chain: OS
+//!   decoder, then pure-Rust decoder, then the ffmpeg subprocess (`FfmpegPolicy`
+//!   and `probe`, under the `decode-ffmpeg` feature), each only where the
+//!   build has it. It is off unless a caller hands a policy over, and
+//!   [`Option::None`] IS the off state, so no value exists that means
+//!   "configured but disabled".
 //! - [`VisionTower`] is the contract a family's tower meets and the server
 //!   consumes, and [`MediaPlacement`] is what that family's template writes for
 //!   a picture. Both are here rather than in the server because a server that
@@ -55,13 +58,16 @@
 //! travelling as a buffer and a shape that must be kept in step.
 #![forbid(unsafe_code)]
 
+mod chain;
 mod config;
 mod container;
 mod error;
+#[cfg(feature = "decode-ffmpeg")]
 mod ffmpeg;
 pub mod generator;
 mod image;
 mod item;
+#[cfg(feature = "decode-ffmpeg")]
 mod mp4;
 pub mod shard;
 mod tower;
@@ -72,9 +78,11 @@ mod generator_tests;
 #[cfg(test)]
 mod testing;
 
+pub use chain::{Attempt, StepInput, VideoDecodePolicy, VideoStep, run_chain};
 pub use config::{ImageLimits, PatchGeometry, PreprocessSpec, Resample, ResizeRule};
 pub use container::{VisionSource, open_checkpoint, open_gguf};
 pub use error::{Container, ShardFault, VisionError};
+#[cfg(feature = "decode-ffmpeg")]
 pub use ffmpeg::{Availability, FfmpegPolicy, decode_frames, probe, run_decoder};
 pub use generator::{
     GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat,

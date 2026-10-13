@@ -55,7 +55,7 @@ fn a_bare_serve_takes_the_documented_defaults() {
     assert!(!args.mtp_exact_sampling);
     assert!(args.kvstore_dir.is_none());
     assert!(args.vision.is_none());
-    assert!(!args.video_allow_ffmpeg);
+    assert!(!args.video_allow_decode);
     assert!(!args.vision_allow_remote_images);
 }
 
@@ -284,21 +284,63 @@ fn a_servable_command_line_validates() {
 #[test]
 fn the_video_flags_become_a_policy_only_when_decoding_is_allowed() {
     let off = parse(&["--model", "m.gguf"]).expect("it parses");
-    assert!(off.ffmpeg_policy().is_none());
+    assert!(off.video_decode_policy().is_none());
 
     let on = parse(&[
         "--model",
         "m.gguf",
-        "--video-allow-ffmpeg",
+        "--video-allow-decode",
         "--video-max-frames",
         "32",
         "--video-decode-timeout-s",
         "5",
     ])
     .expect("it parses");
-    let policy = on.ffmpeg_policy().expect("decoding is allowed");
+    let policy = on.video_decode_policy().expect("decoding is allowed");
     assert_eq!(policy.max_frames(), 32);
     assert_eq!(policy.timeout_secs(), 5);
+    // Allowing decode does not by itself reach for ffmpeg: that needs a path.
+    #[cfg(feature = "decode-ffmpeg")]
+    assert!(policy.ffmpeg().is_none());
+}
+
+/// ffmpeg is reachable only when the operator names a binary, and the one flag
+/// covers video and audio alike.
+#[cfg(feature = "decode-ffmpeg")]
+#[test]
+fn ffmpeg_exists_only_when_a_path_is_given() {
+    let none = parse(&["--model", "m.gguf", "--video-allow-decode"]).expect("it parses");
+    assert!(none.ffmpeg_path.is_none(), "there is no default binary");
+    assert!(none.audio_decode_policy().ffmpeg().is_none());
+
+    let some = parse(&[
+        "--model",
+        "m.gguf",
+        "--video-allow-decode",
+        "--ffmpeg-path",
+        "/opt/ffmpeg",
+    ])
+    .expect("it parses");
+    let video = some.video_decode_policy().expect("decoding is allowed");
+    let ffmpeg = video.ffmpeg().expect("a path was given");
+    assert_eq!(ffmpeg.binary(), std::path::Path::new("/opt/ffmpeg"));
+    assert!(some.audio_decode_policy().ffmpeg().is_some());
+}
+
+/// The flags this change replaced are refused, not aliased: an operator whose
+/// unit file still passes one learns at boot that its meaning changed.
+#[test]
+fn the_removed_ffmpeg_flags_are_refused() {
+    for flag in [
+        "--video-allow-ffmpeg",
+        "--audio-allow-ffmpeg",
+        "--video-ffmpeg-path=ffmpeg",
+    ] {
+        assert!(
+            parse(&["--model", "m.gguf", flag]).is_err(),
+            "{flag} must be a parse error"
+        );
+    }
 }
 
 #[test]
@@ -333,7 +375,9 @@ fn every_documented_flag_declares_its_prefixed_environment_fallback() {
         "SHISO_KVSTORE_BUDGET_MB",
         "SHISO_SPEC_K",
         "SHISO_VISION",
-        "SHISO_VIDEO_ALLOW_FFMPEG",
+        "SHISO_VIDEO_ALLOW_DECODE",
+        #[cfg(feature = "decode-ffmpeg")]
+        "SHISO_FFMPEG_PATH",
         "SHISO_GENERATION_CONFIG",
         "SHISO_SOLO_PREFILL_CHUNK",
         "SHISO_MIXED_PREFILL_QUANTUM",
@@ -366,7 +410,7 @@ fn the_help_lists_every_flag_an_operator_is_told_about() {
         "--kvstore-dir",
         "--kvstore-budget-mb",
         "--vision",
-        "--video-allow-ffmpeg",
+        "--video-allow-decode",
         "--generation-config",
     ] {
         assert!(help.contains(flag), "{flag} is missing from the help");

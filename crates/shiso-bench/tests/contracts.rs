@@ -356,6 +356,22 @@ type AudioEncode = fn(
 ) -> Result<shiso_vision::EncodedRows, shiso_audio::AudioError>;
 const _: AudioEncode = <dyn shiso_audio::AudioTower>::encode;
 
+/// Both decode entry points take the operator's policy by reference. Video's is
+/// optional - `None` is the off state - and audio's is not, because audio has no
+/// opt-in flag.
+type DecodeAudio = fn(
+    &[u8],
+    &shiso_audio::DecodeLimits,
+    &shiso_audio::AudioDecodePolicy,
+) -> Result<shiso_audio::Pcm, shiso_audio::AudioError>;
+const _: DecodeAudio = shiso_audio::decode_audio;
+type DecodeClip = fn(
+    &[u8],
+    f64,
+    Option<&shiso_vision::VideoDecodePolicy>,
+) -> Result<shiso_vision::DecodedClip, shiso_vision::VisionError>;
+const _: DecodeClip = shiso_vision::decode_clip;
+
 /// The openers the server calls, one per role, each trying every family.
 type OpenRecognizer =
     fn(

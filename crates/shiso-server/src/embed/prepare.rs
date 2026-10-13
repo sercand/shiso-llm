@@ -185,7 +185,7 @@ pub(super) fn parts(
                 let video = front.video.as_ref().ok_or_else(|| no_tower("vision"))?;
                 let bytes = media_bytes(source, rules.allow_remote).map_err(bad_media)?;
                 let clip =
-                    shiso_vision::decode_clip(&bytes, video.fps, rules.video_ffmpeg.as_ref())
+                    shiso_vision::decode_clip(&bytes, video.fps, rules.video_decode.as_ref())
                         .map_err(bad_media)?;
                 let frames = video
                     .sample(clip.frames().len(), clip.fps())
@@ -204,12 +204,9 @@ pub(super) fn parts(
             Block::Audio(source) => {
                 let tower = front.audio.as_ref().ok_or_else(|| no_tower("audio"))?;
                 let bytes = media_bytes(source, rules.allow_remote).map_err(bad_media)?;
-                let pcm = shiso_audio::decode_audio(
-                    &bytes,
-                    &rules.audio_limits,
-                    rules.audio_ffmpeg.as_ref(),
-                )
-                .map_err(bad_media)?;
+                let pcm =
+                    shiso_audio::decode_audio(&bytes, &rules.audio_limits, &rules.audio_decode)
+                        .map_err(bad_media)?;
                 let clip = shiso_audio::clip_for(tower.as_ref(), &pcm).map_err(bad_media)?;
                 b.media(EmbedPart::Audio(clip))?;
             }

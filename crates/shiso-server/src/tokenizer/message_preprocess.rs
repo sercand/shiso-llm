@@ -34,9 +34,9 @@
 //! it is.
 
 use serde_json::{Value, json};
-use shiso_audio::{AudioError, AudioTower, DecodeLimits};
+use shiso_audio::{AudioDecodePolicy, AudioError, AudioTower, DecodeLimits};
 use shiso_ir::{Block, MediaSource, Message, Role};
-use shiso_vision::{FfmpegPolicy, ImageLimits, PreprocessSpec, VisionError};
+use shiso_vision::{ImageLimits, PreprocessSpec, VideoDecodePolicy, VisionError};
 
 use crate::media::{EncodedItem, MediaItem};
 use crate::media_cache::{MediaCache, payload_key};
@@ -58,8 +58,8 @@ pub struct MediaPolicy<'a> {
     pub limits: ImageLimits,
     /// Whether an http or https address may be fetched.
     pub allow_remote: bool,
-    /// The subprocess decode policy, or `None` when video decoding is off.
-    pub ffmpeg: Option<&'a FfmpegPolicy>,
+    /// The video decode policy, or `None` when video decoding is off.
+    pub video_decode: Option<&'a VideoDecodePolicy>,
     /// The rate a clip is sampled at.
     pub video_fps: f64,
     /// This checkpoint's audio tower. `None` means an audio part is a request
@@ -67,10 +67,9 @@ pub struct MediaPolicy<'a> {
     pub audio: Option<&'a dyn AudioTower>,
     /// Decode limits for one audio clip.
     pub audio_limits: DecodeLimits,
-    /// The subprocess decoder for audio containers other than WAV, or `None`
-    /// when only WAV is accepted. Separate from the video policy because the
-    /// two are switched on by separate flags, and a refusal names its own.
-    pub audio_ffmpeg: Option<&'a FfmpegPolicy>,
+    /// How audio containers other than WAV are decoded. Separate from the
+    /// video policy because video has an opt-in flag and audio does not.
+    pub audio_decode: &'a AudioDecodePolicy,
     /// Where an item seen before is found without decoding it. `None` decodes
     /// every item, as every request did before there was one.
     pub cache: Option<&'a MediaCache>,
@@ -81,17 +80,21 @@ pub struct MediaPolicy<'a> {
 pub const DEFAULT_AUDIO_LIMITS: DecodeLimits =
     DecodeLimits::new(std::num::NonZeroU32::MIN.saturating_add(29));
 
+/// The audio decode policy when nothing else was configured: WAV, plus what
+/// the build decodes natively, and no ffmpeg.
+static DEFAULT_AUDIO_DECODE: AudioDecodePolicy = AudioDecodePolicy::DEFAULT;
+
 impl Default for MediaPolicy<'_> {
     fn default() -> Self {
         Self {
             vision: None,
             limits: ImageLimits::default(),
             allow_remote: false,
-            ffmpeg: None,
+            video_decode: None,
             video_fps: shiso_vision::DEFAULT_FPS,
             audio: None,
             audio_limits: DEFAULT_AUDIO_LIMITS,
-            audio_ffmpeg: None,
+            audio_decode: &DEFAULT_AUDIO_DECODE,
             cache: None,
         }
     }
@@ -298,7 +301,8 @@ fn render_blocks(
             Block::Video(source) => {
                 let spec = tower(policy, "a video")?;
                 push_media("a video", source, policy, out, |bytes| {
-                    let clip = shiso_vision::decode_clip(bytes, policy.video_fps, policy.ffmpeg)?;
+                    let clip =
+                        shiso_vision::decode_clip(bytes, policy.video_fps, policy.video_decode)?;
                     let frames =
                         clip.into_sampled(policy.video_fps, spec.geometry.temporal_patch_size());
                     let item = shiso_vision::preprocess_video(&frames, spec, policy.limits)?;
@@ -312,7 +316,7 @@ fn render_blocks(
                     let pcm = shiso_audio::decode_audio(
                         bytes,
                         &policy.audio_limits,
-                        policy.audio_ffmpeg,
+                        policy.audio_decode,
                     )?;
                     Ok(MediaItem::Audio(shiso_audio::clip_for(tower, &pcm)?))
                 })?;

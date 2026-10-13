@@ -8,7 +8,7 @@
 #   scripts/check.sh --only clippy,test
 #   scripts/check.sh --skip doc,deny
 #
-# Steps, in order: fmt tree clippy test doc deny libcuda perf
+# Steps, in order: fmt tree clippy test doc features deny libcuda perf
 #
 # The default scope is sound for everything the gate grades: a change is
 # confined to the crates whose files it touched and the crates built against
@@ -22,7 +22,7 @@ cd "$(dirname "$0")/.."
 
 usage() { sed -n '4,11p' "$0" | sed 's/^# \{0,1\}//'; }
 
-ALL_STEPS="fmt tree clippy test doc deny libcuda perf"
+ALL_STEPS="fmt tree clippy test doc features deny libcuda perf"
 scope_args=()
 only=""
 skip=""
@@ -159,6 +159,28 @@ if [ ${#PKGS[@]} -gt 0 ]; then
         step doc
         cargo doc "${PKGS[@]}" --no-deps --locked "${FEATURES[@]+"${FEATURES[@]}"}"
     fi
+fi
+
+# The two non-default decode feature sets of shiso-server. The default set is
+# built by every step above; without this one the other chains
+# (os -> rust -> ffmpeg, and os -> rust) could break unnoticed. A compile alone
+# cannot catch the regression that matters most for the native-only set -
+# feature unification switching ffmpeg back on through some other crate - so the
+# resolved feature tree is read as well.
+if want features && [ "$has_server" -eq 1 ]; then
+    step features
+    backend=""
+    [ "$macos" -eq 1 ] && backend=",metal"
+    cargo check -p shiso-server --locked --features "decode-ffmpeg,decode-native$backend"
+    cargo check -p shiso-server --locked --no-default-features --features "decode-native$backend"
+    for lib in shiso-vision shiso-audio; do
+        if cargo tree -p shiso-server --locked --no-default-features \
+            --features "decode-native$backend" -e features -i "$lib" |
+            grep -q 'feature "decode-ffmpeg"'; then
+            echo "FAIL: decode-ffmpeg is on for $lib in a native-only shiso-server build" >&2
+            exit 1
+        fi
+    done
 fi
 
 # Only the lockfile, the manifests and deny.toml feed this, and it fetches the

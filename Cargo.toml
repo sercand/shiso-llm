@@ -164,8 +164,8 @@ shiso-engine = { path = "crates/shiso-engine" }
 shiso-models = { path = "crates/shiso-models" }
 shiso-kvstore = { path = "crates/shiso-kvstore" }
 shiso-ir = { path = "crates/shiso-ir" }
-shiso-vision = { path = "crates/shiso-vision" }
-shiso-audio = { path = "crates/shiso-audio" }
+shiso-vision = { path = "crates/shiso-vision", default-features = false }
+shiso-audio = { path = "crates/shiso-audio", default-features = false }
 shiso-server = { path = "crates/shiso-server" }
 shiso-bench = { path = "crates/shiso-bench" }
 shiso-kernels = { path = "crates/shiso-kernels" }

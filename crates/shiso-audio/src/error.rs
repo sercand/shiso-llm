@@ -11,15 +11,20 @@ use shiso_vision::VisionError;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AudioError {
-    /// The bytes are a container this crate does not parse and no subprocess
-    /// decoder was configured.
+    /// The bytes are a container no decoder in this build handled.
+    ///
+    /// WAV is always read; anything else needs the `decode-native` feature or,
+    /// with `decode-ffmpeg`, an `--ffmpeg-path` the operator set.
     #[error(
-        "{container} audio needs the subprocess decoder; this server was started without \
-         --audio-allow-ffmpeg"
+        "no audio decoder in this build handled {container}{}; WAV is always accepted, \
+         other containers need the `decode-native` feature or --ffmpeg-path",
+        codec.as_deref().map(|c| format!(" ({c})")).unwrap_or_default()
     )]
-    NeedsDecoder {
+    UnsupportedContainer {
         /// The sniffed container name, e.g. `mp3`.
         container: &'static str,
+        /// The codec, when the container was read far enough to know it.
+        codec: Option<String>,
     },
     /// A WAV file whose structure is broken.
     #[error("the WAV file is malformed: {reason}")]

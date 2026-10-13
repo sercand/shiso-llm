@@ -227,7 +227,7 @@ fn audio_sent_to_a_checkpoint_with_no_audio_tower_is_refused() {
 }
 
 #[test]
-fn an_mp3_without_ffmpeg_is_refused_naming_the_flag() {
+fn an_mp3_no_decoder_handles_is_refused_naming_the_way_out() {
     let tower = stand();
     let policy = MediaPolicy {
         audio: Some(&tower),
@@ -238,16 +238,16 @@ fn an_mp3_without_ffmpeg_is_refused_naming_the_flag() {
     mp3.extend_from_slice(&[0u8; 64]);
     let message = Message::new(Role::User, vec![audio_block(&mp3)]);
     let error = preprocess(&[], std::slice::from_ref(&message), &policy)
-        .expect_err("an mp3 needs the subprocess decoder");
+        .expect_err("no decoder in this build handles an mp3");
     assert!(
         matches!(
             error,
-            PreprocessError::Audio(AudioError::NeedsDecoder { .. })
+            PreprocessError::Audio(AudioError::UnsupportedContainer { .. })
         ),
         "got {error:?}"
     );
     assert!(
-        error.to_string().contains("--audio-allow-ffmpeg"),
+        error.to_string().contains("--ffmpeg-path"),
         "the refusal names the flag that would change it: {error}"
     );
 }

@@ -25,7 +25,7 @@ no Python runtime.
   checkpoints are supported as well.
 - **Drop-in APIs.** OpenAI Chat Completions, Completions and Responses, and
   Anthropic Messages, with streaming, reasoning output and tool calling.
-- **Multimodal.** Image input, plus video input through ffmpeg (opt-in).
+- **Multimodal.** Image input, plus video input decoded by the OS (VideoToolbox, NVDEC), by pure-Rust decoders in a `decode-native` build, or by ffmpeg (opt-in).
 
 ## Supported models
 
@@ -48,7 +48,7 @@ and bf16 and q8_0 GGUF exports).
 Gemma 4 also takes audio input: `input_audio` parts on Chat Completions and
 Responses, up to 30 seconds a clip. The audio tower loads from the same
 `--vision` path, either the MLX export directory or the mmproj GGUF. WAV is
-decoded natively; other containers need `--audio-allow-ffmpeg`.
+decoded natively; other containers are decoded by a `decode-native` build, or by ffmpeg when `--ffmpeg-path` is set.
 
 EmbeddingGemma 2 serves `/v1/embeddings` instead of the chat routes: start
 the server with `--model` naming its GGUF and `--vision` naming its mmproj,
@@ -57,11 +57,11 @@ in one 768-d space. `dimensions` cuts a vector to 512, 256 or 128 (the widths
 the model was trained for), and `input_type` selects the checkpoint's task
 prompt (`search_query`, `search_document`, or any prompt name it ships, such
 as `Classification`). The tokenizer is read from `tokenizer.json` beside
-`--config`, or from `--tokenizer`. Video needs `--video-allow-ffmpeg` for
+`--config`, or from `--tokenizer`. Video needs `--video-allow-decode` for
 containers other than GIF; media is sent inline (data URIs or base64).
 
 ```sh
-shiso serve embeddinggemma-2 --video-allow-ffmpeg
+shiso serve embeddinggemma-2 --video-allow-decode
 curl localhost:8090/v1/embeddings -H 'Content-Type: application/json' -d '{
   "input": [{"content": [
     {"type": "text", "text": "A scenic boardwalk through a green meadow"},
@@ -225,8 +225,8 @@ environment variable. The ones you are most likely to want:
 | `--spec-k` | Speculative decoding depth (0 = off) |
 | `--vision` | Vision tower weights; enables image input |
 | `--vision-allow-remote-images` | Allow fetching images from `http(s)` URLs |
-| `--video-allow-ffmpeg` | Allow video input by spawning ffmpeg |
-| `--audio-allow-ffmpeg` | Allow audio containers other than WAV by spawning ffmpeg |
+| `--video-allow-decode` | Allow video input other than GIF: the OS decoder, then the native one, then ffmpeg when `--ffmpeg-path` is set |
+| `--ffmpeg-path` | The ffmpeg binary, for video and audio nothing else decodes. No default: without it ffmpeg is never run |
 | `--audio-max-seconds` | Longest audio clip a request may carry (default 7200) |
 | `--audio-max-upload-mb` | Largest transcription upload, in MiB (default 512); other routes keep the 32 MiB body limit |
 | `--asr-model`, `--asr-id` | Speech recognizer for `/v1/audio/transcriptions`, and the id it answers to |

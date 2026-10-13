@@ -178,11 +178,11 @@ fn an_empty_payload_is_refused_before_dispatch() {
 /// the flag that would allow it. "Not a decodable animation" leaves the
 /// operator guessing whether the file is corrupt.
 #[test]
-fn a_container_needing_the_subprocess_backend_is_refused_by_name() {
+fn a_container_needing_the_decode_chain_is_refused_by_name() {
     let error = decode_clip(b"\x00\x00\x00\x20ftypmp42____", 10.0, None)
-        .expect_err("no policy means no subprocess decode");
+        .expect_err("no policy means no decode");
     match &error {
-        VisionError::SubprocessDecodeDisabled { container } => {
+        VisionError::VideoDecodeDisabled { container } => {
             assert_eq!(*container, Container::Mp4);
         }
         other => panic!("expected a policy refusal, got {other}"),
@@ -190,7 +190,7 @@ fn a_container_needing_the_subprocess_backend_is_refused_by_name() {
     let text = error.to_string();
     assert!(text.contains("mp4"), "the container is not named: {text}");
     assert!(
-        text.contains("--video-allow-ffmpeg"),
+        text.contains("--video-allow-decode"),
         "no remedy offered: {text}"
     );
 }

@@ -62,7 +62,7 @@ fn paths() -> Option<(PathBuf, PathBuf, PathBuf)> {
 
 /// Qwen3-ASR Q8 and the shared MLX diarizer, booted with the arguments the
 /// production launchd definition passes
-/// (`--asr-id qwen3-asr --audio-allow-ffmpeg --asr-batch 4
+/// (`--asr-id qwen3-asr --ffmpeg-path ffmpeg --asr-batch 4
 /// --asr-skip-silence=false --audio-max-seconds 10800`), plus
 /// `--asr-offline-min-secs 300` added explicitly so the 327 s sample still
 /// takes the offline path the service uses. `None` having said on stderr why
@@ -99,7 +99,8 @@ fn boot() -> Option<Arc<AppState>> {
         "qwen3-asr",
         "--diarization-model",
         &diarizer,
-        "--audio-allow-ffmpeg",
+        "--ffmpeg-path",
+        "ffmpeg",
         "--asr-batch",
         "4",
         "--asr-skip-silence=false",
