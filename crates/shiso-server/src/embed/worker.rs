@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use super::{Queued, refuse};
 use crate::error::AppError;
+use crate::profile::ProfileSink;
 
 /// The most inputs one combined pass gathers from the queue. The model
 /// itself closes a pack at its token limit; this only bounds how long the
@@ -23,7 +24,41 @@ const MAX_GATHERED_INPUTS: usize = 64;
 /// Requests waiting together run as one pass: four callers with a short
 /// query each cost one pass's launches, not four. The model gives each input
 /// the vector it would get alone, so gathering is invisible in the answers.
-pub(super) fn run(mut embedder: Box<dyn Embedder>, mut rx: mpsc::Receiver<Queued>) {
+/// Under `--profile-dir` nothing is gathered, so each report is one request.
+pub(super) fn run(
+    embedder: Box<dyn Embedder>,
+    rx: mpsc::Receiver<Queued>,
+    profile: Option<ProfileSink>,
+) {
+    match profile {
+        Some(sink) => run_profiled(embedder, rx, &sink),
+        None => run_gathering(embedder, rx),
+    }
+}
+
+/// One request per pass, each inside its own profile region.
+fn run_profiled(
+    mut embedder: Box<dyn Embedder>,
+    mut rx: mpsc::Receiver<Queued>,
+    sink: &ProfileSink,
+) {
+    let mut served: u64 = 0;
+    while let Some(Queued { inputs, reply }) = rx.blocking_recv() {
+        if reply.is_closed() {
+            continue;
+        }
+        served += 1;
+        let region = sink.begin(format!("{served:06}"));
+        let outcome = embed(embedder.as_mut(), &inputs);
+        if let Some(region) = region {
+            sink.end(region, "embed");
+        }
+        let _gone = reply.send(outcome);
+    }
+}
+
+/// Gathers whatever is waiting into one pass.
+fn run_gathering(mut embedder: Box<dyn Embedder>, mut rx: mpsc::Receiver<Queued>) {
     while let Some(first) = rx.blocking_recv() {
         let mut batch = vec![first];
         let mut inputs = batch[0].inputs.len();

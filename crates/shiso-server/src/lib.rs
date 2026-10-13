@@ -325,6 +325,11 @@ pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService
         generator,
         model_id,
         max_queue: args.image_max_queue,
+        profile: args
+            .profile_dir
+            .as_deref()
+            .map(|dir| profile::ProfileSink::new(dir, Arc::clone(&backend)))
+            .transpose()?,
     })
     .context("starting image service worker")?;
     // The operator's flags are judged against the model that actually loaded:
@@ -404,6 +409,11 @@ pub fn boot_embedding(
             audio_limits: args.audio_limits(),
             audio_ffmpeg: args.audio_ffmpeg_policy(),
         },
+        profile: args
+            .profile_dir
+            .as_deref()
+            .map(|dir| profile::ProfileSink::new(dir, Arc::clone(&backend)))
+            .transpose()?,
     })
     .context("starting the embedding worker")
 }

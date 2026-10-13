@@ -175,6 +175,8 @@ pub struct ImageServiceDesc {
     /// The most generations that may wait in the queue beyond the running
     /// one; the next is refused.
     pub max_queue: usize,
+    /// Where per-generation profile reports go; `None` unless `--profile-dir`.
+    pub profile: Option<crate::profile::ProfileSink>,
 }
 
 /// The handle the HTTP handlers hold.

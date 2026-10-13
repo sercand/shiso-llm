@@ -57,6 +57,8 @@ pub struct EmbeddingServiceDesc {
     pub max_queue: usize,
     /// What may be decoded.
     pub media: MediaRules,
+    /// Where per-request profile reports go; `None` unless `--profile-dir`.
+    pub profile: Option<crate::profile::ProfileSink>,
 }
 
 /// One queued request: every input's parts, and where the vectors go.
@@ -99,6 +101,7 @@ impl EmbeddingService {
             model_id,
             max_queue,
             media,
+            profile,
         } = desc;
         let shared = Arc::new(Shared {
             info: embedder.info().clone(),
@@ -110,7 +113,7 @@ impl EmbeddingService {
         let (tx, rx) = mpsc::channel(max_queue.max(1));
         std::thread::Builder::new()
             .name("shiso-embed".to_owned())
-            .spawn(move || worker::run(embedder, rx))?;
+            .spawn(move || worker::run(embedder, rx, profile))?;
         Ok(Self { tx, shared })
     }
 
