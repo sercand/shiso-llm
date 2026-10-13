@@ -13,6 +13,13 @@
 //! accumulate into one open command buffer with one open compute encoder, and
 //! exactly three things flush: [`Backend::sync`] and the two host-copy paths,
 //! which must not touch memory the GPU is still writing.
+//!
+//! # Profiling
+//!
+//! While a [`shiso_core::ProfileRegion`] is open every dispatch and blit is
+//! flushed on its own and its `GPUEndTime - GPUStartTime` recorded, which is
+//! the only way to get per-launch time from per-command-buffer timestamps.
+//! Outside a region the cost is one `Option` check per launch.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -33,7 +40,7 @@ use objc2_metal::{
 use parking_lot::{Mutex, MutexGuard};
 use shiso_core::{
     Backend, CoreError, CoreResult, DeviceView, Extent3, HostBytes, KernelArg, KernelRef,
-    LaunchArgs, RawBuffer,
+    LaunchArgs, LaunchKey, LaunchSample, Profiler, RawBuffer,
 };
 
 use crate::compile::compile_library;
@@ -140,6 +147,9 @@ pub(crate) struct State {
     commits: usize,
     /// The value the completion event was last asked to reach.
     signaled: u64,
+    /// Samples of the open profile region; `None` when no region is open,
+    /// which is the only state in which launches batch.
+    profile: Option<Vec<LaunchSample>>,
 }
 
 /// Driver handles have no `Debug`, so the state reports what it can.
@@ -155,6 +165,12 @@ impl fmt::Debug for State {
 }
 
 impl State {
+    /// Whether a profile region is open, so every launch is flushed and timed
+    /// on its own.
+    pub(crate) fn profiling(&self) -> bool {
+        self.profile.is_some()
+    }
+
     /// Registers `buffer` and returns the handle that names it.
     fn insert(
         &mut self,
@@ -284,6 +300,7 @@ impl MetalBackend {
                 pipelines: PipelineCache::default(),
                 commits: 0,
                 signaled: 0,
+                profile: None,
             }),
         }))
     }
@@ -374,12 +391,45 @@ impl MetalBackend {
     /// A no-op when nothing is open, so every flush point can call it
     /// unconditionally.
     pub(crate) fn flush(&self, state: &mut State, op: &'static str) -> CoreResult<()> {
+        self.drain(state, op).map(|_| ())
+    }
+
+    /// Flushes one launch and files its GPU time under `key`.
+    pub(crate) fn flush_timed(
+        &self,
+        state: &mut State,
+        op: &'static str,
+        key: LaunchKey,
+    ) -> CoreResult<()> {
+        let Some(command_buffer) = self.drain(state, op)? else {
+            return Ok(());
+        };
+        // The event the drain waited on is signalled from inside the command
+        // buffer, before the completion notification that sets `GPUEndTime`;
+        // until that arrives the end time reads zero. So the timed path also
+        // waits for completion, which the batched path never pays.
+        command_buffer.waitUntilCompleted();
+        let gpu_ns = seconds_to_ns(command_buffer.GPUEndTime() - command_buffer.GPUStartTime());
+        if let Some(samples) = state.profile.as_mut() {
+            samples.push(LaunchSample { key, gpu_ns });
+        }
+        Ok(())
+    }
+
+    /// [`Self::flush`], handing back the command buffer it waited on.
+    ///
+    /// `None` means nothing was open, so nothing was committed.
+    fn drain(
+        &self,
+        state: &mut State,
+        op: &'static str,
+    ) -> CoreResult<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>> {
         let Batch::Open {
             command_buffer,
             encoder,
         } = std::mem::take(&mut state.batch)
         else {
-            return Ok(());
+            return Ok(None);
         };
         match encoder {
             Encoder::Compute(encoder) => encoder.endEncoding(),
@@ -412,7 +462,7 @@ impl MetalBackend {
             );
             return Err(MetalError::backend(op, detail));
         }
-        Ok(())
+        Ok(Some(command_buffer))
     }
 
     /// The open command buffer, opening one when the slot is empty.
@@ -706,6 +756,9 @@ impl Backend for MetalBackend {
                 size,
             );
         }
+        if state.profiling() {
+            self.flush_timed(&mut state, "copy_d2d", LaunchKey::copy("copy_d2d"))?;
+        }
         Ok(())
     }
 
@@ -794,6 +847,45 @@ impl Backend for MetalBackend {
         let mut state = self.inner.lock();
         self.flush(&mut state, "sync")
     }
+
+    fn as_profiler(&self) -> Option<&dyn Profiler> {
+        Some(self)
+    }
+}
+
+impl Profiler for MetalBackend {
+    fn start(&self) -> CoreResult<()> {
+        let mut state = self.inner.lock();
+        if state.profiling() {
+            return Err(MetalError::backend(
+                "profile",
+                "a profile region is already open",
+            ));
+        }
+        // Work queued before the region is not the region's.
+        self.flush(&mut state, "profile")?;
+        state.profile = Some(Vec::new());
+        Ok(())
+    }
+
+    fn stop(&self) -> CoreResult<Vec<LaunchSample>> {
+        let mut state = self.inner.lock();
+        let Some(samples) = state.profile.take() else {
+            return Err(MetalError::backend("profile", "no profile region is open"));
+        };
+        self.flush(&mut state, "profile")?;
+        Ok(samples)
+    }
+}
+
+/// Host-clock seconds to whole nanoseconds, clamped at zero.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped non-negative, and u64 nanoseconds hold 584 years"
+)]
+fn seconds_to_ns(seconds: f64) -> u64 {
+    (seconds.max(0.0) * 1e9).round() as u64
 }
 
 impl fmt::Debug for MetalBackend {

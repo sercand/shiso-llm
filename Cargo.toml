@@ -146,6 +146,9 @@ objc2-metal = { version = "0.3", features = [
     "MTLArgument",
     "MTLAllocation",
     "block2",
+    # `MTLCommandBuffer::GPUStartTime`/`GPUEndTime`, which per-launch profiling
+    # reads, are gated on this feature.
+    "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSError"] }
 # Page size for the page-aligned no-copy weight wrap (`_SC_PAGESIZE`).

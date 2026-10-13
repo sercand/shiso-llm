@@ -5,9 +5,10 @@
 //! divides, rounds up or otherwise reinterprets either. Specialization comes
 //! from `KernelRef::consts`, so a launch never formats or parses a name.
 //!
-//! There is no `commit` in this module. Launches accumulate into the open
-//! command buffer the backend keeps open; only `sync` and the host-copy paths
-//! flush.
+//! Outside a profile region there is no `commit` in this module. Launches
+//! accumulate into the command buffer the backend keeps open; only `sync` and
+//! the host-copy paths flush. Inside one, each dispatch is flushed and timed
+//! on its own (see `device.rs`).
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -19,7 +20,9 @@ use objc2_metal::{
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLDataType, MTLFunctionConstantValues,
     MTLSize,
 };
-use shiso_core::{CoreResult, Extent3, FnConst, FnConstValue, KernelArg, KernelRef, LaunchArgs};
+use shiso_core::{
+    CoreResult, Extent3, FnConst, FnConstValue, KernelArg, KernelRef, LaunchArgs, LaunchKey,
+};
 
 use crate::device::MetalBackend;
 use crate::device::MetalError;
@@ -135,6 +138,15 @@ pub(crate) fn dispatch(
     }
 
     encoder.dispatchThreadgroups_threadsPerThreadgroup(size(launch.grid), size(launch.block));
+    if state.profiling() {
+        let key = LaunchKey {
+            entry: kernel.entry,
+            consts: kernel.consts,
+            grid: launch.grid,
+            block: launch.block,
+        };
+        backend.flush_timed(&mut state, "run", key)?;
+    }
     Ok(())
 }
 
