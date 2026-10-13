@@ -16,12 +16,15 @@
 //! concrete handle a backend has to keep alive travels through [`Gpu::new`] as
 //! `Box<dyn Any>` for exactly that reason.
 //!
+//! [`mod@bench`] reuses the same fixtures at realistic shapes as microbenchmarks.
+//!
 //! Each backend carries a thin driver per file - `crates/shiso-metal/tests/
 //! dense_*.rs`, `q35_*.rs` and `crates/shiso-cuda/tests/` the same - holding the
 //! `#[test]` wrappers and nothing else: open a device, or say on stderr why the
 //! cases did not run.
 
 pub mod audio;
+pub mod bench;
 pub mod dense;
 pub mod diffusion;
 pub mod generic;

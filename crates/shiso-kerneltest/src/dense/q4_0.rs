@@ -610,3 +610,72 @@ pub fn q4_0_prefill_gemm_matches_a_triple_loop(gpu: &Gpu) {
         }
     }
 }
+
+/// Width of both sides of the bench matvec: a 4096-wide hidden state.
+const BENCH_DIM: usize = 4096;
+
+/// One token through a `BENCH_DIM`-square `q4_0` matvec, at the split and
+/// row blocking the engine picks for one token, for [`crate::bench`].
+pub(crate) fn bench_matvec(gpu: &Gpu) -> crate::bench::Fixture {
+    let (in_dim, out_dim) = (BENCH_DIM, BENCH_DIM);
+    let (r1ptg, nxpsg) = (ext_r1ptg(1), ext_nxpsg(in_dim, 1));
+    let (entry, consts) = matvec_entry(gpu, r1ptg, nxpsg);
+    let mut packed = Vec::with_capacity(out_dim * in_dim / QK4_0 * Q4_0_BYTES);
+    for row in 0..out_dim {
+        packed.extend(pack_q4_0(&crate::oracle::signal(
+            in_dim,
+            0x0F0F ^ (row as u32).wrapping_mul(0x9E37),
+        )));
+    }
+    let x = crate::oracle::signal(in_dim, 0x0B0B);
+    let weights = gpu.upload(&packed);
+    let src = gpu.upload(&f32_bytes(&x));
+    let dst = gpu.upload(&vec![0u8; out_dim * 4]);
+    let row_bytes = (in_dim / QK4_0 * Q4_0_BYTES) as u64;
+    let args = MulMvExtArgs {
+        ne00: in_dim as i32,
+        ne01: out_dim as i32,
+        ne02: 1,
+        _pad0: 0,
+        nb00: row_bytes,
+        nb01: row_bytes,
+        nb02: row_bytes * out_dim as u64,
+        nb03: row_bytes * out_dim as u64,
+        ne10: in_dim as i32,
+        ne11: 1,
+        ne12: 1,
+        _pad1: 0,
+        nb10: 4,
+        nb11: (in_dim * 4) as u64,
+        nb12: (in_dim * 4) as u64,
+        nb13: (in_dim * 4) as u64,
+        ne0: out_dim as i32,
+        ne1: 1,
+        r2: 1,
+        r3: 1,
+        _pad2: [0; 4],
+    };
+    let grid = Extent3::new(
+        (out_dim as u32).div_ceil(ext_rows_per_threadgroup(nxpsg)),
+        1,
+        1,
+    );
+    let bytes = (packed.len() + in_dim * 4 + out_dim * 4) as u64;
+    let flops = 2 * (in_dim * out_dim) as u64;
+    crate::bench::Fixture::new(bytes, flops, move |gpu| {
+        run(
+            gpu,
+            KernelRef::specialized("generic", entry, consts),
+            &LaunchArgs::new(
+                grid,
+                Extent3::new(WARP, EXT_NSG, 1),
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(weights.view()),
+                    KernelArg::Buffer(src.view()),
+                    KernelArg::Buffer(dst.view()),
+                ],
+            ),
+        );
+    })
+}

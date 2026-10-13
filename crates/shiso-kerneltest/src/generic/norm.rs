@@ -282,3 +282,32 @@ pub fn the_residual_add_writes_its_own_destination_and_stops_at_its_bound(gpu: &
         );
     }
 }
+
+/// Width of the bench norm row: a 4096-wide hidden state.
+const BENCH_HIDDEN: usize = 4096;
+
+/// One token's RMS norm times weight over a `BENCH_HIDDEN`-wide row, at the
+/// engine's one-simdgroup launch, for [`crate::bench`].
+pub(crate) fn bench_rms_norm(gpu: &Gpu) -> crate::bench::Fixture {
+    let d_x = gpu.upload(&f32_bytes(&crate::oracle::signal(BENCH_HIDDEN, 21)));
+    let d_w = gpu.upload(&f32_bytes(&crate::oracle::signal(BENCH_HIDDEN, 22)));
+    let dst = zeros(gpu, BENCH_HIDDEN);
+    let args = norm_args(BENCH_HIDDEN, 1);
+    crate::bench::Fixture::new((3 * BENCH_HIDDEN * 4) as u64, 0, move |gpu| {
+        launch(
+            gpu,
+            "kernel_rms_norm_mul_f32_4",
+            Extent3::new(1, 1, 1),
+            Extent3::new(NORM_BLOCK, 1, 1),
+            NORM_SMEM,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d_x.view()),
+                KernelArg::Buffer(d_w.view()),
+                // The unread second fuse operand; see the correctness case.
+                KernelArg::Buffer(d_w.view()),
+                KernelArg::Buffer(dst.view()),
+            ],
+        );
+    })
+}

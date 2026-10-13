@@ -39,6 +39,10 @@ name = "contract"
 path = "tests/contract.rs"
 
 [[test]]
+name = "kernel_bench"
+path = "tests/kernel_bench.rs"
+
+[[test]]
 name = "profile"
 path = "tests/profile.rs"
 

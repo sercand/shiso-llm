@@ -197,3 +197,46 @@ pub fn the_clamp_is_one_sided_on_the_gate_and_two_sided_on_the_up_row(gpu: &Gpu)
         .collect();
     close(&got, &want, "swiglu clamped");
 }
+
+/// Elements of the bench row: one token's FFN inner width at a common size.
+const BENCH_GLU_N: usize = 14_336;
+
+/// One token's gated `SiLU` over a `BENCH_GLU_N`-wide row, for [`crate::bench`].
+pub(crate) fn bench_swiglu(gpu: &Gpu) -> crate::bench::Fixture {
+    let n = BENCH_GLU_N;
+    let d_gate = gpu.upload(&f32_bytes(&crate::oracle::signal(n, 11)));
+    let d_up = gpu.upload(&f32_bytes(&crate::oracle::signal(n, 12)));
+    let dst = zeros(gpu, n);
+    let row = (n * 4) as u64;
+    let args = GluArgs {
+        ne00: n as i32,
+        pad0: [0; 4],
+        nb01: row,
+        ne10: n as i32,
+        pad1: [0; 4],
+        nb11: row,
+        ne0: n as i32,
+        pad2: [0; 4],
+        nb1: row,
+        i00: 0,
+        i10: 0,
+        alpha: 1.0,
+        limit: 0.0,
+    };
+    crate::bench::Fixture::new(3 * row, 0, move |gpu| {
+        run(
+            gpu,
+            KernelRef::new("generic", "kernel_swiglu_flat_f32"),
+            &LaunchArgs::new(
+                Extent3::linear((n as u32).div_ceil(LINEAR_BLOCK)),
+                Extent3::new(LINEAR_BLOCK, 1, 1),
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(d_gate.view()),
+                    KernelArg::Buffer(d_up.view()),
+                    KernelArg::Buffer(dst.view()),
+                ],
+            ),
+        );
+    })
+}

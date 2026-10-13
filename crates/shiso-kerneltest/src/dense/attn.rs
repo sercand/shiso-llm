@@ -1017,3 +1017,53 @@ pub fn an_empty_span_contributes_zeros_rather_than_nan(gpu: &Gpu) {
         },
     );
 }
+
+/// Cache positions the bench decode reads: a 4096-token context.
+const BENCH_CTX: usize = 4096;
+
+/// One decode query per head over a `BENCH_CTX`-long, contiguously paged f16
+/// cache, at the launch the engine uses for one token, for [`crate::bench`].
+pub(crate) fn bench_decode(gpu: &Gpu) -> crate::bench::Fixture {
+    const PAGE: u32 = 64;
+    let pages: Vec<i32> = (0..(BENCH_CTX as u32 / PAGE) as i32).collect();
+    let cache_len = BENCH_CTX * KV_HEADS * KV_HD;
+    let d_q = gpu.upload(&f32_bytes(&fixture(Q_HEADS * KV_HD, 1)));
+    let d_k = gpu.upload(&f16_bytes(&fixture(cache_len, 2)));
+    let d_v = gpu.upload(&f16_bytes(&fixture(cache_len, 3)));
+    let last = BENCH_CTX as i32 - 1;
+    let d_pos = gpu.upload(&i32_bytes(&[last]));
+    let d_bound = gpu.upload(&i32_bytes(&[last]));
+    let d_pages = gpu.upload(&i32_bytes(&pages));
+    let out = zeros(gpu, Q_HEADS * KV_HD);
+    let args = AttnArgs {
+        head_dim: KV_HD as u32,
+        n_head: Q_HEADS as u32,
+        n_head_kv: KV_HEADS as u32,
+        n_tok: 1,
+        page_tokens: PAGE,
+        window: 0,
+        scale: 1.0 / (KV_HD as f32).sqrt(),
+        page_stride: 0,
+    };
+    let bytes = (2 * cache_len * 2 + 2 * Q_HEADS * KV_HD * 4) as u64;
+    let flops = (4 * Q_HEADS * BENCH_CTX * KV_HD) as u64;
+    crate::bench::Fixture::new(bytes, flops, move |gpu| {
+        launch(
+            gpu,
+            DECODE,
+            Extent3::new(Q_HEADS as u32, 1, 1),
+            Extent3::new(BLOCK_256, 1, 1),
+            DECODE_SMEM,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(d_q.view()),
+                KernelArg::Buffer(d_k.view()),
+                KernelArg::Buffer(d_v.view()),
+                KernelArg::Buffer(d_pos.view()),
+                KernelArg::Buffer(d_bound.view()),
+                KernelArg::Buffer(d_pages.view()),
+            ],
+        );
+    })
+}
