@@ -128,6 +128,7 @@ fn install_tracing() {
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     args.validate()?;
     log_media_decoders(&args);
+    log_os_decoder(&args);
 
     // The language model is optional: a server started with only a recognizer
     // serves transcription and answers every generation route with the typed
@@ -887,6 +888,24 @@ compile_error!("features `metal` and `cuda` name two devices; build with one");
 compile_error!(
     "enable `decode-ffmpeg` or `decode-native`: a server with neither has no media decoder"
 );
+
+/// Reports at boot whether the OS can decode video, and which codecs, when video
+/// decoding is on. Unavailable is information, not a failure: the Rust and
+/// ffmpeg steps may still cover a request.
+fn log_os_decoder(args: &ServeArgs) {
+    if !args.video_allow_decode {
+        return;
+    }
+    match shiso_vision::probe_os_decoder() {
+        Ok(probe) => {
+            let codecs: Vec<String> = probe.codecs.iter().map(ToString::to_string).collect();
+            tracing::info!(decoder = probe.decoder, codecs = %codecs.join(","), "OS video decoder is ready");
+        }
+        Err(error) => {
+            tracing::info!(%error, "no OS video decoder; video falls through to the next step");
+        }
+    }
+}
 
 /// Reports at boot which media decoders this server can reach.
 ///

@@ -426,3 +426,33 @@ merged on its own:
 - **A CUDA kernel for NV12→RGB on GB10,** if profiling shows the host
   conversion matters.
 - **VA-API,** if the server is deployed on Intel or AMD GPUs.
+
+## Implementation notes (deviations from the design above)
+
+Recorded after the implementation landed, so the design and the code agree.
+
+- **`rav1d` is vendored** at `vendor/rav1d` (BSD-2-Clause, excluded from the
+  workspace) with one edit: 1.1.0 aborts the process on a damaged tile because
+  `on_error` unwraps a frame header that is already gone, inside an
+  `extern "C"` function. `vendor/rav1d/VENDOR.md` has the details; drop the copy
+  when a release carries the fix. The `asm` feature is off (the published
+  package does not build with it on aarch64 macOS); 720p decodes at about
+  3.8 ms a frame on an M4 without it.
+- **VideoToolbox** uses the H.264/HEVC parameter-set constructors, not the
+  generic format description, because only they carry the stream's colour matrix
+  and picture size (the generic one decoded to BT.601 and a wrong-size buffer).
+  VP9 and AV1 use the generic constructor plus colour extensions parsed in Rust.
+  VideoToolbox returns frames in decode order, so display-order reordering is
+  done in Rust. Decoding was verified to run out of process
+  (`VTDecoderXPCService`).
+- **`Attempt::Done` carries a `DecodedClip`**, so a step reports the rate its
+  frames actually represent: `SamplePlan` keeps at least a few frames of a short
+  clip, so the requested rate would be wrong.
+- **`VisionError::Demux`** refuses a malformed container; a container the
+  demuxer declines is a `demux` step that falls through to ffmpeg.
+- **NVDEC has not been run on hardware.** It compiles and lints for
+  x86_64 and aarch64 Linux and its pure logic is unit-tested; the bindings are
+  transcribed from the MIT-licensed ffnvcodec headers. Device tests are
+  `#[ignore]`d and must be run on the GB10 before relying on it.
+- **Audio:** an ID3v2 tag is skipped by hand rather than through symphonia's
+  `id3v2` feature; AAC in mp4 is not trimmed of encoder padding.

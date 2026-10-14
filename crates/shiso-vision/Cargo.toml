@@ -16,7 +16,7 @@ description = "shiso: host vision pipeline - image/video preprocess, both-tower 
 # binary.
 decode-ffmpeg = []
 # The pure-Rust and library decoders that add build time.
-decode-native = []
+decode-native = ["shiso-media-sys/decode-native"]
 
 [dependencies]
 # The kernel argument blocks are `#[repr(C)]` structs marshalled through
@@ -36,6 +36,9 @@ shiso-core = { workspace = true }
 # checked against. This crate reads a model file but never a quantized block:
 # a vision weight goes to the device whole or is refused by name.
 shiso-modelfile = { workspace = true }
+# The OS video decoders (and, with `decode-native`, the AV1 decoder) behind a
+# safe API. All the FFI is there, so this crate stays `forbid(unsafe_code)`.
+shiso-media-sys = { workspace = true }
 # The tower shard's header is a JSON table, and the checkpoint config carries
 # the shard's path in a key the config parser does not model.
 serde_json = { workspace = true }

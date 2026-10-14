@@ -372,6 +372,40 @@ type DecodeClip = fn(
 ) -> Result<shiso_vision::DecodedClip, shiso_vision::VisionError>;
 const _: DecodeClip = shiso_vision::decode_clip;
 
+/// The OS decoder surface the video chain drives: opened from a codec
+/// configuration record, fed samples in decode order, drained at the end. Only
+/// `Unavailable` and `Unsupported` let the chain move on.
+type HwOpen = fn(
+    &shiso_media_sys::HwDecoderDesc<'_>,
+) -> Result<shiso_media_sys::HwDecoder, shiso_media_sys::HwError>;
+const _: HwOpen = shiso_media_sys::HwDecoder::open;
+type HwDecode = fn(
+    &mut shiso_media_sys::HwDecoder,
+    &[u8],
+    shiso_media_sys::HwTimestamp,
+    bool,
+) -> Result<Vec<shiso_media_sys::HwFrame>, shiso_media_sys::HwError>;
+const _: HwDecode = shiso_media_sys::HwDecoder::decode;
+
+/// The demuxer reads a container into one video track whose samples are ranges
+/// of the request buffer.
+type Demux =
+    for<'a> fn(
+        &'a [u8],
+    )
+        -> Result<shiso_vision::demux::DemuxedTrack<'a>, shiso_vision::demux::DemuxError>;
+const _: Demux = shiso_vision::demux::open;
+
+/// A decoder's refusals, as the chain tells them apart.
+fn hw_error_kind(error: &shiso_media_sys::HwError) -> u8 {
+    match error {
+        shiso_media_sys::HwError::Unavailable { .. } => 0,
+        shiso_media_sys::HwError::Unsupported { .. } => 1,
+        shiso_media_sys::HwError::Failed { .. } => 2,
+        _ => 3,
+    }
+}
+
 /// The openers the server calls, one per role, each trying every family.
 type OpenRecognizer =
     fn(
@@ -676,6 +710,13 @@ fn the_contracts_above_are_compiled() {
         usage_counts(&Usage::default()),
         (0, 0, 0, 0),
         "a fresh usage block counts nothing",
+    );
+    assert_eq!(
+        hw_error_kind(&shiso_media_sys::HwError::Failed {
+            detail: String::new()
+        }),
+        2,
+        "a failed decoder is not a decline"
     );
     let parsed_ref = ModelRef::parse("qwen3.5-9b:metal-mlx4").expect("valid model ref");
     assert_eq!(parsed_ref.model.as_str(), "qwen3.5-9b");

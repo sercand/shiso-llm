@@ -102,23 +102,15 @@ version = "1.0.79"
 version = "0.3"
 features = ["parallel"]
 
-[profile.checked-release]
-opt-level = 2
-codegen-units = 16
-inherits = "dev"
-
 [profile.dev]
 panic = "abort"
-
-[profile.opt-dev]
-opt-level = 1
-inherits = "dev"
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 
-[profile.release-with-debug]
-debug = "line-tables-only"
-inherits = "release"
+
+# Third-party source: its warnings are not ours to fix (see VENDOR.md).
+[lints.rust]
+warnings = "allow"

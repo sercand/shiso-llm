@@ -58,6 +58,8 @@ half = { workspace = true }
 shiso-vision = { workspace = true }
 # The embedding bench frames its audio fixture into a clip.
 shiso-audio = { workspace = true }
+# The contracts file pins the OS decoder surface.
+shiso-media-sys = { workspace = true }
 
 [lints]
 workspace = true

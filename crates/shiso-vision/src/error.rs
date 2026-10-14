@@ -55,6 +55,16 @@ pub enum VisionError {
         field: &'static str,
     },
 
+    /// The container could not be read: its index or sample tables are broken.
+    /// Refused rather than retried on another decoder, which would hide a
+    /// corrupt upload behind whichever decoder happens to tolerate it.
+    #[error("the video container is malformed: {source}")]
+    Demux {
+        /// What the demuxer found wrong.
+        #[from]
+        source: crate::demux::DemuxError,
+    },
+
     /// The media payload carried no bytes at all.
     #[error("the media payload is empty")]
     EmptyPayload,

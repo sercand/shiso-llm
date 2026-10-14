@@ -69,6 +69,9 @@ impl HwDecoder {
     /// # Errors
     ///
     /// [`HwError::Failed`] when the decoder rejects the sample.
+    /// [`HwError::Unsupported`] is possible on the first sample: some decoders
+    /// learn the stream's real format only from the bitstream, and a caller
+    /// treats it exactly like one from [`HwDecoder::open`].
     pub fn decode(
         &mut self,
         sample: &[u8],

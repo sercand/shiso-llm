@@ -1,4 +1,6 @@
 [workspace]
+# vendor/ holds third-party sources, linted by their own rules, not ours.
+exclude = ["vendor/rav1d"]
 # resolver 3 is the edition-2024 default and is MSRV-aware (stable since 1.84;
 # we pin 1.93). Do not downgrade to "2".
 resolver = "3"

@@ -33,6 +33,9 @@ use crate::config::{ImageLimits, PreprocessSpec};
 use crate::error::{Container, VisionError};
 use crate::image::{filter, pack_group, round_u32, side_as_usize, target_size_for, widen};
 use crate::item::VisionItem;
+#[cfg(feature = "decode-native")]
+use crate::steps::Av1Step;
+use crate::steps::{DemuxDeclined, OsStep};
 
 /// Frames per second to sample at when the caller has nothing better to go on.
 /// Matches the rate every shipped video processor block for this family
@@ -289,17 +292,33 @@ pub fn decode_clip(
     let Some(policy) = policy else {
         return Err(VisionError::VideoDecodeDisabled { container });
     };
+    // The container is read once, here. A broken index is refused outright; a
+    // container the demuxer simply does not read (AVI, a fragmented MP4) skips the
+    // in-process decoders and goes to ffmpeg with the original bytes.
+    let (track, declined) = match crate::demux::open(bytes) {
+        Ok(track) => (Some(track), None),
+        Err(crate::demux::DemuxError::Unsupported { reason }) => (None, Some(reason)),
+        Err(error) => return Err(error.into()),
+    };
+    let declined_step = declined.map(DemuxDeclined);
+    let os_step = track.as_ref().map(OsStep);
+    #[cfg(feature = "decode-native")]
+    let rust_step = track.as_ref().map(Av1Step);
     #[cfg(feature = "decode-ffmpeg")]
     let ffmpeg_step = policy.ffmpeg().map(crate::chain::FfmpegStep);
-    // The steps this build has, in chain order.
-    #[cfg_attr(
-        not(feature = "decode-ffmpeg"),
-        expect(
-            unused_mut,
-            reason = "the steps are pushed only by compiled-in decoders"
-        )
-    )]
+
+    // The steps this build has, in chain order: OS, then Rust, then ffmpeg.
     let mut steps: Vec<&dyn VideoStep> = Vec::new();
+    if let Some(step) = &declined_step {
+        steps.push(step);
+    }
+    if let Some(step) = &os_step {
+        steps.push(step);
+    }
+    #[cfg(feature = "decode-native")]
+    if let Some(step) = &rust_step {
+        steps.push(step);
+    }
     #[cfg(feature = "decode-ffmpeg")]
     if let Some(step) = &ffmpeg_step {
         steps.push(step);
@@ -308,6 +327,19 @@ pub fn decode_clip(
         &steps,
         &StepInput::new(bytes, container, target_fps, policy),
     )
+    .map_err(|error| match (error, &track) {
+        (
+            VisionError::NoVideoDecoder {
+                container, tried, ..
+            },
+            Some(track),
+        ) => VisionError::NoVideoDecoder {
+            container,
+            codec: Some(track.codec().to_string()),
+            tried,
+        },
+        (other, _) => other,
+    })
 }
 
 /// Identifies a container from its leading bytes.

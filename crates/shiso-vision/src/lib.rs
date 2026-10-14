@@ -74,6 +74,7 @@ mod image;
 mod item;
 mod mp4;
 pub mod shard;
+mod steps;
 mod tower;
 mod video;
 
@@ -95,6 +96,8 @@ pub use generator::{
 pub use image::preprocess_image;
 pub use item::VisionItem;
 pub use shard::VisionShard;
+/// What this machine's OS video decoder reports, for the boot log.
+pub use shiso_media_sys::{HwProbe, probe as probe_os_decoder};
 pub use tower::{EncodedRows, MediaPlacement, VisionStages, VisionTower};
 pub use video::{
     DEFAULT_FPS, DEFAULT_MAX_FRAMES, DEFAULT_MIN_FRAMES, DecodedClip, DecodedFrame, decode_clip,
