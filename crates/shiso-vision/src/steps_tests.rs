@@ -13,6 +13,7 @@ use crate::error::Container;
 use crate::video::decode_clip;
 
 const H264_MP4: &[u8] = include_bytes!("../tests/fixtures/h264.mp4");
+#[cfg(target_os = "macos")]
 const H264_BFRAMES: &[u8] = include_bytes!("../tests/fixtures/h264_bframes.mp4");
 const FRAGMENTED: &[u8] = include_bytes!("../tests/fixtures/h264_fragmented.mp4");
 #[cfg(feature = "decode-av1")]
