@@ -414,6 +414,19 @@ impl RunLayout {
     fn rows(&self) -> u32 {
         u32::try_from(self.tokens.len()).unwrap_or(u32::MAX)
     }
+
+    /// The rotary position of every row, in pass order: its session position
+    /// less its run's entry of `shifts`.
+    fn rotations(&self, shifts: &[u32]) -> Vec<u32> {
+        self.pieces
+            .iter()
+            .flat_map(|piece| {
+                let shift = shifts.get(piece.run).copied().unwrap_or(0);
+                (0..piece.rows)
+                    .map(move |row| piece.start.saturating_add(row).saturating_sub(shift))
+            })
+            .collect()
+    }
 }
 
 /// Uploads the three per-row inputs a decode step reads: the token ids, the
@@ -424,6 +437,58 @@ impl RunLayout {
 /// writes resident scratch at fixed addresses and stays OUTSIDE the capture,
 /// and everything below goes in. A reader has to be able to see where that line
 /// falls.
+/// Each run's rotary shift, in run order: past a picture a run's rows rotate
+/// at their position less the shift the picture left, as its solo read's
+/// would. Zero under the linear position rule, which has no such shift.
+fn run_shifts(
+    sessions: &HashMap<SessionId, Session>,
+    geometry: &Geometry,
+    runs: &[PromptRun<'_>],
+) -> CoreResult<Vec<u32>> {
+    runs.iter()
+        .map(|run| {
+            let live = sessions
+                .get(&run.session)
+                .ok_or(CoreError::UnknownSession(run.session))?;
+            Ok(if geometry.media_positions == MediaPositions::Mrope3D {
+                live.rope_shift()
+            } else {
+                0
+            })
+        })
+        .collect()
+}
+
+/// Uploads a batched prompt pass's rows as [`upload_decode_rows`] does, and
+/// its three rotary streams when a run of it stands past a picture - each row
+/// at its position less its run's entry of `shifts` - and says whether it
+/// uploaded those. Only such a pass takes the three streams, so a text-only
+/// batch launches what it always did.
+fn upload_run_rows(
+    backend: &dyn Backend,
+    staging: &mut Vec<u8>,
+    scratch: &Scratch,
+    layout: &RunLayout,
+    shifts: &[u32],
+) -> CoreResult<bool> {
+    upload_decode_rows(backend, staging, scratch, &layout.tokens, &layout.positions)?;
+    if shifts.iter().all(|shift| *shift == 0) {
+        return Ok(false);
+    }
+    let rotations = layout.rotations(shifts);
+    for dst in scratch.mrope() {
+        upload_row(
+            backend,
+            staging,
+            dst,
+            rotations
+                .iter()
+                .map(|at| i32::try_from(*at).unwrap_or(i32::MAX)),
+        )?;
+    }
+    Ok(true)
+}
+
 fn upload_decode_rows(
     backend: &dyn Backend,
     staging: &mut Vec<u8>,
@@ -1364,8 +1429,16 @@ impl HybridStack {
             // A chunk may not end inside a placeholder run: a token of a media
             // span may be allowed to read a key from the end of that span, and a
             // key the chunk never reaches is a cache row nothing has written.
+            //
+            // It also stops where a picture ends, so the recurrence sums the
+            // runs after a picture from its end in every read of this prompt -
+            // cold, resumed or batched - whichever boundaries this one had.
             let take = match run.as_ref() {
-                Some(run) => run.walk.split_point(rest, width),
+                Some(run) => crate::media_path::picture_end_within(
+                    rest,
+                    run.walk.split_point(rest, width),
+                    run.prefill.pads(),
+                ),
                 None => rest.len().min(width),
             };
             let live = self
@@ -1433,8 +1506,9 @@ impl HybridStack {
         Ok(last)
     }
 
-    /// The closest a message boundary or a branch point may lie to where a
-    /// read or its resume began and still be stopped at: the tier's floor.
+    /// The closest a media prompt's message boundary or a score's branch point
+    /// may lie to where a read or its resume began and still be stopped at: the
+    /// tier's floor.
     ///
     /// A checkpoint is worth the prefill between it and the one below it, and
     /// a few hundred tokens of that is not worth a snapshot. A score's own
@@ -1501,8 +1575,16 @@ impl HybridStack {
     /// after it, and the prompt - and every prompt resumed from the checkpoint
     /// taken there - sums differently from a read that never stopped. The
     /// resume re-reads the few positions between the grid point and the
-    /// boundary instead. A boundary whose grid point lies inside a picture -
-    /// the end of a shared picture, say - is taken where it is.
+    /// boundary instead. Past a picture the grid counts from its end, which
+    /// every read stops at ([`shiso_core::media::run_floor`]), so the boundary
+    /// just past a shared picture moves back onto that end.
+    ///
+    /// A text prompt that is not a score stops at its first message boundary
+    /// inside the chunk, exactly where it falls: the rule plain conversations
+    /// have always had, which their next turn resumes on. A media prompt's
+    /// boundaries count from `floor` past where its read or its resume began -
+    /// not past each chunk's start, which no boundary inside a chunk as wide
+    /// as the floor could ever clear.
     fn chunk_stop(
         &mut self,
         session: SessionId,
@@ -1515,24 +1597,28 @@ impl HybridStack {
             .sessions
             .get_mut(&session)
             .ok_or(CoreError::UnknownSession(session))?;
+        if !live.scoring() && !media {
+            return Ok(live.hints_between(start, end).next());
+        }
         let lowest = if live.scoring() {
             start
         } else {
-            start.max(live.resumed_at()).saturating_add(floor - 1)
+            start.max(live.resumed_at().saturating_add(floor - 1))
         };
         let clears =
             |live: &Session, at: u32| !media || live.key().is_some_and(|key| !key.splits(at));
-        let Some(hint) = live
-            .hint_between(lowest, end)
-            .filter(|at| clears(live, *at))
-        else {
+        let spans = live.key().map_or(&[][..], |key| key.spans.as_slice());
+        // Each boundary moves onto its grid point, which may be the chunk's
+        // own end - a picture's end, which every read cuts at, with the
+        // questions parting just past it - so the commit there is the shared
+        // one. A grid point at or behind where this chunk starts is one an
+        // earlier cut already took, and the next boundary is asked instead of
+        // stopping off the grid.
+        let Some((hint, at)) = live.hints_between(lowest, u32::MAX).find_map(|hint| {
+            let at = shiso_core::media::run_floor(hint, spans, crate::launch::GDN_CHUNK_RUN);
+            (at > lowest && at <= end && clears(live, at)).then_some((hint, at))
+        }) else {
             return Ok(None);
-        };
-        let grid = hint - hint % crate::launch::GDN_CHUNK_RUN;
-        let at = if grid > lowest && clears(live, grid) {
-            grid
-        } else {
-            hint
         };
         if at != hint {
             live.move_hint(hint, at);
@@ -1636,10 +1722,16 @@ impl HybridStack {
         } else {
             Reason::Continued
         };
+        let scoring = live.scoring();
         let (history, kv) = live.commit_parts();
         let mut opts = CommitOpts::span(&[]);
         if admit {
             opts = opts.checkpoint(staging.ckpt.as_slice(), earned);
+            // A score's boundaries go before a conversation's when slots run
+            // out: a decision burst must not drain the pool chats resume from.
+            if scoring {
+                opts = opts.scoring();
+            }
             if logits_row.is_some() {
                 opts = opts.logits_row(staging.logits.as_slice());
             }
@@ -2201,6 +2293,7 @@ impl HybridStack {
                 });
             }
             let rows = open_ple(resident, geometry, &layout.tokens)?;
+            let shifts = run_shifts(sessions, geometry, runs)?;
             for run in runs {
                 let room = kv::Room {
                     cache: &resident.cache,
@@ -2211,12 +2304,12 @@ impl HybridStack {
                     .ok_or(CoreError::UnknownSession(run.session))?
                     .advance(run.tokens, capacity, room)?;
             }
-            upload_decode_rows(
+            let rotary = upload_run_rows(
                 backend.as_ref(),
                 &mut staging.ids,
                 &resident.scratch,
-                &layout.tokens,
-                &layout.positions,
+                &layout,
+                &shifts,
             )?;
             if let Some(rows) = rows {
                 stage_ple(backend.as_ref(), resident, &mut staging.ple, rows)?;
@@ -2249,9 +2342,7 @@ impl HybridStack {
                 layers::PassExtras {
                     trail: Trail::None,
                     taps: None,
-                    // A segmented pass refuses every session that read media,
-                    // so no run of it stands past a picture.
-                    rotary: false,
+                    rotary,
                 },
             )?;
             drop(segments);
@@ -2326,10 +2417,16 @@ impl HybridStack {
                     backend: "engine",
                 });
             }
-            if live.carries_media() || self.captures.contains_key(&run.session) {
+            // A session that read media joins once its pictures are behind it:
+            // what is left is text, rotated as its solo read would rotate it.
+            let picture_ahead = live.carries_media()
+                && live
+                    .key()
+                    .is_none_or(|key| key.spans.iter().any(|span| span.end() > live.written()));
+            if picture_ahead || self.captures.contains_key(&run.session) {
                 return Err(CoreError::Unsupported {
-                    what: "a batched prompt run over a session that read media or keeps \
-                           a decision capture",
+                    what: "a batched prompt run over a session with a picture left to read \
+                           or that keeps a decision capture",
                     backend: "engine",
                 });
             }

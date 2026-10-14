@@ -1459,6 +1459,13 @@ impl Model for FakeMediaModel {
         self.inner.prefill_last(session, tokens)
     }
 
+    fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        for run in runs {
+            self.read(run.session, run.tokens.len());
+        }
+        self.inner.prefill_last_many(runs)
+    }
+
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
         self.inner.decode_batch(steps)
     }
@@ -1616,6 +1623,30 @@ pub(crate) fn fake_keyed_media_engine(
     media_engine_keyed(rows, vocabulary, Some(tower), true)
 }
 
+/// As [`fake_keyed_media_engine`], with the batched prompt pass on: a model
+/// that reads several scores' tails in one pass, as both real stacks do.
+pub(crate) fn fake_keyed_batching_media_engine(
+    rows: Vec<Vec<f32>>,
+    vocabulary: Option<Arc<Vocabulary>>,
+) -> MediaEngine {
+    let tower = shiso_server::vision::VisionTower::from_tower(Box::new(FakeTower {
+        spec: media_spec(),
+        fail: false,
+    }));
+    let backend: Arc<dyn Backend> = FakeBackend::new();
+    let (model, audit) = FakeModel::new(&backend, Vec::new());
+    let (model, media_calls) =
+        FakeMediaModel::new(model.with_prefill_rows(rows).with_batched_prefill());
+    media_engine_from(
+        backend,
+        model.with_keyed_tier(),
+        audit,
+        media_calls,
+        vocabulary,
+        Some(tower),
+    )
+}
+
 fn media_engine_with(
     rows: Vec<Vec<f32>>,
     vocabulary: Option<Arc<Vocabulary>>,
@@ -1638,6 +1669,18 @@ fn media_engine_keyed(
     } else {
         model
     };
+    media_engine_from(backend, model, audit, media_calls, vocabulary, vision)
+}
+
+/// Spawns the engine over an already-built media fake.
+fn media_engine_from(
+    backend: Arc<dyn Backend>,
+    model: FakeMediaModel,
+    audit: Arc<Audit>,
+    media_calls: Arc<AtomicUsize>,
+    vocabulary: Option<Arc<Vocabulary>>,
+    vision: Option<shiso_server::vision::VisionTower>,
+) -> MediaEngine {
     let (engine, join) = spawn_engine_with_checkpoints(
         backend,
         Box::new(model),

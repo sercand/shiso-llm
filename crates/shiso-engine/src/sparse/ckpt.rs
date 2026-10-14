@@ -349,6 +349,11 @@ impl SparseStack {
         let mut opts = CommitOpts::span(&[]);
         if admit {
             opts = opts.checkpoint(staging.ckpt.as_slice(), earned);
+            // A score's boundaries go before a conversation's when slots run
+            // out: a decision burst must not drain the pool chats resume from.
+            if scoring {
+                opts = opts.scoring();
+            }
             if frontier_row.is_some() {
                 opts = opts.logits_row(staging.logits.as_slice());
             }
@@ -743,6 +748,7 @@ impl SparseStack {
                 key.path.extend_from_slice(&lookup[..tokens.len()]);
             }
             live.rope_shift = rope_shift;
+            live.run_origin = shiso_core::media::run_origin(reused, &spans);
             live.written = reused;
             live.resumed_at = reused;
             restore_state(backend.as_ref(), live, &blob)?;

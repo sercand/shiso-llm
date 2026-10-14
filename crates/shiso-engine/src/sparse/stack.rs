@@ -347,6 +347,14 @@ pub struct SparseSession {
     /// Rotating those at `written` instead leaves the first decoded token
     /// hundreds of positions away from the text it answers.
     pub(crate) rope_shift: u32,
+    /// Where this session's run grid restarts: the end of the last picture it
+    /// has read, zero before any. See [`shiso_core::media::run_origin`].
+    ///
+    /// Every read of a media prompt stops at each picture's end, so the
+    /// recurrent blocks sum the runs after a picture from its end whether the
+    /// prompt was read cold, resumed or batched; a text chunk past a picture
+    /// keeps to that grid rather than the plain one.
+    pub(crate) run_origin: u32,
     /// The position a resume stood this session on, zero for one prefilled
     /// from nothing.
     pub(crate) resumed_at: u32,
@@ -1191,6 +1199,7 @@ impl SparseStack {
             resumed_at: 0,
             key: None,
             rope_shift: 0,
+            run_origin: 0,
         };
         self.sessions.insert(id, session);
         self.order.push(id);

@@ -578,13 +578,14 @@ async fn waiting_siblings_do_not_resume_again_until_a_read_crosses_the_shared_pr
     let questions = (0..3_u32).map(|q| question(256, 6 + q)).collect::<Vec<_>>();
     let (answers, audit) = ask_while_decoding(sibling_cfg(64), true, None, &questions).await;
     assert_keyed_answers(&answers);
-    // First tick: all three ask and miss, the lead reads 128. Its second
-    // quantum crosses 256, so the two waiting ask once more and miss; the
-    // second reads alone without asking again, its second quantum crosses,
-    // and the third asks one last time before reading alone too.
+    // First tick: only the lead asks - the others wait until it stands on
+    // the shared prefix - misses, and reads 128. Its second quantum reaches
+    // 256, so the two waiting ask once and miss; the second reads alone
+    // without asking again, its second quantum crosses, and the third asks
+    // one last time before reading alone too.
     assert_eq!(
         score_resumes(&audit),
-        6,
+        4,
         "{:?} {:?}",
         audit.resumes.lock(),
         prompt_calls(&audit)

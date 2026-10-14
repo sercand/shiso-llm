@@ -693,10 +693,12 @@ impl Session {
         self.hints.dedup();
     }
 
-    /// The first shared boundary strictly after `from` and before `to`.
-    #[must_use]
-    pub(crate) fn hint_between(&self, from: u32, to: u32) -> Option<u32> {
-        self.hints.iter().copied().find(|&at| at > from && at < to)
+    /// The shared boundaries strictly after `from` and before `to`, ascending.
+    pub(crate) fn hints_between(&self, from: u32, to: u32) -> impl Iterator<Item = u32> + '_ {
+        self.hints
+            .iter()
+            .copied()
+            .filter(move |&at| at > from && at < to)
     }
 
     /// Whether `at` is one of this session's shared boundaries.

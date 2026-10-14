@@ -21,6 +21,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use shiso_core::media::MediaSpan;
 use shiso_core::{DecodeStep, SamplingParams, Seed, SessionId, StopTokens, TokenId};
 use shiso_ir::{BlockDelta, BlockStart, StopReason, StreamEvent, Usage};
 use tokio::sync::{mpsc, oneshot};
@@ -314,7 +315,7 @@ pub(crate) struct PendingMedia {
     /// One digest per item, in the same order.
     pub(crate) digests: Arc<[shiso_core::media::MediaDigest]>,
     /// One span per item, in the same order.
-    pub(crate) spans: Vec<shiso_core::media::MediaSpan>,
+    pub(crate) spans: Vec<MediaSpan>,
 }
 
 /// What a scoring sequence carries that a generation turn does not: the
@@ -336,6 +337,9 @@ struct ScoreJob {
     /// shared, or a grid point below the checkpoint tier's floor, which the
     /// stack never checkpoints at. See [`SeqSlot::set_checkpoint_floor`].
     stand_at: usize,
+    /// The checkpoint tier's floor, kept so that [`SeqSlot::hold_media`] can
+    /// place the stand point again once the pictures' spans are known.
+    floor: u32,
     /// The shared-read epoch at which its last resume found nothing; see
     /// [`SeqSlot::take_score_resume_at`].
     missed_at: Option<u64>,
@@ -487,7 +491,7 @@ impl SeqSlot {
         let stand_at = if decides {
             0
         } else {
-            stand_point(request.shared_prefix, request.prompt_tokens.len(), 1)
+            stand_point(request.shared_prefix, request.prompt_tokens.len(), 1, &[])
         };
         Self {
             flex: request.is_flex(),
@@ -551,6 +555,7 @@ impl SeqSlot {
                 shared_prefix: if decides { 0 } else { request.shared_prefix },
                 resume_pending: !decides,
                 stand_at,
+                floor: 1,
                 missed_at: None,
                 reply: setup.score_reply,
             }),
@@ -573,26 +578,35 @@ impl SeqSlot {
             flex: self.flex,
             // A decision pass is planned as a solo prefill: it never joins a
             // batched score pass, whose rows its head would never see.
-            // A score carrying media is never offered for the batched pass
-            // either: the pass reads only text-only sessions, and a sibling
-            // standing on a keyed checkpoint resumes when its own read comes.
+            // A score carrying media is offered only once every picture lies
+            // behind where it stands: the pass reads text, and a keyed score
+            // standing past its pictures has only its question left. One with
+            // a picture still to read - its rows attached, or held for a stand
+            // point short of them - reads alone, whole.
             score: self
                 .score
                 .as_ref()
                 .filter(|job| {
                     self.phase == Phase::Prefill
                         && job.decision.is_none()
-                        && matches!(self.path_media, PathMedia::Text)
+                        && !matches!(self.path_media, PathMedia::Unkeyed)
+                        && self.media.is_none()
                 })
-                .map(|job| {
+                .and_then(|job| {
                     let from = if job.resume_pending {
                         self.cursor.max(job.stand_at)
                     } else {
                         self.cursor
                     };
-                    ScoreFacts {
+                    let pictures_behind = self.pending_media.as_ref().is_none_or(|pending| {
+                        pending
+                            .spans
+                            .iter()
+                            .all(|span| usize::try_from(span.end()).unwrap_or(usize::MAX) <= from)
+                    });
+                    pictures_behind.then(|| ScoreFacts {
                         tail: self.prompt.len().saturating_sub(from),
-                    }
+                    })
                 }),
         }
     }
@@ -638,7 +652,15 @@ impl SeqSlot {
     }
 
     /// Holds a keyed score's items until its resume has run.
+    ///
+    /// The stand point moves onto the grid the pictures leave: past a
+    /// picture it counts from the picture's end, which is where the stack
+    /// checkpoints the siblings that part just past it.
     pub(crate) fn hold_media(&mut self, pending: PendingMedia) {
+        let len = self.prompt.len();
+        if let Some(job) = self.score.as_mut().filter(|job| job.decision.is_none()) {
+            job.stand_at = stand_point(job.shared_prefix, len, job.floor, &pending.spans);
+        }
         self.pending_media = Some(pending);
     }
 
@@ -1185,8 +1207,13 @@ impl SeqSlot {
     /// the start. Called once, at admission.
     pub(crate) fn set_checkpoint_floor(&mut self, floor: u32) {
         let len = self.prompt.len();
+        let spans = self
+            .pending_media
+            .as_ref()
+            .map_or(&[][..], |pending| pending.spans.as_slice());
         if let Some(job) = self.score.as_mut().filter(|job| job.decision.is_none()) {
-            job.stand_at = stand_point(job.shared_prefix, len, floor);
+            job.floor = floor;
+            job.stand_at = stand_point(job.shared_prefix, len, floor, spans);
         }
     }
 
@@ -1396,21 +1423,27 @@ impl SeqSlot {
 
 /// The grid point at or below a score's shared prefix: where a sibling's
 /// checkpoint stands a resumed score, because the stack checkpoints on the
-/// recurrence's grid ([`PREFILL_GRID`] is that grid).
-fn shared_grid(shared_prefix: u32, prompt_len: usize) -> usize {
-    let shared = usize::try_from(shared_prefix)
-        .unwrap_or(usize::MAX)
-        .min(prompt_len);
-    shared - shared % PREFILL_GRID
+/// recurrence's grid ([`PREFILL_GRID`] is that grid), which restarts at each
+/// of the prompt's pictures' ends ([`shiso_core::media::run_floor`]).
+fn shared_grid(shared_prefix: u32, prompt_len: usize, spans: &[MediaSpan]) -> usize {
+    let len = u32::try_from(prompt_len).unwrap_or(u32::MAX);
+    let grid = u32::try_from(PREFILL_GRID).unwrap_or(u32::MAX);
+    let at = shiso_core::media::run_floor(shared_prefix.min(len), spans, grid);
+    usize::try_from(at).unwrap_or(usize::MAX)
 }
 
 /// Where a score stands once a sibling has read the shared prefix: its
 /// [`shared_grid`], or zero when that lies below `floor`, the checkpoint
 /// tier's `min_tokens` - the stack takes no checkpoint closer than that to a
 /// prompt's start, so a sibling's read leaves nothing there to stand on.
-fn stand_point(shared_prefix: u32, prompt_len: usize, floor: u32) -> usize {
-    let grid = shared_grid(shared_prefix, prompt_len);
-    let floor = usize::try_from(floor.max(1)).unwrap_or(usize::MAX);
+///
+/// A score over pictures (`spans`) has no floor: the stack takes a media
+/// score's own boundaries wherever they fall, because the alternative is
+/// every sibling reading the picture again.
+fn stand_point(shared_prefix: u32, prompt_len: usize, floor: u32, spans: &[MediaSpan]) -> usize {
+    let grid = shared_grid(shared_prefix, prompt_len, spans);
+    let floor = if spans.is_empty() { floor.max(1) } else { 1 };
+    let floor = usize::try_from(floor).unwrap_or(usize::MAX);
     if grid < floor { 0 } else { grid }
 }
 

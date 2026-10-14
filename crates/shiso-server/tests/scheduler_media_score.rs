@@ -306,6 +306,55 @@ async fn sibling_questions_over_one_keyed_picture_read_it_once() {
         .expect("the loop exits cleanly");
 }
 
+/// Past the picture the siblings have only their questions left, which is
+/// text: they stand where the picture ends and read their tails together in
+/// one batched pass, rather than one after another.
+#[tokio::test]
+async fn sibling_questions_past_a_keyed_picture_read_their_tails_in_one_pass() {
+    let (item, digest) = one_picture();
+    let (engine, join, audit, media_calls) =
+        common::fake_keyed_batching_media_engine(vec![label_row(); 3], Some(qwen_vocabulary()));
+    let items: Arc<[MediaItem]> = Arc::from(vec![item]);
+    let digests: Arc<[shiso_core::media::MediaDigest]> = Arc::from(vec![digest]);
+
+    let outcomes = futures::future::join_all(sibling_prompts().into_iter().map(|prompt| {
+        engine.score(
+            ScoreRequest::new(prompt, labels())
+                .with_media(Arc::clone(&items), Arc::clone(&digests))
+                .with_shared_prefix(7),
+        )
+    }))
+    .await;
+    for outcome in outcomes {
+        outcome.expect("every question is answered");
+    }
+
+    assert_eq!(
+        media_calls.load(Ordering::SeqCst),
+        1,
+        "the picture is read once"
+    );
+    let batched: Vec<usize> = audit
+        .calls
+        .lock()
+        .iter()
+        .filter_map(|call| match call {
+            common::Call::PrefillMany { runs, .. } => Some(*runs),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        batched,
+        vec![2],
+        "the two siblings read in one pass: {batched:?}"
+    );
+
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
+}
+
 #[tokio::test]
 async fn another_picture_under_the_same_pad_run_never_resumes_past_it() {
     let (item, digest) = one_picture();

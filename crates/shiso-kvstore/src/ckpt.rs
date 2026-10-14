@@ -27,13 +27,18 @@
 //!
 //! 1. A **speculative** slot — taken because a boundary looked likely to pay off,
 //!    not because a rule asked — is always evicted before an earned one.
-//! 2. Among earned slots, the least useful goes first.
-//! 3. A slot the caller wants kept is priced above the scale in the price table it
+//! 2. A **scoring** slot — a boundary a score asked for, which its sibling
+//!    questions and an agent's next step stand on within seconds or not at all —
+//!    goes before every other earned one. A burst of decisions recycles its own
+//!    slots instead of draining a conversation's: it takes at most one earned
+//!    slot, the first time the store holds no scoring one.
+//! 3. Within a class, the least useful goes first.
+//! 4. A slot the caller wants kept is priced above the scale in the price table it
 //!    hands in, so it never loses a comparison it was not supposed to enter. There is
 //!    no separate pinned flag, because a price is the same mechanism with fewer ways to
 //!    disagree with itself.
 //!
-//! Above all three: **a chunk boundary never evicts.** The caller states whether
+//! Above all four: **a chunk boundary never evicts.** The caller states whether
 //! eviction is allowed; when it is not, a full store is a refusal rather than a
 //! victim, because the boundary will come around again and a checkpoint bought with
 //! a better one is a net loss nobody agreed to.
@@ -51,6 +56,18 @@ use crate::geom::CacheGeometry;
 use crate::ids::to_u32;
 use crate::ids::{NodeId, SlotId};
 
+/// Why a checkpoint was taken, which is the order eviction keeps them in:
+/// a lower class is always evicted before a higher one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Standing {
+    /// A chunk end the engine happened to stop at.
+    Speculative,
+    /// A boundary a score asked for.
+    Scoring,
+    /// A boundary a rule earned: a message end, a branch point, a prompt end.
+    Earned,
+}
+
 /// One slot's contents.
 #[derive(Debug)]
 struct Slot {
@@ -65,8 +82,8 @@ struct Slot {
     logits: Option<Arc<[u8]>>,
     /// The node this state was taken at, which is what makes a slot findable again.
     node: Option<NodeId>,
-    /// Taken on speculation rather than because a rule asked.
-    speculative: bool,
+    /// Why it was taken.
+    standing: Standing,
     /// Monotonic time of the last touch.
     hit: f64,
 }
@@ -147,7 +164,9 @@ impl CkptStore {
     /// stop at rather than a boundary a rule earned. The disk tier stores only
     /// earned ones.
     pub(crate) fn is_speculative(&self, slot: SlotId) -> bool {
-        self.slots.get(slot.index()).is_some_and(|s| s.speculative)
+        self.slots
+            .get(slot.index())
+            .is_some_and(|s| s.standing == Standing::Speculative)
     }
 
     /// Whether a slot's logits row is present alongside its state.
@@ -272,7 +291,7 @@ impl CkptStore {
         &mut self,
         now: f64,
         allow_evict: bool,
-        speculative: bool,
+        standing: Standing,
         prices: &[(SlotId, f64)],
     ) -> Option<Admission> {
         // A slot that has never held state is always the cheapest admission, and an
@@ -285,7 +304,7 @@ impl CkptStore {
                 state: None,
                 logits: None,
                 node: None,
-                speculative: false,
+                standing: Standing::Earned,
                 hit: now,
             });
             SlotId::new(to_u32(self.slots.len() - 1))
@@ -305,7 +324,7 @@ impl CkptStore {
         // that was never taken, and it is what makes `used` mean "ever taken".
         if let Some(entry) = self.slots.get_mut(slot.index()) {
             entry.hit = now;
-            entry.speculative = speculative;
+            entry.standing = standing;
         }
         Some(Admission { slot, displaced })
     }
@@ -367,13 +386,13 @@ impl CkptStore {
         entry.state = None;
         entry.logits = None;
         entry.node = None;
-        entry.speculative = false;
+        entry.standing = Standing::Earned;
         owner
     }
 
     /// The victim eviction would take, or `None` when nothing may be taken.
     ///
-    /// Speculative slots are offered first, then earned ones. `prices` is the caller's
+    /// The lowest [`Standing`] held is offered first, then the next. `prices` is the caller's
     /// valuation of each candidate on the
     /// shared utility scale, which is how the tree's knowledge of neighbouring
     /// checkpoints reaches the store without the store having to know what a tree is.
@@ -385,20 +404,15 @@ impl CkptStore {
             .filter(|(_, entry)| entry.state.is_some())
             .map(|(index, _)| SlotId::new(to_u32(index)))
             .collect();
-        if filled.is_empty() {
-            return None;
-        }
-        let speculative: Vec<SlotId> = filled
+        let lowest = filled
+            .iter()
+            .map(|slot| self.slots[slot.index()].standing)
+            .min()?;
+        let pool = filled
             .iter()
             .copied()
-            .filter(|slot| self.slots[slot.index()].speculative)
-            .collect();
-        let pool = if speculative.is_empty() {
-            &filled
-        } else {
-            &speculative
-        };
-        pool.iter().copied().min_by(|a, b| {
+            .filter(|slot| self.slots[slot.index()].standing == lowest);
+        pool.min_by(|a, b| {
             price_of(prices, *a)
                 .partial_cmp(&price_of(prices, *b))
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -448,7 +462,7 @@ pub struct CkptRef {
 /// *cache* does with these answers; these cover what the store promises on its own.
 #[cfg(test)]
 mod tests {
-    use super::{CkptStore, KvError};
+    use super::{CkptStore, KvError, Standing};
     use crate::geom::CacheGeometry;
     use crate::ids::{NodeId, SlotId};
 
@@ -473,9 +487,13 @@ mod tests {
     #[test]
     fn a_slot_is_handed_out_without_evicting_while_the_table_has_room() {
         let mut store = CkptStore::new(geometry(), 2);
-        let first = store.alloc(1.0, false, false, &[]).expect("room");
+        let first = store
+            .alloc(1.0, false, Standing::Earned, &[])
+            .expect("room");
         fill(&mut store, first.slot, 1, 1.0);
-        let second = store.alloc(2.0, false, false, &[]).expect("room");
+        let second = store
+            .alloc(2.0, false, Standing::Earned, &[])
+            .expect("room");
         assert_eq!(second.displaced, None);
         assert_eq!(store.filled(), 1);
         assert_eq!(store.evictions(), 0);
@@ -485,9 +503,9 @@ mod tests {
     #[test]
     fn a_boundary_that_may_not_evict_gets_nothing_from_a_full_store() {
         let mut store = CkptStore::new(geometry(), 1);
-        let taken = store.alloc(1.0, true, false, &[]).expect("room");
+        let taken = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
         fill(&mut store, taken.slot, 1, 1.0);
-        assert!(store.alloc(2.0, false, false, &[]).is_none());
+        assert!(store.alloc(2.0, false, Standing::Earned, &[]).is_none());
         assert!(store.is_live(taken.slot), "the earned slot survived");
         assert_eq!(store.evictions(), 0);
     }
@@ -495,17 +513,46 @@ mod tests {
     #[test]
     fn a_speculative_slot_is_evicted_before_an_earned_one() {
         let mut store = CkptStore::new(geometry(), 2);
-        let earned = store.alloc(1.0, true, false, &[]).expect("room");
+        let earned = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
         fill(&mut store, earned.slot, 1, 1.0);
-        let guessed = store.alloc(1.0, true, true, &[]).expect("room");
+        let guessed = store
+            .alloc(1.0, true, Standing::Speculative, &[])
+            .expect("room");
         fill(&mut store, guessed.slot, 2, 1.0);
         assert!(store.is_speculative(guessed.slot));
         assert!(!store.is_speculative(earned.slot));
 
         let prices = vec![(earned.slot, 9.0), (guessed.slot, 1.0)];
-        let next = store.alloc(5.0, true, false, &prices).expect("a victim");
+        let next = store
+            .alloc(5.0, true, Standing::Earned, &prices)
+            .expect("a victim");
         assert_eq!(next.slot, guessed.slot, "the speculative one went");
         assert_eq!(next.displaced, Some(NodeId::new(2)));
+        assert!(store.is_live(earned.slot), "the earned one stayed");
+    }
+
+    /// A score's slot goes before a conversation's whatever their prices, and
+    /// once one is held a score recycles it instead of taking another earned one.
+    #[test]
+    fn a_scoring_slot_is_evicted_before_an_earned_one() {
+        let mut store = CkptStore::new(geometry(), 2);
+        let earned = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
+        fill(&mut store, earned.slot, 1, 1.0);
+        let scored = store
+            .alloc(1.0, true, Standing::Scoring, &[])
+            .expect("room");
+        fill(&mut store, scored.slot, 2, 1.0);
+
+        let prices = vec![(earned.slot, 0.01), (scored.slot, 50.0)];
+        let next = store
+            .alloc(5.0, true, Standing::Scoring, &prices)
+            .expect("a victim");
+        assert_eq!(next.slot, scored.slot, "the score recycled its own slot");
+        fill(&mut store, next.slot, 3, 5.0);
+        let next = store
+            .alloc(6.0, true, Standing::Earned, &prices)
+            .expect("a victim");
+        assert_eq!(next.slot, scored.slot, "the conversation took the score's");
         assert!(store.is_live(earned.slot), "the earned one stayed");
     }
 
@@ -514,12 +561,14 @@ mod tests {
     #[test]
     fn the_least_useful_earned_slot_goes_when_no_speculative_one_is_left() {
         let mut store = CkptStore::new(geometry(), 2);
-        let cheap = store.alloc(1.0, true, false, &[]).expect("room");
+        let cheap = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
         fill(&mut store, cheap.slot, 7, 1.0);
-        let dear = store.alloc(1.0, true, false, &[]).expect("room");
+        let dear = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
         fill(&mut store, dear.slot, 8, 1.0);
         let prices = vec![(cheap.slot, 0.01), (dear.slot, 50.0)];
-        let next = store.alloc(9.0, true, false, &prices).expect("a victim");
+        let next = store
+            .alloc(9.0, true, Standing::Earned, &prices)
+            .expect("a victim");
         assert_eq!(next.slot, cheap.slot);
         assert_eq!(next.displaced, Some(NodeId::new(7)));
         assert!(store.is_live(dear.slot));
@@ -530,7 +579,7 @@ mod tests {
     #[test]
     fn a_slot_priced_above_the_scale_is_not_the_one_that_goes() {
         let mut store = CkptStore::new(geometry(), 1);
-        let kept = store.alloc(1.0, true, false, &[]).expect("room");
+        let kept = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
         fill(&mut store, kept.slot, 1, 1.0);
         let prices = vec![(kept.slot, f64::MAX)];
         assert_eq!(
@@ -538,7 +587,9 @@ mod tests {
             Some(kept.slot),
             "it is the only candidate"
         );
-        let next = store.alloc(2.0, true, false, &prices).expect("a victim");
+        let next = store
+            .alloc(2.0, true, Standing::Earned, &prices)
+            .expect("a victim");
         assert_eq!(next.slot, kept.slot);
         assert_eq!(store.evictions(), 1);
     }
@@ -547,10 +598,10 @@ mod tests {
     fn a_free_slot_is_reported_while_the_table_can_still_grow() {
         let mut store = CkptStore::new(geometry(), 2);
         assert!(store.any_free());
-        let first = store.alloc(1.0, true, false, &[]).expect("room");
+        let first = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
         fill(&mut store, first.slot, 1, 1.0);
         assert!(store.any_free(), "the table has one slot left to grow into");
-        let second = store.alloc(1.0, true, false, &[]).expect("room");
+        let second = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
         fill(&mut store, second.slot, 2, 1.0);
         assert!(!store.any_free(), "the cap is reached and nothing is free");
     }
@@ -558,7 +609,7 @@ mod tests {
     #[test]
     fn a_blob_of_the_wrong_size_is_refused_rather_than_stored() {
         let mut store = CkptStore::new(geometry(), 1);
-        let slot = store.alloc(1.0, true, false, &[]).expect("room");
+        let slot = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
         let short = [0u8; 512];
         let error = store
             .fill(slot.slot, NodeId::new(1), 100, &short, None, 1.0)
@@ -576,7 +627,7 @@ mod tests {
     #[test]
     fn evicting_clears_the_owner_so_it_cannot_be_advertised_again() {
         let mut store = CkptStore::new(geometry(), 1);
-        let slot = store.alloc(1.0, true, false, &[]).expect("room");
+        let slot = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
         fill(&mut store, slot.slot, 3, 1.0);
         assert_eq!(store.node_of(slot.slot), Some(NodeId::new(3)));
         assert_eq!(store.evict(slot.slot), Some(NodeId::new(3)));

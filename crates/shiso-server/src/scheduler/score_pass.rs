@@ -85,21 +85,32 @@ impl Coordinator {
 
     /// Several scores' last quanta in one prompt pass.
     ///
-    /// Every member resumes first, as its solo quantum would, except one
+    /// The lead resumes first, as its solo quantum would, and the other
+    /// members only once it stands on its shared prefix - each except one
     /// whose last resume missed with no shared read since. Members that then
     /// stand on their shared prefix are read together. A lead that does not
     /// stand reads alone instead, and so does the first member that missed
     /// when none stands. Every other member that missed is put back to
     /// resume again. One prompt read a tick either way.
+    ///
+    /// The others wait for the lead because a resume stands a sequence on
+    /// the deepest prefix stored so far and cannot be taken again: a member
+    /// resumed before the lead has written the checkpoint its siblings share
+    /// would stand on a shallower one - an agent's previous step, short of
+    /// this step's picture - and read the rest, picture and all, alone.
     pub(super) fn prefill_batch_step(&mut self, steps: &[PrefillStep], quantum: usize) {
         let epoch = self.score_pass.shared_reads;
-        for step in steps {
-            if let Some(shared) = self
-                .slots
-                .get_mut(step.slot)
-                .and_then(|slot| slot.take_score_resume_at(epoch))
-            {
-                self.resume_score(step.slot, shared);
+        if let Some(lead) = steps.first() {
+            self.resume_member(lead.slot, epoch);
+        }
+        let lead_stands = steps.first().is_some_and(|lead| {
+            self.slots.slots().get(lead.slot).is_some_and(|slot| {
+                slot.is_done() || slot.prompt_done() || slot.score_stands_on_shared()
+            })
+        });
+        if lead_stands {
+            for step in steps.iter().skip(1) {
+                self.resume_member(step.slot, epoch);
             }
         }
         let (runs, missed) = self.score_runs(steps, quantum);
@@ -135,6 +146,31 @@ impl Coordinator {
         }
     }
 
+    /// Resumes one member of a batch, unless its last resume missed with no
+    /// shared read since.
+    ///
+    /// A media score its resume stood past every picture has nothing left to
+    /// encode: settling its held items now drops them, so it joins the pass
+    /// as the text it has left. One that stopped short keeps them for its own
+    /// read.
+    fn resume_member(&mut self, at: usize, epoch: u64) {
+        if let Some(shared) = self
+            .slots
+            .get_mut(at)
+            .and_then(|slot| slot.take_score_resume_at(epoch))
+        {
+            self.resume_score(at, shared);
+        }
+        if self
+            .slots
+            .slots()
+            .get(at)
+            .is_some_and(|slot| slot.pending_media().is_some() && slot.score_stands_on_shared())
+        {
+            self.encode_held(at);
+        }
+    }
+
     /// The members that stand on their shared prefix, as quanta of their
     /// whole remaining prompts within `quantum`, and the members that do not.
     fn score_runs(&self, steps: &[PrefillStep], quantum: usize) -> (Vec<Quantum>, Vec<usize>) {
@@ -155,7 +191,10 @@ impl Coordinator {
             if slot.score_decision().is_some() {
                 continue;
             }
-            if !slot.score_stands_on_shared() {
+            if !slot.score_stands_on_shared()
+                || slot.pending_media().is_some()
+                || slot.media().is_some()
+            {
                 missed.push(step.slot);
                 continue;
             }
@@ -194,7 +233,14 @@ impl Coordinator {
         let Some(fact) = self.slots.slots().get(at).map(SeqSlot::facts) else {
             return;
         };
-        let tokens = batching::on_grid(fact.prompt_at, fact.prompt_remaining, quantum);
+        // A prompt with a picture left in it is read whole, as the planner
+        // plans its solo reads: the walk over its placeholder runs cannot be
+        // restarted halfway.
+        let tokens = if fact.indivisible_prompt {
+            fact.prompt_remaining
+        } else {
+            batching::on_grid(fact.prompt_at, fact.prompt_remaining, quantum)
+        };
         self.read_alone(PrefillStep {
             slot: at,
             tokens,

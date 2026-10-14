@@ -14,7 +14,7 @@
 
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::TokenId;
-use shiso_core::media::{KEY_ID_FLOOR, MediaKey, MediaSpan};
+use shiso_core::media::{KEY_ID_FLOOR, MediaKey, MediaSpan, PadTokens};
 
 /// A media session's cache key, and its history as the cache reads it.
 #[derive(Debug)]
@@ -125,4 +125,17 @@ pub(crate) fn resume_lookup(
         }),
         None => Ok((prompt.to_vec(), Vec::new())),
     }
+}
+
+/// The first `take` tokens of `rest`, cut short at the first picture that ends
+/// inside them with more of the prompt after it.
+///
+/// A placeholder followed by anything else is a picture's last row: a prompt's
+/// pictures are fenced by their template's own markers, so two never touch.
+#[must_use]
+pub(crate) fn picture_end_within(rest: &[TokenId], take: usize, pads: PadTokens) -> usize {
+    let take = take.min(rest.len());
+    (1..take)
+        .find(|at| pads.matches(rest[at - 1]) && !pads.matches(rest[*at]))
+        .unwrap_or(take)
 }

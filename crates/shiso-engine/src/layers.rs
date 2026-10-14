@@ -1806,6 +1806,25 @@ fn segments_here() -> CoreError {
 }
 
 /// Rows `first .. first + rows` of a buffer whose rows are `row_bytes` wide.
+/// Rows `first..first + rows` of every stream in `positions`: one run's share
+/// of a segmented pass's position rows.
+fn run_positions<'a>(
+    positions: &Positions<'a>,
+    first: u32,
+    rows: u32,
+) -> CoreResult<Positions<'a>> {
+    let span = |view: DeviceView<'a>| row_span(view, ID_BYTES, first, rows);
+    Ok(match positions {
+        Positions::Linear(linear) => Positions::Linear(span(*linear)?),
+        Positions::Mrope { linear, t, h, w } => Positions::Mrope {
+            linear: span(*linear)?,
+            t: span(*t)?,
+            h: span(*h)?,
+            w: span(*w)?,
+        },
+    })
+}
+
 fn row_span(
     view: DeviceView<'_>,
     row_bytes: u64,
@@ -2029,8 +2048,10 @@ pub(crate) fn forward(
                 let (k, v) = kv.layer_runs(rank)?;
                 if let PassRows::Segments(runs) = rows {
                     // Each run attends through its own session's table, as
-                    // its solo chunk would; a segmented pass carries no media,
-                    // so its positions are the linear row.
+                    // its solo chunk would. A segmented pass carries no media,
+                    // but a run past a picture rotates on the three streams,
+                    // so each run reads its own rows of whichever the pass
+                    // uploaded.
                     let row_bytes = u64::from(geometry.hidden).saturating_mul(launch::F32_BYTES);
                     let mut first = 0u32;
                     for run in runs {
@@ -2046,12 +2067,7 @@ pub(crate) fn forward(
                             &scratch.attn,
                             AttnIo {
                                 input: row_span(scratch.normed.view(), row_bytes, first, run.rows)?,
-                                pos: Positions::Linear(row_span(
-                                    scratch.positions(),
-                                    ID_BYTES,
-                                    first,
-                                    run.rows,
-                                )?),
+                                pos: run_positions(&positions, first, run.rows)?,
                                 bound: row_span(scratch.bound(), ID_BYTES, first, run.rows)?,
                                 block_out: row_span(
                                     scratch.block_out.view(),

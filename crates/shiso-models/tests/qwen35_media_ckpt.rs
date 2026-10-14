@@ -251,3 +251,74 @@ fn text_after_a_picture_rotates_on_three_streams_and_a_text_session_never_does()
         "a session that read no picture keeps the one-dimensional rotation"
     );
 }
+
+/// Sibling questions over one picture, as a decision request asks them: the
+/// first read cuts where the picture ends, the siblings resume there, and
+/// their text tails read together in one batched pass that rotates on the
+/// three-stream rule, as each one's solo read would.
+#[test]
+fn sibling_questions_stand_at_the_pictures_end_and_read_their_tails_together() {
+    let store = tempfile::TempDir::new().expect("a temporary directory");
+    let (_dir, fake, mut model) = loaded();
+    model
+        .kv_enable(&CkptConfig::new(store.path()).with_options(options()))
+        .expect("the checkpoint directory opens");
+    // Where the questions part: two tokens past the picture, so the plain
+    // grid point below it lies inside the picture.
+    let split = span().end() + 2;
+    let mark_sibling = |model: &mut shiso_models::qwen35::Qwen35Model, session| {
+        model
+            .kv_set_scoring(session)
+            .expect("the session is marked as scoring");
+        model
+            .kv_set_hints(session, &[LEAD, split])
+            .expect("the boundaries are recorded");
+    };
+
+    let first = model.open_session().expect("a session opens");
+    mark_sibling(&mut model, first);
+    read_picture(&fake, &mut model, first, Some(7));
+
+    let path = key_path(7);
+    let spans = [span()];
+    let mut siblings = Vec::new();
+    for _ in 0..2 {
+        let session = model.open_session().expect("a session opens");
+        model
+            .kv_set_media_key(
+                session,
+                &prompt(),
+                MediaKey::new(&path, &spans).expect("the same picture's key"),
+            )
+            .expect("the key is accepted before anything is read");
+        mark_sibling(&mut model, session);
+        let reused = model
+            .kv_resume(session, &prompt())
+            .expect("the resume answers")
+            .map_or(0, |info| info.tokens_reused);
+        assert_eq!(
+            reused,
+            span().end(),
+            "a sibling stands where the shared picture ends"
+        );
+        siblings.push(session);
+    }
+
+    let tail = &prompt()[span().end() as usize..];
+    let runs: Vec<shiso_core::PromptRun<'_>> = siblings
+        .iter()
+        .map(|session| shiso_core::PromptRun {
+            session: *session,
+            tokens: tail,
+        })
+        .collect();
+    let mark = fake.launch_mark();
+    let logits = model
+        .prefill_last_many(&runs)
+        .expect("siblings past their picture read their tails in one pass");
+    assert_eq!(logits.rows(), 2, "one answer row per sibling");
+    assert!(
+        rotated_on_three_streams(&fake, mark),
+        "a tail past a picture rotates at its trailing rotary position"
+    );
+}
