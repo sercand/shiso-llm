@@ -4,7 +4,10 @@
 //! macOS-only; everything else runs anywhere.
 
 use super::*;
-use crate::chain::{VideoDecodePolicy, run_chain};
+use crate::chain::VideoDecodePolicy;
+#[cfg(feature = "decode-native")]
+use crate::chain::run_chain;
+#[cfg(feature = "decode-native")]
 use crate::demux;
 use crate::error::Container;
 use crate::video::decode_clip;
@@ -56,7 +59,7 @@ fn the_rust_step_decodes_an_av1_mp4() {
     let input = StepInput::new(AV1_MP4, Container::Mp4, 10.0, &policy);
     let step = Av1Step(&track);
     let clip = run_chain(&[&step], &input).expect("decodes");
-    let plan = demux::SamplePlan::new(&track, 10.0, policy.max_frames());
+    let plan = SamplePlan::new(&track, 10.0, policy.max_frames());
     assert_eq!(clip.frames().len(), plan.kept());
     for frame in clip.frames() {
         assert_eq!((frame.width(), frame.height()), (64, 64));
