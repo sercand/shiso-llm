@@ -28,11 +28,14 @@
 
 use image::RgbImage;
 
+use crate::chain::{StepInput, VideoDecodePolicy, VideoStep, run_chain};
 use crate::config::{ImageLimits, PreprocessSpec};
 use crate::error::{Container, VisionError};
-use crate::ffmpeg::FfmpegPolicy;
 use crate::image::{filter, pack_group, round_u32, side_as_usize, target_size_for, widen};
 use crate::item::VisionItem;
+#[cfg(feature = "decode-av1")]
+use crate::steps::Av1Step;
+use crate::steps::{DemuxDeclined, OsStep};
 
 /// Frames per second to sample at when the caller has nothing better to go on.
 /// Matches the rate every shipped video processor block for this family
@@ -257,26 +260,27 @@ pub fn sample_indices(
 /// Decodes a container, choosing a backend by what the bytes actually are.
 ///
 /// GIF is decoded in process and reports the container's own average rate, so
-/// the caller still has to sample it. The subprocess backend resamples DURING
-/// decode, so its frames are already at `target_fps` and the clip reports that
-/// rate - which makes the caller's sampling step a no-op rather than a second,
-/// lossy resample.
+/// the caller still has to sample it. Everything else goes down the decode chain
+/// (see [`crate::chain`]), whose steps sample DURING decode, so their frames are
+/// already at `target_fps` and the clip reports that rate - which makes the
+/// caller's sampling step a no-op rather than a second, lossy resample.
 ///
-/// `ffmpeg` being [`None`] IS the disabled state. There is no policy value that
+/// `policy` being [`None`] IS the disabled state. There is no policy value that
 /// means "configured but off", so a deployment that never passes a policy can
-/// never reach a process spawn, and the error a caller gets names both the
-/// container and the flag that would allow it.
+/// never reach a decoder, and the error a caller gets names both the container
+/// and the flag that would allow it.
 ///
 /// # Errors
 ///
 /// [`VisionError::EmptyPayload`] for no bytes;
-/// [`VisionError::SubprocessDecodeDisabled`] when the container needs the
-/// subprocess backend and no policy was supplied; [`VisionError::NoFrames`]
-/// when the container held no video; and the decoder's own failures otherwise.
+/// [`VisionError::VideoDecodeDisabled`] when the container needs the chain and
+/// no policy was supplied; [`VisionError::NoVideoDecoder`] when no step in this
+/// build handled it; [`VisionError::NoFrames`] when the container held no
+/// video; and the decoder's own failures otherwise.
 pub fn decode_clip(
     bytes: &[u8],
     target_fps: f64,
-    ffmpeg: Option<&FfmpegPolicy>,
+    policy: Option<&VideoDecodePolicy>,
 ) -> Result<DecodedClip, VisionError> {
     if bytes.is_empty() {
         return Err(VisionError::EmptyPayload);
@@ -285,11 +289,57 @@ pub fn decode_clip(
     if container == Container::Gif {
         return decode_gif(bytes);
     }
-    let Some(policy) = ffmpeg else {
-        return Err(VisionError::SubprocessDecodeDisabled { container });
+    let Some(policy) = policy else {
+        return Err(VisionError::VideoDecodeDisabled { container });
     };
-    let frames = crate::ffmpeg::decode_frames(bytes, target_fps, policy)?;
-    DecodedClip::new(frames, target_fps)
+    // The container is read once, here. A broken index is refused outright; a
+    // container the demuxer simply does not read (AVI, a fragmented MP4) skips the
+    // in-process decoders and goes to ffmpeg with the original bytes.
+    let (track, declined) = match crate::demux::open(bytes) {
+        Ok(track) => (Some(track), None),
+        Err(crate::demux::DemuxError::Unsupported { reason }) => (None, Some(reason)),
+        Err(error) => return Err(error.into()),
+    };
+    let declined_step = declined.map(DemuxDeclined);
+    let os_step = track.as_ref().map(OsStep);
+    #[cfg(feature = "decode-av1")]
+    let rust_step = track.as_ref().map(Av1Step);
+    #[cfg(feature = "decode-ffmpeg")]
+    let ffmpeg_step = policy.ffmpeg().map(crate::chain::FfmpegStep);
+
+    // The steps this build has, in chain order: OS, then Rust, then ffmpeg.
+    let mut steps: Vec<&dyn VideoStep> = Vec::new();
+    if let Some(step) = &declined_step {
+        steps.push(step);
+    }
+    if let Some(step) = &os_step {
+        steps.push(step);
+    }
+    #[cfg(feature = "decode-av1")]
+    if let Some(step) = &rust_step {
+        steps.push(step);
+    }
+    #[cfg(feature = "decode-ffmpeg")]
+    if let Some(step) = &ffmpeg_step {
+        steps.push(step);
+    }
+    run_chain(
+        &steps,
+        &StepInput::new(bytes, container, target_fps, policy),
+    )
+    .map_err(|error| match (error, &track) {
+        (
+            VisionError::NoVideoDecoder {
+                container, tried, ..
+            },
+            Some(track),
+        ) => VisionError::NoVideoDecoder {
+            container,
+            codec: Some(track.codec().to_string()),
+            tried,
+        },
+        (other, _) => other,
+    })
 }
 
 /// Identifies a container from its leading bytes.

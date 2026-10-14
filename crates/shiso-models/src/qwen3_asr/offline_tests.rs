@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use shiso_audio::chunks::{OfflineRule, Span, plan_offline};
 use shiso_audio::{
-    ContextIds, DecodeLimits, Language, MelFrames, MelFrontend, SpeechRecognizer, StreamOptions,
-    TokenEvent, decode_audio,
+    AudioDecodePolicy, ContextIds, DecodeLimits, Language, MelFrames, MelFrontend,
+    SpeechRecognizer, StreamOptions, TokenEvent, decode_audio,
 };
 
 use super::{Schedule, check_plan, to_redecode};
@@ -182,7 +182,7 @@ fn offline_text_equals_streaming_text_on_long_dialogue() {
         .join("../../test-vectors/references/audio/clips/long-dialogue.wav");
     let bytes = std::fs::read(&wav).expect("the clip");
     let limits = DecodeLimits::new(std::num::NonZeroU32::new(600).expect("non-zero"));
-    let pcm = decode_audio(&bytes, &limits, None).expect("decodes");
+    let pcm = decode_audio(&bytes, &limits, &AudioDecodePolicy::default()).expect("decodes");
     let mel = MelFrontend::new(asr.mel_spec().clone())
         .expect("a frontend")
         .compute(pcm.samples());

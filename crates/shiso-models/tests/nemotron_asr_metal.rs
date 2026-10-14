@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use shiso_audio::{
-    ContextIds, DecodeLimits, Language, MelFrontend, MelStream, StreamOptions, decode_audio,
+    AudioDecodePolicy, ContextIds, DecodeLimits, Language, MelFrontend, MelStream, StreamOptions,
+    decode_audio,
 };
 use shiso_core::Backend;
 use shiso_models::audio_registry::{RecognizerDesc, open_speech_recognizer};
@@ -99,7 +100,8 @@ fn every_export_transcribes_through_the_public_path() {
         for clip in ["speech-en", "weather-es"] {
             let bytes = std::fs::read(fixtures().join(format!("clips/{clip}.wav")))
                 .expect("the clip exists");
-            let pcm = decode_audio(&bytes, &limits, None).expect("decodes");
+            let pcm =
+                decode_audio(&bytes, &limits, &AudioDecodePolicy::default()).expect("decodes");
             let frontend = Arc::new(
                 MelFrontend::new(recognizer.mel_spec().clone()).expect("the spec is valid"),
             );

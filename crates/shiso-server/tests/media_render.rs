@@ -198,7 +198,7 @@ fn a_video_is_refused_when_subprocess_decoding_is_off() {
     let error = preprocess(&[], std::slice::from_ref(&message), &policy(&spec))
         .expect_err("video decoding is off");
     assert!(
-        error.to_string().contains("--video-allow-ffmpeg"),
+        error.to_string().contains("--video-allow-decode"),
         "the refusal names the flag that would change it: {error}"
     );
 }

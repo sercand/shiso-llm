@@ -29,9 +29,9 @@ use std::sync::Arc;
 
 use shiso_core::{PadTokens, TokenId, VisionConfig};
 use shiso_ir::{Block, Effort, Message, Request, Role, ThinkingDirective};
-use shiso_vision::{FfmpegPolicy, ImageLimits, MediaPlacement, PreprocessSpec};
+use shiso_vision::{ImageLimits, MediaPlacement, PreprocessSpec, VideoDecodePolicy};
 
-use shiso_audio::{AudioTower, DecodeLimits};
+use shiso_audio::{AudioDecodePolicy, AudioTower, DecodeLimits};
 
 use crate::media::MediaItem;
 use crate::media_cache::MediaCache;
@@ -178,7 +178,7 @@ pub struct PromptRenderer {
     placement: Option<MediaPlacement>,
     limits: ImageLimits,
     allow_remote: bool,
-    ffmpeg: Option<FfmpegPolicy>,
+    video_decode: Option<VideoDecodePolicy>,
     video_fps: f64,
     thinking_default: bool,
     effort: EffortSpelling,
@@ -187,7 +187,7 @@ pub struct PromptRenderer {
     /// The audio tower whose frontend and token rule size a clip's pad run.
     audio: Option<Arc<dyn AudioTower>>,
     audio_limits: DecodeLimits,
-    audio_ffmpeg: Option<FfmpegPolicy>,
+    audio_decode: AudioDecodePolicy,
     /// Where a picture seen before is found without decoding it again.
     media_cache: Option<Arc<MediaCache>>,
 }
@@ -222,14 +222,14 @@ impl PromptRenderer {
             placement: None,
             limits: ImageLimits::default(),
             allow_remote: false,
-            ffmpeg: None,
+            video_decode: None,
             video_fps: shiso_vision::DEFAULT_FPS,
             thinking_default: true,
             effort: EffortSpelling::STANDARD,
             replay: None,
             audio: None,
             audio_limits: DEFAULT_AUDIO_LIMITS,
-            audio_ffmpeg: None,
+            audio_decode: AudioDecodePolicy::default(),
             media_cache: None,
         })
     }
@@ -326,7 +326,7 @@ impl PromptRenderer {
         tower: Arc<dyn AudioTower>,
         placement: MediaPlacement,
         limits: DecodeLimits,
-        ffmpeg: Option<FfmpegPolicy>,
+        decode: AudioDecodePolicy,
     ) -> Self {
         self.pads = self.vocabulary.media_ids(&placement);
         self.audio_wrap = self.vocabulary.audio_wrap_ids(&placement);
@@ -339,7 +339,7 @@ impl PromptRenderer {
         }
         self.audio = Some(tower);
         self.audio_limits = limits;
-        self.audio_ffmpeg = ffmpeg;
+        self.audio_decode = decode;
         self
     }
 
@@ -352,8 +352,8 @@ impl PromptRenderer {
 
     /// The same renderer with video decoding switched on.
     #[must_use]
-    pub fn with_video(mut self, ffmpeg: Option<FfmpegPolicy>, fps: f64) -> Self {
-        self.ffmpeg = ffmpeg;
+    pub fn with_video(mut self, decode: Option<VideoDecodePolicy>, fps: f64) -> Self {
+        self.video_decode = decode;
         self.video_fps = fps;
         self
     }
@@ -496,11 +496,11 @@ impl PromptRenderer {
             vision: self.vision.as_ref(),
             limits: self.limits,
             allow_remote: self.allow_remote,
-            ffmpeg: self.ffmpeg.as_ref(),
+            video_decode: self.video_decode.as_ref(),
             video_fps: self.video_fps,
             audio: self.audio.as_deref(),
             audio_limits: self.audio_limits,
-            audio_ffmpeg: self.audio_ffmpeg.as_ref(),
+            audio_decode: &self.audio_decode,
             cache: self.media_cache.as_deref(),
         }
     }

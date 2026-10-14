@@ -1,15 +1,28 @@
 //! Request bytes to model-rate mono.
 //!
-//! WAV is parsed here, and everything else goes to the subprocess decoder
-//! when the operator enabled one. Either way the result is capped in duration
-//! BEFORE resampling, so an hour-long upload to a server that accepts ten
-//! minutes costs a parse, not a resample.
+//! WAV is parsed here, and everything else goes down the decoders this build
+//! has, in order:
+//!
+//! 1. symphonia in process (`decode-native`, in `native.rs`);
+//! 2. the ffmpeg subprocess (`decode-ffmpeg`), only when the operator named a
+//!    binary;
+//! 3. nothing left: [`AudioError::UnsupportedContainer`].
+//!
+//! A step hands the bytes on only when it does not read that container or
+//! codec. Malformed bytes are refused by the first step that reads the format.
+//! Every step caps the duration BEFORE resampling, so an hour-long upload to a
+//! server that accepts ten minutes costs a parse, not a resample.
 
-use std::num::{NonZeroU32, NonZeroUsize};
+#[cfg(feature = "decode-ffmpeg")]
+use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroU64};
 
+#[cfg(feature = "decode-ffmpeg")]
 use shiso_vision::{FfmpegPolicy, VisionError, run_decoder};
 
 use crate::error::AudioError;
+#[cfg(feature = "decode-native")]
+use crate::native;
 use crate::num::f64_of;
 use crate::pcm::{MODEL_RATE, Pcm};
 use crate::resample::resample;
@@ -32,6 +45,67 @@ impl DecodeLimits {
     #[must_use]
     pub const fn max_seconds(&self) -> u32 {
         self.max_seconds.get()
+    }
+}
+
+/// Wall-clock budget for one decode when the operator gave none.
+const DEFAULT_TIMEOUT: NonZeroU64 = NonZeroU64::MIN.saturating_add(19);
+
+/// Operator policy for decoding audio that is not WAV.
+///
+/// Unlike video there is no opt-in flag: any container the build can decode
+/// without a subprocess is accepted. The ffmpeg step is the one thing that
+/// stays opt-in, because it exists only when the operator named a binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AudioDecodePolicy {
+    timeout_secs: NonZeroU64,
+    #[cfg(feature = "decode-ffmpeg")]
+    ffmpeg: Option<FfmpegPolicy>,
+}
+
+impl AudioDecodePolicy {
+    /// The default deadline and no ffmpeg step, as a constant so a caller can
+    /// hold a `static` of it.
+    pub const DEFAULT: Self = Self::new(DEFAULT_TIMEOUT);
+
+    /// A policy with the given decode deadline and no ffmpeg step.
+    #[must_use]
+    pub const fn new(timeout_secs: NonZeroU64) -> Self {
+        Self {
+            timeout_secs,
+            #[cfg(feature = "decode-ffmpeg")]
+            ffmpeg: None,
+        }
+    }
+
+    /// Adds the ffmpeg step, run under `policy`'s own caps.
+    #[cfg(feature = "decode-ffmpeg")]
+    #[must_use]
+    pub fn with_ffmpeg(mut self, policy: FfmpegPolicy) -> Self {
+        self.ffmpeg = Some(policy);
+        self
+    }
+
+    /// Wall-clock budget for one decode, in seconds.
+    #[must_use]
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs.get()
+    }
+
+    /// The ffmpeg step's policy, when the operator pointed the server at one.
+    #[cfg(feature = "decode-ffmpeg")]
+    #[must_use]
+    pub fn ffmpeg(&self) -> Option<&FfmpegPolicy> {
+        self.ffmpeg.as_ref()
+    }
+}
+
+impl Default for AudioDecodePolicy {
+    /// The default deadline and no ffmpeg step: WAV, plus whatever the build
+    /// decodes natively.
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -67,14 +141,18 @@ fn too_long(pcm: &Pcm, limits: DecodeLimits) -> Result<(), AudioError> {
 /// # Errors
 ///
 /// - [`AudioError::Empty`] for no bytes or no samples.
-/// - [`AudioError::NeedsDecoder`] for a non-WAV container with no policy.
+/// - [`AudioError::UnsupportedContainer`] for a non-WAV container no decoder in
+///   this build handled.
 /// - [`AudioError::TooLong`] past the cap.
+/// - [`AudioError::Malformed`] for a stream a decoder here reads but that
+///   breaks its own format.
 /// - The WAV reader's refusals.
-/// - [`AudioError::Decoder`] carrying the subprocess decoder's own failure.
+/// - [`AudioError::Decoder`] carrying a passed deadline, or the subprocess
+///   decoder's own failure.
 pub fn decode_audio(
     bytes: &[u8],
     limits: &DecodeLimits,
-    ffmpeg: Option<&FfmpegPolicy>,
+    policy: &AudioDecodePolicy,
 ) -> Result<Pcm, AudioError> {
     if bytes.is_empty() {
         return Err(AudioError::Empty);
@@ -86,46 +164,7 @@ pub fn decode_audio(
         let rate = native.rate();
         Pcm::new(resample(native.samples(), rate, MODEL_RATE)?, MODEL_RATE)?
     } else {
-        let policy = ffmpeg.ok_or(AudioError::NeedsDecoder { container })?;
-        // Bound the decoder's output by the duration cap plus one second, so an
-        // overlong upload is stopped by the decoder rather than read in full.
-        let max = limits.max_seconds();
-        let cap_bytes =
-            usize::try_from((u64::from(max) + 1) * u64::from(MODEL_RATE) * 4).unwrap_or(usize::MAX);
-        let capped = policy.clone().with_max_output_bytes(
-            NonZeroUsize::new(cap_bytes.min(policy.max_output_bytes()))
-                .unwrap_or(NonZeroUsize::MIN),
-        );
-        let limit = (max + 1).to_string();
-        let raw = run_decoder(
-            &capped,
-            &[
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-t",
-                &limit,
-                "-f",
-                "f32le",
-                "-acodec",
-                "pcm_f32le",
-            ],
-            bytes,
-        )
-        .map_err(|error| match error {
-            VisionError::DecoderOutputCap { .. } => AudioError::TooLong {
-                seconds: f64::from(max) + 1.0,
-                max,
-            },
-            other => AudioError::Decoder(other),
-        })?;
-        let samples: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        Pcm::new(samples, MODEL_RATE)?
+        decode_with_steps(bytes, container, *limits, policy)?
     };
     if pcm.samples().is_empty() {
         return Err(AudioError::Empty);
@@ -137,6 +176,86 @@ pub fn decode_audio(
         "decoded audio"
     );
     Ok(pcm)
+}
+
+/// Offers a non-WAV container to each decoder this build has, in order.
+fn decode_with_steps(
+    bytes: &[u8],
+    container: &'static str,
+    limits: DecodeLimits,
+    policy: &AudioDecodePolicy,
+) -> Result<Pcm, AudioError> {
+    // The codec a step identified but could not decode, carried into the
+    // refusal so the caller learns why (e.g. "opus") rather than just "mp4".
+    #[cfg(feature = "decode-native")]
+    let codec = match native::decode(
+        bytes,
+        container,
+        limits,
+        native::Deadline::after(policy.timeout_secs()),
+    )? {
+        native::Native::Decoded(pcm) => return Ok(pcm),
+        native::Native::Unsupported { codec } => {
+            tracing::debug!(container, ?codec, "symphonia passed on this audio");
+            codec
+        }
+    };
+    #[cfg(not(feature = "decode-native"))]
+    let codec = None;
+    #[cfg(feature = "decode-ffmpeg")]
+    if let Some(ffmpeg) = policy.ffmpeg() {
+        return decode_ffmpeg(bytes, limits, ffmpeg);
+    }
+    let _ = (bytes, limits, policy);
+    Err(AudioError::UnsupportedContainer { container, codec })
+}
+
+/// The ffmpeg step: the container goes to the subprocess and raw `f32` samples
+/// come back at the model rate.
+#[cfg(feature = "decode-ffmpeg")]
+fn decode_ffmpeg(
+    bytes: &[u8],
+    limits: DecodeLimits,
+    policy: &FfmpegPolicy,
+) -> Result<Pcm, AudioError> {
+    // Bound the decoder's output by the duration cap plus one second, so an
+    // overlong upload is stopped by the decoder rather than read in full.
+    let max = limits.max_seconds();
+    let cap_bytes =
+        usize::try_from((u64::from(max) + 1) * u64::from(MODEL_RATE) * 4).unwrap_or(usize::MAX);
+    let capped = policy.clone().with_max_output_bytes(
+        NonZeroUsize::new(cap_bytes.min(policy.max_output_bytes())).unwrap_or(NonZeroUsize::MIN),
+    );
+    let limit = (max + 1).to_string();
+    let raw = run_decoder(
+        &capped,
+        &[
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-t",
+            &limit,
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+        ],
+        bytes,
+    )
+    .map_err(|error| match error {
+        VisionError::DecoderOutputCap { .. } => AudioError::TooLong {
+            seconds: f64::from(max) + 1.0,
+            max,
+        },
+        other => AudioError::Decoder(other),
+    })?;
+    let samples: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Pcm::new(samples, MODEL_RATE)
 }
 
 #[cfg(test)]

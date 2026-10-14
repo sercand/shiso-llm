@@ -1,21 +1,20 @@
 //! Frame extraction for real-world containers, through a subprocess decoder.
 //!
-//! # Why a subprocess and not a linked decoder
+//! # Where this sits in the decode chain
 //!
-//! A linked pure-Rust H.264 decoder plus a demuxer builds in seconds and needs
-//! no runtime dependency, but it covers H.264 ONLY - no H.265, VP9 or AV1,
-//! which between them are a large share of what people actually send - and the
-//! royalty-free patent grants in that space cover binaries the grantor
-//! distributes, not a source build redistributed by someone else. That is a
-//! licensing question for a project to answer deliberately, not one to settle
-//! by adding a dependency.
+//! This is the LAST step of the video chain and the only one that decodes every
+//! codec and container. The steps before it are the OS's own decoders
+//! (`VideoToolbox`, NVDEC) and, under the `decode-av1` feature (off until its decoder's release is fixed), a pure-Rust AV1
+//! decoder. H.264 and HEVC are deliberately never linked into the server: their
+//! royalty-free patent grants cover binaries the grantor distributes, not a
+//! source build redistributed by someone else, so those codecs go to the
+//! platform's own licensed decoder or to a binary the operator installed.
 //!
-//! A subprocess needs no build or link dependency, decodes everything, and can
-//! be swapped for an in-process decoder later without changing this module's
-//! signatures. The cost is a runtime binary and a process spawn per request, so
-//! it is OPT-IN - a caller that never constructs a [`FfmpegPolicy`] never
-//! reaches a spawn - and an absent binary is reported by name rather than as a
-//! decode failure.
+//! A subprocess needs no build or link dependency and decodes everything. The
+//! cost is a runtime binary and a process spawn per request, so it is OPT-IN:
+//! the step exists only when the operator passes `--ffmpeg-path`, a caller that
+//! never constructs a [`FfmpegPolicy`] never reaches a spawn, and an absent
+//! binary is reported by name rather than as a decode failure.
 //!
 //! # What is bounded
 //!

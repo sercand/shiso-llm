@@ -108,7 +108,7 @@ fn media(model: &EmbeddingGemma2, case: &serde_json::Value) -> Media {
         let pcm = shiso_audio::decode_audio(
             &bytes,
             &shiso_audio::DecodeLimits::new(std::num::NonZeroU32::new(60).expect("nonzero")),
-            None,
+            &shiso_audio::AudioDecodePolicy::default(),
         )
         .expect("decodes");
         out.audio

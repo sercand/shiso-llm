@@ -127,6 +127,8 @@ fn install_tracing() {
 /// a client can be told the server is up and then refused.
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     args.validate()?;
+    log_media_decoders(&args);
+    log_os_decoder(&args);
 
     // The language model is optional: a server started with only a recognizer
     // serves transcription and answers every generation route with the typed
@@ -266,7 +268,7 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
         max_streams: args.audio_max_streams,
         queue: args.audio_max_streams.saturating_mul(4),
         limits: args.audio_limits(),
-        ffmpeg: args.audio_ffmpeg_policy(),
+        decode: args.audio_decode_policy(),
         max_upload_bytes: args.audio_max_upload_bytes(),
         offline_min_secs: args.asr_offline_min_secs,
         skip_silence: args.asr_skip_silence,
@@ -405,9 +407,9 @@ pub fn boot_embedding(
         media: embed::MediaRules {
             image_limits: args.image_limits(),
             allow_remote: args.vision_allow_remote_images,
-            video_ffmpeg: args.ffmpeg_policy(),
+            video_decode: args.video_decode_policy(),
             audio_limits: args.audio_limits(),
-            audio_ffmpeg: args.audio_ffmpeg_policy(),
+            audio_decode: args.audio_decode_policy(),
         },
         profile: args
             .profile_dir
@@ -879,6 +881,64 @@ fn open_checkpoint_tier(
 #[cfg(all(feature = "metal", feature = "cuda"))]
 compile_error!("features `metal` and `cuda` name two devices; build with one");
 
+/// A build with no media decoder at all is not one of the supported decode
+/// chains (OS then ffmpeg, OS then Rust then ffmpeg, OS then Rust): on a machine
+/// without a hardware decoder it could decode nothing but WAV and GIF.
+#[cfg(not(any(feature = "decode-ffmpeg", feature = "decode-native")))]
+compile_error!(
+    "enable `decode-ffmpeg` or `decode-native`: a server with neither has no media decoder"
+);
+
+/// Reports at boot whether the OS can decode video, and which codecs, when video
+/// decoding is on. Unavailable is information, not a failure: the Rust and
+/// ffmpeg steps may still cover a request.
+fn log_os_decoder(args: &ServeArgs) {
+    if !args.video_allow_decode {
+        return;
+    }
+    match shiso_vision::probe_os_decoder() {
+        Ok(probe) => {
+            let codecs: Vec<String> = probe.codecs.iter().map(ToString::to_string).collect();
+            tracing::info!(decoder = probe.decoder, codecs = %codecs.join(","), "OS video decoder is ready");
+        }
+        Err(error) => {
+            tracing::info!(%error, "no OS video decoder; video falls through to the next step");
+        }
+    }
+}
+
+/// Reports at boot which media decoders this server can reach.
+///
+/// An operator who named an ffmpeg binary that is not runnable is
+/// misconfigured, and should learn that from the startup log rather than from a
+/// user's failed request an hour later. A missing binary is a warning, not a
+/// failure: the OS and Rust steps may still cover the request.
+#[cfg(feature = "decode-ffmpeg")]
+fn log_media_decoders(args: &ServeArgs) {
+    match shiso_vision::probe(args.ffmpeg_policy().as_ref()) {
+        shiso_vision::Availability::Ready { version } => {
+            tracing::info!(%version, "ffmpeg is ready for the containers nothing else decodes");
+        }
+        shiso_vision::Availability::Missing { binary, reason } => {
+            tracing::warn!(
+                ?binary,
+                %reason,
+                "--ffmpeg-path is not usable: audio other than WAV and video the OS and \
+                 native decoders do not handle will be refused"
+            );
+        }
+        shiso_vision::Availability::Disabled => {
+            tracing::info!("no --ffmpeg-path: ffmpeg will not be used");
+        }
+    }
+}
+
+/// Reports at boot which media decoders this server can reach.
+#[cfg(not(feature = "decode-ffmpeg"))]
+fn log_media_decoders(_args: &ServeArgs) {
+    tracing::info!("this build decodes media without ffmpeg");
+}
+
 /// Opens the compute device this build was compiled with.
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 fn open_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
@@ -1003,7 +1063,7 @@ fn build_renderer(
     };
     let renderer = renderer
         .with_remote_media(args.vision_allow_remote_images)
-        .with_video(args.ffmpeg_policy(), args.video_fps)
+        .with_video(args.video_decode_policy(), args.video_fps)
         .with_turn_replay(replay);
     // The clip's frontend and token rule are the tower's, so a renderer that
     // sizes a clip's pad run needs the tower itself; without one an audio part
@@ -1013,7 +1073,7 @@ fn build_renderer(
             tower,
             placement,
             args.audio_limits(),
-            args.audio_ffmpeg_policy(),
+            args.audio_decode_policy(),
         ),
         None => renderer,
     };

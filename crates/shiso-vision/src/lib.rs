@@ -20,9 +20,16 @@
 //!   type with a temporal extent above one. One type for both, because a still
 //!   is genuinely the degenerate video: the tower's patch dimension spans
 //!   several frames whether or not the input moves.
-//! - [`FfmpegPolicy`] and [`probe`] are the subprocess decode backend. It is
-//!   off unless a caller hands a policy over, and [`Option::None`] IS the off
-//!   state, so no value exists that means "configured but disabled".
+//! - [`VideoDecodePolicy`] and [`run_chain`] are the video decode chain: OS
+//!   decoder, then pure-Rust decoder, then the ffmpeg subprocess (`FfmpegPolicy`
+//!   and `probe`, under the `decode-ffmpeg` feature), each only where the
+//!   build has it. It is off unless a caller hands a policy over, and
+//!   [`Option::None`] IS the off state, so no value exists that means
+//!   "configured but disabled".
+//! - [`demux`] reads an MP4/MOV or Matroska/WebM container into one video
+//!   track's coded samples (ranges of the request buffer, in decode order),
+//!   and [`demux::SamplePlan`] decides which of them an in-process decoder
+//!   converts. It is always compiled: reading a container links no codec.
 //! - [`VisionTower`] is the contract a family's tower meets and the server
 //!   consumes, and [`MediaPlacement`] is what that family's template writes for
 //!   a picture. Both are here rather than in the server because a server that
@@ -55,15 +62,19 @@
 //! travelling as a buffer and a shape that must be kept in step.
 #![forbid(unsafe_code)]
 
+mod chain;
 mod config;
 mod container;
+pub mod demux;
 mod error;
+#[cfg(feature = "decode-ffmpeg")]
 mod ffmpeg;
 pub mod generator;
 mod image;
 mod item;
 mod mp4;
 pub mod shard;
+mod steps;
 mod tower;
 mod video;
 
@@ -72,9 +83,11 @@ mod generator_tests;
 #[cfg(test)]
 mod testing;
 
+pub use chain::{Attempt, StepInput, VideoDecodePolicy, VideoStep, run_chain};
 pub use config::{ImageLimits, PatchGeometry, PreprocessSpec, Resample, ResizeRule};
 pub use container::{VisionSource, open_checkpoint, open_gguf};
 pub use error::{Container, ShardFault, VisionError};
+#[cfg(feature = "decode-ffmpeg")]
 pub use ffmpeg::{Availability, FfmpegPolicy, decode_frames, probe, run_decoder};
 pub use generator::{
     GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat,
@@ -83,6 +96,8 @@ pub use generator::{
 pub use image::preprocess_image;
 pub use item::VisionItem;
 pub use shard::VisionShard;
+/// What this machine's OS video decoder reports, for the boot log.
+pub use shiso_media_sys::{HwProbe, probe as probe_os_decoder};
 pub use tower::{EncodedRows, MediaPlacement, VisionStages, VisionTower};
 pub use video::{
     DEFAULT_FPS, DEFAULT_MAX_FRAMES, DEFAULT_MIN_FRAMES, DecodedClip, DecodedFrame, decode_clip,

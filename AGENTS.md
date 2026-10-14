@@ -93,11 +93,11 @@ of truth. Every crate sets `[lints] workspace = true`. Do not add crate-level
 `#![deny(warnings)]` (rule 6).
 
 - **Unsafe:** denied everywhere except `shiso-modelfile` (mmap),
-  `shiso-metal` (objc2), `shiso-cuda` (driver FFI) and `shiso-ple` (io_uring).
-  Each of those relaxes the lint with a stated `reason`. Every `unsafe` block and
-  `unsafe impl` needs a `// SAFETY:` comment directly above it. Adding a fifth
-  crate to that set is a design decision; raise it with the user, don't just do
-  it.
+  `shiso-metal` (objc2), `shiso-cuda` (driver FFI), `shiso-ple` (io_uring) and
+  `shiso-media-sys` (OS video decoders). Each of those relaxes the lint with a
+  stated `reason`. Every `unsafe` block and `unsafe impl` needs a `// SAFETY:`
+  comment directly above it. Adding a sixth crate to that set is a design
+  decision; raise it with the user, don't just do it.
 - **Docs:** `missing_docs` is deny, so every public item needs a doc comment.
   Broken intra-doc links are deny.
 - **Lint suppressions:** use `#[expect(..., reason = "...")]`, never `#[allow]`.

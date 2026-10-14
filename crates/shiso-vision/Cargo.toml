@@ -7,6 +7,20 @@ license.workspace = true
 publish = false
 description = "shiso: host vision pipeline - image/video preprocess, both-tower weight loaders, encoder driver."
 
+[features]
+# Neither feature is on by default: a dependent that wants a decoder asks for
+# one, so a native-only server cannot have ffmpeg switched back on by feature
+# unification.
+#
+# The ffmpeg subprocess step. It still only runs when the operator names a
+# binary.
+decode-ffmpeg = []
+# The pure-Rust and library decoders that add build time.
+decode-native = []
+# The in-process AV1 step. OFF in every shipped configuration until a rav1d
+# release carries the fix for its abort on a damaged tile (see shiso-media-sys).
+decode-av1 = ["shiso-media-sys/av1-rav1d"]
+
 [dependencies]
 # The kernel argument blocks are `#[repr(C)]` structs marshalled through
 # `bytemuck`, so their layout comes from the struct definition rather than from
@@ -16,11 +30,18 @@ bytemuck = { workspace = true }
 # no device API and no HTTP stack. `thiserror` because a rejected decode is a
 # typed outcome the server turns into a 400, not a string.
 image = { workspace = true }
+# Matroska/WebM container parsing for the demuxer, which is always compiled:
+# reading a container links no codec, so it is not behind a decode feature.
+# MP4 is read in house (src/demux/mp4.rs) on the box walker faststart uses.
+matroska-demuxer = { workspace = true }
 shiso-core = { workspace = true }
 # The standalone tower container, and the tensor descriptors both towers are
 # checked against. This crate reads a model file but never a quantized block:
 # a vision weight goes to the device whole or is refused by name.
 shiso-modelfile = { workspace = true }
+# The OS video decoders (and, with `decode-av1`, the AV1 decoder) behind a
+# safe API. All the FFI is there, so this crate stays `forbid(unsafe_code)`.
+shiso-media-sys = { workspace = true }
 # The tower shard's header is a JSON table, and the checkpoint config carries
 # the shard's path in a key the config parser does not model.
 serde_json = { workspace = true }

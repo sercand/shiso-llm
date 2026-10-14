@@ -55,6 +55,16 @@ pub enum VisionError {
         field: &'static str,
     },
 
+    /// The container could not be read: its index or sample tables are broken.
+    /// Refused rather than retried on another decoder, which would hide a
+    /// corrupt upload behind whichever decoder happens to tolerate it.
+    #[error("the video container is malformed: {source}")]
+    Demux {
+        /// What the demuxer found wrong.
+        #[from]
+        source: crate::demux::DemuxError,
+    },
+
     /// The media payload carried no bytes at all.
     #[error("the media payload is empty")]
     EmptyPayload,
@@ -68,15 +78,33 @@ pub enum VisionError {
         source: image::ImageError,
     },
 
-    /// The container is one the in-process decoder does not handle and
-    /// subprocess decoding was not enabled by the operator.
+    /// The container is one the in-process GIF decoder does not handle and the
+    /// operator did not enable video decoding.
     #[error(
-        "decoding {container} needs ffmpeg and subprocess decoding is disabled; \
-         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
+        "decoding {container} needs video decoding, which is disabled; \
+         pass --video-allow-decode to enable it, or send an animated GIF"
     )]
-    SubprocessDecodeDisabled {
+    VideoDecodeDisabled {
         /// What the payload's magic bytes say it is.
         container: Container,
+    },
+
+    /// Video decoding is enabled but no decoder in this build handled the
+    /// container. Every step declined (an `Unsupported` outcome, never a
+    /// failure), so the request is refused rather than guessed at.
+    #[error(
+        "no video decoder in this build handled {container}{}; tried: {}. Enable the \
+         `decode-ffmpeg` feature and pass --ffmpeg-path, or use a platform with an OS decoder",
+        codec.as_deref().map(|c| format!(" ({c})")).unwrap_or_default(),
+        if tried.is_empty() { "nothing".to_owned() } else { tried.join(", ") }
+    )]
+    NoVideoDecoder {
+        /// What the payload's magic bytes say it is.
+        container: Container,
+        /// The video codec, when the container was read far enough to know it.
+        codec: Option<String>,
+        /// The steps that were offered the container, in order.
+        tried: Vec<&'static str>,
     },
 
     /// The container parsed but held no frames.
@@ -124,7 +152,7 @@ pub enum VisionError {
     /// and a corrupt upload have completely different fixes, and an error that
     /// reads like the latter sends the operator looking at the wrong thing.
     #[error(
-        "could not run {binary:?} - is ffmpeg installed and on PATH? (set --video-ffmpeg-path to point at it)"
+        "could not run {binary:?} - is ffmpeg installed and on PATH? (set --ffmpeg-path to point at it)"
     )]
     DecoderSpawn {
         /// The binary as configured, resolved on PATH or used as given.

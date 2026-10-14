@@ -141,7 +141,7 @@ fn main() -> Result<()> {
         let pcm = shiso_audio::decode_audio(
             &wav,
             &shiso_audio::DecodeLimits::new(std::num::NonZeroU32::new(60).context("nonzero")?),
-            None,
+            &shiso_audio::AudioDecodePolicy::default(),
         )?;
         let clip = shiso_audio::clip_for(tower.as_ref(), &pcm)?;
         let one = vec![EmbedPart::Audio(clip)];

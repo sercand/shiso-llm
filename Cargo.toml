@@ -17,6 +17,7 @@ members = [
     "crates/shiso-kernels",
     "crates/shiso-cuda",
     "crates/shiso-ple",
+    "crates/shiso-media-sys",
     "crates/shiso-parsers",
     "crates/shiso-kerneltest",
     "crates/shiso-router",
@@ -35,6 +36,11 @@ license = "MIT"
 [workspace.dependencies]
 # The real-input FFT of the log-mel frontends: planned once per frontend, f64.
 realfft = "3"
+# Pure-Rust audio decoding for shiso-audio's `decode-native` step. The codec
+# list is explicit: mp3, aac and isomp4 are off in symphonia's defaults, and the
+# defaults' SIMD and metadata features stay off so the set is the one the
+# design names and nothing more.
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "aac", "isomp4", "flac", "ogg", "vorbis", "wav", "pcm", "mkv"] }
 # --- serialization -------------------------------------------------------
 # preserve_order keeps JSON object keys in insertion order (IndexMap). The chat
 # template renderer must reproduce the transformers `tojson` key order, so this
@@ -110,6 +116,15 @@ hex = "0.4"
 # --- vision --------------------------------------------------------------
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 base64 = "0.22"
+# Matroska/WebM demux for the in-process video decoders. Pure Rust,
+# forbid(unsafe_code), no dependencies; Zlib OR MIT OR Apache-2.0.
+matroska-demuxer = "0.8"
+# The AV1 decoder behind shiso-media-sys's `av1-rav1d` feature (BSD-2-Clause).
+# That feature is OFF in every shipped configuration: 1.1.0 aborts the process on
+# a damaged tile (upstream issues 1492 and 1497, fixed by PR 1503 on main and
+# not yet in a release), which an untrusted upload can cause. Without `asm`: the
+# 1.1.0 package does not build with it on aarch64 macOS.
+rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 
 # --- dev -----------------------------------------------------------------
 tempfile = "3"
@@ -123,6 +138,8 @@ cudarc = { version = "0.19", default-features = false, features = [
     "std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-version-from-build-system",
 ] }
 io-uring = "0.7"
+# Run-time loading of the NVDEC driver libraries (shiso-media-sys, Linux only).
+libloading = "0.9"
 
 # --- Apple Metal ---------------------------------------------------------
 objc2 = "0.6"
@@ -156,6 +173,13 @@ objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSError
 # Page size for the page-aligned no-copy weight wrap (`_SC_PAGESIZE`).
 libc = "0.2"
 
+# --- VideoToolbox (shiso-media-sys, macOS target table) -------------------
+objc2-core-foundation = { version = "0.3", default-features = false }
+objc2-core-media = { version = "0.3", default-features = false }
+objc2-core-video = { version = "0.3", default-features = false }
+objc2-video-toolbox = { version = "0.3", default-features = false }
+block2 = "0.6"
+
 # --- workspace crates ----------------------------------------------------
 shiso-core = { path = "crates/shiso-core" }
 shiso-modelfile = { path = "crates/shiso-modelfile" }
@@ -164,22 +188,24 @@ shiso-engine = { path = "crates/shiso-engine" }
 shiso-models = { path = "crates/shiso-models" }
 shiso-kvstore = { path = "crates/shiso-kvstore" }
 shiso-ir = { path = "crates/shiso-ir" }
-shiso-vision = { path = "crates/shiso-vision" }
-shiso-audio = { path = "crates/shiso-audio" }
+shiso-vision = { path = "crates/shiso-vision", default-features = false }
+shiso-audio = { path = "crates/shiso-audio", default-features = false }
 shiso-server = { path = "crates/shiso-server" }
 shiso-bench = { path = "crates/shiso-bench" }
 shiso-kernels = { path = "crates/shiso-kernels" }
 shiso-cuda = { path = "crates/shiso-cuda" }
 shiso-ple = { path = "crates/shiso-ple" }
+shiso-media-sys = { path = "crates/shiso-media-sys", default-features = false }
 shiso-parsers = { path = "crates/shiso-parsers" }
 shiso-kerneltest = { path = "crates/shiso-kerneltest" }
 shiso-router = { path = "crates/shiso-router" }
 shiso-hub = { path = "crates/shiso-hub" }
 shiso-registry = { path = "crates/shiso-registry" }
 [workspace.lints.rust]
-# Safety. Four crates relax this with a crate-level
+# Safety. Five crates relax this with a crate-level
 # #![allow(unsafe_code, reason = "...")]: shiso-modelfile (mmap), shiso-metal (objc2),
-# shiso-cuda (driver FFI), shiso-ple (io-uring). Everywhere else it stands.
+# shiso-cuda (driver FFI), shiso-ple (io-uring), shiso-media-sys (OS video decoders).
+# Everywhere else it stands.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 

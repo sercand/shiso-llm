@@ -359,7 +359,7 @@ async fn post(state: &Arc<AppState>, body: Vec<u8>) -> (StatusCode, String) {
 }
 
 /// A recognizer and the shared MLX diarizer, booted as the binary boots them,
-/// with `--audio-allow-ffmpeg`, a `--audio-max-seconds` wide enough for the
+/// with `--ffmpeg-path`, a `--audio-max-seconds` wide enough for the
 /// meeting, and `extra` flags. `None` having said on stderr why the
 /// checkpoint was skipped.
 fn boot(recognizer: &Recognizer, diarizer: &Path, extra: &[&str]) -> Option<Arc<AppState>> {
@@ -393,10 +393,9 @@ fn boot(recognizer: &Recognizer, diarizer: &Path, extra: &[&str]) -> Option<Arc<
         recognizer.name,
         "--diarization-model",
         &diarizer,
-        "--audio-allow-ffmpeg",
         "--audio-max-seconds",
         "3600",
-        "--video-ffmpeg-path",
+        "--ffmpeg-path",
         &ffmpeg,
         // The default 20 s watchdog is sized for short video clips, not a
         // 57-minute container; ffmpeg's own decode is well under this, but

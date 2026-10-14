@@ -417,10 +417,10 @@ fn activity_and_mel(
     shiso_audio::transcript::SpeakerActivity,
     shiso_audio::MelFrames,
 ) {
-    use shiso_audio::{DecodeLimits, LogScale, MelFrontend, decode_audio};
+    use shiso_audio::{AudioDecodePolicy, DecodeLimits, LogScale, MelFrontend, decode_audio};
 
     let limits = DecodeLimits::new(std::num::NonZeroU32::new(600).expect("non-zero"));
-    let pcm = decode_audio(&clip(name), &limits, None).expect("decodes");
+    let pcm = decode_audio(&clip(name), &limits, &AudioDecodePolicy::default()).expect("decodes");
     let backend: Arc<dyn shiso_core::Backend> =
         shiso_metal::MetalBackend::new().expect("the Metal library compiles");
     let diarizer = shiso_models::audio_registry::open_diarizer(diar, &backend).expect("loads");

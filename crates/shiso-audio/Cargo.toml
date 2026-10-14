@@ -7,6 +7,17 @@ license.workspace = true
 publish = false
 description = "shiso: host audio pipeline - decode, resample, log-mel frontends, vocabularies, transcript assembly."
 
+[features]
+# No default decoders: a dependent asks for the ones it wants, so a native-only
+# server cannot have ffmpeg switched back on by feature unification.
+#
+# The ffmpeg subprocess step (the runner lives in shiso-vision). It still only
+# runs when the operator names a binary.
+decode-ffmpeg = ["shiso-vision/decode-ffmpeg"]
+# The pure-Rust decoders: symphonia for mp3, aac (mp4/m4a), flac, vorbis and
+# PCM in their usual containers.
+decode-native = ["shiso-vision/decode-native", "dep:symphonia"]
+
 [dependencies]
 # The subprocess decoder and its policy are shared with video input: one set of
 # caps and one watchdog for every container the server hands to ffmpeg. The
@@ -22,6 +33,9 @@ serde_json = { workspace = true }
 # The frames' real-input FFT: a planned transform and reused scratch, rather
 # than a hand-written complex transform of a real frame.
 realfft = { workspace = true }
+# The `decode-native` step. Optional, so a build without it compiles no decoder
+# it would never call.
+symphonia = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

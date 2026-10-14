@@ -29,7 +29,6 @@ use shiso_audio::{
     AudioError, Context, ContextEncoder, ContextIds, DecodeLimits, Diarizer, Language, Pcm,
     SpeechRecognizer,
 };
-use shiso_vision::FfmpegPolicy;
 use tokio::sync::mpsc;
 
 use crate::error::AppError;
@@ -129,9 +128,8 @@ pub struct AudioServiceDesc {
     pub queue: usize,
     /// The decode cap a request's audio is held to.
     pub limits: DecodeLimits,
-    /// The subprocess decoder for containers other than WAV, or `None` when
-    /// only WAV is accepted.
-    pub ffmpeg: Option<FfmpegPolicy>,
+    /// How containers other than WAV are decoded.
+    pub decode: shiso_audio::AudioDecodePolicy,
     /// The largest request body the transcription routes read.
     pub max_upload_bytes: usize,
     /// The shortest decoded clip, in seconds, that a non-streaming job
@@ -159,7 +157,7 @@ pub struct AudioService {
     languages: Arc<[String]>,
     diarizer: bool,
     limits: DecodeLimits,
-    ffmpeg: Option<Arc<FfmpegPolicy>>,
+    decode: Arc<shiso_audio::AudioDecodePolicy>,
     max_upload_bytes: usize,
     /// The encoder the recognizer hands the server for its context, or
     /// `None` for a recognizer that takes none.
@@ -181,7 +179,7 @@ impl AudioService {
             languages: desc.recognizer.languages().into(),
             diarizer: desc.diarizer.is_some(),
             limits: desc.limits,
-            ffmpeg: desc.ffmpeg.clone().map(Arc::new),
+            decode: Arc::new(desc.decode.clone()),
             max_upload_bytes: desc.max_upload_bytes,
             context: desc.recognizer.context_encoder(),
             max_context_ids: desc.max_context_ids,
@@ -301,15 +299,13 @@ impl AudioService {
     /// could not run.
     pub async fn decode(&self, bytes: axum::body::Bytes) -> Result<Pcm, AudioError> {
         let limits = self.limits;
-        let ffmpeg = self.ffmpeg.clone();
-        tokio::task::spawn_blocking(move || {
-            shiso_audio::decode_audio(&bytes, &limits, ffmpeg.as_deref())
-        })
-        .await
-        .map_err(|error| AudioError::Io {
-            what: "running the audio decode",
-            source: std::io::Error::other(error),
-        })?
+        let decode = Arc::clone(&self.decode);
+        tokio::task::spawn_blocking(move || shiso_audio::decode_audio(&bytes, &limits, &decode))
+            .await
+            .map_err(|error| AudioError::Io {
+                what: "running the audio decode",
+                source: std::io::Error::other(error),
+            })?
     }
 
     /// Queues `job` and returns the channel its events arrive on.

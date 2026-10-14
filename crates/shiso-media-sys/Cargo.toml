@@ -1,0 +1,41 @@
+[package]
+name = "shiso-media-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "shiso: OS video decoders (VideoToolbox, NVDEC) and the AV1 decoder behind a safe API - the one place media FFI lives."
+
+[features]
+# The pure-Rust AV1 decoder, for a machine whose OS has none. OFF in every shipped
+# configuration: the rav1d 1.1.0 release aborts the process on a damaged tile
+# (fixed upstream in PR 1503, unreleased), so untrusted input must not reach it.
+# Turn it on once a release carries the fix. The OS decoders are always compiled.
+av1-rav1d = ["dep:rav1d", "dep:libc"]
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# av1-rav1d: the AV1 decoder, and libc for the errno values its C ABI
+# returns (EAGAIN differs between macOS and Linux).
+rav1d = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+
+# NVDEC: libcuda and libnvcuvid are opened at run time, never linked, so a
+# machine without the NVIDIA driver runs the same binary.
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = { workspace = true }
+
+# VideoToolbox, through the objc2 framework bindings. A target table, not a
+# feature: the OS decoder is always compiled where the OS has one.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { workspace = true }
+objc2-core-foundation = { workspace = true, features = ["std", "CFBase", "CFData", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-media = { workspace = true, features = ["std", "objc2", "CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
+objc2-core-video = { workspace = true, features = ["std", "objc2", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-video-toolbox = { workspace = true, features = ["std", "objc2", "VTBase", "VTDecompressionProperties", "VTDecompressionSession", "VTErrors", "VTSession", "VTUtilities", "block2", "objc2-core-media", "objc2-core-video"] }
+
+[lints]
+workspace = true

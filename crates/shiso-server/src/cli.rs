@@ -12,15 +12,19 @@
 //! whether a remote address may be fetched, whether a subprocess may be spawned,
 //! how much wall clock one decode may burn - and a policy decision that lives in
 //! a file nobody reads is a policy decision nobody made. They map one to one
-//! onto the types the media layer takes, and [`ServeArgs::ffmpeg_policy`] is the
-//! only place that mapping happens.
+//! onto the types the media layer takes, and [`ServeArgs::video_decode_policy`]
+//! and [`ServeArgs::audio_decode_policy`] are the only places that mapping
+//! happens.
 
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
+use shiso_audio::AudioDecodePolicy;
 use shiso_parsers::{ReasoningScheme, ToolCallScheme};
 pub use shiso_router::cli::RouterArgs;
-use shiso_vision::{FfmpegPolicy, ImageLimits};
+#[cfg(feature = "decode-ffmpeg")]
+use shiso_vision::FfmpegPolicy;
+use shiso_vision::{ImageLimits, VideoDecodePolicy};
 
 use clap::parser::ValueSource;
 use shiso_hub::recipe::{ExpertResidency, ServerDefaults};
@@ -443,13 +447,17 @@ pub struct ServeArgs {
         default_value_t = false
     )]
     pub vision_allow_remote_images: bool,
-    /// Allow decoding video by spawning the configured decoder.
-    #[arg(long, env = "SHISO_VIDEO_ALLOW_FFMPEG", default_value_t = false)]
-    pub video_allow_ffmpeg: bool,
-    /// The decoder binary. A bare name is resolved on `PATH`; an absolute path
-    /// pins a known build.
-    #[arg(long, env = "SHISO_VIDEO_FFMPEG_PATH", default_value = "ffmpeg")]
-    pub video_ffmpeg_path: PathBuf,
+    /// Allow decoding video other than GIF: the OS decoder, then the pure-Rust
+    /// one, then ffmpeg when `--ffmpeg-path` is set.
+    #[arg(long, env = "SHISO_VIDEO_ALLOW_DECODE", default_value_t = false)]
+    pub video_allow_decode: bool,
+    /// The ffmpeg binary, for the containers and codecs nothing else in this
+    /// build decodes. A bare name is resolved on `PATH`; an absolute path pins
+    /// a known build. There is no default: without it ffmpeg is never loaded or
+    /// spawned, for video or for audio.
+    #[cfg(feature = "decode-ffmpeg")]
+    #[arg(long, env = "SHISO_FFMPEG_PATH")]
+    pub ffmpeg_path: Option<PathBuf>,
     /// Frames a second to sample a clip at.
     #[arg(long, env = "SHISO_VIDEO_FPS", default_value_t = shiso_vision::DEFAULT_FPS)]
     pub video_fps: f64,
@@ -469,10 +477,6 @@ pub struct ServeArgs {
     /// routes take it; every other route keeps the JSON body limit.
     #[arg(long, env = "SHISO_AUDIO_MAX_UPLOAD_MB", default_value = "512")]
     pub audio_max_upload_mb: NonZeroU32,
-    /// Allow decoding audio containers other than WAV by spawning the decoder
-    /// `--video-ffmpeg-path` names.
-    #[arg(long, env = "SHISO_AUDIO_ALLOW_FFMPEG", default_value_t = false)]
-    pub audio_allow_ffmpeg: bool,
     /// Speech recognizer checkpoint: an export directory or a GGUF file.
     /// Serves `/v1/audio/transcriptions`.
     #[arg(long, env = "SHISO_ASR_MODEL")]
@@ -1248,22 +1252,43 @@ impl ServeArgs {
         })
     }
 
-    /// The decode policy these flags describe, or `None` when video decoding is
-    /// off.
+    /// The video decode policy these flags describe, or `None` when video
+    /// decoding is off.
     ///
     /// `None` *is* the off state, which is why this returns an option rather
     /// than a policy with a disabled flag inside it: there is then no value
     /// that means "configured but not allowed" for a later caller to
     /// misinterpret.
     #[must_use]
-    pub fn ffmpeg_policy(&self) -> Option<FfmpegPolicy> {
-        if !self.video_allow_ffmpeg {
+    pub fn video_decode_policy(&self) -> Option<VideoDecodePolicy> {
+        if !self.video_allow_decode {
             return None;
         }
-        let mut policy = FfmpegPolicy::new(self.video_ffmpeg_path.clone());
-        if let Some(frames) = NonZeroUsize::new(self.video_max_frames) {
-            policy = policy.with_max_frames(frames);
+        let mut policy = VideoDecodePolicy::default();
+        if let (Some(seconds), Some(frames)) = (
+            NonZeroU64::new(self.video_decode_timeout_s),
+            NonZeroUsize::new(self.video_max_frames),
+        ) {
+            policy = VideoDecodePolicy::new(seconds, frames);
         }
+        #[cfg(feature = "decode-ffmpeg")]
+        if let Some(ffmpeg) = self.ffmpeg_policy() {
+            let ffmpeg = match NonZeroUsize::new(self.video_max_frames) {
+                Some(frames) => ffmpeg.with_max_frames(frames),
+                None => ffmpeg,
+            };
+            policy = policy.with_ffmpeg(ffmpeg);
+        }
+        Some(policy)
+    }
+
+    /// The ffmpeg policy `--ffmpeg-path` describes, or `None` when no binary
+    /// was named.
+    #[cfg(feature = "decode-ffmpeg")]
+    #[must_use]
+    pub fn ffmpeg_policy(&self) -> Option<FfmpegPolicy> {
+        let path = self.ffmpeg_path.clone()?;
+        let mut policy = FfmpegPolicy::new(path);
         if let Some(seconds) = NonZeroU64::new(self.video_decode_timeout_s) {
             policy = policy.with_timeout_secs(seconds);
         }
@@ -1284,21 +1309,23 @@ impl ServeArgs {
         shiso_audio::DecodeLimits::new(self.audio_max_seconds)
     }
 
-    /// The subprocess policy for audio containers other than WAV, or `None`
-    /// when only WAV is accepted.
+    /// How audio containers other than WAV are decoded.
     ///
-    /// The binary and the timeout are the video decoder's: one ffmpeg per
-    /// server, switched on per kind of media.
+    /// There is no audio opt-in flag: any container the build decodes without
+    /// a subprocess is accepted, and the ffmpeg step exists only when
+    /// `--ffmpeg-path` names a binary. The binary and the timeout are shared
+    /// with video: one ffmpeg per server.
     #[must_use]
-    pub fn audio_ffmpeg_policy(&self) -> Option<FfmpegPolicy> {
-        if !self.audio_allow_ffmpeg {
-            return None;
-        }
-        let mut policy = FfmpegPolicy::new(self.video_ffmpeg_path.clone());
+    pub fn audio_decode_policy(&self) -> AudioDecodePolicy {
+        let mut policy = AudioDecodePolicy::default();
         if let Some(seconds) = NonZeroU64::new(self.video_decode_timeout_s) {
-            policy = policy.with_timeout_secs(seconds);
+            policy = AudioDecodePolicy::new(seconds);
         }
-        Some(policy)
+        #[cfg(feature = "decode-ffmpeg")]
+        if let Some(ffmpeg) = self.ffmpeg_policy() {
+            policy = policy.with_ffmpeg(ffmpeg);
+        }
+        policy
     }
 }
 
