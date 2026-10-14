@@ -1355,6 +1355,48 @@ impl shiso_vision::VisionTower for FakeTower {
 pub(crate) struct FakeMediaModel {
     inner: FakeModel,
     media_calls: Arc<AtomicUsize>,
+    /// A checkpoint tier that files media prompts under their content key,
+    /// when the test asked for one.
+    keyed: Option<KeyedTier>,
+}
+
+/// A checkpoint tier in miniature that keeps only the rule under test: a
+/// prefix is filed under the path the session was keyed with, at each shared
+/// boundary its reads cross, and a resume stands on the longest filed prefix
+/// of its own key. Nothing unkeyed is ever filed.
+#[derive(Debug, Default)]
+struct KeyedTier {
+    sessions: HashMap<SessionId, KeyedSession>,
+    filed: Vec<Vec<TokenId>>,
+}
+
+/// One session as the keyed tier sees it.
+#[derive(Debug, Default)]
+struct KeyedSession {
+    key: Option<Vec<TokenId>>,
+    written: usize,
+    hints: Vec<u32>,
+}
+
+impl KeyedTier {
+    /// Advances `session` by `n` tokens, filing its key at every boundary
+    /// the read crosses.
+    fn read(&mut self, session: SessionId, n: usize) {
+        let Some(live) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let (from, to) = (live.written, live.written + n);
+        live.written = to;
+        let Some(key) = live.key.as_ref() else {
+            return;
+        };
+        for hint in &live.hints {
+            let at = usize::try_from(*hint).unwrap_or(usize::MAX);
+            if at > from && at <= to && at <= key.len() {
+                self.filed.push(key[..at].to_vec());
+            }
+        }
+    }
 }
 
 impl FakeMediaModel {
@@ -1367,9 +1409,23 @@ impl FakeMediaModel {
             Self {
                 inner,
                 media_calls: Arc::clone(&media_calls),
+                keyed: None,
             },
             media_calls,
         )
+    }
+
+    /// The same model, its checkpoint tier filing media prompts by content.
+    pub(crate) fn with_keyed_tier(mut self) -> Self {
+        self.keyed = Some(KeyedTier::default());
+        self
+    }
+
+    /// Advances `session` on the keyed tier, when there is one.
+    fn read(&mut self, session: SessionId, n: usize) {
+        if let Some(tier) = self.keyed.as_mut() {
+            tier.read(session, n);
+        }
     }
 }
 
@@ -1379,18 +1435,27 @@ impl Model for FakeMediaModel {
     }
 
     fn open_session(&mut self) -> CoreResult<SessionId> {
-        self.inner.open_session()
+        let session = self.inner.open_session()?;
+        if let Some(tier) = self.keyed.as_mut() {
+            tier.sessions.insert(session, KeyedSession::default());
+        }
+        Ok(session)
     }
 
     fn close_session(&mut self, session: SessionId) -> CoreResult<()> {
+        if let Some(tier) = self.keyed.as_mut() {
+            tier.sessions.remove(&session);
+        }
         self.inner.close_session(session)
     }
 
     fn prefill_chunk(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<()> {
+        self.read(session, tokens.len());
         self.inner.prefill_chunk(session, tokens)
     }
 
     fn prefill_last(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<Logits<'_>> {
+        self.read(session, tokens.len());
         self.inner.prefill_last(session, tokens)
     }
 
@@ -1415,6 +1480,7 @@ impl shiso_core::MediaModel for FakeMediaModel {
         _media: &shiso_core::VisionPrefill<'_>,
     ) -> CoreResult<Logits<'_>> {
         self.media_calls.fetch_add(1, Ordering::SeqCst);
+        self.read(session, tokens.len());
         // The scripted row answers through the plain entry point, which also
         // records the prompt: a media read and a text read differ by the
         // counter, not by what the audit's prompt list shows.
@@ -1428,22 +1494,74 @@ impl Checkpointed for FakeMediaModel {
     }
 
     fn kv_checkpoint_enabled(&self) -> bool {
-        false
+        self.keyed.is_some()
     }
 
     fn kv_resume(
         &mut self,
-        _session: SessionId,
-        _prompt: &[TokenId],
+        session: SessionId,
+        prompt: &[TokenId],
     ) -> CoreResult<Option<ResumeInfo<'_>>> {
-        Ok(None)
+        self.inner.audit.resumes.lock().push(prompt.len());
+        let Some(tier) = self.keyed.as_mut() else {
+            return Ok(None);
+        };
+        let Some(live) = tier.sessions.get_mut(&session) else {
+            return Err(CoreError::UnknownSession(session));
+        };
+        let lookup = live.key.clone().unwrap_or_else(|| prompt.to_vec());
+        let reused = tier
+            .filed
+            .iter()
+            .filter(|path| path.len() < prompt.len() && lookup.starts_with(path))
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        if reused == 0 {
+            return Ok(None);
+        }
+        live.written = reused;
+        Ok(Some(ResumeInfo::new(
+            u32::try_from(reused).unwrap_or(u32::MAX),
+            prompt[..reused].to_vec(),
+            None,
+            ResumeSource::Memory,
+        )))
+    }
+
+    fn kv_set_media_key(
+        &mut self,
+        session: SessionId,
+        _prompt: &[TokenId],
+        key: shiso_core::media::MediaKey<'_>,
+    ) -> CoreResult<()> {
+        match self.keyed.as_mut() {
+            Some(tier) => {
+                if let Some(live) = tier.sessions.get_mut(&session) {
+                    live.key = Some(key.path().to_vec());
+                }
+                Ok(())
+            }
+            None => Err(CoreError::Unsupported {
+                what: "a content-keyed prefix for a media prompt",
+                backend: "fake",
+            }),
+        }
     }
 
     fn kv_save(&mut self, _session: SessionId, _reason: Reason) -> CoreResult<SaveOutcome> {
         Ok(SaveOutcome::Refused(PersistRefusal::NoCheckpoint))
     }
 
-    fn kv_set_hints(&mut self, _session: SessionId, _hints: &[u32]) -> CoreResult<()> {
+    fn kv_set_hints(&mut self, session: SessionId, hints: &[u32]) -> CoreResult<()> {
+        self.inner.audit.hints.lock().push(hints.to_vec());
+        if let Some(live) = self
+            .keyed
+            .as_mut()
+            .and_then(|tier| tier.sessions.get_mut(&session))
+        {
+            live.hints = hints.to_vec();
+        }
         Ok(())
     }
 
@@ -1485,14 +1603,41 @@ pub(crate) fn fake_media_engine_without_tower(
     media_engine_with(rows, vocabulary, None)
 }
 
+/// As [`fake_media_engine`], over a model whose checkpoint tier files media
+/// prompts under their content key.
+pub(crate) fn fake_keyed_media_engine(
+    rows: Vec<Vec<f32>>,
+    vocabulary: Option<Arc<Vocabulary>>,
+) -> MediaEngine {
+    let tower = shiso_server::vision::VisionTower::from_tower(Box::new(FakeTower {
+        spec: media_spec(),
+        fail: false,
+    }));
+    media_engine_keyed(rows, vocabulary, Some(tower), true)
+}
+
 fn media_engine_with(
     rows: Vec<Vec<f32>>,
     vocabulary: Option<Arc<Vocabulary>>,
     vision: Option<shiso_server::vision::VisionTower>,
 ) -> MediaEngine {
+    media_engine_keyed(rows, vocabulary, vision, false)
+}
+
+fn media_engine_keyed(
+    rows: Vec<Vec<f32>>,
+    vocabulary: Option<Arc<Vocabulary>>,
+    vision: Option<shiso_server::vision::VisionTower>,
+    keyed: bool,
+) -> MediaEngine {
     let backend: Arc<dyn Backend> = FakeBackend::new();
     let (model, audit) = FakeModel::new(&backend, Vec::new());
     let (model, media_calls) = FakeMediaModel::new(model.with_prefill_rows(rows));
+    let model = if keyed {
+        model.with_keyed_tier()
+    } else {
+        model
+    };
     let (engine, join) = spawn_engine_with_checkpoints(
         backend,
         Box::new(model),

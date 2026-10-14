@@ -103,13 +103,13 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     // puts them.
     if let Some(layout) = state.decision_layout.as_deref() {
         let media = sources.iter().map(core::image_block).collect();
-        let (answers, prompt_tokens) =
+        let (answers, tally) =
             head::run(state, layout, &state_text, media, questions, 1.0, false).await?;
         return Ok(Json(encode(
             state.model_id.clone(),
             state_text,
             &answers,
-            prompt_tokens,
+            tally.input,
         ))
         .into_response());
     }
@@ -118,7 +118,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     // prompt's next-token row, laid out the way its family lays it out.
     if let Some(layout) = state.decision_readout.as_deref() {
         let media = sources.iter().map(core::image_block).collect();
-        let (answers, prompt_tokens) = readout::run(
+        let (answers, tally) = readout::run(
             state,
             layout,
             readout_state.as_deref(),
@@ -132,7 +132,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
             state.model_id.clone(),
             state_text,
             &answers,
-            prompt_tokens,
+            tally.input,
         ))
         .into_response());
     }

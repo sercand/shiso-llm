@@ -255,3 +255,100 @@ async fn a_score_without_media_is_unchanged() {
         .expect("the engine thread does not panic")
         .expect("the loop exits cleanly");
 }
+
+/// Three questions over one picture, as a decision request asks them: one
+/// prompt each, every one opening with the same words and pad run.
+fn sibling_prompts() -> Vec<Arc<[TokenId]>> {
+    (0..3u32)
+        .map(|question| {
+            Arc::from(
+                // Each tail its own word, clear of the pad id.
+                [1, PAD, PAD, PAD, PAD, 1, 1, 10 + question]
+                    .iter()
+                    .copied()
+                    .map(TokenId::new)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn sibling_questions_over_one_keyed_picture_read_it_once() {
+    let (item, digest) = one_picture();
+    let (engine, join, _audit, media_calls) =
+        common::fake_keyed_media_engine(vec![label_row(); 3], Some(qwen_vocabulary()));
+    let items: Arc<[MediaItem]> = Arc::from(vec![item]);
+    let digests: Arc<[shiso_core::media::MediaDigest]> = Arc::from(vec![digest]);
+
+    let outcomes = futures::future::join_all(sibling_prompts().into_iter().map(|prompt| {
+        engine.score(
+            ScoreRequest::new(prompt, labels())
+                .with_media(Arc::clone(&items), Arc::clone(&digests))
+                .with_shared_prefix(7),
+        )
+    }))
+    .await;
+    let cached: Vec<u64> = outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("every question is answered").cached_tokens)
+        .collect();
+
+    // The first question reads the picture and leaves the state after the
+    // shared words filed under the picture's content; the other two stand on
+    // it and read only their own tail - the picture is never read again.
+    assert_eq!(cached, vec![0, 7, 7], "{cached:?}");
+    assert_eq!(media_calls.load(Ordering::SeqCst), 1);
+
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
+}
+
+#[tokio::test]
+async fn another_picture_under_the_same_pad_run_never_resumes_past_it() {
+    let (item, digest) = one_picture();
+    let (engine, join, _audit, media_calls) =
+        common::fake_keyed_media_engine(vec![label_row(); 2], Some(qwen_vocabulary()));
+    let items: Arc<[MediaItem]> = Arc::from(vec![item]);
+    let prompt = sibling_prompts().remove(0);
+
+    let first = engine
+        .score(
+            ScoreRequest::new(Arc::clone(&prompt), labels())
+                .with_media(Arc::clone(&items), Arc::from(vec![digest]))
+                .with_shared_prefix(7),
+        )
+        .await
+        .expect("the first picture is answered");
+    assert_eq!(first.cached_tokens, 0);
+
+    // The same ids, pad run and all, under another picture's digest: what was
+    // filed past the first picture must not serve this one. The word before
+    // the run is the only prefix the two share.
+    let other = shiso_core::media::MediaDigest::new([0xab; 32]);
+    let second = engine
+        .score(
+            ScoreRequest::new(prompt, labels())
+                .with_media(items, Arc::from(vec![other]))
+                .with_shared_prefix(7),
+        )
+        .await
+        .expect("the second picture is answered");
+    assert!(
+        second.cached_tokens <= 1,
+        "resumed {} tokens of another picture's prefix",
+        second.cached_tokens
+    );
+    assert_eq!(
+        media_calls.load(Ordering::SeqCst),
+        2,
+        "the second picture was read"
+    );
+
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
+}

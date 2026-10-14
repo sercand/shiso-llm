@@ -337,7 +337,7 @@ pub struct SparseSession {
     pub(crate) media: bool,
     /// The content-keyed path the cache files this session under, when the
     /// host supplied one. See [`shiso_core::media::MediaKey`].
-    pub(crate) key: Option<SessionKey>,
+    pub(crate) key: Option<crate::media_path::SessionKey>,
     /// How far this session's rotary position trails its sequence position.
     ///
     /// Zero until a picture has been read. A picture occupies its grid's area
@@ -350,36 +350,6 @@ pub struct SparseSession {
     /// The position a resume stood this session on, zero for one prefilled
     /// from nothing.
     pub(crate) resumed_at: u32,
-}
-
-/// A media session's cache key, and its history as the cache reads it.
-#[derive(Debug)]
-pub(crate) struct SessionKey {
-    /// The prompt's key path, as long as the prompt.
-    pub(crate) prompt: Vec<TokenId>,
-    /// The prompt's items, in prompt order.
-    pub(crate) spans: Vec<shiso_core::media::MediaSpan>,
-    /// `history` with every position the prompt keyed written in its key id.
-    ///
-    /// Kept rather than derived because a commit reads it once per span and a
-    /// decode step is one span: rebuilding it there would make every token
-    /// cost a pass over the conversation.
-    pub(crate) path: Vec<TokenId>,
-}
-
-impl SessionKey {
-    /// Appends `tokens`, which sit at the positions from `at`, as the cache
-    /// reads them.
-    pub(crate) fn extend_keyed(&self, at: u32, tokens: &[TokenId], out: &mut Vec<TokenId>) {
-        let at = usize::try_from(at).unwrap_or(usize::MAX);
-        out.extend(tokens.iter().enumerate().map(|(i, token)| {
-            self.prompt
-                .get(at.saturating_add(i))
-                .copied()
-                .filter(|id| id.get() >= shiso_core::media::KEY_ID_FLOOR)
-                .unwrap_or(*token)
-        }));
-    }
 }
 
 impl SparseSession {
@@ -1399,9 +1369,7 @@ impl SparseStack {
                 .get_mut(&session)
                 .ok_or(CoreError::UnknownSession(session))?;
             if let Some(key) = live.key.as_mut() {
-                let mut path = std::mem::take(&mut key.path);
-                key.extend_keyed(live.written, tokens, &mut path);
-                key.path = path;
+                key.push(live.written, tokens);
             }
             live.history.extend_from_slice(tokens);
             live.written = live.written.saturating_add(n_tok);

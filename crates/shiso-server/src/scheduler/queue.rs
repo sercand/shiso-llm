@@ -374,6 +374,9 @@ pub struct ScoreOutcome {
     /// One logit per option, per question, for a decision pass; empty for a
     /// label pass.
     pub option_logits: Vec<Vec<f32>>,
+    /// Prompt tokens a stored prefix covered rather than this pass reading
+    /// them: a sibling question's checkpoint, or an earlier request's.
+    pub cached_tokens: u64,
 }
 
 /// The handlers' end of the boundary.

@@ -744,18 +744,45 @@ impl SparseStack {
         // must not hide the message boundary a thousand tokens later.
         let floor = ckpt.options.min_tokens.max(1);
         let lowest = pos.max(live.resumed_at).saturating_add(floor).max(floor);
+        // A media score's own boundaries - where its picture starts and where
+        // its sibling questions part - are the host's call, and its siblings
+        // stand on exactly those, so they are taken wherever they fall. A text
+        // score's keep the floor: its siblings read together in one batched
+        // pass, which a stop inside a run would refuse.
+        let media_score = live.scoring && live.media;
+        let own_lowest = if media_score {
+            pos.saturating_add(1)
+        } else {
+            lowest
+        };
+        let clears = |at: u32| {
+            !live.media
+                || live
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| !key.spans.iter().any(|span| span.splits(at)))
+        };
         // Each is moved back onto the recurrence's grid first: a stop between
         // two grid points would cut a run, and every later pass of this prompt -
         // and of every prompt resumed from the checkpoint taken here - would sum
         // differently from a cold prefill of the same tokens. The resume re-reads
-        // the few positions between the grid point and the boundary instead.
+        // the few positions between the grid point and the boundary instead. In
+        // a media prompt a boundary whose grid point lies inside a picture - the
+        // end of a shared picture, where sibling questions part - is taken where
+        // it is rather than dropped, because the alternative is every sibling
+        // reading the picture again.
+        let place = |stop: u32, lowest: u32| {
+            let grid = stop - stop % GDN_CHUNK;
+            let exact = live.media.then_some(stop);
+            std::iter::once(grid)
+                .chain(exact)
+                .find(|at| *at > pos && *at < len && *at >= lowest && clears(*at))
+        };
         let stop = live
             .hints
             .iter()
-            .copied()
-            .chain(std::iter::once(branch))
-            .map(|stop| stop - stop % GDN_CHUNK)
-            .filter(|stop| *stop > pos && *stop < len && *stop >= lowest)
+            .filter_map(|hint| place(*hint, own_lowest))
+            .chain(place(branch, lowest))
             .min();
         Ok(stop.and_then(|stop| usize::try_from(stop - pos).ok()))
     }

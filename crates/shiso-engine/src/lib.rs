@@ -46,6 +46,7 @@ pub mod gdn;
 mod kv;
 pub mod launch;
 pub mod layers;
+mod media_path;
 pub mod moe;
 pub mod moe_biased;
 /// Speculative decode's decidable half, shared by both stacks.

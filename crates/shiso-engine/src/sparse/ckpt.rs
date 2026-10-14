@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
-use shiso_core::media::{KEY_ID_FLOOR, MediaKey, MediaSpan};
+use shiso_core::media::{MediaKey, MediaSpan};
 use shiso_core::model::Logits;
 use shiso_kvstore::{
     CacheStats, CommitOpts, KvCache, PathLayout, PersistRefusal, PumpReport, Reason,
@@ -53,13 +53,14 @@ use shiso_kvstore::{
 
 use crate::ckpt::{Checkpoint, CkptConfig, ResumeInfo, SaveOutcome, source_of};
 use crate::ckpt_layout::CkptIdentity;
+use crate::media_path::{self, SessionKey};
 use crate::shape::LayerKind;
 use crate::sparse::kernels::F32_BYTES;
 use crate::sparse::mtp::SpecDepth;
 use crate::sparse::paged::{self, PagePlanes, conv_state_bytes, ple_window_bytes, state_bytes};
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
-use crate::sparse::stack::{MAX_PREFILL_CHUNK, SessionKey, SparseSession, SparseStack};
+use crate::sparse::stack::{MAX_PREFILL_CHUNK, SparseSession, SparseStack};
 
 /// Bytes per stored key/value element: this family's cache is half precision end
 /// to end, exactly as the dense one's is.
@@ -614,32 +615,13 @@ impl SparseStack {
                 backend: "engine",
             });
         }
-        let path = key.path();
-        let differs = path.len() != prompt.len()
-            || path
-                .iter()
-                .zip(prompt)
-                .any(|(keyed, own)| keyed != own && keyed.get() < KEY_ID_FLOOR);
-        if differs {
-            return Err(CoreError::InvalidValue {
-                key: "media cache key",
-                value: format!(
-                    "a {}-token key for a {}-token prompt that differs outside its spans",
-                    path.len(),
-                    prompt.len()
-                ),
-            });
-        }
+        let checked = SessionKey::for_prompt(prompt, &key)?;
         // Marked media now rather than when a chunk splices: a resume can cover
         // every picture, and the tail it leaves is then read as text - but the
         // path still carries placeholder runs, and dropping the key must never
         // leave it checkpointable under them.
         live.media = true;
-        live.key = Some(SessionKey {
-            prompt: path.to_vec(),
-            spans: key.spans().to_vec(),
-            path: Vec::with_capacity(path.len()),
-        });
+        live.key = Some(checked);
         Ok(())
     }
 
@@ -673,16 +655,7 @@ impl SparseStack {
         session: SessionId,
         prompt: &[TokenId],
     ) -> CoreResult<(Vec<TokenId>, Vec<MediaSpan>)> {
-        match &self.session(session)?.key {
-            Some(key) if key.prompt.len() == prompt.len() => {
-                Ok((key.prompt.clone(), key.spans.clone()))
-            }
-            Some(_) => Err(CoreError::InvalidValue {
-                key: "media cache key",
-                value: "a resume of a prompt other than the one the key was set for".into(),
-            }),
-            None => Ok((prompt.to_vec(), Vec::new())),
-        }
+        media_path::resume_lookup(self.session(session)?.key.as_ref(), prompt)
     }
 
     /// Stands `session` on the deepest usable checkpoint of `prompt`. See
@@ -809,10 +782,7 @@ impl SparseStack {
 /// Whether `live` may be checkpointed at `q`: a text session anywhere, and a
 /// media session only under a content key and never inside one of its runs.
 fn keyed_at(live: &SparseSession, q: u32) -> bool {
-    match &live.key {
-        None => !live.media,
-        Some(key) => !key.spans.iter().any(|span| span.splits(q)),
-    }
+    media_path::keyed_at(live.media, live.key.as_ref(), q)
 }
 
 /// Copies the session's whole restorable state into `blob`.

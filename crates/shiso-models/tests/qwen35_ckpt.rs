@@ -313,10 +313,16 @@ fn every_refusal_says_which_one_it_is() {
         "a stack nobody gave a directory to says so rather than failing"
     );
     assert!(!cold.kv_checkpoint_enabled());
+    // Nothing persists without a directory, but the checkpoints a commit
+    // admits are kept in memory whether or not one is open, so a resume is
+    // still answered - from memory, never from a disk tier this stack lacks.
+    let source = cold
+        .kv_resume(session, &path)
+        .expect("a disabled tier still answers")
+        .map(|info| info.source);
     assert!(
-        cold.kv_resume(session, &path)
-            .expect("a disabled tier still answers")
-            .is_none()
+        source.is_none_or(|source| source == shiso_engine::ckpt::ResumeSource::Memory),
+        "a stack with no directory resumes from memory or not at all: {source:?}"
     );
 
     // Below the floor, which is the one intrinsic gate this tier owns.

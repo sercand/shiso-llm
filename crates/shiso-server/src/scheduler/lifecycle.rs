@@ -287,6 +287,9 @@ pub(crate) struct SeqSlot {
     media: Option<EncodedMedia>,
     /// Whether its path carries media and how the cache may file it.
     path_media: PathMedia,
+    /// A keyed score's items, held until its resume has said which of them a
+    /// stored prefix already read: the tower runs over only the rest.
+    pending_media: Option<PendingMedia>,
     /// Audio placeholder tokens in the prompt, counted from the request rather
     /// than from what was encoded, which a resume can make smaller.
     audio_pads: u32,
@@ -300,6 +303,18 @@ pub(crate) struct SeqSlot {
     /// The scoring half, present only on a sequence that scores its prompt
     /// rather than generating from it.
     score: Option<ScoreJob>,
+}
+
+/// A keyed score's media, not yet encoded: the items, their digests, and
+/// where each one's placeholder run sits in the prompt.
+#[derive(Debug)]
+pub(crate) struct PendingMedia {
+    /// The items, in prompt order.
+    pub(crate) items: Arc<[crate::media::MediaItem]>,
+    /// One digest per item, in the same order.
+    pub(crate) digests: Arc<[shiso_core::media::MediaDigest]>,
+    /// One span per item, in the same order.
+    pub(crate) spans: Vec<shiso_core::media::MediaSpan>,
 }
 
 /// What a scoring sequence carries that a generation turn does not: the
@@ -388,6 +403,7 @@ impl SeqSlot {
             paused_since: None,
             media,
             path_media,
+            pending_media: None,
             audio_pads,
             parser,
             blocks: BlockCursor::default(),
@@ -479,6 +495,7 @@ impl SeqSlot {
             // The rows attach after admission, where `encode_media` runs.
             media: None,
             path_media,
+            pending_media: None,
             audio_pads,
             // A real parser, never fed: the token stream this slot will
             // produce is empty, and `wants_greedy` must answer something.
@@ -550,14 +567,23 @@ impl SeqSlot {
                 0
             },
             prompt_at: self.cursor,
-            indivisible_prompt: self.media.is_some(),
+            // Media held for after the resume is media all the same: the
+            // prompt is read whole once it is encoded.
+            indivisible_prompt: self.media.is_some() || self.pending_media.is_some(),
             flex: self.flex,
             // A decision pass is planned as a solo prefill: it never joins a
             // batched score pass, whose rows its head would never see.
+            // A score carrying media is never offered for the batched pass
+            // either: the pass reads only text-only sessions, and a sibling
+            // standing on a keyed checkpoint resumes when its own read comes.
             score: self
                 .score
                 .as_ref()
-                .filter(|job| self.phase == Phase::Prefill && job.decision.is_none())
+                .filter(|job| {
+                    self.phase == Phase::Prefill
+                        && job.decision.is_none()
+                        && matches!(self.path_media, PathMedia::Text)
+                })
                 .map(|job| {
                     let from = if job.resume_pending {
                         self.cursor.max(job.stand_at)
@@ -609,6 +635,21 @@ impl SeqSlot {
     /// Hands it the encoder rows for the items its prompt still has to read.
     pub(crate) fn attach_media(&mut self, media: EncodedMedia) {
         self.media = Some(media);
+    }
+
+    /// Holds a keyed score's items until its resume has run.
+    pub(crate) fn hold_media(&mut self, pending: PendingMedia) {
+        self.pending_media = Some(pending);
+    }
+
+    /// The items held for after the resume, when there are any.
+    pub(crate) const fn pending_media(&self) -> Option<&PendingMedia> {
+        self.pending_media.as_ref()
+    }
+
+    /// Takes the held items, for the encode that follows the resume.
+    pub(crate) fn take_pending_media(&mut self) -> Option<PendingMedia> {
+        self.pending_media.take()
     }
 
     /// Records that the model files this sequence under a content key.

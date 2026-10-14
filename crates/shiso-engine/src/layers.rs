@@ -1270,6 +1270,11 @@ const EMBED_AFFINE_BLOCK: u32 = 64;
 /// positions text: there the three streams are the position row repeated, and
 /// the rotation has no three-stream entry point to reach. What makes a media
 /// span a span for that family is [`Scratch::bound`], not the angle.
+///
+/// A text pass past a picture, under the three-stream rule, takes the streams
+/// too (`multimodal` is then the pass's `rotary`): its rotation trails the
+/// sequence position by the shift the picture left, and the one-dimensional
+/// entry points rotate and address the cache from one row.
 fn positions<'a>(geometry: &Geometry, scratch: &'a Scratch, multimodal: bool) -> Positions<'a> {
     if !multimodal || geometry.media_positions == MediaPositions::Linear {
         return Positions::Linear(scratch.positions());
@@ -1908,7 +1913,7 @@ pub(crate) fn forward(
             got: 0,
         });
     };
-    let positions = positions(geometry, scratch, media.is_some());
+    let positions = positions(geometry, scratch, media.is_some() || extras.rotary);
     let ple = per_layer_io(geometry, scratch, ple)?;
     let mut cur = 0usize;
     open(backend, weights, geometry, scratch, media, cur, n_tok)?;
@@ -2249,6 +2254,11 @@ pub(crate) struct PassExtras<'a> {
     pub(crate) trail: Trail,
     /// The tapped layers and where their rows go, when a drafter is bound.
     pub(crate) taps: Option<crate::block_draft::TapSink<'a>>,
+    /// Whether the rotation reads the three multimodal streams although the
+    /// pass splices no media: some row of it stands past a picture, where its
+    /// rotary position trails the sequence position the cache is addressed
+    /// by. The caller has written the streams.
+    pub(crate) rotary: bool,
 }
 
 /// Normalizes a block's output, for a family that normalizes it.

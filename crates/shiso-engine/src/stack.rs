@@ -50,7 +50,7 @@ use crate::options::EngineOptions;
 use crate::ple_rows::{PleRows, issue_rows};
 use crate::rows::RowPages;
 use crate::sessions::Session;
-use crate::shape::{HybridShape, NormScheme};
+use crate::shape::{HybridShape, MediaPositions, NormScheme};
 use crate::vision::{MediaChunk, Streams, VisionPrefill, Walk};
 
 /// Rows one forward pass may carry.
@@ -256,10 +256,14 @@ pub(crate) struct PendingBlock {
     pub(crate) started: Instant,
 }
 
-/// What a captured decode step belongs to.
+/// What a captured decode step belongs to: its width, its sessions, and
+/// whether its rotation reads the three multimodal streams.
 ///
-/// See [`HybridStack::graph_slots`] for why the session list is in here.
-type DecodeShape = (u32, Vec<SessionId>);
+/// See [`HybridStack::graph_slots`] for why the session list is in here. The
+/// rotation is too because the two rules are different launches, and a
+/// replay of one for the other would rotate past a picture as though it were
+/// text.
+type DecodeShape = (u32, Vec<SessionId>, bool);
 
 impl std::fmt::Debug for HybridStack {
     /// Names the model by its geometry and its live sessions.
@@ -726,6 +730,13 @@ impl HybridStack {
         };
         let rows = open_ple(resident, geometry, &ple_tokens)?;
         let start = live.written();
+        // A text chunk past a picture rotates at its sequence position less
+        // the shift the picture left; a media chunk's walk already carries it.
+        let shift = if media.is_none() && geometry.media_positions == MediaPositions::Mrope3D {
+            live.rope_shift()
+        } else {
+            0
+        };
         let room = kv::Room {
             cache: &resident.cache,
             now,
@@ -759,6 +770,20 @@ impl HybridStack {
                     resident.scratch.bound(),
                     (0..n_tok).map(|t| i32::try_from(start.saturating_add(t)).unwrap_or(i32::MAX)),
                 )?;
+                if shift > 0 {
+                    // Text has one rotary position on every stream.
+                    for dst in resident.scratch.mrope() {
+                        upload_row(
+                            backend.as_ref(),
+                            &mut staging.ids,
+                            dst,
+                            (0..n_tok).map(|t| {
+                                i32::try_from(start.saturating_add(t).saturating_sub(shift))
+                                    .unwrap_or(i32::MAX)
+                            }),
+                        )?;
+                    }
+                }
                 None
             }
             Some(run) => {
@@ -838,6 +863,7 @@ impl HybridStack {
             layers::PassExtras {
                 trail,
                 taps: block.as_ref().map(crate::block_draft::BlockDrafter::sink),
+                rotary: shift > 0,
             },
         )?;
         // A plain pass's rows are committed as they run, so they become the
@@ -932,7 +958,17 @@ impl HybridStack {
         const MAX_SLOTS: usize = 256;
 
         self.backend.as_graph()?;
-        let shape: DecodeShape = (n_tok, steps.iter().map(|step| step.session).collect());
+        let rotary = matches!(self.shape.media_positions, MediaPositions::Mrope3D)
+            && steps.iter().any(|step| {
+                self.sessions
+                    .get(&step.session)
+                    .is_some_and(|live| live.rope_shift() > 0)
+            });
+        let shape: DecodeShape = (
+            n_tok,
+            steps.iter().map(|step| step.session).collect(),
+            rotary,
+        );
         if let Some(key) = self.graph_slots.get(&shape) {
             return Some(*key);
         }
@@ -996,13 +1032,22 @@ impl HybridStack {
         // Before any session is advanced: the one refusal this can make must
         // leave every member exactly as it found it.
         let rows = open_ple(resident, geometry, &tokens)?;
-        // Each member's own next position, read before the advance moves it.
+        // Each member's own next position, read before the advance moves it,
+        // and where it rotates: past a picture, that position less the shift
+        // the picture left.
         let mut positions = Vec::with_capacity(steps.len());
+        let mut rotations = Vec::with_capacity(steps.len());
         for step in steps {
             let live = sessions
                 .get_mut(&step.session)
                 .ok_or(CoreError::UnknownSession(step.session))?;
             positions.push(live.written());
+            let shift = if geometry.media_positions == MediaPositions::Mrope3D {
+                live.rope_shift()
+            } else {
+                0
+            };
+            rotations.push(live.written().saturating_sub(shift));
             let room = kv::Room {
                 cache: &resident.cache,
                 now,
@@ -1016,6 +1061,21 @@ impl HybridStack {
             &tokens,
             &positions,
         )?;
+        // Only a step with a member past a picture takes the three streams,
+        // so a text-only batch launches what it always did.
+        let rotary = rotations.iter().zip(&positions).any(|(r, p)| r != p);
+        if rotary {
+            for dst in resident.scratch.mrope() {
+                upload_row(
+                    backend.as_ref(),
+                    &mut staging.ids,
+                    dst,
+                    rotations
+                        .iter()
+                        .map(|at| i32::try_from(*at).unwrap_or(i32::MAX)),
+                )?;
+            }
+        }
         // Immutable from here: the pass reads every member at once, and the
         // advance above is the last thing that could have moved one.
         let members: Vec<&Session> = steps
@@ -1067,6 +1127,7 @@ impl HybridStack {
                 layers::PassExtras {
                     trail: Trail::None,
                     taps: taps_sink,
+                    rotary,
                 },
             )?);
             Ok(())
@@ -1281,10 +1342,20 @@ impl HybridStack {
             live.mark_media();
         }
         let start = live.written();
+        let floor = self.hint_floor();
+        self.hint_branch_point(session, tokens, floor)?;
+        let live = self
+            .sessions
+            .get(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        // A session that already read a picture - this prompt's earlier
+        // chunks, or the prefix a resume stood it on - continues the rotary
+        // stream where that picture left it, not at its sequence position.
+        let rotary = start.saturating_sub(live.rope_shift());
         let positions = self.shape.media_positions;
         let mut run = media.map(|prefill| MediaRun {
             prefill: *prefill,
-            walk: Walk::new(prefill.grids(), prefill.pads(), start, positions),
+            walk: Walk::new(prefill.grids(), prefill.pads(), start, positions).at_rotary(rotary),
         });
         let width = usize::try_from(MAX_PREFILL_CHUNK).unwrap_or(usize::MAX);
         let mut last = 0;
@@ -1304,10 +1375,11 @@ impl HybridStack {
             let start = live.written();
             // A chunk also stops at a shared boundary inside it, so the state
             // there is committed - and checkpointed - before the rest is read:
-            // a sibling sharing exactly that much stands on it.
+            // a sibling sharing exactly that much stands on it. See
+            // `chunk_stop` for which boundaries count and where it cuts.
             let end = start.saturating_add(u32::try_from(take).unwrap_or(u32::MAX));
-            let take = live
-                .hint_between(start, end)
+            let take = self
+                .chunk_stop(session, start, end, floor, run.is_some())?
                 .and_then(|at| usize::try_from(at - start).ok())
                 .unwrap_or(take);
             let (head, tail) = rest.split_at(take);
@@ -1327,6 +1399,14 @@ impl HybridStack {
             let row = (final_chunk && with_logits).then_some(0);
             if row.is_some() {
                 self.write_logits(last, 0)?;
+            }
+            // Before the commit: a checkpoint taken here is resumed at the
+            // shift its key's spans give, which is the one the walk reached.
+            if let Some(run) = run.as_ref() {
+                self.sessions
+                    .get_mut(&session)
+                    .ok_or(CoreError::UnknownSession(session))?
+                    .set_rope_shift(run.walk.shift());
             }
             self.commit(session, final_chunk, row)?;
             rest = tail;
@@ -1351,6 +1431,113 @@ impl HybridStack {
             }
         }
         Ok(last)
+    }
+
+    /// The closest a message boundary or a branch point may lie to where a
+    /// read or its resume began and still be stopped at: the tier's floor.
+    ///
+    /// A checkpoint is worth the prefill between it and the one below it, and
+    /// a few hundred tokens of that is not worth a snapshot. A score's own
+    /// boundaries are the host's call - its siblings wait on exactly those -
+    /// and are taken wherever they fall.
+    fn hint_floor(&self) -> u32 {
+        self.ckpt.map_or(1, |crate::ckpt::Checkpoint { options }| {
+            options.min_tokens.max(1)
+        })
+    }
+
+    /// Adds where a scoring read of `tokens` parts from the paths the cache
+    /// holds to its boundaries, when that lies at least `floor` past where the
+    /// read or its resume began and clears every picture.
+    ///
+    /// A score's end is answered and dropped, so without this a later request
+    /// sharing everything up to that point - an agent's next step, whose
+    /// history grew by one line - would find nothing to stand on short of the
+    /// shared boundaries its own siblings asked for.
+    fn hint_branch_point(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        floor: u32,
+    ) -> CoreResult<()> {
+        let Self {
+            ckpt,
+            resident,
+            sessions,
+            ..
+        } = self;
+        let live = sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        let (Some(_), Some(resident)) = (ckpt.as_ref(), resident.as_ref()) else {
+            return Ok(());
+        };
+        if !live.scoring() {
+            return Ok(());
+        }
+        let start = live.written();
+        let len = start.saturating_add(u32::try_from(tokens.len()).unwrap_or(u32::MAX));
+        let branch = resident.cache.branch_point(&live.cache_path_with(tokens));
+        let lowest = start.max(live.resumed_at()).saturating_add(floor);
+        if branch > start
+            && branch < len
+            && branch >= lowest
+            && !live.key().is_some_and(|key| key.splits(branch))
+        {
+            live.add_hint(branch);
+        }
+        Ok(())
+    }
+
+    /// Where a chunk of `session` from `start` stops short of `end`: the first
+    /// shared boundary inside it that the read may stop at, moved back onto
+    /// the recurrence's grid where that still clears every picture. `None` is
+    /// not a refusal: no boundary lies inside, and the chunk runs to `end`.
+    ///
+    /// In a media prompt (`media`) a boundary counts only where the content
+    /// key lets the state there be filed and the cut clears every picture: a
+    /// chunk may not end inside a run. The chunked recurrence walks its runs
+    /// from a chunk's start, so a stop between two grid points shifts every run
+    /// after it, and the prompt - and every prompt resumed from the checkpoint
+    /// taken there - sums differently from a read that never stopped. The
+    /// resume re-reads the few positions between the grid point and the
+    /// boundary instead. A boundary whose grid point lies inside a picture -
+    /// the end of a shared picture, say - is taken where it is.
+    fn chunk_stop(
+        &mut self,
+        session: SessionId,
+        start: u32,
+        end: u32,
+        floor: u32,
+        media: bool,
+    ) -> CoreResult<Option<u32>> {
+        let live = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        let lowest = if live.scoring() {
+            start
+        } else {
+            start.max(live.resumed_at()).saturating_add(floor - 1)
+        };
+        let clears =
+            |live: &Session, at: u32| !media || live.key().is_some_and(|key| !key.splits(at));
+        let Some(hint) = live
+            .hint_between(lowest, end)
+            .filter(|at| clears(live, *at))
+        else {
+            return Ok(None);
+        };
+        let grid = hint - hint % crate::launch::GDN_CHUNK_RUN;
+        let at = if grid > lowest && clears(live, grid) {
+            grid
+        } else {
+            hint
+        };
+        if at != hint {
+            live.move_hint(hint, at);
+        }
+        Ok(Some(at))
     }
 
     /// Registers the span the session just wrote, and admits a checkpoint when the
@@ -1404,8 +1591,9 @@ impl HybridStack {
         // point, which every rendered prompt passes on its template's opening,
         // so gating the end on it stored nothing but first prompts and exact
         // repeats - and a stride position still has to be the cache's own stop.
-        // A session that read media is never checkpointed: its placeholder
-        // runs cannot tell two pictures apart.
+        // A session that read media is checkpointed only under its content key
+        // and never inside a picture: its placeholder runs cannot tell two
+        // pictures apart, and a resume there would start halfway through one.
         //
         // A shared boundary is admitted as a prompt's end is, whether the
         // chunk ended there or the prompt did. A scoring session's prompt
@@ -1420,11 +1608,11 @@ impl HybridStack {
             (earned || hint, q > 0 && q.is_multiple_of(MAX_PREFILL_CHUNK))
         };
         let admit = (earned || periodic)
-            && !live.carries_media()
+            && live.keyed_at(q)
             && (earned
                 || resident.cache.next_admission(
                     live.kv().frontier(),
-                    live.history(),
+                    live.cache_path(),
                     &[],
                     MAX_PREFILL_CHUNK,
                 ) == Some(q));
@@ -2061,6 +2249,9 @@ impl HybridStack {
                 layers::PassExtras {
                     trail: Trail::None,
                     taps: None,
+                    // A segmented pass refuses every session that read media,
+                    // so no run of it stands past a picture.
+                    rotary: false,
                 },
             )?;
             drop(segments);

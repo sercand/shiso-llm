@@ -13,14 +13,14 @@
 //! # Sharing the state between questions
 //!
 //! Every question's prompt opens with the same trunk - the state and its
-//! pictures - so a request of several text questions names the trunk as the
+//! pictures - so a request of several questions names the trunk as the
 //! shared prefix, and the scheduler reads it once and continues it per
 //! question from its checkpoint, as it does for the label route's siblings.
 //! The checkpoint is the stack's own, recurrent state included, so a hybrid
 //! backbone resumes exactly where a whole read would have stood. With media
-//! the share is zero: a scoring pass carrying media is never checkpointed,
-//! so a sibling would wait for a stand point nobody leaves, and every
-//! question reads its pictures whole.
+//! the checkpoint is filed under the pictures' content key; a model that
+//! cannot key it keeps the score off the tier, and every question then reads
+//! its pictures whole.
 
 use std::sync::Arc;
 
@@ -32,7 +32,7 @@ use shiso_core::{
 use shiso_ir::Block;
 
 use crate::api::pipeline::remaining_budget;
-use crate::decision::core::{self, Answered, RawQuestion};
+use crate::decision::core::{self, Answered, InputTally, RawQuestion};
 use crate::decision::head::{self, Encoder};
 use crate::decision::math::{label_mass, softmax};
 use crate::error::AppError;
@@ -139,7 +139,9 @@ fn passes(
 ///
 /// Returns the answers in the order of `questions` and the tokens read: the
 /// trunk once and every question's own branch, which is what the passes cost
-/// when the trunk is shared.
+/// when the trunk is shared. The cached count is what a stored prefix covered
+/// beyond that sharing - an earlier request's checkpoint - since the
+/// siblings' resumes of the trunk are already left out of the input.
 ///
 /// # Errors
 ///
@@ -154,7 +156,7 @@ pub(crate) async fn run(
     questions: Vec<RawQuestion>,
     temperature: f64,
     want_token_ids: bool,
-) -> Result<(Vec<Answered>, u64), AppError> {
+) -> Result<(Vec<Answered>, InputTally), AppError> {
     let engine = state.engine()?;
     let vocabulary = state.vocabulary.as_ref().ok_or(AppError::NotReady {
         what: "a vocabulary",
@@ -204,7 +206,7 @@ pub(crate) async fn run(
         Some(decoded) => (Arc::from(decoded.media), Arc::from(decoded.digests)),
         None => (Arc::from(Vec::new()), Arc::from(Vec::new())),
     };
-    let shared = if runs.is_empty() && prompt.questions.len() > 1 {
+    let shared = if prompt.questions.len() > 1 {
         u32::try_from(prompt.trunk.len()).unwrap_or(u32::MAX)
     } else {
         0
@@ -249,13 +251,30 @@ pub(crate) async fn run(
             label_mass: label_mass(&pooled),
             top,
             prompt_tokens: tokens.len() as u64,
+            cached_tokens: outcome.cached_tokens.min(tokens.len() as u64),
             prompt_token_ids: want_token_ids
                 .then(|| tokens.iter().map(|token| token.get()).collect()),
             label_token_ids: want_token_ids
                 .then(|| labels.iter().map(|token| token.get()).collect()),
         });
     }
-    Ok((answers, total))
+    let tally = shared_tally(&answers, total);
+    Ok((answers, tally))
+}
+
+/// The input of passes that share a trunk, counted as `total` - the trunk
+/// once and every branch - and the part of it a stored prefix covered.
+///
+/// The siblings' resumes of the trunk are the reads `total` already left
+/// out, so they are taken off the passes' own cached counts: what remains came
+/// from a checkpoint the input does count, an earlier request's.
+fn shared_tally(answers: &[Answered], total: u64) -> InputTally {
+    let whole = InputTally::of(answers);
+    let deduplicated = whole.input.saturating_sub(total);
+    InputTally {
+        input: total,
+        cached: whole.cached.saturating_sub(deduplicated).min(total),
+    }
 }
 
 #[cfg(test)]

@@ -165,6 +165,7 @@ mod tests {
             label_mass,
             top,
             prompt_tokens: 0,
+            cached_tokens: 0,
             prompt_token_ids: None,
             label_token_ids: None,
         }
