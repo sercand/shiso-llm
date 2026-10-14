@@ -10,7 +10,7 @@ description = "shiso: host vision pipeline - image/video preprocess, both-tower 
 [features]
 # Neither feature is on by default: a dependent that wants a decoder asks for
 # one, so a native-only server cannot have ffmpeg switched back on by feature
-# unification. See docs/specs/native-media-decoding.md.
+# unification.
 #
 # The ffmpeg subprocess step. It still only runs when the operator names a
 # binary.

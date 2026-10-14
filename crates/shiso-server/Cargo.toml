@@ -64,7 +64,7 @@ cuda = ["dep:shiso-cuda"]
 # machine without an OS one, which is none of the supported chains, so lib.rs
 # refuses it. `decode-ffmpeg` adds the ffmpeg subprocess step (still inert until
 # the operator passes --ffmpeg-path); `decode-native` adds the pure-Rust
-# decoders. See docs/specs/native-media-decoding.md.
+# decoders.
 decode-ffmpeg = ["shiso-vision/decode-ffmpeg", "shiso-audio/decode-ffmpeg"]
 decode-native = ["shiso-vision/decode-native", "shiso-audio/decode-native"]
 
