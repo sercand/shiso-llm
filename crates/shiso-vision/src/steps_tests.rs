@@ -5,9 +5,9 @@
 
 use super::*;
 use crate::chain::VideoDecodePolicy;
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "decode-av1")]
 use crate::chain::run_chain;
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "decode-av1")]
 use crate::demux;
 use crate::error::Container;
 use crate::video::decode_clip;
@@ -15,7 +15,7 @@ use crate::video::decode_clip;
 const H264_MP4: &[u8] = include_bytes!("../tests/fixtures/h264.mp4");
 const H264_BFRAMES: &[u8] = include_bytes!("../tests/fixtures/h264_bframes.mp4");
 const FRAGMENTED: &[u8] = include_bytes!("../tests/fixtures/h264_fragmented.mp4");
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "decode-av1")]
 const AV1_MP4: &[u8] = include_bytes!("../tests/fixtures/av1.mp4");
 
 #[test]
@@ -51,7 +51,7 @@ fn a_broken_index_is_refused_not_retried() {
     );
 }
 
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "decode-av1")]
 #[test]
 fn the_rust_step_decodes_an_av1_mp4() {
     let track = demux::open(AV1_MP4).expect("demuxes");
@@ -67,7 +67,7 @@ fn the_rust_step_decodes_an_av1_mp4() {
     assert!(clip.fps() > 0.0);
 }
 
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "decode-av1")]
 #[test]
 fn the_rust_step_declines_other_codecs_by_name() {
     let track = demux::open(H264_MP4).expect("demuxes");

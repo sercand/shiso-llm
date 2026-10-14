@@ -3,7 +3,7 @@
 //! Every decoder a server reaches for that lives outside the process's own safe
 //! code is here, so that `unsafe` is confined to one crate and the crates above
 //! it (`shiso-vision`, the server) stay `forbid(unsafe_code)`: `VideoToolbox` on
-//! macOS, the NVDEC driver library on Linux, and, with `decode-native`, the C-ABI
+//! macOS, the NVDEC driver library on Linux, and, with `av1-rav1d`, the C-ABI
 //! of the AV1 decoder. A decoder that is not there is a typed outcome
 //! ([`HwError::Unavailable`]), never a panic or a link error: the OS libraries
 //! are reached at run time on Linux and through system frameworks on macOS, so a
@@ -25,13 +25,13 @@
               library through dlopen on Linux, and the C-ABI call into the AV1 decoder"
 )]
 
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "av1-rav1d")]
 mod av1;
 pub mod colour;
 mod platform;
 mod types;
 
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "av1-rav1d")]
 pub use av1::Av1Decoder;
 pub use types::{HwCodec, HwDecoderDesc, HwError, HwFrame, HwProbe, HwTimestamp};
 

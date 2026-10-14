@@ -431,13 +431,19 @@ merged on its own:
 
 Recorded after the implementation landed, so the design and the code agree.
 
-- **`rav1d` is vendored** at `vendor/rav1d` (BSD-2-Clause, excluded from the
-  workspace) with one edit: 1.1.0 aborts the process on a damaged tile because
-  `on_error` unwraps a frame header that is already gone, inside an
-  `extern "C"` function. `vendor/rav1d/VENDOR.md` has the details; drop the copy
-  when a release carries the fix. The `asm` feature is off (the published
-  package does not build with it on aarch64 macOS); 720p decodes at about
-  3.8 ms a frame on an M4 without it.
+- **The Rust AV1 step is built but disabled.** `rav1d` 1.1.0 aborts the process
+  on a damaged tile (an `unwrap` inside an `extern "C"` function, reachable by
+  flipping one bit of an upload). Upstream fixed it in PR 1503 on `main`
+  (issues 1492 and 1497) and has not released it; 1.1.0 is still the latest.
+  The decoder therefore sits behind the `av1-rav1d` feature of `shiso-media-sys`
+  (forwarded as `decode-av1` on `shiso-vision`), which no shipped configuration
+  enables, and `scripts/check.sh features` fails if one does. The chain is
+  OS, then ffmpeg when `--ffmpeg-path` is set, until a release carries the fix:
+  then bump `rav1d`, un-ignore the two damaged-input tests in
+  `crates/shiso-media-sys/tests/av1.rs`, and turn the feature on. The `asm`
+  feature stays off (the published package does not build with it on aarch64
+  macOS); 720p decodes at about 3.8 ms a frame on an M4 without it. As a result
+  `decode-native` currently adds audio decoding only.
 - **VideoToolbox** uses the H.264/HEVC parameter-set constructors, not the
   generic format description, because only they carry the stream's colour matrix
   and picture size (the generic one decoded to BT.601 and a wrong-size buffer).

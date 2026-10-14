@@ -33,7 +33,7 @@ use crate::config::{ImageLimits, PreprocessSpec};
 use crate::error::{Container, VisionError};
 use crate::image::{filter, pack_group, round_u32, side_as_usize, target_size_for, widen};
 use crate::item::VisionItem;
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "decode-av1")]
 use crate::steps::Av1Step;
 use crate::steps::{DemuxDeclined, OsStep};
 
@@ -302,7 +302,7 @@ pub fn decode_clip(
     };
     let declined_step = declined.map(DemuxDeclined);
     let os_step = track.as_ref().map(OsStep);
-    #[cfg(feature = "decode-native")]
+    #[cfg(feature = "decode-av1")]
     let rust_step = track.as_ref().map(Av1Step);
     #[cfg(feature = "decode-ffmpeg")]
     let ffmpeg_step = policy.ffmpeg().map(crate::chain::FfmpegStep);
@@ -315,7 +315,7 @@ pub fn decode_clip(
     if let Some(step) = &os_step {
         steps.push(step);
     }
-    #[cfg(feature = "decode-native")]
+    #[cfg(feature = "decode-av1")]
     if let Some(step) = &rust_step {
         steps.push(step);
     }

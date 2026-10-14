@@ -4,7 +4,7 @@
 //!
 //! This is the LAST step of the video chain and the only one that decodes every
 //! codec and container. The steps before it are the OS's own decoders
-//! (`VideoToolbox`, NVDEC) and, under the `decode-native` feature, a pure-Rust AV1
+//! (`VideoToolbox`, NVDEC) and, under the `decode-av1` feature (off until its decoder's release is fixed), a pure-Rust AV1
 //! decoder. H.264 and HEVC are deliberately never linked into the server: their
 //! royalty-free patent grants cover binaries the grantor distributes, not a
 //! source build redistributed by someone else, so those codecs go to the

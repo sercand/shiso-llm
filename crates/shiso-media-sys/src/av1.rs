@@ -43,14 +43,17 @@
 //! 30 fps 720p is about 7 s of decoding: if that ever matters, the assembly is
 //! the first lever, once the package builds with it.
 //!
-//! **Why the library is vendored.** The published 1.1.0 aborts the process (a
-//! panic inside an `extern "C"` function, which cannot unwind) when a frame's
-//! tile data fails to decode with one frame context: its frame-submit error
-//! path unwraps a frame header its own frame-exit step has already released.
-//! One flipped bit in a sample is enough, and settings cannot route around it.
-//! The workspace therefore builds `vendor/rav1d`, which carries the one-line fix
-//! (`vendor/rav1d/VENDOR.md`); `tests/av1.rs` holds the reproducer and a mutation
-//! loop that must keep passing.
+//! **Disabled until upstream releases a fix.** The published 1.1.0 aborts the
+//! process (a panic inside an `extern "C"` function, which cannot unwind) when a
+//! frame's tile data fails to decode with one frame context: its frame-submit
+//! error path unwraps a frame header its own frame-exit step has already
+//! released. One flipped bit in a sample is enough, and settings cannot route
+//! around it. Upstream tracks it as issues 1492 and 1497 and fixed it in PR 1503
+//! on `main`, but the latest release is still 1.1.0. This decoder therefore sits
+//! behind the `av1-rav1d` feature, which no shipped configuration turns on, so
+//! untrusted uploads never reach it. `tests/av1.rs` holds the reproducer and a
+//! mutation loop, both `#[ignore]`d against 1.1.0; when a release carries the fix,
+//! bump the dependency, un-ignore them, and enable the feature.
 
 use std::ffi::{c_int, c_void};
 use std::mem::MaybeUninit;

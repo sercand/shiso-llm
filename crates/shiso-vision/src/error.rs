@@ -94,7 +94,7 @@ pub enum VisionError {
     /// failure), so the request is refused rather than guessed at.
     #[error(
         "no video decoder in this build handled {container}{}; tried: {}. Enable the \
-         `decode-ffmpeg` feature and pass --ffmpeg-path, or build with `decode-native`",
+         `decode-ffmpeg` feature and pass --ffmpeg-path, or use a platform with an OS decoder",
         codec.as_deref().map(|c| format!(" ({c})")).unwrap_or_default(),
         if tried.is_empty() { "nothing".to_owned() } else { tried.join(", ") }
     )]

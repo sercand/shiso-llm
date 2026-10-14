@@ -1,4 +1,4 @@
-//! The in-process decode steps: the OS decoder and, with `decode-native`, the
+//! The in-process decode steps: the OS decoder and, with `decode-av1`, the
 //! AV1 decoder, both driven over a demuxed track.
 //!
 //! Both are the same loop with a different decoder behind it, so the loop is
@@ -46,7 +46,7 @@ impl FrameSource for HwDecoder {
     }
 }
 
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "decode-av1")]
 impl FrameSource for shiso_media_sys::Av1Decoder {
     fn decode(
         &mut self,
@@ -199,11 +199,11 @@ impl VideoStep for OsStep<'_, '_> {
 }
 
 /// The in-process AV1 decoder as a chain step.
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "decode-av1")]
 #[derive(Debug)]
 pub(crate) struct Av1Step<'a, 'b>(pub(crate) &'a DemuxedTrack<'b>);
 
-#[cfg(feature = "decode-native")]
+#[cfg(feature = "decode-av1")]
 impl VideoStep for Av1Step<'_, '_> {
     fn name(&self) -> &'static str {
         "rust"

@@ -173,6 +173,17 @@ if want features && [ "$has_server" -eq 1 ]; then
     [ "$macos" -eq 1 ] && backend=",metal"
     cargo check -p shiso-server --locked --features "decode-ffmpeg,decode-native$backend"
     cargo check -p shiso-server --locked --no-default-features --features "decode-native$backend"
+    # The in-process AV1 decoder aborts the process on a damaged tile until a
+    # rav1d release carries the upstream fix, so no shiso-server configuration may
+    # enable it. (Remove this check when that feature is turned on deliberately.)
+    for set in "decode-native$backend" "decode-ffmpeg,decode-native$backend"; do
+        if cargo tree -p shiso-server --locked --no-default-features \
+            --features "$set" -e features -i shiso-media-sys |
+            grep -q 'feature "av1-rav1d"'; then
+            echo "FAIL: av1-rav1d is on in a shiso-server build ($set)" >&2
+            exit 1
+        fi
+    done
     for lib in shiso-vision shiso-audio; do
         if cargo tree -p shiso-server --locked --no-default-features \
             --features "decode-native$backend" -e features -i "$lib" |
