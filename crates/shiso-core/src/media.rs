@@ -273,6 +273,47 @@ impl MediaSpan {
     }
 }
 
+/// Where the run grid of a prompt carrying `spans` restarts at or below `q`:
+/// the end of the last item that ends at or before it, or zero.
+///
+/// A recurrent block's chunked walk sums its runs from the first row of each
+/// pass, so where a prompt is cut decides how its runs are summed. A prompt
+/// carrying media is cut at every item's end, whoever reads it - a cold read,
+/// a resume, a batched tail - so the grid after an item counts from that
+/// end, and every read of the same prompt sums the same runs.
+#[must_use]
+pub fn run_origin(q: u32, spans: &[MediaSpan]) -> u32 {
+    spans
+        .iter()
+        .map(MediaSpan::end)
+        .filter(|end| *end <= q)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The highest point at or below `q` a prompt carrying `spans` may be cut
+/// at without changing how its runs of `grid` are summed: a whole number of
+/// runs past its [`run_origin`], and never inside an item.
+///
+/// A text prompt's cut points are the multiples of `grid`. A point that would
+/// lie inside an item falls back below the item's start, so a cut never
+/// splits an item's rows across two passes.
+#[must_use]
+pub fn run_floor(q: u32, spans: &[MediaSpan], grid: u32) -> u32 {
+    let grid = grid.max(1);
+    let mut q = q;
+    loop {
+        let origin = run_origin(q, spans);
+        let floor = origin + (q - origin) / grid * grid;
+        match spans.iter().find(|span| span.splits(floor)) {
+            // Strictly below `q`, so this ends: each round moves under an
+            // item that started below where the last round looked.
+            Some(span) => q = span.start(),
+            None => return floor,
+        }
+    }
+}
+
 /// A prompt's prefix-cache key: the prompt with every placeholder run written
 /// in its item's [`MediaDigest::key_id`]s, and where those runs are.
 ///

@@ -48,7 +48,7 @@ use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{LayerIdx, SessionId, TokenId};
 use shiso_core::media::{MediaModel, VisionPrefill};
 use shiso_core::model::{
-    DecisionModel, DecisionQuestion, DecodeStep, Logits, Model, ModelInfo, StopTokens,
+    DecisionModel, DecisionQuestion, DecodeStep, Logits, Model, ModelInfo, PromptRun, StopTokens,
 };
 use shiso_engine::attn::Attn;
 use shiso_engine::draft::DraftHead;
@@ -787,6 +787,14 @@ impl Model for Qwen35Model {
 
     fn prefill_last(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<Logits<'_>> {
         self.stack.prefill_last(session, tokens)
+    }
+
+    // A decision request's questions share their opening - its text and its
+    // pictures - and a checkpoint stands each sibling past it, leaving a few
+    // dozen rows of question each. One pass over all of them reads the
+    // weights once. The stack refuses it when a draft head is loaded.
+    fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
+        self.stack.prefill_last_many(runs)
     }
 
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {

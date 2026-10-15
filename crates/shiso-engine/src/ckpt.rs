@@ -58,6 +58,7 @@ use shiso_kvstore::{
 use crate::ckpt_layout::{CkptIdentity, path_layout};
 use crate::kv;
 use crate::launch::F32_BYTES;
+use crate::media_path::{self, SessionKey};
 use crate::sessions::Session;
 use crate::stack::{HybridStack, cache_failure, snapshot};
 
@@ -543,10 +544,10 @@ impl HybridStack {
         let live = sessions
             .get_mut(&session)
             .ok_or(CoreError::UnknownSession(session))?;
-        if live.carries_media() {
+        let q = live.written();
+        if !live.keyed_at(q) {
             return Ok(SaveOutcome::CarriesMedia);
         }
-        let q = live.written();
         // The floor is checked before the snapshot: below it the store would
         // refuse the entry, and the snapshot is the expensive half.
         let min = options.min_tokens;
@@ -641,6 +642,34 @@ impl HybridStack {
         Ok(())
     }
 
+    /// Files `session` under the content key of the media prompt `prompt` it
+    /// is about to resume or read. See [`Checkpointed::kv_set_media_key`].
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`], [`CoreError::Unsupported`] for a session
+    /// that has already written, and [`CoreError::InvalidValue`] for a key that
+    /// is not `prompt` with only its spans rewritten.
+    pub fn ckpt_set_media_key(
+        &mut self,
+        session: SessionId,
+        prompt: &[TokenId],
+        key: MediaKey<'_>,
+    ) -> CoreResult<()> {
+        let live = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        if live.written() != 0 {
+            return Err(CoreError::Unsupported {
+                what: "a media key on a session that has already written",
+                backend: "engine",
+            });
+        }
+        live.set_key(SessionKey::for_prompt(prompt, &key)?);
+        Ok(())
+    }
+
     /// Marks `session` as reading its prompt only to score it. See
     /// [`Checkpointed::kv_set_scoring`].
     ///
@@ -682,14 +711,34 @@ impl HybridStack {
         let capacity = self.opts.ctx;
         let vocab = self.geometry.vocab;
         let slots = self.recurrent_slots;
+        let positions = self.shape.media_positions;
         let cache = Arc::clone(&self.resident()?.cache);
-        let Some(resume) = cache.resume(prompt, now).map_err(cache_failure)? else {
+        let (lookup, spans) = media_path::resume_lookup(
+            self.sessions
+                .get(&session)
+                .ok_or(CoreError::UnknownSession(session))?
+                .key(),
+            prompt,
+        )?;
+        let Some(resume) = cache.resume(&lookup, now).map_err(cache_failure)? else {
             return Ok(None);
         };
         let Some(reference) = resume.ckpt else {
             return Ok(None);
         };
         let reused = resume.ckpt_pos;
+        // The rotary stream a resumed session continues from is a fact about
+        // the pictures behind it, and the key pins those: the same key path is
+        // the same pictures, so the shift is recomputed here rather than
+        // stored. A checkpoint inside a run is never admitted; one found there
+        // anyway is not continued halfway through an item.
+        let Some(rope_shift) = crate::vision::rotary_shift_at(&spans, reused, positions) else {
+            tracing::warn!(
+                reused,
+                "a stored media prefix ends inside a picture; prefilling instead"
+            );
+            return Ok(None);
+        };
         let whole = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
         let want_row = u64::from(vocab).saturating_mul(F32_BYTES);
         let row = if reused == whole {
@@ -717,6 +766,7 @@ impl HybridStack {
                 .ok_or(CoreError::UnknownSession(session))?;
             live.adopt(resume.frontier, tokens.clone(), capacity)?;
             live.set_resumed_at(reused);
+            live.set_rope_shift(rope_shift);
             restore_stack(backend.as_ref(), live, slots, &blob)?;
         }
         let logits = match row {

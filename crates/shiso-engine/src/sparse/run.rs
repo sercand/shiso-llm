@@ -473,9 +473,17 @@ impl SparseStack {
         crate::sparse::stack::distinct(&sessions)?;
         for (session, tokens) in runs {
             let live = self.session(*session)?;
-            if !live.scoring || live.media {
+            // A media score joins once its pictures are behind it: what is left
+            // is text, rotated at `written - rope_shift` as its solo read would.
+            let picture_ahead = live.media
+                && live
+                    .key
+                    .as_ref()
+                    .is_none_or(|key| key.spans.iter().any(|span| span.end() > live.written()));
+            if !live.scoring || picture_ahead {
                 return Err(CoreError::Unsupported {
-                    what: "a batched prompt pass over a session that is not a text-only score",
+                    what: "a batched prompt pass over a session that is not a score, or one \
+                           with a picture left to read",
                     backend: "engine",
                 });
             }
@@ -592,15 +600,8 @@ impl SparseStack {
         let width = usize::try_from(self.opts.prefill_rows).unwrap_or(usize::MAX);
         let mut rest = tokens;
         while !rest.is_empty() {
-            // A chunk may not end inside a placeholder run: the walk hands out
-            // an item's encoder rows and its grid positions together, and a cut
-            // through one would split an item's rows across two passes whose
-            // maps were built from two different walks of the same item.
             let at = self.session(session)?.written();
-            let mut take = match run.as_ref() {
-                Some(run) => run.walk.split_point(rest, width),
-                None => on_grid(at, rest.len().min(width), rest.len()),
-            };
+            let mut take = self.piece_width(session, rest, width, run.as_ref())?;
             // A chunk also stops at a boundary a later request is likely to
             // resume from - a message end, or where this prompt branches off a
             // path the cache holds - so the commit there can take a checkpoint.
@@ -641,7 +642,7 @@ impl SparseStack {
                 run.as_mut(),
                 PassRole::Prompt { snapshot },
             )?;
-            self.keep_rope_shift(session, run.as_ref());
+            self.keep_rope_shift(session, run.as_ref(), head, start);
             // A prompt that ends between two grid points is checkpointed at the
             // last one instead of at its end: a longer prompt continues from
             // there exactly as a cold prefill of it would, where a checkpoint at
@@ -695,15 +696,65 @@ impl SparseStack {
         run.as_ref().map_or(Ok(()), every_row_consumed)
     }
 
+    /// Tokens of `rest` the next piece of `session`'s read takes, before any
+    /// shared boundary stops it shorter.
+    ///
+    /// A media piece may not end inside a placeholder run: the walk hands out
+    /// an item's encoder rows and its grid positions together, and a cut
+    /// through one would split an item's rows across two passes whose maps
+    /// were built from two different walks of the same item. It also stops
+    /// where a picture ends, so the runs after it count from its end in every
+    /// read of this prompt (see `SparseSession::run_origin`). A text piece
+    /// ends on that grid.
+    fn piece_width(
+        &self,
+        session: SessionId,
+        rest: &[TokenId],
+        width: usize,
+        run: Option<&MediaRun<'_>>,
+    ) -> CoreResult<usize> {
+        let live = self.session(session)?;
+        Ok(match run {
+            Some(run) => crate::media_path::picture_end_within(
+                rest,
+                run.walk.split_point(rest, width),
+                run.prefill.pads(),
+            ),
+            None => on_grid(
+                live.written(),
+                live.run_origin,
+                rest.len().min(width),
+                rest.len(),
+            ),
+        })
+    }
+
     /// Records where a media chunk's walk left the rotary stream: whatever
     /// reads this session next - the rest of the prompt as text, a decode
     /// step, a verify - rotates from there. Mid-item the number is transient,
     /// and nothing reads it there: a prompt never ends inside a run.
-    fn keep_rope_shift(&mut self, session: SessionId, run: Option<&MediaRun<'_>>) {
+    ///
+    /// `head` is the piece that just ran from `start`. A piece never ends
+    /// inside a picture, so one whose last token is a placeholder ended on a
+    /// picture's end, and the run grid restarts there.
+    fn keep_rope_shift(
+        &mut self,
+        session: SessionId,
+        run: Option<&MediaRun<'_>>,
+        head: &[TokenId],
+        start: u32,
+    ) {
         if let Some(run) = run
             && let Some(live) = self.sessions.get_mut(&session)
         {
             live.rope_shift = run.walk.shift();
+            if head
+                .last()
+                .is_some_and(|last| run.prefill.pads().matches(*last))
+            {
+                live.run_origin =
+                    start.saturating_add(u32::try_from(head.len()).unwrap_or(u32::MAX));
+            }
         }
     }
 
@@ -744,18 +795,46 @@ impl SparseStack {
         // must not hide the message boundary a thousand tokens later.
         let floor = ckpt.options.min_tokens.max(1);
         let lowest = pos.max(live.resumed_at).saturating_add(floor).max(floor);
-        // Each is moved back onto the recurrence's grid first: a stop between
-        // two grid points would cut a run, and every later pass of this prompt -
-        // and of every prompt resumed from the checkpoint taken here - would sum
+        // A media score's own boundaries - where its picture starts and where
+        // its sibling questions part - are the host's call, and its siblings
+        // stand on exactly those, so they are taken wherever they fall. A text
+        // score's keep the floor: its siblings read together in one batched
+        // pass, which a stop inside a run would refuse.
+        let media_score = live.scoring && live.media;
+        let own_lowest = if media_score {
+            pos.saturating_add(1)
+        } else {
+            lowest
+        };
+        let clears = |at: u32| {
+            !live.media
+                || live
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| !key.spans.iter().any(|span| span.splits(at)))
+        };
+        // Each is moved back onto the recurrence's grid: a stop between two grid
+        // points would cut a run, and every later pass of this prompt - and of
+        // every prompt resumed from the checkpoint taken here - would sum
         // differently from a cold prefill of the same tokens. The resume re-reads
-        // the few positions between the grid point and the boundary instead.
+        // the few positions between the grid point and the boundary instead. In
+        // a media prompt the grid restarts at each picture's end, which every
+        // read stops at, so a boundary just past a shared picture - where
+        // sibling questions part - moves back onto that end rather than into
+        // the picture.
+        let spans = live
+            .key
+            .as_ref()
+            .map_or(&[][..], |key| key.spans.as_slice());
+        let place = |stop: u32, lowest: u32| {
+            Some(shiso_core::media::run_floor(stop, spans, GDN_CHUNK))
+                .filter(|at| *at > pos && *at < len && *at >= lowest && clears(*at))
+        };
         let stop = live
             .hints
             .iter()
-            .copied()
-            .chain(std::iter::once(branch))
-            .map(|stop| stop - stop % GDN_CHUNK)
-            .filter(|stop| *stop > pos && *stop < len && *stop >= lowest)
+            .filter_map(|hint| place(*hint, own_lowest))
+            .chain(place(branch, lowest))
             .min();
         Ok(stop.and_then(|stop| usize::try_from(stop - pos).ok()))
     }
@@ -1075,7 +1154,8 @@ impl Phases {
 }
 
 /// Tokens of a piece that starts at position `start`, wants `want` and has
-/// `rest` to go: ending on the recurrence's run grid unless it ends the call.
+/// `rest` to go: ending on the recurrence's run grid, which counts from
+/// `origin`, unless it ends the call.
 ///
 /// The recurrent blocks' chunked walk counts its runs from the pass's first
 /// row, so a pass that started between two grid points would cut every run of
@@ -1083,11 +1163,14 @@ impl Phases {
 /// tokens, which starts on the grid. Rounded down, so a piece never grows past
 /// the pass width; a start off the grid - a resume that stood on a turn's end -
 /// takes the short piece up to the next grid point and is on the grid after it.
-fn on_grid(start: u32, want: usize, rest: usize) -> usize {
+/// Past a picture the grid counts from the picture's end
+/// ([`SparseSession::run_origin`](crate::sparse::stack::SparseSession)).
+fn on_grid(start: u32, origin: u32, want: usize, rest: usize) -> usize {
     if want >= rest {
         return rest;
     }
     let grid = u64::from(GDN_CHUNK);
+    let start = start.saturating_sub(origin.min(start));
     let end = u64::from(start).saturating_add(want as u64);
     let down = end - end % grid;
     let take = if down > u64::from(start) {

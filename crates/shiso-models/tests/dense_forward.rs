@@ -531,13 +531,14 @@ fn a_media_prompt_keeps_the_one_dimensional_rotation() {
     let media =
         VisionPrefill::new(block.view(), &grids, pads, HIDDEN).expect("the block matches the item");
 
-    // Text, the item's four placeholders, text.
+    // Text, then the item's four placeholders. The prompt ends on the item:
+    // a read stops at a picture's end, so text after it would be a second
+    // chunk, and this case reads the rows one chunk leaves.
     let mut tokens = vec![TokenId::new(1)];
     tokens.extend(std::iter::repeat_n(
         IMG,
         usize::try_from(rows).expect("fits"),
     ));
-    tokens.push(TokenId::new(2));
 
     let session = stack.open_session().expect("a session opens");
     let mark = fake.launch_mark();
@@ -564,10 +565,10 @@ fn a_media_prompt_keeps_the_one_dimensional_rotation() {
     // bidirectional attention over the span and corrupted the states this path
     // produces. The checkpoint's config carries no `use_bidirectional_attention`.
     let (pos, bound) = position_rows(&fake, &fake.launches_since(mark), tokens.len());
-    assert_eq!(pos, vec![0, 1, 2, 3, 4, 5], "one position per token");
+    assert_eq!(pos, vec![0, 1, 2, 3, 4], "one position per token");
     assert_eq!(
         bound,
-        vec![0, 1, 2, 3, 4, 5],
+        vec![0, 1, 2, 3, 4],
         "every token, placeholder or text alike, reads up to its own position and no further"
     );
 }
@@ -600,16 +601,16 @@ fn an_item_wider_than_the_chunk_is_bounded_by_what_the_chunk_wrote() {
     let media =
         VisionPrefill::new(block.view(), &grids, pads, HIDDEN).expect("the block matches the item");
 
-    // One text token, the whole item, one text token. The first chunk is that
-    // leading text token alone, because the split cannot cut into the item and
-    // so stops before it; the second is the item's first 512 placeholders; the
-    // third is its last 64 and the trailing text token.
+    // One text token, then the whole item. The first chunk is that leading
+    // text token alone, because the split cannot cut into the item and so
+    // stops before it; the second is the item's first 512 placeholders; the
+    // third is its last 64. Text after the item would be a fourth chunk of its
+    // own, because a read stops at a picture's end.
     let mut tokens = vec![TokenId::new(1)];
     tokens.extend(std::iter::repeat_n(
         IMG,
         usize::try_from(rows).expect("fits"),
     ));
-    tokens.push(TokenId::new(2));
 
     let session = stack.open_session().expect("a session opens");
     let mark = fake.launch_mark();
@@ -618,7 +619,7 @@ fn an_item_wider_than_the_chunk_is_bounded_by_what_the_chunk_wrote() {
         .expect("a multimodal prefill runs");
 
     // Every chunk uploads into the same scratch row, and the last one rewrote
-    // only its own 65 entries: past them the row still holds what the 512-wide
+    // only its own 64 entries: past them the row still holds what the 512-wide
     // chunk's softmax was handed. That tail is the assertion. Without the clamp
     // it reads 576 - a key 64 positions past anything that chunk wrote.
     let width = usize::try_from(MAX_PREFILL_CHUNK).expect("the chunk fits this host");
@@ -630,8 +631,8 @@ fn an_item_wider_than_the_chunk_is_bounded_by_what_the_chunk_wrote() {
         width,
     );
     // Attention is causal, so within a chunk the bound is the token's own
-    // sequence position: the final chunk covers 513..=577, and past its 65
-    // entries the row still holds what the 512-wide chunk was handed, 66..=512.
+    // sequence position: the final chunk covers 513..=576, and past its 64
+    // entries the row still holds what the 512-wide chunk was handed, 65..=512.
     //
     // Note what this no longer proves. A causal bound cannot exceed its own
     // chunk, so the tail's ceiling of 512 is arithmetic rather than a guard

@@ -95,6 +95,7 @@ use crate::decision;
 use crate::error::AppError;
 use crate::media::{MediaItem, MediaTowers};
 use crate::media_cache::{CachedRows, MediaCache};
+use crate::scheduler::lifecycle::PendingMedia;
 use crate::tokenizer::Vocabulary;
 use crate::vision::{EncodedMedia, VisionTower};
 use shiso_audio::AudioTower;
@@ -690,7 +691,11 @@ impl Coordinator {
             send_event(&sink, StreamEvent::Failed { message });
             return;
         }
-        let key = self.media_key(&request);
+        let key = self.media_key(
+            &request.prompt_tokens,
+            &request.media,
+            &request.media_digests,
+        );
         let items = Arc::clone(&request.media);
         let key_digests = Arc::clone(&request.media_digests);
 
@@ -806,12 +811,15 @@ impl Coordinator {
     /// the prefill terminus, or by the retirement path if the prompt never
     /// finishes reading.
     ///
-    /// Deliberately bare beside [`Coordinator::open`]: a scoring prompt is
-    /// read once and kept by nobody, so the media checks, the checkpoint
-    /// resume, the scaffold and the disk store a generation passes through
-    /// are all work this request will never benefit from - and the store,
-    /// left in, would file a one-question prompt under a key no follow-up
-    /// will ever ask for. The empty prompt and empty label set are refused
+    /// Deliberately bare beside [`Coordinator::open`]: a scoring prompt's end
+    /// is read once and kept by nobody, so the scaffold and the store at its
+    /// end a generation passes through are work this request will never
+    /// benefit from - and the store, left in, would file a one-question
+    /// prompt under a key no follow-up will ever ask for. What a score does
+    /// keep is the state at its shared boundaries and before its pictures,
+    /// where a sibling or a later request stands; its resume runs at its
+    /// first quantum ([`Coordinator::resume_score`]), and a keyed score's
+    /// pictures are encoded only after it. The empty prompt and empty label set are refused
     /// here as well as at the handle: the HTTP surface and the handle both
     /// refuse first, and the scheduler refuses too, because a forward pass
     /// over nothing must not be reachable from any caller. Media encoding
@@ -918,20 +926,7 @@ impl Coordinator {
             },
         );
         slot.set_checkpoint_floor(self.cfg.store.min_tokens);
-        // The generation encode step in its plain form: a score never resumes
-        // and is never keyed, so there is no covered prefix to subtract and no
-        // resume to run ahead of. A failure fails the slot, whose still-held
-        // reply carries the message through the retirement path.
-        if !items.is_empty() {
-            match self.encode_media(&items, &digests) {
-                Ok(Some(media)) => slot.attach_media(media),
-                Ok(None) => {}
-                Err(message) => {
-                    tracing::warn!(%message, "a scoring request carrying media could not be served");
-                    slot.fail(message);
-                }
-            }
-        }
+        self.admit_score_media(&mut slot, &items, &digests, decision);
         if let Some(refused) = self.slots.admit(slot) {
             // Unreachable while admission only happens with a free slot;
             // handled for the same reason `open` handles it - a dropped slot
@@ -942,6 +937,52 @@ impl Coordinator {
                 "a scoring sequence was admitted with no slot for it"
             );
             self.release(refused.session);
+        }
+    }
+
+    /// Settles a new score's media before its first quantum.
+    ///
+    /// A score whose pictures the model files under their content is keyed
+    /// here, while nothing has been read, and its pictures wait for its
+    /// resume at its first quantum: a sibling question's checkpoint or an
+    /// earlier request's may already cover them, and the tower then runs
+    /// over only the rest (see [`Coordinator::encode_held`]). A decision pass never
+    /// resumes, and a model that refuses the key keeps the score off the
+    /// tier; both encode here, in the generation encode step's plain form.
+    /// A failure fails the slot, whose still-held reply carries the
+    /// message through the retirement path.
+    fn admit_score_media(
+        &mut self,
+        slot: &mut SeqSlot,
+        items: &Arc<[MediaItem]>,
+        digests: &Arc<[MediaDigest]>,
+        decision: bool,
+    ) {
+        let held = if items.is_empty() || decision {
+            None
+        } else {
+            let key = self.media_key(&slot.prompt, items, digests);
+            if let Some((path, spans)) = &key {
+                self.key_session(slot, path, spans);
+            }
+            key.filter(|_| slot.checkpointable())
+                .map(|(_, spans)| spans)
+        };
+        if let Some(spans) = held {
+            slot.hold_media(PendingMedia {
+                items: Arc::clone(items),
+                digests: Arc::clone(digests),
+                spans,
+            });
+        } else if !items.is_empty() {
+            match self.encode_media(items, digests) {
+                Ok(Some(media)) => slot.attach_media(media),
+                Ok(None) => {}
+                Err(message) => {
+                    tracing::warn!(%message, "a scoring request carrying media could not be served");
+                    slot.fail(message);
+                }
+            }
         }
     }
 
@@ -977,22 +1018,22 @@ impl Coordinator {
         None
     }
 
-    /// The prefix-cache key of a media request's prompt. See [`media_key`].
-    fn media_key(&self, request: &GenerateRequest) -> Option<(Vec<TokenId>, Vec<MediaSpan>)> {
-        if request.media.is_empty() {
+    /// The prefix-cache key of a media prompt. See [`media_key`].
+    fn media_key(
+        &self,
+        prompt: &[TokenId],
+        media: &[MediaItem],
+        digests: &[MediaDigest],
+    ) -> Option<(Vec<TokenId>, Vec<MediaSpan>)> {
+        if media.is_empty() {
             return None;
         }
         let merge = self
             .vision
             .as_ref()
             .map_or(1, VisionTower::spatial_merge_size);
-        let grids: Vec<VisionGrid> = request.media.iter().map(|item| item.grid(merge)).collect();
-        media_key(
-            &request.prompt_tokens,
-            &grids,
-            &request.media_digests,
-            self.pads,
-        )
+        let grids: Vec<VisionGrid> = media.iter().map(|item| item.grid(merge)).collect();
+        media_key(prompt, &grids, digests, self.pads)
     }
 
     /// Asks the model to file `slot`'s path under its media key, and marks the
@@ -1227,6 +1268,7 @@ impl Coordinator {
         {
             self.resume_score(step.slot, shared);
         }
+        self.encode_held(step.slot);
         let slot = self.slots.slots().get(step.slot)?;
         if slot.is_done() || slot.prompt_done() {
             return None;
@@ -1244,6 +1286,45 @@ impl Coordinator {
             prompt: Arc::clone(&slot.prompt),
             window: start..end,
         })
+    }
+
+    /// Runs the tower over a keyed score's held items that its resume left
+    /// unread, and attaches their rows; a failure fails the score.
+    ///
+    /// A resume never ends inside a picture, so an item is covered whole or
+    /// not at all, and the covered ones are the leading ones.
+    fn encode_held(&mut self, at: usize) {
+        let Some(slot) = self.slots.get_mut(at) else {
+            return;
+        };
+        let Some(pending) = slot.take_pending_media() else {
+            return;
+        };
+        // A full hit already answered; a failed slot reads nothing.
+        if slot.is_done() || slot.prompt_done() {
+            return;
+        }
+        let from = slot.prompt_cursor();
+        let covered = pending
+            .spans
+            .iter()
+            .take_while(|span| usize::try_from(span.end()).unwrap_or(usize::MAX) <= from)
+            .count();
+        let encoded = self.encode_media(
+            pending.items.get(covered..).unwrap_or_default(),
+            pending.digests.get(covered..).unwrap_or_default(),
+        );
+        let Some(slot) = self.slots.get_mut(at) else {
+            return;
+        };
+        match encoded {
+            Ok(Some(media)) => slot.attach_media(media),
+            Ok(None) => {}
+            Err(message) => {
+                tracing::warn!(%message, "a scoring request carrying media could not be served");
+                slot.fail(message);
+            }
+        }
     }
 
     /// Stands a score on a stored prefix at its first prefill quantum, and
@@ -1278,8 +1359,24 @@ impl Coordinator {
         if let Err(error) = ckpt.kv_set_scoring(slot.session) {
             tracing::debug!(error = %error.chain(), "a score was not marked as one");
         }
-        let hints: &[u32] = if shared > 0 { &[shared] } else { &[] };
-        if let Err(error) = ckpt.kv_set_hints(slot.session, hints) {
+        // Where its siblings part, and where each of its pictures begins: a
+        // later request that keeps this text and sends a new picture - an
+        // agent's next step - stands on the state just before it.
+        let mut hints: Vec<u32> = slot
+            .pending_media()
+            .map(|pending| {
+                pending
+                    .spans
+                    .iter()
+                    .map(MediaSpan::start)
+                    .filter(|start| *start > 0)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if shared > 0 {
+            hints.push(shared);
+        }
+        if let Err(error) = ckpt.kv_set_hints(slot.session, &hints) {
             tracing::debug!(error = %error.chain(), "the shared prefix of a score was not recorded");
         }
         let whole_prompt = slot.prompt.len();
@@ -1796,6 +1893,8 @@ impl Coordinator {
                         let _ = reply.send(Ok(ScoreOutcome {
                             label_logprobs: Vec::new(),
                             option_logits,
+                            // A decision pass never stands on a stored prefix.
+                            cached_tokens: 0,
                         }));
                     }
                 }
@@ -2416,6 +2515,7 @@ fn finish_scoring(row: &[u8], scores: &mut [f32], slot: &mut SeqSlot) {
         let _ = reply.send(Ok(ScoreOutcome {
             label_logprobs,
             option_logits: Vec::new(),
+            cached_tokens: slot.cached_tokens(),
         }));
     }
 }

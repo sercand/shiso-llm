@@ -134,7 +134,10 @@ fn score_batch(
         }
         let Some(score) = fact.score else { continue };
         let fits = score.tail > 0 && rows.saturating_add(score.tail) <= quantum;
-        if fact.prompt_remaining == 0 || fact.indivisible_prompt || !runs(fact) || !fits {
+        // An offered score is batchable whatever its solo read would be: a
+        // media score is offered only once its pictures lie behind its stand
+        // point, so the tail this pass reads is text.
+        if fact.prompt_remaining == 0 || !runs(fact) || !fits {
             continue;
         }
         rows += score.tail;
@@ -226,10 +229,8 @@ pub(crate) fn plan(facts: &[SlotFacts], cfg: &SchedulerConfig) -> TickPlan {
     // tail fits: a generation at the front reads alone, exactly as before, and
     // a batch is bounded by the same quantum a solo read would be.
     let batches = lead.is_some_and(|(_at, fact)| {
-        !fact.indivisible_prompt
-            && fact
-                .score
-                .is_some_and(|score| score.tail > 0 && score.tail <= quantum)
+        fact.score
+            .is_some_and(|score| score.tail > 0 && score.tail <= quantum)
     });
     let max_runs = if decode.is_empty() {
         SCORE_BATCH_RUNS

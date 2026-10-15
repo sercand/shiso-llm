@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use shiso_core::TokenId;
 
 use crate::backing::Backing;
-use crate::ckpt::{Admission, CkptRef, CkptStore};
+use crate::ckpt::{Admission, CkptRef, CkptStore, Standing};
 use crate::error::KvError;
 use crate::evict::ckpt_utility;
 use crate::geom::CacheGeometry;
@@ -194,6 +194,11 @@ pub struct CommitOpts<'a> {
     /// A chunk boundary rather than a rule-earned boundary: the checkpoint taken for
     /// it is speculative and is the first thing evicted.
     pub chunk_only: bool,
+    /// A boundary a score asked for: its siblings and an agent's next step stand
+    /// on it within seconds or not at all, so it is evicted before every other
+    /// earned checkpoint and never drains a conversation's. Ignored for a chunk
+    /// boundary, which is below it already.
+    pub scoring: bool,
     /// Message boundaries: positions the engine would rather stop a span at, because
     /// a later request is likely to end there.
     pub hints: &'a [u32],
@@ -219,6 +224,7 @@ impl<'a> CommitOpts<'a> {
         Self {
             with_logits: false,
             chunk_only: false,
+            scoring: false,
             hints,
             state: None,
             logits: None,
@@ -236,6 +242,14 @@ impl<'a> CommitOpts<'a> {
     pub const fn checkpoint(mut self, state: &'a [u8], earned: bool) -> Self {
         self.state = Some(state);
         self.chunk_only = !earned;
+        self
+    }
+
+    /// The same commit, its checkpoint ranked as a score's: see
+    /// [`CommitOpts::scoring`].
+    #[must_use]
+    pub const fn scoring(mut self) -> Self {
+        self.scoring = true;
         self
     }
 
@@ -1064,9 +1078,16 @@ impl Inner {
                 displaced: None,
             })
         } else {
+            // A refresh keeps the standing the slot was admitted with.
+            let standing = if opts.chunk_only {
+                Standing::Speculative
+            } else if opts.scoring {
+                Standing::Scoring
+            } else {
+                Standing::Earned
+            };
             let prices = self.ckpt_prices(now);
-            self.ckpt
-                .alloc(now, !opts.chunk_only, opts.chunk_only, &prices)
+            self.ckpt.alloc(now, !opts.chunk_only, standing, &prices)
         };
 
         let Some(Admission { slot, displaced }) = admission else {
@@ -1655,7 +1676,8 @@ impl Inner {
             return None;
         }
         let prices = self.ckpt_prices(now);
-        let Admission { slot, displaced } = self.ckpt.alloc(now, true, false, &prices)?;
+        let Admission { slot, displaced } =
+            self.ckpt.alloc(now, true, Standing::Earned, &prices)?;
         self.clear_displaced(displaced, slot);
         match self.ckpt.fill(slot, target, pos, state, logits, now) {
             Ok(reference) => {

@@ -17,7 +17,7 @@ use shiso_core::{
 };
 use shiso_ir::Block;
 
-use crate::decision::core::{self, Answered, Kind, RawQuestion};
+use crate::decision::core::{self, Answered, InputTally, Kind, RawQuestion};
 use crate::decision::decisions_wire::{DecisionInput, InputBlock};
 use crate::decision::math::softmax;
 use crate::error::AppError;
@@ -154,7 +154,8 @@ pub(crate) fn layout_refusal(
 /// Scores `questions` over the state `text` and the pictures in `media`
 /// with the model's decision head.
 ///
-/// Returns the answers in the order of `questions` and the prompt's length.
+/// Returns the answers in the order of `questions` and the prompt's length,
+/// none of it cached: a decision pass reads every row itself.
 ///
 /// # Errors
 ///
@@ -169,7 +170,7 @@ pub(crate) async fn run(
     questions: Vec<RawQuestion>,
     temperature: f64,
     want_token_ids: bool,
-) -> Result<(Vec<Answered>, u64), AppError> {
+) -> Result<(Vec<Answered>, InputTally), AppError> {
     let engine = state.engine()?;
     let vocabulary = state.vocabulary.as_ref().ok_or(AppError::NotReady {
         what: "a vocabulary",
@@ -242,7 +243,15 @@ pub(crate) async fn run(
             ))
         })
         .collect::<Result<Vec<_>, _>>()
-        .map(|answers| (answers, prompt_tokens))
+        .map(|answers| {
+            (
+                answers,
+                InputTally {
+                    input: prompt_tokens,
+                    cached: 0,
+                },
+            )
+        })
 }
 
 /// One question's answer from the head's probabilities, put back in the
@@ -278,6 +287,8 @@ fn answer(
         label_mass: 1.0,
         top,
         prompt_tokens: 0,
+        // A decision pass reads every row of its prompt itself.
+        cached_tokens: 0,
         prompt_token_ids,
         // The head scores options, not label tokens.
         label_token_ids: want_token_ids.then(Vec::new),

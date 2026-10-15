@@ -33,6 +33,7 @@ use shiso_kvstore::Frontier;
 use crate::blocks::StateTrail;
 use crate::kv::{Room, SessionKv, conv_state_bytes, state_bytes};
 use crate::layers::ResidualIndex;
+use crate::media_path::SessionKey;
 use crate::mtp::{Rollback, SpecDepth};
 
 /// Bytes cleared per pass when a state buffer is wiped.
@@ -251,10 +252,25 @@ pub(crate) struct Session {
     /// The engine hands tokens over a chunk at a time, which makes the session the
     /// only place that path can live.
     history: Vec<TokenId>,
-    /// Whether any chunk this session read spliced media rows in. Such a path
-    /// is never checkpointed: a placeholder run is one id repeated, so its
-    /// tokens cannot tell two pictures apart.
+    /// Whether any chunk this session read spliced media rows in, or a media
+    /// key was set. Such a path is checkpointed only under [`Session::key`]: a
+    /// placeholder run is one id repeated, so its own tokens cannot tell two
+    /// pictures apart.
     media: bool,
+    /// The content-keyed path the cache files this session under, when the
+    /// host supplied one. See [`shiso_core::media::MediaKey`].
+    key: Option<SessionKey>,
+    /// How far this session's rotary position trails its sequence position.
+    ///
+    /// Zero until a picture has been read, and always zero for a family that
+    /// positions a picture the way it positions text. A picture occupies its
+    /// grid's area in sequence positions but advances a three-stream rotary
+    /// position by only its longest extent, and every token after it - the
+    /// rest of the prompt, each decoded token, each verified draft - rotates
+    /// at `written - rope_shift`. Rotating those at `written` instead leaves
+    /// the first decoded token hundreds of positions away from the text it
+    /// answers.
+    rope_shift: u32,
     /// The position a resume stood this session on, zero for one prefilled
     /// from nothing: what files a prompt's end as cold or as a continuation.
     resumed_at: u32,
@@ -296,6 +312,8 @@ impl Session {
             history: Vec::new(),
             spec,
             media: false,
+            key: None,
+            rope_shift: 0,
             resumed_at: 0,
             hints: Vec::new(),
             scoring: false,
@@ -325,8 +343,11 @@ impl Session {
         if position >= self.written {
             return;
         }
-        self.history
-            .truncate(usize::try_from(position).unwrap_or(usize::MAX));
+        let keep = usize::try_from(position).unwrap_or(usize::MAX);
+        self.history.truncate(keep);
+        if let Some(key) = self.key.as_mut() {
+            key.path.truncate(keep);
+        }
         self.written = position;
     }
 
@@ -400,6 +421,14 @@ impl Session {
 
     /// Appends the chunk the session was just advanced by.
     pub(crate) fn push_history(&mut self, tokens: &[TokenId]) {
+        // The history holds every position before the chunk, so its length is
+        // where the chunk sits on the key.
+        if let Some(key) = self.key.as_mut() {
+            key.push(
+                u32::try_from(self.history.len()).unwrap_or(u32::MAX),
+                tokens,
+            );
+        }
         self.history.extend_from_slice(tokens);
     }
 
@@ -523,6 +552,12 @@ impl Session {
             });
         }
         self.kv.adopt(frontier)?;
+        // The resumed prefix is the prompt's own ids, so the key path is
+        // rebuilt over it: a keyed session commits under the key from here on.
+        if let Some(key) = self.key.as_mut() {
+            key.path.clear();
+            key.push(0, &tokens);
+        }
         self.history = tokens;
         self.written = position;
         // After the two fallible steps, so a refused adopt leaves the session
@@ -580,6 +615,75 @@ impl Session {
         self.media = true;
     }
 
+    /// Files this session under `key` from its first token on, and marks it
+    /// media now rather than when a chunk splices: a resume can cover every
+    /// picture, and the tail it leaves is then read as text - but the path
+    /// still carries placeholder runs, and dropping the key must never leave
+    /// it checkpointable under them.
+    pub(crate) fn set_key(&mut self, key: SessionKey) {
+        self.media = true;
+        self.key = Some(key);
+    }
+
+    /// The content key this session is filed under, when it has one.
+    #[must_use]
+    pub(crate) const fn key(&self) -> Option<&SessionKey> {
+        self.key.as_ref()
+    }
+
+    /// Whether this session may be checkpointed at `q`. See
+    /// [`crate::media_path::keyed_at`].
+    #[must_use]
+    pub(crate) fn keyed_at(&self, q: u32) -> bool {
+        crate::media_path::keyed_at(self.media, self.key.as_ref(), q)
+    }
+
+    /// How far this session's rotary position trails its sequence position.
+    #[must_use]
+    pub(crate) const fn rope_shift(&self) -> u32 {
+        self.rope_shift
+    }
+
+    /// Records where the rotary stream stands after a read or a resume.
+    pub(crate) fn set_rope_shift(&mut self, shift: u32) {
+        self.rope_shift = shift;
+    }
+
+    /// The path the cache files this session under: its history, with a media
+    /// prompt's placeholder runs written in their key ids.
+    #[must_use]
+    pub(crate) fn cache_path(&self) -> &[TokenId] {
+        self.key.as_ref().map_or(&self.history, |key| &key.path)
+    }
+
+    /// [`Self::cache_path`] followed by `rest`, the tokens about to be written
+    /// at the positions from [`Self::written`].
+    pub(crate) fn cache_path_with(&self, rest: &[TokenId]) -> Vec<TokenId> {
+        let mut path = Vec::with_capacity(self.history.len().saturating_add(rest.len()));
+        path.extend_from_slice(self.cache_path());
+        match &self.key {
+            Some(key) => key.extend_keyed(self.written, rest, &mut path),
+            None => path.extend_from_slice(rest),
+        }
+        path
+    }
+
+    /// Adds one shared boundary to those already recorded.
+    pub(crate) fn add_hint(&mut self, at: u32) {
+        if let Err(slot) = self.hints.binary_search(&at) {
+            self.hints.insert(slot, at);
+        }
+    }
+
+    /// Moves the shared boundary `from` to `to`, where the chunk is cut and
+    /// the checkpoint taken instead.
+    pub(crate) fn move_hint(&mut self, from: u32, to: u32) {
+        if let Ok(slot) = self.hints.binary_search(&from) {
+            self.hints.remove(slot);
+        }
+        self.add_hint(to);
+    }
+
     /// Records the shared boundaries of the prompt this session is about to
     /// read, ascending and without repeats.
     pub(crate) fn set_hints(&mut self, hints: &[u32]) {
@@ -589,10 +693,12 @@ impl Session {
         self.hints.dedup();
     }
 
-    /// The first shared boundary strictly after `from` and before `to`.
-    #[must_use]
-    pub(crate) fn hint_between(&self, from: u32, to: u32) -> Option<u32> {
-        self.hints.iter().copied().find(|&at| at > from && at < to)
+    /// The shared boundaries strictly after `from` and before `to`, ascending.
+    pub(crate) fn hints_between(&self, from: u32, to: u32) -> impl Iterator<Item = u32> + '_ {
+        self.hints
+            .iter()
+            .copied()
+            .filter(move |&at| at > from && at < to)
     }
 
     /// Whether `at` is one of this session's shared boundaries.
@@ -631,7 +737,11 @@ impl Session {
     /// together, and the alternative to splitting the borrow here is copying a
     /// context-length token vector on every committed step.
     pub(crate) fn commit_parts(&mut self) -> (&[TokenId], &mut SessionKv) {
-        (&self.history, &mut self.kv)
+        let path = match &self.key {
+            Some(key) => key.path.as_slice(),
+            None => self.history.as_slice(),
+        };
+        (path, &mut self.kv)
     }
 
     /// How many recurrent slots this session carries state for.

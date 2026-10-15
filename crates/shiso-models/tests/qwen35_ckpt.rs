@@ -313,10 +313,16 @@ fn every_refusal_says_which_one_it_is() {
         "a stack nobody gave a directory to says so rather than failing"
     );
     assert!(!cold.kv_checkpoint_enabled());
+    // Nothing persists without a directory, but the checkpoints a commit
+    // admits are kept in memory whether or not one is open, so a resume is
+    // still answered - from memory, never from a disk tier this stack lacks.
+    let source = cold
+        .kv_resume(session, &path)
+        .expect("a disabled tier still answers")
+        .map(|info| info.source);
     assert!(
-        cold.kv_resume(session, &path)
-            .expect("a disabled tier still answers")
-            .is_none()
+        source.is_none_or(|source| source == shiso_engine::ckpt::ResumeSource::Memory),
+        "a stack with no directory resumes from memory or not at all: {source:?}"
     );
 
     // Below the floor, which is the one intrinsic gate this tier owns.
@@ -432,4 +438,38 @@ fn a_sweep_without_a_directory_writes_nothing() {
         0,
         "a stack with no checkpoint directory has nowhere to sweep to"
     );
+}
+
+/// A plain conversation stops at a message end inside a chunk, exactly where it
+/// falls and whatever the tier's floor, so its next turn resumes there: the
+/// shipped floor is as wide as a chunk, and a floor counted from the chunk's
+/// start would leave no message end inside one that could ever clear it.
+#[test]
+fn a_conversation_stops_at_its_message_end_under_the_shipped_floor() {
+    // Off the recurrence's run grid on purpose: the stop is the boundary itself.
+    const TURN: u32 = 13;
+    let store = tempfile::TempDir::new().expect("a temporary directory");
+    let (_dir, _fake, mut model) = loaded();
+    let mut opts = ckpt_options();
+    opts.min_tokens = CkptOptions::new().min_tokens;
+    model
+        .kv_enable(&CkptConfig::new(store.path()).with_options(opts))
+        .expect("the checkpoint directory opens");
+
+    let first = model.open_session().expect("a session opens");
+    model
+        .kv_set_hints(first, &[TURN])
+        .expect("the boundary is recorded");
+    model
+        .prefill_last(first, &tokens(1, 40))
+        .expect("the first turn reads");
+
+    let mut next = tokens(1, TURN);
+    next.extend(tokens(200, 20));
+    let second = model.open_session().expect("a session opens");
+    let reused = model
+        .kv_resume(second, &next)
+        .expect("the resume answers")
+        .map_or(0, |info| info.tokens_reused);
+    assert_eq!(reused, TURN, "the next turn stands on the message end");
 }

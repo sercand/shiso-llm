@@ -18,7 +18,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::decision::core::{Answered, Kind, choice_name};
+use crate::decision::core::{Answered, InputTally, Kind, choice_name};
 use crate::decision::math::expected_score;
 
 /// The one prompt format this server answers in, echoed so a caller knows
@@ -36,13 +36,13 @@ fn name_value(id: &str) -> Value {
 }
 
 /// Encodes the scored answers under `model` (the request's own name, or the
-/// server's when the caller named none). `total_input_tokens` is the prompt
-/// side of `usage`: nothing is generated on this surface, so the output
-/// count is zero and the total is the input.
+/// server's when the caller named none). `tally` is the prompt side of
+/// `usage`: nothing is generated on this surface, so the output count is zero
+/// and the total is the input.
 pub(crate) fn encode(
     model: String,
     answers: &[Answered],
-    total_input_tokens: u64,
+    tally: InputTally,
     want_token_ids: bool,
 ) -> Value {
     let answered: Vec<Value> = answers
@@ -133,17 +133,18 @@ pub(crate) fn encode(
     body.insert("answers".to_owned(), Value::Array(answered));
     // Nothing is generated on this surface, so the output count is zero and
     // the total is the input - the same accounting a caller would compute
-    // from the answers, stated rather than implied. The detail objects carry
-    // the official keys at zero: this server reports no prompt-cache
-    // accounting and scores with reasoning off.
+    // from the answers, stated rather than implied. `cached_tokens` is the
+    // part of the input a stored prefix covered; nothing is billed for
+    // writing a checkpoint, so `cache_write_tokens` stays zero, and scoring
+    // runs with reasoning off.
     body.insert(
         "usage".to_owned(),
         json!({
-            "input_tokens": total_input_tokens,
-            "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
+            "input_tokens": tally.input,
+            "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": tally.cached},
             "output_tokens": 0,
             "output_tokens_details": {"reasoning_tokens": 0},
-            "total_tokens": total_input_tokens,
+            "total_tokens": tally.input,
         }),
     );
     Value::Object(body)
@@ -152,7 +153,9 @@ pub(crate) fn encode(
 #[cfg(test)]
 mod tests {
     use super::encode;
-    use crate::decision::core::{Answered, ChoiceOption, ChoiceValue, Kind, ScoreLevel};
+    use crate::decision::core::{
+        Answered, ChoiceOption, ChoiceValue, InputTally, Kind, ScoreLevel,
+    };
     use serde_json::{Value, json};
 
     /// One scored answer with every field the encoder reads set by hand, and
@@ -174,13 +177,22 @@ mod tests {
             label_mass,
             top,
             prompt_tokens: 0,
+            cached_tokens: 0,
             prompt_token_ids: None,
             label_token_ids: None,
         }
     }
 
     fn body(answers: &[Answered], want_ids: bool) -> Value {
-        encode("test-model".to_owned(), answers, 42, want_ids)
+        encode(
+            "test-model".to_owned(),
+            answers,
+            InputTally {
+                input: 42,
+                cached: 0,
+            },
+            want_ids,
+        )
     }
 
     /// The entry one answer renders to, on its own.

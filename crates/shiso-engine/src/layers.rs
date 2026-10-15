@@ -1270,6 +1270,11 @@ const EMBED_AFFINE_BLOCK: u32 = 64;
 /// positions text: there the three streams are the position row repeated, and
 /// the rotation has no three-stream entry point to reach. What makes a media
 /// span a span for that family is [`Scratch::bound`], not the angle.
+///
+/// A text pass past a picture, under the three-stream rule, takes the streams
+/// too (`multimodal` is then the pass's `rotary`): its rotation trails the
+/// sequence position by the shift the picture left, and the one-dimensional
+/// entry points rotate and address the cache from one row.
 fn positions<'a>(geometry: &Geometry, scratch: &'a Scratch, multimodal: bool) -> Positions<'a> {
     if !multimodal || geometry.media_positions == MediaPositions::Linear {
         return Positions::Linear(scratch.positions());
@@ -1801,6 +1806,25 @@ fn segments_here() -> CoreError {
 }
 
 /// Rows `first .. first + rows` of a buffer whose rows are `row_bytes` wide.
+/// Rows `first..first + rows` of every stream in `positions`: one run's share
+/// of a segmented pass's position rows.
+fn run_positions<'a>(
+    positions: &Positions<'a>,
+    first: u32,
+    rows: u32,
+) -> CoreResult<Positions<'a>> {
+    let span = |view: DeviceView<'a>| row_span(view, ID_BYTES, first, rows);
+    Ok(match positions {
+        Positions::Linear(linear) => Positions::Linear(span(*linear)?),
+        Positions::Mrope { linear, t, h, w } => Positions::Mrope {
+            linear: span(*linear)?,
+            t: span(*t)?,
+            h: span(*h)?,
+            w: span(*w)?,
+        },
+    })
+}
+
 fn row_span(
     view: DeviceView<'_>,
     row_bytes: u64,
@@ -1908,7 +1932,7 @@ pub(crate) fn forward(
             got: 0,
         });
     };
-    let positions = positions(geometry, scratch, media.is_some());
+    let positions = positions(geometry, scratch, media.is_some() || extras.rotary);
     let ple = per_layer_io(geometry, scratch, ple)?;
     let mut cur = 0usize;
     open(backend, weights, geometry, scratch, media, cur, n_tok)?;
@@ -2024,8 +2048,10 @@ pub(crate) fn forward(
                 let (k, v) = kv.layer_runs(rank)?;
                 if let PassRows::Segments(runs) = rows {
                     // Each run attends through its own session's table, as
-                    // its solo chunk would; a segmented pass carries no media,
-                    // so its positions are the linear row.
+                    // its solo chunk would. A segmented pass carries no media,
+                    // but a run past a picture rotates on the three streams,
+                    // so each run reads its own rows of whichever the pass
+                    // uploaded.
                     let row_bytes = u64::from(geometry.hidden).saturating_mul(launch::F32_BYTES);
                     let mut first = 0u32;
                     for run in runs {
@@ -2041,12 +2067,7 @@ pub(crate) fn forward(
                             &scratch.attn,
                             AttnIo {
                                 input: row_span(scratch.normed.view(), row_bytes, first, run.rows)?,
-                                pos: Positions::Linear(row_span(
-                                    scratch.positions(),
-                                    ID_BYTES,
-                                    first,
-                                    run.rows,
-                                )?),
+                                pos: run_positions(&positions, first, run.rows)?,
                                 bound: row_span(scratch.bound(), ID_BYTES, first, run.rows)?,
                                 block_out: row_span(
                                     scratch.block_out.view(),
@@ -2249,6 +2270,11 @@ pub(crate) struct PassExtras<'a> {
     pub(crate) trail: Trail,
     /// The tapped layers and where their rows go, when a drafter is bound.
     pub(crate) taps: Option<crate::block_draft::TapSink<'a>>,
+    /// Whether the rotation reads the three multimodal streams although the
+    /// pass splices no media: some row of it stands past a picture, where its
+    /// rotary position trails the sequence position the cache is addressed
+    /// by. The caller has written the streams.
+    pub(crate) rotary: bool,
 }
 
 /// Normalizes a block's output, for a family that normalizes it.

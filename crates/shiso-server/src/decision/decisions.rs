@@ -18,7 +18,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse as _, Response};
 
-use crate::decision::core::{self, TemplateKwargs, prepare_question, run_questions};
+use crate::decision::core::{self, InputTally, TemplateKwargs, prepare_question, run_questions};
 use crate::decision::decisions_encode::encode;
 use crate::decision::decisions_wire::{self, DecisionsBody};
 use crate::decision::head;
@@ -70,7 +70,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     // lays it out.
     if let Some(layout) = state.decision_layout.as_deref() {
         let (text, media) = head::split_input(&input);
-        let (answers, prompt_tokens) = head::run(
+        let (answers, tally) = head::run(
             state,
             layout,
             &text,
@@ -80,7 +80,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
             want_token_ids,
         )
         .await?;
-        return Ok(Json(encode(model, &answers, prompt_tokens, want_token_ids)).into_response());
+        return Ok(Json(encode(model, &answers, tally, want_token_ids)).into_response());
     }
 
     // A decision checkpoint with no head answers each question from its own
@@ -90,7 +90,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
         let (text, media) = head::split_input(&input);
         let text = serde_json::Value::String(text);
         let text = readout::spell_state(Some(&text), layout.state_spelling());
-        let (answers, prompt_tokens) = readout::run(
+        let (answers, tally) = readout::run(
             state,
             layout,
             text.as_deref(),
@@ -100,7 +100,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
             want_token_ids,
         )
         .await?;
-        return Ok(Json(encode(model, &answers, prompt_tokens, want_token_ids)).into_response());
+        return Ok(Json(encode(model, &answers, tally, want_token_ids)).into_response());
     }
 
     // Every question is prepared before any is scored: a refusal to score the
@@ -117,6 +117,6 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
         )?);
     }
     let answers = run_questions(state, prepared, temperature, want_token_ids).await?;
-    let total_prompt_tokens = answers.iter().map(|answer| answer.prompt_tokens).sum();
-    Ok(Json(encode(model, &answers, total_prompt_tokens, want_token_ids)).into_response())
+    let tally = InputTally::of(&answers);
+    Ok(Json(encode(model, &answers, tally, want_token_ids)).into_response())
 }

@@ -53,6 +53,14 @@ impl Checkpointed for NemotronHModel {
         self.stack_mut().ckpt_resume(session, prompt)
     }
 
+    fn kv_set_hints(&mut self, session: SessionId, hints: &[u32]) -> CoreResult<()> {
+        self.stack_mut().ckpt_set_hints(session, hints)
+    }
+
+    fn kv_set_scoring(&mut self, session: SessionId) -> CoreResult<()> {
+        self.stack_mut().ckpt_set_scoring(session)
+    }
+
     fn kv_save(&mut self, session: SessionId, reason: Reason) -> CoreResult<SaveOutcome> {
         self.stack_mut().ckpt_save(session, reason)
     }

@@ -55,7 +55,7 @@ pub use ids::{LayerIdx, Seed, SessionId, TokenId, TokenOutOfRange};
 pub use ledger::{LedgerReport, MemLedger, MemTag, Residence};
 pub use media::{
     KEY_ID_FLOOR, MediaDigest, MediaKey, MediaModel, MediaSpan, PadTokens, VisionGrid,
-    VisionPrefill,
+    VisionPrefill, run_floor, run_origin,
 };
 pub use model::{
     DecisionModel, DecisionQuestion, DecodeStep, DraftHint, Logits, Model, ModelInfo,

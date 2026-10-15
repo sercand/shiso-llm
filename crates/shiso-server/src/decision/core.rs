@@ -1085,10 +1085,38 @@ pub(crate) struct Answered {
     pub top: usize,
     /// Tokens this question's prompt occupied.
     pub prompt_tokens: u64,
+    /// Of `prompt_tokens`, those a stored prefix covered: a sibling
+    /// question's checkpoint or an earlier request's.
+    pub cached_tokens: u64,
     /// The prompt's ids, when the caller asked for them.
     pub prompt_token_ids: Option<Vec<u32>>,
     /// The label ids, when the caller asked for them.
     pub label_token_ids: Option<Vec<u32>>,
+}
+
+/// What a request's prompts cost: the tokens `usage` counts as input, and how
+/// many of those a stored prefix covered rather than a pass reading them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct InputTally {
+    /// The input side of `usage`.
+    pub input: u64,
+    /// Of `input`, the tokens resumed from a checkpoint. Never more than
+    /// `input`.
+    pub cached: u64,
+}
+
+impl InputTally {
+    /// Every question's whole prompt counted, as the label route reads them:
+    /// one prefill each, so a sibling standing on the first question's
+    /// checkpoint is cached tokens of its own prompt.
+    pub(crate) fn of(answers: &[Answered]) -> Self {
+        let input: u64 = answers.iter().map(|answer| answer.prompt_tokens).sum();
+        let cached: u64 = answers.iter().map(|answer| answer.cached_tokens).sum();
+        Self {
+            input,
+            cached: cached.min(input),
+        }
+    }
 }
 
 /// How many leading prompt tokens every question of a request shares, zero
@@ -1097,13 +1125,21 @@ pub(crate) struct Answered {
 /// The questions render the same input ahead of their own blocks, so this is
 /// roughly the input's length - and the point the scheduler checkpoints the
 /// first question it reads, so every later one reads only its own block.
-/// A question carrying media stops the share at zero: its pad runs are one id
-/// whichever picture it is, so equal ids there say nothing about equal rows.
+///
+/// Questions over pictures share only when every one carries the same
+/// pictures, by digest: a pad run is one id whichever picture it is, so equal
+/// ids say something about equal rows only when the pictures are the same.
+/// The scheduler then files the shared state under the pictures' content key,
+/// and a model that cannot key it keeps every question's read whole.
 fn shared_prefix(prepared: &[PreparedQuestion]) -> u32 {
     let [first, rest @ ..] = prepared else {
         return 0;
     };
-    if rest.is_empty() || prepared.iter().any(|question| !question.media.is_empty()) {
+    if rest.is_empty()
+        || rest
+            .iter()
+            .any(|question| question.media_digests != first.media_digests)
+    {
         return 0;
     }
     let common = rest
@@ -1186,6 +1222,7 @@ pub(crate) async fn run_questions(
                 label_mass: label_mass(&outcome.label_logprobs),
                 top,
                 prompt_tokens,
+                cached_tokens: outcome.cached_tokens.min(prompt_tokens),
                 prompt_token_ids: ids.as_ref().map(|(prompt, _)| prompt.clone()),
                 label_token_ids: ids.map(|(_, labels)| labels),
             })
