@@ -26,8 +26,8 @@ use crate::api::service_tier::ServiceTier;
 use crate::error::AppError;
 use crate::openai::chat_wire::StopField;
 use crate::openai::responses_wire::{
-    BareMessage, ContentPart, InputContent, InputField, InputItem, InputRole, ResponsesBody,
-    ResponsesTool, ResponsesToolChoice, TypedItem,
+    BareMessage, ContentPart, FunctionOutput, InputContent, InputField, InputItem, InputRole,
+    ResponsesBody, ResponsesTool, ResponsesToolChoice, TypedItem,
 };
 
 /// Turns a validated body into the neutral request.
@@ -116,10 +116,7 @@ fn append_item(request: &mut Request, item: &InputItem) {
             push(request, Role::Assistant, vec![call]);
         }
         InputItem::Typed(TypedItem::FunctionCallOutput { call_id, output }) => {
-            let result = Block::ToolResult(ToolResult::new(
-                call_id.clone(),
-                vec![Block::Text(output_text(output))],
-            ));
+            let result = Block::ToolResult(ToolResult::new(call_id.clone(), output_blocks(output)));
             push(request, Role::User, vec![result]);
         }
         InputItem::Typed(TypedItem::Reasoning { summary }) => {
@@ -173,35 +170,42 @@ fn content_blocks(content: &InputContent) -> Vec<Block> {
                 vec![Block::Text(text.clone())]
             }
         }
-        InputContent::Parts(parts) => parts
-            .iter()
-            .map(|part| match part {
-                ContentPart::InputText { text } | ContentPart::OutputText { text } => {
-                    Block::Text(text.clone())
-                }
-                ContentPart::InputImage { image_url } => {
-                    Block::Image(MediaSource::classify(image_url.url()))
-                }
-                ContentPart::InputVideo { video_url } => {
-                    Block::Video(MediaSource::classify(video_url.url()))
-                }
-                ContentPart::InputAudio { input_audio } => {
-                    Block::Audio(MediaSource::Inline(input_audio.data.clone()))
-                }
-                ContentPart::Refusal { refusal } => Block::Refusal(refusal.clone()),
-            })
-            .collect(),
+        InputContent::Parts(parts) => part_blocks(parts),
     }
 }
 
-/// A tool result's text, whatever JSON shape it arrived as.
+/// Content parts as blocks, one for one.
+fn part_blocks(parts: &[ContentPart]) -> Vec<Block> {
+    parts
+        .iter()
+        .map(|part| match part {
+            ContentPart::InputText { text } | ContentPart::OutputText { text } => {
+                Block::Text(text.clone())
+            }
+            ContentPart::InputImage { image_url } => {
+                Block::Image(MediaSource::classify(image_url.url()))
+            }
+            ContentPart::InputVideo { video_url } => {
+                Block::Video(MediaSource::classify(video_url.url()))
+            }
+            ContentPart::InputAudio { input_audio } => {
+                Block::Audio(MediaSource::Inline(input_audio.data.clone()))
+            }
+            ContentPart::Refusal { refusal } => Block::Refusal(refusal.clone()),
+        })
+        .collect()
+}
+
+/// A tool result's content, whatever shape it arrived as.
 ///
 /// A string stays a string: quoting it would show the model an escaped value
-/// where it expects the value.
-fn output_text(output: &Value) -> String {
+/// where it expects the value. Parts stay parts, so an image a tool returned
+/// reaches the vision tower rather than the tokenizer.
+fn output_blocks(output: &FunctionOutput) -> Vec<Block> {
     match output {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
+        FunctionOutput::Text(text) => vec![Block::Text(text.clone())],
+        FunctionOutput::Parts(parts) => part_blocks(parts),
+        FunctionOutput::Json(value) => vec![Block::Text(value.to_string())],
     }
 }
 
@@ -493,6 +497,46 @@ mod tests {
             request.messages[0].content[1],
             Block::Image(shiso_ir::MediaSource::Inline(_))
         ));
+    }
+
+    /// A screenshot tool answers with parts. Stringifying them would hand the
+    /// model a base64 blob as prose, and it would describe the blob, not the
+    /// picture.
+    #[test]
+    fn a_function_output_made_of_parts_keeps_its_image_as_an_image() {
+        let request = ir(serde_json::json!({"input": [
+            {"role": "user", "content": "screenshot?"},
+            {"type": "function_call", "call_id": "c1", "name": "shot", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": [
+                {"type": "input_text", "text": "Screenshot:"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"}
+            ]}
+        ]}));
+        let Block::ToolResult(result) = &request.messages[2].content[0] else {
+            panic!("the third turn opens with the result");
+        };
+        assert_eq!(result.content[0], Block::Text("Screenshot:".to_owned()));
+        assert!(matches!(
+            result.content[1],
+            Block::Image(shiso_ir::MediaSource::Inline(_))
+        ));
+    }
+
+    /// Structured JSON that is not a part list is still a tool's answer, shown
+    /// to the model as the JSON it is.
+    #[test]
+    fn a_function_output_of_plain_json_is_shown_as_json_text() {
+        let request = ir(serde_json::json!({"input": [
+            {"type": "function_call", "call_id": "c1", "name": "ls", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": [{"name": "a.txt"}]}
+        ]}));
+        let Block::ToolResult(result) = &request.messages[1].content[0] else {
+            panic!("the second turn opens with the result");
+        };
+        assert_eq!(
+            result.content,
+            vec![Block::Text(r#"[{"name":"a.txt"}]"#.to_owned())]
+        );
     }
 
     #[test]
