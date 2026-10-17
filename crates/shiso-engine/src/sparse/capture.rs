@@ -428,7 +428,18 @@ pub fn optional_paths(backend: &dyn Backend) -> OptionalPaths {
             && has(MOD_GDN_TC, "q4e_gdn_tc_scan_kernel")
             && has(MOD_GDN_TC, "q4e_gdn_conv_par_kernel")
             && has(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
-        prompt_matmul: if has(MOD_MATVEC, "q4e_bf16_gemm_kernel") {
+        prompt_matmul: if [
+            "q4e_bf16_gemm_kernel",
+            "q4e_bf16_gemm_split_kernel",
+            "q4e_bf16_gemv_kernel",
+            "q4e_bf16_rows_kernel",
+            "q4e_bf16_rows_wide_kernel",
+        ]
+        .iter()
+        .all(|entry| has(kernels::MOD_BF16, entry))
+        {
+            crate::sparse::matmul::PromptMatmul::Tensor
+        } else if has(MOD_MATVEC, "q4e_bf16_gemm_kernel") {
             crate::sparse::matmul::PromptMatmul::Matrix
         } else {
             crate::sparse::matmul::PromptMatmul::Rows

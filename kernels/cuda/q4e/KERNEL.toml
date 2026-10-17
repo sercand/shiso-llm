@@ -28,6 +28,9 @@
 # repository's own. `idxring` is a fifth: the indexer's pooled key pass reading
 # raw keys from a per-session ring and the pass's own rows instead of from a
 # per-position raw key plane, which the page no longer carries.
+# `bf16` is a sixth: the dense projections over a brain-float weight on a
+# device with tensor cores - split step kernels and a tensor-core prompt GEMM -
+# beside the ported `matvec` kernel it replaces there.
 
 [build]
 sources = [
@@ -47,6 +50,7 @@ sources = [
     "kv8.cu",
     "mxfp8.cu",
     "idxring.cu",
+    "bf16.cu",
 ]
 
 # Every unit includes `q4e.cuh` by bare name, and that header reaches its own
@@ -96,3 +100,4 @@ exact = "q4e_exact"
 kv8 = "q4e_kv8"
 mxfp8 = "q4e_mxfp8"
 idxring = "q4e_idxring"
+bf16 = "q4e_bf16"

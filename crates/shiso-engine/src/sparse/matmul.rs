@@ -32,8 +32,8 @@ use shiso_core::error::{CoreError, CoreResult};
 use crate::sparse::bind::{Args, Operand, WeightRef};
 use crate::sparse::exl3::{self, Fanout, GemmShape, Staging};
 use crate::sparse::kernels::{
-    self, Elem, Entry, Launch, MOD_EXL3, MOD_MATVEC, MOD_MXFP8, MOD_MXFP8_A8, TemplateArgs,
-    blocks_for,
+    self, Elem, Entry, Launch, MOD_BF16, MOD_EXL3, MOD_MATVEC, MOD_MXFP8, MOD_MXFP8_A8,
+    TemplateArgs, blocks_for,
 };
 use crate::sparse::plan::{Plan, Step, TrellisOp};
 use crate::sparse::scratch::Buf;
@@ -226,6 +226,18 @@ pub enum Projection {
         entry: Entry,
         /// Its launch.
         launch: Launch,
+    },
+    /// A brain-float weight through the step kernels of [`MOD_BF16`]: one
+    /// launch over up to [`BF16_STEP_ROWS`] rows, each output row's
+    /// contraction sliced across the warps of one block by the shape alone
+    /// and folded inside it.
+    BrainStep {
+        /// The projection itself.
+        entry: Entry,
+        /// Its launch.
+        launch: Launch,
+        /// Warps one output row's contraction is sliced across.
+        splits: u32,
     },
     /// A brain-float weight through the warp-per-row kernel.
     BrainRows {
@@ -528,10 +540,10 @@ pub struct Device {
     /// [`GemmReduction::ColumnInvariant`]. A fact about the pass, carried here
     /// for the reason `half_block_input` is.
     pub role: PassRole,
-    /// Which kernel a prompt pass's brain-float projections take: the
-    /// matrix-unit one (`q4e_bf16_gemm_kernel`) at every width where the
-    /// device has it. A probed device fact: a kernel set without it keeps the
-    /// warp-per-row kernel.
+    /// Which kernels a pass's brain-float projections take: a matrix-unit
+    /// one for a prompt chunk at every width where the device has it, and on
+    /// a device with [`MOD_BF16`] that module's step kernels as well. A probed
+    /// device fact: a kernel set without either keeps the warp-per-row kernel.
     pub prompt_matmul: PromptMatmul,
     /// The precision a prompt pass's activations enter the block-scaled
     /// weights' products at; see [`PrefillActivations`]. An operator's
@@ -606,6 +618,12 @@ pub enum PromptMatmul {
     Rows,
     /// The matrix-unit kernel, a whole chunk a launch.
     Matrix,
+    /// The brain-float module of a device with tensor cores ([`MOD_BF16`]):
+    /// its tensor-core GEMM for a prompt chunk, a whole chunk a launch, and
+    /// its split step kernels for a decode step or a verify pass in place of
+    /// the warp-per-row kernel. The one probe covers both because they are
+    /// one module: a kernel set that has the GEMM has the step kernels.
+    Tensor,
 }
 
 /// What one session's pass of consecutive positions is for.
@@ -861,6 +879,9 @@ fn expand_packed(out: &mut Plan, weight: WeightDesc, w: Operand, wide: Elem) {
 /// A prompt pass on a device with the matrix-unit kernel takes it at every
 /// width instead, as the affine tier does, for the same reason.
 fn brain(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Projection> {
+    if matches!(device.prompt_matmul, PromptMatmul::Tensor) {
+        return brain_tensor(in_dim, out_dim, rows, device);
+    }
     if brain_gemm(in_dim, device) {
         return Ok(Projection::BrainGemm {
             entry: Entry::plain(MOD_MATVEC, "q4e_bf16_gemm_kernel"),
@@ -899,13 +920,137 @@ fn brain(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Pro
     })
 }
 
-/// Whether a brain-float projection of contraction `in_dim` takes the
-/// matrix-unit kernel on this pass: a prompt pass, on a device that has it,
+/// Whether a brain-float projection of contraction `in_dim` takes a
+/// matrix-unit kernel on this pass: a prompt pass, on a device that has one,
 /// over a contraction its 32-wide slices divide.
 const fn brain_gemm(in_dim: u32, device: Device) -> bool {
-    matches!(device.prompt_matmul, PromptMatmul::Matrix)
-        && device.row_invariant()
+    matches!(
+        device.prompt_matmul,
+        PromptMatmul::Matrix | PromptMatmul::Tensor
+    ) && device.row_invariant()
         && in_dim.is_multiple_of(32)
+}
+
+/// The widest pass the brain-float step kernels of [`MOD_BF16`] take in one
+/// launch; a wider step pass runs as passes of this width, which are the one
+/// launch's bits because a row's sum does not depend on the rows beside it.
+/// The half-precision tier's width ([`HALF_MAX_ROWS`]), for the reason given
+/// there: a batched verify is wider than sixteen rows.
+pub const BF16_STEP_ROWS: u32 = HALF_MAX_ROWS;
+
+/// Warps a brain-float step-kernel block runs (`Q4E_BF_WARPS`).
+pub const BF16_STEP_WARPS: u32 = 8;
+
+/// Threads a brain-float step-kernel block runs.
+pub const BF16_STEP_THREADS: u32 = BF16_STEP_WARPS * kernels::WARP;
+
+/// Output rows one warp of the brain-float step kernel for `rows` activation
+/// rows owns (`R` in `bf16.cu`): one at a decode step, two over a verify pass.
+/// Sharing each activation load between two output rows is what keeps a
+/// verify pass bound by the weight read.
+#[must_use]
+pub const fn bf16_warp_rows(rows: u32) -> u32 {
+    if rows <= 1 { 1 } else { 2 }
+}
+
+/// Warps one output row's contraction is sliced across in a brain-float step
+/// projection: 1, 2, 4 or 8, a function of the shape alone so that every pass
+/// width sums a row the same way. A narrow output is sliced until about two
+/// thousand warps carry it, each slice at least one full step of the warp's
+/// loads: the stream mix down (320 outputs over 10,240) on one warp a row is
+/// 320 warps, too few to keep the memory busy.
+#[must_use]
+pub const fn bf16_split(in_dim: u32, out_dim: u32) -> u32 {
+    let mut split = 1;
+    while split < BF16_STEP_WARPS
+        && out_dim.saturating_mul(split) < 2_048
+        && in_dim / (split * 2) >= 256
+    {
+        split *= 2;
+    }
+    split
+}
+
+/// Output rows and activation rows one tile of the brain-float prompt GEMM
+/// covers (`Q4E_BF_BM`, `Q4E_BF_BN`).
+pub const BF16_GEMM_TILE: u32 = 128;
+
+/// Threads the brain-float prompt GEMM runs a tile with: sixteen warps of
+/// 32 x 32 (`Q4E_BF_GEMM_THREADS`).
+pub const BF16_GEMM_THREADS: u32 = 512;
+
+/// Dynamic shared memory the brain-float prompt GEMM takes
+/// (`Q4E_BF_GEMM_SMEM(0)`): a three-step ring of weight tiles and raw
+/// activations, and two rounded activation tiles. Above the 48 KiB a launch
+/// gets without opting in, below the device's 99 KiB per block.
+pub const BF16_GEMM_SMEM: u32 = 3 * (128 * 32 * 2 + 128 * 32 * 4) + 2 * (128 * 32 * 2);
+
+/// Dynamic shared memory the split-activation prompt GEMM takes
+/// (`Q4E_BF_GEMM_SMEM(1)`): a two-step ring, and two pairs of rounded tiles
+/// (the activations' brain-float part and what rounding left).
+pub const BF16_GEMM_SPLIT_SMEM: u32 = 2 * (128 * 32 * 2 + 128 * 32 * 4) + 4 * (128 * 32 * 2);
+
+/// The brain-float tier on a device with [`MOD_BF16`].
+///
+/// A prompt pass takes the tensor-core GEMM at every width. The projections
+/// [`half_exact`] keeps off the rounded half-precision multiply - narrow
+/// outputs over the residual width, the router above all - take the split
+/// GEMM, which carries each activation as two brain floats, sixteen
+/// significant bits, so a near-tie between two experts is not decided by the
+/// rounding; the rest round their activations to brain floats, as the
+/// checkpoint's own arithmetic does.
+///
+/// A step pass takes the split step kernels, whose sums do not move with the
+/// row count: a verify row reproduces the single-row step bit for bit. A
+/// prompt pass over a contraction the GEMM's slices do not divide takes them
+/// too, which keeps its promise for the same reason.
+fn brain_tensor(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Projection> {
+    if brain_gemm(in_dim, device) {
+        let (entry, smem) = if half_exact(in_dim, out_dim, device.tier_rows(rows)) {
+            ("q4e_bf16_gemm_split_kernel", BF16_GEMM_SPLIT_SMEM)
+        } else {
+            ("q4e_bf16_gemm_kernel", BF16_GEMM_SMEM)
+        };
+        return Ok(Projection::BrainGemm {
+            entry: Entry::plain(MOD_BF16, entry),
+            launch: Launch::new(
+                shiso_core::Extent3::new(
+                    out_dim.div_ceil(BF16_GEMM_TILE),
+                    rows.div_ceil(BF16_GEMM_TILE),
+                    1,
+                ),
+                BF16_GEMM_THREADS,
+                smem,
+            ),
+        });
+    }
+    // Eight brain floats a lane: the kernels load sixteen bytes of weight at
+    // a time.
+    if !in_dim.is_multiple_of(8) {
+        return Err(CoreError::ShapeMismatch {
+            field: "brain-float contraction width",
+            expected: 8,
+            got: u64::from(in_dim),
+        });
+    }
+    let entry = match rows {
+        1 => "q4e_bf16_gemv_kernel",
+        2..=8 => "q4e_bf16_rows_kernel",
+        9..=BF16_STEP_ROWS => "q4e_bf16_rows_wide_kernel",
+        _ => {
+            return Err(CoreError::Unsupported {
+                what: "a brain-float step pass wider than its widest kernel; it runs in passes",
+                backend: "engine",
+            });
+        }
+    };
+    let splits = bf16_split(in_dim, out_dim);
+    let rows_per_block = BF16_STEP_WARPS / splits * bf16_warp_rows(rows);
+    Ok(Projection::BrainStep {
+        entry: Entry::plain(MOD_BF16, entry),
+        launch: Launch::linear(out_dim.div_ceil(rows_per_block), BF16_STEP_THREADS),
+        splits,
+    })
 }
 
 /// Trellis width of one of the three codec element types.
@@ -1112,7 +1257,14 @@ pub fn project(
         }
         // The brain-float tier has no BLAS path, so passes are its only way
         // through a chunk - a draft head's catch-up over the prompt is one.
-        DType::BF16 => rows > MAX_ROWS && !brain_gemm(weight.in_dim, device),
+        DType::BF16 => {
+            let widest = if matches!(device.prompt_matmul, PromptMatmul::Tensor) {
+                BF16_STEP_ROWS
+            } else {
+                MAX_ROWS
+            };
+            rows > widest && !brain_gemm(weight.in_dim, device)
+        }
         // A step pass wider than the multi-row kernel - a batched verify -
         // runs in passes of it; a prompt chunk is one tensor-core launch.
         DType::Mxfp8E4M3G32 => rows > MXFP8_STEP_ROWS && !device.row_invariant(),
@@ -1121,6 +1273,7 @@ pub fn project(
     if passes {
         let width = match weight.dtype {
             DType::F16 | DType::F16Pack12 => HALF_MAX_ROWS,
+            DType::BF16 if matches!(device.prompt_matmul, PromptMatmul::Tensor) => BF16_STEP_ROWS,
             DType::Mxfp8E4M3G32 => MXFP8_STEP_ROWS,
             _ => MAX_ROWS,
         };
@@ -1337,6 +1490,24 @@ fn project_one(
                 bound.src,
                 Operand::U32(weight.in_dim),
                 Operand::U32(weight.out_dim),
+                Operand::U32(rows),
+            ]),
+        ),
+        // `out, w, x, in_dim, out_dim, splits, rows`.
+        Projection::BrainStep {
+            entry,
+            launch,
+            splits,
+        } => out.launch(
+            entry,
+            launch,
+            Args::of(&[
+                bound.dst,
+                w,
+                bound.src,
+                Operand::U32(weight.in_dim),
+                Operand::U32(weight.out_dim),
+                Operand::U32(splits),
                 Operand::U32(rows),
             ]),
         ),
@@ -1960,6 +2131,115 @@ mod tests {
         )
         .expect("a brain-float chunk runs in passes");
         assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn a_tensor_core_device_takes_the_brain_float_gemm_on_a_prompt_pass() {
+        let prompt = Device {
+            prompt_matmul: PromptMatmul::Tensor,
+            role: PassRole::Prompt { snapshot: None },
+            ..GPU
+        };
+        // The stream mixes and the n-gram projections round their activations;
+        // the router and the shared router, narrow over the residual width,
+        // carry them as two brain floats. The choice reads the shape only, so
+        // every width of a prompt takes the same kernel.
+        for (out_dim, in_dim, want, smem) in [
+            (320, 10_240, "q4e_bf16_gemm_kernel", BF16_GEMM_SMEM),
+            (10_240, 320, "q4e_bf16_gemm_kernel", BF16_GEMM_SMEM),
+            (4, 10_240, "q4e_bf16_gemm_kernel", BF16_GEMM_SMEM),
+            (248_320, 2_560, "q4e_bf16_gemm_kernel", BF16_GEMM_SMEM),
+            (
+                512,
+                2_560,
+                "q4e_bf16_gemm_split_kernel",
+                BF16_GEMM_SPLIT_SMEM,
+            ),
+            (1, 2_560, "q4e_bf16_gemm_split_kernel", BF16_GEMM_SPLIT_SMEM),
+        ] {
+            for rows in [1, 7, 2048] {
+                let plan = brain(in_dim, out_dim, rows, prompt).expect("the device has it");
+                let Projection::BrainGemm { entry, launch } = plan else {
+                    panic!("{plan:?}");
+                };
+                assert_eq!(entry.name(), want, "[{out_dim} x {in_dim}] at {rows}");
+                assert_eq!(entry.module(), MOD_BF16);
+                assert_eq!(launch.grid.x, out_dim.div_ceil(BF16_GEMM_TILE));
+                assert_eq!(launch.grid.y, rows.div_ceil(BF16_GEMM_TILE));
+                assert_eq!(launch.smem, smem);
+            }
+        }
+        const { assert!(BF16_GEMM_SMEM <= 101_376 && BF16_GEMM_SPLIT_SMEM <= 101_376) };
+    }
+
+    #[test]
+    fn a_tensor_core_device_steps_brain_floats_on_the_split_kernels() {
+        let step = Device {
+            prompt_matmul: PromptMatmul::Tensor,
+            ..GPU
+        };
+        for (rows, want, per_warp) in [
+            (1, "q4e_bf16_gemv_kernel", 1),
+            (2, "q4e_bf16_rows_kernel", 2),
+            (8, "q4e_bf16_rows_kernel", 2),
+            (9, "q4e_bf16_rows_wide_kernel", 2),
+            (BF16_STEP_ROWS, "q4e_bf16_rows_wide_kernel", 2),
+        ] {
+            // The stream mix down: narrow, so each row is sliced eight ways.
+            let plan = brain(10_240, 320, rows, step).expect("a step pass");
+            let Projection::BrainStep {
+                entry,
+                launch,
+                splits,
+            } = plan
+            else {
+                panic!("{plan:?}");
+            };
+            assert_eq!(entry.name(), want);
+            assert_eq!(splits, 8);
+            assert_eq!(launch.grid.x, 320 / per_warp);
+            assert_eq!(launch.block.x, BF16_STEP_THREADS);
+            // The output head: wide, so one warp a row.
+            let plan = brain(2_560, 248_320, rows, step).expect("a step pass");
+            let Projection::BrainStep { launch, splits, .. } = plan else {
+                panic!("{plan:?}");
+            };
+            assert_eq!(splits, 1);
+            assert_eq!(launch.grid.x, 248_320 / (8 * per_warp));
+        }
+        // The split is the shape's alone.
+        assert_eq!(bf16_split(2_560, 512), 4);
+        assert_eq!(bf16_split(10_240, 4), 8);
+        assert_eq!(bf16_split(320, 10_240), 1);
+        assert_eq!(bf16_split(2_560, 2_560), 1);
+        let err = brain(2_560, 512, BF16_STEP_ROWS + 1, step).expect_err("one launch at most");
+        assert!(matches!(err, CoreError::Unsupported { .. }), "{err:?}");
+        // A batched verify wider than one launch: passes of the widest one.
+        let weight = WeightRef::layer(
+            crate::sparse::bind::LayerRef::target(0),
+            crate::sparse::bind::Role::AttnQuery,
+        );
+        let bound = Bound::new(
+            weight,
+            Operand::Scratch(Buf::Residual),
+            Operand::Scratch(Buf::Embed),
+        );
+        let mut out = Plan::new();
+        project(
+            &mut out,
+            WeightDesc::new(DType::BF16, 2_560, 12_288),
+            bound,
+            BF16_STEP_ROWS + 5,
+            step,
+        )
+        .expect("a wide verify runs in passes");
+        let names: Vec<_> = out
+            .steps()
+            .iter()
+            .filter_map(Step::entry)
+            .map(|e| e.name())
+            .collect();
+        assert_eq!(names, ["q4e_bf16_rows_wide_kernel", "q4e_bf16_rows_kernel"]);
     }
 
     #[test]

@@ -315,6 +315,218 @@ pub const CASES: &[Case] = &[
         name: "q4e_mxfp8_a8_gemm2048_2560x6144",
         build: crate::qwen4exp::lowp::bench_a8_gemm2048_2560x6144,
     },
+    Case {
+        name: "q4e_bf16_gemv_320x10240",
+        build: crate::qwen4exp::bf16::bench_gemv_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_gemv_10240x320",
+        build: crate::qwen4exp::bf16::bench_gemv_10240x320,
+    },
+    Case {
+        name: "q4e_bf16_gemv_4x10240",
+        build: crate::qwen4exp::bf16::bench_gemv_4x10240,
+    },
+    Case {
+        name: "q4e_bf16_gemv_512x2560",
+        build: crate::qwen4exp::bf16::bench_gemv_512x2560,
+    },
+    Case {
+        name: "q4e_bf16_gemv_10240x2560",
+        build: crate::qwen4exp::bf16::bench_gemv_10240x2560,
+    },
+    Case {
+        name: "q4e_bf16_gemv_2560x2560",
+        build: crate::qwen4exp::bf16::bench_gemv_2560x2560,
+    },
+    Case {
+        name: "q4e_bf16_gemv_248320x2560",
+        build: crate::qwen4exp::bf16::bench_gemv_248320x2560,
+    },
+    Case {
+        name: "q4e_bf16_rows5_320x10240",
+        build: crate::qwen4exp::bf16::bench_rows5_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_rows5_10240x320",
+        build: crate::qwen4exp::bf16::bench_rows5_10240x320,
+    },
+    Case {
+        name: "q4e_bf16_rows5_512x2560",
+        build: crate::qwen4exp::bf16::bench_rows5_512x2560,
+    },
+    Case {
+        name: "q4e_bf16_rows5_10240x2560",
+        build: crate::qwen4exp::bf16::bench_rows5_10240x2560,
+    },
+    Case {
+        name: "q4e_bf16_rows8_320x10240",
+        build: crate::qwen4exp::bf16::bench_rows8_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_rows8_10240x2560",
+        build: crate::qwen4exp::bf16::bench_rows8_10240x2560,
+    },
+    Case {
+        name: "q4e_bf16_rows20_320x10240",
+        build: crate::qwen4exp::bf16::bench_rows20_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_gemm2048_320x10240",
+        build: crate::qwen4exp::bf16::bench_gemm2048_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_gemm2048_10240x320",
+        build: crate::qwen4exp::bf16::bench_gemm2048_10240x320,
+    },
+    Case {
+        name: "q4e_bf16_gemm2048_4x10240",
+        build: crate::qwen4exp::bf16::bench_gemm2048_4x10240,
+    },
+    Case {
+        name: "q4e_bf16_gemm_split2048_512x2560",
+        build: crate::qwen4exp::bf16::bench_gemm_split2048_512x2560,
+    },
+    Case {
+        name: "q4e_bf16_gemm2048_10240x2560",
+        build: crate::qwen4exp::bf16::bench_gemm2048_10240x2560,
+    },
+    Case {
+        name: "q4e_bf16_gemm2048_2560x2560",
+        build: crate::qwen4exp::bf16::bench_gemm2048_2560x2560,
+    },
+    Case {
+        name: "q4e_bf16_gemm2048_12288x2560",
+        build: crate::qwen4exp::bf16::bench_gemm2048_12288x2560,
+    },
+    Case {
+        name: "q4e_bf16_ported2048_320x10240",
+        build: crate::qwen4exp::bf16::bench_ported2048_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_ported2048_512x2560",
+        build: crate::qwen4exp::bf16::bench_ported2048_512x2560,
+    },
+    Case {
+        name: "q4e_bf16_ported1_320x10240",
+        build: crate::qwen4exp::bf16::bench_ported1_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_ported1_10240x2560",
+        build: crate::qwen4exp::bf16::bench_ported1_10240x2560,
+    },
+    Case {
+        name: "q4e_bf16_ported1_248320x2560",
+        build: crate::qwen4exp::bf16::bench_ported1_248320x2560,
+    },
+    Case {
+        name: "q4e_bf16_p12_1_320x10240",
+        build: crate::qwen4exp::bf16::bench_p12_1_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_p12_1_10240x320",
+        build: crate::qwen4exp::bf16::bench_p12_1_10240x320,
+    },
+    Case {
+        name: "q4e_bf16_p12_1_512x2560",
+        build: crate::qwen4exp::bf16::bench_p12_1_512x2560,
+    },
+    Case {
+        name: "q4e_bf16_p12_1_10240x2560",
+        build: crate::qwen4exp::bf16::bench_p12_1_10240x2560,
+    },
+    Case {
+        name: "q4e_bf16_p12_5_320x10240",
+        build: crate::qwen4exp::bf16::bench_p12_5_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_p12_5_10240x2560",
+        build: crate::qwen4exp::bf16::bench_p12_5_10240x2560,
+    },
+    Case {
+        name: "vit_q_mxfp8_qkv_4096",
+        build: crate::vision::quant::bench_mxfp8_qkv_4096,
+    },
+    Case {
+        name: "vit_q_mxfp8_proj_4096",
+        build: crate::vision::quant::bench_mxfp8_proj_4096,
+    },
+    Case {
+        name: "vit_q_nvfp4_fc1_4096",
+        build: crate::vision::quant::bench_nvfp4_fc1_4096,
+    },
+    Case {
+        name: "vit_q_nvfp4_fc2_4096",
+        build: crate::vision::quant::bench_nvfp4_fc2_4096,
+    },
+    Case {
+        name: "vit_q_nvfp4_merger_1024",
+        build: crate::vision::quant::bench_nvfp4_merger_1024,
+    },
+    Case {
+        name: "vit_q_mxfp8_qkv_16384",
+        build: crate::vision::quant::bench_mxfp8_qkv_16384,
+    },
+    Case {
+        name: "vit_q_nvfp4_fc1_16384",
+        build: crate::vision::quant::bench_nvfp4_fc1_16384,
+    },
+    Case {
+        name: "vit_q_nvfp4_fc2_16384",
+        build: crate::vision::quant::bench_nvfp4_fc2_16384,
+    },
+    Case {
+        name: "vit_q_blas_qkv_4096",
+        build: crate::vision::quant::bench_blas_qkv_4096,
+    },
+    Case {
+        name: "vit_q_blas_proj_4096",
+        build: crate::vision::quant::bench_blas_proj_4096,
+    },
+    Case {
+        name: "vit_q_blas_fc1_4096",
+        build: crate::vision::quant::bench_blas_fc1_4096,
+    },
+    Case {
+        name: "vit_q_blas_fc2_4096",
+        build: crate::vision::quant::bench_blas_fc2_4096,
+    },
+    Case {
+        name: "vit_q_blas_merger_1024",
+        build: crate::vision::quant::bench_blas_merger_1024,
+    },
+    Case {
+        name: "vit_q_blas_qkv_16384",
+        build: crate::vision::quant::bench_blas_qkv_16384,
+    },
+    Case {
+        name: "vit_q_blas_fc1_16384",
+        build: crate::vision::quant::bench_blas_fc1_16384,
+    },
+    Case {
+        name: "vit_q_blas_fc2_16384",
+        build: crate::vision::quant::bench_blas_fc2_16384,
+    },
+    Case {
+        name: "vit_q_mxfp8_proj_196_narrow",
+        build: crate::vision::quant::bench_mxfp8_proj_196_narrow,
+    },
+    Case {
+        name: "vit_q_mxfp8_proj_196",
+        build: crate::vision::quant::bench_mxfp8_proj_196,
+    },
+    Case {
+        name: "vit_q_nvfp4_fc2_196_narrow",
+        build: crate::vision::quant::bench_nvfp4_fc2_196_narrow,
+    },
+    Case {
+        name: "vit_q_blas_proj_196",
+        build: crate::vision::quant::bench_blas_proj_196,
+    },
+    Case {
+        name: "vit_q_blas_fc2_196",
+        build: crate::vision::quant::bench_blas_fc2_196,
+    },
 ];
 
 /// What [`time`] measured.

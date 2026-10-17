@@ -114,6 +114,13 @@ pub const LOWP_ENTRIES: [(&str, &str); 7] = [
     (MOD_MXFP8_A8, "q4e_mxfp8_a8_quant_kernel"),
     (MOD_MXFP8_A8, "q4e_mxfp8_a8_gemm_kernel"),
 ];
+
+/// Dense projections over a brain-float weight, read as stored, on a device
+/// with tensor cores: split step kernels that sum a row one way whatever the
+/// pass width, and the tensor-core prompt GEMM. Not an upstream unit, for the
+/// reason [`MOD_MODELOPT`] is not; the ported brain-float kernel in
+/// [`MOD_MATVEC`] is what a kernel set without this module keeps.
+pub const MOD_BF16: &str = "q4e_bf16";
 /// The logits stages run before any pick: today, the suppress stage.
 pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a

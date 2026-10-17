@@ -100,10 +100,13 @@ pub enum DenseFormat {
     /// value below half precision's subnormal floor loses anything.
     Half,
     /// MXFP8 where the export stored a matrix so, kept as stored and served
-    /// by the MXFP8 tier; widened to half precision, as [`DenseFormat::Half`],
-    /// wherever it stored brain floats (the output head, the routers, the stream mixes and the draft
-    /// head's input projections). Decided per tensor by the stored format, so
-    /// a checkpoint that quantized one more or one fewer matrix still loads.
+    /// by the MXFP8 tier; kept as brain floats, as [`DenseFormat::Brain`],
+    /// wherever it stored brain floats (the output head, the routers, the
+    /// stream mixes, the n-gram projections and the draft head's dense
+    /// matrices). Decided per tensor by the stored format, so a checkpoint
+    /// that quantized one more or one fewer matrix still loads. Nothing is
+    /// re-encoded: a device with tensor cores serves the brain floats on its
+    /// brain-float GEMM and split step kernels.
     Mxfp8,
 }
 
@@ -205,13 +208,7 @@ impl Loader<'_> {
         let start = span.start + rows.start as usize * row_bytes;
         let end = span.start + rows.end as usize * row_bytes;
         let host: Arc<Shard> = self.ck.shard(slot);
-        // The mixed export's brain-float matrices (the stream mixes, the routers,
-        // the n-gram projections, the output head) take the half-precision
-        // path too: the brain-float tier plans a prompt chunk as sixteen-row
-        // passes that each re-read the weight, which measured 78% of a
-        // 2k-token prefill there (215 tok/s); half precision reaches the
-        // tensor-core tiers and the twelve-bit packing.
-        if matches!(self.layout.dense, DenseFormat::Half | DenseFormat::Mxfp8) {
+        if self.layout.dense == DenseFormat::Half {
             let src = &AsRef::<[u8]>::as_ref(&*host)[start..end];
             let moved = match how {
                 Move::InPlace => None,
@@ -236,23 +233,25 @@ impl Loader<'_> {
                 upload(self.backend, halves)?,
             ));
         }
+        let src = &AsRef::<[u8]>::as_ref(&*host)[start..end];
         let buffer = match how {
-            Move::InPlace => import_host(self.backend, host, start..end)?,
+            // The brain-float step kernels and GEMM read sixteen bytes at a
+            // time, and a safetensors payload sits wherever the header put it:
+            // a span off a sixteen-byte boundary is copied rather than
+            // wrapped.
+            Move::InPlace if src.as_ptr().align_offset(16) != 0 => {
+                upload(self.backend, src.to_vec())?
+            }
+            Move::InPlace => import_host(self.backend, host.clone(), start..end)?,
             Move::Rows {
                 rows: r,
                 lead,
                 perm,
-            } => {
-                let src = &AsRef::<[u8]>::as_ref(&*host)[start..end];
-                upload(self.backend, permute_blocks(src, r * row_bytes, lead, perm))?
-            }
-            Move::Cols { cols, perm } => {
-                let src = &AsRef::<[u8]>::as_ref(&*host)[start..end];
-                upload(
-                    self.backend,
-                    permute_columns(src, row_bytes, cols * 2, perm),
-                )?
-            }
+            } => upload(self.backend, permute_blocks(src, r * row_bytes, lead, perm))?,
+            Move::Cols { cols, perm } => upload(
+                self.backend,
+                permute_columns(src, row_bytes, cols * 2, perm),
+            )?,
         };
         Ok(Weight::over(
             DType::BF16,
