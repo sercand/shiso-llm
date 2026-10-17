@@ -70,6 +70,19 @@ pub enum PleRowType {
         /// The table scale, as `f32::to_bits`.
         scale_bits: u32,
     },
+    /// NVFP4: four-bit `e2m1` codes in groups of sixteen, one `e4m3` scale
+    /// byte per group, and one single-precision scale for the whole table,
+    /// carried here as its bit pattern for the same reason as
+    /// [`PleRowType::Fp8E4M3`]'s.
+    ///
+    /// The container stores codes and group scales as two arrays, so a row as
+    /// this crate hands it out is their two slices concatenated: `head_dim / 2`
+    /// bytes of codes, low nibble the earlier weight, then `head_dim / 16`
+    /// scale bytes.
+    Nvfp4 {
+        /// The table scale, as `f32::to_bits`.
+        global_bits: u32,
+    },
 }
 
 /// The table metadata a checkpoint supplies, before it has been checked.

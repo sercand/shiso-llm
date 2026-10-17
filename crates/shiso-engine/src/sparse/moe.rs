@@ -1095,12 +1095,36 @@ pub fn grouped_experts(
 /// Output rows one affine expert threadgroup covers (`Q4E_AFFINE_ROWS`).
 const AFFINE_EXPERT_ROWS: u32 = 8;
 
-/// Weight rows one block of the NVFP4 prompt kernels covers (`Q4E_MO_BM`).
-const NVFP4_GEMM_ROWS: u32 = 64;
+/// Weight rows one block of the NVFP4 prompt kernels covers (`Q4E_MG_BM`):
+/// 256 of down, or the same 128 (`Q4E_MG_HALF`) of gate and of up.
+const NVFP4_GEMM_ROWS: u32 = 256;
 
-/// Threads one block of the NVFP4 prompt kernels runs (`Q4E_MO_THREADS`):
-/// four warps, sixteen rows each.
-const NVFP4_GEMM_THREADS: u32 = 128;
+/// Blocks one row tile of the NVFP4 prompt kernels is split over, column tile
+/// `z` of every `NVFP4_GEMM_SPLIT` to block `z` (`Q4E_MG_SPLIT`).
+const NVFP4_GEMM_SPLIT: u32 = 4;
+
+/// Threads one block of the NVFP4 prompt kernels runs (`Q4E_MG_THREADS`):
+/// sixteen warps, sixteen rows each.
+const NVFP4_GEMM_THREADS: u32 = 512;
+
+/// Dynamic shared memory one block of the NVFP4 prompt kernels takes
+/// (`Q4E_MG_SMEM`): two weight stages, two activation steps, and the output
+/// tile staged over them.
+const NVFP4_GEMM_SMEM: u32 = 92_416;
+
+/// Contraction widths the NVFP4 prompt kernels take: whole multiples of
+/// their two activation steps of 64.
+const NVFP4_GEMM_K_ALIGN: u32 = 128;
+
+/// Output rows a block of the NVFP4 step kernels covers: gate and up one row
+/// a warp (`Q4E_NVFP4_GU_ROWS`), down four (`Q4E_NVFP4_DN_ROWS`), four warps
+/// a block.
+const NVFP4_STEP_GATE_UP_ROWS: u32 = 4;
+/// See [`NVFP4_STEP_GATE_UP_ROWS`].
+const NVFP4_STEP_DOWN_ROWS: u32 = 16;
+
+/// Threads a block of the NVFP4 step kernels runs (`Q4E_NVFP4_WARPS`).
+const NVFP4_STEP_THREADS: u32 = 128;
 
 /// Weight rows one tile of the routed prompt kernels covers
 /// (`Q4E_GEMM_EXPERT_ROWS`).
@@ -1205,26 +1229,53 @@ pub fn affine_experts(
         // expert's weights are decoded once a tile rather than once a column.
         // A step keeps the warp-per-row kernels.
         let gemm = device.row_invariant();
-        let (gate_up, down, rows, threads) = if gemm {
+        if gemm
+            && !(hidden.is_multiple_of(NVFP4_GEMM_K_ALIGN)
+                && inter.is_multiple_of(NVFP4_GEMM_K_ALIGN))
+        {
+            return Err(CoreError::Unsupported {
+                what: "an NVFP4 prompt expert stage whose widths are not multiples of 128",
+                backend: "engine",
+            });
+        }
+        let (gate_up, down) = if gemm {
             (
                 "q4e_nvfp4_experts_gemm_gate_up_kernel",
                 "q4e_nvfp4_experts_gemm_down_kernel",
-                NVFP4_GEMM_ROWS,
-                NVFP4_GEMM_THREADS,
             )
         } else {
             (
                 "q4e_nvfp4_experts_gate_up_kernel",
                 "q4e_nvfp4_experts_down_kernel",
-                AFFINE_EXPERT_ROWS,
-                32 * AFFINE_EXPERT_ROWS,
             )
         };
-        let tiles = |out_dim: u32, copies: u32| {
-            kernels::Launch::new(
-                shiso_core::Extent3::new(copies * out_dim.div_ceil(rows), groups, 1),
-                threads,
-                0,
+        // The prompt grid: a gate-and-up block covers half the rows a down
+        // block does, of both matrices, and every row tile is split over
+        // `NVFP4_GEMM_SPLIT` blocks. The step grid: rows a block, one block
+        // per active expert on the second axis either way.
+        let (gate_up_launch, down_launch) = if gemm {
+            let tiles = |rows: u32| {
+                kernels::Launch::new(
+                    shiso_core::Extent3::new(NVFP4_GEMM_SPLIT * rows, groups, 1),
+                    NVFP4_GEMM_THREADS,
+                    NVFP4_GEMM_SMEM,
+                )
+            };
+            (
+                tiles(inter.div_ceil(NVFP4_GEMM_ROWS / 2)),
+                tiles(hidden.div_ceil(NVFP4_GEMM_ROWS)),
+            )
+        } else {
+            let rows = |out_dim: u32, per: u32| {
+                kernels::Launch::new(
+                    shiso_core::Extent3::new(out_dim.div_ceil(per), groups, 1),
+                    NVFP4_STEP_THREADS,
+                    0,
+                )
+            };
+            (
+                rows(inter, NVFP4_STEP_GATE_UP_ROWS),
+                rows(hidden, NVFP4_STEP_DOWN_ROWS),
             )
         };
         // `out_gate, out_up, gate_w, gate_s, gate_g, up_w, up_s, up_g, x,
@@ -1243,8 +1294,7 @@ pub fn affine_experts(
         ops.extend(tail(hidden, inter));
         plan.launch(
             Entry::plain(MOD_MODELOPT, gate_up),
-            // The gemm's grid holds the gate's row tiles, then the up's.
-            tiles(inter, if gemm { 2 } else { 1 }),
+            gate_up_launch,
             Args::of(&ops),
         );
         plan.append(activate(
@@ -1266,7 +1316,7 @@ pub fn affine_experts(
         ops.extend(tail(inter, hidden));
         plan.launch(
             Entry::plain(MOD_MODELOPT, down),
-            tiles(hidden, 1),
+            down_launch,
             Args::of(&ops),
         );
         return Ok(plan);

@@ -581,8 +581,9 @@ impl HybridStack {
     ///
     /// # Errors
     ///
-    /// [`CoreError::Unsupported`] when no row-gather kernel reads `embed` or the
-    /// per-layer rows are in a format no prepare kernel decodes,
+    /// [`CoreError::Unsupported`] when no row-gather kernel reads `embed`, the
+    /// per-layer rows are in a format no prepare kernel decodes, or the options
+    /// ask for a cache element other than f16,
     /// [`CoreError::ShapeMismatch`] when the weight list and the shape disagree
     /// about the layer count or a slot's kind or about the per-layer table, and
     /// [`CoreError::Backend`] when a device allocation fails.
@@ -605,6 +606,16 @@ impl HybridStack {
         // them can answer, and which no kernel can refuse once it is launched.
         shape.validate()?;
         kernels.validate(&shape)?;
+        // This stack's pages, kernels and disk files are f16 throughout. A
+        // narrower element asked for here would otherwise be accepted and
+        // ignored: the server would report a cache it does not have.
+        if opts.kv_elem != shiso_core::page::KvElem::F16 {
+            return Err(CoreError::Unsupported {
+                what: "a key/value cache element other than f16 on the dense stack, whose pages \
+                       and kernels are f16 only (--kv-cache-dtype fp8 is for the sparse stack)",
+                backend: "engine",
+            });
+        }
         let slots = u64::try_from(weights.layers.len()).unwrap_or(u64::MAX);
         if slots != u64::from(shape.n_layers()) {
             return Err(CoreError::ShapeMismatch {

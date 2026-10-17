@@ -32,13 +32,14 @@
 //! the function's own signature and is not read - two instantiations of one
 //! template cannot differ there without differing in their arguments first.
 
-use shiso_core::{Backend, Extent3};
+use shiso_core::page::KvElem;
+use shiso_core::{Backend, CoreError, CoreResult, Extent3};
 
 use crate::sparse::exl3::{self as exl3, GemmShape};
 use crate::sparse::kernels::{
     self, Elem, Entry, EntryTable, Instantiation, MOD_EMBED, MOD_EXACT, MOD_EXL3, MOD_GDN,
-    MOD_GDN_TC, MOD_HC, MOD_IDX, MOD_MATVEC, MOD_MISC, MOD_MOE, MOD_PLE, MOD_QSA, MOD_QSA_SPARSE,
-    TemplateArgs,
+    MOD_GDN_TC, MOD_HC, MOD_IDX, MOD_KV8, MOD_MATVEC, MOD_MISC, MOD_MOE, MOD_PLE, MOD_QSA,
+    MOD_QSA_SPARSE, TemplateArgs,
 };
 
 /// Every module the sparse stack launches out of.
@@ -59,6 +60,7 @@ const MODULES: &[&str] = &[
     MOD_MISC,
     MOD_EMBED,
     MOD_EXACT,
+    MOD_KV8,
     MOD_EXL3,
 ];
 
@@ -487,6 +489,46 @@ pub fn co_resident_blocks(backend: &dyn Backend, entries: EntryTable) -> u32 {
 /// Keeps one captured name for the life of the process.
 fn leak(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
+}
+
+/// Refuses a cache element this device has no kernels for.
+///
+/// Asked once, before any weight is loaded, rather than left to the first launch: a stack whose store
+/// or one of its six attention readers cannot resolve would fail partway into
+/// the first prompt - or, for a reader only some shapes reach, hours later on
+/// the first prompt long enough to take it. Every entry the element needs is
+/// probed, so a kernel set that ships some of them is refused as loudly as one
+/// that ships none (Metal's, or a build whose kernels were not compiled).
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] naming the element when any of its entries is
+/// missing.
+pub fn check_kv_elem(backend: &dyn Backend, kv: KvElem) -> CoreResult<()> {
+    let Some(entries) = kernels::kv_entries(kv) else {
+        return Ok(());
+    };
+    let missing = entries.iter().find(|entry| {
+        backend
+            .max_block_threads(shiso_core::backend::KernelRef::new(entry.0, entry.1))
+            .is_none()
+    });
+    if let Some((module, entry)) = missing {
+        tracing::error!(
+            kv_elem = %kv,
+            module,
+            entry,
+            backend = backend.backend_name(),
+            "the key/value cache element needs a kernel this device does not have"
+        );
+        return Err(CoreError::Unsupported {
+            what: "an fp8 key/value cache on a device whose kernel set has no fp8 cache kernels \
+                   (only the CUDA build compiled with its kernels has them; use \
+                   --kv-cache-dtype f16)",
+            backend: "engine",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

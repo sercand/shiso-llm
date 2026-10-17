@@ -149,6 +149,20 @@ pub enum DType {
     /// re-encoding of a [`DType::Pq2_0`] file, whose scales are `f16`, and a
     /// brain float would round three of their mantissa bits away.
     MlxAffine2Gs128 = 212,
+    /// MXFP8: `e4m3` weights under one power-of-two scale per 32 consecutive
+    /// weights along a row - a `ue8m0` byte, `2^(byte - 127)` - in an array
+    /// beside the codes (a `modelopt` export's `weight_scale`, `[out, in/32]`).
+    ///
+    /// [`block_bytes`] is **32**, the codes of one group without the scale
+    /// byte that covers it, by [`DType::Nvfp4Gs16`]'s convention: the scales
+    /// are a separate array in the file and a separate buffer on the device,
+    /// and `row_bytes` answers the length of the codes buffer. Not one of the
+    /// formats [`DType::is_modelopt`] names: only the sparse engine's
+    /// projection ladder reads it, and the dense family's `modelopt` path
+    /// has no kernel for it.
+    ///
+    /// [`block_bytes`]: DType::block_bytes
+    Mxfp8E4M3G32 = 213,
 }
 
 impl DType {
@@ -240,6 +254,7 @@ impl DType {
             Self::Pq2_0 => "pq2_0",
             Self::Ptq1_0 => "ptq1_0",
             Self::MlxAffine2Gs128 => "mlx_affine_2_gs128",
+            Self::Mxfp8E4M3G32 => "mxfp8_e4m3_g32",
         }
     }
 }
@@ -264,7 +279,8 @@ impl DType {
             | Self::Q8_0
             | Self::IQ4_NL
             | Self::MXFP4
-            | Self::MlxAffine4Gs32 => 32,
+            | Self::MlxAffine4Gs32
+            | Self::Mxfp8E4M3G32 => 32,
             Self::MlxAffine4Gs64 | Self::MlxAffine8Gs64 => 64,
             Self::Exl3Ngram6 => 160,
             Self::Pq2_0 | Self::Ptq1_0 | Self::MlxAffine2Gs128 => 128,
@@ -331,6 +347,9 @@ impl DType {
             // The two planes of two weights; see the variant.
             Self::F16Pack12 => 3,
             Self::Ptq1_0 => 28,
+            // The codes of one group, without its `ue8m0` scale byte; see the
+            // variant.
+            Self::Mxfp8E4M3G32 => 32,
         };
         expect_nonzero(bytes)
     }

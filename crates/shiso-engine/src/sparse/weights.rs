@@ -65,8 +65,10 @@ pub enum WeightPart {
     /// block, row-major over the blocks. The codes are its
     /// [`WeightPart::Whole`].
     BlockScales,
-    /// An NVFP4 weight's group scales: one `e4m3` byte per sixteen weights
-    /// along a row. The packed four-bit codes are its [`WeightPart::Whole`].
+    /// A group-scaled weight's scales: for NVFP4 one `e4m3` byte per sixteen
+    /// weights along a row, the packed four-bit codes being its
+    /// [`WeightPart::Whole`]; for MXFP8 one `ue8m0` byte per 32, the `e4m3`
+    /// codes being its [`WeightPart::Whole`].
     GroupScales,
     /// An NVFP4 weight's per-tensor scale, one `f32`, which the group scales
     /// are relative to. A streamed bank holds one per slot.
@@ -79,6 +81,15 @@ struct AffineParams {
     scales: DeviceBuffer,
     /// Per-group biases.
     biases: DeviceBuffer,
+}
+
+/// The arrays a group-scaled weight carries beside its codes.
+struct GroupParams {
+    /// One scale byte per group along a row, every slot back to back.
+    scales: DeviceBuffer,
+    /// One `f32` per slot that the group scales are relative to: an NVFP4
+    /// bank's, absent for MXFP8, whose scales are absolute.
+    globals: Option<DeviceBuffer>,
 }
 
 /// One projection weight, resident on the device.
@@ -119,6 +130,9 @@ pub struct Weight {
     /// The block scales of a block-scaled FP8 weight, whose `buffer` is its
     /// codes.
     block_scales: Option<DeviceBuffer>,
+    /// The group scales (and an NVFP4 bank's globals) of a group-scaled
+    /// weight, whose `buffer` is its codes.
+    group: Option<Box<GroupParams>>,
     /// Whether the payload is on the device at all.
     ///
     /// A routed expert bank that is streamed from disk is described here - its
@@ -159,6 +173,38 @@ pub fn fp8_block_bytes(in_dim: u32, out_dim: u32) -> (u64, u64) {
 pub fn nvfp4_bytes(in_dim: u32, out_dim: u32) -> (u64, u64) {
     let (in_dim, out_dim) = (u64::from(in_dim), u64::from(out_dim));
     (in_dim * out_dim / 2, in_dim.div_ceil(16) * out_dim)
+}
+
+/// Weights one MXFP8 scale byte covers.
+pub const MXFP8_GROUP: u32 = 32;
+
+/// Bytes of one MXFP8 matrix's `e4m3` codes and `ue8m0` group scales, or
+/// `None` when the contraction is not a whole, nonzero number of groups of
+/// [`MXFP8_GROUP`].
+#[must_use]
+pub fn mxfp8_bytes(in_dim: u32, out_dim: u32) -> Option<(u64, u64)> {
+    if in_dim == 0 || !in_dim.is_multiple_of(MXFP8_GROUP) {
+        return None;
+    }
+    let (in_dim, out_dim) = (u64::from(in_dim), u64::from(out_dim));
+    Some((
+        in_dim.checked_mul(out_dim)?,
+        (in_dim / u64::from(MXFP8_GROUP)).checked_mul(out_dim)?,
+    ))
+}
+
+/// Checks each `(field, want, got)` length, naming the first that differs.
+fn lengths(checks: &[(&'static str, u64, u64)]) -> CoreResult<()> {
+    for &(field, expected, got) in checks {
+        if expected != got {
+            return Err(CoreError::ShapeMismatch {
+                field,
+                expected,
+                got,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl Weight {
@@ -232,6 +278,7 @@ impl Weight {
             buffer,
             affine: None,
             block_scales: None,
+            group: None,
             resident: true,
         })
     }
@@ -282,6 +329,7 @@ impl Weight {
             buffer: codes,
             affine: Some(Box::new(AffineParams { scales, biases })),
             block_scales: None,
+            group: None,
             resident: true,
         })
     }
@@ -321,6 +369,151 @@ impl Weight {
             buffer: codes,
             affine: None,
             block_scales: Some(scales),
+            group: None,
+            resident: true,
+        })
+    }
+
+    /// Assembles a resident MXFP8 weight from its `e4m3` codes, row-major
+    /// `[out_dim, in_dim]`, and its `ue8m0` group scales, `[out_dim,
+    /// in_dim / 32]`.
+    ///
+    /// One matrix: MXFP8 is a dense projection format here, never a routed
+    /// bank. The codes are the weight's [`WeightPart::Whole`] and the scales
+    /// its [`WeightPart::GroupScales`]. The kernels load the codes sixteen
+    /// bytes at a time, so the codes buffer must start sixteen-byte aligned,
+    /// which every allocation does and a slice of a mapping may not.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] when the contraction is not a whole number
+    /// of groups of 32, or when either array's length is not the one the
+    /// widths imply.
+    pub fn mxfp8(
+        in_dim: u32,
+        out_dim: u32,
+        [codes, scales]: [DeviceBuffer; 2],
+    ) -> CoreResult<Self> {
+        let (one_codes, one_scales) =
+            mxfp8_bytes(in_dim, out_dim).ok_or(CoreError::ShapeMismatch {
+                field: "mxfp8 contraction width",
+                expected: u64::from(MXFP8_GROUP),
+                got: u64::from(in_dim),
+            })?;
+        lengths(&[
+            ("mxfp8 codes bytes", one_codes, codes.len()),
+            ("mxfp8 group scales bytes", one_scales, scales.len()),
+        ])?;
+        Ok(Self {
+            dtype: DType::Mxfp8E4M3G32,
+            in_dim,
+            out_dim,
+            slots: 1,
+            buffer: codes,
+            affine: None,
+            block_scales: None,
+            group: Some(Box::new(GroupParams {
+                scales,
+                globals: None,
+            })),
+            resident: true,
+        })
+    }
+
+    /// Copies an MXFP8 matrix's two host arrays to fresh device allocations
+    /// and assembles them as [`Weight::mxfp8`] does.
+    ///
+    /// For bytes that are not a container's own - a test fixture, or a matrix
+    /// a loader re-laid - where a copy is what the caller wants. The lengths
+    /// are checked before anything is allocated.
+    ///
+    /// # Errors
+    ///
+    /// As [`Weight::mxfp8`], and whatever the allocation or the copy reports.
+    pub fn mxfp8_uploaded(
+        backend: &Arc<dyn Backend>,
+        in_dim: u32,
+        out_dim: u32,
+        codes: &[u8],
+        scales: &[u8],
+    ) -> CoreResult<Self> {
+        let (one_codes, one_scales) =
+            mxfp8_bytes(in_dim, out_dim).ok_or(CoreError::ShapeMismatch {
+                field: "mxfp8 contraction width",
+                expected: u64::from(MXFP8_GROUP),
+                got: u64::from(in_dim),
+            })?;
+        let len = |bytes: &[u8]| u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        lengths(&[
+            ("mxfp8 codes bytes", one_codes, len(codes)),
+            ("mxfp8 group scales bytes", one_scales, len(scales)),
+        ])?;
+        let upload = |bytes: &[u8]| -> CoreResult<DeviceBuffer> {
+            let buffer = shiso_core::buffer::alloc(backend, len(bytes))?;
+            backend.copy_h2d(buffer.view(), bytes)?;
+            Ok(buffer)
+        };
+        Self::mxfp8(in_dim, out_dim, [upload(codes)?, upload(scales)?])
+    }
+
+    /// Assembles a resident NVFP4 bank of `slots` matrices from its packed
+    /// codes, its `e4m3` group scales and its per-slot `f32` global scales.
+    ///
+    /// Slot `e`'s codes start at `e * codes_bytes`, its scales at
+    /// `e * scale_bytes` (the two halves of [`nvfp4_bytes`]) and its global at
+    /// `e * 4`: the layout the NVFP4 expert kernels address a slot pool by -
+    /// row `slot * out_dim + o` of each array, and `globals[slot]` - so a
+    /// resident bank is read through the same launches as a streamed one,
+    /// with an expert-to-slot map that is the identity.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] when `slots` is zero, when the contraction
+    /// is not a whole number of groups of sixteen, or when an array's length
+    /// is not the one the widths and slot count imply.
+    pub fn nvfp4(
+        in_dim: u32,
+        out_dim: u32,
+        slots: u32,
+        [codes, scales, globals]: [DeviceBuffer; 3],
+    ) -> CoreResult<Self> {
+        if slots == 0 {
+            return Err(CoreError::ShapeMismatch {
+                field: "nvfp4 bank slots",
+                expected: 1,
+                got: 0,
+            });
+        }
+        if in_dim == 0 || !in_dim.is_multiple_of(16) {
+            return Err(CoreError::ShapeMismatch {
+                field: "nvfp4 contraction width",
+                expected: 16,
+                got: u64::from(in_dim),
+            });
+        }
+        let slots64 = u64::from(slots);
+        let (one_codes, one_scales) = nvfp4_bytes(in_dim, out_dim);
+        lengths(&[
+            ("nvfp4 codes bytes", one_codes * slots64, codes.len()),
+            (
+                "nvfp4 group scales bytes",
+                one_scales * slots64,
+                scales.len(),
+            ),
+            ("nvfp4 global scales bytes", 4 * slots64, globals.len()),
+        ])?;
+        Ok(Self {
+            dtype: DType::Nvfp4Gs16,
+            in_dim,
+            out_dim,
+            slots,
+            buffer: codes,
+            affine: None,
+            block_scales: None,
+            group: Some(Box::new(GroupParams {
+                scales,
+                globals: Some(globals),
+            })),
             resident: true,
         })
     }
@@ -344,6 +537,7 @@ impl Weight {
             buffer: placeholder,
             affine: None,
             block_scales: None,
+            group: None,
             resident: false,
         }
     }
@@ -380,6 +574,27 @@ impl Weight {
                 what: "a part of a streamed expert bank, whose experts live in the stream's slots",
                 backend: "engine",
             });
+        }
+        if let Some(group) = &self.group {
+            return match part {
+                WeightPart::Whole => Ok(self.buffer.view()),
+                WeightPart::GroupScales => Ok(group.scales.view()),
+                WeightPart::GlobalScale => group.globals.as_ref().map(DeviceBuffer::view).ok_or(
+                    CoreError::Unsupported {
+                        what: "a global scale of an MXFP8 weight, whose group scales are absolute",
+                        backend: "engine",
+                    },
+                ),
+                WeightPart::Tiles
+                | WeightPart::InputScales
+                | WeightPart::OutputScales
+                | WeightPart::AffineScales
+                | WeightPart::AffineBiases
+                | WeightPart::BlockScales => Err(CoreError::Unsupported {
+                    what: "a part a group-scaled weight does not have",
+                    backend: "engine",
+                }),
+            };
         }
         if let Some(scales) = &self.block_scales {
             return match part {
@@ -494,6 +709,7 @@ impl Weight {
             buffer,
             affine: None,
             block_scales: None,
+            group: None,
             resident: true,
         }))
     }
@@ -556,6 +772,7 @@ impl Weight {
             buffer,
             affine: None,
             block_scales: None,
+            group: None,
             resident: true,
         })
     }
@@ -577,6 +794,7 @@ impl Weight {
             buffer,
             affine: None,
             block_scales: None,
+            group: None,
             resident: true,
         }
     }
@@ -594,6 +812,9 @@ impl Weight {
                 .as_ref()
                 .map_or(0, |p| p.scales.len() + p.biases.len())
             + self.block_scales.as_ref().map_or(0, DeviceBuffer::len)
+            + self.group.as_ref().map_or(0, |g| {
+                g.scales.len() + g.globals.as_ref().map_or(0, DeviceBuffer::len)
+            })
     }
 
     /// Whether the weight is empty, which no bound tensor ever is.
@@ -620,6 +841,7 @@ impl fmt::Debug for Weight {
             .field("buffer", &self.buffer.len())
             .field("affine", &self.affine.is_some())
             .field("block_scales", &self.block_scales.is_some())
+            .field("group_scales", &self.group.is_some())
             .field("resident", &self.resident)
             .finish()
     }
@@ -665,6 +887,7 @@ impl WeightDesc {
                     | (DType::BF16, DType::BF16)
                     | (DType::F32, DType::F32)
                     | (DType::MlxAffine4Gs64, DType::MlxAffine4Gs64)
+                    | (DType::Mxfp8E4M3G32, DType::Mxfp8E4M3G32)
             )
     }
 }
@@ -1184,3 +1407,7 @@ impl SparseWeights {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "weights_tests.rs"]
+mod tests;

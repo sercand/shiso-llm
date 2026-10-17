@@ -474,20 +474,29 @@ impl Tower {
                 let tensor = file.get(name).ok_or_else(|| VisionError::MissingTensor {
                     name: name.to_owned(),
                 })?;
-                // Every tensor of this tower is plain `BF16`; a quantized one
-                // would be a different loading problem rather than a bigger
-                // one, so it is refused by name here rather than decoded.
-                let Stored::Plain { dtype } = tensor.stored() else {
-                    return Err(VisionError::TensorDType {
+                match tensor.stored() {
+                    Stored::Plain { dtype } => Ok((
+                        st_dtype(name, dtype)?,
+                        tensor.declared().to_vec(),
+                        AxisOrder::SlowestFirst,
+                    )),
+                    // The mixed-precision export quantizes the tower's linears:
+                    // MXFP8 attention, NVFP4 MLP and merger. They are decoded
+                    // to brain floats at load ([`Self::bytes`]) and described
+                    // at their logical shape. The tower is 0.4 B parameters and
+                    // runs once per image, so the decode costs a load-time pass
+                    // and nothing per token; MXFP8 widens exactly, NVFP4 rounds
+                    // once from its `f32` product.
+                    Stored::Mxfp8 | Stored::Nvfp4 { .. } => Ok((
+                        DType::BF16,
+                        vec![tensor.rows(), tensor.cols()],
+                        AxisOrder::SlowestFirst,
+                    )),
+                    Stored::Fp8 { .. } => Err(VisionError::TensorDType {
                         name: name.to_owned(),
                         dtype: DType::F32,
-                    });
-                };
-                Ok((
-                    st_dtype(name, dtype)?,
-                    tensor.declared().to_vec(),
-                    AxisOrder::SlowestFirst,
-                ))
+                    }),
+                }
             }
             Self::Trellis(tower) => tower.describe(name),
             Self::Mmproj(tower) => tower.describe(name),
@@ -520,12 +529,37 @@ impl Tower {
                 let tensor = file.get(name).ok_or_else(|| VisionError::MissingTensor {
                     name: name.to_owned(),
                 })?;
-                file.weight_bytes(tensor)
-                    .map(Cow::Borrowed)
-                    .map_err(|source| VisionError::TowerContainer {
-                        path: std::path::PathBuf::from(name),
-                        source,
-                    })
+                let fail = |source| VisionError::TowerContainer {
+                    path: std::path::PathBuf::from(name),
+                    source,
+                };
+                let mut values = Vec::new();
+                if let Some(parts) = file.mxfp8_parts(tensor).map_err(fail)? {
+                    shiso_modelfile::mxfp8::dequant_mxfp8(
+                        name,
+                        parts.layout,
+                        parts.codes,
+                        parts.scales,
+                        &mut values,
+                    )
+                    .map_err(fail)?;
+                } else if let Some(parts) = file.nvfp4_parts(tensor).map_err(fail)? {
+                    shiso_modelfile::nvfp4::dequant_nvfp4(
+                        parts.layout,
+                        parts.weights,
+                        parts.scales,
+                        &mut values,
+                    )
+                    .map_err(fail)?;
+                } else {
+                    return file.weight_bytes(tensor).map(Cow::Borrowed).map_err(fail);
+                }
+                Ok(Cow::Owned(
+                    values
+                        .iter()
+                        .flat_map(|v| half::bf16::from_f32(*v).to_bits().to_le_bytes())
+                        .collect(),
+                ))
             }
             Self::Trellis(tower) => tower.bytes(name),
             Self::Mmproj(tower) => tower.bytes(name),

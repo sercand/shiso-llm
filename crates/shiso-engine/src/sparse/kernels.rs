@@ -43,6 +43,7 @@
 use shiso_core::Extent3;
 use shiso_core::backend::KernelRef;
 use shiso_core::error::{CoreError, CoreResult};
+use shiso_core::page::KvElem;
 
 // ---------------------------------------------------------------------------
 // modules
@@ -77,6 +78,16 @@ pub const MOD_MODELOPT: &str = "q4e_modelopt";
 /// with exact softmax weights, and the fused decode row of a recurrent layer.
 /// Not an upstream unit, for the reason [`MOD_MODELOPT`] is not.
 pub const MOD_EXACT: &str = "q4e_exact";
+/// The key/value store and every attention reader of the K and V planes, over
+/// a cache of FP8 E4M3 bytes. Not an upstream unit, for the reason
+/// [`MOD_MODELOPT`] is not; see [`CacheKernel`].
+pub const MOD_KV8: &str = "q4e_kv8";
+
+/// Dense projections over an MXFP8 weight, read as stored: the decode and
+/// verify kernels, which sum a row as the brain-float tier sums the widened
+/// weight, and the tensor-core prompt kernel. Not an upstream unit, for the
+/// reason [`MOD_MODELOPT`] is not.
+pub const MOD_MXFP8: &str = "q4e_mxfp8";
 /// The logits stages run before any pick: today, the suppress stage.
 pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a
@@ -427,6 +438,98 @@ pub enum Entry {
     Plain(KernelRef),
     /// One instantiation of a template, resolved through an [`EntryTable`].
     Template(Instantiation),
+}
+
+/// The kernels that touch the attention key and value planes, named by the job
+/// they do rather than by entry point.
+///
+/// Each one has an entry per cache element, and they share everything else:
+/// the grid, the block, the shared-memory reservation and the argument list.
+/// So a launch site names the job and the element and gets the entry, and the
+/// geometry helpers below serve both. An enum rather than a name lookup, so a
+/// launch site cannot ask for the fp8 twin of a kernel that has none and get
+/// the f16 one back - every match below is exhaustive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CacheKernel {
+    /// The key norm, rotary and store of one sequence's rows.
+    Store,
+    /// The same store with one page table per row.
+    StoreBatch,
+    /// The always-correct dense attention.
+    Attention,
+    /// The dense attention with one page table per row.
+    AttentionBatch,
+    /// The tiled dense attention.
+    Tiled,
+    /// The split-key attention.
+    Split,
+    /// The gathered attention over a selection.
+    Gather,
+    /// The exact tensor-core attention, dense or gathered.
+    TensorCore,
+}
+
+impl CacheKernel {
+    /// Every cache kernel, in no particular order.
+    pub const ALL: [Self; 8] = [
+        Self::Store,
+        Self::StoreBatch,
+        Self::Attention,
+        Self::AttentionBatch,
+        Self::Tiled,
+        Self::Split,
+        Self::Gather,
+        Self::TensorCore,
+    ];
+
+    /// The entry that does this job over a cache of `kv`.
+    #[must_use]
+    pub const fn entry(self, kv: KvElem) -> Entry {
+        let (module, name) = self.name(kv);
+        Entry::plain(module, name)
+    }
+
+    /// The module and entry name that do this job over a cache of `kv`.
+    #[must_use]
+    pub const fn name(self, kv: KvElem) -> (&'static str, &'static str) {
+        match kv {
+            KvElem::Fp8E4m3 => (
+                MOD_KV8,
+                match self {
+                    Self::Store => "q4e_qsa_store_kv_fp8_kernel",
+                    Self::StoreBatch => "q4e_qsa_store_kv_batch_fp8_kernel",
+                    Self::Attention => "q4e_qsa_attention_fp8_kernel",
+                    Self::AttentionBatch => "q4e_qsa_attention_batch_fp8_kernel",
+                    Self::Tiled => "q4e_qsa_attention_tiled_fp8_kernel",
+                    Self::Split => "q4e_qsa_attention_split_fp8_kernel",
+                    Self::Gather => "q4e_qsa_attention_gather_fp8_kernel",
+                    Self::TensorCore => "q4e_qsa_attention_tc_exact_fp8_kernel",
+                },
+            ),
+            KvElem::F16 => match self {
+                Self::Store => (MOD_QSA, "q4e_qsa_store_kv_kernel"),
+                Self::StoreBatch => (MOD_QSA, "q4e_qsa_store_kv_batch_kernel"),
+                Self::Attention => (MOD_QSA, "q4e_qsa_attention_kernel"),
+                Self::AttentionBatch => (MOD_QSA, "q4e_qsa_attention_batch_kernel"),
+                Self::Tiled => (MOD_QSA, "q4e_qsa_attention_tiled_kernel"),
+                Self::Split => (MOD_QSA_SPARSE, "q4e_qsa_attention_split_kernel"),
+                Self::Gather => (MOD_QSA_SPARSE, "q4e_qsa_attention_gather_kernel"),
+                Self::TensorCore => (MOD_EXACT, "q4e_qsa_attention_tc_exact_kernel"),
+            },
+        }
+    }
+}
+
+/// The `(module, entry)` pairs a cache element needs beyond the f16 set, which
+/// a stack probes before it accepts the element; `None` for f16, whose kernels
+/// are the ones every other path already requires.
+#[must_use]
+pub fn kv_entries(kv: KvElem) -> Option<[(&'static str, &'static str); 8]> {
+    if kv == KvElem::F16 {
+        return None;
+    }
+    Some(CacheKernel::ALL.map(|kernel| kernel.name(kv)))
 }
 
 impl Entry {

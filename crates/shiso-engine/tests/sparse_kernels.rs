@@ -52,6 +52,7 @@ const SLOT: AttnSlot = AttnSlot {
     rank: 0,
     pool_slots: 1_024,
     ctx: CTX,
+    kv: shiso_core::page::KvElem::F16,
 };
 
 /// The shape this binary plans against: the shipping one.
@@ -509,6 +510,33 @@ fn every_path() -> Plan {
         )
         .expect("a trellis projection has a tier");
     }
+    // The MXFP8 tier: the one-row and multi-row step kernels, a batched
+    // verify's passes of the latter, and the tensor-core prompt kernel.
+    let prompt = Device {
+        role: PassRole::Prompt { snapshot: None },
+        ..GPU
+    };
+    for (out_dim, rows, device) in [
+        (shape.hidden, 1_u32, GPU),
+        (shape.moe.experts, 1, GPU),
+        (shape.hidden, 5, GPU),
+        (shape.moe.experts, 5, GPU),
+        (shape.hidden, 20, GPU),
+        (shape.hidden, 333, prompt),
+    ] {
+        matmul::project(
+            &mut plan,
+            WeightDesc::new(DType::Mxfp8E4M3G32, shape.hidden, out_dim),
+            Bound::new(
+                WeightRef::layer(LayerRef::target(0), Role::AttnOutput),
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(Buf::BlockOut),
+            ),
+            rows,
+            device,
+        )
+        .expect("an MXFP8 projection has a tier at every row count");
+    }
     plan.launch(
         kernels::Entry::plain(kernels::MOD_MISC, "q4e_argmax_rows_kernel"),
         kernels::argmax_rows(9),
@@ -852,6 +880,8 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "misc.cu",
         "embed.cu",
         "exact.cu",
+        "kv8.cu",
+        "mxfp8.cu",
     ] {
         let path = dir.join(unit);
         let text = std::fs::read_to_string(&path)
@@ -1074,6 +1104,11 @@ fn every_launch_binds_exactly_the_parameters_its_kernel_declares() {
         kernels::EXL3_MOE,
         kernels::EXL3_RECONSTRUCT,
         "q4e_f32_to_f16_kernel",
+        "q4e_mxfp8_gemv_kernel",
+        "q4e_mxfp8_gemv_narrow_kernel",
+        "q4e_mxfp8_rows_kernel",
+        "q4e_mxfp8_rows_narrow_kernel",
+        "q4e_mxfp8_gemm_kernel",
     ] {
         assert!(seen.contains(entry), "{entry} was never bound: {seen:?}");
     }
@@ -1083,6 +1118,187 @@ fn every_launch_binds_exactly_the_parameters_its_kernel_declares() {
     // other kernels would have gone on saying nothing about them.
     for entry in BATCHED {
         assert!(seen.contains(entry), "{entry} was never bound: {seen:?}");
+    }
+}
+
+/// Every attention block shape the ladder can take at `slot`: each grant and
+/// selection state, one sequence's rows and a batch's, at a decode, a verify, a
+/// short chunk and a prefill width.
+fn attention_blocks(slot: AttnSlot) -> Plan {
+    let shape = shape();
+    let mut plan = Plan::new();
+    for rows in [1_u32, 4, 16, 512] {
+        for ctx in [
+            AttnContext::default(),
+            AttnContext {
+                tiled: true,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                tensor_core: true,
+                tiled: true,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                selected: true,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                selected: true,
+                tensor_core: true,
+                tiled: true,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                selected: true,
+                tensor_core: true,
+                tiled: true,
+                dense_rows: rows / 2,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                origin: RowOrigin::Unrelated,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                selected: true,
+                tensor_core: true,
+                tiled: true,
+                origin: RowOrigin::Unrelated,
+                batch_selected: 0b01,
+                ..AttnContext::default()
+            },
+        ] {
+            plan.append(
+                qsa::block(&shape, &attn_desc(&shape), slot, ctx, rows, GPU)
+                    .expect("a half-precision attention block has a tier"),
+            );
+        }
+        // The batched reader, which a block no longer reaches - a batch
+        // attends one row at a time - but the ladder still names.
+        plan.append(qsa::attend(
+            &shape,
+            slot,
+            AttnContext {
+                origin: RowOrigin::Unrelated,
+                ..AttnContext::default()
+            },
+            rows,
+        ));
+    }
+    plan
+}
+
+#[test]
+fn an_fp8_cache_changes_the_entry_of_every_cache_kernel_and_nothing_else() {
+    // The fp8 kernels are the f16 ones with the cache element changed, so the
+    // plan over an fp8 slot has to be the f16 plan launch for launch - the same
+    // grid, block, shared memory and operands - with only the store's and the
+    // readers' entries swapped for their twins. Anything else moving would be
+    // a path chosen by the element rather than by the shape.
+    let fp8_slot = AttnSlot {
+        kv: shiso_core::page::KvElem::Fp8E4m3,
+        ..SLOT
+    };
+    let f16 = attention_blocks(SLOT);
+    let fp8 = attention_blocks(fp8_slot);
+    assert_eq!(f16.steps().len(), fp8.steps().len(), "launch counts");
+    let twin = |name: &str| {
+        kernels::CacheKernel::ALL
+            .into_iter()
+            .find(|kernel| kernel.name(shiso_core::page::KvElem::F16).1 == name)
+            .map(|kernel| kernel.name(shiso_core::page::KvElem::Fp8E4m3))
+    };
+    let mut swapped = BTreeSet::new();
+    for (a, b) in f16.steps().iter().zip(fp8.steps()) {
+        let (
+            shiso_engine::sparse::plan::Step::Kernel {
+                entry: ea,
+                launch: la,
+                ..
+            },
+            shiso_engine::sparse::plan::Step::Kernel {
+                entry: eb,
+                launch: lb,
+                ..
+            },
+        ) = (a, b)
+        else {
+            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+            continue;
+        };
+        assert_eq!(
+            format!("{la:?}"),
+            format!("{lb:?}"),
+            "{}: geometry",
+            ea.name()
+        );
+        assert_eq!(
+            a.operands().expect("binds"),
+            b.operands().expect("binds"),
+            "{}: operands",
+            ea.name()
+        );
+        match twin(ea.name()) {
+            Some((module, name)) => {
+                assert_eq!((eb.module(), eb.name()), (module, name), "{}", ea.name());
+                swapped.insert(name);
+            }
+            None => assert_eq!(
+                (ea.module(), ea.name()),
+                (eb.module(), eb.name()),
+                "a kernel that does not touch the cache planes kept its entry"
+            ),
+        }
+    }
+    let every: BTreeSet<_> = kernels::CacheKernel::ALL
+        .into_iter()
+        .map(|kernel| kernel.name(shiso_core::page::KvElem::Fp8E4m3).1)
+        .collect();
+    assert_eq!(
+        swapped, every,
+        "every fp8 entry is reachable from the ladder"
+    );
+}
+
+#[test]
+fn every_fp8_cache_launch_binds_the_parameters_its_kernel_declares() {
+    let signatures = signatures();
+    let table = kernel_names();
+    let plan = attention_blocks(AttnSlot {
+        kv: shiso_core::page::KvElem::Fp8E4m3,
+        ..SLOT
+    });
+    for step in plan.steps() {
+        let Some(entry) = step.entry() else {
+            continue;
+        };
+        let name = entry.name();
+        if entry.module() != kernels::MOD_KV8 {
+            continue;
+        }
+        assert!(
+            table.contains(&format!("`{name}`")),
+            "{name} is not in the name table"
+        );
+        let signature = signatures
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is launched but kv8.cu does not declare it"));
+        let operands = step.operands().expect("binds");
+        assert_eq!(
+            operands.len(),
+            signature.pointers.len(),
+            "{name}: parameter count"
+        );
+        for (index, (operand, is_pointer)) in
+            operands.iter().zip(signature.pointers.iter()).enumerate()
+        {
+            assert_eq!(
+                operand.is_pointer(),
+                *is_pointer,
+                "{name} parameter {index}"
+            );
+        }
     }
 }
 

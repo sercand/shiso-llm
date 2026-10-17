@@ -230,6 +230,22 @@ pub struct ServeArgs {
     /// `--ctx` context refuses to start, with the numbers.
     #[arg(long, env = "SHISO_GPU_MEMORY_UTILIZATION")]
     pub gpu_memory_utilization: Option<f64>,
+    /// The element the KV cache stores attention keys and values as: `f16`,
+    /// or `fp8` (E4M3 at a static scale of 1, also spelled `fp8_e4m3`).
+    ///
+    /// `fp8` halves the attention key and value bytes of every cached token,
+    /// so `--gpu-memory-utilization` and `--kv-cache-tokens` buy more context
+    /// for the same memory; the indexer's planes stay f16. Values are rounded
+    /// to a 3-bit mantissa when stored, saturate at 448 and flush below 2^-10.
+    /// Only the sparse stack on CUDA has the kernels for it; any other model or
+    /// device refuses to start rather than serving f16 under this name.
+    #[arg(
+        long,
+        env = "SHISO_KV_CACHE_DTYPE",
+        value_enum,
+        default_value_t = KvCacheDtype::F16
+    )]
+    pub kv_cache_dtype: KvCacheDtype,
     /// Recurrent-state checkpoints the prefix cache may hold, shared by every
     /// session. Zero holds none.
     ///
@@ -1329,6 +1345,25 @@ impl ServeArgs {
     }
 }
 
+/// `--kv-cache-dtype`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum KvCacheDtype {
+    /// Half precision, two bytes an element.
+    F16,
+    /// FP8 E4M3 at a static scale of 1, one byte an element.
+    #[value(alias = "fp8_e4m3")]
+    Fp8,
+}
+
+impl From<KvCacheDtype> for shiso_core::page::KvElem {
+    fn from(choice: KvCacheDtype) -> Self {
+        match choice {
+            KvCacheDtype::F16 => Self::F16,
+            KvCacheDtype::Fp8 => Self::Fp8E4m3,
+        }
+    }
+}
+
 /// Where the routed expert banks live, as the operator asked for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ExpertResidencyChoice {
@@ -1656,6 +1691,16 @@ fn apply_engine_defaults(
             ExpertResidency::Stream => ExpertResidencyChoice::Stream,
         };
         tracing::info!(?residency, "applied recipe default for expert_residency");
+    }
+
+    if let Some(kv) = defaults.kv_cache_dtype
+        && check_override("kv_cache_dtype")
+    {
+        args.kv_cache_dtype = match kv {
+            shiso_hub::recipe::KvCacheDtype::F16 => KvCacheDtype::F16,
+            shiso_hub::recipe::KvCacheDtype::Fp8 => KvCacheDtype::Fp8,
+        };
+        tracing::info!(?kv, "applied recipe default for kv_cache_dtype");
     }
 
     if let Some(reserve) = defaults.expert_reserve_gb

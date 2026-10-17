@@ -69,6 +69,27 @@ const _: FromSamples = ProfileReport::from_samples;
 type ReportJson = fn(&ProfileReport) -> serde_json::Value;
 const _: ReportJson = ProfileReport::to_json;
 
+// The group-scaled weights a model crate's loader assembles for the sparse
+// engine: the MXFP8 dense projection, whose format id the engine's tier
+// ladder matches on and whose two arrays are the codes and the group scales,
+// and the resident NVFP4 bank a draft head's experts are held in.
+const _: () = assert!(shiso_core::DType::Mxfp8E4M3G32.gguf_id() == 213);
+type Mxfp8Bytes = fn(u32, u32) -> Option<(u64, u64)>;
+const _: Mxfp8Bytes = shiso_engine::sparse::weights::mxfp8_bytes;
+type Mxfp8Weight = fn(
+    u32,
+    u32,
+    [shiso_core::DeviceBuffer; 2],
+) -> CoreResult<shiso_engine::sparse::weights::Weight>;
+const _: Mxfp8Weight = shiso_engine::sparse::weights::Weight::mxfp8;
+type Nvfp4Bank = fn(
+    u32,
+    u32,
+    u32,
+    [shiso_core::DeviceBuffer; 3],
+) -> CoreResult<shiso_engine::sparse::weights::Weight>;
+const _: Nvfp4Bank = shiso_engine::sparse::weights::Weight::nvfp4;
+
 const _: Option<&Recipe> = None;
 const _: Option<&ModelRef> = None;
 const _: Option<&HostProfile> = None;
@@ -181,6 +202,33 @@ const _: CacheLookup = KvCache::lookup;
 type Commit =
     fn(&KvCache, &mut Frontier, &[TokenId], u32, CommitOpts<'static>, f64) -> Result<(), KvError>;
 const _: Commit = KvCache::commit;
+
+/// The cache element: one family-neutral type from the command line to the
+/// pool. The server converts its flag into it, the engine options carry it,
+/// the sparse stack's page geometry and attention slots take it, and its width
+/// and codec name are what the disk tier files a page under - so a second
+/// spelling anywhere along that path would be a page sized at one element and
+/// filed under another.
+fn kv_elem_codes(kv: shiso_core::page::KvElem) -> (u32, &'static str, u8) {
+    use shiso_core::page::KvElem;
+    // Exhaustive on purpose: an element added without a row here is a build
+    // failure, not a silent f16.
+    let tag = match kv {
+        KvElem::F16 => 0,
+        KvElem::Fp8E4m3 => 1,
+    };
+    (kv.bytes(), kv.codec(), tag)
+}
+const _: fn(shiso_core::page::KvElem) -> (u32, &'static str, u8) = kv_elem_codes;
+const _: fn(shiso_server::cli::KvCacheDtype) -> shiso_core::page::KvElem = Into::into;
+const _: fn(&shiso_engine::EngineOptions) -> shiso_core::page::KvElem = |opts| opts.kv_elem;
+const _: fn(shiso_core::page::KvElem) -> shiso_engine::sparse::paged::PagePlanes =
+    |kv| shiso_engine::sparse::paged::PagePlanes {
+        indexer: true,
+        draft: true,
+        kv,
+    };
+const _: fn(shiso_engine::sparse::qsa::AttnSlot) -> shiso_core::page::KvElem = |slot| slot.kv;
 
 // ---------------------------------------------------------------------------
 // the shapes that had drifted before
@@ -717,6 +765,11 @@ fn the_contracts_above_are_compiled() {
         }),
         2,
         "a failed decoder is not a decline"
+    );
+    assert_eq!(
+        kv_elem_codes(shiso_core::page::KvElem::default()),
+        (2, "f16", 0),
+        "the default cache element is f16, under the codec name existing disk files carry"
     );
     let parsed_ref = ModelRef::parse("qwen3.5-9b:metal-mlx4").expect("valid model ref");
     assert_eq!(parsed_ref.model.as_str(), "qwen3.5-9b");

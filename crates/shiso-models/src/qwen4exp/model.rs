@@ -353,6 +353,25 @@ impl Qwen4ExpModel {
         Self::load_streamed(backend, dir, hf, opts, load, StreamedExport::Nvfp4)
     }
 
+    /// Opens NVIDIA's mixed-precision `modelopt` export
+    /// ([`crate::qwen4exp::modelopt_mixed`]) and puts it on the device: MXFP8
+    /// projections as stored, CSF-scaled NVFP4 experts through the stream
+    /// (expanded as each slot fills), the NVFP4 n-gram table from SSD, and,
+    /// when `load.draft` is set, the NVFP4 draft head held resident.
+    ///
+    /// # Errors
+    ///
+    /// As [`Qwen4ExpModel::load_nvfp4`].
+    pub fn load_modelopt_mixed(
+        backend: &Arc<dyn Backend>,
+        dir: &Path,
+        hf: &shiso_core::config::HfConfig,
+        opts: SparseOptions,
+        load: &StreamedLoad<'_>,
+    ) -> CoreResult<Self> {
+        Self::load_streamed(backend, dir, hf, opts, load, StreamedExport::ModeloptMixed)
+    }
+
     /// The body of the two streamed-expert exports, which differ only in the
     /// routed codec and in what their dense matrices become.
     fn load_streamed(
@@ -368,11 +387,17 @@ impl Qwen4ExpModel {
         let ck = match export {
             StreamedExport::Reference => crate::qwen4exp::fp8::open(dir)?,
             StreamedExport::Nvfp4 => crate::qwen4exp::nvfp4::open(dir)?,
+            StreamedExport::ModeloptMixed => crate::qwen4exp::modelopt_mixed::open(dir)?,
         };
         let config = Qwen4ExpConfig::from_reference(hf, &ck)?;
         let ngram = {
             let _tag = ledger::scope(MemTag::WeightsEmbedding);
-            crate::qwen4exp::fp8::open_ngram(backend, &ck, &config, &opts)?
+            match export {
+                StreamedExport::ModeloptMixed => {
+                    crate::qwen4exp::ple_nvfp4::open_ngram_nvfp4(backend, &ck, &config, &opts)?
+                }
+                _ => crate::qwen4exp::fp8::open_ngram(backend, &ck, &config, &opts)?,
+            }
         };
         let all = EXPERTS * N_LAYERS;
         let sized = slots.is_none();
@@ -402,36 +427,55 @@ impl Qwen4ExpModel {
             }
         };
         tracing::info!(slots, all, export = ?export, "routed expert pool of the streamed export");
-        let mut weights = crate::qwen4exp::fp8::import(backend, &ck, &config, export.layout())?;
+        let layout = crate::qwen4exp::fp8::ImportLayout {
+            pack: opts.pack_halves,
+            ..export.layout()
+        };
+        let mut weights = crate::qwen4exp::fp8::import(backend, &ck, &config, layout)?;
         if load.draft {
             let rank = config.shape().count(shiso_engine::shape::LayerKind::Attn);
             weights.draft = Some(crate::qwen4exp::fp8::import_draft(
-                backend,
-                &ck,
-                rank,
-                export.layout(),
+                backend, &ck, rank, layout,
             )?);
             if let Some(list) = load.counts {
                 narrow_draft_head(backend, &mut weights, list, config.shape().vocab)?;
             }
         }
+        let open = |slots: u32| match export {
+            StreamedExport::Reference => {
+                crate::qwen4exp::fp8::open_stream(backend, &ck, slots, opts.prefill_rows)
+            }
+            StreamedExport::Nvfp4 => {
+                crate::qwen4exp::nvfp4::open_stream(backend, &ck, slots, opts.prefill_rows)
+            }
+            StreamedExport::ModeloptMixed => {
+                crate::qwen4exp::modelopt_mixed::open_stream(backend, &ck, slots, opts.prefill_rows)
+            }
+        };
+        // A pool that holds every expert is opened and filled BEFORE the stack,
+        // whose KV pool is sized to the device's free memory: opened after, the
+        // pool's tens of gigabytes were not yet written when the KV pool was
+        // sized, the KV pool took them, and filling the experts then exhausted
+        // the machine (measured: a 2.8M-token pool beside 68 GB of experts on a
+        // 121 GB device). Only a pool sized to the device is opened after, from
+        // what the stack left.
+        let early = if slots >= all {
+            Some(open(slots)?)
+        } else {
+            None
+        };
         let free = device_free(backend.as_ref());
         let mut stack =
             SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
-        // A pool that holds every expert keeps them all; only one sized to the
-        // device gives back what the stack took.
-        let slots = if sized && slots < all {
-            beside_stack(backend.as_ref(), free, slots, slot_bytes)
+        let stream = if let Some(stream) = early {
+            stream
         } else {
-            slots
-        };
-        let stream = match export {
-            StreamedExport::Reference => {
-                crate::qwen4exp::fp8::open_stream(backend, &ck, slots, opts.prefill_rows)?
-            }
-            StreamedExport::Nvfp4 => {
-                crate::qwen4exp::nvfp4::open_stream(backend, &ck, slots, opts.prefill_rows)?
-            }
+            let slots = if sized {
+                beside_stack(backend.as_ref(), free, slots, slot_bytes)
+            } else {
+                slots
+            };
+            open(slots)?
         };
         stack.attach_expert_stream(stream)?;
         Ok(Self {
@@ -673,7 +717,13 @@ fn open_ngram(
         (PleRowType::TrellisK6, Some(view)) => Some(view),
         // A bias beside a codec that takes no such pointer is a tensor nothing
         // would read, and the tier below refuses it rather than carrying it.
-        (PleRowType::BlockNl4 | PleRowType::MlxAffine4 | PleRowType::Fp8E4M3 { .. }, _) => None,
+        (
+            PleRowType::BlockNl4
+            | PleRowType::MlxAffine4
+            | PleRowType::Fp8E4M3 { .. }
+            | PleRowType::Nvfp4 { .. },
+            _,
+        ) => None,
     };
     let params =
         config
@@ -1208,6 +1258,9 @@ enum StreamedExport {
     Reference,
     /// The same layout with NVFP4 experts, NVIDIA's `modelopt` export.
     Nvfp4,
+    /// NVIDIA's mixed-precision `modelopt` export: CSF-scaled NVFP4 experts,
+    /// MXFP8 projections, an NVFP4 n-gram table and draft head.
+    ModeloptMixed,
 }
 
 impl StreamedExport {
@@ -1218,6 +1271,12 @@ impl StreamedExport {
             Self::Nvfp4 => crate::qwen4exp::fp8::ImportLayout {
                 dense: crate::qwen4exp::fp8::DenseFormat::Half,
                 experts: DType::Nvfp4Gs16,
+                pack: false,
+            },
+            Self::ModeloptMixed => crate::qwen4exp::fp8::ImportLayout {
+                dense: crate::qwen4exp::fp8::DenseFormat::Mxfp8,
+                experts: DType::Nvfp4Gs16,
+                pack: false,
             },
         }
     }
@@ -1227,6 +1286,7 @@ impl StreamedExport {
         match self {
             Self::Reference => crate::qwen4exp::fp8::slot_bytes(),
             Self::Nvfp4 => crate::qwen4exp::nvfp4::slot_bytes(),
+            Self::ModeloptMixed => crate::qwen4exp::modelopt_mixed::slot_bytes(),
         }
     }
 
@@ -1235,6 +1295,7 @@ impl StreamedExport {
         match self {
             Self::Reference => crate::qwen4exp::fp8::expert_bytes(),
             Self::Nvfp4 => crate::qwen4exp::nvfp4::expert_bytes(),
+            Self::ModeloptMixed => crate::qwen4exp::modelopt_mixed::expert_bytes(),
         }
     }
 }

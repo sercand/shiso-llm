@@ -426,6 +426,35 @@ fn load_loaded(
             backend, path, &family, opts,
         )?)));
     }
+    // The mixed-precision export is a directory whose metadata the GGUF
+    // reader below cannot read; it carries its own config and is held every
+    // expert resident, the way the server serves it.
+    if shiso_models::qwen4exp::modelopt_mixed::is_export(path) {
+        let entries = capture::capture(backend.as_ref());
+        let opts = SparseOptions {
+            engine: opts,
+            spec: SpecDepth::NONE,
+            entries,
+            co_resident_blocks: capture::co_resident_blocks(backend.as_ref(), entries),
+            pack_halves: true,
+            ..SparseOptions::default()
+        };
+        let all = shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS;
+        return Ok(Loaded::Sparse(Box::new(
+            Qwen4ExpModel::load_modelopt_mixed(
+                backend,
+                path,
+                config,
+                opts,
+                &shiso_models::qwen4exp::StreamedLoad {
+                    slots: Some(all),
+                    reserve: 0,
+                    draft: false,
+                    counts: None,
+                },
+            )?,
+        )));
+    }
     match Qwen4ExpConfig::from_hf(config, path) {
         Ok(family) => {
             // The two device facts this family's stack cannot default: the

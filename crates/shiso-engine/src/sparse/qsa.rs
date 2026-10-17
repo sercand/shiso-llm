@@ -23,11 +23,12 @@
 //! one, because this kernel set ships no batched selected-block attention.
 
 use shiso_core::error::CoreResult;
+use shiso_core::page::KvElem;
 
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
 use crate::sparse::indexer::{self, Scorer};
 use crate::sparse::inputs::MROPE_PREFIX_BYTES;
-use crate::sparse::kernels::{self, Entry, MOD_EXACT, MOD_QSA, MOD_QSA_SPARSE};
+use crate::sparse::kernels::{self, CacheKernel, Entry, MOD_QSA, MOD_QSA_SPARSE};
 use crate::sparse::matmul::{self, Bound, Device, PassRole};
 use crate::sparse::moe::{RowOrigin, Segments};
 use crate::sparse::paged::Plane;
@@ -61,6 +62,13 @@ pub struct AttnSlot {
     /// The selection's score buffer is strided by it: see
     /// [`crate::sparse::shape::IndexerShape::score_blocks`].
     pub ctx: u32,
+    /// The element the slot's key and value planes are stored as, which picks
+    /// the store's entry and every attention reader's.
+    ///
+    /// Per slot rather than per pass because it is a fact about the planes the
+    /// slot names, exactly as `pool_slots` is; in practice every slot of a
+    /// stack, the draft head's included, carries the same answer.
+    pub kv: KvElem,
 }
 
 /// Which attention kernel a call takes.
@@ -325,7 +333,7 @@ fn attend_at(
         //  pages_arr, n_tok` - the scalar list with the page table replaced by
         // the per-row array, which is the whole of the difference.
         AttnPath::Batched => plan.launch(
-            Entry::plain(MOD_QSA, "q4e_qsa_attention_batch_kernel"),
+            CacheKernel::AttentionBatch.entry(slot.kv),
             kernels::qsa_attention_batch(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
             Args::of(&[
                 out,
@@ -341,12 +349,12 @@ fn attend_at(
             ]),
         ),
         AttnPath::Dense => plan.launch(
-            Entry::plain(MOD_QSA, "q4e_qsa_attention_kernel"),
+            CacheKernel::Attention.entry(slot.kv),
             kernels::qsa_attention(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
             dense,
         ),
         AttnPath::Tiled => plan.launch(
-            Entry::plain(MOD_QSA, "q4e_qsa_attention_tiled_kernel"),
+            CacheKernel::Tiled.entry(slot.kv),
             kernels::qsa_attention_tiled(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
             dense,
         ),
@@ -358,13 +366,13 @@ fn attend_at(
         // (1.6e-4 against 6e-7 on the kernel case's short rows). It is the
         // ported kernel's arguments and grid, so it is a drop-in.
         AttnPath::TensorCore => plan.launch(
-            Entry::plain(MOD_EXACT, "q4e_qsa_attention_tc_exact_kernel"),
+            CacheKernel::TensorCore.entry(slot.kv),
             kernels::qsa_attention_tc_exact(shape.gqa.kv_heads, n_tok, 1),
             tc_args(shape, slot, 1, false, at),
         ),
         AttnPath::Split => {
             plan.launch(
-                Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_split_kernel"),
+                CacheKernel::Split.entry(slot.kv),
                 kernels::qsa_attention_split(shape.gqa.kv_heads, n_tok),
                 // `out, part, k_cache, v_cache, q, n_head, n_head_kv, pos,
                 //  pages, n_tok, n_splits`
@@ -386,7 +394,7 @@ fn attend_at(
         }
         AttnPath::Gathered => {
             plan.launch(
-                Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_gather_kernel"),
+                CacheKernel::Gather.entry(slot.kv),
                 kernels::qsa_attention_gather(shape.gqa.kv_heads, n_tok),
                 // `part, k_cache, v_cache, q, tokens, n_sel, pages, width,
                 //  n_head, n_head_kv, n_splits` - it writes only the slabs, so
@@ -417,7 +425,7 @@ fn attend_at(
                 },
             );
             plan.launch(
-                Entry::plain(MOD_EXACT, "q4e_qsa_attention_tc_exact_kernel"),
+                CacheKernel::TensorCore.entry(slot.kv),
                 kernels::qsa_attention_tc_exact(shape.gqa.kv_heads, n_tok, splits),
                 tc_args(shape, slot, splits, true, at),
             );
@@ -456,7 +464,7 @@ fn segmented(
         let first = u64::from(runs.start(run));
         let rows = runs.len(run);
         plan.launch(
-            Entry::plain(MOD_QSA, "q4e_qsa_store_kv_kernel"),
+            CacheKernel::Store.entry(slot.kv),
             kernels::qsa_store_kv(shape.gqa.kv_heads, rows, shape.gqa.head_dim),
             // `k_cache, v_cache, k, v, kw, head_dim, n_head_kv, n_rot,
             //  rope_base, pos, mrope, sec_t, sec_h, sec_w, pages, pool_slots,
@@ -798,21 +806,21 @@ pub fn block(
     if let RowOrigin::Segmented(runs) = ctx.origin {
         return segmented(shape, desc, slot, &ctx, &runs, device, plan);
     }
-    let (store_entry, store_launch, store_pages) = if batched {
+    let (store_kernel, store_launch, store_pages) = if batched {
         (
-            "q4e_qsa_store_kv_batch_kernel",
+            CacheKernel::StoreBatch,
             kernels::qsa_store_kv_batch(shape.gqa.kv_heads, n_tok, shape.gqa.head_dim),
             Operand::PageTables,
         )
     } else {
         (
-            "q4e_qsa_store_kv_kernel",
+            CacheKernel::Store,
             kernels::qsa_store_kv(shape.gqa.kv_heads, n_tok, shape.gqa.head_dim),
             Operand::Pages,
         )
     };
     plan.launch(
-        Entry::plain(MOD_QSA, store_entry),
+        store_kernel.entry(slot.kv),
         store_launch,
         // `k_cache, v_cache, k, v, kw, head_dim, n_head_kv, n_rot, rope_base,
         //  pos, mrope, sec_t, sec_h, sec_w, pages, pool_slots, eps`

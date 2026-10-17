@@ -13,6 +13,7 @@ the name "ds4" for the host project.
 |---|---|---|
 | `kernels/cuda/q4e` | [antirez/ds4](https://github.com/antirez/ds4), MIT | ported from ds4 |
 | `kernels/cuda/q4e/exact.cu` | - | original to this repository: the exact-weight tensor-core attention and the fused recurrent decode step, derived from the ported q4e kernels (`qsa_sparse.cu`, `gdn.cu`) and kept in a unit of their own so no ported unit is edited |
+| `kernels/cuda/q4e/kv8.cu` | - | original to this repository: the FP8 (E4M3, static scale 1) key/value cache's store and attention readers, derived from the ported q4e kernels (`qsa.cu`, `qsa_sparse.cu`) and from `exact.cu`, with only the cache element changed, and kept in a unit of their own so no ported unit is edited |
 | `crates/shiso-metal/metal/q4e/exact.metal` | - | original to this repository: the Metal port of `exact.cu`'s fused recurrent decode step, derived from `gdn.metal` |
 | `kernels/cuda/q4e/misc.cu` (`q4e_copy_row_kernel`) | - | original to this repository: the one kernel in that ported file with no source, written for the prompt-role segmented pass's gathered vocabulary projection; the rest of the file is ported from ds4 as above |
 | `kernels/cuda/mmq` | [llama.cpp](https://github.com/ggml-org/llama.cpp) `ggml-cuda`, MIT; ds4 adapter | vendored, pinned commit, reached through ds4's shim (`ggml_stubs`, `mmq.{h,cu}`); see `kernels/cuda/mmq/VENDOR.md` |

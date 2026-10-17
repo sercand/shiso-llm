@@ -482,6 +482,7 @@ pub fn load_model(
     // what `for_config` does. A document no reader recognises fails here with
     // the same error the fallthrough at the end would have produced.
     let defaults = FamilyDefaults::for_config(config)?;
+    refuse_kv_dtype(args, config)?;
 
     // Before any arm, because this is the one speculative question that can be
     // answered from the document alone - and because the answer is a refusal
@@ -636,6 +637,32 @@ pub fn load_model(
     }
 
     load_last_arms(backend, path, config, opts, defaults)
+}
+
+/// Refuses `--kv-cache-dtype` other than f16 for every family but the sparse
+/// one, whose stack is the only one that stores anything else.
+///
+/// Asked from the document alone, before any arm, for the reason the
+/// speculative question in [`load_model`] is: every other stack refuses the
+/// element too, but only once its weights are resident.
+///
+/// # Errors
+///
+/// [`FactoryError::Load`] carrying [`CoreError::InvalidValue`] naming the
+/// flag.
+fn refuse_kv_dtype(args: &ServeArgs, config: &HfConfig) -> Result<(), FactoryError> {
+    if args.kv_cache_dtype == crate::cli::KvCacheDtype::F16 || Qwen4ExpConfig::describes(config) {
+        return Ok(());
+    }
+    Err(FactoryError::Load(CoreError::InvalidValue {
+        key: "--kv-cache-dtype",
+        value: format!(
+            "{:?} was asked for, and the {:?} family's cache is f16 only - use \
+             --kv-cache-dtype f16",
+            args.kv_cache_dtype,
+            config.model_type()
+        ),
+    }))
 }
 
 /// The arms tried after the Gemma 4 one, and the refusal when none of them
@@ -904,6 +931,7 @@ fn engine_options(args: &ServeArgs) -> Result<EngineOptions, FactoryError> {
     }
     opts.kv_fit = args.kv_fit().map_err(FactoryError::Load)?;
     opts.kv_check = args.kv_check().map_err(FactoryError::Load)?;
+    opts.kv_elem = args.kv_cache_dtype.into();
     Ok(opts)
 }
 
@@ -1021,6 +1049,9 @@ fn sparse_options(
     engine: EngineOptions,
     backend: &Arc<dyn Backend>,
 ) -> Result<SparseOptions, FactoryError> {
+    // Before the weights: a device without the cache element's kernels would
+    // otherwise be found out only once the stack is built over them.
+    capture::check_kv_elem(backend.as_ref(), engine.kv_elem).map_err(FactoryError::Load)?;
     let entries = capture::capture(backend.as_ref());
     let co_resident_blocks = capture::co_resident_blocks(backend.as_ref(), entries);
     let paths = capture::optional_paths(backend.as_ref());
@@ -1102,24 +1133,33 @@ fn load_qwen4exp_dir(
 ) -> Result<Loaded, FactoryError> {
     if shiso_models::qwen4exp::exl3::is_exl3_dir(path) {
         load_qwen4exp_exl3(backend, path, config, args, opts, defaults)
+    } else if shiso_models::qwen4exp::modelopt_mixed::is_export(path) {
+        // Asked before both arms below, whose tests this directory may also
+        // pass: it carries the reference export's names, and only its
+        // `config.json` says how each matrix is stored.
+        load_qwen4exp_streamed(backend, path, config, args, opts, defaults, true)
     } else if shiso_models::qwen4exp::nvfp4::is_nvfp4_export(path) {
         // Before the MLX arm, whose reference-export test this directory also
         // passes: the two share every name and differ in the experts' codec.
-        load_qwen4exp_nvfp4(backend, path, config, args, opts, defaults)
+        load_qwen4exp_streamed(backend, path, config, args, opts, defaults, false)
     } else {
         load_qwen4exp_mlx(backend, path, config, args, opts, defaults)
     }
 }
 
-/// NVIDIA's `modelopt` export of the sparse family: the reference export's
-/// layout with NVFP4 routed experts, always streamed.
-fn load_qwen4exp_nvfp4(
+/// NVIDIA's two `modelopt` exports of the sparse family, both with NVFP4
+/// routed experts, always streamed: the first (`mixed: false`) with
+/// brain-float dense weights, the mixed-precision one (`mixed: true`) with
+/// MXFP8 projections, CSF-scaled experts and an NVFP4 n-gram table and draft
+/// head.
+fn load_qwen4exp_streamed(
     backend: &Arc<dyn Backend>,
     path: &Path,
     config: &HfConfig,
     args: &ServeArgs,
     opts: EngineOptions,
     defaults: FamilyDefaults,
+    mixed: bool,
 ) -> Result<Loaded, FactoryError> {
     let reserve = args.expert_reserve_gb.saturating_mul(1 << 30);
     // The head is in the directory; a second one named beside it would be a
@@ -1140,7 +1180,12 @@ fn load_qwen4exp_nvfp4(
         _ if args.expert_slots > 0 => Some(args.expert_slots),
         _ => None,
     };
-    let model = Qwen4ExpModel::load_nvfp4(
+    let load = if mixed {
+        Qwen4ExpModel::load_modelopt_mixed
+    } else {
+        Qwen4ExpModel::load_nvfp4
+    };
+    let model = load(
         backend,
         path,
         config,

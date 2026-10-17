@@ -30,7 +30,7 @@ use shiso_engine::sparse::stack::SparseOptions;
 use shiso_engine::sparse::stream::{ExpertSource, ExpertStream};
 use shiso_engine::sparse::weights::{
     DraftHead, ExpertBank, Indexer, NgramBlock, Recurrent, SparseAttn, SparseBlock, SparseLayer,
-    SparseWeights, StreamMix, Weight, WeightPart, fp8_block_bytes,
+    SparseWeights, StreamMix, Weight, WeightPart, fp8_block_bytes, nvfp4_bytes,
 };
 use shiso_modelfile::st_header::Shard;
 use shiso_ple::{PleRowType, PleSegment, PleShards, PleStream};
@@ -99,6 +99,12 @@ pub enum DenseFormat {
     /// formats share a mantissa width of at least seven bits, and only a
     /// value below half precision's subnormal floor loses anything.
     Half,
+    /// MXFP8 where the export stored a matrix so, kept as stored and served
+    /// by the MXFP8 tier; widened to half precision, as [`DenseFormat::Half`],
+    /// wherever it stored brain floats (the output head, the routers, the stream mixes and the draft
+    /// head's input projections). Decided per tensor by the stored format, so
+    /// a checkpoint that quantized one more or one fewer matrix still loads.
+    Mxfp8,
 }
 
 /// How [`import`] reads one export: its dense format and its routed codec.
@@ -109,6 +115,10 @@ pub struct ImportLayout {
     /// The routed banks' format: [`DType::Fp8E4M3Block128`] for the
     /// reference export, [`DType::Nvfp4Gs16`] for the `modelopt` one.
     pub experts: DType,
+    /// Whether half-precision matrices are repacked to twelve bits a weight
+    /// ([`Weight::packed_half`]), losslessly: their values are brain floats,
+    /// and the stream mixes among them are read whole every decode step.
+    pub pack: bool,
 }
 
 impl ImportLayout {
@@ -116,6 +126,7 @@ impl ImportLayout {
     pub const REFERENCE: Self = Self {
         dense: DenseFormat::Brain,
         experts: DType::Fp8E4M3Block128,
+        pack: false,
     };
 }
 
@@ -140,6 +151,40 @@ fn brain_to_half(bytes: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+// The bytes of one MXFP8 array after `how`, or `None` when `how` leaves it in
+// place and the caller wraps the stored span as it is. `per_value` is 1 for the
+// codes (one byte a weight) and the group width for the scales (one byte a
+// group); a column move narrower than a group is refused.
+fn mxfp8_moved(
+    name: &str,
+    src: &[u8],
+    row_bytes: usize,
+    per_value: usize,
+    how: Move<'_>,
+) -> CoreResult<Option<Vec<u8>>> {
+    use shiso_modelfile::mxfp8::GROUP;
+    Ok(match how {
+        Move::InPlace => None,
+        Move::Rows {
+            rows: r,
+            lead,
+            perm,
+        } => Some(permute_blocks(src, r * row_bytes, lead, perm)),
+        Move::Cols { cols, perm } => {
+            if cols % GROUP != 0 {
+                return Err(CoreError::InvalidValue {
+                    key: "tensor layout",
+                    value: format!(
+                        "{name}: a column move of {cols} would split MXFP8 scale groups"
+                    ),
+                });
+            }
+            let block = if per_value == 1 { cols } else { cols / GROUP };
+            Some(permute_columns(src, row_bytes, block, perm))
+        }
+    })
+}
+
 impl Loader<'_> {
     /// A brain-float matrix `[out, in]`, optionally a row range of a larger
     /// one, optionally moved.
@@ -151,13 +196,22 @@ impl Loader<'_> {
         rows: std::ops::Range<u32>,
         how: Move<'_>,
     ) -> CoreResult<Weight> {
+        if self.layout.dense == DenseFormat::Mxfp8 && self.ck.raw(name)?.1.dtype == "F8_E4M3" {
+            return self.mxfp8(name, stored_rows, in_dim, rows, how);
+        }
         let shape = [u64::from(stored_rows), u64::from(in_dim)];
         let row_bytes = in_dim as usize * 2;
         let (slot, span) = self.ck.span(name, "BF16", &shape)?;
         let start = span.start + rows.start as usize * row_bytes;
         let end = span.start + rows.end as usize * row_bytes;
         let host: Arc<Shard> = self.ck.shard(slot);
-        if self.layout.dense == DenseFormat::Half {
+        // The mixed export's brain-float matrices (the stream mixes, the routers,
+        // the n-gram projections, the output head) take the half-precision
+        // path too: the brain-float tier plans a prompt chunk as sixteen-row
+        // passes that each re-read the weight, which measured 78% of a
+        // 2k-token prefill there (215 tok/s); half precision reaches the
+        // tensor-core tiers and the twelve-bit packing.
+        if matches!(self.layout.dense, DenseFormat::Half | DenseFormat::Mxfp8) {
             let src = &AsRef::<[u8]>::as_ref(&*host)[start..end];
             let moved = match how {
                 Move::InPlace => None,
@@ -169,6 +223,12 @@ impl Loader<'_> {
                 Move::Cols { cols, perm } => Some(permute_columns(src, row_bytes, cols * 2, perm)),
             };
             let halves = brain_to_half(moved.as_deref().unwrap_or(src));
+            let rows_out = rows.end - rows.start;
+            if self.layout.pack
+                && let Some(packed) = Weight::packed_half(self.backend, in_dim, rows_out, &halves)?
+            {
+                return Ok(packed);
+            }
             return Ok(Weight::over(
                 DType::F16,
                 in_dim,
@@ -200,6 +260,72 @@ impl Loader<'_> {
             rows.end - rows.start,
             buffer,
         ))
+    }
+
+    /// An MXFP8 matrix `[out, in]` with its `ue8m0` scales `[out, in/32]`,
+    /// optionally a row range, optionally moved, kept as stored.
+    ///
+    /// A move applies to both arrays at once, because a row of scales belongs
+    /// to its row of codes: a row move carries `in/32` scale bytes with each
+    /// `in` code bytes. A column move is only exact when its blocks are whole
+    /// scale groups, which the recurrent output projection's 128-wide head
+    /// blocks are; anything narrower is refused rather than regrouped.
+    fn mxfp8(
+        &self,
+        name: &str,
+        stored_rows: u32,
+        in_dim: u32,
+        rows: std::ops::Range<u32>,
+        how: Move<'_>,
+    ) -> CoreResult<Weight> {
+        use shiso_modelfile::mxfp8::GROUP;
+        let groups = in_dim as usize / GROUP;
+        if !(in_dim as usize).is_multiple_of(GROUP) {
+            return Err(CoreError::InvalidValue {
+                key: "tensor layout",
+                value: format!("{name}: MXFP8 contraction {in_dim} is not whole groups of 32"),
+            });
+        }
+        let scale_name = format!(
+            "{}.weight_scale",
+            name.strip_suffix(".weight").unwrap_or(name)
+        );
+        let (code_slot, code_span) = self.ck.span(
+            name,
+            "F8_E4M3",
+            &[u64::from(stored_rows), u64::from(in_dim)],
+        )?;
+        let (scale_slot, scale_span) =
+            self.ck
+                .span(&scale_name, "U8", &[u64::from(stored_rows), groups as u64])?;
+        let pick = |slot: usize, span: std::ops::Range<usize>, row_bytes: usize| {
+            let host = self.ck.shard(slot);
+            let start = span.start + rows.start as usize * row_bytes;
+            let end = span.start + rows.end as usize * row_bytes;
+            (host, start..end)
+        };
+        let (code_host, code_range) = pick(code_slot, code_span, in_dim as usize);
+        let (scale_host, scale_range) = pick(scale_slot, scale_span, groups);
+        let moved = |src: &[u8], row_bytes: usize, per_value: usize| {
+            mxfp8_moved(name, src, row_bytes, per_value, how)
+        };
+        let codes_src = &AsRef::<[u8]>::as_ref(&*code_host)[code_range.clone()];
+        let scales_src = &AsRef::<[u8]>::as_ref(&*scale_host)[scale_range.clone()];
+        // The kernels read codes sixteen bytes at a time, and a safetensors
+        // payload sits wherever the header put it: a span that is not on a
+        // sixteen-byte boundary is copied rather than wrapped.
+        let codes = match moved(codes_src, in_dim as usize, 1)? {
+            Some(bytes) => upload(self.backend, bytes)?,
+            None if codes_src.as_ptr().align_offset(16) != 0 => {
+                upload(self.backend, codes_src.to_vec())?
+            }
+            None => import_host(self.backend, code_host.clone(), code_range)?,
+        };
+        let scales = match moved(scales_src, groups, GROUP)? {
+            Some(bytes) => upload(self.backend, bytes)?,
+            None => import_host(self.backend, scale_host.clone(), scale_range)?,
+        };
+        Weight::mxfp8(in_dim, rows.end - rows.start, [codes, scales])
     }
 
     /// A whole brain-float matrix, as stored.
@@ -465,16 +591,72 @@ impl Loader<'_> {
         )
     }
 
+    /// Every expert of one projection as one resident NVFP4 bank: expert
+    /// `e`'s codes, group scales and global at slot `e`, the layout the
+    /// identity expert map addresses.
+    fn resident_nvfp4(
+        &self,
+        base: &str,
+        proj: &str,
+        in_dim: u32,
+        out_dim: u32,
+    ) -> CoreResult<Weight> {
+        let (one_codes, one_scales) = nvfp4_bytes(in_dim, out_dim);
+        let n = u64::from(EXPERTS);
+        let mut codes = Vec::with_capacity(usize::try_from(one_codes * n).unwrap_or(0));
+        let mut scales = Vec::with_capacity(usize::try_from(one_scales * n).unwrap_or(0));
+        let mut globals = Vec::with_capacity(EXPERTS as usize * 4);
+        let code_shape = [u64::from(out_dim), u64::from(in_dim / 2)];
+        let scale_shape = [u64::from(out_dim), u64::from(in_dim / 16)];
+        for e in 0..EXPERTS {
+            let at = format!("{base}.mlp.experts.{e}.{proj}");
+            for (name, dtype, shape, out) in [
+                (format!("{at}.weight"), "U8", &code_shape[..], &mut codes),
+                (
+                    format!("{at}.weight_scale"),
+                    "F8_E4M3",
+                    &scale_shape[..],
+                    &mut scales,
+                ),
+                (format!("{at}.weight_scale_2"), "F32", &[][..], &mut globals),
+            ] {
+                let (slot, span) = self.ck.span(&name, dtype, shape)?;
+                out.extend_from_slice(&AsRef::<[u8]>::as_ref(&*self.ck.shard(slot))[span]);
+            }
+        }
+        Weight::nvfp4(
+            in_dim,
+            out_dim,
+            EXPERTS,
+            [
+                upload(self.backend, codes)?,
+                upload(self.backend, scales)?,
+                upload(self.backend, globals)?,
+            ],
+        )
+    }
+
     /// The draft head's routed feed-forward: block-scaled FP8 banks, resident
     /// because a draft pass never fetches, beside the dense router and shared
     /// expert.
     fn draft_experts(&self, base: &str) -> CoreResult<ExpertBank> {
         let m = format!("{base}.mlp");
+        // Which codec the head's banks are in is a fact of the stored bytes:
+        // the reference and first NVFP4 exports ship block-scaled FP8 here,
+        // the mixed-precision one NVFP4.
+        let probe = format!("{base}.mlp.experts.0.gate_proj.weight");
+        let resident = |proj: &str, in_dim: u32, out_dim: u32| {
+            if self.ck.raw(&probe)?.1.dtype == "U8" {
+                self.resident_nvfp4(base, proj, in_dim, out_dim)
+            } else {
+                self.resident_fp8(base, proj, in_dim, out_dim)
+            }
+        };
         Ok(ExpertBank {
             router: self.matrix(&format!("{m}.gate.weight"), HIDDEN, EXPERTS)?,
-            gate: self.resident_fp8(base, "gate_proj", HIDDEN, EXPERT_INTERMEDIATE)?,
-            up: self.resident_fp8(base, "up_proj", HIDDEN, EXPERT_INTERMEDIATE)?,
-            down: self.resident_fp8(base, "down_proj", EXPERT_INTERMEDIATE, HIDDEN)?,
+            gate: resident("gate_proj", HIDDEN, EXPERT_INTERMEDIATE)?,
+            up: resident("up_proj", HIDDEN, EXPERT_INTERMEDIATE)?,
+            down: resident("down_proj", EXPERT_INTERMEDIATE, HIDDEN)?,
             shared_router: self.matrix(&format!("{m}.shared_expert_gate.weight"), HIDDEN, 1)?,
             shared_gate: self.matrix(
                 &format!("{m}.shared_expert.gate_proj.weight"),
@@ -586,7 +768,16 @@ pub fn import(
         loader.table(&format!("{LM}.embed_tokens.weight"))?
     };
     let _tag = ledger::scope(MemTag::WeightsHead);
-    let lm_head = loader.matrix("lm_head.weight", HIDDEN, VOCAB)?;
+    // The head stays unpacked: a draft's narrowed head is cut out of it by
+    // rows, which the twelve-bit layout's per-row exception lists do not allow.
+    let head_loader = Loader {
+        layout: ImportLayout {
+            pack: false,
+            ..layout
+        },
+        ..loader
+    };
+    let lm_head = head_loader.matrix("lm_head.weight", HIDDEN, VOCAB)?;
     let output_mix = loader.mix(&format!("{LM}.hyper_connection_mixer"), false)?;
     let identity: Vec<u8> = (0..EXPERTS).flat_map(u32::to_le_bytes).collect();
     Ok(SparseWeights {

@@ -8,7 +8,7 @@ registry key; a kernel inside it is fetched by the exact name recorded here.
 Two kinds of entry live in these units, and they are fetched differently.
 
 **Plain kernels** carry C linkage, so the name below is the name the driver
-answers to, verbatim. There are 57 of them.
+answers to, verbatim. There are 65 of them.
 
 **Template kernels** do not. They are instantiated explicitly at the bottom of
 their translation unit - 155 instantiations across 12 templates - and each one
@@ -46,7 +46,9 @@ back to the kernel it belongs to.
 | `q4e_embed` | `embed.cu` | 4 | 0 |
 | `q4e_modelopt` | `modelopt.cu` | 7 | 0 |
 | `q4e_exact` | `exact.cu` | 2 | 0 |
-| **total** | 13 units | **69** | **105** |
+| `q4e_kv8` | `kv8.cu` | 8 | 0 |
+| `q4e_mxfp8` | `mxfp8.cu` | 5 | 0 |
+| **total** | 15 units | **82** | **105** |
 
 ## Plain entries, by module
 
@@ -59,7 +61,7 @@ back to the kernel it belongs to.
 
 ### `q4e_modelopt`
 
-Not an upstream unit: this repository's own NVFP4 routed stages and FP8
+Not an upstream unit: this repository's own NVFP4 routed stages and FP8 and NVFP4
 n-gram decode, for the `modelopt` export.
 
 - `q4e_nvfp4_experts_gate_up_kernel`
@@ -69,6 +71,7 @@ n-gram decode, for the `modelopt` export.
 - `q4e_fp8_experts_gate_up_kernel`
 - `q4e_fp8_experts_down_kernel`
 - `q4e_ple_dequant_fp8_kernel`
+- `q4e_ple_dequant_nvfp4_kernel`
 
 ### `q4e_exact`
 
@@ -81,6 +84,43 @@ ported unit is edited.
 - `q4e_gdn_step_kernel` - one decode row of a recurrent layer after its
   convolution: the two L2 norms, the gates, the recurrence and the output
   gate, bit for bit the five launches it replaces.
+
+### `q4e_kv8`
+
+Not an upstream unit: the key/value store and every reader of the attention
+K and V planes over a cache of FP8 E4M3 bytes (static scale 1) instead of
+f16, for `--kv-cache-dtype fp8`. Each is the named kernel with the cache's
+element type changed: the store rounds to E4M3 (saturating at 448, never the
+NaN code), and each reader decodes a byte to exactly the f16 value it stands
+for and then runs the ported arithmetic unchanged.
+
+- `q4e_qsa_store_kv_fp8_kernel` - `q4e_qsa_store_kv_kernel`.
+- `q4e_qsa_store_kv_batch_fp8_kernel` - `q4e_qsa_store_kv_batch_kernel`.
+- `q4e_qsa_attention_fp8_kernel` - `q4e_qsa_attention_kernel`.
+- `q4e_qsa_attention_batch_fp8_kernel` - `q4e_qsa_attention_batch_kernel`.
+- `q4e_qsa_attention_tiled_fp8_kernel` - `q4e_qsa_attention_tiled_kernel`.
+- `q4e_qsa_attention_split_fp8_kernel` - `q4e_qsa_attention_split_kernel`.
+- `q4e_qsa_attention_gather_fp8_kernel` - `q4e_qsa_attention_gather_kernel`.
+- `q4e_qsa_attention_tc_exact_fp8_kernel` - `q4e_qsa_attention_tc_exact_kernel`.
+
+### `q4e_mxfp8`
+
+Not an upstream unit: this repository's own dense projections over an MXFP8
+weight (`e4m3` codes, one `ue8m0` scale per 32), read as stored. One argument
+list for all five: `out, codes, scales, x, in_dim, out_dim, rows`.
+
+- `q4e_mxfp8_gemv_kernel` - one activation row; a row's sum is the
+  brain-float rows kernel's on the exactly widened weight. Two output rows a
+  warp.
+- `q4e_mxfp8_gemv_narrow_kernel` - the same sums, one output row a warp, for
+  outputs of at most 1024 rows.
+- `q4e_mxfp8_rows_kernel` - two to eight activation rows, each summed as the
+  one-row kernel sums it; the activations staged once a block, four output
+  rows a warp.
+- `q4e_mxfp8_rows_narrow_kernel` - the same sums, one output row a warp, for
+  outputs of at most 1024 rows.
+- `q4e_mxfp8_gemm_kernel` - a prompt chunk on tensor cores, 128 x 128 tiles,
+  one scale group a contraction step, activations rounded to halves.
 
 ### `q4e_moe`
 
@@ -605,6 +645,14 @@ of that kernel.
 tile unchanged, 66,048 B at the one head width it is planned at (128). It is
 planned only for one row of one session's decode step; every other pass runs
 the chain it replaces.
+
+### `q4e_kv8`
+
+Every entry takes the grid, block, dynamic shared memory and argument list of
+the f16 kernel it is named after (tables above), with the two cache pointers
+typed `uint8_t *` instead of `__half *`. The readers' shared tiles stay f16 -
+the codes are decoded as they are staged - so the reservations are the same
+numbers, including the opt-in ones.
 
 ### `q4e_idx`
 

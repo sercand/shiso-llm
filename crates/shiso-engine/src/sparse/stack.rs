@@ -706,6 +706,7 @@ fn log_resident(shape: &SparseShape, opts: &SparseOptions, kv: &PagedKv, ckpt_by
         pool_tokens = u64::from(opts.engine.kv_pool_pages) * u64::from(PAGE_TOKENS),
         page_bytes = kv.page_bytes(),
         kv_bytes_per_token = kv.page_bytes() / u64::from(PAGE_TOKENS),
+        kv_elem = %opts.engine.kv_elem,
         session_bytes = session_bytes(shape, opts.spec),
         ckpt_bytes,
         ckpt_slots = opts.engine.kv_ckpt_slots,
@@ -820,6 +821,7 @@ impl SparseStack {
         shape.validate()?;
         check_layers(&shape, &weights)?;
         check_prefill_rows(opts.prefill_rows)?;
+        crate::sparse::capture::check_kv_elem(backend.as_ref(), opts.engine.kv_elem)?;
         // Everything resident so far is weights: the ledger's second mark.
         if let Some(ledger) = backend.ledger() {
             ledger.mark("after_weights", backend.memory_info());
@@ -830,6 +832,7 @@ impl SparseStack {
         let planes = PagePlanes {
             indexer: true,
             draft: weights.draft.is_some(),
+            kv: opts.engine.kv_elem,
         };
         let scratch = Scratch::new(
             backend,

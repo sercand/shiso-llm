@@ -843,6 +843,7 @@ impl SparseStack {
                                 .kv_pool_pages
                                 .saturating_mul(shiso_core::page::PAGE_TOKENS),
                             ctx: self.opts.engine.ctx,
+                            kv: self.opts.engine.kv_elem,
                         };
                         plan.append(qsa::block(&self.shape, &desc, attn, *ctx, n_tok, device)?);
                     }

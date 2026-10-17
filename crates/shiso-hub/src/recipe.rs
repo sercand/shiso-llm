@@ -859,6 +859,23 @@ pub struct ServerDefaults {
     /// (`--solo-prefill-chunk`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solo_prefill_chunk: Option<usize>,
+    /// Element type of the attention key/value cache (`--kv-cache-dtype`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_dtype: Option<KvCacheDtype>,
+}
+
+/// Element type of the attention key/value cache (`--kv-cache-dtype`).
+///
+/// Typed for the reason [`ExpertResidency`] is: a recipe naming a cache format
+/// this build does not have fails to parse rather than silently serving f16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvCacheDtype {
+    /// Half precision.
+    F16,
+    /// FP8 E4M3 at a static scale of one.
+    #[serde(alias = "fp8_e4m3")]
+    Fp8,
 }
 
 /// Where a sparse checkpoint's routed expert banks live (`--expert-residency`).

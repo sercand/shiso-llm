@@ -36,7 +36,7 @@ use shiso_core::backend::Backend;
 use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc_tagged};
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ledger::MemTag;
-use shiso_core::page::{PAGE_TOKENS, pages_for};
+use shiso_core::page::{KvElem, PAGE_TOKENS, pages_for};
 use shiso_kvstore::{Backing, CacheGeometry, Frontier, KvError, PageId};
 
 use crate::shape::LayerKind;
@@ -84,14 +84,20 @@ pub const PLANES: [Plane; 4] = [
 ];
 
 impl Plane {
-    /// Bytes this plane occupies for one page of positions.
+    /// Bytes this plane occupies for one page of positions, with the attention
+    /// planes stored as `kv`.
+    ///
+    /// Only the key and value planes take the cache element. The indexer's
+    /// planes stay f16 whatever it is: they decide which blocks attention reads
+    /// at all, so an error there is a block never seen rather than a value seen
+    /// slightly wrong.
     #[must_use]
-    pub fn page_bytes(self, shape: &SparseShape) -> u64 {
+    pub fn page_bytes(self, shape: &SparseShape, kv: KvElem) -> u64 {
         let positions = u64::from(PAGE_TOKENS);
         match self {
             Self::Key | Self::Value => positions
                 .saturating_mul(u64::from(shape.kv_dim()))
-                .saturating_mul(F16_BYTES),
+                .saturating_mul(u64::from(kv.bytes())),
             Self::IndexerKey => positions
                 .saturating_mul(u64::from(shape.indexer.head_dim))
                 .saturating_mul(F16_BYTES),
@@ -105,11 +111,12 @@ impl Plane {
     }
 }
 
-/// Whether a stack's pages carry the indexer planes and the draft head's.
+/// Whether a stack's pages carry the indexer planes and the draft head's, and
+/// what element their key and value planes are stored as.
 ///
-/// Two independent facts, and they are a struct rather than two `bool`
-/// arguments because at a call site `page_bytes(shape, true, false)` reads
-/// identically to `page_bytes(shape, false, true)` and means something else.
+/// Independent facts, and they are a struct rather than positional arguments
+/// because at a call site `page_bytes(shape, true, false)` reads identically to
+/// `page_bytes(shape, false, true)` and means something else.
 ///
 /// Deliberately NOT `#[non_exhaustive]`: a caller has to build one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -122,6 +129,10 @@ pub struct PagePlanes {
     /// contributes a full attention layer's worth of planes rather than only a
     /// key and a value.
     pub draft: bool,
+    /// The element every attention rank's key and value planes are stored as,
+    /// the draft head's included: it runs the same attention kernels over its
+    /// own planes, so it reads them the same way.
+    pub kv: KvElem,
 }
 
 impl PagePlanes {
@@ -132,6 +143,7 @@ impl PagePlanes {
         Self {
             indexer: true,
             draft: true,
+            kv: KvElem::F16,
         }
     }
 
@@ -141,6 +153,7 @@ impl PagePlanes {
         Self {
             indexer: true,
             draft: false,
+            kv: KvElem::F16,
         }
     }
 }
@@ -159,11 +172,11 @@ impl PagePlanes {
 pub fn page_bytes(shape: &SparseShape, planes: PagePlanes) -> u64 {
     let attn = u64::from(shape.count(LayerKind::Attn));
     let kv = Plane::Key
-        .page_bytes(shape)
-        .saturating_add(Plane::Value.page_bytes(shape));
+        .page_bytes(shape, planes.kv)
+        .saturating_add(Plane::Value.page_bytes(shape, planes.kv));
     let idx = Plane::IndexerKey
-        .page_bytes(shape)
-        .saturating_add(Plane::IndexerPooled.page_bytes(shape));
+        .page_bytes(shape, planes.kv)
+        .saturating_add(Plane::IndexerPooled.page_bytes(shape, planes.kv));
     let mut bytes = attn.saturating_mul(kv);
     if planes.indexer {
         bytes = bytes.saturating_add(attn.saturating_mul(idx));
@@ -385,7 +398,7 @@ impl PagedKv {
                     (false, Plane::Key | Plane::Value) => MemTag::KvAttention,
                     (false, Plane::IndexerKey | Plane::IndexerPooled) => MemTag::KvIndexer,
                 };
-                let stride = plane.page_bytes(shape);
+                let stride = plane.page_bytes(shape, planes.kv);
                 let bytes = u64::from(pool_pages).checked_mul(stride).ok_or_else(|| {
                     CoreError::InvalidValue {
                         key: "kv_pool_pages",

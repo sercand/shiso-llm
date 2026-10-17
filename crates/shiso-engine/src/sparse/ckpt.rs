@@ -47,6 +47,7 @@ use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::media::{MediaKey, MediaSpan};
 use shiso_core::model::Logits;
+use shiso_core::page::KvElem;
 use shiso_kvstore::{
     CacheStats, CommitOpts, KvCache, PathLayout, PersistRefusal, PumpReport, Reason,
 };
@@ -62,27 +63,29 @@ use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
 use crate::sparse::stack::{MAX_PREFILL_CHUNK, SparseSession, SparseStack};
 
-/// Bytes per stored key/value element: this family's cache is half precision end
-/// to end, exactly as the dense one's is.
-const CACHE_ELEMENT_BYTES: u32 = 2;
-
 /// The geometry guard a stored payload carries, derived from the running build.
 ///
 /// Every number is either a count from the shape or a width the cache was built
 /// with, so a file this build writes and a file this build will accept are
 /// described by one function.
+///
+/// `kv_width` is a key row's bytes at the element the attention planes are
+/// stored as, so an f16 build and an fp8 build already disagree here; the
+/// codec name in [`disk_numerics`] is what keeps two elements of the same
+/// width apart.
 #[must_use]
 pub(crate) fn path_layout(
     shape: &SparseShape,
     ctx: u32,
     spec: SpecDepth,
+    kv: KvElem,
     identity: CkptIdentity,
 ) -> PathLayout {
     PathLayout {
         model_id: identity.model_id,
         quant_bits: identity.quant_bits,
         ctx_size: ctx,
-        kv_width: shape.kv_dim().saturating_mul(CACHE_ELEMENT_BYTES),
+        kv_width: shape.kv_dim().saturating_mul(kv.bytes()),
         n_layers: shape.n_layers(),
         n_attn_layers: shape.count(LayerKind::Attn),
         n_gdn_layers: shape.count(LayerKind::Gdn),
@@ -103,6 +106,24 @@ pub(crate) fn path_layout(
         // it, or a row a speculating session invented, are both answers from
         // numbers nothing computed.
         draft_head: spec.is_speculative(),
+    }
+}
+
+/// The arithmetic name the disk tier files this build's pages under: the
+/// device's own, plus the key/value codec when it is not f16.
+///
+/// The codec goes into the name rather than into a new layout word because a
+/// layout word is a format change that would orphan every f16 file already on
+/// disk; f16 keeps exactly the name it always had, so those files stay valid.
+/// The name is hashed into a page file's identity, so two builds whose caches
+/// hold different bytes for the same tokens never read each other's files -
+/// even at an equal page size, which a future codec of the same width (another
+/// one-byte format, or E4M3 under a different scale law) would have.
+#[must_use]
+pub(crate) fn disk_numerics(device: String, kv: KvElem) -> String {
+    match kv {
+        KvElem::F16 => device,
+        KvElem::Fp8E4m3 => format!("{device}+kv={}", kv.codec()),
     }
 }
 
@@ -184,7 +205,14 @@ impl SparseStack {
                 backend: "engine",
             });
         }
-        let layout = path_layout(&self.shape, self.opts.engine.ctx, self.opts.spec, identity);
+        let kv = self.opts.engine.kv_elem;
+        let layout = path_layout(
+            &self.shape,
+            self.opts.engine.ctx,
+            self.opts.spec,
+            kv,
+            identity,
+        );
         // The planes the pool was allocated with, which include a draft head's
         // own four when one is resident: a geometry that left them out handed
         // the store a page buffer one draft layer short of the page, and every
@@ -192,6 +220,7 @@ impl SparseStack {
         let planes = PagePlanes {
             indexer: true,
             draft: self.has_draft_head(),
+            kv,
         };
         let geometry =
             paged::cache_geometry(&self.shape, planes, self.opts.spec).with_layout(layout);
@@ -202,7 +231,7 @@ impl SparseStack {
         let disk = config.options.disk(
             config.dir.clone(),
             geometry.page_bytes_total(pool_pages),
-            self.backend.numerics_id(),
+            disk_numerics(self.backend.numerics_id(), kv),
         )?;
         let budget_bytes = disk.budget_bytes;
         let numerics = disk.numerics.clone();
@@ -928,5 +957,80 @@ fn cache_failure(source: shiso_kvstore::KvError) -> CoreError {
         backend: "engine",
         op: "kv cache",
         source: Box::new(source),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shape::GdnShape;
+    use crate::sparse::shape::{GqaShape, IndexerShape, MoeShape, MropeSections};
+
+    fn shape() -> SparseShape {
+        SparseShape {
+            layers: vec![
+                LayerKind::Gdn,
+                LayerKind::Gdn,
+                LayerKind::Gdn,
+                LayerKind::Attn,
+            ],
+            hidden: 2_560,
+            vocab: 248_320,
+            streams: 4,
+            stream_rank: 320,
+            gqa: GqaShape::new(24, 2, 256, 64),
+            gdn: GdnShape::new(48, 16, 128, 4),
+            moe: MoeShape::new(512, 10, 1, 640),
+            indexer: IndexerShape::new(4, 128, 2_048, 4),
+            ple: None,
+            mrope: MropeSections::new(11, 11, 10),
+            rms_eps: 1.0e-6,
+            rope_theta: 1.0e7,
+        }
+    }
+
+    #[test]
+    fn an_fp8_build_and_an_f16_build_file_their_pages_under_different_identities() {
+        // Both halves of the identity have to move: the layout word, which a
+        // narrower element changes on its own, and the arithmetic name, which
+        // is what would still tell two one-byte codecs apart.
+        let identity = CkptIdentity::new(7, 4);
+        let f16 = path_layout(&shape(), 65_536, SpecDepth::NONE, KvElem::F16, identity);
+        let fp8 = path_layout(&shape(), 65_536, SpecDepth::NONE, KvElem::Fp8E4m3, identity);
+        assert_eq!(
+            f16.kv_width,
+            2 * 2 * 256,
+            "two key heads of 256 f16 elements"
+        );
+        assert_eq!(fp8.kv_width, 2 * 256, "the same row at one byte an element");
+        assert_ne!(f16, fp8);
+        let device = || "cuda-sm121".to_owned();
+        assert_eq!(
+            disk_numerics(device(), KvElem::F16),
+            device(),
+            "an f16 build keeps the name its existing files were written under"
+        );
+        assert_eq!(
+            disk_numerics(device(), KvElem::Fp8E4m3),
+            "cuda-sm121+kv=e4m3s1"
+        );
+    }
+
+    #[test]
+    fn an_fp8_page_is_the_f16_page_less_half_of_every_attention_plane() {
+        // The indexer planes stay f16, so the page shrinks by exactly the
+        // attention ranks' key and value bytes halved - draft head included.
+        let shape = shape();
+        let f16 = paged::page_bytes(&shape, PagePlanes::full());
+        let fp8 = paged::page_bytes(
+            &shape,
+            PagePlanes {
+                kv: KvElem::Fp8E4m3,
+                ..PagePlanes::full()
+            },
+        );
+        let ranks = u64::from(shape.count(LayerKind::Attn)) + 1;
+        let kv_f16 = 2 * u64::from(shiso_core::page::PAGE_TOKENS) * u64::from(shape.kv_dim()) * 2;
+        assert_eq!(f16 - fp8, ranks * kv_f16 / 2);
     }
 }

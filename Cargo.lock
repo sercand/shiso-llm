@@ -2889,6 +2889,7 @@ dependencies = [
  "parking_lot",
  "serde_json",
  "shiso-core",
+ "shiso-modelfile",
  "shiso-models",
  "tempfile",
  "thiserror",

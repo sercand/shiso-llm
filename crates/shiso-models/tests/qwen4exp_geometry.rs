@@ -55,6 +55,7 @@ fn a_page_without_the_indexer_still_pays_for_a_draft_head_s_rows() {
         PagePlanes {
             indexer: false,
             draft: true,
+            ..PagePlanes::default()
         },
     );
     let kv_only = page_bytes(&shape, PagePlanes::default());

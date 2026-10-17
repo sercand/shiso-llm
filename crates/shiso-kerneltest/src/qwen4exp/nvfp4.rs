@@ -1,20 +1,24 @@
 //! The sparse family's NVFP4 routed expert stages, graded against a host
 //! restatement of the decode: four-bit codes, an `e4m3` scale per sixteen
 //! weights, and a per-slot `f32` above both.
+//!
+//! Beside the grading, two invariance cases hold the property speculative
+//! decoding and chunked prompts lean on - a column's bits depend on its own
+//! token and expert, never on what else shares the launch - and the bench
+//! fixtures time the four entries under a skewed, prompt-like routing.
 #![expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
-    clippy::too_many_lines,
-    reason = "fixture dimensions and ids are small literals; every case asserts by panicking; \
-              a case running both expert stages reads best as one sequence"
+    reason = "fixture dimensions and ids are small literals"
 )]
 
+use crate::bench::Fixture;
 use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::signal;
 use crate::qwen4exp::fp8::e4m3;
-use shiso_core::{Extent3, KernelArg, KernelRef, LaunchArgs};
+use shiso_core::{DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs, alloc};
 
 /// The module the entries live in.
 const MODULE: &str = "q4e_modelopt";
@@ -81,6 +85,14 @@ impl Bank {
             })
             .collect()
     }
+
+    fn upload(&self, gpu: &Gpu) -> [DeviceBuffer; 3] {
+        [
+            gpu.upload(&self.codes),
+            gpu.upload(&self.scales),
+            gpu.upload(&f32_bytes(&self.globals)),
+        ]
+    }
 }
 
 fn close(what: &str, got: &[f32], want: &[f32], rel: f32) {
@@ -95,53 +107,227 @@ fn i32_bytes(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-/// One stage set: entries, rows a block, threads a block, and the tolerance
-/// against the host product.
+/// A routing's column lists as the engine's router leaves them: columns
+/// grouped by expert in column order (`sorted`), each expert's span
+/// (`bounds`), and the experts with a nonempty span followed by their count
+/// at index `n_expert` (`active`).
+struct Route {
+    sorted: Vec<i32>,
+    bounds: Vec<i32>,
+    active: Vec<i32>,
+}
+
+impl Route {
+    /// `ids[col]` is column `col`'s expert; column `col` is token
+    /// `col / n_used`'s.
+    fn new(ids: &[i32], n_expert: usize) -> Self {
+        let mut bounds = vec![0i32; n_expert + 1];
+        for &e in ids {
+            bounds[e as usize + 1] += 1;
+        }
+        for e in 0..n_expert {
+            bounds[e + 1] += bounds[e];
+        }
+        let mut cursor = bounds.clone();
+        let mut sorted = vec![0i32; ids.len()];
+        for (col, &e) in ids.iter().enumerate() {
+            sorted[cursor[e as usize] as usize] = col as i32;
+            cursor[e as usize] += 1;
+        }
+        let mut active: Vec<i32> = (0..n_expert as i32)
+            .filter(|&e| bounds[e as usize + 1] > bounds[e as usize])
+            .collect();
+        let n_active = active.len() as i32;
+        active.resize(n_expert, 0);
+        active.push(n_active);
+        Self {
+            sorted,
+            bounds,
+            active,
+        }
+    }
+
+    /// Distinct experts the routing touches.
+    fn distinct(&self) -> usize {
+        *self.active.last().expect("the count closes the list") as usize
+    }
+
+    fn upload(&self, gpu: &Gpu, map: &[u32], columns: usize) -> DevRoute {
+        DevRoute {
+            sorted: gpu.upload(&i32_bytes(&self.sorted)),
+            bounds: gpu.upload(&i32_bytes(&self.bounds)),
+            active: gpu.upload(&i32_bytes(&self.active)),
+            map: gpu.upload(&map.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()),
+            columns,
+        }
+    }
+}
+
+/// A [`Route`] and the expert-to-slot map on the device.
+struct DevRoute {
+    sorted: DeviceBuffer,
+    bounds: DeviceBuffer,
+    active: DeviceBuffer,
+    map: DeviceBuffer,
+    columns: usize,
+}
+
+/// One stage set: entries, launch geometry, and the tolerance against the
+/// host product.
+#[derive(Clone, Copy)]
 struct Stages {
     gate_up: &'static str,
     down: &'static str,
-    rows: usize,
+    /// The gate-and-up grid's first axis at an intermediate width.
+    gate_up_blocks: fn(u32) -> u32,
+    /// The down grid's first axis at a hidden width.
+    down_blocks: fn(u32) -> u32,
     threads: u32,
-    /// Copies of the gate's row tiles the gate-and-up grid holds: the step
-    /// kernel covers gate and up in one block, the prompt kernel tiles them
-    /// one after the other.
-    copies: usize,
+    /// Dynamic shared memory a block takes.
+    smem: u32,
     rel: f32,
+}
+
+/// The warp-per-row step kernels: one row of gate and up a warp, four of
+/// down, four warps a block (`Q4E_NVFP4_GU_ROWS`, `Q4E_NVFP4_DN_ROWS`,
+/// `Q4E_NVFP4_WARPS`).
+const STEP: Stages = Stages {
+    gate_up: "q4e_nvfp4_experts_gate_up_kernel",
+    down: "q4e_nvfp4_experts_down_kernel",
+    gate_up_blocks: |out_dim| out_dim.div_ceil(4),
+    down_blocks: |out_dim| out_dim.div_ceil(16),
+    threads: 128,
+    smem: 0,
+    rel: 2e-4,
+};
+
+/// The tensor-core prompt kernels: 128 rows of gate and up, or 256 of down, a
+/// block, each row tile over four blocks, sixteen warps and `Q4E_MG_SMEM`
+/// bytes of dynamic shared memory a block (`Q4E_MG_HALF`, `Q4E_MG_BM`,
+/// `Q4E_MG_SPLIT`, `Q4E_MG_THREADS`). Their weights decode exactly but their activations are
+/// rounded to halves, which is the whole of the wider budget: eleven bits of
+/// mantissa on every input of a 2,560-term sum.
+const PROMPT: Stages = Stages {
+    gate_up: "q4e_nvfp4_experts_gemm_gate_up_kernel",
+    down: "q4e_nvfp4_experts_gemm_down_kernel",
+    gate_up_blocks: |out_dim| 4 * out_dim.div_ceil(128),
+    down_blocks: |out_dim| 4 * out_dim.div_ceil(256),
+    threads: 512,
+    smem: 92_416,
+    rel: 4e-3,
+};
+
+/// The three device arrays of one bank.
+type Parts<'a> = [DeviceView<'a>; 3];
+
+/// One gate-and-up launch.
+struct GateUp<'a> {
+    out_gate: DeviceView<'a>,
+    out_up: DeviceView<'a>,
+    gate: Parts<'a>,
+    up: Parts<'a>,
+    x: DeviceView<'a>,
+    route: &'a DevRoute,
+    hidden: u32,
+    inter: u32,
+    n_expert: u32,
+    n_used: u32,
+}
+
+impl GateUp<'_> {
+    fn launch(&self, gpu: &Gpu, st: &Stages) {
+        let r = self.route;
+        let args = [
+            KernelArg::Buffer(self.out_gate),
+            KernelArg::Buffer(self.out_up),
+            KernelArg::Buffer(self.gate[0]),
+            KernelArg::Buffer(self.gate[1]),
+            KernelArg::Buffer(self.gate[2]),
+            KernelArg::Buffer(self.up[0]),
+            KernelArg::Buffer(self.up[1]),
+            KernelArg::Buffer(self.up[2]),
+            KernelArg::Buffer(self.x),
+            KernelArg::Buffer(r.sorted.view()),
+            KernelArg::Buffer(r.bounds.view()),
+            KernelArg::Buffer(r.active.view()),
+            KernelArg::Buffer(r.map.view()),
+            KernelArg::U32(self.hidden),
+            KernelArg::U32(self.inter),
+            KernelArg::U32(self.n_expert),
+            KernelArg::U32(self.n_used),
+        ];
+        let mut launch = LaunchArgs::new(
+            Extent3::new(
+                (st.gate_up_blocks)(self.inter),
+                (r.columns as u32).min(self.n_expert),
+                1,
+            ),
+            Extent3::linear(st.threads),
+            &args,
+        );
+        launch.smem_bytes = st.smem;
+        run(gpu, KernelRef::new(MODULE, st.gate_up), &launch);
+    }
+}
+
+/// One down launch.
+struct Down<'a> {
+    out: DeviceView<'a>,
+    weights: Parts<'a>,
+    mid: DeviceView<'a>,
+    route: &'a DevRoute,
+    hidden: u32,
+    inter: u32,
+    n_expert: u32,
+    n_used: u32,
+}
+
+impl Down<'_> {
+    fn launch(&self, gpu: &Gpu, st: &Stages) {
+        let r = self.route;
+        let args = [
+            KernelArg::Buffer(self.out),
+            KernelArg::Buffer(self.weights[0]),
+            KernelArg::Buffer(self.weights[1]),
+            KernelArg::Buffer(self.weights[2]),
+            KernelArg::Buffer(self.mid),
+            KernelArg::Buffer(r.sorted.view()),
+            KernelArg::Buffer(r.bounds.view()),
+            KernelArg::Buffer(r.active.view()),
+            KernelArg::Buffer(r.map.view()),
+            KernelArg::U32(self.inter),
+            KernelArg::U32(self.hidden),
+            KernelArg::U32(self.n_expert),
+            KernelArg::U32(self.n_used),
+        ];
+        let mut launch = LaunchArgs::new(
+            Extent3::new(
+                (st.down_blocks)(self.hidden),
+                (r.columns as u32).min(self.n_expert),
+                1,
+            ),
+            Extent3::linear(st.threads),
+            &args,
+        );
+        launch.smem_bytes = st.smem;
+        run(gpu, KernelRef::new(MODULE, st.down), &launch);
+    }
+}
+
+fn views(bufs: &[DeviceBuffer; 3]) -> Parts<'_> {
+    [bufs[0].view(), bufs[1].view(), bufs[2].view()]
 }
 
 /// Both NVFP4 expert stages over a sorted column list through a slot map that
 /// is not the identity, at this family's widths: the warp-per-row step
 /// kernels.
 pub fn the_nvfp4_expert_stages_follow_the_slot_map(gpu: &Gpu) {
-    stages(
-        gpu,
-        &Stages {
-            gate_up: "q4e_nvfp4_experts_gate_up_kernel",
-            down: "q4e_nvfp4_experts_down_kernel",
-            rows: 8,
-            threads: 256,
-            copies: 1,
-            rel: 2e-4,
-        },
-    );
+    stages(gpu, &STEP);
 }
 
-/// The same, through the tensor-core prompt kernels. Their weights decode
-/// exactly but their activations are rounded to halves, which is the whole of
-/// the wider budget: eleven bits of mantissa on every input of a 2,560-term
-/// sum.
+/// The same, through the tensor-core prompt kernels.
 pub fn the_nvfp4_prompt_stages_follow_the_slot_map(gpu: &Gpu) {
-    stages(
-        gpu,
-        &Stages {
-            gate_up: "q4e_nvfp4_experts_gemm_gate_up_kernel",
-            down: "q4e_nvfp4_experts_gemm_down_kernel",
-            rows: 64,
-            threads: 128,
-            copies: 2,
-            rel: 4e-3,
-        },
-    );
+    stages(gpu, &PROMPT);
 }
 
 fn stages(gpu: &Gpu, st: &Stages) {
@@ -155,76 +341,26 @@ fn stages(gpu: &Gpu, st: &Stages) {
     for (e, slot) in [(1usize, 5u32), (4, 0), (9, 3), (13, 2)] {
         map[e] = slot;
     }
-    let mut bounds = vec![0i32; n_expert + 1];
-    for &e in &ids {
-        bounds[e as usize + 1] += 1;
-    }
-    for e in 0..n_expert {
-        bounds[e + 1] += bounds[e];
-    }
-    let mut cursor = bounds.clone();
-    let mut sorted = vec![0i32; ids.len()];
-    for (col, &e) in ids.iter().enumerate() {
-        sorted[cursor[e as usize] as usize] = col as i32;
-        cursor[e as usize] += 1;
-    }
-    let mut active: Vec<i32> = (0..n_expert as i32)
-        .filter(|&e| bounds[e as usize + 1] > bounds[e as usize])
-        .collect();
-    let n_active = active.len() as i32;
-    active.resize(n_expert, 0);
-    active.push(n_active);
     let x = signal(n_tok * hidden, 81);
-    let up_b = |bank: &Bank| {
-        (
-            gpu.upload(&bank.codes),
-            gpu.upload(&bank.scales),
-            gpu.upload(&f32_bytes(&bank.globals)),
-        )
-    };
-    let (gw, gs, gg) = up_b(&gate);
-    let (uw, us, ug) = up_b(&up);
-    let (dw, ds, dg) = up_b(&down);
+    let (gb, ub, db) = (gate.upload(gpu), up.upload(gpu), down.upload(gpu));
     let xs = gpu.upload(&f32_bytes(&x));
-    let sorted_b = gpu.upload(&i32_bytes(&sorted));
-    let bounds_b = gpu.upload(&i32_bytes(&bounds));
-    let active_b = gpu.upload(&i32_bytes(&active));
-    let map_b = gpu.upload(&map.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
     let cols = ids.len();
+    let route = Route::new(&ids, n_expert).upload(gpu, &map, cols);
     let og = gpu.upload(&vec![0u8; cols * inter * 4]);
     let ou = gpu.upload(&vec![0u8; cols * inter * 4]);
-    let args = [
-        KernelArg::Buffer(og.view()),
-        KernelArg::Buffer(ou.view()),
-        KernelArg::Buffer(gw.view()),
-        KernelArg::Buffer(gs.view()),
-        KernelArg::Buffer(gg.view()),
-        KernelArg::Buffer(uw.view()),
-        KernelArg::Buffer(us.view()),
-        KernelArg::Buffer(ug.view()),
-        KernelArg::Buffer(xs.view()),
-        KernelArg::Buffer(sorted_b.view()),
-        KernelArg::Buffer(bounds_b.view()),
-        KernelArg::Buffer(active_b.view()),
-        KernelArg::Buffer(map_b.view()),
-        KernelArg::U32(hidden as u32),
-        KernelArg::U32(inter as u32),
-        KernelArg::U32(n_expert as u32),
-        KernelArg::U32(n_used as u32),
-    ];
-    run(
-        gpu,
-        KernelRef::new(MODULE, st.gate_up),
-        &LaunchArgs::new(
-            Extent3::new(
-                (st.copies * inter.div_ceil(st.rows)) as u32,
-                cols.min(n_expert) as u32,
-                1,
-            ),
-            Extent3::linear(st.threads),
-            &args,
-        ),
-    );
+    GateUp {
+        out_gate: og.view(),
+        out_up: ou.view(),
+        gate: views(&gb),
+        up: views(&ub),
+        x: xs.view(),
+        route: &route,
+        hidden: hidden as u32,
+        inter: inter as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+    }
+    .launch(gpu, st);
     drain(gpu);
     let got_g = gpu.read_f32(&og);
     let got_u = gpu.read_f32(&ou);
@@ -242,34 +378,17 @@ fn stages(gpu: &Gpu, st: &Stages) {
     }
     let mid_b = gpu.upload(&f32_bytes(&mid));
     let od = gpu.upload(&vec![0u8; cols * hidden * 4]);
-    let args = [
-        KernelArg::Buffer(od.view()),
-        KernelArg::Buffer(dw.view()),
-        KernelArg::Buffer(ds.view()),
-        KernelArg::Buffer(dg.view()),
-        KernelArg::Buffer(mid_b.view()),
-        KernelArg::Buffer(sorted_b.view()),
-        KernelArg::Buffer(bounds_b.view()),
-        KernelArg::Buffer(active_b.view()),
-        KernelArg::Buffer(map_b.view()),
-        KernelArg::U32(inter as u32),
-        KernelArg::U32(hidden as u32),
-        KernelArg::U32(n_expert as u32),
-        KernelArg::U32(n_used as u32),
-    ];
-    run(
-        gpu,
-        KernelRef::new(MODULE, st.down),
-        &LaunchArgs::new(
-            Extent3::new(
-                hidden.div_ceil(st.rows) as u32,
-                cols.min(n_expert) as u32,
-                1,
-            ),
-            Extent3::linear(st.threads),
-            &args,
-        ),
-    );
+    Down {
+        out: od.view(),
+        weights: views(&db),
+        mid: mid_b.view(),
+        route: &route,
+        hidden: hidden as u32,
+        inter: inter as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+    }
+    .launch(gpu, st);
     drain(gpu);
     let got_d = gpu.read_f32(&od);
     for (col, &e) in ids.iter().enumerate() {
@@ -284,4 +403,522 @@ fn stages(gpu: &Gpu, st: &Stages) {
             st.rel,
         );
     }
+}
+
+/// Runs both stages of `st` over one routing and returns every column's
+/// gate, up and down rows, `[columns, width]` each. `mid` is the down
+/// stage's input, `[columns, inter]`.
+fn outputs(
+    gpu: &Gpu,
+    st: &Stages,
+    banks: &[[DeviceBuffer; 3]; 3],
+    case: &Case<'_>,
+) -> [Vec<f32>; 3] {
+    let (hidden, inter) = (case.hidden, case.inter);
+    let cols = case.ids.len();
+    let route = Route::new(case.ids, case.n_expert).upload(gpu, case.map, cols);
+    let xs = gpu.upload(&f32_bytes(case.x));
+    let mid = gpu.upload(&f32_bytes(case.mid));
+    let og = gpu.upload(&vec![0u8; cols * inter * 4]);
+    let ou = gpu.upload(&vec![0u8; cols * inter * 4]);
+    let od = gpu.upload(&vec![0u8; cols * hidden * 4]);
+    GateUp {
+        out_gate: og.view(),
+        out_up: ou.view(),
+        gate: views(&banks[0]),
+        up: views(&banks[1]),
+        x: xs.view(),
+        route: &route,
+        hidden: hidden as u32,
+        inter: inter as u32,
+        n_expert: case.n_expert as u32,
+        n_used: case.n_used as u32,
+    }
+    .launch(gpu, st);
+    Down {
+        out: od.view(),
+        weights: views(&banks[2]),
+        mid: mid.view(),
+        route: &route,
+        hidden: hidden as u32,
+        inter: inter as u32,
+        n_expert: case.n_expert as u32,
+        n_used: case.n_used as u32,
+    }
+    .launch(gpu, st);
+    drain(gpu);
+    [gpu.read_f32(&og), gpu.read_f32(&ou), gpu.read_f32(&od)]
+}
+
+/// One routing of an invariance case.
+struct Case<'a> {
+    ids: &'a [i32],
+    map: &'a [u32],
+    x: &'a [f32],
+    mid: &'a [f32],
+    hidden: usize,
+    inter: usize,
+    n_expert: usize,
+    n_used: usize,
+}
+
+/// A row of `st` computed alone and inside a wider pass must be the same
+/// bits: the first token's columns, routed alone, and again as the first of
+/// `n_tok` tokens whose other columns land on the same experts (and on
+/// others), so a stage whose sums depended on how many columns share an
+/// expert, or on where a column sits in its expert's span, shows here.
+fn invariant(gpu: &Gpu, st: &Stages, n_tok: usize) {
+    let (hidden, inter, n_expert, n_used, slots) = (2560usize, 640usize, 32usize, 4usize, 8usize);
+    let banks = [
+        Bank::new(slots, inter, hidden, 171).upload(gpu),
+        Bank::new(slots, inter, hidden, 172).upload(gpu),
+        Bank::new(slots, hidden, inter, 173).upload(gpu),
+    ];
+    let map: Vec<u32> = (0..n_expert as u32)
+        .map(|e| (e * 5 + 3) % slots as u32)
+        .collect();
+    // Token 0 takes experts 3, 7, 11, 30; every later token shares two of them
+    // and adds two of its own, so the shared experts' spans grow with the pass
+    // and token 0's column is not always first in them.
+    let mut ids = vec![3i32, 7, 11, 30];
+    for t in 1..n_tok as i32 {
+        ids.extend([(t * 13) % 32, 7, (t * 7 + 1) % 32, 3]);
+    }
+    // Duplicates inside a token are not a routing the router produces.
+    for t in 1..n_tok {
+        let row = &mut ids[t * n_used..(t + 1) * n_used];
+        for i in 0..n_used {
+            while row[..i].contains(&row[i]) {
+                row[i] = (row[i] + 1) % 32;
+            }
+        }
+    }
+    let cols = ids.len();
+    let x = signal(n_tok * hidden, 181);
+    let mid = signal(cols * inter, 182);
+    let wide = outputs(
+        gpu,
+        st,
+        &banks,
+        &Case {
+            ids: &ids,
+            map: &map,
+            x: &x,
+            mid: &mid,
+            hidden,
+            inter,
+            n_expert,
+            n_used,
+        },
+    );
+    let alone = outputs(
+        gpu,
+        st,
+        &banks,
+        &Case {
+            ids: &ids[..n_used],
+            map: &map,
+            x: &x[..hidden],
+            mid: &mid[..n_used * inter],
+            hidden,
+            inter,
+            n_expert,
+            n_used,
+        },
+    );
+    for (what, (w, a), width) in [
+        ("gate", (&wide[0], &alone[0]), inter),
+        ("up", (&wide[1], &alone[1]), inter),
+        ("down", (&wide[2], &alone[2]), hidden),
+    ] {
+        for (i, (p, q)) in w[..n_used * width].iter().zip(a).enumerate() {
+            assert_eq!(
+                p.to_bits(),
+                q.to_bits(),
+                "{}: {what} {i}: {p} in a pass of {n_tok} tokens vs {q} alone",
+                st.gate_up
+            );
+        }
+    }
+}
+
+/// A verify row equals the single-step row bit for bit, through the step
+/// kernels: speculative decoding accepts a drafted token only if the target
+/// would have produced it alone.
+pub fn the_nvfp4_step_rows_do_not_depend_on_the_pass(gpu: &Gpu) {
+    for n_tok in [2, 5, 8] {
+        invariant(gpu, &STEP, n_tok);
+    }
+}
+
+/// A prompt column equals itself computed in a narrower chunk, bit for bit,
+/// through the prompt kernels, at widths that fill one tile of an expert and
+/// spill into several.
+pub fn the_nvfp4_prompt_columns_do_not_depend_on_the_chunk(gpu: &Gpu) {
+    for n_tok in [3, 40, 200] {
+        invariant(gpu, &PROMPT, n_tok);
+    }
+}
+
+/// One NVFP4 bank's three host arrays, every slot back to back, as a caller
+/// puts them on the device.
+#[derive(Debug, Clone, Copy)]
+pub struct BankArrays<'a> {
+    /// Packed four-bit codes, `slots * out_dim * in_dim / 2` bytes.
+    pub codes: &'a [u8],
+    /// `e4m3` group scales, `slots * out_dim * in_dim / 16` bytes.
+    pub scales: &'a [u8],
+    /// One `f32` global per slot, little-endian.
+    pub globals: &'a [u8],
+    /// Matrices in the bank.
+    pub slots: u32,
+    /// Contraction width of one matrix.
+    pub in_dim: u32,
+    /// Output width of one matrix.
+    pub out_dim: u32,
+}
+
+/// Both NVFP4 step stages over banks the caller places on the device - the
+/// engine's resident bank type, in the CUDA driver - through the identity
+/// expert-to-slot map a resident bank is read with, at four experts of this
+/// family's widths, against the host restatement of the decode.
+///
+/// `place` puts one bank on the device; `parts` hands back its codes, group
+/// scales and globals, in that order. The case is the one
+/// [`the_nvfp4_expert_stages_follow_the_slot_map`] runs over plain buffers,
+/// so a resident bank whose slots were laid out other than a streamed slot
+/// pool's would read a neighbouring expert's rows or its global here.
+pub fn the_nvfp4_stages_read_a_placed_bank<B>(
+    gpu: &Gpu,
+    place: impl Fn(&Gpu, BankArrays<'_>) -> B,
+    parts: impl for<'a> Fn(&'a B) -> [DeviceView<'a>; 3],
+) {
+    let (hidden, inter, n_expert, n_used) = (2560usize, 640usize, 4usize, 2usize);
+    let gate = Bank::new(n_expert, inter, hidden, 91);
+    let up = Bank::new(n_expert, inter, hidden, 92);
+    let down = Bank::new(n_expert, hidden, inter, 93);
+    let placed = |bank: &Bank| {
+        place(
+            gpu,
+            BankArrays {
+                codes: &bank.codes,
+                scales: &bank.scales,
+                globals: &f32_bytes(&bank.globals),
+                slots: n_expert as u32,
+                in_dim: bank.in_dim as u32,
+                out_dim: bank.out_dim as u32,
+            },
+        )
+    };
+    let (gate_b, up_b, down_b) = (placed(&gate), placed(&up), placed(&down));
+    // Three tokens, two experts each, every expert used and the last slot
+    // twice, so a stride error past slot 0 cannot hide.
+    let ids: Vec<i32> = vec![3, 1, 0, 3, 2, 1];
+    let n_tok = ids.len() / n_used;
+    let map: Vec<u32> = (0..n_expert as u32).collect();
+    let x = signal(n_tok * hidden, 97);
+    let xs = gpu.upload(&f32_bytes(&x));
+    let cols = ids.len();
+    let route = Route::new(&ids, n_expert).upload(gpu, &map, cols);
+    let og = gpu.upload(&vec![0u8; cols * inter * 4]);
+    let ou = gpu.upload(&vec![0u8; cols * inter * 4]);
+    GateUp {
+        out_gate: og.view(),
+        out_up: ou.view(),
+        gate: parts(&gate_b),
+        up: parts(&up_b),
+        x: xs.view(),
+        route: &route,
+        hidden: hidden as u32,
+        inter: inter as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+    }
+    .launch(gpu, &STEP);
+    drain(gpu);
+    let got_g = gpu.read_f32(&og);
+    let got_u = gpu.read_f32(&ou);
+    let mut mid = vec![0f32; cols * inter];
+    for (col, &e) in ids.iter().enumerate() {
+        let xr = &x[(col / n_used) * hidden..(col / n_used + 1) * hidden];
+        let g = gate.project(e as usize, xr);
+        let u = up.project(e as usize, xr);
+        close(
+            "resident gate",
+            &got_g[col * inter..(col + 1) * inter],
+            &g,
+            STEP.rel,
+        );
+        close(
+            "resident up",
+            &got_u[col * inter..(col + 1) * inter],
+            &u,
+            STEP.rel,
+        );
+        for i in 0..inter {
+            mid[col * inter + i] = g[i] / (1.0 + (-g[i]).exp()) * u[i];
+        }
+    }
+    let mid_b = gpu.upload(&f32_bytes(&mid));
+    let od = gpu.upload(&vec![0u8; cols * hidden * 4]);
+    Down {
+        out: od.view(),
+        weights: parts(&down_b),
+        mid: mid_b.view(),
+        route: &route,
+        hidden: hidden as u32,
+        inter: inter as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+    }
+    .launch(gpu, &STEP);
+    drain(gpu);
+    let got_d = gpu.read_f32(&od);
+    for (col, &e) in ids.iter().enumerate() {
+        let want = down.project(e as usize, &mid[col * inter..(col + 1) * inter]);
+        close(
+            "resident down",
+            &got_d[col * hidden..(col + 1) * hidden],
+            &want,
+            STEP.rel,
+        );
+    }
+}
+
+// --- bench -------------------------------------------------------------------
+
+/// This family's routed shape: hidden width, expert intermediate width,
+/// experts, experts a token.
+const BENCH_SHAPE: (u32, u32, u32, u32) = (2560, 640, 512, 10);
+
+/// Routings a step fixture cycles through, so consecutive launches touch
+/// different experts and none finds its weights in the last-level cache.
+const BENCH_STEP_ROUTINGS: u64 = 8;
+
+/// A tiny deterministic generator for the bench routings.
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// A prompt-like routing: `n_used` distinct experts a token drawn from a
+/// Zipf-like law (`p ∝ 1 / (rank + 20)`) over a shuffled expert order, with
+/// eight experts never chosen. At 2,048 tokens of ten experts over 512 this
+/// gives a median of about 22 columns an expert, a tenth below 12, and a few
+/// above 300 - the spread a real prompt's router produces.
+fn bench_routing(n_tok: u32, seed: u64) -> Vec<i32> {
+    let (_, _, n_expert, n_used) = BENCH_SHAPE;
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut order: Vec<i32> = (0..n_expert as i32).collect();
+    for i in (1..order.len()).rev() {
+        let j = (xorshift(&mut state) % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    let live = n_expert as usize - 8;
+    let mut cdf = Vec::with_capacity(live);
+    let mut total = 0.0f64;
+    for rank in 0..live {
+        total += 1.0 / (rank as f64 + 20.0);
+        cdf.push(total);
+    }
+    let mut ids = Vec::with_capacity((n_tok * n_used) as usize);
+    for _ in 0..n_tok {
+        let start = ids.len();
+        while ids.len() - start < n_used as usize {
+            let u = (xorshift(&mut state) >> 11) as f64 / (1u64 << 53) as f64 * total;
+            let rank = cdf.partition_point(|&c| c < u).min(live - 1);
+            let e = order[rank];
+            if !ids[start..].contains(&e) {
+                ids.push(e);
+            }
+        }
+    }
+    ids
+}
+
+/// One bench bank of `slots` matrices on the device, filled from a repeated
+/// pseudo-random pattern so no host copy of the whole bank is ever held.
+fn bench_bank(gpu: &Gpu, slots: u32, out_dim: u32, in_dim: u32, seed: u32) -> [DeviceBuffer; 3] {
+    let fill = |bytes: u64, salt: u32, scale_bytes: bool| {
+        let buf = alloc(gpu.device(), bytes).expect("device allocation");
+        let chunk_len = bytes.min(16 << 20);
+        let chunk: Vec<u8> = signal(chunk_len as usize, seed ^ salt)
+            .iter()
+            .map(|v| {
+                let b = (v.abs() * 9973.0) as u32;
+                // Scales stay in a narrow normal band so the sums stay finite.
+                if scale_bytes {
+                    (0x30 + b % 0x10) as u8
+                } else {
+                    (b & 0xFF) as u8
+                }
+            })
+            .collect();
+        let mut at = 0;
+        while at < bytes {
+            let len = chunk_len.min(bytes - at);
+            gpu.device()
+                .copy_h2d(
+                    buf.slice(at, len).expect("inside the buffer"),
+                    &chunk[..len as usize],
+                )
+                .expect("host-to-device copy");
+            at += len;
+        }
+        buf
+    };
+    let rows = u64::from(slots) * u64::from(out_dim);
+    let globals: Vec<f32> = (0..slots)
+        .map(|s| 1.0e-2 * (1.0 + (s % 7) as f32 * 0.1))
+        .collect();
+    [
+        fill(rows * u64::from(in_dim) / 2, 0x11, false),
+        fill(rows * u64::from(in_dim) / 16, 0x22, true),
+        gpu.upload(&f32_bytes(&globals)),
+    ]
+}
+
+/// A zeroed device buffer of `bytes`.
+fn zeroed(gpu: &Gpu, bytes: u64) -> DeviceBuffer {
+    let buf = alloc(gpu.device(), bytes).expect("device allocation");
+    gpu.device().fill_zero(buf.view()).expect("zero fill");
+    buf
+}
+
+/// Bytes of one matrix of a bank: codes and group scales.
+const fn matrix_bytes(out_dim: u32, in_dim: u32) -> u64 {
+    out_dim as u64 * in_dim as u64 / 2 + out_dim as u64 * in_dim as u64 / 16
+}
+
+/// Which stage a bench fixture times.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    GateUp,
+    Down,
+}
+
+/// One stage of `st` over `n_tok` tokens of the bench routing, cycling
+/// through `routings` routings. Bytes are the distinct experts' matrices (the
+/// floor: each read once) plus the activations in and the outputs out; flops
+/// are the routed columns' products.
+fn bench_stage(gpu: &Gpu, st: Stages, stage: Stage, n_tok: u32, routings: u64) -> Fixture {
+    let (hidden, inter, n_expert, n_used) = BENCH_SHAPE;
+    let cols = n_tok * n_used;
+    let map: Vec<u32> = (0..n_expert).collect();
+    let routes: Vec<(Route, DevRoute)> = (0..routings)
+        .map(|seed| {
+            let route = Route::new(&bench_routing(n_tok, seed + 1), n_expert as usize);
+            let dev = route.upload(gpu, &map, cols as usize);
+            (route, dev)
+        })
+        .collect();
+    let distinct = routes.iter().map(|(r, _)| r.distinct() as u64).sum::<u64>() / routings;
+    let col_bytes = u64::from(cols) * 4;
+    let next = std::cell::Cell::new(0usize);
+    match stage {
+        Stage::GateUp => {
+            let gate = bench_bank(gpu, n_expert, inter, hidden, 0x6A7E);
+            let up = bench_bank(gpu, n_expert, inter, hidden, 0x0B0B);
+            let x = gpu.upload(&f32_bytes(&signal((n_tok * hidden) as usize, 0x5EED)));
+            let og = zeroed(gpu, col_bytes * u64::from(inter));
+            let ou = zeroed(gpu, col_bytes * u64::from(inter));
+            let bytes = distinct * 2 * matrix_bytes(inter, hidden)
+                + u64::from(n_tok * hidden) * 4
+                + 2 * col_bytes * u64::from(inter);
+            let flops = 2 * 2 * u64::from(cols) * u64::from(inter) * u64::from(hidden);
+            Fixture::new(bytes, flops, move |gpu| {
+                let (_, route) = &routes[next.get() % routes.len()];
+                next.set(next.get().wrapping_add(1));
+                GateUp {
+                    out_gate: og.view(),
+                    out_up: ou.view(),
+                    gate: views(&gate),
+                    up: views(&up),
+                    x: x.view(),
+                    route,
+                    hidden,
+                    inter,
+                    n_expert,
+                    n_used,
+                }
+                .launch(gpu, &st);
+            })
+        }
+        Stage::Down => {
+            let down = bench_bank(gpu, n_expert, hidden, inter, 0xD0D0);
+            let mid = gpu.upload(&f32_bytes(&signal((cols * inter) as usize, 0x3EED)));
+            let od = zeroed(gpu, col_bytes * u64::from(hidden));
+            let bytes = distinct * matrix_bytes(hidden, inter)
+                + col_bytes * u64::from(inter)
+                + col_bytes * u64::from(hidden);
+            let flops = 2 * u64::from(cols) * u64::from(inter) * u64::from(hidden);
+            Fixture::new(bytes, flops, move |gpu| {
+                let (_, route) = &routes[next.get() % routes.len()];
+                next.set(next.get().wrapping_add(1));
+                Down {
+                    out: od.view(),
+                    weights: views(&down),
+                    mid: mid.view(),
+                    route,
+                    hidden,
+                    inter,
+                    n_expert,
+                    n_used,
+                }
+                .launch(gpu, &st);
+            })
+        }
+    }
+}
+
+/// The step gate-and-up stage at one decode token.
+pub(crate) fn bench_step_gate_up_t1(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, STEP, Stage::GateUp, 1, BENCH_STEP_ROUTINGS)
+}
+
+/// The step gate-and-up stage at a speculative verify of five tokens.
+pub(crate) fn bench_step_gate_up_t5(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, STEP, Stage::GateUp, 5, BENCH_STEP_ROUTINGS)
+}
+
+/// The step gate-and-up stage at eight tokens.
+pub(crate) fn bench_step_gate_up_t8(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, STEP, Stage::GateUp, 8, BENCH_STEP_ROUTINGS)
+}
+
+/// The step down stage at one decode token.
+pub(crate) fn bench_step_down_t1(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, STEP, Stage::Down, 1, BENCH_STEP_ROUTINGS)
+}
+
+/// The step down stage at a speculative verify of five tokens.
+pub(crate) fn bench_step_down_t5(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, STEP, Stage::Down, 5, BENCH_STEP_ROUTINGS)
+}
+
+/// The step down stage at eight tokens.
+pub(crate) fn bench_step_down_t8(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, STEP, Stage::Down, 8, BENCH_STEP_ROUTINGS)
+}
+
+/// The prompt gate-and-up stage over a 2,048-token chunk.
+pub(crate) fn bench_prompt_gate_up_2048(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, PROMPT, Stage::GateUp, 2048, 1)
+}
+
+/// The prompt down stage over a 2,048-token chunk.
+pub(crate) fn bench_prompt_down_2048(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, PROMPT, Stage::Down, 2048, 1)
+}
+
+/// The prompt gate-and-up stage over a 4,096-token chunk.
+pub(crate) fn bench_prompt_gate_up_4096(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, PROMPT, Stage::GateUp, 4096, 1)
+}
+
+/// The prompt down stage over a 4,096-token chunk.
+pub(crate) fn bench_prompt_down_4096(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, PROMPT, Stage::Down, 4096, 1)
 }
