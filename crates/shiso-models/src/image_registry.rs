@@ -66,6 +66,9 @@ pub enum ImageFamily {
     Flux2,
     /// The Qwen-Image-2.1 single-stream-per-block `MMDiT` family.
     QwenImage21,
+    /// The distilled FLUX.3 Klein family: per-mode block stacks, a
+    /// single-stream tail and a flow-map sampler.
+    Flux3,
 }
 
 /// The tensor prefix a diffusion checkpoint may nest its transformer under.
@@ -81,6 +84,10 @@ const QWEN_IMAGE21_SIGNATURE: &str = "'transformer_blocks.0.attn.to_q.weight' pl
      the shared 'modulation.1.weight' or a per-block 'transformer_blocks.0.*modulation.1.weight' \
      or '*_mod.1.weight' (optionally under 'model.diffusion_model.')";
 
+/// The signature the third family looks for, spelled for the refusal message.
+const FLUX3_SIGNATURE: &str =
+    "'content_mode_blocks.image.0.q_proj.weight' plus 'txt_mode_blocks.0.q_proj.weight'";
+
 /// Decides which family `desc.model_path` holds.
 ///
 /// Reads safetensors headers only (a file, or every `*.safetensors` in a
@@ -90,23 +97,49 @@ const QWEN_IMAGE21_SIGNATURE: &str = "'transformer_blocks.0.attn.to_q.weight' pl
 ///
 /// # Errors
 /// [`ImageGenError::Checkpoint`] if the headers cannot be read, no family's
-/// signature matches (the message lists both), or more than one does.
+/// signature matches (the message lists all of them), or more than one does.
 pub fn detect_image_family(desc: &ImageModelDesc) -> Result<ImageFamily, ImageGenError> {
     let names = tensor_names(&desc.model_path)?;
-    let flux2 = looks_like_flux2(&names);
-    let qwen = looks_like_qwen_image21(&names);
-    match (flux2, qwen) {
-        (true, false) => Ok(ImageFamily::Flux2),
-        (false, true) => Ok(ImageFamily::QwenImage21),
-        (true, true) => Err(ImageGenError::Checkpoint(format!(
-            "{} matches both the flux2 signature ({FLUX2_SIGNATURE}) and the qwen_image21 \
-             signature ({QWEN_IMAGE21_SIGNATURE}); refusing to guess",
+    let matched: Vec<(ImageFamily, &str, &str)> = [
+        (
+            looks_like_flux2(&names),
+            ImageFamily::Flux2,
+            "flux2",
+            FLUX2_SIGNATURE,
+        ),
+        (
+            looks_like_qwen_image21(&names),
+            ImageFamily::QwenImage21,
+            "qwen_image21",
+            QWEN_IMAGE21_SIGNATURE,
+        ),
+        (
+            looks_like_flux3(&names),
+            ImageFamily::Flux3,
+            "flux3",
+            FLUX3_SIGNATURE,
+        ),
+    ]
+    .into_iter()
+    .filter(|(hit, ..)| *hit)
+    .map(|(_, family, name, signature)| (family, name, signature))
+    .collect();
+    match matched.as_slice() {
+        [(family, ..)] => Ok(*family),
+        [] => Err(ImageGenError::Checkpoint(format!(
+            "{} is not a known image checkpoint: looked for the flux2 signature \
+             ({FLUX2_SIGNATURE}), the qwen_image21 signature ({QWEN_IMAGE21_SIGNATURE}) and \
+             the flux3 signature ({FLUX3_SIGNATURE})",
             desc.model_path.display()
         ))),
-        (false, false) => Err(ImageGenError::Checkpoint(format!(
-            "{} is not a known image checkpoint: looked for the flux2 signature \
-             ({FLUX2_SIGNATURE}) and the qwen_image21 signature ({QWEN_IMAGE21_SIGNATURE})",
-            desc.model_path.display()
+        several => Err(ImageGenError::Checkpoint(format!(
+            "{} matches the signatures of {}; refusing to guess",
+            desc.model_path.display(),
+            several
+                .iter()
+                .map(|(_, name, signature)| format!("{name} ({signature})"))
+                .collect::<Vec<_>>()
+                .join(" and ")
         ))),
     }
 }
@@ -148,6 +181,14 @@ pub fn open_image_generator(
             let model = crate::qwen_image21::pipeline::QwenImage21Model::load(desc, backend)?;
             Ok(Arc::new(model))
         }
+        ImageFamily::Flux3 => {
+            // Swap residency is the flux3 pipeline's own; the draft stage and
+            // block reuse are refused by the locator.
+            crate::flux3::config::locate_and_inspect(desc)?;
+            Err(ImageGenError::Checkpoint(
+                "the flux3 pipeline is not wired into this build yet".to_owned(),
+            ))
+        }
     }
 }
 
@@ -168,6 +209,13 @@ fn looks_like_flux2(names: &HashSet<String>) -> bool {
         bare.starts_with("double_blocks.") || bare.starts_with("single_blocks.")
     });
     stem && blocks
+}
+
+/// The first per-mode image block and the first text block: no other
+/// family names its blocks per mode.
+fn looks_like_flux3(names: &HashSet<String>) -> bool {
+    has(names, "content_mode_blocks.image.0.q_proj.weight")
+        && has(names, "txt_mode_blocks.0.q_proj.weight")
 }
 
 /// Block zero's query projection and a modulation linear, with or without
