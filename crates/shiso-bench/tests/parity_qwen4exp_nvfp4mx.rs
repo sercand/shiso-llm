@@ -254,15 +254,28 @@ fn the_brain_float_reference_rows_agree_on_the_answer() {
 }
 
 /// The prompt passes with low-precision activations (NVFP4 into the routed
-/// experts, MXFP8 into the dense projections), graded against the same library
-/// reference: what the activation quantization costs on real prompts.
+/// experts, MXFP8 into the dense projections), graded against the served
+/// reference as its checkpoint card runs it - which quantizes prompt
+/// activations the same way - with the library reference printed.
+///
+/// Not graded against the library reference: activation quantization costs
+/// both servers about the same there (the served reference itself shares 3 of
+/// the library's top 5 on `short_italian_fact` and 15 of its top 20 on
+/// `short_code_completion`), so a floor that the published configuration fails
+/// would measure the format, not this port.
 #[test]
 #[ignore = "needs the local Qwen3.8-Flash-Next FP4-Local export and a device"]
-fn low_precision_prompt_rows_agree_with_the_library_reference() {
+fn low_precision_prompt_rows_agree_with_the_served_reference() {
     replay_as(
-        GOLDEN_HF,
+        GOLDEN,
         &[&FLOOR],
         &[&MLX_REFERENCE, &REFERENCE],
+        PrefillActivations::Lowp,
+    );
+    replay_as(
+        GOLDEN_HF,
+        &[],
+        &[&FLOOR, &MLX_REFERENCE],
         PrefillActivations::Lowp,
     );
 }
