@@ -14,3 +14,7 @@
 #include "elementwise.cu"
 #include "kquant.cuh"
 #include "gemm.cu"
+#include "norm.cu"
+#include "attention.cu"
+#include "rope.cu"
+#include "conv.cu"

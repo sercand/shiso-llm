@@ -18,15 +18,25 @@ the source, not pasted from compiled PTX.** The first CUDA build should replace
 this with the output of
 `grep -o '\.visible \.entry [^(]*' <module>.ptx` (module `diffusion`).
 
-## Module `diffusion` - 40 entries
+## Module `diffusion` - 59 entries
 
 ```
 kernel_dit_add_f32
 kernel_dit_add_gated_f32
 kernel_dit_axpy_f32
+kernel_dit_channel_rms_inv_f32
 kernel_dit_concat_rows_f32
+kernel_dit_conv2d_f32
+kernel_dit_conv2d_gemm_f32
+kernel_dit_conv2d_rms_gemm_f32
+kernel_dit_conv2d_up2_gemm_f32
 kernel_dit_dup_up_add_f32
 kernel_dit_embed_bf16_f32
+kernel_dit_flash_sdpa_causal_d128_f32
+kernel_dit_flash_sdpa_causal_f32
+kernel_dit_flash_sdpa_d128_f32
+kernel_dit_flash_sdpa_f32
+kernel_dit_gelu_tanh_f32
 kernel_dit_gemm64_bf16
 kernel_dit_gemm64_f32
 kernel_dit_gemm64_fp8
@@ -51,16 +61,25 @@ kernel_dit_gemm_bf16
 kernel_dit_gemm_f32
 kernel_dit_gemm_fp8
 kernel_dit_gemm_i8
+kernel_dit_gqa_f32
+kernel_dit_group_norm_apply_f32
+kernel_dit_group_norm_stats_f32
 kernel_dit_hadamard256_f32
 kernel_dit_layer_norm_f32
 kernel_dit_modulate_f32
 kernel_dit_qk_norm_f32
+kernel_dit_qk_norm_rope_f32
 kernel_dit_rmsnorm_f32
+kernel_dit_rope_4d
+kernel_dit_rope_half
+kernel_dit_sdpa_f32
 kernel_dit_silu_f32
 kernel_dit_softmax_rows_f32
 kernel_dit_swiglu2_f32
 kernel_dit_swiglu_f32
+kernel_dit_tanh_f32
 kernel_dit_transpose_f32
+kernel_dit_upsample_nearest_f32
 ```
 
 ## Translation unit

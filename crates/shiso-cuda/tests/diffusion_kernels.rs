@@ -16,7 +16,7 @@ use std::sync::Arc;
 use shiso_core::{Backend, KernelRef};
 use shiso_cuda::{CudaBackend, CudaOptions};
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::diffusion::{int8, kquant};
+use shiso_kerneltest::diffusion::{int8, kquant, prefix, vae};
 
 /// The module every diffusion entry lives under.
 const MODULE: &str = "diffusion";
@@ -72,10 +72,12 @@ macro_rules! cases {
 
 #[test]
 #[ignore = "requires a CUDA device"]
-fn the_int8_and_kquant_entries_resolve_on_the_device() {
+fn every_shared_case_entry_resolves_on_the_device() {
     let Some(gpu) = open() else { return };
     assert_entries_resolve(&gpu, &int8::ENTRIES);
     assert_entries_resolve(&gpu, &kquant::ENTRIES);
+    assert_entries_resolve(&gpu, &vae::ENTRIES);
+    assert_entries_resolve(&gpu, &prefix::ENTRIES);
 }
 
 cases!(int8:
@@ -100,4 +102,19 @@ cases!(kquant:
     gemm64_fused_q5k_is_the_unfused_composition,
     gemm64_fused_q6k_is_the_unfused_composition,
     gemm64_fused_q8_0_is_the_unfused_composition,
+);
+
+cases!(vae:
+    channel_rms_inv_is_the_scaled_inverse_pixel_norm,
+    conv2d_rms_is_the_conv_of_the_normalized_activated_field,
+    conv2d_up2_is_the_conv_of_the_upsampled_field,
+    dup_up_add_matches_the_reshaped_shortcut,
+);
+
+cases!(prefix:
+    flash_sdpa_causal_masks_every_later_key,
+    qk_norm_rope_normalizes_then_turns_adjacent_pairs,
+    tanh_and_gelu_tanh_match_their_formulas,
+    gqa_valid_keys_masks_pad_keys,
+    rope_half_pins_trailing_rows_to_one_position,
 );
