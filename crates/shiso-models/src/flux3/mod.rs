@@ -16,6 +16,7 @@ pub mod config;
 pub(crate) mod pack;
 pub(crate) mod scheduler;
 pub(crate) mod text_encoder;
+pub(crate) mod transformer;
 
 use crate::catalog::FamilyFacts;
 
@@ -30,3 +31,5 @@ mod pack_tests;
 mod scheduler_tests;
 #[cfg(test)]
 mod text_encoder_tests;
+#[cfg(test)]
+mod transformer_tests;
