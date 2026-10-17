@@ -61,6 +61,17 @@ pub struct ImageLimits {
     pub fixed_steps: Option<u32>,
 }
 
+/// The refusal's closing clause: the largest square that fits, or the plain
+/// fact that none does (the weights alone are over the budget), rather than
+/// naming a 0x0 image.
+fn largest_fit(side: u32) -> String {
+    if side == 0 {
+        "no image size fits: the weights that must be loaded together are over it".to_owned()
+    } else {
+        format!("the largest square image that fits is {side}x{side}")
+    }
+}
+
 /// Errors occurring during image generation job preparation or execution.
 #[derive(Debug, thiserror::Error)]
 pub enum ImageGenError {
@@ -145,8 +156,7 @@ pub enum ImageGenError {
     /// image fits.
     #[error(
         "a {width}x{height} image needs about {needed_mib} MiB at its peak, over this \
-         host's {budget_mib} MiB budget; the largest square image that fits is \
-         {largest_side}x{largest_side}"
+         host's {budget_mib} MiB budget; {}", largest_fit(*largest_side)
     )]
     TooLargeForMemory {
         /// Width in pixels.
