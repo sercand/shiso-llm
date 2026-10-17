@@ -1207,6 +1207,105 @@ struct dit_wrows_q6k {
     }
 };
 
+/// Q2_K (84 bytes): `uchar scales[16]; uchar qs[64]; half d, dmin`. Two
+/// planes of 128 weights, each four runs of 32 at bit shifts 0, 2, 4, 6 of
+/// the plane's 32 `qs` bytes; every 16 weights have a scale nibble (low) and
+/// a min nibble (high) in `scales[8 * plane + 2 * run + half]`, and the
+/// weight is `d * sc * q - dmin * m`. Four weights from a 4-aligned `kk`
+/// share one 16-run, so one load decodes one scale/min pair.
+struct dit_wrows_q2k {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        device const uchar *b = w + (uint64_t) n * (k / 256u) * 84u + (kk / 256u) * 84u;
+        const uint i = kk % 256u;
+        const uint plane = i / 128u;
+        const uint run = (i % 128u) / 32u;
+        const uint within = i % 32u;
+        const uint sc = b[8u * plane + 2u * run + within / 16u];
+        const float d = float(*((device const half *) (b + 80))) * float(sc & 0xFu);
+        const float m = float(*((device const half *) (b + 82))) * float(sc >> 4u);
+        const uchar4 q = uchar4(*((device const packed_uchar4 *) (b + 16u + 32u * plane + within)));
+        return d * float4((uint4(q) >> (2u * run)) & 3u) - m;
+    }
+};
+
+/// Q3_K (110 bytes): `uchar hmask[32]; uchar qs[64]; uchar scales[12]; half
+/// d`. The 2-bit codes lay out as in Q2_K; the third bit is the inverted
+/// `hmask` bit `4 * plane + run` of byte `within`, so a clear bit subtracts
+/// 4. The sixteen 6-bit scales (minus 32) keep their low nibbles in
+/// `scales[0..8]` (low then high nibble for scales 0..8 and 8..16) and
+/// their top two bits in `scales[8..12]`; the weight is `d * scale * q`.
+struct dit_wrows_q3k {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        device const uchar *b = w + (uint64_t) n * (k / 256u) * 110u + (kk / 256u) * 110u;
+        const uint i = kk % 256u;
+        const uint plane = i / 128u;
+        const uint run = (i % 128u) / 32u;
+        const uint within = i % 32u;
+        const uint is = 8u * plane + 2u * run + within / 16u;
+        device const uchar *sc = b + 96;
+        const uint low = is < 8u ? (uint(sc[is]) & 0xFu) : (uint(sc[is - 8u]) >> 4u);
+        const uint high = (uint(sc[8u + (is & 3u)]) >> (2u * (is >> 2u))) & 3u;
+        const float d = float(*((device const half *) (b + 108))) * float(int(low | (high << 4u)) - 32);
+        const uchar4 q = uchar4(*((device const packed_uchar4 *) (b + 32u + 32u * plane + within)));
+        const uchar4 h = uchar4(*((device const packed_uchar4 *) (b + within)));
+        const int4 lo = int4((uint4(q) >> (2u * run)) & 3u);
+        const int4 set = int4((uint4(h) >> (4u * plane + run)) & 1u);
+        return d * float4(lo - 4 + 4 * set);
+    }
+};
+
+/// Q5_K (176 bytes): `half d, dmin; uchar scales[12]; uchar qh[32]; uchar
+/// qs[128]`. Q4_K's runs and scale/min packing, plus a fifth bit: bit
+/// `2 * chunk` (low nibbles) or `2 * chunk + 1` (high nibbles) of `qh[l]`
+/// adds 16 to the code.
+struct dit_wrows_q5k {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        device const uchar *b = w + (uint64_t) n * (k / 256u) * 176u + (kk / 256u) * 176u;
+        const uint i = kk % 256u;
+        const uint chunk = i / 64u;
+        const uint within = i % 64u;
+        const uint high_half = within >= 32u ? 1u : 0u;
+        const uint sub = 2u * chunk + high_half;
+        device const uchar *sc = b + 4;
+        uint scale;
+        uint min;
+        if (sub < 4u) {
+            scale = sc[sub] & 63u;
+            min = sc[sub + 4u] & 63u;
+        } else {
+            scale = (sc[sub + 4u] & 0xFu) | ((sc[sub - 4u] >> 6u) << 4u);
+            min = (sc[sub + 4u] >> 4u) | ((sc[sub] >> 6u) << 4u);
+        }
+        const float d = float(*((device const half *) b)) * float(scale);
+        const float m = float(*((device const half *) (b + 2))) * float(min);
+        const uint l = within % 32u;
+        const uchar4 q = uchar4(*((device const packed_uchar4 *) (b + 48u + 32u * chunk + l)));
+        const uchar4 qh = uchar4(*((device const packed_uchar4 *) (b + 16u + l)));
+        const uint4 nib = high_half != 0u ? uint4(q) >> 4u : uint4(q) & 0xFu;
+        const uint4 bit = (uint4(qh) >> (2u * chunk + high_half)) & 1u;
+        return d * float4(nib | (bit << 4u)) - m;
+    }
+};
+
+/// Q8_0 (34 bytes): `half d; char qs[32]`; the weight is `d * q`. Rows are
+/// `k / 32` blocks, and a 4-aligned `kk` never straddles one.
+struct dit_wrows_q8_0 {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        device const uchar *b = w + (uint64_t) n * (k / 32u) * 34u + (kk / 32u) * 34u;
+        const float d = float(*((device const half *) b));
+        const char4 q = char4(*((device const packed_char4 *) (b + 2u + kk % 32u)));
+        return d * float4(q);
+    }
+};
+
 /// A linear's epilogue: `out[r][c] = acc * scale(c) + bias[c]`, the bias read
 /// only when the driver's presence flag says the binding is real.
 template <typename SC>
@@ -1407,6 +1506,40 @@ kernel void kernel_dit_gemm64_q6k(DIT_GEMM64_PARAMS(uchar)) {
     threadgroup float smem[DIT_G64_SMEM];
     dit_gemm64_tile(args.m, args.n, args.k,
                       dit_rows_f32{in, args.k}, dit_wrows_q6k{weight, args.k},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+/// The same tile over GGUF Q2_K, Q3_K, Q5_K and Q8_0 weights (`k % 256 == 0`,
+/// `k % 32 == 0` for Q8_0); binding 4 is the unit scale.
+kernel void kernel_dit_gemm64_q2k(DIT_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_q2k{weight, args.k},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_dit_gemm64_q3k(DIT_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_q3k{weight, args.k},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_dit_gemm64_q5k(DIT_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_q5k{weight, args.k},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_dit_gemm64_q8_0(DIT_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_q8_0{weight, args.k},
                       dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
                       smem, tgpig, tid, lane, sg);
 }
@@ -1893,6 +2026,22 @@ kernel void kernel_dit_gemm64_fused_q4k(DIT_GEMM_FUSED_PARAMS(uchar)) {
 
 kernel void kernel_dit_gemm64_fused_q6k(DIT_GEMM_FUSED_PARAMS(uchar)) {
     DIT_GEMM_FUSED_BODY(dit_wrows_q6k)
+}
+
+kernel void kernel_dit_gemm64_fused_q2k(DIT_GEMM_FUSED_PARAMS(uchar)) {
+    DIT_GEMM_FUSED_BODY(dit_wrows_q2k)
+}
+
+kernel void kernel_dit_gemm64_fused_q3k(DIT_GEMM_FUSED_PARAMS(uchar)) {
+    DIT_GEMM_FUSED_BODY(dit_wrows_q3k)
+}
+
+kernel void kernel_dit_gemm64_fused_q5k(DIT_GEMM_FUSED_PARAMS(uchar)) {
+    DIT_GEMM_FUSED_BODY(dit_wrows_q5k)
+}
+
+kernel void kernel_dit_gemm64_fused_q8_0(DIT_GEMM_FUSED_PARAMS(uchar)) {
+    DIT_GEMM_FUSED_BODY(dit_wrows_q8_0)
 }
 
 /// The same fused linear over a per-row INT8 weight; binding 5 is the

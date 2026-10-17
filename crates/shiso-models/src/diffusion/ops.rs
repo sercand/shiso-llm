@@ -410,24 +410,29 @@ pub(crate) fn check_reduction(
     }
 }
 
-/// The tiled GEMM entry for a block-stored kind, once the device has one.
-///
-/// A kind whose entry is not registered in [`REQUIRED_KERNELS`] answers
-/// `None`, and the caller refuses instead of launching a name the probe never
-/// checked.
+/// The tiled GEMM entry for a block-stored kind: the plain one, or the fused
+/// residual one. `None` for a kind that is not stored in blocks.
 fn block_gemm_entry(kind: WeightKind, fused: bool) -> Option<&'static str> {
     match (kind, fused) {
+        (WeightKind::Q2K, false) => Some("kernel_dit_gemm64_q2k"),
+        (WeightKind::Q3K, false) => Some("kernel_dit_gemm64_q3k"),
         (WeightKind::Q4K, false) => Some("kernel_dit_gemm64_q4k"),
+        (WeightKind::Q5K, false) => Some("kernel_dit_gemm64_q5k"),
         (WeightKind::Q6K, false) => Some("kernel_dit_gemm64_q6k"),
+        (WeightKind::Q8_0, false) => Some("kernel_dit_gemm64_q8_0"),
+        (WeightKind::Q2K, true) => Some("kernel_dit_gemm64_fused_q2k"),
+        (WeightKind::Q3K, true) => Some("kernel_dit_gemm64_fused_q3k"),
         (WeightKind::Q4K, true) => Some("kernel_dit_gemm64_fused_q4k"),
+        (WeightKind::Q5K, true) => Some("kernel_dit_gemm64_fused_q5k"),
         (WeightKind::Q6K, true) => Some("kernel_dit_gemm64_fused_q6k"),
+        (WeightKind::Q8_0, true) => Some("kernel_dit_gemm64_fused_q8_0"),
         _ => None,
     }
 }
 
 fn no_block_entry(step: &'static str, kind: WeightKind) -> ImageGenError {
     ImageGenError::Backend(format!(
-        "{step}: no diffusion GEMM entry reads a {kind:?} weight yet"
+        "{step}: {kind:?} is not a block-stored weight kind with a tiled GEMM entry"
     ))
 }
 
@@ -894,6 +899,14 @@ const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_gemm64_q6k",
     "kernel_dit_gemm64_fused_q4k",
     "kernel_dit_gemm64_fused_q6k",
+    "kernel_dit_gemm64_q2k",
+    "kernel_dit_gemm64_q3k",
+    "kernel_dit_gemm64_q5k",
+    "kernel_dit_gemm64_q8_0",
+    "kernel_dit_gemm64_fused_q2k",
+    "kernel_dit_gemm64_fused_q3k",
+    "kernel_dit_gemm64_fused_q5k",
+    "kernel_dit_gemm64_fused_q8_0",
     "kernel_dit_hadamard256_f32",
     "kernel_dit_channel_rms_inv_f32",
     "kernel_dit_conv2d_rms_gemm_f32",

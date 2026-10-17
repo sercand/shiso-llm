@@ -93,6 +93,14 @@ const ENTRIES: &[&str] = &[
     "kernel_dit_gemm64_q6k",
     "kernel_dit_gemm64_fused_q4k",
     "kernel_dit_gemm64_fused_q6k",
+    "kernel_dit_gemm64_q2k",
+    "kernel_dit_gemm64_q3k",
+    "kernel_dit_gemm64_q5k",
+    "kernel_dit_gemm64_q8_0",
+    "kernel_dit_gemm64_fused_q2k",
+    "kernel_dit_gemm64_fused_q3k",
+    "kernel_dit_gemm64_fused_q5k",
+    "kernel_dit_gemm64_fused_q8_0",
     "kernel_dit_hadamard256_f32",
     "kernel_dit_channel_rms_inv_f32",
     "kernel_dit_conv2d_rms_gemm_f32",
@@ -3213,8 +3221,18 @@ macro_rules! kquant_cases {
 }
 
 kquant_cases!(
-    gemm_kquant_matches_the_decoded_product,
-    fused_kquant_is_the_unfused_composition,
+    gemm64_q2k_matches_dequant_oracle,
+    gemm64_q3k_matches_dequant_oracle,
+    gemm64_q4k_matches_dequant_oracle,
+    gemm64_q5k_matches_dequant_oracle,
+    gemm64_q6k_matches_dequant_oracle,
+    gemm64_q8_0_matches_dequant_oracle,
+    gemm64_fused_q2k_is_the_unfused_composition,
+    gemm64_fused_q3k_is_the_unfused_composition,
+    gemm64_fused_q4k_is_the_unfused_composition,
+    gemm64_fused_q5k_is_the_unfused_composition,
+    gemm64_fused_q6k_is_the_unfused_composition,
+    gemm64_fused_q8_0_is_the_unfused_composition,
 );
 
 #[test]
