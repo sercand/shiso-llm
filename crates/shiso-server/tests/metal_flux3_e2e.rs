@@ -11,6 +11,12 @@
 //! - `SHISO_TEST_MODEL_FLUX3_VAE`: `ae.safetensors`;
 //! - `SHISO_TEST_TOKENIZER_FLUX3` (optional): the tokenizer directory, else
 //!   the locator's usual places;
+//! - `SHISO_TEST_FLUX3_RESIDENCY` (optional): `auto` (default), `resident` or
+//!   `swap`, and `SHISO_TEST_FLUX3_RESERVE_GB` (optional, default the
+//!   server's): the same knobs `--image-residency` and `--image-reserve-gb`
+//!   set, so a host that holds everything can still run the swap;
+//! - `RUST_LOG` (optional): `shiso_models=info` prints the residency events
+//!   and phase timings on stderr;
 //! - `SHISO_TEST_OUTPUT_DIR` (optional): where the cases save the PNGs they
 //!   decoded, for a person to look at.
 //!
@@ -99,6 +105,36 @@ fn backend() -> Option<Arc<dyn Backend>> {
     Some(backend)
 }
 
+/// `SHISO_TEST_FLUX3_RESIDENCY`; an unknown word is a mistake, not a default.
+fn residency_knob() -> ImageResidency {
+    match std::env::var("SHISO_TEST_FLUX3_RESIDENCY").as_deref() {
+        Err(_) | Ok("auto") => ImageResidency::Auto,
+        Ok("resident") => ImageResidency::Resident,
+        Ok("swap") => ImageResidency::Swap,
+        Ok(other) => panic!("SHISO_TEST_FLUX3_RESIDENCY={other}: expected auto, resident or swap"),
+    }
+}
+
+/// `SHISO_TEST_FLUX3_RESERVE_GB` in bytes, else the server's default.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "a test knob in GiB, checked non-negative; the product is far below 2^53"
+)]
+fn reserve_knob() -> u64 {
+    match std::env::var("SHISO_TEST_FLUX3_RESERVE_GB") {
+        Err(_) => DEFAULT_IMAGE_RESERVE_BYTES,
+        Ok(text) => {
+            let gb: f64 = text
+                .parse()
+                .unwrap_or_else(|_| panic!("SHISO_TEST_FLUX3_RESERVE_GB={text} is not a number"));
+            assert!(gb >= 0.0 && gb.is_finite(), "reserve must be >= 0 GiB");
+            (gb * (1u64 << 30) as f64) as u64
+        }
+    }
+}
+
 #[expect(
     clippy::print_stderr,
     reason = "the case reports its load time on stderr under --nocapture"
@@ -110,11 +146,18 @@ fn open(models: &Models, backend: &Arc<dyn Backend>) -> Arc<dyn ImageGenerator> 
         vae_path: Some(models.vae.clone()),
         tokenizer_path: models.tokenizer.clone(),
         assets_dir: None,
-        residency: ImageResidency::Auto,
-        reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
+        residency: residency_knob(),
+        reserve_bytes: reserve_knob(),
         draft_steps: 0,
         final_reuse: None,
     };
+    if std::env::var_os("RUST_LOG").is_some() {
+        // The residency events and phase timings are `tracing` records.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let began = Instant::now();
     let generator = open_image_generator(&desc, backend)
         .unwrap_or_else(|e| panic!("the FLUX.3 checkpoint did not load: {e}"));
@@ -207,16 +250,49 @@ fn job(
     }
 }
 
+/// The highest device allocation the backend reported while it ran,
+/// sampled every 50 ms, for the swap-versus-resident comparison.
+struct DevicePeak {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<u64>,
+}
+
+impl DevicePeak {
+    fn start(backend: &Arc<dyn Backend>) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, backend) = (Arc::clone(&stop), Arc::clone(backend));
+        let handle = std::thread::spawn(move || {
+            let mut peak = 0;
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(info) = backend.memory_info() {
+                    peak = peak.max(info.total.saturating_sub(info.free));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            peak
+        });
+        Self { stop, handle }
+    }
+
+    fn finish(self) -> u64 {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle.join().expect("the sampler does not panic")
+    }
+}
+
 #[expect(
+    clippy::cast_precision_loss,
     clippy::print_stderr,
-    reason = "the case reports its generation time on stderr under --nocapture"
+    reason = "the case reports its generation time and device peak on stderr under --nocapture"
 )]
 fn run(
+    backend: &Arc<dyn Backend>,
     generator: &Arc<dyn ImageGenerator>,
     job: &ImageGenerationJob,
     label: &str,
 ) -> GeneratedImage {
     let began = Instant::now();
+    let peak = DevicePeak::start(backend);
     let last = std::cell::RefCell::new(began);
     let report = |event: shiso_vision::generator::ImageStepEvent| {
         let now = Instant::now();
@@ -235,6 +311,10 @@ fn run(
         "{label}: generation took {:.1}s",
         began.elapsed().as_secs_f64()
     );
+    eprintln!(
+        "{label}: peak device allocation {:.0} MB",
+        peak.finish() as f64 / 1e6
+    );
     result
 }
 
@@ -247,6 +327,7 @@ fn flux3_generates_1024_png_for_prompt() {
     let generator = open(&models, &backend);
     assert_eq!(generator.model_id(), "flux-3-klein");
     let result = run(
+        &backend,
         &generator,
         &job(
             "a red panda wearing an astronaut helmet, floating in space, photograph",
@@ -302,6 +383,7 @@ fn flux3_edit_with_reference_keeps_size() {
         .expect("the reference prepares");
     assert_eq!(canvas, (1008, 752));
     let result = run(
+        &backend,
         &generator,
         &job(
             "the same scene as an oil painting, thick brush strokes",

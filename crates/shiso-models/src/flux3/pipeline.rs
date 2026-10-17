@@ -515,6 +515,10 @@ impl Flux3KleinModel {
         residency: Residency,
         shape: &JobShape,
     ) -> Result<bool, ImageGenError> {
+        tracing::info!(
+            device_mb = device_used(self.ops.backend()).map_or(0.0, mb),
+            "flux3 device bytes after denoise"
+        );
         let Residency::Swap {
             keep_denoiser: false,
         } = residency
@@ -877,7 +881,11 @@ impl ImageGenerator for Flux3KleinModel {
             cond_rows: references.tokens.rows,
         };
         let residency = self.sizer.plan(&shape)?;
+        let peaks = self.sizer.peaks(&shape);
         tracing::info!(
+            encode_peak_mb = mb(peaks.encode),
+            denoise_peak_mb = mb(peaks.denoise),
+            decode_peak_mb = mb(peaks.decode),
             width = job.width,
             height = job.height,
             steps = job.steps,

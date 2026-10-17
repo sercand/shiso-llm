@@ -766,7 +766,8 @@ fn swap_and_resident_same_bytes_for_one_seed() {
 
 /// The same comparison on the real files, at 256x256 so it fits beside
 /// itself: `SHISO_TEST_MODEL_FLUX3` (the transformer), `_TEXT` (the text
-/// encoder file or directory) and `_VAE` name them.
+/// encoder file or directory) and `_VAE` name them; `SHISO_TEST_TOKENIZER_FLUX3`
+/// optionally names the tokenizer directory (an int8 export has none beside it).
 #[test]
 #[ignore = "requires a Metal device and the real FLUX.3 files"]
 #[expect(
@@ -792,7 +793,7 @@ fn real_files_swap_and_resident_same_bytes_for_one_seed() {
             model_path: model.clone(),
             text_encoder_path: Some(text.clone()),
             vae_path: Some(vae.clone()),
-            tokenizer_path: None,
+            tokenizer_path: var("SHISO_TEST_TOKENIZER_FLUX3"),
             assets_dir: None,
             residency,
             reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
