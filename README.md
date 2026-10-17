@@ -217,6 +217,7 @@ environment variable. The ones you are most likely to want:
 | `--kv-cache-tokens` | Tokens the shared KV cache holds across all sessions (default 131072) |
 | `--gpu-memory-utilization` | Size the KV cache to fill this share of device memory instead, in (0, 1] |
 | `--kv-cache-dtype` | `f16` (default) or `fp8`: store attention keys and values as FP8 E4M3, about 43% fewer cache bytes per token (sparse models on CUDA only) |
+| `--prefill-activations` | `a16` (default) or `lowp`: quantize prompt activations to NVFP4 (routed experts) and MXFP8 (dense projections) and run those products on the block-scaled tensor-core instructions; faster prefill at a measured accuracy cost; decode and verify unchanged (sparse models on a CUDA build for `sm_121a` only) |
 | `--bind`, `--port` | Listen address (default `127.0.0.1:8090`) |
 | `--model-name` | The name clients use in the `model` field |
 | `--auth-tokens` | Comma-separated bearer tokens required on inference routes |

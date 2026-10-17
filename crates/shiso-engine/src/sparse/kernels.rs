@@ -92,6 +92,28 @@ pub const MOD_MXFP8: &str = "q4e_mxfp8";
 /// what lets a page carry no raw key row per position. Not an upstream unit,
 /// for the reason [`MOD_MODELOPT`] is not.
 pub const MOD_IDXRING: &str = "q4e_idxring";
+
+/// The routed NVFP4 expert stages of a prompt pass with NVFP4 activations
+/// (W4A4) on the block-scaled FP4 instruction, and their quantizer and
+/// brain-float combine. Present only in a kernel set built for a
+/// family-specific architecture (`kernels/cuda/q4e_lowp`); see
+/// [`crate::sparse::matmul::PrefillActivations`].
+pub const MOD_NVFP4_A4: &str = "q4e_nvfp4_a4";
+/// The dense MXFP8 projections of a prompt pass with MXFP8 activations
+/// (W8A8) on the block-scaled FP8 instruction, and their quantizer. Present
+/// where [`MOD_NVFP4_A4`] is.
+pub const MOD_MXFP8_A8: &str = "q4e_mxfp8_a8";
+/// The entries `--prefill-activations lowp` launches, as (module, entry):
+/// every one has to resolve before the option is accepted.
+pub const LOWP_ENTRIES: [(&str, &str); 7] = [
+    (MOD_NVFP4_A4, "q4e_nvfp4_a4_quant_kernel"),
+    (MOD_NVFP4_A4, "q4e_nvfp4_a4_quant_bf16_kernel"),
+    (MOD_NVFP4_A4, "q4e_nvfp4_a4_gate_up_kernel"),
+    (MOD_NVFP4_A4, "q4e_nvfp4_a4_down_kernel"),
+    (MOD_NVFP4_A4, "q4e_nvfp4_a4_combine_kernel"),
+    (MOD_MXFP8_A8, "q4e_mxfp8_a8_quant_kernel"),
+    (MOD_MXFP8_A8, "q4e_mxfp8_a8_gemm_kernel"),
+];
 /// The logits stages run before any pick: today, the suppress stage.
 pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a

@@ -67,7 +67,7 @@ const ROWS: &str = "q4e_mxfp8_rows_kernel";
 /// The narrow multi-row step kernel.
 const ROWS_NARROW: &str = "q4e_mxfp8_rows_narrow_kernel";
 /// The prompt kernel.
-const GEMM: &str = "q4e_mxfp8_gemm_kernel";
+pub(crate) const GEMM: &str = "q4e_mxfp8_gemm_kernel";
 /// The widest multi-row step launch, mirroring `matmul::MXFP8_STEP_ROWS`.
 const STEP_ROWS: u32 = 8;
 /// One prompt-kernel tile's side, mirroring `matmul::MXFP8_GEMM_TILE`.
@@ -107,7 +107,7 @@ pub const GEMM_TOLERANCE: f64 = 1e-6;
 
 /// A deterministic byte stream, fast enough for a 31-million-weight fixture
 /// in a debug build.
-fn bytes(len: usize, seed: u64) -> Vec<u8> {
+pub(crate) fn bytes(len: usize, seed: u64) -> Vec<u8> {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     (0..len)
         .map(|_| {
@@ -120,18 +120,18 @@ fn bytes(len: usize, seed: u64) -> Vec<u8> {
 }
 
 /// One MXFP8 matrix, `[out, in]`, and its exact widening.
-struct Matrix {
-    codes: Vec<u8>,
-    scales: Vec<u8>,
+pub(crate) struct Matrix {
+    pub(crate) codes: Vec<u8>,
+    pub(crate) scales: Vec<u8>,
     /// The decoded weights, row-major.
-    values: Vec<f32>,
-    in_dim: u32,
-    out_dim: u32,
+    pub(crate) values: Vec<f32>,
+    pub(crate) in_dim: u32,
+    pub(crate) out_dim: u32,
 }
 
 impl Matrix {
     /// Random codes (never the two NaN codes) under scales of 2^-15 to 2^-3.
-    fn new(out_dim: u32, in_dim: u32, seed: u64) -> Self {
+    pub(crate) fn new(out_dim: u32, in_dim: u32, seed: u64) -> Self {
         let n = out_dim as usize * in_dim as usize;
         let codes = bytes(n, seed)
             .into_iter()
@@ -184,13 +184,13 @@ impl Matrix {
 }
 
 /// The matrix on the device, codes and scales.
-struct Device {
-    codes: DeviceBuffer,
-    scales: DeviceBuffer,
+pub(crate) struct Device {
+    pub(crate) codes: DeviceBuffer,
+    pub(crate) scales: DeviceBuffer,
 }
 
 impl Device {
-    fn upload(gpu: &Gpu, m: &Matrix) -> Self {
+    pub(crate) fn upload(gpu: &Gpu, m: &Matrix) -> Self {
         Self {
             codes: gpu.upload(&m.codes),
             scales: gpu.upload(&m.scales),
@@ -200,7 +200,7 @@ impl Device {
 
 /// A device buffer of NaNs, so an output the kernel never writes fails the
 /// comparison rather than reading as zero.
-fn sentinel(gpu: &Gpu, len: usize) -> DeviceBuffer {
+pub(crate) fn sentinel(gpu: &Gpu, len: usize) -> DeviceBuffer {
     gpu.upload(&f32_bytes(&vec![f32::NAN; len]))
 }
 
@@ -233,14 +233,14 @@ fn geometry(entry: &str, out_dim: u32, rows: u32) -> (Extent3, u32, u32) {
 
 /// The shape of one pass: the matrix and the activation rows it projects.
 #[derive(Debug, Clone, Copy)]
-struct PassDesc {
-    in_dim: u32,
-    out_dim: u32,
-    rows: u32,
+pub(crate) struct PassDesc {
+    pub(crate) in_dim: u32,
+    pub(crate) out_dim: u32,
+    pub(crate) rows: u32,
 }
 
 /// Launches one MXFP8 entry over `pass.rows` activation rows into `out`.
-fn launch(
+pub(crate) fn launch(
     gpu: &Gpu,
     entry: &'static str,
     out: &DeviceBuffer,
@@ -264,7 +264,14 @@ fn launch(
 }
 
 /// Runs one MXFP8 entry over `rows` activation rows; `[rows, out_dim]`.
-fn mxfp8(gpu: &Gpu, entry: &'static str, w: &Device, m: &Matrix, x: &[f32], rows: u32) -> Vec<f32> {
+pub(crate) fn mxfp8(
+    gpu: &Gpu,
+    entry: &'static str,
+    w: &Device,
+    m: &Matrix,
+    x: &[f32],
+    rows: u32,
+) -> Vec<f32> {
     let xs = gpu.upload(&f32_bytes(x));
     let out = sentinel(gpu, rows as usize * m.out_dim as usize);
     let pass = PassDesc {
@@ -324,7 +331,7 @@ fn bf16_tier(gpu: &Gpu, wide: &DeviceBuffer, m: &Matrix, x: &[f32], rows: u32) -
 }
 
 /// Asserts two outputs are the same bits, naming the first that is not.
-fn same_bits(what: &str, got: &[f32], want: &[f32]) {
+pub(crate) fn same_bits(what: &str, got: &[f32], want: &[f32]) {
     assert_eq!(got.len(), want.len(), "{what}: element count");
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
         assert!(

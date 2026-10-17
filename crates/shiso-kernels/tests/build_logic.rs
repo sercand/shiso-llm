@@ -187,6 +187,8 @@ fn the_real_manifest_tree_parses() {
             "q4e_modelopt",
             "q4e_moe",
             "q4e_mxfp8",
+            "q4e_mxfp8_a8",
+            "q4e_nvfp4_a4",
             "q4e_ple",
             "q4e_qsa",
             "q4e_qsa_sparse",
@@ -360,6 +362,50 @@ fn a_family_specific_architecture_adds_the_fp4_define() {
             "the override replaces the manifest list"
         );
     }
+}
+
+#[test]
+fn a_directory_pinned_at_a_family_specific_architecture_gets_the_fp4_define_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = fixture(tmp.path());
+    write(
+        &root.join("cuda/gamma/KERNEL.toml"),
+        r#"
+[build]
+sources = ["four.cu"]
+arch = ["sm_121a"]
+"#,
+    );
+    write(&root.join("cuda/gamma/four.cu"), "__global__ void k() {}\n");
+    let plan = parse_manifests(&root).expect("parses");
+    let jobs = plan_nvcc_jobs(&plan, Path::new("/out"), None).expect("plans");
+    for job in &jobs.compile {
+        let has = job.flags.contains(&"-DSHISO_CUDA_HAVE_MXF4=1".to_string());
+        assert_eq!(
+            has,
+            job.dir == "cuda/gamma",
+            "only the job whose own target accepts the block-scaled instructions: {} {:?}",
+            job.dir,
+            job.flags
+        );
+    }
+    let gamma = jobs
+        .compile
+        .iter()
+        .find(|job| job.dir == "cuda/gamma")
+        .expect("the pinned directory compiles");
+    assert_eq!(gamma.arch, "sm_121a");
+
+    // A portable override replaces the pinned list, and the define goes with it.
+    let portable =
+        plan_nvcc_jobs(&plan, Path::new("/out"), Some(&["compute_80".to_string()])).expect("plans");
+    assert!(
+        portable
+            .compile
+            .iter()
+            .all(|job| !job.flags.iter().any(|f| f.contains("HAVE_MXF4"))),
+        "a portable target must not select the block-scaled instructions"
+    );
 }
 
 // ── Lane selection and the stub path ────────────────────────────────────────

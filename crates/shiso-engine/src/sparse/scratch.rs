@@ -188,13 +188,17 @@ pub enum Buf {
     /// A batch of sessions' staged draft rows, side by side, which a batched
     /// draft pass opens from.
     DraftStage,
-    /// The routed gate projection, one row per column.
+    /// The routed gate projection, one row per column. The W4A4 prompt stage
+    /// (`moe::lowp_experts`) holds its quantized token rows here instead.
     MoeGate,
-    /// The routed up projection, one row per column.
+    /// The routed up projection, one row per column. The W4A4 prompt stage
+    /// holds its quantized inner rows here instead.
     MoeUp,
-    /// The activated inner rows the down projection reads, one per column.
+    /// The activated inner rows the down projection reads, one per column:
+    /// `f32`, or brain floats from the W4A4 prompt stage.
     MoeMid,
-    /// The down projection's output, one row per column.
+    /// The down projection's output, one row per column: `f32`, or brain
+    /// floats from the W4A4 prompt stage.
     MoeDown,
     /// The weight-stationary routed block's gate input: every routed column's
     /// row, scaled and transformed, in half precision and expert order.
@@ -262,6 +266,11 @@ pub enum Buf {
     /// multiply returns. It is sized for the widest contraction any projection
     /// in the stack has, which is also what keeps its address still under a
     /// capture.
+    ///
+    /// The low-precision prompt tier's MXFP8 quantizer writes its activations
+    /// here too (`Projection::Mxfp8Lowp`), under the same rule - written
+    /// immediately before the one multiply that reads it - at 33/32 of a byte
+    /// an element against the two this is sized for.
     HalfActivation,
     /// The partial sums a contraction-split projection writes before its fold.
     ///

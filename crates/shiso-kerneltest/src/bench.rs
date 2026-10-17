@@ -211,6 +211,110 @@ pub const CASES: &[Case] = &[
         name: "q4e_nvfp4_prompt_down_4096",
         build: crate::qwen4exp::nvfp4::bench_prompt_down_4096,
     },
+    Case {
+        name: "q4e_nvfp4_prompt_gate_up_8192",
+        build: crate::qwen4exp::nvfp4::bench_prompt_gate_up_8192,
+    },
+    Case {
+        name: "q4e_nvfp4_prompt_down_8192",
+        build: crate::qwen4exp::nvfp4::bench_prompt_down_8192,
+    },
+    Case {
+        name: "q4e_swiglu_2048",
+        build: crate::qwen4exp::lowp::bench_swiglu_2048,
+    },
+    Case {
+        name: "q4e_swiglu_4096",
+        build: crate::qwen4exp::lowp::bench_swiglu_4096,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_quant_x_2048",
+        build: crate::qwen4exp::lowp::bench_a4_quant_x_2048,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_quant_mid_2048",
+        build: crate::qwen4exp::lowp::bench_a4_quant_mid_2048,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_quant_mid_4096",
+        build: crate::qwen4exp::lowp::bench_a4_quant_mid_4096,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_gate_up_2048",
+        build: crate::qwen4exp::lowp::bench_a4_gate_up_2048,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_down_2048",
+        build: crate::qwen4exp::lowp::bench_a4_down_2048,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_gate_up_4096",
+        build: crate::qwen4exp::lowp::bench_a4_gate_up_4096,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_down_4096",
+        build: crate::qwen4exp::lowp::bench_a4_down_4096,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_gate_up_8192",
+        build: crate::qwen4exp::lowp::bench_a4_gate_up_8192,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_down_8192",
+        build: crate::qwen4exp::lowp::bench_a4_down_8192,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_quant_x_8192",
+        build: crate::qwen4exp::lowp::bench_a4_quant_x_8192,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_quant_mid_8192",
+        build: crate::qwen4exp::lowp::bench_a4_quant_mid_8192,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_combine_2048",
+        build: crate::qwen4exp::lowp::bench_a4_combine_2048,
+    },
+    Case {
+        name: "q4e_nvfp4_a4_combine_8192",
+        build: crate::qwen4exp::lowp::bench_a4_combine_8192,
+    },
+    Case {
+        name: "q4e_moe_combine_2048",
+        build: crate::qwen4exp::lowp::bench_combine_f32_2048,
+    },
+    Case {
+        name: "q4e_moe_combine_8192",
+        build: crate::qwen4exp::lowp::bench_combine_f32_8192,
+    },
+    Case {
+        name: "q4e_swiglu_8192",
+        build: crate::qwen4exp::lowp::bench_swiglu_8192,
+    },
+    Case {
+        name: "q4e_mxfp8_a8_quant_2048x2560",
+        build: crate::qwen4exp::lowp::bench_a8_quant_2048x2560,
+    },
+    Case {
+        name: "q4e_mxfp8_a8_quant_2048x6144",
+        build: crate::qwen4exp::lowp::bench_a8_quant_2048x6144,
+    },
+    Case {
+        name: "q4e_mxfp8_a8_gemm2048_10240x2560",
+        build: crate::qwen4exp::lowp::bench_a8_gemm2048_10240x2560,
+    },
+    Case {
+        name: "q4e_mxfp8_a8_gemm2048_12288x2560",
+        build: crate::qwen4exp::lowp::bench_a8_gemm2048_12288x2560,
+    },
+    Case {
+        name: "q4e_mxfp8_a8_gemm2048_6144x2560",
+        build: crate::qwen4exp::lowp::bench_a8_gemm2048_6144x2560,
+    },
+    Case {
+        name: "q4e_mxfp8_a8_gemm2048_2560x6144",
+        build: crate::qwen4exp::lowp::bench_a8_gemm2048_2560x6144,
+    },
 ];
 
 /// What [`time`] measured.

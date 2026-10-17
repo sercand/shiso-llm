@@ -21,6 +21,7 @@ pub mod idx;
 pub mod idxring;
 pub mod indexer;
 pub mod kv8;
+pub mod lowp;
 pub mod matvec;
 pub mod misc;
 pub mod mxfp8;

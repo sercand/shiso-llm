@@ -43,7 +43,9 @@ use shiso_core::error::{CoreError, CoreResult};
 
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef, WeightSet};
 use crate::sparse::exl3::{self, Fanout};
-use crate::sparse::kernels::{self, Entry, MOD_EXL3, MOD_MODELOPT, MOD_MOE, TemplateArgs};
+use crate::sparse::kernels::{
+    self, Entry, MOD_EXL3, MOD_MODELOPT, MOD_MOE, MOD_NVFP4_A4, TemplateArgs,
+};
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::plan::{Branch, Plan, Step, TrellisOp};
 use crate::sparse::scratch::Buf;
@@ -1116,6 +1118,188 @@ const NVFP4_GEMM_SMEM: u32 = 92_416;
 /// their two activation steps of 64.
 const NVFP4_GEMM_K_ALIGN: u32 = 128;
 
+/// Weight rows one block of the W4A4 prompt kernels covers (`LP_A4_BW`): 128
+/// of down, or the same 64 of gate and of up.
+const NVFP4_A4_ROWS: u32 = 128;
+
+/// Blocks one row tile of the W4A4 prompt kernels is split over
+/// (`LP_A4_SPLIT`).
+const NVFP4_A4_SPLIT: u32 = 4;
+
+/// Threads one block of the W4A4 prompt kernels runs (`LP_A4_THREADS`).
+const NVFP4_A4_THREADS: u32 = 256;
+
+/// Columns one W4A4 tile covers (`LP_A4_BN`).
+const NVFP4_A4_COLS: u32 = 128;
+
+/// Dynamic shared memory one block of the W4A4 prompt kernels takes
+/// (`LP_A4_SMEM`): two stages of 128 weight rows and 128 columns at 256
+/// contraction elements (codes and scales of both), and three words a column.
+const NVFP4_A4_SMEM: u32 =
+    2 * (128 * 128 + 128 * 16 + NVFP4_A4_COLS * 128 + NVFP4_A4_COLS * 16) + NVFP4_A4_COLS * 12;
+
+/// Rows one block of the NVFP4 quantizer covers, a warp each.
+const NVFP4_A4_QUANT_ROWS: u32 = 4;
+
+/// Bytes of `rows` rows of width `k` quantized for the W4A4 kernels: codes,
+/// block scales and one `f32` global a row.
+const fn nvfp4_a4_bytes(rows: u64, k: u32) -> u64 {
+    rows * (k as u64 / 2 + k as u64 / 16 + 4)
+}
+
+/// Whether a routed stage takes the W4A4 kernels: a target layer's NVFP4
+/// bank in a prompt pass under
+/// [`matmul::PrefillActivations::Lowp`]. The draft head's resident experts
+/// keep the weight-only kernels, as the reference keeps them.
+#[must_use]
+pub fn lowp_routed(desc: &ExpertDesc, layer: LayerRef, device: Device) -> bool {
+    device.lowp_prompt() && layer.set == WeightSet::Target && desc.gate.dtype == DType::Nvfp4Gs16
+}
+
+/// The W4A4 routed stage of a prompt pass: the token rows quantized, gate and
+/// up with the `SwiGLU` fused, the intermediate quantized, down. The quantized
+/// rows take the weight-only stage's gate and up buffers, which this stage
+/// does not otherwise write: a quantized row is a ninth of the bytes of the
+/// `f32` rows they were sized for. The intermediate and the routed rows are
+/// brain floats in the buffers sized for their `f32` forms, and the combine
+/// that reads them is [`combine_lowp`].
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when a width is not a multiple of 128.
+fn lowp_experts(
+    shape: &SparseShape,
+    layer: LayerRef,
+    n_tok: u32,
+    groups: u32,
+    map: Operand,
+) -> CoreResult<Plan> {
+    let hidden = shape.hidden;
+    let inter = shape.moe.intermediate;
+    if !(hidden.is_multiple_of(NVFP4_GEMM_K_ALIGN) && inter.is_multiple_of(NVFP4_GEMM_K_ALIGN)) {
+        return Err(CoreError::Unsupported {
+            what: "a W4A4 prompt expert stage whose widths are not multiples of 128",
+            backend: "engine",
+        });
+    }
+    let columns = u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX);
+    debug_assert!(
+        nvfp4_a4_bytes(u64::from(n_tok), hidden) <= Buf::MoeGate.bytes(shape, n_tok, 1, 0)
+            && nvfp4_a4_bytes(u64::from(columns), inter) <= Buf::MoeUp.bytes(shape, n_tok, 1, 0),
+        "the quantized rows fit the buffers they borrow"
+    );
+    let at = |role: Role, span| Operand::Weight(WeightRef::layer(layer, role).spanning(span));
+    let quant = |entry: &'static str, q: Buf, x: Buf, rows: u32, k: u32| {
+        let mut plan = Plan::new();
+        // `q, x, static_gs, static_idx, rows, k`: dynamic globals.
+        plan.launch(
+            Entry::plain(MOD_NVFP4_A4, entry),
+            kernels::Launch::linear(rows.div_ceil(NVFP4_A4_QUANT_ROWS), 32 * NVFP4_A4_QUANT_ROWS),
+            Args::of(&[
+                Operand::Scratch(q),
+                Operand::Scratch(x),
+                Operand::Null,
+                Operand::Null,
+                Operand::U32(rows),
+                Operand::U32(k),
+            ]),
+        );
+        plan
+    };
+    let tiles = |rows_per: u32, out_dim: u32| {
+        kernels::Launch::new(
+            shiso_core::Extent3::new(NVFP4_A4_SPLIT * out_dim.div_ceil(rows_per), groups, 1),
+            NVFP4_A4_THREADS,
+            NVFP4_A4_SMEM,
+        )
+    };
+    let tail = |in_dim: u32, out_dim: u32, rows: u32| {
+        [
+            Operand::Scratch(Buf::MoeSorted),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            map,
+            Operand::U32(in_dim),
+            Operand::U32(out_dim),
+            Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+            Operand::U32(rows),
+        ]
+    };
+    let mut plan = quant(
+        "q4e_nvfp4_a4_quant_kernel",
+        Buf::MoeGate,
+        Buf::Mixed,
+        n_tok,
+        hidden,
+    );
+    // `mid, gate_w, gate_s, gate_g, up_w, up_s, up_g, xq, sorted, bounds,
+    //  active, map, in_dim, out_dim, n_expert, n_used, rows`
+    let mut ops = vec![
+        Operand::Scratch(Buf::MoeMid),
+        at(Role::ExpertGate, WeightPart::Whole),
+        at(Role::ExpertGate, WeightPart::GroupScales),
+        at(Role::ExpertGate, WeightPart::GlobalScale),
+        at(Role::ExpertUp, WeightPart::Whole),
+        at(Role::ExpertUp, WeightPart::GroupScales),
+        at(Role::ExpertUp, WeightPart::GlobalScale),
+        Operand::Scratch(Buf::MoeGate),
+    ];
+    ops.extend(tail(hidden, inter, n_tok));
+    plan.launch(
+        Entry::plain(MOD_NVFP4_A4, "q4e_nvfp4_a4_gate_up_kernel"),
+        tiles(NVFP4_A4_ROWS / 2, inter),
+        Args::of(&ops),
+    );
+    plan.append(quant(
+        "q4e_nvfp4_a4_quant_bf16_kernel",
+        Buf::MoeUp,
+        Buf::MoeMid,
+        columns,
+        inter,
+    ));
+    // `out, down_w, down_s, down_g, midq, sorted, bounds, active, map,
+    //  in_dim, out_dim, n_expert, n_used, rows`
+    let mut ops = vec![
+        Operand::Scratch(Buf::MoeDown),
+        at(Role::ExpertDown, WeightPart::Whole),
+        at(Role::ExpertDown, WeightPart::GroupScales),
+        at(Role::ExpertDown, WeightPart::GlobalScale),
+        Operand::Scratch(Buf::MoeUp),
+    ];
+    ops.extend(tail(inter, hidden, columns));
+    plan.launch(
+        Entry::plain(MOD_NVFP4_A4, "q4e_nvfp4_a4_down_kernel"),
+        tiles(NVFP4_A4_ROWS, hidden),
+        Args::of(&ops),
+    );
+    Ok(plan)
+}
+
+/// The recombination of the W4A4 stage's brain-float routed rows into one
+/// `f32` contribution per token, in slot order as [`combine`] sums.
+#[must_use]
+pub fn combine_lowp(shape: &SparseShape, n_tok: u32) -> Plan {
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::plain(MOD_NVFP4_A4, "q4e_nvfp4_a4_combine_kernel"),
+        kernels::Launch::new(
+            shiso_core::Extent3::new(shape.hidden.div_ceil(512), n_tok, 1),
+            256,
+            0,
+        ),
+        // `out, down, weights, n_embd, n_used`
+        Args::of(&[
+            Operand::Scratch(Buf::BlockOut),
+            Operand::Scratch(Buf::MoeDown),
+            Operand::Scratch(Buf::MoeWeights),
+            Operand::U32(shape.hidden),
+            Operand::U32(shape.moe.used),
+        ]),
+    );
+    plan
+}
+
 /// Output rows a block of the NVFP4 step kernels covers: gate and up one row
 /// a warp (`Q4E_NVFP4_GU_ROWS`), down four (`Q4E_NVFP4_DN_ROWS`), four warps
 /// a block.
@@ -1223,6 +1407,9 @@ pub fn affine_experts(
             Operand::U32(shape.moe.used),
         ]
     };
+    if nvfp4 && lowp_routed(desc, layer, device) {
+        return lowp_experts(shape, layer, n_tok, groups, map);
+    }
     if nvfp4 {
         // A prompt pass takes the tensor-core tiles: a column's result then
         // depends on the shape alone, which is the prompt's promise, and an
@@ -1782,7 +1969,11 @@ pub fn block(
             });
         }
         plan.append(affine_experts(shape, desc, layer, n_tok, device)?);
-        plan.append(combine(shape, n_tok));
+        plan.append(if lowp_routed(desc, layer, device) {
+            combine_lowp(shape, n_tok)
+        } else {
+            combine(shape, n_tok)
+        });
         plan.append(shared(shape, desc, layer, n_tok, device)?);
         return Ok(plan);
     }
@@ -1863,6 +2054,123 @@ pub fn block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The published geometry, four layers of it.
+    fn sparse_shape() -> SparseShape {
+        use crate::shape::{GdnShape, LayerKind};
+        use crate::sparse::shape::{GqaShape, IndexerShape, MoeShape, MropeSections};
+        SparseShape {
+            layers: vec![
+                LayerKind::Gdn,
+                LayerKind::Gdn,
+                LayerKind::Gdn,
+                LayerKind::Attn,
+            ],
+            hidden: 2_560,
+            vocab: 248_320,
+            streams: 4,
+            stream_rank: 320,
+            gqa: GqaShape::new(24, 2, 256, 64),
+            gdn: GdnShape::new(48, 16, 128, 4),
+            moe: MoeShape::new(512, 10, 1, 640),
+            indexer: IndexerShape::new(4, 128, 2_048, 4),
+            ple: None,
+            mrope: MropeSections::new(11, 11, 10),
+            rms_eps: 1.0e-6,
+            rope_theta: 1.0e7,
+        }
+    }
+
+    /// An NVFP4 routed bank at the published widths; the rest of the
+    /// description is never read by the routed stages.
+    fn nvfp4_desc() -> ExpertDesc {
+        use crate::sparse::weights::WeightDesc;
+        let w = |dtype, in_dim, out_dim| WeightDesc::new(dtype, in_dim, out_dim);
+        ExpertDesc {
+            router: w(DType::BF16, 2_560, 512),
+            gate: w(DType::Nvfp4Gs16, 2_560, 640),
+            up: w(DType::Nvfp4Gs16, 2_560, 640),
+            down: w(DType::Nvfp4Gs16, 640, 2_560),
+            shared_router: w(DType::BF16, 2_560, 1),
+            shared_gate: w(DType::Mxfp8E4M3G32, 2_560, 640),
+            shared_up: w(DType::Mxfp8E4M3G32, 2_560, 640),
+            shared_down: w(DType::Mxfp8E4M3G32, 640, 2_560),
+        }
+    }
+
+    fn entries(plan: &Plan) -> Vec<&'static str> {
+        plan.steps()
+            .iter()
+            .filter_map(Step::entry)
+            .map(|e| e.name())
+            .collect()
+    }
+
+    #[test]
+    fn only_a_target_prompt_pass_under_lowp_takes_the_w4a4_stages() {
+        let shape = sparse_shape();
+        let desc = nvfp4_desc();
+        let base = Device {
+            prefill_activations: matmul::PrefillActivations::Lowp,
+            ..Device::default()
+        };
+        let prompt = Device {
+            role: matmul::PassRole::Prompt { snapshot: None },
+            ..base
+        };
+        let target = LayerRef::target(0);
+        for n_tok in [1, 64, 2_048] {
+            let plan = affine_experts(&shape, &desc, target, n_tok, prompt).expect("plans");
+            assert_eq!(
+                entries(&plan),
+                [
+                    "q4e_nvfp4_a4_quant_kernel",
+                    "q4e_nvfp4_a4_gate_up_kernel",
+                    "q4e_nvfp4_a4_quant_bf16_kernel",
+                    "q4e_nvfp4_a4_down_kernel",
+                ],
+                "{n_tok} tokens"
+            );
+            assert!(lowp_routed(&desc, target, prompt));
+        }
+        // A step under the option, a prompt without it, and the draft head's
+        // resident bank keep the weight-only stages.
+        for (device, layer) in [
+            (base, target),
+            (
+                Device {
+                    prefill_activations: matmul::PrefillActivations::A16,
+                    ..prompt
+                },
+                target,
+            ),
+            (prompt, LayerRef::draft()),
+        ] {
+            assert!(!lowp_routed(&desc, layer, device));
+            let plan = affine_experts(&shape, &desc, layer, 64, device).expect("plans");
+            assert!(
+                entries(&plan).iter().all(|e| !e.contains("_a4_")),
+                "{:?}",
+                entries(&plan)
+            );
+        }
+    }
+
+    #[test]
+    fn the_w4a4_quantized_rows_fit_the_buffers_they_borrow() {
+        let shape = sparse_shape();
+        for rows in [1u32, 64, 2_048, crate::sparse::MAX_PREFILL_CHUNK] {
+            let columns = shape.moe.slot_rows(rows);
+            assert!(
+                nvfp4_a4_bytes(u64::from(rows), shape.hidden)
+                    <= Buf::MoeGate.bytes(&shape, rows, 1, 0)
+            );
+            assert!(
+                nvfp4_a4_bytes(columns, shape.moe.intermediate)
+                    <= Buf::MoeUp.bytes(&shape, rows, 1, 0)
+            );
+        }
+    }
 
     #[test]
     fn segments_carry_up_to_sixty_four_runs_of_any_width() {

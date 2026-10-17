@@ -419,7 +419,6 @@ pub(crate) fn plan_nvcc_jobs(
     out_root: &Path,
     arch_override: Option<&[String]>,
 ) -> Result<JobPlan, String> {
-    let extra_defines = mxf4_defines(arch_override);
     let mut jobs = JobPlan::default();
     let mut seen: BTreeMap<String, PathBuf> = BTreeMap::new();
 
@@ -437,7 +436,7 @@ pub(crate) fn plan_nvcc_jobs(
         if arches.is_empty() {
             return Err(format!("{}: no architecture to build for", dir.rel));
         }
-        let flags = compose_nvcc_flags(dir, &plan.root, &extra_defines);
+        let flags = compose_nvcc_flags(dir, &plan.root, &mxf4_defines(arches));
         for source in &dir.build.sources {
             let stem = stem_of(source).to_string();
             let module = dir.module_of(&stem);
@@ -471,12 +470,17 @@ pub(crate) fn plan_nvcc_jobs(
     Ok(jobs)
 }
 
-/// The extra defines an architecture override implies.
-fn mxf4_defines(arch_override: Option<&[String]>) -> Vec<String> {
-    let selects_mxf4 = arch_override.is_some_and(|list| {
-        list.iter()
-            .any(|arch| MXF4_ARCHES.contains(&arch.trim().trim_start_matches("arch=")))
-    });
+/// The extra defines a directory's architecture list implies: the override
+/// when there is one, else the directory's own manifest list.
+///
+/// A directory pinned at a family-specific target in its own manifest gets
+/// the define as an override does; a portable directory under no override
+/// does not, so the define marks exactly the jobs whose target accepts the
+/// block-scaled instructions.
+fn mxf4_defines(arches: &[String]) -> Vec<String> {
+    let selects_mxf4 = arches
+        .iter()
+        .any(|arch| MXF4_ARCHES.contains(&arch.trim().trim_start_matches("arch=")));
     if selects_mxf4 {
         vec![MXF4_DEFINE.to_string()]
     } else {

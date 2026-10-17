@@ -24,23 +24,23 @@ use shiso_core::{DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef, Launch
 const MODULE: &str = "q4e_modelopt";
 
 /// One four-bit code as a float.
-fn e2m1(code: u8) -> f32 {
+pub(crate) fn e2m1(code: u8) -> f32 {
     const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let v = MAG[usize::from(code & 7)];
     if code & 8 != 0 { -v } else { v }
 }
 
 /// An NVFP4 bank of `slots` matrices `[out, in]`.
-struct Bank {
-    codes: Vec<u8>,
-    scales: Vec<u8>,
-    globals: Vec<f32>,
-    in_dim: usize,
-    out_dim: usize,
+pub(crate) struct Bank {
+    pub(crate) codes: Vec<u8>,
+    pub(crate) scales: Vec<u8>,
+    pub(crate) globals: Vec<f32>,
+    pub(crate) in_dim: usize,
+    pub(crate) out_dim: usize,
 }
 
 impl Bank {
-    fn new(slots: usize, out_dim: usize, in_dim: usize, seed: u32) -> Self {
+    pub(crate) fn new(slots: usize, out_dim: usize, in_dim: usize, seed: u32) -> Self {
         let codes = signal(slots * out_dim * in_dim / 2, seed)
             .iter()
             .map(|v| ((v.abs() * 9973.0) as u32 & 0xFF) as u8)
@@ -64,7 +64,7 @@ impl Bank {
         }
     }
 
-    fn at(&self, slot: usize, o: usize, k: usize) -> f32 {
+    pub(crate) fn at(&self, slot: usize, o: usize, k: usize) -> f32 {
         let row = slot * self.out_dim + o;
         let byte = self.codes[(row * self.in_dim + k) / 2];
         let code = if k.is_multiple_of(2) {
@@ -76,7 +76,7 @@ impl Bank {
         e2m1(code) * scale
     }
 
-    fn project(&self, slot: usize, x: &[f32]) -> Vec<f32> {
+    pub(crate) fn project(&self, slot: usize, x: &[f32]) -> Vec<f32> {
         (0..self.out_dim)
             .map(|o| {
                 (0..self.in_dim)
@@ -86,7 +86,7 @@ impl Bank {
             .collect()
     }
 
-    fn upload(&self, gpu: &Gpu) -> [DeviceBuffer; 3] {
+    pub(crate) fn upload(&self, gpu: &Gpu) -> [DeviceBuffer; 3] {
         [
             gpu.upload(&self.codes),
             gpu.upload(&self.scales),
@@ -103,7 +103,7 @@ fn close(what: &str, got: &[f32], want: &[f32], rel: f32) {
     }
 }
 
-fn i32_bytes(v: &[i32]) -> Vec<u8> {
+pub(crate) fn i32_bytes(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
@@ -111,16 +111,16 @@ fn i32_bytes(v: &[i32]) -> Vec<u8> {
 /// grouped by expert in column order (`sorted`), each expert's span
 /// (`bounds`), and the experts with a nonempty span followed by their count
 /// at index `n_expert` (`active`).
-struct Route {
-    sorted: Vec<i32>,
-    bounds: Vec<i32>,
-    active: Vec<i32>,
+pub(crate) struct Route {
+    pub(crate) sorted: Vec<i32>,
+    pub(crate) bounds: Vec<i32>,
+    pub(crate) active: Vec<i32>,
 }
 
 impl Route {
     /// `ids[col]` is column `col`'s expert; column `col` is token
     /// `col / n_used`'s.
-    fn new(ids: &[i32], n_expert: usize) -> Self {
+    pub(crate) fn new(ids: &[i32], n_expert: usize) -> Self {
         let mut bounds = vec![0i32; n_expert + 1];
         for &e in ids {
             bounds[e as usize + 1] += 1;
@@ -148,11 +148,11 @@ impl Route {
     }
 
     /// Distinct experts the routing touches.
-    fn distinct(&self) -> usize {
+    pub(crate) fn distinct(&self) -> usize {
         *self.active.last().expect("the count closes the list") as usize
     }
 
-    fn upload(&self, gpu: &Gpu, map: &[u32], columns: usize) -> DevRoute {
+    pub(crate) fn upload(&self, gpu: &Gpu, map: &[u32], columns: usize) -> DevRoute {
         DevRoute {
             sorted: gpu.upload(&i32_bytes(&self.sorted)),
             bounds: gpu.upload(&i32_bytes(&self.bounds)),
@@ -164,18 +164,18 @@ impl Route {
 }
 
 /// A [`Route`] and the expert-to-slot map on the device.
-struct DevRoute {
-    sorted: DeviceBuffer,
-    bounds: DeviceBuffer,
-    active: DeviceBuffer,
-    map: DeviceBuffer,
-    columns: usize,
+pub(crate) struct DevRoute {
+    pub(crate) sorted: DeviceBuffer,
+    pub(crate) bounds: DeviceBuffer,
+    pub(crate) active: DeviceBuffer,
+    pub(crate) map: DeviceBuffer,
+    pub(crate) columns: usize,
 }
 
 /// One stage set: entries, launch geometry, and the tolerance against the
 /// host product.
 #[derive(Clone, Copy)]
-struct Stages {
+pub(crate) struct Stages {
     gate_up: &'static str,
     down: &'static str,
     /// The gate-and-up grid's first axis at an intermediate width.
@@ -207,7 +207,7 @@ const STEP: Stages = Stages {
 /// `Q4E_MG_SPLIT`, `Q4E_MG_THREADS`). Their weights decode exactly but their activations are
 /// rounded to halves, which is the whole of the wider budget: eleven bits of
 /// mantissa on every input of a 2,560-term sum.
-const PROMPT: Stages = Stages {
+pub(crate) const PROMPT: Stages = Stages {
     gate_up: "q4e_nvfp4_experts_gemm_gate_up_kernel",
     down: "q4e_nvfp4_experts_gemm_down_kernel",
     gate_up_blocks: |out_dim| 4 * out_dim.div_ceil(128),
@@ -218,24 +218,24 @@ const PROMPT: Stages = Stages {
 };
 
 /// The three device arrays of one bank.
-type Parts<'a> = [DeviceView<'a>; 3];
+pub(crate) type Parts<'a> = [DeviceView<'a>; 3];
 
 /// One gate-and-up launch.
-struct GateUp<'a> {
-    out_gate: DeviceView<'a>,
-    out_up: DeviceView<'a>,
-    gate: Parts<'a>,
-    up: Parts<'a>,
-    x: DeviceView<'a>,
-    route: &'a DevRoute,
-    hidden: u32,
-    inter: u32,
-    n_expert: u32,
-    n_used: u32,
+pub(crate) struct GateUp<'a> {
+    pub(crate) out_gate: DeviceView<'a>,
+    pub(crate) out_up: DeviceView<'a>,
+    pub(crate) gate: Parts<'a>,
+    pub(crate) up: Parts<'a>,
+    pub(crate) x: DeviceView<'a>,
+    pub(crate) route: &'a DevRoute,
+    pub(crate) hidden: u32,
+    pub(crate) inter: u32,
+    pub(crate) n_expert: u32,
+    pub(crate) n_used: u32,
 }
 
 impl GateUp<'_> {
-    fn launch(&self, gpu: &Gpu, st: &Stages) {
+    pub(crate) fn launch(&self, gpu: &Gpu, st: &Stages) {
         let r = self.route;
         let args = [
             KernelArg::Buffer(self.out_gate),
@@ -271,19 +271,19 @@ impl GateUp<'_> {
 }
 
 /// One down launch.
-struct Down<'a> {
-    out: DeviceView<'a>,
-    weights: Parts<'a>,
-    mid: DeviceView<'a>,
-    route: &'a DevRoute,
-    hidden: u32,
-    inter: u32,
-    n_expert: u32,
-    n_used: u32,
+pub(crate) struct Down<'a> {
+    pub(crate) out: DeviceView<'a>,
+    pub(crate) weights: Parts<'a>,
+    pub(crate) mid: DeviceView<'a>,
+    pub(crate) route: &'a DevRoute,
+    pub(crate) hidden: u32,
+    pub(crate) inter: u32,
+    pub(crate) n_expert: u32,
+    pub(crate) n_used: u32,
 }
 
 impl Down<'_> {
-    fn launch(&self, gpu: &Gpu, st: &Stages) {
+    pub(crate) fn launch(&self, gpu: &Gpu, st: &Stages) {
         let r = self.route;
         let args = [
             KernelArg::Buffer(self.out),
@@ -314,7 +314,7 @@ impl Down<'_> {
     }
 }
 
-fn views(bufs: &[DeviceBuffer; 3]) -> Parts<'_> {
+pub(crate) fn views(bufs: &[DeviceBuffer; 3]) -> Parts<'_> {
     [bufs[0].view(), bufs[1].view(), bufs[2].view()]
 }
 
@@ -689,7 +689,7 @@ pub fn the_nvfp4_stages_read_a_placed_bank<B>(
 
 /// This family's routed shape: hidden width, expert intermediate width,
 /// experts, experts a token.
-const BENCH_SHAPE: (u32, u32, u32, u32) = (2560, 640, 512, 10);
+pub(crate) const BENCH_SHAPE: (u32, u32, u32, u32) = (2560, 640, 512, 10);
 
 /// Routings a step fixture cycles through, so consecutive launches touch
 /// different experts and none finds its weights in the last-level cache.
@@ -708,7 +708,7 @@ fn xorshift(state: &mut u64) -> u64 {
 /// eight experts never chosen. At 2,048 tokens of ten experts over 512 this
 /// gives a median of about 22 columns an expert, a tenth below 12, and a few
 /// above 300 - the spread a real prompt's router produces.
-fn bench_routing(n_tok: u32, seed: u64) -> Vec<i32> {
+pub(crate) fn bench_routing(n_tok: u32, seed: u64) -> Vec<i32> {
     let (_, _, n_expert, n_used) = BENCH_SHAPE;
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut order: Vec<i32> = (0..n_expert as i32).collect();
@@ -740,7 +740,13 @@ fn bench_routing(n_tok: u32, seed: u64) -> Vec<i32> {
 
 /// One bench bank of `slots` matrices on the device, filled from a repeated
 /// pseudo-random pattern so no host copy of the whole bank is ever held.
-fn bench_bank(gpu: &Gpu, slots: u32, out_dim: u32, in_dim: u32, seed: u32) -> [DeviceBuffer; 3] {
+pub(crate) fn bench_bank(
+    gpu: &Gpu,
+    slots: u32,
+    out_dim: u32,
+    in_dim: u32,
+    seed: u32,
+) -> [DeviceBuffer; 3] {
     let fill = |bytes: u64, salt: u32, scale_bytes: bool| {
         let buf = alloc(gpu.device(), bytes).expect("device allocation");
         let chunk_len = bytes.min(16 << 20);
@@ -781,14 +787,14 @@ fn bench_bank(gpu: &Gpu, slots: u32, out_dim: u32, in_dim: u32, seed: u32) -> [D
 }
 
 /// A zeroed device buffer of `bytes`.
-fn zeroed(gpu: &Gpu, bytes: u64) -> DeviceBuffer {
+pub(crate) fn zeroed(gpu: &Gpu, bytes: u64) -> DeviceBuffer {
     let buf = alloc(gpu.device(), bytes).expect("device allocation");
     gpu.device().fill_zero(buf.view()).expect("zero fill");
     buf
 }
 
 /// Bytes of one matrix of a bank: codes and group scales.
-const fn matrix_bytes(out_dim: u32, in_dim: u32) -> u64 {
+pub(crate) const fn matrix_bytes(out_dim: u32, in_dim: u32) -> u64 {
     out_dim as u64 * in_dim as u64 / 2 + out_dim as u64 * in_dim as u64 / 16
 }
 
@@ -921,4 +927,14 @@ pub(crate) fn bench_prompt_gate_up_4096(gpu: &Gpu) -> Fixture {
 /// The prompt down stage over a 4,096-token chunk.
 pub(crate) fn bench_prompt_down_4096(gpu: &Gpu) -> Fixture {
     bench_stage(gpu, PROMPT, Stage::Down, 4096, 1)
+}
+
+/// The prompt gate-and-up stage over an 8,192-token chunk.
+pub(crate) fn bench_prompt_gate_up_8192(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, PROMPT, Stage::GateUp, 8192, 1)
+}
+
+/// The prompt down stage over an 8,192-token chunk.
+pub(crate) fn bench_prompt_down_8192(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, PROMPT, Stage::Down, 8192, 1)
 }

@@ -1052,6 +1052,9 @@ fn sparse_options(
     // Before the weights: a device without the cache element's kernels would
     // otherwise be found out only once the stack is built over them.
     capture::check_kv_elem(backend.as_ref(), engine.kv_elem).map_err(FactoryError::Load)?;
+    let prefill_activations = args.prefill_activations.into();
+    capture::check_prefill_activations(backend.as_ref(), prefill_activations)
+        .map_err(FactoryError::Load)?;
     let entries = capture::capture(backend.as_ref());
     let co_resident_blocks = capture::co_resident_blocks(backend.as_ref(), entries);
     let paths = capture::optional_paths(backend.as_ref());
@@ -1089,6 +1092,7 @@ fn sparse_options(
         tensor_core: paths.tensor_core,
         tiled_attention: paths.tiled_attention,
         prompt_matmul: paths.prompt_matmul,
+        prefill_activations,
         chunk: shiso_engine::sparse::recurrent::ChunkPolicy {
             available: paths.chunked_recurrence,
             ..shiso_engine::sparse::recurrent::ChunkPolicy::new()

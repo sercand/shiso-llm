@@ -246,6 +246,26 @@ pub struct ServeArgs {
         default_value_t = KvCacheDtype::F16
     )]
     pub kv_cache_dtype: KvCacheDtype,
+    /// The precision prompt (prefill) activations enter the block-scaled
+    /// weights' products at: `a16`, or `lowp`.
+    ///
+    /// `a16` keeps every prompt activation at half precision against the
+    /// decoded weights - the reference numerics. `lowp` quantizes a prompt
+    /// pass's activations to the weight's own format - NVFP4 for the routed
+    /// NVFP4 experts, MXFP8 for the dense MXFP8 projections - and runs those
+    /// products on the GPU's block-scaled tensor-core instructions: a faster
+    /// prefill, at a measurable cost in accuracy (a few percent of a row on
+    /// the experts). Decode steps and speculative verifies keep the
+    /// half-precision kernels either way. Only the sparse stack on a CUDA
+    /// build with kernels for a family-specific architecture (`sm_121a`, a
+    /// GB10) has the kernels; anywhere else `lowp` refuses to start.
+    #[arg(
+        long,
+        env = "SHISO_PREFILL_ACTIVATIONS",
+        value_enum,
+        default_value_t = PrefillActivations::A16
+    )]
+    pub prefill_activations: PrefillActivations,
     /// Recurrent-state checkpoints the prefix cache may hold, shared by every
     /// session. Zero holds none.
     ///
@@ -1360,6 +1380,25 @@ impl From<KvCacheDtype> for shiso_core::page::KvElem {
         match choice {
             KvCacheDtype::F16 => Self::F16,
             KvCacheDtype::Fp8 => Self::Fp8E4m3,
+        }
+    }
+}
+
+/// `--prefill-activations`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PrefillActivations {
+    /// Half-precision prompt activations against the decoded weights.
+    A16,
+    /// Prompt activations quantized to the weight's format, on the
+    /// block-scaled tensor-core instructions.
+    Lowp,
+}
+
+impl From<PrefillActivations> for shiso_engine::sparse::matmul::PrefillActivations {
+    fn from(choice: PrefillActivations) -> Self {
+        match choice {
+            PrefillActivations::A16 => Self::A16,
+            PrefillActivations::Lowp => Self::Lowp,
         }
     }
 }

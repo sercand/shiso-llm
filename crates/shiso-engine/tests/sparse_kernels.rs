@@ -94,6 +94,7 @@ const GPU: Device = Device {
     half_block_input: false,
     role: PassRole::Step,
     prompt_matmul: matmul::PromptMatmul::Rows,
+    prefill_activations: matmul::PrefillActivations::A16,
 };
 
 fn half(in_dim: u32, out_dim: u32) -> WeightDesc {
@@ -537,6 +538,36 @@ fn every_path() -> Plan {
         )
         .expect("an MXFP8 projection has a tier at every row count");
     }
+    // The low-precision prompt path: the W8A8 projection, and the W4A4 routed
+    // stage over an NVFP4 bank with its brain-float combine.
+    let lowp = Device {
+        prefill_activations: matmul::PrefillActivations::Lowp,
+        ..prompt
+    };
+    matmul::project(
+        &mut plan,
+        WeightDesc::new(DType::Mxfp8E4M3G32, shape.hidden, shape.hidden),
+        Bound::new(
+            WeightRef::layer(LayerRef::target(0), Role::AttnOutput),
+            Operand::Scratch(Buf::Mixed),
+            Operand::Scratch(Buf::BlockOut),
+        ),
+        333,
+        lowp,
+    )
+    .expect("a W8A8 prompt projection");
+    let nvfp4 = |in_dim, out_dim| WeightDesc::new(DType::Nvfp4Gs16, in_dim, out_dim);
+    let fp4_experts = ExpertDesc {
+        gate: nvfp4(shape.hidden, shape.moe.intermediate),
+        up: nvfp4(shape.hidden, shape.moe.intermediate),
+        down: nvfp4(shape.moe.intermediate, shape.hidden),
+        ..expert_desc(&shape)
+    };
+    plan.append(
+        moe::affine_experts(&shape, &fp4_experts, LayerRef::target(0), 333, lowp)
+            .expect("a W4A4 routed stage"),
+    );
+    plan.append(moe::combine_lowp(&shape, 333));
     plan.launch(
         kernels::Entry::plain(kernels::MOD_MISC, "q4e_argmax_rows_kernel"),
         kernels::argmax_rows(9),
@@ -551,7 +582,7 @@ fn every_path() -> Plan {
 
 /// The kernel set's own name table.
 fn kernel_names() -> String {
-    read_kernel_file("q4e/KERNEL_NAMES.md")
+    read_kernel_file("q4e/KERNEL_NAMES.md") + &read_kernel_file("q4e_lowp/KERNEL_NAMES.md")
 }
 
 /// One file of the vendored kernel tree.
@@ -883,6 +914,8 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "kv8.cu",
         "mxfp8.cu",
         "idxring.cu",
+        "../q4e_lowp/nvfp4_a4.cu",
+        "../q4e_lowp/mxfp8_a8.cu",
     ] {
         let path = dir.join(unit);
         let text = std::fs::read_to_string(&path)
@@ -1110,6 +1143,13 @@ fn every_launch_binds_exactly_the_parameters_its_kernel_declares() {
         "q4e_mxfp8_rows_kernel",
         "q4e_mxfp8_rows_narrow_kernel",
         "q4e_mxfp8_gemm_kernel",
+        "q4e_mxfp8_a8_quant_kernel",
+        "q4e_mxfp8_a8_gemm_kernel",
+        "q4e_nvfp4_a4_quant_kernel",
+        "q4e_nvfp4_a4_quant_bf16_kernel",
+        "q4e_nvfp4_a4_gate_up_kernel",
+        "q4e_nvfp4_a4_down_kernel",
+        "q4e_nvfp4_a4_combine_kernel",
     ] {
         assert!(seen.contains(entry), "{entry} was never bound: {seen:?}");
     }

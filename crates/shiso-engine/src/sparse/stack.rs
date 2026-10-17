@@ -134,6 +134,12 @@ pub struct SparseOptions {
     /// Which kernel its prompt passes' brain-float projections take; see
     /// [`crate::sparse::matmul::Device::prompt_matmul`].
     pub prompt_matmul: crate::sparse::matmul::PromptMatmul,
+    /// The precision prompt passes' activations enter the block-scaled
+    /// weights' products at; see
+    /// [`crate::sparse::matmul::PrefillActivations`]. The caller checks the
+    /// kernel set has the low-precision kernels before asking for them
+    /// ([`crate::sparse::capture::check_prefill_activations`]).
+    pub prefill_activations: crate::sparse::matmul::PrefillActivations,
     /// The entry names this build captured for the template kernels.
     ///
     /// Empty on a host that never compiled the kernels, which makes every
@@ -197,6 +203,7 @@ impl SparseOptions {
             tiled_attention: true,
             tensor_core: true,
             prompt_matmul: crate::sparse::matmul::PromptMatmul::Rows,
+            prefill_activations: crate::sparse::matmul::PrefillActivations::A16,
             entries: kernels::EntryTable::new(&[]),
             ngram_cache_bytes: NGRAM_CACHE_BYTES,
             ngram_reader: shiso_ple::PleConfig::DEFAULT,
@@ -909,6 +916,7 @@ impl SparseStack {
             half_block_input: false,
             role: crate::sparse::matmul::PassRole::Step,
             prompt_matmul: opts.prompt_matmul,
+            prefill_activations: opts.prefill_activations,
         };
         let desc = weights.desc(ngram.as_ref().map(|tier| tier.table().row()));
         log_resident(&shape, &opts, &kv, planes, geometry.ckpt_bytes);

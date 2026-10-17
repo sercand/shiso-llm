@@ -75,6 +75,26 @@ fn validate_images(images: &[Image]) -> CoreResult<()> {
     Ok(())
 }
 
+/// Whether a PTX image targets a family-specific architecture - one whose
+/// name carries the `a` (or `f`) suffix, like `sm_121a` - which only devices
+/// of that family load.
+///
+/// Read from the image's own `.target` directive, the one place the
+/// architecture is recorded once the build is done.
+fn family_specific(image: &[u8]) -> bool {
+    let Ok(text) = core::str::from_utf8(image) else {
+        return false;
+    };
+    text.lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(".target"))
+        .and_then(|rest| rest.split([',', ' ', '\t']).find(|t| !t.is_empty()))
+        .is_some_and(|arch| {
+            (arch.starts_with("sm_") || arch.starts_with("compute_"))
+                && (arch.ends_with('a') || arch.ends_with('f'))
+        })
+}
+
 /// A loaded module that unloads itself.
 #[derive(Debug)]
 struct OwnedModule {
@@ -141,8 +161,26 @@ impl ModuleRegistry {
         }
         let mut modules = HashMap::with_capacity(images.len());
         for (name, bytes) in images {
-            let module = nvidia::module_load(bytes)?;
-            modules.insert(name, OwnedModule { name, module });
+            match nvidia::module_load(bytes) {
+                Ok(module) => {
+                    modules.insert(name, OwnedModule { name, module });
+                }
+                // A family-specific image (`sm_121a`) is an optional path by
+                // construction: only that family's devices can load it, and
+                // every entry in it has a portable twin the planner falls back
+                // to. Refusing the whole device over it would turn "this GPU
+                // lacks the block-scaled instructions" into "this GPU cannot
+                // run anything".
+                Err(err) if family_specific(bytes) => {
+                    tracing::warn!(
+                        module = name,
+                        error = %err,
+                        "a family-specific kernel module does not load on this device; \
+                         its entry points are unavailable",
+                    );
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
         tracing::debug!(
             modules = modules.len(),
@@ -431,6 +469,19 @@ mod tests {
             }
             other => panic!("expected a fail-closed error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_family_specific_target_is_read_from_the_image_itself() {
+        use super::family_specific;
+        let ptx = |target: &str| format!("//\n.version 9.0\n.target {target}\n.address_size 64\n");
+        assert!(family_specific(ptx("sm_121a").as_bytes()));
+        assert!(family_specific(ptx("sm_120a, debug").as_bytes()));
+        assert!(family_specific(ptx("sm_100f").as_bytes()));
+        assert!(!family_specific(ptx("sm_80").as_bytes()));
+        assert!(!family_specific(ptx("sm_121").as_bytes()));
+        assert!(!family_specific(b"\x7fELF"));
+        assert!(!family_specific(b"no target here"));
     }
 
     #[test]

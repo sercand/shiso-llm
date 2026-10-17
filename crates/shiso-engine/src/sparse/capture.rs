@@ -389,6 +389,11 @@ fn trellis(args: &[Arg]) -> Option<TemplateArgs> {
 /// [`Backend::max_block_threads`] reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent probed fact about one kernel family; \
+              no two are states of one thing"
+)]
 pub struct OptionalPaths {
     /// The tensor-core attention and indexer scorer.
     pub tensor_core: bool,
@@ -398,6 +403,11 @@ pub struct OptionalPaths {
     pub chunked_recurrence: bool,
     /// The kernel a prompt pass's brain-float projections can take.
     pub prompt_matmul: crate::sparse::matmul::PromptMatmul,
+    /// The block-scaled low-precision prompt kernels
+    /// ([`kernels::LOWP_ENTRIES`]), which only a kernel set built for a
+    /// family-specific architecture carries and only that family's devices
+    /// load.
+    pub lowp_prefill: bool,
 }
 
 /// Asks the device which optional paths it has kernels for.
@@ -423,6 +433,7 @@ pub fn optional_paths(backend: &dyn Backend) -> OptionalPaths {
         } else {
             crate::sparse::matmul::PromptMatmul::Rows
         },
+        lowp_prefill: kernels::LOWP_ENTRIES.iter().all(|&(m, e)| has(m, e)),
     };
     tracing::info!(?paths, "optional sparse kernel paths this device has");
     paths
@@ -526,6 +537,47 @@ pub fn check_kv_elem(backend: &dyn Backend, kv: KvElem) -> CoreResult<()> {
             what: "an fp8 key/value cache on a device whose kernel set has no fp8 cache kernels \
                    (only the CUDA build compiled with its kernels has them; use \
                    --kv-cache-dtype f16)",
+            backend: "engine",
+        });
+    }
+    Ok(())
+}
+
+/// Refuses [`PrefillActivations::Lowp`] on a device whose kernel set lacks
+/// any of the block-scaled prompt kernels, naming the first one missing.
+///
+/// Asked before the weights are read, for the reason [`check_kv_elem`] is:
+/// a server that silently served the weight-only kernels under this option
+/// would report speeds and numerics nobody asked for.
+///
+/// [`PrefillActivations::Lowp`]: crate::sparse::matmul::PrefillActivations::Lowp
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] naming what is missing and what to do instead.
+pub fn check_prefill_activations(
+    backend: &dyn Backend,
+    choice: crate::sparse::matmul::PrefillActivations,
+) -> CoreResult<()> {
+    if choice == crate::sparse::matmul::PrefillActivations::A16 {
+        return Ok(());
+    }
+    let missing = kernels::LOWP_ENTRIES.iter().find(|entry| {
+        backend
+            .max_block_threads(shiso_core::backend::KernelRef::new(entry.0, entry.1))
+            .is_none()
+    });
+    if let Some((module, entry)) = missing {
+        tracing::error!(
+            module,
+            entry,
+            backend = backend.backend_name(),
+            "the low-precision prompt activations need a kernel this device does not have"
+        );
+        return Err(CoreError::Unsupported {
+            what: "low-precision prompt activations on a device or kernel set without the \
+                   block-scaled kernels (they need a CUDA build with SHISO_CUDA_COMPILE=1 and a \
+                   GB10-class device, sm_120a/sm_121a; use --prefill-activations a16)",
             backend: "engine",
         });
     }

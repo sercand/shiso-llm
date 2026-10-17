@@ -32,7 +32,8 @@ use shiso_core::error::{CoreError, CoreResult};
 use crate::sparse::bind::{Args, Operand, WeightRef};
 use crate::sparse::exl3::{self, Fanout, GemmShape, Staging};
 use crate::sparse::kernels::{
-    self, Elem, Entry, Launch, MOD_EXL3, MOD_MATVEC, MOD_MXFP8, TemplateArgs, blocks_for,
+    self, Elem, Entry, Launch, MOD_EXL3, MOD_MATVEC, MOD_MXFP8, MOD_MXFP8_A8, TemplateArgs,
+    blocks_for,
 };
 use crate::sparse::plan::{Plan, Step, TrellisOp};
 use crate::sparse::scratch::Buf;
@@ -281,6 +282,15 @@ pub enum Projection {
         /// Its launch.
         launch: Launch,
     },
+    /// An MXFP8 weight against MXFP8 activations, a prompt chunk under
+    /// [`PrefillActivations::Lowp`]: the activations quantized into
+    /// [`Buf::HalfActivation`], then the block-scaled FP8 GEMM.
+    Mxfp8Lowp {
+        /// The quantizer's launch.
+        quant: Launch,
+        /// The GEMM's launch.
+        gemm: Launch,
+    },
 }
 
 /// Threads an MXFP8 step-kernel block runs: four warps (`Q4E_MX_WARPS`),
@@ -314,6 +324,25 @@ pub const MXFP8_GEMM_TILE: u32 = 128;
 /// (`Q4E_MX_GEMM_THREADS`).
 pub const MXFP8_GEMM_THREADS: u32 = 512;
 
+/// Contraction widths the W8A8 prompt kernel takes: its scales arrive sixteen
+/// groups (512 elements) a row at a time.
+pub const MXFP8_A8_K_ALIGN: u32 = 512;
+
+/// Rows and outputs one tile of the W8A8 prompt kernel covers (`LP_A8_BM`,
+/// `LP_A8_BN`).
+pub const MXFP8_A8_TILE: u32 = 128;
+
+/// Threads the W8A8 prompt kernel runs a tile with (`LP_A8_THREADS`).
+pub const MXFP8_A8_THREADS: u32 = 256;
+
+/// Dynamic shared memory the W8A8 prompt kernel takes (`LP_A8_SMEM`): four
+/// stages of two 128 x 64 code tiles and two chunks of sixteen scale bytes
+/// for its 256 rows.
+pub const MXFP8_A8_SMEM: u32 = 4 * 2 * 128 * 64 + 2 * 256 * 16;
+
+/// Threads one block of the MXFP8 quantizer runs, four values a thread.
+pub const MXFP8_A8_QUANT_THREADS: u32 = 256;
+
 /// Dynamic shared memory the MXFP8 prompt kernel takes (`Q4E_MX_GEMM_SMEM`):
 /// a three-step ring of raw codes and activations, two converted half tiles
 /// of each operand and two steps of scales. Above the 48 KiB a launch gets
@@ -334,6 +363,27 @@ fn mxfp8(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Pro
             field: "mxfp8 contraction width",
             expected: u64::from(crate::sparse::weights::MXFP8_GROUP),
             got: u64::from(in_dim),
+        });
+    }
+    // A contraction the W8A8 kernel cannot stride stays on the weight-only
+    // one: a fact about the weight's shape, so every width of every prompt
+    // takes the same kernel for it.
+    if device.lowp_prompt() && in_dim.is_multiple_of(MXFP8_A8_K_ALIGN) {
+        let quads = u64::from(rows) * u64::from(in_dim) / 4;
+        return Ok(Projection::Mxfp8Lowp {
+            quant: Launch::linear(
+                blocks_for(quads, u64::from(MXFP8_A8_QUANT_THREADS)),
+                MXFP8_A8_QUANT_THREADS,
+            ),
+            gemm: Launch::new(
+                shiso_core::Extent3::new(
+                    out_dim.div_ceil(MXFP8_A8_TILE),
+                    rows.div_ceil(MXFP8_A8_TILE),
+                    1,
+                ),
+                MXFP8_A8_THREADS,
+                MXFP8_A8_SMEM,
+            ),
         });
     }
     if device.row_invariant() {
@@ -483,6 +533,10 @@ pub struct Device {
     /// device has it. A probed device fact: a kernel set without it keeps the
     /// warp-per-row kernel.
     pub prompt_matmul: PromptMatmul,
+    /// The precision a prompt pass's activations enter the block-scaled
+    /// weights' products at; see [`PrefillActivations`]. An operator's
+    /// choice, checked against the kernel set at startup.
+    pub prefill_activations: PrefillActivations,
 }
 
 impl Device {
@@ -509,6 +563,39 @@ impl Device {
     pub const fn tier_rows(self, rows: u32) -> u32 {
         if self.row_invariant() { u32::MAX } else { rows }
     }
+
+    /// Whether this pass quantizes its activations for the block-scaled
+    /// kernels: a prompt pass under [`PrefillActivations::Lowp`]. A step or
+    /// a verify never does, whatever the option, so a decoded token is the
+    /// weight-only tier's answer and speculation's equality holds.
+    #[must_use]
+    pub const fn lowp_prompt(self) -> bool {
+        self.row_invariant() && matches!(self.prefill_activations, PrefillActivations::Lowp)
+    }
+}
+
+/// The precision a prompt pass's activations take into the products with the
+/// block-scaled weights (the NVFP4 routed experts and the MXFP8 dense
+/// projections).
+///
+/// A trade of accuracy for prefill speed, made by the operator
+/// (`--prefill-activations`). Only prompt passes are affected: decode steps
+/// and speculative verifies keep the weight-only kernels under either choice.
+/// Within a prompt the choice reads no row count, so a row's bits still do not
+/// depend on where the prompt was cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PrefillActivations {
+    /// Activations kept at half precision against the decoded weights: the
+    /// weight-only kernels, the reference numerics.
+    #[default]
+    A16,
+    /// Activations quantized to the weight's own format - NVFP4 (one `e4m3`
+    /// scale per 16, a per-row global) for the routed experts, MXFP8 (one
+    /// `ue8m0` scale per 32) for the dense projections - and multiplied on the
+    /// block-scaled tensor-core instructions. Needs a kernel set built for a
+    /// family-specific architecture (`sm_121a`); refused at startup without
+    /// one.
+    Lowp,
 }
 
 /// The kernel a prompt pass's brain-float projections take.
@@ -1376,6 +1463,37 @@ fn project_one(
                 Operand::U32(rows),
             ]),
         ),
+        // The quantizer `q, x, rows, k` into the half-precision tier's
+        // staging - which only that tier's rounding pass and the BLAS call
+        // right after it ever use, never across another projection, and which
+        // is sized for the widest contraction at two bytes an element, against
+        // the 33/32 of a byte this layout takes - then the GEMM
+        // `out, codes, scales, xq, in_dim, out_dim, rows`.
+        Projection::Mxfp8Lowp { quant, gemm } => {
+            out.launch(
+                Entry::plain(MOD_MXFP8_A8, "q4e_mxfp8_a8_quant_kernel"),
+                quant,
+                Args::of(&[
+                    Operand::Scratch(Buf::HalfActivation),
+                    bound.src,
+                    Operand::U32(rows),
+                    Operand::U32(weight.in_dim),
+                ]),
+            );
+            out.launch(
+                Entry::plain(MOD_MXFP8_A8, "q4e_mxfp8_a8_gemm_kernel"),
+                gemm,
+                Args::of(&[
+                    bound.dst,
+                    w,
+                    Operand::Weight(part(bound.weight, WeightPart::GroupScales)),
+                    Operand::Scratch(Buf::HalfActivation),
+                    Operand::U32(weight.in_dim),
+                    Operand::U32(weight.out_dim),
+                    Operand::U32(rows),
+                ]),
+            );
+        }
         // `out, codes, scales, x, in_dim, out_dim, rows`
         Projection::Mxfp8 { entry, launch } => out.launch(
             entry,
@@ -1683,6 +1801,7 @@ mod tests {
         half_block_input: false,
         role: PassRole::Step,
         prompt_matmul: PromptMatmul::Rows,
+        prefill_activations: PrefillActivations::A16,
     };
 
     #[test]
@@ -1964,6 +2083,76 @@ mod tests {
         let err = plan(DType::Mxfp8E4M3G32, 2_570, 640, 1, GPU)
             .expect_err("a contraction that is not whole groups");
         assert!(matches!(err, CoreError::ShapeMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn low_precision_activations_take_the_block_scaled_kernel_on_prompt_rows_only() {
+        let lowp = Device {
+            prefill_activations: PrefillActivations::Lowp,
+            ..GPU
+        };
+        let prompt = Device {
+            role: PassRole::Prompt { snapshot: None },
+            ..lowp
+        };
+        // Every prompt width takes the W8A8 kernel: the choice reads the
+        // weight's shape, never the row count.
+        for rows in [1, 7, 333, 4_096] {
+            let p = plan(DType::Mxfp8E4M3G32, 2_560, 12_288, rows, prompt).expect("a prompt chunk");
+            let Projection::Mxfp8Lowp { quant, gemm } = p else {
+                panic!("{p:?}");
+            };
+            assert_eq!(gemm.grid.x, 12_288 / MXFP8_A8_TILE);
+            assert_eq!(gemm.grid.y, rows.div_ceil(MXFP8_A8_TILE));
+            assert_eq!((gemm.block.x, gemm.smem), (MXFP8_A8_THREADS, MXFP8_A8_SMEM));
+            assert_eq!(
+                u64::from(quant.grid.x) * u64::from(quant.block.x) * 4,
+                (u64::from(rows) * 2_560).next_multiple_of(4 * u64::from(MXFP8_A8_QUANT_THREADS)),
+                "four values a thread over every activation"
+            );
+        }
+        // A step or a verify keeps the weight-only kernels under the option.
+        for rows in [1, 5] {
+            let p = plan(DType::Mxfp8E4M3G32, 2_560, 12_288, rows, lowp).expect("a step");
+            assert!(matches!(p, Projection::Mxfp8 { .. }), "{p:?}");
+        }
+        // A contraction the W8A8 kernel cannot stride keeps the weight-only
+        // prompt kernel, at every width.
+        let p = plan(DType::Mxfp8E4M3G32, 2_592, 640, 333, prompt).expect("a prompt chunk");
+        let Projection::Mxfp8 { entry, .. } = p else {
+            panic!("{p:?}");
+        };
+        assert_eq!(entry.name(), "q4e_mxfp8_gemm_kernel");
+        // And the projection is two launches: the quantizer, then the GEMM,
+        // through the half-precision staging.
+        let weight = WeightRef::layer(
+            crate::sparse::bind::LayerRef::target(0),
+            crate::sparse::bind::Role::AttnQuery,
+        );
+        let bound = Bound::new(
+            weight,
+            Operand::Scratch(Buf::Residual),
+            Operand::Scratch(Buf::Embed),
+        );
+        let mut out = Plan::new();
+        project(
+            &mut out,
+            WeightDesc::new(DType::Mxfp8E4M3G32, 2_560, 12_288),
+            bound,
+            333,
+            prompt,
+        )
+        .expect("a prompt chunk");
+        let names: Vec<_> = out
+            .steps()
+            .iter()
+            .filter_map(Step::entry)
+            .map(|e| e.name())
+            .collect();
+        assert_eq!(
+            names,
+            ["q4e_mxfp8_a8_quant_kernel", "q4e_mxfp8_a8_gemm_kernel"]
+        );
     }
 
     #[test]
