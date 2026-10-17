@@ -189,6 +189,36 @@ fn mxfp8_moved(
 }
 
 impl Loader<'_> {
+    /// Bytes the loader assembled (moved rows, a stacked bank), on the device:
+    /// copied into a device allocation for the mixed export, for the reason
+    /// [`Self::place`] gives; uploaded as before for the others.
+    fn place_owned(&self, bytes: Vec<u8>) -> CoreResult<DeviceBuffer> {
+        if self.layout.dense != DenseFormat::Mxfp8 {
+            return upload(self.backend, bytes);
+        }
+        let buffer = shiso_core::buffer::alloc(self.backend, bytes.len() as u64)?;
+        self.backend.copy_h2d(buffer.view(), &bytes)?;
+        Ok(buffer)
+    }
+
+    /// One stored span on the device, as stored.
+    ///
+    /// The mixed export's dense weights are copied into device allocations
+    /// rather than wrapped in place: a wrapped span is the file mapping's own
+    /// small pages, and a decode step that streams 6 GB of weights through
+    /// them ran its projections at 60-70% of the bandwidth the same kernels
+    /// reach over device memory. The other exports keep wrapping, which costs
+    /// nothing extra in memory.
+    fn place(&self, host: Arc<Shard>, range: std::ops::Range<usize>) -> CoreResult<DeviceBuffer> {
+        if self.layout.dense != DenseFormat::Mxfp8 {
+            return import_host(self.backend, host, range);
+        }
+        let bytes = &AsRef::<[u8]>::as_ref(&*host)[range];
+        let buffer = shiso_core::buffer::alloc(self.backend, bytes.len() as u64)?;
+        self.backend.copy_h2d(buffer.view(), bytes)?;
+        Ok(buffer)
+    }
+
     /// A brain-float matrix `[out, in]`, optionally a row range of a larger
     /// one, optionally moved.
     fn dense(
@@ -230,7 +260,7 @@ impl Loader<'_> {
                 DType::F16,
                 in_dim,
                 rows.end - rows.start,
-                upload(self.backend, halves)?,
+                self.place_owned(halves)?,
             ));
         }
         let src = &AsRef::<[u8]>::as_ref(&*host)[start..end];
@@ -240,14 +270,14 @@ impl Loader<'_> {
             // a span off a sixteen-byte boundary is copied rather than
             // wrapped.
             Move::InPlace if src.as_ptr().align_offset(16) != 0 => {
-                upload(self.backend, src.to_vec())?
+                self.place_owned(src.to_vec())?
             }
-            Move::InPlace => import_host(self.backend, host.clone(), start..end)?,
+            Move::InPlace => self.place(host.clone(), start..end)?,
             Move::Rows {
                 rows: r,
                 lead,
                 perm,
-            } => upload(self.backend, permute_blocks(src, r * row_bytes, lead, perm))?,
+            } => self.place_owned(permute_blocks(src, r * row_bytes, lead, perm))?,
             Move::Cols { cols, perm } => upload(
                 self.backend,
                 permute_columns(src, row_bytes, cols * 2, perm),
@@ -314,15 +344,15 @@ impl Loader<'_> {
         // payload sits wherever the header put it: a span that is not on a
         // sixteen-byte boundary is copied rather than wrapped.
         let codes = match moved(codes_src, in_dim as usize, 1)? {
-            Some(bytes) => upload(self.backend, bytes)?,
+            Some(bytes) => self.place_owned(bytes)?,
             None if codes_src.as_ptr().align_offset(16) != 0 => {
-                upload(self.backend, codes_src.to_vec())?
+                self.place_owned(codes_src.to_vec())?
             }
-            None => import_host(self.backend, code_host.clone(), code_range)?,
+            None => self.place(code_host.clone(), code_range)?,
         };
         let scales = match moved(scales_src, groups, GROUP)? {
-            Some(bytes) => upload(self.backend, bytes)?,
-            None => import_host(self.backend, scale_host.clone(), scale_range)?,
+            Some(bytes) => self.place_owned(bytes)?,
+            None => self.place(scale_host.clone(), scale_range)?,
         };
         Weight::mxfp8(in_dim, rows.end - rows.start, [codes, scales])
     }
@@ -338,7 +368,7 @@ impl Loader<'_> {
     fn table(&self, name: &str) -> CoreResult<Weight> {
         let shape = [u64::from(VOCAB), u64::from(HIDDEN)];
         let (slot, span) = self.ck.span(name, "BF16", &shape)?;
-        let buffer = import_host(self.backend, self.ck.shard(slot), span)?;
+        let buffer = self.place(self.ck.shard(slot), span)?;
         Ok(Weight::over(DType::BF16, HIDDEN, VOCAB, buffer))
     }
 
@@ -358,7 +388,7 @@ impl Loader<'_> {
             Some((block, lead, perm)) => permute_blocks(&bytes, block * 4, lead, perm),
             None => bytes,
         };
-        upload(self.backend, bytes)
+        self.place_owned(bytes)
     }
 
     fn mix(&self, base: &str, inject: bool) -> CoreResult<StreamMix> {
@@ -586,7 +616,7 @@ impl Loader<'_> {
             in_dim,
             out_dim,
             EXPERTS,
-            [upload(self.backend, codes)?, upload(self.backend, scales)?],
+            [self.place_owned(codes)?, self.place_owned(scales)?],
         )
     }
 
@@ -628,9 +658,9 @@ impl Loader<'_> {
             out_dim,
             EXPERTS,
             [
-                upload(self.backend, codes)?,
-                upload(self.backend, scales)?,
-                upload(self.backend, globals)?,
+                self.place_owned(codes)?,
+                self.place_owned(scales)?,
+                self.place_owned(globals)?,
             ],
         )
     }
