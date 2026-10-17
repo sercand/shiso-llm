@@ -182,12 +182,11 @@ pub fn open_image_generator(
             Ok(Arc::new(model))
         }
         ImageFamily::Flux3 => {
-            // Swap residency is the flux3 pipeline's own; the draft stage and
-            // block reuse are refused by the locator.
-            crate::flux3::config::locate_and_inspect(desc)?;
-            Err(ImageGenError::Checkpoint(
-                "the flux3 pipeline is not wired into this build yet".to_owned(),
-            ))
+            // Residency, the draft stage and block reuse are the family's own
+            // to accept or refuse: the locator refuses the last two.
+            let located = crate::flux3::config::locate_and_inspect(desc)?;
+            let model = crate::flux3::pipeline::Flux3KleinModel::load(&located, desc, backend)?;
+            Ok(Arc::new(model))
         }
     }
 }

@@ -18,11 +18,11 @@ use crate::diffusion::ops::Ops;
 use crate::diffusion::prompt::{PromptTokenizer, load_chat_template};
 use crate::diffusion::weights::StStore;
 
-const CHAT_TEMPLATE: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+pub(super) const CHAT_TEMPLATE: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
 
 /// A directory with a word-level tokenizer, its config and the chat
 /// template. `pad` is the `pad_token` the config names, if any.
-fn toy_tokenizer(dir: &Path, pad: Option<&str>) {
+pub(super) fn toy_tokenizer(dir: &Path, pad: Option<&str>) {
     let added = |id: u32, content: &str| {
         serde_json::json!({
             "id": id, "content": content, "single_word": false, "lstrip": false,
@@ -171,14 +171,32 @@ impl Noise {
     }
 }
 
+/// Writes a BF16 safetensors file holding a `layers`-deep Qwen3-style
+/// decoder under `prefix`, and the flat config beside it.
+fn write_decoder(dir: &Path, prefix: &str, layers: usize) -> std::path::PathBuf {
+    write_decoder_sized(dir, prefix, layers, HIDDEN)
+}
+
+/// [`write_decoder`] with a residual width of `hidden`: 2560 makes eight
+/// taps the transformer's 20480.
 #[expect(
     clippy::too_many_lines,
     reason = "one flat table of the decoder's tensors and their shapes"
 )]
-/// Writes a BF16 safetensors file holding a `layers`-deep Qwen3-style
-/// decoder under `prefix`, and the flat config beside it.
-fn write_decoder(dir: &Path, prefix: &str, layers: usize) -> std::path::PathBuf {
+pub(super) fn write_decoder_sized(
+    dir: &Path,
+    prefix: &str,
+    layers: usize,
+    hidden: usize,
+) -> std::path::PathBuf {
     let mut noise = Noise(7);
+    // Keeps a wide residual stream from growing with the fan-in; 1.0 at the
+    // 16-wide size the other cases use.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a width of a few thousand is exact in f32"
+    )]
+    let width_scale = (16.0 / hidden as f32).sqrt();
     let mut header = serde_json::Map::new();
     let mut payload: Vec<u8> = Vec::new();
     let mut add = |name: String, shape: Vec<usize>, base: f32, scale: f32| {
@@ -186,7 +204,7 @@ fn write_decoder(dir: &Path, prefix: &str, layers: usize) -> std::path::PathBuf 
         let start = payload.len();
         for _ in 0..count {
             payload.extend_from_slice(
-                &bf16::from_f32(base + noise.next(scale))
+                &bf16::from_f32(base + noise.next(scale * width_scale))
                     .to_bits()
                     .to_le_bytes(),
             );
@@ -202,40 +220,40 @@ fn write_decoder(dir: &Path, prefix: &str, layers: usize) -> std::path::PathBuf 
     };
     add(
         format!("{prefix}embed_tokens.weight"),
-        vec![VOCAB, HIDDEN],
+        vec![VOCAB, hidden],
         0.0,
         0.5,
     );
     for l in 0..layers {
         let b = format!("{prefix}layers.{l}.");
-        add(format!("{b}input_layernorm.weight"), vec![HIDDEN], 1.0, 0.1);
+        add(format!("{b}input_layernorm.weight"), vec![hidden], 1.0, 0.1);
         add(
             format!("{b}post_attention_layernorm.weight"),
-            vec![HIDDEN],
+            vec![hidden],
             1.0,
             0.1,
         );
         add(
             format!("{b}self_attn.q_proj.weight"),
-            vec![Q_HEADS * HEAD_DIM, HIDDEN],
+            vec![Q_HEADS * HEAD_DIM, hidden],
             0.0,
             0.3,
         );
         add(
             format!("{b}self_attn.k_proj.weight"),
-            vec![KV_HEADS * HEAD_DIM, HIDDEN],
+            vec![KV_HEADS * HEAD_DIM, hidden],
             0.0,
             0.3,
         );
         add(
             format!("{b}self_attn.v_proj.weight"),
-            vec![KV_HEADS * HEAD_DIM, HIDDEN],
+            vec![KV_HEADS * HEAD_DIM, hidden],
             0.0,
             0.3,
         );
         add(
             format!("{b}self_attn.o_proj.weight"),
-            vec![HIDDEN, Q_HEADS * HEAD_DIM],
+            vec![hidden, Q_HEADS * HEAD_DIM],
             0.0,
             0.3,
         );
@@ -253,19 +271,19 @@ fn write_decoder(dir: &Path, prefix: &str, layers: usize) -> std::path::PathBuf 
         );
         add(
             format!("{b}mlp.gate_proj.weight"),
-            vec![INTER, HIDDEN],
+            vec![INTER, hidden],
             0.0,
             0.3,
         );
         add(
             format!("{b}mlp.up_proj.weight"),
-            vec![INTER, HIDDEN],
+            vec![INTER, hidden],
             0.0,
             0.3,
         );
         add(
             format!("{b}mlp.down_proj.weight"),
-            vec![HIDDEN, INTER],
+            vec![hidden, INTER],
             0.0,
             0.3,
         );

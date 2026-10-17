@@ -13,15 +13,6 @@
 //! 0-indexed layers 3, 7, ..., 31. Layers past the last tap are neither
 //! loaded nor run.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the pipeline that drives the encoder lands in a later task; the expectation \
-                  fails the build once it does, which is the cue to delete it"
-    )
-)]
-
 use std::path::{Path, PathBuf};
 
 use shiso_vision::generator::ImageGenError;

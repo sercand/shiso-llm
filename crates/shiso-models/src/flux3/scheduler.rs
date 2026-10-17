@@ -5,15 +5,6 @@
 //! spends more of the steps near noise. Each step also tells the model the
 //! time it is jumping to, which is simply the next entry of this schedule.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the transformer and pipeline that consume these land in later tasks; \
-                  the expectation fails the build once they do, which is the cue to delete it"
-    )
-)]
-
 /// The bend the distilled checkpoint was trained with.
 pub(crate) const ALPHA: f32 = 6.93;
 

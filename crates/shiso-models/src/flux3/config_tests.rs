@@ -17,17 +17,17 @@ use crate::image_registry::{DEFAULT_IMAGE_RESERVE_BYTES, ImageModelDesc, ImageRe
 const H: u64 = 256;
 
 /// What a forged checkpoint gets wrong.
-struct Forge {
+pub(super) struct Forge {
     /// A tensor to leave out.
-    omit: Option<&'static str>,
+    pub(super) omit: Option<&'static str>,
     /// The width of `txt_in.weight`'s input.
-    txt_in: u64,
+    pub(super) txt_in: u64,
     /// The width of the QK norm scales.
-    head_dim: u64,
+    pub(super) head_dim: u64,
     /// Blocks in the `image_cond` stack (the others have one).
-    cond_depth: u64,
+    pub(super) cond_depth: u64,
     /// `general.architecture` of the GGUF.
-    arch: &'static str,
+    pub(super) arch: &'static str,
 }
 
 impl Default for Forge {
@@ -43,7 +43,7 @@ impl Default for Forge {
 }
 
 /// Every tensor of the forged `DiT` as `(name, shape in out-then-in order)`.
-fn layout(forge: &Forge) -> Vec<(String, Vec<u64>)> {
+pub(super) fn layout(forge: &Forge) -> Vec<(String, Vec<u64>)> {
     let mlp = 3 * H;
     let mut out: Vec<(String, Vec<u64>)> = Vec::new();
     let block = |prefix: String, out: &mut Vec<(String, Vec<u64>)>| {
@@ -99,7 +99,7 @@ fn layout(forge: &Forge) -> Vec<(String, Vec<u64>)> {
 }
 
 /// Whether a forged tensor is an F32 norm scale (else BF16).
-fn is_f32(name: &str) -> bool {
+pub(super) fn is_f32(name: &str) -> bool {
     name.rsplit('.').next() == Some("scale")
 }
 

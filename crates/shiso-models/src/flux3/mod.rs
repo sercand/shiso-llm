@@ -8,15 +8,23 @@
 //! off the checkpoint's tensors and refuses a checkpoint whose shapes do not
 //! match what the kernels were built for, naming the tensor.
 //!
+//! [`pipeline`] composes them; [`vae`] is the autoencoder, [`reference`] prepares edit
+//! pictures and [`sampler`] is the Euler walk.
+//!
 //! [`config`] locates a checkpoint and inspects its headers; the helper
 //! modules hold the pure parts (schedule, ids, token packing) that can be
 //! checked without a device.
 
 pub mod config;
 pub(crate) mod pack;
+pub(crate) mod pipeline;
+pub(crate) mod reference;
+pub use reference::default_size_for_references;
+pub(crate) mod sampler;
 pub(crate) mod scheduler;
 pub(crate) mod text_encoder;
 pub(crate) mod transformer;
+pub(crate) mod vae;
 
 use crate::catalog::FamilyFacts;
 
@@ -28,8 +36,16 @@ mod config_tests;
 #[cfg(test)]
 mod pack_tests;
 #[cfg(test)]
+mod pipeline_tests;
+#[cfg(test)]
+mod reference_tests;
+#[cfg(test)]
+mod sampler_tests;
+#[cfg(test)]
 mod scheduler_tests;
 #[cfg(test)]
 mod text_encoder_tests;
 #[cfg(test)]
 mod transformer_tests;
+#[cfg(test)]
+mod vae_tests;

@@ -27,15 +27,6 @@
 //! projections and never attends it, and no phantom token exists here to
 //! leak.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the sampler and pipeline that drive the transformer land in a later task; the \
-                  expectation fails the build once they do, which is the cue to delete it"
-    )
-)]
-
 use std::ops::Range;
 
 use half::bf16;

@@ -9,15 +9,6 @@
 //! carry a negative index on the last axis so the model can tell them apart;
 //! text tokens carry only their position on the last axis.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the transformer and pipeline that consume these land in later tasks; \
-                  the expectation fails the build once they do, which is the cue to delete it"
-    )
-)]
-
 use std::ops::Range;
 
 use shiso_vision::generator::ImageGenError;
