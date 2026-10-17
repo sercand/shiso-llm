@@ -24,6 +24,12 @@
 //! is brain-float throughout: the residual stream these vectors are scattered
 //! into is f32, so narrowing here would only mean rounding twice.
 //!
+//! A linear the checkpoint stored quantized (the mixed-precision export's
+//! MXFP8 attention and NVFP4 feed-forward and merger) stays quantized too: its
+//! codes are decoded a tile at a time inside the projection kernel
+//! (`kernel_vit_qmm_*`), never to a wider copy of the weight. A device without
+//! that kernel refuses such a tower rather than decoding it.
+//!
 //! # Where the position embedding is resampled
 //!
 //! On the host, in [`VisionEncoder::resample_positions`]. The learned table is a
@@ -340,6 +346,7 @@ impl VisionEncoder {
         sink: &mut S,
     ) -> Result<DeviceBuffer, VisionError> {
         let tree = weights.tensors();
+        run.check_quantized(weights)?;
         let mut buffers = Buffers::new(run, plan)?;
         let pixels = run.upload("patch rows", item.as_flat())?;
         sink.on_pixel_values(&pixels)?;
@@ -825,6 +832,10 @@ impl Shape {
 /// not (Metal, or a build with no kernels) runs the scalar set, and nothing
 /// above the backend has to know which device it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one independently probed entry set, and every combination is a run the encoder supports"
+)]
 pub(crate) struct Fast {
     /// `kernel_vit_attention_mma`, for a head no wider than it holds.
     attention: bool,
@@ -840,6 +851,9 @@ pub(crate) struct Fast {
     /// `kernel_vit_flash_attn_d*` for this tower's head width, the
     /// simdgroup-matrix attention, for a device without the tensor-core one.
     flash: Option<&'static str>,
+    /// `kernel_vit_qmm_mxfp8` and `kernel_vit_qmm_nvfp4`, the projections
+    /// over weights the checkpoint stored quantized.
+    quant: bool,
 }
 
 impl Fast {
@@ -850,6 +864,7 @@ impl Fast {
         rope_split: false,
         tile: None,
         flash: None,
+        quant: false,
     };
 
     /// What `backend` offers, for a tower whose head is `head_dim` wide.
@@ -887,6 +902,9 @@ impl Fast {
                         .max_block_threads(KernelRef::new(MODULE, entry))
                         .is_some_and(|threads| threads >= FLASH_THREADS)
             }),
+            quant: [QMM_MXFP8, QMM_NVFP4, QMM_MXFP8_NARROW, QMM_NVFP4_NARROW]
+                .iter()
+                .all(|name| has(name)),
         }
     }
 }
@@ -929,6 +947,58 @@ const MMA_QUERIES: usize = 128;
 const MMA_KEYS: usize = 64;
 /// The split into brain-float pairs the tensor-core attention reads.
 const SPLIT_KV: &str = "kernel_vit_split_kv";
+/// The projection over an MXFP8 weight; see
+/// `kernels/cuda/vision/vit_quant.cuh`.
+const QMM_MXFP8: &str = "kernel_vit_qmm_mxfp8";
+/// The projection over an NVFP4 weight.
+const QMM_NVFP4: &str = "kernel_vit_qmm_nvfp4";
+/// The two at the narrow tile; see [`QmmTiling`].
+const QMM_MXFP8_NARROW: &str = "kernel_vit_qmm_mxfp8_narrow";
+const QMM_NVFP4_NARROW: &str = "kernel_vit_qmm_nvfp4_narrow";
+/// One tiling of the quantized projections: its entries' suffix, the outputs
+/// and patch rows a tile covers (square), its threads and its dynamic shared
+/// memory (`VIT_Q_SMEM_OF`: three steps of raw codes and both operand planes,
+/// two decoded weight tiles).
+#[derive(Debug, Clone, Copy)]
+struct QmmTiling {
+    tile: u32,
+    threads: u32,
+    smem: u32,
+}
+
+impl QmmTiling {
+    /// 128 x 128, sixteen warps. Past the 48 KiB default shared memory, which
+    /// the backend raises for the entry on its first launch.
+    const WIDE: Self = Self::of(128);
+    /// 64 x 64, four warps.
+    const NARROW: Self = Self::of(64);
+
+    const fn of(tile: u32) -> Self {
+        Self {
+            tile,
+            threads: tile * tile / 32,
+            smem: 3 * (tile * 32 + 2 * tile * 32 * 2) + 2 * tile * 32 * 2,
+        }
+    }
+
+    /// The tiling for a projection: the wide tile unless its grid would be
+    /// under [`QMM_WIDE_MIN_BLOCKS`].
+    fn pick(shape: Shape) -> Self {
+        let wide = u64::from(grid_for(shape.out_width, Self::WIDE.tile))
+            * u64::from(grid_for(shape.rows, Self::WIDE.tile));
+        if wide < QMM_WIDE_MIN_BLOCKS {
+            Self::NARROW
+        } else {
+            Self::WIDE
+        }
+    }
+}
+
+/// Wide tiles below which a quantized projection takes the narrow ones: two
+/// waves on a GB10's 48 multiprocessors, one wide block each. A small
+/// picture's 196 patch rows into 1152 outputs is eighteen wide tiles and left
+/// most of the device idle (an encode slower than the BLAS pair it replaced).
+const QMM_WIDE_MIN_BLOCKS: u64 = 96;
 /// Threads of one tensor-core attention block: eight warps.
 const MMA_THREADS: u32 = 256;
 /// Dynamic shared memory of one tensor-core attention block: `VIT_FA_SMEM`,
@@ -1205,6 +1275,79 @@ impl Run<'_> {
         )
     }
 
+    /// Refuses a tower with a quantized linear on a run that cannot multiply
+    /// it as stored: one without the quantized projection kernels, without
+    /// the split operand they read, or over a half-precision tower, whose
+    /// operand planes are halves.
+    ///
+    /// Checked once, before the first launch, so a device that lacks the
+    /// kernels (Metal, or a build without them) fails naming the reason
+    /// rather than partway through the blocks; no weight is ever decoded to a
+    /// wider format to get around it.
+    fn check_quantized(&self, weights: &VisionWeights) -> Result<(), VisionError> {
+        let Some(first) = weights.tensors().iter().find(|t| quantized(t.dtype())) else {
+            return Ok(());
+        };
+        if self.fast.quant && self.staged_operand().is_some() && self.width == WeightWidth::Bf16 {
+            return Ok(());
+        }
+        Err(VisionError::WeightDType {
+            name: first.name().to_owned(),
+            dtype: first.dtype(),
+        })
+    }
+
+    /// `out[m, n] = operand[m, k] . weight[n, k]` over a weight stored
+    /// quantized, from the staged planes: the codes decoded a tile at a time
+    /// in shared memory and multiplied against both planes, each into its own
+    /// single-precision sum (`kernel_vit_qmm_*`).
+    fn multiply_quantized(
+        &self,
+        step: &'static str,
+        out: &DeviceBuffer,
+        layer: &Affine<TowerTensor>,
+        shape: Shape,
+    ) -> Result<(), VisionError> {
+        let weight = &layer.weight;
+        let tiling = QmmTiling::pick(shape);
+        let narrow_tile = tiling.tile == QmmTiling::NARROW.tile;
+        let entry = match (weight.dtype(), narrow_tile) {
+            (DType::Mxfp8E4M3G32, false) => QMM_MXFP8,
+            (DType::Mxfp8E4M3G32, true) => QMM_MXFP8_NARROW,
+            (_, false) => QMM_NVFP4,
+            (_, true) => QMM_NVFP4_NARROW,
+        };
+        let scales = weight.scales().ok_or_else(|| VisionError::WeightDType {
+            name: weight.name().to_owned(),
+            dtype: weight.dtype(),
+        })?;
+        let planes = self.operand_planes(step, shape.rows * shape.in_width)?;
+        let args = QmmArgs {
+            m: narrow(shape.rows),
+            n: narrow(shape.out_width),
+            k: narrow(shape.in_width),
+            global: weight.global(),
+        };
+        self.launch(
+            step,
+            entry,
+            Extent3::new(
+                grid_for(shape.out_width, tiling.tile),
+                grid_for(shape.rows, tiling.tile),
+                1,
+            ),
+            Extent3::linear(tiling.threads),
+            tiling.smem,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(planes),
+                KernelArg::Buffer(weight.view()),
+                KernelArg::Buffer(scales),
+            ],
+        )
+    }
+
     /// `out[m, n] = operand[m, k] . weight[n, k]`, from the staged planes: one
     /// brain-float multiply per plane, accumulated in single precision.
     ///
@@ -1218,6 +1361,9 @@ impl Run<'_> {
         layer: &Affine<TowerTensor>,
         shape: Shape,
     ) -> Result<(), VisionError> {
+        if quantized(layer.weight.dtype()) {
+            return self.multiply_quantized(step, out, layer, shape);
+        }
         let fail = |source| VisionError::Encode { step, source };
         let blas = self.backend.as_blas().ok_or(VisionError::Encode {
             step,
@@ -1717,10 +1863,12 @@ impl WeightWidth {
                 });
             }
         };
+        // A linear stored quantized is not in the tower's width and is not
+        // read by a width-templated kernel: `Run::check_quantized` judges it.
         if let Some(odd) = weights
             .tensors()
             .iter()
-            .find(|t| t.dtype() != width.dtype())
+            .find(|t| t.dtype() != width.dtype() && !quantized(t.dtype()))
         {
             return Err(VisionError::WeightDType {
                 name: odd.name().to_owned(),
@@ -1768,6 +1916,12 @@ impl WeightWidth {
     }
 }
 
+/// Whether `dtype` is one of the formats a tower linear is served in as
+/// stored, by `kernel_vit_qmm_*`.
+const fn quantized(dtype: DType) -> bool {
+    matches!(dtype, DType::Mxfp8E4M3G32 | DType::Nvfp4Gs16)
+}
+
 /// A grid extent in the float domain the sample arithmetic works in.
 ///
 /// Exact rather than lossy: grids and position tables are bounded by the
@@ -1806,6 +1960,16 @@ struct GemmArgs {
     m: u32,
     n: u32,
     k: u32,
+}
+
+/// `vit_args_qmm`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct QmmArgs {
+    m: u32,
+    n: u32,
+    k: u32,
+    global: f32,
 }
 
 /// `vit_args_layer_norm`.

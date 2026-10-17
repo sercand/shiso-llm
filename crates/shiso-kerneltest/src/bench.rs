@@ -339,6 +339,90 @@ pub const CASES: &[Case] = &[
         name: "q4e_bf16_p12_5_10240x2560",
         build: crate::qwen4exp::bf16::bench_p12_5_10240x2560,
     },
+    Case {
+        name: "vit_q_mxfp8_qkv_4096",
+        build: crate::vision::quant::bench_mxfp8_qkv_4096,
+    },
+    Case {
+        name: "vit_q_mxfp8_proj_4096",
+        build: crate::vision::quant::bench_mxfp8_proj_4096,
+    },
+    Case {
+        name: "vit_q_nvfp4_fc1_4096",
+        build: crate::vision::quant::bench_nvfp4_fc1_4096,
+    },
+    Case {
+        name: "vit_q_nvfp4_fc2_4096",
+        build: crate::vision::quant::bench_nvfp4_fc2_4096,
+    },
+    Case {
+        name: "vit_q_nvfp4_merger_1024",
+        build: crate::vision::quant::bench_nvfp4_merger_1024,
+    },
+    Case {
+        name: "vit_q_mxfp8_qkv_16384",
+        build: crate::vision::quant::bench_mxfp8_qkv_16384,
+    },
+    Case {
+        name: "vit_q_nvfp4_fc1_16384",
+        build: crate::vision::quant::bench_nvfp4_fc1_16384,
+    },
+    Case {
+        name: "vit_q_nvfp4_fc2_16384",
+        build: crate::vision::quant::bench_nvfp4_fc2_16384,
+    },
+    Case {
+        name: "vit_q_blas_qkv_4096",
+        build: crate::vision::quant::bench_blas_qkv_4096,
+    },
+    Case {
+        name: "vit_q_blas_proj_4096",
+        build: crate::vision::quant::bench_blas_proj_4096,
+    },
+    Case {
+        name: "vit_q_blas_fc1_4096",
+        build: crate::vision::quant::bench_blas_fc1_4096,
+    },
+    Case {
+        name: "vit_q_blas_fc2_4096",
+        build: crate::vision::quant::bench_blas_fc2_4096,
+    },
+    Case {
+        name: "vit_q_blas_merger_1024",
+        build: crate::vision::quant::bench_blas_merger_1024,
+    },
+    Case {
+        name: "vit_q_blas_qkv_16384",
+        build: crate::vision::quant::bench_blas_qkv_16384,
+    },
+    Case {
+        name: "vit_q_blas_fc1_16384",
+        build: crate::vision::quant::bench_blas_fc1_16384,
+    },
+    Case {
+        name: "vit_q_blas_fc2_16384",
+        build: crate::vision::quant::bench_blas_fc2_16384,
+    },
+    Case {
+        name: "vit_q_mxfp8_proj_196_narrow",
+        build: crate::vision::quant::bench_mxfp8_proj_196_narrow,
+    },
+    Case {
+        name: "vit_q_mxfp8_proj_196",
+        build: crate::vision::quant::bench_mxfp8_proj_196,
+    },
+    Case {
+        name: "vit_q_nvfp4_fc2_196_narrow",
+        build: crate::vision::quant::bench_nvfp4_fc2_196_narrow,
+    },
+    Case {
+        name: "vit_q_blas_proj_196",
+        build: crate::vision::quant::bench_blas_proj_196,
+    },
+    Case {
+        name: "vit_q_blas_fc2_196",
+        build: crate::vision::quant::bench_blas_fc2_196,
+    },
 ];
 
 /// What [`time`] measured.

@@ -28,3 +28,4 @@
 #include "vit_tower.cuh"
 #include "vit_seam.cuh"
 #include "vit_fast.cuh"
+#include "vit_quant.cuh"

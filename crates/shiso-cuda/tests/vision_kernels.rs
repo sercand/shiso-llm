@@ -180,3 +180,17 @@ fn the_half_precision_bias_repeats_with_its_period() {
     let Some(gpu) = open() else { return };
     tower::the_half_precision_bias_repeats_with_its_period(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_mxfp8_projection_matches_the_host_decode() {
+    let Some(gpu) = open() else { return };
+    shiso_kerneltest::vision::quant::the_mxfp8_projection_matches_the_host_decode(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_nvfp4_projection_matches_the_host_decode() {
+    let Some(gpu) = open() else { return };
+    shiso_kerneltest::vision::quant::the_nvfp4_projection_matches_the_host_decode(&gpu);
+}
