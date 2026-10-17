@@ -358,3 +358,33 @@ extraction: each unit is byte-identical to the lines of the upstream header it
 names, after the one `extern "C"` delta, which
 `scripts/q4e_ptx_oracle.sh --mode=fidelity` checks on every run of
 `scripts/check.sh`.
+
+### `vision` — the CUDA-only quantized projections (`vit_quant.cuh`)
+
+```
+kernel_vit_qmm_mxfp8
+kernel_vit_qmm_nvfp4
+kernel_vit_qmm_mxfp8_narrow
+kernel_vit_qmm_nvfp4_narrow
+```
+
+The projections over a tower linear the checkpoint stored quantized (the
+mixed-precision export's MXFP8 attention, NVFP4 feed-forward and merger), read
+as stored. They replace the BLAS pair of the tensor-core path for those
+weights only: the operand is the same split planes `kernel_vit_to_bf16` and
+its fused producers write, and the bias rides the same epilogues afterwards.
+No Metal twin; the Qwen encoder refuses a quantized tower on a run without
+both entries, the split operand, or a brain-float tower width
+(`Run::check_quantized`), and never decodes the weights to get around it.
+
+| Entry point | Parameters after the argument block | grid | block | smem |
+|---|---|---|---|---|
+| `kernel_vit_qmm_mxfp8` | `out (m * n f32), planes (2 * m * k bf16), codes (n * k e4m3), scales (n * k/32 ue8m0)` | `(ceil(n/128), ceil(m/128))` | 512 | 77 824 (`VIT_Q_SMEM`) |
+| `kernel_vit_qmm_nvfp4` | `out (m * n f32), planes (2 * m * k bf16), codes (n * k/2, e2m1 low nibble first), scales (n * k/16 e4m3)` | `(ceil(n/128), ceil(m/128))` | 512 | 77 824 (`VIT_Q_SMEM`) |
+
+The `_narrow` twins take the same parameters at a 64 x 64 tile: grid
+`(ceil(n/64), ceil(m/64))`, 128 threads, 38 912 bytes (`VIT_Q_SMEM_NARROW`).
+The encoder takes them when the wide grid would be under 96 blocks (a small
+picture). All four take `vit_args_qmm {m, n, k, global}`, 16 bytes; `global` is an NVFP4
+tensor's f32 scale (one for MXFP8) and multiplies the finished sum. `k` a
+multiple of 32 (MXFP8) or 16 (NVFP4); a ragged NVFP4 tail step stages zeros.
