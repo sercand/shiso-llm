@@ -13,6 +13,8 @@
 //! checked without a device.
 
 pub mod config;
+pub(crate) mod pack;
+pub(crate) mod scheduler;
 
 use crate::catalog::FamilyFacts;
 
@@ -21,3 +23,7 @@ pub const FACTS: FamilyFacts = FamilyFacts { name: "flux3" };
 
 #[cfg(test)]
 mod config_tests;
+#[cfg(test)]
+mod pack_tests;
+#[cfg(test)]
+mod scheduler_tests;
