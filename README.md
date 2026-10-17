@@ -266,6 +266,19 @@ each beside the model or under `--image-assets-dir`, or take the explicit flags.
 It runs 16 flow-map Euler steps without guidance at 1024x1024 by default (sides
 64 to 4096 on a 16-pixel grid), and `--image-residency swap` (or `auto` on a host
 too small for both) drops the text encoder before the transformer is imported.
+Measured on a 24 GiB M4 (Metal working set 17.8 GiB), 1024x1024, 16 steps, with
+the Q4_K_XL transformer: the pictures are byte-identical across `resident`, `swap`
+and an `auto` that chose swap (BF16 and INT8 text encoders), and the image takes
+the same ~242 s either way, since a swap costs under a few seconds of page-cache
+reads and imports (the files were mostly in the page cache; a fully cold read was
+not measured). What changes is the device's peak allocation: with the BF16 text
+encoder (7.2 GB loaded) 16.7 GB resident, 9.5 GB for a swap that keeps the
+transformer through the decode and 7.6 GB for one that drops it first
+(`--image-reserve-gb 10`); with the INT8 encoder (4.3 GB) 13.8 GB resident against
+9.5 GB. `auto` chooses `resident` here at the default reserve and swap once
+`--image-reserve-gb` leaves too little. A reserve that leaves less than a 1024x1024
+job needs is refused when the model opens, naming the largest square side that
+would fit (or saying that none does).
 The generator itself accepts up to 10 reference pictures for editing: a single
 reference is fitted under 4 MiB pixels and reflect-padded to a canvas on the grid,
 several are each fitted under 1 MP. Over HTTP an edit is `POST /v1/images/edits`
