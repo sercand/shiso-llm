@@ -46,6 +46,7 @@ use shiso_core::ids::{LayerIdx, SessionId, TokenId};
 use crate::sparse::bind::{LayerRef, Operand, Role, WeightRef};
 use crate::sparse::gather;
 use crate::sparse::hyper::{self, MixRoles};
+use crate::sparse::indexer::RingTap;
 use crate::sparse::island::{self, Island};
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::moe::RowOrigin;
@@ -69,8 +70,11 @@ pub const ROWS: u32 = MAX_DRAFT + 1;
 /// Whose rows a draft pass carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DraftRows {
-    /// One session's consecutive positions; the pick is the last row's.
-    Sequential,
+    /// One session's consecutive positions; the pick is the last row's. The
+    /// tap, when there is one, copies the head's raw key ring into the
+    /// snapshot buffer as it stands before one of those rows: see
+    /// [`crate::sparse::indexer::RingTap`].
+    Sequential(Option<RingTap>),
     /// One row per session, each at its own position; every row is picked.
     /// The bits say which rows' own heads have outgrown the indexer budget.
     Batch(u8),
@@ -201,9 +205,9 @@ impl SparseStack {
         // is the one a single-row decode takes: a draft never carries unrelated
         // rows, and its attention runs dense until its own cache holds more
         // complete blocks than the indexer budget.
-        let (origin, batch_selected) = match rows {
-            DraftRows::Sequential => (RowOrigin::Sequential, 0),
-            DraftRows::Batch(bits) => (RowOrigin::Unrelated, u64::from(bits)),
+        let (origin, batch_selected, ring_tap) = match rows {
+            DraftRows::Sequential(tap) => (RowOrigin::Sequential, 0, tap),
+            DraftRows::Batch(bits) => (RowOrigin::Unrelated, u64::from(bits), None),
         };
         let ctx = AttnContext {
             selected: origin == RowOrigin::Sequential && shape.indexer.sparse_at(frontier),
@@ -211,6 +215,7 @@ impl SparseStack {
             tiled: self.opts.tiled_attention,
             origin,
             batch_selected,
+            ring_tap,
             ..AttnContext::default()
         };
         let chain = island::draft_chain();
@@ -252,7 +257,7 @@ impl SparseStack {
         // the last one, for the reason a chunk's logits are its last rows, and a
         // batch's is every row.
         let (last, picked) = match rows {
-            DraftRows::Sequential => (
+            DraftRows::Sequential(_) => (
                 u64::from(n_tok.saturating_sub(1))
                     .saturating_mul(u64::from(shape.hidden))
                     .saturating_mul(crate::sparse::kernels::F32_BYTES),
@@ -336,6 +341,23 @@ impl SparseStack {
         hidden: Operand,
         pick: bool,
     ) -> CoreResult<Option<TokenId>> {
+        self.draft_tapped(session, tokens, positions, hidden, pick, None)
+    }
+
+    /// [`SparseStack::draft`], with the head's raw key ring also copied into
+    /// the snapshot buffer by `tap`.
+    ///
+    /// `None` is not a refusal: it is what `pick: false` asked for, as for
+    /// [`SparseStack::draft`].
+    fn draft_tapped(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        positions: &[u32],
+        hidden: Operand,
+        pick: bool,
+        tap: Option<RingTap>,
+    ) -> CoreResult<Option<TokenId>> {
         let n_tok = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
         if n_tok == 0 || n_tok > self.opts.prefill_rows {
             return Err(CoreError::ShapeMismatch {
@@ -365,7 +387,7 @@ impl SparseStack {
             n_tok,
             pick,
             self.device(),
-            DraftRows::Sequential,
+            DraftRows::Sequential(tap),
         )?;
         // A chain step is the same shape every time and worth capturing, and
         // its key cannot alias a target island's: it is filed under the slot
@@ -761,13 +783,17 @@ impl SparseStack {
             source,
         )?;
         self.remember_lookup(session, &outcome)?;
-        // The rewind before the commit, and both before the row is staged: the
-        // staged row is the residual of the last *committed* position, and the
-        // rewind is what makes the recurrent state agree with it.
+        // The rewind first: the staged row is the residual of the last
+        // *committed* position, and the rewind is what makes the recurrent
+        // state agree with it. Then the row is staged, because the catch-up
+        // overwrites the residual it is copied from. And the commit last,
+        // because a checkpoint it admits carries the head's raw key ring, and
+        // the head's rows up to the position before the new frontier are the
+        // catch-up's to write: committed before it, the blob would carry the
+        // chain's guesses for them.
         if let Some(rewind) = outcome.rollback {
             self.spec_rollback(session, rewind)?;
         }
-        self.advance(session, &outcome.committed, false, Some(outcome.logits_row))?;
         self.stage_draft_row(session, outcome.logits_row)?;
         self.reflush(
             session,
@@ -775,6 +801,8 @@ impl SparseStack {
             &outcome.committed,
             Operand::Scratch(Buf::Residual),
         )?;
+        self.advance(session, &outcome.committed, false, Some(outcome.logits_row))?;
+        self.mark_staged_current(session)?;
         // What the caller has not seen: the guesses that were kept, and then the
         // target's own pick at the row the step settled on. `first` is left out
         // because it was already the caller's - handing it back would emit it
@@ -947,7 +975,6 @@ impl SparseStack {
                 self.spec_rollback(*session, rewind)?;
             }
             let row = u32::try_from(start).unwrap_or(u32::MAX) + outcome.logits_row;
-            self.advance(*session, &outcome.committed, false, Some(row))?;
             self.stage_draft_row(*session, row)?;
             settled.push((
                 *session,
@@ -956,14 +983,20 @@ impl SparseStack {
                 outcome,
                 own.to_vec(),
                 drafts.len(),
+                row,
             ));
             start += rows.len();
         }
 
         let mut out = Vec::with_capacity(settled.len());
-        for (session, frontier, start, outcome, own, drafted) in settled {
+        for (session, frontier, start, outcome, own, drafted, row) in settled {
             let hidden = Operand::ScratchFrom(Buf::ResidualHold, start as u64 * width);
             self.reflush(session, frontier, &outcome.committed, hidden)?;
+            // Committed after its catch-up, as a solo step commits: see
+            // `speculate`. No catch-up writes the logits block, so the row the
+            // commit files is still the verify's.
+            self.advance(session, &outcome.committed, false, Some(row))?;
+            self.mark_staged_current(session)?;
             let accepted = usize::try_from(outcome.logits_row).unwrap_or(0);
             let mut produced = outcome.committed.get(1..).unwrap_or(&[]).to_vec();
             produced.push(*own.get(accepted).ok_or(CoreError::ShapeMismatch {
@@ -992,6 +1025,32 @@ impl SparseStack {
     #[must_use]
     pub fn has_draft_head(&self) -> bool {
         self.desc.draft.is_some()
+    }
+
+    /// Marks the staged draft row as the one for the frontier `session` now
+    /// stands on: what a step that staged its row before committing does once
+    /// the commit has moved the frontier.
+    fn mark_staged_current(&mut self, session: SessionId) -> CoreResult<()> {
+        let live = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        if let Some(spec) = live.spec.as_mut() {
+            spec.staged_for = live.written;
+        }
+        Ok(())
+    }
+
+    /// The planes this stack's pages carry, and so the ranks its sessions keep
+    /// a raw indexer key ring for: every attention slot's, and the draft
+    /// head's when one is resident.
+    #[must_use]
+    pub fn page_planes(&self) -> crate::sparse::paged::PagePlanes {
+        crate::sparse::paged::PagePlanes {
+            indexer: true,
+            draft: self.has_draft_head(),
+            kv: self.opts.engine.kv_elem,
+        }
     }
 
     /// The head's chain of guesses behind `first`.
@@ -1090,6 +1149,25 @@ impl SparseStack {
         tokens: &[TokenId],
         start: u32,
     ) -> CoreResult<()> {
+        self.warm_draft_tapped(session, tokens, start, None)
+    }
+
+    /// [`SparseStack::warm_draft`] over a chunk a grid checkpoint is cut
+    /// inside, at row `snapshot` of the target's pass over it.
+    ///
+    /// That checkpoint stands the head where it has written up to the position
+    /// before the cut, and the raw keys of the block holding that position are
+    /// in the head's ring only while this pass runs: it writes on past them.
+    /// So the pass copies them into the snapshot buffer before that row of its
+    /// own - row `snapshot - 1`, since the head's row `i` is the target's
+    /// position `start + i`.
+    pub(crate) fn warm_draft_tapped(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        start: u32,
+        snapshot: Option<u32>,
+    ) -> CoreResult<()> {
         let rows = tokens.len().saturating_sub(1);
         let Some(span) = tokens.get(1..) else {
             return Ok(());
@@ -1100,12 +1178,23 @@ impl SparseStack {
         let positions: Vec<u32> = (0..rows)
             .map(|i| start.saturating_add(u32::try_from(i).unwrap_or(0)))
             .collect();
-        self.draft(
+        // The head's ring is the last rank's section of the blob.
+        let offset = crate::sparse::paged::snapshot_ring_offset(&self.shape, self.opts.spec)
+            .saturating_add(
+                u64::from(self.shape.count(crate::shape::LayerKind::Attn))
+                    .saturating_mul(crate::sparse::paged::ring_rank_bytes(&self.shape)),
+            );
+        let tap = snapshot
+            .and_then(|row| row.checked_sub(1))
+            .filter(|row| usize::try_from(*row).is_ok_and(|row| row < rows))
+            .map(|row| RingTap { row, offset });
+        self.draft_tapped(
             session,
             span,
             &positions,
             Operand::Scratch(Buf::Residual),
             false,
+            tap,
         )?;
         Ok(())
     }

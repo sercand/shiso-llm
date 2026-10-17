@@ -48,7 +48,8 @@ back to the kernel it belongs to.
 | `q4e_exact` | `exact.cu` | 2 | 0 |
 | `q4e_kv8` | `kv8.cu` | 8 | 0 |
 | `q4e_mxfp8` | `mxfp8.cu` | 5 | 0 |
-| **total** | 15 units | **82** | **105** |
+| `q4e_idxring` | `idxring.cu` | 1 | 0 |
+| **total** | 16 units | **83** | **105** |
 
 ## Plain entries, by module
 
@@ -121,6 +122,17 @@ list for all five: `out, codes, scales, x, in_dim, out_dim, rows`.
   outputs of at most 1024 rows.
 - `q4e_mxfp8_gemm_kernel` - a prompt chunk on tensor cores, 128 x 128 tiles,
   one scale group a contraction step, activations rounded to halves.
+
+### `q4e_idxring`
+
+Not an upstream unit: the indexer's pooled key pass over a per-session ring of
+raw keys, so a page carries no raw key row per position.
+
+- `q4e_idx_ring_pool_kernel` - `q4e_idx_pool_kernel`'s arithmetic, reading a
+  raw key from the pass's own f32 rows (rounded to f16 as the store rounded
+  it) or, before the pass's first position, from the ring; block 0 then copies
+  the frontier block's raw keys into a checkpoint's ring section when asked
+  (`snap_row != 0xFFFFFFFF`) and stores the pass's last 16 rows into the ring.
 
 ### `q4e_moe`
 
@@ -680,6 +692,17 @@ runs only at `n_head == 4` and when its 49,152 B opt-in succeeded; otherwise the
 scalar one, whose shared memory depends on `n_head` and reaches 32,768 B at the
 shipped 4. Their tile widths differ (`Q4E_IDX_TC_BT` vs `Q4E_IDX_BT`), so the
 `x` extents are not interchangeable.
+
+### `q4e_idxring`
+
+| Kernel | Grid | Block | Dynamic shared memory |
+|---|---|---|---|
+| `q4e_idx_ring_pool_kernel` | `n_tok / Q4E_IDX_R + 1` | `128` | `0` |
+
+Its arguments are `pooled, ring, k, w, pos, pages, n_tok, n_rot, rope_base,
+mrope_all, sec_t, sec_h, sec_w, eps, snap, snap_row`; the grid follows the
+same truncating-divide rule as `q4e_idx_pool_kernel` above, and block 0 always
+exists, because it is the one that writes the ring.
 
 ### `q4e_misc`
 

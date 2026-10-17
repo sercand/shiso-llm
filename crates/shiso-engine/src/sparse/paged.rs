@@ -10,15 +10,29 @@
 //! # A page is more than a key and a value here
 //!
 //! In the dense stack a page is each attention layer's key rows and value rows
-//! for one run of positions. Here it is that plus the indexer's two planes: the
-//! raw key row every position stores, and the pooled key row that stands for a
-//! whole block of them. All four have to be present for a span to be reusable,
-//! because an attention block that resumed on a span without its pooled keys
-//! would select blocks from another session's rows.
+//! for one run of positions. Here it is that plus the indexer's pooled key row,
+//! one for each block of [`IndexerShape::compress`] positions. All three have
+//! to be present for a span to be reusable, because an attention block that
+//! resumed on a span without its pooled keys would select blocks from another
+//! session's rows.
 //!
 //! The pooled plane is the reason the page size is what it is: it is a multiple
 //! of the pooling ratio, so a pooled block never straddles a page and a page's
 //! pooled rows are exactly its own share of the pooled table.
+//!
+//! # The raw indexer keys are not a plane
+//!
+//! A pooled row is the mean of its block's raw keys, and nothing else ever
+//! reads a raw key: not the scorers, which read pooled rows, and not the
+//! attention, which reads the incomplete block's tail out of the key and value
+//! planes. So once a block is pooled its raw keys are dead, and the only ones a
+//! session ever needs again are those of the block its frontier stands inside -
+//! at most `compress - 1` of them. A plane that kept one per position spent a
+//! quarter of a key's width on every cached token to hold three live rows per
+//! session; those rows live in each session's raw key ring instead
+//! ([`ring_bytes`]), and travel in its checkpoint blob rather than in its pages.
+//!
+//! [`IndexerShape::compress`]: crate::sparse::shape::IndexerShape::compress
 //!
 //! # Growth invalidates captured graphs
 //!
@@ -40,7 +54,7 @@ use shiso_core::page::{KvElem, PAGE_TOKENS, pages_for};
 use shiso_kvstore::{Backing, CacheGeometry, Frontier, KvError, PageId};
 
 use crate::shape::LayerKind;
-use crate::sparse::kernels::{F16_BYTES, F32_BYTES, I32_BYTES};
+use crate::sparse::kernels::{F16_BYTES, F32_BYTES, I32_BYTES, IDX_RING};
 use crate::sparse::mtp::SpecDepth;
 use crate::sparse::shape::SparseShape;
 
@@ -55,7 +69,7 @@ const UTILITY_DECAY_S: f64 = 600.0;
 
 /// Which plane of a page one run holds.
 ///
-/// Named rather than positional because the four have different widths: a
+/// Named rather than positional because the three have different widths: a
 /// reader that walked them by index alone and got the order wrong would read
 /// finite numbers out of the wrong plane, which is the failure this whole
 /// module is arranged to prevent.
@@ -65,30 +79,23 @@ pub enum Plane {
     Key,
     /// Attention values for one layer.
     Value,
-    /// The indexer's raw key row, one per position.
-    IndexerKey,
     /// The indexer's pooled key row, one per block of positions.
     IndexerPooled,
 }
 
-/// The four planes in the order a page lays them out, per attention layer.
+/// The three planes in the order a page lays them out, per attention layer.
 ///
-/// One array rather than four call sites, because the order is the layout: the
-/// allocator, the page copier and the host serializer all walk it, and they
+/// One array rather than three call sites, because the order is the layout:
+/// the allocator, the page copier and the host serializer all walk it, and they
 /// agree because there is one list.
-pub const PLANES: [Plane; 4] = [
-    Plane::Key,
-    Plane::Value,
-    Plane::IndexerKey,
-    Plane::IndexerPooled,
-];
+pub const PLANES: [Plane; 3] = [Plane::Key, Plane::Value, Plane::IndexerPooled];
 
 impl Plane {
     /// Bytes this plane occupies for one page of positions, with the attention
     /// planes stored as `kv`.
     ///
     /// Only the key and value planes take the cache element. The indexer's
-    /// planes stay f16 whatever it is: they decide which blocks attention reads
+    /// pooled plane stays f16 whatever it is: they decide which blocks attention reads
     /// at all, so an error there is a block never seen rather than a value seen
     /// slightly wrong.
     #[must_use]
@@ -98,9 +105,6 @@ impl Plane {
             Self::Key | Self::Value => positions
                 .saturating_mul(u64::from(shape.kv_dim()))
                 .saturating_mul(u64::from(kv.bytes())),
-            Self::IndexerKey => positions
-                .saturating_mul(u64::from(shape.indexer.head_dim))
-                .saturating_mul(F16_BYTES),
             Self::IndexerPooled => {
                 let compress = u64::from(shape.indexer.compress).max(1);
                 (positions / compress)
@@ -121,9 +125,10 @@ impl Plane {
 /// Deliberately NOT `#[non_exhaustive]`: a caller has to build one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PagePlanes {
-    /// Whether the indexer's raw and pooled planes are part of a page.
+    /// Whether the indexer's pooled plane is part of a page, and whether each
+    /// session keeps a raw key ring beside it.
     pub indexer: bool,
-    /// Whether a draft head's own key, value and indexer planes are too.
+    /// Whether a draft head's own key, value and pooled planes are too.
     ///
     /// The draft head runs the same indexer over its own rows, so it
     /// contributes a full attention layer's worth of planes rather than only a
@@ -161,9 +166,10 @@ impl PagePlanes {
 /// Bytes one pool page occupies across every cache buffer.
 ///
 /// Derived from the geometry rather than stated: one page is [`PAGE_TOKENS`]
-/// positions of every attention layer's keys and values, of the indexer's raw
-/// and quarter-rate pooled keys, and - when a draft head is resident - of that
-/// head's own four planes.
+/// positions of every attention layer's keys and values, of the indexer's
+/// quarter-rate pooled keys, and - when a draft head is resident - of that
+/// head's own three planes. The raw indexer keys are not here: see the
+/// module's notes.
 ///
 /// A page is *not* one contiguous extent. It is the run each of those buffers
 /// holds at one row range, and nothing here pretends otherwise: copying a page
@@ -174,9 +180,7 @@ pub fn page_bytes(shape: &SparseShape, planes: PagePlanes) -> u64 {
     let kv = Plane::Key
         .page_bytes(shape, planes.kv)
         .saturating_add(Plane::Value.page_bytes(shape, planes.kv));
-    let idx = Plane::IndexerKey
-        .page_bytes(shape, planes.kv)
-        .saturating_add(Plane::IndexerPooled.page_bytes(shape, planes.kv));
+    let idx = Plane::IndexerPooled.page_bytes(shape, planes.kv);
     let mut bytes = attn.saturating_mul(kv);
     if planes.indexer {
         bytes = bytes.saturating_add(attn.saturating_mul(idx));
@@ -211,8 +215,15 @@ pub fn page_bytes(shape: &SparseShape, planes: PagePlanes) -> u64 {
 /// it has to: the store derives the same length from the stored layout's own
 /// draft-head word, and a blob whose length did not follow that word would be
 /// read back with its sections shifted.
+///
+/// Last comes the session's raw indexer key ring, one section per rank the
+/// pages carry (`planes`): the raw keys of the block the frontier stands
+/// inside, which no page holds. It is the reason a blob from before the ring
+/// is a different length - and so, with the page size, a different identity on
+/// disk: a file written when the page still carried a raw key per position is
+/// a miss, never a misread.
 #[must_use]
-pub fn ckpt_bytes(shape: &SparseShape, spec: SpecDepth) -> u64 {
+pub fn ckpt_bytes(shape: &SparseShape, spec: SpecDepth, planes: PagePlanes) -> u64 {
     let gdn = u64::from(shape.count(LayerKind::Gdn));
     let per_slot = conv_state_bytes(shape).saturating_add(state_bytes(shape));
     let draft = if spec.is_speculative() {
@@ -223,12 +234,56 @@ pub fn ckpt_bytes(shape: &SparseShape, spec: SpecDepth) -> u64 {
     gdn.saturating_mul(per_slot)
         .saturating_add(ple_window_bytes(shape))
         .saturating_add(draft)
+        .saturating_add(ring_bytes(shape, planes))
+}
+
+/// Ranks a session keeps a raw indexer key ring for: every attention slot, and
+/// the draft head's when its planes are part of a page - the same ranks the
+/// pool allocates pooled planes for, in the same order.
+#[must_use]
+pub fn ring_ranks(shape: &SparseShape, planes: PagePlanes) -> u32 {
+    if !planes.indexer {
+        return 0;
+    }
+    shape
+        .count(LayerKind::Attn)
+        .saturating_add(u32::from(planes.draft))
+}
+
+/// Bytes of one rank's raw indexer key ring: [`IDX_RING`] f16 rows.
+#[must_use]
+pub fn ring_rank_bytes(shape: &SparseShape) -> u64 {
+    u64::from(IDX_RING)
+        .saturating_mul(u64::from(shape.indexer.head_dim))
+        .saturating_mul(F16_BYTES)
+}
+
+/// Bytes of a session's whole raw indexer key ring, every rank's in rank order.
+///
+/// Per session, not per token: this is what replaced a raw key row for every
+/// cached position.
+#[must_use]
+pub fn ring_bytes(shape: &SparseShape, planes: PagePlanes) -> u64 {
+    u64::from(ring_ranks(shape, planes)).saturating_mul(ring_rank_bytes(shape))
+}
+
+/// Where the raw key ring starts in a checkpoint blob: past the draft row when
+/// the stack speculates, past the n-gram window when it does not.
+#[must_use]
+pub fn snapshot_ring_offset(shape: &SparseShape, spec: SpecDepth) -> u64 {
+    let draft = if spec.is_speculative() {
+        draft_row_bytes(shape)
+    } else {
+        0
+    };
+    snapshot_draft_offset(shape).saturating_add(draft)
 }
 
 /// Where one recurrent slot's convolution window starts in a checkpoint blob,
 /// and so in the stack's snapshot buffer, which is laid out as one: every slot
 /// in ordinal order, each window followed by its state matrix, then the n-gram
-/// window, then the draft row. The order is `ckpt::snapshot`'s.
+/// window, then the draft row, then the raw indexer key ring. The order is
+/// `ckpt::snapshot`'s.
 #[must_use]
 pub fn snapshot_conv_offset(shape: &SparseShape, slot: u32) -> u64 {
     u64::from(slot).saturating_mul(conv_state_bytes(shape).saturating_add(state_bytes(shape)))
@@ -306,6 +361,105 @@ pub fn ple_window_bytes(shape: &SparseShape) -> u64 {
     })
 }
 
+/// Where a checkpoint blob's raw key ring section sits and what is live in it.
+///
+/// A checkpoint at `q` stands each target rank on frontier `q` and the draft
+/// head's rank, the last, on `q - 1`: the head at position `p` reads the token
+/// at `p + 1`, so it has only ever written up to the position before the
+/// target's frontier. The rows a resume there reads are the raw keys of the
+/// block each frontier stands inside, from the block's first position up to
+/// the frontier - at most `compress - 1` per rank.
+///
+/// Every other row of the ring is stale: a key whose block was pooled long ago,
+/// a draft the target rejected, or nothing at all. None of it is ever read, but
+/// left in the blob it would make two checkpoints of the same state differ by
+/// whatever the ring happened to hold, so [`RingLayout::canonicalize`] zeroes
+/// it. Copied into a blob as it stands, then canonicalized, the section is a
+/// function of the tokens alone.
+///
+/// Deliberately NOT `#[non_exhaustive]`: a caller builds one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingLayout {
+    /// Byte offset of the section in the blob.
+    pub offset: u64,
+    /// Ranks the section holds, in rank order.
+    pub ranks: u32,
+    /// Whether the last rank is the draft head's.
+    pub draft: bool,
+    /// Bytes of one raw key row.
+    pub row_bytes: u64,
+    /// Positions one pooled block averages over.
+    pub compress: u32,
+}
+
+impl RingLayout {
+    /// The section a blob of this geometry carries.
+    #[must_use]
+    pub fn of(shape: &SparseShape, spec: SpecDepth, planes: PagePlanes) -> Self {
+        Self {
+            offset: snapshot_ring_offset(shape, spec),
+            ranks: ring_ranks(shape, planes),
+            draft: planes.draft && planes.indexer,
+            row_bytes: u64::from(shape.indexer.head_dim).saturating_mul(F16_BYTES),
+            compress: shape.indexer.compress.max(1),
+        }
+    }
+
+    /// The frontier rank `rank` stands on in a checkpoint at `q`.
+    #[must_use]
+    pub const fn frontier(&self, rank: u32, q: u32) -> u32 {
+        if self.draft && rank + 1 == self.ranks {
+            q.saturating_sub(1)
+        } else {
+            q
+        }
+    }
+
+    /// Whether a resume at `q` reads ring slot `slot` of rank `rank`.
+    #[must_use]
+    pub const fn live(&self, rank: u32, slot: u32, q: u32) -> bool {
+        let frontier = self.frontier(rank, q);
+        let first = frontier - frontier % self.compress;
+        let mut at = first;
+        while at < frontier {
+            if at % IDX_RING == slot {
+                return true;
+            }
+            at += 1;
+        }
+        false
+    }
+
+    /// Zeroes every row of `blob`'s ring section a resume at `q` does not read.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] when the blob is too short to hold the
+    /// section, which would mean it was cut for another geometry.
+    pub fn canonicalize(&self, blob: &mut [u8], q: u32) -> CoreResult<()> {
+        let row = usize::try_from(self.row_bytes).unwrap_or(usize::MAX);
+        let start = usize::try_from(self.offset).unwrap_or(usize::MAX);
+        let len = row
+            .saturating_mul(IDX_RING as usize)
+            .saturating_mul(self.ranks as usize);
+        let end = start.saturating_add(len);
+        let got = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+        let section = blob.get_mut(start..end).ok_or(CoreError::ShapeMismatch {
+            field: "checkpoint ring section",
+            expected: u64::try_from(end).unwrap_or(u64::MAX),
+            got,
+        })?;
+        for (index, bytes) in section.chunks_exact_mut(row.max(1)).enumerate() {
+            let rank = u32::try_from(index / IDX_RING as usize).unwrap_or(u32::MAX);
+            let slot = u32::try_from(index % IDX_RING as usize).unwrap_or(u32::MAX);
+            if !self.live(rank, slot, q) {
+                bytes.fill(0);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The cache geometry this shape implies.
 #[must_use]
 pub fn cache_geometry(shape: &SparseShape, planes: PagePlanes, spec: SpecDepth) -> CacheGeometry {
@@ -315,7 +469,7 @@ pub fn cache_geometry(shape: &SparseShape, planes: PagePlanes, spec: SpecDepth) 
     CacheGeometry::new(
         PAGE_TOKENS,
         page_bytes(shape, planes),
-        ckpt_bytes(shape, spec),
+        ckpt_bytes(shape, spec, planes),
         ESTIMATED_PREFILL_S_PER_TOKEN,
         UTILITY_DECAY_S,
     )
@@ -396,7 +550,7 @@ impl PagedKv {
                 let tag = match (draft, plane) {
                     (true, _) => MemTag::KvDraft,
                     (false, Plane::Key | Plane::Value) => MemTag::KvAttention,
-                    (false, Plane::IndexerKey | Plane::IndexerPooled) => MemTag::KvIndexer,
+                    (false, Plane::IndexerPooled) => MemTag::KvIndexer,
                 };
                 let stride = plane.page_bytes(shape, planes.kv);
                 let bytes = u64::from(pool_pages).checked_mul(stride).ok_or_else(|| {
@@ -703,5 +857,127 @@ impl SessionPages {
         self.backend.copy_h2d(self.table.slice(0, len)?, &bytes)?;
         self.uploaded = pages.len();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LAYOUT: RingLayout = RingLayout {
+        offset: 8,
+        ranks: 3,
+        draft: true,
+        row_bytes: 4,
+        compress: 4,
+    };
+
+    #[test]
+    fn a_checkpoint_on_a_block_boundary_keeps_no_target_row_and_three_draft_rows() {
+        // q = 64: every target rank starts a fresh block, and the draft head,
+        // one position behind, stands after 60, 61 and 62.
+        for slot in 0..IDX_RING {
+            assert!(!LAYOUT.live(0, slot, 64));
+            assert!(!LAYOUT.live(1, slot, 64));
+            assert_eq!(
+                LAYOUT.live(2, slot, 64),
+                matches!(slot, 12..=14),
+                "slot {slot}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_live_rows_are_the_frontier_blocks_positions_at_their_ring_slots() {
+        // q = 1_027 = 4 * 256 + 3: targets need 1024, 1025, 1026 - slots 0, 1,
+        // 2 - and the head, standing on 1026, needs 1024 and 1025.
+        let live = |rank| {
+            (0..IDX_RING)
+                .filter(|slot| LAYOUT.live(rank, *slot, 1_027))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(live(0), [0, 1, 2]);
+        assert_eq!(live(2), [0, 1]);
+        // And a position wrapping the ring lands on its own slot.
+        assert_eq!(
+            (0..IDX_RING)
+                .filter(|slot| LAYOUT.live(0, *slot, 31))
+                .collect::<Vec<_>>(),
+            [12, 13, 14]
+        );
+    }
+
+    #[test]
+    fn canonicalizing_zeroes_every_dead_row_and_nothing_outside_the_section() {
+        let rows = (LAYOUT.ranks * IDX_RING) as usize;
+        let mut blob = vec![0xAB_u8; 8 + rows * 4 + 5];
+        LAYOUT
+            .canonicalize(&mut blob, 1_027)
+            .expect("the blob holds the section");
+        assert!(
+            blob[..8].iter().all(|b| *b == 0xAB),
+            "the bytes in front moved"
+        );
+        assert!(
+            blob[8 + rows * 4..].iter().all(|b| *b == 0xAB),
+            "the bytes behind moved"
+        );
+        let kept = blob[8..8 + rows * 4]
+            .chunks_exact(4)
+            .filter(|row| row.iter().all(|b| *b == 0xAB))
+            .count();
+        // Three rows for each target rank, two for the head.
+        assert_eq!(kept, 3 + 3 + 2);
+        assert!(
+            LAYOUT.canonicalize(&mut [0u8; 16], 1).is_err(),
+            "a blob cut for another geometry is refused"
+        );
+    }
+
+    #[test]
+    fn the_pages_carry_no_raw_key_and_the_ring_is_per_session() {
+        let shape = SparseShape {
+            layers: vec![LayerKind::Gdn, LayerKind::Attn],
+            hidden: 2_560,
+            vocab: 248_320,
+            streams: 4,
+            stream_rank: 320,
+            gqa: crate::sparse::shape::GqaShape::new(24, 2, 256, 64),
+            gdn: crate::shape::GdnShape::new(48, 16, 128, 4),
+            moe: crate::sparse::shape::MoeShape::new(512, 10, 1, 640),
+            indexer: crate::sparse::shape::IndexerShape::new(4, 128, 2_048, 4),
+            ple: None,
+            mrope: crate::sparse::shape::MropeSections::new(11, 11, 10),
+            rms_eps: 1.0e-6,
+            rope_theta: 1.0e7,
+        };
+        let tokens = u64::from(PAGE_TOKENS);
+        // One attention rank plus the head: key and value at two heads of 256,
+        // then one pooled f16 row of 128 per four positions.
+        for (kv, per_rank) in [
+            (KvElem::F16, 2 * 2 * 256 * 2 + 64),
+            (KvElem::Fp8E4m3, 2 * 2 * 256 + 64),
+        ] {
+            let planes = PagePlanes {
+                kv,
+                ..PagePlanes::full()
+            };
+            assert_eq!(page_bytes(&shape, planes), 2 * per_rank * tokens);
+        }
+        assert_eq!(ring_ranks(&shape, PagePlanes::full()), 2);
+        assert_eq!(ring_ranks(&shape, PagePlanes::indexer_only()), 1);
+        assert_eq!(ring_ranks(&shape, PagePlanes::default()), 0);
+        assert_eq!(ring_bytes(&shape, PagePlanes::full()), 2 * 16 * 128 * 2);
+        let spec = SpecDepth::new(3);
+        assert_eq!(
+            ckpt_bytes(&shape, spec, PagePlanes::full())
+                - ckpt_bytes(&shape, spec, PagePlanes::default()),
+            ring_bytes(&shape, PagePlanes::full())
+        );
+        assert_eq!(
+            snapshot_ring_offset(&shape, spec) + ring_bytes(&shape, PagePlanes::full()),
+            ckpt_bytes(&shape, spec, PagePlanes::full()),
+            "the ring is the blob's last section"
+        );
     }
 }

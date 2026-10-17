@@ -18,6 +18,7 @@ pub mod fp8;
 pub mod gdn;
 pub mod hc;
 pub mod idx;
+pub mod idxring;
 pub mod indexer;
 pub mod kv8;
 pub mod matvec;

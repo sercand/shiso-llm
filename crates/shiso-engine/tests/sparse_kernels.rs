@@ -806,11 +806,11 @@ fn the_geometry_of_every_kernel_is_the_expression_its_launcher_computes() {
         attn_batch,
         kernels::qsa_attention(shape.gqa.q_heads, rows, shape.gqa.head_dim)
     );
-    assert_eq!(kernels::idx_store_k_batch(rows), kernels::idx_store_k(rows));
 
     // And the pooled key pass a batch launches per row covers one position, so
-    // its grid is the one block the truncating divide plus one gives.
-    assert_eq!(kernels::idx_pool(1, kernels::IDX_R).grid.x, 1);
+    // its grid is the one block the truncating divide plus one gives - the
+    // block that also refills the row's raw key ring.
+    assert_eq!(kernels::idx_ring_pool(1, kernels::IDX_R).grid.x, 1);
 
     // Both n-gram row decodes: one block per (token, hash head) either way, and
     // the block width is the whole of the difference - a warp for the
@@ -882,6 +882,7 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "exact.cu",
         "kv8.cu",
         "mxfp8.cu",
+        "idxring.cu",
     ] {
         let path = dir.join(unit);
         let text = std::fs::read_to_string(&path)
@@ -1310,11 +1311,13 @@ fn every_fp8_cache_launch_binds_the_parameters_its_kernel_declares() {
 /// the position it points at. The batched attention entry is not among them any
 /// more: a batch attends one row at a time through the single-row kernels, over
 /// each row's own page table, so a row computes what it would alone.
-const BATCHED: [&str; 5] = [
+/// The raw indexer key store's batched entry is not here: no raw key is
+/// stored per position any more, and the pooled pass that took its place reads
+/// each row's ring by row instead.
+const BATCHED: [&str; 4] = [
     "q4e_gdn_conv_batch_kernel",
     "q4e_gdn_recurrent_batch_kernel",
     "q4e_qsa_store_kv_batch_kernel",
-    "q4e_idx_store_k_batch_kernel",
     "q4e_ple_conv_batch_kernel",
 ];
 
@@ -1336,7 +1339,6 @@ fn every_batched_entry_binds_a_per_row_array_where_its_declaration_takes_one() {
             Operand::RecurrentStates(0),
         ),
         ("q4e_qsa_store_kv_batch_kernel", 14, Operand::PageTables),
-        ("q4e_idx_store_k_batch_kernel", 3, Operand::PageTables),
         ("q4e_ple_conv_batch_kernel", 1, Operand::NgramWindows),
     ];
     for (name, index, want) in arrays {
@@ -1442,11 +1444,11 @@ fn the_pooled_key_pass_reads_the_rotary_table_from_its_prefix_and_nothing_else_d
     let pool = plan
         .steps()
         .iter()
-        .find(|step| step.name() == "q4e_idx_pool_kernel")
+        .find(|step| step.name() == "q4e_idx_ring_pool_kernel")
         .expect("the storing half pools");
     let operands = pool.operands().expect("the list fits a launch");
     assert_eq!(
-        operands[8],
+        operands[9],
         Operand::Scratch(Buf::Mrope),
         "the pooled pass reads the table whole"
     );
@@ -1470,6 +1472,77 @@ fn the_pooled_key_pass_reads_the_rotary_table_from_its_prefix_and_nothing_else_d
         matches!(operands[8], Operand::ScratchFrom(Buf::Mrope, offset) if offset > 0),
         "the query rotation reads the chunk's own first row, not the prefix: {:?}",
         operands[8]
+    );
+}
+
+#[test]
+fn the_storing_half_is_one_pooled_pass_per_session_over_its_own_ring_and_its_own_keys() {
+    // No raw key plane is written any more: the only launch after the key
+    // projection is the pooled pass, and it reads the session's ring. A chunk
+    // binds the pass's one session; a batch binds row `r`'s ring and row `r`'s
+    // key row in row `r`'s launch - a ring bound by the wrong row would pool
+    // one sequence's block out of another's raw keys.
+    let shape = shape();
+    let desc = attn_desc(&shape).indexer;
+    let slot = indexer::IndexerSlot::new(LayerRef::target(3), 2, CTX);
+    let pools = |origin, rows| {
+        indexer::store(&shape, &desc, slot, origin, rows, GPU)
+            .expect("a half-precision indexer has a tier")
+            .steps()
+            .iter()
+            .filter(|step| step.entry().is_some() && step.name().starts_with("q4e_idx"))
+            .map(|step| {
+                (
+                    step.name().to_owned(),
+                    step.operands().expect("the list fits a launch").to_vec(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let chunk = pools(RowOrigin::Sequential, 8);
+    assert_eq!(chunk.len(), 1, "one launch stores a chunk: {chunk:?}");
+    assert_eq!(chunk[0].0, "q4e_idx_ring_pool_kernel");
+    assert_eq!(chunk[0].1[1], Operand::IndexerRing(2));
+    assert_eq!(chunk[0].1[2], Operand::Scratch(Buf::IdxKey));
+    assert_eq!(
+        (chunk[0].1[14], chunk[0].1[15]),
+        (Operand::IndexerRing(2), Operand::U32(kernels::IDX_NO_TAP)),
+        "a pass with no tap hands the kernel its own ring and no row"
+    );
+    let batch = pools(RowOrigin::Unrelated, 3);
+    assert_eq!(batch.len(), 3, "a batch pools once per row: {batch:?}");
+    for (row, (name, operands)) in (0_u32..).zip(&batch) {
+        assert_eq!(name, "q4e_idx_ring_pool_kernel");
+        assert_eq!(operands[1], Operand::IndexerRingOf { rank: 2, row });
+        assert_eq!(
+            operands[2],
+            Operand::ScratchFrom(Buf::IdxKey, u64::from(row) * 128 * 4)
+        );
+        assert_eq!(operands[5], Operand::PagesOf(row));
+    }
+    // And a tap reaches the kernel only on the one-session pass that asks.
+    let tap = indexer::RingTap {
+        row: 5,
+        offset: 4_096,
+    };
+    let tapped = indexer::store(
+        &shape,
+        &desc,
+        slot.with_tap(Some(tap)),
+        RowOrigin::Sequential,
+        8,
+        GPU,
+    )
+    .expect("a half-precision indexer has a tier");
+    let step = tapped
+        .steps()
+        .iter()
+        .find(|step| step.name() == "q4e_idx_ring_pool_kernel")
+        .expect("the storing half pools");
+    let operands = step.operands().expect("the list fits a launch");
+    assert_eq!(
+        (operands[14], operands[15]),
+        (Operand::Snapshot(4_096), Operand::U32(5))
     );
 }
 

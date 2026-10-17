@@ -362,6 +362,22 @@ pub enum Operand {
         /// Which plane.
         plane: Plane,
     },
+    /// One attention rank's raw indexer key ring, of the pass's one session.
+    ///
+    /// Session state rather than a cache plane: the raw keys of the block a
+    /// session's frontier stands inside belong to that session alone, so a
+    /// binder holding a batch refuses this for the reason it refuses
+    /// [`Operand::Pages`].
+    IndexerRing(u32),
+    /// One attention rank's raw indexer key ring, of one row's session: what a
+    /// per-row pooled pass binds inside a batched or segmented pass, in the
+    /// way [`Operand::PagesOf`] names one row's page table.
+    IndexerRingOf {
+        /// The attention rank.
+        rank: u32,
+        /// The row, which is the binder's row.
+        row: u32,
+    },
     /// One recurrent slot's convolution window.
     RecurrentConv(u32),
     /// One recurrent slot's state matrix.
@@ -522,6 +538,8 @@ impl Operand {
                 | Self::RecurrentStateCkpts(_)
                 | Self::NgramWindows
                 | Self::CachePlane { .. }
+                | Self::IndexerRing(_)
+                | Self::IndexerRingOf { .. }
                 | Self::RecurrentConv(_)
                 | Self::RecurrentState(_)
                 | Self::RecurrentConvCkpt(_)
@@ -931,6 +949,10 @@ impl<'a> Binder<'a> {
             Operand::NgramWindows => KernelArg::Buffer(self.array(PtrArray::NgramWindows)?),
             Operand::CachePlane { rank, plane } => {
                 KernelArg::Buffer(self.cache.plane(rank, plane)?)
+            }
+            Operand::IndexerRing(rank) => KernelArg::Buffer(self.only()?.indexer_ring(rank)?),
+            Operand::IndexerRingOf { rank, row } => {
+                KernelArg::Buffer(self.row(row)?.indexer_ring(rank)?)
             }
             Operand::RecurrentConv(slot) => KernelArg::Buffer(self.only()?.recurrent(slot)?.0),
             Operand::RecurrentState(slot) => KernelArg::Buffer(self.only()?.recurrent(slot)?.1),

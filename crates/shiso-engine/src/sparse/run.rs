@@ -541,18 +541,22 @@ impl SparseStack {
     /// A scoring session's tail past its shared boundary is never resumed and
     /// never drafted from, so the head's cache is warmed only over the part a
     /// later session can stand on.
+    ///
+    /// `snapshot` is the row of the target's pass a grid checkpoint is cut at,
+    /// whose draft head rows the warm-up copies out on its way past them.
     fn warm_draft_below_boundary(
         &mut self,
         session: SessionId,
         head: &[TokenId],
         start: u32,
+        snapshot: Option<u32>,
     ) -> CoreResult<()> {
         let warm_until = self.session(session)?.warm_until;
         let warm_end = usize::try_from(warm_until.saturating_sub(start))
             .unwrap_or(usize::MAX)
             .min(head.len());
         if warm_end > 0 {
-            self.warm_draft(session, &head[..warm_end], start)?;
+            self.warm_draft_tapped(session, &head[..warm_end], start, snapshot)?;
         }
         Ok(())
     }
@@ -643,6 +647,26 @@ impl SparseStack {
                 PassRole::Prompt { snapshot },
             )?;
             self.keep_rope_shift(session, run.as_ref(), head, start);
+            // Both draft rows a checkpoint can carry come out of the pass's
+            // residual, so both are copied out before the warm-up below
+            // overwrites it: the snapshot row's, and the chunk's last. Staged
+            // after the pass and before the commit: the commit is where a
+            // prompt's final chunk earns its checkpoint, and a speculating
+            // session's checkpoint carries this row - staged any later, the
+            // first chunk had none to carry and was never checkpointed, and a
+            // later chunk carried the chunk before it's.
+            if let Some(row) = snapshot {
+                self.stage_snapshot_row(session, row)?;
+            }
+            if self.has_draft_head() {
+                let last = u32::try_from(head.len().saturating_sub(1)).unwrap_or(0);
+                self.stage_draft_row(session, last)?;
+            }
+            // The warm-up before either commit: a checkpoint carries the draft
+            // head's raw key ring, and the head's rows for this chunk are the
+            // warm-up's to write. A grid checkpoint cut inside the chunk takes
+            // them from inside the warm-up, at its own row.
+            self.warm_draft_below_boundary(session, head, start, snapshot)?;
             // A prompt that ends between two grid points is checkpointed at the
             // last one instead of at its end: a longer prompt continues from
             // there exactly as a cold prefill of it would, where a checkpoint at
@@ -660,16 +684,6 @@ impl SparseStack {
                 }
                 None => boundary,
             };
-            // Staged after the pass and before the commit: the commit is where
-            // a prompt's final chunk earns its checkpoint, and a speculating
-            // session's checkpoint carries this row - staged any later, the
-            // first chunk had none to carry and was never checkpointed, and a
-            // later chunk carried the chunk before it's. And before the warm-up
-            // reads the residual, because the warm-up is what overwrites it.
-            if self.has_draft_head() {
-                let last = u32::try_from(head.len().saturating_sub(1)).unwrap_or(0);
-                self.stage_draft_row(session, last)?;
-            }
             self.advance_at(session, head, boundary, logit_rows.checked_sub(1))?;
             // The row staged before the advance is the residual of the chunk's
             // last position, so it drafts from the frontier the advance just
@@ -679,7 +693,6 @@ impl SparseStack {
             {
                 spec.staged_for = live.written;
             }
-            self.warm_draft_below_boundary(session, head, start)?;
             // The rows the next piece needs are known the moment this one is
             // enqueued, and this one is about to spend its time on the device,
             // so reading them now costs nothing and the fetch that asks for

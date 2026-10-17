@@ -38,8 +38,8 @@ use shiso_core::{Backend, CoreError, CoreResult, Extent3};
 use crate::sparse::exl3::{self as exl3, GemmShape};
 use crate::sparse::kernels::{
     self, Elem, Entry, EntryTable, Instantiation, MOD_EMBED, MOD_EXACT, MOD_EXL3, MOD_GDN,
-    MOD_GDN_TC, MOD_HC, MOD_IDX, MOD_KV8, MOD_MATVEC, MOD_MISC, MOD_MOE, MOD_PLE, MOD_QSA,
-    MOD_QSA_SPARSE, TemplateArgs,
+    MOD_GDN_TC, MOD_HC, MOD_IDX, MOD_IDXRING, MOD_KV8, MOD_MATVEC, MOD_MISC, MOD_MOE, MOD_PLE,
+    MOD_QSA, MOD_QSA_SPARSE, TemplateArgs,
 };
 
 /// Every module the sparse stack launches out of.
@@ -57,6 +57,7 @@ const MODULES: &[&str] = &[
     MOD_QSA,
     MOD_QSA_SPARSE,
     MOD_IDX,
+    MOD_IDXRING,
     MOD_MISC,
     MOD_EMBED,
     MOD_EXACT,

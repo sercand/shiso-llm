@@ -25,7 +25,9 @@
 # attention reader of the K and V planes again, over a cache of FP8 E4M3 bytes
 # instead of f16, selected by `--kv-cache-dtype fp8`. `mxfp8` is a fourth: the
 # dense projections over an MXFP8 weight, read as stored, again this
-# repository's own.
+# repository's own. `idxring` is a fifth: the indexer's pooled key pass reading
+# raw keys from a per-session ring and the pass's own rows instead of from a
+# per-position raw key plane, which the page no longer carries.
 
 [build]
 sources = [
@@ -44,6 +46,7 @@ sources = [
     "exact.cu",
     "kv8.cu",
     "mxfp8.cu",
+    "idxring.cu",
 ]
 
 # Every unit includes `q4e.cuh` by bare name, and that header reaches its own
@@ -92,3 +95,4 @@ modelopt = "q4e_modelopt"
 exact = "q4e_exact"
 kv8 = "q4e_kv8"
 mxfp8 = "q4e_mxfp8"
+idxring = "q4e_idxring"

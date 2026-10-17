@@ -395,6 +395,10 @@ impl SparseStack {
             dense_rows,
             run_dense_rows,
             role,
+            // The target's own passes never tap the ring: a grid checkpoint
+            // cut inside one stands every target rank on a block boundary,
+            // where no raw key is live.
+            ring_tap: None,
         };
         // A pass that crosses the budget is planned with its attention split
         // at the crossing, and the island key does not say where that is: a

@@ -88,6 +88,10 @@ pub const MOD_KV8: &str = "q4e_kv8";
 /// weight, and the tensor-core prompt kernel. Not an upstream unit, for the
 /// reason [`MOD_MODELOPT`] is not.
 pub const MOD_MXFP8: &str = "q4e_mxfp8";
+/// The indexer's pooled key pass over a per-session ring of raw keys, which is
+/// what lets a page carry no raw key row per position. Not an upstream unit,
+/// for the reason [`MOD_MODELOPT`] is not.
+pub const MOD_IDXRING: &str = "q4e_idxring";
 /// The logits stages run before any pick: today, the suppress stage.
 pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a
@@ -159,6 +163,28 @@ pub const IDX_QUERY_BLOCK: u32 = 512;
 /// Slots one expanded selection writes per query row: the selected positions
 /// plus three words of bookkeeping.
 pub const IDX_WIDTH: u32 = 2_048 + 3;
+/// Raw indexer key rows one session keeps per attention rank, each position at
+/// slot `position % IDX_RING`.
+///
+/// The pooled pass is the only reader of a raw key, and it reads the keys of
+/// the block a pass starts inside - at most `IDX_R - 1` positions behind the
+/// pass's first. Between passes those are the only raw keys worth keeping, and
+/// a ring this deep keeps them through the furthest rewind a speculative step
+/// makes: a verify settles anywhere inside its `MAX_DRAFT + 1` rows, and the
+/// draft head's catch-up starts up to `MAX_DRAFT` positions behind its chain.
+/// With every pass starting at most `D` positions behind the highest written,
+/// a slot still holds the key a pass reads when the ring is `D + IDX_R - 1`
+/// deep (see `idxring.cu`); [`RING_REWIND`] is that `D`.
+pub const IDX_RING: u32 = 16;
+/// The furthest any pass starts behind the highest position its rank has
+/// written: a full verify of `MAX_DRAFT` drafts and its committed token.
+pub const RING_REWIND: u32 = crate::sparse::mtp::MAX_DRAFT + 1;
+/// The tap row that asks the pooled pass for no copy into a checkpoint.
+pub const IDX_NO_TAP: u32 = u32::MAX;
+const _: () = assert!(
+    IDX_RING >= RING_REWIND + IDX_R - 1 && IDX_RING.is_multiple_of(IDX_R),
+    "the raw key ring must outlast a speculative rewind"
+);
 
 /// Warps in the dense attention block.
 pub const ATTN_WARPS: u32 = 8;
@@ -1305,18 +1331,6 @@ pub const fn qsa_attention_combine(heads: u32, n_tok: u32) -> Launch {
 
 // --- the indexer ------------------------------------------------------------
 
-/// The raw indexer key store, one block per token.
-#[must_use]
-pub const fn idx_store_k(n_tok: u32) -> Launch {
-    Launch::linear(n_tok, BLOCK_NARROW)
-}
-
-/// The same raw key store with one sequence's page table per row.
-#[must_use]
-pub const fn idx_store_k_batch(n_row: u32) -> Launch {
-    idx_store_k(n_row)
-}
-
 /// The pooled indexer key pass.
 ///
 /// The grid is **not** a ceiling. At most `n_tok / r` key blocks complete in one
@@ -1332,6 +1346,14 @@ pub const fn idx_pool(n_tok: u32, compress: u32) -> Launch {
         None => 0,
     };
     Launch::linear(blocks, BLOCK_NARROW)
+}
+
+/// The pooled indexer key pass over the raw key ring: the pooled pass's own
+/// grid, whose block 0 always exists because it is the one that writes the
+/// ring.
+#[must_use]
+pub const fn idx_ring_pool(n_tok: u32, compress: u32) -> Launch {
+    idx_pool(n_tok, compress)
 }
 
 /// The indexer query normalization and rotary, one block per (head, token).

@@ -180,6 +180,7 @@ fn the_real_manifest_tree_parses() {
             "q4e_gdn_tc",
             "q4e_hc",
             "q4e_idx",
+            "q4e_idxring",
             "q4e_kv8",
             "q4e_matvec",
             "q4e_misc",

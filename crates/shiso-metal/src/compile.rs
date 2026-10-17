@@ -265,6 +265,12 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         include_str!("../metal/q4e/qsa_sparse.metal"),
     ),
     ("q4e/idx.metal", include_str!("../metal/q4e/idx.metal")),
+    // The pooled pass over the raw key ring; after `idx.metal`, whose
+    // constants it uses.
+    (
+        "q4e/idxring.metal",
+        include_str!("../metal/q4e/idxring.metal"),
+    ),
     ("q4e/misc.metal", include_str!("../metal/q4e/misc.metal")),
     ("q4e/embed.metal", include_str!("../metal/q4e/embed.metal")),
     (

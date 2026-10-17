@@ -40,14 +40,15 @@ fn a_session_owns_its_recurrent_stack_and_its_n_gram_window_and_closing_it_hands
     let owned = fake.allocated_since(mark);
 
     // A convolution window and a state matrix per recurrent slot, the n-gram
-    // block's own dilated window, and one page table. Nothing else is per
-    // session: the key/value rows and the indexer's two planes belong to the
-    // shared pool, which is why opening a session is kilobytes rather than a
-    // cache.
+    // block's own dilated window, the raw indexer key ring, and one page
+    // table. Nothing else is per session: the key/value rows and the indexer's
+    // pooled plane belong to the shared pool, which is why opening a session
+    // is kilobytes rather than a cache.
     assert_eq!(
         owned.len(),
-        2 * RECURRENT_SLOTS + 2,
-        "a session allocates two buffers per recurrent slot, an n-gram window and a page table"
+        2 * RECURRENT_SLOTS + 3,
+        "a session allocates two buffers per recurrent slot, an n-gram window, a raw key ring \
+         and a page table"
     );
     assert!(
         owned.iter().all(|id| fake.is_live(*id)),
@@ -72,16 +73,16 @@ fn a_session_owns_its_recurrent_stack_and_its_n_gram_window_and_closing_it_hands
 }
 
 #[test]
-fn the_cache_pool_allocates_four_planes_for_every_attention_slot() {
+fn the_cache_pool_allocates_three_planes_for_every_attention_slot() {
     let (_dir, fake, model) = loaded();
-    // Keys, values, the indexer's raw key rows and its pooled key rows. All
-    // four have to be present for a span to be reusable, because a block that
-    // resumed on a span without its pooled keys would select blocks from rows
-    // another session wrote.
+    // Keys, values and the indexer's pooled key rows; the raw keys are each
+    // session's ring, not the pool's. All three have to be present for a span
+    // to be reusable, because a block that resumed on a span without its
+    // pooled keys would select blocks from rows another session wrote.
     let live = fake.live_count();
     assert!(
-        live >= 4 * ATTN_SLOTS,
-        "{live} live allocations is fewer than the four planes of {ATTN_SLOTS} attention slots"
+        live >= 3 * ATTN_SLOTS,
+        "{live} live allocations is fewer than the three planes of {ATTN_SLOTS} attention slots"
     );
     drop(model);
 }

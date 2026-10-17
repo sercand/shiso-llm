@@ -191,6 +191,10 @@ pub struct AttnContext {
     /// rows at the end of a prompt are summed as they would have been in the
     /// middle of one. See [`crate::sparse::matmul::Device::role`].
     pub role: PassRole,
+    /// The copy of this rank's raw indexer key ring a checkpoint cut inside
+    /// this pass needs, if any. See [`indexer::RingTap`]; `None`, the
+    /// default, for every pass but the one the draft head warms a chunk with.
+    pub ring_tap: Option<indexer::RingTap>,
 }
 
 /// Query heads that share one key head.
@@ -499,7 +503,7 @@ fn segmented(
             ]),
         );
     }
-    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx);
+    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx).with_tap(ctx.ring_tap);
     plan.append(indexer::store(
         shape,
         &desc.indexer,
@@ -850,7 +854,7 @@ pub fn block(
             Operand::f32(shape.rms_eps),
         ]),
     );
-    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx);
+    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx).with_tap(ctx.ring_tap);
     plan.append(indexer::store(
         shape,
         &desc.indexer,
