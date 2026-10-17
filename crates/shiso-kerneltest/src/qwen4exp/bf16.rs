@@ -473,19 +473,35 @@ const BENCH_ROTATION_BYTES: usize = 512 << 20;
 /// How many copies of a `bytes`-byte weight fill [`BENCH_ROTATION_BYTES`];
 /// one for a weight that is itself larger than every cache.
 fn copies(bytes: usize) -> usize {
-    if bytes >= BENCH_ROTATION_BYTES {
+    copies_over(bytes, BENCH_ROTATION_BYTES)
+}
+
+/// How many copies of a `bytes`-byte weight fill `rotation` bytes.
+fn copies_over(bytes: usize, rotation: usize) -> usize {
+    if bytes >= rotation {
         1
     } else {
-        BENCH_ROTATION_BYTES.div_ceil(bytes.max(1)).max(2)
+        rotation.div_ceil(bytes.max(1)).max(2)
     }
 }
+
+/// The working set the in-model fixtures rotate over: a decode step reads
+/// some 7 GB of weights, so a matrix is never in any cache and its pages are
+/// rarely in the translation caches either; 2 GiB of copies comes closer to
+/// that than the 512 MiB ring.
+const BENCH_WIDE_ROTATION_BYTES: usize = 2 << 30;
 
 /// The step kernels the engine plans for `rows` rows at one shape: the
 /// weight read once, the activations read and the output written once.
 fn bench_step(gpu: &Gpu, out_dim: u32, in_dim: u32, rows: u32) -> Fixture {
+    bench_step_over(gpu, out_dim, in_dim, rows, BENCH_ROTATION_BYTES)
+}
+
+/// [`bench_step`] rotating over `rotation` bytes of weight copies.
+fn bench_step_over(gpu: &Gpu, out_dim: u32, in_dim: u32, rows: u32, rotation: usize) -> Fixture {
     let m = Matrix::new(out_dim, in_dim, 0xBE7C);
     let bytes_w = m.bytes();
-    let weights: Vec<DeviceBuffer> = (0..copies(bytes_w.len()))
+    let weights: Vec<DeviceBuffer> = (0..copies_over(bytes_w.len(), rotation))
         .map(|_| gpu.upload(&bytes_w))
         .collect();
     let x = gpu.upload(&f32_bytes(&signal(rows as usize * in_dim as usize, 0x0B0B)));
@@ -694,6 +710,14 @@ macro_rules! benches {
 }
 
 benches! {
+    /// One-row step at the stream mix down's shape, over a 2 GiB working set.
+    bench_wide_gemv_320x10240 => |g| bench_step_over(g, 320, 10_240, 1, BENCH_WIDE_ROTATION_BYTES);
+    /// One-row step at the stream mix up's shape, over a 2 GiB working set.
+    bench_wide_gemv_10240x320 => |g| bench_step_over(g, 10_240, 320, 1, BENCH_WIDE_ROTATION_BYTES);
+    /// Four-row verify at the stream mix down's shape, over 2 GiB.
+    bench_wide_rows4_320x10240 => |g| bench_step_over(g, 320, 10_240, 4, BENCH_WIDE_ROTATION_BYTES);
+    /// Four-row verify at the stream mix up's shape, over 2 GiB.
+    bench_wide_rows4_10240x320 => |g| bench_step_over(g, 10_240, 320, 4, BENCH_WIDE_ROTATION_BYTES);
     /// One-row step at the stream mix down's shape.
     bench_gemv_320x10240 => |g| bench_step(g, 320, 10_240, 1);
     /// One-row step at the stream mix up's shape.

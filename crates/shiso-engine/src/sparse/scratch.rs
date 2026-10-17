@@ -104,6 +104,10 @@ pub enum Buf {
     Expanded,
     /// The per-stream logits a combine injects.
     Inject,
+    /// The per-(row, stream) norm scale a prompt pass's combine leaves in
+    /// place of the normed streams, which the next mix's fused launches
+    /// apply as they read the residual.
+    NormScale,
     /// A block's contribution, before the combine folds it in.
     BlockOut,
     /// The recurrent block's fused query, key and value projection.
@@ -284,7 +288,7 @@ pub enum Buf {
 
 impl Buf {
     /// Every buffer, in allocation order.
-    pub const ALL: [Self; 78] = [
+    pub const ALL: [Self; 79] = [
         Self::Ids,
         Self::Positions,
         Self::Mrope,
@@ -297,6 +301,7 @@ impl Buf {
         Self::LowRank,
         Self::Expanded,
         Self::Inject,
+        Self::NormScale,
         Self::BlockOut,
         Self::GdnQkv,
         Self::GdnConv,
@@ -392,7 +397,7 @@ impl Buf {
             Self::Embed | Self::Mixed | Self::BlockOut => per_token(shape.hidden),
             Self::Residual | Self::Normed | Self::Expanded => per_token(shape.stream_dim()),
             Self::LowRank => per_token(shape.stream_rank),
-            Self::Inject => per_token(shape.streams),
+            Self::Inject | Self::NormScale => per_token(shape.streams),
             Self::GdnQkv | Self::GdnConv => per_token(shape.gdn_in_dim()),
             Self::GdnDecay | Self::GdnBeta | Self::GdnAlphaProj | Self::GdnBetaProj => {
                 per_token(shape.gdn.v_heads)

@@ -232,6 +232,86 @@ pub const CASES: &[Case] = &[
         build: crate::qwen4exp::route::bench_route_sort_tiny_t5,
     },
     Case {
+        name: "q4e_hc_mix_pair_4096",
+        build: crate::qwen4exp::hc_mix::bench_pair_4096,
+    },
+    Case {
+        name: "q4e_hc_mix_down_inject_4096",
+        build: crate::qwen4exp::hc_mix::bench_down_inject_4096,
+    },
+    Case {
+        name: "q4e_hc_mix_fused_collapse_4096",
+        build: crate::qwen4exp::hc_mix::bench_fused_collapse_4096,
+    },
+    Case {
+        name: "q4e_hc_mix_up_collapse_4096",
+        build: crate::qwen4exp::hc_mix::bench_up_collapse_4096,
+    },
+    Case {
+        name: "q4e_hc_mix_combine_norm_4096",
+        build: crate::qwen4exp::hc_mix::bench_combine_norm_4096,
+    },
+    Case {
+        name: "q4e_hc_mix_combine_scale_4096",
+        build: crate::qwen4exp::hc_mix::bench_combine_scale_4096,
+    },
+    Case {
+        name: "q4e_bf16_wide_gemv_320x10240",
+        build: crate::qwen4exp::bf16::bench_wide_gemv_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_wide_gemv_10240x320",
+        build: crate::qwen4exp::bf16::bench_wide_gemv_10240x320,
+    },
+    Case {
+        name: "q4e_bf16_wide_rows4_320x10240",
+        build: crate::qwen4exp::bf16::bench_wide_rows4_320x10240,
+    },
+    Case {
+        name: "q4e_bf16_wide_rows4_10240x320",
+        build: crate::qwen4exp::bf16::bench_wide_rows4_10240x320,
+    },
+    Case {
+        name: "q4e_hc_mix_step_pair_t1",
+        build: crate::qwen4exp::hc_mix::bench_step_pair_t1,
+    },
+    Case {
+        name: "q4e_hc_mix_step_down_inject_t1",
+        build: crate::qwen4exp::hc_mix::bench_step_down_inject_t1,
+    },
+    Case {
+        name: "q4e_hc_mix_step_pair_t4",
+        build: crate::qwen4exp::hc_mix::bench_step_pair_t4,
+    },
+    Case {
+        name: "q4e_hc_mix_step_down_inject_t4",
+        build: crate::qwen4exp::hc_mix::bench_step_down_inject_t4,
+    },
+    Case {
+        name: "q4e_hc_mix_step_mix_t1",
+        build: crate::qwen4exp::hc_mix::bench_step_mix_t1,
+    },
+    Case {
+        name: "q4e_hc_mix_step_up_collapse_t1",
+        build: crate::qwen4exp::hc_mix::bench_step_up_collapse_t1,
+    },
+    Case {
+        name: "q4e_hc_mix_step_mix_t4",
+        build: crate::qwen4exp::hc_mix::bench_step_mix_t4,
+    },
+    Case {
+        name: "q4e_hc_mix_step_up_collapse_t4",
+        build: crate::qwen4exp::hc_mix::bench_step_up_collapse_t4,
+    },
+    Case {
+        name: "q4e_hc_mix_pair_norm_4096",
+        build: crate::qwen4exp::hc_mix::bench_pair_norm_4096,
+    },
+    Case {
+        name: "q4e_hc_mix_collapse_norm_4096",
+        build: crate::qwen4exp::hc_mix::bench_collapse_norm_4096,
+    },
+    Case {
         name: "q4e_bf16_rows1_10240x2560",
         build: crate::qwen4exp::mxfp8::bench_bf16_10240x2560,
     },

@@ -57,7 +57,7 @@ use crate::sparse::hyper::{self, ChainLink, MixRoles, NextNorm};
 use crate::sparse::island::{self, Island, IslandContext, IslandKey, LayerChain};
 use crate::sparse::kernels::{Elem, F32_BYTES};
 pub use crate::sparse::matmul::PassRole;
-use crate::sparse::matmul::{self, Bound, Device};
+use crate::sparse::matmul::{self, Bound, Device, NormedStreams};
 use crate::sparse::media;
 use crate::sparse::moe::{self, RowOrigin};
 use crate::sparse::plan::{Plan, Step};
@@ -425,6 +425,10 @@ impl SparseStack {
             half_block_input: self.stream_elem(n_tok, device) == Elem::F16,
             ..device
         };
+        let device = Device {
+            normed: self.normed_streams(n_tok, device),
+            ..device
+        };
         let context = if batched {
             IslandContext::Batch
         } else {
@@ -725,6 +729,27 @@ impl SparseStack {
             .collect()
     }
 
+    /// What the chained combines of a target pass of `n_tok` rows leave for
+    /// the next mix: only the norm scale when every mix of the pass reads
+    /// the residual through the norming launches, the normed streams
+    /// otherwise.
+    pub(crate) fn normed_streams(&self, n_tok: u32, device: Device) -> NormedStreams {
+        // Every chained combine of the pass leaves only the scale, so every
+        // mix it chains into has to read through the norming launches: one
+        // answer for the whole target pass, never per layer.
+        let all = self
+            .desc
+            .layers
+            .iter()
+            .flat_map(|layer| [&layer.attn_mix, &layer.ffn_mix])
+            .all(|mix| hyper::norms_on_read(&self.shape, mix, n_tok, device));
+        if all && self.stream_elem(n_tok, device) == Elem::F32 {
+            NormedStreams::Scaled
+        } else {
+            NormedStreams::Stored
+        }
+    }
+
     /// The precision every stream mix of a pass of `n_tok` rows holds its
     /// normed residual and its expansion in.
     ///
@@ -872,7 +897,8 @@ impl SparseStack {
                 )?);
             }
         }
-        plan.append(hyper::combine(&self.shape, next, n_tok, elem)?);
+        let closing = hyper::combine(&self.shape, next, n_tok, elem, device.normed)?;
+        plan.append(closing);
         Ok(plan)
     }
 }

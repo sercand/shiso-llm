@@ -922,6 +922,7 @@ impl SparseStack {
             prompt_matmul: opts.prompt_matmul,
             prefill_activations: opts.prefill_activations,
             route_sort: opts.route_sort,
+            normed: crate::sparse::matmul::NormedStreams::Stored,
         };
         let desc = weights.desc(ngram.as_ref().map(|tier| tier.table().row()));
         log_resident(&shape, &opts, &kv, planes, geometry.ckpt_bytes);

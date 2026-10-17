@@ -96,6 +96,7 @@ const GPU: Device = Device {
     prompt_matmul: matmul::PromptMatmul::Rows,
     prefill_activations: matmul::PrefillActivations::A16,
     route_sort: matmul::RouteSort::Tiny,
+    normed: matmul::NormedStreams::Stored,
 };
 
 fn half(in_dim: u32, out_dim: u32) -> WeightDesc {
@@ -241,6 +242,7 @@ fn every_path() -> Plan {
         )
         .expect("a brain-float weight has a tier at every row count");
     }
+    plan.append(brain_mixes(&shape, prompt));
     plan.append(hyper::init(&shape, 1));
     plan.append(hyper::init_add(
         &shape,
@@ -276,7 +278,7 @@ fn every_path() -> Plan {
                 NextNorm::Chained(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm)),
             ] {
                 plan.append(
-                    hyper::combine(&shape, next, rows, elem)
+                    hyper::combine(&shape, next, rows, elem, matmul::NormedStreams::Stored)
                         .expect("the residual fits the fused combine"),
                 );
             }
@@ -704,6 +706,97 @@ fn mxfp8_groups(shape: &SparseShape, prompt: Device) -> Plan {
         }
         plan.append(block);
     }
+    plan
+}
+
+/// The stream mixes over brain-float weights on a tensor-core device: a
+/// prompt pass takes the fused pair and collapse launches, a step the
+/// separate ones.
+fn brain_mixes(shape: &SparseShape, prompt: Device) -> Plan {
+    let bf = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::BF16, in_dim, out_dim);
+    let step = Device {
+        role: PassRole::Step,
+        ..prompt
+    };
+    let scaled = Device {
+        normed: matmul::NormedStreams::Scaled,
+        ..prompt
+    };
+    let mut plan = Plan::new();
+    for inject in [true, false] {
+        let desc = MixDesc {
+            down: bf(shape.stream_dim(), shape.stream_rank),
+            up: bf(shape.stream_rank, shape.stream_dim()),
+            inject: inject.then(|| bf(shape.stream_dim(), shape.streams)),
+        };
+        let roles = if inject {
+            MixRoles::token_mixer(LayerRef::target(0))
+        } else {
+            MixRoles::output()
+        };
+        // A prompt pass: the pair and the fused collapse, over the stored
+        // normed streams or, chained on a scaled pass, norming as they read.
+        for (input, device, norming) in [
+            (MixInput::Raw, prompt, false),
+            (MixInput::AlreadyNormed, prompt, false),
+            (MixInput::Raw, scaled, false),
+            (MixInput::AlreadyNormed, scaled, true),
+        ] {
+            let mix = hyper::mix(shape, &desc, roles, input, 512, device, Elem::F32)
+                .expect("a brain-float mix has a tier");
+            let names = mix.names();
+            let collapse = if norming {
+                "q4e_bf16_gemm_collapse_norm_kernel"
+            } else {
+                "q4e_bf16_gemm_collapse_kernel"
+            };
+            let pair = if norming {
+                "q4e_bf16_gemm_pair_norm_kernel"
+            } else {
+                "q4e_bf16_gemm_pair_kernel"
+            };
+            assert!(mix.launches(collapse), "{names:?}");
+            assert_eq!(mix.launches(pair), inject, "{names:?}");
+            assert!(!mix.launches("q4e_hc_collapse_kernel"), "{names:?}");
+            plan.append(mix);
+        }
+        // A step or verify pass, a batched one's passes included: the step
+        // pair and the fused step, at every width.
+        for rows in [1_u32, 4, 12] {
+            let mix = hyper::mix(
+                shape,
+                &desc,
+                roles,
+                MixInput::AlreadyNormed,
+                rows,
+                step,
+                Elem::F32,
+            )
+            .expect("a brain-float mix has a tier");
+            let names = mix.names();
+            assert_eq!(
+                mix.count("q4e_bf16_mix_step_kernel"),
+                rows.div_ceil(8) as usize,
+                "{names:?}"
+            );
+            let pair = if rows == 1 {
+                "q4e_bf16_gemv_pair_kernel"
+            } else {
+                "q4e_bf16_rows_pair_kernel"
+            };
+            assert_eq!(mix.launches(pair), inject, "{names:?}");
+            assert!(!mix.launches("q4e_hc_collapse_kernel"), "{names:?}");
+            assert!(!mix.launches("q4e_scale_silu_kernel"), "{names:?}");
+            plan.append(mix);
+        }
+    }
+    // The chained combine of a scaled pass leaves the scale; a broken one is
+    // the residual update alone either way.
+    let next = NextNorm::Chained(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm));
+    let combine = hyper::combine(shape, next, 512, Elem::F32, matmul::NormedStreams::Scaled)
+        .expect("the residual fits");
+    assert!(combine.launches("q4e_hc_combine_scale_kernel"));
+    plan.append(combine);
     plan
 }
 
@@ -1940,6 +2033,7 @@ fn the_combine_binds_the_next_block_s_norm_and_a_null_where_the_chain_breaks() {
         NextNorm::Chained(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm)),
         1,
         Elem::F32,
+        matmul::NormedStreams::Stored,
     )
     .expect("the residual fits the fused combine");
     let operands = chained.steps()[0]
@@ -1949,7 +2043,14 @@ fn the_combine_binds_the_next_block_s_norm_and_a_null_where_the_chain_breaks() {
         operands[4],
         Operand::Weight(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm))
     );
-    let broken = hyper::combine(&shape, NextNorm::Broken, 1, Elem::F32).expect("the residual fits");
+    let broken = hyper::combine(
+        &shape,
+        NextNorm::Broken,
+        1,
+        Elem::F32,
+        matmul::NormedStreams::Scaled,
+    )
+    .expect("the residual fits");
     let operands = broken.steps()[0]
         .operands()
         .expect("the list fits a launch");

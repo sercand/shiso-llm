@@ -552,6 +552,22 @@ pub struct Device {
     /// Which one-launch routed selection a decode-sized pass takes. A probed
     /// device fact, for the reason `prompt_matmul` is.
     pub route_sort: RouteSort,
+    /// What a chained combine leaves for the next mix on this pass. A fact
+    /// about the pass, set once for all of it, for the reason
+    /// `half_block_input` is.
+    pub normed: NormedStreams,
+}
+
+/// What the combine that closes a block leaves for the next mix to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum NormedStreams {
+    /// The normed streams themselves, `[rows, streams * hidden]`.
+    #[default]
+    Stored,
+    /// Only each (row, stream)'s norm scale: every mix of the pass reads the
+    /// residual through launches that norm it as they read it, so the normed
+    /// copy - the widest activation of a prompt chunk - is never written.
+    Scaled,
 }
 
 impl Device {
@@ -1310,6 +1326,19 @@ pub fn project(
         return Ok(());
     }
     project_one(out, weight, bound, rows, device)
+}
+
+/// Whether `weight` is projected over `rows` rows by the plain brain-float
+/// prompt GEMM (`q4e_bf16_gemm_kernel`) on this pass - the kernel whose sums
+/// the stream mix's fused launches reproduce.
+#[must_use]
+pub fn brain_plain_gemm(weight: WeightDesc, rows: u32, device: Device) -> bool {
+    weight.dtype == DType::BF16
+        && matches!(
+            plan(weight.dtype, weight.in_dim, weight.out_dim, rows, device),
+            Ok(Projection::BrainGemm { entry, .. })
+                if entry.module() == MOD_BF16 && entry.name() == "q4e_bf16_gemm_kernel"
+        )
 }
 
 /// Matrices one MXFP8 group launch takes (`Q4E_MXG_PARAMS`).
@@ -2119,6 +2148,7 @@ mod tests {
         prompt_matmul: PromptMatmul::Rows,
         prefill_activations: PrefillActivations::A16,
         route_sort: RouteSort::Tiny,
+        normed: NormedStreams::Stored,
     };
 
     #[test]

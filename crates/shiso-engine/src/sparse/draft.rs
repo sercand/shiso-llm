@@ -48,7 +48,7 @@ use crate::sparse::gather;
 use crate::sparse::hyper::{self, MixRoles};
 use crate::sparse::indexer::RingTap;
 use crate::sparse::island::{self, Island};
-use crate::sparse::matmul::{self, Bound, Device};
+use crate::sparse::matmul::{self, Bound, Device, NormedStreams};
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::mtp::{self, DraftSource, MAX_DRAFT, StepOutcome};
 use crate::sparse::plan::Plan;
@@ -129,6 +129,13 @@ impl SparseStack {
         device: Device,
         rows: DraftRows,
     ) -> CoreResult<Plan> {
+        // The head's combines store the normed streams whatever the target
+        // pass leaves: only the target's mixes are checked for the norming
+        // reads (`SparseStack::normed_streams`).
+        let device = Device {
+            normed: NormedStreams::Stored,
+            ..device
+        };
         let head = self.desc.draft.as_ref().ok_or(CoreError::Unsupported {
             what: "a draft pass on a stack that carries no draft head",
             backend: "engine",

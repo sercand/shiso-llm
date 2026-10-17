@@ -33,7 +33,7 @@ back to the kernel it belongs to.
 
 | Registry key | Unit | Plain entries | Template instantiations |
 |---|---|---|---|
-| `q4e_hc` | `hc.cu` | 3 | 6 |
+| `q4e_hc` | `hc.cu` | 4 | 6 |
 | `q4e_moe` | `moe.cu` | 9 | 4 |
 | `q4e_gdn` | `gdn.cu` | 8 | 0 |
 | `q4e_gdn_tc` | `gdn_tc.cu` | 4 | 0 |
@@ -49,8 +49,8 @@ back to the kernel it belongs to.
 | `q4e_kv8` | `kv8.cu` | 8 | 0 |
 | `q4e_mxfp8` | `mxfp8.cu` | 9 | 0 |
 | `q4e_idxring` | `idxring.cu` | 1 | 0 |
-| `q4e_bf16` | `bf16.cu` | 5 | 0 |
-| **total** | 17 units | **95** | **105** |
+| `q4e_bf16` | `bf16.cu` | 12 | 0 |
+| **total** | 17 units | **103** | **105** |
 
 ## Plain entries, by module
 
@@ -60,6 +60,8 @@ back to the kernel it belongs to.
 - `q4e_hc_init_add_kernel`
 - `q4e_scale_silu_kernel`
 - `q4e_hc_collapse_f16_dual_kernel`
+- `q4e_hc_combine_scale_kernel` - the fused combine leaving the next norm's
+  per-(token, stream) scale in place of the normed streams.
 
 ### `q4e_modelopt`
 
@@ -171,6 +173,24 @@ kernels take `out, w, x, in_dim, out_dim, rows`.
   activations rounded to brain floats.
 - `q4e_bf16_gemm_split_kernel` - the same with each activation carried as two
   brain floats, for the narrow projections.
+- `q4e_bf16_gemm_pair_kernel` - the plain prompt kernel over two weights of one
+  input stacked in one grid (`out_a, w_a, out_dim_a, out_b, w_b, out_dim_b, x,
+  in_dim, rows`): the stream mix's contraction and injection logits.
+- `q4e_bf16_gemm_collapse_kernel` - the stream mix's expansion with the
+  collapse of the gated streams as its epilogue (`out, w_up, x, xn, in_dim,
+  n_embd, n_hc, rows`); `q4e_bf16_gemm_kernel` then `q4e_hc_collapse_kernel`,
+  bit for bit.
+- `q4e_bf16_gemm_pair_norm_kernel` - the pair over the residual streams, each
+  value normed as it is read (`..., res, scale, nw, n_embd, in_dim, rows`).
+- `q4e_bf16_gemm_collapse_norm_kernel` - the fused collapse over the residual
+  streams, normed as they are read (`out, w_up, x, res, scale, nw, in_dim,
+  n_embd, n_hc, rows`).
+- `q4e_bf16_gemv_pair_kernel`, `q4e_bf16_rows_pair_kernel` - the step kernels
+  over two weights of one input stacked in one grid (`out_a, w_a, out_dim_a,
+  out_b, w_b, out_dim_b, x, in_dim, splits, rows`).
+- `q4e_bf16_mix_step_kernel` - the stream mix's activation, expansion and
+  collapse for one to eight step rows (`out, w_up, x, xn, inv_hc, in_dim,
+  n_embd, n_hc, rows`), four 320-wide expansion rows a warp.
 
 ### `q4e_moe`
 
@@ -502,6 +522,7 @@ not thereby broken at the shipped shape.
 | `q4e_hc_collapse_kernel` ⊤ | `n_tok` | `256` | `0` |
 | `q4e_hc_collapse_f16_dual_kernel` | `n_tok` | `256` | `0` |
 | `q4e_hc_combine_norm_kernel` ⊤ | `(n_tok, n_tok >= 256 ? 1 : n_hc, 1)` | `256` | `0` |
+| `q4e_hc_combine_scale_kernel` | `(n_tok, n_tok >= 256 ? 1 : n_hc, 1)` | `256` | `0` |
 
 `q4e_hc_combine_norm_kernel`'s `y` is the launcher's own switch: one block per
 token once there are enough tokens to fill the machine that way, one block per
