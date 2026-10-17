@@ -803,14 +803,24 @@ fn the_real_export_step_profile_at_1024() {
         drop(out);
     };
     step();
-    let began = std::time::Instant::now();
-    step();
-    let batched = began.elapsed().as_secs_f64();
+    let mut times: Vec<f64> = (0..4)
+        .map(|_| {
+            let began = std::time::Instant::now();
+            step();
+            began.elapsed().as_secs_f64()
+        })
+        .collect();
+    eprintln!("batched steps: {times:.3?}");
+    times.sort_by(f64::total_cmp);
+    let batched = times[1];
     let profiler = backend.as_profiler().expect("the Metal backend profiles");
     let region = shiso_core::ProfileRegion::open(profiler).expect("opens");
     step();
     let report = region.finish().expect("finishes");
-    eprintln!("batched step {batched:.3}s\n{}", report.table(40));
+    eprintln!(
+        "batched step (lower median of 4) {batched:.3}s\n{}",
+        report.table(40)
+    );
     if let Some(json) = std::env::var_os("SHISO_FLUX3_PROFILE_JSON") {
         std::fs::write(json, report.to_json().to_string()).expect("writes the JSON report");
     }

@@ -832,6 +832,9 @@ pub(crate) struct Ops {
     /// Released [`Scratch`] buffers by byte length, handed out again before
     /// the device is asked for fresh memory. See [`Ops::alloc_f32`].
     pool: Mutex<HashMap<u64, Vec<DeviceBuffer>>>,
+    /// Whether the module carries [`HALF_KV_KERNELS`], so [`Ops::sdpa`]
+    /// narrows K and V once instead of in every query tile.
+    half_kv: bool,
 }
 
 /// A pooled working buffer: derefs to the [`DeviceBuffer`] it holds and goes
@@ -868,6 +871,15 @@ impl Drop for Scratch<'_> {
         }
     }
 }
+
+/// Speed-only entries [`Ops::sdpa`] uses when the module carries both: K
+/// and V narrowed to half once (`kernel_dit_kv_half_f32`), then the 128-wide
+/// bidirectional attention reading those rows. The values are the ones the
+/// f32 entry stages, so the output is the same bits either way; a module
+/// without them (the CUDA set today) keeps the f32 entry rather than being
+/// refused.
+pub(crate) const HALF_KV_KERNELS: [&str; 2] =
+    ["kernel_dit_kv_half_f32", "kernel_dit_flash_sdpa_d128_kvh"];
 
 /// Every diffusion kernel entry this driver launches: the module's full
 /// registration in `metal/diffusion/diffusion.metal`. [`Ops::new`] probes the device
@@ -965,6 +977,11 @@ impl Ops {
                 missing.join(", ")
             )));
         }
+        let half_kv = HALF_KV_KERNELS.iter().all(|entry| {
+            backend
+                .max_block_threads(KernelRef::new(MODULE, entry))
+                .is_some()
+        });
         let dummy = alloc(backend, 4).map_err(|e| ImageGenError::Backend(e.to_string()))?;
         backend
             .fill_zero(dummy.view())
@@ -973,6 +990,7 @@ impl Ops {
             backend: Arc::clone(backend),
             dummy,
             pool: Mutex::default(),
+            half_kv,
         })
     }
 
@@ -990,6 +1008,7 @@ impl Ops {
             backend: Arc::clone(backend),
             dummy,
             pool: Mutex::default(),
+            half_kv: false,
         })
     }
 
@@ -1831,6 +1850,9 @@ impl Ops {
                 call.step, call.cache_tokens, call.head_dim
             )));
         }
+        if flash && !call.causal && call.head_dim == 128 && self.half_kv {
+            return self.sdpa_half_kv(call, &args, rows);
+        }
         let (entry, grid, block) = if flash {
             (
                 // The 128-wide entries fix the head width at compile time so
@@ -1870,6 +1892,64 @@ impl Ops {
                 KernelArg::Buffer(call.v_img),
                 KernelArg::Buffer(cache_k),
                 KernelArg::Buffer(cache_v),
+            ],
+        )
+    }
+
+    /// [`Ops::sdpa`] through [`HALF_KV_KERNELS`]: K and V (live and cached
+    /// rows) narrowed into packed half scratch, then the attention reading
+    /// them. Bit-identical to the f32 entry; measured on an M4 at a FLUX.3
+    /// single block (4176 rows, 24 heads of 128) 65 + ~1 ms against 77 ms.
+    fn sdpa_half_kv(
+        &self,
+        call: &SdpaCall<'_>,
+        args: &SdpaArgs,
+        rows: u32,
+    ) -> Result<(), ImageGenError> {
+        let width = call.heads * call.head_dim;
+        let all_rows = call.txt_tokens + call.img_tokens + call.cache_tokens;
+        // Halves, two per f32 slot; the width is a multiple of eight.
+        let k_half = self.alloc_f32(call.step, all_rows * width / 2)?;
+        let v_half = self.alloc_f32(call.step, all_rows * width / 2)?;
+        let (cache_k, cache_v) = if call.cache_tokens == 0 {
+            (self.dummy.view(), self.dummy.view())
+        } else {
+            (call.cache_k, call.cache_v)
+        };
+        self.launch(
+            call.step,
+            HALF_KV_KERNELS[0],
+            Extent3::new(grid_for((width / 4) as u32, BLOCK), all_rows as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(args)),
+                KernelArg::Buffer(k_half.view()),
+                KernelArg::Buffer(v_half.view()),
+                KernelArg::Buffer(call.k_txt),
+                KernelArg::Buffer(call.v_txt),
+                KernelArg::Buffer(call.k_img),
+                KernelArg::Buffer(call.v_img),
+                KernelArg::Buffer(cache_k),
+                KernelArg::Buffer(cache_v),
+            ],
+        )?;
+        self.launch(
+            call.step,
+            HALF_KV_KERNELS[1],
+            Extent3::new(grid_for(rows, FA_QROWS), call.heads as u32, 1),
+            Extent3::linear(FA_THREADS),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(args)),
+                KernelArg::Buffer(call.out_txt),
+                KernelArg::Buffer(call.out_img),
+                KernelArg::Buffer(call.q_txt),
+                KernelArg::Buffer(k_half.view()),
+                KernelArg::Buffer(v_half.view()),
+                KernelArg::Buffer(call.q_img),
+                KernelArg::Buffer(self.dummy.view()),
+                KernelArg::Buffer(self.dummy.view()),
+                KernelArg::Buffer(self.dummy.view()),
+                KernelArg::Buffer(self.dummy.view()),
             ],
         )
     }

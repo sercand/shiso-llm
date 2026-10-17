@@ -106,6 +106,8 @@ const ENTRIES: &[&str] = &[
     "kernel_dit_conv2d_rms_gemm_f32",
     "kernel_dit_conv2d_up2_gemm_f32",
     "kernel_dit_dup_up_add_f32",
+    "kernel_dit_kv_half_f32",
+    "kernel_dit_flash_sdpa_d128_kvh",
 ];
 
 // --- argument blocks: byte-for-byte the driver's `#[repr(C)]` Pods ---------
@@ -2724,6 +2726,141 @@ fn run_flash(b: &Arc<dyn Backend>, c: &Joint<'_>) -> (Vec<f32>, Vec<f32>) {
         read_f32(b, out_txt_buf.view(), c.txt * hidden),
         read_f32(b, out_img_buf.view(), c.img * hidden),
     )
+}
+
+/// The driver's half-K/V route for 128-wide heads: K and V narrowed once
+/// into packed half rows (`kernel_dit_kv_half_f32`), then the attention
+/// entry that reads them.
+fn run_flash_kv_half(b: &Arc<dyn Backend>, c: &Joint<'_>) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(c.hd, 128, "the half-K/V entry is built for 128-wide heads");
+    let hidden = c.heads * c.hd;
+    let stream = |v: &[f32]| -> DeviceBuffer {
+        if v.is_empty() {
+            dummy(b)
+        } else {
+            upload_f32(b, v)
+        }
+    };
+    let [q_txt, k_txt, v_txt, q_img, k_img, v_img, cache_k, cache_v] = [
+        c.q_txt, c.k_txt, c.v_txt, c.q_img, c.k_img, c.v_img, c.cache_k, c.cache_v,
+    ]
+    .map(stream);
+    let rows = c.txt + c.img + c.cache;
+    let k_half = alloc(b, (rows * hidden * 2) as u64).expect("alloc");
+    let v_half = alloc(b, (rows * hidden * 2) as u64).expect("alloc");
+    let out_txt_buf = alloc(b, (c.txt * hidden * 4) as u64).expect("alloc");
+    let out_img_buf = alloc(b, (c.img * hidden * 4) as u64).expect("alloc");
+    let args = SdpaArgs {
+        txt_tokens: c.txt as u32,
+        img_tokens: c.img as u32,
+        cache_tokens: c.cache as u32,
+        heads: c.heads as u32,
+        head_dim: c.hd as u32,
+        txt_stride: c.txt_stride as u32,
+        img_stride: c.img_stride as u32,
+        cache_stride: c.cache_stride as u32,
+        q_offset: c.q_off as u32,
+        k_offset: c.k_off as u32,
+        v_offset: c.v_off as u32,
+    };
+    launch(
+        b,
+        "kernel_dit_kv_half_f32",
+        Extent3::new(grid_for((hidden / 4) as u32, 64), rows as u32, 1),
+        Extent3::linear(64),
+        &[
+            KernelArg::Bytes(bytes_of(&args)),
+            KernelArg::Buffer(k_half.view()),
+            KernelArg::Buffer(v_half.view()),
+            KernelArg::Buffer(k_txt.view()),
+            KernelArg::Buffer(v_txt.view()),
+            KernelArg::Buffer(k_img.view()),
+            KernelArg::Buffer(v_img.view()),
+            KernelArg::Buffer(cache_k.view()),
+            KernelArg::Buffer(cache_v.view()),
+        ],
+    );
+    let unread = dummy(b);
+    launch(
+        b,
+        "kernel_dit_flash_sdpa_d128_kvh",
+        Extent3::new(
+            grid_for((c.txt + c.img) as u32, FA_QROWS),
+            c.heads as u32,
+            1,
+        ),
+        Extent3::linear(FA_THREADS),
+        &[
+            KernelArg::Bytes(bytes_of(&args)),
+            KernelArg::Buffer(out_txt_buf.view()),
+            KernelArg::Buffer(out_img_buf.view()),
+            KernelArg::Buffer(q_txt.view()),
+            KernelArg::Buffer(k_half.view()),
+            KernelArg::Buffer(v_half.view()),
+            KernelArg::Buffer(q_img.view()),
+            KernelArg::Buffer(unread.view()),
+            KernelArg::Buffer(unread.view()),
+            KernelArg::Buffer(unread.view()),
+            KernelArg::Buffer(unread.view()),
+        ],
+    );
+    (
+        read_f32(b, out_txt_buf.view(), c.txt * hidden),
+        read_f32(b, out_img_buf.view(), c.img * hidden),
+    )
+}
+
+/// Narrowing K and V once gives the bits the f32 entry gives while staging:
+/// fused rows read at their k and v offsets, txt/img/cache sections with
+/// their own strides (the cache packed narrower than the live rows), a
+/// partial query tile and key block, and values past half's range, which
+/// both routes saturate.
+#[test]
+fn flash_sdpa_from_half_kv_is_the_f32_entry_bit_for_bit() {
+    let Some(b) = open() else { return };
+    let (heads, hd) = (2usize, 128usize);
+    let hidden = heads * hd;
+    let fused = 3 * hidden;
+    let (txt, img, cache) = (7usize, 70usize, 19usize);
+    let rows = |n: usize, width: usize, seed: usize| -> Vec<f32> {
+        vals(n * width, seed)
+            .iter()
+            .enumerate()
+            .map(|(i, v)| if i % 97 == 5 { v * 2.0e4 } else { v * 0.05 })
+            .collect()
+    };
+    let txt_rows = rows(txt, fused, 91);
+    let img_rows = rows(img, fused, 92);
+    let cache_rows = rows(cache, 2 * hidden, 93);
+    let case = Joint {
+        q_txt: &txt_rows,
+        k_txt: &txt_rows,
+        v_txt: &txt_rows,
+        q_img: &img_rows,
+        k_img: &img_rows,
+        v_img: &img_rows,
+        cache_k: &cache_rows,
+        cache_v: &cache_rows,
+        txt,
+        img,
+        cache,
+        heads,
+        hd,
+        txt_stride: fused,
+        img_stride: fused,
+        cache_stride: 2 * hidden,
+        q_off: 0,
+        k_off: hidden,
+        v_off: 2 * hidden,
+    };
+    let (want_txt, want_img) = run_flash(&b, &case);
+    let (got_txt, got_img) = run_flash_kv_half(&b, &case);
+    assert!(
+        want_txt.iter().chain(&want_img).all(|v| v.is_finite()),
+        "the f32 entry's output is finite"
+    );
+    assert_bit_identical(&got_txt, &want_txt, "half K/V vs f32 entry: txt rows");
+    assert_bit_identical(&got_img, &want_img, "half K/V vs f32 entry: img rows");
 }
 
 fn expect_all(c: &Joint<'_>) -> Vec<f32> {

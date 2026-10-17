@@ -1845,6 +1845,41 @@ static inline half4 dit_half4_sat(float4 v) {
     return half4(clamp(v, float4(-65504.0f), float4(65504.0f)));
 }
 
+/// K and V of one joint attention narrowed to half once, for
+/// `kernel_dit_flash_sdpa_d128_kvh`: `k_out` and `v_out` are packed
+/// `(txt + img + cache, heads * head_dim)` in joint-row order, each element
+/// the operand's own section (`k_offset`, `v_offset`, the txt/img/cache
+/// strides) through `dit_half4_sat`, the conversion the f32 entry applies
+/// while staging. The flash kernel's every query tile would otherwise re-read
+/// and re-narrow the f32 rows; measured on an M4 at a FLUX.3 single block
+/// (4176 rows, 24 heads of 128) the attention took 65 ms from half rows
+/// against 77 ms from f32 ones, with the same staged halves.
+/// Grid `(ceil(heads * head_dim / 256), rows)` x 64, four values per thread.
+kernel void kernel_dit_kv_half_f32(
+        constant dit_args_sdpa & args [[buffer(0)]],
+        device half *k_out               [[buffer(1)]],
+        device half *v_out               [[buffer(2)]],
+        device const float *k_txt        [[buffer(3)]],
+        device const float *v_txt        [[buffer(4)]],
+        device const float *k_img        [[buffer(5)]],
+        device const float *v_img        [[buffer(6)]],
+        device const float *cache_k      [[buffer(7)]],
+        device const float *cache_v      [[buffer(8)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint width = args.heads * args.head_dim;
+    const uint t = tgpig.y;
+    const uint c = (tgpig.x * DIT_BLOCK + tpitg.x) * 4u;
+    if (t >= args.txt_tokens + args.img_tokens + args.cache_tokens || c >= width) {
+        return;
+    }
+    device const float *kp = dit_joint_row(args, t, 0u, args.k_offset, k_txt, k_img, cache_k) + c;
+    device const float *vp = dit_joint_row(args, t, 0u, args.v_offset, v_txt, v_img, cache_v) + c;
+    const uint64_t o = (uint64_t) t * width + c;
+    *((device packed_half4 *) (k_out + o)) = packed_half4(dit_half4_sat(float4(*((device const packed_float4 *) kp))));
+    *((device packed_half4 *) (v_out + o)) = packed_half4(dit_half4_sat(float4(*((device const packed_float4 *) vp))));
+}
+
 /// Joint-sequence attention in one pass over the keys with an online
 /// softmax, on simdgroup matrices: the same contract, bindings and output as
 /// `kernel_dit_sdpa_f32`, for `head_dim % 8 == 0` and `head_dim <= 128`.
@@ -1893,7 +1928,7 @@ static inline half4 dit_half4_sat(float4 v) {
         ushort lane [[thread_index_in_simdgroup]], \
         ushort sg [[simdgroup_index_in_threadgroup]]
 
-template <bool CAUSAL, uint RB, uint NSG, uint HD, bool UNIT_SCALE = false>
+template <bool CAUSAL, uint RB, uint NSG, uint HD, bool UNIT_SCALE = false, bool KV_HALF = false>
 kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
     const uint QR = 8u * RB * NSG;
     const uint KB = DIT_FA_KEYS;
@@ -1974,10 +2009,18 @@ kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
             rk[q] = half4(0.0h);
             rv[q] = half4(0.0h);
             if (e < KB * hd4 && s < keys) {
-                rk[q] = dit_half4_sat(float4(*((device const packed_float4 *)
-                        (dit_joint_row(args, s, h, args.k_offset, k_txt, k_img, cache_k) + d))));
-                rv[q] = dit_half4_sat(float4(*((device const packed_float4 *)
-                        (dit_joint_row(args, s, h, args.v_offset, v_txt, v_img, cache_v) + d))));
+                if (KV_HALF) {
+                    // Bindings 4 and 5 carry `kernel_dit_kv_half_f32`'s
+                    // packed rows: the same halves, already narrowed.
+                    const uint64_t o = (uint64_t) s * (args.heads * hd) + h * hd + d;
+                    rk[q] = half4(*((device const packed_half4 *) ((device const half *) k_txt + o)));
+                    rv[q] = half4(*((device const packed_half4 *) ((device const half *) v_txt + o)));
+                } else {
+                    rk[q] = dit_half4_sat(float4(*((device const packed_float4 *)
+                            (dit_joint_row(args, s, h, args.k_offset, k_txt, k_img, cache_k) + d))));
+                    rv[q] = dit_half4_sat(float4(*((device const packed_float4 *)
+                            (dit_joint_row(args, s, h, args.v_offset, v_txt, v_img, cache_v) + d))));
+                }
             }
         }
     };
@@ -2092,6 +2135,13 @@ kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 128u>(DIT_FLASH_S
 
 template [[host_name("kernel_dit_flash_sdpa_causal_d128_f32")]]
 kernel void kernel_dit_flash_sdpa<true, DIT_FA_RB, DIT_FA_SG, 128u>(DIT_FLASH_SDPA_PARAMS);
+
+/// The 128-wide bidirectional entry over K and V that
+/// `kernel_dit_kv_half_f32` narrowed beforehand: bindings 4 and 5 are its
+/// packed half rows (joint order, cache rows last), bindings 7 to 10 are
+/// not read. Same staged values, so the same bits as the f32 entry.
+template [[host_name("kernel_dit_flash_sdpa_d128_kvh")]]
+kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 128u, false, true>(DIT_FLASH_SDPA_PARAMS);
 
 template [[host_name("kernel_dit_flash_sdpa_unit_d64_f32")]]
 kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 64u, true>(DIT_FLASH_SDPA_PARAMS);
