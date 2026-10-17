@@ -23,10 +23,11 @@
 use std::path::{Path, PathBuf};
 
 use shiso_bench::compare::{FLOOR, MLX_REFERENCE, REFERENCE, compare};
-use shiso_bench::replay::{Device, Harness, Vocabulary};
+use shiso_bench::replay::{Device, Harness, HarnessOptions, Vocabulary};
 use shiso_bench::run::{REPLAY_CHUNK, case_tokens, logprob_top_k, prompts_digest, tokens_digest};
 use shiso_bench::vecfile::{self, Body, LocalCase, VecFile};
 use shiso_core::ids::TokenId;
+use shiso_engine::sparse::matmul::PrefillActivations;
 
 /// The reference rows, captured from the reference server over the same
 /// checkpoint as that checkpoint's card serves it: FP4 activations on prompt
@@ -98,6 +99,10 @@ fn device_available() -> bool {
 }
 
 fn open(ctx: u32) -> Option<(Harness, Vocabulary)> {
+    open_as(ctx, PrefillActivations::A16)
+}
+
+fn open_as(ctx: u32, prefill: PrefillActivations) -> Option<(Harness, Vocabulary)> {
     let Some(dir) = model_dir() else {
         skip("SHISO_TEST_MODEL_QWEN4EXP_NVFP4MX names no export directory");
         return None;
@@ -108,8 +113,17 @@ fn open(ctx: u32) -> Option<(Harness, Vocabulary)> {
     }
     let vocabulary =
         Vocabulary::load(&dir.join("tokenizer.json")).expect("the export's vocabulary loads");
-    let harness = Harness::open(DEVICE, &dir, &dir.join("config.json"), ctx)
-        .expect("the export loads onto the device");
+    let harness = Harness::open_with_options(
+        DEVICE,
+        &dir,
+        &dir.join("config.json"),
+        ctx,
+        HarnessOptions {
+            prefill_activations: prefill,
+            ..HarnessOptions::default()
+        },
+    )
+    .expect("the export loads onto the device");
     Some((harness, vocabulary))
 }
 
@@ -161,6 +175,16 @@ fn replay(
     graded: &[&shiso_bench::compare::Budget],
     reported: &[&shiso_bench::compare::Budget],
 ) {
+    replay_as(golden, graded, reported, PrefillActivations::A16);
+}
+
+/// [`replay`] at a chosen prompt-pass activation precision.
+fn replay_as(
+    golden: &str,
+    graded: &[&shiso_bench::compare::Budget],
+    reported: &[&shiso_bench::compare::Budget],
+    prefill: PrefillActivations,
+) {
     let file = vecfile::read(&vectors_dir().join(golden)).expect("the fixture parses");
     assert_eq!(
         file.headers.get("values").map(String::as_str),
@@ -178,7 +202,7 @@ fn replay(
         "a prompt file changed since the capture"
     );
     let ctx = cases.iter().map(|c| c.ctx).max().unwrap_or(4096);
-    let Some((mut harness, vocabulary)) = open(ctx) else {
+    let Some((mut harness, vocabulary)) = open_as(ctx, prefill) else {
         return;
     };
     assert_eq!(
@@ -227,6 +251,20 @@ fn the_reference_rows_agree_on_the_answer() {
 #[ignore = "needs the local Qwen3.8-Flash-Next FP4-Local export and a device"]
 fn the_brain_float_reference_rows_agree_on_the_answer() {
     replay(GOLDEN_A16, &[&FLOOR], &[&MLX_REFERENCE, &REFERENCE]);
+}
+
+/// The prompt passes with low-precision activations (NVFP4 into the routed
+/// experts, MXFP8 into the dense projections), graded against the same library
+/// reference: what the activation quantization costs on real prompts.
+#[test]
+#[ignore = "needs the local Qwen3.8-Flash-Next FP4-Local export and a device"]
+fn low_precision_prompt_rows_agree_with_the_library_reference() {
+    replay_as(
+        GOLDEN_HF,
+        &[&FLOOR],
+        &[&MLX_REFERENCE, &REFERENCE],
+        PrefillActivations::Lowp,
+    );
 }
 
 #[test]
