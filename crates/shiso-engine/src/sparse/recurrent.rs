@@ -43,6 +43,12 @@ pub struct ChunkPolicy {
     /// memory. It asks for nearly a hundred kilobytes, which not every device
     /// will give a block.
     pub available: bool,
+    /// Whether a chunk that takes the chunked recurrence runs it as the two
+    /// fused prompt kernels ([`kernels::MOD_GDN_FUSED`]) rather than the chain
+    /// of seven. The two give the same bits, so this moves no answer: it is
+    /// whether the kernel set has the fused pair, and it only matters where
+    /// [`ChunkPolicy::takes_chunk`] already said yes.
+    pub fused: bool,
 }
 
 impl ChunkPolicy {
@@ -55,6 +61,7 @@ impl ChunkPolicy {
         Self {
             min_rows: 2 * kernels::GDN_CHUNK,
             available: true,
+            fused: true,
         }
     }
 
@@ -145,6 +152,19 @@ pub const fn step_eligible(shape: &SparseShape) -> bool {
     shape.gdn.head_dim == kernels::GDN_STATE_HEAD_DIM && shape.gdn.qk_heads != 0
 }
 
+/// Whether the fused prompt kernels are written for this geometry.
+///
+/// They are sized for one head width, one convolution width and three value
+/// heads per key head; any other shape keeps the chain, which reads all three
+/// from its arguments.
+#[must_use]
+pub const fn fused_eligible(shape: &SparseShape) -> bool {
+    shape.gdn.head_dim == kernels::GDN_STATE_HEAD_DIM
+        && shape.gdn.conv_kernel == kernels::GDN_FUSED_CONV_TAPS
+        && shape.gdn.qk_heads != 0
+        && shape.gdn.v_heads == kernels::GDN_FUSED_HEADS_PER_KEY * shape.gdn.qk_heads
+}
+
 /// One recurrent block, in launch order.
 ///
 /// The two normalizations are one kernel launched twice, at the two offsets the
@@ -206,6 +226,74 @@ pub fn block(
             n_tok,
             device,
         )?;
+    }
+    // A prompt chunk on the chunked recurrence, as the two fused kernels:
+    // everything between the projections but the window rewrite, in the
+    // chain's bits. The chain below is what any other pass runs.
+    if policy.chunk.fused
+        && fused_eligible(shape)
+        && (per_run.is_some() || policy.takes_chunk(device.tier_rows(n_tok)))
+    {
+        if !grouped {
+            for (weight, role, out) in [
+                (desc.alpha, Role::RecurrentAlpha, Buf::GdnAlphaProj),
+                (desc.beta, Role::RecurrentBeta, Buf::GdnBetaProj),
+                (desc.gate, Role::RecurrentGate, Buf::GdnGate),
+            ] {
+                matmul::project(
+                    &mut plan,
+                    weight,
+                    Bound::new(
+                        at(role),
+                        Operand::Scratch(Buf::Mixed),
+                        Operand::Scratch(out),
+                    ),
+                    n_tok,
+                    device,
+                )?;
+            }
+        }
+        if let Some(runs) = per_run {
+            for run in 0..runs.count() {
+                plan.append(fused_run(
+                    shape,
+                    layer,
+                    FusedRun {
+                        span: RunSpan::of(&runs, run),
+                        window: Operand::RecurrentConvOf { slot, run },
+                        state: Operand::RecurrentStateOf { slot, run },
+                        snapshot: None,
+                    },
+                ));
+            }
+        } else {
+            plan.append(fused_run(
+                shape,
+                layer,
+                FusedRun {
+                    span: RunSpan {
+                        run: 0,
+                        first: 0,
+                        rows: n_tok,
+                    },
+                    window: Operand::RecurrentConv(slot),
+                    state: Operand::RecurrentState(slot),
+                    snapshot: device.role.snapshot().map(|row| (slot, row)),
+                },
+            ));
+        }
+        matmul::project(
+            &mut plan,
+            desc.out,
+            Bound::new(
+                at(Role::RecurrentOut),
+                Operand::Scratch(Buf::GdnGated),
+                Operand::Scratch(Buf::BlockOut),
+            ),
+            n_tok,
+            device,
+        )?;
+        return Ok(plan);
     }
     if let Some(runs) = per_run {
         for run in 0..runs.count() {
@@ -751,6 +839,122 @@ fn prompt_runs(policy: &Recurrence, device: Device) -> Option<Segments> {
     (device.row_invariant() && solo.takes_chunk(device.tier_rows(u32::MAX))).then_some(runs)
 }
 
+/// Where one fused launch pair reads and writes: its rows, its session's
+/// window and state, and the snapshot it takes, if any.
+#[derive(Debug, Clone, Copy)]
+struct FusedRun {
+    span: RunSpan,
+    window: Operand,
+    state: Operand,
+    /// The recurrent slot and the chunk row a snapshot is taken before.
+    snapshot: Option<(u32, u32)>,
+}
+
+/// The fused prompt kernels over one run of rows, then the window rewrite.
+///
+/// The prep reads the convolution window as it stood before these rows, so
+/// the rewrite comes after it. The per-run slabs start at the head of their
+/// buffers for every run, as the chain's do: the launches are serialized. The
+/// normalized query rows fill the convolution buffer from its start and the
+/// key rows follow them, one whole-run block per (run, key head) each.
+fn fused_run(shape: &SparseShape, layer: LayerRef, run: FusedRun) -> Plan {
+    let at = |role: Role| WeightRef::layer(layer, role);
+    let span = run.span;
+    let mut plan = Plan::new();
+    let key_rows = u64::from(kernels::gdn_tc_runs(span.rows))
+        * u64::from(kernels::GDN_TC_RUN)
+        * u64::from(shape.gdn_qk_dim())
+        * 4;
+    plan.launch(
+        Entry::plain(kernels::MOD_GDN_FUSED, "q4e_gdf_prep_kernel"),
+        kernels::gdn_fused_prep(shape.gdn.qk_heads, span.rows),
+        // `u_out, t_out, p_out, ge_out, q_out, k_out, x, conv_state, conv_w,
+        //  alpha_proj, beta_proj, dt_bias, a, n_head_k, n_head_v, stride,
+        //  row0, n_tok`
+        Args::of(&[
+            Operand::Scratch(Buf::GdnTcU),
+            Operand::Scratch(Buf::GdnTcP),
+            Operand::Scratch(Buf::GdnTcW),
+            Operand::Scratch(Buf::GdnAttn),
+            Operand::Scratch(Buf::GdnConv),
+            Operand::ScratchFrom(Buf::GdnConv, key_rows),
+            span.at(Buf::GdnQkv, shape.gdn_in_dim()),
+            run.window,
+            Operand::Weight(at(Role::RecurrentConv1d)),
+            span.at(Buf::GdnAlphaProj, shape.gdn.v_heads),
+            span.at(Buf::GdnBetaProj, shape.gdn.v_heads),
+            Operand::Weight(at(Role::RecurrentDecayBias)),
+            Operand::Weight(at(Role::RecurrentDecayBase)),
+            Operand::U32(shape.gdn.qk_heads),
+            Operand::U32(shape.gdn.v_heads),
+            Operand::U32(shape.gdn_in_dim()),
+            Operand::U32(0),
+            Operand::U32(span.rows),
+        ]),
+    );
+    // The state before the snapshot row's run goes to this slot's place in
+    // the snapshot buffer; a null slab and a run past the last is none.
+    let (snap, snap_run) = match run.snapshot {
+        Some((slot, row)) => (
+            Operand::Snapshot(paged::snapshot_state_offset(shape, slot)),
+            row / kernels::GDN_CHUNK,
+        ),
+        None => (Operand::Null, u32::MAX),
+    };
+    plan.launch(
+        Entry::plain(kernels::MOD_GDN_FUSED, "q4e_gdf_scan_kernel"),
+        kernels::gdn_fused_scan(shape.gdn.v_heads),
+        // `out, state, u, t, p, ge, q, k, z, norm_w, n_head_k, n_head_v, row0,
+        //  n_tok, eps, snap, snap_run`
+        Args::of(&[
+            span.at(Buf::GdnGated, shape.gdn_v_dim()),
+            run.state,
+            Operand::Scratch(Buf::GdnTcU),
+            Operand::Scratch(Buf::GdnTcP),
+            Operand::Scratch(Buf::GdnTcW),
+            Operand::Scratch(Buf::GdnAttn),
+            Operand::Scratch(Buf::GdnConv),
+            Operand::ScratchFrom(Buf::GdnConv, key_rows),
+            span.at(Buf::GdnGate, shape.gdn_v_dim()),
+            Operand::Weight(at(Role::RecurrentNorm)),
+            Operand::U32(shape.gdn.qk_heads),
+            Operand::U32(shape.gdn.v_heads),
+            Operand::U32(0),
+            Operand::U32(span.rows),
+            Operand::f32(shape.rms_eps),
+            snap,
+            Operand::U32(snap_run),
+        ]),
+    );
+    plan.launch(
+        Entry::plain(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
+        kernels::gdn_conv(shape.gdn_in_dim()),
+        // `state, x, channels, kernel, n_tok`
+        Args::of(&[
+            run.window,
+            span.at(Buf::GdnQkv, shape.gdn_in_dim()),
+            Operand::U32(shape.gdn_in_dim()),
+            Operand::U32(shape.gdn.conv_kernel),
+            Operand::U32(span.rows),
+        ]),
+    );
+    // The window as it stood before the snapshot row, as the chain takes it.
+    if let Some((slot, row)) = run.snapshot {
+        plan.launch(
+            Entry::plain(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
+            kernels::gdn_conv(shape.gdn_in_dim()),
+            Args::of(&[
+                Operand::Snapshot(paged::snapshot_conv_offset(shape, slot)),
+                span.at(Buf::GdnQkv, shape.gdn_in_dim()),
+                Operand::U32(shape.gdn_in_dim()),
+                Operand::U32(shape.gdn.conv_kernel),
+                Operand::U32(row),
+            ]),
+        );
+    }
+    plan
+}
+
 /// One run's convolution: the parallel convolution and the window rewrite its
 /// own prompt pass launches, at its own row count, over its own rows and its
 /// own session's window.
@@ -857,6 +1061,7 @@ mod tests {
         let policy = ChunkPolicy {
             min_rows: 4,
             available: true,
+            fused: true,
         };
         let deep = SpecDepth::new(8);
         assert!(!policy.takes_chunk(5, deep));
@@ -871,6 +1076,7 @@ mod tests {
         let policy = ChunkPolicy {
             min_rows: 0,
             available: true,
+            fused: true,
         };
         assert!(!policy.takes_chunk(512, SpecDepth::NONE));
     }

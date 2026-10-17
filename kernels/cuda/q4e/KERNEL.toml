@@ -30,7 +30,10 @@
 # per-position raw key plane, which the page no longer carries.
 # `bf16` is a sixth: the dense projections over a brain-float weight on a
 # device with tensor cores - split step kernels and a tensor-core prompt GEMM -
-# beside the ported `matvec` kernel it replaces there.
+# beside the ported `matvec` kernel it replaces there. `gdn_fused` is a
+# seventh: a prefill chunk's whole recurrent block between its projections in
+# two kernels, bit for bit what the `gdn`/`gdn_tc` chain computes, with the
+# intermediates the chain writes kept out of memory.
 
 [build]
 sources = [
@@ -51,6 +54,7 @@ sources = [
     "mxfp8.cu",
     "idxring.cu",
     "bf16.cu",
+    "gdn_fused.cu",
 ]
 
 # Every unit includes `q4e.cuh` by bare name, and that header reaches its own
@@ -101,3 +105,4 @@ kv8 = "q4e_kv8"
 mxfp8 = "q4e_mxfp8"
 idxring = "q4e_idxring"
 bf16 = "q4e_bf16"
+gdn_fused = "q4e_gdn_fused"

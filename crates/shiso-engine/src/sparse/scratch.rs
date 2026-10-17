@@ -112,7 +112,8 @@ pub enum Buf {
     BlockOut,
     /// The recurrent block's fused query, key and value projection.
     GdnQkv,
-    /// The same rows after the causal convolution.
+    /// The same rows after the causal convolution; on the fused prompt path,
+    /// the normalized query rows and then the key rows, per (run, key head).
     GdnConv,
     /// Per-head decay.
     GdnDecay,
@@ -122,14 +123,17 @@ pub enum Buf {
     GdnAlphaProj,
     /// The write-strength projection's output, which the gate pass reads.
     GdnBetaProj,
-    /// The recurrence's output.
+    /// The recurrence's output; on the fused prompt path, the cumulative log
+    /// decays and write scales per (run, head) - two rows of a run's width
+    /// where a token has a whole head row each, so they always fit.
     GdnAttn,
     /// The tensor-core recurrence's `u` per (run, head), in half precision.
     GdnTcU,
-    /// Its `w` per (run, head), in half precision.
+    /// Its `w` per (run, head), in half precision; on the fused prompt path,
+    /// the packed masked query-key products.
     GdnTcW,
     /// Its masked, scaled query-key products per (run, head), in half
-    /// precision.
+    /// precision; on the fused prompt path, the packed inverse `T`.
     GdnTcP,
     /// Its cumulative log decays per (run, head).
     GdnTcG,
@@ -286,6 +290,13 @@ pub enum Buf {
     ProjectionPartial,
 }
 
+/// Bytes of the fused prompt path's normalized query and key rows over
+/// `run_rows` rows: whole runs of both, f32. Below a few dozen rows this is
+/// more than the convolution buffer they share needs for the chain.
+fn fused_qk_bytes(shape: &SparseShape, run_rows: u64) -> u64 {
+    run_rows * 2 * u64::from(shape.gdn_qk_dim()) * F32_BYTES
+}
+
 impl Buf {
     /// Every buffer, in allocation order.
     pub const ALL: [Self; 79] = [
@@ -398,7 +409,8 @@ impl Buf {
             Self::Residual | Self::Normed | Self::Expanded => per_token(shape.stream_dim()),
             Self::LowRank => per_token(shape.stream_rank),
             Self::Inject | Self::NormScale => per_token(shape.streams),
-            Self::GdnQkv | Self::GdnConv => per_token(shape.gdn_in_dim()),
+            Self::GdnQkv => per_token(shape.gdn_in_dim()),
+            Self::GdnConv => per_token(shape.gdn_in_dim()).max(fused_qk_bytes(shape, run_rows)),
             Self::GdnDecay | Self::GdnBeta | Self::GdnAlphaProj | Self::GdnBetaProj => {
                 per_token(shape.gdn.v_heads)
             }

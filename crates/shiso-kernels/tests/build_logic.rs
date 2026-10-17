@@ -178,6 +178,7 @@ fn the_real_manifest_tree_parses() {
             "q4e_embed",
             "q4e_exact",
             "q4e_gdn",
+            "q4e_gdn_fused",
             "q4e_gdn_tc",
             "q4e_hc",
             "q4e_idx",

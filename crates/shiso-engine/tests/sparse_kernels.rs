@@ -299,12 +299,18 @@ fn every_path() -> Plan {
         // Both recurrences, and both draft depths: the per-position checkpoint
         // slab is a pointer at one depth and a null at the other, and the
         // declaration says a pointer belongs in that slot either way.
+        // The chunked one both as the fused pair and as the chain a kernel set
+        // without the pair keeps.
         for policy in [
             ChunkPolicy {
                 min_rows: 0,
                 ..ChunkPolicy::new()
             },
             ChunkPolicy::new(),
+            ChunkPolicy {
+                fused: false,
+                ..ChunkPolicy::new()
+            },
         ] {
             for spec in [SpecDepth::NONE, SpecDepth::new(4)] {
                 let policy = Recurrence {
@@ -1161,6 +1167,7 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "moe.cu",
         "gdn.cu",
         "gdn_tc.cu",
+        "gdn_fused.cu",
         "ple.cu",
         "matvec.cu",
         "qsa.cu",
@@ -2002,6 +2009,141 @@ fn a_decode_row_plans_the_fused_step_and_a_verify_window_plans_the_chain() {
             }
         )
         .contains(&"q4e_gdn_step_kernel")
+    );
+}
+
+#[test]
+fn a_prompt_chunk_plans_the_fused_pair_where_the_set_has_it_and_the_chain_elsewhere() {
+    const CHAIN: [&str; 7] = [
+        "q4e_gdn_conv_par_kernel",
+        "q4e_gdn_conv_tail_kernel",
+        "q4e_gdn_l2norm_kernel",
+        "q4e_gdn_gates_kernel",
+        "q4e_gdn_tc_prep_kernel",
+        "q4e_gdn_tc_scan_kernel",
+        "q4e_gdn_out_gate_kernel",
+    ];
+    let shape = shape();
+    assert!(recurrent::fused_eligible(&shape), "the shipped geometry");
+    let prompt = Device {
+        role: PassRole::Prompt { snapshot: None },
+        ..GPU
+    };
+    let recurrent_launches = |entries: &[&'static str]| -> Vec<&'static str> {
+        entries
+            .iter()
+            .copied()
+            .filter(|name| name.starts_with("q4e_gdn") || name.starts_with("q4e_gdf"))
+            .collect()
+    };
+    // Between the projections: the prep, the carry, and the window rewrite
+    // after both, and nothing of the chain they replace.
+    let fused = recurrent_entries(&Recurrence::default(), 512, prompt);
+    assert_eq!(
+        recurrent_launches(&fused),
+        [
+            "q4e_gdf_prep_kernel",
+            "q4e_gdf_scan_kernel",
+            "q4e_gdn_conv_tail_kernel"
+        ]
+    );
+    // A kernel set without the pair keeps the chain, and so does a geometry the
+    // pair is not written for.
+    let chain_policy = Recurrence {
+        chunk: ChunkPolicy {
+            fused: false,
+            ..ChunkPolicy::new()
+        },
+        ..Recurrence::default()
+    };
+    let chain = recurrent_entries(&chain_policy, 512, prompt);
+    let mut odd = shape.clone();
+    odd.gdn = GdnShape::new(32, 16, 128, 4);
+    assert!(!recurrent::fused_eligible(&odd));
+    let odd_chain: Vec<&'static str> = recurrent::block(
+        &odd,
+        &recurrent_desc(&odd),
+        LayerRef::target(0),
+        0,
+        Recurrence::default(),
+        512,
+        prompt,
+    )
+    .expect("a half-precision recurrent block has a tier")
+    .steps()
+    .iter()
+    .filter_map(|step| step.entry().map(|entry| entry.name()))
+    .collect();
+    for entries in [&chain, &odd_chain] {
+        for name in CHAIN {
+            assert!(entries.contains(&name), "{name} missing: {entries:?}");
+        }
+        assert!(!entries.contains(&"q4e_gdf_prep_kernel"));
+    }
+    // A pass the chunked recurrence does not take never reaches the pair: it
+    // replaces the chunked chain and nothing else. (A prompt pass takes the
+    // chunked recurrence at every width, so the short pass here is a step.)
+    let short = recurrent_entries(&Recurrence::default(), 8, GPU);
+    assert!(short.contains(&"q4e_gdn_recurrent_kernel"));
+    assert!(!short.contains(&"q4e_gdf_prep_kernel"));
+}
+
+#[test]
+fn the_fused_carry_takes_the_snapshot_the_chained_carry_takes() {
+    // The state goes to the same place at the same run, and the window is cut
+    // at the same row, whichever carry the chunk takes.
+    let shape = shape();
+    let snapshot = Device {
+        role: PassRole::Prompt {
+            snapshot: Some(256),
+        },
+        ..GPU
+    };
+    let operands = |policy: &Recurrence, entry: &str| -> Vec<Vec<Operand>> {
+        recurrent::block(
+            &shape,
+            &recurrent_desc(&shape),
+            LayerRef::target(0),
+            2,
+            *policy,
+            512,
+            snapshot,
+        )
+        .expect("a half-precision recurrent block has a tier")
+        .steps()
+        .iter()
+        .filter(|step| step.name() == entry)
+        .map(|step| step.operands().expect("the list fits a launch").to_vec())
+        .collect()
+    };
+    let chain_policy = Recurrence {
+        chunk: ChunkPolicy {
+            fused: false,
+            ..ChunkPolicy::new()
+        },
+        ..Recurrence::default()
+    };
+    let chained = operands(&chain_policy, "q4e_gdn_tc_scan_kernel");
+    let fused = operands(&Recurrence::default(), "q4e_gdf_scan_kernel");
+    assert_eq!(chained.len(), 1);
+    assert_eq!(fused.len(), 1);
+    // `snap, snap_run` close both declarations.
+    assert_eq!(
+        chained[0][chained[0].len() - 2..],
+        fused[0][fused[0].len() - 2..]
+    );
+    assert_eq!(
+        fused[0][fused[0].len() - 2..],
+        [
+            Operand::Snapshot(shiso_engine::sparse::paged::snapshot_state_offset(
+                &shape, 2
+            )),
+            Operand::U32(4)
+        ]
+    );
+    assert_eq!(
+        operands(&chain_policy, "q4e_gdn_conv_tail_kernel"),
+        operands(&Recurrence::default(), "q4e_gdn_conv_tail_kernel")
     );
 }
 

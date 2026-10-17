@@ -38,8 +38,8 @@ use shiso_core::{Backend, CoreError, CoreResult, Extent3};
 use crate::sparse::exl3::{self as exl3, GemmShape};
 use crate::sparse::kernels::{
     self, Elem, Entry, EntryTable, Instantiation, MOD_EMBED, MOD_EXACT, MOD_EXL3, MOD_GDN,
-    MOD_GDN_TC, MOD_HC, MOD_IDX, MOD_IDXRING, MOD_KV8, MOD_MATVEC, MOD_MISC, MOD_MOE, MOD_PLE,
-    MOD_QSA, MOD_QSA_SPARSE, TemplateArgs,
+    MOD_GDN_FUSED, MOD_GDN_TC, MOD_HC, MOD_IDX, MOD_IDXRING, MOD_KV8, MOD_MATVEC, MOD_MISC,
+    MOD_MOE, MOD_PLE, MOD_QSA, MOD_QSA_SPARSE, TemplateArgs,
 };
 
 /// Every module the sparse stack launches out of.
@@ -52,6 +52,7 @@ const MODULES: &[&str] = &[
     MOD_MOE,
     MOD_GDN,
     MOD_GDN_TC,
+    MOD_GDN_FUSED,
     MOD_PLE,
     MOD_MATVEC,
     MOD_QSA,
@@ -401,6 +402,10 @@ pub struct OptionalPaths {
     pub tiled_attention: bool,
     /// The chunked recurrence and its parallel convolution.
     pub chunked_recurrence: bool,
+    /// The fused prompt kernels the chunked recurrence takes in place of its
+    /// chain: on top of `chunked_recurrence`, never instead of it, because
+    /// the fused path still launches that module's window rewrite.
+    pub fused_recurrence: bool,
     /// The kernel a prompt pass's brain-float projections can take.
     pub prompt_matmul: crate::sparse::matmul::PromptMatmul,
     /// The block-scaled low-precision prompt kernels
@@ -430,6 +435,8 @@ pub fn optional_paths(backend: &dyn Backend) -> OptionalPaths {
             && has(MOD_GDN_TC, "q4e_gdn_tc_scan_kernel")
             && has(MOD_GDN_TC, "q4e_gdn_conv_par_kernel")
             && has(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
+        fused_recurrence: has(MOD_GDN_FUSED, "q4e_gdf_prep_kernel")
+            && has(MOD_GDN_FUSED, "q4e_gdf_scan_kernel"),
         prompt_matmul: if [
             "q4e_bf16_gemm_kernel",
             "q4e_bf16_gemm_split_kernel",

@@ -57,6 +57,12 @@ pub const MOD_MOE: &str = "q4e_moe";
 pub const MOD_GDN: &str = "q4e_gdn";
 /// The gated recurrence of a prefill chunk, on tensor cores.
 pub const MOD_GDN_TC: &str = "q4e_gdn_tc";
+/// The same prefill chunk's whole recurrent block between its projections in
+/// two launches: the convolution, norms, gates and run-independent half in one,
+/// the carry and the output gate in the other, bit for bit what the
+/// [`MOD_GDN_TC`] chain computes. Not an upstream unit, for the reason
+/// [`MOD_MODELOPT`] is not.
+pub const MOD_GDN_FUSED: &str = "q4e_gdn_fused";
 /// The n-gram embedding block.
 pub const MOD_PLE: &str = "q4e_ple";
 /// Dense projections at every stored element type.
@@ -1002,6 +1008,45 @@ pub const fn gdn_tc_prep(v_heads: u32, n_tok: u32) -> Launch {
         512,
         2 * c * 136 * 2 + c * 68 * 4 + 3 * c * 4,
     )
+}
+
+/// Value heads per key head the fused prompt kernels are written for.
+pub const GDN_FUSED_HEADS_PER_KEY: u32 = 3;
+
+/// Convolution taps the fused prompt kernels are written for.
+pub const GDN_FUSED_CONV_TAPS: u32 = 4;
+
+/// Shared memory the fused prep reserves (`Q4E_GF_PREP_SMEM`): two padded
+/// half tiles, three float solve tiles and the three heads' decays and write
+/// strengths.
+pub const GDN_FUSED_PREP_SMEM: u32 = {
+    let c = GDN_TC_RUN;
+    let r = GDN_FUSED_HEADS_PER_KEY;
+    2 * c * 136 * 2 + r * c * 68 * 4 + 2 * r * c * 4
+};
+
+/// Shared memory the fused scan reserves (`Q4E_GF_SCAN_SMEM`): the f32 query
+/// and key rows, w, T and P, and the decays and write scales of one run.
+pub const GDN_FUSED_SCAN_SMEM: u32 = {
+    let c = GDN_TC_RUN;
+    let d = GDN_STATE_HEAD_DIM;
+    2 * c * d * 4 + c * d * 2 + 2 * c * c * 2 + 2 * c * 4
+};
+
+/// The fused prep: one block per (key head, run), heads fastest.
+#[must_use]
+pub const fn gdn_fused_prep(qk_heads: u32, n_tok: u32) -> Launch {
+    Launch::new(
+        Extent3::new(qk_heads, gdn_tc_runs(n_tok), 1),
+        512,
+        GDN_FUSED_PREP_SMEM,
+    )
+}
+
+/// The fused carry and output gate: one block per value head.
+#[must_use]
+pub const fn gdn_fused_scan(v_heads: u32) -> Launch {
+    Launch::new(Extent3::linear(v_heads), 256, GDN_FUSED_SCAN_SMEM)
 }
 
 /// The convolution of a prefill chunk, parallel over 64-token tiles.

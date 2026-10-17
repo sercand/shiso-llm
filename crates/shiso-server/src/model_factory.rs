@@ -1096,6 +1096,7 @@ fn sparse_options(
         route_sort: paths.route_sort,
         chunk: shiso_engine::sparse::recurrent::ChunkPolicy {
             available: paths.chunked_recurrence,
+            fused: paths.fused_recurrence,
             ..shiso_engine::sparse::recurrent::ChunkPolicy::new()
         },
         ..SparseOptions::default()

@@ -50,7 +50,8 @@ back to the kernel it belongs to.
 | `q4e_mxfp8` | `mxfp8.cu` | 9 | 0 |
 | `q4e_idxring` | `idxring.cu` | 1 | 0 |
 | `q4e_bf16` | `bf16.cu` | 12 | 0 |
-| **total** | 17 units | **103** | **105** |
+| `q4e_gdn_fused` | `gdn_fused.cu` | 2 | 0 |
+| **total** | 18 units | **105** | **105** |
 
 ## Plain entries, by module
 
@@ -191,6 +192,21 @@ kernels take `out, w, x, in_dim, out_dim, rows`.
 - `q4e_bf16_mix_step_kernel` - the stream mix's activation, expansion and
   collapse for one to eight step rows (`out, w_up, x, xn, inv_hc, in_dim,
   n_embd, n_hc, rows`), four 320-wide expansion rows a warp.
+
+### `q4e_gdn_fused`
+
+Not an upstream unit: a prefill chunk's recurrent block between its
+projections - convolution, norms, gates, the chunked delta rule and the output
+gate - in two kernels that reproduce the `q4e_gdn` / `q4e_gdn_tc` chain bit for
+bit.
+
+- `q4e_gdf_prep_kernel` - one block per (key head, run): the convolution, silu
+  and norms of the key head's rows, the gates and grams, and the three value
+  heads' triangular solves; writes u, T, P and the decays per (run, value head)
+  and the normalized query and key rows per (run, key head).
+- `q4e_gdf_scan_kernel` - one block per value head: the state carried across
+  the chunk's runs with the state transposed in mma accumulators, and each run's
+  outputs normed and gated in place.
 
 ### `q4e_moe`
 

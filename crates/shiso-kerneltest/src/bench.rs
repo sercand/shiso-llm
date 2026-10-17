@@ -428,6 +428,38 @@ pub const CASES: &[Case] = &[
         build: crate::qwen4exp::lowp::bench_a4_combine_8192,
     },
     Case {
+        name: "q4e_gdn_chain_4096",
+        build: crate::qwen4exp::gdn_fused::bench_chain_4096,
+    },
+    Case {
+        name: "q4e_gdn_fused_4096",
+        build: crate::qwen4exp::gdn_fused::bench_fused_4096,
+    },
+    Case {
+        name: "q4e_gdn_conv_par_4096",
+        build: crate::qwen4exp::gdn_fused::bench_conv_par_4096,
+    },
+    Case {
+        name: "q4e_gdn_tc_prep_4096",
+        build: crate::qwen4exp::gdn_fused::bench_tc_prep_4096,
+    },
+    Case {
+        name: "q4e_gdn_tc_scan_4096",
+        build: crate::qwen4exp::gdn_fused::bench_tc_scan_4096,
+    },
+    Case {
+        name: "q4e_gdn_out_gate_4096",
+        build: crate::qwen4exp::gdn_fused::bench_out_gate_4096,
+    },
+    Case {
+        name: "q4e_gdf_prep_4096",
+        build: crate::qwen4exp::gdn_fused::bench_fused_prep_4096,
+    },
+    Case {
+        name: "q4e_gdf_scan_4096",
+        build: crate::qwen4exp::gdn_fused::bench_fused_scan_4096,
+    },
+    Case {
         name: "q4e_moe_combine_2048",
         build: crate::qwen4exp::lowp::bench_combine_f32_2048,
     },
