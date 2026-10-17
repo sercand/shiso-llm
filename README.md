@@ -271,7 +271,11 @@ several are each fitted under 1 MP; the HTTP routes carry text only, so edits ar
 reachable from the library, not from `/v1/images/generations`. The model's
 authors ship a prompt upsampler with it and recommend not running it without
 one; this build has none, so prompts reach the model as typed. FLUX.3 Klein on
-CUDA is not implemented in this build.
+CUDA is **written but unvalidated**: the `diffusion` kernel module has a CUDA
+port (`kernels/cuda/diffusion`) that was written on a machine with no CUDA
+toolchain, so it has never been compiled by nvcc or run on a device. Treat any
+CUDA output as untrusted until the `shiso-cuda` `diffusion_kernels` cases and
+the FLUX.3 end-to-end case have passed on a GPU.
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
 

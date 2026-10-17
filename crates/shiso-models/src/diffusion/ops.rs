@@ -874,7 +874,7 @@ impl Drop for Scratch<'_> {
 /// for all of them, so a build or device without the set is refused at load
 /// naming what is missing, and a launch can never fall back to a host twin
 /// unnoticed. A name launched here but absent from this list is a driver bug.
-const REQUIRED_KERNELS: &[&str] = &[
+pub(crate) const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_silu_f32",
     "kernel_dit_swiglu_f32",
     "kernel_dit_swiglu2_f32",
