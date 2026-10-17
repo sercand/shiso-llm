@@ -515,10 +515,14 @@ impl Flux3KleinModel {
         residency: Residency,
         shape: &JobShape,
     ) -> Result<bool, ImageGenError> {
+        // The denoise's pooled working buffers are idle now; left in the pool
+        // they sit under the decode's own and the job's peak is their sum,
+        // which the planner's per-phase peaks do not count.
         tracing::info!(
             device_mb = device_used(self.ops.backend()).map_or(0.0, mb),
-            "flux3 device bytes after denoise"
+            "flux3 device bytes after denoise, before the pool is trimmed"
         );
+        self.ops.trim_pool();
         let Residency::Swap {
             keep_denoiser: false,
         } = residency
