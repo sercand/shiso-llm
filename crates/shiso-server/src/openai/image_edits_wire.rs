@@ -93,7 +93,8 @@ fn decode_data_url(url: &str, index: usize) -> Result<Vec<u8>, AppError> {
     })
 }
 
-/// One numeric text field, absent when the form has none.
+/// One numeric text field. `None` means the form has no such field, which is
+/// not a refusal; a field that is present but not a number is.
 fn number<T: std::str::FromStr>(
     text: &std::collections::HashMap<String, String>,
     name: &str,
