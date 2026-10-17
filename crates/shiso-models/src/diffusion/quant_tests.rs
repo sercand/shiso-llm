@@ -671,3 +671,14 @@ mod gguf_formats {
         check_reduction("step.c", WeightKind::Bf16, 17).expect("plain kinds have no block");
     }
 }
+
+#[test]
+fn the_document_a_real_export_writes_parses() {
+    // Verbatim from a published per-row ConvRot export: the format name says
+    // tensorwise, `per_row` marks the [out, 1] scale.
+    let doc = br#"{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256, "per_row": true}"#;
+    assert_eq!(
+        parse_quant_spec("blk.w.weight", doc).expect("parses"),
+        Some(RotGroup::Hadamard256)
+    );
+}
