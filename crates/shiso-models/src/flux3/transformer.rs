@@ -38,7 +38,7 @@ use super::pack::{Mode, Pack};
 use crate::diffusion::lin::Lin;
 use crate::diffusion::ops::{
     GemmCall, LayerNormCall, LinearResidualCall, ModulateCall, NormCall, Ops, Rope4dCall, Scratch,
-    SdpaCall, SliceExt, SwigluInput,
+    SdpaCall, SliceExt,
 };
 use crate::diffusion::weights::StStore;
 use crate::flux2::rope::rope_4d_freqs;
@@ -87,7 +87,7 @@ pub(crate) struct DiT {
     pub(super) image_blocks: Vec<Block>,
     cond_blocks: Vec<Block>,
     text_blocks: Vec<Block>,
-    single_blocks: Vec<Block>,
+    pub(super) single_blocks: Vec<Block>,
     rope_freqs: DeviceBuffer,
 }
 
@@ -519,6 +519,22 @@ impl DiT {
         })?;
 
         let gate_up = Self::project(ops, "dit mlp in", &block.mlp_in, xn.view(), rows)?;
+        // `silu(gate) * up` once over every row, then read as a dense input.
+        // The fused tile could form it while staging, but every one of the
+        // `h / 64` column tiles would recompute the same silu over the whole
+        // 3h-wide row: measured on an M4 at 4096 rows, the fused mlp_out
+        // took 134 ms against 81 ms for this pass plus the dense tile, with
+        // the same values (one `dit_silu` and one product per element).
+        let act = ops.alloc_f32("dit mlp act", rows * mlp)?;
+        ops.swiglu(
+            "dit mlp act",
+            act.view(),
+            gate_up.view(),
+            rows,
+            mlp,
+            2 * mlp,
+        )?;
+        drop(gate_up);
         for segment in &stream.segments {
             let rows_in = segment.rows.len();
             let start = segment.rows.start;
@@ -539,14 +555,9 @@ impl DiT {
                 step: "dit mlp out",
                 residual,
                 gate,
-                dense: None,
-                dense_cols: 0,
-                swiglu: Some(SwigluInput {
-                    rows: cut_rows(&gate_up, start, rows_in, 2 * mlp)?,
-                    stride: 2 * mlp,
-                    offset: 0,
-                    inner: mlp,
-                }),
+                dense: Some(cut_rows(&act, start, rows_in, mlp)?),
+                dense_cols: mlp,
+                swiglu: None,
                 weight: block.mlp_out.weight(),
                 m: rows_in,
                 n: h,

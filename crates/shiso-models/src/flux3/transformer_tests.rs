@@ -744,3 +744,228 @@ fn the_real_export_step_time_at_1024() {
         );
     }
 }
+
+/// Where one 1024x1024 step (4096 image rows, 80 text rows, no reference)
+/// spends its GPU time on the real export's shapes and quant formats, per
+/// kernel. The profiler times every launch in its own command buffer, so its
+/// total exceeds the batched step by the gaps it adds; read the shares, and
+/// the batched time from `the_real_export_step_time_at_1024`. Set
+/// `SHISO_FLUX3_PROFILE_JSON` to also write the report as JSON.
+#[test]
+#[ignore = "requires a Metal device and SHISO_TEST_MODEL_FLUX3"]
+#[expect(
+    clippy::print_stderr,
+    reason = "the profile table is the case's report, and a skip must say why"
+)]
+fn the_real_export_step_profile_at_1024() {
+    let Some(path) = std::env::var_os("SHISO_TEST_MODEL_FLUX3").map(PathBuf::from) else {
+        eprintln!("SKIP the_real_export_step_profile_at_1024: SHISO_TEST_MODEL_FLUX3 is unset");
+        return;
+    };
+    let Some(backend) = device() else { return };
+    let ops = Ops::new(&backend).expect("the diffusion kernel set");
+    let store = StStore::open(&path).expect("the export opens");
+    let params = super::config::inspect(&store).expect("the export inspects");
+    let dit = DiT::load(&store, &ops, &params).expect("loads");
+    let up = |rows: usize, width: usize| {
+        let values: Vec<f32> = (0..rows * width)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
+            .collect();
+        ops.upload_f32("input", &values).expect("uploads")
+    };
+    let ids = |rows: usize| {
+        let values: Vec<f32> = (0..rows * 4).map(|i| (i % 64) as f32 * 0.5).collect();
+        ops.upload_f32("ids", &values).expect("uploads")
+    };
+    let (image_rows, text_rows) = (4096usize, 80usize);
+    let (text, text_ids) = (up(text_rows, params.txt_in), ids(text_rows));
+    let (image, image_ids) = (up(image_rows, 128), ids(image_rows));
+    let step = || {
+        let out = dit
+            .forward(
+                &ops,
+                &DiTInput {
+                    image: image.view(),
+                    image_cond: None,
+                    text: text.view(),
+                    image_rows,
+                    cond_rows: 0,
+                    text_rows,
+                    t: 0.9,
+                    t_ref: 0.8,
+                    image_ids: image_ids.view(),
+                    cond_ids: None,
+                    text_ids: text_ids.view(),
+                },
+            )
+            .expect("a step runs");
+        backend.sync().expect("drains");
+        drop(out);
+    };
+    step();
+    let began = std::time::Instant::now();
+    step();
+    let batched = began.elapsed().as_secs_f64();
+    let profiler = backend.as_profiler().expect("the Metal backend profiles");
+    let region = shiso_core::ProfileRegion::open(profiler).expect("opens");
+    step();
+    let report = region.finish().expect("finishes");
+    eprintln!("batched step {batched:.3}s\n{}", report.table(40));
+    if let Some(json) = std::env::var_os("SHISO_FLUX3_PROFILE_JSON") {
+        std::fs::write(json, report.to_json().to_string()).expect("writes the JSON report");
+    }
+}
+
+/// The per-kernel profile of `SHISO_FLUX3_PROFILE_BLOCKS` (default 4)
+/// single-stream blocks of the real export over a 1024x1024 tail (4096 image
+/// rows then 80 text rows, two modulation segments): the shapes that hold
+/// most of a step, in seconds rather than the minute a whole step costs.
+#[test]
+#[ignore = "requires a Metal device and SHISO_TEST_MODEL_FLUX3"]
+#[expect(
+    clippy::print_stderr,
+    reason = "the profile table is the case's report, and a skip must say why"
+)]
+fn the_real_export_block_profile_at_1024() {
+    let Some(path) = std::env::var_os("SHISO_TEST_MODEL_FLUX3").map(PathBuf::from) else {
+        eprintln!("SKIP the_real_export_block_profile_at_1024: SHISO_TEST_MODEL_FLUX3 is unset");
+        return;
+    };
+    let Some(backend) = device() else { return };
+    let blocks: usize = std::env::var("SHISO_FLUX3_PROFILE_BLOCKS")
+        .ok()
+        .map_or(4, |v| v.parse().expect("a block count"));
+    let ops = Ops::new(&backend).expect("the diffusion kernel set");
+    let store = StStore::open(&path).expect("the export opens");
+    let params = super::config::inspect(&store).expect("the export inspects");
+    let dit = DiT::load(&store, &ops, &params).expect("loads");
+    let h = params.hidden;
+    let (image_rows, text_rows) = (4096usize, 80usize);
+    let rows = image_rows + text_rows;
+    let x_host: Vec<f32> = (0..rows * h)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
+        .collect();
+    let ids_host: Vec<f32> = (0..rows * 4).map(|i| (i % 64) as f32 * 0.5).collect();
+    let mod_host: Vec<f32> = (0..3 * h).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
+    let x = ops.upload_f32("x", &x_host).expect("uploads");
+    let ids = ops.upload_f32("ids", &ids_host).expect("uploads");
+    let mods = [0, 1].map(|_| ModVec {
+        buffer: ops.upload_scratch("mod", &mod_host).expect("uploads"),
+        hidden: h,
+    });
+    let stream = Stream {
+        x: &x,
+        rows,
+        ids: ids.view(),
+        segments: vec![
+            Segment {
+                rows: 0..image_rows,
+                modulation: &mods[0],
+            },
+            Segment {
+                rows: image_rows..rows,
+                modulation: &mods[1],
+            },
+        ],
+    };
+    let run = || {
+        for block in dit.single_blocks.iter().take(blocks) {
+            dit.run_block(&ops, block, &stream).expect("the block runs");
+        }
+        backend.sync().expect("drains");
+    };
+    run();
+    let began = std::time::Instant::now();
+    run();
+    let batched = began.elapsed().as_secs_f64();
+    let profiler = backend.as_profiler().expect("the Metal backend profiles");
+    let region = shiso_core::ProfileRegion::open(profiler).expect("opens");
+    run();
+    let report = region.finish().expect("finishes");
+    eprintln!(
+        "{blocks} single blocks batched {batched:.3}s ({:.1} ms per block)\n{}",
+        batched * 1e3 / blocks as f64,
+        report.table(30)
+    );
+}
+
+/// One step's velocity on the real export over 1024 image rows and 80 text
+/// rows of fixed synthetic input, written as little-endian f32 to the file
+/// `SHISO_FLUX3_VELOCITY_OUT` names: the before/after record a speed change
+/// is compared on (bit for bit, or by its largest deviation).
+#[test]
+#[ignore = "requires a Metal device, SHISO_TEST_MODEL_FLUX3 and SHISO_FLUX3_VELOCITY_OUT"]
+#[expect(
+    clippy::print_stderr,
+    reason = "a skipped checkpoint case must say why on stderr"
+)]
+fn the_real_export_velocity_dump() {
+    let (Some(path), Some(out_path)) = (
+        std::env::var_os("SHISO_TEST_MODEL_FLUX3").map(PathBuf::from),
+        std::env::var_os("SHISO_FLUX3_VELOCITY_OUT").map(PathBuf::from),
+    ) else {
+        eprintln!(
+            "SKIP the_real_export_velocity_dump: SHISO_TEST_MODEL_FLUX3 or SHISO_FLUX3_VELOCITY_OUT is unset"
+        );
+        return;
+    };
+    let Some(backend) = device() else { return };
+    let ops = Ops::new(&backend).expect("the diffusion kernel set");
+    let store = StStore::open(&path).expect("the export opens");
+    let params = super::config::inspect(&store).expect("the export inspects");
+    let dit = DiT::load(&store, &ops, &params).expect("loads");
+    let seeded = |n: usize, seed: u32, scale: f32| -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 9) as f32 / (1u32 << 23) as f32 * 2.0 - 1.0) * scale
+            })
+            .collect()
+    };
+    let (image_rows, text_rows) = (1024usize, 80usize);
+    let image = ops
+        .upload_f32("image", &seeded(image_rows * 128, 1, 1.0))
+        .expect("uploads");
+    let text = ops
+        .upload_f32("text", &seeded(text_rows * params.txt_in, 2, 0.5))
+        .expect("uploads");
+    let ids = |rows: usize, text: bool| {
+        let values: Vec<f32> = (0..rows)
+            .flat_map(|r| {
+                if text {
+                    [0.0, 0.0, 0.0, r as f32]
+                } else {
+                    [0.0, (r / 32) as f32, (r % 32) as f32, 0.0]
+                }
+            })
+            .collect();
+        ops.upload_f32("ids", &values).expect("uploads")
+    };
+    let (image_ids, text_ids) = (ids(image_rows, false), ids(text_rows, true));
+    let out = dit
+        .forward(
+            &ops,
+            &DiTInput {
+                image: image.view(),
+                image_cond: None,
+                text: text.view(),
+                image_rows,
+                cond_rows: 0,
+                text_rows,
+                t: 0.7,
+                t_ref: 0.6,
+                image_ids: image_ids.view(),
+                cond_ids: None,
+                text_ids: text_ids.view(),
+            },
+        )
+        .expect("a step runs");
+    let velocity = ops
+        .download("velocity", out.view(), image_rows * 128)
+        .expect("downloads");
+    let bad = velocity.iter().filter(|v| !v.is_finite()).count();
+    assert_eq!(bad, 0, "{bad} non-finite velocity values");
+    let bytes: Vec<u8> = velocity.iter().flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(out_path, bytes).expect("writes the velocity");
+}
