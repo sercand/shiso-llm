@@ -29,6 +29,8 @@ pub enum DType {
     Q8_0 = 8,
     /// K-quant 2-bit, 256 elements per block.
     Q2_K = 10,
+    /// K-quant 3-bit, 256 elements per block.
+    Q3_K = 11,
     /// K-quant 4-bit, 256 elements per block.
     Q4_K = 12,
     /// K-quant 5-bit, 256 elements per block.
@@ -164,6 +166,7 @@ impl DType {
             7 => Some(Self::Q5_1),
             8 => Some(Self::Q8_0),
             10 => Some(Self::Q2_K),
+            11 => Some(Self::Q3_K),
             12 => Some(Self::Q4_K),
             13 => Some(Self::Q5_K),
             14 => Some(Self::Q6_K),
@@ -210,6 +213,7 @@ impl DType {
             Self::Q5_1 => "q5_1",
             Self::Q8_0 => "q8_0",
             Self::Q2_K => "q2_k",
+            Self::Q3_K => "q3_k",
             Self::Q4_K => "q4_k",
             Self::Q5_K => "q5_k",
             Self::Q6_K => "q6_k",
@@ -269,6 +273,7 @@ impl DType {
             Self::Exl3Ngram6 => 160,
             Self::Pq2_0 | Self::Ptq1_0 | Self::MlxAffine2Gs128 => 128,
             Self::Q2_K
+            | Self::Q3_K
             | Self::Q4_K
             | Self::Q5_K
             | Self::Q6_K
@@ -308,7 +313,7 @@ impl DType {
             Self::IQ2_XS => 74,
             Self::IQ3_XXS => 98,
             Self::IQ1_S => 50,
-            Self::IQ3_S => 110,
+            Self::IQ3_S | Self::Q3_K => 110,
             Self::IQ2_S => 82,
             Self::IQ4_XS => 136,
             Self::IQ1_M => 56,

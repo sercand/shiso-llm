@@ -22,13 +22,64 @@ use shiso_vision::generator::ImageGenError;
 use super::ops::Ops;
 use super::residency::{FileSpan, coalesce};
 
-/// A GGUF k-quant block format, stored as raw bytes along each row.
+/// A GGUF block format, stored as raw bytes along each row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockFormat {
+    /// 256 weights in 84 bytes: 2-bit codes, 4-bit scales and mins.
+    Q2K,
+    /// 256 weights in 110 bytes: 3-bit codes (2 bits plus a high-bit mask),
+    /// 6-bit scales.
+    Q3K,
     /// 256 weights in 144 bytes: 4-bit codes, 6-bit scales and mins.
     Q4K,
+    /// 256 weights in 176 bytes: 5-bit codes, 6-bit scales and mins.
+    Q5K,
     /// 256 weights in 210 bytes: 6-bit codes, 8-bit scales.
     Q6K,
+    /// 32 weights in 34 bytes: 8-bit codes under one half-precision scale.
+    Q8_0,
+}
+
+impl BlockFormat {
+    /// Bytes one block occupies in the file.
+    pub(crate) const fn block_bytes(self) -> usize {
+        match self {
+            Self::Q2K => 84,
+            Self::Q3K => 110,
+            Self::Q4K => 144,
+            Self::Q5K => 176,
+            Self::Q6K => 210,
+            Self::Q8_0 => 34,
+        }
+    }
+
+    /// Weights one block covers; the reduction length of a row must be a
+    /// multiple of it.
+    pub(crate) const fn block_elems(self) -> usize {
+        match self {
+            Self::Q8_0 => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
+        }
+    }
+
+    /// Bytes one row of `k` weights occupies; `k` must be a multiple of
+    /// [`BlockFormat::block_elems`].
+    pub(crate) const fn row_bytes(self, k: usize) -> usize {
+        k / self.block_elems() * self.block_bytes()
+    }
+
+    /// The block format a GGUF tensor type is stored as, if it is one.
+    fn of_dtype(dtype: DType) -> Option<Self> {
+        match dtype {
+            DType::Q2_K => Some(Self::Q2K),
+            DType::Q3_K => Some(Self::Q3K),
+            DType::Q4_K => Some(Self::Q4K),
+            DType::Q5_K => Some(Self::Q5K),
+            DType::Q6_K => Some(Self::Q6K),
+            DType::Q8_0 => Some(Self::Q8_0),
+            _ => None,
+        }
+    }
 }
 
 /// One tensor as its shard header described it, resolved to a shard slot.
@@ -150,8 +201,9 @@ impl StStore {
     ///
     /// GGUF lists a tensor's dimensions fastest-varying first; they are
     /// reversed here into the safetensors order every caller reads. `F32`
-    /// and `BF16` tensors index as their safetensors twins; `Q4_K` and
-    /// `Q6_K` as raw bytes tagged with their [`BlockFormat`]; any other
+    /// and `BF16` tensors index as their safetensors twins; `Q2_K`, `Q3_K`,
+    /// `Q4_K`, `Q5_K`, `Q6_K` and `Q8_0` as raw bytes tagged with their
+    /// [`BlockFormat`]; any other
     /// format is refused at open, before a byte is imported.
     pub(crate) fn open_gguf(path: &Path) -> Result<Self, ImageGenError> {
         let file = GgufFile::open_shared(path)
@@ -162,15 +214,17 @@ impl StStore {
                 DType::F32 => (StDType::F32, None),
                 DType::BF16 => (StDType::Bf16, None),
                 DType::F16 => (StDType::F16, None),
-                DType::Q4_K => (StDType::U8, Some(BlockFormat::Q4K)),
-                DType::Q6_K => (StDType::U8, Some(BlockFormat::Q6K)),
-                other => {
-                    return Err(ImageGenError::Checkpoint(format!(
-                        "{}: tensor '{}' is {other:?}, which no diffusion kernel reads",
-                        path.display(),
-                        desc.name
-                    )));
-                }
+                other => match BlockFormat::of_dtype(other) {
+                    Some(format) => (StDType::U8, Some(format)),
+                    None => {
+                        return Err(ImageGenError::Checkpoint(format!(
+                            "{}: tensor '{}' is {}, which no diffusion kernel reads",
+                            path.display(),
+                            desc.name,
+                            other.type_name()
+                        )));
+                    }
+                },
             };
             let range = file.range_of(desc);
             if u64::try_from(range.len()).ok() != Some(desc.bytes) {

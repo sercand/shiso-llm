@@ -365,11 +365,70 @@ pub(crate) enum WeightKind {
     /// natively: the codes are widened while the tile stages them and the
     /// row's scale multiplies the accumulator in the epilogue.
     Int8Row,
-    /// GGUF `Q4_K` blocks along each row, decoded while the tile stages
+    /// GGUF `Q2_K` blocks along each row, decoded while the tile stages
     /// them; the reduction length must be a multiple of 256.
+    Q2K,
+    /// GGUF `Q3_K` blocks, as [`WeightKind::Q2K`].
+    Q3K,
+    /// GGUF `Q4_K` blocks, as [`WeightKind::Q2K`].
     Q4K,
-    /// GGUF `Q6_K` blocks, as [`WeightKind::Q4K`].
+    /// GGUF `Q5_K` blocks, as [`WeightKind::Q2K`].
+    Q5K,
+    /// GGUF `Q6_K` blocks, as [`WeightKind::Q2K`].
     Q6K,
+    /// GGUF `Q8_0` blocks, as [`WeightKind::Q2K`] but 32 weights wide: the
+    /// reduction length must be a multiple of 32.
+    Q8_0,
+}
+
+impl WeightKind {
+    /// The weights one stored block covers, which the reduction length of a
+    /// product against this kind must be a multiple of; `None` for the kinds
+    /// that are not stored in blocks.
+    pub(crate) const fn block_elems(self) -> Option<usize> {
+        match self {
+            Self::Q8_0 => Some(32),
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => Some(256),
+            Self::Bf16 | Self::Fp8 | Self::F32 | Self::Int8Row => None,
+        }
+    }
+}
+
+/// Refuses a reduction length `k` a block-stored weight cannot hold whole
+/// blocks of: a partial block would read its neighbour row's bytes.
+pub(crate) fn check_reduction(
+    step: &'static str,
+    kind: WeightKind,
+    k: usize,
+) -> Result<(), ImageGenError> {
+    match kind.block_elems() {
+        Some(block) if !k.is_multiple_of(block) => Err(ImageGenError::Backend(format!(
+            "{step}: a {kind:?} weight needs a reduction length that is a multiple of {block}, \
+             got {k}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The tiled GEMM entry for a block-stored kind, once the device has one.
+///
+/// A kind whose entry is not registered in [`REQUIRED_KERNELS`] answers
+/// `None`, and the caller refuses instead of launching a name the probe never
+/// checked.
+fn block_gemm_entry(kind: WeightKind, fused: bool) -> Option<&'static str> {
+    match (kind, fused) {
+        (WeightKind::Q4K, false) => Some("kernel_dit_gemm64_q4k"),
+        (WeightKind::Q6K, false) => Some("kernel_dit_gemm64_q6k"),
+        (WeightKind::Q4K, true) => Some("kernel_dit_gemm64_fused_q4k"),
+        (WeightKind::Q6K, true) => Some("kernel_dit_gemm64_fused_q6k"),
+        _ => None,
+    }
+}
+
+fn no_block_entry(step: &'static str, kind: WeightKind) -> ImageGenError {
+    ImageGenError::Backend(format!(
+        "{step}: no diffusion GEMM entry reads a {kind:?} weight yet"
+    ))
 }
 
 /// Everything a GEMM entry needs to know about the weight side of a product,
@@ -1308,20 +1367,21 @@ impl Ops {
         // The simdgroup tile stages whole 16-wide k slices; every linear in
         // the family qualifies, and the scalar kernels keep any other shape.
         let tiled = call.k.is_multiple_of(G64_K);
+        check_reduction(call.step, lw.kind, call.k)?;
         let entry = match (lw.kind, tiled) {
             (WeightKind::Fp8, true) => "kernel_dit_gemm64_fp8",
             (WeightKind::Bf16, true) => "kernel_dit_gemm64_bf16",
             (WeightKind::F32, true) => "kernel_dit_gemm64_f32",
             (WeightKind::Int8Row, true) => "kernel_dit_gemm64_i8",
-            (WeightKind::Q4K, true) => "kernel_dit_gemm64_q4k",
-            (WeightKind::Q6K, true) => "kernel_dit_gemm64_q6k",
-            (WeightKind::Q4K | WeightKind::Q6K, false) => {
-                return Err(ImageGenError::Backend(format!(
-                    "{}: a k-quant weight needs a reduction length that is a multiple of 256, \
-                     got {}",
-                    call.step, call.k
-                )));
-            }
+            (
+                kind @ (WeightKind::Q2K
+                | WeightKind::Q3K
+                | WeightKind::Q4K
+                | WeightKind::Q5K
+                | WeightKind::Q6K
+                | WeightKind::Q8_0),
+                _,
+            ) => block_gemm_entry(kind, false).ok_or_else(|| no_block_entry(call.step, kind))?,
             (WeightKind::Fp8, false) => "kernel_dit_gemm_fp8",
             (WeightKind::Bf16, false) => "kernel_dit_gemm_bf16",
             (WeightKind::F32, false) => "kernel_dit_gemm_f32",
@@ -1420,13 +1480,20 @@ impl Ops {
             gu_offset: swiglu.map_or(0, |s| s.offset) as u32,
             has_bias: u32::from(lw.bias.is_some()),
         };
+        check_reduction(call.step, lw.kind, k)?;
         let entry = match lw.kind {
             WeightKind::Fp8 => "kernel_dit_gemm64_fused_fp8",
             WeightKind::Bf16 => "kernel_dit_gemm64_fused_bf16",
             WeightKind::F32 => "kernel_dit_gemm64_fused_f32",
             WeightKind::Int8Row => "kernel_dit_gemm64_fused_i8",
-            WeightKind::Q4K => "kernel_dit_gemm64_fused_q4k",
-            WeightKind::Q6K => "kernel_dit_gemm64_fused_q6k",
+            kind @ (WeightKind::Q2K
+            | WeightKind::Q3K
+            | WeightKind::Q4K
+            | WeightKind::Q5K
+            | WeightKind::Q6K
+            | WeightKind::Q8_0) => {
+                block_gemm_entry(kind, true).ok_or_else(|| no_block_entry(call.step, kind))?
+            }
         };
         self.launch(
             call.step,
