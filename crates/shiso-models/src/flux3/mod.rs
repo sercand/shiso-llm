@@ -22,6 +22,7 @@ pub(crate) mod reference;
 pub use reference::default_size_for_references;
 pub(crate) mod sampler;
 pub(crate) mod scheduler;
+pub(crate) mod sizing;
 pub(crate) mod text_encoder;
 pub(crate) mod transformer;
 pub(crate) mod vae;

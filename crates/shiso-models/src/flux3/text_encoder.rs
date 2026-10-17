@@ -130,11 +130,29 @@ pub(crate) fn tokenize(
     Ok(PaddedPrompt { ids, real })
 }
 
+/// Encodes an already tokenized, padded prompt.
+///
+/// # Errors
+/// The refusals of the encoder's prefill.
+pub(crate) fn encode_padded(
+    enc: &TextEncoder,
+    ops: &Ops,
+    padded: &PaddedPrompt,
+) -> Result<EncodedText, ImageGenError> {
+    let tokens = enc.prefill_padded(ops, &padded.ids, padded.real)?;
+    Ok(EncodedText {
+        tokens,
+        len: padded.ids.len(),
+        real: padded.real,
+    })
+}
+
 /// Encodes `prompt` to the `(len, 8 * hidden)` conditioning the transformer
 /// reads, `len` being the padded length.
 ///
 /// # Errors
 /// The refusals of [`tokenize`] and of the encoder's prefill.
+#[cfg(test)]
 pub(crate) fn encode(
     enc: &TextEncoder,
     tok: &PromptTokenizer,
@@ -142,11 +160,5 @@ pub(crate) fn encode(
     ops: &Ops,
     prompt: &str,
 ) -> Result<EncodedText, ImageGenError> {
-    let padded = tokenize(tok, template, prompt)?;
-    let tokens = enc.prefill_padded(ops, &padded.ids, padded.real)?;
-    Ok(EncodedText {
-        tokens,
-        len: padded.ids.len(),
-        real: padded.real,
-    })
+    encode_padded(enc, ops, &tokenize(tok, template, prompt)?)
 }

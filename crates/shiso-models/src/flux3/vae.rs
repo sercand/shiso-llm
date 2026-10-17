@@ -534,6 +534,47 @@ impl Vae {
         }
         z
     }
+
+    /// Bytes the weights occupy on the device (all f32).
+    ///
+    /// # Errors
+    /// [`ImageGenError::Checkpoint`] when the file cannot be opened.
+    pub(crate) fn weight_bytes(path: &Path) -> Result<u64, ImageGenError> {
+        let store = StStore::open(&weights_file(path)?)?;
+        Ok(store
+            .names()
+            .filter(|n| n.starts_with("encoder.") || n.starts_with("decoder."))
+            .filter_map(|n| store.get(n))
+            .map(|e| e.elements() * 4)
+            .sum())
+    }
+
+    /// The widest field at full resolution, in channels: the largest
+    /// activation either half carries.
+    pub(crate) fn full_resolution_channels(&self) -> usize {
+        let widest = |levels: &[Level]| {
+            levels
+                .first()
+                .into_iter()
+                .flat_map(|l| l.blocks.iter())
+                .map(|b| b.conv1.out_c.max(b.conv1.in_c))
+                .max()
+                .unwrap_or(0)
+        };
+        widest(&self.decoder.levels).max(widest(&self.encoder.levels))
+    }
+
+    /// Estimated peak working bytes of encoding or decoding a picture of
+    /// `pixels` pixels whose widest full-resolution field has `channels`:
+    /// four such fields live at once (a residual block's input, two stages
+    /// and its sum) plus the attention's score block, which is the smaller
+    /// of the budget and the square of the mid-level's positions.
+    pub(crate) fn working_set_bytes(channels: usize, pixels: usize) -> u64 {
+        let field = (channels as u64) * (pixels as u64) * 4;
+        let mid_positions = (pixels / 64).max(1) as u64;
+        let scores = (mid_positions * mid_positions).min(ATTN_SCORE_BUDGET as u64) * 4;
+        4 * field + scores
+    }
 }
 
 /// A same-padding convolution; updates the field's channels.

@@ -20,8 +20,12 @@ use shiso_vision::generator::{
     ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat, InputReferenceImage,
 };
 
+use super::config::locate_and_inspect;
 use super::config_tests::{Forge, is_f32, layout};
+use super::pipeline::{Component, Flux3KleinModel, ResidencyEvent};
+use super::sizing::{JobShape, JobSizer};
 use super::text_encoder_tests::{toy_tokenizer, write_decoder_sized};
+use crate::diffusion::residency::{Footprint, Residency, ResidencyMode};
 use crate::image_registry::{
     DEFAULT_IMAGE_RESERVE_BYTES, ImageModelDesc, ImageResidency, open_image_generator,
 };
@@ -439,4 +443,367 @@ fn progress_ticks_once_per_step_without_a_partial_image() {
         seen.iter()
             .all(|e| e.total_steps == 2 && e.partial_image.is_none())
     );
+}
+
+// --- residency ----------------------------------------------------------------
+
+const GIB: u64 = 1 << 30;
+
+/// A sizer with a real checkpoint's proportions: an INT8 text encoder of
+/// 4.4 GB, the Q4 transformer of 3.9 GB, the autoencoder's 0.3 GB.
+fn real_sizer(mode: ResidencyMode, working_set: u64) -> JobSizer {
+    JobSizer {
+        mode,
+        working_set,
+        reserve: 3 << 29,
+        footprint: Footprint {
+            encoder: 44 * GIB / 10,
+            denoiser: 39 * GIB / 10,
+            decoder: 3 * GIB / 10,
+        },
+        encoder_hidden: 2560,
+        encoder_inter: 9728,
+        hidden: 3072,
+        mlp_hidden: 9216,
+        txt_in: 20_480,
+        vae_channels: 128,
+    }
+}
+
+fn square(side: usize) -> JobShape {
+    JobShape {
+        width: side,
+        height: side,
+        text_rows: 160,
+        cond_rows: 0,
+    }
+}
+
+#[test]
+fn auto_plans_swap_when_working_set_is_small() {
+    // A 16 GB host's working set is about 11 GB: the encoder and the
+    // transformer (8.3 GB) plus the job's peaks do not fit together.
+    let small = real_sizer(ResidencyMode::Auto, 11 * GIB);
+    assert!(
+        matches!(small.plan(&square(1024)), Ok(Residency::Swap { .. })),
+        "{:?}",
+        small.plan(&square(1024))
+    );
+    // A 64 GB host keeps everything resident.
+    let large = real_sizer(ResidencyMode::Auto, 48 * GIB);
+    assert_eq!(
+        large.plan(&square(1024)).expect("fits"),
+        Residency::Resident
+    );
+    // The operator's word decides when both would fit.
+    let forced = real_sizer(ResidencyMode::Swap, 48 * GIB);
+    assert!(matches!(
+        forced.plan(&square(1024)),
+        Ok(Residency::Swap {
+            keep_denoiser: true
+        })
+    ));
+    // A swapping host that cannot keep the transformer beside the decode of a
+    // big picture drops it before the decode.
+    let tight = real_sizer(ResidencyMode::Auto, 10 * GIB);
+    assert!(
+        matches!(
+            tight.plan(&square(1536)),
+            Ok(Residency::Swap {
+                keep_denoiser: false
+            })
+        ),
+        "{:?}",
+        tight.plan(&square(1536))
+    );
+}
+
+#[test]
+fn resident_refuses_job_that_does_not_fit_naming_side() {
+    let sizer = real_sizer(ResidencyMode::Resident, 11 * GIB);
+    let Err(ImageGenError::TooLargeForMemory {
+        width,
+        height,
+        needed_mib,
+        budget_mib,
+        largest_side,
+    }) = sizer.plan(&square(1024))
+    else {
+        panic!("a resident plan of 8.6 GB of weights beside a 1024 job must not fit 9.5 GB");
+    };
+    assert_eq!((width, height), (1024, 1024));
+    assert!(needed_mib > budget_mib, "{needed_mib} vs {budget_mib}");
+    assert_eq!(budget_mib, (11 * GIB - (3 << 29)) >> 20);
+    // The named side is the largest square that plans, on the 16-pixel grid.
+    assert_eq!(largest_side % 16, 0);
+    let side = largest_side as usize;
+    if side > 0 {
+        assert!(sizer.plan(&square(side)).is_ok(), "{side} must fit");
+    }
+    assert!(
+        sizer.plan(&square(side + 16)).is_err(),
+        "{} must not fit",
+        side + 16
+    );
+    // An absurd picture is refused under Auto as well, with a smaller side named.
+    let auto = real_sizer(ResidencyMode::Auto, 11 * GIB);
+    match auto.plan(&square(4096)) {
+        Err(ImageGenError::TooLargeForMemory { largest_side, .. }) => {
+            assert!((1024..4096).contains(&largest_side), "{largest_side}");
+        }
+        other => panic!("a 4096x4096 job must be refused on an 11 GB working set: {other:?}"),
+    }
+    // The decode peak is what grows with the picture, so references count too.
+    let with_refs = JobShape {
+        cond_rows: 4 * 64 * 64,
+        ..square(1024)
+    };
+    let plain = sizer.peaks(&square(1024));
+    assert!(sizer.peaks(&with_refs).denoise > plain.denoise);
+    assert!(sizer.peaks(&with_refs).decode >= plain.decode);
+}
+
+/// Loads the tiny model concretely (not through the registry) so a test can
+/// read its residency log and shrink its working set.
+fn load_tiny(tiny: &Tiny, backend: &Arc<dyn Backend>) -> Flux3KleinModel {
+    let located = locate_and_inspect(&tiny.desc).expect("locates");
+    Flux3KleinModel::load(&located, &tiny.desc, backend).expect("loads")
+}
+
+/// Replays `events` and returns how many times each component was loaded,
+/// failing if a component was dropped or loaded twice in a row, or if the
+/// encoder and the transformer were loaded together at or after event
+/// `swap_from` (a resident load, before the first swap job, holds both).
+fn audit(events: &[ResidencyEvent], swap_from: usize) -> (usize, usize) {
+    let (mut encoder, mut denoiser) = (false, false);
+    let (mut encoders, mut denoisers) = (0, 0);
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            ResidencyEvent::Loaded {
+                component: Component::Encoder,
+                ..
+            } => {
+                assert!(!encoder, "the encoder was loaded twice: {events:?}");
+                encoder = true;
+                encoders += 1;
+            }
+            ResidencyEvent::Loaded {
+                component: Component::Denoiser,
+                ..
+            } => {
+                assert!(!denoiser, "the transformer was loaded twice: {events:?}");
+                denoiser = true;
+                denoisers += 1;
+            }
+            ResidencyEvent::Dropped {
+                component: Component::Encoder,
+                ..
+            } => {
+                assert!(
+                    encoder,
+                    "the encoder was dropped while not loaded: {events:?}"
+                );
+                encoder = false;
+            }
+            ResidencyEvent::Dropped {
+                component: Component::Denoiser,
+                ..
+            } => {
+                assert!(
+                    denoiser,
+                    "the transformer was dropped while not loaded: {events:?}"
+                );
+                denoiser = false;
+            }
+        }
+        assert!(
+            index < swap_from || !(encoder && denoiser),
+            "the encoder and the transformer were loaded together: {events:?}"
+        );
+    }
+    (encoders, denoisers)
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn swap_events_order_encoder_dropped_before_denoiser_loaded() {
+    let Some(backend) = device() else { return };
+    let tiny = forge_tiny(ImageResidency::Swap);
+    let model = load_tiny(&tiny, &backend);
+    assert!(
+        model.events().is_empty(),
+        "a swapping model loads nothing until a job needs it"
+    );
+    model.generate(&job(64, 64, 1), None).expect("generates");
+    let first = model.events();
+    let kinds: Vec<_> = first
+        .iter()
+        .map(|e| match e {
+            ResidencyEvent::Loaded { component, .. } => ("load", *component),
+            ResidencyEvent::Dropped { component, .. } => ("drop", *component),
+        })
+        .collect();
+    assert_eq!(
+        &kinds[..3],
+        &[
+            ("load", Component::Encoder),
+            ("drop", Component::Encoder),
+            ("load", Component::Denoiser)
+        ],
+        "the encoder is gone before the transformer is imported: {first:?}"
+    );
+    // A second job needs the encoder again: the transformer goes first.
+    model.generate(&job(64, 64, 2), None).expect("generates");
+    let all = model.events();
+    let (encoders, denoisers) = audit(&all, 0);
+    assert_eq!((encoders, denoisers), (2, 2), "{all:?}");
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn a_host_too_small_to_keep_the_transformer_drops_it_before_the_decode() {
+    let Some(backend) = device() else { return };
+    let tiny = forge_tiny(ImageResidency::Auto);
+    let mut model = load_tiny(&tiny, &backend);
+    let shape = JobShape {
+        width: 128,
+        height: 128,
+        text_rows: 80,
+        cond_rows: 0,
+    };
+    // Shrink the working set to the smallest that still plans a swap, which
+    // on these proportions cannot hold the transformer beside the decode.
+    let reserve = model.sizer_mut().reserve;
+    let mut found = None;
+    for ws in (1..400).map(|mb| reserve + mb * (1 << 20)) {
+        model.sizer_mut().working_set = ws;
+        if matches!(
+            model.sizer_mut().plan(&shape),
+            Ok(Residency::Swap {
+                keep_denoiser: false
+            })
+        ) {
+            found = Some(ws);
+            break;
+        }
+    }
+    assert!(
+        found.is_some(),
+        "no working set plans a swap that drops the transformer"
+    );
+    model.generate(&job(128, 128, 5), None).expect("generates");
+    let events = model.events();
+    // The model loaded both while the plan said resident (events 0 and 1);
+    // the job then swaps: transformer out, encode, encoder out, transformer
+    // in, steps, transformer out before the decode.
+    audit(&events, 2);
+    let kinds: Vec<_> = events[2..]
+        .iter()
+        .map(|e| match e {
+            ResidencyEvent::Loaded { component, .. } => ("load", *component),
+            ResidencyEvent::Dropped { component, .. } => ("drop", *component),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("drop", Component::Denoiser),
+            ("drop", Component::Encoder),
+            ("load", Component::Denoiser),
+            ("drop", Component::Denoiser)
+        ],
+        "{events:?}"
+    );
+    // And the job that does not fit at all is refused, loading nothing more.
+    model.sizer_mut().working_set = reserve + (1 << 20);
+    assert!(matches!(
+        model.generate(&job(128, 128, 5), None),
+        Err(ImageGenError::TooLargeForMemory { .. })
+    ));
+    assert_eq!(model.events().len(), events.len());
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn swap_and_resident_same_bytes_for_one_seed() {
+    let Some(backend) = device() else { return };
+    let resident = {
+        let tiny = forge_tiny(ImageResidency::Resident);
+        let model = load_tiny(&tiny, &backend);
+        let (encoders, denoisers) = audit(&model.events(), usize::MAX);
+        assert_eq!((encoders, denoisers), (1, 1), "resident loads both at once");
+        let mut edit = job(112, 64, 21);
+        edit.input_references = vec![png(100, 40, 3)];
+        (
+            model
+                .generate(&job(96, 64, 21), None)
+                .expect("generates")
+                .bytes,
+            model.generate(&edit, None).expect("edits").bytes,
+        )
+    };
+    let swapped = {
+        let tiny = forge_tiny(ImageResidency::Swap);
+        let model = load_tiny(&tiny, &backend);
+        let mut edit = job(112, 64, 21);
+        edit.input_references = vec![png(100, 40, 3)];
+        let out = (
+            model
+                .generate(&job(96, 64, 21), None)
+                .expect("generates")
+                .bytes,
+            model.generate(&edit, None).expect("edits").bytes,
+        );
+        audit(&model.events(), 0);
+        out
+    };
+    assert_eq!(
+        resident.0, swapped.0,
+        "text-to-image bytes differ across residency"
+    );
+    assert_eq!(resident.1, swapped.1, "edit bytes differ across residency");
+}
+
+/// The same comparison on the real files, at 256x256 so it fits beside
+/// itself: `SHISO_TEST_MODEL_FLUX3` (the transformer), `_TEXT` (the text
+/// encoder file or directory) and `_VAE` name them.
+#[test]
+#[ignore = "requires a Metal device and the real FLUX.3 files"]
+#[expect(
+    clippy::print_stderr,
+    reason = "a skipped real-checkpoint case must say why on stderr"
+)]
+fn real_files_swap_and_resident_same_bytes_for_one_seed() {
+    let Some(backend) = device() else { return };
+    let var = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
+    let (Some(model), Some(text), Some(vae)) = (
+        var("SHISO_TEST_MODEL_FLUX3"),
+        var("SHISO_TEST_MODEL_FLUX3_TEXT"),
+        var("SHISO_TEST_MODEL_FLUX3_VAE"),
+    ) else {
+        eprintln!(
+            "SKIP flux3 real-file residency case: SHISO_TEST_MODEL_FLUX3, \
+             SHISO_TEST_MODEL_FLUX3_TEXT and SHISO_TEST_MODEL_FLUX3_VAE are not all set"
+        );
+        return;
+    };
+    let run = |residency| {
+        let desc = ImageModelDesc {
+            model_path: model.clone(),
+            text_encoder_path: Some(text.clone()),
+            vae_path: Some(vae.clone()),
+            tokenizer_path: None,
+            assets_dir: None,
+            residency,
+            reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
+            draft_steps: 0,
+            final_reuse: None,
+        };
+        let generator = open_image_generator(&desc, &backend).expect("opens");
+        generator
+            .generate(&job(256, 256, 42), None)
+            .expect("generates")
+            .bytes
+    };
+    assert_eq!(run(ImageResidency::Swap), run(ImageResidency::Resident));
 }

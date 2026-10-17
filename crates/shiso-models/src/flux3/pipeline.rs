@@ -5,7 +5,7 @@
 //! encoder, the diffusion transformer and the autoencoder - on one backend,
 //! with the tokenizer and chat template that turn text into ids.
 //! [`ImageGenerator::generate`] is four stages, each a method so a device
-//! test can run one without the rest: [`Flux3KleinModel::encode_prompt`]
+//! test can run one without the rest: [`Flux3KleinModel::tokenize_prompt`] and the encoder
 //! (padded, masked text conditioning), [`Flux3KleinModel::prepare_references`]
 //! (VAE-encoded reference tokens), [`Flux3KleinModel::sample`] (the flow-map
 //! Euler walk over `[image, image_cond, text]`) and
@@ -22,13 +22,36 @@
 //! an edit generated at the canvas size comes back at the reference's own
 //! size, which need not sit on the 16-pixel grid.
 //!
+//! # Residency
+//!
+//! The text encoder (about 8 GB in BF16, 4 GB as INT8) and the transformer
+//! (4 GB as the Q4 export) do not both fit a 16 GB-class working set beside
+//! a 1024x1024 job, so such a host swaps, as the Qwen-Image pipeline does:
+//!
+//! 1. The transformer is dropped if loaded, the encoder is loaded (its pages
+//!    read ahead in large chunks first), the prompt encoded, and the encoder
+//!    dropped *before* the transformer is imported. While it encodes, as
+//!    much of the transformer as fits beside it is read into the page cache
+//!    on a background thread.
+//! 2. The rest is read ahead, the transformer imported, the steps run.
+//! 3. The transformer stays loaded if it fits beside the decode; otherwise
+//!    it is dropped before the decode, and the encoder's pages are read
+//!    ahead behind the decode for the next job when they fit.
+//!
+//! The autoencoder is small and always loaded. Every transformer import
+//! goes through one function that, in swap mode, drops the encoder first, so
+//! the two are never loaded together whatever path led there (including an
+//! encode that failed). [`JobSizer`] decides from byte counts alone, per
+//! job, and refuses one no residency fits.
+//!
 //! # Progress
 //!
 //! A progress event goes out after every step without a partial image: a
 //! preview is a whole VAE decode, which per step would cost more than the
 //! step.
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use shiso_core::Backend;
@@ -38,7 +61,7 @@ use shiso_vision::generator::{
     ImageOutputFormat, ImageStepEvent,
 };
 
-use super::config::Flux3Located;
+use super::config::{Flux3Located, Flux3Params};
 use super::pack::{Pack, image_ids, reference_ids, text_ids};
 use super::reference::{
     check_reference_count, check_reference_size, decode_reference, prepare_multi_reference,
@@ -46,13 +69,20 @@ use super::reference::{
 };
 use super::sampler::{initial_noise, round_bf16, run_euler};
 use super::scheduler::{ALPHA, DEFAULT_STEPS, schedule};
-use super::text_encoder::{EncodedText, encode, load as load_text_encoder};
+use super::sizing::{JobShape, JobSizer};
+use super::text_encoder::{
+    EncodedText, PaddedPrompt, TAP_LAYERS, detect_prefix, encode_padded, load as load_text_encoder,
+    tokenize,
+};
 use super::transformer::{DiT, DiTInput};
 use super::vae::{PIXELS_PER_TOKEN, Vae};
 use crate::diffusion::encode::{Channels, encode_image};
 use crate::diffusion::ops::Ops;
 use crate::diffusion::prompt::{PromptTokenizer, load_chat_template};
 use crate::diffusion::qwen3_text::TextEncoder;
+use crate::diffusion::residency::{
+    FileSpan, Footprint, Prefetch, Residency, ResidencyMode, split_at, total_bytes,
+};
 use crate::diffusion::weights::StStore;
 use crate::image_registry::{ImageModelDesc, ImageResidency};
 
@@ -67,19 +97,468 @@ const MAX_SIDE: u32 = 4096;
 /// The size a request that names none gets.
 const DEFAULT_SIZE: (u32, u32) = (1024, 1024);
 
+/// A read-ahead of a component's first spans already running, and the
+/// spans it left for later.
+type ReadAhead = (Prefetch, Vec<FileSpan>);
+
+/// A pipeline component, for the residency log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Component {
+    /// The text encoder.
+    Encoder,
+    /// The diffusion transformer.
+    Denoiser,
+}
+
+/// One residency change, in the order it happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResidencyEvent {
+    /// The component was imported; `device_bytes` is the device's own
+    /// allocation growth across the import.
+    Loaded {
+        /// Which one.
+        component: Component,
+        /// Device bytes the import added.
+        device_bytes: i64,
+    },
+    /// The component was dropped; `device_bytes` is the allocation shrink.
+    Dropped {
+        /// Which one.
+        component: Component,
+        /// Device bytes the drop released.
+        device_bytes: i64,
+    },
+}
+
+/// The text encoder's files and the facts the planner needs about it.
+#[derive(Debug)]
+struct EncoderFiles {
+    weights: Vec<PathBuf>,
+    config: PathBuf,
+    /// The byte ranges an import reads: the embedding and the layers through
+    /// the last tap.
+    spans: Vec<FileSpan>,
+}
+
+/// What a job changes between jobs.
+#[derive(Debug)]
+struct State {
+    encoder: Option<TextEncoder>,
+    dit: Option<DiT>,
+    /// The encoder's read-ahead started behind the last decode.
+    encoder_prefetch: Option<Prefetch>,
+    events: Vec<ResidencyEvent>,
+}
+
+/// Text rows the load-time residency decision is sized for.
+const PLAN_TEXT_ROWS: usize = 512;
+
 /// The FLUX.3 Klein generator: text encoder, transformer and autoencoder on
 /// one device, driven one job at a time.
 #[derive(Debug)]
 pub(crate) struct Flux3KleinModel {
     model_id: String,
-    pub(super) ops: Ops,
-    pub(super) text: TextEncoder,
-    pub(super) dit: DiT,
-    pub(super) vae: Vae,
+    ops: Ops,
+    params: Flux3Params,
+    dit_path: PathBuf,
+    dit_spans: Vec<FileSpan>,
+    encoder_files: EncoderFiles,
+    sizer: JobSizer,
+    vae: Vae,
     /// The vocabulary; caller text spelling a control token is encoded as
     /// plain text so it cannot forge a marker.
     tokenizer: PromptTokenizer,
     chat_template: String,
+    state: Mutex<State>,
+}
+
+/// Device bytes in use now, when the backend says.
+fn device_used(backend: &Arc<dyn Backend>) -> Option<u64> {
+    backend
+        .memory_info()
+        .map(|info| info.total.saturating_sub(info.free))
+}
+
+/// `after - before` as signed bytes.
+fn delta(before: Option<u64>, after: Option<u64>) -> i64 {
+    match (before, after) {
+        (Some(b), Some(a)) => {
+            i64::try_from(a).unwrap_or(i64::MAX) - i64::try_from(b).unwrap_or(i64::MAX)
+        }
+        _ => 0,
+    }
+}
+
+fn ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[expect(clippy::cast_precision_loss, reason = "byte counts logged in MB")]
+fn mb(bytes: u64) -> f64 {
+    bytes as f64 / 1e6
+}
+
+/// The text encoder's file facts from headers alone: the spans an import
+/// reads, the residual width and the MLP width.
+fn read_encoder_facts(files: &[PathBuf]) -> Result<(Vec<FileSpan>, usize, usize), ImageGenError> {
+    let store = StStore::open_files(files)?;
+    let prefix = detect_prefix(&store, files)?;
+    let last_tap = TAP_LAYERS[TAP_LAYERS.len() - 1];
+    let layers = format!("{prefix}layers.");
+    let embed = format!("{prefix}embed_tokens.");
+    let spans = store.spans(|name| {
+        name.starts_with(&embed)
+            || name.strip_prefix(&layers).is_some_and(|rest| {
+                rest.split('.')
+                    .next()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|n| n <= last_tap)
+            })
+    });
+    let axis = |name: String, axis: usize| -> Result<usize, ImageGenError> {
+        store
+            .require(&name)?
+            .shape
+            .get(axis)
+            .and_then(|&d| usize::try_from(d).ok())
+            .ok_or_else(|| ImageGenError::Checkpoint(format!("'{name}' has no axis {axis}")))
+    };
+    let hidden = axis(format!("{prefix}embed_tokens.weight"), 1)?;
+    let inter = axis(format!("{prefix}layers.0.mlp.gate_proj.weight"), 0)?;
+    Ok((spans, hidden, inter))
+}
+
+impl Flux3KleinModel {
+    /// Opens the components `located` names: sizes them from headers,
+    /// loads the autoencoder, and loads the rest when the residency plan for
+    /// a default job keeps them together.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Checkpoint`] for components that disagree, and
+    /// [`ImageGenError::TooLargeForMemory`] when not even a default job fits
+    /// the device; whatever a component's load refuses.
+    pub(crate) fn load(
+        located: &Flux3Located,
+        desc: &ImageModelDesc,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<Self, ImageGenError> {
+        let began = Instant::now();
+        let ops = Ops::new(backend)?;
+        let (encoder_spans, encoder_hidden, encoder_inter) =
+            read_encoder_facts(&located.text_encoder_files)?;
+        if 8 * encoder_hidden != located.params.txt_in {
+            return Err(ImageGenError::Checkpoint(format!(
+                "the text encoder's taps are {} wide but the transformer reads {}",
+                8 * encoder_hidden,
+                located.params.txt_in
+            )));
+        }
+        let dit_spans = StStore::open(&located.weight_file)?.spans(|_| true);
+        let vae = Vae::load(&located.vae_path, &ops)?;
+        let footprint = Footprint {
+            encoder: total_bytes(&encoder_spans),
+            denoiser: total_bytes(&dit_spans),
+            decoder: Vae::weight_bytes(&located.vae_path)?,
+        };
+        let working_set = backend.memory_info().map_or(u64::MAX, |info| info.total);
+        let mode = match desc.residency {
+            ImageResidency::Auto => ResidencyMode::Auto,
+            ImageResidency::Resident => ResidencyMode::Resident,
+            ImageResidency::Swap => ResidencyMode::Swap,
+        };
+        let sizer = JobSizer {
+            mode,
+            working_set,
+            reserve: desc.reserve_bytes,
+            footprint,
+            encoder_hidden,
+            encoder_inter,
+            hidden: located.params.hidden,
+            mlp_hidden: located.params.mlp_hidden,
+            txt_in: located.params.txt_in,
+            vae_channels: vae.full_resolution_channels(),
+        };
+        tracing::info!(
+            working_set_mb = mb(working_set),
+            reserve_mb = mb(desc.reserve_bytes),
+            encoder_mb = mb(footprint.encoder),
+            denoiser_mb = mb(footprint.denoiser),
+            decoder_mb = mb(footprint.decoder),
+            ?mode,
+            "flux3 residency inputs"
+        );
+        let tokenizer_file = if located.tokenizer_path.is_dir() {
+            located.tokenizer_path.join("tokenizer.json")
+        } else {
+            located.tokenizer_path.clone()
+        };
+        let tokenizer = PromptTokenizer::open(&tokenizer_file)?;
+        let chat_template = load_chat_template(tokenizer_file.parent())?;
+        let model = Self {
+            model_id: "flux-3-klein".to_owned(),
+            ops,
+            params: located.params.clone(),
+            dit_path: located.weight_file.clone(),
+            dit_spans,
+            encoder_files: EncoderFiles {
+                weights: located.text_encoder_files.clone(),
+                config: located.text_encoder_config.clone(),
+                spans: encoder_spans,
+            },
+            sizer,
+            vae,
+            tokenizer,
+            chat_template,
+            state: Mutex::new(State {
+                encoder: None,
+                dit: None,
+                encoder_prefetch: None,
+                events: Vec::new(),
+            }),
+        };
+        // A default job decides what stays loaded: both components when they
+        // fit together, else nothing yet (the first job swaps them in; the
+        // cost of that first import is not measured here, so no warm-up runs).
+        let residency = model.sizer.plan(&JobShape {
+            width: DEFAULT_SIZE.0 as usize,
+            height: DEFAULT_SIZE.1 as usize,
+            text_rows: PLAN_TEXT_ROWS,
+            cond_rows: 0,
+        })?;
+        tracing::info!(?residency, "flux3 load-time residency");
+        if residency == Residency::Resident {
+            let mut state = model.state.lock().unwrap_or_else(PoisonError::into_inner);
+            model.ensure_encoder(&mut state)?;
+            model.ensure_denoiser(&mut state, None, false)?;
+        }
+        tracing::info!(ms = ms(began), "flux3 model loaded");
+        Ok(model)
+    }
+
+    /// Loads the text encoder if it is not, reading its pages ahead first.
+    fn ensure_encoder(&self, state: &mut State) -> Result<(), ImageGenError> {
+        if state.encoder.is_some() {
+            return Ok(());
+        }
+        let phase = Instant::now();
+        let prefetch = match state.encoder_prefetch.take() {
+            Some(running) => running,
+            None => Prefetch::spawn("encoder", self.encoder_files.spans.clone())?,
+        };
+        let read = prefetch.wait()?;
+        tracing::info!(
+            ms = ms(phase),
+            read_mb = mb(read.bytes),
+            read_mb_per_s = read.mb_per_s(),
+            "flux3 phase te_prefetch"
+        );
+        let phase = Instant::now();
+        let before = device_used(self.ops.backend());
+        let encoder = load_text_encoder(
+            &self.encoder_files.weights,
+            &self.encoder_files.config,
+            &self.ops,
+        )?;
+        if encoder.context_width() != self.params.txt_in {
+            return Err(ImageGenError::Checkpoint(format!(
+                "the text encoder's taps are {} wide but the transformer reads {}",
+                encoder.context_width(),
+                self.params.txt_in
+            )));
+        }
+        let device_bytes = delta(before, device_used(self.ops.backend()));
+        tracing::info!(ms = ms(phase), device_bytes, "flux3 phase te_load");
+        state.encoder = Some(encoder);
+        state.events.push(ResidencyEvent::Loaded {
+            component: Component::Encoder,
+            device_bytes,
+        });
+        Ok(())
+    }
+
+    /// Loads the transformer if it is not. `ahead` is a read-ahead of its
+    /// first spans already running; the rest is read here.
+    ///
+    /// This is the only place the transformer is imported, and with `swap`
+    /// it drops the encoder first - whatever path led here - so a swapping
+    /// host never holds both. An encoder read-ahead left from an earlier
+    /// decode is cancelled: this import may evict its pages.
+    fn ensure_denoiser(
+        &self,
+        state: &mut State,
+        ahead: Option<ReadAhead>,
+        swap: bool,
+    ) -> Result<(), ImageGenError> {
+        state.encoder_prefetch = None;
+        if state.dit.is_some() {
+            return Ok(());
+        }
+        if swap {
+            self.release(state, Component::Encoder);
+        }
+        let phase = Instant::now();
+        let (head, rest) = match ahead {
+            Some((head, rest)) => (Some(head), rest),
+            None => (None, self.dit_spans.clone()),
+        };
+        let tail = Prefetch::spawn("denoiser", rest)?;
+        let mut bytes = 0;
+        if let Some(head) = head {
+            bytes += head.wait()?.bytes;
+        }
+        let read = tail.wait()?;
+        bytes += read.bytes;
+        tracing::info!(
+            ms = ms(phase),
+            read_mb = mb(bytes),
+            tail_mb_per_s = read.mb_per_s(),
+            "flux3 phase dit_prefetch"
+        );
+        let phase = Instant::now();
+        let before = device_used(self.ops.backend());
+        let dit = DiT::load(&StStore::open(&self.dit_path)?, &self.ops, &self.params)?;
+        let device_bytes = delta(before, device_used(self.ops.backend()));
+        tracing::info!(ms = ms(phase), device_bytes, "flux3 phase dit_load");
+        state.dit = Some(dit);
+        state.events.push(ResidencyEvent::Loaded {
+            component: Component::Denoiser,
+            device_bytes,
+        });
+        Ok(())
+    }
+
+    /// Drops `component` if loaded and gives its pooled scratch back.
+    fn release(&self, state: &mut State, component: Component) {
+        let phase = Instant::now();
+        let before = device_used(self.ops.backend());
+        let dropped = match component {
+            Component::Encoder => state.encoder.take().is_some(),
+            Component::Denoiser => state.dit.take().is_some(),
+        };
+        if !dropped {
+            return;
+        }
+        self.ops.trim_pool();
+        let device_bytes = delta(device_used(self.ops.backend()), before);
+        tracing::info!(ms = ms(phase), device_bytes, ?component, "flux3 phase drop");
+        state.events.push(ResidencyEvent::Dropped {
+            component,
+            device_bytes,
+        });
+    }
+
+    /// The prompt's conditioning, from the loaded encoder (loading it, and
+    /// in swap mode dropping the transformer first and the encoder after),
+    /// and the read-ahead of the transformer started during the encode.
+    fn encode_text(
+        &self,
+        state: &mut State,
+        padded: &PaddedPrompt,
+        job: &JobShape,
+        residency: Residency,
+    ) -> Result<(EncodedText, Option<ReadAhead>), ImageGenError> {
+        let swap = matches!(residency, Residency::Swap { .. });
+        if swap {
+            self.release(state, Component::Denoiser);
+        }
+        self.ensure_encoder(state)?;
+        // While the encoder runs, read ahead as much of the transformer as
+        // fits beside the encoder's phase; the rest waits for the drop.
+        let mut ahead = None;
+        if swap && state.dit.is_none() {
+            let peaks = self.sizer.peaks(job);
+            let room = self
+                .sizer
+                .working_set
+                .saturating_sub(self.sizer.reserve)
+                .saturating_sub(
+                    self.sizer.footprint.encoder + self.sizer.footprint.decoder + peaks.encode,
+                );
+            let (head, rest) = split_at(&self.dit_spans, room);
+            if !head.is_empty() {
+                tracing::info!(
+                    overlap_mb = mb(total_bytes(&head)),
+                    "flux3 dit read-ahead during encode"
+                );
+                ahead = Some((Prefetch::spawn("denoiser-overlap", head)?, rest));
+            }
+        }
+        let phase = Instant::now();
+        let encoded = state
+            .encoder
+            .as_ref()
+            .ok_or_else(|| ImageGenError::Backend("the text encoder is not loaded".to_owned()))
+            .and_then(|enc| encode_padded(enc, &self.ops, padded));
+        tracing::info!(
+            ms = ms(phase),
+            rows = padded.ids.len(),
+            ok = encoded.is_ok(),
+            "flux3 phase encode"
+        );
+        // Dropped whether the encode worked or not: a failed job must not
+        // leave the encoder where the next job's transformer goes.
+        if swap {
+            self.release(state, Component::Encoder);
+        }
+        Ok((encoded?, ahead))
+    }
+
+    /// What happens between the last step and the decode: a swapping host
+    /// that cannot keep the transformer beside the decode drops it, and
+    /// reads the next job's encoder pages ahead behind the decode when they
+    /// fit beside the decoder and the decode's working set - otherwise the
+    /// read would evict pages the decode is using. Returns whether that
+    /// read-ahead is left for after the decode.
+    fn after_denoise(
+        &self,
+        state: &mut State,
+        residency: Residency,
+        shape: &JobShape,
+    ) -> Result<bool, ImageGenError> {
+        let Residency::Swap {
+            keep_denoiser: false,
+        } = residency
+        else {
+            return Ok(false);
+        };
+        self.release(state, Component::Denoiser);
+        let decode_peak = self.sizer.peaks(shape).decode;
+        let budget = self.sizer.working_set.saturating_sub(self.sizer.reserve);
+        if self.sizer.footprint.encoder + self.sizer.footprint.decoder + decode_peak <= budget {
+            state.encoder_prefetch = Some(Prefetch::spawn(
+                "encoder",
+                self.encoder_files.spans.clone(),
+            )?);
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// Tokenizes and pads `prompt`.
+    ///
+    /// # Errors
+    /// The refusals of [`tokenize`].
+    pub(crate) fn tokenize_prompt(&self, prompt: &str) -> Result<PaddedPrompt, ImageGenError> {
+        tokenize(&self.tokenizer, &self.chat_template, prompt)
+    }
+
+    /// The residency changes so far, oldest first.
+    #[cfg(test)]
+    pub(crate) fn events(&self) -> Vec<ResidencyEvent> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .events
+            .clone()
+    }
+
+    /// The sizing the residency plan reads, for a test to shrink the
+    /// device's working set.
+    #[cfg(test)]
+    pub(crate) fn sizer_mut(&mut self) -> &mut JobSizer {
+        &mut self.sizer
+    }
 }
 
 /// The reference pictures of a job, encoded.
@@ -124,70 +603,6 @@ pub(crate) struct SampleDesc<'a> {
 }
 
 impl Flux3KleinModel {
-    /// Opens every component `located` names and uploads it to `backend`.
-    ///
-    /// # Errors
-    /// [`ImageGenError::Checkpoint`] for components that disagree or a
-    /// residency this build does not run, and whatever a component's load
-    /// refuses.
-    pub(crate) fn load(
-        located: &Flux3Located,
-        desc: &ImageModelDesc,
-        backend: &Arc<dyn Backend>,
-    ) -> Result<Self, ImageGenError> {
-        if desc.residency == ImageResidency::Swap {
-            return Err(ImageGenError::Checkpoint(
-                "--image-residency swap is not wired for the flux3 family yet".to_owned(),
-            ));
-        }
-        let ops = Ops::new(backend)?;
-        let text = load_text_encoder(
-            &located.text_encoder_files,
-            &located.text_encoder_config,
-            &ops,
-        )?;
-        if text.context_width() != located.params.txt_in {
-            return Err(ImageGenError::Checkpoint(format!(
-                "the text encoder's taps are {} wide but the transformer reads {}",
-                text.context_width(),
-                located.params.txt_in
-            )));
-        }
-        let store = StStore::open(&located.weight_file)?;
-        let dit = DiT::load(&store, &ops, &located.params)?;
-        let vae = Vae::load(&located.vae_path, &ops)?;
-        let tokenizer_file = if located.tokenizer_path.is_dir() {
-            located.tokenizer_path.join("tokenizer.json")
-        } else {
-            located.tokenizer_path.clone()
-        };
-        let tokenizer = PromptTokenizer::open(&tokenizer_file)?;
-        let chat_template = load_chat_template(tokenizer_file.parent())?;
-        Ok(Self {
-            model_id: "flux-3-klein".to_owned(),
-            ops,
-            text,
-            dit,
-            vae,
-            tokenizer,
-            chat_template,
-        })
-    }
-
-    /// Encodes `prompt` to padded text conditioning.
-    ///
-    /// # Errors
-    /// The refusals of [`encode`].
-    pub(crate) fn encode_prompt(&self, prompt: &str) -> Result<EncodedText, ImageGenError> {
-        encode(
-            &self.text,
-            &self.tokenizer,
-            &self.chat_template,
-            &self.ops,
-            prompt,
-        )
-    }
-
     /// Decodes, prepares and VAE-encodes the job's references.
     ///
     /// # Errors
@@ -243,6 +658,7 @@ impl Flux3KleinModel {
     /// The device's failures, and a progress callback's.
     pub(crate) fn sample(
         &self,
+        dit: &DiT,
         desc: &SampleDesc<'_>,
         progress: Option<&dyn Fn(ImageStepEvent)>,
     ) -> Result<Vec<f32>, ImageGenError> {
@@ -286,7 +702,7 @@ impl Flux3KleinModel {
             &times,
             &mut |_, step, state| {
                 step_began.set(Instant::now());
-                self.dit.forward(
+                dit.forward(
                     ops,
                     &DiTInput {
                         image: state,
@@ -436,25 +852,53 @@ impl ImageGenerator for Flux3KleinModel {
     ) -> Result<GeneratedImage, ImageGenError> {
         job.validate(&self.limits())?;
         let began = Instant::now();
-        // Declared first so it drops last, after every working buffer of
-        // this generation is back in the pool.
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // Declared after the state guard so it drops first, with the guard
+        // still held, after every working buffer of this generation is back
+        // in the pool.
         let _trim = TrimPool(&self.ops);
         let references = self.prepare_references(job)?;
-        let encoded = self.encode_prompt(&job.prompt)?;
-        let latents = self.sample(
-            &SampleDesc {
-                text: &encoded.tokens,
-                text_rows: encoded.len,
-                grid: (
-                    job.height as usize / PIXELS_PER_TOKEN,
-                    job.width as usize / PIXELS_PER_TOKEN,
-                ),
-                references: &references.tokens,
-                seed: job.seed,
-                steps: job.steps,
-            },
-            progress,
-        )?;
+        let padded = self.tokenize_prompt(&job.prompt)?;
+        let shape = JobShape {
+            width: job.width as usize,
+            height: job.height as usize,
+            text_rows: padded.ids.len(),
+            cond_rows: references.tokens.rows,
+        };
+        let residency = self.sizer.plan(&shape)?;
+        tracing::info!(
+            width = job.width,
+            height = job.height,
+            steps = job.steps,
+            text_rows = shape.text_rows,
+            cond_rows = shape.cond_rows,
+            ?residency,
+            "flux3 generation started"
+        );
+        let (encoded, ahead) = self.encode_text(&mut state, &padded, &shape, residency)?;
+        let swap = matches!(residency, Residency::Swap { .. });
+        self.ensure_denoiser(&mut state, ahead, swap)?;
+        let latents = {
+            let dit = state.dit.as_ref().ok_or_else(|| {
+                ImageGenError::Backend("the transformer is not loaded".to_owned())
+            })?;
+            self.sample(
+                dit,
+                &SampleDesc {
+                    text: &encoded.tokens,
+                    text_rows: encoded.len,
+                    grid: (
+                        shape.height / PIXELS_PER_TOKEN,
+                        shape.width / PIXELS_PER_TOKEN,
+                    ),
+                    references: &references.tokens,
+                    seed: job.seed,
+                    steps: job.steps,
+                },
+                progress,
+            )?
+        };
+        let read_after_decode = self.after_denoise(&mut state, residency, &shape)?;
         // A single reference's output returns at the fitted size when the
         // job asked for the canvas it was padded to.
         let crop = references
@@ -468,6 +912,19 @@ impl ImageGenerator for Flux3KleinModel {
             job.output_format,
             job.output_compression,
         )?;
+        // The read-ahead that could not run beside the decode runs after it,
+        // once the decode's working buffers are released.
+        if read_after_decode
+            && state.encoder.is_none()
+            && self.sizer.footprint.encoder + self.sizer.footprint.decoder
+                <= self.sizer.working_set.saturating_sub(self.sizer.reserve)
+        {
+            self.ops.trim_pool();
+            state.encoder_prefetch = Some(Prefetch::spawn(
+                "encoder",
+                self.encoder_files.spans.clone(),
+            )?);
+        }
         tracing::info!(
             seconds = phase.elapsed().as_secs_f64(),
             total_seconds = began.elapsed().as_secs_f64(),
@@ -481,8 +938,8 @@ impl ImageGenerator for Flux3KleinModel {
             height,
             prompt_tokens: u32::try_from(encoded.real).unwrap_or(u32::MAX),
             completion_tokens: u32::try_from(
-                (job.height as usize / PIXELS_PER_TOKEN)
-                    * (job.width as usize / PIXELS_PER_TOKEN)
+                (shape.height / PIXELS_PER_TOKEN)
+                    * (shape.width / PIXELS_PER_TOKEN)
                     * job.steps as usize,
             )
             .unwrap_or(u32::MAX),
