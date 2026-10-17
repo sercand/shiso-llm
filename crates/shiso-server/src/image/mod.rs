@@ -25,10 +25,16 @@ use std::sync::Arc;
 
 use shiso_vision::generator::{
     GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits, ImageStepEvent,
+    InputReferenceImage,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::AppError;
+
+/// The body ceiling of the image edit routes when `--image-max-upload-mb` is
+/// not given: 64 MiB, room for the ten references the model takes at a few
+/// MiB each, which the 32 MiB JSON ceiling would not leave.
+pub const DEFAULT_MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// What an image request that names no geometry or step count gets.
 ///
@@ -186,6 +192,10 @@ pub struct ImageService {
     model_id: String,
     limits: ImageLimits,
     defaults: ImageDefaults,
+    /// The generator, kept for the questions that need no queue slot: how
+    /// many references it takes and what size they imply.
+    generator: Arc<dyn ImageGenerator>,
+    max_upload_bytes: usize,
 }
 
 impl ImageService {
@@ -210,6 +220,8 @@ impl ImageService {
             model_id: desc.model_id.clone(),
             limits,
             defaults: ImageDefaults::of(&limits),
+            generator: Arc::clone(&desc.generator),
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
         };
         std::thread::Builder::new()
             .name("shiso-image".to_owned())
@@ -226,6 +238,44 @@ impl ImageService {
     pub fn with_overrides(mut self, overrides: ImageOverrides) -> Result<Self, OverrideError> {
         self.defaults = overrides.resolve(&self.limits)?;
         Ok(self)
+    }
+
+    /// The same service with the edit routes' body ceiling set.
+    #[must_use]
+    pub const fn with_max_upload_bytes(mut self, bytes: usize) -> Self {
+        self.max_upload_bytes = bytes;
+        self
+    }
+
+    /// The edit routes' body ceiling, in bytes.
+    #[must_use]
+    pub const fn max_upload_bytes(&self) -> usize {
+        self.max_upload_bytes
+    }
+
+    /// The most reference images one job may carry; zero when the loaded
+    /// model generates from text alone.
+    #[must_use]
+    pub fn max_references(&self) -> usize {
+        self.generator.max_references()
+    }
+
+    /// The size an edit takes when its caller names none.
+    ///
+    /// Decodes the first reference, so it is a few milliseconds of CPU on the
+    /// calling thread and no device work.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::BadRequest`] for references the model cannot read or a
+    /// model that takes none.
+    pub fn default_size_for_references(
+        &self,
+        references: &[InputReferenceImage],
+    ) -> Result<(u32, u32), AppError> {
+        self.generator
+            .default_size_for_references(references)
+            .map_err(refuse)
     }
 
     /// What the loaded model accepts.

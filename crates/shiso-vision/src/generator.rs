@@ -280,6 +280,35 @@ pub trait ImageGenerator: Send + Sync + fmt::Debug {
     /// What this model accepts and defaults to.
     fn limits(&self) -> ImageLimits;
 
+    /// The most reference images one job may carry; zero for a model that
+    /// generates from text alone, which is the default.
+    ///
+    /// A caller that holds references checks this before queueing, so a
+    /// request that can never run is refused without costing a queue slot.
+    fn max_references(&self) -> usize {
+        0
+    }
+
+    /// The size an edit takes when its caller names none, given the
+    /// references it carries.
+    ///
+    /// The default refuses: a model that does not take references has no
+    /// size to derive from them. A generator is handed a final size, so the
+    /// caller that fills in an omitted one asks here first.
+    ///
+    /// # Errors
+    /// [`ImageGenError::ReferenceImage`] for a model without editing, and for
+    /// references the model cannot read.
+    fn default_size_for_references(
+        &self,
+        references: &[InputReferenceImage],
+    ) -> Result<(u32, u32), ImageGenError> {
+        let _ = references;
+        Err(ImageGenError::ReferenceImage(
+            "this model does not take reference images".to_owned(),
+        ))
+    }
+
     /// Generates an image, optionally emitting step progress.
     ///
     /// The per-step partial decode is a full extra decode per step, so a

@@ -58,14 +58,14 @@ use shiso_core::Backend;
 use shiso_core::ids::Seed;
 use shiso_vision::generator::{
     GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits,
-    ImageOutputFormat, ImageStepEvent,
+    ImageOutputFormat, ImageStepEvent, InputReferenceImage,
 };
 
 use super::config::{Flux3Located, Flux3Params};
 use super::pack::{Pack, image_ids, reference_ids, text_ids};
 use super::reference::{
-    check_reference_count, check_reference_size, decode_reference, prepare_multi_reference,
-    prepare_single_reference,
+    MAX_REFERENCES, check_reference_count, check_reference_size, decode_reference,
+    prepare_multi_reference, prepare_single_reference,
 };
 use super::sampler::{initial_noise, round_bf16, run_euler};
 use super::scheduler::{ALPHA, DEFAULT_STEPS, schedule};
@@ -843,6 +843,17 @@ impl ImageGenerator for Flux3KleinModel {
             default_steps: DEFAULT_STEPS,
             fixed_steps: None,
         }
+    }
+
+    fn max_references(&self) -> usize {
+        MAX_REFERENCES
+    }
+
+    fn default_size_for_references(
+        &self,
+        references: &[InputReferenceImage],
+    ) -> Result<(u32, u32), ImageGenError> {
+        super::default_size_for_references(references)
     }
 
     fn generate(

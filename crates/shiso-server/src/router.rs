@@ -64,6 +64,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         DEFAULT_MAX_BODY_BYTES,
         crate::audio::AudioService::max_upload_bytes,
     );
+    let image_upload_limit = state.image.as_ref().map_or(
+        crate::image::DEFAULT_MAX_UPLOAD_BYTES,
+        crate::image::ImageService::max_upload_bytes,
+    );
     let routes = Router::new()
         .route("/health", get(misc_handlers::health))
         .route("/metrics", get(misc_handlers::metrics))
@@ -121,6 +125,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/v1/images/generations",
             post(crate::openai::images::generate_images),
+        )
+        // Edits carry reference pictures, so they take the image upload
+        // limit; the route's layer is the inner one and wins.
+        .route(
+            "/images/edits",
+            post(crate::openai::image_edits::edit_images)
+                .layer(DefaultBodyLimit::max(image_upload_limit)),
+        )
+        .route(
+            "/v1/images/edits",
+            post(crate::openai::image_edits::edit_images)
+                .layer(DefaultBodyLimit::max(image_upload_limit)),
         )
         // `/embeddings` is the OpenRouter spelling, `/v1/embeddings` the
         // OpenAI one; one handler answers both.

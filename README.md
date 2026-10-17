@@ -244,6 +244,7 @@ environment variable. The ones you are most likely to want:
 | `--image-text-encoder` | Text encoder weights path when it is split from `--image-model`; overrides where the locator would look |
 | `--image-vae` | VAE weights path when it is split from `--image-model`; overrides where the locator would look |
 | `--image-tokenizer` | Tokenizer path when it is split from `--image-model`; overrides where the locator would look |
+| `--image-max-upload-mb` | Largest image edit request body in MiB (default 64); only the edit routes take it |
 | `--image-max-queue` | Image requests that may wait in the queue beyond the one generating (default 16); the next is refused with a 503 a retry can fix |
 | `--image-default-steps` | Denoising steps a request that names none gets (default: the loaded model's own: 4 for FLUX.2-klein, 16 for FLUX.3 Klein; for Qwen-Image-2.1 the length of `model_index.json`'s `sample_sigmas`, fixed, when it ships them (8 for Turbo), else 40) |
 | `--image-default-size` | The image size a request that names none gets, as `WxH` (default: the loaded model's own: 1024x1024 on a 16-pixel grid for FLUX.2-klein and FLUX.3 Klein (FLUX.3 Klein sides run 64 to 4096), 512x512 on a 32-pixel grid for Qwen-Image-2.1, where sizes must be exact multiples of 32); a size off the model's grid is refused at boot |
@@ -267,8 +268,11 @@ It runs 16 flow-map Euler steps without guidance at 1024x1024 by default (sides
 too small for both) drops the text encoder before the transformer is imported.
 The generator itself accepts up to 10 reference pictures for editing: a single
 reference is fitted under 4 MiB pixels and reflect-padded to a canvas on the grid,
-several are each fitted under 1 MP; the HTTP routes carry text only, so edits are
-reachable from the library, not from `/v1/images/generations`. The model's
+several are each fitted under 1 MP. Over HTTP an edit is `POST /v1/images/edits`
+(multipart `image` / `image[]`, up to 10, or JSON `images: [{"image_url":
+"data:..."}]`); a request that names no `size` gets the size its references
+imply (one reference: its own aspect ratio), and `n` must be 1. FLUX.2-klein and
+Qwen-Image-2.1 answer an edit with a 400 naming the model. The model's
 authors ship a prompt upsampler with it and recommend not running it without
 one; this build has none, so prompts reach the model as typed. FLUX.3 Klein on
 CUDA is **written but unvalidated**: the `diffusion` kernel module has a CUDA
@@ -289,6 +293,7 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/audio/transcriptions` | OpenAI Audio Transcriptions (also at `/audio/transcriptions`) |
 | `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein, the distilled FLUX.3 Klein and Qwen-Image-2.1 (Turbo, base, and fine-tunes in the same format; the schedule is the assets' `model_index.json` `sample_sigmas`, shifted by `scheduler/scheduler_config.json`); `b64_json` only) |
+| `POST /v1/images/edits` | OpenAI Image edits (also at `/images/edits`; FLUX.3 Klein only; multipart `image`/`image[]` (up to 10) or JSON `images` with `data:` URLs, plus `prompt`, `size`, `seed`, `steps`, `output_format`, `output_compression`; `n` must be 1, no `mask`; `b64_json` only; body limit `--image-max-upload-mb`) |
 | `POST /v1/embeddings` | OpenAI and OpenRouter Embeddings (also at `/embeddings`; text, token-id and multimodal `content` inputs, `dimensions`, `encoding_format` `float` or `base64`, `input_type`) |
 | `GET /v1/models` | OpenAI Models |
 | `GET /health`, `GET /metrics`, `GET /cache` | health, metrics, cache report |

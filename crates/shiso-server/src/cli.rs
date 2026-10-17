@@ -477,6 +477,10 @@ pub struct ServeArgs {
     /// routes take it; every other route keeps the JSON body limit.
     #[arg(long, env = "SHISO_AUDIO_MAX_UPLOAD_MB", default_value = "512")]
     pub audio_max_upload_mb: NonZeroU32,
+    /// The largest image edit request body, in MiB. Only the image edit
+    /// routes take it; every other route keeps the JSON body limit.
+    #[arg(long, env = "SHISO_IMAGE_MAX_UPLOAD_MB", default_value = "64")]
+    pub image_max_upload_mb: NonZeroU32,
     /// Speech recognizer checkpoint: an export directory or a GGUF file.
     /// Serves `/v1/audio/transcriptions`.
     #[arg(long, env = "SHISO_ASR_MODEL")]
@@ -1298,6 +1302,14 @@ impl ServeArgs {
             policy = policy.with_timeout_secs(seconds);
         }
         Some(policy)
+    }
+
+    /// The image edit routes' body limit, in bytes.
+    #[must_use]
+    pub fn image_max_upload_bytes(&self) -> usize {
+        usize::try_from(self.image_max_upload_mb.get())
+            .unwrap_or(usize::MAX)
+            .saturating_mul(1024 * 1024)
     }
 
     /// The transcription routes' body limit, in bytes.
