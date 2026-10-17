@@ -721,7 +721,8 @@ kernel void kernel_dit_sdpa_f32(
 
 /// Causal grouped-query attention over packed rows (the text encoder's
 /// prefill): query head `h` reads kv head `h / (q_heads / kv_heads)` and
-/// attends to keys `0..=t`.
+/// attends to keys `0..=t`, of which only those below `valid_keys` count (a
+/// padded prompt's pad rows attend every real key and no pad key).
 kernel void kernel_dit_gqa_f32(
         constant dit_args_gqa & args [[buffer(0)]],
         device float *out               [[buffer(1)]],
@@ -743,8 +744,10 @@ kernel void kernel_dit_gqa_f32(
     const uint qrow = (t * args.q_heads + h) * hd;
     const float scale = 1.0f / sqrt(float(hd));
 
+    // Keys `0..seen`: causal, and never at or past the valid limit.
+    const uint seen = min(t + 1u, args.valid_keys);
     float max_score = -INFINITY;
-    for (uint s = 0u; s <= t; s++) {
+    for (uint s = 0u; s < seen; s++) {
         const uint krow = (s * args.kv_heads + kvh) * hd;
         const float score = dit_head_dot(q, qrow, k, krow, hd, tid, scratch) * scale;
         max_score = max(max_score, score);
@@ -755,7 +758,7 @@ kernel void kernel_dit_gqa_f32(
         acc[slot] = 0.0f;
     }
     float sum = 0.0f;
-    for (uint s = 0u; s <= t; s++) {
+    for (uint s = 0u; s < seen; s++) {
         const uint krow = (s * args.kv_heads + kvh) * hd;
         const float score = dit_head_dot(q, qrow, k, krow, hd, tid, scratch) * scale;
         const float p = exp(score - max_score);
@@ -836,8 +839,8 @@ kernel void kernel_dit_rope_4d(
 }
 
 /// Rotate-half 1-axis RoPE on one packed (tokens, heads, head_dim) tensor,
-/// with the token index as the position: pair `(i, i + head_dim/2)` turns
-/// by `token * freqs[i]`.
+/// with the token index as the position (rows from `pinned_from` on use
+/// `pinned_pos`): pair `(i, i + head_dim/2)` turns by `position * freqs[i]`.
 kernel void kernel_dit_rope_half(
         constant dit_args_rope_half & args [[buffer(0)]],
         device float *tensor                  [[buffer(1)]],
@@ -852,9 +855,10 @@ kernel void kernel_dit_rope_half(
     }
     // `half` is a reserved type name in MSL, so the split point is `fold`.
     const uint fold = args.head_dim / 2u;
+    const uint position = t >= args.pinned_from ? args.pinned_pos : t;
     device float *row = tensor + (uint64_t)(t * args.heads + h) * args.head_dim;
     for (uint i = tid; i < fold; i += DIT_BLOCK) {
-        const float angle = float(t) * freqs[i];
+        const float angle = float(position) * freqs[i];
         const float c = cos(angle);
         const float s = sin(angle);
         const float x0 = row[i];

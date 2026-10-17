@@ -243,6 +243,8 @@ struct RopeHalfArgs {
     tokens: u32,
     heads: u32,
     head_dim: u32,
+    pinned_from: u32,
+    pinned_pos: u32,
 }
 
 #[repr(C)]
@@ -271,6 +273,7 @@ struct GqaArgs {
     q_heads: u32,
     kv_heads: u32,
     head_dim: u32,
+    valid_keys: u32,
 }
 
 #[repr(C)]
@@ -343,9 +346,9 @@ const _: () = assert!(size_of::<QkNormRopeArgs>() == 24);
 const _: () = assert!(size_of::<ConcatArgs>() == 12);
 const _: () = assert!(size_of::<GroupNormArgs>() == 24);
 const _: () = assert!(size_of::<Rope4dArgs>() == 28);
-const _: () = assert!(size_of::<RopeHalfArgs>() == 12);
+const _: () = assert!(size_of::<RopeHalfArgs>() == 20);
 const _: () = assert!(size_of::<SdpaArgs>() == 44);
-const _: () = assert!(size_of::<GqaArgs>() == 16);
+const _: () = assert!(size_of::<GqaArgs>() == 20);
 const _: () = assert!(size_of::<Conv2dArgs>() == 48);
 const _: () = assert!(size_of::<AxpyArgs>() == 8);
 const _: () = assert!(size_of::<GemmFusedArgs>() == 28);
@@ -614,6 +617,25 @@ pub(crate) struct GqaCall<'a> {
     pub q_heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
+    /// Keys at or beyond this index are masked for every row; `tokens`
+    /// masks nothing (the plain causal answer). A padded prompt passes its
+    /// real length so the pad rows attend the real keys and no pad key.
+    pub valid_keys: usize,
+}
+
+/// One rotate-half rotation of a (tokens, heads, `head_dim`) tensor.
+pub(crate) struct RopeHalfCall<'a> {
+    pub step: &'static str,
+    pub tensor: DeviceView<'a>,
+    pub freqs: DeviceView<'a>,
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    /// Rows from this one on turn by `pinned_pos` instead of their own
+    /// index; `tokens` pins nothing.
+    pub pinned_from: usize,
+    /// The position the pinned rows turn by.
+    pub pinned_pos: u32,
 }
 
 /// One 2D convolution of the VAE decoder.
@@ -1979,11 +2001,18 @@ impl Ops {
 
     /// Causal grouped-query attention (text encoder prefill).
     pub(crate) fn gqa(&self, call: &GqaCall<'_>) -> Result<(), ImageGenError> {
+        if call.valid_keys == 0 || call.valid_keys > call.tokens {
+            return Err(ImageGenError::Backend(format!(
+                "{}: valid_keys {} is outside 1..={} (a row with no key to attend has no answer)",
+                call.step, call.valid_keys, call.tokens
+            )));
+        }
         let args = GqaArgs {
             tokens: call.tokens as u32,
             q_heads: call.q_heads as u32,
             kv_heads: call.kv_heads as u32,
             head_dim: call.head_dim as u32,
+            valid_keys: call.valid_keys as u32,
         };
         self.launch(
             call.step,
@@ -2046,31 +2075,26 @@ impl Ops {
         Ok(())
     }
 
-    /// rotate-half 1-axis `RoPE` on one (tokens, heads, `head_dim`) tensor, with
-    /// the token index as the position.
-    pub(crate) fn rope_half(
-        &self,
-        step: &'static str,
-        tensor: DeviceView<'_>,
-        freqs: DeviceView<'_>,
-        tokens: usize,
-        heads: usize,
-        head_dim: usize,
-    ) -> Result<(), ImageGenError> {
+    /// Rotate-half 1-axis `RoPE` on one (tokens, heads, `head_dim`) tensor,
+    /// with the token index as the position, except that the rows from
+    /// `pinned_from` on turn by one fixed position (a padded prompt's pad rows).
+    pub(crate) fn rope_half(&self, call: &RopeHalfCall<'_>) -> Result<(), ImageGenError> {
         let args = RopeHalfArgs {
-            tokens: tokens as u32,
-            heads: heads as u32,
-            head_dim: head_dim as u32,
+            tokens: call.tokens as u32,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+            pinned_from: call.pinned_from.min(call.tokens) as u32,
+            pinned_pos: call.pinned_pos,
         };
         self.launch(
-            step,
+            call.step,
             "kernel_dit_rope_half",
-            Extent3::new(tokens as u32, heads as u32, 1),
+            Extent3::new(call.tokens as u32, call.heads as u32, 1),
             Extent3::linear(BLOCK),
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                KernelArg::Buffer(tensor),
-                KernelArg::Buffer(freqs),
+                KernelArg::Buffer(call.tensor),
+                KernelArg::Buffer(call.freqs),
             ],
         )
     }

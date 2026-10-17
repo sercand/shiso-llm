@@ -215,6 +215,7 @@ struct GqaArgs {
     q_heads: u32,
     kv_heads: u32,
     head_dim: u32,
+    valid_keys: u32,
 }
 
 #[repr(C)]
@@ -235,6 +236,8 @@ struct RopeHalfArgs {
     tokens: u32,
     heads: u32,
     head_dim: u32,
+    pinned_from: u32,
+    pinned_pos: u32,
 }
 
 #[repr(C)]
@@ -1596,6 +1599,7 @@ fn gqa_is_causal_grouped_attention() {
         q_heads: q_heads as u32,
         kv_heads: kv_heads as u32,
         head_dim: hd as u32,
+        valid_keys: tokens as u32,
     };
     launch(
         &b,
@@ -1825,6 +1829,8 @@ fn rope_half_rotates_pairs_across_the_halves() {
         tokens: tokens as u32,
         heads: heads as u32,
         head_dim: hd as u32,
+        pinned_from: tokens as u32,
+        pinned_pos: 0,
     };
     launch(
         &b,
@@ -3308,6 +3314,8 @@ prefix_cases!(
     flash_sdpa_causal_masks_every_later_key,
     qk_norm_rope_normalizes_then_turns_adjacent_pairs,
     tanh_and_gelu_tanh_match_their_formulas,
+    gqa_valid_keys_masks_pad_keys,
+    rope_half_pins_trailing_rows_to_one_position,
 );
 
 #[test]
