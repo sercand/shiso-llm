@@ -549,6 +549,9 @@ pub struct Device {
     /// weights' products at; see [`PrefillActivations`]. An operator's
     /// choice, checked against the kernel set at startup.
     pub prefill_activations: PrefillActivations,
+    /// Which one-launch routed selection a decode-sized pass takes. A probed
+    /// device fact, for the reason `prompt_matmul` is.
+    pub route_sort: RouteSort,
 }
 
 impl Device {
@@ -608,6 +611,19 @@ pub enum PrefillActivations {
     /// family-specific architecture (`sm_121a`); refused at startup without
     /// one.
     Lowp,
+}
+
+/// The one-launch routed selection a decode-sized pass takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RouteSort {
+    /// `q4e_moe_route_sort_small_kernel` at every width it takes: every
+    /// kernel set has it.
+    #[default]
+    Small,
+    /// `q4e_moe_route_sort_tiny_kernel` for a pass of at most
+    /// [`crate::sparse::moe::ROUTE_TINY_MAX_TOKENS`] rows, the small one past
+    /// that: the same results at a shorter serial chain.
+    Tiny,
 }
 
 /// The kernel a prompt pass's brain-float projections take.
@@ -1296,6 +1312,130 @@ pub fn project(
     project_one(out, weight, bound, rows, device)
 }
 
+/// Matrices one MXFP8 group launch takes (`Q4E_MXG_PARAMS`).
+pub const MXFP8_GROUP_SLOTS: usize = 4;
+
+/// Output rows in all at or below which an MXFP8 group takes its one-row-a-
+/// warp entries. The shared expert's pair (1280 rows) measured 22.5 us on two
+/// rows a warp and 18.7 us on the pipelined one row a warp; the recurrent and
+/// attention groups (over 13,000 rows) are fastest on two.
+pub const MXFP8_GROUP_NARROW: u32 = 4_096;
+
+/// Whether projections of one input with these weights take MXFP8 group
+/// launches at `rows`: every weight MXFP8 over one contraction width, on a
+/// step or verify pass.
+///
+/// A prompt pass keeps the tensor-core kernel per matrix, whose tiles gain
+/// nothing from sharing a launch. A planner that reorders projections to put
+/// them side by side asks this first, so that a weight in any other format
+/// keeps its place in the chain.
+#[must_use]
+pub fn groups(weights: &[WeightDesc], device: Device) -> bool {
+    weights.len() > 1
+        && !device.row_invariant()
+        && weights.iter().all(|w| {
+            w.dtype == DType::Mxfp8E4M3G32
+                && w.in_dim == weights[0].in_dim
+                && crate::sparse::weights::mxfp8_bytes(w.in_dim, w.out_dim).is_some()
+        })
+}
+
+/// The MXFP8 group entry for `rows` activation rows over matrices of `total`
+/// output rows in all, and the output rows one of its blocks covers.
+///
+/// The blockings sum a row identically, so the choice is made for bandwidth
+/// alone and by the shape alone, like the single-matrix kernels'.
+#[must_use]
+pub const fn mxfp8_group_entry(rows: u32, total: u32) -> (&'static str, u32) {
+    // A verify block stages the pass's activations once for its rows, so one
+    // row a warp re-stages them four times as often: past the single-matrix
+    // kernels' narrow width that costs more than the extra warps gain.
+    match rows {
+        1 if total > MXFP8_GROUP_NARROW => {
+            ("q4e_mxfp8_gemv_group_kernel", MXFP8_GEMV_ROWS_PER_BLOCK)
+        }
+        1 => ("q4e_mxfp8_gemv_group_narrow_kernel", MXFP8_ROWS_PER_BLOCK),
+        _ if total > NARROW_OUTPUT => ("q4e_mxfp8_rows_group_kernel", MXFP8_VERIFY_ROWS_PER_BLOCK),
+        _ => ("q4e_mxfp8_rows_group_narrow_kernel", MXFP8_ROWS_PER_BLOCK),
+    }
+}
+
+/// Plans projections that all read one input, in order.
+///
+/// Where [`groups`] allows it, up to [`MXFP8_GROUP_SLOTS`] matrices share one
+/// launch that reads the activation once and writes each matrix's own
+/// destination, in passes of [`MXFP8_STEP_ROWS`] rows; a row of every matrix
+/// is summed exactly as its own launch would sum it, so the group moves no
+/// bit. Anything else is the projections one by one, as [`project`] plans
+/// them.
+///
+/// # Errors
+///
+/// Whatever [`project`] reports for a weight this build cannot project, and
+/// [`CoreError::ShapeMismatch`] for members that do not share their input.
+pub fn project_group(
+    out: &mut Plan,
+    members: &[(WeightDesc, Bound)],
+    rows: u32,
+    device: Device,
+) -> CoreResult<()> {
+    let weights: Vec<WeightDesc> = members.iter().map(|(w, _)| *w).collect();
+    if rows == 0 || !groups(&weights, device) {
+        for &(weight, bound) in members {
+            project(out, weight, bound, rows, device)?;
+        }
+        return Ok(());
+    }
+    if members.iter().any(|(_, b)| b.src != members[0].1.src) {
+        return Err(CoreError::ShapeMismatch {
+            field: "group projection input",
+            expected: 1,
+            got: 2,
+        });
+    }
+    let in_dim = weights[0].in_dim;
+    for slots in members.chunks(MXFP8_GROUP_SLOTS) {
+        let mut done = 0;
+        while done < rows {
+            let take = (rows - done).min(MXFP8_STEP_ROWS);
+            let src_bytes = u64::from(done) * u64::from(in_dim) * 4;
+            let total: u32 = slots.iter().map(|(w, _)| w.out_dim).sum();
+            let (entry, per_block) = mxfp8_group_entry(take, total);
+            let blocks: u32 = slots
+                .iter()
+                .map(|(w, _)| w.out_dim.div_ceil(per_block))
+                .sum();
+            let mut ops = Vec::with_capacity(4 * MXFP8_GROUP_SLOTS + 3);
+            for slot in 0..MXFP8_GROUP_SLOTS {
+                if let Some(&(weight, bound)) = slots.get(slot) {
+                    let dst_bytes = u64::from(done) * u64::from(weight.out_dim) * 4;
+                    let b = bound.advanced(src_bytes, dst_bytes);
+                    ops.extend([
+                        b.dst,
+                        Operand::Weight(b.weight),
+                        Operand::Weight(part(b.weight, WeightPart::GroupScales)),
+                        Operand::U32(weight.out_dim),
+                    ]);
+                } else {
+                    ops.extend([Operand::Null, Operand::Null, Operand::Null, Operand::U32(0)]);
+                }
+            }
+            ops.extend([
+                members[0].1.src.advanced(src_bytes),
+                Operand::U32(in_dim),
+                Operand::U32(take),
+            ]);
+            out.launch(
+                Entry::plain(MOD_MXFP8, entry),
+                Launch::linear(blocks, MXFP8_THREADS),
+                Args::of(&ops),
+            );
+            done += take;
+        }
+    }
+    Ok(())
+}
+
 /// Plans one half-precision projection on the BLAS tier whose input may
 /// already be half precision and whose output may be.
 ///
@@ -1882,6 +2022,11 @@ pub fn project_pair(
     rows: u32,
     device: Device,
 ) -> CoreResult<()> {
+    // An MXFP8 pair is one group launch on a step or verify pass: the same
+    // sums as the two launches, at one reading of the input.
+    if groups(&[gate, up], device) {
+        return project_group(out, &[(gate, gate_bound), (up, up_bound)], rows, device);
+    }
     // Narrow enough for the decode-shaped launch, the pair is two of those, at
     // every row count that launch covers, so that a row is summed one way
     // below the bound whatever else shares its pass. Serially the two cost a
@@ -1973,6 +2118,7 @@ mod tests {
         role: PassRole::Step,
         prompt_matmul: PromptMatmul::Rows,
         prefill_activations: PrefillActivations::A16,
+        route_sort: RouteSort::Tiny,
     };
 
     #[test]

@@ -309,6 +309,11 @@ pub fn router_logits(
 /// Tokens up to which the routed selection, the sort and its inverse run as
 /// one launch (`Q4E_ROUTE_SORT_TOKENS`).
 pub const ROUTE_SORT_MAX_TOKENS: u32 = 32;
+/// Tokens up to which [`route_sort`] takes the tiny entry
+/// (`Q4E_ROUTE_TINY_TOKENS`).
+pub const ROUTE_TINY_MAX_TOKENS: u32 = 8;
+/// Threads the tiny entry runs (`Q4E_ROUTE_TINY_THREADS`).
+const ROUTE_TINY_THREADS: u32 = 256;
 /// Experts the one-launch selection holds in registers
 /// (`Q4E_ROUTE_SORT_EXPERTS`).
 const ROUTE_SORT_MAX_EXPERTS: u32 = 512;
@@ -329,11 +334,23 @@ pub const fn route_sorts(shape: &SparseShape, n_tok: u32) -> bool {
 /// At a decode step those were seven launches of a block or less each, 17 us a
 /// layer of dependent latency in front of the routed projections.
 #[must_use]
-pub fn route_sort(shape: &SparseShape, n_tok: u32) -> Plan {
+pub fn route_sort(shape: &SparseShape, n_tok: u32, device: Device) -> Plan {
+    // The tiny entry is the small one's results at a shorter serial chain
+    // (GB10: 12.7 -> 7.8 us at one token), for the widths it takes, on a
+    // kernel set that has it.
+    let (entry, threads) =
+        if device.route_sort == matmul::RouteSort::Tiny && n_tok <= ROUTE_TINY_MAX_TOKENS {
+            ("q4e_moe_route_sort_tiny_kernel", ROUTE_TINY_THREADS)
+        } else {
+            (
+                "q4e_moe_route_sort_small_kernel",
+                32 * ROUTE_SORT_MAX_TOKENS,
+            )
+        };
     let mut plan = Plan::new();
     plan.launch(
-        Entry::plain(MOD_MOE, "q4e_moe_route_sort_small_kernel"),
-        kernels::Launch::linear(1, 32 * ROUTE_SORT_MAX_TOKENS),
+        Entry::plain(MOD_MOE, entry),
+        kernels::Launch::linear(1, threads),
         // `ids, weights, logits, bounds, active, sorted, pos, n_tok,
         //  n_expert, n_used`
         Args::of(&[
@@ -1431,8 +1448,17 @@ pub fn affine_experts(
                 "q4e_nvfp4_experts_gemm_down_kernel",
             )
         } else {
+            // A step applies the activation as gate and up are stored: the
+            // activation launch's bits, without the two intermediate rows. A
+            // wider pass holds each row in registers across an expert's
+            // columns; the two entries sum a row identically, so the choice
+            // by row count moves no bit.
             (
-                "q4e_nvfp4_experts_gate_up_kernel",
+                if n_tok == 1 {
+                    "q4e_nvfp4_experts_gate_up_act_kernel"
+                } else {
+                    "q4e_nvfp4_experts_gate_up_act_held_kernel"
+                },
                 "q4e_nvfp4_experts_down_kernel",
             )
         };
@@ -1466,10 +1492,15 @@ pub fn affine_experts(
             )
         };
         // `out_gate, out_up, gate_w, gate_s, gate_g, up_w, up_s, up_g, x,
-        //  sorted, bounds, active, map, in_dim, out_dim, n_expert, n_used`
-        let mut ops = vec![
-            Operand::Scratch(Buf::MoeGate),
-            Operand::Scratch(Buf::MoeUp),
+        //  sorted, bounds, active, map, in_dim, out_dim, n_expert, n_used`,
+        // and on a step the one output `out_mid` in place of the first two.
+        let outputs: &[Operand] = if gemm {
+            &[Operand::Scratch(Buf::MoeGate), Operand::Scratch(Buf::MoeUp)]
+        } else {
+            &[Operand::Scratch(Buf::MoeMid)]
+        };
+        let mut ops = outputs.to_vec();
+        ops.extend([
             at(Role::ExpertGate, WeightPart::Whole),
             at(Role::ExpertGate, WeightPart::GroupScales),
             at(Role::ExpertGate, WeightPart::GlobalScale),
@@ -1477,20 +1508,22 @@ pub fn affine_experts(
             at(Role::ExpertUp, WeightPart::GroupScales),
             at(Role::ExpertUp, WeightPart::GlobalScale),
             Operand::Scratch(Buf::Mixed),
-        ];
+        ]);
         ops.extend(tail(hidden, inter));
         plan.launch(
             Entry::plain(MOD_MODELOPT, gate_up),
             gate_up_launch,
             Args::of(&ops),
         );
-        plan.append(activate(
-            shape,
-            Operand::Scratch(Buf::MoeGate),
-            Operand::Scratch(Buf::MoeUp),
-            Operand::Scratch(Buf::MoeMid),
-            n_tok,
-        ));
+        if gemm {
+            plan.append(activate(
+                shape,
+                Operand::Scratch(Buf::MoeGate),
+                Operand::Scratch(Buf::MoeUp),
+                Operand::Scratch(Buf::MoeMid),
+                n_tok,
+            ));
+        }
         // `out, down_w, down_s, down_g, mid, sorted, bounds, active, map,
         //  in_dim, out_dim, n_expert, n_used`
         let mut ops = vec![
@@ -1917,6 +1950,14 @@ pub fn shared(
     device: Device,
 ) -> CoreResult<Plan> {
     let mut plan = shared_projections(shape, desc, layer, n_tok, device)?;
+    plan.append(shared_add(shape, n_tok));
+    Ok(plan)
+}
+
+/// The shared expert's gated output added onto [`Buf::BlockOut`].
+#[must_use]
+pub fn shared_add(shape: &SparseShape, n_tok: u32) -> Plan {
+    let mut plan = Plan::new();
     plan.launch(
         Entry::plain(MOD_MOE, "q4e_shared_add_kernel"),
         kernels::moe_combine(shape.hidden, n_tok),
@@ -1928,7 +1969,45 @@ pub fn shared(
             Operand::U32(shape.hidden),
         ]),
     );
-    Ok(plan)
+    plan
+}
+
+/// `main` followed by the shared expert.
+///
+/// On a step or verify pass whose shared expert is MXFP8 group launches, the
+/// shared expert runs as a branch beside `main` (the router, the selection
+/// and the routed stages), as the trellis path runs its own: it reads only
+/// the block input and writes only its own buffers, and on its own it is a
+/// chain of latency-bound launches (the router's selection alone is one
+/// block). Only when neither side carves per-stream scratch, which the two
+/// would share. Its gate logit and the add stay after the join, in the order
+/// the serial plan has them, so no value moves.
+fn with_shared(
+    shape: &SparseShape,
+    desc: &ExpertDesc,
+    layer: LayerRef,
+    n_tok: u32,
+    device: Device,
+    mut main: Plan,
+) -> CoreResult<Plan> {
+    if matmul::groups(&[desc.shared_gate, desc.shared_up], device)
+        && desc.shared_down.dtype == DType::Mxfp8E4M3G32
+    {
+        let branch = shared_expert(shape, desc, layer, n_tok, device)?;
+        if branch.staging().bytes == 0 && main.staging().bytes == 0 {
+            let mut forked = Plan::new();
+            forked.push(Step::Branch(Branch::Fork));
+            forked.append(branch);
+            forked.push(Step::Branch(Branch::Resume));
+            forked.append(main);
+            forked.push(Step::Branch(Branch::Join));
+            forked.append(shared_logit(desc, layer, n_tok, device)?);
+            forked.append(shared_add(shape, n_tok));
+            return Ok(forked);
+        }
+    }
+    main.append(shared(shape, desc, layer, n_tok, device)?);
+    Ok(main)
 }
 
 /// One routed feed-forward, in launch order.
@@ -1954,7 +2033,7 @@ pub fn block(
         // one does - at a sixth of the dependent launches.
         let mut plan = if route_sorts(shape, n_tok) {
             let mut plan = router_logits(desc, layer, n_tok, device)?;
-            plan.append(route_sort(shape, n_tok));
+            plan.append(route_sort(shape, n_tok, device));
             plan
         } else {
             let mut plan = route(shape, desc, layer, n_tok, device)?;
@@ -1974,8 +2053,7 @@ pub fn block(
         } else {
             combine(shape, n_tok)
         });
-        plan.append(shared(shape, desc, layer, n_tok, device)?);
-        return Ok(plan);
+        return with_shared(shape, desc, layer, n_tok, device, plan);
     }
     let Some(bits) = matmul::trellis_bits(desc.gate.dtype) else {
         return Err(CoreError::Unsupported {
@@ -1999,7 +2077,7 @@ pub fn block(
         && let Some(main) = {
             let main = if wsd {
                 let mut main = router_logits(desc, layer, n_tok, device)?;
-                main.append(route_sort(shape, n_tok));
+                main.append(route_sort(shape, n_tok, device));
                 main.append(wsd_experts(shape, layer, bits, n_tok)?);
                 main
             } else {
@@ -2037,7 +2115,7 @@ pub fn block(
     // projections run first.
     if wsd {
         let mut plan = router_logits(desc, layer, n_tok, device)?;
-        plan.append(route_sort(shape, n_tok));
+        plan.append(route_sort(shape, n_tok, device));
         plan.append(wsd_experts(shape, layer, bits, n_tok)?);
         plan.append(shared_projections(shape, desc, layer, n_tok, device)?);
         plan.append(wsd_combine(shape, layer, n_tok));

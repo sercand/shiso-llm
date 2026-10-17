@@ -140,6 +140,9 @@ pub struct SparseOptions {
     /// kernel set has the low-precision kernels before asking for them
     /// ([`crate::sparse::capture::check_prefill_activations`]).
     pub prefill_activations: crate::sparse::matmul::PrefillActivations,
+    /// Which one-launch routed selection a decode-sized pass takes; see
+    /// [`crate::sparse::matmul::Device::route_sort`].
+    pub route_sort: crate::sparse::matmul::RouteSort,
     /// The entry names this build captured for the template kernels.
     ///
     /// Empty on a host that never compiled the kernels, which makes every
@@ -204,6 +207,7 @@ impl SparseOptions {
             tensor_core: true,
             prompt_matmul: crate::sparse::matmul::PromptMatmul::Rows,
             prefill_activations: crate::sparse::matmul::PrefillActivations::A16,
+            route_sort: crate::sparse::matmul::RouteSort::Small,
             entries: kernels::EntryTable::new(&[]),
             ngram_cache_bytes: NGRAM_CACHE_BYTES,
             ngram_reader: shiso_ple::PleConfig::DEFAULT,
@@ -917,6 +921,7 @@ impl SparseStack {
             role: crate::sparse::matmul::PassRole::Step,
             prompt_matmul: opts.prompt_matmul,
             prefill_activations: opts.prefill_activations,
+            route_sort: opts.route_sort,
         };
         let desc = weights.desc(ngram.as_ref().map(|tier| tier.table().row()));
         log_resident(&shape, &opts, &kv, planes, geometry.ckpt_bytes);

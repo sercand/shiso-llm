@@ -27,7 +27,7 @@ use crate::sparse::paged;
 use crate::sparse::plan::Plan;
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
-use crate::sparse::weights::RecurrentDesc;
+use crate::sparse::weights::{RecurrentDesc, WeightDesc};
 
 /// When the chunked recurrence is allowed to run.
 ///
@@ -187,17 +187,26 @@ pub fn block(
     }
     let per_run = prompt_runs(&policy, device);
     let mut plan = Plan::new();
-    matmul::project(
-        &mut plan,
-        desc.qkv,
-        Bound::new(
-            at(Role::RecurrentQkv),
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::GdnQkv),
-        ),
-        n_tok,
-        device,
-    )?;
+    // On a step or verify pass of MXFP8 weights the four input projections
+    // are one group launch at the top of the block: they read only the block
+    // input, and nothing between here and their readers writes it. Elsewhere
+    // each keeps its place in the chain.
+    let grouped = matmul::groups(&[desc.qkv, desc.alpha, desc.beta, desc.gate], device);
+    if grouped {
+        matmul::project_group(&mut plan, &input_projections(desc, layer), n_tok, device)?;
+    } else {
+        matmul::project(
+            &mut plan,
+            desc.qkv,
+            Bound::new(
+                at(Role::RecurrentQkv),
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(Buf::GdnQkv),
+            ),
+            n_tok,
+            device,
+        )?;
+    }
     if let Some(runs) = per_run {
         for run in 0..runs.count() {
             plan.append(prompt_run_conv(
@@ -318,28 +327,30 @@ pub fn block(
             ]),
         );
     }
-    matmul::project(
-        &mut plan,
-        desc.alpha,
-        Bound::new(
-            at(Role::RecurrentAlpha),
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::GdnAlphaProj),
-        ),
-        n_tok,
-        device,
-    )?;
-    matmul::project(
-        &mut plan,
-        desc.beta,
-        Bound::new(
-            at(Role::RecurrentBeta),
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::GdnBetaProj),
-        ),
-        n_tok,
-        device,
-    )?;
+    if !grouped {
+        matmul::project(
+            &mut plan,
+            desc.alpha,
+            Bound::new(
+                at(Role::RecurrentAlpha),
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(Buf::GdnAlphaProj),
+            ),
+            n_tok,
+            device,
+        )?;
+        matmul::project(
+            &mut plan,
+            desc.beta,
+            Bound::new(
+                at(Role::RecurrentBeta),
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(Buf::GdnBetaProj),
+            ),
+            n_tok,
+            device,
+        )?;
+    }
     plan.launch(
         Entry::plain(MOD_GDN, "q4e_gdn_gates_kernel"),
         kernels::gdn_gates(shape.gdn.v_heads, n_tok),
@@ -493,17 +504,19 @@ pub fn block(
             ]),
         );
     }
-    matmul::project(
-        &mut plan,
-        desc.gate,
-        Bound::new(
-            at(Role::RecurrentGate),
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::GdnGate),
-        ),
-        n_tok,
-        device,
-    )?;
+    if !grouped {
+        matmul::project(
+            &mut plan,
+            desc.gate,
+            Bound::new(
+                at(Role::RecurrentGate),
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(Buf::GdnGate),
+            ),
+            n_tok,
+            device,
+        )?;
+    }
     plan.launch(
         Entry::plain(MOD_GDN, "q4e_gdn_out_gate_kernel"),
         kernels::gdn_out_gate(shape.gdn.v_heads, n_tok),
@@ -588,24 +601,7 @@ fn decode_step(
 ) -> CoreResult<Plan> {
     let at = |role: Role| WeightRef::layer(layer, role);
     let mut plan = Plan::new();
-    for (weight, role, out) in [
-        (desc.qkv, Role::RecurrentQkv, Buf::GdnQkv),
-        (desc.alpha, Role::RecurrentAlpha, Buf::GdnAlphaProj),
-        (desc.beta, Role::RecurrentBeta, Buf::GdnBetaProj),
-        (desc.gate, Role::RecurrentGate, Buf::GdnGate),
-    ] {
-        matmul::project(
-            &mut plan,
-            weight,
-            Bound::new(
-                at(role),
-                Operand::Scratch(Buf::Mixed),
-                Operand::Scratch(out),
-            ),
-            1,
-            device,
-        )?;
-    }
+    matmul::project_group(&mut plan, &input_projections(desc, layer), 1, device)?;
     plan.append(sequential_conv(
         shape,
         at(Role::RecurrentConv1d),
@@ -648,6 +644,43 @@ fn decode_step(
         device,
     )?;
     Ok(plan)
+}
+
+/// The four projections of the block input - the fused query/key/value rows,
+/// the two decay inputs and the output gate - each into its own buffer.
+fn input_projections(desc: &RecurrentDesc, layer: LayerRef) -> [(WeightDesc, Bound); 4] {
+    let at = |role: Role| WeightRef::layer(layer, role);
+    let mixed = Operand::Scratch(Buf::Mixed);
+    [
+        (
+            desc.qkv,
+            Bound::new(at(Role::RecurrentQkv), mixed, Operand::Scratch(Buf::GdnQkv)),
+        ),
+        (
+            desc.alpha,
+            Bound::new(
+                at(Role::RecurrentAlpha),
+                mixed,
+                Operand::Scratch(Buf::GdnAlphaProj),
+            ),
+        ),
+        (
+            desc.beta,
+            Bound::new(
+                at(Role::RecurrentBeta),
+                mixed,
+                Operand::Scratch(Buf::GdnBetaProj),
+            ),
+        ),
+        (
+            desc.gate,
+            Bound::new(
+                at(Role::RecurrentGate),
+                mixed,
+                Operand::Scratch(Buf::GdnGate),
+            ),
+        ),
+    ]
 }
 
 /// The slab and the record count one per-position checkpoint argument pair

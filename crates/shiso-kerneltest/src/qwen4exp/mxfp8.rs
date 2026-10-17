@@ -716,3 +716,253 @@ pub(crate) fn bench_bf16_10240x2560(gpu: &Gpu) -> Fixture {
 pub(crate) fn bench_bf16_2560x6144(gpu: &Gpu) -> Fixture {
     bench_bf16(gpu, 2_560, 6_144)
 }
+
+/* ---------------------------------------------------------------------------
+ * Group launches: up to four matrices of one input in one grid.
+ * ------------------------------------------------------------------------ */
+
+/// Matrices one group launch takes, mirroring `matmul::MXFP8_GROUP_SLOTS`.
+pub const GROUP_SLOTS: usize = 4;
+/// The wide one-row group kernel.
+const GEMV_GROUP: &str = "q4e_mxfp8_gemv_group_kernel";
+/// The narrow one-row group kernel.
+const GEMV_GROUP_NARROW: &str = "q4e_mxfp8_gemv_group_narrow_kernel";
+/// The wide multi-row group kernel.
+const ROWS_GROUP: &str = "q4e_mxfp8_rows_group_kernel";
+/// The narrow multi-row group kernel.
+const ROWS_GROUP_NARROW: &str = "q4e_mxfp8_rows_group_narrow_kernel";
+
+/// The groups the model launches, `(out, in)` a slot: a recurrent layer's
+/// input, gate and two decay projections; attention's query, key, value and
+/// indexer key; the shared expert's gate and up; and a ragged group whose
+/// slots end inside a block.
+pub const GROUPS: [&[(u32, u32)]; 4] = [
+    &[(10_240, 2_560), (6_144, 2_560), (48, 2_560), (48, 2_560)],
+    &[(12_288, 2_560), (512, 2_560), (512, 2_560), (128, 2_560)],
+    &[(640, 2_560), (640, 2_560)],
+    &[(37, 640), (5, 640), (130, 640)],
+];
+
+/// Output rows one block of a group entry covers.
+fn group_rows_per_block(entry: &str) -> u32 {
+    match entry {
+        GEMV_GROUP => GEMV_ROWS_PER_BLOCK,
+        ROWS_GROUP => VERIFY_ROWS_PER_BLOCK,
+        _ => ROWS_PER_BLOCK,
+    }
+}
+
+/// The group entry the engine plans for `rows` activation rows over slots
+/// of `total` output rows in all.
+fn group_entry(rows: u32, total: u32) -> &'static str {
+    match rows {
+        1 if total > GROUP_NARROW => GEMV_GROUP,
+        1 => GEMV_GROUP_NARROW,
+        _ if total > NARROW_OUTPUT => ROWS_GROUP,
+        _ => ROWS_GROUP_NARROW,
+    }
+}
+
+/// Group rows at or below which a group takes its narrow entry, mirroring
+/// `matmul::MXFP8_GROUP_NARROW`.
+const GROUP_NARROW: u32 = 4_096;
+
+/// One group launch's operands: slot `i` reads `w[i]` and writes `outs[i]`,
+/// `dims[i]` rows of it.
+struct GroupPass<'a> {
+    outs: &'a [DeviceBuffer],
+    w: &'a [Device],
+    dims: &'a [u32],
+    x: &'a DeviceBuffer,
+    in_dim: u32,
+    rows: u32,
+}
+
+/// Launches one group entry.
+fn launch_group(gpu: &Gpu, entry: &'static str, pass: &GroupPass<'_>) {
+    let GroupPass {
+        outs,
+        w,
+        dims,
+        x,
+        in_dim,
+        rows,
+    } = *pass;
+    assert!(!w.is_empty() && w.len() <= GROUP_SLOTS && w.len() == outs.len());
+    let per = group_rows_per_block(entry);
+    let blocks: u32 = dims.iter().map(|d| d.div_ceil(per)).sum();
+    let mut args = Vec::with_capacity(4 * GROUP_SLOTS + 3);
+    for slot in 0..GROUP_SLOTS {
+        // An unused slot has no rows; its pointers are never read, so the
+        // first slot's stand in for null.
+        let (i, rows_of) = match dims.get(slot) {
+            Some(&d) if slot < w.len() => (slot, d),
+            _ => (0, 0),
+        };
+        args.push(KernelArg::Buffer(outs[i].view()));
+        args.push(KernelArg::Buffer(w[i].codes.view()));
+        args.push(KernelArg::Buffer(w[i].scales.view()));
+        args.push(KernelArg::U32(rows_of));
+    }
+    args.push(KernelArg::Buffer(x.view()));
+    args.push(KernelArg::U32(in_dim));
+    args.push(KernelArg::U32(rows));
+    let launch = LaunchArgs::new(
+        Extent3::new(blocks, 1, 1),
+        Extent3::new(STEP_THREADS, 1, 1),
+        &args,
+    );
+    run(gpu, KernelRef::new(MODULE, entry), &launch);
+}
+
+/// A group launch returns, slot for slot, the bits each matrix's own step
+/// kernel returns - at one row and at every verify width, through both
+/// blockings - for every group the model launches and a ragged one.
+pub fn a_group_launch_is_its_separate_launches_bit_for_bit(gpu: &Gpu) {
+    for (g, group) in GROUPS.iter().enumerate() {
+        let in_dim = group[0].1;
+        let mats: Vec<Matrix> = group
+            .iter()
+            .enumerate()
+            .map(|(i, &(o, k))| {
+                assert_eq!(k, in_dim, "a group shares its input");
+                Matrix::new(o, k, 0x6A0 + (g * 8 + i) as u64)
+            })
+            .collect();
+        let devs: Vec<Device> = mats.iter().map(|m| Device::upload(gpu, m)).collect();
+        let dims: Vec<u32> = mats.iter().map(|m| m.out_dim).collect();
+        for rows in 1..=STEP_ROWS {
+            let x = signal(rows as usize * in_dim as usize, 0x7E57 ^ rows ^ g as u32);
+            let xs = gpu.upload(&f32_bytes(&x));
+            let want: Vec<Vec<f32>> = mats
+                .iter()
+                .zip(&devs)
+                .map(|(m, d)| mxfp8(gpu, step_entry(rows, m.out_dim), d, m, &x, rows))
+                .collect();
+            let entries: &[&'static str] = if rows == 1 {
+                &[GEMV_GROUP, GEMV_GROUP_NARROW]
+            } else {
+                &[ROWS_GROUP, ROWS_GROUP_NARROW]
+            };
+            for &entry in entries {
+                let outs: Vec<DeviceBuffer> = dims
+                    .iter()
+                    .map(|&d| sentinel(gpu, rows as usize * d as usize))
+                    .collect();
+                let pass = GroupPass {
+                    outs: &outs,
+                    w: &devs,
+                    dims: &dims,
+                    x: &xs,
+                    in_dim,
+                    rows,
+                };
+                launch_group(gpu, entry, &pass);
+                drain(gpu);
+                for (i, out) in outs.iter().enumerate() {
+                    same_bits(
+                        &format!("{entry} group {g} slot {i} at {rows} rows"),
+                        &gpu.read_f32(out),
+                        &want[i],
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// One group launch through `entry` (or, with `None`, each slot's own step
+/// launch in turn) over `rows` activation rows, weights rotated as
+/// [`bench_entry`] rotates them.
+fn bench_group(
+    gpu: &Gpu,
+    group: &'static [(u32, u32)],
+    rows: u32,
+    entry: Option<&'static str>,
+) -> Fixture {
+    let in_dim = group[0].1;
+    let mats: Vec<Matrix> = group
+        .iter()
+        .enumerate()
+        .map(|(i, &(o, k))| Matrix::new(o, k, 0xBE7C + i as u64))
+        .collect();
+    let wbytes: usize = mats.iter().map(|m| m.codes.len() + m.scales.len()).sum();
+    let sets: Vec<Vec<Device>> = (0..copies(wbytes))
+        .map(|_| mats.iter().map(|m| Device::upload(gpu, m)).collect())
+        .collect();
+    let dims: Vec<u32> = mats.iter().map(|m| m.out_dim).collect();
+    let x = gpu.upload(&f32_bytes(&signal(rows as usize * in_dim as usize, 0x0B0B)));
+    let outs: Vec<DeviceBuffer> = dims
+        .iter()
+        .map(|&d| gpu.upload(&vec![0u8; rows as usize * d as usize * 4]))
+        .collect();
+    let total: u32 = dims.iter().sum();
+    let bytes = wbytes as u64 + 4 * u64::from(rows) * u64::from(in_dim + total);
+    let flops = 2 * u64::from(rows) * u64::from(in_dim) * u64::from(total);
+    let next = std::cell::Cell::new(0usize);
+    Fixture::new(bytes, flops, move |gpu| {
+        let set = &sets[next.get() % sets.len()];
+        next.set(next.get().wrapping_add(1));
+        if let Some(entry) = entry {
+            let pass = GroupPass {
+                outs: &outs,
+                w: set,
+                dims: &dims,
+                x: &x,
+                in_dim,
+                rows,
+            };
+            launch_group(gpu, entry, &pass);
+        } else {
+            for ((out, dev), &d) in outs.iter().zip(set).zip(&dims) {
+                let pass = PassDesc {
+                    in_dim,
+                    out_dim: d,
+                    rows,
+                };
+                launch(gpu, step_entry(rows, d), out, dev, &x, pass);
+            }
+        }
+    })
+}
+
+/// The recurrent layer's four input projections as one group launch.
+pub(crate) fn bench_group_gdn_t1(gpu: &Gpu) -> Fixture {
+    bench_group(gpu, GROUPS[0], 1, Some(group_entry(1, 16_480)))
+}
+/// The same four as separate launches.
+pub(crate) fn bench_split_gdn_t1(gpu: &Gpu) -> Fixture {
+    bench_group(gpu, GROUPS[0], 1, None)
+}
+/// The recurrent group over a five-row verify.
+pub(crate) fn bench_group_gdn_t5(gpu: &Gpu) -> Fixture {
+    bench_group(gpu, GROUPS[0], 5, Some(group_entry(5, 16_480)))
+}
+/// The same as separate launches.
+pub(crate) fn bench_split_gdn_t5(gpu: &Gpu) -> Fixture {
+    bench_group(gpu, GROUPS[0], 5, None)
+}
+/// Attention's four input projections as one group launch.
+pub(crate) fn bench_group_attn_t1(gpu: &Gpu) -> Fixture {
+    bench_group(gpu, GROUPS[1], 1, Some(group_entry(1, 13_440)))
+}
+/// The same four as separate launches.
+pub(crate) fn bench_split_attn_t1(gpu: &Gpu) -> Fixture {
+    bench_group(gpu, GROUPS[1], 1, None)
+}
+/// The shared expert's gate and up as one group launch.
+pub(crate) fn bench_group_shared_t1(gpu: &Gpu) -> Fixture {
+    bench_group(gpu, GROUPS[2], 1, Some(group_entry(1, 1_280)))
+}
+/// The same two as separate launches.
+pub(crate) fn bench_split_shared_t1(gpu: &Gpu) -> Fixture {
+    bench_group(gpu, GROUPS[2], 1, None)
+}
+/// The shared expert's pair over a five-row verify, one launch.
+pub(crate) fn bench_group_shared_t5(gpu: &Gpu) -> Fixture {
+    bench_group(gpu, GROUPS[2], 5, Some(group_entry(5, 1_280)))
+}
+/// The same as separate launches.
+pub(crate) fn bench_split_shared_t5(gpu: &Gpu) -> Fixture {
+    bench_group(gpu, GROUPS[2], 5, None)
+}

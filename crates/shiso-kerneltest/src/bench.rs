@@ -164,6 +164,74 @@ pub const CASES: &[Case] = &[
         build: crate::qwen4exp::mxfp8::bench_gemm512_10240x2560,
     },
     Case {
+        name: "q4e_mxfp8_group_gdn_t1",
+        build: crate::qwen4exp::mxfp8::bench_group_gdn_t1,
+    },
+    Case {
+        name: "q4e_mxfp8_split_gdn_t1",
+        build: crate::qwen4exp::mxfp8::bench_split_gdn_t1,
+    },
+    Case {
+        name: "q4e_mxfp8_group_gdn_t5",
+        build: crate::qwen4exp::mxfp8::bench_group_gdn_t5,
+    },
+    Case {
+        name: "q4e_mxfp8_split_gdn_t5",
+        build: crate::qwen4exp::mxfp8::bench_split_gdn_t5,
+    },
+    Case {
+        name: "q4e_mxfp8_group_attn_t1",
+        build: crate::qwen4exp::mxfp8::bench_group_attn_t1,
+    },
+    Case {
+        name: "q4e_mxfp8_split_attn_t1",
+        build: crate::qwen4exp::mxfp8::bench_split_attn_t1,
+    },
+    Case {
+        name: "q4e_mxfp8_group_shared_t1",
+        build: crate::qwen4exp::mxfp8::bench_group_shared_t1,
+    },
+    Case {
+        name: "q4e_mxfp8_split_shared_t1",
+        build: crate::qwen4exp::mxfp8::bench_split_shared_t1,
+    },
+    Case {
+        name: "q4e_mxfp8_group_shared_t5",
+        build: crate::qwen4exp::mxfp8::bench_group_shared_t5,
+    },
+    Case {
+        name: "q4e_mxfp8_split_shared_t5",
+        build: crate::qwen4exp::mxfp8::bench_split_shared_t5,
+    },
+    Case {
+        name: "q4e_nvfp4_step_gate_up_act_t1",
+        build: crate::qwen4exp::nvfp4::bench_step_gate_up_act_t1,
+    },
+    Case {
+        name: "q4e_nvfp4_step_gate_up_act_t5",
+        build: crate::qwen4exp::nvfp4::bench_step_gate_up_act_t5,
+    },
+    Case {
+        name: "q4e_nvfp4_step_gate_up_act_held_t5",
+        build: crate::qwen4exp::nvfp4::bench_step_gate_up_act_held_t5,
+    },
+    Case {
+        name: "q4e_moe_route_sort_small_t1",
+        build: crate::qwen4exp::route::bench_route_sort_small_t1,
+    },
+    Case {
+        name: "q4e_moe_route_sort_small_t5",
+        build: crate::qwen4exp::route::bench_route_sort_small_t5,
+    },
+    Case {
+        name: "q4e_moe_route_sort_tiny_t1",
+        build: crate::qwen4exp::route::bench_route_sort_tiny_t1,
+    },
+    Case {
+        name: "q4e_moe_route_sort_tiny_t5",
+        build: crate::qwen4exp::route::bench_route_sort_tiny_t5,
+    },
+    Case {
         name: "q4e_bf16_rows1_10240x2560",
         build: crate::qwen4exp::mxfp8::bench_bf16_10240x2560,
     },

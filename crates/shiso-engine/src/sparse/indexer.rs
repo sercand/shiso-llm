@@ -42,7 +42,7 @@ use crate::sparse::paged::Plane;
 use crate::sparse::plan::Plan;
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
-use crate::sparse::weights::IndexerDesc;
+use crate::sparse::weights::{IndexerDesc, WeightDesc};
 
 /// Which of the two scorers a head count reaches.
 ///
@@ -154,19 +154,37 @@ pub fn store(
     device: Device,
 ) -> CoreResult<Plan> {
     let mut plan = Plan::new();
-    matmul::project(
-        &mut plan,
+    let (weight, bound) = key_projection(desc, slot);
+    matmul::project(&mut plan, weight, bound, n_tok, device)?;
+    plan.append(store_projected(shape, slot, origin, n_tok));
+    Ok(plan)
+}
+
+/// The key projection [`store`] opens with: the block input into
+/// [`Buf::IdxKey`]. Its own function so that an attention block that projects
+/// its input once for several weights can take this one along.
+#[must_use]
+pub fn key_projection(desc: &IndexerDesc, slot: IndexerSlot) -> (WeightDesc, Bound) {
+    (
         desc.k,
         Bound::new(
             WeightRef::layer(slot.layer, Role::IndexerKey),
             Operand::Scratch(Buf::Mixed),
             Operand::Scratch(Buf::IdxKey),
         ),
-        n_tok,
-        device,
-    )?;
-    plan.append(pool(shape, slot, &origin, n_tok));
-    Ok(plan)
+    )
+}
+
+/// [`store`] after its key projection: [`Buf::IdxKey`] already holds this
+/// pass's key rows.
+#[must_use]
+pub fn store_projected(
+    shape: &SparseShape,
+    slot: IndexerSlot,
+    origin: RowOrigin,
+    n_tok: u32,
+) -> Plan {
+    pool(shape, slot, &origin, n_tok)
 }
 
 /// The pooled key pass, once for a chunk, once per run and once per row of a

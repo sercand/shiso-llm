@@ -408,6 +408,8 @@ pub struct OptionalPaths {
     /// family-specific architecture carries and only that family's devices
     /// load.
     pub lowp_prefill: bool,
+    /// The one-launch routed selection a decode-sized pass takes.
+    pub route_sort: crate::sparse::matmul::RouteSort,
 }
 
 /// Asks the device which optional paths it has kernels for.
@@ -445,6 +447,11 @@ pub fn optional_paths(backend: &dyn Backend) -> OptionalPaths {
             crate::sparse::matmul::PromptMatmul::Rows
         },
         lowp_prefill: kernels::LOWP_ENTRIES.iter().all(|&(m, e)| has(m, e)),
+        route_sort: if has(MOD_MOE, "q4e_moe_route_sort_tiny_kernel") {
+            crate::sparse::matmul::RouteSort::Tiny
+        } else {
+            crate::sparse::matmul::RouteSort::Small
+        },
     };
     tracing::info!(?paths, "optional sparse kernel paths this device has");
     paths

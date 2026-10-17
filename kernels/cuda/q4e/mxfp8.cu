@@ -17,6 +17,10 @@
  *   rows;
  * - `q4e_mxfp8_gemm_kernel`, a prompt chunk of any width, on tensor cores.
  *
+ * And four group entries - the step kernels over up to four matrices that
+ * read one activation, in one grid - with an argument list of their own; see
+ * "Group launches" below.
+ *
  * # The step kernels are the brain-float tier, bit for bit
  *
  * Every MXFP8 weight is exactly a brain float whenever it is a normal number:
@@ -463,6 +467,309 @@ extern "C" __global__ void __launch_bounds__(Q4E_MX_WARPS * 32u) q4e_mxfp8_rows_
         float *out, const uint8_t *codes, const uint8_t *scales, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t rows) {
     q4e_mx_verify<1>(out, codes, scales, x, in_dim, out_dim, rows);
+}
+
+/* ---------------------------------------------------------------------------
+ * Group launches: up to four matrices that read one activation, in one grid.
+ *
+ * A layer's projections of one input - a recurrent layer's four, attention's
+ * query, key, value and indexer key, the shared expert's gate and up - were
+ * one launch each, and the narrow ones ran far below the memory system: a
+ * 48-row matrix is twelve blocks, a 512-row one 128, each paying a launch and
+ * a ramp. Here the matrices' row blocks are laid end to end in one grid,
+ * every block owning rows of exactly one matrix, and each matrix writes its
+ * own buffer as its own launch would.
+ *
+ * A row's arithmetic is the single-matrix kernels' - the same helper, the
+ * same order - so a group launch returns, bit for bit, what the separate
+ * launches return, at one row and at every verify width.
+ *
+ * Argument list (`MXG` below): `out0, codes0, scales0, out_dim0`, the same
+ * for slots 1 to 3, then `x, in_dim, rows`. An unused slot has `out_dim` 0
+ * (and null pointers), and must follow every used one.
+ * ------------------------------------------------------------------------ */
+
+#define Q4E_MXG_PARAMS                                                             \
+    float *out0, const uint8_t *codes0, const uint8_t *scales0, uint32_t out_dim0, \
+    float *out1, const uint8_t *codes1, const uint8_t *scales1, uint32_t out_dim1, \
+    float *out2, const uint8_t *codes2, const uint8_t *scales2, uint32_t out_dim2, \
+    float *out3, const uint8_t *codes3, const uint8_t *scales3, uint32_t out_dim3, \
+    const float *x, uint32_t in_dim, uint32_t rows
+
+/* One matrix of a group. */
+struct q4e_mxg_slot {
+    float *out;
+    const uint8_t *codes;
+    const uint8_t *scales;
+    uint32_t out_dim;
+    /* This block's first row within the matrix. */
+    uint32_t row0;
+};
+
+/* The matrix block `b` of a group belongs to, `per` rows a block. `false`
+ * past the last matrix's last block. Selected by comparisons rather than an
+ * indexed array, which would sit in local memory. */
+__device__ __forceinline__ bool q4e_mxg_pick(
+        uint32_t b, uint32_t per, q4e_mxg_slot &s,
+        float *out0, const uint8_t *codes0, const uint8_t *scales0, uint32_t out_dim0,
+        float *out1, const uint8_t *codes1, const uint8_t *scales1, uint32_t out_dim1,
+        float *out2, const uint8_t *codes2, const uint8_t *scales2, uint32_t out_dim2,
+        float *out3, const uint8_t *codes3, const uint8_t *scales3, uint32_t out_dim3) {
+    const uint32_t n0 = (out_dim0 + per - 1u) / per;
+    const uint32_t n1 = (out_dim1 + per - 1u) / per;
+    const uint32_t n2 = (out_dim2 + per - 1u) / per;
+    const uint32_t n3 = (out_dim3 + per - 1u) / per;
+    if (b < n0) {
+        s = {out0, codes0, scales0, out_dim0, b * per};
+        return true;
+    }
+    b -= n0;
+    if (b < n1) {
+        s = {out1, codes1, scales1, out_dim1, b * per};
+        return true;
+    }
+    b -= n1;
+    if (b < n2) {
+        s = {out2, codes2, scales2, out_dim2, b * per};
+        return true;
+    }
+    b -= n2;
+    if (b < n3) {
+        s = {out3, codes3, scales3, out_dim3, b * per};
+        return true;
+    }
+    return false;
+}
+
+#define Q4E_MXG_PICK(per, s)                                                         \
+    q4e_mxg_pick(blockIdx.x, (per), (s), out0, codes0, scales0, out_dim0, out1,      \
+                 codes1, scales1, out_dim1, out2, codes2, scales2, out_dim2, out3,    \
+                 codes3, scales3, out_dim3)
+
+/* One activation row over a group, `R` output rows a warp, `D` chunks deep,
+ * as `q4e_mxfp8_gemv_kernel` runs its rows.
+ *
+ * Measured on a GB10 (kernel bench, wall clock, one matrix): two rows a warp
+ * one chunk deep, 2560 x 6144 in 78-80 us and 10240 x 2560 in 123-125 us,
+ * was as fast as or faster than every other blocking tried (one, two or four
+ * rows a warp at one to eight chunks deep, the pipelined helper below, and a
+ * per-warp cp.async ring three to six chunks deep: 79-95 us at 2560 x 6144).
+ * A load-only kernel over the same row blocks takes 70-73 and 113-118 us, so
+ * the arithmetic costs under a tenth. */
+template <int R, int D>
+__device__ __forceinline__ void q4e_mxg_gemv(Q4E_MXG_PARAMS) {
+    (void) rows;
+    __shared__ __align__(16) uint8_t stage[Q4E_MX_WARPS][R * Q4E_MX_CHUNK];
+    q4e_mxg_slot s;
+    if (!Q4E_MXG_PICK(Q4E_MX_WARPS * R, s)) {
+        return;
+    }
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t row0 = s.row0 + warp * (uint32_t) R;
+    if (row0 >= s.out_dim) {
+        return;
+    }
+    q4e_mx_rows<1, R, D>(s.out, s.codes, s.scales, x, in_dim, s.out_dim, row0, lane, stage[warp]);
+}
+
+/* One activation row, two output rows a warp: a group whose rows add up to
+ * more than 4096. Grid: the sum over the slots of `ceil(out_dim / 8)`, 128
+ * threads. `in_dim` a multiple of 32, every `codes` sixteen-byte aligned. */
+extern "C" __global__ void __launch_bounds__(Q4E_MX_WARPS * 32u)
+q4e_mxfp8_gemv_group_kernel(
+        float *out0, const uint8_t *codes0, const uint8_t *scales0, uint32_t out_dim0,
+        float *out1, const uint8_t *codes1, const uint8_t *scales1, uint32_t out_dim1,
+        float *out2, const uint8_t *codes2, const uint8_t *scales2, uint32_t out_dim2,
+        float *out3, const uint8_t *codes3, const uint8_t *scales3, uint32_t out_dim3,
+        const float *x, uint32_t in_dim, uint32_t rows) {
+    q4e_mxg_gemv<2, 1>(out0, codes0, scales0, out_dim0, out1, codes1, scales1, out_dim1,
+                       out2, codes2, scales2, out_dim2, out3, codes3, scales3, out_dim3,
+                       x, in_dim, rows);
+}
+
+/* `q4e_mx_rows` at one activation row and one chunk deep, with the next
+ * chunk's codes requested before this chunk's arithmetic and a chunk's scale
+ * bytes read once, four to a word, rather than once a pair. The same values
+ * in the same order: only the loads move.
+ *
+ * Measured on a GB10 (kernel bench, wall clock) over the shared expert's
+ * gate and up as one group: 22.5 us with `q4e_mx_rows<1, 1, 4>`, 18.7 us
+ * here. At the wide shapes it measured no better than two rows a warp. */
+template <int R>
+__device__ __forceinline__ void q4e_mx_rows_pf(
+        float *__restrict__ out, const uint8_t *__restrict__ codes,
+        const uint8_t *__restrict__ scales, const float *__restrict__ x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t row0, uint32_t lane,
+        uint8_t *__restrict__ stage) {
+    const uint8_t *wr[R];
+    const uint8_t *sr[R];
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const uint64_t row = min(row0 + (uint32_t) r, out_dim - 1u);
+        wr[r] = codes + row * in_dim;
+        sr[r] = scales + row * (in_dim / Q4E_MX_GROUP);
+        acc[r] = 0.0f;
+    }
+    uint4 cur[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        cur[r] = __ldg(reinterpret_cast<const uint4 *>(wr[r] + 16u * lane));
+    }
+    const uint32_t hi = lane >> 4;
+    for (uint32_t base = 0; base < in_dim; base += Q4E_MX_CHUNK) {
+        uint4 nxt[R];
+        const uint32_t noff = base + Q4E_MX_CHUNK + 16u * lane;
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            nxt[r] = noff < in_dim ? __ldg(reinterpret_cast<const uint4 *>(wr[r] + noff))
+                                   : make_uint4(0u, 0u, 0u, 0u);
+        }
+        /* This chunk's sixteen scale bytes a row, groups `base / 32 + 4 q`
+         * to `+ 3` in word `q`; a group past the row is never read. Bytes,
+         * not words: a row of scales is only four-byte aligned when the
+         * contraction is a multiple of 128. */
+        const uint32_t ng = in_dim / Q4E_MX_GROUP;
+        uint32_t sw[R][4];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const uint32_t g = base / Q4E_MX_GROUP + 4u * (uint32_t) q;
+                uint32_t word = 0u;
+#pragma unroll
+                for (uint32_t i = 0; i < 4u; i++) {
+                    if (g + i < ng) {
+                        word |= (uint32_t) __ldg(sr[r] + g + i) << (8u * i);
+                    }
+                }
+                sw[r][q] = word;
+            }
+        }
+        __syncwarp();
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            *reinterpret_cast<uint4 *>(stage + r * Q4E_MX_CHUNK + 16u * lane) = cur[r];
+        }
+        __syncwarp();
+#pragma unroll
+        for (uint32_t j = 0; j < Q4E_MX_CHUNK / 64u; j++) {
+            const uint32_t e = base + 2u * lane + 64u * j;
+            if (e < in_dim) {
+                const float2 xv = *reinterpret_cast<const float2 *>(x + e);
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    const uint32_t p = *reinterpret_cast<const uint16_t *>(
+                            stage + r * Q4E_MX_CHUNK + 2u * lane + 64u * j);
+                    /* Element `e` is in group `base / 32 + 2 j + hi`. */
+                    const float s =
+                            q4e_mx_scale((sw[r][j >> 1] >> (16u * (j & 1u) + 8u * hi)) & 0xFFu);
+                    const float2 v = q4e_mx_pair(p);
+                    const float w0 = q4e_mx_mul(v.x, s);
+                    const float w1 = q4e_mx_mul(v.y, s);
+                    acc[r] = q4e_mx_fma(w0, xv.x, acc[r]);
+                    acc[r] = q4e_mx_fma(w1, xv.y, acc[r]);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            cur[r] = nxt[r];
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const float v = q4e_mx_warp_sum(acc[r]);
+        if (lane == 0u && row0 + (uint32_t) r < out_dim) {
+            out[row0 + r] = v;
+        }
+    }
+}
+/* One activation row, one output row a warp, pipelined: a group of at most
+ * 4096 rows in all, which two rows a warp would spread over half as many
+ * warps. Grid: the sum of `ceil(out_dim / 4)`, 128 threads. */
+extern "C" __global__ void __launch_bounds__(Q4E_MX_WARPS * 32u)
+q4e_mxfp8_gemv_group_narrow_kernel(
+        float *out0, const uint8_t *codes0, const uint8_t *scales0, uint32_t out_dim0,
+        float *out1, const uint8_t *codes1, const uint8_t *scales1, uint32_t out_dim1,
+        float *out2, const uint8_t *codes2, const uint8_t *scales2, uint32_t out_dim2,
+        float *out3, const uint8_t *codes3, const uint8_t *scales3, uint32_t out_dim3,
+        const float *x, uint32_t in_dim, uint32_t rows) {
+    (void) rows;
+    __shared__ __align__(16) uint8_t stage[Q4E_MX_WARPS][Q4E_MX_CHUNK];
+    q4e_mxg_slot s;
+    if (!Q4E_MXG_PICK(Q4E_MX_WARPS, s)) {
+        return;
+    }
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t row0 = s.row0 + warp;
+    if (row0 >= s.out_dim) {
+        return;
+    }
+    q4e_mx_rows_pf<1>(s.out, s.codes, s.scales, x, in_dim, s.out_dim, row0, lane, stage[warp]);
+}
+
+/* Two to eight activation rows over a group, `R` output rows a warp: the
+ * verify kernels' rows. The whole block belongs to one matrix, so every warp
+ * reaches every barrier of `q4e_mx_rows_xs`. */
+template <int R>
+__device__ __forceinline__ void q4e_mxg_verify(Q4E_MXG_PARAMS) {
+    __shared__ __align__(16) float xs[2u * Q4E_MX_STEP_ROWS * Q4E_MX_SLAB];
+    __shared__ __align__(16) uint8_t stage[Q4E_MX_WARPS][R * Q4E_MX_CHUNK];
+    q4e_mxg_slot s;
+    if (!Q4E_MXG_PICK(Q4E_MX_WARPS * R, s)) {
+        return;
+    }
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t row0 = s.row0 + warp * (uint32_t) R;
+    uint8_t *st = stage[warp];
+    float *o = s.out;
+    const uint8_t *c = s.codes;
+    const uint8_t *sc = s.scales;
+    const uint32_t od = s.out_dim;
+    switch (rows) {
+    case 2u: q4e_mx_rows_xs<2, R>(o, c, sc, x, in_dim, od, row0, lane, xs, st); break;
+    case 3u: q4e_mx_rows_xs<3, R>(o, c, sc, x, in_dim, od, row0, lane, xs, st); break;
+    case 4u: q4e_mx_rows_xs<4, R>(o, c, sc, x, in_dim, od, row0, lane, xs, st); break;
+    case 5u: q4e_mx_rows_xs<5, R>(o, c, sc, x, in_dim, od, row0, lane, xs, st); break;
+    case 6u: q4e_mx_rows_xs<6, R>(o, c, sc, x, in_dim, od, row0, lane, xs, st); break;
+    case 7u: q4e_mx_rows_xs<7, R>(o, c, sc, x, in_dim, od, row0, lane, xs, st); break;
+    case 8u: q4e_mx_rows_xs<8, R>(o, c, sc, x, in_dim, od, row0, lane, xs, st); break;
+    default: break;
+    }
+}
+
+/* Two to eight activation rows, `[rows, in_dim]` in and `[rows, out_dim_m]`
+ * out per slot, four output rows a warp: a group of more than 1024 rows.
+ * Grid: the sum of `ceil(out_dim / 16)`, 128 threads. `x` sixteen-byte
+ * aligned as well. */
+extern "C" __global__ void __launch_bounds__(Q4E_MX_WARPS * 32u)
+q4e_mxfp8_rows_group_kernel(
+        float *out0, const uint8_t *codes0, const uint8_t *scales0, uint32_t out_dim0,
+        float *out1, const uint8_t *codes1, const uint8_t *scales1, uint32_t out_dim1,
+        float *out2, const uint8_t *codes2, const uint8_t *scales2, uint32_t out_dim2,
+        float *out3, const uint8_t *codes3, const uint8_t *scales3, uint32_t out_dim3,
+        const float *x, uint32_t in_dim, uint32_t rows) {
+    q4e_mxg_verify<4>(out0, codes0, scales0, out_dim0, out1, codes1, scales1, out_dim1,
+                      out2, codes2, scales2, out_dim2, out3, codes3, scales3, out_dim3,
+                      x, in_dim, rows);
+}
+
+/* The same, one output row a warp: a group of at most 1024 rows. Grid: the
+ * sum of `ceil(out_dim / 4)`, 128 threads. */
+extern "C" __global__ void __launch_bounds__(Q4E_MX_WARPS * 32u)
+q4e_mxfp8_rows_group_narrow_kernel(
+        float *out0, const uint8_t *codes0, const uint8_t *scales0, uint32_t out_dim0,
+        float *out1, const uint8_t *codes1, const uint8_t *scales1, uint32_t out_dim1,
+        float *out2, const uint8_t *codes2, const uint8_t *scales2, uint32_t out_dim2,
+        float *out3, const uint8_t *codes3, const uint8_t *scales3, uint32_t out_dim3,
+        const float *x, uint32_t in_dim, uint32_t rows) {
+    q4e_mxg_verify<1>(out0, codes0, scales0, out_dim0, out1, codes1, scales1, out_dim1,
+                      out2, codes2, scales2, out_dim2, out3, codes3, scales3, out_dim3,
+                      x, in_dim, rows);
 }
 
 /* ---------------------------------------------------------------------------

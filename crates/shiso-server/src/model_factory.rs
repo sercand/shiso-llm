@@ -1093,6 +1093,7 @@ fn sparse_options(
         tiled_attention: paths.tiled_attention,
         prompt_matmul: paths.prompt_matmul,
         prefill_activations,
+        route_sort: paths.route_sort,
         chunk: shiso_engine::sparse::recurrent::ChunkPolicy {
             available: paths.chunked_recurrence,
             ..shiso_engine::sparse::recurrent::ChunkPolicy::new()

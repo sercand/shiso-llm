@@ -145,9 +145,12 @@ __device__ __forceinline__ float q4e_mo_nvfp4_row(
 #define Q4E_NVFP4_DN_ROWS 4u
 #define Q4E_NVFP4_WARPS 4u
 /* Groups a lane holds in registers: 32 lanes x 3 groups x 16 weights covers a
- * 1,536..3,072-wide contraction, the hidden width here; a wider one takes the
- * reload path. */
+ * contraction up to 1,536 wide; a wider one - the hidden width here - takes
+ * the reload path, which re-reads the row once per column. */
 #define Q4E_NVFP4_LANE_GROUPS 3u
+/* The same for the held entry: five groups a lane covers the 2,560-wide
+ * hidden row. */
+#define Q4E_NVFP4_HELD_GROUPS 5u
 
 /* Eight codes of `w` widened exactly to floats, `v[j]` the code in bits
  * `4j .. 4j + 3`. Codes `j` and `j + 4` share a half2: the sign goes to the
@@ -193,7 +196,33 @@ __device__ __forceinline__ float q4e_mo_word_dot_fast(uint32_t w, float4 a, floa
  * its slot's scale and `out[m]` its output; `row` is the first row's index
  * and `rows` how many of the `R` exist. Columns `c0 .. c1` of `sorted` read
  * activation row `col / div`. */
-template <uint32_t M, uint32_t R, uint32_t P, uint32_t G>
+/* `silu(gate) * up`, exactly as `q4e_swiglu_kernel` (moe.cu, built with the
+ * same flags) computes it from the two stored rows. */
+__device__ __forceinline__ float q4e_mo_swiglu(float g, float u) {
+    return (g / (1.0f + __expf(-g))) * u;
+}
+
+/* Stores one row's `M` sums for column `col`: each matrix's own output, or
+ * with `ACT` (two matrices, gate then up) the activated product into
+ * `out[0]`, the value the activation launch would have written from the two
+ * stored rows. Every lane holds the folded sums; lane 0 stores. */
+template <uint32_t M, bool ACT>
+__device__ __forceinline__ void q4e_mo_store_row(
+        float *const *out, const float *v, uint64_t at, uint32_t lane) {
+    if (lane != 0u) {
+        return;
+    }
+    if (ACT) {
+        out[0][at] = q4e_mo_swiglu(v[0], v[1]);
+    } else {
+#pragma unroll
+        for (uint32_t m = 0; m < M; ++m) {
+            out[m][at] = v[m];
+        }
+    }
+}
+
+template <uint32_t M, uint32_t R, uint32_t P, uint32_t G, bool ACT = false>
 __device__ __forceinline__ void q4e_mo_nvfp4_step_rows(
         float *const *out, const uint8_t *const *w, const uint8_t *const *s,
         const float *global, const float *__restrict__ x, const int *__restrict__ sorted,
@@ -208,17 +237,16 @@ __device__ __forceinline__ void q4e_mo_nvfp4_step_rows(
             const uint32_t col = (uint32_t) sorted[c];
             const float *xr = x + (uint64_t) (col / div) * in_dim;
 #pragma unroll
-            for (uint32_t m = 0; m < M; ++m) {
+            for (uint32_t r = 0; r < R; ++r) {
+                if (r < rows) {
+                    float v[M];
 #pragma unroll
-                for (uint32_t r = 0; r < R; ++r) {
-                    if (r < rows) {
-                        const float v = q4e_mo_warp_sum(q4e_mo_nvfp4_row(
+                    for (uint32_t m = 0; m < M; ++m) {
+                        v[m] = q4e_mo_warp_sum(q4e_mo_nvfp4_row(
                                 w[m] + r * packed, s[m] + r * groups, global[m], xr, in_dim,
                                 lane));
-                        if (lane == 0u) {
-                            out[m][(uint64_t) col * out_dim + row + r] = v;
-                        }
                     }
+                    q4e_mo_store_row<M, ACT>(out, v, (uint64_t) col * out_dim + row + r, lane);
                 }
             }
         }
@@ -251,13 +279,24 @@ __device__ __forceinline__ void q4e_mo_nvfp4_step_rows(
                 /* The row's scale bytes as one word a lane - whole lines,
                  * not a byte a lane - handed to the lanes that use them. */
                 const uint32_t r = r0 + p;
-                const uint32_t word = (r < rows && lane * 4u < groups)
-                                              ? ((const uint32_t *) (s[m] + r * groups))[lane]
-                                              : 0u;
+                /* Word `v` of lane `l` holds groups `4 (l + 32 v) .. + 3`:
+                 * one word a lane covers 128 groups, and a wider row (the
+                 * hidden width, 160) takes a second. */
+                constexpr uint32_t W = (G + 3u) / 4u;
+                uint32_t word[W];
+#pragma unroll
+                for (uint32_t v = 0; v < W; ++v) {
+                    const uint32_t at = lane + 32u * v;
+                    word[v] = (r < rows && at * 4u < groups)
+                                      ? ((const uint32_t *) (s[m] + r * groups))[at]
+                                      : 0u;
+                }
 #pragma unroll
                 for (uint32_t q = 0; q < G; ++q) {
                     const uint32_t g = lane + 32u * q;
-                    const uint32_t b = __shfl_sync(0xffffffffu, word, (g >> 2) & 31u);
+                    /* Group `g` is byte `g % 4` of word `q / 4` of lane
+                     * `(g / 4) % 32`. */
+                    const uint32_t b = __shfl_sync(0xffffffffu, word[q >> 2], (g >> 2) & 31u);
                     scale[m][p][q] = (r < rows && g < groups)
                                              ? q4e_mo_e4m3((b >> (8u * (g & 3u))) & 0xFFu)
                                                        * global[m]
@@ -303,29 +342,28 @@ __device__ __forceinline__ void q4e_mo_nvfp4_step_rows(
                 }
             }
 #pragma unroll
-            for (uint32_t m = 0; m < M; ++m) {
+            for (uint32_t p = 0; p < P; ++p) {
+                float v[M];
 #pragma unroll
-                for (uint32_t p = 0; p < P; ++p) {
-                    const float v = q4e_mo_warp_sum(acc[m][p]);
-                    if (lane == 0u && r0 + p < rows) {
-                        out[m][(uint64_t) col * out_dim + row + r0 + p] = v;
-                    }
+                for (uint32_t m = 0; m < M; ++m) {
+                    v[m] = q4e_mo_warp_sum(acc[m][p]);
+                }
+                if (r0 + p < rows) {
+                    q4e_mo_store_row<M, ACT>(out, v, (uint64_t) col * out_dim + row + r0 + p,
+                                             lane);
                 }
             }
         }
     }
 }
 
-/* Gate and up for one active expert's columns: `Q4E_NVFP4_GU_ROWS` rows of
- * each a warp, `Q4E_NVFP4_WARPS` warps a block, the expert's span of the sorted column
- * list walked with the rows held. `map[e]` is the slot expert `e`'s matrices
- * sit at; a column's activation row is its token's, `col / n_used`.
- *
- * Buffers: out_gate, out_up, gate_w, gate_s, gate_g, up_w, up_s, up_g, x,
- * sorted, bounds, active, map, in_dim, out_dim, n_expert, n_used. Grid
- * `(ceil(out_dim / 4), min(columns, n_expert))`, 128 threads. */
-extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_experts_gate_up_kernel(
-        float *out_gate, float *out_up,
+/* Gate and up for one active expert's columns, `Q4E_NVFP4_GU_ROWS` rows of
+ * each a warp: the body of both gate-and-up entries. `out[0]` and `out[1]`
+ * are the gate and up outputs, or with `ACT` `out[0]` is the activated
+ * intermediate. */
+template <uint32_t G, bool ACT>
+__device__ __forceinline__ void q4e_mo_nvfp4_gate_up(
+        float *const *out,
         const uint8_t *gate_w, const uint8_t *gate_s, const float *gate_g,
         const uint8_t *up_w, const uint8_t *up_s, const float *up_g,
         const float *x, const int *sorted, const int *bounds, const int *active,
@@ -350,15 +388,80 @@ extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_ex
     const uint8_t *s[2] = {gate_s + first * (in_dim / Q4E_NVFP4_GROUP),
                            up_s + first * (in_dim / Q4E_NVFP4_GROUP)};
     const float g[2] = {gate_g[slot], up_g[slot]};
-    float *const out[2] = {out_gate, out_up};
-    q4e_mo_nvfp4_step_rows<2u, Q4E_NVFP4_GU_ROWS, 1u, Q4E_NVFP4_LANE_GROUPS>(
+    q4e_mo_nvfp4_step_rows<2u, Q4E_NVFP4_GU_ROWS, 1u, G, ACT>(
             out, w, s, g, x, sorted, c0, c1, n_used, row,
             min(Q4E_NVFP4_GU_ROWS, out_dim - row), in_dim, out_dim, lane);
 }
 
+/* Gate and up for one active expert's columns: `Q4E_NVFP4_GU_ROWS` rows of
+ * each a warp, `Q4E_NVFP4_WARPS` warps a block, the expert's span of the sorted column
+ * list walked with the rows held. `map[e]` is the slot expert `e`'s matrices
+ * sit at; a column's activation row is its token's, `col / n_used`.
+ *
+ * Buffers: out_gate, out_up, gate_w, gate_s, gate_g, up_w, up_s, up_g, x,
+ * sorted, bounds, active, map, in_dim, out_dim, n_expert, n_used. Grid
+ * `(ceil(out_dim / 4), min(columns, n_expert))`, 128 threads. */
+extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_experts_gate_up_kernel(
+        float *out_gate, float *out_up,
+        const uint8_t *gate_w, const uint8_t *gate_s, const float *gate_g,
+        const uint8_t *up_w, const uint8_t *up_s, const float *up_g,
+        const float *x, const int *sorted, const int *bounds, const int *active,
+        const uint32_t *map, uint32_t in_dim, uint32_t out_dim, uint32_t n_expert,
+        uint32_t n_used) {
+    float *const out[2] = {out_gate, out_up};
+    q4e_mo_nvfp4_gate_up<Q4E_NVFP4_LANE_GROUPS, false>(
+            out, gate_w, gate_s, gate_g, up_w, up_s, up_g, x, sorted, bounds, active, map,
+            in_dim, out_dim, n_expert, n_used);
+}
+
+/* The same rows with the activation applied as they are stored: each
+ * column's `silu(gate) * up` into `out_mid`, `[column, out_dim]` - the bits
+ * `q4e_swiglu_kernel` writes from the two rows `q4e_nvfp4_experts_gate_up_kernel`
+ * stores - without the two intermediate rows or the activation launch.
+ * The decode step's entry: one column an expert.
+ *
+ * Buffers: out_mid, gate_w, gate_s, gate_g, up_w, up_s, up_g, x, sorted,
+ * bounds, active, map, in_dim, out_dim, n_expert, n_used. Grid as the
+ * unactivated entry's. */
+extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_experts_gate_up_act_kernel(
+        float *out_mid,
+        const uint8_t *gate_w, const uint8_t *gate_s, const float *gate_g,
+        const uint8_t *up_w, const uint8_t *up_s, const float *up_g,
+        const float *x, const int *sorted, const int *bounds, const int *active,
+        const uint32_t *map, uint32_t in_dim, uint32_t out_dim, uint32_t n_expert,
+        uint32_t n_used) {
+    float *const out[2] = {out_mid, out_mid};
+    q4e_mo_nvfp4_gate_up<Q4E_NVFP4_LANE_GROUPS, true>(
+            out, gate_w, gate_s, gate_g, up_w, up_s, up_g, x, sorted, bounds, active, map,
+            in_dim, out_dim, n_expert, n_used);
+}
+
+/* The activated rows with a 2560-wide row held in registers (five groups a
+ * lane) while an expert's columns are walked, rather than re-read per
+ * column: the verify's entry. The same sums - the register and the reload
+ * paths are one order - so a verify row is still the decode row's bits.
+ *
+ * Measured on a GB10 (kernel bench, Zipf routing over 512 experts, wall
+ * clock, medians of three): five tokens 391-427 -> 378-388 us; one token
+ * 84-87 -> 88-89 us, which is why the decode keeps the reload path.
+ * Arguments and grid as `q4e_nvfp4_experts_gate_up_act_kernel`'s. */
+extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_experts_gate_up_act_held_kernel(
+        float *out_mid,
+        const uint8_t *gate_w, const uint8_t *gate_s, const float *gate_g,
+        const uint8_t *up_w, const uint8_t *up_s, const float *up_g,
+        const float *x, const int *sorted, const int *bounds, const int *active,
+        const uint32_t *map, uint32_t in_dim, uint32_t out_dim, uint32_t n_expert,
+        uint32_t n_used) {
+    float *const out[2] = {out_mid, out_mid};
+    q4e_mo_nvfp4_gate_up<Q4E_NVFP4_HELD_GROUPS, true>(
+            out, gate_w, gate_s, gate_g, up_w, up_s, up_g, x, sorted, bounds, active, map,
+            in_dim, out_dim, n_expert, n_used);
+}
+
 /* The routed down projection over an NVFP4 bank: each column reads its own row
  * of the activated intermediate and writes `[column, out_dim]`;
- * `Q4E_NVFP4_DN_ROWS` rows a warp.
+ * `Q4E_NVFP4_DN_ROWS` rows a warp, taken one at a time (two or four held at
+ * once measured 3-6% slower on a GB10).
  *
  * Buffers: out, down_w, down_s, down_g, mid, sorted, bounds, active, map,
  * in_dim, out_dim, n_expert, n_used. Grid `(ceil(out_dim / 16), min(columns,
@@ -391,7 +494,6 @@ extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_ex
             o, w, s, g, mid, sorted, c0, c1, 1u, row,
             min(Q4E_NVFP4_DN_ROWS, out_dim - row), in_dim, out_dim, lane);
 }
-
 /* ---------------------------------------------------------------------------
  * The routed stages of a prompt pass, on tensor cores.
  *

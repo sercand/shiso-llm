@@ -186,6 +186,9 @@ pub(crate) struct Stages {
     /// Dynamic shared memory a block takes.
     smem: u32,
     rel: f32,
+    /// Whether the gate-and-up entry writes the activated intermediate (one
+    /// output) rather than the two rows.
+    act: bool,
 }
 
 /// The warp-per-row step kernels: one row of gate and up a warp, four of
@@ -199,6 +202,21 @@ const STEP: Stages = Stages {
     threads: 128,
     smem: 0,
     rel: 2e-4,
+    act: false,
+};
+
+/// The step stages with the activation fused into gate and up.
+const STEP_ACT: Stages = Stages {
+    gate_up: "q4e_nvfp4_experts_gate_up_act_kernel",
+    act: true,
+    ..STEP
+};
+
+/// The activated stages holding a 2560-wide row in registers, a verify's.
+const STEP_ACT_HELD: Stages = Stages {
+    gate_up: "q4e_nvfp4_experts_gate_up_act_held_kernel",
+    act: true,
+    ..STEP
 };
 
 /// The tensor-core prompt kernels: 128 rows of gate and up, or 256 of down, a
@@ -215,6 +233,7 @@ pub(crate) const PROMPT: Stages = Stages {
     threads: 512,
     smem: 92_416,
     rel: 4e-3,
+    act: false,
 };
 
 /// The three device arrays of one bank.
@@ -237,7 +256,7 @@ pub(crate) struct GateUp<'a> {
 impl GateUp<'_> {
     pub(crate) fn launch(&self, gpu: &Gpu, st: &Stages) {
         let r = self.route;
-        let args = [
+        let mut args = vec![
             KernelArg::Buffer(self.out_gate),
             KernelArg::Buffer(self.out_up),
             KernelArg::Buffer(self.gate[0]),
@@ -256,6 +275,10 @@ impl GateUp<'_> {
             KernelArg::U32(self.n_expert),
             KernelArg::U32(self.n_used),
         ];
+        if st.act {
+            // One output: the activated intermediate.
+            args.remove(1);
+        }
         let mut launch = LaunchArgs::new(
             Extent3::new(
                 (st.gate_up_blocks)(self.inter),
@@ -557,6 +580,188 @@ pub fn the_nvfp4_step_rows_do_not_depend_on_the_pass(gpu: &Gpu) {
 pub fn the_nvfp4_prompt_columns_do_not_depend_on_the_chunk(gpu: &Gpu) {
     for n_tok in [3, 40, 200] {
         invariant(gpu, &PROMPT, n_tok);
+    }
+}
+
+impl Bank {
+    /// Row `o` of slot `slot` against `x` in the step kernels' exact order:
+    /// lane `l` takes groups `l, l + 32, ...`; a group is its two eight-code
+    /// words, each a fused multiply-add chain from zero over its codes in
+    /// order, the two added, then fused into the lane's sum by the group's
+    /// `e4m3(scale) * global`; the lanes fold by the xor butterfly at 16, 8,
+    /// 4, 2 and 1, and lane 0's value is the row.
+    fn lane_order(&self, slot: usize, o: usize, x: &[f32]) -> f32 {
+        let groups = self.in_dim / 16;
+        let row = slot * self.out_dim + o;
+        let mut lanes = [0f32; 32];
+        for (l, lane) in lanes.iter_mut().enumerate() {
+            let mut acc = 0f32;
+            for g in (l..groups).step_by(32) {
+                let word = |half: usize| {
+                    let at = row * self.in_dim / 2 + g * 8 + half * 4;
+                    let mut s = 0f32;
+                    for j in 0..8 {
+                        let byte = self.codes[at + j / 2];
+                        let code = if j % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                        s = e2m1(code).mul_add(x[g * 16 + half * 8 + j], s);
+                    }
+                    s
+                };
+                let part = word(0) + word(1);
+                let scale = e4m3(self.scales[row * groups + g]) * self.globals[slot];
+                acc = part.mul_add(scale, acc);
+            }
+            *lane = acc;
+        }
+        for offset in [16, 8, 4, 2, 1] {
+            let before = lanes;
+            for (l, lane) in lanes.iter_mut().enumerate() {
+                *lane = before[l] + before[l ^ offset];
+            }
+        }
+        lanes[0]
+    }
+}
+
+/// Asserts `got` holds `want`'s bits, naming the first element that differs.
+fn same_bits(what: &str, got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len(), "{what}: element count");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.to_bits() == w.to_bits(),
+            "{what}: element {i} is {g:e}, expected {w:e}"
+        );
+    }
+}
+
+/// The step stages' rows are, bit for bit, the host restatement of their
+/// order ([`Bank::lane_order`]), at this family's widths over a routing that
+/// shares experts between tokens: the contract that lets a kernel change its
+/// loads, its blocking or its fusion and prove it moved no bit.
+pub fn the_nvfp4_step_rows_are_the_lane_order_bit_for_bit(gpu: &Gpu) {
+    let (hidden, inter, n_expert, n_used, slots) = (2560usize, 640usize, 32usize, 4usize, 8usize);
+    let host = [
+        Bank::new(slots, inter, hidden, 271),
+        Bank::new(slots, inter, hidden, 272),
+        Bank::new(slots, hidden, inter, 273),
+    ];
+    let banks = [
+        host[0].upload(gpu),
+        host[1].upload(gpu),
+        host[2].upload(gpu),
+    ];
+    let map: Vec<u32> = (0..n_expert as u32)
+        .map(|e| (e * 3 + 1) % slots as u32)
+        .collect();
+    let ids: Vec<i32> = vec![3, 7, 11, 30, 7, 2, 3, 19, 30, 7, 5, 12];
+    let n_tok = ids.len() / n_used;
+    let x = signal(n_tok * hidden, 281);
+    let mid = signal(ids.len() * inter, 282);
+    for st in [&STEP] {
+        let [g, u, d] = outputs(
+            gpu,
+            st,
+            &banks,
+            &Case {
+                ids: &ids,
+                map: &map,
+                x: &x,
+                mid: &mid,
+                hidden,
+                inter,
+                n_expert,
+                n_used,
+            },
+        );
+        for (col, &e) in ids.iter().enumerate() {
+            let slot = map[e as usize] as usize;
+            let xr = &x[(col / n_used) * hidden..(col / n_used + 1) * hidden];
+            let mr = &mid[col * inter..(col + 1) * inter];
+            for (what, got, bank, input, width) in [
+                ("gate", &g, &host[0], xr, inter),
+                ("up", &u, &host[1], xr, inter),
+                ("down", &d, &host[2], mr, hidden),
+            ] {
+                let want: Vec<f32> = (0..width)
+                    .map(|o| bank.lane_order(slot, o, input))
+                    .collect();
+                same_bits(
+                    &format!("{} {what} column {col}", st.gate_up),
+                    &got[col * width..(col + 1) * width],
+                    &want,
+                );
+            }
+        }
+    }
+}
+
+/// The activated gate-and-up entry writes, bit for bit, what the activation
+/// launch (`q4e_swiglu_kernel`) writes from the two rows the plain entry
+/// stores, over the same routing as
+/// [`the_nvfp4_step_rows_are_the_lane_order_bit_for_bit`].
+///
+/// # Panics
+///
+/// When an output differs, or the device refuses a launch or a copy.
+pub fn the_activated_gate_up_is_the_activation_of_its_rows(gpu: &Gpu) {
+    let (hidden, inter, n_expert, n_used, slots) = (2560usize, 640usize, 32usize, 4usize, 8usize);
+    let banks = [
+        Bank::new(slots, inter, hidden, 371).upload(gpu),
+        Bank::new(slots, inter, hidden, 372).upload(gpu),
+    ];
+    let map: Vec<u32> = (0..n_expert as u32)
+        .map(|e| (e * 3 + 1) % slots as u32)
+        .collect();
+    let ids: Vec<i32> = vec![3, 7, 11, 30, 7, 2, 3, 19, 30, 7, 5, 12];
+    let n_tok = ids.len() / n_used;
+    let cols = ids.len();
+    let x = gpu.upload(&f32_bytes(&signal(n_tok * hidden, 381)));
+    let route = Route::new(&ids, n_expert).upload(gpu, &map, cols);
+    let n = cols * inter;
+    let og = gpu.upload(&vec![0u8; n * 4]);
+    let ou = gpu.upload(&vec![0u8; n * 4]);
+    let want = gpu.upload(&f32_bytes(&vec![f32::NAN; n]));
+    let got = gpu.upload(&f32_bytes(&vec![f32::NAN; n]));
+    let gate_up = GateUp {
+        out_gate: og.view(),
+        out_up: ou.view(),
+        gate: views(&banks[0]),
+        up: views(&banks[1]),
+        x: x.view(),
+        route: &route,
+        hidden: hidden as u32,
+        inter: inter as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+    };
+    gate_up.launch(gpu, &STEP);
+    run(
+        gpu,
+        KernelRef::new("q4e_moe", "q4e_swiglu_kernel"),
+        &LaunchArgs::new(
+            Extent3::new((n as u32).div_ceil(256), 1, 1),
+            Extent3::linear(256),
+            &[
+                KernelArg::Buffer(want.view()),
+                KernelArg::Buffer(og.view()),
+                KernelArg::Buffer(ou.view()),
+                KernelArg::U64(n as u64),
+            ],
+        ),
+    );
+    drain(gpu);
+    let want = gpu.read_f32(&want);
+    for st in [&STEP_ACT, &STEP_ACT_HELD] {
+        gpu.device()
+            .copy_h2d(got.view(), &f32_bytes(&vec![f32::NAN; n]))
+            .expect("host-to-device copy");
+        GateUp {
+            out_gate: got.view(),
+            ..gate_up
+        }
+        .launch(gpu, st);
+        drain(gpu);
+        same_bits(st.gate_up, &gpu.read_f32(&got), &want);
     }
 }
 
@@ -877,6 +1082,19 @@ fn bench_stage(gpu: &Gpu, st: Stages, stage: Stage, n_tok: u32, routings: u64) -
             })
         }
     }
+}
+
+/// The activated step gate-and-up stage at one decode token.
+pub(crate) fn bench_step_gate_up_act_t1(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, STEP_ACT, Stage::GateUp, 1, BENCH_STEP_ROUTINGS)
+}
+/// The activated step gate-and-up stage over a five-token verify.
+pub(crate) fn bench_step_gate_up_act_t5(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, STEP_ACT, Stage::GateUp, 5, BENCH_STEP_ROUTINGS)
+}
+/// The held activated step gate-and-up stage over a five-token verify.
+pub(crate) fn bench_step_gate_up_act_held_t5(gpu: &Gpu) -> Fixture {
+    bench_stage(gpu, STEP_ACT_HELD, Stage::GateUp, 5, BENCH_STEP_ROUTINGS)
 }
 
 /// The step gate-and-up stage at one decode token.

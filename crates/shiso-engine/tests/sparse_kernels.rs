@@ -95,6 +95,7 @@ const GPU: Device = Device {
     role: PassRole::Step,
     prompt_matmul: matmul::PromptMatmul::Rows,
     prefill_activations: matmul::PrefillActivations::A16,
+    route_sort: matmul::RouteSort::Tiny,
 };
 
 fn half(in_dim: u32, out_dim: u32) -> WeightDesc {
@@ -598,6 +599,11 @@ fn every_path() -> Plan {
             .expect("a W4A4 routed stage"),
     );
     plan.append(moe::combine_lowp(&shape, 333));
+    // The MXFP8 group launches: a recurrent layer's four input projections,
+    // attention's query, key, value and indexer key, and the shared expert's
+    // pair, at a decode row, a verify, a batched verify's passes and (the
+    // separate tensor-core launches) a prompt chunk.
+    plan.append(mxfp8_groups(&shape, prompt));
     plan.launch(
         kernels::Entry::plain(kernels::MOD_MISC, "q4e_argmax_rows_kernel"),
         kernels::argmax_rows(9),
@@ -608,6 +614,135 @@ fn every_path() -> Plan {
         ]),
     );
     plan
+}
+
+/// The block planners over MXFP8 projection weights, where the projections
+/// of one input share group launches.
+fn mxfp8_groups(shape: &SparseShape, prompt: Device) -> Plan {
+    let mx = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::Mxfp8E4M3G32, in_dim, out_dim);
+    let recurrent = mxfp8_recurrent(shape);
+    let attn = AttnDesc {
+        q: mx(shape.hidden, 2 * shape.q_dim()),
+        k: mx(shape.hidden, shape.kv_dim()),
+        v: mx(shape.hidden, shape.kv_dim()),
+        output: mx(shape.q_dim(), shape.hidden),
+        indexer: IndexerDesc {
+            q: mx(shape.hidden, shape.indexer_q_dim()),
+            k: mx(shape.hidden, shape.indexer.head_dim),
+        },
+    };
+    let inter = shape.moe.intermediate;
+    let experts = ExpertDesc {
+        shared_gate: mx(shape.hidden, inter),
+        shared_up: mx(shape.hidden, inter),
+        shared_down: mx(inter, shape.hidden),
+        ..expert_desc(shape)
+    };
+    let mut plan = Plan::new();
+    for (rows, device) in [(1_u32, GPU), (5, GPU), (20, GPU), (333, prompt)] {
+        plan.append(
+            recurrent::block(
+                shape,
+                &recurrent,
+                LayerRef::target(0),
+                0,
+                Recurrence {
+                    chunk: ChunkPolicy::new(),
+                    spec: SpecDepth::new(4),
+                    origin: RowOrigin::Sequential,
+                },
+                rows,
+                device,
+            )
+            .expect("an MXFP8 recurrent block has a tier"),
+        );
+        plan.append(
+            qsa::block(shape, &attn, SLOT, AttnContext::default(), rows, device)
+                .expect("an MXFP8 attention block has a tier"),
+        );
+        plan.append(
+            moe::shared_expert(shape, &experts, LayerRef::target(0), rows, device)
+                .expect("an MXFP8 shared expert has a tier"),
+        );
+        // The NVFP4 routed stages beside it: the activated gate and up on a
+        // step (the one activation launch left is the shared expert's), the
+        // tensor-core tiles and the activation launch on a prompt.
+        let nv = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::Nvfp4Gs16, in_dim, out_dim);
+        let routed = ExpertDesc {
+            gate: nv(shape.hidden, inter),
+            up: nv(shape.hidden, inter),
+            down: nv(inter, shape.hidden),
+            ..experts
+        };
+        let block = moe::block(shape, &routed, LayerRef::target(0), rows, device)
+            .expect("an NVFP4 routed block has a tier");
+        if device.row_invariant() {
+            assert!(block.launches("q4e_nvfp4_experts_gemm_gate_up_kernel"));
+        } else {
+            assert!(
+                block.launches(if rows == 1 {
+                    "q4e_nvfp4_experts_gate_up_act_kernel"
+                } else {
+                    "q4e_nvfp4_experts_gate_up_act_held_kernel"
+                }) && block.count("q4e_swiglu_kernel") == 1,
+                "a step's routed activation rides on gate and up: {:?}",
+                block.names()
+            );
+            // The shared expert forks off beside the router and the routed
+            // stages, and joins before its gate logit.
+            let names = block.names();
+            let at = |what: &str| names.iter().position(|n| *n == what);
+            assert!(
+                at("fork") < at("q4e_swiglu_kernel")
+                    && at("q4e_swiglu_kernel") < at("resume")
+                    && at("resume") < at("fetch routed experts")
+                    && at("q4e_moe_combine_kernel") < at("join")
+                    && at("join") < at("q4e_shared_add_kernel")
+                    && at("fork").is_some(),
+                "{names:?}"
+            );
+        }
+        plan.append(block);
+    }
+    plan
+}
+
+/// A recurrent layer whose five projections are MXFP8.
+fn mxfp8_recurrent(shape: &SparseShape) -> RecurrentDesc {
+    let mx = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::Mxfp8E4M3G32, in_dim, out_dim);
+    RecurrentDesc {
+        qkv: mx(shape.hidden, shape.gdn_in_dim()),
+        gate: mx(shape.hidden, shape.gdn_v_dim()),
+        alpha: mx(shape.hidden, shape.gdn.v_heads),
+        beta: mx(shape.hidden, shape.gdn.v_heads),
+        out: mx(shape.gdn_v_dim(), shape.hidden),
+    }
+}
+
+#[test]
+fn a_recurrent_decode_row_projects_its_mxfp8_input_in_one_launch() {
+    let shape = shape();
+    let decode = recurrent::block(
+        &shape,
+        &mxfp8_recurrent(&shape),
+        LayerRef::target(0),
+        0,
+        Recurrence::default(),
+        1,
+        GPU,
+    )
+    .expect("an MXFP8 recurrent decode row has a tier");
+    assert_eq!(
+        (
+            decode.count("q4e_mxfp8_gemv_group_kernel"),
+            decode.count("q4e_mxfp8_gemv_kernel"),
+            decode.count("q4e_mxfp8_gemv_narrow_kernel"),
+        ),
+        (1, 1, 0),
+        "a recurrent decode row projects its input in one group launch and its \
+         output in one more: {:?}",
+        decode.names()
+    );
 }
 
 /// The kernel set's own name table.
@@ -947,6 +1082,7 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "../q4e_lowp/nvfp4_a4.cu",
         "../q4e_lowp/mxfp8_a8.cu",
         "bf16.cu",
+        "modelopt.cu",
     ] {
         let path = dir.join(unit);
         let text = std::fs::read_to_string(&path)
@@ -1181,6 +1317,9 @@ fn every_launch_binds_exactly_the_parameters_its_kernel_declares() {
         "q4e_nvfp4_a4_gate_up_kernel",
         "q4e_nvfp4_a4_down_kernel",
         "q4e_nvfp4_a4_combine_kernel",
+        "q4e_mxfp8_gemv_group_kernel",
+        "q4e_mxfp8_gemv_group_narrow_kernel",
+        "q4e_mxfp8_rows_group_kernel",
     ] {
         assert!(seen.contains(entry), "{entry} was never bound: {seen:?}");
     }

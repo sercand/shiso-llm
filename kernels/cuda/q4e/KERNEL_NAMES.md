@@ -34,7 +34,7 @@ back to the kernel it belongs to.
 | Registry key | Unit | Plain entries | Template instantiations |
 |---|---|---|---|
 | `q4e_hc` | `hc.cu` | 3 | 6 |
-| `q4e_moe` | `moe.cu` | 8 | 4 |
+| `q4e_moe` | `moe.cu` | 9 | 4 |
 | `q4e_gdn` | `gdn.cu` | 8 | 0 |
 | `q4e_gdn_tc` | `gdn_tc.cu` | 4 | 0 |
 | `q4e_ple` | `ple.cu` | 5 | 0 |
@@ -44,13 +44,13 @@ back to the kernel it belongs to.
 | `q4e_idx` | `idx.cu` | 8 | 0 |
 | `q4e_misc` | `misc.cu` | 3 | 0 |
 | `q4e_embed` | `embed.cu` | 4 | 0 |
-| `q4e_modelopt` | `modelopt.cu` | 7 | 0 |
+| `q4e_modelopt` | `modelopt.cu` | 9 | 0 |
 | `q4e_exact` | `exact.cu` | 2 | 0 |
 | `q4e_kv8` | `kv8.cu` | 8 | 0 |
-| `q4e_mxfp8` | `mxfp8.cu` | 5 | 0 |
+| `q4e_mxfp8` | `mxfp8.cu` | 9 | 0 |
 | `q4e_idxring` | `idxring.cu` | 1 | 0 |
 | `q4e_bf16` | `bf16.cu` | 5 | 0 |
-| **total** | 17 units | **88** | **105** |
+| **total** | 17 units | **95** | **105** |
 
 ## Plain entries, by module
 
@@ -67,6 +67,10 @@ Not an upstream unit: this repository's own NVFP4 routed stages and FP8 and NVFP
 n-gram decode, for the `modelopt` export.
 
 - `q4e_nvfp4_experts_gate_up_kernel`
+- `q4e_nvfp4_experts_gate_up_act_kernel` - the same rows, each column's
+  `silu(gate) * up` stored as `q4e_swiglu_kernel` would compute it.
+- `q4e_nvfp4_experts_gate_up_act_held_kernel` - the same activated rows, a
+  2560-wide row held in registers across an expert's columns (a verify).
 - `q4e_nvfp4_experts_down_kernel`
 - `q4e_nvfp4_experts_gemm_gate_up_kernel`
 - `q4e_nvfp4_experts_gemm_down_kernel`
@@ -124,6 +128,20 @@ list for all five: `out, codes, scales, x, in_dim, out_dim, rows`.
 - `q4e_mxfp8_gemm_kernel` - a prompt chunk on tensor cores, 128 x 128 tiles,
   one scale group a contraction step, activations rounded to halves.
 
+The group entries take up to four matrices that read one activation, each
+writing its own output, in one grid whose blocks each own rows of one matrix:
+`out0, codes0, scales0, out_dim0` for slots 0 to 3 (an unused slot has
+`out_dim` 0), then `x, in_dim, rows`. A row of every matrix is summed exactly
+as the single-matrix entries sum it.
+
+- `q4e_mxfp8_gemv_group_kernel` - one activation row, two output rows a warp.
+- `q4e_mxfp8_gemv_group_narrow_kernel` - one activation row, one output row a
+  warp with the next chunk's codes in flight, for groups of at most 4096 rows.
+- `q4e_mxfp8_rows_group_kernel` - two to eight activation rows, four output
+  rows a warp.
+- `q4e_mxfp8_rows_group_narrow_kernel` - two to eight activation rows, one
+  output row a warp, for groups of at most 1024 rows.
+
 ### `q4e_idxring`
 
 Not an upstream unit: the indexer's pooled key pass over a per-session ring of
@@ -158,6 +176,8 @@ kernels take `out, w, x, in_dim, out_dim, rows`.
 
 - `q4e_moe_route_kernel`
 - `q4e_moe_route_sort_small_kernel`
+- `q4e_moe_route_sort_tiny_kernel` - the small kernel's results for at most
+  eight tokens, at a shorter serial chain.
 - `q4e_swiglu_kernel`
 - `q4e_moe_combine_kernel`
 - `q4e_shared_add_kernel`
@@ -494,6 +514,7 @@ refuses the call outright when `n_embd > 256 * Q4E_HC_FUSE_MAX`.
 |---|---|---|---|
 | `q4e_moe_route_kernel` | `n_tok` | `256` | `n_expert * 4` |
 | `q4e_moe_route_sort_small_kernel` | `1` | `1024` | `0` |
+| `q4e_moe_route_sort_tiny_kernel` | `1` | `256` | `0` |
 | `q4e_swiglu_kernel` | `ceil(n / 256)` | `256` | `0` |
 | `q4e_moe_combine_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
 | `q4e_shared_add_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |

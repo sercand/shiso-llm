@@ -749,17 +749,41 @@ pub fn block(
 ) -> CoreResult<Plan> {
     let at = |role: Role| WeightRef::layer(slot.layer, role);
     let mut plan = Plan::new();
-    matmul::project(
-        &mut plan,
+    let mixed = Operand::Scratch(Buf::Mixed);
+    let query = (
         desc.q,
         Bound::new(
             at(Role::AttnQuery),
-            Operand::Scratch(Buf::Mixed),
+            mixed,
             Operand::Scratch(Buf::AttnQueryFull),
         ),
-        n_tok,
-        device,
-    )?;
+    );
+    let key = (
+        desc.k,
+        Bound::new(at(Role::AttnKey), mixed, Operand::Scratch(Buf::AttnKey)),
+    );
+    let value = (
+        desc.v,
+        Bound::new(at(Role::AttnValue), mixed, Operand::Scratch(Buf::AttnValue)),
+    );
+    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx).with_tap(ctx.ring_tap);
+    // On a step or verify pass of MXFP8 weights the block input's projections
+    // - query, key, value and, outside a segmented pass (whose store runs
+    // per run), the indexer key - are one group launch: the same sums, the
+    // input read once. Elsewhere each keeps its place in the chain.
+    let grouped = matmul::groups(&[desc.q, desc.k, desc.v], device);
+    let index_grouped = grouped
+        && !matches!(ctx.origin, RowOrigin::Segmented(_))
+        && matmul::groups(&[desc.q, desc.indexer.k], device);
+    if grouped {
+        let mut members = vec![query, key, value];
+        if index_grouped {
+            members.push(indexer::key_projection(&desc.indexer, indexed));
+        }
+        matmul::project_group(&mut plan, &members, n_tok, device)?;
+    } else {
+        matmul::project(&mut plan, query.0, query.1, n_tok, device)?;
+    }
     plan.launch(
         Entry::plain(MOD_QSA, "q4e_qsa_q_norm_rope_kernel"),
         kernels::qsa_q_norm_rope(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
@@ -782,28 +806,10 @@ pub fn block(
             Operand::f32(shape.rms_eps),
         ]),
     );
-    matmul::project(
-        &mut plan,
-        desc.k,
-        Bound::new(
-            at(Role::AttnKey),
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::AttnKey),
-        ),
-        n_tok,
-        device,
-    )?;
-    matmul::project(
-        &mut plan,
-        desc.v,
-        Bound::new(
-            at(Role::AttnValue),
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::AttnValue),
-        ),
-        n_tok,
-        device,
-    )?;
+    if !grouped {
+        matmul::project(&mut plan, key.0, key.1, n_tok, device)?;
+        matmul::project(&mut plan, value.0, value.1, n_tok, device)?;
+    }
     // The batched store is the scalar one with `pages` replaced by the per-row
     // array; every other parameter, and the grid, is the same.
     let batched = ctx.origin == RowOrigin::Unrelated;
@@ -854,15 +860,11 @@ pub fn block(
             Operand::f32(shape.rms_eps),
         ]),
     );
-    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx).with_tap(ctx.ring_tap);
-    plan.append(indexer::store(
-        shape,
-        &desc.indexer,
-        indexed,
-        ctx.origin,
-        n_tok,
-        device,
-    )?);
+    plan.append(if index_grouped {
+        indexer::store_projected(shape, indexed, ctx.origin, n_tok)
+    } else {
+        indexer::store(shape, &desc.indexer, indexed, ctx.origin, n_tok, device)?
+    });
     let scorer = Scorer::choose(shape.indexer.heads, ctx.tensor_core);
     if batched {
         // Each row of a batch is attended exactly as a single-row step of its

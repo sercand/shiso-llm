@@ -72,6 +72,20 @@ fn the_nvfp4_step_rows_do_not_depend_on_the_pass() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
+fn the_nvfp4_step_rows_are_the_lane_order_bit_for_bit() {
+    let Some(gpu) = open() else { return };
+    nvfp4::the_nvfp4_step_rows_are_the_lane_order_bit_for_bit(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_activated_gate_up_is_the_activation_of_its_rows() {
+    let Some(gpu) = open() else { return };
+    nvfp4::the_activated_gate_up_is_the_activation_of_its_rows(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
 fn the_nvfp4_prompt_columns_do_not_depend_on_the_chunk() {
     let Some(gpu) = open() else { return };
     nvfp4::the_nvfp4_prompt_columns_do_not_depend_on_the_chunk(&gpu);

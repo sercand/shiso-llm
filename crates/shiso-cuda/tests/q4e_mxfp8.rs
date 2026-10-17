@@ -57,6 +57,13 @@ fn a_verify_row_reproduces_the_single_row_step() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
+fn a_group_launch_is_its_separate_launches_bit_for_bit() {
+    let Some(gpu) = open() else { return };
+    mxfp8::a_group_launch_is_its_separate_launches_bit_for_bit(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
 #[expect(
     clippy::print_stderr,
     reason = "the measured error is the number the case's tolerance is justified by"
