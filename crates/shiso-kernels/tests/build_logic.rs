@@ -174,6 +174,7 @@ fn the_real_manifest_tree_parses() {
             "mmq",
             "mmq_d2r",
             "mmvq",
+            "q4e_bf16",
             "q4e_embed",
             "q4e_exact",
             "q4e_gdn",

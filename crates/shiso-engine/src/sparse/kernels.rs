@@ -88,6 +88,12 @@ pub const MOD_KV8: &str = "q4e_kv8";
 /// weight, and the tensor-core prompt kernel. Not an upstream unit, for the
 /// reason [`MOD_MODELOPT`] is not.
 pub const MOD_MXFP8: &str = "q4e_mxfp8";
+/// Dense projections over a brain-float weight, read as stored, on a device
+/// with tensor cores: split step kernels that sum a row one way whatever the
+/// pass width, and the tensor-core prompt GEMM. Not an upstream unit, for the
+/// reason [`MOD_MODELOPT`] is not; the ported brain-float kernel in
+/// [`MOD_MATVEC`] is what a kernel set without this module keeps.
+pub const MOD_BF16: &str = "q4e_bf16";
 /// The logits stages run before any pick: today, the suppress stage.
 pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a

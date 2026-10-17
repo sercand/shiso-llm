@@ -25,7 +25,10 @@
 # attention reader of the K and V planes again, over a cache of FP8 E4M3 bytes
 # instead of f16, selected by `--kv-cache-dtype fp8`. `mxfp8` is a fourth: the
 # dense projections over an MXFP8 weight, read as stored, again this
-# repository's own.
+# repository's own. `bf16` is a fifth: the dense projections over a
+# brain-float weight on a device with tensor cores - split step kernels and a
+# tensor-core prompt GEMM - beside the ported `matvec` kernel it replaces
+# there.
 
 [build]
 sources = [
@@ -44,6 +47,7 @@ sources = [
     "exact.cu",
     "kv8.cu",
     "mxfp8.cu",
+    "bf16.cu",
 ]
 
 # Every unit includes `q4e.cuh` by bare name, and that header reaches its own
@@ -92,3 +96,4 @@ modelopt = "q4e_modelopt"
 exact = "q4e_exact"
 kv8 = "q4e_kv8"
 mxfp8 = "q4e_mxfp8"
+bf16 = "q4e_bf16"

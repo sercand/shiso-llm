@@ -48,7 +48,8 @@ back to the kernel it belongs to.
 | `q4e_exact` | `exact.cu` | 2 | 0 |
 | `q4e_kv8` | `kv8.cu` | 8 | 0 |
 | `q4e_mxfp8` | `mxfp8.cu` | 5 | 0 |
-| **total** | 15 units | **82** | **105** |
+| `q4e_bf16` | `bf16.cu` | 5 | 0 |
+| **total** | 16 units | **87** | **105** |
 
 ## Plain entries, by module
 
@@ -121,6 +122,25 @@ list for all five: `out, codes, scales, x, in_dim, out_dim, rows`.
   outputs of at most 1024 rows.
 - `q4e_mxfp8_gemm_kernel` - a prompt chunk on tensor cores, 128 x 128 tiles,
   one scale group a contraction step, activations rounded to halves.
+
+### `q4e_bf16`
+
+Not an upstream unit: this repository's own dense projections over a
+brain-float weight, read as stored. The step kernels take
+`out, w, x, in_dim, out_dim, splits, rows` (each output row's contraction
+sliced across `splits` warps of one block and folded there); the prompt
+kernels take `out, w, x, in_dim, out_dim, rows`.
+
+- `q4e_bf16_gemv_kernel` - one activation row, one output row a warp, eight
+  contiguous weights a lane a step.
+- `q4e_bf16_rows_kernel` - two to eight activation rows, each summed as the
+  one-row kernel sums it; two output rows a warp.
+- `q4e_bf16_rows_wide_kernel` - nine to thirty-two rows, the same sums; four
+  output rows a warp.
+- `q4e_bf16_gemm_kernel` - a prompt chunk on tensor cores, 128 x 128 tiles,
+  activations rounded to brain floats.
+- `q4e_bf16_gemm_split_kernel` - the same with each activation carried as two
+  brain floats, for the narrow projections.
 
 ### `q4e_moe`
 

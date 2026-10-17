@@ -14,6 +14,7 @@
 //! does.
 
 pub mod affine;
+pub mod bf16;
 pub mod fp8;
 pub mod gdn;
 pub mod hc;

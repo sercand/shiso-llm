@@ -209,6 +209,36 @@ fn every_path() -> Plan {
         )
         .expect("a packed half-precision weight has a tier at every row count");
     }
+    // The brain-float module of a tensor-core device at every rung: the three
+    // step kernels with and without a split, both prompt GEMMs.
+    let tensor = Device {
+        prompt_matmul: matmul::PromptMatmul::Tensor,
+        ..GPU
+    };
+    let prompt = Device {
+        role: PassRole::Prompt { snapshot: None },
+        ..tensor
+    };
+    for (in_dim, out_dim, rows, device) in [
+        (shape.stream_dim(), shape.stream_rank, 1_u32, tensor),
+        (shape.hidden, shape.moe.experts, 5, tensor),
+        (shape.hidden, shape.stream_dim(), 20, tensor),
+        (shape.stream_dim(), shape.stream_rank, 512, prompt),
+        (shape.hidden, shape.moe.experts, 512, prompt),
+    ] {
+        matmul::project(
+            &mut plan,
+            WeightDesc::new(DType::BF16, in_dim, out_dim),
+            Bound::new(
+                WeightRef::layer(LayerRef::target(0), Role::Router),
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(Buf::MoeRouter),
+            ),
+            rows,
+            device,
+        )
+        .expect("a brain-float weight has a tier at every row count");
+    }
     plan.append(hyper::init(&shape, 1));
     plan.append(hyper::init_add(
         &shape,
@@ -882,6 +912,7 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "exact.cu",
         "kv8.cu",
         "mxfp8.cu",
+        "bf16.cu",
     ] {
         let path = dir.join(unit);
         let text = std::fs::read_to_string(&path)
