@@ -23,6 +23,7 @@ use std::sync::Arc;
 use shiso_core::Backend;
 use shiso_vision::generator::ImageGenError;
 
+use super::pipeline_tests::{forge_vae, vae_layout};
 use super::vae::Vae;
 use crate::diffusion::ops::Ops;
 use crate::diffusion::weights::StStore;
@@ -318,4 +319,56 @@ fn a_file_missing_a_decoder_tensor_is_refused_naming_it() {
         }
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     }
+}
+
+/// The real autoencoder's widths (128 base channels, 84M weights) with seeded
+/// weights, at the picture size a default job uses: it must decode a
+/// 1024x1024 latent and encode a 1024x1024 reference without failing, and
+/// reports how long each takes. The weights mean nothing, so this grades
+/// that the shapes, the mid-block attention at 16384 positions and the
+/// memory plan work at full size - not the picture.
+#[test]
+#[ignore = "requires a Metal device"]
+#[expect(
+    clippy::print_stderr,
+    reason = "the measured times are the case's report"
+)]
+fn a_full_width_autoencoder_decodes_and_encodes_1024() {
+    let Some(backend) = device() else { return };
+    let ops = Ops::new(&backend).expect("the diffusion kernel set");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ae.safetensors");
+    forge_vae(&path, 128);
+    let names: BTreeSet<String> = vae_layout(128).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(
+        names,
+        expected_names(),
+        "the forged full-width layout has the reference's names"
+    );
+    let vae = Vae::load(&path, &ops).expect("loads");
+    let weight_bytes = Vae::weight_bytes(&path).expect("sizes");
+    let estimate = Vae::working_set_bytes(vae.full_resolution_channels(), 1024 * 1024);
+    let latent: Vec<f32> = (0..64 * 64 * 128)
+        .map(|i| (((i * 2_654_435_761_usize) >> 7) % 2001) as f32 / 1000.0 - 1.0)
+        .collect();
+    let began = std::time::Instant::now();
+    let picture = vae
+        .decode(&ops, &latent, 1024, 1024)
+        .expect("decodes 1024x1024");
+    let decode = began.elapsed().as_secs_f64();
+    assert_eq!(picture.len(), 3 * 1024 * 1024);
+    let planar: Vec<f32> = picture.iter().map(|v| v / 127.5 - 1.0).collect();
+    let began = std::time::Instant::now();
+    let tokens = vae
+        .encode(&ops, &planar, 1024, 1024)
+        .expect("encodes 1024x1024");
+    let encode = began.elapsed().as_secs_f64();
+    assert_eq!(tokens.len(), 64 * 64 * 128);
+    assert!(tokens.iter().all(|v| v.is_finite()));
+    eprintln!(
+        "full-width VAE: weights {:.0} MB, working-set estimate {:.2} GB, 1024x1024 decode \
+         {decode:.1}s, encode {encode:.1}s",
+        weight_bytes as f64 / 1e6,
+        estimate as f64 / 1e9
+    );
 }

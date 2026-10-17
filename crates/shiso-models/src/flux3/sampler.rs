@@ -8,7 +8,7 @@
 //!
 //! [`run_euler`] is the loop the pipeline runs, parameterised over the
 //! velocity so a test can drive it with a function it can integrate by hand;
-//! [`euler_host`] is its host twin.
+//! `euler_host` is its host twin.
 
 use half::bf16;
 use shiso_core::ids::Seed;

@@ -18,7 +18,7 @@
 //! The reference implementation crops a single reference's output back to
 //! the fitted box when the caller named no size; here that is the case where
 //! the job's size equals the reference's canvas (what an omitted size
-//! becomes once [`default_size`](super::reference::default_size) has run), so
+//! becomes once [`default_size_for_references`](super::default_size_for_references) has run), so
 //! an edit generated at the canvas size comes back at the reference's own
 //! size, which need not sit on the 16-pixel grid.
 //!

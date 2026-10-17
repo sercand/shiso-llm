@@ -91,9 +91,9 @@ fn forge_dit(path: &Path) {
 }
 
 /// The tiny autoencoder's tensors: base width 32, levels `(1, 2, 4, 4)`.
-fn vae_layout() -> Vec<(String, Vec<u64>)> {
-    const BASE: u64 = 32;
-    let widths = [BASE, 2 * BASE, 4 * BASE, 4 * BASE];
+pub(super) fn vae_layout(base: u64) -> Vec<(String, Vec<u64>)> {
+    let base_width = base;
+    let widths = [base_width, 2 * base_width, 4 * base_width, 4 * base_width];
     let mut out: Vec<(String, Vec<u64>)> = Vec::new();
     let conv = |name: String, o: u64, i: u64, k: u64, out: &mut Vec<(String, Vec<u64>)>| {
         out.push((format!("{name}.weight"), vec![o, i, k, k]));
@@ -120,8 +120,8 @@ fn vae_layout() -> Vec<(String, Vec<u64>)> {
             conv(format!("{base}.attn_1.{part}"), c, c, 1, out);
         }
     };
-    conv("encoder.conv_in".into(), BASE, 3, 3, &mut out);
-    let mut block_in = BASE;
+    conv("encoder.conv_in".into(), base_width, 3, 3, &mut out);
+    let mut block_in = base_width;
     for (level, &w) in widths.iter().enumerate() {
         for block in 0..2 {
             resnet(
@@ -177,9 +177,9 @@ fn vae_layout() -> Vec<(String, Vec<u64>)> {
     out
 }
 
-fn forge_vae(path: &Path) {
+pub(super) fn forge_vae(path: &Path, base: u64) {
     let mut noise = Noise(5);
-    let tensors: Vec<_> = vae_layout()
+    let tensors: Vec<_> = vae_layout(base)
         .into_iter()
         .map(|(name, shape)| {
             let count: u64 = shape.iter().product();
@@ -217,7 +217,7 @@ pub(super) fn forge_tiny(residency: ImageResidency) -> Tiny {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     forge_dit(&root.join("dit.safetensors"));
-    forge_vae(&root.join("ae.safetensors"));
+    forge_vae(&root.join("ae.safetensors"), 32);
     let text = root.join("text_encoder");
     std::fs::create_dir(&text).expect("mkdir");
     write_decoder_sized(&text, "model.language_model.", 32, 2560);
@@ -289,10 +289,10 @@ fn open(tiny: &Tiny, backend: &Arc<dyn Backend>) -> Arc<dyn ImageGenerator> {
 #[test]
 fn the_forged_autoencoder_has_the_reference_tensor_names() {
     use std::collections::BTreeSet;
-    let have: BTreeSet<String> = vae_layout().into_iter().map(|(n, _)| n).collect();
+    let have: BTreeSet<String> = vae_layout(32).into_iter().map(|(n, _)| n).collect();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("ae.safetensors");
-    forge_vae(&path);
+    forge_vae(&path, 32);
     let store = crate::diffusion::weights::StStore::open(&path).expect("opens");
     let on_disk: BTreeSet<String> = store.names().map(str::to_owned).collect();
     assert_eq!(have, on_disk);

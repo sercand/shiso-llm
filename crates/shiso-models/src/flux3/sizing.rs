@@ -1,7 +1,7 @@
 //! What a FLUX.3 job needs from the device, and whether it fits.
 //!
 //! The numbers are estimates from shapes, not measurements: they feed
-//! [`plan`](crate::diffusion::residency::plan), which decides whether the
+//! [`plan`], which decides whether the
 //! text encoder and the transformer stay loaded together or take turns, and
 //! refuses a job whose largest phase fits no residency. They err high, so a
 //! job is refused with a named largest side rather than failing an

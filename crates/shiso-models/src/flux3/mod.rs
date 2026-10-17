@@ -8,8 +8,8 @@
 //! off the checkpoint's tensors and refuses a checkpoint whose shapes do not
 //! match what the kernels were built for, naming the tensor.
 //!
-//! [`pipeline`] composes them; [`vae`] is the autoencoder, [`reference`] prepares edit
-//! pictures and [`sampler`] is the Euler walk.
+//! `pipeline` composes them; `vae` is the autoencoder, `reference` prepares edit
+//! pictures and `sampler` is the Euler walk.
 //!
 //! [`config`] locates a checkpoint and inspects its headers; the helper
 //! modules hold the pure parts (schedule, ids, token packing) that can be

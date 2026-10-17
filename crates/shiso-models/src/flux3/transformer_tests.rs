@@ -672,3 +672,75 @@ fn the_real_export_loads_and_runs_a_step() {
         "the velocity is finite"
     );
 }
+
+/// How long one step takes at the sizes a real job runs, on the real
+/// export's shapes and quant formats: 1024x1024 (4096 image rows) with an
+/// 80-row prompt, then with one 4096-row reference. Kernel time does not
+/// depend on the weight values, so a header-only copy (zero payload) answers;
+/// with real weights it answers the same. The first step is not timed (it
+/// pays the weights' first touch).
+#[test]
+#[ignore = "requires a Metal device and SHISO_TEST_MODEL_FLUX3"]
+#[expect(
+    clippy::print_stderr,
+    reason = "the measured step times are the case's report, and a skip must say why"
+)]
+fn the_real_export_step_time_at_1024() {
+    let Some(path) = std::env::var_os("SHISO_TEST_MODEL_FLUX3").map(PathBuf::from) else {
+        eprintln!("SKIP the_real_export_step_time_at_1024: SHISO_TEST_MODEL_FLUX3 is unset");
+        return;
+    };
+    let Some(backend) = device() else { return };
+    let ops = Ops::new(&backend).expect("the diffusion kernel set");
+    let store = StStore::open(&path).expect("the export opens");
+    let params = super::config::inspect(&store).expect("the export inspects");
+    let dit = DiT::load(&store, &ops, &params).expect("loads");
+    let up = |rows: usize, width: usize| {
+        let values: Vec<f32> = (0..rows * width)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
+            .collect();
+        ops.upload_f32("input", &values).expect("uploads")
+    };
+    let ids = |rows: usize| {
+        let values: Vec<f32> = (0..rows * 4).map(|i| (i % 64) as f32 * 0.5).collect();
+        ops.upload_f32("ids", &values).expect("uploads")
+    };
+    let text_rows = 80usize;
+    let text = up(text_rows, params.txt_in);
+    let text_ids = ids(text_rows);
+    for cond_rows in [0usize, 4096] {
+        let image_rows = 4096usize;
+        let (image, image_ids) = (up(image_rows, 128), ids(image_rows));
+        let (cond, cond_ids) = (up(cond_rows.max(1), 128), ids(cond_rows.max(1)));
+        let mut times = Vec::new();
+        for _ in 0..3 {
+            let began = std::time::Instant::now();
+            let out = dit
+                .forward(
+                    &ops,
+                    &DiTInput {
+                        image: image.view(),
+                        image_cond: (cond_rows > 0).then(|| cond.view()),
+                        text: text.view(),
+                        image_rows,
+                        cond_rows,
+                        text_rows,
+                        t: 0.9,
+                        t_ref: 0.8,
+                        image_ids: image_ids.view(),
+                        cond_ids: (cond_rows > 0).then(|| cond_ids.view()),
+                        text_ids: text_ids.view(),
+                    },
+                )
+                .expect("a step runs");
+            backend.sync().expect("drains");
+            drop(out);
+            times.push(began.elapsed().as_secs_f64());
+        }
+        ops.trim_pool();
+        eprintln!(
+            "real-export step at 1024x1024, {cond_rows} reference rows: first {:.2}s, then {:.2}s and {:.2}s",
+            times[0], times[1], times[2]
+        );
+    }
+}
