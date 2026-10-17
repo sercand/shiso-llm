@@ -875,16 +875,23 @@ fn the_real_export_block_profile_at_1024() {
         backend.sync().expect("drains");
     };
     run();
-    let began = std::time::Instant::now();
-    run();
-    let batched = began.elapsed().as_secs_f64();
+    let mut times: Vec<f64> = (0..5)
+        .map(|_| {
+            let began = std::time::Instant::now();
+            run();
+            began.elapsed().as_secs_f64() * 1e3 / blocks as f64
+        })
+        .collect();
+    times.sort_by(f64::total_cmp);
     let profiler = backend.as_profiler().expect("the Metal backend profiles");
     let region = shiso_core::ProfileRegion::open(profiler).expect("opens");
     run();
     let report = region.finish().expect("finishes");
     eprintln!(
-        "{blocks} single blocks batched {batched:.3}s ({:.1} ms per block)\n{}",
-        batched * 1e3 / blocks as f64,
+        "{blocks} single blocks batched, ms per block over 5 runs: median {:.1}, min {:.1}, max {:.1}\n{}",
+        times[2],
+        times[0],
+        times[4],
         report.table(30)
     );
 }
