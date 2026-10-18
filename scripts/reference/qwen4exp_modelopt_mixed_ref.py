@@ -46,6 +46,7 @@ Run inside the reference container (transformers 5.19), see `--help`:
     greedy     GPU: 64 greedy ids after the first case's prompt, as JSON
     mtp        CPU: the draft head (mtp.*) teacher-forced over a few prompts,
                its top-16 per position beside the target's own pick
+    mtp-precision  CPU: that fixture's bf16 head against the same head in f32
 
 Helpers shared with the FP8 reference are imported from `qwen4exp_fp8_ref.py`
 by path, so this runs under `python3 -I`.
@@ -1414,6 +1415,53 @@ def cmd_mtp(args) -> None:
         f"{ {r['name']: round(r['p1'], 3) for r in records} }")
 
 
+def cmd_mtp_precision(args) -> None:
+    """The recorded brain-float head against the same head in single precision.
+
+    Reads the target rows a `mtp` fixture recorded (no target pass), runs the
+    head twice - bf16 as recorded, then every dense tensor, expert and the
+    embedding widened to f32 - and prints top-1 agreement, both heads' p1 and
+    the relative L2 of every stage at the probe positions: the size of the
+    reference's own rounding, which is the yardstick for another
+    implementation's stage errors.
+    """
+    fx_path = Path(args.fixture).resolve()
+    fx = json.loads(fx_path.read_text())
+    guard(args.min_start_gib, gpu=False)
+    # One target layer: only the embedding and the head are read.
+    ref = Reference(Path(args.checkpoint), "cpu", layers=1, norm_dtype=args.norm_dtype, offload=True)
+    head = MtpHead(ref)
+    width = fx["hidden_size"] * fx["streams"]
+    plain = head.store.dequant
+    for case in fx["cases"]:
+        ids = case["prompt_tokens"]
+        n = len(ids)
+        rows = np.fromfile(fx_path.parent / case["hidden_file"], dtype="<f4").reshape(n - 1, width)
+        hidden = torch.from_numpy(rows)
+        runs = {}
+        for wide in (False, True):
+            if wide:
+                head.mods.float()
+                ref.model.model.embed_tokens.float()
+                head.store.dequant = lambda parts, what: plain(parts, what).float()
+            probes: dict = {}
+            mixed = head.forward(hidden.float() if wide else hidden.to(torch.bfloat16), ids[1:], probes)
+            _, picks = full_logprob_rows(ref, mixed, 1)
+            runs[wide] = (probes, picks)
+        head.mods.to(torch.bfloat16)
+        ref.model.model.embed_tokens.to(torch.bfloat16)
+        head.store.dequant = plain
+        target = [p["target"] for p in case["positions"]]
+        (pb, kb), (pf, kf) = runs[False], runs[True]
+        log(f"{case['name']}: top-1 bf16 = f32 head {np.mean([a == b for a, b in zip(kb, kf)]):.3f}; "
+            f"p1 bf16 {np.mean([a == t for a, t in zip(kb, target)]):.3f}, "
+            f"f32 {np.mean([a == t for a, t in zip(kf, target)]):.3f}")
+        for t in case["probe_positions"]:
+            errs = ", ".join(f"{s} {float((pb[s][t] - pf[s][t]).norm() / pf[s][t].norm()):.2e}"
+                             for s, _ in MTP_STAGES)
+            log(f"  t={t}: {errs}")
+
+
 # --------------------------------------------------------------------------
 # CPU checks
 # --------------------------------------------------------------------------
@@ -1642,6 +1690,10 @@ def main() -> None:
     t.add_argument("--device", default="cpu", choices=("cuda", "cpu"))
     t.add_argument("--threads", type=int, default=16)
     t.add_argument("--min-start-gib", type=float)
+    q = sub.add_parser("mtp-precision")
+    q.add_argument("--fixture", default=str(REPO / "test-vectors/references/qwen38-flash-fp4local-hf-mtp.json"))
+    q.add_argument("--threads", type=int, default=12)
+    q.add_argument("--min-start-gib", type=float, default=10)
     g = sub.add_parser("greedy")
     g.add_argument("--skeleton", help="use this fixture's first case's prompt")
     g.add_argument("--prompt-file")
@@ -1659,7 +1711,8 @@ def main() -> None:
     if getattr(args, "threads", None):
         torch.set_num_threads(args.threads)
     {"selfcheck": cmd_selfcheck, "smoke": cmd_smoke, "capture": cmd_capture,
-     "greedy": cmd_greedy, "mtp": cmd_mtp}[args.cmd](args)
+     "greedy": cmd_greedy, "mtp": cmd_mtp,
+     "mtp-precision": cmd_mtp_precision}[args.cmd](args)
 
 
 if __name__ == "__main__":

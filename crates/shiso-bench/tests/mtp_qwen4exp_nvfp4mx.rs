@@ -35,6 +35,16 @@
 //!   input, the residual after the attention half, the layer's output and the
 //!   collapsed row - which bisects a defect to one stage in one run.
 //!
+//!   What the reference's own rounding looks like, measured by running its
+//!   head in single precision against the recorded brain-float one
+//!   (`mtp-precision`): about 1.6e-3 on the normed hidden term, 3e-3 on the
+//!   projections and the layer input, 6e-3 to 1.3e-2 after the attention half
+//!   at `t = 0` - where attention is one row and only the value path counts -
+//!   and 1e-2 to 6e-2 from `t = 1` on, where the scores count, carried through
+//!   to the layer output and the collapsed row (up to 0.15 on a few rows of
+//!   `list`). A stage within those of the reference is this port agreeing
+//!   with single precision; one well past them is a defect.
+//!
 //! ```text
 //! SHISO_TEST_MODEL_QWEN4EXP_NVFP4MX=<the export directory> cargo test -p shiso-bench \
 //!   --release --test mtp_qwen4exp_nvfp4mx -- --ignored --nocapture --test-threads=1
@@ -78,10 +88,12 @@ const CTX: u32 = 2048;
 /// The head's top-1 agreement with the reference's, on the reference's own
 /// input, below which the head is wrong rather than rounded differently.
 ///
-/// Provisional, not measured: brain-float and single-precision activations
-/// flip near-ties, and a few percent of positions are near-ties on ordinary
-/// text. Replace with the measured figure once a run has been graded.
-const HEAD_TOP1_FLOOR: f64 = 0.9;
+/// Set from the reference's own rounding: the same head run in single
+/// precision (`qwen4exp_modelopt_mixed_ref.py mtp-precision`) agrees with the
+/// recorded brain-float head on 0.992 (math), 0.994 (story) and 0.998 (list) of
+/// positions, and this port keeps single-precision activations. Before the
+/// head's collapse bound its own mix it agreed on 0.924 of math's.
+const HEAD_TOP1_FLOOR: f64 = 0.97;
 
 #[expect(clippy::print_stderr, reason = "the skip report is a test's output")]
 fn skip(why: &str) {

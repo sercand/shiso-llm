@@ -1153,6 +1153,21 @@ impl<'a> Binder<'a> {
                 backend: "engine",
             })
         };
+        // The draft head's own collapsing mix answers to the same three roles
+        // the target's does, and those roles are model-wide: so the set is
+        // read *before* the model-wide table. Read after it, the head's
+        // collapse bound the target's final mix - tensors of exactly the right
+        // shapes, every launch succeeding, and a collapsed row 0.2-0.9 off in
+        // relative L2 that still picked the reference's top token most of the
+        // time, which is what made it look like rounding.
+        if reference.layer.set == WeightSet::Draft {
+            match reference.role {
+                Role::OutputMixNorm => return vector(&head()?.output_mix.norm),
+                Role::OutputMixDown => return head()?.output_mix.down.part(part),
+                Role::OutputMixUp => return head()?.output_mix.up.part(part),
+                _ => {}
+            }
+        }
         if reference.role.is_model_wide() {
             return match reference.role {
                 Role::TokenEmbd => self.weights.token_embd.part(part),
@@ -1175,16 +1190,8 @@ impl<'a> Binder<'a> {
                     .part(part),
             };
         }
-        // The draft head's own mix is model-wide *to the head*, so it answers
-        // to the same three roles the target's collapsing mix does - which is
-        // why the set is read before the role and not after it.
         if reference.layer.set == WeightSet::Draft {
-            return match reference.role {
-                Role::OutputMixNorm => vector(&head()?.output_mix.norm),
-                Role::OutputMixDown => head()?.output_mix.down.part(part),
-                Role::OutputMixUp => head()?.output_mix.up.part(part),
-                _ => Self::layer_weight(&head()?.layer, reference, part),
-            };
+            return Self::layer_weight(&head()?.layer, reference, part);
         }
         if let Some(stream) = self.stream
             && matches!(
