@@ -577,17 +577,57 @@ impl<'a> Exec<'a> {
         &self,
         pass: &Pass,
         graphs: Option<&dyn GraphBackend>,
+        tap: Option<&mut ResidualTap>,
+    ) -> CoreResult<PassReport> {
+        self.run_pass_landed(pass, graphs, tap, None)
+    }
+
+    /// Issues a whole pass as [`Exec::run_pass_tapped`] does, calling `land`
+    /// exactly once on the way: in front of the island
+    /// [`Pass::ngram_island`] names, or before the first step when it names
+    /// none.
+    ///
+    /// `land` is the host work the island needs done first - awaiting the
+    /// n-gram reads and uploading them - and everything issued before it reads
+    /// none of what it writes, so the device runs those launches while the
+    /// host does it. A pass is one stream either way: the upload `land` makes
+    /// is ordered behind the launches already issued and in front of the ones
+    /// after it, exactly where the rows were always read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Exec::run_pass_tapped`], plus whatever `land` reports. The steps
+    /// issued before a failing `land` have already been issued: a pass is a
+    /// stream, and there is no undo.
+    pub fn run_pass_landed(
+        &self,
+        pass: &Pass,
+        graphs: Option<&dyn GraphBackend>,
         mut tap: Option<&mut ResidualTap>,
+        mut land: Option<&mut dyn FnMut() -> CoreResult<()>>,
     ) -> CoreResult<PassReport> {
         let steps = pass.plan.steps();
         let graphs = graphs.filter(|_| pass.capturable && tap.is_none());
         if let Some(tap) = tap.as_deref_mut() {
             tap.restart();
         }
+        let landing_island = pass
+            .ngram_island
+            .filter(|island| *island < pass.islands.len());
+        if landing_island.is_none()
+            && let Some(land) = land.take()
+        {
+            land()?;
+        }
         let mut report = PassReport::default();
         let mut at = 0usize;
         for (index, span) in pass.islands.iter().enumerate() {
             report = merge(report, self.run_steps(prefix(steps, at, span.start)?)?);
+            if landing_island == Some(index)
+                && let Some(land) = land.take()
+            {
+                land()?;
+            }
             // The prologue is everything in front of the first island. It ends
             // with the broadcast; the reservation placed there writes no
             // activation.

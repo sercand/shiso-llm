@@ -168,10 +168,12 @@ pub fn issue_rows(table: &Arc<PleStream>, ids: Vec<u64>) -> CoreResult<PleRows> 
 /// Reads the rows for `ids` on the caller's thread, for a caller with nothing
 /// to overlap them with.
 ///
-/// The sparse stack's decode step lands its rows before it launches anything,
-/// so a hand-off to a reader thread overlapped nothing and cost two thread
-/// wake-ups: 200-600 us a token on a GB10 whose host cores idle while the
-/// device runs, against 6 us for sixteen cached rows read in place.
+/// The sparse stack reads its rows here, on its own thread, after issuing the
+/// launches in front of the island that reads them: the device has those to
+/// run meanwhile, so the overlap needs no second thread, and a hand-off to a
+/// reader thread would cost two thread wake-ups - 200-600 us a token on a GB10
+/// whose host cores idle while the device runs, against 6 us for sixteen
+/// cached rows read in place.
 #[must_use]
 pub fn fetch_rows(table: &PleStream, ids: &[u64]) -> PleRows {
     let row_bytes = table.row_bytes();

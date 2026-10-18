@@ -473,6 +473,9 @@ pub(crate) struct FakeModel {
     /// The prompt rows each session the head is capturing has read since
     /// the capture began: alone, and in batched passes.
     captures: HashMap<SessionId, (usize, usize)>,
+    /// Where decode steps write their device picks, and how far past the
+    /// scripted id each pick lands; see [`FakeModel::with_picks`].
+    picks: Option<(DeviceBuffer, u32)>,
 }
 
 /// How a fake's batched prompt pass misbehaves.
@@ -531,9 +534,22 @@ impl FakeModel {
                 batch_calls: 0,
                 decision_head: false,
                 captures: HashMap::new(),
+                picks: None,
             },
             audit,
         )
+    }
+
+    /// The same model, handing every decode step's block out with a device
+    /// pick per row: the row's scripted id moved `offset` places along.
+    ///
+    /// An offset of zero is the honest pick, the argmax of the row the step
+    /// wrote. Any other offset is a pick that disagrees with its row, which
+    /// is what lets a test see which of the two a token was drawn from.
+    pub(crate) fn with_picks(mut self, offset: u32) -> Self {
+        let picks = alloc(&self.backend, u64::from(MAX_ROWS) * 4).expect("a picks block allocates");
+        self.picks = Some((picks, offset));
+        self
     }
 
     /// The same model, answering the next `rows.len()` prefills with these
@@ -609,11 +625,17 @@ impl FakeModel {
         }
     }
 
-    /// Writes one session's next scripted token into `row`.
+    /// Writes one session's next scripted token into `row`, and its pick
+    /// beside it when the model hands picks out.
     fn write_row(&mut self, session: SessionId, row: u32) -> CoreResult<()> {
         let at = self.cursors.entry(session).or_insert(0);
         let token = self.script.get(*at).copied().unwrap_or(EOS);
         *at += 1;
+        if let Some((picks, offset)) = self.picks.as_ref() {
+            let pick = i32::try_from((token + offset) % VOCAB).unwrap_or(0);
+            self.backend
+                .copy_h2d(picks.slice(u64::from(row) * 4, 4)?, &pick.to_le_bytes())?;
+        }
         let width = usize::try_from(VOCAB).expect("a small vocabulary fits a host index");
         let mut scores = vec![0f32; width];
         if let Some(slot) = scores.get_mut(usize::try_from(token).unwrap_or(0)) {
@@ -785,7 +807,12 @@ impl Model for FakeModel {
             let row = u32::try_from(row).unwrap_or(u32::MAX);
             self.write_row(step.session, row)?;
         }
-        self.block(u32::try_from(steps.len()).unwrap_or(MAX_ROWS))
+        let rows = u32::try_from(steps.len()).unwrap_or(MAX_ROWS);
+        let block = self.block(rows)?;
+        match self.picks.as_ref() {
+            Some((picks, _)) => block.with_picks(picks.slice(0, u64::from(rows) * 4)?),
+            None => Ok(block),
+        }
     }
 
     fn decision_mut(&mut self) -> Option<&mut dyn DecisionModel> {
@@ -1121,6 +1148,26 @@ pub(crate) fn scheduled_engine(
         Some(gate) => model.with_gate(gate),
         None => model,
     };
+    let (engine, join) =
+        spawn_engine_configured(backend, Box::new(model), None, "fake-model", CAPACITY, cfg);
+    (engine, join, audit)
+}
+
+/// Starts an engine thread over a model whose decode steps hand out device
+/// picks `offset` places past their scripted ids; see
+/// [`FakeModel::with_picks`].
+pub(crate) fn picked_engine(
+    script: Vec<u32>,
+    offset: u32,
+    cfg: SchedulerConfig,
+) -> (
+    EngineHandle,
+    std::thread::JoinHandle<Result<(), EngineFailure>>,
+    Arc<Audit>,
+) {
+    let backend: Arc<dyn Backend> = FakeBackend::new();
+    let (model, audit) = FakeModel::new(&backend, script);
+    let model = model.with_picks(offset);
     let (engine, join) =
         spawn_engine_configured(backend, Box::new(model), None, "fake-model", CAPACITY, cfg);
     (engine, join, audit)

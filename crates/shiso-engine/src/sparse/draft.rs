@@ -436,6 +436,7 @@ impl SparseStack {
             rows: n_tok,
             origin: RowOrigin::Sequential,
             gather: Vec::new(),
+            ngram_island: None,
         };
         self.execute(session, &pass)?;
         pick.then(|| self.read_draft_pick()).transpose()
@@ -515,6 +516,7 @@ impl SparseStack {
             rows: n,
             origin: RowOrigin::Unrelated,
             gather: Vec::new(),
+            ngram_island: None,
         };
         self.pack_row_pointers(sessions)?;
         self.execute_rows(sessions, &pass)?;

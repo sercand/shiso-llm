@@ -850,6 +850,36 @@ impl SeqSlot {
         }
     }
 
+    /// Whether this sequence's next draw is the argmax of its row: the
+    /// temperature [`SeqSlot::draw`] hands the sampler is not above zero.
+    ///
+    /// The samplers' own test rather than its negation: a NaN temperature
+    /// fails `<= 0` and is drawn stochastically, so it is not an argmax here
+    /// either.
+    pub(crate) fn draws_argmax(&self) -> bool {
+        self.parser.wants_greedy() || self.sampling.temperature <= 0.0
+    }
+
+    /// The token [`SeqSlot::choose`] would draw from a row whose device-side
+    /// greedy pick is `pick`, when that can be known without the row.
+    ///
+    /// Only for a draw that is the argmax - a temperature of zero under either
+    /// rule, asked for or forced by the parser - since that draw reads nothing
+    /// but the row's largest logit and advances no seed. And only when `pick`
+    /// is not one of this sequence's suppressed ids: suppressing an id can
+    /// only move the maximum when the id held it, and the lowest id at the
+    /// maximum is the one the device picked, so an unsuppressed pick is the
+    /// host's pick too. Everything else is `None`, and the caller reads the
+    /// row.
+    pub(crate) fn greedy_pick(&self, pick: i32, vocab: u32) -> Option<TokenId> {
+        if !self.draws_argmax() {
+            return None;
+        }
+        let id = u32::try_from(pick).ok().filter(|id| *id < vocab)?;
+        let token = TokenId::new(id);
+        (!self.suppressed.contains(&token)).then_some(token)
+    }
+
     /// How this sequence will choose its next tokens, for a drafter to follow:
     /// its key and its current temperature under the keyed rule, greedy
     /// otherwise.
