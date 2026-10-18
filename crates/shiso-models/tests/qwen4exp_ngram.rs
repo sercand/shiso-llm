@@ -17,7 +17,7 @@
 //! the byte each of that table's rows holds at each position.
 
 use shiso_core::Backend as _;
-use shiso_core::{DeviceView, Model as _, TokenId};
+use shiso_core::{DecodeStep, DeviceView, Model as _, TokenId};
 use shiso_engine::sparse::bind::Operand;
 use shiso_ple::{PleParams, PleRowType, codec};
 
@@ -193,4 +193,67 @@ fn a_pass_whose_gather_was_never_issued_is_refused_rather_than_decoded() {
         0,
         "the refusal came before the first launch"
     );
+}
+
+#[test]
+fn the_rows_land_behind_the_first_layer_and_ahead_of_the_launch_that_decodes_them() {
+    // The reads are awaited at the island that first reads the staging, not
+    // before the pass: the device runs the prologue and the layers ahead of it
+    // while the host reads. What has to hold is the stream order - the upload
+    // after every launch that does not read the staging and before the one
+    // that decodes it - for a prompt chunk and for a decode step alike.
+    let (_dir, backend, mut model) = loaded();
+    let session = model.open_session().expect("a session opens");
+    let staged = {
+        let binder = model.stack().binder(session).expect("a live session binds");
+        let view = binder.buffer(Operand::NgramRows).expect("the rows bind");
+        view.id().get()
+    };
+    model
+        .prefill_chunk(session, &tokens(3, 4))
+        .expect("a chunk runs");
+    for step in 0..2 {
+        let mark = backend.launch_count();
+        if step == 0 {
+            model
+                .prefill_chunk(session, &tokens(30, 4))
+                .expect("a second chunk runs");
+        } else {
+            model
+                .decode_batch(&[DecodeStep {
+                    session,
+                    token: TokenId::new(9),
+                }])
+                .expect("a decode step runs");
+        }
+        let launches = backend.launches();
+        let decode = (mark..launches.len())
+            .find(|at| launches[*at].entry == "q4e_ple_dequant_kernel")
+            .expect("the pass decodes the gathered rows");
+        let landed = backend
+            .uploads()
+            .into_iter()
+            .filter(|upload| upload.buffer == staged && upload.launches >= mark)
+            .collect::<Vec<_>>();
+        assert_eq!(landed.len(), 1, "one upload of the rows per pass");
+        let upload = landed[0];
+        assert!(
+            upload.launches > mark,
+            "the rows landed before anything was launched, so nothing overlapped the reads"
+        );
+        assert!(
+            upload.launches <= decode,
+            "the rows landed after the launch that decodes them"
+        );
+        for launch in &launches[mark..upload.launches] {
+            assert!(
+                !launch
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg, fixture::Arg::Buffer(id, _, _) if *id == staged)),
+                "{} read the staging before the rows landed",
+                launch.entry
+            );
+        }
+    }
 }

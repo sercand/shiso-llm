@@ -294,6 +294,74 @@ impl SparseStack {
         )
     }
 
+    /// Drops every step pass kept for reuse, so the next step of every session
+    /// is planned afresh.
+    ///
+    /// Never needed for correctness - a kept pass is handed back only for the
+    /// facts it was planned from - and public so a caller can show exactly
+    /// that: a step issued from a kept pass and the same step planned afresh
+    /// issue the same launches.
+    pub fn drop_kept_plans(&mut self) {
+        self.plans.clear();
+    }
+
+    /// The key a text step pass of `n_tok` rows for `session` is kept under.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`].
+    pub(crate) fn step_plan_key(
+        &self,
+        session: SessionId,
+        n_tok: u32,
+        logit_rows: u32,
+    ) -> CoreResult<crate::sparse::plancache::PlanKey> {
+        let (selected, dense_rows) =
+            self.sequential_attention(self.session(session)?.written(), n_tok);
+        Ok(crate::sparse::plancache::PlanKey {
+            session,
+            rows: n_tok,
+            logit_rows,
+            selected,
+            dense_rows,
+        })
+    }
+
+    /// The n-gram gather a kept step pass of `n_tok` rows for `session` needs
+    /// at the session's current frontier: what [`SparseStack::plan_chunk`]
+    /// would have planned into it.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`], and whatever [`PleGather::start`]
+    /// refuses.
+    pub(crate) fn step_gathers(
+        &self,
+        session: SessionId,
+        n_tok: u32,
+    ) -> CoreResult<Vec<PleGather>> {
+        let live = self.session(session)?;
+        self.plan_gathers(&[live], n_tok, &RowOrigin::Sequential)
+    }
+
+    /// What one sequence's pass of `n_tok` rows from frontier `written`
+    /// decides from the frontier alone: whether its attention reads the
+    /// indexer's selection, and how many of its front rows still attend
+    /// densely because their own single-row step would.
+    ///
+    /// The only two facts about a session's position a sequential plan
+    /// depends on - every launch reads the position itself out of the inputs
+    /// it is handed - which is what lets [`crate::sparse::plancache`] reuse a
+    /// decode step's plan for as long as both stay the same.
+    pub(crate) fn sequential_attention(&self, written: u32, n_tok: u32) -> (bool, u32) {
+        let indexer = &self.shape.indexer;
+        let selected = indexer.sparse_at(written.saturating_add(n_tok));
+        let dense = (0..n_tok)
+            .take_while(|&i| !indexer.sparse_at(written.saturating_add(i).saturating_add(1)))
+            .count();
+        (selected, u32::try_from(dense).unwrap_or(n_tok))
+    }
+
     /// The pass itself.
     #[expect(
         clippy::too_many_lines,
@@ -331,11 +399,8 @@ impl SparseStack {
         // has one frontier per row, and each row answers for itself: its
         // attention is planned as a single-row step of its own sequence, over
         // its own selection when its own context is past the budget.
-        let selected = !batched
-            && self
-                .shape
-                .indexer
-                .sparse_at(first.written().saturating_add(n_tok));
+        let (own_selected, own_dense_rows) = self.sequential_attention(first.written(), n_tok);
+        let selected = !batched && own_selected;
         // A segmented pass's run `r` is session `r`'s, and covers `len(r)` rows
         // past its frontier; a batch's row `r` covers one.
         let run_rows = |row: u32| match origin {
@@ -372,11 +437,7 @@ impl SparseStack {
                 })
                 .count()
         };
-        let dense_rows = if batched {
-            0
-        } else {
-            u32::try_from(within(first.written(), n_tok)).unwrap_or(n_tok)
-        };
+        let dense_rows = if batched { 0 } else { own_dense_rows };
         let mut run_dense_rows = RunRows::default();
         if let RowOrigin::Segmented(runs) = origin {
             for (run, live) in (0..runs.count()).zip(rows.iter()) {
@@ -503,6 +564,7 @@ impl SparseStack {
         // they are issued with.
         let (plan, mut islands) = with_reservation(plan, islands);
         plan.validate()?;
+        let ngram_island = first_ngram_island(&plan, &islands);
         if batched && capturable {
             let slot = self.batch_slot(rows, &plan)?;
             for span in &mut islands {
@@ -518,6 +580,7 @@ impl SparseStack {
             rows: n_tok,
             origin: *origin,
             gather,
+            ngram_island,
         })
     }
 
@@ -602,8 +665,8 @@ impl SparseStack {
             // More than one logit row means a speculative verify or a decode
             // batch, and what comes back from a verify is the greedy pick of
             // every row rather than the rows themselves. A batch wants the rows,
-            // so the pick is skipped there: its output is one slot per row
-            // either way and reading it would cost a transfer nobody looks at.
+            // so the pick is skipped there: a decode step's picks are launched
+            // by `SparseStack::decode_batch` itself, outside the plan.
             if logit_rows > 1 && !batched {
                 plan.launch(
                     crate::sparse::kernels::Entry::plain(
@@ -955,6 +1018,37 @@ impl SparseStack {
 
 fn context_id(session: SessionId) -> u32 {
     u32::try_from(session.get().get()).unwrap_or(u32::MAX)
+}
+
+/// The island the gathered n-gram rows are awaited in front of: see
+/// [`Pass::ngram_island`].
+pub(crate) fn first_ngram_island(plan: &Plan, islands: &[IslandSpan]) -> Option<usize> {
+    let steps = plan.steps();
+    let first = steps.iter().position(reads_ngram_rows)?;
+    islands
+        .iter()
+        .position(|span| first >= span.start && first < span.start.saturating_add(span.len))
+        // A reader outside every island, or in front of an earlier island
+        // than the one holding it, is read before any island could stand
+        // in for it: land the rows up front.
+        .filter(|&island| {
+            let start = islands[island].start;
+            !steps[..start].iter().any(reads_ngram_rows)
+        })
+}
+
+/// Whether `step` reads the gathered n-gram rows.
+///
+/// A step whose operands cannot be listed counts as a reader: the answer
+/// decides how early the rows land, and the safe mistake is landing them too
+/// early.
+fn reads_ngram_rows(step: &Step) -> bool {
+    match step {
+        Step::Blas { a, b, c, .. } => [a, b, c].iter().any(|o| **o == Operand::NgramRows),
+        _ => step
+            .operands()
+            .map_or(true, |operands| operands.contains(&Operand::NgramRows)),
+    }
 }
 
 /// Puts the pass's one cooperative-scratch reservation in front of its first

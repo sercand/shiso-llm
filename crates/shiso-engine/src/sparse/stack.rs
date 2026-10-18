@@ -614,6 +614,14 @@ pub struct Pass {
     /// otherwise - a decode batch's rows belong to different sequences, so each
     /// hashes its own trailing grams.
     pub gather: Vec<PleGather>,
+    /// The island whose steps are the first to read the gathered rows, or
+    /// `None` when a step outside every island reads them first (or nothing
+    /// reads them at all).
+    ///
+    /// The rows are read and uploaded in front of it, while the device runs
+    /// everything issued before it (see [`crate::sparse::run`]); `None` lands
+    /// them before the first step.
+    pub ngram_island: Option<usize>,
 }
 
 /// Everything that lives on the device, in construction order.
@@ -696,6 +704,8 @@ pub struct SparseStack {
     /// since the graphs were last dropped, and the context slot it is filed
     /// under. See [`crate::sparse::island::IslandContext::Batched`].
     pub(crate) batch_slots: std::sync::Mutex<HashMap<u64, u32>>,
+    /// Step passes kept for reuse; see [`crate::sparse::plancache`].
+    pub(crate) plans: crate::sparse::plancache::PlanCache,
 }
 
 impl std::fmt::Debug for SparseStack {
@@ -722,6 +732,7 @@ impl std::fmt::Debug for SparseStack {
                 &self.batch_slots.lock().map_or(0, |slots| slots.len()),
             )
             .field("staging", &self.staging)
+            .field("kept_plans", &self.plans.len())
             .field("clock", &self.clock)
             .field("layers", &self.desc.layers.len())
             .finish()
@@ -950,6 +961,7 @@ impl SparseStack {
             ckpt: None,
             tap: None,
             batch_slots: std::sync::Mutex::new(HashMap::new()),
+            plans: crate::sparse::plancache::PlanCache::default(),
         })
     }
 
@@ -1280,6 +1292,7 @@ impl SparseStack {
             .remove(&session)
             .ok_or(CoreError::UnknownSession(session))?;
         self.order.retain(|id| *id != session);
+        self.plans.forget(session);
         // Dropping the session releases its recurrent stack and drops its
         // frontier, which is what returns the page references to the pool.
         drop(live);
@@ -1712,7 +1725,7 @@ impl SparseStack {
         pass: &Pass,
         media: Option<DeviceView<'a>>,
     ) -> CoreResult<crate::sparse::exec::PassReport> {
-        self.execute_rows_tapped(sessions, pass, media, None)
+        self.execute_rows_tapped(sessions, pass, media, None, None)
     }
 
     /// The same pass, copying residual rows into `tap` when one is given.
@@ -1720,13 +1733,15 @@ impl SparseStack {
     /// # Errors
     ///
     /// As [`SparseStack::execute_rows_media`], plus whatever
-    /// [`crate::sparse::exec::Exec::run_pass_tapped`] reports for the copy.
+    /// [`crate::sparse::exec::Exec::run_pass_landed`] reports for the copy
+    /// and for `land`, which it calls where [`Pass::ngram_island`] says.
     pub(crate) fn execute_rows_tapped<'a>(
         &'a self,
         sessions: &[SessionId],
         pass: &Pass,
         media: Option<DeviceView<'a>>,
         tap: Option<&mut crate::sparse::tap::ResidualTap>,
+        land: Option<&mut dyn FnMut() -> CoreResult<()>>,
     ) -> CoreResult<crate::sparse::exec::PassReport> {
         if pass.media_rows.is_some() != media.is_some() {
             return Err(CoreError::Unsupported {
@@ -1779,7 +1794,7 @@ impl SparseStack {
             None => binder,
         };
         crate::sparse::exec::Exec::new(self.backend.as_ref(), self.opts.entries, binder)
-            .run_pass_tapped(pass, self.backend.as_graph(), tap)
+            .run_pass_landed(pass, self.backend.as_graph(), tap, land)
     }
 
     /// The executor one session's launches are issued through.
@@ -1828,6 +1843,7 @@ impl SparseStack {
             }
         }
         self.sessions.clear();
+        self.plans.clear();
         if let Some(resident) = self.resident.take() {
             let Resident {
                 weights,

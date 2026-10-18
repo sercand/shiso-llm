@@ -1827,8 +1827,32 @@ impl Coordinator {
                     return;
                 }
             };
+            // A greedy draw is the device's pick, read with every other row's
+            // in four bytes apiece; see `SeqSlot::greedy_pick`. Nobody greedy,
+            // nothing read.
+            let any_greedy = batch.iter().any(|entry| {
+                slots
+                    .slots()
+                    .get(entry.slot)
+                    .is_some_and(SeqSlot::draws_argmax)
+            });
+            let picks = if any_greedy {
+                read_picks(backend.as_ref(), &logits)
+            } else {
+                Vec::new()
+            };
+            let vocab = logits.vocab();
             let mut sampled = Vec::with_capacity(batch.len());
             for (index, entry) in batch.iter().enumerate() {
+                let device = picks
+                    .get(index)
+                    .copied()
+                    .zip(slots.slots().get(entry.slot))
+                    .and_then(|(pick, slot)| slot.greedy_pick(pick, vocab));
+                if let Some(token) = device {
+                    sampled.push((entry.slot, token));
+                    continue;
+                }
                 let at = u32::try_from(index).unwrap_or(u32::MAX);
                 let read = logits
                     .row(at)
@@ -2529,6 +2553,26 @@ struct Quantum {
     session: SessionId,
     prompt: Arc<[TokenId]>,
     window: std::ops::Range<usize>,
+}
+
+/// The device's greedy pick of every row of `logits`, or nothing when the
+/// model computed none or they would not read back - in which case every row
+/// is read and drawn from on the host, as it always could be.
+fn read_picks(backend: &dyn Backend, logits: &shiso_core::model::Logits<'_>) -> Vec<i32> {
+    let Some(view) = logits.picks() else {
+        return Vec::new();
+    };
+    let mut bytes = vec![0u8; usize::try_from(view.len()).unwrap_or(0)];
+    if let Err(error) = backend.copy_d2h(view, &mut bytes) {
+        tracing::debug!(error = %error.chain(), "the device picks did not read back; reading rows");
+        return Vec::new();
+    }
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| i32::from_le_bytes(*word))
+        .collect()
 }
 
 /// Reads one logits row out of its bytes into `scores`.
