@@ -75,15 +75,48 @@ __device__ __forceinline__ float q4e_mx_warp_sum(float v) {
     return v;
 }
 
-/* `R` output rows a warp, `NT` activation rows, `D` chunks deep. `stage` is
- * this warp's `R * 512` bytes of shared memory. Rows past `out_dim` read the
- * last row and store nothing.
+/* Nonzero when a byte of `w` is one of the two `e4m3` NaN codes. */
+__device__ __forceinline__ uint32_t q4e_mx_nan4(uint32_t w) {
+    return ((w & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u;
+}
+
+/* Nonzero when a scale byte of `w` is 135 or more, where `2^(s - 7)` below
+ * is no longer a normal float (255, the NaN scale, included). */
+__device__ __forceinline__ uint32_t q4e_mx_big4(uint32_t w) {
+    return (((w & 0x7F7F7F7Fu) + 0x79797979u) & w) & 0x80808080u;
+}
+
+/* The two weights of code pair `p` (the even element in the low byte) under
+ * the scale `k = 2^(s - 7)`, for codes that are not NaN and `s < 135`.
  *
- * `R` and `D` move nothing in a row's arithmetic - each row is still one
- * lane-strided sequence of fused multiply-adds and one fold - so the entries
- * below choose them for bandwidth alone. */
+ * A code's sign, exponent and mantissa moved into a float's sign and low
+ * exponent bits (`code << 20`) read as the code's value times 2^-120: a
+ * normal code lands on a normal float, and a subnormal one (exponent 0) on a
+ * float subnormal of the same mantissa, which is the same factor. So
+ * `w = f * 2^(s - 7)` is the code's value times `2^(s - 127)`, formed by one
+ * round-to-nearest multiply of the exact real product - the one rounding
+ * `q4e_mx_pair` then `q4e_mx_mul` by the group scale also make of it (the
+ * factor of 256 there is exact). `mul.rn.f32` without `.ftz` keeps the
+ * subnormal operand. Bit for bit the same weight in two integer operations
+ * and a multiply a code instead of the half-precision widening. */
+__device__ __forceinline__ float2 q4e_mx_pair_k(uint32_t p, float k) {
+    const uint32_t b0 = ((p << 24) & 0x80000000u) | ((p << 20) & 0x07F00000u);
+    const uint32_t b1 = ((p << 16) & 0x80000000u) | ((p << 12) & 0x07F00000u);
+    return make_float2(q4e_mx_mul(__uint_as_float(b0), k), q4e_mx_mul(__uint_as_float(b1), k));
+}
+
+/* `2^(s - 7)` for scale byte `byte` of word `word + 0x78787878` (each byte
+ * already raised by 120, which no byte under 135 carries out of): the byte
+ * moved to the top of the word and down one bit is the float's exponent
+ * field. */
+__device__ __forceinline__ float q4e_mx_k(uint32_t raised, uint32_t byte) {
+    return __uint_as_float(__byte_perm(raised, 0u, (byte << 12) | 0x0444u) >> 1);
+}
+
+/* The original `q4e_mx_rows` body, for a contraction that is not whole
+ * 512-wide chunks; see `q4e_mx_rows`. */
 template <int NT, int R, int D>
-__device__ __forceinline__ void q4e_mx_rows(
+__device__ __forceinline__ void q4e_mx_rows_bytes(
         float *__restrict__ out, const uint8_t *__restrict__ codes,
         const uint8_t *__restrict__ scales, const float *__restrict__ x,
         uint32_t in_dim, uint32_t out_dim, uint32_t row0, uint32_t lane,
@@ -135,6 +168,162 @@ __device__ __forceinline__ void q4e_mx_rows(
             for (uint32_t j = 0; j < Q4E_MX_CHUNK / 64u; j++) {
                 const uint32_t e = base + 2u * lane + 64u * j;
                 if (e < in_dim) {
+                    float2 xv[NT];
+#pragma unroll
+                    for (int t = 0; t < NT; t++) {
+                        xv[t] = *reinterpret_cast<const float2 *>(x + (uint64_t) t * in_dim + e);
+                    }
+#pragma unroll
+                    for (int r = 0; r < R; r++) {
+                        const uint32_t p = *reinterpret_cast<const uint16_t *>(
+                                stage + r * Q4E_MX_CHUNK + 2u * lane + 64u * j);
+                        const float s = q4e_mx_scale(__ldg(sr[r] + e / Q4E_MX_GROUP));
+                        const float2 v = q4e_mx_pair(p);
+                        const float w0 = q4e_mx_mul(v.x, s);
+                        const float w1 = q4e_mx_mul(v.y, s);
+#pragma unroll
+                        for (int t = 0; t < NT; t++) {
+                            acc[r][t] = q4e_mx_fma(w0, xv[t].x, acc[r][t]);
+                            acc[r][t] = q4e_mx_fma(w1, xv[t].y, acc[r][t]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+            const float v = q4e_mx_warp_sum(acc[r][t]);
+            if (lane == 0u && row0 + (uint32_t) r < out_dim) {
+                out[(uint64_t) t * out_dim + row0 + r] = v;
+            }
+        }
+    }
+}
+
+/* `R` output rows a warp, `NT` activation rows, `D` chunks deep. `stage` is
+ * this warp's `R * 512` bytes of shared memory. Rows past `out_dim` read the
+ * last row and store nothing.
+ *
+ * `R` and `D` move nothing in a row's arithmetic - each row is still one
+ * lane-strided sequence of fused multiply-adds and one fold - so the entries
+ * below choose them for bandwidth alone.
+ *
+ * A contraction of whole 512-wide chunks (every one this family stores) reads
+ * a chunk's sixteen scale bytes a row as one broadcast load beside its codes
+ * and forms the weights with `q4e_mx_pair_k`; a chunk with a NaN code or a
+ * scale of 135 or more in it - none in a real checkpoint, but a weight is a
+ * weight - takes the general decode for that chunk. Both form every weight
+ * bit for bit, so the sums are the same whichever a chunk took. Measured on a
+ * GB10 at 2560 x 6144 (ncu, one row): 9.72 M -> 5.64 M instructions a launch,
+ * 96 -> 90-93 us mean at the base clock; at the boost clock the kernel bench
+ * moves 81 -> 79 us and the wide group not at all, because the memory system
+ * is the limit there. The instructions are what an SM clocked down under the
+ * power cap - which this device's counters show it spending time in - runs
+ * short of first. */
+template <int NT, int R, int D>
+__device__ __forceinline__ void q4e_mx_rows(
+        float *__restrict__ out, const uint8_t *__restrict__ codes,
+        const uint8_t *__restrict__ scales, const float *__restrict__ x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t row0, uint32_t lane,
+        uint8_t *__restrict__ stage) {
+    if ((in_dim & (Q4E_MX_CHUNK - 1u)) != 0u) {
+        q4e_mx_rows_bytes<NT, R, D>(out, codes, scales, x, in_dim, out_dim, row0, lane, stage);
+        return;
+    }
+    const uint8_t *wr[R];
+    const uint8_t *sr[R];
+    float acc[R][NT];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        const uint64_t row = min(row0 + (uint32_t) r, out_dim - 1u);
+        wr[r] = codes + row * in_dim;
+        sr[r] = scales + row * (in_dim / Q4E_MX_GROUP);
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+            acc[r][t] = 0.0f;
+        }
+    }
+    const uint32_t hi = lane >> 4;
+    for (uint32_t c0 = 0; c0 < in_dim; c0 += Q4E_MX_CHUNK * D) {
+        /* Every load first, codes and scales. A row's scales start on a
+         * sixteen-byte boundary because the contraction is whole chunks, and
+         * a chunk's sixteen bytes are the same for every lane. */
+        uint4 buf[R][D];
+        uint4 sc[R][D];
+#pragma unroll
+        for (int d = 0; d < D; d++) {
+            const uint32_t base = c0 + (uint32_t) d * Q4E_MX_CHUNK;
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                const bool in = base < in_dim;
+                buf[r][d] = in ? __ldg(reinterpret_cast<const uint4 *>(wr[r] + base + 16u * lane))
+                               : make_uint4(0u, 0u, 0u, 0u);
+                sc[r][d] = in ? __ldg(reinterpret_cast<const uint4 *>(sr[r] + base / Q4E_MX_GROUP))
+                              : make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+#pragma unroll
+        for (int d = 0; d < D; d++) {
+            const uint32_t base = c0 + (uint32_t) d * Q4E_MX_CHUNK;
+            if (base >= in_dim) {
+                break;
+            }
+            uint32_t odd = 0u;
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                odd |= q4e_mx_nan4(buf[r][d].x) | q4e_mx_nan4(buf[r][d].y)
+                     | q4e_mx_nan4(buf[r][d].z) | q4e_mx_nan4(buf[r][d].w)
+                     | q4e_mx_big4(sc[r][d].x) | q4e_mx_big4(sc[r][d].y)
+                     | q4e_mx_big4(sc[r][d].z) | q4e_mx_big4(sc[r][d].w);
+            }
+            const bool general = __any_sync(0xffffffffu, odd != 0u);
+            __syncwarp();
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                *reinterpret_cast<uint4 *>(stage + r * Q4E_MX_CHUNK + 16u * lane) = buf[r][d];
+            }
+            __syncwarp();
+            if (!general) {
+                uint4 raised[R];
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    raised[r] = make_uint4(sc[r][d].x + 0x78787878u, sc[r][d].y + 0x78787878u,
+                                           sc[r][d].z + 0x78787878u, sc[r][d].w + 0x78787878u);
+                }
+                /* Pair `j` of this chunk for this lane is element
+                 * `base + 2 lane + 64 j`, in group `2 j + hi` of the chunk:
+                 * byte `2 (j % 2) + hi` of scale word `j / 2`. */
+#pragma unroll
+                for (uint32_t j = 0; j < Q4E_MX_CHUNK / 64u; j++) {
+                    const uint32_t e = base + 2u * lane + 64u * j;
+                    float2 xv[NT];
+#pragma unroll
+                    for (int t = 0; t < NT; t++) {
+                        xv[t] = *reinterpret_cast<const float2 *>(x + (uint64_t) t * in_dim + e);
+                    }
+#pragma unroll
+                    for (int r = 0; r < R; r++) {
+                        const uint32_t p = *reinterpret_cast<const uint16_t *>(
+                                stage + r * Q4E_MX_CHUNK + 2u * lane + 64u * j);
+                        const uint32_t word = (j >> 1) == 0u ? raised[r].x
+                                            : (j >> 1) == 1u ? raised[r].y
+                                            : (j >> 1) == 2u ? raised[r].z
+                                                             : raised[r].w;
+                        const float2 w = q4e_mx_pair_k(p, q4e_mx_k(word, 2u * (j & 1u) + hi));
+#pragma unroll
+                        for (int t = 0; t < NT; t++) {
+                            acc[r][t] = q4e_mx_fma(w.x, xv[t].x, acc[r][t]);
+                            acc[r][t] = q4e_mx_fma(w.y, xv[t].y, acc[r][t]);
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (uint32_t j = 0; j < Q4E_MX_CHUNK / 64u; j++) {
+                    const uint32_t e = base + 2u * lane + 64u * j;
                     float2 xv[NT];
 #pragma unroll
                     for (int t = 0; t < NT; t++) {

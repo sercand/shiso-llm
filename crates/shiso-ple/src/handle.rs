@@ -659,6 +659,65 @@ impl RowReader {
         (a - 1 + self.row_bytes).div_ceil(a) * a
     }
 
+    /// Reads a row is assembled from: one per array of a sharded table, one
+    /// otherwise.
+    pub(crate) fn parts(&self) -> usize {
+        self.shards
+            .as_ref()
+            .and_then(|layout| layout.shards.first())
+            .map_or(1, Vec::len)
+    }
+
+    /// Where part `part` of a sharded row starts inside the assembled row, and
+    /// how wide it is. Every shard has the same arrays in the same order, so
+    /// the first shard's widths are every shard's.
+    pub(crate) fn part_span(&self, part: usize) -> (usize, usize) {
+        let Some(first) = self
+            .shards
+            .as_ref()
+            .and_then(|layout| layout.shards.first())
+        else {
+            return (0, self.row_bytes);
+        };
+        let at = first
+            .iter()
+            .take(part)
+            .map(|seg| seg.row_bytes as usize)
+            .sum();
+        (at, first.get(part).map_or(0, |seg| seg.row_bytes as usize))
+    }
+
+    /// Reads part `part` of `row` of a sharded table into `dst`, which is that
+    /// part's width: one of the reads [`RowReader::read_row`] makes in turn,
+    /// for a caller that keeps the parts of a row in flight side by side.
+    ///
+    /// # Errors
+    ///
+    /// [`PleError::RowOutOfRange`] for a row or part the layout does not have,
+    /// and what [`RowReader::read_row`] reports for the read itself.
+    pub(crate) fn read_part(&self, row: u64, part: usize, dst: &mut [u8]) -> PleResult<Tally> {
+        let started = Instant::now();
+        let layout = self
+            .shards
+            .as_ref()
+            .ok_or(PleError::RowOutOfRange { row, n_rows: 0 })?;
+        let shard = usize::try_from(row / layout.rows_per_shard.max(1)).unwrap_or(usize::MAX);
+        let local = row % layout.rows_per_shard.max(1);
+        let seg = layout
+            .shards
+            .get(shard)
+            .and_then(|segments| segments.get(part))
+            .ok_or(PleError::RowOutOfRange { row, n_rows: 0 })?;
+        let len = seg.row_bytes as usize;
+        let start = seg.offset + local * u64::from(seg.row_bytes);
+        read_at(&seg.file, &mut dst[..len], start, row, 0, len)?;
+        Ok(Tally {
+            reads: 1,
+            bytes: len as u64,
+            elapsed: started.elapsed(),
+        })
+    }
+
     /// Reads one row into `dst`, through `bounce` when the descriptor is direct.
     ///
     /// # Errors
@@ -807,7 +866,9 @@ struct Io {
     /// Declared first so it is torn down before the descriptor it registered.
     ring: Option<Ring>,
     pool: Pool,
-    reader: RowReader,
+    /// Shared with the pool's standing helpers, which read on their own
+    /// threads.
+    reader: Arc<RowReader>,
 }
 
 impl RowSource for Io {
@@ -1088,7 +1149,7 @@ impl PleStream {
                     io: Io {
                         ring,
                         pool: Pool::new(cfg.workers),
-                        reader,
+                        reader: Arc::new(reader),
                     },
                 }),
             }),

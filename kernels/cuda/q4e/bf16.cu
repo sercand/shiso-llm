@@ -96,7 +96,7 @@ __device__ __forceinline__ void q4e_bf_widen8(uint4 raw, float *v) {
  * decreasing-offset shuffle, and the `S` slices of an output are added in
  * slice order through shared memory. Rows past `out_dim` read the last row
  * and store nothing. */
-template <int NT, int R>
+template <int NT, int R, int DEPTH = 0>
 __device__ __forceinline__ void q4e_bf_step(
         float *__restrict__ out, const __nv_bfloat16 *__restrict__ w, const float *__restrict__ x,
         uint32_t in_dim, uint32_t out_dim, uint32_t splits, float *__restrict__ part,
@@ -128,8 +128,9 @@ __device__ __forceinline__ void q4e_bf_step(
     }
     /* `D` steps' weights are loaded before the first of them is consumed:
      * the slices are short (five steps at the stream mix down), so a lane
-     * needs every load of its slice in flight at once, not one ahead. */
-    constexpr int D = R == 1 ? 4 : (R == 2 ? 2 : 1);
+     * needs every load of its slice in flight at once, not one ahead. An
+     * entry may ask for a depth (`DEPTH`); see `q4e_bf16_gemv_pair_kernel`. */
+    constexpr int D = DEPTH > 0 ? DEPTH : (R == 1 ? 4 : (R == 2 ? 2 : 1));
     for (uint32_t i = i0 + lane * 8u; i < i1; i += D * Q4E_BF_STEP) {
         uint4 raw[D][R];
 #pragma unroll
@@ -234,14 +235,21 @@ extern "C" __global__ void __launch_bounds__(Q4E_BF_WARPS * 32u) q4e_bf16_rows_k
  * stream mix's contraction and injection logits do: eight). One activation
  * row, or (`q4e_bf16_rows_pair_kernel`) two to eight. Arguments
  * `out_a, w_a, out_dim_a, out_b, w_b, out_dim_b, x, in_dim, splits, rows`;
- * grids as the single-weight kernels' over `out_dim_a + out_dim_b` rows. */
+ * grids as the single-weight kernels' over `out_dim_a + out_dim_b` rows.
+ *
+ * The one-row entry loads up to eight steps of a slice at once: the stream
+ * mix's contraction is 10240 wide at eight slices, five steps a lane, which
+ * four steps deep took as two dependent rounds. Measured on a GB10 (graph of
+ * 48 layers' contraction and expansion, compute_80 JIT, p25 of three runs):
+ * 59.8-67.3 -> 58.8-60.2 us a layer for the pair. */
 extern "C" __global__ void __launch_bounds__(Q4E_BF_WARPS * 32u) q4e_bf16_gemv_pair_kernel(
         float *out_a, const __nv_bfloat16 *w_a, uint32_t out_dim_a,
         float *out_b, const __nv_bfloat16 *w_b, uint32_t out_dim_b,
         const float *x, uint32_t in_dim, uint32_t splits, uint32_t rows) {
     __shared__ float part[Q4E_BF_WARPS];
     if (rows == 1u) {
-        q4e_bf_step<1, 1>(out_a, w_a, x, in_dim, out_dim_a, splits, part, out_b, w_b, out_dim_b);
+        q4e_bf_step<1, 1, 8>(out_a, w_a, x, in_dim, out_dim_a, splits, part, out_b, w_b,
+                             out_dim_b);
     }
 }
 

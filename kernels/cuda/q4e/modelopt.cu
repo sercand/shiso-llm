@@ -78,26 +78,6 @@ __device__ __forceinline__ float q4e_mo_word_dot(uint32_t w, float4 a, float4 b)
     return s;
 }
 
-/* One lane's share of the dot of one NVFP4 row with `x`: lane `l` takes
- * groups `l`, `l + 32`, ... The widths this family stores (2560 and 640) are
- * whole groups, and a row starts at a multiple of eight bytes, so a group is
- * one eight-byte load and four sixteen-byte ones. */
-__device__ __forceinline__ float q4e_mo_nvfp4_row(
-        const uint8_t *__restrict__ w, const uint8_t *__restrict__ s, float global,
-        const float *__restrict__ x, uint32_t in_dim, uint32_t lane) {
-    float acc = 0.0f;
-    const uint32_t groups = in_dim / Q4E_NVFP4_GROUP;
-    for (uint32_t g = lane; g < groups; g += 32u) {
-        const uint2 word = ((const uint2 *) w)[g];
-        const float scale = q4e_mo_e4m3(s[g]) * global;
-        const float4 *xg = (const float4 *) (x + (uint64_t) g * Q4E_NVFP4_GROUP);
-        const float part = q4e_mo_word_dot(word.x, xg[0], xg[1])
-                         + q4e_mo_word_dot(word.y, xg[2], xg[3]);
-        acc = fmaf(part, scale, acc);
-    }
-    return acc;
-}
-
 #include <cuda_fp16.h>
 #include <string.h>
 
@@ -189,6 +169,36 @@ __device__ __forceinline__ float q4e_mo_word_dot_fast(uint32_t w, float4 a, floa
     s = fmaf(v[6], b.z, s);
     s = fmaf(v[7], b.w, s);
     return s;
+}
+
+/* One lane's share of the dot of one NVFP4 row with `x`: lane `l` takes
+ * groups `l`, `l + 32`, ... The widths this family stores (2560 and 640) are
+ * whole groups, and a row starts at a multiple of eight bytes, so a group is
+ * one eight-byte load and four sixteen-byte ones.
+ *
+ * The codes widen through `q4e_mo_word_dot_fast`, which is
+ * `q4e_mo_word_dot`'s values in its order: this is the decode step's
+ * gate-and-up path (a 2560-wide row is too wide to hold). GB10, ncu, the
+ * kernel bench's one-token launch: 15.53 M -> 7.74 M instructions, every
+ * output bit for bit. At the boost clock the launch is the memory system's
+ * either way (85.6 us); the instructions are what the SM runs short of when
+ * the shared power budget clocks it down (1.9 GHz measured under CPU load),
+ * and in an interleaved graph of 48 layers taken while another job loaded the
+ * CPU the old decode measured 101-107 us a layer against 86.6-87.6. */
+__device__ __forceinline__ float q4e_mo_nvfp4_row(
+        const uint8_t *__restrict__ w, const uint8_t *__restrict__ s, float global,
+        const float *__restrict__ x, uint32_t in_dim, uint32_t lane) {
+    float acc = 0.0f;
+    const uint32_t groups = in_dim / Q4E_NVFP4_GROUP;
+    for (uint32_t g = lane; g < groups; g += 32u) {
+        const uint2 word = ((const uint2 *) w)[g];
+        const float scale = q4e_mo_e4m3(s[g]) * global;
+        const float4 *xg = (const float4 *) (x + (uint64_t) g * Q4E_NVFP4_GROUP);
+        const float part = q4e_mo_word_dot_fast(word.x, xg[0], xg[1])
+                         + q4e_mo_word_dot_fast(word.y, xg[2], xg[3]);
+        acc = fmaf(part, scale, acc);
+    }
+    return acc;
 }
 
 /* One step stage over `M` matrices of `R` rows each, a warp's share.
@@ -357,6 +367,184 @@ __device__ __forceinline__ void q4e_mo_nvfp4_step_rows(
     }
 }
 
+/* `q4e_mo_nvfp4_step_rows<1, R, 1, G>` - one matrix, `R` rows taken one at a
+ * time - with the next row's codes and scale words requested before this
+ * row's columns are summed, so a warp's rows are one stream instead of `R`
+ * round trips. The same values in the same order: only the loads move.
+ *
+ * Measured on a GB10 (graph of 48 layers' down stages, ten random experts of
+ * 512, compute_80 JIT, three runs): 44.4-45.0 -> 42.7-43.9 us a layer.
+ * Holding all four rows' loads at once (`P = 4`) measured 49.4-50.5 us: the
+ * registers it takes cost more blocks than the bytes in flight bought. */
+template <uint32_t R, uint32_t G>
+__device__ __forceinline__ void q4e_mo_nvfp4_step_rows_pipe(
+        float *__restrict__ out, const uint8_t *__restrict__ w, const uint8_t *__restrict__ s,
+        float global, const float *__restrict__ x, const int *__restrict__ sorted, int c0,
+        int c1, uint32_t div, uint32_t row, uint32_t rows, uint32_t in_dim, uint32_t out_dim,
+        uint32_t lane) {
+    const uint32_t groups = in_dim / Q4E_NVFP4_GROUP;
+    const uint64_t packed = in_dim / 2u;
+    if (groups > 32u * G || (groups & 3u) != 0u) {
+        const uint8_t *const wm[1] = {w};
+        const uint8_t *const sm[1] = {s};
+        float *const om[1] = {out};
+        q4e_mo_nvfp4_step_rows<1u, R, 1u, G>(om, wm, sm, &global, x, sorted, c0, c1, div, row,
+                                             rows, in_dim, out_dim, lane);
+        return;
+    }
+    constexpr uint32_t W = (G + 3u) / 4u;
+    uint2 code[2][G];
+    uint32_t word[2][W];
+    /* Row `r`'s codes and scale words, as `q4e_mo_nvfp4_step_rows` loads them. */
+    auto load = [&](uint32_t r, uint2 *c, uint32_t *wd) {
+#pragma unroll
+        for (uint32_t q = 0; q < G; ++q) {
+            const uint32_t g = lane + 32u * q;
+            c[q] = (r < rows && g < groups) ? ((const uint2 *) (w + r * packed))[g]
+                                            : make_uint2(0u, 0u);
+        }
+#pragma unroll
+        for (uint32_t v = 0; v < W; ++v) {
+            const uint32_t at = lane + 32u * v;
+            wd[v] = (r < rows && at * 4u < groups) ? ((const uint32_t *) (s + r * groups))[at] : 0u;
+        }
+    };
+    load(0u, code[0], word[0]);
+#pragma unroll
+    for (uint32_t r = 0; r < R; ++r) {
+        const uint32_t cur = r & 1u;
+        if (r + 1u < R) {
+            load(r + 1u, code[cur ^ 1u], word[cur ^ 1u]);
+        }
+        if (r >= rows) {
+            continue;
+        }
+        float scale[G];
+#pragma unroll
+        for (uint32_t q = 0; q < G; ++q) {
+            const uint32_t g = lane + 32u * q;
+            const uint32_t b = __shfl_sync(0xffffffffu, word[cur][q >> 2], (g >> 2) & 31u);
+            scale[q] = g < groups ? q4e_mo_e4m3((b >> (8u * (g & 3u))) & 0xFFu) * global : 0.0f;
+        }
+        for (int c = c0; c < c1; ++c) {
+            const uint32_t col = (uint32_t) sorted[c];
+            const float *xr = x + (uint64_t) (col / div) * in_dim;
+            float acc = 0.0f;
+#pragma unroll
+            for (uint32_t q = 0; q < G; ++q) {
+                const uint32_t g = lane + 32u * q;
+                if (g < groups) {
+                    const float4 *xg = (const float4 *) (xr + (uint64_t) g * Q4E_NVFP4_GROUP);
+                    const float4 x0 = xg[0];
+                    const float4 x1 = xg[1];
+                    const float4 x2 = xg[2];
+                    const float4 x3 = xg[3];
+                    uint32_t lo = code[cur][q].x;
+                    uint32_t hi = code[cur][q].y;
+                    asm volatile("" : "+r"(lo), "+r"(hi));
+                    const float part = q4e_mo_word_dot_fast(lo, x0, x1)
+                                     + q4e_mo_word_dot_fast(hi, x2, x3);
+                    acc = fmaf(part, scale[q], acc);
+                }
+            }
+            const float v = q4e_mo_warp_sum(acc);
+            if (lane == 0u) {
+                out[(uint64_t) col * out_dim + row + r] = v;
+            }
+        }
+    }
+}
+
+/* `q4e_mo_nvfp4_step_rows<1, R, 1, 2>` for a contraction of 33 to 64 groups
+ * whose rows' tails fit one warp together (`R * (groups - 32) <= 32`): the
+ * down projection's 640-wide rows are 40 groups, so one row a pass left 24 of
+ * 32 lanes idle for its second group. Here each row's first 32 groups are
+ * summed as before, one group a lane, and the `R` rows' remaining groups are
+ * summed in one pass over the whole warp - lane `L` takes group
+ * `32 + L % rem` of row `L / rem` - and each of those parts, with its scale,
+ * is handed by shuffle to the lane that owns it, which adds it in the same
+ * fused multiply-add the one-row pass makes. Every lane's sequence and the
+ * fold are unchanged, so the bits are; the column's activations are read once
+ * for all `R` rows.
+ *
+ * GB10, ncu, the kernel bench's one-token launch: 7.88 M -> 4.76 M
+ * instructions (with the fast row above), 45.2 -> 44.0 us at the base clock. */
+template <uint32_t R>
+__device__ __forceinline__ void q4e_mo_nvfp4_down_packed(
+        float *__restrict__ out, const uint8_t *__restrict__ w, const uint8_t *__restrict__ s,
+        float global, const float *__restrict__ x, const int *__restrict__ sorted, int c0,
+        int c1, uint32_t div, uint32_t row, uint32_t rows, uint32_t in_dim, uint32_t out_dim,
+        uint32_t lane) {
+    const uint32_t groups = in_dim / Q4E_NVFP4_GROUP;
+    const uint32_t rem = groups - 32u;
+    const uint64_t packed = in_dim / 2u;
+    /* This lane's tail group: row `pr`, group `pg`. */
+    const uint32_t pr = lane / rem;
+    const uint32_t pg = 32u + lane % rem;
+    const bool plive = pr < R && pr < rows;
+    uint2 code0[R];
+    uint32_t word[R];
+#pragma unroll
+    for (uint32_t r = 0; r < R; ++r) {
+        code0[r] = r < rows ? ((const uint2 *) (w + r * packed))[lane] : make_uint2(0u, 0u);
+        /* Word `lane` of a row's scales holds groups `4 lane .. + 3`, as
+         * `q4e_mo_nvfp4_step_rows` reads them. */
+        word[r] = (r < rows && lane * 4u < groups) ? ((const uint32_t *) (s + r * groups))[lane]
+                                                   : 0u;
+    }
+    const uint2 code1 = plive ? ((const uint2 *) (w + pr * packed))[pg] : make_uint2(0u, 0u);
+    float s0[R];
+    uint32_t tail = 0u;
+#pragma unroll
+    for (uint32_t r = 0; r < R; ++r) {
+        const uint32_t b = __shfl_sync(0xffffffffu, word[r], lane >> 2);
+        s0[r] = r < rows ? q4e_mo_e4m3((b >> (8u * (lane & 3u))) & 0xFFu) * global : 0.0f;
+        const uint32_t bt = __shfl_sync(0xffffffffu, word[r], pg >> 2);
+        tail = r == pr ? bt : tail;
+    }
+    const float s1 = plive ? q4e_mo_e4m3((tail >> (8u * (pg & 3u))) & 0xFFu) * global : 0.0f;
+    for (int c = c0; c < c1; ++c) {
+        const uint32_t col = (uint32_t) sorted[c];
+        const float *xr = x + (uint64_t) (col / div) * in_dim;
+        const float4 *xa = (const float4 *) (xr + (uint64_t) lane * Q4E_NVFP4_GROUP);
+        const float4 a0 = xa[0];
+        const float4 a1 = xa[1];
+        const float4 a2 = xa[2];
+        const float4 a3 = xa[3];
+        const float4 *xb = (const float4 *) (xr + (uint64_t) pg * Q4E_NVFP4_GROUP);
+        const float4 b0 = xb[0];
+        const float4 b1 = xb[1];
+        const float4 b2 = xb[2];
+        const float4 b3 = xb[3];
+        float part1;
+        {
+            uint32_t lo = code1.x;
+            uint32_t hi = code1.y;
+            asm volatile("" : "+r"(lo), "+r"(hi));
+            part1 = q4e_mo_word_dot_fast(lo, b0, b1) + q4e_mo_word_dot_fast(hi, b2, b3);
+        }
+#pragma unroll
+        for (uint32_t r = 0; r < R; ++r) {
+            uint32_t lo = code0[r].x;
+            uint32_t hi = code0[r].y;
+            asm volatile("" : "+r"(lo), "+r"(hi));
+            const float part0 =
+                    q4e_mo_word_dot_fast(lo, a0, a1) + q4e_mo_word_dot_fast(hi, a2, a3);
+            float acc = fmaf(part0, s0[r], 0.0f);
+            const uint32_t from = r * rem + lane % rem;
+            const float p = __shfl_sync(0xffffffffu, part1, from);
+            const float sc = __shfl_sync(0xffffffffu, s1, from);
+            if (lane < rem) {
+                acc = fmaf(p, sc, acc);
+            }
+            const float v = q4e_mo_warp_sum(acc);
+            if (lane == 0u && r < rows) {
+                out[(uint64_t) col * out_dim + row + r] = v;
+            }
+        }
+    }
+}
+
 /* Gate and up for one active expert's columns, `Q4E_NVFP4_GU_ROWS` rows of
  * each a warp: the body of both gate-and-up entries. `out[0]` and `out[1]`
  * are the gate and up outputs, or with `ACT` `out[0]` is the activated
@@ -460,8 +648,11 @@ extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_ex
 
 /* The routed down projection over an NVFP4 bank: each column reads its own row
  * of the activated intermediate and writes `[column, out_dim]`;
- * `Q4E_NVFP4_DN_ROWS` rows a warp, taken one at a time (two or four held at
- * once measured 3-6% slower on a GB10).
+ * `Q4E_NVFP4_DN_ROWS` rows a warp: their tails packed into one pass where they
+ * fit (`q4e_mo_nvfp4_down_packed`, the 640-wide rows of this family),
+ * otherwise taken one at a time with the next one's loads in flight
+ * (`q4e_mo_nvfp4_step_rows_pipe`; two or four held at once measured 3-6%
+ * slower on a GB10).
  *
  * Buffers: out, down_w, down_s, down_g, mid, sorted, bounds, active, map,
  * in_dim, out_dim, n_expert, n_used. Grid `(ceil(out_dim / 16), min(columns,
@@ -486,13 +677,19 @@ extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_ex
         return;
     }
     const uint64_t first = slot * out_dim + row;
-    const uint8_t *w[1] = {down_w + first * (in_dim / 2u)};
-    const uint8_t *s[1] = {down_s + first * (in_dim / Q4E_NVFP4_GROUP)};
-    const float g[1] = {down_g[slot]};
-    float *const o[1] = {out};
-    q4e_mo_nvfp4_step_rows<1u, Q4E_NVFP4_DN_ROWS, 1u, 2u>(
-            o, w, s, g, mid, sorted, c0, c1, 1u, row,
-            min(Q4E_NVFP4_DN_ROWS, out_dim - row), in_dim, out_dim, lane);
+    const uint8_t *w = down_w + first * (in_dim / 2u);
+    const uint8_t *s = down_s + first * (in_dim / Q4E_NVFP4_GROUP);
+    const uint32_t rows = min(Q4E_NVFP4_DN_ROWS, out_dim - row);
+    const uint32_t groups = in_dim / Q4E_NVFP4_GROUP;
+    if (groups > 32u && groups <= 64u && (groups & 3u) == 0u
+        && Q4E_NVFP4_DN_ROWS * (groups - 32u) <= 32u) {
+        q4e_mo_nvfp4_down_packed<Q4E_NVFP4_DN_ROWS>(out, w, s, down_g[slot], mid, sorted, c0, c1,
+                                                    1u, row, rows, in_dim, out_dim, lane);
+    } else {
+        q4e_mo_nvfp4_step_rows_pipe<Q4E_NVFP4_DN_ROWS, 2u>(out, w, s, down_g[slot], mid, sorted,
+                                                           c0, c1, 1u, row, rows, in_dim,
+                                                           out_dim, lane);
+    }
 }
 /* ---------------------------------------------------------------------------
  * The routed stages of a prompt pass, on tensor cores.
