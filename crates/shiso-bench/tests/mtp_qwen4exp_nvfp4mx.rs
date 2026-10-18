@@ -1292,7 +1292,7 @@ fn reference_chain(
     fx: &Fixture,
     cfx: &ChainFixture,
     dump: Option<&Path>,
-) -> Vec<f64> {
+) -> ChainResult {
     let width = fx.hidden * fx.streams;
     let depth = cfx.depth;
     let stage_width: usize = cfx.stages.iter().map(|(_, w)| w * fx.hidden).sum();
@@ -1410,7 +1410,34 @@ fn reference_chain(
         std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         report(&format!("wrote {}", path.display()));
     }
-    tallies.iter().map(StepTally::top1).collect()
+    ChainResult {
+        top1: tallies.iter().map(StepTally::top1).collect(),
+        ours: acceptance_rates(&ours_accept, depth),
+        reference: acceptance_rates(&ref_accept, depth),
+    }
+}
+
+/// What a reference-input chain measured, step by step.
+struct ChainResult {
+    /// The head's top-1 agreement with the reference chain's.
+    top1: Vec<f64>,
+    /// This head's acceptance against the target at each draft position.
+    ours: Vec<f64>,
+    /// The reference head's acceptance against the same target.
+    reference: Vec<f64>,
+}
+
+/// Per-position acceptance rates over the starts whose outcome is known.
+fn acceptance_rates(flags: &[Vec<Option<bool>>], depth: usize) -> Vec<f64> {
+    (0..depth)
+        .map(|i| {
+            let col: Vec<bool> = flags
+                .iter()
+                .filter_map(|f| f.get(i).copied().flatten())
+                .collect();
+            frac_usize(col.iter().filter(|b| **b).count(), col.len())
+        })
+        .collect()
 }
 
 /// The staged draft row of a session, as f32.
@@ -1741,8 +1768,24 @@ fn served_greedy(
 
 /// The head's top-1 agreement with the reference chain's, step for step on the
 /// reference's own input, below which a step is wrong rather than rounded
-/// differently: the floor the first step is held to.
+/// differently: the floor the first step is held to, applied to the first
+/// [`CHAIN_TOP1_STEPS`] steps.
 const CHAIN_TOP1_FLOOR: f64 = HEAD_TOP1_FLOOR;
+
+/// Chain steps held to [`CHAIN_TOP1_FLOOR`].
+///
+/// Later steps are not. A chain step's input is the previous step's own pick
+/// and state, so where the head is unsure - the story case's fourth step is
+/// accepted at 0.14 - two arithmetics that agree to rounding pick different
+/// wrong guesses: measured on the FP4-Local head, steps three and four agree on
+/// 0.92-0.96 of starts with f16 and fp8 caches alike, while acceptance against
+/// the target matches the reference's to within 0.007 at every position.
+/// Those steps are held to that instead ([`CHAIN_ACCEPT_GAP`]).
+const CHAIN_TOP1_STEPS: usize = 2;
+
+/// Largest acceptance gap to the reference head at any draft position: what a
+/// draft is for. Measured 0.007 at worst once the head bound its own mix.
+const CHAIN_ACCEPT_GAP: f64 = 0.02;
 
 #[test]
 #[ignore = "needs the local Qwen3.8-Flash-Next FP4-Local export and a device"]
@@ -1808,8 +1851,19 @@ fn the_draft_chain_agrees_with_the_library_reference_chain() {
     let mut failures = Vec::new();
     for (fx, cfx) in &sets {
         for (case, chain) in fx.cases.iter().zip(&cfx.cases) {
-            let top1 = reference_chain(&backend, &mut model, case, chain, fx, cfx, dump.as_deref());
-            for (j, agree) in top1.iter().enumerate() {
+            let result =
+                reference_chain(&backend, &mut model, case, chain, fx, cfx, dump.as_deref());
+            for (j, (ours, reference)) in result.ours.iter().zip(&result.reference).enumerate() {
+                if (ours - reference).abs() > CHAIN_ACCEPT_GAP {
+                    failures.push(format!(
+                        "{}: draft position {} is accepted at {ours:.3} against the reference \
+                         head's {reference:.3}",
+                        case.name,
+                        j + 1
+                    ));
+                }
+            }
+            for (j, agree) in result.top1.iter().enumerate().take(CHAIN_TOP1_STEPS) {
                 if *agree < CHAIN_TOP1_FLOOR {
                     failures.push(format!(
                         "{}: chain step {j}'s top 1 agrees with the reference chain's at \
