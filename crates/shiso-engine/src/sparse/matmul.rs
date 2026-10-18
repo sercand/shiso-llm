@@ -640,6 +640,12 @@ pub enum RouteSort {
     /// [`crate::sparse::moe::ROUTE_TINY_MAX_TOKENS`] rows, the small one past
     /// that: the same results at a shorter serial chain.
     Tiny,
+    /// [`Self::Tiny`], and on a step or verify pass of at most
+    /// [`crate::sparse::moe::FUSED_ROUTE_MAX_TOKENS`] rows whose router,
+    /// shared expert and gate are in the formats it reads, the router, the
+    /// selection and the shared expert as one launch
+    /// ([`crate::sparse::moe::fused_route`]): the same results again.
+    Fused,
 }
 
 /// The kernel a prompt pass's brain-float projections take.

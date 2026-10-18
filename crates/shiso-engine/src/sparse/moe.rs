@@ -338,15 +338,18 @@ pub fn route_sort(shape: &SparseShape, n_tok: u32, device: Device) -> Plan {
     // The tiny entry is the small one's results at a shorter serial chain
     // (GB10: 12.7 -> 7.8 us at one token), for the widths it takes, on a
     // kernel set that has it.
-    let (entry, threads) =
-        if device.route_sort == matmul::RouteSort::Tiny && n_tok <= ROUTE_TINY_MAX_TOKENS {
-            ("q4e_moe_route_sort_tiny_kernel", ROUTE_TINY_THREADS)
-        } else {
-            (
-                "q4e_moe_route_sort_small_kernel",
-                32 * ROUTE_SORT_MAX_TOKENS,
-            )
-        };
+    let (entry, threads) = if matches!(
+        device.route_sort,
+        matmul::RouteSort::Tiny | matmul::RouteSort::Fused
+    ) && n_tok <= ROUTE_TINY_MAX_TOKENS
+    {
+        ("q4e_moe_route_sort_tiny_kernel", ROUTE_TINY_THREADS)
+    } else {
+        (
+            "q4e_moe_route_sort_small_kernel",
+            32 * ROUTE_SORT_MAX_TOKENS,
+        )
+    };
     let mut plan = Plan::new();
     plan.launch(
         Entry::plain(MOD_MOE, entry),
@@ -363,6 +366,184 @@ pub fn route_sort(shape: &SparseShape, n_tok: u32, device: Device) -> Plan {
             Operand::Scratch(Buf::MoeWsPos),
             Operand::U32(n_tok),
             Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+        ]),
+    );
+    plan
+}
+
+/// Rows up to which a step or verify pass can take [`fused_route`]
+/// (`Q4E_FR_ROWS`): the tiny selection's width.
+pub const FUSED_ROUTE_MAX_TOKENS: u32 = ROUTE_TINY_MAX_TOKENS;
+/// Words of [`Buf::MoeSync`] the fused route launch orders its work through
+/// (`Q4E_FR_SYNC_*`).
+pub const FUSED_ROUTE_SYNC_WORDS: u32 = 4;
+/// Warps a block of the fused route launch runs (`Q4E_FR_WARPS`): each item
+/// is eight shared gate-and-up rows, eight slices of router rows, or sixteen
+/// shared down rows.
+const FUSED_ROUTE_WARPS: u32 = 8;
+/// The widest block input the fused route launch stages a shared row's scales
+/// for (`Q4E_FR_MX_SCALES` groups of 32).
+const FUSED_ROUTE_MAX_IN: u32 = 5_120;
+/// The contraction width the shared gate and up must be whole chunks of
+/// (`Q4E_MX_CHUNK`).
+const FUSED_ROUTE_IN_ALIGN: u32 = 512;
+/// Rows of the shared down projection one fused route item covers: two a
+/// warp (`q4e_mx_rows<NT, 2, 1>`).
+const FUSED_ROUTE_DOWN_ROWS: u32 = 2 * FUSED_ROUTE_WARPS;
+/// Dynamic shared memory a fused route block reserves and never touches: with
+/// the 11 KB it declares, two blocks fill a GB10 multiprocessor's 100 KB.
+///
+/// A throttle, measured: at the three blocks an SM its registers allow, the
+/// gate-and-up items' row pairs and the router's slices all in flight at once
+/// queued the memory system so deep that every item took longer, and the
+/// launch took 46.5 us at one row; at two, 39.3 us (two rows 41.6 -> 39.5).
+/// From three rows on the verify entry's own registers hold it near two
+/// blocks and the reservation measured no better (eight rows 54.2 -> 57.5,
+/// with less of the multiprocessor left to the first-level cache the rows'
+/// activations are read through), so only the passes of at most
+/// [`FUSED_ROUTE_THROTTLED`] rows take it. A launch parameter, not a sum: no
+/// value moves with it. Below the 48 KB a launch takes without opting in.
+pub const FUSED_ROUTE_SMEM: u32 = 36_000;
+/// The widest pass that takes [`FUSED_ROUTE_SMEM`].
+pub const FUSED_ROUTE_THROTTLED: u32 = 2;
+
+/// Whether a pass takes [`fused_route`] in place of the router's projection,
+/// [`route_sort`], the shared expert's branch and its gate logit.
+///
+/// Only where it reproduces them bit for bit: a step or verify pass (a prompt
+/// pass's router takes the tensor-core GEMM, whose sums differ) of at most
+/// [`FUSED_ROUTE_MAX_TOKENS`] rows that [`route_sorts`], on a device whose
+/// brain-float projections take [`kernels::MOD_BF16`]'s step kernels, with a
+/// brain-float router and gate and an MXFP8 shared expert at the widths the
+/// launch is written for. A pass that misses any of these keeps the separate
+/// launches - and since both reproduce the same kernels' arithmetic, which
+/// one a pass takes moves no bit.
+#[must_use]
+pub fn route_fuses(shape: &SparseShape, desc: &ExpertDesc, n_tok: u32, device: Device) -> bool {
+    let hidden = shape.hidden;
+    let inter = shape.moe.intermediate;
+    let bf16 = |w: crate::sparse::weights::WeightDesc, out_dim: u32| {
+        w.dtype == DType::BF16 && w.in_dim == hidden && w.out_dim == out_dim
+    };
+    let mx = |w: crate::sparse::weights::WeightDesc, in_dim: u32, out_dim: u32| {
+        w.dtype == DType::Mxfp8E4M3G32 && w.in_dim == in_dim && w.out_dim == out_dim
+    };
+    device.route_sort == matmul::RouteSort::Fused
+        && matches!(device.prompt_matmul, matmul::PromptMatmul::Tensor)
+        && !device.row_invariant()
+        && (1..=FUSED_ROUTE_MAX_TOKENS).contains(&n_tok)
+        && route_sorts(shape, n_tok)
+        && hidden.is_multiple_of(FUSED_ROUTE_IN_ALIGN)
+        && hidden <= FUSED_ROUTE_MAX_IN
+        && inter.is_multiple_of(32)
+        && bf16(desc.router, shape.moe.experts)
+        && bf16(desc.shared_router, 1)
+        && mx(desc.shared_gate, hidden, inter)
+        && mx(desc.shared_up, hidden, inter)
+        && mx(desc.shared_down, inter, hidden)
+}
+
+/// The router's projection, the shared expert's gate logit, the routed
+/// selection and sort, and the shared expert's gate, up, activation and down,
+/// as one launch over the block input: what [`router_logits`], [`route_sort`],
+/// [`shared_expert`] and [`shared_logit`] write, into the same buffers, bit
+/// for bit. The caller checks [`route_fuses`] first.
+///
+/// At a decode step those were seven launches, two of them on a branch: the
+/// router and the shared expert's gate and up side by side (33 and 35 us in
+/// the model), the one-block selection behind the router (11 us), the
+/// activation, the shared down projection, and the gate logit after the join.
+/// Here they are the work items of one grid (`q4e_ffn_route_kernel`): the
+/// router item that finishes last runs the selection while the shared down
+/// items stream, and nothing the pass reads afterwards changes. GB10, kernel
+/// bench over 24 layers' weights: one row 51.0 -> 39.3 us, two 59.8 -> 39.5,
+/// five 65.1 -> 46.8, eight 74.1 -> 54.2.
+#[must_use]
+pub fn fused_route(shape: &SparseShape, desc: &ExpertDesc, layer: LayerRef, n_tok: u32) -> Plan {
+    let hidden = shape.hidden;
+    let inter = shape.moe.intermediate;
+    // The slice counts the brain-float step kernels take for these weights
+    // (`matmul::project` hands them the same), which fix each logit's sum.
+    let splits = matmul::bf16_split(desc.router.in_dim, desc.router.out_dim);
+    let gate_splits = matmul::bf16_split(desc.shared_router.in_dim, desc.shared_router.out_dim);
+    let blocks = inter.div_ceil(FUSED_ROUTE_WARPS)
+        + shape.moe.experts * splits / FUSED_ROUTE_WARPS
+        + 1
+        + hidden.div_ceil(FUSED_ROUTE_DOWN_ROWS);
+    let at = |role: Role| WeightRef::layer(layer, role);
+    let scales = |role: Role| Operand::Weight(at(role).spanning(WeightPart::GroupScales));
+    let entry = if n_tok == 1 {
+        "q4e_ffn_route_kernel"
+    } else {
+        "q4e_ffn_route_rows_kernel"
+    };
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::plain(kernels::MOD_FFN, entry),
+        kernels::Launch::new(
+            shiso_core::Extent3::linear(blocks),
+            FUSED_ROUTE_WARPS * kernels::WARP,
+            if n_tok <= FUSED_ROUTE_THROTTLED {
+                FUSED_ROUTE_SMEM
+            } else {
+                0
+            },
+        ),
+        // `logits, gate_logit, mid, shared_out, ids, weights, bounds, active,
+        //  sorted, pos, sync, router, gate, g_codes, g_scales, u_codes,
+        //  u_scales, d_codes, d_scales, x, in_dim, n_expert, n_used, inter,
+        //  splits, gate_splits, rows`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeRouter),
+            Operand::Scratch(Buf::SharedLogit),
+            Operand::Scratch(Buf::SharedMid),
+            Operand::Scratch(Buf::SharedOut),
+            Operand::Scratch(Buf::MoeIds),
+            Operand::Scratch(Buf::MoeWeights),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            Operand::Scratch(Buf::MoeSorted),
+            Operand::Scratch(Buf::MoeWsPos),
+            Operand::Scratch(Buf::MoeSync),
+            Operand::Weight(at(Role::Router)),
+            Operand::Weight(at(Role::SharedRouter)),
+            Operand::Weight(at(Role::SharedGate)),
+            scales(Role::SharedGate),
+            Operand::Weight(at(Role::SharedUp)),
+            scales(Role::SharedUp),
+            Operand::Weight(at(Role::SharedDown)),
+            scales(Role::SharedDown),
+            Operand::Scratch(Buf::Mixed),
+            Operand::U32(hidden),
+            Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+            Operand::U32(inter),
+            Operand::U32(splits),
+            Operand::U32(gate_splits),
+            Operand::U32(n_tok),
+        ]),
+    );
+    plan
+}
+
+/// [`combine`] then [`shared_add`] as one launch (`q4e_ffn_combine_kernel`):
+/// the same expressions in the same order, the routed sum never stored in
+/// between - the close of a block whose shared expert [`fused_route`] ran.
+#[must_use]
+pub fn fused_close(shape: &SparseShape, n_tok: u32) -> Plan {
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::plain(kernels::MOD_FFN, "q4e_ffn_combine_kernel"),
+        kernels::moe_combine(shape.hidden, n_tok),
+        // `out, down, weights, shared, logit, n_embd, n_used`
+        Args::of(&[
+            Operand::Scratch(Buf::BlockOut),
+            Operand::Scratch(Buf::MoeDown),
+            Operand::Scratch(Buf::MoeWeights),
+            Operand::Scratch(Buf::SharedOut),
+            Operand::Scratch(Buf::SharedLogit),
+            Operand::U32(shape.hidden),
             Operand::U32(shape.moe.used),
         ]),
     );
@@ -2027,6 +2208,23 @@ pub fn block(
     if desc.gate.dtype.is_affine()
         || matches!(desc.gate.dtype, DType::Fp8E4M3Block128 | DType::Nvfp4Gs16)
     {
+        // A step or verify pass whose router and shared expert the fused
+        // route launch reads computes all of them, the selection included,
+        // in that one launch; the routed stages follow it on the same stream
+        // and the shared expert's output and gate logit are in place for the
+        // add.
+        if route_fuses(shape, desc, n_tok, device) {
+            let mut plan = fused_route(shape, desc, layer, n_tok);
+            if layer.set == WeightSet::Target {
+                plan.push(Step::Fetch {
+                    layer: layer.index,
+                    ids: u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX),
+                });
+            }
+            plan.append(affine_experts(shape, desc, layer, n_tok, device)?);
+            plan.append(fused_close(shape, n_tok));
+            return Ok(plan);
+        }
         // A decode-sized pass routes and sorts in one launch, which is the
         // same answer as the four-launch route and sort bit for bit - so a
         // prompt pass narrow enough to take it still routes a row as a wider

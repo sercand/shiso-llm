@@ -15,6 +15,7 @@
 
 pub mod affine;
 pub mod bf16;
+pub mod ffn;
 pub mod fp8;
 pub mod gdn;
 pub mod gdn_fused;

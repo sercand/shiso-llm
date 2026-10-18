@@ -612,6 +612,8 @@ fn every_path() -> Plan {
     // pair, at a decode row, a verify, a batched verify's passes and (the
     // separate tensor-core launches) a prompt chunk.
     plan.append(mxfp8_groups(&shape, prompt));
+    // The mixed export's routed block through the fused route launch.
+    plan.append(fused_routes(&shape));
     plan.launch(
         kernels::Entry::plain(kernels::MOD_MISC, "q4e_argmax_rows_kernel"),
         kernels::argmax_rows(9),
@@ -713,6 +715,208 @@ fn mxfp8_groups(shape: &SparseShape, prompt: Device) -> Plan {
         plan.append(block);
     }
     plan
+}
+
+/// A step device whose kernel set has the fused route launch and the
+/// brain-float step kernels it reproduces.
+const FUSED: Device = Device {
+    prompt_matmul: matmul::PromptMatmul::Tensor,
+    route_sort: matmul::RouteSort::Fused,
+    ..GPU
+};
+
+/// The NVIDIA mixed export's routed block: NVFP4 experts, a brain-float
+/// router and gate, an MXFP8 shared expert.
+fn mixed_experts(shape: &SparseShape) -> ExpertDesc {
+    let inter = shape.moe.intermediate;
+    let nv = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::Nvfp4Gs16, in_dim, out_dim);
+    let mx = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::Mxfp8E4M3G32, in_dim, out_dim);
+    let bf = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::BF16, in_dim, out_dim);
+    ExpertDesc {
+        router: bf(shape.hidden, shape.moe.experts),
+        gate: nv(shape.hidden, inter),
+        up: nv(shape.hidden, inter),
+        down: nv(inter, shape.hidden),
+        shared_router: bf(shape.hidden, 1),
+        shared_gate: mx(shape.hidden, inter),
+        shared_up: mx(shape.hidden, inter),
+        shared_down: mx(inter, shape.hidden),
+    }
+}
+
+/// The mixed export's routed block at a decode row and a verify, through the
+/// fused route launch.
+fn fused_routes(shape: &SparseShape) -> Plan {
+    let experts = mixed_experts(shape);
+    let mut plan = Plan::new();
+    for rows in [1, 5] {
+        plan.append(
+            moe::block(shape, &experts, LayerRef::target(0), rows, FUSED)
+                .expect("the mixed export's routed block has a tier"),
+        );
+    }
+    plan
+}
+
+#[test]
+fn a_step_routes_and_runs_its_shared_expert_in_one_launch_where_the_set_has_it() {
+    let shape = shape();
+    let experts = mixed_experts(&shape);
+    for rows in 1..=moe::FUSED_ROUTE_MAX_TOKENS {
+        let block = moe::block(&shape, &experts, LayerRef::target(0), rows, FUSED)
+            .expect("the mixed export's routed block has a tier");
+        let names = block.names();
+        let entry = if rows == 1 {
+            "q4e_ffn_route_kernel"
+        } else {
+            "q4e_ffn_route_rows_kernel"
+        };
+        // The router, the selection, the shared expert and its gate logit are
+        // the one launch: nothing of theirs is left, and nothing forks.
+        assert_eq!(block.count(entry), 1, "{names:?}");
+        for gone in [
+            "q4e_bf16_gemv_kernel",
+            "q4e_bf16_rows_kernel",
+            "q4e_moe_route_sort_tiny_kernel",
+            "q4e_mxfp8_gemv_group_narrow_kernel",
+            "q4e_mxfp8_rows_group_kernel",
+            "q4e_swiglu_kernel",
+            "q4e_mxfp8_gemv_kernel",
+            "q4e_mxfp8_rows_kernel",
+            "q4e_moe_combine_kernel",
+            "q4e_shared_add_kernel",
+            "fork",
+            "join",
+        ] {
+            assert!(!block.launches(gone), "{gone} at {rows} rows: {names:?}");
+        }
+        let at = |what: &str| names.iter().position(|n| *n == what);
+        assert!(
+            at(entry) < at("fetch routed experts")
+                && at("fetch routed experts") < at("q4e_nvfp4_experts_down_kernel")
+                && at("q4e_nvfp4_experts_down_kernel") < at("q4e_ffn_combine_kernel")
+                && at("q4e_ffn_combine_kernel") == Some(names.len() - 1)
+                && at(entry) == Some(0),
+            "{names:?}"
+        );
+        // Every buffer the separate launches wrote, and the words it orders
+        // its items through.
+        let step = block
+            .steps()
+            .iter()
+            .find(|step| step.entry().is_some_and(|e| e.name() == entry))
+            .expect("the fused launch is a step of the plan");
+        let operands = step.operands().expect("a launch's operands");
+        for buf in [
+            Buf::MoeRouter,
+            Buf::SharedLogit,
+            Buf::SharedMid,
+            Buf::SharedOut,
+            Buf::MoeIds,
+            Buf::MoeWeights,
+            Buf::MoeBounds,
+            Buf::MoeActive,
+            Buf::MoeSorted,
+            Buf::MoeWsPos,
+            Buf::MoeSync,
+            Buf::Mixed,
+        ] {
+            assert!(operands.contains(&Operand::Scratch(buf)), "{buf:?}");
+        }
+    }
+}
+
+#[test]
+fn the_fused_route_launch_covers_every_item_and_keeps_the_step_kernels_slices() {
+    let shape = shape();
+    let experts = mixed_experts(&shape);
+    let block = moe::block(&shape, &experts, LayerRef::target(0), 1, FUSED)
+        .expect("the mixed export's routed block has a tier");
+    let step = block
+        .steps()
+        .iter()
+        .find(|step| {
+            step.entry()
+                .is_some_and(|e| e.name() == "q4e_ffn_route_kernel")
+        })
+        .expect("the fused launch is a step of the plan");
+    let shiso_engine::sparse::plan::Step::Kernel { launch, .. } = step else {
+        panic!("the fused route is an ordinary launch");
+    };
+    // Eighty shared gate-and-up items of eight rows, 256 router items of two
+    // rows at four slices and the gate's, 160 shared down items of sixteen.
+    assert_eq!(launch.grid.x, 640 / 8 + 512 * 4 / 8 + 1 + 2_560 / 16);
+    assert_eq!(launch.block.x, 256);
+    let operands = step.operands().expect("a launch's operands");
+    // `..., in_dim, n_expert, n_used, inter, splits, gate_splits, rows`: the
+    // slice counts the brain-float step kernels take for the two weights.
+    let tail: Vec<Operand> = operands[operands.len() - 7..].to_vec();
+    assert_eq!(
+        tail,
+        [
+            Operand::U32(2_560),
+            Operand::U32(512),
+            Operand::U32(10),
+            Operand::U32(640),
+            Operand::U32(matmul::bf16_split(2_560, 512)),
+            Operand::U32(matmul::bf16_split(2_560, 1)),
+            Operand::U32(1),
+        ]
+    );
+}
+
+#[test]
+fn a_pass_the_fused_route_cannot_reproduce_keeps_the_separate_launches() {
+    let shape = shape();
+    let experts = mixed_experts(&shape);
+    let fused = |rows: u32, device: Device, desc: &ExpertDesc| {
+        moe::block(&shape, desc, LayerRef::target(0), rows, device)
+            .expect("a routed block has a tier")
+            .names()
+            .iter()
+            .any(|n| n.starts_with("q4e_ffn_route"))
+    };
+    assert!(fused(1, FUSED, &experts));
+    // Wider than the tiny selection.
+    assert!(!fused(moe::FUSED_ROUTE_MAX_TOKENS + 1, FUSED, &experts));
+    // A kernel set without the launch, or without the step kernels whose sums
+    // it reproduces.
+    assert!(!fused(
+        1,
+        Device {
+            route_sort: matmul::RouteSort::Tiny,
+            ..FUSED
+        },
+        &experts
+    ));
+    assert!(!fused(
+        1,
+        Device {
+            prompt_matmul: matmul::PromptMatmul::Rows,
+            ..FUSED
+        },
+        &experts
+    ));
+    // A prompt pass, whose router takes the tensor-core GEMM.
+    assert!(!fused(
+        1,
+        Device {
+            role: PassRole::Prompt { snapshot: None },
+            ..FUSED
+        },
+        &experts
+    ));
+    // A shared expert or a router in another format.
+    let half_shared = ExpertDesc {
+        shared_gate: half(shape.hidden, shape.moe.intermediate),
+        ..experts
+    };
+    assert!(!fused(1, FUSED, &half_shared));
+    let half_router = ExpertDesc {
+        router: half(shape.hidden, shape.moe.experts),
+        ..experts
+    };
+    assert!(!fused(1, FUSED, &half_router));
 }
 
 /// The stream mixes over brain-float weights on a tensor-core device: a
@@ -1183,6 +1387,7 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "../q4e_lowp/mxfp8_a8.cu",
         "bf16.cu",
         "modelopt.cu",
+        "ffn.cu",
     ] {
         let path = dir.join(unit);
         let text = std::fs::read_to_string(&path)
@@ -1420,6 +1625,9 @@ fn every_launch_binds_exactly_the_parameters_its_kernel_declares() {
         "q4e_mxfp8_gemv_group_kernel",
         "q4e_mxfp8_gemv_group_narrow_kernel",
         "q4e_mxfp8_rows_group_kernel",
+        "q4e_ffn_route_kernel",
+        "q4e_ffn_route_rows_kernel",
+        "q4e_ffn_combine_kernel",
     ] {
         assert!(seen.contains(entry), "{entry} was never bound: {seen:?}");
     }

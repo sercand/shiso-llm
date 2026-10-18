@@ -33,7 +33,11 @@
 # beside the ported `matvec` kernel it replaces there. `gdn_fused` is a
 # seventh: a prefill chunk's whole recurrent block between its projections in
 # two kernels, bit for bit what the `gdn`/`gdn_tc` chain computes, with the
-# intermediates the chain writes kept out of memory.
+# intermediates the chain writes kept out of memory. `ffn` is an eighth: a
+# decode step's or a verify's router, routed selection and shared expert as
+# one launch of work items, bit for bit what the `bf16`/`moe`/`mxfp8` launches
+# it replaces compute; it shares `mxfp8.cuh` with `mxfp8` so the two run the
+# same MXFP8 arithmetic.
 
 [build]
 sources = [
@@ -55,6 +59,7 @@ sources = [
     "idxring.cu",
     "bf16.cu",
     "gdn_fused.cu",
+    "ffn.cu",
 ]
 
 # Every unit includes `q4e.cuh` by bare name, and that header reaches its own
@@ -106,3 +111,4 @@ mxfp8 = "q4e_mxfp8"
 idxring = "q4e_idxring"
 bf16 = "q4e_bf16"
 gdn_fused = "q4e_gdn_fused"
+ffn = "q4e_ffn"
