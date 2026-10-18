@@ -436,6 +436,42 @@ __device__ __forceinline__ void q4e_fr_mx_pair(
                             sstage + r * Q4E_FR_MX_SCALES + base / Q4E_MX_GROUP + 4u * q);
                 }
             }
+            /* `q4e_mx_rows`' fast weights (mxfp8.cuh) unless this chunk holds
+             * a NaN code or a scale of 135 or more: bit for bit the same
+             * weights either way, a dozen integer operations a weight fewer
+             * on the fast side. */
+            uint32_t odd = 0u;
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                odd |= q4e_mx_nan4(buf[d][r].x) | q4e_mx_nan4(buf[d][r].y)
+                     | q4e_mx_nan4(buf[d][r].z) | q4e_mx_nan4(buf[d][r].w)
+                     | q4e_mx_big4(sw[r][0]) | q4e_mx_big4(sw[r][1])
+                     | q4e_mx_big4(sw[r][2]) | q4e_mx_big4(sw[r][3]);
+            }
+            if (!__any_sync(0xffffffffu, odd != 0u)) {
+#pragma unroll
+                for (uint32_t j = 0; j < Q4E_MX_CHUNK / 64u; j++) {
+                    const uint32_t e = base + 2u * lane + 64u * j;
+                    float2 xv[NT];
+#pragma unroll
+                    for (int t = 0; t < NT; t++) {
+                        xv[t] = __ldg(reinterpret_cast<const float2 *>(x + (uint64_t) t * in_dim + e));
+                    }
+#pragma unroll
+                    for (int r = 0; r < 2; r++) {
+                        const uint32_t p = *reinterpret_cast<const uint16_t *>(
+                                stage + r * Q4E_MX_CHUNK + 2u * lane + 64u * j);
+                        const float2 w = q4e_mx_pair_k(
+                                p, q4e_mx_k(sw[r][j >> 1] + 0x78787878u, 2u * (j & 1u) + hi));
+#pragma unroll
+                        for (int t = 0; t < NT; t++) {
+                            acc[r][t] = q4e_mx_fma(w.x, xv[t].x, acc[r][t]);
+                            acc[r][t] = q4e_mx_fma(w.y, xv[t].y, acc[r][t]);
+                        }
+                    }
+                }
+                continue;
+            }
 #pragma unroll
             for (uint32_t j = 0; j < Q4E_MX_CHUNK / 64u; j++) {
                 const uint32_t e = base + 2u * lane + 64u * j;
