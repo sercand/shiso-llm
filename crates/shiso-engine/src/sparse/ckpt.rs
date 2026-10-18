@@ -1081,8 +1081,9 @@ mod tests {
 
     #[test]
     fn an_fp8_page_is_the_f16_page_less_half_of_every_attention_plane() {
-        // The indexer planes stay f16, so the page shrinks by exactly the
-        // attention ranks' key and value bytes halved - draft head included.
+        // The indexer planes stay f16, and so do the draft head's key and value
+        // planes (`PagePlanes::rank_kv`), so the page shrinks by exactly the
+        // target attention ranks' key and value bytes halved.
         let shape = shape();
         let f16 = paged::page_bytes(&shape, PagePlanes::full());
         let fp8 = paged::page_bytes(
@@ -1092,7 +1093,7 @@ mod tests {
                 ..PagePlanes::full()
             },
         );
-        let ranks = u64::from(shape.count(LayerKind::Attn)) + 1;
+        let ranks = u64::from(shape.count(LayerKind::Attn));
         let kv_f16 = 2 * u64::from(shiso_core::page::PAGE_TOKENS) * u64::from(shape.kv_dim()) * 2;
         assert_eq!(f16 - fp8, ranks * kv_f16 / 2);
     }

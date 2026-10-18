@@ -935,7 +935,11 @@ impl SparseStack {
                                 .kv_pool_pages
                                 .saturating_mul(shiso_core::page::PAGE_TOKENS),
                             ctx: self.opts.engine.ctx,
-                            kv: self.opts.engine.kv_elem,
+                            // The draft head's planes stay f16 whatever the
+                            // target's are: see `PagePlanes::rank_kv`.
+                            kv: self
+                                .page_planes()
+                                .rank_kv(slot.set == crate::sparse::bind::WeightSet::Draft),
                         };
                         plan.append(qsa::block(&self.shape, &desc, attn, *ctx, n_tok, device)?);
                     }

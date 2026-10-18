@@ -134,13 +134,28 @@ pub struct PagePlanes {
     /// contributes a full attention layer's worth of planes rather than only a
     /// key and a value.
     pub draft: bool,
-    /// The element every attention rank's key and value planes are stored as,
-    /// the draft head's included: it runs the same attention kernels over its
-    /// own planes, so it reads them the same way.
+    /// The element the target's attention ranks store their key and value
+    /// planes as. The draft head's planes are always f16: see
+    /// [`PagePlanes::rank_kv`].
     pub kv: KvElem,
 }
 
 impl PagePlanes {
+    /// The element rank planes are stored as: the configured one for a target
+    /// rank, f16 for the draft head's.
+    ///
+    /// The draft head writes its own chain rows into its planes and reads them
+    /// back on the next chain step, so a rounding there compounds down the
+    /// chain where the target's does not. Measured against the library
+    /// reference's chained head on this family's FP4 export: with e4m3 draft
+    /// planes the per-step agreement fell from 0.99/0.98/0.98/0.98 to
+    /// 0.98/0.93/0.90/0.85 and served acceptance at the fourth draft from 0.61
+    /// to 0.48, for a rank that is one of thirteen.
+    #[must_use]
+    pub const fn rank_kv(self, draft_rank: bool) -> KvElem {
+        if draft_rank { KvElem::F16 } else { self.kv }
+    }
+
     /// Both planes present, which is what a stack with an indexer and a draft
     /// head runs.
     #[must_use]
@@ -177,16 +192,20 @@ impl PagePlanes {
 #[must_use]
 pub fn page_bytes(shape: &SparseShape, planes: PagePlanes) -> u64 {
     let attn = u64::from(shape.count(LayerKind::Attn));
-    let kv = Plane::Key
-        .page_bytes(shape, planes.kv)
-        .saturating_add(Plane::Value.page_bytes(shape, planes.kv));
+    let rank_kv = |draft: bool| {
+        let kv = planes.rank_kv(draft);
+        Plane::Key
+            .page_bytes(shape, kv)
+            .saturating_add(Plane::Value.page_bytes(shape, kv))
+    };
+    let kv = rank_kv(false);
     let idx = Plane::IndexerPooled.page_bytes(shape, planes.kv);
     let mut bytes = attn.saturating_mul(kv);
     if planes.indexer {
         bytes = bytes.saturating_add(attn.saturating_mul(idx));
     }
     if planes.draft {
-        bytes = bytes.saturating_add(kv);
+        bytes = bytes.saturating_add(rank_kv(true));
         if planes.indexer {
             bytes = bytes.saturating_add(idx);
         }
@@ -552,7 +571,7 @@ impl PagedKv {
                     (false, Plane::Key | Plane::Value) => MemTag::KvAttention,
                     (false, Plane::IndexerPooled) => MemTag::KvIndexer,
                 };
-                let stride = plane.page_bytes(shape, planes.kv);
+                let stride = plane.page_bytes(shape, planes.rank_kv(draft));
                 let bytes = u64::from(pool_pages).checked_mul(stride).ok_or_else(|| {
                     CoreError::InvalidValue {
                         key: "kv_pool_pages",
@@ -953,7 +972,9 @@ mod tests {
         };
         let tokens = u64::from(PAGE_TOKENS);
         // One attention rank plus the head: key and value at two heads of 256,
-        // then one pooled f16 row of 128 per four positions.
+        // then one pooled f16 row of 128 per four positions. The head's key and
+        // value stay f16 whatever the target's are.
+        let head = 2 * 2 * 256 * 2 + 64;
         for (kv, per_rank) in [
             (KvElem::F16, 2 * 2 * 256 * 2 + 64),
             (KvElem::Fp8E4m3, 2 * 2 * 256 + 64),
@@ -962,7 +983,7 @@ mod tests {
                 kv,
                 ..PagePlanes::full()
             };
-            assert_eq!(page_bytes(&shape, planes), 2 * per_rank * tokens);
+            assert_eq!(page_bytes(&shape, planes), (per_rank + head) * tokens);
         }
         assert_eq!(ring_ranks(&shape, PagePlanes::full()), 2);
         assert_eq!(ring_ranks(&shape, PagePlanes::indexer_only()), 1);

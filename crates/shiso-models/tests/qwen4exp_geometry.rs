@@ -49,9 +49,11 @@ fn a_page_carries_every_attention_layer_s_three_planes() {
 fn a_cached_token_costs_what_the_reference_server_s_cache_costs() {
     // Thirteen ranks - twelve attention layers and the draft head - of a key
     // and a value at two heads of 256, plus a quarter of a 128-wide f16 pooled
-    // row. 27,456 bytes a token at f16 and 14,144 at one byte an element: the
-    // figures the reference server's cache costs on the same model. With the
-    // raw key plane the page carried until now they were 30,784 and 17,472.
+    // row. 27,456 bytes a token at f16. At one byte an element the twelve
+    // target ranks shrink and the draft head's key and value stay f16
+    // (`PagePlanes::rank_kv`: its chain reads back its own rows, and e4m3 there
+    // measurably costs acceptance), so 12 * 1,088 + 2,112 = 15,168; without a
+    // draft head it is 13,056, below the reference server's 14,144.
     let shape = shape();
     let per_token = |kv| {
         page_bytes(
@@ -63,7 +65,7 @@ fn a_cached_token_costs_what_the_reference_server_s_cache_costs() {
         ) / u64::from(PAGE_TOKENS)
     };
     assert_eq!(per_token(KvElem::F16), 27_456);
-    assert_eq!(per_token(KvElem::Fp8E4m3), 14_144);
+    assert_eq!(per_token(KvElem::Fp8E4m3), 15_168);
     // What the raw plane cost, 256 bytes a rank a token, is now a session's
     // ring: sixteen rows a rank, whatever the context.
     assert_eq!(ring_bytes(&shape, PagePlanes::full()), 13 * 16 * 128 * 2);
