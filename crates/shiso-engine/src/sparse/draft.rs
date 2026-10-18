@@ -112,6 +112,32 @@ pub enum DraftProbe {
     PostAttention,
 }
 
+/// Whose answers decide what a speculative step keeps: see
+/// [`SparseStack::speculate_judged`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Judge<'a> {
+    /// The target's own greedy picks: the served step.
+    Target,
+    /// A given text: `text[i]` stands in for the target's answer at verify row
+    /// `i`, which is the token at the position after the step's frontier plus
+    /// `i`. The step commits the guesses that match it, then `text` at the
+    /// first that does not, so a session walks the text whatever its guesses.
+    Forced(&'a [TokenId]),
+}
+
+/// One speculative step as a harness inspects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecTrace {
+    /// The guesses the step verified, in order.
+    pub drafts: Vec<TokenId>,
+    /// The target's own greedy pick at every verify row: row `i` is its pick
+    /// for the position `drafts[i]` proposed, the last row the one after them.
+    /// These are the target's whatever the [`Judge`].
+    pub picks: Vec<TokenId>,
+    /// What the step returned.
+    pub outcome: Speculated,
+}
+
 /// The widths one draft pass plans from.
 ///
 /// Deliberately NOT `#[non_exhaustive]`: a loader builds one.
@@ -870,6 +896,33 @@ impl SparseStack {
         first: TokenId,
         eos: TokenId,
     ) -> CoreResult<Speculated> {
+        Ok(self
+            .speculate_judged(session, first, eos, Judge::Target)?
+            .outcome)
+    }
+
+    /// [`SparseStack::speculate`], with what the step drafted and what the
+    /// target answered handed back, and `judge` deciding what it keeps.
+    ///
+    /// With [`Judge::Target`] this is the served step exactly. With
+    /// [`Judge::Forced`] the step keeps the guesses that match a given text
+    /// instead of the target's picks, so a harness can walk a prompt it holds
+    /// an independent reference for and still exercise every rejection,
+    /// rewind and catch-up a served step runs: the verify pass, the rewind, the
+    /// staged row and the head's catch-up are the served code over the rows the
+    /// text commits.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::speculate`], and [`CoreError::ShapeMismatch`] when a
+    /// forced text is shorter than the step's drafts.
+    pub fn speculate_judged(
+        &mut self,
+        session: SessionId,
+        first: TokenId,
+        eos: TokenId,
+        judge: Judge<'_>,
+    ) -> CoreResult<SpecTrace> {
         let live = self.session(session)?;
         let (depth, frontier) = (live.spec_depth(), live.written());
         let budget = mtp::draft_budget(depth, frontier, self.opts.engine.ctx, MAX_DRAFT + 1);
@@ -885,11 +938,21 @@ impl SparseStack {
         let logit_rows = u32::try_from(rows.len()).unwrap_or(1);
         self.run_rows(session, &rows, logit_rows)?;
         let picks = self.read_picks(logit_rows)?;
+        // The answers the step settles against: the target's own picks, or the
+        // forced text's tokens at the same positions.
+        let answers = match judge {
+            Judge::Target => picks.as_slice(),
+            Judge::Forced(text) => text.get(..rows.len()).ok_or(CoreError::ShapeMismatch {
+                field: "forced verify answers",
+                expected: rows.len() as u64,
+                got: text.len() as u64,
+            })?,
+        };
 
         let outcome = StepOutcome::settle(
             first,
             &drafts,
-            picks.get(..drafts.len()).unwrap_or(&[]),
+            answers.get(..drafts.len()).unwrap_or(&[]),
             eos,
             source,
         )?;
@@ -921,15 +984,20 @@ impl SparseStack {
         // twice.
         let accepted = usize::try_from(outcome.logits_row).unwrap_or(0);
         let mut produced = outcome.committed.get(1..).unwrap_or(&[]).to_vec();
-        produced.push(*picks.get(accepted).ok_or(CoreError::ShapeMismatch {
+        produced.push(*answers.get(accepted).ok_or(CoreError::ShapeMismatch {
             field: "verify rows",
             expected: u64::from(outcome.logits_row).saturating_add(1),
-            got: u64::try_from(picks.len()).unwrap_or(u64::MAX),
+            got: u64::try_from(answers.len()).unwrap_or(u64::MAX),
         })?);
-        Ok(Speculated {
+        let outcome = Speculated {
             produced,
             accepted: outcome.logits_row,
             drafted: u32::try_from(drafts.len()).unwrap_or(u32::MAX),
+        };
+        Ok(SpecTrace {
+            drafts,
+            picks,
+            outcome,
         })
     }
 

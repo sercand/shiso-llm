@@ -47,6 +47,12 @@ Run inside the reference container (transformers 5.19), see `--help`:
     mtp        CPU: the draft head (mtp.*) teacher-forced over a few prompts,
                its top-16 per position beside the target's own pick
     mtp-precision  CPU: that fixture's bf16 head against the same head in f32
+    mtp-chain  CPU: from every position of that fixture, the head's chain of
+               drafts as a served step runs it (each step from the head's own
+               state and pick), per-step picks, top-16 and acceptance
+    mtp-serve  CPU: the reference's own served loop (greedy speculative decoding
+               with its head) after each prompt, and that continuation as a
+               teacher-forced fixture `mtp-chain` reads (`--fixture`)
 
 Helpers shared with the FP8 reference are imported from `qwen4exp_fp8_ref.py`
 by path, so this runs under `python3 -I`.
@@ -1097,6 +1103,67 @@ class PlainNvfp4ExpertStore(Nvfp4ExpertStore):
         return dequant_nvfp4(w, scales, g, what)
 
 
+class KeyRecorder:
+    """A `past_key_values` stand-in that keeps the keys a no-cache pass makes.
+
+    The library's attention hands its rotated keys and values to `update`, and
+    its indexer its raw keys to `update_indexer`, and uses what comes back. This
+    returns them unchanged - the pass is the teacher-forced one bit for bit -
+    and keeps a reference to each.
+    """
+
+    def __init__(self):
+        self.k = self.v = self.raw = None
+
+    def update(self, key_states, value_states, layer_idx):
+        self.k, self.v = key_states, value_states
+        return key_states, value_states
+
+    def update_indexer(self, raw_keys, layer_idx):
+        self.raw = raw_keys
+        return raw_keys
+
+
+class ChainCache:
+    """The head's cache as a chained draft sees it.
+
+    Positions `<= t` hold what the teacher-forced pass wrote there (the head
+    run from the target's own rows), and every chained step appends its own
+    row behind them - the cache a served chain leaves, which is written at the
+    chain's positions and read by the steps after it.
+    """
+
+    def __init__(self, rec: KeyRecorder, t: int):
+        self.k = rec.k[:, :, : t + 1]
+        self.v = rec.v[:, :, : t + 1]
+        self.raw = rec.raw[:, : t + 1]
+        self.raw_pending = None
+
+    @classmethod
+    def over(cls, k, v, raw) -> "ChainCache":
+        """A cache holding exactly these keys, values and raw indexer keys."""
+        cache = cls.__new__(cls)
+        cache.k, cache.v, cache.raw, cache.raw_pending = k, v, raw, None
+        return cache
+
+    def length(self) -> int:
+        return self.k.shape[2]
+
+    def update_indexer(self, raw_keys, layer_idx):
+        # Called before `update` in the same attention call; the raw keys are
+        # committed with the main ones so the two never disagree in length.
+        self.raw_pending = torch.cat([self.raw, raw_keys], dim=1)
+        return self.raw_pending
+
+    def update(self, key_states, value_states, layer_idx):
+        self.k = torch.cat([self.k, key_states], dim=2)
+        self.v = torch.cat([self.v, value_states], dim=2)
+        if self.raw_pending is None or self.raw_pending.shape[1] != self.k.shape[2]:
+            raise RuntimeError("the indexer's keys and the attention's keys disagree in length")
+        self.raw, self.raw_pending = self.raw_pending, None
+        return self.k, self.v
+
+
 class MtpHead:
     """The checkpoint's draft head assembled from the library's own modules.
 
@@ -1188,11 +1255,21 @@ class MtpHead:
         return worst[0], worst[1], tied
 
     @torch.no_grad()
-    def forward(self, hidden: torch.Tensor, next_ids: list[int], probes: dict | None = None) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, next_ids: list[int], probes: dict | None = None,
+                cache=None, start: int = 0, layer_out: list | None = None) -> torch.Tensor:
         """The collapsed rows for `hidden[t]` (four streams) beside `next_ids[t]`.
 
         `probes`, when given, collects every stage in `MTP_STAGES` as a
         [rows, width] f32 tensor.
+
+        `cache` is handed to the layer as its `past_key_values` (see
+        `KeyRecorder` and `ChainCache`); the attention calls nothing on it but
+        `update` and `update_indexer`. With a `ChainCache` the rows sit at
+        positions `start..start+n` behind the keys it already holds, and the
+        mask lets every row see all of those and the rows before it. Without
+        one, `start` must be 0 and the pass is the teacher-forced one.
+        `layer_out`, when given, receives the layer's four-stream output (the
+        state before the collapsing mix, which a chained step reads next).
         """
         ref, m, layer = self.ref, self.mods, self.layer
         n = hidden.shape[0]
@@ -1205,13 +1282,27 @@ class MtpHead:
         fc_hidden = m["fc_hidden"](normed.unflatten(-1, (self.hc, self.hidden_size)))
         x = (fc_hidden + fc_embed.unsqueeze(-2)).flatten(-2)
 
-        # Positions are the target's: the head at t rotates at t. Three axes,
-        # all the same for text, as the text model expands them.
-        pos = torch.arange(n, device=dev).view(1, 1, -1).expand(3, 1, -1)
-        pe = ref.model.model.rotary_emb(x, pos)
-        mask = ref.mq.create_causal_mask(config=ref.config, inputs_embeds=x, attention_mask=None,
-                                         past_key_values=None, position_ids=pos[0],
-                                         allow_is_causal_skip=False)
+        if isinstance(cache, ChainCache):
+            if cache.length() != start:
+                raise ValueError(f"the cache holds {cache.length()} keys, the rows start at {start}")
+            # The indexer and the attention both take the rotary tables of
+            # every key position and slice the queries' rows off the end.
+            total = start + n
+            pos = torch.arange(total, device=dev).view(1, 1, -1).expand(3, 1, -1)
+            pe = ref.model.model.rotary_emb(x, pos)
+            q = torch.arange(start, total, device=dev).view(-1, 1)
+            k = torch.arange(total, device=dev).view(1, -1)
+            mask = (k <= q).view(1, 1, n, total)
+        else:
+            if start != 0:
+                raise ValueError("a pass without a chain cache starts at position 0")
+            # Positions are the target's: the head at t rotates at t. Three
+            # axes, all the same for text, as the text model expands them.
+            pos = torch.arange(n, device=dev).view(1, 1, -1).expand(3, 1, -1)
+            pe = ref.model.model.rotary_emb(x, pos)
+            mask = ref.mq.create_causal_mask(config=ref.config, inputs_embeds=x, attention_mask=None,
+                                             past_key_values=None, position_ids=pos[0],
+                                             allow_is_causal_skip=False)
         hooks, seen = [], {}
         if probes is not None:
             hooks.append(layer.self_attn.register_forward_hook(
@@ -1222,10 +1313,12 @@ class MtpHead:
                 lambda mod, args, out: seen.__setitem__("moe_out", out)))
         try:
             out = layer(x, position_embeddings=pe, attention_mask=mask, conv_mask=None,
-                        past_key_values=None, ple_input_ids=None)
+                        past_key_values=cache, ple_input_ids=None)
         finally:
             for hk in hooks:
                 hk.remove()
+        if layer_out is not None:
+            layer_out.append(out[0])
         mixed = m["hyper_connection_mixer"](out)
         if probes is not None:
             rows = {
@@ -1462,6 +1555,450 @@ def cmd_mtp_precision(args) -> None:
             log(f"  t={t}: {errs}")
 
 
+CHAIN_DEPTH = 4
+# A chained step's stage rows: the four-stream state it was handed (the
+# previous step's layer output; the target's row for step 0), then every stage
+# the teacher-forced fixture records.
+CHAIN_STAGES = (("hidden_in", 4),) + MTP_STAGES
+
+
+def chain_acceptance(picks: list[int], t: int, positions: list[dict], ids: list[int]) -> list:
+    """Whether the target would have accepted each chained pick, where that is known.
+
+    A served verify accepts pick i when picks 0..i are the target's own greedy
+    continuation g_0..g_i after token t+1. g_0 is the recorded target pick at
+    t; g_i for i > 0 is the target's pick after g_0..g_{i-1}, which the
+    teacher-forced record holds only while g_0..g_{i-1} are the prompt's own
+    tokens t+2.. (then it is the recorded pick at t+i). So each step is True,
+    False (this pick or an earlier one rejected) or None (the target's
+    continuation left the prompt before it: unknown, not counted).
+    """
+    out: list = []
+    state = "alive"
+    for i, d in enumerate(picks):
+        if state == "rejected":
+            out.append(False)
+            continue
+        if state == "unknown" or t + i >= len(positions):
+            out.append(None)
+            state = "unknown"
+            continue
+        g = positions[t + i]["target"]
+        if d != g:
+            out.append(False)
+            state = "rejected"
+            continue
+        out.append(True)
+        if t + 2 + i >= len(ids) or ids[t + 2 + i] != g:
+            state = "unknown"
+    return out
+
+
+def text_acceptance(picks: list[int], t: int, ids: list[int]) -> list:
+    """Whether picks 0..i are all the prompt's own tokens t+2..t+2+i (None past its end)."""
+    out: list = []
+    alive = True
+    for i, d in enumerate(picks):
+        if t + 2 + i >= len(ids):
+            out.append(None)
+            continue
+        alive = alive and d == ids[t + 2 + i]
+        out.append(alive)
+    return out
+
+
+def acceptance_summary(flags: list[list]) -> dict:
+    """Per step: the fraction of starts whose step was accepted, among those where it is known."""
+    depth = max((len(f) for f in flags), default=0)
+    rate, known = [], []
+    for i in range(depth):
+        col = [f[i] for f in flags if i < len(f) and f[i] is not None]
+        known.append(len(col))
+        rate.append(round(sum(col) / max(1, len(col)), 4))
+    cond = [rate[0]] + [round(rate[i] / rate[i - 1], 4) if rate[i - 1] else 0.0 for i in range(1, depth)]
+    return {"rate": rate, "known": known, "conditional": cond}
+
+
+def cache_check(head: "MtpHead", hidden: torch.Tensor, ids: list[int], name: str) -> None:
+    """The chain cache's own check, in single precision.
+
+    A cached one-row step handed the teacher-forced inputs of position t + 1
+    must give that position's teacher-forced row. In brain floats the two
+    differ by about 1e-2 (a one-row pass and a 500-row pass round in different
+    orders, the size `mtp-precision` measures for the head's own rounding), so
+    the comparison is made with the head widened to f32, where only a wrong key
+    row, position or mask could leave more than rounding.
+    """
+    ref = head.ref
+    plain = head.store.dequant
+    head.mods.float()
+    ref.model.model.embed_tokens.float()
+    head.store.dequant = lambda parts, what: plain(parts, what).float()
+    try:
+        n = len(ids)
+        rec = KeyRecorder()
+        outs: list = []
+        wide = hidden.float()
+        mixed = head.forward(wide, ids[1:], cache=rec, layer_out=outs)
+        for t in sorted({0, 1, 15, (n - 1) // 2, n - 3}):
+            check: list = []
+            again = head.forward(wide[t + 1: t + 2], [ids[t + 2]], cache=ChainCache(rec, t),
+                                 start=t + 1, layer_out=check)
+            err_mixed = float((again[0] - mixed[t + 1]).norm() / mixed[t + 1].norm())
+            err_out = float((check[0][0] - outs[0][t + 1]).norm() / outs[0][t + 1].norm())
+            log(f"  cache check (f32) t={t + 1}: mixed rel L2 {err_mixed:.2e}, layer out {err_out:.2e}")
+            if err_mixed > 1e-4 or err_out > 1e-4:
+                sys.exit(f"case {name}: a cached step does not reproduce the teacher-forced row at {t + 1}")
+    finally:
+        head.mods.to(torch.bfloat16)
+        ref.model.model.embed_tokens.to(torch.bfloat16)
+        head.store.dequant = plain
+
+
+def cmd_mtp_chain(args) -> None:
+    """Chained draft steps from every position of a `mtp` fixture.
+
+    For each start t: step 0 is the teacher-forced pass at t (the target's row
+    at t beside token t+1), and step j > 0 reads the head's own four-stream
+    layer output from step j-1 (the state before its collapsing mix) beside the
+    embedding of its own step j-1 pick, rotates at t+j, and attends over the
+    head's cache: positions <= t as the teacher-forced pass wrote them (from the
+    target's rows), then the chain's own rows t+1..t+j. That is what a served
+    chain does after the head's cache has been caught up to t. Per step the pick
+    and the top-16 log-probabilities are recorded; at the base fixture's probe
+    positions every stage of every step too.
+    """
+    fx_path = Path(args.fixture).resolve()
+    fx = json.loads(fx_path.read_text())
+    if fx.get("format") != "shiso-mtp-teacher-forced-v1" or fx.get("layers") is not None:
+        sys.exit(f"{fx_path}: not a full-target teacher-forced draft-head fixture")
+    out = Path(args.out).resolve()
+    if out.exists():
+        sys.exit(f"{out} already exists; a recorded answer is replaced only deliberately")
+    side = out.with_suffix("")
+    if side.exists() and not args.resume:
+        sys.exit(f"{side} already exists (--resume keeps the cases it already holds)")
+    side.mkdir(parents=True, exist_ok=True)
+    guard(args.min_start_gib, gpu=False)
+    # One target layer: only the embedding, the rotary tables and the head are read.
+    ref = Reference(Path(args.checkpoint), "cpu", layers=1, norm_dtype=args.norm_dtype, offload=True)
+    head = MtpHead(ref)
+    width = fx["hidden_size"] * fx["streams"]
+    depth = args.depth
+    stage_width = sum(w for _, w in CHAIN_STAGES) * fx["hidden_size"]
+    records = []
+    for case in fx["cases"]:
+        name = case["name"]
+        kept = side / f"{name}.chain.json"
+        if kept.exists():
+            rec = json.loads(kept.read_text())
+            if rec["tokens_digest"] != case["tokens_digest"]:
+                sys.exit(f"{kept} was recorded over other tokens")
+            log(f"case {name}: kept from an earlier run")
+            records.append(rec)
+            continue
+        ids = case["prompt_tokens"]
+        n = len(ids)
+        positions = case["positions"]
+        rows = np.fromfile(fx_path.parent / case["hidden_file"], dtype="<f4").reshape(n - 1, width)
+        hidden = torch.from_numpy(rows.copy()).to(torch.bfloat16)
+        t0 = time.perf_counter()
+        rec_keys = KeyRecorder()
+        probes: dict = {}
+        outs: list = []
+        mixed = head.forward(hidden, ids[1:], probes, cache=rec_keys, layer_out=outs)
+        tops0, picks0 = full_logprob_rows(ref, mixed, MTP_TOP)
+        layer_out0 = outs[0]
+        # The recorded fixture is this same pass; it must come back identical.
+        drift = max(abs(a[1] - b[1]) for t in range(n - 1)
+                    for a, b in zip(tops0[t], positions[t]["draft"]) if a[0] == b[0])
+        same = sum(int(picks0[t] == positions[t]["draft"][0][0]) for t in range(n - 1))
+        log(f"case {name}: step 0 = recorded head top-1 at {same}/{n - 1} positions, max logprob "
+            f"drift {drift:.2e} ({time.perf_counter() - t0:.0f}s)")
+        if same != n - 1:
+            sys.exit(f"case {name}: the teacher-forced pass no longer reproduces the fixture")
+        cache_check(head, hidden, ids, name)
+        probe_at = set(case["probe_positions"])
+        stage_rows: list[torch.Tensor] = []
+        starts = []
+        t1 = time.perf_counter()
+        for t in range(n - 1):
+            picks = [picks0[t]]
+            tops = [[[i, round(v, 6)] for i, v in tops0[t]]]
+            step_stages = []
+            if t in probe_at:
+                own = {"hidden_in": hidden[t: t + 1].float(), **{s: probes[s][t: t + 1] for s, _ in MTP_STAGES}}
+                step_stages.append(torch.cat([own[s].reshape(1, -1).float() for s, _ in CHAIN_STAGES], dim=-1))
+            prev = layer_out0[t: t + 1]
+            cache = ChainCache(rec_keys, t)
+            for j in range(1, depth):
+                sp: dict | None = {} if t in probe_at else None
+                outs_j: list = []
+                mixed_j = head.forward(prev, [picks[-1]], sp, cache=cache, start=t + j, layer_out=outs_j)
+                tj, pj = full_logprob_rows(ref, mixed_j, MTP_TOP)
+                if sp is not None:
+                    own = {"hidden_in": prev.float(), **sp}
+                    step_stages.append(torch.cat([own[s].reshape(1, -1).float() for s, _ in CHAIN_STAGES],
+                                                 dim=-1))
+                picks.append(pj[0])
+                tops.append([[i, round(v, 6)] for i, v in tj[0]])
+                prev = outs_j[0]
+            if step_stages:
+                stage_rows.append(torch.cat(step_stages, dim=0))
+            starts.append({
+                "t": t,
+                "picks": picks,
+                "draft": tops,
+                "accept": chain_acceptance(picks, t, positions, ids),
+                "text": text_acceptance(picks, t, ids),
+            })
+            if t % 64 == 0:
+                log(f"  {name} t={t}: picks {picks} ({time.perf_counter() - t1:.0f}s, MemAvailable low "
+                    f"{WATCHDOG.min_seen / GIB:.1f} GiB)")
+        acc = acceptance_summary([s["accept"] for s in starts])
+        txt = acceptance_summary([s["text"] for s in starts])
+        log(f"case {name}: chain acceptance vs target {acc['rate']} (known {acc['known']}, conditional "
+            f"{acc['conditional']}); vs text {txt['rate']} ({time.perf_counter() - t1:.0f}s)")
+        probe_list = sorted(probe_at)
+        if stage_rows:
+            write_f32(side / f"{name}.chain_probes.f32", torch.cat(stage_rows, dim=0))
+        rec = {
+            "name": name,
+            "tokens_digest": case["tokens_digest"],
+            "starts": starts,
+            "acceptance": acc,
+            "text_acceptance": txt,
+            "probe_starts": probe_list,
+            "probes_file": f"{side.name}/{name}.chain_probes.f32",
+        }
+        kept.write_text(json.dumps(rec, separators=(",", ":")) + "\n")
+        records.append(rec)
+    doc = {
+        "format": "shiso-mtp-chain-v1",
+        "captured_from": "reference",
+        "reference": fx["reference"] + "; chained steps through a cache of the library attention's own "
+                                       "keys (update / update_indexer)",
+        "precision": fx["precision"],
+        "base_fixture": fx_path.name,
+        "base_digest": T.fnv_digest(fx_path.read_bytes()),
+        "vocabulary_digest": fx["vocabulary_digest"],
+        "depth": depth,
+        "top": MTP_TOP,
+        "hidden_size": fx["hidden_size"],
+        "streams": fx["streams"],
+        "stages": [[s, w] for s, w in CHAIN_STAGES],
+        "semantics": "start t: step 0 is the base fixture's teacher-forced pass at t; step j > 0 reads the "
+                     "head's own four-stream layer output of step j-1 (before its collapsing mix) and the "
+                     "embedding of its step j-1 pick, rotates at t+j, and attends over the head's rows <= t "
+                     "from the teacher-forced pass plus its own chain rows t+1..t+j. `picks[j]` is its "
+                     "greedy pick (for token t+2+j), `draft[j]` its top log-probabilities. `accept[j]`: "
+                     "would a greedy verify accept pick j (picks 0..j equal to the target's continuation "
+                     "after t+1), null when the target's continuation left the prompt before step j and "
+                     "the record cannot tell. `text[j]`: picks 0..j equal the prompt's tokens t+2... "
+                     "`probes_file`: for each probe start (ascending), for each step, the `stages` rows "
+                     "concatenated, little-endian f32.",
+        "cases": records,
+    }
+    out.write_text(json.dumps(doc, separators=(",", ":")) + "\n")
+    log(f"wrote {out} and {side}/")
+
+
+def per_position(steps: list[dict], depth: int) -> dict:
+    """The fraction of verify steps that kept draft j, and each over the one before it."""
+    n = max(1, len(steps))
+    rate = [round(sum(int(s["accepted"] > j) for s in steps) / n, 4) for j in range(depth)]
+    cond = [rate[0]] + [round(rate[j] / rate[j - 1], 4) if rate[j - 1] else 0.0 for j in range(1, depth)]
+    return {"steps": len(steps), "rate": rate, "conditional": cond}
+
+
+def cmd_mtp_serve(args) -> None:
+    """The reference's own served loop: greedy speculative decoding with its draft head.
+
+    After each prompt of a `mtp` fixture, the target decodes greedily through
+    its own cache (`DynamicCache`) and the head drafts `--depth` tokens a step
+    exactly as a served step does: step 0 from the target's four-stream row at
+    the last committed position beside the token just committed, every later
+    step from the head's own layer output and pick, its cache holding the rows
+    the target's states wrote below the frontier plus its own chain rows. The
+    target verifies the committed token and the drafts in one cached pass (on a
+    copy of its cache), keeps the agreeing prefix and its own next pick, and the
+    head's rows for the newly committed positions are rewritten from the
+    target's verify rows. Greedy by construction: every committed token is the
+    target's own pick, so the run also is the reference's greedy continuation.
+
+    What it writes is a `shiso-mtp-teacher-forced-v1` fixture over prompt plus
+    continuation (four-stream rows, target picks and the head's teacher-forced
+    top-16 at every position, probes), which `mtp-chain` and the harness read
+    like the prompt fixture; along the continuation the target's continuation
+    is the text itself, so every chain acceptance is known. Each case also
+    carries the served loop's own record: every step's drafts, the target's
+    picks and how many were kept, and the per-position acceptance.
+    """
+    from transformers.cache_utils import DynamicCache
+
+    fx_path = Path(args.fixture).resolve()
+    fx = json.loads(fx_path.read_text())
+    if fx.get("format") != "shiso-mtp-teacher-forced-v1" or fx.get("layers") is not None:
+        sys.exit(f"{fx_path}: not a full-target teacher-forced draft-head fixture")
+    out = Path(args.out).resolve()
+    if out.exists():
+        sys.exit(f"{out} already exists; a recorded answer is replaced only deliberately")
+    side = out.with_suffix("")
+    if side.exists() and not args.resume:
+        sys.exit(f"{side} already exists (--resume keeps the cases it already holds)")
+    side.mkdir(parents=True, exist_ok=True)
+    gen_cfg = json.loads((Path(args.checkpoint) / "generation_config.json").read_text())
+    eos = gen_cfg.get("eos_token_id", [])
+    eos = set(eos if isinstance(eos, list) else [eos])
+    guard(args.min_start_gib if args.min_start_gib is not None else 12, gpu=False)
+    ref = Reference(Path(args.checkpoint), "cpu", norm_dtype=args.norm_dtype, offload=True)
+    head = MtpHead(ref)
+    captured: list[torch.Tensor] = []
+    ref.model.model.hyper_connection_mixer.register_forward_pre_hook(
+        lambda mod, a: captured.append(a[0].detach().clone()))
+    depth = args.depth
+    records = []
+
+    def target(ids: list[int], cache) -> tuple[torch.Tensor, list[int]]:
+        """One cached target pass: its four-stream rows and greedy picks."""
+        captured.clear()
+        with torch.no_grad():
+            o = ref.model.model(input_ids=torch.tensor([ids], dtype=torch.long), past_key_values=cache,
+                                use_cache=True)
+        if len(captured) != 1:
+            raise RuntimeError(f"the collapsing mix ran {len(captured)} times")
+        _, picks = full_logprob_rows(ref, o.last_hidden_state[0], 1)
+        return captured[0][0], picks
+
+    for case in fx["cases"]:
+        name = f"{case['name']}_greedy"
+        kept = side / f"{name}.record.json"
+        if kept.exists():
+            records.append(json.loads(kept.read_text()))
+            log(f"case {name}: kept from an earlier run")
+            continue
+        prompt = case["prompt_tokens"]
+        n = len(prompt)
+        t0 = time.perf_counter()
+        cache = DynamicCache(config=ref.config)
+        prompt_rows, prompt_picks = target(prompt, cache)
+        log(f"case {name}: prompt of {n} tokens in {time.perf_counter() - t0:.0f}s")
+        rows = [prompt_rows]  # four-stream rows of every committed position, in order
+        # The head's cache over the prompt: position p from the target's row p
+        # and token p + 1, so positions 0..n-2 now; n-1 needs the first pick.
+        rec = KeyRecorder()
+        head.forward(prompt_rows[: n - 1], prompt[1:], cache=rec)
+        hk = (rec.k, rec.v, rec.raw)
+        first = prompt_picks[n - 1]
+        gen = [first]
+        steps = []
+        f = n
+        while len(gen) < args.tokens and first not in eos:
+            ts = time.perf_counter()
+            hist = torch.cat(rows, dim=0)
+            cc = ChainCache.over(*hk)
+            prev = hist[f - 1: f]
+            tok = first
+            drafts, tops = [], []
+            for j in range(depth):
+                outs: list = []
+                mixed = head.forward(prev, [tok], cache=cc, start=f - 1 + j, layer_out=outs)
+                t16, p = full_logprob_rows(ref, mixed, MTP_TOP)
+                drafts.append(p[0])
+                tops.append([[i, round(v, 6)] for i, v in t16[0]])
+                tok = p[0]
+                prev = outs[0]
+                if j == 0:
+                    # Step 0's row at f - 1 is the teacher-forced one (the
+                    # target's row beside the committed token): it stays.
+                    hk = (cc.k, cc.v, cc.raw)
+            verify = copy.deepcopy(cache)
+            vrows, vpicks = target([first] + drafts, verify)
+            a = 0
+            while a < depth and drafts[a] == vpicks[a] and drafts[a] not in eos:
+                a += 1
+            committed = [first] + drafts[:a]
+            if a == depth:
+                cache = verify
+            else:
+                del verify
+                target(committed, cache)
+            rows.append(vrows[: a + 1])
+            # The head's rows for the newly committed positions f..f+a-1, from
+            # the target's verify rows beside the token after each.
+            if a > 0:
+                cc = ChainCache.over(*hk)
+                head.forward(vrows[:a], committed[1:], cache=cc, start=f)
+                hk = (cc.k, cc.v, cc.raw)
+            steps.append({"f": f, "first": first, "drafts": drafts, "picks": vpicks, "accepted": a,
+                          "draft": tops})
+            first = vpicks[a]
+            gen += drafts[:a] + [first]
+            f += a + 1
+            log(f"  {name} f={f}: drafts {drafts} picks {vpicks} kept {a} "
+                f"({time.perf_counter() - ts:.0f}s, MemAvailable low {WATCHDOG.min_seen / GIB:.1f} GiB)")
+        served = per_position(steps, depth)
+        log(f"case {name}: {len(gen)} tokens in {len(steps)} steps, per-position acceptance "
+            f"{served['rate']}, conditional {served['conditional']}")
+        # The sequence the fixture covers: every committed position. Position
+        # t's target pick (for t + 2) is the prompt pass's pick inside the
+        # prompt and the committed token itself after it (the uncommitted next
+        # first token for the last one).
+        ids = prompt + gen[:-1]  # gen[-1] is the next step's uncommitted first token
+        hidden = torch.cat(rows, dim=0)
+        if hidden.shape[0] != len(ids):
+            raise RuntimeError(f"{hidden.shape[0]} rows for {len(ids)} committed positions")
+        hidden = hidden[: len(ids) - 1]
+        m = len(ids)
+        picks_at = {r: prompt_picks[r] for r in range(n)}
+        for r in range(n, m):
+            picks_at[r] = ids[r + 1] if r + 1 < m else gen[-1]
+        probe_at = sorted({16, 64, n - 2, n + 16, n + 64} & set(range(m - 1)))
+        probes: dict = {}
+        mixed = head.forward(hidden, ids[1:], probes)
+        draft_tops, _ = full_logprob_rows(ref, mixed, MTP_TOP)
+        positions = []
+        for t in range(m - 1):
+            positions.append({
+                "t": t,
+                "next": ids[t + 1],
+                "text": ids[t + 2] if t + 2 < m else None,
+                "target": picks_at[t + 1],
+                "draft": [[i, round(v, 6)] for i, v in draft_tops[t]],
+            })
+        agree = [p["draft"][0][0] == p["target"] for p in positions]
+        write_f32(side / f"{name}.probes.f32",
+                  torch.cat([probes[s][probe_at] for s, _ in MTP_STAGES], dim=-1))
+        write_f32(side / f"{name}.hidden.f32", hidden.float())
+        rec = {
+            "name": name,
+            "prompt_file": case["prompt_file"],
+            "prompt_tokens": ids,
+            "tokens_digest": T.tokens_digest(ids),
+            "generated_from": n,
+            "p1": sum(agree) / len(agree),
+            "positions": positions,
+            "probe_positions": probe_at,
+            "hidden_file": f"{side.name}/{name}.hidden.f32",
+            "probes_file": f"{side.name}/{name}.probes.f32",
+            "served": {**served, "tokens": gen, "steps_detail": steps},
+        }
+        kept.write_text(json.dumps(rec, separators=(",", ":")) + "\n")
+        records.append(rec)
+        log(f"case {name}: {time.perf_counter() - t0:.0f}s; teacher-forced p1 over {m - 1} positions "
+            f"{rec['p1']:.3f}")
+    doc = {**{k: v for k, v in fx.items() if k != "cases"},
+           "reference": fx["reference"] + "; served loop: cached greedy target (DynamicCache), chained "
+                                          "head drafts, verify on a cache copy",
+           "label": f"greedy continuation of {fx_path.name}, {args.tokens} tokens, depth {depth}",
+           "semantics": fx["semantics"] + " Cases named <case>_greedy run over the prompt plus the "
+                        "reference's own greedy continuation from `generated_from` on, where `target` "
+                        "is the continuation itself; `served` holds the reference's served loop.",
+           "cases": records}
+    out.write_text(json.dumps(doc, separators=(",", ":")) + "\n")
+    log(f"wrote {out} and {side}/")
+
+
 # --------------------------------------------------------------------------
 # CPU checks
 # --------------------------------------------------------------------------
@@ -1694,6 +2231,23 @@ def main() -> None:
     q.add_argument("--fixture", default=str(REPO / "test-vectors/references/qwen38-flash-fp4local-hf-mtp.json"))
     q.add_argument("--threads", type=int, default=12)
     q.add_argument("--min-start-gib", type=float, default=10)
+    ch = sub.add_parser("mtp-chain")
+    ch.add_argument("--fixture", default=str(REPO / "test-vectors/references/qwen38-flash-fp4local-hf-mtp.json"))
+    ch.add_argument("--out", default=str(REPO / "test-vectors/references/qwen38-flash-fp4local-hf-mtp-chain.json"))
+    ch.add_argument("--depth", type=int, default=CHAIN_DEPTH, help="chained steps per start, step 0 included")
+    ch.add_argument("--resume", action="store_true",
+                    help="keep the cases an interrupted run already wrote beside --out")
+    ch.add_argument("--threads", type=int, default=12)
+    ch.add_argument("--min-start-gib", type=float, default=10)
+    sv = sub.add_parser("mtp-serve")
+    sv.add_argument("--fixture", default=str(REPO / "test-vectors/references/qwen38-flash-fp4local-hf-mtp.json"))
+    sv.add_argument("--out", default=str(REPO / "test-vectors/references/qwen38-flash-fp4local-hf-mtp-greedy.json"))
+    sv.add_argument("--depth", type=int, default=CHAIN_DEPTH, help="drafts per served step")
+    sv.add_argument("--tokens", type=int, default=128, help="greedy tokens after each prompt")
+    sv.add_argument("--resume", action="store_true",
+                    help="keep the cases an interrupted run already wrote beside --out")
+    sv.add_argument("--threads", type=int, default=12)
+    sv.add_argument("--min-start-gib", type=float)
     g = sub.add_parser("greedy")
     g.add_argument("--skeleton", help="use this fixture's first case's prompt")
     g.add_argument("--prompt-file")
@@ -1712,7 +2266,8 @@ def main() -> None:
         torch.set_num_threads(args.threads)
     {"selfcheck": cmd_selfcheck, "smoke": cmd_smoke, "capture": cmd_capture,
      "greedy": cmd_greedy, "mtp": cmd_mtp,
-     "mtp-precision": cmd_mtp_precision}[args.cmd](args)
+     "mtp-precision": cmd_mtp_precision, "mtp-chain": cmd_mtp_chain,
+     "mtp-serve": cmd_mtp_serve}[args.cmd](args)
 
 
 if __name__ == "__main__":
