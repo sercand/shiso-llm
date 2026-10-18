@@ -80,6 +80,38 @@ pub(crate) enum DraftRows {
     Batch(u8),
 }
 
+/// Where a draft pass ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DraftEnd {
+    /// The whole pass, through the collapsing mix, the vocabulary head and the
+    /// argmax.
+    Pick,
+    /// The layer and no further: a pass that only fills the head's cache.
+    Fill,
+    /// A diagnostic stop: see [`DraftProbe`].
+    Probe(DraftProbe),
+}
+
+/// The stage a diagnostic draft pass stops after, leaving that stage's
+/// multi-stream rows in [`Buf::Residual`].
+///
+/// What it is for: holding the head's pass against an independent reference
+/// stage by stage. The two buffers the opening terms are written to are never
+/// reused later in the pass, so [`Buf::DraftNormed`] (the normed hidden term)
+/// and [`Buf::DraftHidden`] (its projection, per stream) can be read after any
+/// pass; the token term's projection, in [`Buf::Mixed`], only after a
+/// [`DraftProbe::LayerInput`] stop, since the collapsing mix overwrites it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftProbe {
+    /// After the two terms are added: the residual the head's layer opens on.
+    LayerInput,
+    /// After the attention half's combine, before the feed-forward half.
+    ///
+    /// The attention half writes the head's key and value rows for the probed
+    /// position, the same rows a full pass at that position writes.
+    PostAttention,
+}
+
 /// The widths one draft pass plans from.
 ///
 /// Deliberately NOT `#[non_exhaustive]`: a loader builds one.
@@ -125,7 +157,7 @@ impl SparseStack {
         hidden: Operand,
         frontier: u32,
         n_tok: u32,
-        pick: bool,
+        end: DraftEnd,
         device: Device,
         rows: DraftRows,
     ) -> CoreResult<Plan> {
@@ -207,6 +239,9 @@ impl SparseStack {
             Operand::Scratch(Buf::DraftHidden),
             n_tok,
         ));
+        if end == DraftEnd::Probe(DraftProbe::LayerInput) {
+            return finish(plan);
+        }
 
         // The head's block, through the target's own layer planner. The context
         // is the one a single-row decode takes: a draft never carries unrelated
@@ -238,6 +273,9 @@ impl SparseStack {
                 n_tok,
                 device,
             )?);
+            if half == Island::Mixer && end == DraftEnd::Probe(DraftProbe::PostAttention) {
+                return finish(plan);
+            }
         }
 
         // The head's own collapsing mix, then the *target's* vocabulary head on
@@ -247,10 +285,8 @@ impl SparseStack {
         // A pass that is only filling the head's cache asks for neither. The
         // projection is the single widest matmul in the model, and running it
         // for a token nobody reads is most of what such a pass would cost.
-        if !pick {
-            let (plan, _) = crate::sparse::passes::with_reservation(plan, Vec::new());
-            plan.validate()?;
-            return Ok(plan);
+        if end != DraftEnd::Pick {
+            return finish(plan);
         }
         plan.append(hyper::collapse(
             shape,
@@ -307,15 +343,21 @@ impl SparseStack {
                 Operand::U32(picked),
             ]),
         );
-        // The head's cooperative launches read the same per-stream scratch the
-        // target's do, and it is reserved the same way: once, in front of
-        // everything, at the widest carve-up the pass makes. A draft that ran
-        // before any target pass would otherwise be the first launch on the
-        // stream and find nothing reserved at all.
-        let (plan, _) = crate::sparse::passes::with_reservation(plan, Vec::new());
-        plan.validate()?;
-        Ok(plan)
+        finish(plan)
     }
+}
+
+/// A draft plan made runnable: its scratch reserved and the whole validated.
+///
+/// The head's cooperative launches read the same per-stream scratch the
+/// target's do, and it is reserved the same way: once, in front of everything,
+/// at the widest carve-up the pass makes. A draft that ran before any target
+/// pass would otherwise be the first launch on the stream and find nothing
+/// reserved at all.
+fn finish(plan: Plan) -> CoreResult<Plan> {
+    let (plan, _) = crate::sparse::passes::with_reservation(plan, Vec::new());
+    plan.validate()?;
+    Ok(plan)
 }
 
 impl SparseStack {
@@ -348,21 +390,51 @@ impl SparseStack {
         hidden: Operand,
         pick: bool,
     ) -> CoreResult<Option<TokenId>> {
-        self.draft_tapped(session, tokens, positions, hidden, pick, None)
+        let end = if pick { DraftEnd::Pick } else { DraftEnd::Fill };
+        self.draft_tapped(session, tokens, positions, hidden, end, None)
+    }
+
+    /// Runs one draft pass at `position` that stops at `probe`, leaving that
+    /// stage's rows in the residual: a diagnostic, for holding the head's pass
+    /// against a reference stage by stage (see [`DraftProbe`]).
+    ///
+    /// `token` and `hidden` are what [`SparseStack::draft`] takes for a one-row
+    /// pass. Like a draft, it advances nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::draft`].
+    pub fn draft_probe(
+        &mut self,
+        session: SessionId,
+        token: TokenId,
+        position: u32,
+        hidden: Operand,
+        probe: DraftProbe,
+    ) -> CoreResult<()> {
+        self.draft_tapped(
+            session,
+            &[token],
+            &[position],
+            hidden,
+            DraftEnd::Probe(probe),
+            None,
+        )?;
+        Ok(())
     }
 
     /// [`SparseStack::draft`], with the head's raw key ring also copied into
-    /// the snapshot buffer by `tap`.
+    /// the snapshot buffer by `tap`, ending where `end` says.
     ///
-    /// `None` is not a refusal: it is what `pick: false` asked for, as for
-    /// [`SparseStack::draft`].
+    /// `None` is not a refusal: it is what any `end` but [`DraftEnd::Pick`]
+    /// asked for, as `pick: false` is for [`SparseStack::draft`].
     fn draft_tapped(
         &mut self,
         session: SessionId,
         tokens: &[TokenId],
         positions: &[u32],
         hidden: Operand,
-        pick: bool,
+        end: DraftEnd,
         tap: Option<RingTap>,
     ) -> CoreResult<Option<TokenId>> {
         let n_tok = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
@@ -388,11 +460,12 @@ impl SparseStack {
         }
         self.write_draft_inputs(session, tokens, positions)?;
 
+        let pick = end == DraftEnd::Pick;
         let plan = self.plan_draft(
             hidden,
             reach,
             n_tok,
-            pick,
+            end,
             self.device(),
             DraftRows::Sequential(tap),
         )?;
@@ -503,7 +576,7 @@ impl SparseStack {
             hidden,
             reach,
             n,
-            true,
+            DraftEnd::Pick,
             self.device(),
             DraftRows::Batch(bits),
         )?;
@@ -1233,7 +1306,7 @@ impl SparseStack {
             span,
             &positions,
             Operand::Scratch(Buf::Residual),
-            false,
+            DraftEnd::Fill,
             tap,
         )?;
         Ok(())

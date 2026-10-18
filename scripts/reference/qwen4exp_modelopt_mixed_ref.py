@@ -44,6 +44,8 @@ Run inside the reference container (transformers 5.19), see `--help`:
     smoke      CPU: a forward through the first N layers (default 4)
     capture    GPU: the logprob fixture
     greedy     GPU: 64 greedy ids after the first case's prompt, as JSON
+    mtp        CPU: the draft head (mtp.*) teacher-forced over a few prompts,
+               its top-16 per position beside the target's own pick
 
 Helpers shared with the FP8 reference are imported from `qwen4exp_fp8_ref.py`
 by path, so this runs under `python3 -I`.
@@ -52,6 +54,7 @@ by path, so this runs under `python3 -I`.
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import math
@@ -1045,6 +1048,373 @@ def cmd_greedy(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# The draft head (mtp.*), teacher-forced
+# --------------------------------------------------------------------------
+
+
+MTP = "mtp"
+MTP_TOP = 16
+# The intermediates recorded at the probe positions, in file order, with the
+# width of each row in units of the residual width. Each name says where in the
+# head's pass the row is taken; see `MtpHead.forward`.
+MTP_STAGES = (
+    ("normed_hidden", 4),  # pre_fc_norm_hidden(target hidden), one RMS over all four streams
+    ("fc_hidden", 4),      # fc_hidden on each stream of that
+    ("fc_embed", 1),       # fc_embedding(pre_fc_norm_embedding(embed(token t+1)))
+    ("layer_in", 4),       # fc_hidden + fc_embed broadcast: the layer's residual
+    ("attn_out", 1),       # the attention block's output (after o_proj)
+    ("post_attn", 4),      # the residual after the attention combine
+    ("moe_out", 1),        # the feed-forward block's output (routed + gated shared)
+    ("layer_out", 4),      # the residual after the feed-forward combine
+    ("mixed", 1),          # the collapsing mix: the row the vocabulary head reads
+)
+
+
+class PlainNvfp4ExpertStore(Nvfp4ExpertStore):
+    """The draft head's experts: NVFP4 with one plain e4m3 scale per 16 inputs (no CSF)."""
+
+    def __init__(self, ck: Checkpoint, device: torch.device, hidden: int, inter: int, prefix: str):
+        super().__init__(ck, device, hidden, inter)
+        self.prefix = prefix
+
+    def read_cpu(self, layer: int, expert: int) -> dict:
+        t0 = time.perf_counter()
+        out = {}
+        for proj in PROJECTIONS:
+            p = f"{self.prefix}.{expert}.{proj}"
+            out[proj] = (
+                self.ck.read(p + ".weight", "U8"),
+                self.ck.read(p + ".weight_scale", "F8_E4M3"),
+                None,
+                self.ck.read(p + ".weight_scale_2", "F32"),
+            )
+        self.read_seconds += time.perf_counter() - t0
+        return out
+
+    def dequant(self, parts, what: str) -> torch.Tensor:
+        w, scales, _, g = (None if t is None else t.to(self.device) for t in parts)
+        return dequant_nvfp4(w, scales, g, what)
+
+
+class MtpHead:
+    """The checkpoint's draft head assembled from the library's own modules.
+
+    The library's causal-LM class ignores every `mtp.*` tensor, so the head is
+    put together here out of the same classes its decoder is built from: one
+    `Qwen4ExpTextDecoderLayer` of the full-attention type (with its own
+    attention, indexer, sparse-MoE block and two stream mixes), two
+    `nn.Linear` projections, two `(1 + w)` RMS norms and one collapsing
+    `Qwen4ExpTextGatedResidual` without a block injection. The embedding table,
+    the rotary tables and the vocabulary head are the target's own.
+
+    The pass at position t reads the target's four-stream residual at t (the
+    state after the last layer's combine, before the final collapsing mix) and
+    the embedding of token t+1, and its vocabulary row predicts token t+2. Run
+    over every position of a prompt at once with the causal mask, its attention
+    at t sees exactly the head's own keys and values of positions <= t, built
+    the same way: the cache a teacher-forced sequential run would have.
+    """
+
+    def __init__(self, ref: Reference):
+        mq, tc, ck = ref.mq, ref.config, ref.ck
+        self.ref = ref
+        self.hc = tc.hc_count
+        self.hidden_size = tc.hidden_size
+        # The head's config is the target's described as a one-layer model of
+        # the kind the checkpoint's `mtp` block names: full attention, no
+        # n-gram block. Its rotary parameters must be the target's, since the
+        # target's rotary tables are reused.
+        mtp_cfg = getattr(tc, "mtp", None) or {}
+        if mtp_cfg.get("layer_types", ["full_attention"]) != ["full_attention"]:
+            raise ValueError(f"draft head layer types {mtp_cfg.get('layer_types')}")
+        theta = mtp_cfg.get("rope_theta")
+        if theta is not None and theta != tc.rope_parameters["rope_theta"]:
+            raise ValueError(f"draft head rope_theta {theta} differs from the target's")
+        hcfg = copy.deepcopy(tc)
+        hcfg.layer_types = ["full_attention"]
+        hcfg.ple_layer_ids = []
+        idx = 0
+        h, hc = self.hidden_size, self.hc
+        with torch.device("meta"):
+            mods = nn.ModuleDict({
+                "layers": nn.ModuleList([mq.Qwen4ExpTextDecoderLayer(hcfg, idx)]),
+                "fc_embedding": nn.Linear(h, h, bias=False),
+                "fc_hidden": nn.Linear(h, h, bias=False),
+                "pre_fc_norm_embedding": mq.Qwen4ExpTextRMSNorm(h, eps=tc.rms_norm_eps),
+                "pre_fc_norm_hidden": mq.Qwen4ExpTextRMSNorm(hc * h, eps=tc.rms_norm_eps),
+                "hyper_connection_mixer": mq.Qwen4ExpTextGatedResidual(tc, use_combine=False),
+            })
+        layer = mods["layers"][0]
+        if layer.layer_type != "full_attention" or layer.ple is not None:
+            raise RuntimeError(f"layer template {idx} is {layer.layer_type} with n-gram {layer.ple is not None}")
+        self.store = PlainNvfp4ExpertStore(ck, ref.device, h, tc.moe_intermediate_size,
+                                           f"{MTP}.layers.0.mlp.experts")
+        self.experts = StreamedExperts(self.store, 0, tc.num_experts, layer.mlp.experts.act_fn)
+        layer.mlp.experts = self.experts
+        mods = mods.to(torch.bfloat16)
+        mods.to_empty(device=ref.device)
+        consumed = set()
+        with torch.no_grad():
+            for name, dst in mods.state_dict(keep_vars=True).items():
+                ckn = f"{MTP}.{name}"
+                dtype, shape = ck.dtype_shape(ckn)
+                if dtype != "BF16" or tuple(shape) != tuple(dst.shape) or dst.dtype != torch.bfloat16:
+                    raise TypeError(f"{ckn}: checkpoint {dtype} {shape}, head {dst.dtype} {tuple(dst.shape)}")
+                dst.copy_(ck.read(ckn, "BF16").to(ref.device))
+                consumed.add(ckn)
+        leftovers = [n for n in ck.files if n.startswith(MTP + ".") and n not in consumed
+                     and not (".mlp.experts." in n and n.split(".")[-1] in
+                              ("weight", "weight_scale", "weight_scale_2", "input_scale"))]
+        if leftovers:
+            raise ValueError(f"{len(leftovers)} draft-head tensors unused, e.g. {leftovers[:8]}")
+        self.mods = mods
+        self.layer = layer
+        log(f"draft head: layer template {idx} ({layer.layer_type}), {len(consumed)} dense tensors, "
+            f"experts streamed from {self.store.prefix}")
+
+    def check_experts(self) -> tuple[float, float, bool]:
+        """max|W| / (6 * 448 * weight_scale_2) over a few experts, and gate/up tied."""
+        worst = (math.inf, -math.inf)
+        tied = True
+        for expert in (0, 1, 255, 511):
+            cpu = self.store.read_cpu(0, expert)
+            amax = {p: float(self.store.dequant(cpu[p], p).float().abs().max()) for p in PROJECTIONS}
+            g = {p: float(cpu[p][3]) for p in PROJECTIONS}
+            tied &= g["gate_proj"] == g["up_proj"]
+            for ratio in (max(amax["gate_proj"], amax["up_proj"]) / (6 * 448 * g["gate_proj"]),
+                          amax["down_proj"] / (6 * 448 * g["down_proj"])):
+                worst = (min(worst[0], ratio), max(worst[1], ratio))
+        return worst[0], worst[1], tied
+
+    @torch.no_grad()
+    def forward(self, hidden: torch.Tensor, next_ids: list[int], probes: dict | None = None) -> torch.Tensor:
+        """The collapsed rows for `hidden[t]` (four streams) beside `next_ids[t]`.
+
+        `probes`, when given, collects every stage in `MTP_STAGES` as a
+        [rows, width] f32 tensor.
+        """
+        ref, m, layer = self.ref, self.mods, self.layer
+        n = hidden.shape[0]
+        if len(next_ids) != n:
+            raise ValueError(f"{n} hidden rows, {len(next_ids)} tokens")
+        dev = ref.device
+        emb = ref.model.model.embed_tokens(torch.tensor([next_ids], dtype=torch.long, device=dev))
+        fc_embed = m["fc_embedding"](m["pre_fc_norm_embedding"](emb))
+        normed = m["pre_fc_norm_hidden"](hidden[None].to(dev))
+        fc_hidden = m["fc_hidden"](normed.unflatten(-1, (self.hc, self.hidden_size)))
+        x = (fc_hidden + fc_embed.unsqueeze(-2)).flatten(-2)
+
+        # Positions are the target's: the head at t rotates at t. Three axes,
+        # all the same for text, as the text model expands them.
+        pos = torch.arange(n, device=dev).view(1, 1, -1).expand(3, 1, -1)
+        pe = ref.model.model.rotary_emb(x, pos)
+        mask = ref.mq.create_causal_mask(config=ref.config, inputs_embeds=x, attention_mask=None,
+                                         past_key_values=None, position_ids=pos[0],
+                                         allow_is_causal_skip=False)
+        hooks, seen = [], {}
+        if probes is not None:
+            hooks.append(layer.self_attn.register_forward_hook(
+                lambda mod, args, out: seen.__setitem__("attn_out", out[0])))
+            hooks.append(layer.mlp_hyper_connection.register_forward_pre_hook(
+                lambda mod, args: seen.__setitem__("post_attn", args[0])))
+            hooks.append(layer.mlp.register_forward_hook(
+                lambda mod, args, out: seen.__setitem__("moe_out", out)))
+        try:
+            out = layer(x, position_embeddings=pe, attention_mask=mask, conv_mask=None,
+                        past_key_values=None, ple_input_ids=None)
+        finally:
+            for hk in hooks:
+                hk.remove()
+        mixed = m["hyper_connection_mixer"](out)
+        if probes is not None:
+            rows = {
+                "normed_hidden": normed, "fc_hidden": fc_hidden.flatten(-2), "fc_embed": fc_embed,
+                "layer_in": x, "layer_out": out, "mixed": mixed, **seen,
+            }
+            for name, width in MTP_STAGES:
+                t = rows[name].reshape(n, -1).float().cpu()
+                if t.shape[1] != width * self.hidden_size:
+                    raise ValueError(f"stage {name}: width {t.shape[1]}, want {width * self.hidden_size}")
+                probes[name] = t
+        return mixed[0]
+
+
+@torch.no_grad()
+def full_logprob_rows(ref: Reference, hidden: torch.Tensor, top: int, block: int = 32):
+    """fp32 logits of bf16 rows against the bf16 head, as top-`top` log-probabilities.
+
+    Returns (tops, argmax) per row. The head is widened in vocabulary slices so
+    the f32 copy never exists whole on the CPU.
+    """
+    head = ref.model.lm_head.weight
+    tops, picks = [], []
+    for s in range(0, hidden.shape[0], block):
+        h = hidden[s: s + block].float()
+        if ref.device.type == "cuda":
+            if getattr(ref, "_head32", None) is None:
+                ref._head32 = head.float()
+            rows = F.linear(h, ref._head32)
+        else:
+            rows = torch.cat([F.linear(h, head[v: v + 16384].float())
+                              for v in range(0, head.shape[0], 16384)], dim=-1)
+        rows = rows.cpu().numpy()
+        for r in rows:
+            if not np.isfinite(r).all():
+                raise ValueError("non-finite logits")
+            t = logprob_top(r, top)
+            tops.append(t)
+            picks.append(t[0][0])
+    return tops, picks
+
+
+def write_f32(path: Path, rows: torch.Tensor) -> None:
+    path.write_bytes(rows.float().contiguous().numpy().astype("<f4").tobytes())
+
+
+def cmd_mtp(args) -> None:
+    """Teacher-forced draft-head records over a few prompts; see `MtpHead`."""
+    from tokenizers import Tokenizer
+
+    out = Path(args.out).resolve()
+    if out.exists():
+        sys.exit(f"{out} already exists; a recorded answer is replaced only deliberately")
+    side = out.with_suffix("")  # the directory of binary rows beside the fixture
+    if side.exists() and not args.resume:
+        sys.exit(f"{side} already exists (--resume keeps the cases it already holds)")
+    tok_path = Path(args.tokenizer or args.checkpoint) / "tokenizer.json"
+    tokenizer = Tokenizer.from_file(str(tok_path))
+    cases = []
+    for spec in args.case:
+        name, _, path = spec.partition("=")
+        if not name or not path or not name.replace("_", "").isalnum():
+            sys.exit(f"--case wants name=path, got {spec!r}")
+        p = Path(path).resolve()
+        text = p.read_text()
+        ids = encode(tokenizer, text, "text")
+        if args.max_tokens and len(ids) > args.max_tokens:
+            ids = ids[: args.max_tokens]
+        if len(ids) < 8:
+            sys.exit(f"case {name}: {len(ids)} tokens")
+        cases.append((name, p, ids))
+    if len({c[0] for c in cases}) != len(cases):
+        sys.exit("duplicate case names")
+
+    guard(min_start(args), gpu=args.device == "cuda")
+    ref = Reference(Path(args.checkpoint), args.device, layers=args.layers, norm_dtype=args.norm_dtype,
+                    offload=args.device == "cpu")
+    head = MtpHead(ref)
+    lo, hi, tied = head.check_experts()
+    log(f"draft experts: max|W| / (6*448*weight_scale_2) in [{lo:.4f}, {hi:.4f}], gate/up tied {tied}")
+    if not (0.85 <= lo and hi <= 1.0 + 1 / 256 and tied):
+        sys.exit("the draft head's experts do not decode as NVFP4 with plain scales")
+
+    captured: list[torch.Tensor] = []
+    ref.model.model.hyper_connection_mixer.register_forward_pre_hook(
+        lambda mod, a: captured.append(a[0].detach().clone()))
+    side.mkdir(parents=True, exist_ok=True)
+    records = []
+    for name, path, ids in cases:
+        n = len(ids)
+        # Each case is kept as it completes, so a run the memory watchdog ends
+        # resumes at the case it was on.
+        kept = side / f"{name}.record.json"
+        if kept.exists():
+            rec = json.loads(kept.read_text())
+            if rec["tokens_digest"] != T.tokens_digest(ids):
+                sys.exit(f"{kept} was recorded over other tokens")
+            log(f"case {name}: kept from an earlier run, p1 {rec['p1']:.3f}")
+            records.append(rec)
+            continue
+        t0 = time.perf_counter()
+        captured.clear()
+        final = ref.hidden(ids)
+        if len(captured) != 1:
+            raise RuntimeError(f"the collapsing mix ran {len(captured)} times")
+        multi = captured[0][0]  # [n, hc * hidden], bf16
+        target_s = time.perf_counter() - t0
+        # The target's own greedy pick at every position, fp32 logits.
+        target_tops, target_picks = full_logprob_rows(ref, final, 4)
+        t1 = time.perf_counter()
+        probe_at = sorted({p if p >= 0 else n - 2 + p + 1 for p in args.probe} & set(range(n - 1)))
+        probes: dict = {}
+        mixed = head.forward(multi[: n - 1], ids[1:], probes)
+        draft_tops, draft_picks = full_logprob_rows(ref, mixed, MTP_TOP)
+        draft_s = time.perf_counter() - t1
+        # Position t predicts token t+2; the target's pick for t+2 is its row
+        # at t+1.
+        positions = []
+        for t in range(n - 1):
+            positions.append({
+                "t": t,
+                "next": ids[t + 1],
+                "text": ids[t + 2] if t + 2 < n else None,
+                "target": target_picks[t + 1],
+                "target_logprob": target_tops[t + 1][0][1],
+                "draft": [[i, round(v, 6)] for i, v in draft_tops[t]],
+            })
+        agree = [p["draft"][0][0] == p["target"] for p in positions]
+        text_agree = [p["draft"][0][0] == p["text"] for p in positions if p["text"] is not None]
+        target_text = [target_picks[t + 1] == ids[t + 2] for t in range(n - 2)]
+        p1 = sum(agree) / len(agree)
+        stage_rms = {s: [round(float(r), 6) for r in probes[s].pow(2).mean(-1).sqrt()] for s, _ in MTP_STAGES}
+        # The probe rows: for each probe position, every stage in MTP_STAGES
+        # order, little-endian f32. Also the target's four-stream rows (bf16
+        # values held exactly in f32) for every position the head reads, so the
+        # other side can run its head from this reference's own input.
+        rows = [probes[s][probe_at] for s, _ in MTP_STAGES]
+        write_f32(side / f"{name}.probes.f32", torch.cat(rows, dim=-1))
+        write_f32(side / f"{name}.hidden.f32", multi[: n - 1].float().cpu())
+        log(f"case {name}: {n} tokens, target {target_s:.0f}s, head {draft_s:.0f}s; draft p1 vs target "
+            f"{p1:.3f} ({sum(agree)}/{len(agree)}), vs text {sum(text_agree) / max(1, len(text_agree)):.3f}, "
+            f"target next-token vs text {sum(target_text) / max(1, len(target_text)):.3f}; experts per pass "
+            f"{head.experts.hit_log[-1]}; MemAvailable low {WATCHDOG.min_seen / GIB:.1f} GiB")
+        rec = {
+            "name": name,
+            "prompt_file": T.prompt_key(path),
+            "prompt_tokens": ids,
+            "tokens_digest": T.tokens_digest(ids),
+            "p1": p1,
+            "positions": positions,
+            "probe_positions": probe_at,
+            "stage_rms": stage_rms,
+            "hidden_file": f"{side.name}/{name}.hidden.f32",
+            "probes_file": f"{side.name}/{name}.probes.f32",
+        }
+        kept.write_text(json.dumps(rec, separators=(",", ":")) + "\n")
+        records.append(rec)
+    ckpt = Path(args.checkpoint)
+    doc = {
+        "format": "shiso-mtp-teacher-forced-v1",
+        "captured_from": "reference",
+        "reference": f"modeling_qwen4_exp ({ref.versions}) modules assembled into the mtp.* head, "
+                     "teacher-forced no-cache sdpa, W-dequant bf16 A16",
+        "precision": "target as the capture subcommand; head: bf16 dense tensors as stored, NVFP4 experts "
+                     "(plain e4m3 scales) dequantized to bf16, bf16 activations, fp32 logits from the bf16 "
+                     "collapsed row and the bf16 head",
+        "label": args.label,
+        "layers": args.layers,
+        "vocabulary_digest": T.fnv_digest(tok_path.read_bytes()),
+        "checkpoint": f"config {T.fnv_digest((ckpt / 'config.json').read_bytes())} index "
+                      f"{T.fnv_digest((ckpt / 'model.safetensors.index.json').read_bytes())}",
+        "hidden_size": head.hidden_size,
+        "streams": head.hc,
+        "top": MTP_TOP,
+        "stages": [[s, w] for s, w in MTP_STAGES],
+        "semantics": "position t: the head reads the target's four-stream residual at t (after the last "
+                     "combine, before the final collapsing mix) and the embedding of token t+1, attends over "
+                     "its own rows <= t, and `draft` is its top log-probabilities for token t+2. `target` is "
+                     "the target's own greedy pick for t+2 (its row at t+1); `text` is the prompt's token "
+                     "t+2 (null past the end). `hidden_file` holds the four-stream rows for t = 0..n-2 as "
+                     "little-endian f32 [n-1, streams*hidden]; `probes_file` holds, for each probe "
+                     "position, the stages in order, concatenated.",
+        "cases": records,
+    }
+    out.write_text(json.dumps(doc, separators=(",", ":")) + "\n")
+    log(f"wrote {out} and {side}/; p1 by case "
+        f"{ {r['name']: round(r['p1'], 3) for r in records} }")
+
+
+# --------------------------------------------------------------------------
 # CPU checks
 # --------------------------------------------------------------------------
 
@@ -1258,6 +1628,20 @@ def main() -> None:
                    help="cpu streams the decoder layers one at a time (a few GB)")
     c.add_argument("--threads", type=int, default=16)
     c.add_argument("--min-start-gib", type=float)
+    t = sub.add_parser("mtp")
+    t.add_argument("--case", action="append", required=True, help="name=prompt file (repeatable)")
+    t.add_argument("--out", required=True, help="the fixture (JSON); binary rows go in a directory "
+                                                "beside it named after it")
+    t.add_argument("--label", default="")
+    t.add_argument("--max-tokens", type=int, default=600)
+    t.add_argument("--probe", type=int, action="append", default=None,
+                   help="positions whose stage rows are recorded (negative from the end)")
+    t.add_argument("--resume", action="store_true",
+                   help="keep the cases an interrupted run already wrote beside --out")
+    t.add_argument("--layers", type=int, help="truncate the target (plumbing runs only; meaningless)")
+    t.add_argument("--device", default="cpu", choices=("cuda", "cpu"))
+    t.add_argument("--threads", type=int, default=16)
+    t.add_argument("--min-start-gib", type=float)
     g = sub.add_parser("greedy")
     g.add_argument("--skeleton", help="use this fixture's first case's prompt")
     g.add_argument("--prompt-file")
@@ -1268,12 +1652,14 @@ def main() -> None:
     g.add_argument("--threads", type=int, default=16)
     g.add_argument("--min-start-gib", type=float)
     args = p.parse_args()
+    if args.cmd == "mtp" and args.probe is None:
+        args.probe = [0, 1, 2, 16, 64, 128, -1]
     if args.cmd == "greedy" and not (args.skeleton or args.prompt_file):
         p.error("greedy needs --skeleton or --prompt-file")
     if getattr(args, "threads", None):
         torch.set_num_threads(args.threads)
     {"selfcheck": cmd_selfcheck, "smoke": cmd_smoke, "capture": cmd_capture,
-     "greedy": cmd_greedy}[args.cmd](args)
+     "greedy": cmd_greedy, "mtp": cmd_mtp}[args.cmd](args)
 
 
 if __name__ == "__main__":
