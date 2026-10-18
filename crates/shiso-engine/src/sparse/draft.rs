@@ -669,6 +669,38 @@ impl SparseStack {
     }
 }
 
+/// One speculative step's drafts beside the target's own picks, at debug
+/// level: the record that separates a head whose first guess is wrong (the
+/// draft's input or first step) from one whose chain decays (its own rows), and
+/// a step the prompt lookup drafted from one the head did.
+fn trace_step(
+    session: SessionId,
+    source: Option<DraftSource>,
+    drafts: &[TokenId],
+    picks: &[TokenId],
+    accepted: u32,
+) {
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let ids = |tokens: &[TokenId]| {
+            tokens
+                .iter()
+                .map(|token| token.get().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let lookup = matches!(source, Some(DraftSource::Lookup(_)));
+        tracing::debug!(
+            %session,
+            lookup,
+            drafted = drafts.len(),
+            accepted,
+            drafts = %ids(drafts),
+            target = %ids(picks.get(..drafts.len()).unwrap_or(picks)),
+            "speculative step"
+        );
+    }
+}
+
 /// The layer index a captured draft chain step is filed under: past every
 /// target layer a key can name, so the two can never share a slot.
 const DRAFT_ISLAND_LAYER: u32 = 0xffff;
@@ -676,7 +708,7 @@ const DRAFT_ISLAND_LAYER: u32 = 0xffff;
 /// The prompt lookup beside the head.
 impl SparseStack {
     /// The drafts a step verifies: the prompt lookup's proposal when it is
-    /// longer than the head's chain and starts with the head's first guess
+    /// longer than the head's chain and starts with all of it
     /// ([`mtp::lookup_beats_head`]), the head's chain otherwise.
     ///
     /// A guess either way - the verify pass decides what is kept - so the
@@ -709,11 +741,8 @@ impl SparseStack {
             &spec.lookup_fails,
             policy,
         );
-        let head_drafts = u32::try_from(head.len()).unwrap_or(u32::MAX);
         match proposal {
-            Some(proposal)
-                if mtp::lookup_beats_head(&proposal, head_drafts, head.first().copied()) =>
-            {
+            Some(proposal) if mtp::lookup_beats_head(&proposal, &head) => {
                 tracing::trace!(%session, len = proposal.len(), "prompt lookup drafts the step");
                 let id = proposal.id();
                 Ok((proposal.tokens().to_vec(), Some(DraftSource::Lookup(id))))
@@ -790,6 +819,7 @@ impl SparseStack {
             source,
         )?;
         self.remember_lookup(session, &outcome)?;
+        trace_step(session, source, &drafts, &picks, outcome.logits_row);
         // The rewind first: the staged row is the residual of the last
         // *committed* position, and the rewind is what makes the recurrent
         // state agree with it. Then the row is staged, because the catch-up
@@ -978,6 +1008,7 @@ impl SparseStack {
                 source,
             )?;
             self.remember_lookup(*session, &outcome)?;
+            trace_step(*session, source, drafts, own, outcome.logits_row);
             if let Some(rewind) = outcome.rollback {
                 self.spec_rollback(*session, rewind)?;
             }

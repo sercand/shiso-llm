@@ -520,7 +520,7 @@ fn read_forward(
 pub enum DraftSource {
     /// The draft head's own chain.
     Head,
-    /// The prompt lookup, which the head's first token agreed with.
+    /// The prompt lookup, whose proposal extended the head's whole chain.
     Lookup(ProposalId),
     /// The caller's own proposal: structure it knew would come next. Not the
     /// drafter's guess, so it teaches the drafter's acceptance estimate
@@ -531,19 +531,22 @@ pub enum DraftSource {
 /// Whether a lookup proposal is worth taking in place of the head's chain.
 ///
 /// Two conditions, and both are necessary. It has to be *longer* than what the
-/// head would have drafted, because a proposal no longer than that is the same
-/// verify width for a worse guess; and its first token has to be the one the head
-/// picked, because that agreement is the entire evidence that the earlier
-/// occurrence is the text being echoed. `head_first` is `None` on a step where
-/// the head drafted nothing, which is a step where there is no evidence at all.
+/// head drafted, because a proposal no longer than that is the same verify
+/// width for a worse guess; and it has to agree with *every* guess the head
+/// made, so that it only ever extends the head's chain. `head` is empty on a
+/// step where the head drafted nothing, which is a step with no evidence at
+/// all that the earlier occurrence is the text being echoed.
+///
+/// Agreement on the first guess alone was the rule once, and it let a lookup
+/// that diverged from the head at its second guess replace guesses the head
+/// gets right most of the time: on prose the head keeps its second guess in
+/// nearly nine steps of ten that kept its first, and an echo that disagrees
+/// with it there is more often a phrase that recurred than one being copied.
+/// Where the two agree the verify rows they share are the head's own, so a
+/// step that takes the lookup commits at least what the head alone would have.
 #[must_use]
-pub fn lookup_beats_head(
-    proposal: &Proposal,
-    head_drafts: u32,
-    head_first: Option<TokenId>,
-) -> bool {
-    let longer = u32::try_from(proposal.len()).unwrap_or(u32::MAX) > head_drafts;
-    longer && head_first.is_some_and(|first| proposal.tokens.first() == Some(&first))
+pub fn lookup_beats_head(proposal: &Proposal, head: &[TokenId]) -> bool {
+    proposal.tokens.len() > head.len() && !head.is_empty() && proposal.tokens.starts_with(head)
 }
 
 /// How much of a draft the target agreed with.

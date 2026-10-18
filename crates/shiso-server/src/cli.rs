@@ -338,9 +338,9 @@ pub struct ServeArgs {
     /// Prompt-lookup drafts: tokens a step may propose by finding the text
     /// being written earlier in the context. Zero is off.
     ///
-    /// Taken in place of the draft head's chain only when it is longer and its
-    /// first token is the head's own first guess, which is the evidence that
-    /// the text is an echo; a rejected proposal is not made again from the
+    /// Taken in place of the draft head's chain only when it is longer and
+    /// starts with the head's whole chain, so it only ever extends the head's
+    /// guesses; a rejected proposal is not made again from the
     /// same place. The verify pass is `1 + max(--spec-k, this)` rows at the
     /// widest, which is what the per-session rollback records are sized for.
     /// Read by the sparse family's arm, and only beside `--spec-k`.

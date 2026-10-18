@@ -2375,6 +2375,7 @@ fn log_retired(slot: &SeqSlot, ending: Option<&Ending>, now: Instant) {
         None => "unknown".to_owned(),
     };
     let (drafted, accepted, steps) = slot.speculation();
+    let positions = slot.speculation_positions();
     #[expect(
         clippy::cast_precision_loss,
         reason = "ratios printed for a human to read to one decimal place"
@@ -2400,6 +2401,8 @@ fn log_retired(slot: &SeqSlot, ending: Option<&Ending>, now: Instant) {
         decode_tps = format_args!("{:.1}", usage.tokens_per_second),
         spec_accept = spec_accept.map(tracing::field::display),
         spec_tokens_per_step = spec_tokens_per_step.map(tracing::field::display),
+        spec_accept_pos = positions.rates().map(tracing::field::display),
+        spec_rounds = (positions.rounds > 0).then_some(positions.rounds),
         total_ms = format_args!(
             "{:.0}",
             now.saturating_duration_since(slot.started_at()).as_secs_f64() * 1e3

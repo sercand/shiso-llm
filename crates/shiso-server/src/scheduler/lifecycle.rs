@@ -301,6 +301,8 @@ pub(crate) struct SeqSlot {
     /// Guesses drafted for it, guesses kept, and speculative steps taken:
     /// the turn's own share of the scheduler's speculation counters.
     spec: (u64, u64, u64),
+    /// Where in the chain the kept guesses were: see [`SpecPositions`].
+    spec_pos: SpecPositions,
     /// The scoring half, present only on a sequence that scores its prompt
     /// rather than generating from it.
     score: Option<ScoreJob>,
@@ -447,6 +449,7 @@ impl SeqSlot {
             prefill_decodes: None,
             prefill_mixed: false,
             spec: (0, 0, 0),
+            spec_pos: SpecPositions::default(),
             score: None,
         }
     }
@@ -549,6 +552,7 @@ impl SeqSlot {
             prefill_decodes: None,
             prefill_mixed: false,
             spec: (0, 0, 0),
+            spec_pos: SpecPositions::default(),
             score: Some(ScoreJob {
                 labels: request.labels,
                 decision: request.decision,
@@ -1404,6 +1408,12 @@ impl SeqSlot {
     pub(crate) fn speculated(&mut self, accepted: u32, drafted: u32) {
         let (d, a, steps) = self.spec;
         self.spec = (d + u64::from(drafted), a + u64::from(accepted), steps + 1);
+        self.spec_pos.record(accepted, drafted);
+    }
+
+    /// The per-position acceptance tally of this turn's speculative steps.
+    pub(crate) const fn speculation_positions(&self) -> &SpecPositions {
+        &self.spec_pos
     }
 
     /// Guesses drafted, guesses kept, and speculative steps, in that order.
@@ -1418,6 +1428,63 @@ impl SeqSlot {
         let (tokens, elapsed) = self.prefill_timed;
         let secs = elapsed.as_secs_f64();
         (tokens > 0 && secs > 0.0).then(|| f64::from(tokens) / secs)
+    }
+}
+
+/// Draft positions the per-position tally keeps; a deeper chain folds its
+/// tail into the last one rather than growing the line.
+pub(crate) const SPEC_POSITIONS: usize = 8;
+
+/// How often each position of a drafted chain was kept.
+///
+/// `kept[p]` counts the drafting steps whose first `p + 1` guesses the target
+/// accepted, and `rounds` counts the steps that drafted at all, so
+/// `kept[p] / rounds` is the fraction of verify steps in which position
+/// `p + 1` was accepted. Position one too low says the draft's input or first
+/// step is wrong; a curve that falls faster than another's says the chain is.
+/// A step that drafted nothing is no round: it had no position to accept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SpecPositions {
+    /// Steps that drafted at least one guess.
+    pub(crate) rounds: u64,
+    /// Steps whose guess at position `p + 1` was accepted.
+    pub(crate) kept: [u64; SPEC_POSITIONS],
+    /// Steps that drafted a guess at position `p + 1`.
+    pub(crate) drafted: [u64; SPEC_POSITIONS],
+}
+
+impl SpecPositions {
+    /// One step that drafted `drafted` guesses and kept the first `accepted`.
+    pub(crate) fn record(&mut self, accepted: u32, drafted: u32) {
+        if drafted == 0 {
+            return;
+        }
+        self.rounds += 1;
+        let width = |n: u32| usize::try_from(n).unwrap_or(usize::MAX).min(SPEC_POSITIONS);
+        for slot in &mut self.kept[..width(accepted.min(drafted))] {
+            *slot += 1;
+        }
+        for slot in &mut self.drafted[..width(drafted)] {
+            *slot += 1;
+        }
+    }
+
+    /// `kept / rounds` per position, to three places, over the positions any
+    /// step drafted: `None` when no step drafted.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "ratios printed for a human to read to three decimal places"
+    )]
+    pub(crate) fn rates(&self) -> Option<String> {
+        if self.rounds == 0 {
+            return None;
+        }
+        let deep = self.drafted.iter().take_while(|n| **n > 0).count();
+        let rates = self.kept[..deep]
+            .iter()
+            .map(|kept| format!("{:.3}", *kept as f64 / self.rounds as f64))
+            .collect::<Vec<_>>();
+        Some(rates.join(","))
     }
 }
 
@@ -1449,7 +1516,7 @@ fn stand_point(shared_prefix: u32, prompt_len: usize, floor: u32, spans: &[Media
 
 #[cfg(test)]
 mod tests {
-    use super::{Ending, SeqSlot, SlotSetup};
+    use super::{Ending, SeqSlot, SlotSetup, SpecPositions};
     use crate::scheduler::GenerateRequest;
     use crate::tokenizer::Vocabulary;
     use shiso_core::{SamplingParams, Seed, SessionId, StopTokens, TokenId};
@@ -1458,6 +1525,29 @@ mod tests {
     use std::str::FromStr as _;
     use std::sync::Arc;
     use std::time::Instant;
+
+    #[test]
+    fn per_position_acceptance_is_kept_steps_over_drafting_steps() {
+        let mut tally = SpecPositions::default();
+        tally.record(4, 4);
+        tally.record(1, 4);
+        tally.record(0, 4);
+        tally.record(2, 4);
+        // A step that drafted nothing is no round.
+        tally.record(0, 0);
+        assert_eq!(tally.rounds, 4);
+        assert_eq!(&tally.kept[..5], &[3, 2, 1, 1, 0]);
+        assert_eq!(tally.rates().as_deref(), Some("0.750,0.500,0.250,0.250"));
+    }
+
+    #[test]
+    fn a_shorter_chain_counts_as_a_round_that_kept_nothing_past_its_end() {
+        let mut tally = SpecPositions::default();
+        tally.record(2, 2);
+        tally.record(3, 4);
+        assert_eq!(tally.rates().as_deref(), Some("1.000,1.000,0.500,0.000"));
+        assert_eq!(SpecPositions::default().rates(), None);
+    }
 
     /// The stop set of the fake these cases run against: one id, 63.
     fn stop() -> StopTokens {
