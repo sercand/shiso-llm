@@ -380,7 +380,7 @@ fn mxfp8(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Pro
     // A contraction the W8A8 kernel cannot stride stays on the weight-only
     // one: a fact about the weight's shape, so every width of every prompt
     // takes the same kernel for it.
-    if device.lowp_prompt() && in_dim.is_multiple_of(MXFP8_A8_K_ALIGN) {
+    if device.lowp_dense() && in_dim.is_multiple_of(MXFP8_A8_K_ALIGN) {
         let quads = u64::from(rows) * u64::from(in_dim) / 4;
         return Ok(Projection::Mxfp8Lowp {
             quant: Launch::linear(
@@ -596,12 +596,25 @@ impl Device {
     }
 
     /// Whether this pass quantizes its activations for the block-scaled
-    /// kernels: a prompt pass under [`PrefillActivations::Lowp`]. A step or
+    /// kernels: a prompt pass under [`PrefillActivations::Lowp`] for the routed
+    /// experts. A step or
     /// a verify never does, whatever the option, so a decoded token is the
     /// weight-only tier's answer and speculation's equality holds.
     #[must_use]
     pub const fn lowp_prompt(self) -> bool {
         self.row_invariant() && matches!(self.prefill_activations, PrefillActivations::Lowp)
+    }
+
+    /// Whether this pass's dense MXFP8 projections take MXFP8 activations: a
+    /// prompt pass under [`PrefillActivations::Lowp`] or
+    /// [`PrefillActivations::Dense8`].
+    #[must_use]
+    pub const fn lowp_dense(self) -> bool {
+        self.row_invariant()
+            && matches!(
+                self.prefill_activations,
+                PrefillActivations::Lowp | PrefillActivations::Dense8
+            )
     }
 }
 
@@ -627,6 +640,13 @@ pub enum PrefillActivations {
     /// family-specific architecture (`sm_121a`); refused at startup without
     /// one.
     Lowp,
+    /// MXFP8 activations into the dense MXFP8 projections only; the routed
+    /// experts keep half-precision activations. The MXFP8 activation quantizer
+    /// costs about 1.7% relative error against FP4's 12-15%, and the routed
+    /// stage is where FP4 prompt activations measurably cost speculation
+    /// acceptance (the draft head warms over the prompt pass's rows). Needs the
+    /// same kernel set as [`PrefillActivations::Lowp`].
+    Dense8,
 }
 
 /// The one-launch routed selection a decode-sized pass takes.

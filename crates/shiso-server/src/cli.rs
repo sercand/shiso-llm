@@ -1392,6 +1392,9 @@ pub enum PrefillActivations {
     /// Prompt activations quantized to the weight's format, on the
     /// block-scaled tensor-core instructions.
     Lowp,
+    /// MXFP8 prompt activations into the dense projections only; the routed
+    /// experts keep half-precision activations.
+    Dense8,
 }
 
 impl From<PrefillActivations> for shiso_engine::sparse::matmul::PrefillActivations {
@@ -1399,6 +1402,7 @@ impl From<PrefillActivations> for shiso_engine::sparse::matmul::PrefillActivatio
         match choice {
             PrefillActivations::A16 => Self::A16,
             PrefillActivations::Lowp => Self::Lowp,
+            PrefillActivations::Dense8 => Self::Dense8,
         }
     }
 }

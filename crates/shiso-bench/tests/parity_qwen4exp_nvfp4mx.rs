@@ -280,6 +280,20 @@ fn low_precision_prompt_rows_agree_with_the_served_reference() {
     );
 }
 
+/// MXFP8 activations into the dense projections only, the routed experts at
+/// half precision: held to the same floor against the library reference as
+/// the half-precision prompt passes.
+#[test]
+#[ignore = "needs the local Qwen3.8-Flash-Next FP4-Local export and a device"]
+fn dense_mxfp8_prompt_rows_agree_with_the_library_reference() {
+    replay_as(
+        GOLDEN_HF,
+        &[&FLOOR],
+        &[&MLX_REFERENCE, &REFERENCE],
+        PrefillActivations::Dense8,
+    );
+}
+
 #[test]
 #[ignore = "needs the local Qwen3.8-Flash-Next FP4-Local export and a device"]
 fn the_library_reference_rows_agree_on_the_answer() {
