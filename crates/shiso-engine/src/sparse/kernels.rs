@@ -127,6 +127,12 @@ pub const LOWP_ENTRIES: [(&str, &str); 7] = [
 /// reason [`MOD_MODELOPT`] is not; the ported brain-float kernel in
 /// [`MOD_MATVEC`] is what a kernel set without this module keeps.
 pub const MOD_BF16: &str = "q4e_bf16";
+/// The routed block's step launch: a decode step's or a verify's router,
+/// routed selection and shared expert as one grid of work items, bit for bit
+/// what the [`MOD_BF16`], [`MOD_MOE`] and [`MOD_MXFP8`] launches it replaces
+/// compute. Not an upstream unit, for the reason [`MOD_MODELOPT`] is not; see
+/// [`crate::sparse::moe::fused_route`].
+pub const MOD_FFN: &str = "q4e_ffn";
 /// The logits stages run before any pick: today, the suppress stage.
 pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a

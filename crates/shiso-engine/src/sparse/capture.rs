@@ -454,7 +454,12 @@ pub fn optional_paths(backend: &dyn Backend) -> OptionalPaths {
             crate::sparse::matmul::PromptMatmul::Rows
         },
         lowp_prefill: kernels::LOWP_ENTRIES.iter().all(|&(m, e)| has(m, e)),
-        route_sort: if has(MOD_MOE, "q4e_moe_route_sort_tiny_kernel") {
+        route_sort: if has(MOD_MOE, "q4e_moe_route_sort_tiny_kernel")
+            && has(kernels::MOD_FFN, "q4e_ffn_route_kernel")
+            && has(kernels::MOD_FFN, "q4e_ffn_route_rows_kernel")
+        {
+            crate::sparse::matmul::RouteSort::Fused
+        } else if has(MOD_MOE, "q4e_moe_route_sort_tiny_kernel") {
             crate::sparse::matmul::RouteSort::Tiny
         } else {
             crate::sparse::matmul::RouteSort::Small

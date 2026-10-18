@@ -51,7 +51,8 @@ back to the kernel it belongs to.
 | `q4e_idxring` | `idxring.cu` | 1 | 0 |
 | `q4e_bf16` | `bf16.cu` | 12 | 0 |
 | `q4e_gdn_fused` | `gdn_fused.cu` | 2 | 0 |
-| **total** | 18 units | **105** | **105** |
+| `q4e_ffn` | `ffn.cu` | 3 | 0 |
+| **total** | 19 units | **108** | **105** |
 
 ## Plain entries, by module
 
@@ -207,6 +208,23 @@ bit.
 - `q4e_gdf_scan_kernel` - one block per value head: the state carried across
   the chunk's runs with the state transposed in mma accumulators, and each run's
   outputs normed and gated in place.
+
+### `q4e_ffn`
+
+Not an upstream unit: a decode step's or a verify's router, gate logit, routed
+selection and shared expert in one launch of work items, reproducing the
+`q4e_bf16` step kernels, `q4e_moe_route_sort_tiny_kernel`, the `q4e_mxfp8`
+group and step kernels and `q4e_swiglu_kernel` bit for bit. Both take `logits,
+gate_logit, mid, shared_out, ids, weights, bounds, active, sorted, pos, sync,
+router, gate, g_codes, g_scales, u_codes, u_scales, d_codes, d_scales, x,
+in_dim, n_expert, n_used, inter, splits, gate_splits, rows`; grid
+`ceil(inter / 8) + n_expert * splits / 8 + 1 + ceil(in_dim / 16)`, 256 threads.
+
+- `q4e_ffn_route_kernel` - one activation row (a decode step).
+- `q4e_ffn_route_rows_kernel` - two to eight rows (a verify), the same sums.
+- `q4e_ffn_combine_kernel` - `q4e_moe_combine_kernel` then
+  `q4e_shared_add_kernel` in one pass (`out, down, weights, shared, logit,
+  n_embd, n_used`), grid `(ceil(n_embd / 256), rows)`, 256 threads.
 
 ### `q4e_moe`
 

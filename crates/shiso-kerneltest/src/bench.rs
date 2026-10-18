@@ -232,6 +232,14 @@ pub const CASES: &[Case] = &[
         build: crate::qwen4exp::route::bench_route_sort_tiny_t5,
     },
     Case {
+        name: "q4e_ffn_route_t1",
+        build: crate::qwen4exp::ffn::bench_route_t1,
+    },
+    Case {
+        name: "q4e_ffn_route_t5",
+        build: crate::qwen4exp::ffn::bench_route_t5,
+    },
+    Case {
         name: "q4e_hc_mix_pair_4096",
         build: crate::qwen4exp::hc_mix::bench_pair_4096,
     },

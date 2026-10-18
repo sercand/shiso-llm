@@ -185,6 +185,10 @@ pub enum Buf {
     MoeActive,
     /// The routed columns, sorted by expert.
     MoeSorted,
+    /// The words the fused route launch orders its work items through
+    /// (`moe::fused_route`): zero when allocated, and put back to zero by
+    /// the block that finishes each launch last.
+    MoeSync,
     /// The draft head's normed view of the target hidden state it starts from.
     DraftNormed,
     /// The draft head's projection of that hidden state, per stream.
@@ -299,7 +303,7 @@ fn fused_qk_bytes(shape: &SparseShape, run_rows: u64) -> u64 {
 
 impl Buf {
     /// Every buffer, in allocation order.
-    pub const ALL: [Self; 79] = [
+    pub const ALL: [Self; 80] = [
         Self::Ids,
         Self::Positions,
         Self::Mrope,
@@ -349,6 +353,7 @@ impl Buf {
         Self::MoeBounds,
         Self::MoeActive,
         Self::MoeSorted,
+        Self::MoeSync,
         Self::DraftNormed,
         Self::DraftHidden,
         Self::ResidualHold,
@@ -471,6 +476,7 @@ impl Buf {
                 (u64::from(shape.moe.experts) + 1) * I32_BYTES
             }
             Self::MoeSorted => columns * I32_BYTES,
+            Self::MoeSync => u64::from(crate::sparse::moe::FUSED_ROUTE_SYNC_WORDS) * I32_BYTES,
             Self::MoeGate | Self::MoeUp | Self::MoeMid => {
                 columns * u64::from(shape.moe.intermediate) * F32_BYTES
             }
@@ -555,6 +561,7 @@ impl Buf {
             | Self::MoeBounds
             | Self::MoeActive
             | Self::MoeSorted
+            | Self::MoeSync
             | Self::MoeGate
             | Self::MoeUp
             | Self::MoeMid
@@ -672,7 +679,13 @@ impl Scratch {
                 } else {
                     buf.bytes(shape, rows, logit_rows, ctx)
                 };
-                alloc_tagged(backend, buf.tag(), bytes)
+                let buffer = alloc_tagged(backend, buf.tag(), bytes)?;
+                // The fused route launch finds its words at zero and leaves
+                // them so; a fresh allocation holds whatever was there.
+                if *buf == Buf::MoeSync {
+                    backend.fill_zero(buffer.view())?;
+                }
+                Ok(buffer)
             })
             .collect::<CoreResult<Vec<_>>>()?;
         Ok(Self {

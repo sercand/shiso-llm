@@ -41,10 +41,11 @@ use crate::sparse::weights::{SparseWeights, WeightPart};
 
 /// Arguments one launch may carry.
 ///
-/// The widest kernel in this set declares eighteen parameters; the bound is
-/// above that with room, and an argument list that reaches it is refused rather
-/// than truncated.
-pub const MAX_ARGS: usize = 24;
+/// The widest kernel in this set declares twenty-seven parameters (the fused
+/// route launch, `moe::fused_route`, which takes every buffer and weight of
+/// the seven launches it replaces); the bound is above that with room, and an
+/// argument list that reaches it is refused rather than truncated.
+pub const MAX_ARGS: usize = 32;
 
 /// Rows one binder may hold a session for.
 ///
