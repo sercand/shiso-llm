@@ -357,6 +357,94 @@ __device__ __forceinline__ void q4e_mo_nvfp4_step_rows(
     }
 }
 
+/* `q4e_mo_nvfp4_step_rows<1, R, 1, G>` - one matrix, `R` rows taken one at a
+ * time - with the next row's codes and scale words requested before this
+ * row's columns are summed, so a warp's rows are one stream instead of `R`
+ * round trips. The same values in the same order: only the loads move.
+ *
+ * Measured on a GB10 (graph of 48 layers' down stages, ten random experts of
+ * 512, compute_80 JIT, three runs): 44.4-45.0 -> 42.7-43.9 us a layer.
+ * Holding all four rows' loads at once (`P = 4`) measured 49.4-50.5 us: the
+ * registers it takes cost more blocks than the bytes in flight bought. */
+template <uint32_t R, uint32_t G>
+__device__ __forceinline__ void q4e_mo_nvfp4_step_rows_pipe(
+        float *__restrict__ out, const uint8_t *__restrict__ w, const uint8_t *__restrict__ s,
+        float global, const float *__restrict__ x, const int *__restrict__ sorted, int c0,
+        int c1, uint32_t div, uint32_t row, uint32_t rows, uint32_t in_dim, uint32_t out_dim,
+        uint32_t lane) {
+    const uint32_t groups = in_dim / Q4E_NVFP4_GROUP;
+    const uint64_t packed = in_dim / 2u;
+    if (groups > 32u * G || (groups & 3u) != 0u) {
+        const uint8_t *const wm[1] = {w};
+        const uint8_t *const sm[1] = {s};
+        float *const om[1] = {out};
+        q4e_mo_nvfp4_step_rows<1u, R, 1u, G>(om, wm, sm, &global, x, sorted, c0, c1, div, row,
+                                             rows, in_dim, out_dim, lane);
+        return;
+    }
+    constexpr uint32_t W = (G + 3u) / 4u;
+    uint2 code[2][G];
+    uint32_t word[2][W];
+    /* Row `r`'s codes and scale words, as `q4e_mo_nvfp4_step_rows` loads them. */
+    auto load = [&](uint32_t r, uint2 *c, uint32_t *wd) {
+#pragma unroll
+        for (uint32_t q = 0; q < G; ++q) {
+            const uint32_t g = lane + 32u * q;
+            c[q] = (r < rows && g < groups) ? ((const uint2 *) (w + r * packed))[g]
+                                            : make_uint2(0u, 0u);
+        }
+#pragma unroll
+        for (uint32_t v = 0; v < W; ++v) {
+            const uint32_t at = lane + 32u * v;
+            wd[v] = (r < rows && at * 4u < groups) ? ((const uint32_t *) (s + r * groups))[at] : 0u;
+        }
+    };
+    load(0u, code[0], word[0]);
+#pragma unroll
+    for (uint32_t r = 0; r < R; ++r) {
+        const uint32_t cur = r & 1u;
+        if (r + 1u < R) {
+            load(r + 1u, code[cur ^ 1u], word[cur ^ 1u]);
+        }
+        if (r >= rows) {
+            continue;
+        }
+        float scale[G];
+#pragma unroll
+        for (uint32_t q = 0; q < G; ++q) {
+            const uint32_t g = lane + 32u * q;
+            const uint32_t b = __shfl_sync(0xffffffffu, word[cur][q >> 2], (g >> 2) & 31u);
+            scale[q] = g < groups ? q4e_mo_e4m3((b >> (8u * (g & 3u))) & 0xFFu) * global : 0.0f;
+        }
+        for (int c = c0; c < c1; ++c) {
+            const uint32_t col = (uint32_t) sorted[c];
+            const float *xr = x + (uint64_t) (col / div) * in_dim;
+            float acc = 0.0f;
+#pragma unroll
+            for (uint32_t q = 0; q < G; ++q) {
+                const uint32_t g = lane + 32u * q;
+                if (g < groups) {
+                    const float4 *xg = (const float4 *) (xr + (uint64_t) g * Q4E_NVFP4_GROUP);
+                    const float4 x0 = xg[0];
+                    const float4 x1 = xg[1];
+                    const float4 x2 = xg[2];
+                    const float4 x3 = xg[3];
+                    uint32_t lo = code[cur][q].x;
+                    uint32_t hi = code[cur][q].y;
+                    asm volatile("" : "+r"(lo), "+r"(hi));
+                    const float part = q4e_mo_word_dot_fast(lo, x0, x1)
+                                     + q4e_mo_word_dot_fast(hi, x2, x3);
+                    acc = fmaf(part, scale[q], acc);
+                }
+            }
+            const float v = q4e_mo_warp_sum(acc);
+            if (lane == 0u) {
+                out[(uint64_t) col * out_dim + row + r] = v;
+            }
+        }
+    }
+}
+
 /* Gate and up for one active expert's columns, `Q4E_NVFP4_GU_ROWS` rows of
  * each a warp: the body of both gate-and-up entries. `out[0]` and `out[1]`
  * are the gate and up outputs, or with `ACT` `out[0]` is the activated
@@ -460,8 +548,9 @@ extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_ex
 
 /* The routed down projection over an NVFP4 bank: each column reads its own row
  * of the activated intermediate and writes `[column, out_dim]`;
- * `Q4E_NVFP4_DN_ROWS` rows a warp, taken one at a time (two or four held at
- * once measured 3-6% slower on a GB10).
+ * `Q4E_NVFP4_DN_ROWS` rows a warp, taken one at a time with the next one's
+ * loads in flight (`q4e_mo_nvfp4_step_rows_pipe`; two or four held at once
+ * measured 3-6% slower on a GB10).
  *
  * Buffers: out, down_w, down_s, down_g, mid, sorted, bounds, active, map,
  * in_dim, out_dim, n_expert, n_used. Grid `(ceil(out_dim / 16), min(columns,
@@ -486,13 +575,10 @@ extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_ex
         return;
     }
     const uint64_t first = slot * out_dim + row;
-    const uint8_t *w[1] = {down_w + first * (in_dim / 2u)};
-    const uint8_t *s[1] = {down_s + first * (in_dim / Q4E_NVFP4_GROUP)};
-    const float g[1] = {down_g[slot]};
-    float *const o[1] = {out};
-    q4e_mo_nvfp4_step_rows<1u, Q4E_NVFP4_DN_ROWS, 1u, 2u>(
-            o, w, s, g, mid, sorted, c0, c1, 1u, row,
-            min(Q4E_NVFP4_DN_ROWS, out_dim - row), in_dim, out_dim, lane);
+    q4e_mo_nvfp4_step_rows_pipe<Q4E_NVFP4_DN_ROWS, 2u>(
+            out, down_w + first * (in_dim / 2u), down_s + first * (in_dim / Q4E_NVFP4_GROUP),
+            down_g[slot], mid, sorted, c0, c1, 1u, row, min(Q4E_NVFP4_DN_ROWS, out_dim - row),
+            in_dim, out_dim, lane);
 }
 /* ---------------------------------------------------------------------------
  * The routed stages of a prompt pass, on tensor cores.
