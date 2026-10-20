@@ -8,7 +8,7 @@
 use shiso_core::DType;
 
 /// Every variant, so the round-trip test cannot silently skip one.
-const ALL: [DType; 30] = [
+const ALL: [DType; 31] = [
     DType::F32,
     DType::F16,
     DType::Q4_0,
@@ -36,6 +36,7 @@ const ALL: [DType; 30] = [
     DType::Exl3K4,
     DType::Exl3K5,
     DType::Exl3K6,
+    DType::Exl3K8,
     DType::Exl3Ngram6,
     DType::Pq2_0,
     DType::Ptq1_0,
@@ -60,7 +61,7 @@ fn on_disk_ids_are_unique() {
 
 #[test]
 fn discriminants_are_the_documented_ids() {
-    let expected: [(DType, u32); 30] = [
+    let expected: [(DType, u32); 31] = [
         (DType::F32, 0),
         (DType::F16, 1),
         (DType::Q4_0, 2),
@@ -88,6 +89,7 @@ fn discriminants_are_the_documented_ids() {
         (DType::Exl3K4, 68),
         (DType::Exl3K5, 69),
         (DType::Exl3K6, 70),
+        (DType::Exl3K8, 73),
         (DType::Exl3Ngram6, 72),
         (DType::Pq2_0, 142),
         (DType::Ptq1_0, 143),
@@ -105,7 +107,7 @@ fn unknown_id_is_none_rather_than_a_default() {
     assert_eq!(DType::from_gguf_id(u32::MAX), None);
     // The ids in the gaps between the ones this build reads stay unknown.
     for id in 71..=100 {
-        if id != 72 {
+        if id != 72 && id != 73 {
             assert_eq!(DType::from_gguf_id(id), None, "id {id} should be unknown");
         }
     }
@@ -113,7 +115,7 @@ fn unknown_id_is_none_rather_than_a_default() {
 
 #[test]
 fn block_dimensions_of_the_formats_that_matter() {
-    let pinned: [(DType, u32, u32); 16] = [
+    let pinned: [(DType, u32, u32); 17] = [
         (DType::Mxfp8E4M3G32, 32, 32),
         (DType::Pq2_0, 128, 34),
         (DType::Ptq1_0, 128, 28),
@@ -123,6 +125,7 @@ fn block_dimensions_of_the_formats_that_matter() {
         (DType::MXFP4, 32, 17),
         (DType::IQ2_XXS, 256, 66),
         (DType::Exl3Ngram6, 160, 122),
+        (DType::Exl3K8, 256, 256),
         (DType::IQ2_XS, 256, 74),
         (DType::IQ3_XXS, 256, 98),
         (DType::IQ1_S, 256, 50),

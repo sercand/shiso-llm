@@ -446,6 +446,7 @@ pub mod exl3 {
             DType::Exl3K4 => Some(4),
             DType::Exl3K5 => Some(5),
             DType::Exl3K6 => Some(6),
+            DType::Exl3K8 => Some(8),
             _ => None,
         }
     }

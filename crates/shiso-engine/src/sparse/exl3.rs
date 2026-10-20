@@ -15,10 +15,19 @@
 
 use shiso_core::error::{CoreError, CoreResult};
 
-/// Narrowest trellis width the kernel set was built for.
-pub const MIN_BITS: u32 = 4;
-/// Widest trellis width the kernel set was built for.
-pub const MAX_BITS: u32 = 6;
+/// Trellis widths the kernel set was built for.
+///
+/// Not a range: seven bits has no checkpoint that uses it, and every width is
+/// a full set of GEMM, grouped, routed and decode-shaped instances in the
+/// module, so a width is built only once a checkpoint ships it. Eight is the
+/// draft head of a re-quantized export.
+pub const BUILT_BITS: [u32; 4] = [4, 5, 6, 8];
+
+/// Whether the kernel set carries instances for a trellis width.
+#[must_use]
+pub const fn is_built(bits: u32) -> bool {
+    matches!(bits, 4 | 5 | 6 | 8)
+}
 
 /// Tiles a shape divides the contraction into, indexed by shape number.
 const TILE_K: [u32; 5] = [0, 16, 32, 32, 16];
@@ -180,9 +189,9 @@ impl Fanout {
 /// [`CoreError::ShapeMismatch`] naming the dimension that does not tile, and
 /// [`CoreError::Unsupported`] for a trellis width this build has no kernel for.
 pub fn check_shape(k: u32, n: u32, bits: u32) -> CoreResult<()> {
-    if !(MIN_BITS..=MAX_BITS).contains(&bits) {
+    if !is_built(bits) {
         return Err(CoreError::Unsupported {
-            what: "a trellis width outside the range this kernel set was built for",
+            what: "a trellis width this kernel set was not built for",
             backend: "engine",
         });
     }
@@ -220,10 +229,9 @@ pub fn select_shape(k: u32, n: u32, bits: u32, fanout: Fanout) -> Option<GemmSha
     let k_eff = u64::from(k) * u64::from(fanout.input_scale());
     let n_eff = u64::from(n) * u64::from(fanout.output_scale());
 
-    // The proposal. The `bits >= 7` arm is unreachable in this build - a wider
-    // trellis is refused by `check_shape` before anything gets here - and it is
-    // transcribed anyway so that this table and the one it mirrors can be read
-    // against each other line for line.
+    // The proposal, transcribed so that this table and the one it mirrors can
+    // be read against each other line for line. Of the `bits >= 7` arm only
+    // eight is reachable; `check_shape` refuses seven before anything gets here.
     let proposed: u8 = if (bits == 4 || bits == 2) && !fanout.is_grouped() && k_eff <= 2_048 {
         1
     } else if bits >= 7 {
@@ -816,6 +824,9 @@ mod tests {
         );
         let err = check_shape(2_560, 128, 3).expect_err("three bits has no kernel here");
         assert!(matches!(err, CoreError::Unsupported { .. }), "{err:?}");
+        let err = check_shape(2_560, 128, 7).expect_err("seven bits has no kernel here");
+        assert!(matches!(err, CoreError::Unsupported { .. }), "{err:?}");
+        check_shape(2_560, 128, 8).expect("eight bits is built");
     }
 
     #[test]

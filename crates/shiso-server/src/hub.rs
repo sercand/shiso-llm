@@ -823,6 +823,45 @@ mod tests {
         assert_eq!(args.solo_prefill_chunk, 4096);
     }
 
+    /// The re-quantized export of the same family: its shards carry no tower
+    /// file, so the base checkpoint's tower comes from another repository as a
+    /// component of its own.
+    const QWEN38_UNCENSORED: &str =
+        include_str!("../../shiso-registry/tests/fixtures/qwen3.8-flash-uncensored.json");
+
+    /// A tower supplied by a component of its own resolves to that
+    /// component's directory and entry, while the n-gram table stays the file
+    /// bound inside the base directory.
+    #[test]
+    fn a_tower_from_another_repository_resolves_to_its_component() {
+        let recipe: Recipe = serde_json::from_str(QWEN38_UNCENSORED).expect("fixture parses");
+        validate_recipe(&recipe, ValidationMode::Strict).expect("fixture validates");
+        let variant = recipe
+            .variants
+            .iter()
+            .find(|v| v.key.as_str() == "exl3-405")
+            .expect("cuda variant");
+        let matches = Cli::command().get_matches_from(["shiso", "serve", "--port", "1"]);
+        let serve = matches.subcommand_matches("serve").expect("serve");
+        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
+        let vdir = Path::new("/hub/models/qwen3.8-flash-uncensored/exl3-405");
+        populate_serve_args_from_variant(&mut args, vdir, variant, &recipe.name)
+            .expect("populates");
+
+        let base = vdir.join(Role::Base.as_str());
+        assert_eq!(args.model, Some(base.clone()));
+        assert_eq!(
+            args.vision,
+            Some(
+                vdir.join(Role::Vision.as_str())
+                    .join("vision_k6.safetensors")
+            )
+        );
+        assert_eq!(args.ngram, Some(base.join("ngram_embedding.safetensors")));
+        assert_eq!(args.draft_model, None);
+        assert_eq!(args.model_name.as_deref(), Some("qwen3.8-flash-uncensored"));
+    }
+
     /// The MLX variant is a directory checkpoint with no entry file, and the
     /// residency choice is the server's own `auto`.
     #[test]

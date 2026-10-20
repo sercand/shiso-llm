@@ -503,7 +503,7 @@ pub fn co_resident_blocks(backend: &dyn Backend, entries: EntryTable) -> u32 {
             ),
         }
     };
-    for bits in exl3::MIN_BITS..=exl3::MAX_BITS {
+    for bits in exl3::BUILT_BITS {
         for shape in GemmShape::all() {
             let args = TemplateArgs::Trellis {
                 bits,
