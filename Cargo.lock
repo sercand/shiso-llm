@@ -2635,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-audio"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "realfft",
  "serde_json",
@@ -2649,7 +2649,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-bench"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2678,7 +2678,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "half",
  "parking_lot",
@@ -2690,7 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-cuda"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "cudarc",
  "half",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-engine"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytemuck",
  "half",
@@ -2732,7 +2732,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-hub"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "futures-util",
  "hex",
@@ -2754,7 +2754,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-ir"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "futures",
  "serde_json",
@@ -2763,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-kernels"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "tempfile",
  "toml",
@@ -2771,7 +2771,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-kerneltest"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytemuck",
  "half",
@@ -2781,7 +2781,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-kvstore"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "parking_lot",
  "sha1",
@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-media-sys"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "block2",
  "libc",
@@ -2810,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-metal"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytemuck",
  "half",
@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-modelfile"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytemuck",
  "half",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-models"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytemuck",
  "half",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-parsers"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -2882,7 +2882,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-ple"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "io-uring",
  "libc",
@@ -2898,7 +2898,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-registry"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -2927,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-router"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -2957,7 +2957,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-server"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3002,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-vision"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytemuck",
  "image",

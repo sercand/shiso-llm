@@ -70,6 +70,11 @@ pub enum DType {
     Exl3K5 = 69,
     /// Trellis 6-bit codec, one 16x16 tile per block.
     Exl3K6 = 70,
+    /// Trellis 8-bit codec, one 16x16 tile per block.
+    ///
+    /// Not `64 + K` like the narrower widths: 72 was already the n-gram row
+    /// codec when this width arrived.
+    Exl3K8 = 73,
     /// N-gram row codec: 160 weights per row with an fp16 scale word.
     Exl3Ngram6 = 72,
     /// MLX 4-bit affine block quant, group size 64: 32 bytes weights + 2 bytes scale + 2 bytes bias.
@@ -200,6 +205,7 @@ impl DType {
             68 => Some(Self::Exl3K4),
             69 => Some(Self::Exl3K5),
             70 => Some(Self::Exl3K6),
+            73 => Some(Self::Exl3K8),
             72 => Some(Self::Exl3Ngram6),
             142 => Some(Self::Pq2_0),
             143 => Some(Self::Ptq1_0),
@@ -247,6 +253,7 @@ impl DType {
             Self::Exl3K4 => "exl3_k4",
             Self::Exl3K5 => "exl3_k5",
             Self::Exl3K6 => "exl3_k6",
+            Self::Exl3K8 => "exl3_k8",
             Self::Exl3Ngram6 => "exl3_ngram6",
             Self::MlxAffine4Gs64 => "mlx_affine_4_gs64",
             Self::MlxAffine8Gs64 => "mlx_affine_8_gs64",
@@ -304,7 +311,8 @@ impl DType {
             | Self::IQ1_M
             | Self::Exl3K4
             | Self::Exl3K5
-            | Self::Exl3K6 => 256,
+            | Self::Exl3K6
+            | Self::Exl3K8 => 256,
         };
         expect_nonzero(elems)
     }
@@ -341,6 +349,7 @@ impl DType {
             Self::Exl3K4 => 128,
             Self::Exl3K5 => 160,
             Self::Exl3K6 => 192,
+            Self::Exl3K8 => 256,
             Self::Exl3Ngram6 => 122,
             Self::MlxAffine4Gs64 | Self::MlxAffine2Gs128 => 36,
             Self::MlxAffine8Gs64 => 68,

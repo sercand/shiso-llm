@@ -750,7 +750,7 @@ pub fn plan(
         DType::F16 => half(in_dim, out_dim, rows, device),
         DType::F16Pack12 => packed_half(in_dim, out_dim, rows, device),
         DType::BF16 => brain(in_dim, out_dim, rows, device),
-        DType::Exl3K4 | DType::Exl3K5 | DType::Exl3K6 => {
+        DType::Exl3K4 | DType::Exl3K5 | DType::Exl3K6 | DType::Exl3K8 => {
             trellis(dtype, in_dim, out_dim, rows, device)
         }
         DType::MlxAffine4Gs64 => affine(in_dim, out_dim, rows, device),
@@ -1111,13 +1111,14 @@ fn brain_tensor(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreRes
     })
 }
 
-/// Trellis width of one of the three codec element types.
+/// Trellis width of one of the four codec element types.
 #[must_use]
 pub const fn trellis_bits(dtype: DType) -> Option<u32> {
     match dtype {
         DType::Exl3K4 => Some(4),
         DType::Exl3K5 => Some(5),
         DType::Exl3K6 => Some(6),
+        DType::Exl3K8 => Some(8),
         _ => None,
     }
 }

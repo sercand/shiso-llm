@@ -109,6 +109,7 @@ const SUPPORTED: &[DType] = &[
     DType::Exl3K4,
     DType::Exl3K5,
     DType::Exl3K6,
+    DType::Exl3K8,
 ];
 
 /// A loaded checkpoint of this family.

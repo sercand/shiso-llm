@@ -883,6 +883,7 @@ impl WeightDesc {
                 (DType::Exl3K4, DType::Exl3K4)
                     | (DType::Exl3K5, DType::Exl3K5)
                     | (DType::Exl3K6, DType::Exl3K6)
+                    | (DType::Exl3K8, DType::Exl3K8)
                     | (DType::F16, DType::F16)
                     | (DType::BF16, DType::BF16)
                     | (DType::F32, DType::F32)

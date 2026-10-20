@@ -1,0 +1,204 @@
+{
+  "schema_version": 1,
+  "name": "qwen3.8-flash-uncensored",
+  "aliases": [
+    "qwen3.8-flash-next-uncensored"
+  ],
+  "family": "qwen4exp",
+  "min_shiso_version": "0.2.3",
+  "description": "Abliterated (refusal-removed) Qwen3.8-Flash-Next: sparse hybrid-attention MoE with n-gram embeddings, built-in MTP draft head and the base model's vision tower. Safety alignment is substantially removed",
+  "tags": [],
+  "tasks": [
+    "chat"
+  ],
+  "modalities": {
+    "inputs": [
+      "text",
+      "image",
+      "video"
+    ],
+    "outputs": [
+      "text"
+    ]
+  },
+  "features": {
+    "tools": true,
+    "reasoning": true,
+    "reasoning_efforts": [
+      "none",
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "default_reasoning_effort": "medium",
+    "structured_output": false
+  },
+  "variants": [
+    {
+      "key": "exl3-405",
+      "backends": [
+        "cuda"
+      ],
+      "quant": "exl3-4.05bpw",
+      "requires": {},
+      "requirements": {
+        "min_ram_bytes": 68719476736,
+        "disk_bytes": 109685410201
+      },
+      "components": {
+        "base": {
+          "provider": "huggingface",
+          "repo": "Lygodactylus/Qwen3.8-Flash-Next-Uncensored-exl3-4bpw",
+          "revision": "9c715c0b1a745b7db1c335347e8d45595b3cad3a",
+          "files": [
+            {
+              "name": "chat_template.jinja",
+              "size": 8952,
+              "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+            },
+            {
+              "name": "config.json",
+              "size": 5055,
+              "sha256": "3a309c5f4892849cb92c57e7636f7fb2592a6835cb25edd20675f4c447d7f6a2"
+            },
+            {
+              "name": "generation_config.json",
+              "size": 202,
+              "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+            },
+            {
+              "name": "merges.txt",
+              "size": 3353259,
+              "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+            },
+            {
+              "name": "model-00001-of-00009.safetensors",
+              "size": 8357469645,
+              "sha256": "abcc7f315f3436c3e47b0dd5b26fdd85f6ee324e2b07b64e84586da916e9d522"
+            },
+            {
+              "name": "model-00002-of-00009.safetensors",
+              "size": 8028543792,
+              "sha256": "45d8be43f2ec076378464d3688eb6466178e4ce4c281fcb6dda449d88d0cdfd7"
+            },
+            {
+              "name": "model-00003-of-00009.safetensors",
+              "size": 8030548026,
+              "sha256": "1fa494485042a21894667a039c83de63e9ab661668422a70a2dd7aa261ddbe44"
+            },
+            {
+              "name": "model-00004-of-00009.safetensors",
+              "size": 8028574718,
+              "sha256": "a66464efaa22a41b8c368c5b1202f8a9754b41fe2b2ee5a0dfe9898135103410"
+            },
+            {
+              "name": "model-00005-of-00009.safetensors",
+              "size": 8030548026,
+              "sha256": "bbef948b45dae500447e8aceb794ad9225eca81738795cc0acec576f4b3e5e3d"
+            },
+            {
+              "name": "model-00006-of-00009.safetensors",
+              "size": 8028574718,
+              "sha256": "1102f8b7aef81c46664873f613fd2360737bb98fd6010b91e9c55202ee26585b"
+            },
+            {
+              "name": "model-00007-of-00009.safetensors",
+              "size": 8030548026,
+              "sha256": "01d075e16ad6a9d6dd6f5938bb64039c35ae62b6a2302fe0e2f1d14948dc7600"
+            },
+            {
+              "name": "model-00008-of-00009.safetensors",
+              "size": 8028574718,
+              "sha256": "f8f53bf2d0909ab8dfa66f67ab2a81f4f7c9db5e8db8cc19d54b54042a589186"
+            },
+            {
+              "name": "model-00009-of-00009.safetensors",
+              "size": 5367150779,
+              "sha256": "ae3f2dde5a71f4d0ba9124993f32a8be0ce8a3eb6dbdef280c82ba24e4a6feef"
+            },
+            {
+              "name": "model.safetensors.index.json",
+              "size": 32706314,
+              "sha256": "7d3d126046f3d5e569e0b39fc2165d9b05dffe4393d10018d64494e827a57703"
+            },
+            {
+              "name": "ngram_embedding.safetensors",
+              "size": 39040214152,
+              "sha256": "45237a092e234c7665999256966671c04419fa1e0b21f917689bd93eb7ffb3f1",
+              "binds": "ngram"
+            },
+            {
+              "name": "preprocessor_config.json",
+              "size": 390,
+              "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+            },
+            {
+              "name": "quantization_config.json",
+              "size": 96644804,
+              "sha256": "3f29b6714f8d472ae2b71713036ae1ebf0b5da9ce0e1db801b4c1f91740bf207"
+            },
+            {
+              "name": "tokenizer.json",
+              "size": 12809320,
+              "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+            },
+            {
+              "name": "tokenizer_config.json",
+              "size": 17928,
+              "sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
+            },
+            {
+              "name": "video_preprocessor_config.json",
+              "size": 385,
+              "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+            },
+            {
+              "name": "vocab.json",
+              "size": 6722759,
+              "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+            }
+          ]
+        },
+        "vision": {
+          "provider": "huggingface",
+          "repo": "turboderp/Qwen3.8-Flash-Next-exl3",
+          "revision": "55a732e0c4c3d4614bc42b68493bb930d9b02c0a",
+          "entry": "vision_k6.safetensors",
+          "files": [
+            {
+              "name": "config.json",
+              "size": 5055,
+              "sha256": "2ff43c0d52242195071dbb6b190f358eaf74d54ba64abdd780d4776c102ed719"
+            },
+            {
+              "name": "vision_k6.safetensors",
+              "size": 561389181,
+              "sha256": "04a66385d96ee7015dab2202615de786319d6219cd70b5208ef00f363b34b620"
+            }
+          ]
+        },
+        "draft_vocab": {
+          "provider": "shiso",
+          "entry": "draft_vocab_en_tr_code.txt",
+          "files": [
+            {
+              "name": "draft_vocab_en_tr_code.txt",
+              "size": 999997,
+              "sha256": "f6371cfff16e83c2202fb237744f225620dc78063f8bd69995e438f2c6264d41"
+            }
+          ]
+        }
+      },
+      "server_defaults": {
+        "ctx": 262000,
+        "max_num_seqs": 4,
+        "spec_k": 4,
+        "spec_lookup": 8,
+        "capture_verify": true,
+        "capture_batch": true,
+        "gpu_memory_utilization": 0.88,
+        "solo_prefill_chunk": 4096
+      }
+    }
+  ]
+}

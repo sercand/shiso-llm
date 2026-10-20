@@ -167,6 +167,7 @@ fn the_real_manifest_tree_parses() {
         [
             "audio",
             "dense",
+            "diffusion",
             "exl3",
             "generic",
             "ggml_stubs",
