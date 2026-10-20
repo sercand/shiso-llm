@@ -37,6 +37,9 @@ pub use manifest::{
     TowerTensorSpec, TowerTree,
 };
 
+/// The shard index a multi-shard checkpoint carries beside its shards.
+const SHARD_INDEX: &str = "model.safetensors.index.json";
+
 /// A loaded Qwen vision tower.
 ///
 /// Holds the weights, the encoder that drives them, and the preprocessing spec
@@ -82,6 +85,12 @@ impl Qwen35Tower {
     pub fn open(backend: &Arc<dyn Backend>, path: &Path) -> Result<Self, VisionError> {
         let source = if path.is_dir() {
             Self::checkpoint_source(path)?
+        } else if path.file_name().is_some_and(|name| name == SHARD_INDEX) {
+            // A checkpoint's shard index names the shard set the tower rides
+            // in: the mixed-precision export interleaves `model.visual.*`
+            // through its language-model shards. A registry recipe binds the
+            // tower role to a file, so this is how it points at that set.
+            Self::checkpoint_source(path.parent().unwrap_or_else(|| Path::new(".")))?
         } else if path.extension().is_some_and(|ext| ext == "safetensors") {
             // A tower file of a checkpoint directory rather than a standalone
             // container: the trellis export ships its tower this way.

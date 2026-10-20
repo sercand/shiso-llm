@@ -24,7 +24,9 @@ pub mod exl3;
 pub mod fp8;
 pub mod mlx;
 mod model;
+pub mod modelopt_mixed;
 pub mod nvfp4;
+pub mod ple_nvfp4;
 
 pub use binding::{
     AttnRoles, BlockRoles, BoundLayer, ExpertRoles, MixRoles, ModelBinding, NGRAM_BIAS,

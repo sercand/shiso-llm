@@ -19,10 +19,11 @@
 //!    graph, because a capture bakes in the table's address.
 //! 2. **Plan.** The plan is also what starts the n-gram gather: the handle it
 //!    carries is the one thing in a pass that has to be started early and
-//!    awaited late.
-//! 3. **Issue the gather.** The rows are a dozen cold reads a token off a table
-//!    that is tens of gibibytes; they go onto a thread of their own here so the
-//!    host work below overlaps them.
+//!    awaited late. A text step usually takes the plan the step before it
+//!    kept, with a fresh gather (the `plancache` module).
+//! 3. **Hash the gather.** The rows are a dozen cold reads a token off a table
+//!    that is tens of gibibytes. Only their identifiers are computed here; the
+//!    reads themselves wait for step 5.
 //! 4. **Write the inputs.** The token ids, the positions and the rotary table.
 //!    A decode batch of more than one row adds the fifth input here, and it is
 //!    an input in every sense the other three are: the per-row pointer arrays
@@ -30,14 +31,17 @@
 //!    every launch of the pass reads whatever the allocator last left at those
 //!    addresses and still succeeds - which is why they are written from one
 //!    place, at one point in this order, like the rows above them.
-//! 5. **Land the rows.** The await, and the upload into the staging the decode
-//!    launch was planned against. It happens before the pass is issued rather
-//!    than at the block, because a pass is handed to the device as one stream:
-//!    the point where the launches could be split around the await is the point
-//!    where an island stops being capturable.
-//! 6. **Issue.** Every step, in order, islands replayed where the device has
-//!    them.
-//! 7. **Advance and commit.** After the pass, not before: a session that
+//! 5. **Issue, landing the rows on the way.** Every step, in order, islands
+//!    replayed where the device has them - and in front of the island that
+//!    first reads the n-gram rows, the reads and the upload into the staging
+//!    the decode launch was planned against. Not before the pass: everything
+//!    ahead of that island (the prologue and the whole first layer, about
+//!    0.73 ms of a GB10's time per decode step) reads no row, so the device
+//!    runs it while the host reads, where landing first left the device idle
+//!    for the reads - 0.5 ms a token when they miss the row cache. Not inside
+//!    an island either: the split falls between two islands, so both stay
+//!    capturable, and the upload is ordered on the one stream between them.
+//! 6. **Advance and commit.** After the pass, not before: a session that
 //!    recorded the tokens first and then failed to run them would believe it
 //!    held a prefix nothing computed.
 
@@ -50,7 +54,7 @@ use crate::sparse::kernels::{F32_BYTES, GDN_CHUNK};
 use crate::sparse::media::MediaRun;
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::passes::PassRole;
-use crate::sparse::ple::{PleGather, PleRows};
+use crate::sparse::ple::PleGather;
 use crate::sparse::scratch::Buf;
 use crate::sparse::stack::{MAX_DECODE_BATCH, MAX_PROMPT_RUNS, Pass, SparseStack};
 
@@ -248,7 +252,53 @@ impl SparseStack {
                 }
             }
         }
-        self.logits(rows)
+        // The picks are every row's only when one pass wrote every row: a
+        // device that ran the rows one pass at a time holds the last row's
+        // pick alone, so its block goes out without any.
+        let one_pass = rows == 1 || self.backend.as_pointers().is_some();
+        if let (Some(first), true) = (steps.first(), one_pass) {
+            self.launch_picks(first.session, rows)?;
+        }
+        let logits = self.logits(rows)?;
+        if rows > 0 && one_pass {
+            let picks = self
+                .scratch_view(Buf::Argmax)?
+                .slice(0, u64::from(rows).saturating_mul(4))?;
+            logits.with_picks(picks)
+        } else {
+            Ok(logits)
+        }
+    }
+
+    /// Launches the greedy pick of each of the front `rows` logits rows into
+    /// the pick buffer, behind the pass that wrote them and its suppression.
+    ///
+    /// Outside the pass's plan rather than at its end, because only a decode
+    /// step hands its picks out: a prompt's last row is sampled once per
+    /// request, and a verify plans its own. It costs the device one launch
+    /// over a megabyte; a greedy sequence then reads four bytes instead of
+    /// that megabyte and a host scan of it, about 0.1 ms of a token on a GB10
+    /// that the device spent idle.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the binder and the launch report.
+    fn launch_picks(&self, session: SessionId, rows: u32) -> CoreResult<()> {
+        use crate::sparse::bind::{Args, Operand};
+        use crate::sparse::kernels::{Entry, MOD_MISC, argmax_rows};
+        let mut plan = crate::sparse::plan::Plan::new();
+        plan.launch(
+            Entry::plain(MOD_MISC, "q4e_argmax_rows_kernel"),
+            argmax_rows(rows),
+            // `out, logits, n_vocab`
+            Args::of(&[
+                Operand::Scratch(Buf::Argmax),
+                Operand::Scratch(Buf::Logits),
+                Operand::U32(self.shape.vocab),
+            ]),
+        );
+        self.executor(session)?.run_steps(plan.steps())?;
+        Ok(())
     }
 
     /// One pass over one row per session, in this module's own order.
@@ -291,14 +341,12 @@ impl SparseStack {
             .zip(tokens.iter().copied())
             .collect::<Vec<_>>();
         let mut phase = Phases::start();
-        let gathered = self.issue_gathers(&mut pass, &rows)?;
-        phase.mark("issue");
+        let hashed = self.hash_gathers(&mut pass, &rows)?;
+        phase.mark("hash");
         self.write_batch_inputs(steps)?;
         self.pack_row_pointers(&sessions)?;
         phase.mark("inputs");
-        self.land_gathers(gathered)?;
-        phase.mark("land");
-        self.execute_rows(&sessions, &pass)?;
+        self.execute_landed(&sessions, &pass, None, None, &hashed)?;
         phase.mark("execute");
         phase.report(pass.plan.len());
         // Row `i` of the logits block is step `i`, which is what makes the
@@ -334,13 +382,12 @@ impl SparseStack {
             .map(|(_, tokens)| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
             .collect::<Vec<_>>();
         let mut pass = self.plan_segments(&sessions, &lens)?;
-        let gathered = self.issue_gathers(&mut pass, runs)?;
+        let hashed = self.hash_gathers(&mut pass, runs)?;
         self.write_segment_inputs(runs)?;
         // The recurrence and its convolution run every session's run in one
         // launch, through the per-row arrays: one pointer per run here.
         self.pack_row_pointers(&sessions)?;
-        self.land_gathers(gathered)?;
-        self.execute_rows(&sessions, &pass)?;
+        self.execute_landed(&sessions, &pass, None, None, &hashed)?;
         Ok(())
     }
 
@@ -393,18 +440,17 @@ impl SparseStack {
             .map(|(_, tokens)| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
             .collect::<Vec<_>>();
         let mut pass = self.plan_prompt_segments(&sessions, &lens)?;
-        let gathered = self.issue_gathers(&mut pass, runs)?;
+        let hashed = self.hash_gathers(&mut pass, runs)?;
         self.write_segment_inputs(runs)?;
         // No per-row pointer arrays: every launch here that reads a session's
         // state names it by run.
-        self.land_gathers(gathered)?;
         // The tap goes back on the failure path too, as in a solo chunk.
         match self.tap.take() {
             None => {
-                self.execute_rows(&sessions, &pass)?;
+                self.execute_landed(&sessions, &pass, None, None, &hashed)?;
             }
             Some(mut tap) => {
-                let ran = self.execute_rows_tapped(&sessions, &pass, None, Some(&mut tap));
+                let ran = self.execute_landed(&sessions, &pass, None, Some(&mut tap), &hashed);
                 self.tap = Some(tap);
                 ran?;
             }
@@ -541,18 +587,22 @@ impl SparseStack {
     /// A scoring session's tail past its shared boundary is never resumed and
     /// never drafted from, so the head's cache is warmed only over the part a
     /// later session can stand on.
+    ///
+    /// `snapshot` is the row of the target's pass a grid checkpoint is cut at,
+    /// whose draft head rows the warm-up copies out on its way past them.
     fn warm_draft_below_boundary(
         &mut self,
         session: SessionId,
         head: &[TokenId],
         start: u32,
+        snapshot: Option<u32>,
     ) -> CoreResult<()> {
         let warm_until = self.session(session)?.warm_until;
         let warm_end = usize::try_from(warm_until.saturating_sub(start))
             .unwrap_or(usize::MAX)
             .min(head.len());
         if warm_end > 0 {
-            self.warm_draft(session, &head[..warm_end], start)?;
+            self.warm_draft_tapped(session, &head[..warm_end], start, snapshot)?;
         }
         Ok(())
     }
@@ -643,6 +693,26 @@ impl SparseStack {
                 PassRole::Prompt { snapshot },
             )?;
             self.keep_rope_shift(session, run.as_ref(), head, start);
+            // Both draft rows a checkpoint can carry come out of the pass's
+            // residual, so both are copied out before the warm-up below
+            // overwrites it: the snapshot row's, and the chunk's last. Staged
+            // after the pass and before the commit: the commit is where a
+            // prompt's final chunk earns its checkpoint, and a speculating
+            // session's checkpoint carries this row - staged any later, the
+            // first chunk had none to carry and was never checkpointed, and a
+            // later chunk carried the chunk before it's.
+            if let Some(row) = snapshot {
+                self.stage_snapshot_row(session, row)?;
+            }
+            if self.has_draft_head() {
+                let last = u32::try_from(head.len().saturating_sub(1)).unwrap_or(0);
+                self.stage_draft_row(session, last)?;
+            }
+            // The warm-up before either commit: a checkpoint carries the draft
+            // head's raw key ring, and the head's rows for this chunk are the
+            // warm-up's to write. A grid checkpoint cut inside the chunk takes
+            // them from inside the warm-up, at its own row.
+            self.warm_draft_below_boundary(session, head, start, snapshot)?;
             // A prompt that ends between two grid points is checkpointed at the
             // last one instead of at its end: a longer prompt continues from
             // there exactly as a cold prefill of it would, where a checkpoint at
@@ -660,16 +730,6 @@ impl SparseStack {
                 }
                 None => boundary,
             };
-            // Staged after the pass and before the commit: the commit is where
-            // a prompt's final chunk earns its checkpoint, and a speculating
-            // session's checkpoint carries this row - staged any later, the
-            // first chunk had none to carry and was never checkpointed, and a
-            // later chunk carried the chunk before it's. And before the warm-up
-            // reads the residual, because the warm-up is what overwrites it.
-            if self.has_draft_head() {
-                let last = u32::try_from(head.len().saturating_sub(1)).unwrap_or(0);
-                self.stage_draft_row(session, last)?;
-            }
             self.advance_at(session, head, boundary, logit_rows.checked_sub(1))?;
             // The row staged before the advance is the residual of the chunk's
             // last position, so it drafts from the frontier the advance just
@@ -679,7 +739,6 @@ impl SparseStack {
             {
                 spec.staged_for = live.written;
             }
-            self.warm_draft_below_boundary(session, head, start)?;
             // The rows the next piece needs are known the moment this one is
             // enqueued, and this one is about to spend its time on the device,
             // so reading them now costs nothing and the fetch that asks for
@@ -936,36 +995,54 @@ impl SparseStack {
         // splice that the binder cannot name is refused by `execute_rows_media`
         // rather than issued.
         let block = media.as_ref().map(|run| run.prefill);
-        let mut pass = self.plan_chunk_media(
-            session,
-            tokens,
-            logit_rows,
-            block.map(|prefill| prefill.row_count()),
-            role,
-        )?;
+        // A text step's plan is the plan of the last text step with the same
+        // key; see `plancache`. Its gather is per position, so it is planned
+        // afresh either way.
+        let key = match (block, role) {
+            (None, PassRole::Step) => Some(self.step_plan_key(session, n_tok, logit_rows)?),
+            _ => None,
+        };
+        let mut pass = match key.and_then(|key| self.plans.take(key)) {
+            Some(mut kept) => {
+                kept.gather = self.step_gathers(session, n_tok)?;
+                kept
+            }
+            None => self.plan_chunk_media(
+                session,
+                tokens,
+                logit_rows,
+                block.map(|prefill| prefill.row_count()),
+                role,
+            )?,
+        };
         phase.mark("plan");
-        let gathered = self.issue_gathers(&mut pass, &[(session, tokens)])?;
-        phase.mark("issue");
+        let hashed = self.hash_gathers(&mut pass, &[(session, tokens)])?;
+        phase.mark("hash");
         match media {
             Some(run) => self.write_inputs_media(session, tokens, run)?,
             None => self.write_inputs(session, tokens)?,
         }
         phase.mark("inputs");
-        self.land_gathers(gathered)?;
-        phase.mark("land");
         // The tap is taken out for the pass and put back after it, on the
         // failure path too, so an armed tap outlives a pass that failed and
         // the caller still disarms it. Unarmed, this is the plain call.
         match self.tap.take() {
             None => {
-                self.execute_rows_media(&[session], &pass, block.map(|prefill| prefill.rows()))?;
+                self.execute_landed(
+                    &[session],
+                    &pass,
+                    block.map(|prefill| prefill.rows()),
+                    None,
+                    &hashed,
+                )?;
             }
             Some(mut tap) => {
-                let ran = self.execute_rows_tapped(
+                let ran = self.execute_landed(
                     &[session],
                     &pass,
                     block.map(|prefill| prefill.rows()),
                     Some(&mut tap),
+                    &hashed,
                 );
                 self.tap = Some(tap);
                 ran?;
@@ -973,10 +1050,18 @@ impl SparseStack {
         }
         phase.mark("execute");
         phase.report(pass.plan.len());
+        if let Some(key) = key {
+            self.plans.put(key, pass);
+        }
         Ok(())
     }
 
-    /// Starts this pass's n-gram reads on threads of their own, one per row.
+    /// Hashes this pass's n-gram row identifiers, one list per row.
+    ///
+    /// Only the arithmetic happens here; the reads are
+    /// [`SparseStack::land_gathers`], which the pass calls at the island that
+    /// first reads the rows (see [`Pass::ngram_island`]), so the device runs
+    /// the launches in front of that island while the host reads.
     ///
     /// The gathers are taken out of the pass rather than borrowed, so a pass
     /// that reaches [`SparseStack::execute`] still holding one is a pass whose
@@ -988,11 +1073,11 @@ impl SparseStack {
     /// `(row, hash head)`, so a gather landed out of order is one sequence's
     /// n-gram rows decoded as another's. An empty result means this geometry
     /// folds in no n-gram block.
-    fn issue_gathers(
+    fn hash_gathers(
         &mut self,
         pass: &mut Pass,
         rows: &[(SessionId, &[TokenId])],
-    ) -> CoreResult<Vec<PleRows>> {
+    ) -> CoreResult<Vec<Vec<u64>>> {
         let gathers = std::mem::take(&mut pass.gather);
         if gathers.is_empty() {
             return Ok(Vec::new());
@@ -1017,7 +1102,7 @@ impl SparseStack {
                 what: "an n-gram gather on a stack that holds no streamed table",
                 backend: "engine",
             })?;
-        let mut issued = Vec::with_capacity(gathers.len());
+        let mut hashed = Vec::with_capacity(gathers.len());
         for (gather, (session, tokens)) in gathers.into_iter().zip(rows.iter()) {
             let live = sessions
                 .get(session)
@@ -1032,29 +1117,28 @@ impl SparseStack {
             staging.path.clear();
             staging.path.extend_from_slice(live.history());
             staging.path.extend_from_slice(tokens);
-            issued.push(gather.fetch(tier.table().stream(), &staging.path)?);
+            hashed.push(gather.row_ids(tier.table().stream(), &staging.path)?);
         }
-        Ok(issued)
+        Ok(hashed)
     }
 
-    /// Awaits every row's rows and uploads them into the staging the pass was
+    /// Reads every row's rows and uploads them into the staging the pass was
     /// planned against, in row order.
     ///
-    /// One transfer rather than one per row: the staging is a single slab the
-    /// decode launch reads from its front, and the rows of row `i` sit exactly
-    /// where `i` rows of the same width put them.
-    fn land_gathers(&self, gathered: Vec<PleRows>) -> CoreResult<()> {
-        if gathered.is_empty() {
+    /// The reads block, on this thread: a hand-off to a reader thread costs two
+    /// wake-ups, which on a GB10 run to hundreds of microseconds, and the
+    /// device has the launches in front of the reading island to get on with
+    /// meanwhile. One transfer rather than one per row: the staging is a single
+    /// slab the decode launch reads from its front, and the rows of row `i`
+    /// sit exactly where `i` rows of the same width put them.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the reader reports, and [`CoreError::Unsupported`] on a stack
+    /// that holds no streamed table.
+    fn land_gathers(&self, hashed: &[Vec<u64>]) -> CoreResult<()> {
+        if hashed.is_empty() {
             return Ok(());
-        }
-        let mut bytes = Vec::new();
-        for rows in gathered {
-            let landed = rows.await_rows()?;
-            if bytes.is_empty() {
-                bytes = landed;
-            } else {
-                bytes.extend_from_slice(&landed);
-            }
         }
         let tier = self
             .resident()?
@@ -1064,7 +1148,57 @@ impl SparseStack {
                 what: "an n-gram upload on a stack that holds no streamed table",
                 backend: "engine",
             })?;
-        tier.upload(self.backend.as_ref(), &bytes)
+        let stream = tier.table().stream();
+        let started = Phases::on().then(std::time::Instant::now);
+        let mut bytes = Vec::new();
+        for ids in hashed {
+            let landed = crate::ple_rows::fetch_rows(stream, ids).await_rows()?;
+            if bytes.is_empty() {
+                bytes = landed;
+            } else {
+                bytes.extend_from_slice(&landed);
+            }
+        }
+        let read = started.map(|at| at.elapsed());
+        tier.upload(self.backend.as_ref(), &bytes)?;
+        // The upload drains the stream, so its time is the part of the
+        // launches ahead of the island the reads did not cover: the device
+        // still busy when the rows were ready. A read longer than those
+        // launches shows as an upload of a few microseconds.
+        if let (Some(started), Some(read)) = (started, read) {
+            tracing::info!(
+                rows = hashed.iter().map(Vec::len).sum::<usize>(),
+                read_us = read.as_micros(),
+                upload_us = started.elapsed().saturating_sub(read).as_micros(),
+                "n-gram rows landed behind the launches ahead of their island"
+            );
+        }
+        Ok(())
+    }
+
+    /// Issues a pass whose n-gram rows were hashed by
+    /// [`SparseStack::hash_gathers`], reading and landing them at the island
+    /// that first reads them.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::execute_rows_tapped`], plus whatever
+    /// [`SparseStack::land_gathers`] reports.
+    fn execute_landed<'a>(
+        &'a self,
+        sessions: &[SessionId],
+        pass: &Pass,
+        media: Option<shiso_core::DeviceView<'a>>,
+        tap: Option<&mut crate::sparse::tap::ResidualTap>,
+        hashed: &[Vec<u64>],
+    ) -> CoreResult<crate::sparse::exec::PassReport> {
+        let mut land = || self.land_gathers(hashed);
+        let land: Option<&mut dyn FnMut() -> CoreResult<()>> = if hashed.is_empty() {
+            None
+        } else {
+            Some(&mut land)
+        };
+        self.execute_rows_tapped(sessions, pass, media, tap, land)
     }
 
     /// Warms the table for the chunk after the one just enqueued.

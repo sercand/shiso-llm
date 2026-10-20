@@ -14,14 +14,23 @@
 //! does.
 
 pub mod affine;
+pub mod bf16;
+pub mod ffn;
 pub mod fp8;
 pub mod gdn;
+pub mod gdn_fused;
 pub mod hc;
+pub mod hc_mix;
 pub mod idx;
+pub mod idxring;
 pub mod indexer;
+pub mod kv8;
+pub mod lowp;
 pub mod matvec;
 pub mod misc;
+pub mod mxfp8;
 pub mod nvfp4;
 pub mod ple;
+pub mod ple_nvfp4;
 pub mod qsa;
 pub mod route;

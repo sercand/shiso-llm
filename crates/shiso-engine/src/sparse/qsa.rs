@@ -23,11 +23,12 @@
 //! one, because this kernel set ships no batched selected-block attention.
 
 use shiso_core::error::CoreResult;
+use shiso_core::page::KvElem;
 
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
 use crate::sparse::indexer::{self, Scorer};
 use crate::sparse::inputs::MROPE_PREFIX_BYTES;
-use crate::sparse::kernels::{self, Entry, MOD_EXACT, MOD_QSA, MOD_QSA_SPARSE};
+use crate::sparse::kernels::{self, CacheKernel, Entry, MOD_QSA, MOD_QSA_SPARSE};
 use crate::sparse::matmul::{self, Bound, Device, PassRole};
 use crate::sparse::moe::{RowOrigin, Segments};
 use crate::sparse::paged::Plane;
@@ -61,6 +62,13 @@ pub struct AttnSlot {
     /// The selection's score buffer is strided by it: see
     /// [`crate::sparse::shape::IndexerShape::score_blocks`].
     pub ctx: u32,
+    /// The element the slot's key and value planes are stored as, which picks
+    /// the store's entry and every attention reader's.
+    ///
+    /// Per slot rather than per pass because it is a fact about the planes the
+    /// slot names, exactly as `pool_slots` is; in practice every slot of a
+    /// stack, the draft head's included, carries the same answer.
+    pub kv: KvElem,
 }
 
 /// Which attention kernel a call takes.
@@ -183,6 +191,10 @@ pub struct AttnContext {
     /// rows at the end of a prompt are summed as they would have been in the
     /// middle of one. See [`crate::sparse::matmul::Device::role`].
     pub role: PassRole,
+    /// The copy of this rank's raw indexer key ring a checkpoint cut inside
+    /// this pass needs, if any. See [`indexer::RingTap`]; `None`, the
+    /// default, for every pass but the one the draft head warms a chunk with.
+    pub ring_tap: Option<indexer::RingTap>,
 }
 
 /// Query heads that share one key head.
@@ -325,7 +337,7 @@ fn attend_at(
         //  pages_arr, n_tok` - the scalar list with the page table replaced by
         // the per-row array, which is the whole of the difference.
         AttnPath::Batched => plan.launch(
-            Entry::plain(MOD_QSA, "q4e_qsa_attention_batch_kernel"),
+            CacheKernel::AttentionBatch.entry(slot.kv),
             kernels::qsa_attention_batch(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
             Args::of(&[
                 out,
@@ -341,12 +353,12 @@ fn attend_at(
             ]),
         ),
         AttnPath::Dense => plan.launch(
-            Entry::plain(MOD_QSA, "q4e_qsa_attention_kernel"),
+            CacheKernel::Attention.entry(slot.kv),
             kernels::qsa_attention(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
             dense,
         ),
         AttnPath::Tiled => plan.launch(
-            Entry::plain(MOD_QSA, "q4e_qsa_attention_tiled_kernel"),
+            CacheKernel::Tiled.entry(slot.kv),
             kernels::qsa_attention_tiled(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
             dense,
         ),
@@ -358,13 +370,13 @@ fn attend_at(
         // (1.6e-4 against 6e-7 on the kernel case's short rows). It is the
         // ported kernel's arguments and grid, so it is a drop-in.
         AttnPath::TensorCore => plan.launch(
-            Entry::plain(MOD_EXACT, "q4e_qsa_attention_tc_exact_kernel"),
+            CacheKernel::TensorCore.entry(slot.kv),
             kernels::qsa_attention_tc_exact(shape.gqa.kv_heads, n_tok, 1),
             tc_args(shape, slot, 1, false, at),
         ),
         AttnPath::Split => {
             plan.launch(
-                Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_split_kernel"),
+                CacheKernel::Split.entry(slot.kv),
                 kernels::qsa_attention_split(shape.gqa.kv_heads, n_tok),
                 // `out, part, k_cache, v_cache, q, n_head, n_head_kv, pos,
                 //  pages, n_tok, n_splits`
@@ -386,7 +398,7 @@ fn attend_at(
         }
         AttnPath::Gathered => {
             plan.launch(
-                Entry::plain(MOD_QSA_SPARSE, "q4e_qsa_attention_gather_kernel"),
+                CacheKernel::Gather.entry(slot.kv),
                 kernels::qsa_attention_gather(shape.gqa.kv_heads, n_tok),
                 // `part, k_cache, v_cache, q, tokens, n_sel, pages, width,
                 //  n_head, n_head_kv, n_splits` - it writes only the slabs, so
@@ -417,7 +429,7 @@ fn attend_at(
                 },
             );
             plan.launch(
-                Entry::plain(MOD_EXACT, "q4e_qsa_attention_tc_exact_kernel"),
+                CacheKernel::TensorCore.entry(slot.kv),
                 kernels::qsa_attention_tc_exact(shape.gqa.kv_heads, n_tok, splits),
                 tc_args(shape, slot, splits, true, at),
             );
@@ -456,7 +468,7 @@ fn segmented(
         let first = u64::from(runs.start(run));
         let rows = runs.len(run);
         plan.launch(
-            Entry::plain(MOD_QSA, "q4e_qsa_store_kv_kernel"),
+            CacheKernel::Store.entry(slot.kv),
             kernels::qsa_store_kv(shape.gqa.kv_heads, rows, shape.gqa.head_dim),
             // `k_cache, v_cache, k, v, kw, head_dim, n_head_kv, n_rot,
             //  rope_base, pos, mrope, sec_t, sec_h, sec_w, pages, pool_slots,
@@ -491,7 +503,7 @@ fn segmented(
             ]),
         );
     }
-    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx);
+    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx).with_tap(ctx.ring_tap);
     plan.append(indexer::store(
         shape,
         &desc.indexer,
@@ -737,17 +749,41 @@ pub fn block(
 ) -> CoreResult<Plan> {
     let at = |role: Role| WeightRef::layer(slot.layer, role);
     let mut plan = Plan::new();
-    matmul::project(
-        &mut plan,
+    let mixed = Operand::Scratch(Buf::Mixed);
+    let query = (
         desc.q,
         Bound::new(
             at(Role::AttnQuery),
-            Operand::Scratch(Buf::Mixed),
+            mixed,
             Operand::Scratch(Buf::AttnQueryFull),
         ),
-        n_tok,
-        device,
-    )?;
+    );
+    let key = (
+        desc.k,
+        Bound::new(at(Role::AttnKey), mixed, Operand::Scratch(Buf::AttnKey)),
+    );
+    let value = (
+        desc.v,
+        Bound::new(at(Role::AttnValue), mixed, Operand::Scratch(Buf::AttnValue)),
+    );
+    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx).with_tap(ctx.ring_tap);
+    // On a step or verify pass of MXFP8 weights the block input's projections
+    // - query, key, value and, outside a segmented pass (whose store runs
+    // per run), the indexer key - are one group launch: the same sums, the
+    // input read once. Elsewhere each keeps its place in the chain.
+    let grouped = matmul::groups(&[desc.q, desc.k, desc.v], device);
+    let index_grouped = grouped
+        && !matches!(ctx.origin, RowOrigin::Segmented(_))
+        && matmul::groups(&[desc.q, desc.indexer.k], device);
+    if grouped {
+        let mut members = vec![query, key, value];
+        if index_grouped {
+            members.push(indexer::key_projection(&desc.indexer, indexed));
+        }
+        matmul::project_group(&mut plan, &members, n_tok, device)?;
+    } else {
+        matmul::project(&mut plan, query.0, query.1, n_tok, device)?;
+    }
     plan.launch(
         Entry::plain(MOD_QSA, "q4e_qsa_q_norm_rope_kernel"),
         kernels::qsa_q_norm_rope(shape.gqa.q_heads, n_tok, shape.gqa.head_dim),
@@ -770,49 +806,31 @@ pub fn block(
             Operand::f32(shape.rms_eps),
         ]),
     );
-    matmul::project(
-        &mut plan,
-        desc.k,
-        Bound::new(
-            at(Role::AttnKey),
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::AttnKey),
-        ),
-        n_tok,
-        device,
-    )?;
-    matmul::project(
-        &mut plan,
-        desc.v,
-        Bound::new(
-            at(Role::AttnValue),
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::AttnValue),
-        ),
-        n_tok,
-        device,
-    )?;
+    if !grouped {
+        matmul::project(&mut plan, key.0, key.1, n_tok, device)?;
+        matmul::project(&mut plan, value.0, value.1, n_tok, device)?;
+    }
     // The batched store is the scalar one with `pages` replaced by the per-row
     // array; every other parameter, and the grid, is the same.
     let batched = ctx.origin == RowOrigin::Unrelated;
     if let RowOrigin::Segmented(runs) = ctx.origin {
         return segmented(shape, desc, slot, &ctx, &runs, device, plan);
     }
-    let (store_entry, store_launch, store_pages) = if batched {
+    let (store_kernel, store_launch, store_pages) = if batched {
         (
-            "q4e_qsa_store_kv_batch_kernel",
+            CacheKernel::StoreBatch,
             kernels::qsa_store_kv_batch(shape.gqa.kv_heads, n_tok, shape.gqa.head_dim),
             Operand::PageTables,
         )
     } else {
         (
-            "q4e_qsa_store_kv_kernel",
+            CacheKernel::Store,
             kernels::qsa_store_kv(shape.gqa.kv_heads, n_tok, shape.gqa.head_dim),
             Operand::Pages,
         )
     };
     plan.launch(
-        Entry::plain(MOD_QSA, store_entry),
+        store_kernel.entry(slot.kv),
         store_launch,
         // `k_cache, v_cache, k, v, kw, head_dim, n_head_kv, n_rot, rope_base,
         //  pos, mrope, sec_t, sec_h, sec_w, pages, pool_slots, eps`
@@ -842,15 +860,11 @@ pub fn block(
             Operand::f32(shape.rms_eps),
         ]),
     );
-    let indexed = indexer::IndexerSlot::new(slot.layer, slot.rank, slot.ctx);
-    plan.append(indexer::store(
-        shape,
-        &desc.indexer,
-        indexed,
-        ctx.origin,
-        n_tok,
-        device,
-    )?);
+    plan.append(if index_grouped {
+        indexer::store_projected(shape, indexed, ctx.origin, n_tok)
+    } else {
+        indexer::store(shape, &desc.indexer, indexed, ctx.origin, n_tok, device)?
+    });
     let scorer = Scorer::choose(shape.indexer.heads, ctx.tensor_core);
     if batched {
         // Each row of a batch is attended exactly as a single-row step of its

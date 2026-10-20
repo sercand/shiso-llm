@@ -44,13 +44,12 @@ use crate::sessions::clear_range;
 use crate::shape::LayerKind;
 use crate::sparse::ckpt::Boundary;
 use crate::sparse::island::{GraphPolicy, IslandKey};
-use crate::sparse::kernels::IDX_QUERY_BLOCK;
-use crate::sparse::kernels::{self, F32_BYTES};
+use crate::sparse::kernels::{self, F16_BYTES, F32_BYTES, IDX_DIM, IDX_QUERY_BLOCK, IDX_RING};
 use crate::sparse::matmul::Device;
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::mtp::{Rollback, SpecDepth};
 use crate::sparse::paged::{
-    PagePlanes, PagedKv, SessionPages, conv_state_bytes, ple_window_bytes, state_bytes,
+    PagePlanes, PagedKv, SessionPages, conv_state_bytes, ple_window_bytes, ring_bytes, state_bytes,
     state_rollback_bytes,
 };
 use crate::sparse::plan::Plan;
@@ -135,6 +134,15 @@ pub struct SparseOptions {
     /// Which kernel its prompt passes' brain-float projections take; see
     /// [`crate::sparse::matmul::Device::prompt_matmul`].
     pub prompt_matmul: crate::sparse::matmul::PromptMatmul,
+    /// The precision prompt passes' activations enter the block-scaled
+    /// weights' products at; see
+    /// [`crate::sparse::matmul::PrefillActivations`]. The caller checks the
+    /// kernel set has the low-precision kernels before asking for them
+    /// ([`crate::sparse::capture::check_prefill_activations`]).
+    pub prefill_activations: crate::sparse::matmul::PrefillActivations,
+    /// Which one-launch routed selection a decode-sized pass takes; see
+    /// [`crate::sparse::matmul::Device::route_sort`].
+    pub route_sort: crate::sparse::matmul::RouteSort,
     /// The entry names this build captured for the template kernels.
     ///
     /// Empty on a host that never compiled the kernels, which makes every
@@ -198,6 +206,8 @@ impl SparseOptions {
             tiled_attention: true,
             tensor_core: true,
             prompt_matmul: crate::sparse::matmul::PromptMatmul::Rows,
+            prefill_activations: crate::sparse::matmul::PrefillActivations::A16,
+            route_sort: crate::sparse::matmul::RouteSort::Small,
             entries: kernels::EntryTable::new(&[]),
             ngram_cache_bytes: NGRAM_CACHE_BYTES,
             ngram_reader: shiso_ple::PleConfig::DEFAULT,
@@ -311,6 +321,11 @@ pub struct SparseSession {
     pub(crate) states: Vec<RecurrentState>,
     /// The n-gram block's dilated window, when the stack has one.
     pub(crate) ngram_window: Option<DeviceBuffer>,
+    /// The raw indexer keys the pooled pass still has to read: one ring of
+    /// [`IDX_RING`] f16 rows per attention rank, in rank order, each position at
+    /// slot `position % IDX_RING`. See [`crate::sparse::paged::ring_bytes`] for
+    /// why these are the session's and not the page's.
+    pub(crate) ring: DeviceBuffer,
     /// What this session holds because it may speculate, or `None` on a session
     /// opened for plain decode.
     pub(crate) spec: Option<SpecState>,
@@ -450,6 +465,27 @@ impl SparseSession {
         (self.pages.frontier_mut(), path)
     }
 
+    /// One attention rank's raw indexer key ring.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::OutOfBounds`] for a rank past the last one the ring was
+    /// sized for.
+    pub fn indexer_ring(&self, rank: u32) -> CoreResult<DeviceView<'_>> {
+        let width = u64::from(IDX_RING)
+            .saturating_mul(u64::from(IDX_DIM))
+            .saturating_mul(F16_BYTES);
+        self.ring
+            .slice(u64::from(rank).saturating_mul(width), width)
+    }
+
+    /// The whole raw indexer key ring, every rank's in rank order: the section
+    /// a checkpoint blob carries.
+    #[must_use]
+    pub fn indexer_rings(&self) -> DeviceView<'_> {
+        self.ring.view()
+    }
+
     /// The n-gram block's window, when this stack has one.
     #[must_use]
     pub fn ngram_window(&self) -> Option<DeviceView<'_>> {
@@ -578,6 +614,14 @@ pub struct Pass {
     /// otherwise - a decode batch's rows belong to different sequences, so each
     /// hashes its own trailing grams.
     pub gather: Vec<PleGather>,
+    /// The island whose steps are the first to read the gathered rows, or
+    /// `None` when a step outside every island reads them first (or nothing
+    /// reads them at all).
+    ///
+    /// The rows are read and uploaded in front of it, while the device runs
+    /// everything issued before it (see [`crate::sparse::run`]); `None` lands
+    /// them before the first step.
+    pub ngram_island: Option<usize>,
 }
 
 /// Everything that lives on the device, in construction order.
@@ -660,6 +704,8 @@ pub struct SparseStack {
     /// since the graphs were last dropped, and the context slot it is filed
     /// under. See [`crate::sparse::island::IslandContext::Batched`].
     pub(crate) batch_slots: std::sync::Mutex<HashMap<u64, u32>>,
+    /// Step passes kept for reuse; see [`crate::sparse::plancache`].
+    pub(crate) plans: crate::sparse::plancache::PlanCache,
 }
 
 impl std::fmt::Debug for SparseStack {
@@ -686,6 +732,7 @@ impl std::fmt::Debug for SparseStack {
                 &self.batch_slots.lock().map_or(0, |slots| slots.len()),
             )
             .field("staging", &self.staging)
+            .field("kept_plans", &self.plans.len())
             .field("clock", &self.clock)
             .field("layers", &self.desc.layers.len())
             .finish()
@@ -695,7 +742,13 @@ impl std::fmt::Debug for SparseStack {
 /// The line a resident stack announces itself with: its geometry, and what
 /// its cache costs per token, per session and per checkpoint - the figures a
 /// capacity question starts from.
-fn log_resident(shape: &SparseShape, opts: &SparseOptions, kv: &PagedKv, ckpt_bytes: u64) {
+fn log_resident(
+    shape: &SparseShape,
+    opts: &SparseOptions,
+    kv: &PagedKv,
+    planes: PagePlanes,
+    ckpt_bytes: u64,
+) {
     tracing::info!(
         layers = shape.n_layers(),
         recurrent = shape.count(LayerKind::Gdn),
@@ -706,7 +759,8 @@ fn log_resident(shape: &SparseShape, opts: &SparseOptions, kv: &PagedKv, ckpt_by
         pool_tokens = u64::from(opts.engine.kv_pool_pages) * u64::from(PAGE_TOKENS),
         page_bytes = kv.page_bytes(),
         kv_bytes_per_token = kv.page_bytes() / u64::from(PAGE_TOKENS),
-        session_bytes = session_bytes(shape, opts.spec),
+        kv_elem = %opts.engine.kv_elem,
+        session_bytes = session_bytes(shape, opts.spec, planes),
         ckpt_bytes,
         ckpt_slots = opts.engine.kv_ckpt_slots,
         "sparse stack resident"
@@ -768,14 +822,16 @@ fn check_prefill_rows(rows: u32) -> CoreResult<()> {
 /// Device bytes one session allocates when it opens.
 ///
 /// Every recurrent slot's window and state, one rollback record of each per
-/// drafted row, the n-gram window and its records, and the staged draft row -
-/// what [`SparseStack::open_session`] allocates, counted the same way.
-fn session_bytes(shape: &SparseShape, spec: SpecDepth) -> u64 {
+/// drafted row, the n-gram window and its records, the raw indexer key ring,
+/// and the staged draft row - what [`SparseStack::open_session`] allocates,
+/// counted the same way.
+fn session_bytes(shape: &SparseShape, spec: SpecDepth, planes: PagePlanes) -> u64 {
     let records = u64::from(spec.rollback_slots());
     let slots = u64::from(shape.count(LayerKind::Gdn));
     let live = slots
         .saturating_mul(conv_state_bytes(shape).saturating_add(state_bytes(shape)))
-        .saturating_add(ple_window_bytes(shape));
+        .saturating_add(ple_window_bytes(shape))
+        .saturating_add(ring_bytes(shape, planes));
     if !spec.is_speculative() {
         return live;
     }
@@ -820,6 +876,7 @@ impl SparseStack {
         shape.validate()?;
         check_layers(&shape, &weights)?;
         check_prefill_rows(opts.prefill_rows)?;
+        crate::sparse::capture::check_kv_elem(backend.as_ref(), opts.engine.kv_elem)?;
         // Everything resident so far is weights: the ledger's second mark.
         if let Some(ledger) = backend.ledger() {
             ledger.mark("after_weights", backend.memory_info());
@@ -830,6 +887,7 @@ impl SparseStack {
         let planes = PagePlanes {
             indexer: true,
             draft: weights.draft.is_some(),
+            kv: opts.engine.kv_elem,
         };
         let scratch = Scratch::new(
             backend,
@@ -850,7 +908,7 @@ impl SparseStack {
             backend.as_ref(),
             crate::options::PoolCost {
                 page_bytes: geometry.page_bytes,
-                session_bytes: session_bytes(&shape, opts.spec),
+                session_bytes: session_bytes(&shape, opts.spec, planes),
                 fixed_bytes: u64::from(opts.engine.kv_ckpt_slots)
                     .saturating_mul(geometry.ckpt_bytes),
             },
@@ -873,9 +931,12 @@ impl SparseStack {
             half_block_input: false,
             role: crate::sparse::matmul::PassRole::Step,
             prompt_matmul: opts.prompt_matmul,
+            prefill_activations: opts.prefill_activations,
+            route_sort: opts.route_sort,
+            normed: crate::sparse::matmul::NormedStreams::Stored,
         };
         let desc = weights.desc(ngram.as_ref().map(|tier| tier.table().row()));
-        log_resident(&shape, &opts, &kv, geometry.ckpt_bytes);
+        log_resident(&shape, &opts, &kv, planes, geometry.ckpt_bytes);
         Ok(Self {
             backend: Arc::clone(backend),
             shape,
@@ -900,6 +961,7 @@ impl SparseStack {
             ckpt: None,
             tap: None,
             batch_slots: std::sync::Mutex::new(HashMap::new()),
+            plans: crate::sparse::plancache::PlanCache::default(),
         })
     }
 
@@ -1183,12 +1245,23 @@ impl SparseStack {
             })
             .transpose()?;
         let spec = self.fresh_spec_state(records, window_bytes)?;
+        // Zeroed for the reason the recurrent slots are: a fresh allocation is
+        // the last tenant's bytes, and the first pass of a session that starts
+        // inside a block - which no cold session does, but a restore that
+        // carried no ring would - reads it before writing it.
+        let ring = alloc_tagged(
+            &self.backend,
+            MemTag::SessionOther,
+            ring_bytes(&self.shape, self.page_planes()).max(1),
+        )?;
+        clear_range(&self.backend, &ring)?;
         let pages = SessionPages::open(&self.backend, frontier, capacity)?;
         let session = SparseSession {
             id,
             pages,
             states,
             ngram_window,
+            ring,
             spec,
             written: 0,
             history: Vec::new(),
@@ -1219,6 +1292,7 @@ impl SparseStack {
             .remove(&session)
             .ok_or(CoreError::UnknownSession(session))?;
         self.order.retain(|id| *id != session);
+        self.plans.forget(session);
         // Dropping the session releases its recurrent stack and drops its
         // frontier, which is what returns the page references to the pool.
         drop(live);
@@ -1651,7 +1725,7 @@ impl SparseStack {
         pass: &Pass,
         media: Option<DeviceView<'a>>,
     ) -> CoreResult<crate::sparse::exec::PassReport> {
-        self.execute_rows_tapped(sessions, pass, media, None)
+        self.execute_rows_tapped(sessions, pass, media, None, None)
     }
 
     /// The same pass, copying residual rows into `tap` when one is given.
@@ -1659,13 +1733,15 @@ impl SparseStack {
     /// # Errors
     ///
     /// As [`SparseStack::execute_rows_media`], plus whatever
-    /// [`crate::sparse::exec::Exec::run_pass_tapped`] reports for the copy.
+    /// [`crate::sparse::exec::Exec::run_pass_landed`] reports for the copy
+    /// and for `land`, which it calls where [`Pass::ngram_island`] says.
     pub(crate) fn execute_rows_tapped<'a>(
         &'a self,
         sessions: &[SessionId],
         pass: &Pass,
         media: Option<DeviceView<'a>>,
         tap: Option<&mut crate::sparse::tap::ResidualTap>,
+        land: Option<&mut dyn FnMut() -> CoreResult<()>>,
     ) -> CoreResult<crate::sparse::exec::PassReport> {
         if pass.media_rows.is_some() != media.is_some() {
             return Err(CoreError::Unsupported {
@@ -1718,7 +1794,7 @@ impl SparseStack {
             None => binder,
         };
         crate::sparse::exec::Exec::new(self.backend.as_ref(), self.opts.entries, binder)
-            .run_pass_tapped(pass, self.backend.as_graph(), tap)
+            .run_pass_landed(pass, self.backend.as_graph(), tap, land)
     }
 
     /// The executor one session's launches are issued through.
@@ -1767,6 +1843,7 @@ impl SparseStack {
             }
         }
         self.sessions.clear();
+        self.plans.clear();
         if let Some(resident) = self.resident.take() {
             let Resident {
                 weights,

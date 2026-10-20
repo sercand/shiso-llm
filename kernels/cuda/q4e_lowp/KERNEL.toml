@@ -1,0 +1,43 @@
+# The low-precision prompt kernels of the qwen4exp family's NVIDIA export:
+# the routed NVFP4 expert stages with NVFP4 activations (W4A4) and the dense
+# MXFP8 projections with MXFP8 activations (W8A8), each on the block-scaled
+# tensor-core instruction of its format.
+#
+# Written for this repository; nothing here is a byte copy, so no unit
+# carries a provenance header and no VENDOR.md applies.
+#
+# A directory of its own, rather than two more units in `cuda/q4e`, for the
+# one reason that cannot be expressed there: the architecture. Those
+# instructions (`mma.sync ... kind::mxf4nvf4.block_scale`, `kind::mxf8f6f4`)
+# exist only on the family-specific targets; plain `sm_120`/`sm_121` and every
+# portable `compute_*` target reject them. `cuda/q4e` is pinned at
+# `compute_80` so it loads on any tensor-core device, and these kernels are
+# the opposite: a module that only a GB10-class device can load at all.
+#
+# So the host treats this module as optional. An image whose target is
+# family-specific and that the driver refuses is skipped with a warning
+# instead of failing the device open (`shiso-cuda`'s module registry), its
+# entries then resolve to nothing, the planner never selects them, and
+# `--prefill-activations lowp` is refused at startup on that device. The
+# weight-only kernels in `cuda/q4e` remain the portable prompt path.
+#
+# `SHISO_CUDA_HAVE_MXF4` is defined for every job this directory compiles at
+# a family-specific architecture; under a `SHISO_CUDA_ARCH` override that
+# names a portable one, the units compile to no entries at all rather than to
+# stubs that would resolve and compute nothing.
+
+[build]
+sources = ["nvfp4_a4.cu", "mxfp8_a8.cu"]
+
+includes = ["cuda/q4e_lowp"]
+
+# No `--use_fast_math`: the quantizers are held bit for bit to a host
+# restatement, and an approximate division or a flushed subnormal moves a code
+# off its tie.
+base_flags = ["-O3", "-g", "-lineinfo"]
+
+arch = ["sm_121a"]
+
+[modules]
+nvfp4_a4 = "q4e_nvfp4_a4"
+mxfp8_a8 = "q4e_mxfp8_a8"

@@ -43,6 +43,7 @@
 use shiso_core::Extent3;
 use shiso_core::backend::KernelRef;
 use shiso_core::error::{CoreError, CoreResult};
+use shiso_core::page::KvElem;
 
 // ---------------------------------------------------------------------------
 // modules
@@ -56,6 +57,12 @@ pub const MOD_MOE: &str = "q4e_moe";
 pub const MOD_GDN: &str = "q4e_gdn";
 /// The gated recurrence of a prefill chunk, on tensor cores.
 pub const MOD_GDN_TC: &str = "q4e_gdn_tc";
+/// The same prefill chunk's whole recurrent block between its projections in
+/// two launches: the convolution, norms, gates and run-independent half in one,
+/// the carry and the output gate in the other, bit for bit what the
+/// [`MOD_GDN_TC`] chain computes. Not an upstream unit, for the reason
+/// [`MOD_MODELOPT`] is not.
+pub const MOD_GDN_FUSED: &str = "q4e_gdn_fused";
 /// The n-gram embedding block.
 pub const MOD_PLE: &str = "q4e_ple";
 /// Dense projections at every stored element type.
@@ -77,6 +84,55 @@ pub const MOD_MODELOPT: &str = "q4e_modelopt";
 /// with exact softmax weights, and the fused decode row of a recurrent layer.
 /// Not an upstream unit, for the reason [`MOD_MODELOPT`] is not.
 pub const MOD_EXACT: &str = "q4e_exact";
+/// The key/value store and every attention reader of the K and V planes, over
+/// a cache of FP8 E4M3 bytes. Not an upstream unit, for the reason
+/// [`MOD_MODELOPT`] is not; see [`CacheKernel`].
+pub const MOD_KV8: &str = "q4e_kv8";
+
+/// Dense projections over an MXFP8 weight, read as stored: the decode and
+/// verify kernels, which sum a row as the brain-float tier sums the widened
+/// weight, and the tensor-core prompt kernel. Not an upstream unit, for the
+/// reason [`MOD_MODELOPT`] is not.
+pub const MOD_MXFP8: &str = "q4e_mxfp8";
+/// The indexer's pooled key pass over a per-session ring of raw keys, which is
+/// what lets a page carry no raw key row per position. Not an upstream unit,
+/// for the reason [`MOD_MODELOPT`] is not.
+pub const MOD_IDXRING: &str = "q4e_idxring";
+
+/// The routed NVFP4 expert stages of a prompt pass with NVFP4 activations
+/// (W4A4) on the block-scaled FP4 instruction, and their quantizer and
+/// brain-float combine. Present only in a kernel set built for a
+/// family-specific architecture (`kernels/cuda/q4e_lowp`); see
+/// [`crate::sparse::matmul::PrefillActivations`].
+pub const MOD_NVFP4_A4: &str = "q4e_nvfp4_a4";
+/// The dense MXFP8 projections of a prompt pass with MXFP8 activations
+/// (W8A8) on the block-scaled FP8 instruction, and their quantizer. Present
+/// where [`MOD_NVFP4_A4`] is.
+pub const MOD_MXFP8_A8: &str = "q4e_mxfp8_a8";
+/// The entries `--prefill-activations lowp` launches, as (module, entry):
+/// every one has to resolve before the option is accepted.
+pub const LOWP_ENTRIES: [(&str, &str); 7] = [
+    (MOD_NVFP4_A4, "q4e_nvfp4_a4_quant_kernel"),
+    (MOD_NVFP4_A4, "q4e_nvfp4_a4_quant_bf16_kernel"),
+    (MOD_NVFP4_A4, "q4e_nvfp4_a4_gate_up_kernel"),
+    (MOD_NVFP4_A4, "q4e_nvfp4_a4_down_kernel"),
+    (MOD_NVFP4_A4, "q4e_nvfp4_a4_combine_kernel"),
+    (MOD_MXFP8_A8, "q4e_mxfp8_a8_quant_kernel"),
+    (MOD_MXFP8_A8, "q4e_mxfp8_a8_gemm_kernel"),
+];
+
+/// Dense projections over a brain-float weight, read as stored, on a device
+/// with tensor cores: split step kernels that sum a row one way whatever the
+/// pass width, and the tensor-core prompt GEMM. Not an upstream unit, for the
+/// reason [`MOD_MODELOPT`] is not; the ported brain-float kernel in
+/// [`MOD_MATVEC`] is what a kernel set without this module keeps.
+pub const MOD_BF16: &str = "q4e_bf16";
+/// The routed block's step launch: a decode step's or a verify's router,
+/// routed selection and shared expert as one grid of work items, bit for bit
+/// what the [`MOD_BF16`], [`MOD_MOE`] and [`MOD_MXFP8`] launches it replaces
+/// compute. Not an upstream unit, for the reason [`MOD_MODELOPT`] is not; see
+/// [`crate::sparse::moe::fused_route`].
+pub const MOD_FFN: &str = "q4e_ffn";
 /// The logits stages run before any pick: today, the suppress stage.
 pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a
@@ -148,6 +204,28 @@ pub const IDX_QUERY_BLOCK: u32 = 512;
 /// Slots one expanded selection writes per query row: the selected positions
 /// plus three words of bookkeeping.
 pub const IDX_WIDTH: u32 = 2_048 + 3;
+/// Raw indexer key rows one session keeps per attention rank, each position at
+/// slot `position % IDX_RING`.
+///
+/// The pooled pass is the only reader of a raw key, and it reads the keys of
+/// the block a pass starts inside - at most `IDX_R - 1` positions behind the
+/// pass's first. Between passes those are the only raw keys worth keeping, and
+/// a ring this deep keeps them through the furthest rewind a speculative step
+/// makes: a verify settles anywhere inside its `MAX_DRAFT + 1` rows, and the
+/// draft head's catch-up starts up to `MAX_DRAFT` positions behind its chain.
+/// With every pass starting at most `D` positions behind the highest written,
+/// a slot still holds the key a pass reads when the ring is `D + IDX_R - 1`
+/// deep (see `idxring.cu`); [`RING_REWIND`] is that `D`.
+pub const IDX_RING: u32 = 16;
+/// The furthest any pass starts behind the highest position its rank has
+/// written: a full verify of `MAX_DRAFT` drafts and its committed token.
+pub const RING_REWIND: u32 = crate::sparse::mtp::MAX_DRAFT + 1;
+/// The tap row that asks the pooled pass for no copy into a checkpoint.
+pub const IDX_NO_TAP: u32 = u32::MAX;
+const _: () = assert!(
+    IDX_RING >= RING_REWIND + IDX_R - 1 && IDX_RING.is_multiple_of(IDX_R),
+    "the raw key ring must outlast a speculative rewind"
+);
 
 /// Warps in the dense attention block.
 pub const ATTN_WARPS: u32 = 8;
@@ -427,6 +505,98 @@ pub enum Entry {
     Plain(KernelRef),
     /// One instantiation of a template, resolved through an [`EntryTable`].
     Template(Instantiation),
+}
+
+/// The kernels that touch the attention key and value planes, named by the job
+/// they do rather than by entry point.
+///
+/// Each one has an entry per cache element, and they share everything else:
+/// the grid, the block, the shared-memory reservation and the argument list.
+/// So a launch site names the job and the element and gets the entry, and the
+/// geometry helpers below serve both. An enum rather than a name lookup, so a
+/// launch site cannot ask for the fp8 twin of a kernel that has none and get
+/// the f16 one back - every match below is exhaustive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CacheKernel {
+    /// The key norm, rotary and store of one sequence's rows.
+    Store,
+    /// The same store with one page table per row.
+    StoreBatch,
+    /// The always-correct dense attention.
+    Attention,
+    /// The dense attention with one page table per row.
+    AttentionBatch,
+    /// The tiled dense attention.
+    Tiled,
+    /// The split-key attention.
+    Split,
+    /// The gathered attention over a selection.
+    Gather,
+    /// The exact tensor-core attention, dense or gathered.
+    TensorCore,
+}
+
+impl CacheKernel {
+    /// Every cache kernel, in no particular order.
+    pub const ALL: [Self; 8] = [
+        Self::Store,
+        Self::StoreBatch,
+        Self::Attention,
+        Self::AttentionBatch,
+        Self::Tiled,
+        Self::Split,
+        Self::Gather,
+        Self::TensorCore,
+    ];
+
+    /// The entry that does this job over a cache of `kv`.
+    #[must_use]
+    pub const fn entry(self, kv: KvElem) -> Entry {
+        let (module, name) = self.name(kv);
+        Entry::plain(module, name)
+    }
+
+    /// The module and entry name that do this job over a cache of `kv`.
+    #[must_use]
+    pub const fn name(self, kv: KvElem) -> (&'static str, &'static str) {
+        match kv {
+            KvElem::Fp8E4m3 => (
+                MOD_KV8,
+                match self {
+                    Self::Store => "q4e_qsa_store_kv_fp8_kernel",
+                    Self::StoreBatch => "q4e_qsa_store_kv_batch_fp8_kernel",
+                    Self::Attention => "q4e_qsa_attention_fp8_kernel",
+                    Self::AttentionBatch => "q4e_qsa_attention_batch_fp8_kernel",
+                    Self::Tiled => "q4e_qsa_attention_tiled_fp8_kernel",
+                    Self::Split => "q4e_qsa_attention_split_fp8_kernel",
+                    Self::Gather => "q4e_qsa_attention_gather_fp8_kernel",
+                    Self::TensorCore => "q4e_qsa_attention_tc_exact_fp8_kernel",
+                },
+            ),
+            KvElem::F16 => match self {
+                Self::Store => (MOD_QSA, "q4e_qsa_store_kv_kernel"),
+                Self::StoreBatch => (MOD_QSA, "q4e_qsa_store_kv_batch_kernel"),
+                Self::Attention => (MOD_QSA, "q4e_qsa_attention_kernel"),
+                Self::AttentionBatch => (MOD_QSA, "q4e_qsa_attention_batch_kernel"),
+                Self::Tiled => (MOD_QSA, "q4e_qsa_attention_tiled_kernel"),
+                Self::Split => (MOD_QSA_SPARSE, "q4e_qsa_attention_split_kernel"),
+                Self::Gather => (MOD_QSA_SPARSE, "q4e_qsa_attention_gather_kernel"),
+                Self::TensorCore => (MOD_EXACT, "q4e_qsa_attention_tc_exact_kernel"),
+            },
+        }
+    }
+}
+
+/// The `(module, entry)` pairs a cache element needs beyond the f16 set, which
+/// a stack probes before it accepts the element; `None` for f16, whose kernels
+/// are the ones every other path already requires.
+#[must_use]
+pub fn kv_entries(kv: KvElem) -> Option<[(&'static str, &'static str); 8]> {
+    if kv == KvElem::F16 {
+        return None;
+    }
+    Some(CacheKernel::ALL.map(|kernel| kernel.name(kv)))
 }
 
 impl Entry {
@@ -846,6 +1016,45 @@ pub const fn gdn_tc_prep(v_heads: u32, n_tok: u32) -> Launch {
     )
 }
 
+/// Value heads per key head the fused prompt kernels are written for.
+pub const GDN_FUSED_HEADS_PER_KEY: u32 = 3;
+
+/// Convolution taps the fused prompt kernels are written for.
+pub const GDN_FUSED_CONV_TAPS: u32 = 4;
+
+/// Shared memory the fused prep reserves (`Q4E_GF_PREP_SMEM`): two padded
+/// half tiles, three float solve tiles and the three heads' decays and write
+/// strengths.
+pub const GDN_FUSED_PREP_SMEM: u32 = {
+    let c = GDN_TC_RUN;
+    let r = GDN_FUSED_HEADS_PER_KEY;
+    2 * c * 136 * 2 + r * c * 68 * 4 + 2 * r * c * 4
+};
+
+/// Shared memory the fused scan reserves (`Q4E_GF_SCAN_SMEM`): the f32 query
+/// and key rows, w, T and P, and the decays and write scales of one run.
+pub const GDN_FUSED_SCAN_SMEM: u32 = {
+    let c = GDN_TC_RUN;
+    let d = GDN_STATE_HEAD_DIM;
+    2 * c * d * 4 + c * d * 2 + 2 * c * c * 2 + 2 * c * 4
+};
+
+/// The fused prep: one block per (key head, run), heads fastest.
+#[must_use]
+pub const fn gdn_fused_prep(qk_heads: u32, n_tok: u32) -> Launch {
+    Launch::new(
+        Extent3::new(qk_heads, gdn_tc_runs(n_tok), 1),
+        512,
+        GDN_FUSED_PREP_SMEM,
+    )
+}
+
+/// The fused carry and output gate: one block per value head.
+#[must_use]
+pub const fn gdn_fused_scan(v_heads: u32) -> Launch {
+    Launch::new(Extent3::linear(v_heads), 256, GDN_FUSED_SCAN_SMEM)
+}
+
 /// The convolution of a prefill chunk, parallel over 64-token tiles.
 #[must_use]
 pub const fn gdn_conv_par(channels: u32, n_tok: u32) -> Launch {
@@ -1202,18 +1411,6 @@ pub const fn qsa_attention_combine(heads: u32, n_tok: u32) -> Launch {
 
 // --- the indexer ------------------------------------------------------------
 
-/// The raw indexer key store, one block per token.
-#[must_use]
-pub const fn idx_store_k(n_tok: u32) -> Launch {
-    Launch::linear(n_tok, BLOCK_NARROW)
-}
-
-/// The same raw key store with one sequence's page table per row.
-#[must_use]
-pub const fn idx_store_k_batch(n_row: u32) -> Launch {
-    idx_store_k(n_row)
-}
-
 /// The pooled indexer key pass.
 ///
 /// The grid is **not** a ceiling. At most `n_tok / r` key blocks complete in one
@@ -1229,6 +1426,14 @@ pub const fn idx_pool(n_tok: u32, compress: u32) -> Launch {
         None => 0,
     };
     Launch::linear(blocks, BLOCK_NARROW)
+}
+
+/// The pooled indexer key pass over the raw key ring: the pooled pass's own
+/// grid, whose block 0 always exists because it is the one that writes the
+/// ring.
+#[must_use]
+pub const fn idx_ring_pool(n_tok: u32, compress: u32) -> Launch {
+    idx_pool(n_tok, compress)
 }
 
 /// The indexer query normalization and rotary, one block per (head, token).

@@ -32,7 +32,8 @@ use shiso_core::error::{CoreError, CoreResult};
 use crate::sparse::bind::{Args, Operand, WeightRef};
 use crate::sparse::exl3::{self, Fanout, GemmShape, Staging};
 use crate::sparse::kernels::{
-    self, Elem, Entry, Launch, MOD_EXL3, MOD_MATVEC, TemplateArgs, blocks_for,
+    self, Elem, Entry, Launch, MOD_BF16, MOD_EXL3, MOD_MATVEC, MOD_MXFP8, MOD_MXFP8_A8,
+    TemplateArgs, blocks_for,
 };
 use crate::sparse::plan::{Plan, Step, TrellisOp};
 use crate::sparse::scratch::Buf;
@@ -226,6 +227,18 @@ pub enum Projection {
         /// Its launch.
         launch: Launch,
     },
+    /// A brain-float weight through the step kernels of [`MOD_BF16`]: one
+    /// launch over up to [`BF16_STEP_ROWS`] rows, each output row's
+    /// contraction sliced across the warps of one block by the shape alone
+    /// and folded inside it.
+    BrainStep {
+        /// The projection itself.
+        entry: Entry,
+        /// Its launch.
+        launch: Launch,
+        /// Warps one output row's contraction is sliced across.
+        splits: u32,
+    },
     /// A brain-float weight through the warp-per-row kernel.
     BrainRows {
         /// The projection itself.
@@ -271,6 +284,155 @@ pub enum Projection {
         /// Its launch.
         launch: Launch,
     },
+    /// An MXFP8 weight, read in place: a one-row kernel at a decode step and a
+    /// multi-row kernel over a verify pass of up to [`MXFP8_STEP_ROWS`] (each
+    /// one of two blockings, by output width), and the tensor-core kernel over
+    /// a prompt chunk of any width. Every one takes the same argument list.
+    Mxfp8 {
+        /// The projection itself.
+        entry: Entry,
+        /// Its launch.
+        launch: Launch,
+    },
+    /// An MXFP8 weight against MXFP8 activations, a prompt chunk under
+    /// [`PrefillActivations::Lowp`]: the activations quantized into
+    /// [`Buf::HalfActivation`], then the block-scaled FP8 GEMM.
+    Mxfp8Lowp {
+        /// The quantizer's launch.
+        quant: Launch,
+        /// The GEMM's launch.
+        gemm: Launch,
+    },
+}
+
+/// Threads an MXFP8 step-kernel block runs: four warps (`Q4E_MX_WARPS`),
+/// which keep more blocks resident on a GB10 than eight-warp ones.
+pub const MXFP8_THREADS: u32 = 128;
+
+/// Output rows one block of the narrow one-row and the narrow multi-row MXFP8
+/// kernels covers, a warp each.
+pub const MXFP8_ROWS_PER_BLOCK: u32 = 4;
+
+/// Output rows one block of the wide multi-row MXFP8 kernel covers, four a
+/// warp: the block stages a verify pass's activations once for sixteen weight
+/// rows, so the pass reads the weight about as fast as a one-row step does.
+pub const MXFP8_VERIFY_ROWS_PER_BLOCK: u32 = 16;
+
+/// Output rows one block of the wide one-row MXFP8 kernel covers, two a
+/// warp.
+pub const MXFP8_GEMV_ROWS_PER_BLOCK: u32 = 8;
+
+/// The widest step pass the multi-row MXFP8 kernel takes in one launch; a
+/// wider one (a batched verify) runs as passes of this width. A row's sum
+/// does not depend on the width it shares, so the passes are the one launch's
+/// bits.
+pub const MXFP8_STEP_ROWS: u32 = 8;
+
+/// Output rows and activation rows one tile of the MXFP8 prompt kernel covers
+/// (`Q4E_MX_BM`, `Q4E_MX_BN`).
+pub const MXFP8_GEMM_TILE: u32 = 128;
+
+/// Threads the MXFP8 prompt kernel runs a tile with: sixteen warps of 32 x 32
+/// (`Q4E_MX_GEMM_THREADS`).
+pub const MXFP8_GEMM_THREADS: u32 = 512;
+
+/// Contraction widths the W8A8 prompt kernel takes: its scales arrive sixteen
+/// groups (512 elements) a row at a time.
+pub const MXFP8_A8_K_ALIGN: u32 = 512;
+
+/// Rows and outputs one tile of the W8A8 prompt kernel covers (`LP_A8_BM`,
+/// `LP_A8_BN`).
+pub const MXFP8_A8_TILE: u32 = 128;
+
+/// Threads the W8A8 prompt kernel runs a tile with (`LP_A8_THREADS`).
+pub const MXFP8_A8_THREADS: u32 = 256;
+
+/// Dynamic shared memory the W8A8 prompt kernel takes (`LP_A8_SMEM`): four
+/// stages of two 128 x 64 code tiles and two chunks of sixteen scale bytes
+/// for its 256 rows.
+pub const MXFP8_A8_SMEM: u32 = 4 * 2 * 128 * 64 + 2 * 256 * 16;
+
+/// Threads one block of the MXFP8 quantizer runs, four values a thread.
+pub const MXFP8_A8_QUANT_THREADS: u32 = 256;
+
+/// Dynamic shared memory the MXFP8 prompt kernel takes (`Q4E_MX_GEMM_SMEM`):
+/// a three-step ring of raw codes and activations, two converted half tiles
+/// of each operand and two steps of scales. Above the 48 KiB a launch gets
+/// without opting in, below the device's 99 KiB per block.
+pub const MXFP8_GEMM_SMEM: u32 = 3 * (128 * 32 + 128 * 32 * 4) + 4 * (128 * 32 * 2) + 2 * 128 * 4;
+
+/// The MXFP8 tier.
+///
+/// A prompt pass takes the tensor-core kernel at every width: its rows only
+/// have to agree with each other across pass widths, which that kernel keeps
+/// by summing a column in an order fixed by the shape. A step takes the
+/// warp-per-row kernels, whose sums are the brain-float tier's on the widened
+/// weight and do not move with the row count, so a verify row reproduces the
+/// single-row step.
+fn mxfp8(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Projection> {
+    if crate::sparse::weights::mxfp8_bytes(in_dim, out_dim).is_none() {
+        return Err(CoreError::ShapeMismatch {
+            field: "mxfp8 contraction width",
+            expected: u64::from(crate::sparse::weights::MXFP8_GROUP),
+            got: u64::from(in_dim),
+        });
+    }
+    // A contraction the W8A8 kernel cannot stride stays on the weight-only
+    // one: a fact about the weight's shape, so every width of every prompt
+    // takes the same kernel for it.
+    if device.lowp_dense() && in_dim.is_multiple_of(MXFP8_A8_K_ALIGN) {
+        let quads = u64::from(rows) * u64::from(in_dim) / 4;
+        return Ok(Projection::Mxfp8Lowp {
+            quant: Launch::linear(
+                blocks_for(quads, u64::from(MXFP8_A8_QUANT_THREADS)),
+                MXFP8_A8_QUANT_THREADS,
+            ),
+            gemm: Launch::new(
+                shiso_core::Extent3::new(
+                    out_dim.div_ceil(MXFP8_A8_TILE),
+                    rows.div_ceil(MXFP8_A8_TILE),
+                    1,
+                ),
+                MXFP8_A8_THREADS,
+                MXFP8_A8_SMEM,
+            ),
+        });
+    }
+    if device.row_invariant() {
+        return Ok(Projection::Mxfp8 {
+            entry: Entry::plain(MOD_MXFP8, "q4e_mxfp8_gemm_kernel"),
+            launch: Launch::new(
+                shiso_core::Extent3::new(
+                    out_dim.div_ceil(MXFP8_GEMM_TILE),
+                    rows.div_ceil(MXFP8_GEMM_TILE),
+                    1,
+                ),
+                MXFP8_GEMM_THREADS,
+                MXFP8_GEMM_SMEM,
+            ),
+        });
+    }
+    // The one-row and the multi-row kernels each come in two blockings,
+    // chosen by the output width alone: both sum a row the same way, so the
+    // choice moves no bit.
+    let (entry, rows_per_block) = match rows {
+        1 if out_dim > NARROW_OUTPUT => ("q4e_mxfp8_gemv_kernel", MXFP8_GEMV_ROWS_PER_BLOCK),
+        1 => ("q4e_mxfp8_gemv_narrow_kernel", MXFP8_ROWS_PER_BLOCK),
+        2..=MXFP8_STEP_ROWS if out_dim > NARROW_OUTPUT => {
+            ("q4e_mxfp8_rows_kernel", MXFP8_VERIFY_ROWS_PER_BLOCK)
+        }
+        2..=MXFP8_STEP_ROWS => ("q4e_mxfp8_rows_narrow_kernel", MXFP8_ROWS_PER_BLOCK),
+        _ => {
+            return Err(CoreError::Unsupported {
+                what: "an MXFP8 step pass wider than its multi-row kernel; it runs in passes",
+                backend: "engine",
+            });
+        }
+    };
+    Ok(Projection::Mxfp8 {
+        entry: Entry::plain(MOD_MXFP8, entry),
+        launch: Launch::linear(out_dim.div_ceil(rows_per_block), MXFP8_THREADS),
+    })
 }
 
 /// Output rows one affine projection threadgroup covers
@@ -378,11 +540,34 @@ pub struct Device {
     /// [`GemmReduction::ColumnInvariant`]. A fact about the pass, carried here
     /// for the reason `half_block_input` is.
     pub role: PassRole,
-    /// Which kernel a prompt pass's brain-float projections take: the
-    /// matrix-unit one (`q4e_bf16_gemm_kernel`) at every width where the
-    /// device has it. A probed device fact: a kernel set without it keeps the
-    /// warp-per-row kernel.
+    /// Which kernels a pass's brain-float projections take: a matrix-unit
+    /// one for a prompt chunk at every width where the device has it, and on
+    /// a device with [`MOD_BF16`] that module's step kernels as well. A probed
+    /// device fact: a kernel set without either keeps the warp-per-row kernel.
     pub prompt_matmul: PromptMatmul,
+    /// The precision a prompt pass's activations enter the block-scaled
+    /// weights' products at; see [`PrefillActivations`]. An operator's
+    /// choice, checked against the kernel set at startup.
+    pub prefill_activations: PrefillActivations,
+    /// Which one-launch routed selection a decode-sized pass takes. A probed
+    /// device fact, for the reason `prompt_matmul` is.
+    pub route_sort: RouteSort,
+    /// What a chained combine leaves for the next mix on this pass. A fact
+    /// about the pass, set once for all of it, for the reason
+    /// `half_block_input` is.
+    pub normed: NormedStreams,
+}
+
+/// What the combine that closes a block leaves for the next mix to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum NormedStreams {
+    /// The normed streams themselves, `[rows, streams * hidden]`.
+    #[default]
+    Stored,
+    /// Only each (row, stream)'s norm scale: every mix of the pass reads the
+    /// residual through launches that norm it as they read it, so the normed
+    /// copy - the widest activation of a prompt chunk - is never written.
+    Scaled,
 }
 
 impl Device {
@@ -409,6 +594,78 @@ impl Device {
     pub const fn tier_rows(self, rows: u32) -> u32 {
         if self.row_invariant() { u32::MAX } else { rows }
     }
+
+    /// Whether this pass quantizes its activations for the block-scaled
+    /// kernels: a prompt pass under [`PrefillActivations::Lowp`] for the routed
+    /// experts. A step or
+    /// a verify never does, whatever the option, so a decoded token is the
+    /// weight-only tier's answer and speculation's equality holds.
+    #[must_use]
+    pub const fn lowp_prompt(self) -> bool {
+        self.row_invariant() && matches!(self.prefill_activations, PrefillActivations::Lowp)
+    }
+
+    /// Whether this pass's dense MXFP8 projections take MXFP8 activations: a
+    /// prompt pass under [`PrefillActivations::Lowp`] or
+    /// [`PrefillActivations::Dense8`].
+    #[must_use]
+    pub const fn lowp_dense(self) -> bool {
+        self.row_invariant()
+            && matches!(
+                self.prefill_activations,
+                PrefillActivations::Lowp | PrefillActivations::Dense8
+            )
+    }
+}
+
+/// The precision a prompt pass's activations take into the products with the
+/// block-scaled weights (the NVFP4 routed experts and the MXFP8 dense
+/// projections).
+///
+/// A trade of accuracy for prefill speed, made by the operator
+/// (`--prefill-activations`). Only prompt passes are affected: decode steps
+/// and speculative verifies keep the weight-only kernels under either choice.
+/// Within a prompt the choice reads no row count, so a row's bits still do not
+/// depend on where the prompt was cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PrefillActivations {
+    /// Activations kept at half precision against the decoded weights: the
+    /// weight-only kernels, the reference numerics.
+    #[default]
+    A16,
+    /// Activations quantized to the weight's own format - NVFP4 (one `e4m3`
+    /// scale per 16, a per-row global) for the routed experts, MXFP8 (one
+    /// `ue8m0` scale per 32) for the dense projections - and multiplied on the
+    /// block-scaled tensor-core instructions. Needs a kernel set built for a
+    /// family-specific architecture (`sm_121a`); refused at startup without
+    /// one.
+    Lowp,
+    /// MXFP8 activations into the dense MXFP8 projections only; the routed
+    /// experts keep half-precision activations. The MXFP8 activation quantizer
+    /// costs about 1.7% relative error against FP4's 12-15%, and the routed
+    /// stage is where FP4 prompt activations measurably cost speculation
+    /// acceptance (the draft head warms over the prompt pass's rows). Needs the
+    /// same kernel set as [`PrefillActivations::Lowp`].
+    Dense8,
+}
+
+/// The one-launch routed selection a decode-sized pass takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RouteSort {
+    /// `q4e_moe_route_sort_small_kernel` at every width it takes: every
+    /// kernel set has it.
+    #[default]
+    Small,
+    /// `q4e_moe_route_sort_tiny_kernel` for a pass of at most
+    /// [`crate::sparse::moe::ROUTE_TINY_MAX_TOKENS`] rows, the small one past
+    /// that: the same results at a shorter serial chain.
+    Tiny,
+    /// [`Self::Tiny`], and on a step or verify pass of at most
+    /// [`crate::sparse::moe::FUSED_ROUTE_MAX_TOKENS`] rows whose router,
+    /// shared expert and gate are in the formats it reads, the router, the
+    /// selection and the shared expert as one launch
+    /// ([`crate::sparse::moe::fused_route`]): the same results again.
+    Fused,
 }
 
 /// The kernel a prompt pass's brain-float projections take.
@@ -419,6 +676,12 @@ pub enum PromptMatmul {
     Rows,
     /// The matrix-unit kernel, a whole chunk a launch.
     Matrix,
+    /// The brain-float module of a device with tensor cores ([`MOD_BF16`]):
+    /// its tensor-core GEMM for a prompt chunk, a whole chunk a launch, and
+    /// its split step kernels for a decode step or a verify pass in place of
+    /// the warp-per-row kernel. The one probe covers both because they are
+    /// one module: a kernel set that has the GEMM has the step kernels.
+    Tensor,
 }
 
 /// What one session's pass of consecutive positions is for.
@@ -491,6 +754,7 @@ pub fn plan(
             trellis(dtype, in_dim, out_dim, rows, device)
         }
         DType::MlxAffine4Gs64 => affine(in_dim, out_dim, rows, device),
+        DType::Mxfp8E4M3G32 => mxfp8(in_dim, out_dim, rows, device),
         // Every block-quantized tier reaches its kernel through an activation
         // quantizer, and drops through to a dense path, that belong to the
         // general kernel set rather than to this one.
@@ -673,6 +937,9 @@ fn expand_packed(out: &mut Plan, weight: WeightDesc, w: Operand, wide: Elem) {
 /// A prompt pass on a device with the matrix-unit kernel takes it at every
 /// width instead, as the affine tier does, for the same reason.
 fn brain(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Projection> {
+    if matches!(device.prompt_matmul, PromptMatmul::Tensor) {
+        return brain_tensor(in_dim, out_dim, rows, device);
+    }
     if brain_gemm(in_dim, device) {
         return Ok(Projection::BrainGemm {
             entry: Entry::plain(MOD_MATVEC, "q4e_bf16_gemm_kernel"),
@@ -711,13 +978,137 @@ fn brain(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Pro
     })
 }
 
-/// Whether a brain-float projection of contraction `in_dim` takes the
-/// matrix-unit kernel on this pass: a prompt pass, on a device that has it,
+/// Whether a brain-float projection of contraction `in_dim` takes a
+/// matrix-unit kernel on this pass: a prompt pass, on a device that has one,
 /// over a contraction its 32-wide slices divide.
 const fn brain_gemm(in_dim: u32, device: Device) -> bool {
-    matches!(device.prompt_matmul, PromptMatmul::Matrix)
-        && device.row_invariant()
+    matches!(
+        device.prompt_matmul,
+        PromptMatmul::Matrix | PromptMatmul::Tensor
+    ) && device.row_invariant()
         && in_dim.is_multiple_of(32)
+}
+
+/// The widest pass the brain-float step kernels of [`MOD_BF16`] take in one
+/// launch; a wider step pass runs as passes of this width, which are the one
+/// launch's bits because a row's sum does not depend on the rows beside it.
+/// The half-precision tier's width ([`HALF_MAX_ROWS`]), for the reason given
+/// there: a batched verify is wider than sixteen rows.
+pub const BF16_STEP_ROWS: u32 = HALF_MAX_ROWS;
+
+/// Warps a brain-float step-kernel block runs (`Q4E_BF_WARPS`).
+pub const BF16_STEP_WARPS: u32 = 8;
+
+/// Threads a brain-float step-kernel block runs.
+pub const BF16_STEP_THREADS: u32 = BF16_STEP_WARPS * kernels::WARP;
+
+/// Output rows one warp of the brain-float step kernel for `rows` activation
+/// rows owns (`R` in `bf16.cu`): one at a decode step, two over a verify pass.
+/// Sharing each activation load between two output rows is what keeps a
+/// verify pass bound by the weight read.
+#[must_use]
+pub const fn bf16_warp_rows(rows: u32) -> u32 {
+    if rows <= 1 { 1 } else { 2 }
+}
+
+/// Warps one output row's contraction is sliced across in a brain-float step
+/// projection: 1, 2, 4 or 8, a function of the shape alone so that every pass
+/// width sums a row the same way. A narrow output is sliced until about two
+/// thousand warps carry it, each slice at least one full step of the warp's
+/// loads: the stream mix down (320 outputs over 10,240) on one warp a row is
+/// 320 warps, too few to keep the memory busy.
+#[must_use]
+pub const fn bf16_split(in_dim: u32, out_dim: u32) -> u32 {
+    let mut split = 1;
+    while split < BF16_STEP_WARPS
+        && out_dim.saturating_mul(split) < 2_048
+        && in_dim / (split * 2) >= 256
+    {
+        split *= 2;
+    }
+    split
+}
+
+/// Output rows and activation rows one tile of the brain-float prompt GEMM
+/// covers (`Q4E_BF_BM`, `Q4E_BF_BN`).
+pub const BF16_GEMM_TILE: u32 = 128;
+
+/// Threads the brain-float prompt GEMM runs a tile with: sixteen warps of
+/// 32 x 32 (`Q4E_BF_GEMM_THREADS`).
+pub const BF16_GEMM_THREADS: u32 = 512;
+
+/// Dynamic shared memory the brain-float prompt GEMM takes
+/// (`Q4E_BF_GEMM_SMEM(0)`): a three-step ring of weight tiles and raw
+/// activations, and two rounded activation tiles. Above the 48 KiB a launch
+/// gets without opting in, below the device's 99 KiB per block.
+pub const BF16_GEMM_SMEM: u32 = 3 * (128 * 32 * 2 + 128 * 32 * 4) + 2 * (128 * 32 * 2);
+
+/// Dynamic shared memory the split-activation prompt GEMM takes
+/// (`Q4E_BF_GEMM_SMEM(1)`): a two-step ring, and two pairs of rounded tiles
+/// (the activations' brain-float part and what rounding left).
+pub const BF16_GEMM_SPLIT_SMEM: u32 = 2 * (128 * 32 * 2 + 128 * 32 * 4) + 4 * (128 * 32 * 2);
+
+/// The brain-float tier on a device with [`MOD_BF16`].
+///
+/// A prompt pass takes the tensor-core GEMM at every width. The projections
+/// [`half_exact`] keeps off the rounded half-precision multiply - narrow
+/// outputs over the residual width, the router above all - take the split
+/// GEMM, which carries each activation as two brain floats, sixteen
+/// significant bits, so a near-tie between two experts is not decided by the
+/// rounding; the rest round their activations to brain floats, as the
+/// checkpoint's own arithmetic does.
+///
+/// A step pass takes the split step kernels, whose sums do not move with the
+/// row count: a verify row reproduces the single-row step bit for bit. A
+/// prompt pass over a contraction the GEMM's slices do not divide takes them
+/// too, which keeps its promise for the same reason.
+fn brain_tensor(in_dim: u32, out_dim: u32, rows: u32, device: Device) -> CoreResult<Projection> {
+    if brain_gemm(in_dim, device) {
+        let (entry, smem) = if half_exact(in_dim, out_dim, device.tier_rows(rows)) {
+            ("q4e_bf16_gemm_split_kernel", BF16_GEMM_SPLIT_SMEM)
+        } else {
+            ("q4e_bf16_gemm_kernel", BF16_GEMM_SMEM)
+        };
+        return Ok(Projection::BrainGemm {
+            entry: Entry::plain(MOD_BF16, entry),
+            launch: Launch::new(
+                shiso_core::Extent3::new(
+                    out_dim.div_ceil(BF16_GEMM_TILE),
+                    rows.div_ceil(BF16_GEMM_TILE),
+                    1,
+                ),
+                BF16_GEMM_THREADS,
+                smem,
+            ),
+        });
+    }
+    // Eight brain floats a lane: the kernels load sixteen bytes of weight at
+    // a time.
+    if !in_dim.is_multiple_of(8) {
+        return Err(CoreError::ShapeMismatch {
+            field: "brain-float contraction width",
+            expected: 8,
+            got: u64::from(in_dim),
+        });
+    }
+    let entry = match rows {
+        1 => "q4e_bf16_gemv_kernel",
+        2..=8 => "q4e_bf16_rows_kernel",
+        9..=BF16_STEP_ROWS => "q4e_bf16_rows_wide_kernel",
+        _ => {
+            return Err(CoreError::Unsupported {
+                what: "a brain-float step pass wider than its widest kernel; it runs in passes",
+                backend: "engine",
+            });
+        }
+    };
+    let splits = bf16_split(in_dim, out_dim);
+    let rows_per_block = BF16_STEP_WARPS / splits * bf16_warp_rows(rows);
+    Ok(Projection::BrainStep {
+        entry: Entry::plain(MOD_BF16, entry),
+        launch: Launch::linear(out_dim.div_ceil(rows_per_block), BF16_STEP_THREADS),
+        splits,
+    })
 }
 
 /// Trellis width of one of the three codec element types.
@@ -924,14 +1315,25 @@ pub fn project(
         }
         // The brain-float tier has no BLAS path, so passes are its only way
         // through a chunk - a draft head's catch-up over the prompt is one.
-        DType::BF16 => rows > MAX_ROWS && !brain_gemm(weight.in_dim, device),
+        DType::BF16 => {
+            let widest = if matches!(device.prompt_matmul, PromptMatmul::Tensor) {
+                BF16_STEP_ROWS
+            } else {
+                MAX_ROWS
+            };
+            rows > widest && !brain_gemm(weight.in_dim, device)
+        }
+        // A step pass wider than the multi-row kernel - a batched verify -
+        // runs in passes of it; a prompt chunk is one tensor-core launch.
+        DType::Mxfp8E4M3G32 => rows > MXFP8_STEP_ROWS && !device.row_invariant(),
         _ => false,
     };
     if passes {
-        let width = if matches!(weight.dtype, DType::F16 | DType::F16Pack12) {
-            HALF_MAX_ROWS
-        } else {
-            MAX_ROWS
+        let width = match weight.dtype {
+            DType::F16 | DType::F16Pack12 => HALF_MAX_ROWS,
+            DType::BF16 if matches!(device.prompt_matmul, PromptMatmul::Tensor) => BF16_STEP_ROWS,
+            DType::Mxfp8E4M3G32 => MXFP8_STEP_ROWS,
+            _ => MAX_ROWS,
         };
         let mut done = 0;
         while done < rows {
@@ -950,6 +1352,143 @@ pub fn project(
         return Ok(());
     }
     project_one(out, weight, bound, rows, device)
+}
+
+/// Whether `weight` is projected over `rows` rows by the plain brain-float
+/// prompt GEMM (`q4e_bf16_gemm_kernel`) on this pass - the kernel whose sums
+/// the stream mix's fused launches reproduce.
+#[must_use]
+pub fn brain_plain_gemm(weight: WeightDesc, rows: u32, device: Device) -> bool {
+    weight.dtype == DType::BF16
+        && matches!(
+            plan(weight.dtype, weight.in_dim, weight.out_dim, rows, device),
+            Ok(Projection::BrainGemm { entry, .. })
+                if entry.module() == MOD_BF16 && entry.name() == "q4e_bf16_gemm_kernel"
+        )
+}
+
+/// Matrices one MXFP8 group launch takes (`Q4E_MXG_PARAMS`).
+pub const MXFP8_GROUP_SLOTS: usize = 4;
+
+/// Output rows in all at or below which an MXFP8 group takes its one-row-a-
+/// warp entries. The shared expert's pair (1280 rows) measured 22.5 us on two
+/// rows a warp and 18.7 us on the pipelined one row a warp; the recurrent and
+/// attention groups (over 13,000 rows) are fastest on two.
+pub const MXFP8_GROUP_NARROW: u32 = 4_096;
+
+/// Whether projections of one input with these weights take MXFP8 group
+/// launches at `rows`: every weight MXFP8 over one contraction width, on a
+/// step or verify pass.
+///
+/// A prompt pass keeps the tensor-core kernel per matrix, whose tiles gain
+/// nothing from sharing a launch. A planner that reorders projections to put
+/// them side by side asks this first, so that a weight in any other format
+/// keeps its place in the chain.
+#[must_use]
+pub fn groups(weights: &[WeightDesc], device: Device) -> bool {
+    weights.len() > 1
+        && !device.row_invariant()
+        && weights.iter().all(|w| {
+            w.dtype == DType::Mxfp8E4M3G32
+                && w.in_dim == weights[0].in_dim
+                && crate::sparse::weights::mxfp8_bytes(w.in_dim, w.out_dim).is_some()
+        })
+}
+
+/// The MXFP8 group entry for `rows` activation rows over matrices of `total`
+/// output rows in all, and the output rows one of its blocks covers.
+///
+/// The blockings sum a row identically, so the choice is made for bandwidth
+/// alone and by the shape alone, like the single-matrix kernels'.
+#[must_use]
+pub const fn mxfp8_group_entry(rows: u32, total: u32) -> (&'static str, u32) {
+    // A verify block stages the pass's activations once for its rows, so one
+    // row a warp re-stages them four times as often: past the single-matrix
+    // kernels' narrow width that costs more than the extra warps gain.
+    match rows {
+        1 if total > MXFP8_GROUP_NARROW => {
+            ("q4e_mxfp8_gemv_group_kernel", MXFP8_GEMV_ROWS_PER_BLOCK)
+        }
+        1 => ("q4e_mxfp8_gemv_group_narrow_kernel", MXFP8_ROWS_PER_BLOCK),
+        _ if total > NARROW_OUTPUT => ("q4e_mxfp8_rows_group_kernel", MXFP8_VERIFY_ROWS_PER_BLOCK),
+        _ => ("q4e_mxfp8_rows_group_narrow_kernel", MXFP8_ROWS_PER_BLOCK),
+    }
+}
+
+/// Plans projections that all read one input, in order.
+///
+/// Where [`groups`] allows it, up to [`MXFP8_GROUP_SLOTS`] matrices share one
+/// launch that reads the activation once and writes each matrix's own
+/// destination, in passes of [`MXFP8_STEP_ROWS`] rows; a row of every matrix
+/// is summed exactly as its own launch would sum it, so the group moves no
+/// bit. Anything else is the projections one by one, as [`project`] plans
+/// them.
+///
+/// # Errors
+///
+/// Whatever [`project`] reports for a weight this build cannot project, and
+/// [`CoreError::ShapeMismatch`] for members that do not share their input.
+pub fn project_group(
+    out: &mut Plan,
+    members: &[(WeightDesc, Bound)],
+    rows: u32,
+    device: Device,
+) -> CoreResult<()> {
+    let weights: Vec<WeightDesc> = members.iter().map(|(w, _)| *w).collect();
+    if rows == 0 || !groups(&weights, device) {
+        for &(weight, bound) in members {
+            project(out, weight, bound, rows, device)?;
+        }
+        return Ok(());
+    }
+    if members.iter().any(|(_, b)| b.src != members[0].1.src) {
+        return Err(CoreError::ShapeMismatch {
+            field: "group projection input",
+            expected: 1,
+            got: 2,
+        });
+    }
+    let in_dim = weights[0].in_dim;
+    for slots in members.chunks(MXFP8_GROUP_SLOTS) {
+        let mut done = 0;
+        while done < rows {
+            let take = (rows - done).min(MXFP8_STEP_ROWS);
+            let src_bytes = u64::from(done) * u64::from(in_dim) * 4;
+            let total: u32 = slots.iter().map(|(w, _)| w.out_dim).sum();
+            let (entry, per_block) = mxfp8_group_entry(take, total);
+            let blocks: u32 = slots
+                .iter()
+                .map(|(w, _)| w.out_dim.div_ceil(per_block))
+                .sum();
+            let mut ops = Vec::with_capacity(4 * MXFP8_GROUP_SLOTS + 3);
+            for slot in 0..MXFP8_GROUP_SLOTS {
+                if let Some(&(weight, bound)) = slots.get(slot) {
+                    let dst_bytes = u64::from(done) * u64::from(weight.out_dim) * 4;
+                    let b = bound.advanced(src_bytes, dst_bytes);
+                    ops.extend([
+                        b.dst,
+                        Operand::Weight(b.weight),
+                        Operand::Weight(part(b.weight, WeightPart::GroupScales)),
+                        Operand::U32(weight.out_dim),
+                    ]);
+                } else {
+                    ops.extend([Operand::Null, Operand::Null, Operand::Null, Operand::U32(0)]);
+                }
+            }
+            ops.extend([
+                members[0].1.src.advanced(src_bytes),
+                Operand::U32(in_dim),
+                Operand::U32(take),
+            ]);
+            out.launch(
+                Entry::plain(MOD_MXFP8, entry),
+                Launch::linear(blocks, MXFP8_THREADS),
+                Args::of(&ops),
+            );
+            done += take;
+        }
+    }
+    Ok(())
 }
 
 /// Plans one half-precision projection on the BLAS tier whose input may
@@ -1149,6 +1688,24 @@ fn project_one(
                 Operand::U32(rows),
             ]),
         ),
+        // `out, w, x, in_dim, out_dim, splits, rows`.
+        Projection::BrainStep {
+            entry,
+            launch,
+            splits,
+        } => out.launch(
+            entry,
+            launch,
+            Args::of(&[
+                bound.dst,
+                w,
+                bound.src,
+                Operand::U32(weight.in_dim),
+                Operand::U32(weight.out_dim),
+                Operand::U32(splits),
+                Operand::U32(rows),
+            ]),
+        ),
         // `out, w, x, in_dim, out_dim`.
         Projection::BrainRows { entry, launch, .. } => out.launch(
             entry,
@@ -1266,6 +1823,51 @@ fn project_one(
                 w,
                 Operand::Weight(part(bound.weight, WeightPart::AffineScales)),
                 Operand::Weight(part(bound.weight, WeightPart::AffineBiases)),
+                bound.src,
+                Operand::U32(weight.in_dim),
+                Operand::U32(weight.out_dim),
+                Operand::U32(rows),
+            ]),
+        ),
+        // The quantizer `q, x, rows, k` into the half-precision tier's
+        // staging - which only that tier's rounding pass and the BLAS call
+        // right after it ever use, never across another projection, and which
+        // is sized for the widest contraction at two bytes an element, against
+        // the 33/32 of a byte this layout takes - then the GEMM
+        // `out, codes, scales, xq, in_dim, out_dim, rows`.
+        Projection::Mxfp8Lowp { quant, gemm } => {
+            out.launch(
+                Entry::plain(MOD_MXFP8_A8, "q4e_mxfp8_a8_quant_kernel"),
+                quant,
+                Args::of(&[
+                    Operand::Scratch(Buf::HalfActivation),
+                    bound.src,
+                    Operand::U32(rows),
+                    Operand::U32(weight.in_dim),
+                ]),
+            );
+            out.launch(
+                Entry::plain(MOD_MXFP8_A8, "q4e_mxfp8_a8_gemm_kernel"),
+                gemm,
+                Args::of(&[
+                    bound.dst,
+                    w,
+                    Operand::Weight(part(bound.weight, WeightPart::GroupScales)),
+                    Operand::Scratch(Buf::HalfActivation),
+                    Operand::U32(weight.in_dim),
+                    Operand::U32(weight.out_dim),
+                    Operand::U32(rows),
+                ]),
+            );
+        }
+        // `out, codes, scales, x, in_dim, out_dim, rows`
+        Projection::Mxfp8 { entry, launch } => out.launch(
+            entry,
+            launch,
+            Args::of(&[
+                bound.dst,
+                w,
+                Operand::Weight(part(bound.weight, WeightPart::GroupScales)),
                 bound.src,
                 Operand::U32(weight.in_dim),
                 Operand::U32(weight.out_dim),
@@ -1475,6 +2077,11 @@ pub fn project_pair(
     rows: u32,
     device: Device,
 ) -> CoreResult<()> {
+    // An MXFP8 pair is one group launch on a step or verify pass: the same
+    // sums as the two launches, at one reading of the input.
+    if groups(&[gate, up], device) {
+        return project_group(out, &[(gate, gate_bound), (up, up_bound)], rows, device);
+    }
     // Narrow enough for the decode-shaped launch, the pair is two of those, at
     // every row count that launch covers, so that a row is summed one way
     // below the bound whatever else shares its pass. Serially the two cost a
@@ -1565,6 +2172,9 @@ mod tests {
         half_block_input: false,
         role: PassRole::Step,
         prompt_matmul: PromptMatmul::Rows,
+        prefill_activations: PrefillActivations::A16,
+        route_sort: RouteSort::Tiny,
+        normed: NormedStreams::Stored,
     };
 
     #[test]
@@ -1726,6 +2336,115 @@ mod tests {
     }
 
     #[test]
+    fn a_tensor_core_device_takes_the_brain_float_gemm_on_a_prompt_pass() {
+        let prompt = Device {
+            prompt_matmul: PromptMatmul::Tensor,
+            role: PassRole::Prompt { snapshot: None },
+            ..GPU
+        };
+        // The stream mixes and the n-gram projections round their activations;
+        // the router and the shared router, narrow over the residual width,
+        // carry them as two brain floats. The choice reads the shape only, so
+        // every width of a prompt takes the same kernel.
+        for (out_dim, in_dim, want, smem) in [
+            (320, 10_240, "q4e_bf16_gemm_kernel", BF16_GEMM_SMEM),
+            (10_240, 320, "q4e_bf16_gemm_kernel", BF16_GEMM_SMEM),
+            (4, 10_240, "q4e_bf16_gemm_kernel", BF16_GEMM_SMEM),
+            (248_320, 2_560, "q4e_bf16_gemm_kernel", BF16_GEMM_SMEM),
+            (
+                512,
+                2_560,
+                "q4e_bf16_gemm_split_kernel",
+                BF16_GEMM_SPLIT_SMEM,
+            ),
+            (1, 2_560, "q4e_bf16_gemm_split_kernel", BF16_GEMM_SPLIT_SMEM),
+        ] {
+            for rows in [1, 7, 2048] {
+                let plan = brain(in_dim, out_dim, rows, prompt).expect("the device has it");
+                let Projection::BrainGemm { entry, launch } = plan else {
+                    panic!("{plan:?}");
+                };
+                assert_eq!(entry.name(), want, "[{out_dim} x {in_dim}] at {rows}");
+                assert_eq!(entry.module(), MOD_BF16);
+                assert_eq!(launch.grid.x, out_dim.div_ceil(BF16_GEMM_TILE));
+                assert_eq!(launch.grid.y, rows.div_ceil(BF16_GEMM_TILE));
+                assert_eq!(launch.smem, smem);
+            }
+        }
+        const { assert!(BF16_GEMM_SMEM <= 101_376 && BF16_GEMM_SPLIT_SMEM <= 101_376) };
+    }
+
+    #[test]
+    fn a_tensor_core_device_steps_brain_floats_on_the_split_kernels() {
+        let step = Device {
+            prompt_matmul: PromptMatmul::Tensor,
+            ..GPU
+        };
+        for (rows, want, per_warp) in [
+            (1, "q4e_bf16_gemv_kernel", 1),
+            (2, "q4e_bf16_rows_kernel", 2),
+            (8, "q4e_bf16_rows_kernel", 2),
+            (9, "q4e_bf16_rows_wide_kernel", 2),
+            (BF16_STEP_ROWS, "q4e_bf16_rows_wide_kernel", 2),
+        ] {
+            // The stream mix down: narrow, so each row is sliced eight ways.
+            let plan = brain(10_240, 320, rows, step).expect("a step pass");
+            let Projection::BrainStep {
+                entry,
+                launch,
+                splits,
+            } = plan
+            else {
+                panic!("{plan:?}");
+            };
+            assert_eq!(entry.name(), want);
+            assert_eq!(splits, 8);
+            assert_eq!(launch.grid.x, 320 / per_warp);
+            assert_eq!(launch.block.x, BF16_STEP_THREADS);
+            // The output head: wide, so one warp a row.
+            let plan = brain(2_560, 248_320, rows, step).expect("a step pass");
+            let Projection::BrainStep { launch, splits, .. } = plan else {
+                panic!("{plan:?}");
+            };
+            assert_eq!(splits, 1);
+            assert_eq!(launch.grid.x, 248_320 / (8 * per_warp));
+        }
+        // The split is the shape's alone.
+        assert_eq!(bf16_split(2_560, 512), 4);
+        assert_eq!(bf16_split(10_240, 4), 8);
+        assert_eq!(bf16_split(320, 10_240), 1);
+        assert_eq!(bf16_split(2_560, 2_560), 1);
+        let err = brain(2_560, 512, BF16_STEP_ROWS + 1, step).expect_err("one launch at most");
+        assert!(matches!(err, CoreError::Unsupported { .. }), "{err:?}");
+        // A batched verify wider than one launch: passes of the widest one.
+        let weight = WeightRef::layer(
+            crate::sparse::bind::LayerRef::target(0),
+            crate::sparse::bind::Role::AttnQuery,
+        );
+        let bound = Bound::new(
+            weight,
+            Operand::Scratch(Buf::Residual),
+            Operand::Scratch(Buf::Embed),
+        );
+        let mut out = Plan::new();
+        project(
+            &mut out,
+            WeightDesc::new(DType::BF16, 2_560, 12_288),
+            bound,
+            BF16_STEP_ROWS + 5,
+            step,
+        )
+        .expect("a wide verify runs in passes");
+        let names: Vec<_> = out
+            .steps()
+            .iter()
+            .filter_map(Step::entry)
+            .map(|e| e.name())
+            .collect();
+        assert_eq!(names, ["q4e_bf16_rows_wide_kernel", "q4e_bf16_rows_kernel"]);
+    }
+
+    #[test]
     fn a_trellis_projection_streams_at_decode_and_is_expanded_at_prefill() {
         let decode = plan(DType::Exl3K4, 2_560, 2_560, 1, GPU).expect("a decode row");
         assert!(
@@ -1788,6 +2507,166 @@ mod tests {
         assert!(narrow_quant_rows_wanted(512, 80));
         assert!(!narrow_quant_rows_wanted(2_560, 80));
         assert!(!narrow_quant_rows_wanted(512, 16));
+    }
+
+    #[test]
+    fn an_mxfp8_step_takes_the_row_kernels_and_a_prompt_the_tensor_core_kernel() {
+        let one = plan(DType::Mxfp8E4M3G32, 2_560, 10_240, 1, GPU).expect("a decode row");
+        let Projection::Mxfp8 { entry, launch } = one else {
+            panic!("{one:?}");
+        };
+        assert_eq!(entry.name(), "q4e_mxfp8_gemv_kernel");
+        assert_eq!(entry.module(), MOD_MXFP8);
+        assert_eq!(launch.grid.x, 10_240 / MXFP8_GEMV_ROWS_PER_BLOCK);
+        assert_eq!(launch.block.x, MXFP8_THREADS);
+        // A narrow output keeps one row a warp.
+        let narrow = plan(DType::Mxfp8E4M3G32, 2_560, 512, 1, GPU).expect("a decode row");
+        let Projection::Mxfp8 { entry, launch } = narrow else {
+            panic!("{narrow:?}");
+        };
+        assert_eq!(entry.name(), "q4e_mxfp8_gemv_narrow_kernel");
+        assert_eq!(launch.grid.x, 512 / MXFP8_ROWS_PER_BLOCK);
+        for rows in 2..=MXFP8_STEP_ROWS {
+            let many = plan(DType::Mxfp8E4M3G32, 6_144, 2_560, rows, GPU).expect("a verify pass");
+            let Projection::Mxfp8 { entry, launch } = many else {
+                panic!("{many:?}");
+            };
+            assert_eq!(entry.name(), "q4e_mxfp8_rows_kernel");
+            // The grid is the output's alone, whatever the row count.
+            assert_eq!(launch.grid.x, 2_560 / MXFP8_VERIFY_ROWS_PER_BLOCK);
+            assert_eq!(launch.grid.y, 1);
+            let narrow = plan(DType::Mxfp8E4M3G32, 2_560, 48, rows, GPU).expect("a verify pass");
+            let Projection::Mxfp8 { entry, launch } = narrow else {
+                panic!("{narrow:?}");
+            };
+            assert_eq!(entry.name(), "q4e_mxfp8_rows_narrow_kernel");
+            assert_eq!(launch.grid.x, 48 / MXFP8_ROWS_PER_BLOCK);
+        }
+        let err = plan(DType::Mxfp8E4M3G32, 2_560, 512, MXFP8_STEP_ROWS + 1, GPU)
+            .expect_err("one step launch is at most the multi-row width");
+        assert!(matches!(err, CoreError::Unsupported { .. }), "{err:?}");
+        // A prompt pass takes the tensor-core kernel at every width, one row
+        // included, so that where the prompt was cut moves no bit.
+        let prompt = Device {
+            role: PassRole::Prompt { snapshot: None },
+            ..GPU
+        };
+        for rows in [1, 7, 64, 333, 4_096] {
+            let p = plan(DType::Mxfp8E4M3G32, 2_560, 640, rows, prompt).expect("a prompt chunk");
+            let Projection::Mxfp8 { entry, launch } = p else {
+                panic!("{p:?}");
+            };
+            assert_eq!(entry.name(), "q4e_mxfp8_gemm_kernel");
+            assert_eq!(launch.grid.x, 640 / MXFP8_GEMM_TILE);
+            assert_eq!(launch.grid.y, rows.div_ceil(MXFP8_GEMM_TILE));
+            assert_eq!(launch.block.x, MXFP8_GEMM_THREADS);
+            assert_eq!(launch.smem, MXFP8_GEMM_SMEM);
+        }
+        let err = plan(DType::Mxfp8E4M3G32, 2_570, 640, 1, GPU)
+            .expect_err("a contraction that is not whole groups");
+        assert!(matches!(err, CoreError::ShapeMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn low_precision_activations_take_the_block_scaled_kernel_on_prompt_rows_only() {
+        let lowp = Device {
+            prefill_activations: PrefillActivations::Lowp,
+            ..GPU
+        };
+        let prompt = Device {
+            role: PassRole::Prompt { snapshot: None },
+            ..lowp
+        };
+        // Every prompt width takes the W8A8 kernel: the choice reads the
+        // weight's shape, never the row count.
+        for rows in [1, 7, 333, 4_096] {
+            let p = plan(DType::Mxfp8E4M3G32, 2_560, 12_288, rows, prompt).expect("a prompt chunk");
+            let Projection::Mxfp8Lowp { quant, gemm } = p else {
+                panic!("{p:?}");
+            };
+            assert_eq!(gemm.grid.x, 12_288 / MXFP8_A8_TILE);
+            assert_eq!(gemm.grid.y, rows.div_ceil(MXFP8_A8_TILE));
+            assert_eq!((gemm.block.x, gemm.smem), (MXFP8_A8_THREADS, MXFP8_A8_SMEM));
+            assert_eq!(
+                u64::from(quant.grid.x) * u64::from(quant.block.x) * 4,
+                (u64::from(rows) * 2_560).next_multiple_of(4 * u64::from(MXFP8_A8_QUANT_THREADS)),
+                "four values a thread over every activation"
+            );
+        }
+        // A step or a verify keeps the weight-only kernels under the option.
+        for rows in [1, 5] {
+            let p = plan(DType::Mxfp8E4M3G32, 2_560, 12_288, rows, lowp).expect("a step");
+            assert!(matches!(p, Projection::Mxfp8 { .. }), "{p:?}");
+        }
+        // A contraction the W8A8 kernel cannot stride keeps the weight-only
+        // prompt kernel, at every width.
+        let p = plan(DType::Mxfp8E4M3G32, 2_592, 640, 333, prompt).expect("a prompt chunk");
+        let Projection::Mxfp8 { entry, .. } = p else {
+            panic!("{p:?}");
+        };
+        assert_eq!(entry.name(), "q4e_mxfp8_gemm_kernel");
+        // And the projection is two launches: the quantizer, then the GEMM,
+        // through the half-precision staging.
+        let weight = WeightRef::layer(
+            crate::sparse::bind::LayerRef::target(0),
+            crate::sparse::bind::Role::AttnQuery,
+        );
+        let bound = Bound::new(
+            weight,
+            Operand::Scratch(Buf::Residual),
+            Operand::Scratch(Buf::Embed),
+        );
+        let mut out = Plan::new();
+        project(
+            &mut out,
+            WeightDesc::new(DType::Mxfp8E4M3G32, 2_560, 12_288),
+            bound,
+            333,
+            prompt,
+        )
+        .expect("a prompt chunk");
+        let names: Vec<_> = out
+            .steps()
+            .iter()
+            .filter_map(Step::entry)
+            .map(|e| e.name())
+            .collect();
+        assert_eq!(
+            names,
+            ["q4e_mxfp8_a8_quant_kernel", "q4e_mxfp8_a8_gemm_kernel"]
+        );
+    }
+
+    #[test]
+    fn a_wide_mxfp8_verify_runs_in_passes_and_a_prompt_in_one_launch() {
+        let weight = WeightRef::layer(
+            crate::sparse::bind::LayerRef::target(0),
+            crate::sparse::bind::Role::AttnQuery,
+        );
+        let bound = Bound::new(
+            weight,
+            Operand::Scratch(Buf::Residual),
+            Operand::Scratch(Buf::Embed),
+        );
+        let desc = WeightDesc::new(DType::Mxfp8E4M3G32, 2_560, 12_288);
+        // Twenty rows: two full passes and a four-row tail.
+        let mut out = Plan::new();
+        project(&mut out, desc, bound, 20, GPU).expect("a batched verify");
+        assert_eq!(out.len(), 3);
+        let names: Vec<_> = out
+            .steps()
+            .iter()
+            .filter_map(Step::entry)
+            .map(|e| e.name())
+            .collect();
+        assert_eq!(names, ["q4e_mxfp8_rows_kernel"; 3]);
+        let mut out = Plan::new();
+        let prompt = Device {
+            role: PassRole::Prompt { snapshot: None },
+            ..GPU
+        };
+        project(&mut out, desc, bound, 333, prompt).expect("a prompt chunk");
+        assert_eq!(out.len(), 1);
     }
 
     #[test]

@@ -61,6 +61,7 @@ pub mod pack12;
 pub mod paged;
 pub mod passes;
 pub mod plan;
+mod plancache;
 pub mod ple;
 pub mod qsa;
 pub mod recurrent;

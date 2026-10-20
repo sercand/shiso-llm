@@ -40,14 +40,15 @@ fn a_session_owns_its_recurrent_stack_and_its_n_gram_window_and_closing_it_hands
     let owned = fake.allocated_since(mark);
 
     // A convolution window and a state matrix per recurrent slot, the n-gram
-    // block's own dilated window, and one page table. Nothing else is per
-    // session: the key/value rows and the indexer's two planes belong to the
-    // shared pool, which is why opening a session is kilobytes rather than a
-    // cache.
+    // block's own dilated window, the raw indexer key ring, and one page
+    // table. Nothing else is per session: the key/value rows and the indexer's
+    // pooled plane belong to the shared pool, which is why opening a session
+    // is kilobytes rather than a cache.
     assert_eq!(
         owned.len(),
-        2 * RECURRENT_SLOTS + 2,
-        "a session allocates two buffers per recurrent slot, an n-gram window and a page table"
+        2 * RECURRENT_SLOTS + 3,
+        "a session allocates two buffers per recurrent slot, an n-gram window, a raw key ring \
+         and a page table"
     );
     assert!(
         owned.iter().all(|id| fake.is_live(*id)),
@@ -72,16 +73,16 @@ fn a_session_owns_its_recurrent_stack_and_its_n_gram_window_and_closing_it_hands
 }
 
 #[test]
-fn the_cache_pool_allocates_four_planes_for_every_attention_slot() {
+fn the_cache_pool_allocates_three_planes_for_every_attention_slot() {
     let (_dir, fake, model) = loaded();
-    // Keys, values, the indexer's raw key rows and its pooled key rows. All
-    // four have to be present for a span to be reusable, because a block that
-    // resumed on a span without its pooled keys would select blocks from rows
-    // another session wrote.
+    // Keys, values and the indexer's pooled key rows; the raw keys are each
+    // session's ring, not the pool's. All three have to be present for a span
+    // to be reusable, because a block that resumed on a span without its
+    // pooled keys would select blocks from rows another session wrote.
     let live = fake.live_count();
     assert!(
-        live >= 4 * ATTN_SLOTS,
-        "{live} live allocations is fewer than the four planes of {ATTN_SLOTS} attention slots"
+        live >= 3 * ATTN_SLOTS,
+        "{live} live allocations is fewer than the three planes of {ATTN_SLOTS} attention slots"
     );
     drop(model);
 }
@@ -303,4 +304,120 @@ fn a_prompt_wider_than_one_pass_is_split_and_the_session_stands_on_all_of_it() {
         wide
     );
     assert!(fake.launch_count() > 0);
+}
+
+/// One launch as a comparable value: everything the device was handed.
+type Launch = (
+    &'static str,
+    &'static str,
+    shiso_core::Extent3,
+    shiso_core::Extent3,
+    u32,
+    Vec<fixture::Arg>,
+    bool,
+);
+
+fn launches(fake: &fixture::FakeBackend) -> Vec<Launch> {
+    fake.launches()
+        .into_iter()
+        .map(|launch| {
+            (
+                launch.module,
+                launch.entry,
+                launch.grid,
+                launch.block,
+                launch.smem,
+                launch.args,
+                launch.cooperative,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_step_issued_from_a_kept_plan_issues_exactly_what_a_fresh_plan_would() {
+    // A decode step's plan is kept and handed back while the facts it was
+    // planned from hold. Two identical models decode the same tokens, one
+    // reusing its kept plans and one dropping them before every step; the
+    // device must be handed the same launches, the same operands and the same
+    // uploads either way - across the step where the indexer's selection goes
+    // live, which is the one fact a kept step plan changes on.
+    let prompt = tokens(1, 60);
+    let (_dir_kept, fake_kept, mut kept) = loaded();
+    let (_dir_fresh, fake_fresh, mut fresh) = loaded();
+    let session = kept.open_session().expect("a session opens");
+    assert_eq!(fresh.open_session().expect("a session opens"), session);
+    kept.prefill_chunk(session, &prompt)
+        .expect("the prompt reads");
+    fresh
+        .prefill_chunk(session, &prompt)
+        .expect("the prompt reads");
+    let before = kept
+        .stack()
+        .plan_chunk(session, &tokens(5, 1), 1)
+        .expect("a step plans")
+        .selected;
+    for i in 0..16 {
+        let step = DecodeStep {
+            session,
+            token: TokenId::new((10 + 3 * i) % VOCAB),
+        };
+        kept.decode_batch(&[step]).expect("a kept step runs");
+        fresh.stack_mut().drop_kept_plans();
+        fresh.decode_batch(&[step]).expect("a fresh step runs");
+    }
+    let after = kept
+        .stack()
+        .plan_chunk(session, &tokens(5, 1), 1)
+        .expect("a step plans")
+        .selected;
+    assert!(
+        !before && after,
+        "the steps were meant to cross into the selection: {before} then {after}"
+    );
+    assert_eq!(launches(&fake_kept), launches(&fake_fresh));
+    assert_eq!(fake_kept.uploads(), fake_fresh.uploads());
+}
+
+#[test]
+fn a_decode_step_hands_out_every_rows_greedy_pick_launched_behind_its_logits() {
+    // The pick is what a greedy sequence reads instead of its row, so it has
+    // to be the argmax of the block the step hands out - launched after the
+    // pass and its suppression, over every row, into the view the block names.
+    let (_dir, fake, mut model) = loaded();
+    let sessions = (0..2)
+        .map(|_| model.open_session().expect("a session opens"))
+        .collect::<Vec<_>>();
+    for session in &sessions {
+        model
+            .prefill_chunk(*session, &tokens(3, 4))
+            .expect("a prompt reads");
+    }
+    for rows in [1_usize, 2] {
+        let steps = sessions[..rows]
+            .iter()
+            .map(|session| DecodeStep {
+                session: *session,
+                token: TokenId::new(7),
+            })
+            .collect::<Vec<_>>();
+        let logits = model.decode_batch(&steps).expect("a decode step runs");
+        let picks = logits.picks().expect("a decode step hands out its picks");
+        assert_eq!(picks.len(), 4 * rows as u64);
+        let block = logits.view();
+        let last = fake.launches().pop().expect("the step launched something");
+        assert_eq!(last.entry, "q4e_argmax_rows_kernel", "{rows} rows");
+        assert_eq!(last.grid.x, u32::try_from(rows).expect("small"));
+        assert!(
+            matches!(last.args[0], fixture::Arg::Buffer(id, 0, _) if id == picks.id().get()),
+            "the picks went somewhere other than the view the block names: {:?}",
+            last.args[0]
+        );
+        assert!(
+            matches!(last.args[1], fixture::Arg::Buffer(id, 0, _) if id == block.id().get()),
+            "the picks were taken over something other than the logits: {:?}",
+            last.args[1]
+        );
+        assert_eq!(last.args[2], fixture::Arg::U32(VOCAB));
+    }
 }

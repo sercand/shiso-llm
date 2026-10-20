@@ -98,6 +98,7 @@ fn apply_recipe_defaults_precedence() {
         capture_batch: Some(true),
         gpu_memory_utilization: Some(0.88),
         solo_prefill_chunk: Some(4096),
+        kv_cache_dtype: Some(shiso_hub::recipe::KvCacheDtype::Fp8),
     };
 
     apply_recipe_defaults(&mut args, Some(serve_matches), &defaults);
@@ -118,6 +119,7 @@ fn apply_recipe_defaults_precedence() {
     assert!(args.capture_verify);
     assert!(args.capture_batch);
     assert_eq!(args.gpu_memory_utilization, Some(0.88));
+    assert_eq!(args.kv_cache_dtype, shiso_server::cli::KvCacheDtype::Fp8);
     assert_eq!(args.solo_prefill_chunk, 4096);
 
     // 2. Explicit CLI flag: wins over recipe default

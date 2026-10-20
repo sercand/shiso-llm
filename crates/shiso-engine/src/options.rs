@@ -24,7 +24,7 @@
 //! size that was allocated.
 
 use shiso_core::error::{CoreError, CoreResult};
-use shiso_core::page::{PAGE_TOKENS, pages_for};
+use shiso_core::page::{KvElem, PAGE_TOKENS, pages_for};
 use shiso_core::{Backend, MemoryInfo};
 
 use crate::mtp::SpecDepth;
@@ -71,6 +71,13 @@ pub struct EngineOptions {
     ///
     /// `None`, the default, trusts the count.
     pub kv_check: Option<KvCheck>,
+    /// The element the cache stores attention keys and values as.
+    ///
+    /// [`KvElem::F16`], the default, is the only one every stack supports. A
+    /// stack that cannot store another refuses it when it is built rather than
+    /// storing f16 under a different name: the pool it sized and the pages it
+    /// files on disk would both be the wrong size.
+    pub kv_elem: KvElem,
 }
 
 impl EngineOptions {
@@ -88,6 +95,7 @@ impl EngineOptions {
             spec: SpecDepth::NONE,
             kv_fit: None,
             kv_check: None,
+            kv_elem: KvElem::F16,
         }
     }
 

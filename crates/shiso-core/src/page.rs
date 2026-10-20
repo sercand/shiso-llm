@@ -67,3 +67,61 @@ pub fn kv_row(pages: &[u32], p: u32) -> Option<u32> {
 pub const fn pages_for(positions: u32) -> u32 {
     positions.div_ceil(PAGE_TOKENS)
 }
+
+/// The element a paged cache stores its attention keys and values as.
+///
+/// Family-neutral on purpose: it names a storage codec, not a model. Which
+/// planes of a page take it is the stack's business - a stack that keeps a
+/// plane at full width (an indexer's keys, say) keeps it there whatever this
+/// says - and which kernels honour it is the backend's.
+///
+/// Two caches built at different elements hold different bytes for the same
+/// tokens, so anything that persists a page has to carry this in its identity
+/// ([`KvElem::codec`]) or it will read one build's pages as the other's.
+///
+/// Deliberately NOT `#[non_exhaustive]`: every stack and kernel table matches
+/// on it, and a new element has to be a compile error in each of them rather
+/// than a wildcard arm that quietly treats it as f16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum KvElem {
+    /// IEEE half precision, two bytes an element. Every stack's default.
+    #[default]
+    F16,
+    /// FP8 E4M3 at a static scale of one, one byte an element.
+    ///
+    /// The store rounds to nearest even and saturates at +-448 rather than
+    /// writing the not-a-number code; a reader recovers the stored value
+    /// exactly. Values below 2^-10 in magnitude are stored as zero.
+    Fp8E4m3,
+}
+
+impl KvElem {
+    /// Bytes one stored element occupies.
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        match self {
+            Self::F16 => 2,
+            Self::Fp8E4m3 => 1,
+        }
+    }
+
+    /// A short name for the codec, stable across releases because a disk tier
+    /// files pages under it: `f16`, or `e4m3s1` (E4M3, static scale 1).
+    ///
+    /// The scale law is part of the name because it is part of the bytes: a
+    /// future per-row-scaled E4M3 cache stores the same width and must not
+    /// read these pages.
+    #[must_use]
+    pub const fn codec(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Fp8E4m3 => "e4m3s1",
+        }
+    }
+}
+
+impl std::fmt::Display for KvElem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.codec())
+    }
+}

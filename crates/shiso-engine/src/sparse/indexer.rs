@@ -2,18 +2,29 @@
 //! attention block actually reads.
 //!
 //! It is a second, much smaller attention problem run in front of the real one.
-//! Every position stores one key row of its own; every block of
+//! Every position projects one raw key row; every block of
 //! [`IndexerShape::compress`] consecutive positions is mean-pooled into one
 //! pooled row; and when the context has outgrown the selection budget, the
 //! block's queries are scored against those pooled rows, the best blocks are
 //! kept, and the kept blocks are expanded into the position list the attention
 //! kernel then gathers.
 //!
+//! # A raw key lives until its block is pooled, and no longer
+//!
+//! The pooled pass is the only reader of a raw key. So the page keeps only the
+//! pooled plane, and the raw keys a later pass still needs - those of the
+//! block a session's frontier stands inside - sit in the session's own ring
+//! ([`crate::sparse::paged::ring_bytes`]). The pass reads the raw keys of its
+//! own positions straight from its key projection, rounded as a cache store
+//! would round them, and only the block it starts inside reaches back into the
+//! ring; one launch pools, then refills the ring with the pass's last rows.
+//!
 //! # The storing half runs on every pass and the selecting half does not
 //!
-//! Keeping the raw and pooled planes current is not optional: a forward pass
-//! that skipped it would leave a hole in the table for the positions it wrote,
-//! and a later pass would select blocks whose rows were never filled in. The
+//! Keeping the pooled plane and the ring current is not optional: a forward
+//! pass that skipped it would leave a hole in the table for the positions it
+//! wrote, and a later pass would select blocks whose rows were never filled
+//! in. The
 //! *selection* is optional, and below the budget it is not merely optional but
 //! wrong to take: the selection there would be every visible token, and the
 //! dense kernel covers that exactly and faster.
@@ -24,14 +35,14 @@ use shiso_core::error::CoreResult;
 
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef};
 use crate::sparse::inputs::{MROPE_PREFIX_BYTES, batch_lookback_offset};
-use crate::sparse::kernels::{self, Entry, I32_BYTES, MOD_IDX};
+use crate::sparse::kernels::{self, Entry, I32_BYTES, IDX_NO_TAP, MOD_IDX, MOD_IDXRING};
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::paged::Plane;
 use crate::sparse::plan::Plan;
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
-use crate::sparse::weights::IndexerDesc;
+use crate::sparse::weights::{IndexerDesc, WeightDesc};
 
 /// Which of the two scorers a head count reaches.
 ///
@@ -66,36 +77,70 @@ impl Scorer {
 /// Three numbers that always travel together and that nothing else can supply:
 /// two name the weights and the cache planes, and the third is a fact about the
 /// run rather than about the model, which is why it cannot be read off the
-/// shape.
+/// shape. The fourth is optional and rare: a copy of the raw key ring into a
+/// checkpoint, which only the pass a snapshot is cut inside asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IndexerSlot {
     /// The layer, which names the weights.
     pub layer: LayerRef,
-    /// The slot's rank among attention slots, which names the cache planes.
+    /// The slot's rank among attention slots, which names the cache planes and
+    /// the session's raw key ring.
     pub rank: u32,
     /// Positions this run's context reaches, which is what the score buffer is
     /// strided by. See [`crate::sparse::shape::IndexerShape::score_blocks`].
     pub ctx: u32,
+    /// The ring copy this pass makes into the snapshot buffer, if any.
+    pub tap: Option<RingTap>,
 }
 
 impl IndexerSlot {
     /// One indexer's identity.
     #[must_use]
     pub const fn new(layer: LayerRef, rank: u32, ctx: u32) -> Self {
-        Self { layer, rank, ctx }
+        Self {
+            layer,
+            rank,
+            ctx,
+            tap: None,
+        }
+    }
+
+    /// The same indexer, also copying its ring into a checkpoint as it stands
+    /// before one row of the pass.
+    #[must_use]
+    pub const fn with_tap(mut self, tap: Option<RingTap>) -> Self {
+        self.tap = tap;
+        self
     }
 }
 
-/// The storing half: keep this pass's raw and pooled key rows current.
+/// A copy of one rank's raw key ring into the stack's snapshot buffer, as the
+/// ring stands before row `row` of a one-session pass: the raw keys of the
+/// block holding that row's position, from its first position up to it.
 ///
-/// Both launches address the cache through a page table, which is what makes
-/// them the part of an attention block that cannot be shared between two
-/// sessions. The raw store has a batched sibling and takes the per-row array;
-/// the pooled pass has none and is launched per row. Neither is optional: a
-/// pass that skipped either would leave a hole in the table for the positions
-/// it wrote, and a later pass would select blocks whose rows were never filled
-/// in.
+/// It exists for one pass: the draft head's warm-up over a prompt chunk that a
+/// grid checkpoint is cut inside. That checkpoint stands where the head has
+/// written up to the position before the cut, and the warm-up writes on past
+/// it, so the only moment those raw keys exist is inside this launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RingTap {
+    /// The pass row the copy is taken before.
+    pub row: u32,
+    /// Where this rank's ring section starts in the snapshot buffer.
+    pub offset: u64,
+}
+
+/// The storing half: keep this pass's pooled key rows and the session's raw key
+/// ring current.
+///
+/// The key projection, then the pooled pass over it: once for a chunk, once
+/// per run of a segmented pass, once per row of a batch. Its launch addresses
+/// the cache through a page table and the ring through a session, which is what
+/// makes it the part of an attention block that cannot be shared between two
+/// sessions. Neither half is optional: a pass that skipped it would leave a
+/// hole in the table for the positions it wrote, and a later pass would select
+/// blocks whose rows were never filled in.
 ///
 /// # Errors
 ///
@@ -108,96 +153,61 @@ pub fn store(
     n_tok: u32,
     device: Device,
 ) -> CoreResult<Plan> {
-    let IndexerSlot { layer, rank, .. } = slot;
-    let batched = origin == RowOrigin::Unrelated;
     let mut plan = Plan::new();
-    matmul::project(
-        &mut plan,
-        desc.k,
-        Bound::new(
-            WeightRef::layer(layer, Role::IndexerKey),
-            Operand::Scratch(Buf::Mixed),
-            Operand::Scratch(Buf::IdxKey),
-        ),
-        n_tok,
-        device,
-    )?;
-    // The raw store has a batched sibling: it is a plain move, one block per
-    // row, and the only thing a row needs of its own is the page table it
-    // translates its position through.
-    if let RowOrigin::Segmented(runs) = origin {
-        // One scalar store per run, over its rows and through its own table,
-        // then its own pooled pass: a run is its own sequence's chunk.
-        for run in 0..runs.count() {
-            let first = u64::from(runs.start(run));
-            plan.launch(
-                Entry::plain(MOD_IDX, "q4e_idx_store_k_kernel"),
-                kernels::idx_store_k(runs.len(run)),
-                // `cache, k, pos, pages, n_tok`
-                Args::of(&[
-                    Operand::CachePlane {
-                        rank,
-                        plane: Plane::IndexerKey,
-                    },
-                    Operand::ScratchFrom(
-                        Buf::IdxKey,
-                        first * u64::from(shape.indexer.head_dim) * 4,
-                    ),
-                    Operand::ScratchFrom(Buf::Positions, first * I32_BYTES),
-                    Operand::PagesOf(run),
-                    Operand::U32(runs.len(run)),
-                ]),
-            );
-        }
-        plan.append(pool(shape, layer, rank, &origin, n_tok));
-        return Ok(plan);
-    }
-    let (store_entry, store_launch, store_pages) = if batched {
-        (
-            "q4e_idx_store_k_batch_kernel",
-            kernels::idx_store_k_batch(n_tok),
-            Operand::PageTables,
-        )
-    } else {
-        (
-            "q4e_idx_store_k_kernel",
-            kernels::idx_store_k(n_tok),
-            Operand::Pages,
-        )
-    };
-    plan.launch(
-        Entry::plain(MOD_IDX, store_entry),
-        store_launch,
-        // `cache, k, pos, pages, n_tok`
-        Args::of(&[
-            Operand::CachePlane {
-                rank,
-                plane: Plane::IndexerKey,
-            },
-            Operand::Scratch(Buf::IdxKey),
-            Operand::Scratch(Buf::Positions),
-            store_pages,
-            Operand::U32(n_tok),
-        ]),
-    );
-    plan.append(pool(shape, layer, rank, &origin, n_tok));
+    let (weight, bound) = key_projection(desc, slot);
+    matmul::project(&mut plan, weight, bound, n_tok, device)?;
+    plan.append(store_projected(shape, slot, origin, n_tok));
     Ok(plan)
 }
 
-/// The pooled key pass, once for a chunk and once per row for a batch.
+/// The key projection [`store`] opens with: the block input into
+/// [`Buf::IdxKey`]. Its own function so that an attention block that projects
+/// its input once for several weights can take this one along.
+#[must_use]
+pub fn key_projection(desc: &IndexerDesc, slot: IndexerSlot) -> (WeightDesc, Bound) {
+    (
+        desc.k,
+        Bound::new(
+            WeightRef::layer(slot.layer, Role::IndexerKey),
+            Operand::Scratch(Buf::Mixed),
+            Operand::Scratch(Buf::IdxKey),
+        ),
+    )
+}
+
+/// [`store`] after its key projection: [`Buf::IdxKey`] already holds this
+/// pass's key rows.
+#[must_use]
+pub fn store_projected(
+    shape: &SparseShape,
+    slot: IndexerSlot,
+    origin: RowOrigin,
+    n_tok: u32,
+) -> Plan {
+    pool(shape, slot, &origin, n_tok)
+}
+
+/// The pooled key pass, once for a chunk, once per run and once per row of a
+/// batch.
 ///
 /// It has no batched sibling and could not have one without a different kernel:
 /// its grid and its block range are derived from the first and the last position
 /// of the launch - `pos[0] / r` to `(pos[n_tok - 1] + 1) / r` - which for rows
 /// that belong to different sequences is not a range at all. So a batch launches
-/// it per row, each over one position, one page table and one lookback group.
+/// it per row, each over one position, one page table, one ring and one
+/// lookback group.
 ///
 /// One block per launch at one row, on a kernel whose body is an average, a norm
 /// and a rotation over a hundred and twenty-eight values: the launches cost more
 /// than the work, which is exactly the trade the other five batched kernels were
 /// written to avoid and exactly the one that does not matter here, because it is
-/// one launch per row per attention slot rather than one per row per layer.
-fn pool(shape: &SparseShape, layer: LayerRef, rank: u32, origin: &RowOrigin, n_tok: u32) -> Plan {
+/// one launch per row per attention slot rather than one per row per layer. It
+/// is also the only launch of the storing half: the raw keys no longer have a
+/// store of their own.
+fn pool(shape: &SparseShape, slot: IndexerSlot, origin: &RowOrigin, n_tok: u32) -> Plan {
+    let IndexerSlot {
+        layer, rank, tap, ..
+    } = slot;
     let mut plan = Plan::new();
     let batched = *origin == RowOrigin::Unrelated;
     let segments = match origin {
@@ -209,20 +219,25 @@ fn pool(shape: &SparseShape, layer: LayerRef, rank: u32, origin: &RowOrigin, n_t
         None if batched => n_tok,
         None => 1,
     };
+    let key_row = u64::from(shape.indexer.head_dim) * 4;
     for row in 0..rows {
         // A chunk's launch covers every row and reads the table whole, from the
         // prefix the writer put in front of the chunk's first position. A
         // batched row's covers one position and reads its own group, and a
-        // segmented run's covers its own rows from its own group.
-        let (pos, pages, table, covered) = if let Some(runs) = segments {
+        // segmented run's covers its own rows from its own group. Each reads
+        // its own rows of the key projection and its own session's ring.
+        let (pos, pages, table, covered, keys, ring) = if let Some(runs) = segments {
+            let first = u64::from(runs.start(row));
             (
-                Operand::ScratchFrom(Buf::Positions, u64::from(runs.start(row)) * I32_BYTES),
+                Operand::ScratchFrom(Buf::Positions, first * I32_BYTES),
                 Operand::PagesOf(row),
                 Operand::ScratchFrom(
                     Buf::Mrope,
                     crate::sparse::inputs::segment_lookback_offset(runs, row),
                 ),
                 runs.len(row),
+                Operand::ScratchFrom(Buf::IdxKey, first * key_row),
+                Operand::IndexerRingOf { rank, row },
             )
         } else if batched {
             (
@@ -230,6 +245,8 @@ fn pool(shape: &SparseShape, layer: LayerRef, rank: u32, origin: &RowOrigin, n_t
                 Operand::PagesOf(row),
                 Operand::ScratchFrom(Buf::Mrope, batch_lookback_offset(n_tok, row)),
                 1,
+                Operand::ScratchFrom(Buf::IdxKey, u64::from(row) * key_row),
+                Operand::IndexerRingOf { rank, row },
             )
         } else {
             (
@@ -237,24 +254,32 @@ fn pool(shape: &SparseShape, layer: LayerRef, rank: u32, origin: &RowOrigin, n_t
                 Operand::Pages,
                 Operand::Scratch(Buf::Mrope),
                 n_tok,
+                Operand::Scratch(Buf::IdxKey),
+                Operand::IndexerRing(rank),
             )
         };
+        // A pass with no tap still hands the kernel a real buffer for the copy
+        // it will not make - its own ring - so no backend has to bind a null.
+        let (snap, snap_row) = match tap {
+            Some(tap) if segments.is_none() && !batched => {
+                (Operand::Snapshot(tap.offset), Operand::U32(tap.row))
+            }
+            _ => (ring, Operand::U32(IDX_NO_TAP)),
+        };
         plan.launch(
-            Entry::plain(MOD_IDX, "q4e_idx_pool_kernel"),
-            kernels::idx_pool(covered, shape.indexer.compress),
-            // `pooled, cache, w, pos, pages, n_tok, n_rot, rope_base, mrope_all,
-            //  sec_t, sec_h, sec_w, eps` - and this is the one launch that reads
-            // the rotary table from a lookback rather than from a row's own
-            // position.
+            Entry::plain(MOD_IDXRING, "q4e_idx_ring_pool_kernel"),
+            kernels::idx_ring_pool(covered, shape.indexer.compress),
+            // `pooled, ring, k, w, pos, pages, n_tok, n_rot, rope_base,
+            //  mrope_all, sec_t, sec_h, sec_w, eps, snap, snap_row` - and this
+            // is the one launch that reads the rotary table from a lookback
+            // rather than from a row's own position.
             Args::of(&[
                 Operand::CachePlane {
                     rank,
                     plane: Plane::IndexerPooled,
                 },
-                Operand::CachePlane {
-                    rank,
-                    plane: Plane::IndexerKey,
-                },
+                ring,
+                keys,
                 Operand::Weight(WeightRef::layer(layer, Role::IndexerKeyNorm)),
                 pos,
                 pages,
@@ -266,6 +291,8 @@ fn pool(shape: &SparseShape, layer: LayerRef, rank: u32, origin: &RowOrigin, n_t
                 Operand::U32(shape.mrope.height),
                 Operand::U32(shape.mrope.width),
                 Operand::f32(shape.rms_eps),
+                snap,
+                snap_row,
             ]),
         );
     }

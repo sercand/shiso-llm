@@ -58,6 +58,8 @@ mod q4e_gdn;
 mod q4e_hc;
 #[path = "q4e_idx.rs"]
 mod q4e_idx;
+#[path = "q4e_idxring.rs"]
+mod q4e_idxring;
 #[path = "q4e_matvec.rs"]
 mod q4e_matvec;
 #[path = "q4e_misc.rs"]

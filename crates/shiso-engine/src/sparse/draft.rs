@@ -46,8 +46,9 @@ use shiso_core::ids::{LayerIdx, SessionId, TokenId};
 use crate::sparse::bind::{LayerRef, Operand, Role, WeightRef};
 use crate::sparse::gather;
 use crate::sparse::hyper::{self, MixRoles};
+use crate::sparse::indexer::RingTap;
 use crate::sparse::island::{self, Island};
-use crate::sparse::matmul::{self, Bound, Device};
+use crate::sparse::matmul::{self, Bound, Device, NormedStreams};
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::mtp::{self, DraftSource, MAX_DRAFT, StepOutcome};
 use crate::sparse::plan::Plan;
@@ -69,11 +70,72 @@ pub const ROWS: u32 = MAX_DRAFT + 1;
 /// Whose rows a draft pass carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DraftRows {
-    /// One session's consecutive positions; the pick is the last row's.
-    Sequential,
+    /// One session's consecutive positions; the pick is the last row's. The
+    /// tap, when there is one, copies the head's raw key ring into the
+    /// snapshot buffer as it stands before one of those rows: see
+    /// [`crate::sparse::indexer::RingTap`].
+    Sequential(Option<RingTap>),
     /// One row per session, each at its own position; every row is picked.
     /// The bits say which rows' own heads have outgrown the indexer budget.
     Batch(u8),
+}
+
+/// Where a draft pass ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DraftEnd {
+    /// The whole pass, through the collapsing mix, the vocabulary head and the
+    /// argmax.
+    Pick,
+    /// The layer and no further: a pass that only fills the head's cache.
+    Fill,
+    /// A diagnostic stop: see [`DraftProbe`].
+    Probe(DraftProbe),
+}
+
+/// The stage a diagnostic draft pass stops after, leaving that stage's
+/// multi-stream rows in [`Buf::Residual`].
+///
+/// What it is for: holding the head's pass against an independent reference
+/// stage by stage. The two buffers the opening terms are written to are never
+/// reused later in the pass, so [`Buf::DraftNormed`] (the normed hidden term)
+/// and [`Buf::DraftHidden`] (its projection, per stream) can be read after any
+/// pass; the token term's projection, in [`Buf::Mixed`], only after a
+/// [`DraftProbe::LayerInput`] stop, since the collapsing mix overwrites it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftProbe {
+    /// After the two terms are added: the residual the head's layer opens on.
+    LayerInput,
+    /// After the attention half's combine, before the feed-forward half.
+    ///
+    /// The attention half writes the head's key and value rows for the probed
+    /// position, the same rows a full pass at that position writes.
+    PostAttention,
+}
+
+/// Whose answers decide what a speculative step keeps: see
+/// [`SparseStack::speculate_judged`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Judge<'a> {
+    /// The target's own greedy picks: the served step.
+    Target,
+    /// A given text: `text[i]` stands in for the target's answer at verify row
+    /// `i`, which is the token at the position after the step's frontier plus
+    /// `i`. The step commits the guesses that match it, then `text` at the
+    /// first that does not, so a session walks the text whatever its guesses.
+    Forced(&'a [TokenId]),
+}
+
+/// One speculative step as a harness inspects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecTrace {
+    /// The guesses the step verified, in order.
+    pub drafts: Vec<TokenId>,
+    /// The target's own greedy pick at every verify row: row `i` is its pick
+    /// for the position `drafts[i]` proposed, the last row the one after them.
+    /// These are the target's whatever the [`Judge`].
+    pub picks: Vec<TokenId>,
+    /// What the step returned.
+    pub outcome: Speculated,
 }
 
 /// The widths one draft pass plans from.
@@ -121,10 +183,17 @@ impl SparseStack {
         hidden: Operand,
         frontier: u32,
         n_tok: u32,
-        pick: bool,
+        end: DraftEnd,
         device: Device,
         rows: DraftRows,
     ) -> CoreResult<Plan> {
+        // The head's combines store the normed streams whatever the target
+        // pass leaves: only the target's mixes are checked for the norming
+        // reads (`SparseStack::normed_streams`).
+        let device = Device {
+            normed: NormedStreams::Stored,
+            ..device
+        };
         let head = self.desc.draft.as_ref().ok_or(CoreError::Unsupported {
             what: "a draft pass on a stack that carries no draft head",
             backend: "engine",
@@ -196,14 +265,17 @@ impl SparseStack {
             Operand::Scratch(Buf::DraftHidden),
             n_tok,
         ));
+        if end == DraftEnd::Probe(DraftProbe::LayerInput) {
+            return finish(plan);
+        }
 
         // The head's block, through the target's own layer planner. The context
         // is the one a single-row decode takes: a draft never carries unrelated
         // rows, and its attention runs dense until its own cache holds more
         // complete blocks than the indexer budget.
-        let (origin, batch_selected) = match rows {
-            DraftRows::Sequential => (RowOrigin::Sequential, 0),
-            DraftRows::Batch(bits) => (RowOrigin::Unrelated, u64::from(bits)),
+        let (origin, batch_selected, ring_tap) = match rows {
+            DraftRows::Sequential(tap) => (RowOrigin::Sequential, 0, tap),
+            DraftRows::Batch(bits) => (RowOrigin::Unrelated, u64::from(bits), None),
         };
         let ctx = AttnContext {
             selected: origin == RowOrigin::Sequential && shape.indexer.sparse_at(frontier),
@@ -211,6 +283,7 @@ impl SparseStack {
             tiled: self.opts.tiled_attention,
             origin,
             batch_selected,
+            ring_tap,
             ..AttnContext::default()
         };
         let chain = island::draft_chain();
@@ -226,6 +299,9 @@ impl SparseStack {
                 n_tok,
                 device,
             )?);
+            if half == Island::Mixer && end == DraftEnd::Probe(DraftProbe::PostAttention) {
+                return finish(plan);
+            }
         }
 
         // The head's own collapsing mix, then the *target's* vocabulary head on
@@ -235,10 +311,8 @@ impl SparseStack {
         // A pass that is only filling the head's cache asks for neither. The
         // projection is the single widest matmul in the model, and running it
         // for a token nobody reads is most of what such a pass would cost.
-        if !pick {
-            let (plan, _) = crate::sparse::passes::with_reservation(plan, Vec::new());
-            plan.validate()?;
-            return Ok(plan);
+        if end != DraftEnd::Pick {
+            return finish(plan);
         }
         plan.append(hyper::collapse(
             shape,
@@ -252,7 +326,7 @@ impl SparseStack {
         // the last one, for the reason a chunk's logits are its last rows, and a
         // batch's is every row.
         let (last, picked) = match rows {
-            DraftRows::Sequential => (
+            DraftRows::Sequential(_) => (
                 u64::from(n_tok.saturating_sub(1))
                     .saturating_mul(u64::from(shape.hidden))
                     .saturating_mul(crate::sparse::kernels::F32_BYTES),
@@ -295,15 +369,21 @@ impl SparseStack {
                 Operand::U32(picked),
             ]),
         );
-        // The head's cooperative launches read the same per-stream scratch the
-        // target's do, and it is reserved the same way: once, in front of
-        // everything, at the widest carve-up the pass makes. A draft that ran
-        // before any target pass would otherwise be the first launch on the
-        // stream and find nothing reserved at all.
-        let (plan, _) = crate::sparse::passes::with_reservation(plan, Vec::new());
-        plan.validate()?;
-        Ok(plan)
+        finish(plan)
     }
+}
+
+/// A draft plan made runnable: its scratch reserved and the whole validated.
+///
+/// The head's cooperative launches read the same per-stream scratch the
+/// target's do, and it is reserved the same way: once, in front of everything,
+/// at the widest carve-up the pass makes. A draft that ran before any target
+/// pass would otherwise be the first launch on the stream and find nothing
+/// reserved at all.
+fn finish(plan: Plan) -> CoreResult<Plan> {
+    let (plan, _) = crate::sparse::passes::with_reservation(plan, Vec::new());
+    plan.validate()?;
+    Ok(plan)
 }
 
 impl SparseStack {
@@ -336,6 +416,53 @@ impl SparseStack {
         hidden: Operand,
         pick: bool,
     ) -> CoreResult<Option<TokenId>> {
+        let end = if pick { DraftEnd::Pick } else { DraftEnd::Fill };
+        self.draft_tapped(session, tokens, positions, hidden, end, None)
+    }
+
+    /// Runs one draft pass at `position` that stops at `probe`, leaving that
+    /// stage's rows in the residual: a diagnostic, for holding the head's pass
+    /// against a reference stage by stage (see [`DraftProbe`]).
+    ///
+    /// `token` and `hidden` are what [`SparseStack::draft`] takes for a one-row
+    /// pass. Like a draft, it advances nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::draft`].
+    pub fn draft_probe(
+        &mut self,
+        session: SessionId,
+        token: TokenId,
+        position: u32,
+        hidden: Operand,
+        probe: DraftProbe,
+    ) -> CoreResult<()> {
+        self.draft_tapped(
+            session,
+            &[token],
+            &[position],
+            hidden,
+            DraftEnd::Probe(probe),
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// [`SparseStack::draft`], with the head's raw key ring also copied into
+    /// the snapshot buffer by `tap`, ending where `end` says.
+    ///
+    /// `None` is not a refusal: it is what any `end` but [`DraftEnd::Pick`]
+    /// asked for, as `pick: false` is for [`SparseStack::draft`].
+    fn draft_tapped(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        positions: &[u32],
+        hidden: Operand,
+        end: DraftEnd,
+        tap: Option<RingTap>,
+    ) -> CoreResult<Option<TokenId>> {
         let n_tok = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
         if n_tok == 0 || n_tok > self.opts.prefill_rows {
             return Err(CoreError::ShapeMismatch {
@@ -359,13 +486,14 @@ impl SparseStack {
         }
         self.write_draft_inputs(session, tokens, positions)?;
 
+        let pick = end == DraftEnd::Pick;
         let plan = self.plan_draft(
             hidden,
             reach,
             n_tok,
-            pick,
+            end,
             self.device(),
-            DraftRows::Sequential,
+            DraftRows::Sequential(tap),
         )?;
         // A chain step is the same shape every time and worth capturing, and
         // its key cannot alias a target island's: it is filed under the slot
@@ -407,6 +535,7 @@ impl SparseStack {
             rows: n_tok,
             origin: RowOrigin::Sequential,
             gather: Vec::new(),
+            ngram_island: None,
         };
         self.execute(session, &pass)?;
         pick.then(|| self.read_draft_pick()).transpose()
@@ -473,7 +602,7 @@ impl SparseStack {
             hidden,
             reach,
             n,
-            true,
+            DraftEnd::Pick,
             self.device(),
             DraftRows::Batch(bits),
         )?;
@@ -486,6 +615,7 @@ impl SparseStack {
             rows: n,
             origin: RowOrigin::Unrelated,
             gather: Vec::new(),
+            ngram_island: None,
         };
         self.pack_row_pointers(sessions)?;
         self.execute_rows(sessions, &pass)?;
@@ -640,6 +770,38 @@ impl SparseStack {
     }
 }
 
+/// One speculative step's drafts beside the target's own picks, at debug
+/// level: the record that separates a head whose first guess is wrong (the
+/// draft's input or first step) from one whose chain decays (its own rows), and
+/// a step the prompt lookup drafted from one the head did.
+fn trace_step(
+    session: SessionId,
+    source: Option<DraftSource>,
+    drafts: &[TokenId],
+    picks: &[TokenId],
+    accepted: u32,
+) {
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let ids = |tokens: &[TokenId]| {
+            tokens
+                .iter()
+                .map(|token| token.get().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let lookup = matches!(source, Some(DraftSource::Lookup(_)));
+        tracing::debug!(
+            %session,
+            lookup,
+            drafted = drafts.len(),
+            accepted,
+            drafts = %ids(drafts),
+            target = %ids(picks.get(..drafts.len()).unwrap_or(picks)),
+            "speculative step"
+        );
+    }
+}
+
 /// The layer index a captured draft chain step is filed under: past every
 /// target layer a key can name, so the two can never share a slot.
 const DRAFT_ISLAND_LAYER: u32 = 0xffff;
@@ -647,7 +809,7 @@ const DRAFT_ISLAND_LAYER: u32 = 0xffff;
 /// The prompt lookup beside the head.
 impl SparseStack {
     /// The drafts a step verifies: the prompt lookup's proposal when it is
-    /// longer than the head's chain and starts with the head's first guess
+    /// longer than the head's chain and starts with all of it
     /// ([`mtp::lookup_beats_head`]), the head's chain otherwise.
     ///
     /// A guess either way - the verify pass decides what is kept - so the
@@ -680,11 +842,8 @@ impl SparseStack {
             &spec.lookup_fails,
             policy,
         );
-        let head_drafts = u32::try_from(head.len()).unwrap_or(u32::MAX);
         match proposal {
-            Some(proposal)
-                if mtp::lookup_beats_head(&proposal, head_drafts, head.first().copied()) =>
-            {
+            Some(proposal) if mtp::lookup_beats_head(&proposal, &head) => {
                 tracing::trace!(%session, len = proposal.len(), "prompt lookup drafts the step");
                 let id = proposal.id();
                 Ok((proposal.tokens().to_vec(), Some(DraftSource::Lookup(id))))
@@ -737,6 +896,33 @@ impl SparseStack {
         first: TokenId,
         eos: TokenId,
     ) -> CoreResult<Speculated> {
+        Ok(self
+            .speculate_judged(session, first, eos, Judge::Target)?
+            .outcome)
+    }
+
+    /// [`SparseStack::speculate`], with what the step drafted and what the
+    /// target answered handed back, and `judge` deciding what it keeps.
+    ///
+    /// With [`Judge::Target`] this is the served step exactly. With
+    /// [`Judge::Forced`] the step keeps the guesses that match a given text
+    /// instead of the target's picks, so a harness can walk a prompt it holds
+    /// an independent reference for and still exercise every rejection,
+    /// rewind and catch-up a served step runs: the verify pass, the rewind, the
+    /// staged row and the head's catch-up are the served code over the rows the
+    /// text commits.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::speculate`], and [`CoreError::ShapeMismatch`] when a
+    /// forced text is shorter than the step's drafts.
+    pub fn speculate_judged(
+        &mut self,
+        session: SessionId,
+        first: TokenId,
+        eos: TokenId,
+        judge: Judge<'_>,
+    ) -> CoreResult<SpecTrace> {
         let live = self.session(session)?;
         let (depth, frontier) = (live.spec_depth(), live.written());
         let budget = mtp::draft_budget(depth, frontier, self.opts.engine.ctx, MAX_DRAFT + 1);
@@ -752,22 +938,37 @@ impl SparseStack {
         let logit_rows = u32::try_from(rows.len()).unwrap_or(1);
         self.run_rows(session, &rows, logit_rows)?;
         let picks = self.read_picks(logit_rows)?;
+        // The answers the step settles against: the target's own picks, or the
+        // forced text's tokens at the same positions.
+        let answers = match judge {
+            Judge::Target => picks.as_slice(),
+            Judge::Forced(text) => text.get(..rows.len()).ok_or(CoreError::ShapeMismatch {
+                field: "forced verify answers",
+                expected: rows.len() as u64,
+                got: text.len() as u64,
+            })?,
+        };
 
         let outcome = StepOutcome::settle(
             first,
             &drafts,
-            picks.get(..drafts.len()).unwrap_or(&[]),
+            answers.get(..drafts.len()).unwrap_or(&[]),
             eos,
             source,
         )?;
         self.remember_lookup(session, &outcome)?;
-        // The rewind before the commit, and both before the row is staged: the
-        // staged row is the residual of the last *committed* position, and the
-        // rewind is what makes the recurrent state agree with it.
+        trace_step(session, source, &drafts, &picks, outcome.logits_row);
+        // The rewind first: the staged row is the residual of the last
+        // *committed* position, and the rewind is what makes the recurrent
+        // state agree with it. Then the row is staged, because the catch-up
+        // overwrites the residual it is copied from. And the commit last,
+        // because a checkpoint it admits carries the head's raw key ring, and
+        // the head's rows up to the position before the new frontier are the
+        // catch-up's to write: committed before it, the blob would carry the
+        // chain's guesses for them.
         if let Some(rewind) = outcome.rollback {
             self.spec_rollback(session, rewind)?;
         }
-        self.advance(session, &outcome.committed, false, Some(outcome.logits_row))?;
         self.stage_draft_row(session, outcome.logits_row)?;
         self.reflush(
             session,
@@ -775,21 +976,28 @@ impl SparseStack {
             &outcome.committed,
             Operand::Scratch(Buf::Residual),
         )?;
+        self.advance(session, &outcome.committed, false, Some(outcome.logits_row))?;
+        self.mark_staged_current(session)?;
         // What the caller has not seen: the guesses that were kept, and then the
         // target's own pick at the row the step settled on. `first` is left out
         // because it was already the caller's - handing it back would emit it
         // twice.
         let accepted = usize::try_from(outcome.logits_row).unwrap_or(0);
         let mut produced = outcome.committed.get(1..).unwrap_or(&[]).to_vec();
-        produced.push(*picks.get(accepted).ok_or(CoreError::ShapeMismatch {
+        produced.push(*answers.get(accepted).ok_or(CoreError::ShapeMismatch {
             field: "verify rows",
             expected: u64::from(outcome.logits_row).saturating_add(1),
-            got: u64::try_from(picks.len()).unwrap_or(u64::MAX),
+            got: u64::try_from(answers.len()).unwrap_or(u64::MAX),
         })?);
-        Ok(Speculated {
+        let outcome = Speculated {
             produced,
             accepted: outcome.logits_row,
             drafted: u32::try_from(drafts.len()).unwrap_or(u32::MAX),
+        };
+        Ok(SpecTrace {
+            drafts,
+            picks,
+            outcome,
         })
     }
 
@@ -943,11 +1151,11 @@ impl SparseStack {
                 source,
             )?;
             self.remember_lookup(*session, &outcome)?;
+            trace_step(*session, source, drafts, own, outcome.logits_row);
             if let Some(rewind) = outcome.rollback {
                 self.spec_rollback(*session, rewind)?;
             }
             let row = u32::try_from(start).unwrap_or(u32::MAX) + outcome.logits_row;
-            self.advance(*session, &outcome.committed, false, Some(row))?;
             self.stage_draft_row(*session, row)?;
             settled.push((
                 *session,
@@ -956,14 +1164,20 @@ impl SparseStack {
                 outcome,
                 own.to_vec(),
                 drafts.len(),
+                row,
             ));
             start += rows.len();
         }
 
         let mut out = Vec::with_capacity(settled.len());
-        for (session, frontier, start, outcome, own, drafted) in settled {
+        for (session, frontier, start, outcome, own, drafted, row) in settled {
             let hidden = Operand::ScratchFrom(Buf::ResidualHold, start as u64 * width);
             self.reflush(session, frontier, &outcome.committed, hidden)?;
+            // Committed after its catch-up, as a solo step commits: see
+            // `speculate`. No catch-up writes the logits block, so the row the
+            // commit files is still the verify's.
+            self.advance(session, &outcome.committed, false, Some(row))?;
+            self.mark_staged_current(session)?;
             let accepted = usize::try_from(outcome.logits_row).unwrap_or(0);
             let mut produced = outcome.committed.get(1..).unwrap_or(&[]).to_vec();
             produced.push(*own.get(accepted).ok_or(CoreError::ShapeMismatch {
@@ -992,6 +1206,32 @@ impl SparseStack {
     #[must_use]
     pub fn has_draft_head(&self) -> bool {
         self.desc.draft.is_some()
+    }
+
+    /// Marks the staged draft row as the one for the frontier `session` now
+    /// stands on: what a step that staged its row before committing does once
+    /// the commit has moved the frontier.
+    fn mark_staged_current(&mut self, session: SessionId) -> CoreResult<()> {
+        let live = self
+            .sessions
+            .get_mut(&session)
+            .ok_or(CoreError::UnknownSession(session))?;
+        if let Some(spec) = live.spec.as_mut() {
+            spec.staged_for = live.written;
+        }
+        Ok(())
+    }
+
+    /// The planes this stack's pages carry, and so the ranks its sessions keep
+    /// a raw indexer key ring for: every attention slot's, and the draft
+    /// head's when one is resident.
+    #[must_use]
+    pub fn page_planes(&self) -> crate::sparse::paged::PagePlanes {
+        crate::sparse::paged::PagePlanes {
+            indexer: true,
+            draft: self.has_draft_head(),
+            kv: self.opts.engine.kv_elem,
+        }
     }
 
     /// The head's chain of guesses behind `first`.
@@ -1090,6 +1330,25 @@ impl SparseStack {
         tokens: &[TokenId],
         start: u32,
     ) -> CoreResult<()> {
+        self.warm_draft_tapped(session, tokens, start, None)
+    }
+
+    /// [`SparseStack::warm_draft`] over a chunk a grid checkpoint is cut
+    /// inside, at row `snapshot` of the target's pass over it.
+    ///
+    /// That checkpoint stands the head where it has written up to the position
+    /// before the cut, and the raw keys of the block holding that position are
+    /// in the head's ring only while this pass runs: it writes on past them.
+    /// So the pass copies them into the snapshot buffer before that row of its
+    /// own - row `snapshot - 1`, since the head's row `i` is the target's
+    /// position `start + i`.
+    pub(crate) fn warm_draft_tapped(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        start: u32,
+        snapshot: Option<u32>,
+    ) -> CoreResult<()> {
         let rows = tokens.len().saturating_sub(1);
         let Some(span) = tokens.get(1..) else {
             return Ok(());
@@ -1100,12 +1359,23 @@ impl SparseStack {
         let positions: Vec<u32> = (0..rows)
             .map(|i| start.saturating_add(u32::try_from(i).unwrap_or(0)))
             .collect();
-        self.draft(
+        // The head's ring is the last rank's section of the blob.
+        let offset = crate::sparse::paged::snapshot_ring_offset(&self.shape, self.opts.spec)
+            .saturating_add(
+                u64::from(self.shape.count(crate::shape::LayerKind::Attn))
+                    .saturating_mul(crate::sparse::paged::ring_rank_bytes(&self.shape)),
+            );
+        let tap = snapshot
+            .and_then(|row| row.checked_sub(1))
+            .filter(|row| usize::try_from(*row).is_ok_and(|row| row < rows))
+            .map(|row| RingTap { row, offset });
+        self.draft_tapped(
             session,
             span,
             &positions,
             Operand::Scratch(Buf::Residual),
-            false,
+            DraftEnd::Fill,
+            tap,
         )?;
         Ok(())
     }

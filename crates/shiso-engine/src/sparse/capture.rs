@@ -32,13 +32,14 @@
 //! the function's own signature and is not read - two instantiations of one
 //! template cannot differ there without differing in their arguments first.
 
-use shiso_core::{Backend, Extent3};
+use shiso_core::page::KvElem;
+use shiso_core::{Backend, CoreError, CoreResult, Extent3};
 
 use crate::sparse::exl3::{self as exl3, GemmShape};
 use crate::sparse::kernels::{
     self, Elem, Entry, EntryTable, Instantiation, MOD_EMBED, MOD_EXACT, MOD_EXL3, MOD_GDN,
-    MOD_GDN_TC, MOD_HC, MOD_IDX, MOD_MATVEC, MOD_MISC, MOD_MOE, MOD_PLE, MOD_QSA, MOD_QSA_SPARSE,
-    TemplateArgs,
+    MOD_GDN_FUSED, MOD_GDN_TC, MOD_HC, MOD_IDX, MOD_IDXRING, MOD_KV8, MOD_MATVEC, MOD_MISC,
+    MOD_MOE, MOD_PLE, MOD_QSA, MOD_QSA_SPARSE, TemplateArgs,
 };
 
 /// Every module the sparse stack launches out of.
@@ -51,14 +52,17 @@ const MODULES: &[&str] = &[
     MOD_MOE,
     MOD_GDN,
     MOD_GDN_TC,
+    MOD_GDN_FUSED,
     MOD_PLE,
     MOD_MATVEC,
     MOD_QSA,
     MOD_QSA_SPARSE,
     MOD_IDX,
+    MOD_IDXRING,
     MOD_MISC,
     MOD_EMBED,
     MOD_EXACT,
+    MOD_KV8,
     MOD_EXL3,
 ];
 
@@ -386,6 +390,11 @@ fn trellis(args: &[Arg]) -> Option<TemplateArgs> {
 /// [`Backend::max_block_threads`] reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent probed fact about one kernel family; \
+              no two are states of one thing"
+)]
 pub struct OptionalPaths {
     /// The tensor-core attention and indexer scorer.
     pub tensor_core: bool,
@@ -393,8 +402,19 @@ pub struct OptionalPaths {
     pub tiled_attention: bool,
     /// The chunked recurrence and its parallel convolution.
     pub chunked_recurrence: bool,
+    /// The fused prompt kernels the chunked recurrence takes in place of its
+    /// chain: on top of `chunked_recurrence`, never instead of it, because
+    /// the fused path still launches that module's window rewrite.
+    pub fused_recurrence: bool,
     /// The kernel a prompt pass's brain-float projections can take.
     pub prompt_matmul: crate::sparse::matmul::PromptMatmul,
+    /// The block-scaled low-precision prompt kernels
+    /// ([`kernels::LOWP_ENTRIES`]), which only a kernel set built for a
+    /// family-specific architecture carries and only that family's devices
+    /// load.
+    pub lowp_prefill: bool,
+    /// The one-launch routed selection a decode-sized pass takes.
+    pub route_sort: crate::sparse::matmul::RouteSort,
 }
 
 /// Asks the device which optional paths it has kernels for.
@@ -415,10 +435,34 @@ pub fn optional_paths(backend: &dyn Backend) -> OptionalPaths {
             && has(MOD_GDN_TC, "q4e_gdn_tc_scan_kernel")
             && has(MOD_GDN_TC, "q4e_gdn_conv_par_kernel")
             && has(MOD_GDN_TC, "q4e_gdn_conv_tail_kernel"),
-        prompt_matmul: if has(MOD_MATVEC, "q4e_bf16_gemm_kernel") {
+        fused_recurrence: has(MOD_GDN_FUSED, "q4e_gdf_prep_kernel")
+            && has(MOD_GDN_FUSED, "q4e_gdf_scan_kernel"),
+        prompt_matmul: if [
+            "q4e_bf16_gemm_kernel",
+            "q4e_bf16_gemm_split_kernel",
+            "q4e_bf16_gemv_kernel",
+            "q4e_bf16_rows_kernel",
+            "q4e_bf16_rows_wide_kernel",
+        ]
+        .iter()
+        .all(|entry| has(kernels::MOD_BF16, entry))
+        {
+            crate::sparse::matmul::PromptMatmul::Tensor
+        } else if has(MOD_MATVEC, "q4e_bf16_gemm_kernel") {
             crate::sparse::matmul::PromptMatmul::Matrix
         } else {
             crate::sparse::matmul::PromptMatmul::Rows
+        },
+        lowp_prefill: kernels::LOWP_ENTRIES.iter().all(|&(m, e)| has(m, e)),
+        route_sort: if has(MOD_MOE, "q4e_moe_route_sort_tiny_kernel")
+            && has(kernels::MOD_FFN, "q4e_ffn_route_kernel")
+            && has(kernels::MOD_FFN, "q4e_ffn_route_rows_kernel")
+        {
+            crate::sparse::matmul::RouteSort::Fused
+        } else if has(MOD_MOE, "q4e_moe_route_sort_tiny_kernel") {
+            crate::sparse::matmul::RouteSort::Tiny
+        } else {
+            crate::sparse::matmul::RouteSort::Small
         },
     };
     tracing::info!(?paths, "optional sparse kernel paths this device has");
@@ -487,6 +531,87 @@ pub fn co_resident_blocks(backend: &dyn Backend, entries: EntryTable) -> u32 {
 /// Keeps one captured name for the life of the process.
 fn leak(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
+}
+
+/// Refuses a cache element this device has no kernels for.
+///
+/// Asked once, before any weight is loaded, rather than left to the first launch: a stack whose store
+/// or one of its six attention readers cannot resolve would fail partway into
+/// the first prompt - or, for a reader only some shapes reach, hours later on
+/// the first prompt long enough to take it. Every entry the element needs is
+/// probed, so a kernel set that ships some of them is refused as loudly as one
+/// that ships none (Metal's, or a build whose kernels were not compiled).
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] naming the element when any of its entries is
+/// missing.
+pub fn check_kv_elem(backend: &dyn Backend, kv: KvElem) -> CoreResult<()> {
+    let Some(entries) = kernels::kv_entries(kv) else {
+        return Ok(());
+    };
+    let missing = entries.iter().find(|entry| {
+        backend
+            .max_block_threads(shiso_core::backend::KernelRef::new(entry.0, entry.1))
+            .is_none()
+    });
+    if let Some((module, entry)) = missing {
+        tracing::error!(
+            kv_elem = %kv,
+            module,
+            entry,
+            backend = backend.backend_name(),
+            "the key/value cache element needs a kernel this device does not have"
+        );
+        return Err(CoreError::Unsupported {
+            what: "an fp8 key/value cache on a device whose kernel set has no fp8 cache kernels \
+                   (only the CUDA build compiled with its kernels has them; use \
+                   --kv-cache-dtype f16)",
+            backend: "engine",
+        });
+    }
+    Ok(())
+}
+
+/// Refuses [`PrefillActivations::Lowp`] on a device whose kernel set lacks
+/// any of the block-scaled prompt kernels, naming the first one missing.
+///
+/// Asked before the weights are read, for the reason [`check_kv_elem`] is:
+/// a server that silently served the weight-only kernels under this option
+/// would report speeds and numerics nobody asked for.
+///
+/// [`PrefillActivations::Lowp`]: crate::sparse::matmul::PrefillActivations::Lowp
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] naming what is missing and what to do instead.
+pub fn check_prefill_activations(
+    backend: &dyn Backend,
+    choice: crate::sparse::matmul::PrefillActivations,
+) -> CoreResult<()> {
+    if choice == crate::sparse::matmul::PrefillActivations::A16 {
+        return Ok(());
+    }
+    let missing = kernels::LOWP_ENTRIES.iter().find(|entry| {
+        backend
+            .max_block_threads(shiso_core::backend::KernelRef::new(entry.0, entry.1))
+            .is_none()
+    });
+    if let Some((module, entry)) = missing {
+        tracing::error!(
+            module,
+            entry,
+            backend = backend.backend_name(),
+            "the low-precision prompt activations need a kernel this device does not have"
+        );
+        return Err(CoreError::Unsupported {
+            what: "low-precision prompt activations on a device or kernel set without the \
+                   block-scaled kernels (they need a CUDA build with SHISO_CUDA_COMPILE=1 and a \
+                   GB10-class device, sm_120a/sm_121a; use --prefill-activations a16)",
+            backend: "engine",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

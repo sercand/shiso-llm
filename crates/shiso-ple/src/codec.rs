@@ -80,8 +80,13 @@ pub const fn row_bytes(params: &PleParams) -> u32 {
         // brain floats.
         PleRowType::MlxAffine4 => params.head_dim() / 2 + params.head_dim() / BLOCK_ELEMS * 4,
         PleRowType::Fp8E4M3 { .. } => params.head_dim(),
+        // Codes at four bits, then one scale byte per sixteen weights.
+        PleRowType::Nvfp4 { .. } => params.head_dim() / 2 + params.head_dim() / NVFP4_GROUP,
     }
 }
+
+/// Weights one `e4m3` group scale of the NVFP4 codec covers.
+pub const NVFP4_GROUP: u32 = 16;
 
 /// Writes the row identifiers for positions `pos0 .. pos0 + n`.
 ///
@@ -206,8 +211,69 @@ pub fn dequant_row(params: &PleParams, src: &[u8], head: u32, dst: &mut [f32]) -
                 *out = e4m3(byte) * scale;
             }
         }
+        PleRowType::Nvfp4 { global_bits } => {
+            decode_nvfp4(src, width, f32::from_bits(global_bits), dst);
+        }
     }
     Ok(())
+}
+
+/// The NVFP4 codec: `bf16((e2m1(code) * e4m3(scale)) * global)` per weight.
+///
+/// The order is the reference table's, and it is not the order the NVFP4
+/// projections use (`code * (scale * global)`). The code-times-scale product
+/// is exact - two and four significant bits - so this order rounds once in
+/// single precision where the other rounds twice, and the two disagree in the
+/// last bit whenever the code's magnitude is 1.5 or 3.
+///
+/// The final rounding to a brain float is the reference's too: its table
+/// holds brain floats, so these are the values the model was run with, and
+/// keeping the extra single-precision bits would make every weight differ
+/// from that table by up to half a brain-float unit. It is the trellis
+/// codec's rule: round where the reference rounds, and nowhere else. The
+/// output stays single precision so every codec fills the same buffer.
+fn decode_nvfp4(src: &[u8], width: usize, global: f32, dst: &mut [f32]) {
+    let scales = &src[width / 2..];
+    for (i, out) in dst.iter_mut().enumerate().take(width) {
+        let byte = src[i / 2];
+        let code = if i.is_multiple_of(2) {
+            byte & 0x0F
+        } else {
+            byte >> 4
+        };
+        let scale = e4m3(scales[i / NVFP4_GROUP as usize]);
+        *out = round_to_bf16((e2m1(code) * scale) * global);
+    }
+}
+
+/// The eight magnitudes a four-bit `e2m1` code names, by its low three bits.
+const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+/// One four-bit `e2m1` code: a sign bit over two exponent bits and one
+/// mantissa bit. Code `0x8` is negative zero, as the format stores it.
+#[must_use]
+pub fn e2m1(code: u8) -> f32 {
+    let magnitude = E2M1[usize::from(code & 0x07)];
+    if code & 0x08 == 0 {
+        magnitude
+    } else {
+        -magnitude
+    }
+}
+
+/// A single-precision value rounded to the nearest brain float, ties to even,
+/// and widened back.
+///
+/// A NaN passes through unrounded: the carry the rounding adds could walk its
+/// payload into the exponent and turn it into an infinity.
+#[must_use]
+pub fn round_to_bf16(value: f32) -> f32 {
+    if value.is_nan() {
+        return value;
+    }
+    let bits = value.to_bits();
+    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000;
+    f32::from_bits(rounded)
 }
 
 /// One FP8 E4M3 byte: one sign, four exponent bits biased by seven, three

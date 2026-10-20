@@ -12,8 +12,9 @@ use crate::error::HubError;
 use crate::host::{Backend, CudaInfo, HostProfile, MetalInfo};
 use crate::recipe::{
     CURRENT_SCHEMA_VERSION, CommitSha, Component, FileEntry, HUB_FILE_MAX_BYTES, HostConstraints,
-    ModalCapabilities, Modality, ModelName, ModelRef, Provider, Recipe, RecipeFeatures,
-    Requirements, Role, ServerDefaults, Sha256, Task, Variant, VariantKey, hub_file_name_ok,
+    KvCacheDtype, ModalCapabilities, Modality, ModelName, ModelRef, Provider, Recipe,
+    RecipeFeatures, Requirements, Role, ServerDefaults, Sha256, Task, Variant, VariantKey,
+    hub_file_name_ok,
 };
 use crate::select::select_variant;
 use crate::store::BlobStore;
@@ -467,6 +468,13 @@ fn config_role_must_name_its_file() {
     let mut recipe = make_test_recipe();
     recipe.variants = vec![variant];
     assert!(validate_recipe(&recipe, ValidationMode::Strict).is_err());
+}
+
+#[test]
+fn kv_cache_dtype_is_typed() {
+    let parsed: ServerDefaults = serde_json::from_str(r#"{"kv_cache_dtype": "fp8"}"#).unwrap();
+    assert_eq!(parsed.kv_cache_dtype, Some(KvCacheDtype::Fp8));
+    assert!(serde_json::from_str::<ServerDefaults>(r#"{"kv_cache_dtype": "int4"}"#).is_err());
 }
 
 #[test]

@@ -45,6 +45,13 @@ fn the_greedy_pick_takes_the_lowest_index_of_the_maximum() {
 
 #[test]
 #[ignore = "requires a Metal device"]
+fn the_greedy_pick_reads_an_odd_width_one_float_at_a_time() {
+    let Some(gpu) = open() else { return };
+    misc::the_greedy_pick_reads_an_odd_width_one_float_at_a_time(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
 fn the_half_gather_reads_one_row_per_token() {
     let Some(gpu) = open() else { return };
     misc::the_half_gather_reads_one_row_per_token(&gpu);

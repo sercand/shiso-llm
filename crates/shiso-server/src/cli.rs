@@ -230,6 +230,42 @@ pub struct ServeArgs {
     /// `--ctx` context refuses to start, with the numbers.
     #[arg(long, env = "SHISO_GPU_MEMORY_UTILIZATION")]
     pub gpu_memory_utilization: Option<f64>,
+    /// The element the KV cache stores attention keys and values as: `f16`,
+    /// or `fp8` (E4M3 at a static scale of 1, also spelled `fp8_e4m3`).
+    ///
+    /// `fp8` halves the attention key and value bytes of every cached token,
+    /// so `--gpu-memory-utilization` and `--kv-cache-tokens` buy more context
+    /// for the same memory; the indexer's planes stay f16. Values are rounded
+    /// to a 3-bit mantissa when stored, saturate at 448 and flush below 2^-10.
+    /// Only the sparse stack on CUDA has the kernels for it; any other model or
+    /// device refuses to start rather than serving f16 under this name.
+    #[arg(
+        long,
+        env = "SHISO_KV_CACHE_DTYPE",
+        value_enum,
+        default_value_t = KvCacheDtype::F16
+    )]
+    pub kv_cache_dtype: KvCacheDtype,
+    /// The precision prompt (prefill) activations enter the block-scaled
+    /// weights' products at: `a16`, or `lowp`.
+    ///
+    /// `a16` keeps every prompt activation at half precision against the
+    /// decoded weights - the reference numerics. `lowp` quantizes a prompt
+    /// pass's activations to the weight's own format - NVFP4 for the routed
+    /// NVFP4 experts, MXFP8 for the dense MXFP8 projections - and runs those
+    /// products on the GPU's block-scaled tensor-core instructions: a faster
+    /// prefill, at a measurable cost in accuracy (a few percent of a row on
+    /// the experts). Decode steps and speculative verifies keep the
+    /// half-precision kernels either way. Only the sparse stack on a CUDA
+    /// build with kernels for a family-specific architecture (`sm_121a`, a
+    /// GB10) has the kernels; anywhere else `lowp` refuses to start.
+    #[arg(
+        long,
+        env = "SHISO_PREFILL_ACTIVATIONS",
+        value_enum,
+        default_value_t = PrefillActivations::A16
+    )]
+    pub prefill_activations: PrefillActivations,
     /// Recurrent-state checkpoints the prefix cache may hold, shared by every
     /// session. Zero holds none.
     ///
@@ -302,9 +338,9 @@ pub struct ServeArgs {
     /// Prompt-lookup drafts: tokens a step may propose by finding the text
     /// being written earlier in the context. Zero is off.
     ///
-    /// Taken in place of the draft head's chain only when it is longer and its
-    /// first token is the head's own first guess, which is the evidence that
-    /// the text is an echo; a rejected proposal is not made again from the
+    /// Taken in place of the draft head's chain only when it is longer and
+    /// starts with the head's whole chain, so it only ever extends the head's
+    /// guesses; a rejected proposal is not made again from the
     /// same place. The verify pass is `1 + max(--spec-k, this)` rows at the
     /// widest, which is what the per-session rollback records are sized for.
     /// Read by the sparse family's arm, and only beside `--spec-k`.
@@ -1346,6 +1382,48 @@ impl ServeArgs {
     }
 }
 
+/// `--kv-cache-dtype`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum KvCacheDtype {
+    /// Half precision, two bytes an element.
+    F16,
+    /// FP8 E4M3 at a static scale of 1, one byte an element.
+    #[value(alias = "fp8_e4m3")]
+    Fp8,
+}
+
+impl From<KvCacheDtype> for shiso_core::page::KvElem {
+    fn from(choice: KvCacheDtype) -> Self {
+        match choice {
+            KvCacheDtype::F16 => Self::F16,
+            KvCacheDtype::Fp8 => Self::Fp8E4m3,
+        }
+    }
+}
+
+/// `--prefill-activations`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PrefillActivations {
+    /// Half-precision prompt activations against the decoded weights.
+    A16,
+    /// Prompt activations quantized to the weight's format, on the
+    /// block-scaled tensor-core instructions.
+    Lowp,
+    /// MXFP8 prompt activations into the dense projections only; the routed
+    /// experts keep half-precision activations.
+    Dense8,
+}
+
+impl From<PrefillActivations> for shiso_engine::sparse::matmul::PrefillActivations {
+    fn from(choice: PrefillActivations) -> Self {
+        match choice {
+            PrefillActivations::A16 => Self::A16,
+            PrefillActivations::Lowp => Self::Lowp,
+            PrefillActivations::Dense8 => Self::Dense8,
+        }
+    }
+}
+
 /// Where the routed expert banks live, as the operator asked for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ExpertResidencyChoice {
@@ -1673,6 +1751,16 @@ fn apply_engine_defaults(
             ExpertResidency::Stream => ExpertResidencyChoice::Stream,
         };
         tracing::info!(?residency, "applied recipe default for expert_residency");
+    }
+
+    if let Some(kv) = defaults.kv_cache_dtype
+        && check_override("kv_cache_dtype")
+    {
+        args.kv_cache_dtype = match kv {
+            shiso_hub::recipe::KvCacheDtype::F16 => KvCacheDtype::F16,
+            shiso_hub::recipe::KvCacheDtype::Fp8 => KvCacheDtype::Fp8,
+        };
+        tracing::info!(?kv, "applied recipe default for kv_cache_dtype");
     }
 
     if let Some(reserve) = defaults.expert_reserve_gb

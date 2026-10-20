@@ -113,7 +113,8 @@ fn unknown_id_is_none_rather_than_a_default() {
 
 #[test]
 fn block_dimensions_of_the_formats_that_matter() {
-    let pinned: [(DType, u32, u32); 15] = [
+    let pinned: [(DType, u32, u32); 16] = [
+        (DType::Mxfp8E4M3G32, 32, 32),
         (DType::Pq2_0, 128, 34),
         (DType::Ptq1_0, 128, 28),
         (DType::MlxAffine2Gs128, 128, 36),
@@ -192,4 +193,17 @@ fn ternary_and_two_bit_affine_are_told_apart() {
     assert!(DType::MlxAffine2Gs128.is_affine());
     assert!(!DType::MlxAffine2Gs128.is_ternary());
     assert_eq!(DType::MlxAffine2Gs128.affine_bits(), Some(2));
+}
+
+#[test]
+fn mxfp8_is_this_project_s_own_id_and_never_read_from_a_container() {
+    // Numbered beside the other engine-side formats, above every upstream id,
+    // and not mapped by the container reader: an MXFP8 matrix is two arrays,
+    // which a single tensor record cannot carry.
+    assert_eq!(DType::Mxfp8E4M3G32.gguf_id(), 213);
+    assert_eq!(DType::from_gguf_id(213), None);
+    assert_eq!(DType::Mxfp8E4M3G32.type_name(), "mxfp8_e4m3_g32");
+    assert!(DType::Mxfp8E4M3G32.is_quantized());
+    assert!(!DType::Mxfp8E4M3G32.is_modelopt());
+    assert!(!DType::Mxfp8E4M3G32.is_affine());
 }

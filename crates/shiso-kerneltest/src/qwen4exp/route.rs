@@ -16,10 +16,8 @@
               index here is a small literal"
 )]
 #![expect(
-    clippy::missing_panics_doc,
     clippy::too_many_lines,
-    reason = "the case asserts by panicking, and running the four launches beside the one reads \
-              best as one sequence"
+    reason = "running the four launches beside the one reads best as one sequence"
 )]
 
 use shiso_core::{Extent3, KernelArg, KernelRef, LaunchArgs};
@@ -33,6 +31,10 @@ const MOD_MOE: &str = "q4e_moe";
 const EXPERTS: usize = 512;
 /// Experts each token is routed to.
 const USED: usize = 10;
+/// The widest pass the tiny entry takes (`Q4E_ROUTE_TINY_TOKENS`).
+const TINY_TOKENS: usize = 8;
+/// Threads the tiny entry runs (`Q4E_ROUTE_TINY_THREADS`).
+const TINY_THREADS: u32 = 256;
 
 /// Launches one entry and waits for it.
 fn launch(
@@ -66,12 +68,40 @@ fn ints(gpu: &Gpu, buffer: &shiso_core::DeviceBuffer) -> Vec<i32> {
 
 /// The fused launch and the four it replaces, over the same logits, agree.
 pub fn the_fused_route_sort_is_the_four_launch_route_and_sort(gpu: &Gpu) {
-    for n_tok in [1usize, 5, 32] {
+    fused_matches(
+        gpu,
+        "q4e_moe_route_sort_small_kernel",
+        32 * 32,
+        &[1, 5, 8, 32],
+    );
+}
+
+/// The tiny one-launch entry agrees with the four launches too, at every
+/// width it takes.
+pub fn the_tiny_route_sort_is_the_four_launch_route_and_sort(gpu: &Gpu) {
+    fused_matches(
+        gpu,
+        "q4e_moe_route_sort_tiny_kernel",
+        TINY_THREADS,
+        &[1, 2, 5, TINY_TOKENS],
+    );
+}
+
+/// One fused entry at `threads` against the four launches, at each width.
+fn fused_matches(gpu: &Gpu, entry: &'static str, threads: u32, widths: &[usize]) {
+    for &n_tok in widths {
         let rows = n_tok * USED;
         // Logits with ties on purpose: the lower id has to win both ways.
         let mut logits = signal(n_tok * EXPERTS, 0x5eed ^ n_tok as u32);
         for t in 0..n_tok {
             logits[t * EXPERTS + 7] = logits[t * EXPERTS + 300];
+        }
+        // At eight tokens, logits on a coarse grid: ties everywhere,
+        // signed zeros among them.
+        if n_tok == 8 {
+            for v in &mut logits {
+                *v = (*v * 4.0).round() / 4.0;
+            }
         }
         let lg = gpu.upload(&f32_bytes(&logits));
         let zeros = |n: usize| gpu.upload(&vec![0u8; n * 4]);
@@ -144,76 +174,152 @@ pub fn the_fused_route_sort_is_the_four_launch_route_and_sort(gpu: &Gpu) {
         );
 
         // The one launch.
-        let (f_ids, f_w, f_bounds, f_active, f_sorted, f_pos) = (
-            zeros(rows),
-            zeros(rows),
-            zeros(EXPERTS + 1),
-            zeros(EXPERTS + 1),
-            zeros(rows),
-            zeros(rows),
-        );
-        launch(
-            gpu,
-            "q4e_moe_route_sort_small_kernel",
-            1,
-            32 * 32,
-            0,
-            &[
-                KernelArg::Buffer(f_ids.view()),
-                KernelArg::Buffer(f_w.view()),
-                KernelArg::Buffer(lg.view()),
-                KernelArg::Buffer(f_bounds.view()),
-                KernelArg::Buffer(f_active.view()),
-                KernelArg::Buffer(f_sorted.view()),
-                KernelArg::Buffer(f_pos.view()),
-                KernelArg::U32(n_tok as u32),
-                KernelArg::U32(EXPERTS as u32),
-                KernelArg::U32(USED as u32),
-            ],
-        );
+        {
+            let (f_ids, f_w, f_bounds, f_active, f_sorted, f_pos) = (
+                zeros(rows),
+                zeros(rows),
+                zeros(EXPERTS + 1),
+                zeros(EXPERTS + 1),
+                zeros(rows),
+                zeros(rows),
+            );
+            launch(
+                gpu,
+                entry,
+                1,
+                threads,
+                0,
+                &[
+                    KernelArg::Buffer(f_ids.view()),
+                    KernelArg::Buffer(f_w.view()),
+                    KernelArg::Buffer(lg.view()),
+                    KernelArg::Buffer(f_bounds.view()),
+                    KernelArg::Buffer(f_active.view()),
+                    KernelArg::Buffer(f_sorted.view()),
+                    KernelArg::Buffer(f_pos.view()),
+                    KernelArg::U32(n_tok as u32),
+                    KernelArg::U32(EXPERTS as u32),
+                    KernelArg::U32(USED as u32),
+                ],
+            );
 
-        let want_w = gpu.read_f32(&w);
-        let got_w = gpu.read_f32(&f_w);
-        assert_eq!(ints(gpu, &f_ids), ints(gpu, &ids), "{n_tok} tokens: ids");
-        assert!(
-            got_w
-                .iter()
-                .zip(&want_w)
-                .all(|(a, b)| a.to_bits() == b.to_bits()),
-            "{n_tok} tokens: weights {got_w:?} vs {want_w:?}"
-        );
-        let bounds_v = ints(gpu, &bounds);
-        assert_eq!(ints(gpu, &f_bounds), bounds_v, "{n_tok} tokens: bounds");
-        let active_v = ints(gpu, &active);
-        let n_active = active_v[EXPERTS] as usize;
-        let f_active_v = ints(gpu, &f_active);
-        assert_eq!(
-            f_active_v[EXPERTS], active_v[EXPERTS],
-            "{n_tok} tokens: active count"
-        );
-        assert_eq!(
-            f_active_v[..n_active],
-            active_v[..n_active],
-            "{n_tok} tokens: active"
-        );
-        let (want_s, got_s, pos) = (ints(gpu, &sorted), ints(gpu, &f_sorted), ints(gpu, &f_pos));
-        for e in 0..EXPERTS {
-            let span = bounds_v[e] as usize..bounds_v[e + 1] as usize;
-            let mut a = want_s[span.clone()].to_vec();
-            let mut b = got_s[span].to_vec();
-            a.sort_unstable();
-            assert!(
-                b.windows(2).all(|p| p[0] < p[1]),
-                "{n_tok} tokens: expert {e} span is not by rank"
-            );
-            b.sort_unstable();
-            assert_eq!(a, b, "{n_tok} tokens: expert {e}'s columns");
-        }
-        for (col, &at) in pos.iter().enumerate() {
+            let want_w = gpu.read_f32(&w);
+            let got_w = gpu.read_f32(&f_w);
             assert_eq!(
-                got_s[at as usize], col as i32,
-                "{n_tok} tokens: inverse of column {col}"
+                ints(gpu, &f_ids),
+                ints(gpu, &ids),
+                "{entry} {n_tok} tokens: ids"
             );
+            assert!(
+                got_w
+                    .iter()
+                    .zip(&want_w)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{entry} {n_tok} tokens: weights {got_w:?} vs {want_w:?}"
+            );
+            let bounds_v = ints(gpu, &bounds);
+            assert_eq!(
+                ints(gpu, &f_bounds),
+                bounds_v,
+                "{entry} {n_tok} tokens: bounds"
+            );
+            let active_v = ints(gpu, &active);
+            let n_active = active_v[EXPERTS] as usize;
+            let f_active_v = ints(gpu, &f_active);
+            assert_eq!(
+                f_active_v[EXPERTS], active_v[EXPERTS],
+                "{entry} {n_tok} tokens: active count"
+            );
+            assert_eq!(
+                f_active_v[..n_active],
+                active_v[..n_active],
+                "{entry} {n_tok} tokens: active"
+            );
+            let (want_s, got_s, pos) =
+                (ints(gpu, &sorted), ints(gpu, &f_sorted), ints(gpu, &f_pos));
+            for e in 0..EXPERTS {
+                let span = bounds_v[e] as usize..bounds_v[e + 1] as usize;
+                let mut a = want_s[span.clone()].to_vec();
+                let mut b = got_s[span].to_vec();
+                a.sort_unstable();
+                assert!(
+                    b.windows(2).all(|p| p[0] < p[1]),
+                    "{entry} {n_tok} tokens: expert {e} span is not by rank"
+                );
+                b.sort_unstable();
+                assert_eq!(a, b, "{entry} {n_tok} tokens: expert {e}'s columns");
+            }
+            for (col, &at) in pos.iter().enumerate() {
+                assert_eq!(
+                    got_s[at as usize], col as i32,
+                    "{entry} {n_tok} tokens: inverse of column {col}"
+                );
+            }
         }
     }
+}
+
+/// The fused routed selection and sort over `n_tok` tokens through `entry`
+/// at `threads` a block, for the bench: one block, the logits read once.
+fn bench_route(
+    gpu: &Gpu,
+    entry: &'static str,
+    threads: u32,
+    n_tok: usize,
+) -> crate::bench::Fixture {
+    let rows = n_tok * USED;
+    let lg = gpu.upload(&f32_bytes(&signal(n_tok * EXPERTS, 0xB0B ^ n_tok as u32)));
+    let zeros = |n: usize| gpu.upload(&vec![0u8; n * 4]);
+    let bufs = [
+        zeros(rows),
+        zeros(rows),
+        zeros(EXPERTS + 1),
+        zeros(EXPERTS + 1),
+        zeros(rows),
+        zeros(rows),
+    ];
+    let bytes = (n_tok * EXPERTS * 4 + rows * 16 + (EXPERTS + 1) * 8) as u64;
+    crate::bench::Fixture::new(bytes, 0, move |gpu| {
+        run(
+            gpu,
+            KernelRef::new(MOD_MOE, entry),
+            &LaunchArgs {
+                grid: Extent3::new(1, 1, 1),
+                block: Extent3::new(threads, 1, 1),
+                smem_bytes: 0,
+                args: &[
+                    KernelArg::Buffer(bufs[0].view()),
+                    KernelArg::Buffer(bufs[1].view()),
+                    KernelArg::Buffer(lg.view()),
+                    KernelArg::Buffer(bufs[2].view()),
+                    KernelArg::Buffer(bufs[3].view()),
+                    KernelArg::Buffer(bufs[4].view()),
+                    KernelArg::Buffer(bufs[5].view()),
+                    KernelArg::U32(n_tok as u32),
+                    KernelArg::U32(EXPERTS as u32),
+                    KernelArg::U32(USED as u32),
+                ],
+            },
+        );
+    })
+}
+
+/// `q4e_moe_route_sort_small_kernel` at one decode token.
+pub(crate) fn bench_route_sort_small_t1(gpu: &Gpu) -> crate::bench::Fixture {
+    bench_route(gpu, "q4e_moe_route_sort_small_kernel", 32 * 32, 1)
+}
+
+/// `q4e_moe_route_sort_tiny_kernel` at one decode token.
+pub(crate) fn bench_route_sort_tiny_t1(gpu: &Gpu) -> crate::bench::Fixture {
+    bench_route(gpu, "q4e_moe_route_sort_tiny_kernel", TINY_THREADS, 1)
+}
+
+/// `q4e_moe_route_sort_tiny_kernel` over a five-token verify.
+pub(crate) fn bench_route_sort_tiny_t5(gpu: &Gpu) -> crate::bench::Fixture {
+    bench_route(gpu, "q4e_moe_route_sort_tiny_kernel", TINY_THREADS, 5)
+}
+
+/// `q4e_moe_route_sort_small_kernel` over a five-token verify.
+pub(crate) fn bench_route_sort_small_t5(gpu: &Gpu) -> crate::bench::Fixture {
+    bench_route(gpu, "q4e_moe_route_sort_small_kernel", 32 * 32, 5)
 }

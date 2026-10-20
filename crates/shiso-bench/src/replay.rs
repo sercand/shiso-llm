@@ -29,6 +29,7 @@ use shiso_core::backend::Backend;
 use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::model::{DecodeStep, Model, ModelInfo};
 use shiso_engine::sparse::capture;
+use shiso_engine::sparse::matmul::PrefillActivations;
 use shiso_engine::sparse::mtp::SpecDepth;
 use shiso_engine::sparse::stack::SparseOptions;
 use shiso_engine::sparse::tap::ResidualTap;
@@ -191,6 +192,34 @@ impl Harness {
         ctx: u32,
         pool_pages: Option<u32>,
     ) -> ReplayResult<Self> {
+        Self::open_with_options(
+            device,
+            model_path,
+            config_path,
+            ctx,
+            HarnessOptions {
+                pool_pages,
+                ..HarnessOptions::default()
+            },
+        )
+    }
+
+    /// [`Harness::open`] with the loader knobs a replay may vary.
+    ///
+    /// # Errors
+    ///
+    /// As [`Harness::open`].
+    pub fn open_with_options(
+        device: Device,
+        model_path: &Path,
+        config_path: &Path,
+        ctx: u32,
+        options: HarnessOptions,
+    ) -> ReplayResult<Self> {
+        let HarnessOptions {
+            pool_pages,
+            prefill_activations,
+        } = options;
         let backend = open_backend(device)?;
         // Read here rather than handing the path to the parser: the parser's own
         // error would name the failure but not the file, and a run pointed at
@@ -205,7 +234,14 @@ impl Harness {
         if let Some(pages) = pool_pages {
             opts.kv_pool_pages = pages;
         }
-        let mut model = load_loaded(&backend, model_path, &config, opts, None)?;
+        let mut model = load_loaded(
+            &backend,
+            model_path,
+            &config,
+            opts,
+            None,
+            prefill_activations,
+        )?;
         let info = *model.get().info();
         let row = vec![0u8; usize::try_from(info.logits_row_bytes()).unwrap_or(0)];
         Ok(Self {
@@ -366,10 +402,21 @@ pub(crate) fn load_model_with(
     opts: EngineOptions,
     ple: Option<PleOptions>,
 ) -> ReplayResult<Box<dyn Model>> {
-    Ok(match load_loaded(backend, path, config, opts, ple)? {
-        Loaded::Sparse(model) => model,
-        Loaded::Other(model) => model,
-    })
+    Ok(
+        match load_loaded(backend, path, config, opts, ple, PrefillActivations::A16)? {
+            Loaded::Sparse(model) => model,
+            Loaded::Other(model) => model,
+        },
+    )
+}
+
+/// Loader knobs a replay may vary; the default is an unconfigured server's.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HarnessOptions {
+    /// Key/value pool pages; `None` is the engine's default pool.
+    pub pool_pages: Option<u32>,
+    /// The sparse family's prompt-pass activation precision.
+    pub prefill_activations: PrefillActivations,
 }
 
 /// A loaded checkpoint, keeping the sparse family's concrete type.
@@ -395,13 +442,15 @@ impl Loaded {
     }
 }
 
-/// The body of [`load_model_with`].
+/// The body of [`load_model_with`]; `prefill` is the sparse family's prompt
+/// activation precision, and the other families ignore it.
 fn load_loaded(
     backend: &Arc<dyn Backend>,
     path: &Path,
     config: &HfConfig,
     opts: EngineOptions,
     ple: Option<PleOptions>,
+    prefill: PrefillActivations,
 ) -> ReplayResult<Loaded> {
     match Qwen35Config::from_hf(config) {
         Ok(family) => {
@@ -425,6 +474,36 @@ fn load_loaded(
         return Ok(Loaded::Other(Box::new(NemotronHModel::load(
             backend, path, &family, opts,
         )?)));
+    }
+    // The mixed-precision export is a directory whose metadata the GGUF
+    // reader below cannot read; it carries its own config and is held every
+    // expert resident, the way the server serves it.
+    if shiso_models::qwen4exp::modelopt_mixed::is_export(path) {
+        let entries = capture::capture(backend.as_ref());
+        let opts = SparseOptions {
+            engine: opts,
+            spec: SpecDepth::NONE,
+            entries,
+            co_resident_blocks: capture::co_resident_blocks(backend.as_ref(), entries),
+            pack_halves: true,
+            prefill_activations: prefill,
+            ..SparseOptions::default()
+        };
+        let all = shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS;
+        return Ok(Loaded::Sparse(Box::new(
+            Qwen4ExpModel::load_modelopt_mixed(
+                backend,
+                path,
+                config,
+                opts,
+                &shiso_models::qwen4exp::StreamedLoad {
+                    slots: Some(all),
+                    reserve: 0,
+                    draft: false,
+                    counts: None,
+                },
+            )?,
+        )));
     }
     match Qwen4ExpConfig::from_hf(config, path) {
         Ok(family) => {

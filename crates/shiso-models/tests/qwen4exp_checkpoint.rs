@@ -308,6 +308,115 @@ fn a_build_that_speculates_will_not_read_a_file_written_by_one_that_does_not() {
     );
 }
 
+/// Bytes of one raw indexer key ring row, mirroring `IDX_DIM` f16 elements.
+const RING_ROW: usize = 128 * 2;
+/// Rows of one rank's raw key ring, mirroring `kernels::IDX_RING`.
+const RING_ROWS: usize = 16;
+
+/// Writes `value(rank, slot)` into every byte of every row of the session's raw
+/// key ring.
+fn paint_ring(model: &Qwen4ExpModel, session: SessionId, value: impl Fn(usize, usize) -> u8) {
+    let stack = model.stack();
+    let ring = stack
+        .session(session)
+        .expect("the session is open")
+        .indexer_rings();
+    let len = usize::try_from(ring.len()).expect("a fixture range fits");
+    let bytes = (0..len)
+        .map(|at| {
+            let row = at / RING_ROW;
+            value(row / RING_ROWS, row % RING_ROWS)
+        })
+        .collect::<Vec<_>>();
+    stack
+        .backend()
+        .copy_h2d(ring, &bytes)
+        .expect("the fake device accepts a write");
+}
+
+#[test]
+fn a_resume_restores_the_raw_keys_of_the_frontier_block_and_zeros_every_other_ring_row() {
+    // The page carries no raw indexer key, so the blob is the only place the
+    // raw keys of the block a frontier stands inside survive. At 67 tokens an
+    // attention rank stands after 64, 65 and 66 - ring slots 0, 1 and 2 - and a
+    // draft head, which has written only up to the position before the
+    // frontier, after 64 and 65. Everything else in the ring is dead and comes
+    // back as zeros, so two checkpoints of one state are one byte image.
+    const AT: u32 = 67;
+    let dir = tempfile::TempDir::new().expect("a cache directory");
+    let opts = fixture::speculative_options(4);
+    {
+        let (_weights, _backend, mut model) = fixture::loaded_with(opts);
+        model
+            .kv_enable(&config(dir.path()))
+            .expect("the tier opens over a fresh directory");
+        let session = model.open_session().expect("a session opens");
+        model
+            .stack_mut()
+            .reserve(session, AT)
+            .expect("the pool has room for the prompt");
+        model
+            .stack_mut()
+            .stage_draft_row(session, 0)
+            .expect("a speculative session stages its row");
+        paint(&model, session, 0x3C);
+        paint_ring(&model, session, |rank, slot| {
+            u8::try_from(1 + rank * RING_ROWS + slot).expect("a few rows")
+        });
+        model
+            .stack_mut()
+            .advance(session, &path_of(AT), true, Some(0))
+            .expect("the span is registered");
+        drain(&mut model);
+    }
+
+    let (_weights, _backend, mut fresh) = fixture::loaded_with(opts);
+    fresh
+        .kv_enable(&config(dir.path()))
+        .expect("the tier opens over the directory the first model wrote");
+    let session = fresh.open_session().expect("a session opens");
+    // A pattern no live row holds, so a restore that skipped the ring - or
+    // skipped zeroing the dead rows - shows.
+    paint_ring(&fresh, session, |_, _| 0xEE);
+    let info = fresh
+        .kv_resume(session, &path_of(AT))
+        .expect("the resume did not fail")
+        .expect("the stored prefix was found");
+    assert_eq!(info.tokens_reused, AT);
+
+    let stack = fresh.stack();
+    // The fixture's checkpoint carries no head, so its ring is the attention
+    // slots' alone; a head's rank, the last, is covered by the engine's own
+    // `RingLayout` cases.
+    let head = stack.has_draft_head();
+    let ring = stack.session(session).expect("open").indexer_rings();
+    let mut bytes = vec![0_u8; usize::try_from(ring.len()).expect("a fixture range fits")];
+    stack
+        .backend()
+        .copy_d2h(ring, &mut bytes)
+        .expect("the fake device answers a read");
+    let ranks = bytes.len() / (RING_ROW * RING_ROWS);
+    assert_eq!(ranks, 2 + usize::from(head), "one ring per attention slot");
+    for (row, chunk) in bytes.chunks_exact(RING_ROW).enumerate() {
+        let (rank, slot) = (row / RING_ROWS, row % RING_ROWS);
+        let live = if head && rank + 1 == ranks {
+            0..2
+        } else {
+            0..3
+        };
+        let want = if live.contains(&slot) {
+            u8::try_from(1 + row).expect("a few rows")
+        } else {
+            0
+        };
+        assert!(
+            chunk.iter().all(|byte| *byte == want),
+            "rank {rank} slot {slot} came back {:#04x}, expected {want:#04x}",
+            chunk[0]
+        );
+    }
+}
+
 #[test]
 fn a_finished_turn_is_stored_at_the_last_position_it_wrote() {
     // The next turn's prompt is this one plus the answer plus a new message, so
