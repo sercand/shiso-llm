@@ -32,6 +32,10 @@ pub(crate) mod residency;
 pub(crate) mod weights;
 
 #[cfg(test)]
+mod cuda_set_tests;
+#[cfg(test)]
+pub(crate) mod gguf_forge;
+#[cfg(test)]
 mod quant_tests;
 #[cfg(test)]
 mod residency_tests;

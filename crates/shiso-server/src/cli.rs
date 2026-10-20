@@ -477,6 +477,10 @@ pub struct ServeArgs {
     /// routes take it; every other route keeps the JSON body limit.
     #[arg(long, env = "SHISO_AUDIO_MAX_UPLOAD_MB", default_value = "512")]
     pub audio_max_upload_mb: NonZeroU32,
+    /// The largest image edit request body, in MiB. Only the image edit
+    /// routes take it; every other route keeps the JSON body limit.
+    #[arg(long, env = "SHISO_IMAGE_MAX_UPLOAD_MB", default_value = "64")]
+    pub image_max_upload_mb: NonZeroU32,
     /// Speech recognizer checkpoint: an export directory or a GGUF file.
     /// Serves `/v1/audio/transcriptions`.
     #[arg(long, env = "SHISO_ASR_MODEL")]
@@ -546,8 +550,9 @@ pub struct ServeArgs {
     /// name the loaded checkpoint reports for itself.
     #[arg(long, env = "SHISO_IMAGE_MODEL_ID")]
     pub image_model_id: Option<String>,
-    /// Directory holding shared image assets (`text_encoder`, `vae`,
-    /// `tokenizer`) when they are not collocated with `--image-model`.
+    /// Directory holding shared image assets (`text_encoder`, `vae` or
+    /// `ae.safetensors`, `tokenizer`) when they are not collocated with
+    /// `--image-model`.
     #[arg(long, env = "SHISO_IMAGE_ASSETS_DIR")]
     pub image_assets_dir: Option<PathBuf>,
     /// Explicit path to the text encoder weights when they are split from
@@ -573,18 +578,22 @@ pub struct ServeArgs {
     pub embedding_max_queue: usize,
     /// Denoising steps a request that names none gets. More is slower and,
     /// past the point the checkpoint was distilled for, not better.
-    /// Unset, the loaded model's own default (or fixed schedule) is used.
+    /// Unset, the loaded model's own default (or fixed schedule) is used:
+    /// 4 for FLUX.2-klein, 16 for the distilled FLUX.3 Klein.
     #[arg(long, env = "SHISO_IMAGE_DEFAULT_STEPS")]
     pub image_default_steps: Option<u32>,
     /// The image size a request that names none gets, as `WxH`
     /// (e.g. 1024x1024). Both sides must sit on the loaded model's grid and
-    /// within its bounds; unset, the model's own default size is used.
+    /// within its bounds; unset, the model's own default size is used
+    /// (1024x1024 on a 16-pixel grid for FLUX.2-klein and FLUX.3 Klein, whose
+    /// sides run 64 to 4096).
     #[arg(long, env = "SHISO_IMAGE_DEFAULT_SIZE")]
     pub image_default_size: Option<String>,
     /// Which image pipeline components stay loaded across jobs: `auto`
     /// keeps all of them when they fit the device's working set beside a
     /// job and otherwise swaps; `resident` refuses a job that does not fit;
-    /// `swap` lets the text encoder and the transformer take turns.
+    /// `swap` lets the text encoder and the transformer take turns (the
+    /// FLUX.3 Klein and Qwen-Image-2.1 pipelines; FLUX.2-klein refuses it).
     #[arg(
         long,
         env = "SHISO_IMAGE_RESIDENCY",
@@ -1293,6 +1302,14 @@ impl ServeArgs {
             policy = policy.with_timeout_secs(seconds);
         }
         Some(policy)
+    }
+
+    /// The image edit routes' body limit, in bytes.
+    #[must_use]
+    pub fn image_max_upload_bytes(&self) -> usize {
+        usize::try_from(self.image_max_upload_mb.get())
+            .unwrap_or(usize::MAX)
+            .saturating_mul(1024 * 1024)
     }
 
     /// The transcription routes' body limit, in bytes.

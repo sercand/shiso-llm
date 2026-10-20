@@ -50,8 +50,12 @@ impl Lin {
         let weight_name = format!("{name}.weight");
         let entry = store.require(&weight_name)?;
         let kind = match (entry.block, entry.dtype) {
+            (Some(BlockFormat::Q2K), _) => WeightKind::Q2K,
+            (Some(BlockFormat::Q3K), _) => WeightKind::Q3K,
             (Some(BlockFormat::Q4K), _) => WeightKind::Q4K,
+            (Some(BlockFormat::Q5K), _) => WeightKind::Q5K,
             (Some(BlockFormat::Q6K), _) => WeightKind::Q6K,
+            (Some(BlockFormat::Q8_0), _) => WeightKind::Q8_0,
             (None, dtype) => Self::plain_kind(&weight_name, dtype)?,
         };
         let scale = if kind == WeightKind::Fp8 {
@@ -82,6 +86,25 @@ impl Lin {
             })?)
             .unwrap_or(usize::MAX),
         );
+        if let Some(format) = entry.block {
+            // The GGUF reader sized the span from the declared shape; this
+            // pins the per-row geometry the kernels walk, so a row that is
+            // not whole blocks is refused naming the tensor, not read into
+            // its neighbour.
+            let row_bytes = in_dim
+                .is_multiple_of(format.block_elems())
+                .then(|| format.row_bytes(in_dim));
+            let stored = store.bytes(&weight_name)?.len();
+            if row_bytes.and_then(|row| row.checked_mul(out_dim)) != Some(stored) {
+                return Err(ImageGenError::Checkpoint(format!(
+                    "'{weight_name}' is {format:?} with {in_dim} weights per row; a row must \
+                     be whole {}-weight blocks of {} bytes and the tensor {stored} bytes \
+                     long",
+                    format.block_elems(),
+                    format.block_bytes()
+                )));
+            }
+        }
         let bias_name = format!("{name}.bias");
         let bias = if store.contains(&bias_name) {
             let values = store.f32_vec(&bias_name)?;

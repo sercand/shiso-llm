@@ -240,18 +240,59 @@ environment variable. The ones you are most likely to want:
 | `--asr-max-context-tokens` | Most tokens a transcription's `keywords` and `prompt` may take once tokenized (default 256; at most the recognizer's own cap, 512 for Qwen3-ASR) |
 | `--image-model` | Image generation checkpoint (file or directory); serves the image generation routes |
 | `--image-model-id` | The name the image generator answers to on the wire (default: the name the loaded checkpoint reports) |
-| `--image-assets-dir` | Directory holding shared image assets (`text_encoder`, `vae`, `tokenizer`; for Qwen-Image-2.1 also `model_index.json`, `scheduler/` and `transformer/config.json`, which carry the schedule) when they are not collocated with `--image-model` |
+| `--image-assets-dir` | Directory holding shared image assets (`text_encoder`, `vae` (FLUX.3 Klein: `ae.safetensors`), `tokenizer`; for Qwen-Image-2.1 also `model_index.json`, `scheduler/` and `transformer/config.json`, which carry the schedule) when they are not collocated with `--image-model` |
 | `--image-text-encoder` | Text encoder weights path when it is split from `--image-model`; overrides where the locator would look |
 | `--image-vae` | VAE weights path when it is split from `--image-model`; overrides where the locator would look |
 | `--image-tokenizer` | Tokenizer path when it is split from `--image-model`; overrides where the locator would look |
+| `--image-max-upload-mb` | Largest image edit request body in MiB (default 64); only the edit routes take it |
 | `--image-max-queue` | Image requests that may wait in the queue beyond the one generating (default 16); the next is refused with a 503 a retry can fix |
-| `--image-default-steps` | Denoising steps a request that names none gets (default: the loaded model's own: 4 for FLUX.2-klein; for Qwen-Image-2.1 the length of `model_index.json`'s `sample_sigmas`, fixed, when it ships them (8 for Turbo), else 40) |
-| `--image-default-size` | The image size a request that names none gets, as `WxH` (default: the loaded model's own: 1024x1024 on a 16-pixel grid for FLUX.2-klein, 512x512 on a 32-pixel grid for Qwen-Image-2.1, where sizes must be exact multiples of 32); a size off the model's grid is refused at boot |
-| `--image-residency` | Which image pipeline components stay loaded across jobs: `auto` (default) keeps all of them when they fit the device's working set beside a job and otherwise swaps, `resident` refuses a job that does not fit, `swap` lets the text encoder and the transformer take turns |
+| `--image-default-steps` | Denoising steps a request that names none gets (default: the loaded model's own: 4 for FLUX.2-klein, 16 for FLUX.3 Klein; for Qwen-Image-2.1 the length of `model_index.json`'s `sample_sigmas`, fixed, when it ships them (8 for Turbo), else 40) |
+| `--image-default-size` | The image size a request that names none gets, as `WxH` (default: the loaded model's own: 1024x1024 on a 16-pixel grid for FLUX.2-klein and FLUX.3 Klein (FLUX.3 Klein sides run 64 to 4096), 512x512 on a 32-pixel grid for Qwen-Image-2.1, where sizes must be exact multiples of 32); a size off the model's grid is refused at boot |
+| `--image-residency` | Which image pipeline components stay loaded across jobs: `auto` (default) keeps all of them when they fit the device's working set beside a job and otherwise swaps, `resident` refuses a job that does not fit, `swap` lets the text encoder and the transformer take turns (FLUX.3 Klein and Qwen-Image-2.1; FLUX.2-klein refuses it) |
 | `--image-reserve-gb` | GiB of the device working set the image pipeline leaves to the rest of the host when it plans what stays loaded (default 1.5) |
 | `--image-draft-steps` | Leading denoising steps of every image job run at half the requested resolution, then handed over to the full size (Qwen-Image-2.1 only; default 0). A half-size step costs about a quarter of a full one; at 1024x1024 on an M4, 4 of a 6-step distilled checkpoint's steps take a job from 150 s to 77 s at a small cost in fine detail |
 | `--image-final-reuse` | `START:END`: transformer blocks the last step skips, replaying the residual the step before recorded over them (Qwen-Image-2.1 only; the last two steps must run at full size). Faster, visibly softer |
 | `--embedding-max-queue` | Embedding requests that may wait in the queue beyond the one running (default 64), when `--model` is an embedding checkpoint |
+
+### FLUX.3 Klein (image generation, Metal)
+
+`--image-model` takes the distilled FLUX.3 Klein transformer as one `.gguf` (the
+Q2_K to Q8_0 mixed-quantization exports are read in their stored formats, never
+dequantized) or one `.safetensors` file; the Base (guidance, 50-step) release is
+refused by name. The text encoder is the Qwen3-VL-4B language model, as
+`text_encoder/` shards or one INT8 ConvRot file with its `config.json`, the VAE
+is `ae.safetensors`, and the tokenizer is `tokenizer.json`; the locator finds
+each beside the model or under `--image-assets-dir`, or take the explicit flags.
+It runs 16 flow-map Euler steps without guidance at 1024x1024 by default (sides
+64 to 4096 on a 16-pixel grid), and `--image-residency swap` (or `auto` on a host
+too small for both) drops the text encoder before the transformer is imported.
+Measured on a 24 GiB M4 (Metal working set 17.8 GiB), 1024x1024, 16 steps, with
+the Q4_K_XL transformer: the pictures are byte-identical across `resident`, `swap`
+and an `auto` that chose swap (BF16 and INT8 text encoders), and the image takes
+the same ~242 s either way, since a swap costs under a few seconds of page-cache
+reads and imports (the files were mostly in the page cache; a fully cold read was
+not measured). What changes is the device's peak allocation: with the BF16 text
+encoder (7.2 GB loaded) 16.7 GB resident, 9.5 GB for a swap that keeps the
+transformer through the decode and 7.6 GB for one that drops it first
+(`--image-reserve-gb 10`); with the INT8 encoder (4.3 GB) 13.8 GB resident against
+9.5 GB. `auto` chooses `resident` here at the default reserve and swap once
+`--image-reserve-gb` leaves too little. A reserve that leaves less than a 1024x1024
+job needs is refused when the model opens, naming the largest square side that
+would fit (or saying that none does).
+The generator itself accepts up to 10 reference pictures for editing: a single
+reference is fitted under 4 MiB pixels and reflect-padded to a canvas on the grid,
+several are each fitted under 1 MP. Over HTTP an edit is `POST /v1/images/edits`
+(multipart `image` / `image[]`, up to 10, or JSON `images: [{"image_url":
+"data:..."}]`); a request that names no `size` gets the size its references
+imply (one reference: its own aspect ratio), and `n` must be 1. FLUX.2-klein and
+Qwen-Image-2.1 answer an edit with a 400 naming the model. The model's
+authors ship a prompt upsampler with it and recommend not running it without
+one; this build has none, so prompts reach the model as typed. FLUX.3 Klein on
+CUDA is **written but unvalidated**: the `diffusion` kernel module has a CUDA
+port (`kernels/cuda/diffusion`) that was written on a machine with no CUDA
+toolchain, so it has never been compiled by nvcc or run on a device. Treat any
+CUDA output as untrusted until the `shiso-cuda` `diffusion_kernels` cases and
+the FLUX.3 end-to-end case have passed on a GPU.
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
 
@@ -264,7 +305,8 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/audio/transcriptions` | OpenAI Audio Transcriptions (also at `/audio/transcriptions`) |
-| `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein and Qwen-Image-2.1 (Turbo, base, and fine-tunes in the same format; the schedule is the assets' `model_index.json` `sample_sigmas`, shifted by `scheduler/scheduler_config.json`); `b64_json` only) |
+| `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein, the distilled FLUX.3 Klein and Qwen-Image-2.1 (Turbo, base, and fine-tunes in the same format; the schedule is the assets' `model_index.json` `sample_sigmas`, shifted by `scheduler/scheduler_config.json`); `b64_json` only) |
+| `POST /v1/images/edits` | OpenAI Image edits (also at `/images/edits`; FLUX.3 Klein only; multipart `image`/`image[]` (up to 10) or JSON `images` with `data:` URLs, plus `prompt`, `size`, `seed`, `steps`, `output_format`, `output_compression`; `n` must be 1, no `mask`; `b64_json` only; body limit `--image-max-upload-mb`) |
 | `POST /v1/embeddings` | OpenAI and OpenRouter Embeddings (also at `/embeddings`; text, token-id and multimodal `content` inputs, `dimensions`, `encoding_format` `float` or `base64`, `input_type`) |
 | `GET /v1/models` | OpenAI Models |
 | `GET /health`, `GET /metrics`, `GET /cache` | health, metrics, cache report |

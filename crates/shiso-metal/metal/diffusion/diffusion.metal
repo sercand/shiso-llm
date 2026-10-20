@@ -721,7 +721,8 @@ kernel void kernel_dit_sdpa_f32(
 
 /// Causal grouped-query attention over packed rows (the text encoder's
 /// prefill): query head `h` reads kv head `h / (q_heads / kv_heads)` and
-/// attends to keys `0..=t`.
+/// attends to keys `0..=t`, of which only those below `valid_keys` count (a
+/// padded prompt's pad rows attend every real key and no pad key).
 kernel void kernel_dit_gqa_f32(
         constant dit_args_gqa & args [[buffer(0)]],
         device float *out               [[buffer(1)]],
@@ -743,8 +744,10 @@ kernel void kernel_dit_gqa_f32(
     const uint qrow = (t * args.q_heads + h) * hd;
     const float scale = 1.0f / sqrt(float(hd));
 
+    // Keys `0..seen`: causal, and never at or past the valid limit.
+    const uint seen = min(t + 1u, args.valid_keys);
     float max_score = -INFINITY;
-    for (uint s = 0u; s <= t; s++) {
+    for (uint s = 0u; s < seen; s++) {
         const uint krow = (s * args.kv_heads + kvh) * hd;
         const float score = dit_head_dot(q, qrow, k, krow, hd, tid, scratch) * scale;
         max_score = max(max_score, score);
@@ -755,7 +758,7 @@ kernel void kernel_dit_gqa_f32(
         acc[slot] = 0.0f;
     }
     float sum = 0.0f;
-    for (uint s = 0u; s <= t; s++) {
+    for (uint s = 0u; s < seen; s++) {
         const uint krow = (s * args.kv_heads + kvh) * hd;
         const float score = dit_head_dot(q, qrow, k, krow, hd, tid, scratch) * scale;
         const float p = exp(score - max_score);
@@ -836,8 +839,8 @@ kernel void kernel_dit_rope_4d(
 }
 
 /// Rotate-half 1-axis RoPE on one packed (tokens, heads, head_dim) tensor,
-/// with the token index as the position: pair `(i, i + head_dim/2)` turns
-/// by `token * freqs[i]`.
+/// with the token index as the position (rows from `pinned_from` on use
+/// `pinned_pos`): pair `(i, i + head_dim/2)` turns by `position * freqs[i]`.
 kernel void kernel_dit_rope_half(
         constant dit_args_rope_half & args [[buffer(0)]],
         device float *tensor                  [[buffer(1)]],
@@ -852,9 +855,10 @@ kernel void kernel_dit_rope_half(
     }
     // `half` is a reserved type name in MSL, so the split point is `fold`.
     const uint fold = args.head_dim / 2u;
+    const uint position = t >= args.pinned_from ? args.pinned_pos : t;
     device float *row = tensor + (uint64_t)(t * args.heads + h) * args.head_dim;
     for (uint i = tid; i < fold; i += DIT_BLOCK) {
-        const float angle = float(t) * freqs[i];
+        const float angle = float(position) * freqs[i];
         const float c = cos(angle);
         const float s = sin(angle);
         const float x0 = row[i];
@@ -1207,6 +1211,105 @@ struct dit_wrows_q6k {
     }
 };
 
+/// Q2_K (84 bytes): `uchar scales[16]; uchar qs[64]; half d, dmin`. Two
+/// planes of 128 weights, each four runs of 32 at bit shifts 0, 2, 4, 6 of
+/// the plane's 32 `qs` bytes; every 16 weights have a scale nibble (low) and
+/// a min nibble (high) in `scales[8 * plane + 2 * run + half]`, and the
+/// weight is `d * sc * q - dmin * m`. Four weights from a 4-aligned `kk`
+/// share one 16-run, so one load decodes one scale/min pair.
+struct dit_wrows_q2k {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        device const uchar *b = w + (uint64_t) n * (k / 256u) * 84u + (kk / 256u) * 84u;
+        const uint i = kk % 256u;
+        const uint plane = i / 128u;
+        const uint run = (i % 128u) / 32u;
+        const uint within = i % 32u;
+        const uint sc = b[8u * plane + 2u * run + within / 16u];
+        const float d = float(*((device const half *) (b + 80))) * float(sc & 0xFu);
+        const float m = float(*((device const half *) (b + 82))) * float(sc >> 4u);
+        const uchar4 q = uchar4(*((device const packed_uchar4 *) (b + 16u + 32u * plane + within)));
+        return d * float4((uint4(q) >> (2u * run)) & 3u) - m;
+    }
+};
+
+/// Q3_K (110 bytes): `uchar hmask[32]; uchar qs[64]; uchar scales[12]; half
+/// d`. The 2-bit codes lay out as in Q2_K; the third bit is the inverted
+/// `hmask` bit `4 * plane + run` of byte `within`, so a clear bit subtracts
+/// 4. The sixteen 6-bit scales (minus 32) keep their low nibbles in
+/// `scales[0..8]` (low then high nibble for scales 0..8 and 8..16) and
+/// their top two bits in `scales[8..12]`; the weight is `d * scale * q`.
+struct dit_wrows_q3k {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        device const uchar *b = w + (uint64_t) n * (k / 256u) * 110u + (kk / 256u) * 110u;
+        const uint i = kk % 256u;
+        const uint plane = i / 128u;
+        const uint run = (i % 128u) / 32u;
+        const uint within = i % 32u;
+        const uint is = 8u * plane + 2u * run + within / 16u;
+        device const uchar *sc = b + 96;
+        const uint low = is < 8u ? (uint(sc[is]) & 0xFu) : (uint(sc[is - 8u]) >> 4u);
+        const uint high = (uint(sc[8u + (is & 3u)]) >> (2u * (is >> 2u))) & 3u;
+        const float d = float(*((device const half *) (b + 108))) * float(int(low | (high << 4u)) - 32);
+        const uchar4 q = uchar4(*((device const packed_uchar4 *) (b + 32u + 32u * plane + within)));
+        const uchar4 h = uchar4(*((device const packed_uchar4 *) (b + within)));
+        const int4 lo = int4((uint4(q) >> (2u * run)) & 3u);
+        const int4 set = int4((uint4(h) >> (4u * plane + run)) & 1u);
+        return d * float4(lo - 4 + 4 * set);
+    }
+};
+
+/// Q5_K (176 bytes): `half d, dmin; uchar scales[12]; uchar qh[32]; uchar
+/// qs[128]`. Q4_K's runs and scale/min packing, plus a fifth bit: bit
+/// `2 * chunk` (low nibbles) or `2 * chunk + 1` (high nibbles) of `qh[l]`
+/// adds 16 to the code.
+struct dit_wrows_q5k {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        device const uchar *b = w + (uint64_t) n * (k / 256u) * 176u + (kk / 256u) * 176u;
+        const uint i = kk % 256u;
+        const uint chunk = i / 64u;
+        const uint within = i % 64u;
+        const uint high_half = within >= 32u ? 1u : 0u;
+        const uint sub = 2u * chunk + high_half;
+        device const uchar *sc = b + 4;
+        uint scale;
+        uint min;
+        if (sub < 4u) {
+            scale = sc[sub] & 63u;
+            min = sc[sub + 4u] & 63u;
+        } else {
+            scale = (sc[sub + 4u] & 0xFu) | ((sc[sub - 4u] >> 6u) << 4u);
+            min = (sc[sub + 4u] >> 4u) | ((sc[sub] >> 6u) << 4u);
+        }
+        const float d = float(*((device const half *) b)) * float(scale);
+        const float m = float(*((device const half *) (b + 2))) * float(min);
+        const uint l = within % 32u;
+        const uchar4 q = uchar4(*((device const packed_uchar4 *) (b + 48u + 32u * chunk + l)));
+        const uchar4 qh = uchar4(*((device const packed_uchar4 *) (b + 16u + l)));
+        const uint4 nib = high_half != 0u ? uint4(q) >> 4u : uint4(q) & 0xFu;
+        const uint4 bit = (uint4(qh) >> (2u * chunk + high_half)) & 1u;
+        return d * float4(nib | (bit << 4u)) - m;
+    }
+};
+
+/// Q8_0 (34 bytes): `half d; char qs[32]`; the weight is `d * q`. Rows are
+/// `k / 32` blocks, and a 4-aligned `kk` never straddles one.
+struct dit_wrows_q8_0 {
+    device const uchar *w;
+    uint k;
+    float4 load4(uint n, uint kk) const {
+        device const uchar *b = w + (uint64_t) n * (k / 32u) * 34u + (kk / 32u) * 34u;
+        const float d = float(*((device const half *) b));
+        const char4 q = char4(*((device const packed_char4 *) (b + 2u + kk % 32u)));
+        return d * float4(q);
+    }
+};
+
 /// A linear's epilogue: `out[r][c] = acc * scale(c) + bias[c]`, the bias read
 /// only when the driver's presence flag says the binding is real.
 template <typename SC>
@@ -1236,8 +1339,151 @@ static inline float4 dit_load4m(const AR a, uint r, uint kk, uint m) {
     return float4(0.0f);
 }
 
+/// Eight consecutive weights of row `n` from a 8-aligned `kk`, as two
+/// float4s. A reader whose eight share one decoded scale overrides this, so
+/// the scale is unpacked once per eight; the floats are the ones two
+/// `load4` calls return.
+template <typename WR>
+static inline void dit_load8(const WR w, uint n, uint kk, thread float4 &lo, thread float4 &hi) {
+    lo = w.load4(n, kk);
+    hi = w.load4(n, kk + 4u);
+}
+
+/// Q4_K: an 8-aligned run of eight lies in one 32-run, so one scale/min.
+static inline void dit_load8(const dit_wrows_q4k w, uint n, uint kk, thread float4 &lo, thread float4 &hi) {
+    device const uchar *b = w.w + (uint64_t) n * (w.k / 256u) * 144u + (kk / 256u) * 144u;
+    const uint i = kk % 256u;
+    const uint chunk = i / 64u;
+    const uint within = i % 64u;
+    const uint sub = 2u * chunk + (within >= 32u ? 1u : 0u);
+    device const uchar *sc = b + 4;
+    uint scale;
+    uint min;
+    if (sub < 4u) {
+        scale = sc[sub] & 63u;
+        min = sc[sub + 4u] & 63u;
+    } else {
+        scale = (sc[sub + 4u] & 0xFu) | ((sc[sub - 4u] >> 6u) << 4u);
+        min = (sc[sub + 4u] >> 4u) | ((sc[sub] >> 6u) << 4u);
+    }
+    const float d = float(*((device const half *) b)) * float(scale);
+    const float m = float(*((device const half *) (b + 2))) * float(min);
+    device const uchar *qs = b + 16 + 32u * chunk + within % 32u;
+    const uchar4 q0 = uchar4(*((device const packed_uchar4 *) qs));
+    const uchar4 q1 = uchar4(*((device const packed_uchar4 *) (qs + 4)));
+    const uint4 c0 = within >= 32u ? uint4(q0) >> 4u : uint4(q0) & 0xFu;
+    const uint4 c1 = within >= 32u ? uint4(q1) >> 4u : uint4(q1) & 0xFu;
+    lo = d * float4(c0) - m;
+    hi = d * float4(c1) - m;
+}
+
+/// Q5_K: Q4_K's runs plus the fifth bit, one scale/min per eight.
+static inline void dit_load8(const dit_wrows_q5k w, uint n, uint kk, thread float4 &lo, thread float4 &hi) {
+    device const uchar *b = w.w + (uint64_t) n * (w.k / 256u) * 176u + (kk / 256u) * 176u;
+    const uint i = kk % 256u;
+    const uint chunk = i / 64u;
+    const uint within = i % 64u;
+    const uint high_half = within >= 32u ? 1u : 0u;
+    const uint sub = 2u * chunk + high_half;
+    device const uchar *sc = b + 4;
+    uint scale;
+    uint min;
+    if (sub < 4u) {
+        scale = sc[sub] & 63u;
+        min = sc[sub + 4u] & 63u;
+    } else {
+        scale = (sc[sub + 4u] & 0xFu) | ((sc[sub - 4u] >> 6u) << 4u);
+        min = (sc[sub + 4u] >> 4u) | ((sc[sub] >> 6u) << 4u);
+    }
+    const float d = float(*((device const half *) b)) * float(scale);
+    const float m = float(*((device const half *) (b + 2))) * float(min);
+    const uint l = within % 32u;
+    device const uchar *qs = b + 48u + 32u * chunk + l;
+    device const uchar *qhp = b + 16u + l;
+    const uint shift = 2u * chunk + high_half;
+    DIT_UNROLL for (uint h = 0; h < 2u; ++h) {
+        const uchar4 q = uchar4(*((device const packed_uchar4 *) (qs + 4u * h)));
+        const uchar4 qh = uchar4(*((device const packed_uchar4 *) (qhp + 4u * h)));
+        const uint4 nib = high_half != 0u ? uint4(q) >> 4u : uint4(q) & 0xFu;
+        const uint4 bit = (uint4(qh) >> shift) & 1u;
+        const float4 v = d * float4(nib | (bit << 4u)) - m;
+        if (h == 0u) { lo = v; } else { hi = v; }
+    }
+}
+
+/// Q6_K: eight from an 8-aligned `kk` share one int8 scale (one per 16).
+static inline void dit_load8(const dit_wrows_q6k w, uint n, uint kk, thread float4 &lo, thread float4 &hi) {
+    device const uchar *b = w.w + (uint64_t) n * (w.k / 256u) * 210u + (kk / 256u) * 210u;
+    const uint i = kk % 256u;
+    const uint half_ = i / 128u;
+    const uint r = (i % 128u) / 32u;
+    const uint l = i % 32u;
+    const float scale = float(((device const char *) (b + 192u))[8u * half_ + l / 16u + 2u * r]);
+    const float d = float(*((device const half *) (b + 208u)));
+    device const uchar *qlp = b + 64u * half_ + 32u * (r & 1u) + l;
+    device const uchar *qhp = b + 128u + 32u * half_ + l;
+    DIT_UNROLL for (uint h = 0; h < 2u; ++h) {
+        const uchar4 ql = uchar4(*((device const packed_uchar4 *) (qlp + 4u * h)));
+        const uchar4 qh = uchar4(*((device const packed_uchar4 *) (qhp + 4u * h)));
+        const uint4 lo4 = r >= 2u ? uint4(ql) >> 4u : uint4(ql) & 0xFu;
+        const uint4 hi4 = (uint4(qh) >> (2u * r)) & 3u;
+        const int4 q = int4(lo4 | (hi4 << 4u)) - 32;
+        const float4 v = d * scale * float4(q);
+        if (h == 0u) { lo = v; } else { hi = v; }
+    }
+}
+
+/// Q2_K: eight from an 8-aligned `kk` share one 16-run's scale/min.
+static inline void dit_load8(const dit_wrows_q2k w, uint n, uint kk, thread float4 &lo, thread float4 &hi) {
+    device const uchar *b = w.w + (uint64_t) n * (w.k / 256u) * 84u + (kk / 256u) * 84u;
+    const uint i = kk % 256u;
+    const uint plane = i / 128u;
+    const uint run = (i % 128u) / 32u;
+    const uint within = i % 32u;
+    const uint sc = b[8u * plane + 2u * run + within / 16u];
+    const float d = float(*((device const half *) (b + 80))) * float(sc & 0xFu);
+    const float m = float(*((device const half *) (b + 82))) * float(sc >> 4u);
+    device const uchar *qs = b + 16u + 32u * plane + within;
+    DIT_UNROLL for (uint h = 0; h < 2u; ++h) {
+        const uchar4 q = uchar4(*((device const packed_uchar4 *) (qs + 4u * h)));
+        const float4 v = d * float4((uint4(q) >> (2u * run)) & 3u) - m;
+        if (h == 0u) { lo = v; } else { hi = v; }
+    }
+}
+
+/// Q3_K: eight from an 8-aligned `kk` share one 16-run's scale.
+static inline void dit_load8(const dit_wrows_q3k w, uint n, uint kk, thread float4 &lo, thread float4 &hi) {
+    device const uchar *b = w.w + (uint64_t) n * (w.k / 256u) * 110u + (kk / 256u) * 110u;
+    const uint i = kk % 256u;
+    const uint plane = i / 128u;
+    const uint run = (i % 128u) / 32u;
+    const uint within = i % 32u;
+    const uint is = 8u * plane + 2u * run + within / 16u;
+    device const uchar *sc = b + 96;
+    const uint low = is < 8u ? (uint(sc[is]) & 0xFu) : (uint(sc[is - 8u]) >> 4u);
+    const uint high = (uint(sc[8u + (is & 3u)]) >> (2u * (is >> 2u))) & 3u;
+    const float d = float(*((device const half *) (b + 108))) * float(int(low | (high << 4u)) - 32);
+    DIT_UNROLL for (uint h = 0; h < 2u; ++h) {
+        const uchar4 q = uchar4(*((device const packed_uchar4 *) (b + 32u + 32u * plane + within + 4u * h)));
+        const uchar4 hm = uchar4(*((device const packed_uchar4 *) (b + within + 4u * h)));
+        const int4 lo4 = int4((uint4(q) >> (2u * run)) & 3u);
+        const int4 set = int4((uint4(hm) >> (4u * plane + run)) & 1u);
+        const float4 v = d * float4(lo4 - 4 + 4 * set);
+        if (h == 0u) { lo = v; } else { hi = v; }
+    }
+}
+
+/// Q8_0: eight from an 8-aligned `kk` lie in one 32-block.
+static inline void dit_load8(const dit_wrows_q8_0 w, uint n, uint kk, thread float4 &lo, thread float4 &hi) {
+    device const uchar *b = w.w + (uint64_t) n * (w.k / 32u) * 34u + (kk / 32u) * 34u;
+    const float d = float(*((device const half *) b));
+    device const uchar *qs = b + 2u + kk % 32u;
+    lo = d * float4(char4(*((device const packed_char4 *) qs)));
+    hi = d * float4(char4(*((device const packed_char4 *) (qs + 4u))));
+}
+
 /// Threadgroup floats the tile stages through: `[64][16+4]` activations and
-/// `[16][64+4]` weights.
+/// `[64][16+4]` weights, both k-fastest.
 #define DIT_G64_SMEM (DIT_G64_TILE * (DIT_G64_K + 4u) + DIT_G64_K * (DIT_G64_TILE + 4u))
 
 template <typename AR, typename WR, typename EP>
@@ -1261,7 +1507,17 @@ static inline void dit_gemm64_tile(
     // Two float4 slots per thread per operand: slot e is row e / 4, k (e % 4) * 4.
     const uint SLOTS = BM * BK / 4u / NT;
     float4 ra[SLOTS];
-    float4 rb[SLOTS];
+    // Weights: thread t stages eight consecutive k of column t / 2, so a
+    // block-quantized reader decodes one scale per eight weights instead of
+    // one per four. Same floats in the same slots, so the same bits. Measured
+    // on an M4 at the FLUX.3 single-block shapes (4176 rows): Q4_K
+    // 18432x3072 161 -> 153 ms, Q5_K 3072x3072 27.7 -> 26.5 ms. A k-fastest
+    // weight layout read with transposed simdgroup loads ran 166 ms, 32-deep
+    // k slices 158 ms, issuing the next fetch before the MMAs 157 ms, and a
+    // 128-row tile 162 ms.
+    float4 rb[2];
+    const uint wn = tid >> 1u;
+    const uint wk = (tid & 1u) * 8u;
     const bool along_m = dit_reads_along_m<AR>::value != 0;
     auto fetch = [&](uint k0) {
         DIT_UNROLL for (uint q = 0; q < SLOTS; ++q) {
@@ -1276,7 +1532,12 @@ static inline void dit_gemm64_tile(
             } else {
                 ra[q] = m0 + rr < M ? a.load4(m0 + rr, k0 + kk) : float4(0.0f);
             }
-            rb[q] = n0 + rr < N ? w.load4(n0 + rr, k0 + kk) : float4(0.0f);
+        }
+        if (n0 + wn < N) {
+            dit_load8(w, n0 + wn, k0 + wk, rb[0], rb[1]);
+        } else {
+            rb[0] = float4(0.0f);
+            rb[1] = float4(0.0f);
         }
     };
 
@@ -1303,10 +1564,10 @@ static inline void dit_gemm64_tile(
             } else {
                 *((threadgroup float4 *) (sa + rr * LDA + kk)) = ra[q];
             }
-            sb[(kk + 0u) * LDB + rr] = rb[q].x;
-            sb[(kk + 1u) * LDB + rr] = rb[q].y;
-            sb[(kk + 2u) * LDB + rr] = rb[q].z;
-            sb[(kk + 3u) * LDB + rr] = rb[q].w;
+        }
+        DIT_UNROLL for (uint e = 0; e < 4u; ++e) {
+            sb[(wk + e) * LDB + wn] = rb[0][e];
+            sb[(wk + 4u + e) * LDB + wn] = rb[1][e];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         DIT_UNROLL for (uint kk = 0; kk < BK; kk += 8u) {
@@ -1407,6 +1668,40 @@ kernel void kernel_dit_gemm64_q6k(DIT_GEMM64_PARAMS(uchar)) {
     threadgroup float smem[DIT_G64_SMEM];
     dit_gemm64_tile(args.m, args.n, args.k,
                       dit_rows_f32{in, args.k}, dit_wrows_q6k{weight, args.k},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+/// The same tile over GGUF Q2_K, Q3_K, Q5_K and Q8_0 weights (`k % 256 == 0`,
+/// `k % 32 == 0` for Q8_0); binding 4 is the unit scale.
+kernel void kernel_dit_gemm64_q2k(DIT_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_q2k{weight, args.k},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_dit_gemm64_q3k(DIT_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_q3k{weight, args.k},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_dit_gemm64_q5k(DIT_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_q5k{weight, args.k},
+                      dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
+                      smem, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_dit_gemm64_q8_0(DIT_GEMM64_PARAMS(uchar)) {
+    threadgroup float smem[DIT_G64_SMEM];
+    dit_gemm64_tile(args.m, args.n, args.k,
+                      dit_rows_f32{in, args.k}, dit_wrows_q8_0{weight, args.k},
                       dit_store_rows<dit_scale_tensor>{out, args.n, {weight_scale}, bias, args.has_bias != 0u},
                       smem, tgpig, tid, lane, sg);
 }
@@ -1550,6 +1845,41 @@ static inline half4 dit_half4_sat(float4 v) {
     return half4(clamp(v, float4(-65504.0f), float4(65504.0f)));
 }
 
+/// K and V of one joint attention narrowed to half once, for
+/// `kernel_dit_flash_sdpa_d128_kvh`: `k_out` and `v_out` are packed
+/// `(txt + img + cache, heads * head_dim)` in joint-row order, each element
+/// the operand's own section (`k_offset`, `v_offset`, the txt/img/cache
+/// strides) through `dit_half4_sat`, the conversion the f32 entry applies
+/// while staging. The flash kernel's every query tile would otherwise re-read
+/// and re-narrow the f32 rows; measured on an M4 at a FLUX.3 single block
+/// (4176 rows, 24 heads of 128) the attention took 65 ms from half rows
+/// against 77 ms from f32 ones, with the same staged halves.
+/// Grid `(ceil(heads * head_dim / 256), rows)` x 64, four values per thread.
+kernel void kernel_dit_kv_half_f32(
+        constant dit_args_sdpa & args [[buffer(0)]],
+        device half *k_out               [[buffer(1)]],
+        device half *v_out               [[buffer(2)]],
+        device const float *k_txt        [[buffer(3)]],
+        device const float *v_txt        [[buffer(4)]],
+        device const float *k_img        [[buffer(5)]],
+        device const float *v_img        [[buffer(6)]],
+        device const float *cache_k      [[buffer(7)]],
+        device const float *cache_v      [[buffer(8)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint width = args.heads * args.head_dim;
+    const uint t = tgpig.y;
+    const uint c = (tgpig.x * DIT_BLOCK + tpitg.x) * 4u;
+    if (t >= args.txt_tokens + args.img_tokens + args.cache_tokens || c >= width) {
+        return;
+    }
+    device const float *kp = dit_joint_row(args, t, 0u, args.k_offset, k_txt, k_img, cache_k) + c;
+    device const float *vp = dit_joint_row(args, t, 0u, args.v_offset, v_txt, v_img, cache_v) + c;
+    const uint64_t o = (uint64_t) t * width + c;
+    *((device packed_half4 *) (k_out + o)) = packed_half4(dit_half4_sat(float4(*((device const packed_float4 *) kp))));
+    *((device packed_half4 *) (v_out + o)) = packed_half4(dit_half4_sat(float4(*((device const packed_float4 *) vp))));
+}
+
 /// Joint-sequence attention in one pass over the keys with an online
 /// softmax, on simdgroup matrices: the same contract, bindings and output as
 /// `kernel_dit_sdpa_f32`, for `head_dim % 8 == 0` and `head_dim <= 128`.
@@ -1598,7 +1928,7 @@ static inline half4 dit_half4_sat(float4 v) {
         ushort lane [[thread_index_in_simdgroup]], \
         ushort sg [[simdgroup_index_in_threadgroup]]
 
-template <bool CAUSAL, uint RB, uint NSG, uint HD, bool UNIT_SCALE = false>
+template <bool CAUSAL, uint RB, uint NSG, uint HD, bool UNIT_SCALE = false, bool KV_HALF = false>
 kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
     const uint QR = 8u * RB * NSG;
     const uint KB = DIT_FA_KEYS;
@@ -1679,10 +2009,18 @@ kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
             rk[q] = half4(0.0h);
             rv[q] = half4(0.0h);
             if (e < KB * hd4 && s < keys) {
-                rk[q] = dit_half4_sat(float4(*((device const packed_float4 *)
-                        (dit_joint_row(args, s, h, args.k_offset, k_txt, k_img, cache_k) + d))));
-                rv[q] = dit_half4_sat(float4(*((device const packed_float4 *)
-                        (dit_joint_row(args, s, h, args.v_offset, v_txt, v_img, cache_v) + d))));
+                if (KV_HALF) {
+                    // Bindings 4 and 5 carry `kernel_dit_kv_half_f32`'s
+                    // packed rows: the same halves, already narrowed.
+                    const uint64_t o = (uint64_t) s * (args.heads * hd) + h * hd + d;
+                    rk[q] = half4(*((device const packed_half4 *) ((device const half *) k_txt + o)));
+                    rv[q] = half4(*((device const packed_half4 *) ((device const half *) v_txt + o)));
+                } else {
+                    rk[q] = dit_half4_sat(float4(*((device const packed_float4 *)
+                            (dit_joint_row(args, s, h, args.k_offset, k_txt, k_img, cache_k) + d))));
+                    rv[q] = dit_half4_sat(float4(*((device const packed_float4 *)
+                            (dit_joint_row(args, s, h, args.v_offset, v_txt, v_img, cache_v) + d))));
+                }
             }
         }
     };
@@ -1798,6 +2136,13 @@ kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 128u>(DIT_FLASH_S
 template [[host_name("kernel_dit_flash_sdpa_causal_d128_f32")]]
 kernel void kernel_dit_flash_sdpa<true, DIT_FA_RB, DIT_FA_SG, 128u>(DIT_FLASH_SDPA_PARAMS);
 
+/// The 128-wide bidirectional entry over K and V that
+/// `kernel_dit_kv_half_f32` narrowed beforehand: bindings 4 and 5 are its
+/// packed half rows (joint order, cache rows last), bindings 7 to 10 are
+/// not read. Same staged values, so the same bits as the f32 entry.
+template [[host_name("kernel_dit_flash_sdpa_d128_kvh")]]
+kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 128u, false, true>(DIT_FLASH_SDPA_PARAMS);
+
 template [[host_name("kernel_dit_flash_sdpa_unit_d64_f32")]]
 kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 64u, true>(DIT_FLASH_SDPA_PARAMS);
 
@@ -1893,6 +2238,22 @@ kernel void kernel_dit_gemm64_fused_q4k(DIT_GEMM_FUSED_PARAMS(uchar)) {
 
 kernel void kernel_dit_gemm64_fused_q6k(DIT_GEMM_FUSED_PARAMS(uchar)) {
     DIT_GEMM_FUSED_BODY(dit_wrows_q6k)
+}
+
+kernel void kernel_dit_gemm64_fused_q2k(DIT_GEMM_FUSED_PARAMS(uchar)) {
+    DIT_GEMM_FUSED_BODY(dit_wrows_q2k)
+}
+
+kernel void kernel_dit_gemm64_fused_q3k(DIT_GEMM_FUSED_PARAMS(uchar)) {
+    DIT_GEMM_FUSED_BODY(dit_wrows_q3k)
+}
+
+kernel void kernel_dit_gemm64_fused_q5k(DIT_GEMM_FUSED_PARAMS(uchar)) {
+    DIT_GEMM_FUSED_BODY(dit_wrows_q5k)
+}
+
+kernel void kernel_dit_gemm64_fused_q8_0(DIT_GEMM_FUSED_PARAMS(uchar)) {
+    DIT_GEMM_FUSED_BODY(dit_wrows_q8_0)
 }
 
 /// The same fused linear over a per-row INT8 weight; binding 5 is the

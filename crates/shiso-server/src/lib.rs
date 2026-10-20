@@ -338,7 +338,8 @@ pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService
     // a default the model would refuse on every request is refused here.
     let service = service
         .with_overrides(args.image_overrides()?)
-        .context("--image-default-size / --image-default-steps")?;
+        .context("--image-default-size / --image-default-steps")?
+        .with_max_upload_bytes(args.image_max_upload_bytes());
     Ok(Some(service))
 }
 

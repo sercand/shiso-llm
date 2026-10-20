@@ -31,6 +31,9 @@ pub(crate) struct PromptTokenizer {
     as_text: tokenizers::Tokenizer,
     /// The spellings the vocabulary reads as control tokens.
     special_spellings: Vec<String>,
+    /// The id of the `pad_token` the checkpoint's `tokenizer_config.json`
+    /// names, when it names one the vocabulary holds.
+    pad_id: Option<u32>,
 }
 
 impl PromptTokenizer {
@@ -53,10 +56,29 @@ impl PromptTokenizer {
             .collect();
         let mut as_text = tokenizer.clone();
         as_text.set_encode_special_tokens(true);
+        let pad_id = read_pad_id(&file, &tokenizer);
         Ok(Self {
             tokenizer,
             as_text,
             special_spellings,
+            pad_id,
+        })
+    }
+
+    /// The id padding rows are filled with: the `pad_token` of the
+    /// `tokenizer_config.json` beside the tokenizer.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Checkpoint`] when the config names no pad token or
+    /// the vocabulary does not hold it: a padded prompt is never filled with
+    /// a guessed id.
+    pub(crate) fn pad_id(&self) -> Result<u32, ImageGenError> {
+        self.pad_id.ok_or_else(|| {
+            ImageGenError::Checkpoint(
+                "the tokenizer config names no pad_token the vocabulary holds; a padded prompt \
+                 is not filled with a guessed id"
+                    .to_string(),
+            )
         })
     }
 
@@ -83,6 +105,18 @@ impl PromptTokenizer {
             encode(&self.tokenizer, text)
         }
     }
+}
+
+/// The id of `tokenizer_config.json`'s `pad_token` (a string, or an object
+/// with `content`), looked up in the vocabulary; `None` when any step is
+/// missing.
+fn read_pad_id(tokenizer_file: &Path, tokenizer: &tokenizers::Tokenizer) -> Option<u32> {
+    let config = tokenizer_file.parent()?.join("tokenizer_config.json");
+    let document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config).ok()?).ok()?;
+    let pad = &document["pad_token"];
+    let content = pad.as_str().or_else(|| pad["content"].as_str())?;
+    tokenizer.token_to_id(content)
 }
 
 fn encode(tokenizer: &tokenizers::Tokenizer, text: &str) -> Result<Vec<u32>, ImageGenError> {

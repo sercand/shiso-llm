@@ -309,11 +309,14 @@ struct dit_args_sdpa {
 };
 
 /// Causal grouped-query attention over packed rows (text encoder prefill).
+/// Keys at or past `valid_keys` are masked for every row (`tokens` masks
+/// nothing): the padded prefill's pad rows still attend every real key.
 struct dit_args_gqa {
     uint32_t tokens;
     uint32_t q_heads;
     uint32_t kv_heads;
     uint32_t head_dim;
+    uint32_t valid_keys;
 };
 
 /// 4-axis interleaved RoPE on the q and k head sections of strided rows, in
@@ -329,10 +332,14 @@ struct dit_args_rope_4d {
 };
 
 /// Rotate-half 1-axis RoPE on one packed (tokens, heads, head_dim) tensor.
+/// Rows from `pinned_from` on turn by position `pinned_pos` instead of their
+/// own index (`pinned_from == tokens` pins nothing).
 struct dit_args_rope_half {
     uint32_t tokens;
     uint32_t heads;
     uint32_t head_dim;
+    uint32_t pinned_from;
+    uint32_t pinned_pos;
 };
 
 /// One NCHW f32 convolution. `has_bias` is the presence contract from
@@ -441,9 +448,9 @@ static_assert(sizeof(dit_args_qk_norm) == 20, "QkNormArgs");
 static_assert(sizeof(dit_args_qk_norm_rope) == 24, "QkNormRopeArgs");
 static_assert(sizeof(dit_args_concat) == 12, "ConcatArgs");
 static_assert(sizeof(dit_args_sdpa) == 44, "SdpaArgs");
-static_assert(sizeof(dit_args_gqa) == 16, "GqaArgs");
+static_assert(sizeof(dit_args_gqa) == 20, "GqaArgs");
 static_assert(sizeof(dit_args_rope_4d) == 28, "Rope4dArgs");
-static_assert(sizeof(dit_args_rope_half) == 12, "RopeHalfArgs");
+static_assert(sizeof(dit_args_rope_half) == 20, "RopeHalfArgs");
 static_assert(sizeof(dit_args_conv2d) == 48, "Conv2dArgs");
 static_assert(sizeof(dit_args_group_norm) == 24, "GroupNormArgs");
 static_assert(sizeof(dit_args_upsample) == 16, "UpsampleArgs");

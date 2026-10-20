@@ -1,5 +1,9 @@
 //! `POST /images`, `POST /v1/images`, `POST /v1/images/generations`.
 //!
+//! The edit routes ([`crate::openai::image_edits`]) enter at [`run`] with the
+//! same plan and answer paths and a list of reference pictures; these three
+//! routes are text-only and always enter with none.
+//!
 //! # One request, two readings
 //!
 //! The blocking answer waits for each finished image and encodes one JSON
@@ -43,7 +47,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::StreamExt as _;
 use shiso_core::ids::Seed;
 use shiso_vision::generator::{
-    GeneratedImage, ImageGenerationJob, ImageOutputFormat, ImageStepEvent,
+    GeneratedImage, ImageGenerationJob, ImageOutputFormat, ImageStepEvent, InputReferenceImage,
 };
 use tokio::sync::mpsc;
 
@@ -83,9 +87,20 @@ async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
     // plan is built in the same position for the same reason - a malformed
     // size or output format is a 400 with no generator loaded too, so the 503
     // is reserved for a well-formed request this server could have run.
+    run(state, parsed, Vec::new()).await
+}
+
+/// Validates a parsed request and answers it: the part the generation and the
+/// edit routes share, which differ only in the references they carry.
+pub(crate) async fn run(
+    state: &AppState,
+    parsed: ImageGenerationRequest,
+    references: Vec<InputReferenceImage>,
+) -> Result<Response, AppError> {
     parsed.validate()?;
     let plan = Plan::from_wire(&parsed, state.image.as_ref())?;
     let service = state.image()?;
+    let plan = plan.with_references(references, service)?;
     if let Some(quality) = parsed.quality.as_deref() {
         tracing::debug!(
             quality,
@@ -132,6 +147,12 @@ struct Plan {
     n: usize,
     /// Whether the caller asked for the SSE stream.
     stream: bool,
+    /// Whether the caller named a size (or an aspect ratio); an edit that
+    /// names none takes the size its references imply.
+    size_named: bool,
+    /// The reference pictures every image of the request is edited from;
+    /// empty for text-to-image.
+    references: Vec<InputReferenceImage>,
 }
 
 impl Plan {
@@ -186,7 +207,55 @@ impl Plan {
             output_compression: parsed.output_compression,
             n: parsed.n.unwrap_or(1),
             stream: parsed.stream.unwrap_or(false),
+            size_named: size.is_some() || parsed.aspect_ratio.is_some(),
+            references: Vec::new(),
         })
+    }
+
+    /// Attaches the references, after the checks that only the loaded model
+    /// can make, all before any queue slot or device work is spent.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::BadRequest`] when the model takes no references, when there
+    /// are more than it takes, or when they imply no size.
+    fn with_references(
+        mut self,
+        references: Vec<InputReferenceImage>,
+        service: &ImageService,
+    ) -> Result<Self, AppError> {
+        if references.is_empty() {
+            return Ok(self);
+        }
+        let max = service.max_references();
+        if max == 0 {
+            return Err(AppError::bad_request(
+                format!(
+                    "the loaded model '{}' does not take reference images",
+                    service.model_id()
+                ),
+                Some("image"),
+                "unsupported_parameter",
+            ));
+        }
+        if references.len() > max {
+            return Err(AppError::bad_request(
+                format!(
+                    "{} reference images were given; the loaded model '{}' accepts at most {max}",
+                    references.len(),
+                    service.model_id()
+                ),
+                Some("image"),
+                "invalid_request",
+            ));
+        }
+        // The model's own size for these references, not the text-to-image
+        // default: a single reference is edited at its own aspect ratio.
+        if !self.size_named {
+            (self.width, self.height) = service.default_size_for_references(&references)?;
+        }
+        self.references = references;
+        Ok(self)
     }
 
     /// The job for image `index` of the request.
@@ -200,7 +269,7 @@ impl Plan {
             seed: Seed::new(self.seed.wrapping_add(offset)),
             output_format: self.output_format,
             output_compression: self.output_compression,
-            input_references: Vec::new(),
+            input_references: self.references.clone(),
         }
     }
 }

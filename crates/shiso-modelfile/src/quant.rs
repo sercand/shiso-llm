@@ -112,6 +112,26 @@ impl QuantBlock for BlockPtq1_0 {
     const ELEMS: usize = QK_TERNARY;
 }
 
+/// 3-bit `K`-quant: a high-bit mask, packed 2-bit weights, 16 six-bit
+/// signed-offset scales and one fp16 block scale.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockQ3K {
+    /// The third bit of each weight, one bit per weight.
+    pub hmask: [u8; QK_K / 8],
+    /// Low two bits of each weight, four per byte.
+    pub qs: [u8; QK_K / 4],
+    /// Sixteen 6-bit scales packed into 12 bytes.
+    pub scales: [u8; 12],
+    /// fp16 block scale.
+    pub d: u16,
+}
+const _: () = assert!(size_of::<BlockQ3K>() == 110);
+impl QuantBlock for BlockQ3K {
+    const DTYPE: DType = DType::Q3_K;
+    const ELEMS: usize = QK_K;
+}
+
 /// 4-bit `K`-quant: super-block scale and minimum, 12 scale bytes, packed
 /// 4-bit weights.
 #[repr(C)]

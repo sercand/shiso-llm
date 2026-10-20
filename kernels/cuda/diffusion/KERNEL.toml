@@ -1,0 +1,33 @@
+# The FLUX.3 / DiT image-generation kernel pack, module `diffusion`.
+#
+# ONE translation unit (`diffusion.cu`), because a module name is the key of a
+# separately compiled image on this backend and `Ops::new` in
+# `crates/shiso-models/src/diffusion/ops.rs` launches every entry under the
+# module name `diffusion`. The other `.cu` / `.cuh` files in this directory are
+# include-only pieces of that one unit (they are not listed in `sources`, so the
+# build never compiles them alone), split along the same seams the Metal twin
+# (`crates/shiso-metal/metal/diffusion/diffusion.metal`) is read in.
+#
+# Nothing here is a byte copy of anything: the kernels are written against the
+# Metal twin and the argument blocks in `ops.rs`, so no unit carries a
+# provenance header.
+
+[build]
+sources = ["diffusion.cu"]
+
+includes = ["cuda/diffusion"]
+
+# `--use_fast_math` is DROPPED (it is in the tree default this list replaces).
+# The Metal twin asks for `precise::tanh` and accurate `exp`/`sin`/`cos`: the
+# gate tanh multiplies every block's whole branch, the GELU cubic drives tanh
+# past the fast form's overflow point, and the RoPE angles reach thousands of
+# radians. nvcc rewrites every `expf`/`tanhf`/`sinf`/`cosf` to the reduced
+# precision intrinsic under fast math and offers no per-call opt-out.
+base_flags = ["-O3", "-g", "-lineinfo"]
+
+# Nothing needs more than shuffles and static shared memory; this is the floor
+# the rest of the tree's CUDA families are pinned at.
+arch = ["compute_80"]
+
+[modules]
+diffusion = "diffusion"

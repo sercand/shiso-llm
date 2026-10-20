@@ -25,6 +25,8 @@ pub mod chat_wire;
 pub mod completions;
 pub mod embeddings;
 pub mod embeddings_wire;
+pub mod image_edits;
+pub mod image_edits_wire;
 pub mod images;
 pub mod images_wire;
 pub mod responses;
