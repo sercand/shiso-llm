@@ -746,6 +746,74 @@ pub trait Speculating: Model {
             backend: "model",
         })
     }
+
+    /// [`Speculating::verify_block`] for several sessions in one pass over the
+    /// weights: `steps[i]` is session `i`'s, and block `i` of the answer is
+    /// what `verify_block` would have answered for it.
+    ///
+    /// What lets a batch with sampled members speculate together. Each block
+    /// is chosen over by its own sequence's rule, exactly as a solo block is,
+    /// and [`Speculating::settle_blocks`] is then told how many of each were
+    /// kept.
+    ///
+    /// The default is `None`: a family that verifies sessions one at a time
+    /// answers for one session through `verify_block` and for a batch not at
+    /// all.
+    ///
+    /// # Errors
+    ///
+    /// As [`Speculating::verify_block`] for any session.
+    // None: this family has no batched two-phase step.
+    fn verify_blocks(&mut self, steps: &[BlockStep<'_>]) -> CoreResult<Option<Vec<VerifiedBlock>>> {
+        let _ = steps;
+        Ok(None)
+    }
+
+    /// Commits, for every session of the blocks
+    /// [`Speculating::verify_blocks`] returned, its `first` and as many of its
+    /// drafts as `kept` says, in the order the sessions were verified.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] for a family with no batched two-phase step,
+    /// or `kept` that does not name the verified sessions in order;
+    /// [`CoreError::ShapeMismatch`] for more kept drafts than a session
+    /// drafted; and whatever the device reports.
+    fn settle_blocks(&mut self, kept: &[KeptDrafts]) -> CoreResult<()> {
+        let _ = kept;
+        Err(CoreError::Unsupported {
+            what: "a batched two-phase speculative step on a family that has none",
+            backend: "model",
+        })
+    }
+}
+
+/// One session's part of a batched two-phase step: what
+/// [`Speculating::verify_block`] takes for that session alone.
+///
+/// Deliberately NOT `#[non_exhaustive]`: the scheduler builds one per row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlockStep<'a> {
+    /// The session to step.
+    pub session: SessionId,
+    /// The token the step commits unconditionally.
+    pub first: TokenId,
+    /// How the caller will choose this session's tokens.
+    pub hint: DraftHint,
+    /// What the caller already knows comes next, or empty.
+    pub proposal: &'a [TokenId],
+}
+
+/// How many drafts one session of a batched two-phase step kept: see
+/// [`Speculating::settle_blocks`].
+///
+/// Deliberately NOT `#[non_exhaustive]`: the scheduler builds one per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeptDrafts {
+    /// The session the count is for.
+    pub session: SessionId,
+    /// The drafts it kept, the first `accepted` of its block's.
+    pub accepted: u32,
 }
 
 #[cfg(test)]

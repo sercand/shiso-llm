@@ -58,8 +58,8 @@ pub use media::{
     VisionPrefill, run_floor, run_origin,
 };
 pub use model::{
-    DecisionModel, DecisionQuestion, DecodeStep, DraftHint, Logits, Model, ModelInfo,
-    NO_BATCHED_PROMPT_PASS, PromptRun, SamplingParams, Speculated, Speculating, StopTokens,
-    VerifiedBlock,
+    BlockStep, DecisionModel, DecisionQuestion, DecodeStep, DraftHint, KeptDrafts, Logits, Model,
+    ModelInfo, NO_BATCHED_PROMPT_PASS, PromptRun, SamplingParams, Speculated, Speculating,
+    StopTokens, VerifiedBlock,
 };
 pub use profile::{KernelTiming, LaunchKey, LaunchSample, ProfileRegion, ProfileReport, Profiler};

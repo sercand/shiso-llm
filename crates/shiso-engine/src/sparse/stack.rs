@@ -706,6 +706,9 @@ pub struct SparseStack {
     pub(crate) batch_slots: std::sync::Mutex<HashMap<u64, u32>>,
     /// Step passes kept for reuse; see [`crate::sparse::plancache`].
     pub(crate) plans: crate::sparse::plancache::PlanCache,
+    /// The verify a caller is choosing over, until it settles: see
+    /// [`SparseStack::verify_blocks`].
+    pub(crate) verified: Vec<crate::sparse::draft::VerifiedRound>,
 }
 
 impl std::fmt::Debug for SparseStack {
@@ -733,6 +736,7 @@ impl std::fmt::Debug for SparseStack {
             )
             .field("staging", &self.staging)
             .field("kept_plans", &self.plans.len())
+            .field("verified", &self.verified.len())
             .field("clock", &self.clock)
             .field("layers", &self.desc.layers.len())
             .finish()
@@ -962,6 +966,7 @@ impl SparseStack {
             tap: None,
             batch_slots: std::sync::Mutex::new(HashMap::new()),
             plans: crate::sparse::plancache::PlanCache::default(),
+            verified: Vec::new(),
         })
     }
 

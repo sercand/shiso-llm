@@ -770,7 +770,9 @@ pub fn keyed_sample(logits: &[f32], p: &SamplingParams, key: u64, position: u32)
     // temperature-scaled units below the maximum carries under e^-40 of its
     // mass, which no nucleus below 1 and no min-p floor keeps.
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut cands: Vec<(f32, u32)> = if top_k > 0 {
+    let mut cands: Vec<(f32, u32)> = if top_k > 0 && top_k <= SCAN_TOP_K {
+        scan_top_k(logits, top_k)
+    } else if top_k > 0 {
         let mut all: Vec<(f32, u32)> = logits
             .iter()
             .enumerate()
@@ -820,6 +822,35 @@ pub fn keyed_sample(logits: &[f32], p: &SamplingParams, key: u64, position: u32)
     TokenId::new(best.1)
 }
 
+/// The widest top-k [`scan_top_k`] answers; a wider one partitions the row.
+///
+/// The scan inserts into a sorted list of `k`, so its worst case - a row whose
+/// every entry beats the list's last - is `k` moves an entry. At the sizes
+/// checkpoints ship (twenty, forty) almost every entry is turned away by one
+/// comparison with the list's last, which is what makes it several times
+/// faster than building and partitioning a pair for every one of a 248k row.
+const SCAN_TOP_K: usize = 64;
+
+/// The `k` largest entries of `logits`, highest first and ties to the lower
+/// id: the set and order a full partition by that rule gives, in one pass and
+/// without a pair per entry.
+fn scan_top_k(logits: &[f32], k: usize) -> Vec<(f32, u32)> {
+    let mut top: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+    for (i, &l) in logits.iter().enumerate() {
+        // Ids arrive in increasing order, so an entry that only ties the last
+        // kept one ranks below it and is turned away.
+        if top.len() == k && top.last().is_some_and(|last| l.total_cmp(&last.0).is_le()) {
+            continue;
+        }
+        // After every kept entry at or above it: those are higher, or tie it
+        // with a lower id.
+        let at = top.partition_point(|kept| kept.0.total_cmp(&l).is_ge());
+        top.insert(at, (l, u32::try_from(i).unwrap_or(u32::MAX)));
+        top.truncate(k);
+    }
+    top
+}
+
 /// A uniform in `(0, 1)` from `(key, position, id)`: three rounds of the
 /// splitmix64 finalizer, 24 bits, offset half a step off both ends.
 pub(crate) fn keyed_uniform(key: u64, position: u32, id: u32) -> f32 {
@@ -844,6 +875,37 @@ pub(crate) fn keyed_uniform(key: u64, position: u32, id: u32) -> f32 {
 #[cfg(test)]
 #[expect(clippy::cast_precision_loss, reason = "small fixture values")]
 mod keyed_tests {
+    use super::scan_top_k;
+
+    /// The scan keeps the set and order a full partition keeps, ties and
+    /// all: rows with repeated values are where an insertion rule and a
+    /// partition rule part ways first.
+    #[test]
+    fn the_scanned_top_k_is_the_partitioned_top_k() {
+        let mut state = 0x9e37_79b9_u32;
+        for case in 0..64_u32 {
+            let len = 50 + (case as usize * 37) % 400;
+            let row: Vec<f32> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    // Few distinct values, so ties are common.
+                    ((state >> 24) % 9) as f32 - 4.0
+                })
+                .collect();
+            for k in [1_usize, 2, 7, 20, 40, 64] {
+                let k = k.min(len);
+                let mut all: Vec<(f32, u32)> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &l)| (l, u32::try_from(i).expect("an id")))
+                    .collect();
+                all.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                all.truncate(k);
+                assert_eq!(scan_top_k(&row, k), all, "case {case}, k {k}");
+            }
+        }
+    }
+
     use super::keyed_sample;
     use shiso_core::{SamplingParams, TokenId};
 

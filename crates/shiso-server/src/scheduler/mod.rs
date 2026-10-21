@@ -1545,7 +1545,11 @@ impl Coordinator {
             // A sampled member is settled by the two-phase step, one session
             // at a time; an all-greedy batch keeps the batched step. In
             // opportunistic mode, speculative batching runs for all members.
-            if rows.iter().all(|at| self.greedy(*at)) || !self.cfg.mtp_exact_sampling {
+            if rows.iter().all(|at| self.greedy(*at)) {
+                self.speculative_batch_step(rows);
+            } else if self.two_phase_batch_step(rows) {
+                // Every member chose its own tokens over one shared verify.
+            } else if !self.cfg.mtp_exact_sampling {
                 self.speculative_batch_step(rows);
             } else {
                 for at in rows {
@@ -1736,6 +1740,29 @@ impl Coordinator {
         step: DecodeStep,
         mut block: shiso_core::model::VerifiedBlock,
     ) {
+        if self.slots.slots().get(at).is_none() {
+            return;
+        }
+        let accepted = self.choose_over_block(at, &mut block);
+        let settled = match self.model.as_model_mut().spec_mut() {
+            Some(spec) => spec.settle_block(step.session, block, accepted),
+            None => return,
+        };
+        if let Err(error) = settled {
+            tracing::error!(%error, "a speculative settle failed");
+            self.fail_slot(at, &error, "a speculative settle failed");
+        }
+    }
+
+    /// The sequence at `at` chooses its tokens over a verified block: each
+    /// row by its own rule at that position, keeping the drafts up to the
+    /// first it did not choose, and emitting every token it chose. Returns how
+    /// many drafts it kept, zero for a slot that is gone.
+    fn choose_over_block(
+        &mut self,
+        at: usize,
+        block: &mut shiso_core::model::VerifiedBlock,
+    ) -> u32 {
         let now = self.cfg.clock.now();
         let drafted = u32::try_from(block.drafts.len()).unwrap_or(u32::MAX);
         let mut accepted = 0u32;
@@ -1749,7 +1776,7 @@ impl Coordinator {
                 ..
             } = self;
             let Some(slot) = slots.get_mut(at) else {
-                return;
+                return 0;
             };
             let mut events = Vec::new();
             // A copy of the drafts, so the block can lend each row out to be
@@ -1778,14 +1805,76 @@ impl Coordinator {
         }
         self.stats.speculated(accepted, drafted);
         self.stats.decoded(produced);
+        accepted
+    }
+
+    /// One two-phase speculative step over several sequences: one pass
+    /// verifies every member's drafts, each member chooses its own tokens over
+    /// its block by its own rule, and the model then keeps what each chose.
+    ///
+    /// What lets a batch with sampled members speculate together without
+    /// deciding any member's tokens by the target's greedy pick. Returns
+    /// `false`, having run nothing, when the model has no batched two-phase
+    /// step, so the caller can step the batch another way.
+    fn two_phase_batch_step(&mut self, rows: &[usize]) -> bool {
+        let mut members = Vec::with_capacity(rows.len());
+        for &at in rows {
+            let Some(step) = self.slots.slots().get(at).and_then(SeqSlot::decode_step) else {
+                continue;
+            };
+            let Some(slot) = self.slots.get_mut(at) else {
+                continue;
+            };
+            let hint = slot.draft_hint();
+            let proposal = slot.scaffold_proposal(self.vocabulary.as_deref());
+            members.push((at, step, hint, proposal));
+        }
+        if members.is_empty() {
+            return true;
+        }
+        let asked = members
+            .iter()
+            .map(|(_, step, hint, proposal)| shiso_core::model::BlockStep {
+                session: step.session,
+                first: step.token,
+                hint: *hint,
+                proposal: proposal.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let verified = match self.model.as_model_mut().spec_mut() {
+            Some(spec) => spec.verify_blocks(&asked),
+            None => return false,
+        };
+        let blocks = match verified {
+            Ok(Some(blocks)) => blocks,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::error!(%error, rows = members.len(), "a batched speculative verify failed");
+                for (at, ..) in &members {
+                    self.fail_slot(*at, &error, "a batched speculative verify failed");
+                }
+                return true;
+            }
+        };
+        let mut kept = Vec::with_capacity(members.len());
+        for ((at, step, ..), mut block) in members.iter().zip(blocks) {
+            let accepted = self.choose_over_block(*at, &mut block);
+            kept.push(shiso_core::model::KeptDrafts {
+                session: step.session,
+                accepted,
+            });
+        }
         let settled = match self.model.as_model_mut().spec_mut() {
-            Some(spec) => spec.settle_block(step.session, block, accepted),
-            None => return,
+            Some(spec) => spec.settle_blocks(&kept),
+            None => return true,
         };
         if let Err(error) = settled {
-            tracing::error!(%error, "a speculative settle failed");
-            self.fail_slot(at, &error, "a speculative settle failed");
+            tracing::error!(%error, rows = members.len(), "a batched speculative settle failed");
+            for (at, ..) in &members {
+                self.fail_slot(*at, &error, "a batched speculative settle failed");
+            }
         }
+        true
     }
 
     /// One batched decode step over every ready sequence.

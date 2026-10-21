@@ -56,7 +56,7 @@ use crate::sparse::qsa::AttnContext;
 use crate::sparse::scratch::Buf;
 use crate::sparse::stack::{Pass, SparseStack};
 use crate::sparse::weights::{LayerDesc, MixDesc, WeightDesc};
-use shiso_core::model::Speculated;
+use shiso_core::model::{KeptDrafts, Speculated, VerifiedBlock};
 
 /// Rows the widest draft pass of a decode step runs.
 ///
@@ -136,6 +136,114 @@ pub struct SpecTrace {
     pub picks: Vec<TokenId>,
     /// What the step returned.
     pub outcome: Speculated,
+}
+
+/// One session's verify pass, run and not yet settled.
+///
+/// Everything a settle needs to commit the rows that were kept and nothing
+/// else: the token the step commits whatever happens, the guesses behind it,
+/// and where in the pass its rows sit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedRound {
+    /// The session the rows are this one's.
+    session: SessionId,
+    /// The token the step commits unconditionally, at `frontier`.
+    first: TokenId,
+    /// The session's frontier when the pass ran.
+    frontier: u32,
+    /// The guesses behind `first`, in order.
+    drafts: Vec<TokenId>,
+    /// Where the guesses came from, or `None` for a step that drafted nothing.
+    source: Option<DraftSource>,
+    /// The row of the pass `first` sits at: zero alone, the run's offset in a
+    /// segmented pass.
+    start: u32,
+}
+
+impl VerifiedRound {
+    /// The tokens the verify pass runs: `first`, then the guesses.
+    fn rows(&self) -> Vec<TokenId> {
+        let mut rows = Vec::with_capacity(self.drafts.len().saturating_add(1));
+        rows.push(self.first);
+        rows.extend_from_slice(&self.drafts);
+        rows
+    }
+
+    /// How many rows of the pass are this round's.
+    fn row_count(&self) -> u32 {
+        u32::try_from(self.drafts.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+    }
+
+    /// This round's rows of a per-row answer covering the whole pass.
+    fn own<'a>(&self, answers: &'a [TokenId]) -> &'a [TokenId] {
+        let from = self.start as usize;
+        answers
+            .get(from..from.saturating_add(self.row_count() as usize))
+            .unwrap_or(&[])
+    }
+
+    /// The outcome of keeping the first `accepted` guesses, as the caller
+    /// chose them.
+    ///
+    /// No end-of-turn check here, unlike [`StepOutcome::settle`]: a caller
+    /// that chooses its own tokens stops at the end of its turn itself, and
+    /// the count it hands back already stops there.
+    fn kept(&self, accepted: u32) -> CoreResult<StepOutcome> {
+        let drafted = u32::try_from(self.drafts.len()).unwrap_or(u32::MAX);
+        if accepted > drafted {
+            return Err(CoreError::ShapeMismatch {
+                field: "kept drafts",
+                expected: u64::from(drafted),
+                got: u64::from(accepted),
+            });
+        }
+        let mut committed = Vec::with_capacity(accepted as usize + 1);
+        committed.push(self.first);
+        committed.extend_from_slice(&self.drafts[..accepted as usize]);
+        Ok(StepOutcome {
+            committed,
+            rollback: mtp::Rollback::new(accepted, drafted),
+            logits_row: accepted,
+            source: self.source,
+        })
+    }
+}
+
+/// The caller's proposal over a session's drafts: the drafts when they begin
+/// with it, the proposal where they do not, cut to `budget` either way.
+///
+/// The proposal is structure the caller knows comes next, so a draft that
+/// does not begin with it is wrong from its first disagreement; one that does
+/// is the proposal and more, and is kept whole.
+fn scaffolded(
+    drafts: Vec<TokenId>,
+    source: Option<DraftSource>,
+    proposal: &[TokenId],
+    budget: u32,
+) -> (Vec<TokenId>, Option<DraftSource>) {
+    let (mut drafts, source) = if proposal.is_empty() || drafts.starts_with(proposal) {
+        (drafts, source)
+    } else {
+        (proposal.to_vec(), Some(DraftSource::Scaffold))
+    };
+    drafts.truncate(budget as usize);
+    (drafts, source)
+}
+
+/// What a greedy step hands back: the guesses it kept, then the answer at the
+/// row it settled on. `first` is left out because it was already the
+/// caller's - handing it back would emit it twice.
+fn produced(outcome: &StepOutcome, answers: &[TokenId]) -> CoreResult<Vec<TokenId>> {
+    let accepted = usize::try_from(outcome.logits_row).unwrap_or(0);
+    let mut produced = outcome.committed.get(1..).unwrap_or(&[]).to_vec();
+    produced.push(*answers.get(accepted).ok_or(CoreError::ShapeMismatch {
+        field: "verify rows",
+        expected: u64::from(outcome.logits_row).saturating_add(1),
+        got: u64::try_from(answers.len()).unwrap_or(u64::MAX),
+    })?);
+    Ok(produced)
 }
 
 /// The widths one draft pass plans from.
@@ -923,79 +1031,50 @@ impl SparseStack {
         eos: TokenId,
         judge: Judge<'_>,
     ) -> CoreResult<SpecTrace> {
-        let live = self.session(session)?;
-        let (depth, frontier) = (live.spec_depth(), live.written());
-        let budget = mtp::draft_budget(depth, frontier, self.opts.engine.ctx, MAX_DRAFT + 1);
-        let head = self.chain(session, first, frontier, budget.min(self.opts.head_depth()))?;
-        let (drafts, source) = self.lookup_or_head(session, first, head, budget, eos)?;
-
-        // The verify pass: the committed token and every guess behind it, at
-        // consecutive positions from the frontier. Its row `i` is the target's
-        // own pick for the position `drafts[i]` proposed.
-        let mut rows = Vec::with_capacity(drafts.len().saturating_add(1));
-        rows.push(first);
-        rows.extend_from_slice(&drafts);
-        let logit_rows = u32::try_from(rows.len()).unwrap_or(1);
-        self.run_rows(session, &rows, logit_rows)?;
-        let picks = self.read_picks(logit_rows)?;
+        let mut rounds = self.draft_rounds(&[(session, first, &[])], eos)?;
+        let rows = self.verify_rounds(&mut rounds)?;
+        let round = rounds.pop().ok_or(CoreError::ShapeMismatch {
+            field: "verify rounds",
+            expected: 1,
+            got: 0,
+        })?;
+        // Row `i` of the verify pass is the target's own pick for the position
+        // `drafts[i]` proposed.
+        let picks = self.read_picks(rows)?;
         // The answers the step settles against: the target's own picks, or the
         // forced text's tokens at the same positions.
         let answers = match judge {
             Judge::Target => picks.as_slice(),
-            Judge::Forced(text) => text.get(..rows.len()).ok_or(CoreError::ShapeMismatch {
+            Judge::Forced(text) => text.get(..rows as usize).ok_or(CoreError::ShapeMismatch {
                 field: "forced verify answers",
-                expected: rows.len() as u64,
+                expected: u64::from(rows),
                 got: text.len() as u64,
             })?,
         };
 
         let outcome = StepOutcome::settle(
             first,
-            &drafts,
-            answers.get(..drafts.len()).unwrap_or(&[]),
+            &round.drafts,
+            answers.get(..round.drafts.len()).unwrap_or(&[]),
             eos,
-            source,
+            round.source,
         )?;
-        self.remember_lookup(session, &outcome)?;
-        trace_step(session, source, &drafts, &picks, outcome.logits_row);
-        // The rewind first: the staged row is the residual of the last
-        // *committed* position, and the rewind is what makes the recurrent
-        // state agree with it. Then the row is staged, because the catch-up
-        // overwrites the residual it is copied from. And the commit last,
-        // because a checkpoint it admits carries the head's raw key ring, and
-        // the head's rows up to the position before the new frontier are the
-        // catch-up's to write: committed before it, the blob would carry the
-        // chain's guesses for them.
-        if let Some(rewind) = outcome.rollback {
-            self.spec_rollback(session, rewind)?;
-        }
-        self.stage_draft_row(session, outcome.logits_row)?;
-        self.reflush(
+        trace_step(
             session,
-            frontier,
-            &outcome.committed,
-            Operand::Scratch(Buf::Residual),
-        )?;
-        self.advance(session, &outcome.committed, false, Some(outcome.logits_row))?;
-        self.mark_staged_current(session)?;
-        // What the caller has not seen: the guesses that were kept, and then the
-        // target's own pick at the row the step settled on. `first` is left out
-        // because it was already the caller's - handing it back would emit it
-        // twice.
-        let accepted = usize::try_from(outcome.logits_row).unwrap_or(0);
-        let mut produced = outcome.committed.get(1..).unwrap_or(&[]).to_vec();
-        produced.push(*answers.get(accepted).ok_or(CoreError::ShapeMismatch {
-            field: "verify rows",
-            expected: u64::from(outcome.logits_row).saturating_add(1),
-            got: u64::try_from(answers.len()).unwrap_or(u64::MAX),
-        })?);
+            round.source,
+            &round.drafts,
+            &picks,
+            outcome.logits_row,
+        );
+        self.settle_rounds(std::slice::from_ref(&round), std::slice::from_ref(&outcome))?;
+        let produced = produced(&outcome, answers)?;
         let outcome = Speculated {
             produced,
             accepted: outcome.logits_row,
-            drafted: u32::try_from(drafts.len()).unwrap_or(u32::MAX),
+            drafted: u32::try_from(round.drafts.len()).unwrap_or(u32::MAX),
         };
         Ok(SpecTrace {
-            drafts,
+            drafts: round.drafts,
             picks,
             outcome,
         })
@@ -1058,20 +1137,157 @@ impl SparseStack {
     ///
     /// As [`SparseStack::speculate`], for any of the sessions, and
     /// [`CoreError::InvalidValue`] when one session appears twice.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the step's phases run in one order over one set of borrowed \
-                  plans and picks, and reading them as one sequence is what \
-                  shows that every session settles before any reflushes"
-    )]
     pub fn speculate_batch(
         &mut self,
         steps: &[(SessionId, TokenId)],
         eos: TokenId,
     ) -> CoreResult<Vec<Speculated>> {
         let started = std::time::Instant::now();
+        let asked = steps
+            .iter()
+            .map(|&(session, first)| (session, first, &[][..]))
+            .collect::<Vec<_>>();
+        let mut rounds = self.draft_rounds(&asked, eos)?;
+        let drafted_at = started.elapsed();
+        let total = self.verify_rounds(&mut rounds)?;
+        let picks = self.read_picks(total)?;
+        let verified_at = started.elapsed();
+        let mut outcomes = Vec::with_capacity(rounds.len());
+        for round in &rounds {
+            let own = round.own(&picks);
+            let outcome = StepOutcome::settle(
+                round.first,
+                &round.drafts,
+                own.get(..round.drafts.len()).unwrap_or(&[]),
+                eos,
+                round.source,
+            )?;
+            trace_step(
+                round.session,
+                round.source,
+                &round.drafts,
+                own,
+                outcome.logits_row,
+            );
+            outcomes.push(outcome);
+        }
+        self.settle_rounds(&rounds, &outcomes)?;
+        let mut out = Vec::with_capacity(rounds.len());
+        for (round, outcome) in rounds.iter().zip(&outcomes) {
+            out.push(Speculated {
+                produced: produced(outcome, round.own(&picks))?,
+                accepted: outcome.logits_row,
+                drafted: u32::try_from(round.drafts.len()).unwrap_or(u32::MAX),
+            });
+        }
+        tracing::debug!(
+            sessions = steps.len(),
+            rows = total,
+            draft_ms = drafted_at.as_secs_f64() * 1e3,
+            verify_ms = verified_at.saturating_sub(drafted_at).as_secs_f64() * 1e3,
+            settle_ms = started.elapsed().saturating_sub(verified_at).as_secs_f64() * 1e3,
+            "a batched speculative step's phases"
+        );
+        Ok(out)
+    }
+
+    /// The first half of a step whose tokens the caller chooses: each session
+    /// drafts behind its `first`, one pass verifies them all, and what comes
+    /// back is every session's drafts with the target's logits over them.
+    /// Nothing is committed until [`SparseStack::settle_verified`].
+    ///
+    /// `steps[i]` is session `i`'s committed token and the caller's proposal,
+    /// which replaces the session's drafts wherever the two disagree; see
+    /// [`shiso_core::model::Speculating::verify_block`]. The drafts themselves
+    /// are the head's greedy chain or the prompt lookup, whatever rule the
+    /// caller will choose by: a draft only decides how much a step *can*
+    /// keep, and the caller's own choice at every row decides what it does.
+    ///
+    /// # Errors
+    ///
+    /// As [`SparseStack::speculate_batch`].
+    pub fn verify_blocks(
+        &mut self,
+        steps: &[(SessionId, TokenId, &[TokenId])],
+        eos: TokenId,
+    ) -> CoreResult<Vec<VerifiedBlock>> {
+        let mut rounds = self.draft_rounds(steps, eos)?;
+        let total = self.verify_rounds(&mut rounds)?;
+        let mut logits = self.read_logits(total)?;
+        let vocab = self.shape.vocab as usize;
+        let blocks = if let [round] = rounds.as_slice() {
+            vec![VerifiedBlock {
+                drafts: round.drafts.clone(),
+                logits: std::mem::take(&mut logits),
+                vocab,
+            }]
+        } else {
+            rounds
+                .iter()
+                .map(|round| {
+                    let from = round.start as usize * vocab;
+                    let to = from + round.row_count() as usize * vocab;
+                    VerifiedBlock {
+                        drafts: round.drafts.clone(),
+                        logits: logits.get(from..to).unwrap_or(&[]).to_vec(),
+                        vocab,
+                    }
+                })
+                .collect()
+        };
+        self.verified = rounds;
+        Ok(blocks)
+    }
+
+    /// Commits, for every session [`SparseStack::verify_blocks`] verified, its
+    /// `first` and the first `accepted` of its drafts, winding it back past the
+    /// rest - the second half of the step, after the caller has chosen.
+    ///
+    /// `kept` names the sessions in the order they were verified.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] when `kept` does not name the pending
+    /// sessions in order (a settle with nothing pending included),
+    /// [`CoreError::ShapeMismatch`] for more kept drafts than a session
+    /// drafted, and whatever the rewind, the catch-up and the commit report.
+    pub fn settle_verified(&mut self, kept: &[KeptDrafts]) -> CoreResult<()> {
+        let rounds = std::mem::take(&mut self.verified);
+        let matches = rounds.len() == kept.len()
+            && rounds
+                .iter()
+                .zip(kept)
+                .all(|(round, kept)| round.session == kept.session);
+        if !matches {
+            return Err(CoreError::Unsupported {
+                what: "a settle that does not name the pending verify's sessions in order",
+                backend: "engine",
+            });
+        }
+        let outcomes = rounds
+            .iter()
+            .zip(kept)
+            .map(|(round, kept)| round.kept(kept.accepted))
+            .collect::<CoreResult<Vec<_>>>()?;
+        self.settle_rounds(&rounds, &outcomes)
+    }
+
+    /// Every session's drafts behind its `first`: the head's chain - one
+    /// batched chain when every session drafts as deep, which is the usual
+    /// case, since the depth is the server's and only the end of a context
+    /// shortens it - then the prompt lookup beside it, then the caller's
+    /// proposal over both. Runs nothing through the target.
+    ///
+    /// A verify that was never settled is dropped here: a new round is drafted
+    /// from the sessions as they stand, which is where that verify left them.
+    fn draft_rounds(
+        &mut self,
+        steps: &[(SessionId, TokenId, &[TokenId])],
+        eos: TokenId,
+    ) -> CoreResult<Vec<VerifiedRound>> {
+        self.verified.clear();
         let mut plans = Vec::with_capacity(steps.len());
-        for &(session, first) in steps {
+        for &(session, first, _) in steps {
             let live = self.session(session)?;
             let (depth, frontier) = (live.spec_depth(), live.written());
             let budget = mtp::draft_budget(depth, frontier, self.opts.engine.ctx, MAX_DRAFT + 1);
@@ -1083,9 +1299,6 @@ impl SparseStack {
                 budget,
             ));
         }
-        // One batched draft pass a step when every session drafts as deep - the
-        // usual case, since the depth is the server's and only the end of a
-        // context shortens it - and each session's own chain otherwise.
         let uniform = plans.windows(2).all(|pair| pair[0].3 == pair[1].3);
         let chains = if uniform && plans.len() > 1 {
             let sessions = plans.iter().map(|plan| plan.0).collect::<Vec<_>>();
@@ -1099,107 +1312,122 @@ impl SparseStack {
             }
             chains
         };
-        // Each session's own prompt lookup, beside its own chain: the runs of a
-        // segmented verify need not be one length.
-        let mut runs: Vec<(SessionId, u32, Vec<TokenId>)> = Vec::with_capacity(steps.len());
-        let mut sources = Vec::with_capacity(steps.len());
-        for (&(session, first, frontier, _, budget), head) in plans.iter().zip(chains) {
-            let (drafts, source) = self.lookup_or_head(session, first, head, budget, eos)?;
-            let mut rows = Vec::with_capacity(drafts.len().saturating_add(1));
-            rows.push(first);
-            rows.extend_from_slice(&drafts);
-            runs.push((session, frontier, rows));
-            sources.push(source);
-        }
-        let borrowed = runs
-            .iter()
-            .map(|(session, _, rows)| (*session, rows.as_slice()))
-            .collect::<Vec<_>>();
-        let drafted_at = started.elapsed();
-        self.run_segments(&borrowed)?;
-        let total = runs.iter().map(|(_, _, rows)| rows.len()).sum::<usize>();
-        let picks = self.read_picks(u32::try_from(total).unwrap_or(u32::MAX))?;
-        let verified_at = started.elapsed();
-        // Every catch-up pass below overwrites the residual, and each reads its
-        // own session's verify rows: they are held first.
-        let width = u64::from(self.shape.stream_dim()) * crate::sparse::kernels::F32_BYTES;
+        let mut rounds = Vec::with_capacity(plans.len());
+        for ((&(session, first, frontier, _, budget), head), &(_, _, proposal)) in
+            plans.iter().zip(chains).zip(steps)
         {
-            let hold = self
-                .scratch_view(Buf::ResidualHold)?
-                .slice(0, total as u64 * width)?;
-            let residual = self
-                .scratch_view(Buf::Residual)?
-                .slice(0, total as u64 * width)?;
-            self.backend.copy_d2d(hold, residual)?;
-        }
-
-        let mut settled = Vec::with_capacity(runs.len());
-        let mut start = 0usize;
-        for ((session, frontier, rows), source) in runs.iter().zip(sources) {
-            let drafts = rows.get(1..).unwrap_or(&[]);
-            let first = rows.first().copied().ok_or(CoreError::ShapeMismatch {
-                field: "verify run rows",
-                expected: 1,
-                got: 0,
-            })?;
-            let own = picks.get(start..start + rows.len()).unwrap_or(&[]);
-            let outcome = StepOutcome::settle(
+            let (drafts, source) = self.lookup_or_head(session, first, head, budget, eos)?;
+            let (drafts, source) = scaffolded(drafts, source, proposal, budget);
+            rounds.push(VerifiedRound {
+                session,
                 first,
+                frontier,
                 drafts,
-                own.get(..drafts.len()).unwrap_or(&[]),
-                eos,
                 source,
-            )?;
-            self.remember_lookup(*session, &outcome)?;
-            trace_step(*session, source, drafts, own, outcome.logits_row);
-            if let Some(rewind) = outcome.rollback {
-                self.spec_rollback(*session, rewind)?;
-            }
-            let row = u32::try_from(start).unwrap_or(u32::MAX) + outcome.logits_row;
-            self.stage_draft_row(*session, row)?;
-            settled.push((
-                *session,
-                *frontier,
-                start,
-                outcome,
-                own.to_vec(),
-                drafts.len(),
-                row,
-            ));
-            start += rows.len();
-        }
-
-        let mut out = Vec::with_capacity(settled.len());
-        for (session, frontier, start, outcome, own, drafted, row) in settled {
-            let hidden = Operand::ScratchFrom(Buf::ResidualHold, start as u64 * width);
-            self.reflush(session, frontier, &outcome.committed, hidden)?;
-            // Committed after its catch-up, as a solo step commits: see
-            // `speculate`. No catch-up writes the logits block, so the row the
-            // commit files is still the verify's.
-            self.advance(session, &outcome.committed, false, Some(row))?;
-            self.mark_staged_current(session)?;
-            let accepted = usize::try_from(outcome.logits_row).unwrap_or(0);
-            let mut produced = outcome.committed.get(1..).unwrap_or(&[]).to_vec();
-            produced.push(*own.get(accepted).ok_or(CoreError::ShapeMismatch {
-                field: "verify rows",
-                expected: u64::from(outcome.logits_row).saturating_add(1),
-                got: own.len() as u64,
-            })?);
-            out.push(Speculated {
-                produced,
-                accepted: outcome.logits_row,
-                drafted: u32::try_from(drafted).unwrap_or(u32::MAX),
+                start: 0,
             });
         }
-        tracing::debug!(
-            sessions = steps.len(),
-            rows = total,
-            draft_ms = drafted_at.as_secs_f64() * 1e3,
-            verify_ms = verified_at.saturating_sub(drafted_at).as_secs_f64() * 1e3,
-            settle_ms = started.elapsed().saturating_sub(verified_at).as_secs_f64() * 1e3,
-            "a batched speculative step's phases"
-        );
-        Ok(out)
+        Ok(rounds)
+    }
+
+    /// The verify pass over every round: each session's `first` and drafts at
+    /// consecutive positions from its frontier, one session alone or several
+    /// in one segmented pass. Advances nothing, and files each round's first
+    /// row of the pass in [`VerifiedRound::start`]. Returns the rows the pass
+    /// ran.
+    fn verify_rounds(&mut self, rounds: &mut [VerifiedRound]) -> CoreResult<u32> {
+        if let [round] = rounds {
+            let rows = round.rows();
+            let count = round.row_count();
+            self.run_rows(round.session, &rows, count)?;
+            return Ok(count);
+        }
+        let rows = rounds.iter().map(VerifiedRound::rows).collect::<Vec<_>>();
+        let borrowed = rounds
+            .iter()
+            .zip(&rows)
+            .map(|(round, rows)| (round.session, rows.as_slice()))
+            .collect::<Vec<_>>();
+        self.run_segments(&borrowed)?;
+        let mut start = 0u32;
+        for round in rounds.iter_mut() {
+            round.start = start;
+            start = start.saturating_add(round.row_count());
+        }
+        Ok(start)
+    }
+
+    /// Settles every round by its outcome: the rewind, the staged draft row,
+    /// the head's catch-up and the commit.
+    ///
+    /// The rewind first: the staged row is the residual of the last
+    /// *committed* position, and the rewind is what makes the recurrent state
+    /// agree with it. Then the row is staged, because the catch-up overwrites
+    /// the residual it is copied from - which is why, over several sessions,
+    /// every one stages before any catches up, each catch-up reading its own
+    /// verify rows out of a copy held first. And the commit last, because a
+    /// checkpoint it admits carries the head's raw key ring, and the head's
+    /// rows up to the position before the new frontier are the catch-up's to
+    /// write: committed before it, the blob would carry the chain's guesses
+    /// for them. No catch-up writes the logits block, so the row a commit
+    /// files is still the verify's.
+    fn settle_rounds(
+        &mut self,
+        rounds: &[VerifiedRound],
+        outcomes: &[StepOutcome],
+    ) -> CoreResult<()> {
+        let width = u64::from(self.shape.stream_dim()) * crate::sparse::kernels::F32_BYTES;
+        let several = rounds.len() > 1;
+        if several {
+            let total = rounds
+                .iter()
+                .map(|round| u64::from(round.row_count()))
+                .sum::<u64>();
+            let hold = self
+                .scratch_view(Buf::ResidualHold)?
+                .slice(0, total * width)?;
+            let residual = self.scratch_view(Buf::Residual)?.slice(0, total * width)?;
+            self.backend.copy_d2d(hold, residual)?;
+        }
+        for (round, outcome) in rounds.iter().zip(outcomes) {
+            self.remember_lookup(round.session, outcome)?;
+            if let Some(rewind) = outcome.rollback {
+                self.spec_rollback(round.session, rewind)?;
+            }
+            self.stage_draft_row(round.session, round.start + outcome.logits_row)?;
+        }
+        for (round, outcome) in rounds.iter().zip(outcomes) {
+            let hidden = if several {
+                Operand::ScratchFrom(Buf::ResidualHold, u64::from(round.start) * width)
+            } else {
+                Operand::Scratch(Buf::Residual)
+            };
+            self.reflush(round.session, round.frontier, &outcome.committed, hidden)?;
+            self.advance(
+                round.session,
+                &outcome.committed,
+                false,
+                Some(round.start + outcome.logits_row),
+            )?;
+            self.mark_staged_current(round.session)?;
+        }
+        Ok(())
+    }
+
+    /// The front `rows` of the logits block, on the host.
+    fn read_logits(&self, rows: u32) -> CoreResult<Vec<f32>> {
+        let want = u64::from(rows)
+            .saturating_mul(u64::from(self.shape.vocab))
+            .saturating_mul(crate::sparse::kernels::F32_BYTES);
+        let view = self.scratch_view(Buf::Logits)?.slice(0, want)?;
+        let mut bytes = vec![0u8; usize::try_from(want).unwrap_or(0)];
+        self.backend.copy_d2h(view, &mut bytes)?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect())
     }
 
     /// Whether a draft head is resident, which is what makes a step speculative.

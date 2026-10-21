@@ -25,12 +25,15 @@ use shiso_core::model::Logits;
 use shiso_core::model::Model;
 use shiso_core::model::PromptRun;
 use shiso_core::model::Speculating as _;
+use shiso_core::model::{
+    BlockStep, DecodeStep, DraftHint, KeptDrafts, SamplingParams, VerifiedBlock,
+};
 use shiso_cuda::{CudaBackend, CudaOptions};
-use shiso_engine::EngineOptions;
 use shiso_engine::ckpt::Checkpointed as _;
 use shiso_engine::sparse::capture;
 use shiso_engine::sparse::mtp::SpecDepth;
 use shiso_engine::sparse::stack::SparseOptions;
+use shiso_engine::{EngineOptions, keyed_sample};
 use shiso_models::qwen4exp::Qwen4ExpModel;
 
 /// Context the model is loaded with.
@@ -386,6 +389,224 @@ fn a_batched_speculative_step_keeps_its_tokens() {
         model.close_session(session).expect("closes");
     }
     model.teardown().expect("the model tears down");
+}
+
+/// Chooses over one verified block the way the server's sequence does:
+/// `choose` picks the token at each row, the drafts are kept up to the first
+/// it did not pick, and an accepted end-of-turn token stops the block as the
+/// greedy step's acceptance does. Returns the tokens chosen, the last being
+/// the next step's `first`, and how many drafts were kept.
+fn choose_over(
+    block: &VerifiedBlock,
+    eos: TokenId,
+    mut choose: impl FnMut(usize, &[f32]) -> TokenId,
+) -> (Vec<TokenId>, u32) {
+    let mut chosen = Vec::new();
+    let mut accepted = 0_u32;
+    for i in 0..=block.drafts.len() {
+        let token = choose(i, block.row(i));
+        chosen.push(token);
+        if block.drafts.get(i) != Some(&token) {
+            break;
+        }
+        accepted += 1;
+        if token == eos {
+            break;
+        }
+    }
+    (chosen, accepted)
+}
+
+/// The index of a row's largest value, ties to the lower id.
+fn host_argmax(row: &[f32]) -> TokenId {
+    let best = row
+        .iter()
+        .enumerate()
+        .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+            if v > bv { (i, v) } else { (bi, bv) }
+        })
+        .0;
+    TokenId::new(u32::try_from(best).expect("a vocabulary id"))
+}
+
+/// The served preset: temperature one, the checkpoint's top-k and nucleus.
+fn served_sampling() -> SamplingParams {
+    let mut params = SamplingParams::neutral();
+    params.temperature = 1.0;
+    params.top_k = std::num::NonZeroU32::new(20);
+    params.top_p = 0.95;
+    params
+}
+
+/// A two-phase step that chooses each row's argmax keeps exactly the tokens
+/// the greedy batched step keeps: the same golden, through the other half of
+/// the stack's speculative surface.
+#[test]
+#[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
+fn a_greedy_two_phase_batch_keeps_the_greedy_steps_tokens() {
+    let backend: Arc<dyn Backend> =
+        CudaBackend::new(0, CudaOptions::default()).expect("a CUDA device");
+    let Some(mut model) = load_served(&backend, true) else {
+        skip("no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
+        return;
+    };
+    let eos = model.info().stop_tokens.primary();
+    let tokens = prompt(1_400);
+    let sessions = (0..4)
+        .map(|_| model.open_session().expect("a session"))
+        .collect::<Vec<_>>();
+    let mut next = Vec::new();
+    for (at, session) in sessions.iter().enumerate() {
+        let row = last_row(
+            &backend,
+            &mut model,
+            *session,
+            &tokens[at * 100..at * 100 + 600],
+        );
+        next.push(TokenId::new(argmax(&row)));
+    }
+    let mut streams = vec![Vec::new(); sessions.len()];
+    for _ in 0..8 {
+        let steps = sessions
+            .iter()
+            .zip(&next)
+            .map(|(session, first)| BlockStep {
+                session: *session,
+                first: *first,
+                hint: DraftHint::greedy(),
+                proposal: &[],
+            })
+            .collect::<Vec<_>>();
+        let blocks = model
+            .verify_blocks(&steps)
+            .expect("the verify runs")
+            .expect("the family verifies in two phases");
+        let mut kept = Vec::new();
+        for ((block, stream), (session, first)) in blocks
+            .iter()
+            .zip(streams.iter_mut())
+            .zip(sessions.iter().zip(next.iter_mut()))
+        {
+            let (chosen, accepted) = choose_over(block, eos, |_, row| host_argmax(row));
+            stream.extend(chosen.iter().map(|token| token.get()));
+            *first = *chosen.last().expect("a block chooses at least one token");
+            kept.push(KeptDrafts {
+                session: *session,
+                accepted,
+            });
+        }
+        model.settle_blocks(&kept).expect("the settle runs");
+    }
+    let text = streams
+        .iter()
+        .map(|stream| format!("{stream:?}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let golden = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/speculate-batch.txt");
+    let want = std::fs::read_to_string(&golden).expect("the greedy step's golden");
+    assert_eq!(
+        text, want,
+        "a greedy two-phase batch must keep what the greedy batched step keeps"
+    );
+    for session in sessions {
+        model.close_session(session).expect("closes");
+    }
+    model.teardown().expect("the model tears down");
+}
+
+/// A sampled sequence speculated in two phases draws exactly the tokens it
+/// draws one step at a time: under the keyed rule a token depends on its row,
+/// the key and its position only, so which pass computed the row cannot
+/// matter. The step that decided every row by the target's greedy pick
+/// instead failed this from its first rejected draft.
+#[test]
+#[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
+fn a_sampled_two_phase_sequence_draws_what_one_token_steps_draw() {
+    const KEY: u64 = 0x5eed_cafe;
+    const LEN: usize = 96;
+    let backend: Arc<dyn Backend> =
+        CudaBackend::new(0, CudaOptions::default()).expect("a CUDA device");
+    let Some(mut model) = load_served(&backend, true) else {
+        skip("no export named by SHISO_TEST_MODEL_QWEN4EXP_EXL3");
+        return;
+    };
+    let eos = model.info().stop_tokens.primary();
+    let params = served_sampling();
+    let hint = DraftHint {
+        key: KEY,
+        temperature: params.temperature,
+    };
+    let tokens = prompt(600);
+    let draw = |position: usize, row: &[f32]| {
+        keyed_sample(
+            row,
+            &params,
+            KEY,
+            u32::try_from(position).expect("a position"),
+        )
+    };
+    let floats = |bytes: &[u8]| {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect::<Vec<_>>()
+    };
+
+    // One token at a time.
+    let plain = model.open_session().expect("a session");
+    let row = floats(&last_row(&backend, &mut model, plain, &tokens));
+    let mut want = vec![draw(0, &row)];
+    while want.len() < LEN {
+        let token = *want.last().expect("a token");
+        let logits = model
+            .decode_batch(&[DecodeStep {
+                session: plain,
+                token,
+            }])
+            .expect("the step runs");
+        let row = floats(&read_row(&backend, &logits, 0));
+        want.push(draw(want.len(), &row));
+    }
+    model.close_session(plain).expect("closes");
+
+    // Speculated, the sequence choosing every row.
+    let spec = model.open_session().expect("a session");
+    let row = floats(&last_row(&backend, &mut model, spec, &tokens));
+    let mut got = vec![draw(0, &row)];
+    let (mut drafted, mut kept) = (0_u32, 0_u32);
+    while got.len() < LEN {
+        let first = *got.last().expect("a token");
+        let block = model
+            .verify_block(spec, first, hint, &[])
+            .expect("the verify runs")
+            .expect("the family verifies in two phases");
+        let from = got.len();
+        let (chosen, accepted) = choose_over(&block, eos, |i, row| draw(from + i, row));
+        drafted += u32::try_from(block.drafts.len()).expect("a count");
+        kept += accepted;
+        got.extend(chosen);
+        model
+            .settle_block(spec, block, accepted)
+            .expect("the settle runs");
+    }
+    got.truncate(LEN);
+    model.close_session(spec).expect("closes");
+    model.teardown().expect("the model tears down");
+
+    assert!(
+        drafted > 0 && kept > 0,
+        "the case must exercise kept drafts: {kept} of {drafted}"
+    );
+    assert!(
+        kept < drafted,
+        "the case must exercise a rejection: {kept} of {drafted}"
+    );
+    let first_difference = got.iter().zip(&want).position(|(a, b)| a != b);
+    assert_eq!(
+        first_difference, None,
+        "speculated {got:?}\none at a time {want:?}"
+    );
 }
 
 #[test]
