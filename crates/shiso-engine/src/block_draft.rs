@@ -1215,6 +1215,7 @@ impl crate::stack::HybridStack {
             drafts,
             logits: floats(&bytes),
             vocab,
+            tops: Vec::new(),
         })
     }
 

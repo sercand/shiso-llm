@@ -635,10 +635,32 @@ impl DraftHint {
 pub struct VerifiedBlock {
     /// The tokens drafted behind `first`, in order.
     pub drafts: Vec<TokenId>,
-    /// `drafts.len() + 1` rows of `vocab` logits, back to back.
+    /// `drafts.len() + 1` rows of `vocab` logits, back to back - or empty,
+    /// when `tops` carries the rows instead.
     pub logits: Vec<f32>,
     /// Entries in one row.
     pub vocab: usize,
+    /// Each row's highest entries in place of the row: `drafts.len() + 1` of
+    /// them, or empty when `logits` carries the rows.
+    ///
+    /// A family hands these only to a caller whose draw has a top-k stage no
+    /// wider than they are (its [`DraftHint`] says so), because over those the
+    /// draw is the whole row's.
+    pub tops: Vec<RowTop>,
+}
+
+/// One logits row's highest entries, larger first and ties to the lower id,
+/// held ascending by token id: `values[i]` is token `ids[i]`'s logit.
+///
+/// A keyed draw with a top-k stage of `k` reads a row's top `k` and nothing
+/// else - its nucleus and floor are cut from those - so over this it draws what
+/// it would over the row whenever `k <= ids.len()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowTop {
+    /// The entries' token ids, ascending.
+    pub ids: Vec<TokenId>,
+    /// Their logits, in the same order.
+    pub values: Vec<f32>,
 }
 
 impl VerifiedBlock {

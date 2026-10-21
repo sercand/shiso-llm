@@ -1791,7 +1791,11 @@ impl Coordinator {
                 if slot.is_done() {
                     break;
                 }
-                let token = slot.choose(block.row_mut(i));
+                let vocab = block.vocab;
+                let token = match block.tops.get(i) {
+                    Some(top) => slot.choose_top(top, vocab),
+                    None => slot.choose(block.row_mut(i)),
+                };
                 events.extend(slot.accept(token, vocabulary.as_deref(), *stop, now));
                 produced += 1;
                 if draft == Some(&token) {

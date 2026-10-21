@@ -59,7 +59,7 @@ pub use media::{
 };
 pub use model::{
     BlockStep, DecisionModel, DecisionQuestion, DecodeStep, DraftHint, KeptDrafts, Logits, Model,
-    ModelInfo, NO_BATCHED_PROMPT_PASS, PromptRun, SamplingParams, Speculated, Speculating,
+    ModelInfo, NO_BATCHED_PROMPT_PASS, PromptRun, RowTop, SamplingParams, Speculated, Speculating,
     StopTokens, VerifiedBlock,
 };
 pub use profile::{KernelTiming, LaunchKey, LaunchSample, ProfileRegion, ProfileReport, Profiler};

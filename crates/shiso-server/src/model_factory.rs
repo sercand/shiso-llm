@@ -1095,6 +1095,11 @@ fn sparse_options(
         prompt_matmul: paths.prompt_matmul,
         prefill_activations,
         route_sort: paths.route_sort,
+        verify_rows: if paths.row_top {
+            shiso_engine::sparse::stack::VerifyRows::Top
+        } else {
+            shiso_engine::sparse::stack::VerifyRows::Whole
+        },
         chunk: shiso_engine::sparse::recurrent::ChunkPolicy {
             available: paths.chunked_recurrence,
             fused: paths.fused_recurrence,

@@ -95,3 +95,100 @@ pub fn an_empty_list_leaves_the_rows_alone(gpu: &Gpu) {
     // A stale id behind a zero count must not be read.
     same(&suppress(gpu, &logits, 2, &[0, 5, 6]), &logits);
 }
+
+/// Entries the top-of-row kernel keeps, mirroring
+/// `shiso_engine::sparse::kernels::ROW_TOP`.
+const ROW_TOP: u32 = 64;
+
+/// Runs the top-of-row kernel over `rows` rows of `n_vocab` entries and
+/// returns each row's `(ids, values)`, `min(ROW_TOP, n_vocab)` of them.
+fn top_rows(gpu: &Gpu, logits: &[f32], rows: u32, n_vocab: u32) -> Vec<(Vec<u32>, Vec<f32>)> {
+    let logits_dev = gpu.upload(&f32_bytes(logits));
+    let entries = rows as usize * ROW_TOP as usize;
+    let values_dev = gpu.upload(&vec![0u8; entries * 4]);
+    let ids_dev = gpu.upload(&vec![0u8; entries * 4]);
+    run(
+        gpu,
+        KernelRef::new(MOD_SAMPLE, "sample_top_rows_kernel"),
+        &LaunchArgs {
+            grid: Extent3::new(rows, 1, 1),
+            block: Extent3::new(1_024, 1, 1),
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Buffer(logits_dev.view()),
+                KernelArg::U32(n_vocab),
+                KernelArg::U32(ROW_TOP),
+                KernelArg::Buffer(values_dev.view()),
+                KernelArg::Buffer(ids_dev.view()),
+            ],
+        },
+    );
+    drain(gpu);
+    let values = gpu.read_f32(&values_dev);
+    let ids: Vec<u32> = gpu
+        .read(&ids_dev)
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let kept = ROW_TOP.min(n_vocab) as usize;
+    (0..rows as usize)
+        .map(|r| {
+            let at = r * ROW_TOP as usize..r * ROW_TOP as usize + kept;
+            (ids[at.clone()].to_vec(), values[at].to_vec())
+        })
+        .collect()
+}
+
+/// The oracle: a row's top `ROW_TOP` by the host's total order, larger first
+/// and ties to the lower id, then ascending by id.
+fn top_oracle(row: &[f32]) -> (Vec<u32>, Vec<f32>) {
+    let mut order: Vec<usize> = (0..row.len()).collect();
+    order.sort_by(|a, b| row[*b].total_cmp(&row[*a]).then(a.cmp(b)));
+    order.truncate(ROW_TOP as usize);
+    order.sort_unstable();
+    (
+        order.iter().map(|i| *i as u32).collect(),
+        order.iter().map(|i| row[*i]).collect(),
+    )
+}
+
+/// `sample_top_rows_kernel` keeps each row's top entries, ascending by id,
+/// exactly the oracle's set: on full-vocabulary rows with a wide tie at the
+/// cut, with `-inf` (a suppressed id) above it in value order and a negative
+/// row, and on a row shorter than the kept count.
+///
+/// # Panics
+///
+/// When a row's ids or values differ from the oracle's.
+pub fn the_top_of_a_row_is_its_highest_entries_by_id(gpu: &Gpu) {
+    let v = VOCAB as usize;
+    let mut logits = signal(4 * v, 11);
+    // Row 1: a tie of 300 entries straddling the cut, so which ties are kept
+    // is the lower ids' and not an arrival order's.
+    for i in 0..300 {
+        logits[v + i * 800] = 5.0;
+    }
+    for i in 0..40 {
+        logits[v + 7 + i * 900] = 6.0;
+    }
+    // Row 2: the top masked to -inf, as a suppressed id would be.
+    for i in 0..10 {
+        logits[2 * v + i] = 9.0;
+        logits[2 * v + 100 + i] = f32::NEG_INFINITY;
+    }
+    // Row 3: every entry negative.
+    for value in &mut logits[3 * v..] {
+        *value = -1.0 - value.abs();
+    }
+    let got = top_rows(gpu, &logits, 4, VOCAB);
+    for (r, row) in logits.chunks(v).enumerate() {
+        let want = top_oracle(row);
+        assert_eq!(got[r].0, want.0, "row {r}: ids");
+        same(&got[r].1, &want.1);
+    }
+    let short = signal(40, 3);
+    let got = top_rows(gpu, &short, 1, 40);
+    let want = top_oracle(&short);
+    assert_eq!(got[0].0, want.0, "the short row keeps every entry");
+    same(&got[0].1, &want.1);
+}

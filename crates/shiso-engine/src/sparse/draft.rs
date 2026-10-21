@@ -56,7 +56,7 @@ use crate::sparse::qsa::AttnContext;
 use crate::sparse::scratch::Buf;
 use crate::sparse::stack::{Pass, SparseStack};
 use crate::sparse::weights::{LayerDesc, MixDesc, WeightDesc};
-use shiso_core::model::{BlockStep, DraftHint, KeptDrafts, Speculated, VerifiedBlock};
+use shiso_core::model::{BlockStep, DraftHint, KeptDrafts, RowTop, Speculated, VerifiedBlock};
 
 /// Rows the widest draft pass of a decode step runs.
 ///
@@ -1273,28 +1273,57 @@ impl SparseStack {
     ) -> CoreResult<Vec<VerifiedBlock>> {
         let mut rounds = self.draft_rounds(steps, eos)?;
         let total = self.verify_rounds(&mut rounds)?;
-        let mut logits = self.read_logits(total)?;
         let vocab = self.shape.vocab as usize;
-        let blocks = if let [round] = rounds.as_slice() {
-            vec![VerifiedBlock {
-                drafts: round.drafts.clone(),
-                logits: std::mem::take(&mut logits),
-                vocab,
-            }]
+        // A session whose draw has a top-k stage no wider than the kept top
+        // reads its rows' tops - half a kilobyte a row - and any other its rows
+        // whole, a megabyte each.
+        let topped = steps
+            .iter()
+            .map(|step| {
+                self.opts.verify_rows == crate::sparse::stack::VerifyRows::Top
+                    && step
+                        .hint
+                        .sampling
+                        .top_k
+                        .is_some_and(|k| k.get() <= crate::sparse::kernels::ROW_TOP)
+            })
+            .collect::<Vec<_>>();
+        let tops = if topped.iter().any(|on| *on) {
+            let first =
+                rounds
+                    .first()
+                    .map(|round| round.session)
+                    .ok_or(CoreError::ShapeMismatch {
+                        field: "verify rounds",
+                        expected: 1,
+                        got: 0,
+                    })?;
+            self.read_row_tops(first, total)?
         } else {
-            rounds
-                .iter()
-                .map(|round| {
-                    let from = round.start as usize * vocab;
-                    let to = from + round.row_count() as usize * vocab;
-                    VerifiedBlock {
-                        drafts: round.drafts.clone(),
-                        logits: logits.get(from..to).unwrap_or(&[]).to_vec(),
-                        vocab,
-                    }
-                })
-                .collect()
+            Vec::new()
         };
+        let mut blocks = Vec::with_capacity(rounds.len());
+        for (round, topped) in rounds.iter().zip(&topped) {
+            let rows = round.start..round.start + round.row_count();
+            blocks.push(if *topped {
+                VerifiedBlock {
+                    drafts: round.drafts.clone(),
+                    logits: Vec::new(),
+                    vocab,
+                    tops: tops
+                        .get(rows.start as usize..rows.end as usize)
+                        .unwrap_or(&[])
+                        .to_vec(),
+                }
+            } else {
+                VerifiedBlock {
+                    drafts: round.drafts.clone(),
+                    logits: self.read_logits(rows.start, round.row_count())?,
+                    vocab,
+                    tops: Vec::new(),
+                }
+            });
+        }
         self.verified = rounds;
         Ok(blocks)
     }
@@ -1475,12 +1504,14 @@ impl SparseStack {
         Ok(())
     }
 
-    /// The front `rows` of the logits block, on the host.
-    fn read_logits(&self, rows: u32) -> CoreResult<Vec<f32>> {
-        let want = u64::from(rows)
-            .saturating_mul(u64::from(self.shape.vocab))
-            .saturating_mul(crate::sparse::kernels::F32_BYTES);
-        let view = self.scratch_view(Buf::Logits)?.slice(0, want)?;
+    /// Rows `from..from + rows` of the logits block, on the host.
+    fn read_logits(&self, from: u32, rows: u32) -> CoreResult<Vec<f32>> {
+        let row_bytes =
+            u64::from(self.shape.vocab).saturating_mul(crate::sparse::kernels::F32_BYTES);
+        let want = u64::from(rows).saturating_mul(row_bytes);
+        let view = self
+            .scratch_view(Buf::Logits)?
+            .slice(u64::from(from).saturating_mul(row_bytes), want)?;
         let mut bytes = vec![0u8; usize::try_from(want).unwrap_or(0)];
         self.backend.copy_d2h(view, &mut bytes)?;
         Ok(bytes
@@ -1488,6 +1519,55 @@ impl SparseStack {
             .0
             .iter()
             .map(|word| f32::from_le_bytes(*word))
+            .collect())
+    }
+
+    /// The top of each of the front `rows` logits rows, on the host: one
+    /// launch of the top-of-row kernel behind the verify that wrote them (and
+    /// its suppression), then [`ROW_TOP`] entries a row read back.
+    ///
+    /// [`ROW_TOP`]: crate::sparse::kernels::ROW_TOP
+    fn read_row_tops(&self, session: SessionId, rows: u32) -> CoreResult<Vec<RowTop>> {
+        use crate::sparse::bind::Args;
+        use crate::sparse::kernels::{Entry, F32_BYTES, MOD_SAMPLE, ROW_TOP, top_rows};
+        let entries = u64::from(rows) * u64::from(ROW_TOP);
+        let ids_at = entries * F32_BYTES;
+        let mut plan = Plan::new();
+        plan.launch(
+            Entry::plain(MOD_SAMPLE, "sample_top_rows_kernel"),
+            top_rows(rows),
+            // `logits, n_vocab, k, values, ids`
+            Args::of(&[
+                Operand::Scratch(Buf::Logits),
+                Operand::U32(self.shape.vocab),
+                Operand::U32(ROW_TOP),
+                Operand::Scratch(Buf::RowTop),
+                Operand::ScratchFrom(Buf::RowTop, ids_at),
+            ]),
+        );
+        self.executor(session)?.run_steps(plan.steps())?;
+        let view = self.scratch_view(Buf::RowTop)?.slice(0, 2 * ids_at)?;
+        let mut bytes = vec![0u8; usize::try_from(2 * ids_at).unwrap_or(0)];
+        self.backend.copy_d2h(view, &mut bytes)?;
+        let (values, ids) = bytes.split_at(usize::try_from(ids_at).unwrap_or(0));
+        let words = |half: &[u8]| half.as_chunks::<4>().0.to_vec();
+        let (values, ids) = (words(values), words(ids));
+        let kept = ROW_TOP.min(self.shape.vocab) as usize;
+        let width = ROW_TOP as usize;
+        Ok((0..rows as usize)
+            .map(|row| {
+                let at = row * width..row * width + kept;
+                RowTop {
+                    ids: ids[at.clone()]
+                        .iter()
+                        .map(|word| TokenId::new(u32::from_le_bytes(*word)))
+                        .collect(),
+                    values: values[at]
+                        .iter()
+                        .map(|word| f32::from_le_bytes(*word))
+                        .collect(),
+                }
+            })
             .collect())
     }
 

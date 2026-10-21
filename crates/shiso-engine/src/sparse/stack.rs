@@ -185,12 +185,28 @@ pub struct SparseOptions {
     /// keep if it kept that one. The head's first guess is always made: a
     /// step with no guess at all saves only that one head pass.
     pub draft_confidence: f32,
+    /// What a two-phase verify hands a sampling caller: whole rows, or each
+    /// row's top ([`crate::sparse::scratch::Buf::RowTop`]) where the caller's
+    /// draw only reads a top. [`VerifyRows::Top`] is set by a caller that
+    /// found the kernel on its device; the default keeps reading whole rows,
+    /// which every kernel set can.
+    pub verify_rows: VerifyRows,
     /// Whether the loader repacks half-precision projections to
     /// [`shiso_core::DType::F16Pack12`] (see [`crate::sparse::pack12`]).
     ///
     /// Off by default because only the device kernel set reads the packed form;
     /// a server on a device that has it turns it on.
     pub pack_halves: bool,
+}
+
+/// What a two-phase verify reads back for a caller that draws its own tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyRows {
+    /// Every row whole: a megabyte a row, and any draw at all.
+    Whole,
+    /// Each row's top entries, for a caller whose draw has a top-k stage no
+    /// wider than they are; whole rows for any other.
+    Top,
 }
 
 impl SparseOptions {
@@ -223,6 +239,7 @@ impl SparseOptions {
             head_drafts: u32::MAX,
             lookup_drafts: 0,
             draft_confidence: 0.0,
+            verify_rows: VerifyRows::Whole,
             pack_halves: false,
         }
     }

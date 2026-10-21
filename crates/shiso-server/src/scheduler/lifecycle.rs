@@ -850,6 +850,51 @@ impl SeqSlot {
         }
     }
 
+    /// [`SeqSlot::choose`] over a row's top entries instead of the row, for
+    /// a row of `vocab` entries.
+    ///
+    /// Under the keyed rule with a top-k stage no wider than the entries that
+    /// survive suppression this is the same token `choose` draws from the
+    /// whole row: the stage keeps the row's top `k`, which are all here, and
+    /// the nucleus and floor are cut from those. A family only hands tops to a
+    /// sequence whose hint says its draw is such a one. Any other draw - a
+    /// stream draw, or a top-k wider than what survived, which only a family
+    /// that ignored the hint could produce - is taken over the row rebuilt
+    /// from the entries with every other id out of reach, and said out loud.
+    pub(crate) fn choose_top(&mut self, top: &shiso_core::model::RowTop, vocab: usize) -> TokenId {
+        let (ids, values): (Vec<u32>, Vec<f32>) = top
+            .ids
+            .iter()
+            .zip(&top.values)
+            .filter(|(id, _)| !self.suppressed.contains(id))
+            .map(|(id, value)| (id.get(), *value))
+            .unzip();
+        let keyed = self.rule == DrawRule::Keyed;
+        let (params, _) = self.draw();
+        let exact = params.is_greedy() && !ids.is_empty()
+            || params
+                .top_k
+                .is_some_and(|k| usize::try_from(k.get()).is_ok_and(|k| k <= ids.len()));
+        if keyed && exact {
+            let position = self.frontier_len();
+            let (params, seed) = self.draw();
+            return shiso_engine::keyed_sample_ids(&values, &ids, &params, seed.get(), position);
+        }
+        tracing::warn!(
+            keyed,
+            entries = ids.len(),
+            top_k = params.top_k.map(std::num::NonZeroU32::get),
+            "a row's top does not cover this draw; drawing over the top alone"
+        );
+        let mut row = vec![f32::NEG_INFINITY; vocab];
+        for (id, value) in ids.iter().zip(&values) {
+            if let Some(slot) = row.get_mut(*id as usize) {
+                *slot = *value;
+            }
+        }
+        self.choose(&mut row)
+    }
+
     /// Whether this sequence's next draw is the argmax of its row: the
     /// temperature [`SeqSlot::draw`] hands the sampler is not above zero.
     ///
@@ -2058,6 +2103,59 @@ mod tests {
                 assert_ne!(token, TokenId::new(3));
             } else {
                 assert_eq!(token, TokenId::new(2), "the next best");
+            }
+        }
+    }
+
+    /// Over a row's top 64 entries a keyed draw with a top-k stage takes the
+    /// token it takes over the whole row - at every position, with a
+    /// suppressed id among the top and the request's own nucleus - and a
+    /// greedy one takes the argmax.
+    #[test]
+    fn a_draw_over_a_rows_top_is_the_draw_over_the_row() {
+        let vocab = 4_096_usize;
+        let mut state = 0x2545_f491_u32;
+        let row: Vec<f32> = (0..vocab)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Few distinct values near the top, so ties reach the cut.
+                f32::from(u16::try_from((state >> 8) % 4_000).expect("under 4000")) / 400.0
+            })
+            .collect();
+        // The device's top: 64 entries, larger first and ties to the lower
+        // id, held ascending by id.
+        let mut order: Vec<usize> = (0..vocab).collect();
+        order.sort_by(|a, b| row[*b].total_cmp(&row[*a]).then(a.cmp(b)));
+        let mut kept: Vec<usize> = order[..64].to_vec();
+        kept.sort_unstable();
+        let top = shiso_core::model::RowTop {
+            ids: kept
+                .iter()
+                .map(|id| TokenId::new(u32::try_from(*id).expect("an id")))
+                .collect(),
+            values: kept.iter().map(|id| row[*id]).collect(),
+        };
+        let suppressed = TokenId::new(u32::try_from(order[3]).expect("an id"));
+        for temperature in [1.0_f32, 0.0] {
+            for out in 0..48_u32 {
+                let mut slot = slot(&[1], 8);
+                slot.rule = super::DrawRule::Keyed;
+                slot.suppressed = Arc::from([suppressed]);
+                slot.sampling = SamplingParams {
+                    temperature,
+                    top_k: std::num::NonZeroU32::new(20),
+                    top_p: 0.9,
+                    ..SamplingParams::neutral()
+                };
+                slot.seed = Seed::new(u64::from(out) * 7 + 1);
+                slot.out = vec![TokenId::new(0); out as usize];
+                let whole = slot.choose(&mut row.clone());
+                assert_eq!(
+                    slot.choose_top(&top, vocab),
+                    whole,
+                    "t {temperature}, out {out}"
+                );
+                assert_ne!(whole, suppressed);
             }
         }
     }
