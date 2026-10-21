@@ -346,6 +346,15 @@ pub struct ServeArgs {
     /// Read by the sparse family's arm, and only beside `--spec-k`.
     #[arg(long, env = "SHISO_SPEC_LOOKUP", default_value_t = 0)]
     pub spec_lookup: u32,
+    /// The draft head's own probability under which a step's chain stops:
+    /// a guess the head gives less than this, past its first, is not
+    /// drafted, and nothing after it is. Zero never stops a chain.
+    ///
+    /// A guess the head itself doubts is a verify row the target mostly
+    /// rejects, and each costs a head pass and a row of the verify. Read by
+    /// the sparse family's arm, and only beside `--spec-k`.
+    #[arg(long, env = "SHISO_SPEC_CONFIDENCE", default_value_t = 0.0)]
+    pub spec_confidence: f32,
     /// Capture the speculative verify passes as device graphs, one per row
     /// count and session, as the single-row step already is.
     ///
@@ -786,6 +795,14 @@ pub enum ConfigError {
         /// The grid it must be a multiple of.
         grid: usize,
     },
+    /// A probability that is not in `[0, 1)`.
+    #[error("--{flag} {value} is not a probability in [0, 1)")]
+    NotAProbability {
+        /// The flag, spelled as it is typed.
+        flag: &'static str,
+        /// The value as it was given.
+        value: f32,
+    },
     /// One of the two settings speculation needs was given without the other.
     #[error("--{given} without --{missing}: speculation needs a draft head and a depth")]
     HalfSpeculative {
@@ -965,7 +982,26 @@ impl ServeArgs {
                 missing: "spec-k",
             });
         }
+        self.validate_speculation()?;
         self.validate_profile()
+    }
+
+    /// `--spec-confidence` is a probability, and it stops a chain that only
+    /// `--spec-k` drafts.
+    fn validate_speculation(&self) -> Result<(), ConfigError> {
+        if !(0.0..1.0).contains(&self.spec_confidence) {
+            return Err(ConfigError::NotAProbability {
+                flag: "spec-confidence",
+                value: self.spec_confidence,
+            });
+        }
+        if self.spec_confidence > 0.0 && self.spec_k == 0 {
+            return Err(ConfigError::HalfSpeculative {
+                given: "spec-confidence",
+                missing: "spec-k",
+            });
+        }
+        Ok(())
     }
 
     /// `--profile-dir` needs every report to be one request's kernels: one

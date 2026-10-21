@@ -522,6 +522,10 @@ fn a_greedy_two_phase_batch_keeps_the_greedy_steps_tokens() {
 /// instead failed this from its first rejected draft.
 #[test]
 #[ignore = "needs a CUDA device and the served qwen4exp EXL3 export"]
+#[expect(
+    clippy::print_stdout,
+    reason = "the acceptance the head reached is the test's output"
+)]
 fn a_sampled_two_phase_sequence_draws_what_one_token_steps_draw() {
     const KEY: u64 = 0x5eed_cafe;
     const LEN: usize = 96;
@@ -535,7 +539,7 @@ fn a_sampled_two_phase_sequence_draws_what_one_token_steps_draw() {
     let params = served_sampling();
     let hint = DraftHint {
         key: KEY,
-        temperature: params.temperature,
+        sampling: params,
     };
     let tokens = prompt(600);
     let draw = |position: usize, row: &[f32]| {
@@ -594,6 +598,7 @@ fn a_sampled_two_phase_sequence_draws_what_one_token_steps_draw() {
     model.close_session(spec).expect("closes");
     model.teardown().expect("the model tears down");
 
+    println!("sampled two-phase: kept {kept} of {drafted} drafts");
     assert!(
         drafted > 0 && kept > 0,
         "the case must exercise kept drafts: {kept} of {drafted}"

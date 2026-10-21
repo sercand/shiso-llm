@@ -881,7 +881,7 @@ impl SeqSlot {
     }
 
     /// How this sequence will choose its next tokens, for a drafter to follow:
-    /// its key and its current temperature under the keyed rule, greedy
+    /// its key and its current settings under the keyed rule, greedy
     /// otherwise.
     pub(crate) fn draft_hint(&mut self) -> shiso_core::model::DraftHint {
         if self.rule != DrawRule::Keyed {
@@ -890,7 +890,7 @@ impl SeqSlot {
         let (params, seed) = self.draw();
         shiso_core::model::DraftHint {
             key: seed.get(),
-            temperature: params.temperature,
+            sampling: params,
         }
     }
 

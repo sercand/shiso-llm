@@ -1222,9 +1222,8 @@ impl Speculating for Qwen4ExpModel {
         }
     }
 
-    // None never: the stack verifies any session in two phases. The hint is
-    // not followed: the head drafts its greedy chain whatever the caller's
-    // rule, which costs a sampled sequence acceptance and never correctness.
+    // None never: the stack verifies any session in two phases, the head
+    // drawing its guesses by the caller's rule.
     fn verify_block(
         &mut self,
         session: SessionId,
@@ -1254,11 +1253,7 @@ impl Speculating for Qwen4ExpModel {
     // None never: one segmented pass verifies every session.
     fn verify_blocks(&mut self, steps: &[BlockStep<'_>]) -> CoreResult<Option<Vec<VerifiedBlock>>> {
         let eos = self.info.stop_tokens.primary();
-        let asked = steps
-            .iter()
-            .map(|step| (step.session, step.first, step.proposal))
-            .collect::<Vec<_>>();
-        self.stack.verify_blocks(&asked, eos).map(Some)
+        self.stack.verify_blocks(steps, eos).map(Some)
     }
 
     fn settle_blocks(&mut self, kept: &[KeptDrafts]) -> CoreResult<()> {

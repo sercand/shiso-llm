@@ -56,7 +56,7 @@ use crate::sparse::qsa::AttnContext;
 use crate::sparse::scratch::Buf;
 use crate::sparse::stack::{Pass, SparseStack};
 use crate::sparse::weights::{LayerDesc, MixDesc, WeightDesc};
-use shiso_core::model::{KeptDrafts, Speculated, VerifiedBlock};
+use shiso_core::model::{BlockStep, DraftHint, KeptDrafts, Speculated, VerifiedBlock};
 
 /// Rows the widest draft pass of a decode step runs.
 ///
@@ -230,6 +230,27 @@ fn scaffolded(
     };
     drafts.truncate(budget as usize);
     (drafts, source)
+}
+
+/// The temperature-one probability `row` gives `pick`, entry `i` of the row
+/// standing for token `ids[i]` (or for token `i` with no table). Zero for a
+/// token the row does not hold.
+fn pick_probability(row: &[f32], ids: Option<&[u32]>, pick: TokenId) -> f32 {
+    let at = match ids {
+        Some(ids) => ids.binary_search(&pick.get()).ok(),
+        None => Some(pick.get() as usize),
+    };
+    let Some(&chosen) = at.and_then(|i| row.get(i)) else {
+        return 0.0;
+    };
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let total: f64 = row.iter().map(|&l| f64::from(l - max).exp()).sum();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a probability in [0, 1] is held at single precision"
+    )]
+    let p = (f64::from(chosen - max).exp() / total) as f32;
+    p
 }
 
 /// What a greedy step hands back: the guesses it kept, then the answer at the
@@ -738,6 +759,7 @@ impl SparseStack {
         sessions: &[SessionId],
         firsts: &[TokenId],
         frontiers: &[u32],
+        hints: &[DraftHint],
         budget: u32,
     ) -> CoreResult<Vec<Vec<TokenId>>> {
         let width = u64::from(self.shape.stream_dim()) * crate::sparse::kernels::F32_BYTES;
@@ -761,11 +783,34 @@ impl SparseStack {
             .map(|at| at.saturating_sub(1))
             .collect::<Vec<_>>();
         let mut hidden = Operand::Scratch(Buf::DraftStage);
-        for _ in 0..budget {
+        // A session whose chain stopped still rides the batched passes - their
+        // rows are one pass either way - and keeps nothing more from them.
+        let mut live = vec![true; sessions.len()];
+        let threshold = self.opts.draft_confidence;
+        for step in 0..budget {
             let picks = self.draft_batch(sessions, &tokens, &positions, hidden)?;
-            for ((draft, token), pick) in drafts.iter_mut().zip(tokens.iter_mut()).zip(picks) {
-                draft.push(pick);
+            let draws = hints
+                .iter()
+                .zip(frontiers)
+                .map(|(hint, frontier)| (*hint, frontier.saturating_add(1).saturating_add(step)))
+                .collect::<Vec<_>>();
+            let (picks, sure) = self.head_picks(picks, &draws, threshold > 0.0)?;
+            for (i, ((draft, token), pick)) in drafts
+                .iter_mut()
+                .zip(tokens.iter_mut())
+                .zip(picks)
+                .enumerate()
+            {
+                if step > 0 && sure.get(i).is_some_and(|p| *p < threshold) {
+                    live[i] = false;
+                }
+                if live[i] {
+                    draft.push(pick);
+                }
                 *token = pick;
+            }
+            if !live.iter().any(|on| *on) {
+                break;
             }
             for at in &mut positions {
                 *at = at.saturating_add(1);
@@ -1031,7 +1076,15 @@ impl SparseStack {
         eos: TokenId,
         judge: Judge<'_>,
     ) -> CoreResult<SpecTrace> {
-        let mut rounds = self.draft_rounds(&[(session, first, &[])], eos)?;
+        let mut rounds = self.draft_rounds(
+            &[BlockStep {
+                session,
+                first,
+                hint: DraftHint::greedy(),
+                proposal: &[],
+            }],
+            eos,
+        )?;
         let rows = self.verify_rounds(&mut rounds)?;
         let round = rounds.pop().ok_or(CoreError::ShapeMismatch {
             field: "verify rounds",
@@ -1145,7 +1198,12 @@ impl SparseStack {
         let started = std::time::Instant::now();
         let asked = steps
             .iter()
-            .map(|&(session, first)| (session, first, &[][..]))
+            .map(|&(session, first)| BlockStep {
+                session,
+                first,
+                hint: DraftHint::greedy(),
+                proposal: &[],
+            })
             .collect::<Vec<_>>();
         let mut rounds = self.draft_rounds(&asked, eos)?;
         let drafted_at = started.elapsed();
@@ -1196,19 +1254,21 @@ impl SparseStack {
     /// back is every session's drafts with the target's logits over them.
     /// Nothing is committed until [`SparseStack::settle_verified`].
     ///
-    /// `steps[i]` is session `i`'s committed token and the caller's proposal,
-    /// which replaces the session's drafts wherever the two disagree; see
-    /// [`shiso_core::model::Speculating::verify_block`]. The drafts themselves
-    /// are the head's greedy chain or the prompt lookup, whatever rule the
-    /// caller will choose by: a draft only decides how much a step *can*
-    /// keep, and the caller's own choice at every row decides what it does.
+    /// `steps[i]` is session `i`'s committed token, how it will choose its
+    /// tokens, and its proposal, which replaces the session's drafts wherever
+    /// the two disagree; see [`shiso_core::model::Speculating::verify_block`].
+    /// The head draws each guess by the session's own keyed rule at the
+    /// position the guess would take, so a sampled session's drafts are the
+    /// draws it is about to make wherever the head's row agrees with the
+    /// target's. A draft only decides how much a step *can* keep, and the
+    /// caller's own choice at every row decides what it does.
     ///
     /// # Errors
     ///
     /// As [`SparseStack::speculate_batch`].
     pub fn verify_blocks(
         &mut self,
-        steps: &[(SessionId, TokenId, &[TokenId])],
+        steps: &[BlockStep<'_>],
         eos: TokenId,
     ) -> CoreResult<Vec<VerifiedBlock>> {
         let mut rounds = self.draft_rounds(steps, eos)?;
@@ -1282,12 +1342,12 @@ impl SparseStack {
     /// from the sessions as they stand, which is where that verify left them.
     fn draft_rounds(
         &mut self,
-        steps: &[(SessionId, TokenId, &[TokenId])],
+        steps: &[BlockStep<'_>],
         eos: TokenId,
     ) -> CoreResult<Vec<VerifiedRound>> {
         self.verified.clear();
         let mut plans = Vec::with_capacity(steps.len());
-        for &(session, first, _) in steps {
+        for &BlockStep { session, first, .. } in steps {
             let live = self.session(session)?;
             let (depth, frontier) = (live.spec_depth(), live.written());
             let budget = mtp::draft_budget(depth, frontier, self.opts.engine.ctx, MAX_DRAFT + 1);
@@ -1304,20 +1364,21 @@ impl SparseStack {
             let sessions = plans.iter().map(|plan| plan.0).collect::<Vec<_>>();
             let firsts = plans.iter().map(|plan| plan.1).collect::<Vec<_>>();
             let frontiers = plans.iter().map(|plan| plan.2).collect::<Vec<_>>();
-            self.chain_batch(&sessions, &firsts, &frontiers, plans[0].3)?
+            let hints = steps.iter().map(|step| step.hint).collect::<Vec<_>>();
+            self.chain_batch(&sessions, &firsts, &frontiers, &hints, plans[0].3)?
         } else {
             let mut chains = Vec::with_capacity(plans.len());
-            for &(session, first, frontier, head, _) in &plans {
-                chains.push(self.chain(session, first, frontier, head)?);
+            for (&(session, first, frontier, head, _), step) in plans.iter().zip(steps) {
+                chains.push(self.chain(session, first, frontier, step.hint, head)?);
             }
             chains
         };
         let mut rounds = Vec::with_capacity(plans.len());
-        for ((&(session, first, frontier, _, budget), head), &(_, _, proposal)) in
+        for ((&(session, first, frontier, _, budget), head), step) in
             plans.iter().zip(chains).zip(steps)
         {
             let (drafts, source) = self.lookup_or_head(session, first, head, budget, eos)?;
-            let (drafts, source) = scaffolded(drafts, source, proposal, budget);
+            let (drafts, source) = scaffolded(drafts, source, step.proposal, budget);
             rounds.push(VerifiedRound {
                 session,
                 first,
@@ -1473,6 +1534,7 @@ impl SparseStack {
         session: SessionId,
         first: TokenId,
         frontier: u32,
+        hint: DraftHint,
         budget: u32,
     ) -> CoreResult<Vec<TokenId>> {
         let mut drafts = Vec::with_capacity(budget as usize);
@@ -1482,19 +1544,107 @@ impl SparseStack {
         // after it reads the head's own residual, which its previous pass left
         // in row zero.
         let mut hidden = Operand::DraftRow;
-        for _ in 0..budget {
+        for step in 0..budget {
             let pick = self.draft(session, &[token], &[at], hidden, true)?.ok_or(
                 CoreError::Unsupported {
                     what: "a draft pass that was asked for a token and produced none",
                     backend: "engine",
                 },
             )?;
+            // Guess `step` takes position `frontier + 1 + step`: `first` sits
+            // at the frontier, and the caller's keyed draw is indexed by the
+            // position the token it draws will occupy.
+            let draw = (hint, frontier.saturating_add(1).saturating_add(step));
+            let threshold = self.opts.draft_confidence;
+            let (picks, sure) = self.head_picks(vec![pick], &[draw], threshold > 0.0)?;
+            let pick = picks.first().copied().ok_or(CoreError::ShapeMismatch {
+                field: "draft picks",
+                expected: 1,
+                got: 0,
+            })?;
+            if step > 0 && sure.first().is_some_and(|p| *p < threshold) {
+                break;
+            }
             drafts.push(pick);
             token = pick;
             at = at.saturating_add(1);
             hidden = Operand::Scratch(Buf::Residual);
         }
         Ok(drafts)
+    }
+
+    /// The head's guesses for the rows of the draft pass that just ran, each
+    /// drawn the way its caller will draw: `picks` as the head's argmax wrote
+    /// them, `draws[i]` row `i`'s hint and the position its guess would take.
+    ///
+    /// A greedy caller keeps the argmax, and nothing is read. A sampling one is
+    /// drawn from the row the head projected - narrowed or whole - by the
+    /// caller's own keyed rule, its noise keyed by token id, so the guess is the
+    /// token the target's draw lands on wherever the two rows agree on it.
+    /// The argmax is only the most likely token: under sampling the draw lands
+    /// elsewhere often, and every such guess is a rejected verify row.
+    ///
+    /// With `confident` set it also answers each guess's temperature-one
+    /// probability under the head's own row - what
+    /// [`SparseOptions::draft_confidence`] holds a chain to. Without it the
+    /// probabilities are empty, and a greedy chain reads nothing.
+    ///
+    /// [`SparseOptions::draft_confidence`]: crate::sparse::stack::SparseOptions::draft_confidence
+    fn head_picks(
+        &self,
+        mut picks: Vec<TokenId>,
+        draws: &[(DraftHint, u32)],
+        confident: bool,
+    ) -> CoreResult<(Vec<TokenId>, Vec<f32>)> {
+        if !confident && draws.iter().all(|(hint, _)| hint.sampling.is_greedy()) {
+            return Ok((picks, Vec::new()));
+        }
+        let narrow = self
+            .resident()?
+            .weights
+            .draft
+            .as_ref()
+            .and_then(|head| head.head.as_ref());
+        let width =
+            narrow.map_or(self.shape.vocab, crate::sparse::headslice::HeadSlice::rows) as usize;
+        let rows = u32::try_from(draws.len()).unwrap_or(u32::MAX);
+        let want = u64::from(rows)
+            .saturating_mul(width as u64)
+            .saturating_mul(crate::sparse::kernels::F32_BYTES);
+        let view = self.scratch_view(Buf::Logits)?.slice(0, want)?;
+        let mut bytes = vec![0u8; usize::try_from(want).unwrap_or(0)];
+        self.backend.copy_d2h(view, &mut bytes)?;
+        let logits = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect::<Vec<_>>();
+        let table = narrow.map(crate::sparse::headslice::HeadSlice::ids);
+        let mut sure = Vec::with_capacity(if confident { draws.len() } else { 0 });
+        for (i, ((hint, position), pick)) in draws.iter().zip(picks.iter_mut()).enumerate() {
+            let row = logits.get(i * width..(i + 1) * width).unwrap_or(&[]);
+            if hint.sampling.is_greedy() {
+                if confident {
+                    sure.push(pick_probability(row, table, *pick));
+                }
+                continue;
+            }
+            *pick = match narrow {
+                Some(slice) => crate::sampling::keyed_sample_ids(
+                    row,
+                    slice.ids(),
+                    &hint.sampling,
+                    hint.key,
+                    *position,
+                ),
+                None => crate::sampling::keyed_sample(row, &hint.sampling, hint.key, *position),
+            };
+            if confident {
+                sure.push(pick_probability(row, table, *pick));
+            }
+        }
+        Ok((picks, sure))
     }
 
     /// The greedy pick of every row of the pass that just ran.
@@ -1638,5 +1788,26 @@ impl SparseStack {
         }
         self.draft(session, &[first], &[previous], Operand::DraftRow, false)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_probability;
+    use shiso_core::ids::TokenId;
+
+    /// The probability is the row's softmax at the pick, found through the
+    /// narrowed head's table when there is one, and zero for a token the
+    /// row does not hold.
+    #[test]
+    fn a_picks_probability_is_its_softmax_share() {
+        let row = [0.0_f32, (3.0_f32).ln(), 0.0];
+        // exp: 1, 3, 1 - the middle entry holds three fifths.
+        let whole = pick_probability(&row, None, TokenId::new(1));
+        assert!((whole - 0.6).abs() < 1e-6, "{whole}");
+        let ids = [10_u32, 20, 30];
+        let narrowed = pick_probability(&row, Some(&ids), TokenId::new(20));
+        assert!((narrowed - 0.6).abs() < 1e-6, "{narrowed}");
+        assert!(pick_probability(&row, Some(&ids), TokenId::new(21)).abs() < f32::EPSILON);
     }
 }

@@ -87,7 +87,9 @@ pub use ckpt::{
 pub use ckpt_layout::CkptIdentity;
 pub use draft::{DraftHead, DraftParts};
 pub use options::{EngineOptions, KvCheck, KvFit, PoolCost};
-pub use sampling::{argmax, keyed_sample, rng_f32, rng_next, sample_logits, suppress};
+pub use sampling::{
+    argmax, keyed_sample, keyed_sample_ids, rng_f32, rng_next, sample_logits, suppress,
+};
 pub use sampling_probs::{build_probabilities, sample_probabilities};
 /// What the cache holds, re-exported so a model crate can forward it without
 /// taking a dependency on the cache crate: the type is part of this crate's own

@@ -699,6 +699,37 @@ fn router_subcommand_parses_defaults_and_options() {
     );
 }
 
+/// A confidence is a probability and only means something beside a depth:
+/// anything else is refused rather than read as "never stop".
+#[test]
+fn spec_confidence_is_a_probability_beside_a_depth() {
+    let args = parse(&[
+        "--model",
+        "m.gguf",
+        "--spec-k",
+        "4",
+        "--spec-confidence",
+        "0.6",
+    ])
+    .expect("it parses");
+    assert!((args.spec_confidence - 0.6).abs() < f32::EPSILON);
+    args.validate()
+        .expect("a probability beside a depth is served");
+    for bad in ["1.0", "-0.1", "NaN"] {
+        let flag = format!("--spec-confidence={bad}");
+        let args = parse(&["--model", "m.gguf", "--spec-k", "4", &flag]).expect("it parses");
+        assert!(
+            args.validate().is_err(),
+            "--spec-confidence {bad} was accepted"
+        );
+    }
+    let args = parse(&["--model", "m.gguf", "--spec-confidence", "0.6"]).expect("it parses");
+    assert!(
+        args.validate().is_err(),
+        "a confidence with no depth was accepted"
+    );
+}
+
 #[test]
 fn mtp_exact_sampling_flag_sets_exact_sampling() {
     let args = parse(&["--model", "m.gguf", "--mtp-exact-sampling"]).expect("it parses");

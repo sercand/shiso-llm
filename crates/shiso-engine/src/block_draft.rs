@@ -798,7 +798,7 @@ impl BlockDrafter {
         let shape = &self.parts.shape;
         let rank = shape.selector_rank as usize;
         let k = shape.selector_top_k as usize;
-        let sampled = hint.temperature > 0.0;
+        let sampled = hint.sampling.temperature > 0.0;
         let mut prev = first.get();
         let mut out = Vec::with_capacity(shape.block as usize - 1);
         let mut code = Vec::with_capacity(rank);
@@ -820,7 +820,7 @@ impl BlockDrafter {
                 let mut score = row[cand as usize] + edge;
                 if sampled {
                     let u = crate::sampling::keyed_uniform(hint.key, position, cand);
-                    score = score / hint.temperature + DRAFT_NOISE * -(-u.ln()).ln();
+                    score = score / hint.sampling.temperature + DRAFT_NOISE * -(-u.ln()).ln();
                 }
                 if score > best.0 {
                     best = (score, cand);

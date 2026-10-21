@@ -177,6 +177,14 @@ pub struct SparseOptions {
     /// Tokens the prompt lookup may propose a step, zero for none; at most
     /// [`SparseOptions::spec`]. See [`crate::sparse::mtp::propose`].
     pub lookup_drafts: u32,
+    /// The probability under which the head's chain stops, zero for never.
+    ///
+    /// A guess the head itself thinks unlikely - its temperature-one
+    /// probability for the token it proposes - is a verify row the target
+    /// mostly rejects, and every guess after it is one the target can only
+    /// keep if it kept that one. The head's first guess is always made: a
+    /// step with no guess at all saves only that one head pass.
+    pub draft_confidence: f32,
     /// Whether the loader repacks half-precision projections to
     /// [`shiso_core::DType::F16Pack12`] (see [`crate::sparse::pack12`]).
     ///
@@ -214,6 +222,7 @@ impl SparseOptions {
             prefill_rows: MAX_PREFILL_CHUNK,
             head_drafts: u32::MAX,
             lookup_drafts: 0,
+            draft_confidence: 0.0,
             pack_halves: false,
         }
     }

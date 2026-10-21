@@ -592,17 +592,19 @@ pub struct Speculated {
 }
 
 /// What a drafter may know about how the caller will choose tokens: the
-/// sequence's sampling key and temperature.
+/// sequence's sampling key and the settings its keyed draw runs.
 ///
 /// A drafter that scores its candidates with the same noise the caller's keyed
 /// draw will add proposes the token that draw is likely to land on, rather than
-/// the most likely token. Only acceptance depends on it.
+/// the most likely token; one that draws by the same settings too lands on it
+/// wherever the two rows agree. Only acceptance depends on it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DraftHint {
     /// The key the caller's keyed draw uses.
     pub key: u64,
-    /// The temperature it divides by; zero or below is a greedy caller.
-    pub temperature: f32,
+    /// The settings it draws by; a temperature of zero or below is a greedy
+    /// caller.
+    pub sampling: SamplingParams,
 }
 
 impl DraftHint {
@@ -611,7 +613,12 @@ impl DraftHint {
     pub const fn greedy() -> Self {
         Self {
             key: 0,
-            temperature: 0.0,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                top_k: None,
+                top_p: 1.0,
+                min_p: 0.0,
+            },
         }
     }
 }

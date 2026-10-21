@@ -308,7 +308,7 @@ fn drafted_keyed(
     let (mut rounds, mut kept) = (0u32, 0u32);
     let hint = shiso_core::model::DraftHint {
         key,
-        temperature: params.temperature,
+        sampling: params,
     };
     while out.len() < STEPS {
         let first = *out.last().expect("a token");
