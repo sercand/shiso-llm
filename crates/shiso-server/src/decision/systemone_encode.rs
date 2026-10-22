@@ -14,14 +14,14 @@
 //! id in the order the request's map carried them — and the workspace builds
 //! `serde_json` with `preserve_order` so the map keeps that insertion order
 //! into the response bytes. Nothing here computes anything: every number was
-//! decided in [`super::core`] and [`super::math`], and the mass this wire
+//! decided in [`super::core`] and [`shiso_decision::math`], and the mass this wire
 //! calls `x_label_mass` is the same quantity the decisions wire calls
 //! `label_mass`, renamed at the edge.
 
 use serde_json::{Map, Value, json};
 
 use crate::decision::core::{Answered, Kind, answer_label, choice_name, type_name};
-use crate::decision::math::{choice_confidence, expected_score, score_confidence};
+use shiso_decision::math::{choice_confidence, expected_score, score_confidence};
 
 /// Encodes the scored answers. `model` is the server's served model id —
 /// this surface never echoes the request's name — and `state` is the

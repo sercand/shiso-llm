@@ -19,11 +19,11 @@ use shiso_ir::Block;
 
 use crate::decision::core::{self, Answered, InputTally, Kind, RawQuestion};
 use crate::decision::decisions_wire::{DecisionInput, InputBlock};
-use crate::decision::math::softmax;
 use crate::error::AppError;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
 use crate::tokenizer::Vocabulary;
+use shiso_decision::math::softmax;
 
 /// The vocabulary, as a layout reaches it.
 pub(crate) struct Encoder<'a>(pub(crate) &'a Vocabulary);

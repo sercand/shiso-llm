@@ -9,6 +9,7 @@ description = "shiso: the shiso binary - clap CLI, axum router, OpenAI/Anthropic
 
 [dependencies]
 shiso-core = { workspace = true }
+shiso-decision = { workspace = true }
 shiso-engine = { workspace = true }
 shiso-ir = { workspace = true }
 shiso-kvstore = { workspace = true }

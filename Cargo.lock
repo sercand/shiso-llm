@@ -2713,6 +2713,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shiso-decision"
+version = "0.2.3"
+dependencies = [
+ "shiso-core",
+ "thiserror",
+]
+
+[[package]]
 name = "shiso-engine"
 version = "0.2.3"
 dependencies = [
@@ -2979,6 +2987,7 @@ dependencies = [
  "shiso-audio",
  "shiso-core",
  "shiso-cuda",
+ "shiso-decision",
  "shiso-engine",
  "shiso-hub",
  "shiso-ir",

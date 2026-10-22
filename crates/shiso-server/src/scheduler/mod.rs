@@ -91,7 +91,6 @@ use shiso_ir::{EventStream, StopReason, StreamEvent};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::decision;
 use crate::error::AppError;
 use crate::media::{MediaItem, MediaTowers};
 use crate::media_cache::{CachedRows, MediaCache};
@@ -2536,7 +2535,8 @@ fn start_decoding(
 /// (see [`Coordinator::retire`]). A failed send is a caller that hung up
 /// mid-prefill; the sequence still retires and frees its session either way.
 fn finish_scoring(row: &[u8], scores: &mut [f32], slot: &mut SeqSlot) {
-    let label_logprobs = decision::math::label_logprobs(fill(row, scores), slot.score_labels());
+    let label_logprobs =
+        shiso_decision::math::label_logprobs(fill(row, scores), slot.score_labels());
     slot.finish_score();
     if let Some(reply) = slot.take_score_reply() {
         let _ = reply.send(Ok(ScoreOutcome {

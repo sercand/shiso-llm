@@ -23,12 +23,12 @@ use shiso_ir::{Block, MediaSource, Message, Request, Role, ThinkingDirective};
 
 use crate::api::pipeline::remaining_budget;
 use crate::decision::decisions_wire::{DecisionInput, InputBlock, InputImageSource};
-use crate::decision::math::{label_mass, softmax};
 use crate::error::AppError;
 use crate::media::MediaItem;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
 use crate::tokenizer::{AddedSeam, Vocabulary};
+use shiso_decision::math::{label_mass, softmax};
 
 /// The value of a choice option, typed as the official wire types it: a
 /// string and a boolean with the same text are distinct options, so the

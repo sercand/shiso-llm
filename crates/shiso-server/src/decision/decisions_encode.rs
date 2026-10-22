@@ -8,7 +8,7 @@
 //! request's question order, and the workspace builds `serde_json` with
 //! `preserve_order` so the map keeps insertion order into the response bytes.
 //! Nothing here computes anything - every number was decided in
-//! [`super::core`] and [`super::math`] - this only spells them out.
+//! [`super::core`] and [`shiso_decision::math`] - this only spells them out.
 //!
 //! Two spellings are shiso's beside the official shape, both documented
 //! deviations: `confidence` is the label mass (the official API does not
@@ -19,7 +19,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::decision::core::{Answered, InputTally, Kind, choice_name};
-use crate::decision::math::expected_score;
+use shiso_decision::math::expected_score;
 
 /// The one prompt format this server answers in, echoed so a caller knows
 /// which bytes produced the answer it is reading. (shiso extension.)

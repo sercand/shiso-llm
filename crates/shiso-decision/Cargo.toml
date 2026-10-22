@@ -1,0 +1,16 @@
+[package]
+name = "shiso-decision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "shiso: decision models in-process - the answer arithmetic and the readout/head scoring, with no HTTP."
+
+[dependencies]
+# Token newtypes and the decision layout traits (`DecisionReadout`, `DecisionLayout`).
+shiso-core = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

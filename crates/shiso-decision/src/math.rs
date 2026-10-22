@@ -13,7 +13,8 @@ use shiso_core::TokenId;
 /// The vocabulary-wide normalizer is the same for every label and cancels in
 /// the softmax over labels; the mass is not a softmax artifact, so the row's
 /// log-sum-exp is what turns raw logits into real log-probabilities.
-pub(crate) fn label_logprobs(row: &[f32], labels: &[TokenId]) -> Vec<f64> {
+#[must_use]
+pub fn label_logprobs(row: &[f32], labels: &[TokenId]) -> Vec<f64> {
     let norm = logsumexp(row);
     labels
         .iter()
@@ -34,7 +35,8 @@ pub(crate) fn label_logprobs(row: &[f32], labels: &[TokenId]) -> Vec<f64> {
 ///
 /// The caller guarantees `temperature > 0`; a zero or negative temperature is
 /// refused at the wire, not softened here.
-pub(crate) fn softmax(logprobs: &[f64], temperature: f64) -> Vec<f64> {
+#[must_use]
+pub fn softmax(logprobs: &[f64], temperature: f64) -> Vec<f64> {
     let scaled: Vec<f64> = logprobs.iter().map(|lp| lp / temperature).collect();
     let max = scaled
         .iter()
@@ -49,7 +51,8 @@ pub(crate) fn softmax(logprobs: &[f64], temperature: f64) -> Vec<f64> {
 /// Independent of the temperature by construction — a softmax over the labels
 /// would always sum to one and say nothing about how much of the distribution
 /// lives outside them.
-pub(crate) fn label_mass(logprobs: &[f64]) -> f64 {
+#[must_use]
+pub fn label_mass(logprobs: &[f64]) -> f64 {
     logprobs.iter().map(|lp| lp.exp()).sum()
 }
 
@@ -58,7 +61,8 @@ pub(crate) fn label_mass(logprobs: &[f64]) -> f64 {
     clippy::cast_precision_loss,
     reason = "level indices are single digits and exact in f64"
 )]
-pub(crate) fn expected_score(probabilities: &[f64]) -> f64 {
+#[must_use]
+pub fn expected_score(probabilities: &[f64]) -> f64 {
     probabilities
         .iter()
         .enumerate()
@@ -78,7 +82,8 @@ pub(crate) fn expected_score(probabilities: &[f64]) -> f64 {
     clippy::cast_precision_loss,
     reason = "label counts are single digits and exact in f64"
 )]
-pub(crate) fn choice_confidence(probabilities: &[f64]) -> f64 {
+#[must_use]
+pub fn choice_confidence(probabilities: &[f64]) -> f64 {
     if probabilities.is_empty() {
         return 0.0;
     }
@@ -107,7 +112,8 @@ pub(crate) fn choice_confidence(probabilities: &[f64]) -> f64 {
     clippy::cast_precision_loss,
     reason = "level indices and counts are single digits and exact in f64"
 )]
-pub(crate) fn score_confidence(probabilities: &[f64]) -> f64 {
+#[must_use]
+pub fn score_confidence(probabilities: &[f64]) -> f64 {
     let n = probabilities.len();
     if n <= 1 {
         return 1.0;

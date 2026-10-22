@@ -34,10 +34,10 @@ use shiso_ir::Block;
 use crate::api::pipeline::remaining_budget;
 use crate::decision::core::{self, Answered, InputTally, RawQuestion};
 use crate::decision::head::{self, Encoder};
-use crate::decision::math::{label_mass, softmax};
 use crate::error::AppError;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
+use shiso_decision::math::{label_mass, softmax};
 
 /// The state a readout reads, spelled the way its family wants.
 ///
