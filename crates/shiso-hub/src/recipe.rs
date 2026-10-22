@@ -517,8 +517,6 @@ pub enum Task {
     Embedding,
     /// Schema decisions answered by a decision head.
     Decision,
-    /// Fixed-label text classification (a classifier head over the input text).
-    Classification,
 }
 
 impl Task {
@@ -532,7 +530,6 @@ impl Task {
             Self::ImageGeneration => "image_generation",
             Self::Embedding => "embedding",
             Self::Decision => "decision",
-            Self::Classification => "classification",
         }
     }
 }
@@ -553,7 +550,6 @@ impl FromStr for Task {
             "image_generation" => Ok(Self::ImageGeneration),
             "embedding" => Ok(Self::Embedding),
             "decision" => Ok(Self::Decision),
-            "classification" => Ok(Self::Classification),
             _ => Err(HubError::Validation {
                 reason: format!("unknown task '{s}'"),
             }),
@@ -1147,21 +1143,6 @@ pub struct IndexVariantEntry {
     pub min_metal_family: Option<u32>,
 }
 
-/// Reads a list of enum strings, dropping the ones this client does not know.
-///
-/// The index is shared by every client version. A newer registry may list a
-/// task or modality this build predates; failing the whole catalog over it
-/// would hide every other model. Recipes stay strict (see `validate_recipe`),
-/// so an unknown value is only ever dropped from the browse metadata.
-fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: FromStr,
-{
-    let raw = Vec::<String>::deserialize(deserializer)?;
-    Ok(raw.iter().filter_map(|s| s.parse().ok()).collect())
-}
-
 /// An entry for one model inside the compact registry index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexModelEntry {
@@ -1180,13 +1161,13 @@ pub struct IndexModelEntry {
     #[serde(default)]
     pub tags: Vec<String>,
     /// Tasks served.
-    #[serde(default, deserialize_with = "lenient_list")]
+    #[serde(default)]
     pub tasks: Vec<Task>,
     /// Input modalities.
-    #[serde(default, deserialize_with = "lenient_list")]
+    #[serde(default)]
     pub inputs: Vec<Modality>,
     /// Output modalities.
-    #[serde(default, deserialize_with = "lenient_list")]
+    #[serde(default)]
     pub outputs: Vec<Modality>,
     /// Last update timestamp.
     pub updated_at: String,
