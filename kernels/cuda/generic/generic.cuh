@@ -8,7 +8,7 @@
  * tables at the bottom are format data transcribed from
  * `crates/shiso-modelfile/src/quant_tables.rs`; and the dequantizers are the
  * arithmetic of the formats, derived from the Metal twins in
- * `crates/shiso-metal/metal/generic/mul_mv_ext.metal` so both devices round
+ * `kernels/metal/generic/mul_mv_ext.metal` so both devices round
  * the same way.
  */
 #ifndef SHISO_GENERIC_CUH
@@ -201,7 +201,7 @@ extern __shared__ __align__(16) char shiso_generic_smem[];
 /* One q6_K block: low nibbles, the two high bits per weight, one signed scale
  * per sixteen weights and an fp16 block scale. 210 bytes, matching the loader's
  * `BlockQ6K`, the Metal block struct in
- * `crates/shiso-metal/metal/qwen35/gemv_ext_q5k_q6k.metal` and the dense
+ * `kernels/metal/qwen35/gemv_ext_q5k_q6k.metal` and the dense
  * module's copy in `kernels/cuda/dense/dense_common.cuh`. */
 struct shiso_block_q6_K {
     unsigned char ql[SHISO_QK_K / 2];
@@ -284,8 +284,8 @@ __device__ __forceinline__ void shiso_dequantize_q6_K_t4(
  * a fifth-bit plane.
  *
  * The arithmetic below is `dequantize_dense_q4_K` and `dequantize_dense_q5_K`
- * from `crates/shiso-metal/metal/generic/mul_mv_ext.metal` and
- * `crates/shiso-metal/metal/qwen35/gemv_ext_q5k_q6k.metal`, which is what
+ * from `kernels/metal/generic/mul_mv_ext.metal` and
+ * `kernels/metal/qwen35/gemv_ext_q5k_q6k.metal`, which is what
  * produced the committed goldens. Neither the element order nor the fold order
  * is adjusted: element `16*il + i` is built as `dl * q - ml` with the same
  * left-to-right association. That is the contract, not a style choice.
@@ -436,7 +436,7 @@ __device__ __forceinline__ void shiso_dequantize_q5_K_t4(
 
 /* One q8_0 block: a half scale and 32 signed bytes, in element order.
  *
- * `block_q8_0` in `crates/shiso-metal/metal/generic/00_common.metal`, which is
+ * `block_q8_0` in `kernels/metal/generic/00_common.metal`, which is
  * the GGUF container's file layout rather than anybody's source. A qwen35 `Q4_K_M` container
  * keeps this family's two gate projections - `ssm_alpha` and `ssm_beta`, 24 of
  * each - at this codec, so the dense hybrid cannot decode a token without it. */
@@ -448,7 +448,7 @@ static_assert(sizeof(struct shiso_block_q8_0) == 34, "a q8_0 block is 34 bytes")
 
 /* Sixteen consecutive elements of a q8_0 block, `il` picking which half.
  *
- * `dequantize_q8_0` in `crates/shiso-metal/metal/generic/mul_mv_q8_0.metal`,
+ * `dequantize_q8_0` in `kernels/metal/generic/mul_mv_q8_0.metal`,
  * including where it rounds: the byte widens to float and the scale widens to
  * float, and the product is taken there. The GEMM's staging loop narrows the
  * result to half afterwards, which is the template's `S0` and not this
@@ -535,7 +535,7 @@ __device__ __forceinline__ void shiso_dequantize_q4_0_block(
  * for `q2_K` two of its sixteen 16-weight subblocks).
  *
  * The dequantizers below are the device twins of `deq32_*` in
- * `crates/shiso-metal/metal/generic/mul_mv_ext.metal` and of the host
+ * `kernels/metal/generic/mul_mv_ext.metal` and of the host
  * reference decoders in `shiso_modelfile::iq_quant`: same block bytes in,
  * same f32 values out, in the same multiplication order. That is the
  * contract, not a style choice - a golden that pins a decode step pins the

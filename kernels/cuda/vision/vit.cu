@@ -11,7 +11,7 @@
  * Nothing in this unit is a byte copy of anything, so it carries no provenance
  * header and `scripts/q4e_ptx_oracle.sh --mode=fidelity` reports it as
  * generated. The arithmetic is the Metal twins' in
- * `crates/shiso-metal/metal/vision`, and the argument blocks are the ones the
+ * `kernels/metal/vision`, and the argument blocks are the ones the
  * two encoders and the engine pack.
  *
  * This is NOT the `qwen3vl_*` set in the same directory. That one is a verbatim

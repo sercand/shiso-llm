@@ -1,7 +1,7 @@
 /* The half-precision vocabulary gather.
  *
  * Nothing here is copied. What is preserved from the Metal twin in
- * `crates/shiso-metal/metal/generic/get_rows.metal` is the contract: the entry
+ * `kernels/metal/generic/get_rows.metal` is the contract: the entry
  * name, the `GetRowsArgs` block, the buffer order, one block per 256-element
  * span of one row with the token index on the second grid axis, and the two
  * guards - an id outside the table leaves its row untouched, and a span past

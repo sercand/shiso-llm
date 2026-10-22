@@ -195,7 +195,7 @@ operand planes), `kernel_vit_add_bias_f16`, `kernel_vit_layer_norm_split_f16`,
 `kernel_vit_bias_gelu_split_f16`, `kernel_vit_add_bias_residual_f16` and
 `kernel_vit_qkv_rope_split_f16`. The encoder picks one width per tower.
 
-Geometry and parameter order are `crates/shiso-metal/metal/vision/KERNELS.md`'s,
+Geometry and parameter order are `kernels/metal/vision/KERNELS.md`'s,
 because the twins share an engine that names them and hands both the same
 argument block and the same grid. The argument block is parameter 0 in all nine
 — unlike the `dense` set's four affine matmuls, none of these binds it last.

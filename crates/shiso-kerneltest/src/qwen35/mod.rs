@@ -1,7 +1,7 @@
 //! The qwen35 kernel set's cases, one module per entry-point family.
 //!
 //! The split mirrors the five test binaries these came out of, and the
-//! headings of `crates/shiso-metal/metal/qwen35/KERNELS.md`: the gated delta
+//! headings of `kernels/metal/qwen35/KERNELS.md`: the gated delta
 //! network and its four small helpers, the `q5_K`/`q6_K`/`q4_K` linear path,
 //! the fused norm-and-rotate pair with its two multimodal siblings, the gated
 //! attention family, and the chunk kernel's lane handout replayed as index

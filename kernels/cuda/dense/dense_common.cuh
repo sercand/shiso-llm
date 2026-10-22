@@ -1,6 +1,6 @@
 /* Shared reduction shapes, activations and argument blocks for the dense set.
  *
- * The CUDA half of `crates/shiso-metal/metal/dense/dense_common.h`, written
+ * The CUDA half of `kernels/metal/dense/dense_common.h`, written
  * against the same contract: "dense" is the parametric family, so nothing here
  * assumes a hidden width, a head count or a head dimension, and every dimension
  * arrives in an argument block rather than in a constant.

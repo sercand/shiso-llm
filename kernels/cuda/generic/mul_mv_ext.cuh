@@ -2,7 +2,7 @@
  * entry point and two function constants on Metal.
  *
  * Nothing here is copied. The decomposition is the Metal twin's in
- * `crates/shiso-metal/metal/generic/mul_mv_ext.metal` - the same lane split,
+ * `kernels/metal/generic/mul_mv_ext.metal` - the same lane split,
  * the same four-chunks-per-thread inner loop, the same reduction order and the
  * same guarded store - because the host names these kernels itself and hands
  * them the same argument block and the same grid. What changes is that the two

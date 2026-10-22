@@ -1,7 +1,7 @@
 //! Every kernel the forward pass dispatches, described once.
 //!
 //! A kernel is named, argued and launched exactly as its module records it. The
-//! qwen35 entries come from `shiso-metal/metal/qwen35/KERNELS.md`; the generic
+//! qwen35 entries come from `kernels/metal/qwen35/KERNELS.md`; the generic
 //! entries come from the argument block the kernel itself declares. Nothing here
 //! invents a name, rounds a grid into a shape a kernel was not written for, or
 //! shares an argument block between two kernels that merely have the same fields.
@@ -1771,7 +1771,7 @@ const EXT_Q5_K_BY_NAME: [[&str; 3]; 5] = [
 /// `q2_K` and the eight i-quant tables below are the mixed set of the Saluki
 /// export. All nine decode through the `kq` walk - one whole 32-weight
 /// sub-block a lane, the twin of `kernel_mul_mv_ext_kq_f32_disp` in
-/// `crates/shiso-metal/metal/generic/mul_mv_ext.metal` - and all fifteen
+/// `kernels/metal/generic/mul_mv_ext.metal` - and all fifteen
 /// `(r1ptg, nxpsg)` pairs are instantiated in
 /// `kernels/cuda/generic/generic.cu`, because a pair that is merely absent is
 /// a decode that resolves at one prompt width and refuses at another. Without

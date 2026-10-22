@@ -1,7 +1,7 @@
 /* Shared widths, reduction shapes, activations and argument blocks for the
  * parametric vision-tower set.
  *
- * The CUDA half of `crates/shiso-metal/metal/vision/vit_common.h`, written
+ * The CUDA half of `kernels/metal/vision/vit_common.h`, written
  * against the same contract: nothing here assumes a hidden width, a depth, a
  * head count or a patch geometry, because the two towers this tree loads differ
  * in all four and a literal would be an encoder running the wrong arithmetic on

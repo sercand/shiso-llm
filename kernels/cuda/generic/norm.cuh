@@ -1,7 +1,7 @@
 /* The two fused RMS norms every dense slot passes through.
  *
  * Nothing here is copied. What is preserved from the Metal twins in
- * `crates/shiso-metal/metal/generic/norm.metal` is the contract: the entry
+ * `kernels/metal/generic/norm.metal` is the contract: the entry
  * names, the argument block, the buffer order, one warp per row, and - the part
  * that is arithmetic rather than plumbing - where the reduction folds. Both
  * kernels reduce with a whole-warp butterfly, spill one partial per warp to

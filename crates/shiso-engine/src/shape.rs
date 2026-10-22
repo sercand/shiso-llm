@@ -325,7 +325,7 @@ pub struct ShortConvShape {
 /// `__shared__ float chosen_w[16]` / `chosen_i[16]` at
 /// `kernels/cuda/q4e/moe.cu:44-47`, and the `threadgroup` pair the Metal port
 /// carries faithfully at
-/// `crates/shiso-metal/metal/qwen35moe/moe_route.metal:161-162`. Both index
+/// `kernels/metal/qwen35moe/moe_route.metal:161-162`. Both index
 /// them by `n_used` with no test. The CUDA comment claims its entry point
 /// rejects anything wider; it does not, and the constant that comment cites
 /// does not exist in this tree. That file is fidelity-gated and its bytes are
@@ -725,7 +725,7 @@ impl HybridShape {
                 value: format!(
                     "{used} exceeds the {ROUTER_CHOSEN_SLOTS} slots both routers' chosen-weight \
                      and chosen-id arrays hold, at kernels/cuda/q4e/moe.cu:44-47 and \
-                     crates/shiso-metal/metal/qwen35moe/moe_route.metal:161-162; neither bounds \
+                     kernels/metal/qwen35moe/moe_route.metal:161-162; neither bounds \
                      its writes, so a wider router silently answers from the wrong experts",
                     used = moe.used
                 ),
@@ -976,7 +976,7 @@ mod tests {
                 // either file that will lead them to the other.
                 assert!(value.contains("kernels/cuda/q4e/moe.cu:44-47"), "{value}");
                 assert!(
-                    value.contains("crates/shiso-metal/metal/qwen35moe/moe_route.metal:161-162"),
+                    value.contains("kernels/metal/qwen35moe/moe_route.metal:161-162"),
                     "{value}"
                 );
                 assert!(value.contains("17"), "{value}");

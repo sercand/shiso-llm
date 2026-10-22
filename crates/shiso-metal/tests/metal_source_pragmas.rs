@@ -94,7 +94,7 @@ fn pragma_counts(source: &str) -> (usize, usize) {
 fn every_qwen35_metal_file_restores_fast_math_by_eof() {
     for module in ["qwen35", "qwen35moe"] {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("metal")
+            .join("../../kernels/metal")
             .join(module);
         let entries = fs::read_dir(&dir)
             .unwrap_or_else(|err| panic!("{} reads as a directory: {err}", dir.display()));

@@ -1,6 +1,6 @@
 /* Per-head RMSNorm plus partial rope for the query and key projections.
  *
- * The CUDA twins of `crates/shiso-metal/metal/qwen35/rmsnorm_rope.metal`, over
+ * The CUDA twins of `kernels/metal/qwen35/rmsnorm_rope.metal`, over
  * the law `kernels/cuda/q4e/qsa.cu` carries as `q4e_qsa_q_norm_rope_kernel` and
  * `q4e_qsa_store_kv_kernel`.
  *

@@ -1,7 +1,7 @@
 /* The prefill GEMM, once per weight codec.
  *
  * Nothing here is copied. What is preserved from the Metal twin in
- * `crates/shiso-metal/metal/qwen35/gemm_q4k.metal` is the contract: the entry
+ * `kernels/metal/qwen35/gemm_q4k.metal` is the contract: the entry
  * name, the argument block, the buffer order, the 64-by-32 output tile, the
  * 32-wide k tile, the 128-thread block, the 8192 bytes of threadgroup memory
  * and the guarded epilogue. It also preserves where the arithmetic rounds -
