@@ -121,14 +121,12 @@ impl RegistryClient {
             source: e,
         })?;
 
-        // Parse before caching: a body this client cannot read must not
-        // replace the last good index (and its etag, which would turn the
-        // next request into a 304 for the bad one).
-        let index: Index = serde_json::from_slice(&index_bytes)?;
         atomic_write(index_path, &index_bytes)?;
         if let Some(etag) = new_etag {
             atomic_write(etag_path, etag.as_bytes())?;
         }
+
+        let index: Index = serde_json::from_slice(&index_bytes)?;
         Ok(index)
     }
 

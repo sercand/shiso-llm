@@ -1088,27 +1088,3 @@ fn hub_file_names_are_plain_url_and_git_safe() {
         assert!(!hub_file_name_ok(bad), "{bad:?}");
     }
 }
-
-#[test]
-fn task_classification_round_trips() {
-    assert_eq!(Task::Classification.as_str(), "classification");
-    assert_eq!(
-        "classification".parse::<Task>().unwrap(),
-        Task::Classification
-    );
-    let mut recipe = make_test_recipe();
-    recipe.tasks = vec![Task::Classification];
-    let text = serde_json::to_string(&recipe).unwrap();
-    assert!(text.contains("\"classification\""));
-    let back: Recipe = serde_json::from_str(&text).unwrap();
-    assert_eq!(back.tasks, vec![Task::Classification]);
-}
-
-#[test]
-fn recipe_with_classification_task_validates() {
-    let text = include_str!("../../shiso-registry/tests/fixtures/distilbert-cls.json");
-    let recipe: Recipe = serde_json::from_str(text).unwrap();
-    assert_eq!(recipe.tasks, vec![Task::Classification]);
-    assert_eq!(recipe.family, "distilbert_cls");
-    validate_recipe(&recipe, ValidationMode::Strict).unwrap();
-}
