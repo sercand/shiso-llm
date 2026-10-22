@@ -5,4 +5,7 @@
 //! This crate names no model family and depends on no server, router or HTTP
 //! crate; whoever runs the model hands it rows through a narrow seam.
 
+pub mod error;
 pub mod math;
+pub mod schema;
+pub mod score;

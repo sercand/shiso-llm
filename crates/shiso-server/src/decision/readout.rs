@@ -27,7 +27,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use shiso_core::{
     DecisionLayoutError, DecisionMedia, DecisionMediaKind, DecisionReadout, ReadoutPrompt,
-    ReadoutRecord, SchemaQuestion, StateSpelling, TokenId,
+    ReadoutRecord, SchemaQuestion, StateSpelling,
 };
 use shiso_ir::Block;
 
@@ -37,7 +37,7 @@ use crate::decision::head::{self, Encoder};
 use crate::error::AppError;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
-use shiso_decision::math::{label_mass, softmax};
+use shiso_decision::score::{RunScore, ScoreRun, fold_readout, readout_runs};
 
 /// The state a readout reads, spelled the way its family wants.
 ///
@@ -81,16 +81,9 @@ fn readout_refusal(error: DecisionLayoutError, questions: &[RawQuestion], ctx: u
     }
 }
 
-/// One question's scoring pass: its whole prompt and the labels read at its
-/// last row.
-struct Pass {
-    tokens: Vec<TokenId>,
-    labels: Vec<TokenId>,
-}
-
-/// Every question's whole prompt and label list, checked against the context
-/// and against the question it answers, and the tokens the passes read: the
-/// trunk once and each branch once.
+/// The library's scoring runs for every question, after checking each whole
+/// prompt against the context, and the tokens the passes read: the trunk once
+/// and each branch once.
 ///
 /// # Errors
 ///
@@ -99,39 +92,26 @@ struct Pass {
 /// with the wrong number of options or with an option read from nothing.
 fn passes(
     ctx: u32,
-    questions: &[RawQuestion],
+    schema: &[SchemaQuestion],
     prompt: &ReadoutPrompt,
-) -> Result<(Vec<Pass>, u64), AppError> {
-    let mut passes = Vec::with_capacity(questions.len());
+) -> Result<(Vec<ScoreRun>, u64), AppError> {
     let mut total = prompt.trunk.len() as u64;
-    for (question, laid) in questions.iter().zip(&prompt.questions) {
-        let mut tokens: Vec<TokenId> = Vec::with_capacity(prompt.trunk.len() + laid.branch.len());
-        tokens.extend_from_slice(&prompt.trunk);
-        tokens.extend_from_slice(&laid.branch);
-        let prompt_tokens = tokens.len() as u64;
+    for laid in &prompt.questions {
+        let prompt_tokens = (prompt.trunk.len() + laid.branch.len()) as u64;
         remaining_budget(ctx, prompt_tokens).ok_or(AppError::ContextOverflow {
             param: "input",
             prompt_tokens,
             ctx,
         })?;
-        let options = match &question.kind {
-            core::Kind::YesNo { .. } => 2,
-            core::Kind::Choice { options, .. } => options.len(),
-            core::Kind::Score { levels, .. } => levels.len(),
-        };
-        if laid.options.len() != options || laid.options.iter().any(Vec::is_empty) {
-            return Err(AppError::internal(
-                "the decision readout laid out a different number of options",
-                std::io::Error::other("option count mismatch"),
-            ));
-        }
         total += laid.branch.len() as u64;
-        passes.push(Pass {
-            labels: laid.labels(),
-            tokens,
-        });
     }
-    Ok((passes, total))
+    let runs = readout_runs(prompt, schema).map_err(|error| {
+        AppError::internal(
+            "the decision readout laid out a different number of options",
+            error,
+        )
+    })?;
+    Ok((runs, total))
 }
 
 /// Scores `questions` over `text` (`None` for no state) and the pictures in
@@ -206,58 +186,51 @@ pub(crate) async fn run(
         Some(decoded) => (Arc::from(decoded.media), Arc::from(decoded.digests)),
         None => (Arc::from(Vec::new()), Arc::from(Vec::new())),
     };
-    let shared = if prompt.questions.len() > 1 {
-        u32::try_from(prompt.trunk.len()).unwrap_or(u32::MAX)
-    } else {
-        0
-    };
-
-    let (passes, total) = passes(state.ctx, &questions, &prompt)?;
-    let scored = futures::future::join_all(passes.iter().map(|Pass { tokens, labels }| {
+    let (runs, total) = passes(state.ctx, &schema, &prompt)?;
+    let pending = futures::future::join_all(runs.iter().map(|run| {
         engine.score(
-            ScoreRequest::new(Arc::from(tokens.as_slice()), Arc::from(labels.as_slice()))
-                .with_media(Arc::clone(&media_items), Arc::clone(&digests))
-                .with_shared_prefix(shared),
+            ScoreRequest::new(
+                Arc::from(run.tokens.as_slice()),
+                Arc::from(run.labels.as_slice()),
+            )
+            .with_media(Arc::clone(&media_items), Arc::clone(&digests))
+            .with_shared_prefix(run.shared_prefix),
         )
     }))
     .await;
-
-    let mut answers = Vec::with_capacity(questions.len());
-    for (((question, laid), outcome), Pass { tokens, labels }) in questions
+    let outcomes = pending
         .into_iter()
-        .zip(&prompt.questions)
-        .zip(scored)
-        .zip(passes)
-    {
-        let outcome = outcome?;
-        let pooled = laid.pool(&outcome.label_logprobs);
-        let probabilities = softmax(&pooled, temperature);
-        // The first argmax, so a tie goes to the earlier option, as on the
-        // label route.
-        let top = probabilities
-            .iter()
-            .enumerate()
-            .fold((0usize, f64::NEG_INFINITY), |best, (index, p)| {
-                if *p > best.1 { (index, *p) } else { best }
+        .map(|outcome| {
+            outcome.map(|outcome| RunScore {
+                label_logprobs: outcome.label_logprobs,
+                cached_tokens: outcome.cached_tokens,
             })
-            .0;
-        answers.push(Answered {
-            id: question.id,
-            kind: question.kind,
-            probability_answer: question.probability_answer,
-            probabilities,
-            // The best spelling of each option is the mass that option was
-            // given; the other spellings of it are not added on top.
-            label_mass: label_mass(&pooled),
-            top,
-            prompt_tokens: tokens.len() as u64,
-            cached_tokens: outcome.cached_tokens.min(tokens.len() as u64),
-            prompt_token_ids: want_token_ids
-                .then(|| tokens.iter().map(|token| token.get()).collect()),
-            label_token_ids: want_token_ids
-                .then(|| labels.iter().map(|token| token.get()).collect()),
-        });
-    }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let folded = fold_readout(&prompt, &runs, &outcomes, temperature)
+        .map_err(|error| AppError::internal("the decision readout could not be scored", error))?;
+
+    let answers: Vec<Answered> = questions
+        .into_iter()
+        .zip(folded)
+        .zip(runs)
+        .map(
+            |((question, folded), ScoreRun { tokens, labels, .. })| Answered {
+                id: question.id,
+                kind: question.kind,
+                probability_answer: question.probability_answer,
+                probabilities: folded.probabilities,
+                label_mass: folded.label_mass,
+                top: folded.top,
+                prompt_tokens: tokens.len() as u64,
+                cached_tokens: folded.cached_tokens,
+                prompt_token_ids: want_token_ids
+                    .then(|| tokens.iter().map(|token| token.get()).collect()),
+                label_token_ids: want_token_ids
+                    .then(|| labels.iter().map(|token| token.get()).collect()),
+            },
+        )
+        .collect();
     let tally = shared_tally(&answers, total);
     Ok((answers, tally))
 }

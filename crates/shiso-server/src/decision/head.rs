@@ -24,6 +24,7 @@ use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
 use crate::tokenizer::Vocabulary;
 use shiso_decision::math::softmax;
+use shiso_decision::score::{first_argmax, reorder};
 
 /// The vocabulary, as a layout reaches it.
 pub(crate) struct Encoder<'a>(pub(crate) &'a Vocabulary);
@@ -263,21 +264,8 @@ fn answer(
     prompt_token_ids: Option<Vec<u32>>,
     want_token_ids: bool,
 ) -> Answered {
-    let mut ordered = vec![0.0f64; probabilities.len()];
-    for (head, caller) in order.iter().enumerate() {
-        if let Some(slot) = ordered.get_mut(*caller) {
-            *slot = probabilities[head];
-        }
-    }
-    // The first argmax, so a tie goes to the earlier option, as on the label
-    // route.
-    let top = ordered
-        .iter()
-        .enumerate()
-        .fold((0usize, f64::NEG_INFINITY), |best, (index, p)| {
-            if *p > best.1 { (index, *p) } else { best }
-        })
-        .0;
+    let ordered = reorder(probabilities, order);
+    let top = first_argmax(&ordered);
     Answered {
         id: question.id,
         kind: question.kind,
