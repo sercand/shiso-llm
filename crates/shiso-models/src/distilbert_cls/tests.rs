@@ -113,6 +113,11 @@ fn config_rejects_wrong_arch() {
         ClassifierConfig::from_json(&bert),
         Err(ClassifyError::BadConfig(_))
     ));
+    let twin = config_with(r#""2":"dangerous""#, r#""2":"safe""#);
+    assert!(matches!(
+        ClassifierConfig::from_json(&twin),
+        Err(ClassifyError::BadConfig(why)) if why.contains("repeats")
+    ));
     let gap = config_with(r#""2":"dangerous""#, r#""7":"dangerous""#);
     assert!(matches!(
         ClassifierConfig::from_json(&gap),
@@ -134,6 +139,12 @@ fn describes_requires_both_files() {
     let bert = config_with(r#""model_type":"distilbert""#, r#""model_type":"bert""#);
     std::fs::write(dir.path().join("config.json"), bert).expect("write");
     assert!(!describes(dir.path()));
+    let encoder = config_with(
+        r#""architectures":["DistilBertForSequenceClassification"]"#,
+        r#""architectures":["DistilBertModel"]"#,
+    );
+    std::fs::write(dir.path().join("config.json"), encoder).expect("write");
+    assert!(!describes(dir.path()), "a bare encoder has no head");
 }
 
 #[test]
@@ -200,6 +211,28 @@ fn weights_report_bad_dtype() {
         Err(ClassifyError::BadTensor { name, .. }) => assert_eq!(name, "pre_classifier.bias"),
         other => panic!("expected BadTensor, got {other:?}"),
     }
+}
+
+#[test]
+fn host_table_refuses_short_buffer_and_names_tensor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = tiny();
+    let store = store_of(dir.path(), &complete(&cfg));
+    let table =
+        super::weights::host_table(&store, "distilbert.embeddings.word_embeddings.weight", 4)
+            .expect("table");
+    let mut short = [0.0_f32; 3];
+    match table.row(0, &mut short) {
+        Err(ClassifyError::BadTensor { name, why }) => {
+            assert_eq!(name, "distilbert.embeddings.word_embeddings.weight");
+            assert!(why.contains("row buffer"), "{why}");
+        }
+        other => panic!("expected BadTensor, got {other:?}"),
+    }
+    let mut ok = [1.0_f32; 4];
+    table.row(4, &mut ok).expect("last row");
+    assert_eq!(ok, [0.0; 4]);
+    assert!(table.row(5, &mut ok).is_err());
 }
 
 #[test]

@@ -63,6 +63,7 @@ pub struct LayerWeights {
 /// A `[rows][width]` table read on the host.
 #[derive(Debug)]
 pub struct HostTable {
+    name: String,
     host: Arc<dyn HostBytes>,
     start: usize,
     encoding: RowEncoding,
@@ -113,14 +114,21 @@ impl HostTable {
     ///
     /// # Errors
     ///
-    /// [`ClassifyError::BadTensor`] for an id past the table or a row that
-    /// runs past the mapping; a caller that tokenizes with this model's own
+    /// [`ClassifyError::BadTensor`] for an `out` shorter than a row, an id
+    /// past the table or a row that runs past the mapping; a caller that tokenizes with this model's own
     /// vocabulary never sees either.
     pub fn row(&self, id: usize, out: &mut [f32]) -> Result<(), ClassifyError> {
         let why = |why: String| ClassifyError::BadTensor {
-            name: "embedding table".to_owned(),
+            name: self.name.clone(),
             why,
         };
+        if out.len() < self.width {
+            return Err(why(format!(
+                "row buffer holds {} values, a row is {}",
+                out.len(),
+                self.width
+            )));
+        }
         if id >= self.rows {
             return Err(why(format!("row {id} is past its {} rows", self.rows)));
         }
@@ -264,17 +272,21 @@ pub fn validate(store: &TensorStore, cfg: &ClassifierConfig) -> Result<(), Class
     Ok(())
 }
 
-fn device(error: AudioError) -> ClassifyError {
+fn device(name: &str, error: AudioError) -> ClassifyError {
     match error {
         AudioError::Checkpoint { what } => ClassifyError::BadTensor {
-            name: what,
-            why: "could not be imported".to_owned(),
+            name: name.to_owned(),
+            why: format!("could not be imported: {what}"),
         },
         other => ClassifyError::Device(other.to_string()),
     }
 }
 
-fn host_table(store: &TensorStore, name: &str, width: usize) -> Result<HostTable, ClassifyError> {
+pub(super) fn host_table(
+    store: &TensorStore,
+    name: &str,
+    width: usize,
+) -> Result<HostTable, ClassifyError> {
     let t = store
         .get(name)
         .ok_or_else(|| ClassifyError::MissingTensor(name.to_owned()))?;
@@ -286,6 +298,7 @@ fn host_table(store: &TensorStore, name: &str, width: usize) -> Result<HostTable
         .and_then(|r| usize::try_from(*r).ok())
         .ok_or_else(|| bad_tensor(name, "has no rows".to_owned()))?;
     Ok(HostTable {
+        name: name.to_owned(),
         host: Arc::clone(&t.host),
         start: t.range.start,
         encoding,
@@ -298,7 +311,7 @@ fn host_vec(store: &TensorStore, name: &str) -> Result<Vec<f32>, ClassifyError> 
     let t = store
         .get(name)
         .ok_or_else(|| ClassifyError::MissingTensor(name.to_owned()))?;
-    dequant(&t).map_err(device)
+    dequant(&t).map_err(|e| device(name, e))
 }
 
 fn host_linear(store: &TensorStore, prefix: &str) -> Result<HostLinear, ClassifyError> {
@@ -328,10 +341,10 @@ impl ClassifierWeights {
         let norm = |prefix: &str| -> Result<NormWeights, ClassifyError> {
             Ok(NormWeights {
                 weight: f32_param(ops, store, &format!("{prefix}.weight"), d)
-                    .map_err(device)?
+                    .map_err(|e| device(&format!("{prefix}.weight"), e))?
                     .0,
                 bias: f32_param(ops, store, &format!("{prefix}.bias"), d)
-                    .map_err(device)?
+                    .map_err(|e| device(&format!("{prefix}.bias"), e))?
                     .0,
             })
         };
@@ -349,7 +362,7 @@ impl ClassifierWeights {
                 out,
                 inp,
             )
-            .map_err(device)
+            .map_err(|e| device(&weight, e))
         };
         let layers = (0..cfg.layers)
             .map(|i| {

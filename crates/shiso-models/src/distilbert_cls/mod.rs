@@ -55,14 +55,23 @@ pub enum ClassifyError {
     Io(#[from] std::io::Error),
 }
 
+/// The `architectures` entry that says the checkpoint has a classification
+/// head; a bare encoder of the same `model_type` has none.
+pub const ARCHITECTURE: &str = "DistilBertForSequenceClassification";
+
 /// Whether `dir` holds a checkpoint this family reads: a `config.json`
-/// declaring [`MODEL_TYPE`] with a `model.safetensors` beside it.
+/// declaring [`MODEL_TYPE`] and [`ARCHITECTURE`] with a `model.safetensors`
+/// beside it.
 #[must_use]
 pub fn describes(dir: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dir.join("config.json")) else {
         return false;
     };
-    let is_ours = serde_json::from_str::<serde_json::Value>(&text)
-        .is_ok_and(|v| v.get("model_type").and_then(|t| t.as_str()) == Some(MODEL_TYPE));
+    let is_ours = serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| {
+        v.get("model_type").and_then(|t| t.as_str()) == Some(MODEL_TYPE)
+            && v.get("architectures")
+                .and_then(|a| a.as_array())
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(ARCHITECTURE)))
+    });
     is_ours && dir.join("model.safetensors").is_file()
 }

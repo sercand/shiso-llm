@@ -115,6 +115,11 @@ impl ClassifierConfig {
                     .ok_or_else(|| bad(format!("id2label has no entry for class {id}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        for (i, label) in labels.iter().enumerate() {
+            if labels[..i].contains(label) {
+                return Err(bad(format!("id2label repeats the label {label:?}")));
+            }
+        }
         if !(raw.layer_norm_eps.is_finite() && raw.layer_norm_eps > 0.0) {
             return Err(bad(format!(
                 "layer_norm_eps is {}, not a positive number",
