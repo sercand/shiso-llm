@@ -107,8 +107,9 @@ impl Encoder {
     ///
     /// # Errors
     ///
-    /// [`ClassifyError::BadTensor`] for an id or a length the tables do not
-    /// have, [`ClassifyError::Device`] when a launch or copy fails.
+    /// [`ClassifyError::BadConfig`] for a length the position table does not
+    /// have, [`ClassifyError::BadTensor`] for an id the word table does not,
+    /// [`ClassifyError::Device`] when a launch or copy fails.
     #[expect(
         clippy::many_single_char_names,
         reason = "n rows, d width and q k v are the names of the pass's own quantities"

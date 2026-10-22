@@ -326,9 +326,8 @@ fn tokenizer() -> Option<tokens::WordPiece> {
 
 #[test]
 fn tokenizer_matches_reference_ids() {
-    let (Some(dir), Some(wp)) = (model_dir(), tokenizer()) else {
-        return;
-    };
+    let Some(dir) = model_dir() else { return };
+    let wp = tokens::WordPiece::load(&dir.join("tokenizer.json")).expect("tokenizer.json loads");
     let rows = goldens(&dir, "goldens.json").expect("goldens.json");
     assert!(!rows.is_empty());
     for g in &rows {
@@ -371,20 +370,27 @@ fn head_math_matches_reference() {
         -1.0, 0.0, 0.0, 0.0,
     ];
     let cls_b = [0.5, 0.0, 0.25];
-    let out = head::apply(&pre_w, &pre_b, &cls_w, &cls_b, &x, 4, 3);
+    let out = head::apply(&pre_w, &pre_b, &cls_w, &cls_b, &x, (4, 3)).expect("shapes agree");
+    assert!(head::apply(&pre_w, &pre_b, &cls_w[..11], &cls_b, &x, (4, 3)).is_err());
     // [2 + 1.5 + 0.5, 3.0, -2 + 0.25]
     for (got, want) in out.iter().zip([4.0_f32, 3.0, -1.75]) {
         assert!((got - want).abs() < 1e-6, "{out:?}");
     }
 }
 
-/// `approve` iff the temperature-scaled probability of `safe` is over 0.90:
-/// the caller's policy, reproduced here to compare decisions.
+/// The caller's policy, reproduced here to compare decisions: `approve` iff
+/// the energy score is not above the calibration's 95th percentile and the
+/// temperature-scaled probability of `safe` is over 0.90.
 fn approves(logits: &[f32]) -> bool {
     const TEMPERATURE: f64 = 1.336_620_330_810_546_9;
+    const ENERGY_P95: f64 = -2.543_365_240_097_046;
     let z: Vec<f64> = logits.iter().map(|l| f64::from(*l) / TEMPERATURE).collect();
     let top = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let sum: f64 = z.iter().map(|v| (v - top).exp()).sum();
+    let energy = -(TEMPERATURE * (top + sum.ln()));
+    if energy > ENERGY_P95 {
+        return false;
+    }
     (z[0] - top).exp() / sum > 0.90
 }
 
@@ -417,6 +423,13 @@ fn logits_match_reference_goldens() {
     let clf = open_classifier(&dir, backend);
     assert_eq!(clf.labels(), ["safe", "needs-approval", "dangerous"]);
     let numpy = goldens(&dir, "goldens_numpy.json");
+    let numpy_note = |worst: f32| {
+        if numpy.is_some() {
+            format!("{worst:.4}")
+        } else {
+            "skipped (no goldens_numpy.json)".to_owned()
+        }
+    };
     let (mut worst_onnx, mut worst_numpy) = (0.0_f32, 0.0_f32);
     let (mut agree, mut false_approvals) = (0, 0);
     for (i, g) in rows.iter().enumerate() {
@@ -452,8 +465,9 @@ fn logits_match_reference_goldens() {
     let pct = 100.0 * f64::from(u32::try_from(agree).expect("small"))
         / f64::from(u32::try_from(rows.len()).expect("small"));
     eprintln!(
-        "rows {} max|dlogit| onnx {worst_onnx:.4} numpy {worst_numpy:.4} decisions {agree}/{} ({pct:.2}%) false approvals {false_approvals}",
+        "rows {} max|dlogit| onnx {worst_onnx:.4} numpy {} decisions {agree}/{} ({pct:.2}%) false approvals {false_approvals}",
         rows.len(),
+        numpy_note(worst_numpy),
         rows.len()
     );
     assert!(pct >= 97.0);

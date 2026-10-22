@@ -122,6 +122,8 @@ impl Classifier {
     /// config, weight or tokenizer loading reports.
     pub fn open(desc: &ClassifierDesc<'_>) -> Result<Self, ClassifyError> {
         let text = std::fs::read_to_string(desc.dir.join("config.json"))?;
+        // Before any upload: a broken tokenizer.json fails fast.
+        let tokens = tokens::WordPiece::load(&desc.dir.join("tokenizer.json"))?;
         let cfg = ClassifierConfig::from_json(&text)?;
         let store =
             TensorStore::open_safetensors(&desc.dir.join("model.safetensors")).map_err(|e| {
@@ -133,7 +135,6 @@ impl Classifier {
         let ops = Ops::new(Arc::clone(&desc.backend));
         let weights = ClassifierWeights::load(&ops, &store, &cfg)?;
         desc.backend.finish_imports();
-        let tokens = tokens::WordPiece::load(&desc.dir.join("tokenizer.json"))?;
         Ok(Self {
             labels: cfg.labels.clone(),
             tokens,
@@ -173,9 +174,8 @@ impl Classifier {
             &w.classifier.weight,
             &w.classifier.bias,
             &cls,
-            encoder.config().dim,
-            NUM_LABELS,
-        );
+            (encoder.config().dim, NUM_LABELS),
+        )?;
         <[f32; NUM_LABELS]>::try_from(out).map_err(|o| ClassifyError::BadTensor {
             name: "classifier.weight".to_owned(),
             why: format!("gave {} logits, not {NUM_LABELS}", o.len()),
