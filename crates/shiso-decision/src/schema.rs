@@ -145,3 +145,45 @@ pub struct Answer {
     /// distribution.
     pub confidence: f32,
 }
+
+#[cfg(test)]
+mod tests {
+    use shiso_core::SchemaAnswer;
+
+    use super::{Choice, Question};
+
+    #[test]
+    fn a_blank_wording_reaches_the_layout_as_empty() {
+        let question = Question::Choice {
+            name: "q".to_owned(),
+            instructions: "  \n".to_owned(),
+            choices: vec![Choice {
+                value: "a".to_owned(),
+                description: Some("first".to_owned()),
+            }],
+        };
+        let schema = question.to_schema();
+        assert!(schema.wording.is_empty());
+        assert_eq!(schema.id, "q");
+        assert!(
+            matches!(&schema.answer, SchemaAnswer::Choice(o) if o[0].description.as_deref() == Some("first"))
+        );
+        let spoken = Question::Score {
+            name: "s".to_owned(),
+            instructions: " how bad ".to_owned(),
+            levels: Vec::new(),
+        };
+        assert_eq!(spoken.to_schema().wording, " how bad ");
+    }
+
+    #[test]
+    fn a_yes_no_question_has_the_options_yes_then_no() {
+        let question = Question::YesNo {
+            name: "q".to_owned(),
+            instructions: String::new(),
+            yes: None,
+            no: None,
+        };
+        assert_eq!(question.option_values(), vec!["yes", "no"]);
+    }
+}

@@ -19,7 +19,7 @@ use shiso_core::{
     PromptEncoder, ReadoutPrompt, ReadoutRecord, SchemaAnswer, SchemaQuestion, TokenId,
 };
 
-pub use crate::error::DecideError;
+use crate::error::DecideError;
 use crate::math::{label_mass, softmax};
 use crate::schema::{Answer, DecisionRequest, Question};
 
@@ -249,11 +249,7 @@ fn validate(req: &DecisionRequest) -> Result<f64, DecideError> {
         return Err(DecideError::Request("no questions".to_owned()));
     }
     for question in &req.questions {
-        let options = match question {
-            Question::YesNo { .. } => 2,
-            Question::Choice { choices, .. } => choices.len(),
-            Question::Score { levels, .. } => levels.len(),
-        };
+        let options = question.option_values().len();
         if options == 0 {
             return Err(DecideError::Request(format!(
                 "question {:?} has no options",
@@ -394,7 +390,11 @@ mod tests {
         StateSpelling, TokenId,
     };
 
-    use super::{DecideError, RunScore, ScoreRun, Scorer, decide_with_head, decide_with_readout};
+    use super::{
+        RunScore, ScoreRun, Scorer, decide_with_head, decide_with_readout, fold_head, fold_readout,
+        readout_runs,
+    };
+    use crate::error::DecideError;
     use crate::schema::{Choice, DecisionRequest, Question};
 
     struct NoEncoder;
@@ -517,7 +517,7 @@ mod tests {
         };
         assert_eq!(answer.name, "pick");
         assert_eq!(answer.choice, "a");
-        // softmax([ln .3, ln .2]) = [.6, .4]; the labels carry .1 + .3 + .2 = .6.
+        // softmax([ln .3, ln .2]) = [.6, .4]; the labels carry .3 + .2 = .5 (best spellings).
         assert_eq!(answer.probabilities[0].0, "a");
         assert!((answer.probabilities[0].1 - 0.6).abs() < 1e-6);
         assert!((answer.probabilities[1].1 - 0.4).abs() < 1e-6);
@@ -613,5 +613,93 @@ mod tests {
         let error = decide_with_readout(&readout, &NoEncoder, &quiet_scorer(), &req, 100)
             .expect_err("zero temperature");
         assert!(matches!(error, DecideError::Request(_)), "{error:?}");
+    }
+
+    fn laid(groups: &[Vec<TokenId>]) -> ReadoutQuestion {
+        ReadoutQuestion {
+            branch: vec![token(2)],
+            options: groups.to_vec(),
+        }
+    }
+
+    fn schema_of(questions: usize, options: &[&str]) -> Vec<shiso_core::SchemaQuestion> {
+        (0..questions)
+            .map(|_| request(options).questions[0].to_schema())
+            .collect()
+    }
+
+    #[test]
+    fn several_questions_share_the_trunk_as_their_prefix() {
+        let groups = vec![vec![token(10)], vec![token(11)]];
+        let prompt = ReadoutPrompt {
+            trunk: vec![token(1), token(3), token(4)],
+            questions: vec![laid(&groups), laid(&groups)],
+        };
+        let runs = readout_runs(&prompt, &schema_of(2, &["a", "b"])).expect("runs");
+        assert!(runs.iter().all(|run| run.shared_prefix == 3));
+        assert_eq!(runs[0].tokens.len(), 4);
+        // One question shares nothing.
+        let one = ReadoutPrompt {
+            trunk: prompt.trunk.clone(),
+            questions: vec![laid(&groups)],
+        };
+        let runs = readout_runs(&one, &schema_of(1, &["a", "b"])).expect("runs");
+        assert_eq!(runs[0].shared_prefix, 0);
+    }
+
+    #[test]
+    fn cached_tokens_never_exceed_the_prompt() {
+        let groups = vec![vec![token(10)], vec![token(11)]];
+        let prompt = ReadoutPrompt {
+            trunk: vec![token(1)],
+            questions: vec![laid(&groups)],
+        };
+        let runs = readout_runs(&prompt, &schema_of(1, &["a", "b"])).expect("runs");
+        let scores = [RunScore {
+            label_logprobs: vec![-1.0, -1.0],
+            cached_tokens: 99,
+        }];
+        let folded = fold_readout(&prompt, &runs, &scores, 1.0).expect("folded");
+        assert_eq!(folded[0].cached_tokens, 2);
+    }
+
+    #[test]
+    fn count_mismatches_are_typed_errors() {
+        let groups = vec![vec![token(10)], vec![token(11)]];
+        let prompt = ReadoutPrompt {
+            trunk: vec![token(1)],
+            questions: vec![laid(&groups)],
+        };
+        // Schema holds two questions, the layout one.
+        let error = readout_runs(&prompt, &schema_of(2, &["a", "b"])).expect_err("questions");
+        assert!(matches!(error, DecideError::Layout(_)), "{error:?}");
+        // Schema question has three options, the layout two.
+        let error = readout_runs(&prompt, &schema_of(1, &["a", "b", "c"])).expect_err("options");
+        assert!(matches!(error, DecideError::Layout(_)), "{error:?}");
+        // An option read from no token.
+        let empty = ReadoutPrompt {
+            trunk: vec![token(1)],
+            questions: vec![laid(&[vec![token(10)], Vec::new()])],
+        };
+        assert!(readout_runs(&empty, &schema_of(1, &["a", "b"])).is_err());
+
+        let runs = readout_runs(&prompt, &schema_of(1, &["a", "b"])).expect("runs");
+        let error = fold_readout(&prompt, &runs, &[], 1.0).expect_err("scores");
+        assert!(matches!(error, DecideError::Engine(_)), "{error:?}");
+
+        let error = fold_head(&[vec![1.0, 2.0]], &[], 1.0).expect_err("questions");
+        assert!(matches!(&error, DecideError::Engine(m) if m.contains("number of questions")));
+        let error = fold_head(&[vec![1.0]], &[vec![0, 1]], 1.0).expect_err("options");
+        assert!(matches!(&error, DecideError::Engine(m) if m.contains("number of options")));
+    }
+
+    #[test]
+    fn fold_head_puts_options_back_in_the_callers_order() {
+        // The head read the caller's second option first.
+        let folded = fold_head(&[vec![0.0, 3.0f32.ln()]], &[vec![1, 0]], 1.0).expect("folded");
+        assert!((folded[0].probabilities[0] - 0.75).abs() < 1e-6);
+        assert!((folded[0].probabilities[1] - 0.25).abs() < 1e-6);
+        assert_eq!(folded[0].top, 0);
+        assert!((folded[0].label_mass - 1.0).abs() < f64::EPSILON);
     }
 }

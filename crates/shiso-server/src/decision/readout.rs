@@ -90,6 +90,8 @@ fn readout_refusal(error: DecisionLayoutError, questions: &[RawQuestion], ctx: u
 /// [`AppError::ContextOverflow`] for a prompt that leaves no room to read an
 /// answer, and [`AppError::Internal`] for a layout that answered a question
 /// with the wrong number of options or with an option read from nothing.
+/// The option-count check runs after every question's context check, on
+/// purpose: the library does it once for all questions.
 fn passes(
     ctx: u32,
     schema: &[SchemaQuestion],

@@ -23,8 +23,7 @@ use crate::error::AppError;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
 use crate::tokenizer::Vocabulary;
-use shiso_decision::math::softmax;
-use shiso_decision::score::{first_argmax, reorder};
+use shiso_decision::score::{Scored, fold_head};
 
 /// The vocabulary, as a layout reaches it.
 pub(crate) struct Encoder<'a>(pub(crate) &'a Vocabulary);
@@ -220,60 +219,46 @@ pub(crate) async fn run(
             std::io::Error::other("question count mismatch"),
         ));
     }
-    questions
+    let folded =
+        fold_head(&outcome.option_logits, &prompt.order, temperature).map_err(|error| {
+            // The library names which count was off; the context says the same.
+            let context = if error.to_string().contains("number of questions") {
+                "the decision head answered a different number of questions"
+            } else {
+                "the decision head answered a different number of options"
+            };
+            AppError::internal(context, error)
+        })?;
+    let answers = questions
         .into_iter()
-        .zip(outcome.option_logits)
-        .zip(prompt.order)
-        .map(|((question, logits), order)| {
-            if logits.len() != order.len() {
-                return Err(AppError::internal(
-                    "the decision head answered a different number of options",
-                    std::io::Error::other("option count mismatch"),
-                ));
-            }
-            let probabilities = softmax(
-                &logits.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
-                temperature,
-            );
-            Ok(answer(
-                question,
-                &probabilities,
-                &order,
-                prompt_ids.clone(),
-                want_token_ids,
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|answers| {
-            (
-                answers,
-                InputTally {
-                    input: prompt_tokens,
-                    cached: 0,
-                },
-            )
-        })
+        .zip(folded)
+        .map(|(question, scored)| answer(question, scored, prompt_ids.clone(), want_token_ids))
+        .collect();
+    Ok((
+        answers,
+        InputTally {
+            input: prompt_tokens,
+            cached: 0,
+        },
+    ))
 }
 
-/// One question's answer from the head's probabilities, put back in the
+/// One question's answer from the head's folded probabilities, already in the
 /// caller's option order.
 fn answer(
     question: RawQuestion,
-    probabilities: &[f64],
-    order: &[usize],
+    scored: Scored,
     prompt_token_ids: Option<Vec<u32>>,
     want_token_ids: bool,
 ) -> Answered {
-    let ordered = reorder(probabilities, order);
-    let top = first_argmax(&ordered);
     Answered {
         id: question.id,
         kind: question.kind,
         probability_answer: question.probability_answer,
-        probabilities: ordered,
+        probabilities: scored.probabilities,
         // The head's options are the whole distribution.
-        label_mass: 1.0,
-        top,
+        label_mass: scored.label_mass,
+        top: scored.top,
         prompt_tokens: 0,
         // A decision pass reads every row of its prompt itself.
         cached_tokens: 0,
@@ -285,7 +270,7 @@ fn answer(
 
 #[cfg(test)]
 mod tests {
-    use super::{answer, schema_question, split_input};
+    use super::{schema_question, split_input};
     use crate::decision::core::{ChoiceOption, ChoiceValue, Kind, RawQuestion};
     use crate::decision::decisions_wire::{DecisionInput, InputBlock, InputImageSource};
     use shiso_core::SchemaAnswer;
@@ -306,14 +291,6 @@ mod tests {
             },
             probability_answer: false,
         }
-    }
-
-    #[test]
-    fn answers_come_back_in_the_callers_order() {
-        // The head read `billing` first; the caller listed it second.
-        let answered = answer(choice(), &[0.75, 0.25], &[1, 0], None, false);
-        assert_eq!(answered.probabilities, vec![0.25, 0.75]);
-        assert_eq!(answered.top, 1);
     }
 
     #[test]
