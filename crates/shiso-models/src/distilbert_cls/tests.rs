@@ -564,3 +564,46 @@ fn very_long_text_is_truncated() {
         clf.logits(&long).expect("logits").map(f32::to_bits)
     );
 }
+
+/// Median of `calls` timed runs of `f`, in milliseconds.
+fn median_ms(calls: usize, mut f: impl FnMut()) -> f64 {
+    let mut times: Vec<f64> = (0..calls)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            f();
+            start.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect();
+    times.sort_by(f64::total_cmp);
+    times[calls / 2]
+}
+
+/// Startup and steady-state cost, recorded in the module docs. Run with
+/// `--release`; a debug build measures nothing useful.
+#[test]
+#[ignore = "requires a Metal or CUDA device and SHISO_TEST_MODEL_DISTILBERT_CLS; run with --release -- --nocapture"]
+#[expect(clippy::print_stderr, reason = "the measured numbers are the report")]
+fn measure_latency() {
+    let Some(dir) = model_dir() else { return };
+    let start = std::time::Instant::now();
+    let Some(backend) = crate::audio_ops::testing::device() else {
+        return;
+    };
+    let clf = open_classifier(&dir, backend);
+    let short = "grep -rn TODO src | sort | head -n 5";
+    let long = "echo hello world and then some more words ".repeat(40);
+    let first = clf.logits(short).expect("logits");
+    let startup = start.elapsed().as_secs_f64();
+    assert!(first.iter().all(|l| l.is_finite()));
+    let n_short = clf.token_ids(short).expect("encodes").len();
+    let n_long = clf.token_ids(&long).expect("encodes").len();
+    let ms_short = median_ms(100, || {
+        clf.logits(short).expect("logits");
+    });
+    let ms_long = median_ms(100, || {
+        clf.logits(&long).expect("logits");
+    });
+    eprintln!(
+        "backend creation to first logits {startup:.2} s; median of 100 calls: {n_short} ids {ms_short:.2} ms, {n_long} ids {ms_long:.2} ms"
+    );
+}

@@ -3,8 +3,49 @@
 //!
 //! This module owns what is this family's alone: how a directory is
 //! recognised ([`describes`]), the typed errors, and the config and weight
-//! binding. Calibration of the logits is the caller's policy and is not read
-//! from the checkpoint.
+//! binding.
+//!
+//! # Usage
+//!
+//! The caller opens the device, once, and hands it in. Creating the backend
+//! compiles the device kernels, so do it off any latency-sensitive thread and
+//! keep the [`Classifier`] for the life of the process; it is `Sync`, and calls
+//! from several threads are serialized on one lock.
+//!
+//! ```ignore
+//! let backend: Arc<dyn Backend> = MetalBackend::new()?;
+//! let classifier = Classifier::open(&ClassifierDesc { dir: model_dir, backend })?;
+//! let logits = classifier.logits("git status")?;
+//! for (label, logit) in classifier.labels().iter().zip(logits) {
+//!     // `labels()` is in logit order: safe, needs-approval, dangerous.
+//! }
+//! ```
+//!
+//! # Input
+//!
+//! `text` is tokenized with the checkpoint's own `tokenizer.json`, which adds
+//! the start and end markers and truncates to the first 128 ids; the last of
+//! those is then the end marker, whatever was cut. Anything after the first 126
+//! content tokens has no effect on the answer. Empty and whitespace-only text
+//! is the two markers alone and yields finite logits. [`Classifier::token_ids`]
+//! shows exactly what a text is classified on.
+//!
+//! # Output
+//!
+//! [`Classifier::logits`] returns raw logits in [`Classifier::labels`] order
+//! (`safe`, `needs-approval`, `dangerous` for the shipped checkpoint).
+//! Calibration is the caller's job: the checkpoint's `config.json` carries a
+//! temperature, an energy threshold and a probability threshold, but nothing
+//! here reads or applies them.
+//!
+//! # Errors
+//!
+//! [`ClassifyError`] is typed and nothing panics on bad input. `open` reports a
+//! malformed config, a missing or misshapen tensor, or a broken tokenizer by
+//! name before the first call. `logits` reports [`ClassifyError::Tokenizer`] or
+//! [`ClassifyError::Device`]; a failed call leaves the classifier usable for the
+//! next one. A machine with no device is the caller's state to report, since
+//! the caller creates the backend.
 //!
 //! # CUDA
 //!
@@ -12,6 +53,24 @@
 //! kernel fails to resolve at runtime and the build only warns. The device
 //! tests in `tests.rs` are backend-neutral, but they have only been run on
 //! Metal: the CUDA backend is untested for this family.
+//!
+//! # Cost
+//!
+//! Measured on an Apple M4 (macOS 26.5.2, Metal) in a release build by the
+//! ignored `measure_latency` test
+//! (`cargo test --release -p shiso-models --lib measure_latency -- --ignored --nocapture`):
+//!
+//! | what | time |
+//! | --- | --- |
+//! | backend creation to first `logits`, first run after a build | 2.19 s |
+//! | backend creation to first `logits`, later runs | 0.08 s |
+//! | median of 100 calls, 17 ids | 2.4 to 3.1 ms |
+//! | median of 100 calls, 128 ids | 6.7 ms |
+//!
+//! The first-run figure includes compiling the device kernel library, which
+//! the platform then caches; a cold cache on another machine, or after a system
+//! update, can take much longer, so create the backend once and not on a UI
+//! thread.
 
 mod config;
 mod forward;
