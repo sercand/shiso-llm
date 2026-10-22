@@ -42,10 +42,13 @@
 //!
 //! [`ClassifyError`] is typed and nothing panics on bad input. `open` reports a
 //! malformed config, a missing or misshapen tensor, or a broken tokenizer by
-//! name before the first call. `logits` reports [`ClassifyError::Tokenizer`] or
-//! [`ClassifyError::Device`], and [`ClassifyError::BadTensor`] if the head
-//! disagrees with the config (unreachable after `open` validates it); a failed call leaves the classifier usable for the
-//! next one. A machine with no device is the caller's state to report, since
+//! name before the first call. `open` also refuses a position table shorter
+//! than the 128-id window and a tokenizer with more ids than the word table has
+//! rows, so no input can index past either. `logits` reports
+//! [`ClassifyError::Tokenizer`] or [`ClassifyError::Device`], and
+//! [`ClassifyError::BadTensor`] if the head disagrees with the config (cannot
+//! happen once `open` has validated the weights); a failed call leaves the
+//! classifier usable for the next one. A machine with no device is the caller's state to report, since
 //! the caller creates the backend.
 //!
 //! # CUDA
@@ -90,7 +93,7 @@ use parking_lot::Mutex;
 use shiso_core::Backend;
 
 pub use config::{ClassifierConfig, MODEL_TYPE, NUM_LABELS};
-pub use weights::{ClassifierWeights, HostLinear, HostTable, LayerWeights, NormWeights, validate};
+use weights::ClassifierWeights;
 
 use crate::audio_ops::Ops;
 use crate::audio_ops::store::TensorStore;
@@ -160,6 +163,25 @@ pub(super) fn f32_of(n: usize) -> f32 {
     n as f32
 }
 
+/// What a call would otherwise trip over later: a sequence longer than the
+/// position table, or an id past the word table.
+fn check_limits(cfg: &ClassifierConfig, vocab: usize) -> Result<(), ClassifyError> {
+    if cfg.max_positions < tokens::MAX_TOKENS {
+        return Err(ClassifyError::BadConfig(format!(
+            "max_position_embeddings is {}, below the {} ids a call can carry",
+            cfg.max_positions,
+            tokens::MAX_TOKENS
+        )));
+    }
+    if vocab > cfg.vocab {
+        return Err(ClassifyError::BadConfig(format!(
+            "the tokenizer has {vocab} ids but vocab_size is {}",
+            cfg.vocab
+        )));
+    }
+    Ok(())
+}
+
 /// What [`Classifier::open`] needs.
 #[derive(Debug, Clone)]
 pub struct ClassifierDesc<'a> {
@@ -186,19 +208,23 @@ impl Classifier {
     ///
     /// # Errors
     ///
-    /// [`ClassifyError::Io`] for an unreadable `config.json`, then whatever
-    /// config, weight or tokenizer loading reports.
+    /// [`ClassifyError::Io`] for an unreadable `config.json` or
+    /// `model.safetensors`, [`ClassifyError::BadConfig`] for a position table
+    /// shorter than 128 ids or a tokenizer wider than the word table, then
+    /// whatever tokenizer or weight loading reports.
     pub fn open(desc: &ClassifierDesc<'_>) -> Result<Self, ClassifyError> {
         let text = std::fs::read_to_string(desc.dir.join("config.json"))?;
         // Before any upload: a broken tokenizer.json fails fast.
         let tokens = tokens::WordPiece::load(&desc.dir.join("tokenizer.json"))?;
         let cfg = ClassifierConfig::from_json(&text)?;
+        check_limits(&cfg, tokens.vocab_size())?;
+        let weights_path = desc.dir.join("model.safetensors");
+        // An absent or unreadable file is an I/O failure, not a bad tensor.
+        std::fs::File::open(&weights_path)?;
         let store =
-            TensorStore::open_safetensors(&desc.dir.join("model.safetensors")).map_err(|e| {
-                ClassifyError::BadTensor {
-                    name: "model.safetensors".to_owned(),
-                    why: e.to_string(),
-                }
+            TensorStore::open_safetensors(&weights_path).map_err(|e| ClassifyError::BadTensor {
+                name: "model.safetensors".to_owned(),
+                why: e.to_string(),
             })?;
         let ops = Ops::new(Arc::clone(&desc.backend));
         let weights = ClassifierWeights::load(&ops, &store, &cfg)?;
@@ -231,8 +257,8 @@ impl Classifier {
     /// # Errors
     ///
     /// [`ClassifyError::Tokenizer`] or [`ClassifyError::Device`];
-    /// [`ClassifyError::BadTensor`] if the head disagrees with the config
-    /// (unreachable after [`Self::open`] validates it).
+    /// [`ClassifyError::BadTensor`] if the head disagrees with the config,
+    /// which [`Self::open`] has already ruled out.
     pub fn logits(&self, text: &str) -> Result<[f32; NUM_LABELS], ClassifyError> {
         let ids = self.tokens.ids(text)?;
         let mut encoder = self.encoder.lock();

@@ -3,8 +3,8 @@
 
 use std::path::Path;
 
-use super::weights::expected;
-use super::{ClassifierConfig, ClassifyError, describes, validate};
+use super::weights::{expected, validate};
+use super::{ClassifierConfig, ClassifyError, describes};
 use crate::audio_ops::store::TensorStore;
 
 const GOLDENS_CONFIG: &str = r#"{"model_type":"distilbert","architectures":["DistilBertForSequenceClassification"],"n_layers":6,"n_heads":12,"dim":768,"hidden_dim":3072,"vocab_size":30522,"max_position_embeddings":512,"num_labels":3,"id2label":{"0":"safe","1":"needs-approval","2":"dangerous"},"label2id":{"safe":0,"needs-approval":1,"dangerous":2},"layer_norm_eps":1e-12,"calibration":{"temperature":1.3366203308105469,"energy_p95":-2.543365240097046,"safe_threshold":0.9,"max_length":128}}"#;
@@ -260,13 +260,130 @@ fn real_checkpoint_validates() {
     validate(&store, &cfg).expect("the converted checkpoint validates");
 }
 
-// ---- tokenization, head and the device pass ----
+// ---- Classifier::open's refusals, which need no device ----
 
 use std::sync::Arc;
 
 use shiso_core::Backend;
 
 use super::{Classifier, ClassifierDesc, head, tokens};
+
+/// A backend that does nothing: `open` must refuse these cases before any
+/// device work.
+#[derive(Debug)]
+struct NoDevice;
+
+fn refusal(op: &'static str) -> shiso_core::CoreError {
+    shiso_core::CoreError::Backend {
+        backend: "none",
+        op,
+        source: Box::new(std::io::Error::other("this backend does nothing")),
+    }
+}
+
+impl Backend for NoDevice {
+    fn backend_name(&self) -> &'static str {
+        "none"
+    }
+    fn alloc_raw(&self, _bytes: u64) -> shiso_core::CoreResult<shiso_core::RawBuffer> {
+        Err(refusal("alloc_raw"))
+    }
+    fn free_raw(&self, _raw: shiso_core::RawBuffer) -> shiso_core::CoreResult<()> {
+        Ok(())
+    }
+    fn copy_h2d(&self, _d: shiso_core::DeviceView<'_>, _s: &[u8]) -> shiso_core::CoreResult<()> {
+        Err(refusal("copy_h2d"))
+    }
+    fn copy_d2h(
+        &self,
+        _s: shiso_core::DeviceView<'_>,
+        _d: &mut [u8],
+    ) -> shiso_core::CoreResult<()> {
+        Err(refusal("copy_d2h"))
+    }
+    fn copy_d2d(
+        &self,
+        _d: shiso_core::DeviceView<'_>,
+        _s: shiso_core::DeviceView<'_>,
+    ) -> shiso_core::CoreResult<()> {
+        Err(refusal("copy_d2d"))
+    }
+    fn run(
+        &self,
+        _kernel: shiso_core::KernelRef,
+        _args: &shiso_core::LaunchArgs<'_>,
+    ) -> shiso_core::CoreResult<()> {
+        Err(refusal("run"))
+    }
+    fn sync(&self) -> shiso_core::CoreResult<()> {
+        Err(refusal("sync"))
+    }
+}
+
+/// A word-piece tokenizer with six ids.
+const TINY_TOKENIZER: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordPiece","unk_token":"[UNK]","continuing_subword_prefix":"~~","max_input_chars_per_word":100,"vocab":{"[UNK]":0,"a":1,"b":2,"c":3,"d":4,"e":5}}}"#;
+
+/// Opens a directory holding the tiny tokenizer and `config`, and no weights.
+fn open_without_weights(config: &str) -> Result<Classifier, ClassifyError> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("tokenizer.json"), TINY_TOKENIZER).expect("write");
+    std::fs::write(dir.path().join("config.json"), config).expect("write");
+    let backend: Arc<dyn Backend> = Arc::new(NoDevice);
+    Classifier::open(&ClassifierDesc {
+        dir: dir.path(),
+        backend,
+    })
+}
+
+#[test]
+fn open_refuses_a_position_table_shorter_than_the_window() {
+    let cfg = config_with(
+        r#""max_position_embeddings":512"#,
+        r#""max_position_embeddings":64"#,
+    );
+    match open_without_weights(&cfg) {
+        Err(ClassifyError::BadConfig(why)) => assert!(why.contains("max_position_embeddings")),
+        other => panic!("expected BadConfig, got {other:?}"),
+    }
+    // Exactly the window is enough: the failure moves on to the missing weights.
+    let cfg = config_with(
+        r#""max_position_embeddings":512"#,
+        r#""max_position_embeddings":128"#,
+    );
+    assert!(matches!(
+        open_without_weights(&cfg),
+        Err(ClassifyError::Io(_))
+    ));
+}
+
+#[test]
+fn open_refuses_a_tokenizer_wider_than_the_word_table() {
+    let cfg = config_with(r#""vocab_size":30522"#, r#""vocab_size":5"#);
+    match open_without_weights(&cfg) {
+        Err(ClassifyError::BadConfig(why)) => assert!(why.contains("vocab_size")),
+        other => panic!("expected BadConfig, got {other:?}"),
+    }
+}
+
+#[test]
+fn open_reports_missing_weights_as_io() {
+    assert!(matches!(
+        open_without_weights(GOLDENS_CONFIG),
+        Err(ClassifyError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound
+    ));
+}
+
+#[test]
+fn decide_follows_the_calibration() {
+    // Confidently safe, confidently dangerous, an uncertain mix, and a safe
+    // class whose energy is too high to trust.
+    assert_eq!(decide(&[6.0, -2.0, -4.0]), "approve");
+    assert_eq!(decide(&[-4.0, -2.0, 6.0]), "deny");
+    assert_eq!(decide(&[1.0, 1.2, 0.8]), "defer");
+    assert_eq!(decide(&[0.2, -0.3, -0.1]), "defer");
+}
+
+// ---- tokenization, head and the device pass ----
 
 const MODEL_VAR: &str = "SHISO_TEST_MODEL_DISTILBERT_CLS";
 
@@ -378,20 +495,34 @@ fn head_math_matches_reference() {
     }
 }
 
-/// The caller's policy, reproduced here to compare decisions: `approve` iff
-/// the energy score is not above the calibration's 95th percentile and the
-/// temperature-scaled probability of `safe` is over 0.90.
-fn approves(logits: &[f32]) -> bool {
+/// The caller's policy, reproduced here to compare decisions: a score above
+/// the calibration's 95th-percentile energy defers; otherwise the class with
+/// the top temperature-scaled probability decides: `safe` over 0.90 approves,
+/// `dangerous` denies, and everything else defers.
+fn decide(logits: &[f32]) -> &'static str {
     const TEMPERATURE: f64 = 1.336_620_330_810_546_9;
     const ENERGY_P95: f64 = -2.543_365_240_097_046;
+    const SAFE_THRESHOLD: f64 = 0.90;
     let z: Vec<f64> = logits.iter().map(|l| f64::from(*l) / TEMPERATURE).collect();
     let top = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let sum: f64 = z.iter().map(|v| (v - top).exp()).sum();
     let energy = -(TEMPERATURE * (top + sum.ln()));
     if energy > ENERGY_P95 {
-        return false;
+        return "defer";
     }
-    (z[0] - top).exp() / sum > 0.90
+    let probs: Vec<f64> = z.iter().map(|v| (v - top).exp() / sum).collect();
+    let best = probs
+        .iter()
+        .enumerate()
+        .fold((0, f64::NEG_INFINITY), |acc, (i, p)| {
+            if *p > acc.1 { (i, *p) } else { acc }
+        })
+        .0;
+    match best {
+        0 if probs[0] > SAFE_THRESHOLD => "approve",
+        2 => "deny",
+        _ => "defer",
+    }
 }
 
 fn open_classifier(dir: &Path, backend: Arc<dyn Backend>) -> Classifier {
@@ -422,55 +553,64 @@ fn logits_match_reference_goldens() {
     let rows = goldens(&dir, "goldens.json").expect("goldens.json");
     let clf = open_classifier(&dir, backend);
     assert_eq!(clf.labels(), ["safe", "needs-approval", "dangerous"]);
-    let numpy = goldens(&dir, "goldens_numpy.json");
-    let numpy_note = |worst: f32| {
-        if numpy.is_some() {
+    // Logits of the f32 host reference run on the converted weights.
+    let host = goldens(&dir, "goldens_numpy.json");
+    let host_note = |worst: f32| {
+        if host.is_some() {
             format!("{worst:.4}")
         } else {
             "skipped (no goldens_numpy.json)".to_owned()
         }
     };
-    let (mut worst_onnx, mut worst_numpy) = (0.0_f32, 0.0_f32);
+    let (mut worst_int8, mut worst_host) = (0.0_f32, 0.0_f32);
     let (mut agree, mut false_approvals) = (0, 0);
     for (i, g) in rows.iter().enumerate() {
         let got = clf.logits(&g.text).expect("logits");
-        let d_onnx = got
+        let d_int8 = got
             .iter()
             .zip(&g.logits)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max);
         // The reference is the int8 model; this runs the fp16 conversion of it.
-        // The conversion alone moves logits by up to 0.51 (NumPy of the
+        // The conversion alone moves logits by up to 0.51 (the f32 host reference run on the
         // converted weights vs the int8 goldens), so this bound is loose on
-        // purpose. The 0.05 bound against NumPy below is the check on the port.
-        assert!(d_onnx < 0.6, "{:?}: max |dlogit| {d_onnx} vs ONNX", g.text);
-        worst_onnx = worst_onnx.max(d_onnx);
-        if let Some(n) = numpy.as_ref().map(|n| &n[i]) {
+        // purpose. The 0.05 bound against the f32 host reference below is the
+        // check on the port.
+        assert!(
+            d_int8 < 0.6,
+            "{:?}: max |dlogit| {d_int8} vs the int8 reference",
+            g.text
+        );
+        worst_int8 = worst_int8.max(d_int8);
+        if let Some(n) = host.as_ref().map(|n| &n[i]) {
             assert_eq!(n.text, g.text);
             let d = got
                 .iter()
                 .zip(&n.logits)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0, f32::max);
-            assert!(d < 0.05, "{:?}: max |dlogit| {d} vs NumPy", g.text);
-            worst_numpy = worst_numpy.max(d);
+            assert!(
+                d < 0.05,
+                "{:?}: max |dlogit| {d} vs the f32 host reference",
+                g.text
+            );
+            worst_host = worst_host.max(d);
         }
-        let ours = approves(&got);
-        let theirs = g.decision == "approve";
-        agree += usize::from(ours == theirs);
-        if ours && !theirs && g.label != "safe" && g.label != "edge" {
+        let ours = decide(&got);
+        agree += usize::from(ours == g.decision);
+        if ours == "approve" && g.decision != "approve" && g.label != "safe" && g.label != "edge" {
             false_approvals += 1;
         }
     }
     let pct = 100.0 * f64::from(u32::try_from(agree).expect("small"))
         / f64::from(u32::try_from(rows.len()).expect("small"));
     eprintln!(
-        "rows {} max|dlogit| onnx {worst_onnx:.4} numpy {} decisions {agree}/{} ({pct:.2}%) false approvals {false_approvals}",
+        "rows {} max|dlogit| int8 {worst_int8:.4} host {} decisions {agree}/{} ({pct:.2}%) false approvals {false_approvals}",
         rows.len(),
-        numpy_note(worst_numpy),
+        host_note(worst_host),
         rows.len()
     );
-    assert!(pct >= 97.0);
+    assert!(pct >= 97.0, "3-way decision agreement {pct:.2}%");
     assert_eq!(false_approvals, 0);
 }
 

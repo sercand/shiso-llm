@@ -32,37 +32,37 @@ const CLASSIFIER: &str = "classifier";
 
 /// A `LayerNorm`'s scale and shift, on the device.
 #[derive(Debug)]
-pub struct NormWeights {
+pub(crate) struct NormWeights {
     /// Scale, `[dim]`.
-    pub weight: DeviceBuffer,
+    pub(crate) weight: DeviceBuffer,
     /// Shift, `[dim]`.
-    pub bias: DeviceBuffer,
+    pub(crate) bias: DeviceBuffer,
 }
 
 /// One transformer layer's resident tensors.
 #[derive(Debug)]
-pub struct LayerWeights {
+pub(crate) struct LayerWeights {
     /// Query projection, `dim -> dim`.
-    pub q: Linear,
+    pub(crate) q: Linear,
     /// Key projection, `dim -> dim`.
-    pub k: Linear,
+    pub(crate) k: Linear,
     /// Value projection, `dim -> dim`.
-    pub v: Linear,
+    pub(crate) v: Linear,
     /// Attention output projection, `dim -> dim`.
-    pub out: Linear,
+    pub(crate) out: Linear,
     /// Norm after the attention residual.
-    pub attn_norm: NormWeights,
+    pub(crate) attn_norm: NormWeights,
     /// Feed-forward up projection, `dim -> hidden_dim`.
-    pub ffn_in: Linear,
+    pub(crate) ffn_in: Linear,
     /// Feed-forward down projection, `hidden_dim -> dim`.
-    pub ffn_out: Linear,
+    pub(crate) ffn_out: Linear,
     /// Norm after the feed-forward residual.
-    pub ffn_norm: NormWeights,
+    pub(crate) ffn_norm: NormWeights,
 }
 
 /// A `[rows][width]` table read on the host.
 #[derive(Debug)]
-pub struct HostTable {
+pub(crate) struct HostTable {
     name: String,
     host: Arc<dyn HostBytes>,
     start: usize,
@@ -98,26 +98,15 @@ impl RowEncoding {
 }
 
 impl HostTable {
-    /// Rows in the table.
-    #[must_use]
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    /// Elements per row.
-    #[must_use]
-    pub fn width(&self) -> usize {
-        self.width
-    }
-
     /// Writes row `id`, decoded, into the first `width` elements of `out`.
     ///
     /// # Errors
     ///
     /// [`ClassifyError::BadTensor`] for an `out` shorter than a row, an id
-    /// past the table or a row that runs past the mapping; a caller that tokenizes with this model's own
-    /// vocabulary never sees either.
-    pub fn row(&self, id: usize, out: &mut [f32]) -> Result<(), ClassifyError> {
+    /// past the table, or a row that runs past the mapping. A caller that
+    /// tokenizes with this model's own vocabulary and passes a row-sized
+    /// `out` never sees any of them.
+    pub(crate) fn row(&self, id: usize, out: &mut [f32]) -> Result<(), ClassifyError> {
         let why = |why: String| ClassifyError::BadTensor {
             name: self.name.clone(),
             why,
@@ -163,28 +152,28 @@ impl HostTable {
 
 /// A dense linear layer on the host, `[out][inp]` row-major plus its bias.
 #[derive(Debug, Clone, PartialEq)]
-pub struct HostLinear {
+pub(crate) struct HostLinear {
     /// Weight, `[out][inp]` row-major.
-    pub weight: Vec<f32>,
+    pub(crate) weight: Vec<f32>,
     /// Bias, `[out]`.
-    pub bias: Vec<f32>,
+    pub(crate) bias: Vec<f32>,
 }
 
 /// Everything the classifier reads.
 #[derive(Debug)]
-pub struct ClassifierWeights {
+pub(crate) struct ClassifierWeights {
     /// Word table, `[vocab][dim]`.
-    pub word: HostTable,
+    pub(crate) word: HostTable,
     /// Position table, `[max_positions][dim]`.
-    pub position: HostTable,
+    pub(crate) position: HostTable,
     /// The embedding `LayerNorm`, applied on the device to the summed rows.
-    pub embed_norm: NormWeights,
+    pub(crate) embed_norm: NormWeights,
     /// The layers, in order.
-    pub layers: Vec<LayerWeights>,
+    pub(crate) layers: Vec<LayerWeights>,
     /// First head layer, `dim -> dim`, followed by a `ReLU`.
-    pub pre_classifier: HostLinear,
+    pub(crate) pre_classifier: HostLinear,
     /// Last head layer, `dim -> labels`.
-    pub classifier: HostLinear,
+    pub(crate) classifier: HostLinear,
 }
 
 /// One tensor the checkpoint must hold: its name and expected shape.
@@ -247,7 +236,7 @@ fn bad_tensor(name: &str, why: String) -> ClassifyError {
 /// [`ClassifyError::MissingTensor`] naming the first tensor that is absent;
 /// [`ClassifyError::BadTensor`] naming the first one that is misshapen,
 /// stored in another encoding, or shorter than its shape.
-pub fn validate(store: &TensorStore, cfg: &ClassifierConfig) -> Result<(), ClassifyError> {
+pub(crate) fn validate(store: &TensorStore, cfg: &ClassifierConfig) -> Result<(), ClassifyError> {
     for (name, shape) in expected(cfg) {
         let t = store
             .get(&name)
@@ -331,7 +320,7 @@ impl ClassifierWeights {
     ///
     /// Whatever [`validate`] returns; [`ClassifyError::Device`] when an
     /// upload fails.
-    pub fn load(
+    pub(crate) fn load(
         ops: &Ops,
         store: &TensorStore,
         cfg: &ClassifierConfig,
@@ -351,18 +340,26 @@ impl ClassifierWeights {
         let lin = |prefix: &str, out: usize, inp: usize| -> Result<Linear, ClassifyError> {
             let weight = format!("{prefix}.weight");
             let bias = format!("{prefix}.bias");
-            linear(
+            // The bias is imported here, not by `linear`, so a bad one is
+            // named as the bias and not as the weight beside it.
+            let mut lin = linear(
                 ops,
                 store,
                 &LinearSource {
                     weight: &weight,
-                    bias: Some(&bias),
+                    bias: None,
                     affine_group: None,
                 },
                 out,
                 inp,
             )
-            .map_err(|e| device(&weight, e))
+            .map_err(|e| device(&weight, e))?;
+            lin.bias = Some(
+                f32_param(ops, store, &bias, out)
+                    .map_err(|e| device(&bias, e))?
+                    .0,
+            );
+            Ok(lin)
         };
         let layers = (0..cfg.layers)
             .map(|i| {

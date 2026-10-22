@@ -36,6 +36,11 @@ impl WordPiece {
         Ok(Self { inner })
     }
 
+    /// Ids the tokenizer can emit, added tokens included.
+    pub(super) fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+
     /// The ids of `text` with the opening and closing markers, the padding
     /// dropped, at most [`MAX_TOKENS`] long.
     ///
