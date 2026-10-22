@@ -37,6 +37,14 @@ no Python runtime.
 | Qwen4Exp (MoE) | - | EXL3 |
 | Nemotron-H (hybrid state-space MoE) | Nemotron 3.5 Lightning 30B-A3B | MLX 4-bit |
 | EmbeddingGemma 2 (embeddings) | embeddinggemma-2 | GGUF (BF16, Q8_0) |
+| DistilBERT command classifier | da-command-classifier | safetensors (fp16) |
+
+The DistilBERT command classifier is a library-only family: there is no
+server route and no registry recipe yet. The converted fp16 weights are
+published on Hugging Face as `sercand/da-command-classifier-fp16`, and `shiso_models::distilbert_cls::Classifier` is opened and
+called in process. It labels a shell command `safe`, `needs-approval` or
+`dangerous` from the first 128 tokens of its text and returns raw logits;
+the caller applies its own calibration and decision threshold.
 
 Vision towers are supported for Qwen 3.5, Qwen 3.6 MoE and Gemma 4.
 

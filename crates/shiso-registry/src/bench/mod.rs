@@ -156,7 +156,7 @@ impl BenchKind {
             Task::Decision => Some(Self::Decision),
             Task::ImageGeneration => Some(Self::Image),
             Task::Transcription => Some(Self::Transcription),
-            Task::Diarization | Task::Embedding => None,
+            Task::Diarization | Task::Embedding | Task::Classification => None,
         }
     }
 

@@ -748,6 +748,35 @@ const _: fn(Vec<u32>) -> shiso_ir::EmbedInput = shiso_ir::EmbedInput::Tokens;
 type Matryoshka = fn(&[f32], usize) -> Result<Vec<f32>, shiso_models::embedder::EmbedError>;
 const _: Matryoshka = shiso_models::embedder::matryoshka;
 
+/// The sequence classifier's consumer API. A library user opens it once with a
+/// device it created and shares it across threads, so the shapes and `Sync`
+/// are part of the contract.
+type OpenClassifier = for<'a, 'b> fn(
+    &'a shiso_models::distilbert_cls::ClassifierDesc<'b>,
+) -> Result<
+    shiso_models::distilbert_cls::Classifier,
+    shiso_models::distilbert_cls::ClassifyError,
+>;
+const _: OpenClassifier = shiso_models::distilbert_cls::Classifier::open;
+const _: fn(
+    &shiso_models::distilbert_cls::Classifier,
+    &str,
+) -> Result<
+    [f32; shiso_models::distilbert_cls::NUM_LABELS],
+    shiso_models::distilbert_cls::ClassifyError,
+> = shiso_models::distilbert_cls::Classifier::logits;
+const _: fn(&shiso_models::distilbert_cls::Classifier) -> &[String] =
+    shiso_models::distilbert_cls::Classifier::labels;
+const _: fn(
+    &shiso_models::distilbert_cls::Classifier,
+    &str,
+) -> Result<Vec<u32>, shiso_models::distilbert_cls::ClassifyError> =
+    shiso_models::distilbert_cls::Classifier::token_ids;
+const _: fn() = || {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<shiso_models::distilbert_cls::Classifier>();
+};
+
 /// The contracts above are checked by the compiler, so this file building at
 /// all is the result. The test exists so a target that stopped being built
 /// shows up as a missing test rather than as silence.

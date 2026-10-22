@@ -47,6 +47,8 @@ sha2 = { workspace = true }
 # a computed digest - and an enum with a `#[error]` per variant is how that
 # sentence stays next to the case that produces it.
 thiserror = { workspace = true }
+# The classifier serializes its device scratch behind a lock that a failed call does not poison.
+parking_lot = { workspace = true }
 tracing = { workspace = true }
 # The byte-level BPE a speech recognizer's prompt context is tokenized
 # with, built from the checkpoint's own pieces and merges.
@@ -64,8 +66,6 @@ minijinja = { workspace = true }
 # encoded with. Dev-only: this crate names no device API.
 shiso-metal = { workspace = true }
 tempfile = { workspace = true }
-# The fake devices the lifecycle tests drive record their launches behind a lock.
-parking_lot = { workspace = true }
 # The checkpoint test forges a stored payload to prove that a file describing
 # another stack is unlinked rather than refused forever. Only a test reaches the
 # store directly: the models speak to it through the engine's checkpoint tier.
