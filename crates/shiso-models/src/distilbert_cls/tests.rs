@@ -231,7 +231,7 @@ fn host_table_refuses_short_buffer_and_names_tensor() {
     }
     let mut ok = [1.0_f32; 4];
     table.row(4, &mut ok).expect("last row");
-    assert_eq!(ok, [0.0; 4]);
+    assert!(ok.iter().all(|v| v.to_bits() == 0));
     assert!(table.row(5, &mut ok).is_err());
 }
 
