@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "name": "distilbert-cls",
+  "aliases": [],
+  "family": "distilbert_cls",
+  "min_shiso_version": "0.1.0",
+  "description": "Three-label text classifier (placeholder digests; the real recipe lives in the registry)",
+  "tags": ["classifier"],
+  "tasks": ["classification"],
+  "modalities": {
+    "inputs": ["text"],
+    "outputs": ["text"]
+  },
+  "features": {
+    "tools": false,
+    "reasoning": false,
+    "structured_output": false
+  },
+  "variants": [
+    {
+      "key": "universal-fp16",
+      "backend": ["metal", "cuda"],
+      "quant": "fp16",
+      "requirements": {
+        "min_ram_bytes": 536870912,
+        "disk_bytes": 267712096
+      },
+      "components": {
+        "base": {
+          "provider": "huggingface",
+          "repo": "shiso-community/distilbert-cls-fp16",
+          "revision": "0123456789abcdef0123456789abcdef01234567",
+          "files": [
+            {
+              "name": "model.safetensors",
+              "size": 267000000,
+              "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"
+            },
+            {
+              "name": "config.json",
+              "size": 700,
+              "sha256": "0d1f7c5b2e9a8b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4"
+            },
+            {
+              "name": "tokenizer.json",
+              "size": 711396,
+              "sha256": "a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

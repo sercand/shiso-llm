@@ -517,6 +517,8 @@ pub enum Task {
     Embedding,
     /// Schema decisions answered by a decision head.
     Decision,
+    /// Fixed-label text classification (a classifier head over the input text).
+    Classification,
 }
 
 impl Task {
@@ -530,6 +532,7 @@ impl Task {
             Self::ImageGeneration => "image_generation",
             Self::Embedding => "embedding",
             Self::Decision => "decision",
+            Self::Classification => "classification",
         }
     }
 }
@@ -550,6 +553,7 @@ impl FromStr for Task {
             "image_generation" => Ok(Self::ImageGeneration),
             "embedding" => Ok(Self::Embedding),
             "decision" => Ok(Self::Decision),
+            "classification" => Ok(Self::Classification),
             _ => Err(HubError::Validation {
                 reason: format!("unknown task '{s}'"),
             }),
