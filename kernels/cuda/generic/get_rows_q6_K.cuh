@@ -1,7 +1,7 @@
 /* The q6_K vocabulary gather.
  *
  * Nothing here is copied. What is preserved from the Metal twin in
- * `crates/shiso-metal/metal/qwen35/gemv_ext_q5k_q6k.metal` is the contract: the
+ * `kernels/metal/qwen35/gemv_ext_q5k_q6k.metal` is the contract: the
  * entry name, the `GetRowsArgs` block, the buffer order, one block per
  * 256-element span of one row with the token index on the second grid axis, and
  * the unpack - `ql` low nibbles, the two high bits out of `qh`, one signed

@@ -33,7 +33,7 @@ const DTYPES: [DType; 6] = [
 /// Every `.metal` source under `dir`, concatenated.
 fn metal_sources(dir: &str) -> String {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../shiso-metal/metal")
+        .join("../../kernels/metal")
         .join(dir);
     let mut text = String::new();
     for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {

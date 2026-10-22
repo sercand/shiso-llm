@@ -8,7 +8,7 @@
  * tensors here - `ssm_alpha` and `ssm_beta`, one pair per recurrent layer.
  *
  * Nothing here is copied. What is preserved from the Metal twin in
- * `crates/shiso-metal/metal/generic/mul_mv_q8_0.metal` is the contract: the
+ * `kernels/metal/generic/mul_mv_q8_0.metal` is the contract: the
  * entry name, the `MulMvArgs` block, the buffer order, the `(32, nsg)` block
  * with the output rows divided by two on `x`, the eight-element run each lane
  * takes, and the reduction - a whole-warp fold, one partial per warp into

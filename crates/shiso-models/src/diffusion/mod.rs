@@ -17,7 +17,7 @@
 //!
 //! New weight dtypes extend [`ops::WeightKind`] and [`lin::Lin::load`]; the
 //! device kernels they launch are registered in
-//! `crates/shiso-metal/metal/diffusion/`.
+//! `kernels/metal/diffusion/`.
 
 pub(crate) mod draft;
 pub(crate) mod encode;

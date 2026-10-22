@@ -1,5 +1,5 @@
 //! Argument blocks of the `audio` kernel set, field for field as
-//! `crates/shiso-metal/metal/audio/audio_common.h` declares them.
+//! `kernels/metal/audio/audio_common.h` declares them.
 //!
 //! Each block is passed as the launch's first argument, and its size is pinned
 //! beside it: a field added on one side only would shift every field after it

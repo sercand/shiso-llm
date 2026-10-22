@@ -25,7 +25,7 @@ pub(crate) const SOURCE_DIR_ENV: &str = "SHISO_METAL_SOURCE_DIR";
 pub(crate) const SOURCES: &[(&str, &str)] = &[
     (
         "00_common.metal",
-        include_str!("../metal/generic/00_common.metal"),
+        include_str!("../../../kernels/metal/generic/00_common.metal"),
     ),
     // The i-quant codebook tables, before every file that reads them:
     // `get_rows.metal` decodes IQ1_M rows through `IQ1S_GRID` and
@@ -34,124 +34,145 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     // both.
     (
         "iq_tables.metal",
-        include_str!("../metal/generic/iq_tables.metal"),
+        include_str!("../../../kernels/metal/generic/iq_tables.metal"),
     ),
-    ("norm.metal", include_str!("../metal/generic/norm.metal")),
+    (
+        "norm.metal",
+        include_str!("../../../kernels/metal/generic/norm.metal"),
+    ),
     (
         "softmax.metal",
-        include_str!("../metal/generic/softmax.metal"),
+        include_str!("../../../kernels/metal/generic/softmax.metal"),
     ),
-    ("unary.metal", include_str!("../metal/generic/unary.metal")),
-    ("bin.metal", include_str!("../metal/generic/bin.metal")),
-    ("glu.metal", include_str!("../metal/generic/glu.metal")),
+    (
+        "unary.metal",
+        include_str!("../../../kernels/metal/generic/unary.metal"),
+    ),
+    (
+        "bin.metal",
+        include_str!("../../../kernels/metal/generic/bin.metal"),
+    ),
+    (
+        "glu.metal",
+        include_str!("../../../kernels/metal/generic/glu.metal"),
+    ),
     (
         "concat.metal",
-        include_str!("../metal/generic/concat.metal"),
+        include_str!("../../../kernels/metal/generic/concat.metal"),
     ),
-    ("cpy.metal", include_str!("../metal/generic/cpy.metal")),
+    (
+        "cpy.metal",
+        include_str!("../../../kernels/metal/generic/cpy.metal"),
+    ),
     (
         "get_rows.metal",
-        include_str!("../metal/generic/get_rows.metal"),
+        include_str!("../../../kernels/metal/generic/get_rows.metal"),
     ),
     (
         "set_rows.metal",
-        include_str!("../metal/generic/set_rows.metal"),
+        include_str!("../../../kernels/metal/generic/set_rows.metal"),
     ),
     (
         "sum_rows.metal",
-        include_str!("../metal/generic/sum_rows.metal"),
+        include_str!("../../../kernels/metal/generic/sum_rows.metal"),
     ),
     (
         "repeat.metal",
-        include_str!("../metal/generic/repeat.metal"),
+        include_str!("../../../kernels/metal/generic/repeat.metal"),
     ),
     (
         "argsort.metal",
-        include_str!("../metal/generic/argsort.metal"),
+        include_str!("../../../kernels/metal/generic/argsort.metal"),
     ),
     (
         "dsv4_rope.metal",
-        include_str!("../metal/generic/dsv4_rope.metal"),
+        include_str!("../../../kernels/metal/generic/dsv4_rope.metal"),
     ),
     (
         "mul_mv_q8_0.metal",
-        include_str!("../metal/generic/mul_mv_q8_0.metal"),
+        include_str!("../../../kernels/metal/generic/mul_mv_q8_0.metal"),
     ),
     (
         "mul_mv_ext.metal",
-        include_str!("../metal/generic/mul_mv_ext.metal"),
+        include_str!("../../../kernels/metal/generic/mul_mv_ext.metal"),
     ),
     (
         "mul_mv_dense.metal",
-        include_str!("../metal/generic/mul_mv_dense.metal"),
+        include_str!("../../../kernels/metal/generic/mul_mv_dense.metal"),
     ),
     // --- qwen35 kernel set (T5); appended, nothing above this line changed ---
-    ("q35_common.h", include_str!("../metal/qwen35/q35_common.h")),
+    (
+        "q35_common.h",
+        include_str!("../../../kernels/metal/qwen35/q35_common.h"),
+    ),
     (
         "qwen35/gdn_conv.metal",
-        include_str!("../metal/qwen35/gdn_conv.metal"),
+        include_str!("../../../kernels/metal/qwen35/gdn_conv.metal"),
     ),
     (
         "qwen35/gdn_recurrent.metal",
-        include_str!("../metal/qwen35/gdn_recurrent.metal"),
+        include_str!("../../../kernels/metal/qwen35/gdn_recurrent.metal"),
     ),
     (
         "qwen35/gdn_recurrent_hybrid.metal",
-        include_str!("../metal/qwen35/gdn_recurrent_hybrid.metal"),
+        include_str!("../../../kernels/metal/qwen35/gdn_recurrent_hybrid.metal"),
     ),
     (
         "qwen35/gdn_chunk.metal",
-        include_str!("../metal/qwen35/gdn_chunk.metal"),
+        include_str!("../../../kernels/metal/qwen35/gdn_chunk.metal"),
     ),
     // After gdn_chunk.metal, not before: the hybrid is one more instantiation
     // of that file's template, so the template has to have been parsed.
     (
         "qwen35/gdn_chunk_hybrid.metal",
-        include_str!("../metal/qwen35/gdn_chunk_hybrid.metal"),
+        include_str!("../../../kernels/metal/qwen35/gdn_chunk_hybrid.metal"),
     ),
     (
         "rmsnorm_rope.metal",
-        include_str!("../metal/qwen35/rmsnorm_rope.metal"),
+        include_str!("../../../kernels/metal/qwen35/rmsnorm_rope.metal"),
     ),
     (
         "gated_attn.metal",
-        include_str!("../metal/qwen35/gated_attn.metal"),
+        include_str!("../../../kernels/metal/qwen35/gated_attn.metal"),
     ),
     (
         "gated_attn_prefill.metal",
-        include_str!("../metal/qwen35/gated_attn_prefill.metal"),
+        include_str!("../../../kernels/metal/qwen35/gated_attn_prefill.metal"),
     ),
     (
         "gemv_ext_q5k_q6k.metal",
-        include_str!("../metal/qwen35/gemv_ext_q5k_q6k.metal"),
+        include_str!("../../../kernels/metal/qwen35/gemv_ext_q5k_q6k.metal"),
     ),
     (
         "gemm_q4k.metal",
-        include_str!("../metal/qwen35/gemm_q4k.metal"),
+        include_str!("../../../kernels/metal/qwen35/gemm_q4k.metal"),
     ),
     // --- vision tower kernel set (T6c); appended, nothing above this line
     // changed. The header comes first for the same reason the qwen35 one does:
     // the files after it use its argument blocks and its reductions.
-    ("vit_common.h", include_str!("../metal/vision/vit_common.h")),
+    (
+        "vit_common.h",
+        include_str!("../../../kernels/metal/vision/vit_common.h"),
+    ),
     (
         "vision/vit_gemm.metal",
-        include_str!("../metal/vision/vit_gemm.metal"),
+        include_str!("../../../kernels/metal/vision/vit_gemm.metal"),
     ),
     (
         "vision/vit_norm_gelu.metal",
-        include_str!("../metal/vision/vit_norm_gelu.metal"),
+        include_str!("../../../kernels/metal/vision/vit_norm_gelu.metal"),
     ),
     (
         "vision/vit_attn.metal",
-        include_str!("../metal/vision/vit_attn.metal"),
+        include_str!("../../../kernels/metal/vision/vit_attn.metal"),
     ),
     (
         "vision/vit_merge.metal",
-        include_str!("../metal/vision/vit_merge.metal"),
+        include_str!("../../../kernels/metal/vision/vit_merge.metal"),
     ),
     (
         "vision/vit_splice.metal",
-        include_str!("../metal/vision/vit_splice.metal"),
+        include_str!("../../../kernels/metal/vision/vit_splice.metal"),
     ),
     // --- dense kernel set (Gemma 4 phase 1); appended, nothing above this line
     // changed. The header comes first for the same reason the qwen35 and vision
@@ -159,26 +180,26 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     // its reductions.
     (
         "dense_common.h",
-        include_str!("../metal/dense/dense_common.h"),
+        include_str!("../../../kernels/metal/dense/dense_common.h"),
     ),
     (
         "dense/dense_misc.metal",
-        include_str!("../metal/dense/dense_misc.metal"),
+        include_str!("../../../kernels/metal/dense/dense_misc.metal"),
     ),
     (
         "dense/dense_norm_rope.metal",
-        include_str!("../metal/dense/dense_norm_rope.metal"),
+        include_str!("../../../kernels/metal/dense/dense_norm_rope.metal"),
     ),
     (
         "dense/dense_attn.metal",
-        include_str!("../metal/dense/dense_attn.metal"),
+        include_str!("../../../kernels/metal/dense/dense_attn.metal"),
     ),
     // The per-layer embedding pair reuses `dequantize_dense_q6_K` and the block
     // struct it reads out of `qwen35/gemv_ext_q5k_q6k.metal`, which is why it
     // is appended after that file rather than declaring either again.
     (
         "dense/dense_ple.metal",
-        include_str!("../metal/dense/dense_ple.metal"),
+        include_str!("../../../kernels/metal/dense/dense_ple.metal"),
     ),
     // The Gemma 4 vision tower's dense kernels: the attention-plane norm and
     // two-axis rotation, the pooler and the clamp. Appended after the rest of
@@ -186,44 +207,44 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     // reuse its reduction helpers and its neox rotation.
     (
         "dense/dense_vision.metal",
-        include_str!("../metal/dense/dense_vision.metal"),
+        include_str!("../../../kernels/metal/dense/dense_vision.metal"),
     ),
     // The MLX packed affine matrix-vector (qmv) and matrix-matrix (qmm) kernels.
     (
         "dense/dense_affine.metal",
-        include_str!("../metal/dense/dense_affine.metal"),
+        include_str!("../../../kernels/metal/dense/dense_affine.metal"),
     ),
     (
         "dense/dense_affine_rows.metal",
-        include_str!("../metal/dense/dense_affine_rows.metal"),
+        include_str!("../../../kernels/metal/dense/dense_affine_rows.metal"),
     ),
     // The row-exact affine matmul: one arithmetic for every row count, so a
     // verify window's rows equal the serial steps they check.
     (
         "dense/dense_exact_affine.metal",
-        include_str!("../metal/dense/dense_exact_affine.metal"),
+        include_str!("../../../kernels/metal/dense/dense_exact_affine.metal"),
     ),
     // The block drafter's two kernels of its own: the strided row copy that
     // gathers the target's tapped hidden states, and the grouped dynamic
     // causal convolution.
     (
         "dense/dense_block_draft.metal",
-        include_str!("../metal/dense/dense_block_draft.metal"),
+        include_str!("../../../kernels/metal/dense/dense_block_draft.metal"),
     ),
     // The state-space block (convolution, scan, gated norm) and the routed
     // feed-forward over row-major affine stacks with a biased sigmoid router.
     (
         "dense/dense_ssm.metal",
-        include_str!("../metal/dense/dense_ssm.metal"),
+        include_str!("../../../kernels/metal/dense/dense_ssm.metal"),
     ),
     (
         "dense/dense_moe.metal",
-        include_str!("../metal/dense/dense_moe.metal"),
+        include_str!("../../../kernels/metal/dense/dense_moe.metal"),
     ),
     // The gated short convolution block's one sequential kernel.
     (
         "dense/dense_short_conv.metal",
-        include_str!("../metal/dense/dense_short_conv.metal"),
+        include_str!("../../../kernels/metal/dense/dense_short_conv.metal"),
     ),
     // --- qwen35moe kernel set; appended, nothing above this line changed. The
     // header comes first, for the same reason the qwen35, vision and dense
@@ -232,118 +253,148 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     // enter the translation unit.
     (
         "q35moe_common.h",
-        include_str!("../metal/qwen35moe/q35moe_common.h"),
+        include_str!("../../../kernels/metal/qwen35moe/q35moe_common.h"),
     ),
     (
         "qwen35moe/moe_experts.metal",
-        include_str!("../metal/qwen35moe/moe_experts.metal"),
+        include_str!("../../../kernels/metal/qwen35moe/moe_experts.metal"),
     ),
     (
         "qwen35moe/moe_route.metal",
-        include_str!("../metal/qwen35moe/moe_route.metal"),
+        include_str!("../../../kernels/metal/qwen35moe/moe_route.metal"),
     ),
     (
         "qwen35moe/moe_misc.metal",
-        include_str!("../metal/qwen35moe/moe_misc.metal"),
+        include_str!("../../../kernels/metal/qwen35moe/moe_misc.metal"),
     ),
     // --- qwen4exp (q4e) kernel set; appended, nothing above this line
     // changed. The header comes first for the same reason every other set's
     // does. The router, the sort, the activation, the combine and the shared
     // add are already above, in the qwen35moe set, under the entry names the
     // sparse stack launches.
-    ("q4e_common.h", include_str!("../metal/q4e/q4e_common.h")),
-    ("q4e/hc.metal", include_str!("../metal/q4e/hc.metal")),
-    ("q4e/gdn.metal", include_str!("../metal/q4e/gdn.metal")),
-    ("q4e/ple.metal", include_str!("../metal/q4e/ple.metal")),
+    (
+        "q4e_common.h",
+        include_str!("../../../kernels/metal/q4e/q4e_common.h"),
+    ),
+    (
+        "q4e/hc.metal",
+        include_str!("../../../kernels/metal/q4e/hc.metal"),
+    ),
+    (
+        "q4e/gdn.metal",
+        include_str!("../../../kernels/metal/q4e/gdn.metal"),
+    ),
+    (
+        "q4e/ple.metal",
+        include_str!("../../../kernels/metal/q4e/ple.metal"),
+    ),
     (
         "q4e/matvec.metal",
-        include_str!("../metal/q4e/matvec.metal"),
+        include_str!("../../../kernels/metal/q4e/matvec.metal"),
     ),
-    ("q4e/qsa.metal", include_str!("../metal/q4e/qsa.metal")),
+    (
+        "q4e/qsa.metal",
+        include_str!("../../../kernels/metal/q4e/qsa.metal"),
+    ),
     (
         "q4e/qsa_sparse.metal",
-        include_str!("../metal/q4e/qsa_sparse.metal"),
+        include_str!("../../../kernels/metal/q4e/qsa_sparse.metal"),
     ),
-    ("q4e/idx.metal", include_str!("../metal/q4e/idx.metal")),
+    (
+        "q4e/idx.metal",
+        include_str!("../../../kernels/metal/q4e/idx.metal"),
+    ),
     // The pooled pass over the raw key ring; after `idx.metal`, whose
     // constants it uses.
     (
         "q4e/idxring.metal",
-        include_str!("../metal/q4e/idxring.metal"),
+        include_str!("../../../kernels/metal/q4e/idxring.metal"),
     ),
-    ("q4e/misc.metal", include_str!("../metal/q4e/misc.metal")),
-    ("q4e/embed.metal", include_str!("../metal/q4e/embed.metal")),
+    (
+        "q4e/misc.metal",
+        include_str!("../../../kernels/metal/q4e/misc.metal"),
+    ),
+    (
+        "q4e/embed.metal",
+        include_str!("../../../kernels/metal/q4e/embed.metal"),
+    ),
     (
         "q4e/affine.metal",
-        include_str!("../metal/q4e/affine.metal"),
+        include_str!("../../../kernels/metal/q4e/affine.metal"),
     ),
-    ("q4e/fp8.metal", include_str!("../metal/q4e/fp8.metal")),
+    (
+        "q4e/fp8.metal",
+        include_str!("../../../kernels/metal/q4e/fp8.metal"),
+    ),
     // This family's own fused decode row of a recurrent layer; after
     // `gdn.metal`, whose helpers and constants it uses.
-    ("q4e/exact.metal", include_str!("../metal/q4e/exact.metal")),
+    (
+        "q4e/exact.metal",
+        include_str!("../../../kernels/metal/q4e/exact.metal"),
+    ),
     // --- audio encoder kernel set; appended, nothing above this line changed.
     (
         "audio_common.h",
-        include_str!("../metal/audio/audio_common.h"),
+        include_str!("../../../kernels/metal/audio/audio_common.h"),
     ),
     (
         "audio/audio_elementwise.metal",
-        include_str!("../metal/audio/audio_elementwise.metal"),
+        include_str!("../../../kernels/metal/audio/audio_elementwise.metal"),
     ),
     (
         "audio/audio_norm.metal",
-        include_str!("../metal/audio/audio_norm.metal"),
+        include_str!("../../../kernels/metal/audio/audio_norm.metal"),
     ),
     (
         "audio/audio_gemm.metal",
-        include_str!("../metal/audio/audio_gemm.metal"),
+        include_str!("../../../kernels/metal/audio/audio_gemm.metal"),
     ),
     (
         "audio/audio_conv.metal",
-        include_str!("../metal/audio/audio_conv.metal"),
+        include_str!("../../../kernels/metal/audio/audio_conv.metal"),
     ),
     (
         "audio/audio_attn.metal",
-        include_str!("../metal/audio/audio_attn.metal"),
+        include_str!("../../../kernels/metal/audio/audio_attn.metal"),
     ),
     (
         "audio/audio_lstm.metal",
-        include_str!("../metal/audio/audio_lstm.metal"),
+        include_str!("../../../kernels/metal/audio/audio_lstm.metal"),
     ),
     // --- logits stages shared by every stack; appended, nothing above this
     // line changed.
     (
         "sample/suppress.metal",
-        include_str!("../metal/sample/suppress.metal"),
+        include_str!("../../../kernels/metal/sample/suppress.metal"),
     ),
     // --- diffusion DiT kernel set; appended, nothing above this line changed.
     // The header comes first for the same reason every other set's does: the
     // file after it uses its argument blocks, its decoders and its reduction.
     (
         "diffusion_common.h",
-        include_str!("../metal/diffusion/diffusion_common.h"),
+        include_str!("../../../kernels/metal/diffusion/diffusion_common.h"),
     ),
     (
         "diffusion.metal",
-        include_str!("../metal/diffusion/diffusion.metal"),
+        include_str!("../../../kernels/metal/diffusion/diffusion.metal"),
     ),
     // --- ternary kernel set (rotated ternary checkpoints); appended, nothing
     // above this line changed. The header first, as for every other set.
     (
         "ternary_common.h",
-        include_str!("../metal/ternary/ternary_common.h"),
+        include_str!("../../../kernels/metal/ternary/ternary_common.h"),
     ),
     (
         "ternary/rotate.metal",
-        include_str!("../metal/ternary/rotate.metal"),
+        include_str!("../../../kernels/metal/ternary/rotate.metal"),
     ),
     (
         "ternary/ternary_mv.metal",
-        include_str!("../metal/ternary/ternary_mv.metal"),
+        include_str!("../../../kernels/metal/ternary/ternary_mv.metal"),
     ),
     (
         "ternary/ternary_mm.metal",
-        include_str!("../metal/ternary/ternary_mm.metal"),
+        include_str!("../../../kernels/metal/ternary/ternary_mm.metal"),
     ),
 ];
 

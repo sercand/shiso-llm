@@ -691,7 +691,7 @@ const SPECIALIZED_MUL_MV: KernelRef =
 /// The backend compiles the embedded copy of exactly these files, so reading the
 /// crate directory reads the same bytes the device compiled.
 fn kernel_sources() -> Vec<(String, String)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("metal/generic");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/metal/generic");
     let mut files = match std::fs::read_dir(&dir) {
         Ok(entries) => entries
             .map(|entry| entry.expect("a readable kernel source").path())

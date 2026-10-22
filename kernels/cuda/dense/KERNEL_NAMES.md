@@ -21,7 +21,7 @@ the module does not export is worse than no file.
 
 ## Module `dense` — 19 entries
 
-Geometry and buffer order are `crates/shiso-metal/metal/dense/KERNELS.md`'s,
+Geometry and buffer order are `kernels/metal/dense/KERNELS.md`'s,
 because the twins share an engine that names them and hands both the same
 argument block and the same grid. `n` is the element count a flat kernel covers
 and `n_tok` the rows of the chunk.

@@ -1,6 +1,6 @@
 /* Row-exact MLX affine matmul: 4- and 8-bit weights in groups of 64, f32 rows.
  *
- * The CUDA twin of `crates/shiso-metal/metal/dense/dense_exact_affine.metal`,
+ * The CUDA twin of `kernels/metal/dense/dense_exact_affine.metal`,
  * under the same entry names and launch geometry, so the engine's plan in
  * `shiso_engine::projection::exact_affine_plan` drives both. What it keeps is
  * the property, not the Metal bits: a row's output does not depend on how

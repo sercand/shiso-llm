@@ -1,6 +1,6 @@
 /* Matrix-vector products over ternary and 2-bit affine weights, one
  * activation row a block (only `T = 1` is instantiated), and the row gather; the twins of
- * `crates/shiso-metal/metal/ternary/ternary_mv.metal`, whose header comment
+ * `kernels/metal/ternary/ternary_mv.metal`, whose header comment
  * states the formats, the arithmetic and the geometry. A warp here is a Metal
  * simdgroup: 32 lanes, four output rows, eight lanes a 128-input group. */
 #ifndef SHISO_TERNARY_MV_CUH

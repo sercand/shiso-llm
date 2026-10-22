@@ -1,7 +1,7 @@
 /* The `audio` module: the audio encoders' kernel set.
  *
  * Nothing here is copied. The arithmetic is the Metal twin's in
- * `crates/shiso-metal/metal/audio`, the launch contract is that directory's
+ * `kernels/metal/audio`, the launch contract is that directory's
  * KERNELS.md, and the entry names are the host's `&'static str` literals in
  * `crates/shiso-models/src/audio_ops`, so every entry carries C linkage.
  *

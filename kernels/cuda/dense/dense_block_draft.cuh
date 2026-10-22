@@ -2,7 +2,7 @@
  * that hands the drafter the target's tapped hidden states, and the grouped
  * dynamic causal convolution.
  *
- * Twins of `crates/shiso-metal/metal/dense/dense_block_draft.metal`, same
+ * Twins of `kernels/metal/dense/dense_block_draft.metal`, same
  * names, argument blocks and flat grids (`ceil(n / 256)` blocks of 256).
  */
 #ifndef SHISO_DENSE_BLOCK_DRAFT_CUH

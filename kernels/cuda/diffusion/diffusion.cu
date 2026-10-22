@@ -5,7 +5,7 @@
  * of a separately compiled image and `Ops::new` resolves every entry of
  * `REQUIRED_KERNELS` inside the one image named `diffusion`. The pieces below
  * are include-only (KERNEL.toml lists only this file). The entries are the
- * Metal twin's (`crates/shiso-metal/metal/diffusion/diffusion.metal`), under
+ * Metal twin's (`kernels/metal/diffusion/diffusion.metal`), under
  * the same names; `KERNEL_NAMES.md` is the table, and the host-only test
  * `required_kernels_all_present_on_cuda` checks it against `REQUIRED_KERNELS`.
  */

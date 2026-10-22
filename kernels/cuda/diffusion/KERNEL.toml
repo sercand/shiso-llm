@@ -6,7 +6,7 @@
 # module name `diffusion`. The other `.cu` / `.cuh` files in this directory are
 # include-only pieces of that one unit (they are not listed in `sources`, so the
 # build never compiles them alone), split along the same seams the Metal twin
-# (`crates/shiso-metal/metal/diffusion/diffusion.metal`) is read in.
+# (`kernels/metal/diffusion/diffusion.metal`) is read in.
 #
 # Nothing here is a byte copy of anything: the kernels are written against the
 # Metal twin and the argument blocks in `ops.rs`, so no unit carries a

@@ -123,7 +123,7 @@ SHISO_GET_ROWS_BLOCK_ENTRY(q5_K, shiso_block_q5_K)
  * scale multiplier beside it, so the assembled `d`, the per-subblock `dl`
  * and the per-quad grid-shift delta are computed per element from the block
  * header. This is the row-at-a-time twin of `deq32_iq1_m` in
- * `crates/shiso-metal/metal/generic/get_rows.metal` and of the host
+ * `kernels/metal/generic/get_rows.metal` and of the host
  * reference in `shiso_modelfile::iq_quant`, graded bit-for-bit against it by
  * `shiso_kerneltest::dense::iq::iq1_m_get_rows_matches_the_oracle`; the
  * `dl` here for the quad `m` of group `ib` is that dequantizer's `dl0` for

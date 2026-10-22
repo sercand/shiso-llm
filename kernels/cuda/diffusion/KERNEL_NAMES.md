@@ -9,7 +9,7 @@ Every entry carries C linkage and is spelled out in full in the source
 name below is the name the driver answers to, verbatim and unmangled. These are
 the names `REQUIRED_KERNELS` in `crates/shiso-models/src/diffusion/ops.rs`
 lists, and the names the Metal twin
-(`crates/shiso-metal/metal/diffusion/diffusion.metal`) registers. The host-only
+(`kernels/metal/diffusion/diffusion.metal`) registers. The host-only
 test `required_kernels_all_present_on_cuda` (same file) fails when a name in
 that list is missing from this file or from the sources.
 
