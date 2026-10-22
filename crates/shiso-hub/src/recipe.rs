@@ -1147,6 +1147,21 @@ pub struct IndexVariantEntry {
     pub min_metal_family: Option<u32>,
 }
 
+/// Reads a list of enum strings, dropping the ones this client does not know.
+///
+/// The index is shared by every client version. A newer registry may list a
+/// task or modality this build predates; failing the whole catalog over it
+/// would hide every other model. Recipes stay strict (see `validate_recipe`),
+/// so an unknown value is only ever dropped from the browse metadata.
+fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+{
+    let raw = Vec::<String>::deserialize(deserializer)?;
+    Ok(raw.iter().filter_map(|s| s.parse().ok()).collect())
+}
+
 /// An entry for one model inside the compact registry index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexModelEntry {
@@ -1165,13 +1180,13 @@ pub struct IndexModelEntry {
     #[serde(default)]
     pub tags: Vec<String>,
     /// Tasks served.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_list")]
     pub tasks: Vec<Task>,
     /// Input modalities.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_list")]
     pub inputs: Vec<Modality>,
     /// Output modalities.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_list")]
     pub outputs: Vec<Modality>,
     /// Last update timestamp.
     pub updated_at: String,

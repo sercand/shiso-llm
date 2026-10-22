@@ -724,3 +724,111 @@ async fn a_nested_hub_file_is_fetched_and_installed_under_its_directory() {
         .join("scheduler_config.json");
     assert_eq!(fs::read(installed).unwrap(), payload);
 }
+
+fn index_client(server: &MockServer, home: &std::path::Path) -> RegistryClient {
+    RegistryClient::new(HubConfig {
+        home: home.to_path_buf(),
+        registry: RegistryEndpoint {
+            url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+        },
+        hf_endpoint: url::Url::parse("http://hf.invalid").unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    })
+}
+
+/// An index entry naming a task or modality this client predates keeps its
+/// place in the catalog; only the unknown value is dropped.
+#[tokio::test]
+async fn an_index_entry_with_an_unknown_task_still_parses() {
+    let server = MockServer::start().await;
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "generated_at": "2026-10-22T00:00:00Z",
+        "models": [{
+            "name": "m",
+            "family": "f",
+            "min_shiso_version": "0.1.0",
+            "description": "d",
+            "tasks": ["chat", "telepathy", "classification"],
+            "inputs": ["text", "smell"],
+            "outputs": ["hologram"],
+            "updated_at": "2026-10-22T00:00:00Z",
+            "manifest": "models/m/index.json",
+            "manifest_sha256": "0".repeat(64),
+            "variants": [],
+        }],
+    });
+    Mock::given(method("GET"))
+        .and(path("/v1/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let temp = tempdir().unwrap();
+    let index = index_client(&server, temp.path())
+        .fetch_index()
+        .await
+        .unwrap();
+    assert_eq!(index.models.len(), 1);
+    let m = &index.models[0];
+    assert_eq!(
+        m.tasks,
+        vec![
+            shiso_hub::recipe::Task::Chat,
+            shiso_hub::recipe::Task::Classification
+        ]
+    );
+    assert_eq!(m.inputs, vec![shiso_hub::recipe::Modality::Text]);
+    assert!(m.outputs.is_empty());
+}
+
+/// A fresh index that does not parse is an error and leaves the cached index
+/// and etag alone, so the next 304 and the offline fallback still work.
+#[tokio::test]
+async fn a_bad_fresh_index_does_not_replace_the_cached_one() {
+    let server = MockServer::start().await;
+    let good = b"{\"schema_version\":1,\"generated_at\":\"2026-10-22T00:00:00Z\",\"models\":[]}";
+    Mock::given(method("GET"))
+        .and(path("/v1/index.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"good\"")
+                .set_body_bytes(good.as_slice()),
+        )
+        .mount(&server)
+        .await;
+    let temp = tempdir().unwrap();
+    let client = index_client(&server, temp.path());
+    client.fetch_index().await.unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/index.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"bad\"")
+                .set_body_bytes(b"{\"schema_version\":".as_slice()),
+        )
+        .mount(&server)
+        .await;
+    assert!(client.fetch_index().await.is_err());
+
+    let cache = temp.path().join("registry");
+    assert_eq!(fs::read(cache.join("index.json")).unwrap(), good);
+    assert_eq!(
+        fs::read_to_string(cache.join("index.etag")).unwrap(),
+        "\"good\""
+    );
+
+    // The next conditional request still carries the good etag, and its 304
+    // is served from the good cache.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/index.json"))
+        .and(header("if-none-match", "\"good\""))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(client.fetch_index().await.unwrap().models.len(), 0);
+}
