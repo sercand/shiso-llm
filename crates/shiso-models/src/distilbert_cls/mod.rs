@@ -43,7 +43,8 @@
 //! [`ClassifyError`] is typed and nothing panics on bad input. `open` reports a
 //! malformed config, a missing or misshapen tensor, or a broken tokenizer by
 //! name before the first call. `logits` reports [`ClassifyError::Tokenizer`] or
-//! [`ClassifyError::Device`]; a failed call leaves the classifier usable for the
+//! [`ClassifyError::Device`], and [`ClassifyError::BadTensor`] if the head
+//! disagrees with the config (unreachable after `open` validates it); a failed call leaves the classifier usable for the
 //! next one. A machine with no device is the caller's state to report, since
 //! the caller creates the backend.
 //!
@@ -62,13 +63,14 @@
 //!
 //! | what | time |
 //! | --- | --- |
-//! | backend creation to first `logits`, first run after a build | 2.19 s |
-//! | backend creation to first `logits`, later runs | 0.08 s |
+//! | backend creation, `Classifier::open` and the first `logits`, first run after a build | 2.19 s |
+//! | backend creation, `Classifier::open` and the first `logits`, later runs | 0.08 s |
 //! | median of 100 calls, 17 ids | 2.4 to 3.1 ms |
 //! | median of 100 calls, 128 ids | 6.7 ms |
 //!
-//! The first-run figure includes compiling the device kernel library, which
-//! the platform then caches; a cold cache on another machine, or after a system
+//! The first-run figure most likely includes compiling the device kernel
+//! library, which the platform then caches (the gap to later runs fits that,
+//! but it was not isolated); a cold cache on another machine, or after a system
 //! update, can take much longer, so create the backend once and not on a UI
 //! thread.
 
@@ -228,7 +230,9 @@ impl Classifier {
     ///
     /// # Errors
     ///
-    /// [`ClassifyError::Tokenizer`] or [`ClassifyError::Device`].
+    /// [`ClassifyError::Tokenizer`] or [`ClassifyError::Device`];
+    /// [`ClassifyError::BadTensor`] if the head disagrees with the config
+    /// (unreachable after [`Self::open`] validates it).
     pub fn logits(&self, text: &str) -> Result<[f32; NUM_LABELS], ClassifyError> {
         let ids = self.tokens.ids(text)?;
         let mut encoder = self.encoder.lock();
