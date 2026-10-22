@@ -264,46 +264,6 @@ environment variable. The ones you are most likely to want:
 | `--image-final-reuse` | `START:END`: transformer blocks the last step skips, replaying the residual the step before recorded over them (Qwen-Image-2.1 only; the last two steps must run at full size). Faster, visibly softer |
 | `--embedding-max-queue` | Embedding requests that may wait in the queue beyond the one running (default 64), when `--model` is an embedding checkpoint |
 
-### FLUX.3 Klein (image generation, Metal)
-
-`--image-model` takes the distilled FLUX.3 Klein transformer as one `.gguf` (the
-Q2_K to Q8_0 mixed-quantization exports are read in their stored formats, never
-dequantized) or one `.safetensors` file; the Base (guidance, 50-step) release is
-refused by name. The text encoder is the Qwen3-VL-4B language model, as
-`text_encoder/` shards or one INT8 ConvRot file with its `config.json`, the VAE
-is `ae.safetensors`, and the tokenizer is `tokenizer.json`; the locator finds
-each beside the model or under `--image-assets-dir`, or take the explicit flags.
-It runs 16 flow-map Euler steps without guidance at 1024x1024 by default (sides
-64 to 4096 on a 16-pixel grid), and `--image-residency swap` (or `auto` on a host
-too small for both) drops the text encoder before the transformer is imported.
-Measured on a 24 GiB M4 (Metal working set 17.8 GiB), 1024x1024, 16 steps, with
-the Q4_K_XL transformer: the pictures are byte-identical across `resident`, `swap`
-and an `auto` that chose swap (BF16 and INT8 text encoders), and the image takes
-the same ~242 s either way, since a swap costs under a few seconds of page-cache
-reads and imports (the files were mostly in the page cache; a fully cold read was
-not measured). What changes is the device's peak allocation: with the BF16 text
-encoder (7.2 GB loaded) 16.7 GB resident, 9.5 GB for a swap that keeps the
-transformer through the decode and 7.6 GB for one that drops it first
-(`--image-reserve-gb 10`); with the INT8 encoder (4.3 GB) 13.8 GB resident against
-9.5 GB. `auto` chooses `resident` here at the default reserve and swap once
-`--image-reserve-gb` leaves too little. A reserve that leaves less than a 1024x1024
-job needs is refused when the model opens, naming the largest square side that
-would fit (or saying that none does).
-The generator itself accepts up to 10 reference pictures for editing: a single
-reference is fitted under 4 MiB pixels and reflect-padded to a canvas on the grid,
-several are each fitted under 1 MP. Over HTTP an edit is `POST /v1/images/edits`
-(multipart `image` / `image[]`, up to 10, or JSON `images: [{"image_url":
-"data:..."}]`); a request that names no `size` gets the size its references
-imply (one reference: its own aspect ratio), and `n` must be 1. FLUX.2-klein and
-Qwen-Image-2.1 answer an edit with a 400 naming the model. The model's
-authors ship a prompt upsampler with it and recommend not running it without
-one; this build has none, so prompts reach the model as typed. FLUX.3 Klein on
-CUDA is **written but unvalidated**: the `diffusion` kernel module has a CUDA
-port (`kernels/cuda/diffusion`) that was written on a machine with no CUDA
-toolchain, so it has never been compiled by nvcc or run on a device. Treat any
-CUDA output as untrusted until the `shiso-cuda` `diffusion_kernels` cases and
-the FLUX.3 end-to-end case have passed on a GPU.
-
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
 
 ## API endpoints
