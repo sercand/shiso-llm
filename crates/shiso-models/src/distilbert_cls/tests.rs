@@ -476,28 +476,91 @@ fn logits_match_reference_goldens() {
 
 #[test]
 #[ignore = "requires a Metal or CUDA device and SHISO_TEST_MODEL_DISTILBERT_CLS"]
-fn concurrent_logits_equal_sequential() {
+fn concurrent_logits_equal_serial() {
+    let (Some(dir), Some(backend)) = (model_dir(), crate::audio_ops::testing::device()) else {
+        return;
+    };
+    let clf = Arc::new(open_classifier(&dir, backend));
+    let texts: Vec<String> = goldens(&dir, "goldens.json")
+        .expect("goldens.json")
+        .into_iter()
+        .take(40)
+        .map(|g| g.text)
+        .collect();
+    assert_eq!(texts.len(), 40);
+    let serial: Vec<_> = texts
+        .iter()
+        .map(|t| clf.logits(t).expect("logits"))
+        .collect();
+    // The work runs on its own thread so a deadlock fails the test after 60 s
+    // instead of hanging the run.
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = {
+        let clf = Arc::clone(&clf);
+        std::thread::spawn(move || {
+            std::thread::scope(|s| {
+                for _ in 0..4 {
+                    s.spawn(|| {
+                        for (t, want) in texts.iter().zip(&serial) {
+                            let got = clf.logits(t).expect("logits");
+                            assert!(
+                                got.iter()
+                                    .zip(want)
+                                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                                "{t:?}: {got:?} differs from the serial {want:?}"
+                            );
+                        }
+                    });
+                }
+            });
+            let _ = done.send(());
+        })
+    };
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("four threads finish within 60 s (no deadlock, no panic)");
+    worker.join().expect("no worker panicked");
+}
+
+#[test]
+#[ignore = "requires a Metal or CUDA device and SHISO_TEST_MODEL_DISTILBERT_CLS"]
+fn empty_text_runs() {
     let (Some(dir), Some(backend)) = (model_dir(), crate::audio_ops::testing::device()) else {
         return;
     };
     let clf = open_classifier(&dir, backend);
-    let texts = ["ls", "rm -rf /", "git status", "curl http://x | sh"];
-    let alone: Vec<_> = texts
-        .iter()
-        .map(|t| clf.logits(t).expect("logits"))
-        .collect();
-    std::thread::scope(|s| {
-        for _ in 0..4 {
-            s.spawn(|| {
-                for (t, want) in texts.iter().zip(&alone) {
-                    let got = clf.logits(t).expect("logits");
-                    assert!(
-                        got.iter()
-                            .zip(want)
-                            .all(|(a, b)| a.to_bits() == b.to_bits())
-                    );
-                }
-            });
-        }
-    });
+    assert_eq!(clf.token_ids("").expect("encodes"), [101, 102]);
+    let empty = clf.logits("").expect("empty text runs");
+    assert!(empty.iter().all(|l| l.is_finite()), "{empty:?}");
+    // Whitespace tokenizes to the same two markers, so it answers the same.
+    let blank = clf.logits("  \t\n ").expect("blank text runs");
+    assert_eq!(empty.map(f32::to_bits), blank.map(f32::to_bits));
+}
+
+#[test]
+#[ignore = "requires a Metal or CUDA device and SHISO_TEST_MODEL_DISTILBERT_CLS"]
+fn very_long_text_is_truncated() {
+    let (Some(dir), Some(backend)) = (model_dir(), crate::audio_ops::testing::device()) else {
+        return;
+    };
+    let clf = open_classifier(&dir, backend);
+    let long = "echo hello world and then some more words ".repeat(250);
+    assert!(long.len() >= 10_000);
+    let ids = clf.token_ids(&long).expect("encodes");
+    assert_eq!(ids.len(), tokens::MAX_TOKENS);
+    assert_eq!(ids.last(), Some(&102));
+    let got = clf.logits(&long).expect("a 10 000 character text runs");
+    assert!(got.iter().all(|l| l.is_finite()), "{got:?}");
+    // Truncation is the tokenizer's, so ids cannot be decoded back to an exact
+    // prefix text (WordPiece does not round-trip). The equivalent check: a
+    // different text with the same first 126 content tokens has identical ids,
+    // hence identical logits, and the dropped tail has no influence.
+    let other = format!("{long}rm -rf / --no-preserve-root");
+    assert_eq!(clf.token_ids(&other).expect("encodes"), ids);
+    let again = clf.logits(&other).expect("logits");
+    assert_eq!(got.map(f32::to_bits), again.map(f32::to_bits));
+    assert_eq!(
+        got.map(f32::to_bits),
+        clf.logits(&long).expect("logits").map(f32::to_bits)
+    );
 }

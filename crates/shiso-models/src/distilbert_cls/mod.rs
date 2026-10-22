@@ -5,6 +5,13 @@
 //! recognised ([`describes`]), the typed errors, and the config and weight
 //! binding. Calibration of the logits is the caller's policy and is not read
 //! from the checkpoint.
+//!
+//! # CUDA
+//!
+//! A CUDA consumer must build with `SHISO_CUDA_COMPILE=1`; without it every
+//! kernel fails to resolve at runtime and the build only warns. The device
+//! tests in `tests.rs` are backend-neutral, but they have only been run on
+//! Metal: the CUDA backend is untested for this family.
 
 mod config;
 mod forward;
