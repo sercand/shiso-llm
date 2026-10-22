@@ -39,6 +39,8 @@ LAYERS, DIM, HEADS, HIDDEN, VOCAB, POSITIONS, LABELS = 6, 768, 12, 3072, 30522, 
 LN_EPS = 1e-12
 # One copy of the calibration, shared with the goldens script, so the decision
 # comparison in verify mode cannot drift from the reference's decision logic.
+# The script's own directory goes first so this works from any working directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from distilbert_cls_reference import ENERGY_P95, SAFE_THRESHOLD, TEMPERATURE, decide  # noqa: E402
 
 # (module path within a layer, expected `[out, in]` shape) for one encoder layer's linears.

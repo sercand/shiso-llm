@@ -40,7 +40,8 @@ no Python runtime.
 | DistilBERT command classifier | da-command-classifier | safetensors (fp16) |
 
 The DistilBERT command classifier is a library-only family: there is no
-server route, and `shiso_models::distilbert_cls::Classifier` is opened and
+server route and no registry recipe yet. The converted fp16 weights are
+published on Hugging Face as `sercand/da-command-classifier-fp16`, and `shiso_models::distilbert_cls::Classifier` is opened and
 called in process. It labels a shell command `safe`, `needs-approval` or
 `dangerous` from the first 128 tokens of its text and returns raw logits;
 the caller applies its own calibration and decision threshold.
