@@ -1,7 +1,9 @@
 //! Clef: the joint schema head of a decision checkpoint.
 //!
-//! A Clef GGUF is the qwen35 hybrid backbone under the architecture name
-//! `clef`, with a small transformer beside it. The head reads the backbone's
+//! A Clef GGUF is a language-model backbone under the architecture name
+//! `clef`, with a small transformer beside it. [`ClefBackbone`] says which
+//! backbone a file carries: the qwen35 hybrid, or a dense llama stack whose
+//! logits are tied to its embedding. The head reads the backbone's
 //! final normalized row for every prompt token, pools the rows of each
 //! question's wording and of each of its options, lets the options read the
 //! prompt and the questions read each other, and scores every option of every
@@ -96,10 +98,19 @@ struct Joint {
     ffn: Ffn,
 }
 
+/// The output embedding's tensor, when the file has one of its own.
+const OUTPUT: &str = "output.weight";
+
+/// The input embedding, which is also the output embedding of a backbone whose
+/// logits are tied to it.
+const TOKEN_EMBD: &str = "token_embd.weight";
+
 /// Rows of the output embedding, read on the host by token id.
 #[derive(Debug)]
 struct Lexicon {
     file: Arc<GgufFile>,
+    /// [`OUTPUT`], or [`TOKEN_EMBD`] for a tied backbone.
+    tensor: &'static str,
     dtype: DType,
     width: usize,
     vocab: usize,
@@ -117,8 +128,8 @@ impl Lexicon {
         }
         let data = self
             .file
-            .get("output.weight")
-            .ok_or_else(|| invalid("output.weight is missing"))?
+            .get(self.tensor)
+            .ok_or_else(|| invalid(format!("{} is missing", self.tensor)))?
             .data;
         host::dequant_row(data, self.dtype, self.width, index)
     }
@@ -187,6 +198,70 @@ pub fn is_clef(path: &Path) -> bool {
                     .map(|arch| arch == ARCH)
             })
             .unwrap_or(false)
+}
+
+/// The backbone a Clef GGUF carries under the head.
+///
+/// The architecture name is `clef` for every backbone, so the name cannot say
+/// which stack to build. The tensors can: the qwen35 hybrid has recurrent
+/// (`ssm_*`) slots and per-head query norms on its attention slots, and the
+/// dense llama stack has neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClefBackbone {
+    /// The qwen35 hybrid: gated delta-rule slots and normalized attention.
+    Qwen35,
+    /// A dense llama stack: attention slots that rotate without a norm.
+    Llama,
+}
+
+impl ClefBackbone {
+    /// Which backbone the Clef GGUF `file` carries.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownArch`] when the file is not a Clef GGUF, and
+    /// [`CoreError::Unsupported`] when its block tensors are neither stack's.
+    pub fn of(file: &GgufFile) -> CoreResult<Self> {
+        let arch = file.metadata().architecture().unwrap_or_default();
+        if arch != ARCH {
+            return Err(CoreError::UnknownArch {
+                model_type: arch.to_owned(),
+            });
+        }
+        let blocks = || {
+            file.tensors()
+                .iter()
+                .map(|t| t.name.as_ref())
+                .filter(|name: &&str| name.starts_with("blk."))
+        };
+        if blocks().any(|name| name.contains(".ssm_") || name.ends_with(".attn_q_norm.weight")) {
+            return Ok(Self::Qwen35);
+        }
+        if file.find("blk.0.attn_q.weight").is_some() {
+            return Ok(Self::Llama);
+        }
+        Err(CoreError::Unsupported {
+            what: "a clef backbone with neither recurrent slots nor a plain attention block 0",
+            backend: "clef",
+        })
+    }
+
+    /// Which backbone the Clef GGUF at `path` carries, or `None` when the path
+    /// is not a Clef GGUF at all.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::of`], for a file that declares [`ARCH`]; and
+    /// [`CoreError::Backend`] when a file that does cannot be opened.
+    // `Ok(None)`: the path is not a GGUF that declares `clef`, which is every
+    // other checkpoint, and the caller's answer to it is "not mine".
+    pub fn at(path: &Path) -> CoreResult<Option<Self>> {
+        if !is_clef(path) {
+            return Ok(None);
+        }
+        let file = GgufFile::open_shared(path).map_err(|e| invalid(e.to_string()))?;
+        Self::of(&file).map(Some)
+    }
 }
 
 impl ClefHead {
@@ -325,19 +400,28 @@ impl ClefHead {
             .collect::<CoreResult<Vec<_>>>()?;
 
         let scales = host_values("decision.scales", 3)?;
+        // The option words are read out of the output embedding. A backbone
+        // whose logits are tied to its input embedding ships no output tensor,
+        // and its input embedding is that matrix.
+        let tensor = if file.find(OUTPUT).is_some() {
+            OUTPUT
+        } else {
+            TOKEN_EMBD
+        };
         let out = file
-            .find("output.weight")
-            .ok_or_else(|| invalid("output.weight is missing"))?;
+            .find(tensor)
+            .ok_or_else(|| invalid(format!("neither {OUTPUT} nor {TOKEN_EMBD} is present")))?;
         let dims = out.shape.dims();
         let lexicon = Lexicon {
             file: Arc::clone(&file),
+            tensor,
             dtype: out.dtype,
-            width: usize::try_from(dims[0]).unwrap_or(0),
-            vocab: usize::try_from(dims[1]).unwrap_or(0),
+            width: usize::try_from(dims.first().copied().unwrap_or(0)).unwrap_or(0),
+            vocab: usize::try_from(dims.get(1).copied().unwrap_or(0)).unwrap_or(0),
         };
         if lexicon.width != hidden {
             return Err(invalid(format!(
-                "output.weight rows are {} wide, not the backbone's {hidden}",
+                "{tensor} rows are {} wide, not the backbone's {hidden}",
                 lexicon.width
             )));
         }

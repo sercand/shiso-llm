@@ -184,6 +184,17 @@ impl Qwen35Model {
         opts: EngineOptions,
         head: Option<&MtpManifest>,
     ) -> CoreResult<Self> {
+        // Every Clef GGUF declares the same architecture whatever backbone it
+        // carries, so the name cannot say whether this stack is the right one.
+        // The tensors can, and a dense backbone is refused here by name rather
+        // than by the first recurrent tensor the binding fails to find.
+        let clef = crate::clef::ClefBackbone::at(path)?;
+        if clef.is_some_and(|backbone| backbone != crate::clef::ClefBackbone::Qwen35) {
+            return Err(CoreError::Unsupported {
+                what: "a clef checkpoint whose backbone is not the qwen35 hybrid",
+                backend: "qwen35",
+            });
+        }
         // A `modelopt` export is a third container, with its own reader and
         // its own per-tensor storage schemes; everything after the weights are
         // resident is the same as for the other two.
@@ -211,9 +222,7 @@ impl Qwen35Model {
         let weights = import_weights(backend, &file, &binding, config.shape(), rotation.as_ref())?;
         // A Clef checkpoint is this backbone under its own architecture name,
         // with the schema head the binding never reads beside it.
-        let decision = if shiso_modelfile::source::TensorSource::architecture(&file)
-            == Some(crate::qwen35::binding::CLEF_ARCH)
-        {
+        let decision = if clef.is_some() {
             Some(crate::clef::ClefHead::load(backend, path)?)
         } else {
             None

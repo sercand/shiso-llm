@@ -6,6 +6,7 @@
 //! a [`Block::Audio`] exactly as in a chat turn, so the decode path a chat
 //! request takes is the one an embedding input takes.
 
+use crate::error::ErrorResponse as _;
 use std::sync::Arc;
 
 use axum::Json;

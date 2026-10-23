@@ -25,7 +25,11 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::decision::core::{self, ChoiceOption, ChoiceValue, Kind, RawQuestion, ScoreLevel};
+use shiso_ir::MediaSource;
+use shiso_ir::decision::{Choice, ChoiceValue, Input, Level, Part, Question, QuestionKind};
+use shiso_runtime::decision::core;
+
+use crate::decision::wire_common;
 use crate::error::AppError;
 
 /// How a decision question is answered, as the wire spells the discriminant.
@@ -53,6 +57,18 @@ pub(crate) enum DecisionInput {
     Blocks(Vec<InputBlock>),
 }
 
+impl DecisionInput {
+    /// The input as the typed core reads it.
+    pub(crate) fn into_ir(self) -> Input {
+        match self {
+            Self::Text(text) => Input::Text(text),
+            Self::Blocks(blocks) => {
+                Input::Blocks(blocks.into_iter().map(InputBlock::into_part).collect())
+            }
+        }
+    }
+}
+
 /// One part of a message `content` array.
 #[derive(Debug)]
 pub(crate) enum InputBlock {
@@ -64,6 +80,16 @@ pub(crate) enum InputBlock {
     },
     /// An image and where its bytes come from.
     Image(InputImageSource),
+}
+
+impl InputBlock {
+    /// The part of the typed core's input this block is.
+    pub(crate) fn into_part(self) -> Part {
+        match self {
+            Self::Text { text } => Part::Text(text),
+            Self::Image(source) => Part::Image(source.into_source()),
+        }
+    }
 }
 
 /// Where an input image's bytes come from.
@@ -92,6 +118,17 @@ pub(crate) enum InputImageSource {
         /// The url as the caller spelled it.
         url: String,
     },
+}
+
+impl InputImageSource {
+    /// The picture as the media decoder is handed it: the base64 payload, or
+    /// the address to fetch.
+    pub(crate) fn into_source(self) -> MediaSource {
+        match self {
+            Self::Base64 { data, .. } => MediaSource::Inline(data),
+            Self::Url { url } => MediaSource::Remote(url),
+        }
+    }
 }
 
 /// True when `value` is an array in which *any* element is an object with a
@@ -232,8 +269,8 @@ impl<'de> Deserialize<'de> for ChoiceWire {
 
 impl ChoiceWire {
     /// The option as the core renders and validates it.
-    fn into_option(self) -> ChoiceOption {
-        ChoiceOption {
+    fn into_option(self) -> Choice {
+        Choice {
             value: self.value,
             description: self.description,
         }
@@ -303,8 +340,8 @@ impl<'de> Deserialize<'de> for LevelWire {
 
 impl LevelWire {
     /// The level as the core renders and validates it.
-    fn into_level(self) -> ScoreLevel {
-        ScoreLevel {
+    fn into_level(self) -> Level {
+        Level {
             label: self.label,
             description: self.description,
         }
@@ -385,7 +422,7 @@ impl DecisionsBody {
     /// the input, then each question in request order - its name, its type,
     /// the fields that type does not have, the instructions, the choice or
     /// level list - and last the names, once every question can be named.
-    pub(crate) fn validate(self) -> Result<Vec<RawQuestion>, AppError> {
+    pub(crate) fn validate(self) -> Result<Vec<Question>, AppError> {
         if self
             .prompt_format_version
             .is_some_and(|version| version != 1)
@@ -431,18 +468,20 @@ impl DecisionsBody {
                 ));
             }
             let id = question.name.clone().unwrap_or_default();
-            let kind = match question.kind.as_str() {
+            let (instructions, kind) = match question.kind.as_str() {
                 TYPE_PREDICATE => {
                     refuse_fields_other_than(&id, &question.kind, &question, &[])?;
                     core::check_question_text(&question.instructions, &id, false)?;
-                    Kind::YesNo {
-                        question: question.instructions,
+                    (
+                        question.instructions,
                         // A predicate spells no label wordings: the answer is
                         // the yes probability over the version-1 `yes`/`no`
                         // labels.
-                        yes: None,
-                        no: None,
-                    }
+                        QuestionKind::YesNo {
+                            yes: None,
+                            no: None,
+                        },
+                    )
                 }
                 TYPE_CHOICE => {
                     refuse_fields_other_than(&id, &question.kind, &question, &["choices"])?;
@@ -454,10 +493,7 @@ impl DecisionsBody {
                         .map(ChoiceWire::into_option)
                         .collect::<Vec<_>>();
                     core::check_choice_options(&options, &id, 2)?;
-                    Kind::Choice {
-                        question: question.instructions,
-                        options,
-                    }
+                    (question.instructions, QuestionKind::Choice(options))
                 }
                 TYPE_SCORE => {
                     refuse_fields_other_than(&id, &question.kind, &question, &["levels"])?;
@@ -469,10 +505,7 @@ impl DecisionsBody {
                         .map(LevelWire::into_level)
                         .collect::<Vec<_>>();
                     core::check_score_levels(&levels, &id, 2)?;
-                    Kind::Score {
-                        question: question.instructions,
-                        levels,
-                    }
+                    (question.instructions, QuestionKind::Score(levels))
                 }
                 other => {
                     return Err(AppError::bad_request(
@@ -485,8 +518,9 @@ impl DecisionsBody {
                     ));
                 }
             };
-            questions.push(RawQuestion {
-                id,
+            questions.push(Question {
+                name: id,
+                instructions,
                 kind,
                 // The decisions wire has no noul block: every answer keeps
                 // its kind's own answer shape.
@@ -510,7 +544,7 @@ fn question_name_or_position(id: &str, index: usize) -> String {
 /// Refuses a field the question's type has no place for, projecting this
 /// struct's field list into the shared refusal. The presence table belongs to
 /// the wire struct, so that much stays here; the sentence, the param and the
-/// code are [`core::refuse_fields_other_than`]'s, shared with the other
+/// code are [`wire_common::refuse_fields_other_than`]'s, shared with the other
 /// surface so both refuse the same misplaced field in the same words.
 fn refuse_fields_other_than(
     id: &str,
@@ -518,7 +552,7 @@ fn refuse_fields_other_than(
     question: &QuestionWire,
     allowed: &[&str],
 ) -> Result<(), AppError> {
-    core::refuse_fields_other_than(
+    wire_common::refuse_fields_other_than(
         id,
         kind,
         &[
@@ -757,7 +791,7 @@ mod tests {
     /// Runs a body down the handler's own path: parse as the wire type, then
     /// `validate`. The refusals under test are `validate`'s, so a body that
     /// cannot even parse fails as a bug in the test, not as a pass.
-    fn validated(body: Value) -> Result<Vec<RawQuestion>, AppError> {
+    fn validated(body: Value) -> Result<Vec<Question>, AppError> {
         serde_json::from_value::<DecisionsBody>(body)
             .expect("the body parses: shape refusals are validate's job")
             .validate()
@@ -816,12 +850,10 @@ mod tests {
         }))
         .expect("the official shapes validate");
         assert_eq!(questions.len(), 3);
-        assert_eq!(questions[0].id, "damaged");
+        assert_eq!(questions[0].name, "damaged");
         match &questions[0].kind {
-            Kind::YesNo {
-                question, yes, no, ..
-            } => {
-                assert_eq!(question, "is it damaged");
+            QuestionKind::YesNo { yes, no } => {
+                assert_eq!(questions[0].instructions, "is it damaged");
                 assert!(
                     yes.is_none() && no.is_none(),
                     "a predicate spells no wordings"
@@ -830,7 +862,7 @@ mod tests {
             other => panic!("expected a predicate, got {other:?}"),
         }
         match &questions[1].kind {
-            Kind::Choice { options, .. } => {
+            QuestionKind::Choice(options) => {
                 assert_eq!(options[0].value, ChoiceValue::Str("billing".to_owned()));
                 assert_eq!(options[1].value, ChoiceValue::Bool(true));
                 assert_eq!(options[1].description.as_deref(), Some("urgent"));
@@ -838,7 +870,7 @@ mod tests {
             other => panic!("expected a choice, got {other:?}"),
         }
         match &questions[2].kind {
-            Kind::Score { levels, .. } => {
+            QuestionKind::Score(levels) => {
                 assert_eq!(levels[0].label, "Low");
                 assert_eq!(levels[1].description.as_deref(), Some("blocked"));
             }
@@ -886,7 +918,7 @@ mod tests {
         ]}))
         .expect("unnamed questions validate");
         assert!(
-            questions.iter().all(|question| question.id.is_empty()),
+            questions.iter().all(|question| question.name.is_empty()),
             "{questions:?}"
         );
     }
@@ -977,7 +1009,7 @@ mod tests {
              "choices": ["billing", {"value": false, "description": "not urgent"}]}]}))
         .expect("bare values and objects both parse");
         match &questions[0].kind {
-            Kind::Choice { options, .. } => {
+            QuestionKind::Choice(options) => {
                 assert_eq!(options[0].value, ChoiceValue::Str("billing".to_owned()));
                 assert!(options[0].description.is_none());
                 assert_eq!(options[1].value, ChoiceValue::Bool(false));

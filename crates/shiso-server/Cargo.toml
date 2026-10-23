@@ -17,6 +17,8 @@ shiso-vision = { workspace = true }
 shiso-audio = { workspace = true }
 shiso-parsers = { workspace = true }
 shiso-router = { workspace = true }
+# `clap`: the runtime derives its option parser for us, see `ServeArgs`.
+shiso-runtime = { workspace = true, features = ["clap"] }
 shiso-hub = { workspace = true }
 url = { workspace = true }
 semver = { workspace = true }
@@ -32,41 +34,48 @@ futures = { workspace = true }
 indicatif = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-minijinja = { workspace = true }
-sha2 = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokenizers = { workspace = true }
-aho-corasick = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-http-body = { workspace = true }
 image = { workspace = true }
 tempfile = { workspace = true }
+wiremock = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [features]
 # Backend choice lives here, not on shiso-core. Empty default because Cargo
 # features are target-independent: macOS builds pass --features metal and Linux
 # builds pass --features cuda. Enabling both is a build error rather than a
-# silent precedence rule - see `open_backend`.
+# silent precedence rule - see `shiso_runtime::boot`. Both are forwarded to
+# `shiso-runtime`, which owns the backend choice.
 default = ["decode-ffmpeg"]
-metal = ["dep:shiso-metal"]
-cuda = ["dep:shiso-cuda"]
+metal = ["dep:shiso-metal", "shiso-runtime/metal"]
+cuda = ["dep:shiso-cuda", "shiso-runtime/cuda"]
 # Media decoding. Neither is optional: a build with both off has no decoder on a
-# machine without an OS one, which is none of the supported chains, so lib.rs
-# refuses it. `decode-ffmpeg` adds the ffmpeg subprocess step (still inert until
-# the operator passes --ffmpeg-path); `decode-native` adds the pure-Rust
-# decoders.
-decode-ffmpeg = ["shiso-vision/decode-ffmpeg", "shiso-audio/decode-ffmpeg"]
-decode-native = ["shiso-vision/decode-native", "shiso-audio/decode-native"]
+# machine without an OS one, which is none of the supported chains, so the
+# runtime refuses it (`shiso-runtime`). `decode-ffmpeg` adds the ffmpeg
+# subprocess step (still inert until the operator passes --ffmpeg-path);
+# `decode-native` adds the pure-Rust decoders.
+decode-ffmpeg = [
+    "shiso-runtime/decode-ffmpeg",
+    "shiso-vision/decode-ffmpeg",
+    "shiso-audio/decode-ffmpeg",
+]
+decode-native = [
+    "shiso-runtime/decode-native",
+    "shiso-vision/decode-native",
+    "shiso-audio/decode-native",
+]
 
 [[bin]]
 name = "shiso"

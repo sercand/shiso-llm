@@ -205,6 +205,88 @@ curl http://127.0.0.1:8090/v1/audio/transcriptions \
     -F 'keywords[]=Marigold' -F 'keywords[]=Lighthouse'
 ```
 
+## Library use
+
+`shiso-runtime` is the server's engine without the HTTP layer or the
+command-line parser: scheduler, model loading, tokenizer, media, and typed
+cores for chat, images and decisions. `Runtime` is one handle over them. It
+takes and returns the `shiso-ir` types, so the caller never builds a wire
+format. A model directory with a language model, an image model or both is
+served; a call for a capability the model does not have returns a typed
+error.
+
+```rust,ignore
+use shiso_ir::decision::{
+    Choice, ChoiceValue, Input, Question, QuestionKind, ReadoutState, Request,
+};
+use shiso_runtime::{Runtime, RuntimeOptions, Source};
+
+// Opens the model, pulling it first when it is not installed, and warms it.
+let options = RuntimeOptions { pull_if_missing: true, ..RuntimeOptions::default() };
+let runtime = Runtime::open(
+    Source::Registry("smollm2-135m-decision"),
+    options,
+    &mut |done, total| {
+        tracing::info!(done, total, "pulling");
+        true // return false to cancel the pull
+    },
+)?;
+
+let choice = |v: &str| Choice { value: ChoiceValue::Str(v.into()), description: None };
+let response = runtime.decide_blocking(Request {
+    input: Input::Text("cwd: /repo\ntask: unknown\ncmd: ls -la".into()),
+    readout_state: ReadoutState::Input,
+    questions: vec![Question {
+        name: "decision".into(),
+        instructions: "Is this command safe to run without asking?".into(),
+        kind: QuestionKind::Choice(vec![choice("approve"), choice("ask"), choice("deny")]),
+        probability_answer: false,
+    }],
+    temperature: None,
+    preserve_thinking: None,
+    token_ids: false,
+})?;
+tracing::info!(choice = ?response.answers[0].choice, "decided");
+
+// A chat model is a runtime of its own (a decision model has no chat turn).
+let chat = Runtime::open(Source::Registry("a-chat-model"), RuntimeOptions::default(), &mut |_, _| true)?;
+let request = shiso_ir::Request::new("a-chat-model", vec![shiso_ir::Message::user("hello")]);
+let reply = chat.generate_blocking(request)?; // or `chat.generate(request).await` in async code
+```
+
+A model with a decision readout or head answers every question from one
+prompt; any other chat model scores each question's labels from its
+next-token row, as `/v1/decisions` does.
+
+`Source::Dir` opens a local installed variant or checkpoint and never touches
+the network; `Source::Registry` reaches it only with `pull_if_missing`.
+`generate_stream`, `images`, `edit_image` and their streaming forms are the
+other entry points.
+
+- **Warm-up on open.** `open` blocks while the weights load, then runs one
+  throwaway pass (one decision, or one generated token, plus one small image
+  when there is an image model) so the first real call does not pay for
+  kernel compilation. A failed decision or text pass is `OpenError::WarmUp`;
+  a failed image pass is only logged.
+- **Cache size.** Unlike `shiso serve`, which holds a 131072-token KV pool, a
+  `Runtime` sizes the pool to `2 x ctx x max_num_seqs` tokens unless you set
+  `serve.kv_cache_tokens` or `serve.gpu_memory_utilization` (measured: about
+  0.5 GiB resident for the 135M decision model instead of 2.9 GiB).
+- **Async and blocking.** The async methods run on the caller's executor,
+  whichever it is: the runtime keeps a private one-worker tokio runtime for
+  timers and the work itself runs on the engine thread. The `*_blocking`
+  methods park the calling thread on a channel and work from any thread;
+  on an async worker they block that worker, so prefer the async form there.
+  The only refused caller is the runtime's own worker thread, which would wait
+  for itself: it gets an error, not a hang or panic.
+- **Sharing and dropping.** Methods take `&self`; wrap the `Runtime` in an
+  `Arc` to share it. Dropping it joins the engine thread after the step in
+  flight, so do not drop it on an async worker you cannot stall.
+
+Build with `--features metal` or `--features cuda`. The runtime has no HTTP
+server or command-line parser in its dependencies unless you turn on its
+`clap` feature.
+
 ## Configuration
 
 Run `shiso serve --help` for every option. Each flag also reads a `SHISO_*`

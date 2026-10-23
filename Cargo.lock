@@ -2635,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-audio"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "realfft",
  "serde_json",
@@ -2649,7 +2649,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-bench"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -2668,6 +2668,7 @@ dependencies = [
  "shiso-metal",
  "shiso-modelfile",
  "shiso-models",
+ "shiso-runtime",
  "shiso-server",
  "shiso-vision",
  "thiserror",
@@ -2678,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "half",
  "parking_lot",
@@ -2690,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-cuda"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cudarc",
  "half",
@@ -2714,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-engine"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "half",
@@ -2732,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-hub"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "futures-util",
  "hex",
@@ -2754,7 +2755,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-ir"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "futures",
  "serde_json",
@@ -2763,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-kernels"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "tempfile",
  "toml",
@@ -2771,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-kerneltest"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "half",
@@ -2781,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-kvstore"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "parking_lot",
  "sha1",
@@ -2794,7 +2795,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-media-sys"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "block2",
  "libc",
@@ -2810,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-metal"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "half",
@@ -2828,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-modelfile"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "half",
@@ -2846,7 +2847,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-models"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "half",
@@ -2874,7 +2875,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-parsers"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -2882,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-ple"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "io-uring",
  "libc",
@@ -2898,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-registry"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -2927,7 +2928,7 @@ dependencies = [
 
 [[package]]
 name = "shiso-router"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -2956,20 +2957,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "shiso-server"
-version = "0.2.3"
+name = "shiso-runtime"
+version = "0.2.4"
 dependencies = [
  "aho-corasick",
- "anyhow",
- "axum",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "futures",
- "http-body",
- "hyper",
- "hyper-util",
+ "hex",
+ "http",
  "image",
- "indicatif",
  "minijinja",
  "parking_lot",
  "semver",
@@ -2986,23 +2984,64 @@ dependencies = [
  "shiso-metal",
  "shiso-models",
  "shiso-parsers",
- "shiso-router",
  "shiso-vision",
  "tempfile",
  "thiserror",
  "tokenizers",
  "tokio",
  "tokio-stream",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "shiso-server"
+version = "0.2.4"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "futures",
+ "hex",
+ "hyper",
+ "hyper-util",
+ "image",
+ "indicatif",
+ "parking_lot",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shiso-audio",
+ "shiso-core",
+ "shiso-cuda",
+ "shiso-engine",
+ "shiso-hub",
+ "shiso-ir",
+ "shiso-kvstore",
+ "shiso-metal",
+ "shiso-models",
+ "shiso-parsers",
+ "shiso-router",
+ "shiso-runtime",
+ "shiso-vision",
+ "tempfile",
+ "thiserror",
+ "tokenizers",
+ "tokio",
  "tower",
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
  "url",
+ "wiremock",
 ]
 
 [[package]]
 name = "shiso-vision"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "image",

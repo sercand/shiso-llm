@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256 as Sha256Hasher};
 use tokio::sync::{Semaphore, mpsc};
 use url::Url;
 
-use crate::config::HubConfig;
+use crate::config::{CONNECT_TIMEOUT, HubConfig, READ_TIMEOUT};
 use crate::error::HubError;
 use crate::host::probe_free_disk;
 use crate::progress::ProgressEvent;
@@ -86,6 +86,8 @@ impl Downloader {
             config.registry.url.scheme() == "http" && config.hf_endpoint.scheme() == "http";
         let client = reqwest::Client::builder()
             .tls_built_in_root_certs(!plain_http)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .redirect(redirect_policy)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());

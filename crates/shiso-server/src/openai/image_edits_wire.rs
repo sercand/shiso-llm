@@ -11,7 +11,6 @@ use axum::body::Bytes;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
-use shiso_vision::generator::InputReferenceImage;
 
 use crate::error::AppError;
 use crate::openai::images_wire::ImageGenerationRequest;
@@ -31,7 +30,7 @@ pub struct EditRequest {
     /// The generation-shaped fields.
     pub request: ImageGenerationRequest,
     /// The reference pictures, in the order the caller sent them.
-    pub references: Vec<InputReferenceImage>,
+    pub references: Vec<Vec<u8>>,
 }
 
 /// The JSON body: the generation fields plus the references.
@@ -138,9 +137,7 @@ impl EditRequest {
                 .image_url
                 .as_deref()
                 .ok_or_else(|| invalid(format!("images[{index}] has no image_url"), "images"))?;
-            references.push(InputReferenceImage {
-                bytes: decode_data_url(url, index)?,
-            });
+            references.push(decode_data_url(url, index)?);
         }
         Ok(Self {
             request: parsed.request,
@@ -160,9 +157,7 @@ impl EditRequest {
         let mut text = std::collections::HashMap::new();
         for field in fields {
             match field.name.as_str() {
-                "image" | "image[]" => references.push(InputReferenceImage {
-                    bytes: field.bytes.to_vec(),
-                }),
+                "image" | "image[]" => references.push(field.bytes.to_vec()),
                 "mask" => return Err(mask_refused()),
                 _ => {
                     let value = String::from_utf8(field.bytes.to_vec()).map_err(|_| {
@@ -207,5 +202,85 @@ impl EditRequest {
             request,
             references,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Bytes;
+    use base64::Engine as _;
+    use shiso_ir::image::{Edit, Generate};
+
+    use super::{EditRequest, Field};
+
+    fn field(name: &str, bytes: &[u8]) -> Field {
+        Field {
+            name: name.to_owned(),
+            bytes: Bytes::copy_from_slice(bytes),
+        }
+    }
+
+    fn ir(request: &EditRequest) -> Edit {
+        Edit {
+            generate: request.request.to_ir(),
+            references: request.references.clone(),
+        }
+    }
+
+    fn expected(prompt: &str, size: Option<&str>, references: Vec<Vec<u8>>) -> Edit {
+        Edit {
+            generate: Generate {
+                prompt: prompt.to_owned(),
+                n: None,
+                size: size.map(str::to_owned),
+                aspect_ratio: None,
+                steps: None,
+                seed: None,
+                output_format: None,
+                output_compression: None,
+            },
+            references,
+        }
+    }
+
+    /// A form and a JSON body that say the same thing become the same IR.
+    #[test]
+    fn both_body_shapes_become_the_same_ir_edit() {
+        let from_form = EditRequest::from_fields(vec![
+            field("image", &[1, 2]),
+            field("image[]", &[3]),
+            field("prompt", b"make it blue"),
+            field("size", b"512x512"),
+        ])
+        .expect("form parses");
+        let url = |bytes: &[u8]| {
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        };
+        let body = serde_json::json!({
+            "prompt": "make it blue",
+            "size": "512x512",
+            "images": [{"image_url": url(&[1, 2])}, {"image_url": url(&[3])}],
+        });
+        let from_json = EditRequest::from_json(body.to_string().as_bytes()).expect("json parses");
+        let want = expected("make it blue", Some("512x512"), vec![vec![1, 2], vec![3]]);
+        assert_eq!(ir(&from_form), want);
+        assert_eq!(ir(&from_json), want);
+    }
+
+    #[test]
+    fn a_form_number_travels_to_the_ir_typed() {
+        let request = EditRequest::from_fields(vec![
+            field("image", &[1]),
+            field("prompt", b"p"),
+            field("seed", b"5"),
+            field("steps", b"7"),
+        ])
+        .expect("parses");
+        let edit = ir(&request);
+        assert_eq!(edit.generate.seed, Some(5));
+        assert_eq!(edit.generate.steps, Some(7));
     }
 }

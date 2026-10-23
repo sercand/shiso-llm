@@ -547,3 +547,19 @@ fn every_type_an_adapter_has_to_build_can_be_built_from_outside_this_crate() {
     };
     assert_eq!(sampling.top_p, None);
 }
+
+#[test]
+fn image_usage_totals_saturate() {
+    use crate::image::Usage;
+    let usage = Usage {
+        prompt_tokens: 3,
+        completion_tokens: 4,
+    };
+    assert_eq!(usage.total_tokens(), 7);
+    let huge = Usage {
+        prompt_tokens: u32::MAX,
+        completion_tokens: 1,
+    };
+    assert_eq!(huge.total_tokens(), u32::MAX);
+    assert_eq!(Usage::default().total_tokens(), 0);
+}
