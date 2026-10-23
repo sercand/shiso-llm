@@ -251,10 +251,10 @@ fn resolve_is_offline_and_none_when_absent() {
     assert_eq!(fx.requests(), 0);
 }
 
-/// A blocking-pool thread is a thread that may block: the pull runs there,
-/// and from an async task it refuses instead of panicking.
+/// A pull runs from a blocking-pool thread, and from an async task, where it
+/// blocks that task's worker and neither panics nor hangs.
 #[test]
-fn pull_runs_on_a_blocking_thread_and_refuses_in_a_task() {
+fn pull_runs_on_a_blocking_thread_and_in_a_task() {
     let fx = Fixture::new(&[]);
     let (config, host) = (fx.config(), metal_host());
     let installed = fx
@@ -268,16 +268,17 @@ fn pull_runs_on_a_blocking_thread_and_refuses_in_a_task() {
     assert_eq!(installed.total_bytes, 3_000_023);
     drop(installed);
 
-    // Installed models return before the guard, so ask for one that is not.
+    // Installed models return before any work, so remove it and pull again.
+    fs::remove_dir_all(fx.home.path().join("models/mini")).unwrap_or_else(|e| panic!("{e}"));
     let (config, host) = (fx.config(), metal_host());
-    let error = fx
+    let again = fx
         .rt
         .block_on(async {
-            tokio::spawn(async move { pull_on(&host, "mini-two", &config, &mut |_, _| true) }).await
+            tokio::spawn(async move { pull_on(&host, "mini", &config, &mut |_, _| true) }).await
         })
         .expect("the task ends")
-        .expect_err("refused in a task");
-    assert!(matches!(error, PullError::Request(_)), "{error:?}");
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(again.total_bytes, 3_000_023);
 }
 
 /// `shiso pull MiNi` was a parse error before the move and still is: only
@@ -524,13 +525,13 @@ fn cancel_works_while_the_index_is_stalled() {
 }
 
 #[test]
-fn calling_inside_an_async_runtime_is_a_request_error() {
+fn calling_inside_a_block_on_main_future_works() {
     let fx = Fixture::new(&[]);
     let config = fx.config();
     let result = fx
         .rt
         .block_on(async { pull_on(&metal_host(), "mini", &config, &mut |_, _| true) });
-    assert!(matches!(result, Err(PullError::Request(_))), "{result:?}");
+    assert!(result.is_ok(), "{:?}", result.err());
 }
 
 #[test]

@@ -96,7 +96,9 @@ fn options(home: &Path, tweak: impl FnOnce(&mut ServeOptions)) -> RuntimeOptions
         home: Some(home.to_owned()),
         pull_if_missing: false,
         serve,
-        explicit: ["ctx", "kv_checkpoints"].into_iter().collect(),
+        explicit: ["ctx", "kv_checkpoints", "max_num_seqs"]
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -225,12 +227,14 @@ fn largest_gap(a: &[Answer], b: &[Answer]) -> f64 {
 /// checkpoint slots, so it reads every question from its first token; `shared`
 /// has the default ones and is asked each case twice. (The head path reads one
 /// prompt for all questions, so there is nothing to resume and no case for it.)
+///
+/// Both run with one sequence slot, so the engine never batches one request's
+/// branches with each other and only resume-versus-whole is measured (batching
+/// alone moves d1-3b by up to 1.7e-4), and they are loaded one after the other,
+/// never together.
 fn resume_parity(name: &str) {
     let Some(home) = home_with(name) else { return };
     let _device = exclusive();
-    let shared = open(name, &home, |_| {});
-    let whole = open(name, &home, |serve| serve.kv_checkpoints = 0);
-    let mut resumed = 0;
     // A short prompt stands below the checkpoint grid, so one long enough to
     // have a prefix worth resuming is added to the shared cases.
     let long = format!(
@@ -253,24 +257,43 @@ fn resume_parity(name: &str) {
             ),
         ],
     ));
-    for (input, questions) in all {
-        let ask = |runtime: &Runtime| {
-            runtime
-                .decide_blocking(request(
-                    &input,
-                    questions
-                        .iter()
-                        .map(|(question, _)| question.clone())
-                        .collect(),
-                ))
-                .expect("decide answers")
-        };
-        let first = ask(&shared);
-        let second = ask(&shared);
-        let read_whole = ask(&whole);
+    let ask = |runtime: &Runtime, input: &str, questions: &[(Question, Value)]| {
+        runtime
+            .decide_blocking(request(
+                input,
+                questions
+                    .iter()
+                    .map(|(question, _)| question.clone())
+                    .collect(),
+            ))
+            .expect("decide answers")
+    };
+
+    let shared = open(name, &home, |serve| serve.max_num_seqs = 1);
+    let resumed_reads: Vec<_> = all
+        .iter()
+        .map(|(input, questions)| {
+            (
+                ask(&shared, input, questions),
+                ask(&shared, input, questions),
+            )
+        })
+        .collect();
+    drop(shared);
+
+    let whole = open(name, &home, |serve| {
+        serve.max_num_seqs = 1;
+        serve.kv_checkpoints = 0;
+    });
+    let mut resumed = 0;
+    for ((input, questions), (first, second)) in all.iter().zip(&resumed_reads) {
+        let read_whole = ask(&whole, input, questions);
         resumed += first.usage.cached_tokens + second.usage.cached_tokens;
-        for (label, answers) in [("first", &first), ("second", &second)] {
+        for (label, answers) in [("first", first), ("second", second)] {
             let gap = largest_gap(&answers.answers, &read_whole.answers);
+            say(&format!(
+                "{name}: {label} read is {gap:e} from a whole read"
+            ));
             assert!(
                 gap < TOLERANCE,
                 "{input:?}: the {label} read of the shared runtime is {gap} from a whole read"

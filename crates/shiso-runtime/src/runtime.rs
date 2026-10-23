@@ -10,20 +10,21 @@
 //! # Which executor
 //!
 //! The async methods run on the caller's executor, whatever it is: a tokio
-//! task, `futures::executor::block_on`, a UI toolkit's. The cores need two
-//! things from tokio that a foreign executor does not provide - a timer for
-//! the admission deadline and a handle for `spawn_blocking` - so the runtime
-//! owns a one-worker tokio runtime whose only job is to be the context each
-//! poll enters. The work itself is on the engine thread and the image worker;
-//! the caller's task only awaits channels, which are executor-neutral.
+//! task, `futures::executor::block_on`, a UI toolkit's. The cores need a tokio
+//! timer for the engine's admission deadline, which a foreign executor does not
+//! provide, so the runtime owns a one-worker tokio runtime that drives timers
+//! and is the context each poll enters. The work itself is on the engine thread
+//! and the image worker; the caller's task only awaits channels, which are
+//! executor-neutral.
 //!
 //! # Blocking
 //!
-//! The `*_blocking` methods park the calling thread. They work from a plain
-//! thread and from a `spawn_blocking` thread; from an async worker they return
-//! an [`AppError`] with code [`BLOCKING_IN_ASYNC`] instead of stalling the
-//! executor. tokio refuses the nested `block_on` with a panic, which is caught
-//! and reported the same way (its message still reaches the panic hook).
+//! The `*_blocking` methods spawn the call onto that private runtime and park
+//! the calling thread on a standard channel until it answers. They never call
+//! `block_on` on the caller's thread, so they cannot panic whatever the caller
+//! is: a plain thread, a `spawn_blocking` thread, or an async worker. On an
+//! async worker they block that worker for the length of the call, as any
+//! blocking I/O does; prefer the async methods there.
 //!
 //! # Sharing and dropping
 //!
@@ -52,9 +53,6 @@ use crate::error::AppError;
 use crate::hub::{self, InstalledModel, PullError};
 use crate::options::{ConfigError, ExplicitlySet, ServeOptions};
 use crate::state::AppState;
-
-/// The [`AppError::code`] of a `*_blocking` call made from an async worker.
-pub const BLOCKING_IN_ASYNC: &str = "blocking_in_async_context";
 
 /// Where a [`Runtime`]'s model comes from.
 #[derive(Debug, Clone, Copy)]
@@ -105,9 +103,6 @@ pub enum OpenError {
     /// The private tokio runtime could not start.
     #[error("could not start the runtime's executor")]
     Executor(#[source] std::io::Error),
-    /// `open` was called from an async task, which it would stall.
-    #[error("Runtime::open blocks; call it from a thread that may block, not from an async task")]
-    BlockingInAsync,
     /// The throwaway pass that warms the device failed.
     #[error("the warm-up pass failed")]
     WarmUp(#[source] AppError),
@@ -198,33 +193,30 @@ impl Runtime {
     /// template, one small step on an image model - so the device's first-use
     /// cost (kernel and buffer set-up, about 1.5 s on Metal) is paid here and
     /// the first real call is as fast as any other. `open` takes that much
-    /// longer. A failed decision or text pass fails the open; a failed image
-    /// pass is logged and ignored, because that request is built from the
-    /// model's own limits and a refusal of it says nothing about the real ones.
+    /// longer. The image pass asks for the smallest picture the model's limits
+    /// allow (the smallest side, at the model's fixed step count or one step).
+    /// A failed decision or text pass fails the open; a failed image pass is
+    /// logged and ignored, because it has only been exercised against mocks.
     ///
     /// `progress(done, total)` reports a pull's bytes; returning `false`
     /// cancels it ([`PullError::Cancelled`]). It is not called for a
     /// [`Source::Dir`] or an installed model.
     ///
-    /// Blocks while the weights load: call it from a thread that may block.
+    /// Blocks while the weights load (and the pull, if any): call it from a
+    /// thread that may block. From an async worker it blocks that worker.
     ///
     /// # Errors
     ///
     /// [`OpenError::Pull`] for a model that is not installed or cannot be
     /// pulled; [`OpenError::Config`] and [`OpenError::Boot`] for settings or
     /// files that will not boot; [`OpenError::NothingLoaded`];
-    /// [`OpenError::BlockingInAsync`]; [`OpenError::WarmUp`].
+    /// [`OpenError::WarmUp`].
     pub fn open(
         source: Source<'_>,
         options: RuntimeOptions,
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Self, OpenError> {
-        // Before any weight moves: loading and then failing the warm-up for
-        // being on the wrong thread would be the expensive place to find out.
         let executor = Executor::start().map_err(OpenError::Executor)?;
-        if try_block_on(&executor.handle, async {}).is_none() {
-            return Err(OpenError::BlockingInAsync);
-        }
         let RuntimeOptions {
             home,
             pull_if_missing,
@@ -239,8 +231,13 @@ impl Runtime {
             Source::Registry(name) => {
                 let home = home.unwrap_or_else(shiso_hub::HubConfig::default_home);
                 let config = hub::config_for_home(&home);
-                // The registry's spelling is lowercase; an embedder need not know that.
-                let name = name.to_lowercase();
+                // The registry's spelling is lowercase and an embedder need not
+                // know that; a string that is a path is left as it is, which is
+                // what `shiso serve` does with it.
+                let name = match hub::classify_model_arg(name) {
+                    hub::ModelArgKind::RegistryRef(reference) => reference.to_lowercase(),
+                    hub::ModelArgKind::Path(_) => name.to_owned(),
+                };
                 match hub::resolve_serve_model(&name, &mut serve, &explicit, &config) {
                     Err(PullError::NotInstalled(_)) if pull_if_missing => {
                         // Held across the second resolve so the variant cannot
@@ -282,6 +279,10 @@ impl Runtime {
     /// A runtime over a state its caller built, with the engine thread that
     /// serves it (joined when the runtime drops), for an embedder or a test
     /// that boots by hand. Nothing is warmed.
+    ///
+    /// Drop closes the queue by dropping the state and then joins `engine`, so
+    /// a caller that keeps its own clone of the engine handle (or of anything
+    /// in the state that holds one) makes the drop wait for it forever.
     ///
     /// # Errors
     ///
@@ -344,20 +345,18 @@ impl Runtime {
     /// for a prompt that leaves no room to answer; otherwise as
     /// [`pipeline::start`] and [`crate::api::blocking::collect_response`].
     pub async fn generate(&self, request: &Request) -> Result<Response, AppError> {
-        within(self.executor.handle.clone(), async {
-            let started = pipeline::start(&self.state, request, PromptField::Messages).await?;
-            crate::api::blocking::collect_response(started.events).await
-        })
-        .await
+        within(self.executor.handle.clone(), chat(&self.state, request)).await
     }
 
-    /// [`Self::generate`], parking the calling thread.
+    /// [`Self::generate`], parking the calling thread (see the
+    /// [module documentation](self#blocking)).
     ///
     /// # Errors
     ///
-    /// As [`Self::generate`], and [`BLOCKING_IN_ASYNC`] from an async worker.
+    /// As [`Self::generate`].
     pub fn generate_blocking(&self, request: &Request) -> Result<Response, AppError> {
-        self.block(self.generate(request))
+        let request = request.clone();
+        self.block(move |state| async move { chat(&state, &request).await })
     }
 
     /// Runs one chat turn, handing each [`StreamEvent`] to `sink` as it
@@ -455,18 +454,23 @@ impl Runtime {
     /// Scores the questions of `request`: one answer per question, each with
     /// its probabilities.
     ///
-    /// Concurrent calls are answered one prompt at a time by the engine, so an
-    /// answer does not depend on who else is asking.
+    /// Concurrent calls may share a batched pass in the engine. On a backend
+    /// that batches in half precision an answer can then differ from the one a
+    /// lone call gets in the low bits (up to about 2e-4 in a probability,
+    /// measured on d1-3b; none on a decision-head model); the chosen option is
+    /// stable.
     ///
     /// # Errors
     ///
-    /// [`AppError::BadRequest`] for a request with no questions or one the
-    /// model cannot be asked, and the errors of [`crate::decision::decide`];
-    /// [`AppError::NoModel`] with no language model.
+    /// [`AppError::BadRequest`] (code `invalid_request`, param `questions`) for
+    /// a request with no questions, or one the model cannot be asked, and the
+    /// errors of [`crate::decision::decide`]; [`AppError::NoModel`] with no
+    /// language model.
     pub async fn decide(
         &self,
         request: shiso_ir::decision::Request,
     ) -> Result<shiso_ir::decision::Response, AppError> {
+        require_questions(&request)?;
         within(
             self.executor.handle.clone(),
             crate::decision::decide(&self.state, request),
@@ -474,25 +478,44 @@ impl Runtime {
         .await
     }
 
-    /// [`Self::decide`], parking the calling thread.
+    /// [`Self::decide`], parking the calling thread (see the
+    /// [module documentation](self#blocking)).
     ///
     /// # Errors
     ///
-    /// As [`Self::decide`], and [`BLOCKING_IN_ASYNC`] from an async worker.
+    /// As [`Self::decide`].
     pub fn decide_blocking(
         &self,
         request: shiso_ir::decision::Request,
     ) -> Result<shiso_ir::decision::Response, AppError> {
-        self.block(self.decide(request))
+        require_questions(&request)?;
+        self.block(move |state| async move { crate::decision::decide(&state, request).await })
     }
 
-    /// Parks the calling thread on `future`, or refuses when that would stall
-    /// an async worker.
-    fn block<T>(&self, future: impl Future<Output = Result<T, AppError>>) -> Result<T, AppError> {
-        try_block_on(&self.executor.handle, future).unwrap_or_else(|| Err(blocking_in_async()))
+    /// Runs the call `make` builds on the private runtime and parks the calling
+    /// thread on a channel until it answers. Nothing here calls `block_on`, so
+    /// no caller can make it panic; the task owns what it needs, which is why
+    /// `make` is handed the state.
+    fn block<T, F>(&self, make: impl FnOnce(Arc<AppState>) -> F) -> Result<T, AppError>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, AppError>> + Send + 'static,
+    {
+        let (answer, answered) = std::sync::mpsc::channel();
+        let call = make(Arc::clone(&self.state));
+        self.executor.handle.spawn(async move {
+            let _ = answer.send(call.await);
+        });
+        // A closed channel is a task that never answered: it panicked, or the
+        // executor stopped.
+        answered.recv().unwrap_or_else(|_| {
+            Err(AppError::internal(
+                "the runtime's executor ended the call without an answer",
+                std::io::Error::other("the call's task was dropped"),
+            ))
+        })
     }
 
-    /// The throwaway pass that warms the device failed.
     /// The throwaway pass [`Self::open`] documents.
     fn warm_up(&self) -> Result<(), OpenError> {
         let state = &*self.state;
@@ -505,18 +528,22 @@ impl Runtime {
             self.generate_blocking(&request)
                 .map_err(OpenError::WarmUp)?;
         }
-        if state.image.is_some() {
+        if let Some(image) = state.image.as_ref() {
+            let limits = image.limits();
+            let side = limits.min_side.div_ceil(limits.size_multiple) * limits.size_multiple;
             let request = Generate {
                 prompt: "warm-up".to_owned(),
                 n: Some(1),
-                size: Some("256x256".to_owned()),
+                size: Some(format!("{side}x{side}")),
                 aspect_ratio: None,
-                steps: Some(1),
+                steps: Some(limits.fixed_steps.unwrap_or(1)),
                 seed: Some(0),
                 output_format: None,
                 output_compression: None,
             };
-            if let Err(error) = self.block(self.images(request)) {
+            if let Err(error) = self
+                .block(move |state| async move { crate::image::generate(&state, request).await })
+            {
                 tracing::warn!(%error, "the image warm-up pass failed; the first image will be slower");
             }
         }
@@ -524,36 +551,23 @@ impl Runtime {
     }
 }
 
-/// Runs `future` to completion on `handle` from the calling thread, or `None`
-/// when that thread is driving async tasks.
-///
-/// There is no way to ask that question: a blocking-pool thread holds the
-/// runtime's handle and has a task id, yet may block, while a `block_on` main
-/// future is no task and may not. Tokio refuses the nested `block_on` by
-/// panicking before it polls anything, which this turns into the `None` it
-/// means. Only that refusal is caught; any other panic goes on.
-fn try_block_on<F: Future>(handle: &Handle, future: F) -> Option<F::Output> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.block_on(future)))
-        .map_err(|payload| {
-            let nested = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .is_some_and(|message| message.contains("within a runtime"));
-            if !nested {
-                std::panic::resume_unwind(payload);
-            }
-        })
-        .ok()
+/// One chat turn over `state`, folded into its response.
+async fn chat(state: &AppState, request: &Request) -> Result<Response, AppError> {
+    let started = pipeline::start(state, request, PromptField::Messages).await?;
+    crate::api::blocking::collect_response(started.events).await
 }
 
-/// The error of a blocking call made where it would stall an executor.
-fn blocking_in_async() -> AppError {
-    AppError::bad_request(
-        "this call blocks; call it from a plain thread or a spawn_blocking thread, or use the async method",
-        None,
-        BLOCKING_IN_ASYNC,
-    )
+/// A decision request with no questions asks nothing; refused here rather than
+/// in the shared core, whose answer on the wire routes stays as it was.
+fn require_questions(request: &shiso_ir::decision::Request) -> Result<(), AppError> {
+    if request.questions.is_empty() {
+        return Err(AppError::bad_request(
+            "a decision request needs at least one question",
+            Some("questions"),
+            "invalid_request",
+        ));
+    }
+    Ok(())
 }
 
 /// The smallest valid decision request: the warm-up pass.

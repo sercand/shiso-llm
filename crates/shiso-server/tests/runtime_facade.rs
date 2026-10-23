@@ -17,7 +17,6 @@ use serde_json::{Value, json};
 use shiso_ir::decision::{Choice, ChoiceValue, Input, Question, QuestionKind, ReadoutState};
 use shiso_ir::image::{Generate, Step};
 use shiso_ir::{Message, Request, StreamEvent};
-use shiso_runtime::runtime::BLOCKING_IN_ASYNC;
 use shiso_runtime::{OpenError, Runtime, RuntimeOptions, Source};
 use shiso_server::error::AppError;
 use shiso_server::image::{ImageService, ImageServiceDesc};
@@ -199,10 +198,6 @@ fn row() -> Vec<f32> {
     row
 }
 
-fn code(error: &AppError) -> &'static str {
-    error.code()
-}
-
 #[test]
 fn a_runtime_is_send_and_sync() {
     fn check<T: Send + Sync>() {}
@@ -277,12 +272,19 @@ fn a_request_with_no_questions_is_refused() {
     let runtime = scored(vec![row()]);
     let mut request = pick_one();
     request.questions.clear();
-    let error = runtime.decide_blocking(request).expect_err("no questions");
-    assert!(
-        matches!(&error, AppError::BadRequest { .. })
-            && error.to_string().contains("at least one question"),
-        "{error:?}"
+    let refused = |error: AppError| {
+        assert!(
+            matches!(&error, AppError::BadRequest { param: Some(param), code: "invalid_request", .. } if param == "questions")
+                && error.to_string().contains("at least one question"),
+            "{error:?}"
+        );
+    };
+    refused(
+        runtime
+            .decide_blocking(request.clone())
+            .expect_err("no questions"),
     );
+    refused(futures::executor::block_on(runtime.decide(request)).expect_err("no questions"));
 }
 
 /// The async methods work under an executor that is not tokio's, and the
@@ -333,43 +335,110 @@ fn generate_answers_blocking_async_and_streamed() {
     assert_eq!(seen, 1);
 }
 
-/// A call from an async worker must neither stall the executor nor panic out
-/// of it; from a blocking-pool thread or a plain thread it must work.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_blocking_call_in_an_async_task_is_an_error() {
-    let runtime = Arc::new(image_runtime());
+/// Runs `work` on a thread of its own and fails the test if it does not finish
+/// in [`GUARD`]: a hang is a failure, not a stuck suite.
+fn within_guard<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(work());
+    });
+    finished
+        .recv_timeout(GUARD)
+        .expect("the call finished without panicking or hanging")
+}
 
-    let in_task = {
-        let runtime = Arc::clone(&runtime);
-        tokio::spawn(async move { runtime.decide_blocking(pick_one()) })
-            .await
-            .expect("the task does not panic")
-    };
-    assert_eq!(code(&in_task.expect_err("refused")), BLOCKING_IN_ASYNC);
+fn said(response: &shiso_ir::Response) -> String {
+    response.message.text()
+}
 
-    // The test body itself is a `block_on` main future, not a task.
-    let in_main = runtime.decide_blocking(pick_one());
-    assert_eq!(code(&in_main.expect_err("refused")), BLOCKING_IN_ASYNC);
+/// A blocking call answers from every kind of caller: a plain thread, a
+/// blocking-pool thread, a task and a `block_on` main future, on a
+/// multi-thread runtime. From an async worker it blocks that worker only.
+#[test]
+fn a_blocking_call_answers_from_every_caller_on_a_multi_thread_runtime() {
+    within_guard(|| {
+        let runtime = Arc::new(scripted(vec![10, 11, 12]));
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        tokio_runtime.block_on(async {
+            let in_task = {
+                let runtime = Arc::clone(&runtime);
+                tokio::spawn(async move { runtime.generate_blocking(&chat()) })
+                    .await
+                    .expect("the task does not panic")
+            };
+            assert_eq!(said(&in_task.expect("answers in a task")), "w10 w11 w12");
 
-    // Both of the others reach the model check, which is the answer here.
-    let in_pool = {
-        let runtime = Arc::clone(&runtime);
-        tokio::task::spawn_blocking(move || runtime.decide_blocking(pick_one()))
-            .await
-            .expect("the blocking task does not panic")
-    };
-    assert!(matches!(in_pool, Err(AppError::NoModel)), "{in_pool:?}");
+            let in_main = runtime.generate_blocking(&chat());
+            assert_eq!(said(&in_main.expect("answers in main")), "w10 w11 w12");
 
-    let in_thread = {
-        let runtime = Arc::clone(&runtime);
-        std::thread::spawn(move || runtime.decide_blocking(pick_one()))
-            .join()
-            .expect("the thread does not panic")
-    };
-    assert!(matches!(in_thread, Err(AppError::NoModel)), "{in_thread:?}");
-    // Dropping joins no thread here (an image runtime has no engine thread),
-    // but it must still be legal on an async worker.
-    drop(runtime);
+            let in_pool = {
+                let runtime = Arc::clone(&runtime);
+                tokio::task::spawn_blocking(move || runtime.generate_blocking(&chat()))
+                    .await
+                    .expect("the blocking task does not panic")
+            };
+            assert_eq!(said(&in_pool.expect("answers in the pool")), "w10 w11 w12");
+        });
+        let in_thread = {
+            let runtime = Arc::clone(&runtime);
+            std::thread::spawn(move || runtime.generate_blocking(&chat()))
+                .join()
+                .expect("the thread does not panic")
+        };
+        assert_eq!(
+            said(&in_thread.expect("answers on a thread")),
+            "w10 w11 w12"
+        );
+        // The last handle goes on a plain thread: it joins the engine.
+        drop(runtime);
+    });
+}
+
+/// The same on a current-thread runtime, where blocking the only thread must
+/// still finish because the call runs on the Runtime's own executor.
+#[test]
+fn a_blocking_call_answers_from_a_current_thread_runtime() {
+    within_guard(|| {
+        let runtime = Arc::new(scripted(vec![10, 11, 12]));
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        tokio_runtime.block_on(async {
+            let in_task = {
+                let runtime = Arc::clone(&runtime);
+                tokio::spawn(async move { runtime.generate_blocking(&chat()) })
+                    .await
+                    .expect("the task does not panic")
+            };
+            assert_eq!(said(&in_task.expect("answers in a task")), "w10 w11 w12");
+            let in_main = runtime.generate_blocking(&chat());
+            assert_eq!(said(&in_main.expect("answers in main")), "w10 w11 w12");
+        });
+        drop(tokio_runtime);
+        drop(runtime);
+    });
+}
+
+/// Capability errors reach a blocking caller in a task as typed errors too.
+#[test]
+fn a_blocking_call_in_a_task_returns_the_capability_error() {
+    within_guard(|| {
+        let runtime = Arc::new(image_runtime());
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
+        let error = tokio_runtime.block_on(async move {
+            tokio::spawn(async move { runtime.generate_blocking(&chat()) })
+                .await
+                .expect("the task does not panic")
+        });
+        assert!(matches!(error, Err(AppError::NoModel)), "{error:?}");
+    });
 }
 
 /// The same runtime answers an async call made from a tokio task: the call
@@ -455,29 +524,30 @@ fn opening_what_is_not_installed_is_a_typed_error() {
     );
 }
 
+/// Opening from a task does not panic or hang; it fails here only because the
+/// directory holds no model.
 #[test]
-fn opening_from_an_async_task_is_refused_before_any_work() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("a runtime");
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let path = dir.path().to_owned();
-    let error = runtime.block_on(async move {
-        tokio::spawn(async move {
-            Runtime::open(
-                Source::Dir(&path),
-                RuntimeOptions::default(),
-                &mut |_, _| true,
-            )
+fn opening_from_an_async_task_proceeds() {
+    let error = within_guard(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().to_owned();
+        runtime.block_on(async move {
+            tokio::spawn(async move {
+                Runtime::open(
+                    Source::Dir(&path),
+                    RuntimeOptions::default(),
+                    &mut |_, _| true,
+                )
+                .err()
+            })
+            .await
+            .expect("no panic")
         })
-        .await
-        .expect("no panic")
     });
-    assert!(
-        matches!(error, Err(OpenError::BlockingInAsync)),
-        "{:?}",
-        error.err()
-    );
+    assert!(matches!(error, Some(OpenError::Boot(_))), "{error:?}");
 }
 
 /// A blocking-pool thread may block, so `open` gets as far as the model home.

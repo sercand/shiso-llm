@@ -1057,22 +1057,14 @@ pub(crate) fn readout_text(
 ///
 /// This is the floor under every surface's own, stricter validation: ids may
 /// be blank (but never repeat), options and levels must be at least one and
-/// within bounds, there must be at least one question, and the temperature
-/// must be positive. Whether the input or a
+/// within bounds, and the temperature must be positive. Whether the input or a
 /// question's wording may be blank is each surface's call, so it is not here.
 ///
 /// # Errors
 ///
 /// The [`AppError::BadRequest`] of the first check that fails, in the order
-/// question count, ids, each question's options or levels, temperature.
+/// ids, each question's options or levels, temperature.
 pub fn validate(request: &DecisionRequest) -> Result<(), AppError> {
-    if request.questions.is_empty() {
-        return Err(AppError::bad_request(
-            "a decision request needs at least one question",
-            Some("questions"),
-            "invalid_request",
-        ));
-    }
     check_ids(&request.questions, true)?;
     for question in &request.questions {
         match &question.kind {
@@ -1922,8 +1914,6 @@ mod tests {
                 .expect_err("the floor must refuse this request")
                 .to_string()
         };
-        let empty = refused(request_of(Vec::new(), None));
-        assert!(empty.contains("at least one question"), "{empty}");
         let duplicate = refused(request_of(vec![yes_no("a"), yes_no("a")], None));
         assert!(duplicate.contains("used by"), "{duplicate}");
         let control = refused(request_of(vec![choice_question("q", &["a\nb"])], None));

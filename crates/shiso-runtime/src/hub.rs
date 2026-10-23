@@ -95,8 +95,8 @@ pub enum PullError {
     /// call resumes them.
     #[error("the download was cancelled")]
     Cancelled,
-    /// The pull cannot run here: the caller is an async task that must not
-    /// block, or the private runtime could not start.
+    /// The pull cannot run: the private runtime could not start, or this
+    /// crate's version is not semver.
     #[error("{0}")]
     Request(String),
     /// Installing or checking the downloaded files failed.
@@ -247,9 +247,9 @@ fn resolve_on(
 /// An installed model is never checked against a newer manifest here; use
 /// [`pull_observed`] with [`PullPolicy::CheckRegistry`] for that.
 ///
-/// This blocks the calling thread on a runtime of its own, so call it from a
-/// thread that may block (a plain thread or a `spawn_blocking` one), not from
-/// an async task, which it refuses with [`PullError::Request`]. `progress`
+/// This blocks the calling thread while a runtime of its own does the work.
+/// From an async task that blocks the task's worker, as any blocking I/O
+/// does; a plain thread or a `spawn_blocking` one is the right place. `progress`
 /// runs on that thread, between the download's steps and about every 200 ms
 /// while nothing arrives, so a slow callback stalls the download and a cancel
 /// is noticed within one tick even when a connection is stalled. `total` is 0
@@ -361,31 +361,19 @@ pub fn pull_observed_on(
             lock,
         });
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // A runtime of its own with a worker to drive its timers and tasks, entered
+    // for the calling thread; the future is polled by a plain executor, which
+    // has no objection to being called from inside a tokio task (it blocks that
+    // worker, as any blocking I/O does).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
         .map_err(|error| PullError::Request(format!("could not start a runtime: {error}")))?;
-    // A blocking-pool thread holds the caller's runtime handle but may block,
-    // so it cannot be told apart from an async task by looking; tokio refuses
-    // a nested `block_on` by panicking before it polls anything, which this
-    // turns into the error it is.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.block_on(drive(config, host, &store, &parsed, observer))
-    }))
-    .unwrap_or_else(|payload| {
-        // Only tokio's own refusal; a panic in the caller's observer goes on.
-        let nested = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .is_some_and(|message| message.contains("within a runtime"));
-        if !nested {
-            std::panic::resume_unwind(payload);
-        }
-        Err(PullError::Request(
-            "pull blocks; call it from a thread that may block, not from an async task".to_owned(),
-        ))
-    });
+    let result = {
+        let _entered = runtime.enter();
+        futures::executor::block_on(drive(config, host, &store, &parsed, observer))
+    };
     // Downloads still in flight after a cancel or an error are dropped here,
     // not awaited: their partial files are what the next call resumes.
     runtime.shutdown_background();

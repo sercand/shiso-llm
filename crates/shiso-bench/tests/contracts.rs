@@ -1165,7 +1165,6 @@ mod runtime_facade {
     use shiso_runtime::boot::EngineThread;
     use shiso_runtime::error::AppError;
     use shiso_runtime::options::{ExplicitlySet, ServeOptions};
-    use shiso_runtime::runtime::BLOCKING_IN_ASYNC;
     use shiso_runtime::state::AppState;
     use shiso_runtime::{OpenError, Runtime, RuntimeOptions, Source};
 
@@ -1187,12 +1186,14 @@ mod runtime_facade {
 
     type OptionsFields = (Option<PathBuf>, bool, ServeOptions, ExplicitlySet);
     fn options_fields(options: RuntimeOptions) -> OptionsFields {
-        (
-            options.home,
-            options.pull_if_missing,
-            options.serve,
-            options.explicit,
-        )
+        // Exhaustive: a field added makes this fail to compile.
+        let RuntimeOptions {
+            home,
+            pull_if_missing,
+            serve,
+            explicit,
+        } = options;
+        (home, pull_if_missing, serve, explicit)
     }
     const _: fn(RuntimeOptions) -> OptionsFields = options_fields;
     const _: fn() -> RuntimeOptions = RuntimeOptions::default;
@@ -1205,8 +1206,7 @@ mod runtime_facade {
             OpenError::Boot(_) => 2,
             OpenError::NothingLoaded => 3,
             OpenError::Executor(_) => 4,
-            OpenError::BlockingInAsync => 5,
-            OpenError::WarmUp(_) => 6,
+            OpenError::WarmUp(_) => 5,
             _ => u8::MAX,
         }
     }
@@ -1230,7 +1230,6 @@ mod runtime_facade {
         &Runtime,
         shiso_ir::decision::Request,
     ) -> Result<shiso_ir::decision::Response, AppError> = Runtime::decide_blocking;
-    const _: &str = BLOCKING_IN_ASYNC;
 
     /// The async calls, named so the compiler checks their signatures and that
     /// every future is `Send`: a caller spawns them on a multi-thread executor.
@@ -1312,6 +1311,19 @@ mod runtime_facade {
     /// One handle serves every thread.
     const fn shared<T: Send + Sync>() {}
     const _: () = shared::<Runtime>();
+
+    /// Not `Clone`: sharing is an `Arc`, and Drop joins the engine thread once,
+    /// when the last owner lets go. If `Runtime` were `Clone`, `Runtime: Clone`
+    /// would make both impls below apply and the inference ambiguous, which
+    /// does not compile.
+    const _: fn() = || {
+        trait AmbiguousIfClone<A> {
+            fn some_item() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
+        let _ = <Runtime as AmbiguousIfClone<_>>::some_item;
+    };
 }
 
 /// The contracts above are checked by the compiler, so this file building at
