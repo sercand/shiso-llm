@@ -932,9 +932,9 @@ fn fill_options_from_variant(
 ) -> Result<(), PullError> {
     // A role is supplied by its own component or by a file another component
     // binds to it; `role_paths` folds both into one answer per flag.
-    let roles = variant
-        .role_paths()
-        .map_err(|error| PullError::Inconsistent(format!("installed recipe: {error}")))?;
+    let roles = variant.role_paths().map_err(|error| {
+        PullError::Inconsistent(format!("installed recipe is inconsistent: {error}"))
+    })?;
     for (role, place) in roles {
         let role_dir = vdir.join(place.dir.as_str());
         let target = match place.file {
