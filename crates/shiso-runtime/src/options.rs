@@ -296,6 +296,16 @@ pub struct ServeOptions {
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_LOG_STATS_INTERVAL"))]
     #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_LOG_STATS_INTERVAL_SECS))]
     pub log_stats_interval: u64,
+    /// Which device to run on: `auto`, or one this build compiled.
+    ///
+    /// `auto` takes the GPU when it opens and the CPU otherwise, logging why
+    /// when it passed over a GPU this build has. Naming a device that is not
+    /// usable is an error rather than a silent run elsewhere.
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_DEVICE", value_enum, default_value_t = crate::device::DeviceChoice::Auto)
+    )]
+    pub device: crate::device::DeviceChoice,
     /// Replay a decode step's launches from a captured device graph.
     ///
     /// On by default, and off is a diagnostic rather than a second way to
@@ -956,6 +966,7 @@ impl Default for ServeOptions {
             kvstore_drain_secs: DEFAULT_KVSTORE_DRAIN_SECS,
             turn_replay_tokens: DEFAULT_TURN_REPLAY_TOKENS,
             log_stats_interval: DEFAULT_LOG_STATS_INTERVAL_SECS,
+            device: crate::device::DeviceChoice::Auto,
             no_decode_graphs: false,
             spec_k: 0,
             spec_lookup: 0,
