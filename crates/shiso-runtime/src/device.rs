@@ -161,8 +161,40 @@ pub(crate) struct OpenedDevice {
     pub kind: DeviceKind,
 }
 
-/// A GPU backend that opened, or the reason it did not.
-type GpuProbe = (GpuState, Option<std::sync::Arc<dyn shiso_core::Backend>>);
+/// What probing the GPU found: the state for [`resolve`], the backend when it
+/// opened, and the typed error when opening it failed (kept so a refused boot
+/// reports the driver's own error rather than its flattened text).
+struct GpuProbe {
+    state: GpuState,
+    backend: Option<std::sync::Arc<dyn shiso_core::Backend>>,
+    open_error: Option<shiso_core::CoreError>,
+}
+
+impl GpuProbe {
+    fn absent(reason: String) -> Self {
+        Self {
+            state: GpuState::Absent(reason),
+            backend: None,
+            open_error: None,
+        }
+    }
+
+    fn failed(error: shiso_core::CoreError) -> Self {
+        Self {
+            state: GpuState::Absent(error.chain().to_string()),
+            backend: None,
+            open_error: Some(error),
+        }
+    }
+
+    fn opened(backend: std::sync::Arc<dyn shiso_core::Backend>) -> Self {
+        Self {
+            state: GpuState::Present,
+            backend: Some(backend),
+            open_error: None,
+        }
+    }
+}
 
 /// Probes and opens the GPU this build was compiled for.
 ///
@@ -180,31 +212,32 @@ fn open_gpu(args: &ServeOptions, purpose: Purpose) -> GpuProbe {
     {
         let _ = (args, purpose);
         if !shiso_metal::metal_available() {
-            return (GpuState::Absent("no Metal device found".to_owned()), None);
+            return GpuProbe::absent("no Metal device found".to_owned());
         }
         match shiso_metal::MetalBackend::new() {
-            Ok(backend) => (GpuState::Present, Some(backend)),
-            Err(error) => (GpuState::Absent(error.chain().to_string()), None),
+            Ok(backend) => GpuProbe::opened(backend),
+            Err(error) => GpuProbe::failed(error),
         }
     }
     #[cfg(feature = "cuda")]
     {
         if !shiso_cuda::driver_library_present() {
-            return (
-                GpuState::Absent("the CUDA driver library (libcuda) was not found".to_owned()),
-                None,
-            );
+            return GpuProbe::absent("the CUDA driver library (libcuda) was not found".to_owned());
         }
         let graphs = purpose == Purpose::Language && !args.no_decode_graphs;
         let options = shiso_cuda::CudaOptions::default().with_decode_graphs(graphs);
         match shiso_cuda::CudaBackend::new(0, options) {
-            Ok(backend) => (GpuState::Present, Some(backend)),
-            Err(error) => (GpuState::Absent(error.chain().to_string()), None),
+            Ok(backend) => GpuProbe::opened(backend),
+            Err(error) => GpuProbe::failed(error),
         }
     }
     #[cfg(not(any(feature = "metal", feature = "cuda")))]
     {
-        (GpuState::NotCompiled, None)
+        GpuProbe {
+            state: GpuState::NotCompiled,
+            backend: None,
+            open_error: None,
+        }
     }
 }
 
@@ -216,6 +249,19 @@ const fn gpu_name() -> &'static str {
         "cuda"
     } else {
         "gpu"
+    }
+}
+
+/// The sentence for a GPU that was found and would not open.
+fn open_context(purpose: Purpose) -> String {
+    if cfg!(feature = "cuda") {
+        match purpose {
+            Purpose::Language => "opening the CUDA device".to_owned(),
+            Purpose::Audio => "opening the CUDA device for the speech models".to_owned(),
+            Purpose::Image => "opening the CUDA device for the image generation model".to_owned(),
+        }
+    } else {
+        "opening the Metal device".to_owned()
     }
 }
 
@@ -238,17 +284,33 @@ pub(crate) fn open_device(
     purpose: Purpose,
 ) -> Result<OpenedDevice, BootError> {
     let want = Want::from(args.device);
-    let (gpu, opened) = if want == Want::Cpu {
-        (GpuState::NotCompiled, None)
+    let probe = if want == Want::Cpu {
+        GpuProbe {
+            state: GpuState::NotCompiled,
+            backend: None,
+            open_error: None,
+        }
     } else {
         open_gpu(args, purpose)
     };
-    let decision = resolve(want, cfg!(feature = "cpu"), gpu).map_err(|error| match error {
-        DeviceError::GpuUnavailable { reason } => refuse!(
-            "the {} device is unavailable for {}: {reason}",
-            gpu_name(),
-            purpose.subject()
-        ),
+    let GpuProbe {
+        state,
+        backend: opened,
+        open_error,
+    } = probe;
+    let decision = resolve(want, cfg!(feature = "cpu"), state).map_err(|error| match error {
+        DeviceError::GpuUnavailable { reason } => match open_error {
+            // The device was there and refused to open: keep the typed error.
+            Some(source) => BootError::Step {
+                context: open_context(purpose),
+                source: Box::new(source),
+            },
+            None => refuse!(
+                "the {} device is unavailable for {}: {reason}",
+                gpu_name(),
+                purpose.subject()
+            ),
+        },
         DeviceError::NoDevice => refuse!("{error}"),
     })?;
     match decision {
@@ -292,28 +354,59 @@ fn open_cpu(_purpose: Purpose) -> Result<OpenedDevice, BootError> {
     Err(refuse!("this build has no CPU backend"))
 }
 
+/// The kernel a CPU run found unported, if `err` is or wraps that refusal.
+///
+/// Checked per link rather than by walking `source` alone: the wrappers on the
+/// boot paths (`BootError::Core`, `EmbedError::Core`, `AudioError::Device`) are
+/// `#[error(transparent)]`, so their `source` skips the `CoreError` they hold.
+fn unported_kernel(err: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    use shiso_core::CoreError;
+    let core = if let Some(core) = err.downcast_ref::<CoreError>() {
+        Some(core)
+    } else if let Some(BootError::Core(core)) = err.downcast_ref::<BootError>() {
+        Some(core)
+    } else if let Some(shiso_models::embedder::EmbedError::Core(core)) =
+        err.downcast_ref::<shiso_models::embedder::EmbedError>()
+    {
+        Some(core)
+    } else if let Some(shiso_models::embedder::EmbedError::Audio(inner)) =
+        err.downcast_ref::<shiso_models::embedder::EmbedError>()
+    {
+        // Transparent as well, so the audio error is not a `source` of it.
+        return unported_kernel(inner);
+    } else if let Some(shiso_audio::AudioError::Device(core)) =
+        err.downcast_ref::<shiso_audio::AudioError>()
+    {
+        Some(core)
+    } else {
+        None
+    };
+    match core {
+        Some(CoreError::Unsupported {
+            what,
+            backend: "cpu",
+        }) => Some(what),
+        _ => None,
+    }
+}
+
 /// Turns a CPU run's "kernel not ported" into the sentence an operator needs.
 ///
 /// The CPU backend ports kernels family by family, so a checkpoint can reach
 /// one that is not there yet. That is a property of the model and the device,
 /// not a fault, and it should end boot saying so rather than as a backend
 /// error title. Errors on any other device pass through untouched.
+///
+/// Covered: the language, embedding and speech paths, whose errors keep the
+/// `CoreError` typed. Not covered: the image path, whose device errors are
+/// strings (`ImageGenError::Backend(String)`), so an unported kernel there
+/// surfaces as the raw "... is not supported by the cpu backend" message.
 pub(crate) fn on_device<T>(kind: DeviceKind, r: Result<T, BootError>) -> Result<T, BootError> {
     let Err(error) = r else { return r };
     if kind == DeviceKind::Cpu {
-        // `BootError::Core` is transparent, so its `source` skips the
-        // `CoreError` it holds; look at it directly before walking the chain.
-        let head: &(dyn std::error::Error + 'static) = match &error {
-            BootError::Core(core) => core,
-            other => other,
-        };
-        let mut cause = Some(head);
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
         while let Some(err) = cause {
-            if let Some(shiso_core::CoreError::Unsupported {
-                what,
-                backend: "cpu",
-            }) = err.downcast_ref::<shiso_core::CoreError>()
-            {
+            if let Some(what) = unported_kernel(err) {
                 return Err(refuse!(
                     "this model is not available on the CPU device ({what} is not ported)"
                 ));
@@ -466,6 +559,49 @@ mod tests {
             text.contains("kernel_y") && text.contains("CPU device"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_unported_kernel_is_found_behind_each_transparent_wrapper() {
+        use crate::boot_error::BootError;
+        use shiso_core::CoreError;
+        let core = || CoreError::Unsupported {
+            what: "kernel_z",
+            backend: "cpu",
+        };
+        let step = |source: Box<dyn std::error::Error + Send + Sync>| BootError::Step {
+            context: "opening".to_owned(),
+            source,
+        };
+        let wrapped = [
+            step(Box::new(shiso_models::embedder::EmbedError::Core(core()))),
+            step(Box::new(shiso_audio::AudioError::Device(core()))),
+            step(Box::new(shiso_models::embedder::EmbedError::Audio(
+                shiso_audio::AudioError::Device(core()),
+            ))),
+        ];
+        for error in wrapped {
+            let text = on_device(DeviceKind::Cpu, Err::<(), _>(error))
+                .expect_err("refused")
+                .to_string();
+            assert!(
+                text.contains("kernel_z") && text.contains("CPU device"),
+                "{text}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn device_cpu_opens_the_cpu_without_probing_a_gpu() {
+        let args = ServeOptions {
+            device: DeviceChoice::Cpu,
+            ..ServeOptions::default()
+        };
+        for purpose in [Purpose::Language, Purpose::Audio, Purpose::Image] {
+            let opened = open_device(&args, purpose).expect("the CPU opens");
+            assert_eq!(opened.kind, DeviceKind::Cpu);
+        }
     }
 
     #[test]

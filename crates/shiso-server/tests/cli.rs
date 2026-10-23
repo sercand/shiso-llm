@@ -807,11 +807,8 @@ fn the_device_flag_lists_this_builds_devices() {
     let error = parse(&["--model", "m.gguf", "--device", "cuda"]).expect_err("cuda is not built");
     assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
     let text = error.to_string();
-    for name in ["metal", "cpu", "auto"] {
-        assert!(text.contains(name), "{text}");
-    }
     assert!(
-        !text.contains("[possible values: auto, metal, cuda"),
+        text.contains("[possible values: auto, metal, cpu]"),
         "{text}"
     );
 }
@@ -821,6 +818,10 @@ fn the_device_flag_lists_this_builds_devices() {
 fn the_device_flag_lists_this_builds_devices() {
     let error = parse(&["--model", "m.gguf", "--device", "metal"]).expect_err("metal is not built");
     assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    assert!(
+        error.to_string().contains("[possible values: auto, cpu]"),
+        "{error}"
+    );
     parse(&["--model", "m.gguf", "--device", "cpu"]).expect("cpu is built");
 }
 
