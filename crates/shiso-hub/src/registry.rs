@@ -121,12 +121,24 @@ impl RegistryClient {
             source: e,
         })?;
 
+        // Parsed before anything is written: an index this client cannot read
+        // must not replace one it can, nor leave an ETag that makes the next
+        // request ask for "not modified" against bytes that were thrown away.
+        let index: Index = match serde_json::from_slice(&index_bytes) {
+            Ok(index) => index,
+            Err(error) => {
+                if let Ok(cached) = Self::read_cached_index(index_path) {
+                    tracing::warn!(%error, "the registry index did not parse; using the cached one");
+                    return Ok(cached);
+                }
+                return Err(error.into());
+            }
+        };
+
         atomic_write(index_path, &index_bytes)?;
         if let Some(etag) = new_etag {
             atomic_write(etag_path, etag.as_bytes())?;
         }
-
-        let index: Index = serde_json::from_slice(&index_bytes)?;
         Ok(index)
     }
 

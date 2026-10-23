@@ -16,6 +16,7 @@ pub mod error;
 pub mod literal;
 mod load;
 pub mod math;
+pub mod pull;
 pub mod schema;
 pub mod score;
 mod worker;
@@ -24,3 +25,4 @@ mod worker;
 mod tests;
 
 pub use decider::{DEFAULT_CTX, Decider, OpenDesc};
+pub use pull::{InstalledModel, ensure_model};

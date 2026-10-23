@@ -2717,15 +2717,23 @@ name = "shiso-decision"
 version = "0.2.3"
 dependencies = [
  "futures",
+ "hex",
+ "semver",
+ "serde_json",
+ "sha2",
  "shiso-core",
  "shiso-cuda",
  "shiso-engine",
+ "shiso-hub",
  "shiso-metal",
  "shiso-models",
  "tempfile",
  "thiserror",
  "tokenizers",
+ "tokio",
  "tracing",
+ "url",
+ "wiremock",
 ]
 
 [[package]]

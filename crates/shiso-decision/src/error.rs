@@ -27,6 +27,17 @@ pub enum DecideError {
     /// was asked.
     #[error("the engine failed: {0}")]
     Engine(String),
+    /// The registry has no model of that name.
+    #[error("no model named '{0}' in the registry")]
+    UnknownModel(String),
+    /// Resolving, downloading or installing a model failed. The message names
+    /// the step; files already downloaded are kept, so a retry resumes.
+    #[error("the model could not be installed: {0}")]
+    Download(String),
+    /// The caller's progress callback asked to stop. Partial downloads are
+    /// kept for the next attempt.
+    #[error("the download was cancelled")]
+    Cancelled,
     /// Reading a model file or a cache failed.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
