@@ -174,7 +174,7 @@ struct GpuProbe {
 // stand in for a GPU).
 impl GpuProbe {
     #[cfg_attr(
-        not(any(feature = "metal", feature = "cuda", test)),
+        not(any(feature = "metal", feature = "cuda", all(test, feature = "cpu"))),
         expect(
             dead_code,
             reason = "a build with no GPU backend never probes one, so nothing constructs a probe result"
@@ -204,7 +204,7 @@ impl GpuProbe {
     }
 
     #[cfg_attr(
-        not(any(feature = "metal", feature = "cuda", test)),
+        not(any(feature = "metal", feature = "cuda", all(test, feature = "cpu"))),
         expect(
             dead_code,
             reason = "a build with no GPU backend never probes one, so nothing constructs a probe result"
