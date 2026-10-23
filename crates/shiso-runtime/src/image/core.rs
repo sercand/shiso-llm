@@ -135,30 +135,44 @@ pub fn validate_edit(request: &Edit) -> Result<(), AppError> {
     validate(&request.generate)
 }
 
-/// Judges a request exactly as [`generate`] and [`edit`] would before they
-/// queue anything, without running it: the IR floor, the size and output
-/// format, the missing-model refusal, and what the loaded model says of the
-/// references (pass an edit's, an empty slice for a generation).
+/// Judges a request exactly as [`generate_stream`] and [`edit_stream`] would
+/// before they queue anything, without running it: the IR floor, the size and
+/// output format, the missing-model refusal, and what the loaded model says of
+/// the references (pass an edit's, an empty slice for a generation).
 ///
-/// For a caller that has to know a request will be accepted before it commits
-/// to anything, as the server does before it spawns a stream. The checks are
-/// the cores' own, so the answer cannot drift; the cost is that an edit's
-/// references are checked twice, which is a copy of their bytes and, when the
-/// request names no size, one decode of the first.
+/// For a caller that must know a streamed request will be accepted before it
+/// commits to anything, as the server does before it spawns the stream's task.
+/// The blocking cores need no such step: they return their refusal directly.
+/// The checks are the cores' own, so the answer cannot drift; the cost is that
+/// an edit's references are checked twice, which is a copy of their bytes and,
+/// when the request names no size, one decode of the first.
 ///
 /// # Errors
 ///
-/// The refusals of [`generate`] that precede the first queue slot.
+/// The refusals of [`generate_stream`] that precede the first queue slot.
 pub fn preflight(
     state: &AppState,
     request: &Generate,
     references: &[Vec<u8>],
 ) -> Result<(), AppError> {
     validate(request)?;
+    prepare(state, request, references_of(references.to_vec()))?;
+    Ok(())
+}
+
+/// The one sequence every core runs after [`validate`]: the plan (size and
+/// format judged against the loaded model's limits, or the published ones when
+/// none is loaded, so a malformed request stays a 400 ahead of the 503), the
+/// service, then the references against the model.
+fn prepare<'a>(
+    state: &'a AppState,
+    request: &Generate,
+    references: Vec<InputReferenceImage>,
+) -> Result<(Plan, &'a ImageService), AppError> {
     let plan = Plan::from_request(request, state.image.as_ref())?;
     let service = state.image()?;
-    plan.with_references(references_of(references.to_vec()), service)?;
-    Ok(())
+    let plan = plan.with_references(references, service)?;
+    Ok((plan, service))
 }
 
 /// Makes the pictures of a text-to-image request, in turn.
@@ -251,9 +265,7 @@ async fn run(
     request: Generate,
     references: Vec<InputReferenceImage>,
 ) -> Result<Images, AppError> {
-    let plan = Plan::from_request(&request, state.image.as_ref())?;
-    let service = state.image()?;
-    let plan = plan.with_references(references, service)?;
+    let (plan, service) = prepare(state, &request, references)?;
     let mut images = Vec::with_capacity(plan.n);
     let mut usage = Usage::default();
     for index in 0..plan.n {
@@ -275,9 +287,7 @@ async fn run_stream(
     references: Vec<InputReferenceImage>,
     mut sink: impl FnMut(Step) -> bool + Send,
 ) -> Result<(), AppError> {
-    let plan = Plan::from_request(&request, state.image.as_ref())?;
-    let service = state.image()?;
-    let plan = plan.with_references(references, service)?;
+    let (plan, service) = prepare(state, &request, references)?;
     let created = crate::ids::unix_timestamp();
     let mut usage = Usage::default();
     // The wire's `partial_image_index` counts across ALL images of one
@@ -528,4 +538,60 @@ impl Plan {
 /// A size refusal, naming the field that carried the value.
 fn size_error(error: &size::SizeError, param: &str) -> AppError {
     AppError::bad_request(error.to_string(), Some(param), "invalid_request")
+}
+
+#[cfg(test)]
+mod tests {
+    use shiso_ir::image::Generate;
+
+    use super::{preflight, validate_edit_shape};
+    use crate::state::AppState;
+
+    #[test]
+    fn an_edit_needs_a_reference_and_one_picture() {
+        let refused = |references: &[Vec<u8>], n| {
+            validate_edit_shape(references, n)
+                .expect_err("refused")
+                .to_string()
+        };
+        assert!(refused(&[], None).contains("at least one reference"));
+        assert!(refused(&[vec![1]], Some(2)).contains("n must be 1 for an edit, got 2"));
+        assert!(validate_edit_shape(&[vec![1]], None).is_ok());
+        assert!(validate_edit_shape(&[vec![1], vec![2]], Some(1)).is_ok());
+    }
+
+    fn generate(steps: Option<u32>, size: Option<&str>) -> Generate {
+        Generate {
+            prompt: "x".to_owned(),
+            n: None,
+            size: size.map(str::to_owned),
+            aspect_ratio: None,
+            steps,
+            seed: None,
+            output_format: None,
+            output_compression: None,
+        }
+    }
+
+    /// With no image model loaded a bad request is still a 400, and a good one
+    /// is the missing-model refusal.
+    #[test]
+    fn preflight_judges_the_request_before_the_missing_model() {
+        let state = AppState::without_language_model();
+        let steps = preflight(&state, &generate(Some(0), None), &[]).expect_err("refused");
+        assert!(
+            steps.to_string().contains("steps must be between"),
+            "{steps}"
+        );
+        let size = preflight(&state, &generate(None, Some("wide")), &[]).expect_err("refused");
+        assert!(
+            matches!(size, crate::error::AppError::BadRequest { .. }),
+            "{size:?}"
+        );
+        let none = preflight(&state, &generate(None, None), &[]).expect_err("no model");
+        assert!(
+            matches!(none, crate::error::AppError::NoImageModel),
+            "{none:?}"
+        );
+    }
 }

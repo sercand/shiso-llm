@@ -85,14 +85,15 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     // server could have run.
     parsed.validate()?;
     let ir = parsed.to_ir();
-    // Every refusal the core would make before it queues anything, ahead of
-    // the stream's task and of the debug lines: the ones that say what the
-    // request named fire only for a request that will run.
-    shiso_runtime::image::preflight(state, &ir, &[])?;
-    note_ignored(state, &parsed);
     if parsed.stream.unwrap_or(false) {
+        // Every refusal the core would make before it queues anything, ahead
+        // of the task and of the debug lines, so a refused request spawns
+        // nothing and the lines fire only for one that will run.
+        shiso_runtime::image::preflight(state, &ir, &[])?;
+        note_ignored(state, &parsed);
         stream(state, Job::Generate(ir)).await
     } else {
+        note_ignored(state, &parsed);
         Ok(buffered(shiso_runtime::image::generate(state, ir).await?))
     }
 }
@@ -110,11 +111,12 @@ pub(crate) async fn run_edit(
         generate: parsed.to_ir(),
         references,
     };
-    shiso_runtime::image::preflight(state, &edit.generate, &edit.references)?;
-    note_ignored(state, &parsed);
     if parsed.stream.unwrap_or(false) {
+        shiso_runtime::image::preflight(state, &edit.generate, &edit.references)?;
+        note_ignored(state, &parsed);
         stream(state, Job::Edit(edit)).await
     } else {
+        note_ignored(state, &parsed);
         Ok(buffered(shiso_runtime::image::edit(state, edit).await?))
     }
 }
