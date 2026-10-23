@@ -25,11 +25,6 @@
 //! A kernel whose groups read what earlier groups wrote declares
 //! [`GroupsDisjoint::No`], and runs serially, committing after each group.
 
-#![expect(
-    dead_code,
-    reason = "`GroupsDisjoint::No` and `Launch::smem_bytes` have no kernel yet; the later kernel tasks (audio) use them, and the unit tests here exercise them meanwhile"
-)]
-
 use std::ops::Range;
 
 use bytemuck::Pod;
@@ -72,6 +67,13 @@ pub(crate) enum GroupsDisjoint {
     /// parallel.
     Yes,
     /// A group may read what an earlier one wrote: run serially, in order.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no ported kernel reads what an earlier group wrote; the serial path is unit-tested and kept for the first that does"
+        )
+    )]
     No,
 }
 
@@ -124,9 +126,6 @@ pub(crate) struct Launch<'a> {
     pub block: Extent3,
     /// The function constants the caller sent, already validated.
     pub consts: &'a [FnConst],
-    /// Dynamic shared memory the caller asked for; a CPU group allocates its
-    /// own scratch, so this is only informational.
-    pub smem_bytes: u32,
     entry: &'static str,
     struct_bytes: Option<&'a [u8]>,
     views: Vec<&'a [u8]>,
@@ -314,10 +313,10 @@ impl<'a> Plan<'a> {
                     continue;
                 }
                 let (a, b) = (self.views[i], self.views[j]);
-                if a.id() == b.id()
-                    && a.offset() < b.offset() + b.len()
-                    && b.offset() < a.offset() + a.len()
-                {
+                // Saturating: a range that runs off the end of u64 overlaps
+                // everything after it, and the bounds check refuses it later.
+                let end = |v: DeviceView<'_>| v.offset().saturating_add(v.len());
+                if a.id() == b.id() && a.offset() < end(b) && b.offset() < end(a) {
                     return Err(CoreError::InvalidValue {
                         key: "kernel output views",
                         value: format!("{}: args {i} and {j} overlap", self.entry),
@@ -339,7 +338,6 @@ impl<'a> Plan<'a> {
             grid: self.args.grid,
             block: self.args.block,
             consts: self.consts,
-            smem_bytes: self.args.smem_bytes,
             entry: self.entry,
             struct_bytes: self.struct_bytes,
             views,
@@ -397,11 +395,20 @@ fn check_consts(
     Ok(())
 }
 
+/// Units in an extent, saturating: three `u32` sides can exceed `u64`, and a
+/// wrapped product would read as a small grid.
+fn volume(extent: Extent3) -> u64 {
+    u64::from(extent.x)
+        .saturating_mul(u64::from(extent.y))
+        .saturating_mul(u64::from(extent.z))
+}
+
 /// How many threads a launch uses: one unless it is big enough and its groups
 /// are independent.
 fn workers(spec: &KernelSpec, grid: Extent3, block: Extent3, threads: usize) -> usize {
-    let groups = grid.volume();
-    let big = groups >= MIN_PARALLEL_GROUPS && groups * block.volume() >= MIN_PARALLEL_THREADS;
+    let groups = volume(grid);
+    let big = groups >= MIN_PARALLEL_GROUPS
+        && groups.saturating_mul(volume(block)) >= MIN_PARALLEL_THREADS;
     if spec.disjoint == GroupsDisjoint::Yes && big {
         usize::try_from(groups)
             .map_or(threads, |g| threads.min(g))
@@ -431,7 +438,7 @@ fn run_range(spec: &KernelSpec, launch: &Launch<'_>, range: Range<u64>) -> CoreR
 
 /// Runs every group on `workers` threads, returning the stages in group order.
 fn run_all(spec: &KernelSpec, launch: &Launch<'_>, workers: usize) -> CoreResult<Vec<Writes>> {
-    let groups = launch.grid.volume();
+    let groups = volume(launch.grid);
     if workers <= 1 {
         return run_range(spec, launch, 0..groups);
     }
@@ -478,7 +485,7 @@ pub(crate) fn execute(
             backend: "cpu",
         })?;
     let plan = Plan::new(spec, kernel, args)?;
-    let groups = args.grid.volume();
+    let groups = volume(args.grid);
     match spec.disjoint {
         GroupsDisjoint::No => {
             for g in 0..groups {

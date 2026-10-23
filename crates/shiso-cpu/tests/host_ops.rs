@@ -172,3 +172,32 @@ fn numerics_id_is_versioned() {
     assert_eq!(backend.numerics_id(), "cpu-v1");
     assert_eq!(backend.backend_name(), "cpu");
 }
+
+#[test]
+fn a_clamp_whose_bounds_do_not_order_is_refused_not_a_panic() {
+    use shiso_core::KernelArg;
+    let backend = backend();
+    let out = alloc(&backend, 16).expect("alloc");
+    let input = alloc(&backend, 16).expect("alloc");
+    // `audio_args_unary`: count, op, a, b. Op 5 is the clamp.
+    for (lo, hi) in [(f32::NAN, 1.0f32), (0.0, f32::NAN), (2.0, 1.0)] {
+        let mut args = Vec::new();
+        args.extend_from_slice(&4u32.to_ne_bytes());
+        args.extend_from_slice(&5u32.to_ne_bytes());
+        args.extend_from_slice(&lo.to_ne_bytes());
+        args.extend_from_slice(&hi.to_ne_bytes());
+        let bound = [
+            KernelArg::Bytes(&args),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(input.view()),
+        ];
+        let launch = LaunchArgs::new(Extent3::linear(1), Extent3::linear(256), &bound);
+        let err = backend
+            .run(KernelRef::new("audio", "kernel_audio_unary_f32"), &launch)
+            .expect_err("bounds that do not order");
+        assert!(
+            matches!(err, CoreError::InvalidValue { .. }),
+            "{lo} {hi}: {err:?}"
+        );
+    }
+}
