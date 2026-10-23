@@ -36,9 +36,6 @@ use crate::layers::ResidualIndex;
 use crate::media_path::SessionKey;
 use crate::mtp::{Rollback, SpecDepth};
 
-/// Bytes cleared per pass when a state buffer is wiped.
-const ZERO_RUN: usize = 1 << 16;
-
 /// One recurrent layer's persistent state.
 ///
 /// Both halves are f32 in the layout the kernels read: the convolution window is
@@ -579,28 +576,19 @@ impl Session {
     }
 }
 
-/// Clears `buffer` in [`ZERO_RUN`]-byte passes.
+/// Clears `buffer` on the device, through the backend's own fill.
 ///
-/// The run is a constant rather than the buffer's length because a session's
-/// recurrent stack is tens of mebibytes, and a copy of that size is not something
-/// to hand a backend as one request.
+/// One request a buffer, and on a device with a fill primitive one launch: a
+/// session is opened for every request, and its recurrent stack, rollback
+/// slabs and rings are a few hundred mebibytes that a run of host copies
+/// cleared 64 KiB at a time - over four thousand blocking round trips, 50 ms
+/// of every request on a GB10 before its prompt pass could start.
 ///
 /// # Errors
 ///
-/// [`CoreError::Backend`] when a pass fails to copy.
+/// Whatever [`Backend::fill_zero`] reports.
 pub(crate) fn clear_range(backend: &Arc<dyn Backend>, buffer: &DeviceBuffer) -> CoreResult<()> {
-    // A `static`, not a `const`: a 64 KiB `const` array is duplicated into every
-    // function that names it, and this one runs inside a loop over buffers.
-    static ZEROS: [u8; ZERO_RUN] = [0; ZERO_RUN];
-    let run = u64::try_from(ZERO_RUN).unwrap_or(u64::MAX);
-    let mut offset = 0;
-    while offset < buffer.len() {
-        let len = buffer.len().saturating_sub(offset).min(run);
-        let width = usize::try_from(len).unwrap_or(ZERO_RUN);
-        backend.copy_h2d(buffer.slice(offset, len)?, &ZEROS[..width])?;
-        offset += len;
-    }
-    Ok(())
+    backend.fill_zero(buffer.view())
 }
 
 impl Session {
