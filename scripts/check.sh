@@ -175,6 +175,10 @@ if want features && [ "$has_server" -eq 1 ]; then
     backend=""
     [ "$macos" -eq 1 ] && backend=",metal"
     cargo check -p shiso-server --locked --features "decode-ffmpeg,decode-native$backend"
+    # The default set carries the cpu device and no GPU backend; opting out of
+    # `cpu` must still build with whichever GPU backend the host has.
+    cargo check -p shiso-server --locked
+    cargo check -p shiso-server --locked --no-default-features --features "decode-ffmpeg$backend"
     cargo check -p shiso-server --locked --no-default-features --features "decode-native$backend"
     # The in-process AV1 decoder aborts the process on a damaged tile until a
     # rav1d release carries the upstream fix, so no shiso-server configuration may
@@ -208,7 +212,14 @@ if want features && [ "$has_runtime" -eq 1 ]; then
     cargo clippy -p shiso-runtime --locked --all-targets "${rt_backend[@]+"${rt_backend[@]}"}" -- -D warnings
     # And with no backend at all, which is what an embedder's `cargo check`
     # sees before it picks one.
+    # `cpu` is a default feature, so it is switched off here to keep this step
+    # backend-free; a decoder feature is still required.
     step "features (runtime without clap or a backend)"
+    cargo clippy -p shiso-runtime --locked --all-targets --no-default-features \
+        --features decode-ffmpeg -- -D warnings
+    # And with only the cpu device, which is what the default build runs on a
+    # host with no GPU feature.
+    step "features (runtime with only cpu)"
     cargo clippy -p shiso-runtime --locked --all-targets -- -D warnings
 fi
 
@@ -230,6 +241,15 @@ if want libcuda && [ "$macos" -eq 1 ] && [ "$has_server" -eq 1 ] && [ "$tested" 
     step "libcuda link check"
     if otool -L target/debug/shiso | grep -q libcuda; then
         echo "FAIL: target/debug/shiso links libcuda" >&2
+        exit 1
+    fi
+fi
+
+# On Linux the default (cpu-only) shiso must not link CUDA either.
+if want libcuda && [ "$macos" -eq 0 ] && [ "$has_server" -eq 1 ] && [ "$tested" -eq 1 ]; then
+    step "libcuda link check (linux)"
+    if ldd target/debug/shiso | grep -Eq 'libcuda|libcudart'; then
+        echo "FAIL: the CPU-only shiso links CUDA" >&2
         exit 1
     fi
 fi

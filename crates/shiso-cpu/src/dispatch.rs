@@ -42,13 +42,16 @@ use shiso_core::{
 use crate::memory::Slabs;
 
 /// A launch with fewer groups than this runs on the caller's thread: spawning
-/// threads costs more than a handful of groups saves. A first guess, re-measured
-/// in Task 12 of the CPU backend plan.
+/// threads costs more than a handful of groups saves. Measured on an Apple M1 Max
+/// (2026-10-23, SmolLM2-135M `Q8_0`): 16 with [`MIN_PARALLEL_THREADS`] 8192 gave
+/// 31.8 decode tok/s and a 4.45 s 417-token prefill; 4 with 1024 gave 28.2 and
+/// 3.38 s; 64 with 65536 gave 28.5 and 15.9 s; never parallel gave 19.9 and
+/// 15.9 s. Spawning is not what bounds decode, so the first guess stays.
 pub(crate) const MIN_PARALLEL_GROUPS: u64 = 16;
 
 /// A launch whose grid volume times block volume is below this runs on the
-/// caller's thread, for the same reason as [`MIN_PARALLEL_GROUPS`]. A first
-/// guess, re-measured in Task 12 of the CPU backend plan.
+/// caller's thread, for the same reason as [`MIN_PARALLEL_GROUPS`]. Measured
+/// together with it, see there.
 pub(crate) const MIN_PARALLEL_THREADS: u64 = 8192;
 
 /// How a kernel uses one of its buffers.

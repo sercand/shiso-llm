@@ -22,6 +22,22 @@
 //! kernels bytes with no alignment promise and tie a buffer's life to the
 //! mapping; the copy costs one pass at load and nothing afterwards.
 //!
+//! # Measured speed
+//!
+//! Apple M1 Max (10 cores), 2026-10-23, `--release`, SmolLM2-135M Clef `Q8_0`
+//! (`target/release/shiso serve --device cpu|metal`, one request at a time,
+//! warm). The 417-token `/v1/systemone` request (the `support` reference case)
+//! and decode tok/s from `/v1/completions` (`max_tokens` 128, greedy, the
+//! server's own `decode_tokens_per_second`):
+//!
+//! | Device | `/v1/systemone`, 417 tokens | Decode |
+//! |---|---|---|
+//! | cpu | 4.45 s | 31.8 tok/s |
+//! | metal | 0.050 s | 287 tok/s |
+//!
+//! The parallel-launch thresholds were swept and left alone; the numbers sit beside them in the `dispatch` module.
+//! The Linux `x86_64` and GB10 figures are not recorded here yet.
+//!
 //! Kernel arguments and the launch-time aliasing model are described in the
 //! `dispatch` module docs.
 

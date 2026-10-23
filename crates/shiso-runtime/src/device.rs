@@ -170,6 +170,14 @@ struct GpuProbe {
     open_error: Option<shiso_core::CoreError>,
 }
 
+// Only `open_gpu`'s metal and cuda arms build these.
+#[cfg_attr(
+    not(any(feature = "metal", feature = "cuda")),
+    expect(
+        dead_code,
+        reason = "a build with no GPU backend never probes one, so nothing constructs a probe result"
+    )
+)]
 impl GpuProbe {
     fn absent(reason: String) -> Self {
         Self {

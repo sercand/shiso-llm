@@ -93,6 +93,23 @@ cargo build --release -p shiso-server --features metal --bin shiso
 SHISO_CUDA_COMPILE=1 cargo build --release -p shiso-server --features cuda --bin shiso
 ```
 
+### Devices
+
+Every build also carries a CPU device (the `cpu` feature, on by default), so
+shiso runs on a host with no GPU, only slower. `--device` (`SHISO_DEVICE`)
+picks where models run:
+
+| Build | `--device` values |
+|---|---|
+| default | `auto`, `cpu` |
+| `--features metal` | `auto`, `metal`, `cpu` |
+| `--features cuda` | `auto`, `cuda`, `cpu` |
+
+`auto` (the default) uses the GPU the build was compiled for and falls back to
+the CPU when it is absent, logging why. Naming a GPU that is absent is an
+error, not a fallback. To drop the CPU device from a build, pass
+`--no-default-features --features decode-ffmpeg` (plus `metal` or `cuda`).
+
 ### Serve a model
 
 Point shiso at a checkpoint and the `config.json` of its Hugging Face release.
