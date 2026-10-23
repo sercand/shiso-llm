@@ -33,7 +33,8 @@ use crate::CudaBackend;
 use crate::device::BufferTable;
 use crate::sys::nvidia;
 use crate::sys::{
-    CuBlas, CuBlasLt, CuStream, DevicePtr, GemmCall, GemmStride, MathType, Op as SysOp, host_error,
+    CuBlas, CuBlasLt, CuStream, DevicePtr, GemmCall, GemmStride, MathType, Op as SysOp, SysError,
+    host_error,
 };
 
 /// Bytes of scratch the heuristic tier is allowed to use.
@@ -436,6 +437,12 @@ impl Blas {
     ///
     /// [`CoreError::Backend`] when the library refuses a handle or the mode.
     pub(crate) fn open(tf32: bool) -> CoreResult<Self> {
+        // The heuristic tier is created lazily on the first multiply, and
+        // cudarc panics there if its library is missing; refuse at open so a
+        // host without it falls back instead of dying mid-serve.
+        if !nvidia::blas_lt_library_present() {
+            return Err(SysError::no_driver("libcublasLt").into());
+        }
         let classic = nvidia::blas_create()?;
         // SAFETY: the handle was just created and has not been destroyed.
         unsafe { nvidia::blas_set_math_mode(classic, tf32) }?;

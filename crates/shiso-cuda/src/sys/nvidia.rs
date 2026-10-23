@@ -117,10 +117,25 @@ fn as_size(op: &'static str, value: u64) -> SysResult<usize> {
 /// cudarc loads libcuda lazily and panics in `cuInit` when it is missing, so
 /// every path to the driver asks this first.
 pub(crate) fn library_present() -> bool {
-    // SAFETY: loading a library runs its initialisers; this is cudarc's
-    // documented presence query and it opens only the driver's own candidate
-    // library names.
+    // SAFETY: the probe walks the same candidate list `culib()` later loads
+    // (so present implies the later load succeeds) and closes the handle at
+    // once; each probe runs the library's initialisers again until `culib()`
+    // caches a handle.
     unsafe { cudarc::driver::sys::is_culib_present() }
+}
+
+/// Whether libcublas can be found; cudarc panics in `cublasCreate_v2` without it.
+pub(crate) fn blas_library_present() -> bool {
+    // SAFETY: as `library_present`: same candidate list `culib()` loads, closed
+    // at once.
+    unsafe { cudarc::cublas::sys::is_culib_present() }
+}
+
+/// Whether libcublasLt can be found; cudarc panics in `cublasLtCreate` without it.
+pub(crate) fn blas_lt_library_present() -> bool {
+    // SAFETY: as `library_present`: same candidate list `culib()` loads, closed
+    // at once.
+    unsafe { cudarc::cublaslt::sys::is_culib_present() }
 }
 
 /// Initialises the driver.
@@ -989,6 +1004,9 @@ pub(crate) unsafe fn graph_launch(exec: CuGraphExec, stream: CuStream) -> SysRes
 ///
 /// [`SysError::Math`] when the library refuses a handle.
 pub(crate) fn blas_create() -> SysResult<CuBlas> {
+    if !blas_library_present() {
+        return Err(SysError::no_driver("libcublas"));
+    }
     let mut handle: blas::cublasHandle_t = std::ptr::null_mut();
     // SAFETY: `handle` is a live local of the type the library writes.
     check_blas("cublasCreate", unsafe {
@@ -1204,6 +1222,9 @@ pub(crate) unsafe fn blas_gemm_strided(
 ///
 /// [`SysError::Math`] when the library refuses a handle.
 pub(crate) fn blas_lt_create() -> SysResult<CuBlasLt> {
+    if !blas_lt_library_present() {
+        return Err(SysError::no_driver("libcublasLt"));
+    }
     let mut handle: lt::cublasLtHandle_t = std::ptr::null_mut();
     // SAFETY: `handle` is a live local of the type the library writes.
     check_lt("cublasLtCreate", unsafe {
