@@ -297,7 +297,7 @@ impl AudioService {
     ///
     /// The decoder's refusal, or [`AudioError::Io`] when the decode task
     /// could not run.
-    pub async fn decode(&self, bytes: axum::body::Bytes) -> Result<Pcm, AudioError> {
+    pub async fn decode(&self, bytes: bytes::Bytes) -> Result<Pcm, AudioError> {
         let limits = self.limits;
         let decode = Arc::clone(&self.decode);
         tokio::task::spawn_blocking(move || shiso_audio::decode_audio(&bytes, &limits, &decode))

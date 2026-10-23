@@ -396,7 +396,7 @@ pub struct EngineHandle {
 
 impl EngineHandle {
     /// Builds a handle over an existing sender.
-    pub(crate) fn new(
+    pub fn new(
         tx: mpsc::Sender<EngineRequest>,
         model_id: Arc<str>,
         ctx: u32,

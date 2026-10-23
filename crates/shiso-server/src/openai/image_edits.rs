@@ -13,6 +13,7 @@
 //! a `mask`, more references than the loaded model takes, and a model that
 //! takes none.
 
+use crate::error::ErrorResponse as _;
 use std::sync::Arc;
 
 use axum::body::Bytes;

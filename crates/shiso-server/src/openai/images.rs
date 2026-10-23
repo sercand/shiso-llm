@@ -35,6 +35,7 @@
 //! first partial is decoded. Past that point a failure arrives as an error
 //! frame, because a stream that has sent its 200 cannot take it back.
 
+use crate::error::ErrorResponse as _;
 use std::sync::Arc;
 
 use axum::Json;

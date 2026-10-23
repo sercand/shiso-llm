@@ -7,6 +7,7 @@
 //! at admission is still answered with a status code - and then forwards the
 //! events as they come.
 
+use crate::error::ErrorResponse as _;
 use std::convert::Infallible;
 use std::sync::Arc;
 

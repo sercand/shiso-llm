@@ -133,6 +133,6 @@ of truth. Every crate sets `[lints] workspace = true`. Do not add crate-level
 - Refuse bad input loudly rather than substituting a default. A zero budget, or
   a speculation depth without a draft head, is an error, not a fallback.
 - Every server knob is a clap flag with a `SHISO_*` env var in
-  `crates/shiso-server/src/cli.rs`. Don't add scattered `std::env::var` reads.
+  `crates/shiso-runtime/src/cli.rs` (`ServeArgs`). Don't add scattered `std::env::var` reads.
 - Don't edit vendored kernels in `kernels/cuda/mmq` and `kernels/cuda/exl3`
   without updating the file's row in that directory's `VENDOR.md`.

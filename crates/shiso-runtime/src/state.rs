@@ -30,7 +30,7 @@ use crate::tokenizer::render_prompt::PromptRenderer;
 /// it would be a handler that can read device-backed state while a forward pass
 /// is writing it. What an operator can be shown without that is where the tier
 /// is, what it was allowed to use, and what the scheduler has done with it -
-/// which is what [`crate::api::misc_handlers::cache_body`] reports.
+/// which is what `api::misc_handlers::cache_body` in `shiso-server` reports.
 #[derive(Debug, Clone)]
 pub struct CheckpointTier {
     /// The directory entries are written to.

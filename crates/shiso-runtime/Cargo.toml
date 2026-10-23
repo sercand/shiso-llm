@@ -1,0 +1,65 @@
+[package]
+name = "shiso-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "shiso: the engine behind the HTTP surface - scheduler, model factory, tokenizer, media and the boot path, with no HTTP framework."
+
+[dependencies]
+shiso-core = { workspace = true }
+shiso-decision = { workspace = true }
+shiso-engine = { workspace = true }
+shiso-ir = { workspace = true }
+shiso-kvstore = { workspace = true }
+shiso-models = { workspace = true }
+shiso-vision = { workspace = true }
+shiso-audio = { workspace = true }
+shiso-parsers = { workspace = true }
+# Declared optional so the `metal` feature below has a dep: target to enable.
+shiso-metal = { workspace = true, optional = true }
+shiso-cuda = { workspace = true, optional = true }
+
+# Temporary: `boot` and `ServeArgs` still speak `anyhow` and clap.
+anyhow = { workspace = true }
+clap = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+minijinja = { workspace = true }
+sha2 = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+aho-corasick = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+# Backend choice lives here, not on shiso-core. Empty default because Cargo
+# features are target-independent: macOS builds pass --features metal and Linux
+# builds pass --features cuda. Enabling both is a build error rather than a
+# silent precedence rule - see `boot::open_backend`. `shiso-server` forwards
+# both under the same names.
+default = ["decode-ffmpeg"]
+metal = ["dep:shiso-metal", "shiso-decision/metal"]
+cuda = ["dep:shiso-cuda", "shiso-decision/cuda"]
+# Media decoding. Neither is optional: a build with both off has no decoder on a
+# machine without an OS one, which is none of the supported chains, so `boot`
+# refuses it. `decode-ffmpeg` adds the ffmpeg subprocess step (still inert until
+# the operator passes --ffmpeg-path); `decode-native` adds the pure-Rust
+# decoders.
+decode-ffmpeg = ["shiso-vision/decode-ffmpeg", "shiso-audio/decode-ffmpeg"]
+decode-native = ["shiso-vision/decode-native", "shiso-audio/decode-native"]
+
+[lints]
+workspace = true

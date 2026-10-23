@@ -346,9 +346,10 @@ async fn queue(
 /// The boundary is deliberately "no room at all" rather than "the prompt is
 /// longer than the context": a prompt that exactly fills the window has nowhere
 /// to put a first token, and answering it with an empty turn is a 200 that says
-/// nothing went wrong. Crate-visible because the decision surface guards its
+/// nothing went wrong. Public because the decision surface guards its
 /// rendered prompts with the same boundary.
-pub(crate) fn remaining_budget(ctx: u32, prompt_tokens: u64) -> Option<u32> {
+#[must_use]
+pub fn remaining_budget(ctx: u32, prompt_tokens: u64) -> Option<u32> {
     let room = u64::from(ctx).checked_sub(prompt_tokens)?;
     let room = u32::try_from(room).unwrap_or(u32::MAX);
     (room > 0).then_some(room)

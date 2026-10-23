@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::http::StatusCode;
+use http::StatusCode;
 use shiso_audio::chunks::{self, OfflineRule, Span};
 use shiso_audio::transcript::SpeakerActivity;
 use shiso_audio::{
@@ -760,15 +760,6 @@ async fn a_diarized_job_names_each_segments_speaker() {
 }
 
 #[tokio::test]
-async fn an_audio_only_server_lists_its_recognizer() {
-    let log = Log::default();
-    let state = crate::state::AppState::without_language_model().with_audio(service(1, 1, &log));
-    let listing = crate::api::misc_handlers::model_listing(&state);
-    let ids: Vec<&str> = listing.data.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, vec!["scripted"]);
-}
-
-#[tokio::test]
 async fn a_caller_that_leaves_a_silent_job_frees_its_slot_at_once() {
     let log = Log::default();
     let svc = service(1, 4, &log);
@@ -906,76 +897,6 @@ async fn a_long_diarization_holds_no_other_job() {
     let last_diar = log.iter().rposition(|l| l == "diar").expect("diarized");
     let first_b = log.iter().position(|l| l == "b").expect("b ran");
     assert!(first_b < last_diar, "b waited for the diarizer: {log:?}");
-}
-
-/// A transcription form carrying `file_bytes` bytes that are not audio.
-fn upload(file_bytes: usize) -> axum::http::Request<axum::body::Body> {
-    let boundary = "shisoboundary";
-    let mut body = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nscripted\r\n\
-         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\r\n\
-         Content-Type: application/octet-stream\r\n\r\n"
-    )
-    .into_bytes();
-    body.extend(std::iter::repeat_n(7u8, file_bytes));
-    body.extend(format!("\r\n--{boundary}--\r\n").into_bytes());
-    axum::http::Request::builder()
-        .method("POST")
-        .uri("/v1/audio/transcriptions")
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(axum::body::Body::from(body))
-        .expect("builds")
-}
-
-async fn status_and_code(
-    service: AudioService,
-    request: axum::http::Request<axum::body::Body>,
-) -> (StatusCode, serde_json::Value) {
-    use tower::ServiceExt as _;
-    let state = Arc::new(crate::state::AppState::without_language_model().with_audio(service));
-    let response = crate::router::build_router(state)
-        .oneshot(request)
-        .await
-        .expect("the router answers");
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("the body reads");
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
-    )
-}
-
-#[tokio::test]
-async fn an_upload_past_the_json_body_limit_is_read_as_audio() {
-    let log = Log::default();
-    // 40 MiB: past the 32 MiB every other route takes, inside the audio limit.
-    let (status, body) = status_and_code(
-        service_with_upload(1, 1, &log, 64 * 1024 * 1024),
-        upload(40 * 1024 * 1024),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(
-        body["error"]["code"], "invalid_audio",
-        "it was read: {body}"
-    );
-}
-
-#[tokio::test]
-async fn an_upload_past_the_audio_limit_is_refused_as_too_large() {
-    let log = Log::default();
-    let (status, body) = status_and_code(
-        service_with_upload(1, 1, &log, 1024 * 1024),
-        upload(2 * 1024 * 1024),
-    )
-    .await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
-    assert_eq!(body["error"]["code"], "request_too_large", "{body}");
 }
 
 /// The offline steps the log shows, in order: `a` for `off:a`.

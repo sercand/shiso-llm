@@ -29,6 +29,7 @@
 //! shape, and every failure on this route — 400 or 422 — should be rendered
 //! by the one renderer.
 
+use crate::error::ErrorResponse as _;
 use std::sync::Arc;
 
 use axum::Json;

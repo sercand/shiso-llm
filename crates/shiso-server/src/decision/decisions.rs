@@ -11,6 +11,7 @@
 //! a typed extractor would answer a malformed body with its own error shape,
 //! and every failure on this route should be rendered by the one renderer.
 
+use crate::error::ErrorResponse as _;
 use std::sync::Arc;
 
 use axum::Json;

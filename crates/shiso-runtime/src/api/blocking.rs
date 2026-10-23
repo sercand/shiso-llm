@@ -182,10 +182,7 @@ mod tests {
         ]))
         .await
         .expect_err("the turn failed");
-        assert_eq!(
-            error.status(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(error.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// A stream that stops without a terminal event has produced half a turn,
@@ -195,9 +192,6 @@ mod tests {
         let error = collect_response(stream(vec![start()]))
             .await
             .expect_err("the turn never completed");
-        assert_eq!(
-            error.status(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(error.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

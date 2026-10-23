@@ -12,6 +12,7 @@ members = [
     "crates/shiso-ir",
     "crates/shiso-vision",
     "crates/shiso-audio",
+    "crates/shiso-runtime",
     "crates/shiso-server",
     "crates/shiso-decision",
     "crates/shiso-bench",
@@ -61,6 +62,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # --- HTTP stack ----------------------------------------------------------
 clap = { version = "4", features = ["derive", "env"] }
 axum = { version = "0.8", features = ["json", "multipart"] }
+http = "1"
 http-body = "1"
 hyper = { version = "1", features = ["server", "http1", "http2", "client"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "http1", "tokio"] }
@@ -191,6 +193,7 @@ shiso-kvstore = { path = "crates/shiso-kvstore" }
 shiso-ir = { path = "crates/shiso-ir" }
 shiso-vision = { path = "crates/shiso-vision", default-features = false }
 shiso-audio = { path = "crates/shiso-audio", default-features = false }
+shiso-runtime = { path = "crates/shiso-runtime", default-features = false }
 shiso-server = { path = "crates/shiso-server" }
 shiso-decision = { path = "crates/shiso-decision" }
 shiso-bench = { path = "crates/shiso-bench" }

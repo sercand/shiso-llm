@@ -2981,6 +2981,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "shiso-runtime"
+version = "0.2.4"
+dependencies = [
+ "aho-corasick",
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "futures",
+ "http",
+ "image",
+ "minijinja",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shiso-audio",
+ "shiso-core",
+ "shiso-cuda",
+ "shiso-decision",
+ "shiso-engine",
+ "shiso-ir",
+ "shiso-kvstore",
+ "shiso-metal",
+ "shiso-models",
+ "shiso-parsers",
+ "shiso-vision",
+ "tempfile",
+ "thiserror",
+ "tokenizers",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "shiso-server"
 version = "0.2.4"
 dependencies = [
@@ -3013,6 +3049,7 @@ dependencies = [
  "shiso-models",
  "shiso-parsers",
  "shiso-router",
+ "shiso-runtime",
  "shiso-vision",
  "tempfile",
  "thiserror",

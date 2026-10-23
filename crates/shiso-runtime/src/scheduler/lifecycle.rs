@@ -2093,8 +2093,25 @@ mod tests {
         assert_eq!(slot.sampling, asked);
     }
 
+    /// The reasoning traces, the prose blocks and the number of tool calls of a
+    /// folded turn, in the order the producer made them.
+    fn turn_parts(response: &shiso_ir::Response) -> (Vec<&str>, Vec<&str>, usize) {
+        use shiso_ir::Block;
+        let (mut reasoning, mut prose, mut calls) = (Vec::new(), Vec::new(), 0);
+        for block in &response.message.content {
+            match block {
+                Block::Thinking(trace) => reasoning.push(trace.text.as_str()),
+                Block::Text(text) => prose.push(text.as_str()),
+                Block::ToolUse(_) => calls += 1,
+                _ => {}
+            }
+        }
+        (reasoning, prose, calls)
+    }
+
     /// A qwen4exp turn of the shape the matrix recorded - a trace, a sentence,
-    /// two calls - run through the slot, the one fold, and every encoder.
+    /// two calls - run through the slot and the one fold; the encoders' view of
+    /// it is `shiso-server/tests/turn_encoders.rs`.
     ///
     /// The framing newlines the template puts around the calls are not content
     /// on any surface, and the trace's tokens are counted as reasoning: the
@@ -2139,40 +2156,13 @@ mod tests {
         assert_eq!(response.stop, StopReason::ToolUse);
         assert_eq!(response.usage.reasoning_tokens, 3);
 
-        let chat = crate::openai::chat_encode::encode_response(
-            &response,
-            &crate::openai::chat_encode::EncodeOptions::default(),
-        );
-        let message = &chat["choices"][0]["message"];
-        assert_eq!(message["content"], "I'll read both.");
-        assert_eq!(message["reasoning_content"], "plan one plan two\n");
-        assert_eq!(message["tool_calls"].as_array().map(Vec::len), Some(2));
-        assert_eq!(
-            chat["usage"]["completion_tokens_details"]["reasoning_tokens"],
-            3
-        );
-
-        let responses = crate::openai::responses_encode::encode_response(
-            &response,
-            &crate::openai::responses_encode::ResponseOptions::default(),
-        );
-        assert_eq!(
-            responses["usage"]["output_tokens_details"]["reasoning_tokens"],
-            3
-        );
-
-        let anthropic = crate::anthropic::messages_encode::encode_response(
-            &response,
-            &crate::anthropic::messages_encode::EncodeOptions::default(),
-        );
-        let texts: Vec<&str> = anthropic["content"]
-            .as_array()
-            .expect("content is a list")
-            .iter()
-            .filter(|block| block["type"] == "text")
-            .filter_map(|block| block["text"].as_str())
-            .collect();
-        assert_eq!(texts, vec!["I'll read both."]);
+        // The wire encodings of this turn (content, reasoning_content, the tool
+        // calls, the reasoning count) are asserted in
+        // `shiso-server/tests/turn_encoders.rs`, which has the encoders.
+        let (reasoning, prose, calls) = turn_parts(&response);
+        assert_eq!(reasoning, ["plan one plan two\n"]);
+        assert_eq!(prose, ["I'll read both."]);
+        assert_eq!(calls, 2);
     }
 
     /// A turn that is only calls has no prose at all, so its content is `null`
@@ -2210,13 +2200,9 @@ mod tests {
             builder.accept(event).expect("the slot's events fold");
         }
         let response = builder.finish().expect("the turn is complete");
-        let chat = crate::openai::chat_encode::encode_response(
-            &response,
-            &crate::openai::chat_encode::EncodeOptions::default(),
-        );
-        let message = &chat["choices"][0]["message"];
-        assert_eq!(message["content"], serde_json::Value::Null);
-        assert_eq!(message["tool_calls"].as_array().map(Vec::len), Some(3));
+        let (_, prose, calls) = turn_parts(&response);
+        assert!(prose.is_empty(), "no prose block at all: {prose:?}");
+        assert_eq!(calls, 3);
         assert_eq!(response.usage.reasoning_tokens, 2);
     }
 
