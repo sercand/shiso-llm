@@ -49,7 +49,9 @@ pub enum Command {
 /// positional model reference.
 ///
 /// Dereferences to the options, so a field or a method of either reads the same
-/// off this.
+/// off this. Never give `ServeArgs` an inherent method or field named like one
+/// on [`ServeOptions`]: it would shadow the options' silently for every caller
+/// that reaches it through the `Deref`.
 #[derive(Debug, clap::Args)]
 pub struct ServeArgs {
     /// The serve options themselves.
@@ -214,6 +216,10 @@ pub fn classify_model_arg(arg: &str) -> ModelArgKind {
 ///
 /// Overwrites a field only when the user did not set it: `matches` is what the
 /// command line parsed, and `None` means nothing was set explicitly.
+///
+/// Tests only: the binary and embedders go through
+/// [`shiso_runtime::hub::resolve_serve_model`] with an [`ExplicitlySet`].
+#[doc(hidden)]
 pub fn apply_recipe_defaults(
     args: &mut ServeOptions,
     matches: Option<&clap::ArgMatches>,
@@ -452,6 +458,25 @@ mod tests {
         let mut options = ServeOptions::default();
         apply_recipe_defaults_unless_set(&mut options, &ExplicitlySet::default(), &recipe());
         assert_eq!(options.ctx, 32768);
+    }
+
+    /// A flag given the very value the built-in default has is still the
+    /// operator's choice: the recipe must not move it.
+    #[test]
+    fn a_flag_equal_to_the_default_still_beats_the_recipe() {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        let ctx = DEFAULT_CTX.to_string();
+        let matches =
+            Cli::command().get_matches_from(["shiso", "serve", "-m", "/m", "--ctx", ctx.as_str()]);
+        let serve = matches.subcommand_matches("serve").expect("serve");
+        let mut args = ServeArgs::from_arg_matches(serve).expect("parses");
+        assert_eq!(args.ctx, DEFAULT_CTX);
+        apply_recipe_defaults(&mut args, Some(serve), &recipe());
+        assert_eq!(
+            args.ctx, DEFAULT_CTX,
+            "an explicit value equal to the default"
+        );
+        assert_eq!(args.max_num_seqs, 64, "the untouched one takes the recipe");
     }
 
     #[test]

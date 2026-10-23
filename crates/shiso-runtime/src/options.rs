@@ -121,17 +121,20 @@ pub struct ServeOptions {
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_BIND", default_value = DEFAULT_BIND))]
     pub bind: String,
     /// Port to listen on.
-    #[cfg_attr(feature = "clap", arg(short = 'p', long, env = "SHISO_PORT", default_value_t = DEFAULT_PORT))]
+    #[cfg_attr(feature = "clap", arg(short = 'p', long, env = "SHISO_PORT"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_PORT))]
     pub port: u16,
     /// Tokens one session may hold, prompt included.
-    #[cfg_attr(feature = "clap", arg(short = 'c', long, env = "SHISO_CTX", default_value_t = DEFAULT_CTX))]
+    #[cfg_attr(feature = "clap", arg(short = 'c', long, env = "SHISO_CTX"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_CTX))]
     pub ctx: u32,
     /// Sequences that may be resident at once.
     ///
     /// Also the sessions whose state a `--gpu-memory-utilization` pool sets
     /// aside before it takes the rest. More than one decode pass carries are
     /// decoded in several passes a step.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_MAX_NUM_SEQS", default_value_t = crate::scheduler::DEFAULT_MAX_NUM_SEQS))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_MAX_NUM_SEQS"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = crate::scheduler::DEFAULT_MAX_NUM_SEQS))]
     pub max_num_seqs: usize,
     /// Writes one GPU-time-per-kernel report per request into this directory,
     /// as `<kind>-<pid>-<id>.json`.
@@ -261,31 +264,37 @@ pub struct ServeOptions {
     /// Checkpoints shorter than this many tokens are neither stored on disk nor
     /// looked up there: below it a file costs more to write and read than the
     /// prefill it saves.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_MIN_TOKENS", default_value_t = DEFAULT_KVSTORE_MIN_TOKENS))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_MIN_TOKENS"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_KVSTORE_MIN_TOKENS))]
     pub kvstore_min_tokens: u32,
     /// Host memory the disk tier's write-behind may hold in copied pages, in
     /// mebibytes.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_STAGING_MB", default_value_t = DEFAULT_KVSTORE_STAGING_MB))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_STAGING_MB"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_KVSTORE_STAGING_MB))]
     pub kvstore_staging_mb: u64,
     /// Checkpoint pages one scheduler tick copies off the device for the disk
     /// writer, in mebibytes: what the write-behind costs a decoding stream per
     /// step.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_PUMP_MB", default_value_t = DEFAULT_KVSTORE_PUMP_MB))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_PUMP_MB"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_KVSTORE_PUMP_MB))]
     pub kvstore_pump_mb: u64,
     /// How long a shutdown waits for queued disk writes before abandoning them,
     /// in seconds. Keep it under the service manager's stop timeout.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_DRAIN_SECS", default_value_t = DEFAULT_KVSTORE_DRAIN_SECS))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_DRAIN_SECS"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_KVSTORE_DRAIN_SECS))]
     pub kvstore_drain_secs: u64,
     /// Ids the server keeps from finished turns, so the next prompt in a
     /// conversation carries the ids the model generated rather than a
     /// re-encoding of their text that can split differently and miss the
     /// prefix cache. Zero keeps none.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_TURN_REPLAY_TOKENS", default_value_t = DEFAULT_TURN_REPLAY_TOKENS))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_TURN_REPLAY_TOKENS"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_TURN_REPLAY_TOKENS))]
     pub turn_replay_tokens: usize,
     /// Seconds between the engine's info lines of prefill and decode rates,
     /// speculation acceptance and cache use, printed while requests run and
     /// once as they finish. Zero turns the line off.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_LOG_STATS_INTERVAL", default_value_t = DEFAULT_LOG_STATS_INTERVAL_SECS))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_LOG_STATS_INTERVAL"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_LOG_STATS_INTERVAL_SECS))]
     pub log_stats_interval: u64,
     /// Replay a decode step's launches from a captured device graph.
     ///
@@ -391,7 +400,8 @@ pub struct ServeOptions {
     /// so the default holds a long agent session's screenshots. It is set aside
     /// before the key/value pool is sized, and only when `--vision` names a
     /// tower.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION_CACHE_MB", default_value_t = DEFAULT_VISION_CACHE_MB))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION_CACHE_MB"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_VISION_CACHE_MB))]
     pub vision_cache_mb: u64,
 
     /// Row-cache budget for the per-layer embedding table, in mebibytes.
@@ -401,7 +411,8 @@ pub struct ServeOptions {
     /// rather than held on the device, and this is what a decode step is allowed
     /// to keep of it between steps. Zero disables the cache, which reads every
     /// row from disk and is the slow, correct answer.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_PLE_CACHE_MB", default_value_t = DEFAULT_PLE_CACHE_MB))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_PLE_CACHE_MB"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_PLE_CACHE_MB))]
     pub ple_cache_mb: u64,
     /// Hold the whole per-layer embedding table in host memory.
     ///
@@ -426,7 +437,11 @@ pub struct ServeOptions {
     /// `--expert-reserve-gb` to spare, and streams them otherwise; the other
     /// two insist, and `resident` on a device that cannot hold them fails at
     /// the first allocation that does not fit.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_EXPERT_RESIDENCY", value_enum, default_value_t = ExpertResidencyChoice::Auto))]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_EXPERT_RESIDENCY", value_enum)
+    )]
+    #[cfg_attr(feature = "clap", arg(default_value_t = ExpertResidencyChoice::Auto))]
     pub expert_residency: ExpertResidencyChoice,
     /// Gibibytes of the device's working set the automatic residency choice
     /// leaves for the cache, the activations and the n-gram rows.
@@ -465,7 +480,8 @@ pub struct ServeOptions {
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION"))]
     pub vision: Option<PathBuf>,
     /// Pixel ceiling one image may occupy after resizing.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION_MAX_PIXELS", default_value_t = DEFAULT_VISION_MAX_PIXELS))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION_MAX_PIXELS"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_VISION_MAX_PIXELS))]
     pub vision_max_pixels: usize,
     /// Allow fetching media named by an http or https address.
     ///
@@ -496,10 +512,12 @@ pub struct ServeOptions {
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_FFMPEG_PATH"))]
     pub ffmpeg_path: Option<PathBuf>,
     /// Frames a second to sample a clip at.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VIDEO_FPS", default_value_t = shiso_vision::DEFAULT_FPS))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VIDEO_FPS"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = shiso_vision::DEFAULT_FPS))]
     pub video_fps: f64,
     /// Frames one clip may contribute.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VIDEO_MAX_FRAMES", default_value_t = shiso_vision::DEFAULT_MAX_FRAMES))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VIDEO_MAX_FRAMES"))]
+    #[cfg_attr(feature = "clap", arg(default_value_t = shiso_vision::DEFAULT_MAX_FRAMES))]
     pub video_max_frames: usize,
     /// Wall-clock budget for one decode, in seconds.
     #[cfg_attr(
@@ -692,7 +710,8 @@ pub struct ServeOptions {
     /// of that step at some cost in fidelity. The job's last two steps must
     /// both run at full size (see `--image-draft-steps`). Unset, every
     /// block of every step runs.
-    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_FINAL_REUSE", value_parser = parse_block_span))]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_FINAL_REUSE"))]
+    #[cfg_attr(feature = "clap", arg(value_parser = parse_block_span))]
     pub image_final_reuse: Option<BlockSpan>,
     /// Which reasoning parser to use on model output.
     #[cfg_attr(feature = "clap", arg(
@@ -899,12 +918,12 @@ impl<S: Into<String>> FromIterator<S> for ExplicitlySet {
     }
 }
 
-const fn nonzero(value: u32) -> NonZeroU32 {
-    match NonZeroU32::new(value) {
-        Some(value) => value,
-        None => NonZeroU32::MIN,
-    }
-}
+/// The built-in audio length cap, in seconds; the `default_value` above.
+const DEFAULT_AUDIO_MAX_SECONDS: NonZeroU32 = NonZeroU32::new(7200).expect("7200 is not zero");
+/// The built-in transcription upload cap, in MiB.
+const DEFAULT_AUDIO_MAX_UPLOAD_MB: NonZeroU32 = NonZeroU32::new(512).expect("512 is not zero");
+/// The built-in image edit body cap, in MiB.
+const DEFAULT_IMAGE_MAX_UPLOAD_MB: NonZeroU32 = NonZeroU32::new(64).expect("64 is not zero");
 
 impl Default for ServeOptions {
     /// The values the command line gives a flag nobody passed.
@@ -962,9 +981,9 @@ impl Default for ServeOptions {
             video_fps: shiso_vision::DEFAULT_FPS,
             video_max_frames: shiso_vision::DEFAULT_MAX_FRAMES,
             video_decode_timeout_s: 20,
-            audio_max_seconds: nonzero(7200),
-            audio_max_upload_mb: nonzero(512),
-            image_max_upload_mb: nonzero(64),
+            audio_max_seconds: DEFAULT_AUDIO_MAX_SECONDS,
+            audio_max_upload_mb: DEFAULT_AUDIO_MAX_UPLOAD_MB,
+            image_max_upload_mb: DEFAULT_IMAGE_MAX_UPLOAD_MB,
             asr_model: None,
             asr_mmproj: None,
             asr_id: None,
@@ -1716,12 +1735,13 @@ mod tests {
             options: ServeOptions,
         }
         // `try_parse_from` reads `SHISO_*`; a developer shell with one set would
-        // make this test about the shell.
-        let parsed = Probe::try_parse_from(["probe"]).expect("an empty command line parses");
+        // make this test about the shell, and could make the parse itself fail,
+        // so look before parsing.
         if std::env::vars().any(|(name, _)| name.starts_with("SHISO_")) {
             eprintln!("SKIP: a SHISO_* variable is set and would override the defaults");
             return;
         }
+        let parsed = Probe::try_parse_from(["probe"]).expect("an empty command line parses");
         assert_eq!(parsed.options, ServeOptions::default());
     }
 

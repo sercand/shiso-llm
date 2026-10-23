@@ -76,10 +76,12 @@ fi
 # can only be named when shiso-server is in the build.
 macos=0
 [ "$(uname -s)" = "Darwin" ] && macos=1
+has_runtime=0
 if [ "$scope_all" = "1" ]; then
     echo "check: scope: whole workspace"
     PKGS=(--workspace)
     has_server=1
+    has_runtime=1
 elif [ -n "$crates" ]; then
     echo "check: scope: changed: $changed"
     echo "check:        checking: $crates"
@@ -88,6 +90,7 @@ elif [ -n "$crates" ]; then
     for c in $crates; do
         PKGS+=(-p "$c")
         [ "$c" = "shiso-server" ] && has_server=1
+        [ "$c" = "shiso-runtime" ] && has_runtime=1
     done
 else
     echo "check: scope: no crate changed; running the tree-wide checks only"
@@ -192,6 +195,17 @@ if want features && [ "$has_server" -eq 1 ]; then
             exit 1
         fi
     done
+fi
+
+# shiso-runtime's `clap` feature is the binary's: embedders build the runtime
+# without it, and every step above unifies it on through shiso-server. Lint the
+# runtime alone so a use of clap that forgot its `cfg` fails here, not in an
+# embedder's build.
+if want features && [ "$has_runtime" -eq 1 ]; then
+    step "features (runtime without clap)"
+    rt_backend=()
+    [ "$macos" -eq 1 ] && rt_backend=(--features metal)
+    cargo clippy -p shiso-runtime --locked --all-targets "${rt_backend[@]+"${rt_backend[@]}"}" -- -D warnings
 fi
 
 # Only the lockfile, the manifests and deny.toml feed this, and it fetches the
