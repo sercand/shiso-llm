@@ -82,6 +82,57 @@ impl Engine for Quick {
     fn close(&mut self) {}
 }
 
+/// An engine that counts the requests it is asked and can fail them.
+struct Counting {
+    calls: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+    fail: bool,
+}
+
+impl Engine for Counting {
+    fn decide(&mut self, _: &DecisionRequest) -> Result<Vec<Answer>, DecideError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            Err(DecideError::Engine("the device fell over".to_owned()))
+        } else {
+            Ok(vec![answer()])
+        }
+    }
+
+    fn close(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+}
+
+/// `open` warms the model with one throwaway pass before it returns, so the
+/// first real call does not pay the device's cold start.
+#[test]
+fn start_runs_one_warm_up_pass_before_returning() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine = Counting {
+        calls: Arc::clone(&calls),
+        closed: Arc::new(AtomicBool::new(false)),
+        fail: false,
+    };
+    let decider = Decider::start(Box::new(engine)).expect("starts");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one warm-up pass");
+    decider.decide_blocking(&request()).expect("answers");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_failed_warm_up_fails_the_open_and_closes_the_engine() {
+    let closed = Arc::new(AtomicBool::new(false));
+    let engine = Counting {
+        calls: Arc::new(AtomicUsize::new(0)),
+        closed: Arc::clone(&closed),
+        fail: true,
+    };
+    let error = Decider::start(Box::new(engine)).expect_err("warm-up fails");
+    assert!(matches!(error, DecideError::Engine(_)), "{error:?}");
+    assert!(closed.load(Ordering::SeqCst), "the engine was not closed");
+}
+
 #[test]
 fn decider_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -256,6 +307,22 @@ fn a_call_after_the_drop_is_an_error() {
     drop(decider);
     let error = handle.decide_blocking(request()).expect_err("dropped");
     assert!(matches!(error, DecideError::Engine(_)), "{error:?}");
+}
+
+#[test]
+fn open_rejects_a_context_too_short_to_hold_a_prompt() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    for ctx in [0, 1] {
+        let desc = OpenDesc {
+            ctx,
+            ..OpenDesc::new(dir.path())
+        };
+        let error = Decider::open(&desc).expect_err("ctx too short");
+        assert!(
+            matches!(&error, DecideError::Request(m) if m.contains("ctx")),
+            "{ctx}: {error:?}"
+        );
+    }
 }
 
 #[test]

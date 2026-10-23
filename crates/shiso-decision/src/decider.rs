@@ -9,7 +9,7 @@ use futures::channel::oneshot;
 
 use crate::error::DecideError;
 use crate::load;
-use crate::schema::{Answer, DecisionRequest};
+use crate::schema::{Answer, Choice, DecisionRequest, Question};
 use crate::worker::{self, Engine, Job, Msg, Shared};
 
 /// The context length [`OpenDesc::new`] asks for: a decision prompt is a state
@@ -40,6 +40,24 @@ impl<'a> OpenDesc<'a> {
     }
 }
 
+/// The throwaway request [`Decider::open`] warms the model with: the smallest
+/// valid question, so the pass costs the device's set-up and little else.
+fn warm_up_request() -> DecisionRequest {
+    let choice = |value: &str| Choice {
+        value: value.to_owned(),
+        description: None,
+    };
+    DecisionRequest {
+        input: "warm-up".to_owned(),
+        questions: vec![Question::Choice {
+            name: "warm_up".to_owned(),
+            instructions: "pick one".to_owned(),
+            choices: vec![choice("a"), choice("b")],
+        }],
+        temperature: None,
+    }
+}
+
 /// A decision model owned by a worker thread of its own.
 ///
 /// Dropping a `Decider` joins its worker, so the drop can block for as long as
@@ -63,18 +81,38 @@ pub struct Decider {
 impl Decider {
     /// Opens the model in `desc` on the device this build was compiled for.
     ///
-    /// Blocks while the weights load.
+    /// Blocks while the weights load, then runs one throwaway pass of a tiny
+    /// fixed prompt through the worker, so the device's first-use cost (kernel
+    /// and buffer set-up, measured at about 1.5 s on Metal) is paid here and
+    /// the first real call is as fast as any other. `open` takes that much
+    /// longer.
     ///
     /// # Errors
     ///
-    /// [`DecideError::Load`] for a directory that is not a loadable decision
+    /// [`DecideError::Request`] for a context under 2 (a prompt and its answer
+    /// row need two positions), [`DecideError::Load`] for a directory that is not a loadable decision
     /// model (including a checkpoint with neither a decision readout nor a
     /// head), [`DecideError::NoDevice`] when this build has no backend feature
     /// or the device would not open, and [`DecideError::Io`] for a file that
-    /// cannot be read.
+    /// cannot be read; the warm-up pass can fail with [`DecideError::Layout`]
+    /// or [`DecideError::Engine`], which then fails the open.
     pub fn open(desc: &OpenDesc<'_>) -> Result<Self, DecideError> {
+        if desc.ctx < 2 {
+            return Err(DecideError::Request(format!(
+                "ctx must be at least 2 (a prompt and its answer row), got {}",
+                desc.ctx
+            )));
+        }
         let engine = load::open(desc)?;
-        Self::spawn(Box::new(engine))
+        Self::start(Box::new(engine))
+    }
+
+    /// Spawns the worker over `engine` and warms it. A failed warm-up drops
+    /// the decider, which stops the worker and closes the engine.
+    pub(crate) fn start(engine: Box<dyn Engine>) -> Result<Self, DecideError> {
+        let decider = Self::spawn(engine)?;
+        decider.decide_blocking(&warm_up_request())?;
+        Ok(decider)
     }
 
     /// Starts the worker thread over `engine`.
