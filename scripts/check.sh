@@ -239,7 +239,17 @@ fi
 # just built shiso-server, so that is when it is read.
 if want libcuda && [ "$macos" -eq 1 ] && [ "$has_server" -eq 1 ] && [ "$tested" -eq 1 ]; then
     step "libcuda link check"
-    if otool -L target/debug/shiso | grep -q libcuda; then
+    # A check that cannot read the binary has checked nothing: fail on a
+    # missing binary or a failing otool rather than letting grep see no input.
+    if [ ! -x target/debug/shiso ]; then
+        echo "FAIL: target/debug/shiso is not an executable; the link check has nothing to read" >&2
+        exit 1
+    fi
+    linked=$(otool -L target/debug/shiso) || {
+        echo "FAIL: otool -L target/debug/shiso failed; the link check cannot run" >&2
+        exit 1
+    }
+    if printf '%s\n' "$linked" | grep -q libcuda; then
         echo "FAIL: target/debug/shiso links libcuda" >&2
         exit 1
     fi
@@ -248,7 +258,17 @@ fi
 # On Linux the default (cpu-only) shiso must not link CUDA either.
 if want libcuda && [ "$macos" -eq 0 ] && [ "$has_server" -eq 1 ] && [ "$tested" -eq 1 ]; then
     step "libcuda link check (linux)"
-    if ldd target/debug/shiso | grep -Eq 'libcuda|libcudart'; then
+    # Same rule as above: ldd's own failure (or a missing binary) is a failed
+    # check, not an empty list with nothing in it to match.
+    if [ ! -x target/debug/shiso ]; then
+        echo "FAIL: target/debug/shiso is not an executable; the link check has nothing to read" >&2
+        exit 1
+    fi
+    linked=$(ldd target/debug/shiso) || {
+        echo "FAIL: ldd target/debug/shiso failed; the link check cannot run" >&2
+        exit 1
+    }
+    if printf '%s\n' "$linked" | grep -Eq 'libcuda|libcudart'; then
         echo "FAIL: the CPU-only shiso links CUDA" >&2
         exit 1
     fi
