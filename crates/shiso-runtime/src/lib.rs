@@ -36,7 +36,10 @@ pub mod options;
 pub mod profile;
 pub mod recipe_defaults;
 pub mod response_store;
+pub mod runtime;
 pub mod scheduler;
 pub mod state;
 pub mod tokenizer;
 pub mod vision;
+
+pub use runtime::{OpenError, Runtime, RuntimeOptions, Source};

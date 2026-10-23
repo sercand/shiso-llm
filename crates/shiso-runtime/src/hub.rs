@@ -20,7 +20,8 @@ use std::time::Duration;
 use shiso_hub::Backend;
 use shiso_hub::{
     BlobStore, Downloader, HostProfile, HubConfig, HubError, InstalledVariantSummary, ModelName,
-    ModelRef, ProgressEvent, Recipe, RegistryClient, Role, Sha256, Variant, select_variant,
+    ModelRef, ProgressEvent, Recipe, RegistryClient, Role, Sha256, Variant, VariantKey,
+    select_variant,
 };
 use tokio::sync::mpsc;
 
@@ -665,7 +666,7 @@ fn already_installed(
     store: &BlobStore,
     host: &HostProfile,
     parsed: &ModelRef,
-) -> Result<Option<(shiso_hub::VariantKey, u64)>, PullError> {
+) -> Result<Option<(VariantKey, u64)>, PullError> {
     Ok(store
         .list_installed()?
         .into_iter()
@@ -688,11 +689,7 @@ fn already_installed(
 
 /// Takes `model:key`'s variant lock shared, waiting for an installer to
 /// finish.
-fn lock_shared(
-    store: &BlobStore,
-    model: &ModelName,
-    key: &shiso_hub::VariantKey,
-) -> Result<File, PullError> {
+fn lock_shared(store: &BlobStore, model: &ModelName, key: &VariantKey) -> Result<File, PullError> {
     let file = store.open_variant_lock(model, key)?;
     file.lock_shared().map_err(|source| PullError::Lock {
         variant: key.to_string(),
@@ -836,21 +833,81 @@ fn resolve_serve_model_on(
         .recipe
         .as_ref()
         .ok_or_else(|| PullError::Inconsistent("installed recipe.json missing".to_owned()))?;
+    let total_bytes = fill_from_recipe(recipe, key, &vdir, options, explicit)?;
+    Ok(Some(InstalledModel {
+        dir: vdir,
+        total_bytes,
+        lock,
+    }))
+}
+
+/// Points `options` at the model in `dir`, for an embedder that has a
+/// directory rather than a registry name.
+///
+/// A directory with a `recipe.json` is an installed variant (its name is the
+/// variant key): its components fill the path options and its recipe fills the
+/// defaults `explicit` leaves alone, exactly as [`resolve_serve_model`] does for
+/// a name. Any other directory (or file) is a checkpoint and becomes
+/// `options.model`, as `shiso serve <path>` takes it. Nothing is locked: a path
+/// is the caller's to keep in place.
+///
+/// # Errors
+///
+/// [`PullError::ComponentFlagConflict`] when a component option is also set for
+/// a variant directory, and [`PullError::Inconsistent`] for a `recipe.json` that
+/// cannot be read as the variant its directory names.
+pub fn resolve_serve_dir(
+    dir: &Path,
+    options: &mut ServeOptions,
+    explicit: &ExplicitlySet,
+) -> Result<(), PullError> {
+    let bytes = match std::fs::read(dir.join("recipe.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            options.model = Some(dir.to_owned());
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(PullError::Inconsistent(format!(
+                "reading {}/recipe.json: {error}",
+                dir.display()
+            )));
+        }
+    };
+    check_component_flag_conflicts(options, &dir.display().to_string())?;
+    let inconsistent = |what: String| PullError::Inconsistent(format!("{}: {what}", dir.display()));
+    let recipe: Recipe = serde_json::from_slice(&bytes)
+        .map_err(|error| inconsistent(format!("recipe.json does not parse: {error}")))?;
+    let key = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| inconsistent("the directory name is not a variant key".to_owned()))
+        .and_then(|name| {
+            VariantKey::parse(name).map_err(|error| inconsistent(error.to_string()))
+        })?;
+    fill_from_recipe(&recipe, &key, dir, options, explicit)?;
+    Ok(())
+}
+
+/// Fills `options` from variant `key` of `recipe` installed at `vdir`, and
+/// returns the variant's size in bytes.
+fn fill_from_recipe(
+    recipe: &Recipe,
+    key: &VariantKey,
+    vdir: &Path,
+    options: &mut ServeOptions,
+    explicit: &ExplicitlySet,
+) -> Result<u64, PullError> {
     let variant = recipe
         .variants
         .iter()
         .find(|v| &v.key == key)
         .ok_or_else(|| PullError::Inconsistent("variant not in recipe".to_owned()))?;
-
-    fill_options_from_variant(options, &vdir, variant, &recipe.name)?;
+    fill_options_from_variant(options, vdir, variant, &recipe.name)?;
     if let Some(defaults) = &variant.server_defaults {
         apply_recipe_defaults_unless_set(options, explicit, defaults);
     }
-    Ok(Some(InstalledModel {
-        dir: vdir,
-        total_bytes: variant_bytes(variant),
-        lock,
-    }))
+    Ok(variant_bytes(variant))
 }
 
 fn check_component_flag_conflicts(options: &ServeOptions, ref_str: &str) -> Result<(), PullError> {

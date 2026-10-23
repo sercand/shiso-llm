@@ -701,6 +701,54 @@ fn serve_resolution_refuses_conflicts_and_missing_models() {
     );
 }
 
+/// A directory with a recipe is an installed variant: the same options as
+/// the name gives, with the recipe defaults held back by `explicit`.
+#[test]
+fn a_variant_directory_resolves_as_its_name_does() {
+    let fx = Fixture::new(&[]);
+    install(&fx);
+    let vdir = fx.home.path().join("models/mini/q8_0");
+    let mut by_name = ServeOptions::default();
+    resolve_serve_model_on(
+        &metal_host(),
+        "mini",
+        &mut by_name,
+        &ExplicitlySet::default(),
+        &fx.config(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut by_dir = ServeOptions::default();
+    resolve_serve_dir(&vdir, &mut by_dir, &ExplicitlySet::default())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(by_dir, by_name);
+
+    let mut kept = ServeOptions {
+        ctx: 2048,
+        ..ServeOptions::default()
+    };
+    let explicit: ExplicitlySet = ["ctx"].into_iter().collect();
+    resolve_serve_dir(&vdir, &mut kept, &explicit).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(kept.ctx, 2048, "an explicit setting beats the recipe");
+}
+
+/// A directory with no recipe is a checkpoint, taken as `serve <path>` takes
+/// it; a recipe that does not parse is refused, not guessed around.
+#[test]
+fn a_directory_without_a_recipe_is_a_checkpoint() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let mut options = ServeOptions::default();
+    resolve_serve_dir(dir.path(), &mut options, &ExplicitlySet::default())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(options.model, Some(dir.path().to_owned()));
+
+    let broken = dir.path().join("q8_0");
+    fs::create_dir(&broken).unwrap_or_else(|e| panic!("{e}"));
+    fs::write(broken.join("recipe.json"), b"{").unwrap_or_else(|e| panic!("{e}"));
+    let error = resolve_serve_dir(&broken, &mut options, &ExplicitlySet::default())
+        .expect_err("a recipe that does not parse");
+    assert!(matches!(error, PullError::Inconsistent(_)), "{error:?}");
+}
+
 #[test]
 fn a_path_is_taken_as_the_model_without_a_lock() {
     let fx = Fixture::new(&[]);

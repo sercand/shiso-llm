@@ -1154,6 +1154,166 @@ mod decision {
     const _: Encode = shiso_runtime::decision::literal::encode_with_literals;
 }
 
+/// The in-process facade: the open path, the three capabilities, and the rules
+/// that make one handle safe to share.
+mod runtime_facade {
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
+
+    use shiso_ir::image::{Edit, Generate, Images, Step};
+    use shiso_ir::{Request, Response, StreamEvent};
+    use shiso_runtime::boot::EngineThread;
+    use shiso_runtime::error::AppError;
+    use shiso_runtime::options::{ExplicitlySet, ServeOptions};
+    use shiso_runtime::runtime::BLOCKING_IN_ASYNC;
+    use shiso_runtime::state::AppState;
+    use shiso_runtime::{OpenError, Runtime, RuntimeOptions, Source};
+
+    /// Where a model comes from. Exhaustive: a source added makes this
+    /// non-exhaustive.
+    fn source_shapes(source: Source<'_>) -> u8 {
+        match source {
+            Source::Registry(name) => {
+                let _: &str = name;
+                0
+            }
+            Source::Dir(dir) => {
+                let _: &Path = dir;
+                1
+            }
+        }
+    }
+    const _: fn(Source<'_>) -> u8 = source_shapes;
+
+    type OptionsFields = (Option<PathBuf>, bool, ServeOptions, ExplicitlySet);
+    fn options_fields(options: RuntimeOptions) -> OptionsFields {
+        (
+            options.home,
+            options.pull_if_missing,
+            options.serve,
+            options.explicit,
+        )
+    }
+    const _: fn(RuntimeOptions) -> OptionsFields = options_fields;
+    const _: fn() -> RuntimeOptions = RuntimeOptions::default;
+
+    /// What an open can fail with.
+    fn open_error_variants(error: &OpenError) -> u8 {
+        match error {
+            OpenError::Pull(_) => 0,
+            OpenError::Config(_) => 1,
+            OpenError::Boot(_) => 2,
+            OpenError::NothingLoaded => 3,
+            OpenError::Executor(_) => 4,
+            OpenError::BlockingInAsync => 5,
+            OpenError::WarmUp(_) => 6,
+            _ => u8::MAX,
+        }
+    }
+    const _: fn(&OpenError) -> u8 = open_error_variants;
+
+    /// The open path, blocking, with a pull's progress callback.
+    type Open = for<'a, 'b> fn(
+        Source<'a>,
+        RuntimeOptions,
+        &'b mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<Runtime, OpenError>;
+    const _: Open = Runtime::open;
+    const _: fn(AppState, Option<EngineThread>) -> Result<Runtime, OpenError> = Runtime::from_state;
+    const _: fn(&Runtime) -> bool = Runtime::has_language_model;
+    const _: fn(&Runtime) -> bool = Runtime::has_image_model;
+
+    /// The blocking calls.
+    const _: for<'a> fn(&'a Runtime, &'a Request) -> Result<Response, AppError> =
+        Runtime::generate_blocking;
+    const _: fn(
+        &Runtime,
+        shiso_ir::decision::Request,
+    ) -> Result<shiso_ir::decision::Response, AppError> = Runtime::decide_blocking;
+    const _: &str = BLOCKING_IN_ASYNC;
+
+    /// The async calls, named so the compiler checks their signatures and that
+    /// every future is `Send`: a caller spawns them on a multi-thread executor.
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signatures"
+    )]
+    fn generate_future<'a>(
+        runtime: &'a Runtime,
+        request: &'a Request,
+    ) -> impl Future<Output = Result<Response, AppError>> + Send + 'a {
+        runtime.generate(request)
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn generate_stream_future<'a>(
+        runtime: &'a Runtime,
+        request: &'a Request,
+    ) -> impl Future<Output = Result<(), AppError>> + Send + 'a {
+        runtime.generate_stream(request, |_: StreamEvent| true)
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn images_future(runtime: &Runtime) -> impl Future<Output = Result<Images, AppError>> + Send {
+        runtime.images(blank_generate())
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn images_stream_future(
+        runtime: &Runtime,
+    ) -> impl Future<Output = Result<(), AppError>> + Send {
+        runtime.images_stream(blank_generate(), |_: Step| true)
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn edit_image_future(
+        runtime: &Runtime,
+    ) -> impl Future<Output = Result<Images, AppError>> + Send {
+        runtime.edit_image(blank_edit())
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn edit_image_stream_future(
+        runtime: &Runtime,
+    ) -> impl Future<Output = Result<(), AppError>> + Send {
+        runtime.edit_image_stream(blank_edit(), |_: Step| true)
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn decide_future(
+        runtime: &Runtime,
+    ) -> impl Future<Output = Result<shiso_ir::decision::Response, AppError>> + Send {
+        runtime.decide(blank_decision())
+    }
+
+    fn blank_generate() -> Generate {
+        Generate {
+            prompt: String::new(),
+            n: None,
+            size: None,
+            aspect_ratio: None,
+            steps: None,
+            seed: None,
+            output_format: None,
+            output_compression: None,
+        }
+    }
+    fn blank_edit() -> Edit {
+        Edit {
+            generate: blank_generate(),
+            references: Vec::new(),
+        }
+    }
+    fn blank_decision() -> shiso_ir::decision::Request {
+        shiso_ir::decision::Request {
+            input: shiso_ir::decision::Input::Text(String::new()),
+            readout_state: shiso_ir::decision::ReadoutState::Input,
+            questions: Vec::new(),
+            temperature: None,
+            preserve_thinking: None,
+            token_ids: false,
+        }
+    }
+
+    /// One handle serves every thread.
+    const fn shared<T: Send + Sync>() {}
+    const _: () = shared::<Runtime>();
+}
+
 /// The contracts above are checked by the compiler, so this file building at
 /// all is the result. The test exists so a target that stopped being built
 /// shows up as a missing test rather than as silence.
