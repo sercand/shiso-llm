@@ -5,11 +5,6 @@
 //! [`q8_row_dot`], so two kernels that compute the same product agree bit for
 //! bit instead of differing by summation order.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the kernels Task 4-8 add")
-)]
-
 use half::f16;
 
 /// Quants per block.
