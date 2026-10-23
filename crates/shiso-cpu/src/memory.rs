@@ -4,8 +4,13 @@
 //! promised one-byte alignment, so reinterpreting it as `f32` could fail on an
 //! allocator that hands back an odd address. A 16-byte-aligned chunk makes
 //! every slab base 16-aligned, which also backs each allocation with a whole
-//! number of 16-byte chunks for free. Alignment of a *view* then depends only on its offset,
-//! which is the caller's to get right and is refused loudly when it is not.
+//! number of 16-byte chunks for free. Alignment of a *view* then depends only
+//! on its offset, which is the caller's to get right and is refused loudly
+//! when it is not.
+//!
+//! The chunks are storage only: a slab remembers the byte length that was
+//! requested, reports it as the buffer's size, and bounds-checks every view
+//! against it, so the padding of the last chunk is never reachable.
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -14,7 +19,8 @@ use std::ops::Range;
 use bytemuck::{Pod, Zeroable};
 use shiso_core::{CoreError, CoreResult, DeviceView, RawBuffer};
 
-/// Bytes per [`Chunk`], and so the rounding of every allocation.
+/// Bytes per [`Chunk`], and so the granularity of a slab's storage (not of the
+/// size it reports).
 const CHUNK_BYTES: usize = 16;
 
 /// Sixteen bytes with sixteen-byte alignment; the unit slabs are made of.
@@ -22,13 +28,21 @@ const CHUNK_BYTES: usize = 16;
 #[repr(C, align(16))]
 pub(crate) struct Chunk([u8; CHUNK_BYTES]);
 
+/// One allocation: chunk storage and the byte length that was asked for.
+#[derive(Debug)]
+struct Slab {
+    chunks: Vec<Chunk>,
+    /// Requested size; views are checked against this, not the storage.
+    bytes: usize,
+}
+
 /// Every live allocation of one CPU device, by handle.
 #[derive(Debug)]
 pub(crate) struct Slabs {
     /// The next handle to hand out. Never reused, so a stale view of a freed
     /// buffer is refused instead of silently reading a newer allocation.
     next: NonZeroU64,
-    map: HashMap<NonZeroU64, Vec<Chunk>>,
+    map: HashMap<NonZeroU64, Slab>,
 }
 
 impl Slabs {
@@ -67,7 +81,18 @@ impl Slabs {
         // A u64 handle counter cannot wrap in any process lifetime; the
         // fallback keeps the arithmetic total without an `unwrap`.
         self.next = id.checked_add(1).unwrap_or(id);
-        self.map.insert(id, slab);
+        let len = usize::try_from(bytes).map_err(|_| CoreError::OutOfBounds {
+            offset: 0,
+            len: bytes,
+            buffer_bytes: 0,
+        })?;
+        self.map.insert(
+            id,
+            Slab {
+                chunks: slab,
+                bytes: len,
+            },
+        );
         Ok(RawBuffer::new(id, bytes))
     }
 
@@ -84,8 +109,8 @@ impl Slabs {
     /// [`CoreError::InvalidValue`] for a handle that is not live.
     pub(crate) fn bytes(&self, view: DeviceView<'_>) -> CoreResult<&[u8]> {
         let slab = self.map.get(&view.id()).ok_or_else(|| stale(view))?;
-        let all: &[u8] = bytemuck::cast_slice(slab);
-        let range = span(view, all.len())?;
+        let all: &[u8] = bytemuck::cast_slice(&slab.chunks);
+        let range = span(view, slab.bytes)?;
         Ok(&all[range])
     }
 
@@ -96,8 +121,8 @@ impl Slabs {
     /// What [`Slabs::bytes`] reports.
     pub(crate) fn bytes_mut(&mut self, view: DeviceView<'_>) -> CoreResult<&mut [u8]> {
         let slab = self.map.get_mut(&view.id()).ok_or_else(|| stale(view))?;
-        let all: &mut [u8] = bytemuck::cast_slice_mut(slab);
-        let range = span(view, all.len())?;
+        let range = span(view, slab.bytes)?;
+        let all: &mut [u8] = bytemuck::cast_slice_mut(&mut slab.chunks);
         Ok(&mut all[range])
     }
 
@@ -114,7 +139,7 @@ impl Slabs {
         let to = span(dst, self.slab_bytes(dst)?)?;
         if dst.id() == src.id() {
             let slab = self.map.get_mut(&src.id()).ok_or_else(|| stale(src))?;
-            let all: &mut [u8] = bytemuck::cast_slice_mut(slab);
+            let all: &mut [u8] = bytemuck::cast_slice_mut(&mut slab.chunks);
             all.copy_within(from, to.start);
             return Ok(());
         }
@@ -122,8 +147,8 @@ impl Slabs {
         // source can be borrowed beside it, without staging through a `Vec`.
         let mut dst_slab = self.map.remove(&dst.id()).ok_or_else(|| stale(dst))?;
         if let Some(src_slab) = self.map.get(&src.id()) {
-            let source: &[u8] = bytemuck::cast_slice(src_slab);
-            let target: &mut [u8] = bytemuck::cast_slice_mut(&mut dst_slab);
+            let source: &[u8] = bytemuck::cast_slice(&src_slab.chunks);
+            let target: &mut [u8] = bytemuck::cast_slice_mut(&mut dst_slab.chunks);
             target[to].copy_from_slice(&source[from]);
         }
         self.map.insert(dst.id(), dst_slab);
@@ -133,7 +158,7 @@ impl Slabs {
     /// Size in bytes of the allocation `view` names.
     fn slab_bytes(&self, view: DeviceView<'_>) -> CoreResult<usize> {
         let slab = self.map.get(&view.id()).ok_or_else(|| stale(view))?;
-        Ok(slab.len() * CHUNK_BYTES)
+        Ok(slab.bytes)
     }
 }
 
