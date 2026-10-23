@@ -59,7 +59,7 @@ clap = ["dep:clap"]
 # default because it builds and runs on every target, so a plain `cargo build`
 # yields a server that works anywhere and the GPU features only add to it.
 # Enabling both GPU features is a build error rather than a silent precedence
-# rule - see `boot::open_backend`. `shiso-server` forwards all three under the
+# rule - see `device::open_device`. `shiso-server` forwards all three under the
 # same names.
 default = ["decode-ffmpeg", "cpu"]
 metal = ["dep:shiso-metal"]
