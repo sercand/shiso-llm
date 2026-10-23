@@ -232,6 +232,29 @@ fn scaffolded(
     (drafts, source)
 }
 
+/// Cuts draft counts until every session's `first` and drafts fit one pass of
+/// `rows` rows, longest chain first, so a session keeps as much of its draft
+/// as the others leave room for.
+///
+/// Each session's own budget fits a pass alone, but several together need not:
+/// four sessions taking an eight-token prompt lookup each are thirty-six rows
+/// against a pass of thirty-two, and the pass refused the whole batch - every
+/// request in it failed. A draft only decides how much a step can keep, so
+/// trimming one changes speed and never a token.
+fn fit_rows(lengths: &mut [usize], rows: usize) {
+    let total = |lengths: &[usize]| lengths.iter().map(|len| len + 1).sum::<usize>();
+    while total(lengths) > rows {
+        let Some(longest) = lengths
+            .iter_mut()
+            .filter(|len| **len > 0)
+            .max_by_key(|len| **len)
+        else {
+            return;
+        };
+        *longest -= 1;
+    }
+}
+
 /// The temperature-one probability `row` gives `pick`, entry `i` of the row
 /// standing for token `ids[i]` (or for token `i` with no table). Zero for a
 /// token the row does not hold.
@@ -1417,6 +1440,14 @@ impl SparseStack {
                 start: 0,
             });
         }
+        let mut lengths = rounds
+            .iter()
+            .map(|round| round.drafts.len())
+            .collect::<Vec<_>>();
+        fit_rows(&mut lengths, crate::sparse::stack::MAX_LOGIT_ROWS as usize);
+        for (round, kept) in rounds.iter_mut().zip(lengths) {
+            round.drafts.truncate(kept);
+        }
         Ok(rounds)
     }
 
@@ -1873,7 +1904,33 @@ impl SparseStack {
 
 #[cfg(test)]
 mod tests {
-    use super::pick_probability;
+    use super::{fit_rows, pick_probability};
+
+    /// Drafts that already fit are left alone; ones that do not lose rows from
+    /// the longest chain first until they fit, and no count goes below zero.
+    #[test]
+    fn drafts_are_trimmed_to_one_pass_longest_first() {
+        let mut fits = vec![4, 4, 4, 4];
+        fit_rows(&mut fits, 32);
+        assert_eq!(fits, vec![4, 4, 4, 4]);
+        let mut lookups = vec![8, 8, 8, 8];
+        fit_rows(&mut lookups, 32);
+        assert_eq!(lookups.iter().map(|len| len + 1).sum::<usize>(), 32);
+        assert_eq!(lookups, vec![7, 7, 7, 7]);
+        // Thirty-four rows: the two short chains keep theirs, the long ones
+        // give up the two rows between them.
+        let mut mixed = vec![8, 2, 8, 8, 3];
+        fit_rows(&mut mixed, 32);
+        assert_eq!(mixed.iter().map(|len| len + 1).sum::<usize>(), 32);
+        assert_eq!((mixed[1], mixed[4]), (2, 3), "{mixed:?}");
+        assert!(mixed.iter().all(|len| *len >= 2), "{mixed:?}");
+        let mut many = vec![3; 40];
+        fit_rows(&mut many, 32);
+        assert!(
+            many.iter().all(|len| *len == 0),
+            "only the committed rows remain"
+        );
+    }
     use shiso_core::ids::TokenId;
 
     /// The probability is the row's softmax at the pick, found through the
