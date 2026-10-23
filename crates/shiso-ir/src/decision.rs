@@ -49,7 +49,7 @@ pub enum Input {
     /// The caller's own text and pictures, in the order they were sent.
     Blocks(Vec<Part>),
     /// A state with pictures scored before it, wherever the model's layout
-    /// puts them.
+    /// puts them. With no `media` this is the same input as [`Input::Text`].
     Pictured {
         /// The pictures.
         media: Vec<MediaSource>,
@@ -175,8 +175,8 @@ pub struct Answer {
     pub kind: AnswerKind,
     /// Whether the question asked for the probability of `yes`.
     pub probability_answer: bool,
-    /// The most probable option's value; the level number for a score, `yes`
-    /// or `no` for a yes/no.
+    /// The most probable option's value: the level's label for a score (so it
+    /// is one of the keys of `probabilities`), `yes` or `no` for a yes/no.
     pub choice: ChoiceValue,
     /// Each option and its probability, in the question's own order: a
     /// choice's values, a score's level labels, `yes` then `no`.
@@ -187,6 +187,8 @@ pub struct Answer {
     /// The mass the options carry together before the softmax, independent of
     /// the temperature; `1.0` from a decision head.
     pub label_mass: f64,
+    /// The top level's number, counted from zero; `Some` for a score only.
+    pub level: Option<u32>,
     /// The expectation over the levels; `Some` for a score only.
     pub expected_score: Option<f64>,
     /// The ids the model read, when asked for.

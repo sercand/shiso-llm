@@ -36,7 +36,7 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse as _, Response};
-use shiso_ir::decision::{Input, Request};
+use shiso_ir::decision::{Input, ReadoutState, Request};
 use shiso_runtime::decision;
 
 use crate::decision::decisions_wire::InputImageSource;
@@ -87,7 +87,12 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     let state_text = parsed.state_text();
     // A readout family spells a structured state its own way, from the value
     // the caller sent rather than from the wire's compact rendering of it.
-    let readout_state = wire_common::readout_state(parsed.state.as_ref());
+    // Only a readout reads it, so the two spellings are built only for one.
+    let readout_state = if state.decision_readout.is_some() {
+        wire_common::readout_state(parsed.state.as_ref())
+    } else {
+        ReadoutState::Input
+    };
     // `images` is taken out the same way: it is not a scored text, it is the
     // media the blocks arm renders, and its item refusals are the wire's.
     let images_wire = parsed.images.take();

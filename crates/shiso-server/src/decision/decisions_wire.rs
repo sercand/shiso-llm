@@ -544,7 +544,7 @@ fn question_name_or_position(id: &str, index: usize) -> String {
 /// Refuses a field the question's type has no place for, projecting this
 /// struct's field list into the shared refusal. The presence table belongs to
 /// the wire struct, so that much stays here; the sentence, the param and the
-/// code are [`core::refuse_fields_other_than`]'s, shared with the other
+/// code are [`wire_common::refuse_fields_other_than`]'s, shared with the other
 /// surface so both refuse the same misplaced field in the same words.
 fn refuse_fields_other_than(
     id: &str,

@@ -16,7 +16,7 @@
 //! speaks the official `OpenAI` Decisions API (public beta) shape, `/v1/systemone`
 //! the System One shape with its `images` extension, and the two differ exactly
 //! where their wires do - a `predicate` question and a `noul` criterion are the
-//! same `Kind::YesNo` underneath.
+//! same `QuestionKind::YesNo` underneath.
 
 pub(crate) mod decisions;
 pub(crate) mod decisions_encode;

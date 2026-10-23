@@ -206,6 +206,10 @@ if want features && [ "$has_runtime" -eq 1 ]; then
     rt_backend=()
     [ "$macos" -eq 1 ] && rt_backend=(--features metal)
     cargo clippy -p shiso-runtime --locked --all-targets "${rt_backend[@]+"${rt_backend[@]}"}" -- -D warnings
+    # And with no backend at all, which is what an embedder's `cargo check`
+    # sees before it picks one.
+    step "features (runtime without clap or a backend)"
+    cargo clippy -p shiso-runtime --locked --all-targets -- -D warnings
 fi
 
 # Only the lockfile, the manifests and deny.toml feed this, and it fetches the

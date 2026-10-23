@@ -16,10 +16,11 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(any(feature = "metal", feature = "cuda"))]
+use shiso_hub::Backend;
 use shiso_hub::{
-    Backend, BlobStore, Downloader, HostProfile, HubConfig, HubError, InstalledVariantSummary,
-    ModelName, ModelRef, ProgressEvent, Recipe, RegistryClient, Role, Sha256, Variant,
-    select_variant,
+    BlobStore, Downloader, HostProfile, HubConfig, HubError, InstalledVariantSummary, ModelName,
+    ModelRef, ProgressEvent, Recipe, RegistryClient, Role, Sha256, Variant, select_variant,
 };
 use tokio::sync::mpsc;
 

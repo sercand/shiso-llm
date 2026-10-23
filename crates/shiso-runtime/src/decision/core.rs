@@ -155,7 +155,7 @@ pub const MAX_CHOICE_OPTIONS: usize = 255;
 /// one row at all.
 ///
 /// The vector is shorter than `n` when the vocabulary runs out of one-token
-/// pairs; [`prepare_question`] refuses that list by name.
+/// pairs; `prepare_question` refuses that list by name.
 pub fn choice_labels(n: usize, one_token: impl Fn(&str) -> bool) -> Vec<String> {
     if n <= LETTERS.len() {
         return LETTERS.iter().take(n).map(ToString::to_string).collect();
@@ -987,14 +987,17 @@ pub fn scored_answer(
                 .unwrap_or_else(|| ChoiceValue::Str(String::new()));
             (AnswerKind::Choice, values, choice)
         }
-        QuestionKind::Score(levels) => (
-            AnswerKind::Score,
-            levels
+        QuestionKind::Score(levels) => {
+            let values: Vec<ChoiceValue> = levels
                 .into_iter()
                 .map(|level| ChoiceValue::Str(level.label))
-                .collect(),
-            ChoiceValue::Str(top.to_string()),
-        ),
+                .collect();
+            let choice = values
+                .get(top)
+                .cloned()
+                .unwrap_or_else(|| ChoiceValue::Str(String::new()));
+            (AnswerKind::Score, values, choice)
+        }
         QuestionKind::YesNo { .. } => (
             AnswerKind::YesNo,
             YES_NO_LABELS
@@ -1021,6 +1024,7 @@ pub fn scored_answer(
         choice,
         confidence,
         label_mass,
+        level: (kind == AnswerKind::Score).then(|| u32::try_from(top).unwrap_or(u32::MAX)),
         expected_score: (kind == AnswerKind::Score).then(|| expected_score(&probabilities)),
         probabilities: values.into_iter().zip(probabilities).collect(),
         prompt_token_ids: None,
@@ -1049,6 +1053,30 @@ pub(crate) fn readout_text(
     }
 }
 
+/// The shape checks every request must pass, wherever it came from.
+///
+/// This is the floor under every surface's own, stricter validation: ids may
+/// be blank (but never repeat), options and levels must be at least one and
+/// within bounds, and the temperature must be positive. Whether the input or a
+/// question's wording may be blank is each surface's call, so it is not here.
+///
+/// # Errors
+///
+/// The [`AppError::BadRequest`] of the first check that fails, in the order
+/// ids, each question's options or levels, temperature.
+pub fn validate(request: &DecisionRequest) -> Result<(), AppError> {
+    check_ids(&request.questions, true)?;
+    for question in &request.questions {
+        match &question.kind {
+            QuestionKind::Choice(options) => check_choice_options(options, &question.name, 1)?,
+            QuestionKind::Score(levels) => check_score_levels(levels, &question.name, 1)?,
+            QuestionKind::YesNo { .. } => {}
+        }
+    }
+    check_temperature(request.temperature)?;
+    Ok(())
+}
+
 /// Answers a decision request from the model this state serves.
 ///
 /// A decision checkpoint answers every question from one prompt through its
@@ -1059,10 +1087,8 @@ pub(crate) fn readout_text(
 /// refusal to score the third question reaches the caller as a refusal, not as
 /// a partial answer with the first two already paid for.
 ///
-/// The request is taken as the wire validated it: the shape checks live in
-/// [`check_ids`], [`check_choice_options`] and the like, which a surface calls
-/// while parsing, and only the temperature is checked again here because it is
-/// cheap and the arithmetic divides by it.
+/// The request is checked with [`validate`] first, the floor every surface
+/// already exceeds, so hand-built IR is refused rather than scored wrongly.
 ///
 /// # Errors
 ///
@@ -1075,6 +1101,7 @@ pub async fn decide(
     state: &Arc<AppState>,
     request: DecisionRequest,
 ) -> Result<DecisionResponse, AppError> {
+    validate(&request)?;
     let temperature = check_temperature(request.temperature)?;
     let DecisionRequest {
         input,
@@ -1828,5 +1855,121 @@ mod tests {
             tokens.len(),
             labels.len()
         );
+    }
+
+    fn request_of(questions: Vec<Question>, temperature: Option<f64>) -> DecisionRequest {
+        DecisionRequest {
+            input: Input::Text("x".to_owned()),
+            readout_state: ReadoutState::Input,
+            questions,
+            temperature,
+            preserve_thinking: None,
+            token_ids: false,
+        }
+    }
+
+    fn choice_question(name: &str, values: &[&str]) -> Question {
+        kinded(
+            "pick",
+            QuestionKind::Choice(values.iter().map(|value| option(value)).collect()),
+        )
+        .named(name)
+    }
+
+    trait Named {
+        fn named(self, name: &str) -> Self;
+    }
+
+    impl Named for Question {
+        fn named(mut self, name: &str) -> Self {
+            self.name = name.to_owned();
+            self
+        }
+    }
+
+    #[test]
+    fn validate_accepts_what_the_surfaces_accept() {
+        let request = request_of(
+            vec![
+                choice_question("", &["a"]),
+                choice_question("", &["b", "c"]),
+                yes_no("n"),
+                kinded(
+                    "",
+                    QuestionKind::Score(vec![Level {
+                        label: "only".to_owned(),
+                        description: None,
+                    }]),
+                ),
+            ],
+            Some(0.5),
+        );
+        assert!(validate(&request).is_ok());
+    }
+
+    #[test]
+    fn validate_refuses_each_malformed_part() {
+        let refused = |request: DecisionRequest| {
+            validate(&request)
+                .expect_err("the floor must refuse this request")
+                .to_string()
+        };
+        let duplicate = refused(request_of(vec![yes_no("a"), yes_no("a")], None));
+        assert!(duplicate.contains("used by"), "{duplicate}");
+        let control = refused(request_of(vec![choice_question("q", &["a\nb"])], None));
+        assert!(control.contains("control character"), "{control}");
+        let blank = refused(request_of(vec![choice_question("q", &["  "])], None));
+        assert!(blank.contains("non-blank"), "{blank}");
+        let repeated = refused(request_of(vec![choice_question("q", &["a", "A"])], None));
+        assert!(repeated.contains("more than once"), "{repeated}");
+        let none = refused(request_of(vec![choice_question("q", &[])], None));
+        assert!(none.contains("at least 1"), "{none}");
+        let levels = refused(request_of(
+            vec![kinded("q", QuestionKind::Score(Vec::new()))],
+            None,
+        ));
+        assert!(levels.contains("at least 1 levels"), "{levels}");
+        let blank_level = refused(request_of(
+            vec![kinded(
+                "q",
+                QuestionKind::Score(vec![Level {
+                    label: " ".to_owned(),
+                    description: None,
+                }]),
+            )],
+            None,
+        ));
+        assert!(blank_level.contains("must not be blank"), "{blank_level}");
+        let temperature = refused(request_of(vec![yes_no("a")], Some(0.0)));
+        assert!(temperature.contains("temperature"), "{temperature}");
+    }
+
+    #[test]
+    fn a_score_answer_names_its_level_by_label_and_number() {
+        let answer = scored_answer(
+            kinded(
+                "q",
+                QuestionKind::Score(
+                    ["low", "high"]
+                        .iter()
+                        .map(|label| Level {
+                            label: (*label).to_owned(),
+                            description: None,
+                        })
+                        .collect(),
+                ),
+            ),
+            vec![0.25, 0.75],
+            1.0,
+            1,
+        );
+        assert_eq!(answer.choice, ChoiceValue::Str("high".to_owned()));
+        assert!(
+            answer
+                .probabilities
+                .iter()
+                .any(|(value, _)| *value == answer.choice)
+        );
+        assert_eq!(answer.level, Some(1));
     }
 }

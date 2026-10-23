@@ -33,7 +33,6 @@ pub(crate) fn render_text(value: &Value) -> String {
 /// Recursion depth is bounded by the parser's own nesting limit: a value this
 /// walks was parsed, and parsing is where runaway nesting is refused.
 fn canonical(value: &Value) -> Value {
-    use Value;
     match value {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
@@ -53,7 +52,7 @@ fn canonical(value: &Value) -> Value {
 ///
 /// Both surfaces spell the question key the same way and render it with the
 /// shared rule, so the reading lives here; whether a blank is a refusal or a
-/// dropped line is each surface's [`check_question_text`] call, not this
+/// dropped line is each surface's `check_question_text` call, not this
 /// function's business.
 pub(crate) fn question_text(value: Option<&Value>) -> String {
     value.map_or_else(String::new, render_text)
@@ -105,8 +104,8 @@ pub(crate) fn refuse_fields_other_than(
 /// Chat-template knobs a decision request sent, validated and kept raw.
 ///
 /// Every key rule fires once, in [`Self::from_wire`], so the refusal names
-/// the offending key while the request is still being read; [`Self::apply`]
-/// only lowers what survived.
+/// the offending key while the request is still being read; [`Self::preserve_thinking`]
+/// only reads out what survived.
 #[derive(Debug)]
 pub(crate) struct TemplateKwargs(Map<String, Value>);
 

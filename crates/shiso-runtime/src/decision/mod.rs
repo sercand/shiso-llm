@@ -13,7 +13,7 @@
 //! - [`core`]: the question model's prompt wording (prompt-format version 1),
 //!   the validators every surface shares, preparation, the scoring fan-out
 //!   and [`decide`] itself.
-//! - [`head`] and [`readout`]: the two ways a decision checkpoint is read.
+//! - `head` and `readout`: the two ways a decision checkpoint is read.
 //! - [`math`] and [`score`]: the pure arithmetic - probabilities, confidences,
 //!   and folding a scored row into an answer - which name no model family and
 //!   touch no device.
@@ -31,4 +31,4 @@ pub mod math;
 pub(crate) mod readout;
 pub mod score;
 
-pub use core::{decide, scored_answer};
+pub use core::{decide, scored_answer, validate};
