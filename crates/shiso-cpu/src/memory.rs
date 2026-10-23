@@ -3,8 +3,8 @@
 //! A slab is a `Vec<Chunk>` rather than a `Vec<u8>`: a byte vector is only
 //! promised one-byte alignment, so reinterpreting it as `f32` could fail on an
 //! allocator that hands back an odd address. A 16-byte-aligned chunk makes
-//! every slab base 16-aligned, which also rounds each allocation up to 16
-//! bytes for free. Alignment of a *view* then depends only on its offset,
+//! every slab base 16-aligned, which also backs each allocation with a whole
+//! number of 16-byte chunks for free. Alignment of a *view* then depends only on its offset,
 //! which is the caller's to get right and is refused loudly when it is not.
 
 use std::collections::HashMap;
@@ -40,9 +40,11 @@ impl Slabs {
         }
     }
 
-    /// Allocates `bytes` of zeroed memory, rounded up to a whole chunk.
+    /// Allocates `bytes` of zeroed memory, backed by a whole number of chunks.
     ///
-    /// The handle's size is the rounded one, which the trait allows.
+    /// The handle's size is the requested one, not the rounded one: a whole-
+    /// buffer view must be exactly as long as the bytes a caller uploads, since
+    /// `copy_h2d` and `copy_d2h` refuse any other length.
     pub(crate) fn alloc(&mut self, bytes: u64) -> CoreResult<RawBuffer> {
         let chunks = usize::try_from(bytes.div_ceil(CHUNK_BYTES as u64)).map_err(|_| {
             CoreError::OutOfBounds {
@@ -66,7 +68,7 @@ impl Slabs {
         // fallback keeps the arithmetic total without an `unwrap`.
         self.next = id.checked_add(1).unwrap_or(id);
         self.map.insert(id, slab);
-        Ok(RawBuffer::new(id, chunks as u64 * CHUNK_BYTES as u64))
+        Ok(RawBuffer::new(id, bytes))
     }
 
     /// Drops an allocation. Returns whether the handle was live.
