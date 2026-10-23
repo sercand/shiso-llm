@@ -4,7 +4,7 @@
 //! constants themselves (`KernelRef::specialized`) instead of leaving them to
 //! the engine's pipeline cache, so a backend that honours a specialization table
 //! can run them and a backend that reads the geometry off the launch can ignore
-//! it. The `q8_0` fixture is `product::q8_matrix`: a power-of-two scale, so the
+//! it. The `q8_0` fixture is `product::q8_matrix` with per-block power-of-two scales, so the
 //! dequantized values are exact and the gather is compared bit for bit.
 #![expect(
     clippy::cast_possible_truncation,
@@ -33,25 +33,64 @@ const NSG_INDEX: u16 = 600;
 /// Function-constant index of the lane split, mirroring `EXT_NXPSG_INDEX`.
 const NXPSG_INDEX: u16 = 601;
 
-/// The constant table for one lane split: two simdgroups, `nxpsg` lanes a row.
-macro_rules! ext_consts {
-    ($nxpsg:expr) => {
-        &[
-            FnConst {
-                index: NSG_INDEX,
-                value: FnConstValue::I16(2),
-            },
-            FnConst {
-                index: NXPSG_INDEX,
-                value: FnConstValue::I16($nxpsg),
-            },
-        ]
-    };
-}
+// One table per lane split, as plain literals: `KernelRef::consts` is `'static`.
+// Keep them in step with `EXT_CONSTS_16/8/4` in
+// `crates/shiso-engine/src/launch.rs` (about :2283-2320), which this crate
+// cannot import.
+static CONSTS_NX4: [FnConst; 2] = [
+    FnConst {
+        index: NSG_INDEX,
+        value: FnConstValue::I16(2),
+    },
+    FnConst {
+        index: NXPSG_INDEX,
+        value: FnConstValue::I16(4),
+    },
+];
+static CONSTS_NX8: [FnConst; 2] = [
+    FnConst {
+        index: NSG_INDEX,
+        value: FnConstValue::I16(2),
+    },
+    FnConst {
+        index: NXPSG_INDEX,
+        value: FnConstValue::I16(8),
+    },
+];
+static CONSTS_NX16: [FnConst; 2] = [
+    FnConst {
+        index: NSG_INDEX,
+        value: FnConstValue::I16(2),
+    },
+    FnConst {
+        index: NXPSG_INDEX,
+        value: FnConstValue::I16(16),
+    },
+];
 
-static CONSTS_NX4: [FnConst; 2] = *ext_consts!(4);
-static CONSTS_NX8: [FnConst; 2] = *ext_consts!(8);
-static CONSTS_NX16: [FnConst; 2] = *ext_consts!(16);
+/// Threads per threadgroup of the `q8_0` gather, mirroring the engine's
+/// `GATHER_BLOCK_32` (`crates/shiso-engine/src/layers.rs`, the `DType::Q8_0`
+/// gather entry): one thread per element of a block.
+const GATHER_BLOCK_32: u32 = 32;
+
+/// `f16` bits for 2^-5, 2^-6 and 2^-7, cycled by block index.
+const SCALE_BITS: [u16; 3] = [0x2800, 0x2400, 0x2000];
+
+/// `product::q8_matrix` with a per-block scale, so a kernel that applies one
+/// block's `d` to its neighbours is caught. Post-processed here rather than
+/// changed in `q8_matrix`, which other cases share. Scales stay powers of two,
+/// so every dequantized value is still exact.
+fn varied_q8_matrix(rows: usize, width: usize) -> (Vec<BlockQ80>, Vec<f32>) {
+    let (mut blocks, mut values) = q8_matrix(rows, width);
+    for (b, block) in blocks.iter_mut().enumerate() {
+        block.d = SCALE_BITS[b % SCALE_BITS.len()];
+        let scale = crate::oracle::f16_to_f32(block.d);
+        for (e, &q) in block.qs.iter().enumerate() {
+            values[b * QK8_0 + e] = f32::from(q) * scale;
+        }
+    }
+    (blocks, values)
+}
 
 /// The `(input width, lane split, constant table)` triples the matvec walks.
 ///
@@ -74,7 +113,7 @@ const IDS: [i32; 4] = [3, 0, 8, 3];
 
 /// The gather dequantizes the `q8_0` rows the ids name, one f32 row per token.
 pub fn the_q8_0_gather_dequantizes_the_rows_the_ids_name(gpu: &Gpu) {
-    let (blocks, values) = q8_matrix(VOCAB, EMBD);
+    let (blocks, values) = varied_q8_matrix(VOCAB, EMBD);
     let d_table = gpu.upload(bytemuck::cast_slice::<BlockQ80, u8>(&blocks));
     let d_ids = gpu.upload(bytemuck::cast_slice(&IDS));
     // One row more than the ids need, NaN everywhere: a kernel that wrote past
@@ -97,7 +136,7 @@ pub fn the_q8_0_gather_dequantizes_the_rows_the_ids_name(gpu: &Gpu) {
         "generic",
         ENTRIES[0],
         Extent3::new(per_row as u32, IDS.len() as u32, 1),
-        Extent3::new(WARP, 1, 1),
+        Extent3::new(GATHER_BLOCK_32, 1, 1),
         0,
         &[
             KernelArg::Bytes(bytemuck::bytes_of(&args)),
@@ -124,8 +163,8 @@ pub fn the_q8_0_gather_dequantizes_the_rows_the_ids_name(gpu: &Gpu) {
 
 /// Tokens in the matvec fixture, which is the entry's row blocking.
 const N_TOK: usize = 2;
-/// Output rows: 70 leaves a short last block at 4, 8 and 16 rows a block
-/// (the three lane splits), so the guarded store runs at each.
+/// Output rows: the lane splits 4, 8 and 16 give 16, 8 and 4 rows a block, and
+/// 70 leaves a short last block at each, so the guarded store runs at each.
 const OUT: usize = 70;
 /// NaN slots after the output, to catch a store past `ne0 * ne1`.
 const CANARY: usize = 4;
@@ -134,11 +173,11 @@ const CANARY: usize = 4;
 /// every lane split.
 pub fn the_two_row_q8_0_ext_matvec_matches_the_oracle_dot(gpu: &Gpu) {
     for (seed, &(in_dim, nxpsg, consts)) in EXT_SHAPES.iter().enumerate() {
-        let (blocks, weights) = q8_matrix(OUT, in_dim);
+        let (blocks, weights) = varied_q8_matrix(OUT, in_dim);
         let d_w = gpu.upload(bytemuck::cast_slice::<BlockQ80, u8>(&blocks));
-        // Activations on a 1/16 grid. Every product `q * 2^-6 * k/16` and every
-        // partial sum of up to 1024 of them is then exact in f32 (22 bits at
-        // most), so the lane split's summation order cannot move the result and
+        // Activations on a 1/16 grid. Every product `q * 2^-s * k/16` (scale
+        // 2^-5 at the coarsest) and every partial sum of up to 1024 of them is
+        // then a multiple of 2^-11 below 2^13, so under 2^24 ulps: exact in f32, so the lane split's summation order cannot move the result and
         // the tolerance is spent on the kernel, not on rounding. Raw `signal`
         // values left a 1024-wide row 1.1e-5 off the oracle with 16 lanes, which
         // is reassociation of the sum rather than a wrong read.

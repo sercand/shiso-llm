@@ -303,8 +303,8 @@ pub(crate) fn to_f16_and_back(values: &[f32]) -> (Vec<u8>, Vec<f32>) {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct BlockQ80 {
-    d: u16,
-    qs: [i8; QK8_0],
+    pub(crate) d: u16,
+    pub(crate) qs: [i8; QK8_0],
 }
 
 const _: () = assert!(size_of::<BlockQ80>() == 34);
