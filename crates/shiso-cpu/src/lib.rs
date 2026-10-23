@@ -30,6 +30,7 @@
 mod dispatch;
 mod kernels;
 mod memory;
+mod q8;
 
 use std::fmt;
 use std::num::NonZeroUsize;
