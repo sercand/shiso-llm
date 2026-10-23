@@ -36,13 +36,13 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse as _, Response};
+use shiso_ir::decision::{Input, Request};
+use shiso_runtime::decision;
 
-use crate::decision::core::{self, TemplateKwargs, prepare_question, run_questions};
-use crate::decision::decisions_wire;
-use crate::decision::head;
-use crate::decision::readout;
+use crate::decision::decisions_wire::InputImageSource;
 use crate::decision::systemone_encode::encode;
 use crate::decision::systemone_wire::{self, SystemOneBody};
+use crate::decision::wire_common::{self, TemplateKwargs};
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -87,10 +87,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     let state_text = parsed.state_text();
     // A readout family spells a structured state its own way, from the value
     // the caller sent rather than from the wire's compact rendering of it.
-    let readout_state = state
-        .decision_readout
-        .as_deref()
-        .and_then(|readout| readout::spell_state(parsed.state.as_ref(), readout.state_spelling()));
+    let readout_state = wire_common::readout_state(parsed.state.as_ref());
     // `images` is taken out the same way: it is not a scored text, it is the
     // media the blocks arm renders, and its item refusals are the wire's.
     let images_wire = parsed.images.take();
@@ -98,82 +95,103 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     let sources = systemone_wire::images_sources(images_wire.as_ref())?;
     let kwargs = TemplateKwargs::from_wire(kwargs_wire)?;
 
-    // A decision checkpoint answers every question from one prompt through
-    // its head, pictures and all, laid out the way its family lays it out:
-    // the state as the caller sent it, and the pictures wherever the layout
-    // puts them.
-    if let Some(layout) = state.decision_layout.as_deref() {
-        let media = sources.iter().map(core::image_block).collect();
-        let (answers, tally) =
-            head::run(state, layout, &state_text, media, questions, 1.0, false).await?;
-        return Ok(Json(encode(
-            state.model_id.clone(),
-            state_text,
-            &answers,
-            tally.input,
-        ))
-        .into_response());
-    }
-
-    // A decision checkpoint with no head answers each question from its own
-    // prompt's next-token row, laid out the way its family lays it out.
-    if let Some(layout) = state.decision_readout.as_deref() {
-        let media = sources.iter().map(core::image_block).collect();
-        let (answers, tally) = readout::run(
-            state,
-            layout,
-            readout_state.as_deref(),
-            media,
-            questions,
-            1.0,
-            false,
-        )
-        .await?;
-        return Ok(Json(encode(
-            state.model_id.clone(),
-            state_text,
-            &answers,
-            tally.input,
-        ))
-        .into_response());
-    }
-
-    // Composition (spec §3): images before the state, clef's rule. With no
-    // images the text arm is taken byte-for-byte as it always was; with
-    // them the state enters as a *trimmed* text block, which is what keeps
-    // the question-wording seam (`"\n\n" + wording` after a text block)
-    // byte-identical to the string path's `trim() + "\n\n" + wording`. A
-    // blank state sends no text block at all: image-only is valid.
+    // The state, with the pictures scored before it (spec §3, clef's rule):
+    // with no images the text arm is taken byte-for-byte as it always was.
+    // Where the pictures go in a decision checkpoint's prompt is its layout's
+    // call, and the state travels as the caller sent it.
     let input = if sources.is_empty() {
-        decisions_wire::DecisionInput::Text(state_text.clone())
+        Input::Text(state_text.clone())
     } else {
-        let mut blocks = Vec::with_capacity(sources.len() + 1);
-        blocks.extend(sources.into_iter().map(decisions_wire::InputBlock::Image));
-        let trimmed = state_text.trim();
-        if !trimmed.is_empty() {
-            blocks.push(decisions_wire::InputBlock::Text {
-                text: trimmed.to_owned(),
-            });
+        Input::Pictured {
+            media: sources
+                .into_iter()
+                .map(InputImageSource::into_source)
+                .collect(),
+            text: state_text.clone(),
         }
-        decisions_wire::DecisionInput::Blocks(blocks)
     };
 
-    // Every question is prepared before any is scored, as on the decisions
-    // route, so a refusal to score the last criterion is a refusal rather
-    // than a partial answer already paid for. The scoring knobs this wire
-    // refused are gone, so temperature is 1 and no caller asked for token
-    // ids — `false` here because nothing can have said otherwise.
-    let mut prepared = Vec::with_capacity(questions.len());
-    for question in &questions {
-        prepared.push(prepare_question(state, &input, question, &kwargs, false)?);
+    // The scoring knobs this wire refused are gone, so the temperature is the
+    // default and no caller asked for token ids - nothing can have said
+    // otherwise.
+    let response = decision::decide(
+        state,
+        Request {
+            input,
+            readout_state,
+            questions,
+            temperature: None,
+            preserve_thinking: kwargs.preserve_thinking(),
+            token_ids: false,
+        },
+    )
+    .await?;
+    Ok(Json(encode(state.model_id.clone(), state_text, &response)).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use shiso_ir::decision::{Response, Usage};
+    use shiso_runtime::decision::scored_answer;
+
+    use crate::decision::systemone_encode::encode;
+    use crate::decision::systemone_wire::SystemOneBody;
+
+    /// The body's questions go to the IR and the IR's answers come back out
+    /// in the shape the encoder has always spelled: the `noul` is the yes
+    /// probability, and the derived confidences are the core's.
+    #[test]
+    fn a_body_round_trips_through_the_ir_to_the_same_answer_bytes() {
+        let body: SystemOneBody = serde_json::from_value(json!({
+            "state": "the input",
+            "questions": {
+                "c1": {"type": "choice", "instructions": "pick one",
+                       "criteria": {"red": null, "blue": null}},
+                "s1": {"type": "score", "instructions": "how bad",
+                       "criteria": ["none", "some"]},
+                "n1": {"type": "noul", "instructions": "ready"},
+            },
+        }))
+        .expect("the body parses");
+        let questions = body.validate().expect("the body validates");
+        // The noul's yes is entry zero and wins; the others put 0.75 on
+        // their second option.
+        let answers = questions
+            .into_iter()
+            .map(|question| {
+                if question.name == "n1" {
+                    scored_answer(question, vec![0.75, 0.25], 0.5, 0)
+                } else {
+                    scored_answer(question, vec![0.25, 0.75], 0.5, 1)
+                }
+            })
+            .collect();
+        let response = Response {
+            answers,
+            usage: Usage {
+                input_tokens: 10,
+                cached_tokens: 0,
+            },
+        };
+        let encoded = encode("m".to_owned(), "the input".to_owned(), &response);
+        let want: Value = json!({
+            "model": "m",
+            "state": "the input",
+            "answers": {
+                "c1": {"type": "choice", "choice": "blue",
+                       "probabilities": {"red": 0.25, "blue": 0.75},
+                       "confidence": 0.5, "x_label_mass": 0.5},
+                "s1": {"type": "score", "score": 0.75,
+                       "legend": {"0": "none", "1": "some"},
+                       "probabilities": {"0": 0.25, "1": 0.75},
+                       "confidence": 0.5, "x_label_mass": 0.5},
+                "n1": {"type": "noul", "noul": 0.75, "probabilities": [0.75, 0.25],
+                       "confidence": 0.5, "x_label_mass": 0.5},
+            },
+            "usage": {"input_tokens": 10, "output_tokens": 0, "total_tokens": 10},
+        });
+        assert_eq!(encoded, want);
+        assert_eq!(encoded.to_string(), want.to_string());
     }
-    let answers = run_questions(state, prepared, 1.0, false).await?;
-    let total_input_tokens = answers.iter().map(|answer| answer.prompt_tokens).sum();
-    Ok(Json(encode(
-        state.model_id.clone(),
-        state_text,
-        &answers,
-        total_input_tokens,
-    ))
-    .into_response())
 }

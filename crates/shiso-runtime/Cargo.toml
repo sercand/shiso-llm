@@ -9,7 +9,6 @@ description = "shiso: the engine behind the HTTP surface - scheduler, model fact
 
 [dependencies]
 shiso-core = { workspace = true }
-shiso-decision = { workspace = true }
 shiso-engine = { workspace = true }
 shiso-ir = { workspace = true }
 shiso-kvstore = { workspace = true }
@@ -59,8 +58,8 @@ clap = ["dep:clap"]
 # silent precedence rule - see `boot::open_backend`. `shiso-server` forwards
 # both under the same names.
 default = ["decode-ffmpeg"]
-metal = ["dep:shiso-metal", "shiso-decision/metal"]
-cuda = ["dep:shiso-cuda", "shiso-decision/cuda"]
+metal = ["dep:shiso-metal"]
+cuda = ["dep:shiso-cuda"]
 # Media decoding. Neither is optional: a build with both off has no decoder on a
 # machine without an OS one, which is none of the supported chains, so `boot`
 # refuses it. `decode-ffmpeg` adds the ffmpeg subprocess step (still inert until

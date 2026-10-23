@@ -14,70 +14,60 @@
 //! id in the order the request's map carried them — and the workspace builds
 //! `serde_json` with `preserve_order` so the map keeps that insertion order
 //! into the response bytes. Nothing here computes anything: every number was
-//! decided in [`super::core`] and [`shiso_decision::math`], and the mass this wire
+//! decided in `shiso_runtime::decision`, and the mass this wire
 //! calls `x_label_mass` is the same quantity the decisions wire calls
 //! `label_mass`, renamed at the edge.
 
 use serde_json::{Map, Value, json};
 
-use crate::decision::core::{Answered, Kind, answer_label, choice_name, type_name};
-use shiso_decision::math::{choice_confidence, expected_score, score_confidence};
+use shiso_ir::decision::{AnswerKind, Response};
+
+use crate::decision::wire_common::type_name;
 
 /// Encodes the scored answers. `model` is the server's served model id —
 /// this surface never echoes the request's name — and `state` is the
 /// request's state rendered to text, blank when it said nothing.
-pub(crate) fn encode(
-    model: String,
-    state: String,
-    answers: &[Answered],
-    total_input_tokens: u64,
-) -> Value {
+pub(crate) fn encode(model: String, state: String, response: &Response) -> Value {
     let mut answered = Map::new();
-    for answer in answers {
+    for answer in &response.answers {
         let mut entry = Map::new();
-        entry.insert("type".to_owned(), json!(type_name(&answer.kind)));
-        // Confidence is per kind: a choice or binary answer is how far the
-        // top stands above a uniform draw, a score answer is how
-        // concentrated it is around its top level. A noul criterion answers
-        // as a yes/no question, so its confidence is the binary one over
-        // [yes, no]; the official "the `noul` answer is the yes
-        // probability" is the `noul` field itself, spelled below.
-        let confidence = match &answer.kind {
-            Kind::Choice { options, .. } => {
-                entry.insert(
-                    "choice".to_owned(),
-                    json!(choice_name(&answer.kind, answer.top).text()),
-                );
+        entry.insert("type".to_owned(), json!(type_name(answer.kind)));
+        // Confidence is per kind and comes with the answer: a choice or
+        // binary answer is how far the top stands above a uniform draw, a
+        // score answer is how concentrated it is around its top level. A
+        // noul criterion answers as a yes/no question, so its confidence is
+        // the binary one over [yes, no]; the official "the `noul` answer is
+        // the yes probability" is the `noul` field itself, spelled below.
+        match answer.kind {
+            AnswerKind::Choice => {
+                entry.insert("choice".to_owned(), json!(answer.choice.text()));
                 // The official shape keys the probabilities by option name;
                 // the map order is the option order, which is the order the
                 // caller's `criteria` map carried.
                 let mut probabilities = Map::new();
-                for (option, probability) in options.iter().zip(&answer.probabilities) {
-                    probabilities.insert(option.value.text(), json!(probability));
+                for (value, probability) in &answer.probabilities {
+                    probabilities.insert(value.text(), json!(probability));
                 }
                 entry.insert("probabilities".to_owned(), Value::Object(probabilities));
-                choice_confidence(&answer.probabilities)
             }
-            Kind::Score { levels, .. } => {
+            AnswerKind::Score => {
                 entry.insert(
                     "score".to_owned(),
-                    json!(expected_score(&answer.probabilities)),
+                    json!(answer.expected_score.unwrap_or_default()),
                 );
                 // The official shape indexes the legend and the
                 // probabilities by level number spelled as a string.
                 let mut legend = Map::new();
                 let mut probabilities = Map::new();
-                for (index, level) in levels.iter().enumerate() {
-                    legend.insert(index.to_string(), json!(level.label));
-                }
-                for (index, probability) in answer.probabilities.iter().enumerate() {
+                for (index, (level, probability)) in answer.probabilities.iter().enumerate() {
+                    legend.insert(index.to_string(), json!(level.text()));
                     probabilities.insert(index.to_string(), json!(probability));
                 }
                 entry.insert("legend".to_owned(), Value::Object(legend));
                 entry.insert("probabilities".to_owned(), Value::Object(probabilities));
-                score_confidence(&answer.probabilities)
             }
-            Kind::YesNo { .. } => {
+            AnswerKind::YesNo => {
+                let pair: Vec<f64> = answer.probabilities.iter().map(|(_, p)| *p).collect();
                 if answer.probability_answer {
                     // A noul criterion: the official shape names the type
                     // `noul` and carries the yes probability under `noul` -
@@ -89,9 +79,7 @@ pub(crate) fn encode(
                     entry.insert(
                         "noul".to_owned(),
                         json!(
-                            answer
-                                .probabilities
-                                .first()
+                            pair.first()
                                 .expect("a scored yes/no answer carries two label probabilities")
                         ),
                     );
@@ -101,23 +89,19 @@ pub(crate) fn encode(
                     // every binary question arrives as a noul - but the
                     // flag is data rather than a type, so the arm answers
                     // rather than panicking on a scored response.
-                    entry.insert(
-                        "answer".to_owned(),
-                        json!(answer_label(&answer.kind, answer.top)),
-                    );
+                    entry.insert("answer".to_owned(), json!(answer.choice.text()));
                 }
                 // The kept extra: the pair in label order.
-                entry.insert("probabilities".to_owned(), json!(answer.probabilities));
-                choice_confidence(&answer.probabilities)
+                entry.insert("probabilities".to_owned(), json!(pair));
             }
-        };
-        entry.insert("confidence".to_owned(), json!(confidence));
+        }
+        entry.insert("confidence".to_owned(), json!(answer.confidence));
         // The mass comes from the scoring pass, where it is independent of
         // the temperature; recomputing it from the probabilities would not
         // recover it, because the softmax over the labels has already thrown
         // away the mass the rest of the distribution carries.
         entry.insert("x_label_mass".to_owned(), json!(answer.label_mass));
-        answered.insert(answer.id.clone(), Value::Object(entry));
+        answered.insert(answer.name.clone(), Value::Object(entry));
     }
 
     let mut body = Map::new();
@@ -127,6 +111,7 @@ pub(crate) fn encode(
     // Nothing is generated on this surface either, and every input token is
     // one question's prompt counted once - the same accounting the decisions
     // route reports, under this wire's own key names.
+    let total_input_tokens = response.usage.input_tokens;
     body.insert(
         "usage".to_owned(),
         json!({
@@ -141,8 +126,11 @@ pub(crate) fn encode(
 #[cfg(test)]
 mod tests {
     use super::encode;
-    use crate::decision::core::{Answered, ChoiceOption, ChoiceValue, Kind, ScoreLevel};
     use serde_json::{Value, json};
+    use shiso_ir::decision::{
+        Answer, Choice, ChoiceValue, Level, Question, QuestionKind, Response, Usage,
+    };
+    use shiso_runtime::decision::scored_answer;
 
     /// One scored answer with every field the encoder reads set by hand, and
     /// the token-id fields at their no-request values. The probabilities are
@@ -151,35 +139,43 @@ mod tests {
     /// expected score) lands on an exactly representable value too.
     fn answered(
         id: &str,
-        kind: Kind,
+        kind: QuestionKind,
         probability_answer: bool,
         probabilities: &[f64],
         label_mass: f64,
         top: usize,
-    ) -> Answered {
-        Answered {
-            id: id.to_owned(),
-            kind,
-            probability_answer,
-            probabilities: probabilities.to_vec(),
+    ) -> Answer {
+        scored_answer(
+            Question {
+                name: id.to_owned(),
+                instructions: String::new(),
+                kind,
+                probability_answer,
+            },
+            probabilities.to_vec(),
             label_mass,
             top,
-            prompt_tokens: 0,
-            cached_tokens: 0,
-            prompt_token_ids: None,
-            label_token_ids: None,
+        )
+    }
+
+    fn response(answers: &[Answer], input_tokens: u64) -> Response {
+        Response {
+            answers: answers.to_vec(),
+            usage: Usage {
+                input_tokens,
+                cached_tokens: 0,
+            },
         }
     }
 
     /// The entry one answer renders to, on its own.
-    fn only_answer(answer: &Answered) -> Value {
+    fn only_answer(answer: &Answer) -> Value {
         let body = encode(
             "test-model".to_owned(),
             String::new(),
-            std::slice::from_ref(answer),
-            1,
+            &response(std::slice::from_ref(answer), 1),
         );
-        body["answers"][answer.id.as_str()].clone()
+        body["answers"][answer.name.as_str()].clone()
     }
 
     /// The key order of one JSON object, for pinning the shape's order.
@@ -196,8 +192,7 @@ mod tests {
     fn a_probability_answer_yes_no_renders_the_official_noul_shape() {
         let answer = answered(
             "n1",
-            Kind::YesNo {
-                question: "ready".to_owned(),
+            QuestionKind::YesNo {
                 yes: None,
                 no: None,
             },
@@ -235,23 +230,20 @@ mod tests {
     fn a_choice_answer_keys_its_probabilities_by_option_name() {
         let answer = answered(
             "q1",
-            Kind::Choice {
-                question: "pick one".to_owned(),
-                options: vec![
-                    ChoiceOption {
-                        value: ChoiceValue::Str("red".to_owned()),
-                        description: None,
-                    },
-                    ChoiceOption {
-                        value: ChoiceValue::Str("blue".to_owned()),
-                        description: Some("the sky".to_owned()),
-                    },
-                    ChoiceOption {
-                        value: ChoiceValue::Str("green".to_owned()),
-                        description: None,
-                    },
-                ],
-            },
+            QuestionKind::Choice(vec![
+                Choice {
+                    value: ChoiceValue::Str("red".to_owned()),
+                    description: None,
+                },
+                Choice {
+                    value: ChoiceValue::Str("blue".to_owned()),
+                    description: Some("the sky".to_owned()),
+                },
+                Choice {
+                    value: ChoiceValue::Str("green".to_owned()),
+                    description: None,
+                },
+            ]),
             false,
             &[0.125, 0.75, 0.125],
             0.25,
@@ -279,16 +271,15 @@ mod tests {
     fn a_score_answer_indexes_its_legend_and_probabilities_by_level() {
         let answer = answered(
             "s1",
-            Kind::Score {
-                question: "how bad".to_owned(),
-                levels: ["none", "some", "lots", "max"]
+            QuestionKind::Score(
+                ["none", "some", "lots", "max"]
                     .into_iter()
-                    .map(|label| ScoreLevel {
+                    .map(|label| Level {
                         label: label.to_owned(),
                         description: None,
                     })
                     .collect(),
-            },
+            ),
             false,
             &[0.0, 0.25, 0.5, 0.25],
             0.75,
@@ -325,8 +316,7 @@ mod tests {
         // so the arm must answer with the word rather than panic.
         let answer = answered(
             "q2",
-            Kind::YesNo {
-                question: "ready".to_owned(),
+            QuestionKind::YesNo {
                 yes: None,
                 no: None,
             },
@@ -352,8 +342,7 @@ mod tests {
         let answers = vec![
             answered(
                 "n1",
-                Kind::YesNo {
-                    question: String::new(),
+                QuestionKind::YesNo {
                     yes: None,
                     no: None,
                 },
@@ -364,13 +353,10 @@ mod tests {
             ),
             answered(
                 "q1",
-                Kind::Choice {
-                    question: String::new(),
-                    options: vec![ChoiceOption {
-                        value: ChoiceValue::Str("red".to_owned()),
-                        description: None,
-                    }],
-                },
+                QuestionKind::Choice(vec![Choice {
+                    value: ChoiceValue::Str("red".to_owned()),
+                    description: None,
+                }]),
                 false,
                 &[1.0],
                 1.0,
@@ -380,8 +366,7 @@ mod tests {
         let body = encode(
             "served-model".to_owned(),
             "the input".to_owned(),
-            &answers,
-            42,
+            &response(&answers, 42),
         );
         assert_eq!(keys(&body), ["model", "state", "answers", "usage"]);
         assert_eq!(body["model"], "served-model");

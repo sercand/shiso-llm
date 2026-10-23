@@ -14,7 +14,6 @@ members = [
     "crates/shiso-audio",
     "crates/shiso-runtime",
     "crates/shiso-server",
-    "crates/shiso-decision",
     "crates/shiso-bench",
     "crates/shiso-kernels",
     "crates/shiso-cuda",
@@ -195,7 +194,6 @@ shiso-vision = { path = "crates/shiso-vision", default-features = false }
 shiso-audio = { path = "crates/shiso-audio", default-features = false }
 shiso-runtime = { path = "crates/shiso-runtime", default-features = false }
 shiso-server = { path = "crates/shiso-server" }
-shiso-decision = { path = "crates/shiso-decision" }
 shiso-bench = { path = "crates/shiso-bench" }
 shiso-kernels = { path = "crates/shiso-kernels" }
 shiso-cuda = { path = "crates/shiso-cuda" }

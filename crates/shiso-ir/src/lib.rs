@@ -48,6 +48,7 @@
 //! needs the server's preset and its seed source as inputs - see [`request`].
 #![forbid(unsafe_code)]
 
+pub mod decision;
 mod embed;
 mod message;
 mod request;

@@ -9,20 +9,19 @@
 //!
 //! `decisions` and `systemone` are two wire readings of the same engine — the
 //! shared parts (question model, prompt-format version 1 wording, validation,
-//! label checks, scoring fan-out) live in `core`, the probability and
-//! confidence formulas in `shiso_decision::math`. Each surface owns its own serde structs,
+//! label checks, scoring fan-out) live in `shiso_runtime::decision`, which takes
+//! and returns the `shiso_ir::decision` types, and the probability and
+//! confidence formulas in `shiso_runtime::decision::math`. Each surface owns its own serde structs,
 //! like every other route in this crate owns its own wire format: `/v1/decisions`
 //! speaks the official `OpenAI` Decisions API (public beta) shape, `/v1/systemone`
 //! the System One shape with its `images` extension, and the two differ exactly
 //! where their wires do - a `predicate` question and a `noul` criterion are the
 //! same `Kind::YesNo` underneath.
 
-pub(crate) mod core;
 pub(crate) mod decisions;
 pub(crate) mod decisions_encode;
 pub(crate) mod decisions_wire;
-pub(crate) mod head;
-pub(crate) mod readout;
 pub(crate) mod systemone;
 pub(crate) mod systemone_encode;
 pub(crate) mod systemone_wire;
+pub(crate) mod wire_common;

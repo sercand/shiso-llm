@@ -8,7 +8,7 @@
 //! request's question order, and the workspace builds `serde_json` with
 //! `preserve_order` so the map keeps insertion order into the response bytes.
 //! Nothing here computes anything - every number was decided in
-//! [`super::core`] and [`shiso_decision::math`] - this only spells them out.
+//! `shiso_runtime::decision` - this only spells them out.
 //!
 //! Two spellings are shiso's beside the official shape, both documented
 //! deviations: `confidence` is the label mass (the official API does not
@@ -17,9 +17,9 @@
 //! official `refusal` arm is never sent.
 
 use serde_json::{Map, Value, json};
+use shiso_ir::decision::{AnswerKind, Response};
 
-use crate::decision::core::{Answered, InputTally, Kind, choice_name};
-use shiso_decision::math::expected_score;
+use crate::decision::wire_common::choice_value_json;
 
 /// The one prompt format this server answers in, echoed so a caller knows
 /// which bytes produced the answer it is reading. (shiso extension.)
@@ -36,34 +36,28 @@ fn name_value(id: &str) -> Value {
 }
 
 /// Encodes the scored answers under `model` (the request's own name, or the
-/// server's when the caller named none). `tally` is the prompt side of
-/// `usage`: nothing is generated on this surface, so the output count is zero
-/// and the total is the input.
-pub(crate) fn encode(
-    model: String,
-    answers: &[Answered],
-    tally: InputTally,
-    want_token_ids: bool,
-) -> Value {
-    let answered: Vec<Value> = answers
+/// server's when the caller named none). The response's usage is the prompt
+/// side of `usage`: nothing is generated on this surface, so the output count
+/// is zero and the total is the input.
+pub(crate) fn encode(model: String, response: &Response, want_token_ids: bool) -> Value {
+    let tally = response.usage;
+    let answered: Vec<Value> = response
+        .answers
         .iter()
         .map(|answer| {
             let mut entry = Map::new();
-            match &answer.kind {
-                Kind::Choice { options, .. } => {
+            match answer.kind {
+                AnswerKind::Choice => {
                     entry.insert("type".to_owned(), json!("choice"));
-                    entry.insert("name".to_owned(), name_value(&answer.id));
+                    entry.insert("name".to_owned(), name_value(&answer.name));
                     // The answer echoes the option's value with the type the
                     // caller sent it under.
-                    entry.insert(
-                        "choice".to_owned(),
-                        choice_name(&answer.kind, answer.top).to_json(),
-                    );
-                    let probabilities: Vec<Value> = options
+                    entry.insert("choice".to_owned(), choice_value_json(&answer.choice));
+                    let probabilities: Vec<Value> = answer
+                        .probabilities
                         .iter()
-                        .zip(&answer.probabilities)
-                        .map(|(option, probability)| {
-                            json!({"value": option.value.to_json(), "probability": probability})
+                        .map(|(value, probability)| {
+                            json!({"value": choice_value_json(value), "probability": probability})
                         })
                         .collect();
                     entry.insert(
@@ -73,19 +67,16 @@ pub(crate) fn encode(
                     entry.insert("confidence".to_owned(), json!(answer.label_mass));
                     entry.insert("label_mass".to_owned(), json!(answer.label_mass));
                 }
-                Kind::Score { levels, .. } => {
+                AnswerKind::Score => {
                     entry.insert("type".to_owned(), json!("score"));
-                    entry.insert("name".to_owned(), name_value(&answer.id));
-                    entry.insert(
-                        "score".to_owned(),
-                        json!(expected_score(&answer.probabilities)),
-                    );
-                    let probabilities: Vec<Value> = levels
+                    entry.insert("name".to_owned(), name_value(&answer.name));
+                    entry.insert("score".to_owned(), json!(answer.expected_score.unwrap_or_default()));
+                    let probabilities: Vec<Value> = answer
+                        .probabilities
                         .iter()
-                        .zip(&answer.probabilities)
                         .enumerate()
                         .map(|(index, (level, probability))| {
-                            json!({"value": index, "label": level.label, "probability": probability})
+                            json!({"value": index, "label": level.text(), "probability": probability})
                         })
                         .collect();
                     entry.insert(
@@ -95,16 +86,16 @@ pub(crate) fn encode(
                     entry.insert("confidence".to_owned(), json!(answer.label_mass));
                     entry.insert("label_mass".to_owned(), json!(answer.label_mass));
                 }
-                Kind::YesNo { .. } => {
+                AnswerKind::YesNo => {
                     // The official `predicate`: the probability that the
                     // condition is true. Entry zero of the probabilities is
                     // `yes` by construction, the labels being exactly `yes`
                     // then `no`.
                     entry.insert("type".to_owned(), json!("predicate"));
-                    entry.insert("name".to_owned(), name_value(&answer.id));
+                    entry.insert("name".to_owned(), name_value(&answer.name));
                     entry.insert(
                         "probability".to_owned(),
-                        json!(answer.probabilities.first().copied().unwrap_or(0.0)),
+                        json!(answer.probabilities.first().map_or(0.0, |(_, p)| *p)),
                     );
                     entry.insert("label_mass".to_owned(), json!(answer.label_mass));
                 }
@@ -140,11 +131,11 @@ pub(crate) fn encode(
     body.insert(
         "usage".to_owned(),
         json!({
-            "input_tokens": tally.input,
-            "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": tally.cached},
+            "input_tokens": tally.input_tokens,
+            "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": tally.cached_tokens},
             "output_tokens": 0,
             "output_tokens_details": {"reasoning_tokens": 0},
-            "total_tokens": tally.input,
+            "total_tokens": tally.input_tokens,
         }),
     );
     Value::Object(body)
@@ -153,10 +144,11 @@ pub(crate) fn encode(
 #[cfg(test)]
 mod tests {
     use super::encode;
-    use crate::decision::core::{
-        Answered, ChoiceOption, ChoiceValue, InputTally, Kind, ScoreLevel,
-    };
     use serde_json::{Value, json};
+    use shiso_ir::decision::{
+        Answer, Choice, ChoiceValue, Level, Question, QuestionKind, Response, Usage,
+    };
+    use shiso_runtime::decision::scored_answer;
 
     /// One scored answer with every field the encoder reads set by hand, and
     /// the token-id fields at their no-request values. The probabilities are
@@ -164,39 +156,40 @@ mod tests {
     /// rather than closeness.
     fn answered(
         id: &str,
-        kind: Kind,
+        kind: QuestionKind,
         probabilities: &[f64],
         label_mass: f64,
         top: usize,
-    ) -> Answered {
-        Answered {
-            id: id.to_owned(),
-            kind,
-            probability_answer: false,
-            probabilities: probabilities.to_vec(),
+    ) -> Answer {
+        scored_answer(
+            Question {
+                name: id.to_owned(),
+                instructions: "q".to_owned(),
+                kind,
+                probability_answer: false,
+            },
+            probabilities.to_vec(),
             label_mass,
             top,
-            prompt_tokens: 0,
-            cached_tokens: 0,
-            prompt_token_ids: None,
-            label_token_ids: None,
-        }
+        )
     }
 
-    fn body(answers: &[Answered], want_ids: bool) -> Value {
+    fn body(answers: &[Answer], want_ids: bool) -> Value {
         encode(
             "test-model".to_owned(),
-            answers,
-            InputTally {
-                input: 42,
-                cached: 0,
+            &Response {
+                answers: answers.to_vec(),
+                usage: Usage {
+                    input_tokens: 42,
+                    cached_tokens: 0,
+                },
             },
             want_ids,
         )
     }
 
     /// The entry one answer renders to, on its own.
-    fn only_answer(answer: &Answered) -> Value {
+    fn only_answer(answer: &Answer) -> Value {
         body(std::slice::from_ref(answer), false)["answers"][0].clone()
     }
 
@@ -210,11 +203,10 @@ mod tests {
             .collect()
     }
 
-    fn yes_no(id: &str, probabilities: &[f64], label_mass: f64, top: usize) -> Answered {
+    fn yes_no(id: &str, probabilities: &[f64], label_mass: f64, top: usize) -> Answer {
         answered(
             id,
-            Kind::YesNo {
-                question: "q".to_owned(),
+            QuestionKind::YesNo {
                 yes: None,
                 no: None,
             },
@@ -248,19 +240,16 @@ mod tests {
     fn a_choice_answer_echoes_the_typed_value_and_pairs() {
         let answer = answered(
             "dept",
-            Kind::Choice {
-                question: "q".to_owned(),
-                options: vec![
-                    ChoiceOption {
-                        value: ChoiceValue::Str("billing".to_owned()),
-                        description: None,
-                    },
-                    ChoiceOption {
-                        value: ChoiceValue::Bool(true),
-                        description: None,
-                    },
-                ],
-            },
+            QuestionKind::Choice(vec![
+                Choice {
+                    value: ChoiceValue::Str("billing".to_owned()),
+                    description: None,
+                },
+                Choice {
+                    value: ChoiceValue::Bool(true),
+                    description: None,
+                },
+            ]),
             &[0.95, 0.05],
             0.97,
             0,
@@ -285,19 +274,16 @@ mod tests {
     fn a_boolean_choice_wins_by_type_and_echoes_as_a_boolean() {
         let answer = answered(
             "q",
-            Kind::Choice {
-                question: "q".to_owned(),
-                options: vec![
-                    ChoiceOption {
-                        value: ChoiceValue::Str("true".to_owned()),
-                        description: None,
-                    },
-                    ChoiceOption {
-                        value: ChoiceValue::Bool(true),
-                        description: None,
-                    },
-                ],
-            },
+            QuestionKind::Choice(vec![
+                Choice {
+                    value: ChoiceValue::Str("true".to_owned()),
+                    description: None,
+                },
+                Choice {
+                    value: ChoiceValue::Bool(true),
+                    description: None,
+                },
+            ]),
             &[0.25, 0.75],
             1.0,
             1,
@@ -309,23 +295,20 @@ mod tests {
     fn a_score_answer_weights_the_level_indices() {
         let answer = answered(
             "sev",
-            Kind::Score {
-                question: "q".to_owned(),
-                levels: vec![
-                    ScoreLevel {
-                        label: "Cosmetic".to_owned(),
-                        description: None,
-                    },
-                    ScoreLevel {
-                        label: "Workaround".to_owned(),
-                        description: Some("another way".to_owned()),
-                    },
-                    ScoreLevel {
-                        label: "Blocked".to_owned(),
-                        description: None,
-                    },
-                ],
-            },
+            QuestionKind::Score(vec![
+                Level {
+                    label: "Cosmetic".to_owned(),
+                    description: None,
+                },
+                Level {
+                    label: "Workaround".to_owned(),
+                    description: Some("another way".to_owned()),
+                },
+                Level {
+                    label: "Blocked".to_owned(),
+                    description: None,
+                },
+            ]),
             &[0.25, 0.5, 0.25],
             0.75,
             1,
@@ -401,19 +384,16 @@ mod tests {
     fn a_choice_answer_spells_its_fields_in_the_official_order() {
         let answer = answered(
             "q",
-            Kind::Choice {
-                question: "q".to_owned(),
-                options: vec![
-                    ChoiceOption {
-                        value: ChoiceValue::Str("a".to_owned()),
-                        description: None,
-                    },
-                    ChoiceOption {
-                        value: ChoiceValue::Str("b".to_owned()),
-                        description: None,
-                    },
-                ],
-            },
+            QuestionKind::Choice(vec![
+                Choice {
+                    value: ChoiceValue::Str("a".to_owned()),
+                    description: None,
+                },
+                Choice {
+                    value: ChoiceValue::Str("b".to_owned()),
+                    description: None,
+                },
+            ]),
             &[0.5, 0.5],
             1.0,
             0,

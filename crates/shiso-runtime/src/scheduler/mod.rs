@@ -2536,7 +2536,7 @@ fn start_decoding(
 /// mid-prefill; the sequence still retires and frees its session either way.
 fn finish_scoring(row: &[u8], scores: &mut [f32], slot: &mut SeqSlot) {
     let label_logprobs =
-        shiso_decision::math::label_logprobs(fill(row, scores), slot.score_labels());
+        crate::decision::math::label_logprobs(fill(row, scores), slot.score_labels());
     slot.finish_score();
     if let Some(reply) = slot.take_score_reply() {
         let _ = reply.send(Ok(ScoreOutcome {

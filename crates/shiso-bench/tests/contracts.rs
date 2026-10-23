@@ -748,160 +748,243 @@ const _: fn(Vec<u32>) -> shiso_ir::EmbedInput = shiso_ir::EmbedInput::Tokens;
 type Matryoshka = fn(&[f32], usize) -> Result<Vec<f32>, shiso_models::embedder::EmbedError>;
 const _: Matryoshka = shiso_models::embedder::matryoshka;
 
-/// The in-process decision library as embedders and the server call it:
-/// opening, the two ways of asking, the install door, and the request and
-/// answer shapes. A drift in any of them stops here.
+/// The typed decision core as embedders and the server call it: the IR it
+/// takes and returns, `decide`, and the pure steps the server's scheduler
+/// builds the decisions route from. A drift in any of them stops here.
 mod decision {
-    use shiso_core::{ReadoutPrompt, SchemaQuestion, TokenId};
-    use shiso_decision::error::DecideError;
-    use shiso_decision::schema::{Answer, Choice, DecisionRequest, Question};
-    use shiso_decision::score::{
-        RunScore, ScoreRun, Scored, fold_head, fold_readout, readout_runs,
-    };
-    use shiso_decision::{Decider, InstalledModel, OpenDesc, ensure_model};
+    use std::sync::Arc;
 
-    const _: for<'a> fn(&OpenDesc<'a>) -> Result<Decider, DecideError> = Decider::open;
-    const _: fn(&Decider, &DecisionRequest) -> Result<Vec<Answer>, DecideError> =
-        Decider::decide_blocking;
+    use shiso_core::{ReadoutPrompt, SchemaQuestion, TokenId};
+    use shiso_ir::decision::{
+        Answer, AnswerKind, Choice, ChoiceValue, Input, Level, Part, Question, QuestionKind,
+        ReadoutState, Request, Response, Usage,
+    };
+    use shiso_runtime::decision::score::{
+        RunScore, ScoreError, ScoreRun, Scored, fold_head, fold_readout, readout_runs,
+    };
+    use shiso_runtime::decision::{core, decide, scored_answer};
+    use shiso_runtime::error::AppError;
+    use shiso_runtime::state::AppState;
+
+    /// `decide` answers an IR request from the model a state serves. The
+    /// future is named so the compiler checks the async signature.
     #[expect(
         dead_code,
         reason = "named only so the compiler checks the async signature"
     )]
-    fn decide_future<'a>(
-        decider: &'a Decider,
-        request: &'a DecisionRequest,
-    ) -> impl Future<Output = Result<Vec<Answer>, DecideError>> + 'a {
-        decider.decide(request)
+    fn decide_future(
+        state: &Arc<AppState>,
+        request: Request,
+    ) -> impl Future<Output = Result<Response, AppError>> + '_ {
+        decide(state, request)
     }
-    type EnsureModel = fn(
-        &str,
-        &std::path::Path,
-        &mut dyn FnMut(u64, u64) -> bool,
-    ) -> Result<InstalledModel, DecideError>;
-    const _: EnsureModel = ensure_model;
 
-    /// `OpenDesc` is the model directory and the context length; `new` takes
-    /// the directory alone.
-    type OpenDescFields<'a> = (&'a std::path::Path, usize);
-    fn open_desc_fields(desc: OpenDesc<'_>) -> OpenDescFields<'_> {
-        (desc.model_dir, desc.ctx)
+    type RequestFields = (
+        Input,
+        ReadoutState,
+        Vec<Question>,
+        Option<f64>,
+        Option<bool>,
+        bool,
+    );
+    fn request_fields(request: Request) -> RequestFields {
+        (
+            request.input,
+            request.readout_state,
+            request.questions,
+            request.temperature,
+            request.preserve_thinking,
+            request.token_ids,
+        )
     }
-    const _: for<'a> fn(OpenDesc<'a>) -> OpenDescFields<'a> = open_desc_fields;
-    fn open_desc_new(dir: &std::path::Path) -> OpenDesc<'_> {
-        OpenDesc::new(dir)
-    }
-    const _: for<'a> fn(&'a std::path::Path) -> OpenDesc<'a> = open_desc_new;
+    const _: fn(Request) -> RequestFields = request_fields;
 
-    type InstalledFields = (std::path::PathBuf, u64);
-    fn installed_fields(model: InstalledModel) -> InstalledFields {
-        (model.dir, model.total_bytes)
+    /// Every shape of input, with its payload types. Exhaustive: a shape
+    /// added makes this non-exhaustive.
+    fn input_shapes(input: Input) -> u8 {
+        match input {
+            Input::Text(text) => {
+                let _: String = text;
+                0
+            }
+            Input::Blocks(parts) => {
+                let _: Vec<Part> = parts;
+                1
+            }
+            Input::Pictured { media, text } => {
+                let _: (Vec<shiso_ir::MediaSource>, String) = (media, text);
+                2
+            }
+        }
     }
-    const _: fn(InstalledModel) -> InstalledFields = installed_fields;
+    const _: fn(Input) -> u8 = input_shapes;
 
-    type RequestFields = (String, Vec<Question>, Option<f32>);
-    fn request_fields(request: DecisionRequest) -> RequestFields {
-        (request.input, request.questions, request.temperature)
+    fn part_shapes(part: Part) -> u8 {
+        match part {
+            Part::Text(text) => {
+                let _: String = text;
+                0
+            }
+            Part::Image(source) => {
+                let _: shiso_ir::MediaSource = source;
+                1
+            }
+        }
     }
-    const _: fn(DecisionRequest) -> RequestFields = request_fields;
+    const _: fn(Part) -> u8 = part_shapes;
 
-    type ChoiceFields = (String, Option<String>);
+    fn readout_state_shapes(state: ReadoutState) -> u8 {
+        match state {
+            ReadoutState::Input => 0,
+            ReadoutState::Absent => 1,
+            ReadoutState::Structured { compact, indented } => {
+                let _: (String, String) = (compact, indented);
+                2
+            }
+        }
+    }
+    const _: fn(ReadoutState) -> u8 = readout_state_shapes;
+
+    type QuestionFields = (String, String, QuestionKind, bool);
+    fn question_fields(question: Question) -> QuestionFields {
+        (
+            question.name,
+            question.instructions,
+            question.kind,
+            question.probability_answer,
+        )
+    }
+    const _: fn(Question) -> QuestionFields = question_fields;
+
+    /// Every kind of question, with its payload types. Exhaustive: a kind
+    /// added makes this non-exhaustive.
+    fn question_kinds(kind: QuestionKind) -> u8 {
+        match kind {
+            QuestionKind::Choice(choices) => {
+                let _: Vec<Choice> = choices;
+                0
+            }
+            QuestionKind::YesNo { yes, no } => {
+                let _: (Option<String>, Option<String>) = (yes, no);
+                1
+            }
+            QuestionKind::Score(levels) => {
+                let _: Vec<Level> = levels;
+                2
+            }
+        }
+    }
+    const _: fn(QuestionKind) -> u8 = question_kinds;
+
+    type ChoiceFields = (ChoiceValue, Option<String>);
     fn choice_fields(choice: Choice) -> ChoiceFields {
         (choice.value, choice.description)
     }
     const _: fn(Choice) -> ChoiceFields = choice_fields;
 
-    type AnswerFields = (String, String, Vec<(String, f32)>, f32);
+    type LevelFields = (String, Option<String>);
+    fn level_fields(level: Level) -> LevelFields {
+        (level.label, level.description)
+    }
+    const _: fn(Level) -> LevelFields = level_fields;
+
+    fn choice_values(value: ChoiceValue) -> u8 {
+        match value {
+            ChoiceValue::Str(text) => {
+                let _: String = text;
+                0
+            }
+            ChoiceValue::Bool(flag) => {
+                let _: bool = flag;
+                1
+            }
+        }
+    }
+    const _: fn(ChoiceValue) -> u8 = choice_values;
+
+    type AnswerFields = (
+        String,
+        AnswerKind,
+        bool,
+        ChoiceValue,
+        Vec<(ChoiceValue, f64)>,
+        f64,
+        f64,
+        Option<f64>,
+        Option<Vec<u32>>,
+        Option<Vec<u32>>,
+    );
     fn answer_fields(answer: Answer) -> AnswerFields {
         (
             answer.name,
+            answer.kind,
+            answer.probability_answer,
             answer.choice,
             answer.probabilities,
             answer.confidence,
+            answer.label_mass,
+            answer.expected_score,
+            answer.prompt_token_ids,
+            answer.label_token_ids,
         )
     }
     const _: fn(Answer) -> AnswerFields = answer_fields;
 
-    /// Every kind of question, with its payload types. Exhaustive: a kind
-    /// added upstream makes this non-exhaustive.
-    fn question_kinds(question: Question) -> u8 {
-        match question {
-            Question::Choice {
-                name: _,
-                instructions: _,
-                choices,
-            } => {
-                let _: Vec<Choice> = choices;
-                0
-            }
-            Question::YesNo {
-                name: _,
-                instructions: _,
-                yes,
-                no,
-            } => {
-                let _: (Option<String>, Option<String>) = (yes, no);
-                1
-            }
-            Question::Score {
-                name: _,
-                instructions: _,
-                levels,
-            } => {
-                let _: Vec<Choice> = levels;
-                2
-            }
+    fn answer_kinds(kind: AnswerKind) -> u8 {
+        match kind {
+            AnswerKind::Choice => 0,
+            AnswerKind::YesNo => 1,
+            AnswerKind::Score => 2,
         }
     }
-    const _: fn(Question) -> u8 = question_kinds;
+    const _: fn(AnswerKind) -> u8 = answer_kinds;
+
+    type ResponseFields = (Vec<Answer>, Usage);
+    fn response_fields(response: Response) -> ResponseFields {
+        (response.answers, response.usage)
+    }
+    const _: fn(Response) -> ResponseFields = response_fields;
+
+    type UsageFields = (u64, u64);
+    fn usage_fields(usage: Usage) -> UsageFields {
+        (usage.input_tokens, usage.cached_tokens)
+    }
+    const _: fn(Usage) -> UsageFields = usage_fields;
+
+    const _: fn(Question, Vec<f64>, f64, usize) -> Answer = scored_answer;
+
+    /// The shared validators every wire calls while parsing.
+    const _: fn(Option<&str>) -> Result<(), AppError> = core::check_model;
+    const _: fn(&str) -> Result<(), AppError> = core::check_input;
+    const _: fn(&[Question], bool) -> Result<(), AppError> = core::check_ids;
+    const _: fn(&str, &str, bool) -> Result<(), AppError> = core::check_question_text;
+    const _: fn(&[Choice], &str, usize) -> Result<(), AppError> = core::check_choice_options;
+    const _: fn(&[Level], &str, usize) -> Result<(), AppError> = core::check_score_levels;
+    const _: fn(Option<f64>) -> Result<f64, AppError> = core::check_temperature;
 
     /// Every error variant a caller matches on, with its payload type. The
     /// enum is `non_exhaustive`, so the wildcard is the only way to stay
     /// total; the named arms are what is pinned.
-    fn decide_error_variants(error: &DecideError) -> u8 {
+    fn score_error_variants(error: &ScoreError) -> u8 {
         match error {
-            DecideError::NoDevice(message) => {
+            ScoreError::Layout(message) => {
                 let _: &String = message;
                 0
             }
-            DecideError::Load(message) => {
+            ScoreError::Engine(message) => {
                 let _: &String = message;
                 1
-            }
-            DecideError::Request(message) => {
-                let _: &String = message;
-                2
-            }
-            DecideError::Layout(message) => {
-                let _: &String = message;
-                3
-            }
-            DecideError::Engine(message) => {
-                let _: &String = message;
-                4
-            }
-            DecideError::UnknownModel(name) => {
-                let _: &String = name;
-                5
-            }
-            DecideError::Download(message) => {
-                let _: &String = message;
-                6
-            }
-            DecideError::Cancelled => 7,
-            DecideError::Io(error) => {
-                let _: &std::io::Error = error;
-                8
             }
             _ => u8::MAX,
         }
     }
-    const _: fn(&DecideError) -> u8 = decide_error_variants;
+    const _: fn(&ScoreError) -> u8 = score_error_variants;
 
     /// The pure steps the server's scheduler builds its decisions route from.
-    type ReadoutRuns = fn(&ReadoutPrompt, &[SchemaQuestion]) -> Result<Vec<ScoreRun>, DecideError>;
+    type ReadoutRuns = fn(&ReadoutPrompt, &[SchemaQuestion]) -> Result<Vec<ScoreRun>, ScoreError>;
     type FoldReadout =
-        fn(&ReadoutPrompt, &[ScoreRun], &[RunScore], f64) -> Result<Vec<Scored>, DecideError>;
-    type FoldHead = fn(&[Vec<f32>], &[Vec<usize>], f64) -> Result<Vec<Scored>, DecideError>;
+        fn(&ReadoutPrompt, &[ScoreRun], &[RunScore], f64) -> Result<Vec<Scored>, ScoreError>;
+    type FoldHead = fn(&[Vec<f32>], &[Vec<usize>], f64) -> Result<Vec<Scored>, ScoreError>;
     const _: ReadoutRuns = readout_runs;
     const _: FoldReadout = fold_readout;
     const _: FoldHead = fold_head;
@@ -918,14 +1001,15 @@ mod decision {
     }
     const _: fn(RunScore) -> RunScoreFields = run_score_fields;
 
-    /// The literal-aware encoder the decider and the server's vocabulary share.
+    /// The literal-aware encoder the vocabulary's decision pieces and chat
+    /// prompts share.
     type Encode = fn(
         &tokenizers::Tokenizer,
         &str,
         &[std::ops::Range<usize>],
     ) -> Result<Vec<TokenId>, tokenizers::Error>;
-    const _: Encode = shiso_decision::literal::encode_piece;
-    const _: Encode = shiso_decision::literal::encode_with_literals;
+    const _: Encode = shiso_runtime::decision::literal::encode_piece;
+    const _: Encode = shiso_runtime::decision::literal::encode_with_literals;
 }
 
 /// The contracts above are checked by the compiler, so this file building at

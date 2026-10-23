@@ -2659,7 +2659,6 @@ dependencies = [
  "shiso-audio",
  "shiso-core",
  "shiso-cuda",
- "shiso-decision",
  "shiso-engine",
  "shiso-hub",
  "shiso-ir",
@@ -2669,6 +2668,7 @@ dependencies = [
  "shiso-metal",
  "shiso-modelfile",
  "shiso-models",
+ "shiso-runtime",
  "shiso-server",
  "shiso-vision",
  "thiserror",
@@ -2711,30 +2711,6 @@ dependencies = [
  "thiserror",
  "tokenizers",
  "tracing",
-]
-
-[[package]]
-name = "shiso-decision"
-version = "0.2.4"
-dependencies = [
- "futures",
- "hex",
- "semver",
- "serde_json",
- "sha2",
- "shiso-core",
- "shiso-cuda",
- "shiso-engine",
- "shiso-hub",
- "shiso-metal",
- "shiso-models",
- "tempfile",
- "thiserror",
- "tokenizers",
- "tokio",
- "tracing",
- "url",
- "wiremock",
 ]
 
 [[package]]
@@ -3001,7 +2977,6 @@ dependencies = [
  "shiso-audio",
  "shiso-core",
  "shiso-cuda",
- "shiso-decision",
  "shiso-engine",
  "shiso-hub",
  "shiso-ir",
@@ -3042,7 +3017,6 @@ dependencies = [
  "shiso-audio",
  "shiso-core",
  "shiso-cuda",
- "shiso-decision",
  "shiso-engine",
  "shiso-hub",
  "shiso-ir",

@@ -23,6 +23,7 @@ pub mod api;
 pub mod audio;
 pub mod boot;
 pub mod boot_error;
+pub mod decision;
 pub mod embed;
 pub mod error;
 pub mod hub;

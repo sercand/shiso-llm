@@ -16,14 +16,14 @@ use shiso_core::{
     DecisionRecord, PromptEncoder, SchemaAnswer, SchemaOption, SchemaQuestion, TokenId,
 };
 use shiso_ir::Block;
+use shiso_ir::decision::{Input, Part, Question, QuestionKind};
 
-use crate::decision::core::{self, Answered, InputTally, Kind, RawQuestion};
-use crate::decision::decisions_wire::{DecisionInput, InputBlock};
+use crate::decision::core::{self, Answered, InputTally};
+use crate::decision::score::{Scored, fold_head};
 use crate::error::AppError;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
 use crate::tokenizer::Vocabulary;
-use shiso_decision::score::{Scored, fold_head};
 
 /// The vocabulary, as a layout reaches it.
 pub(crate) struct Encoder<'a>(pub(crate) &'a Vocabulary);
@@ -41,78 +41,73 @@ impl PromptEncoder for Encoder<'_> {
 }
 
 /// A question as the layout reads it.
-pub(crate) fn schema_question(question: &RawQuestion) -> SchemaQuestion {
-    let (wording, answer) = match &question.kind {
-        Kind::YesNo { question, yes, no } => (
-            question,
-            SchemaAnswer::YesNo {
-                yes: yes.clone(),
-                no: no.clone(),
-            },
+pub(crate) fn schema_question(question: &Question) -> SchemaQuestion {
+    let answer = match &question.kind {
+        QuestionKind::YesNo { yes, no } => SchemaAnswer::YesNo {
+            yes: yes.clone(),
+            no: no.clone(),
+        },
+        QuestionKind::Choice(options) => SchemaAnswer::Choice(
+            options
+                .iter()
+                .map(|option| SchemaOption {
+                    value: option.value.text(),
+                    description: option.description.clone(),
+                })
+                .collect(),
         ),
-        Kind::Choice { question, options } => (
-            question,
-            SchemaAnswer::Choice(
-                options
-                    .iter()
-                    .map(|option| SchemaOption {
-                        value: option.value.text(),
-                        description: option.description.clone(),
-                    })
-                    .collect(),
-            ),
-        ),
-        Kind::Score { question, levels } => (
-            question,
-            SchemaAnswer::Score(
-                levels
-                    .iter()
-                    .map(|level| SchemaOption {
-                        value: level.label.clone(),
-                        description: level.description.clone(),
-                    })
-                    .collect(),
-            ),
+        QuestionKind::Score(levels) => SchemaAnswer::Score(
+            levels
+                .iter()
+                .map(|level| SchemaOption {
+                    value: level.label.clone(),
+                    description: level.description.clone(),
+                })
+                .collect(),
         ),
     };
     // A blank wording is no wording: the layout decides what stands in.
-    let wording = if wording.trim().is_empty() {
+    let wording = if question.instructions.trim().is_empty() {
         String::new()
     } else {
-        wording.clone()
+        question.instructions.clone()
     };
     SchemaQuestion {
-        id: question.id.clone(),
+        id: question.name.clone(),
         wording,
         answer,
     }
 }
 
-/// The state text and the media of a decisions input: the string, or the
+/// The state text and the media of a decision input: the string, or the
 /// blocks' text in order beside their pictures in order. Where the pictures
 /// go in the prompt is the layout's call, not the order the caller
 /// interleaved them.
-pub(crate) fn split_input(input: &DecisionInput) -> (String, Vec<Block>) {
+pub(crate) fn split_input(input: &Input) -> (String, Vec<Block>) {
     match input {
-        DecisionInput::Text(text) => (text.clone(), Vec::new()),
-        DecisionInput::Blocks(blocks) => {
+        Input::Text(text) => (text.clone(), Vec::new()),
+        Input::Blocks(parts) => {
             let mut text = String::new();
             let mut media = Vec::new();
-            for block in blocks {
-                match block {
-                    InputBlock::Text { text: part } => text.push_str(part),
-                    InputBlock::Image(source) => media.push(core::image_block(source)),
+            for part in parts {
+                match part {
+                    Part::Text(part) => text.push_str(part),
+                    Part::Image(_) => media.push(core::part_block(part)),
                 }
             }
             (text, media)
         }
+        Input::Pictured { media, text } => (
+            text.clone(),
+            media.iter().cloned().map(Block::Image).collect(),
+        ),
     }
 }
 
 /// What a refusal of the layout tells the caller.
 pub(crate) fn layout_refusal(
     error: DecisionLayoutError,
-    questions: &[RawQuestion],
+    questions: &[Question],
     ctx: u32,
 ) -> AppError {
     match error {
@@ -124,7 +119,7 @@ pub(crate) fn layout_refusal(
         DecisionLayoutError::AmbiguousOption { question, spelling } => AppError::bad_request(
             format!(
                 "{}: the decision head cannot score two options spelled {spelling:?}",
-                core::question_name(questions.get(question).map_or("", |q| q.id.as_str()))
+                core::question_name(questions.get(question).map_or("", |q| q.name.as_str()))
             ),
             Some("questions"),
             "invalid_request",
@@ -149,7 +144,7 @@ pub(crate) async fn run(
     layout: &dyn DecisionLayout,
     text: &str,
     media: Vec<Block>,
-    questions: Vec<RawQuestion>,
+    questions: Vec<Question>,
     temperature: f64,
     want_token_ids: bool,
 ) -> Result<(Vec<Answered>, InputTally), AppError> {
@@ -225,15 +220,13 @@ pub(crate) async fn run(
 /// One question's answer from the head's folded probabilities, already in the
 /// caller's option order.
 fn answer(
-    question: RawQuestion,
+    question: Question,
     scored: Scored,
     prompt_token_ids: Option<Vec<u32>>,
     want_token_ids: bool,
 ) -> Answered {
     Answered {
-        id: question.id,
-        kind: question.kind,
-        probability_answer: question.probability_answer,
+        question,
         probabilities: scored.probabilities,
         // The head's options are the whole distribution.
         label_mass: scored.label_mass,
@@ -250,24 +243,23 @@ fn answer(
 #[cfg(test)]
 mod tests {
     use super::{schema_question, split_input};
-    use crate::decision::core::{ChoiceOption, ChoiceValue, Kind, RawQuestion};
-    use crate::decision::decisions_wire::{DecisionInput, InputBlock, InputImageSource};
     use shiso_core::SchemaAnswer;
-    use shiso_ir::Block;
+    use shiso_ir::decision::{Choice, ChoiceValue, Input, Part, Question, QuestionKind};
+    use shiso_ir::{Block, MediaSource};
 
-    fn choice() -> RawQuestion {
-        RawQuestion {
-            id: "team".to_owned(),
-            kind: Kind::Choice {
-                question: "  ".to_owned(),
-                options: ["tech", "billing"]
+    fn choice() -> Question {
+        Question {
+            name: "team".to_owned(),
+            instructions: "  ".to_owned(),
+            kind: QuestionKind::Choice(
+                ["tech", "billing"]
                     .iter()
-                    .map(|name| ChoiceOption {
+                    .map(|name| Choice {
                         value: ChoiceValue::Str((*name).to_owned()),
                         description: None,
                     })
                     .collect(),
-            },
+            ),
             probability_answer: false,
         }
     }
@@ -281,19 +273,24 @@ mod tests {
 
     #[test]
     fn pictures_are_taken_out_of_the_state_text() {
-        let input = DecisionInput::Blocks(vec![
-            InputBlock::Text {
-                text: "a ".to_owned(),
-            },
-            InputBlock::Image(InputImageSource::Url {
-                url: "https://example.com/a.png".to_owned(),
-            }),
-            InputBlock::Text {
-                text: "b".to_owned(),
-            },
+        let input = Input::Blocks(vec![
+            Part::Text("a ".to_owned()),
+            Part::Image(MediaSource::Remote("https://example.com/a.png".to_owned())),
+            Part::Text("b".to_owned()),
         ]);
         let (text, media) = split_input(&input);
         assert_eq!(text, "a b");
+        assert!(matches!(media.as_slice(), [Block::Image(_)]));
+    }
+
+    #[test]
+    fn pictures_ahead_of_a_state_keep_the_state_as_sent() {
+        let input = Input::Pictured {
+            media: vec![MediaSource::Remote("https://example.com/a.png".to_owned())],
+            text: "  state\n".to_owned(),
+        };
+        let (text, media) = split_input(&input);
+        assert_eq!(text, "  state\n");
         assert!(matches!(media.as_slice(), [Block::Image(_)]));
     }
 }

@@ -39,7 +39,7 @@ mod variant_tests;
 /// this process, which needs the lock exclusively.
 #[derive(Debug)]
 pub struct InstalledModel {
-    /// The installed variant's directory, ready for `Decider::open` or a
+    /// The installed variant's directory, ready for a
     /// serve path.
     pub dir: PathBuf,
     /// The bytes of the variant's files.

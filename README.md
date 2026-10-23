@@ -207,38 +207,43 @@ curl http://127.0.0.1:8090/v1/audio/transcriptions \
 
 ## Library use
 
-The `shiso-decision` crate runs a decision model inside your own process: give
-it some text and a multiple-choice question, get the probability of each
-answer back. It serves models with a decision readout or head only; generic
-chat models go through the server's `/v1/decisions` route. Build it with
-`--features metal` or `--features cuda` (without one, opening a model fails
-with `NoDevice`).
+The `shiso-runtime` crate is the server's engine without the HTTP layer:
+scheduler, model loading, tokenizer, media and the decision core. Hand
+`shiso_runtime::decision::decide` a booted `AppState` and a request in the
+`shiso_ir::decision` types, and get the probability of each answer back. A
+model with a decision readout or head answers every question from one prompt;
+any other chat model scores each question's labels from its next-token row, as
+the `/v1/decisions` route does.
 
 ```rust
-use std::path::Path;
-use shiso_decision::schema::{Choice, DecisionRequest, Question};
-use shiso_decision::{Decider, OpenDesc, ensure_model};
+use shiso_ir::decision::{
+    Choice, ChoiceValue, Input, Question, QuestionKind, ReadoutState, Request,
+};
 
-let model = ensure_model("d1-3b", Path::new("models"), &mut |done, total| {
-    eprintln!("{done}/{total}");
-    true // false cancels; partial files are kept and resumed
-})?;
-let decider = Decider::open(&OpenDesc::new(&model.dir))?;
-let choice = |v: &str| Choice { value: v.into(), description: None };
-let answers = decider.decide_blocking(&DecisionRequest {
-    input: "cwd: /repo\ntask: unknown\ncmd: ls -la".into(),
-    questions: vec![Question::Choice {
-        name: "decision".into(),
-        instructions: "Is this command safe to run without asking?".into(),
-        choices: vec![choice("approve"), choice("ask"), choice("deny")],
-    }],
-    temperature: None,
-})?;
+let choice = |v: &str| Choice { value: ChoiceValue::Str(v.into()), description: None };
+let response = shiso_runtime::decision::decide(
+    &state, // an `Arc<AppState>` from `shiso_runtime::boot`
+    Request {
+        input: Input::Text("cwd: /repo\ntask: unknown\ncmd: ls -la".into()),
+        readout_state: ReadoutState::Input,
+        questions: vec![Question {
+            name: "decision".into(),
+            instructions: "Is this command safe to run without asking?".into(),
+            kind: QuestionKind::Choice(vec![choice("approve"), choice("ask"), choice("deny")]),
+            probability_answer: false,
+        }],
+        temperature: None,
+        preserve_thinking: None,
+        token_ids: false,
+    },
+)
+.await?;
+println!("{:?}", response.answers[0].probabilities);
 ```
 
-`ensure_model` and `decide_blocking` block, so call them from a thread that
-may block. A `Decider` owns its model on a worker thread; dropping it joins
-that thread, so drop it off any async executor.
+Build with `--features metal` or `--features cuda`; the runtime has no HTTP
+server or command-line parser in its dependencies unless you turn on its
+`clap` feature.
 
 ## Configuration
 

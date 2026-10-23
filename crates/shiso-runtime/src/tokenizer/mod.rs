@@ -205,7 +205,7 @@ impl Vocabulary {
         if literal.is_empty() {
             return self.encode_prompt(text);
         }
-        let mut tokens = shiso_decision::literal::encode_with_literals(&self.inner, text, literal)
+        let mut tokens = crate::decision::literal::encode_with_literals(&self.inner, text, literal)
             .map_err(|error| TokenizerError::Encode {
                 message: error.to_string(),
             })?;
@@ -219,8 +219,7 @@ impl Vocabulary {
 
     /// Encodes one piece of a decision prompt: no opening token, and caller
     /// text in `literal` that spells a marker is read as text. The one
-    /// implementation lives in `shiso-decision`, which the in-process decider
-    /// shares.
+    /// implementation lives in [`crate::decision::literal`].
     ///
     /// # Errors
     ///
@@ -230,7 +229,7 @@ impl Vocabulary {
         text: &str,
         literal: &[std::ops::Range<usize>],
     ) -> Result<Vec<TokenId>, TokenizerError> {
-        shiso_decision::literal::encode_piece(&self.inner, text, literal).map_err(|error| {
+        crate::decision::literal::encode_piece(&self.inner, text, literal).map_err(|error| {
             TokenizerError::Encode {
                 message: error.to_string(),
             }

@@ -1,16 +1,19 @@
-//! The in-process decider against the `/v1/decisions` route, on a real d1
-//! checkpoint and a real device.
+//! The typed core against the `/v1/decisions` route, on a real d1 checkpoint
+//! and a real device.
 //!
-//! `shiso-decision`'s `Decider` and the server answer from one library, but
-//! they run the model differently: the server's scheduler checkpoints the
-//! shared state between a request's questions and resumes each from it, the
-//! decider reads every question's prompt whole. This is the test that the two
-//! agree on what the model says.
+//! The route parses the wire into `shiso_ir::decision`, calls
+//! `shiso_runtime::decision::decide`, and spells the answer back out. This is
+//! the test that the wire layer in between changes nothing: the same request
+//! handed to `decide` as IR answers what the endpoint answers, to within
+//! arithmetic noise.
 //!
 //! ```text
-//! SHISO_TEST_MODEL_D1=/path/to/installed/d1/q8_0 \
-//!   cargo test -p shiso-server --features metal --test decisions_in_process -- --ignored --nocapture
+//! SHISO_HOME=/path/to/home cargo test --release -p shiso-server --features metal \
+//!   --test decisions_in_process -- --ignored --nocapture
 //! ```
+//!
+//! The model is `d1-3b` installed under `$SHISO_HOME/models/d1-3b/q8_0`, or
+//! the directory `SHISO_TEST_MODEL_D1` names.
 
 #![cfg(feature = "metal")]
 
@@ -21,16 +24,15 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use shiso_core::Backend;
-use shiso_decision::schema::{Choice, DecisionRequest, Question};
-use shiso_decision::{Decider, OpenDesc};
+use shiso_ir::decision::{Choice, ChoiceValue, Input, Question, QuestionKind, ReadoutState};
+use shiso_runtime::decision::decide;
 use shiso_server::cli::{Cli, Command};
 use shiso_server::router::build_router;
 use shiso_server::scheduler::{SchedulerConfig, spawn_engine_with_checkpoints};
 use shiso_server::state::AppState;
 use tower::ServiceExt as _;
 
-/// What the two paths may differ by: arithmetic noise from reading a prompt
-/// whole against resuming it from a checkpoint.
+/// What the two paths may differ by: arithmetic noise.
 const TOLERANCE: f64 = 1e-4;
 
 /// Says why a case skipped, on stderr.
@@ -41,7 +43,10 @@ fn say(line: &str) {
 
 /// The installed d1 directory: `config/` beside `base/`.
 fn d1_dir() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("SHISO_TEST_MODEL_D1")?);
+    let dir = match std::env::var_os("SHISO_TEST_MODEL_D1") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("SHISO_HOME")?).join("models/d1-3b/q8_0"),
+    };
     dir.join("config/config.json").is_file().then_some(dir)
 }
 
@@ -154,19 +159,22 @@ async fn post_decisions(state: &Arc<AppState>, body: &Value) -> Value {
     body
 }
 
-/// A choice question as the library and the wire each spell it.
+/// A choice question as the IR and the wire each spell it.
 fn question(name: &str, instructions: &str, values: &[&str]) -> (Question, Value) {
     (
-        Question::Choice {
+        Question {
             name: name.to_owned(),
             instructions: instructions.to_owned(),
-            choices: values
-                .iter()
-                .map(|value| Choice {
-                    value: (*value).to_owned(),
-                    description: None,
-                })
-                .collect(),
+            kind: QuestionKind::Choice(
+                values
+                    .iter()
+                    .map(|value| Choice {
+                        value: ChoiceValue::Str((*value).to_owned()),
+                        description: None,
+                    })
+                    .collect(),
+            ),
+            probability_answer: false,
         },
         json!({"name": name, "type": "choice", "instructions": instructions, "choices": values}),
     )
@@ -175,16 +183,19 @@ fn question(name: &str, instructions: &str, values: &[&str]) -> (Question, Value
 /// A choice question whose options carry descriptions, as `(value, text)`.
 fn described(name: &str, instructions: &str, options: &[(&str, &str)]) -> (Question, Value) {
     (
-        Question::Choice {
+        Question {
             name: name.to_owned(),
             instructions: instructions.to_owned(),
-            choices: options
-                .iter()
-                .map(|(value, text)| Choice {
-                    value: (*value).to_owned(),
-                    description: Some((*text).to_owned()),
-                })
-                .collect(),
+            kind: QuestionKind::Choice(
+                options
+                    .iter()
+                    .map(|(value, text)| Choice {
+                        value: ChoiceValue::Str((*value).to_owned()),
+                        description: Some((*text).to_owned()),
+                    })
+                    .collect(),
+            ),
+            probability_answer: false,
         },
         json!({
             "name": name, "type": "choice", "instructions": instructions,
@@ -198,7 +209,7 @@ fn described(name: &str, instructions: &str, options: &[(&str, &str)]) -> (Quest
 
 /// The requests both paths answer: the classifier's single question over
 /// ordinary and hostile commands, and a request of two questions whose shared
-/// state the server checkpoints and the decider reads twice.
+/// state the scheduler checkpoints.
 fn cases() -> Vec<(String, Vec<(Question, Value)>)> {
     let verdict = || {
         question(
@@ -251,10 +262,12 @@ fn cases() -> Vec<(String, Vec<(Question, Value)>)> {
 }
 
 #[test]
-#[ignore = "needs SHISO_TEST_MODEL_D1 and a Metal device"]
+#[ignore = "needs d1-3b under SHISO_HOME (or SHISO_TEST_MODEL_D1) and a Metal device"]
 fn d1_answers_match_the_endpoint() {
     let Some(dir) = d1_dir() else {
-        say("skipping: SHISO_TEST_MODEL_D1 names no installed d1 directory");
+        say(
+            "skipping: neither SHISO_TEST_MODEL_D1 nor SHISO_HOME/models/d1-3b/q8_0 names an installed d1",
+        );
         return;
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -262,7 +275,6 @@ fn d1_answers_match_the_endpoint() {
         .build()
         .expect("a runtime");
     let stack = Stack::boot(&dir);
-    let decider = Decider::open(&OpenDesc::new(&dir)).expect("the decider opens");
 
     for (input, questions) in cases() {
         let wire = json!({
@@ -270,41 +282,51 @@ fn d1_answers_match_the_endpoint() {
             "questions": questions.iter().map(|(_, wire)| wire.clone()).collect::<Vec<_>>(),
         });
         let served = runtime.block_on(post_decisions(&stack.state, &wire));
-        let request = DecisionRequest {
-            input: input.clone(),
-            questions: questions
-                .into_iter()
-                .map(|(question, _)| question)
-                .collect(),
-            temperature: None,
-        };
-        let local = decider
-            .decide_blocking(&request)
-            .expect("the decider answers");
+        let local = runtime
+            .block_on(decide(
+                &stack.state,
+                shiso_ir::decision::Request {
+                    input: Input::Text(input.clone()),
+                    readout_state: ReadoutState::Input,
+                    questions: questions
+                        .into_iter()
+                        .map(|(question, _)| question)
+                        .collect(),
+                    temperature: None,
+                    preserve_thinking: None,
+                    token_ids: false,
+                },
+            ))
+            .expect("decide answers")
+            .answers;
 
         let served = served["answers"].as_array().expect("answers is an array");
         assert_eq!(served.len(), local.len(), "{input:?}");
         for (served, local) in served.iter().zip(&local) {
             assert_eq!(served["name"], json!(local.name), "{input:?}");
-            assert_eq!(served["choice"], json!(local.choice), "{input:?}: {served}");
+            assert_eq!(
+                served["choice"],
+                json!(local.choice.text()),
+                "{input:?}: {served}"
+            );
             let probabilities = served["probabilities"].as_array().expect("probabilities");
             assert_eq!(probabilities.len(), local.probabilities.len(), "{input:?}");
             for (wire, (value, probability)) in probabilities.iter().zip(&local.probabilities) {
-                assert_eq!(wire["value"], json!(value), "{input:?}");
+                assert_eq!(wire["value"], json!(value.text()), "{input:?}");
                 let wire = wire["probability"].as_f64().expect("a probability");
                 assert!(
-                    (wire - f64::from(*probability)).abs() < TOLERANCE,
-                    "{input:?} {value}: endpoint {wire}, decider {probability}"
+                    (wire - probability).abs() < TOLERANCE,
+                    "{input:?} {}: endpoint {wire}, decide {probability}",
+                    value.text()
                 );
             }
             let mass = served["label_mass"].as_f64().expect("a label mass");
             assert!(
-                (mass - f64::from(local.confidence)).abs() < TOLERANCE,
-                "{input:?}: endpoint mass {mass}, decider {}",
-                local.confidence
+                (mass - local.label_mass).abs() < TOLERANCE,
+                "{input:?}: endpoint mass {mass}, decide {}",
+                local.label_mass
             );
         }
     }
-    drop(decider);
     stack.shutdown();
 }

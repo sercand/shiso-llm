@@ -17,161 +17,44 @@
 use std::sync::Arc;
 
 use futures::future::join_all;
-use shiso_core::TokenId;
 use shiso_core::media::MediaDigest;
+use shiso_core::{StateSpelling, TokenId};
 use shiso_ir::{Block, MediaSource, Message, Request, Role, ThinkingDirective};
 
+use shiso_ir::decision::{
+    Answer, AnswerKind, Choice, ChoiceValue, Input, Level, Part, Question, QuestionKind,
+    ReadoutState, Request as DecisionRequest, Response as DecisionResponse, Usage,
+};
+
 use crate::api::pipeline::remaining_budget;
-use crate::decision::decisions_wire::{DecisionInput, InputBlock, InputImageSource};
+use crate::decision::head;
+use crate::decision::math::{
+    choice_confidence, expected_score, label_mass, score_confidence, softmax,
+};
+use crate::decision::readout;
 use crate::error::AppError;
 use crate::media::MediaItem;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
 use crate::tokenizer::{AddedSeam, Vocabulary};
-use shiso_decision::math::{label_mass, softmax};
 
-/// The value of a choice option, typed as the official wire types it: a
-/// string and a boolean with the same text are distinct options, so the
-/// answer can echo the value back with the type the caller sent.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ChoiceValue {
-    /// A string value, spelled verbatim on the option's line.
-    Str(String),
-    /// A boolean value, spelled `true`/`false` on the option's line.
-    Bool(bool),
-}
-
-impl ChoiceValue {
-    /// The text the option's line spells for this value.
-    pub(crate) fn text(&self) -> String {
-        match self {
-            Self::Str(text) => text.clone(),
-            Self::Bool(value) => value.to_string(),
-        }
-    }
-
-    /// The value as JSON, for an answer that echoes it back with its type.
-    pub(crate) fn to_json(&self) -> serde_json::Value {
-        match self {
-            Self::Str(text) => serde_json::Value::String(text.clone()),
-            Self::Bool(value) => serde_json::Value::Bool(*value),
-        }
-    }
-}
-
-/// One level of a score question: the name the digit line spells, and the
-/// wording shown after `" - "` when non-blank.
-#[derive(Debug, Clone)]
-pub(crate) struct ScoreLevel {
-    /// The level's label: what follows the digit on its line.
-    pub label: String,
-    /// Extra wording, shown when non-blank.
-    pub description: Option<String>,
-}
-
-/// One option of a choice question.
-#[derive(Debug, Clone)]
-pub(crate) struct ChoiceOption {
-    /// The option's value: what follows the letter on its line, and what the
-    /// caller reads the answer back as (with its type).
-    pub value: ChoiceValue,
-    /// Extra wording shown after `" - "` when non-blank.
-    pub description: Option<String>,
-}
-
-/// How a question is answered, which is which block [`prompt_body`] renders.
-#[derive(Debug, Clone)]
-pub(crate) enum Kind {
-    /// A lettered list; the answer is one letter.
-    Choice {
-        /// The line above the options; the line is dropped when blank.
-        question: String,
-        /// The options, in the order the caller listed them.
-        options: Vec<ChoiceOption>,
-    },
-    /// A list of levels numbered from zero; the answer is one number.
-    Score {
-        /// The line above the levels; the line is dropped when blank.
-        question: String,
-        /// The levels, indexed from zero.
-        levels: Vec<ScoreLevel>,
-    },
-    /// A binary judgement; the answer is `yes` or `no`.
-    YesNo {
-        /// What is being asserted, named on the lead line when non-blank.
-        question: String,
-        /// Wording for the `yes` label; its line is dropped when blank.
-        yes: Option<String>,
-        /// Wording for the `no` label; its line is dropped when blank.
-        no: Option<String>,
-    },
-}
-
-/// A question as the wire delivered it, before scoring.
-#[derive(Debug)]
-pub(crate) struct RawQuestion {
-    /// The caller's id for the question; blank when the caller sent none.
-    pub id: String,
-    /// How the question is answered.
-    pub kind: Kind,
-    /// Whether the answer is reported as the probability of `yes` rather
-    /// than as a label word: the design pins "the `noul` answer is the yes
-    /// probability", so the systemone wire sets this on its noul criteria
-    /// only, and the decisions wire never sets it.
-    pub probability_answer: bool,
-}
-
-/// The text a JSON input value contributes to a prompt.
-///
-/// A string is itself; objects and arrays render as compact JSON and other
-/// scalars as their JSON form. Object keys are sorted because these bytes are
-/// scored: the same logical object must render the same bytes however the
-/// client happened to order its keys, and the shared parser preserves the
-/// order it was sent in, so sorting is done here rather than assumed.
-pub(crate) fn render_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => text.clone(),
-        other => serde_json::to_string(&canonical(other)).unwrap_or_else(|_| other.to_string()),
-    }
-}
-
-/// A copy of `value` with every object's keys in sorted order, so serialising
-/// it is byte-deterministic.
-///
-/// Recursion depth is bounded by the parser's own nesting limit: a value this
-/// walks was parsed, and parsing is where runaway nesting is refused.
-fn canonical(value: &serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match value {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let mut sorted = serde_json::Map::with_capacity(keys.len());
-            for key in keys {
-                sorted.insert(key.clone(), canonical(&map[key]));
-            }
-            Value::Object(sorted)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
-        other => other.clone(),
-    }
-}
-
-/// The kind's question block: the lines that answer-position the prompt,
-/// without the input or the blank line that precedes them.
+/// The question's block: the lines that answer-position the prompt, without
+/// the input or the blank line that precedes them.
 ///
 /// The exact bytes are pinned by the golden tests below, through
 /// [`prompt_body`] and, on the blocks path, through the whitespace goldens in
 /// `tests/decisions.rs`.
 ///
-/// `labels` are the kind's label words from [`labels_for`]; a choice block
+/// `labels` are the question's label words from [`labels_for`]; a choice block
 /// letters its options with them, the other kinds spell their own.
-pub(crate) fn question_block(kind: &Kind, labels: &[String]) -> String {
-    match kind {
-        Kind::Choice { question, options } => {
+#[must_use]
+pub fn question_block(question: &Question, labels: &[String]) -> String {
+    let wording = question.instructions.as_str();
+    match &question.kind {
+        QuestionKind::Choice(options) => {
             let mut lines = Vec::with_capacity(options.len() + 2);
-            if !question.trim().is_empty() {
-                lines.push(format!("Question: {question}"));
+            if !wording.trim().is_empty() {
+                lines.push(format!("Question: {wording}"));
             }
             for (option, label) in options.iter().zip(labels) {
                 let mut line = format!("{label}: {}", option.value.text());
@@ -194,10 +77,10 @@ pub(crate) fn question_block(kind: &Kind, labels: &[String]) -> String {
             }
             lines.join("\n")
         }
-        Kind::Score { question, levels } => {
+        QuestionKind::Score(levels) => {
             let mut lines = Vec::with_capacity(levels.len() + 2);
-            if !question.trim().is_empty() {
-                lines.push(format!("Question: {question}"));
+            if !wording.trim().is_empty() {
+                lines.push(format!("Question: {wording}"));
             }
             for (level, label) in levels.iter().zip(score_labels(levels.len())) {
                 let mut line = format!("{label}: {}", level.label);
@@ -214,12 +97,12 @@ pub(crate) fn question_block(kind: &Kind, labels: &[String]) -> String {
             lines.push("Answer with the number of one level only.".to_string());
             lines.join("\n")
         }
-        Kind::YesNo { question, yes, no } => {
+        QuestionKind::YesNo { yes, no } => {
             let mut lines = Vec::with_capacity(4);
-            if question.trim().is_empty() {
+            if wording.trim().is_empty() {
                 lines.push("Is the following true?".to_string());
             } else {
-                lines.push(format!("Is the following true? {question}"));
+                lines.push(format!("Is the following true? {wording}"));
             }
             if let Some(text) = yes.as_deref().filter(|text| !text.trim().is_empty()) {
                 lines.push(format!("yes: {text}"));
@@ -234,13 +117,14 @@ pub(crate) fn question_block(kind: &Kind, labels: &[String]) -> String {
 }
 
 /// The prompt-format version-1 body for `input` and one question: the input's
-/// text, one blank line, then the kind's lines, with no trailing newline.
+/// text, one blank line, then the question's lines, with no trailing newline.
 ///
 /// The exact bytes are pinned by the golden tests below, and `input` is
 /// trimmed so the seam between it and the block is always exactly one blank
 /// line whatever whitespace the caller padded it with.
-pub(crate) fn prompt_body(input: &str, kind: &Kind, labels: &[String]) -> String {
-    let block = question_block(kind, labels);
+#[must_use]
+pub fn prompt_body(input: &str, question: &Question, labels: &[String]) -> String {
+    let block = question_block(question, labels);
     let mut body = String::with_capacity(input.len() + block.len() + 2);
     body.push_str(input.trim());
     body.push_str("\n\n");
@@ -257,7 +141,7 @@ const LETTERS: [&str; 26] = [
 /// The most options one choice question takes: the System One wire's own
 /// bound. Any vocabulary that spells most two-letter pairs as one token
 /// labels a list this long; one that cannot is refused at preparation.
-pub(crate) const MAX_CHOICE_OPTIONS: usize = 255;
+pub const MAX_CHOICE_OPTIONS: usize = 255;
 
 /// The labels for `n` options: the letters `A`.. when `n` fits the alphabet,
 /// otherwise two letters each - `AA`, `AB`, .. - keeping only the pairs
@@ -272,7 +156,7 @@ pub(crate) const MAX_CHOICE_OPTIONS: usize = 255;
 ///
 /// The vector is shorter than `n` when the vocabulary runs out of one-token
 /// pairs; [`prepare_question`] refuses that list by name.
-pub(crate) fn choice_labels(n: usize, one_token: impl Fn(&str) -> bool) -> Vec<String> {
+pub fn choice_labels(n: usize, one_token: impl Fn(&str) -> bool) -> Vec<String> {
     if n <= LETTERS.len() {
         return LETTERS.iter().take(n).map(ToString::to_string).collect();
     }
@@ -285,19 +169,21 @@ pub(crate) fn choice_labels(n: usize, one_token: impl Fn(&str) -> bool) -> Vec<S
 }
 
 /// The numbers `0`.. for `n` levels, as label strings.
-pub(crate) fn score_labels(n: usize) -> Vec<String> {
+#[must_use]
+pub fn score_labels(n: usize) -> Vec<String> {
     (0..n).map(|index| index.to_string()).collect()
 }
 
 /// The two labels of a yes/no question.
-pub(crate) const YES_NO_LABELS: [&str; 2] = ["yes", "no"];
+pub const YES_NO_LABELS: [&str; 2] = ["yes", "no"];
 
 /// How a refusal names the offending question in its message.
 ///
 /// Not one of the shared names - it only shapes the sentence. A blank id has
 /// no name to give; the validator that can refuse a blank id,
 /// [`check_ids`], is also the one that knows the position and names it there.
-pub(crate) fn question_name(id: &str) -> String {
+#[must_use]
+pub fn question_name(id: &str) -> String {
     if id.trim().is_empty() {
         "this question".to_owned()
     } else {
@@ -310,7 +196,11 @@ pub(crate) fn question_name(id: &str) -> String {
 /// The server scores against the model it loaded, so the colon form asks for
 /// something it cannot load; refusing it beats answering under a model the
 /// caller did not ask for.
-pub(crate) fn check_model(model: Option<&str>) -> Result<(), AppError> {
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] naming `model` when it uses the adapter form.
+pub fn check_model(model: Option<&str>) -> Result<(), AppError> {
     if let Some(model) = model.filter(|name| name.contains(':')) {
         return Err(AppError::bad_request(
             format!(
@@ -327,7 +217,11 @@ pub(crate) fn check_model(model: Option<&str>) -> Result<(), AppError> {
 ///
 /// The input is the thing being judged; a blank one asks the model to score
 /// silence, and every label wins equally.
-pub(crate) fn check_input(text: &str) -> Result<(), AppError> {
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] naming `input` when it is blank.
+pub fn check_input(text: &str) -> Result<(), AppError> {
     if text.trim().is_empty() {
         return Err(AppError::bad_request(
             "input must not be blank",
@@ -346,9 +240,14 @@ pub(crate) fn check_input(text: &str) -> Result<(), AppError> {
 /// says which wire is checking. A duplicate is a lie on either: two answers
 /// would return under one name. Blank ids never collide with each other,
 /// because neither names anything.
-pub(crate) fn check_ids(questions: &[RawQuestion], blanks_allowed: bool) -> Result<(), AppError> {
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] naming `questions` for a blank id where blanks
+/// are not allowed, and for any id used twice.
+pub fn check_ids(questions: &[Question], blanks_allowed: bool) -> Result<(), AppError> {
     for (index, question) in questions.iter().enumerate() {
-        if question.id.trim().is_empty() {
+        if question.name.trim().is_empty() {
             if !blanks_allowed {
                 return Err(AppError::bad_request(
                     format!("questions[{index}].id must not be blank"),
@@ -358,12 +257,12 @@ pub(crate) fn check_ids(questions: &[RawQuestion], blanks_allowed: bool) -> Resu
             }
         } else if let Some(first) = questions[..index]
             .iter()
-            .position(|earlier| earlier.id == question.id)
+            .position(|earlier| earlier.name == question.name)
         {
             return Err(AppError::bad_request(
                 format!(
                     "question \"{}\" is used by questions[{first}] and questions[{index}]",
-                    question.id
+                    question.name
                 ),
                 Some("questions"),
                 "invalid_request",
@@ -379,11 +278,12 @@ pub(crate) fn check_ids(questions: &[RawQuestion], blanks_allowed: bool) -> Resu
 /// A blank question drops its line from the version-1 block, so it is only a
 /// refusal on a surface that requires every question to state something;
 /// `blanks_allowed` says which that is.
-pub(crate) fn check_question_text(
-    text: &str,
-    id: &str,
-    blanks_allowed: bool,
-) -> Result<(), AppError> {
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] naming the question when its text is blank
+/// where blanks are not allowed.
+pub fn check_question_text(text: &str, id: &str, blanks_allowed: bool) -> Result<(), AppError> {
     if !blanks_allowed && text.trim().is_empty() {
         return Err(AppError::bad_request(
             format!("{}: the question text must not be blank", question_name(id)),
@@ -406,11 +306,12 @@ pub(crate) fn check_question_text(
 /// within their type after trimming and case folding (a collision would score
 /// two letters against the same answer text, so one of them could never win),
 /// while a string and a boolean with the same text stay distinct.
-pub(crate) fn check_choice_options(
-    options: &[ChoiceOption],
-    id: &str,
-    min: usize,
-) -> Result<(), AppError> {
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] naming the question for a list outside its
+/// bounds, a blank or control-character value, or a repeated value.
+pub fn check_choice_options(options: &[Choice], id: &str, min: usize) -> Result<(), AppError> {
     let name = question_name(id);
     if options.len() < min {
         return Err(AppError::bad_request(
@@ -482,11 +383,12 @@ pub(crate) fn check_choice_options(
 /// eleventh level could not be answered with one number, and the lower bound
 /// is the surface's `min`. A blank level is refused outright: it still takes
 /// a digit, and a digit pointing at nothing is a level no answer maps to.
-pub(crate) fn check_score_levels(
-    levels: &[ScoreLevel],
-    id: &str,
-    min: usize,
-) -> Result<(), AppError> {
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] naming the question for a list outside its
+/// bounds or a blank level.
+pub fn check_score_levels(levels: &[Level], id: &str, min: usize) -> Result<(), AppError> {
     let name = question_name(id);
     if levels.len() < min {
         return Err(AppError::bad_request(
@@ -521,7 +423,12 @@ pub(crate) fn check_score_levels(
 /// ranking - a request that asks for that is a caller bug, not a setting to
 /// honour. The guard rejects NaN with them, since NaN is not greater than
 /// zero either.
-pub(crate) fn check_temperature(t: Option<f64>) -> Result<f64, AppError> {
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] naming `temperature` when it is not greater
+/// than zero.
+pub fn check_temperature(t: Option<f64>) -> Result<f64, AppError> {
     match t {
         None => Ok(1.0),
         Some(value) if value > 0.0 => Ok(value),
@@ -533,217 +440,19 @@ pub(crate) fn check_temperature(t: Option<f64>) -> Result<f64, AppError> {
     }
 }
 
-// --- wire helpers shared by both surfaces -----------------------------------
-
-/// The question line as text: absent is blank.
-///
-/// Both surfaces spell the question key the same way and render it with the
-/// shared rule, so the reading lives here; whether a blank is a refusal or a
-/// dropped line is each surface's [`check_question_text`] call, not this
-/// function's business.
-pub(crate) fn question_text(value: Option<&serde_json::Value>) -> String {
-    value.map_or_else(String::new, render_text)
-}
-
-/// The `yes`/`no` wording: absent or blank is no wording at all, which drops
-/// that line from the block.
-pub(crate) fn wording(value: Option<&serde_json::Value>) -> Option<String> {
-    let text = value.map(render_text)?;
-    (!text.trim().is_empty()).then_some(text)
-}
-
-/// Refuses a field the question's type has no place for - `options` on a
-/// score question is a caller expecting a different question than the one its
-/// `type` says will be scored.
-///
-/// Each wire calls this with its own struct in hand - the question's id, the
-/// type word and the field-presence table are arguments, because the fields
-/// belong to the wire - while the refusal itself is shared: the same sentence
-/// naming the same field, the same `questions` param, a 400 on both routes.
-/// A schema difference between the surfaces (400-versus-422) is about what
-/// the *body* says, not about what a misplaced field means to the scored
-/// bytes, so this refusal does not split.
-///
-/// # Errors
-///
-/// [`AppError::BadRequest`] naming the misplaced field and the question.
-pub(crate) fn refuse_fields_other_than(
-    id: &str,
-    kind: &str,
-    present: &[(&str, bool)],
-    allowed: &[&str],
-) -> Result<(), AppError> {
-    for (field, present) in present {
-        if *present && !allowed.contains(field) {
-            return Err(AppError::bad_request(
-                format!(
-                    "{}: {field} does not belong on a \"{kind}\" question",
-                    question_name(id)
-                ),
-                Some("questions"),
-                "invalid_request",
-            ));
-        }
-    }
-    Ok(())
-}
-
 // --- preparation and scoring fan-out ---------------------------------------
-
-/// The wire word for a kind, used in answers and in refusals alike.
-pub(crate) fn type_name(kind: &Kind) -> &'static str {
-    match kind {
-        Kind::Choice { .. } => "choice",
-        Kind::Score { .. } => "score",
-        Kind::YesNo { .. } => "yes_no",
-    }
-}
 
 /// The label words of a kind, in answer order: the letters (or, for a wide
 /// list, the one-token letter pairs `one_token` accepts), the digits, or
 /// `yes` and `no`.
-pub(crate) fn labels_for(kind: &Kind, one_token: impl Fn(&str) -> bool) -> Vec<String> {
+pub fn labels_for(kind: &QuestionKind, one_token: impl Fn(&str) -> bool) -> Vec<String> {
     match kind {
-        Kind::Choice { options, .. } => choice_labels(options.len(), one_token),
-        Kind::Score { levels, .. } => score_labels(levels.len()),
-        Kind::YesNo { .. } => YES_NO_LABELS
+        QuestionKind::Choice(options) => choice_labels(options.len(), one_token),
+        QuestionKind::Score(levels) => score_labels(levels.len()),
+        QuestionKind::YesNo { .. } => YES_NO_LABELS
             .iter()
             .map(|label| (*label).to_string())
             .collect(),
-    }
-}
-
-/// The answer value of a choice question: the typed option value the top
-/// label names. A score kind spells its answer as the level number and a
-/// yes/no kind as its label, so every kind has a value for its `top` - which
-/// indexes that kind's own labels by construction, being the argmax of the
-/// probabilities built from exactly those.
-pub(crate) fn choice_name(kind: &Kind, top: usize) -> ChoiceValue {
-    match kind {
-        Kind::Choice { options, .. } => options.get(top).map_or_else(
-            || ChoiceValue::Str(String::new()),
-            |option| option.value.clone(),
-        ),
-        Kind::Score { .. } => ChoiceValue::Str(top.to_string()),
-        Kind::YesNo { .. } => ChoiceValue::Str(answer_label(kind, top)),
-    }
-}
-
-/// The answer label of a yes/no question: `"yes"` for the first label,
-/// `"no"` for the second.
-pub(crate) fn answer_label(kind: &Kind, top: usize) -> String {
-    match kind {
-        Kind::YesNo { .. } => YES_NO_LABELS
-            .get(top)
-            .copied()
-            .unwrap_or_default()
-            .to_owned(),
-        // Not this kind's answer shape. The encoders dispatch on the kind, so
-        // this arm means a wrong caller rather than a request outcome, and an
-        // empty name says so without a panic path on a scored response.
-        _ => String::new(),
-    }
-}
-
-/// Chat-template knobs a decision request sent, validated and kept raw.
-///
-/// Every key rule fires once, in [`Self::from_wire`], so the refusal names
-/// the offending key while the request is still being read; [`Self::apply`]
-/// only lowers what survived.
-#[derive(Debug)]
-pub(crate) struct TemplateKwargs(serde_json::Map<String, serde_json::Value>);
-
-impl TemplateKwargs {
-    /// Accepts exactly three keys: `enable_thinking` (which must say false or
-    /// nothing, because scoring never opens a thinking block),
-    /// `reasoning_effort` (a spelling this server knows, or nothing), and
-    /// `preserve_thinking` (a boolean, or nothing). Every other key is a 400.
-    ///
-    /// # Errors
-    ///
-    /// [`AppError::BadRequest`] naming the key or the spelling at fault.
-    pub(crate) fn from_wire(
-        map: Option<serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<Self, AppError> {
-        let mut checked = serde_json::Map::new();
-        for (key, value) in map.unwrap_or_default() {
-            match key.as_str() {
-                // The answer is the token right after the question block;
-                // a thinking block would open at that position and score a
-                // reasoning token instead of the label. `false` is accepted
-                // because callers that send the key everywhere should not
-                // have to special-case this surface.
-                "enable_thinking"
-                    if matches!(
-                        value,
-                        serde_json::Value::Bool(false) | serde_json::Value::Null
-                    ) => {}
-                "enable_thinking" => {
-                    return Err(AppError::bad_request(
-                        "a decision is scored from one prefill with thinking off; \
-                         enable_thinking must be false",
-                        Some("chat_template_kwargs"),
-                        "invalid_request",
-                    ));
-                }
-                "reasoning_effort" => match &value {
-                    serde_json::Value::Null => {}
-                    serde_json::Value::String(spelling) => {
-                        if shiso_ir::Effort::parse(spelling).is_none() {
-                            return Err(AppError::bad_request(
-                                format!(
-                                    "reasoning_effort {spelling:?} is not a level this server knows"
-                                ),
-                                Some("chat_template_kwargs"),
-                                "invalid_request",
-                            ));
-                        }
-                    }
-                    other => {
-                        return Err(AppError::bad_request(
-                            format!("reasoning_effort must be a string or null, got {other}"),
-                            Some("chat_template_kwargs"),
-                            "invalid_request",
-                        ));
-                    }
-                },
-                "preserve_thinking"
-                    if matches!(value, serde_json::Value::Bool(_) | serde_json::Value::Null) => {}
-                "preserve_thinking" => {
-                    return Err(AppError::bad_request(
-                        "preserve_thinking must be a boolean or null",
-                        Some("chat_template_kwargs"),
-                        "invalid_request",
-                    ));
-                }
-                other => {
-                    return Err(AppError::bad_request(
-                        format!(
-                            "chat_template_kwargs key {other:?} is not accepted on this surface"
-                        ),
-                        Some("chat_template_kwargs"),
-                        "invalid_request",
-                    ));
-                }
-            }
-            checked.insert(key, value);
-        }
-        Ok(Self(checked))
-    }
-
-    /// Lowers the surviving knobs onto the request a question is rendered
-    /// with.
-    pub(crate) fn apply(&self, request: &mut Request) {
-        if let Some(serde_json::Value::Bool(keep)) = self.0.get("preserve_thinking") {
-            request.preserve_thinking = Some(*keep);
-        }
-        // `enable_thinking` can only have said false or nothing, which is
-        // what every scoring render already does, so it lowers to no change.
-        // `reasoning_effort` was parsed and checked and is deliberately not
-        // lowered: scoring renders with `ThinkingDirective::Off`, so no rung
-        // would ever reach a template. A caller that named one gets the same
-        // answer as one that did not, and the check exists to refuse a typo,
-        // not to promise a thinking budget this surface cannot spend.
     }
 }
 
@@ -751,13 +460,9 @@ impl TemplateKwargs {
 /// pass needs and nothing else.
 #[derive(Debug)]
 pub(crate) struct PreparedQuestion {
-    /// The caller's id for the question.
-    pub id: String,
-    /// How the question is answered.
-    pub kind: Kind,
-    /// Whether the answer is the yes probability rather than a label word
-    /// ([`RawQuestion`]'s field of the same name, carried to the encoder).
-    pub probability_answer: bool,
+    /// The question that was prepared: its name, kind and whether it answers
+    /// as the yes probability, all carried to the answer.
+    pub question: Question,
     /// The rendered prompt ids, in the order the model will read them.
     pub prompt_tokens: Vec<TokenId>,
     /// The label ids, in the question's own label order.
@@ -770,6 +475,19 @@ pub(crate) struct PreparedQuestion {
     pub media_digests: Arc<[MediaDigest]>,
 }
 
+/// The IR block an input picture is decoded from.
+fn image_block(source: &MediaSource) -> Block {
+    Block::Image(source.clone())
+}
+
+/// The IR block of one part of the caller's input.
+pub(crate) fn part_block(part: &Part) -> Block {
+    match part {
+        Part::Text(text) => Block::Text(text.clone()),
+        Part::Image(source) => image_block(source),
+    }
+}
+
 /// The IR message a content-block `input` becomes: the caller's blocks in
 /// order, then one final text part carrying the question block.
 ///
@@ -779,24 +497,10 @@ pub(crate) struct PreparedQuestion {
 /// between input and block survives only when the caller's last block is
 /// text; after a picture the pad run already ends the text side, and the
 /// block follows plain.
-/// The IR block an input picture is decoded from.
-pub(crate) fn image_block(source: &InputImageSource) -> Block {
-    match source {
-        InputImageSource::Base64 { data, .. } => Block::Image(MediaSource::Inline(data.clone())),
-        InputImageSource::Url { url } => Block::Image(MediaSource::Remote(url.clone())),
-    }
-}
-
-fn blocks_message(blocks: &[InputBlock], kind: &Kind, labels: &[String]) -> Message {
-    let mut parts: Vec<Block> = blocks
-        .iter()
-        .map(|block| match block {
-            InputBlock::Text { text } => Block::Text(text.clone()),
-            InputBlock::Image(source) => image_block(source),
-        })
-        .collect();
-    let wording = question_block(kind, labels);
-    let question_text = if matches!(blocks.last(), Some(InputBlock::Text { .. })) {
+fn blocks_message(blocks: &[Part], question: &Question, labels: &[String]) -> Message {
+    let mut parts: Vec<Block> = blocks.iter().map(part_block).collect();
+    let wording = question_block(question, labels);
+    let question_text = if matches!(blocks.last(), Some(Part::Text(_))) {
         format!("\n\n{wording}")
     } else {
         wording
@@ -810,7 +514,7 @@ fn blocks_message(blocks: &[InputBlock], kind: &Kind, labels: &[String]) -> Mess
 /// token, so it can come up short of the options it must label.
 fn vocabulary_labels(
     vocabulary: &Vocabulary,
-    kind: &Kind,
+    kind: &QuestionKind,
     name: &str,
 ) -> Result<Vec<String>, AppError> {
     let one_token = |label: &str| {
@@ -819,7 +523,7 @@ fn vocabulary_labels(
             .is_ok_and(|ids| ids.len() == 1)
     };
     let labels = labels_for(kind, one_token);
-    if let Kind::Choice { options, .. } = kind
+    if let QuestionKind::Choice(options) = kind
         && labels.len() < options.len()
     {
         return Err(AppError::bad_request(
@@ -865,10 +569,9 @@ fn vocabulary_labels(
 /// prompt leaves no room to read an answer.
 pub(crate) fn prepare_question(
     state: &AppState,
-    input: &DecisionInput,
-    question: &RawQuestion,
-    kwargs: &TemplateKwargs,
-    _want_token_ids: bool,
+    input: &Input,
+    question: &Question,
+    preserve_thinking: Option<bool>,
 ) -> Result<PreparedQuestion, AppError> {
     // The same three refusals `pipeline::start` makes, in the same shapes:
     // no engine is "no model is loaded", and no renderer is "not ready".
@@ -877,7 +580,7 @@ pub(crate) fn prepare_question(
         what: "a prompt renderer",
     })?;
     let vocabulary = renderer.vocabulary();
-    let name = question_name(&question.id);
+    let name = question_name(&question.name);
 
     // The labels are chosen before the prompt is rendered because the prompt
     // spells them; the proofs below still check each one against the
@@ -885,15 +588,33 @@ pub(crate) fn prepare_question(
     let label_words = vocabulary_labels(vocabulary, &question.kind, &name)?;
 
     let message = match input {
-        DecisionInput::Text(text) => Message::user(prompt_body(text, &question.kind, &label_words)),
-        DecisionInput::Blocks(blocks) => blocks_message(blocks, &question.kind, &label_words),
+        Input::Text(text) => Message::user(prompt_body(text, question, &label_words)),
+        Input::Blocks(blocks) => blocks_message(blocks, question, &label_words),
+        Input::Pictured { media, text } if media.is_empty() => {
+            Message::user(prompt_body(text, question, &label_words))
+        }
+        // Composition (spec §3): images before the state, clef's rule. The
+        // state enters as a *trimmed* text block, which is what keeps the
+        // question-wording seam (`"\n\n" + wording` after a text block)
+        // byte-identical to the string path's `trim() + "\n\n" + wording`.
+        // A blank state sends no text block at all: image-only is valid.
+        Input::Pictured { media, text } => {
+            let mut blocks: Vec<Part> = media.iter().cloned().map(Part::Image).collect();
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                blocks.push(Part::Text(trimmed.to_owned()));
+            }
+            blocks_message(&blocks, question, &label_words)
+        }
     };
     let mut request = Request::new(state.model_id.clone(), vec![message]);
     // Scoring reads the first row after the question block. A thinking block
     // would open *at* the answer position and the row would score a reasoning
     // token, so Off is not a preference here - it is what the answer is.
     request.thinking = ThinkingDirective::Off;
-    kwargs.apply(&mut request);
+    if preserve_thinking.is_some() {
+        request.preserve_thinking = preserve_thinking;
+    }
     let prompt = renderer.render(&request)?;
 
     // The seam the answer is read at: the prompt's tail text and the ids
@@ -969,9 +690,7 @@ pub(crate) fn prepare_question(
         ctx: state.ctx,
     })?;
     Ok(PreparedQuestion {
-        id: question.id.clone(),
-        kind: question.kind.clone(),
-        probability_answer: question.probability_answer,
+        question: question.clone(),
         prompt_tokens: prompt.tokens,
         labels,
         media: Arc::from(prompt.media),
@@ -1068,13 +787,9 @@ fn prove_labels(
 /// One question's scored answer, before any wire shape.
 #[derive(Debug)]
 pub(crate) struct Answered {
-    /// The caller's id for the question.
-    pub id: String,
-    /// How the question was answered.
-    pub kind: Kind,
-    /// Whether this answer is reported as the yes probability rather than
-    /// a label word ([`PreparedQuestion`]'s field of the same name).
-    pub probability_answer: bool,
+    /// The question this answers: its name, kind and whether it reports the
+    /// yes probability rather than a label word.
+    pub question: Question,
     /// The label probabilities at the answer position, in label order.
     pub probabilities: Vec<f64>,
     /// The probability mass the labels carry together, independent of the
@@ -1215,9 +930,7 @@ pub(crate) async fn run_questions(
                 )
             });
             Ok(Answered {
-                id: question.id,
-                kind: question.kind,
-                probability_answer: question.probability_answer,
+                question: question.question,
                 probabilities,
                 label_mass: label_mass(&outcome.label_logprobs),
                 top,
@@ -1232,62 +945,266 @@ pub(crate) async fn run_questions(
     scored.into_iter().collect()
 }
 
+impl Answered {
+    /// The IR answer, with the token ids that were asked for.
+    pub(crate) fn into_answer(self) -> Answer {
+        let Self {
+            question,
+            probabilities,
+            label_mass,
+            top,
+            prompt_token_ids,
+            label_token_ids,
+            ..
+        } = self;
+        Answer {
+            prompt_token_ids,
+            label_token_ids,
+            ..scored_answer(question, probabilities, label_mass, top)
+        }
+    }
+}
+
+/// The IR answer to `question` from its scored label `probabilities`: the
+/// question's options paired with them, and the numbers a wire spells out
+/// derived once, here, so the two surfaces cannot disagree about them.
+///
+/// `top` indexes `probabilities` (the first argmax) and `label_mass` is the
+/// mass the labels carried before the softmax. Token ids are left unset.
+#[must_use]
+pub fn scored_answer(
+    question: Question,
+    probabilities: Vec<f64>,
+    label_mass: f64,
+    top: usize,
+) -> Answer {
+    let (kind, values, choice) = match question.kind {
+        QuestionKind::Choice(options) => {
+            let values: Vec<ChoiceValue> = options.into_iter().map(|option| option.value).collect();
+            let choice = values
+                .get(top)
+                .cloned()
+                .unwrap_or_else(|| ChoiceValue::Str(String::new()));
+            (AnswerKind::Choice, values, choice)
+        }
+        QuestionKind::Score(levels) => (
+            AnswerKind::Score,
+            levels
+                .into_iter()
+                .map(|level| ChoiceValue::Str(level.label))
+                .collect(),
+            ChoiceValue::Str(top.to_string()),
+        ),
+        QuestionKind::YesNo { .. } => (
+            AnswerKind::YesNo,
+            YES_NO_LABELS
+                .iter()
+                .map(|label| ChoiceValue::Str((*label).to_owned()))
+                .collect(),
+            ChoiceValue::Str(
+                YES_NO_LABELS
+                    .get(top)
+                    .copied()
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+        ),
+    };
+    let confidence = match kind {
+        AnswerKind::Score => score_confidence(&probabilities),
+        AnswerKind::Choice | AnswerKind::YesNo => choice_confidence(&probabilities),
+    };
+    Answer {
+        name: question.name,
+        kind,
+        probability_answer: question.probability_answer,
+        choice,
+        confidence,
+        label_mass,
+        expected_score: (kind == AnswerKind::Score).then(|| expected_score(&probabilities)),
+        probabilities: values.into_iter().zip(probabilities).collect(),
+        prompt_token_ids: None,
+        label_token_ids: None,
+    }
+}
+
+/// How a readout layout is handed the state: the input's own text, or the
+/// structured spelling the layout's family asked for.
+///
+/// A blank input is no state, and so is a state the caller sent as null: the
+/// caller who sent `""` beside a picture meant the picture to be the whole
+/// state, and the layout writes no state block for it.
+pub(crate) fn readout_text(
+    state: &ReadoutState,
+    text: &str,
+    spelling: StateSpelling,
+) -> Option<String> {
+    match state {
+        ReadoutState::Input => (!text.trim().is_empty()).then(|| text.to_owned()),
+        ReadoutState::Absent => None,
+        ReadoutState::Structured { compact, indented } => Some(match spelling {
+            StateSpelling::CompactSorted => compact.clone(),
+            StateSpelling::Indented => indented.clone(),
+        }),
+    }
+}
+
+/// Answers a decision request from the model this state serves.
+///
+/// A decision checkpoint answers every question from one prompt through its
+/// head, at the caller's temperature, laid out the way its family lays it
+/// out; one with no head answers each question from its own prompt's
+/// next-token row; any other model answers each question from the label
+/// route's own prompt. Every question is prepared before any is scored: a
+/// refusal to score the third question reaches the caller as a refusal, not as
+/// a partial answer with the first two already paid for.
+///
+/// The request is taken as the wire validated it: the shape checks live in
+/// [`check_ids`], [`check_choice_options`] and the like, which a surface calls
+/// while parsing, and only the temperature is checked again here because it is
+/// cheap and the arithmetic divides by it.
+///
+/// # Errors
+///
+/// [`AppError::NotReady`] and the model errors of [`AppState::engine`] for a
+/// server that cannot score; [`AppError::BadRequest`] for a question the
+/// model cannot be asked, naming it; [`AppError::ContextOverflow`] for a
+/// prompt that leaves no room to read an answer; and whatever the engine
+/// answers with.
+pub async fn decide(
+    state: &Arc<AppState>,
+    request: DecisionRequest,
+) -> Result<DecisionResponse, AppError> {
+    let temperature = check_temperature(request.temperature)?;
+    let DecisionRequest {
+        input,
+        readout_state,
+        questions,
+        preserve_thinking,
+        token_ids,
+        ..
+    } = request;
+
+    if let Some(layout) = state.decision_layout.as_deref() {
+        let (text, media) = head::split_input(&input);
+        let (answers, tally) = head::run(
+            state,
+            layout,
+            &text,
+            media,
+            questions,
+            temperature,
+            token_ids,
+        )
+        .await?;
+        return Ok(response(answers, tally));
+    }
+
+    if let Some(layout) = state.decision_readout.as_deref() {
+        let (text, media) = head::split_input(&input);
+        let text = readout_text(&readout_state, &text, layout.state_spelling());
+        let (answers, tally) = readout::run(
+            state,
+            layout,
+            text.as_deref(),
+            media,
+            questions,
+            temperature,
+            token_ids,
+        )
+        .await?;
+        return Ok(response(answers, tally));
+    }
+
+    let mut prepared = Vec::with_capacity(questions.len());
+    for question in &questions {
+        prepared.push(prepare_question(
+            state,
+            &input,
+            question,
+            preserve_thinking,
+        )?);
+    }
+    let answers = run_questions(state, prepared, temperature, token_ids).await?;
+    let tally = InputTally::of(&answers);
+    Ok(response(answers, tally))
+}
+
+/// The IR response for scored answers and what they read.
+fn response(answers: Vec<Answered>, tally: InputTally) -> DecisionResponse {
+    DecisionResponse {
+        answers: answers.into_iter().map(Answered::into_answer).collect(),
+        usage: Usage {
+            input_tokens: tally.input,
+            cached_tokens: tally.cached,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A nameless question with the given wording and kind.
+    fn kinded(instructions: impl Into<String>, kind: QuestionKind) -> Question {
+        Question {
+            name: String::new(),
+            instructions: instructions.into(),
+            kind,
+            probability_answer: false,
+        }
+    }
+
     fn choice(kind_input: &str, q: &str, opts: &[(&str, Option<&str>)]) -> String {
         let options = opts
             .iter()
-            .map(|(value, description)| ChoiceOption {
+            .map(|(value, description)| Choice {
                 value: ChoiceValue::Str((*value).to_string()),
                 description: description.map(ToString::to_string),
             })
             .collect();
         body(
             kind_input,
-            &Kind::Choice {
-                question: q.to_string(),
-                options,
-            },
+            &kinded(q.to_string(), QuestionKind::Choice(options)),
         )
     }
 
     /// The version-1 body under a vocabulary that spells every label as one
     /// token, which is what the wording goldens pin.
-    fn body(input: &str, kind: &Kind) -> String {
-        prompt_body(input, kind, &labels_for(kind, |_| true))
+    fn body(input: &str, question: &Question) -> String {
+        prompt_body(input, question, &labels_for(&question.kind, |_| true))
     }
 
-    fn yes_no(id: &str) -> RawQuestion {
-        RawQuestion {
-            id: id.to_string(),
-            kind: Kind::YesNo {
-                question: String::new(),
-                yes: None,
-                no: None,
-            },
-            probability_answer: false,
+    fn yes_no(id: &str) -> Question {
+        Question {
+            name: id.to_string(),
+            ..kinded(
+                String::new(),
+                QuestionKind::YesNo {
+                    yes: None,
+                    no: None,
+                },
+            )
         }
     }
 
-    fn option(name: &str) -> ChoiceOption {
-        ChoiceOption {
+    fn option(name: &str) -> Choice {
+        Choice {
             value: ChoiceValue::Str(name.to_string()),
             description: None,
         }
     }
 
-    fn options(n: usize) -> Vec<ChoiceOption> {
+    fn options(n: usize) -> Vec<Choice> {
         (0..n)
             .map(|index| option(&format!("opt {index}")))
             .collect()
     }
 
-    fn levels(n: usize) -> Vec<ScoreLevel> {
+    fn levels(n: usize) -> Vec<Level> {
         (0..n)
-            .map(|index| ScoreLevel {
+            .map(|index| Level {
                 label: format!("level {index}"),
                 description: None,
             })
@@ -1330,16 +1247,18 @@ mod tests {
 
     #[test]
     fn score_body_numbers_its_levels_from_zero() {
-        let kind = Kind::Score {
-            question: "how bad".to_string(),
-            levels: ["none", "some", "lots"]
-                .iter()
-                .map(|level| ScoreLevel {
-                    label: (*level).to_string(),
-                    description: None,
-                })
-                .collect(),
-        };
+        let kind = kinded(
+            "how bad".to_string(),
+            QuestionKind::Score(
+                ["none", "some", "lots"]
+                    .iter()
+                    .map(|level| Level {
+                        label: (*level).to_string(),
+                        description: None,
+                    })
+                    .collect(),
+            ),
+        );
         assert_eq!(
             body("in", &kind),
             "in\n\nQuestion: how bad\n0: none\n1: some\n2: lots\nAnswer with the number of one level only."
@@ -1348,11 +1267,13 @@ mod tests {
 
     #[test]
     fn yes_no_body_leads_with_the_question() {
-        let kind = Kind::YesNo {
-            question: "it is ready".to_string(),
-            yes: Some("confirmed".to_string()),
-            no: Some("denied".to_string()),
-        };
+        let kind = kinded(
+            "it is ready".to_string(),
+            QuestionKind::YesNo {
+                yes: Some("confirmed".to_string()),
+                no: Some("denied".to_string()),
+            },
+        );
         assert_eq!(
             body("in", &kind),
             "in\n\nIs the following true? it is ready\nyes: confirmed\nno: denied\nAnswer with yes or no only."
@@ -1361,11 +1282,13 @@ mod tests {
 
     #[test]
     fn yes_no_body_is_bare_when_the_question_is_blank() {
-        let kind = Kind::YesNo {
-            question: String::new(),
-            yes: None,
-            no: None,
-        };
+        let kind = kinded(
+            String::new(),
+            QuestionKind::YesNo {
+                yes: None,
+                no: None,
+            },
+        );
         assert_eq!(
             body("in", &kind),
             "in\n\nIs the following true?\nAnswer with yes or no only."
@@ -1376,25 +1299,48 @@ mod tests {
     fn body_separates_input_and_block_with_one_blank_line() {
         // An input ending in whitespace keeps its text, and the seam between
         // that text and the block stays exactly one blank line.
-        let kind = Kind::YesNo {
-            question: String::new(),
-            yes: None,
-            no: None,
-        };
+        let kind = kinded(
+            String::new(),
+            QuestionKind::YesNo {
+                yes: None,
+                no: None,
+            },
+        );
         assert_eq!(
             body("the input  \n", &kind),
             "the input\n\nIs the following true?\nAnswer with yes or no only."
         );
     }
 
+    fn structured() -> ReadoutState {
+        ReadoutState::Structured {
+            compact: "{\"a\":[\"é\",true],\"b\":1}".to_owned(),
+            indented: "{\n  \"b\": 1,\n  \"a\": [\n    \"é\",\n    true\n  ]\n}".to_owned(),
+        }
+    }
+
     #[test]
-    fn render_text_passes_strings_and_compacts_containers() {
-        assert_eq!(render_text(&json!("plain")), "plain");
+    fn a_structured_state_is_spelled_the_familys_way() {
         assert_eq!(
-            render_text(&json!({"b": 1, "a": [1, 2]})),
-            "{\"a\":[1,2],\"b\":1}"
+            readout_text(&structured(), "ignored", StateSpelling::Indented).as_deref(),
+            Some("{\n  \"b\": 1,\n  \"a\": [\n    \"é\",\n    true\n  ]\n}")
         );
-        assert_eq!(render_text(&json!(42)), "42");
+        assert_eq!(
+            readout_text(&structured(), "ignored", StateSpelling::CompactSorted).as_deref(),
+            Some("{\"a\":[\"é\",true],\"b\":1}")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_blank_state_is_no_state_and_text_is_verbatim() {
+        let spelling = StateSpelling::Indented;
+        assert_eq!(readout_text(&ReadoutState::Absent, "x", spelling), None);
+        assert_eq!(readout_text(&ReadoutState::Input, "  ", spelling), None);
+        assert_eq!(readout_text(&ReadoutState::Input, "", spelling), None);
+        assert_eq!(
+            readout_text(&ReadoutState::Input, " hi\n", spelling).as_deref(),
+            Some(" hi\n")
+        );
     }
 
     #[test]
@@ -1406,13 +1352,13 @@ mod tests {
 
     fn prepared(ids: &[u32]) -> PreparedQuestion {
         PreparedQuestion {
-            id: String::new(),
-            kind: Kind::YesNo {
-                question: String::new(),
-                yes: None,
-                no: None,
-            },
-            probability_answer: false,
+            question: kinded(
+                String::new(),
+                QuestionKind::YesNo {
+                    yes: None,
+                    no: None,
+                },
+            ),
             prompt_tokens: ids.iter().copied().map(TokenId::new).collect(),
             labels: Vec::new(),
             media: Arc::from(Vec::new()),
@@ -1500,15 +1446,15 @@ mod tests {
         );
     }
 
-    fn str_option(name: &str) -> ChoiceOption {
-        ChoiceOption {
+    fn str_option(name: &str) -> Choice {
+        Choice {
             value: ChoiceValue::Str(name.to_string()),
             description: None,
         }
     }
 
-    fn bool_option(value: bool) -> ChoiceOption {
-        ChoiceOption {
+    fn bool_option(value: bool) -> Choice {
+        Choice {
             value: ChoiceValue::Bool(value),
             description: None,
         }
@@ -1518,10 +1464,10 @@ mod tests {
     fn a_boolean_choice_value_renders_as_the_word() {
         // The official wire's choice values are typed; a boolean spells
         // itself `true`/`false` on the option's line.
-        let kind = Kind::Choice {
-            question: "q".to_string(),
-            options: vec![bool_option(true), bool_option(false)],
-        };
+        let kind = kinded(
+            "q".to_string(),
+            QuestionKind::Choice(vec![bool_option(true), bool_option(false)]),
+        );
         assert_eq!(
             body("in", &kind),
             "in\n\nQuestion: q\nA: true\nB: false\nAnswer with the letter of one option only."
@@ -1530,19 +1476,19 @@ mod tests {
 
     #[test]
     fn a_score_level_description_shares_its_digit_line() {
-        let kind = Kind::Score {
-            question: "how bad".to_string(),
-            levels: vec![
-                ScoreLevel {
+        let kind = kinded(
+            "how bad".to_string(),
+            QuestionKind::Score(vec![
+                Level {
                     label: "Cosmetic".to_string(),
                     description: None,
                 },
-                ScoreLevel {
+                Level {
                     label: "Blocked".to_string(),
                     description: Some("no workaround".to_string()),
                 },
-            ],
-        };
+            ]),
+        );
         assert_eq!(
             body("in", &kind),
             "in\n\nQuestion: how bad\n0: Cosmetic\n1: Blocked - no workaround\nAnswer with the number of one level only."
@@ -1551,19 +1497,19 @@ mod tests {
 
     #[test]
     fn a_blank_score_level_description_keeps_the_bare_line() {
-        let kind = Kind::Score {
-            question: "how bad".to_string(),
-            levels: vec![
-                ScoreLevel {
+        let kind = kinded(
+            "how bad".to_string(),
+            QuestionKind::Score(vec![
+                Level {
                     label: "a".to_string(),
                     description: Some("   ".to_string()),
                 },
-                ScoreLevel {
+                Level {
                     label: "b".to_string(),
                     description: None,
                 },
-            ],
-        };
+            ]),
+        );
         assert_eq!(
             body("in", &kind),
             "in\n\nQuestion: how bad\n0: a\n1: b\nAnswer with the number of one level only."
@@ -1614,11 +1560,11 @@ mod tests {
         assert!(
             check_score_levels(
                 &[
-                    ScoreLevel {
+                    Level {
                         label: "ok".to_string(),
                         description: None
                     },
-                    ScoreLevel {
+                    Level {
                         label: "  ".to_string(),
                         description: None
                     },
@@ -1838,12 +1784,12 @@ mod tests {
             .map(|at| words[(at * 7 + at / 3) % words.len()])
             .collect::<Vec<_>>()
             .join(" ");
-        let kind = Kind::Choice {
-            question: "Which aspect is discussed?".to_owned(),
-            options: options(151),
-        };
+        let kind = kinded(
+            "Which aspect is discussed?".to_owned(),
+            QuestionKind::Choice(options(151)),
+        );
         let started = std::time::Instant::now();
-        let labels = vocabulary_labels(&vocabulary, &kind, "q").expect("151 labels");
+        let labels = vocabulary_labels(&vocabulary, &kind.kind, "q").expect("151 labels");
         let labelled = started.elapsed();
         let text = format!(
             "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",

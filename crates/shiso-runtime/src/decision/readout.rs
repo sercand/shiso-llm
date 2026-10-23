@@ -24,45 +24,23 @@
 
 use std::sync::Arc;
 
-use serde_json::Value;
 use shiso_core::{
     DecisionLayoutError, DecisionMedia, DecisionMediaKind, DecisionReadout, ReadoutPrompt,
-    ReadoutRecord, SchemaQuestion, StateSpelling,
+    ReadoutRecord, SchemaQuestion,
 };
 use shiso_ir::Block;
+use shiso_ir::decision::Question;
 
 use crate::api::pipeline::remaining_budget;
-use crate::decision::core::{self, Answered, InputTally, RawQuestion};
+use crate::decision::core::{self, Answered, InputTally};
 use crate::decision::head::{self, Encoder};
+use crate::decision::score::{RunScore, ScoreRun, fold_readout, readout_runs};
 use crate::error::AppError;
 use crate::scheduler::ScoreRequest;
 use crate::state::AppState;
-use shiso_decision::score::{RunScore, ScoreRun, fold_readout, readout_runs};
-
-/// The state a readout reads, spelled the way its family wants.
-///
-/// A missing or `null` state is no state, and so is a blank string: the
-/// caller who sent `""` beside a picture meant the picture to be the whole
-/// state, and the layout writes no state block for it. Any other string is
-/// the caller's text verbatim, untrimmed, because these bytes are scored.
-pub(crate) fn spell_state(state: Option<&Value>, spelling: StateSpelling) -> Option<String> {
-    match state? {
-        Value::Null => None,
-        Value::String(text) if text.trim().is_empty() => None,
-        Value::String(text) => Some(text.clone()),
-        structured => Some(match spelling {
-            StateSpelling::CompactSorted => core::render_text(structured),
-            // Serialising a parsed value cannot fail; the compact form is the
-            // fallback only so the type says so.
-            StateSpelling::Indented => {
-                serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string())
-            }
-        }),
-    }
-}
 
 /// What a refusal of the readout layout tells the caller.
-fn readout_refusal(error: DecisionLayoutError, questions: &[RawQuestion], ctx: u32) -> AppError {
+fn readout_refusal(error: DecisionLayoutError, questions: &[Question], ctx: u32) -> AppError {
     match error {
         DecisionLayoutError::PromptTooLong { tokens, .. } => AppError::ContextOverflow {
             param: "input",
@@ -72,7 +50,7 @@ fn readout_refusal(error: DecisionLayoutError, questions: &[RawQuestion], ctx: u
         DecisionLayoutError::Unreadable { question, reason } => AppError::bad_request(
             format!(
                 "{}: {reason}",
-                core::question_name(questions.get(question).map_or("", |q| q.id.as_str()))
+                core::question_name(questions.get(question).map_or("", |q| q.name.as_str()))
             ),
             Some("questions"),
             "invalid_request",
@@ -135,7 +113,7 @@ pub(crate) async fn run(
     readout: &dyn DecisionReadout,
     text: Option<&str>,
     media: Vec<Block>,
-    questions: Vec<RawQuestion>,
+    questions: Vec<Question>,
     temperature: f64,
     want_token_ids: bool,
 ) -> Result<(Vec<Answered>, InputTally), AppError> {
@@ -218,9 +196,7 @@ pub(crate) async fn run(
         .zip(runs)
         .map(
             |((question, folded), ScoreRun { tokens, labels, .. })| Answered {
-                id: question.id,
-                kind: question.kind,
-                probability_answer: question.probability_answer,
+                question,
                 probabilities: folded.probabilities,
                 label_mass: folded.label_mass,
                 top: folded.top,
@@ -249,42 +225,5 @@ fn shared_tally(answers: &[Answered], total: u64) -> InputTally {
     InputTally {
         input: total,
         cached: whole.cached.saturating_sub(deduplicated).min(total),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::spell_state;
-    use serde_json::json;
-    use shiso_core::StateSpelling;
-
-    #[test]
-    fn a_structured_state_is_spelled_the_familys_way() {
-        let state = json!({"b": 1, "a": ["é", true]});
-        assert_eq!(
-            spell_state(Some(&state), StateSpelling::Indented).as_deref(),
-            Some("{\n  \"b\": 1,\n  \"a\": [\n    \"é\",\n    true\n  ]\n}")
-        );
-        assert_eq!(
-            spell_state(Some(&state), StateSpelling::CompactSorted).as_deref(),
-            Some("{\"a\":[\"é\",true],\"b\":1}")
-        );
-    }
-
-    #[test]
-    fn a_missing_or_blank_state_is_no_state_and_text_is_verbatim() {
-        assert_eq!(spell_state(None, StateSpelling::Indented), None);
-        assert_eq!(
-            spell_state(Some(&json!(null)), StateSpelling::Indented),
-            None
-        );
-        assert_eq!(
-            spell_state(Some(&json!("  ")), StateSpelling::Indented),
-            None
-        );
-        assert_eq!(
-            spell_state(Some(&json!(" hi\n")), StateSpelling::Indented).as_deref(),
-            Some(" hi\n")
-        );
     }
 }
