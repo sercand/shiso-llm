@@ -575,11 +575,13 @@ fn cpu_decisions_are_bit_identical_at_one_and_many_threads() {
             .flatten()
             .zip(d4.iter().flatten().flatten())
             .all(|(a, b)| a.to_bits() == b.to_bits());
-    let same_rows = r1
-        .iter()
-        .flatten()
-        .zip(r4.iter().flatten())
-        .all(|(a, b)| a.to_bits() == b.to_bits());
+    let same_rows = r1.len() == r4.len()
+        && r1.iter().flatten().count() == r4.iter().flatten().count()
+        && r1
+            .iter()
+            .flatten()
+            .zip(r4.iter().flatten())
+            .all(|(a, b)| a.to_bits() == b.to_bits());
     report(&format!(
         "1 vs 4 threads: {} decision cases and {} rows, decisions identical {same_decisions}, rows identical {same_rows}",
         d1.len(),

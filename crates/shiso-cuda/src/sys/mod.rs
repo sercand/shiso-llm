@@ -142,6 +142,16 @@ impl SysError {
         }
     }
 
+    /// The error for a CUDA library other than the driver that is not
+    /// installed (cuBLAS, cuBLASLt): the driver may be fine, so the text must
+    /// not blame it.
+    pub(crate) const fn missing_library(op: &'static str) -> Self {
+        Self::Host {
+            op,
+            what: "a required CUDA library is not installed",
+        }
+    }
+
     /// Whether this failure means "the thing you are releasing is already gone".
     ///
     /// Teardown races are normal: the process may be exiting, the context may

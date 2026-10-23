@@ -441,7 +441,7 @@ impl Blas {
         // cudarc panics there if its library is missing; refuse at open so a
         // host without it falls back instead of dying mid-serve.
         if !nvidia::blas_lt_library_present() {
-            return Err(SysError::no_driver("libcublasLt").into());
+            return Err(SysError::missing_library("libcublasLt").into());
         }
         let classic = nvidia::blas_create()?;
         // SAFETY: the handle was just created and has not been destroyed.

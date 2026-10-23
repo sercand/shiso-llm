@@ -1005,7 +1005,7 @@ pub(crate) unsafe fn graph_launch(exec: CuGraphExec, stream: CuStream) -> SysRes
 /// [`SysError::Math`] when the library refuses a handle.
 pub(crate) fn blas_create() -> SysResult<CuBlas> {
     if !blas_library_present() {
-        return Err(SysError::no_driver("libcublas"));
+        return Err(SysError::missing_library("libcublas"));
     }
     let mut handle: blas::cublasHandle_t = std::ptr::null_mut();
     // SAFETY: `handle` is a live local of the type the library writes.
@@ -1223,7 +1223,7 @@ pub(crate) unsafe fn blas_gemm_strided(
 /// [`SysError::Math`] when the library refuses a handle.
 pub(crate) fn blas_lt_create() -> SysResult<CuBlasLt> {
     if !blas_lt_library_present() {
-        return Err(SysError::no_driver("libcublasLt"));
+        return Err(SysError::missing_library("libcublasLt"));
     }
     let mut handle: lt::cublasLtHandle_t = std::ptr::null_mut();
     // SAFETY: `handle` is a live local of the type the library writes.

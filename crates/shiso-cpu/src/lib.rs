@@ -28,14 +28,17 @@
 //! (`target/release/shiso serve --device cpu|metal`, one request at a time,
 //! warm). The 417-token `/v1/systemone` request (the `support` reference case)
 //! and decode tok/s from `/v1/completions` (`max_tokens` 128, greedy, the
-//! server's own `decode_tokens_per_second`):
+//! server's own `decode_tokens_per_second`). Completions was timed because the
+//! hand-built serve borrowed its config and tokenizer from another model home,
+//! so the chat template was not this model's:
 //!
 //! | Device | `/v1/systemone`, 417 tokens | Decode |
 //! |---|---|---|
 //! | cpu | 4.45 s | 31.8 tok/s |
 //! | metal | 0.050 s | 287 tok/s |
 //!
-//! The parallel-launch thresholds were swept and left alone; the numbers sit beside them in the `dispatch` module.
+//! The parallel-launch thresholds were swept and left alone; the numbers sit
+//! beside them in the `dispatch` module.
 //! The Linux `x86_64` and GB10 figures are not recorded here yet.
 //!
 //! Kernel arguments and the launch-time aliasing model are described in the

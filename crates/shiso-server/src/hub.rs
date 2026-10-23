@@ -15,7 +15,7 @@ use url::Url;
 
 use shiso_hub::config::{HfToken, HubConfig, RegistryEndpoint};
 use shiso_hub::download::Downloader;
-use shiso_hub::host::{Backend, HostProfile};
+use shiso_hub::host::{Backend, HostProfile, ServingDevice};
 use shiso_hub::progress::ProgressEvent;
 use shiso_hub::recipe::{ModelName, ModelRef};
 use shiso_hub::registry::RegistryClient;
@@ -259,10 +259,19 @@ pub async fn run_pull(args: PullArgs) -> anyhow::Result<()> {
     let is_tty = std::io::stdout().is_terminal();
     // The pull blocks on a runtime of its own, so it runs on a thread that may.
     tokio::task::spawn_blocking(move || {
+        let profile = probe_host_profile(device)?;
+        // A CUDA build on a host with no GPU quietly resolves `auto` to the
+        // CPU, and then pulls the CPU variant; say which device chose it.
+        tracing::info!(
+            requested = ?device,
+            device = ?profile.device,
+            "selecting a variant for the {} device",
+            if profile.device == ServingDevice::Cpu { "cpu" } else { "gpu" }
+        );
         pull_rendered(
             &model_ref,
             &config,
-            &probe_host_profile(device)?,
+            &profile,
             style,
             is_tty,
             &mut std::io::stdout(),
