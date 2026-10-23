@@ -424,6 +424,38 @@ fn a_blocking_call_answers_from_a_current_thread_runtime() {
     });
 }
 
+/// A sink runs inside the Runtime's own tokio context, so a task it spawns
+/// lands on the Runtime's only worker. A blocking call there would wait for the
+/// worker that has to run it; it returns an error instead.
+#[test]
+fn a_blocking_call_on_the_runtimes_own_worker_is_an_error() {
+    let code = within_guard(|| {
+        let runtime = Arc::new(scripted(vec![10, 11, 12]));
+        let mut spawned = Vec::new();
+        {
+            let inner = Arc::clone(&runtime);
+            futures::executor::block_on(runtime.generate_stream(&chat(), |event| {
+                if matches!(event, StreamEvent::Start { .. }) {
+                    let inner = Arc::clone(&inner);
+                    spawned.push(tokio::spawn(
+                        async move { inner.generate_blocking(&chat()) },
+                    ));
+                }
+                true
+            }))
+            .expect("streams");
+        }
+        let error = futures::executor::block_on(spawned.remove(0))
+            .expect("the task does not panic")
+            .expect_err("refused, not hung");
+        let code = error.code();
+        drop(spawned);
+        drop(runtime);
+        code
+    });
+    assert_eq!(code, "blocking_on_runtime_worker");
+}
+
 /// Capability errors reach a blocking caller in a task as typed errors too.
 #[test]
 fn a_blocking_call_in_a_task_returns_the_capability_error() {

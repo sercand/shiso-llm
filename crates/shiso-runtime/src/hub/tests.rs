@@ -15,6 +15,18 @@ use crate::options::{DEFAULT_CTX, ExplicitlySet, ServeOptions};
 
 const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
 
+/// Runs `work` on a thread of its own and fails if it takes over a minute, so
+/// a hang is a failure and not a stuck suite.
+fn guarded<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(work());
+    });
+    finished
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("the call neither returned nor panicked within a minute"))
+}
+
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -255,6 +267,10 @@ fn resolve_is_offline_and_none_when_absent() {
 /// blocks that task's worker and neither panics nor hangs.
 #[test]
 fn pull_runs_on_a_blocking_thread_and_in_a_task() {
+    guarded(pull_on_a_blocking_thread_and_in_a_task);
+}
+
+fn pull_on_a_blocking_thread_and_in_a_task() {
     let fx = Fixture::new(&[]);
     let (config, host) = (fx.config(), metal_host());
     let installed = fx
@@ -524,14 +540,28 @@ fn cancel_works_while_the_index_is_stalled() {
     cancelled_within(&fx, Duration::from_millis(300));
 }
 
+/// A pull inside a `futures::executor::block_on` main future, which refuses
+/// nested use of itself: the pull must neither panic nor hang.
+#[test]
+fn calling_inside_a_futures_executor_works() {
+    let fx = Fixture::new(&[]);
+    let (config, host) = (fx.config(), metal_host());
+    let result = guarded(move || {
+        futures::executor::block_on(async { pull_on(&host, "mini", &config, &mut |_, _| true) })
+    });
+    assert!(result.is_ok(), "{:?}", result.err());
+}
+
 #[test]
 fn calling_inside_a_block_on_main_future_works() {
-    let fx = Fixture::new(&[]);
-    let config = fx.config();
-    let result = fx
-        .rt
-        .block_on(async { pull_on(&metal_host(), "mini", &config, &mut |_, _| true) });
-    assert!(result.is_ok(), "{:?}", result.err());
+    guarded(|| {
+        let fx = Fixture::new(&[]);
+        let config = fx.config();
+        let result = fx
+            .rt
+            .block_on(async { pull_on(&metal_host(), "mini", &config, &mut |_, _| true) });
+        assert!(result.is_ok(), "{:?}", result.err());
+    });
 }
 
 #[test]

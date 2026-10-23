@@ -86,7 +86,11 @@ fn home_with(name: &str) -> Option<PathBuf> {
     }
 }
 
-fn options(home: &Path, tweak: impl FnOnce(&mut ServeOptions)) -> RuntimeOptions {
+fn options(
+    home: &Path,
+    explicit: &[&str],
+    tweak: impl FnOnce(&mut ServeOptions),
+) -> RuntimeOptions {
     let mut serve = ServeOptions {
         ctx: 2048,
         ..ServeOptions::default()
@@ -96,16 +100,30 @@ fn options(home: &Path, tweak: impl FnOnce(&mut ServeOptions)) -> RuntimeOptions
         home: Some(home.to_owned()),
         pull_if_missing: false,
         serve,
-        explicit: ["ctx", "kv_checkpoints", "max_num_seqs"]
+        explicit: ["ctx"]
             .into_iter()
+            .chain(explicit.iter().copied())
             .collect(),
     }
 }
 
 fn open(name: &str, home: &Path, tweak: impl FnOnce(&mut ServeOptions)) -> Runtime {
-    Runtime::open(Source::Registry(name), options(home, tweak), &mut |_, _| {
-        true
-    })
+    open_explicit(name, home, &[], tweak)
+}
+
+/// [`open`] with the named fields of the settings marked as set on purpose, so
+/// a recipe's default for them does not apply.
+fn open_explicit(
+    name: &str,
+    home: &Path,
+    explicit: &[&str],
+    tweak: impl FnOnce(&mut ServeOptions),
+) -> Runtime {
+    Runtime::open(
+        Source::Registry(name),
+        options(home, explicit, tweak),
+        &mut |_, _| true,
+    )
     .unwrap_or_else(|error| panic!("{name} opens: {error:?}"))
 }
 
@@ -269,7 +287,9 @@ fn resume_parity(name: &str) {
             .expect("decide answers")
     };
 
-    let shared = open(name, &home, |serve| serve.max_num_seqs = 1);
+    let shared = open_explicit(name, &home, &["max_num_seqs"], |serve| {
+        serve.max_num_seqs = 1;
+    });
     let resumed_reads: Vec<_> = all
         .iter()
         .map(|(input, questions)| {
@@ -281,7 +301,7 @@ fn resume_parity(name: &str) {
         .collect();
     drop(shared);
 
-    let whole = open(name, &home, |serve| {
+    let whole = open_explicit(name, &home, &["max_num_seqs", "kv_checkpoints"], |serve| {
         serve.max_num_seqs = 1;
         serve.kv_checkpoints = 0;
     });
@@ -514,12 +534,23 @@ fn images_smoke() {
     let Some(home) = home() else { return };
     let store = shiso_hub::BlobStore::new(config_for_home(&home));
     let installed = store.list_installed().expect("the home lists");
-    let Some(model) = installed.iter().find(|v| v.roles.contains(&Role::Image)) else {
+    let Some(model) = installed
+        .iter()
+        .filter(|v| v.roles.contains(&Role::Image))
+        .min_by_key(|v| v.disk_bytes)
+    else {
         say("skipping: no image model is installed");
         return;
     };
     let _device = exclusive();
+    let started = Instant::now();
     let runtime = open(model.model.as_ref(), &home, |_| {});
+    say(&format!(
+        "images: {} {} opened in {:?} (warm-up included)",
+        model.model.as_ref(),
+        model.variant.as_ref(),
+        started.elapsed()
+    ));
     let picture = Generate {
         prompt: "a lighthouse at dusk".to_owned(),
         n: Some(1),

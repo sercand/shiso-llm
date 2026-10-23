@@ -124,6 +124,12 @@ impl Drop for EngineGuard {
     }
 }
 
+thread_local! {
+    /// Set on the private runtime's worker thread, which a blocking call must
+    /// not wait on: that worker is the one that would have to run it.
+    static ON_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A tokio runtime that is shut down without waiting, so dropping it is legal
 /// on any thread (a plain drop panics inside an async context).
 #[derive(Debug)]
@@ -137,6 +143,7 @@ impl Executor {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("shiso-runtime")
+            .on_thread_start(|| ON_WORKER.set(true))
             .enable_all()
             .build()?;
         Ok(Self {
@@ -154,9 +161,9 @@ impl Drop for Executor {
     }
 }
 
-/// Polls `future` inside `handle`'s context on every poll, so timers and
-/// `spawn_blocking` work under any executor, and the future stays in the
-/// caller's task (it need not be `'static`, and dropping it cancels it).
+/// Polls `future` inside `handle`'s context on every poll, so tokio timers
+/// work under any executor, and the future stays in the caller's task (it need
+/// not be `'static`, and dropping it cancels it).
 async fn within<F: Future>(handle: Handle, future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     std::future::poll_fn(|cx| {
@@ -496,11 +503,26 @@ impl Runtime {
     /// thread on a channel until it answers. Nothing here calls `block_on`, so
     /// no caller can make it panic; the task owns what it needs, which is why
     /// `make` is handed the state.
+    ///
+    /// The one caller that cannot wait is the runtime's own worker, which would
+    /// be waiting for itself: a sink runs inside the runtime's tokio context,
+    /// so a task it spawns lands there. That is refused with an error.
+    ///
+    /// The task drops its state clone after the answer is sent, so a caller
+    /// that drops the runtime at once joins the engine while the clone is still
+    /// held; the executor, declared after the engine guard, is alive to drop it.
     fn block<T, F>(&self, make: impl FnOnce(Arc<AppState>) -> F) -> Result<T, AppError>
     where
         T: Send + 'static,
         F: Future<Output = Result<T, AppError>> + Send + 'static,
     {
+        if ON_WORKER.get() {
+            return Err(AppError::bad_request(
+                "a blocking call was made on the runtime's own worker thread (a task spawned from a sink?); use the async method there",
+                None,
+                "blocking_on_runtime_worker",
+            ));
+        }
         let (answer, answered) = std::sync::mpsc::channel();
         let call = make(Arc::clone(&self.state));
         self.executor.handle.spawn(async move {
@@ -529,18 +551,7 @@ impl Runtime {
                 .map_err(OpenError::WarmUp)?;
         }
         if let Some(image) = state.image.as_ref() {
-            let limits = image.limits();
-            let side = limits.min_side.div_ceil(limits.size_multiple) * limits.size_multiple;
-            let request = Generate {
-                prompt: "warm-up".to_owned(),
-                n: Some(1),
-                size: Some(format!("{side}x{side}")),
-                aspect_ratio: None,
-                steps: Some(limits.fixed_steps.unwrap_or(1)),
-                seed: Some(0),
-                output_format: None,
-                output_compression: None,
-            };
+            let request = warm_up_image(image.limits());
             if let Err(error) = self
                 .block(move |state| async move { crate::image::generate(&state, request).await })
             {
@@ -570,6 +581,24 @@ fn require_questions(request: &shiso_ir::decision::Request) -> Result<(), AppErr
     Ok(())
 }
 
+/// The smallest picture the limits allow: the smallest side on the size grid
+/// (a multiple of zero is no grid, so the side stands as it is), at the fixed
+/// step count or one step.
+fn warm_up_image(limits: &shiso_vision::generator::ImageLimits) -> Generate {
+    let multiple = limits.size_multiple.max(1);
+    let side = (limits.min_side.div_ceil(multiple) * multiple).max(multiple);
+    Generate {
+        prompt: "warm-up".to_owned(),
+        n: Some(1),
+        size: Some(format!("{side}x{side}")),
+        aspect_ratio: None,
+        steps: Some(limits.fixed_steps.unwrap_or(1)),
+        seed: Some(0),
+        output_format: None,
+        output_compression: None,
+    }
+}
+
 /// The smallest valid decision request: the warm-up pass.
 fn warm_up_decision() -> shiso_ir::decision::Request {
     let choice = |value: &str| Choice {
@@ -588,5 +617,38 @@ fn warm_up_decision() -> shiso_ir::decision::Request {
         temperature: None,
         preserve_thinking: None,
         token_ids: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::warm_up_image;
+    use shiso_vision::generator::ImageLimits;
+
+    fn limits(multiple: u32, min_side: u32, fixed: Option<u32>) -> ImageLimits {
+        ImageLimits {
+            size_multiple: multiple,
+            min_side,
+            max_side: 4096,
+            default_size: (1024, 1024),
+            default_steps: 4,
+            fixed_steps: fixed,
+        }
+    }
+
+    #[test]
+    fn the_warm_up_picture_is_the_smallest_the_limits_allow() {
+        let size = |l: &ImageLimits| warm_up_image(l).size.expect("a size");
+        assert_eq!(size(&limits(16, 256, None)), "256x256");
+        assert_eq!(
+            size(&limits(16, 250, None)),
+            "256x256",
+            "rounded up to the grid"
+        );
+        assert_eq!(size(&limits(64, 100, None)), "128x128");
+        assert_eq!(size(&limits(16, 0, None)), "16x16", "never a zero side");
+        assert_eq!(size(&limits(0, 250, None)), "250x250", "no grid: no panic");
+        assert_eq!(warm_up_image(&limits(16, 256, None)).steps, Some(1));
+        assert_eq!(warm_up_image(&limits(16, 256, Some(4))).steps, Some(4));
     }
 }

@@ -362,9 +362,9 @@ pub fn pull_observed_on(
         });
     }
     // A runtime of its own with a worker to drive its timers and tasks, entered
-    // for the calling thread; the future is polled by a plain executor, which
-    // has no objection to being called from inside a tokio task (it blocks that
-    // worker, as any blocking I/O does).
+    // for the calling thread; the future is polled by a bare park loop, which
+    // has no objection to being called from inside any executor (it blocks that
+    // executor's thread, as any blocking I/O does).
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -372,12 +372,36 @@ pub fn pull_observed_on(
         .map_err(|error| PullError::Request(format!("could not start a runtime: {error}")))?;
     let result = {
         let _entered = runtime.enter();
-        futures::executor::block_on(drive(config, host, &store, &parsed, observer))
+        park_on(drive(config, host, &store, &parsed, observer))
     };
     // Downloads still in flight after a cancel or an error are dropped here,
     // not awaited: their partial files are what the next call resumes.
     runtime.shutdown_background();
     result
+}
+
+/// Wakes a parked thread.
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Polls `future` on this thread, parking between polls. Unlike an executor's
+/// `block_on` it keeps no thread-local "already inside an executor" guard, so
+/// it may be called from inside any executor, tokio's or not.
+fn park_on<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+        std::thread::park();
+    }
 }
 
 fn parse_ref(model_ref: &str) -> Result<ModelRef, PullError> {
