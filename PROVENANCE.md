@@ -24,7 +24,7 @@ the name "ds4" for the host project.
 | `crates/shiso-modelfile` | llama.cpp (GGUF format, `ggml-quants` block layouts); MLX (affine quantization); NVIDIA modelopt (FP8/NVFP4 exports) | file-format readers written against those formats |
 | `crates/shiso-kvstore` | Marconi (hybrid-model prefix caching) | eviction policy follows the paper's utility scoring |
 | `crates/shiso-engine` | - | original to this repository |
-| `crates/shiso-decision` | - | original to this repository |
+| `crates/shiso-decision` | - | original to this repository; the answer arithmetic, readout/head scoring and `Decider` are new, and model download reuses `shiso-hub` |
 | `crates/shiso-models` | Hugging Face `transformers`, MLX, llama.cpp; the Splash package format | per-family configs and tensor names follow the reference exports |
 | `crates/shiso-ir` | - | original; shaped after the OpenAI Responses and Anthropic Messages APIs |
 | `crates/shiso-parsers` | - | original; tag formats are the model families' own |

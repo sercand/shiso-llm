@@ -205,6 +205,41 @@ curl http://127.0.0.1:8090/v1/audio/transcriptions \
     -F 'keywords[]=Marigold' -F 'keywords[]=Lighthouse'
 ```
 
+## Library use
+
+The `shiso-decision` crate runs a decision model inside your own process: give
+it some text and a multiple-choice question, get the probability of each
+answer back. It serves models with a decision readout or head only; generic
+chat models go through the server's `/v1/decisions` route. Build it with
+`--features metal` or `--features cuda` (without one, opening a model fails
+with `NoDevice`).
+
+```rust
+use std::path::Path;
+use shiso_decision::schema::{Choice, DecisionRequest, Question};
+use shiso_decision::{Decider, OpenDesc, ensure_model};
+
+let model = ensure_model("d1-3b", Path::new("models"), &mut |done, total| {
+    eprintln!("{done}/{total}");
+    true // false cancels; partial files are kept and resumed
+})?;
+let decider = Decider::open(&OpenDesc::new(&model.dir))?;
+let choice = |v: &str| Choice { value: v.into(), description: None };
+let answers = decider.decide_blocking(&DecisionRequest {
+    input: "cwd: /repo\ntask: unknown\ncmd: ls -la".into(),
+    questions: vec![Question::Choice {
+        name: "decision".into(),
+        instructions: "Is this command safe to run without asking?".into(),
+        choices: vec![choice("approve"), choice("ask"), choice("deny")],
+    }],
+    temperature: None,
+})?;
+```
+
+`ensure_model` and `decide_blocking` block, so call them from a thread that
+may block. A `Decider` owns its model on a worker thread; dropping it joins
+that thread, so drop it off any async executor.
+
 ## Configuration
 
 Run `shiso serve --help` for every option. Each flag also reads a `SHISO_*`
