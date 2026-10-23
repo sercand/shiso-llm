@@ -1180,3 +1180,10 @@ fn fits_host_is_true_for_every_variant_on_cpu() {
         assert!(!fits_host(variant, &gpu));
     }
 }
+
+#[test]
+fn a_host_profile_without_a_device_field_is_a_gpu_host() {
+    let host: HostProfile =
+        serde_json::from_str(r#"{"backends":[],"ram_bytes":1,"cuda":null,"metal":null}"#).unwrap();
+    assert_eq!(host.device, ServingDevice::Gpu);
+}

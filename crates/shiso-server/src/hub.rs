@@ -29,7 +29,7 @@ use crate::cli::{
 };
 
 use shiso_runtime::device::DeviceChoice;
-pub use shiso_runtime::hub::probe_host_profile;
+pub use shiso_runtime::hub::{host_facts, probe_host_profile};
 
 /// Resolves `home` directory from string, expanding `~`.
 #[must_use]
@@ -262,7 +262,7 @@ pub async fn run_pull(args: PullArgs) -> anyhow::Result<()> {
         pull_rendered(
             &model_ref,
             &config,
-            &probe_host_profile(device),
+            &probe_host_profile(device)?,
             style,
             is_tty,
             &mut std::io::stdout(),
@@ -328,7 +328,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<()> {
     if args.remote {
         let client = RegistryClient::new(config.clone());
         let store = BlobStore::new(config);
-        let host = probe_host_profile(DeviceChoice::Auto);
+        let host = probe_host_profile(DeviceChoice::Auto).unwrap_or_else(|_| host_facts());
 
         println!("Querying remote registry...");
         let index = client.fetch_index().await?;
@@ -456,7 +456,7 @@ pub async fn run_info(args: InfoArgs) -> anyhow::Result<()> {
     println!("Tasks:       {}", tasks.join(", "));
     println!("Tags:        {}", recipe.tags.join(", "));
 
-    let host = probe_host_profile(DeviceChoice::Auto);
+    let host = probe_host_profile(DeviceChoice::Auto).unwrap_or_else(|_| host_facts());
     if let Some(metal) = &host.metal {
         println!(
             "Host:        {} (Apple GPU family {} = {}, working set {} MB)",
