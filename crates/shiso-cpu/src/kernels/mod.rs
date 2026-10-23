@@ -5,6 +5,7 @@
 //! an entry without a row is `Unsupported`, never a silent no-op.
 
 mod args;
+mod audio;
 mod dense;
 mod generic;
 mod qwen35;
@@ -67,4 +68,24 @@ pub(crate) static TABLE: &Table = &[
     ("dense", "kernel_dense_attn_decode", dense::attn::DECODE),
     ("dense", "kernel_dense_attn_prefill", dense::attn::PREFILL),
     ("qwen35", "kernel_mul_mm_q8_0_f32", qwen35::gemm::Q8_0),
+    ("audio", "kernel_audio_gemm_q8_0w", audio::gemm::GEMM),
+    ("audio", "kernel_audio_gemm64_q8_0w", audio::gemm::GEMM64),
+    ("audio", "kernel_audio_gemv_q8_0w", audio::gemm::GEMV),
+    (
+        "audio",
+        "kernel_audio_split_sum_f32",
+        audio::gemm::SPLIT_SUM,
+    ),
+    (
+        "audio",
+        "kernel_audio_layer_norm_f32",
+        audio::norm::LAYER_NORM,
+    ),
+    (
+        "audio",
+        "kernel_audio_window_attn_f32",
+        audio::attn::WINDOW_ATTN,
+    ),
+    ("audio", "kernel_audio_unary_f32", audio::elementwise::UNARY),
+    ("audio", "kernel_audio_axpy_f32", audio::elementwise::AXPY),
 ];
