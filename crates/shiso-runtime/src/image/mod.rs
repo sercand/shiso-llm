@@ -15,9 +15,15 @@
 //! while one that waits forever holds a connection for an answer that arrives
 //! too late to be worth anything.
 
+mod core;
 mod worker;
 
 pub mod size;
+
+pub use core::{
+    MAX_IMAGES_PER_REQUEST, MAX_STEPS_PER_IMAGE, edit, edit_stream, generate, generate_stream,
+    validate, validate_edit,
+};
 
 use std::future::Future;
 use std::pin::Pin;

@@ -50,6 +50,7 @@
 
 pub mod decision;
 mod embed;
+pub mod image;
 mod message;
 mod request;
 mod response;

@@ -1,27 +1,27 @@
 //! `POST /images`, `POST /v1/images`, `POST /v1/images/generations`.
 //!
-//! The edit routes ([`crate::openai::image_edits`]) enter at [`run`] with the
-//! same plan and answer paths and a list of reference pictures; these three
-//! routes are text-only and always enter with none.
+//! The edit routes ([`crate::openai::image_edits`]) enter at `run_edit` with
+//! the same answer paths and a list of reference pictures; these three routes
+//! are text-only.
+//!
+//! This module is the wire's half: it parses the body, picks the blocking or
+//! the streaming core of [`shiso_runtime::image`], and spells the IR it gets
+//! back as JSON or as SSE frames. The size grammar, the defaults, the plan and
+//! the generation loop are the core's.
 //!
 //! # One request, two readings
 //!
 //! The blocking answer waits for each finished image and encodes one JSON
 //! body; the streamed one forwards the generator's step events as they happen
 //! and closes with the finished image. Both readings come from the same
-//! [`ImageGenerationJob`]s, so the `b64_json` of a streamed answer and of a
+//! image generation jobs, so the `b64_json` of a streamed answer and of a
 //! blocking one are the same bytes for the same request.
 //!
 //! # What the wire values become
 //!
-//! The size grammar lives in [`crate::image::size`]: `WxH` is rounded to the
-//! generator's 16-grid and clamped to its bounds, the named aspect ratios
-//! become the table's concrete pixels, and a named resolution (`2K`) becomes
-//! its square. A size of `auto` is an omitted size: the caller gets the
-//! server default. `steps` names the denoising steps per image; omitted, it
-//! is the operator's `--image-default-steps`. `quality`, `user` and
-//! `session_id` are accepted and unused, each for the reason spelled out on
-//! the wire field.
+//! See [`shiso_runtime::image`]: the size grammar, `auto`, and the default
+//! step count. `quality`, `user` and `session_id` are accepted and unused,
+//! each for the reason spelled out on the wire field.
 //!
 //! # Why a streamed request waits for admission
 //!
@@ -46,16 +46,11 @@ use axum::response::{IntoResponse as _, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::StreamExt as _;
-use shiso_core::ids::Seed;
-use shiso_vision::generator::{
-    GeneratedImage, ImageGenerationJob, ImageOutputFormat, ImageStepEvent, InputReferenceImage,
-};
+use shiso_ir::image::{Edit, Generate, Image, Images, Step, Usage};
 use tokio::sync::mpsc;
 
 use crate::api::sse::Frame;
 use crate::error::{AppError, type_for_status};
-use crate::image::ImageService;
-use crate::image::{self, size};
 use crate::openai::images_wire::{
     ImageData, ImageGenCompletedEvent, ImageGenPartialImageEvent, ImageGenerationRequest,
     ImageGenerationResponse, ImageGenerationUsage,
@@ -75,7 +70,7 @@ pub async fn generate_images(State(state): State<Arc<AppState>>, body: Bytes) ->
 }
 
 /// The handler, with its failures still typed.
-async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
+async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppError> {
     let parsed: ImageGenerationRequest = serde_json::from_slice(body).map_err(|error| {
         AppError::bad_request(
             format!("the request body is not an image generation request: {error}"),
@@ -85,252 +80,89 @@ async fn answer(state: &AppState, body: &Bytes) -> Result<Response, AppError> {
     })?;
     // Refused before the image-model question: a body this server will never
     // act on is the caller's fault whether or not a generator is loaded. The
-    // plan is built in the same position for the same reason - a malformed
-    // size or output format is a 400 with no generator loaded too, so the 503
-    // is reserved for a well-formed request this server could have run.
-    run(state, parsed, Vec::new()).await
+    // core judges the size and the output format in the same position for the
+    // same reason, so the 503 is reserved for a well-formed request this
+    // server could have run.
+    parsed.validate()?;
+    note_ignored(state, &parsed);
+    let ir = parsed.to_ir();
+    if parsed.stream.unwrap_or(false) {
+        stream(state, Job::Generate(ir)).await
+    } else {
+        Ok(buffered(shiso_runtime::image::generate(state, ir).await?))
+    }
 }
 
-/// Validates a parsed request and answers it: the part the generation and the
-/// edit routes share, which differ only in the references they carry.
-pub(crate) async fn run(
-    state: &AppState,
+/// Answers an edit: the generation route's own request plus the references,
+/// through the same answer paths, so a streamed or buffered edit is the same
+/// response a generation is.
+pub(crate) async fn run_edit(
+    state: &Arc<AppState>,
     parsed: ImageGenerationRequest,
-    references: Vec<InputReferenceImage>,
+    references: Vec<Vec<u8>>,
 ) -> Result<Response, AppError> {
     parsed.validate()?;
-    let plan = Plan::from_wire(&parsed, state.image.as_ref())?;
-    let service = state.image()?;
-    let plan = plan.with_references(references, service)?;
+    note_ignored(state, &parsed);
+    let edit = Edit {
+        generate: parsed.to_ir(),
+        references,
+    };
+    if parsed.stream.unwrap_or(false) {
+        stream(state, Job::Edit(edit)).await
+    } else {
+        Ok(buffered(shiso_runtime::image::edit(state, edit).await?))
+    }
+}
+
+/// Says in the debug log what the request named that this server does not act
+/// on.
+fn note_ignored(state: &AppState, parsed: &ImageGenerationRequest) {
     if let Some(quality) = parsed.quality.as_deref() {
         tracing::debug!(
             quality,
             "quality is accepted and ignored: this server has one rendering path"
         );
     }
-    if let Some(model) = parsed.model.as_deref() {
+    if let Some(model) = parsed.model.as_deref()
+        && let Some(service) = state.image.as_ref()
+    {
         tracing::debug!(
             model,
             served = service.model_id(),
             "the named model is answered by whichever generator is loaded"
         );
     }
-    if plan.stream {
-        stream(service.clone(), plan).await
-    } else {
-        buffered(service, &plan).await
-    }
 }
 
-/// One validated request as the server will run it: the job template and how
-/// many of it to make.
-///
-/// A named struct rather than a dozen arguments: the wire fields arrive
-/// together, get checked together, and both answer paths need all of them.
-#[derive(Debug)]
-struct Plan {
-    /// Prompt every image of the request carries.
-    prompt: String,
-    /// Output width, normalized to the grid.
-    width: u32,
-    /// Output height, normalized to the grid.
-    height: u32,
-    /// Denoising steps: the named count, or the server default.
-    steps: u32,
-    /// The seed of the first image: the named one, or entropy so the images
-    /// of one request differ from each other.
-    seed: u64,
-    /// Encoding every image is returned in.
-    output_format: ImageOutputFormat,
-    /// Compression, when the caller named one.
-    output_compression: Option<u32>,
-    /// How many images to generate, `1..=10`.
-    n: usize,
-    /// Whether the caller asked for the SSE stream.
-    stream: bool,
-    /// Whether the caller named a size (or an aspect ratio); an edit that
-    /// names none takes the size its references imply.
-    size_named: bool,
-    /// The reference pictures every image of the request is edited from;
-    /// empty for text-to-image.
-    references: Vec<InputReferenceImage>,
+/// What a streamed request runs: a generation, or an edit with references.
+enum Job {
+    Generate(Generate),
+    Edit(Edit),
 }
 
-impl Plan {
-    /// Checks the wire values the format alone cannot judge - the size
-    /// grammar, the output format - and folds in the server defaults.
-    ///
-    /// # Errors
-    ///
-    /// [`AppError::BadRequest`] for a size string neither shape, and for an
-    /// output format the generator does not encode.
-    fn from_wire(
-        parsed: &ImageGenerationRequest,
-        service: Option<&ImageService>,
-    ) -> Result<Self, AppError> {
-        // With no model loaded the request is still judged for shape, against
-        // the published limits, so a malformed one stays a 400 ahead of the 503.
-        let limits = service.map_or(image::UNLOADED_LIMITS, |s| *s.limits());
-        let defaults = service.map_or_else(|| image::ImageDefaults::of(&limits), |s| *s.defaults());
-        // `auto` is an omitted size: the caller is asking for this server's
-        // default, which is exactly what an omitted size gets. It is read
-        // out here rather than in the grammar because the grammar has no
-        // business knowing what the default is.
-        let size = parsed.size.as_deref().filter(|value| !size::is_auto(value));
-        let (width, height) = match (size, parsed.aspect_ratio.as_deref()) {
-            // `size` wins when both are named: it is the more specific of the
-            // two, and a client that sends both wants the pixels it spelled.
-            (Some(value), _) => {
-                size::normalize_size(value, &limits).map_err(|error| size_error(&error, "size"))?
-            }
-            (None, Some(value)) => size::normalize_size(value, &limits)
-                .map_err(|error| size_error(&error, "aspect_ratio"))?,
-            (None, None) => (defaults.width, defaults.height),
-        };
-        // The generator's own format parser is the one authority on what it
-        // encodes; its refusal is the request's fault and names the field.
-        let output_format = parsed
-            .output_format
-            .as_deref()
-            .map(str::parse::<ImageOutputFormat>)
-            .transpose()
-            .map_err(image::refuse)?;
-        Ok(Self {
-            prompt: parsed.prompt.clone(),
-            width,
-            height,
-            steps: parsed.steps.unwrap_or(defaults.steps),
-            // A named seed makes the request reproducible and image `i` of it
-            // gets `seed + i`; an unnamed one draws a base from the process's
-            // one entropy source so the `n` images of one request differ.
-            seed: parsed.seed.unwrap_or_else(crate::ids::entropy_u64),
-            output_format: output_format.unwrap_or_default(),
-            output_compression: parsed.output_compression,
-            n: parsed.n.unwrap_or(1),
-            stream: parsed.stream.unwrap_or(false),
-            size_named: size.is_some() || parsed.aspect_ratio.is_some(),
-            references: Vec::new(),
-        })
-    }
-
-    /// Attaches the references, after the checks that only the loaded model
-    /// can make, all before any queue slot or device work is spent.
-    ///
-    /// # Errors
-    ///
-    /// [`AppError::BadRequest`] when the model takes no references, when there
-    /// are more than it takes, or when they imply no size.
-    fn with_references(
-        mut self,
-        references: Vec<InputReferenceImage>,
-        service: &ImageService,
-    ) -> Result<Self, AppError> {
-        if references.is_empty() {
-            return Ok(self);
-        }
-        let max = service.max_references();
-        if max == 0 {
-            return Err(AppError::bad_request(
-                format!(
-                    "the loaded model '{}' does not take reference images",
-                    service.model_id()
-                ),
-                Some("image"),
-                "unsupported_parameter",
-            ));
-        }
-        if references.len() > max {
-            return Err(AppError::bad_request(
-                format!(
-                    "{} reference images were given; the loaded model '{}' accepts at most {max}",
-                    references.len(),
-                    service.model_id()
-                ),
-                Some("image"),
-                "invalid_request",
-            ));
-        }
-        // The model's own size for these references, not the text-to-image
-        // default: a single reference is edited at its own aspect ratio.
-        if !self.size_named {
-            (self.width, self.height) = service.default_size_for_references(&references)?;
-        }
-        self.references = references;
-        Ok(self)
-    }
-
-    /// The job for image `index` of the request.
-    fn job(&self, index: usize) -> ImageGenerationJob {
-        let offset = u64::try_from(index).unwrap_or(u64::MAX);
-        ImageGenerationJob {
-            prompt: self.prompt.clone(),
-            width: self.width,
-            height: self.height,
-            steps: self.steps,
-            seed: Seed::new(self.seed.wrapping_add(offset)),
-            output_format: self.output_format,
-            output_compression: self.output_compression,
-            input_references: self.references.clone(),
-        }
-    }
-}
-
-/// A size refusal, naming the wire field that carried the value.
-fn size_error(error: &size::SizeError, param: &str) -> AppError {
-    AppError::bad_request(error.to_string(), Some(param), "invalid_request")
-}
-
-/// The token accounting across the images of one request: each image's
-/// estimate, summed.
-#[derive(Debug, Clone, Copy, Default)]
-struct UsageTotals {
-    prompt: u32,
-    completion: u32,
-}
-
-impl UsageTotals {
-    fn add(&mut self, image: &GeneratedImage) {
-        self.prompt = self.prompt.saturating_add(image.prompt_tokens);
-        self.completion = self.completion.saturating_add(image.completion_tokens);
-    }
-
-    fn wire(self) -> ImageGenerationUsage {
-        ImageGenerationUsage {
-            prompt_tokens: self.prompt,
-            completion_tokens: self.completion,
-            total_tokens: self.prompt.saturating_add(self.completion),
-        }
-    }
-}
-
-/// The blocking answer: every image generated in turn, then one JSON body.
-///
-/// In turn, not at once: the service runs one generation at a time anyway,
-/// and a caller that asked for three gets them in request order.
-///
-/// All-or-nothing: an overload partway through an `n > 1` request answers
-/// the whole request with the 503 and no image body. A JSON body carrying
-/// fewer than the `n` images the caller asked for would be a silent
-/// contract violation - the caller could not tell a partial success from a
-/// truncated list - so the refusal is the whole answer and a retry redoes
-/// the lot.
-async fn buffered(service: &ImageService, plan: &Plan) -> Result<Response, AppError> {
-    let mut data = Vec::with_capacity(plan.n);
-    let mut usage = UsageTotals::default();
-    for index in 0..plan.n {
-        let generated = service.generate(plan.job(index)).await?;
-        usage.add(&generated);
-        data.push(ImageData {
-            b64_json: BASE64_STANDARD.encode(&generated.bytes),
-            media_type: Some(generated.media_type.to_owned()),
-        });
-    }
+/// The blocking answer: one JSON body for every image.
+fn buffered(images: Images) -> Response {
     let body = ImageGenerationResponse {
-        created: crate::ids::unix_timestamp(),
-        data,
-        usage: Some(usage.wire()),
+        created: images.created,
+        data: images
+            .images
+            .into_iter()
+            .map(|image| ImageData {
+                b64_json: BASE64_STANDARD.encode(&image.bytes),
+                media_type: Some(image.media_type),
+            })
+            .collect(),
+        usage: Some(usage_wire(images.usage)),
     };
-    Ok(Json(body).into_response())
+    Json(body).into_response()
+}
+
+fn usage_wire(usage: Usage) -> ImageGenerationUsage {
+    ImageGenerationUsage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens(),
+    }
 }
 
 /// The streamed answer: frames from a task that runs the generations, after
@@ -340,9 +172,9 @@ async fn buffered(service: &ImageService, plan: &Plan) -> Result<Response, AppEr
 /// the stream, so an admission refusal still answers with a status code;
 /// the answer on success is a comment frame, so the head is flushed at
 /// admission rather than at the first decoded partial.
-async fn stream(service: ImageService, plan: Plan) -> Result<Response, AppError> {
+async fn stream(state: &Arc<AppState>, job: Job) -> Result<Response, AppError> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Result<Event, AppError>>();
-    tokio::spawn(run_stream(service, plan, tx));
+    tokio::spawn(run_stream(Arc::clone(state), job, tx));
     let first = rx.recv().await.ok_or_else(|| {
         AppError::internal("the image stream ended before it started", StreamGone)
     })?;
@@ -367,108 +199,47 @@ async fn stream(service: ImageService, plan: Plan) -> Result<Response, AppError>
         .into_response())
 }
 
-/// Runs the plan's generations and sends the frames as they happen.
+/// Runs the core and sends the frames as they happen.
 ///
 /// A task rather than a stream state machine because the generation and the
 /// client's reading run at different speeds by design: a caller that stops
 /// reading does not stop the generation (the service's own rule), and the
 /// frames it missed are simply not sent.
 async fn run_stream(
-    service: ImageService,
-    plan: Plan,
+    state: Arc<AppState>,
+    job: Job,
     tx: mpsc::UnboundedSender<Result<Event, AppError>>,
 ) {
-    let created = crate::ids::unix_timestamp();
-    let mut usage = UsageTotals::default();
-    // The wire's `partial_image_index` counts across ALL images of one
-    // request: with n>1 the counter keeps incrementing into the second image
-    // rather than restarting, which is why it lives outside the loop.
-    let mut partial_index = 0u32;
     // Whether any item has been promised to the client yet (the acceptance
     // comment counts): before the first one a failure is still answerable
     // as a status code; after it, the 200 is spent and the failure has to
     // arrive as content.
     let mut streaming = false;
-    for index in 0..plan.n {
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ImageStepEvent>();
-        // Admission is decided synchronously - validate and the queue slot -
-        // so a refusal is still answerable as a status code while nothing
-        // has gone out, and an accepted job can flush the head before the
-        // first step runs.
-        let mut running = match service.admit(plan.job(index), Some(progress_tx)) {
-            Ok(answer) => answer,
-            Err(error) => {
-                fail(&tx, error, streaming);
-                return;
-            }
+    let sink = |step: Step| {
+        let event = match step {
+            Step::Admitted => accepted_event(),
+            Step::Partial { index, bytes } => partial_frame(&bytes, index).into_event(),
+            Step::Completed {
+                created,
+                image,
+                usage,
+            } => completed_frame(created, &image, usage_wire(usage)).into_event(),
         };
-        // The acceptance comment: it carries no event and no data, so the
-        // wire event shape is unchanged, but it is the first item out of
-        // this task, which is the moment the handler commits to the 200.
-        if !send(&tx, Ok(accepted_event()), &mut streaming) {
-            return;
+        streaming = true;
+        tx.send(Ok(event)).is_ok()
+    };
+    let result = match job {
+        Job::Generate(request) => {
+            shiso_runtime::image::generate_stream(&state, request, sink).await
         }
-        // The worker drops its progress sender before it sends the reply,
-        // so `recv` starts answering `None` while the answer is still
-        // pending; a bare `recv` branch would then hand back `None` forever
-        // and spin beside the running generation, so the branch is disabled
-        // once the channel says it is done.
-        let mut progress_open = true;
-        let answer = loop {
-            tokio::select! {
-                step = progress_rx.recv(), if progress_open => {
-                    match step {
-                        Some(event) => {
-                            // A step event that carries no bytes produces no
-                            // frame: this event's payload is the partial
-                            // image, and a step tick has nothing to put in
-                            // it. The keep-alive is what tells a waiting
-                            // client the generation is still alive.
-                            if !is_final_step(&event)
-                                && let Some(bytes) = event.partial_image
-                            {
-                                let frame = partial_frame(bytes, partial_index);
-                                partial_index += 1;
-                                if !send(&tx, Ok(frame.into_event()), &mut streaming) {
-                                    return;
-                                }
-                            }
-                        }
-                        None => progress_open = false,
-                    }
-                }
-                answer = &mut running => break answer,
-            }
-        };
-        // The worker sends every step event before the reply, so anything
-        // still buffered belongs to this image and goes out before its
-        // completed frame.
-        while let Ok(event) = progress_rx.try_recv() {
-            if !is_final_step(&event)
-                && let Some(bytes) = event.partial_image
-            {
-                let frame = partial_frame(bytes, partial_index);
-                partial_index += 1;
-                if !send(&tx, Ok(frame.into_event()), &mut streaming) {
-                    return;
-                }
-            }
+        Job::Edit(request) => shiso_runtime::image::edit_stream(&state, request, sink).await,
+    };
+    match result {
+        Ok(()) => {
+            let _ = tx.send(Ok(Frame::done().into_event()));
         }
-        match answer {
-            Ok(generated) => {
-                usage.add(&generated);
-                let frame = completed_frame(created, &generated, usage.wire());
-                if !send(&tx, Ok(frame.into_event()), &mut streaming) {
-                    return;
-                }
-            }
-            Err(error) => {
-                fail(&tx, error, streaming);
-                return;
-            }
-        }
+        Err(error) => fail(&tx, error, streaming),
     }
-    let _ = tx.send(Ok(Frame::done().into_event()));
 }
 
 /// Reports a failure at the right altitude: while nothing has been promised
@@ -484,18 +255,6 @@ fn fail(tx: &mpsc::UnboundedSender<Result<Event, AppError>>, error: AppError, st
     let _ = tx.send(Ok(Frame::done().into_event()));
 }
 
-/// Sends one item and records that the stream has begun. `false` when the
-/// receiver is gone: the client stopped reading, and a generation nobody is
-/// waiting on does not owe the connection any more frames.
-fn send(
-    tx: &mpsc::UnboundedSender<Result<Event, AppError>>,
-    event: Result<Event, AppError>,
-    streaming: &mut bool,
-) -> bool {
-    *streaming = true;
-    tx.send(event).is_ok()
-}
-
 /// The SSE comment that says the request was admitted. A comment carries no
 /// event and no data - every SSE client ignores it - so the wire event shape
 /// is unchanged; its whole job is to be the first item out, which is what
@@ -504,20 +263,12 @@ fn accepted_event() -> Event {
     Event::default().comment("accepted")
 }
 
-/// Whether this step is the last one. Its partial decode is the finished
-/// image byte for byte, so a partial frame for it would make every client
-/// decode the same picture twice for no new information; the completed
-/// frame carries it once.
-fn is_final_step(event: &ImageStepEvent) -> bool {
-    event.step.saturating_add(1) >= event.total_steps
-}
-
 /// One partial-image frame.
 ///
 /// Partials are always PNG previews regardless of the request's
 /// `output_format`: they are progress, not the product, and the completed
 /// frame is the one that honors the format.
-fn partial_frame(bytes: Vec<u8>, index: u32) -> Frame {
+fn partial_frame(bytes: &[u8], index: u32) -> Frame {
     let body = ImageGenPartialImageEvent {
         r#type: "image_generation.partial_image",
         partial_image_index: index,
@@ -532,12 +283,12 @@ fn partial_frame(bytes: Vec<u8>, index: u32) -> Frame {
 /// The completed-image frame for one finished image. Its `usage` is the
 /// request's running total, so the last frame of a multi-image stream carries
 /// the whole request's accounting.
-fn completed_frame(created: u64, image: &GeneratedImage, usage: ImageGenerationUsage) -> Frame {
+fn completed_frame(created: u64, image: &Image, usage: ImageGenerationUsage) -> Frame {
     let body = ImageGenCompletedEvent {
         r#type: "image_generation.completed",
         created,
         b64_json: BASE64_STANDARD.encode(&image.bytes),
-        media_type: Some(image.media_type.to_owned()),
+        media_type: Some(image.media_type.clone()),
         usage: Some(usage),
     };
     Frame::named(
@@ -573,3 +324,71 @@ fn error_frame(error: &AppError) -> Frame {
 #[derive(Debug, thiserror::Error)]
 #[error("the image stream task ended before its first frame")]
 struct StreamGone;
+
+#[cfg(test)]
+mod tests {
+    use shiso_ir::image::{Image, Images, Usage};
+
+    use super::{buffered, completed_frame, partial_frame, usage_wire};
+
+    fn png(bytes: &[u8]) -> Image {
+        Image {
+            bytes: bytes.to_vec(),
+            media_type: "image/png".to_owned(),
+        }
+    }
+
+    /// The IR a core returns is spelled as the body this route has always
+    /// sent.
+    #[tokio::test]
+    async fn images_are_spelled_as_the_buffered_body() {
+        let response = buffered(Images {
+            created: 5,
+            images: vec![png(&[1, 2, 3]), png(&[4])],
+            usage: Usage {
+                prompt_tokens: 2,
+                completion_tokens: u32::MAX,
+            },
+        });
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("reads");
+        assert_eq!(
+            std::str::from_utf8(&bytes).expect("utf8"),
+            concat!(
+                r#"{"created":5,"data":[{"b64_json":"AQID","media_type":"image/png"},"#,
+                r#"{"b64_json":"BA==","media_type":"image/png"}],"#,
+                r#""usage":{"prompt_tokens":2,"completion_tokens":4294967295,"total_tokens":4294967295}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn steps_are_spelled_as_the_named_frames() {
+        let partial = partial_frame(&[1, 2, 3], 4);
+        assert_eq!(
+            partial.name.as_deref(),
+            Some("image_generation.partial_image")
+        );
+        assert_eq!(
+            partial.data,
+            r#"{"type":"image_generation.partial_image","partial_image_index":4,"b64_json":"AQID"}"#
+        );
+        let usage = Usage {
+            prompt_tokens: 1,
+            completion_tokens: 10,
+        };
+        let completed = completed_frame(7, &png(&[4]), usage_wire(usage));
+        assert_eq!(
+            completed.name.as_deref(),
+            Some("image_generation.completed")
+        );
+        assert_eq!(
+            completed.data,
+            concat!(
+                r#"{"type":"image_generation.completed","created":7,"b64_json":"BA==","#,
+                r#""media_type":"image/png","usage":{"prompt_tokens":1,"completion_tokens":10,"total_tokens":11}}"#
+            )
+        );
+    }
+}

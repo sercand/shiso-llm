@@ -4,7 +4,7 @@
 //! The body is a multipart form (`image` or `image[]`, repeatable) or the
 //! newer JSON shape (`images: [{"image_url": "data:..."}]`); both become the
 //! generation routes' own request plus the references, and the shared
-//! [`crate::openai::images::run`] answers them, so a streamed or buffered edit
+//! `crate::openai::images::run_edit` answers them, so a streamed or buffered edit
 //! is the same response a generation is.
 //!
 //! What an edit refuses, before any queue slot or device work is spent: no
@@ -79,7 +79,7 @@ async fn answer(state: &Arc<AppState>, request: Request) -> Result<Response, App
             "invalid_request",
         ));
     }
-    crate::openai::images::run(state, edit.request, edit.references).await
+    crate::openai::images::run_edit(state, edit.request, edit.references).await
 }
 
 /// Reads every field of the form; the body limit surfaces here as a read

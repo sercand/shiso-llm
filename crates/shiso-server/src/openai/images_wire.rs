@@ -12,16 +12,9 @@
 //! this server answer a working request with a parse error.
 
 use serde::{Deserialize, Serialize};
+use shiso_ir::image::Generate;
 
 use crate::error::AppError;
-
-/// The most images one request may ask for.
-pub const MAX_IMAGES_PER_REQUEST: usize = 10;
-
-/// The most denoising steps one image may ask for. The generator runs one job
-/// at a time, so an unbounded count would let a single request hold the queue
-/// for as long as it liked.
-pub const MAX_STEPS_PER_IMAGE: u32 = 100;
 
 /// Request payload matching `OpenRouter`'s `/images` and `OpenAI`'s
 /// `/v1/images/generations`.
@@ -80,16 +73,16 @@ pub struct ImageGenerationRequest {
 }
 
 impl ImageGenerationRequest {
-    /// The refusals this format can make on the body alone: a response format
-    /// this server cannot honor, an image count outside `1..=10`, a step
-    /// count outside `1..=100`, a compression level outside `1..=100`. Zero is refused rather than
-    /// clamped: a quality of zero has no encoding to mean it, and silently
-    /// encoding at quality 1 would answer a request nobody made.
+    /// The refusal this format can make on the body alone: a response format
+    /// this server cannot honor. The ranges of `n`, `steps` and
+    /// `output_compression` are the IR's own floor
+    /// ([`shiso_runtime::image::validate`]), which the core applies first
+    /// thing.
     ///
-    /// The size grammar and the output format are checked by the handler,
-    /// which is where the server's defaults and the generator's bounds are
-    /// known; a blank prompt is refused by the job's own validation, which is
-    /// the one prompt rule this server enforces.
+    /// The size grammar and the output format are checked by the core, which
+    /// is where the generator's bounds are known; a blank prompt is refused by
+    /// the job's own validation, which is the one prompt rule this server
+    /// enforces.
     ///
     /// # Errors
     ///
@@ -106,34 +99,24 @@ impl ImageGenerationRequest {
                 "unsupported_parameter",
             ));
         }
-        if let Some(n) = self.n
-            && (n == 0 || n > MAX_IMAGES_PER_REQUEST)
-        {
-            return Err(AppError::bad_request(
-                format!("n must be between 1 and {MAX_IMAGES_PER_REQUEST}"),
-                Some("n"),
-                "invalid_request",
-            ));
-        }
-        if let Some(steps) = self.steps
-            && (steps == 0 || steps > MAX_STEPS_PER_IMAGE)
-        {
-            return Err(AppError::bad_request(
-                format!("steps must be between 1 and {MAX_STEPS_PER_IMAGE}"),
-                Some("steps"),
-                "invalid_request",
-            ));
-        }
-        if let Some(compression) = self.output_compression
-            && !(1..=100).contains(&compression)
-        {
-            return Err(AppError::bad_request(
-                "output_compression must be between 1 and 100",
-                Some("output_compression"),
-                "invalid_request",
-            ));
-        }
         Ok(())
+    }
+
+    /// The IR request: the fields the core reads. `stream` picks which core
+    /// answers it, and `model`, `quality`, `user` and `session_id` are
+    /// accepted and unused, for the reasons spelled out on the fields.
+    #[must_use]
+    pub fn to_ir(&self) -> Generate {
+        Generate {
+            prompt: self.prompt.clone(),
+            n: self.n,
+            size: self.size.clone(),
+            aspect_ratio: self.aspect_ratio.clone(),
+            steps: self.steps,
+            seed: self.seed,
+            output_format: self.output_format.clone(),
+            output_compression: self.output_compression,
+        }
     }
 }
 
@@ -196,4 +179,69 @@ pub struct ImageGenCompletedEvent {
     /// Optional token accounting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<ImageGenerationUsage>,
+}
+
+#[cfg(test)]
+mod tests {
+    use shiso_ir::image::Generate;
+
+    use super::ImageGenerationRequest;
+
+    /// Every field a route reads reaches the IR as sent; the ones it ignores
+    /// do not.
+    #[test]
+    fn a_body_becomes_the_ir_request_it_names() {
+        let body = serde_json::json!({
+            "prompt": "a cat",
+            "model": "anything",
+            "n": 2,
+            "size": "1024x768",
+            "aspect_ratio": "16:9",
+            "quality": "hd",
+            "steps": 12,
+            "seed": 9,
+            "output_format": "jpeg",
+            "response_format": "b64_json",
+            "output_compression": 80,
+            "stream": true,
+            "user": "u",
+            "session_id": "s",
+            "an_extra_nobody_knows": 1,
+        });
+        let parsed: ImageGenerationRequest =
+            serde_json::from_value(body).expect("unknown fields are accepted");
+        parsed.validate().expect("b64_json is served");
+        assert_eq!(
+            parsed.to_ir(),
+            Generate {
+                prompt: "a cat".to_owned(),
+                n: Some(2),
+                size: Some("1024x768".to_owned()),
+                aspect_ratio: Some("16:9".to_owned()),
+                steps: Some(12),
+                seed: Some(9),
+                output_format: Some("jpeg".to_owned()),
+                output_compression: Some(80),
+            }
+        );
+        assert_eq!(parsed.stream, Some(true));
+    }
+
+    #[test]
+    fn a_body_that_names_only_a_prompt_names_nothing_else() {
+        let parsed: ImageGenerationRequest =
+            serde_json::from_str(r#"{"prompt":"x"}"#).expect("parses");
+        let ir = parsed.to_ir();
+        assert_eq!(ir.n, None);
+        assert_eq!(ir.size, None);
+        assert_eq!(ir.seed, None);
+    }
+
+    #[test]
+    fn a_url_response_format_is_refused_by_the_wire() {
+        let parsed: ImageGenerationRequest =
+            serde_json::from_str(r#"{"prompt":"x","response_format":"url"}"#).expect("parses");
+        let error = parsed.validate().expect_err("refused");
+        assert!(error.to_string().contains("only 'b64_json'"), "{error}");
+    }
 }

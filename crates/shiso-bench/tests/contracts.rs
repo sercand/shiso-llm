@@ -687,6 +687,142 @@ fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
 }
 const _: fn(&ImageGenError) -> (u8, u32, u32) = image_gen_error_variants;
 
+/// The typed image cores as embedders and the server call them: the IR they
+/// take and return, the four entry points (blocking and sink-streaming, for a
+/// generation and for an edit), and the floor they check first. A drift in any
+/// of them stops here.
+mod image_core {
+    use shiso_ir::image::{Edit, Generate, Image, Images, Step, Usage};
+    use shiso_runtime::error::AppError;
+    use shiso_runtime::image::{
+        MAX_IMAGES_PER_REQUEST, MAX_STEPS_PER_IMAGE, edit, edit_stream, generate, generate_stream,
+        validate, validate_edit,
+    };
+    use shiso_runtime::state::AppState;
+
+    /// The entry points are async and the streaming ones take a sink that
+    /// answers whether anyone is still reading; the futures are named so the
+    /// compiler checks both.
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signature"
+    )]
+    fn generate_future(
+        state: &AppState,
+        request: Generate,
+    ) -> impl Future<Output = Result<Images, AppError>> + '_ {
+        generate(state, request)
+    }
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signature"
+    )]
+    fn generate_stream_future(
+        state: &AppState,
+        request: Generate,
+    ) -> impl Future<Output = Result<(), AppError>> + '_ {
+        generate_stream(state, request, |_: Step| true)
+    }
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signature"
+    )]
+    fn edit_future(
+        state: &AppState,
+        request: Edit,
+    ) -> impl Future<Output = Result<Images, AppError>> + '_ {
+        edit(state, request)
+    }
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signature"
+    )]
+    fn edit_stream_future(
+        state: &AppState,
+        request: Edit,
+    ) -> impl Future<Output = Result<(), AppError>> + '_ {
+        edit_stream(state, request, |_: Step| true)
+    }
+    const _: fn(&Generate) -> Result<(), AppError> = validate;
+    const _: fn(&Edit) -> Result<(), AppError> = validate_edit;
+    const _: [usize; 1] = [MAX_IMAGES_PER_REQUEST];
+    const _: [u32; 1] = [MAX_STEPS_PER_IMAGE];
+
+    type GenerateFields = (
+        String,
+        Option<usize>,
+        Option<String>,
+        Option<String>,
+        Option<u32>,
+        Option<u64>,
+        Option<String>,
+        Option<u32>,
+    );
+    fn generate_fields(request: Generate) -> GenerateFields {
+        (
+            request.prompt,
+            request.n,
+            request.size,
+            request.aspect_ratio,
+            request.steps,
+            request.seed,
+            request.output_format,
+            request.output_compression,
+        )
+    }
+    const _: fn(Generate) -> GenerateFields = generate_fields;
+
+    type EditFields = (Generate, Vec<Vec<u8>>);
+    fn edit_fields(request: Edit) -> EditFields {
+        (request.generate, request.references)
+    }
+    const _: fn(Edit) -> EditFields = edit_fields;
+
+    type ImagesFields = (u64, Vec<Image>, Usage);
+    fn images_fields(images: Images) -> ImagesFields {
+        (images.created, images.images, images.usage)
+    }
+    const _: fn(Images) -> ImagesFields = images_fields;
+
+    fn image_fields(image: Image) -> (Vec<u8>, String) {
+        (image.bytes, image.media_type)
+    }
+    const _: fn(Image) -> (Vec<u8>, String) = image_fields;
+
+    fn usage_fields(usage: Usage) -> (u32, u32, u32) {
+        (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens(),
+        )
+    }
+    const _: fn(Usage) -> (u32, u32, u32) = usage_fields;
+
+    /// The stream's three events and what each carries.
+    type StepFields = Option<(u32, Vec<u8>, u64, Image, Usage)>;
+    fn step_fields(step: Step) -> StepFields {
+        match step {
+            Step::Admitted => None,
+            Step::Partial { index, bytes } => Some((
+                index,
+                bytes,
+                0,
+                Image {
+                    bytes: Vec::new(),
+                    media_type: String::new(),
+                },
+                Usage::default(),
+            )),
+            Step::Completed {
+                created,
+                image,
+                usage,
+            } => Some((0, Vec::new(), created, image, usage)),
+        }
+    }
+    const _: fn(Step) -> StepFields = step_fields;
+}
+
 // ---------------------------------------------------------------------------
 // Embeddings.
 //
