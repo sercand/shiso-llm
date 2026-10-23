@@ -30,6 +30,11 @@ fn q8_0_group(launch: &Launch<'_>, gid: [u32; 3], out: &mut Writes) -> CoreResul
     if tok >= count(args.n_tokens, "get_rows n_tokens")? {
         return Ok(());
     }
+    // Groups past the row's last block own nothing and never read the id.
+    let i0 = block * QK8_0;
+    if i0 >= n_embd {
+        return Ok(());
+    }
     let ids = launch.raw(1)?;
     let at = (tok as u64).saturating_mul(args.token_stride);
     let id_bytes = usize::try_from(at)
@@ -42,10 +47,6 @@ fn q8_0_group(launch: &Launch<'_>, gid: [u32; 3], out: &mut Writes) -> CoreResul
     let Some(token) = usize::try_from(token).ok().filter(|_| token < args.n_vocab) else {
         return Ok(());
     };
-    let i0 = block * QK8_0;
-    if i0 >= n_embd {
-        return Ok(());
-    }
     let table = launch.raw(0)?;
     let start = (token as u64)
         .saturating_mul(args.src_row_bytes)

@@ -107,6 +107,28 @@ fn a_view_past_the_allocation_is_out_of_bounds() {
 }
 
 #[test]
+fn an_allocation_reports_and_enforces_the_requested_size() {
+    let backend = backend();
+    let buffer = alloc(&backend, 5).expect("alloc");
+    assert_eq!(buffer.len(), 5);
+    // The storage is chunk-padded; a view over the padding is still refused.
+    let forged = DeviceView::from_raw(shiso_core::RawBuffer::new(buffer.view().id(), 16), 0, 16);
+    let err = backend
+        .copy_d2h(forged, &mut [0u8; 16])
+        .expect_err("past the requested size");
+    assert!(matches!(err, CoreError::OutOfBounds { .. }), "{err:?}");
+    let err = backend
+        .copy_h2d(forged, &[0u8; 16])
+        .expect_err("past the requested size");
+    assert!(matches!(err, CoreError::OutOfBounds { .. }), "{err:?}");
+    let other = alloc(&backend, 16).expect("alloc");
+    let err = backend
+        .copy_d2d(other.view(), forged)
+        .expect_err("past the requested size");
+    assert!(matches!(err, CoreError::OutOfBounds { .. }), "{err:?}");
+}
+
+#[test]
 fn an_unknown_kernel_is_unsupported() {
     let backend = backend();
     let args = LaunchArgs::new(Extent3::linear(1), Extent3::linear(1), &[]);
