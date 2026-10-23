@@ -4,6 +4,8 @@
 //! treat its arguments. Later kernels add their rows here; a launch that names
 //! an entry without a row is `Unsupported`, never a silent no-op.
 
+mod args;
+
 use crate::dispatch::Table;
 
 /// Every kernel the CPU device runs. Empty until the first kernels land.
