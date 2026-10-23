@@ -1,9 +1,9 @@
-//! `kernel_mul_mv_ext_q8_0_f32_r1_2`: the small-batch matvec, two tokens per
-//! group.
+//! `kernel_mul_mv_ext_q8_0_f32_r1_{2,3,4,5}`: the small-batch matvec, `R`
+//! tokens per group (Metal's `r1ptg` template argument).
 //!
 //! Group `(x, y, z)` owns rows `x * R .. (x + 1) * R` with `R = (32 / nxpsg) *
 //! nsg` (each of the `nsg` simdgroups covers `32 / nxpsg` rows) and tokens
-//! `2y, 2y + 1` of plane `z`. Lanes within a row split `k`; the shuffle
+//! `R*y .. R*y + R` of plane `z`. Lanes within a row split `k`; the shuffle
 //! reduction is one `q8_row_dot` here. `nsg` comes from `block.y` and `nxpsg`
 //! from constant 601 (16 when absent). Rows past `ne01` and tokens past `ne11`
 //! are not written.
@@ -16,19 +16,31 @@ use crate::q8::q8_row_dot;
 
 use super::{bytes_at, count, floats_at, q8_row_bytes, ratio};
 
-/// Tokens per group (`r1ptg`).
-const TOKENS: usize = 2;
+/// The kernel at `TOKENS` tokens per group. Weights, activations, destination.
+const fn spec<const TOKENS: usize>() -> KernelSpec {
+    KernelSpec {
+        group: group::<TOKENS>,
+        roles: &[Role::In, Role::In, Role::Out],
+        consts: ConstRule::MulMvExt,
+        block: |b: Extent3| b.x == 32 && b.y >= 1 && b.z == 1,
+        disjoint: GroupsDisjoint::Yes,
+    }
+}
 
-/// Weights, activations, destination.
-pub(in crate::kernels) const R1_2: KernelSpec = KernelSpec {
-    group,
-    roles: &[Role::In, Role::In, Role::Out],
-    consts: ConstRule::MulMvExt,
-    block: |b: Extent3| b.x == 32 && b.y >= 1 && b.z == 1,
-    disjoint: GroupsDisjoint::Yes,
-};
+/// Two tokens per group.
+pub(in crate::kernels) const R1_2: KernelSpec = spec::<2>();
+/// Three tokens per group.
+pub(in crate::kernels) const R1_3: KernelSpec = spec::<3>();
+/// Four tokens per group.
+pub(in crate::kernels) const R1_4: KernelSpec = spec::<4>();
+/// Five tokens per group.
+pub(in crate::kernels) const R1_5: KernelSpec = spec::<5>();
 
-fn group(launch: &Launch<'_>, gid: [u32; 3], out: &mut Writes) -> CoreResult<()> {
+fn group<const TOKENS: usize>(
+    launch: &Launch<'_>,
+    gid: [u32; 3],
+    out: &mut Writes,
+) -> CoreResult<()> {
     let args: MulMvExtArgs = launch.bytes()?;
     let nxpsg = launch
         .consts

@@ -1,4 +1,4 @@
-//! Metal's run of the shared `q8_0` gather and two-row extended matvec cases.
+//! Metal's run of the shared `q8_0` gather and extended matvec cases.
 //!
 //! The cases live in `shiso-kerneltest`, so this file is the backend's half
 //! only: open a device, or say why the cases did not run.
@@ -41,14 +41,12 @@ fn every_q8_entry_resolves() {
     metal
         .prepare(KernelRef::new("generic", rows_q8::ENTRIES[0]))
         .expect("the q8_0 gather resolves");
-    for (in_dim, nxpsg, consts) in EXT_SHAPES {
-        metal
-            .prepare(KernelRef::specialized(
-                "generic",
-                rows_q8::ENTRIES[1],
-                consts,
-            ))
-            .unwrap_or_else(|err| panic!("the ext matvec resolves at {in_dim}/nx{nxpsg}: {err}"));
+    for entry in &rows_q8::ENTRIES[1..] {
+        for (in_dim, nxpsg, consts) in EXT_SHAPES {
+            metal
+                .prepare(KernelRef::specialized("generic", entry, consts))
+                .unwrap_or_else(|err| panic!("{entry} resolves at {in_dim}/nx{nxpsg}: {err}"));
+        }
     }
 }
 
@@ -68,5 +66,5 @@ macro_rules! device_cases {
 
 device_cases!(
     the_q8_0_gather_dequantizes_the_rows_the_ids_name,
-    the_two_row_q8_0_ext_matvec_matches_the_oracle_dot,
+    the_q8_0_ext_matvec_matches_the_oracle_dot_at_every_row_count,
 );

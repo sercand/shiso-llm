@@ -3,9 +3,13 @@
 //! Group `(x, y, z)` owns a 32-token by 64-row tile: tokens `32x ..`, rows
 //! `64y ..`, plane `z`, clipped to `ne1` and `ne0` on both edges. The Metal
 //! tile stages both operands as `half`, so each activation is narrowed to f16
-//! before the shared dot; the weights are left as stored (their block scale is
-//! already f16). The bounds-check function constants are accepted and ignored:
-//! a CPU group clips its tile unconditionally.
+//! before the shared dot. The weights are deliberately NOT narrowed: Metal's
+//! dequantizer rounds `q * d` to half, but the CPU keeps it in f32. That is
+//! at most one half-ulp (2^-11 relative) per weight, well inside the tolerance
+//! the shared cases grade with, and the exact value is the better one for the
+//! single Q8 dot every CPU kernel shares.
+//!
+//! The bounds-check function constants are accepted and ignored: a CPU group clips its tile unconditionally.
 
 use half::f16;
 use shiso_core::{CoreError, CoreResult, Extent3};

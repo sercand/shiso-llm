@@ -1,4 +1,4 @@
-//! The `q8_0` vocabulary gather and the two-row extended matvec.
+//! The `q8_0` vocabulary gather and the extended matvec at every row count.
 //!
 //! Unlike the rest of this module, both cases name their Metal function
 //! constants themselves (`KernelRef::specialized`) instead of leaving them to
@@ -22,9 +22,28 @@ use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::{TOL_F32, dot, gather, signal};
 
 /// Every entry point this file's cases launch.
-pub const ENTRIES: [&str; 2] = [
+pub const ENTRIES: [&str; 5] = [
     "kernel_get_rows_q8_0_f32",
     "kernel_mul_mv_ext_q8_0_f32_r1_2",
+    "kernel_mul_mv_ext_q8_0_f32_r1_3",
+    "kernel_mul_mv_ext_q8_0_f32_r1_4",
+    "kernel_mul_mv_ext_q8_0_f32_r1_5",
+];
+
+/// The `(tokens in flight, tokens per group, entry)` triples the matvec walks.
+///
+/// Mirrors the engine's `ext_r1ptg` (`crates/shiso-engine/src/launch.rs`): 3 and
+/// 6 go three at a time, 5 goes five, 4, 7 and 8 go four, and 2 goes two. Six is
+/// left out because it runs the same entry as three with a full second group;
+/// seven and eight leave a short last group on `r1_4`, three on `r1_3` and five
+/// on `r1_5` leave none, so both edges are covered.
+pub const EXT_ROW_COUNTS: [(usize, u32, &str); 6] = [
+    (2, 2, ENTRIES[1]),
+    (3, 3, ENTRIES[2]),
+    (4, 4, ENTRIES[3]),
+    (5, 5, ENTRIES[4]),
+    (7, 4, ENTRIES[3]),
+    (8, 4, ENTRIES[3]),
 ];
 
 /// Function-constant index of the simdgroup count, mirroring the engine's
@@ -161,17 +180,22 @@ pub fn the_q8_0_gather_dequantizes_the_rows_the_ids_name(gpu: &Gpu) {
     );
 }
 
-/// Tokens in the matvec fixture, which is the entry's row blocking.
-const N_TOK: usize = 2;
 /// Output rows: the lane splits 4, 8 and 16 give 16, 8 and 4 rows a block, and
 /// 70 leaves a short last block at each, so the guarded store runs at each.
 const OUT: usize = 70;
 /// NaN slots after the output, to catch a store past `ne0 * ne1`.
 const CANARY: usize = 4;
 
-/// The two-row `q8_0` extended matvec agrees with the oracle dot product at
-/// every lane split.
-pub fn the_two_row_q8_0_ext_matvec_matches_the_oracle_dot(gpu: &Gpu) {
+/// The `q8_0` extended matvec agrees with the oracle dot product at every lane
+/// split and at every token count the engine routes to it, each on the entry
+/// `ext_r1ptg` picks for that count.
+pub fn the_q8_0_ext_matvec_matches_the_oracle_dot_at_every_row_count(gpu: &Gpu) {
+    for &(n_tok, r1ptg, entry) in &EXT_ROW_COUNTS {
+        ext_at(gpu, n_tok, r1ptg, entry);
+    }
+}
+
+fn ext_at(gpu: &Gpu, n_tok: usize, r1ptg: u32, entry: &'static str) {
     for (seed, &(in_dim, nxpsg, consts)) in EXT_SHAPES.iter().enumerate() {
         let (blocks, weights) = varied_q8_matrix(OUT, in_dim);
         let d_w = gpu.upload(bytemuck::cast_slice::<BlockQ80, u8>(&blocks));
@@ -181,17 +205,17 @@ pub fn the_two_row_q8_0_ext_matvec_matches_the_oracle_dot(gpu: &Gpu) {
         // the tolerance is spent on the kernel, not on rounding. Raw `signal`
         // values left a 1024-wide row 1.1e-5 off the oracle with 16 lanes, which
         // is reassociation of the sum rather than a wrong read.
-        let x: Vec<f32> = signal(N_TOK * in_dim, 200 + seed as u32)
+        let x: Vec<f32> = signal(n_tok * in_dim, 200 + seed as u32 + 10 * n_tok as u32)
             .iter()
             .map(|v| (v * 16.0).round() / 16.0)
             .collect();
         let d_x = gpu.upload(&f32_bytes(&x));
-        let dst = gpu.upload(&f32_bytes(&vec![f32::NAN; N_TOK * OUT + CANARY]));
+        let dst = gpu.upload(&f32_bytes(&vec![f32::NAN; n_tok * OUT + CANARY]));
 
         let row = ((in_dim / QK8_0) * size_of::<BlockQ80>()) as u64;
         let plane = row * OUT as u64;
         let act_row = (in_dim * 4) as u64;
-        let act_plane = act_row * N_TOK as u64;
+        let act_plane = act_row * n_tok as u64;
         let args = MulMvExtArgs {
             ne00: in_dim as i32,
             ne01: OUT as i32,
@@ -202,7 +226,7 @@ pub fn the_two_row_q8_0_ext_matvec_matches_the_oracle_dot(gpu: &Gpu) {
             nb02: plane,
             nb03: plane,
             ne10: in_dim as i32,
-            ne11: N_TOK as i32,
+            ne11: n_tok as i32,
             ne12: 1,
             pad1: [0; 4],
             nb10: 4,
@@ -210,19 +234,23 @@ pub fn the_two_row_q8_0_ext_matvec_matches_the_oracle_dot(gpu: &Gpu) {
             nb12: act_plane,
             nb13: act_plane,
             ne0: OUT as i32,
-            ne1: N_TOK as i32,
+            ne1: n_tok as i32,
             r2: 1,
             r3: 1,
             pad2: [0; 4],
         };
         // Each simdgroup covers `32 / nxpsg` rows, and a block has `EXT_NSG`
-        // simdgroups; the two tokens are one `r1_2` group, so y is one.
+        // simdgroups; a group takes `r1ptg` tokens, so y tiles the tokens.
         let rows_per_block = (32 / nxpsg as u32) * EXT_NSG;
         run(
             gpu,
-            KernelRef::specialized("generic", ENTRIES[1], consts),
+            KernelRef::specialized("generic", entry, consts),
             &LaunchArgs {
-                grid: Extent3::new((OUT as u32).div_ceil(rows_per_block), 1, 1),
+                grid: Extent3::new(
+                    (OUT as u32).div_ceil(rows_per_block),
+                    (n_tok as u32).div_ceil(r1ptg),
+                    1,
+                ),
                 block: Extent3::new(WARP, EXT_NSG, 1),
                 smem_bytes: 0,
                 args: &[
@@ -236,7 +264,7 @@ pub fn the_two_row_q8_0_ext_matvec_matches_the_oracle_dot(gpu: &Gpu) {
         drain(gpu);
 
         let got = gpu.read_f32(&dst);
-        for t in 0..N_TOK {
+        for t in 0..n_tok {
             for r in 0..OUT {
                 let want = dot(
                     &weights[r * in_dim..(r + 1) * in_dim],
@@ -246,13 +274,13 @@ pub fn the_two_row_q8_0_ext_matvec_matches_the_oracle_dot(gpu: &Gpu) {
                     got[t * OUT + r],
                     want,
                     TOL_F32,
-                    "q8_0 ext matvec in {in_dim} nxpsg {nxpsg} token {t} row {r}"
+                    "q8_0 ext matvec {entry} in {in_dim} nxpsg {nxpsg} token {t} row {r}"
                 );
             }
         }
         assert!(
-            got[N_TOK * OUT..].iter().all(|v| v.is_nan()),
-            "q8_0 ext matvec in {in_dim} nxpsg {nxpsg} wrote past its output",
+            got[n_tok * OUT..].iter().all(|v| v.is_nan()),
+            "q8_0 ext matvec {entry} in {in_dim} nxpsg {nxpsg} wrote past its output",
         );
     }
 }

@@ -37,7 +37,7 @@ cpu_cases!(
     generic::glu::the_gated_silu_is_the_sigmoid_weighted_gate_times_the_up_row,
     generic::glu::the_clamp_is_one_sided_on_the_gate_and_two_sided_on_the_up_row,
     generic::rows_q8::the_q8_0_gather_dequantizes_the_rows_the_ids_name,
-    generic::rows_q8::the_two_row_q8_0_ext_matvec_matches_the_oracle_dot,
+    generic::rows_q8::the_q8_0_ext_matvec_matches_the_oracle_dot_at_every_row_count,
     generic::product::the_q8_0_decode_matvec_matches_the_oracle_dot,
     generic::product::the_q8_0_prefill_gemm_matches_a_triple_loop,
 );
