@@ -6,6 +6,7 @@
 
 mod args;
 mod generic;
+mod qwen35;
 
 use crate::dispatch::Table;
 
@@ -31,4 +32,15 @@ pub(crate) static TABLE: &Table = &[
         "kernel_swiglu_flat_f32",
         generic::glu::SWIGLU_FLAT,
     ),
+    (
+        "generic",
+        "kernel_mul_mv_q8_0_f32",
+        generic::mul_mv_q8_0::Q8_0,
+    ),
+    (
+        "generic",
+        "kernel_mul_mv_ext_q8_0_f32_r1_2",
+        generic::mul_mv_ext::R1_2,
+    ),
+    ("qwen35", "kernel_mul_mm_q8_0_f32", qwen35::gemm::Q8_0),
 ];
