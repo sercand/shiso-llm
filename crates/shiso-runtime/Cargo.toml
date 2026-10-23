@@ -17,6 +17,9 @@ shiso-models = { workspace = true }
 shiso-vision = { workspace = true }
 shiso-audio = { workspace = true }
 shiso-parsers = { workspace = true }
+# Model download: the registry client, downloader and blob store. HTTP client only.
+shiso-hub = { workspace = true }
+semver = { workspace = true }
 # Declared optional so the `metal` feature below has a dep: target to enable.
 shiso-metal = { workspace = true, optional = true }
 shiso-cuda = { workspace = true, optional = true }
@@ -42,6 +45,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 image = { workspace = true }
 tempfile = { workspace = true }
+wiremock = { workspace = true }
+hex = { workspace = true }
+url = { workspace = true }
 
 [features]
 # Derives `clap::Args` / `ValueEnum` on `ServeOptions` and its choice enums. Only
