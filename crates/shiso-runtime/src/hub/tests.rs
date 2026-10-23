@@ -47,6 +47,15 @@ impl Fixture {
 
     /// A fixture whose routes ending in `slow` answer only after `delay`.
     fn slow(extra_models: &[&str], slow: &str, delay: Duration) -> Self {
+        Self::build(extra_models, slow, delay, &["metal", "cuda"])
+    }
+
+    /// A fixture whose one variant names exactly `backends`.
+    fn with_backends(backends: &[&str]) -> Self {
+        Self::build(&[], "", Duration::ZERO, backends)
+    }
+
+    fn build(extra_models: &[&str], slow: &str, delay: Duration, backends: &[&str]) -> Self {
         let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| panic!("runtime: {e}"));
         let server = rt.block_on(MockServer::start());
         // Large enough that the progress interval (512 KiB) fires.
@@ -93,7 +102,7 @@ impl Fixture {
             "variants": [{
                 "key": "q8_0",
                 "server_defaults": {"ctx": 32768},
-                "backends": ["metal", "cuda"],
+                "backends": backends,
                 "quant": "Q8_0",
                 "requirements": {"min_ram_bytes": 1, "disk_bytes": 3_000_023},
                 "components": {"base": component("base"), "config": component("config")},
@@ -469,10 +478,46 @@ fn no_backend_is_no_device_before_any_request() {
 /// variant and every variant is a candidate there.
 #[test]
 fn a_cpu_device_pulls_a_metal_only_variant() {
-    let fx = Fixture::new(&[]);
+    let fx = Fixture::with_backends(&["metal"]);
     let host = HostProfile::probe(Vec::new(), None, None).on(ServingDevice::Cpu);
-    let installed = pull_on(&host, "mini", &fx.config(), &mut |_, _| true);
-    assert!(installed.is_ok(), "{:?}", installed.err());
+    let installed =
+        pull_on(&host, "mini", &fx.config(), &mut |_, _| true).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        installed.dir.file_name().and_then(|n| n.to_str()),
+        Some("q8_0")
+    );
+    // The same index on a GPU host with no backend is refused.
+    let gpu = HostProfile::probe(Vec::new(), None, None);
+    let result = pull_observed_on(
+        &gpu,
+        "mini",
+        &fx.config(),
+        PullPolicy::CheckRegistry,
+        &mut |_| true,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+#[cfg(feature = "cpu")]
+fn the_cpu_choice_profiles_a_cpu_host() {
+    let host = probe_host_profile(DeviceChoice::Cpu).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(host.device, ServingDevice::Cpu);
+}
+
+/// A named GPU that is absent is refused with the GPU's own reason, not the
+/// "no compute backend" of a build that has none.
+#[test]
+#[cfg(feature = "metal")]
+fn a_named_gpu_that_is_absent_is_no_device_with_its_reason() {
+    let gpu = GpuState::Absent("no Metal device found".to_owned());
+    let host = HostProfile::probe(Vec::new(), None, None);
+    let error = with_device(host, gpu, DeviceChoice::Metal, true)
+        .map_err(|error| PullError::NoDevice(error.to_string()))
+        .expect_err("a named GPU that is absent");
+    let text = error.to_string();
+    assert!(text.contains("no Metal device found"), "{text}");
+    assert!(!text.contains("no compute backend"), "{text}");
 }
 
 #[test]

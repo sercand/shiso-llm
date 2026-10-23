@@ -77,7 +77,7 @@ pub struct MetalInfo {
 /// Host profile describing available backends and hardware memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostProfile {
-    /// Hardware backends compiled into this binary.
+    /// Backends whose device this host has.
     pub backends: Vec<Backend>,
     /// Total physical RAM in bytes.
     pub ram_bytes: u64,
