@@ -32,12 +32,23 @@ impl Markers {
         Self(spellings)
     }
 
-    /// Whether any of `literal` holds a marker's spelling, so that encoding
-    /// the text whole would read caller text as a marker.
+    /// Whether `text` spells a marker anywhere that touches `literal`, so that
+    /// encoding the text whole would read caller text as a marker. A spelling
+    /// that starts in caller text and ends in the layout's (or the reverse)
+    /// counts: it is found in the whole text, not piece by piece.
     fn spelled_in(&self, text: &str, literal: &[Range<usize>]) -> bool {
-        literal.iter().any(|range| {
-            text.get(range.clone())
-                .is_some_and(|piece| self.0.iter().any(|marker| piece.contains(marker.as_str())))
+        if literal.is_empty() {
+            return false;
+        }
+        // Every start, so two spellings that overlap each other are both seen.
+        text.char_indices().any(|(start, _)| {
+            self.0.iter().any(|marker| {
+                let end = start + marker.len();
+                text[start..].starts_with(marker.as_str())
+                    && literal
+                        .iter()
+                        .any(|range| start < range.end && range.start < end)
+            })
         })
     }
 }

@@ -321,6 +321,29 @@ fn caller_text_cannot_plant_a_marker() {
     assert_eq!(typed.last().map(|id| id.get()), Some(1));
 }
 
+/// A marker spelled half by the caller and half by the layout is planted too:
+/// the caller's `<|en` followed by the layout's `d|>`.
+#[test]
+fn a_marker_split_across_a_literal_boundary_is_planted() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, TOKENIZER).expect("writes");
+    let tokens = PromptTokens::from_file(&path).expect("the vocabulary loads");
+    let text = "a <|end|> b";
+    let marker = |ids: &[shiso_core::TokenId]| ids.iter().any(|id| id.get() == 3);
+    for literal in [2..6, 5..9, 3..8] {
+        let typed = tokens
+            .encode(text, std::slice::from_ref(&literal))
+            .expect("encodes");
+        assert!(!marker(&typed), "{literal:?}: {typed:?}");
+    }
+    // Literal text elsewhere does not turn a layout-written marker into text.
+    let apart = tokens
+        .encode(text, std::slice::from_ref(&(0..1)))
+        .expect("encodes");
+    assert!(marker(&apart), "{apart:?}");
+}
+
 /// A marker that does not open with `<` is still a marker.
 #[test]
 fn a_marker_without_an_angle_bracket_is_not_plantable_either() {
