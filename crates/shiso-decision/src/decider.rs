@@ -1,0 +1,172 @@
+//! [`Decider`]: a decision checkpoint opened in this process.
+
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
+
+use futures::channel::oneshot;
+
+use crate::error::DecideError;
+use crate::load;
+use crate::schema::{Answer, DecisionRequest};
+use crate::worker::{self, Engine, Job, Msg};
+
+/// The context length [`OpenDesc::new`] asks for: a decision prompt is a state
+/// and a few short questions, so the engine does not reserve more.
+pub const DEFAULT_CTX: usize = 2048;
+
+/// What [`Decider::open`] needs to find and load a model.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenDesc<'a> {
+    /// The model directory: `config.json`, `tokenizer.json` and one `.gguf`
+    /// checkpoint, either directly in it or under its `config/` and `base/`
+    /// subdirectories, which is how an installed model is laid out. A
+    /// `mmproj*` file is a vision sidecar, not the checkpoint.
+    pub model_dir: &'a Path,
+    /// The context length: the longest prompt, answer row included, a request
+    /// may lay out.
+    pub ctx: usize,
+}
+
+impl<'a> OpenDesc<'a> {
+    /// A description of `model_dir` at the [`DEFAULT_CTX`].
+    #[must_use]
+    pub const fn new(model_dir: &'a Path) -> Self {
+        Self {
+            model_dir,
+            ctx: DEFAULT_CTX,
+        }
+    }
+}
+
+/// A decision model owned by a worker thread of its own.
+///
+/// The model lives on that thread for good; requests reach it over a channel
+/// and are answered one at a time, in arrival order, so any number of threads
+/// may share one `Decider`. Dropping it stops the worker and joins it: a
+/// request that was queued, or that the worker was running, then fails with
+/// [`DecideError::Engine`] rather than returning an answer nobody can still
+/// be waiting for.
+#[derive(Debug)]
+pub struct Decider {
+    queue: mpsc::Sender<Msg>,
+    /// Set before the stop message is queued, so the worker can tell a job it
+    /// finished while the `Decider` was being dropped.
+    closing: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Decider {
+    /// Opens the model in `desc` on the device this build was compiled for.
+    ///
+    /// Blocks while the weights load.
+    ///
+    /// # Errors
+    ///
+    /// [`DecideError::Load`] for a directory that is not a loadable decision
+    /// model (including a checkpoint with neither a decision readout nor a
+    /// head), [`DecideError::NoDevice`] when this build has no backend feature
+    /// or the device would not open, and [`DecideError::Io`] for a file that
+    /// cannot be read.
+    pub fn open(desc: &OpenDesc<'_>) -> Result<Self, DecideError> {
+        let engine = load::open(desc)?;
+        Self::spawn(Box::new(engine))
+    }
+
+    /// Starts the worker thread over `engine`.
+    pub(crate) fn spawn(engine: Box<dyn Engine>) -> Result<Self, DecideError> {
+        let (queue, rx) = mpsc::channel();
+        let closing = Arc::new(AtomicBool::new(false));
+        let worker = std::thread::Builder::new()
+            .name("shiso-decision".to_owned())
+            .spawn({
+                let closing = Arc::clone(&closing);
+                move || worker::run(engine, &rx, &closing)
+            })
+            .map_err(DecideError::Io)?;
+        Ok(Self {
+            queue,
+            closing,
+            worker: Some(worker),
+        })
+    }
+
+    /// Answers `req`, blocking the calling thread until the worker has.
+    ///
+    /// # Errors
+    ///
+    /// [`DecideError::Request`], [`DecideError::Layout`] or
+    /// [`DecideError::Engine`] as [`crate::score::decide_with_readout`]
+    /// reports them, and [`DecideError::Engine`] when the decider was dropped
+    /// or its worker stopped before answering.
+    pub fn decide_blocking(&self, req: &DecisionRequest) -> Result<Vec<Answer>, DecideError> {
+        futures::executor::block_on(self.decide(req))
+    }
+
+    /// Answers `req`. The future holds no thread: the worker wakes it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Decider::decide_blocking`].
+    pub async fn decide(&self, req: &DecisionRequest) -> Result<Vec<Answer>, DecideError> {
+        self.handle().decide(req.clone()).await
+    }
+
+    /// The flag the drop raises, so a test can tell when a drop has begun.
+    #[cfg(test)]
+    pub(crate) fn closing_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.closing)
+    }
+
+    /// A handle that can ask for answers without borrowing the `Decider`, so
+    /// a test can have a call in flight while the `Decider` is dropped.
+    pub(crate) fn handle(&self) -> Handle {
+        Handle {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+impl Drop for Decider {
+    fn drop(&mut self) {
+        self.closing.store(true, Ordering::SeqCst);
+        // Behind whatever is already queued: the worker fails those and then
+        // leaves its loop.
+        let _ = self.queue.send(Msg::Stop);
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::warn!("the decision worker panicked");
+        }
+    }
+}
+
+/// A way to queue requests that outlives a borrow of the [`Decider`].
+#[derive(Debug, Clone)]
+pub(crate) struct Handle {
+    queue: mpsc::Sender<Msg>,
+}
+
+impl Handle {
+    /// Queues `req` and waits for its answer.
+    pub(crate) async fn decide(&self, req: DecisionRequest) -> Result<Vec<Answer>, DecideError> {
+        let (reply, answer) = oneshot::channel();
+        self.queue
+            .send(Msg::Job(Job { req, reply }))
+            .map_err(|_| stopped())?;
+        // A dropped reply means the worker went away with the job unanswered.
+        answer.await.map_err(|_| stopped())?
+    }
+
+    /// As [`Handle::decide`], blocking the calling thread.
+    #[cfg(test)]
+    pub(crate) fn decide_blocking(&self, req: DecisionRequest) -> Result<Vec<Answer>, DecideError> {
+        futures::executor::block_on(self.decide(req))
+    }
+}
+
+/// The error of a request the worker will never answer.
+fn stopped() -> DecideError {
+    DecideError::Engine("the decider was dropped before it answered".to_owned())
+}

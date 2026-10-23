@@ -2716,8 +2716,16 @@ dependencies = [
 name = "shiso-decision"
 version = "0.2.3"
 dependencies = [
+ "futures",
  "shiso-core",
+ "shiso-cuda",
+ "shiso-engine",
+ "shiso-metal",
+ "shiso-models",
+ "tempfile",
  "thiserror",
+ "tokenizers",
+ "tracing",
 ]
 
 [[package]]

@@ -10,7 +10,27 @@ description = "shiso: decision models in-process - the answer arithmetic and the
 [dependencies]
 # Token newtypes and the decision layout traits (`DecisionReadout`, `DecisionLayout`).
 shiso-core = { workspace = true }
+shiso-engine = { workspace = true }
+shiso-models = { workspace = true }
+# The vocabulary a decision prompt is encoded with; the checkpoint ships its own.
+tokenizers = { workspace = true }
+# Runtime-free one-shot channel, so `decide` is async with no executor of ours.
+futures = { workspace = true }
+tracing = { workspace = true }
 thiserror = { workspace = true }
+# Declared optional so the features below have a `dep:` target to enable.
+shiso-metal = { workspace = true, optional = true }
+shiso-cuda = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+# Backend choice lives on the crate, as on shiso-server: empty default because
+# Cargo features are target-independent. Neither feature is `NoDevice` at
+# `Decider::open`; both is a build error.
+metal = ["dep:shiso-metal"]
+cuda = ["dep:shiso-cuda"]
 
 [lints]
 workspace = true
