@@ -696,7 +696,7 @@ mod image_core {
     use shiso_runtime::error::AppError;
     use shiso_runtime::image::{
         MAX_IMAGES_PER_REQUEST, MAX_STEPS_PER_IMAGE, edit, edit_stream, generate, generate_stream,
-        validate, validate_edit,
+        preflight, validate, validate_edit, validate_edit_shape,
     };
     use shiso_runtime::state::AppState;
 
@@ -745,6 +745,10 @@ mod image_core {
     }
     const _: fn(&Generate) -> Result<(), AppError> = validate;
     const _: fn(&Edit) -> Result<(), AppError> = validate_edit;
+    type EditShape = fn(&[Vec<u8>], Option<usize>) -> Result<(), AppError>;
+    const _: EditShape = validate_edit_shape;
+    type Preflight = fn(&AppState, &Generate, &[Vec<u8>]) -> Result<(), AppError>;
+    const _: Preflight = preflight;
     const _: [usize; 1] = [MAX_IMAGES_PER_REQUEST];
     const _: [u32; 1] = [MAX_STEPS_PER_IMAGE];
 

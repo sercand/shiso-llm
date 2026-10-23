@@ -84,8 +84,12 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     // same reason, so the 503 is reserved for a well-formed request this
     // server could have run.
     parsed.validate()?;
-    note_ignored(state, &parsed);
     let ir = parsed.to_ir();
+    // Every refusal the core would make before it queues anything, ahead of
+    // the stream's task and of the debug lines: the ones that say what the
+    // request named fire only for a request that will run.
+    shiso_runtime::image::preflight(state, &ir, &[])?;
+    note_ignored(state, &parsed);
     if parsed.stream.unwrap_or(false) {
         stream(state, Job::Generate(ir)).await
     } else {
@@ -102,11 +106,12 @@ pub(crate) async fn run_edit(
     references: Vec<Vec<u8>>,
 ) -> Result<Response, AppError> {
     parsed.validate()?;
-    note_ignored(state, &parsed);
     let edit = Edit {
         generate: parsed.to_ir(),
         references,
     };
+    shiso_runtime::image::preflight(state, &edit.generate, &edit.references)?;
+    note_ignored(state, &parsed);
     if parsed.stream.unwrap_or(false) {
         stream(state, Job::Edit(edit)).await
     } else {

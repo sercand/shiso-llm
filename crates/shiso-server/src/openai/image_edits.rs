@@ -4,8 +4,8 @@
 //! The body is a multipart form (`image` or `image[]`, repeatable) or the
 //! newer JSON shape (`images: [{"image_url": "data:..."}]`); both become the
 //! generation routes' own request plus the references, and the shared
-//! `crate::openai::images::run_edit` answers them, so a streamed or buffered edit
-//! is the same response a generation is.
+//! `crate::openai::images::run_edit` answers them, so a streamed or buffered
+//! edit is the same response a generation is.
 //!
 //! What an edit refuses, before any queue slot or device work is spent: no
 //! reference at all (that is `/v1/images/generations`), `n` other than 1 (the
@@ -62,23 +62,7 @@ async fn answer(state: &Arc<AppState>, request: Request) -> Result<Response, App
             "invalid_request",
         ));
     };
-    if edit.references.is_empty() {
-        return Err(AppError::bad_request(
-            "an image edit needs at least one reference image in 'image'; \
-             text-to-image is /v1/images/generations",
-            Some("image"),
-            "invalid_request",
-        ));
-    }
-    if let Some(n) = edit.request.n
-        && n != 1
-    {
-        return Err(AppError::bad_request(
-            format!("n must be 1 for an edit, got {n}"),
-            Some("n"),
-            "invalid_request",
-        ));
-    }
+    shiso_runtime::image::validate_edit_shape(&edit.references, edit.request.n)?;
     crate::openai::images::run_edit(state, edit.request, edit.references).await
 }
 

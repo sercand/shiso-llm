@@ -22,7 +22,7 @@ pub mod size;
 
 pub use core::{
     MAX_IMAGES_PER_REQUEST, MAX_STEPS_PER_IMAGE, edit, edit_stream, generate, generate_stream,
-    validate, validate_edit,
+    preflight, validate, validate_edit, validate_edit_shape,
 };
 
 use std::future::Future;

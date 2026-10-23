@@ -103,7 +103,7 @@ fn prompt(text: &str) -> Generate {
     }
 }
 
-fn bad_request_param(error: &AppError) -> String {
+fn bad_request_message(error: &AppError) -> String {
     assert!(matches!(error, AppError::BadRequest { .. }), "{error:?}");
     error.to_string()
 }
@@ -216,7 +216,13 @@ async fn a_refusal_comes_back_before_the_sink_is_ever_called() {
     .await
     .expect_err("refused");
     assert!(!called);
-    bad_request_param(&error);
+    bad_request_message(&error);
+}
+
+#[test]
+fn the_floor_constants_are_the_published_limits() {
+    assert_eq!(shiso_runtime::image::MAX_IMAGES_PER_REQUEST, 10);
+    assert_eq!(shiso_runtime::image::MAX_STEPS_PER_IMAGE, 100);
 }
 
 #[tokio::test]
@@ -255,7 +261,7 @@ async fn the_ir_floor_is_checked_first() {
         let error = shiso_runtime::image::generate(&state, request)
             .await
             .expect_err("refused");
-        assert!(bad_request_param(&error).contains(wanted), "{error}");
+        assert!(bad_request_message(&error).contains(wanted), "{error}");
     }
     assert!(generator.jobs.lock().expect("lock").is_empty());
 }
@@ -270,7 +276,7 @@ async fn a_malformed_request_is_a_400_ahead_of_the_missing_model() {
     let error = shiso_runtime::image::generate(&state, malformed)
         .await
         .expect_err("refused");
-    bad_request_param(&error);
+    bad_request_message(&error);
     let error = shiso_runtime::image::generate(&state, prompt("x"))
         .await
         .expect_err("no model");
@@ -304,7 +310,7 @@ async fn an_edit_is_refused_for_what_its_shape_or_model_cannot_take() {
     let error = shiso_runtime::image::edit(&state, none)
         .await
         .expect_err("none");
-    assert!(bad_request_param(&error).contains("at least one reference"));
+    assert!(bad_request_message(&error).contains("at least one reference"));
     let two = Edit {
         generate: Generate {
             n: Some(2),
@@ -315,7 +321,7 @@ async fn an_edit_is_refused_for_what_its_shape_or_model_cannot_take() {
     let error = shiso_runtime::image::edit(&state, two)
         .await
         .expect_err("n");
-    assert!(bad_request_param(&error).contains("n must be 1 for an edit, got 2"));
+    assert!(bad_request_message(&error).contains("n must be 1 for an edit, got 2"));
     let many = Edit {
         generate: prompt("x"),
         references: vec![vec![1], vec![2], vec![3]],
@@ -323,6 +329,6 @@ async fn an_edit_is_refused_for_what_its_shape_or_model_cannot_take() {
     let error = shiso_runtime::image::edit_stream(&state, many, |_| true)
         .await
         .expect_err("too many");
-    assert!(bad_request_param(&error).contains("accepts at most 2"));
+    assert!(bad_request_message(&error).contains("accepts at most 2"));
     assert!(generator.jobs.lock().expect("lock").is_empty());
 }

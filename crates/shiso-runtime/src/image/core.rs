@@ -93,14 +93,18 @@ pub fn validate(request: &Generate) -> Result<(), AppError> {
     Ok(())
 }
 
-/// [`validate`] for an edit: at least one reference, and one picture out, then
-/// everything a generation is held to.
+/// The refusals an edit makes on its shape alone, before anything else about
+/// the request is judged: no reference at all, and `n` other than 1.
+///
+/// Public so the server's handler can run it where these refusals have always
+/// come, ahead of the wire's own checks; [`validate_edit`] runs the same
+/// function, so the messages have one copy.
 ///
 /// # Errors
 ///
 /// [`AppError::BadRequest`] naming the field at fault.
-pub fn validate_edit(request: &Edit) -> Result<(), AppError> {
-    if request.references.is_empty() {
+pub fn validate_edit_shape(references: &[Vec<u8>], n: Option<usize>) -> Result<(), AppError> {
+    if references.is_empty() {
         return Err(AppError::bad_request(
             "an image edit needs at least one reference image in 'image'; \
              text-to-image is /v1/images/generations",
@@ -108,7 +112,7 @@ pub fn validate_edit(request: &Edit) -> Result<(), AppError> {
             "invalid_request",
         ));
     }
-    if let Some(n) = request.generate.n
+    if let Some(n) = n
         && n != 1
     {
         return Err(AppError::bad_request(
@@ -117,7 +121,44 @@ pub fn validate_edit(request: &Edit) -> Result<(), AppError> {
             "invalid_request",
         ));
     }
+    Ok(())
+}
+
+/// [`validate`] for an edit: [`validate_edit_shape`], then everything a
+/// generation is held to.
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] naming the field at fault.
+pub fn validate_edit(request: &Edit) -> Result<(), AppError> {
+    validate_edit_shape(&request.references, request.generate.n)?;
     validate(&request.generate)
+}
+
+/// Judges a request exactly as [`generate`] and [`edit`] would before they
+/// queue anything, without running it: the IR floor, the size and output
+/// format, the missing-model refusal, and what the loaded model says of the
+/// references (pass an edit's, an empty slice for a generation).
+///
+/// For a caller that has to know a request will be accepted before it commits
+/// to anything, as the server does before it spawns a stream. The checks are
+/// the cores' own, so the answer cannot drift; the cost is that an edit's
+/// references are checked twice, which is a copy of their bytes and, when the
+/// request names no size, one decode of the first.
+///
+/// # Errors
+///
+/// The refusals of [`generate`] that precede the first queue slot.
+pub fn preflight(
+    state: &AppState,
+    request: &Generate,
+    references: &[Vec<u8>],
+) -> Result<(), AppError> {
+    validate(request)?;
+    let plan = Plan::from_request(request, state.image.as_ref())?;
+    let service = state.image()?;
+    plan.with_references(references_of(references.to_vec()), service)?;
+    Ok(())
 }
 
 /// Makes the pictures of a text-to-image request, in turn.
