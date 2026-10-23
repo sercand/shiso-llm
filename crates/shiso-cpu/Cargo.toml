@@ -1,0 +1,21 @@
+[package]
+name = "shiso-cpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "shiso: host-CPU backend - safe-Rust kernels behind the Backend trait."
+
+[lints]
+workspace = true
+
+[dependencies]
+shiso-core = { workspace = true }
+bytemuck = { workspace = true }
+half = { workspace = true }
+sysinfo = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+shiso-kerneltest = { workspace = true }

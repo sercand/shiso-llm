@@ -24,6 +24,7 @@ members = [
     "crates/shiso-router",
     "crates/shiso-hub",
     "crates/shiso-registry",
+    "crates/shiso-cpu",
 ]
 
 [workspace.package]
@@ -204,6 +205,7 @@ shiso-kerneltest = { path = "crates/shiso-kerneltest" }
 shiso-router = { path = "crates/shiso-router" }
 shiso-hub = { path = "crates/shiso-hub" }
 shiso-registry = { path = "crates/shiso-registry" }
+shiso-cpu = { path = "crates/shiso-cpu" }
 [workspace.lints.rust]
 # Safety. Five crates relax this with a crate-level
 # #![allow(unsafe_code, reason = "...")]: shiso-modelfile (mmap), shiso-metal (objc2),
