@@ -37,6 +37,13 @@
 //! | cpu | 4.45 s | 31.8 tok/s |
 //! | metal | 0.050 s | 287 tok/s |
 //!
+//! Boot memory on the same machine and model: `shiso serve --device cpu`
+//! is 419 MB resident when it starts listening (458 MB after two scoring
+//! requests) with the default 2.8 GiB KV pool, because the pool is allocated
+//! zeroed and its pages are only mapped when a sequence touches them.
+//! Writing the pool at boot, as an earlier build did, made that figure about
+//! 3 GB.
+//!
 //! The parallel-launch thresholds were swept and left alone; the numbers sit
 //! beside them in the `dispatch` module.
 //! The Linux `x86_64` and GB10 figures are not recorded here yet.
