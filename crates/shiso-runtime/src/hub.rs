@@ -57,7 +57,7 @@ pub struct InstalledModel {
 pub enum PullError {
     /// This build has no compute backend, or no variant of the model runs on
     /// this host.
-    #[error("no device can run the model: {0}")]
+    #[error("{0}")]
     NoDevice(String),
     /// The registry does not list the model.
     #[error("model '{0}' not found in registry")]
@@ -78,8 +78,17 @@ pub enum PullError {
     #[error("Error: {0}")]
     NotInstalled(String),
     /// The installed files cannot be read as a model.
-    #[error("the installed model is unusable: {0}")]
+    #[error("{0}")]
     Inconsistent(String),
+    /// The variant's lock could not be taken.
+    #[error("locking variant {variant}")]
+    Lock {
+        /// The variant key.
+        variant: String,
+        /// The operating system's refusal.
+        #[source]
+        source: std::io::Error,
+    },
     /// The progress callback asked to stop. Partial files stay, so the next
     /// call resumes them.
     #[error("the download was cancelled")]
@@ -95,6 +104,9 @@ pub enum PullError {
     #[error(transparent)]
     Hub(#[from] HubError),
 }
+
+/// Why a build with no backend cannot pull for an embedder.
+const NO_BACKEND: &str = "no device can run the model: this build has no compute backend; rebuild with the `metal` or `cuda` feature";
 
 /// Whether [`pull_observed`] asks the registry about a model that is already
 /// installed.
@@ -193,7 +205,8 @@ pub fn probe_host_profile() -> HostProfile {
 /// [`PullError::InvalidReference`] for text that is not a model reference, and
 /// [`PullError::Hub`] when the model home cannot be read or locked.
 pub fn resolve(model_ref: &str, config: &HubConfig) -> Result<Option<InstalledModel>, PullError> {
-    resolve_on(&probe_host_profile(), model_ref, config)
+    // The registry's spelling is lowercase; an embedder need not know that.
+    resolve_on(&probe_host_profile(), &model_ref.to_lowercase(), config)
 }
 
 // None is not a refusal: the model is not in the home (or not complete), which the caller answers by pulling.
@@ -204,7 +217,7 @@ fn resolve_on(
 ) -> Result<Option<InstalledModel>, PullError> {
     let parsed = parse_ref(model_ref)?;
     let store = BlobStore::new(config.clone());
-    let Some((key, bytes)) = already_installed(&store, host, &parsed) else {
+    let Some((key, bytes)) = already_installed(&store, host, &parsed)? else {
         return Ok(None);
     };
     let lock = lock_shared(&store, &parsed.model, &key)?;
@@ -220,7 +233,8 @@ fn resolve_on(
 /// A variant that is already installed and complete is returned without
 /// touching the network. Otherwise the registry is asked, the missing files
 /// are downloaded and checked against their pinned digests, and the variant is
-/// installed and hashed once more end to end. A reference may name a variant
+/// installed and hashed once more end to end (the installed files are
+/// hash-verified again, so a large model is read a second time). A reference may name a variant
 /// (`name:variant`); without one this host's best is chosen.
 ///
 /// `progress(done, total)` is called as bytes arrive, with the bytes still
@@ -262,11 +276,17 @@ fn pull_on(
     config: &HubConfig,
     progress: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<InstalledModel, PullError> {
+    // The device comes first: an embedder whose build cannot run a model must
+    // not spend a request, let alone gigabytes of bandwidth, on one.
+    if host.backends.is_empty() {
+        return Err(PullError::NoDevice(NO_BACKEND.to_owned()));
+    }
     let mut tally = Tally::default();
     let mut asked_registry = false;
-    let model = observe_on(
+    // The registry's spelling is lowercase; an embedder need not know that.
+    let model = pull_observed_on(
         host,
-        model_ref,
+        &model_ref.to_lowercase(),
         config,
         PullPolicy::ReuseInstalled,
         &mut |event| match event {
@@ -309,28 +329,28 @@ pub fn pull_observed(
     policy: PullPolicy,
     observer: &mut dyn FnMut(&PullEvent) -> bool,
 ) -> Result<InstalledModel, PullError> {
-    observe_on(&probe_host_profile(), model_ref, config, policy, observer)
+    pull_observed_on(&probe_host_profile(), model_ref, config, policy, observer)
 }
 
-fn observe_on(
+/// [`pull_observed`] for an explicit host profile, as an embedder or a test
+/// that already knows its device supplies it. Unlike [`pull`], this asks the
+/// registry even when the host has no backend; the variant selection then
+/// refuses with the registry's own reasons.
+///
+/// # Errors
+///
+/// As [`pull`].
+pub fn pull_observed_on(
     host: &HostProfile,
     model_ref: &str,
     config: &HubConfig,
     policy: PullPolicy,
     observer: &mut dyn FnMut(&PullEvent) -> bool,
 ) -> Result<InstalledModel, PullError> {
-    // The device comes first: a build that cannot run a model must not spend
-    // gigabytes of bandwidth on one.
-    if host.backends.is_empty() {
-        return Err(PullError::NoDevice(
-            "this build has no compute backend; rebuild with the `metal` or `cuda` feature"
-                .to_owned(),
-        ));
-    }
     let parsed = parse_ref(model_ref)?;
     let store = BlobStore::new(config.clone());
     if policy == PullPolicy::ReuseInstalled
-        && let Some((key, bytes)) = already_installed(&store, host, &parsed)
+        && let Some((key, bytes)) = already_installed(&store, host, &parsed)?
     {
         let lock = lock_shared(&store, &parsed.model, &key)?;
         return Ok(InstalledModel {
@@ -371,8 +391,7 @@ fn observe_on(
 }
 
 fn parse_ref(model_ref: &str) -> Result<ModelRef, PullError> {
-    // The same spelling for the installed lookup and the registry's.
-    ModelRef::parse(&model_ref.to_lowercase()).map_err(|error| PullError::InvalidReference {
+    ModelRef::parse(model_ref).map_err(|error| PullError::InvalidReference {
         reference: model_ref.to_owned(),
         reason: error.to_string(),
     })
@@ -640,14 +659,14 @@ fn discard_bad(
 
 /// The variant `parsed` names here (or the host's pick), as its key and size,
 /// when it is on disk and complete. Reads only the model home.
+// None is not a refusal: the variant is not installed (completely).
 fn already_installed(
     store: &BlobStore,
     host: &HostProfile,
     parsed: &ModelRef,
-) -> Option<(shiso_hub::VariantKey, u64)> {
-    store
-        .list_installed()
-        .ok()?
+) -> Result<Option<(shiso_hub::VariantKey, u64)>, PullError> {
+    Ok(store
+        .list_installed()?
         .into_iter()
         .filter(|summary| summary.model == parsed.model)
         .find_map(|summary| {
@@ -663,7 +682,7 @@ fn already_installed(
                     wanted,
                 );
             complete.then(|| (wanted.key.clone(), variant_bytes(wanted)))
-        })
+        }))
 }
 
 /// Takes `model:key`'s variant lock shared, waiting for an installer to
@@ -674,8 +693,8 @@ fn lock_shared(
     key: &shiso_hub::VariantKey,
 ) -> Result<File, PullError> {
     let file = store.open_variant_lock(model, key)?;
-    file.lock_shared().map_err(|source| HubError::Io {
-        path: store.variant_lock_path(model, key),
+    file.lock_shared().map_err(|source| PullError::Lock {
+        variant: key.to_string(),
         source,
     })?;
     Ok(file)

@@ -3029,6 +3029,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures",
+ "hex",
  "hyper",
  "hyper-util",
  "image",
@@ -3037,6 +3038,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "shiso-audio",
  "shiso-core",
  "shiso-cuda",
@@ -3060,6 +3062,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wiremock",
 ]
 
 [[package]]

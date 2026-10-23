@@ -280,6 +280,83 @@ fn pull_runs_on_a_blocking_thread_and_refuses_in_a_task() {
     assert!(matches!(error, PullError::Request(_)), "{error:?}");
 }
 
+/// `shiso pull MiNi` was a parse error before the move and still is: only
+/// the embedder's `pull` and `resolve` fold case.
+#[test]
+fn the_command_line_path_does_not_fold_case() {
+    let fx = Fixture::new(&[]);
+    let result = pull_observed_on(
+        &metal_host(),
+        "MiNi",
+        &fx.config(),
+        PullPolicy::CheckRegistry,
+        &mut |_| true,
+    );
+    assert!(
+        matches!(result, Err(PullError::InvalidReference { .. })),
+        "{:?}",
+        result.err()
+    );
+    assert_eq!(fx.requests(), 0);
+}
+
+/// With no backend the command line still announces the index fetch and
+/// fails after it, as it always did; only the embedder's `pull` refuses
+/// before a request.
+#[test]
+fn the_command_line_with_no_backend_fetches_the_index_then_fails() {
+    let fx = Fixture::new(&[]);
+    let host = HostProfile::probe(Vec::new(), None, None);
+    let mut events = Vec::new();
+    let result = pull_observed_on(
+        &host,
+        "mini",
+        &fx.config(),
+        PullPolicy::CheckRegistry,
+        &mut |event| {
+            events.push(event.clone());
+            true
+        },
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, PullEvent::FetchingIndex)),
+        "{events:?}"
+    );
+    assert!(fx.requests() > 0);
+    let error = result.expect_err("no variant runs without a backend");
+    assert!(matches!(error, PullError::NoDevice(_)), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .starts_with("no compatible variant found for model 'mini'"),
+        "the registry's own text: {error}"
+    );
+}
+
+/// A model home that cannot be read is an error, not "nothing installed".
+#[test]
+#[cfg(unix)]
+fn resolve_reports_an_unreadable_home() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Fixture::new(&[]);
+    install(&fx);
+    let models = fx.home.path().join("models");
+    fs::set_permissions(&models, fs::Permissions::from_mode(0o000))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let result = resolve_on(&metal_host(), "mini", &fx.config());
+    fs::set_permissions(&models, fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("{e}"));
+    // Running as root reads everything; there the premise does not hold.
+    if matches!(result, Ok(Some(_))) {
+        return;
+    }
+    assert!(
+        matches!(result, Err(PullError::Hub(_))),
+        "{:?}",
+        result.err()
+    );
+}
+
 #[test]
 fn a_name_in_any_case_installs_and_is_found_again() {
     let fx = Fixture::new(&[]);
@@ -405,14 +482,15 @@ fn a_blob_that_rotted_is_never_installed_as_good() {
         "a failed verify leaves no install behind"
     );
     assert!(!blob.exists(), "the blob that failed its hash is removed");
-    // The next call never accepts the bad bytes: it errors or fetches them again.
-    match fx.ensure("mini", &mut |_, _| true) {
-        Ok(again) => assert_eq!(
-            fs::read(again.dir.join("base").join("mini.gguf")).unwrap_or_default(),
-            fx.weights
-        ),
-        Err(error) => assert!(matches!(error, PullError::Install(_)), "{error:?}"),
-    }
+    // The bad blob and the install are gone, so the next call fetches the
+    // good bytes again and succeeds.
+    let again = fx
+        .ensure("mini", &mut |_, _| true)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        fs::read(again.dir.join("base").join("mini.gguf")).unwrap_or_default(),
+        fx.weights
+    );
 }
 
 /// Cancels once `after` has passed, and checks the call returns promptly.
@@ -484,7 +562,7 @@ fn observed_events_arrive_in_order_and_the_registry_is_asked_on_request() {
     let fx = Fixture::new(&[]);
     let config = fx.config();
     let mut kinds = Vec::new();
-    let first = observe_on(
+    let first = pull_observed_on(
         &metal_host(),
         "mini",
         &config,
@@ -517,7 +595,7 @@ fn observed_events_arrive_in_order_and_the_registry_is_asked_on_request() {
 
     let requests = fx.requests();
     let mut again = Vec::new();
-    let second = observe_on(
+    let second = pull_observed_on(
         &metal_host(),
         "mini",
         &config,
