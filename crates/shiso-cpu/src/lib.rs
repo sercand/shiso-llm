@@ -23,7 +23,7 @@
 //! mapping; the copy costs one pass at load and nothing afterwards.
 //!
 //! Kernel arguments and the launch-time aliasing model are described in the
-//! [`dispatch`] module docs.
+//! `dispatch` module docs.
 
 #![forbid(unsafe_code)]
 
