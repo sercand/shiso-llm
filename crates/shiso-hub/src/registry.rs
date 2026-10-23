@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use reqwest::header::{ETAG, IF_NONE_MATCH};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
-use crate::config::HubConfig;
+use crate::config::{CONNECT_TIMEOUT, HubConfig, READ_TIMEOUT};
 use crate::error::HubError;
 use crate::recipe::{Index, IndexModelEntry, ModelName, Recipe};
 use crate::validate::{ValidationMode, validate_recipe};
@@ -24,6 +24,8 @@ impl RegistryClient {
     pub fn new(config: HubConfig) -> Self {
         let client = reqwest::Client::builder()
             .tls_built_in_root_certs(config.registry.url.scheme() != "http")
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { client, config }

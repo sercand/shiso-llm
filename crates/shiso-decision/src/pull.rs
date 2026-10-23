@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use shiso_hub::{
     BlobStore, Downloader, HostProfile, HubConfig, HubError, ModelName, ProgressEvent,
@@ -41,8 +42,14 @@ pub struct InstalledModel {
 /// the call returns [`DecideError::Cancelled`] and partial files stay under
 /// `home`, so the next call resumes them.
 ///
+/// An installed model is never checked against a newer manifest: once it is
+/// there and complete, the registry is not asked again.
+///
 /// This blocks the calling thread on its own runtime, so call it from a
-/// thread that may block, not from inside an async executor.
+/// thread that may block, not from inside an async executor. `progress` runs
+/// on that thread, between the download's steps and about every 200 ms while
+/// nothing arrives, so a slow callback stalls the download and a cancel is
+/// noticed within one tick even when a connection is stalled.
 ///
 /// # Errors
 ///
@@ -59,8 +66,10 @@ pub fn ensure_model(
     // The same token `shiso pull` would use, for repositories that need one.
     config.hf_token = BlobStore::new(config.clone())
         .read_auth_token()
-        .ok()
-        .flatten();
+        .unwrap_or_else(|error| {
+            tracing::debug!(%error, "no usable Hugging Face token; downloading without one");
+            None
+        });
     ensure_with(&config, &probe_host(), name, progress)
 }
 
@@ -87,18 +96,64 @@ fn ensure_with(
         return Ok(installed);
     }
     if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(DecideError::Download(
+        return Err(DecideError::Request(
             "ensure_model blocks; call it from a thread outside an async executor".to_owned(),
         ));
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(pull(config, host, &store, name, progress));
+    let result = runtime.block_on(drive(config, host, &store, name, progress));
     // Downloads still in flight after a cancel or an error are dropped here,
     // not awaited: their partial files are what the next call resumes.
     runtime.shutdown_background();
     result
+}
+
+/// How often the caller is asked whether to go on while nothing is arriving:
+/// a stalled connection must not make a cancel wait for the next byte.
+const TICK: Duration = Duration::from_millis(200);
+
+/// Runs [`pull`] while feeding `progress`, from download events and from a
+/// timer, and drops it the moment `progress` says stop.
+async fn drive(
+    config: &HubConfig,
+    host: &HostProfile,
+    store: &BlobStore,
+    name: &str,
+    progress: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<InstalledModel, DecideError> {
+    let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
+    let work = pull(config, host, store, name, tx);
+    tokio::pin!(work);
+    let mut tally = Tally::default();
+    let mut tick = tokio::time::interval(TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let result = loop {
+        tokio::select! {
+            result = &mut work => break result,
+            Some(event) = rx.recv() => {
+                if !tally.report(&event, progress) {
+                    return Err(DecideError::Cancelled);
+                }
+            }
+            _ = tick.tick() => {
+                if !progress(tally.done(), tally.total) {
+                    return Err(DecideError::Cancelled);
+                }
+            }
+        }
+    };
+    let installed = result?;
+    // The work is done, so a caller's bar ends full; with nothing to download
+    // the tally is empty and the model's own size stands for the total.
+    let total = if tally.total == 0 {
+        installed.total_bytes
+    } else {
+        tally.total
+    };
+    let _ = progress(total, total);
+    Ok(installed)
 }
 
 /// What `shiso pull` does: index, manifest, variant, download, install.
@@ -107,7 +162,7 @@ async fn pull(
     host: &HostProfile,
     store: &BlobStore,
     name: &str,
-    progress: &mut dyn FnMut(u64, u64) -> bool,
+    events: mpsc::Sender<ProgressEvent>,
 ) -> Result<InstalledModel, DecideError> {
     let client = RegistryClient::new(config.clone());
     let index = client
@@ -130,30 +185,12 @@ async fn pull(
         other => download(&other),
     })?;
     let variant = selected.variant;
-    let total_bytes = variant_bytes(variant);
 
     if !store.is_up_to_date(&recipe.name, &variant.key, &entry.manifest_sha256, variant) {
-        let downloader = Downloader::new(config.clone());
-        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
-        let transfer = downloader.download_variant(recipe.name.as_ref(), variant, Some(&tx));
-        tokio::pin!(transfer);
-        let mut tally = Tally::default();
-        let outcome = loop {
-            tokio::select! {
-                result = &mut transfer => break result,
-                Some(event) = rx.recv() => {
-                    if !tally.report(&event, progress) {
-                        return Err(DecideError::Cancelled);
-                    }
-                }
-            }
-        };
-        outcome.map_err(|error| download(&error))?;
-        while let Ok(event) = rx.try_recv() {
-            if !tally.report(&event, progress) {
-                return Err(DecideError::Cancelled);
-            }
-        }
+        Downloader::new(config.clone())
+            .download_variant(recipe.name.as_ref(), variant, Some(&events))
+            .await
+            .map_err(|error| download(&error))?;
         store
             .install_variant(&recipe, variant, &entry.manifest_sha256)
             .map_err(|error| download(&error))?;
@@ -161,17 +198,37 @@ async fn pull(
         let checked = store
             .verify_variant(&recipe.name, &variant.key)
             .map_err(|error| download(&error))?;
-        if let Some((file, _)) = checked.iter().find(|(_, ok)| !ok) {
+        let bad: Vec<&str> = checked
+            .iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(file, _)| file.as_str())
+            .collect();
+        if !bad.is_empty() {
+            // The next call must not take this directory for a good install,
+            // nor reuse the blobs that failed: the downloader trusts a blob's
+            // size alone.
+            let _ = std::fs::remove_dir_all(store.variant_dir(&recipe.name, &variant.key));
+            for (role, component) in &variant.components {
+                for file in &component.files {
+                    if bad.contains(&format!("{}/{}", role.as_str(), file.name).as_str()) {
+                        let blob = config
+                            .home
+                            .join("blobs")
+                            .join("sha256")
+                            .join(file.sha256.as_str());
+                        let _ = std::fs::remove_file(blob);
+                    }
+                }
+            }
             return Err(DecideError::Download(format!(
-                "{file} does not match its digest after installing"
+                "{} does not match its digest after installing",
+                bad.join(", ")
             )));
         }
-        // The count of the work done, so a caller's bar ends full.
-        let _ = progress(tally.total, tally.total);
     }
     Ok(InstalledModel {
         dir: store.variant_dir(&recipe.name, &variant.key),
-        total_bytes,
+        total_bytes: variant_bytes(variant),
     })
 }
 
@@ -224,6 +281,11 @@ struct Tally {
 impl Tally {
     /// Applies `event` and reports the new totals; `false` when the caller
     /// asked to stop.
+    fn done(&self) -> u64 {
+        let done: u64 = self.files.values().map(|(done, _)| done).sum();
+        done.min(self.total)
+    }
+
     fn report(
         &mut self,
         event: &ProgressEvent,
@@ -254,8 +316,7 @@ impl Tally {
             }
             ProgressEvent::Installed { .. } | ProgressEvent::Error { .. } => return true,
         }
-        let done: u64 = self.files.values().map(|(done, _)| done).sum();
-        progress(done.min(self.total), self.total)
+        progress(self.done(), self.total)
     }
 }
 
@@ -316,6 +377,11 @@ mod tests {
 
     impl Fixture {
         fn new(extra_models: &[&str]) -> Self {
+            Self::slow(extra_models, "", Duration::ZERO)
+        }
+
+        /// A fixture whose routes ending in `slow` answer only after `delay`.
+        fn slow(extra_models: &[&str], slow: &str, delay: Duration) -> Self {
             let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| panic!("runtime: {e}"));
             let server = rt.block_on(MockServer::start());
             // Large enough that the progress interval (512 KiB) fires.
@@ -380,28 +446,25 @@ mod tests {
                 "manifest_sha256": digest(&manifest),
                 "variants": [],
             })];
-            for extra in extra_models {
-                models.push(json!({
-                    "name": extra,
-                    "family": "lfm2",
-                    "min_shiso_version": "0.1.0",
-                    "description": "other",
-                    "tasks": ["a_task_from_the_future"],
-                    "updated_at": "2026-10-05T00:00:00Z",
-                    "manifest": format!("models/{extra}/index.json"),
-                    "manifest_sha256": "0".repeat(64),
-                    "variants": [],
-                }));
-            }
+            models.extend(extra_models.iter().map(|extra| other_entry(extra)));
             let index = json!({
                 "schema_version": 1, "generated_at": "2026-10-05T00:00:00Z", "models": models
             })
             .to_string()
             .into_bytes();
             let serve = |route: &str, body: Vec<u8>| {
+                let wait = if !slow.is_empty() && route.ends_with(slow) {
+                    delay
+                } else {
+                    Duration::ZERO
+                };
                 let mock = Mock::given(method("GET"))
                     .and(path(route.to_owned()))
-                    .respond_with(ResponseTemplate::new(200).set_body_bytes(body));
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_bytes(body)
+                            .set_delay(wait),
+                    );
                 rt.block_on(mock.mount(&server));
             };
             serve("/v1/index.json", index);
@@ -443,6 +506,21 @@ mod tests {
         ) -> Result<InstalledModel, DecideError> {
             ensure_with(&self.config(), &metal_host(), name, progress)
         }
+    }
+
+    /// An index entry whose task this client has never heard of.
+    fn other_entry(name: &str) -> serde_json::Value {
+        json!({
+            "name": name,
+            "family": "lfm2",
+            "min_shiso_version": "0.1.0",
+            "description": "other",
+            "tasks": ["a_task_from_the_future"],
+            "updated_at": "2026-10-05T00:00:00Z",
+            "manifest": format!("models/{name}/index.json"),
+            "manifest_sha256": "0".repeat(64),
+            "variants": [],
+        })
     }
 
     fn metal_host() -> HostProfile {
@@ -581,6 +659,101 @@ mod tests {
             matches!(result, Err(DecideError::NoDevice(_))),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn a_blob_that_rotted_is_never_installed_as_good() {
+        let fx = Fixture::new(&[]);
+        let installed = fx
+            .ensure("mini", &mut |_, _| true)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Same size, wrong bytes: the downloader reuses a blob on size alone.
+        let blob = fx
+            .home
+            .path()
+            .join("blobs")
+            .join("sha256")
+            .join(digest(&fx.weights));
+        fs::remove_file(&blob).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(&blob, vec![7u8; fx.weights.len()]).unwrap_or_else(|e| panic!("{e}"));
+        fs::remove_dir_all(&installed.dir).unwrap_or_else(|e| panic!("{e}"));
+
+        let result = fx.ensure("mini", &mut |_, _| true);
+        assert!(
+            matches!(result, Err(DecideError::Download(_))),
+            "{result:?}"
+        );
+        assert!(
+            !installed.dir.join("installed.json").exists(),
+            "a failed verify leaves no install behind"
+        );
+        // The next call never accepts the bad bytes: it errors or fetches them again.
+        match fx.ensure("mini", &mut |_, _| true) {
+            Ok(again) => assert_eq!(
+                fs::read(again.dir.join("base").join("mini.gguf")).unwrap_or_default(),
+                fx.weights
+            ),
+            Err(error) => assert!(matches!(error, DecideError::Download(_)), "{error:?}"),
+        }
+    }
+
+    /// Cancels once `after` has passed, and checks the call returns promptly.
+    fn cancelled_within(fx: &Fixture, after: Duration) {
+        let started = std::time::Instant::now();
+        let result = fx.ensure("mini", &mut |_, _| started.elapsed() < after);
+        assert!(matches!(result, Err(DecideError::Cancelled)), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancel took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn cancel_works_while_the_weights_are_stalled() {
+        let fx = Fixture::slow(&[], "mini.gguf", Duration::from_secs(30));
+        cancelled_within(&fx, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn cancel_works_while_the_manifest_is_stalled() {
+        let fx = Fixture::slow(&[], "models/mini/index.json", Duration::from_secs(30));
+        cancelled_within(&fx, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn cancel_works_while_the_index_is_stalled() {
+        let fx = Fixture::slow(&[], "/v1/index.json", Duration::from_secs(30));
+        cancelled_within(&fx, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn calling_inside_an_async_runtime_is_a_request_error() {
+        let fx = Fixture::new(&[]);
+        let config = fx.config();
+        let result = fx
+            .rt
+            .block_on(async { ensure_with(&config, &metal_host(), "mini", &mut |_, _| true) });
+        assert!(matches!(result, Err(DecideError::Request(_))), "{result:?}");
+    }
+
+    #[test]
+    fn an_already_present_model_ends_its_progress_full() {
+        let fx = Fixture::new(&[]);
+        fx.ensure("mini", &mut |_, _| true)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Same files in the home, but a manifest that reaches this call as new:
+        // remove only the install record so the network path runs with every
+        // blob already present.
+        let record = fx.home.path().join("models/mini/q8_0/installed.json");
+        fs::remove_file(record).unwrap_or_else(|e| panic!("{e}"));
+        let mut last = (0, 0);
+        fx.ensure("mini", &mut |done, total| {
+            last = (done, total);
+            true
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(last, (3_000_023, 3_000_023));
     }
 
     /// Downloads the real `d1-3b` into a fresh home and opens it.
