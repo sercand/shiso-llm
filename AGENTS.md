@@ -81,6 +81,13 @@ cargo test -p <crate> --test <name>          # a single test target
 - `shiso-ir` is the narrow waist. Each wire format (`shiso-server/src/openai`,
   `anthropic`) owns its own serde structs and converts them to and from the IR.
   The IR types carry no serde derives.
+- `shiso-runtime` is the engine without HTTP: scheduler, model factory,
+  tokenizer, media, boot, hub glue, the typed cores (`api::pipeline`, `image`,
+  `decision`) and the `Runtime` facade. It never depends on `axum`, `tower`,
+  `tower-http` or `clap` (the `clap` feature only derives the flags of
+  `ServeOptions`). `shiso-server` is the adapter over it: wire formats, routes,
+  SSE framing and the `shiso` CLI. Logic a route and an embedder both need
+  belongs in the runtime's typed core, not in a handler.
 - Only the scheduler thread calls methods on the model.
 - `shiso-modelfile` describes files and never converts them: weights are
   borrowed from the mapping, not copied or dequantized, wherever the container
