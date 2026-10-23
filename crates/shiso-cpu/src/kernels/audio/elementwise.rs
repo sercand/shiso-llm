@@ -48,13 +48,18 @@ fn sigmoid(x: f32) -> f32 {
 /// `kernels/metal/audio/audio_common.h` (error below 1.5e-7), which the
 /// shared oracle evaluates in f64. std has no stable `erf`, and using the
 /// device's own approximation keeps GELU-erf the same function on both.
+#[expect(
+    clippy::excessive_precision,
+    reason = "the coefficients are the digits `audio_erf` writes, so a diff of the two reads as equal; shortened literals round to a neighbouring f32 for some of them"
+)]
 fn erf(x: f32) -> f32 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let a = x.abs();
     let t = 1.0 / (1.0 + 0.327_591_1 * a);
     let poly = t
-        * (0.254_829_6
-            + t * (-0.284_496_74 + t * (1.421_413_8 + t * (-1.453_152 + t * 1.061_405_4))));
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     sign * (1.0 - poly * (-a * a).exp())
 }
 
@@ -83,11 +88,12 @@ fn unary_group(launch: &Launch<'_>, gid: [u32; 3], out: &mut Writes) -> CoreResu
             });
         }
     };
-    if args.op == 5 && a > b {
-        // `f32::clamp` panics on this; the device's clamp is just wrong.
+    if args.op == 5 && a.partial_cmp(&b).is_none_or(std::cmp::Ordering::is_gt) {
+        // `f32::clamp` panics on this (and on a NaN bound, which has no order
+        // and is refused with it); the device's clamp is just wrong.
         return Err(CoreError::InvalidValue {
             key: "unary clamp",
-            value: format!("min {a} exceeds max {b}"),
+            value: format!("min {a} does not order below max {b}"),
         });
     }
     let vals: Vec<f32> = input.iter().map(|&x| f(x, a, b)).collect();
