@@ -80,9 +80,9 @@ fn opening_a_backend_without_a_driver_names_the_entry_point_it_could_not_reach()
         Err(CoreError::Backend { backend, op, .. }) => {
             assert_eq!(backend, "cuda");
             assert_eq!(
-                op, "cuInit",
-                "the first thing a backend does is initialise the driver, and that is what has to \
-                 be named when there is none",
+                op, "libcuda",
+                "the first thing a backend does is probe the driver library, and that is what has \
+                 to be named when there is none",
             );
         }
         Ok(_) => panic!("a host with no driver must not produce a working backend"),

@@ -133,18 +133,12 @@ impl SysError {
         }
     }
 
-    /// The message every entry point on a target without a driver answers with.
-    #[cfg_attr(
-        all(target_os = "linux", not(test)),
-        expect(
-            dead_code,
-            reason = "only the stub arm has an absent driver to report; the constructor lives here so both arms share one error type"
-        )
-    )]
+    /// The error every entry point answers with when there is no driver to reach:
+    /// the stub arm always, and Linux when libcuda is not installed.
     pub(crate) const fn no_driver(op: &'static str) -> Self {
         Self::Host {
             op,
-            what: "this build has no CUDA driver: the backend was compiled against its stub arm",
+            what: "no CUDA driver is reachable: the build targets a stub arm or libcuda is not installed",
         }
     }
 
