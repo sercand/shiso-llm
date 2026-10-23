@@ -42,21 +42,43 @@ pub(crate) struct Job {
     pub(crate) reply: oneshot::Sender<Result<Vec<Answer>, DecideError>>,
 }
 
-/// The error of a request the `Decider` was dropped under.
-fn closed() -> DecideError {
-    DecideError::Engine("the decider was dropped before it answered".to_owned())
+/// What the `Decider`, its handles and the worker all see.
+#[derive(Debug, Default)]
+pub(crate) struct Shared {
+    /// Set before the stop message is queued, so the worker can tell a job it
+    /// finished while the `Decider` was being dropped.
+    pub(crate) closing: AtomicBool,
+    /// Set when the model panicked and the worker stopped.
+    pub(crate) panicked: AtomicBool,
+}
+
+impl Shared {
+    /// The error of a request that will never be answered: the worker failed,
+    /// or the `Decider` was dropped under it.
+    pub(crate) fn stopped(&self) -> DecideError {
+        if self.panicked.load(Ordering::SeqCst) {
+            DecideError::Engine("the decision worker failed: the model panicked".to_owned())
+        } else {
+            DecideError::Engine("the decider was dropped before it answered".to_owned())
+        }
+    }
 }
 
 /// The worker's loop: one request at a time until told to stop.
 ///
-/// Once `closing` is set no request is run, and one that was running when it
+/// Once `shared.closing` is set no request is run, and one that was running when it
 /// was set fails with the rest: whoever dropped the `Decider` has no use for
 /// the answer, and the caller must not take a result for one the decider
 /// stood behind.
-pub(crate) fn run(mut engine: Box<dyn Engine>, rx: &Receiver<Msg>, closing: &AtomicBool) {
+pub(crate) fn run(mut engine: Box<dyn Engine>, rx: &Receiver<Msg>, shared: &Shared) {
     while let Ok(Msg::Job(job)) = rx.recv() {
-        if closing.load(Ordering::SeqCst) {
-            let _ = job.reply.send(Err(closed()));
+        // Nobody is waiting: the caller's future was dropped while the job
+        // queued, and reading a prompt for it would only delay the next.
+        if job.reply.is_canceled() {
+            continue;
+        }
+        if shared.closing.load(Ordering::SeqCst) {
+            let _ = job.reply.send(Err(shared.stopped()));
             continue;
         }
         let Ok(result) = catch_unwind(AssertUnwindSafe(|| engine.decide(&job.req))) else {
@@ -64,13 +86,12 @@ pub(crate) fn run(mut engine: Box<dyn Engine>, rx: &Receiver<Msg>, closing: &Ato
             // this is worth trusting, so the worker stops and every later
             // request fails at the queue.
             tracing::error!("the model panicked while deciding; the worker stops");
-            let _ = job
-                .reply
-                .send(Err(DecideError::Engine("the model panicked".to_owned())));
+            shared.panicked.store(true, Ordering::SeqCst);
+            let _ = job.reply.send(Err(shared.stopped()));
             break;
         };
-        let result = if closing.load(Ordering::SeqCst) {
-            Err(closed())
+        let result = if shared.closing.load(Ordering::SeqCst) {
+            Err(shared.stopped())
         } else {
             result
         };

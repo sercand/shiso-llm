@@ -249,6 +249,14 @@ fn validate(req: &DecisionRequest) -> Result<f64, DecideError> {
         return Err(DecideError::Request("no questions".to_owned()));
     }
     for question in &req.questions {
+        // As the server's decisions route: a question with no wording is the
+        // caller's mistake, not a prompt the layout should improvise.
+        if question.instructions().trim().is_empty() {
+            return Err(DecideError::Request(format!(
+                "question {:?}: the question text must not be blank",
+                question.name()
+            )));
+        }
         let options = question.option_values().len();
         if options == 0 {
             return Err(DecideError::Request(format!(
@@ -484,7 +492,7 @@ mod tests {
             input: "state".to_owned(),
             questions: vec![Question::Choice {
                 name: "pick".to_owned(),
-                instructions: String::new(),
+                instructions: "pick one".to_owned(),
                 choices: options(values),
             }],
             temperature: None,
@@ -600,6 +608,25 @@ mod tests {
         )
         .expect_err("the layout refused");
         assert!(matches!(error, DecideError::Layout(_)), "{error:?}");
+    }
+
+    #[test]
+    fn blank_instructions_are_refused() {
+        let readout = FakeReadout {
+            groups: vec![vec![token(10)], vec![token(11)]],
+            refuse: false,
+        };
+        let mut req = request(&["a", "b"]);
+        let Question::Choice { instructions, .. } = &mut req.questions[0] else {
+            panic!("a choice question");
+        };
+        *instructions = "  \n".to_owned();
+        let error = decide_with_readout(&readout, &NoEncoder, &quiet_scorer(), &req, 100)
+            .expect_err("blank instructions");
+        assert!(
+            matches!(&error, DecideError::Request(m) if m.contains("pick")),
+            "{error:?}"
+        );
     }
 
     #[test]

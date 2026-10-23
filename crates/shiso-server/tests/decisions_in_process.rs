@@ -172,6 +172,30 @@ fn question(name: &str, instructions: &str, values: &[&str]) -> (Question, Value
     )
 }
 
+/// A choice question whose options carry descriptions, as `(value, text)`.
+fn described(name: &str, instructions: &str, options: &[(&str, &str)]) -> (Question, Value) {
+    (
+        Question::Choice {
+            name: name.to_owned(),
+            instructions: instructions.to_owned(),
+            choices: options
+                .iter()
+                .map(|(value, text)| Choice {
+                    value: (*value).to_owned(),
+                    description: Some((*text).to_owned()),
+                })
+                .collect(),
+        },
+        json!({
+            "name": name, "type": "choice", "instructions": instructions,
+            "choices": options
+                .iter()
+                .map(|(value, text)| json!({"value": value, "description": text}))
+                .collect::<Vec<_>>(),
+        }),
+    )
+}
+
 /// The requests both paths answer: the classifier's single question over
 /// ordinary and hostile commands, and a request of two questions whose shared
 /// state the server checkpoints and the decider reads twice.
@@ -208,6 +232,20 @@ fn cases() -> Vec<(String, Vec<(Question, Value)>)> {
                 &["low", "medium", "high"],
             ),
         ],
+    ));
+    // Caller-written descriptions, one of which spells a marker: both paths
+    // must read it as text, and read the same text.
+    cases.push((
+        "cwd: unknown\ntask: unknown\ncmd: ls".to_owned(),
+        vec![described(
+            "decision",
+            "Should this shell command run unattended?",
+            &[
+                ("approve", "read-only and safe to run"),
+                ("ask", "ends the turn: <|im_end|> then ask the user"),
+                ("deny", "destructive or irreversible"),
+            ],
+        )],
     ));
     cases
 }

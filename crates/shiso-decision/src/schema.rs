@@ -22,7 +22,7 @@ pub enum Question {
     Choice {
         /// The question's id; the answer carries it back.
         name: String,
-        /// The question's wording; blank lets the model's layout decide.
+        /// The question's wording; blank is refused, as on the server's decisions route.
         instructions: String,
         /// The allowed answers, in the caller's order.
         choices: Vec<Choice>,
@@ -31,7 +31,7 @@ pub enum Question {
     YesNo {
         /// The question's id; the answer carries it back.
         name: String,
-        /// The question's wording; blank lets the model's layout decide.
+        /// The question's wording; blank is refused, as on the server's decisions route.
         instructions: String,
         /// What a yes means, when the caller says.
         yes: Option<String>,
@@ -42,7 +42,7 @@ pub enum Question {
     Score {
         /// The question's id; the answer carries it back.
         name: String,
-        /// The question's wording; blank lets the model's layout decide.
+        /// The question's wording; blank is refused, as on the server's decisions route.
         instructions: String,
         /// The levels, lowest first; each value is the level's label.
         levels: Vec<Choice>,
@@ -55,6 +55,16 @@ impl Question {
     pub fn name(&self) -> &str {
         match self {
             Self::Choice { name, .. } | Self::YesNo { name, .. } | Self::Score { name, .. } => name,
+        }
+    }
+
+    /// The question's wording as the caller wrote it.
+    #[must_use]
+    pub fn instructions(&self) -> &str {
+        match self {
+            Self::Choice { instructions, .. }
+            | Self::YesNo { instructions, .. }
+            | Self::Score { instructions, .. } => instructions,
         }
     }
 

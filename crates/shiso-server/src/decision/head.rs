@@ -30,31 +30,13 @@ pub(crate) struct Encoder<'a>(pub(crate) &'a Vocabulary);
 
 impl PromptEncoder for Encoder<'_> {
     fn encode(&self, text: &str, literal: &[Range<usize>]) -> Result<Vec<TokenId>, CoreError> {
-        let failed = |error: crate::tokenizer::TokenizerError| CoreError::Backend {
-            backend: "tokenizer",
-            op: "encode",
-            source: Box::new(error),
-        };
-        // Every marker this vocabulary has opens with `<`, so a piece whose
-        // caller text holds none takes the plain encode: the literal-aware
-        // one rebuilds the tokenizer on every call, and a schema is dozens of
-        // pieces.
-        let marked = literal
-            .iter()
-            .any(|range| text.get(range.clone()).is_some_and(|t| t.contains('<')));
-        if !marked {
-            return self.0.encode(text, false).map_err(failed);
-        }
-        let mut tokens = self
-            .0
-            .encode_prompt_with_literals(text, literal)
-            .map_err(failed)?;
-        // A piece sits inside a prompt; only the prompt's own start takes the
-        // sequence opener.
-        if self.0.bos().is_some() && tokens.first() == self.0.bos().as_ref() {
-            tokens.remove(0);
-        }
-        Ok(tokens)
+        self.0
+            .encode_piece(text, literal)
+            .map_err(|error| CoreError::Backend {
+                backend: "tokenizer",
+                op: "encode",
+                source: Box::new(error),
+            })
     }
 }
 

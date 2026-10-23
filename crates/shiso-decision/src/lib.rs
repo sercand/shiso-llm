@@ -13,6 +13,7 @@ compile_error!("the `metal` and `cuda` features are mutually exclusive");
 
 pub mod decider;
 pub mod error;
+pub mod literal;
 mod load;
 pub mod math;
 pub mod schema;

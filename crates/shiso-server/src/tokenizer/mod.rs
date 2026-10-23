@@ -67,6 +67,8 @@ pub enum TokenizerError {
 #[derive(Debug)]
 pub struct Vocabulary {
     inner: tokenizers::Tokenizer,
+    /// Which spellings of `inner` are markers, read once at load.
+    markers: shiso_decision::literal::Markers,
     bos: Option<TokenId>,
 }
 
@@ -90,7 +92,11 @@ impl Vocabulary {
             .parent()
             .map(|dir| dir.join("tokenizer_config.json"))
             .and_then(|config| bos_from_config(&config, &inner));
-        Ok(Self { inner, bos })
+        Ok(Self {
+            markers: shiso_decision::literal::Markers::of(&inner),
+            inner,
+            bos,
+        })
     }
 
     /// The opening token this checkpoint puts in front of a prompt, if any.
@@ -113,8 +119,12 @@ impl Vocabulary {
     /// to a file. Both end at the same struct, so a test that renders a prompt
     /// is exercising the same encoder a deployment does.
     #[must_use]
-    pub const fn from_tokenizer(inner: tokenizers::Tokenizer) -> Self {
-        Self { inner, bos: None }
+    pub fn from_tokenizer(inner: tokenizers::Tokenizer) -> Self {
+        Self {
+            markers: shiso_decision::literal::Markers::of(&inner),
+            inner,
+            bos: None,
+        }
     }
 
     /// Encodes prompt text.
@@ -205,71 +215,36 @@ impl Vocabulary {
         if literal.is_empty() {
             return self.encode_prompt(text);
         }
-        let encode_error = |error: tokenizers::Error| TokenizerError::Encode {
-            message: error.to_string(),
-        };
-        let encoded = self.inner.encode(text, false).map_err(encode_error)?;
-        let added = self.inner.get_added_tokens_decoder();
-        // Cloned per call rather than kept: only a prompt that spells a marker
-        // in its text comes here, and a second resident copy of a large
-        // vocabulary is paid by every prompt that does not.
-        let mut as_text = self.inner.clone();
-        as_text.set_encode_special_tokens(true);
-        let overlaps = |(start, end): (usize, usize)| {
-            literal
-                .iter()
-                .any(|range| start < range.end && range.start < end)
-        };
-
-        let mut tokens = Vec::with_capacity(encoded.get_ids().len());
-        let mut stretch: Vec<TokenId> = Vec::new();
-        let mut stretch_start = 0usize;
-        let mut holds_literal = false;
-        let flush = |tokens: &mut Vec<TokenId>,
-                     stretch: &mut Vec<TokenId>,
-                     span: std::ops::Range<usize>,
-                     holds_literal: bool|
-         -> Result<(), TokenizerError> {
-            if holds_literal {
-                let piece = text.get(span).unwrap_or_default();
-                let again = as_text.encode(piece, false).map_err(encode_error)?;
-                tokens.extend(again.get_ids().iter().copied().map(TokenId::new));
-                stretch.clear();
-            } else {
-                tokens.append(stretch);
-            }
-            Ok(())
-        };
-        for (&id, &offsets) in encoded.get_ids().iter().zip(encoded.get_offsets()) {
-            let inside = overlaps(offsets);
-            if added.contains_key(&id) && !inside {
-                flush(
-                    &mut tokens,
-                    &mut stretch,
-                    stretch_start..offsets.0,
-                    holds_literal,
-                )?;
-                tokens.push(TokenId::new(id));
-                stretch_start = offsets.1;
-                holds_literal = false;
-            } else {
-                stretch.push(TokenId::new(id));
-                holds_literal |= inside;
-            }
-        }
-        flush(
-            &mut tokens,
-            &mut stretch,
-            stretch_start..text.len(),
-            holds_literal,
-        )?;
-
+        let mut tokens = shiso_decision::literal::encode_with_literals(&self.inner, text, literal)
+            .map_err(|error| TokenizerError::Encode {
+                message: error.to_string(),
+            })?;
         if let Some(bos) = self.bos
             && tokens.first() != Some(&bos)
         {
             tokens.insert(0, bos);
         }
         Ok(tokens)
+    }
+
+    /// Encodes one piece of a decision prompt: no opening token, and caller
+    /// text in `literal` that spells a marker is read as text. The one
+    /// implementation lives in `shiso-decision`, which the in-process decider
+    /// shares.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenizerError::Encode`] when the text cannot be encoded.
+    pub fn encode_piece(
+        &self,
+        text: &str,
+        literal: &[std::ops::Range<usize>],
+    ) -> Result<Vec<TokenId>, TokenizerError> {
+        shiso_decision::literal::encode_piece(&self.inner, &self.markers, text, literal).map_err(
+            |error| TokenizerError::Encode {
+                message: error.to_string(),
+            },
+        )
     }
 
     /// Encodes `text` as [`Self::encode`] does, and says where in it the

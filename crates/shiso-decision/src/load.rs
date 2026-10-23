@@ -10,6 +10,7 @@ use shiso_models::lfm2::{Lfm2Config, Lfm2Model};
 
 use crate::decider::OpenDesc;
 use crate::error::DecideError;
+use crate::literal::{Markers, encode_piece};
 use crate::worker::{Kind, ModelEngine};
 
 /// Opens the model in `desc` and wraps it in an engine.
@@ -35,8 +36,12 @@ pub(crate) fn open(desc: &OpenDesc<'_>) -> Result<ModelEngine, DecideError> {
     let mut opts = EngineOptions::default();
     opts.ctx = u32::try_from(desc.ctx)
         .map_err(|_| DecideError::Load(format!("a context of {} tokens is too long", desc.ctx)))?;
-    let mut model = Lfm2Model::load(&backend, &checkpoint, &family, opts)
-        .map_err(|error| load_error("loading the checkpoint", &error))?;
+    // A loader that panics (an allocation or a driver call that cannot be
+    // refused with an error) is a failed load, not a dead caller.
+    let mut model = caught("loading the checkpoint", || {
+        Lfm2Model::load(&backend, &checkpoint, &family, opts)
+            .map_err(|error| load_error("loading the checkpoint", &error))
+    })?;
     // Every weight is resident now, so whatever the backend kept to make the
     // imports fast can go.
     backend.finish_imports();
@@ -62,6 +67,15 @@ pub(crate) fn open(desc: &OpenDesc<'_>) -> Result<ModelEngine, DecideError> {
         kind,
         desc.ctx,
     ))
+}
+
+/// Runs `body`, turning a panic into [`DecideError::Load`] naming `what`.
+pub(crate) fn caught<T>(
+    what: &str,
+    body: impl FnOnce() -> Result<T, DecideError>,
+) -> Result<T, DecideError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+        .unwrap_or_else(|_| Err(DecideError::Load(format!("{what}: the loader panicked"))))
 }
 
 fn load_error(what: &str, error: &CoreError) -> DecideError {
@@ -189,122 +203,31 @@ fn guarded(
 
 /// The checkpoint's vocabulary, as a decision layout reaches it.
 #[derive(Debug)]
-pub(crate) struct PromptTokens(tokenizers::Tokenizer);
-
-impl PromptTokens {
-    /// Reads `tokenizer.json`.
-    pub(crate) fn from_file(path: &Path) -> Result<Self, DecideError> {
-        tokenizers::Tokenizer::from_file(path)
-            .map(Self)
-            .map_err(|error| DecideError::Load(format!("reading {}: {error}", path.display())))
-    }
-
-    /// Encodes `text` with its added tokens read as markers.
-    fn plain(&self, text: &str) -> Result<Vec<TokenId>, CoreError> {
-        Ok(self
-            .0
-            .encode(text, false)
-            .map_err(failed)?
-            .get_ids()
-            .iter()
-            .copied()
-            .map(TokenId::new)
-            .collect())
-    }
-
-    /// Encodes `text` with the byte ranges in `literal` read as ordinary text
-    /// even where they spell an added token.
-    ///
-    /// Those ranges are text a caller wrote, and a caller must not be able to
-    /// plant a marker in the prompt. The text is encoded once as usual; each
-    /// stretch between two added tokens the layout wrote that holds a literal
-    /// range is encoded again with added tokens read as text. Added tokens are
-    /// split out before any other step of the encoder, so re-encoding such a
-    /// stretch alone gives the ids the same characters would get anywhere.
-    fn with_literals(
-        &self,
-        text: &str,
-        literal: &[Range<usize>],
-    ) -> Result<Vec<TokenId>, CoreError> {
-        let encoded = self.0.encode(text, false).map_err(failed)?;
-        let added = self.0.get_added_tokens_decoder();
-        // Cloned per call rather than kept: only a prompt that spells a marker
-        // in caller text comes here, and a second resident copy of a large
-        // vocabulary is paid by every prompt that does not.
-        let mut as_text = self.0.clone();
-        as_text.set_encode_special_tokens(true);
-        let overlaps = |(start, end): (usize, usize)| {
-            literal
-                .iter()
-                .any(|range| start < range.end && range.start < end)
-        };
-        let flush = |tokens: &mut Vec<TokenId>,
-                     stretch: &mut Vec<TokenId>,
-                     span: Range<usize>,
-                     holds_literal: bool|
-         -> Result<(), CoreError> {
-            if holds_literal {
-                let piece = text.get(span).unwrap_or_default();
-                let again = as_text.encode(piece, false).map_err(failed)?;
-                tokens.extend(again.get_ids().iter().copied().map(TokenId::new));
-                stretch.clear();
-            } else {
-                tokens.append(stretch);
-            }
-            Ok(())
-        };
-
-        let mut tokens = Vec::with_capacity(encoded.get_ids().len());
-        let mut stretch: Vec<TokenId> = Vec::new();
-        let mut stretch_start = 0usize;
-        let mut holds_literal = false;
-        for (&id, &offsets) in encoded.get_ids().iter().zip(encoded.get_offsets()) {
-            let inside = overlaps(offsets);
-            if added.contains_key(&id) && !inside {
-                flush(
-                    &mut tokens,
-                    &mut stretch,
-                    stretch_start..offsets.0,
-                    holds_literal,
-                )?;
-                tokens.push(TokenId::new(id));
-                stretch_start = offsets.1;
-                holds_literal = false;
-            } else {
-                stretch.push(TokenId::new(id));
-                holds_literal |= inside;
-            }
-        }
-        flush(
-            &mut tokens,
-            &mut stretch,
-            stretch_start..text.len(),
-            holds_literal,
-        )?;
-        Ok(tokens)
-    }
+pub(crate) struct PromptTokens {
+    tokenizer: tokenizers::Tokenizer,
+    markers: Markers,
 }
 
-fn failed(error: tokenizers::Error) -> CoreError {
-    CoreError::Backend {
-        backend: "tokenizer",
-        op: "encode",
-        source: error,
+impl PromptTokens {
+    /// Reads `tokenizer.json`, and which spellings in it are markers.
+    pub(crate) fn from_file(path: &Path) -> Result<Self, DecideError> {
+        let tokenizer = tokenizers::Tokenizer::from_file(path)
+            .map_err(|error| DecideError::Load(format!("reading {}: {error}", path.display())))?;
+        Ok(Self {
+            markers: Markers::of(&tokenizer),
+            tokenizer,
+        })
     }
 }
 
 impl PromptEncoder for PromptTokens {
     fn encode(&self, text: &str, literal: &[Range<usize>]) -> Result<Vec<TokenId>, CoreError> {
-        // Every marker this vocabulary has opens with `<`, so a piece whose
-        // caller text holds none takes the plain encode: the literal-aware one
-        // clones the tokenizer on every call, and a schema is dozens of pieces.
-        let marked = literal
-            .iter()
-            .any(|range| text.get(range.clone()).is_some_and(|t| t.contains('<')));
-        if marked {
-            self.with_literals(text, literal)
-        } else {
-            self.plain(text)
-        }
+        encode_piece(&self.tokenizer, &self.markers, text, literal).map_err(|source| {
+            CoreError::Backend {
+                backend: "tokenizer",
+                op: "encode",
+                source,
+            }
+        })
     }
 }

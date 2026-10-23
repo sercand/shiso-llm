@@ -1,11 +1,12 @@
 //! Host tests: the worker, the lifecycle and the loader's refusals. The device
 //! cases at the bottom need a real checkpoint and say so when they skip.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::FutureExt as _;
 use shiso_core::PromptEncoder as _;
 
 use crate::decider::{Decider, OpenDesc};
@@ -22,7 +23,7 @@ fn request() -> DecisionRequest {
         input: "state".to_owned(),
         questions: vec![Question::Choice {
             name: "pick".to_owned(),
-            instructions: String::new(),
+            instructions: "pick one".to_owned(),
             choices: vec![Choice {
                 value: "a".to_owned(),
                 description: None,
@@ -47,10 +48,12 @@ struct Gated {
     entered: Sender<()>,
     release: Mutex<Receiver<()>>,
     closed: Arc<AtomicBool>,
+    calls: Arc<AtomicUsize>,
 }
 
 impl Engine for Gated {
     fn decide(&mut self, _: &DecisionRequest) -> Result<Vec<Answer>, DecideError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let _ = self.entered.send(());
         self.release
             .lock()
@@ -103,7 +106,11 @@ fn a_panicking_model_fails_the_call_and_every_later_one() {
         "{first:?}"
     );
     let later = decider.decide_blocking(&request()).expect_err("stopped");
-    assert!(matches!(later, DecideError::Engine(_)), "{later:?}");
+    // Not "dropped": nobody dropped the decider; its worker failed.
+    assert!(
+        matches!(&later, DecideError::Engine(m) if m.contains("failed") && !m.contains("dropped")),
+        "{later:?}"
+    );
 }
 
 #[test]
@@ -115,10 +122,11 @@ fn drop_while_deciding_returns_error_and_joins() {
         entered: entered_tx,
         release: Mutex::new(release_rx),
         closed: Arc::clone(&closed),
+        calls: Arc::default(),
     }))
     .expect("spawns");
     let handle = decider.handle();
-    let closing = decider.closing_flag();
+    let closing = decider.shared();
 
     let (answered_tx, answered) = mpsc::channel();
     let caller = std::thread::spawn(move || {
@@ -136,7 +144,7 @@ fn drop_while_deciding_returns_error_and_joins() {
     // The drop has begun once the flag is up; it is joined on the worker, which
     // is still inside the call.
     let began = std::time::Instant::now();
-    while !closing.load(Ordering::SeqCst) {
+    while !closing.closing.load(Ordering::SeqCst) {
         assert!(began.elapsed() < GUARD, "the drop never began");
         std::thread::yield_now();
     }
@@ -159,6 +167,86 @@ fn drop_while_deciding_returns_error_and_joins() {
     );
     caller.join().expect("the caller does not panic");
     drop_thread.join().expect("the drop thread does not panic");
+}
+
+/// A call whose future is dropped before the worker reaches it costs the
+/// model nothing.
+#[test]
+fn an_abandoned_call_is_not_run() {
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let decider = Arc::new(
+        Decider::spawn(Box::new(Gated {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            closed: Arc::default(),
+            calls: Arc::clone(&calls),
+        }))
+        .expect("spawns"),
+    );
+    let first = {
+        let decider = Arc::clone(&decider);
+        std::thread::spawn(move || decider.decide_blocking(&request()))
+    };
+    entered
+        .recv_timeout(GUARD)
+        .expect("the worker took the first call");
+    // Queued behind the first, then abandoned: polled once, which sends it.
+    assert!(decider.decide(&request()).now_or_never().is_none());
+    let last = {
+        let decider = Arc::clone(&decider);
+        std::thread::spawn(move || decider.decide_blocking(&request()))
+    };
+    release.send(()).expect("releases the first");
+    release.send(()).expect("releases the last");
+    first.join().expect("no panic").expect("answers");
+    last.join().expect("no panic").expect("answers");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the abandoned call was run"
+    );
+}
+
+/// Spawning the worker can fail; the model must still be released.
+#[test]
+fn a_failed_spawn_closes_the_engine() {
+    let closed = Arc::new(AtomicBool::new(false));
+    let (entered, _) = mpsc::channel();
+    let engine = Gated {
+        entered,
+        release: Mutex::new(mpsc::channel().1),
+        closed: Arc::clone(&closed),
+        calls: Arc::default(),
+    };
+    let error = Decider::spawn_with(Box::new(engine), |_| {
+        Err(std::io::Error::other("no threads left"))
+    })
+    .expect_err("the spawn fails");
+    assert!(matches!(error, DecideError::Io(_)), "{error:?}");
+    assert!(closed.load(Ordering::SeqCst), "the engine was not closed");
+}
+
+#[test]
+fn a_panic_while_loading_is_a_load_error() {
+    let error = crate::load::caught("loading the checkpoint", || -> Result<(), DecideError> {
+        panic!("a driver fell over")
+    })
+    .expect_err("caught");
+    assert!(
+        matches!(&error, DecideError::Load(m) if m.contains("loading the checkpoint")),
+        "{error:?}"
+    );
+}
+
+/// The future `decide` returns can be handed to a multi-threaded executor.
+#[test]
+fn the_decide_future_is_send() {
+    fn assert_send<T: Send>(_: &T) {}
+    let decider = Decider::spawn(Box::new(Quick { panic: false })).expect("spawns");
+    let req = request();
+    assert_send(&decider.decide(&req));
 }
 
 #[test]
@@ -233,6 +321,21 @@ fn caller_text_cannot_plant_a_marker() {
     assert_eq!(typed.last().map(|id| id.get()), Some(1));
 }
 
+/// A marker that does not open with `<` is still a marker.
+#[test]
+fn a_marker_without_an_angle_bracket_is_not_plantable_either() {
+    let json = TOKENIZER.replace("<|end|>", "[SEP]");
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, json).expect("writes");
+    let tokens = PromptTokens::from_file(&path).expect("the vocabulary loads");
+    let text = "a [SEP] b";
+    let typed = tokens
+        .encode(text, std::slice::from_ref(&(2..7)))
+        .expect("encodes");
+    assert!(typed.iter().all(|id| id.get() != 3), "{typed:?}");
+}
+
 /// Device cases: `SHISO_TEST_MODEL_D1` names an installed d1 directory.
 #[cfg(any(feature = "metal", feature = "cuda"))]
 mod device {
@@ -267,7 +370,7 @@ mod device {
             input: format!("cwd: unknown\ntask: unknown\ncmd: {cmd}"),
             questions: vec![Question::Choice {
                 name: "decision".to_owned(),
-                instructions: String::new(),
+                instructions: "pick one".to_owned(),
                 choices: vec![choice("approve"), choice("ask"), choice("deny")],
             }],
             temperature: None,
