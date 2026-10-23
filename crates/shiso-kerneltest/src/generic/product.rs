@@ -76,10 +76,10 @@ pub(crate) const QK8_0: usize = 32;
 /// `shiso_engine::launch::GET_ROWS_BLOCK`.
 const GET_ROWS_BLOCK: u32 = 256;
 /// Lanes in a warp, mirroring `shiso_engine::launch::WARP`.
-const WARP: u32 = 32;
+pub(crate) const WARP: u32 = 32;
 /// Simdgroups per threadgroup of the extended matvec, mirroring
 /// `shiso_engine::launch::EXT_NSG`.
-const EXT_NSG: u32 = 2;
+pub(crate) const EXT_NSG: u32 = 2;
 /// Threads per threadgroup of the prefill GEMM, mirroring
 /// `shiso_engine::launch::GEMM_BLOCK`.
 const GEMM_BLOCK: u32 = 128;
@@ -107,14 +107,14 @@ const Q8_MV_NSG: u32 = 4;
 /// `shiso_engine::launch::GetRowsArgs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct GetRowsArgs {
-    n_embd: i32,
-    n_vocab: i32,
-    n_tokens: i32,
-    pad0: i32,
-    src_row_bytes: u64,
-    dst_row_bytes: u64,
-    token_stride: u64,
+pub(crate) struct GetRowsArgs {
+    pub(crate) n_embd: i32,
+    pub(crate) n_vocab: i32,
+    pub(crate) n_tokens: i32,
+    pub(crate) pad0: i32,
+    pub(crate) src_row_bytes: u64,
+    pub(crate) dst_row_bytes: u64,
+    pub(crate) token_stride: u64,
 }
 
 const _: () = assert!(size_of::<GetRowsArgs>() == 40);
@@ -123,28 +123,28 @@ const _: () = assert!(size_of::<GetRowsArgs>() == 40);
 /// mirroring `shiso_engine::launch::MulMvExtArgs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct MulMvExtArgs {
-    ne00: i32,
-    ne01: i32,
-    ne02: i32,
-    pad0: [u8; 4],
-    nb00: u64,
-    nb01: u64,
-    nb02: u64,
-    nb03: u64,
-    ne10: i32,
-    ne11: i32,
-    ne12: i32,
-    pad1: [u8; 4],
-    nb10: u64,
-    nb11: u64,
-    nb12: u64,
-    nb13: u64,
-    ne0: i32,
-    ne1: i32,
-    r2: i16,
-    r3: i16,
-    pad2: [i8; 4],
+pub(crate) struct MulMvExtArgs {
+    pub(crate) ne00: i32,
+    pub(crate) ne01: i32,
+    pub(crate) ne02: i32,
+    pub(crate) pad0: [u8; 4],
+    pub(crate) nb00: u64,
+    pub(crate) nb01: u64,
+    pub(crate) nb02: u64,
+    pub(crate) nb03: u64,
+    pub(crate) ne10: i32,
+    pub(crate) ne11: i32,
+    pub(crate) ne12: i32,
+    pub(crate) pad1: [u8; 4],
+    pub(crate) nb10: u64,
+    pub(crate) nb11: u64,
+    pub(crate) nb12: u64,
+    pub(crate) nb13: u64,
+    pub(crate) ne0: i32,
+    pub(crate) ne1: i32,
+    pub(crate) r2: i16,
+    pub(crate) r3: i16,
+    pub(crate) pad2: [i8; 4],
 }
 
 const _: () = assert!(size_of::<MulMvExtArgs>() == 112);
@@ -344,7 +344,7 @@ pub(crate) fn q8_matrix(rows: usize, width: usize) -> (Vec<BlockQ80>, Vec<f32>) 
 // -- helpers ----------------------------------------------------------------
 
 /// Launches one entry of a named module.
-fn launch(
+pub(crate) fn launch(
     gpu: &Gpu,
     module: &'static str,
     entry: &'static str,

@@ -34,6 +34,8 @@ mod dense_ssm_moe;
 mod dense_vision;
 #[path = "dit_kernels.rs"]
 mod dit_kernels;
+#[path = "generic_q8.rs"]
+mod generic_q8;
 #[path = "metal_kernels.rs"]
 mod metal_kernels;
 #[path = "q35_attn.rs"]
