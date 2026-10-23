@@ -1486,3 +1486,54 @@ type LlamaLoad = fn(
     shiso_engine::EngineOptions,
 ) -> CoreResult<shiso_models::llama::LlamaModel>;
 const _: LlamaLoad = shiso_models::llama::LlamaModel::load;
+
+// ---------------------------------------------------------------------------
+// The CPU device.
+//
+// A plain CPU answers `None` to `max_block_threads` and exposes no optional
+// capability trait, so the engine launches the kernels listed below by name.
+// The table was measured by wrapping the Metal device that way and running the
+// llama Clef model through every pass it makes; a model change that reaches
+// for another entry must add it here and to `shiso-cpu` in the same commit.
+
+/// How a test opens the CPU device.
+type CpuOpen = fn(shiso_cpu::CpuOptions) -> CoreResult<std::sync::Arc<shiso_cpu::CpuBackend>>;
+const _: CpuOpen = shiso_cpu::CpuBackend::new;
+
+/// Every `(module, entry)` the engine launches for the llama Clef model on a
+/// plain device. The spec's table has 19 rows; the engine also picks the
+/// `mul_mv_ext` `r1_3`, `r1_4` and `r1_5` variants for 3-8 decode rows, which
+/// the measured 2-session batch never reached, so there are 22.
+const CPU_INVENTORY: [(&str, &str); 22] = [
+    ("generic", "kernel_get_rows_q8_0_f32"),
+    ("generic", "kernel_rms_norm_mul_f32_4"),
+    ("generic", "kernel_add_rms_norm_mul_f32_4"),
+    ("generic", "kernel_swiglu_flat_f32"),
+    ("generic", "kernel_mul_mv_q8_0_f32"),
+    ("generic", "kernel_mul_mv_ext_q8_0_f32_r1_2"),
+    ("generic", "kernel_mul_mv_ext_q8_0_f32_r1_3"),
+    ("generic", "kernel_mul_mv_ext_q8_0_f32_r1_4"),
+    ("generic", "kernel_mul_mv_ext_q8_0_f32_r1_5"),
+    ("qwen35", "kernel_mul_mm_q8_0_f32"),
+    ("dense", "kernel_dense_q_rope"),
+    ("dense", "kernel_dense_kv_rope_store"),
+    ("dense", "kernel_dense_attn_decode"),
+    ("dense", "kernel_dense_attn_prefill"),
+    ("audio", "kernel_audio_gemv_q8_0w"),
+    ("audio", "kernel_audio_gemm_q8_0w"),
+    ("audio", "kernel_audio_gemm64_q8_0w"),
+    ("audio", "kernel_audio_split_sum_f32"),
+    ("audio", "kernel_audio_layer_norm_f32"),
+    ("audio", "kernel_audio_window_attn_f32"),
+    ("audio", "kernel_audio_unary_f32"),
+    ("audio", "kernel_audio_axpy_f32"),
+];
+
+#[test]
+fn every_inventory_entry_resolves_on_the_cpu_device() {
+    let missing: Vec<_> = CPU_INVENTORY
+        .iter()
+        .filter(|(module, entry)| !shiso_cpu::has_entry(module, entry))
+        .collect();
+    assert!(missing.is_empty(), "no CPU kernel for {missing:?}");
+}

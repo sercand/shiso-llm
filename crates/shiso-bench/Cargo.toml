@@ -70,6 +70,8 @@ workspace = true
 # ends of each seam. Nothing in `src/` depends on them, which is why they sit
 # here rather than above.
 [dev-dependencies]
+# The CPU device's open call and its kernel table are pinned in tests/contracts.rs.
+shiso-cpu = { workspace = true }
 # The neutral request/response layer, which counts tokens and never names one.
 shiso-ir = { workspace = true }
 # The cache the checkpoint tier keys on token paths.
