@@ -29,10 +29,13 @@ fn group(launch: &Launch<'_>, gid: [u32; 3], out: &mut Writes) -> CoreResult<()>
     let args: MulMvArgs = launch.bytes()?;
     let ne01 = count(args.ne01, "mul_mv ne01")?;
     let nr0 = count(args.nr0, "mul_mv nr0")?;
-    if nr0 == 0 {
+    // The Metal entry ignores `args.nr0` and uses the compile-time
+    // `N_R0_Q8_0` (2). A different value would make this port own other rows
+    // than the device kernel, so it is refused rather than honoured.
+    if nr0 != 2 {
         return Err(shiso_core::CoreError::InvalidValue {
             key: "mul_mv nr0",
-            value: "0".into(),
+            value: format!("{nr0}: the kernel always takes 2 rows per group"),
         });
     }
     let ne0 = count(args.ne0, "mul_mv ne0")? as u64;

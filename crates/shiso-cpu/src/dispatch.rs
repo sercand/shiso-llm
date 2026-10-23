@@ -27,7 +27,7 @@
 
 #![expect(
     dead_code,
-    reason = "the table is empty until the kernel tasks land; each row they add uses another part of this surface"
+    reason = "`Role::InOut`, `GroupsDisjoint::No`, `Launch::{i32, f16}`, `Writes::f16` and `Launch::smem_bytes` have no kernel yet; the later kernel tasks (norm-rope, attention, audio) use them, and the unit tests here exercise them meanwhile"
 )]
 
 use std::ops::Range;

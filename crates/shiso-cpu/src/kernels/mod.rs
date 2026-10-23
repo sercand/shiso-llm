@@ -42,5 +42,20 @@ pub(crate) static TABLE: &Table = &[
         "kernel_mul_mv_ext_q8_0_f32_r1_2",
         generic::mul_mv_ext::R1_2,
     ),
+    (
+        "generic",
+        "kernel_mul_mv_ext_q8_0_f32_r1_3",
+        generic::mul_mv_ext::R1_3,
+    ),
+    (
+        "generic",
+        "kernel_mul_mv_ext_q8_0_f32_r1_4",
+        generic::mul_mv_ext::R1_4,
+    ),
+    (
+        "generic",
+        "kernel_mul_mv_ext_q8_0_f32_r1_5",
+        generic::mul_mv_ext::R1_5,
+    ),
     ("qwen35", "kernel_mul_mm_q8_0_f32", qwen35::gemm::Q8_0),
 ];
