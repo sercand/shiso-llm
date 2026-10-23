@@ -25,8 +25,10 @@ fn scale(block: &[u8]) -> f32 {
 /// `row · x` for one `Q8_0` row.
 ///
 /// Per block the quants are summed against `x` in f32 in index order, scaled
-/// by `d`, and the blocks are added in block order. That order is the contract
-/// the other devices' kernels share; do not reassociate it.
+/// by `d`, and the blocks are added in block order. This order is a CPU-internal
+/// contract, not one shared with the Metal or CUDA kernels (they reduce by
+/// simd trees): it keeps `gemm`, `gemm64` and the matvecs bit-identical to each
+/// other. Do not reassociate it.
 pub(crate) fn q8_row_dot(row: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(row.len(), x.len() / QK8_0 * BLOCK_Q8_0_BYTES);
     let mut acc = 0.0f32;

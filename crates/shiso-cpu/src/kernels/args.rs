@@ -1,14 +1,14 @@
 //! `#[repr(C)]` mirrors of the kernels' argument blocks.
 //!
 //! The engine and model crates own the originals; this crate may not depend on
-//! them, so each block is copied field for field and its size pinned. A field
-//! added on one side only would shift every later field and a kernel would read
-//! a plausible, wrong geometry; `contracts.rs` in `shiso-bench` is where the
-//! two sides are compared.
+//! them, so each block is copied field for field and its size pinned. The size
+//! pins are the only automatic guard, and a same-size reorder or retype passes
+//! them: any edit to `crates/shiso-engine/src/launch.rs` or
+//! `crates/shiso-models/src/audio_ops/args.rs` must be mirrored here by hand.
 
 use bytemuck::{Pod, Zeroable};
 
-/// Engine `GetRowsArgs`.
+/// Mirror of `GetRowsArgs` in `crates/shiso-engine/src/launch.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct GetRowsArgs {
@@ -29,7 +29,7 @@ pub(crate) struct GetRowsArgs {
 }
 const _: () = assert!(size_of::<GetRowsArgs>() == 40);
 
-/// Engine `NormArgs`.
+/// Mirror of `NormArgs` in `crates/shiso-engine/src/launch.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct NormArgs {
@@ -60,7 +60,7 @@ pub(crate) struct NormArgs {
 }
 const _: () = assert!(size_of::<NormArgs>() == 144);
 
-/// Engine `GluArgs`.
+/// Mirror of `GluArgs` in `crates/shiso-engine/src/launch.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct GluArgs {
@@ -93,7 +93,7 @@ pub(crate) struct GluArgs {
 }
 const _: () = assert!(size_of::<GluArgs>() == 64);
 
-/// Engine `MulMvArgs`.
+/// Mirror of `MulMvArgs` in `crates/shiso-engine/src/launch.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct MulMvArgs {
@@ -142,7 +142,7 @@ pub(crate) struct MulMvArgs {
 }
 const _: () = assert!(size_of::<MulMvArgs>() == 112);
 
-/// Engine `MulMvExtArgs`.
+/// Mirror of `MulMvExtArgs` in `crates/shiso-engine/src/launch.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct MulMvExtArgs {
@@ -191,7 +191,7 @@ pub(crate) struct MulMvExtArgs {
 }
 const _: () = assert!(size_of::<MulMvExtArgs>() == 112);
 
-/// Engine `MulMmArgs`.
+/// Mirror of `MulMmArgs` in `crates/shiso-engine/src/launch.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct MulMmArgs {
@@ -230,7 +230,7 @@ pub(crate) struct MulMmArgs {
 }
 const _: () = assert!(size_of::<MulMmArgs>() == 88);
 
-/// Engine `DenseQNormRopeArgs`.
+/// Mirror of `DenseQNormRopeArgs` in `crates/shiso-engine/src/launch.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct DenseQNormRopeArgs {
@@ -251,7 +251,7 @@ pub(crate) struct DenseQNormRopeArgs {
 }
 const _: () = assert!(size_of::<DenseQNormRopeArgs>() == 28);
 
-/// Engine `DenseKvNormRopeArgs`.
+/// Mirror of `DenseKvNormRopeArgs` in `crates/shiso-engine/src/launch.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct DenseKvNormRopeArgs {
@@ -278,7 +278,7 @@ pub(crate) struct DenseKvNormRopeArgs {
 }
 const _: () = assert!(size_of::<DenseKvNormRopeArgs>() == 40);
 
-/// Engine `DenseAttnArgs`.
+/// Mirror of `DenseAttnArgs` in `crates/shiso-engine/src/launch.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct DenseAttnArgs {
@@ -301,7 +301,7 @@ pub(crate) struct DenseAttnArgs {
 }
 const _: () = assert!(size_of::<DenseAttnArgs>() == 32);
 
-/// Audio `GemmArgs`.
+/// Mirror of `GemmArgs` in `crates/shiso-models/src/audio_ops/args.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct AudioGemmArgs {
@@ -320,7 +320,7 @@ pub(crate) struct AudioGemmArgs {
 }
 const _: () = assert!(size_of::<AudioGemmArgs>() == 24);
 
-/// Audio `NormArgs`.
+/// Mirror of `NormArgs` in `crates/shiso-models/src/audio_ops/args.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct AudioNormArgs {
@@ -335,7 +335,7 @@ pub(crate) struct AudioNormArgs {
 }
 const _: () = assert!(size_of::<AudioNormArgs>() == 16);
 
-/// Audio `WindowAttnArgs`.
+/// Mirror of `WindowAttnArgs` in `crates/shiso-models/src/audio_ops/args.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct WindowAttnArgs {
@@ -374,7 +374,7 @@ pub(crate) struct WindowAttnArgs {
 }
 const _: () = assert!(size_of::<WindowAttnArgs>() == 64);
 
-/// Audio `UnaryArgs`.
+/// Mirror of `UnaryArgs` in `crates/shiso-models/src/audio_ops/args.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct UnaryArgs {
@@ -389,7 +389,7 @@ pub(crate) struct UnaryArgs {
 }
 const _: () = assert!(size_of::<UnaryArgs>() == 16);
 
-/// Audio `AxpyArgs`.
+/// Mirror of `AxpyArgs` in `crates/shiso-models/src/audio_ops/args.rs`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct AxpyArgs {
