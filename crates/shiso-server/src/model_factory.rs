@@ -45,10 +45,12 @@ use shiso_engine::ckpt::Checkpointed;
 use shiso_engine::sparse::capture;
 use shiso_engine::sparse::mtp::SpecDepth;
 use shiso_engine::sparse::stack::SparseOptions;
+use shiso_models::clef::ClefBackbone;
 use shiso_models::gemma4::{
     Gemma4AudioTower, Gemma4Config, Gemma4Model, Gemma4Tower, PleOptions, holds_audio_tower,
 };
 use shiso_models::lfm2::{Lfm2Config, Lfm2Model, Lfm2Tower};
+use shiso_models::llama::{LlamaConfig, LlamaModel};
 use shiso_models::nemotron_h::{NemotronHConfig, NemotronHModel};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::mtp::{self, AffineQuant, MtpManifest};
@@ -286,6 +288,17 @@ impl FamilyDefaults {
         speculates: false,
     };
 
+    /// Family defaults for the dense llama family, served for its Clef head:
+    /// its template writes no reasoning tags and no tool calls.
+    pub const LLAMA: Self = Self {
+        reasoning: ReasoningScheme::None,
+        tools: ToolCallScheme::None,
+        thinking_default: false,
+        effort: EffortSpelling::STANDARD,
+        // No draft head exists for this family.
+        speculates: false,
+    };
+
     /// Family defaults for Gemma 4 models.
     pub const GEMMA4: Self = Self {
         reasoning: ReasoningScheme::Gemma4,
@@ -340,6 +353,9 @@ impl FamilyDefaults {
         }
         if Lfm2Config::describes(config) {
             return Ok(Self::LFM2);
+        }
+        if LlamaConfig::describes(config) {
+            return Ok(Self::LLAMA);
         }
         Err(FactoryError::UnknownArchitecture {
             model_type: config.model_type().to_owned(),
@@ -483,6 +499,7 @@ pub fn load_model(
     // the same error the fallthrough at the end would have produced.
     let defaults = FamilyDefaults::for_config(config)?;
     refuse_kv_dtype(args, config)?;
+    refuse_clef_mismatch(path, config)?;
 
     // Before any arm, because this is the one speculative question that can be
     // answered from the document alone - and because the answer is a refusal
@@ -665,6 +682,45 @@ fn refuse_kv_dtype(args: &ServeArgs, config: &HfConfig) -> Result<(), FactoryErr
     }))
 }
 
+/// Refuses a Clef GGUF whose backbone is not the one the document names.
+///
+/// Every Clef GGUF declares the architecture `clef`, whatever backbone it
+/// carries, so the container alone cannot pick an arm and the document alone
+/// cannot either: a `config.json` copied from the wrong checkpoint would send a
+/// dense backbone to the hybrid's loader, which would fail on the first
+/// recurrent tensor it looks for - or worse, the other way round. The backbone
+/// is read from the tensors ([`ClefBackbone`]) and has to be the family the
+/// document names, before any arm is tried.
+///
+/// # Errors
+///
+/// [`FactoryError::Load`] carrying [`CoreError::InvalidValue`] when the two
+/// disagree, and whatever reading the container's tensor directory reports.
+fn refuse_clef_mismatch(path: &Path, config: &HfConfig) -> Result<(), FactoryError> {
+    let Some(backbone) = ClefBackbone::at(path).map_err(FactoryError::Load)? else {
+        return Ok(());
+    };
+    let named = match backbone {
+        ClefBackbone::Qwen35 => !matches!(
+            Qwen35Config::from_hf(config),
+            Err(CoreError::UnknownArch { .. })
+        ),
+        ClefBackbone::Llama => LlamaConfig::describes(config),
+    };
+    if named {
+        return Ok(());
+    }
+    Err(FactoryError::Load(CoreError::InvalidValue {
+        key: "config.json model_type",
+        value: format!(
+            "{:?} names another family than the {backbone:?} backbone the clef container at {} \
+             carries",
+            config.model_type(),
+            path.display()
+        ),
+    }))
+}
+
 /// The arms tried after the Gemma 4 one, and the refusal when none of them
 /// recognises the document either.
 ///
@@ -690,6 +746,22 @@ fn load_last_arms(
     // document's against them, so its reader takes the checkpoint too.
     if Lfm2Config::describes(config) {
         return load_lfm2(backend, path, config, opts, defaults);
+    }
+
+    // The dense llama family, which this build serves from a Clef container
+    // only; its reader refuses any other, so its config takes the checkpoint.
+    if LlamaConfig::describes(config) {
+        let family = LlamaConfig::from_hf(config, path).map_err(FactoryError::Load)?;
+        let model = LlamaModel::load(backend, path, &family, opts).map_err(FactoryError::Load)?;
+        return Ok(Loaded {
+            model: Box::new(model),
+            open_tower: open_no_tower,
+            open_audio: no_audio_tower,
+            // The template writes no media marker; the placement is only what
+            // a renderer is configured with.
+            placement: MediaPlacement::QWEN35,
+            defaults,
+        });
     }
 
     Err(FactoryError::UnknownArchitecture {
@@ -1350,11 +1422,52 @@ pub fn recognises(config: &HfConfig) -> bool {
         || Qwen4ExpConfig::describes(config)
         || Gemma4Config::describes(config)
         || Lfm2Config::describes(config)
+        || LlamaConfig::describes(config)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FactoryError, sparse_prefill_rows};
+    use super::{
+        FactoryError, FamilyDefaults, recognises, refuse_clef_mismatch, sparse_prefill_rows,
+    };
+    use shiso_core::{CoreError, HfConfig};
+
+    fn document(model_type: &str) -> HfConfig {
+        HfConfig::from_json_str(&format!(r#"{{"model_type":"{model_type}"}}"#))
+            .expect("the document parses")
+    }
+
+    #[test]
+    fn a_llama_document_is_served_with_the_llama_defaults() {
+        let llama = document("llama");
+        assert!(recognises(&llama));
+        assert_eq!(
+            FamilyDefaults::for_config(&llama).expect("recognised"),
+            FamilyDefaults::LLAMA
+        );
+    }
+
+    /// The released Clef container over a dense backbone, against a document
+    /// that names its family and one that names the hybrid's.
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "a test that needs a checkpoint says on stderr why it skipped"
+    )]
+    fn a_clef_container_must_match_the_family_its_document_names() {
+        let Some(path) = std::env::var_os("SHISO_TEST_MODEL_CLEF_LLAMA") else {
+            eprintln!("SKIP: SHISO_TEST_MODEL_CLEF_LLAMA is not set");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        refuse_clef_mismatch(&path, &document("llama")).expect("the document names its backbone");
+        let refused = refuse_clef_mismatch(&path, &document("qwen3_5_text"));
+        assert!(
+            matches!(&refused, Err(FactoryError::Load(CoreError::InvalidValue { value, .. }))
+                if value.contains("Llama")),
+            "{refused:?}"
+        );
+    }
 
     #[test]
     fn a_prefill_width_past_the_widest_sparse_pass_is_refused_at_boot() {
