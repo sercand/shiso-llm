@@ -5,6 +5,7 @@
 //! an entry without a row is `Unsupported`, never a silent no-op.
 
 mod args;
+mod dense;
 mod generic;
 mod qwen35;
 
@@ -57,5 +58,13 @@ pub(crate) static TABLE: &Table = &[
         "kernel_mul_mv_ext_q8_0_f32_r1_5",
         generic::mul_mv_ext::R1_5,
     ),
+    ("dense", "kernel_dense_q_rope", dense::norm_rope::Q_ROPE),
+    (
+        "dense",
+        "kernel_dense_kv_rope_store",
+        dense::norm_rope::KV_ROPE_STORE,
+    ),
+    ("dense", "kernel_dense_attn_decode", dense::attn::DECODE),
+    ("dense", "kernel_dense_attn_prefill", dense::attn::PREFILL),
     ("qwen35", "kernel_mul_mm_q8_0_f32", qwen35::gemm::Q8_0),
 ];

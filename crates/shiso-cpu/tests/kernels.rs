@@ -40,4 +40,9 @@ cpu_cases!(
     generic::rows_q8::the_q8_0_ext_matvec_matches_the_oracle_dot_at_every_row_count,
     generic::product::the_q8_0_decode_matvec_matches_the_oracle_dot,
     generic::product::the_q8_0_prefill_gemm_matches_a_triple_loop,
+    dense::attn::rope_without_a_norm_rotates_the_raw_head,
+    dense::attn::the_rope_only_store_keeps_the_value_raw,
+    dense::attn::window_and_bound_select_the_keys,
+    dense::attn::scale_is_an_argument,
+    dense::attn::an_empty_span_contributes_zeros_rather_than_nan,
 );
