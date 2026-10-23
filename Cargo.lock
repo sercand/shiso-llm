@@ -2690,6 +2690,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shiso-cpu"
+version = "0.2.4"
+dependencies = [
+ "bytemuck",
+ "half",
+ "shiso-core",
+ "shiso-kerneltest",
+ "sysinfo",
+ "tracing",
+]
+
+[[package]]
 name = "shiso-cuda"
 version = "0.2.4"
 dependencies = [
