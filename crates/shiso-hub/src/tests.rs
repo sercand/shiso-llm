@@ -9,14 +9,14 @@ use tempfile::tempdir;
 
 use crate::config::{HfToken, HubConfig, RegistryEndpoint};
 use crate::error::HubError;
-use crate::host::{Backend, CudaInfo, HostProfile, MetalInfo};
+use crate::host::{Backend, CudaInfo, HostProfile, MetalInfo, ServingDevice};
 use crate::recipe::{
     CURRENT_SCHEMA_VERSION, CommitSha, Component, FileEntry, HUB_FILE_MAX_BYTES, HostConstraints,
     KvCacheDtype, ModalCapabilities, Modality, ModelName, ModelRef, Provider, Recipe,
     RecipeFeatures, Requirements, Role, ServerDefaults, Sha256, Task, Variant, VariantKey,
     hub_file_name_ok,
 };
-use crate::select::select_variant;
+use crate::select::{fits_host, select_variant};
 use crate::store::BlobStore;
 use crate::validate::{ValidationMode, validate_recipe};
 
@@ -153,6 +153,7 @@ fn model_ref_parsing() {
 fn variant_selection_metal_host() {
     let recipe = make_test_recipe();
     let host = HostProfile {
+        device: ServingDevice::Gpu,
         backends: vec![Backend::Metal],
         ram_bytes: 32 * 1024 * 1024 * 1024,
         cuda: None,
@@ -168,6 +169,7 @@ fn variant_selection_metal_host() {
 fn variant_selection_cuda_host() {
     let recipe = make_test_recipe();
     let host = HostProfile {
+        device: ServingDevice::Gpu,
         backends: vec![Backend::Cuda],
         ram_bytes: 64 * 1024 * 1024 * 1024,
         cuda: Some(CudaInfo {
@@ -185,6 +187,7 @@ fn variant_selection_cuda_host() {
 fn variant_selection_cuda_sm_insufficient() {
     let recipe = make_test_recipe();
     let host = HostProfile {
+        device: ServingDevice::Gpu,
         backends: vec![Backend::Cuda],
         ram_bytes: 64 * 1024 * 1024 * 1024,
         cuda: Some(CudaInfo {
@@ -207,6 +210,7 @@ fn variant_selection_cuda_sm_insufficient() {
 fn variant_selection_explicit_key_overcommit_warning() {
     let recipe = make_test_recipe();
     let host = HostProfile {
+        device: ServingDevice::Gpu,
         backends: vec![Backend::Metal],
         ram_bytes: 4 * 1024 * 1024 * 1024, // 4GB RAM, variant needs 8GB
         cuda: None,
@@ -344,6 +348,7 @@ fn multi_backend_variant_selects_on_either_host_and_skips_cuda_checks_on_metal()
     });
 
     let mac = HostProfile {
+        device: ServingDevice::Gpu,
         backends: vec![Backend::Metal],
         cuda: None,
         ram_bytes: 64 * 1024 * 1024 * 1024,
@@ -356,6 +361,7 @@ fn multi_backend_variant_selects_on_either_host_and_skips_cuda_checks_on_metal()
     select_variant(&recipe, &mac, None).unwrap();
 
     let old_gpu = HostProfile {
+        device: ServingDevice::Gpu,
         backends: vec![Backend::Cuda],
         cuda: Some(CudaInfo {
             sm: 89,
@@ -493,6 +499,7 @@ fn metal_family_and_working_set_gate_selection() {
     let mut recipe = make_test_recipe();
     recipe.variants.truncate(1);
     let mac = HostProfile {
+        device: ServingDevice::Gpu,
         backends: vec![Backend::Metal],
         cuda: None,
         ram_bytes: 64 * 1024 * 1024 * 1024,
@@ -1086,5 +1093,90 @@ fn hub_file_names_are_plain_url_and_git_safe() {
         "a\tb",
     ] {
         assert!(!hub_file_name_ok(bad), "{bad:?}");
+    }
+}
+
+/// The published `smollm2-135m-decision` shape: one Metal-only variant.
+fn metal_only_recipe(mutate: impl FnOnce(&mut Variant)) -> Recipe {
+    let mut recipe = make_test_recipe();
+    recipe.variants.truncate(1);
+    let variant = &mut recipe.variants[0];
+    variant.key = VariantKey::parse("q8_0").unwrap();
+    variant.backends = vec![Backend::Metal];
+    variant.quant = "Q8_0".to_string();
+    variant.requires = None;
+    variant.requirements = Requirements {
+        min_ram_bytes: 2 * 1024 * 1024 * 1024,
+        recommended_ram_bytes: Some(4 * 1024 * 1024 * 1024),
+        min_vram_bytes: None,
+        disk_bytes: 176_100_588,
+    };
+    mutate(variant);
+    recipe
+}
+
+fn cpu_host(ram_gib: u64) -> HostProfile {
+    let mut host = HostProfile::probe(vec![], None, None).on(ServingDevice::Cpu);
+    host.ram_bytes = ram_gib * 1024 * 1024 * 1024;
+    host
+}
+
+#[test]
+fn a_cpu_host_takes_a_metal_only_variant() {
+    let recipe = metal_only_recipe(|_| {});
+    let selected = select_variant(&recipe, &cpu_host(8), None).unwrap();
+    assert_eq!(selected.variant.key.as_str(), "q8_0");
+    assert!(selected.explanation.contains("on the CPU device"));
+    // The same recipe on a GPU host with no backend is still refused.
+    let gpu = HostProfile::probe(vec![], None, None);
+    assert!(select_variant(&recipe, &gpu, None).is_err());
+}
+
+#[test]
+fn a_cpu_host_still_applies_ram_fit() {
+    let recipe = metal_only_recipe(|_| {});
+    match select_variant(&recipe, &cpu_host(1), None).unwrap_err() {
+        HubError::NoCompatibleVariant { reasons, .. } => {
+            assert!(reasons.contains("RAM"), "{reasons}");
+        }
+        other => panic!("expected NoCompatibleVariant, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_cpu_host_skips_metal_family_and_cuda_sm() {
+    let recipe = metal_only_recipe(|v| {
+        v.requires = Some(HostConstraints {
+            min_cuda_sm: Some(89),
+            min_metal_family: Some(9),
+        });
+        v.requirements.min_vram_bytes = Some(48 * 1024 * 1024 * 1024);
+    });
+    let selected = select_variant(&recipe, &cpu_host(8), None).unwrap();
+    assert_eq!(selected.variant.key.as_str(), "q8_0");
+}
+
+#[test]
+fn a_cpu_host_takes_an_explicit_key_without_gpu_checks() {
+    let recipe = metal_only_recipe(|v| {
+        v.requires = Some(HostConstraints {
+            min_cuda_sm: Some(89),
+            min_metal_family: Some(9),
+        });
+    });
+    let key = VariantKey::parse("q8_0").unwrap();
+    let selected = select_variant(&recipe, &cpu_host(8), Some(&key)).unwrap();
+    assert_eq!(selected.variant.key.as_str(), "q8_0");
+    assert!(selected.warning.is_none());
+}
+
+#[test]
+fn fits_host_is_true_for_every_variant_on_cpu() {
+    let recipe = make_test_recipe();
+    let cpu = cpu_host(1);
+    let gpu = HostProfile::probe(vec![], None, None);
+    for variant in &recipe.variants {
+        assert!(fits_host(variant, &cpu));
+        assert!(!fits_host(variant, &gpu));
     }
 }

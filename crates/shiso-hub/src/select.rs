@@ -1,7 +1,7 @@
 //! Hardware-aware variant selection (§5.4).
 
 use crate::error::HubError;
-use crate::host::{Backend, HostProfile, MetalInfo};
+use crate::host::{Backend, HostProfile, MetalInfo, ServingDevice};
 use crate::recipe::{Recipe, Variant, VariantKey};
 use std::fmt::Write;
 
@@ -92,9 +92,9 @@ pub fn select_variant<'a>(
             return Ok(SelectedVariant {
                 variant: candidate,
                 explanation: format!(
-                    "selected variant '{}' (backends {}, quant '{}') fitting recommended RAM ({} MB)",
+                    "selected variant '{}' ({}, quant '{}') fitting recommended RAM ({} MB)",
                     candidate.key.as_str(),
-                    backend_list(candidate),
+                    where_it_runs(candidate, host),
                     candidate.quant,
                     rec / (1024 * 1024)
                 ),
@@ -107,13 +107,21 @@ pub fn select_variant<'a>(
     Ok(SelectedVariant {
         variant: first,
         explanation: format!(
-            "selected variant '{}' (backends {}, quant '{}') as best available fit",
+            "selected variant '{}' ({}, quant '{}') as best available fit",
             first.key.as_str(),
-            backend_list(first),
+            where_it_runs(first, host),
             first.quant
         ),
         warning: None,
     })
+}
+
+/// The explanation's account of where the variant runs.
+fn where_it_runs(variant: &Variant, host: &HostProfile) -> String {
+    match host.device {
+        ServingDevice::Cpu => "on the CPU device".to_owned(),
+        ServingDevice::Gpu => format!("backends {}", backend_list(variant)),
+    }
 }
 
 fn backend_list(variant: &Variant) -> String {
@@ -141,11 +149,31 @@ pub fn host_backend(variant: &Variant, host: &HostProfile) -> Result<Backend, St
         })
 }
 
+/// Whether `variant` can run on `host` at all: a backend the host has, or any
+/// variant on the CPU device. The coarse answer `shiso list` prints; the
+/// selection itself also weighs memory.
+#[must_use]
+pub fn fits_host(variant: &Variant, host: &HostProfile) -> bool {
+    backends_fit_host(&variant.backends, host)
+}
+
+/// [`fits_host`] for a registry index row, which carries a variant's backends
+/// but not its recipe.
+#[must_use]
+pub fn backends_fit_host(backends: &[Backend], host: &HostProfile) -> bool {
+    host.device == ServingDevice::Cpu || backends.iter().any(|b| host.backends.contains(b))
+}
+
 fn check_hard_constraints(
     variant: &Variant,
     host: &HostProfile,
     model_name: &str,
 ) -> Result<(), HubError> {
+    // The CPU runs every variant's weights; there is no backend, SM or family
+    // to check, and RAM is only a warning for an explicit key.
+    if host.device == ServingDevice::Cpu {
+        return Ok(());
+    }
     let target_backend =
         host_backend(variant, host).map_err(|reasons| HubError::NoCompatibleVariant {
             model: model_name.to_string(),
@@ -220,6 +248,9 @@ pub const fn apple_family_label(family: u32) -> &'static str {
 }
 
 fn check_candidate_variant(variant: &Variant, host: &HostProfile) -> Result<(), String> {
+    if host.device == ServingDevice::Cpu {
+        return check_ram(variant, host);
+    }
     let target_backend = host_backend(variant, host)?;
 
     if target_backend == Backend::Cuda {
@@ -263,6 +294,10 @@ fn check_candidate_variant(variant: &Variant, host: &HostProfile) -> Result<(), 
         }
     }
 
+    check_ram(variant, host)
+}
+
+fn check_ram(variant: &Variant, host: &HostProfile) -> Result<(), String> {
     if variant.requirements.min_ram_bytes > host.ram_bytes {
         return Err(format!(
             "requires {} MB RAM, host has {} MB",

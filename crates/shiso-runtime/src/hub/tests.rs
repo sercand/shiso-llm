@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use shiso_hub::{Backend, RegistryEndpoint};
+use shiso_hub::{Backend, RegistryEndpoint, ServingDevice};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -462,6 +462,17 @@ fn no_backend_is_no_device_before_any_request() {
     let result = pull_on(&host, "mini", &fx.config(), &mut |_, _| true);
     assert!(matches!(result, Err(PullError::NoDevice(_))), "{result:?}");
     assert_eq!(fx.requests(), 0);
+}
+
+/// The no-backend refusals above are the no-CPU-build case: a host serving on
+/// the CPU has no backend and still pulls, because the registry has no CPU
+/// variant and every variant is a candidate there.
+#[test]
+fn a_cpu_device_pulls_a_metal_only_variant() {
+    let fx = Fixture::new(&[]);
+    let host = HostProfile::probe(Vec::new(), None, None).on(ServingDevice::Cpu);
+    let installed = pull_on(&host, "mini", &fx.config(), &mut |_, _| true);
+    assert!(installed.is_ok(), "{:?}", installed.err());
 }
 
 #[test]
