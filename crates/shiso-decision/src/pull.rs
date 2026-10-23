@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use shiso_hub::{
-    BlobStore, Downloader, HostProfile, HubConfig, HubError, ModelName, ProgressEvent,
-    RegistryClient, Variant, select_variant,
+    BlobStore, Downloader, HostProfile, HubConfig, HubError, ModelName, ProgressEvent, Recipe,
+    RegistryClient, Sha256, Variant, select_variant,
 };
 use tokio::sync::mpsc;
 
@@ -49,7 +49,11 @@ pub struct InstalledModel {
 /// thread that may block, not from inside an async executor. `progress` runs
 /// on that thread, between the download's steps and about every 200 ms while
 /// nothing arrives, so a slow callback stalls the download and a cancel is
-/// noticed within one tick even when a connection is stalled.
+/// noticed within one tick even when a connection is stalled. `total` is 0
+/// until the registry has answered; that poll is how a cancel reaches a
+/// stalled index fetch. Installing and
+/// hashing the files run off that thread, so they do not delay a cancel; the
+/// install then finishes in the background and the call returns at once.
 ///
 /// # Errors
 ///
@@ -138,6 +142,8 @@ async fn drive(
                 }
             }
             _ = tick.tick() => {
+                // Also the cancel poll while the registry is slow, so it runs
+                // with a total of 0 until the download's size is known.
                 if !progress(tally.done(), tally.total) {
                     return Err(DecideError::Cancelled);
                 }
@@ -187,49 +193,134 @@ async fn pull(
     let variant = selected.variant;
 
     if !store.is_up_to_date(&recipe.name, &variant.key, &entry.manifest_sha256, variant) {
-        Downloader::new(config.clone())
+        let downloader = Downloader::new(config.clone());
+        downloader
             .download_variant(recipe.name.as_ref(), variant, Some(&events))
             .await
             .map_err(|error| download(&error))?;
-        store
-            .install_variant(&recipe, variant, &entry.manifest_sha256)
-            .map_err(|error| download(&error))?;
-        // The one full hash of what was installed.
-        let checked = store
-            .verify_variant(&recipe.name, &variant.key)
-            .map_err(|error| download(&error))?;
-        let bad: Vec<&str> = checked
-            .iter()
-            .filter(|(_, ok)| !ok)
-            .map(|(file, _)| file.as_str())
-            .collect();
-        if !bad.is_empty() {
-            // The next call must not take this directory for a good install,
-            // nor reuse the blobs that failed: the downloader trusts a blob's
-            // size alone.
-            let _ = std::fs::remove_dir_all(store.variant_dir(&recipe.name, &variant.key));
-            for (role, component) in &variant.components {
-                for file in &component.files {
-                    if bad.contains(&format!("{}/{}", role.as_str(), file.name).as_str()) {
-                        let blob = config
-                            .home
-                            .join("blobs")
-                            .join("sha256")
-                            .join(file.sha256.as_str());
-                        let _ = std::fs::remove_file(blob);
-                    }
-                }
-            }
-            return Err(DecideError::Download(format!(
-                "{} does not match its digest after installing",
-                bad.join(", ")
-            )));
-        }
+        // Installing and hashing are blocking file work, gigabytes of it:
+        // off the runtime's thread, so the progress tick (and a cancel) keeps
+        // running. A cancel drops the join handle, not the task: the install
+        // finishes in the background under its locks.
+        let (store, downloader) = (store.clone(), downloader.clone());
+        let (recipe, variant) = (recipe.clone(), variant.clone());
+        let manifest = entry.manifest_sha256.clone();
+        tokio::task::spawn_blocking(move || {
+            install_and_verify(&store, &downloader, &recipe, &variant, &manifest)
+        })
+        .await
+        .map_err(|error| DecideError::Download(format!("install task failed: {error}")))??;
     }
     Ok(InstalledModel {
         dir: store.variant_dir(&recipe.name, &variant.key),
         total_bytes: variant_bytes(variant),
     })
+}
+
+/// Installs `variant`, hashes it once end to end, and on a mismatch removes
+/// what must not be trusted again.
+fn install_and_verify(
+    store: &BlobStore,
+    downloader: &Downloader,
+    recipe: &Recipe,
+    variant: &Variant,
+    manifest: &Sha256,
+) -> Result<(), DecideError> {
+    store
+        .install_variant(recipe, variant, manifest)
+        .map_err(|error| download(&error))?;
+    // The one full hash of what was installed.
+    let checked = store
+        .verify_variant(&recipe.name, &variant.key)
+        .map_err(|error| download(&error))?;
+    let bad: Vec<&str> = checked
+        .iter()
+        .filter(|(_, ok)| !ok)
+        .map(|(file, _)| file.as_str())
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let mut failures = discard_bad(store, downloader, recipe, variant, &bad);
+    failures.sort();
+    let mut message = format!(
+        "{} does not match its digest after installing",
+        bad.join(", ")
+    );
+    if !failures.is_empty() {
+        message = format!(
+            "{message} (and could not be removed: {})",
+            failures.join("; ")
+        );
+    }
+    Err(DecideError::Download(message))
+}
+
+/// Removes the variant directory and the blobs in `bad` (`role/name`), so the
+/// next call neither takes the directory for a good install nor reuses the
+/// blobs: the downloader trusts a blob's size alone. Holds the variant lock
+/// and each blob's download lock while removing, as `shiso pull` and `rm`
+/// would. Returns what could not be removed, each as a printable line.
+fn discard_bad(
+    store: &BlobStore,
+    downloader: &Downloader,
+    recipe: &Recipe,
+    variant: &Variant,
+    bad: &[&str],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mut note = |what: String| {
+        tracing::warn!("{what}");
+        failures.push(what);
+    };
+    let variant_lock = store
+        .open_variant_lock(&recipe.name, &variant.key)
+        .and_then(|file| {
+            file.lock().map_err(|source| HubError::Io {
+                path: store.variant_dir(&recipe.name, &variant.key),
+                source,
+            })?;
+            Ok(file)
+        });
+    if let Err(error) = &variant_lock {
+        note(format!("variant lock: {error}"));
+    }
+    let dir = store.variant_dir(&recipe.name, &variant.key);
+    if let Err(error) = std::fs::remove_dir_all(&dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        note(format!("{}: {error}", dir.display()));
+    }
+    for (role, component) in &variant.components {
+        for file in &component.files {
+            if !bad.contains(&format!("{}/{}", role.as_str(), file.name).as_str()) {
+                continue;
+            }
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(
+                    downloader
+                        .tmp_dir()
+                        .join(format!("{}.lock", file.sha256.as_str())),
+                )
+                .and_then(|lock| lock.lock().map(|()| lock));
+            if let Err(error) = &lock {
+                note(format!("blob lock {}: {error}", file.sha256.as_str()));
+            }
+            let blob = downloader.blob_path(&file.sha256);
+            if let Err(error) = std::fs::remove_file(&blob)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                note(format!("{}: {error}", blob.display()));
+            }
+            drop(lock);
+        }
+    }
+    drop(variant_lock);
+    failures
 }
 
 /// The variant `model` would be installed as here, when it is on disk and
@@ -687,6 +778,7 @@ mod tests {
             !installed.dir.join("installed.json").exists(),
             "a failed verify leaves no install behind"
         );
+        assert!(!blob.exists(), "the blob that failed its hash is removed");
         // The next call never accepts the bad bytes: it errors or fetches them again.
         match fx.ensure("mini", &mut |_, _| true) {
             Ok(again) => assert_eq!(
