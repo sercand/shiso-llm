@@ -192,7 +192,16 @@ pub struct CudaBackend {
 /// installed.
 #[must_use]
 pub fn cuda_available() -> bool {
-    sys::nvidia::init().is_ok()
+    sys::nvidia::library_present() && sys::nvidia::init().is_ok()
+}
+
+/// Whether the CUDA driver library (libcuda) can be found on this host.
+///
+/// This is the panic-free probe: it never calls into the driver, so it is safe
+/// on a host without one. It is always `false` off Linux.
+#[must_use]
+pub fn driver_library_present() -> bool {
+    sys::nvidia::library_present()
 }
 
 impl CudaBackend {
@@ -209,8 +218,9 @@ impl CudaBackend {
     /// backend's buffers silently unreachable from the other's launches — and
     /// [`shiso_core::CoreError::Backend`] when the driver cannot be
     /// initialised, the device refuses a context, a stream or a handle, or a
-    /// kernel module is empty or unloadable in this build. On a target with no
-    /// driver, the first of those is what every call gets.
+    /// kernel module is empty or unloadable in this build. On a host with no
+    /// driver library the first of those is what every call gets; it is an
+    /// `Err`, never a panic.
     pub fn new(ordinal: u32, options: CudaOptions) -> CoreResult<Arc<Self>> {
         let device = DeviceCtx::open(ordinal)?;
         let blas = Blas::open(options.tf32)?;

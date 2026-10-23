@@ -2990,6 +2990,7 @@ dependencies = [
  "sha2",
  "shiso-audio",
  "shiso-core",
+ "shiso-cpu",
  "shiso-cuda",
  "shiso-engine",
  "shiso-hub",

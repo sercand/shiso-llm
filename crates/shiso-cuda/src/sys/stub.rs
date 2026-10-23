@@ -22,6 +22,11 @@ use super::{
     CuStream, DevicePtr, GemmCall, GemmStride, PinnedPtr, SysError, SysResult,
 };
 
+/// Whether the driver library can be found: never, on this target.
+pub(crate) fn library_present() -> bool {
+    false
+}
+
 /// Initialises the driver.
 ///
 /// # Errors

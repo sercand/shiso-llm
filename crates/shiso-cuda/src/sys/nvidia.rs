@@ -112,6 +112,17 @@ fn as_size(op: &'static str, value: u64) -> SysResult<usize> {
     })
 }
 
+/// Whether the driver library can be found on this host.
+///
+/// cudarc loads libcuda lazily and panics in `cuInit` when it is missing, so
+/// every path to the driver asks this first.
+pub(crate) fn library_present() -> bool {
+    // SAFETY: loading a library runs its initialisers; this is cudarc's
+    // documented presence query and it opens only the driver's own candidate
+    // library names.
+    unsafe { cudarc::driver::sys::is_culib_present() }
+}
+
 /// Initialises the driver.
 ///
 /// # Errors
