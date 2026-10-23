@@ -10,7 +10,7 @@ use shiso_models::lfm2::{Lfm2Config, Lfm2Model};
 
 use crate::decider::OpenDesc;
 use crate::error::DecideError;
-use crate::literal::{Markers, encode_piece};
+use crate::literal::encode_piece;
 use crate::worker::{Kind, ModelEngine};
 
 /// Opens the model in `desc` and wraps it in an engine.
@@ -205,29 +205,23 @@ fn guarded(
 #[derive(Debug)]
 pub(crate) struct PromptTokens {
     tokenizer: tokenizers::Tokenizer,
-    markers: Markers,
 }
 
 impl PromptTokens {
-    /// Reads `tokenizer.json`, and which spellings in it are markers.
+    /// Reads `tokenizer.json`.
     pub(crate) fn from_file(path: &Path) -> Result<Self, DecideError> {
         let tokenizer = tokenizers::Tokenizer::from_file(path)
             .map_err(|error| DecideError::Load(format!("reading {}: {error}", path.display())))?;
-        Ok(Self {
-            markers: Markers::of(&tokenizer),
-            tokenizer,
-        })
+        Ok(Self { tokenizer })
     }
 }
 
 impl PromptEncoder for PromptTokens {
     fn encode(&self, text: &str, literal: &[Range<usize>]) -> Result<Vec<TokenId>, CoreError> {
-        encode_piece(&self.tokenizer, &self.markers, text, literal).map_err(|source| {
-            CoreError::Backend {
-                backend: "tokenizer",
-                op: "encode",
-                source,
-            }
+        encode_piece(&self.tokenizer, text, literal).map_err(|source| CoreError::Backend {
+            backend: "tokenizer",
+            op: "encode",
+            source,
         })
     }
 }

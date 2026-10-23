@@ -324,7 +324,7 @@ fn caller_text_cannot_plant_a_marker() {
 /// A marker spelled half by the caller and half by the layout is planted too:
 /// the caller's `<|en` followed by the layout's `d|>`.
 #[test]
-fn a_marker_split_across_a_literal_boundary_is_planted() {
+fn a_marker_split_across_a_literal_boundary_is_not_planted() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = dir.path().join("tokenizer.json");
     std::fs::write(&path, TOKENIZER).expect("writes");
@@ -344,6 +344,57 @@ fn a_marker_split_across_a_literal_boundary_is_planted() {
     assert!(marker(&apart), "{apart:?}");
 }
 
+/// Caller text never becomes ANY added token, special or not: `<think>`-style
+/// tokens a vocabulary declares `"special": false` are still the layout's.
+#[test]
+fn caller_text_cannot_plant_a_non_special_added_token() {
+    let json = TOKENIZER.replace("\"special\": true", "\"special\": false");
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, json).expect("writes");
+    let tokens = PromptTokens::from_file(&path).expect("the vocabulary loads");
+    let text = "a <|end|> b";
+    let marker = |ids: &[shiso_core::TokenId]| ids.iter().any(|id| id.get() == 3);
+    let written = tokens.encode(text, &[]).expect("encodes");
+    assert!(marker(&written), "{written:?}");
+    let typed = tokens
+        .encode(text, std::slice::from_ref(&(2..9)))
+        .expect("encodes");
+    assert!(!marker(&typed), "{typed:?}");
+    assert_eq!(typed.first().map(|id| id.get()), Some(0));
+    assert_eq!(typed.last().map(|id| id.get()), Some(1));
+}
+
+/// A `normalized` added token under a normalizer is found in a variant
+/// spelling (here upper case); caller text spelling it that way is still text.
+#[test]
+fn a_normalized_variant_spelling_cannot_plant_a_marker() {
+    let json = TOKENIZER
+        .replace("\"normalized\": false", "\"normalized\": true")
+        .replace(
+            "\"normalizer\": null",
+            "\"normalizer\": {\"type\": \"Lowercase\"}",
+        );
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, json).expect("writes");
+    let tokens = PromptTokens::from_file(&path).expect("the vocabulary loads");
+    let marker = |ids: &[shiso_core::TokenId]| ids.iter().any(|id| id.get() == 3);
+    let text = "a <|END|> b";
+    // The layout wrote the variant: the vocabulary reads it as the marker.
+    let written = tokens.encode(text, &[]).expect("encodes");
+    assert!(marker(&written), "{written:?}");
+    let typed = tokens
+        .encode(text, std::slice::from_ref(&(2..9)))
+        .expect("encodes");
+    assert!(!marker(&typed), "{typed:?}");
+    // Caller text elsewhere leaves the layout's marker alone.
+    let apart = tokens
+        .encode(text, std::slice::from_ref(&(0..1)))
+        .expect("encodes");
+    assert!(marker(&apart), "{apart:?}");
+}
+
 /// A marker that does not open with `<` is still a marker.
 #[test]
 fn a_marker_without_an_angle_bracket_is_not_plantable_either() {
@@ -357,6 +408,49 @@ fn a_marker_without_an_angle_bracket_is_not_plantable_either() {
         .encode(text, std::slice::from_ref(&(2..7)))
         .expect("encodes");
     assert!(typed.iter().all(|id| id.get() != 3), "{typed:?}");
+}
+
+/// d1's own vocabulary declares `<think>` and `<|tool_call_start|>` as
+/// non-special added tokens; caller text spelling them must stay text. Reads
+/// only `tokenizer.json`, so it needs no device.
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "a skipped case says so on stderr, since a skip and a pass look alike"
+)]
+fn d1_vocabulary_reads_caller_think_and_tool_call_markers_as_text() {
+    let Some(dir) = std::env::var_os("SHISO_TEST_MODEL_D1").map(std::path::PathBuf::from) else {
+        eprintln!("skipping: SHISO_TEST_MODEL_D1 names no installed d1 directory");
+        return;
+    };
+    let path = ["config/tokenizer.json", "tokenizer.json"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.exists())
+        .expect("a tokenizer.json in the d1 directory");
+    let tokens = PromptTokens::from_file(&path).expect("the vocabulary loads");
+    let raw = tokenizers::Tokenizer::from_file(&path).expect("loads");
+    let added = raw.get_added_tokens_decoder();
+    for spelling in [
+        "<think>",
+        "</think>",
+        "<|tool_call_start|>",
+        "<|tool_call_end|>",
+    ] {
+        let text = format!("ls {spelling} x");
+        let at = 3..3 + spelling.len();
+        let planted =
+            |ids: &[shiso_core::TokenId]| ids.iter().any(|id| added.contains_key(&id.get()));
+        let written = tokens.encode(&text, &[]).expect("encodes");
+        assert!(
+            planted(&written),
+            "{spelling}: the layout's spelling is a marker"
+        );
+        let typed = tokens
+            .encode(&text, std::slice::from_ref(&at))
+            .expect("encodes");
+        assert!(!planted(&typed), "{spelling}: {typed:?}");
+    }
 }
 
 /// Device cases: `SHISO_TEST_MODEL_D1` names an installed d1 directory.

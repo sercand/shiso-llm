@@ -67,8 +67,6 @@ pub enum TokenizerError {
 #[derive(Debug)]
 pub struct Vocabulary {
     inner: tokenizers::Tokenizer,
-    /// Which spellings of `inner` are markers, read once at load.
-    markers: shiso_decision::literal::Markers,
     bos: Option<TokenId>,
 }
 
@@ -92,11 +90,7 @@ impl Vocabulary {
             .parent()
             .map(|dir| dir.join("tokenizer_config.json"))
             .and_then(|config| bos_from_config(&config, &inner));
-        Ok(Self {
-            markers: shiso_decision::literal::Markers::of(&inner),
-            inner,
-            bos,
-        })
+        Ok(Self { inner, bos })
     }
 
     /// The opening token this checkpoint puts in front of a prompt, if any.
@@ -120,11 +114,7 @@ impl Vocabulary {
     /// is exercising the same encoder a deployment does.
     #[must_use]
     pub fn from_tokenizer(inner: tokenizers::Tokenizer) -> Self {
-        Self {
-            markers: shiso_decision::literal::Markers::of(&inner),
-            inner,
-            bos: None,
-        }
+        Self { inner, bos: None }
     }
 
     /// Encodes prompt text.
@@ -240,11 +230,11 @@ impl Vocabulary {
         text: &str,
         literal: &[std::ops::Range<usize>],
     ) -> Result<Vec<TokenId>, TokenizerError> {
-        shiso_decision::literal::encode_piece(&self.inner, &self.markers, text, literal).map_err(
-            |error| TokenizerError::Encode {
+        shiso_decision::literal::encode_piece(&self.inner, text, literal).map_err(|error| {
+            TokenizerError::Encode {
                 message: error.to_string(),
-            },
-        )
+            }
+        })
     }
 
     /// Encodes `text` as [`Self::encode`] does, and says where in it the
