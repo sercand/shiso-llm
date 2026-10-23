@@ -138,3 +138,91 @@ kernel void kernel_dense_kv_norm_rope_store(
         v_cache[slot + i] = half(s_row[i] * vinv);
     }
 }
+
+// -- rotation without a norm -------------------------------------------------
+//
+// The pair below is the two kernels above with the per-head norm taken out,
+// for a family whose attention rotates its queries and keys and normalizes
+// neither.  A unit weight on the kernels above is NOT this: their division by
+// the head's root mean square is unconditional, and a unit weight only removes
+// the multiply after it.
+//
+// The argument blocks are the norm pair's, with `eps` unread and `v_norm`
+// unread: a slot that normalizes nothing has no epsilon, and the engine
+// refuses a value norm on a slot without the key norm whose mean square it
+// would share.  The staging row is the same width, so the launches ask for the
+// same threadgroup memory.
+
+/// The query half: rotate one head and store it.
+///
+/// One threadgroup per (head, token), the head staged in threadgroup memory
+/// for the same reason as `kernel_dense_q_norm_rope`: a pair's two dimensions
+/// belong to different lanes.
+kernel void kernel_dense_q_rope(
+        constant dense_args_q_norm_rope & args [[buffer(0)]],
+        device float *q_out [[buffer(1)]],
+        device const float *q_in [[buffer(2)]],
+        device const int32_t *pos [[buffer(3)]],
+        threadgroup float *tbuf [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    const uint head_dim = args.head_dim;
+    const uint t = tgpig.y;
+    const uint h = tgpig.x;
+    const uint tid = tpitg.x;
+    const uint nt = ntg.x;
+    const uint64_t base = ((uint64_t) t * args.n_head + h) * head_dim;
+
+    threadgroup float *s_q = tbuf + DENSE_BLOCK_SUM_SLOTS;
+    for (uint i = tid; i < head_dim; i += nt) {
+        s_q[i] = q_in[base + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    dense_rope_pairs(s_q, args.n_rot, args.freq_dims, args.rope_base,
+            (float) (uint32_t) pos[t], tid, nt);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < head_dim; i += nt) {
+        q_out[base + i] = s_q[i];
+    }
+}
+
+/// The key/value half: rotate the key, and write it and the raw value into the
+/// f16 cache row the page table names.
+kernel void kernel_dense_kv_rope_store(
+        constant dense_args_kv_norm_rope & args [[buffer(0)]],
+        device half *k_cache [[buffer(1)]],
+        device half *v_cache [[buffer(2)]],
+        device const float *k_in [[buffer(3)]],
+        device const float *v_in [[buffer(4)]],
+        device const int32_t *pos [[buffer(5)]],
+        device const int32_t *pages [[buffer(6)]],
+        threadgroup float *tbuf [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    const uint head_dim = args.head_dim;
+    const uint t = tgpig.y;
+    const uint h = tgpig.x;
+    const uint tid = tpitg.x;
+    const uint nt = ntg.x;
+    const uint64_t row = dense_kv_row(dense_row_pages(pages, t, args.page_stride),
+                                      (uint32_t) pos[t], args.page_tokens);
+    const uint64_t src = ((uint64_t) t * args.n_head_kv + h) * head_dim;
+    const uint64_t slot = ((uint64_t) row * args.n_head_kv + h) * head_dim;
+
+    threadgroup float *s_row = tbuf + DENSE_BLOCK_SUM_SLOTS;
+    for (uint i = tid; i < head_dim; i += nt) {
+        s_row[i] = k_in[src + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    dense_rope_pairs(s_row, args.n_rot, args.freq_dims, args.rope_base,
+            (float) (uint32_t) pos[t], tid, nt);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The value never touches the staging row, so it is stored in the same
+    // loop as the key.
+    for (uint i = tid; i < head_dim; i += nt) {
+        k_cache[slot + i] = half(s_row[i]);
+        v_cache[slot + i] = half(v_in[src + i]);
+    }
+}

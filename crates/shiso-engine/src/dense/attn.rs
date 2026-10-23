@@ -192,6 +192,110 @@ fn kv_store_plain(
     .map_err(|err| launch::launch_failure(NAME, err))
 }
 
+/// Rotates the query, for a slot that rotates and normalizes nothing.
+fn q_rope(
+    backend: &dyn Backend,
+    geometry: &AttnGeometry,
+    scratch: &AttnScratch,
+    pos: DeviceView<'_>,
+    n_tok: u32,
+) -> CoreResult<()> {
+    const NAME: &str = "kernel_dense_q_rope";
+    // The norm pair's block; the kernel leaves `eps` unread.
+    let args = DenseQNormRopeArgs {
+        head_dim: geometry.head_dim,
+        n_head: geometry.n_head,
+        n_rot: geometry.n_rot,
+        freq_dims: geometry.freq_dims,
+        n_tok,
+        rope_base: geometry.rope_base,
+        eps: 0.0,
+    };
+    launch::run(
+        backend,
+        KernelRef::new(DENSE, NAME),
+        Extent3::new(geometry.n_head, n_tok, 1),
+        Extent3::new(BLOCK_128, 1, 1),
+        DENSE_NORM_ROPE_SMEM_BYTES,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(scratch.q.view()),
+            KernelArg::Buffer(scratch.qkv.view()),
+            KernelArg::Buffer(pos),
+        ],
+    )
+    .map_err(|err| launch::launch_failure(NAME, err))
+}
+
+/// Rotates the keys and writes them and the raw values into the cache, for a
+/// slot that rotates and normalizes nothing.
+fn kv_rope_store(
+    backend: &dyn Backend,
+    geometry: &AttnGeometry,
+    scratch: &AttnScratch,
+    cache: &AttnCache<'_>,
+    pos: DeviceView<'_>,
+    n_tok: u32,
+) -> CoreResult<()> {
+    const NAME: &str = "kernel_dense_kv_rope_store";
+    // The norm pair's block; the kernel leaves `eps` and `v_norm` unread, and
+    // the set's validation refuses a value norm on a slot like this one.
+    let args = DenseKvNormRopeArgs {
+        head_dim: geometry.head_dim,
+        n_head_kv: geometry.n_head_kv,
+        n_rot: geometry.n_rot,
+        freq_dims: geometry.freq_dims,
+        n_tok,
+        rope_base: geometry.rope_base,
+        eps: 0.0,
+        page_tokens: geometry.page_tokens,
+        v_norm: 0,
+        page_stride: cache.pages.stride(),
+    };
+    launch::run(
+        backend,
+        KernelRef::new(DENSE, NAME),
+        Extent3::new(geometry.n_head_kv, n_tok, 1),
+        Extent3::new(BLOCK_128, 1, 1),
+        DENSE_NORM_ROPE_SMEM_BYTES,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(cache.k),
+            KernelArg::Buffer(cache.v),
+            KernelArg::Buffer(scratch.k.view()),
+            KernelArg::Buffer(scratch.v.view()),
+            KernelArg::Buffer(pos),
+            KernelArg::Buffer(cache.pages.table()),
+        ],
+    )
+    .map_err(|err| launch::launch_failure(NAME, err))
+}
+
+/// What a slot does to its query and key heads before the softmax reads them.
+///
+/// Two independent facts of the slot's shape - whether it normalizes
+/// ([`AttnGeometry::qk_norm`]) and whether it rotates (`n_rot` above zero) -
+/// read once, so the query and the key half cannot take different branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadPrep {
+    /// A weighted per-head norm, then the rotation over `n_rot` dimensions.
+    NormRope,
+    /// The rotation alone.
+    Rope,
+    /// Neither: the projections are stored and read as they came out.
+    Plain,
+}
+
+impl HeadPrep {
+    const fn of(geometry: &AttnGeometry) -> Self {
+        match (geometry.qk_norm, geometry.n_rot) {
+            (true, _) => Self::NormRope,
+            (false, 0) => Self::Plain,
+            (false, _) => Self::Rope,
+        }
+    }
+}
+
 /// Projects the keys and values of `n_tok` rows and writes them into the
 /// cache, through the store the slot's shape names.
 fn project_and_store(
@@ -202,7 +306,7 @@ fn project_and_store(
     cache: &AttnCache<'_>,
     rows: StoreRows<'_>,
 ) -> CoreResult<()> {
-    if geometry.qk_norm {
+    if HeadPrep::of(geometry) == HeadPrep::NormRope {
         let (k_proj, v_proj, k_norm) = attn.kv()?;
         projection::projections(
             backend,
@@ -210,17 +314,20 @@ fn project_and_store(
             rows.input,
             &[(k_proj, scratch.k.view()), (v_proj, scratch.v.view())],
         )?;
-        kv_norm_rope_store(
+        return kv_norm_rope_store(
             backend, k_norm, geometry, scratch, cache, rows.pos, rows.n_tok,
-        )
+        );
+    }
+    let (k_proj, v_proj) = attn.kv_plain()?;
+    projection::projections(
+        backend,
+        rows.n_tok,
+        rows.input,
+        &[(k_proj, scratch.k.view()), (v_proj, scratch.v.view())],
+    )?;
+    if HeadPrep::of(geometry) == HeadPrep::Rope {
+        kv_rope_store(backend, geometry, scratch, cache, rows.pos, rows.n_tok)
     } else {
-        let (k_proj, v_proj) = attn.kv_plain()?;
-        projection::projections(
-            backend,
-            rows.n_tok,
-            rows.input,
-            &[(k_proj, scratch.k.view()), (v_proj, scratch.v.view())],
-        )?;
         kv_store_plain(backend, geometry, scratch, cache, rows.pos, rows.n_tok)
     }
 }
@@ -397,13 +504,20 @@ pub fn run(
     n_tok: u32,
 ) -> CoreResult<()> {
     let pos = linear_positions(io.pos)?;
-    if geometry.qk_norm {
-        projection::projection(backend, &attn.q, n_tok, io.input, scratch.qkv.view())?;
-        q_norm_rope(backend, attn, geometry, scratch, pos, n_tok)?;
-    } else {
+    match HeadPrep::of(geometry) {
+        HeadPrep::NormRope => {
+            projection::projection(backend, &attn.q, n_tok, io.input, scratch.qkv.view())?;
+            q_norm_rope(backend, attn, geometry, scratch, pos, n_tok)?;
+        }
+        HeadPrep::Rope => {
+            projection::projection(backend, &attn.q, n_tok, io.input, scratch.qkv.view())?;
+            q_rope(backend, geometry, scratch, pos, n_tok)?;
+        }
         // Nothing to do to the query, so the projection writes where the
         // softmax reads.
-        projection::projection(backend, &attn.q, n_tok, io.input, scratch.q.view())?;
+        HeadPrep::Plain => {
+            projection::projection(backend, &attn.q, n_tok, io.input, scratch.q.view())?;
+        }
     }
     // A shared-cache slot launches neither projection nor store: the runs its
     // `cache` names are the owner's, already filled earlier in this same pass.

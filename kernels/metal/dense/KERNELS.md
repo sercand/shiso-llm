@@ -52,6 +52,8 @@ disagree, the kernel is right and this file is the bug.
 | `kernel_dense_scale_f32` | `x` | `ceil(n/256)` | 256 | 0 |
 | `kernel_dense_q_norm_rope` | `q_out, q_in, w, pos` | `(n_head, n_tok)` | 128 | 2180 |
 | `kernel_dense_kv_norm_rope_store` | `k_cache, v_cache, k_in, v_in, kw, pos, pages` | `(n_head_kv, n_tok)` | 128 | 2180 |
+| `kernel_dense_q_rope` | `q_out, q_in, pos` | `(n_head, n_tok)` | 128 | 2180 |
+| `kernel_dense_kv_rope_store` | `k_cache, v_cache, k_in, v_in, pos, pages` | `(n_head_kv, n_tok)` | 128 | 2180 |
 | `kernel_dense_attn_decode` | `out, q, k_cache, v_cache, pos, bound, pages` | `(n_head, n_tok)` | 256 | 16448 |
 | `kernel_dense_attn_prefill` | `out, q, k_cache, v_cache, pos, bound, pages` | `(n_head, ceil(n_tok/16))` | 256 | 16384 |
 | `kernel_dense_attn_flash_hd64`, `kernel_dense_attn_flash_hd128` | `out, q, k_cache, v_cache, pos, bound, pages` | `(n_head, ceil(n_tok/64))` | 256 | 0 (static) |
@@ -146,6 +148,15 @@ for field in `crates/shiso-engine/src/launch.rs`.
   non-zero and raw otherwise, with NO weight either way. Both halves are written
   as `half` at `dense_kv_row(dense_row_pages(pages, t, page_stride), pos[t], page_tokens)`, which is the
   translation `q35_kv_row` performs.
+- `kernel_dense_q_rope` and `kernel_dense_kv_rope_store`: the norm pair with the
+  norm taken out, for a slot that rotates its queries and keys and normalizes
+  neither. The query is the rotation above and nothing else; the key is the same
+  rotation and the value is stored raw, both as `half` at the row the norm
+  pair's store uses. They read the norm pair's argument blocks and leave `eps`
+  and `v_norm` unread: the engine refuses a value norm on a slot with no key
+  norm. They stage the head at the same offset as the norm pair, so the launch
+  asks for the same 2180 bytes. A unit weight on the norm pair is not this
+  pair, because the division by the head's root mean square is unconditional.
 - `kernel_dense_attn_decode` and `kernel_dense_attn_prefill`: a query at `pos[t]`
   reads keys `p_lo..=p_hi`, where
   `p_lo = (window != 0 && pos + 1 > window) ? pos + 1 - window : 0` and

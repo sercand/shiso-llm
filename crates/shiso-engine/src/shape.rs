@@ -117,8 +117,10 @@ pub struct AttnLayer {
     pub scale: AttnScale,
     /// Whether the query and key heads are RMS-normalized before the rotation.
     ///
-    /// `false` for a family whose slots take the projections as they are; such
-    /// a slot rotates nothing either, which [`Self::n_rot`] of zero states.
+    /// Independent of the rotation, which [`Self::n_rot`] states: `false` with
+    /// a non-zero `n_rot` is a slot that rotates its heads and normalizes
+    /// neither, and `false` with an `n_rot` of zero takes the projections as
+    /// they are.
     pub qk_norm: bool,
 }
 
