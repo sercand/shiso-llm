@@ -221,13 +221,10 @@ pub(crate) async fn run(
     }
     let folded =
         fold_head(&outcome.option_logits, &prompt.order, temperature).map_err(|error| {
-            // The library names which count was off; the context says the same.
-            let context = if error.to_string().contains("number of questions") {
-                "the decision head answered a different number of questions"
-            } else {
-                "the decision head answered a different number of options"
-            };
-            AppError::internal(context, error)
+            AppError::internal(
+                "the decision head answered something other than what was asked",
+                error,
+            )
         })?;
     let answers = questions
         .into_iter()

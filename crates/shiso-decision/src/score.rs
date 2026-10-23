@@ -681,7 +681,8 @@ mod tests {
             trunk: vec![token(1)],
             questions: vec![laid(&[vec![token(10)], Vec::new()])],
         };
-        assert!(readout_runs(&empty, &schema_of(1, &["a", "b"])).is_err());
+        let error = readout_runs(&empty, &schema_of(1, &["a", "b"])).expect_err("empty option");
+        assert!(matches!(error, DecideError::Layout(_)), "{error:?}");
 
         let runs = readout_runs(&prompt, &schema_of(1, &["a", "b"])).expect("runs");
         let error = fold_readout(&prompt, &runs, &[], 1.0).expect_err("scores");
