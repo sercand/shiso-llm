@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::boot_error::{BootContext as _, BootError, refuse};
-use crate::device::{OpenedDevice, Purpose, on_device, open_device};
+use crate::device::{DeviceKind, OpenedDevice, Purpose, on_device, open_device, warm_up_model};
 use crate::options::ServeOptions;
 use crate::state::AppState;
 use crate::{
@@ -341,7 +341,7 @@ pub fn boot_language_model(
         open_audio,
         placement,
         defaults,
-    } = on_device(kind, load_checkpoint(&backend, &config, args, model_path))?;
+    } = load_checkpoint(&backend, kind, &config, args, model_path)?;
     // Before anything stands on a session: the tier is a property of the cache
     // the sessions draw their pages from, so it is chosen while there are none.
     let tier = open_checkpoint_tier(model.as_mut(), args);
@@ -501,6 +501,18 @@ fn scheduler_config(args: &ServeOptions) -> Result<scheduler::SchedulerConfig, B
 /// whatever it leaves unlabelled is still a weight.
 fn load_checkpoint(
     backend: &Arc<dyn shiso_core::Backend>,
+    kind: DeviceKind,
+    config: &shiso_core::HfConfig,
+    args: &ServeOptions,
+    model: &std::path::Path,
+) -> Result<model_factory::Loaded, BootError> {
+    on_device(kind, load_and_warm(backend, kind, config, args, model))
+}
+
+/// [`load_checkpoint`] before the device's own refusals are worded.
+fn load_and_warm(
+    backend: &Arc<dyn shiso_core::Backend>,
+    kind: DeviceKind,
     config: &shiso_core::HfConfig,
     args: &ServeOptions,
     model: &std::path::Path,
@@ -517,12 +529,18 @@ fn load_checkpoint(
     }
     let _tag = shiso_core::ledger::scope(shiso_core::MemTag::WeightsOther);
     let started = std::time::Instant::now();
-    let loaded = model_factory::load_model(backend, model, config, args)
+    let mut loaded = model_factory::load_model(backend, model, config, args)
         .with_context(|| format!("loading the checkpoint at {}", model.display()))?;
     tracing::info!(
         seconds = started.elapsed().as_secs_f64(),
         "the checkpoint is loaded"
     );
+    // Loaders import weights and launch nothing, so only a pass over the
+    // model finds a kernel the CPU backend has not ported. Metal and CUDA
+    // cover their kernel sets at build time and boot without it.
+    if kind == DeviceKind::Cpu {
+        warm_up_model(loaded.model.as_mut())?;
+    }
     Ok(loaded)
 }
 
@@ -727,10 +745,10 @@ fn open_checkpoint_tier(
     }
 }
 
-/// A build that named two devices, refused at compile time.
+/// A build that named two GPUs, refused at compile time.
 ///
-/// One binary serves one device: the backend is opened once at startup and
-/// every model holds it for the process's life, so "both features on" has no
+/// One GPU per build: `--device` picks between that GPU and the CPU backend,
+/// which rides along in every build, but "metal and cuda both on" has no
 /// meaning that is not a precedence rule invented here. Saying so with the
 /// compiler is better than picking one and logging about it.
 #[cfg(all(feature = "metal", feature = "cuda"))]
