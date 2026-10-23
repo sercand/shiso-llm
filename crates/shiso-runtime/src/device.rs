@@ -487,6 +487,10 @@ fn unported_kernel(err: &(dyn std::error::Error + 'static)) -> Option<&'static s
 /// not a fault, and it should end boot saying so rather than as a backend
 /// error title. Errors on any other device pass through untouched.
 ///
+/// The language model also runs [`warm_up_model`] on the CPU, so it refuses at
+/// load. The embedding and speech boots have no cheap equivalent pass, so a
+/// kernel they need that is not ported refuses at their first request.
+///
 /// Covered: the language, embedding and speech paths, whose errors keep the
 /// `CoreError` typed. Not covered: the image path, whose device errors are
 /// strings (`ImageGenError::Backend(String)`), so an unported kernel there

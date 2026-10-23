@@ -105,7 +105,7 @@ aho-corasick = "1"
 # GGUF is hand-rolled (shiso-modelfile); memmap2 backs the read-only model mapping.
 # bytemuck gives zero-copy #[repr(C)] views over quant blocks and fixed headers.
 memmap2 = "0.9"
-bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+bytemuck = { version = "1", features = ["derive", "min_const_generics", "extern_crate_alloc"] }
 safetensors = "0.8"
 half = { version = "2", features = ["bytemuck"] }
 sha1 = "0.10"

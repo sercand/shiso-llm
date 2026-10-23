@@ -67,16 +67,21 @@ impl Slabs {
                 buffer_bytes: 0,
             }
         })?;
-        let mut slab: Vec<Chunk> = Vec::new();
-        // A request the host cannot satisfy is an error the caller can see,
-        // not the abort `vec!` would turn it into.
-        slab.try_reserve_exact(chunks)
-            .map_err(|source| CoreError::Backend {
+        // Zeroed by the allocator rather than written: the OS maps zero pages
+        // on first touch, so a large KV pool costs address space at boot, not
+        // resident memory (a written `Vec` committed the whole pool, and on an
+        // overcommitting Linux host passed the reservation and was killed
+        // later). A request the host cannot satisfy is an error the caller can
+        // see, not the abort `vec!` would turn it into.
+        let slab: Vec<Chunk> =
+            bytemuck::allocation::try_zeroed_vec(chunks).map_err(|()| CoreError::Backend {
                 backend: "cpu",
                 op: "alloc_raw",
-                source: Box::new(source),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!("the host could not allocate {bytes} bytes"),
+                )),
             })?;
-        slab.resize(chunks, Chunk::zeroed());
         let id = self.next;
         // A u64 handle counter cannot wrap in any process lifetime; the
         // fallback keeps the arithmetic total without an `unwrap`.
@@ -185,4 +190,30 @@ fn span(view: DeviceView<'_>, bytes: usize) -> CoreResult<Range<usize>> {
     let start = usize::try_from(view.offset()).map_err(|_| out_of_bounds())?;
     let end = usize::try_from(end).map_err(|_| out_of_bounds())?;
     Ok(start..end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_allocation_the_host_cannot_hold_is_an_error_not_an_abort() {
+        // Past what any layout can describe, so the refusal does not depend on
+        // how much memory the test host has.
+        let refused = Slabs::new().alloc(u64::MAX / 2);
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
+    #[test]
+    fn an_allocation_reads_back_as_zeros() {
+        let mut slabs = Slabs::new();
+        let raw = slabs.alloc(4096 + 3).expect("a small allocation");
+        let slab = slabs.map.get(&raw.id()).expect("live");
+        assert_eq!(slab.bytes, 4096 + 3);
+        assert!(
+            bytemuck::cast_slice::<Chunk, u8>(&slab.chunks)
+                .iter()
+                .all(|&b| b == 0)
+        );
+    }
 }
