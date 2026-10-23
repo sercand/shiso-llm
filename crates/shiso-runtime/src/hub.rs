@@ -370,14 +370,34 @@ pub fn pull_observed_on(
         .enable_all()
         .build()
         .map_err(|error| PullError::Request(format!("could not start a runtime: {error}")))?;
-    let result = {
-        let _entered = runtime.enter();
-        park_on(drive(config, host, &store, &parsed, observer))
-    };
-    // Downloads still in flight after a cancel or an error are dropped here,
-    // not awaited: their partial files are what the next call resumes.
-    runtime.shutdown_background();
-    result
+    // Downloads still in flight after a cancel, an error or a panic are dropped
+    // here, not awaited: their partial files are what the next call resumes.
+    // The guard makes that so on every path; a plain drop of a runtime inside
+    // an async context would panic again while unwinding.
+    let runtime = ShutdownInBackground(Some(runtime));
+    let _entered = runtime.handle().enter();
+    park_on(drive(config, host, &store, &parsed, observer))
+}
+
+/// Shuts its runtime down without waiting when dropped, whatever the thread.
+struct ShutdownInBackground(Option<tokio::runtime::Runtime>);
+
+impl ShutdownInBackground {
+    fn handle(&self) -> &tokio::runtime::Handle {
+        match &self.0 {
+            Some(runtime) => runtime.handle(),
+            // Emptied only by Drop, after which nothing can call this.
+            None => unreachable!("the runtime is present until it is dropped"),
+        }
+    }
+}
+
+impl Drop for ShutdownInBackground {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 /// Wakes a parked thread.

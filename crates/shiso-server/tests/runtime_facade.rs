@@ -456,6 +456,69 @@ fn a_blocking_call_on_the_runtimes_own_worker_is_an_error() {
     assert_eq!(code, "blocking_on_runtime_worker");
 }
 
+/// What a sink may do besides spawn onto the worker: `spawn_blocking` lands on
+/// the Runtime's blocking pool, where waiting stalls nothing.
+#[test]
+fn a_blocking_call_from_the_runtimes_blocking_pool_answers() {
+    let text = within_guard(|| {
+        let runtime = Arc::new(scripted(vec![10, 11, 12]));
+        let mut spawned = Vec::new();
+        {
+            let inner = Arc::clone(&runtime);
+            futures::executor::block_on(runtime.generate_stream(&chat(), |event| {
+                if matches!(event, StreamEvent::Start { .. }) {
+                    let inner = Arc::clone(&inner);
+                    spawned.push(tokio::task::spawn_blocking(move || {
+                        inner.generate_blocking(&chat())
+                    }));
+                }
+                true
+            }))
+            .expect("streams");
+        }
+        let response = futures::executor::block_on(spawned.remove(0))
+            .expect("the task does not panic")
+            .expect("answers from the blocking pool");
+        let text = said(&response);
+        drop(spawned);
+        drop(runtime);
+        text
+    });
+    assert_eq!(text, "w10 w11 w12");
+}
+
+/// The worker check names its runtime: Runtime A's worker may block on B.
+#[test]
+fn a_blocking_call_from_another_runtimes_worker_answers() {
+    let text = within_guard(|| {
+        let a = Arc::new(scripted(vec![10, 11, 12]));
+        let b = Arc::new(scripted(vec![10, 11, 12]));
+        let mut spawned = Vec::new();
+        {
+            let other = Arc::clone(&b);
+            futures::executor::block_on(a.generate_stream(&chat(), |event| {
+                if matches!(event, StreamEvent::Start { .. }) {
+                    let other = Arc::clone(&other);
+                    spawned.push(tokio::spawn(
+                        async move { other.generate_blocking(&chat()) },
+                    ));
+                }
+                true
+            }))
+            .expect("streams");
+        }
+        let response = futures::executor::block_on(spawned.remove(0))
+            .expect("the task does not panic")
+            .expect("answers from another runtime's worker");
+        let text = said(&response);
+        drop(spawned);
+        drop(a);
+        drop(b);
+        text
+    });
+    assert_eq!(text, "w10 w11 w12");
+}
+
 /// Capability errors reach a blocking caller in a task as typed errors too.
 #[test]
 fn a_blocking_call_in_a_task_returns_the_capability_error() {

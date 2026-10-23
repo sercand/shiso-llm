@@ -24,7 +24,11 @@
 //! `block_on` on the caller's thread, so they cannot panic whatever the caller
 //! is: a plain thread, a `spawn_blocking` thread, or an async worker. On an
 //! async worker they block that worker for the length of the call, as any
-//! blocking I/O does; prefer the async methods there.
+//! blocking I/O does; prefer the async methods there. The single refusal is a
+//! call made on this runtime's own worker thread (reached by a task spawned
+//! from a stream sink, which runs in the runtime's context): it would wait for
+//! itself, so it returns an error. Other threads of that runtime's blocking
+//! pool, and any thread of another `Runtime`, may call.
 //!
 //! # Sharing and dropping
 //!
@@ -125,28 +129,42 @@ impl Drop for EngineGuard {
 }
 
 thread_local! {
-    /// Set on the private runtime's worker thread, which a blocking call must
-    /// not wait on: that worker is the one that would have to run it.
-    static ON_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The id of the [`Executor`] whose worker this thread is, or 0. A blocking
+    /// call must not wait on its own runtime's worker: that worker is the one
+    /// that would have to run it. Blocking-pool threads and other runtimes'
+    /// threads may wait, so this is an id and not a flag, and it is set from
+    /// the park hook, which only workers fire.
+    static WORKER_OF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A tokio runtime that is shut down without waiting, so dropping it is legal
 /// on any thread (a plain drop panics inside an async context).
 #[derive(Debug)]
 struct Executor {
+    id: u64,
     handle: Handle,
     runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl Executor {
     fn start() -> std::io::Result<Self> {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (parked, first_park) = std::sync::mpsc::sync_channel(1);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("shiso-runtime")
-            .on_thread_start(|| ON_WORKER.set(true))
+            .on_thread_park(move || {
+                WORKER_OF.set(id);
+                let _ = parked.try_send(());
+            })
             .enable_all()
             .build()?;
+        // The idle worker parks at once; waiting for that means the thread is
+        // marked before any task can run on it.
+        let _ = first_park.recv_timeout(std::time::Duration::from_secs(5));
         Ok(Self {
+            id,
             handle: runtime.handle().clone(),
             runtime: Some(runtime),
         })
@@ -504,9 +522,11 @@ impl Runtime {
     /// no caller can make it panic; the task owns what it needs, which is why
     /// `make` is handed the state.
     ///
-    /// The one caller that cannot wait is the runtime's own worker, which would
-    /// be waiting for itself: a sink runs inside the runtime's tokio context,
-    /// so a task it spawns lands there. That is refused with an error.
+    /// The one caller that cannot wait is this runtime's own worker thread,
+    /// which would be waiting for itself: a sink runs inside the runtime's tokio
+    /// context, so a task it spawns lands there. That is refused with an error.
+    /// Its blocking-pool threads (`spawn_blocking` from a sink) may wait, and so
+    /// may another runtime's threads, workers included.
     ///
     /// The task drops its state clone after the answer is sent, so a caller
     /// that drops the runtime at once joins the engine while the clone is still
@@ -516,7 +536,7 @@ impl Runtime {
         T: Send + 'static,
         F: Future<Output = Result<T, AppError>> + Send + 'static,
     {
-        if ON_WORKER.get() {
+        if WORKER_OF.get() == self.executor.id {
             return Err(AppError::bad_request(
                 "a blocking call was made on the runtime's own worker thread (a task spawned from a sink?); use the async method there",
                 None,
