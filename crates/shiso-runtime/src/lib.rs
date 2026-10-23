@@ -22,7 +22,7 @@
 pub mod api;
 pub mod audio;
 pub mod boot;
-pub mod cli;
+pub mod boot_error;
 pub mod embed;
 pub mod error;
 pub mod ids;
@@ -30,6 +30,7 @@ pub mod image;
 pub mod media;
 pub mod media_cache;
 pub mod model_factory;
+pub mod options;
 pub mod profile;
 pub mod response_store;
 pub mod scheduler;

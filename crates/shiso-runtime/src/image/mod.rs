@@ -211,7 +211,7 @@ impl ImageService {
     pub fn start(desc: ImageServiceDesc) -> std::io::Result<Self> {
         // A queue of zero would admit nothing beyond the running job and
         // refuse everything else; the floor of one is the audio service's,
-        // and `ServeArgs::validate` is what refuses `--image-max-queue 0`
+        // and `ServeOptions::validate` is what refuses `--image-max-queue 0`
         // for the operator's path.
         let (tx, rx) = mpsc::channel(desc.max_queue.max(1));
         let limits = desc.generator.limits();

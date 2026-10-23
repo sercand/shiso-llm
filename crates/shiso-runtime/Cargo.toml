@@ -21,9 +21,8 @@ shiso-parsers = { workspace = true }
 shiso-metal = { workspace = true, optional = true }
 shiso-cuda = { workspace = true, optional = true }
 
-# Temporary: `boot` and `ServeArgs` still speak `anyhow` and clap.
-anyhow = { workspace = true }
-clap = { workspace = true }
+# Only for `ServeOptions`'s derive, behind the `clap` feature; the binary turns it on.
+clap = { workspace = true, optional = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
@@ -45,6 +44,9 @@ image = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
+# Derives `clap::Args` / `ValueEnum` on `ServeOptions` and its choice enums. Only
+# the command-line binary wants it; embedders leave it off and carry no parser.
+clap = ["dep:clap"]
 # Backend choice lives here, not on shiso-core. Empty default because Cargo
 # features are target-independent: macOS builds pass --features metal and Linux
 # builds pass --features cuda. Enabling both is a build error rather than a

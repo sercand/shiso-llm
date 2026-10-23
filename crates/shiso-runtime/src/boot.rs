@@ -1,14 +1,13 @@
 //! Booting the engine: opening the device, loading a checkpoint, and starting
-//! the worker threads, from a [`ServeArgs`].
+//! the worker threads, from a [`ServeOptions`].
 //!
 //! The order the server uses is load, then bind, then serve, so every function
 //! here finishes with the model resident or fails having served nothing.
 
 use std::sync::Arc;
 
-use anyhow::{Context as _, anyhow};
-
-use crate::cli::ServeArgs;
+use crate::boot_error::{BootContext as _, BootError, refuse};
+use crate::options::ServeOptions;
 use crate::state::AppState;
 use crate::{
     api, audio, embed, image, media, media_cache, model_factory, profile, scheduler, state,
@@ -28,7 +27,7 @@ use crate::{
 /// A recognizer or diarizer that will not load, a lookahead the recognizer
 /// was not trained for, or a device that will not open.
 // `Ok(None)` is a server without transcription: no `--asr-model` was given.
-pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService>> {
+pub fn boot_audio(args: &ServeOptions) -> Result<Option<audio::AudioService>, BootError> {
     let Some(asr) = args.asr_model.as_deref() else {
         return Ok(None);
     };
@@ -51,7 +50,7 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
             "this recognizer has no lookahead; --asr-lookahead is ignored"
         );
     } else if !recognizer.lookaheads().contains(&args.asr_lookahead) {
-        return Err(anyhow!(
+        return Err(refuse!(
             "--asr-lookahead {} is not one this recognizer was trained for; it takes {:?}",
             args.asr_lookahead,
             recognizer.lookaheads()
@@ -75,13 +74,14 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
     // ask for: every chunk's prefill would still be held to the smaller
     // number, so the flag would silently do nothing past the recognizer's
     // own ceiling.
-    if let Some(encoder) = recognizer.context_encoder() {
-        anyhow::ensure!(
-            args.asr_max_context_tokens <= encoder.max_ids(),
+    if let Some(encoder) = recognizer.context_encoder()
+        && args.asr_max_context_tokens > encoder.max_ids()
+    {
+        return Err(refuse!(
             "--asr-max-context-tokens {} is past this recognizer's {}",
             args.asr_max_context_tokens,
             encoder.max_ids()
-        );
+        ));
     }
     let asr_id = args.asr_id().unwrap_or_else(|| "asr".to_owned());
     tracing::info!(
@@ -126,7 +126,7 @@ pub fn boot_audio(args: &ServeArgs) -> anyhow::Result<Option<audio::AudioService
 /// A checkpoint that will not load, an asset the locator could not find, or
 /// a device that will not open.
 // `Ok(None)` is a server without image generation: no `--image-model` was given.
-pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService>> {
+pub fn boot_image(args: &ServeOptions) -> Result<Option<image::ImageService>, BootError> {
     let Some(path) = args.image_model.as_deref() else {
         return Ok(None);
     };
@@ -192,9 +192,9 @@ pub fn boot_image(args: &ServeArgs) -> anyhow::Result<Option<image::ImageService
 /// A checkpoint or projector that will not load, a missing vocabulary, or a
 /// device that will not open.
 pub fn boot_embedding(
-    args: &ServeArgs,
+    args: &ServeOptions,
     model: &std::path::Path,
-) -> anyhow::Result<embed::EmbeddingService> {
+) -> Result<embed::EmbeddingService, BootError> {
     let backend = open_backend(args)?;
     mark_memory(backend.as_ref(), "before_load");
     let started = std::time::Instant::now();
@@ -272,7 +272,7 @@ pub(crate) fn suppress_control_tokens(
         shiso_parsers::ReasoningScheme,
         shiso_parsers::ToolCallScheme,
     ),
-) -> anyhow::Result<Arc<[shiso_core::TokenId]>> {
+) -> Result<Arc<[shiso_core::TokenId]>, BootError> {
     let suppressed = vocabulary
         .map(|vocabulary| {
             vocabulary.generation_suppressed(
@@ -302,9 +302,9 @@ pub type EngineThread = std::thread::JoinHandle<Result<(), scheduler::EngineFail
 /// A checkpoint, tokenizer, projector or checkpoint tier that will not load, a
 /// configuration the checkpoint cannot serve, or a device that will not open.
 pub fn boot_language_model(
-    args: &ServeArgs,
+    args: &ServeOptions,
     model_path: &std::path::Path,
-) -> anyhow::Result<(AppState, EngineThread)> {
+) -> Result<(AppState, EngineThread), BootError> {
     let backend = open_backend(args)?;
     // The first mark: whatever is in use now belongs to the driver and the
     // rest of the machine, and the ledger's unaccounted figure is measured
@@ -445,7 +445,7 @@ pub fn boot_language_model(
 
 /// The scheduler's configuration: its environment, then the flags that
 /// override it.
-fn scheduler_config(args: &ServeArgs) -> anyhow::Result<scheduler::SchedulerConfig> {
+fn scheduler_config(args: &ServeOptions) -> Result<scheduler::SchedulerConfig, BootError> {
     // The one place the scheduler's environment is read. Once, at boot: a knob
     // that could change between two ticks of the same request would be a policy
     // nobody configured.
@@ -488,18 +488,18 @@ fn scheduler_config(args: &ServeArgs) -> anyhow::Result<scheduler::SchedulerConf
 fn load_checkpoint(
     backend: &Arc<dyn shiso_core::Backend>,
     config: &shiso_core::HfConfig,
-    args: &ServeArgs,
+    args: &ServeOptions,
     model: &std::path::Path,
-) -> anyhow::Result<model_factory::Loaded> {
+) -> Result<model_factory::Loaded, BootError> {
     // A table nothing reads is an operator who believes a model is using it.
     if let Some(ngram) = &args.ngram
         && !model_factory::takes_ngram(config, model)
     {
-        anyhow::bail!(
+        return Err(refuse!(
             "--ngram {} was given, but the checkpoint at {} has no n-gram table file to read",
             ngram.display(),
             model.display()
-        );
+        ));
     }
     let _tag = shiso_core::ledger::scope(shiso_core::MemTag::WeightsOther);
     let started = std::time::Instant::now();
@@ -522,7 +522,7 @@ fn load_checkpoint(
 )]
 fn log_kv_capacity(
     model: &dyn shiso_engine::ckpt::Checkpointed,
-    args: &ServeArgs,
+    args: &ServeOptions,
     checkpoint_tier: bool,
 ) {
     let Some(cache) = model.kv_cache() else {
@@ -579,10 +579,10 @@ fn report_memory(backend: &Arc<dyn shiso_core::Backend>) -> Option<state::Memory
 /// otherwise discover them is one whose answer would be fluent and wrong.
 fn open_vision_tower(
     backend: &Arc<dyn shiso_core::Backend>,
-    args: &ServeArgs,
+    args: &ServeOptions,
     model: &mut dyn shiso_engine::ckpt::Checkpointed,
     open: model_factory::TowerOpener,
-) -> anyhow::Result<Option<vision::VisionTower>> {
+) -> Result<Option<vision::VisionTower>, BootError> {
     let Some(path) = args.vision.as_ref() else {
         return Ok(None);
     };
@@ -598,7 +598,7 @@ fn open_vision_tower(
     let hidden = shiso_core::Model::info(model).hidden;
     tower.check_against(hidden)?;
     if shiso_core::Model::media_mut(model).is_none() {
-        return Err(anyhow!(
+        return Err(refuse!(
             "--vision names a tower but this checkpoint has no media path to splice \
              its rows into; serve it without the flag or serve a checkpoint that has one"
         ));
@@ -625,10 +625,10 @@ fn open_vision_tower(
 // or a container exported without the tower. Each is logged.
 pub fn open_audio_tower(
     backend: &Arc<dyn shiso_core::Backend>,
-    args: &ServeArgs,
+    args: &ServeOptions,
     model: &mut dyn shiso_engine::ckpt::Checkpointed,
     open: model_factory::AudioTowerOpener,
-) -> anyhow::Result<Option<Arc<dyn shiso_audio::AudioTower>>> {
+) -> Result<Option<Arc<dyn shiso_audio::AudioTower>>, BootError> {
     let Some(path) = args.vision.as_ref() else {
         return Ok(None);
     };
@@ -645,13 +645,13 @@ pub fn open_audio_tower(
     let hidden = shiso_core::Model::info(model).hidden;
     let width = u32::try_from(tower.out_hidden()).unwrap_or(u32::MAX);
     if width != hidden {
-        return Err(anyhow!(
+        return Err(refuse!(
             "the audio tower projects to {width}-wide rows but this checkpoint's residual \
              stream is {hidden} wide; they are not a pair"
         ));
     }
     if shiso_core::Model::media_mut(model).is_none() {
-        return Err(anyhow!(
+        return Err(refuse!(
             "the tower container carries an audio tower but this checkpoint has no media \
              path to splice its rows into"
         ));
@@ -674,7 +674,7 @@ pub fn open_audio_tower(
 /// service.
 fn open_checkpoint_tier(
     model: &mut dyn shiso_engine::ckpt::Checkpointed,
-    args: &ServeArgs,
+    args: &ServeOptions,
 ) -> Option<state::CheckpointTier> {
     let dir = args.kvstore_dir.as_ref()?;
     let mut options = shiso_engine::ckpt::CkptOptions::new();
@@ -733,7 +733,7 @@ compile_error!(
 /// Reports at boot whether the OS can decode video, and which codecs, when video
 /// decoding is on. Unavailable is information, not a failure: the Rust and
 /// ffmpeg steps may still cover a request.
-pub fn log_os_decoder(args: &ServeArgs) {
+pub fn log_os_decoder(args: &ServeOptions) {
     if !args.video_allow_decode {
         return;
     }
@@ -755,7 +755,7 @@ pub fn log_os_decoder(args: &ServeArgs) {
 /// user's failed request an hour later. A missing binary is a warning, not a
 /// failure: the OS and Rust steps may still cover the request.
 #[cfg(feature = "decode-ffmpeg")]
-pub fn log_media_decoders(args: &ServeArgs) {
+pub fn log_media_decoders(args: &ServeOptions) {
     match shiso_vision::probe(args.ffmpeg_policy().as_ref()) {
         shiso_vision::Availability::Ready { version } => {
             tracing::info!(%version, "ffmpeg is ready for the containers nothing else decodes");
@@ -776,13 +776,13 @@ pub fn log_media_decoders(args: &ServeArgs) {
 
 /// Reports at boot which media decoders this server can reach.
 #[cfg(not(feature = "decode-ffmpeg"))]
-pub fn log_media_decoders(_args: &ServeArgs) {
+pub fn log_media_decoders(_args: &ServeOptions) {
     tracing::info!("this build decodes media without ffmpeg");
 }
 
 /// Opens the compute device this build was compiled with.
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-fn open_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+fn open_backend(_args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
     let backend = shiso_metal::MetalBackend::new().context("opening the Metal device")?;
     Ok(backend)
 }
@@ -790,14 +790,14 @@ fn open_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend
 /// Opens the backend instance the speech models run on: the same device, a
 /// command stream of its own, and no launch recording.
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-fn open_audio_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+fn open_audio_backend(args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
     open_backend(args)
 }
 
 /// Opens the backend instance the speech models run on. Decode graphs stay
 /// off here: the speech models' launches are never replayed.
 #[cfg(all(feature = "cuda", not(feature = "metal")))]
-fn open_audio_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+fn open_audio_backend(_args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
     let options = shiso_cuda::CudaOptions::default().with_decode_graphs(false);
     let backend = shiso_cuda::CudaBackend::new(0, options)
         .context("opening the CUDA device for the speech models")?;
@@ -806,21 +806,21 @@ fn open_audio_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::B
 
 /// As [`open_backend`]: this build has no device for the speech models.
 #[cfg(not(any(feature = "metal", feature = "cuda")))]
-fn open_audio_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+fn open_audio_backend(args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
     open_backend(args)
 }
 
 /// Opens the backend instance the image generation model runs on: the same
 /// device, a command stream of its own, and no launch recording.
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-fn open_image_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+fn open_image_backend(args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
     open_backend(args)
 }
 
 /// Opens the backend instance the image generation model runs on. Decode
 /// graphs stay off here: a diffusion step is never replayed.
 #[cfg(all(feature = "cuda", not(feature = "metal")))]
-fn open_image_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+fn open_image_backend(_args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
     let options = shiso_cuda::CudaOptions::default().with_decode_graphs(false);
     let backend = shiso_cuda::CudaBackend::new(0, options)
         .context("opening the CUDA device for the image generation model")?;
@@ -829,7 +829,7 @@ fn open_image_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::B
 
 /// As [`open_backend`]: this build has no device for the image generation model.
 #[cfg(not(any(feature = "metal", feature = "cuda")))]
-fn open_image_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+fn open_image_backend(args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
     open_backend(args)
 }
 
@@ -840,7 +840,7 @@ fn open_image_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Ba
 /// flag this server would then have to keep meaningful across a multi-device
 /// box it does not otherwise model.
 #[cfg(all(feature = "cuda", not(feature = "metal")))]
-fn open_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
+fn open_backend(args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
     let options = shiso_cuda::CudaOptions::default().with_decode_graphs(!args.no_decode_graphs);
     let backend = shiso_cuda::CudaBackend::new(0, options).context("opening the CUDA device")?;
     Ok(backend)
@@ -853,8 +853,8 @@ fn open_backend(args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>
 /// checks without a backend, which is what lets every test above this line run
 /// on a machine with no device at all.
 #[cfg(not(any(feature = "metal", feature = "cuda")))]
-fn open_backend(_args: &ServeArgs) -> anyhow::Result<Arc<dyn shiso_core::Backend>> {
-    Err(anyhow!(
+fn open_backend(_args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
+    Err(refuse!(
         "this build has no compute backend; rebuild with --features metal or --features cuda"
     ))
 }
@@ -882,7 +882,7 @@ pub const SERVER_TOOL_JSON_STYLE: tokenizer::jinja_helpers::ToolJsonStyle =
 /// (inventing a prompt format) produces fluent answers to a prompt the model was
 /// never trained on, which is the one failure nobody can see in the output.
 fn build_renderer(
-    args: &ServeArgs,
+    args: &ServeOptions,
     config: &shiso_core::HfConfig,
     vocabulary: Arc<tokenizer::Vocabulary>,
     placement: shiso_vision::MediaPlacement,
@@ -946,7 +946,9 @@ fn build_renderer(
 /// says so in the log: plenty of checkpoints ship none. A file that is there
 /// and does not parse is an error, because serving on with neutral sampling
 /// would silently be a different model from the one the operator pointed at.
-fn load_sampling_preset(args: &ServeArgs) -> anyhow::Result<Option<shiso_core::SamplingParams>> {
+fn load_sampling_preset(
+    args: &ServeOptions,
+) -> Result<Option<shiso_core::SamplingParams>, BootError> {
     let path = args.generation_config_path();
     match std::fs::read_to_string(&path) {
         Ok(text) => {
@@ -969,16 +971,14 @@ fn load_sampling_preset(args: &ServeArgs) -> anyhow::Result<Option<shiso_core::S
             );
             Ok(None)
         }
-        Err(error) => Err(anyhow!(error).context(format!(
-            "reading the generation config at {}",
-            path.display()
-        ))),
+        Err(error) => Err(error)
+            .with_context(|| format!("reading the generation config at {}", path.display())),
     }
 }
 
 /// The chat template text, from the file the operator named or from the two
 /// places a checkpoint conventionally keeps one.
-fn load_chat_template(args: &ServeArgs) -> Option<String> {
+fn load_chat_template(args: &ServeOptions) -> Option<String> {
     let named = args.chat_template_path();
     match std::fs::read_to_string(&named) {
         Ok(template) => {
@@ -1015,7 +1015,7 @@ fn load_chat_template(args: &ServeArgs) -> Option<String> {
 }
 
 /// Loads the vocabulary, reporting rather than failing when it is absent.
-fn load_vocabulary(args: &ServeArgs) -> Option<Arc<tokenizer::Vocabulary>> {
+fn load_vocabulary(args: &ServeOptions) -> Option<Arc<tokenizer::Vocabulary>> {
     let path = args.tokenizer_path();
     match tokenizer::Vocabulary::from_file(&path) {
         Ok(vocabulary) => Some(Arc::new(vocabulary)),

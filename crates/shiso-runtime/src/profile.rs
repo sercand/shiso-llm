@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Context as _;
 use shiso_core::profile::elapsed_ns;
 use shiso_core::{Backend, ProfileReport, Profiler};
 
@@ -28,6 +27,27 @@ pub struct OpenRegion {
     label: String,
 }
 
+/// Why a [`ProfileSink`] could not be opened.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProfileError {
+    /// The backend has no way to time its launches.
+    #[error("--profile-dir: the {backend} backend cannot time launches")]
+    Untimed {
+        /// The backend's name.
+        backend: String,
+    },
+    /// The report directory could not be created.
+    #[error("creating --profile-dir {}", dir.display())]
+    CreateDir {
+        /// The directory asked for.
+        dir: PathBuf,
+        /// The filesystem's refusal.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 impl OpenRegion {
     /// Names the report after an id minted once the region was already open.
     pub fn relabel(&mut self, label: String) {
@@ -41,15 +61,16 @@ impl ProfileSink {
     /// # Errors
     ///
     /// When `backend` cannot time launches, or `dir` cannot be created.
-    pub fn new(dir: &Path, backend: Arc<dyn Backend>) -> anyhow::Result<Self> {
+    pub fn new(dir: &Path, backend: Arc<dyn Backend>) -> Result<Self, ProfileError> {
         if backend.as_profiler().is_none() {
-            anyhow::bail!(
-                "--profile-dir: the {} backend cannot time launches",
-                backend.backend_name()
-            );
+            return Err(ProfileError::Untimed {
+                backend: backend.backend_name().to_owned(),
+            });
         }
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating --profile-dir {}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|source| ProfileError::CreateDir {
+            dir: dir.to_path_buf(),
+            source,
+        })?;
         Ok(Self {
             dir: Arc::from(dir),
             backend,

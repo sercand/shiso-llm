@@ -58,7 +58,7 @@ use shiso_models::qwen35::{Qwen35Config, Qwen35Model, Qwen35Tower};
 use shiso_models::qwen35moe::{Qwen35MoeConfig, Qwen35MoeModel};
 use shiso_vision::{MediaPlacement, VisionError, VisionTower};
 
-use crate::cli::ServeArgs;
+use crate::options::ServeOptions;
 use crate::tokenizer::render_prompt::{EffortSpelling, PromptRenderer};
 use shiso_parsers::{ReasoningScheme, ToolCallScheme};
 
@@ -469,7 +469,7 @@ fn open_gemma4_tower(
 
 /// Loads the checkpoint at `path` as whichever family `config` describes.
 ///
-/// Takes `&ServeArgs` whole rather than a merged options struct: the factory
+/// Takes `&ServeOptions` whole rather than a merged options struct: the factory
 /// lives in the crate that owns the command line, so each arm reads the knobs
 /// its own architecture has, and no union-of-all-models configuration type has
 /// to exist for arms to share.
@@ -483,7 +483,7 @@ pub fn load_model(
     backend: &Arc<dyn Backend>,
     path: &Path,
     config: &HfConfig,
-    args: &ServeArgs,
+    args: &ServeOptions,
 ) -> Result<Loaded, FactoryError> {
     let opts = engine_options(args)?;
     // Resolved once, from the same table every other caller reads, rather than
@@ -505,7 +505,7 @@ pub fn load_model(
     // answered from the document alone - and because the answer is a refusal
     // that must land before several gigabytes of weights do.
     //
-    // `ServeArgs::validate` deliberately no longer asks it: whether a depth
+    // `ServeOptions::validate` deliberately no longer asks it: whether a depth
     // needs an explicit `--draft-model` depends on the family, and pushing
     // that to the arms is what made the dense family's sidecar default
     // reachable. What the arms cannot be trusted with is the *prior* question
@@ -583,7 +583,7 @@ pub fn load_model(
         Ok(family) => {
             // This family publishes its head as a separate container and its
             // config names no `mtp_file`, so there is nothing to default to.
-            // Refused by name here because `ServeArgs::validate` no longer
+            // Refused by name here because `ServeOptions::validate` no longer
             // does it for every family: the dense arm has a default and this
             // one does not, and a silent fallback would be a server that
             // decodes one token a step while an operator believes it is
@@ -667,8 +667,9 @@ pub fn load_model(
 ///
 /// [`FactoryError::Load`] carrying [`CoreError::InvalidValue`] naming the
 /// flag.
-fn refuse_kv_dtype(args: &ServeArgs, config: &HfConfig) -> Result<(), FactoryError> {
-    if args.kv_cache_dtype == crate::cli::KvCacheDtype::F16 || Qwen4ExpConfig::describes(config) {
+fn refuse_kv_dtype(args: &ServeOptions, config: &HfConfig) -> Result<(), FactoryError> {
+    if args.kv_cache_dtype == crate::options::KvCacheDtype::F16 || Qwen4ExpConfig::describes(config)
+    {
         return Ok(());
     }
     Err(FactoryError::Load(CoreError::InvalidValue {
@@ -818,7 +819,7 @@ fn load_lfm2(
 
 /// The `--draft-model` directory when it holds a block drafter: the target
 /// then loads plain, at the asked depth, and the drafter binds beside it.
-fn block_drafter_dir(args: &ServeArgs) -> Option<&Path> {
+fn block_drafter_dir(args: &ServeOptions) -> Option<&Path> {
     args.draft_model
         .as_deref()
         .filter(|dir| shiso_models::qwen35::block_draft::is_block_drafter(dir))
@@ -834,7 +835,7 @@ fn load_qwen35_block(
     backend: &Arc<dyn Backend>,
     path: &Path,
     family: &Qwen35Config,
-    args: &ServeArgs,
+    args: &ServeOptions,
     dir: &Path,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
@@ -883,7 +884,7 @@ fn load_qwen35_block(
 fn load_qwen35moe(
     backend: &Arc<dyn Backend>,
     path: &Path,
-    args: &ServeArgs,
+    args: &ServeOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
     if !path.exists() {
@@ -981,8 +982,8 @@ fn load_qwen35moe(
 /// # Errors
 ///
 /// [`FactoryError::Load`] carrying [`CoreError::InvalidValue`] for a pool or a
-/// share [`ServeArgs::validate`] would have refused.
-fn engine_options(args: &ServeArgs) -> Result<EngineOptions, FactoryError> {
+/// share [`ServeOptions::validate`] would have refused.
+fn engine_options(args: &ServeOptions) -> Result<EngineOptions, FactoryError> {
     let mut opts = EngineOptions::default();
     opts.ctx = args.ctx;
     let pages = args.kv_pool_pages().map_err(|error| {
@@ -1012,7 +1013,7 @@ fn engine_options(args: &ServeArgs) -> Result<EngineOptions, FactoryError> {
 /// # Errors
 ///
 /// As [`engine_options`].
-fn dense_options(args: &ServeArgs) -> Result<EngineOptions, FactoryError> {
+fn dense_options(args: &ServeOptions) -> Result<EngineOptions, FactoryError> {
     let mut opts = engine_options(args)?;
     opts.spec = SpecDepth::new(args.spec_k);
     Ok(opts)
@@ -1038,7 +1039,7 @@ fn dense_options(args: &ServeArgs) -> Result<EngineOptions, FactoryError> {
 /// [`CoreError::ConfigMissing`] naming the head when the depth was asked for
 /// and no head can be found, and whatever the sidecar's document reports when
 /// it cannot be read.
-pub fn draft_manifest(args: &ServeArgs) -> Result<Option<MtpManifest>, CoreError> {
+pub fn draft_manifest(args: &ServeOptions) -> Result<Option<MtpManifest>, CoreError> {
     if !SpecDepth::new(args.spec_k).is_speculative() {
         return Ok(None);
     }
@@ -1108,7 +1109,7 @@ pub fn draft_manifest(args: &ServeArgs) -> Result<Option<MtpManifest>, CoreError
 /// the stack can be built with.
 /// The draft vocabulary a load narrows the draft head with, said once in the
 /// log: nothing else shows the narrowing except the speed.
-fn draft_vocab_of(args: &ServeArgs) -> Option<&Path> {
+fn draft_vocab_of(args: &ServeOptions) -> Option<&Path> {
     let path = args.draft_vocab.as_deref();
     if let Some(path) = path {
         tracing::info!(path = %path.display(), "narrowed the draft head's vocabulary");
@@ -1117,7 +1118,7 @@ fn draft_vocab_of(args: &ServeArgs) -> Option<&Path> {
 }
 
 fn sparse_options(
-    args: &ServeArgs,
+    args: &ServeOptions,
     engine: EngineOptions,
     backend: &Arc<dyn Backend>,
 ) -> Result<SparseOptions, FactoryError> {
@@ -1205,7 +1206,7 @@ fn load_qwen4exp_dir(
     backend: &Arc<dyn Backend>,
     path: &Path,
     config: &HfConfig,
-    args: &ServeArgs,
+    args: &ServeOptions,
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
@@ -1234,7 +1235,7 @@ fn load_qwen4exp_streamed(
     backend: &Arc<dyn Backend>,
     path: &Path,
     config: &HfConfig,
-    args: &ServeArgs,
+    args: &ServeOptions,
     opts: EngineOptions,
     defaults: FamilyDefaults,
     mixed: bool,
@@ -1252,7 +1253,7 @@ fn load_qwen4exp_streamed(
         }));
     }
     let slots = match args.expert_residency {
-        crate::cli::ExpertResidencyChoice::Resident => {
+        crate::options::ExpertResidencyChoice::Resident => {
             Some(shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS)
         }
         _ if args.expert_slots > 0 => Some(args.expert_slots),
@@ -1291,7 +1292,7 @@ fn load_qwen4exp_exl3(
     backend: &Arc<dyn Backend>,
     path: &Path,
     config: &HfConfig,
-    args: &ServeArgs,
+    args: &ServeOptions,
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
@@ -1339,7 +1340,7 @@ fn load_qwen4exp_mlx(
     backend: &Arc<dyn Backend>,
     path: &Path,
     config: &HfConfig,
-    args: &ServeArgs,
+    args: &ServeOptions,
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
@@ -1351,9 +1352,10 @@ fn load_qwen4exp_mlx(
         }));
     }
     let residency = match args.expert_residency {
-        crate::cli::ExpertResidencyChoice::Auto if args.expert_slots == 0 => None,
-        crate::cli::ExpertResidencyChoice::Resident => Some(ExpertResidency::Resident),
-        crate::cli::ExpertResidencyChoice::Auto | crate::cli::ExpertResidencyChoice::Stream => {
+        crate::options::ExpertResidencyChoice::Auto if args.expert_slots == 0 => None,
+        crate::options::ExpertResidencyChoice::Resident => Some(ExpertResidency::Resident),
+        crate::options::ExpertResidencyChoice::Auto
+        | crate::options::ExpertResidencyChoice::Stream => {
             let slots = if args.expert_slots == 0 {
                 shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS
             } else {
@@ -1367,7 +1369,7 @@ fn load_qwen4exp_mlx(
         // The reference export streams its FP8 experts whatever the device;
         // `resident` asks for a pool that holds every one of them.
         let slots = match args.expert_residency {
-            crate::cli::ExpertResidencyChoice::Resident => {
+            crate::options::ExpertResidencyChoice::Resident => {
                 Some(shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS)
             }
             _ if args.expert_slots > 0 => Some(args.expert_slots),

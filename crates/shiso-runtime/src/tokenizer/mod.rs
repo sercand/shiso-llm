@@ -1005,7 +1005,7 @@ mod detokenizer_tests {
         let mut model = BoundCheckingModel::with_width(64);
         let error = crate::boot::suppress_control_tokens(&mut model, Some(&vocabulary), NO_PARSERS)
             .expect_err("a special id past the logits width refuses boot");
-        let message = format!("{error:#}");
+        let message = shiso_core::chain_of(&error).to_string();
         assert!(
             message.contains("suppressed token id") && message.contains("900 (vocabulary 64)"),
             "the boot failure names the offending id and the width it passed: {message}"
@@ -1042,7 +1042,7 @@ mod detokenizer_tests {
         let mut model = BoundCheckingModel::with_width(8_192);
         let error = crate::boot::suppress_control_tokens(&mut model, Some(&vocabulary), NO_PARSERS)
             .expect_err("more specials than the suppression capacity refuses boot");
-        let message = format!("{error:#}");
+        let message = shiso_core::chain_of(&error).to_string();
         assert!(
             message.contains("suppressed token count")
                 && message.contains(&format!("{} (at most {capacity})", capacity + 1)),

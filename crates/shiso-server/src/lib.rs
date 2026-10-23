@@ -82,8 +82,11 @@ pub async fn run_with_matches(cli: Cli, matches: Option<clap::ArgMatches>) -> an
     install_tracing();
     match cli.command {
         Command::Serve(mut args) => {
-            let serve_matches = matches.as_ref().and_then(|m| m.subcommand_matches("serve"));
-            let _lock = hub::resolve_serve_model(&mut args, serve_matches)?;
+            let explicit = matches
+                .as_ref()
+                .and_then(|m| m.subcommand_matches("serve"))
+                .map(cli::explicitly_set);
+            let _lock = hub::resolve_serve_model(&mut args, explicit.as_ref())?;
             serve(*args).await
         }
         Command::Router(args) => router(*args).await,

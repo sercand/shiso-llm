@@ -12,8 +12,8 @@
 //! whether a remote address may be fetched, whether a subprocess may be spawned,
 //! how much wall clock one decode may burn - and a policy decision that lives in
 //! a file nobody reads is a policy decision nobody made. They map one to one
-//! onto the types the media layer takes, and [`ServeArgs::video_decode_policy`]
-//! and [`ServeArgs::audio_decode_policy`] are the only places that mapping
+//! onto the types the media layer takes, and [`ServeOptions::video_decode_policy`]
+//! and [`ServeOptions::audio_decode_policy`] are the only places that mapping
 //! happens.
 
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -60,24 +60,24 @@ pub const DEFAULT_PLE_CACHE_MB: u64 = 512;
 /// under load, and 2 GiB is a small price against a pool of tens.
 pub const KV_FIT_HEADROOM_BYTES: u64 = 2 << 30;
 
-/// Everything `shiso serve` accepts.
-#[derive(Debug, clap::Args)]
+/// Everything `shiso serve` configures, with no command line in it.
+///
+/// With the `clap` feature on this derives `clap::Args`, so the binary flattens
+/// it into its parser; an embedder builds it from [`Default`] and sets the
+/// fields it cares about. The field list exists once: the clap attributes are
+/// `cfg_attr`s on the fields themselves rather than a mirror struct.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each one is a separate on-off policy an operator sets on the command line, and a state machine over four independent switches would be sixteen states nobody asked for"
 )]
-pub struct ServeArgs {
+pub struct ServeOptions {
     /// Language model checkpoint to serve. Either a checkpoint file or a
     /// checkpoint directory. Optional when `--asr-model` is given: a server
     /// can serve transcription alone.
-    #[arg(short = 'm', long, env = "SHISO_MODEL")]
+    #[cfg_attr(feature = "clap", arg(short = 'm', long, env = "SHISO_MODEL"))]
     pub model: Option<PathBuf>,
-    /// Model reference (registry recipe) or path.
-    ///
-    /// If it contains `/` or starts with `.` or `~`, it is treated as a path (`--model`).
-    /// Otherwise, it resolves to an installed registry model variant.
-    #[arg(value_name = "MODEL", conflicts_with = "model")]
-    pub model_ref: Option<String>,
     /// The name this checkpoint answers to on the wire. Defaults to the last
     /// component of `--model`, with any extension removed.
     ///
@@ -89,17 +89,17 @@ pub struct ServeArgs {
     /// is no way to tell the two kinds of directory name apart from the outside -
     /// and a server that renamed itself on a rule the operator did not know would
     /// be worse than one with a dull name.
-    #[arg(long, env = "SHISO_MODEL_NAME")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_MODEL_NAME"))]
     pub model_name: Option<String>,
     /// The architecture config. Defaults to `config.json` beside `--model`.
     ///
     /// Required in practice wherever the checkpoint directory holds only the
     /// weights file: the geometry is read from the config, never guessed from
     /// the weights.
-    #[arg(long, env = "SHISO_CONFIG")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_CONFIG"))]
     pub config: Option<PathBuf>,
     /// The vocabulary. Defaults to `tokenizer.json` beside the config.
-    #[arg(long, env = "SHISO_TOKENIZER")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_TOKENIZER"))]
     pub tokenizer: Option<PathBuf>,
     /// The chat template. Defaults to `chat_template.jinja` beside the config,
     /// and then to the `chat_template` key of `tokenizer_config.json`.
@@ -107,7 +107,7 @@ pub struct ServeArgs {
     /// A checkpoint that ships neither still serves: the informational routes
     /// answer, and the generation routes say that no template was found rather
     /// than inventing a prompt format the model has never seen.
-    #[arg(long, env = "SHISO_CHAT_TEMPLATE")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_CHAT_TEMPLATE"))]
     pub chat_template: Option<PathBuf>,
     /// Sampling defaults. Defaults to `generation_config.json` beside the config.
     ///
@@ -115,23 +115,23 @@ pub struct ServeArgs {
     /// names no sampling knob gets, and each knob a caller names overrides its
     /// own. A missing file means neutral sampling; a file that does not parse
     /// stops the server at boot.
-    #[arg(long, env = "SHISO_GENERATION_CONFIG")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_GENERATION_CONFIG"))]
     pub generation_config: Option<PathBuf>,
     /// Address to listen on.
-    #[arg(long, env = "SHISO_BIND", default_value = DEFAULT_BIND)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_BIND", default_value = DEFAULT_BIND))]
     pub bind: String,
     /// Port to listen on.
-    #[arg(short = 'p', long, env = "SHISO_PORT", default_value_t = DEFAULT_PORT)]
+    #[cfg_attr(feature = "clap", arg(short = 'p', long, env = "SHISO_PORT", default_value_t = DEFAULT_PORT))]
     pub port: u16,
     /// Tokens one session may hold, prompt included.
-    #[arg(short = 'c', long, env = "SHISO_CTX", default_value_t = DEFAULT_CTX)]
+    #[cfg_attr(feature = "clap", arg(short = 'c', long, env = "SHISO_CTX", default_value_t = DEFAULT_CTX))]
     pub ctx: u32,
     /// Sequences that may be resident at once.
     ///
     /// Also the sessions whose state a `--gpu-memory-utilization` pool sets
     /// aside before it takes the rest. More than one decode pass carries are
     /// decoded in several passes a step.
-    #[arg(long, env = "SHISO_MAX_NUM_SEQS", default_value_t = crate::scheduler::DEFAULT_MAX_NUM_SEQS)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_MAX_NUM_SEQS", default_value_t = crate::scheduler::DEFAULT_MAX_NUM_SEQS))]
     pub max_num_seqs: usize,
     /// Writes one GPU-time-per-kernel report per request into this directory,
     /// as `<kind>-<pid>-<id>.json`.
@@ -139,31 +139,31 @@ pub struct ServeArgs {
     /// Every launch is submitted and timed on its own while a request runs, so
     /// serving is slower: a development tool, not a serving mode. Needs
     /// `--max-num-seqs 1`, so a report is one request's kernels.
-    #[arg(long, env = "SHISO_PROFILE_DIR")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_PROFILE_DIR"))]
     pub profile_dir: Option<PathBuf>,
     /// Prompt tokens one prefill chunk covers when nothing else is decoding.
     ///
     /// Wide, because with nobody to starve the only thing a narrow chunk buys is
     /// more passes, and the sparse family reads every routed expert once per
     /// pass. A stack splits a chunk wider than its own widest pass itself.
-    #[arg(
+    #[cfg_attr(feature = "clap", arg(
         long,
         env = "SHISO_SOLO_PREFILL_CHUNK",
         default_value_t = crate::scheduler::DEFAULT_SOLO_CHUNK,
         conflicts_with = "max_num_batched_tokens"
-    )]
+    ))]
     pub solo_prefill_chunk: usize,
     /// Prompt tokens one prefill quantum adds to a step while other sequences
     /// are decoding.
     ///
     /// The trade: a wider quantum brings a waiting prompt's first token sooner,
     /// and makes every decoding sequence's step that much longer.
-    #[arg(
+    #[cfg_attr(feature = "clap", arg(
         long,
         env = "SHISO_MIXED_PREFILL_QUANTUM",
         default_value_t = crate::scheduler::DEFAULT_MIXED_QUANTUM,
         conflicts_with = "max_num_batched_tokens"
-    )]
+    ))]
     pub mixed_prefill_quantum: usize,
     /// Tokens one scheduler step may carry, prompt and decode rows together.
     ///
@@ -172,17 +172,20 @@ pub struct ServeArgs {
     /// decode rows are counted at their worst, `--max-num-seqs` times
     /// `1 + --spec-k`, so a budget that fits them never lets a mixed step grow
     /// past it. Refused beside either width, since the two would disagree.
-    #[arg(long, env = "SHISO_MAX_NUM_BATCHED_TOKENS")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_MAX_NUM_BATCHED_TOKENS"))]
     pub max_num_batched_tokens: Option<usize>,
     /// Tokens the KV cache holds, shared by every session.
     ///
     /// The pool is allocated whole at load, so this is device memory spent up
     /// front: `--ctx` caps one session, and this caps all of them together.
     /// Unset, and without `--gpu-memory-utilization`, the pool holds 131072.
-    #[arg(
-        long,
-        env = "SHISO_KV_CACHE_TOKENS",
-        conflicts_with = "gpu_memory_utilization"
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            env = "SHISO_KV_CACHE_TOKENS",
+            conflicts_with = "gpu_memory_utilization"
+        )
     )]
     pub kv_cache_tokens: Option<u64>,
     /// Share of the device's memory this process may fill, in (0, 1]; the KV
@@ -193,7 +196,7 @@ pub struct ServeArgs {
     /// it, other processes included - which on a device that shares memory with
     /// its host is the rest of the machine. A share that leaves less than one
     /// `--ctx` context refuses to start, with the numbers.
-    #[arg(long, env = "SHISO_GPU_MEMORY_UTILIZATION")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_GPU_MEMORY_UTILIZATION"))]
     pub gpu_memory_utilization: Option<f64>,
     /// The element the KV cache stores attention keys and values as: `f16`,
     /// or `fp8` (E4M3 at a static scale of 1, also spelled `fp8_e4m3`).
@@ -204,12 +207,12 @@ pub struct ServeArgs {
     /// to a 3-bit mantissa when stored, saturate at 448 and flush below 2^-10.
     /// Only the sparse stack on CUDA has the kernels for it; any other model or
     /// device refuses to start rather than serving f16 under this name.
-    #[arg(
+    #[cfg_attr(feature = "clap", arg(
         long,
         env = "SHISO_KV_CACHE_DTYPE",
         value_enum,
         default_value_t = KvCacheDtype::F16
-    )]
+    ))]
     pub kv_cache_dtype: KvCacheDtype,
     /// The precision prompt (prefill) activations enter the block-scaled
     /// weights' products at: `a16`, or `lowp`.
@@ -224,12 +227,12 @@ pub struct ServeArgs {
     /// half-precision kernels either way. Only the sparse stack on a CUDA
     /// build with kernels for a family-specific architecture (`sm_121a`, a
     /// GB10) has the kernels; anywhere else `lowp` refuses to start.
-    #[arg(
+    #[cfg_attr(feature = "clap", arg(
         long,
         env = "SHISO_PREFILL_ACTIVATIONS",
         value_enum,
         default_value_t = PrefillActivations::A16
-    )]
+    ))]
     pub prefill_activations: PrefillActivations,
     /// Recurrent-state checkpoints the prefix cache may hold, shared by every
     /// session. Zero holds none.
@@ -241,48 +244,48 @@ pub struct ServeArgs {
     /// that shares memory with its host they come out of the same memory: every
     /// slot here is a slot's worth of bytes the KV cache does not get, and a
     /// count that leaves no room for one `--ctx` context refuses to start.
-    #[arg(
+    #[cfg_attr(feature = "clap", arg(
         long,
         env = "SHISO_KV_CHECKPOINTS",
         default_value_t = shiso_engine::EngineOptions::new().kv_ckpt_slots
-    )]
+    ))]
     pub kv_checkpoints: u32,
     /// Directory for the cache's disk tier. Unset means nothing is persisted.
-    #[arg(long, env = "SHISO_KVSTORE_DIR")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_DIR"))]
     pub kvstore_dir: Option<PathBuf>,
     /// Budget for the disk tier, in mebibytes. Unset is twice the key/value
     /// pool's bytes: enough for every resident session and as many again that
     /// memory gave up.
-    #[arg(long, env = "SHISO_KVSTORE_BUDGET_MB")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_BUDGET_MB"))]
     pub kvstore_budget_mb: Option<u64>,
     /// Checkpoints shorter than this many tokens are neither stored on disk nor
     /// looked up there: below it a file costs more to write and read than the
     /// prefill it saves.
-    #[arg(long, env = "SHISO_KVSTORE_MIN_TOKENS", default_value_t = DEFAULT_KVSTORE_MIN_TOKENS)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_MIN_TOKENS", default_value_t = DEFAULT_KVSTORE_MIN_TOKENS))]
     pub kvstore_min_tokens: u32,
     /// Host memory the disk tier's write-behind may hold in copied pages, in
     /// mebibytes.
-    #[arg(long, env = "SHISO_KVSTORE_STAGING_MB", default_value_t = DEFAULT_KVSTORE_STAGING_MB)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_STAGING_MB", default_value_t = DEFAULT_KVSTORE_STAGING_MB))]
     pub kvstore_staging_mb: u64,
     /// Checkpoint pages one scheduler tick copies off the device for the disk
     /// writer, in mebibytes: what the write-behind costs a decoding stream per
     /// step.
-    #[arg(long, env = "SHISO_KVSTORE_PUMP_MB", default_value_t = DEFAULT_KVSTORE_PUMP_MB)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_PUMP_MB", default_value_t = DEFAULT_KVSTORE_PUMP_MB))]
     pub kvstore_pump_mb: u64,
     /// How long a shutdown waits for queued disk writes before abandoning them,
     /// in seconds. Keep it under the service manager's stop timeout.
-    #[arg(long, env = "SHISO_KVSTORE_DRAIN_SECS", default_value_t = DEFAULT_KVSTORE_DRAIN_SECS)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_KVSTORE_DRAIN_SECS", default_value_t = DEFAULT_KVSTORE_DRAIN_SECS))]
     pub kvstore_drain_secs: u64,
     /// Ids the server keeps from finished turns, so the next prompt in a
     /// conversation carries the ids the model generated rather than a
     /// re-encoding of their text that can split differently and miss the
     /// prefix cache. Zero keeps none.
-    #[arg(long, env = "SHISO_TURN_REPLAY_TOKENS", default_value_t = DEFAULT_TURN_REPLAY_TOKENS)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_TURN_REPLAY_TOKENS", default_value_t = DEFAULT_TURN_REPLAY_TOKENS))]
     pub turn_replay_tokens: usize,
     /// Seconds between the engine's info lines of prefill and decode rates,
     /// speculation acceptance and cache use, printed while requests run and
     /// once as they finish. Zero turns the line off.
-    #[arg(long, env = "SHISO_LOG_STATS_INTERVAL", default_value_t = DEFAULT_LOG_STATS_INTERVAL_SECS)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_LOG_STATS_INTERVAL", default_value_t = DEFAULT_LOG_STATS_INTERVAL_SECS))]
     pub log_stats_interval: u64,
     /// Replay a decode step's launches from a captured device graph.
     ///
@@ -291,14 +294,17 @@ pub struct ServeArgs {
     /// two arms are meant to answer identically and a difference between them
     /// is a bug in the capture. `--no-decode-graphs` is what an operator turns
     /// on to find out which side of that line a wrong answer is on.
-    #[arg(long, env = "SHISO_NO_DECODE_GRAPHS", default_value_t = false)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_NO_DECODE_GRAPHS", default_value_t = false)
+    )]
     pub no_decode_graphs: bool,
     /// Speculative decode depth. Zero is plain decode.
     ///
     /// Read only by the arm of the model factory whose architecture implements
     /// speculation; a knob one architecture reads belongs to that
     /// architecture's arm rather than to a union-of-all-models options struct.
-    #[arg(long, env = "SHISO_SPEC_K", default_value_t = 0)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPEC_K", default_value_t = 0))]
     pub spec_k: u32,
     /// Prompt-lookup drafts: tokens a step may propose by finding the text
     /// being written earlier in the context. Zero is off.
@@ -309,7 +315,10 @@ pub struct ServeArgs {
     /// same place. The verify pass is `1 + max(--spec-k, this)` rows at the
     /// widest, which is what the per-session rollback records are sized for.
     /// Read by the sparse family's arm, and only beside `--spec-k`.
-    #[arg(long, env = "SHISO_SPEC_LOOKUP", default_value_t = 0)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_SPEC_LOOKUP", default_value_t = 0)
+    )]
     pub spec_lookup: u32,
     /// Capture the speculative verify passes as device graphs, one per row
     /// count and session, as the single-row step already is.
@@ -317,7 +326,10 @@ pub struct ServeArgs {
     /// Off, a verify pass is encoded launch by launch every step: thousands of
     /// launches whose host cost shows as gaps between them. On, the first pass
     /// at each width pays a capture. Read by the sparse family's arm.
-    #[arg(long, env = "SHISO_CAPTURE_VERIFY", default_value_t = false)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_CAPTURE_VERIFY", default_value_t = false)
+    )]
     pub capture_verify: bool,
     /// Capture passes over several sessions as device graphs, one per distinct
     /// pass: its sessions in row order and every launch's arguments.
@@ -325,7 +337,10 @@ pub struct ServeArgs {
     /// Off, a decode batch or a batched verify is encoded launch by launch
     /// every step, and at four sessions the device idled 6 ms of each 58 ms
     /// step waiting on the host. Read by the sparse family's arm.
-    #[arg(long, env = "SHISO_CAPTURE_BATCH", default_value_t = false)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_CAPTURE_BATCH", default_value_t = false)
+    )]
     pub capture_batch: bool,
     /// Preserve the ordinary target sampling distribution instead of accepting
     /// target-matching greedy drafts directly.
@@ -333,7 +348,10 @@ pub struct ServeArgs {
     /// Off by default: opportunistic speculation accepts matching greedy drafts
     /// even at non-zero temperature. When set, non-greedy sequences fall back
     /// to ordinary batched decoding on models without a two-phase verifier.
-    #[arg(long, env = "SHISO_MTP_EXACT_SAMPLING", default_value_t = false)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_MTP_EXACT_SAMPLING", default_value_t = false)
+    )]
     pub mtp_exact_sampling: bool,
     /// Keep half-precision projections as the checkpoint stores them rather
     /// than repacking them to twelve bits a weight at load.
@@ -342,7 +360,10 @@ pub struct ServeArgs {
     /// a decode step streams a quarter fewer of those bytes; this is the way
     /// back to the stored form for a comparison. Read by the sparse family's
     /// arm.
-    #[arg(long, env = "SHISO_NO_PACK_HALVES", default_value_t = false)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_NO_PACK_HALVES", default_value_t = false)
+    )]
     pub no_pack_halves: bool,
     /// The draft head: a sidecar weights file beside the checkpoint.
     ///
@@ -351,7 +372,7 @@ pub struct ServeArgs {
     /// The two go together: a head with no depth drafts nothing, and a depth
     /// with no head has nothing to draft with, so either alone is refused
     /// rather than quietly ignored.
-    #[arg(long, env = "SHISO_DRAFT_MODEL")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_DRAFT_MODEL"))]
     pub draft_model: Option<PathBuf>,
     /// Corpus token counts the draft's vocabulary head is narrowed from.
     ///
@@ -360,7 +381,7 @@ pub struct ServeArgs {
     /// costs. A token the narrowed head cannot reach is a guess the target
     /// rejects - a verify row that was paid for either way - so this trades
     /// acceptance for speed and never correctness.
-    #[arg(long, env = "SHISO_DRAFT_VOCAB")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_DRAFT_VOCAB"))]
     pub draft_vocab: Option<PathBuf>,
 
     /// Device memory kept for the towers' output, in mebibytes: a picture seen
@@ -370,7 +391,7 @@ pub struct ServeArgs {
     /// so the default holds a long agent session's screenshots. It is set aside
     /// before the key/value pool is sized, and only when `--vision` names a
     /// tower.
-    #[arg(long, env = "SHISO_VISION_CACHE_MB", default_value_t = DEFAULT_VISION_CACHE_MB)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION_CACHE_MB", default_value_t = DEFAULT_VISION_CACHE_MB))]
     pub vision_cache_mb: u64,
 
     /// Row-cache budget for the per-layer embedding table, in mebibytes.
@@ -380,7 +401,7 @@ pub struct ServeArgs {
     /// rather than held on the device, and this is what a decode step is allowed
     /// to keep of it between steps. Zero disables the cache, which reads every
     /// row from disk and is the slow, correct answer.
-    #[arg(long, env = "SHISO_PLE_CACHE_MB", default_value_t = DEFAULT_PLE_CACHE_MB)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_PLE_CACHE_MB", default_value_t = DEFAULT_PLE_CACHE_MB))]
     pub ple_cache_mb: u64,
     /// Hold the whole per-layer embedding table in host memory.
     ///
@@ -391,7 +412,10 @@ pub struct ServeArgs {
     /// touches the disk, at the cost of about 2.3 GB more resident memory for
     /// the E4B table, on top of the 5.1 GB mapping the checkpoint itself
     /// costs.
-    #[arg(long, env = "SHISO_PLE_RESIDENT", default_value_t = false)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_PLE_RESIDENT", default_value_t = false)
+    )]
     pub ple_resident: bool,
 
     /// Where a sparse checkpoint's routed expert banks live: imported beside
@@ -402,21 +426,27 @@ pub struct ServeArgs {
     /// `--expert-reserve-gb` to spare, and streams them otherwise; the other
     /// two insist, and `resident` on a device that cannot hold them fails at
     /// the first allocation that does not fit.
-    #[arg(long, env = "SHISO_EXPERT_RESIDENCY", value_enum, default_value_t = ExpertResidencyChoice::Auto)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_EXPERT_RESIDENCY", value_enum, default_value_t = ExpertResidencyChoice::Auto))]
     pub expert_residency: ExpertResidencyChoice,
     /// Gibibytes of the device's working set the automatic residency choice
     /// leaves for the cache, the activations and the n-gram rows.
     ///
     /// Larger is a smaller expert pool and a larger cache; the pool is sized
     /// from what is left.
-    #[arg(long, env = "SHISO_EXPERT_RESERVE_GB", default_value_t = 6)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_EXPERT_RESERVE_GB", default_value_t = 6)
+    )]
     pub expert_reserve_gb: u64,
     /// Expert slots when the banks are streamed; zero sizes the pool from the
     /// working set.
     ///
     /// One slot holds one expert of one layer, 2.6 MiB for the published
     /// checkpoint.
-    #[arg(long, env = "SHISO_EXPERT_SLOTS", default_value_t = 0)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_EXPERT_SLOTS", default_value_t = 0)
+    )]
     pub expert_slots: u32,
 
     /// The per-layer n-gram embedding table, for a checkpoint that keeps it in
@@ -424,7 +454,7 @@ pub struct ServeArgs {
     ///
     /// Required by that checkpoint and refused beside any other: the table is
     /// read from here and never looked for by name beside `--model`.
-    #[arg(long, env = "SHISO_NGRAM")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_NGRAM"))]
     pub ngram: Option<PathBuf>,
 
     /// The vision tower: a sidecar weights file, a multimodal-projector GGUF
@@ -432,92 +462,119 @@ pub struct ServeArgs {
     /// tower shard.
     ///
     /// Absent means text only, and the encoder is never loaded.
-    #[arg(long, env = "SHISO_VISION")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION"))]
     pub vision: Option<PathBuf>,
     /// Pixel ceiling one image may occupy after resizing.
-    #[arg(long, env = "SHISO_VISION_MAX_PIXELS", default_value_t = DEFAULT_VISION_MAX_PIXELS)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION_MAX_PIXELS", default_value_t = DEFAULT_VISION_MAX_PIXELS))]
     pub vision_max_pixels: usize,
     /// Allow fetching media named by an http or https address.
     ///
     /// Off by default, and the refusal happens before any network call: a
     /// server that fetches whatever a request names is a request-forgery
     /// primitive that happens to also caption pictures.
-    #[arg(
-        long,
-        env = "SHISO_VISION_ALLOW_REMOTE_IMAGES",
-        default_value_t = false
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            env = "SHISO_VISION_ALLOW_REMOTE_IMAGES",
+            default_value_t = false
+        )
     )]
     pub vision_allow_remote_images: bool,
     /// Allow decoding video other than GIF: the OS decoder, then the pure-Rust
     /// one, then ffmpeg when `--ffmpeg-path` is set.
-    #[arg(long, env = "SHISO_VIDEO_ALLOW_DECODE", default_value_t = false)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_VIDEO_ALLOW_DECODE", default_value_t = false)
+    )]
     pub video_allow_decode: bool,
     /// The ffmpeg binary, for the containers and codecs nothing else in this
     /// build decodes. A bare name is resolved on `PATH`; an absolute path pins
     /// a known build. There is no default: without it ffmpeg is never loaded or
     /// spawned, for video or for audio.
     #[cfg(feature = "decode-ffmpeg")]
-    #[arg(long, env = "SHISO_FFMPEG_PATH")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_FFMPEG_PATH"))]
     pub ffmpeg_path: Option<PathBuf>,
     /// Frames a second to sample a clip at.
-    #[arg(long, env = "SHISO_VIDEO_FPS", default_value_t = shiso_vision::DEFAULT_FPS)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VIDEO_FPS", default_value_t = shiso_vision::DEFAULT_FPS))]
     pub video_fps: f64,
     /// Frames one clip may contribute.
-    #[arg(long, env = "SHISO_VIDEO_MAX_FRAMES", default_value_t = shiso_vision::DEFAULT_MAX_FRAMES)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VIDEO_MAX_FRAMES", default_value_t = shiso_vision::DEFAULT_MAX_FRAMES))]
     pub video_max_frames: usize,
     /// Wall-clock budget for one decode, in seconds.
-    #[arg(long, env = "SHISO_VIDEO_DECODE_TIMEOUT_S", default_value_t = 20)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_VIDEO_DECODE_TIMEOUT_S", default_value_t = 20)
+    )]
     pub video_decode_timeout_s: u64,
     /// The longest audio clip one request may carry, in seconds.
     ///
     /// Checked on the decoded length, before any mel frame is computed. A
     /// tower's own limit still applies beneath it.
-    #[arg(long, env = "SHISO_AUDIO_MAX_SECONDS", default_value = "7200")]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_AUDIO_MAX_SECONDS", default_value = "7200")
+    )]
     pub audio_max_seconds: NonZeroU32,
     /// The largest transcription upload, in MiB. Only the transcription
     /// routes take it; every other route keeps the JSON body limit.
-    #[arg(long, env = "SHISO_AUDIO_MAX_UPLOAD_MB", default_value = "512")]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_AUDIO_MAX_UPLOAD_MB", default_value = "512")
+    )]
     pub audio_max_upload_mb: NonZeroU32,
     /// The largest image edit request body, in MiB. Only the image edit
     /// routes take it; every other route keeps the JSON body limit.
-    #[arg(long, env = "SHISO_IMAGE_MAX_UPLOAD_MB", default_value = "64")]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_IMAGE_MAX_UPLOAD_MB", default_value = "64")
+    )]
     pub image_max_upload_mb: NonZeroU32,
     /// Speech recognizer checkpoint: an export directory or a GGUF file.
     /// Serves `/v1/audio/transcriptions`.
-    #[arg(long, env = "SHISO_ASR_MODEL")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_ASR_MODEL"))]
     pub asr_model: Option<PathBuf>,
     /// The audio-tower GGUF (an `mmproj-*.gguf`) for a recognizer whose GGUF
     /// export keeps its tower apart from the text model. Without it the one
     /// mmproj beside `--asr-model` with the same quantisation suffix is taken,
     /// and none or several is refused. Needs `--asr-model`.
-    #[arg(long, env = "SHISO_ASR_MMPROJ")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_ASR_MMPROJ"))]
     pub asr_mmproj: Option<PathBuf>,
     /// The name the recognizer answers to in a transcription's `model` field.
     /// Defaults to the last component of `--asr-model`, extension removed.
-    #[arg(long, env = "SHISO_ASR_ID")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_ASR_ID"))]
     pub asr_id: Option<String>,
     /// Speaker diarizer checkpoint, for `response_format=diarized_json`.
     /// Needs `--asr-model`.
-    #[arg(long, env = "SHISO_DIARIZATION_MODEL")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_DIARIZATION_MODEL"))]
     pub diarization_model: Option<PathBuf>,
     /// Encoder frames of future context the recognizer uses: one of the
     /// lookaheads the checkpoint was trained for, checked when it loads. More
     /// is more accurate and later to emit.
-    #[arg(long, env = "SHISO_ASR_LOOKAHEAD", default_value_t = 13)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_ASR_LOOKAHEAD", default_value_t = 13)
+    )]
     pub asr_lookahead: usize,
     /// Transcriptions advanced at once; the rest wait in the queue.
-    #[arg(long, env = "SHISO_AUDIO_MAX_STREAMS", default_value_t = 4)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_AUDIO_MAX_STREAMS", default_value_t = 4)
+    )]
     pub audio_max_streams: usize,
     /// Chunks an offline transcription decodes at once, on a recognizer that
     /// batches: one weight read per step serves this many. Streaming
     /// requests decode one at a time whatever it is.
-    #[arg(long, env = "SHISO_ASR_BATCH", default_value_t = 8)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_ASR_BATCH", default_value_t = 8)
+    )]
     pub asr_batch: usize,
     /// Whether an offline transcription with a diarizer loaded leaves out
     /// silences of 3 s or more where no speaker is active. Skipped audio
     /// yields no text: speech the diarizer misses there is lost.
     /// `--asr-skip-silence=false` transcribes them.
-    #[arg(
+    #[cfg_attr(feature = "clap", arg(
         long,
         env = "SHISO_ASR_SKIP_SILENCE",
         default_value_t = true,
@@ -525,86 +582,98 @@ pub struct ServeArgs {
         default_missing_value = "true",
         require_equals = true,
         action = clap::ArgAction::Set
-    )]
+    ))]
     pub asr_skip_silence: bool,
     /// The shortest clip, in seconds, that a non-streaming transcription
     /// plans whole and decodes in batches, on a recognizer that batches;
     /// shorter clips keep the chunk-by-chunk path. 0 sends every
     /// non-streaming transcription offline.
-    #[arg(
+    #[cfg_attr(feature = "clap", arg(
         long,
         env = "SHISO_ASR_OFFLINE_MIN_SECS",
         default_value_t = crate::audio::DEFAULT_OFFLINE_MIN_SECS
-    )]
+    ))]
     pub asr_offline_min_secs: u32,
     /// The most tokens a transcription's `keywords` and `prompt` may take in
     /// the recognizer's prompt, once worded and tokenized; a request past it
     /// is refused. At most the recognizer's own cap (512 for the Qwen3-ASR
     /// family); every chunk's prefill carries them.
-    #[arg(long, env = "SHISO_ASR_MAX_CONTEXT_TOKENS", default_value_t = 256)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_ASR_MAX_CONTEXT_TOKENS", default_value_t = 256)
+    )]
     pub asr_max_context_tokens: usize,
     /// Image generation model to serve: a checkpoint file or a checkpoint
     /// directory. Serves the image generation routes.
-    #[arg(long, env = "SHISO_IMAGE_MODEL")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_MODEL"))]
     pub image_model: Option<PathBuf>,
     /// The name the image generator answers to on the wire. Defaults to the
     /// name the loaded checkpoint reports for itself.
-    #[arg(long, env = "SHISO_IMAGE_MODEL_ID")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_MODEL_ID"))]
     pub image_model_id: Option<String>,
     /// Directory holding shared image assets (`text_encoder`, `vae` or
     /// `ae.safetensors`, `tokenizer`) when they are not collocated with
     /// `--image-model`.
-    #[arg(long, env = "SHISO_IMAGE_ASSETS_DIR")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_ASSETS_DIR"))]
     pub image_assets_dir: Option<PathBuf>,
     /// Explicit path to the text encoder weights when they are split from
     /// `--image-model`. Overrides where the locator would otherwise look.
-    #[arg(long, env = "SHISO_IMAGE_TEXT_ENCODER")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_TEXT_ENCODER"))]
     pub image_text_encoder: Option<PathBuf>,
     /// Explicit path to the VAE weights when they are split from
     /// `--image-model`. Overrides where the locator would otherwise look.
-    #[arg(long, env = "SHISO_IMAGE_VAE")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_VAE"))]
     pub image_vae: Option<PathBuf>,
     /// Explicit path to the tokenizer when it is split from `--image-model`.
     /// Overrides where the locator would otherwise look.
-    #[arg(long, env = "SHISO_IMAGE_TOKENIZER")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_TOKENIZER"))]
     pub image_tokenizer: Option<PathBuf>,
     /// Image requests that may wait in the queue beyond the one generating;
     /// the next is refused with a 503 a retry can fix.
-    #[arg(long, env = "SHISO_IMAGE_MAX_QUEUE", default_value_t = 16)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_IMAGE_MAX_QUEUE", default_value_t = 16)
+    )]
     pub image_max_queue: usize,
     /// Embedding requests that may wait in the queue beyond the one running,
     /// when `--model` is an embedding checkpoint; the next is refused with a
     /// 503 a retry can fix.
-    #[arg(long, env = "SHISO_EMBEDDING_MAX_QUEUE", default_value_t = 64)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_EMBEDDING_MAX_QUEUE", default_value_t = 64)
+    )]
     pub embedding_max_queue: usize,
     /// Denoising steps a request that names none gets. More is slower and,
     /// past the point the checkpoint was distilled for, not better.
     /// Unset, the loaded model's own default (or fixed schedule) is used:
     /// 4 for FLUX.2-klein, 16 for the distilled FLUX.3 Klein.
-    #[arg(long, env = "SHISO_IMAGE_DEFAULT_STEPS")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_DEFAULT_STEPS"))]
     pub image_default_steps: Option<u32>,
     /// The image size a request that names none gets, as `WxH`
     /// (e.g. 1024x1024). Both sides must sit on the loaded model's grid and
     /// within its bounds; unset, the model's own default size is used
     /// (1024x1024 on a 16-pixel grid for FLUX.2-klein and FLUX.3 Klein, whose
     /// sides run 64 to 4096).
-    #[arg(long, env = "SHISO_IMAGE_DEFAULT_SIZE")]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_DEFAULT_SIZE"))]
     pub image_default_size: Option<String>,
     /// Which image pipeline components stay loaded across jobs: `auto`
     /// keeps all of them when they fit the device's working set beside a
     /// job and otherwise swaps; `resident` refuses a job that does not fit;
     /// `swap` lets the text encoder and the transformer take turns (the
     /// FLUX.3 Klein and Qwen-Image-2.1 pipelines; FLUX.2-klein refuses it).
-    #[arg(
+    #[cfg_attr(feature = "clap", arg(
         long,
         env = "SHISO_IMAGE_RESIDENCY",
         value_enum,
         default_value_t = ImageResidencyChoice::Auto
-    )]
+    ))]
     pub image_residency: ImageResidencyChoice,
     /// GiB of the device working set the image pipeline leaves to the rest
     /// of the host when it plans what stays loaded.
-    #[arg(long, env = "SHISO_IMAGE_RESERVE_GB", default_value_t = 1.5)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_IMAGE_RESERVE_GB", default_value_t = 1.5)
+    )]
     pub image_reserve_gb: f64,
     /// Leading denoising steps of every image job run at half the
     /// requested resolution; the job then finishes at its own size. Each
@@ -612,7 +681,10 @@ pub struct ServeArgs {
     /// detail. 0 runs every step at full size. A job must keep at least one
     /// full-size step, and a model without a draft stage refuses a nonzero
     /// count at boot.
-    #[arg(long, env = "SHISO_IMAGE_DRAFT_STEPS", default_value_t = 0)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_IMAGE_DRAFT_STEPS", default_value_t = 0)
+    )]
     pub image_draft_steps: u32,
     /// Transformer blocks `START:END` (end exclusive) the last denoising
     /// step of every image job skips, adding instead the residual the step
@@ -620,23 +692,23 @@ pub struct ServeArgs {
     /// of that step at some cost in fidelity. The job's last two steps must
     /// both run at full size (see `--image-draft-steps`). Unset, every
     /// block of every step runs.
-    #[arg(long, env = "SHISO_IMAGE_FINAL_REUSE", value_parser = parse_block_span)]
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_FINAL_REUSE", value_parser = parse_block_span))]
     pub image_final_reuse: Option<BlockSpan>,
     /// Which reasoning parser to use on model output.
-    #[arg(
+    #[cfg_attr(feature = "clap", arg(
         long,
         env = "SHISO_REASONING_PARSER",
         value_enum,
         default_value_t = ParserChoice::Auto
-    )]
+    ))]
     pub reasoning_parser: ParserChoice,
     /// Which tool-call parser to use on model output.
-    #[arg(
+    #[cfg_attr(feature = "clap", arg(
         long,
         env = "SHISO_TOOL_CALL_PARSER",
         value_enum,
         default_value_t = ParserChoice::Auto
-    )]
+    ))]
     pub tool_call_parser: ParserChoice,
 }
 
@@ -650,6 +722,7 @@ pub struct BlockSpan {
 }
 
 /// Parses `START:END` into a non-empty [`BlockSpan`].
+#[cfg(feature = "clap")]
 fn parse_block_span(text: &str) -> Result<BlockSpan, String> {
     let (start, end) = text
         .split_once(':')
@@ -789,7 +862,140 @@ pub enum ConfigError {
     },
 }
 
-impl ServeArgs {
+/// The option names a caller set itself, as opposed to the ones that still hold
+/// their built-in default.
+///
+/// A name is a field of [`ServeOptions`] spelled as the field (`"ctx"`,
+/// `"max_num_seqs"`), which is also the id clap gives the flag. The recipe merge
+/// asks it before replacing a value: a registry recipe may tune a setting the
+/// operator left alone, never one they chose. The command line builds it from
+/// what it parsed - a flag or its `SHISO_*` variable counts as set; an embedder
+/// passes the names it set, or nothing, and [`Default`] is the empty set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExplicitlySet(std::collections::BTreeSet<String>);
+
+impl ExplicitlySet {
+    /// Whether `name` was set explicitly.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.contains(name)
+    }
+
+    /// Records that `name` was set explicitly.
+    pub fn insert(&mut self, name: impl Into<String>) {
+        self.0.insert(name.into());
+    }
+
+    /// Whether nothing was set explicitly.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<S: Into<String>> FromIterator<S> for ExplicitlySet {
+    fn from_iter<I: IntoIterator<Item = S>>(names: I) -> Self {
+        Self(names.into_iter().map(Into::into).collect())
+    }
+}
+
+const fn nonzero(value: u32) -> NonZeroU32 {
+    match NonZeroU32::new(value) {
+        Some(value) => value,
+        None => NonZeroU32::MIN,
+    }
+}
+
+impl Default for ServeOptions {
+    /// The values the command line gives a flag nobody passed.
+    fn default() -> Self {
+        Self {
+            model: None,
+            model_name: None,
+            config: None,
+            tokenizer: None,
+            chat_template: None,
+            generation_config: None,
+            bind: DEFAULT_BIND.to_owned(),
+            port: DEFAULT_PORT,
+            ctx: DEFAULT_CTX,
+            max_num_seqs: crate::scheduler::DEFAULT_MAX_NUM_SEQS,
+            profile_dir: None,
+            solo_prefill_chunk: crate::scheduler::DEFAULT_SOLO_CHUNK,
+            mixed_prefill_quantum: crate::scheduler::DEFAULT_MIXED_QUANTUM,
+            max_num_batched_tokens: None,
+            kv_cache_tokens: None,
+            gpu_memory_utilization: None,
+            kv_cache_dtype: KvCacheDtype::F16,
+            prefill_activations: PrefillActivations::A16,
+            kv_checkpoints: shiso_engine::EngineOptions::new().kv_ckpt_slots,
+            kvstore_dir: None,
+            kvstore_budget_mb: None,
+            kvstore_min_tokens: DEFAULT_KVSTORE_MIN_TOKENS,
+            kvstore_staging_mb: DEFAULT_KVSTORE_STAGING_MB,
+            kvstore_pump_mb: DEFAULT_KVSTORE_PUMP_MB,
+            kvstore_drain_secs: DEFAULT_KVSTORE_DRAIN_SECS,
+            turn_replay_tokens: DEFAULT_TURN_REPLAY_TOKENS,
+            log_stats_interval: DEFAULT_LOG_STATS_INTERVAL_SECS,
+            no_decode_graphs: false,
+            spec_k: 0,
+            spec_lookup: 0,
+            capture_verify: false,
+            capture_batch: false,
+            mtp_exact_sampling: false,
+            no_pack_halves: false,
+            draft_model: None,
+            draft_vocab: None,
+            vision_cache_mb: DEFAULT_VISION_CACHE_MB,
+            ple_cache_mb: DEFAULT_PLE_CACHE_MB,
+            ple_resident: false,
+            expert_residency: ExpertResidencyChoice::Auto,
+            expert_reserve_gb: 6,
+            expert_slots: 0,
+            ngram: None,
+            vision: None,
+            vision_max_pixels: DEFAULT_VISION_MAX_PIXELS,
+            vision_allow_remote_images: false,
+            video_allow_decode: false,
+            #[cfg(feature = "decode-ffmpeg")]
+            ffmpeg_path: None,
+            video_fps: shiso_vision::DEFAULT_FPS,
+            video_max_frames: shiso_vision::DEFAULT_MAX_FRAMES,
+            video_decode_timeout_s: 20,
+            audio_max_seconds: nonzero(7200),
+            audio_max_upload_mb: nonzero(512),
+            image_max_upload_mb: nonzero(64),
+            asr_model: None,
+            asr_mmproj: None,
+            asr_id: None,
+            diarization_model: None,
+            asr_lookahead: 13,
+            audio_max_streams: 4,
+            asr_batch: 8,
+            asr_skip_silence: true,
+            asr_offline_min_secs: crate::audio::DEFAULT_OFFLINE_MIN_SECS,
+            asr_max_context_tokens: 256,
+            image_model: None,
+            image_model_id: None,
+            image_assets_dir: None,
+            image_text_encoder: None,
+            image_vae: None,
+            image_tokenizer: None,
+            image_max_queue: 16,
+            embedding_max_queue: 64,
+            image_default_steps: None,
+            image_default_size: None,
+            image_residency: ImageResidencyChoice::Auto,
+            image_reserve_gb: 1.5,
+            image_draft_steps: 0,
+            image_final_reuse: None,
+            reasoning_parser: ParserChoice::Auto,
+            tool_call_parser: ParserChoice::Auto,
+        }
+    }
+}
+
+impl ServeOptions {
     /// Checks the settings that clap cannot.
     ///
     /// # Errors
@@ -1049,7 +1255,7 @@ impl ServeArgs {
     /// # Errors
     ///
     /// Whatever [`shiso_engine::KvFit::new`] reports for a share outside
-    /// `(0, 1]` or no sessions, which [`ServeArgs::validate`] has already
+    /// `(0, 1]` or no sessions, which [`ServeOptions::validate`] has already
     /// refused by flag name.
     pub fn kv_fit(&self) -> shiso_core::CoreResult<Option<shiso_engine::KvFit>> {
         let Some(fraction) = self.gpu_memory_utilization else {
@@ -1067,7 +1273,7 @@ impl ServeArgs {
     /// # Errors
     ///
     /// Whatever [`shiso_engine::KvCheck::new`] reports for no sessions, which
-    /// [`ServeArgs::validate`] has already refused by flag name.
+    /// [`ServeOptions::validate`] has already refused by flag name.
     pub fn kv_check(&self) -> shiso_core::CoreResult<Option<shiso_engine::KvCheck>> {
         if self.gpu_memory_utilization.is_some() {
             return Ok(None);
@@ -1097,7 +1303,7 @@ impl ServeArgs {
     /// `--model-name` when it was given, and otherwise the file stem, which is
     /// what an operator typed and therefore what they will put in a client's
     /// model field. A checkpoint with no file name has already been refused by
-    /// [`ServeArgs::validate`]; the fallback here keeps the accessor total rather
+    /// [`ServeOptions::validate`]; the fallback here keeps the accessor total rather
     /// than giving it a second failure mode.
     #[must_use]
     pub fn model_id(&self) -> String {
@@ -1348,12 +1554,13 @@ impl ServeArgs {
 }
 
 /// `--kv-cache-dtype`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum KvCacheDtype {
     /// Half precision, two bytes an element.
     F16,
     /// FP8 E4M3 at a static scale of 1, one byte an element.
-    #[value(alias = "fp8_e4m3")]
+    #[cfg_attr(feature = "clap", value(alias = "fp8_e4m3"))]
     Fp8,
 }
 
@@ -1367,7 +1574,8 @@ impl From<KvCacheDtype> for shiso_core::page::KvElem {
 }
 
 /// `--prefill-activations`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum PrefillActivations {
     /// Half-precision prompt activations against the decoded weights.
     A16,
@@ -1390,7 +1598,8 @@ impl From<PrefillActivations> for shiso_engine::sparse::matmul::PrefillActivatio
 }
 
 /// Where the routed expert banks live, as the operator asked for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum ExpertResidencyChoice {
     /// Resident when they fit, streamed when they do not.
     Auto,
@@ -1401,7 +1610,8 @@ pub enum ExpertResidencyChoice {
 }
 
 /// `--image-residency`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum ImageResidencyChoice {
     /// Resident when everything fits, else swap.
     Auto,
@@ -1422,7 +1632,8 @@ impl From<ImageResidencyChoice> for shiso_models::image_registry::ImageResidency
 }
 
 /// The parser choice specified via CLI flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum ParserChoice {
     /// Use the model family's default parser.
     Auto,
@@ -1463,6 +1674,56 @@ impl ParserChoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_options_default_validates() {
+        // Nothing to serve is the one thing the defaults cannot supply; with a
+        // checkpoint named, nothing else is out of range, so an embedder starts
+        // from `default()` and sets only what it needs.
+        assert!(matches!(
+            ServeOptions::default().validate(),
+            Err(ConfigError::NothingToServe)
+        ));
+        let options = ServeOptions {
+            model: Some(PathBuf::from("/models/m.gguf")),
+            ..ServeOptions::default()
+        };
+        options.validate().expect("the defaults are valid");
+        assert!(ExplicitlySet::default().is_empty());
+    }
+
+    #[test]
+    fn explicitly_set_remembers_names() {
+        let set: ExplicitlySet = ["ctx", "port"].into_iter().collect();
+        assert!(set.contains("ctx"));
+        assert!(!set.contains("spec_k"));
+    }
+
+    /// The hand-written [`Default`] and the clap defaults are two spellings of
+    /// one list; this is what keeps them one list.
+    #[cfg(feature = "clap")]
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "a test that cannot run says on stderr why it skipped"
+    )]
+    fn default_matches_what_clap_gives_an_empty_command_line() {
+        use clap::Parser as _;
+
+        #[derive(Debug, clap::Parser)]
+        struct Probe {
+            #[command(flatten)]
+            options: ServeOptions,
+        }
+        // `try_parse_from` reads `SHISO_*`; a developer shell with one set would
+        // make this test about the shell.
+        let parsed = Probe::try_parse_from(["probe"]).expect("an empty command line parses");
+        if std::env::vars().any(|(name, _)| name.starts_with("SHISO_")) {
+            eprintln!("SKIP: a SHISO_* variable is set and would override the defaults");
+            return;
+        }
+        assert_eq!(parsed.options, ServeOptions::default());
+    }
 
     #[test]
     fn parser_choice_resolves_against_defaults() {

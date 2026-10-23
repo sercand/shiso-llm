@@ -26,8 +26,8 @@ use shiso_hub::select::select_variant;
 use shiso_hub::store::{BlobStore, InstalledVariantSummary};
 
 use crate::cli::{
-    HubArgs, InfoArgs, ListArgs, ModelArgKind, ProgressStyle, PullArgs, RmArgs, ServeArgs,
-    VerifyArgs, apply_recipe_defaults, classify_model_arg,
+    ExplicitlySet, HubArgs, InfoArgs, ListArgs, ModelArgKind, ProgressStyle, PullArgs, RmArgs,
+    ServeArgs, VerifyArgs, apply_recipe_defaults_unless_set, classify_model_arg,
 };
 
 /// Builds a `HostProfile` based on compile-time features and runtime RAM probing (§5.2).
@@ -126,7 +126,7 @@ pub fn build_hub_config(args: &HubArgs) -> anyhow::Result<HubConfig> {
 // None is not a refusal: a direct filesystem path was provided or no model was specified, so no shared lock was taken.
 pub fn resolve_serve_model(
     args: &mut ServeArgs,
-    serve_matches: Option<&clap::ArgMatches>,
+    explicit: Option<&ExplicitlySet>,
 ) -> anyhow::Result<Option<File>> {
     let Some(model_ref_str) = &args.model_ref else {
         return Ok(None);
@@ -171,7 +171,11 @@ pub fn resolve_serve_model(
             populate_serve_args_from_variant(args, &vdir, variant, &recipe.name)?;
 
             if let Some(defaults) = &variant.server_defaults {
-                apply_recipe_defaults(args, serve_matches, defaults);
+                apply_recipe_defaults_unless_set(
+                    args,
+                    explicit.unwrap_or(&ExplicitlySet::default()),
+                    defaults,
+                );
             }
 
             Ok(Some(lock_file))

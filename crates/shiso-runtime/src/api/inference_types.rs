@@ -1,11 +1,12 @@
 //! The wire shapes the informational routes answer with.
 //!
-//! These are the only serde types in the crate, and that is on purpose: the
+//! These are the serde types the runtime keeps, and that is on purpose: the
 //! conversation IR carries no serde derives, because each surface owns its own
 //! wire structs and parses into the neutral types rather than deriving them.
 //! The routes here have no neutral counterpart - there is no IR type for "the
 //! list of models this server serves" - so their wire shape is their only
-//! shape, and it lives beside the handlers that build it.
+//! shape. It lives in the runtime, next to the state it describes, and the HTTP
+//! handlers in `shiso-server` that build it import it from here.
 
 use serde::Serialize;
 

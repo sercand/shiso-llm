@@ -10,7 +10,7 @@ use shiso_ir::{Block, Message, Response, Role, StopReason, Thinking, ToolUse, Us
 use shiso_server::anthropic::messages_encode;
 use shiso_server::openai::{chat_encode, responses_encode};
 
-fn calls(n: usize, content: Vec<Block>) -> Response {
+fn calls(n: usize, content: Vec<Block>, reasoning_tokens: u64) -> Response {
     let mut blocks = content;
     for i in 0..n {
         blocks.push(Block::ToolUse(ToolUse::new(
@@ -26,7 +26,7 @@ fn calls(n: usize, content: Vec<Block>) -> Response {
         message: Message::new(Role::Assistant, blocks),
         stop: StopReason::ToolUse,
         usage: Usage {
-            reasoning_tokens: 3,
+            reasoning_tokens,
             ..Usage::default()
         },
         logprobs: None,
@@ -44,6 +44,7 @@ fn a_thinking_turn_with_calls_encodes_trimmed_prose_and_counts_its_trace() {
             Block::Thinking(Thinking::new("plan one plan two\n")),
             Block::Text("I'll read both.".to_owned()),
         ],
+        3,
     );
 
     let chat = chat_encode::encode_response(&response, &chat_encode::EncodeOptions::default());
@@ -79,9 +80,16 @@ fn a_thinking_turn_with_calls_encodes_trimmed_prose_and_counts_its_trace() {
 /// rather than the newlines between the calls.
 #[test]
 fn a_turn_of_only_calls_has_null_content() {
-    let response = calls(3, Vec::new());
+    // The same shape the slot folds to in `shiso-runtime`: a one-line trace
+    // (two reasoning tokens) and three calls, no prose block.
+    let response = calls(3, vec![Block::Thinking(Thinking::new("plan\n"))], 2);
     let chat = chat_encode::encode_response(&response, &chat_encode::EncodeOptions::default());
     let message = &chat["choices"][0]["message"];
     assert_eq!(message["content"], Value::Null);
+    assert_eq!(message["reasoning_content"], "plan\n");
+    assert_eq!(
+        chat["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        2
+    );
     assert_eq!(message["tool_calls"].as_array().map(Vec::len), Some(3));
 }

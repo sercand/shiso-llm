@@ -2985,7 +2985,6 @@ name = "shiso-runtime"
 version = "0.2.4"
 dependencies = [
  "aho-corasick",
- "anyhow",
  "base64 0.22.1",
  "bytes",
  "clap",
@@ -3020,23 +3019,19 @@ dependencies = [
 name = "shiso-server"
 version = "0.2.4"
 dependencies = [
- "aho-corasick",
  "anyhow",
  "axum",
  "base64 0.22.1",
  "clap",
  "futures",
- "http-body",
  "hyper",
  "hyper-util",
  "image",
  "indicatif",
- "minijinja",
  "parking_lot",
  "semver",
  "serde",
  "serde_json",
- "sha2",
  "shiso-audio",
  "shiso-core",
  "shiso-cuda",
@@ -3055,7 +3050,6 @@ dependencies = [
  "thiserror",
  "tokenizers",
  "tokio",
- "tokio-stream",
  "tower",
  "tower-http 0.7.1",
  "tracing",
