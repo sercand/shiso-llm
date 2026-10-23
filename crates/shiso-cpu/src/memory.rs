@@ -15,12 +15,12 @@ use bytemuck::{Pod, Zeroable};
 use shiso_core::{CoreError, CoreResult, DeviceView, RawBuffer};
 
 /// Bytes per [`Chunk`], and so the rounding of every allocation.
-const CHUNK_BYTES: u64 = 16;
+const CHUNK_BYTES: usize = 16;
 
 /// Sixteen bytes with sixteen-byte alignment; the unit slabs are made of.
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 #[repr(C, align(16))]
-pub(crate) struct Chunk([u8; CHUNK_BYTES as usize]);
+pub(crate) struct Chunk([u8; CHUNK_BYTES]);
 
 /// Every live allocation of one CPU device, by handle.
 #[derive(Debug)]
@@ -44,12 +44,13 @@ impl Slabs {
     ///
     /// The handle's size is the rounded one, which the trait allows.
     pub(crate) fn alloc(&mut self, bytes: u64) -> CoreResult<RawBuffer> {
-        let chunks =
-            usize::try_from(bytes.div_ceil(CHUNK_BYTES)).map_err(|_| CoreError::OutOfBounds {
+        let chunks = usize::try_from(bytes.div_ceil(CHUNK_BYTES as u64)).map_err(|_| {
+            CoreError::OutOfBounds {
                 offset: 0,
                 len: bytes,
                 buffer_bytes: 0,
-            })?;
+            }
+        })?;
         let mut slab: Vec<Chunk> = Vec::new();
         // A request the host cannot satisfy is an error the caller can see,
         // not the abort `vec!` would turn it into.
@@ -65,7 +66,7 @@ impl Slabs {
         // fallback keeps the arithmetic total without an `unwrap`.
         self.next = id.checked_add(1).unwrap_or(id);
         self.map.insert(id, slab);
-        Ok(RawBuffer::new(id, chunks as u64 * CHUNK_BYTES))
+        Ok(RawBuffer::new(id, chunks as u64 * CHUNK_BYTES as u64))
     }
 
     /// Drops an allocation. Returns whether the handle was live.
@@ -130,7 +131,7 @@ impl Slabs {
     /// Size in bytes of the allocation `view` names.
     fn slab_bytes(&self, view: DeviceView<'_>) -> CoreResult<usize> {
         let slab = self.map.get(&view.id()).ok_or_else(|| stale(view))?;
-        Ok(slab.len() * CHUNK_BYTES as usize)
+        Ok(slab.len() * CHUNK_BYTES)
     }
 }
 

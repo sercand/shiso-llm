@@ -3,9 +3,7 @@
 
 use std::sync::Arc;
 
-use shiso_core::{
-    Backend, CoreError, DeviceView, Extent3, KernelRef, LaunchArgs, MemTag, alloc,
-};
+use shiso_core::{Backend, CoreError, DeviceView, Extent3, KernelRef, LaunchArgs, MemTag, alloc};
 use shiso_cpu::{CpuBackend, CpuOptions};
 
 fn backend() -> Arc<dyn Backend> {
@@ -98,7 +96,9 @@ fn a_view_past_the_allocation_is_out_of_bounds() {
         wide.len(),
     );
     let mut out = vec![0u8; 48];
-    let err = backend.copy_d2h(forged, &mut out).expect_err("past the end");
+    let err = backend
+        .copy_d2h(forged, &mut out)
+        .expect_err("past the end");
     assert!(matches!(err, CoreError::OutOfBounds { .. }), "{err:?}");
     let err = backend
         .copy_h2d(forged, &[0u8; 48])
