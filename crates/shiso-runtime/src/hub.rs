@@ -26,6 +26,7 @@ use shiso_hub::{
 use tokio::sync::mpsc;
 
 use crate::options::{ExplicitlySet, ServeOptions};
+use crate::private_runtime::PrivateRuntime;
 use crate::recipe_defaults::apply_recipe_defaults_unless_set;
 
 #[cfg(test)]
@@ -56,6 +57,7 @@ pub struct InstalledModel {
 
 /// Why a model could not be made available.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PullError {
     /// This build has no compute backend, or no variant of the model runs on
     /// this host.
@@ -365,39 +367,17 @@ pub fn pull_observed_on(
     // for the calling thread; the future is polled by a bare park loop, which
     // has no objection to being called from inside any executor (it blocks that
     // executor's thread, as any blocking I/O does).
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .map_err(|error| PullError::Request(format!("could not start a runtime: {error}")))?;
-    // Downloads still in flight after a cancel, an error or a panic are dropped
-    // here, not awaited: their partial files are what the next call resumes.
-    // The guard makes that so on every path; a plain drop of a runtime inside
-    // an async context would panic again while unwinding.
-    let runtime = ShutdownInBackground(Some(runtime));
+    // Dropped (shut down without waiting) on every path: downloads still in
+    // flight after a cancel, an error or a panic are dropped, not awaited, and
+    // their partial files are what the next call resumes.
+    let runtime = PrivateRuntime::build(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all(),
+    )
+    .map_err(|error| PullError::Request(format!("could not start a runtime: {error}")))?;
     let _entered = runtime.handle().enter();
     park_on(drive(config, host, &store, &parsed, observer))
-}
-
-/// Shuts its runtime down without waiting when dropped, whatever the thread.
-struct ShutdownInBackground(Option<tokio::runtime::Runtime>);
-
-impl ShutdownInBackground {
-    fn handle(&self) -> &tokio::runtime::Handle {
-        match &self.0 {
-            Some(runtime) => runtime.handle(),
-            // Emptied only by Drop, after which nothing can call this.
-            None => unreachable!("the runtime is present until it is dropped"),
-        }
-    }
-}
-
-impl Drop for ShutdownInBackground {
-    fn drop(&mut self) {
-        if let Some(runtime) = self.0.take() {
-            runtime.shutdown_background();
-        }
-    }
 }
 
 /// Wakes a parked thread.

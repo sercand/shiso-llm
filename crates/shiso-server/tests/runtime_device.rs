@@ -127,6 +127,15 @@ fn open_explicit(
     .unwrap_or_else(|error| panic!("{name} opens: {error:?}"))
 }
 
+/// The installed variant directory of `name`.
+fn variant_dir(name: &str, home: &Path) -> PathBuf {
+    std::fs::read_dir(home.join("models").join(name))
+        .expect("the model directory reads")
+        .map(|entry| entry.expect("an entry").path())
+        .find(|path| path.join("recipe.json").is_file())
+        .expect("an installed variant")
+}
+
 /// The `/v1/decisions` route over an engine booted by `shiso serve`'s own
 /// function, from the same installed directory the runtime reads.
 struct Endpoint {
@@ -136,11 +145,7 @@ struct Endpoint {
 
 impl Endpoint {
     fn boot(name: &str, home: &Path) -> Self {
-        let variants = std::fs::read_dir(home.join("models").join(name))
-            .expect("the model directory reads")
-            .map(|entry| entry.expect("an entry").path())
-            .find(|path| path.join("recipe.json").is_file())
-            .expect("an installed variant");
+        let variants = variant_dir(name, home);
         let mut serve = ServeOptions {
             ctx: 2048,
             ..ServeOptions::default()
@@ -187,6 +192,13 @@ impl Endpoint {
 
 /// `Runtime::decide_blocking` answers what `/v1/decisions` answers.
 fn endpoint_parity(name: &str) {
+    endpoint_parity_from(name, false);
+}
+
+/// [`endpoint_parity`], opening the runtime from the installed directory as a
+/// [`Source::Dir`] (the way an app that manages its own install does), holding
+/// the install's lock itself for the runtime's life.
+fn endpoint_parity_from(name: &str, from_dir: bool) {
     let Some(home) = home_with(name) else { return };
     let _device = exclusive();
     let async_runtime = tokio::runtime::Builder::new_current_thread()
@@ -194,7 +206,22 @@ fn endpoint_parity(name: &str) {
         .build()
         .expect("a runtime");
     let endpoint = Endpoint::boot(name, &home);
-    let runtime = open(name, &home, |_| {});
+    let held = from_dir.then(|| {
+        shiso_runtime::hub::resolve(name, &config_for_home(&home))
+            .expect("the home reads")
+            .expect("the model is installed")
+    });
+    let runtime = if from_dir {
+        let dir = variant_dir(name, &home);
+        Runtime::open(
+            Source::Dir(&dir),
+            options(&home, &[], |_| {}),
+            &mut |_, _| true,
+        )
+        .unwrap_or_else(|error| panic!("{name} opens from its directory: {error:?}"))
+    } else {
+        open(name, &home, |_| {})
+    };
     for (input, questions) in cases() {
         let served = async_runtime.block_on(endpoint.post(&wire_body(&input, &questions)));
         let local = runtime
@@ -210,7 +237,14 @@ fn endpoint_parity(name: &str) {
         assert_same_answers(&served, &local, &input);
     }
     drop(runtime);
+    drop(held);
     endpoint.shutdown();
+}
+
+#[test]
+#[ignore = "needs smollm2-135m-decision under SHISO_HOME and a Metal device"]
+fn smollm2_runtime_from_its_directory_matches_the_endpoint() {
+    endpoint_parity_from(SMOLLM2, true);
 }
 
 #[test]
@@ -512,7 +546,7 @@ fn generate_smoke() {
     let mut chat = ChatRequest::new(D1, vec![Message::user("Say hello in one word.")]);
     chat.max_tokens = 8;
     chat.sampling.temperature = Some(0.0);
-    match runtime.generate_blocking(&chat) {
+    match runtime.generate_blocking(chat) {
         Ok(response) => {
             say(&format!("generate: {:?}", response.message.text()));
             assert!(response.usage.completion_tokens > 0);
@@ -568,4 +602,62 @@ fn images_smoke() {
         images.images[0].media_type
     ));
     assert!(!images.images[0].bytes.is_empty());
+}
+
+/// The process's physical footprint (`vmmap -summary`), in MiB, or `None` where
+/// the tool is missing. On Apple silicon the device's allocations count in it.
+fn footprint_mib() -> Option<f64> {
+    let output = std::process::Command::new("vmmap")
+        .arg("-summary")
+        .arg(std::process::id().to_string())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    if let Some(row) = text.lines().find(|line| line.starts_with("IOAccelerator")) {
+        say(&format!("vmmap: {row}"));
+    }
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("Physical footprint:"))?;
+    say(&format!("vmmap: {line}"));
+    let figure = line.split_whitespace().nth(2)?;
+    let (number, unit) = figure.split_at(figure.len() - 1);
+    let value: f64 = number.parse().ok()?;
+    match unit {
+        "G" => Some(value * 1024.0),
+        "M" => Some(value),
+        "K" => Some(value / 1024.0),
+        _ => None,
+    }
+}
+
+/// An embedder's default options must not reserve a server-sized KV pool: the
+/// footprint after `open` with `RuntimeOptions::default()` settings stays near
+/// the weights plus a pool of `2 x ctx x max_num_seqs` tokens.
+fn memory_after_open(name: &str) {
+    let Some(home) = home_with(name) else { return };
+    let _device = exclusive();
+    let Some(before) = footprint_mib() else {
+        say("skipping: the `vmmap` tool is not available");
+        return;
+    };
+    let runtime = open(name, &home, |_| {});
+    let after = footprint_mib().expect("footprint answered before");
+    say(&format!(
+        "{name}: footprint {before:.0} MiB before open, {after:.0} MiB after (+{:.0} MiB)",
+        after - before
+    ));
+    drop(runtime);
+}
+
+#[test]
+#[ignore = "needs d1-3b under SHISO_HOME, a Metal device and the vmmap tool"]
+fn d1_memory_after_open() {
+    memory_after_open(D1);
+}
+
+#[test]
+#[ignore = "needs smollm2-135m-decision under SHISO_HOME, a Metal device and the vmmap tool"]
+fn smollm2_memory_after_open() {
+    memory_after_open(SMOLLM2);
 }

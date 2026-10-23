@@ -68,7 +68,9 @@ impl ApiSurface {
     }
 }
 
-/// Everything a handler in this crate can fail with.
+/// Everything a typed core in this crate can fail with: the handlers of
+/// `shiso-server` render it on the wire, and [`crate::Runtime`] returns it to
+/// an embedder.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AppError {

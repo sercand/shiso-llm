@@ -56,6 +56,7 @@ use crate::boot_error::BootError;
 use crate::error::AppError;
 use crate::hub::{self, InstalledModel, PullError};
 use crate::options::{ConfigError, ExplicitlySet, ServeOptions};
+use crate::private_runtime::PrivateRuntime;
 use crate::state::AppState;
 
 /// Where a [`Runtime`]'s model comes from.
@@ -66,7 +67,10 @@ pub enum Source<'a> {
     Registry(&'a str),
     /// A directory: an installed variant (it holds a `recipe.json`) or a
     /// checkpoint, as [`hub::resolve_serve_dir`] reads it. Never touches the
-    /// network.
+    /// network and takes no lock: if the directory is a registry install, the
+    /// caller keeps the [`InstalledModel`] from [`hub::resolve`] or
+    /// [`hub::pull`] alive for as long as the `Runtime`, or `shiso rm` or a
+    /// reinstall can remove the files under it.
     Dir(&'a Path),
 }
 
@@ -81,6 +85,22 @@ pub struct RuntimeOptions {
     pub pull_if_missing: bool,
     /// The server settings the model boots with: context, sequences, cache
     /// and so on. A registry recipe fills the ones `explicit` does not name.
+    ///
+    /// The KV cache pool is the exception to "the server's defaults": left
+    /// unset (`kv_cache_tokens` and `gpu_memory_utilization` both `None`), the
+    /// runtime sizes it to `2 x ctx x max_num_seqs` tokens (the sessions and an equal prefix cache), not the server's 131072,
+    /// which would sit resident for an embedder that never has that many
+    /// sessions. To raise it, set `serve.kv_cache_tokens` (a token count) or
+    /// `serve.gpu_memory_utilization` (a share of device memory) yourself; the
+    /// pool must hold at least one `ctx`. `shiso serve` is unchanged.
+    ///
+    /// `bind` and `port` are the server's listener settings; they are never
+    /// used here, and `port` must still be non-zero to validate.
+    ///
+    /// `explicit` is a set of field names, matched exactly (`"ctx"`,
+    /// `"max_num_seqs"`): a misspelled name is ignored, and a field changed in
+    /// `serve` but not named there is replaced by a recipe default when the
+    /// recipe has one.
     pub serve: ServeOptions,
     /// The fields of `serve` the caller set on purpose, which a recipe's
     /// defaults must not replace (`ctx`, `max_num_seqs`, ...).
@@ -91,7 +111,10 @@ pub struct RuntimeOptions {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum OpenError {
-    /// The model is not installed (and pulling was off), or the pull failed.
+    /// The model could not be made available: it is not installed (and pulling
+    /// was off), the pull failed, or, for a [`Source::Dir`], its `recipe.json`
+    /// is unreadable ([`PullError::Inconsistent`]) or a component option was
+    /// also set ([`PullError::ComponentFlagConflict`]).
     #[error(transparent)]
     Pull(#[from] PullError),
     /// The options do not describe something servable.
@@ -137,13 +160,11 @@ thread_local! {
     static WORKER_OF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// A tokio runtime that is shut down without waiting, so dropping it is legal
-/// on any thread (a plain drop panics inside an async context).
+/// The private runtime plus the id its worker carries in [`WORKER_OF`].
 #[derive(Debug)]
 struct Executor {
     id: u64,
-    handle: Handle,
-    runtime: Option<tokio::runtime::Runtime>,
+    runtime: PrivateRuntime,
 }
 
 impl Executor {
@@ -151,31 +172,24 @@ impl Executor {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (parked, first_park) = std::sync::mpsc::sync_channel(1);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("shiso-runtime")
-            .on_thread_park(move || {
-                WORKER_OF.set(id);
-                let _ = parked.try_send(());
-            })
-            .enable_all()
-            .build()?;
+        let runtime = PrivateRuntime::build(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("shiso-runtime")
+                .on_thread_park(move || {
+                    WORKER_OF.set(id);
+                    let _ = parked.try_send(());
+                })
+                .enable_all(),
+        )?;
         // The idle worker parks at once; waiting for that means the thread is
         // marked before any task can run on it.
         let _ = first_park.recv_timeout(std::time::Duration::from_secs(5));
-        Ok(Self {
-            id,
-            handle: runtime.handle().clone(),
-            runtime: Some(runtime),
-        })
+        Ok(Self { id, runtime })
     }
-}
 
-impl Drop for Executor {
-    fn drop(&mut self) {
-        if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
-        }
+    const fn handle(&self) -> &Handle {
+        self.runtime.handle()
     }
 }
 
@@ -277,6 +291,20 @@ impl Runtime {
                 }
             }
         };
+        // A server holds many sessions' worth of cache and its default pool is
+        // sized so (131072 tokens); an embedder asking one question at a time
+        // does not need that resident. Unless the caller chose a pool (tokens or
+        // a memory share), it gets twice what `max_num_seqs` sessions of `ctx`
+        // tokens fill: the second share is the prefix cache, which a request
+        // that resumes from a shared prefix needs beside its own session (with
+        // one share a long two-question prompt ran out of pages at one slot).
+        if serve.kv_cache_tokens.is_none() && serve.gpu_memory_utilization.is_none() {
+            serve.kv_cache_tokens = Some(
+                u64::from(serve.ctx)
+                    .saturating_mul(u64::try_from(serve.max_num_seqs).unwrap_or(u64::MAX))
+                    .saturating_mul(2),
+            );
+        }
         serve.validate()?;
 
         // The image model loads before the language model for the reason
@@ -369,8 +397,11 @@ impl Runtime {
     /// when the model ships no chat template; [`AppError::ContextOverflow`]
     /// for a prompt that leaves no room to answer; otherwise as
     /// [`pipeline::start`] and [`crate::api::blocking::collect_response`].
-    pub async fn generate(&self, request: &Request) -> Result<Response, AppError> {
-        within(self.executor.handle.clone(), chat(&self.state, request)).await
+    pub async fn generate(&self, request: Request) -> Result<Response, AppError> {
+        within(self.executor.handle().clone(), async {
+            chat(&self.state, &request).await
+        })
+        .await
     }
 
     /// [`Self::generate`], parking the calling thread (see the
@@ -379,8 +410,7 @@ impl Runtime {
     /// # Errors
     ///
     /// As [`Self::generate`].
-    pub fn generate_blocking(&self, request: &Request) -> Result<Response, AppError> {
-        let request = request.clone();
+    pub fn generate_blocking(&self, request: Request) -> Result<Response, AppError> {
         self.block(move |state| async move { chat(&state, &request).await })
     }
 
@@ -396,12 +426,12 @@ impl Runtime {
     /// The refusals of [`Self::generate`] that precede the first event.
     pub async fn generate_stream(
         &self,
-        request: &Request,
+        request: Request,
         mut sink: impl FnMut(StreamEvent) -> bool + Send,
     ) -> Result<(), AppError> {
         use futures::StreamExt as _;
-        within(self.executor.handle.clone(), async {
-            let mut events = pipeline::start(&self.state, request, PromptField::Messages)
+        within(self.executor.handle().clone(), async {
+            let mut events = pipeline::start(&self.state, &request, PromptField::Messages)
                 .await?
                 .events;
             while let Some(event) = events.next().await {
@@ -422,7 +452,7 @@ impl Runtime {
     /// [`crate::image::generate`].
     pub async fn images(&self, request: Generate) -> Result<Images, AppError> {
         within(
-            self.executor.handle.clone(),
+            self.executor.handle().clone(),
             crate::image::generate(&self.state, request),
         )
         .await
@@ -439,7 +469,7 @@ impl Runtime {
         sink: impl FnMut(Step) -> bool + Send,
     ) -> Result<(), AppError> {
         within(
-            self.executor.handle.clone(),
+            self.executor.handle().clone(),
             crate::image::generate_stream(&self.state, request, sink),
         )
         .await
@@ -453,7 +483,7 @@ impl Runtime {
     /// model cannot take.
     pub async fn edit_image(&self, request: Edit) -> Result<Images, AppError> {
         within(
-            self.executor.handle.clone(),
+            self.executor.handle().clone(),
             crate::image::edit(&self.state, request),
         )
         .await
@@ -470,7 +500,7 @@ impl Runtime {
         sink: impl FnMut(Step) -> bool + Send,
     ) -> Result<(), AppError> {
         within(
-            self.executor.handle.clone(),
+            self.executor.handle().clone(),
             crate::image::edit_stream(&self.state, request, sink),
         )
         .await
@@ -497,7 +527,7 @@ impl Runtime {
     ) -> Result<shiso_ir::decision::Response, AppError> {
         require_questions(&request)?;
         within(
-            self.executor.handle.clone(),
+            self.executor.handle().clone(),
             crate::decision::decide(&self.state, request),
         )
         .await
@@ -545,7 +575,7 @@ impl Runtime {
         }
         let (answer, answered) = std::sync::mpsc::channel();
         let call = make(Arc::clone(&self.state));
-        self.executor.handle.spawn(async move {
+        self.executor.handle().spawn(async move {
             let _ = answer.send(call.await);
         });
         // A closed channel is a task that never answered: it panicked, or the
@@ -567,8 +597,7 @@ impl Runtime {
         } else if state.engine.is_some() && state.renderer.is_some() {
             let mut request = Request::new(state.model_id.clone(), vec![Message::user("warm-up")]);
             request.max_tokens = 1;
-            self.generate_blocking(&request)
-                .map_err(OpenError::WarmUp)?;
+            self.generate_blocking(request).map_err(OpenError::WarmUp)?;
         }
         if let Some(image) = state.image.as_ref() {
             let request = warm_up_image(image.limits());

@@ -17,6 +17,16 @@
 //!
 //! [`boot`] opens a device and a checkpoint and starts that machinery;
 //! `shiso-server` puts the HTTP routes and the command line on top.
+//!
+//! # Using it in-process
+//!
+//! An embedder wants [`Runtime`]: one handle that opens a model (from the
+//! registry or a directory), serves chat, images and decisions over the
+//! [`shiso_ir`] types, and joins its threads when dropped. [`hub`] is how a
+//! model gets onto disk: [`hub::resolve`] finds an installed one offline,
+//! [`hub::pull`] downloads it, and the [`hub::InstalledModel`] either returns
+//! holds the install's lock for as long as it is kept. [`options::ServeOptions`]
+//! is every setting `shiso serve` has, without the command line.
 #![forbid(unsafe_code)]
 
 pub mod api;
@@ -33,6 +43,7 @@ pub mod media;
 pub mod media_cache;
 pub mod model_factory;
 pub mod options;
+mod private_runtime;
 pub mod profile;
 pub mod recipe_defaults;
 pub mod response_store;

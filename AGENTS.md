@@ -83,9 +83,10 @@ cargo test -p <crate> --test <name>          # a single test target
   The IR types carry no serde derives.
 - `shiso-runtime` is the engine without HTTP: scheduler, model factory,
   tokenizer, media, boot, hub glue, the typed cores (`api::pipeline`, `image`,
-  `decision`) and the `Runtime` facade. It never depends on `axum`, `tower`,
-  `tower-http` or `clap` (the `clap` feature only derives the flags of
-  `ServeOptions`). `shiso-server` is the adapter over it: wire formats, routes,
+  `decision`) and the `Runtime` facade. It has no server-side HTTP framework
+  (no `axum`; `tower` and `tower-http` appear only as reqwest's client
+  dependencies, through `shiso-hub`) and no `clap` (the `clap` feature only
+  derives the flags of `ServeOptions`). `shiso-server` is the adapter over it: wire formats, routes,
   SSE framing and the `shiso` CLI. Logic a route and an embedder both need
   belongs in the runtime's typed core, not in a handler.
 - Only the scheduler thread calls methods on the model.

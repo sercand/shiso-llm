@@ -233,7 +233,7 @@ fn a_language_model_alone_has_no_image_model() {
 fn an_image_model_alone_has_no_language_model() {
     let runtime = image_runtime();
     assert!(!runtime.has_language_model() && runtime.has_image_model());
-    let error = runtime.generate_blocking(&chat()).expect_err("no model");
+    let error = runtime.generate_blocking(chat()).expect_err("no model");
     assert!(matches!(error, AppError::NoModel), "{error:?}");
     let error = runtime.decide_blocking(pick_one()).expect_err("no model");
     assert!(matches!(error, AppError::NoModel), "{error:?}");
@@ -305,14 +305,14 @@ fn async_and_blocking_answers_agree_on_a_foreign_executor() {
 #[test]
 fn generate_answers_blocking_async_and_streamed() {
     let runtime = scripted(vec![10, 11, 12]);
-    let response = futures::executor::block_on(runtime.generate(&chat())).expect("generates");
+    let response = futures::executor::block_on(runtime.generate(chat())).expect("generates");
     assert_eq!(response.message.text(), "w10 w11 w12");
 
-    let again = runtime.generate_blocking(&chat()).expect("generates");
+    let again = runtime.generate_blocking(chat()).expect("generates");
     assert_eq!(again.message.text(), response.message.text());
 
     let mut events = Vec::new();
-    futures::executor::block_on(runtime.generate_stream(&chat(), |event| {
+    futures::executor::block_on(runtime.generate_stream(chat(), |event| {
         events.push(event);
         true
     }))
@@ -327,7 +327,7 @@ fn generate_answers_blocking_async_and_streamed() {
     );
 
     let mut seen = 0;
-    futures::executor::block_on(runtime.generate_stream(&chat(), |_| {
+    futures::executor::block_on(runtime.generate_stream(chat(), |_| {
         seen += 1;
         false
     }))
@@ -366,18 +366,18 @@ fn a_blocking_call_answers_from_every_caller_on_a_multi_thread_runtime() {
         tokio_runtime.block_on(async {
             let in_task = {
                 let runtime = Arc::clone(&runtime);
-                tokio::spawn(async move { runtime.generate_blocking(&chat()) })
+                tokio::spawn(async move { runtime.generate_blocking(chat()) })
                     .await
                     .expect("the task does not panic")
             };
             assert_eq!(said(&in_task.expect("answers in a task")), "w10 w11 w12");
 
-            let in_main = runtime.generate_blocking(&chat());
+            let in_main = runtime.generate_blocking(chat());
             assert_eq!(said(&in_main.expect("answers in main")), "w10 w11 w12");
 
             let in_pool = {
                 let runtime = Arc::clone(&runtime);
-                tokio::task::spawn_blocking(move || runtime.generate_blocking(&chat()))
+                tokio::task::spawn_blocking(move || runtime.generate_blocking(chat()))
                     .await
                     .expect("the blocking task does not panic")
             };
@@ -385,7 +385,7 @@ fn a_blocking_call_answers_from_every_caller_on_a_multi_thread_runtime() {
         });
         let in_thread = {
             let runtime = Arc::clone(&runtime);
-            std::thread::spawn(move || runtime.generate_blocking(&chat()))
+            std::thread::spawn(move || runtime.generate_blocking(chat()))
                 .join()
                 .expect("the thread does not panic")
         };
@@ -411,12 +411,12 @@ fn a_blocking_call_answers_from_a_current_thread_runtime() {
         tokio_runtime.block_on(async {
             let in_task = {
                 let runtime = Arc::clone(&runtime);
-                tokio::spawn(async move { runtime.generate_blocking(&chat()) })
+                tokio::spawn(async move { runtime.generate_blocking(chat()) })
                     .await
                     .expect("the task does not panic")
             };
             assert_eq!(said(&in_task.expect("answers in a task")), "w10 w11 w12");
-            let in_main = runtime.generate_blocking(&chat());
+            let in_main = runtime.generate_blocking(chat());
             assert_eq!(said(&in_main.expect("answers in main")), "w10 w11 w12");
         });
         drop(tokio_runtime);
@@ -434,12 +434,10 @@ fn a_blocking_call_on_the_runtimes_own_worker_is_an_error() {
         let mut spawned = Vec::new();
         {
             let inner = Arc::clone(&runtime);
-            futures::executor::block_on(runtime.generate_stream(&chat(), |event| {
+            futures::executor::block_on(runtime.generate_stream(chat(), |event| {
                 if matches!(event, StreamEvent::Start { .. }) {
                     let inner = Arc::clone(&inner);
-                    spawned.push(tokio::spawn(
-                        async move { inner.generate_blocking(&chat()) },
-                    ));
+                    spawned.push(tokio::spawn(async move { inner.generate_blocking(chat()) }));
                 }
                 true
             }))
@@ -465,11 +463,11 @@ fn a_blocking_call_from_the_runtimes_blocking_pool_answers() {
         let mut spawned = Vec::new();
         {
             let inner = Arc::clone(&runtime);
-            futures::executor::block_on(runtime.generate_stream(&chat(), |event| {
+            futures::executor::block_on(runtime.generate_stream(chat(), |event| {
                 if matches!(event, StreamEvent::Start { .. }) {
                     let inner = Arc::clone(&inner);
                     spawned.push(tokio::task::spawn_blocking(move || {
-                        inner.generate_blocking(&chat())
+                        inner.generate_blocking(chat())
                     }));
                 }
                 true
@@ -496,12 +494,10 @@ fn a_blocking_call_from_another_runtimes_worker_answers() {
         let mut spawned = Vec::new();
         {
             let other = Arc::clone(&b);
-            futures::executor::block_on(a.generate_stream(&chat(), |event| {
+            futures::executor::block_on(a.generate_stream(chat(), |event| {
                 if matches!(event, StreamEvent::Start { .. }) {
                     let other = Arc::clone(&other);
-                    spawned.push(tokio::spawn(
-                        async move { other.generate_blocking(&chat()) },
-                    ));
+                    spawned.push(tokio::spawn(async move { other.generate_blocking(chat()) }));
                 }
                 true
             }))
@@ -528,7 +524,7 @@ fn a_blocking_call_in_a_task_returns_the_capability_error() {
             .build()
             .expect("a runtime");
         let error = tokio_runtime.block_on(async move {
-            tokio::spawn(async move { runtime.generate_blocking(&chat()) })
+            tokio::spawn(async move { runtime.generate_blocking(chat()) })
                 .await
                 .expect("the task does not panic")
         });
@@ -543,7 +539,7 @@ async fn async_calls_work_from_a_tokio_task() {
     let runtime = Arc::new(scripted(vec![10, 11, 12]));
     let answer = {
         let runtime = Arc::clone(&runtime);
-        tokio::spawn(async move { runtime.generate(&chat()).await })
+        tokio::spawn(async move { runtime.generate(chat()).await })
             .await
             .expect("no panic")
     };
@@ -572,7 +568,7 @@ async fn dropping_after_an_abandoned_call_waits_for_the_engine_and_returns() {
         let runtime = Arc::clone(&runtime);
         std::thread::spawn(move || {
             let request = chat();
-            let call = Box::pin(runtime.generate(&request));
+            let call = Box::pin(runtime.generate(request));
             let raced = futures::executor::block_on(futures::future::select(call, cancelled));
             matches!(raced, futures::future::Either::Right(_))
         })

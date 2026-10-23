@@ -246,11 +246,12 @@ let response = runtime.decide_blocking(Request {
     preserve_thinking: None,
     token_ids: false,
 })?;
-tracing::info!(?response.answers[0].probabilities);
+tracing::info!(choice = ?response.answers[0].choice, "decided");
 
-// A chat model answers a turn the same way, from any async executor.
-let request = shiso_ir::Request::new("model", vec![shiso_ir::Message::user("hello")]);
-let reply = runtime.generate(&request).await?;
+// A chat model is a runtime of its own (a decision model has no chat turn).
+let chat = Runtime::open(Source::Registry("a-chat-model"), RuntimeOptions::default(), &mut |_, _| true)?;
+let request = shiso_ir::Request::new("a-chat-model", vec![shiso_ir::Message::user("hello")]);
+let reply = chat.generate_blocking(request)?; // or `chat.generate(request).await` in async code
 ```
 
 A model with a decision readout or head answers every question from one
@@ -265,7 +266,12 @@ other entry points.
 - **Warm-up on open.** `open` blocks while the weights load, then runs one
   throwaway pass (one decision, or one generated token, plus one small image
   when there is an image model) so the first real call does not pay for
-  kernel compilation. A failed warm-up is `OpenError::WarmUp`.
+  kernel compilation. A failed decision or text pass is `OpenError::WarmUp`;
+  a failed image pass is only logged.
+- **Cache size.** Unlike `shiso serve`, which holds a 131072-token KV pool, a
+  `Runtime` sizes the pool to `2 x ctx x max_num_seqs` tokens unless you set
+  `serve.kv_cache_tokens` or `serve.gpu_memory_utilization` (measured: about
+  0.5 GiB resident for the 135M decision model instead of 2.9 GiB).
 - **Async and blocking.** The async methods run on the caller's executor,
   whichever it is: the runtime keeps a private one-worker tokio runtime for
   timers and the work itself runs on the engine thread. The `*_blocking`

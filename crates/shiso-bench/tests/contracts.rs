@@ -1154,6 +1154,61 @@ mod decision {
     const _: Encode = shiso_runtime::decision::literal::encode_with_literals;
 }
 
+/// The hub half of the embedder API: find a model offline, pull it, and hold its
+/// lock.
+mod embedder_hub {
+    use std::path::{Path, PathBuf};
+
+    use shiso_hub::HubConfig;
+    use shiso_runtime::hub::{
+        InstalledModel, PullError, config_for_home, resolve, resolve_serve_dir, resolve_serve_model,
+    };
+    use shiso_runtime::options::{ExplicitlySet, ServeOptions};
+
+    const _: fn(&str, &HubConfig) -> Result<Option<InstalledModel>, PullError> = resolve;
+    type Pull =
+        fn(&str, &HubConfig, &mut dyn FnMut(u64, u64) -> bool) -> Result<InstalledModel, PullError>;
+    const _: Pull = shiso_runtime::hub::pull;
+    const _: fn(&Path) -> HubConfig = config_for_home;
+    const _: fn(&Path, &mut ServeOptions, &ExplicitlySet) -> Result<(), PullError> =
+        resolve_serve_dir;
+    type ResolveServe = fn(
+        &str,
+        &mut ServeOptions,
+        &ExplicitlySet,
+        &HubConfig,
+    ) -> Result<Option<InstalledModel>, PullError>;
+    const _: ResolveServe = resolve_serve_model;
+
+    /// What an installed model tells its holder; the lock is private.
+    fn installed_fields(model: &InstalledModel) -> (&PathBuf, u64) {
+        let InstalledModel {
+            dir, total_bytes, ..
+        } = model;
+        (dir, *total_bytes)
+    }
+    const _: fn(&InstalledModel) -> (&PathBuf, u64) = installed_fields;
+
+    /// What a pull or an open can fail with.
+    fn pull_error_variants(error: &PullError) -> u8 {
+        match error {
+            PullError::NoDevice(_) => 0,
+            PullError::UnknownModel(_) => 1,
+            PullError::InvalidReference { .. } => 2,
+            PullError::ComponentFlagConflict(_) => 3,
+            PullError::NotInstalled(_) => 4,
+            PullError::Inconsistent(_) => 5,
+            PullError::Lock { .. } => 6,
+            PullError::Cancelled => 7,
+            PullError::Request(_) => 8,
+            PullError::Install(_) => 9,
+            PullError::Hub(_) => 10,
+            _ => u8::MAX,
+        }
+    }
+    const _: fn(&PullError) -> u8 = pull_error_variants;
+}
+
 /// The in-process facade: the open path, the three capabilities, and the rules
 /// that make one handle safe to share.
 mod runtime_facade {
@@ -1224,8 +1279,7 @@ mod runtime_facade {
     const _: fn(&Runtime) -> bool = Runtime::has_image_model;
 
     /// The blocking calls.
-    const _: for<'a> fn(&'a Runtime, &'a Request) -> Result<Response, AppError> =
-        Runtime::generate_blocking;
+    const _: fn(&Runtime, Request) -> Result<Response, AppError> = Runtime::generate_blocking;
     const _: fn(
         &Runtime,
         shiso_ir::decision::Request,
@@ -1237,17 +1291,17 @@ mod runtime_facade {
         dead_code,
         reason = "named only so the compiler checks the async signatures"
     )]
-    fn generate_future<'a>(
-        runtime: &'a Runtime,
-        request: &'a Request,
-    ) -> impl Future<Output = Result<Response, AppError>> + Send + 'a {
+    fn generate_future(
+        runtime: &Runtime,
+        request: Request,
+    ) -> impl Future<Output = Result<Response, AppError>> + Send {
         runtime.generate(request)
     }
     #[expect(dead_code, reason = "named only so the compiler checks the signature")]
-    fn generate_stream_future<'a>(
-        runtime: &'a Runtime,
-        request: &'a Request,
-    ) -> impl Future<Output = Result<(), AppError>> + Send + 'a {
+    fn generate_stream_future(
+        runtime: &Runtime,
+        request: Request,
+    ) -> impl Future<Output = Result<(), AppError>> + Send {
         runtime.generate_stream(request, |_: StreamEvent| true)
     }
     #[expect(dead_code, reason = "named only so the compiler checks the signature")]
