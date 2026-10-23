@@ -1,5 +1,8 @@
 //! Scoring a decision from a model's readout rows or its decision head.
 //!
+//! A seam for [`crate::Decider`] and the server's scheduler, not part of the
+//! embedding API: embedders call [`crate::Decider`].
+//!
 //! # The `Scorer` seam is synchronous
 //!
 //! Whoever runs the model implements [`Scorer`]; this module never touches a
@@ -257,13 +260,33 @@ fn validate(req: &DecisionRequest) -> Result<f64, DecideError> {
                 question.name()
             )));
         }
-        let options = question.option_values().len();
-        if options == 0 {
+        let values = question.option_values();
+        if values.is_empty() {
             return Err(DecideError::Request(format!(
                 "question {:?} has no options",
                 question.name()
             )));
         }
+        // Answers are named by value and by question, so a repeat could never
+        // be told apart in the reply.
+        let mut seen = std::collections::HashSet::new();
+        if let Some(repeat) = values.iter().find(|value| !seen.insert(value.as_str())) {
+            return Err(DecideError::Request(format!(
+                "question {:?} has a duplicate option {repeat:?}",
+                question.name()
+            )));
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    if let Some(repeat) = req
+        .questions
+        .iter()
+        .map(Question::name)
+        .find(|name| !names.insert(*name))
+    {
+        return Err(DecideError::Request(format!(
+            "duplicate question name {repeat:?}"
+        )));
     }
     let temperature = f64::from(req.temperature.unwrap_or(1.0));
     if !(temperature.is_finite() && temperature > 0.0) {
@@ -625,6 +648,35 @@ mod tests {
             .expect_err("blank instructions");
         assert!(
             matches!(&error, DecideError::Request(m) if m.contains("pick")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_options_and_question_names_are_refused() {
+        let readout = FakeReadout {
+            groups: vec![vec![token(10)], vec![token(11)]],
+            refuse: false,
+        };
+        let error = decide_with_readout(
+            &readout,
+            &NoEncoder,
+            &quiet_scorer(),
+            &request(&["a", "a"]),
+            100,
+        )
+        .expect_err("duplicate option values");
+        assert!(
+            matches!(&error, DecideError::Request(m) if m.contains("duplicate")),
+            "{error:?}"
+        );
+
+        let mut req = request(&["a", "b"]);
+        req.questions.push(req.questions[0].clone());
+        let error = decide_with_readout(&readout, &NoEncoder, &quiet_scorer(), &req, 100)
+            .expect_err("duplicate question names");
+        assert!(
+            matches!(&error, DecideError::Request(m) if m.contains("duplicate")),
             "{error:?}"
         );
     }

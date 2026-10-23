@@ -748,6 +748,186 @@ const _: fn(Vec<u32>) -> shiso_ir::EmbedInput = shiso_ir::EmbedInput::Tokens;
 type Matryoshka = fn(&[f32], usize) -> Result<Vec<f32>, shiso_models::embedder::EmbedError>;
 const _: Matryoshka = shiso_models::embedder::matryoshka;
 
+/// The in-process decision library as embedders and the server call it:
+/// opening, the two ways of asking, the install door, and the request and
+/// answer shapes. A drift in any of them stops here.
+mod decision {
+    use shiso_core::{ReadoutPrompt, SchemaQuestion, TokenId};
+    use shiso_decision::error::DecideError;
+    use shiso_decision::schema::{Answer, Choice, DecisionRequest, Question};
+    use shiso_decision::score::{
+        RunScore, ScoreRun, Scored, fold_head, fold_readout, readout_runs,
+    };
+    use shiso_decision::{Decider, InstalledModel, OpenDesc, ensure_model};
+
+    const _: for<'a> fn(&OpenDesc<'a>) -> Result<Decider, DecideError> = Decider::open;
+    const _: fn(&Decider, &DecisionRequest) -> Result<Vec<Answer>, DecideError> =
+        Decider::decide_blocking;
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signature"
+    )]
+    fn decide_future<'a>(
+        decider: &'a Decider,
+        request: &'a DecisionRequest,
+    ) -> impl Future<Output = Result<Vec<Answer>, DecideError>> + 'a {
+        decider.decide(request)
+    }
+    type EnsureModel = fn(
+        &str,
+        &std::path::Path,
+        &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<InstalledModel, DecideError>;
+    const _: EnsureModel = ensure_model;
+
+    /// `OpenDesc` is the model directory and the context length; `new` takes
+    /// the directory alone.
+    type OpenDescFields<'a> = (&'a std::path::Path, usize);
+    fn open_desc_fields(desc: OpenDesc<'_>) -> OpenDescFields<'_> {
+        (desc.model_dir, desc.ctx)
+    }
+    const _: for<'a> fn(OpenDesc<'a>) -> OpenDescFields<'a> = open_desc_fields;
+    fn open_desc_new(dir: &std::path::Path) -> OpenDesc<'_> {
+        OpenDesc::new(dir)
+    }
+    const _: for<'a> fn(&'a std::path::Path) -> OpenDesc<'a> = open_desc_new;
+
+    type InstalledFields = (std::path::PathBuf, u64);
+    fn installed_fields(model: InstalledModel) -> InstalledFields {
+        (model.dir, model.total_bytes)
+    }
+    const _: fn(InstalledModel) -> InstalledFields = installed_fields;
+
+    type RequestFields = (String, Vec<Question>, Option<f32>);
+    fn request_fields(request: DecisionRequest) -> RequestFields {
+        (request.input, request.questions, request.temperature)
+    }
+    const _: fn(DecisionRequest) -> RequestFields = request_fields;
+
+    type ChoiceFields = (String, Option<String>);
+    fn choice_fields(choice: Choice) -> ChoiceFields {
+        (choice.value, choice.description)
+    }
+    const _: fn(Choice) -> ChoiceFields = choice_fields;
+
+    type AnswerFields = (String, String, Vec<(String, f32)>, f32);
+    fn answer_fields(answer: Answer) -> AnswerFields {
+        (
+            answer.name,
+            answer.choice,
+            answer.probabilities,
+            answer.confidence,
+        )
+    }
+    const _: fn(Answer) -> AnswerFields = answer_fields;
+
+    /// Every kind of question, with its payload types. Exhaustive: a kind
+    /// added upstream makes this non-exhaustive.
+    fn question_kinds(question: Question) -> u8 {
+        match question {
+            Question::Choice {
+                name: _,
+                instructions: _,
+                choices,
+            } => {
+                let _: Vec<Choice> = choices;
+                0
+            }
+            Question::YesNo {
+                name: _,
+                instructions: _,
+                yes,
+                no,
+            } => {
+                let _: (Option<String>, Option<String>) = (yes, no);
+                1
+            }
+            Question::Score {
+                name: _,
+                instructions: _,
+                levels,
+            } => {
+                let _: Vec<Choice> = levels;
+                2
+            }
+        }
+    }
+    const _: fn(Question) -> u8 = question_kinds;
+
+    /// Every error variant a caller matches on, with its payload type. The
+    /// enum is `non_exhaustive`, so the wildcard is the only way to stay
+    /// total; the named arms are what is pinned.
+    fn decide_error_variants(error: &DecideError) -> u8 {
+        match error {
+            DecideError::NoDevice(message) => {
+                let _: &String = message;
+                0
+            }
+            DecideError::Load(message) => {
+                let _: &String = message;
+                1
+            }
+            DecideError::Request(message) => {
+                let _: &String = message;
+                2
+            }
+            DecideError::Layout(message) => {
+                let _: &String = message;
+                3
+            }
+            DecideError::Engine(message) => {
+                let _: &String = message;
+                4
+            }
+            DecideError::UnknownModel(name) => {
+                let _: &String = name;
+                5
+            }
+            DecideError::Download(message) => {
+                let _: &String = message;
+                6
+            }
+            DecideError::Cancelled => 7,
+            DecideError::Io(error) => {
+                let _: &std::io::Error = error;
+                8
+            }
+            _ => u8::MAX,
+        }
+    }
+    const _: fn(&DecideError) -> u8 = decide_error_variants;
+
+    /// The pure steps the server's scheduler builds its decisions route from.
+    type ReadoutRuns = fn(&ReadoutPrompt, &[SchemaQuestion]) -> Result<Vec<ScoreRun>, DecideError>;
+    type FoldReadout =
+        fn(&ReadoutPrompt, &[ScoreRun], &[RunScore], f64) -> Result<Vec<Scored>, DecideError>;
+    type FoldHead = fn(&[Vec<f32>], &[Vec<usize>], f64) -> Result<Vec<Scored>, DecideError>;
+    const _: ReadoutRuns = readout_runs;
+    const _: FoldReadout = fold_readout;
+    const _: FoldHead = fold_head;
+
+    type ScoreRunFields = (Vec<TokenId>, Vec<TokenId>, u32);
+    fn score_run_fields(run: ScoreRun) -> ScoreRunFields {
+        (run.tokens, run.labels, run.shared_prefix)
+    }
+    const _: fn(ScoreRun) -> ScoreRunFields = score_run_fields;
+
+    type RunScoreFields = (Vec<f64>, u64);
+    fn run_score_fields(score: RunScore) -> RunScoreFields {
+        (score.label_logprobs, score.cached_tokens)
+    }
+    const _: fn(RunScore) -> RunScoreFields = run_score_fields;
+
+    /// The literal-aware encoder the decider and the server's vocabulary share.
+    type Encode = fn(
+        &tokenizers::Tokenizer,
+        &str,
+        &[std::ops::Range<usize>],
+    ) -> Result<Vec<TokenId>, tokenizers::Error>;
+    const _: Encode = shiso_decision::literal::encode_piece;
+    const _: Encode = shiso_decision::literal::encode_with_literals;
+}
+
 /// The contracts above are checked by the compiler, so this file building at
 /// all is the result. The test exists so a target that stopped being built
 /// shows up as a missing test rather than as silence.

@@ -13,6 +13,12 @@
 //! server, router or HTTP-server crate (the model download speaks HTTP as a
 //! client only).
 //!
+//! [`score`] is the seam [`Decider`] implements, and the one other runners
+//! (the server's scheduler) use the pure steps of; [`literal`] is the encoder
+//! the decider and the server's vocabulary share. Both are seams for those
+//! two callers, not API to build on: embedders use [`Decider`] and
+//! [`ensure_model`].
+//!
 //! # Features
 //!
 //! Pick the backend with the `metal` (Apple) or `cuda` (NVIDIA) feature; they
@@ -64,19 +70,19 @@
 //! [`DecideError`]: error::DecideError
 //! [`DecideError::NoDevice`]: error::DecideError::NoDevice
 //! [`DecideError::Engine`]: error::DecideError::Engine
-//! [`score`] is the seam [`Decider`] implements, and the one other runners
-//! (the server's scheduler) use the pure steps of.
 
 #[cfg(all(feature = "metal", feature = "cuda"))]
 compile_error!("the `metal` and `cuda` features are mutually exclusive");
 
 pub mod decider;
 pub mod error;
+#[doc(hidden)]
 pub mod literal;
 mod load;
 pub mod math;
 pub mod pull;
 pub mod schema;
+#[doc(hidden)]
 pub mod score;
 mod worker;
 

@@ -46,7 +46,8 @@ pub struct InstalledModel {
 /// there and complete, the registry is not asked again.
 ///
 /// This blocks the calling thread on its own runtime, so call it from a
-/// thread that may block, not from inside an async executor. `progress` runs
+/// thread that may block (a plain thread or a `spawn_blocking` one), not from
+/// an async task, which it refuses with [`DecideError::Request`]. `progress` runs
 /// on that thread, between the download's steps and about every 200 ms while
 /// nothing arrives, so a slow callback stalls the download and a cancel is
 /// noticed within one tick even when a connection is stalled. `total` is 0
@@ -94,20 +95,38 @@ fn ensure_with(
         ));
     }
     let unknown = || DecideError::UnknownModel(name.to_owned());
-    let model = ModelName::parse(&name.to_lowercase()).map_err(|_| unknown())?;
+    // The same spelling for the installed lookup and the registry's.
+    let lowered = name.to_lowercase();
+    let model = ModelName::parse(&lowered).map_err(|_| unknown())?;
     let store = BlobStore::new(config.clone());
     if let Some(installed) = already_installed(&store, host, &model) {
         return Ok(installed);
     }
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(DecideError::Request(
-            "ensure_model blocks; call it from a thread outside an async executor".to_owned(),
-        ));
-    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(drive(config, host, &store, name, progress));
+    // A blocking-pool thread holds the caller's runtime handle but may block,
+    // so it cannot be told apart from an async task by looking; tokio refuses
+    // a nested `block_on` by panicking before it polls anything, which this
+    // turns into the error it is.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(drive(config, host, &store, &lowered, progress))
+    }))
+    .unwrap_or_else(|payload| {
+        // Only tokio's own refusal; a panic in the caller's `progress` goes on.
+        let nested = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .is_some_and(|message| message.contains("within a runtime"));
+        if !nested {
+            std::panic::resume_unwind(payload);
+        }
+        Err(DecideError::Request(
+            "ensure_model blocks; call it from a thread that may block, not from an async task"
+                .to_owned(),
+        ))
+    });
     // Downloads still in flight after a cancel or an error are dropped here,
     // not awaited: their partial files are what the next call resumes.
     runtime.shutdown_background();
@@ -660,6 +679,51 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(again, installed);
         assert_eq!(fx.requests(), 0, "an installed model needs no network");
+    }
+
+    /// A blocking-pool thread is a thread that may block: `ensure_model` runs
+    /// there, and from an async task it refuses instead of panicking.
+    #[test]
+    fn ensure_model_runs_on_a_blocking_thread_and_refuses_in_a_task() {
+        let fx = Fixture::new(&[]);
+        let (config, host) = (fx.config(), metal_host());
+        let installed = fx
+            .rt
+            .block_on(async {
+                tokio::task::spawn_blocking(move || {
+                    ensure_with(&config, &host, "mini", &mut |_, _| true)
+                })
+                .await
+            })
+            .expect("the blocking task ends")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(installed.total_bytes, 3_000_023);
+
+        // Installed models return before the guard, so ask for one that is not.
+        let (config, host) = (fx.config(), metal_host());
+        let error = fx
+            .rt
+            .block_on(async {
+                tokio::spawn(
+                    async move { ensure_with(&config, &host, "mini-two", &mut |_, _| true) },
+                )
+                .await
+            })
+            .expect("the task ends")
+            .expect_err("refused in a task");
+        assert!(matches!(error, DecideError::Request(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_name_in_any_case_installs_and_is_found_again() {
+        let fx = Fixture::new(&[]);
+        let installed = fx
+            .ensure("MiNi", &mut |_, _| true)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let again = fx
+            .ensure("mini", &mut |_, _| panic!("already installed"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again, installed);
     }
 
     #[test]

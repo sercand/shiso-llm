@@ -2659,6 +2659,7 @@ dependencies = [
  "shiso-audio",
  "shiso-core",
  "shiso-cuda",
+ "shiso-decision",
  "shiso-engine",
  "shiso-hub",
  "shiso-ir",

@@ -81,3 +81,6 @@ shiso-server = { workspace = true }
 shiso-modelfile = { workspace = true }
 # The hub types crossing boundaries between server, editor and bench.
 shiso-hub = { workspace = true }
+# The in-process decision library: its open/decide/install seams and the pure
+# scoring steps the server's decisions route shares are pinned in the contracts.
+shiso-decision = { workspace = true }
