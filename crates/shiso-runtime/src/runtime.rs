@@ -281,7 +281,7 @@ impl Runtime {
                     Err(PullError::NotInstalled(_)) if pull_if_missing => {
                         // Held across the second resolve so the variant cannot
                         // be removed in between; both locks are shared.
-                        let pulled = hub::pull(&name, &config, progress)?;
+                        let pulled = hub::pull_for(serve.device, &name, &config, progress)?;
                         let installed =
                             hub::resolve_serve_model(&name, &mut serve, &explicit, &config)?;
                         drop(pulled);

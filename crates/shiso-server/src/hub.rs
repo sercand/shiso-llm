@@ -28,6 +28,7 @@ use crate::cli::{
     VerifyArgs,
 };
 
+use shiso_runtime::device::DeviceChoice;
 pub use shiso_runtime::hub::probe_host_profile;
 
 /// Resolves `home` directory from string, expanding `~`.
@@ -253,6 +254,7 @@ fn pull_rendered(
 pub async fn run_pull(args: PullArgs) -> anyhow::Result<()> {
     let config = build_hub_config(&args.hub)?;
     let model_ref = args.model_ref;
+    let device = args.device;
     let style = args.hub.progress;
     let is_tty = std::io::stdout().is_terminal();
     // The pull blocks on a runtime of its own, so it runs on a thread that may.
@@ -260,7 +262,7 @@ pub async fn run_pull(args: PullArgs) -> anyhow::Result<()> {
         pull_rendered(
             &model_ref,
             &config,
-            &probe_host_profile(),
+            &probe_host_profile(device),
             style,
             is_tty,
             &mut std::io::stdout(),
@@ -326,7 +328,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<()> {
     if args.remote {
         let client = RegistryClient::new(config.clone());
         let store = BlobStore::new(config);
-        let host = probe_host_profile();
+        let host = probe_host_profile(DeviceChoice::Auto);
 
         println!("Querying remote registry...");
         let index = client.fetch_index().await?;
@@ -354,7 +356,7 @@ pub async fn run_list(args: ListArgs) -> anyhow::Result<()> {
                 let is_inst = installed
                     .iter()
                     .any(|iv| iv.model == model.name && iv.variant == v.key);
-                let fits_host = v.backends.iter().any(|b| host.backends.contains(b));
+                let fits_host = shiso_hub::backends_fit_host(&v.backends, &host);
 
                 let status = match (is_inst, fits_host) {
                     (true, _) => "installed",
@@ -454,7 +456,7 @@ pub async fn run_info(args: InfoArgs) -> anyhow::Result<()> {
     println!("Tasks:       {}", tasks.join(", "));
     println!("Tags:        {}", recipe.tags.join(", "));
 
-    let host = probe_host_profile();
+    let host = probe_host_profile(DeviceChoice::Auto);
     if let Some(metal) = &host.metal {
         println!(
             "Host:        {} (Apple GPU family {} = {}, working set {} MB)",
