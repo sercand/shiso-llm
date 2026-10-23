@@ -1008,3 +1008,29 @@ fn the_moe_rig_opens_and_steps() {
             .expect("a decode number");
     assert!(ms > 0.0 && ms < 1000.0, "a plausible step time, got {ms}");
 }
+
+// ---------------------------------------------------------------------------
+// The Clef backbone.
+//
+// Every Clef GGUF declares one architecture whatever backbone it carries, so
+// the server's factory asks the container which stack it holds before it tries
+// an arm. `None` is "not a Clef GGUF", which every other checkpoint is; a
+// change to that answer would send a non-Clef file through the refusal.
+
+/// The probe the factory calls on the checkpoint path.
+type ClefBackboneAt = fn(&std::path::Path) -> CoreResult<Option<shiso_models::clef::ClefBackbone>>;
+const _: ClefBackboneAt = shiso_models::clef::ClefBackbone::at;
+
+/// The dense backbone's arm: a document and a container in, a model whose
+/// head answers the decision routes out.
+type LlamaFromHf =
+    fn(&shiso_core::HfConfig, &std::path::Path) -> CoreResult<shiso_models::llama::LlamaConfig>;
+const _: LlamaFromHf = shiso_models::llama::LlamaConfig::from_hf;
+
+type LlamaLoad = fn(
+    &std::sync::Arc<dyn Backend>,
+    &std::path::Path,
+    &shiso_models::llama::LlamaConfig,
+    shiso_engine::EngineOptions,
+) -> CoreResult<shiso_models::llama::LlamaModel>;
+const _: LlamaLoad = shiso_models::llama::LlamaModel::load;
