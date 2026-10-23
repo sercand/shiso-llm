@@ -6,9 +6,9 @@
 //! A launch's `args` hold at most one [`KernelArg::Bytes`] (the by-value
 //! struct every kernel here takes) and any number of [`KernelArg::Buffer`]s.
 //! A kernel table row's `roles` describe the buffers only, and every `arg`
-//! index in this module - [`Launch::f32`], [`Writes::f32`], an overlap message
-//! - is the **buffer ordinal**: 0 is the first `Buffer` in the launch, whatever
-//! scalar or struct arguments surround it. The struct is read with
+//! index in this module (in [`Launch::f32`], [`Writes::f32`], an overlap
+//! message) is the **buffer ordinal**: 0 is the first `Buffer` in the launch,
+//! whatever scalar or struct arguments surround it. The struct is read with
 //! [`Launch::bytes`]. A scalar argument is refused, because no kernel in this
 //! project passes one and a silently dropped value would compute the wrong
 //! thing.
@@ -25,11 +25,19 @@
 //! A kernel whose groups read what earlier groups wrote declares
 //! [`GroupsDisjoint::No`], and runs serially, committing after each group.
 
+#![expect(
+    dead_code,
+    reason = "the table is empty until the kernel tasks land; each row they add uses another part of this surface"
+)]
+
 use std::ops::Range;
 
 use bytemuck::Pod;
 use half::f16;
-use shiso_core::{CoreError, CoreResult, DeviceView, Extent3, FnConst, FnConstValue, KernelArg, KernelRef, LaunchArgs};
+use shiso_core::{
+    CoreError, CoreResult, DeviceView, Extent3, FnConst, FnConstValue, KernelArg, KernelRef,
+    LaunchArgs,
+};
 
 use crate::memory::Slabs;
 
@@ -249,7 +257,10 @@ impl<'a> Plan<'a> {
         if !(spec.block)(args.block) {
             return Err(CoreError::InvalidValue {
                 key: "kernel block",
-                value: format!("{entry}: {}x{}x{}", args.block.x, args.block.y, args.block.z),
+                value: format!(
+                    "{entry}: {}x{}x{}",
+                    args.block.x, args.block.y, args.block.z
+                ),
             });
         }
         let mut views = Vec::new();
@@ -359,12 +370,17 @@ impl<'a> Plan<'a> {
 }
 
 /// Checks the launch's function constants against `rule`.
-fn check_consts(rule: ConstRule, entry: &'static str, block: Extent3, consts: &[FnConst]) -> CoreResult<()> {
+fn check_consts(
+    rule: ConstRule,
+    entry: &'static str,
+    block: Extent3,
+    consts: &[FnConst],
+) -> CoreResult<()> {
     let is_block_y = |v: i16| u32::try_from(v).is_ok_and(|v| v == block.y);
     for c in consts {
         let accepted = match (rule, c.index, c.value) {
             (ConstRule::MulMv | ConstRule::MulMvExt, 600, FnConstValue::I16(v)) => is_block_y(v),
-            (ConstRule::MulMvExt, 601, FnConstValue::I16(4 | 8 | 16)) => true,
+            (ConstRule::MulMvExt, 601, FnConstValue::I16(v)) => matches!(v, 4 | 8 | 16),
             (ConstRule::MulMm, 700 | 701, FnConstValue::Bool(_)) => true,
             _ => false,
         };
@@ -384,7 +400,9 @@ fn workers(spec: &KernelSpec, grid: Extent3, block: Extent3, threads: usize) -> 
     let groups = grid.volume();
     let big = groups >= MIN_PARALLEL_GROUPS && groups * block.volume() >= MIN_PARALLEL_THREADS;
     if spec.disjoint == GroupsDisjoint::Yes && big {
-        usize::try_from(groups).map_or(threads, |g| threads.min(g)).max(1)
+        usize::try_from(groups)
+            .map_or(threads, |g| threads.min(g))
+            .max(1)
     } else {
         1
     }
@@ -484,6 +502,13 @@ pub(crate) fn execute(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::float_cmp,
+    clippy::unnecessary_wraps,
+    reason = "fixtures: small indices become floats, the bits are what the tests compare, and group fns must match the table's fallible signature"
+)]
 mod tests {
     use shiso_core::RawBuffer;
 
@@ -542,14 +567,51 @@ mod tests {
 
     const YES: GroupsDisjoint = GroupsDisjoint::Yes;
     const TABLE: &Table = &[
-        ("test", "kernel_test_scale", spec(scale_group, &[Role::In, Role::Out], ConstRule::None, YES)),
-        ("test", "kernel_test_inout", spec(inout_group, &[Role::InOut], ConstRule::None, YES)),
-        ("test", "kernel_test_two_out", spec(noop_group, &[Role::Out, Role::Out], ConstRule::None, YES)),
-        ("test", "kernel_test_overrun", spec(overrun_group, &[Role::Out], ConstRule::None, YES)),
-        ("test", "kernel_test_chain", spec(chain_group, &[Role::InOut], ConstRule::None, GroupsDisjoint::No)),
-        ("test", "kernel_test_mv", spec(noop_group, &[], ConstRule::MulMv, YES)),
-        ("test", "kernel_test_mv_ext", spec(noop_group, &[], ConstRule::MulMvExt, YES)),
-        ("test", "kernel_test_mm", spec(noop_group, &[], ConstRule::MulMm, YES)),
+        (
+            "test",
+            "kernel_test_scale",
+            spec(scale_group, &[Role::In, Role::Out], ConstRule::None, YES),
+        ),
+        (
+            "test",
+            "kernel_test_inout",
+            spec(inout_group, &[Role::InOut], ConstRule::None, YES),
+        ),
+        (
+            "test",
+            "kernel_test_two_out",
+            spec(noop_group, &[Role::Out, Role::Out], ConstRule::None, YES),
+        ),
+        (
+            "test",
+            "kernel_test_overrun",
+            spec(overrun_group, &[Role::Out], ConstRule::None, YES),
+        ),
+        (
+            "test",
+            "kernel_test_chain",
+            spec(
+                chain_group,
+                &[Role::InOut],
+                ConstRule::None,
+                GroupsDisjoint::No,
+            ),
+        ),
+        (
+            "test",
+            "kernel_test_mv",
+            spec(noop_group, &[], ConstRule::MulMv, YES),
+        ),
+        (
+            "test",
+            "kernel_test_mv_ext",
+            spec(noop_group, &[], ConstRule::MulMvExt, YES),
+        ),
+        (
+            "test",
+            "kernel_test_mm",
+            spec(noop_group, &[], ConstRule::MulMm, YES),
+        ),
         (
             "test",
             "kernel_test_block",
@@ -573,8 +635,9 @@ mod tests {
     }
 
     fn fill(slabs: &mut Slabs, values: &[f32]) -> RawBuffer {
-        let raw = slabs.alloc((values.len() * 4) as u64).expect("alloc");
-        let view = DeviceView::from_raw(raw, 0, raw.bytes());
+        let bytes = (values.len() * 4) as u64;
+        let raw = slabs.alloc(bytes).expect("alloc");
+        let view = DeviceView::from_raw(raw, 0, bytes);
         slabs
             .bytes_mut(view)
             .expect("live")
@@ -609,16 +672,29 @@ mod tests {
         let one = launch_scale(&mut slabs, n, 1);
         let many = launch_scale(&mut slabs, n, 7);
         assert_eq!(one.len(), n);
-        assert!(one.iter().zip(&many).all(|(a, b)| a.to_bits() == b.to_bits()));
-        assert_eq!(one[4096].to_bits(), ((4096.0f32 * 0.37 - 5.0) * 2.0).to_bits());
+        assert!(
+            one.iter()
+                .zip(&many)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        assert_eq!(
+            one[4096].to_bits(),
+            ((4096.0f32 * 0.37 - 5.0) * 2.0).to_bits()
+        );
     }
 
     #[test]
     fn small_launches_stay_on_the_caller_thread() {
         let spec = &TABLE[0].2;
-        assert_eq!(workers(spec, Extent3::linear(15), Extent3::linear(1024), 8), 1);
+        assert_eq!(
+            workers(spec, Extent3::linear(15), Extent3::linear(1024), 8),
+            1
+        );
         assert_eq!(workers(spec, Extent3::linear(16), Extent3::linear(1), 8), 1);
-        assert_eq!(workers(&TABLE[4].2, Extent3::linear(64), Extent3::linear(256), 8), 1);
+        assert_eq!(
+            workers(&TABLE[4].2, Extent3::linear(64), Extent3::linear(256), 8),
+            1
+        );
     }
 
     #[test]
@@ -667,7 +743,16 @@ mod tests {
         let launch = LaunchArgs::new(Extent3::linear(1), Extent3::linear(1), &args);
         let err = execute(TABLE, &mut slabs, kernel("kernel_test_two_out"), &launch, 1)
             .expect_err("overlap");
-        assert!(matches!(err, CoreError::InvalidValue { key: "kernel output views", .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                CoreError::InvalidValue {
+                    key: "kernel output views",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         // Touching but not overlapping is fine.
         let args = [
             KernelArg::Buffer(DeviceView::from_raw(raw, 0, 16)),
@@ -688,7 +773,16 @@ mod tests {
         let launch = LaunchArgs::new(Extent3::linear(1), Extent3::linear(1), &args);
         let err = execute(TABLE, &mut slabs, kernel("kernel_test_scale"), &launch, 1)
             .expect_err("misaligned");
-        assert!(matches!(err, CoreError::InvalidValue { key: "kernel buffer view", .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                CoreError::InvalidValue {
+                    key: "kernel buffer view",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -699,7 +793,17 @@ mod tests {
         let launch = LaunchArgs::new(Extent3::linear(1), Extent3::linear(1), &args);
         let err = execute(TABLE, &mut slabs, kernel("kernel_test_overrun"), &launch, 1)
             .expect_err("8 floats into 16 bytes");
-        assert!(matches!(err, CoreError::OutOfBounds { len: 32, buffer_bytes: 16, .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                CoreError::OutOfBounds {
+                    len: 32,
+                    buffer_bytes: 16,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -719,10 +823,29 @@ mod tests {
         let launch = LaunchArgs::new(Extent3::linear(1), Extent3::linear(1), &[]);
         let err = execute(TABLE, &mut slabs, kernel("kernel_test_scale"), &launch, 1)
             .expect_err("no buffers");
-        assert!(matches!(err, CoreError::ShapeMismatch { expected: 2, got: 0, .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                CoreError::ShapeMismatch {
+                    expected: 2,
+                    got: 0,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         let err = execute(TABLE, &mut slabs, kernel("kernel_test_block"), &launch, 1)
             .expect_err("block.x is 1");
-        assert!(matches!(err, CoreError::InvalidValue { key: "kernel block", .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                CoreError::InvalidValue {
+                    key: "kernel block",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         let ok = LaunchArgs::new(Extent3::linear(1), Extent3::linear(32), &[]);
         execute(TABLE, &mut slabs, kernel("kernel_test_block"), &ok, 1).expect("block.x is 32");
     }
@@ -736,7 +859,11 @@ mod tests {
             b: f32,
         }
         let pair = Pair { a: 7, b: 1.5 };
-        let bytes = [0u8; 2].iter().chain(bytemuck::bytes_of(&pair)).copied().collect::<Vec<u8>>();
+        let bytes = [0u8; 2]
+            .iter()
+            .chain(bytemuck::bytes_of(&pair))
+            .copied()
+            .collect::<Vec<u8>>();
         let slabs = Slabs::new();
         let args = [KernelArg::Bytes(&bytes[2..])];
         let launch_args = LaunchArgs::new(Extent3::linear(1), Extent3::linear(1), &args);
@@ -745,14 +872,32 @@ mod tests {
         let launch = plan.bind(&slabs).expect("bind");
         let got: Pair = launch.bytes().expect("decode unaligned bytes");
         assert_eq!((got.a, got.b), (7, 1.5));
-        let err = launch.bytes::<[u32; 3]>().map(|_| ()).expect_err("size differs");
-        assert!(matches!(err, CoreError::ShapeMismatch { expected: 12, got: 8, .. }), "{err:?}");
+        let err = launch
+            .bytes::<[u32; 3]>()
+            .map(|_| ())
+            .expect_err("size differs");
+        assert!(
+            matches!(
+                err,
+                CoreError::ShapeMismatch {
+                    expected: 12,
+                    got: 8,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
-    fn run_with_consts(entry: &'static str, block_y: u32, consts: &'static [FnConst]) -> CoreResult<()> {
+    /// `KernelRef` wants `'static` constants; a test leaks a few bytes for them.
+    fn leaked(consts: &[FnConst]) -> &'static [FnConst] {
+        Box::leak(consts.to_vec().into_boxed_slice())
+    }
+
+    fn run_with_consts(entry: &'static str, block_y: u32, consts: &[FnConst]) -> CoreResult<()> {
         let mut slabs = Slabs::new();
         let launch = LaunchArgs::new(Extent3::linear(1), Extent3::new(32, block_y, 1), &[]);
-        let kernel = KernelRef::specialized("test", entry, consts);
+        let kernel = KernelRef::specialized("test", entry, leaked(consts));
         execute(TABLE, &mut slabs, kernel, &launch, 1)
     }
 
@@ -764,27 +909,76 @@ mod tests {
     fn unexpected_function_constants_are_refused() {
         let refused = |r: CoreResult<()>| {
             assert!(
-                matches!(r, Err(CoreError::InvalidValue { key: "kernel function constant", .. })),
+                matches!(
+                    r,
+                    Err(CoreError::InvalidValue {
+                        key: "kernel function constant",
+                        ..
+                    })
+                ),
                 "{r:?}"
             );
         };
         // None: any constant is refused.
-        refused(run_with_consts("kernel_test_scale", 1, &[c(600, FnConstValue::I16(1))]));
+        refused(run_with_consts(
+            "kernel_test_scale",
+            1,
+            &[c(600, FnConstValue::I16(1))],
+        ));
         // MulMv: 600 must equal block.y, be I16, and nothing else is allowed.
         run_with_consts("kernel_test_mv", 2, &[]).expect("absent");
         run_with_consts("kernel_test_mv", 2, &[c(600, FnConstValue::I16(2))]).expect("equal");
-        refused(run_with_consts("kernel_test_mv", 2, &[c(600, FnConstValue::I16(600))]));
-        refused(run_with_consts("kernel_test_mv", 2, &[c(600, FnConstValue::U16(2))]));
-        refused(run_with_consts("kernel_test_mv", 2, &[c(601, FnConstValue::I16(4))]));
+        refused(run_with_consts(
+            "kernel_test_mv",
+            2,
+            &[c(600, FnConstValue::I16(600))],
+        ));
+        refused(run_with_consts(
+            "kernel_test_mv",
+            2,
+            &[c(600, FnConstValue::U16(2))],
+        ));
+        refused(run_with_consts(
+            "kernel_test_mv",
+            2,
+            &[c(601, FnConstValue::I16(4))],
+        ));
         // MulMvExt: 601 is 4, 8 or 16.
-        run_with_consts("kernel_test_mv_ext", 2, &[c(600, FnConstValue::I16(2)), c(601, FnConstValue::I16(8))])
-            .expect("valid pair");
-        refused(run_with_consts("kernel_test_mv_ext", 2, &[c(601, FnConstValue::I16(5))]));
-        refused(run_with_consts("kernel_test_mv_ext", 2, &[c(600, FnConstValue::I16(4))]));
+        run_with_consts(
+            "kernel_test_mv_ext",
+            2,
+            &[c(600, FnConstValue::I16(2)), c(601, FnConstValue::I16(8))],
+        )
+        .expect("valid pair");
+        refused(run_with_consts(
+            "kernel_test_mv_ext",
+            2,
+            &[c(601, FnConstValue::I16(5))],
+        ));
+        refused(run_with_consts(
+            "kernel_test_mv_ext",
+            2,
+            &[c(600, FnConstValue::I16(4))],
+        ));
         // MulMm: 700 and 701 are Bool toggles; anything else is refused.
-        run_with_consts("kernel_test_mm", 1, &[c(700, FnConstValue::Bool(true)), c(701, FnConstValue::Bool(false))])
-            .expect("toggles");
-        refused(run_with_consts("kernel_test_mm", 1, &[c(700, FnConstValue::U32(1))]));
-        refused(run_with_consts("kernel_test_mm", 1, &[c(702, FnConstValue::Bool(true))]));
+        run_with_consts(
+            "kernel_test_mm",
+            1,
+            &[
+                c(700, FnConstValue::Bool(true)),
+                c(701, FnConstValue::Bool(false)),
+            ],
+        )
+        .expect("toggles");
+        refused(run_with_consts(
+            "kernel_test_mm",
+            1,
+            &[c(700, FnConstValue::U32(1))],
+        ));
+        refused(run_with_consts(
+            "kernel_test_mm",
+            1,
+            &[c(702, FnConstValue::Bool(true))],
+        ));
     }
 }
