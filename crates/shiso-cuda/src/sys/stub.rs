@@ -27,6 +27,11 @@ pub(crate) fn library_present() -> bool {
     false
 }
 
+/// Whether libcublasLt can be found: never, on this target.
+pub(crate) fn blas_lt_library_present() -> bool {
+    false
+}
+
 /// Initialises the driver.
 ///
 /// # Errors
