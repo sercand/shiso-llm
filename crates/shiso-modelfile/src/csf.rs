@@ -32,8 +32,7 @@
 //! cannot wrap a byte - a wrapped scale is a finite number and the wrong
 //! one), every exception inside the matrix, and the exception list strictly
 //! ascending, which is what the writer promises and what makes a duplicated
-//! or truncated list visible. Golden matrices decoded by the reference's own
-//! kernels are replayed in `tests/csf_reference.rs`.
+//! or truncated list visible.
 
 use crate::nvfp4::GROUP;
 use crate::reader::{GgufError, GgufResult};

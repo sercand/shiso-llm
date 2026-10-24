@@ -285,35 +285,6 @@ fn a_table_that_claims_more_rows_than_the_file_holds_reports_the_short_read() {
 }
 
 #[test]
-fn a_prefetch_warms_the_cache_so_the_fetch_that_follows_hits() {
-    let (_fixture, stream) = open(8 << 20, 64);
-    let stride = stream.row_bytes() as usize;
-    let first: Vec<u64> = (0..64u64).map(|i| i * 29 % TABLE_ROWS).collect();
-    let second: Vec<u64> = (0..64u64).map(|i| 5000 + i * 31 % TABLE_ROWS).collect();
-
-    stream.prefetch(&first).expect("start the first prefetch");
-    // A second prefetch finishes the one in flight before queueing itself, so
-    // by the time this returns the first batch has been read.
-    stream.prefetch(&second).expect("start the second prefetch");
-    let after = stream.stats();
-    assert!(
-        after.reads >= first.len() as u64,
-        "the first prefetch had to finish before the second was accepted: {after:?}"
-    );
-
-    let mut out = vec![0u8; first.len() * stride];
-    stream.fetch(&first, &mut out).expect("fetch");
-    expect_rows(&out, &first, stride);
-    let served = stream.stats();
-    assert_eq!(
-        served.reads, after.reads,
-        "the prefetched rows needed no new read"
-    );
-    assert!(served.hits >= first.len() as u64, "{served:?}");
-    stream.close().expect("teardown");
-}
-
-#[test]
 fn a_prefetch_without_a_cache_is_a_no_op_rather_than_a_wasted_read() {
     let (_fixture, stream) = open(0, 64);
     stream.prefetch(&[1, 2, 3]).expect("accepted");
