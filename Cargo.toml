@@ -24,6 +24,7 @@ members = [
     "crates/shiso-router",
     "crates/shiso-hub",
     "crates/shiso-registry",
+    "crates/shiso-cpu",
 ]
 
 [workspace.package]
@@ -104,7 +105,7 @@ aho-corasick = "1"
 # GGUF is hand-rolled (shiso-modelfile); memmap2 backs the read-only model mapping.
 # bytemuck gives zero-copy #[repr(C)] views over quant blocks and fixed headers.
 memmap2 = "0.9"
-bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+bytemuck = { version = "1", features = ["derive", "min_const_generics", "extern_crate_alloc"] }
 safetensors = "0.8"
 half = { version = "2", features = ["bytemuck"] }
 sha1 = "0.10"
@@ -204,6 +205,7 @@ shiso-kerneltest = { path = "crates/shiso-kerneltest" }
 shiso-router = { path = "crates/shiso-router" }
 shiso-hub = { path = "crates/shiso-hub" }
 shiso-registry = { path = "crates/shiso-registry" }
+shiso-cpu = { path = "crates/shiso-cpu" }
 [workspace.lints.rust]
 # Safety. Five crates relax this with a crate-level
 # #![allow(unsafe_code, reason = "...")]: shiso-modelfile (mmap), shiso-metal (objc2),

@@ -135,6 +135,10 @@ pub struct HubArgs {
 pub struct PullArgs {
     /// Model reference to download (`<name-or-alias>[:<variant-key>]`).
     pub model_ref: String,
+    /// Which device the model will serve on, so the variant pulled is the one
+    /// `shiso serve --device` runs: `auto`, or one this build compiled.
+    #[arg(long, env = "SHISO_DEVICE", value_enum, default_value_t = shiso_runtime::device::DeviceChoice::Auto)]
+    pub device: shiso_runtime::device::DeviceChoice,
     /// Common hub configuration options.
     #[command(flatten)]
     pub hub: HubArgs,

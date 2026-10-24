@@ -34,6 +34,7 @@ pub mod audio;
 pub mod boot;
 pub mod boot_error;
 pub mod decision;
+pub mod device;
 pub mod embed;
 pub mod error;
 pub mod hub;

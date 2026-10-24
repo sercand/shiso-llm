@@ -60,6 +60,8 @@ image = { workspace = true }
 minijinja = { workspace = true }
 
 [dev-dependencies]
+# The CPU device the Clef parity twins run on. Dev-only, like the Metal one.
+shiso-cpu = { workspace = true }
 # The device the model tests run on, and the vocabulary the golden prompt is
 # encoded with. Dev-only: this crate names no device API.
 shiso-metal = { workspace = true }

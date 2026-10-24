@@ -806,6 +806,13 @@ pub fn gemm_matches_for_every_weight_type_and_ragged_shape(gpu: &Gpu) {
             gemm_case(gpu, kind, (m, n, k), bias, GemmMode::Tiled);
         }
     }
+    q8_0w_gemm_matches_for_ragged_shapes(gpu);
+}
+
+/// The tiled GEMM over `Q8_0` weights alone: the `Q8_0` shapes of
+/// [`gemm_matches_for_every_weight_type_and_ragged_shape`], for a backend that
+/// ports only the `Q8_0` kernels.
+pub fn q8_0w_gemm_matches_for_ragged_shapes(gpu: &Gpu) {
     // Q8_0 rows are whole blocks, so its shapes keep k a multiple of 32.
     for &(m, n, k, bias) in &[
         (37usize, 5usize, 64usize, false),
@@ -825,6 +832,12 @@ pub fn split_k_gemm_matches_the_whole_product(gpu: &Gpu) {
             gemm_case(gpu, kind, (m, n, k), true, GemmMode::Split(splits));
         }
     }
+    q8_0w_split_k_gemm_matches_the_whole_product(gpu);
+}
+
+/// Split k over `Q8_0` weights alone: the `Q8_0` shape of
+/// [`split_k_gemm_matches_the_whole_product`].
+pub fn q8_0w_split_k_gemm_matches_the_whole_product(gpu: &Gpu) {
     gemm_case(gpu, "q8_0w", (19, 70, 1024), true, GemmMode::Split(5));
 }
 
@@ -843,6 +856,12 @@ pub fn tall_gemm_matches_for_every_weight_type(gpu: &Gpu) {
             tall_as_tiled(gpu, kind, (m, n, k), bias);
         }
     }
+    q8_0w_tall_gemm_matches_the_tiled_one(gpu);
+}
+
+/// The 64-row GEMM over `Q8_0` weights alone: the `Q8_0` shapes of
+/// [`tall_gemm_matches_for_every_weight_type`].
+pub fn q8_0w_tall_gemm_matches_the_tiled_one(gpu: &Gpu) {
     // Q8_0 rows are whole blocks, so its k stay multiples of 32.
     for &(m, n, k) in &[(200usize, 130usize, 1024usize), (37, 96, 992)] {
         tall_as_tiled(gpu, "q8_0w", (m, n, k), true);
@@ -876,6 +895,12 @@ pub fn gemv_matches_for_every_weight_type(gpu: &Gpu) {
             gemm_case(gpu, kind, (m, n, k), bias, GemmMode::Gemv);
         }
     }
+    q8_0w_gemv_matches(gpu);
+}
+
+/// The matrix-vector kernel over `Q8_0` weights alone: the `Q8_0` shapes of
+/// [`gemv_matches_for_every_weight_type`].
+pub fn q8_0w_gemv_matches(gpu: &Gpu) {
     for &(m, n, k) in &[(1usize, 1300usize, 1152usize), (4, 37, 64)] {
         gemm_case(gpu, "q8_0w", (m, n, k), true, GemmMode::Gemv);
     }

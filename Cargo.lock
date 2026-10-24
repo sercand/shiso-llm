@@ -2658,6 +2658,7 @@ dependencies = [
  "serde_json",
  "shiso-audio",
  "shiso-core",
+ "shiso-cpu",
  "shiso-cuda",
  "shiso-engine",
  "shiso-hub",
@@ -2686,6 +2687,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "shiso-cpu"
+version = "0.2.4"
+dependencies = [
+ "bytemuck",
+ "half",
+ "shiso-core",
+ "shiso-kerneltest",
+ "sysinfo",
  "tracing",
 ]
 
@@ -2859,6 +2872,7 @@ dependencies = [
  "sha2",
  "shiso-audio",
  "shiso-core",
+ "shiso-cpu",
  "shiso-cuda",
  "shiso-engine",
  "shiso-kvstore",
@@ -2976,6 +2990,7 @@ dependencies = [
  "sha2",
  "shiso-audio",
  "shiso-core",
+ "shiso-cpu",
  "shiso-cuda",
  "shiso-engine",
  "shiso-hub",
