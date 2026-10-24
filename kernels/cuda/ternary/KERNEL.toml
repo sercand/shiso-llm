@@ -8,7 +8,7 @@
 # pieces and is the whole of the module.
 #
 # Nothing here is a byte copy of anything: the arithmetic is the Metal twins'
-# in `crates/shiso-metal/metal/ternary`, graded by the same
+# in `kernels/metal/ternary`, graded by the same
 # `shiso-kerneltest::ternary` cases.
 
 [build]

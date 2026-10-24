@@ -205,6 +205,88 @@ curl http://127.0.0.1:8090/v1/audio/transcriptions \
     -F 'keywords[]=Marigold' -F 'keywords[]=Lighthouse'
 ```
 
+## Library use
+
+`shiso-runtime` is the server's engine without the HTTP layer or the
+command-line parser: scheduler, model loading, tokenizer, media, and typed
+cores for chat, images and decisions. `Runtime` is one handle over them. It
+takes and returns the `shiso-ir` types, so the caller never builds a wire
+format. A model directory with a language model, an image model or both is
+served; a call for a capability the model does not have returns a typed
+error.
+
+```rust,ignore
+use shiso_ir::decision::{
+    Choice, ChoiceValue, Input, Question, QuestionKind, ReadoutState, Request,
+};
+use shiso_runtime::{Runtime, RuntimeOptions, Source};
+
+// Opens the model, pulling it first when it is not installed, and warms it.
+let options = RuntimeOptions { pull_if_missing: true, ..RuntimeOptions::default() };
+let runtime = Runtime::open(
+    Source::Registry("smollm2-135m-decision"),
+    options,
+    &mut |done, total| {
+        tracing::info!(done, total, "pulling");
+        true // return false to cancel the pull
+    },
+)?;
+
+let choice = |v: &str| Choice { value: ChoiceValue::Str(v.into()), description: None };
+let response = runtime.decide_blocking(Request {
+    input: Input::Text("cwd: /repo\ntask: unknown\ncmd: ls -la".into()),
+    readout_state: ReadoutState::Input,
+    questions: vec![Question {
+        name: "decision".into(),
+        instructions: "Is this command safe to run without asking?".into(),
+        kind: QuestionKind::Choice(vec![choice("approve"), choice("ask"), choice("deny")]),
+        probability_answer: false,
+    }],
+    temperature: None,
+    preserve_thinking: None,
+    token_ids: false,
+})?;
+tracing::info!(choice = ?response.answers[0].choice, "decided");
+
+// A chat model is a runtime of its own (a decision model has no chat turn).
+let chat = Runtime::open(Source::Registry("a-chat-model"), RuntimeOptions::default(), &mut |_, _| true)?;
+let request = shiso_ir::Request::new("a-chat-model", vec![shiso_ir::Message::user("hello")]);
+let reply = chat.generate_blocking(request)?; // or `chat.generate(request).await` in async code
+```
+
+A model with a decision readout or head answers every question from one
+prompt; any other chat model scores each question's labels from its
+next-token row, as `/v1/decisions` does.
+
+`Source::Dir` opens a local installed variant or checkpoint and never touches
+the network; `Source::Registry` reaches it only with `pull_if_missing`.
+`generate_stream`, `images`, `edit_image` and their streaming forms are the
+other entry points.
+
+- **Warm-up on open.** `open` blocks while the weights load, then runs one
+  throwaway pass (one decision, or one generated token, plus one small image
+  when there is an image model) so the first real call does not pay for
+  kernel compilation. A failed decision or text pass is `OpenError::WarmUp`;
+  a failed image pass is only logged.
+- **Cache size.** Unlike `shiso serve`, which holds a 131072-token KV pool, a
+  `Runtime` sizes the pool to `2 x ctx x max_num_seqs` tokens unless you set
+  `serve.kv_cache_tokens` or `serve.gpu_memory_utilization` (measured: about
+  0.5 GiB resident for the 135M decision model instead of 2.9 GiB).
+- **Async and blocking.** The async methods run on the caller's executor,
+  whichever it is: the runtime keeps a private one-worker tokio runtime for
+  timers and the work itself runs on the engine thread. The `*_blocking`
+  methods park the calling thread on a channel and work from any thread;
+  on an async worker they block that worker, so prefer the async form there.
+  The only refused caller is the runtime's own worker thread, which would wait
+  for itself: it gets an error, not a hang or panic.
+- **Sharing and dropping.** Methods take `&self`; wrap the `Runtime` in an
+  `Arc` to share it. Dropping it joins the engine thread after the step in
+  flight, so do not drop it on an async worker you cannot stall.
+
+Build with `--features metal` or `--features cuda`. The runtime has no HTTP
+server or command-line parser in its dependencies unless you turn on its
+`clap` feature.
+
 ## Configuration
 
 Run `shiso serve --help` for every option. Each flag also reads a `SHISO_*`
@@ -255,46 +337,6 @@ environment variable. The ones you are most likely to want:
 | `--image-draft-steps` | Leading denoising steps of every image job run at half the requested resolution, then handed over to the full size (Qwen-Image-2.1 only; default 0). A half-size step costs about a quarter of a full one; at 1024x1024 on an M4, 4 of a 6-step distilled checkpoint's steps take a job from 150 s to 77 s at a small cost in fine detail |
 | `--image-final-reuse` | `START:END`: transformer blocks the last step skips, replaying the residual the step before recorded over them (Qwen-Image-2.1 only; the last two steps must run at full size). Faster, visibly softer |
 | `--embedding-max-queue` | Embedding requests that may wait in the queue beyond the one running (default 64), when `--model` is an embedding checkpoint |
-
-### FLUX.3 Klein (image generation, Metal)
-
-`--image-model` takes the distilled FLUX.3 Klein transformer as one `.gguf` (the
-Q2_K to Q8_0 mixed-quantization exports are read in their stored formats, never
-dequantized) or one `.safetensors` file; the Base (guidance, 50-step) release is
-refused by name. The text encoder is the Qwen3-VL-4B language model, as
-`text_encoder/` shards or one INT8 ConvRot file with its `config.json`, the VAE
-is `ae.safetensors`, and the tokenizer is `tokenizer.json`; the locator finds
-each beside the model or under `--image-assets-dir`, or take the explicit flags.
-It runs 16 flow-map Euler steps without guidance at 1024x1024 by default (sides
-64 to 4096 on a 16-pixel grid), and `--image-residency swap` (or `auto` on a host
-too small for both) drops the text encoder before the transformer is imported.
-Measured on a 24 GiB M4 (Metal working set 17.8 GiB), 1024x1024, 16 steps, with
-the Q4_K_XL transformer: the pictures are byte-identical across `resident`, `swap`
-and an `auto` that chose swap (BF16 and INT8 text encoders), and the image takes
-the same ~242 s either way, since a swap costs under a few seconds of page-cache
-reads and imports (the files were mostly in the page cache; a fully cold read was
-not measured). What changes is the device's peak allocation: with the BF16 text
-encoder (7.2 GB loaded) 16.7 GB resident, 9.5 GB for a swap that keeps the
-transformer through the decode and 7.6 GB for one that drops it first
-(`--image-reserve-gb 10`); with the INT8 encoder (4.3 GB) 13.8 GB resident against
-9.5 GB. `auto` chooses `resident` here at the default reserve and swap once
-`--image-reserve-gb` leaves too little. A reserve that leaves less than a 1024x1024
-job needs is refused when the model opens, naming the largest square side that
-would fit (or saying that none does).
-The generator itself accepts up to 10 reference pictures for editing: a single
-reference is fitted under 4 MiB pixels and reflect-padded to a canvas on the grid,
-several are each fitted under 1 MP. Over HTTP an edit is `POST /v1/images/edits`
-(multipart `image` / `image[]`, up to 10, or JSON `images: [{"image_url":
-"data:..."}]`); a request that names no `size` gets the size its references
-imply (one reference: its own aspect ratio), and `n` must be 1. FLUX.2-klein and
-Qwen-Image-2.1 answer an edit with a 400 naming the model. The model's
-authors ship a prompt upsampler with it and recommend not running it without
-one; this build has none, so prompts reach the model as typed. FLUX.3 Klein on
-CUDA is **written but unvalidated**: the `diffusion` kernel module has a CUDA
-port (`kernels/cuda/diffusion`) that was written on a machine with no CUDA
-toolchain, so it has never been compiled by nvcc or run on a device. Treat any
-CUDA output as untrusted until the `shiso-cuda` `diffusion_kernels` cases and
-the FLUX.3 end-to-end case have passed on a GPU.
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
 

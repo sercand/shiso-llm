@@ -1,7 +1,7 @@
 /* The gated delta network: the four small entries, the sequential recurrence
  * and the chunked-parallel form.
  *
- * The CUDA twins of `crates/shiso-metal/metal/qwen35/gdn_conv.metal`,
+ * The CUDA twins of `kernels/metal/qwen35/gdn_conv.metal`,
  * `gdn_recurrent.metal`, `gdn_recurrent_hybrid.metal`, `gdn_chunk.metal` and
  * `gdn_chunk_hybrid.metal`, over the laws `kernels/cuda/q4e/gdn.cu` carries as
  * `q4e_gdn_conv_kernel`, `q4e_gdn_l2norm_kernel`, `q4e_gdn_gates_kernel`,

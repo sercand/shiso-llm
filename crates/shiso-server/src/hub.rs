@@ -5,66 +5,30 @@
     reason = "CLI command output intended for operator console or NDJSON stream"
 )]
 
-use std::fs::File;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle as IndicatifStyle};
-use tokio::sync::mpsc;
 use url::Url;
 
 use shiso_hub::config::{HfToken, HubConfig, RegistryEndpoint};
 use shiso_hub::download::Downloader;
-use shiso_hub::host::Backend;
-use shiso_hub::host::HostProfile;
+use shiso_hub::host::{Backend, HostProfile};
 use shiso_hub::progress::ProgressEvent;
-use shiso_hub::recipe::{ModelName, ModelRef, Role, Variant};
+use shiso_hub::recipe::{ModelName, ModelRef};
 use shiso_hub::registry::RegistryClient;
 use shiso_hub::select::select_variant;
-use shiso_hub::store::{BlobStore, InstalledVariantSummary};
+use shiso_hub::store::BlobStore;
+use shiso_runtime::hub::{InstalledModel, PullEvent, PullPolicy, pull_observed_on};
 
 use crate::cli::{
-    HubArgs, InfoArgs, ListArgs, ModelArgKind, ProgressStyle, PullArgs, RmArgs, ServeArgs,
-    VerifyArgs, apply_recipe_defaults, classify_model_arg,
+    ExplicitlySet, HubArgs, InfoArgs, ListArgs, ProgressStyle, PullArgs, RmArgs, ServeArgs,
+    VerifyArgs,
 };
 
-/// Builds a `HostProfile` based on compile-time features and runtime RAM probing (§5.2).
-#[must_use]
-pub fn probe_host_profile() -> HostProfile {
-    let backends = vec![
-        #[cfg(feature = "metal")]
-        Backend::Metal,
-        #[cfg(feature = "cuda")]
-        Backend::Cuda,
-    ];
-
-    #[cfg(feature = "cuda")]
-    let cuda = {
-        if shiso_cuda::cuda_available() {
-            Some(shiso_hub::host::CudaInfo {
-                sm: 89,
-                vram_bytes: 16 * 1024 * 1024 * 1024,
-            })
-        } else {
-            None
-        }
-    };
-    #[cfg(not(feature = "cuda"))]
-    let cuda = None;
-
-    #[cfg(feature = "metal")]
-    let metal = shiso_metal::device_facts().map(|facts| shiso_hub::host::MetalInfo {
-        name: facts.name,
-        family: facts.apple_family,
-        working_set_bytes: facts.working_set_bytes,
-    });
-    #[cfg(not(feature = "metal"))]
-    let metal = None;
-
-    HostProfile::probe(backends, cuda, metal)
-}
+pub use shiso_runtime::hub::probe_host_profile;
 
 /// Resolves `home` directory from string, expanding `~`.
 #[must_use]
@@ -116,184 +80,32 @@ pub fn build_hub_config(args: &HubArgs) -> anyhow::Result<HubConfig> {
     Ok(config)
 }
 
-/// Resolves a positional model argument on `ServeArgs` (§6.6).
+/// Resolves a positional model argument on `ServeArgs` (§6.6): a path becomes
+/// the model, a registry reference is looked up in the model home and fills the
+/// path options and the recipe defaults the command line left alone.
 ///
-/// Returns an open shared lock file guard if a registry model was resolved.
+/// Returns the installed model, whose shared variant lock the caller holds
+/// while serving, or `None` when a path (or nothing) was given.
 ///
 /// # Errors
 /// Returns an error if component flags conflict with a model reference, the model is not installed,
 /// or opening the variant fails.
-// None is not a refusal: a direct filesystem path was provided or no model was specified, so no shared lock was taken.
 pub fn resolve_serve_model(
     args: &mut ServeArgs,
-    serve_matches: Option<&clap::ArgMatches>,
-) -> anyhow::Result<Option<File>> {
-    let Some(model_ref_str) = &args.model_ref else {
+    explicit: Option<&ExplicitlySet>,
+) -> anyhow::Result<Option<InstalledModel>> {
+    let Some(model_ref) = args.model_ref.clone() else {
         return Ok(None);
     };
-
-    match classify_model_arg(model_ref_str) {
-        ModelArgKind::Path(path) => {
-            args.model = Some(path);
-            Ok(None)
-        }
-        ModelArgKind::RegistryRef(ref_str) => {
-            check_component_flag_conflicts(args, &ref_str)?;
-
-            let parsed_ref = ModelRef::parse(&ref_str)
-                .map_err(|e| anyhow::anyhow!("invalid model reference '{ref_str}': {e}"))?;
-
-            let default_home = HubConfig::default_home();
-            let config = HubConfig::with_defaults(default_home);
-            let store = BlobStore::new(config);
-
-            let installed = store.list_installed()?;
-            let chosen = find_installed_serve_variant(&installed, &parsed_ref, &ref_str)?;
-
-            let variant_key = &chosen.variant;
-            let vdir = store.variant_dir(&parsed_ref.model, variant_key);
-
-            let lock_file = store.open_variant_lock(&parsed_ref.model, variant_key)?;
-            lock_file
-                .lock_shared()
-                .with_context(|| format!("locking variant {variant_key}"))?;
-
-            let recipe = chosen
-                .recipe
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("installed recipe.json missing"))?;
-            let variant = recipe
-                .variants
-                .iter()
-                .find(|v| &v.key == variant_key)
-                .ok_or_else(|| anyhow::anyhow!("variant not in recipe"))?;
-
-            populate_serve_args_from_variant(args, &vdir, variant, &recipe.name)?;
-
-            if let Some(defaults) = &variant.server_defaults {
-                apply_recipe_defaults(args, serve_matches, defaults);
-            }
-
-            Ok(Some(lock_file))
-        }
-    }
-}
-
-fn check_component_flag_conflicts(args: &ServeArgs, ref_str: &str) -> anyhow::Result<()> {
-    if args.config.is_some()
-        || args.ngram.is_some()
-        || args.vision.is_some()
-        || args.draft_model.is_some()
-        || args.draft_vocab.is_some()
-        || args.asr_model.is_some()
-        || args.asr_mmproj.is_some()
-        || args.diarization_model.is_some()
-        || args.image_model.is_some()
-        || args.image_assets_dir.is_some()
-        || args.image_text_encoder.is_some()
-        || args.image_vae.is_some()
-        || args.image_tokenizer.is_some()
-    {
-        bail!("cannot pass component flags together with model reference '{ref_str}'");
-    }
-    Ok(())
-}
-
-fn find_installed_serve_variant<'a>(
-    installed: &'a [InstalledVariantSummary],
-    parsed_ref: &ModelRef,
-    ref_str: &str,
-) -> anyhow::Result<&'a InstalledVariantSummary> {
-    let matching_variants: Vec<_> = installed
-        .iter()
-        .filter(|iv| iv.model == parsed_ref.model)
-        .collect();
-
-    if matching_variants.is_empty() {
-        bail!(
-            "Error: model '{}' is not installed. Run 'shiso pull {}' first.",
-            parsed_ref.model,
-            ref_str
-        );
-    }
-
-    if let Some(target_key) = &parsed_ref.variant {
-        matching_variants
-            .into_iter()
-            .find(|iv| &iv.variant == target_key)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Error: variant '{target_key}' for model '{}' is not installed.",
-                    parsed_ref.model
-                )
-            })
-    } else {
-        let host = probe_host_profile();
-        let recipe = matching_variants
-            .first()
-            .and_then(|iv| iv.recipe.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("could not load recipe for installed model"))?;
-
-        let selected = select_variant(recipe, &host, None)
-            .map_err(|e| anyhow::anyhow!("no compatible installed variant for this host: {e}"))?;
-
-        matching_variants
-            .into_iter()
-            .find(|iv| iv.variant == selected.variant.key)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Error: variant '{}' is not installed.",
-                    selected.variant.key
-                )
-            })
-    }
-}
-
-fn populate_serve_args_from_variant(
-    args: &mut ServeArgs,
-    vdir: &Path,
-    variant: &Variant,
-    recipe_name: &ModelName,
-) -> anyhow::Result<()> {
-    // A role is supplied by its own component or by a file another component
-    // binds to it; `role_paths` folds both into one answer per flag.
-    let roles = variant
-        .role_paths()
-        .map_err(|e| anyhow::anyhow!("installed recipe is inconsistent: {e}"))?;
-    for (role, place) in roles {
-        let role_dir = vdir.join(place.dir.as_str());
-        let target_path = match place.file {
-            Some(file) => role_dir.join(file),
-            None => role_dir,
-        };
-
-        match role {
-            Role::Base => args.model = Some(target_path),
-            Role::Draft => args.draft_model = Some(target_path),
-            Role::DraftVocab => args.draft_vocab = Some(target_path),
-            Role::Vision => args.vision = Some(target_path),
-            Role::Asr => args.asr_model = Some(target_path),
-            Role::AsrMmproj => args.asr_mmproj = Some(target_path),
-            Role::Diarization => args.diarization_model = Some(target_path),
-            Role::Config => args.config = Some(target_path),
-            Role::Ngram => args.ngram = Some(target_path),
-            Role::Image => args.image_model = Some(target_path),
-            Role::ImageAssets => args.image_assets_dir = Some(target_path),
-            Role::ImageTextEncoder => args.image_text_encoder = Some(target_path),
-            Role::ImageVae => args.image_vae = Some(target_path),
-            Role::ImageTokenizer => args.image_tokenizer = Some(target_path),
-        }
-    }
-
-    if args.image_model.is_some() && args.image_model_id.is_none() {
-        args.image_model_id = Some(recipe_name.to_string());
-    }
-
-    if args.model_name.is_none() {
-        args.model_name = Some(recipe_name.to_string());
-    }
-
-    Ok(())
+    let config = HubConfig::with_defaults(HubConfig::default_home());
+    let none = ExplicitlySet::default();
+    let installed = shiso_runtime::hub::resolve_serve_model(
+        &model_ref,
+        &mut args.options,
+        explicit.unwrap_or(&none),
+        &config,
+    )?;
+    Ok(installed)
 }
 
 /// The backends a variant names, as `metal/cuda`.
@@ -305,143 +117,197 @@ fn backends_label(backends: &[Backend]) -> String {
     names.join("/")
 }
 
+/// Prints a pull as `shiso pull` shows it: the steps as lines, the bytes as
+/// bars, a plain log, or one JSON object per download event (§6.1).
+struct PullRenderer<'a> {
+    style: ProgressStyle,
+    is_tty: bool,
+    out: &'a mut dyn Write,
+    bars: Option<Bars>,
+    /// The model and variant that was installed or found up to date, and
+    /// whether it was installed now.
+    done: Option<(String, String, bool)>,
+}
+
+impl<'a> PullRenderer<'a> {
+    fn new(style: ProgressStyle, is_tty: bool, out: &'a mut dyn Write) -> Self {
+        Self {
+            style,
+            is_tty,
+            out,
+            bars: None,
+            done: None,
+        }
+    }
+
+    fn bars_wanted(&self) -> bool {
+        matches!(self.style, ProgressStyle::Bars | ProgressStyle::Auto) && self.is_tty
+    }
+
+    /// One line on the output. A closed pipe is the reader's business, as it
+    /// is for `println!` in the other commands.
+    fn line(&mut self, text: &str) {
+        let _ = writeln!(self.out, "{text}");
+    }
+
+    fn event(&mut self, event: &PullEvent) {
+        match event {
+            PullEvent::FetchingIndex => self.line("Fetching registry index..."),
+            PullEvent::Selected {
+                explanation,
+                warning,
+            } => {
+                self.line(explanation);
+                if let Some(warn) = warning {
+                    self.line(warn);
+                }
+            }
+            PullEvent::UpToDate { model, variant } => {
+                self.line(&format!("Model '{model}:{variant}' is already up to date."));
+                self.done = Some((model.clone(), variant.clone(), false));
+            }
+            PullEvent::Progress(event) => self.progress(event),
+            PullEvent::Tick => {}
+        }
+    }
+
+    fn progress(&mut self, event: &ProgressEvent) {
+        if let ProgressEvent::Installed { model, variant } = event {
+            self.done = Some((model.clone(), variant.clone(), true));
+        }
+        if matches!(self.style, ProgressStyle::Json) {
+            if let Ok(json) = serde_json::to_string(event) {
+                self.line(&json);
+            }
+        } else if self.bars_wanted() {
+            self.bars.get_or_insert_with(Bars::new).event(event);
+        } else {
+            match event {
+                ProgressEvent::Resolved { total, .. } => {
+                    self.line(&format!("Downloading {total} bytes across components..."));
+                }
+                ProgressEvent::FileStarted {
+                    role, file, total, ..
+                } => {
+                    self.line(&format!("  [{role}] {file} started ({total} bytes)"));
+                }
+                ProgressEvent::FileVerified { role, file, .. } => {
+                    self.line(&format!("  [{role}] {file} verified"));
+                }
+                ProgressEvent::Installed { model, variant } => {
+                    self.line(&format!("Installed {model}:{variant}"));
+                }
+                ProgressEvent::Error { message, .. } => {
+                    self.line(&format!("Error: {message}"));
+                }
+                ProgressEvent::FileProgress { .. } => {}
+            }
+        }
+    }
+
+    /// The closing line, after the bars have ended.
+    fn finish(mut self) {
+        let done = self.done.take();
+        self.bars = None;
+        if let Some((model, variant, true)) = done {
+            self.line(&format!(
+                "Successfully pulled and installed '{model}:{variant}'."
+            ));
+        }
+    }
+}
+
+/// Pulls `model_ref` for `host`, rendering to `out` as `shiso pull` does.
+/// Blocks; see `shiso_runtime::hub::pull_observed_on`.
+fn pull_rendered(
+    model_ref: &str,
+    config: &HubConfig,
+    host: &HostProfile,
+    style: ProgressStyle,
+    is_tty: bool,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let mut renderer = PullRenderer::new(style, is_tty, out);
+    let installed = pull_observed_on(
+        host,
+        model_ref,
+        config,
+        PullPolicy::CheckRegistry,
+        &mut |event| {
+            renderer.event(event);
+            true
+        },
+    )?;
+    drop(installed);
+    renderer.finish();
+    Ok(())
+}
+
 /// Executes the `shiso pull <ref>` command (§6.1).
+///
+/// The pull itself is `shiso_runtime::hub::pull_observed`, the one embedders
+/// call too; this only prints what it reports.
 ///
 /// # Errors
 /// Returns an error if resolution, download, or installation fails.
 pub async fn run_pull(args: PullArgs) -> anyhow::Result<()> {
     let config = build_hub_config(&args.hub)?;
-    let parsed_ref = ModelRef::parse(&args.model_ref)
-        .map_err(|e| anyhow::anyhow!("invalid model reference '{}': {e}", args.model_ref))?;
-
-    let client = RegistryClient::new(config.clone());
-    let downloader = Downloader::new(config.clone());
-    let store = BlobStore::new(config);
-
-    println!("Fetching registry index...");
-    let index = client.fetch_index().await?;
-
-    let model_entry = client
-        .resolve_model(&index, parsed_ref.model.as_str())
-        .ok_or_else(|| anyhow::anyhow!("model '{}' not found in registry", parsed_ref.model))?;
-
-    let current_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))
-        .unwrap_or_else(|_| semver::Version::new(0, 1, 0));
-    let recipe = client.fetch_manifest(model_entry, &current_version).await?;
-
-    let host = probe_host_profile();
-    let selected = select_variant(&recipe, &host, parsed_ref.variant.as_ref())?;
-
-    println!("{}", selected.explanation);
-    if let Some(warn) = selected.warning {
-        println!("{warn}");
-    }
-
-    if store.is_up_to_date(
-        &recipe.name,
-        &selected.variant.key,
-        &model_entry.manifest_sha256,
-        selected.variant,
-    ) {
-        println!(
-            "Model '{}:{}' is already up to date.",
-            recipe.name, selected.variant.key
-        );
-        return Ok(());
-    }
-
-    let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
-    let progress_style = args.hub.progress;
+    let model_ref = args.model_ref;
+    let style = args.hub.progress;
     let is_tty = std::io::stdout().is_terminal();
-
-    let render_handle = tokio::spawn(async move {
-        match progress_style {
-            ProgressStyle::Json => {
-                while let Some(event) = rx.recv().await {
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        println!("{json}");
-                    }
-                }
-            }
-            ProgressStyle::Bars | ProgressStyle::Auto if is_tty => {
-                render_bars(&mut rx).await;
-            }
-            _ => {
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        ProgressEvent::Resolved { total, .. } => {
-                            println!("Downloading {total} bytes across components...");
-                        }
-                        ProgressEvent::FileStarted {
-                            role, file, total, ..
-                        } => {
-                            println!("  [{role}] {file} started ({total} bytes)");
-                        }
-                        ProgressEvent::FileVerified { role, file, .. } => {
-                            println!("  [{role}] {file} verified");
-                        }
-                        ProgressEvent::Installed { model, variant } => {
-                            println!("Installed {model}:{variant}");
-                        }
-                        ProgressEvent::Error { message, .. } => {
-                            println!("Error: {message}");
-                        }
-                        ProgressEvent::FileProgress { .. } => {}
-                    }
-                }
-            }
-        }
-    });
-
-    downloader
-        .download_variant(recipe.name.as_ref(), selected.variant, Some(&tx))
-        .await?;
-
-    store.install_variant(&recipe, selected.variant, &model_entry.manifest_sha256)?;
-
-    let _ = tx
-        .send(ProgressEvent::Installed {
-            model: recipe.name.to_string(),
-            variant: selected.variant.key.to_string(),
-        })
-        .await;
-    drop(tx);
-    let _ = render_handle.await;
-
-    println!(
-        "Successfully pulled and installed '{}:{}'.",
-        recipe.name, selected.variant.key
-    );
-    Ok(())
+    // The pull blocks on a runtime of its own, so it runs on a thread that may.
+    tokio::task::spawn_blocking(move || {
+        pull_rendered(
+            &model_ref,
+            &config,
+            &probe_host_profile(),
+            style,
+            is_tty,
+            &mut std::io::stdout(),
+        )
+    })
+    .await
+    .context("the pull task ended abnormally")?
 }
 
-async fn render_bars(rx: &mut mpsc::Receiver<ProgressEvent>) {
-    let mp = MultiProgress::new();
-    let style = IndicatifStyle::default_bar()
-        .template(
-            "{prefix:.bold} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
-        )
-        .unwrap_or_else(|_| IndicatifStyle::default_bar());
+/// One progress bar per file, as an interactive terminal shows a pull.
+struct Bars {
+    multi: MultiProgress,
+    style: IndicatifStyle,
+    by_file: std::collections::HashMap<String, ProgressBar>,
+}
 
-    let mut bars = std::collections::HashMap::new();
+impl Bars {
+    fn new() -> Self {
+        let style = IndicatifStyle::default_bar()
+            .template(
+                "{prefix:.bold} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+            )
+            .unwrap_or_else(|_| IndicatifStyle::default_bar());
+        Self {
+            multi: MultiProgress::new(),
+            style,
+            by_file: std::collections::HashMap::new(),
+        }
+    }
 
-    while let Some(event) = rx.recv().await {
+    fn event(&mut self, event: &ProgressEvent) {
         match event {
             ProgressEvent::FileStarted {
                 role, file, total, ..
             } => {
-                let pb = mp.add(ProgressBar::new(total));
-                pb.set_style(style.clone());
+                let pb = self.multi.add(ProgressBar::new(*total));
+                pb.set_style(self.style.clone());
                 pb.set_prefix(format!("{role}/{file}"));
-                bars.insert(file, pb);
+                self.by_file.insert(file.clone(), pb);
             }
             ProgressEvent::FileProgress { file, bytes, .. } => {
-                if let Some(pb) = bars.get(&file) {
-                    pb.set_position(bytes);
+                if let Some(pb) = self.by_file.get(file) {
+                    pb.set_position(*bytes);
                 }
             }
             ProgressEvent::FileVerified { file, .. } => {
-                if let Some(pb) = bars.get(&file) {
+                if let Some(pb) = self.by_file.get(file) {
                     pb.finish_with_message("verified");
                 }
             }
@@ -766,267 +632,201 @@ pub fn run_rm(args: &RmArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::num::NonZeroUsize;
 
-    use clap::{CommandFactory as _, FromArgMatches as _};
-    use shiso_hub::recipe::{Recipe, Role};
-    use shiso_hub::validate::{ValidationMode, validate_recipe};
+    use serde_json::json;
+    use sha2::{Digest as _, Sha256};
+    use shiso_hub::config::RegistryEndpoint;
+    use shiso_hub::host::MetalInfo;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::populate_serve_args_from_variant;
-    use crate::cli::{Cli, ServeArgs, apply_recipe_defaults};
+    use super::*;
 
-    /// The recipe the registry fixture carries for the sparse family: the
-    /// published trellis export as one directory, its tower file bound to
-    /// `--vision`, its draft head inside the directory.
-    const QWEN38: &str = include_str!("../../shiso-registry/tests/fixtures/qwen3.8-flash.json");
+    const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    /// The CUDA variant resolves to the directory as `--model`, the tower
-    /// and n-gram table files inside it as `--vision` and `--ngram`, and the
-    /// tuned knobs as recipe defaults.
+    fn digest(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// A registry and file host in one mock server, serving one tiny model.
+    struct Registry {
+        rt: tokio::runtime::Runtime,
+        server: MockServer,
+        home: tempfile::TempDir,
+    }
+
+    impl Registry {
+        fn new() -> Self {
+            let rt = tokio::runtime::Runtime::new().expect("runtime");
+            let server = rt.block_on(MockServer::start());
+            let files: [(&str, &str, Vec<u8>); 2] = [
+                ("base", "mini.gguf", vec![3u8; 2048]),
+                (
+                    "config",
+                    "config.json",
+                    br#"{"model_type":"lfm2"}"#.to_vec(),
+                ),
+            ];
+            let component = |role: &str| {
+                let entries: Vec<_> = files
+                    .iter()
+                    .filter(|(r, ..)| *r == role)
+                    .map(|(_, name, bytes)| {
+                        json!({"name": name, "size": bytes.len(), "sha256": digest(bytes)})
+                    })
+                    .collect();
+                json!({
+                    "provider": "huggingface",
+                    "repo": format!("acme/{role}"),
+                    "revision": REVISION,
+                    "entry": if role == "base" { "mini.gguf" } else { "config.json" },
+                    "files": entries,
+                })
+            };
+            let manifest = json!({
+                "schema_version": 1, "name": "mini", "aliases": [], "family": "lfm2",
+                "min_shiso_version": "0.1.0", "description": "fixture", "tags": [],
+                "tasks": ["decision"],
+                "modalities": {"inputs": ["text"], "outputs": ["text"]},
+                "features": {
+                    "tools": false, "reasoning": false, "reasoning_efforts": [],
+                    "default_reasoning_effort": null, "structured_output": false
+                },
+                "variants": [{
+                    "key": "q8_0", "backends": ["metal", "cuda"], "quant": "Q8_0",
+                    "requirements": {"min_ram_bytes": 1, "disk_bytes": 2069},
+                    "components": {"base": component("base"), "config": component("config")},
+                }],
+            })
+            .to_string()
+            .into_bytes();
+            let index = json!({
+                "schema_version": 1, "generated_at": "2026-10-05T00:00:00Z",
+                "models": [{
+                    "name": "mini", "family": "lfm2", "min_shiso_version": "0.1.0",
+                    "description": "fixture", "tasks": ["decision"],
+                    "updated_at": "2026-10-05T00:00:00Z",
+                    "manifest": "models/mini/index.json",
+                    "manifest_sha256": digest(&manifest), "variants": [],
+                }],
+            })
+            .to_string()
+            .into_bytes();
+            let serve = |route: &str, body: Vec<u8>| {
+                let mock = Mock::given(method("GET"))
+                    .and(path(route.to_owned()))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(body));
+                rt.block_on(mock.mount(&server));
+            };
+            serve("/v1/index.json", index);
+            serve("/v1/models/mini/index.json", manifest);
+            for (role, name, bytes) in files {
+                serve(&format!("/acme/{role}/resolve/{REVISION}/{name}"), bytes);
+            }
+            Self {
+                rt,
+                server,
+                home: tempfile::tempdir().expect("tempdir"),
+            }
+        }
+
+        fn config(&self) -> HubConfig {
+            let uri = self.server.uri();
+            HubConfig {
+                home: self.home.path().to_path_buf(),
+                registry: RegistryEndpoint {
+                    url: Url::parse(&format!("{uri}/v1")).expect("url"),
+                },
+                hf_endpoint: Url::parse(&uri).expect("url"),
+                hf_token: None,
+                max_parallel_files: NonZeroUsize::MIN,
+            }
+        }
+
+        /// What `shiso pull mini` prints, on a host that runs the fixture.
+        fn pull(&self, style: ProgressStyle) -> Vec<String> {
+            let host = HostProfile::probe(
+                vec![Backend::Metal],
+                None,
+                Some(MetalInfo {
+                    name: "test device".to_owned(),
+                    family: 9,
+                    working_set_bytes: 64 << 30,
+                }),
+            );
+            let mut out = Vec::new();
+            pull_rendered("mini", &self.config(), &host, style, false, &mut out)
+                .unwrap_or_else(|e| panic!("{e}"));
+            String::from_utf8(out)
+                .expect("utf8")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
     #[test]
-    fn exl3_variant_resolves_to_directory_and_tower() {
-        let recipe: Recipe = serde_json::from_str(QWEN38).expect("fixture parses");
-        validate_recipe(&recipe, ValidationMode::Strict).expect("fixture validates");
-        let variant = recipe
-            .variants
+    fn a_fresh_pull_prints_the_steps_then_the_closing_line() {
+        let fx = Registry::new();
+        let lines = fx.pull(ProgressStyle::Auto);
+        assert_eq!(lines[0], "Fetching registry index...");
+        assert!(lines[1].starts_with("selected variant 'q8_0'"), "{lines:?}");
+        assert_eq!(lines[2], "Downloading 2069 bytes across components...");
+        let mut started: Vec<_> = lines
             .iter()
-            .find(|v| v.key.as_str() == "cuda-exl3-405")
-            .expect("cuda variant");
-
-        let matches =
-            Cli::command().get_matches_from(["shiso", "serve", "--ctx", "8192", "--port", "1"]);
-        let serve = matches.subcommand_matches("serve").expect("serve");
-        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
-        let vdir = Path::new("/hub/models/qwen3.8-flash/cuda-exl3-405");
-        populate_serve_args_from_variant(&mut args, vdir, variant, &recipe.name)
-            .expect("populates");
-        apply_recipe_defaults(
-            &mut args,
-            Some(serve),
-            variant.server_defaults.as_ref().expect("defaults"),
+            .filter(|l| l.contains("started ("))
+            .cloned()
+            .collect();
+        started.sort();
+        assert_eq!(
+            started,
+            [
+                "  [base] mini.gguf started (2048 bytes)",
+                "  [config] config.json started (21 bytes)"
+            ]
         );
-
-        let base = vdir.join(Role::Base.as_str());
-        assert_eq!(args.model, Some(base.clone()));
-        assert_eq!(args.vision, Some(base.join("vision_k6.safetensors")));
-        assert_eq!(args.ngram, Some(base.join("ngram_embedding.safetensors")));
-        // The head is inside the directory: no flag names it.
-        assert_eq!(args.draft_model, None);
-        assert_eq!(args.config, None);
-        assert_eq!(args.model_name.as_deref(), Some("qwen3.8-flash"));
-
-        assert_eq!(args.ctx, 8192, "an explicit flag beats the recipe");
-        assert_eq!(args.spec_k, 4);
-        assert_eq!(args.spec_lookup, 8);
-        assert!(args.capture_verify && args.capture_batch);
-        assert_eq!(args.gpu_memory_utilization, Some(0.88));
-        assert_eq!(args.solo_prefill_chunk, 4096);
+        assert!(lines.contains(&"  [base] mini.gguf verified".to_owned()));
+        assert!(lines.contains(&"  [config] config.json verified".to_owned()));
+        let n = lines.len();
+        assert_eq!(lines[n - 2], "Installed mini:q8_0");
+        assert_eq!(
+            lines[n - 1],
+            "Successfully pulled and installed 'mini:q8_0'."
+        );
+        assert_eq!(n, 9, "{lines:?}");
     }
 
-    /// The re-quantized export of the same family: its shards carry no tower
-    /// file, so the base checkpoint's tower comes from another repository as a
-    /// component of its own.
-    const QWEN38_UNCENSORED: &str =
-        include_str!("../../shiso-registry/tests/fixtures/qwen3.8-flash-uncensored.json");
-
-    /// A tower supplied by a component of its own resolves to that
-    /// component's directory and entry, while the n-gram table stays the file
-    /// bound inside the base directory.
     #[test]
-    fn a_tower_from_another_repository_resolves_to_its_component() {
-        let recipe: Recipe = serde_json::from_str(QWEN38_UNCENSORED).expect("fixture parses");
-        validate_recipe(&recipe, ValidationMode::Strict).expect("fixture validates");
-        let variant = recipe
-            .variants
+    fn pulling_what_is_installed_says_it_is_up_to_date_and_nothing_more() {
+        let fx = Registry::new();
+        fx.pull(ProgressStyle::Auto);
+        let lines = fx.pull(ProgressStyle::Auto);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "Fetching registry index...");
+        assert!(lines[1].starts_with("selected variant 'q8_0'"));
+        assert_eq!(lines[2], "Model 'mini:q8_0' is already up to date.");
+        drop(fx.rt);
+    }
+
+    #[test]
+    fn json_progress_prints_one_object_per_download_event() {
+        let fx = Registry::new();
+        let lines = fx.pull(ProgressStyle::Json);
+        assert_eq!(lines[0], "Fetching registry index...");
+        let events: Vec<serde_json::Value> = lines[2..lines.len() - 1]
             .iter()
-            .find(|v| v.key.as_str() == "exl3-405")
-            .expect("cuda variant");
-        let matches = Cli::command().get_matches_from(["shiso", "serve", "--port", "1"]);
-        let serve = matches.subcommand_matches("serve").expect("serve");
-        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
-        let vdir = Path::new("/hub/models/qwen3.8-flash-uncensored/exl3-405");
-        populate_serve_args_from_variant(&mut args, vdir, variant, &recipe.name)
-            .expect("populates");
-
-        let base = vdir.join(Role::Base.as_str());
-        assert_eq!(args.model, Some(base.clone()));
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{l}: {e}")))
+            .collect();
+        assert_eq!(events[0]["event"], "resolved");
+        assert_eq!(events[0]["total"], 2069);
         assert_eq!(
-            args.vision,
-            Some(
-                vdir.join(Role::Vision.as_str())
-                    .join("vision_k6.safetensors")
-            )
-        );
-        assert_eq!(args.ngram, Some(base.join("ngram_embedding.safetensors")));
-        assert_eq!(args.draft_model, None);
-        assert_eq!(args.model_name.as_deref(), Some("qwen3.8-flash-uncensored"));
-    }
-
-    /// The MLX variant is a directory checkpoint with no entry file, and the
-    /// residency choice is the server's own `auto`.
-    #[test]
-    fn mlx_variant_points_at_its_directory() {
-        let recipe: Recipe = serde_json::from_str(QWEN38).expect("fixture parses");
-        let variant = recipe
-            .variants
-            .iter()
-            .find(|v| v.key.as_str() == "metal-mlx4")
-            .expect("metal variant");
-        let matches = Cli::command().get_matches_from(["shiso", "serve"]);
-        let serve = matches.subcommand_matches("serve").expect("serve");
-        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
-        // A real directory: the config is looked for inside a checkpoint
-        // directory and beside a checkpoint file, decided on the filesystem.
-        let home = tempfile::tempdir().expect("tempdir");
-        let vdir = home.path();
-        std::fs::create_dir_all(vdir.join("base")).expect("base dir");
-        populate_serve_args_from_variant(&mut args, vdir, variant, &recipe.name)
-            .expect("populates");
-        assert_eq!(args.model, Some(vdir.join("base")));
-        assert_eq!(args.config, None);
-        assert_eq!(args.config_path(), vdir.join("base").join("config.json"));
-        assert_eq!(args.draft_model, None);
-    }
-
-    /// A hub-hosted draft vocabulary reaches `--draft-vocab` from its own
-    /// component directory, beside a base that speculates by itself.
-    #[test]
-    fn a_hub_draft_vocabulary_resolves_to_its_file() {
-        let recipe: Recipe = serde_json::from_str(
-            r#"{
-              "schema_version": 1, "name": "q-test", "family": "qwen4exp",
-              "min_shiso_version": "0.2.0", "description": "x",
-              "tasks": ["chat"], "features": {},
-              "modalities": {"inputs": ["text"], "outputs": ["text"]},
-              "variants": [{
-                "key": "exl3", "backends": ["cuda"], "quant": "exl3",
-                "requirements": {"min_ram_bytes": 1, "disk_bytes": 20},
-                "server_defaults": {"spec_k": 4},
-                "components": {
-                  "base": {"provider": "huggingface", "repo": "o/q",
-                    "revision": "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c",
-                    "files": [{"name": "model.safetensors", "size": 10,
-                      "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]},
-                  "draft_vocab": {"provider": "shiso", "entry": "draft_vocab_counts.txt",
-                    "files": [{"name": "draft_vocab_counts.txt", "size": 10,
-                      "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]}
-                }
-              }]
-            }"#,
-        )
-        .expect("recipe parses");
-        validate_recipe(&recipe, ValidationMode::Strict).expect("recipe validates");
-        let matches = Cli::command().get_matches_from(["shiso", "serve"]);
-        let serve = matches.subcommand_matches("serve").expect("serve");
-        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
-        let vdir = Path::new("/hub/models/q-test/exl3");
-        populate_serve_args_from_variant(&mut args, vdir, &recipe.variants[0], &recipe.name)
-            .expect("populates");
-        assert_eq!(
-            args.draft_vocab,
-            Some(vdir.join("draft_vocab").join("draft_vocab_counts.txt"))
-        );
-    }
-
-    /// Files bound to `image_text_encoder`, `image_vae` and
-    /// `image_tokenizer` reach their own flags as paths inside the component
-    /// that downloads them.
-    #[test]
-    fn image_variant_routes_bound_text_encoder_vae_and_tokenizer() {
-        let recipe: Recipe = serde_json::from_str(
-            r#"{
-              "schema_version": 1, "name": "qwen-test", "family": "flux2",
-              "min_shiso_version": "0.1.0", "description": "x",
-              "tasks": ["image_generation"], "features": {},
-              "modalities": {"inputs": ["text"], "outputs": ["image"]},
-              "variants": [{
-                "key": "fp8", "backends": ["metal"], "quant": "fp8",
-                "requirements": {"min_ram_bytes": 1, "disk_bytes": 40},
-                "components": {
-                  "image": {"provider": "huggingface", "repo": "o/split",
-                    "revision": "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c",
-                    "entry": "dit.safetensors",
-                    "files": [
-                      {"name": "dit.safetensors", "size": 10,
-                       "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"},
-                      {"name": "te.safetensors", "size": 10, "binds": "image_text_encoder",
-                       "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"},
-                      {"name": "vae.safetensors", "size": 10, "binds": "image_vae",
-                       "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"},
-                      {"name": "tokenizer.json", "size": 10, "binds": "image_tokenizer",
-                       "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]}
-                }
-              }]
-            }"#,
-        )
-        .expect("recipe parses");
-        validate_recipe(&recipe, ValidationMode::Strict).expect("recipe validates");
-        let matches = Cli::command().get_matches_from(["shiso", "serve"]);
-        let serve = matches.subcommand_matches("serve").expect("serve");
-        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
-        let vdir = Path::new("/hub/models/qwen-test/fp8");
-        populate_serve_args_from_variant(&mut args, vdir, &recipe.variants[0], &recipe.name)
-            .expect("populates");
-        assert_eq!(
-            args.image_model,
-            Some(vdir.join("image").join("dit.safetensors"))
+            events.last().map(|e| e["event"].clone()),
+            Some("installed".into())
         );
         assert_eq!(
-            args.image_text_encoder,
-            Some(vdir.join("image").join("te.safetensors"))
+            lines.last().map(String::as_str),
+            Some("Successfully pulled and installed 'mini:q8_0'.")
         );
-        assert_eq!(
-            args.image_vae,
-            Some(vdir.join("image").join("vae.safetensors"))
-        );
-        assert_eq!(
-            args.image_tokenizer,
-            Some(vdir.join("image").join("tokenizer.json"))
-        );
-        assert_eq!(args.image_assets_dir, None);
-    }
-
-    /// An image variant hands its checkpoint file to `--image-model`, its
-    /// asset tree to `--image-assets-dir`, and answers to the recipe's name.
-    #[test]
-    fn image_variant_resolves_to_model_and_assets() {
-        let recipe: Recipe = serde_json::from_str(
-            r#"{
-              "schema_version": 1, "name": "flux-test", "family": "flux2",
-              "min_shiso_version": "0.1.0", "description": "x",
-              "tasks": ["image_generation"], "features": {},
-              "modalities": {"inputs": ["text"], "outputs": ["image"]},
-              "variants": [{
-                "key": "fp8", "backends": ["metal"], "quant": "fp8",
-                "requirements": {"min_ram_bytes": 1, "disk_bytes": 20},
-                "components": {
-                  "image": {"provider": "huggingface", "repo": "o/fp8",
-                    "revision": "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c",
-                    "entry": "model.safetensors",
-                    "files": [{"name": "model.safetensors", "size": 10,
-                      "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]},
-                  "image_assets": {"provider": "huggingface", "repo": "o/bf16",
-                    "revision": "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c",
-                    "files": [{"name": "vae/config.json", "size": 10,
-                      "sha256": "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a"}]}
-                }
-              }]
-            }"#,
-        )
-        .expect("recipe parses");
-        validate_recipe(&recipe, ValidationMode::Strict).expect("recipe validates");
-        let matches = Cli::command().get_matches_from(["shiso", "serve"]);
-        let serve = matches.subcommand_matches("serve").expect("serve");
-        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
-        let vdir = Path::new("/hub/models/flux-test/fp8");
-        populate_serve_args_from_variant(&mut args, vdir, &recipe.variants[0], &recipe.name)
-            .expect("populates");
-        assert_eq!(
-            args.image_model,
-            Some(vdir.join("image").join("model.safetensors"))
-        );
-        assert_eq!(args.image_assets_dir, Some(vdir.join("image_assets")));
-        assert_eq!(args.image_model_id.as_deref(), Some("flux-test"));
-        assert_eq!(args.model, None);
     }
 }

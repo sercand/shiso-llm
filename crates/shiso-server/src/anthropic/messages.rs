@@ -29,6 +29,7 @@
 //! is left unread. `X-Service-Tier: flex` asks for the flex class here as on
 //! every other surface.
 
+use crate::error::ErrorResponse as _;
 use std::sync::Arc;
 
 use axum::body::Bytes;

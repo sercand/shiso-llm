@@ -75,6 +75,20 @@ fn the_value_norm_is_unweighted() {
 
 #[test]
 #[ignore = "requires a Metal device"]
+fn rope_without_a_norm_rotates_the_raw_head() {
+    let Some(gpu) = open() else { return };
+    attn::rope_without_a_norm_rotates_the_raw_head(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_rope_only_store_keeps_the_value_raw() {
+    let Some(gpu) = open() else { return };
+    attn::the_rope_only_store_keeps_the_value_raw(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
 fn window_and_bound_select_the_keys() {
     let Some(gpu) = open() else { return };
     attn::window_and_bound_select_the_keys(&gpu);

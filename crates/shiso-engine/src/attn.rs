@@ -83,9 +83,10 @@ pub struct AttnGeometry {
     /// Whether this slot writes the cache runs it reads. `false` for a slot that
     /// reads an earlier slot's.
     pub owns_kv: bool,
-    /// Whether the query and key heads are normalized and rotated before the
-    /// softmax reads them. `false` stores and reads the projections as they
-    /// came out.
+    /// Whether the query and key heads are normalized before the softmax reads
+    /// them. The rotation is [`Self::n_rot`]'s to state: `false` here with a
+    /// non-zero `n_rot` rotates without normalizing, and with an `n_rot` of
+    /// zero stores and reads the projections as they came out.
     pub qk_norm: bool,
 }
 
@@ -185,7 +186,7 @@ impl Attn {
     }
 
     /// The key and value projections of a slot that owns its cache and
-    /// normalizes nothing.
+    /// normalizes nothing, whether or not it rotates.
     ///
     /// # Errors
     ///

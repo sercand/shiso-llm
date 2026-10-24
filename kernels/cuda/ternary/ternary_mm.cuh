@@ -1,5 +1,5 @@
 /* Matrix-matrix products over ternary and 2-bit affine weights; the twins of
- * `crates/shiso-metal/metal/ternary/ternary_mm.metal` under the same entry
+ * `kernels/metal/ternary/ternary_mm.metal` under the same entry
  * names and argument order. The Metal pair feeds the simdgroup matrix units;
  * these are plain shared-memory tiles with FMA cores, the simplest kernels
  * that read the same weights the same way: 32 output rows by `TN` tokens a

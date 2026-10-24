@@ -21,7 +21,7 @@ the module does not export is worse than no file.
 
 ## Module `dense` — 19 entries
 
-Geometry and buffer order are `crates/shiso-metal/metal/dense/KERNELS.md`'s,
+Geometry and buffer order are `kernels/metal/dense/KERNELS.md`'s,
 because the twins share an engine that names them and hands both the same
 argument block and the same grid. `n` is the element count a flat kernel covers
 and `n_tok` the rows of the chunk.
@@ -136,6 +136,28 @@ deliberate: the same buffer as both `out` and `in` is a documented call, and a
 restrict qualifier over an aliased pair is undefined behaviour rather than a
 hint. `kernel_vit_layer_norm` in the `vision` module is the same shape for the
 same reason.
+
+## Added for rotation without a norm — 2 entries
+
+Written by hand to mirror `kernel_dense_q_rope` and `kernel_dense_kv_rope_store`
+in `kernels/metal/dense/dense_norm_rope.metal`, and **not yet compiled or run on
+a CUDA device**: unlike the lists around it, this one was not pasted from
+`scripts/q4e_ptx_oracle.sh --mode=ptx`. Replace this paragraph with the oracle's
+output once the module has been built and the `dense_attn` cases have run.
+
+```
+kernel_dense_q_rope
+kernel_dense_kv_rope_store
+```
+
+| Entry point | Parameters after the argument block | grid | block | smem |
+|---|---|---|---|---|
+| `kernel_dense_q_rope` | `q_out, q_in, pos` | `(n_head, n_tok)` | 128 | 2180 |
+| `kernel_dense_kv_rope_store` | `k_cache, v_cache, k_in, v_in, pos, pages` | `(n_head_kv, n_tok)` | 128 | 2180 |
+
+The rotary pair with the per-head norm taken out. They read the norm pair's
+argument blocks (`eps` and `v_norm` unread) and stage the head at the same
+offset, so the shared allocation is the same 2180 bytes.
 
 ## Added for the speculative 27B path — 20 entries
 

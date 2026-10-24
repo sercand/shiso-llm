@@ -174,5 +174,5 @@ To find a diverging layer, use `--dump-layers` with
 - Putting a model family name in `shiso-core`/`shiso-engine`/`shiso-kvstore`,
   or upstream project names in code or comments.
 - Adding a scattered `std::env::var`. Knobs are clap flags with `SHISO_*` env
-  vars in `crates/shiso-server/src/cli.rs`.
+  vars in `crates/shiso-runtime/src/options.rs`.
 - Using `#[allow]`, `println!`, `unwrap()`, or `unsafe` without `// SAFETY:`.

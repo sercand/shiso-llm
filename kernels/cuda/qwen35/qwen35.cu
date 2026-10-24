@@ -36,7 +36,7 @@
 #include "get_rows_q6_K.cuh"
 
 /* The family's own entries. One `.cuh` per heading of
- * `crates/shiso-metal/metal/qwen35/KERNELS.md`. */
+ * `kernels/metal/qwen35/KERNELS.md`. */
 #include "q35_norm_rope.cuh"
 #include "q35_attn.cuh"
 #include "q35_gdn.cuh"

@@ -1,5 +1,5 @@
-//! Device cases for the dense attention family: the two norm-and-rotate kernels
-//! and the two softmax entry points.
+//! Device cases for the dense attention family: the two norm-and-rotate kernels,
+//! their two rotate-only twins and the two softmax entry points.
 //!
 //! These are the parametric attention kernels Gemma 4 needs and qwen35 does not:
 //! a rotation whose frequency ladder is computed over a width of its own rather
@@ -60,9 +60,11 @@ const DECODE: &str = "kernel_dense_attn_decode";
 const PREFILL: &str = "kernel_dense_attn_prefill";
 
 /// Every entry point this module's cases launch.
-pub const ENTRIES: [&str; 4] = [
+pub const ENTRIES: [&str; 6] = [
     "kernel_dense_q_norm_rope",
     "kernel_dense_kv_norm_rope_store",
+    "kernel_dense_q_rope",
+    "kernel_dense_kv_rope_store",
     DECODE,
     PREFILL,
 ];
@@ -256,7 +258,11 @@ const ROPE_HEADS: usize = 2;
 /// with `i + n_rot / 2`, and a kernel that conflated the two would be plausible
 /// and wrong on every global layer.
 fn norm_rope(row: &[f32], weight: &[f32], shape: RopeShape, pos: f32) -> Vec<f32> {
-    let mut out = norm_only(row, weight, shape.head_dim);
+    rope(norm_only(row, weight, shape.head_dim), shape, pos)
+}
+
+/// The rotation alone, over a row as it is.
+fn rope(mut out: Vec<f32>, shape: RopeShape, pos: f32) -> Vec<f32> {
     let half = shape.freq_dims / 2;
     for i in 0..shape.n_rot / 2 {
         let theta = pos * shape.base.powf(-2.0 * i as f32 / shape.freq_dims as f32);
@@ -567,6 +573,176 @@ pub fn the_value_norm_is_unweighted(gpu: &Gpu) {
     // written for its first token. It is still zero.
     assert!(
         got_v[..KV_HD].iter().all(|v| *v == 0.0),
+        "row 0 was written, so the store went by token index rather than through the page table",
+    );
+}
+
+// -- rotation without a norm ----------------------------------------------
+
+/// A Llama-style head: 64 wide, every dimension rotated over a ladder of its
+/// own width, pairing `i` with `i + 32`.
+const NARROW: RopeShape = RopeShape {
+    head_dim: 64,
+    n_rot: 64,
+    freq_dims: 64,
+    base: 1e5,
+};
+
+/// How far the rotate-only fixtures sit from unit root mean square.
+///
+/// The signal is uniform over `[-1, 1]`, a root mean square near 0.58, which a
+/// normalizing kernel would scale by about 1.7; tripled, it would scale by about
+/// 0.58 instead. Either way every dimension moves far past the tolerance, but
+/// tripled is the side where "close to unit" cannot be argued.
+const RAW_AMPLITUDE: f32 = 3.0;
+
+/// Runs the rotate-only query kernel over [`ROPE_HEADS`] heads of `pos.len()`
+/// tokens and reads the rows back.
+fn q_rope(gpu: &Gpu, row: &[f32], shape: RopeShape, pos: &[i32]) -> Vec<f32> {
+    let n_tok = pos.len();
+    let d_row = gpu.upload(&f32_bytes(row));
+    let d_pos = gpu.upload(&i32_bytes(pos));
+    let out = zeros(gpu, n_tok * ROPE_HEADS * shape.head_dim);
+    let args = QNormRopeArgs {
+        head_dim: shape.head_dim as u32,
+        n_head: ROPE_HEADS as u32,
+        n_rot: shape.n_rot as u32,
+        freq_dims: shape.freq_dims as u32,
+        n_tok: n_tok as u32,
+        rope_base: shape.base,
+        // Unread: a rotate-only slot has no norm to put an epsilon in.
+        eps: 0.0,
+    };
+    launch(
+        gpu,
+        "kernel_dense_q_rope",
+        Extent3::new(ROPE_HEADS as u32, n_tok as u32, 1),
+        Extent3::new(BLOCK_128, 1, 1),
+        NORM_ROPE_SMEM,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(d_row.view()),
+            KernelArg::Buffer(d_pos.view()),
+        ],
+    );
+    drain(gpu);
+    gpu.read_f32(&out)
+}
+
+/// The rotate-only query kernel is the rotation of the raw head: no division
+/// by its root mean square, at a Llama head's width and at the partially
+/// rotated Gemma shape whose pair stride is not `n_rot / 2`.
+pub fn rope_without_a_norm_rotates_the_raw_head(gpu: &Gpu) {
+    for (salt, shape) in [(63, NARROW), (64, FULL)] {
+        let pos = [9i32, 0, 21];
+        let rows: Vec<f32> = crate::oracle::signal(pos.len() * ROPE_HEADS * shape.head_dim, salt)
+            .iter()
+            .map(|v| v * RAW_AMPLITUDE)
+            .collect();
+        let got = q_rope(gpu, &rows, shape, &pos);
+        for (tok, &at) in pos.iter().enumerate() {
+            for head in 0..ROPE_HEADS {
+                let base = (tok * ROPE_HEADS + head) * shape.head_dim;
+                let raw = &rows[base..base + shape.head_dim];
+                let want = rope(raw.to_vec(), shape, at as f32);
+                close(
+                    &got[base..base + shape.head_dim],
+                    &want,
+                    TOL_F32,
+                    &format!("{}-wide head, token {tok} head {head}", shape.head_dim),
+                );
+                // Position 0 rotates by nothing, so the row is the input to
+                // the last bit: the kernel added no scale of its own.
+                if at == 0 {
+                    close(
+                        &got[base..base + shape.head_dim],
+                        raw,
+                        0.0,
+                        "position 0 is the identity",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The rotate-only store: the key rotated, the value raw, both in the cache row
+/// the page table names and neither normalized.
+pub fn the_rope_only_store_keeps_the_value_raw(gpu: &Gpu) {
+    let keys: Vec<f32> = crate::oracle::signal(KV_TOK * KV_HEADS * KV_HD, 74)
+        .iter()
+        .map(|v| v * RAW_AMPLITUDE)
+        .collect();
+    let values: Vec<f32> = crate::oracle::signal(KV_TOK * KV_HEADS * KV_HD, 75)
+        .iter()
+        .map(|v| v * RAW_AMPLITUDE)
+        .collect();
+    let pos: Vec<i32> = (0..KV_TOK as i32).map(|t| t * 5 + 2).collect();
+
+    let d_k = gpu.upload(&f32_bytes(&keys));
+    let d_v = gpu.upload(&f32_bytes(&values));
+    let d_pos = gpu.upload(&i32_bytes(&pos));
+    let pages = page_table(gpu, SHUFFLED_PAGES);
+    let rows = SHUFFLED_PAGES.rows();
+    let k_cache = zeros_f16(gpu, rows * KV_HEADS * KV_HD);
+    let v_cache = zeros_f16(gpu, rows * KV_HEADS * KV_HD);
+
+    let args = KvNormRopeArgs {
+        head_dim: KV_HD as u32,
+        n_head_kv: KV_HEADS as u32,
+        n_rot: KV_SHAPE.n_rot as u32,
+        freq_dims: KV_SHAPE.freq_dims as u32,
+        n_tok: KV_TOK as u32,
+        rope_base: KV_SHAPE.base,
+        eps: 0.0,
+        page_tokens: SHUFFLED_PAGES.page_tokens,
+        // Set on purpose: the kernel must not read it.
+        v_norm: 1,
+        page_stride: 0,
+    };
+    launch(
+        gpu,
+        "kernel_dense_kv_rope_store",
+        Extent3::new(KV_HEADS as u32, KV_TOK as u32, 1),
+        Extent3::new(BLOCK_128, 1, 1),
+        NORM_ROPE_SMEM,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(k_cache.view()),
+            KernelArg::Buffer(v_cache.view()),
+            KernelArg::Buffer(d_k.view()),
+            KernelArg::Buffer(d_v.view()),
+            KernelArg::Buffer(d_pos.view()),
+            KernelArg::Buffer(pages.view()),
+        ],
+    );
+    drain(gpu);
+
+    let got_k = f16_values(&gpu.read(&k_cache));
+    let got_v = f16_values(&gpu.read(&v_cache));
+    for (tok, &at) in pos.iter().enumerate() {
+        for head in 0..KV_HEADS {
+            let src = (tok * KV_HEADS + head) * KV_HD;
+            let slot = (SHUFFLED_PAGES.row(at as u32) * KV_HEADS + head) * KV_HD;
+            let want_k = rope(keys[src..src + KV_HD].to_vec(), KV_SHAPE, at as f32);
+            close(
+                &got_k[slot..slot + KV_HD],
+                &want_k,
+                TOL_QUANT,
+                &format!("key token {tok} head {head}"),
+            );
+            close(
+                &got_v[slot..slot + KV_HD],
+                &values[src..src + KV_HD],
+                TOL_QUANT,
+                &format!("value token {tok} head {head}"),
+            );
+        }
+    }
+    // Row 0 belongs to logical position 16, which this chunk never names.
+    assert!(
+        got_k[..KV_HD].iter().all(|v| *v == 0.0),
         "row 0 was written, so the store went by token index rather than through the page table",
     );
 }

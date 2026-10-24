@@ -3,7 +3,7 @@
 The lookup table a loader resolves a kernel through. The module is loaded by
 its registry key, `audio`; every entry carries C linkage, so each name below is
 the name the driver answers to, verbatim. The same names are the
-Metal twin's (`crates/shiso-metal/metal/audio`) and the host's literals in
+Metal twin's (`kernels/metal/audio`) and the host's literals in
 `crates/shiso-models/src/audio_ops`; `shiso_kerneltest::audio::cases::ENTRIES`
 holds them, and `crates/shiso-cuda/tests/audio_kernels.rs` resolves every one.
 
